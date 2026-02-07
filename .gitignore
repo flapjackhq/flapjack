@@ -1,0 +1,32 @@
+# Build
+/target
+/.cache
+
+# Dependencies
+**/node_modules/
+
+# Environment & secrets
+**/.env
+!.env.example
+/.secret
+
+# Runtime data
+/data
+/dev-data
+/datasets
+/tmp
+
+# IDE
+/.vscode
+/.idea
+/.claude
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dashboard build output
+/dashboard/dist
+
+# Logs
+*.log
