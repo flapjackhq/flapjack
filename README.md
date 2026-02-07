@@ -2,8 +2,8 @@
 
 Drop-in replacement for Algolia. Self-hosted, single binary, no dependencies.
 
-[![CI](https://github.com/stuartcrobinson/flapjack/actions/workflows/ci.yml/badge.svg)](https://github.com/stuartcrobinson/flapjack/actions/workflows/ci.yml)
-[![Release](https://github.com/stuartcrobinson/flapjack/actions/workflows/release.yml/badge.svg)](https://github.com/stuartcrobinson/flapjack/actions/workflows/release.yml)
+[![CI](https://github.com/flapjackhq/flapjack/actions/workflows/ci.yml/badge.svg)](https://github.com/flapjackhq/flapjack/actions/workflows/ci.yml)
+[![Release](https://github.com/flapjackhq/flapjack/actions/workflows/release.yml/badge.svg)](https://github.com/flapjackhq/flapjack/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Works with [InstantSearch.js](https://github.com/algolia/instantsearch), [algoliasearch](https://github.com/algolia/algoliasearch-client-javascript) (Algolia's JavaScript client), or plain HTTP.
@@ -14,7 +14,7 @@ Works with [InstantSearch.js](https://github.com/algolia/instantsearch), [algoli
 
 ## Quick Start
 
-Download the latest binary from [Releases](https://github.com/stuartcrobinson/flapjack/releases/latest).
+Download the latest binary from [Releases](https://github.com/flapjackhq/flapjack/releases/latest).
 
 ```bash
 tar xzf flapjack-*.tar.gz

@@ -13,7 +13,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Full-text search engine library with typo tolerance, faceting, and Algolia-compatible conventions"
 license = "MIT"
-repository = "https://github.com/stuartcrobinson/flapjack"
+repository = "https://github.com/flapjackhq/flapjack"
 keywords = ["search", "full-text", "tantivy", "algolia", "faceting"]
 categories = ["database", "text-processing"]
 

@@ -7,7 +7,7 @@ Open an issue first to discuss proposed changes.
 ## Setup
 
 ```bash
-git clone https://github.com/stuartcrobinson/flapjack.git
+git clone https://github.com/flapjackhq/flapjack.git
 cd flapjack
 cargo build
 ```
