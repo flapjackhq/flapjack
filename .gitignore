@@ -28,5 +28,17 @@ Thumbs.db
 # Dashboard build output
 /dashboard/dist
 
+# Backup files
+*.bak
+
+# Test artifacts
+/dashboard/playwright-report
+/dashboard/test-results
+
+# Session notes
+SESSION_*
+BUILD_SESSION_*
+TESTING_SUMMARY*
+
 # Logs
 *.log
