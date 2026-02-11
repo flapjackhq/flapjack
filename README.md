@@ -2,10 +2,10 @@
 
 Self-hosted search engine with an Algolia-compatible API. Single binary, no dependencies.
 
-[![CI](https://github.com/stuartcrobinson/flapjack202511/actions/workflows/ci.yml/badge.svg)](https://github.com/stuartcrobinson/flapjack202511/actions/workflows/ci.yml)
-[![Release](https://github.com/stuartcrobinson/flapjack202511/actions/workflows/release.yml/badge.svg)](https://github.com/stuartcrobinson/flapjack202511/actions/workflows/release.yml)
+[![CI](https://github.com/flapjackhq/flapjack/actions/workflows/ci.yml/badge.svg)](https://github.com/flapjackhq/flapjack/actions/workflows/ci.yml)
+[![Release](https://github.com/flapjackhq/flapjack/actions/workflows/release.yml/badge.svg)](https://github.com/flapjackhq/flapjack/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Status: Beta](https://img.shields.io/badge/Status-Beta-orange)](https://github.com/stuartcrobinson/flapjack202511)
+[![Status: Beta](https://img.shields.io/badge/Status-Beta-orange)](https://github.com/flapjackhq/flapjack)
 
 > **Beta:** Flapjack is under active development. The API is largely stable but breaking changes may still occur. Not yet recommended for production workloads without testing. Feedback and bug reports welcome.
 

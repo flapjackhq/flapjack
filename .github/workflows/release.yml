@@ -29,6 +29,8 @@ jobs:
             os: macos-15-intel
           - target: aarch64-apple-darwin
             os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +56,8 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} --package flapjack-server
 
-      - name: Package
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
@@ -62,13 +65,21 @@ jobs:
           cd ../../..
           shasum -a 256 flapjack-${{ matrix.target }}.tar.gz > flapjack-${{ matrix.target }}.tar.gz.sha256
 
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../flapjack-${{ matrix.target }}.zip flapjack-server.exe
+          cd ../../..
+          sha256sum flapjack-${{ matrix.target }}.zip > flapjack-${{ matrix.target }}.zip.sha256
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: flapjack-${{ matrix.target }}
           path: |
-            flapjack-${{ matrix.target }}.tar.gz
-            flapjack-${{ matrix.target }}.tar.gz.sha256
+            flapjack-${{ matrix.target }}.*
 
   release:
     needs: build
@@ -93,3 +104,5 @@ jobs:
           files: |
             flapjack-*.tar.gz
             flapjack-*.tar.gz.sha256
+            flapjack-*.zip
+            flapjack-*.zip.sha256
