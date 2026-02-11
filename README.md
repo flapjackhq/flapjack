@@ -19,11 +19,18 @@ Self-hosted search engine with an Algolia-compatible API. Single binary, no depe
 
 ## Quick Start
 
-Download the latest binary from [Releases](https://github.com/flapjackhq/flapjack/releases/latest):
+Install with a single command (auto-detects OS and architecture):
 
 ```bash
-tar xzf flapjack-*.tar.gz
-./flapjack-server
+curl -fsSL https://install.flapjack.foo | sh
+```
+
+Or download manually from [Releases](https://github.com/flapjackhq/flapjack/releases/latest).
+
+Then start the server and add some data:
+
+```bash
+flapjack-server
 
 # Add documents
 curl -X POST http://localhost:7701/1/indexes/movies/batch \
@@ -38,6 +45,25 @@ curl -X POST http://localhost:7701/1/indexes/movies/query \
   -H "Content-Type: application/json" \
   -d '{"query":"matrx"}'
 ```
+
+<details>
+<summary>Install options</summary>
+
+```bash
+# Install a specific version
+curl -fsSL https://install.flapjack.foo | sh -s -- v0.2.0
+
+# Custom install directory
+FLAPJACK_INSTALL=/opt/flapjack curl -fsSL https://install.flapjack.foo | sh
+
+# Skip PATH modification
+NO_MODIFY_PATH=1 curl -fsSL https://install.flapjack.foo | sh
+
+# Uninstall
+rm -rf ~/.flapjack
+```
+
+</details>
 
 No auth required in development mode. For production, set `FLAPJACK_ENV=production` and `FLAPJACK_ADMIN_KEY` — see [Configuration](#configuration). Data is stored in `FLAPJACK_DATA_DIR` (default `./data`). Mount this as a volume if running in Docker.
 
