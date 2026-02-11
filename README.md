@@ -13,13 +13,13 @@ Self-hosted search engine with an Algolia-compatible API. Single binary, no depe
 - Typo-tolerant full-text search with faceting, geo-search, and custom ranking
 - Single static binary, runs anywhere, data on local disk
 
-**[Live Demo](https://main.flapjack-demo.pages.dev)** · **[Geo Demo](https://main.flapjack-demo.pages.dev/geo)** · **[API Docs](https://main.flapjack-demo.pages.dev/api-docs)**
+**[Live Demo](https://flapjack-demo.pages.dev)** · **[Geo Demo](https://flapjack-demo.pages.dev/geo)** · **[API Docs](https://flapjack-demo.pages.dev/api-docs)**
 
 ---
 
 ## Quick Start
 
-Download the latest binary from [Releases](https://github.com/stuartcrobinson/flapjack202511/releases/latest):
+Download the latest binary from [Releases](https://github.com/flapjackhq/flapjack/releases/latest):
 
 ```bash
 tar xzf flapjack-*.tar.gz
@@ -166,7 +166,7 @@ curl -X POST http://localhost:7701/1/migrate-from-algolia \
 
 ## API Documentation
 
-Browse the API at [main.flapjack-demo.pages.dev/api-docs](https://main.flapjack-demo.pages.dev/api-docs), or run the server locally and use the interactive Swagger UI at `http://localhost:7701/swagger-ui/`.
+Browse the API at [flapjack-demo.pages.dev/api-docs](https://flapjack-demo.pages.dev/api-docs), or run the server locally and use the interactive Swagger UI at `http://localhost:7701/swagger-ui/`.
 
 ---
 
