@@ -1736,9 +1736,11 @@ dependencies = [
 name = "flapjack-server"
 version = "0.1.0"
 dependencies = [
+ "assert_cmd",
  "clap",
  "flapjack",
  "flapjack-http",
+ "predicates",
  "tikv-jemallocator",
  "tokio",
 ]

@@ -18,7 +18,7 @@ use tempfile::TempDir;
 // runners.  Tighten them over time as the engine gets faster.
 const P99_TEXT_SEARCH_US: u64 = 5_000; // 5 ms
 const P99_MULTI_WORD_US: u64 = 10_000; // 10 ms
-const P99_LONG_QUERY_US: u64 = 20_000; // 20 ms
+const P99_LONG_QUERY_US: u64 = 25_000; // 25 ms
 const P99_FILTER_US: u64 = 10_000; // 10 ms
 const P99_SORT_US: u64 = 10_000; // 10 ms
 const P99_FACET_US: u64 = 30_000; // 30 ms

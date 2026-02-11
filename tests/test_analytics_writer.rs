@@ -151,7 +151,7 @@ async fn search_events_roundtrip_via_query_engine() {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
     let result = engine
-        .top_searches(index_name, &today, &today, 10, false)
+        .top_searches(index_name, &today, &today, 10, false, None, None)
         .await
         .unwrap();
 
@@ -286,7 +286,7 @@ async fn query_empty_index_returns_empty() {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
     let result = engine
-        .top_searches("nonexistent", &today, &today, 10, false)
+        .top_searches("nonexistent", &today, &today, 10, false, None, None)
         .await
         .unwrap();
 

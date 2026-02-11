@@ -26,6 +26,18 @@ where
     Option::<Vec<String>>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
 }
 
+fn remove_stop_words_is_default(v: &RemoveStopWordsValue) -> bool {
+    matches!(v, RemoveStopWordsValue::Disabled)
+}
+
+fn ignore_plurals_is_default(v: &IgnorePluralsValue) -> bool {
+    matches!(v, IgnorePluralsValue::Disabled)
+}
+
+fn vec_is_empty(v: &Vec<String>) -> bool {
+    v.is_empty()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IndexSettings {
@@ -121,13 +133,25 @@ pub struct IndexSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distinct: Option<DistinctValue>,
 
-    #[serde(rename = "removeStopWords", default)]
+    #[serde(
+        rename = "removeStopWords",
+        default,
+        skip_serializing_if = "remove_stop_words_is_default"
+    )]
     pub remove_stop_words: RemoveStopWordsValue,
 
-    #[serde(rename = "queryLanguages", default)]
+    #[serde(
+        rename = "queryLanguages",
+        default,
+        skip_serializing_if = "vec_is_empty"
+    )]
     pub query_languages: Vec<String>,
 
-    #[serde(rename = "ignorePlurals", default)]
+    #[serde(
+        rename = "ignorePlurals",
+        default,
+        skip_serializing_if = "ignore_plurals_is_default"
+    )]
     pub ignore_plurals: IgnorePluralsValue,
 }
 

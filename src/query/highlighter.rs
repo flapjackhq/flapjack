@@ -59,21 +59,18 @@ impl Highlighter {
             if field_name == "objectID" {
                 continue;
             }
-            let is_searchable = searchable_paths.is_empty()
-                || searchable_paths
-                    .iter()
-                    .any(|p| p == field_name || field_name.starts_with(&format!("{}.", p)));
-            if is_searchable {
-                result.insert(
-                    field_name.clone(),
-                    self.highlight_field_value(
-                        field_value,
-                        query_words,
-                        field_name,
-                        searchable_paths,
-                    ),
-                );
-            }
+            // Algolia highlights ALL attributes with query words, not just
+            // searchable ones.  The searchableAttributes setting only controls
+            // which fields the *search* engine queries, not highlighting.
+            result.insert(
+                field_name.clone(),
+                self.highlight_field_value(
+                    field_value,
+                    query_words,
+                    field_name,
+                    searchable_paths,
+                ),
+            );
         }
 
         result

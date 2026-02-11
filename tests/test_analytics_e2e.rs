@@ -141,7 +141,7 @@ async fn full_analytics_pipeline() {
 
     // 1. Top searches
     let result = engine
-        .top_searches("products", &today, &today, 10, false)
+        .top_searches("products", &today, &today, 10, false, None, None)
         .await
         .unwrap();
     let searches = result["searches"].as_array().unwrap();

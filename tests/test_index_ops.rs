@@ -621,7 +621,15 @@ mod oplog_replay {
         };
         let set_data = std::fs::read(tenant_path.join("settings.json")).ok();
 
-        std::fs::remove_dir_all(tenant_path).unwrap();
+        for attempt in 0..10 {
+            match std::fs::remove_dir_all(tenant_path) {
+                Ok(()) => break,
+                Err(_) if attempt < 9 => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => panic!("failed to remove_dir_all after retries: {e}"),
+            }
+        }
         std::fs::create_dir_all(tenant_path).unwrap();
 
         let schema = flapjack::index::schema::Schema::builder().build();

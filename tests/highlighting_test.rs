@@ -208,17 +208,19 @@ async fn test_highlight_only_searchable_attributes() -> flapjack::error::Result<
         result.contains_key("brand"),
         "should highlight searchable field 'brand'"
     );
+    // Algolia includes ALL attributes in _highlightResult (not just searchable
+    // ones).  Non-searchable fields are highlighted with query words too.
     assert!(
-        !result.contains_key("price"),
-        "non-searchable fields excluded from _highlightResult"
+        result.contains_key("price"),
+        "non-searchable fields should be included in _highlightResult"
     );
     assert!(
-        !result.contains_key("url"),
-        "non-searchable fields excluded from _highlightResult"
+        result.contains_key("url"),
+        "non-searchable fields should be included in _highlightResult"
     );
     assert!(
-        !result.contains_key("image"),
-        "non-searchable fields excluded from _highlightResult"
+        result.contains_key("image"),
+        "non-searchable fields should be included in _highlightResult"
     );
 
     Ok(())

@@ -386,10 +386,27 @@ impl QueryParser {
                         term
                     };
                     let fuzzy = Box::new(tantivy::query::FuzzyTermQuery::new(fuzzy_term, distance, true));
-                    Box::new(tantivy::query::BooleanQuery::new(vec![
-                        (tantivy::query::Occur::Should, exact),
-                        (tantivy::query::Occur::Should, fuzzy),
-                    ]))
+                    let mut clauses: Vec<(tantivy::query::Occur, Box<dyn TantivyQuery>)> = vec![
+                        (tantivy::query::Occur::Should, exact as Box<dyn TantivyQuery>),
+                        (tantivy::query::Occur::Should, fuzzy as Box<dyn TantivyQuery>),
+                    ];
+                    // First-char error fallback: strip the first character and
+                    // prefix-match the remainder on the n-gram index.  Algolia
+                    // handles first-character typos this way — e.g. "lsha" →
+                    // "sha" matches "shades".
+                    if is_prefix && token.len() >= 4 {
+                        let stripped = &token[token.char_indices().nth(1).map(|(i, _)| i).unwrap_or(1)..];
+                        if stripped.len() >= 3 {
+                            let stripped_term_text = format!("{}\0s{}", path, stripped);
+                            let stripped_term = tantivy::Term::from_field_text(json_search_field, &stripped_term_text);
+                            let stripped_q: Box<dyn TantivyQuery> = Box::new(tantivy::query::TermQuery::new(
+                                stripped_term,
+                                tantivy::schema::IndexRecordOption::WithFreqsAndPositions,
+                            ));
+                            clauses.push((tantivy::query::Occur::Should, stripped_q));
+                        }
+                    }
+                    Box::new(tantivy::query::BooleanQuery::new(clauses))
                 } else {
                     Box::new(tantivy::query::TermQuery::new(
                         term,

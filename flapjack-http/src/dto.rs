@@ -129,7 +129,7 @@ pub struct DocFailureDto {
     pub message: String,
 }
 
-#[derive(Debug, Deserialize, Clone, ToSchema)]
+#[derive(Debug, Default, Deserialize, Clone, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchRequest {
     #[serde(default)]
