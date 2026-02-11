@@ -1,6 +1,6 @@
 use datafusion::datasource::listing::ListingOptions;
 use datafusion::prelude::*;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use super::config::AnalyticsConfig;
@@ -45,7 +45,7 @@ impl AnalyticsQueryEngine {
 
     async fn query_parquet_dir(
         &self,
-        dir: &PathBuf,
+        dir: &Path,
         table_name: &str,
         sql: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
@@ -131,13 +131,21 @@ impl AnalyticsQueryEngine {
             where_clause, limit
         );
 
-        let df = ctx.sql(&sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let rows = batches_to_json(&batches)?;
 
         if click_analytics {
             // Enrich with CTR data from events
-            let enriched = self.enrich_with_click_data(index_name, start_ms, end_ms, rows).await?;
+            let enriched = self
+                .enrich_with_click_data(index_name, start_ms, end_ms, rows)
+                .await?;
             Ok(serde_json::json!({"searches": enriched}))
         } else {
             Ok(serde_json::json!({"searches": rows}))
@@ -161,8 +169,14 @@ impl AnalyticsQueryEngine {
              WHERE timestamp_ms >= {} AND timestamp_ms <= {}",
             start_ms, end_ms
         );
-        let df = ctx.sql(&total_sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = ctx
+            .sql(&total_sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let total_rows = batches_to_json(&batches)?;
         let total = total_rows
             .first()
@@ -180,8 +194,14 @@ impl AnalyticsQueryEngine {
              ORDER BY day_ms",
             start_ms, end_ms
         );
-        let df = ctx.sql(&daily_sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = ctx
+            .sql(&daily_sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let daily_rows = batches_to_json(&batches)?;
 
         let dates: Vec<serde_json::Value> = daily_rows
@@ -222,8 +242,14 @@ impl AnalyticsQueryEngine {
             start_ms, end_ms, limit
         );
 
-        let df = ctx.sql(&sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let rows = batches_to_json(&batches)?;
 
         Ok(serde_json::json!({"searches": rows}))
@@ -248,8 +274,14 @@ impl AnalyticsQueryEngine {
              WHERE timestamp_ms >= {} AND timestamp_ms <= {}",
             start_ms, end_ms
         );
-        let df = ctx.sql(&sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let rows = batches_to_json(&batches)?;
         let (total, no_results) = rows
             .first()
@@ -275,8 +307,14 @@ impl AnalyticsQueryEngine {
              GROUP BY day_ms ORDER BY day_ms",
             start_ms, end_ms
         );
-        let df = ctx.sql(&daily_sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = ctx
+            .sql(&daily_sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let daily = batches_to_json(&batches)?
             .into_iter()
             .filter_map(|row| {
@@ -318,8 +356,14 @@ impl AnalyticsQueryEngine {
              WHERE timestamp_ms >= {} AND timestamp_ms <= {} AND query_id IS NOT NULL",
             start_ms, end_ms
         );
-        let df = search_ctx.sql(&search_sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = search_ctx
+            .sql(&search_sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let tracked_searches = batches_to_json(&batches)?
             .first()
             .and_then(|r| r.get("count"))
@@ -335,8 +379,14 @@ impl AnalyticsQueryEngine {
              GROUP BY day_ms ORDER BY day_ms",
             start_ms, end_ms
         );
-        let df = search_ctx.sql(&daily_search_sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = search_ctx
+            .sql(&daily_search_sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let daily_searches = batches_to_json(&batches)?;
 
         // Get click count + daily clicks
@@ -348,7 +398,10 @@ impl AnalyticsQueryEngine {
         );
         let click_count = match events_ctx.sql(&click_sql).await {
             Ok(df) => {
-                let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+                let batches = df
+                    .collect()
+                    .await
+                    .map_err(|e| format!("Exec error: {}", e))?;
                 batches_to_json(&batches)?
                     .first()
                     .and_then(|r| r.get("count"))
@@ -366,20 +419,24 @@ impl AnalyticsQueryEngine {
              GROUP BY day_ms ORDER BY day_ms",
             start_ms, end_ms
         );
-        let daily_clicks: std::collections::HashMap<i64, i64> = match events_ctx.sql(&daily_click_sql).await {
-            Ok(df) => {
-                let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
-                batches_to_json(&batches)?
-                    .iter()
-                    .filter_map(|r| {
-                        let ms = r.get("day_ms")?.as_i64()?;
-                        let c = r.get("count")?.as_i64()?;
-                        Some((ms, c))
-                    })
-                    .collect()
-            }
-            Err(_) => std::collections::HashMap::new(),
-        };
+        let daily_clicks: std::collections::HashMap<i64, i64> =
+            match events_ctx.sql(&daily_click_sql).await {
+                Ok(df) => {
+                    let batches = df
+                        .collect()
+                        .await
+                        .map_err(|e| format!("Exec error: {}", e))?;
+                    batches_to_json(&batches)?
+                        .iter()
+                        .filter_map(|r| {
+                            let ms = r.get("day_ms")?.as_i64()?;
+                            let c = r.get("count")?.as_i64()?;
+                            Some((ms, c))
+                        })
+                        .collect()
+                }
+                Err(_) => std::collections::HashMap::new(),
+            };
 
         let rate = if tracked_searches > 0 {
             click_count as f64 / tracked_searches as f64
@@ -393,7 +450,11 @@ impl AnalyticsQueryEngine {
                 let ms = row.get("day_ms")?.as_i64()?;
                 let tracked = row.get("count")?.as_i64()?;
                 let clicks = daily_clicks.get(&ms).copied().unwrap_or(0);
-                let day_rate = if tracked > 0 { clicks as f64 / tracked as f64 } else { 0.0 };
+                let day_rate = if tracked > 0 {
+                    clicks as f64 / tracked as f64
+                } else {
+                    0.0
+                };
                 Some(serde_json::json!({
                     "date": ms_to_date_string(ms),
                     "rate": (day_rate * 1000.0).round() / 1000.0,
@@ -433,16 +494,26 @@ impl AnalyticsQueryEngine {
 
         match events_ctx.sql(&sql).await {
             Ok(df) => {
-                let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+                let batches = df
+                    .collect()
+                    .await
+                    .map_err(|e| format!("Exec error: {}", e))?;
                 let rows = batches_to_json(&batches)?;
 
                 let mut total_sum: f64 = 0.0;
                 let mut total_count: i64 = 0;
-                let mut daily: std::collections::BTreeMap<i64, (f64, i64)> = std::collections::BTreeMap::new();
+                let mut daily: std::collections::BTreeMap<i64, (f64, i64)> =
+                    std::collections::BTreeMap::new();
 
                 for row in &rows {
-                    let pos_str = row.get("positions").and_then(|v| v.as_str()).unwrap_or("[]");
-                    let ts = row.get("timestamp_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let pos_str = row
+                        .get("positions")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("[]");
+                    let ts = row
+                        .get("timestamp_ms")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
                     let day_ms = ts / 86400000 * 86400000;
                     let positions: Vec<f64> = serde_json::from_str(pos_str).unwrap_or_default();
                     for &p in &positions {
@@ -454,7 +525,11 @@ impl AnalyticsQueryEngine {
                     }
                 }
 
-                let avg = if total_count > 0 { total_sum / total_count as f64 } else { 0.0 };
+                let avg = if total_count > 0 {
+                    total_sum / total_count as f64
+                } else {
+                    0.0
+                };
 
                 let dates: Vec<serde_json::Value> = daily
                     .iter()
@@ -501,33 +576,37 @@ impl AnalyticsQueryEngine {
         );
 
         // Algolia-style position buckets
-        let buckets: Vec<(i32, i32)> = vec![
-            (1, 1), (2, 2), (3, 4), (5, 8), (9, 16), (17, 20), (21, -1),
-        ];
+        let buckets: Vec<(i32, i32)> =
+            vec![(1, 1), (2, 2), (3, 4), (5, 8), (9, 16), (17, 20), (21, -1)];
         let mut bucket_counts: Vec<i64> = vec![0; buckets.len()];
         let mut total_clicks: i64 = 0;
 
-        match events_ctx.sql(&sql).await {
-            Ok(df) => {
-                let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
-                let rows = batches_to_json(&batches)?;
+        if let Ok(df) = events_ctx.sql(&sql).await {
+            let batches = df
+                .collect()
+                .await
+                .map_err(|e| format!("Exec error: {}", e))?;
+            let rows = batches_to_json(&batches)?;
 
-                for row in &rows {
-                    let pos_str = row.get("positions").and_then(|v| v.as_str()).unwrap_or("[]");
-                    let positions: Vec<i32> = serde_json::from_str(pos_str).unwrap_or_default();
-                    for &p in &positions {
-                        total_clicks += 1;
-                        for (i, &(lo, hi)) in buckets.iter().enumerate() {
-                            if hi == -1 {
-                                if p >= lo { bucket_counts[i] += 1; }
-                            } else if p >= lo && p <= hi {
+            for row in &rows {
+                let pos_str = row
+                    .get("positions")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("[]");
+                let positions: Vec<i32> = serde_json::from_str(pos_str).unwrap_or_default();
+                for &p in &positions {
+                    total_clicks += 1;
+                    for (i, &(lo, hi)) in buckets.iter().enumerate() {
+                        if hi == -1 {
+                            if p >= lo {
                                 bucket_counts[i] += 1;
                             }
+                        } else if p >= lo && p <= hi {
+                            bucket_counts[i] += 1;
                         }
                     }
                 }
             }
-            Err(_) => {}
         }
 
         let positions: Vec<serde_json::Value> = buckets
@@ -565,8 +644,14 @@ impl AnalyticsQueryEngine {
             start_ms, end_ms
         );
 
-        let df = ctx.sql(&sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let count = batches_to_json(&batches)?
             .first()
             .and_then(|r| r.get("count"))
@@ -582,8 +667,14 @@ impl AnalyticsQueryEngine {
              GROUP BY day_ms ORDER BY day_ms",
             start_ms, end_ms
         );
-        let df = ctx.sql(&daily_sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = ctx
+            .sql(&daily_sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let dates: Vec<serde_json::Value> = batches_to_json(&batches)?
             .into_iter()
             .filter_map(|row| {
@@ -618,8 +709,14 @@ impl AnalyticsQueryEngine {
             start_ms, end_ms, limit
         );
 
-        let df = ctx.sql(&sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let rows = batches_to_json(&batches)?;
 
         Ok(serde_json::json!({"filters": rows}))
@@ -652,12 +749,19 @@ impl AnalyticsQueryEngine {
             start_ms, end_ms, escaped_attr
         );
 
-        let df = ctx.sql(&sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let rows = batches_to_json(&batches)?;
 
         // Post-process: extract attribute values from filter strings
-        let mut value_counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut value_counts: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
         let attr_prefix = format!("{}:", attribute);
         for row in &rows {
             let filter_str = row.get("filters").and_then(|v| v.as_str()).unwrap_or("");
@@ -708,8 +812,14 @@ impl AnalyticsQueryEngine {
             start_ms, end_ms, limit
         );
 
-        let df = ctx.sql(&sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let rows = batches_to_json(&batches)?;
 
         Ok(serde_json::json!({"filters": rows}))
@@ -739,7 +849,10 @@ impl AnalyticsQueryEngine {
 
         match events_ctx.sql(&sql).await {
             Ok(df) => {
-                let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+                let batches = df
+                    .collect()
+                    .await
+                    .map_err(|e| format!("Exec error: {}", e))?;
                 let rows = batches_to_json(&batches)?;
                 Ok(serde_json::json!({"hits": rows}))
             }
@@ -776,8 +889,14 @@ impl AnalyticsQueryEngine {
              WHERE timestamp_ms >= {} AND timestamp_ms <= {} AND query_id IS NOT NULL",
             start_ms, end_ms
         );
-        let df = search_ctx.sql(&search_sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = search_ctx
+            .sql(&search_sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let tracked_searches = batches_to_json(&batches)?
             .first()
             .and_then(|r| r.get("count"))
@@ -792,8 +911,14 @@ impl AnalyticsQueryEngine {
              GROUP BY day_ms ORDER BY day_ms",
             start_ms, end_ms
         );
-        let df = search_ctx.sql(&daily_search_sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = search_ctx
+            .sql(&daily_search_sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let daily_searches = batches_to_json(&batches)?;
 
         // Get conversion count + daily
@@ -805,7 +930,10 @@ impl AnalyticsQueryEngine {
         );
         let conversion_count = match events_ctx.sql(&conv_sql).await {
             Ok(df) => {
-                let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+                let batches = df
+                    .collect()
+                    .await
+                    .map_err(|e| format!("Exec error: {}", e))?;
                 batches_to_json(&batches)?
                     .first()
                     .and_then(|r| r.get("count"))
@@ -823,20 +951,24 @@ impl AnalyticsQueryEngine {
              GROUP BY day_ms ORDER BY day_ms",
             start_ms, end_ms
         );
-        let daily_convs: std::collections::HashMap<i64, i64> = match events_ctx.sql(&daily_conv_sql).await {
-            Ok(df) => {
-                let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
-                batches_to_json(&batches)?
-                    .iter()
-                    .filter_map(|r| {
-                        let ms = r.get("day_ms")?.as_i64()?;
-                        let c = r.get("count")?.as_i64()?;
-                        Some((ms, c))
-                    })
-                    .collect()
-            }
-            Err(_) => std::collections::HashMap::new(),
-        };
+        let daily_convs: std::collections::HashMap<i64, i64> =
+            match events_ctx.sql(&daily_conv_sql).await {
+                Ok(df) => {
+                    let batches = df
+                        .collect()
+                        .await
+                        .map_err(|e| format!("Exec error: {}", e))?;
+                    batches_to_json(&batches)?
+                        .iter()
+                        .filter_map(|r| {
+                            let ms = r.get("day_ms")?.as_i64()?;
+                            let c = r.get("count")?.as_i64()?;
+                            Some((ms, c))
+                        })
+                        .collect()
+                }
+                Err(_) => std::collections::HashMap::new(),
+            };
 
         let rate = if tracked_searches > 0 {
             conversion_count as f64 / tracked_searches as f64
@@ -850,7 +982,11 @@ impl AnalyticsQueryEngine {
                 let ms = row.get("day_ms")?.as_i64()?;
                 let tracked = row.get("count")?.as_i64()?;
                 let convs = daily_convs.get(&ms).copied().unwrap_or(0);
-                let day_rate = if tracked > 0 { convs as f64 / tracked as f64 } else { 0.0 };
+                let day_rate = if tracked > 0 {
+                    convs as f64 / tracked as f64
+                } else {
+                    0.0
+                };
                 Some(serde_json::json!({
                     "date": ms_to_date_string(ms),
                     "rate": (day_rate * 1000.0).round() / 1000.0,
@@ -890,8 +1026,14 @@ impl AnalyticsQueryEngine {
              ORDER BY count DESC",
             start_ms, end_ms
         );
-        let df = search_ctx.sql(&sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = search_ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let all_tracked = batches_to_json(&batches)?;
 
         // Get queries that DID get clicks (via queryID correlation)
@@ -903,32 +1045,42 @@ impl AnalyticsQueryEngine {
                AND event_type = 'click' AND query_id IS NOT NULL",
             start_ms, end_ms
         );
-        let clicked_queries: std::collections::HashSet<String> = match events_ctx.sql(&click_qids_sql).await {
-            Ok(df) => {
-                let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
-                batches_to_json(&batches)?
-                    .iter()
-                    .filter_map(|r| r.get("query_id")?.as_str().map(String::from))
-                    .collect()
-            }
-            Err(_) => std::collections::HashSet::new(),
-        };
+        let clicked_queries: std::collections::HashSet<String> =
+            match events_ctx.sql(&click_qids_sql).await {
+                Ok(df) => {
+                    let batches = df
+                        .collect()
+                        .await
+                        .map_err(|e| format!("Exec error: {}", e))?;
+                    batches_to_json(&batches)?
+                        .iter()
+                        .filter_map(|r| r.get("query_id")?.as_str().map(String::from))
+                        .collect()
+                }
+                Err(_) => std::collections::HashSet::new(),
+            };
 
         // Now get the actual query text for those queryIDs from searches
         let search_ctx2 = self.create_session_with_searches(index_name).await?;
         let clicked_query_texts: std::collections::HashSet<String> = if clicked_queries.is_empty() {
             std::collections::HashSet::new()
         } else {
-            let qid_list: Vec<String> = clicked_queries.iter().map(|q| format!("'{}'", q)).collect();
+            let qid_list: Vec<String> =
+                clicked_queries.iter().map(|q| format!("'{}'", q)).collect();
             let qid_sql = format!(
                 "SELECT DISTINCT query FROM searches \
                  WHERE timestamp_ms >= {} AND timestamp_ms <= {} \
                    AND query_id IN ({}) ",
-                start_ms, end_ms, qid_list.join(",")
+                start_ms,
+                end_ms,
+                qid_list.join(",")
             );
             match search_ctx2.sql(&qid_sql).await {
                 Ok(df) => {
-                    let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+                    let batches = df
+                        .collect()
+                        .await
+                        .map_err(|e| format!("Exec error: {}", e))?;
                     batches_to_json(&batches)?
                         .iter()
                         .filter_map(|r| r.get("query")?.as_str().map(String::from))
@@ -967,8 +1119,14 @@ impl AnalyticsQueryEngine {
              WHERE timestamp_ms >= {} AND timestamp_ms <= {} AND query_id IS NOT NULL",
             start_ms, end_ms
         );
-        let df = search_ctx.sql(&sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = search_ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let tracked = batches_to_json(&batches)?
             .first()
             .and_then(|r| r.get("count"))
@@ -984,8 +1142,14 @@ impl AnalyticsQueryEngine {
              GROUP BY day_ms ORDER BY day_ms",
             start_ms, end_ms
         );
-        let df = search_ctx.sql(&daily_search_sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = search_ctx
+            .sql(&daily_search_sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let daily_searches = batches_to_json(&batches)?;
 
         let events_ctx = self.create_session_with_events(index_name).await?;
@@ -997,7 +1161,10 @@ impl AnalyticsQueryEngine {
         );
         let clicked = match events_ctx.sql(&click_sql).await {
             Ok(df) => {
-                let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+                let batches = df
+                    .collect()
+                    .await
+                    .map_err(|e| format!("Exec error: {}", e))?;
                 batches_to_json(&batches)?
                     .first()
                     .and_then(|r| r.get("count"))
@@ -1017,20 +1184,24 @@ impl AnalyticsQueryEngine {
              GROUP BY day_ms ORDER BY day_ms",
             start_ms, end_ms
         );
-        let daily_clicked: std::collections::HashMap<i64, i64> = match events_ctx.sql(&daily_click_sql).await {
-            Ok(df) => {
-                let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
-                batches_to_json(&batches)?
-                    .iter()
-                    .filter_map(|r| {
-                        let ms = r.get("day_ms")?.as_i64()?;
-                        let c = r.get("count")?.as_i64()?;
-                        Some((ms, c))
-                    })
-                    .collect()
-            }
-            Err(_) => std::collections::HashMap::new(),
-        };
+        let daily_clicked: std::collections::HashMap<i64, i64> =
+            match events_ctx.sql(&daily_click_sql).await {
+                Ok(df) => {
+                    let batches = df
+                        .collect()
+                        .await
+                        .map_err(|e| format!("Exec error: {}", e))?;
+                    batches_to_json(&batches)?
+                        .iter()
+                        .filter_map(|r| {
+                            let ms = r.get("day_ms")?.as_i64()?;
+                            let c = r.get("count")?.as_i64()?;
+                            Some((ms, c))
+                        })
+                        .collect()
+                }
+                Err(_) => std::collections::HashMap::new(),
+            };
 
         let no_click = tracked - clicked;
         let rate = if tracked > 0 {
@@ -1046,7 +1217,11 @@ impl AnalyticsQueryEngine {
                 let day_tracked = row.get("count")?.as_i64()?;
                 let day_clicked = daily_clicked.get(&ms).copied().unwrap_or(0);
                 let day_no_click = day_tracked - day_clicked;
-                let day_rate = if day_tracked > 0 { day_no_click as f64 / day_tracked as f64 } else { 0.0 };
+                let day_rate = if day_tracked > 0 {
+                    day_no_click as f64 / day_tracked as f64
+                } else {
+                    0.0
+                };
                 Some(serde_json::json!({
                     "date": ms_to_date_string(ms),
                     "rate": (day_rate * 1000.0).round() / 1000.0,
@@ -1092,7 +1267,8 @@ impl AnalyticsQueryEngine {
         let mut total_tracked: i64 = 0;
         let mut total_clicks: i64 = 0;
         let mut all_users: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut daily_searches: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+        let mut daily_searches: std::collections::BTreeMap<i64, i64> =
+            std::collections::BTreeMap::new();
         let mut per_index: Vec<serde_json::Value> = Vec::new();
 
         for index_name in &indices {
@@ -1267,8 +1443,14 @@ impl AnalyticsQueryEngine {
             start_ms, end_ms
         );
 
-        let df = ctx.sql(&sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let rows = batches_to_json(&batches)?;
 
         // Also get daily breakdown per platform
@@ -1289,8 +1471,14 @@ impl AnalyticsQueryEngine {
             start_ms, end_ms
         );
 
-        let df = ctx.sql(&daily_sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = ctx
+            .sql(&daily_sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let daily_rows = batches_to_json(&batches)?;
 
         let dates: Vec<serde_json::Value> = daily_rows
@@ -1335,8 +1523,14 @@ impl AnalyticsQueryEngine {
             start_ms, end_ms, limit
         );
 
-        let df = ctx.sql(&sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let rows = batches_to_json(&batches)?;
 
         let total: i64 = rows.iter().filter_map(|r| r.get("count")?.as_i64()).sum();
@@ -1373,8 +1567,14 @@ impl AnalyticsQueryEngine {
             start_ms, end_ms, safe_country, limit
         );
 
-        let df = ctx.sql(&sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let rows = batches_to_json(&batches)?;
 
         Ok(serde_json::json!({
@@ -1408,8 +1608,14 @@ impl AnalyticsQueryEngine {
             start_ms, end_ms, safe_country, limit
         );
 
-        let df = ctx.sql(&sql).await.map_err(|e| format!("SQL error: {}", e))?;
-        let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
+        let df = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| format!("SQL error: {}", e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("Exec error: {}", e))?;
         let rows = batches_to_json(&batches)?;
 
         Ok(serde_json::json!({
@@ -1428,9 +1634,8 @@ impl AnalyticsQueryEngine {
         let ctx = SessionContext::new();
         if !dir.exists() {
             // Register an empty table so SQL queries return 0 rows instead of erroring
-            let batch = arrow::record_batch::RecordBatch::new_empty(
-                super::schema::search_event_schema(),
-            );
+            let batch =
+                arrow::record_batch::RecordBatch::new_empty(super::schema::search_event_schema());
             let mem_table = datafusion::datasource::MemTable::try_new(
                 super::schema::search_event_schema(),
                 vec![vec![batch]],
@@ -1452,16 +1657,12 @@ impl AnalyticsQueryEngine {
         Ok(ctx)
     }
 
-    async fn create_session_with_events(
-        &self,
-        index_name: &str,
-    ) -> Result<SessionContext, String> {
+    async fn create_session_with_events(&self, index_name: &str) -> Result<SessionContext, String> {
         let dir = self.config.events_dir(index_name);
         let ctx = SessionContext::new();
         if !dir.exists() {
-            let batch = arrow::record_batch::RecordBatch::new_empty(
-                super::schema::insight_event_schema(),
-            );
+            let batch =
+                arrow::record_batch::RecordBatch::new_empty(super::schema::insight_event_schema());
             let mem_table = datafusion::datasource::MemTable::try_new(
                 super::schema::insight_event_schema(),
                 vec![vec![batch]],
@@ -1499,20 +1700,24 @@ impl AnalyticsQueryEngine {
              GROUP BY query",
             start_ms, end_ms
         );
-        let tracked_by_query: std::collections::HashMap<String, i64> = match search_ctx.sql(&tracked_sql).await {
-            Ok(df) => {
-                let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
-                batches_to_json(&batches)?
-                    .iter()
-                    .filter_map(|r| {
-                        let q = r.get("query")?.as_str()?.to_string();
-                        let c = r.get("tracked_count")?.as_i64()?;
-                        Some((q, c))
-                    })
-                    .collect()
-            }
-            Err(_) => return Ok(rows),
-        };
+        let tracked_by_query: std::collections::HashMap<String, i64> =
+            match search_ctx.sql(&tracked_sql).await {
+                Ok(df) => {
+                    let batches = df
+                        .collect()
+                        .await
+                        .map_err(|e| format!("Exec error: {}", e))?;
+                    batches_to_json(&batches)?
+                        .iter()
+                        .filter_map(|r| {
+                            let q = r.get("query")?.as_str()?.to_string();
+                            let c = r.get("tracked_count")?.as_i64()?;
+                            Some((q, c))
+                        })
+                        .collect()
+                }
+                Err(_) => return Ok(rows),
+            };
 
         // Get click events per query by joining through queryID
         // First get queryID->query mapping from searches
@@ -1521,20 +1726,24 @@ impl AnalyticsQueryEngine {
              WHERE timestamp_ms >= {} AND timestamp_ms <= {} AND query_id IS NOT NULL",
             start_ms, end_ms
         );
-        let qid_to_query: std::collections::HashMap<String, String> = match search_ctx.sql(&qid_sql).await {
-            Ok(df) => {
-                let batches = df.collect().await.map_err(|e| format!("Exec error: {}", e))?;
-                batches_to_json(&batches)?
-                    .iter()
-                    .filter_map(|r| {
-                        let qid = r.get("query_id")?.as_str()?.to_string();
-                        let q = r.get("query")?.as_str()?.to_string();
-                        Some((qid, q))
-                    })
-                    .collect()
-            }
-            Err(_) => return Ok(rows),
-        };
+        let qid_to_query: std::collections::HashMap<String, String> =
+            match search_ctx.sql(&qid_sql).await {
+                Ok(df) => {
+                    let batches = df
+                        .collect()
+                        .await
+                        .map_err(|e| format!("Exec error: {}", e))?;
+                    batches_to_json(&batches)?
+                        .iter()
+                        .filter_map(|r| {
+                            let qid = r.get("query_id")?.as_str()?.to_string();
+                            let q = r.get("query")?.as_str()?.to_string();
+                            Some((qid, q))
+                        })
+                        .collect()
+                }
+                Err(_) => return Ok(rows),
+            };
 
         // Get click counts per queryID from events
         let events_ctx = self.create_session_with_events(index_name).await?;
@@ -1546,7 +1755,8 @@ impl AnalyticsQueryEngine {
              GROUP BY query_id",
             start_ms, end_ms
         );
-        let mut clicks_by_query: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut clicks_by_query: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
         if let Ok(df) = events_ctx.sql(&clicks_sql).await {
             if let Ok(batches) = df.collect().await {
                 for row in batches_to_json(&batches)? {
@@ -1571,7 +1781,8 @@ impl AnalyticsQueryEngine {
              GROUP BY query_id",
             start_ms, end_ms
         );
-        let mut convs_by_query: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut convs_by_query: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
         if let Ok(df) = events_ctx.sql(&conv_sql).await {
             if let Ok(batches) = df.collect().await {
                 for row in batches_to_json(&batches)? {
@@ -1600,10 +1811,19 @@ impl AnalyticsQueryEngine {
                         let ctr = clicks as f64 / tracked as f64;
                         let cr = convs as f64 / tracked as f64;
                         if let Some(obj) = row.as_object_mut() {
-                            obj.insert("clickThroughRate".to_string(), serde_json::json!((ctr * 1000.0).round() / 1000.0));
-                            obj.insert("conversionRate".to_string(), serde_json::json!((cr * 1000.0).round() / 1000.0));
+                            obj.insert(
+                                "clickThroughRate".to_string(),
+                                serde_json::json!((ctr * 1000.0).round() / 1000.0),
+                            );
+                            obj.insert(
+                                "conversionRate".to_string(),
+                                serde_json::json!((cr * 1000.0).round() / 1000.0),
+                            );
                             obj.insert("clickCount".to_string(), serde_json::json!(clicks));
-                            obj.insert("trackedSearchCount".to_string(), serde_json::json!(tracked));
+                            obj.insert(
+                                "trackedSearchCount".to_string(),
+                                serde_json::json!(tracked),
+                            );
                         }
                     }
                 }
@@ -1660,13 +1880,14 @@ fn date_to_end_ms(date: &str) -> Result<i64, String> {
 }
 
 fn ms_to_date_string(ms: i64) -> String {
-    let dt = chrono::DateTime::from_timestamp_millis(ms)
-        .unwrap_or_default();
+    let dt = chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default();
     dt.format("%Y-%m-%d").to_string()
 }
 
 /// Convert Arrow RecordBatches to JSON rows.
-fn batches_to_json(batches: &[arrow::record_batch::RecordBatch]) -> Result<Vec<serde_json::Value>, String> {
+fn batches_to_json(
+    batches: &[arrow::record_batch::RecordBatch],
+) -> Result<Vec<serde_json::Value>, String> {
     let mut rows = Vec::new();
     for batch in batches {
         let schema = batch.schema();

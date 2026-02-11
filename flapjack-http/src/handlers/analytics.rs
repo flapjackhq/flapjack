@@ -60,8 +60,11 @@ pub async fn get_top_searches(
     let click_analytics = params.click_analytics.unwrap_or(false);
     let result = engine
         .top_searches(
-            &params.index, &params.start_date, &params.end_date,
-            limit, click_analytics,
+            &params.index,
+            &params.start_date,
+            &params.end_date,
+            limit,
+            click_analytics,
             params.country.as_deref(),
             params.tags.as_deref(),
         )
@@ -214,7 +217,13 @@ pub async fn get_filter_values(
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
     let limit = params.limit.unwrap_or(1000);
     let result = engine
-        .filter_values(&params.index, &attribute, &params.start_date, &params.end_date, limit)
+        .filter_values(
+            &params.index,
+            &attribute,
+            &params.start_date,
+            &params.end_date,
+            limit,
+        )
         .await
         .map_err(|e| FlapjackError::InvalidQuery(format!("Analytics error: {}", e)))?;
     Ok(Json(result))
@@ -262,9 +271,9 @@ pub async fn seed_analytics(
     State(engine): State<Arc<AnalyticsQueryEngine>>,
     Json(body): Json<SeedRequest>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
-    let index = body.index.ok_or_else(|| {
-        FlapjackError::InvalidQuery("Missing 'index' field".to_string())
-    })?;
+    let index = body
+        .index
+        .ok_or_else(|| FlapjackError::InvalidQuery("Missing 'index' field".to_string()))?;
     let days = body.days.unwrap_or(30).min(90);
 
     let config = engine.config();
@@ -293,7 +302,9 @@ pub async fn flush_analytics() -> Result<Json<serde_json::Value>, FlapjackError>
         collector.flush_all();
         Ok(Json(serde_json::json!({ "status": "ok" })))
     } else {
-        Ok(Json(serde_json::json!({ "status": "ok", "note": "analytics not initialized" })))
+        Ok(Json(
+            serde_json::json!({ "status": "ok", "note": "analytics not initialized" }),
+        ))
     }
 }
 
@@ -302,9 +313,9 @@ pub async fn clear_analytics(
     State(engine): State<Arc<AnalyticsQueryEngine>>,
     Json(body): Json<SeedRequest>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
-    let index = body.index.ok_or_else(|| {
-        FlapjackError::InvalidQuery("Missing 'index' field".to_string())
-    })?;
+    let index = body
+        .index
+        .ok_or_else(|| FlapjackError::InvalidQuery("Missing 'index' field".to_string()))?;
 
     let config = engine.config();
     let searches_dir = config.searches_dir(&index);
@@ -368,7 +379,13 @@ pub async fn get_geo_top_searches(
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
     let limit = params.limit.unwrap_or(10);
     let result = engine
-        .geo_top_searches(&params.index, &country, &params.start_date, &params.end_date, limit)
+        .geo_top_searches(
+            &params.index,
+            &country,
+            &params.start_date,
+            &params.end_date,
+            limit,
+        )
         .await
         .map_err(|e| FlapjackError::InvalidQuery(format!("Analytics error: {}", e)))?;
     Ok(Json(result))
@@ -382,7 +399,13 @@ pub async fn get_geo_regions(
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
     let limit = params.limit.unwrap_or(50);
     let result = engine
-        .geo_region_breakdown(&params.index, &country, &params.start_date, &params.end_date, limit)
+        .geo_region_breakdown(
+            &params.index,
+            &country,
+            &params.start_date,
+            &params.end_date,
+            limit,
+        )
         .await
         .map_err(|e| FlapjackError::InvalidQuery(format!("Analytics error: {}", e)))?;
     Ok(Json(result))

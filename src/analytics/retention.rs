@@ -9,13 +9,11 @@ pub fn cleanup_old_partitions(analytics_dir: &Path, retention_days: u32) -> Resu
         return Ok(0);
     }
 
-    let cutoff = chrono::Utc::now().date_naive()
-        - chrono::Duration::days(retention_days as i64);
+    let cutoff = chrono::Utc::now().date_naive() - chrono::Duration::days(retention_days as i64);
     let mut removed = 0;
 
     // Walk: analytics_dir/{index_name}/{searches|events}/date=YYYY-MM-DD/
-    let entries = std::fs::read_dir(analytics_dir)
-        .map_err(|e| format!("read_dir error: {}", e))?;
+    let entries = std::fs::read_dir(analytics_dir).map_err(|e| format!("read_dir error: {}", e))?;
 
     for index_entry in entries.flatten() {
         if !index_entry.path().is_dir() {
@@ -67,7 +65,9 @@ pub fn cleanup_old_partitions(analytics_dir: &Path, retention_days: u32) -> Resu
 pub async fn run_retention_loop(analytics_dir: std::path::PathBuf, retention_days: u32) {
     // Run once at startup
     match cleanup_old_partitions(&analytics_dir, retention_days) {
-        Ok(n) if n > 0 => tracing::info!("[analytics] Startup cleanup: removed {} old partitions", n),
+        Ok(n) if n > 0 => {
+            tracing::info!("[analytics] Startup cleanup: removed {} old partitions", n)
+        }
         Ok(_) => {}
         Err(e) => tracing::warn!("[analytics] Startup cleanup error: {}", e),
     }
@@ -79,7 +79,10 @@ pub async fn run_retention_loop(analytics_dir: std::path::PathBuf, retention_day
         interval.tick().await;
         match cleanup_old_partitions(&analytics_dir, retention_days) {
             Ok(n) if n > 0 => {
-                tracing::info!("[analytics] Retention cleanup: removed {} old partitions", n)
+                tracing::info!(
+                    "[analytics] Retention cleanup: removed {} old partitions",
+                    n
+                )
             }
             Ok(_) => {}
             Err(e) => tracing::warn!("[analytics] Retention cleanup error: {}", e),

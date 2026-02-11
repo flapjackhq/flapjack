@@ -33,12 +33,7 @@ impl QueryAggregator {
     /// Returns true if this search should be counted as a new search
     /// (i.e., not a continuation of a previous as-you-type sequence or pagination).
     /// Also updates the window with the new query.
-    pub fn should_count(
-        &self,
-        user_id: &str,
-        index_name: &str,
-        query: &str,
-    ) -> bool {
+    pub fn should_count(&self, user_id: &str, index_name: &str, query: &str) -> bool {
         self.should_count_with_filters(user_id, index_name, query, None)
     }
 
@@ -95,8 +90,7 @@ impl QueryAggregator {
     /// Periodic cleanup of expired windows to prevent unbounded memory growth.
     pub fn evict_expired(&self) {
         let cutoff_secs = self.window_secs * 2;
-        self.windows.retain(|_, v| {
-            v.last_seen.elapsed().as_secs() < cutoff_secs
-        });
+        self.windows
+            .retain(|_, v| v.last_seen.elapsed().as_secs() < cutoff_secs);
     }
 }

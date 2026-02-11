@@ -54,8 +54,16 @@ pub struct IndexManager {
     settings_cache: DashMap<TenantId, Arc<IndexSettings>>,
     rules_cache: DashMap<TenantId, Arc<RuleStore>>,
     synonyms_cache: DashMap<TenantId, Arc<SynonymStore>>,
-    pub facet_cache:
-        Arc<DashMap<String, Arc<(std::time::Instant, usize, HashMap<String, Vec<crate::types::FacetCount>>)>>>,
+    pub facet_cache: Arc<
+        DashMap<
+            String,
+            Arc<(
+                std::time::Instant,
+                usize,
+                HashMap<String, Vec<crate::types::FacetCount>>,
+            )>,
+        >,
+    >,
     pub facet_cache_cap: std::sync::atomic::AtomicUsize,
 }
 
@@ -189,12 +197,20 @@ impl IndexManager {
             .tasks
             .iter()
             .filter(|entry| entry.key().starts_with(&prefix))
-            .map(|entry| (entry.key().clone(), entry.value().numeric_id, entry.value().created_at))
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    entry.value().numeric_id,
+                    entry.value().created_at,
+                )
+            })
             .collect();
 
         if tenant_tasks.len() >= max_tasks {
             tenant_tasks.sort_by_key(|(_, _, created_at)| *created_at);
-            for (task_id, numeric_id, _) in tenant_tasks.iter().take(tenant_tasks.len() - max_tasks + 1) {
+            for (task_id, numeric_id, _) in
+                tenant_tasks.iter().take(tenant_tasks.len() - max_tasks + 1)
+            {
                 self.tasks.remove(task_id);
                 // Also remove the numeric_id alias key
                 self.tasks.remove(&numeric_id.to_string());
@@ -611,20 +627,19 @@ impl IndexManager {
 
         let rules_enabled = enable_rules.unwrap_or(true);
         let rule_ctx = rule_contexts.and_then(|c| c.first().map(|s| s.as_str()));
-        let (query_text_rewritten, rule_effects) =
-            if rules_enabled {
-                if let Some(store) = self.get_rules(tenant_id) {
-                    let rewritten = store
-                        .apply_query_rewrite(query_text, rule_ctx)
-                        .unwrap_or_else(|| query_text.to_string());
-                    let effects = Some(store.apply_rules(&rewritten, rule_ctx));
-                    (rewritten, effects)
-                } else {
-                    (query_text.to_string(), None)
-                }
+        let (query_text_rewritten, rule_effects) = if rules_enabled {
+            if let Some(store) = self.get_rules(tenant_id) {
+                let rewritten = store
+                    .apply_query_rewrite(query_text, rule_ctx)
+                    .unwrap_or_else(|| query_text.to_string());
+                let effects = Some(store.apply_rules(&rewritten, rule_ctx));
+                (rewritten, effects)
             } else {
                 (query_text.to_string(), None)
-            };
+            }
+        } else {
+            (query_text.to_string(), None)
+        };
         let synonyms_enabled = enable_synonyms.unwrap_or(true);
         let expanded_queries = if synonyms_enabled {
             if let Some(store) = self.get_synonyms(tenant_id) {
@@ -747,12 +762,7 @@ impl IndexManager {
             let mut facet_keys: Vec<String> = facet_reqs.iter().map(|r| r.field.clone()).collect();
             facet_keys.sort();
             let filter_hash = filter.map(|f| format!("{:?}", f)).unwrap_or_default();
-            let cache_key = format!(
-                "{}:{}:{}",
-                tenant_id,
-                filter_hash,
-                facet_keys.join(",")
-            );
+            let cache_key = format!("{}:{}:{}", tenant_id, filter_hash, facet_keys.join(","));
             let cached_result = self.facet_cache.get(&cache_key).and_then(|cached| {
                 let (timestamp, count, facets_map) = cached.as_ref();
                 if timestamp.elapsed() < std::time::Duration::from_secs(5) {
@@ -1003,14 +1013,20 @@ impl IndexManager {
                 .filter(|id| all_results.iter().any(|d| &d.document.id == *id))
                 .count();
             total = total.saturating_sub(hidden_count);
-            (docs, effects.user_data.clone(), effects.applied_rules.clone())
+            (
+                docs,
+                effects.user_data.clone(),
+                effects.applied_rules.clone(),
+            )
         } else {
             (page_results, Vec::new(), Vec::new())
         };
 
         // removeWordsIfNoResults: retry with fewer words if we got 0 results
         let remove_strategy = remove_words_override
-            .or(settings.as_ref().map(|s| s.remove_words_if_no_results.as_str()))
+            .or(settings
+                .as_ref()
+                .map(|s| s.remove_words_if_no_results.as_str()))
             .unwrap_or("none");
 
         if total == 0
@@ -1021,16 +1037,12 @@ impl IndexManager {
             let words: Vec<&str> = query_text.split_whitespace().collect();
             if words.len() > 1 {
                 let fallback_queries: Vec<String> = match remove_strategy {
-                    "lastWords" => {
-                        (1..words.len())
-                            .map(|drop| words[..words.len() - drop].join(" "))
-                            .collect()
-                    }
-                    "firstWords" => {
-                        (1..words.len())
-                            .map(|drop| words[drop..].join(" "))
-                            .collect()
-                    }
+                    "lastWords" => (1..words.len())
+                        .map(|drop| words[..words.len() - drop].join(" "))
+                        .collect(),
+                    "firstWords" => (1..words.len())
+                        .map(|drop| words[drop..].join(" "))
+                        .collect(),
                     _ => vec![],
                 };
                 for fallback_q in fallback_queries {

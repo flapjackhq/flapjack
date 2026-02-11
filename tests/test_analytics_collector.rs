@@ -68,7 +68,10 @@ fn record_search_stores_in_buffer() {
 
     // Check files were written
     let searches_dir = tmp.path().join("products").join("searches");
-    assert!(searches_dir.exists(), "Search parquet dir should exist after flush");
+    assert!(
+        searches_dir.exists(),
+        "Search parquet dir should exist after flush"
+    );
 }
 
 #[test]
@@ -84,10 +87,7 @@ fn auto_flush_at_threshold() {
 
     // Files should already exist (auto-flushed at threshold)
     let searches_dir = tmp.path().join("products").join("searches");
-    assert!(
-        searches_dir.exists(),
-        "Should auto-flush at threshold"
-    );
+    assert!(searches_dir.exists(), "Should auto-flush at threshold");
 }
 
 #[test]

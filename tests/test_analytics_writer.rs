@@ -88,7 +88,10 @@ fn write_search_events_creates_parquet_file() {
         })
         .collect();
     assert_eq!(entries.len(), 1, "Should have 1 parquet file");
-    assert!(entries[0].metadata().unwrap().len() > 0, "File should not be empty");
+    assert!(
+        entries[0].metadata().unwrap().len() > 0,
+        "File should not be empty"
+    );
 }
 
 #[test]
@@ -246,7 +249,7 @@ async fn no_results_searches_returns_zero_hit_queries() {
 
     let searches = result["searches"].as_array().unwrap();
     assert_eq!(searches.len(), 2); // "missing" and "also_missing"
-    // "missing" has count=2, should be first
+                                   // "missing" has count=2, should be first
     assert_eq!(searches[0]["search"], "missing");
     assert_eq!(searches[0]["count"], 2);
 }

@@ -167,13 +167,7 @@ mod compact_index {
         // Delete most docs
         mgr.delete_documents_sync(
             "test",
-            vec![
-                "1".into(),
-                "2".into(),
-                "3".into(),
-                "4".into(),
-                "5".into(),
-            ],
+            vec!["1".into(), "2".into(), "3".into(), "4".into(), "5".into()],
         )
         .await
         .unwrap();

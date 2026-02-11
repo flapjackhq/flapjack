@@ -9,9 +9,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use super::schema::{
-    insight_event_schema, search_event_schema, InsightEvent, SearchEvent,
-};
+use super::schema::{insight_event_schema, search_event_schema, InsightEvent, SearchEvent};
 
 /// Write search events to a Parquet file with ZSTD compression.
 pub fn flush_search_events(events: &[SearchEvent], dir: &Path) -> Result<(), String> {

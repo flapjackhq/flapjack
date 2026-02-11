@@ -87,17 +87,31 @@ async fn test_add_record_auto_id() {
         .await
         .unwrap();
 
-    assert!(res.status().is_success(), "POST /indexes/products returned {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "POST /indexes/products returned {}",
+        res.status()
+    );
     let body: serde_json::Value = res.json().await.unwrap();
 
     // Must return objectID, taskID, createdAt
-    assert!(body.get("objectID").is_some(), "missing objectID in response");
+    assert!(
+        body.get("objectID").is_some(),
+        "missing objectID in response"
+    );
     assert!(body.get("taskID").is_some(), "missing taskID in response");
-    assert!(body.get("createdAt").is_some(), "missing createdAt in response");
+    assert!(
+        body.get("createdAt").is_some(),
+        "missing createdAt in response"
+    );
 
     // objectID should be a valid UUID
     let oid = body["objectID"].as_str().unwrap();
-    assert!(uuid::Uuid::parse_str(oid).is_ok(), "objectID is not a UUID: {}", oid);
+    assert!(
+        uuid::Uuid::parse_str(oid).is_ok(),
+        "objectID is not a UUID: {}",
+        oid
+    );
 
     // Verify the record was actually stored by fetching it
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -110,7 +124,11 @@ async fn test_add_record_auto_id() {
         .await
         .unwrap();
 
-    assert!(res.status().is_success(), "GET object returned {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "GET object returned {}",
+        res.status()
+    );
     let obj: serde_json::Value = res.json().await.unwrap();
     assert_eq!(obj["objectID"], oid);
     assert_eq!(obj["name"], "Widget");
@@ -150,7 +168,11 @@ async fn test_partial_update_existing() {
         .await
         .unwrap();
 
-    assert!(res.status().is_success(), "partial update returned {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "partial update returned {}",
+        res.status()
+    );
     let body: serde_json::Value = res.json().await.unwrap();
     assert_eq!(body["objectID"], "p1");
     assert!(body.get("updatedAt").is_some());
@@ -166,7 +188,10 @@ async fn test_partial_update_existing() {
 
     assert!(res.status().is_success());
     let obj: serde_json::Value = res.json().await.unwrap();
-    assert_eq!(obj["name"], "Laptop", "name should be preserved after partial update");
+    assert_eq!(
+        obj["name"], "Laptop",
+        "name should be preserved after partial update"
+    );
     assert_eq!(obj["price"], 799, "price should be updated");
 }
 
@@ -200,7 +225,10 @@ async fn test_partial_update_creates_when_missing() {
         .await
         .unwrap();
 
-    assert!(res.status().is_success(), "object should exist after partial update create");
+    assert!(
+        res.status().is_success(),
+        "object should exist after partial update create"
+    );
     let obj: serde_json::Value = res.json().await.unwrap();
     assert_eq!(obj["objectID"], "new-item");
     assert_eq!(obj["name"], "New Widget");
@@ -240,7 +268,11 @@ async fn test_partial_update_noop_when_missing() {
         .await
         .unwrap();
 
-    assert_eq!(res.status(), 404, "object should not exist when createIfNotExists=false");
+    assert_eq!(
+        res.status(),
+        404,
+        "object should not exist when createIfNotExists=false"
+    );
 }
 
 /// Batch addObject without objectID should auto-generate a UUID
@@ -338,7 +370,12 @@ async fn test_settings_roundtrip() {
     let base = format!("http://{}", addr);
 
     // Create index
-    seed_index(&base, "products", vec![json!({"objectID": "1", "name": "A"})]).await;
+    seed_index(
+        &base,
+        "products",
+        vec![json!({"objectID": "1", "name": "A"})],
+    )
+    .await;
 
     // PUT settings
     let res = h(client.put(format!("{}/1/indexes/products/settings", base)))
@@ -358,8 +395,14 @@ async fn test_settings_roundtrip() {
         .unwrap();
     assert!(res.status().is_success(), "GET settings: {}", res.status());
     let settings: serde_json::Value = res.json().await.unwrap();
-    assert!(settings.get("searchableAttributes").is_some(), "searchableAttributes missing");
-    assert!(settings.get("attributesForFaceting").is_some(), "attributesForFaceting missing");
+    assert!(
+        settings.get("searchableAttributes").is_some(),
+        "searchableAttributes missing"
+    );
+    assert!(
+        settings.get("attributesForFaceting").is_some(),
+        "attributesForFaceting missing"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -400,7 +443,10 @@ async fn test_put_object_replaces_fully() {
     let obj: serde_json::Value = res.json().await.unwrap();
     assert_eq!(obj["name"], "Laptop Pro");
     assert_eq!(obj["price"], 1299);
-    assert!(obj.get("brand").is_none(), "brand should be gone after full PUT replace");
+    assert!(
+        obj.get("brand").is_none(),
+        "brand should be gone after full PUT replace"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -540,7 +586,11 @@ async fn test_list_indices() {
     let body: serde_json::Value = res.json().await.unwrap();
     let items = body["items"].as_array().unwrap();
     let names: Vec<&str> = items.iter().filter_map(|i| i["name"].as_str()).collect();
-    assert!(names.contains(&"alpha"), "should list alpha, got {:?}", names);
+    assert!(
+        names.contains(&"alpha"),
+        "should list alpha, got {:?}",
+        names
+    );
     assert!(names.contains(&"beta"), "should list beta, got {:?}", names);
 }
 
@@ -622,8 +672,18 @@ async fn test_multi_index_search() {
     let client = algolia_client();
     let base = format!("http://{}", addr);
 
-    seed_index(&base, "products", vec![json!({"objectID": "1", "name": "Laptop"})]).await;
-    seed_index(&base, "articles", vec![json!({"objectID": "1", "name": "Review"})]).await;
+    seed_index(
+        &base,
+        "products",
+        vec![json!({"objectID": "1", "name": "Laptop"})],
+    )
+    .await;
+    seed_index(
+        &base,
+        "articles",
+        vec![json!({"objectID": "1", "name": "Review"})],
+    )
+    .await;
 
     let res = h(client.post(format!("{}/1/indexes/*/queries", base)))
         .json(&json!({
@@ -635,7 +695,11 @@ async fn test_multi_index_search() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "multi-index search: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "multi-index search: {}",
+        res.status()
+    );
     let body: serde_json::Value = res.json().await.unwrap();
     let results = body["results"].as_array().unwrap();
     assert_eq!(results.len(), 2, "should return 2 result sets");
@@ -651,8 +715,18 @@ async fn test_multi_index_get_objects() {
     let client = algolia_client();
     let base = format!("http://{}", addr);
 
-    seed_index(&base, "products", vec![json!({"objectID": "p1", "name": "Laptop"})]).await;
-    seed_index(&base, "articles", vec![json!({"objectID": "a1", "name": "Review"})]).await;
+    seed_index(
+        &base,
+        "products",
+        vec![json!({"objectID": "p1", "name": "Laptop"})],
+    )
+    .await;
+    seed_index(
+        &base,
+        "articles",
+        vec![json!({"objectID": "a1", "name": "Review"})],
+    )
+    .await;
 
     let res = h(client.post(format!("{}/1/indexes/products/objects", base)))
         .json(&json!({
@@ -664,7 +738,11 @@ async fn test_multi_index_get_objects() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "multi-index getObjects: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "multi-index getObjects: {}",
+        res.status()
+    );
     let body: serde_json::Value = res.json().await.unwrap();
     let results = body["results"].as_array().unwrap();
     assert_eq!(results.len(), 2);
@@ -682,7 +760,12 @@ async fn test_synonyms_crud() {
     let client = algolia_client();
     let base = format!("http://{}", addr);
 
-    seed_index(&base, "products", vec![json!({"objectID": "1", "name": "TV"})]).await;
+    seed_index(
+        &base,
+        "products",
+        vec![json!({"objectID": "1", "name": "TV"})],
+    )
+    .await;
 
     // Save synonym via PUT
     let res = h(client.put(format!("{}/1/indexes/products/synonyms/syn1", base)))
@@ -711,7 +794,11 @@ async fn test_synonyms_crud() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "search synonyms: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "search synonyms: {}",
+        res.status()
+    );
     let body: serde_json::Value = res.json().await.unwrap();
     assert!(body.get("hits").is_some() || body.get("nbHits").is_some());
 
@@ -720,7 +807,11 @@ async fn test_synonyms_crud() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "DELETE synonym: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "DELETE synonym: {}",
+        res.status()
+    );
 
     // Verify gone
     let res = h(client.get(format!("{}/1/indexes/products/synonyms/syn1", base)))
@@ -740,7 +831,12 @@ async fn test_synonyms_batch_and_clear() {
     let client = algolia_client();
     let base = format!("http://{}", addr);
 
-    seed_index(&base, "products", vec![json!({"objectID": "1", "name": "TV"})]).await;
+    seed_index(
+        &base,
+        "products",
+        vec![json!({"objectID": "1", "name": "TV"})],
+    )
+    .await;
 
     // Batch save
     let res = h(client.post(format!("{}/1/indexes/products/synonyms/batch", base)))
@@ -751,7 +847,11 @@ async fn test_synonyms_batch_and_clear() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "batch synonyms: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "batch synonyms: {}",
+        res.status()
+    );
 
     // Verify they exist
     let res = h(client.get(format!("{}/1/indexes/products/synonyms/s1", base)))
@@ -765,7 +865,11 @@ async fn test_synonyms_batch_and_clear() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "clear synonyms: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "clear synonyms: {}",
+        res.status()
+    );
 
     // Verify cleared
     let res = h(client.get(format!("{}/1/indexes/products/synonyms/s1", base)))
@@ -785,7 +889,12 @@ async fn test_rules_crud() {
     let client = algolia_client();
     let base = format!("http://{}", addr);
 
-    seed_index(&base, "products", vec![json!({"objectID": "1", "name": "Laptop"})]).await;
+    seed_index(
+        &base,
+        "products",
+        vec![json!({"objectID": "1", "name": "Laptop"})],
+    )
+    .await;
 
     // Save rule via PUT
     let res = h(client.put(format!("{}/1/indexes/products/rules/rule1", base)))
@@ -843,7 +952,12 @@ async fn test_rules_batch_and_clear() {
     let client = algolia_client();
     let base = format!("http://{}", addr);
 
-    seed_index(&base, "products", vec![json!({"objectID": "1", "name": "X"})]).await;
+    seed_index(
+        &base,
+        "products",
+        vec![json!({"objectID": "1", "name": "X"})],
+    )
+    .await;
 
     let res = h(client.post(format!("{}/1/indexes/products/rules/batch", base)))
         .json(&json!([
@@ -946,16 +1060,25 @@ async fn test_search_response_format() {
     assert!(body.get("page").is_some(), "missing 'page'");
     assert!(body.get("nbPages").is_some(), "missing 'nbPages'");
     assert!(body.get("hitsPerPage").is_some(), "missing 'hitsPerPage'");
-    assert!(body.get("processingTimeMS").is_some(), "missing 'processingTimeMS'");
+    assert!(
+        body.get("processingTimeMS").is_some(),
+        "missing 'processingTimeMS'"
+    );
     assert!(body.get("query").is_some(), "missing 'query'");
     assert!(body.get("params").is_some(), "missing 'params'");
-    assert!(body.get("exhaustiveNbHits").is_some(), "missing 'exhaustiveNbHits'");
+    assert!(
+        body.get("exhaustiveNbHits").is_some(),
+        "missing 'exhaustiveNbHits'"
+    );
 
     // Verify hits contain objectID and _highlightResult
     let hits = body["hits"].as_array().unwrap();
     assert!(!hits.is_empty(), "should have at least 1 hit");
     assert!(hits[0].get("objectID").is_some(), "hit missing objectID");
-    assert!(hits[0].get("_highlightResult").is_some(), "hit missing _highlightResult");
+    assert!(
+        hits[0].get("_highlightResult").is_some(),
+        "hit missing _highlightResult"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -1350,7 +1473,10 @@ async fn test_snippet_result_basic() {
 
     let desc_snippet = &snippet["description"];
     assert!(desc_snippet.is_object(), "description snippet should exist");
-    assert!(desc_snippet["value"].is_string(), "snippet value should be string");
+    assert!(
+        desc_snippet["value"].is_string(),
+        "snippet value should be string"
+    );
 
     let snippet_value = desc_snippet["value"].as_str().unwrap();
     // Snippet should be truncated (shorter than full description) and have highlight tags
@@ -1394,8 +1520,14 @@ async fn test_snippet_with_highlight() {
     let hit = &body["hits"][0];
 
     // Both should be present
-    assert!(hit["_highlightResult"].is_object(), "_highlightResult should exist");
-    assert!(hit["_snippetResult"].is_object(), "_snippetResult should exist");
+    assert!(
+        hit["_highlightResult"].is_object(),
+        "_highlightResult should exist"
+    );
+    assert!(
+        hit["_snippetResult"].is_object(),
+        "_snippetResult should exist"
+    );
 
     let snippet = &hit["_snippetResult"]["description"];
     assert_eq!(
@@ -1473,7 +1605,10 @@ async fn test_query_type_prefix_last() {
         .await
         .unwrap();
     let body: serde_json::Value = res.json().await.unwrap();
-    assert!(body["nbHits"].as_u64().unwrap() > 0, "prefixLast: 'lap' should match Laptop");
+    assert!(
+        body["nbHits"].as_u64().unwrap() > 0,
+        "prefixLast: 'lap' should match Laptop"
+    );
 }
 
 #[tokio::test]
@@ -1499,7 +1634,11 @@ async fn test_query_type_prefix_none() {
         .await
         .unwrap();
     let body: serde_json::Value = res.json().await.unwrap();
-    assert_eq!(body["nbHits"].as_u64().unwrap(), 0, "prefixNone: 'lap' should NOT match");
+    assert_eq!(
+        body["nbHits"].as_u64().unwrap(),
+        0,
+        "prefixNone: 'lap' should NOT match"
+    );
 }
 
 #[tokio::test]
@@ -1511,9 +1650,7 @@ async fn test_query_type_prefix_all() {
     seed_index(
         &base,
         "products",
-        vec![
-            json!({"objectID": "1", "name": "Laptop Pro Max"}),
-        ],
+        vec![json!({"objectID": "1", "name": "Laptop Pro Max"})],
     )
     .await;
 
@@ -1524,7 +1661,10 @@ async fn test_query_type_prefix_all() {
         .await
         .unwrap();
     let body: serde_json::Value = res.json().await.unwrap();
-    assert!(body["nbHits"].as_u64().unwrap() > 0, "prefixAll: 'lap pro' should match 'Laptop Pro Max'");
+    assert!(
+        body["nbHits"].as_u64().unwrap() > 0,
+        "prefixAll: 'lap pro' should match 'Laptop Pro Max'"
+    );
 }
 
 // ── typoTolerance Tests ─────────────────────────────────────────────────
@@ -1549,7 +1689,10 @@ async fn test_typo_tolerance_default() {
         .await
         .unwrap();
     let body: serde_json::Value = res.json().await.unwrap();
-    assert!(body["nbHits"].as_u64().unwrap() > 0, "fuzzy default: 'latop' should match 'laptop'");
+    assert!(
+        body["nbHits"].as_u64().unwrap() > 0,
+        "fuzzy default: 'latop' should match 'laptop'"
+    );
 }
 
 #[tokio::test]
@@ -1572,7 +1715,11 @@ async fn test_typo_tolerance_false() {
         .await
         .unwrap();
     let body: serde_json::Value = res.json().await.unwrap();
-    assert_eq!(body["nbHits"].as_u64().unwrap(), 0, "typoTolerance=false: 'latop' should NOT match");
+    assert_eq!(
+        body["nbHits"].as_u64().unwrap(),
+        0,
+        "typoTolerance=false: 'latop' should NOT match"
+    );
 }
 
 #[tokio::test]
@@ -1595,7 +1742,10 @@ async fn test_typo_tolerance_true_explicit() {
         .await
         .unwrap();
     let body: serde_json::Value = res.json().await.unwrap();
-    assert!(body["nbHits"].as_u64().unwrap() > 0, "typoTolerance=true: 'latop' should match");
+    assert!(
+        body["nbHits"].as_u64().unwrap() > 0,
+        "typoTolerance=true: 'latop' should match"
+    );
 }
 
 // ── advancedSyntax Tests ────────────────────────────────────────────────
@@ -1629,7 +1779,11 @@ async fn test_advanced_syntax_exclusion() {
     // Should find laptops but NOT desktop
     for hit in hits {
         let name = hit["name"].as_str().unwrap_or("");
-        assert!(!name.to_lowercase().contains("desktop"), "desktop should be excluded: {}", name);
+        assert!(
+            !name.to_lowercase().contains("desktop"),
+            "desktop should be excluded: {}",
+            name
+        );
     }
 }
 
@@ -1662,7 +1816,10 @@ async fn test_advanced_syntax_exact_phrase() {
     if !hits.is_empty() {
         // At minimum, item 1 should be in results
         let ids: Vec<&str> = hits.iter().filter_map(|h| h["objectID"].as_str()).collect();
-        assert!(ids.contains(&"1"), "item with 'Blue Wireless Earbuds' should match exact phrase");
+        assert!(
+            ids.contains(&"1"),
+            "item with 'Blue Wireless Earbuds' should match exact phrase"
+        );
     }
 }
 
@@ -1721,7 +1878,10 @@ async fn test_remove_words_last_words() {
         .await
         .unwrap();
     let body: serde_json::Value = res.json().await.unwrap();
-    assert!(body["nbHits"].as_u64().unwrap() > 0, "lastWords should find results after dropping last word");
+    assert!(
+        body["nbHits"].as_u64().unwrap() > 0,
+        "lastWords should find results after dropping last word"
+    );
 }
 
 #[tokio::test]
@@ -1733,9 +1893,7 @@ async fn test_remove_words_first_words() {
     seed_index(
         &base,
         "products",
-        vec![
-            json!({"objectID": "1", "name": "Laptop"}),
-        ],
+        vec![json!({"objectID": "1", "name": "Laptop"})],
     )
     .await;
 
@@ -1749,7 +1907,10 @@ async fn test_remove_words_first_words() {
         .await
         .unwrap();
     let body: serde_json::Value = res.json().await.unwrap();
-    assert!(body["nbHits"].as_u64().unwrap() > 0, "firstWords should find results after dropping first word");
+    assert!(
+        body["nbHits"].as_u64().unwrap() > 0,
+        "firstWords should find results after dropping first word"
+    );
 }
 
 #[tokio::test]
@@ -1772,7 +1933,11 @@ async fn test_remove_words_none_default() {
         .await
         .unwrap();
     let body: serde_json::Value = res.json().await.unwrap();
-    assert_eq!(body["nbHits"].as_u64().unwrap(), 0, "default: no fallback, 0 results");
+    assert_eq!(
+        body["nbHits"].as_u64().unwrap(),
+        0,
+        "default: no fallback, 0 results"
+    );
 }
 
 // ── Highlight Custom Tags Test ──────────────────────────────────────────
@@ -1805,9 +1970,21 @@ async fn test_highlight_custom_tags() {
 
     let highlight = &hits[0]["_highlightResult"]["name"]["value"];
     let hl_str = highlight.as_str().unwrap();
-    assert!(hl_str.contains("<b>"), "should use custom pre tag: {}", hl_str);
-    assert!(hl_str.contains("</b>"), "should use custom post tag: {}", hl_str);
-    assert!(!hl_str.contains("<em>"), "should NOT use default em tag: {}", hl_str);
+    assert!(
+        hl_str.contains("<b>"),
+        "should use custom pre tag: {}",
+        hl_str
+    );
+    assert!(
+        hl_str.contains("</b>"),
+        "should use custom post tag: {}",
+        hl_str
+    );
+    assert!(
+        !hl_str.contains("<em>"),
+        "should NOT use default em tag: {}",
+        hl_str
+    );
 }
 
 // ── Browse Cursor Pagination Test ───────────────────────────────────────
@@ -1857,9 +2034,15 @@ async fn test_browse_pagination_cursor() {
 
     // IDs should be different from page 1
     let page1_ids: Vec<&str> = hits.iter().filter_map(|h| h["objectID"].as_str()).collect();
-    let page2_ids: Vec<&str> = hits2.iter().filter_map(|h| h["objectID"].as_str()).collect();
+    let page2_ids: Vec<&str> = hits2
+        .iter()
+        .filter_map(|h| h["objectID"].as_str())
+        .collect();
     for id in &page2_ids {
-        assert!(!page1_ids.contains(id), "page 2 should have different IDs than page 1");
+        assert!(
+            !page1_ids.contains(id),
+            "page 2 should have different IDs than page 1"
+        );
     }
 }
 

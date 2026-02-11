@@ -171,7 +171,9 @@ pub async fn set_settings(
         serde_json::to_value(&settings).unwrap_or_default(),
     );
 
-    let noop_task = state.manager.make_noop_task(&index_name)
+    let noop_task = state
+        .manager
+        .make_noop_task(&index_name)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let response = SetSettingsResponse {
         updated_at: chrono::Utc::now().to_rfc3339(),

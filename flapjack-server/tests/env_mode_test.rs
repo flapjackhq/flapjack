@@ -5,7 +5,8 @@ use predicates::str::contains;
 
 #[test]
 fn production_mode_rejects_missing_key() {
-    Command::cargo_bin("flapjack-server").unwrap()
+    Command::cargo_bin("flapjack-server")
+        .unwrap()
         .env("FLAPJACK_ENV", "production")
         .env_remove("FLAPJACK_ADMIN_KEY")
         .assert()
@@ -18,7 +19,8 @@ fn production_mode_rejects_missing_key() {
 
 #[test]
 fn production_mode_rejects_short_key() {
-    Command::cargo_bin("flapjack-server").unwrap()
+    Command::cargo_bin("flapjack-server")
+        .unwrap()
         .env("FLAPJACK_ENV", "production")
         .env("FLAPJACK_ADMIN_KEY", "tooshort")
         .assert()
@@ -29,7 +31,8 @@ fn production_mode_rejects_short_key() {
 
 #[test]
 fn development_mode_allows_missing_key() {
-    Command::cargo_bin("flapjack-server").unwrap()
+    Command::cargo_bin("flapjack-server")
+        .unwrap()
         .env("FLAPJACK_ENV", "development")
         .env_remove("FLAPJACK_ADMIN_KEY")
         .env("FLAPJACK_BIND_ADDR", "127.0.0.1:17798")
@@ -41,7 +44,8 @@ fn development_mode_allows_missing_key() {
 
 #[test]
 fn production_mode_accepts_valid_key() {
-    Command::cargo_bin("flapjack-server").unwrap()
+    Command::cargo_bin("flapjack-server")
+        .unwrap()
         .env("FLAPJACK_ENV", "production")
         .env("FLAPJACK_ADMIN_KEY", "abcdef0123456789")
         .env("FLAPJACK_BIND_ADDR", "127.0.0.1:17799")

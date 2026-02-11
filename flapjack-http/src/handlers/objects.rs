@@ -139,13 +139,8 @@ fn merge_partial_update(
                 }
                 if is_operation(v) {
                     let obj = v.as_object().unwrap();
-                    let op = obj
-                        .get("_operation")
-                        .and_then(|o| o.as_str())
-                        .unwrap_or("");
-                    let op_value = obj
-                        .get("value")
-                        .unwrap_or(&serde_json::Value::Null);
+                    let op = obj.get("_operation").and_then(|o| o.as_str()).unwrap_or("");
+                    let op_value = obj.get("value").unwrap_or(&serde_json::Value::Null);
                     if let Some(new_val) = apply_operation(fields.get(k), op, op_value) {
                         fields.insert(k.clone(), new_val);
                     }
@@ -175,13 +170,8 @@ fn merge_partial_update(
                 }
                 if is_operation(v) {
                     let obj = v.as_object().unwrap();
-                    let op = obj
-                        .get("_operation")
-                        .and_then(|o| o.as_str())
-                        .unwrap_or("");
-                    let op_value = obj
-                        .get("value")
-                        .unwrap_or(&serde_json::Value::Null);
+                    let op = obj.get("_operation").and_then(|o| o.as_str()).unwrap_or("");
+                    let op_value = obj.get("value").unwrap_or(&serde_json::Value::Null);
                     if let Some(new_val) = apply_operation(None, op, op_value) {
                         fields_from_ops.insert(k.clone(), new_val);
                     }

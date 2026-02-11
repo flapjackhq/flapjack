@@ -9,7 +9,7 @@ use super::schema::{InsightEvent, SearchEvent};
 /// Default search queries for when we don't know the index content.
 const DEFAULT_QUERIES: &[(&str, u32, bool)] = &[
     // (query, approx_hits, has_results)
-    ("", 500, true),              // Browse / empty query
+    ("", 500, true), // Browse / empty query
     ("shoes", 42, true),
     ("blue dress", 18, true),
     ("laptop", 35, true),
@@ -157,7 +157,9 @@ struct Rng {
 
 impl Rng {
     fn new(seed: u32) -> Self {
-        Self { state: if seed == 0 { 1 } else { seed } }
+        Self {
+            state: if seed == 0 { 1 } else { seed },
+        }
     }
 
     fn next_u32(&mut self) -> u32 {
@@ -176,7 +178,9 @@ impl Rng {
 
     /// Returns a value in [lo, hi].
     fn range(&mut self, lo: u32, hi: u32) -> u32 {
-        if lo >= hi { return lo; }
+        if lo >= hi {
+            return lo;
+        }
         lo + (self.next_u32() % (hi - lo + 1))
     }
 
@@ -209,8 +213,11 @@ fn queries_for_index(index_name: &str) -> &'static [(&'static str, u32, bool)] {
     let lower = index_name.to_lowercase();
     if lower.contains("movie") || lower.contains("film") || lower.contains("tmdb") {
         MOVIE_QUERIES
-    } else if lower.contains("product") || lower.contains("bestbuy") || lower.contains("shop")
-        || lower.contains("ecommerce") || lower.contains("commerce")
+    } else if lower.contains("product")
+        || lower.contains("bestbuy")
+        || lower.contains("shop")
+        || lower.contains("ecommerce")
+        || lower.contains("commerce")
     {
         PRODUCT_QUERIES
     } else {
@@ -220,12 +227,16 @@ fn queries_for_index(index_name: &str) -> &'static [(&'static str, u32, bool)] {
 
 /// Generate user tokens.
 fn generate_users(rng: &mut Rng, count: usize) -> Vec<String> {
-    (0..count).map(|_| format!("user-{:08x}", rng.next_u32())).collect()
+    (0..count)
+        .map(|_| format!("user-{:08x}", rng.next_u32()))
+        .collect()
 }
 
 /// Generate object IDs for click targets.
 fn generate_object_ids(rng: &mut Rng, count: usize) -> Vec<String> {
-    (0..count).map(|_| format!("obj-{:06x}", rng.next_u32() % 0xffffff)).collect()
+    (0..count)
+        .map(|_| format!("obj-{:06x}", rng.next_u32() % 0xffffff))
+        .collect()
 }
 
 /// Result of seeding analytics data.
@@ -247,7 +258,9 @@ pub fn seed_analytics(
 ) -> Result<SeedResult, String> {
     let queries = queries_for_index(index_name);
     let mut rng = Rng::new(
-        index_name.bytes().fold(42u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32)),
+        index_name
+            .bytes()
+            .fold(42u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32)),
     );
 
     let users = generate_users(&mut rng, 350);
@@ -414,10 +427,10 @@ pub fn seed_analytics(
 fn generate_time_of_day_ms(rng: &mut Rng) -> i64 {
     // Hour distribution weights (0-23)
     let hour_weights: [f64; 24] = [
-        0.01, 0.005, 0.003, 0.003, 0.005, 0.01,  // 0-5am: very low
-        0.02, 0.04, 0.06, 0.08, 0.09, 0.09,      // 6-11am: ramp up
-        0.08, 0.07, 0.06, 0.05, 0.05, 0.06,      // 12-5pm: afternoon
-        0.07, 0.08, 0.07, 0.05, 0.03, 0.02,      // 6-11pm: evening peak then drop
+        0.01, 0.005, 0.003, 0.003, 0.005, 0.01, // 0-5am: very low
+        0.02, 0.04, 0.06, 0.08, 0.09, 0.09, // 6-11am: ramp up
+        0.08, 0.07, 0.06, 0.05, 0.05, 0.06, // 12-5pm: afternoon
+        0.07, 0.08, 0.07, 0.05, 0.03, 0.02, // 6-11pm: evening peak then drop
     ];
 
     let hour = rng.weighted_pick(&hour_weights) as i64;
@@ -431,7 +444,9 @@ fn generate_time_of_day_ms(rng: &mut Rng) -> i64 {
 /// Generate a realistic click position (1-indexed).
 /// ~40% pos 1, ~20% pos 2, ~15% pos 3, tapering off.
 fn generate_click_position(rng: &mut Rng) -> u32 {
-    let weights = [0.40, 0.20, 0.12, 0.08, 0.06, 0.04, 0.03, 0.02, 0.02, 0.01, 0.01, 0.01];
+    let weights = [
+        0.40, 0.20, 0.12, 0.08, 0.06, 0.04, 0.03, 0.02, 0.02, 0.01, 0.01, 0.01,
+    ];
     (rng.weighted_pick(&weights) + 1) as u32
 }
 
@@ -577,7 +592,9 @@ fn write_insight_events_to_partition(
     let mut currency = StringBuilder::with_capacity(len, len * 3);
 
     for e in events {
-        let ts = e.timestamp.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        let ts = e
+            .timestamp
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
         timestamp_ms.append_value(ts);
         event_type.append_value(&e.event_type);
         match &e.event_subtype {

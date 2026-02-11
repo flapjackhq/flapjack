@@ -34,7 +34,7 @@ fn ignore_plurals_is_default(v: &IgnorePluralsValue) -> bool {
     matches!(v, IgnorePluralsValue::Disabled)
 }
 
-fn vec_is_empty(v: &Vec<String>) -> bool {
+fn vec_is_empty(v: &[String]) -> bool {
     v.is_empty()
 }
 

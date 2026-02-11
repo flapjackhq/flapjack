@@ -199,8 +199,7 @@ impl QueryParser {
     pub fn parse(&self, query: &Query) -> Result<Box<dyn TantivyQuery>> {
         // Advanced syntax: extract "phrases" and -exclusions before normal parsing
         if self.advanced_syntax {
-            let (phrases, exclusions, remaining) =
-                Self::preprocess_advanced_syntax(&query.text);
+            let (phrases, exclusions, remaining) = Self::preprocess_advanced_syntax(&query.text);
             if !phrases.is_empty() || !exclusions.is_empty() {
                 return self.parse_with_advanced_syntax(
                     &remaining,
@@ -360,7 +359,14 @@ impl QueryParser {
                 let term_text = format!("{}\0s{}", path, token);
                 let term = tantivy::Term::from_field_text(target_field, &term_text);
 
-                let distance = if self.typo_tolerance && token.len() >= self.min_word_size_for_1_typo && path_idx < max_fuzzy_paths { 1 } else { 0 };
+                let distance = if self.typo_tolerance
+                    && token.len() >= self.min_word_size_for_1_typo
+                    && path_idx < max_fuzzy_paths
+                {
+                    1
+                } else {
+                    0
+                };
                 tracing::trace!(
                     "[PARSER] token='{}' path='{}' is_prefix={} field={:?}",
                     token,
@@ -385,24 +391,37 @@ impl QueryParser {
                     } else {
                         term
                     };
-                    let fuzzy = Box::new(tantivy::query::FuzzyTermQuery::new(fuzzy_term, distance, true));
+                    let fuzzy = Box::new(tantivy::query::FuzzyTermQuery::new(
+                        fuzzy_term, distance, true,
+                    ));
                     let mut clauses: Vec<(tantivy::query::Occur, Box<dyn TantivyQuery>)> = vec![
-                        (tantivy::query::Occur::Should, exact as Box<dyn TantivyQuery>),
-                        (tantivy::query::Occur::Should, fuzzy as Box<dyn TantivyQuery>),
+                        (
+                            tantivy::query::Occur::Should,
+                            exact as Box<dyn TantivyQuery>,
+                        ),
+                        (
+                            tantivy::query::Occur::Should,
+                            fuzzy as Box<dyn TantivyQuery>,
+                        ),
                     ];
                     // First-char error fallback: strip the first character and
                     // prefix-match the remainder on the n-gram index.  Algolia
                     // handles first-character typos this way — e.g. "lsha" →
                     // "sha" matches "shades".
                     if is_prefix && token.len() >= 4 {
-                        let stripped = &token[token.char_indices().nth(1).map(|(i, _)| i).unwrap_or(1)..];
+                        let stripped =
+                            &token[token.char_indices().nth(1).map(|(i, _)| i).unwrap_or(1)..];
                         if stripped.len() >= 3 {
                             let stripped_term_text = format!("{}\0s{}", path, stripped);
-                            let stripped_term = tantivy::Term::from_field_text(json_search_field, &stripped_term_text);
-                            let stripped_q: Box<dyn TantivyQuery> = Box::new(tantivy::query::TermQuery::new(
-                                stripped_term,
-                                tantivy::schema::IndexRecordOption::WithFreqsAndPositions,
-                            ));
+                            let stripped_term = tantivy::Term::from_field_text(
+                                json_search_field,
+                                &stripped_term_text,
+                            );
+                            let stripped_q: Box<dyn TantivyQuery> =
+                                Box::new(tantivy::query::TermQuery::new(
+                                    stripped_term,
+                                    tantivy::schema::IndexRecordOption::WithFreqsAndPositions,
+                                ));
                             clauses.push((tantivy::query::Occur::Should, stripped_q));
                         }
                     }
@@ -542,7 +561,9 @@ impl QueryParser {
 
         // Phrase queries: all words in the phrase must match (exact, on same field paths)
         for phrase in phrases {
-            let words: Vec<String> = phrase.to_lowercase().split_whitespace()
+            let words: Vec<String> = phrase
+                .to_lowercase()
+                .split_whitespace()
                 .map(|s| s.to_string())
                 .collect();
             if words.is_empty() {
@@ -556,8 +577,10 @@ impl QueryParser {
                 for (path_idx, path) in self.searchable_paths.iter().enumerate() {
                     let term_text = format!("{}\0s{}", path, word);
                     let term = tantivy::Term::from_field_text(exact_field, &term_text);
-                    let tq: Box<dyn TantivyQuery> =
-                        Box::new(tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::WithFreqs));
+                    let tq: Box<dyn TantivyQuery> = Box::new(tantivy::query::TermQuery::new(
+                        term,
+                        tantivy::schema::IndexRecordOption::WithFreqs,
+                    ));
                     let weight = self.weights.get(path_idx).copied().unwrap_or(1.0);
                     field_queries.push((
                         tantivy::query::Occur::Should,
@@ -578,13 +601,14 @@ impl QueryParser {
         // Exclusion queries: MustNot for each excluded term
         for exclusion in exclusions {
             let word = exclusion.to_lowercase();
-            let mut field_queries: Vec<(tantivy::query::Occur, Box<dyn TantivyQuery>)> =
-                Vec::new();
+            let mut field_queries: Vec<(tantivy::query::Occur, Box<dyn TantivyQuery>)> = Vec::new();
             for path in &self.searchable_paths {
                 let term_text = format!("{}\0s{}", path, word);
                 let term = tantivy::Term::from_field_text(exact_field, &term_text);
-                let tq: Box<dyn TantivyQuery> =
-                    Box::new(tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::WithFreqs));
+                let tq: Box<dyn TantivyQuery> = Box::new(tantivy::query::TermQuery::new(
+                    term,
+                    tantivy::schema::IndexRecordOption::WithFreqs,
+                ));
                 field_queries.push((tantivy::query::Occur::Should, tq));
             }
             clauses.push((

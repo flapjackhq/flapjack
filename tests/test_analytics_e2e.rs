@@ -99,14 +99,56 @@ async fn full_analytics_pipeline() {
 
     // --- Record search events ---
     // "laptop" searched 3 times by different users (2 with results, 1 with results)
-    collector.record_search(search_event("laptop", "products", 42, Some(&qid1), "alice", None));
-    collector.record_search(search_event("laptop", "products", 38, Some(&qid2), "bob", None));
-    collector.record_search(search_event("laptop", "products", 42, Some(&qid3), "charlie", None));
+    collector.record_search(search_event(
+        "laptop",
+        "products",
+        42,
+        Some(&qid1),
+        "alice",
+        None,
+    ));
+    collector.record_search(search_event(
+        "laptop",
+        "products",
+        38,
+        Some(&qid2),
+        "bob",
+        None,
+    ));
+    collector.record_search(search_event(
+        "laptop",
+        "products",
+        42,
+        Some(&qid3),
+        "charlie",
+        None,
+    ));
     // "phone" searched 1 time
-    collector.record_search(search_event("phone", "products", 15, Some(&qid4), "alice", None));
+    collector.record_search(search_event(
+        "phone",
+        "products",
+        15,
+        Some(&qid4),
+        "alice",
+        None,
+    ));
     // "nonexistent" searched 2 times - zero results
-    collector.record_search(search_event("nonexistent", "products", 0, None, "alice", None));
-    collector.record_search(search_event("nonexistent", "products", 0, None, "bob", None));
+    collector.record_search(search_event(
+        "nonexistent",
+        "products",
+        0,
+        None,
+        "alice",
+        None,
+    ));
+    collector.record_search(search_event(
+        "nonexistent",
+        "products",
+        0,
+        None,
+        "bob",
+        None,
+    ));
     // Filtered searches
     collector.record_search(search_event(
         "laptop",
@@ -145,7 +187,10 @@ async fn full_analytics_pipeline() {
         .await
         .unwrap();
     let searches = result["searches"].as_array().unwrap();
-    assert!(searches.len() >= 2, "Should have at least 2 distinct queries");
+    assert!(
+        searches.len() >= 2,
+        "Should have at least 2 distinct queries"
+    );
     // "laptop" should be most frequent (4 times: 3 tracked + 1 filtered)
     assert_eq!(searches[0]["search"], "laptop");
 
@@ -176,7 +221,7 @@ async fn full_analytics_pipeline() {
         .await
         .unwrap();
     let searches = result["searches"].as_array().unwrap();
-    assert!(searches.len() >= 1, "Should have no-result queries");
+    assert!(!searches.is_empty(), "Should have no-result queries");
     // "nonexistent" should be there with count=2, and "laptop" with brand:Nonexistent with count=1
     let nonexistent = searches
         .iter()
@@ -199,11 +244,7 @@ async fn full_analytics_pipeline() {
     assert_eq!(result["trackedSearchCount"], 4);
     assert_eq!(result["clickCount"], 2);
     let ctr = result["rate"].as_f64().unwrap();
-    assert!(
-        (ctr - 0.5).abs() < 0.01,
-        "CTR should be 0.5, got {}",
-        ctr
-    );
+    assert!((ctr - 0.5).abs() < 0.01, "CTR should be 0.5, got {}", ctr);
 
     // 7. Average click position
     let result = engine
@@ -265,7 +306,7 @@ async fn full_analytics_pipeline() {
         .await
         .unwrap();
     let hits = result["hits"].as_array().unwrap();
-    assert!(hits.len() >= 1, "Should have clicked objects");
+    assert!(!hits.is_empty(), "Should have clicked objects");
 
     // 13. Status
     let result = engine.status("products").await.unwrap();
@@ -283,7 +324,14 @@ async fn query_id_correlation() {
     let qid = "abcdef0123456789abcdef0123456789".to_string();
 
     // Record search with queryID
-    collector.record_search(search_event("laptop", "products", 42, Some(&qid), "alice", None));
+    collector.record_search(search_event(
+        "laptop",
+        "products",
+        42,
+        Some(&qid),
+        "alice",
+        None,
+    ));
 
     // Look up the queryID — should find it
     let entry = collector.lookup_query_id(&qid).unwrap();
@@ -291,7 +339,9 @@ async fn query_id_correlation() {
     assert_eq!(entry.index_name, "products");
 
     // Unknown queryID — should return None
-    assert!(collector.lookup_query_id("0000000000000000000000000000000").is_none());
+    assert!(collector
+        .lookup_query_id("0000000000000000000000000000000")
+        .is_none());
 }
 
 /// Verify analytics: false suppresses recording (disabled config).
@@ -317,7 +367,10 @@ async fn analytics_disabled_suppresses_recording() {
         .search_count("products", &today, &today)
         .await
         .unwrap();
-    assert_eq!(result["count"], 0, "Disabled analytics should record nothing");
+    assert_eq!(
+        result["count"], 0,
+        "Disabled analytics should record nothing"
+    );
 }
 
 /// Verify non-correlated events (no queryID) are still recorded
@@ -333,7 +386,14 @@ async fn non_correlated_events_recorded_but_dont_inflate_ctr() {
     let qid = "a".repeat(32);
 
     // 1 tracked search
-    collector.record_search(search_event("laptop", "products", 42, Some(&qid), "alice", None));
+    collector.record_search(search_event(
+        "laptop",
+        "products",
+        42,
+        Some(&qid),
+        "alice",
+        None,
+    ));
 
     // 1 click WITH queryID (correlated)
     collector.record_insight(click_event(&qid, "products", "alice", vec![1]));
@@ -375,7 +435,7 @@ async fn non_correlated_events_recorded_but_dont_inflate_ctr() {
         .await
         .unwrap();
     let hits = result["hits"].as_array().unwrap();
-    assert!(hits.len() >= 1, "Should have clicked objects");
+    assert!(!hits.is_empty(), "Should have clicked objects");
 }
 
 /// Verify date range filtering works — events outside range are excluded.

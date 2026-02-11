@@ -157,7 +157,8 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize analytics subsystem
     let analytics_config = flapjack::analytics::AnalyticsConfig::from_env();
-    let analytics_collector = flapjack::analytics::AnalyticsCollector::new(analytics_config.clone());
+    let analytics_collector =
+        flapjack::analytics::AnalyticsCollector::new(analytics_config.clone());
     let analytics_engine = Arc::new(flapjack::analytics::AnalyticsQueryEngine::new(
         analytics_config.clone(),
     ));
@@ -342,30 +343,93 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
 
     // Analytics API endpoints (Algolia Analytics API v2 compatible)
     let analytics_routes = Router::new()
-        .route("/2/searches", get(crate::handlers::analytics::get_top_searches))
-        .route("/2/searches/count", get(crate::handlers::analytics::get_search_count))
-        .route("/2/searches/noResults", get(crate::handlers::analytics::get_no_results))
-        .route("/2/searches/noResultRate", get(crate::handlers::analytics::get_no_result_rate))
-        .route("/2/searches/noClicks", get(crate::handlers::analytics::get_no_clicks))
-        .route("/2/searches/noClickRate", get(crate::handlers::analytics::get_no_click_rate))
-        .route("/2/clicks/clickThroughRate", get(crate::handlers::analytics::get_click_through_rate))
-        .route("/2/clicks/averageClickPosition", get(crate::handlers::analytics::get_average_click_position))
-        .route("/2/clicks/positions", get(crate::handlers::analytics::get_click_positions))
-        .route("/2/conversions/conversionRate", get(crate::handlers::analytics::get_conversion_rate))
+        .route(
+            "/2/searches",
+            get(crate::handlers::analytics::get_top_searches),
+        )
+        .route(
+            "/2/searches/count",
+            get(crate::handlers::analytics::get_search_count),
+        )
+        .route(
+            "/2/searches/noResults",
+            get(crate::handlers::analytics::get_no_results),
+        )
+        .route(
+            "/2/searches/noResultRate",
+            get(crate::handlers::analytics::get_no_result_rate),
+        )
+        .route(
+            "/2/searches/noClicks",
+            get(crate::handlers::analytics::get_no_clicks),
+        )
+        .route(
+            "/2/searches/noClickRate",
+            get(crate::handlers::analytics::get_no_click_rate),
+        )
+        .route(
+            "/2/clicks/clickThroughRate",
+            get(crate::handlers::analytics::get_click_through_rate),
+        )
+        .route(
+            "/2/clicks/averageClickPosition",
+            get(crate::handlers::analytics::get_average_click_position),
+        )
+        .route(
+            "/2/clicks/positions",
+            get(crate::handlers::analytics::get_click_positions),
+        )
+        .route(
+            "/2/conversions/conversionRate",
+            get(crate::handlers::analytics::get_conversion_rate),
+        )
         .route("/2/hits", get(crate::handlers::analytics::get_top_hits))
-        .route("/2/filters", get(crate::handlers::analytics::get_top_filters))
-        .route("/2/filters/noResults", get(crate::handlers::analytics::get_filters_no_results))
-        .route("/2/filters/:attribute", get(crate::handlers::analytics::get_filter_values))
-        .route("/2/users/count", get(crate::handlers::analytics::get_users_count))
-        .route("/2/status", get(crate::handlers::analytics::get_analytics_status))
-        .route("/2/devices", get(crate::handlers::analytics::get_device_breakdown))
+        .route(
+            "/2/filters",
+            get(crate::handlers::analytics::get_top_filters),
+        )
+        .route(
+            "/2/filters/noResults",
+            get(crate::handlers::analytics::get_filters_no_results),
+        )
+        .route(
+            "/2/filters/:attribute",
+            get(crate::handlers::analytics::get_filter_values),
+        )
+        .route(
+            "/2/users/count",
+            get(crate::handlers::analytics::get_users_count),
+        )
+        .route(
+            "/2/status",
+            get(crate::handlers::analytics::get_analytics_status),
+        )
+        .route(
+            "/2/devices",
+            get(crate::handlers::analytics::get_device_breakdown),
+        )
         .route("/2/geo", get(crate::handlers::analytics::get_geo_breakdown))
-        .route("/2/geo/:country", get(crate::handlers::analytics::get_geo_top_searches))
-        .route("/2/geo/:country/regions", get(crate::handlers::analytics::get_geo_regions))
+        .route(
+            "/2/geo/:country",
+            get(crate::handlers::analytics::get_geo_top_searches),
+        )
+        .route(
+            "/2/geo/:country/regions",
+            get(crate::handlers::analytics::get_geo_regions),
+        )
         .route("/2/overview", get(crate::handlers::analytics::get_overview))
-        .route("/2/analytics/seed", post(crate::handlers::analytics::seed_analytics))
-        .route("/2/analytics/clear", delete(crate::handlers::analytics::clear_analytics))
-        .route("/2/analytics/flush", post(crate::handlers::analytics::flush_analytics))
+        .route(
+            "/2/analytics/seed",
+            post(crate::handlers::analytics::seed_analytics),
+        )
+        .route(
+            "/2/analytics/clear",
+            delete(crate::handlers::analytics::clear_analytics),
+        )
+        .route(
+            "/2/analytics/flush",
+            post(crate::handlers::analytics::flush_analytics),
+        )
         .with_state(analytics_engine);
 
     // Insights API (event ingestion - Algolia compatible)

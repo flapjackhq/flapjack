@@ -335,8 +335,13 @@ impl SearchRequest {
                             // Handle bare "true"/"false" strings
                             match value.as_ref() {
                                 "true" => self.typo_tolerance = Some(serde_json::Value::Bool(true)),
-                                "false" => self.typo_tolerance = Some(serde_json::Value::Bool(false)),
-                                _ => self.typo_tolerance = Some(serde_json::Value::String(value.into_owned())),
+                                "false" => {
+                                    self.typo_tolerance = Some(serde_json::Value::Bool(false))
+                                }
+                                _ => {
+                                    self.typo_tolerance =
+                                        Some(serde_json::Value::String(value.into_owned()))
+                                }
                             }
                         }
                     }
@@ -810,7 +815,10 @@ pub fn parse_optional_filters(value: &serde_json::Value) -> Vec<(String, String,
         let s = s.strip_prefix('-').unwrap_or(s);
         let colon = s.find(':')?;
         let field = s[..colon].to_string();
-        let value = s[colon + 1..].trim_matches('"').trim_matches('\'').to_string();
+        let value = s[colon + 1..]
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
         Some((field, value, score))
     }
 

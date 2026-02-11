@@ -18,9 +18,7 @@ use flapjack::types::{FacetRequest, FieldValue, Sort, SortOrder};
 use super::field_value_to_json;
 
 /// Extract userToken and client IP from request headers for analytics.
-fn extract_analytics_headers(
-    headers: &axum::http::HeaderMap,
-) -> (Option<String>, Option<String>) {
+fn extract_analytics_headers(headers: &axum::http::HeaderMap) -> (Option<String>, Option<String>) {
     let user_token = headers
         .get("x-algolia-usertoken")
         .and_then(|v| v.to_str().ok())
@@ -249,17 +247,14 @@ pub async fn batch_search(
         }
     }
 
-    let mut indexed_results: Vec<(usize, serde_json::Value)> =
-        Vec::with_capacity(join_set.len());
+    let mut indexed_results: Vec<(usize, serde_json::Value)> = Vec::with_capacity(join_set.len());
     while let Some(join_result) = join_set.join_next().await {
-        let result = join_result.map_err(|e| {
-            FlapjackError::InvalidQuery(format!("Task join error: {}", e))
-        })?;
+        let result = join_result
+            .map_err(|e| FlapjackError::InvalidQuery(format!("Task join error: {}", e)))?;
         indexed_results.push(result?);
     }
     indexed_results.sort_by_key(|(i, _)| *i);
-    let results: Vec<serde_json::Value> =
-        indexed_results.into_iter().map(|(_, v)| v).collect();
+    let results: Vec<serde_json::Value> = indexed_results.into_iter().map(|(_, v)| v).collect();
 
     Ok(Json(serde_json::json!({"results": results})))
 }
@@ -320,9 +315,7 @@ fn search_single_sync(
         None
     };
 
-    let loaded_settings = state
-        .manager
-        .get_settings(&index_name);
+    let loaded_settings = state.manager.get_settings(&index_name);
 
     let facet_requests = req.facets.as_ref().and_then(|facets| {
         let allowed_facets = loaded_settings.as_ref().map(|s| s.facet_set());
@@ -758,7 +751,10 @@ fn search_single_sync(
     if req.analytics != Some(false) {
         if let Some(collector) = flapjack::analytics::get_global_collector() {
             let analytics_tags_str = req.analytics_tags.as_ref().map(|t| t.join(","));
-            let facets_str = req.facets.as_ref().map(|f| serde_json::to_string(f).unwrap_or_default());
+            let facets_str = req
+                .facets
+                .as_ref()
+                .map(|f| serde_json::to_string(f).unwrap_or_default());
             collector.record_search(flapjack::analytics::schema::SearchEvent {
                 timestamp_ms: chrono::Utc::now().timestamp_millis(),
                 query: req.query.clone(),

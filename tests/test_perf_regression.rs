@@ -29,7 +29,9 @@ const P99_TYPEAHEAD_TOTAL_US: u64 = 60_000; // 60 ms — 6-keystroke typeahead s
 // ── Helpers ─────────────────────────────────────────────────────────────
 fn build_corpus(manager: &IndexManager) {
     manager.create_tenant("regr").unwrap();
-    let brands = ["Samsung", "Apple", "HP", "Dell", "Sony", "LG", "Lenovo", "Asus"];
+    let brands = [
+        "Samsung", "Apple", "HP", "Dell", "Sony", "LG", "Lenovo", "Asus",
+    ];
     let adjectives = ["premium", "budget", "gaming", "professional", "compact"];
     let mut docs = Vec::with_capacity(1000);
     for i in 0..1000 {
@@ -59,10 +61,7 @@ fn build_corpus(manager: &IndexManager) {
             "category".into(),
             FieldValue::Facet(format!("/electronics/cat{}", i % 20)),
         );
-        fields.insert(
-            "price".into(),
-            FieldValue::Integer(100 + (i * 7) as i64),
-        );
+        fields.insert("price".into(), FieldValue::Integer(100 + (i * 7) as i64));
         docs.push(Document {
             id: format!("d{}", i),
             fields,
@@ -134,7 +133,13 @@ fn regression_multi_word() {
 fn regression_long_query() {
     with_manager(|m| {
         let (avg, p99) = bench(200, || {
-            let _ = m.search("regr", "samsung premium laptop display screen", None, None, 20);
+            let _ = m.search(
+                "regr",
+                "samsung premium laptop display screen",
+                None,
+                None,
+                20,
+            );
         });
         eprintln!("  long_query:   avg={avg}us  p99={p99}us  (limit {P99_LONG_QUERY_US}us)");
         assert!(
@@ -189,7 +194,15 @@ fn regression_facets() {
             path: "/electronics".into(),
         };
         let (avg, p99) = bench(200, || {
-            let _ = m.search_with_facets("regr", "laptop", None, None, 20, 0, Some(&[facet.clone()]));
+            let _ = m.search_with_facets(
+                "regr",
+                "laptop",
+                None,
+                None,
+                20,
+                0,
+                Some(std::slice::from_ref(&facet)),
+            );
         });
         eprintln!("  facets:       avg={avg}us  p99={p99}us  (limit {P99_FACET_US}us)");
         assert!(
@@ -223,7 +236,7 @@ fn regression_full_stack() {
                 Some(&sort),
                 20,
                 0,
-                Some(&[facet.clone()]),
+                Some(std::slice::from_ref(&facet)),
             );
         });
         eprintln!("  full_stack:   avg={avg}us  p99={p99}us  (limit {P99_FULL_STACK_US}us)");
@@ -280,7 +293,15 @@ fn regression_typeahead_sequence() {
         // warmup
         for _ in 0..3 {
             for q in &prefixes {
-                let _ = m.search_with_facets("regr", q, None, None, 20, 0, Some(&[facet.clone()]));
+                let _ = m.search_with_facets(
+                    "regr",
+                    q,
+                    None,
+                    None,
+                    20,
+                    0,
+                    Some(std::slice::from_ref(&facet)),
+                );
             }
         }
 
@@ -288,7 +309,15 @@ fn regression_typeahead_sequence() {
         for _ in 0..50 {
             let t = std::time::Instant::now();
             for q in &prefixes {
-                let _ = m.search_with_facets("regr", q, None, None, 20, 0, Some(&[facet.clone()]));
+                let _ = m.search_with_facets(
+                    "regr",
+                    q,
+                    None,
+                    None,
+                    20,
+                    0,
+                    Some(std::slice::from_ref(&facet)),
+                );
             }
             times.push(t.elapsed().as_micros() as u64);
         }

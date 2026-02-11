@@ -64,12 +64,7 @@ impl Highlighter {
             // which fields the *search* engine queries, not highlighting.
             result.insert(
                 field_name.clone(),
-                self.highlight_field_value(
-                    field_value,
-                    query_words,
-                    field_name,
-                    searchable_paths,
-                ),
+                self.highlight_field_value(field_value, query_words, field_name, searchable_paths),
             );
         }
 
@@ -133,7 +128,9 @@ impl Highlighter {
         // skip the expensive split/concat/fuzzy matching.
         let unique_matched: std::collections::HashSet<&str> =
             matched_words.iter().map(|w| w.as_str()).collect();
-        let all_found_exact = query_words.iter().all(|qw| unique_matched.contains(qw.as_str()));
+        let all_found_exact = query_words
+            .iter()
+            .all(|qw| unique_matched.contains(qw.as_str()));
 
         if !all_found_exact {
             // 2. Split matching: for each query word >= 4 chars, try inserting a space
@@ -200,18 +197,15 @@ impl Highlighter {
                     let ql_chars = query_lower.chars().count();
                     let twl_chars = text_word_lower.chars().count();
                     if ql_chars >= 4 && twl_chars >= 4 {
-                        let distance =
-                            strsim::damerau_levenshtein(query_lower, &text_word_lower);
+                        let distance = strsim::damerau_levenshtein(query_lower, &text_word_lower);
                         let max_distance = if ql_chars >= 8 { 2 } else { 1 };
                         if distance <= max_distance && distance > 0 {
                             matched_words.push(query_words[qi].clone());
                             let highlight_len = ql_chars.min(text_word.len());
                             match_positions.push((*word_start, word_start + highlight_len));
                         } else if twl_chars > ql_chars {
-                            let prefix: String =
-                                text_word_lower.chars().take(ql_chars).collect();
-                            let prefix_distance =
-                                strsim::damerau_levenshtein(query_lower, &prefix);
+                            let prefix: String = text_word_lower.chars().take(ql_chars).collect();
+                            let prefix_distance = strsim::damerau_levenshtein(query_lower, &prefix);
                             if prefix_distance <= max_distance {
                                 matched_words.push(query_words[qi].clone());
                                 let highlight_end = text_word
@@ -439,11 +433,7 @@ impl Highlighter {
 
         // Center the window around the match
         let half = word_count / 2;
-        let start = if match_word_idx > half {
-            match_word_idx - half
-        } else {
-            0
-        };
+        let start = match_word_idx.saturating_sub(half);
         let end = (start + word_count).min(words.len());
         let start = if end == words.len() && end > word_count {
             end - word_count

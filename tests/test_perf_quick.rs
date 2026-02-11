@@ -14,7 +14,10 @@ fn setup(manager: &IndexManager, num_docs: usize) {
         };
         doc.fields.insert(
             "title".to_string(),
-            FieldValue::Text(format!("Laptop Gaming Product {} electronics samsung apple", i)),
+            FieldValue::Text(format!(
+                "Laptop Gaming Product {} electronics samsung apple",
+                i
+            )),
         );
         doc.fields.insert(
             "description".to_string(),
@@ -25,9 +28,7 @@ fn setup(manager: &IndexManager, num_docs: usize) {
         );
         doc.fields.insert(
             "brand".to_string(),
-            FieldValue::Text(
-                ["Samsung", "Apple", "HP", "Dell", "Sony"][i % 5].to_string(),
-            ),
+            FieldValue::Text(["Samsung", "Apple", "HP", "Dell", "Sony"][i % 5].to_string()),
         );
         doc.fields.insert(
             "category".to_string(),
