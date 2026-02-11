@@ -169,8 +169,7 @@ mod compact_index {
 
         // Add large docs in separate batches to create multiple segments
         let batch1: Vec<Document> = (1..=25).map(|i| make_large_doc(&i.to_string())).collect();
-        let batch2: Vec<Document> =
-            (26..=50).map(|i| make_large_doc(&i.to_string())).collect();
+        let batch2: Vec<Document> = (26..=50).map(|i| make_large_doc(&i.to_string())).collect();
         mgr.add_documents_sync("test", batch1).await.unwrap();
         mgr.add_documents_sync("test", batch2).await.unwrap();
 
