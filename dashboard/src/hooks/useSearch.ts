@@ -6,15 +6,22 @@ interface UseSearchOptions {
   indexName: string;
   params: SearchParams;
   enabled?: boolean;
+  userToken?: string;
 }
 
-export function useSearch<T = Document>({ indexName, params, enabled = true }: UseSearchOptions) {
+export function useSearch<T = Document>({ indexName, params, enabled = true, userToken }: UseSearchOptions) {
   return useQuery({
     queryKey: ['search', indexName, params],
     queryFn: async () => {
+      const payload = { analytics: false, ...params };
+      const headers: Record<string, string> = {};
+      if (userToken) {
+        headers['x-algolia-usertoken'] = userToken;
+      }
       const response = await api.post<SearchResponse<T>>(
         `/1/indexes/${indexName}/query`,
-        params
+        payload,
+        { headers }
       );
       return response.data;
     },

@@ -15,12 +15,12 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::auth::{authenticate_and_authorize, generate_hex_key, KeyStore};
 use crate::handlers::snapshot;
 use crate::handlers::{
-    add_documents, batch_search, browse_index, clear_index, clear_rules, clear_synonyms,
-    create_index, delete_by_query, delete_index, delete_object, delete_rule, delete_synonym,
-    get_object, get_objects, get_rule, get_synonym, get_task, get_task_for_index, health,
-    list_indices, migrate_from_algolia, operation_index, put_object, save_rule, save_rules,
-    save_synonym, save_synonyms, search, search_facet_values, search_rules, search_synonyms,
-    AppState,
+    add_documents, add_record_auto_id, batch_search, browse_index, clear_index, clear_rules,
+    clear_synonyms, compact_index, create_index, delete_by_query, delete_index, delete_object,
+    delete_rule, delete_synonym, get_object, get_objects, get_rule, get_synonym, get_task,
+    get_task_for_index, health, list_indices, migrate_from_algolia, operation_index,
+    partial_update_object, put_object, save_rule, save_rules, save_synonym, save_synonyms, search,
+    search_facet_values, search_rules, search_synonyms, AppState,
 };
 use crate::middleware::{allow_private_network, normalize_content_type};
 use crate::openapi::ApiDoc;
@@ -155,6 +155,38 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Initialize analytics subsystem
+    let analytics_config = flapjack::analytics::AnalyticsConfig::from_env();
+    let analytics_collector = flapjack::analytics::AnalyticsCollector::new(analytics_config.clone());
+    let analytics_engine = Arc::new(flapjack::analytics::AnalyticsQueryEngine::new(
+        analytics_config.clone(),
+    ));
+
+    if analytics_config.enabled {
+        flapjack::analytics::init_global_collector(Arc::clone(&analytics_collector));
+
+        // Spawn background flush loop
+        let collector_for_flush = Arc::clone(&analytics_collector);
+        tokio::spawn(async move {
+            collector_for_flush.run_flush_loop().await;
+        });
+
+        // Spawn retention cleanup loop
+        let retention_dir = analytics_config.data_dir.clone();
+        let retention_days = analytics_config.retention_days;
+        tokio::spawn(async move {
+            flapjack::analytics::retention::run_retention_loop(retention_dir, retention_days).await;
+        });
+
+        tracing::info!(
+            "[analytics] Analytics enabled (flush every {}s, retain {}d)",
+            analytics_config.flush_interval_secs,
+            analytics_config.retention_days
+        );
+    } else {
+        tracing::info!("[analytics] Analytics disabled");
+    }
+
     let state = Arc::new(AppState {
         manager,
         key_store: key_store.clone(),
@@ -189,6 +221,7 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .route("/1/indexes", get(list_indices))
         .route("/1/indexes/:indexName/browse", post(browse_index))
         .route("/1/indexes/:indexName/clear", post(clear_index))
+        .route("/1/indexes/:indexName/compact", post(compact_index))
         .route("/1/indexes/:indexName/batch", post(add_documents))
         .route("/1/indexes/:indexName/query", post(search))
         .route("/1/indexes/:indexName/deleteByQuery", post(delete_by_query))
@@ -253,13 +286,20 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
                 .post(crate::handlers::set_settings)
                 .put(crate::handlers::set_settings),
         )
+        .route(
+            "/1/indexes/:indexName/:objectID/partial",
+            post(partial_update_object),
+        )
         .route("/1/indexes/:indexName/:objectID", get(get_object))
         .route("/1/indexes/:indexName/:objectID", delete(delete_object))
         .route(
             "/1/indexes/:indexName/:objectID",
             axum::routing::put(put_object),
         )
-        .route("/1/indexes/:indexName", delete(delete_index))
+        .route(
+            "/1/indexes/:indexName",
+            post(add_record_auto_id).delete(delete_index),
+        )
         .route("/1/migrate-from-algolia", post(migrate_from_algolia))
         .route("/1/tasks/:task_id", get(get_task))
         .route(
@@ -300,6 +340,39 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_state(state.clone());
 
+    // Analytics API endpoints (Algolia Analytics API v2 compatible)
+    let analytics_routes = Router::new()
+        .route("/2/searches", get(crate::handlers::analytics::get_top_searches))
+        .route("/2/searches/count", get(crate::handlers::analytics::get_search_count))
+        .route("/2/searches/noResults", get(crate::handlers::analytics::get_no_results))
+        .route("/2/searches/noResultRate", get(crate::handlers::analytics::get_no_result_rate))
+        .route("/2/searches/noClicks", get(crate::handlers::analytics::get_no_clicks))
+        .route("/2/searches/noClickRate", get(crate::handlers::analytics::get_no_click_rate))
+        .route("/2/clicks/clickThroughRate", get(crate::handlers::analytics::get_click_through_rate))
+        .route("/2/clicks/averageClickPosition", get(crate::handlers::analytics::get_average_click_position))
+        .route("/2/clicks/positions", get(crate::handlers::analytics::get_click_positions))
+        .route("/2/conversions/conversionRate", get(crate::handlers::analytics::get_conversion_rate))
+        .route("/2/hits", get(crate::handlers::analytics::get_top_hits))
+        .route("/2/filters", get(crate::handlers::analytics::get_top_filters))
+        .route("/2/filters/noResults", get(crate::handlers::analytics::get_filters_no_results))
+        .route("/2/filters/:attribute", get(crate::handlers::analytics::get_filter_values))
+        .route("/2/users/count", get(crate::handlers::analytics::get_users_count))
+        .route("/2/status", get(crate::handlers::analytics::get_analytics_status))
+        .route("/2/devices", get(crate::handlers::analytics::get_device_breakdown))
+        .route("/2/geo", get(crate::handlers::analytics::get_geo_breakdown))
+        .route("/2/geo/:country", get(crate::handlers::analytics::get_geo_top_searches))
+        .route("/2/geo/:country/regions", get(crate::handlers::analytics::get_geo_regions))
+        .route("/2/overview", get(crate::handlers::analytics::get_overview))
+        .route("/2/analytics/seed", post(crate::handlers::analytics::seed_analytics))
+        .route("/2/analytics/clear", delete(crate::handlers::analytics::clear_analytics))
+        .route("/2/analytics/flush", post(crate::handlers::analytics::flush_analytics))
+        .with_state(analytics_engine);
+
+    // Insights API (event ingestion - Algolia compatible)
+    let insights_routes = Router::new()
+        .route("/1/events", post(crate::handlers::insights::post_events))
+        .with_state(analytics_collector);
+
     // Dashboard static files
     let dashboard_path = Path::new("dashboard/dist");
     let dashboard_service = if dashboard_path.exists() {
@@ -325,6 +398,8 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .merge(swagger)
         .merge(key_routes)
         .merge(protected)
+        .merge(analytics_routes)
+        .merge(insights_routes)
         .merge(internal); // Add internal routes before auth middleware
 
     // Add dashboard route if available (before auth middleware so static files don't require API key)
@@ -362,7 +437,7 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .layer(auth_middleware)
         .layer(DefaultBodyLimit::max(max_body_mb * 1024 * 1024))
         .layer(middleware::from_fn(normalize_content_type))
-        .layer(CorsLayer::very_permissive())
+        .layer(CorsLayer::very_permissive().max_age(std::time::Duration::from_secs(86400)))
         .layer(middleware::from_fn(allow_private_network));
 
     tracing::info!("Starting Flapjack server on {}", bind_addr);

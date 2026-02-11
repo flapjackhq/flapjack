@@ -12,7 +12,7 @@ const Editor = lazy(() =>
   }))
 );
 
-const PREVIEW_FIELD_COUNT = 3;
+const PREVIEW_FIELD_COUNT = 6;
 
 interface HighlightResultValue {
   value: string;
@@ -25,8 +25,10 @@ type HighlightResult = Record<string, HighlightResultValue | HighlightResultValu
 
 interface DocumentCardProps {
   document: Document;
+  fieldOrder?: string[];
   onDelete?: (objectID: string) => void;
   isDeleting?: boolean;
+  onClick?: () => void;
 }
 
 /**
@@ -80,8 +82,10 @@ function escapeHtml(text: string): string {
 
 export const DocumentCard = memo(function DocumentCard({
   document,
+  fieldOrder,
   onDelete,
   isDeleting,
+  onClick,
 }: DocumentCardProps) {
   const [showAllFields, setShowAllFields] = useState(false);
   const [showJson, setShowJson] = useState(false);
@@ -100,13 +104,32 @@ export const DocumentCard = memo(function DocumentCard({
   const { objectID, _highlightResult, ...fieldData } = document;
   const highlightResult = _highlightResult as HighlightResult | undefined;
 
-  const allKeys = useMemo(() => Object.keys(fieldData), [fieldData]);
+  // Use stable field order from parent if provided, falling back to this doc's own keys.
+  // This ensures every card in a result set shows fields in the same order.
+  const allKeys = useMemo(() => {
+    if (!fieldOrder) return Object.keys(fieldData);
+    const docKeys = new Set(Object.keys(fieldData));
+    // Ordered keys present in this doc, then any extras not in the canonical order
+    const ordered = fieldOrder.filter((k) => docKeys.has(k));
+    for (const k of docKeys) {
+      if (!fieldOrder.includes(k)) ordered.push(k);
+    }
+    return ordered;
+  }, [fieldData, fieldOrder]);
   const previewKeys = allKeys.slice(0, PREVIEW_FIELD_COUNT);
   const extraKeys = allKeys.slice(PREVIEW_FIELD_COUNT);
   const visibleKeys = showAllFields ? allKeys : previewKeys;
 
   return (
-    <Card className="overflow-hidden" data-testid="document-card">
+    <Card
+      className={`overflow-hidden${onClick ? ' cursor-pointer hover:ring-1 hover:ring-primary/50 transition-shadow' : ''}`}
+      data-testid="document-card"
+      onClick={onClick ? (e) => {
+        // Don't fire click analytics when clicking action buttons
+        if ((e.target as HTMLElement).closest('button, a')) return;
+        onClick();
+      } : undefined}
+    >
       <div className="p-4">
         {/* Header with ID and actions */}
         <div className="flex items-start justify-between gap-4 mb-3">

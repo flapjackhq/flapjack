@@ -61,7 +61,7 @@
 //! All features are enabled by default. Use `default-features = false` for a
 //! minimal dependency footprint (24% fewer deps).
 //!
-//! See [LIB.md](https://github.com/flapjackhq/flapjack/blob/main/LIB.md)
+//! See [LIB.md](https://github.com/stuartcrobinson/flapjack202511/blob/main/LIB.md)
 //! for the full embedding guide.
 
 pub mod error;
@@ -69,6 +69,9 @@ pub mod index;
 pub mod query;
 pub mod tokenizer;
 pub mod types;
+
+#[cfg(feature = "analytics")]
+pub mod analytics;
 
 pub use error::{FlapjackError, Result};
 pub use index::{manager::IndexManager, Index, ManagedIndexWriter};

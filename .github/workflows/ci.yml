@@ -2,9 +2,10 @@ name: CI
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-  pull_request:
+  # Uncomment these when ready to run CI on every push/PR:
+  # push:
+  #   branches: [main]
+  # pull_request:
 
 env:
   CARGO_TERM_COLOR: always

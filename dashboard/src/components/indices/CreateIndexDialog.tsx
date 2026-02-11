@@ -1,5 +1,5 @@
 import { memo, useState, useCallback } from 'react';
-import { useCreateIndex } from '@/hooks/useIndices';
+import { useCreateIndex, useIndices } from '@/hooks/useIndices';
 import { useAddDocuments } from '@/hooks/useDocuments';
 import {
   Dialog,
@@ -12,30 +12,60 @@ import {
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Database } from 'lucide-react';
+import { Database, ShoppingBag } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import api from '@/lib/api';
 import moviesData from '@/data/movies.json';
+import productsData from '@/data/products.json';
+import type { IndexSettings } from '@/lib/types';
 
-type IndexTemplate = 'empty' | 'movies-10' | 'movies-100';
+type IndexTemplate = 'empty' | 'movies' | 'products';
 
-const TEMPLATES = [
+interface TemplateConfig {
+  value: IndexTemplate;
+  label: string;
+  desc: string;
+  icon: typeof Database | null;
+  defaultName: string;
+  settings: Partial<IndexSettings>;
+  getData: () => Record<string, unknown>[];
+}
+
+const TEMPLATE_CONFIGS: TemplateConfig[] = [
   {
-    value: 'empty' as const,
+    value: 'empty',
     label: 'Empty index',
     desc: 'Start from scratch — add your own documents later',
     icon: null,
+    defaultName: '',
+    settings: {},
+    getData: () => [],
   },
   {
-    value: 'movies-10' as const,
-    label: 'Movies (10 documents)',
-    desc: 'Quick demo dataset — great for getting started',
+    value: 'movies',
+    label: 'Movies — 100 docs',
+    desc: 'Search by title/director, filter by genre, see highlighting in action',
     icon: Database,
+    defaultName: 'movies',
+    settings: {
+      searchableAttributes: ['title', 'overview', 'director'],
+      attributesForFaceting: ['genre'],
+      attributesToHighlight: ['title', 'overview', 'director'],
+    },
+    getData: () => moviesData.slice(0, 100),
   },
   {
-    value: 'movies-100' as const,
-    label: 'Movies (100 documents)',
-    desc: 'Full demo dataset — test search, faceting, and filtering',
-    icon: Database,
+    value: 'products',
+    label: 'Products — 100 docs',
+    desc: 'E-commerce demo with category and brand facets',
+    icon: ShoppingBag,
+    defaultName: 'products',
+    settings: {
+      searchableAttributes: ['name', 'description', 'brand', 'category'],
+      attributesForFaceting: ['category', 'brand'],
+      attributesToHighlight: ['name', 'description'],
+    },
+    getData: () => productsData.slice(0, 100),
   },
 ];
 
@@ -49,6 +79,7 @@ export const CreateIndexDialog = memo(function CreateIndexDialog({
   onOpenChange,
 }: CreateIndexDialogProps) {
   const createIndex = useCreateIndex();
+  const { data: existingIndices } = useIndices();
   const [uid, setUid] = useState('');
   const [error, setError] = useState('');
   const [template, setTemplate] = useState<IndexTemplate>('empty');
@@ -56,10 +87,13 @@ export const CreateIndexDialog = memo(function CreateIndexDialog({
 
   const addDocuments = useAddDocuments(uid.trim());
 
+  const selectedConfig = TEMPLATE_CONFIGS.find((t) => t.value === template)!;
+
   const handleTemplateChange = useCallback((newTemplate: IndexTemplate) => {
     setTemplate(newTemplate);
-    if (newTemplate === 'movies-10' || newTemplate === 'movies-100') {
-      setUid('movies');
+    const config = TEMPLATE_CONFIGS.find((t) => t.value === newTemplate)!;
+    if (config.defaultName) {
+      setUid(config.defaultName);
     } else {
       setUid('');
     }
@@ -76,14 +110,33 @@ export const CreateIndexDialog = memo(function CreateIndexDialog({
       setError('Only letters, numbers, hyphens, and underscores allowed');
       return;
     }
+    if (existingIndices?.some((idx) => idx.uid === trimmed)) {
+      setError(`An index named "${trimmed}" already exists`);
+      return;
+    }
 
     try {
       await createIndex.mutateAsync({ uid: trimmed });
 
-      if (template === 'movies-10' || template === 'movies-100') {
+      const data = selectedConfig.getData();
+      if (data.length > 0) {
         setIsLoadingData(true);
-        const count = template === 'movies-10' ? 10 : 100;
-        await addDocuments.mutateAsync(moviesData.slice(0, count));
+
+        // Configure settings BEFORE adding documents so facets are indexed correctly
+        if (Object.keys(selectedConfig.settings).length > 0) {
+          await api.put(`/1/indexes/${trimmed}/settings`, selectedConfig.settings);
+        }
+
+        await addDocuments.mutateAsync(data);
+
+        // Auto-seed analytics data for demo datasets so the Analytics page isn't empty
+        try {
+          await api.post('/2/analytics/seed', { index: trimmed, days: 30 });
+          // Flush so seeded data is immediately queryable
+          await api.post('/2/analytics/flush');
+        } catch {
+          // Non-critical — don't block index creation if seed fails
+        }
         setIsLoadingData(false);
       }
 
@@ -95,7 +148,7 @@ export const CreateIndexDialog = memo(function CreateIndexDialog({
       setIsLoadingData(false);
       console.error('Failed to create index:', err);
     }
-  }, [uid, template, createIndex, addDocuments, onOpenChange]);
+  }, [uid, template, selectedConfig, createIndex, addDocuments, onOpenChange]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -123,10 +176,10 @@ export const CreateIndexDialog = memo(function CreateIndexDialog({
   const buttonText = isPending
     ? createIndex.isPending
       ? 'Creating...'
-      : 'Loading data...'
+      : 'Configuring & loading...'
     : template === 'empty'
     ? 'Create Index'
-    : `Create & Load ${template === 'movies-10' ? '10' : '100'} Movies`;
+    : `Create & Load ${selectedConfig.defaultName}`;
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -160,7 +213,7 @@ export const CreateIndexDialog = memo(function CreateIndexDialog({
           <div className="space-y-2">
             <Label>Starting data</Label>
             <div className="space-y-2">
-              {TEMPLATES.map((opt) => (
+              {TEMPLATE_CONFIGS.map((opt) => (
                 <label
                   key={opt.value}
                   className={cn(

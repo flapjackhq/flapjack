@@ -12,7 +12,7 @@ export function Layout() {
       <Header onMenuToggle={() => setSidebarOpen((o) => !o)} />
       <div className="flex flex-1 overflow-hidden">
         <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
-        <main className="flex-1 overflow-auto p-6 bg-background">
+        <main className="flex-1 overflow-auto p-6 bg-muted/30">
           <Outlet />
         </main>
       </div>

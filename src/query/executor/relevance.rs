@@ -42,7 +42,7 @@ impl QueryExecutor {
 
         let final_docs = top_docs.into_iter().skip(offset).take(limit).collect();
         let documents = self.reconstruct_documents(searcher, final_docs)?;
-        tracing::warn!(
+        tracing::debug!(
             "[REL] search={:?} tier2={:?} reconstruct={:?} total_hits={}",
             tr1,
             tr2.saturating_sub(tr1),
@@ -248,7 +248,8 @@ impl QueryExecutor {
 
         let mut min_pos = u32::MAX;
 
-        for path in &self.searchable_paths {
+        // Only check top 2 searchable paths (same as apply_tier2_only)
+        for path in self.searchable_paths.iter().take(2) {
             for term_text in query_terms {
                 let full_term = format!("{}\0s{}", path, term_text);
                 let term = tantivy::Term::from_field_text(self.json_search_field, &full_term);
@@ -256,32 +257,21 @@ impl QueryExecutor {
                 if let Some(mut postings) =
                     inverted_index.read_postings(&term, IndexRecordOption::WithFreqsAndPositions)?
                 {
-                    let mut doc_id = postings.doc();
-                    while doc_id != TERMINATED {
-                        if doc_id == addr.doc_id {
-                            let mut positions: Vec<u32> =
-                                Vec::with_capacity(postings.term_freq() as usize);
-                            postings.positions(&mut positions);
-                            if let Some(&first_pos) = positions.first() {
-                                tracing::info!(
-                                    "Doc {:?} term '{}' in path '{}' -> position {}",
-                                    addr,
-                                    term_text,
-                                    path,
-                                    first_pos
-                                );
-                                min_pos = min_pos.min(first_pos);
-                            }
-                            break;
+                    // Use seek() to jump directly to target doc instead of
+                    // walking through every doc in the posting list.
+                    let doc_id = postings.seek(addr.doc_id);
+                    if doc_id == addr.doc_id {
+                        let mut positions: Vec<u32> =
+                            Vec::with_capacity(postings.term_freq() as usize);
+                        postings.positions(&mut positions);
+                        if let Some(&first_pos) = positions.first() {
+                            min_pos = min_pos.min(first_pos);
                         }
-                        doc_id = postings.advance();
                     }
                 }
             }
         }
 
-        let final_pos = min_pos;
-        tracing::info!("Doc {:?} final min_position: {}", addr, final_pos);
-        Ok(final_pos)
+        Ok(min_pos)
     }
 }

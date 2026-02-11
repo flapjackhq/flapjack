@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -14,25 +14,191 @@ use crate::filter_parser::parse_filter;
 use flapjack::error::FlapjackError;
 use flapjack::types::{Document, FieldValue};
 
-fn field_value_to_json(value: &FieldValue) -> serde_json::Value {
-    match value {
-        FieldValue::Object(map) => {
-            let mut obj = serde_json::Map::new();
-            for (k, v) in map {
-                obj.insert(k.clone(), field_value_to_json(v));
+/// Apply a built-in partial update operation (Increment, Decrement, Add, Remove, AddUnique).
+/// Returns the new FieldValue for the field, or None if the operation is invalid.
+fn apply_operation(
+    existing: Option<&FieldValue>,
+    operation: &str,
+    value: &serde_json::Value,
+) -> Option<FieldValue> {
+    match operation {
+        "Increment" | "IncrementFrom" | "IncrementSet" => {
+            let delta = value.as_f64().unwrap_or(0.0);
+            match existing {
+                Some(FieldValue::Integer(n)) => Some(FieldValue::Integer(*n + delta as i64)),
+                Some(FieldValue::Float(n)) => Some(FieldValue::Float(*n + delta)),
+                _ => {
+                    // Field missing or non-numeric: create with delta value
+                    if delta.fract() == 0.0 {
+                        Some(FieldValue::Integer(delta as i64))
+                    } else {
+                        Some(FieldValue::Float(delta))
+                    }
+                }
             }
-            serde_json::Value::Object(obj)
         }
-        FieldValue::Array(items) => {
-            serde_json::Value::Array(items.iter().map(field_value_to_json).collect())
+        "Decrement" | "DecrementFrom" | "DecrementSet" => {
+            let delta = value.as_f64().unwrap_or(0.0);
+            match existing {
+                Some(FieldValue::Integer(n)) => Some(FieldValue::Integer(*n - delta as i64)),
+                Some(FieldValue::Float(n)) => Some(FieldValue::Float(*n - delta)),
+                _ => {
+                    if delta.fract() == 0.0 {
+                        Some(FieldValue::Integer(-(delta as i64)))
+                    } else {
+                        Some(FieldValue::Float(-delta))
+                    }
+                }
+            }
         }
-        FieldValue::Text(s) => serde_json::Value::String(s.clone()),
-        FieldValue::Integer(i) => serde_json::Value::Number((*i).into()),
-        FieldValue::Float(f) => serde_json::json!(f),
-        FieldValue::Date(d) => serde_json::Value::Number((*d).into()),
-        FieldValue::Facet(s) => serde_json::Value::String(s.clone()),
+        "Add" => {
+            let new_item = flapjack::types::json_value_to_field_value(value)?;
+            match existing {
+                Some(FieldValue::Array(arr)) => {
+                    let mut new_arr = arr.clone();
+                    new_arr.push(new_item);
+                    Some(FieldValue::Array(new_arr))
+                }
+                None => Some(FieldValue::Array(vec![new_item])),
+                _ => {
+                    // Non-array: wrap existing + new into array
+                    Some(FieldValue::Array(vec![existing.unwrap().clone(), new_item]))
+                }
+            }
+        }
+        "Remove" => {
+            let remove_json = serde_json::to_string(value).unwrap_or_default();
+            match existing {
+                Some(FieldValue::Array(arr)) => {
+                    let new_arr: Vec<FieldValue> = arr
+                        .iter()
+                        .filter(|item| {
+                            let item_json = serde_json::to_string(
+                                &flapjack::types::field_value_to_json_value(item),
+                            )
+                            .unwrap_or_default();
+                            item_json != remove_json
+                        })
+                        .cloned()
+                        .collect();
+                    Some(FieldValue::Array(new_arr))
+                }
+                _ => existing.cloned(),
+            }
+        }
+        "AddUnique" => {
+            let new_item = flapjack::types::json_value_to_field_value(value)?;
+            let new_json = serde_json::to_string(value).unwrap_or_default();
+            match existing {
+                Some(FieldValue::Array(arr)) => {
+                    let already_exists = arr.iter().any(|item| {
+                        let item_json = serde_json::to_string(
+                            &flapjack::types::field_value_to_json_value(item),
+                        )
+                        .unwrap_or_default();
+                        item_json == new_json
+                    });
+                    if already_exists {
+                        Some(FieldValue::Array(arr.clone()))
+                    } else {
+                        let mut new_arr = arr.clone();
+                        new_arr.push(new_item);
+                        Some(FieldValue::Array(new_arr))
+                    }
+                }
+                None => Some(FieldValue::Array(vec![new_item])),
+                _ => Some(FieldValue::Array(vec![existing.unwrap().clone(), new_item])),
+            }
+        }
+        _ => None,
     }
 }
+
+/// Check if a JSON value is a built-in operation object (has `_operation` key).
+fn is_operation(value: &serde_json::Value) -> bool {
+    value
+        .as_object()
+        .map(|obj| obj.contains_key("_operation"))
+        .unwrap_or(false)
+}
+
+/// Merge partial update fields into an existing document, or create a new one.
+/// Returns `None` only when the document doesn't exist and `create_if_not_exists` is false.
+fn merge_partial_update(
+    existing: Option<Document>,
+    object_id: &str,
+    body: &serde_json::Map<String, serde_json::Value>,
+    create_if_not_exists: bool,
+) -> Result<Option<Document>, FlapjackError> {
+    match existing {
+        Some(doc) => {
+            let mut fields = doc.fields.clone();
+            for (k, v) in body {
+                if k == "objectID" || k == "id" {
+                    continue;
+                }
+                if is_operation(v) {
+                    let obj = v.as_object().unwrap();
+                    let op = obj
+                        .get("_operation")
+                        .and_then(|o| o.as_str())
+                        .unwrap_or("");
+                    let op_value = obj
+                        .get("value")
+                        .unwrap_or(&serde_json::Value::Null);
+                    if let Some(new_val) = apply_operation(fields.get(k), op, op_value) {
+                        fields.insert(k.clone(), new_val);
+                    }
+                } else if let Some(field_val) = flapjack::types::json_value_to_field_value(v) {
+                    fields.insert(k.clone(), field_val);
+                }
+            }
+            Ok(Some(Document {
+                id: object_id.to_string(),
+                fields,
+            }))
+        }
+        None => {
+            if !create_if_not_exists {
+                return Ok(None);
+            }
+            let mut json_obj = serde_json::Map::new();
+            json_obj.insert(
+                "_id".to_string(),
+                serde_json::Value::String(object_id.to_string()),
+            );
+            // For new documents, apply operations to empty fields
+            let mut fields_from_ops = std::collections::HashMap::new();
+            for (k, v) in body {
+                if k == "objectID" || k == "id" {
+                    continue;
+                }
+                if is_operation(v) {
+                    let obj = v.as_object().unwrap();
+                    let op = obj
+                        .get("_operation")
+                        .and_then(|o| o.as_str())
+                        .unwrap_or("");
+                    let op_value = obj
+                        .get("value")
+                        .unwrap_or(&serde_json::Value::Null);
+                    if let Some(new_val) = apply_operation(None, op, op_value) {
+                        fields_from_ops.insert(k.clone(), new_val);
+                    }
+                } else {
+                    json_obj.insert(k.clone(), v.clone());
+                }
+            }
+            let mut doc = Document::from_json(&serde_json::Value::Object(json_obj))?;
+            for (k, v) in fields_from_ops {
+                doc.fields.insert(k, v);
+            }
+            Ok(Some(doc))
+        }
+    }
+}
+
+use super::field_value_to_json;
 
 async fn add_documents_batch_impl(
     State(state): State<Arc<AppState>>,
@@ -98,13 +264,6 @@ async fn add_documents_batch_impl(
                     })?
                     .to_string();
 
-                tracing::info!(
-                    "partialUpdateObject: objectID={}, action={}, createIfNotExists={:?}",
-                    object_id,
-                    op.action,
-                    op.create_if_not_exists
-                );
-
                 object_ids.push(object_id.clone());
 
                 let create_if_not_exists = if op.action == "partialUpdateObjectNoCreate" {
@@ -114,49 +273,15 @@ async fn add_documents_batch_impl(
                 };
 
                 let existing = state.manager.get_document(&index_name, &object_id)?;
+                if existing.is_some() {
+                    deletes.push(object_id.clone());
+                }
 
-                let merged_doc = match existing {
-                    Some(doc) => {
-                        let mut fields = doc.fields.clone();
-                        for (k, v) in op.body {
-                            if k != "objectID" && k != "id" {
-                                if let Some(field_val) =
-                                    flapjack::types::json_value_to_field_value(&v)
-                                {
-                                    fields.insert(k, field_val);
-                                }
-                            }
-                        }
-                        deletes.push(object_id.clone());
-                        Some(Document {
-                            id: object_id.clone(),
-                            fields,
-                        })
-                    }
-                    None => {
-                        tracing::info!("Doc not found, createIfNotExists={}", create_if_not_exists);
-                        if !create_if_not_exists {
-                            None
-                        } else {
-                            let mut doc_map = op.body;
-                            doc_map.remove("objectID");
-                            doc_map.remove("id");
-
-                            let mut json_obj = serde_json::Map::new();
-                            json_obj.insert(
-                                "_id".to_string(),
-                                serde_json::Value::String(object_id.clone()),
-                            );
-                            for (k, v) in doc_map {
-                                json_obj.insert(k, v);
-                            }
-
-                            Some(Document::from_json(&serde_json::Value::Object(json_obj))?)
-                        }
-                    }
-                };
-
-                if let Some(doc) = merged_doc {
+                let body_map: serde_json::Map<String, serde_json::Value> =
+                    op.body.into_iter().collect();
+                if let Some(doc) =
+                    merge_partial_update(existing, &object_id, &body_map, create_if_not_exists)?
+                {
                     documents.push(doc);
                 }
             }
@@ -195,11 +320,7 @@ async fn add_documents_batch_impl(
                     .remove("objectID")
                     .or_else(|| doc_map.remove("id"))
                     .and_then(|v| v.as_str().map(String::from))
-                    .ok_or_else(|| {
-                        FlapjackError::InvalidQuery(
-                            "Missing objectID in batch operation".to_string(),
-                        )
-                    })?;
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
                 object_ids.push(id.clone());
 
@@ -226,8 +347,9 @@ async fn add_documents_batch_impl(
             .manager
             .delete_documents_sync(&index_name, deletes)
             .await?;
+        let noop = state.manager.make_noop_task(&index_name)?;
         return Ok(Json(AddDocumentsResponse::Algolia {
-            task_id: 0,
+            task_id: noop.numeric_id,
             object_ids,
         }));
     } else if !deletes.is_empty() {
@@ -314,7 +436,7 @@ pub async fn add_documents(
     let task = state.manager.add_documents(&index_name, vec![document])?;
 
     Ok(Json(AddDocumentsResponse::Algolia {
-        task_id: task.id.parse().unwrap_or(0),
+        task_id: task.numeric_id,
         object_ids: vec![id],
     }))
 }
@@ -392,8 +514,9 @@ pub async fn delete_object(
         .delete_documents_sync(&index_name, vec![object_id])
         .await?;
 
+    let task = state.manager.make_noop_task(&index_name)?;
     Ok(Json(serde_json::json!({
-        "taskID": 0,
+        "taskID": task.numeric_id,
         "deletedAt": chrono::Utc::now().to_rfc3339()
     })))
 }
@@ -446,8 +569,9 @@ pub async fn put_object(
         .add_documents_sync(&index_name, vec![document])
         .await?;
 
+    let task = state.manager.make_noop_task(&index_name)?;
     Ok(Json(serde_json::json!({
-        "taskID": 0,
+        "taskID": task.numeric_id,
         "objectID": object_id,
         "updatedAt": chrono::Utc::now().to_rfc3339()
     })))
@@ -578,8 +702,9 @@ pub async fn delete_by_query(
     }
 
     if all_ids.is_empty() {
+        let task = state.manager.make_noop_task(&index_name)?;
         return Ok(Json(serde_json::json!({
-            "taskID": 0,
+            "taskID": task.numeric_id,
             "deletedAt": chrono::Utc::now().to_rfc3339()
         })));
     }
@@ -589,8 +714,113 @@ pub async fn delete_by_query(
         .delete_documents_sync(&index_name, all_ids)
         .await?;
 
+    let task = state.manager.make_noop_task(&index_name)?;
     Ok(Json(serde_json::json!({
-        "taskID": 0,
+        "taskID": task.numeric_id,
         "deletedAt": chrono::Utc::now().to_rfc3339()
     })))
+}
+
+/// Add a record with an auto-generated objectID (Algolia-compatible)
+#[utoipa::path(
+    post,
+    path = "/1/indexes/{indexName}",
+    tag = "documents",
+    params(
+        ("indexName" = String, Path, description = "Index name")
+    ),
+    request_body(content = serde_json::Value, description = "Object data (objectID is auto-generated)"),
+    responses(
+        (status = 200, description = "Object created successfully", body = serde_json::Value)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn add_record_auto_id(
+    State(state): State<Arc<AppState>>,
+    Path(index_name): Path<String>,
+    Json(mut body): Json<serde_json::Map<String, serde_json::Value>>,
+) -> Result<Json<serde_json::Value>, FlapjackError> {
+    state.manager.create_tenant(&index_name)?;
+
+    let generated_id = uuid::Uuid::new_v4().to_string();
+
+    body.remove("objectID");
+    body.remove("id");
+
+    let mut json_obj = serde_json::Map::new();
+    json_obj.insert(
+        "_id".to_string(),
+        serde_json::Value::String(generated_id.clone()),
+    );
+    for (k, v) in body {
+        json_obj.insert(k, v);
+    }
+
+    let document = Document::from_json(&serde_json::Value::Object(json_obj))?;
+    let task = state.manager.add_documents(&index_name, vec![document])?;
+
+    Ok(Json(serde_json::json!({
+        "taskID": task.numeric_id,
+        "objectID": generated_id,
+        "createdAt": chrono::Utc::now().to_rfc3339()
+    })))
+}
+
+/// Partial update a record (Algolia-compatible dedicated endpoint)
+#[utoipa::path(
+    post,
+    path = "/1/indexes/{indexName}/{objectID}/partial",
+    tag = "documents",
+    params(
+        ("indexName" = String, Path, description = "Index name"),
+        ("objectID" = String, Path, description = "Object ID to partially update"),
+        ("createIfNotExists" = Option<bool>, Query, description = "Create the record if it doesn't exist (default: true)")
+    ),
+    request_body(content = serde_json::Value, description = "Fields to update"),
+    responses(
+        (status = 200, description = "Object partially updated", body = serde_json::Value)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn partial_update_object(
+    State(state): State<Arc<AppState>>,
+    Path((index_name, object_id)): Path<(String, String)>,
+    Query(params): Query<PartialUpdateParams>,
+    Json(body): Json<serde_json::Map<String, serde_json::Value>>,
+) -> Result<Json<serde_json::Value>, FlapjackError> {
+    state.manager.create_tenant(&index_name)?;
+
+    let create_if_not_exists = params.create_if_not_exists.unwrap_or(true);
+    let existing = state.manager.get_document(&index_name, &object_id)?;
+
+    if existing.is_some() {
+        state
+            .manager
+            .delete_documents_sync(&index_name, vec![object_id.clone()])
+            .await?;
+    }
+
+    if let Some(doc) = merge_partial_update(existing, &object_id, &body, create_if_not_exists)? {
+        state
+            .manager
+            .add_documents_sync(&index_name, vec![doc])
+            .await?;
+    }
+
+    let task = state.manager.make_noop_task(&index_name)?;
+    Ok(Json(serde_json::json!({
+        "taskID": task.numeric_id,
+        "objectID": object_id,
+        "updatedAt": chrono::Utc::now().to_rfc3339()
+    })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartialUpdateParams {
+    pub create_if_not_exists: Option<bool>,
 }

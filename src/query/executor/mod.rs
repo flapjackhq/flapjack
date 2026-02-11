@@ -5,9 +5,13 @@ use crate::query::filter::FilterCompiler;
 use crate::query::parser::ShortQueryPlaceholder;
 use crate::types::{Filter, ScoredDocument, SearchResult};
 use std::sync::Arc;
-use tantivy::query::{BooleanQuery, Occur, Query as TantivyQuery, TermQuery};
+use tantivy::query::{BooleanQuery, BoostQuery, Occur, Query as TantivyQuery, TermQuery};
 use tantivy::schema::IndexRecordOption;
 use tantivy::Searcher;
+
+/// Type alias: QueryExecutor stores settings as Arc to avoid cloning the
+/// full IndexSettings struct on every search (it can be 1+ KB).
+type SettingsRef = Option<Arc<IndexSettings>>;
 
 mod facets;
 mod relevance;
@@ -18,7 +22,7 @@ pub struct QueryExecutor {
     pub(crate) converter: Arc<DocumentConverter>,
     pub(crate) filter_compiler: FilterCompiler,
     pub(crate) tantivy_schema: tantivy::schema::Schema,
-    pub(crate) settings: Option<IndexSettings>,
+    pub(crate) settings: SettingsRef,
     pub(crate) json_search_field: tantivy::schema::Field,
     pub(crate) searchable_paths: Vec<String>,
     pub(crate) query_text: String,
@@ -47,7 +51,7 @@ impl QueryExecutor {
         self
     }
 
-    pub fn with_settings(mut self, settings: Option<IndexSettings>) -> Self {
+    pub fn with_settings(mut self, settings: SettingsRef) -> Self {
         if let Some(ref s) = settings {
             if let Some(ref attrs) = s.searchable_attributes {
                 self.searchable_paths = attrs.clone();
@@ -78,7 +82,7 @@ impl QueryExecutor {
         filter: Option<&Filter>,
     ) -> Result<Box<dyn TantivyQuery>> {
         if let Some(f) = filter {
-            let filter_query = self.filter_compiler.compile(f, self.settings.as_ref())?;
+            let filter_query = self.filter_compiler.compile(f, self.settings.as_deref())?;
             Ok(Box::new(BooleanQuery::new(vec![
                 (Occur::Must, query),
                 (Occur::Must, filter_query),
@@ -86,6 +90,41 @@ impl QueryExecutor {
         } else {
             Ok(query)
         }
+    }
+
+    /// Wraps the query with Should + BoostQuery clauses for optional filters.
+    /// Documents matching the optional filters get a score boost; non-matching
+    /// documents are NOT excluded from results.
+    pub fn apply_optional_boosts(
+        &self,
+        query: Box<dyn TantivyQuery>,
+        specs: &[(String, String, f32)],
+    ) -> Result<Box<dyn TantivyQuery>> {
+        if specs.is_empty() {
+            return Ok(query);
+        }
+        let json_filter_field = self
+            .tantivy_schema
+            .get_field("_json_filter")
+            .map_err(|_| crate::error::FlapjackError::FieldNotFound("_json_filter".to_string()))?;
+
+        let mut clauses: Vec<(Occur, Box<dyn TantivyQuery>)> = vec![(Occur::Must, query)];
+
+        for (field, value, score) in specs {
+            // Build a term query on _json_filter.{field} for the value
+            let term_text = format!("{}\0s{}", field, value.to_lowercase());
+            let term = tantivy::Term::from_field_text(json_filter_field, &term_text);
+            let term_query: Box<dyn TantivyQuery> =
+                Box::new(TermQuery::new(term, IndexRecordOption::Basic));
+            let boosted: Box<dyn TantivyQuery> = if *score != 1.0 {
+                Box::new(BoostQuery::new(term_query, *score))
+            } else {
+                term_query
+            };
+            clauses.push((Occur::Should, boosted));
+        }
+
+        Ok(Box::new(BooleanQuery::new(clauses)))
     }
 
     // Expands short queries (≤2 chars) by enumerating matching terms from the index.
@@ -152,7 +191,16 @@ impl QueryExecutor {
         if let Some(segment) = searcher.segment_readers().first() {
             let inv_index = segment.inverted_index(marker.field)?;
 
-            for (path_idx, path) in marker.paths.iter().enumerate() {
+            // Limit searchable paths and terms-per-path for short queries to
+            // keep the resulting BooleanQuery manageable.  With edge_ngram
+            // indexing, 1-char terms like "m" exist for every word starting
+            // with 'm' — extremely high document frequency.  Use tighter caps
+            // for 1-char queries (3 paths × 20 terms = 60 clauses) vs 2-char
+            // (5 paths × 50 terms = 250 clauses).
+            let is_single_char = marker.token.chars().count() == 1;
+            let max_paths = if is_single_char { 3 } else { 5 }.min(marker.paths.len());
+            let max_terms_per_path: usize = if is_single_char { 20 } else { 50 };
+            for (path_idx, path) in marker.paths.iter().take(max_paths).enumerate() {
                 let weight = marker.weights.get(path_idx).copied().unwrap_or(1.0);
                 let prefix_bytes = format!("{}\0s{}", path, marker.token).into_bytes();
                 let mut upper_bound = prefix_bytes.clone();
@@ -165,7 +213,7 @@ impl QueryExecutor {
                     .into_stream()?;
                 let mut count = 0;
 
-                while terms.advance() && count < 100 {
+                while terms.advance() && count < max_terms_per_path {
                     let term_bytes = terms.key();
                     let term = tantivy::Term::from_field_bytes(marker.field, term_bytes);
                     let term_query: Box<dyn TantivyQuery> = Box::new(TermQuery::new(

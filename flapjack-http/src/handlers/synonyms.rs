@@ -113,8 +113,10 @@ pub async fn save_synonym(
         serde_json::to_value(&synonym).unwrap_or_default(),
     );
 
+    let task = state.manager.make_noop_task(&index_name)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({
-        "taskID": 0,
+        "taskID": task.numeric_id,
         "updatedAt": chrono::Utc::now().to_rfc3339(),
         "id": synonym.object_id()
     })))
@@ -176,8 +178,10 @@ pub async fn delete_synonym(
         serde_json::json!({"objectID": object_id}),
     );
 
+    let task = state.manager.make_noop_task(&index_name)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({
-        "taskID": 0,
+        "taskID": task.numeric_id,
         "deletedAt": chrono::Utc::now().to_rfc3339()
     })))
 }
@@ -248,8 +252,10 @@ pub async fn save_synonyms(
         serde_json::json!({"synonyms": synonyms_json, "replace": replace}),
     );
 
+    let task = state.manager.make_noop_task(&index_name)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({
-        "taskID": 0,
+        "taskID": task.numeric_id,
         "updatedAt": chrono::Utc::now().to_rfc3339()
     })))
 }
@@ -289,8 +295,10 @@ pub async fn clear_synonyms(
         .manager
         .append_oplog(&index_name, "clear_synonyms", serde_json::json!({}));
 
+    let task = state.manager.make_noop_task(&index_name)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({
-        "taskID": 0,
+        "taskID": task.numeric_id,
         "updatedAt": chrono::Utc::now().to_rfc3339()
     })))
 }

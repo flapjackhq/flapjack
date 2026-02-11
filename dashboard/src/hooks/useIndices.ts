@@ -55,6 +55,24 @@ export function useDeleteIndex() {
   });
 }
 
+export function useCompactIndex() {
+  const queryClient = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: async (indexName: string) => {
+      const { data } = await api.post(`/1/indexes/${indexName}/compact`);
+      return data;
+    },
+    onSuccess: (_data, indexName) => {
+      queryClient.invalidateQueries({ queryKey: ['indices'] });
+      toast({ title: 'Compaction started', description: `Index "${indexName}" is being compacted.` });
+    },
+    onError: (error: Error) => {
+      toast({ variant: 'destructive', title: 'Failed to compact index', description: error.message });
+    },
+  });
+}
+
 export function useIndexStats(indexName: string) {
   return useQuery({
     queryKey: ['index-stats', indexName],

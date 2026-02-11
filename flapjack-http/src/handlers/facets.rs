@@ -49,6 +49,112 @@ fn highlight_facet_match(value: &str, query: &str) -> String {
     }
 }
 
+/// Search for facet values from a multi-search `type: "facet"` query.
+/// Called by the batch_search handler when a request has `type: "facet"`.
+pub async fn search_facet_values_inline(
+    state: Arc<AppState>,
+    index_name: &str,
+    facet_name: &str,
+    facet_query: &str,
+    max_facet_hits: usize,
+    filters: Option<&str>,
+) -> Result<serde_json::Value, FlapjackError> {
+    let start = Instant::now();
+
+    let settings_path = state
+        .manager
+        .base_path
+        .join(index_name)
+        .join("settings.json");
+    let settings = if settings_path.exists() {
+        IndexSettings::load(&settings_path)?
+    } else {
+        // Return empty facet hits for missing index (don't fail the batch)
+        return Ok(serde_json::json!({
+            "facetHits": [],
+            "exhaustiveFacetsCount": true,
+            "processingTimeMS": 0
+        }));
+    };
+
+    let searchable_facets = settings.searchable_facet_set();
+    if !searchable_facets.contains(facet_name) {
+        return Ok(serde_json::json!({
+            "facetHits": [],
+            "exhaustiveFacetsCount": true,
+            "processingTimeMS": 0
+        }));
+    }
+
+    let filter = if let Some(filter_str) = filters {
+        Some(
+            parse_filter(filter_str)
+                .map_err(|e| FlapjackError::InvalidQuery(format!("Filter parse error: {}", e)))?,
+        )
+    } else {
+        None
+    };
+
+    let facet_request = FacetRequest {
+        field: facet_name.to_string(),
+        path: format!("/{}", facet_name),
+    };
+
+    let result = state.manager.search_full(
+        index_name,
+        "",
+        filter.as_ref(),
+        None,
+        0,
+        0,
+        Some(&[facet_request]),
+        None,
+        Some(1000),
+    )?;
+
+    let facet_counts = result.facets.get(facet_name);
+    let query_lower = facet_query.to_lowercase();
+    let empty_vec = Vec::new();
+    let counts = facet_counts.unwrap_or(&empty_vec);
+
+    let mut matching: Vec<_> = counts
+        .iter()
+        .filter(|fc| {
+            if query_lower.is_empty() {
+                return true;
+            }
+            let leaf_value = fc.path.rsplit(" > ").next().unwrap_or(&fc.path);
+            leaf_value.to_lowercase().contains(&query_lower)
+        })
+        .collect();
+
+    matching.sort_by(|a, b| b.count.cmp(&a.count));
+
+    let hits: Vec<serde_json::Value> = matching
+        .into_iter()
+        .take(max_facet_hits)
+        .map(|fc| {
+            let value = fc.path.clone();
+            let highlighted = if facet_query.is_empty() {
+                value.clone()
+            } else {
+                highlight_facet_match(&value, facet_query)
+            };
+            serde_json::json!({
+                "value": value,
+                "highlighted": highlighted,
+                "count": fc.count
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "facetHits": hits,
+        "exhaustiveFacetsCount": true,
+        "processingTimeMS": start.elapsed().as_millis() as u64
+    }))
+}
+
 /// Search for facet values with optional filtering
 #[utoipa::path(
     post,

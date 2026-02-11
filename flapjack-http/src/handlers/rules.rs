@@ -105,8 +105,10 @@ pub async fn save_rule(
         serde_json::to_value(&rule).unwrap_or_default(),
     );
 
+    let task = state.manager.make_noop_task(&index_name)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({
-        "taskID": 0,
+        "taskID": task.numeric_id,
         "updatedAt": chrono::Utc::now().to_rfc3339(),
         "id": rule.object_id
     })))
@@ -164,8 +166,10 @@ pub async fn delete_rule(
         serde_json::json!({"objectID": object_id}),
     );
 
+    let task = state.manager.make_noop_task(&index_name)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({
-        "taskID": 0,
+        "taskID": task.numeric_id,
         "deletedAt": chrono::Utc::now().to_rfc3339()
     })))
 }
@@ -232,8 +236,10 @@ pub async fn save_rules(
         serde_json::json!({"rules": rules_json, "clearExisting": clear_existing}),
     );
 
+    let task = state.manager.make_noop_task(&index_name)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({
-        "taskID": 0,
+        "taskID": task.numeric_id,
         "updatedAt": chrono::Utc::now().to_rfc3339()
     })))
 }
@@ -269,8 +275,10 @@ pub async fn clear_rules(
         .manager
         .append_oplog(&index_name, "clear_rules", serde_json::json!({}));
 
+    let task = state.manager.make_noop_task(&index_name)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({
-        "taskID": 0,
+        "taskID": task.numeric_id,
         "updatedAt": chrono::Utc::now().to_rfc3339()
     })))
 }

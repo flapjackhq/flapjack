@@ -1,5 +1,6 @@
 import { memo, useCallback, useState } from 'react';
-import { Filter, X } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { Filter, X, Settings } from 'lucide-react';
 import { useSearch } from '@/hooks/useSearch';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -134,7 +135,16 @@ export const FacetsPanel = memo(function FacetsPanel({
     return (
       <Card className="p-6 text-center">
         <Filter className="h-8 w-8 mx-auto mb-2 text-muted-foreground" />
-        <p className="text-sm text-muted-foreground">No facets configured</p>
+        <h4 className="text-sm font-medium mb-1">No facets configured</h4>
+        <p className="text-xs text-muted-foreground mb-3">
+          Add attributes to <span className="font-medium">Faceting</span> in settings to enable filtering.
+        </p>
+        <Link to={`/index/${encodeURIComponent(indexName)}/settings`}>
+          <Button variant="outline" size="sm">
+            <Settings className="h-3.5 w-3.5 mr-1" />
+            Configure Facets
+          </Button>
+        </Link>
       </Card>
     );
   }

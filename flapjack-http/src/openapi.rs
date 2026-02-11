@@ -9,7 +9,7 @@ use utoipa::OpenApi;
         license(name = "MIT OR Apache-2.0"),
         contact(
             name = "Flapjack",
-            url = "https://github.com/flapjackhq/flapjack"
+            url = "https://github.com/stuartcrobinson/flapjack"
         )
     ),
     servers(

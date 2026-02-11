@@ -21,6 +21,11 @@ pub struct MigrateFromAlgoliaRequest {
 
     #[serde(rename = "targetIndex")]
     pub target_index: Option<String>,
+
+    /// If true, delete any existing target index before migrating.
+    /// Without this, migrating to an existing index returns 409.
+    #[serde(default)]
+    pub overwrite: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,6 +135,36 @@ pub async fn migrate_from_algolia(
     }
 
     let client = reqwest::Client::new();
+
+    // Check if the target index already exists
+    let target_path = state.manager.base_path.join(target_index);
+    if target_path.exists() {
+        if !payload.overwrite {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "message": format!(
+                        "Target index '{}' already exists. Use \"overwrite\": true to replace it.",
+                        target_index
+                    )
+                })),
+            ));
+        }
+        // Delete the existing index first
+        tracing::info!("[migrate] Overwriting existing index '{}'", target_index);
+        state
+            .manager
+            .delete_tenant(&target_index.to_string())
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "message": format!("Failed to delete existing index: {}", e)
+                    })),
+                )
+            })?;
+    }
 
     // Create the target index in Flapjack
     state.manager.create_tenant(target_index).map_err(|e| {

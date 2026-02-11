@@ -1,6 +1,6 @@
 use axum::{
     middleware,
-    routing::{delete, get, post},
+    routing::{get, post},
     Router,
 };
 use std::sync::Arc;
@@ -72,17 +72,90 @@ pub async fn spawn_server_with_key(admin_key: Option<&str>) -> (String, TempDir)
         )
         .route(
             "/1/indexes/:indexName/settings",
-            post(flapjack_http::handlers::set_settings),
+            get(flapjack_http::handlers::get_settings)
+                .post(flapjack_http::handlers::set_settings)
+                .put(flapjack_http::handlers::set_settings),
         )
         .route(
-            "/1/indexes/:indexName/settings",
-            get(flapjack_http::handlers::get_settings),
+            "/1/indexes/:indexName/objects",
+            post(flapjack_http::handlers::get_objects),
+        )
+        .route(
+            "/1/indexes/:indexName/deleteByQuery",
+            post(flapjack_http::handlers::delete_by_query),
+        )
+        .route(
+            "/1/indexes/:indexName/:objectID/partial",
+            post(flapjack_http::handlers::partial_update_object),
+        )
+        .route(
+            "/1/indexes/:indexName/:objectID",
+            get(flapjack_http::handlers::get_object)
+                .delete(flapjack_http::handlers::delete_object)
+                .put(flapjack_http::handlers::put_object),
         )
         .route(
             "/1/indexes/:indexName",
-            delete(flapjack_http::handlers::delete_index),
+            post(flapjack_http::handlers::add_record_auto_id)
+                .delete(flapjack_http::handlers::delete_index),
+        )
+        .route(
+            "/1/indexes/:indexName/browse",
+            post(flapjack_http::handlers::browse_index),
+        )
+        .route(
+            "/1/indexes/:indexName/clear",
+            post(flapjack_http::handlers::clear_index),
+        )
+        .route(
+            "/1/indexes/:indexName/facets/:facetName/query",
+            post(flapjack_http::handlers::search_facet_values),
+        )
+        .route(
+            "/1/indexes/:indexName/synonyms/:objectID",
+            get(flapjack_http::handlers::get_synonym)
+                .put(flapjack_http::handlers::save_synonym)
+                .delete(flapjack_http::handlers::delete_synonym),
+        )
+        .route(
+            "/1/indexes/:indexName/synonyms/batch",
+            post(flapjack_http::handlers::save_synonyms),
+        )
+        .route(
+            "/1/indexes/:indexName/synonyms/clear",
+            post(flapjack_http::handlers::clear_synonyms),
+        )
+        .route(
+            "/1/indexes/:indexName/synonyms/search",
+            post(flapjack_http::handlers::search_synonyms),
+        )
+        .route(
+            "/1/indexes/:indexName/rules/:objectID",
+            get(flapjack_http::handlers::get_rule)
+                .put(flapjack_http::handlers::save_rule)
+                .delete(flapjack_http::handlers::delete_rule),
+        )
+        .route(
+            "/1/indexes/:indexName/rules/batch",
+            post(flapjack_http::handlers::save_rules),
+        )
+        .route(
+            "/1/indexes/:indexName/rules/clear",
+            post(flapjack_http::handlers::clear_rules),
+        )
+        .route(
+            "/1/indexes/:indexName/rules/search",
+            post(flapjack_http::handlers::search_rules),
+        )
+        .route(
+            "/1/indexes/:indexName/operation",
+            post(flapjack_http::handlers::operation_index),
         )
         .route("/1/tasks/:task_id", get(flapjack_http::handlers::get_task))
+        .route(
+            "/1/indexes/:indexName/task/:task_id",
+            get(flapjack_http::handlers::get_task_for_index),
+        )
         .with_state(state);
 
     let ks_for_middleware = key_store.clone();

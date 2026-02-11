@@ -110,6 +110,9 @@ pub struct QueryParser {
     searchable_paths: Vec<String>,
     query_type: String,
     plural_map: Option<std::collections::HashMap<String, Vec<String>>>,
+    typo_tolerance: bool,
+    min_word_size_for_1_typo: usize,
+    advanced_syntax: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +133,9 @@ impl QueryParser {
             searchable_paths: vec![],
             query_type: "prefixLast".to_string(),
             plural_map: None,
+            typo_tolerance: true,
+            min_word_size_for_1_typo: 4,
+            advanced_syntax: false,
         }
     }
 
@@ -151,6 +157,9 @@ impl QueryParser {
             searchable_paths,
             query_type: "prefixLast".to_string(),
             plural_map: None,
+            typo_tolerance: true,
+            min_word_size_for_1_typo: 4,
+            advanced_syntax: false,
         }
     }
 
@@ -164,6 +173,21 @@ impl QueryParser {
         self
     }
 
+    pub fn with_typo_tolerance(mut self, enabled: bool) -> Self {
+        self.typo_tolerance = enabled;
+        self
+    }
+
+    pub fn with_min_word_size_for_1_typo(mut self, size: usize) -> Self {
+        self.min_word_size_for_1_typo = size;
+        self
+    }
+
+    pub fn with_advanced_syntax(mut self, enabled: bool) -> Self {
+        self.advanced_syntax = enabled;
+        self
+    }
+
     pub fn with_plural_map(
         mut self,
         plural_map: Option<std::collections::HashMap<String, Vec<String>>>,
@@ -173,11 +197,25 @@ impl QueryParser {
     }
 
     pub fn parse(&self, query: &Query) -> Result<Box<dyn TantivyQuery>> {
+        // Advanced syntax: extract "phrases" and -exclusions before normal parsing
+        if self.advanced_syntax {
+            let (phrases, exclusions, remaining) =
+                Self::preprocess_advanced_syntax(&query.text);
+            if !phrases.is_empty() || !exclusions.is_empty() {
+                return self.parse_with_advanced_syntax(
+                    &remaining,
+                    &phrases,
+                    &exclusions,
+                    query.text.ends_with(' '),
+                );
+            }
+        }
+
         let has_trailing_space = query.text.ends_with(' ');
         let text = query.text.to_lowercase().trim_end_matches('*').to_string();
         let tokens: Vec<String> = split_cjk_aware(&text);
 
-        tracing::info!(
+        tracing::trace!(
             "[PARSER] parse() called: query='{}', tokens={:?}, searchable_paths={:?}",
             query.text,
             tokens,
@@ -191,7 +229,7 @@ impl QueryParser {
         // SHORT QUERY PATH: Single token ≤2 chars uses prefix enumeration
         // BUT: if trailing space, treat as exact match (no prefix)
         if tokens.len() == 1 && tokens[0].chars().count() <= 2 {
-            tracing::info!(
+            tracing::trace!(
                 "[PARSER] Short query detected: token={}, char_count={}, has_trailing_space={}",
                 tokens[0],
                 tokens[0].chars().count(),
@@ -235,14 +273,14 @@ impl QueryParser {
                 weights: self.weights.clone(),
                 field: self.fields[0],
             };
-            tracing::info!(
+            tracing::trace!(
                 "[PARSER] Creating placeholder with {} paths",
                 self.searchable_paths.len()
             );
             return Ok(Box::new(ShortQueryPlaceholder { marker }));
         }
 
-        tracing::info!(
+        tracing::trace!(
             "QueryParser: query='{}', searchable_paths={:?}, weights={:?}, tokens={:?}",
             query.text,
             self.searchable_paths,
@@ -252,6 +290,18 @@ impl QueryParser {
 
         let json_search_field = self.fields[0];
         let mut word_queries: Vec<(tantivy::query::Occur, Box<dyn TantivyQuery>)> = Vec::new();
+
+        // Limit fuzzy matching to top N paths for multi-word queries to keep
+        // the total number of expensive FuzzyTermQuery evaluations manageable.
+        // Cap fuzzy matching to a small number of top searchable paths.
+        // FuzzyTermQuery builds a Levenshtein automaton per term×path — expensive.
+        // For single-word queries like "action", running fuzzy on all 10+ paths
+        // was causing 179ms vs Algolia's 83ms.
+        let max_fuzzy_paths = if tokens.len() >= 3 {
+            2.min(self.searchable_paths.len())
+        } else {
+            4.min(self.searchable_paths.len())
+        };
 
         let last_idx = tokens.len() - 1;
         for (token_idx, token) in tokens.iter().enumerate() {
@@ -310,7 +360,7 @@ impl QueryParser {
                 let term_text = format!("{}\0s{}", path, token);
                 let term = tantivy::Term::from_field_text(target_field, &term_text);
 
-                let distance = if token.len() >= 4 { 1 } else { 0 };
+                let distance = if self.typo_tolerance && token.len() >= self.min_word_size_for_1_typo && path_idx < max_fuzzy_paths { 1 } else { 0 };
                 tracing::trace!(
                     "[PARSER] token='{}' path='{}' is_prefix={} field={:?}",
                     token,
@@ -324,7 +374,18 @@ impl QueryParser {
                         term.clone(),
                         tantivy::schema::IndexRecordOption::WithFreqsAndPositions,
                     ));
-                    let fuzzy = Box::new(tantivy::query::FuzzyTermQuery::new(term, distance, true));
+                    // For prefix queries, run fuzzy on _json_exact (simple tokenizer)
+                    // instead of _json_search (edge_ngram). The prefix match is already
+                    // handled by the TermQuery above on the n-gram index. Running the
+                    // Levenshtein automaton on the n-gram index traverses ~8x more terms
+                    // (every word generates ~8 n-gram terms) for no benefit.
+                    let fuzzy_term = if is_prefix {
+                        let fuzzy_field = self.json_exact_field.unwrap_or(target_field);
+                        tantivy::Term::from_field_text(fuzzy_field, &term_text)
+                    } else {
+                        term
+                    };
+                    let fuzzy = Box::new(tantivy::query::FuzzyTermQuery::new(fuzzy_term, distance, true));
                     Box::new(tantivy::query::BooleanQuery::new(vec![
                         (tantivy::query::Occur::Should, exact),
                         (tantivy::query::Occur::Should, fuzzy),
@@ -388,5 +449,152 @@ impl QueryParser {
             .map(|s| s.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
             .filter(|s| !s.is_empty())
             .collect()
+    }
+
+    /// Extract "quoted phrases" and -exclusion terms from query text.
+    fn preprocess_advanced_syntax(text: &str) -> (Vec<String>, Vec<String>, String) {
+        let mut phrases = Vec::new();
+        let mut exclusions = Vec::new();
+        let mut remaining = String::new();
+
+        let mut chars = text.chars().peekable();
+        while let Some(&c) = chars.peek() {
+            if c == '"' {
+                chars.next();
+                let mut phrase = String::new();
+                while let Some(&nc) = chars.peek() {
+                    if nc == '"' {
+                        chars.next();
+                        break;
+                    }
+                    phrase.push(nc);
+                    chars.next();
+                }
+                let trimmed = phrase.trim().to_string();
+                if !trimmed.is_empty() {
+                    phrases.push(trimmed);
+                }
+            } else if c == '-' && (remaining.is_empty() || remaining.ends_with(' ')) {
+                chars.next();
+                let mut word = String::new();
+                while let Some(&nc) = chars.peek() {
+                    if nc.is_whitespace() {
+                        break;
+                    }
+                    word.push(nc);
+                    chars.next();
+                }
+                if !word.is_empty() {
+                    exclusions.push(word);
+                }
+            } else {
+                remaining.push(c);
+                chars.next();
+            }
+        }
+        (phrases, exclusions, remaining.trim().to_string())
+    }
+
+    /// Build a query combining phrases (Must), exclusions (MustNot), and remaining text.
+    fn parse_with_advanced_syntax(
+        &self,
+        remaining_text: &str,
+        phrases: &[String],
+        exclusions: &[String],
+        _has_trailing_space: bool,
+    ) -> Result<Box<dyn TantivyQuery>> {
+        let json_search_field = self.fields[0];
+        let exact_field = self.json_exact_field.unwrap_or(json_search_field);
+
+        let mut clauses: Vec<(tantivy::query::Occur, Box<dyn TantivyQuery>)> = Vec::new();
+
+        // Parse remaining text as a normal query
+        if !remaining_text.trim().is_empty() {
+            let sub_query = Query {
+                text: remaining_text.to_string(),
+            };
+            // Temporarily disable advanced_syntax to avoid recursion
+            let normal_parser = QueryParser {
+                advanced_syntax: false,
+                ..self.clone_parser()
+            };
+            if let Ok(q) = normal_parser.parse(&sub_query) {
+                clauses.push((tantivy::query::Occur::Must, q));
+            }
+        }
+
+        // Phrase queries: all words in the phrase must match (exact, on same field paths)
+        for phrase in phrases {
+            let words: Vec<String> = phrase.to_lowercase().split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
+            if words.is_empty() {
+                continue;
+            }
+            let mut phrase_clauses: Vec<(tantivy::query::Occur, Box<dyn TantivyQuery>)> =
+                Vec::new();
+            for word in &words {
+                let mut field_queries: Vec<(tantivy::query::Occur, Box<dyn TantivyQuery>)> =
+                    Vec::new();
+                for (path_idx, path) in self.searchable_paths.iter().enumerate() {
+                    let term_text = format!("{}\0s{}", path, word);
+                    let term = tantivy::Term::from_field_text(exact_field, &term_text);
+                    let tq: Box<dyn TantivyQuery> =
+                        Box::new(tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::WithFreqs));
+                    let weight = self.weights.get(path_idx).copied().unwrap_or(1.0);
+                    field_queries.push((
+                        tantivy::query::Occur::Should,
+                        Box::new(tantivy::query::BoostQuery::new(tq, weight)),
+                    ));
+                }
+                phrase_clauses.push((
+                    tantivy::query::Occur::Must,
+                    Box::new(tantivy::query::BooleanQuery::new(field_queries)),
+                ));
+            }
+            clauses.push((
+                tantivy::query::Occur::Must,
+                Box::new(tantivy::query::BooleanQuery::new(phrase_clauses)),
+            ));
+        }
+
+        // Exclusion queries: MustNot for each excluded term
+        for exclusion in exclusions {
+            let word = exclusion.to_lowercase();
+            let mut field_queries: Vec<(tantivy::query::Occur, Box<dyn TantivyQuery>)> =
+                Vec::new();
+            for path in &self.searchable_paths {
+                let term_text = format!("{}\0s{}", path, word);
+                let term = tantivy::Term::from_field_text(exact_field, &term_text);
+                let tq: Box<dyn TantivyQuery> =
+                    Box::new(tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::WithFreqs));
+                field_queries.push((tantivy::query::Occur::Should, tq));
+            }
+            clauses.push((
+                tantivy::query::Occur::MustNot,
+                Box::new(tantivy::query::BooleanQuery::new(field_queries)),
+            ));
+        }
+
+        if clauses.is_empty() {
+            return Ok(Box::new(tantivy::query::AllQuery));
+        }
+
+        Ok(Box::new(tantivy::query::BooleanQuery::new(clauses)))
+    }
+
+    /// Clone parser fields without the Clone trait (for recursion avoidance)
+    fn clone_parser(&self) -> QueryParser {
+        QueryParser {
+            fields: self.fields.clone(),
+            json_exact_field: self.json_exact_field,
+            weights: self.weights.clone(),
+            searchable_paths: self.searchable_paths.clone(),
+            query_type: self.query_type.clone(),
+            plural_map: self.plural_map.clone(),
+            typo_tolerance: self.typo_tolerance,
+            min_word_size_for_1_typo: self.min_word_size_for_1_typo,
+            advanced_syntax: self.advanced_syntax,
+        }
     }
 }

@@ -50,6 +50,7 @@ export default defineConfig({
     port: 5177,
     proxy: {
       '/1': BACKEND_TARGET,
+      '/2': BACKEND_TARGET,
       '/health': BACKEND_TARGET,
       '/internal': BACKEND_TARGET,
       '/api-docs': BACKEND_TARGET,

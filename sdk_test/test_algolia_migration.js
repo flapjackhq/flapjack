@@ -114,6 +114,21 @@ const SYNONYMS = [
   { objectID: 'syn-screen-display', type: 'synonym', synonyms: ['monitor', 'screen', 'display'] },
 ];
 
+const RULES = [
+  {
+    objectID: 'rule-pin-macbook',
+    conditions: [{ pattern: 'laptop', anchoring: 'contains' }],
+    consequence: { promote: [{ objectID: 'p01', position: 0 }] },
+    description: 'Pin MacBook Pro to top when searching laptop',
+  },
+  {
+    objectID: 'rule-hide-galaxy-tab',
+    conditions: [{ pattern: 'tablet', anchoring: 'contains' }],
+    consequence: { hide: [{ objectID: 'p05' }] },
+    description: 'Hide Galaxy Tab S9 when searching tablet',
+  },
+];
+
 const SETTINGS = {
   searchableAttributes: ['name', 'description', 'brand', 'category', 'tags'],
   attributesForFaceting: ['category', 'brand', 'filterOnly(price)', 'filterOnly(inStock)'],
@@ -133,6 +148,8 @@ const SEARCHES = [
   { label: 'complex boolean filter', query: '', params: { filters: '(category:Laptops OR category:Tablets) AND brand:Apple' } },
   { label: '"wireless" + filter + facets', query: 'wireless', params: { filters: 'category:Accessories', facets: ['category'] } },
   { label: '"mac" prefix search', query: 'mac', params: {} },
+  { label: '"laptop" rule pin (p01 first)', query: 'laptop', params: {}, ruleCheck: { firstHit: 'p01' } },
+  { label: '"tablet" rule hide (no p05)', query: 'tablet', params: {}, ruleCheck: { hidden: 'p05' } },
 ];
 
 // ---------------------------------------------------------------------------
@@ -169,7 +186,7 @@ async function waitForFlapjackIndexing(expectedCount, maxWait = 10000) {
   throw new Error(`Flapjack indexing timeout: expected ${expectedCount} docs after ${maxWait}ms`);
 }
 
-function compareResults(algoliaResult, flapjackResult) {
+function compareResults(algoliaResult, flapjackResult, ruleCheck) {
   const diffs = [];
 
   // Compare hit counts
@@ -202,6 +219,21 @@ function compareResults(algoliaResult, flapjackResult) {
     }
   }
 
+  // Check rule effects if specified
+  if (ruleCheck) {
+    if (ruleCheck.firstHit && flapjackResult.hits.length > 0) {
+      if (flapjackResult.hits[0].objectID !== ruleCheck.firstHit) {
+        diffs.push(`rule pin: expected first hit ${ruleCheck.firstHit}, got ${flapjackResult.hits[0].objectID}`);
+      }
+    }
+    if (ruleCheck.hidden) {
+      const fjIds = flapjackResult.hits.map(h => h.objectID);
+      if (fjIds.includes(ruleCheck.hidden)) {
+        diffs.push(`rule hide: ${ruleCheck.hidden} should be hidden but is present in results`);
+      }
+    }
+  }
+
   return diffs;
 }
 
@@ -225,6 +257,16 @@ async function phase1_buildOnAlgolia() {
     });
   }
   log(`saveSynonyms ... OK`);
+
+  log(`saveRules (${RULES.length} rules) ...`);
+  for (const rule of RULES) {
+    await algolia.saveRule({
+      indexName: INDEX_NAME,
+      objectID: rule.objectID,
+      rule,
+    });
+  }
+  log(`saveRules ... OK`);
 
   log(`saveObjects (${PRODUCTS.length} products) ...`);
   await algolia.saveObjects({ indexName: INDEX_NAME, objects: PRODUCTS });
@@ -339,6 +381,38 @@ async function phase3_migrate() {
   }
   log(`Imported ${exportedSynonyms.length} synonyms into Flapjack ... OK`);
 
+  // Export rules from Algolia
+  log('Exporting rules from Algolia ...');
+  const rulesResponse = await fetch(
+    `https://${ALGOLIA_APP_ID}-dsn.algolia.net/1/indexes/${INDEX_NAME}/rules/search`,
+    {
+      method: 'POST',
+      headers: {
+        'x-algolia-api-key': ALGOLIA_ADMIN_KEY,
+        'x-algolia-application-id': ALGOLIA_APP_ID,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ query: '', hitsPerPage: 1000 }),
+    }
+  );
+  const rulesData = await rulesResponse.json();
+  const exportedRules = rulesData.hits || [];
+  log(`Exported ${exportedRules.length} rules from Algolia`);
+  if (VERBOSE) logIndent(`Rules: ${exportedRules.map(r => r.objectID).join(', ')}`);
+
+  // Import rules into Flapjack
+  log(`Importing ${exportedRules.length} rules into Flapjack ...`);
+  for (const rule of exportedRules) {
+    const cleanRule = { ...rule };
+    delete cleanRule._highlightResult;
+    await flapjack.saveRule({
+      indexName: INDEX_NAME,
+      objectID: cleanRule.objectID,
+      rule: cleanRule,
+    });
+  }
+  log(`Imported ${exportedRules.length} rules into Flapjack ... OK`);
+
   // Import objects into Flapjack
   log(`Importing ${allObjects.length} objects into Flapjack ...`);
   // Strip highlight results from exported objects
@@ -373,13 +447,14 @@ async function phase4_compare(expectedResults) {
     const algoliaResult = expectedResults[i];
     const flapjackResult = await searchOne(flapjack, INDEX_NAME, s.query, s.params);
 
-    const diffs = compareResults(algoliaResult, flapjackResult);
+    const diffs = compareResults(algoliaResult, flapjackResult, s.ruleCheck);
 
     if (diffs.length === 0) {
       let detail = `nbHits ${algoliaResult.nbHits}=${flapjackResult.nbHits}`;
       detail += ` | IDs match`;
       if (algoliaResult.facets) detail += ' | facets match';
       if (s.label.includes('synonym')) detail += ' (synonyms migrated!)';
+      if (s.ruleCheck) detail += ' | rules working';
       log(`PASS  "${s.query}" (${s.label}): ${detail}`);
       passed++;
     } else {
@@ -458,7 +533,7 @@ async function phase3b_migrateOneClick() {
   }
   log(`One-click index ready`);
 
-  // Debug: verify synonyms were imported into the one-click index
+  // Verify synonyms and rules were imported into the one-click index
   const synResp = await fetch(
     `${FLAPJACK_URL}/1/indexes/${ONECLICK_INDEX}/synonyms/search`,
     {
@@ -467,8 +542,19 @@ async function phase3b_migrateOneClick() {
       body: JSON.stringify({ query: '', hitsPerPage: 100 }),
     }
   );
-  const synData = await synResp.json();
-  log(`One-click index synonyms: ${synData.nbHits} (${synData.hits?.map(s => s.objectID).join(', ') || 'none'})`);
+  const synData2 = await synResp.json();
+  log(`One-click index synonyms: ${synData2.nbHits} (${synData2.hits?.map(s => s.objectID).join(', ') || 'none'})`);
+
+  const rulesResp = await fetch(
+    `${FLAPJACK_URL}/1/indexes/${ONECLICK_INDEX}/rules/search`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ query: '', hitsPerPage: 100 }),
+    }
+  );
+  const rulesData = await rulesResp.json();
+  log(`One-click index rules: ${rulesData.nbHits} (${rulesData.hits?.map(r => r.objectID).join(', ') || 'none'})`);
 
   return flapjackOneClick;
 }
@@ -488,13 +574,14 @@ async function phase4b_compareOneClick(expectedResults, flapjackOneClick) {
     const algoliaResult = expectedResults[i];
     const flapjackResult = await searchOne(flapjackOneClick, ONECLICK_INDEX, s.query, s.params);
 
-    const diffs = compareResults(algoliaResult, flapjackResult);
+    const diffs = compareResults(algoliaResult, flapjackResult, s.ruleCheck);
 
     if (diffs.length === 0) {
       let detail = `nbHits ${algoliaResult.nbHits}=${flapjackResult.nbHits}`;
       detail += ` | IDs match`;
       if (algoliaResult.facets) detail += ' | facets match';
       if (s.label.includes('synonym')) detail += ' (synonyms migrated!)';
+      if (s.ruleCheck) detail += ' | rules working';
       log(`PASS  "${s.query}" (${s.label}): ${detail}`);
       passed++;
     } else {
@@ -508,6 +595,74 @@ async function phase4b_compareOneClick(expectedResults, flapjackOneClick) {
       }
       failed++;
     }
+  }
+
+  return { passed, failed };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3c: Re-migration safety (overwrite protection)
+// ---------------------------------------------------------------------------
+async function phase3c_remigrationSafety() {
+  log('');
+  log('-- PHASE 3c: Re-migration safety --');
+
+  // Try migrating to the same one-click index WITHOUT overwrite — should get 409
+  log(`Re-migrating to ${ONECLICK_INDEX} without overwrite (expect 409) ...`);
+  const resp1 = await fetch(`${FLAPJACK_URL}/1/migrate-from-algolia`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-algolia-api-key': 'test-key',
+      'x-algolia-application-id': 'migration-test',
+    },
+    body: JSON.stringify({
+      appId: ALGOLIA_APP_ID,
+      apiKey: ALGOLIA_ADMIN_KEY,
+      sourceIndex: INDEX_NAME,
+      targetIndex: ONECLICK_INDEX,
+    }),
+  });
+
+  let passed = 0;
+  let failed = 0;
+
+  if (resp1.status === 409) {
+    log(`PASS  Got 409 Conflict as expected`);
+    const body = await resp1.json();
+    if (VERBOSE) logIndent(`Message: ${body.message}`);
+    passed++;
+  } else {
+    log(`FAIL  Expected 409, got ${resp1.status}`);
+    failed++;
+  }
+
+  // Now re-migrate WITH overwrite: true — should succeed
+  log(`Re-migrating to ${ONECLICK_INDEX} with overwrite: true (expect 200) ...`);
+  const resp2 = await fetch(`${FLAPJACK_URL}/1/migrate-from-algolia`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-algolia-api-key': 'test-key',
+      'x-algolia-application-id': 'migration-test',
+    },
+    body: JSON.stringify({
+      appId: ALGOLIA_APP_ID,
+      apiKey: ALGOLIA_ADMIN_KEY,
+      sourceIndex: INDEX_NAME,
+      targetIndex: ONECLICK_INDEX,
+      overwrite: true,
+    }),
+  });
+
+  if (resp2.ok) {
+    const result = await resp2.json();
+    log(`PASS  Overwrite succeeded (objects: ${result.objects.imported}, synonyms: ${result.synonyms.imported}, rules: ${result.rules.imported})`);
+    passed++;
+  } else {
+    const body = await resp2.text();
+    log(`FAIL  Overwrite returned ${resp2.status}: ${body}`);
+    failed++;
   }
 
   return { passed, failed };
@@ -597,19 +752,23 @@ async function main() {
     const flapjackOneClick = await phase3b_migrateOneClick();
     const oneclick = await phase4b_compareOneClick(expectedResults, flapjackOneClick);
 
-    const totalPassed = manual.passed + oneclick.passed;
-    const totalFailed = manual.failed + oneclick.failed;
+    // Re-migration safety (Phase 3c)
+    const remigration = await phase3c_remigrationSafety();
+
+    const totalPassed = manual.passed + oneclick.passed + remigration.passed;
+    const totalFailed = manual.failed + oneclick.failed + remigration.failed;
 
     log('');
     log('=== RESULTS ===');
     log(`Manual migration:    ${manual.passed}/${manual.passed + manual.failed} searches match`);
     log(`One-click migration: ${oneclick.passed}/${oneclick.passed + oneclick.failed} searches match`);
-    log(`Total: ${totalPassed}/${totalPassed + totalFailed} searches match between Algolia and Flapjack`);
+    log(`Re-migration safety: ${remigration.passed}/${remigration.passed + remigration.failed} checks pass`);
+    log(`Total: ${totalPassed}/${totalPassed + totalFailed} tests pass`);
 
     if (totalFailed > 0) {
-      log(`Migration: ${totalFailed} MISMATCHES FOUND`);
+      log(`Migration: ${totalFailed} FAILURES`);
     } else {
-      log('Migration: VERIFIED (both manual and one-click paths)');
+      log('Migration: ALL VERIFIED (manual, one-click, and re-migration safety)');
     }
 
     await phase5_cleanup();

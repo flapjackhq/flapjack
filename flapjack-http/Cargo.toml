@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-flapjack = { path = ".." }
+flapjack = { path = "..", features = ["analytics"] }
 flapjack-replication = { path = "../flapjack-replication" }
 flapjack-ssl = { path = "../flapjack-ssl" }
 

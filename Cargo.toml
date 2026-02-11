@@ -13,16 +13,17 @@ version = "0.1.0"
 edition = "2021"
 description = "Full-text search engine library with typo tolerance, faceting, and Algolia-compatible conventions"
 license = "MIT"
-repository = "https://github.com/flapjackhq/flapjack"
+repository = "https://github.com/stuartcrobinson/flapjack202511"
 keywords = ["search", "full-text", "tantivy", "algolia", "faceting"]
 categories = ["database", "text-processing"]
 
 [features]
-default = ["axum-support", "s3-snapshots", "openapi"]
+default = ["axum-support", "s3-snapshots", "openapi", "analytics"]
 axum-support = ["axum"]
 s3-snapshots = ["rust-s3", "flate2", "tar"]
 openapi = ["utoipa"]
 memory-stats = ["tikv-jemalloc-ctl", "sysinfo"]
+analytics = ["dep:datafusion", "dep:arrow", "dep:parquet"]
 
 [dependencies]
 tantivy = "0.25"
@@ -38,6 +39,7 @@ axum = { version = "0.7", optional = true }
 tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace", "cors"] }
+# uuid = { version = "1.0", features = ["v4"] }
 nom = "7.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -54,6 +56,9 @@ tar = { version = "0.4.44", optional = true }
 rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 once_cell = "1.19"
+datafusion = { version = "44", default-features = false, features = ["parquet"], optional = true }
+arrow = { version = "53", default-features = false, features = ["json"], optional = true }
+parquet = { version = "53", default-features = false, features = ["zstd", "async"], optional = true }
 hostname = "0.4"
 utoipa = { version = "5.3", features = ["uuid"], optional = true }
 flapjack-ssl = { path = "flapjack-ssl" }
@@ -64,6 +69,9 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"], optional = true }
 
 [patch.crates-io]
 tantivy = { git = "https://github.com/stuartcrobinson/tantivy", branch = "nov19" }
+# tantivy = { git = "https://github.com/stuartcrobinson/tantivy" }
+# tantivy = { git = "https://github.com/stuartcrobinson/tantivy", branch = "my-branch" }
+# https://claude.ai/chat/1f2596ab-8f85-494d-a375-4ee30c1f001e
 
 [dev-dependencies]
 assert_cmd = "2.0"

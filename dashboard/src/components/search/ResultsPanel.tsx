@@ -1,4 +1,4 @@
-import { memo, useCallback, useState } from 'react';
+import { memo, useCallback, useMemo, useState } from 'react';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { useSearch } from '@/hooks/useSearch';
 import { useDeleteDocument } from '@/hooks/useDocuments';
@@ -13,16 +13,21 @@ interface ResultsPanelProps {
   indexName: string;
   params: SearchParams;
   onParamsChange: (updates: Partial<SearchParams>) => void;
+  onResultClick?: (objectID: string, position: number, queryID?: string) => void;
+  userToken?: string;
 }
 
 export const ResultsPanel = memo(function ResultsPanel({
   indexName,
   params,
   onParamsChange,
+  onResultClick,
+  userToken,
 }: ResultsPanelProps) {
   const { data, isLoading, error } = useSearch({
     indexName,
     params,
+    userToken,
   });
   const deleteDoc = useDeleteDocument(indexName);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
@@ -48,6 +53,24 @@ export const ResultsPanel = memo(function ResultsPanel({
       });
     }
   }, [pendingDeleteId, deleteDoc]);
+
+  // Compute a stable field order from all hits so every DocumentCard
+  // shows fields in the same order (first-seen across the result set).
+  const fieldOrder = useMemo(() => {
+    if (!data?.hits?.length) return [];
+    const seen = new Set<string>();
+    const order: string[] = [];
+    for (const hit of data.hits) {
+      for (const key of Object.keys(hit)) {
+        if (key === 'objectID' || key === '_highlightResult') continue;
+        if (!seen.has(key)) {
+          seen.add(key);
+          order.push(key);
+        }
+      }
+    }
+    return order;
+  }, [data?.hits]);
 
   const currentPage = params.page || 0;
   const totalPages = data?.nbPages || 0;
@@ -152,8 +175,17 @@ export const ResultsPanel = memo(function ResultsPanel({
           <DocumentCard
             key={hit.objectID || index}
             document={hit}
+            fieldOrder={fieldOrder}
             onDelete={handleDelete}
             isDeleting={deleteDoc.isPending}
+            onClick={
+              onResultClick
+                ? () => {
+                    const position = (params.page || 0) * (params.hitsPerPage || 20) + index + 1;
+                    onResultClick(hit.objectID, position, data.queryID);
+                  }
+                : undefined
+            }
           />
         ))}
       </div>

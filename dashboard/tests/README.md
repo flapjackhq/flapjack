@@ -1,262 +1,202 @@
-# Flapjack Dashboard - Playwright Tests
+# Flapjack Dashboard — E2E Tests
 
-Automated end-to-end tests for the Flapjack dashboard using Playwright.
+End-to-end tests for the Flapjack dashboard using [Playwright](https://playwright.dev).
 
-## 🚀 Quick Start
-
-```bash
-# Run all tests (headless)
-npm test
-
-# Run tests with UI (recommended for development)
-npm run test:ui
-
-# Run tests in headed mode (see browser)
-npm run test:headed
-
-# Debug tests (step through with debugger)
-npm run test:debug
-
-# View test report
-npm run test:report
-```
-
-## 📦 Test Structure
+## Directory Structure
 
 ```
 tests/
-├── overview.spec.ts      - Overview page tests
-├── search.spec.ts        - Search & Browse page tests
-├── settings.spec.ts      - Settings page tests
-├── apikeys.spec.ts       - API Keys page tests
-└── navigation.spec.ts    - Navigation & layout tests
+  global-setup.ts              Loads .env.secret for integration tests
+  fixtures/
+    auth.fixture.ts            Shared localStorage auth seeding
+    algolia.fixture.ts         Algolia index seed / teardown helpers
+    test-data.ts               Test data constants (products, synonyms, rules)
+  pages/                       UI-only page tests (no external services)
+    overview.spec.ts
+    search.spec.ts
+    settings.spec.ts
+    apikeys.spec.ts
+    navigation.spec.ts
+    system.spec.ts
+    migrate.spec.ts            Migrate page UI (form, validation, toggles)
+  integration/                 Tests requiring external services (Algolia)
+    migrate.spec.ts            Full migration E2E (seeds Algolia → migrates → verifies)
 ```
 
-## ✅ Test Coverage
+**pages/** — Fast tests that only need a running Flapjack server + Vite dev server.
 
-### Overview Page
-- ✅ Page loads
-- ✅ Stats cards display
-- ✅ Index list renders
-- ✅ Pagination works
-- ✅ Browse button navigates to search
-- ✅ Dark mode toggle
+**integration/** — Tests that talk to external services (Algolia). They skip gracefully when credentials are not configured.
 
-### Search & Browse Page
-- ✅ Page loads
-- ✅ Search input and filter button
-- ✅ Results panel displays
-- ✅ Search on Enter key
-- ✅ Filter panel toggle
-- ✅ Facets panel displays
-- ✅ Breadcrumb navigation
-- ✅ Document cards render
-- ✅ Expand/collapse JSON viewer
+## Prerequisites
 
-### Settings Page
-- ✅ Page loads
-- ✅ Settings form displays
-- ✅ Search behavior section
-- ✅ Faceting section
-- ✅ Save/Reset buttons
-- ✅ Form modification detection
-- ✅ Reset functionality
-- ✅ Navigation breadcrumb
+- **Flapjack server** running on `localhost:7700`
+- **Vite dev server** on `localhost:5177` (started automatically by Playwright unless already running)
+- **Algolia credentials** (integration tests only) — set `ALGOLIA_APP_ID` and `ALGOLIA_ADMIN_KEY` in `../../.secret/.env.secret`
 
-### API Keys Page
-- ✅ Page loads
-- ✅ Create key button
-- ✅ Create key dialog
-- ✅ Form fields in dialog
-- ✅ Dialog cancel
-- ✅ Keys list (empty state)
-- ✅ Key actions (copy, delete)
-- ✅ Navigation
+## Running Tests
 
-### Navigation & Layout
-- ✅ Header with logo
-- ✅ Sidebar navigation
-- ✅ Page navigation
-- ✅ Active link highlighting
-- ✅ API logger drawer
-- ✅ Dark mode persistence
-- ✅ 404 handling
-- ✅ Responsive design
+```bash
+# All tests (page + integration)
+npm test
 
-## 🎯 Test Status
+# Only page tests (fast, no Algolia credentials needed)
+npm run test:pages
 
-**Current Results:**
-- **32/195 tests passing** (Chromium only)
-- **163 tests skipped** (Firefox/WebKit not installed)
+# Only integration tests (requires Algolia credentials)
+npm run test:integration
 
-## 🔧 Configuration
+# Interactive UI mode (recommended for development)
+npm run test:ui
 
-### Browser Setup
+# Headed mode (see the browser)
+npm run test:headed
 
-By default, only Chromium is configured to keep tests fast. To test other browsers:
+# Debug mode (step through with Playwright Inspector)
+npm run test:debug
 
-1. Install browsers:
+# View the last HTML report
+npm run test:report
+```
+
+## No Sleeps Policy
+
+**STRICT RULE: Never use `page.waitForTimeout()`, `setTimeout`, or any hardcoded delay in tests.** Every wait must target a specific condition — an element appearing, an API response arriving, or a value changing. Tests that sleep are slow, flaky, and hide real bugs.
+
+| Instead of | Use |
+|---|---|
+| `page.waitForTimeout(2000)` | `expect(locator).toBeVisible()` |
+| Sleeping after a click | `page.waitForResponse(predicate)` |
+| Arbitrary delay for data | `expect(locator).toHaveText(expected)` |
+| Waiting for async state change | `expect(async () => { ... }).toPass()` |
+
+All Playwright `expect()` assertions auto-retry until the condition is met or the timeout expires. Pass `{ timeout: N }` for longer waits (e.g. migration completion).
+
+### `expect().toPass()` for complex polling
+
+When you need to poll for a condition that involves reading a value and asserting on it (not just a simple locator check), use `expect().toPass()`:
+
+```typescript
+// Poll until filtered data appears after selecting a filter
+await expect(async () => {
+  const text = await page.locator('.count').textContent();
+  const num = parseInt(text!.replace(/,/g, ''), 10);
+  expect(num).toBeLessThan(previousValue);
+}).toPass({ timeout: 10000 });
+```
+
+### `waitForResponse` for API-triggered updates
+
+When a user action triggers an API call and you need the response before asserting:
+
+```typescript
+const responsePromise = page.waitForResponse(resp => resp.url().includes('/2/searches'));
+await page.getByTestId('range-30d').click();
+await responsePromise;
+```
+
+### `.or()` for unknown server state
+
+When the server state is unknown (e.g. indices may or may not exist), use Playwright's `.or()` pattern to wait for one of several valid outcomes:
+
+```typescript
+await expect(
+  page.getByText('Search Behavior').or(page.getByText(/no indices/i)),
+).toBeVisible();
+```
+
+### Node-level polling (fixtures, setup)
+
+In non-browser code (fixtures, setup scripts), a manual poll loop with a backoff delay is acceptable since Playwright's `expect()` isn't available:
+
+```typescript
+while (Date.now() - start < maxWaitMs) {
+  const result = await client.search({ ... });
+  if (result.nbHits >= expected) return;
+  await new Promise(r => setTimeout(r, 500)); // backoff between retries — OK
+}
+```
+
+This is the only context where `setTimeout` is acceptable — as a retry backoff inside a polling loop, not as a standalone sleep.
+
+## Writing New Tests
+
+### Using the auth fixture
+
+**All specs** import `test` and `expect` from the auth fixture so every test gets an authenticated page automatically. Do not import from `@playwright/test` directly:
+
+```typescript
+import { test, expect } from '../fixtures/auth.fixture';
+
+test('my test', async ({ page }) => {
+  await page.goto('/overview');
+  // localStorage is already seeded with API key
+});
+```
+
+### Adding integration tests
+
+Place tests that require external services in `tests/integration/`. Use the conditional skip pattern:
+
+```typescript
+import { test, expect } from '../fixtures/auth.fixture';
+import { hasAlgoliaCredentials } from '../fixtures/algolia.fixture';
+
+const describeOrSkip = hasAlgoliaCredentials()
+  ? test.describe
+  : test.describe.skip;
+
+describeOrSkip('My Integration Test', () => {
+  // Tests here skip gracefully when credentials are missing
+});
+```
+
+## Debugging
+
+```bash
+# UI mode — real-time test execution with time-travel debugging
+npm run test:ui
+
+# Debug mode — step through line by line with Playwright Inspector
+npm run test:debug
+
+# Take a screenshot mid-test
+await page.screenshot({ path: 'debug.png' });
+
+# Pause execution and open Inspector
+await page.pause();
+```
+
+## Common Issues
+
+### Tests fail with "No API response"
+The dashboard needs a running Flapjack server at `http://localhost:7700`.
+
+### Integration tests are skipped
+Set `ALGOLIA_APP_ID` and `ALGOLIA_ADMIN_KEY` in `.secret/.env.secret` at the project root.
+
+### Tests timeout
+Increase timeout in `playwright.config.ts` or per-test with `test.describe.configure({ timeout: 120_000 })`.
+
+## Browser Setup
+
+Only Chromium is configured by default. To test other browsers:
+
 ```bash
 npx playwright install firefox webkit
 ```
 
-2. Uncomment browser configs in `playwright.config.ts`
+Then uncomment the browser configs in `playwright.config.ts`.
 
-### Mobile Testing
+## Test Coverage
 
-Mobile viewports are disabled by default. To enable:
-- Uncomment mobile projects in `playwright.config.ts`
+### Page Tests
+- **Overview** — stats cards, index list, create index dialog (validation, templates, cancel), dark mode
+- **Search & Browse** — search input, results panel, facets, add documents dialog (JSON/upload/sample tabs), breadcrumb navigation
+- **Settings** — settings form, searchable attributes, faceting, save button, no-indices empty state
+- **API Keys** — create key dialog, form fields, permissions, cancel, page description
+- **Navigation** — sidebar links, active state highlighting, dark mode persistence, 404 handling, connection status, logo link, migrate link, connection settings dialog
+- **System** — health/indices/replication tabs, sidebar navigation
+- **Migrate (UI)** — form inputs, API key visibility toggle, button enable/disable, dynamic button text, target placeholder, overwrite toggle, info section
 
-## 🐛 Common Issues
-
-### Tests fail with "No API response"
-**Solution:** The dashboard needs a running Flapjack server. Tests expect `http://localhost:7700` to be available.
-
-**Mock Mode (Future):** Tests will be updated to run with mocked API responses.
-
-### Tests timeout
-**Solution:** Increase timeout in `playwright.config.ts`:
-```typescript
-use: {
-  timeout: 60000, // 60 seconds
-}
-```
-
-### Page not found errors
-**Solution:** Ensure dev server is running on `http://localhost:5177`
-
-## 📊 Test Best Practices
-
-### 1. Use test IDs for reliable selectors
-```typescript
-// Good - stable selector
-await page.locator('[data-testid="stat-card"]').count()
-
-// Bad - fragile selector
-await page.locator('.grid > .card').count()
-```
-
-### 2. Wait for navigation
-```typescript
-await page.click('button');
-await page.waitForURL('/new-page');
-```
-
-### 3. Handle async operations
-```typescript
-await searchInput.fill('test');
-await searchInput.press('Enter');
-await page.waitForTimeout(1000); // Wait for results
-```
-
-## 🚀 CI/CD Integration
-
-### GitHub Actions Example
-```yaml
-name: E2E Tests
-
-on: [push, pull_request]
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
-      - run: npm ci
-      - run: npx playwright install chromium
-      - run: npm test
-      - uses: actions/upload-artifact@v3
-        if: always()
-        with:
-          name: playwright-report
-          path: playwright-report/
-```
-
-## 📈 Adding New Tests
-
-### Example Test
-```typescript
-import { test, expect } from '@playwright/test';
-
-test.describe('My Feature', () => {
-  test.beforeEach(async ({ page }) => {
-    await page.goto('/my-page');
-  });
-
-  test('should do something', async ({ page }) => {
-    const button = page.getByRole('button', { name: /click me/i });
-    await button.click();
-
-    await expect(page.getByText('Success!')).toBeVisible();
-  });
-});
-```
-
-## 🎨 Visual Regression Testing (Future)
-
-Playwright supports screenshot comparison:
-
-```typescript
-test('looks correct', async ({ page }) => {
-  await expect(page).toHaveScreenshot();
-});
-```
-
-## 🔍 Debugging Tips
-
-### 1. Use UI Mode
-```bash
-npm run test:ui
-```
-Best for development - see tests run in real-time with time travel debugging.
-
-### 2. Use Debug Mode
-```bash
-npm run test:debug
-```
-Step through tests line by line with Playwright Inspector.
-
-### 3. Add Screenshots
-```typescript
-await page.screenshot({ path: 'debug.png' });
-```
-
-### 4. Pause Execution
-```typescript
-await page.pause(); // Opens Playwright Inspector
-```
-
-## 📝 Test Data
-
-### Mock Data Setup (TODO)
-Create `tests/fixtures/` for mock API responses:
-
-```typescript
-// tests/fixtures/indices.ts
-export const mockIndices = [
-  { uid: 'products', entries: 1000, dataSize: 1024000 },
-  { uid: 'users', entries: 500, dataSize: 512000 },
-];
-```
-
-## 🎯 Next Steps
-
-1. **Add API mocking** - Use MSW (Mock Service Worker) to test without real backend
-2. **Visual regression tests** - Add screenshot comparisons
-3. **Accessibility tests** - Add axe-core for a11y testing
-4. **Performance tests** - Measure page load times
-5. **Coverage reports** - Track test coverage metrics
-
-## 📚 Resources
-
-- [Playwright Docs](https://playwright.dev)
-- [Best Practices](https://playwright.dev/docs/best-practices)
-- [Testing Library](https://testing-library.com/docs/queries/about)
-- [MSW for API Mocking](https://mswjs.io/)
-
----
-
-**Test Status:** ✅ Passing (Chromium)
-**Last Updated:** 2026-02-06
-**Coverage:** 5 test files, 39 test cases
+### Integration Tests
+- **Migrate** — full Algolia-to-Flapjack migration: seeds Algolia with 12 products + synonyms + rules, fills the migration form in the browser, verifies success card with correct counts, navigates to the index, confirms documents are searchable. Also tests error state with invalid credentials.

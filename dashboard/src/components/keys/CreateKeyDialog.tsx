@@ -1,6 +1,8 @@
 import { memo, useState, useCallback } from 'react';
+import { Shield } from 'lucide-react';
 import { useCreateApiKey } from '@/hooks/useApiKeys';
 import { useIndices } from '@/hooks/useIndices';
+import { InfoTooltip } from '@/components/ui/info-tooltip';
 import {
   Dialog,
   DialogContent,
@@ -154,13 +156,17 @@ export const CreateKeyDialog = memo(function CreateKeyDialog({
             )}
           </div>
 
-          {/* Indices */}
-          <div className="space-y-2">
-            <Label>Restrict to Indices (optional)</Label>
+          {/* Index Scope */}
+          <div className="space-y-2 rounded-md border border-border p-4" data-testid="index-scope-section">
+            <div className="flex items-center gap-2">
+              <Shield className="h-4 w-4 text-amber-500" />
+              <Label className="text-base font-semibold">Index Scope</Label>
+              <InfoTooltip content="Scoping a key to specific indices restricts what data it can access — essential for secure multi-index deployments." />
+            </div>
             <p className="text-xs text-muted-foreground">
-              Leave empty to allow access to all indices
+              Restrict this key to specific indices for access control, or leave unselected for access to all indices
             </p>
-            {indices && indices.length > 0 && (
+            {indices && indices.length > 0 ? (
               <div className="flex flex-wrap gap-2">
                 {indices.map((index) => (
                   <button
@@ -174,6 +180,18 @@ export const CreateKeyDialog = memo(function CreateKeyDialog({
                   >
                     {index.name || index.uid}
                   </button>
+                ))}
+              </div>
+            ) : (
+              <p className="text-xs text-muted-foreground italic">
+                No indices created yet. Create an index first to scope keys.
+              </p>
+            )}
+            {selectedIndices.length > 0 && (
+              <div className="flex items-center gap-2 mt-1 text-sm" data-testid="scope-summary">
+                <span className="text-muted-foreground">This key can access:</span>
+                {selectedIndices.map((idx) => (
+                  <Badge key={idx} variant="outline">{idx}</Badge>
                 ))}
               </div>
             )}

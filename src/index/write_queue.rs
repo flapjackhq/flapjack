@@ -10,6 +10,7 @@ pub enum WriteAction {
     Add(Document),
     Upsert(Document),
     Delete(String),
+    Compact,
 }
 
 pub struct WriteOp {
@@ -32,6 +33,7 @@ pub fn create_write_queue(
         dashmap::DashMap<
             String,
             Arc<(
+                std::time::Instant,
                 usize,
                 std::collections::HashMap<String, Vec<crate::types::FacetCount>>,
             )>,
@@ -82,6 +84,7 @@ async fn process_writes(
         dashmap::DashMap<
             String,
             Arc<(
+                std::time::Instant,
                 usize,
                 std::collections::HashMap<String, Vec<crate::types::FacetCount>>,
             )>,
@@ -98,6 +101,12 @@ async fn process_writes(
             return Err(e);
         }
     };
+
+    // Merge segments when >30% of docs are deleted, so disk space is
+    // gradually reclaimed without aggressive write amplification.
+    let mut merge_policy = tantivy::merge_policy::LogMergePolicy::default();
+    merge_policy.set_del_docs_ratio_before_merge(0.3);
+    writer.set_merge_policy(Box::new(merge_policy));
     let mut pending = Vec::new();
     let mut deadline = Instant::now() + Duration::from_millis(100);
 
@@ -113,12 +122,35 @@ async fn process_writes(
         match timeout_at(deadline.into(), rx.recv()).await {
             Ok(Some(op)) => {
                 let action_count = op.actions.len();
+                let is_compact = matches!(op.actions.first(), Some(WriteAction::Compact));
                 tracing::warn!(
-                    "[WQ {}] received op task={} actions={}",
+                    "[WQ {}] received op task={} actions={}{}",
                     tenant_id,
                     op.task_id,
-                    action_count
+                    action_count,
+                    if is_compact { " (compact)" } else { "" }
                 );
+
+                if is_compact {
+                    // Flush any pending writes first
+                    if !pending.is_empty() {
+                        commit_batch(
+                            &index,
+                            &tasks,
+                            &mut pending,
+                            &mut writer,
+                            &tenant_id,
+                            &base_path,
+                            &oplog,
+                            &facet_cache,
+                        )
+                        .await?;
+                    }
+                    compact_segments(&index, &tasks, &op.task_id, &mut writer, &tenant_id)?;
+                    deadline = Instant::now() + Duration::from_millis(100);
+                    continue;
+                }
+
                 pending.push(op);
                 if pending.len() >= 10 {
                     tracing::warn!(
@@ -199,6 +231,7 @@ async fn commit_batch(
         dashmap::DashMap<
             String,
             Arc<(
+                std::time::Instant,
                 usize,
                 std::collections::HashMap<String, Vec<crate::types::FacetCount>>,
             )>,
@@ -288,6 +321,9 @@ async fn commit_batch(
                             });
                         }
                     }
+                }
+                WriteAction::Compact => {
+                    // Handled in the process_writes loop, should not reach here
                 }
             }
         }
@@ -390,6 +426,75 @@ async fn commit_batch(
     }
 
     Ok(())
+}
+
+/// Force-merge all segments into one and garbage-collect stale files.
+fn compact_segments(
+    index: &Arc<crate::index::Index>,
+    tasks: &Arc<dashmap::DashMap<String, TaskInfo>>,
+    task_id: &str,
+    writer: &mut crate::index::ManagedIndexWriter,
+    tenant_id: &str,
+) -> crate::error::Result<()> {
+    tasks.alter(task_id, |_, mut t| {
+        t.status = TaskStatus::Processing;
+        t
+    });
+
+    let segment_ids = index.inner().searchable_segment_ids()?;
+    tracing::info!(
+        "[WQ {}] compacting {} segments",
+        tenant_id,
+        segment_ids.len()
+    );
+
+    let result: crate::error::Result<()> = (|| {
+        if segment_ids.len() > 1 {
+            let merge_future = writer.merge(&segment_ids);
+            // Block on the merge (runs in Tantivy's merge thread pool).
+            // wait() returns Option<SegmentMeta>; None means all docs were deleted.
+            if let Err(e) = merge_future.wait() {
+                tracing::error!("[WQ {}] merge failed: {}", tenant_id, e);
+                return Err(crate::error::FlapjackError::Tantivy(e.to_string()));
+            }
+        }
+
+        // Clean up orphaned segment files left by completed merges
+        let gc_result = writer
+            .garbage_collect_files()
+            .wait()
+            .map_err(|e| crate::error::FlapjackError::Tantivy(e.to_string()))?;
+        tracing::info!(
+            "[WQ {}] compact done, gc removed {} files",
+            tenant_id,
+            gc_result.deleted_files.len()
+        );
+
+        index.reader().reload()?;
+        index.invalidate_searchable_paths_cache();
+        Ok(())
+    })();
+
+    let numeric_id = if let Some(task_ref) = tasks.get(task_id) {
+        task_ref.numeric_id.to_string()
+    } else {
+        task_id.to_string()
+    };
+
+    let status = match &result {
+        Ok(()) => TaskStatus::Succeeded,
+        Err(e) => TaskStatus::Failed(e.to_string()),
+    };
+    tasks.alter(task_id, |_, mut t| {
+        t.status = status.clone();
+        t
+    });
+    tasks.alter(&numeric_id, |_, mut t| {
+        t.status = status;
+        t
+    });
+
+    result
 }
 
 fn classify_error(e: &crate::error::FlapjackError) -> String {

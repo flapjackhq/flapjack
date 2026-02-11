@@ -54,7 +54,7 @@ pub struct SetSettingsResponse {
     pub updated_at: String,
 
     #[serde(rename = "taskID")]
-    pub task_id: u64,
+    pub task_id: i64,
 
     #[serde(rename = "unsupportedParams", skip_serializing_if = "Option::is_none")]
     pub unsupported_params: Option<Vec<String>>,
@@ -171,9 +171,11 @@ pub async fn set_settings(
         serde_json::to_value(&settings).unwrap_or_default(),
     );
 
+    let noop_task = state.manager.make_noop_task(&index_name)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let response = SetSettingsResponse {
         updated_at: chrono::Utc::now().to_rfc3339(),
-        task_id: rand::random(),
+        task_id: noop_task.numeric_id,
         unsupported_params: if unsupported.is_empty() {
             None
         } else {

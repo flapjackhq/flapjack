@@ -9,27 +9,8 @@ use std::sync::Arc;
 use super::AppState;
 use crate::filter_parser::parse_filter;
 use flapjack::error::FlapjackError;
-use flapjack::types::FieldValue;
 
-fn field_value_to_json(value: &FieldValue) -> serde_json::Value {
-    match value {
-        FieldValue::Object(map) => {
-            let mut obj = serde_json::Map::new();
-            for (k, v) in map {
-                obj.insert(k.clone(), field_value_to_json(v));
-            }
-            serde_json::Value::Object(obj)
-        }
-        FieldValue::Array(items) => {
-            serde_json::Value::Array(items.iter().map(field_value_to_json).collect())
-        }
-        FieldValue::Text(s) => serde_json::Value::String(s.clone()),
-        FieldValue::Integer(i) => serde_json::Value::Number((*i).into()),
-        FieldValue::Float(f) => serde_json::json!(f),
-        FieldValue::Date(d) => serde_json::Value::Number((*d).into()),
-        FieldValue::Facet(s) => serde_json::Value::String(s.clone()),
-    }
-}
+use super::field_value_to_json;
 
 #[derive(Deserialize)]
 pub struct BrowseRequest {

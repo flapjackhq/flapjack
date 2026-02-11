@@ -55,7 +55,7 @@ pub struct IndexManager {
     rules_cache: DashMap<TenantId, Arc<RuleStore>>,
     synonyms_cache: DashMap<TenantId, Arc<SynonymStore>>,
     pub facet_cache:
-        Arc<DashMap<String, Arc<(usize, HashMap<String, Vec<crate::types::FacetCount>>)>>>,
+        Arc<DashMap<String, Arc<(std::time::Instant, usize, HashMap<String, Vec<crate::types::FacetCount>>)>>>,
     pub facet_cache_cap: std::sync::atomic::AtomicUsize,
 }
 
@@ -189,13 +189,15 @@ impl IndexManager {
             .tasks
             .iter()
             .filter(|entry| entry.key().starts_with(&prefix))
-            .map(|entry| (entry.key().clone(), entry.value().created_at))
+            .map(|entry| (entry.key().clone(), entry.value().numeric_id, entry.value().created_at))
             .collect();
 
         if tenant_tasks.len() >= max_tasks {
-            tenant_tasks.sort_by_key(|(_, created_at)| *created_at);
-            for (task_id, _) in tenant_tasks.iter().take(tenant_tasks.len() - max_tasks + 1) {
+            tenant_tasks.sort_by_key(|(_, _, created_at)| *created_at);
+            for (task_id, numeric_id, _) in tenant_tasks.iter().take(tenant_tasks.len() - max_tasks + 1) {
                 self.tasks.remove(task_id);
+                // Also remove the numeric_id alias key
+                self.tasks.remove(&numeric_id.to_string());
             }
         }
     }
@@ -504,6 +506,15 @@ impl IndexManager {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
     }
 
@@ -521,6 +532,15 @@ impl IndexManager {
         remove_stop_words_override: Option<&crate::query::stopwords::RemoveStopWordsValue>,
         ignore_plurals_override: Option<&crate::query::plurals::IgnorePluralsValue>,
         query_languages_override: Option<&Vec<String>>,
+        query_type_override: Option<&str>,
+        typo_tolerance_override: Option<bool>,
+        advanced_syntax_override: Option<bool>,
+        remove_words_override: Option<&str>,
+        optional_filter_specs: Option<&[(String, String, f32)]>,
+        enable_synonyms: Option<bool>,
+        enable_rules: Option<bool>,
+        rule_contexts: Option<&[String]>,
+        restrict_searchable_attrs: Option<&[String]>,
     ) -> Result<SearchResult> {
         let t0 = std::time::Instant::now();
         let index = self.get_or_load(tenant_id)?;
@@ -529,7 +549,7 @@ impl IndexManager {
         let t2 = t0.elapsed();
         let searcher = reader.searcher();
 
-        let settings = self.get_settings(tenant_id).map(|arc| (*arc).clone());
+        let settings = self.get_settings(tenant_id);
         if let Some(ref s) = settings {
             tracing::debug!("[SEARCH] Loaded settings query_type={}", s.query_type);
         }
@@ -540,10 +560,12 @@ impl IndexManager {
             attribute_weights: HashMap::new(),
         };
 
-        let qt = settings
-            .as_ref()
-            .map(|s| s.query_type.as_str())
-            .unwrap_or("prefixLast");
+        let qt = query_type_override.unwrap_or_else(|| {
+            settings
+                .as_ref()
+                .map(|s| s.query_type.as_str())
+                .unwrap_or("prefixLast")
+        });
         let effective_stop_words =
             remove_stop_words_override.or(settings.as_ref().map(|s| &s.remove_stop_words));
         let query_text_stopped = match effective_stop_words {
@@ -587,17 +609,29 @@ impl IndexManager {
         };
         let query_text = &query_text_stopped;
 
-        let (query_text_rewritten, rule_effects) = if let Some(store) = self.get_rules(tenant_id) {
-            let rewritten = store
-                .apply_query_rewrite(query_text, None)
-                .unwrap_or_else(|| query_text.to_string());
-            let effects = Some(store.apply_rules(&rewritten, None));
-            (rewritten, effects)
-        } else {
-            (query_text.to_string(), None)
-        };
-        let expanded_queries = if let Some(store) = self.get_synonyms(tenant_id) {
-            store.expand_query(&query_text_rewritten)
+        let rules_enabled = enable_rules.unwrap_or(true);
+        let rule_ctx = rule_contexts.and_then(|c| c.first().map(|s| s.as_str()));
+        let (query_text_rewritten, rule_effects) =
+            if rules_enabled {
+                if let Some(store) = self.get_rules(tenant_id) {
+                    let rewritten = store
+                        .apply_query_rewrite(query_text, rule_ctx)
+                        .unwrap_or_else(|| query_text.to_string());
+                    let effects = Some(store.apply_rules(&rewritten, rule_ctx));
+                    (rewritten, effects)
+                } else {
+                    (query_text.to_string(), None)
+                }
+            } else {
+                (query_text.to_string(), None)
+            };
+        let synonyms_enabled = enable_synonyms.unwrap_or(true);
+        let expanded_queries = if synonyms_enabled {
+            if let Some(store) = self.get_synonyms(tenant_id) {
+                store.expand_query(&query_text_rewritten)
+            } else {
+                vec![query_text_rewritten.clone()]
+            }
         } else {
             vec![query_text_rewritten.clone()]
         };
@@ -647,31 +681,32 @@ impl IndexManager {
                 }
             };
 
+        // restrictSearchableAttributes: filter to only the specified attributes
+        let (searchable_paths, field_weights) = if let Some(restrict) = restrict_searchable_attrs {
+            let mut filtered_paths = Vec::new();
+            let mut filtered_weights = Vec::new();
+            for (i, path) in searchable_paths.iter().enumerate() {
+                if restrict.iter().any(|r| r == path) {
+                    filtered_paths.push(path.clone());
+                    filtered_weights.push(field_weights[i]);
+                }
+            }
+            if filtered_paths.is_empty() {
+                (searchable_paths, field_weights)
+            } else {
+                (filtered_paths, filtered_weights)
+            }
+        } else {
+            (searchable_paths, field_weights)
+        };
+
         let json_exact_field = schema
             .get_field("_json_exact")
             .map_err(|_| FlapjackError::FieldNotFound("_json_exact".to_string()))?;
 
-        // Extend with split/concat alternatives (Algolia parity)
+        // Split/concat alternatives are deferred: only generated if the primary
+        // query + synonyms don't return enough results (see loop below).
         let mut expanded_queries = expanded_queries;
-        if !query_text.trim().is_empty() {
-            let base_queries = expanded_queries.clone();
-            for eq in &base_queries {
-                let alts = crate::query::splitting::generate_alternatives(
-                    eq,
-                    &searcher,
-                    json_exact_field,
-                    &searchable_paths,
-                );
-                for alt in alts {
-                    if !expanded_queries.contains(&alt) {
-                        expanded_queries.push(alt);
-                    }
-                }
-                if expanded_queries.len() >= 15 {
-                    break;
-                }
-            }
-        }
 
         let default_sort_owned = if sort.is_none() && query_text.trim().is_empty() {
             Some(Sort::ByField {
@@ -683,6 +718,13 @@ impl IndexManager {
         };
         let effective_sort: Option<&Sort> = sort.or(default_sort_owned.as_ref());
 
+        let typo_enabled = typo_tolerance_override.unwrap_or(true);
+        let min_word_1_typo = settings
+            .as_ref()
+            .map(|s| s.min_word_size_for_1_typo as usize)
+            .unwrap_or(4);
+        let adv_syntax = advanced_syntax_override.unwrap_or(false);
+
         let parser = QueryParser::new_with_weights(
             &schema,
             searchable_fields,
@@ -691,70 +733,50 @@ impl IndexManager {
         )
         .with_exact_field(json_exact_field)
         .with_query_type(qt)
+        .with_typo_tolerance(typo_enabled)
+        .with_min_word_size_for_1_typo(min_word_1_typo)
+        .with_advanced_syntax(adv_syntax)
         .with_plural_map(plural_map);
 
-        let mut facet_result = if let Some(facet_reqs) = facets {
+        // Time-based facet cache: key excludes query_text so consecutive
+        // typeahead keystrokes share cached facets (distribution is stable
+        // within a short window).  On cache miss we skip the separate
+        // prescan and instead piggyback facet collection onto the main
+        // search below (1 index scan instead of 2).
+        let (facet_cache_key, mut facet_result) = if let Some(facet_reqs) = facets {
             let mut facet_keys: Vec<String> = facet_reqs.iter().map(|r| r.field.clone()).collect();
             facet_keys.sort();
             let filter_hash = filter.map(|f| format!("{:?}", f)).unwrap_or_default();
             let cache_key = format!(
-                "{}:{}:{}:{}",
+                "{}:{}:{}",
                 tenant_id,
-                query_text,
                 filter_hash,
                 facet_keys.join(",")
             );
-            if let Some(cached) = self.facet_cache.get(&cache_key) {
-                tracing::warn!("[FACET_CACHE] HIT key='{}'", cache_key);
-                let (count, facets_map) = cached.as_ref().clone();
-                let executor = QueryExecutor::new(index.converter(), schema.clone())
-                    .with_settings(settings.clone())
-                    .with_query(query_text_rewritten.clone())
-                    .with_max_values_per_facet(max_values_per_facet);
-                let trimmed = executor.trim_facet_counts(facets_map, facet_reqs);
-                Some((count, trimmed))
-            } else {
-                let primary_query = crate::types::Query {
-                    text: query_text_rewritten.clone(),
-                };
-                let parsed = parser.parse(&primary_query)?;
-                let executor = QueryExecutor::new(index.converter(), schema.clone())
-                    .with_settings(settings.clone())
-                    .with_query(query_text_rewritten.clone())
-                    .with_max_values_per_facet(Some(1000));
-                let expanded = executor.expand_short_query_with_searcher(parsed, &searcher)?;
-                let final_query = executor.apply_filter(expanded, filter)?;
-                let mut facet_collector = tantivy::collector::FacetCollector::for_field("_facets");
-                for req in facet_reqs {
-                    facet_collector.add_facet(&req.path);
+            let cached_result = self.facet_cache.get(&cache_key).and_then(|cached| {
+                let (timestamp, count, facets_map) = cached.as_ref();
+                if timestamp.elapsed() < std::time::Duration::from_secs(5) {
+                    tracing::debug!(
+                        "[FACET_CACHE] HIT ({}ms old)",
+                        timestamp.elapsed().as_millis()
+                    );
+                    let executor = QueryExecutor::new(index.converter(), schema.clone())
+                        .with_settings(settings.clone())
+                        .with_query(query_text_rewritten.clone())
+                        .with_max_values_per_facet(max_values_per_facet);
+                    let trimmed = executor.trim_facet_counts(facets_map.clone(), facet_reqs);
+                    Some((*count, trimmed))
+                } else {
+                    tracing::debug!(
+                        "[FACET_CACHE] STALE ({}ms old)",
+                        timestamp.elapsed().as_millis()
+                    );
+                    None
                 }
-                let (count, facet_counts) = searcher.search(
-                    final_query.as_ref(),
-                    &(tantivy::collector::Count, facet_collector),
-                )?;
-                let full_facets = executor.extract_facet_counts(facet_counts, facet_reqs);
-                if self.facet_cache.len()
-                    >= self
-                        .facet_cache_cap
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    if let Some(entry) = self.facet_cache.iter().next() {
-                        let key = entry.key().clone();
-                        drop(entry);
-                        self.facet_cache.remove(&key);
-                    }
-                }
-                self.facet_cache
-                    .insert(cache_key, Arc::new((count, full_facets.clone())));
-                let trimmed_executor = QueryExecutor::new(index.converter(), schema.clone())
-                    .with_settings(settings.clone())
-                    .with_query(query_text_rewritten.clone())
-                    .with_max_values_per_facet(max_values_per_facet);
-                let trimmed = trimmed_executor.trim_facet_counts(full_facets, facet_reqs);
-                Some((count, trimmed))
-            }
+            });
+            (Some(cache_key), cached_result)
         } else {
-            None
+            (None, None)
         };
 
         if limit == 0 {
@@ -767,12 +789,44 @@ impl IndexManager {
                     let parsed = parser.parse(&primary_query)?;
                     let executor = QueryExecutor::new(index.converter(), schema.clone())
                         .with_settings(settings.clone())
-                        .with_query(query_text_rewritten.clone());
+                        .with_query(query_text_rewritten.clone())
+                        .with_max_values_per_facet(max_values_per_facet);
                     let expanded = executor.expand_short_query_with_searcher(parsed, &searcher)?;
                     let final_query = executor.apply_filter(expanded, filter)?;
-                    let count =
-                        searcher.search(final_query.as_ref(), &tantivy::collector::Count)?;
-                    (count, HashMap::new())
+                    if let Some(facet_reqs) = facets {
+                        let mut facet_collector =
+                            tantivy::collector::FacetCollector::for_field("_facets");
+                        for req in facet_reqs {
+                            facet_collector.add_facet(&req.path);
+                        }
+                        let (count, facet_counts) = searcher.search(
+                            final_query.as_ref(),
+                            &(tantivy::collector::Count, facet_collector),
+                        )?;
+                        let facets_map = executor.extract_facet_counts(facet_counts, facet_reqs);
+                        if let Some(ref key) = facet_cache_key {
+                            if self.facet_cache.len()
+                                >= self
+                                    .facet_cache_cap
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                            {
+                                if let Some(entry) = self.facet_cache.iter().next() {
+                                    let evict_key = entry.key().clone();
+                                    drop(entry);
+                                    self.facet_cache.remove(&evict_key);
+                                }
+                            }
+                            self.facet_cache.insert(
+                                key.clone(),
+                                Arc::new((std::time::Instant::now(), count, facets_map.clone())),
+                            );
+                        }
+                        (count, facets_map)
+                    } else {
+                        let count =
+                            searcher.search(final_query.as_ref(), &tantivy::collector::Count)?;
+                        (count, HashMap::new())
+                    }
                 }
             };
             return Ok(SearchResult {
@@ -788,7 +842,12 @@ impl IndexManager {
         let mut seen_ids = HashSet::new();
         let mut first_query_total: Option<usize> = None;
 
-        for (i, expanded_query) in expanded_queries.iter().enumerate() {
+        let effective_limit = limit + offset;
+        let mut split_alternatives_generated = false;
+
+        let mut query_idx = 0;
+        while query_idx < expanded_queries.len() {
+            let expanded_query = &expanded_queries[query_idx];
             let tq0 = std::time::Instant::now();
             let query = crate::types::Query {
                 text: expanded_query.clone(),
@@ -803,8 +862,13 @@ impl IndexManager {
 
             let expanded_parsed =
                 executor.expand_short_query_with_searcher(parsed_query, &searcher)?;
+            let boosted_query = if let Some(specs) = optional_filter_specs {
+                executor.apply_optional_boosts(expanded_parsed, specs)?
+            } else {
+                expanded_parsed
+            };
             let tq2 = tq0.elapsed();
-            tracing::info!(
+            tracing::debug!(
                 "[QUERY_PREP] parse={:?} expand={:?} query='{}'",
                 tq1,
                 tq2.saturating_sub(tq1),
@@ -812,30 +876,28 @@ impl IndexManager {
             );
             let has_text_query = !expanded_query.trim().is_empty();
 
-            let effective_limit = limit + offset;
             let t5 = t0.elapsed();
 
-            let inline_facets = if i == 0 && facet_result.is_none() {
+            let inline_facets = if query_idx == 0 && facet_result.is_none() {
                 facets
             } else {
                 None
             };
 
-            let result = executor.execute_with_facets_distinct_and_rules(
+            let result = executor.execute_with_facets_and_distinct(
                 &searcher,
-                expanded_parsed,
+                boosted_query,
                 filter,
                 effective_sort,
                 effective_limit,
                 0,
                 has_text_query,
                 inline_facets,
-                if i == 0 { distinct } else { None },
-                None,
+                if query_idx == 0 { distinct } else { None },
             )?;
 
             let t6 = t0.elapsed();
-            tracing::warn!(
+            tracing::debug!(
                 "[PERF] load={:?} reader={:?} paths={:?} pre_exec={:?} exec={:?}",
                 t1,
                 t2.saturating_sub(t1),
@@ -848,12 +910,68 @@ impl IndexManager {
                 None => first_query_total = Some(result.total),
                 _ => {}
             }
-            if i == 0 && facet_result.is_none() && !result.facets.is_empty() {
+            if query_idx == 0 && facet_result.is_none() && !result.facets.is_empty() {
+                // Cache inline-collected facets for subsequent keystrokes
+                if let Some(ref key) = facet_cache_key {
+                    if self.facet_cache.len()
+                        >= self
+                            .facet_cache_cap
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        if let Some(entry) = self.facet_cache.iter().next() {
+                            let evict_key = entry.key().clone();
+                            drop(entry);
+                            self.facet_cache.remove(&evict_key);
+                        }
+                    }
+                    self.facet_cache.insert(
+                        key.clone(),
+                        Arc::new((
+                            std::time::Instant::now(),
+                            result.total,
+                            result.facets.clone(),
+                        )),
+                    );
+                }
                 facet_result = Some((result.total, result.facets));
             }
             for doc in result.documents {
                 if seen_ids.insert(doc.document.id.clone()) {
                     all_results.push(doc);
+                }
+            }
+
+            query_idx += 1;
+
+            // Early exit: if we already have enough results, skip remaining variants.
+            if all_results.len() >= effective_limit {
+                break;
+            }
+
+            // Lazy split/concat alternatives: only generate if primary queries
+            // (original + synonyms) didn't produce enough results.
+            if query_idx == expanded_queries.len()
+                && !split_alternatives_generated
+                && !query_text.trim().is_empty()
+                && all_results.len() < effective_limit
+            {
+                split_alternatives_generated = true;
+                let base_queries = expanded_queries.clone();
+                for eq in &base_queries {
+                    let alts = crate::query::splitting::generate_alternatives(
+                        eq,
+                        &searcher,
+                        json_exact_field,
+                        &searchable_paths,
+                    );
+                    for alt in alts {
+                        if !expanded_queries.contains(&alt) {
+                            expanded_queries.push(alt);
+                        }
+                    }
+                    if expanded_queries.len() >= 15 {
+                        break;
+                    }
                 }
             }
         }
@@ -864,38 +982,88 @@ impl IndexManager {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let total = first_query_total.unwrap_or(0);
+        let mut total = first_query_total.unwrap_or(0);
         let result_count = all_results.len();
         let start = offset.min(result_count);
         let end = (start + limit).min(result_count);
         let page_results = all_results[start..end].to_vec();
 
         let (final_docs, user_data, applied_rules) = if let Some(ref effects) = rule_effects {
+            // Apply rules (pins/hides) after synonym expansion so they
+            // operate on the full merged result set.
             let executor = QueryExecutor::new(index.converter(), schema.clone())
-                .with_settings(settings)
+                .with_settings(settings.clone())
                 .with_query(query_text.to_string())
                 .with_max_values_per_facet(max_values_per_facet);
-            let first_query = crate::types::Query {
-                text: expanded_queries[0].clone(),
-            };
-            let parsed_first = parser.parse(&first_query)?;
-            let has_text = !expanded_queries[0].trim().is_empty();
-            let result = executor.execute_with_facets_distinct_and_rules(
-                &searcher,
-                parsed_first,
-                filter,
-                effective_sort,
-                limit,
-                offset,
-                has_text,
-                None,
-                distinct,
-                Some(effects),
-            )?;
-            (result.documents, result.user_data, result.applied_rules)
+            let docs = executor.apply_rules_to_results(&searcher, page_results, effects)?;
+            // Adjust total for hidden docs that matched the query
+            let hidden_count = effects
+                .hidden
+                .iter()
+                .filter(|id| all_results.iter().any(|d| &d.document.id == *id))
+                .count();
+            total = total.saturating_sub(hidden_count);
+            (docs, effects.user_data.clone(), effects.applied_rules.clone())
         } else {
             (page_results, Vec::new(), Vec::new())
         };
+
+        // removeWordsIfNoResults: retry with fewer words if we got 0 results
+        let remove_strategy = remove_words_override
+            .or(settings.as_ref().map(|s| s.remove_words_if_no_results.as_str()))
+            .unwrap_or("none");
+
+        if total == 0
+            && final_docs.is_empty()
+            && remove_strategy != "none"
+            && !query_text.trim().is_empty()
+        {
+            let words: Vec<&str> = query_text.split_whitespace().collect();
+            if words.len() > 1 {
+                let fallback_queries: Vec<String> = match remove_strategy {
+                    "lastWords" => {
+                        (1..words.len())
+                            .map(|drop| words[..words.len() - drop].join(" "))
+                            .collect()
+                    }
+                    "firstWords" => {
+                        (1..words.len())
+                            .map(|drop| words[drop..].join(" "))
+                            .collect()
+                    }
+                    _ => vec![],
+                };
+                for fallback_q in fallback_queries {
+                    if let Ok(retry) = self.search_full_with_stop_words(
+                        tenant_id,
+                        &fallback_q,
+                        filter,
+                        sort,
+                        limit,
+                        offset,
+                        facets,
+                        distinct,
+                        max_values_per_facet,
+                        remove_stop_words_override,
+                        ignore_plurals_override,
+                        query_languages_override,
+                        query_type_override,
+                        typo_tolerance_override,
+                        advanced_syntax_override,
+                        Some("none"), // prevent recursion
+                        optional_filter_specs,
+                        enable_synonyms,
+                        enable_rules,
+                        rule_contexts,
+                        restrict_searchable_attrs,
+                    ) {
+                        if retry.total > 0 {
+                            return Ok(retry);
+                        }
+                    }
+                }
+            }
+        }
 
         let facets_map = match facet_result {
             Some((_, facets)) => facets,
@@ -1034,6 +1202,75 @@ impl IndexManager {
         }
 
         Ok(task)
+    }
+
+    /// Compact an index by merging all segments and garbage-collecting stale files.
+    ///
+    /// This reclaims disk space from deleted documents. The operation is
+    /// enqueued on the write queue so it serialises with other writes.
+    pub fn compact_index(&self, tenant_id: &str) -> Result<TaskInfo> {
+        let index = self.get_or_load(tenant_id)?;
+
+        let numeric_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let task_id = format!("task_{}_{}", tenant_id, uuid::Uuid::new_v4());
+        let task = TaskInfo::new(task_id.clone(), numeric_id, 0);
+        self.tasks.insert(task_id.clone(), task.clone());
+        self.tasks.insert(numeric_id.to_string(), task.clone());
+
+        let tx = self
+            .write_queues
+            .entry(tenant_id.to_string())
+            .or_insert_with(|| {
+                let oplog = self.get_or_create_oplog(tenant_id);
+                let (queue, handle) = create_write_queue(
+                    tenant_id.to_string(),
+                    Arc::clone(&index),
+                    Arc::clone(&self.writers),
+                    Arc::clone(&self.tasks),
+                    self.base_path.clone(),
+                    oplog,
+                    Arc::clone(&self.facet_cache),
+                );
+                self.write_task_handles
+                    .insert(tenant_id.to_string(), handle);
+                queue
+            })
+            .clone();
+
+        if tx
+            .try_send(WriteOp {
+                task_id: task_id.clone(),
+                actions: vec![WriteAction::Compact],
+            })
+            .is_err()
+        {
+            self.tasks.alter(&task_id, |_, mut t| {
+                t.status = TaskStatus::Failed("Queue full".to_string());
+                t
+            });
+            return Err(FlapjackError::QueueFull);
+        }
+
+        Ok(task)
+    }
+
+    /// Compact an index and wait for the operation to complete.
+    pub async fn compact_index_sync(&self, tenant_id: &str) -> Result<()> {
+        let task = self.compact_index(tenant_id)?;
+
+        loop {
+            let status = self.get_task(&task.id)?;
+            match status.status {
+                TaskStatus::Enqueued | TaskStatus::Processing => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                }
+                TaskStatus::Succeeded => return Ok(()),
+                TaskStatus::Failed(e) => return Err(FlapjackError::Tantivy(e)),
+            }
+        }
     }
 
     /// Unload a tenant's index from memory.
@@ -1257,7 +1494,7 @@ impl IndexManager {
         self.make_noop_task(destination)
     }
 
-    fn make_noop_task(&self, index_name: &str) -> Result<TaskInfo> {
+    pub fn make_noop_task(&self, index_name: &str) -> Result<TaskInfo> {
         let numeric_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

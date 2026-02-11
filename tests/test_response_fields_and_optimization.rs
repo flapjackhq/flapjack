@@ -194,6 +194,7 @@ async fn test_response_fields_filters_output() {
         remove_stop_words: None,
         ignore_plurals: None,
         query_languages: None,
+        analytics_tags: None,
     };
 
     assert_eq!(
@@ -239,6 +240,7 @@ async fn test_response_fields_star_keeps_all() {
         remove_stop_words: None,
         ignore_plurals: None,
         query_languages: None,
+        analytics_tags: None,
     };
 
     let fields = req.response_fields.as_ref().unwrap();
@@ -282,6 +284,7 @@ async fn test_params_string_response_fields() {
         remove_stop_words: None,
         ignore_plurals: None,
         query_languages: None,
+        analytics_tags: None,
     };
     req.apply_params_string();
     assert_eq!(

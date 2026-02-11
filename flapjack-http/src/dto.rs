@@ -2,6 +2,51 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
 
+/// Custom deserializer that accepts both a single string and an array of strings.
+/// e.g. `"facets": "brand"` → `Some(vec!["brand"])` and `"facets": ["brand","category"]` → `Some(vec!["brand","category"])`
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct StringOrVec;
+
+    impl<'de> de::Visitor<'de> for StringOrVec {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string, an array of strings, or null")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(vec![v.to_string()]))
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+            Ok(Some(vec![v]))
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut vec = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                vec.push(s);
+            }
+            Ok(Some(vec))
+        }
+    }
+
+    deserializer.deserialize_any(StringOrVec)
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateIndexRequest {
     pub uid: String,
@@ -97,7 +142,7 @@ pub struct SearchRequest {
     pub hits_per_page: Option<usize>,
     #[serde(default)]
     pub page: usize,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub facets: Option<Vec<String>>,
     #[serde(default)]
     pub sort: Option<Vec<String>>,
@@ -111,6 +156,26 @@ pub struct SearchRequest {
     pub attributes_to_retrieve: Option<Vec<String>>,
     #[serde(default, rename = "attributesToHighlight")]
     pub attributes_to_highlight: Option<Vec<String>>,
+    #[serde(default, rename = "attributesToSnippet")]
+    pub attributes_to_snippet: Option<Vec<String>>,
+    #[serde(default, rename = "queryType")]
+    pub query_type_prefix: Option<String>,
+    #[serde(default, rename = "typoTolerance")]
+    pub typo_tolerance: Option<serde_json::Value>,
+    #[serde(default, rename = "advancedSyntax")]
+    pub advanced_syntax: Option<bool>,
+    #[serde(default, rename = "removeWordsIfNoResults")]
+    pub remove_words_if_no_results: Option<String>,
+    #[serde(default, rename = "optionalFilters")]
+    pub optional_filters: Option<serde_json::Value>,
+    #[serde(default, rename = "enableSynonyms")]
+    pub enable_synonyms: Option<bool>,
+    #[serde(default, rename = "enableRules")]
+    pub enable_rules: Option<bool>,
+    #[serde(default, rename = "ruleContexts")]
+    pub rule_contexts: Option<Vec<String>>,
+    #[serde(default, rename = "restrictSearchableAttributes")]
+    pub restrict_searchable_attributes: Option<Vec<String>>,
     #[serde(default, rename = "facetFilters")]
     pub facet_filters: Option<serde_json::Value>,
     #[serde(default, rename = "numericFilters")]
@@ -123,11 +188,22 @@ pub struct SearchRequest {
     pub analytics: Option<bool>,
     #[serde(default, rename = "clickAnalytics")]
     pub click_analytics: Option<bool>,
+    #[serde(default, rename = "analyticsTags")]
+    pub analytics_tags: Option<Vec<String>>,
     /// URL-encoded params string (used by multi-query). Merged during deserialization.
     #[serde(default)]
     pub params: Option<String>,
     #[serde(default, rename = "type")]
     pub query_type: Option<String>,
+    /// Facet name for type=facet multi-search queries
+    #[serde(default)]
+    pub facet: Option<String>,
+    /// Facet query string for type=facet multi-search queries
+    #[serde(default, rename = "facetQuery")]
+    pub facet_query: Option<String>,
+    /// Max facet hits for type=facet multi-search queries
+    #[serde(default, rename = "maxFacetHits")]
+    pub max_facet_hits: Option<usize>,
     #[serde(default, rename = "getRankingInfo")]
     pub get_ranking_info: Option<bool>,
     #[serde(default, rename = "responseFields")]
@@ -144,6 +220,11 @@ pub struct SearchRequest {
     pub around_precision: Option<serde_json::Value>,
     #[serde(default, rename = "minimumAroundRadius")]
     pub minimum_around_radius: Option<u64>,
+    #[serde(default, rename = "userToken")]
+    pub user_token: Option<String>,
+    /// Client IP — not deserialized from JSON, set by handler from headers
+    #[serde(skip)]
+    pub user_ip: Option<String>,
     #[serde(default, rename = "aroundLatLngViaIP")]
     pub around_lat_lng_via_ip: Option<bool>,
     #[serde(default, rename = "removeStopWords")]
@@ -234,6 +315,73 @@ impl SearchRequest {
                         }
                     }
                 }
+                "attributesToSnippet" => {
+                    if self.attributes_to_snippet.is_none() {
+                        if let Ok(v) = serde_json::from_str::<Vec<String>>(&value) {
+                            self.attributes_to_snippet = Some(v);
+                        }
+                    }
+                }
+                "queryType" => {
+                    if self.query_type_prefix.is_none() {
+                        self.query_type_prefix = Some(value.into_owned());
+                    }
+                }
+                "typoTolerance" => {
+                    if self.typo_tolerance.is_none() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&value) {
+                            self.typo_tolerance = Some(v);
+                        } else {
+                            // Handle bare "true"/"false" strings
+                            match value.as_ref() {
+                                "true" => self.typo_tolerance = Some(serde_json::Value::Bool(true)),
+                                "false" => self.typo_tolerance = Some(serde_json::Value::Bool(false)),
+                                _ => self.typo_tolerance = Some(serde_json::Value::String(value.into_owned())),
+                            }
+                        }
+                    }
+                }
+                "advancedSyntax" => {
+                    if self.advanced_syntax.is_none() {
+                        self.advanced_syntax = value.parse().ok();
+                    }
+                }
+                "removeWordsIfNoResults" => {
+                    if self.remove_words_if_no_results.is_none() {
+                        self.remove_words_if_no_results = Some(value.into_owned());
+                    }
+                }
+                "optionalFilters" => {
+                    if self.optional_filters.is_none() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&value) {
+                            self.optional_filters = Some(v);
+                        }
+                    }
+                }
+                "enableSynonyms" => {
+                    if self.enable_synonyms.is_none() {
+                        self.enable_synonyms = value.parse().ok();
+                    }
+                }
+                "enableRules" => {
+                    if self.enable_rules.is_none() {
+                        self.enable_rules = value.parse().ok();
+                    }
+                }
+                "ruleContexts" => {
+                    if self.rule_contexts.is_none() {
+                        if let Ok(v) = serde_json::from_str::<Vec<String>>(&value) {
+                            self.rule_contexts = Some(v);
+                        }
+                    }
+                }
+                "restrictSearchableAttributes" => {
+                    if self.restrict_searchable_attributes.is_none() {
+                        if let Ok(v) = serde_json::from_str::<Vec<String>>(&value) {
+                            self.restrict_searchable_attributes = Some(v);
+                        }
+                    }
+                }
                 "highlightPreTag" => {
                     if self.highlight_pre_tag.is_none() {
                         self.highlight_pre_tag = Some(value.into_owned());
@@ -249,6 +397,23 @@ impl SearchRequest {
                 }
                 "clickAnalytics" => {
                     self.click_analytics = value.parse().ok();
+                }
+                "facetQuery" => {
+                    if self.facet_query.is_none() {
+                        self.facet_query = Some(value.into_owned());
+                    }
+                }
+                "maxFacetHits" => {
+                    if self.max_facet_hits.is_none() {
+                        self.max_facet_hits = value.parse().ok();
+                    }
+                }
+                "analyticsTags" => {
+                    if self.analytics_tags.is_none() {
+                        if let Ok(v) = serde_json::from_str::<Vec<String>>(&value) {
+                            self.analytics_tags = Some(v);
+                        }
+                    }
                 }
                 "distinct" => {
                     if self.distinct.is_none() {
@@ -309,6 +474,11 @@ impl SearchRequest {
                 "minimumAroundRadius" => {
                     if self.minimum_around_radius.is_none() {
                         self.minimum_around_radius = value.parse().ok();
+                    }
+                }
+                "userToken" => {
+                    if self.user_token.is_none() {
+                        self.user_token = Some(value.into_owned());
                     }
                 }
                 "aroundLatLngViaIP" => {
@@ -615,6 +785,66 @@ fn tag_filters_to_ast(value: &serde_json::Value) -> Option<flapjack::types::Filt
         }),
         _ => None,
     }
+}
+
+/// Parse Algolia `optionalFilters` JSON into `(field, value, score)` tuples.
+///
+/// Accepts:
+///   - `"category:Book"` — single string
+///   - `["category:Book", "author:John"]` — flat array (independent boosts)
+///   - `[["category:Book", "category:Movie"], "author:John"]` — nested OR groups
+///   - `"category:Book<score=2>"` — custom score weight
+pub fn parse_optional_filters(value: &serde_json::Value) -> Vec<(String, String, f32)> {
+    fn parse_one(s: &str) -> Option<(String, String, f32)> {
+        let s = s.trim();
+        // Strip optional <score=N> suffix
+        let (s, score) = if let Some(idx) = s.find("<score=") {
+            let rest = &s[idx + 7..];
+            let end = rest.find('>').unwrap_or(rest.len());
+            let sc: f32 = rest[..end].parse().unwrap_or(1.0);
+            (&s[..idx], sc)
+        } else {
+            (s, 1.0)
+        };
+        // Strip leading '-' for negation (we treat as score=0 penalty — skip)
+        let s = s.strip_prefix('-').unwrap_or(s);
+        let colon = s.find(':')?;
+        let field = s[..colon].to_string();
+        let value = s[colon + 1..].trim_matches('"').trim_matches('\'').to_string();
+        Some((field, value, score))
+    }
+
+    let mut specs = Vec::new();
+    match value {
+        serde_json::Value::String(s) => {
+            if let Some(spec) = parse_one(s) {
+                specs.push(spec);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                match item {
+                    serde_json::Value::String(s) => {
+                        if let Some(spec) = parse_one(s) {
+                            specs.push(spec);
+                        }
+                    }
+                    serde_json::Value::Array(or_items) => {
+                        for sub in or_items {
+                            if let Some(s) = sub.as_str() {
+                                if let Some(spec) = parse_one(s) {
+                                    specs.push(spec);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    specs
 }
 
 #[allow(dead_code)]

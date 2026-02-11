@@ -15,6 +15,24 @@ fn make_docs(ids: &[&str]) -> Vec<Document> {
         .collect()
 }
 
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_file() {
+                total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            } else if ft.is_dir() {
+                total += dir_size(&entry.path());
+            }
+        }
+    }
+    total
+}
+
 fn read_oplog_entries(oplog_dir: &Path) -> Vec<serde_json::Value> {
     let mut entries = Vec::new();
     if !oplog_dir.exists() {
@@ -120,6 +138,74 @@ mod batch_delete {
             _ => panic!("Expected text"),
         };
         assert_eq!(name, "Replacement");
+    }
+}
+
+// ============================================================
+// COMPACT INDEX
+// ============================================================
+
+mod compact_index {
+    use super::*;
+
+    #[tokio::test]
+    async fn compact_after_deletes_reclaims_space() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = IndexManager::new(tmp.path());
+        mgr.create_tenant("test").unwrap();
+
+        // Add docs in separate batches to create multiple segments
+        mgr.add_documents_sync("test", make_docs(&["1", "2", "3"]))
+            .await
+            .unwrap();
+        mgr.add_documents_sync("test", make_docs(&["4", "5", "6"]))
+            .await
+            .unwrap();
+
+        let size_with_all_docs = dir_size(&tmp.path().join("test"));
+
+        // Delete most docs
+        mgr.delete_documents_sync(
+            "test",
+            vec![
+                "1".into(),
+                "2".into(),
+                "3".into(),
+                "4".into(),
+                "5".into(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // Compact to force merge + GC
+        mgr.compact_index_sync("test").await.unwrap();
+
+        let size_after_compact = dir_size(&tmp.path().join("test"));
+        assert!(
+            size_after_compact < size_with_all_docs,
+            "compact should reclaim space: all_docs={} after_compact={}",
+            size_with_all_docs,
+            size_after_compact
+        );
+
+        // Verify remaining doc is still searchable
+        let results = mgr.search("test", "", None, None, 100).unwrap();
+        assert_eq!(results.total, 1);
+        assert_eq!(results.documents[0].document.id, "6");
+    }
+
+    #[tokio::test]
+    async fn compact_empty_index() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = IndexManager::new(tmp.path());
+        mgr.create_tenant("test").unwrap();
+
+        // Should not panic on an empty index
+        mgr.compact_index_sync("test").await.unwrap();
+
+        let results = mgr.search("test", "", None, None, 100).unwrap();
+        assert_eq!(results.total, 0);
     }
 }
 

@@ -338,6 +338,16 @@ pub fn required_acl_for_route(method: &Method, path: &str) -> Option<&'static st
         return Some("admin");
     }
 
+    // Analytics API endpoints (/2/*) require "analytics" ACL
+    if path.starts_with("/2/") {
+        return Some("analytics");
+    }
+
+    // Insights API (/1/events) — uses "search" ACL (client-facing, matches Algolia behavior)
+    if path == "/1/events" {
+        return Some("search");
+    }
+
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
     if parts.len() >= 3 && parts[0] == "1" && parts[1] == "indexes" {

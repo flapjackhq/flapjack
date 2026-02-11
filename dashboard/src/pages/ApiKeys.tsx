@@ -1,17 +1,38 @@
-import { useState, useCallback } from 'react';
-import { Plus, Copy, Trash2, Check } from 'lucide-react';
+import { useState, useCallback, useMemo } from 'react';
+import { Plus, Copy, Trash2, Check, Globe, Shield } from 'lucide-react';
 import { useApiKeys, useDeleteApiKey } from '@/hooks/useApiKeys';
+import { useIndices } from '@/hooks/useIndices';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
+import { InfoTooltip } from '@/components/ui/info-tooltip';
 import { CreateKeyDialog } from '@/components/keys/CreateKeyDialog';
 
 export function ApiKeys() {
   const { data: keys, isLoading } = useApiKeys();
+  const { data: indices } = useIndices();
   const deleteKey = useDeleteApiKey();
   const [showCreateDialog, setShowCreateDialog] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [filterIndex, setFilterIndex] = useState<string | null>(null);
+
+  // Collect all unique index names from keys + indices list for the filter bar
+  const allIndexNames = useMemo(() => {
+    const names = new Set<string>();
+    keys?.forEach((key) => key.indexes?.forEach((idx) => names.add(idx)));
+    indices?.forEach((idx) => names.add(idx.uid));
+    return Array.from(names).sort();
+  }, [keys, indices]);
+
+  // Filter keys by selected index
+  const filteredKeys = useMemo(() => {
+    if (!keys) return [];
+    if (!filterIndex) return keys;
+    return keys.filter(
+      (key) => !key.indexes || key.indexes.length === 0 || key.indexes.includes(filterIndex)
+    );
+  }, [keys, filterIndex]);
 
   const handleCopy = useCallback(async (keyValue: string) => {
     try {
@@ -87,6 +108,46 @@ export function ApiKeys() {
         </Button>
       </div>
 
+      {/* Index filter bar */}
+      {allIndexNames.length > 0 && keys && keys.length > 0 && (
+        <div data-testid="index-filter-bar">
+          <div className="text-sm font-medium mb-1 flex items-center gap-1.5">
+            Filter by Index
+            <InfoTooltip content="Filter keys by which index they can access. Keys with 'All Indices' scope appear in every filter." />
+          </div>
+          <p className="text-xs text-muted-foreground mb-2" data-testid="filter-help-text">
+            Select an index to see which API keys have access to it
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <button
+              onClick={() => setFilterIndex(null)}
+              className={`px-3 py-1 rounded-md text-sm border transition-colors ${
+                filterIndex === null
+                  ? 'border-primary bg-primary/10 font-medium'
+                  : 'border-border hover:border-primary/50'
+              }`}
+              data-testid="filter-all"
+            >
+              All
+            </button>
+            {allIndexNames.map((name) => (
+              <button
+                key={name}
+                onClick={() => setFilterIndex(name === filterIndex ? null : name)}
+                className={`px-3 py-1 rounded-md text-sm border transition-colors ${
+                  filterIndex === name
+                    ? 'border-primary bg-primary/10 font-medium'
+                    : 'border-border hover:border-primary/50'
+                }`}
+                data-testid={`filter-index-${name}`}
+              >
+                {name}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Keys list */}
       {!keys || keys.length === 0 ? (
         <Card className="p-8 text-center">
@@ -101,9 +162,9 @@ export function ApiKeys() {
         </Card>
       ) : (
         <div className="space-y-4" data-testid="keys-list">
-          {keys.map((key) => (
-            <Card key={key.value} className="p-6">
-              <div className="space-y-4" data-testid="keys-list">
+          {filteredKeys.map((key) => (
+            <Card key={key.value} className="p-6" data-testid="key-card">
+              <div className="space-y-4">
                 {/* Header */}
                 <div className="flex items-start justify-between">
                   <div>
@@ -139,9 +200,33 @@ export function ApiKeys() {
                     size="sm"
                     onClick={() => handleDelete(key.value, key.description || '')}
                     disabled={deleteKey.isPending}
+                    data-testid="delete-key-btn"
                   >
                     <Trash2 className="h-4 w-4 text-destructive" />
                   </Button>
+                </div>
+
+                {/* Index Scope */}
+                <div data-testid="key-scope">
+                  <div className="text-sm font-medium mb-2 flex items-center gap-1.5">
+                    Index Scope
+                    <InfoTooltip content="Restricting a key to specific indices limits its access. The key can only read and write data in the selected indices." />
+                  </div>
+                  {key.indexes && key.indexes.length > 0 ? (
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <Shield className="h-4 w-4 text-amber-500 shrink-0" />
+                      {key.indexes.map((idx) => (
+                        <Badge key={idx} variant="outline">
+                          {idx}
+                        </Badge>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-2">
+                      <Globe className="h-4 w-4 text-muted-foreground" />
+                      <Badge variant="secondary">All Indices</Badge>
+                    </div>
+                  )}
                 </div>
 
                 {/* ACL */}
@@ -158,13 +243,6 @@ export function ApiKeys() {
 
                 {/* Details */}
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-                  {key.indexes && key.indexes.length > 0 && (
-                    <div>
-                      <div className="text-muted-foreground">Indices</div>
-                      <div className="font-medium">{key.indexes.join(', ')}</div>
-                    </div>
-                  )}
-
                   {key.maxHitsPerQuery && (
                     <div>
                       <div className="text-muted-foreground">Max Hits/Query</div>

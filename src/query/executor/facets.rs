@@ -43,33 +43,6 @@ impl QueryExecutor {
         facet_requests: Option<&[FacetRequest]>,
         distinct_count: Option<u32>,
     ) -> Result<SearchResult> {
-        self.execute_with_facets_distinct_and_rules(
-            searcher,
-            query,
-            filter,
-            sort,
-            limit,
-            offset,
-            has_text_query,
-            facet_requests,
-            distinct_count,
-            None,
-        )
-    }
-
-    pub fn execute_with_facets_distinct_and_rules(
-        &self,
-        searcher: &Searcher,
-        query: Box<dyn TantivyQuery>,
-        filter: Option<&crate::types::Filter>,
-        sort: Option<&Sort>,
-        limit: usize,
-        offset: usize,
-        has_text_query: bool,
-        facet_requests: Option<&[FacetRequest]>,
-        distinct_count: Option<u32>,
-        rule_effects: Option<&crate::index::rules::RuleEffects>,
-    ) -> Result<SearchResult> {
         let tf0 = std::time::Instant::now();
         let final_query = self.apply_filter(query, filter)?;
         let tf1 = tf0.elapsed();
@@ -98,7 +71,7 @@ impl QueryExecutor {
             None | Some(Sort::ByRelevance) => {
                 let (docs, count) =
                     self.execute_relevance_sort(searcher, final_query, limit, offset)?;
-                tracing::warn!(
+                tracing::debug!(
                     "[EXEC] filter={:?} relevance_sort={:?}",
                     tf1,
                     tf0.elapsed().saturating_sub(tf2)
@@ -134,23 +107,12 @@ impl QueryExecutor {
             (documents, total)
         };
 
-        let (documents, user_data, applied_rules) = if let Some(effects) = rule_effects {
-            let docs = self.apply_rules_to_results(searcher, documents, effects)?;
-            (
-                docs,
-                effects.user_data.clone(),
-                effects.applied_rules.clone(),
-            )
-        } else {
-            (documents, Vec::new(), Vec::new())
-        };
-
         Ok(SearchResult {
             documents,
             total,
             facets: HashMap::new(),
-            user_data,
-            applied_rules,
+            user_data: Vec::new(),
+            applied_rules: Vec::new(),
         })
     }
 
@@ -170,7 +132,7 @@ impl QueryExecutor {
             facet_collector.add_facet(&req.path);
         }
 
-        tracing::warn!(
+        tracing::debug!(
             "[FACET_SORT] sort={:?} has_text_query={} limit={} offset={}",
             sort,
             has_text_query,
@@ -224,7 +186,7 @@ impl QueryExecutor {
                 let fi2 = fi0.elapsed();
                 let final_docs = top_docs.into_iter().skip(offset).take(limit).collect();
                 let docs = self.reconstruct_documents(searcher, final_docs)?;
-                tracing::info!(
+                tracing::debug!(
                     "[FACET_INT] search={:?} tier2={:?} reconstruct={:?} prelim_limit={} count={}",
                     fi1,
                     fi2.saturating_sub(fi1),

@@ -135,7 +135,7 @@ async fn test_facet_cache_bounded_by_cap() {
     for i in 0..20 {
         manager.facet_cache.insert(
             format!("t1:q{}:category", i),
-            std::sync::Arc::new((0, HashMap::new())),
+            std::sync::Arc::new((std::time::Instant::now(), 0, HashMap::new())),
         );
     }
     assert_eq!(
@@ -170,10 +170,12 @@ async fn test_facet_cache_no_eviction_under_cap() {
         let _ = manager.search_with_facets("t1", &query, None, None, 1, 0, Some(&facets));
     }
 
+    // Time-based facet cache keys exclude query_text, so all 20 queries
+    // with the same facets/filter share one cache entry.
     let cache_len = manager.facet_cache.len();
     assert_eq!(
-        cache_len, 20,
-        "under cap=50, all 20 entries should be retained, got {}",
+        cache_len, 1,
+        "all queries with same facets/filter should share one cache entry, got {}",
         cache_len
     );
 }

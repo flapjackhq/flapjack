@@ -10,27 +10,32 @@ use flapjack::error::FlapjackError;
 
 use super::AppState;
 use crate::dto::SearchRequest;
-use flapjack::query::highlighter::{extract_query_words, HighlightValue, Highlighter};
+use flapjack::query::highlighter::{
+    extract_query_words, parse_snippet_spec, HighlightValue, Highlighter, SnippetValue,
+};
 use flapjack::types::{FacetRequest, FieldValue, Sort, SortOrder};
 
-fn field_value_to_json(value: &FieldValue) -> serde_json::Value {
-    match value {
-        FieldValue::Object(map) => {
-            let mut obj = serde_json::Map::new();
-            for (k, v) in map {
-                obj.insert(k.clone(), field_value_to_json(v));
-            }
-            serde_json::Value::Object(obj)
-        }
-        FieldValue::Array(items) => {
-            serde_json::Value::Array(items.iter().map(field_value_to_json).collect())
-        }
-        FieldValue::Text(s) => serde_json::Value::String(s.clone()),
-        FieldValue::Integer(i) => serde_json::Value::Number((*i).into()),
-        FieldValue::Float(f) => serde_json::json!(f),
-        FieldValue::Date(d) => serde_json::Value::Number((*d).into()),
-        FieldValue::Facet(s) => serde_json::Value::String(s.clone()),
-    }
+use super::field_value_to_json;
+
+/// Extract userToken and client IP from request headers for analytics.
+fn extract_analytics_headers(
+    headers: &axum::http::HeaderMap,
+) -> (Option<String>, Option<String>) {
+    let user_token = headers
+        .get("x-algolia-usertoken")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let user_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        });
+    (user_token, user_ip)
 }
 
 fn extract_single_geoloc(value: &FieldValue) -> Option<(f64, f64)> {
@@ -107,6 +112,27 @@ fn highlight_value_to_json(value: &HighlightValue) -> serde_json::Value {
     }
 }
 
+fn snippet_value_map_to_json(map: &HashMap<String, SnippetValue>) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    for (k, v) in map {
+        obj.insert(k.clone(), snippet_value_to_json(v));
+    }
+    serde_json::Value::Object(obj)
+}
+
+fn snippet_value_to_json(value: &SnippetValue) -> serde_json::Value {
+    match value {
+        SnippetValue::Single(result) => serde_json::to_value(result).unwrap(),
+        SnippetValue::Array(results) => serde_json::Value::Array(
+            results
+                .iter()
+                .map(|r| serde_json::to_value(r).unwrap())
+                .collect(),
+        ),
+        SnippetValue::Object(map) => snippet_value_map_to_json(map),
+    }
+}
+
 fn merge_secured_filters(
     req: &mut SearchRequest,
     restrictions: &crate::auth::SecuredKeyRestrictions,
@@ -153,6 +179,7 @@ pub async fn batch_search(
         .extensions()
         .get::<crate::auth::SecuredKeyRestrictions>()
         .cloned();
+    let (user_token_header, user_ip) = extract_analytics_headers(request.headers());
     let body_bytes = axum::body::to_bytes(request.into_body(), 10_000_000)
         .await
         .map_err(|e| FlapjackError::InvalidQuery(format!("Failed to read body: {}", e)))?;
@@ -168,9 +195,14 @@ pub async fn batch_search(
         FlapjackError::InvalidQuery(format!("Invalid batch search: {}", e))
     })?;
 
-    let mut results = Vec::new();
-    for mut req in batch.requests {
+    // Validate all requests up front, then execute in parallel.
+    let mut prepared: Vec<(usize, String, SearchRequest)> = Vec::new();
+    for (i, mut req) in batch.requests.into_iter().enumerate() {
         req.apply_params_string();
+        if req.user_token.is_none() {
+            req.user_token = user_token_header.clone();
+        }
+        req.user_ip = user_ip.clone();
         if let Some(ref restrictions) = secured_restrictions {
             merge_secured_filters(&mut req, restrictions);
             if let Some(ref restrict_indices) = restrictions.restrict_indices {
@@ -185,11 +217,49 @@ pub async fn batch_search(
             .index_name
             .clone()
             .ok_or_else(|| FlapjackError::InvalidQuery("Missing indexName".to_string()))?;
-
-        let result = search_single(State(state.clone()), index_name, req).await?;
-
-        results.push(result.0);
+        prepared.push((i, index_name, req));
     }
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for (i, index_name, req) in prepared {
+        let state = state.clone();
+        // Route type=facet queries to the facet search handler
+        if req.query_type.as_deref() == Some("facet") {
+            let facet_name = req.facet.clone().unwrap_or_default();
+            let facet_query = req.facet_query.clone().unwrap_or_default();
+            let max_facet_hits = req.max_facet_hits.unwrap_or(10);
+            let filters = req.filters.clone();
+            join_set.spawn(async move {
+                let result = super::facets::search_facet_values_inline(
+                    state,
+                    &index_name,
+                    &facet_name,
+                    &facet_query,
+                    max_facet_hits,
+                    filters.as_deref(),
+                )
+                .await?;
+                Ok::<_, FlapjackError>((i, result))
+            });
+        } else {
+            join_set.spawn(async move {
+                let result = search_single(State(state), index_name, req).await?;
+                Ok::<_, FlapjackError>((i, result.0))
+            });
+        }
+    }
+
+    let mut indexed_results: Vec<(usize, serde_json::Value)> =
+        Vec::with_capacity(join_set.len());
+    while let Some(join_result) = join_set.join_next().await {
+        let result = join_result.map_err(|e| {
+            FlapjackError::InvalidQuery(format!("Task join error: {}", e))
+        })?;
+        indexed_results.push(result?);
+    }
+    indexed_results.sort_by_key(|(i, _)| *i);
+    let results: Vec<serde_json::Value> =
+        indexed_results.into_iter().map(|(_, v)| v).collect();
 
     Ok(Json(serde_json::json!({"results": results})))
 }
@@ -199,7 +269,30 @@ async fn search_single(
     index_name: String,
     req: SearchRequest,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
+    // Move CPU-bound search + highlighting + JSON serialization off the async
+    // runtime. On t4g.micro (2 vCPUs) this prevents worker-thread starvation
+    // when multiple searches run concurrently.
+    let enqueue_time = Instant::now();
+    tokio::task::spawn_blocking(move || search_single_sync(state, index_name, req, enqueue_time))
+        .await
+        .map_err(|e| FlapjackError::InvalidQuery(format!("spawn_blocking join error: {}", e)))?
+}
+
+fn search_single_sync(
+    state: Arc<AppState>,
+    index_name: String,
+    req: SearchRequest,
+    enqueue_time: Instant,
+) -> Result<Json<serde_json::Value>, FlapjackError> {
+    let queue_wait = enqueue_time.elapsed();
     let start = Instant::now();
+
+    // Generate queryID for click analytics correlation
+    let query_id = if req.click_analytics == Some(true) {
+        Some(hex::encode(uuid::Uuid::new_v4().as_bytes()))
+    } else {
+        None
+    };
 
     let filter = req.build_combined_filter();
 
@@ -229,8 +322,7 @@ async fn search_single(
 
     let loaded_settings = state
         .manager
-        .get_settings(&index_name)
-        .map(|arc| (*arc).clone());
+        .get_settings(&index_name);
 
     let facet_requests = req.facets.as_ref().and_then(|facets| {
         let allowed_facets = loaded_settings.as_ref().map(|s| s.facet_set());
@@ -293,6 +385,17 @@ async fn search_single(
     } else {
         (hits_per_page, req.page * hits_per_page)
     };
+    let typo_tolerance = match &req.typo_tolerance {
+        Some(serde_json::Value::Bool(false)) => Some(false),
+        Some(serde_json::Value::String(s)) if s == "false" => Some(false),
+        _ => None,
+    };
+    let optional_filter_specs = req
+        .optional_filters
+        .as_ref()
+        .map(crate::dto::parse_optional_filters)
+        .filter(|v| !v.is_empty());
+
     let result = state.manager.search_full_with_stop_words(
         &index_name,
         &req.query,
@@ -306,9 +409,18 @@ async fn search_single(
         req.remove_stop_words.as_ref(),
         req.ignore_plurals.as_ref(),
         req.query_languages.as_ref(),
+        req.query_type_prefix.as_deref(),
+        typo_tolerance,
+        req.advanced_syntax,
+        req.remove_words_if_no_results.as_deref(),
+        optional_filter_specs.as_deref(),
+        req.enable_synonyms,
+        req.enable_rules,
+        req.rule_contexts.as_deref(),
+        req.restrict_searchable_attributes.as_deref(),
     )?;
 
-    let elapsed = start.elapsed();
+    let search_elapsed = start.elapsed();
 
     let query_words = extract_query_words(&req.query);
     let highlighter = match (&req.highlight_pre_tag, &req.highlight_post_tag) {
@@ -406,6 +518,7 @@ async fn search_single(
         result
     };
 
+    let highlight_start = Instant::now();
     let hits: Vec<serde_json::Value> = result
         .documents
         .iter()
@@ -439,6 +552,23 @@ async fn search_single(
                 );
                 let highlight_json = highlight_value_map_to_json(&highlight_map);
                 doc_map.insert("_highlightResult".to_string(), highlight_json);
+            }
+
+            // Snippet generation
+            if let Some(ref snippet_attrs) = req.attributes_to_snippet {
+                if !snippet_attrs.is_empty() {
+                    let snippet_specs: Vec<(&str, usize)> = snippet_attrs
+                        .iter()
+                        .map(|s| parse_snippet_spec(s.as_str()))
+                        .collect();
+                    let snippet_map = highlighter.snippet_document(
+                        &scored_doc.document,
+                        &query_words,
+                        &snippet_specs,
+                    );
+                    let snippet_json = snippet_value_map_to_json(&snippet_map);
+                    doc_map.insert("_snippetResult".to_string(), snippet_json);
+                }
             }
 
             if req.get_ranking_info == Some(true) {
@@ -481,6 +611,7 @@ async fn search_single(
             serde_json::Value::Object(doc_map)
         })
         .collect();
+    let highlight_elapsed = highlight_start.elapsed();
 
     let facet_distribution = if req.facets.is_some() {
         if result.total == 0 {
@@ -549,14 +680,16 @@ async fn search_single(
         exhaustive_obj["facetsCount"] = serde_json::json!(true);
     }
 
+    let total_elapsed = start.elapsed();
+
     let mut response = serde_json::json!({
         "hits": hits,
         "nbHits": result.total,
         "page": page,
         "nbPages": nb_pages,
         "hitsPerPage": hits_per_page,
-        "processingTimeMS": elapsed.as_millis() as u64,
-        "serverTimeMS": elapsed.as_millis() as u64,
+        "processingTimeMS": total_elapsed.as_millis() as u64,
+        "serverTimeMS": total_elapsed.as_millis() as u64,
         "query": req.query,
         "params": params_str,
         "exhaustive": exhaustive_obj,
@@ -564,7 +697,12 @@ async fn search_single(
         "exhaustiveTypo": true,
         "index": index_name,
         "renderingContent": {},
-        "processingTimingsMS": {}
+        "processingTimingsMS": {
+            "queue": queue_wait.as_micros() as u64,
+            "search": search_elapsed.as_micros() as u64,
+            "highlight": highlight_elapsed.as_micros() as u64,
+            "total": total_elapsed.as_micros() as u64
+        }
     });
 
     if req.facets.is_some() {
@@ -599,6 +737,11 @@ async fn search_single(
         );
     }
 
+    // Add queryID to response when clickAnalytics is enabled
+    if let Some(ref qid) = query_id {
+        response["queryID"] = serde_json::json!(qid);
+    }
+
     if let Some(ref fields) = req.response_fields {
         if !fields.contains(&"*".to_string()) {
             let response_obj = response.as_object_mut().unwrap();
@@ -608,6 +751,32 @@ async fn search_single(
                     response_obj.remove(&key);
                 }
             }
+        }
+    }
+
+    // Record analytics event (fire-and-forget, never blocks search response)
+    if req.analytics != Some(false) {
+        if let Some(collector) = flapjack::analytics::get_global_collector() {
+            let analytics_tags_str = req.analytics_tags.as_ref().map(|t| t.join(","));
+            let facets_str = req.facets.as_ref().map(|f| serde_json::to_string(f).unwrap_or_default());
+            collector.record_search(flapjack::analytics::schema::SearchEvent {
+                timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                query: req.query.clone(),
+                query_id: query_id.clone(),
+                index_name: index_name.clone(),
+                nb_hits: result.total as u32,
+                processing_time_ms: total_elapsed.as_millis() as u32,
+                user_token: req.user_token.clone(),
+                user_ip: req.user_ip.clone(),
+                filters: req.filters.clone(),
+                facets: facets_str,
+                analytics_tags: analytics_tags_str,
+                page: page as u32,
+                hits_per_page: hits_per_page as u32,
+                has_results: result.total > 0,
+                country: None,
+                region: None,
+            });
         }
     }
 
@@ -640,6 +809,7 @@ pub async fn search(
         .extensions()
         .get::<crate::auth::SecuredKeyRestrictions>()
         .cloned();
+    let (user_token_header, user_ip) = extract_analytics_headers(request.headers());
     let body_bytes = axum::body::to_bytes(request.into_body(), 10_000_000)
         .await
         .map_err(|e| FlapjackError::InvalidQuery(format!("Failed to read body: {}", e)))?;
@@ -648,5 +818,9 @@ pub async fn search(
     if let Some(ref restrictions) = secured_restrictions {
         merge_secured_filters(&mut req, restrictions);
     }
+    if req.user_token.is_none() {
+        req.user_token = user_token_header;
+    }
+    req.user_ip = user_ip;
     search_single(State(state), index_name, req).await
 }

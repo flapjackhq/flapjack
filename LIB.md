@@ -357,6 +357,7 @@ Data format is identical. No re-indexing needed.
 
 ## Further Reading
 
+- [ARCHITECTURE.md](docs2/3_IMPLEMENTATION/ARCHITECTURE.md) — Core design decisions
 - [Integration Tests](tests/) — Real-world usage examples (`test_library_usage.rs`, `test_query.rs`)
 - **API Docs**: Run `cargo doc --open --no-deps` for generated API documentation
 

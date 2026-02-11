@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import { Moon, Sun, Settings, Menu, Loader2, ListTodo } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
@@ -42,7 +43,7 @@ export function Header({ onMenuToggle }: HeaderProps) {
   const isChecking = health.isLoading;
 
   return (
-    <header className="h-16 border-b border-border bg-background px-4 md:px-6 flex items-center justify-between">
+    <header className="h-16 border-b border-border bg-background shadow-sm px-4 md:px-6 flex items-center justify-between">
       <div className="flex items-center gap-3 md:gap-4">
         <Button
           variant="ghost"
@@ -53,7 +54,7 @@ export function Header({ onMenuToggle }: HeaderProps) {
         >
           <Menu className="h-5 w-5" />
         </Button>
-        <h1 className="text-xl font-bold">Flapjack</h1>
+        <Link to="/" className="text-xl font-bold hover:opacity-80 transition-opacity"><span className="text-2xl">🥞</span> Flapjack</Link>
         <span className="text-sm text-muted-foreground hidden sm:inline">{serverHost}</span>
         {isChecking ? (
           <span className="text-xs px-2 py-0.5 rounded-full bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400">

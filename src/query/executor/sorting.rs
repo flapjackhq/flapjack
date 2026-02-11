@@ -345,7 +345,7 @@ impl QueryExecutor {
                 SortValue::Missing
             };
             if scored_docs.len() < 5 {
-                tracing::warn!(
+                tracing::trace!(
                     "[SORT_VALUE] objectID extraction: field={} value={:?}",
                     field,
                     sort_value
@@ -354,37 +354,13 @@ impl QueryExecutor {
             scored_docs.push((sort_value, score, addr));
         }
 
-        tracing::warn!(
-            "[SORT_BEFORE] first 5 values: {:?}",
-            scored_docs
-                .iter()
-                .take(5)
-                .map(|(v, _, _)| v.clone())
-                .collect::<Vec<_>>()
-        );
         match order {
             SortOrder::Asc => scored_docs.sort_by(|a, b| a.0.cmp(&b.0)),
             SortOrder::Desc => scored_docs.sort_by(|a, b| b.0.cmp(&a.0)),
         }
-        tracing::warn!(
-            "[SORT_AFTER] order={:?} first 5 values: {:?}",
-            order,
-            scored_docs
-                .iter()
-                .take(5)
-                .map(|(v, _, _)| v.clone())
-                .collect::<Vec<_>>()
-        );
 
         let start = offset.min(scored_docs.len());
         let end = (offset + limit).min(scored_docs.len());
-        tracing::warn!(
-            "[SORT_SLICE] start={} end={} limit={} offset={}",
-            start,
-            end,
-            limit,
-            offset
-        );
 
         Ok(scored_docs[start..end]
             .iter()

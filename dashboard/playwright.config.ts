@@ -6,6 +6,7 @@ import { defineConfig, devices } from '@playwright/test';
  */
 export default defineConfig({
   testDir: './tests',
+  globalSetup: './tests/global-setup.ts',
 
   // Run tests in files in parallel
   fullyParallel: true,
@@ -16,8 +17,8 @@ export default defineConfig({
   // Retry on CI only
   retries: process.env.CI ? 2 : 0,
 
-  // Opt out of parallel tests on CI
-  workers: process.env.CI ? 1 : undefined,
+  // Cap workers so the Vite dev server isn't overwhelmed
+  workers: process.env.CI ? 1 : 3,
 
   // Reporter to use
   reporter: 'html',

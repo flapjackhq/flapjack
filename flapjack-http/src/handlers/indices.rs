@@ -81,8 +81,9 @@ pub async fn delete_index(
     Path(index_name): Path<String>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
     state.manager.delete_tenant(&index_name).await?;
+    let task = state.manager.make_noop_task(&index_name)?;
     Ok(Json(serde_json::json!({
-        "taskID": 0,
+        "taskID": task.numeric_id,
         "deletedAt": chrono::Utc::now().to_rfc3339()
     })))
 }
@@ -167,28 +168,28 @@ pub async fn clear_index(
     State(state): State<Arc<AppState>>,
     Path(index_name): Path<String>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
-    state.manager.unload(&index_name)?;
-
     let index_path = state.manager.base_path.join(&index_name);
     let settings_path = index_path.join("settings.json");
     let relevance_path = index_path.join("relevance.json");
 
+    // Preserve settings and relevance config before clearing
     let settings = if settings_path.exists() {
         Some(std::fs::read(&settings_path)?)
     } else {
         None
     };
-
     let relevance = if relevance_path.exists() {
         Some(std::fs::read(&relevance_path)?)
     } else {
         None
     };
 
-    std::fs::remove_dir_all(&index_path)?;
-
+    // Use delete_tenant (which awaits the write queue) instead of
+    // unload + remove_dir_all to avoid race conditions.
+    state.manager.delete_tenant(&index_name).await?;
     state.manager.create_tenant(&index_name)?;
 
+    // Restore settings and relevance config
     if let Some(data) = settings {
         std::fs::write(&settings_path, data)?;
     }
@@ -196,8 +197,36 @@ pub async fn clear_index(
         std::fs::write(&relevance_path, data)?;
     }
 
+    let task = state.manager.make_noop_task(&index_name)?;
     Ok(Json(serde_json::json!({
-        "taskID": 0,
+        "taskID": task.numeric_id,
+        "updatedAt": chrono::Utc::now().to_rfc3339()
+    })))
+}
+
+/// Compact an index (merge segments and reclaim disk space)
+#[utoipa::path(
+    post,
+    path = "/1/indexes/{indexName}/compact",
+    tag = "indices",
+    params(
+        ("indexName" = String, Path, description = "Index name to compact")
+    ),
+    responses(
+        (status = 200, description = "Compaction started", body = serde_json::Value),
+        (status = 404, description = "Index not found")
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn compact_index(
+    State(state): State<Arc<AppState>>,
+    Path(index_name): Path<String>,
+) -> Result<Json<serde_json::Value>, FlapjackError> {
+    let task = state.manager.compact_index(&index_name)?;
+    Ok(Json(serde_json::json!({
+        "taskID": task.numeric_id,
         "updatedAt": chrono::Utc::now().to_rfc3339()
     })))
 }
