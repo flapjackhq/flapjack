@@ -149,8 +149,14 @@ mod compact_index {
     use super::*;
 
     fn make_large_doc(id: &str) -> Document {
-        // Use a large payload so index data dominates over fixed metadata overhead
-        let payload = "x".repeat(10_000);
+        // Use random (incompressible) payload so document data dominates over
+        // fixed per-segment metadata overhead, making size comparisons reliable.
+        use rand::Rng;
+        let payload: String = rand::thread_rng()
+            .sample_iter(&rand::distributions::Alphanumeric)
+            .take(10_000)
+            .map(char::from)
+            .collect();
         Document::from_json(&json!({"_id": id, "name": format!("Item {}", id), "body": payload}))
             .unwrap()
     }
@@ -162,15 +168,16 @@ mod compact_index {
         mgr.create_tenant("test").unwrap();
 
         // Add large docs in separate batches to create multiple segments
-        let batch1: Vec<Document> = (1..=10).map(|i| make_large_doc(&i.to_string())).collect();
-        let batch2: Vec<Document> = (11..=20).map(|i| make_large_doc(&i.to_string())).collect();
+        let batch1: Vec<Document> = (1..=25).map(|i| make_large_doc(&i.to_string())).collect();
+        let batch2: Vec<Document> =
+            (26..=50).map(|i| make_large_doc(&i.to_string())).collect();
         mgr.add_documents_sync("test", batch1).await.unwrap();
         mgr.add_documents_sync("test", batch2).await.unwrap();
 
         let size_with_all_docs = dir_size(&tmp.path().join("test"));
 
-        // Delete most docs (keep only doc "20")
-        let to_delete: Vec<String> = (1..=19).map(|i| i.to_string()).collect();
+        // Delete most docs (keep only doc "50")
+        let to_delete: Vec<String> = (1..=49).map(|i| i.to_string()).collect();
         mgr.delete_documents_sync("test", to_delete).await.unwrap();
 
         // Compact to force merge + GC
@@ -187,7 +194,7 @@ mod compact_index {
         // Verify remaining doc is still searchable
         let results = mgr.search("test", "", None, None, 100).unwrap();
         assert_eq!(results.total, 1);
-        assert_eq!(results.documents[0].document.id, "20");
+        assert_eq!(results.documents[0].document.id, "50");
     }
 
     #[tokio::test]
