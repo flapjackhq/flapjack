@@ -81,7 +81,7 @@ detect_platform() {
   # Map to Rust target triples used in our release artifacts
   case "${os}-${arch}" in
     linux-x86_64)   target="x86_64-unknown-linux-musl" ;;
-    linux-aarch64)   target="aarch64-unknown-linux-gnu" ;;
+    linux-aarch64)   target="aarch64-unknown-linux-musl" ;;
     darwin-x86_64)   target="x86_64-apple-darwin" ;;
     darwin-aarch64)  target="aarch64-apple-darwin" ;;
     *)

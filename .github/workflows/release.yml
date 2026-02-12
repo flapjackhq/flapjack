@@ -23,14 +23,19 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
+            use_cross: false
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
+            use_cross: true
           - target: x86_64-apple-darwin
             os: macos-15-intel
+            use_cross: false
           - target: aarch64-apple-darwin
             os: macos-latest
+            use_cross: false
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            use_cross: false
 
     steps:
       - uses: actions/checkout@v4
@@ -42,19 +47,20 @@ jobs:
           key: release-${{ matrix.target }}
 
       - name: Install musl-tools
-        if: contains(matrix.target, 'musl')
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Install aarch64 cross-compiler
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build
+      - name: Build (native)
+        if: "!matrix.use_cross"
         run: cargo build --release --target ${{ matrix.target }} --package flapjack-server
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }} --package flapjack-server
 
       - name: Package (Unix)
         if: runner.os != 'Windows'

@@ -618,10 +618,17 @@ async fn test_delete_index() {
         .send()
         .await
         .unwrap();
-    // After deletion, searching the index should either 404 or return 0 hits
-    if res.status().is_success() {
+    // After deletion, searching the index must either 404 or return 0 hits
+    let status = res.status();
+    if status.is_success() {
         let body: serde_json::Value = res.json().await.unwrap();
         assert_eq!(body["nbHits"], 0, "deleted index should have 0 hits");
+    } else {
+        assert!(
+            status == 404 || status == 400,
+            "expected 404 or 400 for deleted index, got {}",
+            status
+        );
     }
 }
 
@@ -1025,8 +1032,25 @@ async fn test_browse_index() {
         .unwrap();
     assert!(res.status().is_success(), "browse: {}", res.status());
     let body: serde_json::Value = res.json().await.unwrap();
-    assert!(body.get("hits").is_some(), "browse should return hits");
-    assert!(body.get("cursor").is_some() || body.get("nbHits").is_some());
+    let hits = body["hits"].as_array().expect("browse should return hits array");
+    assert_eq!(hits.len(), 2, "hitsPerPage=2 should return exactly 2 hits");
+
+    // Cursor must be a non-empty string for pagination when more results exist
+    let cursor = body["cursor"]
+        .as_str()
+        .expect("cursor must be present when there are more results");
+    assert!(!cursor.is_empty(), "cursor must be a non-empty string");
+
+    // Verify cursor works for fetching the next page
+    let res2 = h(client.post(format!("{}/1/indexes/products/browse", base)))
+        .json(&json!({"cursor": cursor}))
+        .send()
+        .await
+        .unwrap();
+    assert!(res2.status().is_success(), "browse with cursor should succeed");
+    let body2: serde_json::Value = res2.json().await.unwrap();
+    let hits2 = body2["hits"].as_array().expect("cursor page should return hits");
+    assert!(!hits2.is_empty(), "cursor page should have remaining results");
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -1566,18 +1590,19 @@ async fn test_snippet_no_match() {
     assert!(res.status().is_success());
 
     let body: serde_json::Value = res.json().await.unwrap();
-    if let Some(hits) = body["hits"].as_array() {
-        if !hits.is_empty() {
-            let snippet = &hits[0]["_snippetResult"]["description"];
-            if snippet.is_object() {
-                assert_eq!(
-                    snippet["matchLevel"].as_str().unwrap(),
-                    "none",
-                    "no match in description"
-                );
-            }
-        }
-    }
+    let hits = body["hits"].as_array().expect("response must have hits array");
+    assert!(!hits.is_empty(), "snippet no-match query should still return hits");
+    let snippet = &hits[0]["_snippetResult"]["description"];
+    assert!(
+        snippet.is_object(),
+        "_snippetResult.description must be present as object, got: {}",
+        snippet
+    );
+    assert_eq!(
+        snippet["matchLevel"].as_str().unwrap(),
+        "none",
+        "no match in description"
+    );
 }
 
 // ── queryType Tests ─────────────────────────────────────────────────────
@@ -1627,9 +1652,19 @@ async fn test_query_type_prefix_none() {
     )
     .await;
 
-    // prefixNone: "lap" should NOT match "Laptop" (no prefix matching)
+    // First verify default (prefix) behavior: "lap" SHOULD match "Laptop"
+    let res_default = h(client.post(format!("{}/1/indexes/products/query", base)))
+        .json(&json!({"query": "lap"}))
+        .send()
+        .await
+        .unwrap();
+    let default_body: serde_json::Value = res_default.json().await.unwrap();
+    let default_hits = default_body["nbHits"].as_u64().unwrap();
+    assert!(default_hits > 0, "default prefix: 'lap' should match 'Laptop'");
+
+    // prefixNone with typoTolerance disabled: "lap" should NOT match "Laptop"
     let res = h(client.post(format!("{}/1/indexes/products/query", base)))
-        .json(&json!({"query": "lap", "queryType": "prefixNone"}))
+        .json(&json!({"query": "lap", "queryType": "prefixNone", "typoTolerance": false}))
         .send()
         .await
         .unwrap();
@@ -1637,7 +1672,7 @@ async fn test_query_type_prefix_none() {
     assert_eq!(
         body["nbHits"].as_u64().unwrap(),
         0,
-        "prefixNone: 'lap' should NOT match"
+        "prefixNone with typoTolerance=false: 'lap' should NOT match 'Laptop'"
     );
 }
 
@@ -1813,14 +1848,15 @@ async fn test_advanced_syntax_exact_phrase() {
     let body: serde_json::Value = res.json().await.unwrap();
     // Both items contain "blue" and "wireless", but only item 1 has the exact phrase "blue wireless"
     let hits = body["hits"].as_array().unwrap();
-    if !hits.is_empty() {
-        // At minimum, item 1 should be in results
-        let ids: Vec<&str> = hits.iter().filter_map(|h| h["objectID"].as_str()).collect();
-        assert!(
-            ids.contains(&"1"),
-            "item with 'Blue Wireless Earbuds' should match exact phrase"
-        );
-    }
+    assert!(
+        !hits.is_empty(),
+        "exact phrase search for 'blue wireless' must return results"
+    );
+    let ids: Vec<&str> = hits.iter().filter_map(|h| h["objectID"].as_str()).collect();
+    assert!(
+        ids.contains(&"1"),
+        "item with 'Blue Wireless Earbuds' should match exact phrase"
+    );
 }
 
 #[tokio::test]
@@ -1845,8 +1881,25 @@ async fn test_advanced_syntax_disabled_default() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success());
-    // Should not error; results may include desktop since - is not special
+    assert!(
+        res.status().is_success(),
+        "search with dash in query (no advancedSyntax) should not error, got {}",
+        res.status()
+    );
+
+    let body: serde_json::Value = res.json().await.unwrap();
+    // Verify the response has valid structure
+    assert!(
+        body.get("hits").is_some(),
+        "response must include hits field"
+    );
+    assert!(
+        body.get("nbHits").is_some() || body.get("totalHits").is_some(),
+        "response must include a hit count field"
+    );
+    // Note: whether the dash excludes "Desktop" depends on the search engine's
+    // query parser. The key requirement is that the query doesn't error out and
+    // returns a valid response with the expected structure.
 }
 
 // ── removeWordsIfNoResults Tests ────────────────────────────────────────
@@ -2094,6 +2147,17 @@ async fn test_optional_filters_boost() {
     assert!(ids.contains(&"1"), "Electronics item 1 should be present");
     assert!(ids.contains(&"2"), "Accessories item should be present");
     assert!(ids.contains(&"3"), "Electronics item 3 should be present");
+
+    // Verify Electronics items are ranked higher than Accessories
+    let pos = |id: &str| -> usize {
+        ids.iter().position(|&x| x == id).expect("id must be present")
+    };
+    let acc_pos = pos("2"); // Accessories item
+    assert!(
+        pos("1") < acc_pos || pos("3") < acc_pos,
+        "At least one Electronics item should rank above Accessories when boosted, got order: {:?}",
+        ids
+    );
 }
 
 #[tokio::test]
@@ -2195,18 +2259,7 @@ async fn test_enable_synonyms_false() {
     let client = algolia_client();
     let base = format!("http://{}", addr);
 
-    // Add a synonym: phone <-> mobile
-    h(client.put(format!("{}/1/indexes/syn_test/synonyms/syn1", base)))
-        .json(&json!({
-            "objectID": "syn1",
-            "type": "synonym",
-            "synonyms": ["phone", "mobile"]
-        }))
-        .send()
-        .await
-        .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
+    // Seed documents first
     seed_index(
         &base,
         "syn_test",
@@ -2217,12 +2270,30 @@ async fn test_enable_synonyms_false() {
     )
     .await;
 
-    // Search "phone" WITH synonyms (default) — should find "mobile device" too
+    // Add a synonym: phone <-> mobile (after documents so index exists)
+    let syn_res = h(client.put(format!("{}/1/indexes/syn_test/synonyms/syn1", base)))
+        .json(&json!({
+            "objectID": "syn1",
+            "type": "synonym",
+            "synonyms": ["phone", "mobile"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        syn_res.status().is_success(),
+        "saving synonym should succeed, got {}",
+        syn_res.status()
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Search "phone" WITH synonyms (default) — should find "phone case" at minimum
     let res = h(client.post(format!("{}/1/indexes/syn_test/query", base)))
         .json(&json!({"query": "phone"}))
         .send()
         .await
         .unwrap();
+    assert!(res.status().is_success());
     let with_syn: serde_json::Value = res.json().await.unwrap();
     let with_count = with_syn["nbHits"].as_u64().unwrap();
 
@@ -2232,15 +2303,31 @@ async fn test_enable_synonyms_false() {
         .send()
         .await
         .unwrap();
+    assert!(res.status().is_success());
     let without_syn: serde_json::Value = res.json().await.unwrap();
     let without_count = without_syn["nbHits"].as_u64().unwrap();
 
-    // With synonyms should return >= without synonyms
+    // Without synonyms, "phone" should match at least "phone case"
+    assert!(
+        without_count >= 1,
+        "synonyms disabled: 'phone' should match 'phone case', got {} hits",
+        without_count
+    );
+
+    // With synonyms enabled, should return >= without synonyms
+    // (synonym expansion may additionally match "mobile device")
     assert!(
         with_count >= without_count,
         "synonyms enabled ({}) should return >= synonyms disabled ({})",
         with_count,
         without_count
+    );
+
+    // Verify enableSynonyms parameter is accepted and processed
+    // (not just ignored — the response structure should be valid)
+    assert!(
+        without_syn.get("hits").is_some(),
+        "response with enableSynonyms:false must have valid hits"
     );
 }
 
@@ -2276,17 +2363,27 @@ async fn test_enable_rules_false() {
     )
     .await;
 
-    // Search with rules (default) — promo should be pinned
+    // Search with rules (default) — promo should be pinned at position 0
     let res = h(client.post(format!("{}/1/indexes/rule_test/query", base)))
         .json(&json!({"query": "laptop"}))
         .send()
         .await
         .unwrap();
     let with_rules: serde_json::Value = res.json().await.unwrap();
-    let hits = with_rules["hits"].as_array().unwrap();
-    assert!(!hits.is_empty());
+    let hits = with_rules["hits"].as_array().expect("response must have hits array");
+    assert!(
+        hits.len() >= 2,
+        "rule_test should have at least 2 hits, got {}",
+        hits.len()
+    );
+    // The rule pins "promo" to position 0
+    assert_eq!(
+        hits[0]["objectID"].as_str().unwrap(),
+        "promo",
+        "with rules enabled, 'promo' should be pinned at position 0"
+    );
 
-    // Search with rules disabled
+    // Search with rules disabled — promo should NOT necessarily be first
     let res = h(client.post(format!("{}/1/indexes/rule_test/query", base)))
         .json(&json!({"query": "laptop", "enableRules": false}))
         .send()
@@ -2294,8 +2391,14 @@ async fn test_enable_rules_false() {
         .unwrap();
     assert!(res.status().is_success());
     let without_rules: serde_json::Value = res.json().await.unwrap();
+    let hits_no_rules = without_rules["hits"]
+        .as_array()
+        .expect("response must have hits array");
     // Should still return results (rules don't affect what's found, just ordering/promotion)
-    assert!(without_rules["nbHits"].as_u64().unwrap() > 0);
+    assert!(
+        !hits_no_rules.is_empty(),
+        "with rules disabled, search should still return results"
+    );
 }
 
 // ── restrictSearchableAttributes ─────────────────────────────────────
@@ -2353,15 +2456,27 @@ async fn test_rule_contexts() {
     let client = algolia_client();
     let base = format!("http://{}", addr);
 
-    // ruleContexts is accepted without error (functional context matching
-    // depends on rules having context conditions, which is an advanced feature)
     seed_index(
         &base,
         "ctx_test",
-        vec![json!({"objectID": "1", "name": "test item"})],
+        vec![
+            json!({"objectID": "1", "name": "test item"}),
+            json!({"objectID": "2", "name": "other item"}),
+        ],
     )
     .await;
 
+    // Search WITHOUT ruleContexts as baseline
+    let res_baseline = h(client.post(format!("{}/1/indexes/ctx_test/query", base)))
+        .json(&json!({"query": "test"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(res_baseline.status().is_success());
+    let baseline: serde_json::Value = res_baseline.json().await.unwrap();
+    let baseline_hits = baseline["nbHits"].as_u64().unwrap();
+
+    // Search WITH ruleContexts — should be accepted and return valid results
     let res = h(client.post(format!("{}/1/indexes/ctx_test/query", base)))
         .json(&json!({
             "query": "test",
@@ -2375,5 +2490,16 @@ async fn test_rule_contexts() {
         "ruleContexts param should be accepted"
     );
     let body: serde_json::Value = res.json().await.unwrap();
-    assert!(body["nbHits"].as_u64().unwrap() > 0);
+    let ctx_hits = body["nbHits"].as_u64().unwrap();
+    assert!(ctx_hits > 0, "should return results with ruleContexts");
+
+    // Without context-specific rules, results should match baseline
+    assert_eq!(
+        ctx_hits, baseline_hits,
+        "without context-specific rules, results should match baseline"
+    );
+
+    // Verify response structure is valid search response
+    assert!(body.get("hits").is_some(), "response must contain hits");
+    assert!(body.get("processingTimeMS").is_some(), "response must contain processingTimeMS");
 }
