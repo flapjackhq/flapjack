@@ -513,9 +513,18 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             post(crate::handlers::quickstart::qs_add_documents),
         )
         .route(
+            "/indexes/:indexName/documents/delete",
+            post(crate::handlers::quickstart::qs_delete_documents),
+        )
+        .route(
             "/indexes/:indexName/documents/:docId",
             get(crate::handlers::quickstart::qs_get_document)
                 .delete(crate::handlers::quickstart::qs_delete_document),
+        )
+        .route(
+            "/indexes/:indexName/settings",
+            get(crate::handlers::quickstart::qs_get_settings)
+                .put(crate::handlers::quickstart::qs_set_settings),
         )
         .route(
             "/indexes/:indexName",

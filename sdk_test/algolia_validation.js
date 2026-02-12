@@ -2,6 +2,7 @@ import { algoliasearch } from 'algoliasearch';
 import * as dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { execSync } from 'child_process';
 import { CacheManager } from './lib/cache-manager.js';
 import { TestRunner } from './lib/test-runner.js';
 import { loadFixtures } from './lib/fixtures.js';
@@ -162,12 +163,25 @@ function parseCaseFilter(str) {
 
 const filters = suiteFilters.map(parseCaseFilter);
 
+async function ensureServer() {
+  try {
+    const res = await fetch('http://localhost:7700/health');
+    if (res.ok) return;
+  } catch {}
+
+  console.log('Release server not running. Starting it...');
+  const repoRoot = join(__dirname, '..');
+  execSync('./s/dev-server.sh --release restart', { cwd: repoRoot, stdio: 'inherit' });
+}
+
 async function main() {
   const cache = new CacheManager();
-  
+
   if (args.length === 0) {
     console.log('\nNo arguments provided. Run with --man for help.\n');
   }
+
+  await ensureServer();
   
   if (flags.cleanup) {
     const flapjackClient = createFlapjackClient(flags.verbose);

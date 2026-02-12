@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use super::AppState;
 use crate::dto::{AddDocumentsRequest, AddDocumentsResponse, BatchOperation, SearchRequest};
+use super::settings::SetSettingsRequest;
 use flapjack::error::FlapjackError;
 
 // ---------------------------------------------------------------------------
@@ -185,4 +186,57 @@ pub async fn qs_migrate(
     Json(payload): Json<super::migration::MigrateFromAlgoliaRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     super::migration::migrate_from_algolia(State(state), Json(payload)).await
+}
+
+// ---------------------------------------------------------------------------
+// Bulk Delete
+// ---------------------------------------------------------------------------
+
+/// `POST /indexes/:indexName/documents/delete` — delete multiple documents by ID.
+///
+/// Accepts a JSON array of document IDs: `["id1", "id2", "id3"]`.
+pub async fn qs_delete_documents(
+    State(state): State<Arc<AppState>>,
+    Path(index_name): Path<String>,
+    Json(ids): Json<Vec<String>>,
+) -> Result<Json<serde_json::Value>, FlapjackError> {
+    if ids.is_empty() {
+        let task = state.manager.make_noop_task(&index_name)?;
+        return Ok(Json(serde_json::json!({
+            "taskID": task.numeric_id,
+            "deletedAt": chrono::Utc::now().to_rfc3339()
+        })));
+    }
+
+    state
+        .manager
+        .delete_documents_sync(&index_name, ids)
+        .await?;
+
+    let task = state.manager.make_noop_task(&index_name)?;
+    Ok(Json(serde_json::json!({
+        "taskID": task.numeric_id,
+        "deletedAt": chrono::Utc::now().to_rfc3339()
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+/// `GET /indexes/:indexName/settings` — get index settings.
+pub async fn qs_get_settings(
+    State(state): State<Arc<AppState>>,
+    Path(index_name): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    super::settings::get_settings(State(state), Path(index_name)).await
+}
+
+/// `PUT /indexes/:indexName/settings` — update index settings.
+pub async fn qs_set_settings(
+    State(state): State<Arc<AppState>>,
+    Path(index_name): Path<String>,
+    Json(payload): Json<SetSettingsRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    super::settings::set_settings(State(state), Path(index_name), Json(payload)).await
 }

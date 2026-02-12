@@ -173,9 +173,18 @@ pub async fn spawn_server_with_key(admin_key: Option<&str>) -> (String, TempDir)
             post(flapjack_http::handlers::quickstart::qs_add_documents),
         )
         .route(
+            "/indexes/:indexName/documents/delete",
+            post(flapjack_http::handlers::quickstart::qs_delete_documents),
+        )
+        .route(
             "/indexes/:indexName/documents/:docId",
             get(flapjack_http::handlers::quickstart::qs_get_document)
                 .delete(flapjack_http::handlers::quickstart::qs_delete_document),
+        )
+        .route(
+            "/indexes/:indexName/settings",
+            get(flapjack_http::handlers::quickstart::qs_get_settings)
+                .put(flapjack_http::handlers::quickstart::qs_set_settings),
         )
         .route(
             "/indexes/:indexName",
