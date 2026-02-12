@@ -190,7 +190,7 @@ fn merge_partial_update(
 
 use super::field_value_to_json;
 
-async fn add_documents_batch_impl(
+pub async fn add_documents_batch_impl(
     State(state): State<Arc<AppState>>,
     index_name: String,
     req: AddDocumentsRequest,

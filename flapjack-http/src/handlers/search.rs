@@ -259,7 +259,7 @@ pub async fn batch_search(
     Ok(Json(serde_json::json!({"results": results})))
 }
 
-async fn search_single(
+pub async fn search_single(
     State(state): State<Arc<AppState>>,
     index_name: String,
     req: SearchRequest,

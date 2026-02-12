@@ -14,6 +14,7 @@ pub mod internal;
 pub mod keys;
 pub mod migration;
 pub mod objects;
+pub mod quickstart;
 pub mod rules;
 pub mod search;
 pub mod settings;

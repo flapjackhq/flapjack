@@ -1,6 +1,6 @@
 use axum::{
     middleware,
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use std::sync::Arc;
@@ -156,6 +156,39 @@ pub async fn spawn_server_with_key(admin_key: Option<&str>) -> (String, TempDir)
             "/1/indexes/:indexName/task/:task_id",
             get(flapjack_http::handlers::get_task_for_index),
         )
+        .with_state(state.clone());
+
+    let quickstart = Router::new()
+        .route(
+            "/indexes",
+            get(flapjack_http::handlers::quickstart::qs_list_indexes),
+        )
+        .route(
+            "/indexes/:indexName/search",
+            get(flapjack_http::handlers::quickstart::qs_search_get)
+                .post(flapjack_http::handlers::quickstart::qs_search_post),
+        )
+        .route(
+            "/indexes/:indexName/documents",
+            post(flapjack_http::handlers::quickstart::qs_add_documents),
+        )
+        .route(
+            "/indexes/:indexName/documents/:docId",
+            get(flapjack_http::handlers::quickstart::qs_get_document)
+                .delete(flapjack_http::handlers::quickstart::qs_delete_document),
+        )
+        .route(
+            "/indexes/:indexName",
+            delete(flapjack_http::handlers::quickstart::qs_delete_index),
+        )
+        .route(
+            "/tasks/:taskId",
+            get(flapjack_http::handlers::quickstart::qs_get_task),
+        )
+        .route(
+            "/migrate",
+            post(flapjack_http::handlers::quickstart::qs_migrate),
+        )
         .with_state(state);
 
     let ks_for_middleware = key_store.clone();
@@ -175,7 +208,8 @@ pub async fn spawn_server_with_key(admin_key: Option<&str>) -> (String, TempDir)
         .merge(health_route)
         .merge(key_routes)
         .merge(protected)
-        .layer(auth_middleware);
+        .layer(auth_middleware)
+        .merge(quickstart);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();

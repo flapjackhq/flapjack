@@ -27,23 +27,48 @@ curl -fsSL https://install.flapjack.foo | sh
 
 Or download manually from [Releases](https://github.com/flapjackhq/flapjack/releases/latest).
 
-Then start the server and add some data:
+Then start the server and try it out:
 
 ```bash
 flapjack-server
 
-# Add documents
-curl -X POST http://localhost:7701/1/indexes/movies/batch \
-  -H "Content-Type: application/json" \
-  -d '{"requests":[
-    {"action":"addObject","body":{"objectID":"1","title":"The Matrix","year":1999}},
-    {"action":"addObject","body":{"objectID":"2","title":"Inception","year":2010}}
-  ]}'
+# Add documents — just POST a JSON array
+curl -X POST http://localhost:7701/indexes/movies/documents \
+  -d '[
+    {"objectID":"1","title":"The Matrix","year":1999},
+    {"objectID":"2","title":"Inception","year":2010},
+    {"objectID":"3","title":"Interstellar","year":2014}
+  ]'
 
-# Search (typo-tolerant)
-curl -X POST http://localhost:7701/1/indexes/movies/query \
-  -H "Content-Type: application/json" \
-  -d '{"query":"matrx"}'
+# Search (typo-tolerant!) — just a GET with ?q=
+curl "http://localhost:7701/indexes/movies/search?q=matrx"
+
+# Get a document
+curl http://localhost:7701/indexes/movies/documents/1
+
+# List all indexes
+curl http://localhost:7701/indexes
+
+# Delete a document
+curl -X DELETE http://localhost:7701/indexes/movies/documents/1
+
+# Delete an index
+curl -X DELETE http://localhost:7701/indexes/movies
+```
+
+No auth headers, no Content-Type header, no SDK needed. These convenience endpoints follow the same REST patterns as Meilisearch and Elasticsearch.
+
+### Already on Algolia? Migrate in one command:
+
+```bash
+curl -X POST http://localhost:7701/migrate \
+  -d '{"appId":"YOUR_APP_ID","apiKey":"YOUR_ADMIN_KEY","sourceIndex":"products"}'
+```
+
+Pulls settings, synonyms, rules, and all documents. Then search immediately:
+
+```bash
+curl "http://localhost:7701/indexes/products/search?q=widget"
 ```
 
 <details>
@@ -62,6 +87,25 @@ NO_MODIFY_PATH=1 curl -fsSL https://install.flapjack.foo | sh
 # Uninstall
 rm -rf ~/.flapjack
 ```
+
+</details>
+
+<details>
+<summary>Quickstart API reference</summary>
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/indexes` | List all indexes |
+| `GET` | `/indexes/:name/search?q=...` | Search (query params) |
+| `POST` | `/indexes/:name/search` | Search (JSON body for complex queries) |
+| `POST` | `/indexes/:name/documents` | Add documents (JSON array or single object) |
+| `GET` | `/indexes/:name/documents/:id` | Get a document |
+| `DELETE` | `/indexes/:name/documents/:id` | Delete a document |
+| `DELETE` | `/indexes/:name` | Delete an index |
+| `GET` | `/tasks/:taskId` | Check indexing task status |
+| `POST` | `/migrate` | Migrate an index from Algolia |
+
+These endpoints require no authentication. For production use with API keys, filters, facets, and the full feature set, use the [Algolia-compatible API](#algolia-compatible-api) below.
 
 </details>
 
@@ -122,9 +166,9 @@ Release binaries available for Linux x86_64 (static musl), Linux ARM64, macOS In
 
 ---
 
-## Client Setup
+## Algolia-Compatible API
 
-Point the Algolia JavaScript client at your Flapjack server:
+For production use, Flapjack provides a full Algolia-compatible API under the `/1/` prefix. Point any Algolia SDK at your Flapjack server:
 
 ```javascript
 import algoliasearch from 'algoliasearch';
@@ -132,20 +176,12 @@ import algoliasearch from 'algoliasearch';
 const client = algoliasearch('your-app-id', 'your-api-key');
 client.transporter.hosts = [{ url: 'localhost:7701', protocol: 'http' }];
 
-// Everything else unchanged
+// Everything else unchanged — search, filters, facets, synonyms, rules all work
 ```
 
 InstantSearch.js widgets work out of the box — `SearchBox`, `Hits`, `RefinementList`, `Pagination`, `HierarchicalMenu`, `GeoSearch`, etc.
 
-### Migrating from Algolia
-
-One-click migration endpoint pulls settings, synonyms, rules, and all documents from an existing Algolia index:
-
-```bash
-curl -X POST http://localhost:7701/1/migrate-from-algolia \
-  -H "Content-Type: application/json" \
-  -d '{"appId":"YOUR_ALGOLIA_APP_ID","apiKey":"YOUR_ALGOLIA_API_KEY","sourceIndex":"products","targetIndex":"products"}'
-```
+The full API supports 45+ endpoints including secured API keys, query rules, synonyms, faceted search, geo-search, and batch operations. See [API Documentation](#api-documentation) for details.
 
 ---
 

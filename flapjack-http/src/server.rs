@@ -496,9 +496,45 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
     );
+    // Quickstart API: simple, no-auth convenience endpoints for local dev.
+    // Merged AFTER auth middleware layer so these routes bypass authentication.
+    let quickstart = Router::new()
+        .route(
+            "/indexes",
+            get(crate::handlers::quickstart::qs_list_indexes),
+        )
+        .route(
+            "/indexes/:indexName/search",
+            get(crate::handlers::quickstart::qs_search_get)
+                .post(crate::handlers::quickstart::qs_search_post),
+        )
+        .route(
+            "/indexes/:indexName/documents",
+            post(crate::handlers::quickstart::qs_add_documents),
+        )
+        .route(
+            "/indexes/:indexName/documents/:docId",
+            get(crate::handlers::quickstart::qs_get_document)
+                .delete(crate::handlers::quickstart::qs_delete_document),
+        )
+        .route(
+            "/indexes/:indexName",
+            delete(crate::handlers::quickstart::qs_delete_index),
+        )
+        .route(
+            "/tasks/:taskId",
+            get(crate::handlers::quickstart::qs_get_task),
+        )
+        .route(
+            "/migrate",
+            post(crate::handlers::quickstart::qs_migrate),
+        )
+        .with_state(state.clone());
+
     let app = app
-        .layer(memory_middleware)
         .layer(auth_middleware)
+        .merge(quickstart)
+        .layer(memory_middleware)
         .layer(DefaultBodyLimit::max(max_body_mb * 1024 * 1024))
         .layer(middleware::from_fn(normalize_content_type))
         .layer(CorsLayer::very_permissive().max_age(std::time::Duration::from_secs(86400)))
