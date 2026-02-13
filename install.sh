@@ -274,52 +274,60 @@ setup_path() {
       ;;
   esac
 
-  shell_name=$(basename "${SHELL:-/bin/sh}")
   export_line="export PATH=\"${INSTALL_DIR}:\$PATH\""
 
   profile_updated=false
 
-  case "$shell_name" in
-    bash)
-      for rc in "$HOME/.bashrc" "$HOME/.bash_profile"; do
-        if [ -f "$rc" ]; then
-          if ! grep -qF "$INSTALL_DIR" "$rc" 2>/dev/null; then
-            if printf '\n# Flapjack\n%s\n' "$export_line" >> "$rc" 2>/dev/null; then
-              profile_updated=true
-              info "Added to ${rc}"
-            else
-              warn "Could not write to ${rc} (permission denied)"
-            fi
-          fi
-          break
-        fi
-      done
-      ;;
-    zsh)
-      rc="$HOME/.zshrc"
-      if [ -f "$rc" ] || [ "$shell_name" = "zsh" ]; then
-        if ! grep -qF "$INSTALL_DIR" "$rc" 2>/dev/null; then
-          if printf '\n# Flapjack\n%s\n' "$export_line" >> "${rc}" 2>/dev/null; then
-            profile_updated=true
-            info "Added to ${rc}"
-          else
-            warn "Could not write to ${rc} (permission denied)"
-          fi
-        fi
-      fi
-      ;;
-    fish)
-      fish_conf="${HOME}/.config/fish/config.fish"
-      fish_line="set -gx PATH ${INSTALL_DIR} \$PATH"
-      if [ -d "$(dirname "$fish_conf")" ]; then
-        if ! grep -qF "$INSTALL_DIR" "$fish_conf" 2>/dev/null; then
-          printf '\n# Flapjack\n%s\n' "$fish_line" >> "$fish_conf"
+  # Try ALL detected shell profiles, not just $SHELL.
+  # Users often have multiple shells configured (e.g., $SHELL=zsh but terminal=fish).
+
+  # Bash — update first existing file only
+  for rc in "$HOME/.bashrc" "$HOME/.bash_profile"; do
+    if [ -f "$rc" ]; then
+      if ! grep -qF "$INSTALL_DIR" "$rc" 2>/dev/null; then
+        if printf '\n# Flapjack\n%s\n' "$export_line" >> "$rc" 2>/dev/null; then
           profile_updated=true
-          info "Added to ${fish_conf}"
+          info "Added to ${rc}"
+        else
+          warn "Could not write to ${rc} (permission denied)"
         fi
+      else
+        profile_updated=true
       fi
-      ;;
-  esac
+      break
+    fi
+  done
+
+  # Zsh
+  rc="$HOME/.zshrc"
+  if [ -f "$rc" ]; then
+    if ! grep -qF "$INSTALL_DIR" "$rc" 2>/dev/null; then
+      if printf '\n# Flapjack\n%s\n' "$export_line" >> "$rc" 2>/dev/null; then
+        profile_updated=true
+        info "Added to ${rc}"
+      else
+        warn "Could not write to ${rc} (permission denied)"
+      fi
+    else
+      profile_updated=true
+    fi
+  fi
+
+  # Fish
+  fish_conf="${HOME}/.config/fish/config.fish"
+  fish_line="set -gx PATH ${INSTALL_DIR} \$PATH"
+  if [ -d "$(dirname "$fish_conf")" ]; then
+    if ! grep -qF "$INSTALL_DIR" "$fish_conf" 2>/dev/null; then
+      if printf '\n# Flapjack\n%s\n' "$fish_line" >> "$fish_conf" 2>/dev/null; then
+        profile_updated=true
+        info "Added to ${fish_conf}"
+      else
+        warn "Could not write to ${fish_conf} (permission denied)"
+      fi
+    else
+      profile_updated=true
+    fi
+  fi
 
   if [ "$profile_updated" = "false" ]; then
     warn "Could not auto-update PATH. Add this to your shell profile:"
@@ -358,7 +366,20 @@ main() {
       *)
         printf "\n"
         printf "  ${YELLOW}Restart your terminal or run:${NC}\n"
-        printf "    source ~/.$(basename "${SHELL:-sh}")rc\n"
+        # Detect the user's actual terminal shell (parent of this sh process)
+        _term_shell=""
+        if [ -n "${PPID:-}" ]; then
+          _term_shell=$(ps -p "$PPID" -o comm= 2>/dev/null || true)
+        fi
+        _term_shell="${_term_shell:-$(basename "${SHELL:-sh}")}"
+        case "$_term_shell" in
+          *fish*)
+            printf "    set -gx PATH %s \$PATH\n" "$INSTALL_DIR"
+            ;;
+          *)
+            printf "    export PATH=\"%s:\$PATH\"\n" "$INSTALL_DIR"
+            ;;
+        esac
         ;;
     esac
   fi

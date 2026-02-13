@@ -52,14 +52,14 @@ NO_MODIFY_PATH=1 curl -fsSL https://install.flapjack.foo | sh
 flapjack
 
 # Add documents
-curl -X POST http://localhost:7701/indexes/movies/documents \
+curl -X POST http://localhost:7700/indexes/movies/documents \
   -d '[
     {"objectID":"1","title":"The Matrix","year":1999},
     {"objectID":"2","title":"Inception","year":2010}
   ]'
 
 # Search (typo-tolerant)
-curl "http://localhost:7701/indexes/movies/search?q=matrx"
+curl "http://localhost:7700/indexes/movies/search?q=matrx"
 ```
 
 
@@ -92,14 +92,14 @@ These are convenience endpoints with no auth required in dev mode. The full Algo
 ```bash
 flapjack
 
-curl -X POST http://localhost:7701/migrate \
+curl -X POST http://localhost:7700/migrate \
   -d '{"appId":"YOUR_ALGOLIA_APP_ID","apiKey":"YOUR_ALGOLIA_ADMIN_KEY","sourceIndex":"products"}'
 ```
 
 Search:
 
 ```bash
-curl "http://localhost:7701/indexes/products/search?q=widget"
+curl "http://localhost:7700/indexes/products/search?q=widget"
 ```
 
 Then point your frontend at Flapjack instead of Algolia:
@@ -109,7 +109,7 @@ import algoliasearch from 'algoliasearch';
 
 // app-id can be any string, api-key is your FLAPJACK_ADMIN_KEY or a search key
 const client = algoliasearch('my-app', 'your-flapjack-api-key');
-client.transporter.hosts = [{ url: 'localhost:7701', protocol: 'http' }];
+client.transporter.hosts = [{ url: 'localhost:7700', protocol: 'http' }];
 
 // Everything else stays the same
 ```
@@ -159,7 +159,7 @@ services:
   flapjack:
     image: flapjack/flapjack:latest
     ports:
-      - "7701:7701"
+      - "7700:7700"
     volumes:
       - ./data:/data
     environment:
@@ -201,7 +201,7 @@ WantedBy=multi-user.target
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FLAPJACK_DATA_DIR` | `./data` | Index storage directory |
-| `FLAPJACK_BIND_ADDR` | `127.0.0.1:7701` | Listen address |
+| `FLAPJACK_BIND_ADDR` | `127.0.0.1:7700` | Listen address |
 | `FLAPJACK_ADMIN_KEY` | — | Admin API key (enables auth) |
 | `FLAPJACK_ENV` | `development` | `production` requires auth on all endpoints |
 | `FLAPJACK_S3_BUCKET` | — | S3 bucket for snapshots |
@@ -215,7 +215,7 @@ Data stored in `FLAPJACK_DATA_DIR`. Mount as a volume in Docker.
 
 ## API Documentation
 
-Browse at [flapjack-demo.pages.dev/api-docs](https://flapjack-demo.pages.dev/api-docs), or run locally and use the Swagger UI at `http://localhost:7701/swagger-ui/`.
+Browse at [flapjack-demo.pages.dev/api-docs](https://flapjack-demo.pages.dev/api-docs), or run locally and use the Swagger UI at `http://localhost:7700/swagger-ui/`.
 
 ---
 

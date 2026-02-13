@@ -77,6 +77,17 @@ jobs:
       - name: All tests
         run: cargo nextest run -P ci
 
+  installer:
+    name: Installer tests
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run installer tests
+        run: sh tests/test_install.sh
+
   dashboard:
     name: Dashboard build
     runs-on: ubuntu-latest
