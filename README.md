@@ -19,13 +19,20 @@ Drop-in replacement for [Algolia](https://algolia.com) — works with [InstantSe
 curl -fsSL https://install.flapjack.foo | sh
 ```
 
-Or grab a binary from [Releases](https://github.com/flapjackhq/flapjack/releases/latest).
-
-<details>
-<summary>More install options</summary>
+### Uninstall
 
 ```bash
-# Specific version
+flapjack uninstall
+```
+
+
+<details>
+<summary>Note:</summary>
+
+Binaries: [Releases](https://github.com/flapjackhq/flapjack/releases/latest).
+
+```bash
+# Install specific version
 curl -fsSL https://install.flapjack.foo | sh -s -- v0.2.0
 
 # Custom install directory
@@ -33,53 +40,13 @@ FLAPJACK_INSTALL=/opt/flapjack curl -fsSL https://install.flapjack.foo | sh
 
 # Skip PATH modification
 NO_MODIFY_PATH=1 curl -fsSL https://install.flapjack.foo | sh
-
-# Uninstall
-rm -rf ~/.flapjack
 ```
 
 </details>
 
 ---
 
-## Migrate from Algolia
-
-Start the server and pull an existing index — settings, synonyms, rules, and all documents:
-
-```bash
-flapjack
-
-curl -X POST http://localhost:7701/migrate \
-  -d '{"appId":"YOUR_ALGOLIA_APP_ID","apiKey":"YOUR_ALGOLIA_ADMIN_KEY","sourceIndex":"products"}'
-```
-
-Find your Algolia credentials in the [Algolia dashboard](https://dashboard.algolia.com/account/api-keys/) under API Keys. You'll need the Admin API Key (not the Search-Only key).
-
-Search immediately:
-
-```bash
-curl "http://localhost:7701/indexes/products/search?q=widget"
-```
-
-Then point your frontend at Flapjack instead of Algolia:
-
-```javascript
-import algoliasearch from 'algoliasearch';
-
-// app-id can be any string, api-key is your FLAPJACK_ADMIN_KEY or a search key
-const client = algoliasearch('my-app', 'your-flapjack-api-key');
-client.transporter.hosts = [{ url: 'localhost:7701', protocol: 'http' }];
-
-// Everything else stays the same
-```
-
-InstantSearch.js widgets work as-is — `SearchBox`, `Hits`, `RefinementList`, `Pagination`, `GeoSearch`, etc.
-
----
-
-## Quick Start
-
-If you're starting fresh, no SDK needed — just curl:
+## Quickstart
 
 ```bash
 flapjack
@@ -95,10 +62,9 @@ curl -X POST http://localhost:7701/indexes/movies/documents \
 curl "http://localhost:7701/indexes/movies/search?q=matrx"
 ```
 
-No auth headers, no Content-Type header required in dev mode. For production, set `FLAPJACK_ENV=production` and `FLAPJACK_ADMIN_KEY` — see [Configuration](#configuration).
 
 <details>
-<summary>Full API reference</summary>
+<summary>Quickstart API</summary>
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -118,6 +84,37 @@ No auth headers, no Content-Type header required in dev mode. For production, se
 These are convenience endpoints with no auth required in dev mode. The full Algolia-compatible API lives under `/1/` with support for API keys, secured keys, filters, facets, and everything else.
 
 </details>
+
+---
+
+## Migrate from Algolia
+
+```bash
+flapjack
+
+curl -X POST http://localhost:7701/migrate \
+  -d '{"appId":"YOUR_ALGOLIA_APP_ID","apiKey":"YOUR_ALGOLIA_ADMIN_KEY","sourceIndex":"products"}'
+```
+
+Search:
+
+```bash
+curl "http://localhost:7701/indexes/products/search?q=widget"
+```
+
+Then point your frontend at Flapjack instead of Algolia:
+
+```javascript
+import algoliasearch from 'algoliasearch';
+
+// app-id can be any string, api-key is your FLAPJACK_ADMIN_KEY or a search key
+const client = algoliasearch('my-app', 'your-flapjack-api-key');
+client.transporter.hosts = [{ url: 'localhost:7701', protocol: 'http' }];
+
+// Everything else stays the same
+```
+
+InstantSearch.js widgets work as-is — `SearchBox`, `Hits`, `RefinementList`, `Pagination`, `GeoSearch`, etc.
 
 ---
 
@@ -141,8 +138,6 @@ These are convenience endpoints with no auth required in dev mode. The full Algo
 | S3 backup/restore | Scheduled snapshots, auto-restore on startup |
 
 Algolia-compatible REST API under `/1/` — works with InstantSearch.js v5, the algoliasearch client, and [Laravel Scout](integrations/laravel-scout/).
-
-**Not yet implemented:** analytics, A/B testing, query suggestions, vector search, multi-node replication.
 
 ---
 
