@@ -1,0 +1,22 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# IDE  
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build outputs
+/dist/
+/build/
+*.log
+
+# Temporary files
+*.tmp
+tmp/
+.cache/
