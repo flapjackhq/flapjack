@@ -5,12 +5,9 @@ Self-hosted search engine with an Algolia-compatible API. Single binary, no depe
 [![CI](https://github.com/flapjackhq/flapjack/actions/workflows/ci.yml/badge.svg)](https://github.com/flapjackhq/flapjack/actions/workflows/ci.yml)
 [![Release](https://github.com/flapjackhq/flapjack/actions/workflows/release.yml/badge.svg)](https://github.com/flapjackhq/flapjack/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Status: Beta](https://img.shields.io/badge/Status-Beta-orange)](https://github.com/flapjackhq/flapjack)
 
-> **Beta** 
-
-- Drop-in replacement for [Algolia](https://algolia.com): works with [InstantSearch.js](https://github.com/algolia/instantsearch) and the [algoliasearch](https://github.com/algolia/algoliasearch-client-javascript) client
-- Typo-tolerant full-text search with faceting, geo search, and custom ranking
-- Single static binary, runs anywhere, data stays on disk
+Drop-in replacement for [Algolia](https://algolia.com) — works with [InstantSearch.js](https://github.com/algolia/instantsearch) and the [algoliasearch](https://github.com/algolia/algoliasearch-client-javascript) client. Typo-tolerant full-text search with faceting, geo search, and custom ranking. Single static binary, runs anywhere, data stays on disk.
 
 **[Live Demo](https://flapjack-demo.pages.dev)** · **[Geo Demo](https://flapjack-demo.pages.dev/geo)** · **[API Docs](https://flapjack-demo.pages.dev/api-docs)**
 
@@ -53,8 +50,10 @@ Start the server and pull an existing index — settings, synonyms, rules, and a
 flapjack-server
 
 curl -X POST http://localhost:7701/migrate \
-  -d '{"appId":"YOUR_APP_ID","apiKey":"YOUR_ADMIN_KEY","sourceIndex":"products"}'
+  -d '{"appId":"YOUR_ALGOLIA_APP_ID","apiKey":"YOUR_ALGOLIA_ADMIN_KEY","sourceIndex":"products"}'
 ```
+
+Find your Algolia credentials in the [Algolia dashboard](https://dashboard.algolia.com/account/api-keys/) under API Keys. You'll need the Admin API Key (not the Search-Only key).
 
 Search immediately:
 
@@ -67,7 +66,8 @@ Then point your frontend at Flapjack instead of Algolia:
 ```javascript
 import algoliasearch from 'algoliasearch';
 
-const client = algoliasearch('your-app-id', 'your-api-key');
+// app-id can be any string, api-key is your FLAPJACK_ADMIN_KEY or a search key
+const client = algoliasearch('my-app', 'your-flapjack-api-key');
 client.transporter.hosts = [{ url: 'localhost:7701', protocol: 'http' }];
 
 // Everything else stays the same
@@ -88,8 +88,7 @@ flapjack-server
 curl -X POST http://localhost:7701/indexes/movies/documents \
   -d '[
     {"objectID":"1","title":"The Matrix","year":1999},
-    {"objectID":"2","title":"Inception","year":2010},
-    {"objectID":"3","title":"Interstellar","year":2014}
+    {"objectID":"2","title":"Inception","year":2010}
   ]'
 
 # Search (typo-tolerant)
@@ -149,7 +148,15 @@ Algolia-compatible REST API under `/1/` — works with InstantSearch.js v5, the 
 
 ## Deployment
 
-### Docker
+```bash
+cargo build --release
+./target/release/flapjack-server
+```
+
+Requires Rust 1.70+. Pre-built binaries for Linux x86_64 (static musl), Linux ARM64, macOS Intel, and macOS Apple Silicon on the [releases page](https://github.com/flapjackhq/flapjack/releases/latest).
+
+<details>
+<summary>Docker</summary>
 
 ```yaml
 # docker-compose.yml
@@ -166,7 +173,10 @@ services:
     restart: unless-stopped
 ```
 
-### Systemd
+</details>
+
+<details>
+<summary>Systemd</summary>
 
 ```ini
 # /etc/systemd/system/flapjack.service
@@ -187,16 +197,7 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-### Build from Source
-
-Requires Rust 1.70+:
-
-```bash
-cargo build --release
-./target/release/flapjack-server
-```
-
-Binaries available for Linux x86_64 (static musl), Linux ARM64, macOS Intel, and macOS Apple Silicon.
+</details>
 
 ---
 
@@ -261,4 +262,4 @@ cargo nextest run
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
+ [MIT](LICENSE)
