@@ -67,7 +67,7 @@ jobs:
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../flapjack-${{ matrix.target }}.tar.gz flapjack-server
+          tar czf ../../../flapjack-${{ matrix.target }}.tar.gz flapjack
           cd ../../..
           shasum -a 256 flapjack-${{ matrix.target }}.tar.gz > flapjack-${{ matrix.target }}.tar.gz.sha256
 
@@ -76,7 +76,7 @@ jobs:
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          7z a ../../../flapjack-${{ matrix.target }}.zip flapjack-server.exe
+          7z a ../../../flapjack-${{ matrix.target }}.zip flapjack.exe
           cd ../../..
           sha256sum flapjack-${{ matrix.target }}.zip > flapjack-${{ matrix.target }}.zip.sha256
 

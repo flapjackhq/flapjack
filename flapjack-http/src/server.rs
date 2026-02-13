@@ -534,10 +534,7 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             "/tasks/:taskId",
             get(crate::handlers::quickstart::qs_get_task),
         )
-        .route(
-            "/migrate",
-            post(crate::handlers::quickstart::qs_migrate),
-        )
+        .route("/migrate", post(crate::handlers::quickstart::qs_migrate))
         .with_state(state.clone());
 
     let app = app

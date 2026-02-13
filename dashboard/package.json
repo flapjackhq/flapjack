@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "update-server": "cd .. && cargo build -p flapjack-server --release && cp target/release/flapjack-server dashboard/bin/flapjack-server-stable && echo '✓ Server binary updated'",
+    "update-server": "cd .. && cargo build -p flapjack-server --release && cp target/release/flapjack dashboard/bin/flapjack-stable && echo '✓ Server binary updated'",
     "server": "bash scripts/start-stable-server.sh",
     "build": "tsc && vite build",
     "preview": "vite preview",

@@ -53,9 +53,9 @@ start() {
         cargo build -p flapjack-server
         BUILD_TYPE="debug"
     fi
-    
+
     echo "Starting server ($BUILD_TYPE build, data=$DATA_DIR)..."
-    RUST_LOG=warn FLAPJACK_DATA_DIR="$DATA_DIR" ./target/$BUILD_TYPE/flapjack-server > "$LOG_FILE" 2>&1 &
+    RUST_LOG=warn FLAPJACK_DATA_DIR="$DATA_DIR" ./target/$BUILD_TYPE/flapjack > "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
     
     for i in {1..10}; do
@@ -148,8 +148,8 @@ esac
 #     # cargo build
     
 #     echo "Starting server (debug build, data=$DATA_DIR)..."
-#     # RUST_LOG=warn FLAPJACK_DATA_DIR="$DATA_DIR" ./target/debug/flapjack-server > "$LOG_FILE" 2>&1 &
-#     RUST_LOG=warn FLAPJACK_DATA_DIR="$DATA_DIR" ./target/release/flapjack-server > "$LOG_FILE" 2>&1 &
+#     # RUST_LOG=warn FLAPJACK_DATA_DIR="$DATA_DIR" ./target/debug/flapjack > "$LOG_FILE" 2>&1 &
+#     RUST_LOG=warn FLAPJACK_DATA_DIR="$DATA_DIR" ./target/release/flapjack > "$LOG_FILE" 2>&1 &
 #     echo $! > "$PID_FILE"
     
 #     for i in {1..10}; do

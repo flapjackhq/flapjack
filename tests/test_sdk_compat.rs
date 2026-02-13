@@ -1032,7 +1032,9 @@ async fn test_browse_index() {
         .unwrap();
     assert!(res.status().is_success(), "browse: {}", res.status());
     let body: serde_json::Value = res.json().await.unwrap();
-    let hits = body["hits"].as_array().expect("browse should return hits array");
+    let hits = body["hits"]
+        .as_array()
+        .expect("browse should return hits array");
     assert_eq!(hits.len(), 2, "hitsPerPage=2 should return exactly 2 hits");
 
     // Cursor must be a non-empty string for pagination when more results exist
@@ -1047,10 +1049,18 @@ async fn test_browse_index() {
         .send()
         .await
         .unwrap();
-    assert!(res2.status().is_success(), "browse with cursor should succeed");
+    assert!(
+        res2.status().is_success(),
+        "browse with cursor should succeed"
+    );
     let body2: serde_json::Value = res2.json().await.unwrap();
-    let hits2 = body2["hits"].as_array().expect("cursor page should return hits");
-    assert!(!hits2.is_empty(), "cursor page should have remaining results");
+    let hits2 = body2["hits"]
+        .as_array()
+        .expect("cursor page should return hits");
+    assert!(
+        !hits2.is_empty(),
+        "cursor page should have remaining results"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -1590,8 +1600,13 @@ async fn test_snippet_no_match() {
     assert!(res.status().is_success());
 
     let body: serde_json::Value = res.json().await.unwrap();
-    let hits = body["hits"].as_array().expect("response must have hits array");
-    assert!(!hits.is_empty(), "snippet no-match query should still return hits");
+    let hits = body["hits"]
+        .as_array()
+        .expect("response must have hits array");
+    assert!(
+        !hits.is_empty(),
+        "snippet no-match query should still return hits"
+    );
     let snippet = &hits[0]["_snippetResult"]["description"];
     assert!(
         snippet.is_object(),
@@ -1660,7 +1675,10 @@ async fn test_query_type_prefix_none() {
         .unwrap();
     let default_body: serde_json::Value = res_default.json().await.unwrap();
     let default_hits = default_body["nbHits"].as_u64().unwrap();
-    assert!(default_hits > 0, "default prefix: 'lap' should match 'Laptop'");
+    assert!(
+        default_hits > 0,
+        "default prefix: 'lap' should match 'Laptop'"
+    );
 
     // prefixNone with typoTolerance disabled: "lap" should NOT match "Laptop"
     let res = h(client.post(format!("{}/1/indexes/products/query", base)))
@@ -2150,7 +2168,9 @@ async fn test_optional_filters_boost() {
 
     // Verify Electronics items are ranked higher than Accessories
     let pos = |id: &str| -> usize {
-        ids.iter().position(|&x| x == id).expect("id must be present")
+        ids.iter()
+            .position(|&x| x == id)
+            .expect("id must be present")
     };
     let acc_pos = pos("2"); // Accessories item
     assert!(
@@ -2370,7 +2390,9 @@ async fn test_enable_rules_false() {
         .await
         .unwrap();
     let with_rules: serde_json::Value = res.json().await.unwrap();
-    let hits = with_rules["hits"].as_array().expect("response must have hits array");
+    let hits = with_rules["hits"]
+        .as_array()
+        .expect("response must have hits array");
     assert!(
         hits.len() >= 2,
         "rule_test should have at least 2 hits, got {}",
@@ -2501,5 +2523,8 @@ async fn test_rule_contexts() {
 
     // Verify response structure is valid search response
     assert!(body.get("hits").is_some(), "response must contain hits");
-    assert!(body.get("processingTimeMS").is_some(), "response must contain processingTimeMS");
+    assert!(
+        body.get("processingTimeMS").is_some(),
+        "response must contain processingTimeMS"
+    );
 }

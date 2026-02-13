@@ -13,9 +13,9 @@ use axum::{
 use serde::Deserialize;
 use std::sync::Arc;
 
+use super::settings::SetSettingsRequest;
 use super::AppState;
 use crate::dto::{AddDocumentsRequest, AddDocumentsResponse, BatchOperation, SearchRequest};
-use super::settings::SetSettingsRequest;
 use flapjack::error::FlapjackError;
 
 // ---------------------------------------------------------------------------
@@ -46,9 +46,11 @@ pub async fn qs_search_get(
             .unwrap_or_else(|_| f.split(',').map(|s| s.trim().to_string()).collect())
     });
 
-    let sort = params
-        .sort
-        .map(|s| s.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>());
+    let sort = params.sort.map(|s| {
+        s.split(',')
+            .map(|s| s.trim().to_string())
+            .collect::<Vec<_>>()
+    });
 
     let req = SearchRequest {
         query: params.q.unwrap_or_default(),

@@ -6,7 +6,7 @@ use clap::Parser;
 use flapjack_http::serve;
 
 #[derive(Parser)]
-#[command(name = "flapjack-server")]
+#[command(name = "flapjack")]
 struct Args {
     #[arg(long, env = "FLAPJACK_DATA_DIR", default_value = "./data")]
     data_dir: String,

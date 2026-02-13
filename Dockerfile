@@ -13,7 +13,7 @@ COPY tests ./tests
 COPY package ./package
 
 # Build release binary
-RUN cargo build --release --bin flapjack-server
+RUN cargo build --release --bin flapjack
 
 # Runtime stage
 FROM debian:bookworm-slim
@@ -27,7 +27,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy binary from builder
-COPY --from=builder /app/target/release/flapjack-server /usr/local/bin/flapjack-server
+COPY --from=builder /app/target/release/flapjack /usr/local/bin/flapjack
 
 # Create data directory
 RUN mkdir -p /data
@@ -39,4 +39,4 @@ EXPOSE 7700
 WORKDIR /data
 
 # Run the server
-CMD ["flapjack-server"]
+CMD ["flapjack"]

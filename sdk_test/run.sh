@@ -24,11 +24,11 @@ rm -rf "$SCRIPT_DIR/data"
 mkdir -p "$SCRIPT_DIR/data"
 
 echo "Killing existing flapjack servers..."
-pkill -f flapjack-server || true
+pkill -x flapjack || true
 sleep 0.5
 
 echo "Starting flapjack server..."
-FLAPJACK_DATA_DIR="$SCRIPT_DIR/data" ./target/release/flapjack-server > "$SCRIPT_DIR/server.log" 2>&1 &
+FLAPJACK_DATA_DIR="$SCRIPT_DIR/data" ./target/release/flapjack > "$SCRIPT_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 
 cleanup() {

@@ -3,6 +3,10 @@ name = "flapjack-server"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "flapjack"
+path = "src/main.rs"
+
 [dependencies]
 flapjack = { path = "..", features = ["memory-stats"] }
 flapjack-http = { path = "../flapjack-http" }

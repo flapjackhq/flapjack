@@ -1,4 +1,4 @@
-# Flapjack
+# 🥞 Flapjack
 
 Self-hosted search engine with an Algolia-compatible API. Single binary, no dependencies.
 
@@ -47,7 +47,7 @@ rm -rf ~/.flapjack
 Start the server and pull an existing index — settings, synonyms, rules, and all documents:
 
 ```bash
-flapjack-server
+flapjack
 
 curl -X POST http://localhost:7701/migrate \
   -d '{"appId":"YOUR_ALGOLIA_APP_ID","apiKey":"YOUR_ALGOLIA_ADMIN_KEY","sourceIndex":"products"}'
@@ -82,7 +82,7 @@ InstantSearch.js widgets work as-is — `SearchBox`, `Hits`, `RefinementList`, `
 If you're starting fresh, no SDK needed — just curl:
 
 ```bash
-flapjack-server
+flapjack
 
 # Add documents
 curl -X POST http://localhost:7701/indexes/movies/documents \
@@ -150,7 +150,7 @@ Algolia-compatible REST API under `/1/` — works with InstantSearch.js v5, the 
 
 ```bash
 cargo build --release
-./target/release/flapjack-server
+./target/release/flapjack
 ```
 
 Requires Rust 1.70+. Pre-built binaries for Linux x86_64 (static musl), Linux ARM64, macOS Intel, and macOS Apple Silicon on the [releases page](https://github.com/flapjackhq/flapjack/releases/latest).
@@ -190,7 +190,7 @@ User=flapjack
 WorkingDirectory=/var/lib/flapjack
 Environment=FLAPJACK_DATA_DIR=/var/lib/flapjack/data
 Environment=FLAPJACK_ADMIN_KEY=your-key
-ExecStart=/usr/local/bin/flapjack-server
+ExecStart=/usr/local/bin/flapjack
 Restart=always
 
 [Install]
@@ -246,7 +246,7 @@ flapjack/              # Core library (search, indexing, query execution)
 flapjack-http/         # HTTP server (Axum handlers, routing)
 flapjack-replication/  # Cluster coordination
 flapjack-ssl/          # TLS (Let's Encrypt, ACME)
-flapjack-server/       # Binary entrypoint
+flapjack/       # Binary entrypoint
 ```
 
 ---

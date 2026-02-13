@@ -5,7 +5,7 @@ use predicates::str::contains;
 
 #[test]
 fn production_mode_rejects_missing_key() {
-    Command::cargo_bin("flapjack-server")
+    Command::cargo_bin("flapjack")
         .unwrap()
         .env("FLAPJACK_ENV", "production")
         .env_remove("FLAPJACK_ADMIN_KEY")
@@ -19,7 +19,7 @@ fn production_mode_rejects_missing_key() {
 
 #[test]
 fn production_mode_rejects_short_key() {
-    Command::cargo_bin("flapjack-server")
+    Command::cargo_bin("flapjack")
         .unwrap()
         .env("FLAPJACK_ENV", "production")
         .env("FLAPJACK_ADMIN_KEY", "tooshort")
@@ -31,7 +31,7 @@ fn production_mode_rejects_short_key() {
 
 #[test]
 fn development_mode_allows_missing_key() {
-    Command::cargo_bin("flapjack-server")
+    Command::cargo_bin("flapjack")
         .unwrap()
         .env("FLAPJACK_ENV", "development")
         .env_remove("FLAPJACK_ADMIN_KEY")
@@ -44,7 +44,7 @@ fn development_mode_allows_missing_key() {
 
 #[test]
 fn production_mode_accepts_valid_key() {
-    Command::cargo_bin("flapjack-server")
+    Command::cargo_bin("flapjack")
         .unwrap()
         .env("FLAPJACK_ENV", "production")
         .env("FLAPJACK_ADMIN_KEY", "abcdef0123456789")

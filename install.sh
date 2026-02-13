@@ -18,7 +18,7 @@ set -eu
 # ── Configuration ────────────────────────────────────────────────────────────
 
 REPO="${FLAPJACK_REPO:-flapjackhq/flapjack}"
-BINARY_NAME="flapjack-server"
+BINARY_NAME="flapjack"
 INSTALL_DIR="${FLAPJACK_INSTALL:-$HOME/.flapjack}/bin"
 
 # ── Colors (disabled when piped) ─────────────────────────────────────────────
@@ -348,7 +348,7 @@ main() {
   printf "  ${GREEN}${BOLD}Flapjack ${version} installed successfully!${NC}\n"
   printf "\n"
   printf "  Binary:  ${INSTALL_DIR}/${BINARY_NAME}\n"
-  printf "  Run:     ${BOLD}flapjack-server${NC}\n"
+  printf "  Run:     ${BOLD}flapjack${NC}\n"
 
   # Check if we need to remind about PATH
   if ! command -v "$BINARY_NAME" > /dev/null 2>&1; then

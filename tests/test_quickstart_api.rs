@@ -64,7 +64,10 @@ async fn quickstart_full_lifecycle() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
-    assert!(body["nbHits"].as_u64().unwrap() >= 1, "Expected hits for 'matrix'");
+    assert!(
+        body["nbHits"].as_u64().unwrap() >= 1,
+        "Expected hits for 'matrix'"
+    );
     assert!(body.get("hits").is_some(), "Missing hits");
 
     // 3. GET document
@@ -127,7 +130,10 @@ async fn quickstart_full_lifecycle() {
     let status = resp.status();
     if status == 200 {
         let body: Value = resp.json().await.unwrap();
-        assert!(body.get("taskID").is_some(), "Missing taskID on index delete");
+        assert!(
+            body.get("taskID").is_some(),
+            "Missing taskID on index delete"
+        );
     } else {
         // Retry after brief delay
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -138,7 +144,10 @@ async fn quickstart_full_lifecycle() {
             .unwrap();
         assert_eq!(resp.status(), 200, "Delete index failed even after retry");
         let body: Value = resp.json().await.unwrap();
-        assert!(body.get("taskID").is_some(), "Missing taskID on index delete");
+        assert!(
+            body.get("taskID").is_some(),
+            "Missing taskID on index delete"
+        );
     }
 }
 
@@ -240,10 +249,7 @@ async fn quickstart_search_get_with_params() {
 
     // Search with hitsPerPage=1
     let resp = client
-        .get(format!(
-            "{}/indexes/products/search?q=&hitsPerPage=1",
-            base
-        ))
+        .get(format!("{}/indexes/products/search?q=&hitsPerPage=1", base))
         .send()
         .await
         .unwrap();
@@ -406,7 +412,10 @@ async fn quickstart_task_status() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["status"], "published", "Task should be published after wait");
+    assert_eq!(
+        body["status"], "published",
+        "Task should be published after wait"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -467,10 +476,7 @@ async fn quickstart_search_nonexistent_index() {
     let base = format!("http://{}", addr);
 
     let resp = client
-        .get(format!(
-            "{}/indexes/nonexistent/search?q=hello",
-            base
-        ))
+        .get(format!("{}/indexes/nonexistent/search?q=hello", base))
         .send()
         .await
         .unwrap();
@@ -566,7 +572,10 @@ async fn quickstart_bulk_delete_empty_array() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
-    assert!(body.get("taskID").is_some(), "Empty delete should still return taskID");
+    assert!(
+        body.get("taskID").is_some(),
+        "Empty delete should still return taskID"
+    );
 
     // Original doc should still exist
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
@@ -575,7 +584,11 @@ async fn quickstart_bulk_delete_empty_array() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "Doc should still exist after empty delete");
+    assert_eq!(
+        resp.status(),
+        200,
+        "Doc should still exist after empty delete"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -642,7 +655,12 @@ async fn quickstart_settings_put_and_get() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "PUT settings failed: {:?}", resp.text().await);
+    assert_eq!(
+        resp.status(),
+        200,
+        "PUT settings failed: {:?}",
+        resp.text().await
+    );
 
     // GET settings — verify they persisted
     let resp = client
@@ -664,7 +682,10 @@ async fn quickstart_settings_put_and_get() {
     let searchable = body
         .get("searchableAttributes")
         .or_else(|| body.get("searchable_attributes"));
-    assert!(searchable.is_some(), "Settings should have searchable attributes");
+    assert!(
+        searchable.is_some(),
+        "Settings should have searchable attributes"
+    );
     let searchable_arr = searchable.unwrap().as_array().unwrap();
     assert!(searchable_arr.contains(&json!("title")));
     assert!(searchable_arr.contains(&json!("category")));
@@ -682,11 +703,7 @@ async fn quickstart_settings_no_auth_required() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        200,
-        "Quickstart settings should bypass auth"
-    );
+    assert_eq!(resp.status(), 200, "Quickstart settings should bypass auth");
 
     // PUT settings should also bypass auth
     let resp = client
