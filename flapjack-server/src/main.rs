@@ -27,8 +27,8 @@ enum Command {
 
 fn run_uninstall() -> Result<(), Box<dyn std::error::Error>> {
     let home = std::env::var("HOME").map_err(|_| "HOME environment variable not set")?;
-    let install_dir = std::env::var("FLAPJACK_INSTALL")
-        .unwrap_or_else(|_| format!("{}/.flapjack", home));
+    let install_dir =
+        std::env::var("FLAPJACK_INSTALL").unwrap_or_else(|_| format!("{}/.flapjack", home));
 
     // Remove the install directory
     if std::path::Path::new(&install_dir).exists() {
