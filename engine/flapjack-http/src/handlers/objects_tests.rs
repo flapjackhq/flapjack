@@ -1,3 +1,4 @@
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/may31_12pm_4_idempotency_cache_durability/flapjack_dev/engine/flapjack-http/src/handlers/objects_tests.rs.
 use super::*;
 use axum::http::StatusCode;
 
@@ -272,23 +273,25 @@ fn make_write_guard_state(tmp: &TempDir) -> Arc<AppState> {
 
 /// Build an Axum `Router` wired to the document write handlers for use in pause-guard integration tests.
 fn make_write_guard_app(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/1/indexes/:indexName/batch", post(super::add_documents))
-        .route("/1/indexes/:indexName/:objectID", put(super::put_object))
-        .route(
-            "/1/indexes/:indexName/:objectID",
-            delete(super::delete_object),
-        )
-        .route(
-            "/1/indexes/:indexName/:objectID/partial",
-            post(super::partial_update_object).put(super::partial_update_object),
-        )
-        .route(
-            "/1/indexes/:indexName/deleteByQuery",
-            post(super::delete_by_query),
-        )
-        .route("/1/indexes/:indexName", post(super::add_record_auto_id))
-        .with_state(state)
+    crate::router::app_id_layer(
+        Router::new()
+            .route("/1/indexes/:indexName/batch", post(super::add_documents))
+            .route("/1/indexes/:indexName/:objectID", put(super::put_object))
+            .route(
+                "/1/indexes/:indexName/:objectID",
+                delete(super::delete_object),
+            )
+            .route(
+                "/1/indexes/:indexName/:objectID/partial",
+                post(super::partial_update_object).put(super::partial_update_object),
+            )
+            .route(
+                "/1/indexes/:indexName/deleteByQuery",
+                post(super::delete_by_query),
+            )
+            .route("/1/indexes/:indexName", post(super::add_record_auto_id))
+            .with_state(state),
+    )
 }
 
 /// Verify that POST `/1/indexes/{indexName}/batch` returns 503 when the target index is paused.
@@ -479,17 +482,19 @@ async fn test_add_record_auto_id_blocked_when_paused() {
 // ── Reads-unaffected tests (2G) ─────────────────────────────────────
 
 fn make_read_write_app(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route(
-            "/1/indexes/:indexName/query",
-            post(crate::handlers::search::search),
-        )
-        .route(
-            "/1/indexes/:indexName/:objectID",
-            axum::routing::get(super::get_object),
-        )
-        .route("/1/indexes/:indexName/batch", post(super::add_documents))
-        .with_state(state)
+    crate::router::app_id_layer(
+        Router::new()
+            .route(
+                "/1/indexes/:indexName/query",
+                post(crate::handlers::search::search),
+            )
+            .route(
+                "/1/indexes/:indexName/:objectID",
+                axum::routing::get(super::get_object),
+            )
+            .route("/1/indexes/:indexName/batch", post(super::add_documents))
+            .with_state(state),
+    )
 }
 
 /// Verify that search requests are not blocked (no 503) when the target index is paused.
@@ -637,10 +642,12 @@ fn record_size_one_byte_over_limit_rejected() {
 // ── Per-record size limit: HTTP integration tests ──────────────────
 
 fn make_ingest_app(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/1/indexes/:indexName/batch", post(super::add_documents))
-        .route("/1/indexes/:indexName", post(super::add_record_auto_id))
-        .with_state(state)
+    crate::router::app_id_layer(
+        Router::new()
+            .route("/1/indexes/:indexName/batch", post(super::add_documents))
+            .route("/1/indexes/:indexName", post(super::add_record_auto_id))
+            .with_state(state),
+    )
 }
 
 /// Verify that the batch endpoint returns 400 when any individual record exceeds `max_record_bytes()`.
@@ -739,14 +746,16 @@ mod stage4_multi_index {
     use serde_json::{json, Value};
 
     fn make_stage4_app(state: Arc<AppState>) -> Router {
-        Router::new()
-            .route("/1/indexes/:indexName/batch", post(super::add_documents))
-            .route("/1/indexes/:indexName/objects", post(super::get_objects))
-            .route(
-                "/1/indexes/:indexName",
-                get(crate::handlers::search::search_get),
-            )
-            .with_state(state)
+        crate::router::app_id_layer(
+            Router::new()
+                .route("/1/indexes/:indexName/batch", post(super::add_documents))
+                .route("/1/indexes/:indexName/objects", post(super::get_objects))
+                .route(
+                    "/1/indexes/:indexName",
+                    get(crate::handlers::search::search_get),
+                )
+                .with_state(state),
+        )
     }
 
     async fn post_json(app: &Router, uri: &str, body: Value) -> axum::http::Response<Body> {
@@ -1184,14 +1193,20 @@ mod stage4_multi_index {
 // the entire response on retry.
 mod content_hash_and_idempotency {
     use super::*;
+    use crate::auth::AuthenticatedAppId;
+    use crate::router::app_id_layer;
     use crate::test_helpers::body_json;
+    use rusqlite::Connection;
     use serde_json::{json, Value};
+    use tempfile::tempdir;
 
     fn make_app(state: Arc<AppState>) -> Router {
-        Router::new()
-            .route("/1/indexes/:indexName", post(super::add_record_auto_id))
-            .route("/1/indexes/:indexName/batch", post(super::add_documents))
-            .with_state(state)
+        app_id_layer(
+            Router::new()
+                .route("/1/indexes/:indexName", post(super::add_record_auto_id))
+                .route("/1/indexes/:indexName/batch", post(super::add_documents))
+                .with_state(state),
+        )
     }
 
     async fn post_auto_id(
@@ -1199,6 +1214,7 @@ mod content_hash_and_idempotency {
         index: &str,
         body: Value,
         idem_key: Option<&str>,
+        app_id_override: Option<&str>,
     ) -> (StatusCode, Value) {
         let mut builder = Request::builder()
             .method("POST")
@@ -1207,31 +1223,94 @@ mod content_hash_and_idempotency {
         if let Some(k) = idem_key {
             builder = builder.header("x-flapjack-idempotency-key", k);
         }
-        let request = builder
+        let mut request = builder
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
+        if let Some(app_id) = app_id_override {
+            request
+                .extensions_mut()
+                .insert(AuthenticatedAppId(app_id.to_string()));
+        }
         let resp = app.clone().oneshot(request).await.unwrap();
         let status = resp.status();
         let json = body_json(resp).await;
         (status, json)
     }
 
-    async fn post_batch(app: &Router, index: &str, body: Value) -> (StatusCode, Value) {
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/1/indexes/{}/batch", index))
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let status = resp.status();
-        let json = body_json(resp).await;
+    async fn post_batch(
+        app: &Router,
+        index: &str,
+        body: Value,
+        idem_key: Option<&str>,
+        app_id_override: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let (status, raw_bytes) = post_batch_raw(app, index, body, idem_key, app_id_override).await;
+        let json: Value =
+            serde_json::from_slice(&raw_bytes).expect("batch response should be json");
         (status, json)
+    }
+
+    async fn post_batch_raw(
+        app: &Router,
+        index: &str,
+        body: Value,
+        idem_key: Option<&str>,
+        app_id_override: Option<&str>,
+    ) -> (StatusCode, Vec<u8>) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(format!("/1/indexes/{}/batch", index))
+            .header("content-type", "application/json");
+        if let Some(key) = idem_key {
+            builder = builder.header("x-flapjack-idempotency-key", key);
+        }
+        let mut request = builder
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        if let Some(app_id) = app_id_override {
+            request
+                .extensions_mut()
+                .insert(AuthenticatedAppId(app_id.to_string()));
+        }
+        let resp = app.clone().oneshot(request).await.unwrap();
+        let status = resp.status();
+        let raw = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("batch response body should be readable")
+            .to_vec();
+        (status, raw)
+    }
+
+    fn install_idempotency_store_failure_trigger(state: &Arc<AppState>) {
+        let cache_path = state
+            .idempotency_cache
+            .persistence_path()
+            .expect("test requires persistent idempotency cache")
+            .to_path_buf();
+        let conn = Connection::open(cache_path).expect("open idempotency sqlite db");
+        conn.execute(
+            "CREATE TRIGGER idempotency_store_fail_before_insert
+             BEFORE INSERT ON idempotency_cache
+             BEGIN
+                 SELECT RAISE(FAIL, 'forced idempotency store failure');
+             END;",
+            [],
+        )
+        .expect("install sqlite trigger to force post-commit idempotency store failure");
+    }
+
+    fn index_document_count(state: &Arc<AppState>, index_name: &str) -> usize {
+        let index = state
+            .manager
+            .get_or_load(index_name)
+            .expect("index should load for document-count assertion");
+        index
+            .reader()
+            .searcher()
+            .segment_readers()
+            .iter()
+            .map(|segment| segment.num_docs() as usize)
+            .sum()
     }
 
     /// Same body in two separate auto-ID calls must produce the same objectID
@@ -1243,8 +1322,8 @@ mod content_hash_and_idempotency {
         let app = make_app(state.clone());
 
         let body = json!({"title": "hello", "count": 1, "tags": ["x", "y"]});
-        let (s1, r1) = post_auto_id(&app, "idem_idx", body.clone(), None).await;
-        let (s2, r2) = post_auto_id(&app, "idem_idx", body, None).await;
+        let (s1, r1) = post_auto_id(&app, "idem_idx", body.clone(), None, None).await;
+        let (s2, r2) = post_auto_id(&app, "idem_idx", body, None, None).await;
 
         assert_eq!(s1, StatusCode::CREATED);
         assert_eq!(s2, StatusCode::CREATED);
@@ -1266,8 +1345,8 @@ mod content_hash_and_idempotency {
         let state = make_write_guard_state(&tmp);
         let app = make_app(state);
 
-        let (_, r1) = post_auto_id(&app, "diff_idx", json!({"x": 1}), None).await;
-        let (_, r2) = post_auto_id(&app, "diff_idx", json!({"x": 2}), None).await;
+        let (_, r1) = post_auto_id(&app, "diff_idx", json!({"x": 1}), None, None).await;
+        let (_, r2) = post_auto_id(&app, "diff_idx", json!({"x": 2}), None, None).await;
 
         assert_ne!(r1["objectID"], r2["objectID"]);
     }
@@ -1285,7 +1364,7 @@ mod content_hash_and_idempotency {
                 { "action": "addObject", "body": { "objectID": "explicit-keepme", "title": "kept" } }
             ]
         });
-        let (status, response) = post_batch(&app, "explicit_idx", body).await;
+        let (status, response) = post_batch(&app, "explicit_idx", body, None, None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(response["objectIDs"][0], "explicit-keepme");
     }
@@ -1301,15 +1380,15 @@ mod content_hash_and_idempotency {
         let doc = json!({"name": "alpha", "score": 7});
         let batch_body = json!({"requests": [{"action": "addObject", "body": doc.clone()}]});
 
-        let (_, b1) = post_batch(&app, "batch_idx", batch_body.clone()).await;
-        let (_, b2) = post_batch(&app, "batch_idx", batch_body).await;
+        let (_, b1) = post_batch(&app, "batch_idx", batch_body.clone(), None, None).await;
+        let (_, b2) = post_batch(&app, "batch_idx", batch_body, None, None).await;
 
         let id_b1 = b1["objectIDs"][0].as_str().unwrap();
         let id_b2 = b2["objectIDs"][0].as_str().unwrap();
         assert_eq!(id_b1, id_b2, "batch addObject must produce stable IDs");
 
         // Same body via the single-record auto-ID path must converge on the same ID.
-        let (_, r_auto) = post_auto_id(&app, "batch_idx", doc, None).await;
+        let (_, r_auto) = post_auto_id(&app, "batch_idx", doc, None, None).await;
         assert_eq!(
             id_b1,
             r_auto["objectID"].as_str().unwrap(),
@@ -1326,8 +1405,8 @@ mod content_hash_and_idempotency {
         let app = make_app(state);
 
         let key = "client-retry-abc-123";
-        let (s1, r1) = post_auto_id(&app, "key_idx", json!({"v": 1}), Some(key)).await;
-        let (s2, r2) = post_auto_id(&app, "key_idx", json!({"v": 2}), Some(key)).await;
+        let (s1, r1) = post_auto_id(&app, "key_idx", json!({"v": 1}), Some(key), None).await;
+        let (s2, r2) = post_auto_id(&app, "key_idx", json!({"v": 2}), Some(key), None).await;
 
         assert_eq!(s1, StatusCode::CREATED);
         assert_eq!(s2, StatusCode::CREATED);
@@ -1344,8 +1423,189 @@ mod content_hash_and_idempotency {
         let state = make_write_guard_state(&tmp);
         let app = make_app(state);
 
-        let (_, r1) = post_auto_id(&app, "noidem_idx", json!({"v": "a"}), None).await;
-        let (_, r2) = post_auto_id(&app, "noidem_idx", json!({"v": "b"}), None).await;
+        let (_, r1) = post_auto_id(&app, "noidem_idx", json!({"v": "a"}), None, None).await;
+        let (_, r2) = post_auto_id(&app, "noidem_idx", json!({"v": "b"}), None, None).await;
         assert_ne!(r1["objectID"], r2["objectID"]);
+    }
+
+    /// Same idempotency key in the same index but different applications must not replay across apps.
+    #[tokio::test]
+    async fn test_idempotency_key_isolated_across_applications() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_write_guard_state(&tmp);
+        let app = make_app(state.clone());
+
+        let key = "same-key-different-apps";
+        let (s1, r1) = post_auto_id(
+            &app,
+            "app_scope_idx",
+            json!({"title": "doc from app a"}),
+            Some(key),
+            Some("app-a"),
+        )
+        .await;
+        let (s2, r2) = post_auto_id(
+            &app,
+            "app_scope_idx",
+            json!({"title": "doc from app b"}),
+            Some(key),
+            Some("app-b"),
+        )
+        .await;
+
+        assert_eq!(s1, StatusCode::CREATED);
+        assert_eq!(s2, StatusCode::CREATED);
+        assert_ne!(r1["taskID"], r2["taskID"]);
+
+        let id1 = r1["objectID"].as_str().expect("first object id");
+        let id2 = r2["objectID"].as_str().expect("second object id");
+        assert!(state
+            .manager
+            .get_document("app_scope_idx", id1)
+            .unwrap()
+            .is_some());
+        assert!(state
+            .manager
+            .get_document("app_scope_idx", id2)
+            .unwrap()
+            .is_some());
+        assert_ne!(id1, id2);
+        assert_eq!(
+            index_document_count(&state, "app_scope_idx"),
+            2,
+            "same idempotency key across different applications must produce exactly two persisted documents in the shared index"
+        );
+    }
+
+    /// Same app and key but different indexes must not cross-replay.
+    #[tokio::test]
+    async fn test_idempotency_key_isolated_across_indexes() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_write_guard_state(&tmp);
+        let app = make_app(state.clone());
+
+        let key = "same-key-different-indexes";
+        let (s1, r1) = post_auto_id(
+            &app,
+            "scope_idx_a",
+            json!({"title": "doc for index a"}),
+            Some(key),
+            Some("shared-app"),
+        )
+        .await;
+        let (s2, r2) = post_auto_id(
+            &app,
+            "scope_idx_b",
+            json!({"title": "doc for index b"}),
+            Some(key),
+            Some("shared-app"),
+        )
+        .await;
+
+        assert_eq!(s1, StatusCode::CREATED);
+        assert_eq!(s2, StatusCode::CREATED);
+        assert_ne!(r1["taskID"], r2["taskID"]);
+        assert!(state
+            .manager
+            .get_document("scope_idx_a", r1["objectID"].as_str().unwrap())
+            .unwrap()
+            .is_some());
+        assert!(state
+            .manager
+            .get_document("scope_idx_b", r2["objectID"].as_str().unwrap())
+            .unwrap()
+            .is_some());
+    }
+
+    /// Multi-index envelope dedup must replay the exact first envelope response.
+    #[tokio::test]
+    async fn test_multi_index_batch_replay_returns_first_envelope_response() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_write_guard_state(&tmp);
+        let app = make_app(state);
+
+        let request_body = json!({
+            "requests": [
+                { "action": "addObject", "indexName": "multi_a", "body": { "objectID": "a1", "title": "alpha" } },
+                { "action": "addObject", "indexName": "multi_b", "body": { "objectID": "b1", "title": "beta" } }
+            ]
+        });
+        let key = "multi-index-envelope-key";
+        let (s1, raw1) =
+            post_batch_raw(&app, "*", request_body.clone(), Some(key), Some("app-a")).await;
+        let (s2, raw2) = post_batch_raw(&app, "*", request_body, Some(key), Some("app-a")).await;
+
+        assert_eq!(s1, StatusCode::OK);
+        assert_eq!(s2, StatusCode::OK);
+        assert_eq!(
+            raw1, raw2,
+            "multi-index envelope replay must return byte-for-byte identical cached response body"
+        );
+    }
+
+    /// Open-mode requests without auth headers still flow through the shared app_id_layer fallback.
+    #[tokio::test]
+    async fn test_open_mode_default_application_id_replays_consistently() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_write_guard_state(&tmp);
+        let app = make_app(state);
+
+        let key = "open-mode-default-app";
+        let (s1, r1) = post_auto_id(&app, "open_mode_idx", json!({"v": 1}), Some(key), None).await;
+        let (s2, r2) = post_auto_id(&app, "open_mode_idx", json!({"v": 2}), Some(key), None).await;
+
+        assert_eq!(s1, StatusCode::CREATED);
+        assert_eq!(s2, StatusCode::CREATED);
+        assert_eq!(r1, r2);
+    }
+
+    #[tokio::test]
+    async fn test_auto_id_post_commit_idempotency_store_failure_preserves_created_response() {
+        let env_guard = crate::test_helpers::with_env_var("FLAPJACK_IDEMPOTENCY_PERSISTENT", "1");
+        let temp = tempdir().unwrap();
+        let state = make_write_guard_state(&temp);
+        install_idempotency_store_failure_trigger(&state);
+        let app = make_app(state);
+
+        let (status, body) = post_auto_id(
+            &app,
+            "fault_idx",
+            json!({"title": "still committed"}),
+            Some("store-fails-after-commit"),
+            Some("app-fault"),
+        )
+        .await;
+
+        drop(env_guard);
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(body.get("taskID").and_then(|v| v.as_i64()).is_some());
+        assert!(body.get("objectID").and_then(|v| v.as_str()).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_batch_post_commit_idempotency_store_failure_preserves_success_response() {
+        let env_guard = crate::test_helpers::with_env_var("FLAPJACK_IDEMPOTENCY_PERSISTENT", "1");
+        let temp = tempdir().unwrap();
+        let state = make_write_guard_state(&temp);
+        install_idempotency_store_failure_trigger(&state);
+        let app = make_app(state);
+
+        let (status, body) = post_batch(
+            &app,
+            "fault_batch_idx",
+            json!({
+                "requests": [
+                    { "action": "addObject", "body": { "objectID": "k1", "title": "kept" } }
+                ]
+            }),
+            Some("batch-store-fails-after-commit"),
+            Some("app-fault"),
+        )
+        .await;
+
+        drop(env_guard);
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("taskID").and_then(|v| v.as_i64()).is_some());
+        assert_eq!(body["objectIDs"], json!(["k1"]));
     }
 }

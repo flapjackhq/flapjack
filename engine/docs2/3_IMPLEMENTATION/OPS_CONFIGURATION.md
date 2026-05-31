@@ -108,11 +108,37 @@ Verified separately from the harnesses above:
 | `FLAPJACK_MAX_RECORD_BYTES` | Integer bytes | `102400` | Max serialized size per individual record. |
 | `FLAPJACK_MAX_BUFFER_MB` | Integer MB | `31` | In-memory write buffer budget. |
 | `FLAPJACK_MAX_CONCURRENT_WRITERS` | Integer | `40` | Max concurrent writer tasks per tenant manager. |
+| `FLAPJACK_WRITE_QUEUE_BATCH_SIZE` | Positive integer operation count | `32` | Runtime write-queue commit threshold. Invalid values (non-integer or `<=0`) fall back to `32`. Higher values usually improve sustained write throughput by amortizing commit cost, while lower values generally reduce per-op flush latency. |
 | `FLAPJACK_MAX_DOC_MB` | Integer MB | `3` | Max document payload size admitted by memory-budget controls. |
 | `FLAPJACK_MEMORY_HIGH_WATERMARK` | Integer percent | `80` | Elevated pressure threshold. |
 | `FLAPJACK_MEMORY_CRITICAL` | Integer percent | `90` | Critical pressure threshold. |
 | `FLAPJACK_MEMORY_LIMIT_MB` | Integer MB | auto-detected | Explicit memory-limit override for pressure calculations. |
+| `FLAPJACK_IDEMPOTENCY_PERSISTENT` | Boolean (`1`/`true`/`yes`/`on`) | disabled | Enables node-local SQLite persistence for idempotency replay state at `${FLAPJACK_DATA_DIR}/_idempotency/cache.db`. Canonical flag. |
 | `FLAPJACK_IDEMPOTENCY_TTL_SECS` | Integer seconds | `300` | TTL for the per-node `X-Flapjack-Idempotency-Key` response cache. See [`OPERATIONS.md` — Idempotency contract](./OPERATIONS.md#idempotency-contract). Minimum effective value is `1`. |
+
+### Idempotency Restart Durability Proof
+
+- Canonical SQLite path: `${FLAPJACK_DATA_DIR}/_idempotency/cache.db`
+- Compatibility alias: `FLAPJACK_IDEMPOTENCY_PERSIST` is still accepted when `FLAPJACK_IDEMPOTENCY_PERSISTENT` is unset; canonical flag takes precedence when both are set.
+- TTL behavior: idempotency entries older than `FLAPJACK_IDEMPOTENCY_TTL_SECS` are treated as expired and are trimmed on lookup/store.
+
+Proof command:
+
+```bash
+cd engine && cargo test -p flapjack-server --test idempotency_restart_durability_test
+```
+
+Persistent-mode probe command:
+
+```bash
+cd engine && FLAPJACK_IDEMPOTENCY_PERSISTENT=true cargo test -p flapjack-server --test idempotency_restart_durability_test -- --nocapture
+```
+
+Measured baseline from the probe at HEAD (2026-05-31):
+
+- `iterations=300`
+- `store_avg_us=2010.69`, `store_p95_us=7845.58`, `store_p99_us=13000.46`
+- `lookup_avg_us=63.48`, `lookup_p95_us=236.92`, `lookup_p99_us=752.17`
 
 ## Email / Alerts
 

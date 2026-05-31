@@ -1,3 +1,4 @@
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/may31_12pm_4_idempotency_cache_durability/flapjack_dev/engine/flapjack-http/src/router.rs.
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -36,7 +37,6 @@ use crate::openapi::ApiDoc;
 use crate::security_sources::SecuritySourcesMatcher;
 use crate::startup::CorsMode;
 use flapjack::analytics::AnalyticsCollector;
-use flapjack::dictionaries::DEFAULT_DICTIONARY_TENANT;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -543,6 +543,23 @@ pub(crate) fn max_body_mb_from_value(raw: Option<&str>) -> usize {
     raw.and_then(|value| value.parse().ok()).unwrap_or(100)
 }
 
+pub(crate) fn app_id_layer(app: Router) -> Router {
+    app.layer(middleware::from_fn(
+        |mut request: axum::extract::Request, next: middleware::Next| async move {
+            if request.extensions().get::<AuthenticatedAppId>().is_none() {
+                // Dictionaries still need a tenant key in open mode, where auth is intentionally skipped.
+                let application_id = request_application_id(&request).unwrap_or_else(|| {
+                    flapjack::dictionaries::DEFAULT_DICTIONARY_TENANT.to_string()
+                });
+                request
+                    .extensions_mut()
+                    .insert(AuthenticatedAppId(application_id));
+            }
+            next.run(request).await
+        },
+    ))
+}
+
 fn apply_middleware(
     app: Router,
     state: Arc<AppState>,
@@ -598,19 +615,7 @@ fn apply_middleware(
         app
     };
 
-    let app_id_layer = middleware::from_fn(
-        |mut request: axum::extract::Request, next: middleware::Next| async move {
-            // Dictionaries still need a tenant key in open mode, where auth is intentionally skipped.
-            let application_id = request_application_id(&request)
-                .unwrap_or_else(|| DEFAULT_DICTIONARY_TENANT.to_string());
-            request
-                .extensions_mut()
-                .insert(AuthenticatedAppId(application_id));
-            next.run(request).await
-        },
-    );
-
-    app.layer(app_id_layer)
+    app_id_layer(app)
         .layer(memory_middleware)
         .layer(DefaultBodyLimit::max(max_body_mb * 1024 * 1024))
         .layer(middleware::from_fn(normalize_content_type))

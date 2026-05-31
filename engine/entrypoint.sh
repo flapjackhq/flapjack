@@ -36,4 +36,5 @@ EOF
   echo "[entrypoint] Wrote $DATA_DIR/node.json: node=$FLAPJACK_NODE_ID peers=$FLAPJACK_PEERS"
 fi
 
+[ "${1#-}" != "$1" ] && set -- flapjack "$@"
 exec "$@"

@@ -100,7 +100,9 @@ function getSafeImageSrc(rawValue: unknown): string | null {
     return null;
   }
 
-  if (trimmedValue.startsWith('/')) {
+  // Treat only single-slash paths as same-origin. Scheme-relative URLs such as
+  // `//cdn.example.test/image.png` are cross-origin network requests.
+  if (trimmedValue.startsWith('/') && !trimmedValue.startsWith('//')) {
     return trimmedValue;
   }
 
@@ -134,6 +136,22 @@ function getConfiguredFieldDisplay(
   }
 
   return getFieldDisplay(fieldName, fieldData[fieldName], highlightResult);
+}
+
+function isHighlightValue(value: unknown): value is HighlightResultValue {
+  return Boolean(value && typeof value === 'object' && 'matchLevel' in value);
+}
+
+function hasHighlightedMatchForField(
+  highlightResult: HighlightResult | undefined,
+  fieldName: string
+): boolean {
+  const value = highlightResult?.[fieldName];
+  if (Array.isArray(value)) {
+    return value.some((item) => isHighlightValue(item) && item.matchLevel !== 'none');
+  }
+
+  return isHighlightValue(value) && value.matchLevel !== 'none';
 }
 
 export const DocumentCard = memo(function DocumentCard({
@@ -277,8 +295,17 @@ export const DocumentCard = memo(function DocumentCard({
     () => allKeys.filter((key) => !consumedFields.has(key)),
     [allKeys, consumedFields]
   );
-  const previewKeys = filteredKeys.slice(0, PREVIEW_FIELD_COUNT);
-  const extraKeys = filteredKeys.slice(PREVIEW_FIELD_COUNT);
+  const previewKeys = useMemo(() => {
+    const matchedKeys = filteredKeys.filter((key) => hasHighlightedMatchForField(highlightResult, key));
+    const matchedKeySet = new Set(matchedKeys);
+    const unmatchedKeys = filteredKeys.filter((key) => !matchedKeySet.has(key));
+
+    return [...matchedKeys, ...unmatchedKeys].slice(0, PREVIEW_FIELD_COUNT);
+  }, [filteredKeys, highlightResult]);
+  const extraKeys = useMemo(() => {
+    const previewSet = new Set(previewKeys);
+    return filteredKeys.filter((key) => !previewSet.has(key));
+  }, [filteredKeys, previewKeys]);
   const visibleKeys = showAllFields ? filteredKeys : previewKeys;
 
   return (

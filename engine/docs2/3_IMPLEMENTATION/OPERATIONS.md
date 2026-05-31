@@ -278,9 +278,9 @@ and ADR [`0005`](decisions/active/0005_nginx_restart_window_write_recovery.md).
 |---|---|
 | Header name | `X-Flapjack-Idempotency-Key` (case-insensitive per HTTP). |
 | TTL | Default 300s; configurable via `FLAPJACK_IDEMPOTENCY_TTL_SECS` (min 1s). |
-| Scope | Per server process (in-memory). Each node in an HA cluster keeps its own cache. |
+| Scope | Per application + index segment + idempotency key; node-local cache ownership. |
 | Hit semantics | Cache hit replays the original `2xx` response and adds `X-Flapjack-Idempotency-Replayed: true`. |
-| Restart | Cache is cleared. Client retries after a restart re-execute as fresh writes. |
+| Restart | With `FLAPJACK_IDEMPOTENCY_PERSISTENT=true`, same-node restarts replay the cached response body and original `taskID`. |
 | Add durability | `add_documents_durable` waits for `await_task_terminal`/`wait_for_write_durable` before acking success, so accepted add writes are durable-commit acknowledgements rather than queue-only acceptance. |
 | Delete durability | `pending PL-14`: delete handlers currently call `delete_documents_sync` (`objects/batch.rs`, `objects/mod.rs`, and replica fanout in `replicas.rs`). Do not assume add/delete parity yet. |
 | 429 / 503 | Transient errors include `Retry-After: 1`; clients SHOULD retry with the same key. |
@@ -293,12 +293,9 @@ and ADR [`0005`](decisions/active/0005_nginx_restart_window_write_recovery.md).
   generate a fresh idempotency key per unique request. Stricter Stripe-style
   body-matching (return `409` on mismatch) is a known gap not yet captured in
   an ADR open question; track as a v1.0.x post-beta follow-up.
-- **Cross-restart durability**: explicitly out of scope for v1.0.x — see
-  ADR-0005 Open Question 2 ("Where to persist replay/idempotency state for
-  restart safety and bounded memory?"). For workloads that require restart-safe
-  dedup, use content-hash auto-IDs (write a record with no `objectID` — same
-  body yields the same stored `_id` and the write becomes an upsert at the
-  storage layer).
+- **Cross-node durability**: replay persistence is node-local SQLite. This does
+  not provide replication-aware cross-node replay guarantees; that remains
+  explicitly deferred in ADR-0005.
 - **Multi-index batch envelopes**: idempotency replay is per-request, not per
   operation. A batch envelope with one new + one previously-applied operation
   will replay the original batch response; it will not partially execute.
@@ -316,6 +313,9 @@ and ADR [`0005`](decisions/active/0005_nginx_restart_window_write_recovery.md).
 5. Do not treat queue admission as success: accepted add writes acknowledge only
    after durable commit; on transient `429`/`503`, retry the same request with
    the same idempotency key.
+
+Canonical runtime and proof commands are owned by
+[OPS_CONFIGURATION.md](./OPS_CONFIGURATION.md#idempotency-restart-durability-proof).
 
 ## Observability contract
 

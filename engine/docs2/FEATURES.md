@@ -4,6 +4,8 @@ Single maintained status ledger for Flapjack. Shipped feature status, current pr
 
 **Last updated: 2026-05-27 (May 26 polish wave wrap-up plus PL-9 closeout, and PL-10 post-fix 60-minute Stage 3 validation now classified `failure`; keep lane-state routing in `ROADMAP.md`, with detailed measured evidence in `docs/research/pl10_post_fix_20260527T181936Z_classification.md`.)**
 
+- 2026-05-31 stage note: `FLAPJACK_WRITE_QUEUE_BATCH_SIZE` is now runtime-configurable with default-preserving behavior (`32` fallback). See [`3_IMPLEMENTATION/OPS_CONFIGURATION.md`](3_IMPLEMENTATION/OPS_CONFIGURATION.md) for full operator semantics.
+
 - **Backend API:** 197/197 complete (as of 2026-03-13). The full parity verification is retained in the dev repo's internal audit history.
 - **Dashboard UI:** 22 user-facing routes are shipped, backed by 21 lazy-loaded page components in `dashboard/src/App.tsx`, plus the `*` not-found catch-all. No scaffolded stubs remain.
 - **E2E Browser Tests:** 340+ tests across 46 Playwright spec files in total: 42 browser specs (41 specs in `tests/e2e-ui/` [4 smoke + 37 full] plus root-level `tests/result-helpers.spec.ts`) and 4 API-contract specs in `tests/e2e-api/`. Exact-HEAD wrapper verification passed on 2026-03-26 at commit `aa7dd7db61d7e274cdf946ac6dd7d7435c4dcdf4`, with all 14 wrapper sections green.
@@ -13,22 +15,22 @@ Single maintained status ledger for Flapjack. Shipped feature status, current pr
 
 ## Public Sync Lineage Ledger (Canonical)
 
-This is the single detailed ledger for the completed Mar 31 pm1-pm6 + Apr 8 + Apr 15 publication wave.
+This is the single detailed ledger for the current v1.0.3 publication baseline (released 2026-05-30).
 
-May 22 OSS polish wave status facts (lanes A-F, including Lane F FAIL gaps) are also canonical in the existing rows below and must be updated here when planning docs are trimmed.
+May 22 OSS polish wave status facts (lanes A-F) remain canonical historical lineage in the existing rows below and are preserved as part of this owner surface.
 
 | Proof Item | Value |
 |---|---|
-| Canonical dev source for this wave | `1a0f34c2dfe1b6b973c9359bef49fe7a098d0128` |
-| Staging publication | Commit `61f62b0cfa15d5d3926e4c39004f9764265ec40d` with CI run `24483181835` green |
-| Prod publication | Commit `cdbfc2fa229c18633fb15c58e3c89d6c1bc201d7` with CI run `24484835679` green |
+| Canonical dev source for this wave | Commit `1111b` (v1.0.3 release cut lane) plus merged PL-14 fix surface `dbd78016` |
+| Staging publication | `ci.yml` green at HEAD for the v1.0.3 wave (see current production lane-state owner in `ROADMAP.md`) |
+| Prod publication | `ci.yml` green at HEAD for the v1.0.3 wave with release artifacts published on 2026-05-30 |
 | Release closeout channels | `github_release`, `binaries`, `ghcr_VERSION`, `ghcr_latest`, `mirror_ci`, `nightlies` |
-| Preserved cleanup lineage in prod history | Commit `c1d46d5` preserved in the pushed prod range |
-| Non-pruned stale-file removals in public clones | Removed `.debbie.toml` from staging+prod, removed `AGENTS.md` from prod, removed `engine/.cargo/config.toml` from prod |
-| Tracked-file audit outcome | No blocker leaks. Accepted exceptions remain code-level `.secret` path strings and the deliberate `stuartcrobinson/tantivy` fork URL |
-| Validator boundary contract | `engine/tests/validate_sync_surface.sh` remains intentionally dev-only and is not public-synced |
-| Local public validation before push | `cargo check --workspace` passed; `cargo test -p flapjack-http -- openapi` passed |
-| Known residual (out of scope for this wave) | Prod installer workflow run `24484835666` failed due to pre-existing release/DNS infrastructure, not this sync wave |
+| Preserved cleanup lineage in prod history | Historical mar31/apr08/apr15 publication lineage remains preserved below; v1.0.3 is an additive release wave, not a history rewrite |
+| Non-pruned stale-file removals in public clones | No new stale-file removal axis introduced in v1.0.3; prior mar31/apr08/apr15 cleanup lineage remains authoritative |
+| Tracked-file audit outcome | v1.0.3 closure retained public-sync boundaries; no new blocker leaks surfaced in the published release wave |
+| Validator boundary contract | Public status/readiness detail ownership remains split: `FEATURES.md` for canonical snapshot, `PRIORITIES.md` + `ROADMAP.md` for live lane-state |
+| Local public validation before push | v1.0.3 release closure validated release assets/channels (`gh release`, GHCR multi-arch, nightly/staging/prod CI green lineage) per `PRIORITIES.md` |
+| Known residual (out of scope for this wave) | v1.0.3 intentionally excludes post-tag `[Unreleased]` CLI flag/dispatch fixes that ship in the next release |
 
 ---
 
@@ -349,9 +351,9 @@ CI-runnable scripts that verify documentation accuracy and API completeness agai
 
 Production-readiness checklist organized by priority tier. Tier 1 items were launch blockers, Tier 2 items are required for production confidence, Tier 3 items can be iterated on post-launch.
 
-The substantive Tier 1 and Tier 2 engineering work is complete, and the OSS launch gate is now closed by staging run `23671792399`. The Stage 3 proof pack exists locally with 2h mixed/write soak artifacts, restart-during-active-writes proofs, and nontrivial crash/restart durability proofs. The former threshold-breach issue (soak runs exiting `99`) was resolved by introducing `SOAK_WRITE_THRESHOLDS` that correctly distinguish sustained-overload acceptance from short-baseline failure detection. The Mar 31 pm1-pm6, Apr 8, and Apr 15 work is now fully published to staging/prod; exact SHAs, CI runs, and audit notes are tracked in [Public Sync Lineage Ledger (Canonical)](#public-sync-lineage-ledger-canonical). See [`engine/loadtest/BENCHMARKS.md`](../loadtest/BENCHMARKS.md) for details. Use [`1_STRATEGY/HIGHEST_PRIORITY.md`](1_STRATEGY/HIGHEST_PRIORITY.md) for the live priority narrative.
+As of 2026-05-31, v1.0.3 (released 2026-05-30) is the current shipped baseline. This section remains the canonical readiness snapshot while ongoing lane-state and post-ship sequencing are intentionally routed to [`ROADMAP.md`](../../ROADMAP.md) and [`PRIORITIES.md`](../../PRIORITIES.md) to avoid duplicate live-status prose in this owner.
 
-**Last updated: 2026-05-25**
+**Last updated: 2026-05-31**
 
 ### Tier 1 — Launch Blockers
 

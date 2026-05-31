@@ -158,9 +158,9 @@ impl<'tmp> TestStateBuilder<'tmp> {
             start_time: std::time::Instant::now(),
             conversation_store: crate::conversation_store::ConversationStore::default_shared(),
             embedder_store: Arc::new(crate::embedder_store::EmbedderStore::new()),
-            idempotency_cache: Arc::new(crate::idempotency::IdempotencyCache::new(
-                std::time::Duration::from_secs(300),
-            )),
+            idempotency_cache: Arc::new(
+                crate::idempotency::IdempotencyCache::from_env_with_data_dir(self.tmp.path()),
+            ),
         }
     }
 

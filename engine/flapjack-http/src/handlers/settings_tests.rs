@@ -955,38 +955,40 @@ async fn test_replicas_clear_with_empty_array() {
 /// Build a router with settings + write + read + clear endpoints for replica sync tests.
 fn replica_sync_router(state: Arc<AppState>) -> Router {
     use axum::routing::{get, post};
-    Router::new()
-        .route(
-            "/1/indexes/:indexName/settings",
-            get(get_settings).post(set_settings),
-        )
-        .route(
-            "/1/indexes/:indexName/batch",
-            post(crate::handlers::objects::add_documents),
-        )
-        .route(
-            "/1/indexes/:indexName/:objectID",
-            get(crate::handlers::objects::get_object)
-                .put(crate::handlers::objects::put_object)
-                .delete(crate::handlers::objects::delete_object),
-        )
-        .route(
-            "/1/indexes/:indexName/:objectID/partial",
-            post(crate::handlers::objects::partial_update_object),
-        )
-        .route(
-            "/1/indexes/:indexName/clear",
-            post(crate::handlers::indices::clear_index),
-        )
-        .route(
-            "/1/indexes/:indexName/query",
-            post(crate::handlers::search::search),
-        )
-        .route(
-            "/1/indexes/:indexName",
-            post(crate::handlers::objects::add_record_auto_id),
-        )
-        .with_state(state)
+    crate::router::app_id_layer(
+        Router::new()
+            .route(
+                "/1/indexes/:indexName/settings",
+                get(get_settings).post(set_settings),
+            )
+            .route(
+                "/1/indexes/:indexName/batch",
+                post(crate::handlers::objects::add_documents),
+            )
+            .route(
+                "/1/indexes/:indexName/:objectID",
+                get(crate::handlers::objects::get_object)
+                    .put(crate::handlers::objects::put_object)
+                    .delete(crate::handlers::objects::delete_object),
+            )
+            .route(
+                "/1/indexes/:indexName/:objectID/partial",
+                post(crate::handlers::objects::partial_update_object),
+            )
+            .route(
+                "/1/indexes/:indexName/clear",
+                post(crate::handlers::indices::clear_index),
+            )
+            .route(
+                "/1/indexes/:indexName/query",
+                post(crate::handlers::search::search),
+            )
+            .route(
+                "/1/indexes/:indexName",
+                post(crate::handlers::objects::add_record_auto_id),
+            )
+            .with_state(state),
+    )
 }
 
 /// POST /1/indexes/{idx}/settings with a custom index name
@@ -1917,46 +1919,48 @@ async fn test_a6_put_primary_on_replica_is_ignored() {
 /// Build a router that adds synonym and rule batch endpoints on top of the base replica-sync router.
 fn replica_sync_router_with_synonyms_rules(state: Arc<AppState>) -> Router {
     use axum::routing::{get, post};
-    Router::new()
-        .route(
-            "/1/indexes/:indexName/settings",
-            get(get_settings).post(set_settings),
-        )
-        .route(
-            "/1/indexes/:indexName/batch",
-            post(crate::handlers::objects::add_documents),
-        )
-        .route(
-            "/1/indexes/:indexName/:objectID",
-            get(crate::handlers::objects::get_object)
-                .put(crate::handlers::objects::put_object)
-                .delete(crate::handlers::objects::delete_object),
-        )
-        .route(
-            "/1/indexes/:indexName/:objectID/partial",
-            post(crate::handlers::objects::partial_update_object),
-        )
-        .route(
-            "/1/indexes/:indexName/clear",
-            post(crate::handlers::indices::clear_index),
-        )
-        .route(
-            "/1/indexes/:indexName/query",
-            post(crate::handlers::search::search),
-        )
-        .route(
-            "/1/indexes/:indexName",
-            post(crate::handlers::objects::add_record_auto_id),
-        )
-        .route(
-            "/1/indexes/:indexName/synonyms/batch",
-            post(crate::handlers::synonyms::save_synonyms),
-        )
-        .route(
-            "/1/indexes/:indexName/rules/batch",
-            post(crate::handlers::rules::save_rules),
-        )
-        .with_state(state)
+    crate::router::app_id_layer(
+        Router::new()
+            .route(
+                "/1/indexes/:indexName/settings",
+                get(get_settings).post(set_settings),
+            )
+            .route(
+                "/1/indexes/:indexName/batch",
+                post(crate::handlers::objects::add_documents),
+            )
+            .route(
+                "/1/indexes/:indexName/:objectID",
+                get(crate::handlers::objects::get_object)
+                    .put(crate::handlers::objects::put_object)
+                    .delete(crate::handlers::objects::delete_object),
+            )
+            .route(
+                "/1/indexes/:indexName/:objectID/partial",
+                post(crate::handlers::objects::partial_update_object),
+            )
+            .route(
+                "/1/indexes/:indexName/clear",
+                post(crate::handlers::indices::clear_index),
+            )
+            .route(
+                "/1/indexes/:indexName/query",
+                post(crate::handlers::search::search),
+            )
+            .route(
+                "/1/indexes/:indexName",
+                post(crate::handlers::objects::add_record_auto_id),
+            )
+            .route(
+                "/1/indexes/:indexName/synonyms/batch",
+                post(crate::handlers::synonyms::save_synonyms),
+            )
+            .route(
+                "/1/indexes/:indexName/rules/batch",
+                post(crate::handlers::rules::save_rules),
+            )
+            .with_state(state),
+    )
 }
 
 /// POST settings to a named index, optionally appending `?forwardToReplicas=true`.
@@ -2248,20 +2252,22 @@ async fn test_a5_forward_to_replicas_rules_batch() {
 async fn test_a7_list_indices_shows_replica_metadata() {
     let tmp = TempDir::new().unwrap();
     let state = TestStateBuilder::new(&tmp).build_shared();
-    let app = Router::new()
-        .route(
-            "/1/indexes/:indexName/settings",
-            axum::routing::get(get_settings).post(set_settings),
-        )
-        .route(
-            "/1/indexes",
-            axum::routing::get(crate::handlers::indices::list_indices),
-        )
-        .route(
-            "/1/indexes/:indexName/batch",
-            axum::routing::post(crate::handlers::objects::add_documents),
-        )
-        .with_state(state);
+    let app = crate::router::app_id_layer(
+        Router::new()
+            .route(
+                "/1/indexes/:indexName/settings",
+                axum::routing::get(get_settings).post(set_settings),
+            )
+            .route(
+                "/1/indexes",
+                axum::routing::get(crate::handlers::indices::list_indices),
+            )
+            .route(
+                "/1/indexes/:indexName/batch",
+                axum::routing::post(crate::handlers::objects::add_documents),
+            )
+            .with_state(state),
+    );
 
     // Create primary with standard + virtual replicas
     let resp = post_settings_for(

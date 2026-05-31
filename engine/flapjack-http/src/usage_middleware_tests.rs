@@ -329,9 +329,9 @@ fn make_app_state(tmp: &tempfile::TempDir) -> std::sync::Arc<crate::handlers::Ap
         start_time: std::time::Instant::now(),
         conversation_store: crate::conversation_store::ConversationStore::default_shared(),
         embedder_store: std::sync::Arc::new(crate::embedder_store::EmbedderStore::new()),
-        idempotency_cache: std::sync::Arc::new(crate::idempotency::IdempotencyCache::new(
-            std::time::Duration::from_secs(300),
-        )),
+        idempotency_cache: std::sync::Arc::new(
+            crate::idempotency::IdempotencyCache::from_env_with_data_dir(tmp.path()),
+        ),
     })
 }
 
@@ -376,12 +376,14 @@ async fn handler_documents_indexed_total_increments_on_batch() {
     let tmp = tempfile::TempDir::new().unwrap();
     let state = make_app_state(&tmp);
 
-    let app = axum::Router::new()
-        .route(
-            "/1/indexes/:indexName/batch",
-            axum::routing::post(crate::handlers::add_documents),
-        )
-        .with_state(state.clone());
+    let app = crate::router::app_id_layer(
+        axum::Router::new()
+            .route(
+                "/1/indexes/:indexName/batch",
+                axum::routing::post(crate::handlers::add_documents),
+            )
+            .with_state(state.clone()),
+    );
 
     let body = serde_json::json!({
         "requests": [

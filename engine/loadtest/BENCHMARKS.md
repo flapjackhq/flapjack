@@ -71,6 +71,78 @@ Threshold and contract semantics are owned by `engine/loadtest/lib/throughput.js
 - Stage 6 contract-health PASS requires `write_http_5xx_rate=0.00%` and `write_http_unexpected_4xx_rate=0.00%` from retained stdout metrics.
 - High `write_http_4xx_rate` is expected under saturation (dominantly `429`) and does not by itself fail Stage 6 contract health.
 
+## PL-10 Stage 4 Regression Envelope (May 31, 2026)
+
+### Purpose
+
+Stage 4 regression verification after Stage 2 (env-driven write-queue batch-size resolver) and Stage 3 (PL-10 acceptance harness). Confirms adjacent behavior is still correct at current HEAD.
+
+### Run Metadata
+
+- Run timestamp (UTC): 2026-05-31T20:06:32Z
+- Results directory: `engine/loadtest/results/20260531T200632Z-pl10-saturation-acceptance/`
+- Head SHA: `7d3007ea5afc8aa9369b666b64f60b0d593b4aa1`
+- Harness owner: `engine/loadtest/tests/pl10_saturation_acceptance.sh`
+
+### Regression Commands and Results
+
+| Command | Result | Count |
+|---|---|---:|
+| `cargo test -p flapjack --lib -- index::write_queue::tests` | PASS | 14 tests |
+| `cargo test -p flapjack --lib -- index::manager::tests::wait_for_write_durable` | PASS | 2 tests |
+| `cargo test -p flapjack-http --test ack_on_durable_integration` | PASS | 7 tests |
+| `cargo test -p flapjack-replication` | PASS | 39 tests |
+| `cargo test -p flapjack-server` | PASS | 8 tests |
+| `bash engine/loadtest/tests/throughput_acceptance.sh` | PASS | — |
+| `bash engine/loadtest/tests/benchmark_k6_errors.sh` | PASS | 7 checks |
+| `bash engine/loadtest/tests/pl10_saturation_acceptance.sh` | PASS | — |
+| `cargo fmt --all -- --check` | PASS | — |
+| `cargo clippy -p flapjack -p flapjack-http -p flapjack-replication -p flapjack-server --all-targets -- -D warnings` | PASS | — |
+| `./s/test --unit --integ --server` | PASS | 1044 integ + unit + server |
+
+### PL-10 Acceptance Metrics (Stage 4 rerun)
+
+| Metric | Value |
+|---|---|
+| `http_reqs` | 180,573 (1491.3/s) |
+| `successful_writes` | 47,880 |
+| `write_http_5xx_rate` | 0.00% |
+| `write_http_unexpected_4xx_rate` | 0.00% |
+| `write_http_4xx_rate` | 0.00% |
+| write latency avg | 502.93ms |
+| write latency p95 | 893.85ms |
+| search latency avg | 22.23ms |
+| search latency p95 | 68.65ms |
+
+### Threshold Ownership
+
+Thresholds and contract semantics are owned by `engine/loadtest/lib/throughput.js` (Stage 1/3 contract wording). Stage 4 reuses existing contract definitions — no threshold redefinition.
+
+## PL-10 Stage 3 Saturation Acceptance (May 31, 2026)
+
+### Run Metadata
+
+- Run timestamp (UTC): 2026-05-31T19:49:01Z
+- Results directory: `engine/loadtest/results/20260531T194901Z-pl10-saturation-acceptance/`
+- Head SHA: `fa3d78812aff842dd91f3a7aa751c3a37fee90c2`
+- Scenario owner: `engine/loadtest/scenarios/mixed-soak.js`
+- Harness owner: `engine/loadtest/tests/pl10_saturation_acceptance.sh`
+
+### Stage 1 Contract Wording Applied
+
+Under `mixed-soak.js` with `FLAPJACK_LOADTEST_WRITE_VUS=200` and `FLAPJACK_LOADTEST_SOAK_DURATION=2m`, require:
+
+- `successful_writes >= 45000`
+- while preserving write contract: `write_http_5xx_rate == 0.00%` and `write_http_unexpected_4xx_rate == 0.00%`
+- baseline-unset must fail the same saturation target
+
+### Acceptance Verdict
+
+| Case | `successful_writes` | Saturation target (`>=45000`) | `write_http_5xx_rate` | `write_http_unexpected_4xx_rate` | Verdict |
+|---|---:|---:|---:|---:|---|
+| Baseline unset | `27048` | FAIL | `0.00%` | `0.00%` | Contract preserved, saturation target miss |
+| Tuned `FLAPJACK_WRITE_QUEUE_BATCH_SIZE=64` | `54783` | PASS | `0.00%` | `0.00%` | Contract preserved, saturation target pass |
+
 ## Stage 3 Soak Proof (Mar 28, 2026)
 
 ### Run Metadata

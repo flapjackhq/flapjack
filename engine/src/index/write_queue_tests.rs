@@ -1,7 +1,97 @@
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/may31_12pm_6_pl10_write_path_saturation/flapjack_dev/engine/src/index/write_queue_tests.rs.
 use super::*;
 use crate::index::memory::{MemoryBudget, MemoryBudgetConfig};
+use once_cell::sync::Lazy;
 use prometheus::{Encoder, TextEncoder};
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Mutex, time::Duration};
+
+const WRITE_QUEUE_BATCH_SIZE_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_BATCH_SIZE";
+static WRITE_QUEUE_ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+struct WriteQueueBatchSizeEnvRestoreGuard {
+    previous_value: Option<String>,
+}
+
+impl WriteQueueBatchSizeEnvRestoreGuard {
+    fn apply(env_value: Option<&str>) -> Self {
+        let previous_value = std::env::var(WRITE_QUEUE_BATCH_SIZE_ENV_VAR).ok();
+        match env_value {
+            Some(value) => std::env::set_var(WRITE_QUEUE_BATCH_SIZE_ENV_VAR, value),
+            None => std::env::remove_var(WRITE_QUEUE_BATCH_SIZE_ENV_VAR),
+        }
+        Self { previous_value }
+    }
+}
+
+impl Drop for WriteQueueBatchSizeEnvRestoreGuard {
+    fn drop(&mut self) {
+        match &self.previous_value {
+            Some(value) => std::env::set_var(WRITE_QUEUE_BATCH_SIZE_ENV_VAR, value),
+            None => std::env::remove_var(WRITE_QUEUE_BATCH_SIZE_ENV_VAR),
+        }
+    }
+}
+
+fn with_write_queue_batch_size_env<T>(env_value: Option<&str>, test_body: impl FnOnce() -> T) -> T {
+    let _guard = WRITE_QUEUE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    with_write_queue_batch_size_env_locked(env_value, test_body)
+}
+
+/// Applies a temporary batch-size env value while the caller holds WRITE_QUEUE_ENV_LOCK.
+fn with_write_queue_batch_size_env_locked<T>(
+    env_value: Option<&str>,
+    test_body: impl FnOnce() -> T,
+) -> T {
+    let _restore_guard = WriteQueueBatchSizeEnvRestoreGuard::apply(env_value);
+    test_body()
+}
+
+#[test]
+fn test_batch_flush_decision_uses_resolved_batch_size_snapshot() {
+    with_write_queue_batch_size_env(Some("3"), || {
+        let resolved_batch_size = write_queue_batch_size();
+        std::env::set_var(WRITE_QUEUE_BATCH_SIZE_ENV_VAR, "1");
+
+        assert!(
+            !should_flush_pending_batch(2, resolved_batch_size),
+            "pending len should use queue-start batch-size snapshot"
+        );
+        assert!(
+            should_flush_pending_batch(3, resolved_batch_size),
+            "pending len at snapshot threshold should flush"
+        );
+    });
+}
+
+#[test]
+fn test_with_write_queue_batch_size_env_restores_env_after_panic() {
+    let _guard = WRITE_QUEUE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous_value = std::env::var(WRITE_QUEUE_BATCH_SIZE_ENV_VAR).ok();
+    std::env::set_var(WRITE_QUEUE_BATCH_SIZE_ENV_VAR, "before-panic");
+
+    let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_write_queue_batch_size_env_locked(Some("during-panic"), || {
+            panic!("intentional panic to verify restoration guard");
+        });
+    }));
+    assert!(panic_result.is_err(), "test setup should panic");
+
+    let current_value = std::env::var(WRITE_QUEUE_BATCH_SIZE_ENV_VAR).ok();
+    assert_eq!(
+        current_value.as_deref(),
+        Some("before-panic"),
+        "helper must restore env even when closure panics"
+    );
+
+    match previous_value {
+        Some(value) => std::env::set_var(WRITE_QUEUE_BATCH_SIZE_ENV_VAR, value),
+        None => std::env::remove_var(WRITE_QUEUE_BATCH_SIZE_ENV_VAR),
+    }
+}
 
 /// Core helper: create a write queue wired to the given index.
 fn setup_write_queue_with_index(
@@ -147,6 +237,34 @@ fn write_queue_phase_metrics_text() -> String {
         .encode(&gather_write_queue_phase_metric_families(), &mut encoded)
         .unwrap();
     String::from_utf8(encoded).unwrap()
+}
+
+#[test]
+fn test_write_queue_batch_size_uses_default_when_env_unset() {
+    with_write_queue_batch_size_env(None, || {
+        assert_eq!(write_queue_batch_size(), DEFAULT_WRITE_QUEUE_BATCH_SIZE);
+    });
+}
+
+#[test]
+fn test_write_queue_batch_size_uses_env_override_when_valid() {
+    with_write_queue_batch_size_env(Some("64"), || {
+        assert_eq!(write_queue_batch_size(), 64);
+    });
+}
+
+#[test]
+fn test_write_queue_batch_size_falls_back_on_malformed_env() {
+    with_write_queue_batch_size_env(Some("not-a-number"), || {
+        assert_eq!(write_queue_batch_size(), DEFAULT_WRITE_QUEUE_BATCH_SIZE);
+    });
+}
+
+#[test]
+fn test_write_queue_batch_size_falls_back_on_zero_env() {
+    with_write_queue_batch_size_env(Some("0"), || {
+        assert_eq!(write_queue_batch_size(), DEFAULT_WRITE_QUEUE_BATCH_SIZE);
+    });
 }
 
 #[tokio::test]

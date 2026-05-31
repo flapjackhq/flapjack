@@ -125,6 +125,21 @@ describe('DocumentCard display preferences contract', () => {
     expect(screen.getByText('javascript:alert(1)')).toBeInTheDocument();
   });
 
+  it('does not treat scheme-relative image URLs as same-origin paths', () => {
+    render(
+      <DocumentCard
+        document={{
+          ...baseDocument,
+          image_url: '//cdn.attacker.test/track.png',
+        }}
+        displayPreferences={fullPreferences}
+      />
+    );
+
+    expect(screen.queryByTestId('document-card-image')).not.toBeInTheDocument();
+    expect(screen.getByText('//cdn.attacker.test/track.png')).toBeInTheDocument();
+  });
+
   it('keeps default no-preferences fallback and preview-count behavior', async () => {
     const user = userEvent.setup();
     const { image_url: _ignoredImage, ...documentWithoutConfiguredFields } = baseDocument;
@@ -182,6 +197,62 @@ describe('DocumentCard display preferences contract', () => {
     expect(screen.getByText('inStock:')).toBeInTheDocument();
 
     expect(screen.queryByRole('button', { name: /more fields/ })).not.toBeInTheDocument();
+  });
+
+  it('keeps matched brand visible without overriding parent remainder order', () => {
+    render(
+      <DocumentCard
+        document={{
+          ...baseDocument,
+          warranty: '2 years',
+          seller: 'Flapjack Store',
+          condition: 'new',
+          material: 'aluminum',
+          _highlightResult: {
+            brand: { value: '<em>Apple</em>', matchLevel: 'full' },
+            seller: { value: 'Flapjack Store', matchLevel: 'none' },
+            warranty: { value: '2 years', matchLevel: 'none' },
+            condition: { value: 'new', matchLevel: 'none' },
+            material: { value: 'aluminum', matchLevel: 'none' },
+          },
+        }}
+        displayPreferences={{
+          titleAttribute: 'name',
+          subtitleAttribute: 'description',
+          imageAttribute: 'image_url',
+          tagAttributes: ['tags'],
+        }}
+        fieldOrder={[
+          'name',
+          'description',
+          'image_url',
+          'tags',
+          'inStock',
+          'seller',
+          'warranty',
+          'condition',
+          'material',
+          'category',
+          'price',
+          'rating',
+          'brand',
+        ]}
+      />
+    );
+
+    // Brand is matched but appears late in the parent-provided order; collapsed preview
+    // should still keep it visible ahead of lower-priority unmatched overflow fields.
+    expect(screen.getByText('brand:')).toBeInTheDocument();
+    expect(screen.getByText('inStock:')).toBeInTheDocument();
+    expect(screen.getByText('seller:')).toBeInTheDocument();
+    expect(screen.getByText('warranty:')).toBeInTheDocument();
+    expect(screen.getByText('condition:')).toBeInTheDocument();
+    expect(screen.getByText('material:')).toBeInTheDocument();
+
+    expect(screen.queryByText('category:')).not.toBeInTheDocument();
+    expect(screen.queryByText('price:')).not.toBeInTheDocument();
+    expect(screen.queryByText('rating:')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '+3 more fields' })).toBeInTheDocument();
   });
 
   it('preserves existing affordances with configured headers', async () => {

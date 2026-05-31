@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/may31_12pm_4_idempotency_cache_durability/flapjack_dev/engine/flapjack-server/tests/support/mod.rs.
 use assert_cmd::Command;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -12,13 +13,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const AUTO_PORT_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const AUTO_PORT_HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
-const FLAPJACK_AMBIENT_ENV_VARS: [&str; 6] = [
+const FLAPJACK_AMBIENT_ENV_VARS: [&str; 9] = [
     "FLAPJACK_ADMIN_KEY",
     "FLAPJACK_NO_AUTH",
     "FLAPJACK_ENV",
     "FLAPJACK_BIND_ADDR",
     "FLAPJACK_PORT",
     "FLAPJACK_DATA_DIR",
+    "FLAPJACK_IDEMPOTENCY_TTL_SECS",
+    "FLAPJACK_IDEMPOTENCY_PERSISTENT",
+    "FLAPJACK_IDEMPOTENCY_PERSIST",
 ];
 
 pub(crate) fn flapjack_cmd() -> Command {
@@ -204,6 +208,15 @@ impl RunningServer {
         Self::spawn_auto_port(data_dir, false)
     }
 
+    pub(crate) fn spawn_no_auth_auto_port_with_persistent_idempotency(
+        data_dir: &str,
+        ttl: Duration,
+    ) -> Self {
+        let env = persistent_idempotency_env(ttl);
+        let (child, bind_addr) = Self::start_auto_port_process_with_env(data_dir, true, &env);
+        Self { child, bind_addr }
+    }
+
     fn spawn_auto_port(data_dir: &str, no_auth: bool) -> Self {
         let (child, bind_addr) = Self::start_auto_port_process(data_dir, no_auth);
         Self { child, bind_addr }
@@ -224,6 +237,23 @@ impl RunningServer {
         let bind_addr = wait_for_startup_bind_addr(&mut child, AUTO_PORT_STARTUP_TIMEOUT);
         wait_for_health(&bind_addr, AUTO_PORT_HEALTH_TIMEOUT);
 
+        (child, bind_addr)
+    }
+
+    fn start_auto_port_process_with_env(
+        data_dir: &str,
+        no_auth: bool,
+        extra_env: &[(&str, &str)],
+    ) -> (Child, String) {
+        let mut child = spawn_flapjack_auto_port_process_with_env(
+            data_dir,
+            no_auth,
+            extra_env,
+            Stdio::piped(),
+            Stdio::piped(),
+        );
+        let bind_addr = wait_for_startup_bind_addr(&mut child, AUTO_PORT_STARTUP_TIMEOUT);
+        wait_for_health(&bind_addr, AUTO_PORT_HEALTH_TIMEOUT);
         (child, bind_addr)
     }
 
@@ -270,6 +300,18 @@ impl RunningServer {
     pub(crate) fn kill_and_restart_no_auth_auto_port(&mut self, data_dir: &str) {
         self.kill_child();
         let (child, bind_addr) = Self::start_auto_port_process(data_dir, true);
+        self.child = child;
+        self.bind_addr = bind_addr;
+    }
+
+    pub(crate) fn kill_and_restart_no_auth_auto_port_with_persistent_idempotency(
+        &mut self,
+        data_dir: &str,
+        ttl: Duration,
+    ) {
+        self.kill_child();
+        let env = persistent_idempotency_env(ttl);
+        let (child, bind_addr) = Self::start_auto_port_process_with_env(data_dir, true, &env);
         self.child = child;
         self.bind_addr = bind_addr;
     }
@@ -561,6 +603,15 @@ pub(crate) fn http_request(
     body: Option<&str>,
 ) -> Result<HttpResponse, String> {
     http_request_with_headers(bind_addr, method, path, &[], body)
+}
+
+fn persistent_idempotency_env(ttl: Duration) -> [(&'static str, &'static str); 2] {
+    let ttl_secs = ttl.as_secs().max(1);
+    let ttl = Box::leak(ttl_secs.to_string().into_boxed_str());
+    [
+        ("FLAPJACK_IDEMPOTENCY_PERSISTENT", "true"),
+        ("FLAPJACK_IDEMPOTENCY_TTL_SECS", ttl),
+    ]
 }
 
 fn http_json_request(bind_addr: &str, method: &str, path: &str, body: &Value) -> JsonResponse {

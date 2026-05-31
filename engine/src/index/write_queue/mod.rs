@@ -1,3 +1,4 @@
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/may31_12pm_6_pl10_write_path_saturation/flapjack_dev/engine/src/index/write_queue/mod.rs.
 mod finalization;
 mod vectors;
 
@@ -15,7 +16,9 @@ use tokio::time::timeout_at;
 // shows commit_writer_with_panic_guard nested inside commit_batch consuming
 // ~90% of in-batch wall time; WRITE_QUEUE_FLUSH_INTERVAL still caps tail
 // latency and WRITE_QUEUE_CHANNEL_CAPACITY still gates QueueFull admission.
-const WRITE_QUEUE_BATCH_SIZE: usize = 32;
+const DEFAULT_WRITE_QUEUE_BATCH_SIZE: usize = 32;
+// Canonical runtime config key for write queue batching behavior.
+const WRITE_QUEUE_BATCH_SIZE_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_BATCH_SIZE";
 const WRITE_QUEUE_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 const WRITE_QUEUE_CHANNEL_CAPACITY: usize = 2_000;
 const WRITE_QUEUE_PHASE_METRIC_NAME: &str = "flapjack_write_queue_phase_seconds";
@@ -49,6 +52,33 @@ pub(super) fn observe_write_queue_phase(phase: &str, started_at: Instant) {
     WRITE_QUEUE_PHASE_SECONDS
         .with_label_values(&[phase])
         .observe(started_at.elapsed().as_secs_f64());
+}
+
+fn write_queue_batch_size() -> usize {
+    match std::env::var(WRITE_QUEUE_BATCH_SIZE_ENV_VAR) {
+        Ok(raw_value) => match raw_value.parse::<usize>() {
+            Ok(parsed) if parsed > 0 => parsed,
+            Ok(_) => {
+                tracing::warn!(
+                    "{} must be greater than 0; falling back to default {}",
+                    WRITE_QUEUE_BATCH_SIZE_ENV_VAR,
+                    DEFAULT_WRITE_QUEUE_BATCH_SIZE
+                );
+                DEFAULT_WRITE_QUEUE_BATCH_SIZE
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "failed to parse {}='{}' as usize: {}; falling back to default {}",
+                    WRITE_QUEUE_BATCH_SIZE_ENV_VAR,
+                    raw_value,
+                    error,
+                    DEFAULT_WRITE_QUEUE_BATCH_SIZE
+                );
+                DEFAULT_WRITE_QUEUE_BATCH_SIZE
+            }
+        },
+        Err(_) => DEFAULT_WRITE_QUEUE_BATCH_SIZE,
+    }
 }
 
 pub fn gather_write_queue_phase_metric_families() -> Vec<MetricFamily> {
@@ -323,7 +353,9 @@ async fn flush_pending_batch(
 
 /// Run the write-queue event loop: receive `WriteOp`s from the channel, batch them by count or timeout, and flush via `commit_batch`.
 ///
-/// The loop flushes when the batch reaches WRITE_QUEUE_BATCH_SIZE operations, the 100 ms deadline expires, or the channel closes. Compact operations are handled immediately after flushing any pending batch.
+/// The loop flushes when the batch reaches the runtime `FLAPJACK_WRITE_QUEUE_BATCH_SIZE`
+/// threshold, the 100 ms deadline expires, or the channel closes. Compact operations
+/// are handled immediately after flushing any pending batch.
 ///
 /// # Errors
 ///
@@ -334,7 +366,14 @@ async fn process_writes(
 ) -> crate::error::Result<()> {
     let phase_start = Instant::now();
     let tenant_id = &ctx.tenant_id;
+    let resolved_batch_size = write_queue_batch_size();
     tracing::info!("Write queue started for tenant {}", tenant_id);
+    tracing::info!(
+        "[WQ {}] using resolved batch size {} from {}",
+        tenant_id,
+        resolved_batch_size,
+        WRITE_QUEUE_BATCH_SIZE_ENV_VAR
+    );
     let mut pending = Vec::new();
     let mut deadline = reset_write_queue_deadline();
 
@@ -342,7 +381,7 @@ async fn process_writes(
         log_write_queue_state(tenant_id, pending.len(), deadline);
         match next_write_queue_event(deadline, &mut rx).await {
             WriteQueueEvent::Received(op) => {
-                if handle_received_write_op(&ctx, &mut pending, op).await? {
+                if handle_received_write_op(&ctx, &mut pending, op, resolved_batch_size).await? {
                     deadline = reset_write_queue_deadline();
                 }
             }
@@ -398,12 +437,13 @@ async fn next_write_queue_event(
 
 /// Route an incoming `WriteOp`: flush the pending batch and run compaction
 /// immediately for `Compact` ops; otherwise buffer the op and flush when the
-/// batch threshold (`WRITE_QUEUE_BATCH_SIZE`) is reached. Returns `true` when
-/// a flush occurred and the deadline should be reset.
+/// batch threshold (resolved from `FLAPJACK_WRITE_QUEUE_BATCH_SIZE`) is reached.
+/// Returns `true` when a flush occurred and the deadline should be reset.
 async fn handle_received_write_op(
     ctx: &WriteQueueContext,
     pending: &mut Vec<WriteOp>,
     op: WriteOp,
+    resolved_batch_size: usize,
 ) -> crate::error::Result<bool> {
     let tenant_id = &ctx.tenant_id;
     let action_count = op.actions.len();
@@ -430,7 +470,7 @@ async fn handle_received_write_op(
     }
 
     pending.push(op);
-    if pending.len() < WRITE_QUEUE_BATCH_SIZE {
+    if !should_flush_pending_batch(pending.len(), resolved_batch_size) {
         return Ok(false);
     }
 
@@ -441,6 +481,10 @@ async fn handle_received_write_op(
     );
     flush_pending_batch(ctx, pending).await?;
     Ok(true)
+}
+
+fn should_flush_pending_batch(pending_len: usize, resolved_batch_size: usize) -> bool {
+    pending_len >= resolved_batch_size
 }
 
 async fn flush_pending_on_channel_close(

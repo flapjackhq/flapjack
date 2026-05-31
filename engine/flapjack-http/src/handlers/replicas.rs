@@ -1,3 +1,4 @@
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/may31_12pm_4_idempotency_cache_durability/flapjack_dev/engine/flapjack-http/src/handlers/replicas.rs.
 use super::AppState;
 use flapjack::error::FlapjackError;
 use flapjack::index::manager::validate_index_name;
@@ -275,9 +276,9 @@ mod tests {
             start_time: std::time::Instant::now(),
             conversation_store: crate::conversation_store::ConversationStore::default_shared(),
             embedder_store: Arc::new(crate::embedder_store::EmbedderStore::new()),
-            idempotency_cache: Arc::new(crate::idempotency::IdempotencyCache::new(
-                std::time::Duration::from_secs(300),
-            )),
+            idempotency_cache: Arc::new(
+                crate::idempotency::IdempotencyCache::from_env_with_data_dir(base),
+            ),
         })
     }
 

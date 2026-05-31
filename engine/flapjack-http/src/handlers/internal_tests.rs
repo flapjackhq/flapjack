@@ -2045,24 +2045,26 @@ async fn test_full_pause_write_resume_cycle() {
     // Build a combined router with pause/resume + write + search endpoints
     /// Build an Axum router with pause, resume, batch write, and search endpoints for the full pause/resume integration test.
     fn make_cycle_app(state: Arc<AppState>) -> Router {
-        Router::new()
-            .route(
-                "/internal/pause/:indexName",
-                axum::routing::post(super::pause_index),
-            )
-            .route(
-                "/internal/resume/:indexName",
-                axum::routing::post(super::resume_index),
-            )
-            .route(
-                "/1/indexes/:indexName/batch",
-                axum::routing::post(crate::handlers::objects::add_documents),
-            )
-            .route(
-                "/1/indexes/:indexName/query",
-                axum::routing::post(crate::handlers::search::search),
-            )
-            .with_state(state)
+        crate::router::app_id_layer(
+            Router::new()
+                .route(
+                    "/internal/pause/:indexName",
+                    axum::routing::post(super::pause_index),
+                )
+                .route(
+                    "/internal/resume/:indexName",
+                    axum::routing::post(super::resume_index),
+                )
+                .route(
+                    "/1/indexes/:indexName/batch",
+                    axum::routing::post(crate::handlers::objects::add_documents),
+                )
+                .route(
+                    "/1/indexes/:indexName/query",
+                    axum::routing::post(crate::handlers::search::search),
+                )
+                .with_state(state),
+        )
     }
 
     // Step 1: Write before pause — should NOT be 503

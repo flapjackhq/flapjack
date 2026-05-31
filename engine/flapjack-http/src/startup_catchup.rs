@@ -1,4 +1,4 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/may29_pm_2_mirror_ci_green/flapjack_dev/engine/flapjack-http/src/startup_catchup.rs.
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/may31_12pm_1_v104_release_cut/flapjack_dev/engine/flapjack-http/src/startup_catchup.rs.
 use crate::handlers::internal::apply_ops_to_manager;
 use crate::handlers::AppState;
 use flapjack::index::oplog::read_committed_seq;
@@ -56,6 +56,7 @@ pub async fn run_pre_serve_catchup(state: &AppState) -> Result<(), String> {
         .unwrap_or(30);
     let strict_bootstrap = startup_catchup_strict_bootstrap_enabled();
     let timeout = tokio::time::Duration::from_secs(timeout_secs);
+    let deadline = tokio::time::Instant::now() + timeout;
 
     tracing::info!(
         "[REPL-catchup] Pre-serve catch-up starting (timeout={}s)",
@@ -68,7 +69,7 @@ pub async fn run_pre_serve_catchup(state: &AppState) -> Result<(), String> {
     }
 
     execute_timed_catchup(state, timeout, timeout_secs, strict_bootstrap).await?;
-    wait_for_write_queues(state, timeout, timeout_secs, strict_bootstrap).await
+    wait_for_write_queues(state, deadline, timeout_secs, strict_bootstrap).await
 }
 
 async fn execute_timed_catchup(
@@ -114,16 +115,23 @@ fn strict_or_skip(strict_bootstrap: bool, error: String) -> Result<(), String> {
 /// Wait for all write queues to commit enqueued catch-up ops before serving.
 async fn wait_for_write_queues(
     state: &AppState,
-    timeout: tokio::time::Duration,
+    deadline: tokio::time::Instant,
     timeout_secs: u64,
     strict_bootstrap: bool,
 ) -> Result<(), String> {
-    if state.manager.wait_for_pending_tasks(timeout).await {
+    let remaining = remaining_pre_serve_budget(deadline);
+    if state.manager.wait_for_pending_tasks(remaining).await {
         tracing::info!("[REPL-catchup] Pre-serve catch-up complete");
         Ok(())
     } else {
         handle_write_queue_timeout(strict_bootstrap, timeout_secs)
     }
+}
+
+fn remaining_pre_serve_budget(deadline: tokio::time::Instant) -> tokio::time::Duration {
+    deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or(tokio::time::Duration::ZERO)
 }
 
 fn handle_write_queue_timeout(strict_bootstrap: bool, timeout_secs: u64) -> Result<(), String> {
@@ -267,10 +275,13 @@ async fn restore_tenant_from_snapshot(
         }
     };
 
-    if let Err(error) = install_snapshot_bytes(&state.manager, tenant_id, &snapshot_bytes) {
+    if let Err((step, error)) = install_snapshot_bytes(&state.manager, tenant_id, &snapshot_bytes) {
         return Err(format!(
-            "[{}] failed to install snapshot for tenant '{}': {}",
-            log_prefix, tenant_id, error
+            "[{}] failed to install snapshot for tenant '{}' at step '{}': {}",
+            log_prefix,
+            tenant_id,
+            step.as_tag(),
+            error
         ));
     }
 
@@ -283,14 +294,53 @@ async fn restore_tenant_from_snapshot(
     Ok(())
 }
 
+/// Stable, non-PII tag identifying which internal sub-step of `install_snapshot_bytes`
+/// produced a failure. Surfaced as the `sub_step` field on sanitized 500 responses
+/// so the failing branch is observable in logs/test output without leaking paths,
+/// tenant ids, or raw error strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotInstallStep {
+    ValidateTenantId,
+    CleanStaging,
+    RecoverInterrupted,
+    ImportExtract,
+    RenameTenantToBackup,
+    RenameStagingToTenant,
+}
+
+impl SnapshotInstallStep {
+    pub(crate) fn as_tag(self) -> &'static str {
+        match self {
+            SnapshotInstallStep::ValidateTenantId => "validate_tenant_id",
+            SnapshotInstallStep::CleanStaging => "clean_staging",
+            SnapshotInstallStep::RecoverInterrupted => "recover_interrupted",
+            SnapshotInstallStep::ImportExtract => "import_extract",
+            SnapshotInstallStep::RenameTenantToBackup => "rename_tenant_to_backup",
+            SnapshotInstallStep::RenameStagingToTenant => "rename_staging_to_tenant",
+        }
+    }
+}
+
 /// Atomically installs a compressed snapshot as a tenant's data directory: extracts
 /// to a staging path, backs up the existing tenant dir, then renames staging into place.
+///
+/// Returns the failing `SnapshotInstallStep` tag alongside the underlying error
+/// string so callers can surface a stable, non-leaking sub-step tag on the 500
+/// response while logging the full error server-side. Stage 1 diagnosis
+/// (`docs/research/may31_pm_ha_snapshot_flake_diagnosis.md`) identified the
+/// `RenameTenantToBackup` / `RenameStagingToTenant` branches as the
+/// timing-dependent producers of the HA snapshot-restore-under-load flake on
+/// Linux tmpfs; the other branches fail deterministically on bad data or
+/// missing state. The renames at lines 325/336 use a bounded retry loop to
+/// absorb transient `EBUSY`/`ENOTEMPTY` from concurrent `unload_tenant` /
+/// lingering file handles.
 pub(crate) fn install_snapshot_bytes(
     manager: &flapjack::IndexManager,
     tenant_id: &str,
     snapshot_bytes: &[u8],
-) -> Result<(), String> {
-    validate_tenant_id(tenant_id)?;
+) -> Result<(), (SnapshotInstallStep, String)> {
+    validate_tenant_id(tenant_id)
+        .map_err(|error| (SnapshotInstallStep::ValidateTenantId, error))?;
     let tenant_path = manager.base_path.join(tenant_id);
     let staging_path = manager
         .base_path
@@ -299,40 +349,58 @@ pub(crate) fn install_snapshot_bytes(
         .base_path
         .join(format!(".{tenant_id}.snapshot_restore_backup"));
 
-    remove_path_if_exists(&staging_path)?;
-    recover_interrupted_snapshot_restore(&tenant_path, &backup_path)?;
+    remove_path_if_exists(&staging_path)
+        .map_err(|error| (SnapshotInstallStep::CleanStaging, error))?;
+    recover_interrupted_snapshot_restore(&tenant_path, &backup_path)
+        .map_err(|error| (SnapshotInstallStep::RecoverInterrupted, error))?;
 
     if let Err(error) = import_from_bytes(snapshot_bytes, &staging_path) {
         let _ = remove_path_if_exists(&staging_path);
-        return Err(format!(
-            "import snapshot bytes into staging failed: {error}"
+        return Err((
+            SnapshotInstallStep::ImportExtract,
+            format!("import snapshot bytes into staging failed: {error}"),
         ));
     }
 
     manager.unload_tenant(tenant_id);
     let tenant_existed = tenant_path.exists();
     if tenant_existed {
-        std::fs::rename(&tenant_path, &backup_path).map_err(|error| {
+        if let Err(error) = rename_with_transient_retry(&tenant_path, &backup_path) {
             let _ = remove_path_if_exists(&staging_path);
-            format!(
-                "move existing tenant dir '{}' to backup '{}' failed: {}",
-                tenant_path.display(),
-                backup_path.display(),
-                error
-            )
-        })?;
+            return Err((
+                SnapshotInstallStep::RenameTenantToBackup,
+                format!(
+                    "move existing tenant dir '{}' to backup '{}' failed: {}",
+                    tenant_path.display(),
+                    backup_path.display(),
+                    error
+                ),
+            ));
+        }
     }
 
-    if let Err(error) = std::fs::rename(&staging_path, &tenant_path) {
+    if let Err(error) = rename_with_transient_retry(&staging_path, &tenant_path) {
         let _ = remove_path_if_exists(&staging_path);
-        if tenant_existed {
-            let _ = std::fs::rename(&backup_path, &tenant_path);
-        }
-        return Err(format!(
-            "activate staged snapshot '{}' -> '{}' failed: {}",
-            staging_path.display(),
-            tenant_path.display(),
-            error
+        let rollback_error =
+            restore_backup_after_failed_activation(tenant_existed, &backup_path, &tenant_path)
+                .err();
+        return Err((
+            SnapshotInstallStep::RenameStagingToTenant,
+            match rollback_error {
+                Some(rollback_error) => format!(
+                    "activate staged snapshot '{}' -> '{}' failed: {}; rollback failed: {}",
+                    staging_path.display(),
+                    tenant_path.display(),
+                    error,
+                    rollback_error
+                ),
+                None => format!(
+                    "activate staged snapshot '{}' -> '{}' failed: {}",
+                    staging_path.display(),
+                    tenant_path.display(),
+                    error
+                ),
+            },
         ));
     }
 
@@ -343,6 +411,64 @@ pub(crate) fn install_snapshot_bytes(
     Ok(())
 }
 
+/// Linux ephemeral-tmpfs renames can transiently fail with `EBUSY` or `ENOTEMPTY`
+/// when concurrent `unload_tenant` / open file handles haven't fully released the
+/// directory yet. Retry briefly (≤200 ms total) before surfacing the IO error.
+///
+/// Bounded to absorb the race without masking persistent failures: if rename keeps
+/// failing past the budget, the underlying error still propagates with its raw
+/// `io::Error` so callers see the real reason in logs.
+fn rename_with_transient_retry(
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> std::io::Result<()> {
+    const MAX_TOTAL_MS: u64 = 200;
+    const SLEEP_MS: u64 = 10;
+    let start = std::time::Instant::now();
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if !is_transient_rename_error(&error)
+                    || start.elapsed().as_millis() as u64 >= MAX_TOTAL_MS
+                {
+                    return Err(error);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(SLEEP_MS));
+            }
+        }
+    }
+}
+
+fn is_transient_rename_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        // EBUSY = 16 (Linux), ENOTEMPTY = 39 (Linux) / 66 (macOS)
+        Some(16) | Some(39) | Some(66)
+    ) || matches!(
+        error.kind(),
+        std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::ResourceBusy
+    )
+}
+
+fn restore_backup_after_failed_activation(
+    tenant_existed: bool,
+    backup_path: &std::path::Path,
+    tenant_path: &std::path::Path,
+) -> Result<(), String> {
+    if !tenant_existed {
+        return Ok(());
+    }
+
+    rename_with_transient_retry(backup_path, tenant_path).map_err(|error| {
+        format!(
+            "restore previous tenant dir '{}' from backup '{}' failed: {}",
+            tenant_path.display(),
+            backup_path.display(),
+            error
+        )
+    })
+}
 fn validate_tenant_id(tenant_id: &str) -> Result<(), String> {
     flapjack::validate_index_name(tenant_id)
         .map_err(|error| format!("invalid tenant id '{}': {}", tenant_id, error))
@@ -401,6 +527,21 @@ fn read_local_ops_since(
     })
 }
 
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.
@@ -756,6 +897,23 @@ mod tests {
         assert!(parse_strict_bootstrap_override(Some("unexpected")));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn remaining_pre_serve_budget_shrinks_with_elapsed_time() {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+
+        tokio::time::advance(tokio::time::Duration::from_secs(11)).await;
+        assert_eq!(
+            super::remaining_pre_serve_budget(deadline),
+            tokio::time::Duration::from_secs(19)
+        );
+
+        tokio::time::advance(tokio::time::Duration::from_secs(19)).await;
+        assert_eq!(
+            super::remaining_pre_serve_budget(deadline),
+            tokio::time::Duration::ZERO
+        );
+    }
+
     #[test]
     fn write_queue_timeout_is_error_in_strict_mode() {
         let result = super::handle_write_queue_timeout(true, 7);
@@ -931,6 +1089,30 @@ mod tests {
             "restored backup should be moved back to the active tenant path"
         );
     }
+
+    #[test]
+    fn restore_backup_after_failed_activation_surfaces_rollback_errors() {
+        let tmp = TempDir::new().unwrap();
+        let tenant_path = tmp.path().join("tenant");
+        let backup_path = tmp.path().join(".tenant.snapshot_restore_backup");
+        std::fs::create_dir_all(&tenant_path).unwrap();
+        std::fs::write(tenant_path.join("occupied.txt"), "still here").unwrap();
+        std::fs::create_dir_all(&backup_path).unwrap();
+        std::fs::write(backup_path.join("backup.txt"), "restore me").unwrap();
+
+        let error = super::restore_backup_after_failed_activation(true, &backup_path, &tenant_path)
+            .expect_err("existing tenant path should make rollback restore fail");
+
+        assert!(
+            error.contains("restore previous tenant dir"),
+            "rollback failure should identify the restore step, got: {error}"
+        );
+        assert!(
+            error.contains("failed"),
+            "rollback failure should preserve the underlying io error, got: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn install_snapshot_bytes_rejects_path_traversal_tenant_id() {
         let tmp = TempDir::new().unwrap();
@@ -952,13 +1134,16 @@ mod tests {
         let malicious_tenant_id = format!("../{}", victim_name);
         let result = install_snapshot_bytes(&manager, &malicious_tenant_id, &snapshot_bytes);
         assert!(result.is_err(), "path traversal tenant id must be rejected");
+        let (step, error_msg) = result.as_ref().err().expect("error tuple expected").clone();
+        assert_eq!(
+            step,
+            super::SnapshotInstallStep::ValidateTenantId,
+            "path traversal must fail at the validate_tenant_id step",
+        );
         assert!(
-            result
-                .as_ref()
-                .err()
-                .is_some_and(|error| error.contains("invalid tenant id")),
+            error_msg.contains("invalid tenant id"),
             "error should identify invalid tenant id, got: {:?}",
-            result
+            error_msg
         );
         assert!(
             marker.exists(),

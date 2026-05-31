@@ -9,7 +9,7 @@ members = [
 
 [package]
 name = "flapjack"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
 description = "Full-text search engine library with typo tolerance, faceting, and Algolia-compatible conventions"
 license = "MIT"

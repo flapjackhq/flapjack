@@ -7,11 +7,26 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-05-31
+
+### Fixed
+
+- Dashboard `DocumentCard` collapsed previews now apply deterministic remainder-field ordering before the six-field cutoff, preventing key fields such as `brand` from intermittently dropping behind lower-priority fields.
+- `flapjack-server` now accepts the standard `--version` flag (e.g. `docker run ghcr.io/flapjackhq/flapjack:<next> --version` prints the version). The flag was missing from the clap derive metadata; landed on `main` after the v1.0.3 tag was cut, so it ships in 1.0.4.
+- The Docker entrypoint now treats flag-only invocations (e.g. `--version`) as `flapjack` arguments instead of attempting to exec them as a binary. Same release window as above — landed on `main` after the v1.0.3 tag was cut.
+
+## [1.0.3] - 2026-05-30
+
 ### Changed (BREAKING)
 
 - The `vector-search-local` feature (local embedding via `fastembed` → `ort` → `tokenizers` → `hf-hub`) is no longer enabled by default for the `flapjack`, `flapjack-http`, and `flapjack-server` crates. Consumers that need local embedding must build with `--features vector-search-local` (or `--features vector-search` for usearch-only without local model inference). This brings the baseline `cargo build` / `cargo test` graph under the runner disk budget that previously exhausted CI; the heavy embedding chain remains exercised by the explicit `--features vector-search` CI jobs.
 
-## [1.0.3] - 2026-05-28
+### Fixed
+
+- HTTP delete endpoints now return a bounded retriable `503` on accepting-node restart instead of hanging the request indefinitely (completes the PL-13 ack-on-durable contract for the delete path). The new `delete_documents_durable` seam mirrors the add-path's bounded-durable semantics; delete callers in `flapjack-http`'s `objects/batch.rs`, `objects/mod.rs`, and `replicas.rs` are routed through it.
+- Task eviction (`evict_old_tasks` in the index manager) now skips non-terminal (`Enqueued`/`Processing`) tasks. Previously, an in-flight write under ≥1000 tasks/tenant overload could be evicted before the durable-ack poll observed its terminal status, producing a spurious `TaskNotFound`/`5xx` for a write that may still have committed. Eviction now waits for the task to reach a terminal state before reclaiming.
+
+## [1.0.2] - 2026-05-29
 
 ### Fixed
 
@@ -67,7 +82,9 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Stabilized core indexing and query execution paths for production usage.
 - Hardened transport and replication flows to reduce operational failure modes during distributed operation.
 
-[Unreleased]: https://github.com/griddlehq/flapjack/commits/main
+[Unreleased]: https://github.com/flapjackhq/flapjack/commits/main
+[1.0.4]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.4
 [1.0.3]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.3
-[1.0.1]: https://github.com/griddlehq/flapjack/releases/tag/v1.0.1
-[1.0.0]: https://github.com/griddlehq/flapjack/releases
+[1.0.2]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.2
+[1.0.1]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.1
+[1.0.0]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.0

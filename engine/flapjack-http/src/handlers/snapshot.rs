@@ -37,6 +37,31 @@ fn internal_error(prefix: &str, error: impl std::fmt::Display) -> Response {
     json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
 }
 
+/// Sanitized 500 response that preserves the standard `{message, status}` wire
+/// format and adds a stable, enum-bounded `sub_step` tag identifying which
+/// internal step of `install_snapshot_bytes` failed. The tag is non-PII (no
+/// path / tenant / error-string data) and exists so the failing branch is
+/// observable in test output and operator logs without leaking the underlying
+/// error prose. `message` MUST remain exactly `"Internal server error"` —
+/// downstream tests in `test_snapshot_import_failure_contract.rs` lock this
+/// leak-prevention contract.
+fn snapshot_install_error(
+    prefix: &str,
+    step: crate::startup_catchup::SnapshotInstallStep,
+    error: impl std::fmt::Display,
+) -> Response {
+    tracing::error!("{prefix} at step '{}': {error}", step.as_tag());
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(serde_json::json!({
+            "message": "Internal server error",
+            "status": StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+            "sub_step": step.as_tag(),
+        })),
+    )
+        .into_response()
+}
+
 fn should_retry_export_error(error: &FlapjackError) -> bool {
     matches!(error, FlapjackError::Io(_))
 }
@@ -182,7 +207,7 @@ pub async fn import_snapshot(
 ) -> Response {
     match crate::startup_catchup::install_snapshot_bytes(&state.manager, &index_name, &body) {
         Ok(()) => Json(serde_json::json!({ "status": "imported" })).into_response(),
-        Err(e) => internal_error("Import failed", e),
+        Err((step, error)) => snapshot_install_error("Import failed", step, error),
     }
 }
 
@@ -286,7 +311,7 @@ pub async fn restore_from_s3(
             "size_bytes": data_len,
         }))
         .into_response(),
-        Err(e) => internal_error("Restore failed", e),
+        Err((step, error)) => snapshot_install_error("Restore failed", step, error),
     }
 }
 

@@ -11,7 +11,7 @@ use flapjack_http::serve;
 /// flags including data directory, bind address, port, local-dev instance isolation,
 /// auto-port assignment, and authentication control.
 #[derive(Parser)]
-#[command(name = "flapjack")]
+#[command(name = "flapjack", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,

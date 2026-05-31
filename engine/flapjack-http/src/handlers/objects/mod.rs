@@ -3,7 +3,7 @@ mod batch;
 use axum::{
     extract::{Path, Query, State},
     response::IntoResponse,
-    Json,
+    Extension, Json,
 };
 use std::sync::Arc;
 
@@ -12,6 +12,7 @@ use super::replicas::{
     sync_add_documents_to_standard_replicas, sync_delete_documents_to_standard_replicas,
 };
 use super::AppState;
+use crate::auth::AuthenticatedAppId;
 use crate::dto::{
     AddDocumentsRequest, AddDocumentsResponse, BatchWriteResponse, DeleteByQueryRequest,
     DeleteObjectResponse, GetObjectsRequest, GetObjectsResponse, PartialUpdateObjectResponse,
@@ -281,19 +282,36 @@ pub(super) fn merge_partial_update(
 )]
 pub async fn add_documents(
     State(state): State<Arc<AppState>>,
+    Extension(AuthenticatedAppId(app_id)): Extension<AuthenticatedAppId>,
     Path(index_name): Path<String>,
     headers: axum::http::HeaderMap,
     Json(req): Json<serde_json::Value>,
 ) -> Result<axum::response::Response, FlapjackError> {
-    use crate::idempotency::{IdempotencyRecord, IDEMPOTENCY_HEADER};
+    use crate::idempotency::{IdempotencyRecord, BATCH_INDEX_WILDCARD, IDEMPOTENCY_HEADER};
+
+    let index_segment = if index_name == BATCH_INDEX_WILDCARD {
+        BATCH_INDEX_WILDCARD
+    } else {
+        index_name.as_str()
+    };
 
     let idem_key = headers
         .get(IDEMPOTENCY_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     if let Some(ref key) = idem_key {
-        if let Some(record) = state.idempotency_cache.lookup(key) {
-            return Ok(record.into_response());
+        match state
+            .idempotency_cache
+            .lookup_scoped(&app_id, index_segment, key)
+        {
+            Ok(Some(record)) => return Ok(record.into_response()),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::error!(error = %err, "idempotency cache lookup failed");
+                return Err(FlapjackError::Io(
+                    "idempotency persistence lookup failed".to_string(),
+                ));
+            }
         }
     }
 
@@ -310,10 +328,20 @@ pub async fn add_documents(
 
     if let Some(key) = idem_key {
         if let Ok(body_bytes) = serde_json::to_vec(&response) {
-            state.idempotency_cache.store(
-                key,
+            if let Err(err) = state.idempotency_cache.store_scoped(
+                &app_id,
+                index_segment,
+                &key,
                 IdempotencyRecord::json(axum::http::StatusCode::OK, body_bytes.into()),
-            );
+            ) {
+                tracing::error!(
+                    error = %err,
+                    app_id = %app_id,
+                    index_segment,
+                    idempotency_key = %key,
+                    "idempotency cache store failed after successful write; returning write response"
+                );
+            }
         }
     }
 
@@ -886,6 +914,7 @@ pub async fn delete_by_query(
 )]
 pub async fn add_record_auto_id(
     State(state): State<Arc<AppState>>,
+    Extension(AuthenticatedAppId(app_id)): Extension<AuthenticatedAppId>,
     Path(index_name): Path<String>,
     headers: axum::http::HeaderMap,
     Json(mut body): Json<serde_json::Map<String, serde_json::Value>>,
@@ -898,8 +927,18 @@ pub async fn add_record_auto_id(
         .map(str::to_string);
 
     if let Some(ref key) = idem_key {
-        if let Some(record) = state.idempotency_cache.lookup(key) {
-            return Ok(record.into_response());
+        match state
+            .idempotency_cache
+            .lookup_scoped(&app_id, &index_name, key)
+        {
+            Ok(Some(record)) => return Ok(record.into_response()),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::error!(error = %err, "idempotency cache lookup failed");
+                return Err(FlapjackError::Io(
+                    "idempotency persistence lookup failed".to_string(),
+                ));
+            }
         }
     }
 
@@ -953,9 +992,20 @@ pub async fn add_record_auto_id(
 
     if let Some(key) = idem_key {
         let body_bytes = serde_json::to_vec(&payload).unwrap_or_default();
-        state
-            .idempotency_cache
-            .store(key, IdempotencyRecord::json(status, body_bytes.into()));
+        if let Err(err) = state.idempotency_cache.store_scoped(
+            &app_id,
+            &index_name,
+            &key,
+            IdempotencyRecord::json(status, body_bytes.into()),
+        ) {
+            tracing::error!(
+                error = %err,
+                app_id = %app_id,
+                index_name = %index_name,
+                idempotency_key = %key,
+                "idempotency cache store failed after successful write; returning write response"
+            );
+        }
     }
 
     Ok((status, Json(payload)).into_response())
