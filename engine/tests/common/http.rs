@@ -1,5 +1,35 @@
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun01_am_2_ha_contracts_ci_stabilization/flapjack_dev/engine/tests/common/http.rs.
 use axum::extract::ConnectInfo;
 use std::net::SocketAddr;
+
+fn body_preview(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+fn parse_json_text_or_panic(
+    context: &str,
+    status: reqwest::StatusCode,
+    body_text: &str,
+) -> serde_json::Value {
+    serde_json::from_str(body_text).unwrap_or_else(|err| {
+        panic!(
+            "{context}; status {status}; body preview: {}; decode error: {err}",
+            body_preview(body_text, 500)
+        )
+    })
+}
+
+async fn parse_reqwest_response_json(
+    context: &str,
+    resp: reqwest::Response,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_else(|err| {
+        panic!("{context}; failed to read response body for status {status}: {err}")
+    });
+    let body = parse_json_text_or_panic(context, status, &body_text);
+    (status, body)
+}
 
 /// Poll the task endpoint until the task reaches "published" status.
 /// Use this instead of blind sleeps after batch/write operations.
@@ -21,8 +51,11 @@ pub async fn wait_for_task_authed(
                 .header("x-algolia-api-key", key)
                 .header("x-algolia-application-id", "test");
         }
-        let resp = req.send().await.unwrap();
-        let body: serde_json::Value = resp.json().await.unwrap();
+        let (_, body) = parse_reqwest_response_json(
+            "wait_for_task_authed expected JSON task payload",
+            req.send().await.unwrap(),
+        )
+        .await;
         match body["status"].as_str().unwrap_or("pending") {
             "published" => return,
             "error" => panic!(
@@ -50,8 +83,11 @@ pub async fn wait_for_response_task_authed(
     resp: reqwest::Response,
     api_key: Option<&str>,
 ) {
-    let status = resp.status();
-    let body: serde_json::Value = resp.json().await.unwrap();
+    let (status, body) = parse_reqwest_response_json(
+        "wait_for_response_task_authed expected JSON response body",
+        resp,
+    )
+    .await;
     assert!(
         status.is_success(),
         "Expected 2xx response but got {}: {}",
@@ -172,10 +208,17 @@ pub async fn send_empty_response(
 pub async fn parse_response_json(
     resp: axum::http::Response<axum::body::Body>,
 ) -> serde_json::Value {
+    let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), 10_000_000)
         .await
         .unwrap();
-    serde_json::from_slice(&bytes).unwrap()
+    serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+        let body_text = String::from_utf8_lossy(&bytes);
+        panic!(
+            "parse_response_json failed for HTTP status {status}; body preview: {}; decode error: {err}",
+            body_preview(&body_text, 500)
+        )
+    })
 }
 
 /// Extract taskID from a JSON response body.
@@ -312,14 +355,18 @@ pub async fn send_authed(
 
 #[cfg(test)]
 mod local_request_helper_tests {
-    use super::{parse_response_json, send_empty_response, send_json_response_with_headers};
+    use super::{
+        parse_response_json, send_empty_response, send_json_response_with_headers,
+        wait_for_response_task_authed, wait_for_task_authed,
+    };
     use axum::{
-        http::{HeaderMap, Method},
+        http::{HeaderMap, Method, StatusCode},
         response::Json,
         routing::{get, post},
         Router,
     };
     use serde_json::{json, Value};
+    use std::any::Any;
 
     fn run_local_request_test(test: impl std::future::Future<Output = ()>) {
         tokio::runtime::Builder::new_current_thread()
@@ -327,6 +374,30 @@ mod local_request_helper_tests {
             .build()
             .expect("local helper tests should create a runtime")
             .block_on(test);
+    }
+
+    fn panic_message(panic: Box<dyn Any + Send>) -> String {
+        if let Some(message) = panic.downcast_ref::<String>() {
+            return message.clone();
+        }
+        if let Some(message) = panic.downcast_ref::<&str>() {
+            return (*message).to_string();
+        }
+        "non-string panic payload".to_string()
+    }
+
+    fn assert_panic_contains(
+        expected_substrings: &[&str],
+        test: impl FnOnce() + std::panic::UnwindSafe,
+    ) {
+        let panic = std::panic::catch_unwind(test).expect_err("expected panic");
+        let message = panic_message(panic);
+        for expected in expected_substrings {
+            assert!(
+                message.contains(expected),
+                "expected panic message to contain {expected:?}, got {message:?}"
+            );
+        }
     }
 
     async fn inspect_request(headers: HeaderMap, body: String) -> Json<Value> {
@@ -378,5 +449,87 @@ mod local_request_helper_tests {
             assert_eq!(body["content_type"], Value::Null);
             assert_eq!(body["content_type_count"], json!(0));
         });
+    }
+
+    async fn spawn_plaintext_server(status: StatusCode, body: &'static str) -> String {
+        let app = Router::new().fallback(move || async move { (status, body) });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test server should expose local addr")
+            .to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+        addr
+    }
+
+    #[test]
+    fn parse_response_json_reports_status_and_body_on_non_json() {
+        assert_panic_contains(
+            &[
+                "parse_response_json failed for HTTP status 401 Unauthorized",
+                "body preview: auth failed as plain text",
+            ],
+            || {
+                run_local_request_test(async {
+                    let app = Router::new().route(
+                        "/plain",
+                        get(|| async { (StatusCode::UNAUTHORIZED, "auth failed as plain text") }),
+                    );
+
+                    let response = send_empty_response(&app, Method::GET, "/plain").await;
+                    let _ = parse_response_json(response).await;
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn wait_for_task_authed_reports_status_and_body_on_non_json() {
+        assert_panic_contains(
+            &[
+                "wait_for_task_authed expected JSON task payload; status 401 Unauthorized",
+                "body preview: auth failed as plain text",
+            ],
+            || {
+                run_local_request_test(async {
+                    let addr =
+                        spawn_plaintext_server(StatusCode::UNAUTHORIZED, "auth failed as plain text")
+                            .await;
+                    let client = reqwest::Client::new();
+                    wait_for_task_authed(&client, &addr, 1, None).await;
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn wait_for_response_task_authed_reports_status_and_body_on_non_json() {
+        assert_panic_contains(
+            &[
+                "wait_for_response_task_authed expected JSON response body; status 401 Unauthorized",
+                "body preview: auth failed as plain text",
+            ],
+            || {
+                run_local_request_test(async {
+                    let addr =
+                        spawn_plaintext_server(StatusCode::UNAUTHORIZED, "auth failed as plain text")
+                            .await;
+                    let client = reqwest::Client::new();
+                    let resp = client
+                        .post(format!("http://{addr}/1/indexes/test/batch"))
+                        .send()
+                        .await
+                        .expect("seed response should be returned");
+
+                    wait_for_response_task_authed(&client, &addr, resp, None).await;
+                });
+            },
+        );
     }
 }

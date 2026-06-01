@@ -1,4 +1,3 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/may31_eve_2_ha_snapshot_flake_verify/flapjack_dev/engine/flapjack-http/src/startup_catchup.rs.
 use crate::handlers::internal::apply_ops_to_manager;
 use crate::handlers::AppState;
 use flapjack::index::oplog::read_committed_seq;
@@ -426,6 +425,12 @@ fn rename_with_transient_retry(
     const SLEEP_MS: u64 = 10;
     let start = std::time::Instant::now();
     loop {
+        if let Err(error) = reject_symlinked_managed_path(from, "snapshot restore source") {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, error));
+        }
+        if let Err(error) = reject_symlinked_managed_path(to, "snapshot restore destination") {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, error));
+        }
         match std::fs::rename(from, to) {
             Ok(()) => return Ok(()),
             Err(error) => {
@@ -479,6 +484,9 @@ fn recover_interrupted_snapshot_restore(
     tenant_path: &std::path::Path,
     backup_path: &std::path::Path,
 ) -> Result<(), String> {
+    reject_symlinked_managed_path(tenant_path, "tenant")?;
+    reject_symlinked_managed_path(backup_path, "snapshot backup")?;
+
     if !backup_path.exists() {
         return Ok(());
     }
@@ -497,7 +505,27 @@ fn recover_interrupted_snapshot_restore(
     })
 }
 
+fn reject_symlinked_managed_path(path: &std::path::Path, path_role: &str) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "refusing symlinked {} path '{}'",
+            path_role,
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "stat {} path '{}' failed: {}",
+            path_role,
+            path.display(),
+            error
+        )),
+    }
+}
+
 fn remove_path_if_exists(path: &std::path::Path) -> Result<(), String> {
+    reject_symlinked_managed_path(path, "snapshot restore")?;
+
     if !path.exists() {
         return Ok(());
     }
@@ -527,6 +555,14 @@ fn read_local_ops_since(
     })
 }
 
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.
@@ -1156,6 +1192,89 @@ mod tests {
             std::fs::read_to_string(marker).unwrap(),
             "keep-me",
             "victim marker content must remain unchanged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn install_snapshot_bytes_rejects_symlinked_backup_path() {
+        let tmp = TempDir::new().unwrap();
+        let manager = flapjack::IndexManager::new(tmp.path());
+        let tenant_id = "tenant_safe";
+        let backup_path = manager
+            .base_path
+            .join(format!(".{tenant_id}.snapshot_restore_backup"));
+        let victim = TempDir::new().unwrap();
+        let marker = victim.path().join("marker.txt");
+        std::fs::write(&marker, "keep-me").unwrap();
+        std::os::unix::fs::symlink(victim.path(), &backup_path).unwrap();
+
+        let snapshot_src = TempDir::new().unwrap();
+        std::fs::write(snapshot_src.path().join("new.txt"), "new").unwrap();
+        let snapshot_bytes = export_to_bytes(snapshot_src.path()).unwrap();
+
+        let result = install_snapshot_bytes(&manager, tenant_id, &snapshot_bytes);
+        let (step, error_msg) = result.expect_err("symlinked backup path must be rejected");
+        assert_eq!(
+            step,
+            super::SnapshotInstallStep::RecoverInterrupted,
+            "backup symlink must fail during interrupted-restore recovery"
+        );
+        assert!(
+            error_msg.contains("symlink"),
+            "error should mention symlink rejection, got: {error_msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            "keep-me",
+            "rejecting backup symlink must not modify external directories"
+        );
+        assert!(
+            std::fs::symlink_metadata(&backup_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "rejected backup path should remain the original symlink for operator cleanup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn install_snapshot_bytes_rejects_symlinked_staging_path() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let manager = flapjack::IndexManager::new(tmp.path());
+        let outside = TempDir::new().unwrap();
+        let outside_marker = outside.path().join("marker.txt");
+        std::fs::write(&outside_marker, "keep-me").unwrap();
+
+        let tenant_id = "restore_target";
+        let staging_path = manager
+            .base_path
+            .join(format!(".{tenant_id}.snapshot_restore_staging"));
+        symlink(outside.path(), &staging_path).unwrap();
+
+        let result = install_snapshot_bytes(&manager, tenant_id, b"not-a-valid-snapshot");
+        assert!(result.is_err(), "symlinked staging path must be rejected");
+        let (step, error_msg) = result.as_ref().expect_err("error tuple expected");
+        assert_eq!(
+            *step,
+            super::SnapshotInstallStep::ValidateManagedPath,
+            "symlinked managed paths must fail before cleanup/import"
+        );
+        assert!(
+            error_msg.contains("symlink"),
+            "error should mention symlink rejection, got: {error_msg:?}"
+        );
+        assert!(
+            outside_marker.exists(),
+            "rejecting the symlinked staging path must not modify the symlink target"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside_marker).unwrap(),
+            "keep-me",
+            "symlink target content must remain unchanged"
         );
     }
 

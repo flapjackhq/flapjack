@@ -1,4 +1,3 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/may31_eve_2_ha_snapshot_flake_verify/flapjack_dev/engine/tests/common/state.rs.
 use axum::{
     middleware,
     routing::{delete, get, post},
@@ -73,6 +72,12 @@ impl TempDir {
     }
 
     fn attach_node(&mut self, node: TestNode) {
+        if let Some(mut old_node) = self.node.take() {
+            old_node.begin_shutdown();
+            if !old_node.wait_for_exit_blocking(SERVER_SHUTDOWN_TIMEOUT) {
+                old_node.handle.abort();
+            }
+        }
         self.node = Some(node);
     }
 }
@@ -119,7 +124,7 @@ fn apply_standard_test_http_layers(app: Router) -> Router {
     ))
 }
 
-fn apply_test_app_id_layer(app: Router) -> Router {
+pub fn apply_test_app_id_layer(app: Router) -> Router {
     app.layer(middleware::from_fn(
         |mut request: axum::extract::Request, next: middleware::Next| async move {
             if request

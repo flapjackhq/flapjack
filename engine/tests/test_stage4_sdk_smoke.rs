@@ -7,9 +7,8 @@ use axum::{
 use flapjack::{
     analytics::{schema::SearchEvent, AnalyticsCollector, AnalyticsConfig, AnalyticsQueryEngine},
     experiments::store::ExperimentStore,
-    IndexManager,
 };
-use flapjack_http::handlers::{self, AppState};
+use flapjack_http::handlers::{self};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -42,30 +41,15 @@ fn build_stage4_app(tmp: &TempDir) -> (Router, Arc<AnalyticsCollector>) {
     let collector = AnalyticsCollector::new(config.clone());
     let engine = Arc::new(AnalyticsQueryEngine::new(config));
 
-    let state = Arc::new(AppState {
-        manager: IndexManager::new(tmp.path()),
-        key_store: None,
-        replication_manager: None,
-        ssl_manager: None,
-        analytics_engine: Some(engine.clone()),
-        recommend_config: flapjack::recommend::RecommendConfig::default(),
-        experiment_store: Some(Arc::new(ExperimentStore::new(tmp.path()).unwrap())),
-        dictionary_manager: Arc::new(flapjack::dictionaries::manager::DictionaryManager::new(
-            tmp.path(),
-        )),
-        metrics_state: None,
-        usage_counters: Arc::new(dashmap::DashMap::new()),
-        paused_indexes: flapjack_http::pause_registry::PausedIndexes::new(),
-        usage_persistence: None,
-        geoip_reader: None,
-        notification_service: None,
-        start_time: std::time::Instant::now(),
-        conversation_store: flapjack_http::conversation_store::ConversationStore::default_shared(),
-        embedder_store: Arc::new(flapjack_http::embedder_store::EmbedderStore::new()),
-        idempotency_cache: Arc::new(flapjack_http::idempotency::IdempotencyCache::new(
-            std::time::Duration::from_secs(300),
-        )),
-    });
+    let state = common::make_test_app_state(
+        tmp.path(),
+        None,
+        None,
+        None,
+        Some(engine.clone()),
+        Some(Arc::new(ExperimentStore::new(tmp.path()).unwrap())),
+        None,
+    );
 
     let index_routes = Router::new()
         .route("/1/indexes", post(handlers::create_index))
@@ -130,12 +114,14 @@ fn build_stage4_app(tmp: &TempDir) -> (Router, Arc<AnalyticsCollector>) {
         });
 
     (
-        Router::new()
-            .merge(index_routes)
-            .merge(analytics_routes)
-            .merge(experiments_routes)
-            .merge(insights_routes)
-            .merge(gdpr_routes),
+        common::apply_test_app_id_layer(
+            Router::new()
+                .merge(index_routes)
+                .merge(analytics_routes)
+                .merge(experiments_routes)
+                .merge(insights_routes)
+                .merge(gdpr_routes),
+        ),
         collector,
     )
 }

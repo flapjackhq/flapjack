@@ -15,6 +15,17 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tempfile::tempdir;
 
+async fn assert_eventually_unreachable(client: &reqwest::Client, addr: &str) {
+    for _ in 0..20 {
+        if client.get(format!("http://{addr}/health")).send().await.is_err() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    panic!("server still accepted requests after expected shutdown");
+}
+
 async fn inspect_request(headers: HeaderMap, body: String) -> Json<Value> {
     Json(json!({
         "content_type": headers.get("content-type").and_then(|value| value.to_str().ok()),
@@ -51,18 +62,12 @@ fn uses_default_when_missing() {
 
 #[test]
 fn uses_default_when_invalid() {
-    assert_eq!(
-        common::fixtures::parse_usize_or_default(Some("bad"), 77),
-        77
-    );
+    assert_eq!(common::fixtures::parse_usize_or_default(Some("bad"), 77), 77);
 }
 
 #[test]
 fn parses_valid_usize() {
-    assert_eq!(
-        common::fixtures::parse_usize_or_default(Some("10000"), 1),
-        10_000
-    );
+    assert_eq!(common::fixtures::parse_usize_or_default(Some("10000"), 1), 10_000);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -150,17 +155,49 @@ async fn dropping_temp_dir_stops_attached_server() {
 
     drop(temp_dir);
 
-    for _ in 0..20 {
-        if client
-            .get(format!("http://{addr}/health"))
+    assert_eventually_unreachable(&client, &addr).await;
+}
+
+#[tokio::test]
+async fn reattaching_temp_dir_server_shuts_down_previous_node() {
+    let (first_app, mut temp_dir) = common::state::build_test_app_for_local_requests(None);
+    let first_addr = common::state::spawn_router(first_app, &mut temp_dir).await;
+    let client = reqwest::Client::new();
+
+    let ready_first = client
+        .get(format!("http://{first_addr}/health"))
+        .send()
+        .await
+        .expect("first server should answer before replacement");
+    assert!(ready_first.status().is_success());
+
+    let second_app = common::state::build_test_app_for_existing_data_dir(temp_dir.path(), None);
+    let second_addr = common::state::spawn_router(second_app, &mut temp_dir).await;
+    assert_ne!(first_addr, second_addr);
+
+    let ready_second = client
+        .get(format!("http://{second_addr}/health"))
+        .send()
+        .await
+        .expect("second server should answer after replacement");
+    assert!(ready_second.status().is_success());
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert!(
+        client
+            .get(format!("http://{first_addr}/health"))
             .send()
             .await
-            .is_err()
-        {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+            .is_err(),
+        "previously attached server should stop promptly after replacement"
+    );
+}
 
-    panic!("server still accepted requests after temp dir drop");
+#[test]
+fn local_request_helper_assertions_have_single_owner_boundary() {
+    let http_source = include_str!("common/http.rs");
+    assert!(
+        !http_source.contains("mod local_request_helper_tests"),
+        "engine/tests/common/http.rs must not own local-request helper assertions once test_common_helpers.rs is the canonical owner"
+    );
 }

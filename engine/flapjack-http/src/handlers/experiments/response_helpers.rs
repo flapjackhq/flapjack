@@ -1,4 +1,3 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/may31_eve_2_ha_snapshot_flake_verify/flapjack_dev/engine/flapjack-http/src/handlers/experiments/response_helpers.rs.
 use super::{
     dto_algolia, metrics, resolve::resolve_store_and_experiment_id, AppState, Experiment,
     ExperimentArm, ExperimentConclusion, ExperimentError, ExperimentStatus, ExperimentStore,
@@ -132,6 +131,14 @@ pub struct ConcludedExperimentResponse {
 /// The store contract says a concluded experiment should always carry a conclusion payload.
 /// If that invariant is broken, we return a sanitized 500 response instead of serializing
 /// an impossible shape to clients.
+/// TODO: Document concluded_experiment_response.
+/// TODO: Document concluded_experiment_response.
+/// TODO: Document concluded_experiment_response.
+/// TODO: Document concluded_experiment_response.
+/// TODO: Document concluded_experiment_response.
+/// TODO: Document concluded_experiment_response.
+/// TODO: Document concluded_experiment_response.
+/// TODO: Document concluded_experiment_response.
 /// TODO: Document concluded_experiment_response.
 /// TODO: Document concluded_experiment_response.
 /// TODO: Document concluded_experiment_response.
