@@ -1,0 +1,166 @@
+//! Shared-helper tests that should run once in their own binary.
+//!
+//! Keeping these out of owner binaries avoids duplicating helper-only coverage
+//! across unrelated integration suites like replication and snapshot restore.
+
+mod common;
+
+use axum::{
+    http::{HeaderMap, Method},
+    response::Json,
+    routing::{get, post},
+    Router,
+};
+use serde_json::{json, Value};
+use std::sync::Arc;
+use tempfile::tempdir;
+
+async fn inspect_request(headers: HeaderMap, body: String) -> Json<Value> {
+    Json(json!({
+        "content_type": headers.get("content-type").and_then(|value| value.to_str().ok()),
+        "content_type_count": headers.get_all("content-type").iter().count(),
+        "x_test": headers.get("x-test").and_then(|value| value.to_str().ok()),
+        "body": body,
+    }))
+}
+
+async fn inspect_empty_request(headers: HeaderMap) -> Json<Value> {
+    Json(json!({
+        "content_type": headers.get("content-type").and_then(|value| value.to_str().ok()),
+        "content_type_count": headers.get_all("content-type").iter().count(),
+    }))
+}
+
+#[test]
+fn published_task_shape_rejects_extra_fields() {
+    assert!(
+        common::assertions::published_task_shape_error(&json!({
+            "status": "published",
+            "pendingTask": false,
+            "taskID": 123
+        }))
+        .is_some(),
+        "published-task assertion must reject extra fields"
+    );
+}
+
+#[test]
+fn uses_default_when_missing() {
+    assert_eq!(common::fixtures::parse_usize_or_default(None, 123), 123);
+}
+
+#[test]
+fn uses_default_when_invalid() {
+    assert_eq!(
+        common::fixtures::parse_usize_or_default(Some("bad"), 77),
+        77
+    );
+}
+
+#[test]
+fn parses_valid_usize() {
+    assert_eq!(
+        common::fixtures::parse_usize_or_default(Some("10000"), 1),
+        10_000
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn send_json_response_with_headers_preserves_single_content_type_header() {
+    let app = Router::new().route("/inspect", post(inspect_request));
+
+    let response = common::http::send_json_response_with_headers(
+        &app,
+        Method::POST,
+        "/inspect",
+        Some(json!({"hello": "world"})),
+        &[("x-test", "1"), ("content-type", "application/custom+json")],
+    )
+    .await;
+
+    let body = common::http::parse_response_json(response).await;
+    assert_eq!(body["content_type"], json!("application/custom+json"));
+    assert_eq!(body["content_type_count"], json!(1));
+    assert_eq!(body["x_test"], json!("1"));
+    assert_eq!(body["body"], json!("{\"hello\":\"world\"}"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn send_empty_response_omits_content_type_header() {
+    let app = Router::new().route("/inspect", get(inspect_empty_request));
+
+    let response = common::http::send_empty_response(&app, Method::GET, "/inspect").await;
+
+    let body = common::http::parse_response_json(response).await;
+    assert_eq!(body["content_type"], Value::Null);
+    assert_eq!(body["content_type_count"], json!(0));
+}
+
+#[tokio::test]
+async fn make_test_app_state_wires_manager_dictionary_and_defaults() {
+    let tmp = tempdir().expect("tempdir");
+    let state = common::state::make_test_app_state(tmp.path(), None, None, None, None, None, None);
+
+    let manager_dm = state
+        .manager
+        .dictionary_manager()
+        .expect("manager dictionary should be wired");
+    assert!(Arc::ptr_eq(manager_dm, &state.dictionary_manager));
+    assert!(state.key_store.is_none());
+    assert!(state.replication_manager.is_none());
+    assert!(state.analytics_engine.is_none());
+    assert!(state.experiment_store.is_none());
+}
+
+#[tokio::test]
+async fn make_test_app_state_preserves_manager_override_and_rewires_dictionary() {
+    let tmp = tempdir().expect("tempdir");
+    let manager_override = Arc::new(flapjack::IndexManager::new(tmp.path()));
+
+    let state = common::state::make_test_app_state(
+        tmp.path(),
+        Some(Arc::clone(&manager_override)),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    assert!(Arc::ptr_eq(&state.manager, &manager_override));
+    let manager_dm = state
+        .manager
+        .dictionary_manager()
+        .expect("manager dictionary should be wired");
+    assert!(Arc::ptr_eq(manager_dm, &state.dictionary_manager));
+}
+
+#[tokio::test]
+async fn dropping_temp_dir_stops_attached_server() {
+    let (app, mut temp_dir) = common::state::build_test_app_for_local_requests(None);
+    let addr = common::state::spawn_router(app, &mut temp_dir).await;
+    let client = reqwest::Client::new();
+
+    let ready = client
+        .get(format!("http://{addr}/health"))
+        .send()
+        .await
+        .expect("server should answer before drop");
+    assert!(ready.status().is_success());
+
+    drop(temp_dir);
+
+    for _ in 0..20 {
+        if client
+            .get(format!("http://{addr}/health"))
+            .send()
+            .await
+            .is_err()
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    panic!("server still accepted requests after temp dir drop");
+}

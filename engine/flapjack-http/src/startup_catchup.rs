@@ -1,4 +1,4 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/may31_12pm_1_v104_release_cut/flapjack_dev/engine/flapjack-http/src/startup_catchup.rs.
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/may31_eve_2_ha_snapshot_flake_verify/flapjack_dev/engine/flapjack-http/src/startup_catchup.rs.
 use crate::handlers::internal::apply_ops_to_manager;
 use crate::handlers::AppState;
 use flapjack::index::oplog::read_committed_seq;
@@ -527,6 +527,9 @@ fn read_local_ops_since(
     })
 }
 
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.
@@ -1134,7 +1137,7 @@ mod tests {
         let malicious_tenant_id = format!("../{}", victim_name);
         let result = install_snapshot_bytes(&manager, &malicious_tenant_id, &snapshot_bytes);
         assert!(result.is_err(), "path traversal tenant id must be rejected");
-        let (step, error_msg) = result.as_ref().err().expect("error tuple expected").clone();
+        let (step, error_msg) = result.as_ref().expect_err("error tuple expected").clone();
         assert_eq!(
             step,
             super::SnapshotInstallStep::ValidateTenantId,

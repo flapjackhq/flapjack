@@ -22,6 +22,47 @@ import { TEST_INDEX } from '../helpers';
 
 const TEMP_INDEX = 'e2e-temp';
 
+// Keep this smoke case top-level so grep selectors avoid parent describe noise.
+// Playwright grep evaluates a composite title string (project + file + describe + test),
+// so anchored selectors must include that prefix rather than only the leaf test title.
+test('Search returns real results', async ({ page }) => {
+  await page.goto(`/index/${TEST_INDEX}`);
+
+  // Verify the index heading renders
+  await expect(page.getByText(TEST_INDEX).first()).toBeVisible();
+
+  // Search input should be visible
+  const searchInput = page.getByPlaceholder(/search documents/i);
+  await expect(searchInput).toBeVisible();
+
+  // Type "laptop" and press Enter
+  await searchInput.fill('laptop');
+  await searchInput.press('Enter');
+
+  // Verify results appear — seeded data includes products matching "laptop"
+  const resultsPanel = page.getByTestId('results-panel');
+  await expect(resultsPanel).toBeVisible({ timeout: 10000 });
+
+  // Verify at least one document card rendered with real data
+  const firstResultCard = resultsPanel.getByTestId('document-card').first();
+  await expect(firstResultCard).toBeVisible({ timeout: 10000 });
+
+  // Seeded rules pin p01 to the top for "laptop" queries.
+  // Only assert fields guaranteed by the collapsed card contract.
+  await expect(firstResultCard).toContainText('p01');
+  // Brand can be collapsed out of the preview rows; validate it via the raw JSON payload.
+  await firstResultCard.getByRole('button', { name: 'JSON' }).click();
+  await expect(firstResultCard).toContainText(/"brand"\s*:\s*"Apple"/);
+
+  // Verify the localized results summary contract is rendered.
+  // Count and label are separate nodes in ResultsPanel, so assert both directly.
+  const resultsCount = resultsPanel.getByTestId('results-count');
+  const resultsLabel = resultsPanel.getByTestId('results-label');
+  await expect(resultsCount).toHaveText(/^\d{1,3}(?:[,\u00a0\u202f]\d{3})*$/);
+  await expect(resultsLabel).toHaveText(/^results?$/i);
+  await expect(resultsPanel).toContainText(/\b\d{1,3}(?:[,\u00a0\u202f]\d{3})*\s+results?\b/i);
+});
+
 test.describe('Smoke Tests', () => {
   // ===========================================================================
   // SMOKE 1: Overview loads with real data
@@ -48,45 +89,6 @@ test.describe('Smoke Tests', () => {
     const indexesCard = page.getByTestId('stat-card-indexes');
     const indexCount = await indexesCard.getByTestId('stat-value').textContent();
     expect(Number(indexCount)).toBeGreaterThanOrEqual(1);
-  });
-
-  // ===========================================================================
-  // SMOKE 2: Search returns real results
-  // ===========================================================================
-  test('Search returns real results', async ({ page }) => {
-    await page.goto(`/index/${TEST_INDEX}`);
-
-    // Verify the index heading renders
-    await expect(page.getByText(TEST_INDEX).first()).toBeVisible();
-
-    // Search input should be visible
-    const searchInput = page.getByPlaceholder(/search documents/i);
-    await expect(searchInput).toBeVisible();
-
-    // Type "laptop" and press Enter
-    await searchInput.fill('laptop');
-    await searchInput.press('Enter');
-
-    // Verify results appear — seeded data includes products matching "laptop"
-    const resultsPanel = page.getByTestId('results-panel');
-    await expect(resultsPanel).toBeVisible({ timeout: 10000 });
-
-    // Verify at least one document card rendered with real data
-    const firstResultCard = resultsPanel.getByTestId('document-card').first();
-    await expect(firstResultCard).toBeVisible({ timeout: 10000 });
-
-    // Seeded rules pin p01 to the top for "laptop" queries.
-    // Assert seeded identity fields that are always rendered in the card payload.
-    await expect(firstResultCard).toContainText('p01');
-    await expect(firstResultCard).toContainText('brand:Apple');
-
-    // Verify the localized results summary contract is rendered.
-    // Count and label are separate nodes in ResultsPanel, so assert both directly.
-    const resultsCount = resultsPanel.getByTestId('results-count');
-    const resultsLabel = resultsPanel.getByTestId('results-label');
-    await expect(resultsCount).toHaveText(/^\d{1,3}(?:[,\u00a0\u202f]\d{3})*$/);
-    await expect(resultsLabel).toHaveText(/^results?$/i);
-    await expect(resultsPanel).toContainText(/\b\d{1,3}(?:[,\u00a0\u202f]\d{3})*\s+results?\b/i);
   });
 
   // ===========================================================================

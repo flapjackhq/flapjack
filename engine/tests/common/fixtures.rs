@@ -89,23 +89,3 @@ pub fn parse_usize_or_default(raw: Option<&str>, default: usize) -> usize {
 pub fn env_usize_or_default(var: &str, default: usize) -> usize {
     parse_usize_or_default(std::env::var(var).ok().as_deref(), default)
 }
-
-#[cfg(test)]
-mod env_parse_tests {
-    use super::parse_usize_or_default;
-
-    #[test]
-    fn uses_default_when_missing() {
-        assert_eq!(parse_usize_or_default(None, 123), 123);
-    }
-
-    #[test]
-    fn uses_default_when_invalid() {
-        assert_eq!(parse_usize_or_default(Some("bad"), 77), 77);
-    }
-
-    #[test]
-    fn parses_valid_usize() {
-        assert_eq!(parse_usize_or_default(Some("10000"), 1), 10_000);
-    }
-}

@@ -1,3 +1,4 @@
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/may31_eve_2_ha_snapshot_flake_verify/flapjack_dev/engine/tests/common/state.rs.
 use axum::{
     middleware,
     routing::{delete, get, post},
@@ -118,6 +119,27 @@ fn apply_standard_test_http_layers(app: Router) -> Router {
     ))
 }
 
+fn apply_test_app_id_layer(app: Router) -> Router {
+    app.layer(middleware::from_fn(
+        |mut request: axum::extract::Request, next: middleware::Next| async move {
+            if request
+                .extensions()
+                .get::<flapjack_http::auth::AuthenticatedAppId>()
+                .is_none()
+            {
+                let application_id = flapjack_http::auth::request_application_id(&request)
+                    .unwrap_or_else(|| {
+                        flapjack::dictionaries::DEFAULT_DICTIONARY_TENANT.to_string()
+                    });
+                request
+                    .extensions_mut()
+                    .insert(flapjack_http::auth::AuthenticatedAppId(application_id));
+            }
+            next.run(request).await
+        },
+    ))
+}
+
 fn analytics_config(data_dir: &Path, flush_size: usize) -> flapjack::analytics::AnalyticsConfig {
     flapjack::analytics::AnalyticsConfig {
         enabled: true,
@@ -227,7 +249,7 @@ async fn wait_for_health(addrs: &[&str], attempts: usize) {
     );
 }
 
-async fn spawn_router(app: Router, temp_dir: &mut TempDir) -> String {
+pub(crate) async fn spawn_router(app: Router, temp_dir: &mut TempDir) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let node = serve_with_shutdown(listener, app);
     let addr = node.addr.clone();
@@ -551,10 +573,12 @@ fn build_node_router(state: Arc<flapjack_http::handlers::AppState>) -> Router {
         .route("/1/tasks/:task_id", get(flapjack_http::handlers::get_task))
         .with_state(state);
 
-    Router::new()
-        .merge(public_health_routes)
-        .merge(internal)
-        .merge(docs)
+    apply_test_app_id_layer(
+        Router::new()
+            .merge(public_health_routes)
+            .merge(internal)
+            .merge(docs),
+    )
 }
 
 fn replication_manager_for_peers(
@@ -821,76 +845,31 @@ pub async fn try_spawn_replication_node_on_existing_dir_with_peers(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_test_app_for_local_requests, make_test_app_state, spawn_router};
-    use std::sync::Arc;
+    use super::{build_node_router, make_test_app_state};
+    use axum::http::{Method, StatusCode};
+    use flapjack::dictionaries::DEFAULT_DICTIONARY_TENANT;
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn make_test_app_state_wires_manager_dictionary_and_defaults() {
+    async fn build_node_router_injects_default_app_id_for_internal_ops_requests() {
         let tmp = tempdir().expect("tempdir");
         let state = make_test_app_state(tmp.path(), None, None, None, None, None, None);
+        let app = build_node_router(state);
 
-        let manager_dm = state
-            .manager
-            .dictionary_manager()
-            .expect("manager dictionary should be wired");
-        assert!(Arc::ptr_eq(manager_dm, &state.dictionary_manager));
-        assert!(state.key_store.is_none());
-        assert!(state.replication_manager.is_none());
-        assert!(state.analytics_engine.is_none());
-        assert!(state.experiment_store.is_none());
-    }
+        let response = crate::common::http::send_empty_response(
+            &app,
+            Method::GET,
+            &format!("/internal/ops?tenant_id={DEFAULT_DICTIONARY_TENANT}&since_seq=0"),
+        )
+        .await;
+        let status = response.status();
+        let body = crate::common::http::parse_response_json(response).await;
 
-    #[tokio::test]
-    async fn make_test_app_state_preserves_manager_override_and_rewires_dictionary() {
-        let tmp = tempdir().expect("tempdir");
-        let manager_override = Arc::new(flapjack::IndexManager::new(tmp.path()));
-
-        let state = make_test_app_state(
-            tmp.path(),
-            Some(Arc::clone(&manager_override)),
-            None,
-            None,
-            None,
-            None,
-            None,
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "default app-id layer should let internal ops reach the normal tenant-not-found path instead of a missing-extension 500: {body}"
         );
-
-        assert!(Arc::ptr_eq(&state.manager, &manager_override));
-        let manager_dm = state
-            .manager
-            .dictionary_manager()
-            .expect("manager dictionary should be wired");
-        assert!(Arc::ptr_eq(manager_dm, &state.dictionary_manager));
-    }
-
-    #[tokio::test]
-    async fn dropping_temp_dir_stops_attached_server() {
-        let (app, mut temp_dir) = build_test_app_for_local_requests(None);
-        let addr = spawn_router(app, &mut temp_dir).await;
-        let client = reqwest::Client::new();
-
-        let ready = client
-            .get(format!("http://{addr}/health"))
-            .send()
-            .await
-            .expect("server should answer before drop");
-        assert!(ready.status().is_success());
-
-        drop(temp_dir);
-
-        for _ in 0..20 {
-            if client
-                .get(format!("http://{addr}/health"))
-                .send()
-                .await
-                .is_err()
-            {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
-        panic!("server still accepted requests after temp dir drop");
+        assert_eq!(body["message"], "Tenant not found");
     }
 }

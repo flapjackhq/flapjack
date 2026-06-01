@@ -1,6 +1,6 @@
 # Highest Priority: Open-Source Launch Readiness
 
-**Updated: 2026-05-31 (v1.0.3 released; doc reframed as intent SSOT — active status now routes to `PRIORITIES.md` + `ROADMAP.md`; historical launch + post-launch content moved under Archive)**
+**Updated: 2026-05-31 (v1.0.4 released; doc reframed as intent SSOT — active status now routes to `PRIORITIES.md` + `ROADMAP.md`; historical launch + post-launch content moved under Archive)**
 
 ## Mission
 

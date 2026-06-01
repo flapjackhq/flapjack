@@ -255,6 +255,57 @@ describe('DocumentCard display preferences contract', () => {
     expect(screen.getByRole('button', { name: '+3 more fields' })).toBeInTheDocument();
   });
 
+  it('does not guarantee unmatched brand visibility in collapsed preview', () => {
+    render(
+      <DocumentCard
+        document={{
+          ...baseDocument,
+          warranty: '2 years',
+          seller: 'Flapjack Store',
+          condition: 'new',
+          material: 'aluminum',
+          _highlightResult: {
+            seller: { value: '<em>Flapjack Store</em>', matchLevel: 'full' },
+            warranty: { value: '2 years', matchLevel: 'none' },
+            condition: { value: 'new', matchLevel: 'none' },
+            material: { value: 'aluminum', matchLevel: 'none' },
+            brand: { value: 'Apple', matchLevel: 'none' },
+          },
+        }}
+        displayPreferences={{
+          titleAttribute: 'name',
+          subtitleAttribute: 'description',
+          imageAttribute: 'image_url',
+          tagAttributes: ['tags'],
+        }}
+        fieldOrder={[
+          'name',
+          'description',
+          'image_url',
+          'tags',
+          'inStock',
+          'seller',
+          'warranty',
+          'condition',
+          'material',
+          'category',
+          'price',
+          'rating',
+          'brand',
+        ]}
+      />
+    );
+
+    // Unmatched trailing fields are allowed to fall below collapsed preview cut-off.
+    expect(screen.getByText('inStock:')).toBeInTheDocument();
+    expect(screen.getByText('seller:')).toBeInTheDocument();
+    expect(screen.getByText('warranty:')).toBeInTheDocument();
+    expect(screen.getByText('condition:')).toBeInTheDocument();
+    expect(screen.getByText('material:')).toBeInTheDocument();
+    expect(screen.queryByText('brand:')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '+3 more fields' })).toBeInTheDocument();
+  });
+
   it('preserves existing affordances with configured headers', async () => {
     const user = userEvent.setup();
     const onDelete = vi.fn();

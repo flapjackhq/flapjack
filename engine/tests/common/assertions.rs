@@ -330,7 +330,7 @@ pub fn assert_error_envelope(body: &serde_json::Value, expected_status: u16) {
 
 /// Assert that a task-status response body has the Algolia-exact published shape:
 /// `{ "status": "published", "pendingTask": false }`.
-fn published_task_shape_error(body: &serde_json::Value) -> Option<String> {
+pub(crate) fn published_task_shape_error(body: &serde_json::Value) -> Option<String> {
     let object = body.as_object();
     let Some(object) = object else {
         return Some(format!(
@@ -423,23 +423,4 @@ pub async fn put_settings_and_wait(
     assert_write_task_envelope(&body, "updatedAt");
     wait_for_task_local_with_key(app, extract_task_id(&body), key).await;
     body
-}
-
-#[cfg(test)]
-mod tests {
-    use super::published_task_shape_error;
-    use serde_json::json;
-
-    #[test]
-    fn published_task_shape_rejects_extra_fields() {
-        assert!(
-            published_task_shape_error(&json!({
-                "status": "published",
-                "pendingTask": false,
-                "taskID": 123
-            }))
-            .is_some(),
-            "published-task assertion must reject extra fields"
-        );
-    }
 }

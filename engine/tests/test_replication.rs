@@ -209,6 +209,42 @@ async fn test_internal_tenants_no_auth_required() {
 }
 
 #[tokio::test]
+async fn test_internal_helper_router_write_path_injects_app_id_extension() {
+    let (addr, _tmp) = common::spawn_server_with_internal("node-a").await;
+    let client = reqwest::Client::new();
+
+    // Intentionally omit x-algolia-application-id to ensure the helper router
+    // still injects AuthenticatedAppId like the production router middleware.
+    let write_resp = client
+        .post(format!("http://{}/1/indexes/repl_idx/batch", addr))
+        .json(&serde_json::json!({
+            "requests": [{"action": "addObject", "body": {"_id": "doc1", "title": "Parity"}}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    common::wait_for_response_task(&client, &addr, write_resp).await;
+
+    let response = client
+        .post(format!("http://{}/1/indexes/repl_idx/query", addr))
+        .json(&serde_json::json!({"query": "Parity"}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert!(
+        status.is_success(),
+        "helper router write/query path should stay successful without explicit app-id header; got status={status}, body={body}"
+    );
+    assert_eq!(
+        body["nbHits"].as_u64().unwrap_or(0),
+        1,
+        "write issued through helper router should be visible in subsequent query"
+    );
+}
+
+#[tokio::test]
 async fn test_internal_tenant_isolation() {
     use axum::{
         body::Body,

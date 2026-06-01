@@ -14,6 +14,9 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Dashboard `DocumentCard` collapsed previews now apply deterministic remainder-field ordering before the six-field cutoff, preventing key fields such as `brand` from intermittently dropping behind lower-priority fields.
 - `flapjack-server` now accepts the standard `--version` flag (e.g. `docker run ghcr.io/flapjackhq/flapjack:<next> --version` prints the version). The flag was missing from the clap derive metadata; landed on `main` after the v1.0.3 tag was cut, so it ships in 1.0.4.
 - The Docker entrypoint now treats flag-only invocations (e.g. `--version`) as `flapjack` arguments instead of attempting to exec them as a binary. Same release window as above — landed on `main` after the v1.0.3 tag was cut.
+- Startup catch-up snapshot installs now expose stable `sub_step` tags for failing restore branches and harden the staging/activation rename path against transient filesystem races during snapshot remediation.
+- Node-local idempotency durability is now persisted at `${FLAPJACK_DATA_DIR}/_idempotency/cache.db`, with restart replay preserving single-execution semantics for repeated idempotency keys.
+- Write-queue batching is tuned via `FLAPJACK_WRITE_QUEUE_BATCH_SIZE` with a default commit threshold of `32`, so commit batching follows the canonical runtime seam instead of per-operation flush behavior.
 
 ## [1.0.3] - 2026-05-30
 

@@ -1,4 +1,3 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/may31_12pm_1_v104_release_cut/flapjack_dev/engine/flapjack-replication/src/manager.rs.
 use super::circuit_breaker::CircuitState;
 use super::config::NodeConfig;
 use super::peer::PeerClient;
@@ -295,6 +294,34 @@ impl ReplicationManager {
             .await
     }
 
+    fn validate_catch_up_response(
+        peer_id: &str,
+        requested_tenant_id: &str,
+        response: &GetOpsResponse,
+    ) -> Result<(), String> {
+        if response.tenant_id != requested_tenant_id {
+            return Err(format!(
+                "peer {} returned catch-up payload for tenant '{}' while '{}' was requested",
+                peer_id, response.tenant_id, requested_tenant_id
+            ));
+        }
+        if let Some(foreign_op) = response
+            .ops
+            .iter()
+            .find(|op| op.tenant_id != requested_tenant_id)
+        {
+            return Err(format!(
+                "peer {} returned op seq {} for tenant '{}' while '{}' was requested",
+                peer_id, foreign_op.seq, foreign_op.tenant_id, requested_tenant_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
     /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
     /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
     /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
@@ -357,6 +384,21 @@ impl ReplicationManager {
 
             match peer.get_ops(query.clone()).await {
                 Ok(resp) => {
+                    if let Err(error) =
+                        Self::validate_catch_up_response(peer.peer_id(), tenant_id, &resp)
+                    {
+                        if require_all_peers {
+                            return Err(error);
+                        }
+                        tracing::warn!(
+                            "[REPL {}] invalid catch-up response from peer {}: {}",
+                            tenant_id,
+                            peer.peer_id(),
+                            error
+                        );
+                        last_error = error;
+                        continue;
+                    }
                     any_success = true;
                     merged_current_seq = merged_current_seq.max(resp.current_seq);
                     merged_oldest_retained_seq =
@@ -964,6 +1006,126 @@ mod tests {
         assert!(
             error.contains("peer node-c failed catch-up"),
             "strict failure should identify the unreachable peer, got: {}",
+            error
+        );
+    }
+
+    /// Peer responses must match the requested tenant exactly. A foreign tenant
+    /// payload must be rejected instead of being merged into the requested
+    /// tenant's catch-up batch.
+    #[tokio::test]
+    async fn test_catch_up_from_peer_skips_peer_returning_foreign_tenant_ops() {
+        let good_peer_response = GetOpsResponse {
+            tenant_id: "tenant-red".to_string(),
+            ops: vec![OpLogEntry {
+                seq: 1,
+                timestamp_ms: 100,
+                node_id: "node-a".to_string(),
+                tenant_id: "tenant-red".to_string(),
+                op_type: "upsert".to_string(),
+                payload: serde_json::json!({"objectID": "a1", "body": {"_id": "a1", "title": "A"}}),
+            }],
+            current_seq: 1,
+            oldest_retained_seq: Some(1),
+            node_current_seqs: BTreeMap::from([(String::from("node-a"), 1)]),
+        };
+        let foreign_peer_response = GetOpsResponse {
+            tenant_id: "tenant-red".to_string(),
+            ops: vec![OpLogEntry {
+                seq: 9,
+                timestamp_ms: 200,
+                node_id: "node-b".to_string(),
+                tenant_id: "tenant-blue".to_string(),
+                op_type: "upsert".to_string(),
+                payload: serde_json::json!({"objectID": "b9", "body": {"_id": "b9", "title": "B"}}),
+            }],
+            current_seq: 9,
+            oldest_retained_seq: Some(9),
+            node_current_seqs: BTreeMap::from([(String::from("node-b"), 9)]),
+        };
+
+        let (good_peer_url, good_peer_handle) =
+            spawn_single_response_peer(good_peer_response).await;
+        let (foreign_peer_url, foreign_peer_handle) =
+            spawn_single_response_peer(foreign_peer_response).await;
+
+        let manager = ReplicationManager::new(
+            NodeConfig {
+                node_id: "node-c".to_string(),
+                bind_addr: "127.0.0.1:0".to_string(),
+                peers: vec![
+                    PeerConfig {
+                        node_id: "node-a".to_string(),
+                        addr: good_peer_url,
+                    },
+                    PeerConfig {
+                        node_id: "node-b".to_string(),
+                        addr: foreign_peer_url,
+                    },
+                ],
+            },
+            None,
+        );
+
+        let merged = manager
+            .catch_up_from_peer_with_metadata("tenant-red", 0)
+            .await
+            .expect("the valid peer response should still succeed");
+
+        let _ = good_peer_handle.await;
+        let _ = foreign_peer_handle.await;
+
+        assert_eq!(merged.ops.len(), 1);
+        assert_eq!(merged.ops[0].tenant_id, "tenant-red");
+        assert_eq!(merged.ops[0].node_id, "node-a");
+        assert_eq!(merged.node_current_seqs.get("node-a"), Some(&1));
+        assert!(
+            !merged.node_current_seqs.contains_key("node-b"),
+            "foreign-tenant peer metadata must not be merged"
+        );
+    }
+
+    /// Strict catch-up must fail closed when a peer answers the request with the
+    /// wrong tenant altogether.
+    #[tokio::test]
+    async fn test_catch_up_from_peer_with_metadata_strict_rejects_wrong_tenant_response() {
+        let wrong_tenant_response = GetOpsResponse {
+            tenant_id: "tenant-blue".to_string(),
+            ops: vec![OpLogEntry {
+                seq: 1,
+                timestamp_ms: 100,
+                node_id: "node-a".to_string(),
+                tenant_id: "tenant-blue".to_string(),
+                op_type: "upsert".to_string(),
+                payload: serde_json::json!({"objectID": "b1", "body": {"_id": "b1", "title": "B"}}),
+            }],
+            current_seq: 1,
+            oldest_retained_seq: Some(1),
+            node_current_seqs: BTreeMap::from([(String::from("node-a"), 1)]),
+        };
+
+        let (peer_url, peer_handle) = spawn_single_response_peer(wrong_tenant_response).await;
+        let manager = ReplicationManager::new(
+            NodeConfig {
+                node_id: "node-c".to_string(),
+                bind_addr: "127.0.0.1:0".to_string(),
+                peers: vec![PeerConfig {
+                    node_id: "node-a".to_string(),
+                    addr: peer_url,
+                }],
+            },
+            None,
+        );
+
+        let error = manager
+            .catch_up_from_peer_with_metadata_strict("tenant-red", 0)
+            .await
+            .expect_err("strict catch-up must reject a peer response for a different tenant");
+        let _ = peer_handle.await;
+
+        assert!(
+            error.contains("tenant-blue") && error.contains("tenant-red"),
+            "strict failure should identify both the returned and requested tenant, got: {}",
             error
         );
     }
