@@ -300,6 +300,7 @@ async fn restore_tenant_from_snapshot(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SnapshotInstallStep {
     ValidateTenantId,
+    ValidateManagedPath,
     CleanStaging,
     RecoverInterrupted,
     ImportExtract,
@@ -311,6 +312,7 @@ impl SnapshotInstallStep {
     pub(crate) fn as_tag(self) -> &'static str {
         match self {
             SnapshotInstallStep::ValidateTenantId => "validate_tenant_id",
+            SnapshotInstallStep::ValidateManagedPath => "validate_managed_path",
             SnapshotInstallStep::CleanStaging => "clean_staging",
             SnapshotInstallStep::RecoverInterrupted => "recover_interrupted",
             SnapshotInstallStep::ImportExtract => "import_extract",
@@ -347,6 +349,9 @@ pub(crate) fn install_snapshot_bytes(
     let backup_path = manager
         .base_path
         .join(format!(".{tenant_id}.snapshot_restore_backup"));
+
+    reject_symlinked_managed_path(&staging_path, "snapshot restore staging")
+        .map_err(|error| (SnapshotInstallStep::ValidateManagedPath, error))?;
 
     remove_path_if_exists(&staging_path)
         .map_err(|error| (SnapshotInstallStep::CleanStaging, error))?;
