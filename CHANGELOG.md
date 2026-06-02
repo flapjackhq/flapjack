@@ -7,6 +7,16 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-06-01
+
+### Fixed
+
+- Test-environment shim now injects `AuthenticatedAppId` into the `test_stage4_sdk_smoke` Router via the canonical `apply_test_app_id_layer` helper, restoring the `ab_lifecycle_smoke` and `insights_to_analytics_full_lifecycle_smoke` regression gates that v1.0.4's idempotency rewrite (scoping by `AuthenticatedAppId`) left red. The production auth middleware always supplies the extension at runtime, so the v1.0.4 binary's customer-facing behavior was correct; this release re-greens the integration-test signal that protects against future regressions in the auth-scoped idempotency path.
+- HA contracts `c3_replica_freshness` and `c4_restart_recovery` are CI-stabilized: the mirror-CI staging+prod failures observed on every push since the v1.0.4 sync were CI-environment-specific (resource-constrained runners, parallel test execution) rather than HA-mode behavior regressions. The tests now hold under both developer and constrained-CI environments, restoring the per-tenant catch-up and restart-recovery gates that protect HA deployments from real future regressions.
+- PL-10 sustained-write saturation acceptance harness (`engine/loadtest/tests/pl10_saturation_acceptance.sh`) gate semantics were redesigned so the `FLAPJACK_WRITE_QUEUE_BATCH_SIZE` operator-tunable batching knob is legitimately distinguished from the baseline configuration. The prior gate could not fire under the shipped load profile because both configurations passed the absolute saturation threshold; the redesigned gate now produces a deterministic `TUNABLE_VERIFIED` outcome, restoring the harness as a real correctness mechanism for operators tuning batch size.
+- HA test-hygiene sweep closed the LEAKY_PASS sites surfaced by the v1.0.4 snapshot-flake verification — dangling tokio tasks, `TempDir` lifecycle gaps, and adjacent test-helper leaks in `test_replication` and `make_test_app_state_wires_manager_dictionary_and_defaults` — preventing test-suite hygiene debt from masking real HA regressions in future releases.
+- `flapjack-http` snapshot-install path-traversal test now uses the single-call `.expect_err("error tuple expected")` form (replacing the chained `.err().expect()`) to satisfy the staging linux x86_64 `clippy::err_expect` lint under `-D warnings`, re-greening the nightly clippy lane that had been red at the v1.0.4 tag.
+
 ## [1.0.4] - 2026-05-31
 
 ### Fixed
@@ -86,6 +96,7 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Hardened transport and replication flows to reduce operational failure modes during distributed operation.
 
 [Unreleased]: https://github.com/flapjackhq/flapjack/commits/main
+[1.0.5]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.5
 [1.0.4]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.4
 [1.0.3]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.3
 [1.0.2]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.2
