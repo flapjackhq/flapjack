@@ -17,7 +17,12 @@ use tempfile::tempdir;
 
 async fn assert_eventually_unreachable(client: &reqwest::Client, addr: &str) {
     for _ in 0..20 {
-        if client.get(format!("http://{addr}/health")).send().await.is_err() {
+        if client
+            .get(format!("http://{addr}/health"))
+            .send()
+            .await
+            .is_err()
+        {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -62,12 +67,18 @@ fn uses_default_when_missing() {
 
 #[test]
 fn uses_default_when_invalid() {
-    assert_eq!(common::fixtures::parse_usize_or_default(Some("bad"), 77), 77);
+    assert_eq!(
+        common::fixtures::parse_usize_or_default(Some("bad"), 77),
+        77
+    );
 }
 
 #[test]
 fn parses_valid_usize() {
-    assert_eq!(common::fixtures::parse_usize_or_default(Some("10000"), 1), 10_000);
+    assert_eq!(
+        common::fixtures::parse_usize_or_default(Some("10000"), 1),
+        10_000
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -199,5 +210,128 @@ fn local_request_helper_assertions_have_single_owner_boundary() {
     assert!(
         !http_source.contains("mod local_request_helper_tests"),
         "engine/tests/common/http.rs must not own local-request helper assertions once test_common_helpers.rs is the canonical owner"
+    );
+}
+
+fn run_local_request_test(test: impl std::future::Future<Output = ()>) {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("local helper tests should create a runtime")
+        .block_on(test);
+}
+
+fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<String>() {
+        return message.clone();
+    }
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    "non-string panic payload".to_string()
+}
+
+fn assert_panic_contains(
+    expected_substrings: &[&str],
+    test: impl FnOnce() + std::panic::UnwindSafe,
+) {
+    let panic = std::panic::catch_unwind(test).expect_err("expected panic");
+    let message = panic_message(panic);
+    for expected in expected_substrings {
+        assert!(
+            message.contains(expected),
+            "expected panic message to contain {expected:?}, got {message:?}"
+        );
+    }
+}
+
+async fn spawn_plaintext_server(status: axum::http::StatusCode, body: &'static str) -> String {
+    let app = Router::new().fallback(move || async move { (status, body) });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test server should bind");
+    let addr = listener
+        .local_addr()
+        .expect("test server should expose local addr")
+        .to_string();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("test server should run");
+    });
+    addr
+}
+
+#[test]
+fn parse_response_json_reports_status_and_body_on_non_json() {
+    assert_panic_contains(
+        &[
+            "parse_response_json failed for HTTP status 401 Unauthorized",
+            "body preview: auth failed as plain text",
+        ],
+        || {
+            run_local_request_test(async {
+                let app = Router::new().route(
+                    "/plain",
+                    get(|| async {
+                        (
+                            axum::http::StatusCode::UNAUTHORIZED,
+                            "auth failed as plain text",
+                        )
+                    }),
+                );
+
+                let response = common::http::send_empty_response(&app, Method::GET, "/plain").await;
+                let _ = common::http::parse_response_json(response).await;
+            });
+        },
+    );
+}
+
+#[test]
+fn wait_for_task_authed_reports_status_and_body_on_non_json() {
+    assert_panic_contains(
+        &[
+            "wait_for_task_authed expected JSON task payload; status 401 Unauthorized",
+            "body preview: auth failed as plain text",
+        ],
+        || {
+            run_local_request_test(async {
+                let addr = spawn_plaintext_server(
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    "auth failed as plain text",
+                )
+                .await;
+                let client = reqwest::Client::new();
+                common::http::wait_for_task_authed(&client, &addr, 1, None).await;
+            });
+        },
+    );
+}
+
+#[test]
+fn wait_for_response_task_authed_reports_status_and_body_on_non_json() {
+    assert_panic_contains(
+        &[
+            "wait_for_response_task_authed expected JSON response body; status 401 Unauthorized",
+            "body preview: auth failed as plain text",
+        ],
+        || {
+            run_local_request_test(async {
+                let addr = spawn_plaintext_server(
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    "auth failed as plain text",
+                )
+                .await;
+                let client = reqwest::Client::new();
+                let resp = client
+                    .post(format!("http://{addr}/1/indexes/test/batch"))
+                    .send()
+                    .await
+                    .expect("seed response should be returned");
+
+                common::http::wait_for_response_task_authed(&client, &addr, resp, None).await;
+            });
+        },
     );
 }
