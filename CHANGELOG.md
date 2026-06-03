@@ -7,6 +7,14 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.6] - 2026-06-03
+
+### Fixed
+
+- Nightly SDK e2e jobs now wait for full readiness (`/health/ready`) in addition to liveness (`/health`) before exercising the server, eliminating the C# `InitializeAsync` flake whose root cause was that `engine/tests/common/wait_for_flapjack.sh` polls liveness only and the gap to readiness could exceed the C# SDK's 2s `ConnectTimeout`. A readiness curl is now appended after every `wait_for_flapjack.sh` invocation in `.github/workflows/nightly.yml` (dashboard-all, sdk-php-all, sdk-python-all, sdk-go-e2e, sdk-ruby-all, sdk-java-all, sdk-csharp-all), and the C# SDK's default `ConnectTimeout` was raised from `2000ms` to `5000ms` to provide a defense-in-depth margin for cold-start TCP accept jitter.
+- Concurrent admin-key rotations are now serialized with a per-store mutex, preventing a race where two simultaneous `/1/keys/rotate` requests could leave the on-disk `.admin_key` file and in-memory key value inconsistent. The file-first/memory-second write ordering is preserved; the mutex only gates entry to `rotate_admin_key()`.
+- Snapshot export and import filesystem walks now run on a blocking thread via `tokio::task::spawn_blocking` (`engine/flapjack-http/src/handlers/snapshot.rs`), preventing tokio worker starvation under concurrent multi-tenant write load that produced an intermittent restore document-count mismatch in the `snapshot_export_under_load` CI gate.
+
 ## [1.0.5] - 2026-06-01
 
 ### Fixed
@@ -96,6 +104,7 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Hardened transport and replication flows to reduce operational failure modes during distributed operation.
 
 [Unreleased]: https://github.com/flapjackhq/flapjack/commits/main
+[1.0.6]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.6
 [1.0.5]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.5
 [1.0.4]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.4
 [1.0.3]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.3

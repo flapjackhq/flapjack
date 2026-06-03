@@ -1,7 +1,8 @@
 # 🥞 Flapjack
 
-**→ [Project Roadmap](ROADMAP.md)**
+<!-- markdownlint-disable-file MD004 MD013 MD033 MD034 MD040 MD045 MD060 -->
 
+**→ [Project Roadmap](ROADMAP.md)**
 
 [![CI](https://github.com/flapjackhq/flapjack/actions/workflows/ci.yml/badge.svg)](https://github.com/flapjackhq/flapjack/actions/workflows/ci.yml)
 [![Release](https://github.com/flapjackhq/flapjack/actions/workflows/release.yml/badge.svg)](https://github.com/flapjackhq/flapjack/releases)
@@ -170,6 +171,14 @@ InstantSearch.js widgets work as-is — `SearchBox`, `Hits`, `RefinementList`, `
 | Federated search | Weighted multi-index queries with RRF merge |
 
 Algolia-compatible REST API under `/1/` — works with InstantSearch.js v5, the algoliasearch client, and [Laravel Scout](integrations/laravel-scout/).
+
+---
+
+## Known limitations
+
+- Multi-node writes still serialize through the single-writer `Arc<Mutex<ManagedIndexWriter>>` seam, so write throughput does not scale linearly across nodes.
+- Idempotency replay is restart-durable, but the cache is still node-local; cross-node failover dedup remains deferred to v1.1.
+- German `Schulbus` still does not decompound because `Schule` loses its final `-e` combining form and the current algorithm only strips Fugenlaute.
 
 ---
 

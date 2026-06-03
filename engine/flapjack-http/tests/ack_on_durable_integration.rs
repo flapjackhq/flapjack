@@ -1,4 +1,4 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/may31_12pm_4_idempotency_cache_durability/flapjack_dev/engine/flapjack-http/tests/ack_on_durable_integration.rs.
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun02_pm_1_admin_key_rotation_race_fix/flapjack_dev/engine/flapjack-http/tests/ack_on_durable_integration.rs.
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +30,7 @@ use tokio::time::{sleep, Instant};
 // WRITE_QUEUE_CHANNEL_CAPACITY as 2_000 at HEAD, but that constant is private
 // to the crate and inaccessible from integration tests.
 const WRITE_QUEUE_CHANNEL_CAPACITY: usize = 2_000;
+const DEFAULT_WRITE_DURABLE_TIMEOUT_MS_FOR_TEST: u64 = 30_000;
 static DURABLE_TIMEOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn make_state(tmp: &TempDir) -> Arc<AppState> {
@@ -236,6 +237,14 @@ fn set_durable_timeout_env_for_test(timeout_ms: u64) -> DurableTimeoutEnvOverrid
     }
 }
 
+fn set_default_durable_timeout_env_for_test() -> DurableTimeoutEnvOverrideGuard {
+    // Rust integration tests share one process environment while the harness runs
+    // tests concurrently. Tests that assert normal 200 durability must hold the
+    // same lock as timeout-injection tests so they never inherit a sibling's
+    // intentionally tiny `FLAPJACK_WRITE_DURABLE_TIMEOUT_MS`.
+    set_durable_timeout_env_for_test(DEFAULT_WRITE_DURABLE_TIMEOUT_MS_FOR_TEST)
+}
+
 #[test]
 fn test_durable_timeout_env_override_requires_isolation() {
     let (lock_held_tx, lock_held_rx) = std::sync::mpsc::channel();
@@ -248,7 +257,7 @@ fn test_durable_timeout_env_override_requires_isolation() {
     });
 
     lock_held_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(30))
         .expect("worker should acquire lock before main-thread assertion");
     let started = std::time::Instant::now();
     let _main_override = set_durable_timeout_env_for_test(222);
@@ -294,6 +303,7 @@ fn set_tenant_permissions_writable(base: &std::path::Path, tenant: &str) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_http_200_implies_tantivy_durable() {
+    let _durable_timeout_override = set_default_durable_timeout_env_for_test();
     let tmp = TempDir::new().expect("tempdir should create");
     let state = make_state(&tmp);
     let manager = Arc::clone(&state.manager);
@@ -390,6 +400,7 @@ async fn test_queue_full_returns_429_retry_after() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_commit_failure_returns_5xx() {
+    let _durable_timeout_override = set_default_durable_timeout_env_for_test();
     let tmp = TempDir::new().expect("tempdir should create");
     let state = make_state(&tmp);
     let tenant = "commit_fail_red";
@@ -541,6 +552,7 @@ async fn test_delete_object_restart_returns_bounded_503() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_delete_object_replica_durable_failure_preserves_task_id() {
+    let _durable_timeout_override = set_default_durable_timeout_env_for_test();
     let tmp = TempDir::new().expect("tempdir should create");
     let state = make_state(&tmp);
     let manager = Arc::clone(&state.manager);
@@ -594,6 +606,7 @@ async fn test_delete_object_replica_durable_failure_preserves_task_id() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_delete_object_replica_queue_full_preserves_task_id_and_retry_after() {
+    let _durable_timeout_override = set_default_durable_timeout_env_for_test();
     let tmp = TempDir::new().expect("tempdir should create");
     let state = make_state(&tmp);
     let manager = Arc::clone(&state.manager);

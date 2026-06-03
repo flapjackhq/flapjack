@@ -168,8 +168,16 @@ pub async fn export_snapshot(
         Err(response) => return *response,
     };
 
-    match export_with_retry(|| export_to_bytes(&index_path)) {
-        Ok(bytes) => {
+    // Synchronous gzip+tar I/O is moved off the tokio worker pool so it
+    // cannot starve sibling async tasks (health checks, task polling) on
+    // CPU-constrained runners. Stage 1 RCA:
+    // engine/docs/research/jun02_snapshot_flake_stage1.md (defect 1).
+    let export_result =
+        tokio::task::spawn_blocking(move || export_with_retry(|| export_to_bytes(&index_path)))
+            .await;
+
+    match export_result {
+        Ok(Ok(bytes)) => {
             let headers = [
                 ("Content-Type", "application/gzip"),
                 (
@@ -179,7 +187,8 @@ pub async fn export_snapshot(
             ];
             (headers, bytes).into_response()
         }
-        Err(e) => internal_error("Export failed", e),
+        Ok(Err(e)) => internal_error("Export failed", e),
+        Err(join_error) => internal_error("Export failed (join)", join_error),
     }
 }
 
@@ -205,9 +214,24 @@ pub async fn import_snapshot(
     ValidatedIndexName(index_name): ValidatedIndexName,
     body: Bytes,
 ) -> Response {
-    match crate::startup_catchup::install_snapshot_bytes(&state.manager, &index_name, &body) {
-        Ok(()) => Json(serde_json::json!({ "status": "imported" })).into_response(),
-        Err((step, error)) => snapshot_install_error("Import failed", step, error),
+    // Synchronous gzip+tar decode and directory-rename plumbing is moved
+    // off the tokio worker pool so it cannot starve sibling async tasks
+    // (health checks, task polling) on CPU-constrained runners. Stage 1
+    // RCA: engine/docs/research/jun02_snapshot_flake_stage1.md (defect 1).
+    let manager = state.manager.clone();
+    let install_result = tokio::task::spawn_blocking(move || {
+        crate::startup_catchup::install_snapshot_bytes(&manager, &index_name, &body)
+    })
+    .await;
+
+    match install_result {
+        Ok(Ok(())) => Json(serde_json::json!({ "status": "imported" })).into_response(),
+        Ok(Err((step, error))) => snapshot_install_error("Import failed", step, error),
+        Err(join_error) => snapshot_install_error(
+            "Import failed",
+            crate::startup_catchup::SnapshotInstallStep::ImportExtract,
+            join_error,
+        ),
     }
 }
 

@@ -234,7 +234,7 @@ fn addr_not_available_detection_matches_known_os_signatures() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "slow test (30s tcp-keepalive idle wait) - run manually with cargo test -p flapjack --test test_connection_hardening -- --ignored"]
 async fn test_keepalive_reuse_after_30s_idle() {
     let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
     seed_documents(&app, "conn-hard-idle", 10).await;

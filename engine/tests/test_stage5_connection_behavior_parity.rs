@@ -304,7 +304,7 @@ async fn concurrent_20_requests_all_succeed() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "slow test (30s tcp-keepalive idle wait) - run manually with cargo test -p flapjack --test test_stage5_connection_behavior_parity -- --ignored"]
 async fn connection_reuse_after_30s_idle_slow() {
     let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
     seed_documents(&app, "stage5e-idle-test").await;

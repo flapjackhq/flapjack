@@ -20,7 +20,7 @@ internal static class Defaults
   /// <summary>
   /// Connect timeout
   /// </summary>
-  public static TimeSpan ConnectTimeout = TimeSpan.FromSeconds(2);
+  public static TimeSpan ConnectTimeout = TimeSpan.FromSeconds(5);
 
   public const string AcceptHeader = "Accept";
   public const string FlapjackApplicationHeader = "X-Algolia-Application-Id";

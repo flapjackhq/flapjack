@@ -332,27 +332,10 @@ fn reset_admin_key_offline_refusal_preserves_previous_key_after_restart() {
     );
 }
 
-// DEFERRED to next stage (bug: admin-key-rotate-concurrency-desync).
-//
-// This test asserts the real operator contract — the key persisted to
-// `.admin_key` after concurrent rotations must authorize requests (200, not
-// 403). It currently exposes a genuine production race in
-// `flapjack-http/src/auth/key_store.rs::rotate_admin_key`: the `.admin_key`
-// file write (unlocked) and the in-memory `admin_key_value`/keys.json update
-// (locked) are two independent critical sections, so two concurrent rotations
-// A and B can finish with the file holding key B while in-memory state holds
-// key A. A request using the persisted file key then 403s.
-//
-// Because the desync depends on thread interleaving, the test is non-
-// deterministic as written (~1/5 fails when run in isolation), which would
-// make the suite flaky. It cannot be made deterministically green without a
-// production fix (serializing the entire rotation — file write + in-memory
-// update — under one lock so the persisted file always matches in-memory
-// state). That production change is out of scope for this test-audit stage,
-// so the test is quarantined here rather than deleted or weakened. Remove the
-// `#[ignore]` once the rotation is made atomic.
-#[ignore = "exposes unfixed production race admin-key-rotate-concurrency-desync; \
-            flaky until rotate_admin_key serializes file+memory writes (next stage)"]
+// Concurrent rotation requests can legitimately split into 200s that reached
+// the handler before the first rotation committed and 403s that authenticated
+// after the starting key was invalidated. Regardless of that timing, the final
+// `.admin_key` file must contain an authorized key.
 #[test]
 fn rotate_admin_key_concurrent_requests_allow_only_documented_outcomes() {
     let tmp = TempDir::new("fj_test_rotate_admin_key_concurrent");

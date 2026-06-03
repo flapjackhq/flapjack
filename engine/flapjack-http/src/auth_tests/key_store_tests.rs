@@ -1,4 +1,6 @@
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun02_pm_1_admin_key_rotation_race_fix/flapjack_dev/engine/flapjack-http/src/auth_tests/key_store_tests.rs.
 use super::*;
+use std::sync::{Arc, Barrier};
 
 // ── hash_key / verify_key ──
 
@@ -177,6 +179,54 @@ fn load_or_create_rotates_admin_hash_when_admin_key_changes() {
         (original_admin_entry.hash, original_admin_entry.salt),
         (rotated_admin_entry.hash, rotated_admin_entry.salt),
         "admin key rotation should replace both hash and salt"
+    );
+}
+
+#[test]
+fn concurrent_runtime_admin_key_rotations_leave_persisted_key_authorized() {
+    let temp_dir = TempDir::new().unwrap();
+    let store = Arc::new(KeyStore::load_or_create(
+        temp_dir.path(),
+        "original-admin-key-for-concurrent-rotation",
+    ));
+    let key_path = temp_dir.path().join(".admin_key");
+    let worker_count = 8;
+    let start = Arc::new(Barrier::new(worker_count));
+
+    let handles: Vec<_> = (0..worker_count)
+        .map(|_| {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                store
+                    .rotate_admin_key()
+                    .expect("runtime admin key rotation should succeed")
+            })
+        })
+        .collect();
+
+    let rotated_keys: Vec<String> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("rotation worker should not panic"))
+        .collect();
+
+    let persisted_key = std::fs::read_to_string(&key_path)
+        .expect(".admin_key must exist after runtime rotation")
+        .trim()
+        .to_string();
+    assert!(
+        rotated_keys.contains(&persisted_key),
+        "persisted key must be one of the successful rotation results"
+    );
+    assert_eq!(
+        store.admin_key_value(),
+        persisted_key,
+        "persisted .admin_key must match the in-memory admin key after concurrent rotations"
+    );
+    assert!(
+        store.lookup(&persisted_key).is_some(),
+        "persisted .admin_key must authorize via the stored admin hash"
     );
 }
 #[test]

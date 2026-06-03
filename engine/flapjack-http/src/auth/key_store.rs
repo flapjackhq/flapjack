@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use crate::admin_key_persistence::{persist_admin_key_file, PermissionFailureMode};
 
@@ -30,6 +30,12 @@ pub struct KeyStore {
     file_path: PathBuf,
     key_material_path: PathBuf,
     admin_key_value: RwLock<String>,
+    // Serializes `rotate_admin_key` against itself so the `.admin_key` file write and
+    // the subsequent in-memory hash/value update are atomic per-rotation. Concurrent
+    // rotations would otherwise interleave file-write A, file-write B (overwriting A),
+    // then memory-update A — leaving the persisted file inconsistent with in-memory state.
+    // Does NOT block auth readers (`is_admin`, `lookup`, etc.) which use the RwLock.
+    rotation_mutex: Mutex<()>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -63,6 +69,7 @@ impl KeyStore {
             file_path,
             key_material_path,
             admin_key_value: RwLock::new(admin_key.to_string()),
+            rotation_mutex: Mutex::new(()),
         };
         store.save();
         store
@@ -312,6 +319,15 @@ impl KeyStore {
     /// Disk writes happen before in-memory updates so that an I/O failure leaves the
     /// running process in its original consistent state (no admin lockout).
     pub fn rotate_admin_key(&self) -> Result<String, String> {
+        // Serialize concurrent rotations so .admin_key file write + in-memory update
+        // form one critical section. Recover from poison: the guarded value is `()`
+        // with no invariants, so it is safe to proceed after a prior panic — failing
+        // hard here would permanently block all future rotations.
+        let _rotation_guard = self
+            .rotation_mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let new_key = generate_admin_key();
         let new_salt = generate_salt();
         let new_hash = hash_key(&new_key, &new_salt);

@@ -31,9 +31,9 @@ public sealed class MonitoringConfig : FlapjackConfig
   {
     DefaultHosts = GetDefaultHosts();
     Compression = CompressionType.None;
-    ReadTimeout = TimeSpan.FromMilliseconds(5000);
-    WriteTimeout = TimeSpan.FromMilliseconds(30000);
-    ConnectTimeout = TimeSpan.FromMilliseconds(2000);
+    ReadTimeout = Defaults.ReadTimeout;
+    WriteTimeout = Defaults.WriteTimeout;
+    ConnectTimeout = Defaults.ConnectTimeout;
   }
 
   private static List<StatefulHost> GetDefaultHosts()
