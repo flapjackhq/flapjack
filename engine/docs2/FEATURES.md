@@ -15,13 +15,13 @@ Single maintained status ledger for Flapjack. Shipped feature status, current pr
 
 ## Public Sync Lineage Ledger (Canonical)
 
-This is the single detailed ledger for the current v1.0.3 publication baseline (released 2026-05-30).
+This is the detailed public-sync lineage ledger. Current release truth is owned by [`PRIORITIES.md`](../../PRIORITIES.md) and [`CHANGELOG.md`](../../CHANGELOG.md); as of 2026-06-03, v1.0.6 is the latest paid-beta ship in the v1.0 line.
 
-May 22 OSS polish wave status facts (lanes A-F) remain canonical historical lineage in the existing rows below and are preserved as part of this owner surface.
+May 22 OSS polish wave status facts (lanes A-F) and the v1.0.3 public-beta cut remain canonical historical lineage in the existing rows below and are preserved as part of this owner surface.
 
 | Proof Item | Value |
 |---|---|
-| Canonical dev source for this wave | Commit `1111b` (v1.0.3 release cut lane) plus merged PL-14 fix surface `dbd78016` |
+| Canonical dev source for historical v1.0.3 wave | Commit `1111b` (v1.0.3 release cut lane) plus merged PL-14 fix surface `dbd78016` |
 | Staging publication | `ci.yml` green at HEAD for the v1.0.3 wave (see current production lane-state owner in `ROADMAP.md`) |
 | Prod publication | `ci.yml` green at HEAD for the v1.0.3 wave with release artifacts published on 2026-05-30 |
 | Release closeout channels | `github_release`, `binaries`, `ghcr_VERSION`, `ghcr_latest`, `mirror_ci`, `nightlies` |
@@ -351,7 +351,7 @@ CI-runnable scripts that verify documentation accuracy and API completeness agai
 
 Production-readiness checklist organized by priority tier. Tier 1 items were launch blockers, Tier 2 items are required for production confidence, Tier 3 items can be iterated on post-launch.
 
-As of 2026-05-31, v1.0.3 (released 2026-05-30) is the current shipped baseline. This section remains the canonical readiness snapshot while ongoing lane-state and post-ship sequencing are intentionally routed to [`ROADMAP.md`](../../ROADMAP.md) and [`PRIORITIES.md`](../../PRIORITIES.md) to avoid duplicate live-status prose in this owner.
+As of 2026-06-03, v1.0.6 is the current shipped paid-beta baseline. This section remains the canonical readiness snapshot while ongoing lane-state and post-ship sequencing are intentionally routed to [`ROADMAP.md`](../../ROADMAP.md) and [`PRIORITIES.md`](../../PRIORITIES.md) to avoid duplicate live-status prose in this owner.
 
 **Last updated: 2026-05-31**
 

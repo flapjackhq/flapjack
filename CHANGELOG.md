@@ -7,6 +7,12 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.7] - 2026-06-03
+
+### Fixed
+
+- Public install docs now describe the current installer contract: no argument resolves the latest release, while `sh -s -- <version>` pins an explicit release. The stale `v0.2.0` example was replaced with a current `v1.0.7` pin before release-cut validation.
+
 ## [1.0.6] - 2026-06-03
 
 ### Fixed

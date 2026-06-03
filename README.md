@@ -85,8 +85,11 @@ flapjack --data-dir ./data reset-admin-key
 Binaries: [Releases](https://github.com/flapjackhq/flapjack/releases/latest).
 
 ```bash
-# Install specific version
-curl -fsSL https://install.flapjack.foo | sh -s -- v0.2.0
+# Install the latest release
+curl -fsSL https://install.flapjack.foo | sh
+
+# Pin a specific release when needed
+curl -fsSL https://install.flapjack.foo | sh -s -- v1.0.7
 
 # Custom install directory
 FLAPJACK_INSTALL=/opt/flapjack curl -fsSL https://install.flapjack.foo | sh
@@ -130,14 +133,18 @@ curl -X POST http://localhost:7700/1/indexes/products/query \
 Then point your frontend at Flapjack instead of Algolia:
 
 ```javascript
-import algoliasearch from 'algoliasearch';
+import { flapjackSearch } from 'flapjack-search';
 
-// app-id can be any string, api-key is your FLAPJACK_ADMIN_KEY or a search key
-const client = algoliasearch('my-app', 'your-flapjack-api-key');
-client.transporter.hosts = [{ url: 'localhost:7700', protocol: 'http' }];
+// app-id can be any string, api-key is your admin key or a search key
+const client = flapjackSearch('flapjack', 'your-flapjack-api-key', {
+  hosts: [{ url: 'localhost:7700', protocol: 'http', accept: 'readWrite' }],
+});
 
 // Everything else stays the same
 ```
+
+For the full JavaScript migration checklist and method matrix, see
+[`sdks/javascript/MIGRATION.md`](sdks/javascript/MIGRATION.md).
 
 InstantSearch.js widgets work as-is — `SearchBox`, `Hits`, `RefinementList`, `Pagination`, `GeoSearch`, etc.
 

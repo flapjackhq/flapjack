@@ -9,10 +9,10 @@ This guide covers switching a JavaScript/TypeScript application from `algoliasea
 npm uninstall algoliasearch
 
 # Install Flapjack
-npm install flapjack-search@beta
+npm install flapjack-search
 ```
 
-The `flapjack-search` package replaces `algoliasearch`. All sub-packages (`@flapjack-search/client-common`, `@flapjack-search/client-search`, etc.) are installed automatically as dependencies.
+The `flapjack-search` package replaces `algoliasearch`. Use the top-level package unless your application explicitly imports a lower-level scoped package; npm registry probes on 2026-06-03 show `latest` at `1.0.0` for both `flapjack-search` and `@flapjack-search/client-search`.
 
 ## 2. Update imports
 
@@ -212,7 +212,7 @@ When migrating from Algolia Cloud to a self-hosted Flapjack server:
 
 ## 9. Quick migration checklist
 
-- [ ] `npm uninstall algoliasearch && npm install flapjack-search@beta`
+- [ ] `npm uninstall algoliasearch && npm install flapjack-search`
 - [ ] Find/replace `import algoliasearch from 'algoliasearch'` → `import { flapjackSearch } from 'flapjack-search'`
 - [ ] Find/replace `import { liteClient } from 'algoliasearch/lite'` → `import { flapjackSearch } from 'flapjack-search'` (lite build not yet available)
 - [ ] Find/replace `algoliasearch(` → `flapjackSearch(`

@@ -204,7 +204,7 @@ needed, restoring operator-controlled data taken before the upgrade.
 
 ### Scenario: Diagnose node-level replication status
 
-**Symptom:** `curl -s http://<node>/internal/status` reports `node_id`, `replication_enabled`, `peer_count`, `storage_total_bytes`, and `tenant_count`.
+**Symptom:** `curl -s -H "x-algolia-api-key: $FLAPJACK_ADMIN_KEY" https://<node>/internal/status` reports `node_id`, `replication_enabled`, `peer_count`, `storage_total_bytes`, and `tenant_count`. For localhost-only debugging without TLS termination, substitute `http://127.0.0.1:7700`.
 **Diagnosis:** `replication_enabled=false` with `peer_count=0` indicates standalone mode, not peer failure.
 **Recovery:** Confirm replication mode first; if replication is enabled and data is stale, continue with peer reachability and catch-up checks.
 **Test (where applicable):** `cargo test -p flapjack-http handlers::internal::tests::status_includes_storage_total_and_tenant_count -- --exact`
@@ -282,7 +282,7 @@ and ADR [`0005`](decisions/active/0005_nginx_restart_window_write_recovery.md).
 | Hit semantics | Cache hit replays the original `2xx` response and adds `X-Flapjack-Idempotency-Replayed: true`. |
 | Restart | With `FLAPJACK_IDEMPOTENCY_PERSISTENT=true`, same-node restarts replay the cached response body and original `taskID`. |
 | Add durability | `add_documents_durable` waits for `await_task_terminal`/`wait_for_write_durable` before acking success, so accepted add writes are durable-commit acknowledgements rather than queue-only acceptance. |
-| Delete durability | `pending PL-14`: delete handlers currently call `delete_documents_sync` (`objects/batch.rs`, `objects/mod.rs`, and replica fanout in `replicas.rs`). Do not assume add/delete parity yet. |
+| Delete durability | PL-14 is done: delete handlers route through the durable delete path instead of unbounded `delete_documents_sync` calls. Behavioral ownership remains with `delete_documents_durable` in `engine/src/index/manager/write.rs`, delete callers in `objects/batch.rs`, `objects/mod.rs`, and `replicas.rs`, plus the non-terminal task eviction guard in `engine/src/index/manager/mod.rs`. |
 | 429 / 503 | Transient errors include `Retry-After: 1`; clients SHOULD retry with the same key. |
 
 ### Known limitations (paid-beta posture)

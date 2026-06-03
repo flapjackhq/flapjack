@@ -1,4 +1,4 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun02_pm_5_v106_release_cut/flapjack_dev/engine/src/analytics/writer.rs.
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun03_am_4_v107_polish_cut_conditional/flapjack_dev/engine/src/analytics/writer.rs.
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, Float64Builder,
     Int64Array, Int64Builder, StringArray, StringBuilder, UInt32Array, UInt32Builder,
@@ -1528,6 +1528,17 @@ mod tests {
     /// TODO: Document flush_rollup_window_hourly_aggregates_known_answer.
     /// TODO: Document flush_rollup_window_hourly_aggregates_known_answer.
     /// TODO: Document flush_rollup_window_hourly_aggregates_known_answer.
+    /// TODO: Document flush_rollup_window_hourly_aggregates_known_answer.
+    /// TODO: Document flush_rollup_window_hourly_aggregates_known_answer.
+    /// TODO: Document flush_rollup_window_hourly_aggregates_known_answer.
+    /// TODO: Document flush_rollup_window_hourly_aggregates_known_answer.
+    /// TODO: Document flush_rollup_window_hourly_aggregates_known_answer.
+    /// TODO: Document flush_rollup_window_hourly_aggregates_known_answer.
+    /// TODO: Document flush_rollup_window_hourly_aggregates_known_answer.
+    /// TODO: Document flush_rollup_window_hourly_aggregates_known_answer.
+    /// TODO: Document flush_rollup_window_hourly_aggregates_known_answer.
+    /// TODO: Document flush_rollup_window_hourly_aggregates_known_answer.
+    /// TODO: Document flush_rollup_window_hourly_aggregates_known_answer.
     #[test]
     #[allow(clippy::cognitive_complexity)] // Known-answer test keeps all assertions inline so expected aggregates remain explicit and auditable.
     fn flush_rollup_window_hourly_aggregates_known_answer() {
@@ -1612,6 +1623,17 @@ mod tests {
         );
     }
 
+    /// TODO: Document flush_rollup_window_daily_compacts_from_hourly_only.
+    /// TODO: Document flush_rollup_window_daily_compacts_from_hourly_only.
+    /// TODO: Document flush_rollup_window_daily_compacts_from_hourly_only.
+    /// TODO: Document flush_rollup_window_daily_compacts_from_hourly_only.
+    /// TODO: Document flush_rollup_window_daily_compacts_from_hourly_only.
+    /// TODO: Document flush_rollup_window_daily_compacts_from_hourly_only.
+    /// TODO: Document flush_rollup_window_daily_compacts_from_hourly_only.
+    /// TODO: Document flush_rollup_window_daily_compacts_from_hourly_only.
+    /// TODO: Document flush_rollup_window_daily_compacts_from_hourly_only.
+    /// TODO: Document flush_rollup_window_daily_compacts_from_hourly_only.
+    /// TODO: Document flush_rollup_window_daily_compacts_from_hourly_only.
     /// TODO: Document flush_rollup_window_daily_compacts_from_hourly_only.
     /// TODO: Document flush_rollup_window_daily_compacts_from_hourly_only.
     /// TODO: Document flush_rollup_window_daily_compacts_from_hourly_only.

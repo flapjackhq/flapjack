@@ -1,4 +1,4 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun02_pm_5_v106_release_cut/flapjack_dev/engine/flapjack-http/src/startup_catchup.rs.
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun03_am_4_v107_polish_cut_conditional/flapjack_dev/engine/flapjack-http/src/startup_catchup.rs.
 use crate::handlers::internal::apply_ops_to_manager;
 use crate::handlers::AppState;
 use flapjack::index::oplog::read_committed_seq;
@@ -305,6 +305,7 @@ pub(crate) enum SnapshotInstallStep {
     CleanStaging,
     RecoverInterrupted,
     ImportExtract,
+    ValidateSnapshotTenantContent,
     RenameTenantToBackup,
     RenameStagingToTenant,
 }
@@ -317,6 +318,9 @@ impl SnapshotInstallStep {
             SnapshotInstallStep::CleanStaging => "clean_staging",
             SnapshotInstallStep::RecoverInterrupted => "recover_interrupted",
             SnapshotInstallStep::ImportExtract => "import_extract",
+            SnapshotInstallStep::ValidateSnapshotTenantContent => {
+                "validate_snapshot_tenant_content"
+            }
             SnapshotInstallStep::RenameTenantToBackup => "rename_tenant_to_backup",
             SnapshotInstallStep::RenameStagingToTenant => "rename_staging_to_tenant",
         }
@@ -365,6 +369,11 @@ pub(crate) fn install_snapshot_bytes(
             SnapshotInstallStep::ImportExtract,
             format!("import snapshot bytes into staging failed: {error}"),
         ));
+    }
+
+    if let Err(error) = validate_snapshot_tenant_content(&staging_path, tenant_id) {
+        let _ = remove_path_if_exists(&staging_path);
+        return Err((SnapshotInstallStep::ValidateSnapshotTenantContent, error));
     }
 
     manager.unload_tenant(tenant_id);
@@ -484,6 +493,55 @@ fn validate_tenant_id(tenant_id: &str) -> Result<(), String> {
     flapjack::validate_index_name(tenant_id)
         .map_err(|error| format!("invalid tenant id '{}': {}", tenant_id, error))
 }
+
+/// Reject staged snapshot content when its retained oplog entries belong to a
+/// different tenant than the one currently being restored.
+///
+/// Replication catch-up already rejects foreign-tenant op payloads before they
+/// are applied. Snapshot fallback must enforce the same invariant so a peer
+/// cannot replace tenant A with a tarball exported from tenant B.
+fn validate_snapshot_tenant_content(
+    staging_path: &std::path::Path,
+    expected_tenant_id: &str,
+) -> Result<(), String> {
+    let oplog_dir = staging_path.join("oplog");
+    if !oplog_dir.exists() {
+        return Ok(());
+    }
+
+    let oplog = flapjack::index::oplog::OpLog::open(
+        &oplog_dir,
+        expected_tenant_id,
+        "snapshot_restore_validation",
+    )
+    .map_err(|error| {
+        format!(
+            "open staged snapshot oplog '{}' failed: {}",
+            oplog_dir.display(),
+            error
+        )
+    })?;
+
+    if let Some(foreign_op) = oplog
+        .read_since(0)
+        .map_err(|error| {
+            format!(
+                "read staged snapshot oplog '{}' failed: {}",
+                oplog_dir.display(),
+                error
+            )
+        })?
+        .into_iter()
+        .find(|op| op.tenant_id != expected_tenant_id)
+    {
+        return Err(format!(
+            "snapshot oplog entry seq {} belongs to tenant '{}' instead of '{}'",
+            foreign_op.seq, foreign_op.tenant_id, expected_tenant_id
+        ));
+    }
+
+    Ok(())
+}
 /// Recovers from a crash during snapshot restore: if a backup dir exists but the
 /// tenant dir is missing, restores from the backup to avoid data loss.
 fn recover_interrupted_snapshot_restore(
@@ -561,6 +619,17 @@ fn read_local_ops_since(
     })
 }
 
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.
@@ -1124,6 +1193,48 @@ mod tests {
         assert!(
             tenant_path.join(new_marker_name).exists(),
             "restored tenant should contain snapshot content"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_bytes_rejects_foreign_tenant_snapshot_oplog() {
+        let tmp = TempDir::new().unwrap();
+        let manager = flapjack::IndexManager::new(tmp.path());
+        let tenant_id = "tenant_red";
+        let tenant_path = manager.base_path.join(tenant_id);
+        std::fs::create_dir_all(&tenant_path).unwrap();
+        let existing_marker = tenant_path.join("keep.txt");
+        std::fs::write(&existing_marker, "keep-me").unwrap();
+
+        let snapshot_src = TempDir::new().unwrap();
+        let foreign_tenant_id = "tenant_blue";
+        let oplog_dir = snapshot_src.path().join("oplog");
+        let oplog = flapjack::index::oplog::OpLog::open(&oplog_dir, foreign_tenant_id, "peer-node")
+            .unwrap();
+        oplog
+            .append(
+                "upsert",
+                serde_json::json!({"objectID": "doc-1", "body": {"_id": "doc-1", "title": "Blue"}}),
+            )
+            .unwrap();
+        let snapshot_bytes = export_to_bytes(snapshot_src.path()).unwrap();
+
+        let result = install_snapshot_bytes(&manager, tenant_id, &snapshot_bytes)
+            .expect_err("foreign-tenant snapshot oplog must be rejected");
+        assert_eq!(
+            result.0,
+            super::SnapshotInstallStep::ValidateSnapshotTenantContent,
+            "foreign-tenant snapshot should fail before replacing existing tenant data"
+        );
+        assert!(
+            result.1.contains("tenant_blue") && result.1.contains("tenant_red"),
+            "error should identify both tenant ids, got: {}",
+            result.1
+        );
+        assert_eq!(
+            std::fs::read_to_string(existing_marker).unwrap(),
+            "keep-me",
+            "rejecting foreign snapshot content must preserve existing tenant data"
         );
     }
     #[tokio::test]

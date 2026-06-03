@@ -1,6 +1,6 @@
 # Highest Priority: Open-Source Launch Readiness
 
-**Updated: 2026-06-02 (v1.0.5 released — CI/test-hygiene + nightly green chain restored at `PROMOTED_SHA=979c97443d1ffa27ffe6725c8d6553b60cf25831`; doc remains intent SSOT — active status routes to `PRIORITIES.md` + `ROADMAP.md`; historical launch + post-launch content under Archive)**
+**Updated: 2026-06-03 (v1.0.6 released — public paid-beta ship remains current in `PRIORITIES.md` + `CHANGELOG.md`; this doc remains intent/status-routing prose, with active status routed to `PRIORITIES.md` + `ROADMAP.md`; historical launch + post-launch content under Archive)**
 
 ## Mission
 

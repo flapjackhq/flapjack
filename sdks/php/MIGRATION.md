@@ -6,7 +6,9 @@ This guide walks you through migrating from `algolia/algoliasearch-client-php` t
 
 ```bash
 composer remove algolia/algoliasearch-client-php
-composer require flapjackhq/flapjack-search-php:0.1.0-beta.1
+# Packagist returned no public versions for this package on 2026-06-03.
+# Treat this guide as source-migration reference until a public Composer
+# version is available.
 ```
 
 ## 2. Update Imports
@@ -70,22 +72,29 @@ The old `ALGOLIA_*` variables still work as fallbacks.
 
 ## 6. Self-Hosted Configuration (Optional)
 
-If running a self-hosted Flapjack server:
+If running a self-hosted Flapjack server in production or staging, prefer HTTPS:
 
 ```php
 $config = SearchConfig::create('your-app-id', 'your-api-key');
-$config->setFullHosts(['http://your-server:7700']);
+$config->setFullHosts(['https://search.example.com']);
 $client = SearchClient::createWithConfig($config);
 ```
 
-## What Stays the Same
+For local development:
 
-- All API methods (`search`, `saveObjects`, `getSettings`, etc.)
-- Request/response formats
-- Wire protocol headers (`x-algolia-api-key`, `x-algolia-application-id`)
-- Exception class names (`AlgoliaException`, etc.)
-- Model classes and their properties
-- HTTP transport behavior (retry strategy, timeouts)
+```php
+$config = SearchConfig::create('your-app-id', 'your-api-key');
+$config->setFullHosts(['http://127.0.0.1:7700']);
+$client = SearchClient::createWithConfig($config);
+```
+
+## Expected Compatibility Surface
+
+Verify these against the exact package version you install; no public Packagist version was available in the 2026-06-03 registry probe.
+
+- Core search/write method names are intended to track the Algolia PHP SDK shape.
+- Request/response formats and `x-algolia-*` wire headers remain the compatibility target.
+- Exception classes, model classes, and HTTP transport behavior should be checked against the released package before production migration.
 
 ## Quick Regex for Bulk Migration
 

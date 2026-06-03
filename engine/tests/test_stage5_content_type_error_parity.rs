@@ -184,13 +184,14 @@ async fn json_post_put_endpoints_accept_missing_charset_and_bare_json_content_ty
 #[tokio::test]
 async fn import_snapshot_with_application_gzip_still_works_under_content_type_normalization() {
     let (app, _tmp) = common::build_test_app_for_local_requests(None);
+    let index_name = "snapshot-source";
 
-    seed_single_doc(&app, "snapshot-source").await;
+    seed_single_doc(&app, index_name).await;
 
     let export_resp = send(
         &app,
         Method::GET,
-        "/1/indexes/snapshot-source/export",
+        &format!("/1/indexes/{index_name}/export"),
         &[],
         Body::empty(),
     )
@@ -215,7 +216,7 @@ async fn import_snapshot_with_application_gzip_still_works_under_content_type_no
     let import_resp = send(
         &app,
         Method::POST,
-        "/1/indexes/snapshot-restored/import",
+        &format!("/1/indexes/{index_name}/import"),
         &[("content-type", "application/gzip")],
         Body::from(snapshot_bytes),
     )
@@ -228,7 +229,7 @@ async fn import_snapshot_with_application_gzip_still_works_under_content_type_no
     let search = send(
         &app,
         Method::POST,
-        "/1/indexes/snapshot-restored/query",
+        &format!("/1/indexes/{index_name}/query"),
         &[("content-type", "application/json")],
         Body::from(json!({ "query": "alpha" }).to_string()),
     )
