@@ -1,6 +1,6 @@
 # Highest Priority: Open-Source Launch Readiness
 
-**Updated: 2026-06-03 (v1.0.6 released — public paid-beta ship remains current in `PRIORITIES.md` + `CHANGELOG.md`; this doc remains intent/status-routing prose, with active status routed to `PRIORITIES.md` + `ROADMAP.md`; historical launch + post-launch content under Archive)**
+**Updated: 2026-06-04 (v1.0.7 released 2026-06-03 — latest public paid-beta ship remains current in `PRIORITIES.md` + `CHANGELOG.md`; this doc remains intent/status-routing prose, with active status routed to `PRIORITIES.md` + `ROADMAP.md`; historical launch + post-launch content under Archive)**
 
 ## Mission
 
@@ -17,8 +17,8 @@ Ship Flapjack as a polished, delightful open-source search engine. First impress
 
 For active priorities and current execution status, use the repo-root owners:
 
-- [`PRIORITIES.md`](../../PRIORITIES.md)
-- [`ROADMAP.md`](../../ROADMAP.md)
+- [`PRIORITIES.md`](../../../PRIORITIES.md)
+- [`ROADMAP.md`](../../../ROADMAP.md)
 
 This strategy file remains the enduring owner for mission and principles; status detail is intentionally routed to the repo-root docs above.
 

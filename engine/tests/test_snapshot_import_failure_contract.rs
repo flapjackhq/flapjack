@@ -2,24 +2,11 @@ use axum::{
     body::Body,
     http::{Method, StatusCode},
 };
+use flapjack_http::startup_catchup::snapshot_install_step_tags;
 use serde_json::json;
 use std::sync::Arc;
 
 mod common;
-
-/// Stable set of `sub_step` tags the `install_snapshot_bytes` owner may emit.
-/// Kept in sync with `SnapshotInstallStep::as_tag` in
-/// `engine/flapjack-http/src/startup_catchup.rs`. The concurrent regression
-/// test below asserts any non-2xx response carries one of these tags so the
-/// failing branch is always observable even if a future race surfaces.
-const KNOWN_SUB_STEPS: &[&str] = &[
-    "validate_tenant_id",
-    "clean_staging",
-    "recover_interrupted",
-    "import_extract",
-    "rename_tenant_to_backup",
-    "rename_staging_to_tenant",
-];
 
 async fn query_hits(
     app: &axum::Router,
@@ -193,7 +180,7 @@ async fn concurrent_imports_against_warm_server_pin_install_snapshot_step() {
                 )
             });
             assert!(
-                KNOWN_SUB_STEPS.contains(&sub_step),
+                snapshot_install_step_tags().any(|known_sub_step| known_sub_step == sub_step),
                 "non-2xx response carried unknown sub_step={sub_step}: {body}",
             );
         }

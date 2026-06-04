@@ -1,4 +1,4 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun03_am_4_v107_polish_cut_conditional/flapjack_dev/engine/flapjack-http/src/startup_catchup.rs.
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun03_pm_5_pre_launch_verification_conditional_v108_cut/flapjack_dev/engine/flapjack-http/src/startup_catchup.rs.
 use crate::handlers::internal::apply_ops_to_manager;
 use crate::handlers::AppState;
 use flapjack::index::oplog::read_committed_seq;
@@ -559,7 +559,10 @@ fn recover_interrupted_snapshot_restore(
         return remove_path_if_exists(backup_path);
     }
 
-    std::fs::rename(backup_path, tenant_path).map_err(|error| {
+    // Crash recovery can race the same lingering file handles as the primary
+    // activation path, so reuse the bounded rename retry instead of failing on
+    // the first transient EBUSY/ENOTEMPTY.
+    rename_with_transient_retry(backup_path, tenant_path).map_err(|error| {
         format!(
             "restore interrupted snapshot backup '{}' -> '{}' failed: {}",
             backup_path.display(),
@@ -619,6 +622,21 @@ fn read_local_ops_since(
     })
 }
 
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.

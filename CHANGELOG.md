@@ -110,6 +110,7 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Hardened transport and replication flows to reduce operational failure modes during distributed operation.
 
 [Unreleased]: https://github.com/flapjackhq/flapjack/commits/main
+[1.0.7]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.7
 [1.0.6]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.6
 [1.0.5]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.5
 [1.0.4]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.4
