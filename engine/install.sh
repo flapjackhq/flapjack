@@ -4,7 +4,7 @@
 # Usage:
 #   curl -fsSL https://install.flapjack.foo | sh            # latest from prod
 #   curl -fsSL https://install.flapjack.foo | sh             # latest from staging
-#   curl -fsSL https://install.flapjack.foo | sh -s -- v0.2.0   # pinned version
+#   curl -fsSL https://install.flapjack.foo | sh -s -- v1.0.7   # pinned version
 #
 # Environment variables:
 #   FLAPJACK_INSTALL   - Install directory (default: ~/.flapjack)
@@ -138,7 +138,7 @@ get_version() {
     return
   fi
 
-  # Parse version from CLI args (e.g., `| sh -s -- v0.2.0`)
+  # Parse version from CLI args (e.g., `| sh -s -- v1.0.7`)
   if [ -n "${1:-}" ]; then
     version="$1"
     return
@@ -163,7 +163,7 @@ get_version() {
 
   if [ -z "$version" ]; then
     error "Could not determine latest version. Check https://github.com/${REPO}/releases"
-    error "You can also specify a version: curl ... | sh -s -- v0.1.0"
+    error "You can also specify a version: curl ... | sh -s -- v1.0.7"
     exit 1
   fi
 

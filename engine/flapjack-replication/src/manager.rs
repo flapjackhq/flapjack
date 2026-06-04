@@ -1,4 +1,4 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun03_pm_5_pre_launch_verification_conditional_v108_cut/flapjack_dev/engine/flapjack-replication/src/manager.rs.
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun04_pm_2_customer_facing_copy_and_mirror_sync/flapjack_dev/engine/flapjack-replication/src/manager.rs.
 use super::circuit_breaker::CircuitState;
 use super::config::NodeConfig;
 use super::peer::PeerClient;
@@ -319,6 +319,11 @@ impl ReplicationManager {
         Ok(())
     }
 
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
     /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
     /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
     /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.

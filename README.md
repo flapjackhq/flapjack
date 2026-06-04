@@ -183,9 +183,41 @@ Algolia-compatible REST API under `/1/` — works with InstantSearch.js v5, the 
 
 ## Known limitations
 
-- Multi-node writes still serialize through the single-writer `Arc<Mutex<ManagedIndexWriter>>` seam, so write throughput does not scale linearly across nodes.
+- Multi-node writes serialize through a single-writer lock, so write throughput does not scale linearly across nodes.
 - Idempotency replay is restart-durable, but the cache is still node-local; cross-node failover dedup remains deferred to v1.1.
-- German `Schulbus` still does not decompound because `Schule` loses its final `-e` combining form and the current algorithm only strips Fugenlaute.
+- German compound words like `Schulbus` do not fully decompound because the algorithm does not yet handle combining-form vowel changes (e.g. `Schule` → `Schul-`).
+
+---
+
+## FAQ
+
+**Q: How close is the Algolia API compatibility?**
+
+Flapjack implements all 197 Algolia REST API endpoints under `/1/`. It works with the `algoliasearch` JavaScript client and InstantSearch.js v5 without code changes beyond pointing the host at your Flapjack instance. See the Features table below and the Comparison table for a side-by-side breakdown.
+
+**Q: Does Flapjack support multi-tenancy?**
+
+API keys support ACL restrictions, index-pattern scoping, and TTL expiry, so you can isolate each customer's indexes and control access granularly. Per-index usage counters track search, write, read, and bytes-ingested operations automatically. See the "API keys" row in the Features table.
+
+**Q: What is the write throughput?**
+
+Batch writes use durable-ack semantics — HTTP 200 returns only after the Tantivy commit completes, so no acknowledged document is lost to a crash. The write-queue batch size is tunable via `FLAPJACK_WRITE_QUEUE_BATCH_SIZE` (default 32). Multi-node writes serialize through a single-writer lock, so write throughput does not scale linearly across nodes; see Known limitations above.
+
+**Q: Which InstantSearch.js widgets work?**
+
+All standard InstantSearch.js v5 widgets connect directly to Flapjack's `/1/` endpoints without an adapter: `SearchBox`, `Hits`, `RefinementList`, `Pagination`, `GeoSearch`, and others. The Comparison table lists Flapjack as "Native" for InstantSearch.js support. Laravel Scout is also supported via the [integration package](integrations/laravel-scout/).
+
+**Q: What is the licensing and support model?**
+
+Flapjack is MIT-licensed and free to self-host with no feature gates. For managed hosting, [Flapjack Cloud](https://cloud.flapjack.foo) handles provisioning, backups, and updates. Community support is available through the [GitHub repository](https://github.com/flapjackhq/flapjack).
+
+**Q: How do HMAC-scoped API keys work?**
+
+Flapjack supports the same HMAC-signed secured API keys that Algolia uses for frontend search-only keys. You can scope keys by index pattern, ACL permissions, and TTL expiry through the `/1/keys` endpoints. See the "API keys" and "Scoped API keys (HMAC)" rows in the Features and Comparison tables.
+
+**Q: How do I migrate from Algolia?**
+
+`POST /1/migrate-from-algolia` copies an Algolia index into Flapjack in one request — pass your Algolia app ID, admin key, and source index name. Flapjack pulls the records and settings, creating a local index you can search immediately. Then point your frontend at Flapjack's host; your existing `algoliasearch` client code works without changes. See the [Migrate from Algolia](#migrate-from-algolia) section above for the full walkthrough.
 
 ---
 

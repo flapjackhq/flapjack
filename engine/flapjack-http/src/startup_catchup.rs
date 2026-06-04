@@ -1,4 +1,4 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun03_pm_5_pre_launch_verification_conditional_v108_cut/flapjack_dev/engine/flapjack-http/src/startup_catchup.rs.
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun04_pm_2_customer_facing_copy_and_mirror_sync/flapjack_dev/engine/flapjack-http/src/startup_catchup.rs.
 use crate::handlers::internal::apply_ops_to_manager;
 use crate::handlers::AppState;
 use flapjack::index::oplog::read_committed_seq;
@@ -622,6 +622,11 @@ fn read_local_ops_since(
     })
 }
 
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.

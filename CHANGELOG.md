@@ -7,6 +7,14 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Documentation: refreshed install pin examples from stale `v0.2.0`/`v0.1.0` to current `v1.0.7` in `engine/install.sh` (lines 7 and 169) and propagated the repo-wide grep discipline; see Lane B Stage 3 propagation decisions bundle.
+
+### Added
+
+- README: added 7-question evaluator FAQ section covering Algolia API compatibility, multi-tenancy, write throughput, InstantSearch.js support, licensing, HMAC-scoped keys, and the migration endpoint; refreshed Known limitations phrasing for public readability.
+
 ## [1.0.7] - 2026-06-03
 
 ### Fixed
