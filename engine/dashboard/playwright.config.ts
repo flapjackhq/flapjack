@@ -17,6 +17,7 @@ function parseWorkersOverride(rawValue: string | undefined): number | undefined 
 }
 
 const localWorkersOverride = parseWorkersOverride(process.env.PLAYWRIGHT_E2E_WORKERS);
+const videoMode = process.env.FJ_PLAYWRIGHT_VIDEO === 'on' ? 'on' : undefined;
 
 /**
  * Playwright configuration for Flapjack dashboard.
@@ -41,6 +42,7 @@ export default defineConfig({
     baseURL: instance.dashboardBaseUrl,
     trace: 'on-first-retry',
     screenshot: 'only-on-failure',
+    video: videoMode,
   },
 
   projects: [

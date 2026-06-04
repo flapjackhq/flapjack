@@ -19,6 +19,7 @@ export interface SidebarNavItem {
   to: string;
   label: string;
   icon: LucideIcon;
+  activePaths?: readonly string[];
 }
 
 export interface SidebarSectionDefinition {
@@ -32,7 +33,7 @@ export const SIDEBAR_SECTION_DEFINITIONS: SidebarSectionDefinition[] = [
     id: 'indexes',
     heading: 'Indexes',
     items: [
-      { to: '/overview', icon: Home, label: 'Overview' },
+      { to: '/overview', icon: Home, label: 'Overview', activePaths: ['/'] },
     ],
   },
   {

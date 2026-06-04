@@ -231,7 +231,7 @@ export function OverviewAnalyticsSection({
             </div>
             {overview?.dates && overview.dates.length > 0 && (
               <div className="h-32" data-testid="overview-analytics-chart">
-                <ResponsiveContainer width="100%" height="100%">
+                <ResponsiveContainer width="100%" height="100%" minWidth={1}>
                   <AreaChart data={overview.dates}>
                     <defs>
                       <linearGradient id="overviewGradient" x1="0" y1="0" x2="0" y2="1">

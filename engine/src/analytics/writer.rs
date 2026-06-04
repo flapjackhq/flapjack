@@ -1,4 +1,4 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun04_pm_2_customer_facing_copy_and_mirror_sync/flapjack_dev/engine/src/analytics/writer.rs.
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun04_pm_3_dashboard_first_impression_polish/flapjack_dev/engine/src/analytics/writer.rs.
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, Float64Builder,
     Int64Array, Int64Builder, StringArray, StringBuilder, UInt32Array, UInt32Builder,

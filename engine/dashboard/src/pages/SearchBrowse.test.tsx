@@ -172,6 +172,24 @@ describe('SearchBrowse', () => {
     expect(screen.queryByTestId('hybrid-controls')).not.toBeInTheDocument()
   })
 
+  it('does not foreground vector-unavailable status on the primary keyword browse route', () => {
+    vi.mocked(useIndexes).mockReturnValue({ data: [INDEX], isLoading: false } as any)
+    vi.mocked(useHealthDetail).mockReturnValue({
+      data: {
+        capabilities: {
+          vectorSearch: false,
+          vectorSearchLocal: false,
+        },
+      },
+      isLoading: false,
+    } as any)
+
+    render(<SearchBrowse />, { wrapper: withIndex })
+
+    expect(screen.getByTestId('search-box')).toBeInTheDocument()
+    expect(screen.queryByTestId('vector-status-badge-disabled')).not.toBeInTheDocument()
+  })
+
   it('opens the Add Documents dialog when the button is clicked', async () => {
     const user = userEvent.setup()
     vi.mocked(useIndexes).mockReturnValue({ data: [INDEX], isLoading: false } as any)

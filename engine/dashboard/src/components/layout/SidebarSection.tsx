@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { NavLink } from 'react-router-dom';
+import { NavLink, useLocation } from 'react-router-dom';
 import { cn } from '@/lib/utils';
 import type { SidebarNavItem, SidebarSectionId } from './sidebar-nav';
 
@@ -27,6 +27,8 @@ export function SidebarSection({
   sectionTestId,
   children,
 }: SidebarSectionProps) {
+  const location = useLocation();
+
   return (
     <section className="mt-6 first:mt-0" data-testid={sectionTestId}>
       <div
@@ -48,7 +50,7 @@ export function SidebarSection({
             className={({ isActive }) =>
               cn(
                 sectionLinkClassName,
-                isActive
+                isActive || item.activePaths?.includes(location.pathname)
                   ? 'bg-primary/15 text-primary font-semibold'
                   : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground',
               )

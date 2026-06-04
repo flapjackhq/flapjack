@@ -5,11 +5,14 @@ export interface IndexTabDefinition {
   label: string
   relativePath: string
   end?: boolean
-  isVisible: (settings: IndexSettings | undefined) => boolean
+  isVisible: (settings: IndexSettings | undefined, vectorSearchEnabled: boolean | undefined) => boolean
 }
 
 const ALWAYS_VISIBLE = () => true
-const IS_NEURAL_SEARCH_MODE = (settings: IndexSettings | undefined) => settings?.mode === 'neuralSearch'
+const IS_CHAT_AVAILABLE = (
+  settings: IndexSettings | undefined,
+  vectorSearchEnabled: boolean | undefined,
+) => settings?.mode === 'neuralSearch' && vectorSearchEnabled !== false
 
 export const INDEX_TAB_DEFINITIONS: readonly IndexTabDefinition[] = [
   {
@@ -59,12 +62,15 @@ export const INDEX_TAB_DEFINITIONS: readonly IndexTabDefinition[] = [
     id: 'chat',
     label: 'Chat',
     relativePath: 'chat',
-    isVisible: IS_NEURAL_SEARCH_MODE,
+    isVisible: IS_CHAT_AVAILABLE,
   },
 ]
 
-export function getVisibleIndexTabs(settings: IndexSettings | undefined): readonly IndexTabDefinition[] {
-  return INDEX_TAB_DEFINITIONS.filter((tabDefinition) => tabDefinition.isVisible(settings))
+export function getVisibleIndexTabs(
+  settings: IndexSettings | undefined,
+  vectorSearchEnabled: boolean | undefined,
+): readonly IndexTabDefinition[] {
+  return INDEX_TAB_DEFINITIONS.filter((tabDefinition) => tabDefinition.isVisible(settings, vectorSearchEnabled))
 }
 
 export function buildIndexTabHref(indexName: string, relativePath: string): string {

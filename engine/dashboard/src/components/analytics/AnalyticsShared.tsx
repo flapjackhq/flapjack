@@ -62,7 +62,7 @@ export function AreaTrendCard({
         {loading ? (
           <Skeleton className="w-full" style={{ height: chartHeight }} />
         ) : data?.length ? (
-          <ResponsiveContainer width="100%" height={chartHeight}>
+          <ResponsiveContainer width="100%" height={chartHeight} minWidth={1}>
             <AreaChart data={data}>
               <defs>
                 <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">

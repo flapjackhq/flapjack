@@ -3,6 +3,10 @@ import { describe, expect, it, vi } from 'vitest';
 import { Search } from 'lucide-react';
 import { KpiCard, DeltaBadge } from '@/components/analytics/KpiCard';
 
+const { responsiveContainerProps } = vi.hoisted(() => ({
+  responsiveContainerProps: [] as Array<Record<string, unknown>>,
+}));
+
 // Recharts renders ResizeObserver-sensitive primitives in jsdom
 vi.mock('lucide-react', async () => {
   const actual = await vi.importActual<typeof import('lucide-react')>('lucide-react');
@@ -16,7 +20,10 @@ vi.mock('lucide-react', async () => {
 });
 
 vi.mock('recharts', () => ({
-  ResponsiveContainer: ({ children }: { children: any }) => <div>{children}</div>,
+  ResponsiveContainer: ({ children, ...props }: { children: any } & Record<string, unknown>) => {
+    responsiveContainerProps.push(props);
+    return <div>{children}</div>;
+  },
   AreaChart: ({ children }: { children: any }) => (
     <svg data-testid="area-chart" viewBox="0 0 100 100">
       {children}
@@ -92,6 +99,7 @@ describe('KpiCard', () => {
   });
 
   it('normalizes sparkline gradient ids from the title slug', () => {
+    responsiveContainerProps.length = 0;
     const { container } = render(
       <KpiCard
         title="Total   Searches"
@@ -107,6 +115,25 @@ describe('KpiCard', () => {
     expect(container.querySelector('#spark-total-searches')).toBeInTheDocument();
     expect(screen.getByTestId('spark-area')).toHaveAttribute('data-fill', 'url(#spark-total-searches)');
     expect(screen.getByTestId('spark-area')).toHaveAttribute('data-key', 'count');
+  });
+
+  it('gives sparkline charts a positive minimum width before ResizeObserver has measured layout', () => {
+    responsiveContainerProps.length = 0;
+
+    render(
+      <KpiCard
+        title="Total Searches"
+        value={1234}
+        loading={false}
+        icon={Search}
+        sparkData={[{ count: 1234 }]}
+        format="number"
+      />
+    );
+
+    expect(responsiveContainerProps).toContainEqual(
+      expect.objectContaining({ minWidth: 1 }),
+    );
   });
 });
 

@@ -1,4 +1,4 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun04_pm_2_customer_facing_copy_and_mirror_sync/flapjack_dev/engine/flapjack-http/src/handlers/experiments/response_helpers.rs.
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun04_pm_3_dashboard_first_impression_polish/flapjack_dev/engine/flapjack-http/src/handlers/experiments/response_helpers.rs.
 use super::{
     dto_algolia, metrics, resolve::resolve_store_and_experiment_id, AppState, Experiment,
     ExperimentArm, ExperimentConclusion, ExperimentError, ExperimentStatus, ExperimentStore,

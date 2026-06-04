@@ -1,5 +1,5 @@
 import { render, screen } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Search } from 'lucide-react';
 import {
   AreaTrendCard,
@@ -9,9 +9,16 @@ import {
   TableSkeleton,
 } from '@/components/analytics/AnalyticsShared';
 
+const { responsiveContainerProps } = vi.hoisted(() => ({
+  responsiveContainerProps: [] as Array<Record<string, unknown>>,
+}));
+
 // Recharts renders ResizeObserver-sensitive primitives in jsdom
 vi.mock('recharts', () => ({
-  ResponsiveContainer: ({ children }: { children: any }) => <div>{children}</div>,
+  ResponsiveContainer: ({ children, ...props }: { children: any } & Record<string, unknown>) => {
+    responsiveContainerProps.push(props);
+    return <div>{children}</div>;
+  },
   AreaChart: ({ children }: { children: any }) => (
     <svg data-testid="area-chart" viewBox="0 0 100 100">
       {children}
@@ -98,6 +105,10 @@ describe('TableSkeleton', () => {
 });
 
 describe('AreaTrendCard', () => {
+  beforeEach(() => {
+    responsiveContainerProps.length = 0;
+  });
+
   it('shows loading skeleton while loading', () => {
     render(
       <AreaTrendCard
@@ -167,5 +178,31 @@ describe('AreaTrendCard', () => {
 
     expect(screen.getByTestId('area-chart')).toBeInTheDocument();
     expect(screen.queryByTestId('empty-state-content')).not.toBeInTheDocument();
+  });
+
+  it('gives Recharts a positive minimum width before ResizeObserver has measured layout', () => {
+    render(
+      <AreaTrendCard
+        testId="trend-data"
+        title="Trend"
+        loading={false}
+        data={[
+          { date: '2026-01-01', value: 1 },
+          { date: '2026-01-02', value: 2 },
+        ]}
+        chartHeight={160}
+        gradientId="trend-gradient-data"
+        gradientColor="#22c55e"
+        dataKey="value"
+        strokeColor="#22c55e"
+        tooltipValueFormatter={(value) => String(value)}
+        seriesLabel="Series"
+        emptyState={<div data-testid="empty-state-content">empty</div>}
+      />
+    );
+
+    expect(responsiveContainerProps).toContainEqual(
+      expect.objectContaining({ minWidth: 1 }),
+    );
   });
 });

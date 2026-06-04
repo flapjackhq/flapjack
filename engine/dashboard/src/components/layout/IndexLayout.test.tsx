@@ -9,6 +9,13 @@ vi.mock('@/hooks/useSettings', () => ({
   useSettings: vi.fn(),
 }))
 
+vi.mock('@/hooks/useSystemStatus', () => ({
+  useHealthDetail: vi.fn(() => ({
+    data: { capabilities: { vectorSearch: true, vectorSearchLocal: true } },
+    isLoading: false,
+  })),
+}))
+
 import { useSettings } from '@/hooks/useSettings'
 
 function BrowseChild() {

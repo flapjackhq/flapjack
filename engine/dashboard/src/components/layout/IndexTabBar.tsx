@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
 import { useSettings } from '@/hooks/useSettings'
+import { useHealthDetail } from '@/hooks/useSystemStatus'
 import { cn } from '@/lib/utils'
 import { buildIndexTabHref, getVisibleIndexTabs } from './index-tab-contract'
 
@@ -10,6 +11,7 @@ interface IndexTabBarProps {
 
 export function IndexTabBar({ indexName }: IndexTabBarProps) {
   const { data: settings } = useSettings(indexName)
+  const { data: health } = useHealthDetail()
   const location = useLocation()
   const tabScrollContainerRef = useRef<HTMLDivElement | null>(null)
 
@@ -23,7 +25,7 @@ export function IndexTabBar({ indexName }: IndexTabBarProps) {
     }
   }, [location.pathname])
 
-  const visibleTabs = getVisibleIndexTabs(settings)
+  const visibleTabs = getVisibleIndexTabs(settings, health?.capabilities.vectorSearch)
 
   return (
     <section className="mb-6 border-b border-border" data-testid="index-tab-bar">

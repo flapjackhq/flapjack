@@ -6,18 +6,20 @@ interface VectorStatusBadgeProps {
   embedders: Record<string, EmbedderConfig> | undefined;
   mode: IndexMode | undefined;
   vectorSearchEnabled: boolean | undefined;
+  showDisabledStatus?: boolean;
 }
 
 export const VectorStatusBadge = memo(function VectorStatusBadge({
   embedders,
   mode,
+  showDisabledStatus = true,
   vectorSearchEnabled,
 }: VectorStatusBadgeProps) {
   if (vectorSearchEnabled === undefined) {
     return null;
   }
 
-  if (vectorSearchEnabled === false) {
+  if (vectorSearchEnabled === false && showDisabledStatus) {
     return (
       <Badge
         variant="outline"
@@ -27,6 +29,10 @@ export const VectorStatusBadge = memo(function VectorStatusBadge({
         Vector Search unavailable (not compiled in)
       </Badge>
     );
+  }
+
+  if (vectorSearchEnabled === false) {
+    return null;
   }
 
   const embedderCount = embedders ? Object.keys(embedders).length : 0;

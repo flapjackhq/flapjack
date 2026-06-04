@@ -2,6 +2,7 @@
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import api from '@/lib/api';
+import { useApiLogger } from '@/hooks/useApiLogger';
 import { useToast } from '@/hooks/use-toast';
 import { personalizationKeys } from '@/lib/queryKeys';
 import type { PersonalizationProfile, PersonalizationStrategy } from '@/lib/types';
@@ -25,6 +26,8 @@ async function fetchNullableResource<T>(path: string): Promise<T | null> {
     return response.data;
   } catch (error) {
     if (readHttpStatus(error) === 404) {
+      const metadata = (error as { config?: { metadata?: { entryId?: string; startTime?: number } } }).config?.metadata;
+      if (metadata?.entryId && metadata.startTime) useApiLogger.getState().updateEntry(metadata.entryId, { status: 'success', duration: Date.now() - metadata.startTime, response: null });
       return null;
     }
     throw error;

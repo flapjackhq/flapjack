@@ -8,7 +8,12 @@ vi.mock('@/hooks/useSettings', () => ({
   useSettings: vi.fn(),
 }))
 
+vi.mock('@/hooks/useSystemStatus', () => ({
+  useHealthDetail: vi.fn(),
+}))
+
 import { useSettings } from '@/hooks/useSettings'
+import { useHealthDetail } from '@/hooks/useSystemStatus'
 
 function renderTabBar(path: string) {
   return render(
@@ -23,6 +28,10 @@ function renderTabBar(path: string) {
 describe('IndexTabBar', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    vi.mocked(useHealthDetail).mockReturnValue({
+      data: { capabilities: { vectorSearch: true, vectorSearchLocal: true } },
+      isLoading: false,
+    } as any)
   })
 
   it('renders design-doc tab order and hrefs when index mode is neuralSearch', () => {
@@ -70,6 +79,21 @@ describe('IndexTabBar', () => {
     } as any)
 
     renderTabBar('/index/products/settings')
+    expect(screen.queryByRole('link', { name: 'Chat' })).not.toBeInTheDocument()
+  })
+
+  it('hides the Chat tab when vector search is not compiled into the backend', () => {
+    vi.mocked(useSettings).mockReturnValue({
+      data: { mode: 'neuralSearch' },
+      isLoading: false,
+    } as any)
+    vi.mocked(useHealthDetail).mockReturnValue({
+      data: { capabilities: { vectorSearch: false, vectorSearchLocal: false } },
+      isLoading: false,
+    } as any)
+
+    renderTabBar('/index/products')
+
     expect(screen.queryByRole('link', { name: 'Chat' })).not.toBeInTheDocument()
   })
 

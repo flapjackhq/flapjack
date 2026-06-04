@@ -99,6 +99,22 @@ describe('Sidebar', () => {
     expect(screen.getByTestId('sidebar-index-idx-1')).toHaveClass('text-primary');
   });
 
+  it('marks Overview active on the root route because it renders the overview page', () => {
+    vi.mocked(useIndexes).mockReturnValue({
+      data: MANY_INDEXES,
+      isLoading: false,
+    } as unknown as ReturnType<typeof useIndexes>);
+
+    render(
+      <MemoryRouter initialEntries={['/']} future={TEST_ROUTER_FUTURE}>
+        <Sidebar />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('link', { name: 'Overview' })).toHaveClass('bg-primary/15');
+    expect(screen.getByRole('link', { name: 'Overview' })).toHaveClass('text-primary');
+  });
+
   it('does not mark prefix-colliding indexes active on nested routes', () => {
     vi.mocked(useIndexes).mockReturnValue({
       data: [{ uid: 'idx-1' }, { uid: 'idx-10' }],

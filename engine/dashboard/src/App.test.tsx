@@ -28,6 +28,13 @@ vi.mock('./hooks/useSettings', () => ({
   })),
 }))
 
+vi.mock('./hooks/useSystemStatus', () => ({
+  useHealthDetail: vi.fn(() => ({
+    data: { capabilities: { vectorSearch: true, vectorSearchLocal: true } },
+    isLoading: false,
+  })),
+}))
+
 vi.mock('./components/layout/AuthGate', () => ({
   AuthGate: ({ children }: MockWrapperProps) => <>{children}</>,
 }))

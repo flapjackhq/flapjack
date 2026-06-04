@@ -12,6 +12,10 @@ const hookMutations = vi.hoisted(() => ({
   importMutate: vi.fn(),
 }))
 
+const { responsiveContainerProps } = vi.hoisted(() => ({
+  responsiveContainerProps: [] as Array<Record<string, unknown>>,
+}))
+
 // Mock API module
 vi.mock('@/lib/api', () => ({
   default: {
@@ -46,7 +50,10 @@ vi.mock('@/hooks/useSnapshots', () => ({
 vi.mock('recharts', () => ({
   AreaChart: ({ children }: any) => <div data-testid="mock-chart">{children}</div>,
   Area: () => null,
-  ResponsiveContainer: ({ children }: any) => <div>{children}</div>,
+  ResponsiveContainer: ({ children, ...props }: any) => {
+    responsiveContainerProps.push(props)
+    return <div>{children}</div>
+  },
   XAxis: () => null,
   YAxis: () => null,
   CartesianGrid: () => null,
@@ -122,7 +129,12 @@ function setOverviewState({
       totalSearches,
       uniqueUsers: totalSearches > 0 ? 10 : 0,
       noResultRate: totalSearches > 0 ? 0.05 : null,
-      dates: [],
+      dates: totalSearches > 0
+        ? [
+            { date: '2026-02-09', count: Math.floor(totalSearches / 2) },
+            { date: '2026-02-10', count: totalSearches },
+          ]
+        : [],
       indices: [],
     },
     isLoading: false,
@@ -145,6 +157,18 @@ describe('Overview Cleanup Button', () => {
     } finally {
       warnSpy.mockRestore()
     }
+  })
+
+  it('gives the overview analytics chart a positive minimum width before layout measurement', () => {
+    responsiveContainerProps.length = 0
+    setOverviewState()
+
+    render(<Overview />, { wrapper: createWrapper() })
+
+    expect(screen.getByTestId('overview-analytics-chart')).toBeInTheDocument()
+    expect(responsiveContainerProps).toContainEqual(
+      expect.objectContaining({ minWidth: 1 }),
+    )
   })
 
   it('shows cleanup button when analytics card is visible', () => {

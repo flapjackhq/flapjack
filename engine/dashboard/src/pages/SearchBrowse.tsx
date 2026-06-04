@@ -178,6 +178,7 @@ export function SearchBrowse() {
           <VectorStatusBadge
             embedders={settings?.embedders}
             mode={settings?.mode}
+            showDisabledStatus={false}
             vectorSearchEnabled={vectorSearchEnabled}
           />
         </div>
