@@ -310,6 +310,25 @@ pub(crate) enum SnapshotInstallStep {
     RenameStagingToTenant,
 }
 
+const SNAPSHOT_INSTALL_STEPS: [SnapshotInstallStep; 8] = [
+    SnapshotInstallStep::ValidateTenantId,
+    SnapshotInstallStep::ValidateManagedPath,
+    SnapshotInstallStep::CleanStaging,
+    SnapshotInstallStep::RecoverInterrupted,
+    SnapshotInstallStep::ImportExtract,
+    SnapshotInstallStep::ValidateSnapshotTenantContent,
+    SnapshotInstallStep::RenameTenantToBackup,
+    SnapshotInstallStep::RenameStagingToTenant,
+];
+
+/// Returns every stable, non-PII snapshot install failure tag that can appear
+/// in sanitized import/restore responses.
+pub fn snapshot_install_step_tags() -> impl Iterator<Item = &'static str> {
+    SNAPSHOT_INSTALL_STEPS
+        .into_iter()
+        .map(SnapshotInstallStep::as_tag)
+}
+
 impl SnapshotInstallStep {
     pub(crate) fn as_tag(self) -> &'static str {
         match self {

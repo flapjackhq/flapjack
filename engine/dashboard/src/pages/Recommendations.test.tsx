@@ -31,6 +31,10 @@ vi.mock('@/hooks/useSettings', () => ({
   useSettings: vi.fn(),
 }))
 
+vi.mock('@/hooks/useSystemStatus', () => ({
+  useHealthDetail: vi.fn(() => ({ data: undefined })),
+}))
+
 import { useSettings } from '@/hooks/useSettings'
 
 type HookResult = {
