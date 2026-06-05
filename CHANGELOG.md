@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.8] - 2026-06-04
+
+<!-- Promoted from [Unreleased] by Stage 3 CUT_V108 release drain. -->
+
 ### Fixed
 
 - Documentation: refreshed install pin examples from stale `v0.2.0`/`v0.1.0` to current `v1.0.7` in `engine/install.sh` (lines 7 and 169) and propagated the repo-wide grep discipline; see Lane B Stage 3 propagation decisions bundle.
@@ -118,6 +122,7 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Hardened transport and replication flows to reduce operational failure modes during distributed operation.
 
 [Unreleased]: https://github.com/flapjackhq/flapjack/commits/main
+[1.0.8]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.8
 [1.0.7]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.7
 [1.0.6]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.6
 [1.0.5]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.5
