@@ -7,6 +7,12 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Dashboard `/cluster` now presents standalone replication status as a healthy single-node state with explicit reassurance copy for operators who are not running HA peers.
+- Dashboard `/events` now labels the failed-event status filter as `Failed`, reducing confusion with runtime page errors while preserving the underlying `error` status value.
+- Dashboard `/index/:indexName` result-row delete actions now expose document-specific accessible names such as `delete document <objectID>`, restoring screen-reader context for icon-only controls.
+
 ## [1.0.8] - 2026-06-04
 
 <!-- Promoted from [Unreleased] by Stage 3 CUT_V108 release drain. -->

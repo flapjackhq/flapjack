@@ -1,6 +1,6 @@
 # Flapjack — Roadmap
 
-**Last updated:** 2026-06-02
+**Last updated:** 2026-06-05
 **Status ledger policy:** This file is a routing page only. Canonical product status is maintained in [`engine/docs2/FEATURES.md`](engine/docs2/FEATURES.md).
 
 ## Implemented

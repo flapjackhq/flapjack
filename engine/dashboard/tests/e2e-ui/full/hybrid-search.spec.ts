@@ -63,8 +63,9 @@ async function waitForQueryHit(
 }
 
 async function expectHybridControlsUnavailable(page: Page): Promise<void> {
+  await waitForSearchResultsOrEmptyState(page);
   await expect(page.getByTestId('hybrid-controls')).not.toBeVisible();
-  await expect(page.getByText('Vector Search unavailable (not compiled in)')).toBeVisible();
+  await expect(page.getByTestId('vector-status-badge-disabled')).not.toBeVisible();
 }
 
 test.describe('Hybrid Search Controls', () => {
@@ -140,6 +141,45 @@ test.describe('Hybrid Search Controls', () => {
     await page.goto(`/index/${hybridIndex}`);
     await waitForSearchResultsOrEmptyState(page);
     await expect(page.getByTestId('hybrid-controls')).not.toBeVisible();
+  });
+
+  test('disabled capability helper waits for browse results before passing', async ({
+    request,
+    page,
+  }) => {
+    await configureEmbedder(request, hybridIndex, 'default', {
+      source: 'userProvided',
+      dimensions: 384,
+    });
+    await waitForEmbedder(request, hybridIndex, 'default');
+
+    let searchRequestCompleted = false;
+    await page.route(`**/1/indexes/${hybridIndex}/query`, async (route) => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 250));
+      await route.continue();
+      searchRequestCompleted = true;
+    });
+
+    await page.route('**/health', async (route) => {
+      const response = await route.fetch();
+      const health = await response.json();
+      await route.fulfill({
+        response,
+        json: {
+          ...health,
+          capabilities: {
+            ...health.capabilities,
+            vectorSearch: false,
+            vectorSearchLocal: false,
+          },
+        },
+      });
+    });
+
+    await page.goto(`/index/${hybridIndex}`);
+    await expectHybridControlsUnavailable(page);
+
+    expect(searchRequestCompleted).toBe(true);
   });
 
   test('hybrid controls visible when embedders configured', async ({

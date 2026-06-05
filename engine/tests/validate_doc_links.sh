@@ -13,6 +13,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 README_PATH="$REPO_DIR/README.md"
+ENGINE_README_PATH="$REPO_DIR/engine/README.md"
 
 # shellcheck source=engine/tests/doc_sync_helpers.sh
 source "$SCRIPT_DIR/doc_sync_helpers.sh"
@@ -20,6 +21,12 @@ source "$SCRIPT_DIR/doc_sync_helpers.sh"
 FAILURE_LOG=$(mktemp "${TMPDIR:-/tmp}/flapjack-link-failures.XXXXXX")
 COUNT_LOG=$(mktemp "${TMPDIR:-/tmp}/flapjack-link-counts.XXXXXX")
 DOCS_LOG=$(mktemp "${TMPDIR:-/tmp}/flapjack-link-docs.XXXXXX")
+README_FAILURE_LOG=""
+if [ -n "${BUNDLE_DIR:-}" ]; then
+  mkdir -p "$BUNDLE_DIR"
+  README_FAILURE_LOG="$BUNDLE_DIR/readme_link_failures.txt"
+  : > "$README_FAILURE_LOG"
+fi
 
 cleanup() {
   doc_sync_cleanup
@@ -30,16 +37,80 @@ trap cleanup EXIT
 doc_sync_init "$REPO_DIR"
 
 readme_public_guard_urls() {
-  grep -Eo 'https://[^) >"]+' "$README_PATH" \
-    | grep -E '^(https://flapjack-demo\.pages\.dev(/.*)?|https://install\.flapjack\.foo(/.*)?|https://cloud\.flapjack\.foo(/.*)?|https://github\.com/[^/]+/flapjack/releases/latest|https://github\.com/quickwit-oss/tantivy)$' \
+  grep -hEo "https?://[^][) >\"']+" "$README_PATH" "$ENGINE_README_PATH" \
+    | grep -Ev '^https?://(localhost|127\.0\.0\.1)(:|/|$)' \
     | awk '!seen[$0]++' || true
+}
+
+# Reject README URLs that target private, loopback, link-local, or credentialed
+# endpoints before curl ever leaves the machine. The README URL guard runs in CI
+# against repo-controlled content, so doc changes must not be able to repurpose
+# it as an SSRF probe into runner-local networks or metadata services.
+is_safe_public_url() {
+  local url="$1"
+
+  python3 - "$url" <<'PY'
+import ipaddress
+import socket
+import sys
+from urllib.parse import urlsplit
+
+url = sys.argv[1]
+parts = urlsplit(url)
+
+if parts.scheme not in {"http", "https"}:
+    raise SystemExit(1)
+if not parts.hostname:
+    raise SystemExit(1)
+if parts.username is not None or parts.password is not None:
+    raise SystemExit(1)
+
+host = parts.hostname
+try:
+    literal_ip = ipaddress.ip_address(host)
+except ValueError:
+    literal_ip = None
+
+blocked_flags = (
+    "is_private",
+    "is_loopback",
+    "is_link_local",
+    "is_multicast",
+    "is_reserved",
+    "is_unspecified",
+)
+
+def is_blocked(addr):
+    return any(getattr(addr, flag) for flag in blocked_flags)
+
+if literal_ip is not None:
+    raise SystemExit(1 if is_blocked(literal_ip) else 0)
+
+try:
+    infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+except socket.gaierror:
+    # Let the normal curl probe surface a DNS failure later; this guard only
+    # blocks addresses we can positively classify as unsafe.
+    raise SystemExit(0)
+
+for info in infos:
+    addr_text = info[4][0]
+    try:
+        addr = ipaddress.ip_address(addr_text)
+    except ValueError:
+        continue
+    if is_blocked(addr):
+        raise SystemExit(1)
+
+raise SystemExit(0)
+PY
 }
 
 probe_http_status() {
   local url="$1"
   shift
 
-  curl -L -s -o /dev/null -w "%{http_code}" --max-time 15 "$@" "$url"
+  curl -L -s -o /dev/null -w "%{http_code}" --max-time 30 "$@" "$url"
 }
 
 printf "\033[1mDoc Link Validation\033[0m\n"
@@ -64,6 +135,9 @@ done < "$DOCS_LOG"
 README_GUARD_URLS=$(readme_public_guard_urls)
 if [ -z "$README_GUARD_URLS" ]; then
   printf "  \033[0;31m✗\033[0m README public URL guard could not extract any onboarding URLs\n"
+  if [ -n "$README_FAILURE_LOG" ]; then
+    printf "missing-url\tREADME public URL guard could not extract any onboarding URLs\n" >> "$README_FAILURE_LOG"
+  fi
   printf "FAIL\n" >> "$FAILURE_LOG"
 fi
 
@@ -73,6 +147,16 @@ while IFS= read -r url; do
   retry_code=""
   http_probe_failed=0
   retry_probe_failed=0
+
+  if ! is_safe_public_url "$url"; then
+    printf "  \033[0;31m✗\033[0m external URL rejected by safety guard: %s\n" "$url"
+    if [ -n "$README_FAILURE_LOG" ]; then
+      printf "unsafe-url\tunsafe-url\t%s\n" "$url" >> "$README_FAILURE_LOG"
+    fi
+    printf "FAIL\n" >> "$FAILURE_LOG"
+    printf "CHECK\n" >> "$COUNT_LOG"
+    continue
+  fi
 
   if ! http_code=$(probe_http_status "$url"); then
     http_probe_failed=1
@@ -90,6 +174,9 @@ while IFS= read -r url; do
           "${http_code:-curl-error}" "${retry_code:-curl-error}" "$url"
       else
         printf "  \033[0;31m✗\033[0m external URL failed (%s/%s): %s\n" "$http_code" "$retry_code" "$url"
+      fi
+      if [ -n "$README_FAILURE_LOG" ]; then
+        printf "%s\t%s\t%s\n" "${http_code:-curl-error}" "${retry_code:-curl-error}" "$url" >> "$README_FAILURE_LOG"
       fi
       printf "FAIL\n" >> "$FAILURE_LOG"
     fi

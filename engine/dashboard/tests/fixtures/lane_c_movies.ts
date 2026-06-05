@@ -1,5 +1,5 @@
 /**
- * @module Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun04_pm_3_dashboard_first_impression_polish/flapjack_dev/engine/dashboard/tests/fixtures/lane_c_movies.ts.
+ * @module Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun05_am_3_dashboard_polish_round_2/flapjack_dev/engine/dashboard/tests/fixtures/lane_c_movies.ts.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -7,7 +7,24 @@ import type { APIRequestContext } from '@playwright/test';
 import { addDocuments, deleteIndex, searchIndex, type SearchIndexResponse } from './index-api-helpers';
 
 export const MOVIES_INDEX = 'movies';
-const LANE_C_BASELINE_ROOT = path.resolve(process.cwd(), '../../docs/live-state/jun04_pm_lane_c_baseline');
+// Keep document-action coverage on the audit-owned corpus so parallel overview audits
+// never observe a transient test-only index.
+export const MOVIES_DOCUMENT_ACTIONS_INDEX = MOVIES_INDEX;
+const LANE_C_LIVE_STATE_ROOT = path.resolve(process.cwd(), '../../docs/live-state');
+const LANE_C_REPO_ROOT = path.resolve(LANE_C_LIVE_STATE_ROOT, '../..');
+const LANE_C_BASELINE_ROOT = path.join(LANE_C_LIVE_STATE_ROOT, 'jun04_pm_lane_c_baseline');
+const LANE_C_BASELINE_ROOT_PATTERN = /^jun\d{2}_(am|pm)_lane_c_baseline$/;
+const MOVIES_SEED_VERIFY_FILE = 'movies_seed_verify.json';
+const MOVIES_SEED_LOCK_NAME = 'movies_seed.lock';
+const MOVIES_SEED_LOCK_TIMEOUT_MS = 30_000;
+const MOVIES_SEED_LOCK_POLL_MS = 100;
+const STALE_MOVIES_SEED_LOCK_MS = 120_000;
+
+type MovieSeedTarget = {
+  indexName: string;
+  verificationFileName: string;
+  reuseReadyCorpus: boolean;
+};
 
 const MOVIE_TITLES = [
   'North Station',
@@ -108,35 +125,39 @@ export function validateMovieCorpus(movies: readonly LaneCMovie[]): void {
 }
 
 export async function seedMoviesIndex(request: APIRequestContext): Promise<SearchIndexResponse> {
-  validateMovieCorpus(MOVIES);
+  return withMovieSeedLock(() => seedMovieCorpus(request, {
+    indexName: MOVIES_INDEX,
+    verificationFileName: MOVIES_SEED_VERIFY_FILE,
+    reuseReadyCorpus: true,
+  }));
+}
 
-  await deleteIndex(request, MOVIES_INDEX);
-  await addDocuments(request, MOVIES_INDEX, [...MOVIES]);
-
-  const finalResponse = await waitForMoviesReady(request);
-  writeSeedVerification(finalResponse);
-  return finalResponse;
+export async function seedMoviesDocumentActionsIndex(
+  request: APIRequestContext,
+): Promise<SearchIndexResponse> {
+  return seedMoviesIndex(request);
 }
 
 export function resolveLaneCBundleDir(
   candidate: string | undefined,
-  baselineRoot: string = LANE_C_BASELINE_ROOT,
+  baselineRoot: string = resolveLaneCBaselineRoot(candidate),
 ): string | null {
   if (!fs.existsSync(baselineRoot)) {
     return null;
   }
 
   const resolvedBaselineRoot = path.resolve(baselineRoot);
-  const canonicalBaselineRoot = fs.realpathSync.native(baselineRoot);
-  if (fs.lstatSync(canonicalBaselineRoot).isSymbolicLink()) {
-    throw new Error(`Lane C baseline root must not be a symlink: ${canonicalBaselineRoot}`);
+  if (fs.lstatSync(resolvedBaselineRoot).isSymbolicLink()) {
+    throw new Error(`Lane C baseline root must not be a symlink: ${resolvedBaselineRoot}`);
   }
+
+  const canonicalBaselineRoot = fs.realpathSync.native(baselineRoot);
 
   if (!candidate) {
     return findLatestLaneCBundleDir(canonicalBaselineRoot);
   }
 
-  const rawResolvedCandidate = path.resolve(candidate);
+  const rawResolvedCandidate = resolveLaneCRepoRelativePath(candidate);
   const rawRelativeCandidate = path.relative(resolvedBaselineRoot, rawResolvedCandidate);
   if (
     rawRelativeCandidate.length === 0 ||
@@ -168,23 +189,199 @@ export function resolveLaneCBundleDir(
   return resolvedCandidate;
 }
 
-async function waitForMoviesReady(request: APIRequestContext): Promise<SearchIndexResponse> {
+function resolveLaneCBaselineRoot(candidate: string | undefined): string {
+  if (!candidate) {
+    return LANE_C_BASELINE_ROOT;
+  }
+
+  const rawResolvedCandidate = resolveLaneCRepoRelativePath(candidate);
+  const candidateBaselineRoot = path.dirname(rawResolvedCandidate);
+  const baselineName = path.basename(candidateBaselineRoot);
+  const liveStateRelative = path.relative(LANE_C_LIVE_STATE_ROOT, candidateBaselineRoot);
+  if (
+    LANE_C_BASELINE_ROOT_PATTERN.test(baselineName) &&
+    liveStateRelative.length > 0 &&
+    !liveStateRelative.startsWith('..') &&
+    !path.isAbsolute(liveStateRelative)
+  ) {
+    return candidateBaselineRoot;
+  }
+
+  return LANE_C_BASELINE_ROOT;
+}
+
+function resolveLaneCRepoRelativePath(candidate: string): string {
+  return path.isAbsolute(candidate)
+    ? path.resolve(candidate)
+    : path.resolve(LANE_C_REPO_ROOT, candidate);
+}
+
+async function seedMovieCorpus(
+  request: APIRequestContext,
+  target: MovieSeedTarget,
+): Promise<SearchIndexResponse> {
+  validateMovieCorpus(MOVIES);
+
+  const existingResponse = target.reuseReadyCorpus
+    ? await readReadyMovieCorpus(request, target.indexName)
+    : null;
+  if (existingResponse) {
+    writeSeedVerification(existingResponse, target.verificationFileName);
+    return existingResponse;
+  }
+
+  await deleteIndex(request, target.indexName);
+  await addDocuments(request, target.indexName, [...MOVIES]);
+
+  const finalResponse = await waitForMoviesReady(request, target.indexName);
+  writeSeedVerification(finalResponse, target.verificationFileName);
+  return finalResponse;
+}
+
+async function withMovieSeedLock<T>(seed: () => Promise<T>): Promise<T> {
+  const lockDir = resolveMovieSeedLockDir();
+  const deadline = Date.now() + MOVIES_SEED_LOCK_TIMEOUT_MS;
+
+  while (Date.now() <= deadline) {
+    try {
+      fs.mkdirSync(lockDir);
+      try {
+        return await seed();
+      } finally {
+        fs.rmSync(lockDir, { force: true, recursive: true });
+      }
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error
+        ? String(error.code)
+        : '';
+      if (code !== 'EEXIST') {
+        throw error;
+      }
+
+      removeStaleMovieSeedLock(lockDir);
+      await new Promise((resolve) => setTimeout(resolve, MOVIES_SEED_LOCK_POLL_MS));
+    }
+  }
+
+  throw new Error(`Timed out waiting for Lane C movies seed lock: ${lockDir}`);
+}
+
+function resolveMovieSeedLockDir(): string {
+  const bundleDir = resolveLaneCBundleDir(process.env.LANE_C_BUNDLE_DIR);
+  const lockRoot = bundleDir ?? path.join(process.env.TMPDIR || '/tmp', 'flapjack_lane_c_movies');
+
+  fs.mkdirSync(lockRoot, { recursive: true });
+  return path.join(lockRoot, MOVIES_SEED_LOCK_NAME);
+}
+
+function removeStaleMovieSeedLock(lockDir: string): void {
+  try {
+    const ageMs = Date.now() - fs.statSync(lockDir).mtimeMs;
+    if (ageMs > STALE_MOVIES_SEED_LOCK_MS) {
+      fs.rmSync(lockDir, { force: true, recursive: true });
+    }
+  } catch {
+    // Another worker can remove the lock between the mkdir failure and stale-lock probe.
+  }
+}
+
+async function readReadyMovieCorpus(
+  request: APIRequestContext,
+  indexName: string,
+): Promise<SearchIndexResponse | null> {
+  try {
+    const response = await searchIndex(request, indexName, '', { hitsPerPage: MOVIES.length });
+    if (response.nbHits !== MOVIES.length) {
+      return null;
+    }
+
+    const actualMoviesByObjectID = movieHitsByObjectIDFromResponse(response);
+    if (!actualMoviesByObjectID || actualMoviesByObjectID.size !== MOVIES.length) {
+      return null;
+    }
+
+    for (const movie of MOVIES) {
+      const actualMovie = actualMoviesByObjectID.get(movie.objectID);
+      if (!actualMovie || !hasCanonicalMovieFields(actualMovie, movie)) {
+        return null;
+      }
+    }
+
+    return response;
+  } catch {
+    return null;
+  }
+}
+
+function movieHitsByObjectIDFromResponse(
+  response: SearchIndexResponse,
+): Map<string, Record<string, unknown>> | null {
+  if (!Array.isArray(response.hits)) {
+    return null;
+  }
+
+  const hitsByObjectID = new Map<string, Record<string, unknown>>();
+  for (const hit of response.hits) {
+    if (!hit || typeof hit !== 'object') {
+      return null;
+    }
+
+    const movieHit = hit as Record<string, unknown>;
+    const objectID = movieHit.objectID;
+    if (typeof objectID !== 'string' || hitsByObjectID.has(objectID)) {
+      return null;
+    }
+
+    hitsByObjectID.set(objectID, movieHit);
+  }
+
+  return hitsByObjectID;
+}
+
+function hasCanonicalMovieFields(
+  actualMovie: Record<string, unknown>,
+  expectedMovie: LaneCMovie,
+): boolean {
+  return (Object.keys(expectedMovie) as Array<keyof LaneCMovie>).every((fieldName) => (
+    movieFieldMatches(actualMovie[fieldName], expectedMovie[fieldName])
+  ));
+}
+
+function movieFieldMatches(
+  actualValue: unknown,
+  expectedValue: LaneCMovie[keyof LaneCMovie],
+): boolean {
+  if (Array.isArray(expectedValue)) {
+    return Array.isArray(actualValue) &&
+      actualValue.length === expectedValue.length &&
+      actualValue.every((value, index) => value === expectedValue[index]);
+  }
+
+  return actualValue === expectedValue;
+}
+
+async function waitForMoviesReady(
+  request: APIRequestContext,
+  indexName: string,
+): Promise<SearchIndexResponse> {
   const deadline = Date.now() + 15_000;
   let lastResponse: SearchIndexResponse | null = null;
 
   while (Date.now() < deadline) {
-    lastResponse = await searchIndex(request, MOVIES_INDEX, '', { hitsPerPage: 1 });
-    if (lastResponse.nbHits === MOVIES.length) {
+    lastResponse = await readReadyMovieCorpus(request, indexName);
+    if (lastResponse) {
       return lastResponse;
     }
 
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
 
-  throw new Error(`movies seed did not reach ${MOVIES.length} hits; last response: ${JSON.stringify(lastResponse)}`);
+  throw new Error(
+    `movies seed did not reach ${MOVIES.length} hits; last response: ${JSON.stringify(lastResponse)}`,
+  );
 }
 
-function writeSeedVerification(response: SearchIndexResponse): void {
+function writeSeedVerification(response: SearchIndexResponse, verificationFileName: string): void {
   const bundleDir = resolveLaneCBundleDir(process.env.LANE_C_BUNDLE_DIR);
   if (!bundleDir) {
     return;
@@ -192,7 +389,7 @@ function writeSeedVerification(response: SearchIndexResponse): void {
 
   fs.mkdirSync(bundleDir, { recursive: true });
   fs.writeFileSync(
-    path.join(bundleDir, 'movies_seed_verify.json'),
+    path.join(bundleDir, verificationFileName),
     `${JSON.stringify(response, null, 2)}\n`,
     'utf8',
   );

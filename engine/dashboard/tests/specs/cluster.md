@@ -4,9 +4,10 @@
 1. Go to /cluster
 2. See the "Cluster" heading
 3. Confirm payload branch is standalone (`replication_enabled: false`, `peers: []`)
-4. See the Standalone Node card (`cluster-standalone-state`)
+4. See the Standalone mode card (`cluster-standalone-state`)
 5. See Node ID rendered from `node_id`
-6. See Replication rendered as "Disabled"
+6. See Mode rendered as "Standalone mode"
+7. See reassurance that single-node mode is healthy and expected for this instance
 
 ## cluster-2: HA failover visibility in peer table
 1. Go to /cluster with HA payload (`replication_enabled: true`)

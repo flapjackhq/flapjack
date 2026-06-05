@@ -332,6 +332,7 @@ describe('DocumentCard display preferences contract', () => {
     expect(screen.getByText('p01')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'JSON' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Copy' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /delete document p01/i })).toBeInTheDocument();
     const brandRow = screen.getByText('brand:').closest('div');
     expect(brandRow).not.toBeNull();
     const highlightedBrand = within(brandRow as HTMLElement).getByText('Apple');

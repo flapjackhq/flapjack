@@ -63,7 +63,7 @@ export default defineConfig({
     {
       name: 'e2e-ui',
       testDir: './tests/e2e-ui',
-      testIgnore: ['*.setup.ts'],
+      testIgnore: ['*.setup.ts', '*.test.ts'],
       dependencies: ['seed'],
       use: { ...devices['Desktop Chrome'] },
     },

@@ -27,7 +27,7 @@
     "test:pages": "playwright test --project=e2e-ui",
     "test:integration": "playwright test --project=e2e-api",
     "test:report": "playwright show-report",
-    "lint:e2e": "eslint --config tests/e2e-ui/eslint.config.mjs 'tests/e2e-ui/**/*.spec.ts' 'tests/e2e-ui/helpers.ts'"
+    "lint:e2e": "eslint --config tests/e2e-ui/eslint.config.mjs 'tests/e2e-ui/**/*.spec.ts' 'tests/e2e-ui/**/*.test.ts' 'tests/e2e-ui/helpers.ts' 'tests/e2e-ui/**/*_helpers.ts'"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.6.0",

@@ -91,7 +91,7 @@ describe('playwright.config startup contracts', () => {
     expect(seedProject?.teardown).toBe('cleanup')
     expect(cleanupProject?.testMatch).toBe('cleanup.setup.ts')
     expect(uiProject?.dependencies).toEqual(['seed'])
-    expect(uiProject?.testIgnore).toEqual(['*.setup.ts'])
+    expect(uiProject?.testIgnore).toEqual(['*.setup.ts', '*.test.ts'])
     expect(apiProject).toMatchObject({ testDir: './tests/e2e-api' })
 
     // Non-CI defaults: permissive parallelism, no retries, forbidOnly disabled

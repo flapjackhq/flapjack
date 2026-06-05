@@ -158,8 +158,8 @@ test.describe('Event Debugger', () => {
     const table = page.getByTestId('event-table');
     await expect(table.getByText(seeded.clickName).first()).toBeVisible({ timeout: 15_000 });
 
-    // Select "Error" status filter — seeded events are all valid (OK), so should show 0
-    await page.getByLabel('Status').selectOption('error');
+    // Seeded events are all valid (OK), so the failed-events filter should show 0.
+    await page.getByLabel('Status').selectOption({ label: 'Failed' });
 
     // Wait for the table to update (polling refetch) and verify seeded OK events disappear.
     await expect(async () => {

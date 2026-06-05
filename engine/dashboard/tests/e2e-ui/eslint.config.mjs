@@ -19,8 +19,8 @@ import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
   {
-    // Lint spec files plus the shared UI helper used by those specs.
-    files: ['**/*.spec.ts', '**/helpers.ts'],
+    // Lint browser specs, focused helper tests, and shared UI helpers used by those specs.
+    files: ['**/*.spec.ts', '**/*.test.ts', '**/helpers.ts', '**/*_helpers.ts'],
     languageOptions: {
       parser: tseslint.parser,
       parserOptions: {

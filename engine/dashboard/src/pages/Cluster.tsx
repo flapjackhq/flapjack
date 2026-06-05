@@ -98,7 +98,7 @@ function StandaloneClusterState({ nodeId }: { nodeId: string }) {
   return (
     <Card data-testid="cluster-standalone-state">
       <CardHeader>
-        <CardTitle className="text-base">Standalone Node</CardTitle>
+        <CardTitle className="text-base">Standalone mode</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
         <div>
@@ -106,8 +106,11 @@ function StandaloneClusterState({ nodeId }: { nodeId: string }) {
           <p className="font-mono text-sm break-all" data-testid="cluster-node-id-value">{nodeId}</p>
         </div>
         <div>
-          <p className="text-sm text-muted-foreground">Replication</p>
-          <p className="text-sm font-medium" data-testid="cluster-replication-value">Disabled</p>
+          <p className="text-sm text-muted-foreground">Mode</p>
+          <p className="text-sm font-medium" data-testid="cluster-replication-value">Standalone mode</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Single-node operation is healthy and expected. Add peers only if you want multi-node HA replication.
+          </p>
         </div>
       </CardContent>
     </Card>

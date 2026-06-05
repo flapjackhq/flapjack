@@ -238,7 +238,11 @@ test.describe('API Keys Page', () => {
 
       await page.getByTestId('filter-all').click();
 
-      const e2eCards = page.getByTestId('key-card').filter({ hasText: E2E_DESCRIPTION_PREFIX });
+      const e2eCards = page.getByTestId('key-card').filter({
+        has: page.getByRole('heading', {
+          name: /^E2E Filter (Scoped|Global|Other Scoped) Key$/,
+        }),
+      });
       await expect(e2eCards).toHaveCount(3, { timeout: 10_000 });
       await expect(page.getByTestId('key-card').filter({ hasText: otherScopedDescription })).toBeVisible({ timeout: 10_000 });
     } finally {

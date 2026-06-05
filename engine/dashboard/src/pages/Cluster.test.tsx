@@ -78,7 +78,11 @@ describe('Cluster page', () => {
     expect(screen.getByTestId('cluster-page-shell')).toBeInTheDocument();
     expect(screen.getByTestId('cluster-standalone-state')).toBeInTheDocument();
     expect(screen.getByTestId('cluster-node-id-value')).toHaveTextContent('standalone-node');
-    expect(screen.getByTestId('cluster-replication-value')).toHaveTextContent('Disabled');
+    expect(screen.getByRole('heading', { name: 'Standalone mode' })).toBeInTheDocument();
+    expect(screen.getByTestId('cluster-replication-value')).toHaveTextContent('Standalone mode');
+    expect(
+      screen.getByText('Single-node operation is healthy and expected. Add peers only if you want multi-node HA replication.')
+    ).toBeInTheDocument();
   });
 
   it('renders HA summary cards from payload totals and peer rows from peers list', () => {

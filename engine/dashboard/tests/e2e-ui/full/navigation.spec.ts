@@ -323,16 +323,16 @@ test.describe('Navigation & Layout', () => {
 
       await gotoIndexPage(page, chatIndex);
 
+      if (!vectorSearchEnabled) {
+        await expect(page.getByTestId('index-tab-chat')).not.toBeVisible();
+        return;
+      }
+
       // Chat tab should be visible with NeuralSearch mode
       await expect(page.getByTestId('index-tab-chat')).toBeVisible({ timeout: 10_000 });
 
       await page.getByTestId('index-tab-chat').click();
       await expect(page).toHaveURL(new RegExp(`/index/${chatIndex}/chat`));
-      if (!vectorSearchEnabled) {
-        await expect(page.getByTestId('chat-capability-disabled')).toBeVisible({ timeout: 10_000 });
-        await expect(page.getByTestId('chat-capability-disabled')).toContainText('not compiled in');
-        return;
-      }
       await expect(page.getByTestId('chat-input')).toBeVisible({ timeout: 10_000 });
     } finally {
       await deleteIndex(request, chatIndex);

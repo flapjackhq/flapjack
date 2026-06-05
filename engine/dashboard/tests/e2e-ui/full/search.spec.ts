@@ -31,6 +31,10 @@ import {
   readVisibleObjectId,
   responseMatchesIndexQuery,
 } from '../result-helpers';
+import {
+  MOVIES_DOCUMENT_ACTIONS_INDEX,
+  seedMoviesDocumentActionsIndex,
+} from '../../fixtures/lane_c_movies';
 
 function extractObjectIds(hits: unknown[] | undefined): string[] {
   if (!Array.isArray(hits)) {
@@ -745,5 +749,18 @@ test.describe('Search & Browse', () => {
 
       markDocumentRemoved(createdDocumentIds, docId);
     });
+  });
+
+  test('delete document movie action includes object id in accessible name', async ({ page, request }) => {
+    await seedMoviesDocumentActionsIndex(request);
+    await page.goto(`/index/${MOVIES_DOCUMENT_ACTIONS_INDEX}`);
+
+    const movieCard = page.getByTestId('document-card')
+      .filter({ has: page.getByText(/movie_\d{3}/) })
+      .first();
+    await expect(movieCard).toBeVisible({ timeout: 10_000 });
+    await expect(
+      movieCard.getByRole('button', { name: /delete document movie_\d{3}/i }),
+    ).toBeVisible();
   });
 });

@@ -253,7 +253,6 @@ pub struct ConcludedExperimentResponse {
 /// TODO: Document concluded_experiment_response.
 /// TODO: Document concluded_experiment_response.
 /// TODO: Document concluded_experiment_response.
-/// TODO: Document concluded_experiment_response.
 #[allow(clippy::result_large_err)] // Response is inherently large in axum; boxing adds indirection without benefit at a single call site
 pub(super) fn concluded_experiment_response(
     experiment: Experiment,

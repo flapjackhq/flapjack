@@ -80,7 +80,7 @@ export function EventFiltersPanel({
         >
           <option value="">All</option>
           <option value="ok">OK</option>
-          <option value="error">Error</option>
+          <option value="error">Failed</option>
         </select>
       </div>
       <div className="space-y-1">

@@ -4,10 +4,10 @@
 
 ### Scenario Owner
 
-- Probe: [`engine/_dev/s/manual-tests/ha-peer-failed-amp-probe.sh`](../_dev/s/manual-tests/ha-peer-failed-amp-probe.sh)
-- Acceptance contract: [`engine/loadtest/tests/ha_peer_failed_amplification_acceptance.sh`](tests/ha_peer_failed_amplification_acceptance.sh)
-- Stage 1 calibration evidence: [`docs/research/pl12_stage1_baseline.md`](../../docs/research/pl12_stage1_baseline.md)
-- Stage 3 no-tune decision: [`docs/research/pl12v2_stage2_tune_plan.md`](../../docs/research/pl12v2_stage2_tune_plan.md)
+- Probe: `engine/_dev/s/manual-tests/ha-peer-failed-amp-probe.sh`
+- Acceptance contract: `engine/loadtest/tests/ha_peer_failed_amplification_acceptance.sh`
+- Stage 1 calibration evidence: `docs/research/pl12_stage1_baseline.md`
+- Stage 3 no-tune decision: `docs/research/pl12v2_stage2_tune_plan.md`
 
 ### Final Contract Posture
 
@@ -51,7 +51,7 @@
 
 ### Exact Commands
 
-- Server: `/Users/stuart/parallel_development/flapjack_dev/may27_8pm_1_pl10v2_write_throughput/flapjack_dev/engine/target/release/flapjack --no-auth --bind-addr 127.0.0.1:17700 --data-dir /Users/stuart/parallel_development/flapjack_dev/may27_8pm_1_pl10v2_write_throughput/flapjack_dev/engine/loadtest/results/20260528T062547Z-pl10-stage6-dual-scenario/server_data`
+- Server: `engine/target/release/flapjack --no-auth --bind-addr 127.0.0.1:17700 --data-dir <local-results-dir>/server_data`
 - Seed: `FLAPJACK_LOADTEST_BASE_URL=http://127.0.0.1:17700 bash engine/loadtest/seed-loadtest-data.sh`
 - Mixed soak (60m): `cd engine/loadtest && FLAPJACK_LOADTEST_BASE_URL=http://127.0.0.1:17700 FLAPJACK_LOADTEST_SOAK_DURATION=60m k6 run scenarios/mixed-soak.js`
 - Realistic batch soak (30m): `cd engine/loadtest && FLAPJACK_LOADTEST_BASE_URL=http://127.0.0.1:17700 FLAPJACK_LOADTEST_SOAK_DURATION=30m k6 run scenarios/realistic_batch_soak.js`
@@ -345,7 +345,7 @@ Diagnostic 2h soak following the L1 anti-entropy / strict bootstrap peer-coverag
 
 - **L1 anti-entropy + strict bootstrap peer-coverage works as designed.** The `c1_ownership` and `c3_replica_freshness` contracts hold; segment integrity recovers cleanly under sustained restart pressure.
 - **Convergence improved 3.4× over Mar 30** — steady-state spread is 0.88% (vs ~3%).
-- **No node-zero failure mode.** All three nodes ended healthy with non-trivial doc counts. The 2026-05-25 18:46Z node-a→0-docs fluke (preserved evidence at `docs/research/2026_05_26_ha_soak_segment_inconsistency.md`) did not reproduce.
+- **No node-zero failure mode.** All three nodes ended healthy with non-trivial doc counts. The 2026-05-25 18:46Z node-a-to-0-docs fluke (preserved evidence at `docs/research/2026_05_26_ha_soak_segment_inconsistency.md`) did not reproduce.
 
 ### What This Soak Does Not Prove
 

@@ -140,6 +140,44 @@ readme_has_api_docs_swagger_link() {
   ' "$target_readme"
 }
 
+readme_has_migration_quickstart_contract() {
+  target_readme="$1"
+  awk '
+    /^## Migrate from Algolia$/ {
+      migrate_sections += 1
+      in_migration = 1
+      next
+    }
+    /^## / && in_migration {
+      in_migration = 0
+    }
+    in_migration && /^### 3-command quickstart$/ {
+      quickstart_count += 1
+      in_quickstart = 1
+      quickstart_lines = 0
+      next
+    }
+    in_quickstart && (/^## / || /^### /) {
+      in_quickstart = 0
+    }
+    in_quickstart {
+      quickstart_lines += 1
+    }
+    in_quickstart && /^curl -fsSL https:\/\/install\.flapjack\.foo \| sh$/ {
+      quickstart_unpinned_installs += 1
+    }
+    in_quickstart && /hosts: \[\{ url: '\''localhost:7700'\'', protocol: '\''http'\'', accept: '\''readWrite'\'' \}\]/ {
+      localhost_contract = 1
+    }
+    END {
+      if (migrate_sections == 1 && quickstart_count == 1 && quickstart_lines <= 25 && quickstart_unpinned_installs == 1 && localhost_contract) {
+        exit 0
+      }
+      exit 1
+    }
+  ' "$target_readme"
+}
+
 wait_for_task_published() {
   task_id="$1"
 
@@ -175,6 +213,19 @@ trap cleanup EXIT
 # ── Build or locate binary ───────────────────────────────────────────────────
 
 printf "\033[1mREADME API Smoke Tests\033[0m\n"
+
+# Keep high-signal README structure checks cheap; they do not need a running
+# server and should fail before the cargo build when the public on-ramp drifts.
+if readme_has_migration_quickstart_contract "$README_PATH"; then
+  pass "README Algolia migration section has the 3-command quickstart contract"
+else
+  fail "README Algolia migration section must include the canonical 3-command quickstart contract"
+fi
+
+if [ "$TESTS_FAILED" -gt 0 ]; then
+  printf "\033[0;31mREADME doc guard failed before server smoke tests\033[0m\n"
+  exit 1
+fi
 
 if [ -n "${FLAPJACK_BIN:-}" ]; then
   if [ ! -x "$FLAPJACK_BIN" ]; then

@@ -364,6 +364,7 @@ export const DocumentCard = memo(function DocumentCard({
                 onClick={() => onDelete(objectID)}
                 disabled={isDeleting}
                 title="Delete document"
+                aria-label={`delete document ${objectID}`}
               >
                 <Trash2 className="h-3.5 w-3.5" />
               </Button>

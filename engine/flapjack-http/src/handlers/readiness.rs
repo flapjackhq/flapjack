@@ -1,13 +1,18 @@
 use crate::error_response::HandlerError;
 use crate::tenant_dirs::visible_tenant_dir_names;
 use axum::{extract::State, http::StatusCode, Json};
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use super::AppState;
 
-fn first_visible_tenant_to_probe(mut visible_tenants: Vec<String>) -> Option<String> {
+fn first_searchable_tenant_to_probe(
+    data_path: &Path,
+    mut visible_tenants: Vec<String>,
+) -> Option<String> {
     visible_tenants.sort();
-    visible_tenants.into_iter().next()
+    visible_tenants
+        .into_iter()
+        .find(|tenant| data_path.join(tenant).join("meta.json").is_file())
 }
 
 fn readiness_service_unavailable() -> HandlerError {
@@ -30,17 +35,19 @@ pub async fn ready(
         readiness_service_unavailable()
     })?;
 
-    let Some(first_visible_tenant) = first_visible_tenant_to_probe(visible_tenants) else {
+    let Some(first_searchable_tenant) =
+        first_searchable_tenant_to_probe(&state.manager.base_path, visible_tenants)
+    else {
         return Ok(Json(serde_json::json!({ "ready": true })));
     };
 
     state
         .manager
-        .search(&first_visible_tenant, "", None, None, 1)
+        .search(&first_searchable_tenant, "", None, None, 1)
         .map_err(|error| {
             tracing::warn!(
                 "readiness probe failed to search tenant {}: {}",
-                first_visible_tenant,
+                first_searchable_tenant,
                 error
             );
             readiness_service_unavailable()
@@ -109,26 +116,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ready_uses_sorted_first_visible_tenant_for_probe() {
+    async fn ready_skips_visible_non_index_tenant_dirs() {
         let tmp = TempDir::new().unwrap();
         let state = TestStateBuilder::new(&tmp).build_shared();
         state.manager.create_tenant("zeta").unwrap();
-        std::fs::create_dir_all(tmp.path().join("alpha")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("flapjack").join(".dictionaries")).unwrap();
         let app = Router::new()
             .route("/health/ready", get(ready))
             .with_state(state);
 
         let (status, body) = readiness_response_json(app).await;
 
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            body,
-            serde_json::json!({
-                "message": "Service unavailable",
-                "status": 503
-            }),
-            "probe must deterministically use first sorted visible tenant (alpha before zeta)"
-        );
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({ "ready": true }));
+    }
+
+    #[tokio::test]
+    async fn ready_returns_ready_when_only_visible_non_index_tenant_dirs_exist() {
+        let tmp = TempDir::new().unwrap();
+        let state = TestStateBuilder::new(&tmp).build_shared();
+        std::fs::create_dir_all(tmp.path().join("flapjack").join(".dictionaries")).unwrap();
+        let app = Router::new()
+            .route("/health/ready", get(ready))
+            .with_state(state);
+
+        let (status, body) = readiness_response_json(app).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({ "ready": true }));
     }
     #[tokio::test]
     async fn ready_returns_canonical_503_when_visible_tenant_discovery_fails() {
@@ -158,10 +173,17 @@ mod tests {
     }
 
     #[test]
-    fn first_visible_tenant_probe_sorts_names_before_selection() {
+    fn first_searchable_tenant_probe_sorts_names_before_selection() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("zeta")).unwrap();
+        std::fs::write(tmp.path().join("zeta").join("meta.json"), "{}").unwrap();
+
         assert_eq!(
-            first_visible_tenant_to_probe(vec!["zeta".to_string(), "alpha".to_string()]),
-            Some("alpha".to_string())
+            first_searchable_tenant_to_probe(
+                tmp.path(),
+                vec!["zeta".to_string(), "alpha".to_string()]
+            ),
+            Some("zeta".to_string())
         );
     }
 }

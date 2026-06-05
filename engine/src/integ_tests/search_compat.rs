@@ -154,7 +154,6 @@ fn legacy_search_options<'a>(
 /// TODO: Document SearchCompat.
 /// TODO: Document SearchCompat.
 /// TODO: Document SearchCompat.
-/// TODO: Document SearchCompat.
 #[allow(clippy::too_many_arguments)] // Test-only shim preserves legacy lib-test callsites while production stays `SearchOptions`-based.
 pub(crate) trait SearchCompat {
     fn search_with_facets(

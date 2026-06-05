@@ -204,8 +204,11 @@ describe('EventDebugger', () => {
     })
     render(<EventDebugger />, { wrapper })
 
-    // Select "Error" from the status filter
-    await user.selectOptions(screen.getByLabelText('Status'), 'error')
+    const statusSelect = screen.getByLabelText('Status')
+    const failedStatusOption = within(statusSelect).getByRole('option', { name: 'Failed' })
+    expect(failedStatusOption).toHaveValue('error')
+
+    await user.selectOptions(statusSelect, failedStatusOption)
 
     // Hook should have been called with status filter
     expect(mockDebugEvents).toHaveBeenCalledWith(
