@@ -4,7 +4,10 @@ Thanks for your interest in improving Flapjack.
 
 ## Bug Reports
 
-Use GitHub Issues and select the bug report template when available.
+Use GitHub Issues and select the bug report template for confirmed defects.
+Usage questions, setup help, integration troubleshooting, and other unresolved
+support requests belong in [GitHub Discussions Q&A](https://github.com/flapjackhq/flapjack/discussions/categories/q-a)
+or the support path described in [.github/SUPPORT.md](.github/SUPPORT.md).
 
 Include:
 
@@ -15,7 +18,8 @@ Include:
 
 ## Feature Requests
 
-Open a GitHub Issue describing:
+For exploratory product ideas, start in [GitHub Discussions Ideas](https://github.com/flapjackhq/flapjack/discussions/categories/ideas).
+Open a GitHub Issue for concrete behavior or API changes, describing:
 
 - The problem you are trying to solve.
 - Why existing behavior is insufficient.

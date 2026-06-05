@@ -1,4 +1,4 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun04_pm_3_dashboard_first_impression_polish/flapjack_dev/engine/flapjack-replication/src/manager.rs.
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun05_am_4_oss_repo_polish/flapjack_dev/engine/flapjack-replication/src/manager.rs.
 use super::circuit_breaker::CircuitState;
 use super::config::NodeConfig;
 use super::peer::PeerClient;
@@ -319,6 +319,18 @@ impl ReplicationManager {
         Ok(())
     }
 
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
+    /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
     /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
     /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.
     /// TODO: Document ReplicationManager.catch_up_from_peer_with_metadata_internal.

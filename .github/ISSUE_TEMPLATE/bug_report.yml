@@ -1,0 +1,70 @@
+name: Bug report
+description: Report a reproducible defect in Flapjack.
+title: "Bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for actionable defects. Usage questions belong in GitHub Discussions.
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected behavior
+      description: What should Flapjack have done?
+    validations:
+      required: true
+  - type: textarea
+    id: actual_behavior
+    attributes:
+      label: Actual behavior
+      description: What happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction_steps
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest command sequence, request body, dataset, or code sample that reproduces the issue.
+      placeholder: |
+        1. Create index with ...
+        2. Send request ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: input
+    id: version_commit
+    attributes:
+      label: Version or commit
+      description: Include the Flapjack version, image tag, binary build, or commit SHA.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, CPU architecture, deployment mode, client SDK, and relevant configuration.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or traces
+      description: Paste the relevant server logs, client errors, stack traces, or request IDs. Redact secrets.
+      render: text
+    validations:
+      required: false
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact
+      description: How severe is this defect for your deployment?
+      options:
+        - Blocks production usage
+        - Breaks an existing integration
+        - Produces incorrect search results
+        - Causes degraded performance
+        - Minor defect or documentation mismatch
+    validations:
+      required: true

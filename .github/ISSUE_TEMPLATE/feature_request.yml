@@ -1,0 +1,45 @@
+name: Feature request
+description: Propose a concrete Flapjack behavior or API change.
+title: "Feature: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For open-ended product discussion, use Ideas: https://github.com/flapjackhq/flapjack/discussions/categories/ideas
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What concrete workflow, integration, or compatibility gap should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: current_workaround
+    attributes:
+      label: Current workaround
+      description: Describe how you handle this today, including tradeoffs or failure modes.
+    validations:
+      required: true
+  - type: textarea
+    id: proposed_behavior
+    attributes:
+      label: Proposed behavior or API shape
+      description: Describe the request/response shape, setting, command, or user-visible behavior you expect.
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility_impact
+    attributes:
+      label: Compatibility impact
+      description: Note expected effects on Algolia API compatibility, existing clients, data formats, or deployment behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: List other approaches you considered and why they are not enough.
+    validations:
+      required: true
