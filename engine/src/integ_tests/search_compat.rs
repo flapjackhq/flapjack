@@ -1,4 +1,3 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun05_am_4_oss_repo_polish/flapjack_dev/engine/src/integ_tests/search_compat.rs.
 use crate::index::SearchOptions;
 use crate::types::{FacetRequest, Filter, SearchResult, Sort};
 use crate::{error::Result, IndexManager};
@@ -33,6 +32,7 @@ fn legacy_search_options<'a>(
 /// compiling during API migration.
 ///
 /// This trait is test-only compatibility glue and is intentionally not used by production code.
+/// TODO: Document SearchCompat.
 /// TODO: Document SearchCompat.
 /// TODO: Document SearchCompat.
 /// TODO: Document SearchCompat.

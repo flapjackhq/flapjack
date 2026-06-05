@@ -89,7 +89,7 @@ Binaries: [Releases](https://github.com/flapjackhq/flapjack/releases/latest).
 curl -fsSL https://install.flapjack.foo | sh
 
 # Pin a specific release when needed
-curl -fsSL https://install.flapjack.foo | sh -s -- v1.0.7
+curl -fsSL https://install.flapjack.foo | sh -s -- v1.0.8
 
 # Custom install directory
 FLAPJACK_INSTALL=/opt/flapjack curl -fsSL https://install.flapjack.foo | sh
@@ -110,7 +110,10 @@ Use `--instance <name>` to run isolated instances with separate data directories
 
 ## Migrate from Algolia
 
+### 3-command quickstart
+
 ```bash
+curl -fsSL https://install.flapjack.foo | sh
 flapjack
 
 curl -X POST http://localhost:7700/1/migrate-from-algolia \
@@ -120,17 +123,7 @@ curl -X POST http://localhost:7700/1/migrate-from-algolia \
   -d '{"appId":"YOUR_ALGOLIA_APP_ID","apiKey":"YOUR_ALGOLIA_ADMIN_KEY","sourceIndex":"products"}'
 ```
 
-Search:
-
-```bash
-curl -X POST http://localhost:7700/1/indexes/products/query \
-  -H "X-Algolia-API-Key: $API_KEY" \
-  -H "X-Algolia-Application-Id: flapjack" \
-  -H "Content-Type: application/json" \
-  -d '{"query":"widget"}'
-```
-
-Then point your frontend at Flapjack instead of Algolia:
+Then initialize your frontend with `flapjackSearch(...)`:
 
 ```javascript
 import { flapjackSearch } from 'flapjack-search';
@@ -141,6 +134,18 @@ const client = flapjackSearch('flapjack', 'your-flapjack-api-key', {
 });
 
 // Everything else stays the same
+```
+
+### Migration API and search check
+
+After the import finishes, search the migrated index:
+
+```bash
+curl -X POST http://localhost:7700/1/indexes/products/query \
+  -H "X-Algolia-API-Key: $API_KEY" \
+  -H "X-Algolia-Application-Id: flapjack" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"widget"}'
 ```
 
 For the full JavaScript migration checklist and method matrix, see
