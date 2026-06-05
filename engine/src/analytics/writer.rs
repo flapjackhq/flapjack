@@ -1576,6 +1576,8 @@ mod tests {
     /// TODO: Document flush_rollup_window_hourly_aggregates_known_answer.
     /// TODO: Document flush_rollup_window_hourly_aggregates_known_answer.
     /// TODO: Document flush_rollup_window_hourly_aggregates_known_answer.
+    /// TODO: Document flush_rollup_window_hourly_aggregates_known_answer.
+    /// TODO: Document flush_rollup_window_hourly_aggregates_known_answer.
     #[test]
     #[allow(clippy::cognitive_complexity)] // Known-answer test keeps all assertions inline so expected aggregates remain explicit and auditable.
     fn flush_rollup_window_hourly_aggregates_known_answer() {
@@ -1660,6 +1662,8 @@ mod tests {
         );
     }
 
+    /// TODO: Document flush_rollup_window_daily_compacts_from_hourly_only.
+    /// TODO: Document flush_rollup_window_daily_compacts_from_hourly_only.
     /// TODO: Document flush_rollup_window_daily_compacts_from_hourly_only.
     /// TODO: Document flush_rollup_window_daily_compacts_from_hourly_only.
     /// TODO: Document flush_rollup_window_daily_compacts_from_hourly_only.
