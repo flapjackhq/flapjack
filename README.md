@@ -89,7 +89,7 @@ Binaries: [Releases](https://github.com/flapjackhq/flapjack/releases/latest).
 curl -fsSL https://install.flapjack.foo | sh
 
 # Pin a specific release when needed
-curl -fsSL https://install.flapjack.foo | sh -s -- v1.0.8
+curl -fsSL https://install.flapjack.foo | sh -s -- v1.0.9
 
 # Custom install directory
 FLAPJACK_INSTALL=/opt/flapjack curl -fsSL https://install.flapjack.foo | sh

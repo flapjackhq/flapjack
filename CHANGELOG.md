@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.9] - 2026-06-05
+
 ### Fixed
 
 - Dashboard `/cluster` now presents standalone replication status as a healthy single-node state with explicit reassurance copy for operators who are not running HA peers.
@@ -128,6 +130,7 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Hardened transport and replication flows to reduce operational failure modes during distributed operation.
 
 [Unreleased]: https://github.com/flapjackhq/flapjack/commits/main
+[1.0.9]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.9
 [1.0.8]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.8
 [1.0.7]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.7
 [1.0.6]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.6
