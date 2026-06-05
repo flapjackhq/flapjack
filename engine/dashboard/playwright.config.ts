@@ -18,6 +18,13 @@ function parseWorkersOverride(rawValue: string | undefined): number | undefined 
 
 const localWorkersOverride = parseWorkersOverride(process.env.PLAYWRIGHT_E2E_WORKERS);
 const videoMode = process.env.FJ_PLAYWRIGHT_VIDEO === 'on' ? 'on' : undefined;
+const evidenceOnlyLaneCSpecs = [
+  'jun04_pm_lane_c_audit.spec.ts',
+  'jun05_am_lane_c_round2_audit.spec.ts',
+];
+const e2eUiTestIgnore = process.env.LANE_C_BUNDLE_DIR
+  ? ['*.setup.ts', '*.test.ts']
+  : ['*.setup.ts', '*.test.ts', ...evidenceOnlyLaneCSpecs];
 
 /**
  * Playwright configuration for Flapjack dashboard.
@@ -63,7 +70,7 @@ export default defineConfig({
     {
       name: 'e2e-ui',
       testDir: './tests/e2e-ui',
-      testIgnore: ['*.setup.ts', '*.test.ts'],
+      testIgnore: e2eUiTestIgnore,
       dependencies: ['seed'],
       use: { ...devices['Desktop Chrome'] },
     },

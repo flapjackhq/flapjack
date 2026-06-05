@@ -23,7 +23,11 @@ const { mockInstance } = vi.hoisted(() => ({
   },
 }))
 
-async function loadPlaywrightConfig(ciValue?: string, workerOverride?: string) {
+async function loadPlaywrightConfig(
+  ciValue?: string,
+  workerOverride?: string,
+  laneCBundleDir?: string,
+) {
   vi.resetModules()
   vi.unstubAllEnvs()
 
@@ -32,6 +36,9 @@ async function loadPlaywrightConfig(ciValue?: string, workerOverride?: string) {
   }
   if (workerOverride !== undefined) {
     vi.stubEnv('PLAYWRIGHT_E2E_WORKERS', workerOverride)
+  }
+  if (laneCBundleDir !== undefined) {
+    vi.stubEnv('LANE_C_BUNDLE_DIR', laneCBundleDir)
   }
 
   vi.doMock('./local-instance-config', () => ({
@@ -91,7 +98,12 @@ describe('playwright.config startup contracts', () => {
     expect(seedProject?.teardown).toBe('cleanup')
     expect(cleanupProject?.testMatch).toBe('cleanup.setup.ts')
     expect(uiProject?.dependencies).toEqual(['seed'])
-    expect(uiProject?.testIgnore).toEqual(['*.setup.ts', '*.test.ts'])
+    expect(uiProject?.testIgnore).toEqual([
+      '*.setup.ts',
+      '*.test.ts',
+      'jun04_pm_lane_c_audit.spec.ts',
+      'jun05_am_lane_c_round2_audit.spec.ts',
+    ])
     expect(apiProject).toMatchObject({ testDir: './tests/e2e-api' })
 
     // Non-CI defaults: permissive parallelism, no retries, forbidOnly disabled
@@ -118,5 +130,18 @@ describe('playwright.config startup contracts', () => {
   it('honors PLAYWRIGHT_E2E_WORKERS override for local runs', async () => {
     const config = await loadPlaywrightConfig(undefined, '1')
     expect(config.workers).toBe(1)
+  })
+
+  it('runs Lane C evidence-only specs only when the bundle directory is explicit', async () => {
+    const defaultConfig = await loadPlaywrightConfig('')
+    const defaultUiProject = findProject(defaultConfig.projects, 'e2e-ui')
+
+    expect(defaultUiProject?.testIgnore).toContain('jun04_pm_lane_c_audit.spec.ts')
+    expect(defaultUiProject?.testIgnore).toContain('jun05_am_lane_c_round2_audit.spec.ts')
+
+    const laneCConfig = await loadPlaywrightConfig('', undefined, 'docs/live-state/jun05_am_lane_c_baseline/20260605T045543Z')
+    const laneCUiProject = findProject(laneCConfig.projects, 'e2e-ui')
+
+    expect(laneCUiProject?.testIgnore).toEqual(['*.setup.ts', '*.test.ts'])
   })
 })
