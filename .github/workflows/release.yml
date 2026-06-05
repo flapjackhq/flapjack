@@ -184,11 +184,47 @@ jobs:
             git push origin "v${VERSION}"
           fi
 
+      - name: Extract changelog release notes
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          notes_file="release_notes.md"
+          awk -v version="$VERSION" '
+            index($0, "## [" version "] - ") == 1 {
+              found = 1
+              in_section = 1
+              print
+              next
+            }
+
+            in_section && index($0, "## [") == 1 {
+              in_section = 0
+            }
+
+            in_section {
+              print
+            }
+
+            END {
+              if (!found) {
+                exit 1
+              }
+            }
+          ' CHANGELOG.md > "$notes_file"
+
+          if [ ! -s "$notes_file" ]; then
+            echo "ERROR: extracted release notes for ${VERSION} are empty" >&2
+            exit 1
+          fi
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ github.event.inputs.version }}
-          generate_release_notes: true
+          body_path: release_notes.md
           files: |
             flapjack-*.tar.gz
             flapjack-*.tar.gz.sha256
