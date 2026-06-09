@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.10] - 2026-06-09
+
 ### Fixed
 
 - Dashboard `/dashboard/` now serves the embedded dashboard HTML instead of returning 404.
@@ -134,6 +136,7 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Hardened transport and replication flows to reduce operational failure modes during distributed operation.
 
 [Unreleased]: https://github.com/flapjackhq/flapjack/commits/main
+[1.0.10]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.10
 [1.0.9]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.9
 [1.0.8]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.8
 [1.0.7]: https://github.com/flapjackhq/flapjack/releases/tag/v1.0.7

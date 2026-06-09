@@ -1,6 +1,6 @@
 {
   "name": "flapjack-dashboard",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "description": "Web UI for managing Flapjack search indices",
   "type": "module",
   "scripts": {

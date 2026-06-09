@@ -642,6 +642,13 @@ fn read_local_ops_since(
 
 /// Retry pending local ops for peers that still show a recorded delivery error.
 /// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
 #[allow(clippy::cognitive_complexity)] // Per-peer retry/strict-mode handling is centralized here to keep startup catch-up failure semantics in one place.
 async fn repush_failed_peer_ranges(
     state: &AppState,
