@@ -324,7 +324,7 @@ All errors implement `std::error::Error` and can be converted with `?`.
 
 ## Performance Tips
 
-1. **Write throughput (beta)**: When write throughput matters, batch documents per call (for example, `index.add_documents_simple(vec![doc1, doc2, doc3, doc4])?;`) instead of sending one document per request. The post-PL-13 durable single-doc path (`IndexManager::add_documents_durable` -> `wait_for_write_durable` -> `await_task_terminal`) is roughly `5.290291 req/s`, while retained batched/sustained evidence is `831.652577/s` and `921.538969/s` using the write queue batch seam (`WRITE_QUEUE_BATCH_SIZE`). Do not treat parallel-writer fan-out as the throughput path; use batching. See `loadtest/BENCHMARKS.md` and `docs/research/pl13_stage3_throughput_delta.md`.
+1. **Write throughput (beta)**: When write throughput matters, batch documents per call (for example, `index.add_documents_simple(vec![doc1, doc2, doc3, doc4])?;`) instead of sending one document per request. The post-PL-13 durable single-doc path (`IndexManager::add_documents_durable` -> `wait_for_write_durable` -> `await_task_terminal`) is roughly `5.290291 req/s`, while retained batched/sustained evidence is `831.652577/s` and `921.538969/s` using the write queue batch seam (`WRITE_QUEUE_BATCH_SIZE`). Do not treat parallel-writer fan-out as the throughput path; use batching. See `loadtest/BENCHMARKS.md` and `docs/reference/research/pl13_stage3_throughput_delta.md`.
 2. **Batch writes**: Use `add_documents_simple` for bulk loading (one commit per call)
 3. **Reuse writers**: For manual writes, create a writer once and commit multiple times
 4. **Index warming**: Call `index.searchable_paths()` after loading to warm caches

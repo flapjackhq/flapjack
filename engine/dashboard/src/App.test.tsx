@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 import { render, screen } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { BrowserRouter, MemoryRouter } from 'react-router-dom'
 import { TEST_ROUTER_FUTURE } from './test/routerFuture'
 import App from './App'
 
@@ -59,6 +59,10 @@ vi.mock('./components/layout/Layout', async () => {
   }
 })
 
+vi.mock('./pages/Overview', () => ({
+  Overview: () => <h1>Overview page</h1>,
+}))
+
 vi.mock('./pages/SearchBrowse', () => ({
   SearchBrowse: () => <div>Browse page</div>,
 }))
@@ -74,6 +78,16 @@ vi.mock('./pages/Cluster', async () => {
     Cluster: () => <div data-testid="cluster-page-contract">Cluster page contract</div>,
   }
 })
+
+function renderDashboardRoute(path: string) {
+  window.history.replaceState({}, '', path)
+
+  render(
+    <BrowserRouter basename="/dashboard" future={TEST_ROUTER_FUTURE}>
+      <App />
+    </BrowserRouter>,
+  )
+}
 
 describe('App', () => {
   it('renders /cluster through the lazy loading shell and shared layout shell', async () => {
@@ -100,5 +114,20 @@ describe('App', () => {
     expect(screen.getByTestId('index-tab-bar')).toBeInTheDocument()
     expect(await screen.findByText('Browse page')).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Browse' })).toHaveAttribute('aria-current', 'page')
+  })
+
+  it('renders the overview route when the production dashboard overview URL has a trailing slash', async () => {
+    renderDashboardRoute('/dashboard/overview/')
+
+    expect(await screen.findByRole('heading', { name: 'Overview page' })).toBeInTheDocument()
+    expect(screen.queryByText('Page not found')).not.toBeInTheDocument()
+  })
+
+  it('renders nested index settings routes when the production dashboard URL has a trailing slash', async () => {
+    renderDashboardRoute('/dashboard/index/products/settings/')
+
+    expect(await screen.findByText('Settings page')).toBeInTheDocument()
+    expect(screen.getByTestId('index-tab-bar')).toBeInTheDocument()
+    expect(screen.queryByText('Page not found')).not.toBeInTheDocument()
   })
 })

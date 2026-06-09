@@ -1,4 +1,3 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun05_am_5_v109_release_cut/flapjack_dev/engine/flapjack-http/src/startup_catchup.rs.
 use crate::handlers::internal::apply_ops_to_manager;
 use crate::handlers::AppState;
 use flapjack::index::oplog::read_committed_seq;
@@ -352,7 +351,7 @@ impl SnapshotInstallStep {
 /// Returns the failing `SnapshotInstallStep` tag alongside the underlying error
 /// string so callers can surface a stable, non-leaking sub-step tag on the 500
 /// response while logging the full error server-side. Stage 1 diagnosis
-/// (`docs/research/may31_pm_ha_snapshot_flake_diagnosis.md`) identified the
+/// (`docs/reference/research/may31_pm_ha_snapshot_flake_diagnosis.md`) identified the
 /// `RenameTenantToBackup` / `RenameStagingToTenant` branches as the
 /// timing-dependent producers of the HA snapshot-restore-under-load flake on
 /// Linux tmpfs; the other branches fail deterministically on bad data or
@@ -641,110 +640,7 @@ fn read_local_ops_since(
     })
 }
 
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
-/// TODO: Document repush_failed_peer_ranges.
+/// Retry pending local ops for peers that still show a recorded delivery error.
 /// TODO: Document repush_failed_peer_ranges.
 #[allow(clippy::cognitive_complexity)] // Per-peer retry/strict-mode handling is centralized here to keep startup catch-up failure semantics in one place.
 async fn repush_failed_peer_ranges(

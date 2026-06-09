@@ -441,7 +441,7 @@ async fn test_write_queue_close_flush_commits_once() {
 /// With the legacy `WRITE_QUEUE_BATCH_SIZE = 10`, the same workload would
 /// produce 7 size-triggered batches plus 1 close-triggered batch (≥ 7
 /// segments), surfacing the multi_phase commit-pipeline saturation observed in
-/// `docs/research/pl10_write_bottleneck_20260528T033040Z_classification.md`
+/// `docs/reference/research/pl10_write_bottleneck_20260528T033040Z_classification.md`
 /// (commit_writer_with_panic_guard at 30.37% of total phase seconds, nested
 /// inside commit_batch at 33.54%).
 #[tokio::test(flavor = "current_thread")]

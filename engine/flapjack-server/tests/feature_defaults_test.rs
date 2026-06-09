@@ -1,7 +1,7 @@
 // Regression guard: `flapjack-server`'s default features must be empty so
 // `cargo build -p flapjack-server` does not transitively pull
 // `vector-search-local`'s heavy embedding chain. See
-// docs/research/may29_pm_1_ci_vector_search_split_stage1_decision.md.
+// docs/reference/research/may29_pm_1_ci_vector_search_split_stage1_decision.md.
 
 use std::path::PathBuf;
 use std::process::Command;

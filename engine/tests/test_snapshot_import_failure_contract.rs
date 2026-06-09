@@ -110,7 +110,7 @@ async fn invalid_snapshot_import_returns_500_json_and_preserves_existing_index_d
 }
 
 /// Hostile concurrent-import regression test for the HA snapshot-restore-under-load
-/// flake diagnosed in Stage 1 (`docs/research/may31_pm_ha_snapshot_flake_diagnosis.md`).
+/// flake diagnosed in Stage 1 (`docs/reference/research/may31_pm_ha_snapshot_flake_diagnosis.md`).
 ///
 /// Setup: seed a single-document index, export it to obtain valid snapshot bytes,
 /// then fire N concurrent `/1/indexes/{name}/import` requests against the same

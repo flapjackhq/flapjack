@@ -1,3 +1,4 @@
+//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun05_pm_1_dashboard_trailing_slash_routing_fix/flapjack_dev/engine/flapjack-http/src/router_tests.rs.
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -82,6 +83,33 @@ async fn dashboard_route_is_public_and_serves_html() {
     assert!(
         html.contains("<html"),
         "dashboard body should contain HTML markup"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_trailing_slash_route_is_public_and_serves_html() {
+    let (_tmp, app) = build_auth_test_app();
+
+    let resp = send_empty_request(&app, Method::GET, "/dashboard/").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.starts_with("text/html"),
+        "expected dashboard trailing slash route to return HTML, got: {content_type}"
+    );
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        html.contains("<html"),
+        "dashboard trailing slash body should contain HTML markup"
     );
 }
 

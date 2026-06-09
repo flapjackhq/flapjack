@@ -293,7 +293,7 @@ doc_sync_collect_public_doc_graph_docs() {
   while IFS= read -r file_path; do
     [ -n "$file_path" ] || continue
     case "$file_path" in
-      README.md|ROADMAP.md|PRIORITIES.md|engine/README.md|engine/LIB.md|engine/docs2/FEATURES.md|engine/loadtest/BENCHMARKS.md)
+      README.md|PROJECT_OVERVIEW.md|ROADMAP.md|engine/README.md|engine/LIB.md|engine/docs2/FEATURES.md|engine/loadtest/BENCHMARKS.md)
         if [ -f "$DOC_SYNC_REPO_DIR/$file_path" ]; then
           printf '%s\n' "$file_path" >> "$output_log"
         fi

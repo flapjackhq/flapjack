@@ -6,8 +6,8 @@
 
 - Probe: `engine/_dev/s/manual-tests/ha-peer-failed-amp-probe.sh`
 - Acceptance contract: `engine/loadtest/tests/ha_peer_failed_amplification_acceptance.sh`
-- Stage 1 calibration evidence: `docs/research/pl12_stage1_baseline.md`
-- Stage 3 no-tune decision: `docs/research/pl12v2_stage2_tune_plan.md`
+- Stage 1 calibration evidence: `docs/reference/research/pl12_stage1_baseline.md`
+- Stage 3 no-tune decision: `docs/reference/research/pl12v2_stage2_tune_plan.md`
 
 ### Final Contract Posture
 
@@ -345,7 +345,7 @@ Diagnostic 2h soak following the L1 anti-entropy / strict bootstrap peer-coverag
 
 - **L1 anti-entropy + strict bootstrap peer-coverage works as designed.** The `c1_ownership` and `c3_replica_freshness` contracts hold; segment integrity recovers cleanly under sustained restart pressure.
 - **Convergence improved 3.4× over Mar 30** — steady-state spread is 0.88% (vs ~3%).
-- **No node-zero failure mode.** All three nodes ended healthy with non-trivial doc counts. The 2026-05-25 18:46Z node-a-to-0-docs fluke (preserved evidence at `docs/research/2026_05_26_ha_soak_segment_inconsistency.md`) did not reproduce.
+- **No node-zero failure mode.** All three nodes ended healthy with non-trivial doc counts. The 2026-05-25 18:46Z node-a-to-0-docs fluke (preserved evidence at `docs/reference/research/2026_05_26_ha_soak_segment_inconsistency.md`) did not reproduce.
 
 ### What This Soak Does Not Prove
 
@@ -372,7 +372,7 @@ The Mar 30 entry above described this as a "Known boundary" between async replic
 - dev-repo HA soak harness (`engine/_dev/s/manual-tests/ha-soak-test.sh`)
 - L1 fix commit `066549d5` (strict bootstrap peer coverage; touches `engine/flapjack-replication/src/manager.rs` + `engine/flapjack-http/src/startup_catchup.rs`)
 - Script fix commit `528235bf` (preserves per-node `/data` snapshots on non-converged runs)
-- Partial diagnostic evidence from the 2026-05-25 18:46Z run preserved at `docs/research/2026_05_26_ha_soak_segment_inconsistency.md`
+- Partial diagnostic evidence from the 2026-05-25 18:46Z run preserved at `docs/reference/research/2026_05_26_ha_soak_segment_inconsistency.md`
 - Local 2h soak run artifacts (gitignored, but `node_data/` snapshots are local-only)
 
 ---

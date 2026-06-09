@@ -115,6 +115,22 @@ describe('Sidebar', () => {
     expect(screen.getByRole('link', { name: 'Overview' })).toHaveClass('text-primary');
   });
 
+  it('keeps Overview active when the overview route has a trailing slash', () => {
+    vi.mocked(useIndexes).mockReturnValue({
+      data: MANY_INDEXES,
+      isLoading: false,
+    } as unknown as ReturnType<typeof useIndexes>);
+
+    render(
+      <MemoryRouter initialEntries={['/overview/']} future={TEST_ROUTER_FUTURE}>
+        <Sidebar />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('link', { name: 'Overview' })).toHaveClass('bg-primary/15');
+    expect(screen.getByRole('link', { name: 'Overview' })).toHaveClass('text-primary');
+  });
+
   it('does not mark prefix-colliding indexes active on nested routes', () => {
     vi.mocked(useIndexes).mockReturnValue({
       data: [{ uid: 'idx-1' }, { uid: 'idx-10' }],

@@ -65,7 +65,9 @@ pub fn build_router(
         .merge(build_insights_routes(analytics_collector, data_dir))
         .merge(build_internal_routes(state.clone(), auth_enabled));
 
-    let app = app.nest("/dashboard", Router::new().fallback(get(dashboard_handler)));
+    let app = app
+        .route("/dashboard/", get(dashboard_handler))
+        .nest("/dashboard", Router::new().fallback(get(dashboard_handler)));
 
     apply_middleware(app, state, trusted_proxy_matcher, key_store, &cors_mode)
 }

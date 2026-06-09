@@ -3,7 +3,7 @@
 // hf-hub` chain it pulls in caused CI disk exhaustion (>10 GiB target/);
 // consumers needing local embedding must opt in with
 // `--features vector-search-local`. See
-// docs/research/may29_pm_1_ci_vector_search_split_stage1_decision.md.
+// docs/reference/research/may29_pm_1_ci_vector_search_split_stage1_decision.md.
 
 use std::path::PathBuf;
 use std::process::Command;

@@ -109,6 +109,18 @@ describe('IndexTabBar', () => {
     expect(screen.getByRole('link', { name: 'Browse' })).not.toHaveAttribute('aria-current')
   })
 
+  it('keeps the matching nested tab active when the route has a trailing slash', () => {
+    vi.mocked(useSettings).mockReturnValue({
+      data: { mode: 'neuralSearch' },
+      isLoading: false,
+    } as any)
+
+    renderTabBar('/index/products/settings/')
+
+    expect(screen.getByRole('link', { name: 'Settings' })).toHaveAttribute('aria-current', 'page')
+    expect(screen.getByRole('link', { name: 'Browse' })).not.toHaveAttribute('aria-current')
+  })
+
   it('keeps tabs horizontally scrollable without wrapping', () => {
     vi.mocked(useSettings).mockReturnValue({
       data: { mode: 'neuralSearch' },

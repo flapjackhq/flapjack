@@ -12,7 +12,7 @@ use tokio::time::timeout_at;
 
 // Raised from 10 to amortize the dominant Tantivy commit fixed-cost over more
 // queued ops per flush. Stage-3 multi_phase evidence (see
-// docs/research/pl10_write_bottleneck_20260528T033040Z_classification.md)
+// docs/reference/research/pl10_write_bottleneck_20260528T033040Z_classification.md)
 // shows commit_writer_with_panic_guard nested inside commit_batch consuming
 // ~90% of in-batch wall time; WRITE_QUEUE_FLUSH_INTERVAL still caps tail
 // latency and WRITE_QUEUE_CHANNEL_CAPACITY still gates QueueFull admission.

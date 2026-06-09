@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Dashboard `/dashboard/` now serves the embedded dashboard HTML instead of returning 404.
+
 ## [1.0.9] - 2026-06-05
 
 ### Fixed

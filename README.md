@@ -2,7 +2,7 @@
 
 <!-- markdownlint-disable-file MD004 MD013 MD033 MD034 MD040 MD045 MD060 -->
 
-**→ [Project Roadmap](ROADMAP.md)**
+**-> [Project Overview](PROJECT_OVERVIEW.md)** | **[Roadmap](ROADMAP.md)**
 
 [![CI](https://github.com/flapjackhq/flapjack/actions/workflows/ci.yml/badge.svg)](https://github.com/flapjackhq/flapjack/actions/workflows/ci.yml)
 [![Release](https://github.com/flapjackhq/flapjack/actions/workflows/release.yml/badge.svg)](https://github.com/flapjackhq/flapjack/releases)

@@ -15,7 +15,7 @@ Single maintained status ledger for Flapjack. Shipped feature status, current pr
 
 ## Public Sync Lineage Ledger (Canonical)
 
-This is the detailed public-sync lineage ledger. Current release truth is owned by [`PRIORITIES.md`](../../PRIORITIES.md) and [`CHANGELOG.md`](../../CHANGELOG.md); as of the 2026-06-05 doc truth-up, v1.0.9 released 2026-06-05 is the latest paid-beta ship in the v1.0 line.
+This is the detailed public-sync lineage ledger. Current strategic priority order is owned by [`PROJECT_OVERVIEW.md`](../../PROJECT_OVERVIEW.md), current open-work state is owned by [`ROADMAP.md`](../../ROADMAP.md), and release truth is owned by [`CHANGELOG.md`](../../CHANGELOG.md); as of the 2026-06-05 doc truth-up, v1.0.9 released 2026-06-05 is the latest paid-beta ship in the v1.0 line.
 
 May 22 OSS polish wave status facts (lanes A-F) and the v1.0.3 public-beta cut remain canonical historical lineage in the existing rows below; they are preserved as lineage, not as the current release baseline.
 
@@ -28,8 +28,8 @@ May 22 OSS polish wave status facts (lanes A-F) and the v1.0.3 public-beta cut r
 | Preserved cleanup lineage in prod history | Historical mar31/apr08/apr15 publication lineage remains preserved below; v1.0.3 is an additive release wave, not a history rewrite |
 | Non-pruned stale-file removals in public clones | No new stale-file removal axis introduced in v1.0.3; prior mar31/apr08/apr15 cleanup lineage remains authoritative |
 | Tracked-file audit outcome | v1.0.3 closure retained public-sync boundaries; no new blocker leaks surfaced in the published release wave |
-| Validator boundary contract | Public status/readiness detail ownership remains split: `FEATURES.md` for canonical snapshot, `PRIORITIES.md` + `ROADMAP.md` for live lane-state |
-| Local public validation before push | v1.0.3 release closure validated release assets/channels (`gh release`, GHCR multi-arch, nightly/staging/prod CI green lineage) per `PRIORITIES.md` |
+| Validator boundary contract | Public status/readiness detail ownership remains split: `FEATURES.md` for canonical snapshot, `PROJECT_OVERVIEW.md` for strategic priority order, and `ROADMAP.md` for live lane-state |
+| Local public validation before push | v1.0.3 release closure validated release assets/channels (`gh release`, GHCR multi-arch, nightly/staging/prod CI green lineage); release history now routes to `CHANGELOG.md` |
 | Known residual (out of scope for this wave) | v1.0.3 intentionally excludes post-tag `[Unreleased]` CLI flag/dispatch fixes that ship in the next release |
 
 ---
@@ -90,7 +90,7 @@ The original internal launch checklist is retained in the dev repo; the public o
 | Debbie sync pipeline (wave 2) | ✅ Done | mar30_pm_1 | Full debbie sync pipeline to staging and prod repos. OpenAPI test dedup and helper extraction (`openapi_test_helpers.rs`). Experiment handler refactoring (extracted `require_experiment_store`, `resolve_store_and_experiment_id`, `should_promote_variant_settings` helpers). Soak proof consistency harness improvements. Fixed debbie sync excludes for HA soak harness test and SDK lock files. |
 | Cognitive complexity reduction | ✅ Done | mar30_pm_2 | Decomposed 5 high-complexity hotspots: `merge_settings_payload` (CC=35), `SearchRequest::validate` (CC=29), `compute_exact_vs_prefix_bucket` (CC=26), `build_results_response` (CC=22), `browse_index` (CC=21). Each refactored into domain-grouped private helpers. Added settings characterization tests (`settings_tests.rs`). Moved `SearchCompat` trait methods to default implementations. |
 | Full regression gate + targeted fixes | ✅ Done | mar30_pm_5 | Ran the full post-merge regression gate across Rust, dashboard, browser, SDK, and Go surfaces. The real regression fix was FastEmbed test nondeterminism caused by concurrent ONNX/model cache initialization; affected tests are now serialized. Proof artifacts were captured in `engine/state/`, and the committed OpenAPI export was re-synced after restoring real browse/experiment endpoint summaries in current `main`. |
-| Public doc sync surface hardening | ✅ Done | mar30_pm_6 | The public-doc contract is now explicit in `.debbie.toml`: `ROADMAP.md`, `PRIORITIES.md`, `engine/LIB.md`, `engine/docs2/FEATURES.md`, `engine/loadtest/BENCHMARKS.md`, and the public `engine/docs2/1_STRATEGY/` + `3_IMPLEMENTATION/` trees are all whitelisted intentionally. Added `engine/tests/doc_sync_helpers.sh`, `engine/tests/validate_sync_surface.sh`, widened `engine/tests/validate_doc_links.sh`, and scrubbed non-public path references from the synced doc graph, including dev-only multi-instance script references in `engine/README.md`. |
+| Public doc sync surface hardening | ✅ Done | mar30_pm_6 | The public-doc contract is explicit in `.debbie.toml`; Stage 2 of the v2 doc-system migration replaces the former priorities file with `PROJECT_OVERVIEW.md` plus `ROADMAP.md`, alongside `engine/LIB.md`, `engine/docs2/FEATURES.md`, `engine/loadtest/BENCHMARKS.md`, and the public `engine/docs2/1_STRATEGY/` + `3_IMPLEMENTATION/` trees. Added `engine/tests/doc_sync_helpers.sh`, `engine/tests/validate_sync_surface.sh`, widened `engine/tests/validate_doc_links.sh`, and scrubbed non-public path references from the synced doc graph, including dev-only multi-instance script references in `engine/README.md`. |
 | HA convergence contract + runbook truth sync | ✅ Done | mar31_am_2 | Boundary path executed. Added `engine/docs2/4_EVIDENCE/HA_CONVERGENCE_ANALYSIS.md`, aligned `engine/docs2/3_IMPLEMENTATION/OPERATIONS.md` and `engine/examples/ha-cluster/README.md` with the proven async-replication boundary, and tightened `engine/loadtest/tests/ha_soak_acceptance.sh`. |
 | Debbie sync wave 3 | ✅ Done | mar31_am_1 | Published the latest post-launch hardening to staging commit `6166055` (CI run `23818440499`) and prod commit `b7841a0` (CI run `23819698304`). Carried the HA boundary truth surfaces, public doc sync contract, regression-gate follow-through, and refreshed committed OpenAPI export. |
 | Nightly CI + sync hygiene | ✅ Done | mar31_pm_1 | Restored nightly Rust CI parity by stubbing the dashboard dist asset, added `CHANGELOG.md`/`CONTRIBUTING.md`/`SECURITY.md` to the public sync whitelist, and clarified root README vector/hybrid platform caveats by target. Published in the completed public lineage; see [Public Sync Lineage Ledger (Canonical)](#public-sync-lineage-ledger-canonical). |
@@ -341,7 +341,7 @@ CI-runnable scripts that verify documentation accuracy and API completeness agai
 | Script | Purpose |
 |---|---|
 | `engine/tests/readme_api_smoke.sh` | Starts a clean server, executes every API curl example from the root README, asserts correct responses |
-| `engine/tests/validate_doc_links.sh` | Checks all internal markdown links in the current public routing docs (`README.md`, `PRIORITIES.md`, `ROADMAP.md`, `engine/README.md`, `engine/docs/HIGHEST_LEVEL.md`, `engine/docs2/FEATURES.md`, and `engine/docs2/1_STRATEGY/HIGHEST_PRIORITY.md`) resolve to real files |
+| `engine/tests/validate_doc_links.sh` | Checks all internal markdown links in the current public routing docs (`README.md`, `PROJECT_OVERVIEW.md`, `ROADMAP.md`, `engine/README.md`, `engine/docs/HIGHEST_LEVEL.md`, `engine/docs2/FEATURES.md`, and `engine/docs2/1_STRATEGY/HIGHEST_PRIORITY.md`) resolve to real files |
 | `engine/tests/integration_smoke.sh` | Comprehensive 513-line API integration test: 13 categories (health, index CRUD, doc CRUD, search variants, settings, synonyms, rules, analytics, API keys, dashboard, multi-index, browse, task status). Added by mar22_pm_3. |
 | `engine/tests/upgrade_smoke.sh` | Starts an older binary on a temp data dir, seeds data, then upgrades that same dir to a newer binary and re-verifies health/readiness/search/write/dashboard |
 
@@ -351,7 +351,7 @@ CI-runnable scripts that verify documentation accuracy and API completeness agai
 
 Production-readiness checklist organized by priority tier. Tier 1 items were launch blockers, Tier 2 items are required for production confidence, Tier 3 items can be iterated on post-launch.
 
-As of the 2026-06-05 doc truth-up, v1.0.9 released 2026-06-05 is the current shipped paid-beta baseline. This section remains the canonical readiness snapshot while ongoing lane-state and post-ship sequencing are intentionally routed to [`ROADMAP.md`](../../ROADMAP.md) and [`PRIORITIES.md`](../../PRIORITIES.md) to avoid duplicate live-status prose in this owner.
+As of the 2026-06-05 doc truth-up, v1.0.9 released 2026-06-05 is the current shipped paid-beta baseline. This section remains the canonical readiness snapshot while strategic priority order is routed to [`PROJECT_OVERVIEW.md`](../../PROJECT_OVERVIEW.md) and ongoing lane-state/post-ship sequencing is routed to [`ROADMAP.md`](../../ROADMAP.md) to avoid duplicate live-status prose in this owner.
 
 **Last updated: 2026-06-05**
 
