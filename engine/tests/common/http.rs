@@ -1,4 +1,3 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun01_am_2_ha_contracts_ci_stabilization/flapjack_dev/engine/tests/common/http.rs.
 use axum::extract::ConnectInfo;
 use std::net::SocketAddr;
 

@@ -1,6 +1,6 @@
 # Flapjack - Project Overview
 
-**Last updated:** 2026-06-05
+**Last updated:** 2026-06-10
 
 ## Mission
 

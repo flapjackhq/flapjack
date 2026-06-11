@@ -1,11 +1,13 @@
 # Flapjack - Roadmap
 
-**Last updated:** 2026-06-05
+**Last updated:** 2026-06-10
 **Ledger policy:** `ROADMAP.md` is the only root open-work ledger. Mission,
 scope, and strategic priority order live in [`PROJECT_OVERVIEW.md`](PROJECT_OVERVIEW.md).
 Shipped capability status lives in [`engine/docs2/FEATURES.md`](engine/docs2/FEATURES.md),
 release history lives in [`CHANGELOG.md`](CHANGELOG.md), and completed work
 history is routed to `implemented/2026_06_05_history.md`.
+
+**Last shipped release:** [v1.0.10](https://github.com/flapjackhq/flapjack/releases/tag/v1.0.10) (2026-06-09). Detailed release history lives in [`CHANGELOG.md`](CHANGELOG.md).
 
 **ID prefixes:** `RF-*` = foundational refinement track; `PL-*` =
 launch-hardening / operational-polish track. IDs are stable identifiers, not

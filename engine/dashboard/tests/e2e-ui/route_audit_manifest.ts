@@ -1,6 +1,3 @@
-/**
- * @module Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun04_pm_3_dashboard_first_impression_polish/flapjack_dev/engine/dashboard/tests/e2e-ui/route_audit_manifest.ts.
- */
 import type { Page } from '@playwright/test';
 import { expect } from '@playwright/test';
 import { waitForSearchResultsOrEmptyState } from './helpers';

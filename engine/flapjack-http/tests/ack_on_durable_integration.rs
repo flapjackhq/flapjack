@@ -1,4 +1,3 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun02_pm_1_admin_key_rotation_race_fix/flapjack_dev/engine/flapjack-http/tests/ack_on_durable_integration.rs.
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;

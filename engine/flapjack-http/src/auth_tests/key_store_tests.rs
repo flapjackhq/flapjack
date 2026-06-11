@@ -1,4 +1,3 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun02_pm_1_admin_key_rotation_race_fix/flapjack_dev/engine/flapjack-http/src/auth_tests/key_store_tests.rs.
 use super::*;
 use std::sync::{Arc, Barrier};
 

@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/may31_12pm_4_idempotency_cache_durability/flapjack_dev/engine/flapjack-server/tests/support/mod.rs.
 use assert_cmd::Command;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};

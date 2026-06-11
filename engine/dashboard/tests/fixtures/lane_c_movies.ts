@@ -1,6 +1,3 @@
-/**
- * @module Stub summary for /Users/stuart/parallel_development/flapjack_dev/jun05_am_3_dashboard_polish_round_2/flapjack_dev/engine/dashboard/tests/fixtures/lane_c_movies.ts.
- */
 import fs from 'node:fs';
 import path from 'node:path';
 import type { APIRequestContext } from '@playwright/test';

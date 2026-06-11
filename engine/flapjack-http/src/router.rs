@@ -1,4 +1,3 @@
-//! Stub summary for /Users/stuart/parallel_development/flapjack_dev/may31_12pm_4_idempotency_cache_durability/flapjack_dev/engine/flapjack-http/src/router.rs.
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;

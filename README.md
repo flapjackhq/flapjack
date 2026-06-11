@@ -108,6 +108,21 @@ Use `--instance <name>` to run isolated instances with separate data directories
 
 ---
 
+## Available SDKs
+
+Flapjack ships client SDKs across multiple languages; the list below reflects which are currently installable from public package registries.
+
+- **JavaScript** — `flapjack-search` on npm (with `@flapjack-search/*` scoped support packages: `client-common`, `client-search`, `logger-console`, `requester-browser-xhr`, `requester-fetch`, `requester-node-http`)
+- **Python** — `flapjack-search` on PyPI
+- **Go** — `github.com/flapjackhq/flapjack-search-go/v4`
+- **Ruby** — `flapjack-search` on RubyGems (install-path caveat: the published gem's required-Ruby metadata still reflects the pre-correction floor; build from source if `gem install` rejects your Ruby version)
+
+PHP, Java, C#, Dart, Scala, Kotlin, Swift, and the WordPress plugin are source-available under `sdks/` but not yet published to their public registries.
+
+See `docs/reference/research/jun04_sdk_truth_matrix.md` for the per-package publication evidence.
+
+---
+
 ## Migrate from Algolia
 
 ### 3-command quickstart
