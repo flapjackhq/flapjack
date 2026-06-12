@@ -22,13 +22,17 @@ pub(super) fn experiment_error_to_response(err: ExperimentError) -> Response {
         ExperimentError::AlreadyExists(message) => json_error(StatusCode::CONFLICT, message),
         ExperimentError::Io(error) => {
             tracing::error!(error = %error, "experiment storage I/O failed");
-            json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+            internal_server_error_response()
         }
         ExperimentError::Json(error) => {
             tracing::error!(error = %error, "experiment serialization failed");
-            json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+            internal_server_error_response()
         }
     }
+}
+
+fn internal_server_error_response() -> Response {
+    json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
 }
 
 /// Build the Algolia-compatible action payload returned by create/start/stop/delete endpoints.
@@ -156,31 +160,20 @@ pub(super) fn concluded_experiment_response(
     } = experiment;
 
     if status != ExperimentStatus::Concluded {
-        tracing::error!(
-            experiment_id = %id,
-            experiment_status = ?status,
-            "concluded experiment response received non-concluded experiment"
-        );
-        return Err(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal server error",
+        return Err(concluded_experiment_invariant_error(
+            &id,
+            &status,
+            "concluded experiment response received non-concluded experiment",
         ));
     }
 
-    let conclusion = match conclusion {
-        Some(conclusion) => conclusion,
-        None => {
-            tracing::error!(
-                experiment_id = %id,
-                experiment_status = ?status,
-                "concluded experiment response missing conclusion payload"
-            );
-            return Err(json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal server error",
-            ));
-        }
-    };
+    let conclusion = conclusion.ok_or_else(|| {
+        concluded_experiment_invariant_error(
+            &id,
+            &status,
+            "concluded experiment response missing conclusion payload",
+        )
+    })?;
 
     Ok(ConcludedExperimentResponse {
         id,
@@ -200,6 +193,19 @@ pub(super) fn concluded_experiment_response(
         conclusion,
         interleaving,
     })
+}
+
+fn concluded_experiment_invariant_error(
+    id: &str,
+    status: &ExperimentStatus,
+    message: &'static str,
+) -> Response {
+    tracing::error!(
+        experiment_id = %id,
+        experiment_status = ?status,
+        "{message}"
+    );
+    internal_server_error_response()
 }
 
 pub(super) fn attach_experiment_warning_header(

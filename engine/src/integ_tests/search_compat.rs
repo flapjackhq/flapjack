@@ -45,8 +45,8 @@ pub(crate) trait SearchCompat {
         offset: usize,
         facets: Option<&[FacetRequest]>,
     ) -> Result<SearchResult> {
-        self.search_full(
-            tenant_id, query_text, filter, sort, limit, offset, facets, None, None,
+        self.search_with_facets_and_distinct(
+            tenant_id, query_text, filter, sort, limit, offset, facets, None,
         )
     }
 

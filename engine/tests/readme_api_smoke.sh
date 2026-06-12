@@ -28,6 +28,9 @@ SERVER_PID=""
 TMP_DATA=""
 BUILD_LOG=""
 
+# shellcheck source=engine/tests/common/readme_curl_blocks.sh
+. "$SCRIPT_DIR/common/readme_curl_blocks.sh"
+
 pass() {
   TESTS_PASSED=$((TESTS_PASSED + 1))
   TESTS_RUN=$((TESTS_RUN + 1))
@@ -46,80 +49,6 @@ fail() {
 skip() {
   TESTS_SKIPPED=$((TESTS_SKIPPED + 1))
   printf "  \033[1;33m-\033[0m %s\n" "$1"
-}
-
-extract_readme_curl_block() {
-  path="$1"
-
-  # Pull the exact multi-line curl block from README so CI fails when docs drift.
-  awk -v path="$path" '
-    $0 ~ /^curl / && index($0, path) {
-      capture = 1
-    }
-    capture {
-      print
-      line = $0
-      quote_count += gsub(/\047/, "", line)
-      if ($0 !~ /\\$/ && quote_count % 2 == 0) {
-        found = 1
-        exit
-      }
-    }
-    END {
-      if (!found) {
-        exit 1
-      }
-    }
-  ' "$README_PATH"
-}
-
-run_readme_curl() {
-  path="$1"
-
-  command_block=$(extract_readme_curl_block "$path")
-  # Treat README curl blocks as data, not executable shell, so docs drift checks
-  # cannot smuggle extra shell commands into CI via command substitution, pipes,
-  # or separators.
-  COMMAND_BLOCK="$command_block" API_KEY="$ADMIN_KEY" BASE="$BASE" python3 - <<'PY'
-import os
-import shlex
-import subprocess
-import sys
-
-command_block = os.environ["COMMAND_BLOCK"]
-base = os.environ["BASE"]
-api_key = os.environ["API_KEY"]
-
-expanded = (
-    command_block
-    .replace("${API_KEY}", api_key)
-    .replace("$API_KEY", api_key)
-    .replace("http://localhost:7700", base)
-)
-expanded = expanded.replace("\\\n", " ")
-
-for forbidden in ("`", "$(", ";", "&&", "||", "|", "<", ">"):
-    if forbidden in expanded:
-        raise SystemExit(f"Unsupported shell control token in README curl block: {forbidden}")
-
-try:
-    args = shlex.split(expanded, posix=True)
-except ValueError as exc:
-    raise SystemExit(f"Could not parse README curl block safely: {exc}") from exc
-
-if not args or args[0] != "curl":
-    raise SystemExit("README curl block must start with curl")
-
-result = subprocess.run(
-    ["curl", "-sS", "-w", r"\n%{http_code}", *args[1:]],
-    check=False,
-    capture_output=True,
-    text=True,
-)
-sys.stdout.write(result.stdout)
-sys.stderr.write(result.stderr)
-raise SystemExit(result.returncode)
-PY
 }
 
 extract_task_id() {
@@ -196,6 +125,7 @@ wait_for_task_published() {
   return 1
 }
 
+# shellcheck disable=SC2329
 cleanup() {
   if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill "$SERVER_PID" 2>/dev/null || true

@@ -188,7 +188,12 @@ pub fn make_test_app_state(
     experiment_store: Option<Arc<flapjack::experiments::store::ExperimentStore>>,
     metrics_state: Option<flapjack_http::handlers::metrics::MetricsState>,
 ) -> Arc<flapjack_http::handlers::AppState> {
-    let manager = manager_override.unwrap_or_else(|| flapjack::IndexManager::new(data_dir));
+    let manager = manager_override.unwrap_or_else(|| {
+        replication_manager
+            .as_ref()
+            .map(|repl_mgr| flapjack::IndexManager::new_with_node_id(data_dir, repl_mgr.node_id()))
+            .unwrap_or_else(|| flapjack::IndexManager::new(data_dir))
+    });
     let dictionary_manager = Arc::new(flapjack::dictionaries::manager::DictionaryManager::new(
         data_dir,
     ));
@@ -622,10 +627,10 @@ pub fn build_replication_state_for_existing_dir_with_peers(
 /// endpoints. The replication_manager is None (standalone mode), but /internal/ops
 /// still serves oplog entries — used for startup catch-up testing.
 ///
-/// The `_node_id` parameter is unused for now but makes call-sites self-documenting.
-pub async fn spawn_server_with_internal(_node_id: &str) -> (String, TempDir) {
+pub async fn spawn_server_with_internal(node_id: &str) -> (String, TempDir) {
     let mut temp_dir = TempDir::new().unwrap();
-    let state = make_test_app_state(temp_dir.path(), None, None, None, None, None, None);
+    let manager = flapjack::IndexManager::new_with_node_id(temp_dir.path(), node_id);
+    let state = make_test_app_state(temp_dir.path(), Some(manager), None, None, None, None, None);
 
     let app = build_node_router(state);
     let addr = spawn_router(app, &mut temp_dir).await;

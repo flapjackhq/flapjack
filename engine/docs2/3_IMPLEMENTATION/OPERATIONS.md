@@ -164,8 +164,13 @@ needed, restoring operator-controlled data taken before the upgrade.
 
 **Symptom:** Elevated write-path `429` rates, rising request latency, or storage exhaustion near the data-dir/snapshot target.
 **Diagnosis:** Resource pressure is constraining write throughput or service headroom.
-**Recovery:** Check free disk space, inspect `/metrics` for latency/oplog progress, and verify configured memory bounds used by load tests before scaling or throttling traffic.
-**Test (where applicable):** `engine/loadtest/soak_proof.sh`
+**Recovery:** Check free disk space, inspect `/metrics` for latency/oplog progress, and verify configured memory bounds used by load tests before scaling or throttling traffic. For write-path saturation tuning, use the canonical `FLAPJACK_WRITE_QUEUE_BATCH_SIZE` row in [OPS_CONFIGURATION.md](./OPS_CONFIGURATION.md#limits); type, default, fallback semantics, and tradeoff are owned there. PL-10 retained evidence remains in [`engine/loadtest/BENCHMARKS.md`](../../loadtest/BENCHMARKS.md); the operator-facing harness verdict signature `TUNABLE_VERIFIED` is produced by [`engine/loadtest/tests/pl10_saturation_acceptance.sh`](../../loadtest/tests/pl10_saturation_acceptance.sh).
+**Test (where applicable):** `cd engine && timeout 600 cargo test -p flapjack --lib -- write_queue_batch_size`; `engine/loadtest/soak_proof.sh`
+
+### Snapshot export/import runtime offload
+
+Snapshot export and import offload their synchronous tar/gzip work onto a blocking worker via `tokio::task::spawn_blocking` in `engine/flapjack-http/src/handlers/snapshot.rs::export_snapshot` and `::import_snapshot`, so `/health` checks and task polling are not starved by those operations. The restore and import scenarios below cover the operator-visible outcomes.
+**Test (where applicable):** `cd engine && timeout 600 cargo test -p flapjack-http -- export_with_retry_`; `cd engine && timeout 600 cargo test -p flapjack --test test_snapshot_import_failure_contract`
 
 ### Scenario: Restore the latest snapshot for an index
 
@@ -234,8 +239,8 @@ needed, restoring operator-controlled data taken before the upgrade.
 
 **Symptom:** `POST /internal/rotate-admin-key` returns `{"key":"fj_admin_<32hex>","message":"Admin key rotated"}`, old key fails admin routes, and new key succeeds.
 **Diagnosis:** Admin key rotation completed and old credentials are immediately invalidated.
-**Recovery:** Store the new key immediately, update automation to the new key, and verify old-key rejection plus new-key success on `/metrics`.
-**Test (where applicable):** `cargo test -p flapjack-server --test admin_key_test`
+**Recovery:** Store the new key immediately, update automation to the new key, and verify old-key rejection plus new-key success on `/metrics`. Under concurrent rotation requests, only documented `200` or `403` responses are produced, at least one successful response key matches the persisted final `.admin_key`, the starting key fails `/metrics`, and the persisted final key authorizes `/metrics`; admin-only surface policy remains owned by [SECURITY_BASELINE.md](./SECURITY_BASELINE.md).
+**Test (where applicable):** `cd engine && timeout 600 cargo test -p flapjack-server --test admin_key_test -- rotate_admin_key_concurrent_requests_allow_only_documented_outcomes --exact`; `cargo test -p flapjack-server --test admin_key_test`
 
 ### Scenario: Recover after admin key is lost
 
@@ -277,10 +282,10 @@ and ADR `0005`.
 | Surface | Current contract |
 |---|---|
 | Header name | `X-Flapjack-Idempotency-Key` (case-insensitive per HTTP). |
-| TTL | Default 300s; configurable via `FLAPJACK_IDEMPOTENCY_TTL_SECS` (min 1s). |
+| TTL | Runtime TTL ownership lives in [OPS_CONFIGURATION.md](./OPS_CONFIGURATION.md#idempotency-restart-durability-proof). |
 | Scope | Per application + index segment + idempotency key; node-local cache ownership. |
 | Hit semantics | Cache hit replays the original `2xx` response and adds `X-Flapjack-Idempotency-Replayed: true`. |
-| Restart | With `FLAPJACK_IDEMPOTENCY_PERSISTENT=true`, same-node restarts replay the cached response body and original `taskID`. |
+| Restart | Same-node restart durability proof and persistent-cache ownership live in [OPS_CONFIGURATION.md](./OPS_CONFIGURATION.md#idempotency-restart-durability-proof); the canonical SQLite path is `${FLAPJACK_DATA_DIR}/_idempotency/cache.db`. |
 | Add durability | `add_documents_durable` waits for `await_task_terminal`/`wait_for_write_durable` before acking success, so accepted add writes are durable-commit acknowledgements rather than queue-only acceptance. |
 | Delete durability | PL-14 is done: delete handlers route through the durable delete path instead of unbounded `delete_documents_sync` calls. Behavioral ownership remains with `delete_documents_durable` in `engine/src/index/manager/write.rs`, delete callers in `objects/batch.rs`, `objects/mod.rs`, and `replicas.rs`, plus the non-terminal task eviction guard in `engine/src/index/manager/mod.rs`. |
 | 429 / 503 | Transient errors include `Retry-After: 1`; clients SHOULD retry with the same key. |
@@ -293,8 +298,8 @@ and ADR `0005`.
   generate a fresh idempotency key per unique request. Stricter Stripe-style
   body-matching (return `409` on mismatch) is a known gap not yet captured in
   an ADR open question; track as a v1.0.x post-beta follow-up.
-- **Cross-node durability**: replay persistence is node-local SQLite. This does
-  not provide replication-aware cross-node replay guarantees; that remains
+- **Cross-node durability**: replay persistence is node-local and does not
+  provide replication-aware cross-node replay guarantees; that remains
   explicitly deferred in ADR-0005.
 - **Multi-index batch envelopes**: idempotency replay is per-request, not per
   operation. A batch envelope with one new + one previously-applied operation

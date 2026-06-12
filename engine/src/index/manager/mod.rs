@@ -89,6 +89,7 @@ pub fn validate_index_name(name: &str) -> Result<()> {
 /// ```
 pub struct IndexManager {
     pub base_path: PathBuf,
+    node_id: String,
     pub(crate) loaded: DashMap<TenantId, Arc<Index>>,
     tenant_load_locks: DashMap<TenantId, Arc<std::sync::Mutex<()>>>,
     pub(crate) writers:
@@ -146,10 +147,19 @@ impl IndexManager {
     ///
     /// Each tenant's index will be stored in `{base_path}/{tenant_id}/`.
     pub fn new<P: AsRef<Path>>(base_path: P) -> Arc<Self> {
+        Self::new_with_node_id(base_path, crate::index::configured_node_id())
+    }
+
+    /// Create a new IndexManager with an explicit node identifier for local oplog entries.
+    pub fn new_with_node_id<P: AsRef<Path>, S: Into<String>>(
+        base_path: P,
+        node_id: S,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|weak| {
             let tasks = Arc::new(DashMap::new());
             IndexManager {
                 base_path: base_path.as_ref().to_path_buf(),
+                node_id: node_id.into(),
                 loaded: DashMap::new(),
                 tenant_load_locks: DashMap::new(),
                 writers: Arc::new(DashMap::new()),
@@ -483,8 +493,7 @@ impl IndexManager {
             .entry(tenant_id.to_string())
             .or_try_insert_with(|| {
                 let oplog_dir = self.base_path.join(tenant_id).join("oplog");
-                let node_id = crate::index::configured_node_id();
-                OpLog::open(&oplog_dir, tenant_id, &node_id)
+                OpLog::open(&oplog_dir, tenant_id, &self.node_id)
                     .map(Arc::new)
                     .map_err(|e| {
                         tracing::error!("[OPLOG {}] open failed: {}", tenant_id, e);

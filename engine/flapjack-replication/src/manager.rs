@@ -48,6 +48,15 @@ pub struct ReplicationManager {
 }
 
 impl ReplicationManager {
+    fn validate_discovered_tenant_id(peer_id: &str, tenant_id: &str) -> Result<(), String> {
+        flapjack::validate_index_name(tenant_id).map_err(|error| {
+            format!(
+                "peer {} returned invalid tenant id '{}': {}",
+                peer_id, tenant_id, error
+            )
+        })
+    }
+
     /// Initialize a ReplicationManager from the given configuration, creating PeerClient instances for each configured peer. Peer acknowledgment cursors start empty, and the background health probe is not running until explicitly started via `start_health_probe`.
     ///
     /// # Arguments
@@ -124,6 +133,21 @@ impl ReplicationManager {
             .and_then(|tenant| tenant.get(peer_id).and_then(|cursor| cursor.last_acked_seq))
     }
 
+    fn set_failed_peer_cursor(
+        peer_cursors: &DashMap<String, DashMap<String, PeerCursor>>,
+        tenant_id: &str,
+        peer_id: &str,
+        error: String,
+    ) {
+        let previous_ack = Self::existing_acked_seq(peer_cursors, tenant_id, peer_id);
+        Self::set_peer_cursor(
+            peer_cursors,
+            tenant_id,
+            peer_id,
+            PeerCursor::failed(error, previous_ack),
+        );
+    }
+
     async fn replicate_to_peer_with_retry(
         peer: &Arc<PeerClient>,
         tenant_id: &str,
@@ -158,19 +182,14 @@ impl ReplicationManager {
         ops: Vec<OpLogEntry>,
     ) -> Result<u64, String> {
         if !peer.is_available() {
-            let previous_ack = Self::existing_acked_seq(&peer_cursors, &tenant_id, &peer_id);
-            Self::set_peer_cursor(
-                &peer_cursors,
-                &tenant_id,
-                &peer_id,
-                PeerCursor::failed("circuit breaker open".to_string(), previous_ack),
-            );
+            let error = "circuit breaker open".to_string();
+            Self::set_failed_peer_cursor(&peer_cursors, &tenant_id, &peer_id, error.clone());
             tracing::debug!(
                 "[REPL {}] skipping peer {} (circuit breaker open)",
                 tenant_id,
                 peer_id
             );
-            return Err("circuit breaker open".to_string());
+            return Err(error);
         }
 
         match Self::replicate_to_peer_with_retry(&peer, &tenant_id, ops).await {
@@ -190,13 +209,7 @@ impl ReplicationManager {
                 Ok(acked_seq)
             }
             Err(error) => {
-                let previous_ack = Self::existing_acked_seq(&peer_cursors, &tenant_id, &peer_id);
-                Self::set_peer_cursor(
-                    &peer_cursors,
-                    &tenant_id,
-                    &peer_id,
-                    PeerCursor::failed(error.clone(), previous_ack),
-                );
+                Self::set_failed_peer_cursor(&peer_cursors, &tenant_id, &peer_id, error.clone());
                 tracing::warn!(
                     "[REPL {}] peer {} failed after retry, ops dropped: {}",
                     tenant_id,
@@ -223,7 +236,6 @@ impl ReplicationManager {
             let tenant_id = tenant_id.clone();
             let ops = ops.clone();
             let peer_cursors = Arc::clone(&self.peer_cursors);
-            let peer_id = peer_id.clone();
 
             // Fire-and-forget: spawn task and don't await
             tokio::spawn(async move {
@@ -396,6 +408,14 @@ impl ReplicationManager {
                                 || existing.tenant_id != op.tenant_id
                                 || existing.payload != op.payload
                             {
+                                if require_all_peers {
+                                    return Err(format!(
+                                        "peer {} returned conflicting payload for op ({}, {}) while strict catch-up was requested",
+                                        peer.peer_id(),
+                                        key.0,
+                                        key.1
+                                    ));
+                                }
                                 tracing::warn!(
                                     "[REPL {}] conflicting payload for key ({}, {}) across peers; keeping first seen op",
                                     tenant_id,
@@ -499,7 +519,24 @@ impl ReplicationManager {
                     tenants: peer_tenants,
                 }) => {
                     any_success = true;
-                    tenants.extend(peer_tenants);
+                    for tenant_id in peer_tenants {
+                        if let Err(error) =
+                            Self::validate_discovered_tenant_id(peer.peer_id(), &tenant_id)
+                        {
+                            if require_all_peers {
+                                return Err(error);
+                            }
+                            tracing::warn!(
+                                    "[REPL] tenant discovery from peer {} returned invalid tenant id '{}': {}",
+                                    peer.peer_id(),
+                                    tenant_id,
+                                    error
+                                );
+                            last_error = error;
+                            continue;
+                        }
+                        tenants.insert(tenant_id);
+                    }
                 }
                 Err(error) => {
                     if require_all_peers {
@@ -653,6 +690,32 @@ mod tests {
 
     async fn spawn_single_response_peer(
         response: GetOpsResponse,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = serde_json::to_string(&response).unwrap();
+        let header = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+
+        let handle = tokio::spawn(async move {
+            if let Ok(Ok((mut socket, _))) =
+                tokio::time::timeout(tokio::time::Duration::from_secs(3), listener.accept()).await
+            {
+                let mut request_buf = [0u8; 2048];
+                let _ = socket.read(&mut request_buf).await;
+                socket.write_all(header.as_bytes()).await.unwrap();
+                socket.write_all(body.as_bytes()).await.unwrap();
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        (format!("http://{}", addr), handle)
+    }
+
+    async fn spawn_single_tenant_list_peer(
+        response: ListTenantsResponse,
     ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1100,6 +1163,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_catch_up_from_peer_with_metadata_strict_rejects_conflicting_duplicate_ops() {
+        let first_peer_response = GetOpsResponse {
+            tenant_id: "tenant-red".to_string(),
+            ops: vec![OpLogEntry {
+                seq: 1,
+                timestamp_ms: 100,
+                node_id: "node-a".to_string(),
+                tenant_id: "tenant-red".to_string(),
+                op_type: "upsert".to_string(),
+                payload: serde_json::json!({"objectID": "a1", "body": {"_id": "a1", "title": "first"}}),
+            }],
+            current_seq: 1,
+            oldest_retained_seq: Some(1),
+            node_current_seqs: BTreeMap::from([(String::from("node-a"), 1)]),
+        };
+        let conflicting_peer_response = GetOpsResponse {
+            tenant_id: "tenant-red".to_string(),
+            ops: vec![OpLogEntry {
+                seq: 1,
+                timestamp_ms: 200,
+                node_id: "node-a".to_string(),
+                tenant_id: "tenant-red".to_string(),
+                op_type: "upsert".to_string(),
+                payload: serde_json::json!({"objectID": "a1", "body": {"_id": "a1", "title": "second"}}),
+            }],
+            current_seq: 1,
+            oldest_retained_seq: Some(1),
+            node_current_seqs: BTreeMap::from([(String::from("node-a"), 1)]),
+        };
+
+        let (first_peer_url, first_peer_handle) =
+            spawn_single_response_peer(first_peer_response).await;
+        let (conflicting_peer_url, conflicting_peer_handle) =
+            spawn_single_response_peer(conflicting_peer_response).await;
+        let manager = ReplicationManager::new(
+            NodeConfig {
+                node_id: "node-c".to_string(),
+                bind_addr: "127.0.0.1:0".to_string(),
+                peers: vec![
+                    PeerConfig {
+                        node_id: "node-a".to_string(),
+                        addr: first_peer_url,
+                    },
+                    PeerConfig {
+                        node_id: "node-b".to_string(),
+                        addr: conflicting_peer_url,
+                    },
+                ],
+            },
+            None,
+        );
+
+        let error = manager
+            .catch_up_from_peer_with_metadata_strict("tenant-red", 0)
+            .await
+            .expect_err("strict catch-up must fail closed on conflicting peer payloads");
+        let _ = first_peer_handle.await;
+        let _ = conflicting_peer_handle.await;
+
+        assert!(
+            error.contains("conflicting payload") && error.contains("(node-a, 1)"),
+            "strict conflict error should identify the duplicate op key, got: {}",
+            error
+        );
+    }
+
+    #[tokio::test]
     async fn test_discover_tenants_from_peers_strict_rejects_partial_peer_success() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1152,6 +1282,61 @@ mod tests {
         assert!(
             error.contains("peer node-c tenant discovery failed"),
             "strict tenant discovery failure should identify the unreachable peer, got: {}",
+            error
+        );
+    }
+
+    #[tokio::test]
+    async fn test_discover_tenants_from_peers_skips_invalid_tenant_ids() {
+        let (peer_url, peer_handle) = spawn_single_tenant_list_peer(ListTenantsResponse {
+            tenants: vec!["tenant-red".to_string(), "../escape".to_string()],
+        })
+        .await;
+        let manager = ReplicationManager::new(
+            NodeConfig {
+                node_id: "node-b".to_string(),
+                bind_addr: "127.0.0.1:0".to_string(),
+                peers: vec![PeerConfig {
+                    node_id: "node-a".to_string(),
+                    addr: peer_url,
+                }],
+            },
+            None,
+        );
+
+        let tenants = manager.discover_tenants_from_peers().await;
+        let _ = peer_handle.await;
+
+        assert_eq!(tenants, vec!["tenant-red".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_discover_tenants_from_peers_strict_rejects_invalid_tenant_ids() {
+        let (peer_url, peer_handle) = spawn_single_tenant_list_peer(ListTenantsResponse {
+            tenants: vec!["../escape".to_string()],
+        })
+        .await;
+        let manager = ReplicationManager::new(
+            NodeConfig {
+                node_id: "node-b".to_string(),
+                bind_addr: "127.0.0.1:0".to_string(),
+                peers: vec![PeerConfig {
+                    node_id: "node-a".to_string(),
+                    addr: peer_url,
+                }],
+            },
+            None,
+        );
+
+        let error = manager
+            .discover_tenants_from_peers_strict()
+            .await
+            .expect_err("strict tenant discovery must fail on invalid peer tenant ids");
+        let _ = peer_handle.await;
+
+        assert!(
+            error.contains("invalid tenant id '../escape'"),
+            "strict tenant discovery failure should identify the invalid tenant id, got: {}",
             error
         );
     }

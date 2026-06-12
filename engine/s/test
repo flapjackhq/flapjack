@@ -16,6 +16,7 @@
 #   ./s/test --dashboard-full # + playwright full e2e
 #   ./s/test --e2e            # build binary + start server + sdk + contract tests
 #   ./s/test --go             # Go SDK unit tests
+#   ./s/test --cold-install   # cold-install README quickstart smoke (opt-in)
 #   ./s/test --all            # everything (except --sdk-algolia)
 #   ./s/test --ci             # what CI runs
 #   ./s/test --list           # print what each flag does and exit
@@ -44,6 +45,7 @@ RUN_DASHBOARD=false
 RUN_DASHBOARD_FULL=false
 RUN_E2E=false
 RUN_GO=false
+RUN_COLD_INSTALL=false
 RUN_LIST=false
 EXPLICIT=false
 
@@ -59,6 +61,7 @@ for arg in "$@"; do
     --dashboard-full) RUN_DASHBOARD_FULL=true; EXPLICIT=true ;;
     --e2e)            RUN_E2E=true; EXPLICIT=true ;;
     --go)             RUN_GO=true; EXPLICIT=true ;;
+    --cold-install)   RUN_COLD_INSTALL=true; EXPLICIT=true ;;
     --all)
       RUN_UNIT=true; RUN_INTEG=true; RUN_SERVER=true; RUN_SDK=true
       RUN_DASHBOARD=true; RUN_DASHBOARD_FULL=true; RUN_E2E=true; RUN_GO=true
@@ -93,6 +96,8 @@ if [ "$RUN_LIST" = "true" ]; then
   echo "  --dashboard-full   vitest unit + playwright smoke + full e2e    ~15 min"
   echo "  --e2e              build binary + server + sdk + contract tests  ~30s"
   echo "  --go               Go SDK unit tests                            ~5s"
+  echo "  --cold-install     bash \"\$ENGINE_DIR/tests/readme_quickstart_smoke.sh\""
+  echo "                     opt-in; COLD_INSTALL_DRY_RUN=1 probes dispatch without network"
   echo "  --all              everything (except --sdk-algolia)             ~20 min"
   echo "  --ci               unit + integ + server + dashboard            ~5 min"
   echo "  --list             print this help"
@@ -567,6 +572,20 @@ if [ "$RUN_GO" = "true" ]; then
     success "Go SDK tests passed"
   else
     warn "go not found — skipping Go SDK tests"
+  fi
+  echo ""
+fi
+
+# ── Cold-install README quickstart smoke ─────────────────────────────────────
+
+if [ "$RUN_COLD_INSTALL" = "true" ]; then
+  next_step "Cold-install README quickstart smoke"
+  echo "=== Cold-install README quickstart smoke ==="
+  if [ "${COLD_INSTALL_DRY_RUN:-}" = "1" ]; then
+    success "Cold-install dispatch recognized (dry run)"
+  else
+    bash "$ENGINE_DIR/tests/readme_quickstart_smoke.sh"
+    success "Cold-install README quickstart smoke passed"
   fi
   echo ""
 fi

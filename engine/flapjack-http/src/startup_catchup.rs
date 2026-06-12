@@ -134,17 +134,13 @@ fn remaining_pre_serve_budget(deadline: tokio::time::Instant) -> tokio::time::Du
 }
 
 fn handle_write_queue_timeout(strict_bootstrap: bool, timeout_secs: u64) -> Result<(), String> {
-    let error = format!(
-        "write queues did not drain within {}s after pre-serve catch-up",
-        timeout_secs
-    );
-    if strict_bootstrap {
-        tracing::error!("[REPL-catchup] {}", error);
-        Err(error)
-    } else {
-        tracing::warn!("[REPL-catchup] {} (non-strict, continuing)", error);
-        Ok(())
-    }
+    strict_or_skip(
+        strict_bootstrap,
+        format!(
+            "write queues did not drain within {}s after pre-serve catch-up",
+            timeout_secs
+        ),
+    )
 }
 
 fn startup_catchup_strict_bootstrap_enabled() -> bool {
@@ -523,8 +519,24 @@ fn validate_snapshot_tenant_content(
     expected_tenant_id: &str,
 ) -> Result<(), String> {
     let oplog_dir = staging_path.join("oplog");
-    if !oplog_dir.exists() {
-        return Ok(());
+    let oplog_metadata = std::fs::symlink_metadata(&oplog_dir).map_err(|error| {
+        format!(
+            "staged snapshot missing required oplog dir '{}': {}",
+            oplog_dir.display(),
+            error
+        )
+    })?;
+    if oplog_metadata.file_type().is_symlink() {
+        return Err(format!(
+            "staged snapshot oplog path must not be a symlink: {}",
+            oplog_dir.display()
+        ));
+    }
+    if !oplog_metadata.is_dir() {
+        return Err(format!(
+            "staged snapshot oplog path must be a directory: {}",
+            oplog_dir.display()
+        ));
     }
 
     let oplog = flapjack::index::oplog::OpLog::open(
@@ -1139,6 +1151,18 @@ mod tests {
         let snapshot_src = TempDir::new().unwrap();
         let new_marker_name = "new.txt";
         std::fs::write(snapshot_src.path().join(new_marker_name), "new").unwrap();
+        let oplog = flapjack::index::oplog::OpLog::open(
+            &snapshot_src.path().join("oplog"),
+            tenant_id,
+            "peer-node",
+        )
+        .unwrap();
+        oplog
+            .append(
+                "upsert",
+                serde_json::json!({"objectID": "doc-1", "body": {"_id": "doc-1", "title": "Restored"}}),
+            )
+            .unwrap();
         let snapshot_bytes = export_to_bytes(snapshot_src.path()).unwrap();
 
         let result = install_snapshot_bytes(&manager, tenant_id, &snapshot_bytes);
@@ -1150,6 +1174,39 @@ mod tests {
         assert!(
             tenant_path.join(new_marker_name).exists(),
             "restored tenant should contain snapshot content"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_bytes_rejects_snapshot_without_oplog() {
+        let tmp = TempDir::new().unwrap();
+        let manager = flapjack::IndexManager::new(tmp.path());
+        let tenant_id = "restore_target";
+        let tenant_path = manager.base_path.join(tenant_id);
+        std::fs::create_dir_all(&tenant_path).unwrap();
+        let existing_marker = tenant_path.join("keep.txt");
+        std::fs::write(&existing_marker, "keep-me").unwrap();
+
+        let snapshot_src = TempDir::new().unwrap();
+        std::fs::write(snapshot_src.path().join("new.txt"), "new").unwrap();
+        let snapshot_bytes = export_to_bytes(snapshot_src.path()).unwrap();
+
+        let result = install_snapshot_bytes(&manager, tenant_id, &snapshot_bytes)
+            .expect_err("snapshot without oplog must be rejected");
+        assert_eq!(
+            result.0,
+            super::SnapshotInstallStep::ValidateSnapshotTenantContent,
+            "missing oplog must fail before replacing existing tenant data"
+        );
+        assert!(
+            result.1.contains("missing required oplog dir"),
+            "error should identify the missing oplog proof, got: {}",
+            result.1
+        );
+        assert_eq!(
+            std::fs::read_to_string(existing_marker).unwrap(),
+            "keep-me",
+            "rejecting snapshots without tenant identity evidence must preserve existing tenant data"
         );
     }
 

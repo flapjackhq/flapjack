@@ -119,27 +119,19 @@ pub fn flush_rollup_window_with_event_count(
     let parquet_path = tier_dir.join(&filename);
     let backup_path = stage_existing_rollup_backup(&parquet_path)?;
     if let Err(error) = write_parquet_file_atomic(&parquet_path, batch) {
-        if let Err(rollback_error) =
-            rollback_rollup_file_replacement(&parquet_path, backup_path.as_deref())
-        {
-            return Err(format!("{error}; rollback failed: {rollback_error}"));
-        }
-        return Err(error);
+        return rollback_rollup_write_failure(&parquet_path, backup_path.as_deref(), error);
     }
 
     let manifest_path = config.rollup_manifest_path(index_name);
     let mut manifest = match RollupManifest::load(&manifest_path) {
         Ok(manifest) => manifest,
         Err(error) => {
-            rollback_rollup_file_replacement(&parquet_path, backup_path.as_deref()).map_err(
-                |rollback_error| {
-                    format!(
-                        "Failed to load rollup manifest: {}; rollback failed: {}",
-                        error, rollback_error
-                    )
-                },
-            )?;
-            return Err(format!("Failed to load rollup manifest: {}", error));
+            return rollback_rollup_failure(
+                &parquet_path,
+                backup_path.as_deref(),
+                "load rollup manifest",
+                error,
+            );
         }
     };
     let date = window_start_utc_date(window_start_ms);
@@ -155,26 +147,20 @@ pub fn flush_rollup_window_with_event_count(
         },
         &tier_dir,
     ) {
-        rollback_rollup_file_replacement(&parquet_path, backup_path.as_deref()).map_err(
-            |rollback_error| {
-                format!(
-                    "Failed to record manifest window: {}; rollback failed: {}",
-                    error, rollback_error
-                )
-            },
-        )?;
-        return Err(format!("Failed to record manifest window: {}", error));
+        return rollback_rollup_failure(
+            &parquet_path,
+            backup_path.as_deref(),
+            "record manifest window",
+            error,
+        );
     }
     if let Err(error) = manifest.save(&manifest_path) {
-        rollback_rollup_file_replacement(&parquet_path, backup_path.as_deref()).map_err(
-            |rollback_error| {
-                format!(
-                    "Failed to save rollup manifest: {}; rollback failed: {}",
-                    error, rollback_error
-                )
-            },
-        )?;
-        return Err(format!("Failed to save rollup manifest: {}", error));
+        return rollback_rollup_failure(
+            &parquet_path,
+            backup_path.as_deref(),
+            "save rollup manifest",
+            error,
+        );
     }
     drop_rollup_backup(backup_path.as_deref())?;
 
@@ -751,6 +737,28 @@ fn rollback_rollup_file_replacement(path: &Path, backup_path: Option<&Path>) -> 
         })?;
     }
     Ok(())
+}
+
+fn rollback_rollup_write_failure(
+    path: &Path,
+    backup_path: Option<&Path>,
+    error: String,
+) -> Result<(PathBuf, i64), String> {
+    rollback_rollup_file_replacement(path, backup_path)
+        .map_err(|rollback_error| format!("{error}; rollback failed: {rollback_error}"))?;
+    Err(error)
+}
+
+fn rollback_rollup_failure(
+    path: &Path,
+    backup_path: Option<&Path>,
+    action: &str,
+    error: impl std::fmt::Display,
+) -> Result<(PathBuf, i64), String> {
+    rollback_rollup_file_replacement(path, backup_path).map_err(|rollback_error| {
+        format!("Failed to {action}: {error}; rollback failed: {rollback_error}")
+    })?;
+    Err(format!("Failed to {action}: {error}"))
 }
 
 fn drop_rollup_backup(backup_path: Option<&Path>) -> Result<(), String> {
