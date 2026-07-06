@@ -1,0 +1,19 @@
+[advisories]
+version = 2
+# Temporary ignores for quick-xml advisories that have NO reachable fix:
+# quick-xml is a transitive dep of rust-s3 (our S3 snapshot backend, feature
+# "s3-snapshots"). The advisories' patched version is quick-xml >=0.41.0, but
+# rust-s3 0.37.2 — the LATEST release as of 2026-07-06 — pins quick-xml ^0.38,
+# so no cargo update / upgrade path exists until rust-s3 ships a release on
+# quick-xml >=0.41. Exposure is limited: quick-xml only parses XML responses
+# from the operator-configured S3 endpoint (trusted infrastructure), not
+# user/attacker-controlled input, and both advisories are DoS-only (no
+# integrity/confidentiality impact).
+# REMOVE these ignores (and the matching ones in .cargo/audit.toml — keep the
+# two files in lockstep) as soon as a rust-s3 release depends on quick-xml
+# >=0.41: check https://crates.io/crates/rust-s3 then `cargo update rust-s3`.
+# Tracked in ROADMAP.md (RUSTSEC quick-xml row).
+ignore = [
+    { id = "RUSTSEC-2026-0194", reason = "quadratic-runtime DoS in quick-xml; fix (>=0.41) unreachable behind rust-s3 0.37.2 (latest); S3-response parsing only" },
+    { id = "RUSTSEC-2026-0195", reason = "NsReader memory-exhaustion DoS in quick-xml; fix (>=0.41) unreachable behind rust-s3 0.37.2 (latest); S3-response parsing only" },
+]

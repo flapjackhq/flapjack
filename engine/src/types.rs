@@ -234,12 +234,15 @@ pub enum Sort {
 }
 
 /// Request facet counts for a specific field.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FacetRequest {
     /// The field name (e.g. `"category"`).
     pub field: String,
     /// The Tantivy facet path prefix (e.g. `"/category"`).
     pub path: String,
+    /// When set (searchForFacetValues), match against ALL distinct values —
+    /// not just the top `maxValuesPerFacet` by count — before limiting.
+    pub value_query: Option<String>,
 }
 
 /// Results returned by [`IndexManager::search`](crate::IndexManager::search).

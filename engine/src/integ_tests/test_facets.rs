@@ -43,6 +43,7 @@ fn facet_req(field: &str) -> FacetRequest {
     FacetRequest {
         field: field.to_string(),
         path: format!("/{}", field),
+        value_query: None,
     }
 }
 
@@ -1086,6 +1087,7 @@ fn test_algolia_hierarchical_facets_top_level() {
                 facet_requests: Some(&[FacetRequest {
                     field: "categories.lvl0".into(),
                     path: "/categories.lvl0".into(),
+                    value_query: None,
                 }]),
                 distinct_count: None,
             },
@@ -1141,6 +1143,7 @@ fn test_facet_drill_down() {
                 facet_requests: Some(&[FacetRequest {
                     field: "categories.lvl1".into(),
                     path: "/categories.lvl1".into(),
+                    value_query: None,
                 }]),
                 distinct_count: None,
             },
@@ -1542,6 +1545,126 @@ async fn test_max_values_per_facet_capped_at_1000() {
         "Cap at 1000 but only 50 exist, should return 50, got {}",
         brands.len()
     );
+}
+
+/// Long-tail scenario: a value outside the top 1000 by count must be findable
+/// via a facet value query (searchForFacetValues), and the plain facet list
+/// must honestly report non-exhaustive values.
+#[tokio::test]
+async fn test_facet_value_query_finds_values_beyond_top_1000() {
+    use crate::index::SearchOptions;
+
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant("test").unwrap();
+
+    let settings = IndexSettings {
+        attributes_for_faceting: vec!["searchable(brand)".to_string()],
+        ..Default::default()
+    };
+    settings
+        .save(temp_dir.path().join("test/settings.json"))
+        .unwrap();
+
+    // 1050 brands with 2 docs each, plus one rare brand with a single doc —
+    // the rare brand can never appear in a top-1000-by-count facet list.
+    let mut docs = Vec::new();
+    for i in 0..1050 {
+        for j in 0..2 {
+            docs.push(doc(
+                &format!("d{}_{}", i, j),
+                vec![
+                    ("brand", text(&format!("Brand_{:04}", i))),
+                    ("name", text("Popular product")),
+                ],
+            ));
+        }
+    }
+    docs.push(doc(
+        "rare",
+        vec![
+            ("brand", text("Blue Hat Toy Company")),
+            ("name", text("Stunt car")),
+        ],
+    ));
+    manager.add_documents_sync("test", docs).await.unwrap();
+
+    // Plain enumeration: capped at 1000, rare brand absent, flagged non-exhaustive.
+    let plain = manager
+        .search_with_options(
+            "test",
+            "",
+            &SearchOptions {
+                facets: Some(&[facet_req("brand")]),
+                max_values_per_facet: Some(1000),
+                limit: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let brands = plain.facets.get("brand").expect("brand facets");
+    assert_eq!(brands.len(), 1000);
+    assert!(brands.iter().all(|fc| fc.path != "Blue Hat Toy Company"));
+    assert!(!plain.exhaustive_facet_values);
+
+    // Facet value query scans ALL values: rare brand found, result exhaustive.
+    let vq = FacetRequest {
+        field: "brand".to_string(),
+        path: "/brand".to_string(),
+        value_query: Some("blue hat".to_string()),
+    };
+    let searched = manager
+        .search_with_options(
+            "test",
+            "",
+            &SearchOptions {
+                facets: Some(&[vq]),
+                max_values_per_facet: Some(1000),
+                limit: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let hits = searched.facets.get("brand").expect("brand facets");
+    assert_eq!(
+        hits.len(),
+        1,
+        "value query should match exactly the rare brand, got {:?}",
+        hits
+    );
+    assert_eq!(hits[0].path, "Blue Hat Toy Company");
+    assert_eq!(hits[0].count, 1);
+    assert!(searched.exhaustive_facet_values);
+
+    // Same, via the default-limit path the HTTP facet-search handler uses
+    // (limit > 0 takes the ranked-search route, not the zero-limit route).
+    let vq = FacetRequest {
+        field: "brand".to_string(),
+        path: "/brand".to_string(),
+        value_query: Some("blue hat".to_string()),
+    };
+    let ranked = manager
+        .search_with_options(
+            "test",
+            "",
+            &SearchOptions {
+                facets: Some(&[vq]),
+                max_values_per_facet: Some(1000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let hits = ranked
+        .facets
+        .get("brand")
+        .expect("brand facets (ranked path)");
+    assert_eq!(
+        hits.len(),
+        1,
+        "ranked path: value query should match the rare brand, got {} values",
+        hits.len()
+    );
+    assert_eq!(hits[0].path, "Blue Hat Toy Company");
 }
 
 /// Verify that the default `maxValuesPerFacet` is 100 when the setting is not explicitly configured.

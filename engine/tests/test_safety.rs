@@ -182,6 +182,7 @@ mod cold_start_cache_bounds {
         let facets = vec![FacetRequest {
             field: "category".to_string(),
             path: "/category".to_string(),
+            value_query: None,
         }];
 
         for i in 0..20 {
@@ -205,6 +206,7 @@ mod cold_start_cache_bounds {
         let facets = vec![FacetRequest {
             field: "category".to_string(),
             path: "/category".to_string(),
+            value_query: None,
         }];
 
         let options = faceted_search_options(None, None, 10, 0, Some(&facets));
@@ -234,6 +236,7 @@ mod cold_start_cache_bounds {
         let facets = vec![FacetRequest {
             field: "category".to_string(),
             path: "/category".to_string(),
+            value_query: None,
         }];
 
         let warm_options = faceted_search_options(None, None, 10, 0, Some(&facets));

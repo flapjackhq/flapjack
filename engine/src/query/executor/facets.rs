@@ -384,14 +384,44 @@ impl QueryExecutor {
         let mut exhaustive_facet_values = true;
 
         for req in requests {
-            let counts: Vec<FacetCount> = facet_counts
-                .top_k(&req.path, limit)
-                .into_iter()
-                .map(|(facet, count)| FacetCount {
-                    path: clean_facet_path(req, facet),
-                    count,
-                })
-                .collect();
+            let value_query = req
+                .value_query
+                .as_deref()
+                .filter(|q| !q.is_empty())
+                .map(str::to_lowercase);
+            let mut value_query_truncated = false;
+
+            let counts: Vec<FacetCount> = if let Some(vq) = &value_query {
+                // searchForFacetValues: scan ALL distinct values (same full
+                // iteration the stats loop below already does), so matches
+                // outside the top-`limit` by count are still found.
+                let mut matches: Vec<FacetCount> = facet_counts
+                    .get(&req.path)
+                    .map(|(facet, count)| FacetCount {
+                        path: clean_facet_path(req, facet),
+                        count,
+                    })
+                    .filter(|fc| {
+                        let leaf = fc.path.rsplit(" > ").next().unwrap_or(&fc.path);
+                        leaf.to_lowercase().contains(vq)
+                    })
+                    .collect();
+                matches.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.path.cmp(&b.path)));
+                if matches.len() > limit {
+                    value_query_truncated = true;
+                    matches.truncate(limit);
+                }
+                matches
+            } else {
+                facet_counts
+                    .top_k(&req.path, limit)
+                    .into_iter()
+                    .map(|(facet, count)| FacetCount {
+                        path: clean_facet_path(req, facet),
+                        count,
+                    })
+                    .collect()
+            };
 
             let mut counts = counts;
             counts.sort_by_key(|b| std::cmp::Reverse(b.count));
@@ -430,7 +460,11 @@ impl QueryExecutor {
                 }
             }
 
-            if unique_count > limit {
+            if value_query.is_some() {
+                if value_query_truncated {
+                    exhaustive_facet_values = false;
+                }
+            } else if unique_count > limit {
                 exhaustive_facet_values = false;
             }
 

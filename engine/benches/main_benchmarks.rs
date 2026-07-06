@@ -129,6 +129,7 @@ fn bench_query(c: &mut Criterion) {
             let facet = FacetRequest {
                 field: "category".to_string(),
                 path: "/electronics".to_string(),
+                value_query: None,
             };
             let options = SearchOptions {
                 limit: 10,
@@ -154,6 +155,7 @@ fn bench_query(c: &mut Criterion) {
             let facet = FacetRequest {
                 field: "category".to_string(),
                 path: "/electronics".to_string(),
+                value_query: None,
             };
             let options = SearchOptions {
                 filter: Some(&filter),

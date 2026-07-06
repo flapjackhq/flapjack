@@ -1,6 +1,6 @@
 # Highest Priority: Open-Source Launch Readiness
 
-**Updated: 2026-06-05 (v1.0.9 released 2026-06-05; latest public paid-beta ship remains current in `CHANGELOG.md` and `engine/docs2/FEATURES.md`; this doc remains intent/status-routing prose, with strategy routed to `PROJECT_OVERVIEW.md` and active status routed to `ROADMAP.md`; historical launch + post-launch content under Archive)**
+**Updated: 2026-07-06 (v1.0.10 released 2026-06-09; latest public paid-beta ship remains current in `CHANGELOG.md` and `engine/docs2/FEATURES.md`; this doc remains intent/status-routing prose, with strategy routed to `PROJECT_OVERVIEW.md` and active status routed to `ROADMAP.md`; historical launch + post-launch content under Archive)**
 
 ## Mission
 

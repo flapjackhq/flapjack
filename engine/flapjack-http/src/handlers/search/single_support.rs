@@ -68,6 +68,7 @@ pub(super) fn build_facet_requests(
         .map(|field| FacetRequest {
             path: format!("/{}", field),
             field,
+            value_query: None,
         })
         .collect();
 

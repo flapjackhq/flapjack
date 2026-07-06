@@ -1,0 +1,23 @@
+# cargo-audit config — read by `cargo audit` when run from engine/ (the a06
+# security-audit tests in tests/test_security_audit.rs run it from there).
+#
+# These ignores MUST stay in lockstep with the [advisories].ignore list in
+# ../deny.toml — a06_workspace_passes_cargo_audit_and_cargo_deny runs BOTH
+# tools and fails if either flags an advisory.
+#
+# Why ignored (temporary): quick-xml is a transitive dep of rust-s3 (S3
+# snapshot backend). The fix is quick-xml >=0.41.0, but rust-s3 0.37.2 — the
+# latest release as of 2026-07-06 — pins quick-xml ^0.38, so there is no
+# upgrade path until rust-s3 releases against quick-xml >=0.41. Both
+# advisories are DoS-only and only reachable via XML responses from the
+# operator-configured S3 endpoint (trusted infrastructure), not from
+# user-supplied input.
+#
+# REMOVE when a rust-s3 release depends on quick-xml >=0.41:
+# check https://crates.io/crates/rust-s3 then `cargo update rust-s3`.
+# Tracked in ROADMAP.md (RUSTSEC quick-xml row).
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0194", # quick-xml: quadratic runtime on duplicate attribute names
+    "RUSTSEC-2026-0195", # quick-xml: NsReader unbounded namespace allocation
+]

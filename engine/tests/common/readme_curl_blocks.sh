@@ -106,8 +106,13 @@ while i < len(args):
             raise SystemExit(
                 f"README curl block option {arg} must use inline data, not local-file reads"
             )
-        if arg in ("-H", "--header") and ("\n" in value or "\r" in value):
-            raise SystemExit("README curl block headers must be single-line values")
+        if arg in ("-H", "--header"):
+            if value.startswith("@"):
+                raise SystemExit(
+                    "README curl block headers must be inline values, not @file reads"
+                )
+            if "\n" in value or "\r" in value:
+                raise SystemExit("README curl block headers must be single-line values")
         sanitized_args.extend((arg, value))
         i += 2
         continue

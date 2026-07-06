@@ -66,6 +66,7 @@ fn query_p99_budget(c: &mut Criterion) {
             let facet = FacetRequest {
                 field: "category".to_string(),
                 path: "/cat".to_string(),
+                value_query: None,
             };
             let options = SearchOptions {
                 limit: 10,
@@ -95,6 +96,7 @@ fn query_p99_budget(c: &mut Criterion) {
             let facet = FacetRequest {
                 field: "category".to_string(),
                 path: "/cat".to_string(),
+                value_query: None,
             };
             let options = SearchOptions {
                 filter: Some(&filter),

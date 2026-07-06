@@ -404,6 +404,15 @@ fn lookup_cached_facets(
         return (None, None);
     };
 
+    // Cached entries are trimmed to maxValuesPerFacet and keyed without the
+    // value query — a facet-value search must always scan the full value set.
+    if facet_reqs
+        .iter()
+        .any(|req| req.value_query.as_deref().is_some_and(|q| !q.is_empty()))
+    {
+        return (None, None);
+    }
+
     let mut facet_keys: Vec<String> = facet_reqs.iter().map(|req| req.field.clone()).collect();
     facet_keys.sort();
     let filter_hash = prepared
@@ -725,6 +734,7 @@ mod tests {
         let facet_requests = vec![crate::types::FacetRequest {
             field: "brand".to_string(),
             path: "/brand".to_string(),
+            value_query: None,
         }];
         let opts = SearchOptions {
             facets: Some(&facet_requests),

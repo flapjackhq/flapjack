@@ -93,6 +93,7 @@ async fn smoke_library() {
     let facets = [FacetRequest {
         field: "category".to_string(),
         path: "/category".to_string(),
+        value_query: None,
     }];
     let facet_options = SearchOptions {
         limit: 10,

@@ -1405,6 +1405,7 @@ mod oplog_replay {
         let facets = vec![FacetRequest {
             path: "/category".to_string(),
             field: "category".to_string(),
+            value_query: None,
         }];
 
         {

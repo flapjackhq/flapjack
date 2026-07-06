@@ -2,7 +2,7 @@
 
 Single maintained status ledger for Flapjack. Shipped feature status, current production-readiness state, and post-launch work are owned in this document.
 
-**Last updated: 2026-06-05 (v1.0.9 current-release truth-up; keep lane-state routing in `ROADMAP.md`, with detailed measured evidence retained in private stage artifacts.)**
+**Last updated: 2026-07-06 (v1.0.10 current-release truth-up; keep lane-state routing in `ROADMAP.md`, with detailed measured evidence retained in private stage artifacts.)**
 
 - 2026-05-31 stage note: `FLAPJACK_WRITE_QUEUE_BATCH_SIZE` is now runtime-configurable with default-preserving behavior (`32` fallback). See [`3_IMPLEMENTATION/OPS_CONFIGURATION.md`](3_IMPLEMENTATION/OPS_CONFIGURATION.md) for full operator semantics.
 
@@ -15,7 +15,7 @@ Single maintained status ledger for Flapjack. Shipped feature status, current pr
 
 ## Public Sync Lineage Ledger (Canonical)
 
-This is the detailed public-sync lineage ledger. Current strategic priority order is owned by [`PROJECT_OVERVIEW.md`](../../PROJECT_OVERVIEW.md), current open-work state is owned by [`ROADMAP.md`](../../ROADMAP.md), and release truth is owned by [`CHANGELOG.md`](../../CHANGELOG.md); as of the 2026-06-05 doc truth-up, v1.0.9 released 2026-06-05 is the latest paid-beta ship in the v1.0 line.
+This is the detailed public-sync lineage ledger. Current strategic priority order is owned by [`PROJECT_OVERVIEW.md`](../../PROJECT_OVERVIEW.md), current open-work state is owned by [`ROADMAP.md`](../../ROADMAP.md), and release truth is owned by [`CHANGELOG.md`](../../CHANGELOG.md); as of the 2026-07-06 doc truth-up, v1.0.10 released 2026-06-09 is the latest paid-beta ship in the v1.0 line.
 
 May 22 OSS polish wave status facts (lanes A-F) and the v1.0.3 public-beta cut remain canonical historical lineage in the existing rows below; they are preserved as lineage, not as the current release baseline.
 
@@ -351,9 +351,9 @@ CI-runnable scripts that verify documentation accuracy and API completeness agai
 
 Production-readiness checklist organized by priority tier. Tier 1 items were launch blockers, Tier 2 items are required for production confidence, Tier 3 items can be iterated on post-launch.
 
-As of the 2026-06-05 doc truth-up, v1.0.9 released 2026-06-05 is the current shipped paid-beta baseline. This section remains the canonical readiness snapshot while strategic priority order is routed to [`PROJECT_OVERVIEW.md`](../../PROJECT_OVERVIEW.md) and ongoing lane-state/post-ship sequencing is routed to [`ROADMAP.md`](../../ROADMAP.md) to avoid duplicate live-status prose in this owner.
+As of the 2026-07-06 doc truth-up, v1.0.10 released 2026-06-09 is the current shipped paid-beta baseline. This section remains the canonical readiness snapshot while strategic priority order is routed to [`PROJECT_OVERVIEW.md`](../../PROJECT_OVERVIEW.md) and ongoing lane-state/post-ship sequencing is routed to [`ROADMAP.md`](../../ROADMAP.md) to avoid duplicate live-status prose in this owner.
 
-**Last updated: 2026-06-05**
+**Last updated: 2026-07-06**
 
 ### Tier 1 — Launch Blockers
 

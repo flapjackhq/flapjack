@@ -115,9 +115,8 @@ Flapjack ships client SDKs across multiple languages; the list below reflects wh
 - **JavaScript** — `flapjack-search` on npm (with `@flapjack-search/*` scoped support packages: `client-common`, `client-search`, `logger-console`, `requester-browser-xhr`, `requester-fetch`, `requester-node-http`)
 - **Python** — `flapjack-search` on PyPI
 - **Go** — `github.com/flapjackhq/flapjack-search-go/v4`
-- **Ruby** — `flapjack-search` on RubyGems (install-path caveat: the published gem's required-Ruby metadata still reflects the pre-correction floor; build from source if `gem install` rejects your Ruby version)
 
-PHP, Java, C#, Dart, Scala, Kotlin, Swift, and the WordPress plugin are source-available under `sdks/` but not yet published to their public registries.
+A Ruby prerelease gem (`flapjack-search 0.1.0.pre.beta.1`) exists on RubyGems, but its published install path has not passed verification — build from source under `sdks/ruby/` for now. PHP, Java, C#, Dart, Scala, Kotlin, Swift, and the WordPress plugin are source-available under `sdks/` but not yet published to their public registries.
 
 See `docs/reference/research/jun04_sdk_truth_matrix.md` for the per-package publication evidence.
 

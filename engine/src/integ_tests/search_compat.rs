@@ -32,7 +32,6 @@ fn legacy_search_options<'a>(
 /// compiling during API migration.
 ///
 /// This trait is test-only compatibility glue and is intentionally not used by production code.
-/// TODO: Document SearchCompat.
 #[allow(clippy::too_many_arguments)] // Test-only shim preserves legacy lib-test callsites while production stays `SearchOptions`-based.
 pub(crate) trait SearchCompat {
     fn search_with_facets(
@@ -182,6 +181,7 @@ mod tests {
         let facets = vec![FacetRequest {
             field: "category".to_string(),
             path: "/category".to_string(),
+            value_query: None,
         }];
 
         let options = legacy_search_options(
@@ -220,6 +220,7 @@ mod tests {
         let facets = [FacetRequest {
             field: "category".to_string(),
             path: "/category".to_string(),
+            value_query: None,
         }];
 
         let result = recorder.search_with_facets(
@@ -258,6 +259,7 @@ mod tests {
         let facets = [FacetRequest {
             field: "brand".to_string(),
             path: "/brand".to_string(),
+            value_query: None,
         }];
 
         let result = recorder.search_with_facets_and_distinct(

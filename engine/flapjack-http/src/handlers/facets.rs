@@ -128,6 +128,7 @@ pub async fn search_facet_values_inline(
     let facet_request = FacetRequest {
         field: facet_name.to_string(),
         path: format!("/{}", facet_name),
+        value_query: (!facet_query.is_empty()).then(|| facet_query.to_string()),
     };
 
     let result = state.manager.search_with_options(
@@ -183,7 +184,7 @@ pub async fn search_facet_values_inline(
 
     Ok(serde_json::json!({
         "facetHits": hits,
-        "exhaustiveFacetsCount": true,
+        "exhaustiveFacetsCount": result.exhaustive_facet_values,
         "processingTimeMS": start.elapsed().as_millis() as u64
     }))
 }
@@ -294,6 +295,7 @@ pub async fn search_facet_values(
     let facet_request = FacetRequest {
         field: facet_name.clone(),
         path: format!("/{}", facet_name),
+        value_query: (!req.facet_query.is_empty()).then(|| req.facet_query.clone()),
     };
 
     let result = state.manager.search_with_options(
@@ -351,7 +353,7 @@ pub async fn search_facet_values(
 
     Ok(Json(SearchFacetValuesResponse {
         facet_hits: hits,
-        exhaustive_facets_count: true,
+        exhaustive_facets_count: result.exhaustive_facet_values,
         processing_time_ms: start.elapsed().as_millis() as u64,
     }))
 }

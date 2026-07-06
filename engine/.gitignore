@@ -1,5 +1,10 @@
 **/target/
-/.cargo
+# Ignore local cargo state but keep audit.toml tracked: it carries the
+# RUSTSEC ignore list that the a06 security-audit tests (and public CI)
+# depend on. Must be /.cargo/* (not /.cargo) — git cannot re-include a
+# file inside a fully-ignored directory.
+/.cargo/*
+!/.cargo/audit.toml
 /.cache
 **/node_modules/
 node_modules/

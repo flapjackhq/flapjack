@@ -154,6 +154,7 @@ fn test_search_latency_slow() {
         let facet = FacetRequest {
             field: "category".to_string(),
             path: "/cat".to_string(),
+            value_query: None,
         };
         let _ = manager.search_with_facets("bench", "laptop", None, None, 20, 0, Some(&[facet]));
     });
@@ -170,6 +171,7 @@ fn test_search_latency_slow() {
         let facet = FacetRequest {
             field: "category".to_string(),
             path: "/cat".to_string(),
+            value_query: None,
         };
         let _ = manager.search_with_facets(
             "bench",
@@ -185,6 +187,7 @@ fn test_search_latency_slow() {
         let facet = FacetRequest {
             field: "category".to_string(),
             path: "/cat".to_string(),
+            value_query: None,
         };
         let _ = manager.search_with_facets("bench", "", None, None, 20, 0, Some(&[facet]));
     });
@@ -407,6 +410,7 @@ fn regression_facets_slow() {
         let facet = FacetRequest {
             field: "category".into(),
             path: "/electronics".into(),
+            value_query: None,
         };
         let (avg, p99) = bench(200, || {
             let _ = m.search_with_facets(
@@ -447,6 +451,7 @@ fn regression_full_stack_slow() {
         let facet = FacetRequest {
             field: "category".into(),
             path: "/electronics".into(),
+            value_query: None,
         };
         let (avg, p99) = bench(200, || {
             let _ = m.search_with_facets(
@@ -507,6 +512,7 @@ fn regression_typeahead_sequence_slow() {
         let facet = FacetRequest {
             field: "category".into(),
             path: "/electronics".into(),
+            value_query: None,
         };
         let prefixes = ["s", "sa", "sam", "sams", "samsu", "samsun"];
 
