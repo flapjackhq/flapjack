@@ -110,6 +110,7 @@ pub(crate) async fn initialize_infrastructure(
 
     let (analytics_config, analytics_collector, analytics_engine) =
         initialize_analytics_subsystem();
+    manager.set_analytics_config(analytics_config.clone());
     let metrics_state = Some(crate::handlers::metrics::MetricsState::new());
     let usage_counters = Arc::new(dashmap::DashMap::new());
     let usage_persistence = initialize_usage_persistence(data_dir, &usage_counters);

@@ -11,6 +11,7 @@ members = [
 name = "flapjack"
 version = "1.0.10"
 edition = "2021"
+build = "build.rs"
 description = "Full-text search engine library with typo tolerance, faceting, and Algolia-compatible conventions"
 license = "MIT"
 repository = "https://github.com/flapjackhq/flapjack"
@@ -96,6 +97,11 @@ flapjack-http = { path = "flapjack-http" }
 flapjack-replication = { path = "flapjack-replication" }
 flapjack-ssl = { path = "flapjack-ssl" }
 wiremock = "0.6"
+
+[build-dependencies]
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
 
 [profile.test]
 opt-level = 1

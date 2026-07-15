@@ -7,6 +7,8 @@ use super::{
     CompoundEntry, DictionaryError, DictionaryName, DictionarySettings, PluralEntry, StopwordEntry,
 };
 
+pub(crate) const DICTIONARIES_DIR: &str = ".dictionaries";
+
 /// Manages on-disk storage for one tenant's dictionaries.
 pub struct DictionaryStore {
     dir: PathBuf,
@@ -23,7 +25,7 @@ impl DictionaryStore {
 
     /// Construct the store path for a given tenant under a data directory.
     pub fn for_tenant(data_dir: &Path, tenant_id: &str) -> Result<Self, DictionaryError> {
-        let dir = data_dir.join(tenant_id).join(".dictionaries");
+        let dir = data_dir.join(tenant_id).join(DICTIONARIES_DIR);
         Self::new(dir)
     }
 

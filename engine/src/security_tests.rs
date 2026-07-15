@@ -136,6 +136,7 @@ fn outbound_ip_policy_classification_matrix() {
 }
 
 #[test]
+#[serial(flapjack_outbound_url_policy)]
 fn outbound_host_resolution_policy_edge_cases() {
     let loopback = first_blocked_outbound_host_ip("localhost", None, false);
     assert_eq!(

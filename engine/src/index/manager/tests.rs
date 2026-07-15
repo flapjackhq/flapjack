@@ -1,6 +1,196 @@
 use super::*;
 use crate::index::rules::GeneratedFacetFilter;
+use std::collections::BTreeMap;
 use tempfile::TempDir;
+
+fn tenant_tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn collect(root: &Path, current: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        let mut entries: Vec<_> = std::fs::read_dir(current)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(root, &path, files);
+            } else {
+                files.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    std::fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+
+    let mut files = BTreeMap::new();
+    collect(root, root, &mut files);
+    files
+}
+
+async fn create_move_fixture(manager: &IndexManager, tenant: &str, marker: &str) {
+    manager.create_tenant(tenant).unwrap();
+    manager
+        .add_documents_sync(
+            tenant,
+            vec![Document {
+                id: format!("{marker}_document"),
+                fields: HashMap::from([(
+                    "title".to_string(),
+                    FieldValue::Text(format!("{marker} searchable")),
+                )]),
+            }],
+        )
+        .await
+        .unwrap();
+    let path = manager.base_path.join(tenant);
+    std::fs::write(
+        path.join("settings.json"),
+        format!(r#"{{"marker":"{marker}"}}"#),
+    )
+    .unwrap();
+    std::fs::create_dir_all(path.join("oplog")).unwrap();
+    std::fs::write(path.join("oplog/move_test.jsonl"), marker).unwrap();
+    std::fs::write(path.join("committed_seq"), "41").unwrap();
+    manager.unload(&tenant.to_string()).unwrap();
+}
+
+#[tokio::test]
+async fn move_index_replaces_destination_and_preserves_complete_source_tree() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    create_move_fixture(&manager, "source", "source_marker").await;
+    create_move_fixture(&manager, "destination", "old_destination_marker").await;
+    let expected_source = tenant_tree_bytes(&temp_dir.path().join("source"));
+
+    let task = manager.move_index("source", "destination").await.unwrap();
+
+    assert!(!temp_dir.path().join("source").exists());
+    assert_eq!(
+        tenant_tree_bytes(&temp_dir.path().join("destination")),
+        expected_source
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp_dir.path().join("destination/settings.json")).unwrap(),
+        r#"{"marker":"source_marker"}"#
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp_dir.path().join("destination/oplog/move_test.jsonl")).unwrap(),
+        "source_marker"
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp_dir.path().join("destination/committed_seq")).unwrap(),
+        "41"
+    );
+    let search = manager
+        .search("destination", "source", None, None, 10)
+        .unwrap();
+    assert_eq!(search.total, 1);
+    assert_eq!(search.documents[0].document.id, "source_marker_document");
+    assert_eq!(
+        manager.get_task(&task.numeric_id.to_string()).unwrap().id,
+        task.id
+    );
+}
+
+#[tokio::test]
+async fn move_index_creates_destination_when_none_existed() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    create_move_fixture(&manager, "source", "only_source_marker").await;
+    let expected_source = tenant_tree_bytes(&temp_dir.path().join("source"));
+
+    let task = manager.move_index("source", "destination").await.unwrap();
+
+    assert!(!temp_dir.path().join("source").exists());
+    assert_eq!(
+        tenant_tree_bytes(&temp_dir.path().join("destination")),
+        expected_source
+    );
+    assert_eq!(
+        manager.get_task(&task.numeric_id.to_string()).unwrap().id,
+        task.id
+    );
+}
+
+#[tokio::test]
+async fn move_index_precommit_faults_preserve_source_and_destination_without_task() {
+    use publication::PublicationFaultPoint;
+
+    for fault in [
+        PublicationFaultPoint::BeforeStagingDigest,
+        PublicationFaultPoint::DuringStagingSync,
+        PublicationFaultPoint::AfterPrepareJournal,
+        PublicationFaultPoint::AfterTargetBackup,
+        PublicationFaultPoint::AfterStagingPromote,
+        PublicationFaultPoint::BeforeCommitJournal,
+    ] {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = IndexManager::new(temp_dir.path());
+        create_move_fixture(&manager, "source", "source_marker").await;
+        create_move_fixture(&manager, "destination", "destination_marker").await;
+        let source_before = tenant_tree_bytes(&temp_dir.path().join("source"));
+        let destination_before = tenant_tree_bytes(&temp_dir.path().join("destination"));
+        let tasks_before = manager.tasks.len();
+
+        let result = manager
+            .move_index_with_fault_for_test("source", "destination", fault)
+            .await;
+
+        assert!(result.is_err(), "fault {fault:?} must fail move_index");
+        assert_eq!(
+            tenant_tree_bytes(&temp_dir.path().join("source")),
+            source_before
+        );
+        assert_eq!(
+            tenant_tree_bytes(&temp_dir.path().join("destination")),
+            destination_before
+        );
+        assert_eq!(manager.tasks.len(), tasks_before);
+    }
+}
+
+#[tokio::test]
+async fn move_index_retry_converges_after_commit_before_source_cleanup_fault() {
+    use publication::PublicationFaultPoint;
+
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    create_move_fixture(&manager, "source", "source_marker").await;
+    create_move_fixture(&manager, "destination", "destination_marker").await;
+    let source_before = tenant_tree_bytes(&temp_dir.path().join("source"));
+    let tasks_before = manager.tasks.len();
+
+    let interrupted = manager
+        .move_index_with_fault_for_test(
+            "source",
+            "destination",
+            PublicationFaultPoint::BeforeSourceCleanup,
+        )
+        .await;
+
+    assert!(interrupted.is_err());
+    assert_eq!(
+        tenant_tree_bytes(&temp_dir.path().join("source")),
+        source_before
+    );
+    assert_eq!(
+        tenant_tree_bytes(&temp_dir.path().join("destination")),
+        source_before
+    );
+    assert_eq!(manager.tasks.len(), tasks_before);
+
+    let task = manager.move_index("source", "destination").await.unwrap();
+    assert!(!temp_dir.path().join("source").exists());
+    assert_eq!(
+        tenant_tree_bytes(&temp_dir.path().join("destination")),
+        source_before
+    );
+    assert_eq!(
+        manager.get_task(&task.numeric_id.to_string()).unwrap().id,
+        task.id
+    );
+}
 
 #[test]
 fn manager_mod_stays_under_hard_line_limit() {
@@ -3392,6 +3582,21 @@ fn index_name_valid() {
 }
 
 #[test]
+fn index_name_rejects_reserved_publication_roots() {
+    for reserved in [".publication", ".publication_quarantine"] {
+        let err = validate_index_name(reserved).unwrap_err().to_string();
+        assert!(
+            err.contains("reserved publication namespace"),
+            "{reserved} should explain reserved namespace rejection, got: {err}"
+        );
+    }
+
+    assert!(validate_index_name(".publication_archive").is_ok());
+    assert!(validate_index_name("publication").is_ok());
+    assert!(validate_index_name("test.v2").is_ok());
+}
+
+#[test]
 fn index_name_rejects_path_traversal() {
     assert!(validate_index_name("../etc/passwd").is_err());
     assert!(validate_index_name("..").is_err());
@@ -3423,6 +3628,52 @@ async fn create_tenant_rejects_path_traversal() {
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
     assert!(msg.contains("path traversal"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn create_tenant_rejects_reserved_publication_roots_before_directory_creation() {
+    let tmp = TempDir::new().unwrap();
+    let manager = IndexManager::new(tmp.path());
+
+    for reserved in [".publication", ".publication_quarantine"] {
+        let err = manager.create_tenant(reserved).unwrap_err().to_string();
+        assert!(
+            err.contains("reserved publication namespace"),
+            "{reserved} should explain reserved namespace rejection, got: {err}"
+        );
+        assert!(
+            !tmp.path().join(reserved).exists(),
+            "{reserved} must not be created as a tenant directory"
+        );
+    }
+
+    manager.create_tenant("test.v2").unwrap();
+    assert!(tmp.path().join("test.v2").is_dir());
+}
+
+#[tokio::test]
+async fn get_or_load_rejects_reserved_publication_roots_before_loading() {
+    let tmp = TempDir::new().unwrap();
+    let manager = IndexManager::new(tmp.path());
+
+    for reserved in [".publication", ".publication_quarantine"] {
+        std::fs::create_dir_all(tmp.path().join(reserved)).unwrap();
+        let err = match manager.get_or_load(reserved) {
+            Ok(_) => panic!("{reserved} must not load as a tenant"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("reserved publication namespace"),
+            "{reserved} should explain reserved namespace rejection, got: {err}"
+        );
+        assert!(
+            !manager
+                .loaded_tenant_ids()
+                .iter()
+                .any(|tenant| tenant == reserved),
+            "{reserved} must not populate loaded_tenant_ids"
+        );
+    }
 }
 
 #[tokio::test]

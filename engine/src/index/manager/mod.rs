@@ -63,6 +63,11 @@ pub fn validate_index_name(name: &str) -> Result<()> {
             "Index name contains null bytes".to_string(),
         ));
     }
+    if publication::is_reserved_publication_namespace(Path::new(name)) {
+        return Err(FlapjackError::InvalidQuery(
+            "Index name is reserved publication namespace".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -117,12 +122,19 @@ pub struct IndexManager {
         Arc<DashMap<TenantId, Arc<std::sync::RwLock<crate::vector::index::VectorIndex>>>>,
     /// Optional dictionary manager for custom stopwords/plurals/compounds in the query pipeline.
     dictionary_manager: OnceLock<Arc<crate::dictionaries::manager::DictionaryManager>>,
+    analytics_config: OnceLock<crate::analytics::AnalyticsConfig>,
 }
 
 const DEFAULT_FACET_CACHE_CAP: usize = 500;
 
 mod config;
 mod lifecycle;
+#[cfg(test)]
+mod lifecycle_move_tests;
+pub mod publication;
+mod publication_startup;
+#[cfg(test)]
+mod publication_startup_tests;
 mod query;
 mod ranking;
 mod recovery;
@@ -177,6 +189,7 @@ impl IndexManager {
                 #[cfg(feature = "vector-search")]
                 vector_indices: Arc::new(DashMap::new()),
                 dictionary_manager: OnceLock::new(),
+                analytics_config: OnceLock::new(),
             }
         })
     }
@@ -192,6 +205,18 @@ impl IndexManager {
         &self,
     ) -> Option<&Arc<crate::dictionaries::manager::DictionaryManager>> {
         self.dictionary_manager.get()
+    }
+
+    /// Configure the canonical analytics artifact root used by publication operations.
+    pub fn set_analytics_config(&self, config: crate::analytics::AnalyticsConfig) {
+        let _ = self.analytics_config.set(config);
+    }
+
+    pub(super) fn publication_analytics_config(&self) -> crate::analytics::AnalyticsConfig {
+        self.analytics_config
+            .get()
+            .cloned()
+            .unwrap_or_else(|| crate::analytics::AnalyticsConfig::for_data_dir(&self.base_path))
     }
 
     /// Get the oplog for a tenant (for external access)

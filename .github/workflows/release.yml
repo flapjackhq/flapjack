@@ -116,35 +116,36 @@ jobs:
         with:
           tool: cross
 
+      - name: Verify release revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${{ github.sha }}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: github.sha must be exactly 40 lowercase hex characters" >&2
+            exit 1
+          fi
+
       - name: Build (native)
         if: "!matrix.use_cross"
+        env:
+          FLAPJACK_BUILD_REVISION: ${{ github.sha }}
         run: cargo build --release --target ${{ matrix.target }} --package flapjack-server --no-default-features ${{ matrix.features != '' && format('--features {0}', matrix.features) || '' }}
 
       - name: Build (cross)
         if: matrix.use_cross
+        env:
+          FLAPJACK_BUILD_REVISION: ${{ github.sha }}
         run: cross build --release --target ${{ matrix.target }} --package flapjack-server --no-default-features ${{ matrix.features != '' && format('--features {0}', matrix.features) || '' }}
 
       - name: Package (Unix)
         if: ${{ runner.os != 'Windows' }}
         shell: bash
-        run: |
-          mkdir -p staging
-          cp target/${{ matrix.target }}/release/flapjack staging/
-          cd staging
-          tar czf ../flapjack-${{ matrix.target }}.tar.gz .
-          cd ..
-          shasum -a 256 flapjack-${{ matrix.target }}.tar.gz > flapjack-${{ matrix.target }}.tar.gz.sha256
+        run: package/release_artifact_manifest ${{ matrix.target }} target/${{ matrix.target }}/release/flapjack .
 
       - name: Package (Windows)
         if: ${{ runner.os == 'Windows' }}
         shell: bash
-        run: |
-          mkdir -p staging
-          cp target/${{ matrix.target }}/release/flapjack.exe staging/
-          cd staging
-          7z a ../flapjack-${{ matrix.target }}.zip .
-          cd ..
-          sha256sum flapjack-${{ matrix.target }}.zip > flapjack-${{ matrix.target }}.zip.sha256
+        run: package/release_artifact_manifest ${{ matrix.target }} target/${{ matrix.target }}/release/flapjack.exe .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -152,7 +153,11 @@ jobs:
         with:
           name: flapjack-${{ matrix.target }}
           path: |
-            engine/flapjack-${{ matrix.target }}.*
+            engine/flapjack-${{ matrix.target }}.tar.gz
+            engine/flapjack-${{ matrix.target }}.tar.gz.sha256
+            engine/flapjack-${{ matrix.target }}.zip
+            engine/flapjack-${{ matrix.target }}.zip.sha256
+            engine/flapjack-${{ matrix.target }}.manifest.json
           compression-level: 0
 
   release:
@@ -230,6 +235,7 @@ jobs:
             flapjack-*.tar.gz.sha256
             flapjack-*.zip
             flapjack-*.zip.sha256
+            flapjack-*.manifest.json
 
   docker_prepare:
     name: Docker tag source

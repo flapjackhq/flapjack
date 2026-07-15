@@ -13,18 +13,17 @@ use super::AppState;
     )
 )]
 pub async fn health(State(_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let build = flapjack::build_info();
     let budget = flapjack::get_global_budget();
     let observer = flapjack::MemoryObserver::global();
     let mem_stats = observer.stats();
 
     Json(serde_json::json!({
         "status": "ok",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": build.version,
+        "build": build,
         "uptime_secs": _state.start_time.elapsed().as_secs(),
-        "capabilities": {
-            "vectorSearch": cfg!(feature = "vector-search"),
-            "vectorSearchLocal": cfg!(feature = "vector-search-local"),
-        },
+        "capabilities": build.capabilities,
         "active_writers": budget.active_writers(),
         "max_concurrent_writers": budget.max_concurrent_writers(),
         "facet_cache_entries": _state.manager.facet_cache.len(),
@@ -55,6 +54,38 @@ mod tests {
             .with_state(state)
     }
 
+    #[tokio::test]
+    async fn health_exposes_canonical_build_info() {
+        let tmp = TempDir::new().unwrap();
+        let state = TestStateBuilder::new(&tmp).build_shared();
+
+        let json = request_health_json(state).await;
+        let expected_build = serde_json::to_value(flapjack::build_info()).unwrap();
+
+        assert_eq!(json["build"], expected_build);
+        assert_eq!(json["build"]["schemaVersion"], 1);
+        assert!(json["build"]["version"].is_string());
+        assert_eq!(
+            json["build"]["revision"].is_null(),
+            !json["build"]["revisionKnown"].as_bool().unwrap()
+        );
+        assert_eq!(
+            json["build"]["dirty"].is_null(),
+            !json["build"]["dirtyKnown"].as_bool().unwrap()
+        );
+        assert!(json["build"]["workspaceDigest"].is_string());
+        assert!(json["build"]["profile"].is_string());
+        assert!(json["build"]["target"].is_string());
+        assert_eq!(
+            json["build"]["features"],
+            serde_json::to_value(&flapjack::build_info().features).unwrap()
+        );
+        assert_eq!(
+            json["build"]["capabilities"],
+            serde_json::to_value(&flapjack::build_info().capabilities).unwrap()
+        );
+    }
+
     async fn request_health_json(state: Arc<AppState>) -> serde_json::Value {
         let response = test_router(state)
             .oneshot(
@@ -81,9 +112,11 @@ mod tests {
         state.manager.create_tenant("t2").unwrap();
 
         let json = request_health_json(state).await;
+        let expected_build = serde_json::to_value(flapjack::build_info()).unwrap();
 
         assert_eq!(json["status"], "ok");
-        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(json["version"], expected_build["version"]);
+        assert_eq!(json["build"], expected_build);
         assert!(json["active_writers"].is_number());
         assert!(json["max_concurrent_writers"].is_number());
         assert!(json["facet_cache_entries"].is_number());
@@ -95,17 +128,14 @@ mod tests {
         assert!(json["uptime_secs"].is_number());
         assert_eq!(
             json["capabilities"],
-            serde_json::json!({
-                "vectorSearch": cfg!(feature = "vector-search"),
-                "vectorSearchLocal": cfg!(feature = "vector-search-local"),
-            })
+            serde_json::to_value(&flapjack::build_info().capabilities).unwrap()
         );
         assert_eq!(json["tenants_loaded"], serde_json::json!(2));
     }
 
-    /// Verify public /health does not expose build/debug internals.
+    /// Verify public /health keeps only the intended top-level metadata surface.
     #[tokio::test]
-    async fn health_hides_build_and_debug_fields() {
+    async fn health_uses_explicit_top_level_metadata_allowlist() {
         let tmp = TempDir::new().unwrap();
         let state = TestStateBuilder::new(&tmp).build_shared();
 
@@ -119,6 +149,7 @@ mod tests {
         let expected_keys: HashSet<&str> = [
             "status",
             "version",
+            "build",
             "uptime_secs",
             "capabilities",
             "active_writers",
@@ -138,7 +169,13 @@ mod tests {
             "public /health must keep an exact allowlist contract"
         );
 
-        let disallowed_fields = ["build_profile"];
+        let disallowed_fields = [
+            "build_profile",
+            "profile",
+            "target",
+            "features",
+            "workspaceDigest",
+        ];
         for field in disallowed_fields {
             assert!(
                 json.get(field).is_none(),

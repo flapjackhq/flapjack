@@ -64,6 +64,7 @@
 //! See [LIB.md](https://github.com/gridlhq/flapjack/blob/main/LIB.md)
 //! for the full embedding guide.
 
+pub mod build_info;
 pub mod dictionaries;
 pub mod error;
 pub mod experiments;
@@ -91,6 +92,7 @@ pub mod analytics;
 #[cfg(feature = "analytics")]
 pub mod query_suggestions;
 
+pub use build_info::{build_info, BuildCapabilities, BuildInfo};
 pub use error::{FlapjackError, Result};
 pub use index::{manager::validate_index_name, manager::IndexManager, Index, ManagedIndexWriter};
 pub use query::{QueryExecutor, QueryParser};

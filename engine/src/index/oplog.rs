@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 const SEGMENT_MAX_BYTES: u64 = 10 * 1024 * 1024;
+pub(crate) const OPLOG_DIR: &str = "oplog";
+pub(crate) const COMMITTED_SEQ_FILE: &str = "committed_seq";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpLogEntry {
@@ -33,7 +35,7 @@ pub struct OpLog {
 }
 
 fn committed_seq_path(tenant_path: &Path) -> PathBuf {
-    tenant_path.join("committed_seq")
+    tenant_path.join(COMMITTED_SEQ_FILE)
 }
 
 /// Read the durable committed sequence number for a tenant.

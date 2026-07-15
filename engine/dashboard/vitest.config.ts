@@ -16,6 +16,8 @@ export default defineConfig({
       'playwright-webserver.test.ts',
       'vite.config.test.ts',
       'playwright.config.test.ts',
+      'tests/global-setup.test.ts',
+      'tests/fixtures/**/*.test.ts',
     ],
     exclude: ['node_modules', 'dist', 'tests/**/*.spec.ts'],
     coverage: {

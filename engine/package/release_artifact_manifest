@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  package/release_artifact_manifest <target-triple> <binary-path> <output-dir>
+
+Creates the release archive, checksum sidecar, and build manifest for an already-built
+flapjack binary. The manifest build object is copied from the binary's own
+`build-info --json` output.
+EOF
+}
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+if [ "$#" -ne 3 ]; then
+  usage
+  die "expected target triple, binary path, and output directory"
+fi
+
+TARGET_TRIPLE="$1"
+BINARY_PATH="$2"
+OUTPUT_DIR="$3"
+
+[ -n "$TARGET_TRIPLE" ] || die "target triple must not be empty"
+[ -f "$BINARY_PATH" ] || die "binary path does not exist: $BINARY_PATH"
+[ -x "$BINARY_PATH" ] || die "binary path is not executable: $BINARY_PATH"
+
+case "$TARGET_TRIPLE" in
+  *-pc-windows-*|*-windows-*)
+    ARCHIVE_NAME="flapjack-${TARGET_TRIPLE}.zip"
+    PACKAGED_BINARY_NAME="flapjack.exe"
+    ;;
+  *)
+    ARCHIVE_NAME="flapjack-${TARGET_TRIPLE}.tar.gz"
+    PACKAGED_BINARY_NAME="flapjack"
+    ;;
+esac
+
+mkdir -p "$OUTPUT_DIR"
+
+TMP_DIR="$(mktemp -d)"
+cleanup() {
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+
+STAGING_DIR="$TMP_DIR/staging"
+BUILD_JSON="$TMP_DIR/build.json"
+mkdir -p "$STAGING_DIR"
+
+cp "$BINARY_PATH" "$STAGING_DIR/$PACKAGED_BINARY_NAME"
+"$STAGING_DIR/$PACKAGED_BINARY_NAME" build-info --json >"$BUILD_JSON"
+
+ARCHIVE_PATH="$OUTPUT_DIR/$ARCHIVE_NAME"
+CHECKSUM_PATH="$ARCHIVE_PATH.sha256"
+MANIFEST_PATH="$OUTPUT_DIR/flapjack-${TARGET_TRIPLE}.manifest.json"
+
+rm -f "$ARCHIVE_PATH" "$CHECKSUM_PATH" "$MANIFEST_PATH"
+
+case "$ARCHIVE_NAME" in
+  *.zip)
+    python3 - "$STAGING_DIR" "$PACKAGED_BINARY_NAME" "$ARCHIVE_PATH" <<'PY'
+import pathlib
+import sys
+import zipfile
+
+staging_dir = pathlib.Path(sys.argv[1])
+binary_name = sys.argv[2]
+archive_path = pathlib.Path(sys.argv[3])
+with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    archive.write(staging_dir / binary_name, binary_name)
+PY
+    ;;
+  *.tar.gz)
+    tar czf "$ARCHIVE_PATH" -C "$STAGING_DIR" .
+    ;;
+  *)
+    die "unsupported archive extension for $ARCHIVE_NAME"
+    ;;
+esac
+
+SHA256="$(
+  python3 - "$ARCHIVE_PATH" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)"
+printf '%s  %s\n' "$SHA256" "$ARCHIVE_NAME" >"$CHECKSUM_PATH"
+
+python3 - "$BUILD_JSON" "$TARGET_TRIPLE" "$ARCHIVE_NAME" "$SHA256" "$MANIFEST_PATH" <<'PY'
+import json
+import pathlib
+import sys
+
+build_path = pathlib.Path(sys.argv[1])
+target_triple = sys.argv[2]
+archive_name = sys.argv[3]
+archive_sha256 = sys.argv[4]
+manifest_path = pathlib.Path(sys.argv[5])
+
+build = json.loads(build_path.read_text())
+if build.get("target") != target_triple:
+    raise SystemExit(
+        f"build.target {build.get('target')!r} does not match target argument {target_triple!r}"
+    )
+if build.get("profile") != "release":
+    raise SystemExit(f"build.profile must be 'release', got {build.get('profile')!r}")
+if build.get("revisionKnown") is not True:
+    raise SystemExit("build.revisionKnown must be true for release packaging")
+
+artifact = {
+    "file": archive_name,
+    "target": target_triple,
+    "arch": target_triple.split("-", 1)[0],
+    "profile": build["profile"],
+    "sha256": archive_sha256,
+}
+manifest = {
+    "schemaVersion": 1,
+    "artifact": artifact,
+    "build": build,
+}
+
+serialized = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+for spelling in ("algolia_migration_v1", "algoliaMigrationV1"):
+    if spelling in serialized:
+        raise SystemExit(f"manifest contains forbidden migration capability spelling: {spelling}")
+
+manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+
+printf '%s\n' "$ARCHIVE_PATH"

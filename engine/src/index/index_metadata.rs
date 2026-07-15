@@ -8,7 +8,7 @@ use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-const METADATA_FILE: &str = "index_meta.json";
+pub(crate) const METADATA_FILE: &str = "index_meta.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexMetadata {

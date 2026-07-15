@@ -2,12 +2,21 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use flapjack::analytics::{AnalyticsCollector, AnalyticsConfig};
+use flapjack::index::manager::publication::{
+    ContentDigest, PublicationGenerationEvidence, PublicationJournal, PublicationPaths,
+    PublicationTarget, PublicationTransactionId,
+};
+use flapjack::{Document, FieldValue, IndexManager};
+use std::collections::HashMap;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
 use crate::auth::KeyStore;
 use crate::middleware::REQUEST_ID_HEADER_NAME;
-use crate::test_helpers::{body_json, build_test_router, send_empty_request};
+use crate::test_helpers::{
+    body_json, build_test_router, send_empty_request, send_json_request, TestStateBuilder,
+};
 
 fn build_auth_test_app() -> (TempDir, axum::Router) {
     let tmp = TempDir::new().unwrap();
@@ -20,6 +29,116 @@ fn build_no_auth_test_app() -> (TempDir, axum::Router) {
     let tmp = TempDir::new().unwrap();
     let app = build_test_router(&tmp, None);
     (tmp, app)
+}
+
+fn build_no_auth_router_for_state(
+    tmp: &TempDir,
+    state: Arc<crate::handlers::AppState>,
+) -> axum::Router {
+    let analytics_config = AnalyticsConfig {
+        enabled: false,
+        data_dir: tmp.path().join("analytics"),
+        flush_interval_secs: 60,
+        flush_size: 1000,
+        retention_days: 30,
+    };
+    let analytics_collector = AnalyticsCollector::new(analytics_config);
+    let trusted_proxy_matcher =
+        Arc::new(crate::middleware::TrustedProxyMatcher::from_optional_csv(None).unwrap());
+
+    crate::router::build_router(
+        state,
+        None,
+        analytics_collector,
+        trusted_proxy_matcher,
+        crate::startup::CorsMode::LoopbackOnly,
+        tmp.path(),
+    )
+}
+
+fn publication_digest() -> ContentDigest {
+    ContentDigest::new(format!("sha256:{}", "b".repeat(64))).unwrap()
+}
+
+async fn seed_document(manager: &IndexManager, tenant: &str, object_id: &str, version: &str) {
+    manager.create_tenant(tenant).unwrap();
+    manager
+        .add_documents_sync(
+            tenant,
+            vec![Document {
+                id: object_id.to_string(),
+                fields: HashMap::from([
+                    (
+                        "title".to_string(),
+                        FieldValue::Text(format!("{version} product")),
+                    ),
+                    ("version".to_string(), FieldValue::Text(version.to_string())),
+                ]),
+            }],
+        )
+        .await
+        .unwrap();
+}
+
+async fn create_journaled_publication_evidence(
+    base: &std::path::Path,
+    target_name: &str,
+    transaction_name: &str,
+    staged_version: &str,
+) -> PublicationPaths {
+    let target = PublicationTarget::new(target_name).unwrap();
+    let transaction = PublicationTransactionId::new(transaction_name).unwrap();
+    let paths = PublicationPaths::new(base, &target, &transaction);
+
+    let staging_base = paths.staging.parent().unwrap();
+    let staging_manager = IndexManager::new(staging_base);
+    seed_document(&staging_manager, "staging", "new_product", staged_version).await;
+    std::fs::create_dir_all(&paths.backup).unwrap();
+    std::fs::create_dir_all(&paths.quarantine).unwrap();
+
+    let journal = PublicationJournal::prepare(
+        transaction,
+        target,
+        PublicationGenerationEvidence::new(format!("generation_{transaction_name}")).unwrap(),
+        publication_digest(),
+        paths.clone(),
+    );
+    std::fs::create_dir_all(paths.journal.parent().unwrap()).unwrap();
+    std::fs::write(&paths.journal, journal.to_json_value().to_string()).unwrap();
+    std::fs::write(
+        paths.quarantine.join("journal.json"),
+        journal.to_json_value().to_string(),
+    )
+    .unwrap();
+
+    paths
+}
+
+fn item_names(body: &serde_json::Value) -> Vec<String> {
+    body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+async fn assert_reserved_search_rejected(app: &axum::Router, index_name: &str) {
+    let response = send_json_request(
+        app,
+        Method::POST,
+        &format!("/1/indexes/{index_name}/query"),
+        serde_json::json!({ "query": "" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(response).await,
+        serde_json::json!({
+            "message": "Index name is reserved publication namespace",
+            "status": 400
+        })
+    );
 }
 
 async fn assert_invalid_credentials_response(resp: axum::response::Response) {
@@ -255,6 +374,104 @@ async fn internal_replication_routes_remain_available_when_auth_disabled() {
         malformed_replicate.status(),
         StatusCode::BAD_REQUEST,
         "no-auth mode must expose /internal/replicate for peer replication writes"
+    );
+}
+
+#[tokio::test]
+async fn publication_namespace_interrupted_replacement_serves_only_live_target() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).with_analytics().build_shared();
+    seed_document(&state.manager, "products", "old_product", "old").await;
+    let _paths =
+        create_journaled_publication_evidence(tmp.path(), "products", "txn_replacement", "new")
+            .await;
+    let app = build_no_auth_router_for_state(&tmp, state);
+
+    let indices = send_empty_request(&app, Method::GET, "/1/indexes").await;
+    assert_eq!(indices.status(), StatusCode::OK);
+    let indices_body = body_json(indices).await;
+    assert_eq!(item_names(&indices_body), vec!["products"]);
+    assert_eq!(indices_body["nbPages"], 1);
+
+    let tenants = send_empty_request(&app, Method::GET, "/internal/tenants").await;
+    assert_eq!(tenants.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(tenants).await["tenants"],
+        serde_json::json!(["products"])
+    );
+
+    let search = send_json_request(
+        &app,
+        Method::POST,
+        "/1/indexes/products/query",
+        serde_json::json!({ "query": "", "hitsPerPage": 10 }),
+    )
+    .await;
+    assert_eq!(search.status(), StatusCode::OK);
+    let search_body = body_json(search).await;
+    assert_eq!(search_body["nbHits"], 1);
+    assert_eq!(search_body["hits"][0]["objectID"], "old_product");
+    assert_eq!(search_body["hits"][0]["version"], "old");
+    assert!(search_body["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|hit| hit["version"] != "new"));
+
+    let ready = send_empty_request(&app, Method::GET, "/health/ready").await;
+    assert_eq!(ready.status(), StatusCode::OK);
+    assert_eq!(body_json(ready).await, serde_json::json!({ "ready": true }));
+
+    assert_reserved_search_rejected(&app, ".publication").await;
+    assert_reserved_search_rejected(&app, ".publication_quarantine").await;
+}
+
+#[tokio::test]
+async fn publication_namespace_interrupted_create_is_invisible() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).with_analytics().build_shared();
+    let _paths =
+        create_journaled_publication_evidence(tmp.path(), "products", "txn_create", "new").await;
+    let app = build_no_auth_router_for_state(&tmp, state.clone());
+
+    let indices = send_empty_request(&app, Method::GET, "/1/indexes").await;
+    assert_eq!(indices.status(), StatusCode::OK);
+    let indices_body = body_json(indices).await;
+    assert_eq!(item_names(&indices_body), Vec::<String>::new());
+    assert_eq!(indices_body["nbPages"], 1);
+
+    let tenants = send_empty_request(&app, Method::GET, "/internal/tenants").await;
+    assert_eq!(tenants.status(), StatusCode::OK);
+    assert_eq!(body_json(tenants).await["tenants"], serde_json::json!([]));
+
+    let search = send_json_request(
+        &app,
+        Method::POST,
+        "/1/indexes/products/query",
+        serde_json::json!({ "query": "" }),
+    )
+    .await;
+    assert_eq!(search.status(), StatusCode::NOT_FOUND);
+    let search_body = body_json(search).await;
+    assert_eq!(
+        search_body,
+        serde_json::json!({
+            "message": "Index 'products' does not exist",
+            "status": 404
+        })
+    );
+    assert!(search_body.get("hits").is_none());
+
+    let ready = send_empty_request(&app, Method::GET, "/health/ready").await;
+    assert_eq!(ready.status(), StatusCode::OK);
+    assert_eq!(body_json(ready).await, serde_json::json!({ "ready": true }));
+    assert!(
+        !state
+            .manager
+            .loaded_tenant_ids()
+            .iter()
+            .any(|tenant| tenant == "products"),
+        "readiness and failed search must not load a staged-only target"
     );
 }
 #[tokio::test]

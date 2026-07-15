@@ -7,6 +7,8 @@ use crate::index::manager::validate_index_name;
 
 use super::VALID_MODELS;
 
+pub(crate) const RECOMMEND_RULES_DIR: &str = "recommend_rules";
+
 // ── DTOs ────────────────────────────────────────────────────────────────────
 
 /// Represent a recommendation rule with optional conditions and consequences that customize results. Includes objectID (unique identifier), optional condition (filters and context), optional consequence (hide/promote actions and params), description, enabled flag, and operation for batch requests ('delete' removes instead of saving).
@@ -110,7 +112,7 @@ fn rules_dir(base_path: &Path, index_name: &str, model: &str) -> Result<PathBuf,
     validate_model(model)?;
     Ok(base_path
         .join(index_name)
-        .join("recommend_rules")
+        .join(RECOMMEND_RULES_DIR)
         .join(model))
 }
 

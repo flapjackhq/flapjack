@@ -301,24 +301,20 @@ fn find_moved_source_ops(
     source_tenant: &str,
     since_seq: u64,
 ) -> Option<(Vec<OpLogEntry>, u64, String)> {
-    let entries = std::fs::read_dir(&state.manager.base_path).ok()?;
+    let tenant_names =
+        crate::tenant_dirs::valid_index_tenant_dir_names(&state.manager.base_path).ok()?;
     let node_id = std::env::var("FLAPJACK_NODE_ID").unwrap_or_else(|_| "unknown".to_string());
 
-    for entry in entries.flatten() {
-        let file_type = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if !file_type.is_dir() {
+    for candidate_tenant in tenant_names {
+        if candidate_tenant == source_tenant {
             continue;
         }
 
-        let candidate_tenant = entry.file_name().to_string_lossy().to_string();
-        if candidate_tenant == source_tenant || candidate_tenant.starts_with('.') {
-            continue;
-        }
-
-        let oplog_dir = entry.path().join("oplog");
+        let oplog_dir = state
+            .manager
+            .base_path
+            .join(&candidate_tenant)
+            .join("oplog");
         if !oplog_dir.exists() {
             continue;
         }

@@ -42,6 +42,19 @@ enum Command {
     Uninstall,
     /// Generate a new admin API key (replaces the current one in keys.json)
     ResetAdminKey,
+    /// Print build identity metadata
+    BuildInfo {
+        /// Emit the canonical build identity as JSON
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    /// Repair one tenant's node-local staged publication evidence.
+    RepairPublication {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Remove the install directory (`FLAPJACK_INSTALL` first, then `$HOME/.flapjack`) and clean shell rc PATH entries.
@@ -150,12 +163,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = cmd.get_matches();
     let cli = Cli::from_arg_matches(&matches)?;
 
-    match cli.command {
+    match &cli.command {
         Some(Command::Uninstall) => run_uninstall(),
         Some(Command::ResetAdminKey) => {
             let data_dir = resolve_data_dir(&cli, &matches)
                 .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
             run_reset_admin_key(&data_dir)
+        }
+        Some(Command::BuildInfo { json: _ }) => print_build_info_json(),
+        Some(Command::RepairPublication { tenant, json }) => {
+            let data_dir = resolve_data_dir(&cli, &matches)
+                .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
+            run_repair_publication(&data_dir, tenant, *json)
         }
         None => {
             let runtime = resolve_runtime_config(&cli, &matches)
@@ -168,6 +187,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             serve().await
         }
     }
+}
+
+fn print_build_info_json() -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", serde_json::to_string(flapjack::build_info())?);
+    Ok(())
+}
+
+fn run_repair_publication(
+    data_dir: &str,
+    tenant: &str,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use flapjack::index::manager::publication::PublicationRepairStatus;
+
+    let manager = flapjack::IndexManager::new(data_dir);
+    let report = manager.repair_publication_target(tenant)?;
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!(
+            "tenant={} status={} action={} transaction_id={} phase={} evidence={}",
+            report.target.as_str(),
+            report.status.as_str(),
+            report.action.as_str(),
+            report
+                .transaction_id
+                .as_ref()
+                .map_or("null", |value| value.as_str()),
+            report.phase.map_or("null", |value| value.as_str()),
+            report
+                .evidence
+                .as_ref()
+                .map_or_else(|| "null".to_string(), |path| path.display().to_string())
+        );
+    }
+    if matches!(
+        report.status,
+        PublicationRepairStatus::Quarantined | PublicationRepairStatus::Unresolved
+    ) {
+        std::process::exit(2);
+    }
+    Ok(())
 }
 
 fn run_reset_admin_key(data_dir: &str) -> Result<(), Box<dyn std::error::Error>> {

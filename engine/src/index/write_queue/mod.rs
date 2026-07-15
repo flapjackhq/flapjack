@@ -1,6 +1,8 @@
 mod finalization;
 mod vectors;
 
+pub(crate) use finalization::PERSISTED_VECTORS_DIR;
+
 use crate::types::{DocFailure, Document, TaskInfo, TaskStatus};
 use once_cell::sync::Lazy;
 use prometheus::{core::Collector, proto::MetricFamily, HistogramOpts, HistogramVec};

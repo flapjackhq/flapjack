@@ -12,6 +12,10 @@ use crate::startup::{
     shutdown_timeout_secs_from_env, AuthStatus, CorsMode,
 };
 
+#[cfg(test)]
+#[path = "server_startup_tests.rs"]
+mod startup_repair_tests;
+
 /// Main server entry point: loads config, initializes infrastructure (key store, S3,
 /// analytics, replication), builds the router, binds the listener, and runs the
 /// HTTP server with graceful shutdown handling.
@@ -58,9 +62,9 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         startup_start,
     )?;
 
-    // Pre-serve barrier: catch up from peers before accepting traffic so a
-    // rebooted node never serves stale data.
-    crate::startup_catchup::run_pre_serve_catchup(&state)
+    // Pre-serve barrier: repair node-local publication state, then catch up
+    // from peers before accepting traffic.
+    run_pre_serve_barrier(&state)
         .await
         .map_err(std::io::Error::other)?;
 
@@ -93,6 +97,28 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
 
     let _ = run_graceful_shutdown(&mut infrastructure, &state, shutdown_timeout_secs).await;
     Ok(())
+}
+
+pub(crate) async fn run_pre_serve_barrier(
+    state: &crate::handlers::AppState,
+) -> Result<Vec<flapjack::index::manager::publication::PublicationRepairReport>, String> {
+    run_pre_serve_barrier_with_catchup(state, crate::startup_catchup::run_pre_serve_catchup(state))
+        .await
+}
+
+async fn run_pre_serve_barrier_with_catchup<Catchup>(
+    state: &crate::handlers::AppState,
+    catchup: Catchup,
+) -> Result<Vec<flapjack::index::manager::publication::PublicationRepairReport>, String>
+where
+    Catchup: std::future::Future<Output = Result<(), String>>,
+{
+    let reports = state
+        .manager
+        .repair_publications_before_serve()
+        .map_err(|error| format!("pre-serve publication repair failed: {error}"))?;
+    catchup.await?;
+    Ok(reports)
 }
 
 fn log_cors_mode(cors_mode: &CorsMode) {

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_ANALYTICS_RETENTION_DAYS: u32 = 90;
 
@@ -15,6 +15,16 @@ pub struct AnalyticsConfig {
     pub flush_size: usize,
     /// Delete Parquet files older than this many days.
     pub retention_days: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalyticsTargetArtifactPaths {
+    pub data_dir: PathBuf,
+    pub index_root: PathBuf,
+    pub searches_dir: PathBuf,
+    pub events_dir: PathBuf,
+    pub rollups_dir: PathBuf,
+    pub rollup_manifest_path: PathBuf,
 }
 
 impl AnalyticsConfig {
@@ -49,11 +59,20 @@ impl AnalyticsConfig {
         let analytics_dir = std::env::var("FLAPJACK_ANALYTICS_DIR")
             .unwrap_or_else(|_| format!("{}/analytics", base_data_dir));
 
+        Self::with_data_dir(PathBuf::from(analytics_dir))
+    }
+
+    /// Build the default analytics configuration for an explicit engine data directory.
+    pub fn for_data_dir(data_dir: &Path) -> Self {
+        Self::with_data_dir(data_dir.join("analytics"))
+    }
+
+    fn with_data_dir(data_dir: PathBuf) -> Self {
         Self {
             enabled: std::env::var("FLAPJACK_ANALYTICS_ENABLED")
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(true),
-            data_dir: PathBuf::from(analytics_dir),
+            data_dir,
             flush_interval_secs: std::env::var("FLAPJACK_ANALYTICS_FLUSH_INTERVAL")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -108,6 +127,18 @@ impl AnalyticsConfig {
             .join(Self::path_component(index_name))
             .join("rollups")
             .join("manifest.json")
+    }
+
+    pub fn target_artifact_paths(&self, index_name: &str) -> AnalyticsTargetArtifactPaths {
+        let index_root = self.data_dir.join(Self::path_component(index_name));
+        AnalyticsTargetArtifactPaths {
+            data_dir: self.data_dir.clone(),
+            searches_dir: self.searches_dir(index_name),
+            events_dir: self.events_dir(index_name),
+            rollups_dir: index_root.join("rollups"),
+            rollup_manifest_path: self.rollup_manifest_path(index_name),
+            index_root,
+        }
     }
 }
 

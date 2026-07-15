@@ -1,5 +1,8 @@
 use crate::handlers::internal::apply_ops_to_manager;
 use crate::handlers::AppState;
+use flapjack::index::manager::publication::{
+    PreStagedActivationStage, PreStagedPublication, PublicationTargetDisposition,
+};
 use flapjack::index::oplog::read_committed_seq;
 use flapjack::index::snapshot::import_from_bytes;
 use flapjack_replication::types::GetOpsResponse;
@@ -361,147 +364,80 @@ pub(crate) fn install_snapshot_bytes(
 ) -> Result<(), (SnapshotInstallStep, String)> {
     validate_tenant_id(tenant_id)
         .map_err(|error| (SnapshotInstallStep::ValidateTenantId, error))?;
-    let tenant_path = manager.base_path.join(tenant_id);
-    let staging_path = manager
-        .base_path
-        .join(format!(".{tenant_id}.snapshot_restore_staging"));
-    let backup_path = manager
-        .base_path
-        .join(format!(".{tenant_id}.snapshot_restore_backup"));
+    let repair = manager
+        .repair_publication_target(tenant_id)
+        .map_err(|error| (snapshot_repair_step(&error), error.to_string()))?;
+    if repair.disposition == PublicationTargetDisposition::Unavailable {
+        return Err((
+            SnapshotInstallStep::RecoverInterrupted,
+            format!("publication repair did not prove tenant '{tenant_id}' loadable"),
+        ));
+    }
 
-    reject_symlinked_managed_path(&staging_path, "snapshot restore staging")
-        .map_err(|error| (SnapshotInstallStep::ValidateManagedPath, error))?;
+    let publication = PreStagedPublication::prepare(
+        &manager.base_path,
+        flapjack::index::manager::publication::PublicationTarget::new(tenant_id)
+            .map_err(|error| (SnapshotInstallStep::ValidateTenantId, error.to_string()))?,
+    )
+    .map_err(|error| (SnapshotInstallStep::CleanStaging, error.to_string()))?;
 
-    remove_path_if_exists(&staging_path)
-        .map_err(|error| (SnapshotInstallStep::CleanStaging, error))?;
-    recover_interrupted_snapshot_restore(&tenant_path, &backup_path)
-        .map_err(|error| (SnapshotInstallStep::RecoverInterrupted, error))?;
-
-    if let Err(error) = import_from_bytes(snapshot_bytes, &staging_path) {
-        let _ = remove_path_if_exists(&staging_path);
+    if let Err(error) = import_from_bytes(snapshot_bytes, &publication.paths().staging) {
+        let _ = publication.abort();
         return Err((
             SnapshotInstallStep::ImportExtract,
             format!("import snapshot bytes into staging failed: {error}"),
         ));
     }
 
-    if let Err(error) = validate_snapshot_tenant_content(&staging_path, tenant_id) {
-        let _ = remove_path_if_exists(&staging_path);
+    if let Err(error) = validate_snapshot_tenant_content(&publication.paths().staging, tenant_id) {
+        let _ = publication.abort();
         return Err((SnapshotInstallStep::ValidateSnapshotTenantContent, error));
     }
 
-    manager.unload_tenant(tenant_id);
-    let tenant_existed = tenant_path.exists();
-    if tenant_existed {
-        if let Err(error) = rename_with_transient_retry(&tenant_path, &backup_path) {
-            let _ = remove_path_if_exists(&staging_path);
-            return Err((
-                SnapshotInstallStep::RenameTenantToBackup,
-                format!(
-                    "move existing tenant dir '{}' to backup '{}' failed: {}",
-                    tenant_path.display(),
-                    backup_path.display(),
-                    error
-                ),
-            ));
-        }
-    }
-
-    if let Err(error) = rename_with_transient_retry(&staging_path, &tenant_path) {
-        let _ = remove_path_if_exists(&staging_path);
-        let rollback_error =
-            restore_backup_after_failed_activation(tenant_existed, &backup_path, &tenant_path)
-                .err();
-        return Err((
-            SnapshotInstallStep::RenameStagingToTenant,
-            match rollback_error {
-                Some(rollback_error) => format!(
-                    "activate staged snapshot '{}' -> '{}' failed: {}; rollback failed: {}",
-                    staging_path.display(),
-                    tenant_path.display(),
-                    error,
-                    rollback_error
-                ),
-                None => format!(
-                    "activate staged snapshot '{}' -> '{}' failed: {}",
-                    staging_path.display(),
-                    tenant_path.display(),
-                    error
-                ),
-            },
-        ));
-    }
-
-    if tenant_existed {
-        let _ = remove_path_if_exists(&backup_path);
-    }
-    manager.unload_tenant(tenant_id);
-    Ok(())
+    unload_for_snapshot_publication(manager, tenant_id)?;
+    let activation = publication
+        .activate()
+        .map_err(|error| (snapshot_activation_step(error.stage()), error.to_string()));
+    unload_for_snapshot_publication(manager, tenant_id)?;
+    activation.map(|_| ())
 }
 
-/// Linux ephemeral-tmpfs renames can transiently fail with `EBUSY` or `ENOTEMPTY`
-/// when concurrent `unload_tenant` / open file handles haven't fully released the
-/// directory yet. Retry briefly (≤200 ms total) before surfacing the IO error.
-///
-/// Bounded to absorb the race without masking persistent failures: if rename keeps
-/// failing past the budget, the underlying error still propagates with its raw
-/// `io::Error` so callers see the real reason in logs.
-fn rename_with_transient_retry(
-    from: &std::path::Path,
-    to: &std::path::Path,
-) -> std::io::Result<()> {
-    const MAX_TOTAL_MS: u64 = 200;
-    const SLEEP_MS: u64 = 10;
-    let start = std::time::Instant::now();
-    loop {
-        if let Err(error) = reject_symlinked_managed_path(from, "snapshot restore source") {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, error));
-        }
-        if let Err(error) = reject_symlinked_managed_path(to, "snapshot restore destination") {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, error));
-        }
-        match std::fs::rename(from, to) {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                if !is_transient_rename_error(&error)
-                    || start.elapsed().as_millis() as u64 >= MAX_TOTAL_MS
-                {
-                    return Err(error);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(SLEEP_MS));
-            }
-        }
+fn snapshot_repair_step(error: &flapjack::FlapjackError) -> SnapshotInstallStep {
+    if is_publication_staging_path_rejection(error) {
+        SnapshotInstallStep::ValidateManagedPath
+    } else {
+        SnapshotInstallStep::RecoverInterrupted
     }
 }
 
-fn is_transient_rename_error(error: &std::io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        // EBUSY = 16 (Linux), ENOTEMPTY = 39 (Linux) / 66 (macOS)
-        Some(16) | Some(39) | Some(66)
-    ) || matches!(
-        error.kind(),
-        std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::ResourceBusy
-    )
+fn is_publication_staging_path_rejection(error: &flapjack::FlapjackError) -> bool {
+    let message = match error {
+        flapjack::FlapjackError::Io(message) | flapjack::FlapjackError::InvalidQuery(message) => {
+            message.as_str()
+        }
+        _ => return false,
+    };
+    let managed_rejection = message.contains("refusing symlinked publication repair managed")
+        || message.contains("refusing symlinked tenant inventory root");
+    managed_rejection && (message.contains("/staging'") || message.contains("\\staging'"))
 }
 
-fn restore_backup_after_failed_activation(
-    tenant_existed: bool,
-    backup_path: &std::path::Path,
-    tenant_path: &std::path::Path,
-) -> Result<(), String> {
-    if !tenant_existed {
-        return Ok(());
-    }
+fn unload_for_snapshot_publication(
+    manager: &flapjack::IndexManager,
+    tenant_id: &str,
+) -> Result<(), (SnapshotInstallStep, String)> {
+    manager
+        .unload(&tenant_id.to_string())
+        .map_err(|error| (SnapshotInstallStep::RecoverInterrupted, error.to_string()))
+}
 
-    rename_with_transient_retry(backup_path, tenant_path).map_err(|error| {
-        format!(
-            "restore previous tenant dir '{}' from backup '{}' failed: {}",
-            tenant_path.display(),
-            backup_path.display(),
-            error
-        )
-    })
+fn snapshot_activation_step(stage: PreStagedActivationStage) -> SnapshotInstallStep {
+    match stage {
+        PreStagedActivationStage::BackupTarget => SnapshotInstallStep::RenameTenantToBackup,
+        PreStagedActivationStage::Prepare | PreStagedActivationStage::PromoteStaging => {
+            SnapshotInstallStep::RenameStagingToTenant
+        }
+    }
 }
 fn validate_tenant_id(tenant_id: &str) -> Result<(), String> {
     flapjack::validate_index_name(tenant_id)
@@ -572,70 +508,6 @@ fn validate_snapshot_tenant_content(
 
     Ok(())
 }
-/// Recovers from a crash during snapshot restore: if a backup dir exists but the
-/// tenant dir is missing, restores from the backup to avoid data loss.
-fn recover_interrupted_snapshot_restore(
-    tenant_path: &std::path::Path,
-    backup_path: &std::path::Path,
-) -> Result<(), String> {
-    reject_symlinked_managed_path(tenant_path, "tenant")?;
-    reject_symlinked_managed_path(backup_path, "snapshot backup")?;
-
-    if !backup_path.exists() {
-        return Ok(());
-    }
-
-    if tenant_path.exists() {
-        return remove_path_if_exists(backup_path);
-    }
-
-    // Crash recovery can race the same lingering file handles as the primary
-    // activation path, so reuse the bounded rename retry instead of failing on
-    // the first transient EBUSY/ENOTEMPTY.
-    rename_with_transient_retry(backup_path, tenant_path).map_err(|error| {
-        format!(
-            "restore interrupted snapshot backup '{}' -> '{}' failed: {}",
-            backup_path.display(),
-            tenant_path.display(),
-            error
-        )
-    })
-}
-
-fn reject_symlinked_managed_path(path: &std::path::Path, path_role: &str) -> Result<(), String> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
-            "refusing symlinked {} path '{}'",
-            path_role,
-            path.display()
-        )),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "stat {} path '{}' failed: {}",
-            path_role,
-            path.display(),
-            error
-        )),
-    }
-}
-
-fn remove_path_if_exists(path: &std::path::Path) -> Result<(), String> {
-    reject_symlinked_managed_path(path, "snapshot restore")?;
-
-    if !path.exists() {
-        return Ok(());
-    }
-
-    if path.is_dir() {
-        std::fs::remove_dir_all(path)
-            .map_err(|error| format!("remove dir '{}' failed: {}", path.display(), error))
-    } else {
-        std::fs::remove_file(path)
-            .map_err(|error| format!("remove file '{}' failed: {}", path.display(), error))
-    }
-}
-
 fn read_local_ops_since(
     state: &AppState,
     tenant_id: &str,
@@ -841,8 +713,83 @@ mod tests {
     use flapjack_replication::manager::ReplicationManager;
     use flapjack_replication::types::GetOpsResponse;
     use flapjack_replication::types::ReplicateOpsRequest;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, OnceLock};
     use tempfile::TempDir;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum SnapshotTreeEntry {
+        Directory,
+        File(Vec<u8>),
+        Symlink(PathBuf),
+    }
+
+    fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, SnapshotTreeEntry> {
+        let mut entries = BTreeMap::new();
+        snapshot_tree_inner(root, root, &mut entries);
+        entries
+    }
+
+    fn snapshot_tree_inner(
+        root: &Path,
+        current: &Path,
+        entries: &mut BTreeMap<PathBuf, SnapshotTreeEntry>,
+    ) {
+        for entry in std::fs::read_dir(current).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            if metadata.file_type().is_symlink() {
+                entries.insert(
+                    relative,
+                    SnapshotTreeEntry::Symlink(std::fs::read_link(&path).unwrap()),
+                );
+            } else if metadata.is_dir() {
+                entries.insert(relative, SnapshotTreeEntry::Directory);
+                snapshot_tree_inner(root, &path, entries);
+            } else {
+                entries.insert(
+                    relative,
+                    SnapshotTreeEntry::File(std::fs::read(&path).unwrap()),
+                );
+            }
+        }
+    }
+
+    fn assert_unjournaled_snapshot_transaction_removed(
+        manager: &flapjack::IndexManager,
+        tenant_id: &str,
+    ) {
+        let publication_root = manager.base_path.join(".publication").join(tenant_id);
+        assert!(
+            !publication_root.exists()
+                || std::fs::read_dir(publication_root)
+                    .unwrap()
+                    .next()
+                    .is_none(),
+            "failed validation must remove its unjournaled transaction"
+        );
+    }
+
+    #[test]
+    fn snapshot_activation_stages_preserve_stable_response_tags() {
+        use flapjack::index::manager::publication::PreStagedActivationStage;
+
+        assert_eq!(
+            super::snapshot_activation_step(PreStagedActivationStage::BackupTarget),
+            super::SnapshotInstallStep::RenameTenantToBackup
+        );
+        assert_eq!(
+            super::snapshot_activation_step(PreStagedActivationStage::PromoteStaging),
+            super::SnapshotInstallStep::RenameStagingToTenant
+        );
+        assert_eq!(
+            super::snapshot_activation_step(PreStagedActivationStage::Prepare),
+            super::SnapshotInstallStep::RenameStagingToTenant
+        );
+    }
     use tokio::sync::oneshot;
 
     // Async-aware mutex so the guard can be held across the `.await` points in
@@ -1126,17 +1073,37 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let manager = flapjack::IndexManager::new(tmp.path());
         let tenant_id = "restore_target";
+        manager.create_tenant(tenant_id).unwrap();
+        assert!(manager.get_or_create_oplog(tenant_id).is_some());
+        manager.facet_cache.insert(
+            format!("{tenant_id}:facets"),
+            std::sync::Arc::new((
+                std::time::Instant::now(),
+                1,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                true,
+            )),
+        );
         let tenant_path = manager.base_path.join(tenant_id);
-        std::fs::create_dir_all(&tenant_path).unwrap();
-        let marker_path = tenant_path.join("marker.txt");
-        std::fs::write(&marker_path, "keep-me").unwrap();
+        std::fs::write(tenant_path.join("marker.txt"), "keep-me").unwrap();
+        std::fs::create_dir_all(tenant_path.join("nested")).unwrap();
+        std::fs::write(tenant_path.join("nested/keep.bin"), b"\x00keep\xff").unwrap();
+        let live_before = snapshot_tree(&tenant_path);
 
         let result = install_snapshot_bytes(&manager, tenant_id, b"not-a-valid-snapshot");
         assert!(result.is_err(), "invalid snapshot import should fail");
-        assert!(
-            marker_path.exists(),
-            "existing tenant data should remain if snapshot import fails"
+        assert_eq!(
+            snapshot_tree(&tenant_path),
+            live_before,
+            "existing tenant tree should remain byte-for-byte unchanged if snapshot import fails"
         );
+        assert!(manager.loaded_tenant_ids().iter().any(|id| id == tenant_id));
+        assert!(manager.get_oplog(tenant_id).is_some());
+        assert!(manager
+            .facet_cache
+            .contains_key(&format!("{tenant_id}:facets")));
+        assert_unjournaled_snapshot_transaction_removed(&manager, tenant_id);
     }
     #[tokio::test]
     async fn install_snapshot_bytes_replaces_existing_tenant_on_valid_snapshot() {
@@ -1184,8 +1151,10 @@ mod tests {
         let tenant_id = "restore_target";
         let tenant_path = manager.base_path.join(tenant_id);
         std::fs::create_dir_all(&tenant_path).unwrap();
-        let existing_marker = tenant_path.join("keep.txt");
-        std::fs::write(&existing_marker, "keep-me").unwrap();
+        std::fs::write(tenant_path.join("keep.txt"), "keep-me").unwrap();
+        std::fs::create_dir_all(tenant_path.join("nested")).unwrap();
+        std::fs::write(tenant_path.join("nested/keep.bin"), b"\x00keep\xff").unwrap();
+        let live_before = snapshot_tree(&tenant_path);
 
         let snapshot_src = TempDir::new().unwrap();
         std::fs::write(snapshot_src.path().join("new.txt"), "new").unwrap();
@@ -1204,10 +1173,11 @@ mod tests {
             result.1
         );
         assert_eq!(
-            std::fs::read_to_string(existing_marker).unwrap(),
-            "keep-me",
+            snapshot_tree(&tenant_path),
+            live_before,
             "rejecting snapshots without tenant identity evidence must preserve existing tenant data"
         );
+        assert_unjournaled_snapshot_transaction_removed(&manager, tenant_id);
     }
 
     #[tokio::test]
@@ -1217,8 +1187,10 @@ mod tests {
         let tenant_id = "tenant_red";
         let tenant_path = manager.base_path.join(tenant_id);
         std::fs::create_dir_all(&tenant_path).unwrap();
-        let existing_marker = tenant_path.join("keep.txt");
-        std::fs::write(&existing_marker, "keep-me").unwrap();
+        std::fs::write(tenant_path.join("keep.txt"), "keep-me").unwrap();
+        std::fs::create_dir_all(tenant_path.join("nested")).unwrap();
+        std::fs::write(tenant_path.join("nested/keep.bin"), b"\x00keep\xff").unwrap();
+        let live_before = snapshot_tree(&tenant_path);
 
         let snapshot_src = TempDir::new().unwrap();
         let foreign_tenant_id = "tenant_blue";
@@ -1246,56 +1218,47 @@ mod tests {
             result.1
         );
         assert_eq!(
-            std::fs::read_to_string(existing_marker).unwrap(),
-            "keep-me",
+            snapshot_tree(&tenant_path),
+            live_before,
             "rejecting foreign snapshot content must preserve existing tenant data"
         );
+        assert_unjournaled_snapshot_transaction_removed(&manager, tenant_id);
     }
     #[tokio::test]
     async fn install_snapshot_bytes_restores_backup_before_retrying_failed_snapshot() {
         let tmp = TempDir::new().unwrap();
         let manager = flapjack::IndexManager::new(tmp.path());
         let tenant_id = "restore_target";
-        let tenant_path = manager.base_path.join(tenant_id);
-        let backup_path = manager
-            .base_path
-            .join(format!(".{tenant_id}.snapshot_restore_backup"));
+        use flapjack::index::manager::publication::*;
+        let target = PublicationTarget::new(tenant_id).unwrap();
+        let transaction = PublicationTransactionId::new("interrupted").unwrap();
+        let paths = PublicationPaths::new(&manager.base_path, &target, &transaction);
+        let tenant_path = paths.target.clone();
+        let backup_path = paths.backup.clone();
         std::fs::create_dir_all(&backup_path).unwrap();
-        let marker_path = backup_path.join("marker.txt");
-        std::fs::write(&marker_path, "keep-me").unwrap();
+        std::fs::write(backup_path.join("settings.json"), "keep-me").unwrap();
+        let inventory = TantivyManagedInventory::new([]).unwrap();
+        let prior_digest = canonical_tenant_tree_digest(&backup_path, &inventory).unwrap();
+        let mut journal = PublicationJournal::prepare(
+            transaction,
+            target,
+            PublicationGenerationEvidence::new("snapshot_generation").unwrap(),
+            ContentDigest::new(format!("sha256:{}", "0".repeat(64))).unwrap(),
+            paths.clone(),
+        );
+        journal.prior_digest = Some(prior_digest);
+        std::fs::create_dir_all(paths.journal.parent().unwrap()).unwrap();
+        std::fs::write(&paths.journal, journal.to_json_value().to_string()).unwrap();
 
         let result = install_snapshot_bytes(&manager, tenant_id, b"not-a-valid-snapshot");
         assert!(result.is_err(), "invalid snapshot import should fail");
         assert!(
-            tenant_path.join("marker.txt").exists(),
+            tenant_path.join("settings.json").exists(),
             "retry should restore the interrupted backup before attempting a new snapshot install"
         );
         assert!(
             !backup_path.exists(),
             "restored backup should be moved back to the active tenant path"
-        );
-    }
-
-    #[test]
-    fn restore_backup_after_failed_activation_surfaces_rollback_errors() {
-        let tmp = TempDir::new().unwrap();
-        let tenant_path = tmp.path().join("tenant");
-        let backup_path = tmp.path().join(".tenant.snapshot_restore_backup");
-        std::fs::create_dir_all(&tenant_path).unwrap();
-        std::fs::write(tenant_path.join("occupied.txt"), "still here").unwrap();
-        std::fs::create_dir_all(&backup_path).unwrap();
-        std::fs::write(backup_path.join("backup.txt"), "restore me").unwrap();
-
-        let error = super::restore_backup_after_failed_activation(true, &backup_path, &tenant_path)
-            .expect_err("existing tenant path should make rollback restore fail");
-
-        assert!(
-            error.contains("restore previous tenant dir"),
-            "rollback failure should identify the restore step, got: {error}"
-        );
-        assert!(
-            error.contains("failed"),
-            "rollback failure should preserve the underlying io error, got: {error}"
         );
     }
 
@@ -1345,12 +1308,19 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn install_snapshot_bytes_rejects_symlinked_backup_path() {
+        use flapjack::index::manager::publication::{
+            PublicationPaths, PublicationTarget, PublicationTransactionId,
+        };
         let tmp = TempDir::new().unwrap();
         let manager = flapjack::IndexManager::new(tmp.path());
         let tenant_id = "tenant_safe";
-        let backup_path = manager
-            .base_path
-            .join(format!(".{tenant_id}.snapshot_restore_backup"));
+        let backup_path = PublicationPaths::new(
+            &manager.base_path,
+            &PublicationTarget::new(tenant_id).unwrap(),
+            &PublicationTransactionId::new("symlinked_backup").unwrap(),
+        )
+        .backup;
+        std::fs::create_dir_all(backup_path.parent().unwrap()).unwrap();
         let victim = TempDir::new().unwrap();
         let marker = victim.path().join("marker.txt");
         std::fs::write(&marker, "keep-me").unwrap();
@@ -1396,10 +1366,17 @@ mod tests {
         let outside_marker = outside.path().join("marker.txt");
         std::fs::write(&outside_marker, "keep-me").unwrap();
 
+        use flapjack::index::manager::publication::{
+            PublicationPaths, PublicationTarget, PublicationTransactionId,
+        };
         let tenant_id = "restore_target";
-        let staging_path = manager
-            .base_path
-            .join(format!(".{tenant_id}.snapshot_restore_staging"));
+        let staging_path = PublicationPaths::new(
+            &manager.base_path,
+            &PublicationTarget::new(tenant_id).unwrap(),
+            &PublicationTransactionId::new("symlinked_staging").unwrap(),
+        )
+        .staging;
+        std::fs::create_dir_all(staging_path.parent().unwrap()).unwrap();
         symlink(outside.path(), &staging_path).unwrap();
 
         let result = install_snapshot_bytes(&manager, tenant_id, b"not-a-valid-snapshot");
@@ -1408,7 +1385,7 @@ mod tests {
         assert_eq!(
             *step,
             super::SnapshotInstallStep::ValidateManagedPath,
-            "symlinked managed paths must fail before cleanup/import"
+            "caller-managed staging path rejection must keep the stable managed-path step"
         );
         assert!(
             error_msg.contains("symlink"),

@@ -1235,6 +1235,7 @@ async fn a05_public_health_uses_explicit_metadata_denylist() {
     let expected_keys: HashSet<&str> = [
         "status",
         "version",
+        "build",
         "uptime_secs",
         "capabilities",
         "active_writers",
@@ -1251,7 +1252,11 @@ async fn a05_public_health_uses_explicit_metadata_denylist() {
     .collect();
 
     assert_eq!(body["status"], json!("ok"));
-    assert_eq!(body["version"], json!(env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        body["build"],
+        serde_json::to_value(flapjack::build_info()).unwrap()
+    );
+    assert_eq!(body["version"], body["build"]["version"]);
     assert!(body["active_writers"].is_number());
     assert!(body["max_concurrent_writers"].is_number());
     assert!(body["facet_cache_entries"].is_number());
@@ -1261,22 +1266,36 @@ async fn a05_public_health_uses_explicit_metadata_denylist() {
     assert!(body["pressure_level"].is_string());
     assert!(body["allocator"].is_string());
     assert!(body["uptime_secs"].is_number());
-    assert_eq!(
-        body["capabilities"],
-        json!({
-            "vectorSearch": cfg!(feature = "vector-search"),
-            "vectorSearchLocal": cfg!(feature = "vector-search-local"),
-        })
-    );
+    assert_eq!(body["capabilities"], body["build"]["capabilities"]);
     assert!(body["tenants_loaded"].is_number());
     assert_eq!(
         actual_keys, expected_keys,
         "public /health must keep an exact allowlist contract"
     );
-    assert!(
-        body.get("build_profile").is_none(),
-        "public /health must not expose build-profile metadata"
-    );
+    assert_no_migration_capability_spellings(&body["build"]);
+    assert_no_migration_capability_spellings(&body["capabilities"]);
+    for field in [
+        "build_profile",
+        "profile",
+        "target",
+        "features",
+        "workspaceDigest",
+    ] {
+        assert!(
+            body.get(field).is_none(),
+            "public /health must not expose top-level build metadata: {field}"
+        );
+    }
+}
+
+fn assert_no_migration_capability_spellings(value: &serde_json::Value) {
+    let serialized = value.to_string();
+    for spelling in ["algolia_migration_v1", "algoliaMigrationV1"] {
+        assert!(
+            !serialized.contains(spelling),
+            "serialized build capability payload must not include {spelling}: {serialized}"
+        );
+    }
 }
 
 #[tokio::test]

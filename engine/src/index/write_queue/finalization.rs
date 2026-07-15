@@ -4,6 +4,8 @@ use crate::types::{TaskInfo, TaskStatus};
 
 use super::{PreparedWriteDocument, PreparedWriteOperation, WriteFinalizationContext};
 
+pub(crate) const PERSISTED_VECTORS_DIR: &str = "vectors";
+
 pub(super) fn write_valid_documents(
     writer: &mut crate::index::ManagedIndexWriter,
     valid_docs: &[PreparedWriteDocument],
@@ -149,7 +151,10 @@ fn save_vector_index(
         return;
     }
 
-    let vectors_dir = context.base_path.join(context.tenant_id).join("vectors");
+    let vectors_dir = context
+        .base_path
+        .join(context.tenant_id)
+        .join(PERSISTED_VECTORS_DIR);
     let Some(vector_index) = context.vector_ctx.vector_indices.get(context.tenant_id) else {
         return;
     };

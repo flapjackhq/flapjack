@@ -85,6 +85,14 @@ pub struct QsConfigStore {
     dir: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QsTargetArtifactPaths {
+    pub root_dir: PathBuf,
+    pub config_path: PathBuf,
+    pub status_path: PathBuf,
+    pub log_path: PathBuf,
+}
+
 fn validate_store_index_name(index_name: &str) -> std::io::Result<()> {
     crate::validate_index_name(index_name).map_err(|e| {
         std::io::Error::new(
@@ -98,6 +106,18 @@ impl QsConfigStore {
     pub fn new(base_dir: &Path) -> Self {
         let dir = base_dir.join(".query_suggestions");
         Self { dir }
+    }
+
+    pub fn target_artifact_paths(
+        &self,
+        index_name: &str,
+    ) -> std::io::Result<QsTargetArtifactPaths> {
+        Ok(QsTargetArtifactPaths {
+            root_dir: self.dir.clone(),
+            config_path: self.config_path(index_name)?,
+            status_path: self.status_path(index_name)?,
+            log_path: self.log_path(index_name)?,
+        })
     }
 
     fn ensure_dir(&self) -> std::io::Result<()> {

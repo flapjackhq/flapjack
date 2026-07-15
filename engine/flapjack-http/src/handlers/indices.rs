@@ -1,4 +1,3 @@
-//! Handlers for index CRUD operations (create, delete, list, clear, compact, copy/move) with Algolia-compatible pagination, oplog replication, and replica-aware clearing.
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -201,14 +200,8 @@ pub async fn list_indices(
 
     let mut items: Vec<ListIndexItem> = Vec::new();
 
-    for entry in std::fs::read_dir(&state.manager.base_path)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-
-        let name = entry.file_name().to_string_lossy().to_string();
-        let index_path = entry.path();
+    for name in crate::tenant_dirs::valid_index_tenant_dir_names(&state.manager.base_path)? {
+        let index_path = state.manager.base_path.join(&name);
         let file_size = dir_size(&index_path);
 
         let settings = state.manager.get_settings(&name);
@@ -684,6 +677,76 @@ mod tests {
 
         // Verify entries count matches document count
         assert_eq!(entries, 2, "entries should match document count");
+    }
+
+    #[tokio::test]
+    async fn list_indices_excludes_publication_roots_and_paginates_visible_tenants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = TestStateBuilder::new(&tmp).build_shared();
+        state.manager.create_tenant("products").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".publication")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".publication_quarantine")).unwrap();
+
+        let app = Router::new()
+            .route("/1/indexes", get(list_indices))
+            .with_state(Arc::clone(&state));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/1/indexes?page=0&hitsPerPage=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let names: Vec<_> = body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["products"]);
+        assert_eq!(body["nbPages"], 1);
+    }
+
+    #[tokio::test]
+    async fn list_indices_preserves_valid_nonpublication_tenant_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = TestStateBuilder::new(&tmp).build_shared();
+        state.manager.create_tenant("_shadow").unwrap();
+        state.manager.create_tenant("analytics").unwrap();
+        state.manager.create_tenant("products").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".publication")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".publication_quarantine")).unwrap();
+
+        let app = Router::new()
+            .route("/1/indexes", get(list_indices))
+            .with_state(Arc::clone(&state));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/1/indexes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let names: Vec<_> = body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["_shadow", "analytics", "products"]);
+        assert_eq!(body["nbPages"], 1);
     }
 }
 

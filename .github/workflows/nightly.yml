@@ -148,6 +148,9 @@ jobs:
       - name: Run page tests
         working-directory: engine/dashboard
         run: npm run test:pages
+        env:
+          ALGOLIA_APP_ID: ${{ secrets.ALGOLIA_APP_ID }}
+          ALGOLIA_ADMIN_KEY: ${{ secrets.ALGOLIA_ADMIN_KEY }}
       - name: Run integration tests
         working-directory: engine/dashboard
         run: npm run test:integration

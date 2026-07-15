@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RELEASE_WORKFLOW="$REPO_DIR/.github/workflows/release.yml"
 DOCKER_WORKFLOW="$REPO_DIR/.github/workflows/docker.yml"
+RELEASE_MANIFEST_HELPER="$REPO_DIR/engine/package/release_artifact_manifest"
 
 TESTS_RUN=0
 TESTS_PASSED=0
@@ -49,6 +50,88 @@ assert_not_contains() {
   fi
 }
 
+assert_file_executable() {
+  local file_path="$1"
+  local description="$2"
+  if [ -x "$file_path" ]; then
+    pass "$description"
+  else
+    fail "$description"
+  fi
+}
+
+assert_release_helper_contract() {
+  local tmp_dir bin_path output_dir manifest_path
+  tmp_dir="$(mktemp -d)"
+  bin_path="$tmp_dir/flapjack"
+  output_dir="$tmp_dir/out"
+  mkdir -p "$output_dir"
+
+  cat >"$bin_path" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "$#" -ne 2 ] || [ "$1" != "build-info" ] || [ "$2" != "--json" ]; then
+  echo "unexpected invocation: $*" >&2
+  exit 64
+fi
+printf '%s\n' '{"schemaVersion":1,"version":"1.2.3","revision":"0123456789abcdef0123456789abcdef01234567","revisionKnown":true,"dirty":false,"dirtyKnown":true,"workspaceDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"release","target":"x86_64-unknown-linux-gnu","features":["vector-search"],"capabilities":{"vectorSearch":true,"vectorSearchLocal":false}}'
+EOF
+  chmod +x "$bin_path"
+
+  if "$RELEASE_MANIFEST_HELPER" "x86_64-unknown-linux-gnu" "$bin_path" "$output_dir" >/dev/null 2>&1; then
+    manifest_path="$output_dir/flapjack-x86_64-unknown-linux-gnu.manifest.json"
+    if python3 - "$manifest_path" "$output_dir/flapjack-x86_64-unknown-linux-gnu.tar.gz" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+manifest_path = pathlib.Path(sys.argv[1])
+archive_path = pathlib.Path(sys.argv[2])
+manifest = json.loads(manifest_path.read_text())
+expected_build = {
+    "schemaVersion": 1,
+    "version": "1.2.3",
+    "revision": "0123456789abcdef0123456789abcdef01234567",
+    "revisionKnown": True,
+    "dirty": False,
+    "dirtyKnown": True,
+    "workspaceDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "profile": "release",
+    "target": "x86_64-unknown-linux-gnu",
+    "features": ["vector-search"],
+    "capabilities": {"vectorSearch": True, "vectorSearchLocal": False},
+}
+expected_artifact = {
+    "file": archive_path.name,
+    "target": "x86_64-unknown-linux-gnu",
+    "arch": "x86_64",
+    "profile": "release",
+    "sha256": hashlib.sha256(archive_path.read_bytes()).hexdigest(),
+}
+if manifest.get("schemaVersion") != 1:
+    raise SystemExit("manifest schemaVersion must be 1")
+if manifest.get("artifact") != expected_artifact:
+    raise SystemExit(f"artifact contract mismatch: {manifest.get('artifact')}")
+if manifest.get("build") != expected_build:
+    raise SystemExit(f"build object must be copied verbatim: {manifest.get('build')}")
+serialized = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+for forbidden in ("algolia_migration_v1", "algoliaMigrationV1"):
+    if forbidden in serialized:
+        raise SystemExit(f"forbidden migration capability spelling present: {forbidden}")
+PY
+    then
+      pass "release_artifact_manifest writes schemaVersion, artifact fields, and verbatim canonical build object"
+    else
+      fail "release_artifact_manifest writes schemaVersion, artifact fields, and verbatim canonical build object"
+    fi
+  else
+    fail "release_artifact_manifest accepts target, binary path, and output directory CLI"
+  fi
+
+  rm -rf "$tmp_dir"
+}
+
 section "Release workflow sequencing"
 assert_contains "$RELEASE_WORKFLOW" '^\s*validate_release_version:' "release.yml defines a release-version validation gate"
 assert_contains "$RELEASE_WORKFLOW" '^\s*needs:\s*validate_release_version\s*$' "build job waits for the release-version validation gate"
@@ -70,6 +153,19 @@ assert_contains "$RELEASE_WORKFLOW" 'grep -Fq "## \[\$\{VERSION\}\] - "' "releas
 assert_contains "$RELEASE_WORKFLOW" 'version must match MAJOR\.MINOR\.PATCH or MAJOR\.MINOR\.PATCH-prerelease' "release.yml rejects unsafe release-version syntax before tagging or publishing"
 assert_contains "$RELEASE_WORKFLOW" "^\\s*if:\\s*\\$\\{\\{\\s*runner\\.os\\s*!=\\s*'Windows'\\s*\\}\\}" "unix packaging step uses valid runner.os expression syntax"
 assert_contains "$RELEASE_WORKFLOW" "^\\s*if:\\s*\\$\\{\\{\\s*runner\\.os\\s*==\\s*'Windows'\\s*\\}\\}" "windows packaging step uses valid runner.os expression syntax"
+
+section "Release build identity packaging"
+assert_contains "$RELEASE_WORKFLOW" "github\\.sha.*\\^\\[0-9a-f\\]\\{40\\}\\$|\\^\\[0-9a-f\\]\\{40\\}\\$.*github\\.sha" "release.yml verifies github.sha is exactly 40 lowercase hex characters"
+assert_contains "$RELEASE_WORKFLOW" "FLAPJACK_BUILD_REVISION: \\$\\{\\{ github\\.sha \\}\\}" "release.yml exports github.sha as FLAPJACK_BUILD_REVISION for release builds"
+assert_contains "$RELEASE_WORKFLOW" "package/release_artifact_manifest \\$\\{\\{ matrix\\.target \\}\\} target/\\$\\{\\{ matrix\\.target \\}\\}/release/flapjack " "unix packaging calls the shared release_artifact_manifest helper"
+assert_contains "$RELEASE_WORKFLOW" "package/release_artifact_manifest \\$\\{\\{ matrix\\.target \\}\\} target/\\$\\{\\{ matrix\\.target \\}\\}/release/flapjack\\.exe " "windows packaging calls the shared release_artifact_manifest helper"
+assert_contains "$RELEASE_WORKFLOW" "flapjack-\\*\\.manifest\\.json" "release.yml uploads and publishes manifest JSON assets"
+assert_contains "$RELEASE_WORKFLOW" "flapjack-\\*\\.tar\\.gz" "release.yml uploads and publishes Unix archives"
+assert_contains "$RELEASE_WORKFLOW" "flapjack-\\*\\.tar\\.gz\\.sha256" "release.yml uploads and publishes Unix checksum sidecars"
+assert_contains "$RELEASE_WORKFLOW" "flapjack-\\*\\.zip" "release.yml uploads and publishes Windows archives"
+assert_contains "$RELEASE_WORKFLOW" "flapjack-\\*\\.zip\\.sha256" "release.yml uploads and publishes Windows checksum sidecars"
+assert_file_executable "$RELEASE_MANIFEST_HELPER" "release_artifact_manifest helper is executable"
+assert_release_helper_contract
 
 section "Docker build hang protection and retry safety"
 # The qemu arm64 fallback once hung the release pipeline indefinitely because it

@@ -1146,6 +1146,7 @@ fn internal_replication_router(state: std::sync::Arc<AppState>) -> Router {
     Router::new()
         .route("/internal/replicate", post(super::replicate_ops))
         .route("/internal/ops", get(super::get_ops))
+        .route("/internal/tenants", get(super::list_tenants))
         .with_state(state)
 }
 
@@ -1254,6 +1255,106 @@ async fn get_ops_missing_tenant_returns_standard_404_json() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], 404);
     assert_eq!(json["message"], "Tenant not found");
+}
+
+#[tokio::test]
+async fn list_tenants_excludes_publication_roots() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    state.manager.create_tenant("products").unwrap();
+    std::fs::create_dir_all(tmp.path().join(".publication")).unwrap();
+    std::fs::create_dir_all(tmp.path().join(".publication_quarantine")).unwrap();
+    let app = internal_replication_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/internal/tenants")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = crate::test_helpers::body_json(resp).await;
+    assert_eq!(body["tenants"], serde_json::json!(["products"]));
+}
+
+#[tokio::test]
+async fn get_ops_does_not_open_publication_roots_as_moved_source_candidates() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let node_id = std::env::var("FLAPJACK_NODE_ID").unwrap_or_else(|_| "unknown".to_string());
+    let publication_oplog_dir = tmp.path().join(".publication").join("oplog");
+    let publication_oplog =
+        flapjack::index::oplog::OpLog::open(&publication_oplog_dir, ".publication", &node_id)
+            .unwrap();
+    publication_oplog
+        .append(
+            "move_index",
+            serde_json::json!({"source": "missing_source", "destination": "products"}),
+        )
+        .unwrap();
+    let app = internal_replication_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/internal/ops?tenant_id=missing_source&since_seq=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = crate::test_helpers::body_json(resp).await;
+    assert_eq!(body["message"], "Tenant not found");
+    assert_eq!(body["status"], 404);
+}
+
+#[tokio::test]
+async fn get_ops_moved_source_fallback_scans_valid_nonpublication_destinations() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    state.manager.create_tenant("_shadow").unwrap();
+    let destination_oplog = state.manager.get_or_create_oplog("_shadow").unwrap();
+    destination_oplog
+        .append(
+            "move_index",
+            serde_json::json!({"source": "missing_source", "destination": "_shadow"}),
+        )
+        .unwrap();
+    destination_oplog
+        .append(
+            "upsert",
+            serde_json::json!({"objectID": "after-move", "body": {"_id": "after-move"}}),
+        )
+        .unwrap();
+    let app = internal_replication_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/internal/ops?tenant_id=missing_source&since_seq=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["tenant_id"], "missing_source");
+    assert_eq!(json["current_seq"], 1);
+    let ops = json["ops"].as_array().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0]["op_type"], "move_index");
+    assert_eq!(ops[0]["payload"]["destination"], "_shadow");
 }
 
 /// Verify that malformed tenant IDs in GET `/internal/ops` are rejected as

@@ -25,7 +25,7 @@
     "test:headed": "playwright test --project=e2e-ui --headed",
     "test:debug": "playwright test --project=e2e-ui --debug",
     "test:pages": "playwright test --project=e2e-ui",
-    "test:integration": "playwright test --project=e2e-api",
+    "test:integration": "sh -c 'playwright test --project=e2e-api \"$@\" && playwright test --project=e2e-ui tests/e2e-ui/full/migrate-algolia.spec.ts \"$@\"' --",
     "test:report": "playwright show-report",
     "lint:e2e": "eslint --config tests/e2e-ui/eslint.config.mjs 'tests/e2e-ui/**/*.spec.ts' 'tests/e2e-ui/**/*.test.ts' 'tests/e2e-ui/helpers.ts' 'tests/e2e-ui/**/*_helpers.ts'"
   },

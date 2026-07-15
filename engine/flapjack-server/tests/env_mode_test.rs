@@ -10,6 +10,221 @@ use support::{
     flapjack_cmd, http_request, unique_suffix, RunningServer, TempDir,
 };
 
+#[test]
+fn repair_publication_reports_clean_without_creating_evidence() {
+    let tmp = TempDir::new("fj_repair_clean");
+    let output = flapjack_cmd()
+        .arg("--data-dir")
+        .arg(tmp.path())
+        .arg("repair-publication")
+        .arg("--tenant")
+        .arg("products")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report,
+        serde_json::json!({
+            "tenant": "products", "status": "clean", "action": "none",
+            "transaction_id": null, "phase": null, "evidence": null
+        })
+    );
+    assert!(!tmp.root().join(".publication/products").exists());
+}
+
+#[test]
+fn repair_publication_text_renders_complete_canonical_report() {
+    let tmp = TempDir::new("fj_repair_text_clean");
+    let output = flapjack_cmd()
+        .arg("--data-dir")
+        .arg(tmp.path())
+        .arg("repair-publication")
+        .arg("--tenant")
+        .arg("products")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "tenant=products status=clean action=none transaction_id=null phase=null evidence=null\n"
+    );
+}
+
+#[test]
+fn repair_publication_reports_empty_namespace_as_unresolved() {
+    let tmp = TempDir::new("fj_repair_empty_namespace");
+    std::fs::create_dir_all(tmp.root().join(".publication/products")).unwrap();
+
+    let output = flapjack_cmd()
+        .arg("--data-dir")
+        .arg(tmp.path())
+        .arg("repair-publication")
+        .arg("--tenant")
+        .arg("products")
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report,
+        serde_json::json!({
+            "tenant": "products", "status": "unresolved", "action": "unresolved",
+            "transaction_id": null, "phase": null, "evidence": ".publication/products"
+        })
+    );
+    assert!(tmp.root().join(".publication/products").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn repair_publication_reports_symlinked_live_tenant_as_unresolved() {
+    let tmp = TempDir::new("fj_repair_symlinked_tenant");
+    let outside = TempDir::new("fj_repair_symlinked_tenant_outside");
+    std::fs::create_dir_all(outside.root()).unwrap();
+    std::fs::write(outside.root().join("settings.json"), "escaped").unwrap();
+    std::os::unix::fs::symlink(outside.root(), tmp.root().join("products")).unwrap();
+
+    let output = flapjack_cmd()
+        .arg("--data-dir")
+        .arg(tmp.path())
+        .arg("repair-publication")
+        .arg("--tenant")
+        .arg("products")
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report,
+        serde_json::json!({
+            "tenant": "products", "status": "unresolved", "action": "unresolved",
+            "transaction_id": null, "phase": null, "evidence": null
+        })
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.root().join("settings.json")).unwrap(),
+        "escaped"
+    );
+}
+
+#[test]
+fn repair_publication_reports_repaired_and_unresolved_exit_codes() {
+    use flapjack::index::manager::publication::*;
+    let repaired = TempDir::new("fj_repair_repaired");
+    let target = PublicationTarget::new("products").unwrap();
+    let transaction = PublicationTransactionId::new("txn_repair").unwrap();
+    let paths = PublicationPaths::new(repaired.root(), &target, &transaction);
+    std::fs::create_dir_all(&paths.target).unwrap();
+    std::fs::write(paths.target.join("settings.json"), "old").unwrap();
+    std::fs::create_dir_all(&paths.staging).unwrap();
+    std::fs::write(paths.staging.join("settings.json"), "new").unwrap();
+    let inventory = TantivyManagedInventory::new([]).unwrap();
+    let digest = canonical_tenant_tree_digest(&paths.staging, &inventory).unwrap();
+    let prior = canonical_tenant_tree_digest(&paths.target, &inventory).unwrap();
+    let mut journal = PublicationJournal::prepare(
+        transaction,
+        target,
+        PublicationGenerationEvidence::new("generation").unwrap(),
+        digest,
+        paths.clone(),
+    );
+    journal.prior_digest = Some(prior);
+    std::fs::create_dir_all(paths.journal.parent().unwrap()).unwrap();
+    std::fs::write(&paths.journal, journal.to_json_value().to_string()).unwrap();
+    let output = flapjack_cmd()
+        .arg("--data-dir")
+        .arg(repaired.path())
+        .arg("repair-publication")
+        .arg("--tenant")
+        .arg("products")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["tenant"], "products");
+    assert_eq!(report["status"], "repaired");
+    assert_eq!(report["action"], "complete");
+    assert_eq!(report["transaction_id"], "txn_repair");
+    assert_eq!(report["phase"], "prepared");
+    assert_eq!(report["evidence"], ".publication/products/txn_repair");
+
+    let unresolved = TempDir::new("fj_repair_unresolved");
+    for transaction in ["txn_a", "txn_b"] {
+        let path = unresolved
+            .root()
+            .join(".publication/products")
+            .join(transaction)
+            .join("staging");
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let output = flapjack_cmd()
+        .arg("--data-dir")
+        .arg(unresolved.path())
+        .arg("repair-publication")
+        .arg("--tenant")
+        .arg("products")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "unresolved");
+    assert_eq!(report["action"], "unresolved");
+    assert_eq!(report["transaction_id"], serde_json::Value::Null);
+    assert_eq!(report["phase"], serde_json::Value::Null);
+    assert_eq!(report["evidence"], ".publication/products");
+
+    let quarantined = TempDir::new("fj_repair_quarantined");
+    let staging = quarantined
+        .root()
+        .join(".publication/products/txn_stale/staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(staging.join("settings.json"), "unproven").unwrap();
+    let output = flapjack_cmd()
+        .arg("--data-dir")
+        .arg(quarantined.path())
+        .arg("repair-publication")
+        .arg("--tenant")
+        .arg("products")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report,
+        serde_json::json!({
+            "tenant": "products", "status": "quarantined", "action": "quarantine",
+            "transaction_id": "txn_stale", "phase": null,
+            "evidence": ".publication/products/txn_stale"
+        })
+    );
+}
+
+#[test]
+fn repair_publication_uses_clap_for_missing_and_invalid_flags() {
+    flapjack_cmd()
+        .arg("repair-publication")
+        .arg("--json")
+        .assert()
+        .failure();
+    flapjack_cmd()
+        .arg("repair-publication")
+        .arg("--tenant")
+        .arg("products")
+        .arg("--unknown")
+        .assert()
+        .failure();
+}
+
 // Startup assertions depend on the banner/error text being emitted before the
 // helper timeout kills the child process. Keep this comfortably above observed
 // startup jitter so parallel test execution does not produce false negatives.

@@ -61,7 +61,7 @@ tests/
 - **Repo-local config file** at `flapjack.local.conf` (copy from `flapjack.local.conf.example`)
 - **Flapjack server** running on `http://$FJ_HOST:$FJ_BACKEND_PORT` from that file
 - **Vite dev server** on `http://$FJ_HOST:$FJ_DASHBOARD_PORT` from that file (started automatically by Playwright unless already running)
-- **Algolia credentials** (e2e-api tests only) — set `ALGOLIA_APP_ID` and `ALGOLIA_ADMIN_KEY` in `../../.secret/.env.secret`
+- **Algolia credentials** (required for the real-Algolia migration coverage and some API tests) — set `ALGOLIA_APP_ID` and `ALGOLIA_ADMIN_KEY` in `../../.secret/.env.secret`, or point Playwright at another file with `FJ_SECRET_FILE=/path/to/.env.secret`
 
 ## Running Tests
 
@@ -165,22 +165,33 @@ test('my test', async ({ page }) => {
 });
 ```
 
-### Adding e2e-api tests
+### Adding credentialed tests
 
-Place API-level tests (no browser rendering) in `tests/e2e-api/`. For tests requiring external services, use the conditional skip pattern:
+Place API-level tests (no browser rendering) in `tests/e2e-api/`. For tests requiring external services, use the shared credential-mode guard so local runs can skip, but CI fails closed if the required secrets are missing:
 
 ```typescript
 // E2E-API: These tests call REST APIs directly (no browser rendering).
 // For real-browser simulated-human tests, see tests/e2e-ui/
 import { test, expect } from '../fixtures/auth.fixture';
-import { hasAlgoliaCredentials } from '../fixtures/algolia.fixture';
+import {
+  hasAlgoliaCredentials,
+  MissingAlgoliaCredentialsError,
+  resolveAlgoliaCredentialMode,
+} from '../fixtures/algolia.fixture';
 
-const describeOrSkip = hasAlgoliaCredentials()
-  ? test.describe
-  : test.describe.skip;
+const credentialMode = resolveAlgoliaCredentialMode({
+  hasCredentials: hasAlgoliaCredentials(),
+  isCI: !!process.env.CI,
+});
 
-describeOrSkip('My E2E-API Test', () => {
-  // Tests here skip gracefully when credentials are missing
+if (credentialMode === 'fail') {
+  throw new MissingAlgoliaCredentialsError();
+}
+
+const describeOrSkip = credentialMode === 'run' ? test.describe : test.describe.skip;
+
+describeOrSkip('My credentialed test', () => {
+  // Local runs without credentials skip; CI without credentials fails loudly.
 });
 ```
 
@@ -205,8 +216,8 @@ await page.pause();
 ### Tests fail with "No API response"
 The dashboard needs a running Flapjack server at the repo-local configured backend URL (`flapjack.local.conf`).
 
-### Integration tests are skipped
-Set `ALGOLIA_APP_ID` and `ALGOLIA_ADMIN_KEY` in `.secret/.env.secret` at the project root.
+### Credentialed tests fail in CI
+Set `ALGOLIA_APP_ID` and `ALGOLIA_ADMIN_KEY` in `.secret/.env.secret` at the project root, or set `FJ_SECRET_FILE` to another env file. Use `FJ_NO_SECRET_FILE=1` only when you intentionally want to prove the missing-credentials failure path.
 
 ### Tests timeout
 Increase timeout in `playwright.config.ts` or per-test with `test.describe.configure({ timeout: 120_000 })`.

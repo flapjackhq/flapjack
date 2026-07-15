@@ -113,10 +113,13 @@ pub fn flush_rollup_window_with_event_count(
     let batch = aggregates_to_rollup_batch(window_start_ms, window_end_ms, aggregates)?;
 
     let tier_dir = config.rollups_dir(index_name, tier);
+    reject_symlink_if_exists(&tier_dir, "rollup dir")?;
     fs::create_dir_all(&tier_dir)
         .map_err(|e| format!("Failed to create rollup dir {}: {}", tier_dir.display(), e))?;
+    reject_symlink_if_exists(&tier_dir, "rollup dir")?;
     let filename = rollup_window_filename(tier, window_start_ms);
     let parquet_path = tier_dir.join(&filename);
+    reject_symlink_if_exists(&parquet_path, "rollup parquet path")?;
     let backup_path = stage_existing_rollup_backup(&parquet_path)?;
     if let Err(error) = write_parquet_file_atomic(&parquet_path, batch) {
         return rollback_rollup_write_failure(&parquet_path, backup_path.as_deref(), error);
@@ -780,6 +783,24 @@ fn remove_file_if_exists(path: &Path) -> Result<(), String> {
     }
 }
 
+fn reject_symlink_if_exists(path: &Path, path_role: &str) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "refusing symlinked {} {}",
+            path_role,
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "failed to stat {} {}: {}",
+            path_role,
+            path.display(),
+            error
+        )),
+    }
+}
+
 /// UTC date string (YYYY-MM-DD) for the start of a rollup window, used as the
 /// per-date manifest bucket key.
 fn window_start_utc_date(window_start_ms: i64) -> String {
@@ -797,7 +818,10 @@ fn partitioned_parquet_path(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<PathBuf, String> {
     let partition_dir = dir.join(format!("date={}", now.format("%Y-%m-%d")));
+    reject_symlink_if_exists(dir, "analytics root")?;
+    reject_symlink_if_exists(&partition_dir, "analytics partition dir")?;
     fs::create_dir_all(&partition_dir).map_err(|e| format!("Failed to create dir: {}", e))?;
+    reject_symlink_if_exists(&partition_dir, "analytics partition dir")?;
 
     let timestamp_ms = now.timestamp_millis();
     let sequence = PARQUET_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -819,6 +843,11 @@ fn partitioned_parquet_path(
 /// * `path` - Destination file path; created or truncated.
 /// * `batch` - The Arrow record batch to write.
 pub(crate) fn write_parquet_file(path: &Path, batch: RecordBatch) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        reject_symlink_if_exists(parent, "parquet parent dir")?;
+    }
+    reject_symlink_if_exists(path, "parquet file path")?;
+
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
         .set_max_row_group_size(100_000)
@@ -840,6 +869,7 @@ pub(crate) fn write_parquet_file(path: &Path, batch: RecordBatch) -> Result<(), 
 }
 
 fn write_parquet_file_atomic(path: &Path, batch: RecordBatch) -> Result<(), String> {
+    reject_symlink_if_exists(path, "parquet destination")?;
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -855,6 +885,7 @@ fn write_parquet_file_atomic(path: &Path, batch: RecordBatch) -> Result<(), Stri
                 e
             )
         })?;
+    reject_symlink_if_exists(path, "parquet destination")?;
     fs::rename(&tmp_path, path).map_err(|e| {
         format!(
             "Failed to atomically replace parquet file {} with {}: {}",
@@ -1334,6 +1365,54 @@ mod tests {
             .expect_err("analytics purge must fail closed on symlinked directories");
         assert!(
             err.contains("refusing to traverse symlinked analytics path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partitioned_parquet_path_rejects_symlinked_partition_dir() {
+        let tmp = TempDir::new().unwrap();
+        let events_dir = tmp.path().join("events");
+        let outside_dir = tmp.path().join("outside");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+
+        let now = chrono::Utc
+            .with_ymd_and_hms(2025, 6, 15, 12, 0, 0)
+            .single()
+            .unwrap();
+        let partition_dir = events_dir.join(format!("date={}", now.format("%Y-%m-%d")));
+        symlink(&outside_dir, &partition_dir).unwrap();
+
+        let err = partitioned_parquet_path(&events_dir, "events", now)
+            .expect_err("writer must fail closed on symlinked partition directory");
+        assert!(
+            err.contains("refusing symlinked analytics partition dir"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn flush_rollup_window_rejects_symlinked_rollup_dir() {
+        let tmp = TempDir::new().unwrap();
+        let config = rollup_test_config(&tmp);
+        let rollup_dir = config.rollups_dir("products", "1hour");
+        let outside_dir = tmp.path().join("outside-rollups");
+        std::fs::create_dir_all(rollup_dir.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        symlink(&outside_dir, &rollup_dir).unwrap();
+
+        let start = chrono::Utc
+            .with_ymd_and_hms(2025, 6, 15, 12, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let err = flush_rollup_window(&config, "products", "1hour", start, start + 3_600_000)
+            .expect_err("rollup writer must fail closed on symlinked output directories");
+        assert!(
+            err.contains("refusing symlinked rollup dir"),
             "unexpected error: {err}"
         );
     }

@@ -1,4 +1,10 @@
 use super::*;
+use publication::{
+    activate_publication, PublicationArtifactPlan, PublicationGenerationEvidence, PublicationPaths,
+    PublicationPhase, PublicationTarget, PublicationTransactionId, TantivyManagedInventory,
+};
+#[cfg(test)]
+use publication::{activate_publication_for_test, PublicationFaultPoint};
 
 impl super::IndexManager {
     /// Create or load a tenant index, initializing default settings if the index is new.
@@ -213,6 +219,28 @@ impl super::IndexManager {
     ///
     /// Ok with a TaskInfo for the operation, or an error if validation fails or the source doesn't exist.
     pub async fn move_index(&self, source: &str, destination: &str) -> Result<TaskInfo> {
+        self.move_index_with_publication(source, destination, None)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn move_index_with_fault_for_test(
+        &self,
+        source: &str,
+        destination: &str,
+        fault: PublicationFaultPoint,
+    ) -> Result<TaskInfo> {
+        self.move_index_with_publication(source, destination, Some(fault))
+            .await
+    }
+
+    async fn move_index_with_publication(
+        &self,
+        source: &str,
+        destination: &str,
+        #[cfg(test)] fault: Option<PublicationFaultPoint>,
+        #[cfg(not(test))] _fault: Option<()>,
+    ) -> Result<TaskInfo> {
         validate_index_name(source)?;
         validate_index_name(destination)?;
         let src_path = self.base_path.join(source);
@@ -221,19 +249,71 @@ impl super::IndexManager {
         }
 
         self.unload(&source.to_string())?;
+        self.unload(&destination.to_string())?;
 
-        if self.loaded.contains_key(destination) {
-            self.delete_tenant(&destination.to_string()).await?;
-        } else {
-            let dest_path = self.base_path.join(destination);
-            if dest_path.exists() {
-                std::fs::remove_dir_all(&dest_path)?;
-            }
+        let target = PublicationTarget::new(destination)?;
+        let transaction =
+            PublicationTransactionId::new(format!("move_{}", uuid::Uuid::new_v4().simple()))?;
+        let paths = PublicationPaths::new(&self.base_path, &target, &transaction);
+        std::fs::create_dir_all(paths.staging.parent().ok_or_else(|| {
+            FlapjackError::InvalidQuery("publication staging path has no parent".into())
+        })?)?;
+        if paths.staging.exists() {
+            std::fs::remove_dir_all(&paths.staging)?;
         }
+        copy_dir_recursive(&src_path, &paths.staging)?;
 
-        let dest_path = self.base_path.join(destination);
-        std::fs::rename(&src_path, &dest_path)?;
-
+        let inventory = TantivyManagedInventory::from_existing_trees([
+            paths.staging.as_path(),
+            paths.target.as_path(),
+        ])?;
+        let artifacts = PublicationArtifactPlan::for_move(
+            &self.base_path,
+            &self.publication_analytics_config(),
+            source,
+            &target,
+            &transaction,
+        )?;
+        artifacts.stage()?;
+        let generation = PublicationGenerationEvidence::new(format!(
+            "move_{}_to_{}_{}",
+            source,
+            destination,
+            uuid::Uuid::new_v4().simple()
+        ))?;
+        let manifest = artifacts.manifest();
+        #[cfg(test)]
+        if let Some(fault) = fault {
+            let journal = activate_publication_for_test(
+                &paths,
+                target,
+                transaction,
+                generation,
+                manifest,
+                &inventory,
+                fault,
+            )?;
+            ensure_committed_move(&journal)?;
+            if fault == PublicationFaultPoint::BeforeSourceCleanup {
+                return Err(FlapjackError::InvalidQuery(
+                    "injected publication fault before source cleanup".into(),
+                ));
+            }
+            artifacts.remove_source()?;
+            std::fs::remove_dir_all(&src_path)?;
+            return self.make_noop_task(destination);
+        }
+        let journal = activate_publication(
+            &paths,
+            target,
+            transaction,
+            generation,
+            manifest,
+            &inventory,
+        )?;
+        ensure_committed_move(&journal)?;
+        artifacts.remove_source()?;
+        std::fs::remove_dir_all(&src_path)?;
         self.make_noop_task(destination)
     }
 
@@ -347,5 +427,16 @@ impl super::IndexManager {
                 );
             }
         }
+    }
+}
+
+fn ensure_committed_move(journal: &publication::PublicationJournal) -> Result<()> {
+    if journal.phase == PublicationPhase::Committed {
+        Ok(())
+    } else {
+        Err(FlapjackError::InvalidQuery(format!(
+            "move_index publication returned non-committed journal phase {:?}",
+            journal.phase
+        )))
     }
 }

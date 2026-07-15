@@ -1,9 +1,10 @@
 import { test, expect } from '../../fixtures/auth.fixture';
 import {
   hasAlgoliaCredentials,
+  MissingAlgoliaCredentialsError,
+  resolveAlgoliaCredentialMode,
   seedAlgoliaIndex,
-  deleteAlgoliaIndex,
-  deleteFlapjackIndex,
+  cleanupMigrationIndexes,
   type AlgoliaTestContext,
 } from '../../fixtures/algolia.fixture';
 import { EXPECTED_COUNTS } from '../../fixtures/test-data';
@@ -14,37 +15,56 @@ import { EXPECTED_COUNTS } from '../../fixtures/test-data';
  * Tests the full Algolia migration flow through the browser UI:
  * fill credentials → select index → click Migrate → verify success card → browse results.
  *
- * Requires Algolia credentials in .env.secret. Skips gracefully when unavailable.
+ * Requires Algolia credentials in .env.secret. Local runs skip when unavailable;
+ * CI throws instead so the vendor-backed migration path cannot pass by absence.
  */
 
-const hasCredentials = hasAlgoliaCredentials();
-const describeOrSkip = hasCredentials ? test.describe : test.describe.skip;
+const credentialMode = resolveAlgoliaCredentialMode({
+  hasCredentials: hasAlgoliaCredentials(),
+  isCI: !!process.env.CI,
+});
+
+if (credentialMode === 'fail') {
+  // A silent CI skip is indistinguishable from a pass in workflow status.
+  throw new MissingAlgoliaCredentialsError();
+}
+
+const describeOrSkip = credentialMode === 'run' ? test.describe : test.describe.skip;
 
 describeOrSkip('Algolia Migration (real browser)', () => {
-  let ctx: AlgoliaTestContext;
+  let ctx: AlgoliaTestContext | undefined;
 
   test.describe.configure({ timeout: 120_000 });
+
+  function requireAlgoliaContext(): AlgoliaTestContext {
+    if (!ctx) {
+      throw new Error('Algolia test context was not seeded');
+    }
+    return ctx;
+  }
 
   test.beforeAll(async () => {
     ctx = await seedAlgoliaIndex();
   });
 
   test.afterAll(async () => {
-    await Promise.all([
-      deleteAlgoliaIndex(ctx),
-      deleteFlapjackIndex(ctx.indexName),
-    ]);
+    if (!ctx) {
+      return;
+    }
+    await cleanupMigrationIndexes(ctx);
   });
 
   test('migrate Algolia index via UI: fill form → migrate → verify success → browse', async ({ page }) => {
+    const algoliaCtx = requireAlgoliaContext();
+
     // Navigate to Migrate page
     await page.goto('/migrate');
     await expect(page.getByRole('heading', { name: /migrate from algolia/i })).toBeVisible();
 
     // Fill in Algolia credentials
-    await page.locator('#app-id').fill(ctx.appId);
-    await page.locator('#api-key').fill(ctx.adminKey);
-    await page.locator('#source-index').fill(ctx.indexName);
+    await page.locator('#app-id').fill(algoliaCtx.appId);
+    await page.locator('#api-key').fill(algoliaCtx.adminKey);
+    await page.locator('#source-index').fill(algoliaCtx.indexName);
 
     // Enable overwrite
     const overwriteSwitch = page.locator('#overwrite');
@@ -53,7 +73,7 @@ describeOrSkip('Algolia Migration (real browser)', () => {
 
     // Verify Migrate button shows index name and is enabled
     const migrateButton = page.getByRole('button', {
-      name: new RegExp(`Migrate.*"${ctx.indexName}"`),
+      name: new RegExp(`Migrate.*"${algoliaCtx.indexName}"`),
     });
     await expect(migrateButton).toBeEnabled();
 
@@ -72,10 +92,10 @@ describeOrSkip('Algolia Migration (real browser)', () => {
 
     // Click "Browse Index" and verify navigation
     await page.getByRole('link', { name: 'Browse Index' }).click();
-    await expect(page).toHaveURL(new RegExp(`/index/${encodeURIComponent(ctx.indexName)}`));
+    await expect(page).toHaveURL(new RegExp(`/index/${encodeURIComponent(algoliaCtx.indexName)}`));
 
     // Verify documents are searchable
-    await expect(page.getByRole('heading', { name: ctx.indexName })).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByRole('heading', { name: algoliaCtx.indexName })).toBeVisible({ timeout: 10_000 });
     await expect(page.getByTestId('results-panel')).toBeVisible({ timeout: 15_000 });
 
     const searchInput = page.getByPlaceholder(/search documents/i);

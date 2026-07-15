@@ -1,5 +1,9 @@
 use super::*;
 
+pub(crate) const SETTINGS_FILE: &str = "settings.json";
+pub(crate) const RULES_FILE: &str = "rules.json";
+pub(crate) const SYNONYMS_FILE: &str = "synonyms.json";
+
 impl super::IndexManager {
     fn tenant_dir_if_valid(&self, tenant_id: &str) -> Option<PathBuf> {
         if let Err(e) = validate_index_name(tenant_id) {
@@ -13,7 +17,7 @@ impl super::IndexManager {
         if let Some(cached) = self.settings_cache.get(tenant_id) {
             return Some(Arc::clone(&cached));
         }
-        let path = self.tenant_dir_if_valid(tenant_id)?.join("settings.json");
+        let path = self.tenant_dir_if_valid(tenant_id)?.join(SETTINGS_FILE);
         if path.exists() {
             if let Ok(s) = IndexSettings::load(&path) {
                 let arc = Arc::new(s);
@@ -29,7 +33,7 @@ impl super::IndexManager {
         if let Some(cached) = self.rules_cache.get(tenant_id) {
             return Some(Arc::clone(&cached));
         }
-        let path = self.tenant_dir_if_valid(tenant_id)?.join("rules.json");
+        let path = self.tenant_dir_if_valid(tenant_id)?.join(RULES_FILE);
         if path.exists() {
             if let Ok(s) = RuleStore::load(&path) {
                 let arc = Arc::new(s);
@@ -45,7 +49,7 @@ impl super::IndexManager {
         if let Some(cached) = self.synonyms_cache.get(tenant_id) {
             return Some(Arc::clone(&cached));
         }
-        let path = self.tenant_dir_if_valid(tenant_id)?.join("synonyms.json");
+        let path = self.tenant_dir_if_valid(tenant_id)?.join(SYNONYMS_FILE);
         if path.exists() {
             if let Ok(s) = SynonymStore::load(&path) {
                 let arc = Arc::new(s);
@@ -94,7 +98,7 @@ impl super::IndexManager {
 
     /// Read `indexLanguages` from settings.json at the given index path, for tokenizer selection.
     pub(super) fn read_index_languages(path: &std::path::Path) -> Vec<String> {
-        let settings_path = path.join("settings.json");
+        let settings_path = path.join(SETTINGS_FILE);
         if settings_path.exists() {
             if let Ok(settings) = IndexSettings::load(&settings_path) {
                 return settings.index_languages;
@@ -105,7 +109,7 @@ impl super::IndexManager {
 
     /// Read `separatorsToIndex` from settings.json at the given index path.
     pub(super) fn read_indexed_separators(path: &std::path::Path) -> Vec<char> {
-        let settings_path = path.join("settings.json");
+        let settings_path = path.join(SETTINGS_FILE);
         if settings_path.exists() {
             if let Ok(settings) = IndexSettings::load(&settings_path) {
                 return settings.separators_to_index.chars().collect();
@@ -115,7 +119,7 @@ impl super::IndexManager {
     }
 
     pub(super) fn read_keep_diacritics_on_characters(path: &std::path::Path) -> String {
-        let settings_path = path.join("settings.json");
+        let settings_path = path.join(SETTINGS_FILE);
         if settings_path.exists() {
             if let Ok(settings) = IndexSettings::load(&settings_path) {
                 return settings.keep_diacritics_on_characters;
@@ -125,7 +129,7 @@ impl super::IndexManager {
     }
 
     pub(super) fn read_custom_normalization(path: &std::path::Path) -> Vec<(char, String)> {
-        let settings_path = path.join("settings.json");
+        let settings_path = path.join(SETTINGS_FILE);
         if settings_path.exists() {
             if let Ok(settings) = IndexSettings::load(&settings_path) {
                 return IndexSettings::flatten_custom_normalization(&settings);

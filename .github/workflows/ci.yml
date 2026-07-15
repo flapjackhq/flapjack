@@ -346,6 +346,9 @@ jobs:
       - name: Run full e2e tests
         working-directory: engine/dashboard
         run: npm run test:e2e-ui:full
+        env:
+          ALGOLIA_APP_ID: ${{ secrets.ALGOLIA_APP_ID }}
+          ALGOLIA_ADMIN_KEY: ${{ secrets.ALGOLIA_ADMIN_KEY }}
       - name: Upload test report
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
