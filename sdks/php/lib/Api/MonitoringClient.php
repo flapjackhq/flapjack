@@ -91,8 +91,9 @@ class MonitoringClient
             // If a list of hosts was passed, we ignore the cache
             $clusterHosts = ClusterHosts::create($hosts);
         } else {
+            // Default SDK hosts must stay on Flapjack-owned domains.
             $clusterHosts = ClusterHosts::create([
-                'status.algolia.com',
+                'status.flapjack.io',
             ]);
         }
 

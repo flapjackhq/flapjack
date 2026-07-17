@@ -49,8 +49,9 @@ class MonitoringConfig(BaseConfig):
         if self.hosts is not None:
             return
 
+        # Default SDK hosts must stay on Flapjack-owned domains.
         self.hosts = HostsCollection(
             [
-                Host("status.algolia.com"),
+                Host("status.flapjack.io"),
             ]
         )

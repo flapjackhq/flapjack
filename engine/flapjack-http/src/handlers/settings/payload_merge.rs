@@ -14,18 +14,28 @@ pub(super) fn merge_settings_payload(
     mut payload: SetSettingsRequest,
     index_name: &str,
 ) -> Result<Option<Vec<ReplicaEntry>>, (StatusCode, String)> {
-    if let Some(distinct_value) = parse_distinct_value(payload.distinct.take()) {
-        settings.distinct = Some(distinct_value);
-    }
-
-    apply_search_config_fields(settings, &mut payload);
-    apply_response_and_display_fields(settings, &mut payload);
-    apply_embedders_update(settings, payload.embedders.take());
+    merge_non_topology_settings_payload(settings, &mut payload)?;
 
     let validated_replicas =
         validate_and_apply_replicas(settings, payload.replicas.take(), index_name)?;
     warn_neural_without_embedders(settings);
     Ok(validated_replicas)
+}
+
+pub(in crate::handlers) fn merge_non_topology_settings_payload(
+    settings: &mut IndexSettings,
+    payload: &mut SetSettingsRequest,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(distinct_value) = parse_distinct_value_strict(payload.distinct.take())
+        .map_err(|message| (StatusCode::BAD_REQUEST, message.to_string()))?
+    {
+        settings.distinct = Some(distinct_value);
+    }
+
+    apply_search_config_fields(settings, payload);
+    apply_response_and_display_fields(settings, payload);
+    apply_embedders_update(settings, payload.embedders.take());
+    Ok(())
 }
 
 /// Log embedder additions, removals, and mutations after a settings merge.
@@ -35,17 +45,30 @@ pub(super) fn log_embedder_changes(
 ) {
     for change in detect_embedder_changes(old, &settings.embedders) {
         match change {
-            EmbedderChange::Modified(name) => tracing::warn!(
-                "embedder '{}' configuration changed; existing vectors may be stale",
-                name
-            ),
-            EmbedderChange::Removed(name) => tracing::warn!(
-                "embedder '{}' removed; associated vectors will be orphaned",
-                name
-            ),
-            EmbedderChange::Added(name) => tracing::info!("embedder '{}' configured", name),
+            EmbedderChange::Modified(name) => {
+                let name = log_safe_embedder_name(&name);
+                tracing::warn!(
+                    "embedder '{}' configuration changed; existing vectors may be stale",
+                    name
+                );
+            }
+            EmbedderChange::Removed(name) => {
+                let name = log_safe_embedder_name(&name);
+                tracing::warn!(
+                    "embedder '{}' removed; associated vectors will be orphaned",
+                    name
+                );
+            }
+            EmbedderChange::Added(name) => {
+                let name = log_safe_embedder_name(&name);
+                tracing::info!("embedder '{}' configured", name);
+            }
         }
     }
+}
+
+fn log_safe_embedder_name(name: &str) -> String {
+    name.escape_debug().to_string()
 }
 
 /// Applies search-behavior fields from a settings payload to the index settings.
@@ -79,6 +102,30 @@ fn apply_search_config_fields(settings: &mut IndexSettings, payload: &mut SetSet
     }
     if let Some(v) = payload.query_type.take() {
         settings.query_type = v;
+    }
+    if let Some(v) = payload.hits_per_page.take() {
+        settings.hits_per_page = v;
+    }
+    if let Some(v) = payload.min_word_size_for_1_typo.take() {
+        settings.min_word_size_for_1_typo = v;
+    }
+    if let Some(v) = payload.min_word_size_for_2_typos.take() {
+        settings.min_word_size_for_2_typos = v;
+    }
+    if let Some(v) = payload.max_values_per_facet.take() {
+        settings.max_values_per_facet = v;
+    }
+    if let Some(v) = payload.exact_on_single_word_query.take() {
+        settings.exact_on_single_word_query = v;
+    }
+    if let Some(v) = payload.remove_words_if_no_results.take() {
+        settings.remove_words_if_no_results = v;
+    }
+    if let Some(v) = payload.separators_to_index.take() {
+        settings.separators_to_index = v;
+    }
+    if let Some(v) = payload.alternatives_as_exact.take() {
+        settings.alternatives_as_exact = v;
     }
     if let Some(v) = payload.numeric_attributes_for_filtering.take() {
         settings.numeric_attributes_for_filtering = Some(v);
@@ -114,6 +161,21 @@ fn apply_response_and_display_fields(
     }
     if let Some(v) = payload.unretrievable_attributes.take() {
         settings.unretrievable_attributes = Some(v);
+    }
+    if let Some(v) = payload.attributes_to_highlight.take() {
+        settings.attributes_to_highlight = Some(v);
+    }
+    if let Some(v) = payload.attributes_to_snippet.take() {
+        settings.attributes_to_snippet = Some(v);
+    }
+    if let Some(v) = payload.highlight_pre_tag.take() {
+        settings.highlight_pre_tag = Some(v);
+    }
+    if let Some(v) = payload.highlight_post_tag.take() {
+        settings.highlight_post_tag = Some(v);
+    }
+    if let Some(v) = payload.optional_words.take() {
+        settings.optional_words = v;
     }
     if let Some(v) = payload.attribute_for_distinct.take() {
         settings.attribute_for_distinct = Some(v);
@@ -162,14 +224,24 @@ fn apply_response_and_display_fields(
     }
 }
 
-fn parse_distinct_value(raw: Option<serde_json::Value>) -> Option<DistinctValue> {
-    raw.and_then(|value| match value {
-        serde_json::Value::Bool(is_distinct) => Some(DistinctValue::Bool(is_distinct)),
-        serde_json::Value::Number(number) => number
-            .as_u64()
-            .map(|distinct_count| DistinctValue::Integer(distinct_count as u32)),
-        _ => None,
-    })
+pub(in crate::handlers) fn parse_distinct_value_strict(
+    raw: Option<serde_json::Value>,
+) -> Result<Option<DistinctValue>, &'static str> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+
+    match value {
+        serde_json::Value::Bool(is_distinct) => Ok(Some(DistinctValue::Bool(is_distinct))),
+        serde_json::Value::Number(number) => {
+            let distinct_count = number
+                .as_u64()
+                .filter(|value| u32::try_from(*value).is_ok())
+                .ok_or("distinct must be a boolean or a non-negative u32 integer")?;
+            Ok(Some(DistinctValue::Integer(distinct_count as u32)))
+        }
+        _ => Err("distinct must be a boolean or a non-negative u32 integer"),
+    }
 }
 
 fn apply_embedders_update(
@@ -209,6 +281,19 @@ fn warn_neural_without_embedders(settings: &IndexSettings) {
     if settings.mode == Some(IndexMode::NeuralSearch) && settings.embedders.is_none() {
         tracing::warn!(
             "mode set to neuralSearch but no embedders configured; hybrid search will fall back to keyword-only until embedders are added"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::log_safe_embedder_name;
+
+    #[test]
+    fn log_safe_embedder_name_escapes_control_characters() {
+        assert_eq!(
+            log_safe_embedder_name("public\nfake=entry\tprovider"),
+            "public\\nfake=entry\\tprovider"
         );
     }
 }

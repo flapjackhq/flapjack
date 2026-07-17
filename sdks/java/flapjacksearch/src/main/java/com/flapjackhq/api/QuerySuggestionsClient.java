@@ -58,7 +58,8 @@ public class QuerySuggestionsClient extends ApiClient {
       throw new FlapjackRuntimeException("`region` is required and must be one of the following: eu, us");
     }
 
-    String url = "query-suggestions.{region}.algolia.com".replace("{region}", region);
+    // Default SDK hosts must stay on Flapjack-owned domains.
+    String url = "query-suggestions.{region}.flapjack.io".replace("{region}", region);
 
     hosts.add(new Host(url, EnumSet.of(CallType.READ, CallType.WRITE)));
     return hosts;

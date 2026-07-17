@@ -64,12 +64,13 @@ class AbtestingConfig(BaseConfig):
                 f"`region` must be one of the following: {', '.join(_regions)}"
             )
 
+        # Default SDK hosts must stay on Flapjack-owned domains.
         self.hosts = HostsCollection(
             [
                 Host(
-                    "analytics.algolia.com"
+                    "analytics.flapjack.io"
                     if self.region is None
-                    else "analytics.{region}.algolia.com".replace(
+                    else "analytics.{region}.flapjack.io".replace(
                         "{region}", self.region or ""
                     )
                 )

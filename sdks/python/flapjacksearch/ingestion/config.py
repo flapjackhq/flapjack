@@ -60,6 +60,7 @@ class IngestionConfig(BaseConfig):
                 f"`region` is required and must be one of the following: {', '.join(_regions)}"
             )
 
+        # Default SDK hosts must stay on Flapjack-owned domains.
         self.hosts = HostsCollection(
-            [Host("data.{region}.algolia.com".replace("{region}", self.region or ""))]
+            [Host("data.{region}.flapjack.io".replace("{region}", self.region or ""))]
         )

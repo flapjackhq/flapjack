@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-mod payload_merge;
+pub(in crate::handlers) mod payload_merge;
 mod replica_forwarding;
 
 use self::payload_merge::{log_embedder_changes, merge_settings_payload};
@@ -53,6 +53,36 @@ pub struct SetSettingsRequest {
     #[serde(rename = "unretrievableAttributes")]
     pub unretrievable_attributes: Option<Vec<String>>,
 
+    #[serde(rename = "attributesToHighlight")]
+    pub attributes_to_highlight: Option<Vec<String>>,
+
+    #[serde(rename = "attributesToSnippet")]
+    pub attributes_to_snippet: Option<Vec<String>>,
+
+    #[serde(rename = "highlightPreTag", skip_serializing_if = "Option::is_none")]
+    pub highlight_pre_tag: Option<String>,
+
+    #[serde(rename = "highlightPostTag", skip_serializing_if = "Option::is_none")]
+    pub highlight_post_tag: Option<String>,
+
+    #[serde(rename = "hitsPerPage", skip_serializing_if = "Option::is_none")]
+    pub hits_per_page: Option<u32>,
+
+    #[serde(
+        rename = "minWordSizefor1Typo",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub min_word_size_for_1_typo: Option<u32>,
+
+    #[serde(
+        rename = "minWordSizefor2Typos",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub min_word_size_for_2_typos: Option<u32>,
+
+    #[serde(rename = "maxValuesPerFacet", skip_serializing_if = "Option::is_none")]
+    pub max_values_per_facet: Option<u32>,
+
     #[serde(rename = "paginationLimitedTo")]
     pub pagination_limited_to: Option<u32>,
 
@@ -72,6 +102,30 @@ pub struct SetSettingsRequest {
 
     #[serde(rename = "queryType")]
     pub query_type: Option<String>,
+
+    #[serde(
+        rename = "exactOnSingleWordQuery",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub exact_on_single_word_query: Option<String>,
+
+    #[serde(
+        rename = "removeWordsIfNoResults",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub remove_words_if_no_results: Option<String>,
+
+    #[serde(rename = "separatorsToIndex", skip_serializing_if = "Option::is_none")]
+    pub separators_to_index: Option<String>,
+
+    #[serde(
+        rename = "alternativesAsExact",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub alternatives_as_exact: Option<Vec<String>>,
+
+    #[serde(rename = "optionalWords", skip_serializing_if = "Option::is_none")]
+    pub optional_words: Option<Vec<String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedders: Option<HashMap<String, serde_json::Value>>,

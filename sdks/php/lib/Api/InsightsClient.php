@@ -90,9 +90,10 @@ class InsightsClient
             // If a list of hosts was passed, we ignore the cache
             $clusterHosts = ClusterHosts::create($hosts);
         } else {
+            // Default SDK hosts must stay on Flapjack-owned domains.
             $url = null !== $config->getRegion() && '' !== $config->getRegion()
-                ? str_replace('{region}', $config->getRegion(), 'insights.{region}.algolia.io')
-                : 'insights.algolia.io';
+                ? str_replace('{region}', $config->getRegion(), 'insights.{region}.flapjack.io')
+                : 'insights.flapjack.io';
             $clusterHosts = ClusterHosts::create($url);
         }
 

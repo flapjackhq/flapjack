@@ -1,6 +1,6 @@
 # Flapjack - Roadmap
 
-**Last updated:** 2026-06-10
+**Last updated:** 2026-07-16
 **Ledger policy:** `ROADMAP.md` is the only root open-work ledger. Mission,
 scope, and strategic priority order live in [`PROJECT_OVERVIEW.md`](PROJECT_OVERVIEW.md).
 Shipped capability status lives in [`engine/docs2/FEATURES.md`](engine/docs2/FEATURES.md),
@@ -10,13 +10,31 @@ history is routed to `implemented/2026_06_05_history.md`.
 **Last shipped release:** [v1.0.10](https://github.com/flapjackhq/flapjack/releases/tag/v1.0.10) (2026-06-09). Detailed release history lives in [`CHANGELOG.md`](CHANGELOG.md).
 
 **ID prefixes:** `RF-*` = foundational refinement track; `PL-*` =
-launch-hardening / operational-polish track. IDs are stable identifiers, not
-priority rank.
+launch-hardening / operational-polish track; `MIG-*` = Algolia-migration
+capability track. IDs are stable identifiers, not priority rank.
+
+## RELEASE HOLD (2026-07-16)
+
+**Do not cut a release from `main` until `MIG-1` lands.** `main` currently
+reports a successful Algolia migration without importing any documents (see
+`MIG-1`). v1.0.10 (2026-06-09) predates the regression and is unaffected, so
+this hold protects the next cut, not the shipped line. Lift the hold when `MIG-1`'s
+refusal-arm exit passes — the hold exists to stop the *lie* from shipping, not to
+wait for the import. A release cut after the hold lifts but before `MIG-3` lands
+would ship an endpoint that honestly refuses to migrate; that is a product gap to
+weigh, not a correctness defect.
 
 ## Active
 
 | ID | Work Item | Current State | Evidence / Owner |
 |----|-----------|---------------|------------------|
+| MIG-1 | `/1/migrate-from-algolia` reports success without importing | **Highest priority.** Introduced 2026-07-15 by `728cde433`, a checklist-scoped decomposition that deleted the destination writers while the recomposing lane never ran. The handler returns `status:"complete"` with `objects.imported:N` and writes no index; rustdoc and OpenAPI still describe the deleted import. Also adds the typed HA refusal so the import cannot return unguarded. **Falsifiable exit (the refusal arm only — this row does not claim the import works):** `cargo test -p flapjack-http -- handlers::migration` proves the endpoint returns `503 migration_import_unavailable`, creates no target index, and writes no spool; and `migration_import_contract.sh --expect-mode unavailable` proves the same against a running server. The count-implies-reality arm (a 2xx reporting `objects.imported:N` means `GET /1/indexes` lists the target with `entries == N` — exact, not `>=`, which would pass for a handler reporting `imported:1` over 23,407 docs) is authored here but is vacuous until an import exists — it is **`MIG-3`'s** exit, not this row's. Lifting the release hold requires only this row: the hold exists to stop the *lie* from shipping. | Owner: `engine/flapjack-http/src/handlers/migration/mod.rs:156`; status detail: [`engine/docs2/FEATURES.md`](engine/docs2/FEATURES.md) "Algolia migration"; proof that no import occurs: `handlers/migration/export_tests.rs:181` |
+| MIG-2 | Algolia → Flapjack translation matrix | Absent. Needs one closed disposition table (exact / transformed / warned / rejected) with unknown, malformed, and duplicate values rejecting rather than disappearing. Falsifiable exit: `cargo test -p flapjack-http -- handlers::migration::translation` plus a live fixture run asserting hand-calculated known answers. | Planned owner: `engine/flapjack-http/src/handlers/migration/translation.rs` (new) |
+| MIG-3 | Restore the import leg (spool → translate → staged publish → target index) | Absent. Composes `MIG-2` with the shipped `activate_publication` primitive. v1 scope is create-new-target only (409 when the target exists), which needs no concurrent-write fence because a fresh target has no acknowledged writes to lose. Falsifiable exit: `MIG-1`'s count-implies-reality contract test green under `EXPECT_IMPORT_IMPLEMENTED=true` (a 2xx reporting `objects.imported:N` means `GET /1/indexes` lists the target with `entries == N`; the per-index `entries` count is the count surface because `GET /1/indexes/:indexName` is Algolia's search-via-GET and returns hits, not a count), plus `migration_import_contract.sh --expect-mode importing` green against a real Algolia account. | Reuses `engine/src/index/manager/publication.rs::activate_publication`; spool owner `handlers/migration/spool.rs` |
+| MIG-4 | Publication repair CLI: live proof the contract can fail | `flapjack repair-publication` and its scenario generator are built and green, but the live driver never starts a server and no mutation matrix proves the checks can fail — so the current driver asserts filesystem shape only. Falsifiable exit: live driver starts the release server, probes `/health` + `/1/indexes` + query, proves `.publication`/staging/backup/journal never surface as user indexes, and a closed mutation matrix turns each check red. | Owner: `engine/tests/publication_repair_cli_live.sh`; CLI owner `engine/flapjack-server/src/main.rs` (`RepairPublication`) |
+| MIG-5 | Migration `overwrite=true` into an existing target | Deferred by design from `MIG-3`. Requires a mutation fence (durable incarnation epoch + exclusive promotion + drain) so no acknowledged write is lost behind the replacement generation. Until it lands, `MIG-3` returns 409 for an existing target, matching the documented OpenAPI contract. | Prospective owners: `engine/src/index/manager/publication.rs`, `engine/src/index/manager/lifecycle.rs` |
+| MIG-6 | Async migration job contract (status / cancel / resume) | Deferred. The durable substrate exists — `SpoolStore` already carries `job_uuid`, checkpoints, and a written-but-unrouted `resume_algolia_source` (`export.rs:72`) — but no HTTP surface exposes status, cancel, or resume, and `task_id` is the hardcoded stub `EXPORT_ACK_TASK_ID = 0`. v1 keeps the synchronous call that shipped in v1.0.10. | Substrate: `engine/flapjack-http/src/handlers/migration/{spool,spool_lifecycle,export}.rs` |
+| MIG-7 | HA-converging import | Refused by design, not planned for v1. Import-plus-atomic-publish on an HA cluster needs a new convergence protocol: the oplog has no epoch field (`engine/src/index/oplog.rs:14-20`), `move_index` renames the tenant dir including its oplog (resetting the sequence space), and snapshot install is pull-only. `MIG-1` ships the typed refusal instead. Reopen only with a costed convergence design. | `engine/src/index/manager/publication.rs:11-12` (`NODE_LOCAL_GUARANTEE`); refusal owner `MIG-1` |
 | RF-4 | Runbooks iteration | Open-ended operational follow-through. Continue refining runbooks from incident learnings. | [`engine/docs2/3_IMPLEMENTATION/OPERATIONS.md`](engine/docs2/3_IMPLEMENTATION/OPERATIONS.md) |
 | PL-10 | Write-path saturation under sustained load | Open for v1.1 architecture work. The v1.0.4 batch-size knob and v1.0.5 `uplift_ratio >= 1.50` acceptance gate are shipped and verified, but cross-node fanout remains constrained by the single-writer Tantivy mutex. | Stage 6 classification: `engine/docs/research/pl10_stage6_dual_scenario_classification.md`; canonical benchmark owner: [`engine/loadtest/BENCHMARKS.md`](engine/loadtest/BENCHMARKS.md); proof directories: `engine/loadtest/results/20260528T062547Z-pl10-stage6-dual-scenario/`, `engine/loadtest/results/20260601T202043Z-pl10-saturation-acceptance/`, `engine/loadtest/results/20260601T203717Z-pl10-saturation-acceptance/`, `engine/loadtest/results/20260601T204623Z-pl10-saturation-acceptance/` |
 | HA-FLAKE | HA snapshot test flake remediation | Fix verified and leaky-pass sites closed; keep future HA regression signal protected. Not v1.0.x blocking. | Fix owner paths: `engine/flapjack-http/src/startup_catchup.rs`, `engine/flapjack-replication/src/manager.rs`, `engine/src/analytics/writer.rs`; regression contract: `engine/tests/test_snapshot_import_failure_contract.rs`; proof: `docs/reference/research/may31_eve_ha_snapshot_flake_verify_proof.md` |
@@ -28,7 +46,9 @@ priority rank.
 | ID | Work Item | Planned Direction | Evidence / Owner |
 |----|-----------|-------------------|------------------|
 | ADR-0005 OQ4 | Cross-node failover idempotency dedup | v1.1 design work. Node-local restart-durable idempotency is shipped at `${FLAPJACK_DATA_DIR}/_idempotency/cache.db`; cross-node dedup needs a durable coordination layer before a peer restart during the same idempotency-key window can be single-execution across nodes. | `engine/docs2/3_IMPLEMENTATION/decisions/active/0005_nginx_restart_window_write_recovery.md` |
+| PL-11 | Public mirror Laravel Scout CI cleanup | Remove the always-green `integration-laravel-scout` job from the public mirror CI once the Debbie flow reaches the mirror, so CI no longer advertises an unsourced integration stub. | Target: `.github/workflows/ci.yml`; owner: mirror/debbie flow |
 | PL-2 | `cargo-nextest` migration re-evaluation | Re-evaluate around 2026-11-26 against accumulated hang-frequency data. If PL-1 plus test-hang discipline have not covered 95% of hangs, plan `.config/nextest.toml` per-test timeouts, a `.cargo/config.toml` alias, and CI workflow migration. | Existing CI-side cap owner: `engine/tests/ci_test_timeout_cap_acceptance.sh` |
+| DOCS-CLAIMS | Stale docs-site pricing/organization/image claim audit | Audit and correct the public docs-site pricing, organization, and image claims, which live on the separate private `flapjackhq/flapjack-cloud` `docs-site/` surface (not this repo's Debbie sync surface). Entry gate before any edit or deploy: provenance recovery of the editable owner path, plus an automated claim inventory (rendered source → asserted value) that tests correctness, not page existence. No in-repo renderer, second roadmap, or docs-site mirror boundary here. | Research: `docs/reference/research/20260716_stage4_docs_site_claim_followup.md`; owner: private `flapjackhq/flapjack-cloud` `docs-site/` |
 
 Detailed working checklists and proof-pack session notes may exist in the private
 dev repo, but public routing docs should resolve entirely within the synced

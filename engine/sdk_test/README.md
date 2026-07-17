@@ -11,7 +11,7 @@ End-to-end tests that validate Flapjack's Algolia API compatibility against real
 Proves a real customer can migrate from Algolia to Flapjack. Tests both migration paths:
 
 - **Manual migration** (Phase 3/4): Export settings/synonyms/objects from Algolia, import into Flapjack via individual API calls, compare search results.
-- **One-click migration** (Phase 3b/4b): Single `POST /1/migrate-from-algolia` call that does everything automatically, then compares search results.
+- **One-click migration** (Phase 3b/4b): exercises the `POST /1/migrate-from-algolia` endpoint. This path is **not available on `main`** — the import leg is unimplemented, so the endpoint returns `503 migration_import_unavailable` and writes no data; Phase 3b/4b are expected to fail. See the canonical status in [`FEATURES.md`](../docs2/FEATURES.md#algolia-migration-1migrate-from-algolia--not-connected-on-main).
 
 ```bash
 node test_algolia_migration.js           # run full migration test
@@ -44,7 +44,6 @@ Validates Flapjack API endpoint contracts (request/response shapes, status codes
 | `race_test.js` | Concurrent write/read race condition testing |
 | `debug_search.js` | Manual search debugging utility |
 | `audit_algolia_defaults.js` | Audits Algolia default settings |
-| `MIGRATION_TEST_GUIDE.md` | Detailed guide for the migration test |
 | `TEST_COVERAGE.md` | Validation test coverage matrix |
 
 ## One-Click Migration Endpoint
@@ -59,4 +58,4 @@ POST /1/migrate-from-algolia
 }
 ```
 
-Migrates an entire Algolia index (settings, synonyms, rules, all objects) into Flapjack in a single call. See `MIGRATION_TEST_GUIDE.md` for details.
+**Not available on `main`.** This endpoint is not connected end-to-end: the import leg is unimplemented, so it returns `503 migration_import_unavailable` and writes no data. It is intended to migrate an Algolia index (settings, synonyms, rules, objects) into Flapjack once the import leg lands. See the canonical status in [`FEATURES.md`](../docs2/FEATURES.md#algolia-migration-1migrate-from-algolia--not-connected-on-main).

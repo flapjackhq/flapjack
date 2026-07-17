@@ -83,11 +83,16 @@ export function getMigrationErrorMessage(error: unknown): string {
     return 'Unknown error';
   }
 
-  if (axios.isAxiosError<{ message?: string }>(error)) {
+  if (axios.isAxiosError<{ message?: string; code?: string }>(error)) {
     const status = error.response?.status;
     const message = error.response?.data?.message;
+    const code = error.response?.data?.code;
+    const normalizedCode = code?.trim();
 
-    if (message) {
+    if (typeof message === 'string' && message.trim().length > 0) {
+      if (normalizedCode) {
+        return `${message} Code: ${normalizedCode}`;
+      }
       return message;
     }
     if (status === 409) {

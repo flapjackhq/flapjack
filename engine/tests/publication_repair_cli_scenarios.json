@@ -1,0 +1,4451 @@
+{
+  "schema_version": 1,
+  "layout_count": 71,
+  "live_http_fixture": {
+    "target_index": "products",
+    "control_index": "control_products",
+    "target_object": {
+      "object_id": "new-widget",
+      "body": {
+        "objectID": "new-widget",
+        "title": "modern waffle iron",
+        "body": "new repair guide",
+        "generation": "new"
+      }
+    },
+    "control_object": {
+      "object_id": "control-widget",
+      "body": {
+        "objectID": "control-widget",
+        "title": "control waffle iron",
+        "body": "unchanged control guide",
+        "generation": "control"
+      }
+    },
+    "target_query": {
+      "text": "modern",
+      "ordered_hit_ids": [
+        "new-widget"
+      ]
+    },
+    "control_query": {
+      "text": "control",
+      "ordered_hit_ids": [
+        "control-widget"
+      ]
+    },
+    "expectations": {
+      "target_present": {
+        "target": "present",
+        "object": "present",
+        "search": "present"
+      },
+      "target_absent": {
+        "target": "absent",
+        "object": "absent",
+        "search": "absent"
+      },
+      "target_unavailable": {
+        "target": "absent",
+        "object": "unavailable",
+        "search": "unavailable"
+      },
+      "control_present": {
+        "target": "present",
+        "object": "present",
+        "search": "present"
+      }
+    }
+  },
+  "scenarios": [
+    {
+      "id": "base_001_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "boundary": {
+        "identity": "create|rename:.publication/products/txn_001/journal.json.tmp->.publication/products/txn_001/journal.json|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "absent",
+        "search": "unavailable",
+        "target": "absent"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_002_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "boundary": {
+        "identity": "create|rename:.publication/products/txn_001/journal.json.tmp->.publication/products/txn_001/journal.json|2"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "present",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_003_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "boundary": {
+        "identity": "create|rename:.publication/products/txn_001/staging->products|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "absent",
+        "search": "unavailable",
+        "target": "absent"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_004_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "create|sync_dir:.publication/products/txn_001/staging/oplog|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "absent",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "absent",
+        "search": "unavailable",
+        "target": "absent"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_005_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "create|sync_dir:.publication/products/txn_001/staging|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "absent",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "absent",
+        "search": "unavailable",
+        "target": "absent"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_006_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "boundary": {
+        "identity": "create|sync_dir:.publication/products/txn_001|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "absent",
+        "search": "unavailable",
+        "target": "absent"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_007_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "boundary": {
+        "identity": "create|sync_dir:.publication/products/txn_001|2"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "absent",
+        "search": "unavailable",
+        "target": "absent"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_008_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "boundary": {
+        "identity": "create|sync_dir:.publication/products/txn_001|3"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "present",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_009_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "committed",
+      "boundary": {
+        "identity": "create|sync_dir:.publication/products/txn_001|4"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "none",
+        "exit_code": 0,
+        "status": "clean"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_010_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "committed",
+      "boundary": {
+        "identity": "create|sync_dir:.publication/products/txn_001|5"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "none",
+        "exit_code": 0,
+        "status": "clean"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_011_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "boundary": {
+        "identity": "create|sync_dir:|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "present",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_012_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "create|sync_file:.publication/products/txn_001/journal.json.tmp|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "absent",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "absent",
+        "search": "unavailable",
+        "target": "absent"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_013_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "boundary": {
+        "identity": "create|sync_file:.publication/products/txn_001/journal.json.tmp|2"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "present",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_014_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "create|sync_file:.publication/products/txn_001/staging/committed_seq|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "absent",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "absent",
+        "search": "unavailable",
+        "target": "absent"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_015_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "create|sync_file:.publication/products/txn_001/staging/index_meta.json|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "absent",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "absent",
+        "search": "unavailable",
+        "target": "absent"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_016_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "create|sync_file:.publication/products/txn_001/staging/oplog/segment_0001.jsonl|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "absent",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "absent",
+        "search": "unavailable",
+        "target": "absent"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_017_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "create|sync_file:.publication/products/txn_001/staging/settings.json|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "absent",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "absent",
+        "search": "unavailable",
+        "target": "absent"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_018_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "boundary": {
+        "identity": "replacement|rename:.publication/products/txn_001/journal.json.tmp->.publication/products/txn_001/journal.json|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "old-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_019_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|rename:.publication/products/txn_001/journal.json.tmp->.publication/products/txn_001/journal.json|2"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_020_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|rename:.publication/products/txn_001/staging->products|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_021_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|rename:.query_suggestions/publication_txn_001.json->.query_suggestions/products.json|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_022_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|rename:.query_suggestions/publication_txn_001.log.jsonl->.query_suggestions/products.log.jsonl|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_023_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|rename:.query_suggestions/publication_txn_001.status.json->.query_suggestions/products.status.json|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_024_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|rename:analytics/publication_txn_001->analytics/products|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_025_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|rename:products->.publication/products/txn_001/backup|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_026_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "boundary": {
+        "identity": "replacement|sync_dir:.publication/products/txn_001/sidecars/analytics/products|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "old-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_027_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.publication/products/txn_001/sidecars/analytics/products|2"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_028_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.publication/products/txn_001/sidecars/analytics/products|3"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_029_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.publication/products/txn_001/sidecars/analytics|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_030_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.publication/products/txn_001/sidecars/query_suggestions|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_031_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.publication/products/txn_001/sidecars/query_suggestions|2"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_032_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.publication/products/txn_001/sidecars/query_suggestions|3"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_033_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "replacement|sync_dir:.publication/products/txn_001/staging/oplog|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "old-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_034_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "replacement|sync_dir:.publication/products/txn_001/staging|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "old-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_035_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.publication/products/txn_001|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_036_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.publication/products/txn_001|2"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_037_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.publication/products/txn_001|3"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_038_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.publication/products/txn_001|4"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_039_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.publication/products/txn_001|5"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "cleanup",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_040_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.publication/products/txn_001|6"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "cleanup",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_041_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.publication/products/txn_001|7"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "cleanup",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_042_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.publication/products/txn_001|8"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "none",
+        "exit_code": 0,
+        "status": "clean"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_043_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.query_suggestions|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_044_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.query_suggestions|2"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_045_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.query_suggestions|3"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_046_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.query_suggestions|4"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_047_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.query_suggestions|5"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_048_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.query_suggestions|6"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_049_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:analytics|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_050_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:analytics|2"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_051_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_052_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:|2"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_053_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "replacement|sync_file:.publication/products/txn_001/journal.json.tmp|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "old-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_054_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_file:.publication/products/txn_001/journal.json.tmp|2"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_055_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_file:.publication/products/txn_001/sidecars/analytics/products/events.jsonl|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_056_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_file:.publication/products/txn_001/sidecars/query_suggestions/products.json|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_057_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_file:.publication/products/txn_001/sidecars/query_suggestions/products.log.jsonl|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_058_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "prepared",
+      "clean_report_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_file:.publication/products/txn_001/sidecars/query_suggestions/products.status.json|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "complete",
+        "exit_code": 0,
+        "status": "repaired"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_059_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "replacement|sync_file:.publication/products/txn_001/staging/committed_seq|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "old-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_060_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "replacement|sync_file:.publication/products/txn_001/staging/index_meta.json|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "old-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_061_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "replacement|sync_file:.publication/products/txn_001/staging/oplog/segment_0001.jsonl|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "old-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_062_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "replacement|sync_file:.publication/products/txn_001/staging/settings.json|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "old-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_063_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "create|sync_file:.publication/products/txn_001/staging/.managed.json|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "absent",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "absent",
+        "search": "unavailable",
+        "target": "absent"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_064_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "create|sync_file:.publication/products/txn_001/staging/.tantivy-meta.lock|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "absent",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "absent",
+        "search": "unavailable",
+        "target": "absent"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_065_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "create|sync_file:.publication/products/txn_001/staging/meta.json|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "absent",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "absent",
+        "search": "unavailable",
+        "target": "absent"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_066_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "replacement|sync_file:.publication/products/txn_001/staging/.managed.json|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "old-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_067_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "replacement|sync_file:.publication/products/txn_001/staging/.tantivy-meta.lock|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "old-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "base_068_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "absent",
+      "boundary": {
+        "identity": "replacement|sync_file:.publication/products/txn_001/staging/meta.json|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "old-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "absent",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "mutation_corrupt_journal",
+      "kind": "mutation",
+      "base": "base_001_create",
+      "mutation": "corrupt_journal",
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "absent",
+        "search": "unavailable",
+        "target": "absent"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "present",
+        "staging": "present"
+      }
+    },
+    {
+      "id": "mutation_missing_staging",
+      "kind": "mutation",
+      "base": "base_020_replacement",
+      "mutation": "missing_staging",
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "rollback",
+      "cli": {
+        "status": "repaired",
+        "action": "rollback",
+        "exit_code": 0
+      },
+      "visible": {
+        "target": "products",
+        "object": "old-meta",
+        "search": "loadable"
+      },
+      "residue": {
+        "staging": "absent",
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent"
+      },
+      "journal_phase": "prepared",
+      "clean_report_phase": "rolled_back"
+    },
+    {
+      "id": "mutation_ambiguous_target_and_staging",
+      "kind": "mutation",
+      "base": "base_020_replacement",
+      "mutation": "ambiguous_target_and_staging",
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "staging": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "quarantine",
+      "cli": {
+        "action": "quarantine",
+        "exit_code": 2,
+        "status": "quarantined"
+      },
+      "visible": {
+        "object": "old-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "present",
+        "journal": "present",
+        "quarantine": "present",
+        "staging": "present"
+      },
+      "journal_phase": "prepared"
+    }
+  ]
+}

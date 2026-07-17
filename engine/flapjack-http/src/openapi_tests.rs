@@ -165,6 +165,27 @@ fn assert_path_method(doc: &serde_json::Value, path_key: &str, method: &str) {
     );
 }
 
+fn assert_component_schema_exists(doc: &serde_json::Value, schema_name: &str) {
+    assert!(
+        doc.pointer(&format!("/components/schemas/{schema_name}"))
+            .is_some(),
+        "expected OpenAPI component schema {schema_name}"
+    );
+}
+
+fn assert_operation_uses_api_key(doc: &serde_json::Value, path: &str) {
+    let escaped_path = path.replace('/', "~1");
+    let security = doc
+        .pointer(&format!("/paths/{escaped_path}/post/security"))
+        .and_then(|value| value.as_array())
+        .unwrap_or_else(|| panic!("{path} POST should document operation security"));
+
+    assert!(
+        security.iter().any(|entry| entry.get("api_key").is_some()),
+        "{path} POST should require api_key security"
+    );
+}
+
 /// Stage 7: Verify recommendation endpoint appears in the generated spec.
 #[test]
 fn recommendations_endpoint_is_documented() {
@@ -695,6 +716,11 @@ fn dictionaries_dictionary_name_param_uses_enum_schema() {
 #[test]
 fn stage7_typed_request_bodies_use_component_schemas() {
     let doc = openapi_json();
+    assert_operation_uses_api_key(&doc, "/1/migrate-from-algolia");
+    assert_operation_uses_api_key(&doc, "/1/algolia-list-indexes");
+    for schema_name in ["MigrateFromAlgoliaRequest", "ListAlgoliaIndexesRequest"] {
+        assert_component_schema_exists(&doc, schema_name);
+    }
 
     assert_eq!(
         doc.pointer("/paths/~11~1configs/post/requestBody/content/application~1json/schema/$ref")
@@ -747,6 +773,14 @@ fn stage7_typed_request_bodies_use_component_schemas() {
 #[test]
 fn stage7_typed_responses_use_component_schemas() {
     let doc = openapi_json();
+    for schema_name in [
+        "MigrateFromAlgoliaResponse",
+        "MigrateCount",
+        "AlgoliaIndexInfo",
+        "ListAlgoliaIndexesResponse",
+    ] {
+        assert_component_schema_exists(&doc, schema_name);
+    }
 
     assert_eq!(
         doc.pointer("/paths/~11~1configs/get/responses/200/content/application~1json/schema/type")
@@ -802,11 +836,8 @@ fn stage7_typed_responses_use_component_schemas() {
                 .and_then(|v| v.as_str()),
             Some("#/components/schemas/MutationResponse")
         );
-    assert_eq!(
-            doc.pointer("/paths/~11~1migrate-from-algolia/post/responses/200/content/application~1json/schema/$ref")
-                .and_then(|v| v.as_str()),
-            Some("#/components/schemas/MigrateFromAlgoliaResponse")
-        );
+    // Migration import temporarily has no success response; the reachable
+    // response set is owned by openapi_tests_endpoints.rs.
     assert_eq!(
             doc.pointer("/paths/~11~1algolia-list-indexes/post/responses/200/content/application~1json/schema/$ref")
                 .and_then(|v| v.as_str()),

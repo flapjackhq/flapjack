@@ -6,6 +6,21 @@ use publication::{
 #[cfg(test)]
 use publication::{activate_publication_for_test, PublicationFaultPoint};
 
+#[derive(Clone, Copy)]
+enum PublicationArtifactMode {
+    MoveWithSource,
+    PreserveDestination,
+}
+
+impl PublicationArtifactMode {
+    fn operation_name(self) -> &'static str {
+        match self {
+            Self::MoveWithSource => "move",
+            Self::PreserveDestination => "replace",
+        }
+    }
+}
+
 impl super::IndexManager {
     /// Create or load a tenant index, initializing default settings if the index is new.
     ///
@@ -219,8 +234,32 @@ impl super::IndexManager {
     ///
     /// Ok with a TaskInfo for the operation, or an error if validation fails or the source doesn't exist.
     pub async fn move_index(&self, source: &str, destination: &str) -> Result<TaskInfo> {
-        self.move_index_with_publication(source, destination, None)
-            .await
+        self.move_index_with_publication(
+            source,
+            destination,
+            PublicationArtifactMode::MoveWithSource,
+            None,
+        )
+        .await
+    }
+
+    /// Replace a live index's tenant contents while retaining its target-keyed sidecars.
+    ///
+    /// The source must be a staging tenant for the same logical index. Unlike
+    /// [`Self::move_index`], this operation leaves destination query-suggestions
+    /// and analytics control data under the destination key.
+    pub(crate) async fn replace_index_contents(
+        &self,
+        source: &str,
+        destination: &str,
+    ) -> Result<TaskInfo> {
+        self.move_index_with_publication(
+            source,
+            destination,
+            PublicationArtifactMode::PreserveDestination,
+            None,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -230,14 +269,20 @@ impl super::IndexManager {
         destination: &str,
         fault: PublicationFaultPoint,
     ) -> Result<TaskInfo> {
-        self.move_index_with_publication(source, destination, Some(fault))
-            .await
+        self.move_index_with_publication(
+            source,
+            destination,
+            PublicationArtifactMode::MoveWithSource,
+            Some(fault),
+        )
+        .await
     }
 
     async fn move_index_with_publication(
         &self,
         source: &str,
         destination: &str,
+        artifact_mode: PublicationArtifactMode,
         #[cfg(test)] fault: Option<PublicationFaultPoint>,
         #[cfg(not(test))] _fault: Option<()>,
     ) -> Result<TaskInfo> {
@@ -252,8 +297,12 @@ impl super::IndexManager {
         self.unload(&destination.to_string())?;
 
         let target = PublicationTarget::new(destination)?;
-        let transaction =
-            PublicationTransactionId::new(format!("move_{}", uuid::Uuid::new_v4().simple()))?;
+        let operation_name = artifact_mode.operation_name();
+        let transaction = PublicationTransactionId::new(format!(
+            "{}_{}",
+            operation_name,
+            uuid::Uuid::new_v4().simple()
+        ))?;
         let paths = PublicationPaths::new(&self.base_path, &target, &transaction);
         std::fs::create_dir_all(paths.staging.parent().ok_or_else(|| {
             FlapjackError::InvalidQuery("publication staging path has no parent".into())
@@ -267,21 +316,30 @@ impl super::IndexManager {
             paths.staging.as_path(),
             paths.target.as_path(),
         ])?;
-        let artifacts = PublicationArtifactPlan::for_move(
-            &self.base_path,
-            &self.publication_analytics_config(),
-            source,
-            &target,
-            &transaction,
-        )?;
-        artifacts.stage()?;
+        let artifacts = match artifact_mode {
+            PublicationArtifactMode::MoveWithSource => Some(PublicationArtifactPlan::for_move(
+                &self.base_path,
+                &self.publication_analytics_config(),
+                source,
+                &target,
+                &transaction,
+            )?),
+            PublicationArtifactMode::PreserveDestination => None,
+        };
+        if let Some(artifacts) = &artifacts {
+            artifacts.stage()?;
+        }
         let generation = PublicationGenerationEvidence::new(format!(
-            "move_{}_to_{}_{}",
+            "{}_{}_to_{}_{}",
+            operation_name,
             source,
             destination,
             uuid::Uuid::new_v4().simple()
         ))?;
-        let manifest = artifacts.manifest();
+        let manifest = artifacts
+            .as_ref()
+            .map(PublicationArtifactPlan::manifest)
+            .unwrap_or_default();
         #[cfg(test)]
         if let Some(fault) = fault {
             let journal = activate_publication_for_test(
@@ -299,7 +357,9 @@ impl super::IndexManager {
                     "injected publication fault before source cleanup".into(),
                 ));
             }
-            artifacts.remove_source()?;
+            if let Some(artifacts) = &artifacts {
+                artifacts.remove_source()?;
+            }
             std::fs::remove_dir_all(&src_path)?;
             return self.make_noop_task(destination);
         }
@@ -312,7 +372,9 @@ impl super::IndexManager {
             &inventory,
         )?;
         ensure_committed_move(&journal)?;
-        artifacts.remove_source()?;
+        if let Some(artifacts) = &artifacts {
+            artifacts.remove_source()?;
+        }
         std::fs::remove_dir_all(&src_path)?;
         self.make_noop_task(destination)
     }

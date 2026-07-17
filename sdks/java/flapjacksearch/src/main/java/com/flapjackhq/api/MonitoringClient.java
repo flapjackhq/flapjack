@@ -41,7 +41,8 @@ public class MonitoringClient extends ApiClient {
 
   private static List<Host> getDefaultHosts() {
     List<Host> hosts = new ArrayList<>();
-    hosts.add(new Host("status.algolia.com", EnumSet.of(CallType.READ, CallType.WRITE)));
+    // Default SDK hosts must stay on Flapjack-owned domains.
+    hosts.add(new Host("status.flapjack.io", EnumSet.of(CallType.READ, CallType.WRITE)));
     return hosts;
   }
 

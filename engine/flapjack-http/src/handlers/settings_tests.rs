@@ -615,6 +615,22 @@ async fn test_merge_settings_payload_partial_update_preserves_omitted_fields() {
     assert_eq!(json["paginationLimitedTo"], serde_json::json!(75));
 }
 
+#[tokio::test]
+async fn test_set_settings_rejects_malformed_distinct() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let app = settings_router(state);
+
+    for payload in [
+        r#"{"distinct": "2"}"#,
+        r#"{"distinct": 4294967296}"#,
+        r#"{"distinct": -1}"#,
+    ] {
+        let resp = post_settings(&app, payload).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
 // ── Mode and SemanticSearch handler tests (5.8) ──
 
 #[tokio::test]

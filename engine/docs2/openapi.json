@@ -2867,7 +2867,7 @@
           "migration"
         ],
         "summary": "One-click migration from Algolia to Flapjack.",
-        "description": "Fetches settings, synonyms, rules, and all objects from the source Algolia\nindex and imports them into the target Flapjack index in a single call.",
+        "description": "Validates the requested source and target shape, then refuses HA clusters\nbefore import admission. Standalone requests are temporarily refused without\nreading Algolia or writing Flapjack data because the destination import leg\nis not implemented.",
         "operationId": "migrate_from_algolia",
         "requestBody": {
           "content": {
@@ -2880,24 +2880,11 @@
           "required": true
         },
         "responses": {
-          "200": {
-            "description": "Migration completed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/MigrateFromAlgoliaResponse"
-                }
-              }
-            }
-          },
           "400": {
             "description": "Invalid migration request"
           },
-          "409": {
-            "description": "Target index already exists"
-          },
-          "502": {
-            "description": "Upstream Algolia request failed"
+          "503": {
+            "description": "migration_ha_unsupported or migration_import_unavailable"
           }
         },
         "security": [
@@ -8136,7 +8123,7 @@
       },
       "MigrateFromAlgoliaRequest": {
         "type": "object",
-        "description": "Request payload for migrating an index from Algolia to Flapjack.\n\nContains Algolia credentials and the source index name. When `target_index` is\nomitted the source index name is reused. Set `overwrite` to replace an existing\ntarget index; otherwise a 409 Conflict is returned.",
+        "description": "Request payload for migrating an index from Algolia to Flapjack.\n\nContains Algolia credentials, the source index name, and optional target\nindex settings. Valid requests on HA clusters are refused before import\nadmission; standalone requests are temporarily refused without writing data\nuntil the destination import leg is implemented.",
         "required": [
           "appId",
           "apiKey",
@@ -8151,7 +8138,7 @@
           },
           "overwrite": {
             "type": "boolean",
-            "description": "If true, delete any existing target index before migrating.\nWithout this, migrating to an existing index returns 409."
+            "description": "Reserved for the future import leg. Valid requests are currently refused\nwithout deleting or overwriting any target index."
           },
           "sourceIndex": {
             "type": "string"
@@ -9795,6 +9782,15 @@
                   "null"
                 ]
               },
+              "alternativesAsExact": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                }
+              },
               "attributeCriteriaComputedByMinProximity": {
                 "type": [
                   "boolean",
@@ -9816,7 +9812,25 @@
                   "type": "string"
                 }
               },
+              "attributesToHighlight": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                }
+              },
               "attributesToRetrieve": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                }
+              },
+              "attributesToSnippet": {
                 "type": [
                   "array",
                   "null"
@@ -9890,6 +9904,32 @@
                   "null"
                 ]
               },
+              "exactOnSingleWordQuery": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "highlightPostTag": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "highlightPreTag": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "hitsPerPage": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int32",
+                "minimum": 0
+              },
               "ignorePlurals": {
                 "oneOf": [
                   {
@@ -9900,7 +9940,31 @@
                   }
                 ]
               },
+              "maxValuesPerFacet": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int32",
+                "minimum": 0
+              },
               "minProximity": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int32",
+                "minimum": 0
+              },
+              "minWordSizefor1Typo": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int32",
+                "minimum": 0
+              },
+              "minWordSizefor2Typos": {
                 "type": [
                   "integer",
                   "null"
@@ -9919,6 +9983,15 @@
                 ]
               },
               "numericAttributesForFiltering": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                }
+              },
+              "optionalWords": {
                 "type": [
                   "array",
                   "null"
@@ -9977,6 +10050,12 @@
                   }
                 ]
               },
+              "removeWordsIfNoResults": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "renderingContent": {},
               "replaceSynonymsInHighlight": {
                 "type": [
@@ -10016,6 +10095,12 @@
                   {
                     "$ref": "#/components/schemas/SemanticSearchSettings"
                   }
+                ]
+              },
+              "separatorsToIndex": {
+                "type": [
+                  "string",
+                  "null"
                 ]
               },
               "snippetEllipsisText": {

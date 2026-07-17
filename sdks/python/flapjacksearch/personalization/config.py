@@ -61,10 +61,11 @@ class PersonalizationConfig(BaseConfig):
                 f"`region` is required and must be one of the following: {', '.join(_regions)}"
             )
 
+        # Default SDK hosts must stay on Flapjack-owned domains.
         self.hosts = HostsCollection(
             [
                 Host(
-                    "personalization.{region}.algolia.com".replace(
+                    "personalization.{region}.flapjack.io".replace(
                         "{region}", self.region or ""
                     )
                 )

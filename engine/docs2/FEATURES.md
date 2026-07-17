@@ -2,7 +2,7 @@
 
 Single maintained status ledger for Flapjack. Shipped feature status, current production-readiness state, and post-launch work are owned in this document.
 
-**Last updated: 2026-07-06 (v1.0.10 current-release truth-up; keep lane-state routing in `ROADMAP.md`, with detailed measured evidence retained in private stage artifacts.)**
+**Last updated: 2026-07-16 (Algolia-migration status truth-up: the export and dashboard halves are shipped but NOT joined — see "Algolia migration" below. Keep lane-state routing in `ROADMAP.md`.)**
 
 - 2026-05-31 stage note: `FLAPJACK_WRITE_QUEUE_BATCH_SIZE` is now runtime-configurable with default-preserving behavior (`32` fallback). See [`3_IMPLEMENTATION/OPS_CONFIGURATION.md`](3_IMPLEMENTATION/OPS_CONFIGURATION.md) for full operator semantics.
 
@@ -266,10 +266,33 @@ Env-var details for operational behavior are canonical in
 | InstantSearch iOS | ✅ | Via Swift client + Swift smoke |
 | Autocomplete.js | ✅ | |
 
+## Algolia migration (`/1/migrate-from-algolia`) — NOT CONNECTED on `main`
+
+**Status as of 2026-07-16: the backend halves exist and the dashboard page exists, but they are not joined. The endpoint reports success without importing.** This section is the canonical status owner for the migration capability. Remediation is tracked in [`ROADMAP.md`](../../ROADMAP.md) rows `MIG-1` (honesty + HA refusal), `MIG-2` (translation), and `MIG-3` (import leg); `MIG-5`, `MIG-6`, and `MIG-7` record scope deferred by design. (`MIG-4` in that table is a separate publication-repair item, not part of this capability.)
+
+| Leg | Status | Owner |
+|---|---|---|
+| Source export: Algolia → durable on-disk spool (checkpointed, resumable) | ✅ Shipped | `engine/flapjack-http/src/handlers/migration/{algolia_client,source_reader,export,spool}.rs` |
+| Translation: spool → Flapjack documents/settings/synonyms/rules | ❌ Absent | Planned owner `handlers/migration/translation.rs` (`MIG-2`) |
+| Import: translated content → target index via staged publication | ❌ Absent | Planned; reuses `engine/src/index/manager/publication.rs::activate_publication` (`MIG-3`) |
+| Staged publication primitive (crash-safe, node-local) | ✅ Shipped | `engine/src/index/manager/publication.rs` |
+| Dashboard `Migrate` page | ✅ Shipped (March) | `engine/dashboard/src/pages/Migrate.tsx` |
+| **Backend ↔ frontend joined end-to-end** | ❌ **No — and failure is silent** | `MIG-1` |
+
+**The defect.** On 2026-07-15, commit `728cde433` ("Replace destination import with spool-backed source export") deleted `prepare_target_index` and the `import_algolia_*` destination writers as a deliberate, checklist-scoped decomposition step; a later lane was to recompose the import. That lane has not run. Meanwhile `migrate_from_algolia` (`engine/flapjack-http/src/handlers/migration/mod.rs:156`) still returns `status: "complete"` with `objects.imported: N`, while `target_index` is validated and then discarded and no index write occurs. The lane's own regression test asserts the absence of any destination index (`export_tests.rs:181` — `assert!(!base_path.join(SOURCE).exists())`), so the endpoint provably does not import. The rustdoc on the handler and the OpenAPI `200 Migration completed` / `409 Target index already exists` responses still describe the deleted import behavior.
+
+**User-visible consequence:** a user migrating from Algolia via the dashboard sees "complete" and a document count, and receives an empty index. The exported data sits in an internal spool with no user-reachable path.
+
+**Blast radius:** `main` only. The last public release is v1.0.10 (2026-06-09), which predates the regression, so no released binary is affected. `MIG-1` restores fail-closed honesty before any release cut; the ban on releasing from `main` until `MIG-1` lands is recorded in [`ROADMAP.md`](../../ROADMAP.md).
+
+**HA:** migration has no HA guard and the oplog carries no epoch field (`engine/src/index/oplog.rs:14-20`). Staged publication is explicitly node-local (`publication.rs:9-10` `NODE_LOCAL_GUARANTEE`). An import on an HA cluster cannot converge peers; `MIG-1` adds a typed fail-closed refusal so the hazard cannot return with the import.
+
 ## Dashboard UI
 
 22 user-facing routes are shipped, backed by 21 lazy-loaded page components, plus the `*` not-found catch-all. No stub pages remain.
 The route inventory spans overview, search/browse, settings, analytics, relevancy controls, security tooling, and migration workflows with no placeholder pages.
+
+**Caveat — route shipped ≠ capability working.** The `Migrate` route below is a shipped, non-stub page whose backend contract is currently broken; see the Algolia-migration section above. "Built" in this table means the route and its components are real and wired to an endpoint, not that the end-to-end capability is proven.
 
 | Status | Features |
 |---|---|

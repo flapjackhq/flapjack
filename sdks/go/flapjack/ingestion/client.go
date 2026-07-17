@@ -90,8 +90,9 @@ func NewClientWithConfig(cfg IngestionConfiguration) (*APIClient, error) {
 }
 
 func getDefaultHosts(r Region) []transport.StatefulHost {
+	// Default SDK hosts must stay on Flapjack-owned domains.
 	return []transport.StatefulHost{
-		transport.NewStatefulHost("https", strings.ReplaceAll("data.{region}.algolia.com", "{region}", string(r)), call.IsReadWrite),
+		transport.NewStatefulHost("https", strings.ReplaceAll("data.{region}.flapjack.io", "{region}", string(r)), call.IsReadWrite),
 	}
 }
 

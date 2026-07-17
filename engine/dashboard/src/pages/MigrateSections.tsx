@@ -362,7 +362,7 @@ export function MigrationSuccessCard({ migrationData, effectiveTarget }: Migrati
 
 export function MigrationErrorCard({ errorMessage }: { errorMessage: string }) {
   return (
-    <Card className="border-destructive/50">
+    <Card className="border-destructive/50" data-testid="migration-error-card">
       <CardContent className="pt-6">
         <div className="flex items-start gap-3">
           <XCircle className="h-6 w-6 text-destructive shrink-0 mt-0.5" />

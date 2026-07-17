@@ -64,12 +64,13 @@ class InsightsConfig(BaseConfig):
                 f"`region` must be one of the following: {', '.join(_regions)}"
             )
 
+        # Default SDK hosts must stay on Flapjack-owned domains.
         self.hosts = HostsCollection(
             [
                 Host(
-                    "insights.algolia.io"
+                    "insights.flapjack.io"
                     if self.region is None
-                    else "insights.{region}.algolia.io".replace(
+                    else "insights.{region}.flapjack.io".replace(
                         "{region}", self.region or ""
                     )
                 )

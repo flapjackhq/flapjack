@@ -212,17 +212,60 @@ fn repair_publication_reports_repaired_and_unresolved_exit_codes() {
 #[test]
 fn repair_publication_uses_clap_for_missing_and_invalid_flags() {
     flapjack_cmd()
+        .arg("--data-dir")
+        .arg(TempDir::new("fj_repair_missing_tenant").path())
         .arg("repair-publication")
         .arg("--json")
         .assert()
-        .failure();
+        .failure()
+        .code(2);
     flapjack_cmd()
+        .arg("--data-dir")
+        .arg(TempDir::new("fj_repair_missing_tenant_value").path())
+        .arg("repair-publication")
+        .arg("--tenant")
+        .assert()
+        .failure()
+        .code(2);
+    flapjack_cmd()
+        .arg("--data-dir")
+        .arg(TempDir::new("fj_repair_unknown_flag").path())
         .arg("repair-publication")
         .arg("--tenant")
         .arg("products")
         .arg("--unknown")
         .assert()
-        .failure();
+        .failure()
+        .code(2);
+    flapjack_cmd()
+        .arg("repair-publication")
+        .arg("--tenant")
+        .arg("products")
+        .arg("--json")
+        .arg("--data-dir")
+        .arg(TempDir::new("fj_repair_subcommand_before_global").path())
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn repair_publication_rejects_path_traversal_tenant_after_parse() {
+    let tmp = TempDir::new("fj_repair_path_traversal_tenant");
+
+    flapjack_cmd()
+        .arg("--data-dir")
+        .arg(tmp.path())
+        .arg("repair-publication")
+        .arg("--tenant")
+        .arg("../products")
+        .arg("--json")
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(contains(
+            "Index name contains invalid characters (path traversal not allowed)",
+        ));
 }
 
 // Startup assertions depend on the banner/error text being emitted before the

@@ -22,9 +22,61 @@ fn migration_endpoints_are_documented() {
 
     assert_path_exists(&doc, "/1/migrate-from-algolia");
     assert_path_method(&doc, "/1/migrate-from-algolia", "post");
+    assert_migration_operation_uses_api_key(&doc, "/1/migrate-from-algolia");
+    assert_migration_post_documents_admission_refusals(&doc);
 
     assert_path_exists(&doc, "/1/algolia-list-indexes");
     assert_path_method(&doc, "/1/algolia-list-indexes", "post");
+    assert_migration_operation_uses_api_key(&doc, "/1/algolia-list-indexes");
+}
+
+fn assert_migration_operation_uses_api_key(doc: &serde_json::Value, path: &str) {
+    let escaped_path = path.replace('/', "~1");
+    let security = doc
+        .pointer(&format!("/paths/{escaped_path}/post/security"))
+        .and_then(|value| value.as_array())
+        .unwrap_or_else(|| panic!("{path} POST should document operation security"));
+
+    assert!(
+        security.iter().any(|entry| entry.get("api_key").is_some()),
+        "{path} POST should require api_key security in OpenAPI"
+    );
+}
+
+fn assert_migration_post_documents_admission_refusals(doc: &serde_json::Value) {
+    let responses = doc
+        .pointer("/paths/~11~1migrate-from-algolia/post/responses")
+        .and_then(|value| value.as_object())
+        .expect("migration POST should document responses");
+
+    assert!(
+        responses.contains_key("400"),
+        "migration POST should keep invalid-request 400 response"
+    );
+    assert!(
+        responses.contains_key("503"),
+        "migration POST should document admission refusals"
+    );
+    let description = responses
+        .get("503")
+        .and_then(|response| response.get("description"))
+        .and_then(serde_json::Value::as_str)
+        .expect("migration POST 503 should have a description");
+    assert!(
+        description.contains("migration_ha_unsupported"),
+        "migration POST 503 should document HA refusal code"
+    );
+    assert!(
+        description.contains("migration_import_unavailable"),
+        "migration POST 503 should document import-unavailable refusal code"
+    );
+
+    for stale_status in ["200", "409", "502"] {
+        assert!(
+            !responses.contains_key(stale_status),
+            "migration POST should not document unreachable {stale_status} response while import is unavailable"
+        );
+    }
 }
 
 /// Stage 7: Verify usage endpoints appear in the generated spec.

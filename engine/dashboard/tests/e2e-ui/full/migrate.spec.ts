@@ -159,6 +159,9 @@ test.describe('Migrate Page', () => {
   });
 
   test('submitting with invalid credentials shows error', async ({ page }) => {
+    const importUnavailableMessage =
+      'Migration import leg is not implemented; no data was written, and this endpoint will not report success it did not perform.';
+
     // Fill in fake credentials
     await page.getByLabel('Application ID').fill('fake-app-id');
     await page.getByLabel('Admin API Key').fill('fake-api-key');
@@ -168,7 +171,9 @@ test.describe('Migrate Page', () => {
     await page.getByRole('button', { name: /migrate/i }).click();
 
     // Should show an error card after the request fails
-    await expect(page.getByText(/migration failed/i)).toBeVisible({ timeout: 15_000 });
+    const errorCard = page.getByTestId('migration-error-card');
+    await expect(errorCard).toContainText(importUnavailableMessage, { timeout: 15_000 });
+    await expect(errorCard).toContainText('migration_import_unavailable');
   });
 
   test('migration attempts do not expose Algolia API keys in API Logs', async ({ page }) => {

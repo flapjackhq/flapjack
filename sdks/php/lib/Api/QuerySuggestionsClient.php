@@ -94,8 +94,9 @@ class QuerySuggestionsClient
             // If a list of hosts was passed, we ignore the cache
             $clusterHosts = ClusterHosts::create($hosts);
         } else {
+            // Default SDK hosts must stay on Flapjack-owned domains.
             $url = null !== $config->getRegion() && '' !== $config->getRegion()
-                ? str_replace('{region}', $config->getRegion(), 'query-suggestions.{region}.algolia.com')
+                ? str_replace('{region}', $config->getRegion(), 'query-suggestions.{region}.flapjack.io')
                 : '';
             $clusterHosts = ClusterHosts::create($url);
         }

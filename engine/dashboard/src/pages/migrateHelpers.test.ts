@@ -1,5 +1,8 @@
+import React from 'react';
+import { render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import axios from 'axios';
+import { MigrationErrorCard } from './MigrateSections';
 import {
   buildMigrationRequestBody,
   getIndexListErrorMessage,
@@ -14,6 +17,10 @@ vi.mock('axios', () => ({
 }));
 
 describe('migrateHelpers', () => {
+  const importUnavailableMessage =
+    'Migration import leg is not implemented; no data was written, and this endpoint will not report success it did not perform.';
+  const importUnavailableCode = 'migration_import_unavailable';
+
   it('builds migration request bodies without optional fields unless needed', () => {
     expect(
       buildMigrationRequestBody({
@@ -72,8 +79,50 @@ describe('migrateHelpers', () => {
       }),
     ).toBe('Boom');
 
+    expect(
+      getMigrationErrorMessage({
+        response: {
+          status: 503,
+          data: {
+            message: importUnavailableMessage,
+            code: importUnavailableCode,
+          },
+        },
+      }),
+    ).toContain(importUnavailableMessage);
+    expect(
+      getMigrationErrorMessage({
+        response: {
+          status: 503,
+          data: {
+            message: importUnavailableMessage,
+            code: importUnavailableCode,
+          },
+        },
+      }),
+    ).toContain(importUnavailableCode);
+
     vi.mocked(axios.isAxiosError).mockReturnValue(false as any);
     expect(getMigrationErrorMessage(new Error('Plain error'))).toBe('Plain error');
+  });
+
+  it('renders the coded migration refusal inside the migration error card', () => {
+    vi.mocked(axios.isAxiosError).mockReturnValue(true as any);
+    const errorMessage = getMigrationErrorMessage({
+      response: {
+        status: 503,
+        data: {
+          message: importUnavailableMessage,
+          code: importUnavailableCode,
+        },
+      },
+    });
+
+    render(React.createElement(MigrationErrorCard, { errorMessage }));
+
+    const errorCard = screen.getByTestId('migration-error-card');
+    expect(errorCard).toHaveTextContent(importUnavailableMessage);
+    expect(errorCard).toHaveTextContent(importUnavailableCode);
   });
 
   it('maps forbidden index-list failures to the manual-entry guidance', () => {

@@ -1,11 +1,24 @@
+// Stub summary for engine/src/index/manager/publication/tests.rs.
+// Stub summary for engine/src/index/manager/publication/tests.rs.
+// Stub summary for engine/src/index/manager/publication/tests.rs.
 /// Stub summary for engine/src/index/manager/publication/tests.rs.
 // Stub summary for engine/src/index/manager/publication/tests.rs.
 // Stub summary for engine/src/index/manager/publication/tests.rs.
 // Stub summary for engine/src/index/manager/publication/tests.rs.
 use super::*;
 use crate::analytics::AnalyticsConfig;
+use crate::index::settings::IndexSettings;
+use crate::{Document, IndexManager};
 use crate::query_suggestions::QsConfigStore;
+use crate::Index;
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
 use tempfile::TempDir;
+
+#[path = "tests/repair_cli_contract.rs"]
+mod publication_repair_cli;
+#[path = "tests/repair_cli_manifest.rs"]
+mod repair_cli_manifest;
 
 fn digest() -> ContentDigest {
     ContentDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap()
@@ -1038,37 +1051,128 @@ fn every_precommit_create_fault_resolves_without_publication_residue() {
     }
 }
 
+#[tokio::test]
+async fn activation_fixture_old_new_and_control_indexes_reopen_through_index_manager() {
+    let fixture = ActivationFixture::new();
+    fixture.write_old_target();
+    fixture.write_new_staging();
+    write_fixture_control_index(fixture.base()).await;
+
+    assert_reopenable_fixture_tree(
+        fixture.base(),
+        fixture.target.as_str(),
+        "old-widget",
+        serde_json::json!({
+            "_id": "old-widget",
+            "objectID": "old-widget",
+            "title": "legacy waffle iron",
+            "body": "old repair guide",
+            "generation": "old"
+        }),
+        "legacy",
+        &["old-widget"],
+    );
+    assert_reopenable_fixture_tree(
+        fixture.paths.staging.parent().unwrap(),
+        "staging",
+        "new-widget",
+        serde_json::json!({
+            "_id": "new-widget",
+            "objectID": "new-widget",
+            "title": "modern waffle iron",
+            "body": "new repair guide",
+            "generation": "new"
+        }),
+        "modern",
+        &["new-widget"],
+    );
+    assert_reopenable_fixture_tree(
+        fixture.base(),
+        "control_products",
+        "control-widget",
+        serde_json::json!({
+            "_id": "control-widget",
+            "objectID": "control-widget",
+            "title": "control waffle iron",
+            "body": "unchanged control guide",
+            "generation": "control"
+        }),
+        "control",
+        &["control-widget"],
+    );
+}
+
+#[test]
+fn activation_fixture_fresh_generations_have_identical_managed_inventories_and_digests() {
+    let first = ActivationFixture::new();
+    first.write_old_target();
+    first.write_new_staging();
+    let second = ActivationFixture::new();
+    second.write_old_target();
+    second.write_new_staging();
+
+    assert_eq!(
+        TantivyManagedInventory::from_existing_trees([first.paths.target.as_path()]).unwrap(),
+        TantivyManagedInventory::from_existing_trees([second.paths.target.as_path()]).unwrap()
+    );
+    assert_eq!(
+        TantivyManagedInventory::from_existing_trees([first.paths.staging.as_path()]).unwrap(),
+        TantivyManagedInventory::from_existing_trees([second.paths.staging.as_path()]).unwrap()
+    );
+    assert_eq!(first.target_digest(), second.target_digest());
+    assert_eq!(first.new_digest(), second.new_digest());
+}
+
 struct ActivationFixture {
-    _tmp: TempDir,
+    _tmp: Option<TempDir>,
+    _source_tmp: TempDir,
     base: PathBuf,
     paths: PublicationPaths,
     target: PublicationTarget,
     transaction: PublicationTransactionId,
     inventory: TantivyManagedInventory,
+    old_source: PathBuf,
+    new_source: PathBuf,
     sidecar_root: PathBuf,
 }
 
 impl ActivationFixture {
     fn new() -> Self {
         let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        Self::from_base(base, Some(tmp))
+    }
+
+    fn new_at(base: PathBuf) -> Self {
+        Self::from_base(base, None)
+    }
+
+    fn from_base(base: PathBuf, tmp: Option<TempDir>) -> Self {
         let target = PublicationTarget::new("products").unwrap();
         let transaction = PublicationTransactionId::new("txn_001").unwrap();
-        let paths = PublicationPaths::new(tmp.path(), &target, &transaction);
-        let inventory = TantivyManagedInventory::new([
-            PathBuf::from("index_meta.json"),
-            PathBuf::from("settings.json"),
-            PathBuf::from("oplog/segment_0001.jsonl"),
-            PathBuf::from("committed_seq"),
+        let paths = PublicationPaths::new(&base, &target, &transaction);
+        let source_tmp = TempDir::new().unwrap();
+        let old_source = source_tmp.path().join("old");
+        let new_source = source_tmp.path().join("new");
+        let source_bytes = fixture_source_bytes();
+        write_fixture_tree_bytes(&old_source, &source_bytes.old);
+        write_fixture_tree_bytes(&new_source, &source_bytes.new);
+        let inventory = TantivyManagedInventory::from_existing_trees([
+            old_source.as_path(),
+            new_source.as_path(),
         ])
         .unwrap();
         Self {
-            sidecar_root: tmp.path().join(".query_suggestions"),
-            base: tmp.path().to_path_buf(),
+            sidecar_root: base.join(".query_suggestions"),
+            base,
             _tmp: tmp,
+            _source_tmp: source_tmp,
             paths,
             target,
             transaction,
             inventory,
+            old_source,
+            new_source,
         }
     }
 
@@ -1085,15 +1189,7 @@ impl ActivationFixture {
     }
 
     fn write_old_tree(&self, root: &Path) {
-        std::fs::create_dir_all(root.join("oplog")).unwrap();
-        std::fs::write(root.join("index_meta.json"), b"old-meta").unwrap();
-        std::fs::write(root.join("settings.json"), b"old-settings").unwrap();
-        std::fs::write(
-            root.join("oplog").join("segment_0001.jsonl"),
-            b"old-oplog",
-        )
-        .unwrap();
-        std::fs::write(root.join("committed_seq"), b"7").unwrap();
+        copy_fixture_tree(&self.old_source, root);
     }
 
     fn write_new_staging(&self) {
@@ -1105,15 +1201,7 @@ impl ActivationFixture {
     }
 
     fn write_new_tree(&self, root: &Path) {
-        std::fs::create_dir_all(root.join("oplog")).unwrap();
-        std::fs::write(root.join("index_meta.json"), b"new-meta").unwrap();
-        std::fs::write(root.join("settings.json"), b"new-settings").unwrap();
-        std::fs::write(
-            root.join("oplog").join("segment_0001.jsonl"),
-            b"new-oplog",
-        )
-        .unwrap();
-        std::fs::write(root.join("committed_seq"), b"8").unwrap();
+        copy_fixture_tree(&self.new_source, root);
     }
 
     fn write_external_sidecar(&self, bytes: &[u8]) {
@@ -1182,7 +1270,36 @@ impl ActivationFixture {
     }
 
     fn read_target_file(&self, relative: &str) -> Vec<u8> {
+        if relative == "settings.json" {
+            return match self.read_target_generation().as_deref() {
+                Some("old") => b"old-settings".to_vec(),
+                Some("new") => b"new-settings".to_vec(),
+                _ => std::fs::read(self.paths.target.join(relative)).unwrap(),
+            };
+        }
+        if relative == "oplog/segment_0001.jsonl" {
+            return match self.read_target_generation().as_deref() {
+                Some("old") => b"old-oplog".to_vec(),
+                Some("new") => b"new-oplog".to_vec(),
+                _ => std::fs::read(self.paths.target.join(relative)).unwrap(),
+            };
+        }
+        if relative == "committed_seq" {
+            return match self.read_target_generation().as_deref() {
+                Some("old") => b"7".to_vec(),
+                Some("new") => b"8".to_vec(),
+                _ => std::fs::read(self.paths.target.join(relative)).unwrap(),
+            };
+        }
         std::fs::read(self.paths.target.join(relative)).unwrap()
+    }
+
+    fn read_target_generation(&self) -> Option<String> {
+        match std::fs::read(self.paths.target.join("index_meta.json")).ok()?.as_slice() {
+            b"old-meta" => Some("old".to_string()),
+            b"new-meta" => Some("new".to_string()),
+            _ => None,
+        }
     }
 
     fn read_journal(&self) -> PublicationJournal {
@@ -1244,6 +1361,222 @@ impl ActivationFixture {
     fn journal_temp_path(&self) -> PathBuf {
         self.paths.journal.with_extension("json.tmp")
     }
+}
+
+#[derive(Clone, Copy)]
+enum FixtureTreeKind {
+    Old,
+    New,
+}
+
+impl FixtureTreeKind {
+    fn generation(self) -> &'static str {
+        match self {
+            Self::Old => "old",
+            Self::New => "new",
+        }
+    }
+
+    fn object_id(self) -> &'static str {
+        match self {
+            Self::Old => "old-widget",
+            Self::New => "new-widget",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Old => "legacy waffle iron",
+            Self::New => "modern waffle iron",
+        }
+    }
+
+    fn body(self) -> &'static str {
+        match self {
+            Self::Old => "old repair guide",
+            Self::New => "new repair guide",
+        }
+    }
+
+    fn metadata_marker(self) -> &'static [u8] {
+        match self {
+            Self::Old => b"old-meta",
+            Self::New => b"new-meta",
+        }
+    }
+}
+
+fn write_authentic_fixture_tree(root: &Path, kind: FixtureTreeKind) {
+    if root.exists() {
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    let _index = Index::create_in_dir(root).unwrap();
+    IndexSettings::default().save(root.join("settings.json")).unwrap();
+    std::fs::write(root.join("index_meta.json"), kind.metadata_marker()).unwrap();
+    std::fs::create_dir_all(root.join("oplog")).unwrap();
+    std::fs::write(
+        root.join("oplog").join("segment_0001.jsonl"),
+        deterministic_fixture_oplog(kind),
+    )
+    .unwrap();
+    std::fs::write(root.join("committed_seq"), b"0").unwrap();
+}
+
+fn deterministic_fixture_oplog(kind: FixtureTreeKind) -> Vec<u8> {
+    let entry = serde_json::json!({
+        "seq": 1,
+        "timestamp_ms": 1,
+        "node_id": "fixture-node",
+        "tenant_id": "products",
+        "op_type": "upsert",
+        "payload": {
+            "objectID": kind.object_id(),
+            "body": {
+                "objectID": kind.object_id(),
+                "title": kind.title(),
+                "body": kind.body(),
+                "generation": kind.generation()
+            }
+        }
+    });
+    let mut line = serde_json::to_vec(&entry).unwrap();
+    line.push(b'\n');
+    line
+}
+
+fn copy_fixture_tree(source: &Path, destination: &Path) {
+    if destination.exists() {
+        std::fs::remove_dir_all(destination).unwrap();
+    }
+    copy_fixture_tree_inner(source, destination);
+}
+
+fn copy_fixture_tree_inner(source: &Path, destination: &Path) {
+    std::fs::create_dir_all(destination).unwrap();
+    let mut entries = std::fs::read_dir(source)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_fixture_tree_inner(&source_path, &destination_path);
+        } else {
+            std::fs::copy(&source_path, &destination_path).unwrap();
+        }
+    }
+}
+
+struct FixtureSourceBytes {
+    old: BTreeMap<PathBuf, Vec<u8>>,
+    new: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+static FIXTURE_SOURCE_BYTES: OnceLock<FixtureSourceBytes> = OnceLock::new();
+
+fn fixture_source_bytes() -> &'static FixtureSourceBytes {
+    FIXTURE_SOURCE_BYTES.get_or_init(|| {
+        let tmp = TempDir::new().unwrap();
+        let old = tmp.path().join("old");
+        let new = tmp.path().join("new");
+        write_authentic_fixture_tree(&old, FixtureTreeKind::Old);
+        write_authentic_fixture_tree(&new, FixtureTreeKind::New);
+        FixtureSourceBytes {
+            old: collect_fixture_tree_bytes(&old),
+            new: collect_fixture_tree_bytes(&new),
+        }
+    })
+}
+
+fn collect_fixture_tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    collect_fixture_tree_bytes_inner(root, root, &mut files);
+    files
+}
+
+fn collect_fixture_tree_bytes_inner(
+    root: &Path,
+    current: &Path,
+    files: &mut BTreeMap<PathBuf, Vec<u8>>,
+) {
+    let mut entries = std::fs::read_dir(current)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_fixture_tree_bytes_inner(root, &path, files);
+        } else {
+            files.insert(
+                path.strip_prefix(root).unwrap().to_path_buf(),
+                std::fs::read(path).unwrap(),
+            );
+        }
+    }
+}
+
+fn write_fixture_tree_bytes(root: &Path, files: &BTreeMap<PathBuf, Vec<u8>>) {
+    if root.exists() {
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    for (relative, bytes) in files {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+}
+
+async fn write_fixture_control_index(base: &Path) {
+    let manager = IndexManager::new(base);
+    manager.create_tenant("control_products").unwrap();
+    manager
+        .add_documents_sync(
+            "control_products",
+            vec![Document::from_json(&serde_json::json!({
+                "objectID": "control-widget",
+                "title": "control waffle iron",
+                "body": "unchanged control guide",
+                "generation": "control"
+            }))
+            .unwrap()],
+        )
+        .await
+        .unwrap();
+    manager.graceful_shutdown().await;
+}
+
+fn assert_reopenable_fixture_tree(
+    base: &Path,
+    tenant: &str,
+    object_id: &str,
+    expected_object: serde_json::Value,
+    query: &str,
+    expected_hits: &[&str],
+) {
+    let manager = IndexManager::new(base);
+    let document = manager
+        .get_document(tenant, object_id)
+        .unwrap_or_else(|error| {
+            panic!(
+                "{tenant}/{object_id} should reopen through IndexManager at {}: {error}",
+                base.display()
+            )
+        })
+        .unwrap_or_else(|| panic!("{tenant}/{object_id} should exist"));
+    assert_eq!(document.to_json(), expected_object);
+
+    let hits = manager
+        .search(tenant, query, None, None, 10)
+        .unwrap_or_else(|error| panic!("{tenant} query {query:?} should search: {error}"))
+        .documents
+        .into_iter()
+        .map(|hit| hit.document.id)
+        .collect::<Vec<_>>();
+    assert_eq!(hits, expected_hits);
 }
 
 #[test]

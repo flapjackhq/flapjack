@@ -60,7 +60,8 @@ public class IngestionClient extends ApiClient {
       throw new FlapjackRuntimeException("`region` is required and must be one of the following: eu, us");
     }
 
-    String url = "data.{region}.algolia.com".replace("{region}", region);
+    // Default SDK hosts must stay on Flapjack-owned domains.
+    String url = "data.{region}.flapjack.io".replace("{region}", region);
 
     hosts.add(new Host(url, EnumSet.of(CallType.READ, CallType.WRITE)));
     return hosts;

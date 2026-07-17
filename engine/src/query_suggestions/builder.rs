@@ -222,9 +222,10 @@ pub async fn build_suggestions_index(
             .map_err(|e| e.to_string())?;
     }
 
-    // Atomic swap: move staging over live index
+    // Atomic replacement: publish the rebuilt tenant while keeping the live
+    // index's query-suggestions and analytics control sidecars under its key.
     manager
-        .move_index(&staging_name, &config.index_name)
+        .replace_index_contents(&staging_name, &config.index_name)
         .await
         .map_err(|e| e.to_string())?;
 

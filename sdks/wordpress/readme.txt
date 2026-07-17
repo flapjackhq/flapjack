@@ -3,7 +3,7 @@ Contributors: flapjackhq
 Tags: search, instant search, relevance, autocomplete, faceted search
 Requires at least: 6.4
 Tested up to: 6.9
-Requires PHP: 7.4
+Requires PHP: 8.1
 Stable tag: 0.1.0-beta
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -25,7 +25,7 @@ Flapjack Search replaces the default WordPress search with a fast, typo-tolerant
 * **Real-time sync** — Automatically syncs posts on save, delete, and status changes
 * **Bulk reindex** — Reindex all content with one click or via WP-CLI
 * **Background reindex** — Large-site friendly batch reindexing with Action Scheduler support and progress tracking
-* **Atomic reindex** — Zero-downtime reindexing via temporary index and swap
+* **Bulk live-index updates** — Admin, WP-CLI, and REST reindexing update the live index in batches of up to 500 records
 * **WooCommerce faceted search** — Price range slider, category filters, stock/sale toggles, and star rating filters
 * **WooCommerce ready** — Index products with prices, SKUs, categories, and attributes
 * **REST API** — Full REST API for search, indexing, and status
@@ -63,7 +63,7 @@ Background reindexing processes your content in batches of 200 posts. If Action 
 
 = Will reindexing cause downtime? =
 
-No. The plugin uses atomic reindexing — it builds a new index in the background and swaps it in when complete. Your visitors continue to search against the existing index during the process.
+The admin, WP-CLI, and REST bulk reindex paths update the live index in batches of up to 500 records. Searches may observe those in-place updates while the reindex runs.
 
 == Screenshots ==
 
@@ -81,7 +81,7 @@ No. The plugin uses atomic reindexing — it builds a new index in the backgroun
 * Real-time post sync on save/delete/status change
 * Bulk reindex via admin UI and WP-CLI
 * Background reindex with Action Scheduler support and WP-Cron fallback
-* Atomic reindex with zero-downtime index swap
+* Bulk reindex updates the live index in batches of up to 500 records
 * WooCommerce product indexing with prices, SKUs, categories, and attributes
 * WooCommerce faceted search: price slider, category refinement, stock/sale toggles, star ratings
 * REST API endpoints for search, index, and status

@@ -151,6 +151,35 @@ async fn move_index_removes_destination_sidecars_absent_from_source() {
 }
 
 #[tokio::test]
+async fn replace_index_contents_preserves_destination_target_keyed_sidecars() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    create_tenant(&manager, "staging", "new").await;
+    create_tenant(&manager, "destination", "old").await;
+    write_sidecars(temp_dir.path(), "destination", "control");
+    let expected_sidecars = sidecar_bytes(temp_dir.path(), "destination");
+
+    manager
+        .replace_index_contents("staging", "destination")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sidecar_bytes(temp_dir.path(), "destination"),
+        expected_sidecars
+    );
+    assert!(!temp_dir.path().join("staging").exists());
+    assert!(manager
+        .get_document("destination", "new_document")
+        .unwrap()
+        .is_some());
+    assert!(manager
+        .get_document("destination", "old_document")
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn move_index_fault_preserves_source_and_destination_sidecars_byte_for_byte() {
     for fault in [
         PublicationFaultPoint::BeforeStagingDigest,

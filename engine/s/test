@@ -6,6 +6,7 @@
 #
 # Usage:
 #   ./s/test                  # default: unit + integ + server
+#   ./s/test --sdk-host-safety # scan shipped sdks/ for vendor host literals
 #   ./s/test --unit           # cargo test --lib (~15s, 1053 tests)
 #   ./s/test --integ          # cargo nextest run (~90s, 327 tests)
 #   ./s/test --server         # cargo test -p flapjack-server (~10s, 12 tests)
@@ -35,6 +36,7 @@ load_local_instance_config "$ROOT_DIR"
 
 # ── Flag parsing ──────────────────────────────────────────────────────────────
 
+RUN_SDK_HOST_SAFETY=false
 RUN_UNIT=false
 RUN_INTEG=false
 RUN_SERVER=false
@@ -51,6 +53,7 @@ EXPLICIT=false
 
 for arg in "$@"; do
   case "$arg" in
+    --sdk-host-safety) RUN_SDK_HOST_SAFETY=true; EXPLICIT=true ;;
     --unit)           RUN_UNIT=true; EXPLICIT=true ;;
     --integ)          RUN_INTEG=true; EXPLICIT=true ;;
     --server)         RUN_SERVER=true; EXPLICIT=true ;;
@@ -63,10 +66,12 @@ for arg in "$@"; do
     --go)             RUN_GO=true; EXPLICIT=true ;;
     --cold-install)   RUN_COLD_INSTALL=true; EXPLICIT=true ;;
     --all)
+      RUN_SDK_HOST_SAFETY=true
       RUN_UNIT=true; RUN_INTEG=true; RUN_SERVER=true; RUN_SDK=true
       RUN_DASHBOARD=true; RUN_DASHBOARD_FULL=true; RUN_E2E=true; RUN_GO=true
       EXPLICIT=true ;;
     --ci)
+      RUN_SDK_HOST_SAFETY=true
       RUN_UNIT=true; RUN_INTEG=true; RUN_SERVER=true
       RUN_DASHBOARD=true
       EXPLICIT=true ;;
@@ -86,6 +91,7 @@ if [ "$RUN_LIST" = "true" ]; then
   echo "  Flag               What it runs                                  Time"
   divider
   echo "  (no flags)         unit + integ + server (default)               ~2.5 min"
+  echo "  --sdk-host-safety  scan shipped sdks/ for vendor host literals   ~1s"
   echo "  --unit             cargo test --lib (1053 tests)                 ~15s"
   echo "  --integ            cargo nextest run (327 tests)                 ~90s"
   echo "  --server           cargo test -p flapjack-server (12 tests)     ~10s"
@@ -98,8 +104,8 @@ if [ "$RUN_LIST" = "true" ]; then
   echo "  --go               Go SDK unit tests                            ~5s"
   echo "  --cold-install     bash \"\$ENGINE_DIR/tests/readme_quickstart_smoke.sh\""
   echo "                     opt-in; COLD_INSTALL_DRY_RUN=1 probes dispatch without network"
-  echo "  --all              everything (except --sdk-algolia)             ~20 min"
-  echo "  --ci               unit + integ + server + dashboard            ~5 min"
+  echo "  --all              everything (incl. sdk-host-safety gate)       ~20 min"
+  echo "  --ci               sdk-host-safety + unit + integ + server + dashboard  ~5 min"
   echo "  --list             print this help"
   echo ""
   echo "  Combine flags: ./s/test --unit --sdk"
@@ -419,6 +425,18 @@ ensure_server() {
 
 banner "Flapjack Test Suite"
 timer_start
+
+# ── SDK host safety gate ──────────────────────────────────────────────────────
+# Runs first, before any Rust or dashboard work: a cheap source contract that
+# fails fast when the shipped sdks/ mirror still contains executable vendor-host
+# literals. `set -e` makes a nonzero scanner exit stop the whole run here.
+
+if [ "$RUN_SDK_HOST_SAFETY" = "true" ]; then
+  next_step "SDK: no executable vendor-host literals in shipped sdks/"
+  bash "$ENGINE_DIR/tests/no_vendor_host_in_shipped_sdk.sh"
+  success "No executable vendor-host literals in shipped SDK mirror"
+  echo ""
+fi
 
 # ── Rust unit tests ───────────────────────────────────────────────────────────
 

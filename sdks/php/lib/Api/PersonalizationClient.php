@@ -92,8 +92,9 @@ class PersonalizationClient
             // If a list of hosts was passed, we ignore the cache
             $clusterHosts = ClusterHosts::create($hosts);
         } else {
+            // Default SDK hosts must stay on Flapjack-owned domains.
             $url = null !== $config->getRegion() && '' !== $config->getRegion()
-                ? str_replace('{region}', $config->getRegion(), 'personalization.{region}.algolia.com')
+                ? str_replace('{region}', $config->getRegion(), 'personalization.{region}.flapjack.io')
                 : '';
             $clusterHosts = ClusterHosts::create($url);
         }

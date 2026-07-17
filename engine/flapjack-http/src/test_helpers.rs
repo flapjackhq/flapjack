@@ -9,6 +9,7 @@ use axum::http::{Method, Request};
 use flapjack::analytics::{AnalyticsConfig, AnalyticsQueryEngine};
 use flapjack::experiments::store::ExperimentStore;
 use flapjack::recommend::RecommendConfig;
+use flapjack_replication::manager::ReplicationManager;
 use std::ffi::OsString;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -91,6 +92,7 @@ pub(crate) struct TestStateBuilder<'tmp> {
     analytics_engine: Option<Arc<AnalyticsQueryEngine>>,
     experiment_store: Option<Arc<ExperimentStore>>,
     geoip_reader: Option<Arc<GeoIpReader>>,
+    replication_manager: Option<Arc<ReplicationManager>>,
 }
 
 impl<'tmp> TestStateBuilder<'tmp> {
@@ -100,6 +102,7 @@ impl<'tmp> TestStateBuilder<'tmp> {
             analytics_engine: None,
             experiment_store: None,
             geoip_reader: None,
+            replication_manager: None,
         }
     }
 
@@ -133,6 +136,14 @@ impl<'tmp> TestStateBuilder<'tmp> {
         self
     }
 
+    pub(crate) fn with_replication_manager(
+        mut self,
+        replication_manager: Arc<ReplicationManager>,
+    ) -> Self {
+        self.replication_manager = Some(replication_manager);
+        self
+    }
+
     pub(crate) fn build(self) -> AppState {
         let manager = flapjack::IndexManager::new(self.tmp.path());
         let dictionary_manager = Arc::new(flapjack::dictionaries::manager::DictionaryManager::new(
@@ -143,7 +154,7 @@ impl<'tmp> TestStateBuilder<'tmp> {
         AppState {
             manager,
             key_store: None,
-            replication_manager: None,
+            replication_manager: self.replication_manager,
             ssl_manager: None,
             analytics_engine: self.analytics_engine,
             recommend_config: RecommendConfig::default(),

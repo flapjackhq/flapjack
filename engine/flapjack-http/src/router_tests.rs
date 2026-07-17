@@ -141,6 +141,15 @@ async fn assert_reserved_search_rejected(app: &axum::Router, index_name: &str) {
     );
 }
 
+fn search_only_key_value(key_store: &KeyStore) -> String {
+    key_store
+        .list_all_as_dto()
+        .into_iter()
+        .find(|key| key.acl == ["search"])
+        .expect("default key store should include a search-only key")
+        .value
+}
+
 async fn assert_invalid_credentials_response(resp: axum::response::Response) {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert_eq!(
@@ -148,6 +157,108 @@ async fn assert_invalid_credentials_response(resp: axum::response::Response) {
         serde_json::json!({
             "message": "Invalid Application-ID or API key",
             "status": 403
+        })
+    );
+}
+
+async fn assert_method_not_allowed_response(resp: axum::response::Response) {
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        body_json(resp).await,
+        serde_json::json!({
+            "message": "Method not allowed with this API key",
+            "status": 403
+        })
+    );
+}
+
+async fn post_json(
+    app: &axum::Router,
+    uri: &str,
+    api_key: Option<&str>,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(api_key) = api_key {
+        builder = builder
+            .header("x-algolia-api-key", api_key)
+            .header("x-algolia-application-id", "route-contract-app");
+    }
+    app.clone()
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn migration_routes_preserve_admin_contract() {
+    let tmp = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let search_key = search_only_key_value(&key_store);
+    let app = build_test_router(&tmp, Some(key_store));
+
+    for path in ["/1/migrate-from-algolia", "/1/algolia-list-indexes"] {
+        let valid_payload = if path == "/1/migrate-from-algolia" {
+            serde_json::json!({
+                "appId": "APPID",
+                "apiKey": "source-key",
+                "sourceIndex": "products",
+                "targetIndex": "products_copy"
+            })
+        } else {
+            serde_json::json!({
+                "appId": "APPID",
+                "apiKey": "source-key"
+            })
+        };
+
+        let missing_auth = post_json(&app, path, None, valid_payload.clone()).await;
+        assert_invalid_credentials_response(missing_auth).await;
+
+        let non_admin = post_json(&app, path, Some(&search_key), valid_payload).await;
+        assert_method_not_allowed_response(non_admin).await;
+    }
+
+    let migrate_validation = post_json(
+        &app,
+        "/1/migrate-from-algolia",
+        Some("admin-key"),
+        serde_json::json!({
+            "appId": "",
+            "apiKey": "",
+            "sourceIndex": "",
+            "targetIndex": ""
+        }),
+    )
+    .await;
+    assert_eq!(migrate_validation.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(migrate_validation).await,
+        serde_json::json!({
+            "message": "appId, apiKey, and sourceIndex are required",
+            "status": 400
+        })
+    );
+
+    let list_validation = post_json(
+        &app,
+        "/1/algolia-list-indexes",
+        Some("admin-key"),
+        serde_json::json!({
+            "appId": "",
+            "apiKey": ""
+        }),
+    )
+    .await;
+    assert_eq!(list_validation.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(list_validation).await,
+        serde_json::json!({
+            "message": "appId and apiKey are required",
+            "status": 400
         })
     );
 }

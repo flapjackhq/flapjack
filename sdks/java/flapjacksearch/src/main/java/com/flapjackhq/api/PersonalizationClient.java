@@ -58,7 +58,8 @@ public class PersonalizationClient extends ApiClient {
       throw new FlapjackRuntimeException("`region` is required and must be one of the following: eu, us");
     }
 
-    String url = "personalization.{region}.algolia.com".replace("{region}", region);
+    // Default SDK hosts must stay on Flapjack-owned domains.
+    String url = "personalization.{region}.flapjack.io".replace("{region}", region);
 
     hosts.add(new Host(url, EnumSet.of(CallType.READ, CallType.WRITE)));
     return hosts;

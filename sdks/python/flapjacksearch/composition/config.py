@@ -50,21 +50,22 @@ class CompositionConfig(BaseConfig):
         if self.hosts is not None:
             return
 
+        # Default SDK hosts must stay on Flapjack-owned domains.
         self.hosts = HostsCollection(
             [
                 Host(
-                    url="{}-dsn.algolia.net".format(self.app_id),
+                    url="{}-dsn.flapjack.io".format(self.app_id),
                     priority=10,
                     accept=CallType.READ,
                 ),
                 Host(
-                    url="{}.algolia.net".format(self.app_id),
+                    url="{}.flapjack.io".format(self.app_id),
                     priority=10,
                     accept=CallType.WRITE,
                 ),
-                Host("{}-1.algolianet.com".format(self.app_id)),
-                Host("{}-2.algolianet.com".format(self.app_id)),
-                Host("{}-3.algolianet.com".format(self.app_id)),
+                Host("{}-1.flapjack.io".format(self.app_id)),
+                Host("{}-2.flapjack.io".format(self.app_id)),
+                Host("{}-3.flapjack.io".format(self.app_id)),
             ],
             reorder_hosts=True,
         )

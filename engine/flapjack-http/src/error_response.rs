@@ -18,6 +18,21 @@ pub fn json_error_parts(
     )
 }
 
+pub fn json_error_parts_with_code(
+    status: StatusCode,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> (StatusCode, axum::Json<serde_json::Value>) {
+    (
+        status,
+        axum::Json(json!({
+            "message": message.into(),
+            "status": status.as_u16(),
+            "code": code.into(),
+        })),
+    )
+}
+
 pub fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
     json_error_parts(status, message).into_response()
 }
@@ -34,6 +49,13 @@ pub enum HandlerError {
     /// Explicit status and message for cases where no `FlapjackError` variant
     /// carries the right combination (e.g. 404 with a custom entity ID in the message).
     Custom { status: StatusCode, message: String },
+    /// Explicit status, code, and message for handlers that need a stable
+    /// machine-readable error code without changing the standard JSON fields.
+    Coded {
+        status: StatusCode,
+        code: String,
+        message: String,
+    },
 }
 
 impl IntoResponse for HandlerError {
@@ -41,6 +63,11 @@ impl IntoResponse for HandlerError {
         match self {
             HandlerError::Core(e) => e.into_response(),
             HandlerError::Custom { status, message } => json_error(status, message),
+            HandlerError::Coded {
+                status,
+                code,
+                message,
+            } => json_error_parts_with_code(status, code, message).into_response(),
         }
     }
 }
@@ -94,6 +121,14 @@ impl HandlerError {
         }
     }
 
+    pub fn coded(status: StatusCode, code: impl Into<String>, message: impl Into<String>) -> Self {
+        HandlerError::Coded {
+            status,
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
     /// Force a sanitized 500 for server-side storage errors, regardless of the
     /// underlying error type. Use this for load/save operations where any failure
     /// (including serde parse errors from corrupt stored data) is a server fault,
@@ -118,6 +153,45 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         (status, json)
+    }
+
+    #[test]
+    fn json_error_parts_with_code_preserves_standard_shape() {
+        let (status, axum::Json(body)) = json_error_parts_with_code(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "migration_import_unavailable",
+            "Migration import is temporarily unavailable",
+        );
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            json!({
+                "message": "Migration import is temporarily unavailable",
+                "status": 503,
+                "code": "migration_import_unavailable"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_error_coded_delegates_to_coded_json_helper() {
+        let he = HandlerError::coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "migration_import_unavailable",
+            "Migration import is temporarily unavailable",
+        );
+        let (status, json) = response_json(he.into_response()).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            json,
+            json!({
+                "message": "Migration import is temporarily unavailable",
+                "status": 503,
+                "code": "migration_import_unavailable"
+            })
+        );
     }
 
     // ── FlapjackError contract: std::io::Error → sanitized 500 ──

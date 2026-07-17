@@ -66,7 +66,8 @@ public class AnalyticsClient extends ApiClient {
       throw new FlapjackRuntimeException("`region` must be one of the following: de, us");
     }
 
-    String url = region == null ? "analytics.algolia.com" : "analytics.{region}.algolia.com".replace("{region}", region);
+    // Default SDK hosts must stay on Flapjack-owned domains.
+    String url = region == null ? "analytics.flapjack.io" : "analytics.{region}.flapjack.io".replace("{region}", region);
 
     hosts.add(new Host(url, EnumSet.of(CallType.READ, CallType.WRITE)));
     return hosts;

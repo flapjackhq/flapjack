@@ -5,7 +5,7 @@
  * Description:       Fast, typo-tolerant search for WordPress powered by Flapjack. Drop-in replacement for native WordPress search with instant results, faceted filtering, and WooCommerce support. (Beta)
  * Version:           0.1.0-beta
  * Requires at least: 6.4
- * Requires PHP:      7.4
+ * Requires PHP:      8.1
  * Author:            Flapjack HQ
  * Author URI:        https://flapjack.io
  * License:           GPL-2.0-or-later

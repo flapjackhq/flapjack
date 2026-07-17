@@ -39,9 +39,10 @@ module Flapjack
         raise "`region` is required and must be one of the following: #{regions.join(", ")}"
       end
 
+      # Default SDK hosts must stay on Flapjack-owned domains.
       hosts <<
         Transport::StatefulHost.new(
-          "query-suggestions.{region}.algolia.com".sub("{region}", region),
+          "query-suggestions.{region}.flapjack.io".sub("{region}", region),
           accept: CallType::READ | CallType::WRITE
         )
 

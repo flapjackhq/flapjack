@@ -142,9 +142,10 @@ Then initialize your frontend with `flapjackSearch(...)`:
 ```javascript
 import { flapjackSearch } from 'flapjack-search';
 
-// app-id can be any string, api-key is your admin key or a search key
-const client = flapjackSearch('flapjack', 'your-flapjack-api-key', {
-  hosts: [{ url: 'localhost:7700', protocol: 'http', accept: 'readWrite' }],
+// app-id can be any string; the browser must receive a restricted search-only
+// key — never your admin key. The host is read-only so a leaked key cannot write.
+const client = flapjackSearch('flapjack', 'your-flapjack-search-only-key', {
+  hosts: [{ url: 'localhost:7700', protocol: 'http', accept: 'read' }],
 });
 
 // Everything else stays the same
@@ -196,7 +197,7 @@ InstantSearch.js widgets work as-is — `SearchBox`, `Hits`, `RefinementList`, `
 | Analytics | Search events, click tracking, query suggestions, HA fan-out |
 | Federated search | Weighted multi-index queries with RRF merge |
 
-Algolia-compatible REST API under `/1/` — works with InstantSearch.js v5, the algoliasearch client, and [Laravel Scout](integrations/laravel-scout/).
+Algolia-compatible REST API under `/1/` — works with InstantSearch.js v5 and the algoliasearch client.
 
 ---
 
@@ -224,7 +225,7 @@ Batch writes use durable-ack semantics — HTTP 200 returns only after the Tanti
 
 **Q: Which InstantSearch.js widgets work?**
 
-All standard InstantSearch.js v5 widgets connect directly to Flapjack's `/1/` endpoints without an adapter: `SearchBox`, `Hits`, `RefinementList`, `Pagination`, `GeoSearch`, and others. The Comparison table lists Flapjack as "Native" for InstantSearch.js support. Laravel Scout is also supported via the [integration package](integrations/laravel-scout/).
+All standard InstantSearch.js v5 widgets connect directly to Flapjack's `/1/` endpoints without an adapter: `SearchBox`, `Hits`, `RefinementList`, `Pagination`, `GeoSearch`, and others. The Comparison table lists Flapjack as "Native" for InstantSearch.js support.
 
 **Q: What is the licensing and support model?**
 

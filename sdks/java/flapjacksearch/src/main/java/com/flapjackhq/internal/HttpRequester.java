@@ -114,7 +114,7 @@ public final class HttpRequester implements Requester {
   private static HttpUrl createHttpUrl(@Nonnull HttpRequest request, RequestOptions requestOptions) {
     HttpUrl.Builder urlBuilder = new HttpUrl.Builder()
       .scheme("https")
-      .host("algolia.com") // will be overridden by the retry strategy
+      .host("flapjack.io") // Skipped retry overrides must not reach a third party.
       .encodedPath(request.getPath());
     request.getQueryParameters().forEach(urlBuilder::addEncodedQueryParameter);
     if (requestOptions != null) {
