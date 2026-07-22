@@ -5,14 +5,13 @@ use super::{
 };
 use serde_json::Value;
 
-pub(super) fn validate_rule_pages(
-    rule_pages: &[Vec<Value>],
+pub(super) fn validate_rule_page(
+    page_index: usize,
+    page: &[Value],
     entries: &mut Vec<TranslationReportEntry>,
 ) {
-    for (page_index, page) in rule_pages.iter().enumerate() {
-        for (item_index, rule) in page.iter().enumerate() {
-            validate_rule_payload(rule, page_index, item_index, entries);
-        }
+    for (item_index, rule) in page.iter().enumerate() {
+        validate_rule_payload(rule, page_index, item_index, entries);
     }
 }
 
@@ -225,22 +224,21 @@ fn validate_rule_schema_value(
     }
 }
 
-pub(super) fn validate_synonym_pages(
-    synonym_pages: &[Vec<Value>],
+pub(super) fn validate_synonym_page(
+    page_index: usize,
+    page: &[Value],
     entries: &mut Vec<TranslationReportEntry>,
 ) {
-    for (page_index, page) in synonym_pages.iter().enumerate() {
-        for (item_index, synonym) in page.iter().enumerate() {
-            let row = resolve_source_schema(ResourceKind::Synonym, synonym);
-            if row.disposition == Disposition::Rejected {
-                entries.push(hard_entry(
-                    ReportCode::UnsupportedSynonymSchema,
-                    ReportResource::Synonym,
-                    Some(page_index),
-                    Some(item_index),
-                    "$",
-                ));
-            }
+    for (item_index, synonym) in page.iter().enumerate() {
+        let row = resolve_source_schema(ResourceKind::Synonym, synonym);
+        if row.disposition == Disposition::Rejected {
+            entries.push(hard_entry(
+                ReportCode::UnsupportedSynonymSchema,
+                ReportResource::Synonym,
+                Some(page_index),
+                Some(item_index),
+                "$",
+            ));
         }
     }
 }

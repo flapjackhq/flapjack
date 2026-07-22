@@ -548,12 +548,14 @@ fn list_query_deserializes_algolia_params() {
     let json = serde_json::json!({
         "offset": 10,
         "limit": 5,
+        "indexName": "products",
         "indexPrefix": "prod",
         "indexSuffix": "_v2"
     });
     let query: AlgoliaListAbTestsQuery = serde_json::from_value(json).unwrap();
     assert_eq!(query.offset, Some(10));
     assert_eq!(query.limit, Some(5));
+    assert_eq!(query.index_name.as_deref(), Some("products"));
     assert_eq!(query.index_prefix.as_deref(), Some("prod"));
     assert_eq!(query.index_suffix.as_deref(), Some("_v2"));
 }

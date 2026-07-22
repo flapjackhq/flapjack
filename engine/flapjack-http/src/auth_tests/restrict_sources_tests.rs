@@ -33,7 +33,9 @@ async fn regular_key_restrict_sources_response_with_referer(
             "/1/indexes/products/query",
             post(|| async { (StatusCode::OK, "ok") }),
         )
-        .layer(axum::middleware::from_fn(authenticate_and_authorize))
+        .layer(axum::middleware::from_fn(|request, next| async move {
+            authenticate_and_authorize(request, next, false).await
+        }))
         .layer(Extension(key_store));
 
     let mut request = Request::builder()

@@ -30,6 +30,34 @@ async fn get_usage(app: Router, path: &str) -> axum::response::Response {
     app.oneshot(req).await.unwrap()
 }
 
+fn usage_test_document(id: &str) -> flapjack::types::Document {
+    flapjack::types::Document {
+        id: id.to_string(),
+        fields: std::collections::HashMap::from([(
+            "title".to_string(),
+            flapjack::types::FieldValue::Text(format!("Document {id}")),
+        )]),
+    }
+}
+
+/// Create and index test documents so live segment counts are observable.
+async fn seed_loaded_documents(state: &Arc<AppState>, index_name: &str, count: u64) {
+    state.manager.create_tenant(index_name).unwrap();
+    let docs = (0..count)
+        .map(|idx| usage_test_document(&format!("{index_name}_{idx}")))
+        .collect();
+    state
+        .manager
+        .add_documents_sync(index_name, docs)
+        .await
+        .unwrap();
+    assert_eq!(
+        state.manager.tenant_doc_count(index_name),
+        Some(count),
+        "test setup must create the expected live segment document count"
+    );
+}
+
 // ── Red tests ──
 
 /// Verify the `search_operations` statistic returns a single data point with the correct count and a numeric timestamp.
@@ -100,6 +128,45 @@ async fn usage_records_returns_document_count() {
     let arr = json["records"].as_array().unwrap();
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["v"].as_u64().unwrap(), 42);
+}
+
+/// Verify `documents_count` returns the loaded segment document count for one index.
+#[tokio::test]
+async fn usage_documents_count_per_index_returns_live_segment_count() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp);
+
+    seed_loaded_documents(&state, "products", 3).await;
+
+    let app = usage_router(state);
+    let resp = get_usage(app, "/1/usage/documents_count/products").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let arr = json["documents_count"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    // Hand calculation: products has exactly 3 live documents.
+    assert_eq!(arr[0]["v"].as_u64().unwrap(), 3);
+}
+
+/// Verify global `documents_count` sums all loaded indexes.
+#[tokio::test]
+async fn usage_documents_count_global_sums_loaded_indexes() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp);
+
+    seed_loaded_documents(&state, "products", 2).await;
+    seed_loaded_documents(&state, "articles", 3).await;
+
+    let app = usage_router(state);
+    let resp = get_usage(app, "/1/usage/documents_count").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let arr = json["documents_count"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    // Hand calculation: products 2 + articles 3 == 5.
+    assert_eq!(arr[0]["v"].as_u64().unwrap(), 5);
 }
 
 #[tokio::test]
@@ -175,6 +242,63 @@ async fn usage_comma_separated_statistics() {
     assert_eq!(json["total_write_operations"][0]["v"].as_u64().unwrap(), 7);
 }
 
+/// Verify comma-separated counter and gauge stats are returned independently.
+#[tokio::test]
+async fn usage_comma_separated_search_operations_and_documents_count() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp);
+
+    state
+        .usage_counters
+        .entry("idx".to_string())
+        .or_default()
+        .search_count
+        .fetch_add(2, Ordering::Relaxed);
+    seed_loaded_documents(&state, "idx", 4).await;
+
+    let app = usage_router(state);
+    let resp = get_usage(app, "/1/usage/search_operations,documents_count").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let search = json["search_operations"].as_array().unwrap();
+    let documents = json["documents_count"].as_array().unwrap();
+    assert_eq!(search.len(), 1);
+    assert_eq!(documents.len(), 1);
+    assert_eq!(search[0]["v"].as_u64().unwrap(), 2);
+    // Hand calculation: idx has exactly 4 live documents.
+    assert_eq!(documents[0]["v"].as_u64().unwrap(), 4);
+}
+
+#[tokio::test]
+async fn usage_comma_separated_live_points_share_timestamp() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp);
+
+    state
+        .usage_counters
+        .entry("idx".to_string())
+        .or_default()
+        .search_count
+        .fetch_add(2, Ordering::Relaxed);
+    seed_loaded_documents(&state, "idx", 4).await;
+
+    let app = usage_router(state);
+    let resp = get_usage(app, "/1/usage/search_operations,documents_count").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let search = json["search_operations"].as_array().unwrap();
+    let documents = json["documents_count"].as_array().unwrap();
+    assert_eq!(search.len(), 1);
+    assert_eq!(documents.len(), 1);
+    assert_eq!(
+        search[0]["t"].as_i64().unwrap(),
+        documents[0]["t"].as_i64().unwrap(),
+        "one response must publish one live timestamp across all requested statistics"
+    );
+}
+
 #[tokio::test]
 async fn usage_unknown_statistic_returns_error() {
     let tmp = TempDir::new().unwrap();
@@ -229,7 +353,7 @@ async fn usage_requires_usage_acl() {
                 async move {
                     req.extensions_mut().insert(ks);
                     req.extensions_mut().insert(rl);
-                    authenticate_and_authorize(req, next).await
+                    authenticate_and_authorize(req, next, false).await
                 }
             },
         ));
@@ -311,6 +435,117 @@ async fn usage_response_format_matches_algolia() {
     );
 }
 
+/// Verify absent storage cache data is represented as unknown instead of zero.
+#[tokio::test]
+async fn usage_storage_bytes_absent_cache_is_explicit_not_zero() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp);
+
+    state
+        .usage_counters
+        .entry("products".to_string())
+        .or_default()
+        .search_count
+        .fetch_add(1, Ordering::Relaxed);
+
+    let app = usage_router(state);
+    let resp = get_usage(app, "/1/usage/storage_bytes/products").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let arr = json["storage_bytes"].as_array().unwrap();
+    assert!(
+        arr.is_empty(),
+        "missing metrics cache must be represented as unknown, not v=0"
+    );
+}
+
+/// Verify per-index `storage_bytes` reads the background metrics cache.
+#[tokio::test]
+async fn usage_storage_bytes_per_index_reads_metrics_cache() {
+    let tmp = TempDir::new().unwrap();
+    let state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
+    let metrics_state = state.metrics_state.as_ref().unwrap();
+    metrics_state.storage_gauges.clear();
+    metrics_state
+        .storage_gauges
+        .insert("products".to_string(), 12_345);
+    metrics_state
+        .storage_gauges
+        .insert("other".to_string(), 6_789);
+
+    let app = usage_router(state);
+    let resp = get_usage(app, "/1/usage/storage_bytes/products").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let arr = json["storage_bytes"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["v"].as_u64().unwrap(), 12_345);
+}
+
+/// Verify global `storage_bytes` sums the background metrics cache.
+#[tokio::test]
+async fn usage_storage_bytes_global_sums_metrics_cache() {
+    let tmp = TempDir::new().unwrap();
+    let state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
+    let metrics_state = state.metrics_state.as_ref().unwrap();
+    metrics_state.storage_gauges.clear();
+    metrics_state
+        .storage_gauges
+        .insert("products".to_string(), 12_345);
+    metrics_state
+        .storage_gauges
+        .insert("articles".to_string(), 6_789);
+
+    let app = usage_router(state);
+    let resp = get_usage(app, "/1/usage/storage_bytes").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let arr = json["storage_bytes"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    // Hand calculation: products 12_345 + articles 6_789 == 19_134.
+    assert_eq!(arr[0]["v"].as_u64().unwrap(), 19_134);
+}
+
+/// Verify explicit zero document counts are emitted instead of treated as missing.
+#[tokio::test]
+async fn usage_documents_count_explicit_zero_is_emitted() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp);
+    state.manager.create_tenant("empty").unwrap();
+    assert_eq!(state.manager.tenant_doc_count("empty"), Some(0));
+
+    let app = usage_router(state);
+    let resp = get_usage(app, "/1/usage/documents_count/empty").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let arr = json["documents_count"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["v"].as_u64().unwrap(), 0);
+}
+
+/// Verify explicit zero storage cache entries are emitted instead of treated as missing.
+#[tokio::test]
+async fn usage_storage_bytes_explicit_zero_is_emitted() {
+    let tmp = TempDir::new().unwrap();
+    let state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
+    let metrics_state = state.metrics_state.as_ref().unwrap();
+    metrics_state.storage_gauges.clear();
+    metrics_state.storage_gauges.insert("empty".to_string(), 0);
+
+    let app = usage_router(state);
+    let resp = get_usage(app, "/1/usage/storage_bytes/empty").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let arr = json["storage_bytes"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["v"].as_u64().unwrap(), 0);
+}
+
 // ── Date range + persistence tests ──
 
 /// Create an `AppState` wired to the given `UsagePersistence` instance so tests can exercise historical snapshot loading.
@@ -322,6 +557,40 @@ fn make_state_with_persistence(
     state.metrics_state = None;
     state.usage_persistence = Some(persistence);
     Arc::new(state)
+}
+
+/// Verify historical snapshots without gauge fields do not fabricate zeroes.
+#[tokio::test]
+async fn usage_documents_count_no_fabricated_historical_zero() {
+    use crate::usage_persistence::UsagePersistence;
+
+    let tmp = TempDir::new().unwrap();
+    let persistence = Arc::new(UsagePersistence::new(tmp.path()).unwrap());
+
+    let counters: dashmap::DashMap<String, crate::usage_middleware::TenantUsageCounters> =
+        dashmap::DashMap::new();
+    counters
+        .entry("idx".to_string())
+        .or_default()
+        .search_count
+        .fetch_add(7, Ordering::Relaxed);
+    persistence.save_snapshot("2026-02-24", &counters).unwrap();
+
+    let state = make_state_with_persistence(&tmp, persistence);
+    let app = usage_router(state);
+    let resp = get_usage(
+        app,
+        "/1/usage/documents_count?startDate=2026-02-24&endDate=2026-02-24",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let arr = json["documents_count"].as_array().unwrap();
+    assert!(
+        arr.is_empty(),
+        "historical snapshots without gauge data must stay unknown, not v=0"
+    );
 }
 
 /// Verify that querying a past date range loads only the matching persisted snapshots and returns the correct values.
@@ -371,57 +640,34 @@ async fn usage_date_range_returns_historical_data() {
     assert!(values.contains(&20), "day 2 value must be present");
 }
 
-/// Verify that a date range ending on today merges yesterday's persisted snapshot with today's live in-memory counters into two data points.
+/// Verify corrupt persisted usage history returns a server error instead of an empty success payload.
 #[tokio::test]
-async fn usage_date_range_includes_current_day_inmemory() {
+async fn usage_date_range_returns_internal_error_for_corrupt_history() {
     use crate::usage_persistence::UsagePersistence;
 
     let tmp = TempDir::new().unwrap();
     let persistence = Arc::new(UsagePersistence::new(tmp.path()).unwrap());
-
-    let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
-        .format("%Y-%m-%d")
-        .to_string();
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-
-    // Persist yesterday's snapshot
-    let hist: dashmap::DashMap<String, crate::usage_middleware::TenantUsageCounters> =
-        dashmap::DashMap::new();
-    hist.entry("idx".to_string())
-        .or_default()
-        .search_count
-        .fetch_add(5, Ordering::Relaxed);
-    persistence.save_snapshot(&yesterday, &hist).unwrap();
+    std::fs::write(
+        tmp.path().join("_usage/2026-02-22.json"),
+        "{ not valid json }",
+    )
+    .unwrap();
 
     let state = make_state_with_persistence(&tmp, persistence);
-
-    // Add live (today) counter
-    state
-        .usage_counters
-        .entry("idx".to_string())
-        .or_default()
-        .search_count
-        .fetch_add(99, Ordering::Relaxed);
-
     let app = usage_router(state);
-    let path = format!(
-        "/1/usage/search_operations?startDate={}&endDate={}",
-        yesterday, today
-    );
-    let resp = get_usage(app, &path).await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = get_usage(
+        app,
+        "/1/usage/search_operations?startDate=2026-02-22&endDate=2026-02-22",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
     let json = body_json(resp).await;
-    let arr = json["search_operations"].as_array().unwrap();
+    assert_eq!(json["status"].as_u64().unwrap(), 500);
     assert_eq!(
-        arr.len(),
-        2,
-        "should return 1 historical + 1 live data point"
+        json["message"].as_str().unwrap(),
+        "Failed to load usage history"
     );
-
-    let values: Vec<u64> = arr.iter().map(|p| p["v"].as_u64().unwrap()).collect();
-    assert!(values.contains(&5), "historical value must be present");
-    assert!(values.contains(&99), "live value must be present");
 }
 
 /// Verify that the per-index endpoint only returns the filtered index's value from a persisted snapshot containing multiple indexes.
@@ -513,3 +759,6 @@ async fn usage_granularity_daily_returns_one_point_per_day() {
     let t1 = arr[1]["t"].as_i64().unwrap();
     assert!(t1 > t0, "data points must be in chronological order");
 }
+
+#[path = "usage_historical_gauge_tests.rs"]
+mod historical_gauge_tests;

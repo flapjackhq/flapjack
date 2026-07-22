@@ -18,6 +18,57 @@ fn test_parse_modifiers() {
 }
 
 #[test]
+fn ranking_criterion_token_classifier_accepts_only_runtime_textual_criteria() {
+    let recognized = [
+        ("typo", RankingCriterionToken::Typo),
+        ("geo", RankingCriterionToken::Geo),
+        ("words", RankingCriterionToken::Words),
+        ("filters", RankingCriterionToken::Filters),
+        ("proximity", RankingCriterionToken::Proximity),
+        ("attribute", RankingCriterionToken::Attribute),
+        ("exact", RankingCriterionToken::Exact),
+    ];
+
+    for (source, expected) in recognized {
+        assert_eq!(classify_ranking_criterion_token(source), Some(expected));
+        assert!(is_ranking_criterion_token(source));
+    }
+
+    for source in ["custom", "desc(price)", "typo ", "bogus", ""] {
+        assert_eq!(classify_ranking_criterion_token(source), None, "{source}");
+        assert!(!is_ranking_criterion_token(source), "{source}");
+    }
+}
+
+#[test]
+fn custom_ranking_token_parser_preserves_runtime_grammar() {
+    assert_eq!(
+        parse_custom_ranking_token("desc(price)"),
+        Some(ParsedCustomRankingToken {
+            attribute: "price".to_string(),
+            direction: CustomRankingDirection::Desc,
+        })
+    );
+    assert_eq!(
+        parse_custom_ranking_token("asc(meta.score)"),
+        Some(ParsedCustomRankingToken {
+            attribute: "meta.score".to_string(),
+            direction: CustomRankingDirection::Asc,
+        })
+    );
+    assert_eq!(
+        parse_custom_ranking_token("desc(price"),
+        Some(ParsedCustomRankingToken {
+            attribute: "price".to_string(),
+            direction: CustomRankingDirection::Desc,
+        }),
+        "existing runtime parser accepts a missing closing parenthesis"
+    );
+    assert_eq!(parse_custom_ranking_token("custom"), None);
+    assert_eq!(parse_custom_ranking_token("ascending(price)"), None);
+}
+
+#[test]
 fn test_facet_set() {
     let settings = IndexSettings {
         attributes_for_faceting: vec![

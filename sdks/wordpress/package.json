@@ -6,6 +6,7 @@
   "scripts": {
     "build:vendor": "node scripts/vendor-deps.js",
     "build": "npm run build:vendor",
+    "package": "npm run build && node scripts/package-plugin.js",
     "wp-env": "wp-env",
     "wp-env:start": "wp-env start",
     "wp-env:stop": "wp-env stop",
@@ -18,7 +19,7 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.58.2",
-    "@wordpress/env": "^10.39.0",
+    "@wordpress/env": "^11.11.0",
     "dotenv": "^17.2.4",
     "instantsearch.css": "^8.5.1",
     "instantsearch.js": "^4.75.0"

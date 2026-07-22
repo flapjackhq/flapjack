@@ -2,8 +2,8 @@
 mod build_info;
 
 use build_info::{
-    collect_vcs_inputs, discover_vcs, workspace_digest, WORKSPACE_DIGEST_FILES,
-    WORKSPACE_DIGEST_RUST_DIRS,
+    collect_vcs_inputs, discover_vcs, vcs_invalidation_paths, workspace_digest,
+    WORKSPACE_DIGEST_FILES, WORKSPACE_DIGEST_RUST_DIRS,
 };
 use std::env;
 use std::path::Path;
@@ -22,7 +22,7 @@ fn main() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|error| panic!("{error}"));
 
-    emit_invalidation_policy();
+    emit_invalidation_policy(&workspace_root);
 
     let revision_override = revision_override();
     let vcs = collect_vcs_inputs(revision_override.as_deref(), || {
@@ -49,13 +49,16 @@ fn main() {
     emit_raw_input(TARGET_INPUT_ENV, &target);
 }
 
-fn emit_invalidation_policy() {
+fn emit_invalidation_policy(workspace_root: &Path) {
     println!("cargo:rerun-if-env-changed={BUILD_REVISION_ENV}");
     for path in WORKSPACE_DIGEST_FILES
         .iter()
         .chain(WORKSPACE_DIGEST_RUST_DIRS.iter())
     {
         println!("cargo:rerun-if-changed={path}");
+    }
+    for path in vcs_invalidation_paths(|arguments| run_git(workspace_root, arguments)) {
+        println!("cargo:rerun-if-changed={}", path.display());
     }
 }
 

@@ -6,6 +6,7 @@ use super::algolia_client::{
 use super::source_snapshot::{canonical_json_bytes, SourceSnapshot, SourceSnapshotBuilder};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -24,6 +25,10 @@ pub(super) trait MigrationSourceReader {
     fn source_name(&self) -> &str;
     fn wait_for_quiescent_source(&mut self) -> SourceFuture<'_, AlgoliaIndexRecord>;
     fn read_settings(&mut self) -> SourceFuture<'_, Value>;
+    /// Fetch the complete settings JSON for an arbitrary index name. This is the
+    /// single low-level replica read the shared collector composes; it performs
+    /// no parsing or list traversal of its own.
+    fn read_index_settings<'a>(&'a mut self, index_name: &'a str) -> SourceFuture<'a, Value>;
     fn require_unretrievable_access<'a>(&'a mut self, settings: &'a Value) -> SourceFuture<'a, ()>;
     fn read_documents<'a>(
         &'a mut self,
@@ -155,6 +160,10 @@ impl MigrationSourceReader for AlgoliaSourceReader {
         Box::pin(async move { self.client.settings().await })
     }
 
+    fn read_index_settings<'a>(&'a mut self, index_name: &'a str) -> SourceFuture<'a, Value> {
+        Box::pin(async move { self.client.index_settings(index_name).await })
+    }
+
     fn require_unretrievable_access<'a>(&'a mut self, settings: &'a Value) -> SourceFuture<'a, ()> {
         Box::pin(async move { self.client.require_unretrievable_access(settings).await })
     }
@@ -205,6 +214,52 @@ where
     let metadata = reader.wait_for_quiescent_source().await?;
     let snapshot = read_source_snapshot(reader, &mut NoopSink).await?;
     SourceIdentity::new(reader.app_id(), reader.source_name(), &metadata, snapshot)
+}
+
+/// Collect the complete source settings for every replica named in the primary
+/// settings' `replicas` list. Each string entry is parsed through the single
+/// canonical replica parser and its settings fetched exactly once; the returned
+/// map is keyed by replica index name and holds the full response JSON.
+///
+/// Absent `replicas` performs zero index-specific reads. Malformed primary
+/// `replicas` *shapes* (non-array, non-string entries) are left to the existing
+/// translation validation owner, so non-string entries are skipped here rather
+/// than rejected. A string entry that fails the canonical parser is a fail-closed
+/// validation error with a single static, scrubbed message.
+pub(super) async fn collect_replica_settings<R>(
+    reader: &mut R,
+    primary_settings: &Value,
+) -> Result<BTreeMap<String, Value>, AlgoliaClientError>
+where
+    R: MigrationSourceReader,
+{
+    let mut collected = BTreeMap::new();
+    let Some(entries) = primary_settings.get("replicas").and_then(Value::as_array) else {
+        return Ok(collected);
+    };
+
+    for entry in entries {
+        let Some(raw) = entry.as_str() else {
+            continue;
+        };
+        let parsed = flapjack::index::replica::parse_replica_entry(raw)
+            .map_err(|_| replica_entry_validation_error())?;
+        let name = parsed.name().to_string();
+        if collected.contains_key(&name) {
+            continue;
+        }
+        let settings = reader.read_index_settings(&name).await?;
+        collected.insert(name, settings);
+    }
+
+    Ok(collected)
+}
+
+fn replica_entry_validation_error() -> AlgoliaClientError {
+    AlgoliaClientError::new(
+        AlgoliaErrorKind::Validation,
+        "Algolia replica entry could not be parsed for migration",
+    )
 }
 
 pub(super) async fn accept_source_export<R, S>(

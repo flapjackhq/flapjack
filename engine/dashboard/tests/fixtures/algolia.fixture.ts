@@ -7,13 +7,19 @@ export interface AlgoliaTestContext {
   appId: string;
   adminKey: string;
   indexName: string;
+  targetIndexName: string;
+  invalidTargetIndexName: string;
 }
 
-export type AlgoliaCredentialMode = 'run' | 'skip' | 'fail';
+export interface MigrationCleanupReceipt {
+  algoliaSource: string;
+  flapjackTargets: Record<string, string>;
+}
+
+export type AlgoliaCredentialMode = 'run' | 'fail';
 
 export interface AlgoliaCredentialModeInput {
   hasCredentials: boolean;
-  isCI: boolean;
 }
 
 interface DeletionProbeResult {
@@ -47,12 +53,13 @@ export class MissingAlgoliaCredentialsError extends Error {
 
 export function resolveAlgoliaCredentialMode({
   hasCredentials,
-  isCI,
 }: AlgoliaCredentialModeInput): AlgoliaCredentialMode {
   if (hasCredentials) {
     return 'run';
   }
-  return isCI ? 'fail' : 'skip';
+  // Input-spec-required: missing required Algolia credentials fail closed
+  // everywhere; see chats/icg/jul16_3pm_8_green_by_absence_standard.md.
+  return 'fail';
 }
 
 /**
@@ -70,6 +77,8 @@ export async function seedAlgoliaIndex(): Promise<AlgoliaTestContext> {
   const appId = process.env.ALGOLIA_APP_ID!;
   const adminKey = process.env.ALGOLIA_ADMIN_KEY!;
   const indexName = `fj_e2e_migrate_${Date.now()}`;
+  const targetIndexName = `${indexName}_target`;
+  const invalidTargetIndexName = `${indexName}_invalid_target`;
 
   const client = algoliasearch(appId, adminKey);
 
@@ -100,22 +109,34 @@ export async function seedAlgoliaIndex(): Promise<AlgoliaTestContext> {
   // Poll until all documents are indexed and searchable
   await pollAlgoliaReady(client, indexName, PRODUCTS.length);
 
-  return { appId, adminKey, indexName };
+  return { appId, adminKey, indexName, targetIndexName, invalidTargetIndexName };
 }
 
 /**
  * Deletes the stage-owned Algolia and Flapjack indexes, then waits until both
  * backends confirm the index name is gone. Residue is a test failure.
  */
-export async function cleanupMigrationIndexes(ctx: AlgoliaTestContext): Promise<void> {
+export async function cleanupMigrationIndexes(
+  ctx: AlgoliaTestContext,
+): Promise<MigrationCleanupReceipt> {
+  const flapjackIndexNames = [ctx.indexName, ctx.targetIndexName, ctx.invalidTargetIndexName];
   await Promise.all([
     deleteAlgoliaIndex(ctx),
-    deleteFlapjackIndex(ctx.indexName),
+    ...flapjackIndexNames.map((indexName) => deleteFlapjackIndex(indexName)),
   ]);
-  await Promise.all([
+  const [algoliaSource, ...flapjackObservations] = await Promise.all([
     waitForDeletion('Algolia', ctx.indexName, () => probeAlgoliaIndexDeleted(ctx)),
-    waitForDeletion('Flapjack', ctx.indexName, () => probeFlapjackIndexDeleted(ctx.indexName)),
+    ...flapjackIndexNames.map((indexName) => (
+      waitForDeletion('Flapjack', indexName, () => probeFlapjackIndexDeleted(indexName))
+    )),
   ]);
+
+  return {
+    algoliaSource,
+    flapjackTargets: Object.fromEntries(
+      flapjackIndexNames.map((indexName, index) => [indexName, flapjackObservations[index]]),
+    ),
+  };
 }
 
 /**
@@ -194,7 +215,7 @@ async function waitForDeletion(
   indexName: string,
   probe: () => Promise<DeletionProbeResult>,
   maxWaitMs = CLEANUP_TIMEOUT_MS,
-): Promise<void> {
+): Promise<string> {
   const start = Date.now();
   let lastObservation = 'no deletion confirmation observed';
 
@@ -202,7 +223,7 @@ async function waitForDeletion(
     try {
       const result = await probe();
       if (result.deleted) {
-        return;
+        return result.observation;
       }
       lastObservation = result.observation;
     } catch (error) {

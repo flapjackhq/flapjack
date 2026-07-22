@@ -314,14 +314,24 @@ pub(super) fn execute_search_query(
 
     let effective_params = &prepared.effective_params;
 
-    let default_sort_owned = if sort.is_none() && query_text.trim().is_empty() {
-        Some(Sort::ByField {
-            field: "objectID".to_string(),
-            order: crate::types::SortOrder::Desc,
-        })
-    } else {
-        None
-    };
+    // Empty-query browse defaults to a stable objectID-descending order, but only
+    // when settings define no customRanking: the ranking formula's custom criterion
+    // must decide the order whenever it exists (Algolia parity — sort-dropdown
+    // replica indexes are browsed with an empty query).
+    let has_custom_ranking = resolved
+        .settings
+        .as_ref()
+        .and_then(|s| s.custom_ranking.as_ref())
+        .is_some_and(|cr| !cr.is_empty());
+    let default_sort_owned =
+        if sort.is_none() && query_text.trim().is_empty() && !has_custom_ranking {
+            Some(Sort::ByField {
+                field: "objectID".to_string(),
+                order: crate::types::SortOrder::Desc,
+            })
+        } else {
+            None
+        };
     let effective_sort: Option<&Sort> = sort.or(default_sort_owned.as_ref());
     let parser = build_search_parser(resolved, preprocessed, prepared, opts);
     let (facet_cache_key, facet_result) = lookup_cached_facets(

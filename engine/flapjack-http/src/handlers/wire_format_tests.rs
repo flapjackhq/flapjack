@@ -47,7 +47,7 @@ mod tests {
                 async move {
                     request.extensions_mut().insert(ks_clone);
                     request.extensions_mut().insert(rl_clone);
-                    crate::auth::authenticate_and_authorize(request, next).await
+                    crate::auth::authenticate_and_authorize(request, next, false).await
                 }
             },
         );

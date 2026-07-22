@@ -745,6 +745,8 @@ async fn test_cluster_status_with_peers() {
         NodeConfig {
             node_id: "node-a".to_string(),
             bind_addr: "0.0.0.0:7700".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
             peers: vec![
                 PeerConfig {
                     node_id: "node-b".to_string(),
@@ -757,6 +759,7 @@ async fn test_cluster_status_with_peers() {
             ],
         },
         None,
+        temp.path().to_path_buf(),
     );
 
     let state = make_test_app_state(
@@ -950,6 +953,483 @@ async fn query_index(
     let body = resp.json::<serde_json::Value>().await.unwrap();
     let hits = body.get("nbHits").and_then(|v| v.as_u64()).unwrap_or(0);
     (status, hits, body)
+}
+
+fn authenticated_client(api_key: &str) -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-algolia-api-key",
+        reqwest::header::HeaderValue::from_str(api_key).unwrap(),
+    );
+    headers.insert(
+        "x-algolia-application-id",
+        reqwest::header::HeaderValue::from_static("runtime-membership-test"),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap()
+}
+
+async fn write_unique_document(
+    client: &reqwest::Client,
+    addr: &str,
+    index_name: &str,
+    object_id: &str,
+) -> reqwest::Response {
+    client
+        .post(format!("http://{addr}/1/indexes/{index_name}/batch"))
+        .json(&serde_json::json!({
+            "requests": [{
+                "action": "addObject",
+                "body": { "objectID": object_id, "title": object_id }
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn wait_for_exact_document(
+    client: &reqwest::Client,
+    addr: &str,
+    index_name: &str,
+    object_id: &str,
+) {
+    for _ in 0..200 {
+        let (status, hits, body) = query_index(client, addr, index_name, object_id).await;
+        if status.is_success() && hits == 1 && body["hits"][0]["objectID"] == object_id {
+            return;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for exactly {index_name}/{object_id} on {addr}");
+}
+
+#[tokio::test]
+async fn runtime_manager_add_peer_replicates_new_writes_without_restart() {
+    use flapjack_replication::config::PeerConfig;
+
+    let harness = common::state::spawn_runtime_add_peer_pair().await;
+    assert_eq!(harness.node_a_replication_manager.peer_count(), 0);
+    let receipt = harness
+        .node_a_replication_manager
+        .add_peer(PeerConfig {
+            node_id: "node-b".to_string(),
+            addr: harness.node_b_peer_url.clone(),
+        })
+        .unwrap();
+    assert_eq!(receipt.node_id, "node-b");
+    assert_eq!(receipt.addr, harness.node_b_peer_url);
+    assert_eq!(receipt.peers_total, 1);
+
+    let client = reqwest::Client::new();
+    let response = write_unique_document(
+        &client,
+        &harness.node_a_addr,
+        "runtime-manager-receipt",
+        "manager-added-peer-document",
+    )
+    .await;
+    common::wait_for_response_task(&client, &harness.node_a_addr, response).await;
+    wait_for_exact_document(
+        &client,
+        &harness.node_b_addr,
+        "runtime-manager-receipt",
+        "manager-added-peer-document",
+    )
+    .await;
+}
+
+async fn post_add_peer(
+    client: &reqwest::Client,
+    node_a_addr: &str,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    client
+        .post(format!("http://{node_a_addr}/internal/cluster/peers"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn delete_peer(
+    client: &reqwest::Client,
+    node_a_addr: &str,
+    node_id: &str,
+) -> reqwest::Response {
+    client
+        .delete(format!(
+            "http://{node_a_addr}/internal/cluster/peers/{node_id}"
+        ))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn add_runtime_peer(
+    admin_client: &reqwest::Client,
+    node_a_addr: &str,
+    node_id: &str,
+    peer_url: &str,
+) -> serde_json::Value {
+    let response = post_add_peer(
+        admin_client,
+        node_a_addr,
+        serde_json::json!({
+            "node_id": node_id,
+            "addr": format!("{peer_url}/"),
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    response.json().await.unwrap()
+}
+
+async fn assert_unauthorized_and_invalid_adds_preserve_empty_membership(
+    harness: &common::state::RuntimeAddPeerHarness,
+    admin_client: &reqwest::Client,
+    non_admin_client: &reqwest::Client,
+) {
+    let anonymous_client = reqwest::Client::new();
+    let valid_body = serde_json::json!({
+        "node_id": "node-b",
+        "addr": format!("{}/", harness.node_b_peer_url),
+    });
+    for client in [&anonymous_client, non_admin_client] {
+        let response = post_add_peer(client, &harness.node_a_addr, valid_body.clone()).await;
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        assert_eq!(harness.node_a_replication_manager.peer_count(), 0);
+    }
+
+    for invalid_body in [
+        serde_json::json!({ "node_id": "", "addr": harness.node_b_peer_url }),
+        serde_json::json!({ "node_id": "   ", "addr": harness.node_b_peer_url }),
+        serde_json::json!({ "node_id": "node-b", "addr": "not-a-url" }),
+        serde_json::json!({ "node_id": "node-b", "addr": "http://127.0.0.1:7700" }),
+        serde_json::json!({ "node_id": "node-b", "addr": format!("{}/internal/status", harness.node_b_peer_url) }),
+        serde_json::json!({ "node_id": "node-b", "addr": format!("{}?debug=1", harness.node_b_peer_url) }),
+    ] {
+        let response = post_add_peer(admin_client, &harness.node_a_addr, invalid_body).await;
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(harness.node_a_replication_manager.peer_count(), 0);
+    }
+}
+
+async fn assert_missing_replication_manager_rejected(peer_url: &str) {
+    let (standalone_addr, _standalone_temp_dir) =
+        common::spawn_server_with_key(Some("standalone-admin-key")).await;
+    let standalone_client = authenticated_client("standalone-admin-key");
+    let response = post_add_peer(
+        &standalone_client,
+        &standalone_addr,
+        serde_json::json!({ "node_id": "node-b", "addr": peer_url }),
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let status: serde_json::Value = standalone_client
+        .get(format!("http://{standalone_addr}/internal/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["peer_count"], 0);
+}
+
+#[tokio::test]
+async fn authenticated_http_add_peer_validates_authorizes_and_replicates_without_restart() {
+    let admin_key = "runtime-membership-admin-key";
+    let harness = common::state::spawn_authenticated_runtime_add_peer_pair(admin_key).await;
+    let admin_client = authenticated_client(harness.admin_key.as_deref().unwrap());
+    let non_admin_client = authenticated_client(harness.non_admin_key.as_deref().unwrap());
+    assert_unauthorized_and_invalid_adds_preserve_empty_membership(
+        &harness,
+        &admin_client,
+        &non_admin_client,
+    )
+    .await;
+
+    let valid_body = serde_json::json!({
+        "node_id": "node-b",
+        "addr": format!("{}/", harness.node_b_peer_url),
+    });
+    let response = post_add_peer(&admin_client, &harness.node_a_addr, valid_body.clone()).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let receipt: serde_json::Value = response.json().await.unwrap();
+    let normalized_addr = flapjack_replication::config::NodeConfig::normalize_peer_addr(
+        valid_body["addr"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["node_id"], "node-b");
+    assert_eq!(receipt["addr"], normalized_addr);
+    assert_eq!(receipt["peers_total"], 1);
+    assert_eq!(harness.node_a_replication_manager.peer_count(), 1);
+
+    let status: serde_json::Value = admin_client
+        .get(format!(
+            "http://{}/internal/cluster/status",
+            harness.node_a_addr
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["peers_total"], 1);
+    assert_eq!(
+        status["peers_total"],
+        status["peers"].as_array().unwrap().len()
+    );
+    assert_eq!(status["peers"][0]["peer_id"], "node-b");
+    assert_eq!(status["peers"][0]["addr"], normalized_addr);
+
+    let duplicate = post_add_peer(
+        &admin_client,
+        &harness.node_a_addr,
+        serde_json::json!({
+            "node_id": "node-b",
+            "addr": "http://10.9.8.7:7700",
+        }),
+    )
+    .await;
+    assert_eq!(duplicate.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(harness.node_a_replication_manager.peer_count(), 1);
+
+    let response = write_unique_document(
+        &admin_client,
+        &harness.node_a_addr,
+        "runtime-http-receipt",
+        "http-added-peer-document",
+    )
+    .await;
+    common::wait_for_response_task_authed(
+        &admin_client,
+        &harness.node_a_addr,
+        response,
+        Some(admin_key),
+    )
+    .await;
+    wait_for_exact_document(
+        &admin_client,
+        &harness.node_b_addr,
+        "runtime-http-receipt",
+        "http-added-peer-document",
+    )
+    .await;
+    assert_missing_replication_manager_rejected(&harness.node_b_peer_url).await;
+}
+
+async fn wait_for_peer_cursors(
+    manager: &flapjack_replication::manager::ReplicationManager,
+    tenant: &str,
+    expected_peer_ids: &[&str],
+) {
+    for _ in 0..200 {
+        if let Some(cursors) = manager.get_peer_cursors(tenant) {
+            let has_all_expected = expected_peer_ids.iter().all(|peer_id| {
+                cursors
+                    .get(*peer_id)
+                    .is_some_and(|cursor| cursor.last_acked_seq.is_some())
+            });
+            if has_all_expected && cursors.len() == expected_peer_ids.len() {
+                return;
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    let got = manager
+        .get_peer_cursors(tenant)
+        .map(|cursors| {
+            cursors
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    panic!("timed out waiting for {tenant} cursors {expected_peer_ids:?}; got {got:?}");
+}
+
+async fn cluster_status_peer_ids(
+    client: &reqwest::Client,
+    node_addr: &str,
+) -> (u64, Vec<String>, serde_json::Value) {
+    let status: serde_json::Value = client
+        .get(format!("http://{node_addr}/internal/cluster/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let peers_total = status["peers_total"]
+        .as_u64()
+        .expect("cluster status must include peers_total");
+    let peer_ids = status["peers"]
+        .as_array()
+        .expect("cluster status must include peers")
+        .iter()
+        .map(|peer| {
+            peer["peer_id"]
+                .as_str()
+                .expect("peer status must include peer_id")
+                .to_string()
+        })
+        .collect();
+    (peers_total, peer_ids, status)
+}
+
+async fn assert_remove_peer_forbidden_preserves_membership(
+    harness: &common::state::RuntimeAddPeerHarness,
+    admin_client: &reqwest::Client,
+    non_admin_client: &reqwest::Client,
+) {
+    let anonymous_client = reqwest::Client::new();
+    for client in [&anonymous_client, non_admin_client] {
+        let response = delete_peer(client, &harness.node_a_addr, "node-b").await;
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        assert_eq!(harness.node_a_replication_manager.peer_count(), 2);
+        let (peers_total, peer_ids, _status) =
+            cluster_status_peer_ids(admin_client, &harness.node_a_addr).await;
+        assert_eq!(peers_total, 2);
+        assert!(peer_ids.contains(&"node-b".to_string()));
+        assert!(peer_ids.contains(&"node-c".to_string()));
+    }
+}
+
+#[tokio::test]
+async fn authenticated_http_remove_peer_stops_future_replication_without_restart() {
+    let admin_key = "runtime-membership-remove-admin-key";
+    let harness = common::state::spawn_authenticated_runtime_add_peer_triplet(admin_key).await;
+    let admin_client = authenticated_client(harness.admin_key.as_deref().unwrap());
+    let non_admin_client = authenticated_client(harness.non_admin_key.as_deref().unwrap());
+
+    let node_b_receipt = add_runtime_peer(
+        &admin_client,
+        &harness.node_a_addr,
+        "node-b",
+        &harness.node_b_peer_url,
+    )
+    .await;
+    let node_c_receipt = add_runtime_peer(
+        &admin_client,
+        &harness.node_a_addr,
+        "node-c",
+        harness.node_c_peer_url(),
+    )
+    .await;
+    assert_eq!(node_b_receipt["peers_total"], 1);
+    assert_eq!(node_c_receipt["peers_total"], 2);
+    assert_eq!(harness.node_a_replication_manager.peer_count(), 2);
+
+    assert_remove_peer_forbidden_preserves_membership(&harness, &admin_client, &non_admin_client)
+        .await;
+
+    let seed_tenant = "runtime-http-remove-peer-seed";
+    let seed_response = write_unique_document(
+        &admin_client,
+        &harness.node_a_addr,
+        seed_tenant,
+        "seed-before-remove",
+    )
+    .await;
+    common::wait_for_response_task_authed(
+        &admin_client,
+        &harness.node_a_addr,
+        seed_response,
+        Some(admin_key),
+    )
+    .await;
+    wait_for_exact_document(
+        &admin_client,
+        &harness.node_b_addr,
+        seed_tenant,
+        "seed-before-remove",
+    )
+    .await;
+    wait_for_exact_document(
+        &admin_client,
+        harness.node_c_addr(),
+        seed_tenant,
+        "seed-before-remove",
+    )
+    .await;
+    wait_for_peer_cursors(
+        &harness.node_a_replication_manager,
+        seed_tenant,
+        &["node-b", "node-c"],
+    )
+    .await;
+    assert!(
+        harness.node_b_replicate_request_count() > 0,
+        "seed write must hit removed peer before deletion"
+    );
+    assert!(
+        harness.node_c_replicate_request_count() > 0,
+        "seed write must hit retained peer before deletion"
+    );
+
+    let remove_response = delete_peer(&admin_client, &harness.node_a_addr, "node-b").await;
+    assert_eq!(remove_response.status(), reqwest::StatusCode::OK);
+    let remove_body: serde_json::Value = remove_response.json().await.unwrap();
+    assert_eq!(remove_body["node_id"], "node-b");
+    assert_eq!(remove_body["peers_total"], 1);
+    assert_eq!(harness.node_a_replication_manager.peer_count(), 1);
+
+    let (peers_total, peer_ids, _status) =
+        cluster_status_peer_ids(&admin_client, &harness.node_a_addr).await;
+    assert_eq!(peers_total, 1);
+    assert_eq!(peer_ids, vec!["node-c".to_string()]);
+    let cursors_after_remove = harness
+        .node_a_replication_manager
+        .get_peer_cursors(seed_tenant)
+        .expect("seed cursor map should remain for retained peer");
+    assert!(!cursors_after_remove.contains_key("node-b"));
+    assert!(cursors_after_remove.contains_key("node-c"));
+
+    let removed_peer_count_after_delete = harness.node_b_replicate_request_count();
+    let post_remove_response = write_unique_document(
+        &admin_client,
+        &harness.node_a_addr,
+        seed_tenant,
+        "post-remove-retained-only",
+    )
+    .await;
+    common::wait_for_response_task_authed(
+        &admin_client,
+        &harness.node_a_addr,
+        post_remove_response,
+        Some(admin_key),
+    )
+    .await;
+    wait_for_exact_document(
+        &admin_client,
+        harness.node_c_addr(),
+        seed_tenant,
+        "post-remove-retained-only",
+    )
+    .await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        harness.node_b_replicate_request_count(),
+        removed_peer_count_after_delete,
+        "removed peer must not receive future /internal/replicate requests"
+    );
+    let (_status, removed_hits, removed_body) = query_index(
+        &admin_client,
+        &harness.node_b_addr,
+        seed_tenant,
+        "post-remove-retained-only",
+    )
+    .await;
+    assert_eq!(
+        removed_hits, 0,
+        "removed peer should not receive post-remove document; body={removed_body}"
+    );
 }
 
 async fn get_json(client: &reqwest::Client, url: &str) -> (reqwest::StatusCode, serde_json::Value) {
@@ -1714,12 +2194,15 @@ async fn test_two_node_startup_catchup_via_get_ops() {
         NodeConfig {
             node_id: "node-b".to_string(),
             bind_addr: "0.0.0.0:0".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
             peers: vec![PeerConfig {
                 node_id: "node-a".to_string(),
                 addr: format!("http://{}", addr_a),
             }],
         },
         None,
+        tmp_b.path().to_path_buf(),
     );
 
     let ops = repl_mgr_b
@@ -2143,6 +2626,262 @@ async fn test_restart_restores_snapshot_when_peer_oplog_is_compacted() {
     drop(tmp_b);
 }
 
+/// Fresh-node bootstrap: a never-used replica has committed_seq=0, but if the
+/// peer has already compacted away early document ops, startup recovery must
+/// restore a snapshot instead of applying only retained partial history.
+#[tokio::test]
+async fn test_fresh_node_bootstrap_restores_snapshot_when_peer_oplog_is_compacted() {
+    let client = reqwest::Client::new();
+    let tenant = "fresh_gap_test";
+    let doc_count = 6u64;
+
+    let (addr_a, tmp_a) = common::spawn_server_with_internal("fresh-gap-a").await;
+
+    let resp = client
+        .post(format!("http://{addr_a}/1/indexes/{tenant}/batch"))
+        .json(&serde_json::json!({
+            "requests": (1..=doc_count).map(|i| serde_json::json!({
+                "action": "addObject",
+                "body": {"objectID": format!("fresh-doc-{i}"), "num": i}
+            })).collect::<Vec<_>>()
+        }))
+        .send()
+        .await
+        .unwrap();
+    common::wait_for_response_task(&client, &addr_a, resp).await;
+
+    let oplog_dir = tmp_a.path().join(tenant).join("oplog");
+    let oplog = flapjack::index::oplog::OpLog::open(&oplog_dir, tenant, "fresh-gap-a").unwrap();
+    let oversized_payload = "x".repeat(11 * 1024 * 1024);
+    oplog
+        .append(
+            "noop",
+            serde_json::json!({ "marker": "segment-rotate", "blob": oversized_payload }),
+        )
+        .expect("forcing segment rotation should succeed");
+    for doc_id in 4..=doc_count {
+        oplog
+            .append(
+                "upsert",
+                serde_json::json!({
+                    "body": {
+                        "objectID": format!("fresh-doc-{doc_id}"),
+                        "num": doc_id
+                    }
+                }),
+            )
+            .expect("appending retained duplicate upsert should succeed");
+    }
+
+    let removed_segments = oplog
+        .truncate_before(8)
+        .expect("truncate_before should succeed");
+    assert!(
+        removed_segments > 0,
+        "Expected at least one compacted segment to be removed"
+    );
+    assert_eq!(
+        oplog.oldest_seq(),
+        Some(8),
+        "Node A should retain only seq>=8 after compaction for this test scenario"
+    );
+
+    let tmp_b = TempDir::new().unwrap();
+    assert_eq!(
+        flapjack::index::oplog::read_committed_seq(&tmp_b.path().join(tenant)),
+        0,
+        "fresh node B must start from committed_seq=0 for this bootstrap reproduction"
+    );
+
+    let node_b = common::spawn_replication_node_on_existing_dir(
+        tmp_b.path(),
+        "fresh-gap-b",
+        &format!("http://{addr_a}"),
+        "fresh-gap-a",
+    )
+    .await;
+
+    let query_resp = client
+        .post(format!("http://{}/1/indexes/{tenant}/query", node_b.addr))
+        .json(&serde_json::json!({"query": "", "hitsPerPage": doc_count}))
+        .send()
+        .await
+        .unwrap();
+    let query_status = query_resp.status();
+    let query_body = query_resp.text().await.unwrap();
+    assert!(
+        query_status.is_success(),
+        "fresh-node bootstrap query failed with status {query_status}: {query_body}"
+    );
+    let search_result: serde_json::Value = serde_json::from_str(&query_body).unwrap();
+
+    let actual = search_result["nbHits"].as_u64().unwrap_or(0);
+    let empty_hits = Vec::new();
+    let actual_ids = search_result["hits"]
+        .as_array()
+        .unwrap_or(&empty_hits)
+        .iter()
+        .filter_map(|hit| hit["objectID"].as_str().map(str::to_string))
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected_ids = (1..=doc_count)
+        .map(|i| format!("fresh-doc-{i}"))
+        .collect::<std::collections::BTreeSet<_>>();
+    let missing_ids = expected_ids
+        .difference(&actual_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        actual,
+        doc_count,
+        "fresh-node bootstrap should restore snapshot after peer compaction; actual {actual} < {doc_count}, missing {} docs: {:?}",
+        doc_count.saturating_sub(actual),
+        missing_ids
+    );
+    assert!(
+        missing_ids.is_empty(),
+        "fresh-node bootstrap lost objectIDs after peer compaction: {:?}",
+        missing_ids
+    );
+
+    node_b.stop().await;
+    drop(tmp_a);
+    drop(tmp_b);
+}
+
+/// Fresh-node bootstrap: when peer history still starts at seq 1, a never-used
+/// replica must replay ops and must not require the snapshot endpoint.
+#[tokio::test]
+async fn test_fresh_node_bootstrap_uses_op_replay_when_peer_untruncated() {
+    use axum::{routing::get, Router};
+
+    let client = reqwest::Client::new();
+    let tenant = "fresh_replay_test";
+    let expected_ids = ["replay-doc-1", "replay-doc-2", "replay-doc-3"];
+
+    let mut tmp_a = common::TempDir::new().unwrap();
+    let manager_a = IndexManager::new_with_node_id(tmp_a.path(), "fresh-replay-a");
+    manager_a.create_tenant(tenant).unwrap();
+    manager_a
+        .add_documents_sync(
+            tenant,
+            expected_ids
+                .iter()
+                .enumerate()
+                .map(|(offset, object_id)| {
+                    Document::from_json(&serde_json::json!({
+                        "objectID": object_id,
+                        "title": format!("Replay Seed {}", offset + 1),
+                        "rank": offset + 1
+                    }))
+                    .unwrap()
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+
+    for object_id in expected_ids {
+        assert!(
+            manager_a.get_document(tenant, object_id).unwrap().is_some(),
+            "peer A manager should own seeded document {object_id} before serving"
+        );
+    }
+    let oplog = flapjack::index::oplog::OpLog::open(
+        &tmp_a.path().join(tenant).join("oplog"),
+        tenant,
+        "fresh-replay-a",
+    )
+    .unwrap();
+    assert_eq!(
+        oplog.oldest_seq(),
+        Some(1),
+        "peer A must retain history from the first oplog entry"
+    );
+
+    let state = make_test_app_state(
+        tmp_a.path(),
+        Some(Arc::clone(&manager_a)),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let app = common::apply_test_app_id_layer(
+        Router::new()
+            .merge(flapjack_http::router::build_public_health_routes().with_state(state.clone()))
+            .merge(
+                Router::new()
+                    .route(
+                        "/internal/ops",
+                        get(flapjack_http::handlers::internal::get_ops),
+                    )
+                    .route(
+                        "/internal/tenants",
+                        get(flapjack_http::handlers::internal::list_tenants),
+                    )
+                    .with_state(state),
+            ),
+    );
+    let addr_a = common::spawn_router(app, &mut tmp_a).await;
+
+    let tmp_b = common::TempDir::new().unwrap();
+    assert_eq!(
+        flapjack::index::oplog::read_committed_seq(&tmp_b.path().join(tenant)),
+        0,
+        "fresh node B must start from committed_seq=0 before bootstrap"
+    );
+    let node_b = common::try_spawn_replication_node_on_existing_dir(
+        tmp_b.path(),
+        "fresh-replay-b",
+        &format!("http://{addr_a}"),
+        "fresh-replay-a",
+    )
+    .await
+    .expect("fresh node bootstrap should use op replay without calling the missing snapshot route");
+
+    let node_b_addr = node_b.addr.clone();
+    let query_resp = client
+        .post(format!("http://{node_b_addr}/1/indexes/{tenant}/query"))
+        .json(&serde_json::json!({"query": "", "hitsPerPage": expected_ids.len()}))
+        .send()
+        .await
+        .unwrap();
+    let query_status = query_resp.status();
+    let query_body = query_resp.text().await.unwrap();
+    assert!(
+        query_status.is_success(),
+        "fresh replay bootstrap query failed with status {query_status}: {query_body}"
+    );
+    let search_result: serde_json::Value = serde_json::from_str(&query_body).unwrap();
+    let empty_hits = Vec::new();
+    let actual_ids = search_result["hits"]
+        .as_array()
+        .unwrap_or(&empty_hits)
+        .iter()
+        .filter_map(|hit| hit["objectID"].as_str().map(str::to_string))
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected_ids = expected_ids
+        .into_iter()
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(
+        search_result["nbHits"].as_u64(),
+        Some(expected_ids.len() as u64),
+        "fresh replay bootstrap should expose exactly the seeded document count"
+    );
+    assert_eq!(
+        actual_ids, expected_ids,
+        "fresh replay bootstrap should preserve the exact objectID set"
+    );
+
+    node_b.stop().await;
+    drop(tmp_a);
+    drop(tmp_b);
+}
+
 // ============================================================
 // Phase 4: Analytics Rollup Exchange integration test.
 //
@@ -2335,6 +3074,8 @@ async fn test_run_rollup_broadcast_sends_to_peer() {
     let node_cfg = NodeConfig {
         node_id: "node-a-send".to_string(),
         bind_addr: "127.0.0.1:0".to_string(),
+        advertise_addr: None,
+        bootstrap_peer: None,
         peers: vec![PeerConfig {
             node_id: "node-b-recv".to_string(),
             addr: format!("http://{}", addr_b),
@@ -2411,6 +3152,8 @@ async fn test_rollup_broadcaster_integration_periodic() {
     let node_cfg = NodeConfig {
         node_id: "node-a-periodic".to_string(),
         bind_addr: "127.0.0.1:0".to_string(),
+        advertise_addr: None,
+        bootstrap_peer: None,
         peers: vec![PeerConfig {
             node_id: "node-b-periodic".to_string(),
             addr: format!("http://{}", addr_b),
@@ -2507,12 +3250,15 @@ async fn test_periodic_sync_pulls_missed_ops_from_peer() {
         NodeConfig {
             node_id: "node-b-sync".to_string(),
             bind_addr: "0.0.0.0:0".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
             peers: vec![PeerConfig {
                 node_id: "node-a-sync".to_string(),
                 addr: format!("http://{}", addr_a),
             }],
         },
         None,
+        tmp_b.path().to_path_buf(),
     );
 
     let state_b = make_test_app_state(
@@ -2605,12 +3351,15 @@ async fn test_periodic_sync_catches_up_multiple_tenants() {
         NodeConfig {
             node_id: "node-b-multi".to_string(),
             bind_addr: "0.0.0.0:0".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
             peers: vec![PeerConfig {
                 node_id: "node-a-multi".to_string(),
                 addr: format!("http://{}", addr_a),
             }],
         },
         None,
+        tmp_b.path().to_path_buf(),
     );
 
     let state_b = make_test_app_state(
@@ -2688,12 +3437,15 @@ async fn test_periodic_sync_discovers_peer_only_tenant() {
         NodeConfig {
             node_id: "node-b-peer-only".to_string(),
             bind_addr: "0.0.0.0:0".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
             peers: vec![PeerConfig {
                 node_id: "node-a-peer-only".to_string(),
                 addr: format!("http://{}", addr_a),
             }],
         },
         None,
+        tmp_b.path().to_path_buf(),
     );
 
     let state_b = make_test_app_state(
@@ -2763,12 +3515,15 @@ async fn test_spawn_periodic_sync_fires_within_interval() {
         NodeConfig {
             node_id: "node-b-spawn".to_string(),
             bind_addr: "0.0.0.0:0".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
             peers: vec![PeerConfig {
                 node_id: "node-a-spawn".to_string(),
                 addr: format!("http://{}", addr_a),
             }],
         },
         None,
+        tmp_b.path().to_path_buf(),
     );
 
     let state_b = make_test_app_state(

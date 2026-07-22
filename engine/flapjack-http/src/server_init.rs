@@ -1,6 +1,7 @@
 use crate::analytics_cluster;
 use crate::auth::KeyStore;
 use crate::conversation_store::ConversationStore;
+use crate::handlers::internal::{AddPeerRequest, ClusterStatusResponse};
 use crate::handlers::AppState;
 use crate::middleware::{TrustedProxyMatcher, DEFAULT_TRUSTED_PROXY_CIDRS};
 use crate::notifications::{init_global_notifier, NotificationService};
@@ -12,8 +13,9 @@ use flapjack::dictionaries::manager::DictionaryManager;
 use flapjack::experiments::store::ExperimentStore;
 use flapjack::recommend::RecommendConfig;
 use flapjack::IndexManager;
-use flapjack_replication::config::NodeConfig;
+use flapjack_replication::config::{NodeConfig, PeerConfig};
 use flapjack_replication::manager::ReplicationManager;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -90,6 +92,7 @@ pub(crate) async fn initialize_infrastructure(
     server_config: &ServerConfig,
     data_dir: &Path,
     admin_key: Option<String>,
+    mut node_config: NodeConfig,
 ) -> Result<InfrastructureState, Box<dyn std::error::Error>> {
     let manager = IndexManager::new(data_dir);
     let dictionary_manager = Arc::new(flapjack::dictionaries::manager::DictionaryManager::new(
@@ -97,14 +100,28 @@ pub(crate) async fn initialize_infrastructure(
     ));
     manager.set_dictionary_manager(Arc::clone(&dictionary_manager));
 
-    let node_config =
-        flapjack_replication::config::NodeConfig::load_or_default(Path::new(data_dir));
     log_bind_address_resolution(&node_config, server_config, data_dir);
     let bind_addr = node_config.bind_addr.clone();
 
     let trusted_proxy_matcher = initialize_trusted_proxies()?;
+    let replication_manager = initialize_replication(&node_config, admin_key.clone(), data_dir);
+    if node_config.bootstrap_peer.is_some() {
+        let replication_manager = replication_manager
+            .as_ref()
+            .expect("bootstrap intent must initialize replication manager");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        bootstrap_join_with_client(
+            &client,
+            &mut node_config,
+            replication_manager,
+            admin_key.as_deref(),
+        )
+        .await
+        .map_err(std::io::Error::other)?;
+    }
     initialize_analytics_cluster(&node_config);
-    let replication_manager = initialize_replication(&node_config, admin_key);
     let ssl_manager = initialize_ssl_manager().await;
     let (s3_config, s3_snapshot_interval_secs) = initialize_s3(data_dir, &manager).await;
 
@@ -206,16 +223,170 @@ fn initialize_analytics_cluster(node_config: &NodeConfig) {
 fn initialize_replication(
     node_config: &NodeConfig,
     admin_key: Option<String>,
+    data_dir: &Path,
 ) -> Option<Arc<ReplicationManager>> {
-    if !node_config.peers.is_empty() {
+    if node_config.has_replication_intent() {
         tracing::info!("Replication enabled: {} peers", node_config.peers.len());
-        let repl = ReplicationManager::new(node_config.clone(), admin_key);
+        let repl = ReplicationManager::new(node_config.clone(), admin_key, data_dir.to_path_buf());
         flapjack_replication::set_global_manager(Arc::clone(&repl));
         Some(repl)
     } else {
         tracing::info!("Replication disabled (no peers in node.json)");
         None
     }
+}
+
+fn resolve_advertised_origin(node_config: &NodeConfig) -> Result<String, String> {
+    if let Some(advertise_addr) = node_config.advertise_addr.as_deref() {
+        return NodeConfig::normalize_peer_addr(advertise_addr).ok_or_else(|| {
+            "FLAPJACK_ADVERTISE_ADDR must be a safe non-wildcard HTTP or HTTPS origin".to_string()
+        });
+    }
+
+    let bind_candidate = if node_config.bind_addr.contains("://") {
+        node_config.bind_addr.clone()
+    } else {
+        format!("http://{}", node_config.bind_addr)
+    };
+    NodeConfig::normalize_peer_addr(&bind_candidate).ok_or_else(|| {
+        "bootstrap join requires FLAPJACK_ADVERTISE_ADDR when FLAPJACK_BIND_ADDR is not a safe peer origin"
+            .to_string()
+    })
+}
+
+fn with_bootstrap_auth(
+    request: reqwest::RequestBuilder,
+    admin_key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match admin_key {
+        Some(key) => request
+            .header("x-algolia-api-key", key)
+            .header("x-algolia-application-id", "flapjack-replication"),
+        None => request,
+    }
+}
+
+async fn bootstrap_join_with_client(
+    client: &reqwest::Client,
+    node_config: &mut NodeConfig,
+    replication_manager: &ReplicationManager,
+    admin_key: Option<&str>,
+) -> Result<(), String> {
+    let admin_key = admin_key.ok_or_else(|| {
+        "bootstrap join requires an admin API key because runtime membership mutation is not exposed in no-auth mode"
+            .to_string()
+    })?;
+    let bootstrap_peer = node_config
+        .bootstrap_peer
+        .clone()
+        .ok_or_else(|| "bootstrap peer is not configured".to_string())?;
+    let advertised_origin = resolve_advertised_origin(node_config)?;
+    let add_response = with_bootstrap_auth(
+        client
+            .post(format!("{bootstrap_peer}/internal/cluster/peers"))
+            .json(&AddPeerRequest {
+                node_id: node_config.node_id.clone(),
+                addr: advertised_origin,
+            }),
+        Some(admin_key),
+    )
+    .send()
+    .await
+    .map_err(|error| format!("bootstrap peer registration failed: {error}"))?;
+    if !add_response.status().is_success() {
+        return Err(format!(
+            "bootstrap peer rejected registration with {}",
+            add_response.status()
+        ));
+    }
+
+    let status_response = with_bootstrap_auth(
+        client.get(format!("{bootstrap_peer}/internal/cluster/status")),
+        Some(admin_key),
+    )
+    .send()
+    .await
+    .map_err(|error| format!("bootstrap peer status request failed: {error}"))?;
+    if !status_response.status().is_success() {
+        return Err(format!(
+            "bootstrap peer status request returned {}",
+            status_response.status()
+        ));
+    }
+    let status = status_response
+        .json::<ClusterStatusResponse>()
+        .await
+        .map_err(|error| format!("bootstrap peer returned invalid cluster status: {error}"))?;
+    let peers = merge_bootstrap_membership(node_config, &bootstrap_peer, status)?;
+
+    replication_manager.replace_peers(peers.clone())?;
+    node_config.peers = peers;
+    Ok(())
+}
+
+fn merge_bootstrap_membership(
+    node_config: &NodeConfig,
+    bootstrap_peer: &str,
+    status: ClusterStatusResponse,
+) -> Result<Vec<PeerConfig>, String> {
+    if !status.replication_enabled {
+        return Err("bootstrap peer reported replication disabled".to_string());
+    }
+
+    let mut members = BTreeMap::new();
+    insert_bootstrap_member(
+        &mut members,
+        &node_config.node_id,
+        &status.node_id,
+        bootstrap_peer,
+    )?;
+    for peer in status.peers {
+        let normalized_addr = NodeConfig::normalize_peer_addr(&peer.addr).ok_or_else(|| {
+            format!(
+                "bootstrap status contains unsafe address for '{}': {}",
+                peer.peer_id, peer.addr
+            )
+        })?;
+        insert_bootstrap_member(
+            &mut members,
+            &node_config.node_id,
+            &peer.peer_id,
+            &normalized_addr,
+        )?;
+    }
+    if members.is_empty() {
+        return Err("bootstrap status contains no remote members".to_string());
+    }
+
+    Ok(members
+        .into_iter()
+        .map(|(node_id, addr)| PeerConfig { node_id, addr })
+        .collect())
+}
+
+fn insert_bootstrap_member(
+    members: &mut BTreeMap<String, String>,
+    local_node_id: &str,
+    member_node_id: &str,
+    member_addr: &str,
+) -> Result<(), String> {
+    let member_node_id = member_node_id.trim();
+    if member_node_id.is_empty() {
+        return Err("bootstrap status contains a blank node_id".to_string());
+    }
+    if member_node_id == local_node_id {
+        return Ok(());
+    }
+    if let Some(existing_addr) = members.get(member_node_id) {
+        if existing_addr != member_addr {
+            return Err(format!(
+                "bootstrap status contains conflicting addresses for '{member_node_id}'"
+            ));
+        }
+        return Ok(());
+    }
+    members.insert(member_node_id.to_string(), member_addr.to_string());
+    Ok(())
 }
 
 /// Initializes the SSL/TLS manager from environment configuration.
@@ -372,6 +543,11 @@ pub(crate) fn initialize_state(
         paused_indexes: pause_registry::PausedIndexes::new(),
         geoip_reader: infrastructure.geoip_reader.clone(),
         notification_service: infrastructure.notification_service.clone(),
+        migration_runner: Arc::new(crate::handlers::migration::MigrationJobRunner::new(
+            Arc::clone(&infrastructure.manager),
+            infrastructure.replication_manager.clone(),
+            crate::handlers::migration::DEFAULT_ASYNC_MIGRATION_CAPACITY,
+        )),
         start_time: startup_start,
         conversation_store: ConversationStore::default_shared(),
         embedder_store: Arc::new(crate::embedder_store::EmbedderStore::new()),
@@ -419,6 +595,7 @@ mod tests {
             self.clone()
         }
     }
+
     #[test]
     fn startup_summary_struct_fields_reflect_values() {
         let summary = StartupSummary {
@@ -515,3 +692,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "server_bootstrap_tests.rs"]
+mod bootstrap_tests;

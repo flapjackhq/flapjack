@@ -10,8 +10,32 @@ declare(strict_types=1);
 namespace Flapjack\WordPress\Indexing;
 
 use Flapjack\WordPress\ClientFactory;
+use Flapjack\WordPress\Status\FailureReporter;
+use Flapjack\FlapjackSearch\Exceptions\NotFoundException;
 
 class IndexManager {
+
+    /**
+     * Transient holding the canonical cross-request rebuild state
+     * (the temp index name and its live destination). This is the single
+     * owner of full-reindex temp-index state; BackgroundIndexer keeps only
+     * display/progress fields in its own transient.
+     */
+    public const REBUILD_STATE_TRANSIENT = 'flapjack_reindex_rebuild_state';
+
+    /**
+     * Maximum number of single-post mutations (dirty writes + tombstones) that
+     * may accumulate during a rebuild before publication refuses the move. Past
+     * this bound the temp index is too stale to trust with a cheap replay, so
+     * the rebuild aborts rather than publish a possibly-inconsistent index.
+     */
+    public const MUTATION_LIMIT = 10000;
+
+    /**
+     * Per-request monotonic counter guaranteeing distinct temp-index names for
+     * multiple rebuilds started within the same second in one request.
+     */
+    private static int $rebuild_sequence = 0;
 
     private ClientFactory $client_factory;
 
@@ -43,7 +67,14 @@ class IndexManager {
         $client = $this->client_factory->get_client();
         $index  = $this->client_factory->get_index_name();
 
-        return $client->saveObject( $index, $record );
+        $response = $client->addOrUpdateObject( $index, $record['objectID'], $record );
+
+        // If a full rebuild is in flight, the live write above keeps real-time
+        // search correct; record the ID so publication replays this post's
+        // current state onto the temp index before the atomic move.
+        $this->record_dirty_id( (int) $post->ID );
+
+        return $response;
     }
 
     /**
@@ -57,68 +88,340 @@ class IndexManager {
         $index  = $this->client_factory->get_index_name();
 
         try {
-            return $client->deleteObject( $index, (string) $post_id );
+            $result = $client->deleteObject( $index, (string) $post_id );
+        } catch ( NotFoundException $e ) {
+            // A typed not-found means the object simply isn't in the index —
+            // deletion is idempotent, so this is a success, not a failure. Match
+            // on the exception type rather than substrings in an arbitrary
+            // message, which could swallow unrelated errors that happen to
+            // mention "404" or "not found".
+            $result = [ 'deleted' => true ];
         } catch ( \Throwable $e ) {
-            // Ignore 404 errors — the object may not exist in the index.
-            if ( str_contains( $e->getMessage(), '404' ) || str_contains( $e->getMessage(), 'not found' ) ) {
-                return [ 'deleted' => true ];
-            }
+            // A real delete failure — record it durably before rethrowing so it
+            // stays visible in status/admin instead of vanishing into the
+            // caller's catch block.
+            FailureReporter::record( $e, [
+                'operation'  => 'delete_post',
+                'source'     => 'index_manager',
+                'post_id'    => $post_id,
+                'index_name' => $index,
+            ] );
+
             throw $e;
         }
+
+        // Tombstone the removal so an in-flight rebuild drops this post from the
+        // temp index before publishing, even if its batch had already been built.
+        $this->record_tombstone( $post_id );
+
+        return $result;
     }
 
     /**
-     * Reindex all content. Performs an atomic reindex using a temporary index.
+     * Reindex all content atomically.
+     *
+     * This is the single canonical full-reindex entrypoint for CLI, admin, and
+     * REST callers. It populates a fresh temporary index from current
+     * WordPress content, applies settings to that temp index, and atomically
+     * moves it over the live index via Algolia's operationIndex(move). The
+     * previous live index is only replaced once the rebuild fully succeeds, so
+     * a failure mid-rebuild leaves the existing live index untouched and no
+     * live-index cleanup is attempted. Publication is exact: objects that no
+     * longer exist in WordPress are gone after the move.
      *
      * @return array{total: int, batches: int}
      */
     public function reindex_all(): array {
-        $client     = $this->client_factory->get_client();
-        $index_name = $this->client_factory->get_index_name();
-        $post_types = (array) get_option( 'flapjack_post_types', [ 'post', 'page' ] );
+        $this->begin_rebuild();
 
-        $total   = 0;
-        $batches = 0;
-        $batch   = [];
-        $batch_size = 500;
-
-        $query_args = [
-            'post_type'      => $post_types,
-            'post_status'    => 'publish',
-            'posts_per_page' => $batch_size,
-            'paged'          => 1,
-            'orderby'        => 'ID',
-            'order'          => 'ASC',
-            // Disable Flapjack search interception for this query.
-            'flapjack_bypass' => true,
-        ];
-
-        do {
-            $query = new \WP_Query( $query_args );
-
-            foreach ( $query->posts as $post ) {
-                $batch[] = $this->build_record( $post );
-
-                if ( count( $batch ) >= $batch_size ) {
-                    $client->saveObjects( $index_name, $batch );
-                    $total += count( $batch );
-                    $batches++;
-                    $batch = [];
-                }
-            }
-
-            $query_args['paged']++;
-        } while ( $query_args['paged'] <= $query->max_num_pages );
-
-        // Flush remaining batch.
-        if ( ! empty( $batch ) ) {
-            $client->saveObjects( $index_name, $batch );
-            $total += count( $batch );
-            $batches++;
+        try {
+            $counts = $this->build_temp_index();
+        } catch ( \Throwable $e ) {
+            // Rebuild failed before publication — drop the orphaned temp index
+            // and leave the live index untouched.
+            $this->abort_rebuild();
+            throw $e;
         }
 
-        // Configure index settings.
-        $this->configure_index_settings( $index_name );
+        // publish_rebuild() reconciles mid-build mutations, applies settings, and
+        // performs the atomic move; it self-aborts (temp cleanup) on failure.
+        $this->publish_rebuild();
+
+        return $counts;
+    }
+
+    /**
+     * Begin a cross-request rebuild, persisting the canonical temp-index name
+     * and an empty mid-build mutation log.
+     *
+     * Used by both the synchronous full reindex and background reindexing, where
+     * each batch runs in a separate request. The returned temp index is the
+     * single canonical target for all batches until publish_rebuild() moves it
+     * over the live index. Because the state lives in a shared transient, live
+     * single-post writes from concurrent requests can record dirty IDs and
+     * tombstones against the same rebuild.
+     *
+     * @return string The temporary index name.
+     */
+    public function begin_rebuild(): string {
+        $live_index = $this->client_factory->get_index_name();
+        $temp_index = $this->generate_temp_index_name( $live_index );
+
+        set_transient( self::REBUILD_STATE_TRANSIENT, [
+            'temp_index' => $temp_index,
+            'live_index' => $live_index,
+            'cursor'     => 0,
+            'dirty_ids'  => [],
+            'tombstones' => [],
+            'overflow'   => false,
+        ], HOUR_IN_SECONDS );
+
+        return $temp_index;
+    }
+
+    /**
+     * Enumerate and index the next keyset page of the active rebuild onto its
+     * temp index, advancing the persisted ID cursor.
+     *
+     * This is the single enumeration owner shared by the synchronous full
+     * reindex and cross-request background batches, so both seek by ID (stable
+     * against inserts/deletes mid-build) instead of paging by offset.
+     *
+     * @param int $batch_size
+     * @return array{processed: int, done: bool}
+     */
+    public function index_rebuild_batch( int $batch_size ): array {
+        $state      = $this->get_rebuild_state();
+        $after      = (int) ( $state['cursor'] ?? 0 );
+        $post_types = (array) get_option( 'flapjack_post_types', [ 'post', 'page' ] );
+
+        $posts = $this->query_indexable_posts_after( $post_types, $after, $batch_size );
+        $seen  = count( $posts );
+
+        $records = [];
+        $highest = $after;
+        foreach ( $posts as $post ) {
+            if ( $this->should_index_post( $post ) ) {
+                $records[] = $this->build_record( $post );
+            }
+            // The cursor advances past every enumerated post — including
+            // ineligible ones — so a page of skipped posts still makes progress.
+            $highest = max( $highest, (int) $post->ID );
+        }
+
+        // The keyset cursor must strictly advance while posts remain; otherwise
+        // the query is returning overlapping rows and enumeration is unsound.
+        if ( $seen > 0 && $highest <= $after ) {
+            throw new \RuntimeException( 'Reindex enumeration cursor failed to advance; aborting to avoid an inconsistent index.' );
+        }
+
+        $this->append_records_to_rebuild( $records );
+        $this->advance_rebuild_cursor( $highest );
+
+        return [
+            'processed' => count( $records ),
+            'done'      => $seen < $batch_size,
+        ];
+    }
+
+    /**
+     * Append already-built records to the in-progress rebuild's temp index.
+     *
+     * @param array<int, array<string, mixed>> $records
+     */
+    public function append_records_to_rebuild( array $records ): void {
+        if ( empty( $records ) ) {
+            return;
+        }
+
+        $state = $this->get_rebuild_state();
+        $this->client_factory->get_client()->saveObjects( $state['temp_index'], $records );
+    }
+
+    /**
+     * Publish the in-progress rebuild: reconcile mid-build mutations, apply
+     * settings, then atomically move the temp index over the live index.
+     *
+     * On any failure the temp index is dropped and the live index is left
+     * untouched, so a failed publication never damages the current live data.
+     */
+    public function publish_rebuild(): void {
+        $state = $this->get_rebuild_state();
+
+        try {
+            $this->reconcile_mutations( $state );
+            $this->publish_temp_index( $state['temp_index'], $state['live_index'] );
+        } catch ( \Throwable $e ) {
+            $this->abort_rebuild();
+            throw $e;
+        }
+
+        delete_transient( self::REBUILD_STATE_TRANSIENT );
+    }
+
+    /**
+     * Read and validate the canonical rebuild state.
+     *
+     * Only temp_index and live_index are guaranteed present; the cursor and
+     * mutation buckets are seeded by begin_rebuild and defaulted by readers so
+     * legacy or partially-seeded state stays safe to consume.
+     *
+     * @return array{temp_index: string, live_index: string, cursor?: int, dirty_ids?: int[], tombstones?: int[], overflow?: bool}
+     */
+    private function get_rebuild_state(): array {
+        $state = get_transient( self::REBUILD_STATE_TRANSIENT );
+
+        if ( ! is_array( $state ) || empty( $state['temp_index'] ) || empty( $state['live_index'] ) ) {
+            throw new \RuntimeException( 'No reindex rebuild is in progress.' );
+        }
+
+        return $state;
+    }
+
+    /**
+     * Abort the in-progress rebuild: clear its state and best-effort delete the
+     * orphaned temp index. Cleanup failures are swallowed so they can never mask
+     * the original rebuild error that triggered the abort.
+     */
+    private function abort_rebuild(): void {
+        $state = get_transient( self::REBUILD_STATE_TRANSIENT );
+        delete_transient( self::REBUILD_STATE_TRANSIENT );
+
+        if ( ! is_array( $state ) || empty( $state['temp_index'] ) ) {
+            return;
+        }
+
+        try {
+            $this->client_factory->get_client()->deleteIndex( $state['temp_index'] );
+        } catch ( \Throwable $cleanup_error ) {
+            if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+                error_log( sprintf(
+                    '[Flapjack Search] Failed to clean up temp index %s after a rebuild abort: %s',
+                    $state['temp_index'],
+                    $cleanup_error->getMessage()
+                ) );
+            }
+        }
+    }
+
+    /**
+     * Reconcile single-post mutations recorded while the rebuild ran, replaying
+     * them onto the temp index so the moved index reflects the latest state.
+     *
+     * Refuses to proceed (and thus refuses the move) when the mutation log
+     * overflowed — the temp index is then too stale to trust.
+     *
+     * @param array{temp_index: string, dirty_ids?: int[], tombstones?: int[], overflow?: bool} $state
+     */
+    private function reconcile_mutations( array $state ): void {
+        if ( ! empty( $state['overflow'] ) ) {
+            throw new \RuntimeException( sprintf(
+                'Reindex mutation log overflowed (> %d changes during rebuild); refusing to publish a possibly-inconsistent index.',
+                self::MUTATION_LIMIT
+            ) );
+        }
+
+        $client = $this->client_factory->get_client();
+        $temp   = $state['temp_index'];
+
+        foreach ( $state['dirty_ids'] ?? [] as $post_id ) {
+            $post = get_post( (int) $post_id );
+
+            if ( $post instanceof \WP_Post && $this->should_index_post( $post ) ) {
+                $client->saveObjects( $temp, [ $this->build_record( $post ) ] );
+            } else {
+                // The post was edited into an unindexable state after its batch
+                // was written — remove it from the temp index.
+                $client->deleteObject( $temp, (string) $post_id );
+            }
+        }
+
+        foreach ( $state['tombstones'] ?? [] as $post_id ) {
+            $client->deleteObject( $temp, (string) $post_id );
+        }
+    }
+
+    /**
+     * Record a live post write against an in-flight rebuild so it is replayed
+     * onto the temp index at publication. No-op when no rebuild is active.
+     */
+    private function record_dirty_id( int $post_id ): void {
+        $this->record_mutation( 'dirty_ids', 'tombstones', $post_id );
+    }
+
+    /**
+     * Record a live post removal against an in-flight rebuild so it is dropped
+     * from the temp index at publication. No-op when no rebuild is active.
+     */
+    private function record_tombstone( int $post_id ): void {
+        $this->record_mutation( 'tombstones', 'dirty_ids', $post_id );
+    }
+
+    /**
+     * Move a post ID into one mutation bucket, removing it from the other so the
+     * latest intent wins, and flag overflow once the log exceeds MUTATION_LIMIT.
+     */
+    private function record_mutation( string $add_key, string $remove_key, int $post_id ): void {
+        $state = get_transient( self::REBUILD_STATE_TRANSIENT );
+
+        if ( ! is_array( $state ) || empty( $state['temp_index'] ) ) {
+            // No active rebuild — the live single-post write is the whole story.
+            return;
+        }
+
+        $state[ $remove_key ] = array_values( array_diff( $state[ $remove_key ] ?? [], [ $post_id ] ) );
+
+        $bucket = $state[ $add_key ] ?? [];
+        if ( ! in_array( $post_id, $bucket, true ) ) {
+            $bucket[] = $post_id;
+        }
+        $state[ $add_key ] = $bucket;
+
+        if ( count( $state['dirty_ids'] ) + count( $state['tombstones'] ) > self::MUTATION_LIMIT ) {
+            $state['overflow'] = true;
+        }
+
+        set_transient( self::REBUILD_STATE_TRANSIENT, $state, HOUR_IN_SECONDS );
+    }
+
+    /**
+     * Generate a unique temporary index name for a rebuild.
+     *
+     * Bare time() collides for two rebuilds within the same second. Combining it
+     * with a random component (cross-request uniqueness) and a per-request
+     * monotonic sequence (within-request uniqueness) keeps every temp name
+     * distinct while remaining a pure `<live>_tmp_<digits>` identifier.
+     */
+    private function generate_temp_index_name( string $live_index ): string {
+        self::$rebuild_sequence++;
+
+        return sprintf(
+            '%s_tmp_%d%04d%03d',
+            $live_index,
+            time(),
+            random_int( 0, 9999 ),
+            self::$rebuild_sequence % 1000
+        );
+    }
+
+    /**
+     * Build the whole live store into the rebuild's temp index by draining the
+     * shared keyset enumeration primitive one page at a time.
+     *
+     * @return array{total: int, batches: int}
+     */
+    private function build_temp_index(): array {
+        $total   = 0;
+        $batches = 0;
+
+        do {
+            $result = $this->index_rebuild_batch( 500 );
+
+            if ( $result['processed'] > 0 ) {
+                $total += $result['processed'];
+                $batches++;
+            }
+        } while ( ! $result['done'] );
 
         return [
             'total'   => $total,
@@ -127,72 +430,78 @@ class IndexManager {
     }
 
     /**
-     * Atomic reindex: zero-downtime index swap via temporary index + moveIndex.
-     *
-     * Indexes all content to a temporary index, configures settings on it,
-     * then atomically moves it to replace the live index.
-     *
-     * @return array{total: int, batches: int, tmp_index: string}
+     * Advance the persisted rebuild cursor, re-reading the state first so a
+     * concurrent single-post mutation logged against the same rebuild is not
+     * clobbered by the cursor write.
      */
-    public function reindex_atomic(): array {
-        $client     = $this->client_factory->get_client();
-        $index_name = $this->client_factory->get_index_name();
-        $tmp_index  = $index_name . '_tmp_' . time();
-        $post_types = (array) get_option( 'flapjack_post_types', [ 'post', 'page' ] );
+    private function advance_rebuild_cursor( int $cursor ): void {
+        $state = get_transient( self::REBUILD_STATE_TRANSIENT );
 
-        $total      = 0;
-        $batches    = 0;
-        $batch      = [];
-        $batch_size = 500;
-
-        $query_args = [
-            'post_type'      => $post_types,
-            'post_status'    => 'publish',
-            'posts_per_page' => $batch_size,
-            'paged'          => 1,
-            'orderby'        => 'ID',
-            'order'          => 'ASC',
-            'flapjack_bypass' => true,
-        ];
-
-        do {
-            $query = new \WP_Query( $query_args );
-
-            foreach ( $query->posts as $post ) {
-                $batch[] = $this->build_record( $post );
-
-                if ( count( $batch ) >= $batch_size ) {
-                    $client->saveObjects( $tmp_index, $batch );
-                    $total += count( $batch );
-                    $batches++;
-                    $batch = [];
-                }
-            }
-
-            $query_args['paged']++;
-        } while ( $query_args['paged'] <= $query->max_num_pages );
-
-        // Flush remaining batch.
-        if ( ! empty( $batch ) ) {
-            $client->saveObjects( $tmp_index, $batch );
-            $total += count( $batch );
-            $batches++;
+        if ( ! is_array( $state ) || empty( $state['temp_index'] ) ) {
+            return;
         }
 
-        // Configure index settings on the temporary index.
-        $this->configure_index_settings( $tmp_index );
+        $state['cursor'] = max( (int) ( $state['cursor'] ?? 0 ), $cursor );
+        set_transient( self::REBUILD_STATE_TRANSIENT, $state, HOUR_IN_SECONDS );
+    }
 
-        // Atomic swap: move tmp → live (overwrites the live index).
-        $client->operationIndex( $tmp_index, [
+    /**
+     * Query one keyset page of indexable posts with ID greater than the cursor.
+     *
+     * @param string[] $post_types
+     * @return \WP_Post[]
+     */
+    private function query_indexable_posts_after( array $post_types, int $after, int $batch_size ): array {
+        add_filter( 'posts_where', [ $this, 'restrict_query_to_cursor' ], 10, 2 );
+
+        try {
+            $query = new \WP_Query( [
+                'post_type'         => $post_types,
+                'post_status'       => 'publish',
+                'posts_per_page'    => $batch_size,
+                'orderby'           => 'ID',
+                'order'             => 'ASC',
+                'flapjack_after_id' => $after,
+                // Disable Flapjack search interception for this query.
+                'flapjack_bypass'   => true,
+            ] );
+        } finally {
+            remove_filter( 'posts_where', [ $this, 'restrict_query_to_cursor' ], 10 );
+        }
+
+        return $query->posts;
+    }
+
+    /**
+     * WordPress `posts_where` filter: translate the keyset cursor query var into
+     * a SQL ID boundary so full-reindex enumeration seeks by ID instead of
+     * paging by offset. Only affects queries carrying flapjack_after_id.
+     *
+     * @param string    $where
+     * @param \WP_Query $query
+     */
+    public function restrict_query_to_cursor( string $where, \WP_Query $query ): string {
+        $after = (int) $query->get( 'flapjack_after_id' );
+
+        if ( $after > 0 ) {
+            global $wpdb;
+            $where .= $wpdb->prepare( " AND {$wpdb->posts}.ID > %d", $after );
+        }
+
+        return $where;
+    }
+
+    /**
+     * Apply settings to the temp index, then atomically move it over the live index.
+     */
+    private function publish_temp_index( string $temp_index, string $live_index ): void {
+        $this->configure_index_settings( $temp_index );
+
+        // Atomic swap: move temp → live (overwrites the live index).
+        $this->client_factory->get_client()->operationIndex( $temp_index, [
             'operation'   => 'move',
-            'destination' => $index_name,
+            'destination' => $live_index,
         ] );
-
-        return [
-            'total'     => $total,
-            'batches'   => $batches,
-            'tmp_index' => $tmp_index,
-        ];
     }
 
     /**

@@ -1,4 +1,5 @@
-//! Algolia-compatible usage statistics endpoints (`GET /1/usage/:statistic` and `GET /1/usage/:statistic/:indexName`) that merge persisted historical snapshots with live in-memory counters and return time-series data points.
+//! Algolia-compatible usage statistics endpoints that merge persisted counter
+//! snapshots with current live counter and gauge values.
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -13,7 +14,7 @@ use std::sync::Arc;
 use super::AppState;
 use crate::error_response::json_error_parts;
 use crate::usage_middleware::TenantUsageCounters;
-use crate::usage_persistence::{DailyUsageSnapshot, IndexUsageSnapshot};
+use crate::usage_persistence::{CapturedUsageGauges, DailyUsageSnapshot, IndexUsageSnapshot};
 
 /// All supported Algolia usage statistic names.
 const KNOWN_STATS: &[&str] = &[
@@ -26,7 +27,13 @@ const KNOWN_STATS: &[&str] = &[
     "documents_deleted",
     "queries_operations",
     "multi_queries_operations",
+    "documents_count",
+    "storage_bytes",
 ];
+
+fn is_gauge_stat(stat: &str) -> bool {
+    matches!(stat, "documents_count" | "storage_bytes")
+}
 
 /// Query parameters accepted by all usage endpoints.
 #[derive(Debug, Deserialize)]
@@ -109,7 +116,7 @@ fn snapshot_stat(index_stat: &IndexUsageSnapshot, stat: &str) -> u64 {
     }
 }
 
-/// Aggregate a stat from a daily snapshot, optionally filtered to one index.
+/// Aggregate a counter stat from a daily snapshot, optionally filtered to one index.
 /// Returns `None` when the index filter names an index not present in the snapshot.
 fn snapshot_aggregate(
     snapshot: &DailyUsageSnapshot,
@@ -134,6 +141,34 @@ fn snapshot_aggregate(
     }
 }
 
+/// Aggregate a gauge stat from a daily snapshot using `Option` semantics:
+/// filtered queries return the index's option directly; global queries sum
+/// only present values and return `None` when every index has `None`.
+fn snapshot_aggregate_gauge(
+    snapshot: &DailyUsageSnapshot,
+    stat: &str,
+    index_filter: Option<&str>,
+) -> Option<u64> {
+    match index_filter {
+        Some(idx) => snapshot
+            .indexes
+            .get(idx)
+            .and_then(|s| s.captured_gauges().get(stat)),
+        None => {
+            let values: Vec<u64> = snapshot
+                .indexes
+                .values()
+                .filter_map(|s| s.captured_gauges().get(stat))
+                .collect();
+            if values.is_empty() {
+                None
+            } else {
+                Some(values.into_iter().sum())
+            }
+        }
+    }
+}
+
 /// Aggregate a stat value across all live counters, or for a single index.
 /// Returns `None` when there are no counter entries matching the filter.
 fn aggregate_stat(
@@ -153,6 +188,68 @@ fn aggregate_stat(
     }
 }
 
+#[derive(Clone, Copy)]
+struct LiveUsageValues<'a> {
+    counters: &'a Arc<DashMap<String, TenantUsageCounters>>,
+    gauges: Option<&'a CapturedUsageGauges>,
+}
+
+impl LiveUsageValues<'_> {
+    fn get(&self, stat: &str, index_filter: Option<&str>) -> Option<u64> {
+        if is_gauge_stat(stat) {
+            self.gauges.and_then(|gauges| gauges.get(stat))
+        } else {
+            aggregate_stat(self.counters, stat, index_filter)
+        }
+    }
+}
+
+/// Query a single gauge stat from captured per-index gauge values.
+fn gauge_from_captured(
+    captured: &std::collections::HashMap<String, CapturedUsageGauges>,
+    stat: &str,
+    index_filter: Option<&str>,
+) -> Option<u64> {
+    match index_filter {
+        Some(idx) => captured.get(idx).and_then(|g| g.get(stat)),
+        None => {
+            if captured.is_empty() {
+                return None;
+            }
+            let values: Vec<u64> = captured.values().filter_map(|g| g.get(stat)).collect();
+            if values.is_empty() {
+                None
+            } else {
+                Some(values.into_iter().sum())
+            }
+        }
+    }
+}
+
+/// Compute live gauge values by capturing from IndexManager + MetricsState.
+fn live_gauge_values(
+    state: &Arc<AppState>,
+    stats: &[&str],
+    index_filter: Option<&str>,
+) -> CapturedUsageGauges {
+    let storage_gauges = state
+        .metrics_state
+        .as_ref()
+        .map(|ms| ms.storage_gauges.as_ref());
+    let selection = crate::usage_capture::UsageGaugeSelection::from_statistics(stats);
+    let captured = crate::usage_capture::capture_requested_live_gauges(
+        &state.manager,
+        storage_gauges,
+        selection,
+        index_filter,
+    );
+
+    CapturedUsageGauges {
+        documents_count: gauge_from_captured(&captured, "documents_count", index_filter),
+        storage_bytes: gauge_from_captured(&captured, "storage_bytes", index_filter),
+    }
+}
+
 /// Build the Algolia-shaped usage response, merging historical snapshots with
 /// live in-memory counters.
 ///
@@ -162,17 +259,24 @@ fn aggregate_stat(
 fn build_response_merged(
     stats: &[&str],
     historical: &[(NaiveDate, DailyUsageSnapshot)],
-    live_counters: &Arc<DashMap<String, TenantUsageCounters>>,
+    live_values: LiveUsageValues<'_>,
     include_live: bool,
     index_filter: Option<&str>,
 ) -> serde_json::Value {
     let mut map = serde_json::Map::new();
+    let live_timestamp_ms = include_live.then(|| Utc::now().timestamp_millis());
 
     for stat in stats {
         let mut data_points: Vec<serde_json::Value> = Vec::new();
+        let gauge = is_gauge_stat(stat);
 
         for (date, snapshot) in historical {
-            if let Some(v) = snapshot_aggregate(snapshot, stat, index_filter) {
+            let value = if gauge {
+                snapshot_aggregate_gauge(snapshot, stat, index_filter)
+            } else {
+                snapshot_aggregate(snapshot, stat, index_filter)
+            };
+            if let Some(v) = value {
                 let t = date
                     .and_hms_opt(0, 0, 0)
                     .expect("midnight is always valid")
@@ -183,9 +287,11 @@ fn build_response_merged(
         }
 
         if include_live {
-            if let Some(v) = aggregate_stat(live_counters, stat, index_filter) {
-                let t = Utc::now().timestamp_millis();
-                data_points.push(serde_json::json!({"t": t, "v": v}));
+            if let Some(v) = live_values.get(stat, index_filter) {
+                data_points.push(serde_json::json!({
+                    "t": live_timestamp_ms.expect("live timestamp exists when include_live=true"),
+                    "v": v
+                }));
             }
         }
 
@@ -203,53 +309,88 @@ fn build_response_with_range(
     stats: &[&str],
     params: &UsageParams,
     index_filter: Option<&str>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, HandlerError> {
     let today = Utc::now().date_naive();
 
     let start = NaiveDate::parse_from_str(&params.start_date, "%Y-%m-%d")
         .unwrap_or_else(|_| today - chrono::Duration::days(8));
     let end = NaiveDate::parse_from_str(&params.end_date, "%Y-%m-%d").unwrap_or(today);
+    if start > end {
+        return Ok(build_response_merged(
+            stats,
+            &[],
+            LiveUsageValues {
+                counters: &state.usage_counters,
+                gauges: None,
+            },
+            false,
+            index_filter,
+        ));
+    }
 
     // Load historical snapshots for all completed days in the range.
-    let historical: Vec<(NaiveDate, DailyUsageSnapshot)> =
-        if let Some(persistence) = &state.usage_persistence {
-            // Completed days are strictly before today.
-            let hist_end = if end < today {
-                end
-            } else {
-                match today.pred_opt() {
-                    Some(d) => d,
-                    None => {
-                        return build_response_merged(
-                            stats,
-                            &[],
-                            &state.usage_counters,
-                            true,
-                            index_filter,
-                        )
-                    }
+    let historical: Vec<(NaiveDate, DailyUsageSnapshot)> = if let Some(persistence) =
+        &state.usage_persistence
+    {
+        // Completed days are strictly before today.
+        let hist_end = if end < today {
+            end
+        } else {
+            match today.pred_opt() {
+                Some(d) => d,
+                None => {
+                    let live_gauges = live_gauge_values(state, stats, index_filter);
+                    let live_values = LiveUsageValues {
+                        counters: &state.usage_counters,
+                        gauges: Some(&live_gauges),
+                    };
+                    return Ok(build_response_merged(
+                        stats,
+                        &[],
+                        live_values,
+                        true,
+                        index_filter,
+                    ));
                 }
-            };
-            if start <= hist_end {
-                persistence
-                    .load_date_range(start, hist_end)
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
             }
+        };
+        if start <= hist_end {
+            persistence
+                    .load_date_range(start, hist_end)
+                    .map_err(|error| {
+                        tracing::error!(
+                            "Failed to load usage history (start_date={}, end_date={}, index_filter={:?}): {}",
+                            params.start_date,
+                            params.end_date,
+                            index_filter,
+                            error
+                        );
+                        json_error_parts(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to load usage history".to_string(),
+                        )
+                    })?
         } else {
             Vec::new()
-        };
+        }
+    } else {
+        Vec::new()
+    };
 
     let include_live = end >= today;
+    let live_gauges = include_live.then(|| live_gauge_values(state, stats, index_filter));
+    let live_values = LiveUsageValues {
+        counters: &state.usage_counters,
+        gauges: live_gauges.as_ref(),
+    };
 
-    build_response_merged(
+    Ok(build_response_merged(
         stats,
         &historical,
-        &state.usage_counters,
+        live_values,
         include_live,
         index_filter,
-    )
+    ))
 }
 
 /// `GET /1/usage/:statistic`
@@ -267,7 +408,7 @@ pub async fn usage_global(
     let stats = parse_statistics(&statistic)?;
     Ok(Json(build_response_with_range(
         &state, &stats, &params, None,
-    )))
+    )?))
 }
 
 /// `GET /1/usage/:statistic/:indexName`
@@ -291,7 +432,7 @@ pub async fn usage_per_index(
         &stats,
         &params,
         Some(&index_name),
-    )))
+    )?))
 }
 
 #[cfg(test)]

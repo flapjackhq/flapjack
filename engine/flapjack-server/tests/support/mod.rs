@@ -12,11 +12,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const AUTO_PORT_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const AUTO_PORT_HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
-const FLAPJACK_AMBIENT_ENV_VARS: [&str; 9] = [
+const FLAPJACK_AMBIENT_ENV_VARS: [&str; 10] = [
     "FLAPJACK_ADMIN_KEY",
     "FLAPJACK_NO_AUTH",
     "FLAPJACK_ENV",
     "FLAPJACK_BIND_ADDR",
+    "FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND",
     "FLAPJACK_PORT",
     "FLAPJACK_DATA_DIR",
     "FLAPJACK_IDEMPOTENCY_TTL_SECS",

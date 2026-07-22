@@ -17,6 +17,68 @@ pub fn strip_unordered_prefix(attr: &str) -> &str {
     attr
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankingCriterionToken {
+    Typo,
+    Geo,
+    Words,
+    Filters,
+    Proximity,
+    Attribute,
+    Exact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomRankingDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCustomRankingToken {
+    pub attribute: String,
+    pub direction: CustomRankingDirection,
+}
+
+pub fn classify_ranking_criterion_token(token: &str) -> Option<RankingCriterionToken> {
+    match token {
+        "typo" => Some(RankingCriterionToken::Typo),
+        "geo" => Some(RankingCriterionToken::Geo),
+        "words" => Some(RankingCriterionToken::Words),
+        "filters" => Some(RankingCriterionToken::Filters),
+        "proximity" => Some(RankingCriterionToken::Proximity),
+        "attribute" => Some(RankingCriterionToken::Attribute),
+        "exact" => Some(RankingCriterionToken::Exact),
+        _ => None,
+    }
+}
+
+pub fn is_ranking_criterion_token(token: &str) -> bool {
+    classify_ranking_criterion_token(token).is_some()
+}
+
+pub fn is_known_source_ranking_token(token: &str) -> bool {
+    token == "custom"
+        || is_ranking_criterion_token(token)
+        || parse_custom_ranking_token(token).is_some()
+}
+
+pub fn parse_custom_ranking_token(token: &str) -> Option<ParsedCustomRankingToken> {
+    if let Some(attribute) = token.strip_prefix("desc(") {
+        return Some(ParsedCustomRankingToken {
+            attribute: attribute.trim_end_matches(')').to_string(),
+            direction: CustomRankingDirection::Desc,
+        });
+    }
+    if let Some(attribute) = token.strip_prefix("asc(") {
+        return Some(ParsedCustomRankingToken {
+            attribute: attribute.trim_end_matches(')').to_string(),
+            direction: CustomRankingDirection::Asc,
+        });
+    }
+    None
+}
+
 fn default_hits_per_page() -> u32 {
     20
 }

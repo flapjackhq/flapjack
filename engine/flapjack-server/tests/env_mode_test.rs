@@ -277,8 +277,10 @@ const STARTUP_ASSERT_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[test]
 fn production_mode_rejects_missing_key() {
+    let tmp = TempDir::new("fj_test_prod_missing_key");
     flapjack_cmd()
         .env("FLAPJACK_ENV", "production")
+        .env("FLAPJACK_DATA_DIR", tmp.path())
         .assert()
         .failure()
         .code(1)
@@ -289,9 +291,11 @@ fn production_mode_rejects_missing_key() {
 
 #[test]
 fn production_mode_rejects_short_key() {
+    let tmp = TempDir::new("fj_test_prod_short_key");
     flapjack_cmd()
         .env("FLAPJACK_ENV", "production")
         .env("FLAPJACK_ADMIN_KEY", "tooshort")
+        .env("FLAPJACK_DATA_DIR", tmp.path())
         .assert()
         .failure()
         .code(1)
@@ -327,9 +331,11 @@ fn production_mode_accepts_valid_key() {
 
 #[test]
 fn production_mode_rejects_no_auth() {
+    let tmp = TempDir::new("fj_test_prod_no_auth");
     flapjack_cmd()
         .env("FLAPJACK_ENV", "production")
         .env("FLAPJACK_NO_AUTH", "1")
+        .env("FLAPJACK_DATA_DIR", tmp.path())
         .assert()
         .failure()
         .code(1)

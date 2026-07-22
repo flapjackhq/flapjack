@@ -171,6 +171,34 @@ where
     VcsState { revision, dirty }
 }
 
+pub(crate) fn vcs_invalidation_paths<F>(mut run_git: F) -> Vec<PathBuf>
+where
+    F: FnMut(&[&str]) -> Result<String, String>,
+{
+    let mut paths = Vec::new();
+    if let Ok(head) = run_git(&["rev-parse", "--git-path", "HEAD"]) {
+        push_non_empty_path(&mut paths, head);
+    }
+    if let Ok(symbolic_ref) = run_git(&["symbolic-ref", "-q", "HEAD"]) {
+        let symbolic_ref = symbolic_ref.trim();
+        if !symbolic_ref.is_empty() {
+            if let Ok(ref_path) = run_git(&["rev-parse", "--git-path", symbolic_ref]) {
+                push_non_empty_path(&mut paths, ref_path);
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn push_non_empty_path(paths: &mut Vec<PathBuf>, path: String) {
+    let trimmed = path.trim();
+    if !trimmed.is_empty() {
+        paths.push(PathBuf::from(trimmed));
+    }
+}
+
 pub(crate) fn workspace_digest(workspace_root: &Path) -> io::Result<String> {
     let included_paths = workspace_digest_paths(workspace_root)?;
     let mut hasher = Sha256::new();
@@ -574,6 +602,26 @@ mod tests {
             assert!(error.contains("FLAPJACK_BUILD_REVISION"), "{error}");
             assert!(error.contains("40 hexadecimal"), "{error}");
         }
+    }
+
+    #[test]
+    fn vcs_invalidation_tracks_head_and_active_branch_ref() {
+        let paths = vcs_invalidation_paths(|arguments| match arguments {
+            ["rev-parse", "--git-path", "HEAD"] => Ok(".git/worktrees/stage/HEAD\n".to_owned()),
+            ["symbolic-ref", "-q", "HEAD"] => Ok("refs/heads/main\n".to_owned()),
+            ["rev-parse", "--git-path", "refs/heads/main"] => {
+                Ok(".git/refs/heads/main\n".to_owned())
+            }
+            _ => unreachable!("unexpected Git arguments: {arguments:?}"),
+        });
+
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from(".git/refs/heads/main"),
+                PathBuf::from(".git/worktrees/stage/HEAD"),
+            ]
+        );
     }
 
     #[test]

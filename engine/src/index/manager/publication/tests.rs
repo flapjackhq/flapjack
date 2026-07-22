@@ -1,6 +1,8 @@
 // Stub summary for engine/src/index/manager/publication/tests.rs.
 // Stub summary for engine/src/index/manager/publication/tests.rs.
 // Stub summary for engine/src/index/manager/publication/tests.rs.
+// Stub summary for engine/src/index/manager/publication/tests.rs.
+// Stub summary for engine/src/index/manager/publication/tests.rs.
 /// Stub summary for engine/src/index/manager/publication/tests.rs.
 // Stub summary for engine/src/index/manager/publication/tests.rs.
 // Stub summary for engine/src/index/manager/publication/tests.rs.
@@ -1593,6 +1595,7 @@ fn repair_decision_table_is_total_for_every_phase_and_artifact_evidence() {
         RepairArtifactEvidence::MatchesNew,
         RepairArtifactEvidence::Mismatch,
         RepairArtifactEvidence::Unreadable,
+        RepairArtifactEvidence::Reservation,
     ];
 
     for phase in phases {
@@ -1641,14 +1644,45 @@ fn repair_evidence_is_proven(evidence: RepairEvidence) -> bool {
             | (PublicationPhase::Prepared, New, Old, Missing)
             | (PublicationPhase::Prepared, Missing, Old, Missing)
             | (PublicationPhase::Prepared, Old, Missing, Missing)
+            | (
+                PublicationPhase::Prepared,
+                RepairArtifactEvidence::Reservation,
+                Missing,
+                New,
+            )
+            | (
+                PublicationPhase::Prepared,
+                RepairArtifactEvidence::Reservation,
+                Missing,
+                Missing,
+            )
             | (PublicationPhase::Committed, New, Missing, Missing)
+            | (PublicationPhase::Committed, RepairArtifactEvidence::Mismatch, Missing, Missing)
             | (PublicationPhase::Committed, New, Old, Missing)
             | (PublicationPhase::RolledBack, Old, Missing, Missing)
+            | (PublicationPhase::RolledBack, RepairArtifactEvidence::Mismatch, Missing, Missing)
             | (PublicationPhase::RolledBack, Missing, Missing, Missing)
             | (PublicationPhase::RolledBack, Old, Missing, New)
             | (PublicationPhase::RolledBack, Old, Missing, Old)
+            | (PublicationPhase::RolledBack, Old, Missing, RepairArtifactEvidence::Mismatch)
             | (PublicationPhase::RolledBack, Missing, Missing, New)
             | (PublicationPhase::RolledBack, Missing, Missing, Old)
+            | (PublicationPhase::RolledBack, Missing, Missing, RepairArtifactEvidence::Mismatch)
+            // An empty staging tree recorded against no prior digest. These reach the
+            // same residue Cleanup as their Mismatch counterparts above; only the
+            // classification of the empty tree is sharper.
+            | (
+                PublicationPhase::RolledBack,
+                Old,
+                Missing,
+                RepairArtifactEvidence::Reservation,
+            )
+            | (
+                PublicationPhase::RolledBack,
+                Missing,
+                Missing,
+                RepairArtifactEvidence::Reservation,
+            )
     )
 }
 
@@ -1691,6 +1725,15 @@ fn repair_decision_table_only_allows_digest_proven_mutations() {
             ),
             RepairDecision::None,
         ),
+        (
+            RepairEvidence::valid(
+                PublicationPhase::Committed,
+                RepairArtifactEvidence::Mismatch,
+                RepairArtifactEvidence::Missing,
+                RepairArtifactEvidence::Missing,
+            ),
+            RepairDecision::None,
+        ),
     ];
 
     for (evidence, expected) in cases {
@@ -1712,6 +1755,18 @@ fn repair_decision_table_only_allows_digest_proven_mutations() {
             RepairDecision::Quarantine
         );
     }
+}
+
+#[test]
+fn rolled_back_runtime_mutated_target_without_residue_is_converged() {
+    let evidence = RepairEvidence::valid(
+        PublicationPhase::RolledBack,
+        RepairArtifactEvidence::Mismatch,
+        RepairArtifactEvidence::Missing,
+        RepairArtifactEvidence::Missing,
+    );
+
+    assert_eq!(decide_publication_repair(evidence), RepairDecision::None);
 }
 
 #[test]
@@ -2280,6 +2335,37 @@ fn every_sidecar_rollback_repair_fault_converges() {
         assert!(!fixture.sidecar_backup_dir().exists());
         assert_eq!(fixture.read_journal().phase, PublicationPhase::RolledBack);
     }
+}
+
+#[test]
+fn rolled_back_repair_is_idempotent_on_second_scan() {
+    let (fixture, manifest) = prepared_sidecar_rollback_fixture();
+
+    let first = repair_publication(
+        fixture.base(),
+        fixture.target.clone(),
+        fixture.transaction.clone(),
+        manifest.clone(),
+        &fixture.inventory,
+    )
+    .unwrap();
+    assert_eq!(first, RepairDecision::Rollback);
+    assert_eq!(fixture.read_journal().phase, PublicationPhase::RolledBack);
+
+    let second = repair_publication(
+        fixture.base(),
+        fixture.target.clone(),
+        fixture.transaction.clone(),
+        manifest,
+        &fixture.inventory,
+    )
+    .unwrap();
+    assert_eq!(second, RepairDecision::None);
+    assert_eq!(fixture.read_target_file("index_meta.json"), b"old-meta");
+    assert_eq!(std::fs::read(fixture.sidecar_path()).unwrap(), b"old-sidecar");
+    assert!(!fixture.promoted_sidecar_path().exists());
+    assert!(!fixture.sidecar_backup_dir().exists());
+    assert_eq!(fixture.read_journal().phase, PublicationPhase::RolledBack);
 }
 
 #[test]

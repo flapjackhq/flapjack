@@ -16,6 +16,7 @@ namespace Flapjack\WordPress\Tests\Integration;
 use PHPUnit\Framework\TestCase;
 use PHPUnit\Framework\MockObject\MockObject;
 use Flapjack\FlapjackSearch\Api\SearchClient;
+use Flapjack\FlapjackSearch\Exceptions\NotFoundException;
 use Flapjack\WordPress\ClientFactory;
 use Flapjack\WordPress\Indexing\IndexManager;
 use Flapjack\WordPress\Indexing\PostSyncHooks;
@@ -77,19 +78,23 @@ class PluginIntegrationTest extends TestCase {
         ] );
         $wp_posts_store[1] = $post;
 
-        // 2. Index it — expect saveObject called with correct record.
+        // 2. Index it — expect explicit-ID upsert with correct record.
         $saved_record = null;
         $this->mock_client
             ->expects( $this->once() )
-            ->method( 'saveObject' )
-            ->with( 'wp_posts', $this->callback( function ( $record ) use ( &$saved_record ) {
-                $saved_record = $record;
-                return $record['objectID'] === '1'
-                    && $record['post_title'] === 'Hello World'
-                    && ! empty( $record['post_content'] )
-                    && $record['post_type'] === 'post'
-                    && ! empty( $record['permalink'] );
-            } ) )
+            ->method( 'addOrUpdateObject' )
+            ->with(
+                'wp_posts',
+                '1',
+                $this->callback( function ( $record ) use ( &$saved_record ) {
+                    $saved_record = $record;
+                    return $record['objectID'] === '1'
+                        && $record['post_title'] === 'Hello World'
+                        && ! empty( $record['post_content'] )
+                        && $record['post_type'] === 'post'
+                        && ! empty( $record['permalink'] );
+                } )
+            )
             ->willReturn( [ 'objectID' => '1', 'taskID' => 123 ] );
 
         $this->index_manager->index_post( $post );
@@ -135,11 +140,15 @@ class PluginIntegrationTest extends TestCase {
 
         $this->mock_client
             ->expects( $this->once() )
-            ->method( 'saveObject' )
-            ->with( 'wp_posts', $this->callback( function ( $record ) {
-                return $record['objectID'] === '5'
-                    && $record['post_title'] === 'Auto-synced Post';
-            } ) )
+            ->method( 'addOrUpdateObject' )
+            ->with(
+                'wp_posts',
+                '5',
+                $this->callback( function ( $record ) {
+                    return $record['objectID'] === '5'
+                        && $record['post_title'] === 'Auto-synced Post';
+                } )
+            )
             ->willReturn( [ 'objectID' => '5' ] );
 
         // Wire up PostSyncHooks with the real IndexManager.
@@ -173,10 +182,14 @@ class PluginIntegrationTest extends TestCase {
 
         $this->mock_client
             ->expects( $this->once() )
-            ->method( 'saveObject' )
-            ->with( 'wp_posts', $this->callback( function ( $record ) {
-                return $record['objectID'] === '8';
-            } ) )
+            ->method( 'addOrUpdateObject' )
+            ->with(
+                'wp_posts',
+                '8',
+                $this->callback( function ( $record ) {
+                    return $record['objectID'] === '8';
+                } )
+            )
             ->willReturn( [ 'objectID' => '8' ] );
 
         $sync = new PostSyncHooks( $this->index_manager );
@@ -441,7 +454,7 @@ class PluginIntegrationTest extends TestCase {
     public function test_sync_hooks_catch_api_errors_without_breaking_save(): void {
         // Mock client that always throws.
         $this->mock_client
-            ->method( 'saveObject' )
+            ->method( 'addOrUpdateObject' )
             ->willThrowException( new \RuntimeException( 'API unavailable' ) );
 
         $post = $this->make_post( [ 'ID' => 70, 'post_status' => 'publish' ] );
@@ -455,9 +468,9 @@ class PluginIntegrationTest extends TestCase {
     public function test_delete_post_handles_404_gracefully(): void {
         $this->mock_client
             ->method( 'deleteObject' )
-            ->willThrowException( new \RuntimeException( 'Object not found (404)' ) );
+            ->willThrowException( new NotFoundException( 'Object not found', 404 ) );
 
-        // Should not throw — 404 is handled gracefully.
+        // Should not throw — typed not-found responses are handled gracefully.
         $result = $this->index_manager->delete_post( 999 );
         $this->assertArrayHasKey( 'deleted', $result );
         $this->assertTrue( $result['deleted'] );

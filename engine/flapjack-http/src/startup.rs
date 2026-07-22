@@ -1,6 +1,7 @@
 use axum::http::HeaderValue;
 use fs2::FileExt;
 use std::fs::OpenOptions;
+use std::net::SocketAddr;
 use std::path::Path;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Layer;
@@ -26,12 +27,21 @@ pub enum CorsMode {
 
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
 const MIN_PRODUCTION_ADMIN_KEY_LENGTH: usize = 16;
+pub const NO_AUTH_PUBLIC_BIND_WARNING: &str = "WARNING: FLAPJACK_NO_AUTH is enabled on a non-loopback or hostname bind address because FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND=1; this exposes unauthenticated Flapjack APIs publicly.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupAuthValidationOutcome {
+    Accepted,
+    ExplicitlyAllowedPublicNoAuthBind,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartupAuthValidationError {
     NoAuthInProduction,
     MissingAdminKeyInProduction,
     AdminKeyTooShortInProduction,
+    NoAuthPublicBind { bind_addr: SocketAddr },
+    NoAuthHostnameBind { bind_addr: String },
 }
 
 /// Parse an optional raw string into a `LogFormat`.
@@ -82,7 +92,9 @@ pub fn validate_startup_auth_policy(
     env_mode: &str,
     no_auth: bool,
     raw_admin_key: Option<&str>,
-) -> Result<(), StartupAuthValidationError> {
+    resolved_bind_addr: &str,
+    allow_no_auth_public_bind: bool,
+) -> Result<StartupAuthValidationOutcome, StartupAuthValidationError> {
     if no_auth && env_mode == "production" {
         return Err(StartupAuthValidationError::NoAuthInProduction);
     }
@@ -93,8 +105,91 @@ pub fn validate_startup_auth_policy(
         ("production", Some(key)) if key.len() < MIN_PRODUCTION_ADMIN_KEY_LENGTH => {
             Err(StartupAuthValidationError::AdminKeyTooShortInProduction)
         }
-        _ => Ok(()),
+        _ => validate_development_no_auth_bind(
+            no_auth,
+            resolved_bind_addr,
+            allow_no_auth_public_bind,
+        ),
     }
+}
+
+fn validate_development_no_auth_bind(
+    no_auth: bool,
+    resolved_bind_addr: &str,
+    allow_no_auth_public_bind: bool,
+) -> Result<StartupAuthValidationOutcome, StartupAuthValidationError> {
+    if !no_auth {
+        return Ok(StartupAuthValidationOutcome::Accepted);
+    }
+
+    let bind_addr = match resolved_bind_addr.parse::<SocketAddr>() {
+        Ok(bind_addr) => bind_addr,
+        Err(_) if is_hostname_socket_address(resolved_bind_addr) => {
+            return if allow_no_auth_public_bind {
+                Ok(StartupAuthValidationOutcome::ExplicitlyAllowedPublicNoAuthBind)
+            } else {
+                Err(StartupAuthValidationError::NoAuthHostnameBind {
+                    bind_addr: resolved_bind_addr.to_string(),
+                })
+            };
+        }
+        Err(_) => return Ok(StartupAuthValidationOutcome::Accepted),
+    };
+
+    if bind_addr.ip().is_loopback() {
+        return Ok(StartupAuthValidationOutcome::Accepted);
+    }
+
+    if allow_no_auth_public_bind {
+        Ok(StartupAuthValidationOutcome::ExplicitlyAllowedPublicNoAuthBind)
+    } else {
+        Err(StartupAuthValidationError::NoAuthPublicBind { bind_addr })
+    }
+}
+
+fn is_hostname_socket_address(bind_addr: &str) -> bool {
+    let Some((hostname, port)) = bind_addr.rsplit_once(':') else {
+        return false;
+    };
+    let hostname = hostname.strip_suffix('.').unwrap_or(hostname);
+    !hostname.is_empty()
+        && port.parse::<u16>().is_ok()
+        && hostname.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+pub(crate) fn exit_for_startup_auth_validation_error(error: StartupAuthValidationError) -> ! {
+    match error {
+        StartupAuthValidationError::NoAuthInProduction => {
+            eprintln!("ERROR: --no-auth cannot be used in production mode.");
+        }
+        StartupAuthValidationError::MissingAdminKeyInProduction => {
+            let suggested = generate_hex_key();
+            eprintln!("ERROR: FLAPJACK_ADMIN_KEY is required in production mode.");
+            eprintln!("Suggested key: {}", suggested);
+        }
+        StartupAuthValidationError::AdminKeyTooShortInProduction => {
+            eprintln!(
+                "ERROR: FLAPJACK_ADMIN_KEY must be at least {} characters in production.",
+                MIN_PRODUCTION_ADMIN_KEY_LENGTH
+            );
+        }
+        StartupAuthValidationError::NoAuthPublicBind { bind_addr } => {
+            eprintln!(
+                "ERROR: FLAPJACK_NO_AUTH cannot be used with non-loopback bind address {bind_addr} unless FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND=1 is set."
+            );
+        }
+        StartupAuthValidationError::NoAuthHostnameBind { bind_addr } => {
+            eprintln!(
+                "ERROR: FLAPJACK_NO_AUTH cannot be used with hostname bind address {bind_addr} unless FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND=1 is set."
+            );
+        }
+    }
+    std::process::exit(1);
 }
 
 /// Parse `FLAPJACK_SHUTDOWN_TIMEOUT_SECS`-style values.
@@ -215,6 +310,8 @@ pub(crate) fn log_memory_configuration() {
 pub(crate) struct ServerConfig {
     pub env_mode: String,
     pub no_auth: bool,
+    pub disable_dashboard: bool,
+    pub allow_no_auth_public_bind: bool,
     pub admin_key_env: Option<String>,
     pub data_dir: String,
     pub bind_addr: String,
@@ -222,38 +319,25 @@ pub(crate) struct ServerConfig {
 }
 
 /// Loads startup configuration from environment variables for mode/auth, optional
-/// admin key, data directory, and bind address, then initializes logging and
-/// acquires the per-process data directory lock.
+/// dashboard lockdown, public no-auth bind override, admin key, data directory,
+/// and bind address, then
+/// initializes logging and acquires the per-process data directory lock.
 pub(crate) fn load_server_config() -> ServerConfig {
     let env_mode = std::env::var("FLAPJACK_ENV").unwrap_or_else(|_| "development".into());
     let no_auth = std::env::var("FLAPJACK_NO_AUTH")
         .ok()
         .filter(|value| value == "1")
         .is_some();
+    let disable_dashboard = std::env::var("FLAPJACK_DISABLE_DASHBOARD")
+        .ok()
+        .filter(|value| value == "1")
+        .is_some();
+    let allow_no_auth_public_bind = std::env::var("FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND")
+        .ok()
+        .filter(|value| value == "1")
+        .is_some();
 
     let raw_admin_key_env = std::env::var("FLAPJACK_ADMIN_KEY").ok();
-    if let Err(error) =
-        validate_startup_auth_policy(&env_mode, no_auth, raw_admin_key_env.as_deref())
-    {
-        match error {
-            StartupAuthValidationError::NoAuthInProduction => {
-                eprintln!("ERROR: --no-auth cannot be used in production mode.");
-            }
-            StartupAuthValidationError::MissingAdminKeyInProduction => {
-                let suggested = generate_hex_key();
-                eprintln!("ERROR: FLAPJACK_ADMIN_KEY is required in production mode.");
-                eprintln!("Suggested key: {}", suggested);
-            }
-            StartupAuthValidationError::AdminKeyTooShortInProduction => {
-                eprintln!(
-                    "ERROR: FLAPJACK_ADMIN_KEY must be at least {} characters in production.",
-                    MIN_PRODUCTION_ADMIN_KEY_LENGTH
-                );
-            }
-        }
-        std::process::exit(1);
-    }
-
     let admin_key_env = raw_admin_key_env.as_deref().and_then(normalize_admin_key);
 
     let data_dir = std::env::var("FLAPJACK_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
@@ -271,6 +355,8 @@ pub(crate) fn load_server_config() -> ServerConfig {
     ServerConfig {
         env_mode,
         no_auth,
+        disable_dashboard,
+        allow_no_auth_public_bind,
         admin_key_env,
         data_dir,
         bind_addr,

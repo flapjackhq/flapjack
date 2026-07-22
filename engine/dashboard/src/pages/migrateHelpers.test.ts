@@ -17,9 +17,8 @@ vi.mock('axios', () => ({
 }));
 
 describe('migrateHelpers', () => {
-  const importUnavailableMessage =
-    'Migration import leg is not implemented; no data was written, and this endpoint will not report success it did not perform.';
-  const importUnavailableCode = 'migration_import_unavailable';
+  const upstreamFailureMessage = 'Algolia rejected the supplied credentials.';
+  const upstreamFailureCode = 'algolia_upstream_failure';
 
   it('builds migration request bodies without optional fields unless needed', () => {
     expect(
@@ -58,7 +57,7 @@ describe('migrateHelpers', () => {
     expect(resolveEffectiveTargetIndex('products', 'products-copy')).toBe('products-copy');
   });
 
-  it('formats axios and native errors into user-facing migration messages', () => {
+  it('formats conflict and native errors into user-facing migration messages', () => {
     vi.mocked(axios.isAxiosError).mockReturnValue(true as any);
 
     expect(
@@ -69,51 +68,47 @@ describe('migrateHelpers', () => {
 
     expect(
       getMigrationErrorMessage({
-        response: { status: 502, data: {} },
-      }),
-    ).toBe('Could not connect to Algolia. Check your App ID and API Key.');
-
-    expect(
-      getMigrationErrorMessage({
         response: { status: 500, data: { message: 'Boom' } },
       }),
     ).toBe('Boom');
-
-    expect(
-      getMigrationErrorMessage({
-        response: {
-          status: 503,
-          data: {
-            message: importUnavailableMessage,
-            code: importUnavailableCode,
-          },
-        },
-      }),
-    ).toContain(importUnavailableMessage);
-    expect(
-      getMigrationErrorMessage({
-        response: {
-          status: 503,
-          data: {
-            message: importUnavailableMessage,
-            code: importUnavailableCode,
-          },
-        },
-      }),
-    ).toContain(importUnavailableCode);
 
     vi.mocked(axios.isAxiosError).mockReturnValue(false as any);
     expect(getMigrationErrorMessage(new Error('Plain error'))).toBe('Plain error');
   });
 
-  it('renders the coded migration refusal inside the migration error card', () => {
+  it('passes through a coded nonempty backend error', () => {
+    vi.mocked(axios.isAxiosError).mockReturnValue(true as any);
+
+    expect(
+      getMigrationErrorMessage({
+        response: {
+          status: 502,
+          data: {
+            message: upstreamFailureMessage,
+            code: upstreamFailureCode,
+          },
+        },
+      }),
+    ).toBe(`${upstreamFailureMessage} Code: ${upstreamFailureCode}`);
+  });
+
+  it('uses connection guidance when a 502 response has no backend message', () => {
+    vi.mocked(axios.isAxiosError).mockReturnValue(true as any);
+
+    expect(
+      getMigrationErrorMessage({
+        response: { status: 502, data: {} },
+      }),
+    ).toBe('Could not connect to Algolia. Check your App ID and API Key.');
+  });
+
+  it('renders the upstream failure message inside the migration error card', () => {
     vi.mocked(axios.isAxiosError).mockReturnValue(true as any);
     const errorMessage = getMigrationErrorMessage({
       response: {
-        status: 503,
+        status: 502,
         data: {
-          message: importUnavailableMessage,
-          code: importUnavailableCode,
+          message: upstreamFailureMessage,
         },
       },
     });
@@ -121,8 +116,7 @@ describe('migrateHelpers', () => {
     render(React.createElement(MigrationErrorCard, { errorMessage }));
 
     const errorCard = screen.getByTestId('migration-error-card');
-    expect(errorCard).toHaveTextContent(importUnavailableMessage);
-    expect(errorCard).toHaveTextContent(importUnavailableCode);
+    expect(errorCard).toHaveTextContent(upstreamFailureMessage);
   });
 
   it('maps forbidden index-list failures to the manual-entry guidance', () => {

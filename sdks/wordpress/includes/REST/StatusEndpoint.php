@@ -11,6 +11,7 @@ namespace Flapjack\WordPress\REST;
 
 use Flapjack\WordPress\ClientFactory;
 use Flapjack\WordPress\Indexing\IndexManager;
+use Flapjack\WordPress\Status\FailureReporter;
 
 class StatusEndpoint {
 
@@ -66,6 +67,10 @@ class StatusEndpoint {
             'index'           => $index_stats,
             'wp_post_count'   => $wp_count,
             'indexed_types'   => $post_types,
+            // Reporter-owned latest failure (already sanitized), or null when
+            // none has been recorded. Status consumers must not recompute or
+            // reformat failure state.
+            'last_failure'    => FailureReporter::latest(),
         ], 200 );
     }
 

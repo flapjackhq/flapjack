@@ -32,6 +32,47 @@ Verified separately from the harnesses above:
 - Request correlation (`x-request-id`) is always on and has no env flag.
 - Startup dependency summary logging is always on and has no env flag.
 
+## `flapjack ingest` Beta Operations
+
+`flapjack ingest` is a packaged CLI import path for cron, systemd timers, and
+one-shot backfills. It does not run an embedded server and does not write index
+files directly; every mutation is sent to the authenticated
+`POST /1/indexes/{indexName}/batch` endpoint.
+
+Example cron entry:
+
+```cron
+15 * * * * /usr/local/bin/flapjack ingest --endpoint http://127.0.0.1:7700 --index products --source /var/lib/flapjack/imports/products.ndjson --api-key-file /etc/flapjack/ingest.key --report-json >>/var/log/flapjack-ingest.log 2>&1
+```
+
+Example systemd service:
+
+```ini
+[Service]
+Type=oneshot
+Environment=FLAPJACK_INGEST_API_KEY_FILE=/etc/flapjack/ingest.key
+ExecStart=/usr/local/bin/flapjack ingest --endpoint http://127.0.0.1:7700 --index products --source /var/lib/flapjack/imports/products.ndjson --api-key-file ${FLAPJACK_INGEST_API_KEY_FILE} --report-json
+```
+
+Operational bounds:
+
+- Credential input is explicit: use exactly one of `--api-key-env`,
+  `--api-key-file`, or `--api-key-stdin`. There is no `--api-key` flag.
+- `--batch-size` bounds parser batches and the JSON report's
+  `queue_high_watermark` shows the largest queued envelope size observed.
+- The retry policy is intentionally small: transport failures and HTTP `429` or
+  `503` are retried with a capped `Retry-After`; other `4xx` responses are
+  permanent failures.
+- Reports distinguish `confirmed_committed` from `outcome_unknown`. If
+  `outcome_unknown` is non-zero, inspect/search the destination and rerun the
+  same source with stable `objectID` values. Do not count unknown records as
+  committed.
+- Upsert mode preserves target-only records. Source omissions are not delete
+  propagation; send explicit `_action:"delete"` or `_action:"deleteObject"`
+  records to remove objects.
+- `--mode replace` is currently a typed zero-mutation refusal with
+  `failure_classification:"replace_not_supported"`.
+
 ## Server
 
 | Name | Type / Values | Default | Description |
@@ -51,7 +92,9 @@ Verified separately from the harnesses above:
 | Name | Type / Values | Default | Description |
 |---|---|---|---|
 | `FLAPJACK_NO_AUTH` | `1` to enable | disabled | Explicit auth opt-out for local/dev bootstrap only; production startup rejects it fail-closed. |
+| `FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND` | `1` to enable | disabled | Development-only override that permits `FLAPJACK_NO_AUTH=1` with a resolved non-loopback IP or hostname bind address. Production still rejects no-auth startup. |
 | `FLAPJACK_ADMIN_KEY` | Non-empty string (production requires length `>=16`) | required in production; auto-generated in local dev if missing | Admin API key source for auth bootstrap and rotation. |
+| `FLAPJACK_DISABLE_DASHBOARD` | `1` to enable | disabled | Removes unauthenticated dashboard, Swagger UI, and OpenAPI JSON exposure by not mounting `/dashboard`, `/swagger-ui`, or `/api-docs` routes. |
 
 ## Logging / Observability
 
@@ -80,9 +123,34 @@ Verified separately from the harnesses above:
 | Name | Type / Values | Default | Description |
 |---|---|---|---|
 | `FLAPJACK_NODE_ID` | Non-empty string | hostname fallback | Node identity for replication and cluster status. |
-| `FLAPJACK_PEERS` | Comma-separated `id=addr` pairs | empty | Peer list for mesh replication. |
+| `FLAPJACK_ADVERTISE_ADDR` | HTTP(S) origin | unset | Address this node publishes to peers. A fresh seed node with an advertised address starts replication even when its peer list is empty. |
+| `FLAPJACK_PEERS` | Comma-separated `id=addr` pairs | empty | Static full membership for mesh replication. Use this when the complete peer set is known at startup; it takes precedence over bootstrap join. |
+| `FLAPJACK_BOOTSTRAP_PEER` | HTTP(S) origin | unset | Single running member used by a fresh node to join an HA cluster when no static peer list is configured. |
 | `FLAPJACK_STARTUP_CATCHUP_TIMEOUT_SECS` | Integer seconds | `30` | Startup catch-up timeout before serving. |
 | `FLAPJACK_SYNC_INTERVAL_SECS` | Integer seconds | `60` | Periodic replication catch-up interval. |
+
+Topology source precedence is owned by `NodeConfig::load_or_default`. An
+existing `${FLAPJACK_DATA_DIR}/node.json` wins over topology environment
+variables. Without `node.json`, `FLAPJACK_PEERS` supplies static full
+membership; `FLAPJACK_BOOTSTRAP_PEER` is considered only for a fresh node with
+no static peer list.
+
+Replication addresses are normalized by `NodeConfig::normalize_peer_addr`.
+`FLAPJACK_BOOTSTRAP_PEER`, `FLAPJACK_ADVERTISE_ADDR`, and peer addresses must be
+safe HTTP(S) origins; unsafe loopback, wildcard, metadata, non-HTTP(S), or
+non-origin values are rejected by that owner.
+
+Bootstrap join is fail-loud and requires admin auth. `server_init::bootstrap_join_with_client`
+registers the joining node with a running replication-enabled member via the
+admin-only `/internal/cluster/peers` mutation, fetches cluster status, persists
+the learned membership to `node.json`, and fails startup rather than serving as
+a silent single-node fallback when auth, registration, status, or
+advertised-origin resolution fails.
+
+Runtime membership is restart-durable through the existing `node.json` owner.
+`ReplicationManager::{add_peer,remove_peer,replace_peers}` persist membership
+mutations, and a restarted node reloads peers from `node.json` without requiring
+`FLAPJACK_PEERS` or `FLAPJACK_BOOTSTRAP_PEER`.
 
 ## Analytics
 

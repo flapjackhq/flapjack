@@ -1,6 +1,6 @@
 <?php
 /**
- * End-to-end test against a real Flapjack server.
+ * PHP-layer corroboration against a real Flapjack server using WordPress stubs.
  *
  * Requires a running Flapjack/Meilisearch instance. Set environment variables:
  *   FLAPJACK_TEST_HOST     — e.g. http://localhost:7700
@@ -11,20 +11,23 @@
  *   FLAPJACK_TEST_HOST=http://localhost:7700 \
  *   FLAPJACK_TEST_APP_ID=test_app \
  *   FLAPJACK_TEST_API_KEY=test_key \
- *   vendor/bin/phpunit --testsuite integration --filter FlapjackE2ETest
+ *   vendor/bin/phpunit --testsuite realstack
  *
- * @package Flapjack\WordPress\Tests\Integration
+ * @package Flapjack\WordPress\Tests\RealStack
  */
 
 declare(strict_types=1);
 
-namespace Flapjack\WordPress\Tests\Integration;
+namespace Flapjack\WordPress\Tests\RealStack;
 
 use PHPUnit\Framework\TestCase;
 use Flapjack\WordPress\ClientFactory;
 use Flapjack\WordPress\Indexing\IndexManager;
+use Flapjack\WordPress\Indexing\PostSyncHooks;
 use Flapjack\WordPress\Search\QueryInterceptor;
 use Flapjack\WordPress\REST\SearchEndpoint;
+use Flapjack\WordPress\REST\StatusEndpoint;
+use Flapjack\WordPress\Status\FailureReporter;
 use Flapjack\WordPress\Tests\Traits\MakesTestPosts;
 
 class FlapjackE2ETest extends TestCase {
@@ -41,8 +44,8 @@ class FlapjackE2ETest extends TestCase {
         $api_key = getenv( 'FLAPJACK_TEST_API_KEY' );
 
         if ( empty( $host ) || empty( $app_id ) || empty( $api_key ) ) {
-            $this->markTestSkipped(
-                'E2E tests require FLAPJACK_TEST_HOST, FLAPJACK_TEST_APP_ID, and FLAPJACK_TEST_API_KEY environment variables.'
+            self::fail(
+                'Real-stack tests require FLAPJACK_TEST_HOST, FLAPJACK_TEST_APP_ID, and FLAPJACK_TEST_API_KEY environment variables.'
             );
         }
 
@@ -53,6 +56,7 @@ class FlapjackE2ETest extends TestCase {
 
         update_option( 'flapjack_app_id', $app_id );
         update_option( 'flapjack_api_key', $api_key );
+        update_option( 'flapjack_search_api_key', $api_key );
         update_option( 'flapjack_host', $host );
         update_option( 'flapjack_index_name', $this->test_index );
         update_option( 'flapjack_post_types', [ 'post', 'page' ] );
@@ -147,6 +151,52 @@ class FlapjackE2ETest extends TestCase {
         ] );
 
         $this->assertSame( 5, $search_result['nbHits'] );
+    }
+
+    // ─── Exact-set replacement on full reindex ───────────────
+
+    public function test_full_reindex_exactly_replaces_live_index(): void {
+        global $wp_posts_store;
+
+        // Pre-seed a stale object into the live index that no longer maps to any
+        // WordPress post. A correct atomic reindex must remove it.
+        $client = $this->client_factory->get_client();
+        $client->saveObjects( $this->test_index, [
+            [
+                'objectID'   => '9001',
+                'post_title' => 'Stale Ghost Post',
+                'post_type'  => 'post',
+            ],
+        ] );
+        $this->waitForIndexing();
+
+        // The real WordPress store contains a smaller, exact set.
+        for ( $i = 1; $i <= 2; $i++ ) {
+            $wp_posts_store[ $i ] = $this->make_post( [
+                'ID'           => $i,
+                'post_title'   => "Exact Post {$i}",
+                'post_content' => "Exact-set content for post {$i}.",
+                'post_status'  => 'publish',
+                'post_type'    => 'post',
+            ] );
+        }
+
+        $result = $this->index_manager->reindex_all();
+        $this->assertSame( 2, $result['total'] );
+        $this->waitForIndexing();
+
+        // After atomic publication the live index objectIDs must equal exactly
+        // the rebuilt set — the stale ghost object must be gone.
+        $search = $client->searchSingleIndex( $this->test_index, [
+            'query'       => '',
+            'hitsPerPage' => 100,
+        ] );
+
+        $ids = array_map( static fn( array $hit ) => (string) $hit['objectID'], $search['hits'] );
+        sort( $ids );
+
+        $this->assertSame( [ '1', '2' ], $ids, 'Live index must contain exactly the rebuilt objectIDs after reindex.' );
+        $this->assertSame( 2, $search['nbHits'], 'Stale objects must not survive an atomic full reindex.' );
     }
 
     // ─── Delete from index ───────────────────────────────────
@@ -280,6 +330,64 @@ class FlapjackE2ETest extends TestCase {
         ] );
 
         $this->assertGreaterThanOrEqual( 1, $result['nbHits'], 'Typo-tolerant search should still find the post.' );
+    }
+
+    // ─── Durable failure visibility (unmocked) ───────────────
+
+    public function test_real_sync_failure_is_durably_visible_then_recovers(): void {
+        // Nothing recorded before we induce a failure.
+        $this->assertNull( FailureReporter::latest() );
+
+        // Point the plugin at an unreachable host — a real, unmocked failed
+        // network call, not a stubbed exception.
+        $good_host = get_option( 'flapjack_host' );
+        update_option( 'flapjack_host', 'http://127.0.0.1:1' );
+
+        $failing_factory = new ClientFactory();
+        $failing_manager = new IndexManager( $failing_factory );
+        $hooks           = new PostSyncHooks( $failing_manager, $failing_factory );
+
+        $post = $this->make_post( [
+            'ID'          => 4242,
+            'post_title'  => 'Failure Visibility Post',
+            'post_status' => 'publish',
+            'post_type'   => 'post',
+        ] );
+
+        // Trigger a real sync failure via the publish transition. The hook must
+        // not throw — the failure is swallowed after being recorded durably.
+        $hooks->on_status_transition( 'publish', 'draft', $post );
+
+        // Restore the good host so the visible-surface assertions below read the
+        // real stack again.
+        update_option( 'flapjack_host', $good_host );
+
+        // The durable record holds exact, sanitized fields.
+        $failure = FailureReporter::latest();
+        $this->assertNotNull( $failure, 'A real sync failure must be recorded durably.' );
+        $this->assertSame( 'index_post', $failure['operation'] );
+        $this->assertSame( 'post_sync', $failure['source'] );
+        $this->assertSame( 4242, $failure['post_id'] );
+        $this->assertSame( $this->test_index, $failure['index_name'] );
+        $this->assertIsInt( $failure['occurred_at'] );
+        $this->assertNotSame( '', $failure['message'] );
+
+        // No secret leakage: the admin API key must never appear in the record.
+        $api_key = (string) get_option( 'flapjack_api_key' );
+        $this->assertNotSame( '', $api_key );
+        $this->assertStringNotContainsString( $api_key, $failure['message'] );
+
+        // The same failure is visible through the /status surface operators read,
+        // exposed verbatim (no recompute) once the good host is restored.
+        $status = new StatusEndpoint( $this->client_factory, $this->index_manager );
+        $data   = $status->handle_status( new \WP_REST_Request( 'GET' ) )->get_data();
+        $this->assertSame( $failure, $data['last_failure'] );
+
+        // Recovery: a successful sync against the restored host does not, by
+        // itself, resurrect the good stack's data for the failed post, but the
+        // durable record stays inspectable until explicitly cleared.
+        FailureReporter::clear();
+        $this->assertNull( FailureReporter::latest() );
     }
 
     /**

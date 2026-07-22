@@ -686,35 +686,17 @@ impl ExpectedIndexProjection {
         fixture: &repair_cli_manifest::LiveHttpFixture,
         scenario: &Scenario,
     ) -> std::result::Result<Self, String> {
-        match scenario.visible.object.as_str() {
-            "new-meta" => Ok(Self {
-                index: fixture.target_index.clone(),
-                object_id: fixture.target_object.object_id.clone(),
-                object_body: index_manager_document_body(
-                    &fixture.target_object.body,
-                    &fixture.target_object.object_id,
-                ),
-                query: fixture.target_query.text.clone(),
-                hit_ids: fixture.target_query.ordered_hit_ids.clone(),
-            }),
-            "old-meta" => Ok(Self {
-                index: fixture.target_index.clone(),
-                object_id: "old-widget".to_string(),
-                object_body: serde_json::json!({
-                    "_id": "old-widget",
-                    "objectID": "old-widget",
-                    "title": "legacy waffle iron",
-                    "body": "old repair guide",
-                    "generation": "old"
-                }),
-                query: "legacy".to_string(),
-                hit_ids: vec!["old-widget".to_string()],
-            }),
-            value => Err(format!(
-                "{} has unknown loadable object oracle {value}",
-                scenario.id
-            )),
-        }
+        let projection = fixture.resolve_target_projection(&scenario.id, &scenario.visible)?;
+        Ok(Self {
+            index: fixture.target_index.clone(),
+            object_id: projection.object.object_id.clone(),
+            object_body: index_manager_document_body(
+                &projection.object.body,
+                &projection.object.object_id,
+            ),
+            query: projection.query.text.clone(),
+            hit_ids: projection.query.ordered_hit_ids.clone(),
+        })
     }
 }
 

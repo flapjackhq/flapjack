@@ -5,6 +5,7 @@ node_modules/
 phpstan.neon
 *.log
 .env
+.wp-env.override.json
 .DS_Store
 build/
 dist/

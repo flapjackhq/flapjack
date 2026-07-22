@@ -316,6 +316,8 @@ mod tests {
         let config = NodeConfig {
             node_id: "standalone".to_string(),
             bind_addr: "0.0.0.0:7700".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
             peers: vec![],
         };
         assert!(AnalyticsClusterClient::new(&config).is_none());
@@ -326,6 +328,8 @@ mod tests {
         let config = NodeConfig {
             node_id: "node-a".to_string(),
             bind_addr: "0.0.0.0:7700".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
             peers: vec![PeerConfig {
                 node_id: "node-b".to_string(),
                 addr: "http://node-b:7700".to_string(),

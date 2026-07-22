@@ -1,4 +1,7 @@
 use super::*;
+use crate::handlers::migration::spool::{
+    MigrationDisposition, MigrationPhase, SpoolLimits, SpoolStore,
+};
 use flapjack::index::manager::publication::{
     canonical_tenant_tree_digest, PublicationArtifactManifest, PublicationArtifactManifestEntry,
     PublicationArtifactRoot, PublicationEvent, PublicationGenerationEvidence, PublicationJournal,
@@ -187,4 +190,30 @@ async fn pre_serve_barrier_completes_publication_repair_before_catchup_future() 
         reports[0].action,
         PublicationScanAction::Repaired(RepairDecision::Cleanup)
     );
+}
+
+#[tokio::test]
+async fn pre_serve_barrier_recovers_async_migrations_before_catchup_future() {
+    let temp = TempDir::new().unwrap();
+    let state = crate::test_helpers::TestStateBuilder::new(&temp).build();
+    let spool = SpoolStore::new(&state.manager.base_path, SpoolLimits::default()).unwrap();
+    let job_uuid = uuid::Uuid::new_v4();
+    spool
+        .create_async_migration_admission(job_uuid, "async_before_catchup")
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Exporting)
+        .unwrap();
+
+    run_pre_serve_barrier_with_catchup(&state, async {
+        let phase = spool.read_migration_phase(job_uuid).unwrap();
+        assert_eq!(
+            phase.disposition,
+            MigrationDisposition::Failed,
+            "catch-up must not run until async recovery settles known-safe jobs"
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }

@@ -14,6 +14,7 @@ use PHPUnit\Framework\MockObject\MockObject;
 use Flapjack\WordPress\ClientFactory;
 use Flapjack\WordPress\Indexing\IndexManager;
 use Flapjack\WordPress\REST\StatusEndpoint;
+use Flapjack\WordPress\Status\FailureReporter;
 
 class StatusEndpointTest extends TestCase {
 
@@ -56,6 +57,41 @@ class StatusEndpointTest extends TestCase {
         $this->assertSame( 100, $data['index']['count'] );
         $this->assertContains( 'post', $data['indexed_types'] );
         $this->assertContains( 'page', $data['indexed_types'] );
+    }
+
+    public function test_handle_status_returns_null_last_failure_when_none_recorded(): void {
+        $this->client_factory->method( 'is_configured' )->willReturn( true );
+        $this->index_manager->method( 'get_index_stats' )->willReturn( [
+            'exists' => true, 'count' => 0, 'name' => 'wp_posts',
+        ] );
+
+        $request = new \WP_REST_Request( 'GET' );
+        $data    = $this->endpoint->handle_status( $request )->get_data();
+
+        $this->assertArrayHasKey( 'last_failure', $data );
+        $this->assertNull( $data['last_failure'] );
+    }
+
+    public function test_handle_status_includes_reporter_latest_failure(): void {
+        FailureReporter::record(
+            new \RuntimeException( 'Connection refused' ),
+            [ 'operation' => 'delete_post', 'source' => 'post_sync', 'post_id' => 42, 'index_name' => 'wp_posts' ]
+        );
+
+        $this->client_factory->method( 'is_configured' )->willReturn( true );
+        $this->index_manager->method( 'get_index_stats' )->willReturn( [
+            'exists' => true, 'count' => 0, 'name' => 'wp_posts',
+        ] );
+
+        $request = new \WP_REST_Request( 'GET' );
+        $data    = $this->endpoint->handle_status( $request )->get_data();
+
+        // The endpoint must expose the reporter's record verbatim, not recompute it.
+        $this->assertSame( FailureReporter::latest(), $data['last_failure'] );
+        $this->assertSame( 'delete_post', $data['last_failure']['operation'] );
+        $this->assertSame( 'post_sync', $data['last_failure']['source'] );
+        $this->assertSame( 42, $data['last_failure']['post_id'] );
+        $this->assertSame( 'Connection refused', $data['last_failure']['message'] );
     }
 
     public function test_handle_status_shows_wp_post_count(): void {

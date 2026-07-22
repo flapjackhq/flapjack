@@ -6,17 +6,23 @@ mod translation_bundle;
 mod translation_report;
 #[path = "translation_schema.rs"]
 mod translation_schema;
+#[path = "translation_session.rs"]
+mod translation_session;
 
-use self::translation_bundle::{
-    translate_typed_bundle, TranslationBundle, TypedTranslationFailure,
+pub(super) use self::translation_bundle::ReplicaSettingsTranslation;
+use self::translation_bundle::TypedTranslationFailure;
+use self::translation_report::{hard_entry, warning_entry, ReportCode, ReportResource};
+pub(super) use self::translation_report::{
+    warning_message, TranslationReport, TranslationReportEntry,
 };
-use self::translation_report::{
-    contains_hard_rejection, finalize_report, hard_entry, non_portable_product_entries,
-    source_snapshot_violation_entry, warning_entry, ReportCode, ReportResource, TranslationReport,
-    TranslationReportEntry,
+#[cfg(test)]
+pub(super) use self::translation_session::translate_spool_input;
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(super) use self::translation_session::{
+    translate_accepted_spool_payload, translate_accepted_spool_settings, translate_spool_payload,
+    SettingsTranslationOutcome, SpoolTranslationInput, TranslatedSpoolPayload, TranslationOutcome,
+    TranslationSessionInstrumentation, TranslationStreamError,
 };
-use self::translation_schema::{validate_rule_pages, validate_synonym_pages};
-use super::source_snapshot::SourceSnapshotBuilder;
 use crate::handlers::settings::payload_merge::parse_distinct_value_strict;
 use serde_json::Value;
 
@@ -33,55 +39,6 @@ enum ResourceKind {
     Document,
     Rule,
     Synonym,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct SpoolTranslationInput {
-    pub(super) settings: Value,
-    pub(super) document_pages: Vec<Vec<Value>>,
-    pub(super) rule_pages: Vec<Vec<Value>>,
-    pub(super) synonym_pages: Vec<Vec<Value>>,
-}
-
-#[derive(Debug, Clone)]
-pub(super) enum TranslationOutcome {
-    Translated(Box<TranslatedSpoolPayload>),
-    Rejected(TranslationReport),
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct TranslatedSpoolPayload {
-    pub(super) bundle: TranslationBundle,
-    pub(super) report: TranslationReport,
-}
-
-pub(super) fn translate_spool_payload(input: SpoolTranslationInput) -> TranslationOutcome {
-    let mut entries = non_portable_product_entries();
-    let mut snapshot_builder = SourceSnapshotBuilder::new();
-    snapshot_builder.record_settings(&input.settings);
-
-    validate_settings_payload(&input.settings, &mut entries);
-    validate_source_ids(&input, &mut snapshot_builder, &mut entries);
-    validate_rule_pages(&input.rule_pages, &mut entries);
-    validate_synonym_pages(&input.synonym_pages, &mut entries);
-
-    let typed_bundle = translate_typed_bundle(&input);
-    if let Err(failures) = &typed_bundle {
-        for failure in failures.iter().cloned() {
-            push_typed_failure(&mut entries, failure);
-        }
-    }
-    if contains_hard_rejection(&entries) {
-        return TranslationOutcome::Rejected(finalize_report(entries));
-    }
-
-    match typed_bundle {
-        Ok(bundle) => TranslationOutcome::Translated(Box::new(TranslatedSpoolPayload {
-            bundle,
-            report: finalize_report(entries),
-        })),
-        Err(_) => unreachable!("typed failures always add hard report entries"),
-    }
 }
 
 fn push_typed_failure(entries: &mut Vec<TranslationReportEntry>, failure: TypedTranslationFailure) {
@@ -106,7 +63,10 @@ fn typed_failure_entry(failure: TypedTranslationFailure) -> TranslationReportEnt
     )
 }
 
-fn push_unique_entry(entries: &mut Vec<TranslationReportEntry>, candidate: TranslationReportEntry) {
+pub(super) fn push_unique_entry(
+    entries: &mut Vec<TranslationReportEntry>,
+    candidate: TranslationReportEntry,
+) {
     if !entries.contains(&candidate) {
         entries.push(candidate);
     }
@@ -157,28 +117,6 @@ fn validate_settings_payload(settings: &Value, entries: &mut Vec<TranslationRepo
                 None,
                 "$.distinct",
             ));
-        }
-    }
-}
-
-fn validate_source_ids(
-    input: &SpoolTranslationInput,
-    snapshot_builder: &mut SourceSnapshotBuilder,
-    entries: &mut Vec<TranslationReportEntry>,
-) {
-    for (page_index, page) in input.document_pages.iter().enumerate() {
-        if let Err(violation) = snapshot_builder.record_documents_page(page_index, page) {
-            entries.push(source_snapshot_violation_entry(violation));
-        }
-    }
-    for (page_index, page) in input.rule_pages.iter().enumerate() {
-        if let Err(violation) = snapshot_builder.record_rules_page(page_index, page) {
-            entries.push(source_snapshot_violation_entry(violation));
-        }
-    }
-    for (page_index, page) in input.synonym_pages.iter().enumerate() {
-        if let Err(violation) = snapshot_builder.record_synonyms_page(page_index, page) {
-            entries.push(source_snapshot_violation_entry(violation));
         }
     }
 }
@@ -668,23 +606,6 @@ const fn closed_unknown(resource: ResourceKind) -> CompatibilityRow {
     )
 }
 
-const fn rejected_topology_settings(field: &'static str) -> CompatibilityRow {
-    row(
-        ResourceKind::Settings,
-        SourceMatcher::Field(field),
-        RowSemantics {
-            validation_rule: ValidationRule::RejectClosedSchemaUnknown,
-            target_owner: TargetOwner::TranslationReport,
-            disposition: Disposition::Rejected,
-            warning_code: None,
-            rejection_code: Some(ReportCode::ReplicaTopologyNotMigrated),
-            round_trip: RoundTripOracle::ClassificationOnly,
-            owner_path_precondition: OwnerPathPrecondition::None,
-        },
-        FIELD_PRECEDENCE,
-    )
-}
-
 #[cfg_attr(not(test), allow(dead_code))]
 fn stage1_matrix() -> &'static [CompatibilityRow] {
     STAGE1_MATRIX
@@ -736,9 +657,12 @@ fn resolve_matching_row(
     best.expect("every resolver has an explicit fallback row")
 }
 
+// Algolia standard and virtual replicas both migrate as Flapjack virtual replicas.
+// Flapjack sorts at query time, so a physical replica would duplicate the corpus without benefit.
 static STAGE1_MATRIX: &[CompatibilityRow] = &[
     exact_settings("attributesForFaceting"),
     exact_settings("searchableAttributes"),
+    transformed_settings("attributesToIndex"),
     exact_settings("ranking"),
     exact_settings("customRanking"),
     exact_settings("attributesToRetrieve"),
@@ -783,11 +707,11 @@ static STAGE1_MATRIX: &[CompatibilityRow] = &[
     exact_settings("enableReRanking"),
     exact_settings("disableTypoToleranceOnWords"),
     exact_settings("disableTypoToleranceOnAttributes"),
-    rejected_topology_settings("replicas"),
+    transformed_settings("replicas"),
     exact_settings("numericAttributesForFiltering"),
     transformed_settings("numericAttributesToIndex"),
     persisted_no_behavior_setting("allowCompressionOfIntegerArray"),
-    rejected_topology_settings("relevancyStrictness"),
+    transformed_settings("relevancyStrictness"),
     closed_unknown(ResourceKind::Settings),
     row(
         ResourceKind::Document,

@@ -13,6 +13,8 @@ use PHPUnit\Framework\TestCase;
 use PHPUnit\Framework\MockObject\MockObject;
 use Flapjack\WordPress\ClientFactory;
 use Flapjack\WordPress\Indexing\BackgroundIndexer;
+use Flapjack\WordPress\Indexing\IndexManager;
+use Flapjack\WordPress\Status\FailureReporter;
 use Flapjack\WordPress\Tests\Traits\MakesTestPosts;
 use Flapjack\FlapjackSearch\Api\SearchClient;
 
@@ -38,6 +40,20 @@ class BackgroundIndexerTest extends TestCase {
         // Set default options.
         update_option( 'flapjack_post_types', [ 'post', 'page' ] );
         update_option( 'flapjack_searchable_attrs', [ 'post_title', 'post_content', 'post_excerpt' ] );
+    }
+
+    /**
+     * Seed the canonical IndexManager rebuild state a running background
+     * reindex depends on. start_reindex() normally establishes this; tests that
+     * exercise process_batch() in isolation seed it directly.
+     */
+    private function seed_rebuild_state( string $temp_index = 'wp_posts_tmp_1000' ): string {
+        set_transient( IndexManager::REBUILD_STATE_TRANSIENT, [
+            'temp_index' => $temp_index,
+            'live_index' => 'wp_posts',
+        ], HOUR_IN_SECONDS );
+
+        return $temp_index;
     }
 
     // ─── Constants ────────────────────────────────────────────
@@ -207,6 +223,43 @@ class BackgroundIndexerTest extends TestCase {
         $this->assertLessThanOrEqual( $after, $result['started_at'] );
     }
 
+    public function test_start_reindex_initializes_canonical_rebuild_state(): void {
+        global $wp_posts_store;
+        $wp_posts_store[1] = $this->make_post( [
+            'ID' => 1, 'post_status' => 'publish', 'post_type' => 'post',
+        ] );
+
+        $this->indexer->start_reindex();
+
+        // The temp-index rebuild state is owned by IndexManager, not the
+        // BackgroundIndexer progress transient.
+        $state = get_transient( IndexManager::REBUILD_STATE_TRANSIENT );
+        $this->assertIsArray( $state );
+        $this->assertMatchesRegularExpression( '/^wp_posts_tmp_\d+$/', $state['temp_index'] );
+        $this->assertSame( 'wp_posts', $state['live_index'] );
+    }
+
+    public function test_start_reindex_skips_rebuild_state_for_zero_posts(): void {
+        $this->indexer->start_reindex();
+
+        // No posts means nothing to rebuild — no temp index is created.
+        $this->assertFalse( get_transient( IndexManager::REBUILD_STATE_TRANSIENT ) );
+    }
+
+    public function test_progress_transient_holds_only_display_fields(): void {
+        global $wp_posts_store;
+        $wp_posts_store[1] = $this->make_post( [
+            'ID' => 1, 'post_status' => 'publish', 'post_type' => 'post',
+        ] );
+
+        $this->indexer->start_reindex();
+
+        // The progress transient must not leak temp-index/rebuild ownership.
+        $progress = get_transient( BackgroundIndexer::PROGRESS_TRANSIENT );
+        $this->assertArrayNotHasKey( 'temp_index', $progress );
+        $this->assertArrayNotHasKey( 'live_index', $progress );
+    }
+
     // ─── process_batch ─────────────────────────────────────────
 
     public function test_process_batch_indexes_posts(): void {
@@ -221,7 +274,8 @@ class BackgroundIndexerTest extends TestCase {
             ] );
         }
 
-        // Set up initial progress.
+        // Set up initial progress and canonical rebuild state.
+        $temp = $this->seed_rebuild_state();
         set_transient( BackgroundIndexer::PROGRESS_TRANSIENT, [
             'status'       => 'in_progress',
             'total_posts'  => 3,
@@ -235,11 +289,12 @@ class BackgroundIndexerTest extends TestCase {
             'method'       => 'action_scheduler',
         ] );
 
+        // Batch records go to the temp index, not the live index.
         $this->search_client
             ->expects( $this->once() )
             ->method( 'saveObjects' )
             ->with(
-                'wp_posts',
+                $temp,
                 $this->callback( fn( $records ) => count( $records ) === 3 )
             )
             ->willReturn( [ 'objectIDs' => [ '1', '2', '3' ] ] );
@@ -247,6 +302,16 @@ class BackgroundIndexerTest extends TestCase {
         $this->search_client
             ->method( 'setSettings' )
             ->willReturn( [ 'taskID' => 1 ] );
+
+        // Final batch publishes via an atomic move of the temp index.
+        $this->search_client
+            ->expects( $this->once() )
+            ->method( 'operationIndex' )
+            ->with(
+                $temp,
+                $this->callback( fn( array $p ) => $p['operation'] === 'move' && $p['destination'] === 'wp_posts' )
+            )
+            ->willReturn( [ 'taskID' => 2 ] );
 
         $this->indexer->process_batch( 1 );
 
@@ -260,12 +325,10 @@ class BackgroundIndexerTest extends TestCase {
     public function test_process_batch_schedules_next_batch_when_more_pages(): void {
         global $wp_posts_store, $as_scheduled_actions;
 
-        // Create enough posts to need 2 pages with the test WP_Query.
-        // WP_Query stub uses posts_per_page which defaults to the BATCH_SIZE.
-        // We need more posts than BATCH_SIZE for multiple pages.
-        // Since our WP_Query stub works differently, let's create a
-        // scenario where max_num_pages > current page.
-        for ( $i = 1; $i <= 3; $i++ ) {
+        // A full keyset page (BATCH_SIZE posts) means more remain, so the batch
+        // is non-final: it schedules the next batch and does not publish. Create
+        // one more than a batch so the first page comes back full.
+        for ( $i = 1; $i <= BackgroundIndexer::BATCH_SIZE + 1; $i++ ) {
             $wp_posts_store[ $i ] = $this->make_post( [
                 'ID'          => $i,
                 'post_status' => 'publish',
@@ -273,13 +336,13 @@ class BackgroundIndexerTest extends TestCase {
             ] );
         }
 
-        // Set progress with total_pages > 1 to simulate multi-page scenario.
+        $this->seed_rebuild_state();
         set_transient( BackgroundIndexer::PROGRESS_TRANSIENT, [
             'status'       => 'in_progress',
-            'total_posts'  => 600,
+            'total_posts'  => BackgroundIndexer::BATCH_SIZE + 1,
             'processed'    => 0,
             'current_page' => 1,
-            'total_pages'  => 3,
+            'total_pages'  => 2,
             'batches_done' => 0,
             'started_at'   => time(),
             'completed_at' => null,
@@ -291,6 +354,9 @@ class BackgroundIndexerTest extends TestCase {
             ->method( 'saveObjects' )
             ->willReturn( [ 'objectIDs' => [] ] );
 
+        // A non-final batch must not publish.
+        $this->search_client->expects( $this->never() )->method( 'operationIndex' );
+
         $this->indexer->process_batch( 1 );
 
         // Should have scheduled page 2.
@@ -299,9 +365,10 @@ class BackgroundIndexerTest extends TestCase {
         $last_action = end( $batch_actions );
         $this->assertSame( [ 2 ], $last_action['args'] );
 
-        // Progress should still be in_progress.
+        // The first full batch processed exactly BATCH_SIZE posts.
         $progress = get_transient( BackgroundIndexer::PROGRESS_TRANSIENT );
         $this->assertSame( 'in_progress', $progress['status'] );
+        $this->assertSame( BackgroundIndexer::BATCH_SIZE, $progress['processed'] );
     }
 
     public function test_process_batch_marks_failed_on_exception(): void {
@@ -311,6 +378,7 @@ class BackgroundIndexerTest extends TestCase {
             'ID' => 1, 'post_status' => 'publish', 'post_type' => 'post',
         ] );
 
+        $this->seed_rebuild_state();
         set_transient( BackgroundIndexer::PROGRESS_TRANSIENT, [
             'status'       => 'in_progress',
             'total_posts'  => 1,
@@ -328,11 +396,81 @@ class BackgroundIndexerTest extends TestCase {
             ->method( 'saveObjects' )
             ->willThrowException( new \RuntimeException( 'Connection refused' ) );
 
+        // A failed batch must never publish over the live index.
+        $this->search_client->expects( $this->never() )->method( 'operationIndex' );
+
         $this->indexer->process_batch( 1 );
 
         $progress = get_transient( BackgroundIndexer::PROGRESS_TRANSIENT );
         $this->assertSame( 'failed', $progress['status'] );
         $this->assertSame( 'Connection refused', $progress['error'] );
+    }
+
+    public function test_process_batch_records_failure_through_shared_reporter(): void {
+        $this->start_failing_batch( new \RuntimeException( 'Connection refused' ) );
+
+        $this->indexer->process_batch( 1 );
+
+        $failure = FailureReporter::latest();
+        $this->assertNotNull( $failure );
+        $this->assertSame( 'background_reindex', $failure['source'] );
+        $this->assertSame( 'reindex_batch', $failure['operation'] );
+        $this->assertSame( 'wp_posts', $failure['index_name'] );
+        $this->assertSame( 'Connection refused', $failure['message'] );
+    }
+
+    public function test_process_batch_sanitizes_visible_progress_error(): void {
+        $this->start_failing_batch(
+            new \RuntimeException( 'Upstream rejected api_key=SuperSecretKey123 at host' )
+        );
+
+        $this->indexer->process_batch( 1 );
+
+        $progress = get_transient( BackgroundIndexer::PROGRESS_TRANSIENT );
+        $this->assertStringNotContainsString( 'SuperSecretKey123', $progress['error'] );
+        $this->assertStringContainsString( '[redacted]', $progress['error'] );
+        // The visible progress error must match the reporter's sanitized message.
+        $this->assertSame( FailureReporter::latest()['message'], $progress['error'] );
+    }
+
+    public function test_process_batch_bounds_visible_progress_error(): void {
+        $this->start_failing_batch( new \RuntimeException( str_repeat( 'x', 5000 ) ) );
+
+        $this->indexer->process_batch( 1 );
+
+        $progress = get_transient( BackgroundIndexer::PROGRESS_TRANSIENT );
+        $this->assertLessThanOrEqual( 501, mb_strlen( $progress['error'] ) );
+    }
+
+    /**
+     * Seed a running background reindex whose batch write throws, and assert no
+     * publish happens. Shared by the failure-path tests above.
+     */
+    private function start_failing_batch( \Throwable $error ): void {
+        global $wp_posts_store;
+
+        $wp_posts_store[1] = $this->make_post( [
+            'ID' => 1, 'post_status' => 'publish', 'post_type' => 'post',
+        ] );
+
+        $this->seed_rebuild_state();
+        set_transient( BackgroundIndexer::PROGRESS_TRANSIENT, [
+            'status'       => 'in_progress',
+            'total_posts'  => 1,
+            'processed'    => 0,
+            'current_page' => 1,
+            'total_pages'  => 1,
+            'batches_done' => 0,
+            'started_at'   => time(),
+            'completed_at' => null,
+            'error'        => null,
+            'method'       => 'action_scheduler',
+        ] );
+
+        $this->search_client->method( 'saveObjects' )->willThrowException( $error );
+
+        // A failed batch must never publish over the live index.
+        $this->search_client->expects( $this->never() )->method( 'operationIndex' );
     }
 
     public function test_process_batch_does_nothing_when_not_in_progress(): void {
@@ -356,13 +494,14 @@ class BackgroundIndexerTest extends TestCase {
         $this->indexer->process_batch( 1 );
     }
 
-    public function test_process_batch_configures_index_settings_on_final_batch(): void {
+    public function test_process_batch_publishes_temp_index_on_final_batch(): void {
         global $wp_posts_store;
 
         $wp_posts_store[1] = $this->make_post( [
             'ID' => 1, 'post_status' => 'publish', 'post_type' => 'post',
         ] );
 
+        $temp = $this->seed_rebuild_state();
         set_transient( BackgroundIndexer::PROGRESS_TRANSIENT, [
             'status'       => 'in_progress',
             'total_posts'  => 1,
@@ -380,12 +519,22 @@ class BackgroundIndexerTest extends TestCase {
             ->method( 'saveObjects' )
             ->willReturn( [ 'objectIDs' => [ '1' ] ] );
 
-        // setSettings should be called on the final batch.
+        // Settings are applied to the temp index (not the live index) before the move.
         $this->search_client
             ->expects( $this->once() )
             ->method( 'setSettings' )
-            ->with( 'wp_posts', $this->isType( 'array' ) )
+            ->with( $temp, $this->isType( 'array' ) )
             ->willReturn( [ 'taskID' => 1 ] );
+
+        // The final batch publishes via an atomic move of the temp index over live.
+        $this->search_client
+            ->expects( $this->once() )
+            ->method( 'operationIndex' )
+            ->with(
+                $temp,
+                $this->callback( fn( array $p ) => $p['operation'] === 'move' && $p['destination'] === 'wp_posts' )
+            )
+            ->willReturn( [ 'taskID' => 2 ] );
 
         $this->indexer->process_batch( 1 );
     }
@@ -401,6 +550,7 @@ class BackgroundIndexerTest extends TestCase {
             'ID' => 2, 'post_status' => 'publish', 'post_type' => 'post', 'post_password' => 'secret',
         ] );
 
+        $temp = $this->seed_rebuild_state();
         set_transient( BackgroundIndexer::PROGRESS_TRANSIENT, [
             'status'       => 'in_progress',
             'total_posts'  => 2,
@@ -418,7 +568,7 @@ class BackgroundIndexerTest extends TestCase {
             ->expects( $this->once() )
             ->method( 'saveObjects' )
             ->with(
-                'wp_posts',
+                $temp,
                 $this->callback( fn( $records ) => count( $records ) === 1 && $records[0]['objectID'] === '1' )
             )
             ->willReturn( [ 'objectIDs' => [ '1' ] ] );
@@ -426,6 +576,10 @@ class BackgroundIndexerTest extends TestCase {
         $this->search_client
             ->method( 'setSettings' )
             ->willReturn( [ 'taskID' => 1 ] );
+
+        $this->search_client
+            ->method( 'operationIndex' )
+            ->willReturn( [ 'taskID' => 2 ] );
 
         $this->indexer->process_batch( 1 );
 
@@ -435,6 +589,7 @@ class BackgroundIndexerTest extends TestCase {
 
     public function test_process_batch_handles_empty_page_gracefully(): void {
         // No posts in store but progress says there should be.
+        $this->seed_rebuild_state();
         set_transient( BackgroundIndexer::PROGRESS_TRANSIENT, [
             'status'       => 'in_progress',
             'total_posts'  => 0,
@@ -456,6 +611,12 @@ class BackgroundIndexerTest extends TestCase {
         $this->search_client
             ->method( 'setSettings' )
             ->willReturn( [ 'taskID' => 1 ] );
+
+        // The final batch still publishes the (empty) temp index over live.
+        $this->search_client
+            ->expects( $this->once() )
+            ->method( 'operationIndex' )
+            ->willReturn( [ 'taskID' => 2 ] );
 
         $this->indexer->process_batch( 1 );
 
@@ -558,8 +719,11 @@ class BackgroundIndexerTest extends TestCase {
         $this->search_client
             ->method( 'setSettings' )
             ->willReturn( [ 'taskID' => 1 ] );
+        $this->search_client
+            ->method( 'operationIndex' )
+            ->willReturn( [ 'taskID' => 2 ] );
 
-        // Start reindex.
+        // Start reindex — this establishes the canonical rebuild state.
         $result = $this->indexer->start_reindex();
         $this->assertSame( 'in_progress', $result['status'] );
         $this->assertSame( 3, $result['total_posts'] );

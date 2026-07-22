@@ -1,12 +1,17 @@
 use super::super::executor;
 use super::*;
 use crate::analytics::AnalyticsConfig;
+use crate::query::highlighter::{HighlightValue, Highlighter};
 use crate::query_suggestions::QsConfigStore;
+use crate::types::Document;
+use serde::de::{DeserializeOwned, MapAccess, Visitor};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 const SCENARIO_MANIFEST: &str = "tests/publication_repair_cli_scenarios.json";
 const ABSENT: &str = "absent";
+const EMPTY_DIRECTORY_ARTIFACT_DIGEST: &str =
+    "sha256:e011514ddc502d6a524ab78a2a453c263c1c8a3f097c5e3b1bda72b93ed8a140";
 
 pub(super) const SUPPORTED_MUTATIONS: [&str; 3] = [
     "corrupt_journal",
@@ -113,9 +118,16 @@ pub(super) struct LiveHttpFixture {
     pub(super) target_index: String,
     pub(super) control_index: String,
     pub(super) target_object: LiveHttpObject,
+    pub(super) old_target_object: LiveHttpObject,
     pub(super) control_object: LiveHttpObject,
     pub(super) target_query: LiveHttpQuery,
+    pub(super) old_target_query: LiveHttpQuery,
     pub(super) control_query: LiveHttpQuery,
+    #[serde(deserialize_with = "deserialize_unique_btree_map")]
+    pub(super) surface_statuses: BTreeMap<String, LiveHttpSurfaceStatus>,
+    #[serde(deserialize_with = "deserialize_unique_btree_map")]
+    pub(super) target_projections: BTreeMap<String, LiveHttpTargetProjection>,
+    #[serde(deserialize_with = "deserialize_unique_btree_map")]
     pub(super) expectations: BTreeMap<String, LiveHttpVisibility>,
 }
 
@@ -123,6 +135,12 @@ pub(super) struct LiveHttpFixture {
 pub(super) struct LiveHttpObject {
     pub(super) object_id: String,
     pub(super) body: serde_json::Value,
+    /// Exact `_highlightResult` leaf value strings the production highlighter renders
+    /// for `body`, keyed by highlight path. The live helper and its fake server read
+    /// these instead of re-deriving them, because Rust's `f64` Display cannot be
+    /// reproduced in Python without reimplementing its shortest-round-trip algorithm.
+    #[serde(deserialize_with = "deserialize_unique_btree_map")]
+    pub(super) expected_highlight: BTreeMap<String, String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -132,10 +150,89 @@ pub(super) struct LiveHttpQuery {
 }
 
 #[derive(Debug, serde::Deserialize)]
+pub(super) struct LiveHttpTargetProjection {
+    pub(super) object: String,
+    pub(super) query: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
 pub(super) struct LiveHttpVisibility {
     pub(super) target: String,
     pub(super) object: String,
     pub(super) search: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct LiveHttpSurfaceStatus {
+    pub(super) status: u16,
+    pub(super) body: serde_json::Value,
+}
+
+pub(super) struct LiveHttpResolvedTargetProjection<'a> {
+    pub(super) object: &'a LiveHttpObject,
+    pub(super) query: &'a LiveHttpQuery,
+}
+
+impl LiveHttpFixture {
+    pub(super) fn resolve_target_projection(
+        &self,
+        scenario_id: &str,
+        visible: &VisibleOracle,
+    ) -> std::result::Result<LiveHttpResolvedTargetProjection<'_>, String> {
+        if visible.search != "loadable" {
+            return Err(format!(
+                "{scenario_id} visible.search {} is not a loadable target projection",
+                visible.search
+            ));
+        }
+        if visible.target != self.target_index {
+            return Err(format!(
+                "{scenario_id} loadable target {} did not match fixture target {}",
+                visible.target, self.target_index
+            ));
+        }
+        let projection = self
+            .target_projections
+            .get(&visible.object)
+            .ok_or_else(|| {
+                format!(
+                    "{scenario_id} has unknown loadable object projection {}",
+                    visible.object
+                )
+            })?;
+        Ok(LiveHttpResolvedTargetProjection {
+            object: self.object_fixture(&projection.object).ok_or_else(|| {
+                format!(
+                    "target projection {} references unknown object fixture {}",
+                    visible.object, projection.object
+                )
+            })?,
+            query: self.query_fixture(&projection.query).ok_or_else(|| {
+                format!(
+                    "target projection {} references unknown query fixture {}",
+                    visible.object, projection.query
+                )
+            })?,
+        })
+    }
+
+    fn object_fixture(&self, key: &str) -> Option<&LiveHttpObject> {
+        match key {
+            "target_object" => Some(&self.target_object),
+            "old_target_object" => Some(&self.old_target_object),
+            "control_object" => Some(&self.control_object),
+            _ => None,
+        }
+    }
+
+    fn query_fixture(&self, key: &str) -> Option<&LiveHttpQuery> {
+        match key {
+            "target_query" => Some(&self.target_query),
+            "old_target_query" => Some(&self.old_target_query),
+            "control_query" => Some(&self.control_query),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -168,6 +265,7 @@ impl ScenarioManifest {
 
         for scenario in &self.scenarios {
             validate_common_oracles(scenario);
+            validate_scenario_live_http_projection(scenario, &self.live_http_fixture);
             match scenario.kind {
                 ScenarioKind::Base => validate_base_scenario(scenario),
                 ScenarioKind::Mutation => {
@@ -459,7 +557,11 @@ fn assert_sidecar_observed_digest(
     let Some(actual) = values.get(field).map(String::as_str) else {
         return Err(format!("{} missing {name}.{field}", scenario.id));
     };
-    if actual == ABSENT || actual == source.old || actual == source.new {
+    if actual == ABSENT
+        || actual == source.old
+        || actual == source.new
+        || actual == EMPTY_DIRECTORY_ARTIFACT_DIGEST
+    {
         return Ok(());
     }
     Err(format!(
@@ -667,13 +769,21 @@ fn validate_live_http_fixture(fixture: &LiveHttpFixture) {
         "live_http_fixture target/control indexes must be distinct"
     );
     validate_live_http_object("target_object", &fixture.target_object);
+    validate_live_http_object("old_target_object", &fixture.old_target_object);
     validate_live_http_object("control_object", &fixture.control_object);
     validate_live_http_query("target_query", &fixture.target_query, &fixture.target_object);
+    validate_live_http_query(
+        "old_target_query",
+        &fixture.old_target_query,
+        &fixture.old_target_object,
+    );
     validate_live_http_query(
         "control_query",
         &fixture.control_query,
         &fixture.control_object,
     );
+    validate_live_http_surface_statuses(fixture);
+    validate_live_http_target_projections(fixture);
 
     let expected_keys = ["target_absent", "target_present", "target_unavailable", "control_present"]
         .into_iter()
@@ -692,6 +802,93 @@ fn validate_live_http_fixture(fixture: &LiveHttpFixture) {
     }
 }
 
+fn validate_live_http_target_projections(fixture: &LiveHttpFixture) {
+    let expected_keys = ["new-meta", "old-meta"].into_iter().collect::<BTreeSet<_>>();
+    let actual_keys = fixture
+        .target_projections
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual_keys, expected_keys,
+        "live_http_fixture target_projections must be closed over known keys"
+    );
+    for (key, projection) in &fixture.target_projections {
+        let visible = VisibleOracle {
+            target: fixture.target_index.clone(),
+            object: key.clone(),
+            search: "loadable".to_string(),
+        };
+        let resolved = fixture
+            .resolve_target_projection("live_http_fixture", &visible)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            resolved
+                .query
+                .ordered_hit_ids
+                .iter()
+                .any(|hit| hit == &resolved.object.object_id),
+            "live_http_fixture target_projections.{key} query must include its object"
+        );
+        match key.as_str() {
+            "new-meta" => {
+                assert_eq!(projection.object, "target_object");
+                assert_eq!(projection.query, "target_query");
+            }
+            "old-meta" => {
+                assert_eq!(projection.object, "old_target_object");
+                assert_eq!(projection.query, "old_target_query");
+            }
+            _ => unreachable!("closed projection keys reject unknown values"),
+        }
+    }
+}
+
+fn validate_live_http_surface_statuses(fixture: &LiveHttpFixture) {
+    let expected_keys = [
+        "index_absent",
+        "object_absent",
+        "object_unavailable",
+        "search_unavailable",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let actual_keys = fixture
+        .surface_statuses
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual_keys, expected_keys,
+        "live_http_fixture surface_statuses must be closed over known keys"
+    );
+    for (key, status) in &fixture.surface_statuses {
+        validate_live_http_surface_status(key, status);
+    }
+}
+
+fn validate_live_http_surface_status(key: &str, status: &LiveHttpSurfaceStatus) {
+    assert!(
+        (400..=599).contains(&status.status),
+        "live_http_fixture surface_statuses.{key}.status must be a 4xx/5xx status"
+    );
+    let body = status
+        .body
+        .as_object()
+        .unwrap_or_else(|| panic!("live_http_fixture surface_statuses.{key}.body must be an object"));
+    assert_eq!(
+        body.get("status").and_then(serde_json::Value::as_u64),
+        Some(u64::from(status.status)),
+        "live_http_fixture surface_statuses.{key}.body.status must match status"
+    );
+    assert!(
+        body.get("message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| !message.trim().is_empty()),
+        "live_http_fixture surface_statuses.{key}.body.message must be non-empty"
+    );
+}
+
 fn validate_live_http_object(name: &str, object: &LiveHttpObject) {
     assert!(!object.object_id.is_empty(), "live_http_fixture {name} missing object_id");
     let body = object
@@ -703,6 +900,54 @@ fn validate_live_http_object(name: &str, object: &LiveHttpObject) {
         Some(object.object_id.as_str()),
         "live_http_fixture {name}.body.objectID must match object_id"
     );
+    let rendered = production_highlight_value_strings(&object.body).unwrap_or_else(|error| {
+        panic!("live_http_fixture {name}.body is not a valid document: {error}")
+    });
+    assert_eq!(
+        object.expected_highlight, rendered,
+        "live_http_fixture {name}.expected_highlight must match the production highlighter"
+    );
+}
+
+/// Render `body`'s `_highlightResult` leaf value strings exactly as the search API
+/// does, keyed by highlight path.
+///
+/// Passing no query words makes every leaf a no-match, which is precisely the
+/// production `field_value_to_string` rendering of that leaf — so this drives the
+/// real highlighter rather than mirroring it, and stays correct as it evolves.
+pub(super) fn production_highlight_value_strings(
+    body: &serde_json::Value,
+) -> std::result::Result<BTreeMap<String, String>, String> {
+    let document = Document::from_json(body).map_err(|error| error.to_string())?;
+    let highlighted = Highlighter::default().highlight_document(&document, &[]);
+
+    let mut rendered = BTreeMap::new();
+    for (field, value) in &highlighted {
+        flatten_highlight_value(field, value, &mut rendered);
+    }
+    Ok(rendered)
+}
+
+fn flatten_highlight_value(
+    path: &str,
+    value: &HighlightValue,
+    rendered: &mut BTreeMap<String, String>,
+) {
+    match value {
+        HighlightValue::Single(result) => {
+            rendered.insert(path.to_string(), result.value.clone());
+        }
+        HighlightValue::Array(results) => {
+            for (position, result) in results.iter().enumerate() {
+                rendered.insert(format!("{path}[{position}]"), result.value.clone());
+            }
+        }
+        HighlightValue::Object(children) => {
+            for (key, child) in children {
+                flatten_highlight_value(&format!("{path}.{key}"), child, rendered);
+            }
+        }
+    }
 }
 
 fn validate_live_http_query(name: &str, query: &LiveHttpQuery, object: &LiveHttpObject) {
@@ -731,6 +976,70 @@ fn validate_live_http_visibility(key: &str, visibility: &LiveHttpVisibility) {
             "live_http_fixture expectations.{key}.{field} has unknown value {value}"
         );
     }
+}
+
+fn validate_scenario_live_http_projection(scenario: &Scenario, fixture: &LiveHttpFixture) {
+    match scenario.visible.search.as_str() {
+        "loadable" => {
+            fixture
+                .resolve_target_projection(&scenario.id, &scenario.visible)
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+        "unavailable" => {
+            assert_eq!(
+                scenario.visible.target, ABSENT,
+                "{} unavailable search must hide the target from the index list",
+                scenario.id
+            );
+            assert!(
+                matches!(scenario.visible.object.as_str(), "absent" | "unavailable"),
+                "{} unavailable search has invalid object visibility {}",
+                scenario.id,
+                scenario.visible.object
+            );
+        }
+        value => panic!("{} has unknown search visibility {value}", scenario.id),
+    }
+}
+
+fn deserialize_unique_btree_map<'de, D, V>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, V>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    V: DeserializeOwned,
+{
+    struct UniqueMapVisitor<V> {
+        value: std::marker::PhantomData<V>,
+    }
+
+    impl<'de, V> Visitor<'de> for UniqueMapVisitor<V>
+    where
+        V: DeserializeOwned,
+    {
+        type Value = BTreeMap<String, V>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON object without duplicate keys")
+        }
+
+        fn visit_map<A>(self, mut access: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut values = BTreeMap::new();
+            while let Some((key, value)) = access.next_entry::<String, V>()? {
+                if values.insert(key.clone(), value).is_some() {
+                    return Err(serde::de::Error::custom(format!("duplicate key {key}")));
+                }
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueMapVisitor {
+        value: std::marker::PhantomData,
+    })
 }
 
 fn validate_digest_or_absence(scenario_id: &str, field: &str, value: &str) {

@@ -16,11 +16,15 @@ use axum::{
 use flapjack::index::oplog::{OpLog, OpLogEntry};
 use flapjack::index::snapshot::export_to_bytes;
 use flapjack::{validate_index_name, IndexManager};
+use flapjack_replication::config::{NodeConfig, PeerConfig};
+use flapjack_replication::manager::AddPeerError;
 use flapjack_replication::types::{
     GetOpsQuery, GetOpsResponse, ListTenantsResponse, ReplicateOpsRequest, ReplicateOpsResponse,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use utoipa::ToSchema;
 
 /// Core apply logic: parse ops and write to IndexManager.
 /// Returns the highest sequence number applied, or an error string.
@@ -421,11 +425,14 @@ pub async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResp
         None => {
             return (
                 StatusCode::OK,
-                Json(serde_json::json!({
-                    "node_id": std::env::var("FLAPJACK_NODE_ID").unwrap_or_else(|_| "unknown".to_string()),
-                    "replication_enabled": false,
-                    "peers": []
-                })),
+                Json(ClusterStatusResponse {
+                    node_id: std::env::var("FLAPJACK_NODE_ID")
+                        .unwrap_or_else(|_| "unknown".to_string()),
+                    replication_enabled: false,
+                    peers_total: None,
+                    peers_healthy: None,
+                    peers: Vec::new(),
+                }),
             )
                 .into_response();
         }
@@ -434,29 +441,186 @@ pub async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResp
     let peers = repl_mgr
         .peer_statuses()
         .into_iter()
-        .map(|ps| {
-            serde_json::json!({
-                "peer_id": ps.peer_id,
-                "addr": ps.addr,
-                "status": ps.status,
-                "last_success_secs_ago": ps.last_success_secs_ago,
-            })
+        .map(|peer| ClusterPeerStatus {
+            peer_id: peer.peer_id,
+            addr: peer.addr,
+            status: peer.status,
+            last_success_secs_ago: peer.last_success_secs_ago,
         })
         .collect::<Vec<_>>();
 
-    let healthy_count = peers.iter().filter(|p| p["status"] == "healthy").count();
+    let healthy_count = peers.iter().filter(|peer| peer.status == "healthy").count();
+    let peers_total = peers.len();
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "node_id": repl_mgr.node_id(),
-            "replication_enabled": true,
-            "peers_total": repl_mgr.peer_count(),
-            "peers_healthy": healthy_count,
-            "peers": peers,
-        })),
+        Json(ClusterStatusResponse {
+            node_id: repl_mgr.node_id().to_string(),
+            replication_enabled: true,
+            peers_total: Some(peers_total),
+            peers_healthy: Some(healthy_count),
+            peers,
+        }),
     )
         .into_response()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClusterPeerStatus {
+    pub peer_id: String,
+    pub addr: String,
+    pub status: String,
+    pub last_success_secs_ago: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClusterStatusResponse {
+    pub node_id: String,
+    pub replication_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peers_total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peers_healthy: Option<usize>,
+    pub peers: Vec<ClusterPeerStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct AddPeerRequest {
+    pub node_id: String,
+    pub addr: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct AddPeerResponse {
+    pub node_id: String,
+    pub addr: String,
+    pub peers_total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct RemovePeerResponse {
+    pub node_id: String,
+    pub peers_total: usize,
+}
+
+/// Add one peer to the live replication membership without changing bootstrap config.
+#[utoipa::path(
+    post,
+    path = "/internal/cluster/peers",
+    tag = "cluster",
+    request_body = AddPeerRequest,
+    responses(
+        (status = 200, description = "Peer added to runtime membership", body = AddPeerResponse),
+        (status = 400, description = "Invalid peer or replication is not configured"),
+        (status = 403, description = "Admin API key is required"),
+        (status = 409, description = "Peer conflicts with current runtime membership")
+    ),
+    security(("api_key" = []))
+)]
+pub async fn add_cluster_peer(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<AddPeerRequest>,
+) -> Response {
+    let node_id = request.node_id.trim().to_string();
+    if node_id.is_empty() {
+        return crate::error_response::json_error(
+            StatusCode::BAD_REQUEST,
+            "node_id must not be blank",
+        );
+    }
+
+    let Some(addr) = NodeConfig::normalize_peer_addr(&request.addr) else {
+        return crate::error_response::json_error(
+            StatusCode::BAD_REQUEST,
+            "addr must be a safe HTTP or HTTPS peer URL",
+        );
+    };
+    let Some(replication_manager) = state.replication_manager.as_ref() else {
+        return crate::error_response::json_error(
+            StatusCode::BAD_REQUEST,
+            "replication manager is not configured",
+        );
+    };
+
+    let receipt = match replication_manager.add_peer(PeerConfig { node_id, addr }) {
+        Ok(receipt) => receipt,
+        Err(error) => return add_peer_error_response(error),
+    };
+
+    (
+        StatusCode::OK,
+        Json(AddPeerResponse {
+            node_id: receipt.node_id,
+            addr: receipt.addr,
+            peers_total: receipt.peers_total,
+        }),
+    )
+        .into_response()
+}
+
+fn add_peer_error_response(error: AddPeerError) -> Response {
+    match error {
+        AddPeerError::Conflict(message) => {
+            crate::error_response::json_error(StatusCode::CONFLICT, message)
+        }
+        AddPeerError::Persistence(error) => {
+            tracing::error!(error = %error, "failed to persist replication peer membership");
+            crate::error_response::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to persist replication peer membership",
+            )
+        }
+    }
+}
+
+/// Remove one peer from the live replication membership without changing bootstrap config.
+#[utoipa::path(
+    delete,
+    path = "/internal/cluster/peers/{node_id}",
+    tag = "cluster",
+    params(
+        ("node_id" = String, Path, description = "Runtime peer node identifier")
+    ),
+    responses(
+        (status = 200, description = "Peer removed from runtime membership", body = RemovePeerResponse),
+        (status = 400, description = "Replication is not configured"),
+        (status = 403, description = "Admin API key is required"),
+        (status = 404, description = "Peer is not in runtime membership")
+    ),
+    security(("api_key" = []))
+)]
+pub async fn remove_cluster_peer(
+    State(state): State<Arc<AppState>>,
+    Path(node_id): Path<String>,
+) -> Response {
+    let Some(replication_manager) = state.replication_manager.as_ref() else {
+        return crate::error_response::json_error(
+            StatusCode::BAD_REQUEST,
+            "replication manager is not configured",
+        );
+    };
+
+    match replication_manager.remove_peer(&node_id) {
+        Ok(Some(receipt)) => (
+            StatusCode::OK,
+            Json(RemovePeerResponse {
+                node_id: receipt.node_id,
+                peers_total: receipt.peers_total,
+            }),
+        )
+            .into_response(),
+        Ok(None) => crate::error_response::json_error(
+            StatusCode::NOT_FOUND,
+            format!("Peer '{node_id}' not found"),
+        ),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to remove replication peer membership");
+            crate::error_response::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to persist replication peer membership",
+            )
+        }
+    }
 }
 
 /// POST /internal/rotate-admin-key

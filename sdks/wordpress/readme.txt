@@ -25,7 +25,7 @@ Flapjack Search replaces the default WordPress search with a fast, typo-tolerant
 * **Real-time sync** — Automatically syncs posts on save, delete, and status changes
 * **Bulk reindex** — Reindex all content with one click or via WP-CLI
 * **Background reindex** — Large-site friendly batch reindexing with Action Scheduler support and progress tracking
-* **Bulk live-index updates** — Admin, WP-CLI, and REST reindexing update the live index in batches of up to 500 records
+* **Atomic full reindex** — Admin, WP-CLI, and REST rebuild into a temporary index and publish it over the live index only after the rebuild succeeds
 * **WooCommerce faceted search** — Price range slider, category filters, stock/sale toggles, and star rating filters
 * **WooCommerce ready** — Index products with prices, SKUs, categories, and attributes
 * **REST API** — Full REST API for search, indexing, and status
@@ -63,7 +63,7 @@ Background reindexing processes your content in batches of 200 posts. If Action 
 
 = Will reindexing cause downtime? =
 
-The admin, WP-CLI, and REST bulk reindex paths update the live index in batches of up to 500 records. Searches may observe those in-place updates while the reindex runs.
+Admin, WP-CLI, and REST full reindexes build content and settings in a temporary index, then publish it atomically over the live index. If the rebuild fails, the existing live index remains in place.
 
 == Screenshots ==
 
@@ -81,7 +81,7 @@ The admin, WP-CLI, and REST bulk reindex paths update the live index in batches 
 * Real-time post sync on save/delete/status change
 * Bulk reindex via admin UI and WP-CLI
 * Background reindex with Action Scheduler support and WP-Cron fallback
-* Bulk reindex updates the live index in batches of up to 500 records
+* Atomic full reindex publishes a completed temporary index while preserving the live index on rebuild failure
 * WooCommerce product indexing with prices, SKUs, categories, and attributes
 * WooCommerce faceted search: price slider, category refinement, stock/sale toggles, star ratings
 * REST API endpoints for search, index, and status

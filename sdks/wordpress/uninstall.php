@@ -25,6 +25,8 @@ $options = [
     'flapjack_enable_instant',
     'flapjack_posts_per_page',
     'flapjack_searchable_attrs',
+    // Durable latest-failure record. Canonical owner: Flapjack\WordPress\Status\FailureReporter::OPTION.
+    'flapjack_last_failure',
 ];
 
 foreach ( $options as $option ) {

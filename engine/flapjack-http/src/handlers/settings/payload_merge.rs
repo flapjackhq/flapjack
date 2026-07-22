@@ -73,7 +73,7 @@ fn log_safe_embedder_name(name: &str) -> String {
 
 /// Applies search-behavior fields from a settings payload to the index settings.
 ///
-/// Covers fields that affect indexing, ranking, query interpretation, and search mode (15 fields).
+/// Covers fields that affect indexing, ranking, query interpretation, and search mode (16 fields).
 /// Each field is consumed via `.take()` so the caller retains ownership of remaining fields.
 fn apply_search_config_fields(settings: &mut IndexSettings, payload: &mut SetSettingsRequest) {
     if let Some(v) = payload.attributes_for_faceting.take() {
@@ -129,6 +129,9 @@ fn apply_search_config_fields(settings: &mut IndexSettings, payload: &mut SetSet
     }
     if let Some(v) = payload.numeric_attributes_for_filtering.take() {
         settings.numeric_attributes_for_filtering = Some(v);
+    }
+    if let Some(v) = payload.attributes_to_index.take() {
+        settings.attributes_to_index = Some(v);
     }
     if let Some(v) = payload.allow_compression_of_integer_array.take() {
         settings.allow_compression_of_integer_array = Some(v);
@@ -258,7 +261,7 @@ fn apply_embedders_update(
 }
 
 /// Validates replica index names (must differ from the primary and use valid `virtual()` syntax) and returns parsed replica entries for creation.
-fn validate_and_apply_replicas(
+pub(in crate::handlers) fn validate_and_apply_replicas(
     settings: &mut IndexSettings,
     replicas: Option<Vec<String>>,
     index_name: &str,

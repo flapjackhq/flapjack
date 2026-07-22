@@ -307,6 +307,7 @@ class ProductIntegrationTest extends TestCase {
         $result = $this->integration->enhance_index_settings( $settings, 'wp_posts' );
 
         $facets = $result['attributesForFaceting'];
+        $this->assertContains( 'taxonomy_product_cat', $facets );
         $this->assertContains( 'filterOnly(price)', $facets );
         $this->assertContains( 'filterOnly(on_sale)', $facets );
         $this->assertContains( 'filterOnly(in_stock)', $facets );
@@ -406,22 +407,26 @@ class ProductIntegrationTest extends TestCase {
         $product->set_regular_price( '19.99' );
         wc_store_test_product( $product );
 
-        // Expect saveObject to be called with enhanced record.
+        // Expect explicit-ID upsert with enhanced record.
         $this->search_client->expects( $this->once() )
-            ->method( 'saveObject' )
-            ->with( 'wp_posts', $this->callback( function ( $record ) {
-                return $record['objectID'] === '200'
-                    && $record['sku'] === 'UPD-001'
-                    && $record['price'] === 19.99;
-            } ) );
+            ->method( 'addOrUpdateObject' )
+            ->with(
+                'wp_posts',
+                '200',
+                $this->callback( function ( $record ) {
+                    return $record['objectID'] === '200'
+                        && $record['sku'] === 'UPD-001'
+                        && $record['price'] === 19.99;
+                } )
+            );
 
         $this->integration->on_product_update( 200 );
     }
 
     public function test_on_product_update_handles_missing_post_gracefully(): void {
         // Post ID 888 does not exist in the store.
-        // Should not throw or call saveObject.
-        $this->search_client->expects( $this->never() )->method( 'saveObject' );
+        // Should not throw or call the explicit-ID upsert path.
+        $this->search_client->expects( $this->never() )->method( 'addOrUpdateObject' );
         $this->integration->on_product_update( 888 );
     }
 

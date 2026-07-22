@@ -11,6 +11,7 @@ namespace Flapjack\WordPress\Tests\Unit\Admin;
 
 use PHPUnit\Framework\TestCase;
 use Flapjack\WordPress\Admin\SettingsPage;
+use Flapjack\WordPress\Status\FailureReporter;
 
 class SettingsPageTest extends TestCase {
 
@@ -214,6 +215,86 @@ class SettingsPageTest extends TestCase {
         $this->assertStringContainsString( 'Reindex All Content', $output );
         $this->assertStringContainsString( 'flapjack-test-connection', $output );
         $this->assertStringContainsString( 'flapjack-reindex', $output );
+    }
+
+    // ─── Latest failure panel ─────────────────────────────────
+
+    public function test_render_settings_page_shows_empty_failure_state_when_none(): void {
+        ob_start();
+        $this->settings->render_settings_page();
+        $output = ob_get_clean();
+
+        $this->assertStringContainsString( 'data-testid="flapjack-no-failure"', $output );
+        $this->assertStringNotContainsString( 'data-testid="flapjack-last-failure"', $output );
+    }
+
+    public function test_render_settings_page_renders_latest_failure_with_stable_testids(): void {
+        FailureReporter::record(
+            new \RuntimeException( 'Sync failed for A & B host', 500 ),
+            [ 'operation' => 'index_post', 'source' => 'post_sync', 'post_id' => 42, 'index_name' => 'wp_posts' ]
+        );
+        $occurred_at = FailureReporter::latest()['occurred_at'];
+
+        ob_start();
+        $this->settings->render_settings_page();
+        $output = ob_get_clean();
+
+        $this->assertStringContainsString( 'data-testid="flapjack-last-failure"', $output );
+        $this->assertStringNotContainsString( 'data-testid="flapjack-no-failure"', $output );
+
+        // Exact, test-id-anchored values.
+        $this->assertMatchesRegularExpression(
+            '/data-testid="flapjack-failure-operation">index_post</',
+            $output
+        );
+        $this->assertMatchesRegularExpression(
+            '/data-testid="flapjack-failure-source">post_sync</',
+            $output
+        );
+        $this->assertMatchesRegularExpression(
+            '/data-testid="flapjack-failure-post-id">42</',
+            $output
+        );
+        $this->assertMatchesRegularExpression(
+            '/data-testid="flapjack-failure-status-code">500</',
+            $output
+        );
+        // Values are HTML-escaped: the ampersand renders as &amp;.
+        $this->assertStringContainsString( 'Sync failed for A &amp; B host', $output );
+        $this->assertStringContainsString(
+            'data-testid="flapjack-failure-timestamp">' . gmdate( 'Y-m-d H:i:s', $occurred_at ) . ' UTC<',
+            $output
+        );
+    }
+
+    public function test_render_last_failure_omits_absent_optional_fields(): void {
+        FailureReporter::record(
+            new \RuntimeException( 'Background reindex failed' ),
+            [ 'operation' => 'reindex_batch', 'source' => 'background_reindex' ]
+        );
+
+        ob_start();
+        $this->settings->render_last_failure();
+        $output = ob_get_clean();
+
+        $this->assertStringContainsString( 'data-testid="flapjack-failure-operation">reindex_batch<', $output );
+        // No post id and no HTTP status code were recorded — their rows must be absent.
+        $this->assertStringNotContainsString( 'data-testid="flapjack-failure-post-id"', $output );
+        $this->assertStringNotContainsString( 'data-testid="flapjack-failure-status-code"', $output );
+    }
+
+    public function test_render_last_failure_never_leaks_secret_in_message(): void {
+        FailureReporter::record(
+            new \RuntimeException( 'Auth failed api_key=SuperSecretKey123 upstream' ),
+            [ 'operation' => 'index_post', 'source' => 'post_sync' ]
+        );
+
+        ob_start();
+        $this->settings->render_last_failure();
+        $output = ob_get_clean();
+
+        $this->assertStringNotContainsString( 'SuperSecretKey123', $output );
+        $this->assertStringContainsString( '[redacted]', $output );
     }
 
     public function test_render_connection_section_outputs_text(): void {

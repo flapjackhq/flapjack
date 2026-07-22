@@ -17,6 +17,7 @@ use flapjack::types::{Document, FieldValue, TaskStatus};
 use flapjack::IndexManager;
 use flapjack_http::auth::AuthenticatedAppId;
 use flapjack_http::handlers::metrics::MetricsState;
+use flapjack_http::handlers::migration::{MigrationJobRunner, DEFAULT_ASYNC_MIGRATION_CAPACITY};
 use flapjack_http::handlers::{add_documents, delete_object, AppState};
 use flapjack_http::idempotency::IdempotencyCache;
 use flapjack_http::pause_registry::PausedIndexes;
@@ -38,7 +39,7 @@ fn make_state(tmp: &TempDir) -> Arc<AppState> {
     manager.set_dictionary_manager(Arc::clone(&dictionary_manager));
 
     Arc::new(AppState {
-        manager,
+        manager: Arc::clone(&manager),
         key_store: None,
         replication_manager: None,
         ssl_manager: None,
@@ -55,6 +56,11 @@ fn make_state(tmp: &TempDir) -> Arc<AppState> {
         start_time: std::time::Instant::now(),
         conversation_store: flapjack_http::conversation_store::ConversationStore::default_shared(),
         embedder_store: Arc::new(flapjack_http::embedder_store::EmbedderStore::new()),
+        migration_runner: Arc::new(MigrationJobRunner::new(
+            manager,
+            None,
+            DEFAULT_ASYNC_MIGRATION_CAPACITY,
+        )),
         idempotency_cache: Arc::new(IdempotencyCache::new(Duration::from_secs(300))),
     })
 }

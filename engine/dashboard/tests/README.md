@@ -61,7 +61,7 @@ tests/
 - **Repo-local config file** at `flapjack.local.conf` (copy from `flapjack.local.conf.example`)
 - **Flapjack server** running on `http://$FJ_HOST:$FJ_BACKEND_PORT` from that file
 - **Vite dev server** on `http://$FJ_HOST:$FJ_DASHBOARD_PORT` from that file (started automatically by Playwright unless already running)
-- **Algolia credentials** (required for the real-Algolia migration coverage and some API tests) — set `ALGOLIA_APP_ID` and `ALGOLIA_ADMIN_KEY` in `../../.secret/.env.secret`, or point Playwright at another file with `FJ_SECRET_FILE=/path/to/.env.secret`
+- **Algolia credentials** (required for the real-Algolia migration coverage and some API tests) — set both `ALGOLIA_APP_ID` and `ALGOLIA_ADMIN_KEY` in `../../.secret/.env.secret`, or point Playwright at another file with `FJ_SECRET_FILE=/path/to/.env.secret`; missing required credentials fail closed in every environment
 
 ## Running Tests
 
@@ -167,7 +167,7 @@ test('my test', async ({ page }) => {
 
 ### Adding credentialed tests
 
-Place API-level tests (no browser rendering) in `tests/e2e-api/`. For tests requiring external services, use the shared credential-mode guard so local runs can skip, but CI fails closed if the required secrets are missing:
+Place API-level tests (no browser rendering) in `tests/e2e-api/`. For tests requiring Algolia, use the shared credential-mode guard so missing required secrets fail closed before collection:
 
 ```typescript
 // E2E-API: These tests call REST APIs directly (no browser rendering).
@@ -181,17 +181,14 @@ import {
 
 const credentialMode = resolveAlgoliaCredentialMode({
   hasCredentials: hasAlgoliaCredentials(),
-  isCI: !!process.env.CI,
 });
 
 if (credentialMode === 'fail') {
   throw new MissingAlgoliaCredentialsError();
 }
 
-const describeOrSkip = credentialMode === 'run' ? test.describe : test.describe.skip;
-
-describeOrSkip('My credentialed test', () => {
-  // Local runs without credentials skip; CI without credentials fails loudly.
+test.describe('My credentialed test', () => {
+  // Missing credentials fail at module load before Playwright can collect the suite.
 });
 ```
 

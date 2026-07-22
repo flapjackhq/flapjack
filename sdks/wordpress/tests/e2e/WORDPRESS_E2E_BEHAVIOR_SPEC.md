@@ -425,6 +425,35 @@ This document defines all user-facing behaviors that must be tested in E2E tests
 
 ---
 
+### BEH-SET-011: Latest indexing failure is visible in the Tools/status area
+**Feature:** Durable Failure Visibility
+**User Story:** As an admin, when a sync, delete, or background reindex fails, I want to see the latest failure in the settings page so it does not disappear into `WP_DEBUG` logs.
+
+**Preconditions:**
+- The plugin recorded a failure via `Flapjack\WordPress\Status\FailureReporter` (e.g. a real sync/delete/reindex hit an unreachable Flapjack host).
+
+**Actions:**
+1. Open the Flapjack Search settings page (Tools section).
+
+**Expected Outcomes (failure present):**
+- ✅ A failure panel is rendered with stable test id `data-testid="flapjack-last-failure"`.
+- ✅ `data-testid="flapjack-failure-operation"` shows the exact operation (e.g. `index_post`, `delete_post`, `reindex_batch`).
+- ✅ `data-testid="flapjack-failure-source"` shows the exact source (e.g. `post_sync`, `index_manager`, `background_reindex`).
+- ✅ `data-testid="flapjack-failure-post-id"` shows the exact post id when present, and is absent when the failure has no post id.
+- ✅ `data-testid="flapjack-failure-message"` shows the sanitized message; it NEVER contains API keys, credential tokens, HTML tags, or unbounded text (redacted as `[redacted]`, truncated to ≤ 501 chars).
+- ✅ `data-testid="flapjack-failure-timestamp"` shows the failure's `occurred_at` time.
+- ✅ All rendered values are HTML-escaped.
+
+**Expected Outcomes (no failure recorded):**
+- ✅ The failure panel `data-testid="flapjack-last-failure"` is NOT rendered.
+- ✅ An empty-state marker `data-testid="flapjack-no-failure"` is rendered instead.
+
+**Reindex-flow screen state after a failed operation:**
+- ✅ After a failed background reindex, the progress area shows the sanitized error and the failure panel above reflects the same latest failure (source `background_reindex`).
+- ✅ After a failed single sync/delete, the failure panel reflects the latest failure without requiring `WP_DEBUG`.
+
+---
+
 ## 4. Gutenberg Block Editor (3 behaviors)
 
 ### BEH-GB-001: Search block appears in block inserter
@@ -649,12 +678,12 @@ This document defines all user-facing behaviors that must be tested in E2E tests
 |-------------|-----------|-------|----------|
 | InstantSearch Overlay | 4 | 4 | 100% |
 | WooCommerce Facets | 8 | 8 | 100% |
-| Settings Page | 10 | 10 | 100% |
+| Settings Page | 11 | 11 | 100% |
 | Gutenberg Block | 3 | 3 | 100% |
 | Backend Search | 3 | 3 | 100% |
 | Autocomplete | 3 | 3 | 100% |
 | Activation/Setup | 4 | 4 | 100% |
-| **TOTAL** | **35** | **35** | **100%** |
+| **TOTAL** | **36** | **36** | **100%** |
 
 ---
 
@@ -688,3 +717,4 @@ This behavior spec should be updated whenever:
 
 **Version History:**
 - v1.0.0 (2026-02-10): Initial comprehensive behavior spec covering all 35 E2E tests
+- v1.1.0 (2026-07-18): Added BEH-SET-011 — durable, sanitized latest-failure visibility in the Tools/status area (36 behaviors)

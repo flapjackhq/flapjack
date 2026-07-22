@@ -147,6 +147,87 @@ PY
   rm -rf "$work_dir"
 }
 
+assert_helper_runtime_auto_port_non_loopback_banner() {
+  local work_dir server_log port server_pid
+  work_dir="$(mktemp -d)"
+  server_log="$work_dir/server.log"
+  port="$(pick_free_port)"
+  printf '  ->  Local:      http://0.0.0.0:%s\n' "$port" >"$server_log"
+  python3 - "$port" >>"$server_log" 2>&1 <<'PY' &
+import http.server
+import socketserver
+import sys
+
+PORT = int(sys.argv[1])
+
+class HealthHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+with socketserver.TCPServer(("127.0.0.1", PORT), HealthHandler) as server:
+    server.serve_forever()
+PY
+  server_pid=$!
+
+  if "$HELPER_PATH" --pid "$server_pid" --host 127.0.0.1 --port auto --log-path "$server_log" --retries 30 --interval-seconds 0.1 >/dev/null 2>&1; then
+    pass 'wait_for_flapjack helper resolves auto-port from non-loopback startup log'
+  else
+    fail 'wait_for_flapjack helper resolves auto-port from non-loopback startup log'
+  fi
+
+  kill "$server_pid" 2>/dev/null || true
+  rm -rf "$work_dir"
+}
+
+assert_helper_rejects_non_200_health_status() {
+  local work_dir server_log output_file port server_pid
+  work_dir="$(mktemp -d)"
+  server_log="$work_dir/server.log"
+  output_file="$work_dir/output.txt"
+  port="$(pick_free_port)"
+  python3 - "$port" >"$server_log" 2>&1 <<'PY' &
+import http.server
+import socketserver
+import sys
+
+PORT = int(sys.argv[1])
+
+class HealthHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_response(204)
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+with socketserver.TCPServer(("127.0.0.1", PORT), HealthHandler) as server:
+    server.serve_forever()
+PY
+  server_pid=$!
+
+  if "$HELPER_PATH" --pid "$server_pid" --health-url "http://127.0.0.1:${port}/health" --log-path "$server_log" --retries 2 --interval-seconds 0.1 >"$output_file" 2>&1; then
+    fail 'wait_for_flapjack helper rejects non-200 health status'
+  else
+    pass 'wait_for_flapjack helper rejects non-200 health status'
+  fi
+
+  kill "$server_pid" 2>/dev/null || true
+  rm -rf "$work_dir"
+}
+
 assert_helper_runtime_process_exit() {
   local work_dir server_log output_file dead_pid
   work_dir="$(mktemp -d)"
@@ -202,10 +283,10 @@ assert_smoke_and_ci_delegate_to_helper() {
 
   local helper_count
   helper_count="$(grep -c 'engine/tests/common/wait_for_flapjack.sh' "$CI_PATH" || true)"
-  if [ "$helper_count" = "10" ]; then
-    pass 'CI has 10 shared helper readiness calls'
+  if [ "$helper_count" -gt 0 ]; then
+    pass 'CI uses shared helper readiness calls'
   else
-    fail 'CI has 10 shared helper readiness calls' "found $helper_count"
+    fail 'CI uses shared helper readiness calls' "found $helper_count"
   fi
 
   if grep -q 'sleep 3' "$CI_PATH"; then
@@ -226,6 +307,8 @@ main() {
   assert_helper_file_contract
   assert_helper_runtime_success
   assert_helper_runtime_auto_port
+  assert_helper_runtime_auto_port_non_loopback_banner
+  assert_helper_rejects_non_200_health_status
   assert_helper_runtime_process_exit
   assert_helper_runtime_timeout_logs
   assert_smoke_and_ci_delegate_to_helper

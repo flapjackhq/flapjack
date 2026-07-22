@@ -14,6 +14,7 @@ declare(strict_types=1);
 namespace Flapjack\WordPress\Indexing;
 
 use Flapjack\WordPress\ClientFactory;
+use Flapjack\WordPress\Status\FailureReporter;
 
 class BackgroundIndexer {
 
@@ -22,10 +23,14 @@ class BackgroundIndexer {
     public const GROUP              = 'flapjack-search';
     public const BATCH_SIZE         = 200;
 
+    private IndexManager $index_manager;
     private ClientFactory $client_factory;
 
     public function __construct( ClientFactory $client_factory ) {
+        // IndexManager owns all index writes (temp-index rebuild + atomic move);
+        // BackgroundIndexer only schedules batches and tracks progress.
         $this->client_factory = $client_factory;
+        $this->index_manager  = new IndexManager( $client_factory );
     }
 
     /**
@@ -78,6 +83,10 @@ class BackgroundIndexer {
         set_transient( self::PROGRESS_TRANSIENT, $progress, HOUR_IN_SECONDS );
 
         if ( $total > 0 ) {
+            // Initialize the canonical rebuild state (temp index) that every
+            // batch appends to and the final batch publishes. IndexManager owns
+            // this state; BackgroundIndexer only tracks scheduling and progress.
+            $this->index_manager->begin_rebuild();
             $this->schedule_batch( 1, $method );
         } else {
             // No posts to index — mark complete immediately.
@@ -101,55 +110,43 @@ class BackgroundIndexer {
         }
 
         try {
-            $client     = $this->client_factory->get_client();
-            $index_name = $this->client_factory->get_index_name();
-            $post_types = (array) get_option( 'flapjack_post_types', [ 'post', 'page' ] );
-
-            $index_manager = new IndexManager( $this->client_factory );
-
-            $query = new \WP_Query( [
-                'post_type'       => $post_types,
-                'post_status'     => 'publish',
-                'posts_per_page'  => self::BATCH_SIZE,
-                'paged'           => $page,
-                'orderby'         => 'ID',
-                'order'           => 'ASC',
-                'flapjack_bypass' => true,
-            ] );
-
-            $records = [];
-            foreach ( $query->posts as $post ) {
-                if ( $index_manager->should_index_post( $post ) ) {
-                    $records[] = $index_manager->build_record( $post );
-                }
-            }
-
-            if ( ! empty( $records ) ) {
-                $client->saveObjects( $index_name, $records );
-            }
+            // IndexManager owns all reindex enumeration (stable keyset seek) and
+            // temp-index writes; BackgroundIndexer only drives one batch per
+            // request and tracks progress.
+            $result = $this->index_manager->index_rebuild_batch( self::BATCH_SIZE );
 
             // Update progress.
-            $progress['processed']    += count( $records );
+            $progress['processed']    += $result['processed'];
             $progress['current_page']  = $page;
-            $progress['total_pages']   = max( $progress['total_pages'], $query->max_num_pages );
             $progress['batches_done']++;
 
-            $has_more = $page < $progress['total_pages'];
-
-            if ( $has_more ) {
-                set_transient( self::PROGRESS_TRANSIENT, $progress, HOUR_IN_SECONDS );
-                $this->schedule_batch( $page + 1, $progress['method'] );
-            } else {
-                // Final batch — configure settings and mark complete.
-                $index_manager->configure_index_settings( $index_name );
+            if ( $result['done'] ) {
+                // Final batch — atomically move the temp index over the live
+                // index (settings applied to the temp index before the move).
+                $this->index_manager->publish_rebuild();
 
                 $progress['status']       = 'complete';
                 $progress['completed_at'] = time();
                 set_transient( self::PROGRESS_TRANSIENT, $progress, HOUR_IN_SECONDS );
+            } else {
+                set_transient( self::PROGRESS_TRANSIENT, $progress, HOUR_IN_SECONDS );
+                $this->schedule_batch( $page + 1, $progress['method'] );
             }
         } catch ( \Throwable $e ) {
+            // Persist the failure durably through the shared reporter, then reuse
+            // its sanitized message for the operator-visible progress error so we
+            // never expose a raw upstream message (potentially containing secrets
+            // or unbounded text) in the progress transient. IndexManager still
+            // owns rebuild state; a failed batch never publishes over the live
+            // index (publish_rebuild self-aborts).
+            FailureReporter::record( $e, [
+                'operation'  => 'reindex_batch',
+                'source'     => 'background_reindex',
+                'index_name' => $this->client_factory->get_index_name(),
+            ] );
+
             $progress['status'] = 'failed';
-            $progress['error']  = $e->getMessage();
+            $progress['error']  = FailureReporter::latest()['message'] ?? '';
             set_transient( self::PROGRESS_TRANSIENT, $progress, HOUR_IN_SECONDS );
         }
     }

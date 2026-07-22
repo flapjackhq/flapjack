@@ -1,6 +1,3 @@
-//! Orchestration, destination-isolation, sanitization, and resume regressions
-//! for the spool-backed Algolia source export.
-
 use super::{
     export_algolia_source, resume_algolia_source, wait_for_live_drift_barrier, ExportError,
     LIVE_DRIFT_BARRIER_DIR_ENV, LIVE_DRIFT_OBSERVED_FILE, LIVE_DRIFT_RELEASE_FILE,
@@ -10,7 +7,7 @@ use crate::handlers::migration::algolia_client::AlgoliaIndexRecord;
 use crate::handlers::migration::source_reader::collect_quiescent_source_snapshot;
 use crate::handlers::migration::source_test_support::ScriptedSourceReader;
 use crate::handlers::migration::spool::{
-    ResourceDenominators, SpoolErrorKind, SpoolLimits, SpoolStore,
+    PublicExportView, ResourceDenominators, SpoolError, SpoolErrorKind, SpoolLimits, SpoolStore,
 };
 use crate::test_helpers::{EnvVarRestoreGuard, TestStateBuilder, ENV_MUTEX};
 use serde_json::{json, Value};
@@ -22,6 +19,7 @@ use uuid::Uuid;
 
 const APP_ID: &str = "APP-SECRET-ID";
 const SOURCE: &str = "products-source";
+const LIVE_DRIFT_BARRIER_SOURCE: &str = "live-drift-barrier-source";
 const PII_CANARY: &str = "PII-CANARY-123";
 const SETTINGS_CANARY: &str = "settings-canary";
 
@@ -100,6 +98,16 @@ async fn seed_digest() -> (String, ResourceDenominators) {
     seed_digest_for(record(), documents()).await
 }
 
+fn create_export_for_test(
+    store: &SpoolStore,
+    job_uuid: Uuid,
+    source_identity_digest: &str,
+    denominators: ResourceDenominators,
+) -> Result<PublicExportView, SpoolError> {
+    store.create_migration_phase(job_uuid)?;
+    store.create_export(job_uuid, source_identity_digest, denominators)
+}
+
 async fn seed_digest_for(
     record: AlgoliaIndexRecord,
     document_pages: Vec<Vec<Value>>,
@@ -131,7 +139,7 @@ fn store_at(path: &std::path::Path) -> SpoolStore {
 fn live_drift_barrier_records_job_and_waits_for_release() {
     let _env_lock = ENV_MUTEX.lock().expect("env mutex poisoned");
     let tmp = TempDir::new().unwrap();
-    let _source = EnvVarRestoreGuard::set(LIVE_DRIFT_SOURCE_ENV, SOURCE);
+    let _source = EnvVarRestoreGuard::set(LIVE_DRIFT_SOURCE_ENV, LIVE_DRIFT_BARRIER_SOURCE);
     let _dir = EnvVarRestoreGuard::set(
         LIVE_DRIFT_BARRIER_DIR_ENV,
         tmp.path().to_str().expect("temp path should be UTF-8"),
@@ -152,7 +160,8 @@ fn live_drift_barrier_records_job_and_waits_for_release() {
         panic!("barrier observation file was not created");
     });
 
-    wait_for_live_drift_barrier(SOURCE, job_uuid).expect("release should unblock barrier");
+    wait_for_live_drift_barrier(LIVE_DRIFT_BARRIER_SOURCE, job_uuid)
+        .expect("release should unblock barrier");
     release_thread.join().unwrap();
     assert_eq!(fs::read_to_string(observed).unwrap(), job_uuid.to_string());
 }
@@ -165,7 +174,7 @@ async fn export_destination_isolation_and_sanitization_writes_only_spool_job() {
     let store = store_at(&base_path);
     let mut reader = full_reader();
 
-    let accepted = export_algolia_source(&store, &mut reader)
+    let accepted = export_algolia_source(&store, Uuid::new_v4(), &mut reader)
         .await
         .expect("stable source should export");
 
@@ -212,7 +221,7 @@ async fn export_destination_isolation_and_sanitization_scrubs_public_material() 
     let store = store_at(tmp.path());
     let mut reader = full_reader();
 
-    let accepted = export_algolia_source(&store, &mut reader)
+    let accepted = export_algolia_source(&store, Uuid::new_v4(), &mut reader)
         .await
         .expect("stable source should export");
     let (digest, _) = seed_digest().await;
@@ -239,12 +248,204 @@ async fn export_destination_isolation_and_sanitization_scrubs_public_material() 
     }
 }
 
+const REPLICA_CANARY: &str = "REPLICA-SETTINGS-CANARY";
+
+fn settings_with_replicas() -> Value {
+    json!({
+        "attributesForFaceting": ["category"],
+        "ranking": ["typo"],
+        "replicas": ["products_price_asc", "virtual(products_relevance)"]
+    })
+}
+
+fn replica_price_settings() -> Value {
+    json!({
+        "ranking": ["desc(price)"],
+        "customRanking": ["asc(name)"],
+        "relevancyStrictness": 80,
+        "searchableAttributes": ["title"],
+        "note": REPLICA_CANARY,
+        "primary": SOURCE
+    })
+}
+
+fn replica_relevance_settings() -> Value {
+    json!({
+        "ranking": ["asc(popularity)"],
+        "relevancyStrictness": 50,
+        "primary": SOURCE
+    })
+}
+
+/// The accepted export carries each replica's complete source settings while the
+/// primary's differ, and the raw map never leaks through diagnostics.
+#[tokio::test]
+async fn export_carries_replica_settings_and_keeps_them_out_of_debug() {
+    let tmp = TempDir::new().unwrap();
+    let store = store_at(tmp.path());
+    let mut reader = ScriptedSourceReader::new(APP_ID, SOURCE);
+    reader.push_quiescent(record());
+    reader.push_pass(settings_with_replicas(), documents(), rules(), synonyms());
+    reader.push_pass(settings_with_replicas(), documents(), rules(), synonyms());
+    reader.push_quiescent(record());
+    // Collected once after the export pass, in replicas-list order.
+    reader.push_index_settings("products_price_asc", Ok(replica_price_settings()));
+    reader.push_index_settings("products_relevance", Ok(replica_relevance_settings()));
+
+    let accepted = export_algolia_source(&store, Uuid::new_v4(), &mut reader)
+        .await
+        .expect("stable source with replicas should export");
+
+    assert_eq!(
+        accepted.replica_settings.keys().collect::<Vec<_>>(),
+        vec!["products_price_asc", "products_relevance"]
+    );
+    // The complete per-replica payload is preserved, including searchableAttributes.
+    assert_eq!(
+        accepted.replica_settings["products_price_asc"],
+        replica_price_settings()
+    );
+    // Primary ranking (["typo"]) and replica ranking (["desc(price)"]) differ and
+    // both are retained faithfully.
+    assert_eq!(
+        accepted.replica_settings["products_price_asc"]["ranking"],
+        json!(["desc(price)"])
+    );
+    assert_ne!(
+        accepted.replica_settings["products_price_asc"]["ranking"],
+        json!(["typo"])
+    );
+
+    // No replica index name or settings value may reach a diagnostic line; only
+    // the safe count is rendered.
+    let rendered = format!("{accepted:?}");
+    for secret in [
+        REPLICA_CANARY,
+        "products_price_asc",
+        "products_relevance",
+        "desc(price)",
+    ] {
+        assert!(
+            !rendered.contains(secret),
+            "AcceptedExport Debug must not leak replica material `{secret}`"
+        );
+    }
+    assert!(rendered.contains("replica_settings_count"));
+}
+
+/// Replica settings are collected inside the accepted-state window: the fetch
+/// runs before the final quiescence/drift proof, so a source that drifts after
+/// replica collection is still fenced and no export is accepted. Proving the
+/// index-settings reads were consumed before the drift abort locks in the
+/// ordering — under the old order the drift proof would abort first, leaving the
+/// replica reads unconsumed.
+#[tokio::test]
+async fn export_collects_replica_settings_before_final_drift_proof() {
+    let tmp = TempDir::new().unwrap();
+    let store = store_at(tmp.path());
+    let mut reader = ScriptedSourceReader::new(APP_ID, SOURCE);
+    reader.push_quiescent(record());
+    reader.push_pass(settings_with_replicas(), documents(), rules(), synonyms());
+    reader.push_pass(settings_with_replicas(), documents(), rules(), synonyms());
+    reader.push_index_settings("products_price_asc", Ok(replica_price_settings()));
+    reader.push_index_settings("products_relevance", Ok(replica_relevance_settings()));
+    // The final quiescence reports a changed updatedAt: source drift after the
+    // replica fetch.
+    let mut drifted = record();
+    drifted.updated_at = "2026-07-15T02:00:00Z".to_string();
+    reader.push_quiescent(drifted);
+
+    let error = export_algolia_source(&store, Uuid::new_v4(), &mut reader)
+        .await
+        .expect_err("drift after replica collection must fence the job");
+    assert!(matches!(error, ExportError::Source(_)));
+
+    // The replica reads were consumed before the drift proof aborted, proving the
+    // fetch is bracketed by the same proof as the primary snapshot.
+    assert!(
+        reader.index_settings_reads.is_empty(),
+        "replica settings must be fetched before the final drift proof"
+    );
+
+    // The fenced job is durably failed, never left apparently complete.
+    let uuids = store.job_uuids().unwrap();
+    assert_eq!(uuids.len(), 1);
+    let (public_handle, _) = store.handles(uuids[0]).unwrap();
+    assert_eq!(store.public_view(&public_handle).unwrap().state, "Failed");
+}
+
+#[test]
+fn export_failure_settlement_phase_write_error_surfaces_storage_failure() {
+    let tmp = TempDir::new().unwrap();
+    let store = store_at(tmp.path());
+    let job_uuid = Uuid::new_v4();
+    store.create_migration_phase(job_uuid).unwrap();
+    store
+        .fail_next_migration_phase_commit_for_test(job_uuid)
+        .unwrap();
+
+    let error = super::fail_fresh_migration(&store, job_uuid)
+        .expect_err("export settlement must surface phase persistence failure");
+
+    assert!(matches!(
+        error,
+        ExportError::Spool(ref inner) if inner.kind() == SpoolErrorKind::Io
+    ));
+    let phase = store.read_migration_phase(job_uuid).unwrap();
+    assert_eq!(
+        phase.disposition,
+        crate::handlers::migration::spool::MigrationDisposition::Running
+    );
+}
+
+#[test]
+fn fresh_export_failure_always_settles_durable_phase() {
+    use crate::handlers::migration::spool::MigrationDisposition;
+
+    let tmp = TempDir::new().unwrap();
+    let store = store_at(tmp.path());
+
+    // Any post-admission failure of a fresh run must settle the durable phase to
+    // Failed while surfacing the original cause, so the standalone export seam can
+    // never return an error with migration_phase.json still Running.
+    let job_uuid = Uuid::new_v4();
+    store.create_migration_phase(job_uuid).unwrap();
+    let cause = ExportError::Spool(store.read_migration_phase(Uuid::new_v4()).unwrap_err());
+    let returned = super::settle_fresh_export(&store, Some(job_uuid), Err(cause));
+    assert!(matches!(
+        returned.expect_err("a failed export must stay failed"),
+        ExportError::Spool(ref inner) if inner.kind() == SpoolErrorKind::JobNotFound
+    ));
+    assert_eq!(
+        store.read_migration_phase(job_uuid).unwrap().disposition,
+        MigrationDisposition::Failed
+    );
+
+    // If the terminal write path itself breaks, the settlement failure is
+    // surfaced rather than masked as a settled original error.
+    let job_uuid = Uuid::new_v4();
+    store.create_migration_phase(job_uuid).unwrap();
+    store
+        .fail_next_migration_phase_commit_for_test(job_uuid)
+        .unwrap();
+    let cause = ExportError::Spool(store.read_migration_phase(Uuid::new_v4()).unwrap_err());
+    let returned = super::settle_fresh_export(&store, Some(job_uuid), Err(cause));
+    assert!(matches!(
+        returned.expect_err("a broken terminal write must fail closed"),
+        ExportError::Spool(ref inner) if inner.kind() == SpoolErrorKind::Io
+    ));
+    assert_eq!(
+        store.read_migration_phase(job_uuid).unwrap().disposition,
+        MigrationDisposition::Running
+    );
+}
+
 #[tokio::test]
 async fn export_resume_skips_completed_ids_through_checkpoint_handle() {
     let tmp = TempDir::new().unwrap();
     let store = store_at(tmp.path());
     let (digest, denominators) = seed_digest().await;
-    let view = store.create_export(&digest, denominators).unwrap();
+    let view = create_export_for_test(&store, uuid::Uuid::new_v4(), &digest, denominators).unwrap();
 
     // Simulate a crash that already published one document page.
     store
@@ -289,7 +490,7 @@ async fn export_resume_accepts_reordered_inserted_source_and_refuses_mutation() 
     let source_documents = documents_with_inserted();
     let (digest, denominators) =
         seed_digest_for(record_with_entries(4), source_documents.clone()).await;
-    let view = store.create_export(&digest, denominators).unwrap();
+    let view = create_export_for_test(&store, uuid::Uuid::new_v4(), &digest, denominators).unwrap();
 
     for completed_id in ["doc-1", "doc-2"] {
         let payload = format!(r#"[{{"objectID":"{completed_id}"}}]"#);
@@ -346,7 +547,8 @@ async fn export_resume_accepts_reordered_inserted_source_and_refuses_mutation() 
         "Accepted"
     );
 
-    let mutation_view = store.create_export(&digest, denominators).unwrap();
+    let mutation_view =
+        create_export_for_test(&store, uuid::Uuid::new_v4(), &digest, denominators).unwrap();
     store
         .commit_document_page_with_ids(
             mutation_view.job_uuid,
@@ -408,7 +610,7 @@ async fn export_resume_refuses_mutated_source_without_new_artifacts() {
     let tmp = TempDir::new().unwrap();
     let store = store_at(tmp.path());
     let (digest, denominators) = seed_digest().await;
-    let view = store.create_export(&digest, denominators).unwrap();
+    let view = create_export_for_test(&store, uuid::Uuid::new_v4(), &digest, denominators).unwrap();
     store
         .commit_document_page_with_ids(view.job_uuid, br#"[{"objectID":"doc-1"}]"#, &["doc-1"])
         .unwrap();
@@ -457,7 +659,7 @@ async fn export_drift_during_streaming_fences_the_job() {
     drifted.updated_at = "2026-07-15T01:00:00Z".to_string();
     reader.push_quiescent(drifted);
 
-    let error = export_algolia_source(&store, &mut reader)
+    let error = export_algolia_source(&store, Uuid::new_v4(), &mut reader)
         .await
         .expect_err("final metadata drift must be rejected");
     assert!(matches!(error, ExportError::Source(_)));

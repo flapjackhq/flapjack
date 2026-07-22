@@ -153,6 +153,19 @@ fn create_algolia_experiment_body(index_name: &str) -> serde_json::Value {
     })
 }
 
+async fn seed_exact_index_collision_fixture(app: &Router) {
+    for index_name in ["products", "Products", "products_staging", "orders"] {
+        let response = send_json_request(
+            app,
+            Method::POST,
+            "/2/abtests",
+            create_algolia_experiment_body(index_name),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
 fn create_experiment_body_for_index(index_name: &str) -> serde_json::Value {
     create_algolia_experiment_body(index_name)
 }
@@ -1820,6 +1833,92 @@ async fn list_experiments_filter_applied_before_pagination() {
     let json = body_json(resp).await;
     assert_eq!(json["total"], 3, "all prod_ indices end in _v1");
     assert_eq!(json["count"], 3);
+}
+
+#[tokio::test]
+async fn list_experiments_filters_by_exact_index_name() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_experiments_state(&tmp);
+    let app = app_router(state);
+    seed_exact_index_collision_fixture(&app).await;
+
+    let response = send_empty_request(&app, Method::GET, "/2/abtests?indexName=products").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["count"], 1);
+    assert_eq!(json["total"], 1);
+    let abtests = json["abtests"]
+        .as_array()
+        .expect("abtests must be an array");
+    assert_eq!(abtests.len(), 1);
+    assert_eq!(abtests[0]["variants"][0]["index"], "products");
+}
+
+#[tokio::test]
+async fn list_experiments_exact_index_name_no_match_is_empty() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_experiments_state(&tmp);
+    let app = app_router(state);
+    seed_exact_index_collision_fixture(&app).await;
+
+    let response =
+        send_empty_request(&app, Method::GET, "/2/abtests?indexName=does_not_exist").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert!(json["abtests"].is_null());
+    assert_eq!(json["count"], 0);
+    assert_eq!(json["total"], 0);
+}
+
+#[tokio::test]
+async fn list_experiments_exact_index_name_composes_with_prefix_and_suffix() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_experiments_state(&tmp);
+    let app = app_router(state);
+    seed_exact_index_collision_fixture(&app).await;
+
+    let matching_response = send_empty_request(
+        &app,
+        Method::GET,
+        "/2/abtests?indexName=products&indexPrefix=prod&indexSuffix=cts",
+    )
+    .await;
+    assert_eq!(matching_response.status(), StatusCode::OK);
+    let matching_json = body_json(matching_response).await;
+    assert_eq!(matching_json["count"], 1);
+    assert_eq!(matching_json["total"], 1);
+    let abtests = matching_json["abtests"]
+        .as_array()
+        .expect("abtests must be an array");
+    assert_eq!(abtests.len(), 1);
+    assert_eq!(abtests[0]["variants"][0]["index"], "products");
+
+    let conflicting_response = send_empty_request(
+        &app,
+        Method::GET,
+        "/2/abtests?indexName=products&indexPrefix=prod&indexSuffix=_staging",
+    )
+    .await;
+    assert_eq!(conflicting_response.status(), StatusCode::OK);
+    let conflicting_json = body_json(conflicting_response).await;
+    assert!(conflicting_json["abtests"].is_null());
+    assert_eq!(conflicting_json["count"], 0);
+    assert_eq!(conflicting_json["total"], 0);
+}
+
+#[tokio::test]
+async fn list_experiments_exact_index_name_empty_string_matches_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_experiments_state(&tmp);
+    let app = app_router(state);
+    seed_exact_index_collision_fixture(&app).await;
+
+    let response = send_empty_request(&app, Method::GET, "/2/abtests?indexName=").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert!(json["abtests"].is_null());
+    assert_eq!(json["count"], 0);
+    assert_eq!(json["total"], 0);
 }
 
 #[tokio::test]

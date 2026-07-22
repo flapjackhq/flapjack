@@ -33,6 +33,15 @@ pub enum RepairArtifactEvidence {
     MatchesNew,
     Mismatch,
     Unreadable,
+    /// An empty tree where the journal records no prior target. In the target
+    /// position this is the still-held reservation of a create-only activation that
+    /// crashed before promoting; in the staging or backup position it carries no
+    /// reservation meaning and is simply an empty tree.
+    ///
+    /// This is only distinguishable from real content because a prior tree would
+    /// have been digested into `prior_digest`. An empty tree recorded against a
+    /// prior digest is data loss, not a reservation, and stays [`Self::Mismatch`].
+    Reservation,
 }
 
 /// Immutable evidence consumed by the publication repair decision table.
@@ -529,9 +538,16 @@ fn classify_tree_evidence(
     match canonical_tenant_tree_digest(path, inventory) {
         Ok(digest) if &digest == new_digest => RepairArtifactEvidence::MatchesNew,
         Ok(digest) if old_digest == Some(&digest) => RepairArtifactEvidence::MatchesOld,
+        // Ordered after both digest matches so a tree that is genuinely the old or
+        // new content is never reclassified as a reservation.
+        Ok(_) if old_digest.is_none() && tree_is_empty(path) => RepairArtifactEvidence::Reservation,
         Ok(_) => RepairArtifactEvidence::Mismatch,
         Err(_) => RepairArtifactEvidence::Unreadable,
     }
+}
+
+fn tree_is_empty(path: &Path) -> bool {
+    fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
 fn complete_publication_repair(
@@ -566,6 +582,11 @@ fn rollback_publication_repair(
     if paths.backup.exists() {
         remove_path_if_exists(&paths.target, io)?;
         rename_path(&paths.backup, &paths.target, io)?;
+    } else if journal.prior_digest.is_none() {
+        // No prior tree was ever digested, so anything still at the target belongs to
+        // this rolled-back transaction — a create-only reservation. This mirrors the
+        // executor's own rollback, which likewise removes the target it created.
+        remove_path_if_exists(&paths.target, io)?;
     }
     io.checkpoint(PublicationFaultPoint::AfterRepairTargetRename)?;
     restore_journaled_sidecars(paths, manifest, io)?;
@@ -627,35 +648,37 @@ fn journal_temp_path(paths: &PublicationPaths) -> PathBuf {
 }
 
 fn decide_prepared(evidence: RepairEvidence) -> RepairDecision {
-    use RepairArtifactEvidence::{MatchesNew as New, MatchesOld as Old, Missing};
+    use RepairArtifactEvidence::{MatchesNew as New, MatchesOld as Old, Missing, Reservation};
     match (evidence.target, evidence.backup, evidence.staging) {
         (Old, Missing, New) | (Missing, Old, New) | (New, Old, Missing) => RepairDecision::Complete,
         (Missing, Old, Missing) | (Old, Missing, Missing) => RepairDecision::Rollback,
+        // A create-only activation crashed while holding its reservation. Nothing was
+        // committed and nothing existed before it, so the bounded action is to undo
+        // the transaction: drop the uncommitted staging tree and hand the name back.
+        // Completing instead would publish content no caller was ever acknowledged.
+        (Reservation, Missing, New | Missing) => RepairDecision::Rollback,
         _ => RepairDecision::Quarantine,
     }
 }
 
 fn decide_committed(evidence: RepairEvidence) -> RepairDecision {
-    use RepairArtifactEvidence::{MatchesNew as New, MatchesOld as Old, Missing};
+    use RepairArtifactEvidence::{MatchesNew as New, MatchesOld as Old, Mismatch, Missing};
     match (evidence.target, evidence.backup, evidence.staging) {
-        (New, Missing, Missing) => RepairDecision::None,
+        (New | Mismatch, Missing, Missing) => RepairDecision::None,
         (New, Old, Missing) => RepairDecision::Cleanup,
         _ => RepairDecision::Quarantine,
     }
 }
 
 fn decide_rolled_back(evidence: RepairEvidence) -> RepairDecision {
-    use RepairArtifactEvidence::{MatchesOld as Old, Missing};
+    use RepairArtifactEvidence::{MatchesOld as Old, Mismatch, Missing};
     match (evidence.target, evidence.backup, evidence.staging) {
-        (Old, Missing, Missing) | (Missing, Missing, Missing) => RepairDecision::None,
+        (Old | Mismatch, Missing, Missing) | (Missing, Missing, Missing) => RepairDecision::None,
         (Old, Missing, _) | (Missing, Missing, _) => RepairDecision::Cleanup,
         _ => RepairDecision::Quarantine,
     }
 }
 
 fn is_untrusted_artifact(evidence: RepairArtifactEvidence) -> bool {
-    matches!(
-        evidence,
-        RepairArtifactEvidence::Mismatch | RepairArtifactEvidence::Unreadable
-    )
+    matches!(evidence, RepairArtifactEvidence::Unreadable)
 }

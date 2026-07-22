@@ -32,13 +32,14 @@ class UninstallTest extends TestCase {
             'flapjack_enable_instant',
             'flapjack_posts_per_page',
             'flapjack_searchable_attrs',
+            \Flapjack\WordPress\Status\FailureReporter::OPTION,
         ];
 
         foreach ( $option_keys as $key ) {
             update_option( $key, 'test-value' );
         }
 
-        // Verify all 10 options exist.
+        // Verify every option exists.
         foreach ( $option_keys as $key ) {
             $this->assertArrayHasKey( $key, $wp_options, "Option {$key} should exist before uninstall" );
         }
@@ -86,6 +87,16 @@ class UninstallTest extends TestCase {
 
         $this->assertSame( 'My Blog', get_option( 'blogname' ) );
         $this->assertFalse( get_option( 'flapjack_app_id' ) );
+    }
+
+    public function test_uninstall_deletes_durable_failure_record_without_touching_unrelated_options(): void {
+        update_option( \Flapjack\WordPress\Status\FailureReporter::OPTION, [ 'operation' => 'index_post' ] );
+        update_option( 'blogname', 'My Blog' );
+
+        $this->run_uninstall();
+
+        $this->assertFalse( get_option( \Flapjack\WordPress\Status\FailureReporter::OPTION ) );
+        $this->assertSame( 'My Blog', get_option( 'blogname' ) );
     }
 
     public function test_uninstall_deletes_reindex_progress_transient(): void {

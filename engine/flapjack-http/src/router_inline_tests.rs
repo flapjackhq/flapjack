@@ -85,8 +85,11 @@ fn build_test_router_with_state_for_data_dir(
         key_store,
         analytics_collector,
         trusted_proxy_matcher,
-        CorsMode::LoopbackOnly,
         data_dir,
+        RouterConfig {
+            cors_mode: CorsMode::LoopbackOnly,
+            disable_dashboard: false,
+        },
     );
 
     (app, state)

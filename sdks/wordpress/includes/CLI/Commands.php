@@ -18,6 +18,7 @@ namespace Flapjack\WordPress\CLI;
 
 use Flapjack\WordPress\ClientFactory;
 use Flapjack\WordPress\Indexing\IndexManager;
+use Flapjack\WordPress\Status\FailureReporter;
 
 class Commands {
 
@@ -116,12 +117,32 @@ class Commands {
             [ 'Indexed Post Types', implode( ', ', $post_types ) ],
             [ 'Backend Search', get_option( 'flapjack_enable_search', true ) ? 'Enabled' : 'Disabled' ],
             [ 'Instant Search', get_option( 'flapjack_enable_instant', false ) ? 'Enabled' : 'Disabled' ],
+            [ 'Last Failure', $this->format_last_failure() ],
         ];
 
         $table = new \cli\Table();
         $table->setHeaders( $rows[0] );
         $table->setRows( array_slice( $rows, 1 ) );
         $table->display();
+    }
+
+    /**
+     * Render the reporter's latest failure as a single status line, reading the
+     * already-sanitized reporter record rather than recomputing failure state.
+     */
+    private function format_last_failure(): string {
+        $failure = FailureReporter::latest();
+
+        if ( null === $failure ) {
+            return '(none)';
+        }
+
+        return sprintf(
+            '%s/%s: %s',
+            $failure['operation'] ?? 'unknown',
+            $failure['source'] ?? 'unknown',
+            $failure['message'] ?? ''
+        );
     }
 
     /**

@@ -2867,7 +2867,7 @@
           "migration"
         ],
         "summary": "One-click migration from Algolia to Flapjack.",
-        "description": "Validates the requested source and target shape, then refuses HA clusters\nbefore import admission. Standalone requests are temporarily refused without\nreading Algolia or writing Flapjack data because the destination import leg\nis not implemented.",
+        "description": "Validates the requested source and target shape, refuses overwrite and HA\nrequests before import admission, then synchronously imports the Algolia\nsource into a create-only Flapjack target. A successful response reports the\ncounts read back from the activated target; this lane has no durable async\njob id and returns a fixed `taskID` of `0`.",
         "operationId": "migrate_from_algolia",
         "requestBody": {
           "content": {
@@ -2880,11 +2880,175 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "description": "Synchronous Algolia import completed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MigrateFromAlgoliaResponse"
+                }
+              }
+            }
+          },
           "400": {
-            "description": "Invalid migration request"
+            "description": "Invalid migration request or unsupported source payload"
+          },
+          "409": {
+            "description": "Target index already exists"
+          },
+          "502": {
+            "description": "Upstream Algolia request failed"
           },
           "503": {
-            "description": "migration_ha_unsupported or migration_import_unavailable"
+            "description": "migration_ha_unsupported"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/1/migrations/algolia": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Additive async Algolia migration submission endpoint.",
+        "description": "This route admits the same create-only migration request as the synchronous\n`/1/migrate-from-algolia` endpoint, immediately returns the durable\nadmission snapshot, and leaves the synchronous endpoint unchanged.",
+        "operationId": "submit_algolia_migration",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MigrateFromAlgoliaRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Async Algolia migration admitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsyncMigrationStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid migration request or unsupported source payload"
+          },
+          "500": {
+            "description": "Migration admission persistence failed"
+          },
+          "502": {
+            "description": "Upstream Algolia request failed"
+          },
+          "503": {
+            "description": "migration_ha_unsupported or migration_capacity_exhausted"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/1/migrations/algolia/{job_id}": {
+      "get": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Return the durable status for an async Algolia migration job.",
+        "description": "A 404 means no durable phase record is currently retained for the UUID; it\nis not proof that the UUID never existed because future MIG-9 retention may\nremove old records.",
+        "operationId": "get_algolia_migration_status",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Migration job UUID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Durable async Algolia migration status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsyncMigrationStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid migration job UUID"
+          },
+          "404": {
+            "description": "No durable migration phase record is currently retained for the UUID"
+          },
+          "500": {
+            "description": "Migration status record could not be read"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/1/migrations/algolia/{job_id}/cancel": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Request cooperative cancellation for an async Algolia migration job.",
+        "description": "Cancellation is durable and cooperative. Jobs that have not reached the\npublication commit boundary observe the request at their next checkpoint;\nterminal jobs are returned unchanged, and post-commit running jobs are too\nlate to cancel because Stage 2 never rolls back a committed target.",
+        "operationId": "cancel_algolia_migration",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Migration job UUID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Durable async Algolia migration status after cancel request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsyncMigrationStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid migration job UUID"
+          },
+          "404": {
+            "description": "No durable migration phase record is currently retained for the UUID"
+          },
+          "409": {
+            "description": "cancel_too_late"
+          },
+          "500": {
+            "description": "Migration cancel request could not be persisted"
           }
         },
         "security": [
@@ -3321,7 +3485,7 @@
         "tags": [
           "experiments"
         ],
-        "summary": "Lists experiments with Algolia-compatible pagination and optional index name\nprefix/suffix filtering.",
+        "summary": "Lists experiments with Algolia-compatible pagination and optional exact, prefix, or suffix index-name filtering.",
         "operationId": "list_experiments",
         "parameters": [
           {
@@ -3342,6 +3506,15 @@
             "schema": {
               "type": "integer",
               "minimum": 0
+            }
+          },
+          {
+            "name": "indexName",
+            "in": "query",
+            "description": "Filter experiments by exact index name",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           },
           {
@@ -4665,6 +4838,97 @@
           }
         }
       }
+    },
+    "/internal/cluster/peers": {
+      "post": {
+        "tags": [
+          "cluster"
+        ],
+        "summary": "Add one peer to the live replication membership without changing bootstrap config.",
+        "operationId": "add_cluster_peer",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddPeerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Peer added to runtime membership",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AddPeerResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid peer or replication is not configured"
+          },
+          "403": {
+            "description": "Admin API key is required"
+          },
+          "409": {
+            "description": "Peer conflicts with current runtime membership"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/internal/cluster/peers/{node_id}": {
+      "delete": {
+        "tags": [
+          "cluster"
+        ],
+        "summary": "Remove one peer from the live replication membership without changing bootstrap config.",
+        "operationId": "remove_cluster_peer",
+        "parameters": [
+          {
+            "name": "node_id",
+            "in": "path",
+            "description": "Runtime peer node identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Peer removed from runtime membership",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemovePeerResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Replication is not configured"
+          },
+          "403": {
+            "description": "Admin API key is required"
+          },
+          "404": {
+            "description": "Peer is not in runtime membership"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -4773,6 +5037,41 @@
           }
         ],
         "description": "Response variants for document ingestion endpoints.\n\n- `Algolia` — single-index batch with a scalar `taskID`.\n- `MultiIndexAlgolia` — multi-index batch with per-index `taskID` map.\n- `Legacy` — Meilisearch-style response with `task_uid` and `status`."
+      },
+      "AddPeerRequest": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "addr"
+        ],
+        "properties": {
+          "addr": {
+            "type": "string"
+          },
+          "node_id": {
+            "type": "string"
+          }
+        }
+      },
+      "AddPeerResponse": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "addr",
+          "peers_total"
+        ],
+        "properties": {
+          "addr": {
+            "type": "string"
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "peers_total": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
       },
       "AlgoliaAbTest": {
         "type": "object",
@@ -6396,6 +6695,91 @@
           "zeroResultRate": {
             "type": "number",
             "format": "double"
+          }
+        }
+      },
+      "AsyncMigrationDisposition": {
+        "type": "string",
+        "enum": [
+          "running",
+          "succeeded",
+          "failed",
+          "cancelled"
+        ]
+      },
+      "AsyncMigrationExportProgress": {
+        "type": "object",
+        "required": [
+          "completed",
+          "total"
+        ],
+        "properties": {
+          "completed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "AsyncMigrationPhase": {
+        "type": "string",
+        "enum": [
+          "submitted",
+          "exporting",
+          "preparing",
+          "staging",
+          "activating"
+        ]
+      },
+      "AsyncMigrationStatusResponse": {
+        "type": "object",
+        "required": [
+          "jobId",
+          "phase",
+          "disposition",
+          "createdAt",
+          "updatedAt"
+        ],
+        "properties": {
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "disposition": {
+            "$ref": "#/components/schemas/AsyncMigrationDisposition"
+          },
+          "exportProgress": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AsyncMigrationExportProgress"
+              }
+            ]
+          },
+          "jobId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "phase": {
+            "$ref": "#/components/schemas/AsyncMigrationPhase"
+          },
+          "terminalAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
           }
         }
       },
@@ -8123,7 +8507,7 @@
       },
       "MigrateFromAlgoliaRequest": {
         "type": "object",
-        "description": "Request payload for migrating an index from Algolia to Flapjack.\n\nContains Algolia credentials, the source index name, and optional target\nindex settings. Valid requests on HA clusters are refused before import\nadmission; standalone requests are temporarily refused without writing data\nuntil the destination import leg is implemented.",
+        "description": "Request payload for migrating an index from Algolia to Flapjack.\n\nContains Algolia credentials, the source index name, and optional target\nindex settings. Valid requests on HA clusters are refused before import\nadmission; standalone requests synchronously export, translate, stage, and\ncreate-only publish the target index.",
         "required": [
           "appId",
           "apiKey",
@@ -8138,7 +8522,7 @@
           },
           "overwrite": {
             "type": "boolean",
-            "description": "Reserved for the future import leg. Valid requests are currently refused\nwithout deleting or overwriting any target index."
+            "description": "Reserved for a future replacement lane. The synchronous import path is\ncreate-only and refuses overwrite requests before import admission."
           },
           "sourceIndex": {
             "type": "string"
@@ -8180,6 +8564,49 @@
           "taskID": {
             "type": "integer",
             "format": "int64"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MigrateWarning"
+            }
+          }
+        }
+      },
+      "MigrateWarning": {
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "resource",
+          "jsonPath"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "itemIndex": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "jsonPath": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "pageIndex": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "resource": {
+            "type": "string"
           }
         }
       },
@@ -8634,6 +9061,22 @@
           "processingTimeMS": {
             "type": "integer",
             "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "RemovePeerResponse": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "peers_total"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string"
+          },
+          "peers_total": {
+            "type": "integer",
             "minimum": 0
           }
         }
@@ -9820,6 +10263,16 @@
                 "items": {
                   "type": "string"
                 }
+              },
+              "attributesToIndex": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                },
+                "description": "Deprecated Algolia alias of `searchableAttributes`. Persisted verbatim with no\nruntime behavior so legacy client payloads and migrated settings round-trip."
               },
               "attributesToRetrieve": {
                 "type": [

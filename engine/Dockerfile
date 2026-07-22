@@ -30,6 +30,7 @@ COPY engine/package ./package
 
 # Copy built dashboard (required by RustEmbed)
 COPY --from=dashboard-builder /app/dist ./dashboard/dist
+ENV FLAPJACK_REQUIRE_DASHBOARD=1
 
 # rust:1 is based on Debian trixie (GLIBC 2.41, GCC 14). usearch/simsimd requires
 # GLIBC_2.39+ and CXXABI_1.3.15 (GCC 14) at runtime, so the runtime image must

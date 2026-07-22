@@ -4,6 +4,7 @@ use flapjack::index::manager::validate_index_name;
 use flapjack::index::replica::{parse_replica_entry, standard_replica_names, ReplicaEntry};
 use flapjack::index::settings::IndexSettings;
 use flapjack::types::Document;
+use flapjack::IndexManager;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -135,22 +136,46 @@ pub(crate) fn persist_replica_primary_links(
                 std::fs::create_dir_all(state.manager.base_path.join(replica_name))?;
             }
         }
-
-        let settings_path = state
-            .manager
-            .base_path
-            .join(replica_name)
-            .join("settings.json");
-        let mut settings = if settings_path.exists() {
-            IndexSettings::load(&settings_path)?
-        } else {
-            IndexSettings::default()
-        };
-        settings.primary = Some(primary_index_name.to_string());
-        settings.save(&settings_path)?;
-        state.manager.invalidate_settings_cache(replica_name);
-        state.manager.invalidate_facet_cache(replica_name);
+        persist_replica_primary_link_with_settings(
+            &state.manager,
+            primary_index_name,
+            replica,
+            None,
+        )?;
     }
+    Ok(())
+}
+
+/// Persist the `primary` link for a single replica, optionally merging translated
+/// settings (ranking, custom_ranking, relevancy_strictness) from migration.
+///
+/// When `replica_settings` is `Some`, those ranking fields are written into the
+/// sidecar alongside the forced `primary` link. The caller owns directory
+/// creation; this function owns settings persistence and cache invalidation.
+pub(crate) fn persist_replica_primary_link_with_settings(
+    manager: &Arc<IndexManager>,
+    primary_index_name: &str,
+    replica: &ReplicaEntry,
+    replica_settings: Option<&IndexSettings>,
+) -> Result<(), FlapjackError> {
+    validate_index_name(primary_index_name)?;
+    let replica_name = replica.name();
+    validate_index_name(replica_name)?;
+    let settings_path = manager.base_path.join(replica_name).join("settings.json");
+    let mut settings = if settings_path.exists() {
+        IndexSettings::load(&settings_path)?
+    } else {
+        IndexSettings::default()
+    };
+    settings.primary = Some(primary_index_name.to_string());
+    if let Some(source) = replica_settings {
+        settings.ranking = source.ranking.clone();
+        settings.custom_ranking = source.custom_ranking.clone();
+        settings.relevancy_strictness = source.relevancy_strictness;
+    }
+    settings.save(&settings_path)?;
+    manager.invalidate_settings_cache(replica_name);
+    manager.invalidate_facet_cache(replica_name);
     Ok(())
 }
 
@@ -258,7 +283,7 @@ mod tests {
         manager.set_dictionary_manager(Arc::clone(&dictionary_manager));
 
         Arc::new(AppState {
-            manager,
+            manager: Arc::clone(&manager),
             key_store: None,
             replication_manager: None,
             ssl_manager: None,
@@ -272,6 +297,11 @@ mod tests {
             paused_indexes: crate::pause_registry::PausedIndexes::new(),
             geoip_reader: None,
             notification_service: None,
+            migration_runner: Arc::new(crate::handlers::migration::MigrationJobRunner::new(
+                Arc::clone(&manager),
+                None,
+                crate::handlers::migration::DEFAULT_ASYNC_MIGRATION_CAPACITY,
+            )),
             start_time: std::time::Instant::now(),
             conversation_store: crate::conversation_store::ConversationStore::default_shared(),
             embedder_store: Arc::new(crate::embedder_store::EmbedderStore::new()),
@@ -305,6 +335,25 @@ mod tests {
             &[ReplicaEntry::Virtual("replica_virtual".to_string())],
         )
         .expect_err("must reject");
+
+        assert!(
+            matches!(err, FlapjackError::InvalidQuery(_)),
+            "expected invalid query error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_replica_primary_link_with_settings_rejects_path_traversal_primary() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let manager = IndexManager::new(temp_dir.path());
+
+        let err = persist_replica_primary_link_with_settings(
+            &manager,
+            "../escape",
+            &ReplicaEntry::Virtual("replica_virtual".to_string()),
+            None,
+        )
+        .expect_err("must reject invalid primary names");
 
         assert!(
             matches!(err, FlapjackError::InvalidQuery(_)),

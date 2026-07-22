@@ -1,4 +1,3 @@
-//! Spool checkpoint and resume contracts for durable source exports.
 use super::*;
 use chrono::{TimeZone, Utc};
 use tempfile::TempDir;
@@ -34,13 +33,27 @@ fn export_resume_denominators() -> ResourceDenominators {
     }
 }
 
+fn create_export_for_test(
+    store: &SpoolStore,
+    job_uuid: uuid::Uuid,
+    source_identity_digest: &str,
+    denominators: ResourceDenominators,
+) -> SpoolResult<PublicExportView> {
+    store.create_migration_phase(job_uuid)?;
+    store.create_export(job_uuid, source_identity_digest, denominators)
+}
+
 #[test]
 fn export_resume_atomic_pages_publish_payload_and_exact_membership_together() {
     let tmp = TempDir::new().unwrap();
     let store = export_resume_store(&tmp);
-    let view = store
-        .create_export(&hex_digest(b"stable-source"), export_resume_denominators())
-        .unwrap();
+    let view = create_export_for_test(
+        &store,
+        uuid::Uuid::new_v4(),
+        &hex_digest(b"stable-source"),
+        export_resume_denominators(),
+    )
+    .unwrap();
 
     store
         .commit_document_page_with_ids(
@@ -87,9 +100,13 @@ fn export_resume_atomic_pages_publish_payload_and_exact_membership_together() {
 fn export_resume_completed_pages_are_noops_after_reopen_and_page_shift() {
     let tmp = TempDir::new().unwrap();
     let store = export_resume_store(&tmp);
-    let view = store
-        .create_export(&hex_digest(b"stable-source"), export_resume_denominators())
-        .unwrap();
+    let view = create_export_for_test(
+        &store,
+        uuid::Uuid::new_v4(),
+        &hex_digest(b"stable-source"),
+        export_resume_denominators(),
+    )
+    .unwrap();
     store
         .commit_document_page_with_ids(
             view.job_uuid,
@@ -158,9 +175,13 @@ fn export_resume_recovery_rolls_back_payload_and_membership_before_manifest_comm
     ] {
         let tmp = TempDir::new().unwrap();
         let store = export_resume_store(&tmp);
-        let view = store
-            .create_export(&hex_digest(b"stable-source"), export_resume_denominators())
-            .unwrap();
+        let view = create_export_for_test(
+            &store,
+            uuid::Uuid::new_v4(),
+            &hex_digest(b"stable-source"),
+            export_resume_denominators(),
+        )
+        .unwrap();
         commit_one(&store, view.job_uuid, resource, committed_id);
         let staged = store
             .pre_register_artifact_for_test(view.job_uuid, kind, "uncommitted payload")
@@ -198,9 +219,13 @@ fn export_resume_singleton_settings_is_atomic_and_idempotent_after_reopen() {
     let source_digest = hex_digest(b"stable-source");
     let settings = br#"{"attributesForFaceting":["category"]}"#;
     let settings_hash = hex_digest(settings);
-    let view = store
-        .create_export(&source_digest, export_resume_denominators())
-        .unwrap();
+    let view = create_export_for_test(
+        &store,
+        uuid::Uuid::new_v4(),
+        &source_digest,
+        export_resume_denominators(),
+    )
+    .unwrap();
 
     store
         .commit_settings_once(view.job_uuid, settings, &settings_hash)
@@ -238,9 +263,13 @@ fn export_resume_checkpoint_requires_exact_source_identity_without_advancing_sta
     let tmp = TempDir::new().unwrap();
     let store = export_resume_store(&tmp);
     let source_digest = hex_digest(b"stable-source");
-    let view = store
-        .create_export(&source_digest, export_resume_denominators())
-        .unwrap();
+    let view = create_export_for_test(
+        &store,
+        uuid::Uuid::new_v4(),
+        &source_digest,
+        export_resume_denominators(),
+    )
+    .unwrap();
     let before = store.manifest_json(view.job_uuid).unwrap();
 
     let error = store
@@ -264,7 +293,8 @@ fn export_resume_empty_resources_complete_and_terminal_states_fence_writes() {
         synonyms: 0,
         config: 0,
     };
-    let view = store.create_export(&source_digest, denominators).unwrap();
+    let view =
+        create_export_for_test(&store, uuid::Uuid::new_v4(), &source_digest, denominators).unwrap();
     let settings = br#"{"searchableAttributes":[]}"#;
     store
         .commit_settings_once(view.job_uuid, settings, &hex_digest(settings))
@@ -294,9 +324,13 @@ fn export_resume_empty_resources_complete_and_terminal_states_fence_writes() {
         SpoolErrorKind::JobTerminal
     );
 
-    let failed = store
-        .create_export(&hex_digest(b"failed-source"), export_resume_denominators())
-        .unwrap();
+    let failed = create_export_for_test(
+        &store,
+        uuid::Uuid::new_v4(),
+        &hex_digest(b"failed-source"),
+        export_resume_denominators(),
+    )
+    .unwrap();
     store.fail_export(failed.job_uuid).unwrap();
     assert_eq!(
         store
@@ -315,9 +349,13 @@ fn export_resume_empty_resources_complete_and_terminal_states_fence_writes() {
 fn export_resume_resource_completion_rejects_unverified_counts_and_incomplete_acceptance() {
     let tmp = TempDir::new().unwrap();
     let store = export_resume_store(&tmp);
-    let view = store
-        .create_export(&hex_digest(b"stable-source"), export_resume_denominators())
-        .unwrap();
+    let view = create_export_for_test(
+        &store,
+        uuid::Uuid::new_v4(),
+        &hex_digest(b"stable-source"),
+        export_resume_denominators(),
+    )
+    .unwrap();
 
     let count_error = store
         .complete_documents(view.job_uuid, 3, &hex_digest(b"documents"))
@@ -335,9 +373,13 @@ fn export_resume_nonempty_resource_completion_persists_verified_counts_and_hashe
     let tmp = TempDir::new().unwrap();
     let store = export_resume_store(&tmp);
     let source_digest = hex_digest(b"stable-source");
-    let view = store
-        .create_export(&source_digest, export_resume_denominators())
-        .unwrap();
+    let view = create_export_for_test(
+        &store,
+        uuid::Uuid::new_v4(),
+        &source_digest,
+        export_resume_denominators(),
+    )
+    .unwrap();
     let settings = b"{}";
     store
         .commit_settings_once(view.job_uuid, settings, &hex_digest(settings))

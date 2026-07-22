@@ -16,6 +16,7 @@ pub(crate) trait IndexResourceStore: Sized {
     fn save(&self, path: &Path) -> Result<(), FlapjackError>;
     fn insert(&mut self, item: Self::Item);
     fn remove(&mut self, object_id: &str) -> bool;
+    fn count(&self) -> usize;
     fn invalidate(manager: &IndexManager, index_name: &str);
 }
 
@@ -42,6 +43,10 @@ impl IndexResourceStore for RuleStore {
 
     fn remove(&mut self, object_id: &str) -> bool {
         RuleStore::remove(self, object_id).is_some()
+    }
+
+    fn count(&self) -> usize {
+        self.all().len()
     }
 
     fn invalidate(manager: &IndexManager, index_name: &str) {
@@ -72,6 +77,10 @@ impl IndexResourceStore for SynonymStore {
 
     fn remove(&mut self, object_id: &str) -> bool {
         SynonymStore::remove(self, object_id).is_some()
+    }
+
+    fn count(&self) -> usize {
+        self.values().count()
     }
 
     fn invalidate(manager: &IndexManager, index_name: &str) {

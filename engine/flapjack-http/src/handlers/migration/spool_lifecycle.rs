@@ -75,7 +75,9 @@ impl SpoolStore {
         validate_source_identity_digest(expected_source_identity_digest)?;
         let _root_lock = self.lock_root()?;
         for job_uuid in self.job_uuids()? {
-            let manifest = self.read_manifest(job_uuid)?;
+            let Some(manifest) = self.read_manifest_if_exists(job_uuid)? else {
+                continue;
+            };
             if manifest.checkpoint_handle != checkpoint_handle {
                 continue;
             }

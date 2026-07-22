@@ -2,15 +2,17 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::background_tasks::spawn_background_tasks;
-use crate::router::build_router;
+use crate::router::{build_router, RouterConfig};
 use crate::server_init::{
     initialize_infrastructure, initialize_state, log_startup_summary, StartupSummary,
 };
 use crate::startup::{
-    cors_origins_from_env, init_tracing, initialize_key_store, load_server_config,
-    log_memory_configuration, print_startup_banner, shutdown_signal,
-    shutdown_timeout_secs_from_env, AuthStatus, CorsMode,
+    cors_origins_from_env, exit_for_startup_auth_validation_error, init_tracing,
+    initialize_key_store, load_server_config, log_memory_configuration, print_startup_banner,
+    shutdown_signal, shutdown_timeout_secs_from_env, validate_startup_auth_policy, AuthStatus,
+    CorsMode, StartupAuthValidationOutcome, NO_AUTH_PUBLIC_BIND_WARNING,
 };
+use flapjack_replication::config::NodeConfig;
 
 #[cfg(test)]
 #[path = "server_startup_tests.rs"]
@@ -34,10 +36,24 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let cors_mode = cors_origins_from_env();
     let shutdown_timeout_secs = shutdown_timeout_secs_from_env();
     let data_dir = Path::new(&server_config.data_dir);
+    let node_config = NodeConfig::load_or_default(data_dir);
+    match validate_startup_auth_policy(
+        &server_config.env_mode,
+        server_config.no_auth,
+        server_config.admin_key_env.as_deref(),
+        &node_config.bind_addr,
+        server_config.allow_no_auth_public_bind,
+    ) {
+        Ok(StartupAuthValidationOutcome::Accepted) => {}
+        Ok(StartupAuthValidationOutcome::ExplicitlyAllowedPublicNoAuthBind) => {
+            tracing::warn!("{}", NO_AUTH_PUBLIC_BIND_WARNING);
+        }
+        Err(error) => exit_for_startup_auth_validation_error(error),
+    }
     let (key_store, admin_key, key_is_new) = initialize_key_store(&server_config, data_dir);
 
     let mut infrastructure =
-        initialize_infrastructure(&server_config, data_dir, admin_key.clone()).await?;
+        initialize_infrastructure(&server_config, data_dir, admin_key.clone(), node_config).await?;
 
     #[cfg(feature = "otel")]
     {
@@ -75,8 +91,11 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         key_store,
         Arc::clone(&infrastructure.analytics_collector),
         Arc::clone(&infrastructure.trusted_proxy_matcher),
-        cors_mode,
         data_dir,
+        RouterConfig {
+            cors_mode,
+            disable_dashboard: server_config.disable_dashboard,
+        },
     );
 
     let listener = tokio::net::TcpListener::bind(&infrastructure.bind_addr).await?;
@@ -117,6 +136,11 @@ where
         .manager
         .repair_publications_before_serve()
         .map_err(|error| format!("pre-serve publication repair failed: {error}"))?;
+    state
+        .migration_runner
+        .recover_async_jobs_before_serve(&reports)
+        .await
+        .map_err(|error| format!("pre-serve async migration recovery failed: {error}"))?;
     catchup.await?;
     Ok(reports)
 }
@@ -159,6 +183,7 @@ enum ShutdownWaitOutcome {
 
 /// Flushes analytics data then waits for the index manager to complete its graceful
 /// shutdown (flushing write queues), with a configurable timeout.
+#[cfg(test)]
 async fn flush_then_wait_for_manager_shutdown<FlushFn, ShutdownFuture>(
     shutdown_timeout_secs: u64,
     flush_analytics: FlushFn,
@@ -168,11 +193,36 @@ where
     FlushFn: FnOnce(),
     ShutdownFuture: std::future::Future<Output = ()>,
 {
-    flush_analytics();
+    flush_then_wait_for_migration_and_manager_shutdown(
+        shutdown_timeout_secs,
+        flush_analytics,
+        std::future::ready(()),
+        manager_shutdown,
+    )
+    .await
+}
 
+async fn flush_then_wait_for_migration_and_manager_shutdown<
+    FlushFn,
+    MigrationFuture,
+    ShutdownFuture,
+>(
+    shutdown_timeout_secs: u64,
+    flush_analytics: FlushFn,
+    migration_shutdown: MigrationFuture,
+    manager_shutdown: ShutdownFuture,
+) -> ShutdownWaitOutcome
+where
+    FlushFn: FnOnce(),
+    MigrationFuture: std::future::Future<Output = ()>,
+    ShutdownFuture: std::future::Future<Output = ()>,
+{
+    flush_analytics();
     match tokio::time::timeout(
         tokio::time::Duration::from_secs(shutdown_timeout_secs),
-        manager_shutdown,
+        async move {
+            let ((), ()) = tokio::join!(migration_shutdown, manager_shutdown);
+        },
     )
     .await
     {
@@ -184,6 +234,7 @@ where
 /// Run the full shutdown sequence: analytics flush, manager drain (with timeout),
 /// then OTEL provider shutdown. The `otel_shutdown` closure runs unconditionally
 /// after the manager drain path, even when the drain times out.
+#[cfg(test)]
 async fn full_graceful_shutdown<FlushFn, ShutdownFuture, OtelFn>(
     shutdown_timeout_secs: u64,
     flush_analytics: FlushFn,
@@ -198,6 +249,32 @@ where
     let outcome = flush_then_wait_for_manager_shutdown(
         shutdown_timeout_secs,
         flush_analytics,
+        manager_shutdown,
+    )
+    .await;
+
+    otel_shutdown();
+
+    outcome
+}
+
+async fn full_graceful_shutdown_with_migrations<FlushFn, MigrationFuture, ShutdownFuture, OtelFn>(
+    shutdown_timeout_secs: u64,
+    flush_analytics: FlushFn,
+    migration_shutdown: MigrationFuture,
+    manager_shutdown: ShutdownFuture,
+    otel_shutdown: OtelFn,
+) -> ShutdownWaitOutcome
+where
+    FlushFn: FnOnce(),
+    MigrationFuture: std::future::Future<Output = ()>,
+    ShutdownFuture: std::future::Future<Output = ()>,
+    OtelFn: FnOnce(),
+{
+    let outcome = flush_then_wait_for_migration_and_manager_shutdown(
+        shutdown_timeout_secs,
+        flush_analytics,
+        migration_shutdown,
         manager_shutdown,
     )
     .await;
@@ -226,7 +303,7 @@ async fn run_graceful_shutdown(
     let analytics_enabled = infrastructure.analytics_config.enabled;
     let analytics_collector = Arc::clone(&infrastructure.analytics_collector);
 
-    let outcome = full_graceful_shutdown(
+    let outcome = full_graceful_shutdown_with_migrations(
         shutdown_timeout_secs,
         move || {
             if analytics_enabled {
@@ -234,6 +311,7 @@ async fn run_graceful_shutdown(
                 tracing::info!("[shutdown] Analytics buffers flushed");
             }
         },
+        state.migration_runner.drain_active_imports(),
         state.manager.graceful_shutdown(),
         || shutdown_otel_provider(infrastructure),
     )
@@ -276,114 +354,5 @@ fn shutdown_otel_provider(infrastructure: &mut crate::server_init::Infrastructur
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        flush_then_wait_for_manager_shutdown, full_graceful_shutdown, ShutdownWaitOutcome,
-    };
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-    /// Ensures the shutdown helper reports success when the manager drain
-    /// completes before the configured timeout.
-    #[tokio::test]
-    async fn shutdown_wait_helper_returns_drained_when_manager_completes_before_deadline() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let flush_events = Arc::clone(&events);
-        let manager_events = Arc::clone(&events);
-
-        let outcome = flush_then_wait_for_manager_shutdown(
-            1,
-            move || flush_events.lock().unwrap().push("analytics-flushed"),
-            async move {
-                manager_events.lock().unwrap().push("manager-wait-begins");
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            },
-        )
-        .await;
-
-        assert_eq!(outcome, ShutdownWaitOutcome::Drained);
-        assert_eq!(
-            events.lock().unwrap().as_slice(),
-            ["analytics-flushed", "manager-wait-begins"]
-        );
-    }
-    /// Ensures the shutdown helper reports a timeout when the manager drain
-    /// exceeds the configured deadline.
-    #[tokio::test]
-    async fn shutdown_wait_helper_returns_timed_out_when_manager_exceeds_deadline() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let flush_events = Arc::clone(&events);
-        let manager_events = Arc::clone(&events);
-
-        let outcome = flush_then_wait_for_manager_shutdown(
-            1,
-            move || flush_events.lock().unwrap().push("analytics-flushed"),
-            async move {
-                manager_events.lock().unwrap().push("manager-wait-begins");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            },
-        )
-        .await;
-
-        assert_eq!(outcome, ShutdownWaitOutcome::TimedOut);
-        assert_eq!(
-            events.lock().unwrap().as_slice(),
-            ["analytics-flushed", "manager-wait-begins"]
-        );
-    }
-
-    /// Ensures graceful shutdown flushes analytics, waits for the manager, and
-    /// then shuts OTEL down in that order on the success path.
-    #[tokio::test]
-    async fn full_graceful_shutdown_calls_otel_after_manager_drain() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let flush_events = Arc::clone(&events);
-        let manager_events = Arc::clone(&events);
-        let otel_events = Arc::clone(&events);
-
-        let outcome = full_graceful_shutdown(
-            5,
-            move || flush_events.lock().unwrap().push("analytics-flushed"),
-            async move {
-                manager_events.lock().unwrap().push("manager-drained");
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            },
-            move || otel_events.lock().unwrap().push("otel-shutdown"),
-        )
-        .await;
-
-        assert_eq!(outcome, ShutdownWaitOutcome::Drained);
-        assert_eq!(
-            events.lock().unwrap().as_slice(),
-            ["analytics-flushed", "manager-drained", "otel-shutdown"],
-            "shutdown order must be: analytics flush → manager drain → otel shutdown"
-        );
-    }
-
-    /// Ensures OTEL shutdown still runs when the manager drain times out so
-    /// tracing flush semantics stay deterministic.
-    #[tokio::test]
-    async fn full_graceful_shutdown_calls_otel_even_after_timeout() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let flush_events = Arc::clone(&events);
-        let manager_events = Arc::clone(&events);
-        let otel_events = Arc::clone(&events);
-
-        let outcome = full_graceful_shutdown(
-            1,
-            move || flush_events.lock().unwrap().push("analytics-flushed"),
-            async move {
-                manager_events.lock().unwrap().push("manager-wait-begins");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            },
-            move || otel_events.lock().unwrap().push("otel-shutdown"),
-        )
-        .await;
-
-        assert_eq!(outcome, ShutdownWaitOutcome::TimedOut);
-        assert_eq!(
-            events.lock().unwrap().as_slice(),
-            ["analytics-flushed", "manager-wait-begins", "otel-shutdown"],
-            "OTEL shutdown must run even when manager drain times out"
-        );
-    }
-}
+#[path = "server_shutdown_tests.rs"]
+mod tests;

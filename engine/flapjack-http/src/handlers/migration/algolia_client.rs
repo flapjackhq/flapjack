@@ -207,6 +207,19 @@ impl AlgoliaClient {
         self.execute_json(AlgoliaMethod::Get, path, None).await
     }
 
+    /// Fetch the complete settings JSON for an arbitrary index name (used to
+    /// collect replica-owned settings during migration). Reuses the same URL
+    /// encoding, response-size, and retry policy as every other source request,
+    /// and keeps 404/missing-replica and any other non-2xx outcome in the typed,
+    /// credential-scrubbed `AlgoliaClientError` owner.
+    pub(super) async fn index_settings(
+        &self,
+        index_name: &str,
+    ) -> Result<Value, AlgoliaClientError> {
+        let path = index_path(index_name, "settings");
+        self.execute_json(AlgoliaMethod::Get, path, None).await
+    }
+
     pub(super) async fn list_indexes(&self) -> Result<Vec<AlgoliaIndexRecord>, AlgoliaClientError> {
         let mut transport = ReqwestTransport {
             client: &self.client,

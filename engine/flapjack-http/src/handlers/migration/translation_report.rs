@@ -64,6 +64,11 @@ pub(in crate::handlers::migration) enum ReportCode {
     MalformedDocumentPayload,
     MalformedRulePayload,
     MalformedSynonymPayload,
+    ReplicaUnknownRankingToken,
+    ReplicaExhaustiveSortApproximated,
+    ReplicaPrimaryRelevancyStrictnessDropped,
+    ReplicaRelevancyStrictnessSemanticMismatch,
+    ReplicaMatchingCriticalFieldDiverges,
 }
 
 pub(super) fn non_portable_product_entries() -> Vec<TranslationReportEntry> {
@@ -169,6 +174,45 @@ pub(super) fn contains_hard_rejection(entries: &[TranslationReportEntry]) -> boo
         .any(|entry| entry.severity == ReportSeverity::HardRejection)
 }
 
+pub(in crate::handlers::migration) fn warning_message(code: ReportCode) -> Option<&'static str> {
+    Some(match code {
+        ReportCode::PersistedNoBehaviorSetting => {
+            "Source setting is preserved for compatibility but has no Flapjack behavior."
+        }
+        ReportCode::ReadOnlySourceField => {
+            "Source field is read-only in Flapjack and is not applied during migration."
+        }
+        ReportCode::ReplicaTopologyNotMigrated => {
+            "Replica topology contains an entry that cannot be translated, such as a malformed, self-referential, or colliding replica."
+        }
+        ReportCode::ReplicaUnknownRankingToken => {
+            "Replica ranking token is not recognized by Flapjack and was ignored."
+        }
+        ReportCode::ReplicaExhaustiveSortApproximated => {
+            "Algolia standard replica exhaustive sorting is approximated as a Flapjack virtual replica."
+        }
+        ReportCode::ReplicaPrimaryRelevancyStrictnessDropped => {
+            "Primary relevancyStrictness is not applied to translated replica settings."
+        }
+        ReportCode::ReplicaRelevancyStrictnessSemanticMismatch => {
+            "Algolia relevancyStrictness semantics differ from Flapjack deterministic-query ranking and may not produce identical ordering."
+        }
+        ReportCode::ReplicaMatchingCriticalFieldDiverges => {
+            "Replica setting changes matching-critical behavior that virtual replicas cannot independently reproduce."
+        }
+        ReportCode::ProductNotMigrated
+        | ReportCode::UnsupportedSourceField
+        | ReportCode::UnsupportedRuleSchema
+        | ReportCode::UnsupportedSynonymSchema
+        | ReportCode::InvalidObjectId
+        | ReportCode::DuplicateObjectId
+        | ReportCode::MalformedSettingsPayload
+        | ReportCode::MalformedDocumentPayload
+        | ReportCode::MalformedRulePayload
+        | ReportCode::MalformedSynonymPayload => return None,
+    })
+}
+
 pub(super) fn finalize_report(mut entries: Vec<TranslationReportEntry>) -> TranslationReport {
     entries.sort_by(|left, right| report_entry_sort_key(left).cmp(&report_entry_sort_key(right)));
     let summary = TranslationReportSummary {
@@ -249,5 +293,10 @@ fn report_code_rank(code: ReportCode) -> u8 {
         ReportCode::MalformedDocumentPayload => 10,
         ReportCode::MalformedRulePayload => 11,
         ReportCode::MalformedSynonymPayload => 12,
+        ReportCode::ReplicaUnknownRankingToken => 13,
+        ReportCode::ReplicaExhaustiveSortApproximated => 14,
+        ReportCode::ReplicaPrimaryRelevancyStrictnessDropped => 15,
+        ReportCode::ReplicaRelevancyStrictnessSemanticMismatch => 16,
+        ReportCode::ReplicaMatchingCriticalFieldDiverges => 17,
     }
 }

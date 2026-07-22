@@ -1,5 +1,12 @@
 use utoipa::OpenApi;
 
+pub(crate) const DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS: [&str; 2] = [
+    "/internal/cluster/peers",
+    "/internal/cluster/peers/{node_id}",
+];
+pub(crate) const DOCUMENTED_MEMBERSHIP_SCHEMA_NAMES: [&str; 3] =
+    ["AddPeerRequest", "AddPeerResponse", "RemovePeerResponse"];
+
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -18,6 +25,8 @@ use utoipa::OpenApi;
     ),
     paths(
         crate::handlers::health::health,
+        crate::handlers::internal::add_cluster_peer,
+        crate::handlers::internal::remove_cluster_peer,
         crate::handlers::indices::create_index,
         crate::handlers::indices::delete_index,
         crate::handlers::indices::list_indices,
@@ -139,6 +148,9 @@ use utoipa::OpenApi;
         crate::handlers::insights::delete_usertoken,
         // Stage 7: Migration
         crate::handlers::migration::migrate_from_algolia,
+        crate::handlers::migration::submit_algolia_migration,
+        crate::handlers::migration::get_algolia_migration_status,
+        crate::handlers::migration::cancel_algolia_migration,
         crate::handlers::migration::list_algolia_indexes,
         // Stage 7: Usage
         crate::handlers::usage::usage_global,
@@ -148,6 +160,9 @@ use utoipa::OpenApi;
     ),
     components(
         schemas(
+            crate::handlers::internal::AddPeerRequest,
+            crate::handlers::internal::AddPeerResponse,
+            crate::handlers::internal::RemovePeerResponse,
             crate::dto::CreateIndexRequest,
             crate::dto::IndexSchema,
             crate::dto::CreateIndexResponse,
@@ -307,7 +322,12 @@ use utoipa::OpenApi;
             // Stage 7: Migration
             crate::handlers::migration::MigrateFromAlgoliaRequest,
             crate::handlers::migration::MigrateFromAlgoliaResponse,
+            crate::handlers::migration::MigrateWarning,
             crate::handlers::migration::MigrateCount,
+            crate::handlers::migration::AsyncMigrationStatusResponse,
+            crate::handlers::migration::AsyncMigrationPhase,
+            crate::handlers::migration::AsyncMigrationDisposition,
+            crate::handlers::migration::AsyncMigrationExportProgress,
             crate::handlers::migration::ListAlgoliaIndexesRequest,
             crate::handlers::migration::AlgoliaIndexInfo,
             crate::handlers::migration::ListAlgoliaIndexesResponse,
@@ -343,6 +363,25 @@ use utoipa::OpenApi;
     modifiers(&SecurityAddon, &ChatSseAddon),
 )]
 pub struct ApiDoc;
+
+pub fn documented_openapi(auth_enabled: bool) -> utoipa::openapi::OpenApi {
+    let mut document = ApiDoc::openapi();
+    if auth_enabled {
+        return document;
+    }
+
+    for path in DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS {
+        document.paths.paths.remove(path);
+    }
+
+    if let Some(components) = document.components.as_mut() {
+        for schema in DOCUMENTED_MEMBERSHIP_SCHEMA_NAMES {
+            components.schemas.remove(schema);
+        }
+    }
+
+    document
+}
 
 struct SecurityAddon;
 

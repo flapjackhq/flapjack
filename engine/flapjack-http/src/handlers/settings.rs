@@ -218,6 +218,11 @@ pub struct SetSettingsRequest {
     )]
     pub numeric_attributes_for_filtering: Option<Vec<String>>,
 
+    /// Deprecated Algolia alias of `searchableAttributes`. Persisted verbatim with no
+    /// runtime behavior so legacy client payloads and migrated settings round-trip.
+    #[serde(rename = "attributesToIndex", skip_serializing_if = "Option::is_none")]
+    pub attributes_to_index: Option<Vec<String>>,
+
     #[serde(
         rename = "allowCompressionOfIntegerArray",
         skip_serializing_if = "Option::is_none"
@@ -540,6 +545,18 @@ fn save_settings(settings: &IndexSettings, path: &Path) -> Result<(), HandlerErr
         )),
         other => HandlerError::from(other.to_string()),
     })
+}
+
+pub(in crate::handlers) fn persist_index_settings(
+    manager: &flapjack::IndexManager,
+    index_name: &str,
+    settings: &IndexSettings,
+) -> Result<(), HandlerError> {
+    let settings_path = settings_file_path(&manager.base_path, index_name);
+    save_settings(settings, &settings_path)?;
+    manager.invalidate_settings_cache(index_name);
+    manager.invalidate_facet_cache(index_name);
+    Ok(())
 }
 
 /// Get index settings

@@ -47,6 +47,9 @@ fn fixed_path_acl(method: &Method, path: &str) -> Option<&'static str> {
     if path == "/1/migrate-from-algolia" || path == "/1/algolia-list-indexes" {
         return Some("admin");
     }
+    if path.starts_with("/1/migrations/") {
+        return Some("admin");
+    }
     if path.starts_with("/1/keys") || path.starts_with("/1/security/sources") {
         return Some("admin");
     }

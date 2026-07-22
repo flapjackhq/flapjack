@@ -100,6 +100,22 @@ fn committed_docs2_openapi_matches_export_output() {
         "get_experiment_results summary should not ship as a placeholder in the committed OpenAPI export"
     );
 }
+
+#[test]
+fn committed_demo_openapi_matches_export_output() {
+    let committed_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../demo-dualclient/public")
+        .join("openapi.json");
+    let committed = std::fs::read_to_string(&committed_path)
+        .expect("committed engine/demo-dualclient/public/openapi.json must be readable");
+    let expected = expected_openapi_json();
+
+    assert_eq!(
+        committed, expected,
+        "committed engine/demo-dualclient/public/openapi.json must be regenerated from current ApiDoc when routes or schemas change"
+    );
+}
+
 #[test]
 fn export_output_covers_recommend_personalization_and_experiments_routes() {
     let doc = exported_openapi_doc();

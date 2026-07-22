@@ -1,5 +1,3 @@
-//! Tests for `UsagePersistence`: atomic snapshot writes, save/load round-trips, daily rollup with counter reset, multi-index fidelity, and JSON validity.
-
 use crate::usage_middleware::TenantUsageCounters;
 use chrono::NaiveDate;
 use dashmap::DashMap;
@@ -18,6 +16,39 @@ pub struct IndexUsageSnapshot {
     pub bytes_received: u64,
     pub search_results_total: u64,
     pub documents_deleted: u64,
+    /// `None` preserves the distinction between absent legacy data and an explicit zero.
+    #[serde(default)]
+    pub documents_count: Option<u64>,
+    #[serde(default)]
+    pub storage_bytes: Option<u64>,
+}
+
+impl IndexUsageSnapshot {
+    /// View this day's persisted gauge options through the shared gauge type,
+    /// so gauge-name lookups have exactly one owner (`CapturedUsageGauges::get`).
+    pub fn captured_gauges(&self) -> CapturedUsageGauges {
+        CapturedUsageGauges {
+            documents_count: self.documents_count,
+            storage_bytes: self.storage_bytes,
+        }
+    }
+}
+
+/// Immutable per-index gauges captured at rollover time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CapturedUsageGauges {
+    pub documents_count: Option<u64>,
+    pub storage_bytes: Option<u64>,
+}
+
+impl CapturedUsageGauges {
+    pub fn get(&self, stat: &str) -> Option<u64> {
+        match stat {
+            "documents_count" => self.documents_count,
+            "storage_bytes" => self.storage_bytes,
+            _ => None,
+        }
+    }
 }
 
 /// A complete snapshot for one calendar day.
@@ -52,6 +83,21 @@ impl UsagePersistence {
         counters: &DashMap<String, TenantUsageCounters>,
     ) -> io::Result<()> {
         let snapshot = self.counters_to_snapshot(date, counters);
+        self.write_snapshot(date, &snapshot)
+    }
+
+    /// Save counters with caller-owned gauges captured at rollover time.
+    pub fn save_snapshot_with_gauges(
+        &self,
+        date: &str,
+        counters: &DashMap<String, TenantUsageCounters>,
+        gauges: &HashMap<String, CapturedUsageGauges>,
+    ) -> io::Result<()> {
+        let snapshot = self.counters_and_gauges_to_snapshot(date, counters, gauges);
+        self.write_snapshot(date, &snapshot)
+    }
+
+    fn write_snapshot(&self, date: &str, snapshot: &DailyUsageSnapshot) -> io::Result<()> {
         let json = serde_json::to_string_pretty(&snapshot).map_err(io::Error::other)?;
 
         let final_path = self.snapshot_path(date);
@@ -120,9 +166,22 @@ impl UsagePersistence {
         date: &str,
         counters: &DashMap<String, TenantUsageCounters>,
     ) -> io::Result<()> {
-        self.save_snapshot(date, counters)?;
+        self.rollup_with_gauges(date, counters, &HashMap::new())
+    }
 
-        // Reset all counters to zero for the new day.
+    /// Roll up counters with caller-owned gauges captured at rollover time.
+    pub fn rollup_with_gauges(
+        &self,
+        date: &str,
+        counters: &DashMap<String, TenantUsageCounters>,
+        gauges: &HashMap<String, CapturedUsageGauges>,
+    ) -> io::Result<()> {
+        self.save_snapshot_with_gauges(date, counters, gauges)?;
+        Self::reset_counters(counters);
+        Ok(())
+    }
+
+    fn reset_counters(counters: &DashMap<String, TenantUsageCounters>) {
         for entry in counters.iter() {
             entry.search_count.store(0, Ordering::Relaxed);
             entry.write_count.store(0, Ordering::Relaxed);
@@ -132,8 +191,6 @@ impl UsagePersistence {
             entry.documents_indexed_total.store(0, Ordering::Relaxed);
             entry.documents_deleted_total.store(0, Ordering::Relaxed);
         }
-
-        Ok(())
     }
 
     /// Load all snapshots in the inclusive date range `[start, end]`.
@@ -183,6 +240,15 @@ impl UsagePersistence {
         date: &str,
         counters: &DashMap<String, TenantUsageCounters>,
     ) -> DailyUsageSnapshot {
+        self.counters_and_gauges_to_snapshot(date, counters, &HashMap::new())
+    }
+
+    fn counters_and_gauges_to_snapshot(
+        &self,
+        date: &str,
+        counters: &DashMap<String, TenantUsageCounters>,
+        gauges: &HashMap<String, CapturedUsageGauges>,
+    ) -> DailyUsageSnapshot {
         let mut indexes = HashMap::new();
         for entry in counters.iter() {
             let stats = IndexUsageSnapshot {
@@ -193,8 +259,15 @@ impl UsagePersistence {
                 bytes_received: entry.bytes_in.load(Ordering::Relaxed),
                 search_results_total: entry.search_results_total.load(Ordering::Relaxed),
                 documents_deleted: entry.documents_deleted_total.load(Ordering::Relaxed),
+                documents_count: None,
+                storage_bytes: None,
             };
             indexes.insert(entry.key().clone(), stats);
+        }
+        for (index_name, captured) in gauges {
+            let stats = indexes.entry(index_name.clone()).or_default();
+            stats.documents_count = captured.documents_count;
+            stats.storage_bytes = captured.storage_bytes;
         }
         DailyUsageSnapshot {
             date: date.to_string(),
@@ -227,6 +300,151 @@ mod tests {
                 .fetch_add(2, Ordering::Relaxed);
         }
         counters
+    }
+
+    fn assert_zero_counters(snapshot: &IndexUsageSnapshot) {
+        assert_eq!(snapshot.search_operations, 0);
+        assert_eq!(snapshot.total_write_operations, 0);
+        assert_eq!(snapshot.total_read_operations, 0);
+        assert_eq!(snapshot.records, 0);
+        assert_eq!(snapshot.bytes_received, 0);
+        assert_eq!(snapshot.search_results_total, 0);
+        assert_eq!(snapshot.documents_deleted, 0);
+    }
+
+    #[test]
+    fn legacy_snapshot_without_gauges_loads_as_absent() {
+        let tmp = TempDir::new().unwrap();
+        let persistence = UsagePersistence::new(tmp.path()).unwrap();
+        let legacy_json = r#"{
+            "date": "2026-02-23",
+            "indexes": {
+                "legacy": {
+                    "search_operations": 11,
+                    "total_write_operations": 22,
+                    "total_read_operations": 33,
+                    "records": 44,
+                    "bytes_received": 55,
+                    "search_results_total": 66,
+                    "documents_deleted": 77
+                }
+            }
+        }"#;
+        std::fs::write(persistence.snapshot_path("2026-02-23"), legacy_json).unwrap();
+
+        let snapshot = persistence
+            .load_snapshot("2026-02-23")
+            .unwrap()
+            .expect("legacy snapshot should load");
+        let legacy = &snapshot.indexes["legacy"];
+        assert_eq!(legacy.search_operations, 11);
+        assert_eq!(legacy.total_write_operations, 22);
+        assert_eq!(legacy.total_read_operations, 33);
+        assert_eq!(legacy.records, 44);
+        assert_eq!(legacy.bytes_received, 55);
+        assert_eq!(legacy.search_results_total, 66);
+        assert_eq!(legacy.documents_deleted, 77);
+        assert_eq!(legacy.documents_count, None);
+        assert_eq!(legacy.storage_bytes, None);
+    }
+
+    #[test]
+    fn gauge_aware_save_preserves_optional_values_and_unions_indexes() {
+        let tmp = TempDir::new().unwrap();
+        let persistence = UsagePersistence::new(tmp.path()).unwrap();
+        let counters = make_counters();
+        let gauges = HashMap::from([
+            (
+                "products".to_string(),
+                CapturedUsageGauges {
+                    documents_count: Some(900),
+                    storage_bytes: None,
+                },
+            ),
+            (
+                "archive".to_string(),
+                CapturedUsageGauges {
+                    documents_count: None,
+                    storage_bytes: Some(8_192),
+                },
+            ),
+            (
+                "empty".to_string(),
+                CapturedUsageGauges {
+                    documents_count: Some(0),
+                    storage_bytes: Some(0),
+                },
+            ),
+        ]);
+
+        persistence
+            .save_snapshot_with_gauges("2026-02-26", &counters, &gauges)
+            .unwrap();
+
+        let snapshot = persistence
+            .load_snapshot("2026-02-26")
+            .unwrap()
+            .expect("snapshot should exist");
+        let mut names: Vec<_> = snapshot.indexes.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["archive", "empty", "products"]);
+
+        let products = &snapshot.indexes["products"];
+        assert_eq!(products.search_operations, 10);
+        assert_eq!(products.total_write_operations, 5);
+        assert_eq!(products.total_read_operations, 3);
+        assert_eq!(products.records, 42);
+        assert_eq!(products.bytes_received, 1024);
+        assert_eq!(products.search_results_total, 100);
+        assert_eq!(products.documents_deleted, 2);
+        assert_eq!(products.documents_count, Some(900));
+        assert_eq!(products.storage_bytes, None);
+
+        let archive = &snapshot.indexes["archive"];
+        assert_zero_counters(archive);
+        assert_eq!(archive.documents_count, None);
+        assert_eq!(archive.storage_bytes, Some(8_192));
+
+        let empty = &snapshot.indexes["empty"];
+        assert_zero_counters(empty);
+        assert_eq!(empty.documents_count, Some(0));
+        assert_eq!(empty.storage_bytes, Some(0));
+    }
+
+    #[test]
+    fn gauge_aware_rollup_resets_only_counters() {
+        let tmp = TempDir::new().unwrap();
+        let persistence = UsagePersistence::new(tmp.path()).unwrap();
+        let counters = make_counters();
+        let gauges = HashMap::from([(
+            "products".to_string(),
+            CapturedUsageGauges {
+                documents_count: Some(42),
+                storage_bytes: Some(4_096),
+            },
+        )]);
+        let captured_gauges = gauges.clone();
+
+        persistence
+            .rollup_with_gauges("2026-02-26", &counters, &gauges)
+            .unwrap();
+
+        let entry = counters.get("products").unwrap();
+        assert_eq!(entry.search_count.load(Ordering::Relaxed), 0);
+        assert_eq!(entry.write_count.load(Ordering::Relaxed), 0);
+        assert_eq!(entry.read_count.load(Ordering::Relaxed), 0);
+        assert_eq!(entry.bytes_in.load(Ordering::Relaxed), 0);
+        assert_eq!(entry.search_results_total.load(Ordering::Relaxed), 0);
+        assert_eq!(entry.documents_indexed_total.load(Ordering::Relaxed), 0);
+        assert_eq!(entry.documents_deleted_total.load(Ordering::Relaxed), 0);
+        assert_eq!(gauges, captured_gauges);
+
+        let snapshot = persistence
+            .load_snapshot("2026-02-26")
+            .unwrap()
+            .expect("snapshot should exist");
+        assert_eq!(snapshot.indexes["products"].documents_count, Some(42));
+        assert_eq!(snapshot.indexes["products"].storage_bytes, Some(4_096));
     }
 
     /// Verify that saving counters to disk and reloading them into a fresh `DashMap` produces identical values, simulating a server restart.

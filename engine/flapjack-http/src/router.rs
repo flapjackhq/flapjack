@@ -32,12 +32,16 @@ use crate::middleware::{
     allow_private_network, ensure_json_errors, normalize_content_type, request_id_middleware,
     TrustedProxyMatcher,
 };
-use crate::openapi::ApiDoc;
+use crate::openapi::documented_openapi;
 use crate::security_sources::SecuritySourcesMatcher;
 use crate::startup::CorsMode;
 use flapjack::analytics::AnalyticsCollector;
-use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
+
+pub struct RouterConfig {
+    pub cors_mode: CorsMode,
+    pub disable_dashboard: bool,
+}
 
 /// Constructs the full Axum router: mounts all route groups (index CRUD, search,
 /// keys, analytics, experiments, internal ops), applies middleware, and attaches
@@ -47,13 +51,12 @@ pub fn build_router(
     key_store: Option<Arc<KeyStore>>,
     analytics_collector: Arc<AnalyticsCollector>,
     trusted_proxy_matcher: Arc<TrustedProxyMatcher>,
-    cors_mode: CorsMode,
     data_dir: &Path,
+    config: RouterConfig,
 ) -> Router {
     let auth_enabled = key_store.is_some();
     let app = Router::new()
         .merge(build_health_routes(state.clone()))
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .merge(build_key_routes(key_store.clone()))
         .merge(build_protected_routes(state.clone(), data_dir))
         .merge(build_analytics_routes(
@@ -64,11 +67,18 @@ pub fn build_router(
         .merge(build_insights_routes(analytics_collector, data_dir))
         .merge(build_internal_routes(state.clone(), auth_enabled));
 
-    let app = app
+    let app = if config.disable_dashboard {
+        app
+    } else {
+        app.merge(
+            SwaggerUi::new("/swagger-ui")
+                .url("/api-docs/openapi.json", documented_openapi(auth_enabled)),
+        )
         .route("/dashboard/", get(dashboard_handler))
-        .nest("/dashboard", Router::new().fallback(get(dashboard_handler)));
+        .nest("/dashboard", Router::new().fallback(get(dashboard_handler)))
+    };
 
-    apply_middleware(app, state, trusted_proxy_matcher, key_store, &cors_mode)
+    apply_middleware(app, state, trusted_proxy_matcher, key_store, &config)
 }
 
 fn build_health_routes(state: Arc<AppState>) -> Router {
@@ -213,6 +223,18 @@ fn build_protected_routes(state: Arc<AppState>, data_dir: &Path) -> Router {
                 .delete(delete_index),
         )
         .route("/1/migrate-from-algolia", post(migrate_from_algolia))
+        .route(
+            "/1/migrations/algolia",
+            post(handlers::submit_algolia_migration),
+        )
+        .route(
+            "/1/migrations/algolia/:job_id",
+            get(handlers::get_algolia_migration_status),
+        )
+        .route(
+            "/1/migrations/algolia/:job_id/cancel",
+            post(handlers::cancel_algolia_migration),
+        )
         .route("/1/usage/:statistic", get(handlers::usage::usage_global))
         .route(
             "/1/usage/:statistic/:indexName",
@@ -324,9 +346,10 @@ fn build_internal_routes(state: Arc<AppState>, auth_enabled: bool) -> Router {
         .route("/internal/cluster/status", get(internal::cluster_status))
         .with_state(state.clone());
 
-    // Replication/catch-up routes must stay reachable in no-auth HA deployments
-    // (compose sets FLAPJACK_NO_AUTH=1). Without these endpoints, peers get 404s
-    // and anti-entropy cannot deliver writes.
+    // Replication read/write transport must stay reachable in no-auth HA
+    // deployments (compose sets FLAPJACK_NO_AUTH=1). Mutating runtime
+    // membership is excluded because that surface can persist attacker-chosen
+    // peer origins and drive server-side fan-out traffic.
     let replication_mesh_routes = Router::new()
         .route("/internal/replicate", post(internal::replicate_ops))
         .route("/internal/ops", get(internal::get_ops))
@@ -344,6 +367,11 @@ fn build_internal_routes(state: Arc<AppState>, auth_enabled: bool) -> Router {
     let internal_routes = if auth_enabled {
         // Auth mode: expose all internal routes plus admin key rotation.
         let admin_internal_routes = Router::new()
+            .route("/internal/cluster/peers", post(internal::add_cluster_peer))
+            .route(
+                "/internal/cluster/peers/:node_id",
+                delete(internal::remove_cluster_peer),
+            )
             .route("/internal/rollup-cache", get(internal::rollup_cache_status))
             .route("/internal/storage", get(internal::storage_all))
             .route("/internal/storage/:indexName", get(internal::storage_index))
@@ -566,7 +594,7 @@ fn apply_middleware(
     state: Arc<AppState>,
     trusted_proxy_matcher: Arc<TrustedProxyMatcher>,
     key_store: Option<Arc<KeyStore>>,
-    cors_mode: &CorsMode,
+    config: &RouterConfig,
 ) -> Router {
     let max_body_mb: usize =
         max_body_mb_from_value(std::env::var("FLAPJACK_MAX_BODY_MB").ok().as_deref());
@@ -598,6 +626,7 @@ fn apply_middleware(
     let app = if let Some(ks) = key_store {
         let rate_limiter = RateLimiter::new();
         let trusted_proxies = trusted_proxy_matcher.clone();
+        let disable_dashboard = config.disable_dashboard;
         let auth_layer = middleware::from_fn(
             move |mut request: axum::extract::Request, next: middleware::Next| {
                 let ks = ks.clone();
@@ -607,7 +636,7 @@ fn apply_middleware(
                     request.extensions_mut().insert(ks);
                     request.extensions_mut().insert(tp);
                     request.extensions_mut().insert(rl);
-                    authenticate_and_authorize(request, next).await
+                    authenticate_and_authorize(request, next, disable_dashboard).await
                 }
             },
         );
@@ -621,7 +650,7 @@ fn apply_middleware(
         .layer(DefaultBodyLimit::max(max_body_mb * 1024 * 1024))
         .layer(middleware::from_fn(normalize_content_type))
         .layer(middleware::from_fn(ensure_json_errors))
-        .layer(build_cors_layer(cors_mode))
+        .layer(build_cors_layer(&config.cors_mode))
         .layer(middleware::from_fn(allow_private_network))
         .layer(middleware::from_fn(observe_request_latency))
         .layer(middleware::from_fn(request_id_middleware))

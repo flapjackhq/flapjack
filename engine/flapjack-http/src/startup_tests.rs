@@ -1,12 +1,15 @@
 use super::{
     acquire_data_dir_process_lock, build_log_layer_with_writer, build_tracing_subscriber,
-    cors_origins_from_value, initialize_key_store, log_format_from_value, normalize_admin_key,
-    read_admin_key, shutdown_timeout_secs_from_value, validate_startup_auth_policy, CorsMode,
-    LogFormat, ServerConfig, StartupAuthValidationError,
+    cors_origins_from_value, initialize_key_store, load_server_config, log_format_from_value,
+    normalize_admin_key, read_admin_key, shutdown_timeout_secs_from_value,
+    validate_startup_auth_policy, CorsMode, LogFormat, ServerConfig, StartupAuthValidationError,
+    StartupAuthValidationOutcome, NO_AUTH_PUBLIC_BIND_WARNING,
 };
 use crate::test_helpers::{EnvVarRestoreGuard, ENV_MUTEX};
 use axum::http::HeaderValue;
+use flapjack_replication::config::NodeConfig;
 use serde_json::Value;
+use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
@@ -192,38 +195,125 @@ fn cors_origins_from_value_ignores_trailing_commas_and_empty_segments() {
 }
 
 #[test]
-fn validate_startup_auth_policy_rejects_production_no_auth() {
-    assert_eq!(
-        validate_startup_auth_policy("production", true, Some("long-enough-admin-key")),
-        Err(StartupAuthValidationError::NoAuthInProduction)
-    );
-}
-
-#[test]
 fn validate_startup_auth_policy_rejects_missing_blank_and_short_production_admin_key() {
     assert_eq!(
-        validate_startup_auth_policy("production", false, None),
+        validate_startup_auth_policy("production", false, None, "127.0.0.1:7700", false),
         Err(StartupAuthValidationError::MissingAdminKeyInProduction)
     );
     assert_eq!(
-        validate_startup_auth_policy("production", false, Some("   ")),
+        validate_startup_auth_policy("production", false, Some("   "), "127.0.0.1:7700", false),
         Err(StartupAuthValidationError::MissingAdminKeyInProduction)
     );
     assert_eq!(
-        validate_startup_auth_policy("production", false, Some("short-key")),
+        validate_startup_auth_policy(
+            "production",
+            false,
+            Some("short-key"),
+            "127.0.0.1:7700",
+            false
+        ),
         Err(StartupAuthValidationError::AdminKeyTooShortInProduction)
     );
 }
 
 #[test]
-fn validate_startup_auth_policy_accepts_safe_configs() {
+fn validate_startup_auth_policy_classifies_resolved_bind_posture() {
+    let validate_development = |no_auth, bind_addr, allow_public_bind| {
+        validate_startup_auth_policy("development", no_auth, None, bind_addr, allow_public_bind)
+    };
+    let accepted = Ok(StartupAuthValidationOutcome::Accepted);
+    let explicitly_allowed = Ok(StartupAuthValidationOutcome::ExplicitlyAllowedPublicNoAuthBind);
+
     assert_eq!(
-        validate_startup_auth_policy("production", false, Some("1234567890abcdef")),
-        Ok(())
+        validate_development(true, "127.0.0.1:7700", false),
+        accepted
+    );
+    assert_eq!(validate_development(true, "[::1]:7700", false), accepted);
+    assert_eq!(
+        validate_development(true, "0.0.0.0:7700", false),
+        Err(StartupAuthValidationError::NoAuthPublicBind {
+            bind_addr: "0.0.0.0:7700".parse::<SocketAddr>().unwrap(),
+        })
     );
     assert_eq!(
-        validate_startup_auth_policy("development", true, None),
-        Ok(())
+        validate_development(true, "0.0.0.0:7700", true),
+        explicitly_allowed
+    );
+    assert_eq!(
+        validate_development(true, "[::]:7700", false),
+        Err(StartupAuthValidationError::NoAuthPublicBind {
+            bind_addr: "[::]:7700".parse::<SocketAddr>().unwrap(),
+        })
+    );
+    assert_eq!(
+        validate_development(true, "[::]:7700", true),
+        explicitly_allowed
+    );
+    assert_eq!(
+        validate_development(true, "public.example:7700", false),
+        Err(StartupAuthValidationError::NoAuthHostnameBind {
+            bind_addr: "public.example:7700".to_string(),
+        })
+    );
+    assert_eq!(
+        validate_development(true, "public.example:7700", true),
+        explicitly_allowed
+    );
+    assert_eq!(validate_development(false, "0.0.0.0:7700", false), accepted);
+    assert_eq!(validate_development(true, "not-a-socket", false), accepted);
+    assert_eq!(
+        validate_startup_auth_policy(
+            "production",
+            true,
+            Some("1234567890abcdef"),
+            "0.0.0.0:7700",
+            true,
+        ),
+        Err(StartupAuthValidationError::NoAuthInProduction)
+    );
+    assert_eq!(
+        validate_startup_auth_policy(
+            "production",
+            false,
+            Some("1234567890abcdef"),
+            "0.0.0.0:7700",
+            false,
+        ),
+        accepted
+    );
+}
+
+#[test]
+fn resolved_node_config_bind_drives_startup_auth_policy() {
+    let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+    let _bind_addr = EnvVarRestoreGuard::set("FLAPJACK_BIND_ADDR", "127.0.0.1:0");
+    let _node_id = EnvVarRestoreGuard::remove("FLAPJACK_NODE_ID");
+    let _peers = EnvVarRestoreGuard::remove("FLAPJACK_PEERS");
+    let temp_dir = TempDir::new().unwrap();
+    let node_json = serde_json::json!({
+        "node_id": "stage-2-node",
+        "bind_addr": "0.0.0.0:0",
+        "peers": []
+    });
+    std::fs::write(temp_dir.path().join("node.json"), node_json.to_string())
+        .expect("test node.json must be writable");
+
+    let node_config = NodeConfig::load_or_default(temp_dir.path());
+
+    assert_eq!(node_config.bind_addr, "0.0.0.0:0");
+    assert_eq!(
+        validate_startup_auth_policy("development", true, None, &node_config.bind_addr, false),
+        Err(StartupAuthValidationError::NoAuthPublicBind {
+            bind_addr: "0.0.0.0:0".parse::<SocketAddr>().unwrap()
+        })
+    );
+}
+
+#[test]
+fn no_auth_public_bind_warning_text_is_canonical() {
+    assert!(
+        NO_AUTH_PUBLIC_BIND_WARNING.contains("FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND=1"),
+        "warning must name the explicit public no-auth override"
     );
 }
 
@@ -397,6 +487,8 @@ fn initialize_key_store_persists_env_admin_key_with_restrictive_permissions() {
     let server_config = ServerConfig {
         env_mode: "development".to_string(),
         no_auth: false,
+        disable_dashboard: false,
+        allow_no_auth_public_bind: false,
         admin_key_env: Some("  env-admin-key  ".to_string()),
         data_dir: temp_dir.path().display().to_string(),
         bind_addr: "127.0.0.1:7700".to_string(),
@@ -480,6 +572,73 @@ fn startup_banner_shows_capabilities() {
     );
 }
 
+#[test]
+fn flapjack_disable_dashboard_env_parses_true_and_defaults_false() {
+    let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+    let _disable_dashboard = EnvVarRestoreGuard::remove("FLAPJACK_DISABLE_DASHBOARD");
+
+    {
+        let temp_dir = TempDir::new().unwrap();
+        let _data_dir =
+            EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+
+        let server_config = load_server_config();
+
+        assert!(!server_config.disable_dashboard);
+    }
+
+    {
+        let temp_dir = TempDir::new().unwrap();
+        let _data_dir =
+            EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+        let _disable_dashboard_set = EnvVarRestoreGuard::set("FLAPJACK_DISABLE_DASHBOARD", "1");
+
+        let server_config = load_server_config();
+
+        assert!(server_config.disable_dashboard);
+    }
+}
+
+#[test]
+fn flapjack_allow_no_auth_public_bind_env_parses_one_and_defaults_false() {
+    let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+    let _allow_public_bind = EnvVarRestoreGuard::remove("FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND");
+
+    {
+        let temp_dir = TempDir::new().unwrap();
+        let _data_dir =
+            EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+
+        let server_config = load_server_config();
+
+        assert!(!server_config.allow_no_auth_public_bind);
+    }
+
+    {
+        let temp_dir = TempDir::new().unwrap();
+        let _data_dir =
+            EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+        let _allow_public_bind_set =
+            EnvVarRestoreGuard::set("FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND", "true");
+
+        let server_config = load_server_config();
+
+        assert!(!server_config.allow_no_auth_public_bind);
+    }
+
+    {
+        let temp_dir = TempDir::new().unwrap();
+        let _data_dir =
+            EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+        let _allow_public_bind_set =
+            EnvVarRestoreGuard::set("FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND", "1");
+
+        let server_config = load_server_config();
+
+        assert!(server_config.allow_no_auth_public_bind);
+    }
+}
+
 // --- Tracing subscriber builder tests ---
 
 #[test]
@@ -555,8 +714,9 @@ fn load_server_config_doc_lists_only_fields_loaded_here() {
     let source = include_str!("startup.rs");
     let expected_doc =
         "/// Loads startup configuration from environment variables for mode/auth, optional\n\
-/// admin key, data directory, and bind address, then initializes logging and\n\
-/// acquires the per-process data directory lock.";
+/// dashboard lockdown, public no-auth bind override, admin key, data directory,\n\
+/// and bind address, then\n\
+/// initializes logging and acquires the per-process data directory lock.";
     let stale_doc =
             "/// Loads server configuration from environment variables: data directory, bind address,\n\
 /// auth mode, admin key, SSL settings, replication config, and operational flags.";

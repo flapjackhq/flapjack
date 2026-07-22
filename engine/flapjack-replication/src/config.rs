@@ -2,11 +2,20 @@ use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::Path;
 
+const NODE_CONFIG_FILE: &str = "node.json";
+
+#[cfg(test)]
+static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
     pub node_id: String,
     pub bind_addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertise_addr: Option<String>,
     pub peers: Vec<PeerConfig>,
+    #[serde(skip)]
+    pub bootstrap_peer: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,18 +27,36 @@ pub struct PeerConfig {
 impl NodeConfig {
     /// Load node configuration from {data_dir}/node.json or return standalone default
     pub fn load_or_default(data_dir: &Path) -> Self {
-        let node_json = data_dir.join("node.json");
+        let node_json = data_dir.join(NODE_CONFIG_FILE);
         if let Some(config) = Self::load_from_file(&node_json) {
             return config;
         }
 
+        let peers = Self::parse_env_peers();
         let config = Self {
             node_id: Self::default_node_id(),
             bind_addr: Self::default_bind_addr(),
-            peers: Self::parse_env_peers(),
+            advertise_addr: Self::parse_optional_peer_origin_env("FLAPJACK_ADVERTISE_ADDR"),
+            bootstrap_peer: if peers.is_empty() {
+                Self::parse_optional_peer_origin_env("FLAPJACK_BOOTSTRAP_PEER")
+            } else {
+                None
+            },
+            peers,
         };
         Self::log_default_source(&config);
         config
+    }
+
+    /// Persist runtime membership through the canonical `{data_dir}/node.json` owner.
+    pub fn persist_peers(&self, data_dir: &Path, peers: Vec<PeerConfig>) -> Result<(), String> {
+        let node_json = data_dir.join(NODE_CONFIG_FILE);
+        let document = self.peer_document_with_replacement(&node_json, peers)?;
+        Self::replace_node_json_atomically(&node_json, &document)
+    }
+
+    pub fn has_replication_intent(&self) -> bool {
+        !self.peers.is_empty() || self.bootstrap_peer.is_some() || self.advertise_addr.is_some()
     }
 
     /// Read `{data_dir}/node.json` if it exists, returning `None` on read or parse errors.
@@ -48,6 +75,10 @@ impl NodeConfig {
 
         match serde_json::from_str::<NodeConfig>(&content) {
             Ok(mut config) => {
+                config.advertise_addr = config
+                    .advertise_addr
+                    .as_deref()
+                    .and_then(Self::normalize_peer_addr);
                 config.peers = config
                     .peers
                     .into_iter()
@@ -73,6 +104,89 @@ impl NodeConfig {
         }
     }
 
+    fn peer_document_with_replacement(
+        &self,
+        node_json: &Path,
+        peers: Vec<PeerConfig>,
+    ) -> Result<serde_json::Value, String> {
+        if !node_json.exists() {
+            let mut config = self.clone();
+            config.peers = peers;
+            return serde_json::to_value(config).map_err(|error| {
+                format!("failed to serialize node config for node.json: {error}")
+            });
+        }
+
+        let peers_value = serde_json::to_value(peers)
+            .map_err(|error| format!("failed to serialize replication peers: {error}"))?;
+        Self::existing_peer_document_with_replacement(node_json, peers_value)
+    }
+
+    fn existing_peer_document_with_replacement(
+        node_json: &Path,
+        peers_value: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let content = std::fs::read_to_string(node_json)
+            .map_err(|error| format!("failed to read {}: {error}", node_json.display()))?;
+        let mut document: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|error| format!("failed to parse {}: {error}", node_json.display()))?;
+        let Some(object) = document.as_object_mut() else {
+            return Err(format!(
+                "{} must contain a JSON object",
+                node_json.display()
+            ));
+        };
+        object.insert("peers".to_string(), peers_value);
+        Ok(document)
+    }
+
+    fn replace_node_json_atomically(
+        node_json: &Path,
+        document: &serde_json::Value,
+    ) -> Result<(), String> {
+        let parent = node_json
+            .parent()
+            .ok_or_else(|| format!("{} has no parent directory", node_json.display()))?;
+        let temp_path = parent.join(format!(
+            ".node.json.{}.{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+
+        let result = Self::write_node_json_temp(&temp_path, document).and_then(|()| {
+            std::fs::rename(&temp_path, node_json).map_err(|error| {
+                format!(
+                    "failed to replace {} with {}: {error}",
+                    node_json.display(),
+                    temp_path.display()
+                )
+            })
+        });
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        result
+    }
+
+    fn write_node_json_temp(temp_path: &Path, document: &serde_json::Value) -> Result<(), String> {
+        use std::io::Write;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(temp_path)
+            .map_err(|error| format!("failed to create {}: {error}", temp_path.display()))?;
+        serde_json::to_writer_pretty(&mut file, document)
+            .map_err(|error| format!("failed to serialize {}: {error}", temp_path.display()))?;
+        file.write_all(b"\n")
+            .map_err(|error| format!("failed to finish {}: {error}", temp_path.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("failed to sync {}: {error}", temp_path.display()))
+    }
+
     fn default_node_id() -> String {
         std::env::var("FLAPJACK_NODE_ID").unwrap_or_else(|_| {
             hostname::get()
@@ -92,6 +206,12 @@ impl NodeConfig {
             .split(',')
             .filter_map(Self::parse_peer_entry)
             .collect()
+    }
+
+    fn parse_optional_peer_origin_env(name: &str) -> Option<String> {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| Self::normalize_peer_addr(&value))
     }
 
     /// Parse one `FLAPJACK_PEERS` entry in `node_id=addr` form, ignoring malformed values.
@@ -114,11 +234,21 @@ impl NodeConfig {
         })
     }
 
-    fn normalize_peer_addr(addr: &str) -> Option<String> {
+    /// Validate and canonicalize a replication peer URL, rejecting local-host
+    /// and metadata-style destinations that are unsafe for server-side fan-out.
+    pub fn normalize_peer_addr(addr: &str) -> Option<String> {
         let parsed = reqwest::Url::parse(addr).ok()?;
         match parsed.scheme() {
             "http" | "https" => {}
             _ => return None,
+        }
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || !parsed.path().trim_matches('/').is_empty()
+        {
+            return None;
         }
 
         let host = parsed.host_str()?;
@@ -131,7 +261,7 @@ impl NodeConfig {
         // resolved address is checked. Operator-configured replication peers may
         // legitimately live on RFC1918/ULA private networks, so only local-host /
         // metadata-style destinations are blocked here.
-        if let Ok(ip) = host.parse::<IpAddr>() {
+        if let Some(ip) = Self::parse_literal_peer_ip(host) {
             if Self::is_unsafe_peer_ip(&ip) {
                 return None;
             }
@@ -139,7 +269,16 @@ impl NodeConfig {
             return None;
         }
 
-        Some(parsed.as_str().trim_end_matches('/').to_string())
+        Some(parsed.origin().ascii_serialization())
+    }
+
+    fn parse_literal_peer_ip(host: &str) -> Option<IpAddr> {
+        host.parse::<IpAddr>().ok().or_else(|| {
+            host.strip_prefix('[')?
+                .strip_suffix(']')?
+                .parse::<IpAddr>()
+                .ok()
+        })
     }
 
     /// Resolve a non-literal peer host and return the first resolved address that
@@ -175,7 +314,12 @@ impl NodeConfig {
     }
 
     fn log_default_source(config: &NodeConfig) {
-        if config.peers.is_empty() {
+        if config.bootstrap_peer.is_some() {
+            tracing::info!(
+                "No node.json found, bootstrap join configured: node_id={}",
+                config.node_id
+            );
+        } else if config.peers.is_empty() {
             tracing::info!(
                 "No node.json found, running in standalone mode: node_id={}",
                 config.node_id
@@ -194,11 +338,6 @@ impl NodeConfig {
 mod tests {
     use super::*;
     use std::io::Write;
-
-    // Tests that mutate global env vars must not run in parallel — they share
-    // process-wide state. Serialize them with this mutex instead of adding a
-    // new `serial_test` dev-dependency.
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn test_load_or_default_no_file() {
@@ -353,6 +492,90 @@ mod tests {
     }
 
     #[test]
+    fn persist_peers_replaces_only_peers_in_existing_node_json() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let node_json_path = temp_dir.path().join("node.json");
+        let original = serde_json::json!({
+            "node_id": "node-a",
+            "bind_addr": "0.0.0.0:7700",
+            "peers": [
+                {"node_id": "node-b", "addr": "http://node-b:7700"}
+            ],
+            "operator": {
+                "role": "primary",
+                "limits": {"replicas": 3}
+            }
+        });
+        std::fs::write(
+            &node_json_path,
+            serde_json::to_vec_pretty(&original).unwrap(),
+        )
+        .unwrap();
+
+        let config = NodeConfig::load_or_default(temp_dir.path());
+        config
+            .persist_peers(
+                temp_dir.path(),
+                vec![PeerConfig {
+                    node_id: "node-c".to_string(),
+                    addr: "http://node-c:7700".to_string(),
+                }],
+            )
+            .expect("peer persistence should succeed");
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&node_json_path).unwrap()).unwrap();
+        assert_eq!(persisted["node_id"], original["node_id"]);
+        assert_eq!(persisted["bind_addr"], original["bind_addr"]);
+        assert_eq!(persisted["operator"], original["operator"]);
+        assert_eq!(
+            persisted["peers"],
+            serde_json::json!([
+                {"node_id": "node-c", "addr": "http://node-c:7700"}
+            ])
+        );
+    }
+
+    #[test]
+    fn persist_peers_creates_loadable_node_json_from_active_config_when_missing() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        std::env::set_var("FLAPJACK_NODE_ID", "node-env");
+        std::env::set_var("FLAPJACK_BIND_ADDR", "0.0.0.0:9900");
+        std::env::set_var("FLAPJACK_PEERS", "node-b=http://node-b:7700");
+        let config = NodeConfig::load_or_default(temp_dir.path());
+        std::env::remove_var("FLAPJACK_NODE_ID");
+        std::env::remove_var("FLAPJACK_BIND_ADDR");
+        std::env::remove_var("FLAPJACK_PEERS");
+
+        config
+            .persist_peers(
+                temp_dir.path(),
+                vec![
+                    PeerConfig {
+                        node_id: "node-b".to_string(),
+                        addr: "http://node-b:7700".to_string(),
+                    },
+                    PeerConfig {
+                        node_id: "node-c".to_string(),
+                        addr: "http://node-c:7700".to_string(),
+                    },
+                ],
+            )
+            .expect("missing node.json should be created");
+
+        let reloaded = NodeConfig::load_or_default(temp_dir.path());
+        assert_eq!(reloaded.node_id, "node-env");
+        assert_eq!(reloaded.bind_addr, "0.0.0.0:9900");
+        assert_eq!(reloaded.peers.len(), 2);
+        assert_eq!(reloaded.peers[0].node_id, "node-b");
+        assert_eq!(reloaded.peers[0].addr, "http://node-b:7700");
+        assert_eq!(reloaded.peers[1].node_id, "node-c");
+        assert_eq!(reloaded.peers[1].addr, "http://node-c:7700");
+    }
+
+    #[test]
     fn a10_env_peer_parser_rejects_unsafe_or_malformed_peer_addresses() {
         let _guard = ENV_MUTEX.lock().unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
@@ -414,4 +637,46 @@ mod tests {
         assert_eq!(config.peers[1].node_id, "safe");
         assert_eq!(config.peers[1].addr, "http://peer-safe.example.com:7700");
     }
+
+    #[test]
+    fn normalize_peer_addr_rejects_unsafe_bracketed_ipv6_literals() {
+        assert_eq!(NodeConfig::normalize_peer_addr("http://[::1]:7700"), None);
+        assert_eq!(
+            NodeConfig::normalize_peer_addr("http://[fe80::1]:7700"),
+            None
+        );
+        assert_eq!(
+            NodeConfig::normalize_peer_addr("http://[::ffff:127.0.0.1]:7700"),
+            None
+        );
+        assert_eq!(
+            NodeConfig::normalize_peer_addr("http://[fd00::1]:7700"),
+            Some("http://[fd00::1]:7700".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_peer_addr_rejects_non_origin_urls() {
+        for candidate in [
+            "http://user:secret@10.0.0.1:7700",
+            "http://10.0.0.1:7700/internal/status",
+            "http://10.0.0.1:7700?mode=debug",
+            "http://10.0.0.1:7700#frag",
+        ] {
+            assert_eq!(
+                NodeConfig::normalize_peer_addr(candidate),
+                None,
+                "candidate should be rejected: {candidate}"
+            );
+        }
+
+        assert_eq!(
+            NodeConfig::normalize_peer_addr("http://10.0.0.1:7700///"),
+            Some("http://10.0.0.1:7700".to_string())
+        );
+    }
 }
+
+#[cfg(test)]
+#[path = "config_bootstrap_tests.rs"]
+mod bootstrap_tests;

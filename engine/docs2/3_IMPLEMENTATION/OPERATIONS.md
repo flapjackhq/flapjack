@@ -1,5 +1,7 @@
 # Operations & Release Discipline
 
+<!-- markdownlint-disable-file MD013 MD060 -->
+
 This document is the canonical operator-facing guide for release proof,
 upgrade/rollback discipline, and day-2 runbooks in the open-source Flapjack
 repo.
@@ -167,6 +169,53 @@ needed, restoring operator-controlled data taken before the upgrade.
 **Recovery:** Check free disk space, inspect `/metrics` for latency/oplog progress, and verify configured memory bounds used by load tests before scaling or throttling traffic. For write-path saturation tuning, use the canonical `FLAPJACK_WRITE_QUEUE_BATCH_SIZE` row in [OPS_CONFIGURATION.md](./OPS_CONFIGURATION.md#limits); type, default, fallback semantics, and tradeoff are owned there. PL-10 retained evidence remains in [`engine/loadtest/BENCHMARKS.md`](../../loadtest/BENCHMARKS.md); the operator-facing harness verdict signature `TUNABLE_VERIFIED` is produced by [`engine/loadtest/tests/pl10_saturation_acceptance.sh`](../../loadtest/tests/pl10_saturation_acceptance.sh).
 **Test (where applicable):** `cd engine && timeout 600 cargo test -p flapjack --lib -- write_queue_batch_size`; `engine/loadtest/soak_proof.sh`
 
+### Migration jobs
+
+Async Algolia migration jobs are admin-only, app-owned, create-only imports exposed as `POST /1/migrations/algolia`, `GET /1/migrations/algolia/{job_id}`, and `POST /1/migrations/algolia/{job_id}/cancel`; the legacy synchronous `/1/migrate-from-algolia` route remains separate. <!-- owner: engine/flapjack-http/src/router.rs:218 --> <!-- owner: engine/flapjack-http/src/auth/route_acl.rs:50 --> <!-- owner: engine/flapjack-http/src/openapi.rs:141 --> <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:287 -->
+
+Admission validates the same migration payload as the synchronous path, refuses `overwrite=true`, refuses HA imports while replication peers are configured, records the authenticated app owner, creates a UUID job directory, persists `async_migration.json` and `migration_phase.json`, returns HTTP `202`, and starts the import in the background. <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:46 --> <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:489 --> <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:495 --> <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:343 --> <!-- owner: engine/flapjack-http/src/handlers/migration/job_runner.rs:68 --> <!-- owner: engine/flapjack-http/src/handlers/migration/spool.rs:548 -->
+
+Use these command templates with the Flapjack application id in `x-algolia-application-id`, the Flapjack admin key in `x-algolia-api-key`, and the source Algolia credentials in the JSON body. <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:53 --> <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:306 --> <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:369 --> <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:406 -->
+
+```bash
+curl -sS -i -X POST "$FLAPJACK_URL/1/migrations/algolia" -H "content-type: application/json" -H "x-algolia-application-id: $FLAPJACK_APP_ID" -H "x-algolia-api-key: $FLAPJACK_ADMIN_KEY" --data '{"appId":"'"$ALGOLIA_APP_ID"'","apiKey":"'"$ALGOLIA_API_KEY"'","sourceIndex":"'"$ALGOLIA_SOURCE_INDEX"'","targetIndex":"'"$FLAPJACK_TARGET_INDEX"'"}'
+curl -sS -i -X GET "$FLAPJACK_URL/1/migrations/algolia/$JOB_ID" -H "x-algolia-application-id: $FLAPJACK_APP_ID" -H "x-algolia-api-key: $FLAPJACK_ADMIN_KEY"
+curl -sS -i -X POST "$FLAPJACK_URL/1/migrations/algolia/$JOB_ID/cancel" -H "content-type: application/json" -H "x-algolia-application-id: $FLAPJACK_APP_ID" -H "x-algolia-api-key: $FLAPJACK_ADMIN_KEY" --data '{}'
+```
+
+Status responses expose the job id, phase, disposition, optional export progress, creation/update timestamps, and terminal timestamp; only the owning authenticated app id can read or cancel a retained job record. <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:161 --> <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:573 -->
+
+The phase sequence is `submitted`, `exporting`, `preparing`, `staging`, `activating`; dispositions are `running`, `succeeded`, `failed`, and `cancelled`. <!-- owner: engine/flapjack-http/src/handlers/migration/spool.rs:159 --> <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:103 --> <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:127 -->
+
+Durable job state lives under `migration_exports/jobs/<uuid>/` and may include `manifest.json`, `migration_phase.json`, `async_migration.json`, artifact files with `settings`, `documents`, `rules`, `synonyms`, or `config` prefixes, and completed-ID sidecars for documents, rules, and synonyms. <!-- owner: engine/flapjack-http/src/handlers/migration/spool.rs:19 --> <!-- owner: engine/flapjack-http/src/handlers/migration/spool.rs:21 --> <!-- owner: engine/flapjack-http/src/handlers/migration/spool.rs:29 --> <!-- owner: engine/flapjack-http/src/handlers/migration/spool.rs:138 -->
+
+Cancellation is cooperative: before the publication commit boundary, the runner checks the durable cancel flag and can settle the job as `cancelled`; after a recorded publication transaction has a journal, the cancel route returns HTTP `409` with `code=cancel_too_late`, and committed targets are not rolled back by cancel. <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:384 --> <!-- owner: engine/flapjack-http/src/handlers/migration/import.rs:319 --> <!-- owner: engine/flapjack-http/src/handlers/migration/spool.rs:743 --> <!-- owner: engine/flapjack-http/src/handlers/migration/spool.rs:769 -->
+
+On graceful shutdown, the server waits for active migration imports to drain within `FLAPJACK_SHUTDOWN_TIMEOUT_SECS`; on startup, pre-serve publication repair runs first and async migration recovery uses those repair reports to recover running jobs before serving. <!-- owner: engine/flapjack-http/src/server.rs:118 --> <!-- owner: engine/flapjack-http/src/server.rs:245 --> <!-- owner: engine/flapjack-http/src/server.rs:291 --> <!-- owner: engine/flapjack-http/src/handlers/migration/job_runner.rs:246 -->
+
+Recovery does not run from `startup_catchup.rs`: it is invoked from `server.rs`, and the only periodic background loops started today are SSL, analytics, S3 backup, replication, usage, metrics, and alert tasks. <!-- owner: engine/flapjack-http/src/server.rs:123 --> <!-- owner: engine/flapjack-http/src/background_tasks.rs:212 --> <!-- owner: engine/flapjack-http/src/background_tasks.rs:391 -->
+
+Failed jobs expose terminal status but no retryability taxonomy; treat a failed migration as an investigation target, inspect the durable status and server logs, and submit a fresh job only after the source or target cause is understood. <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:161 --> <!-- owner: engine/flapjack-http/src/handlers/migration/import.rs:968 --> <!-- owner: engine/flapjack-http/src/handlers/migration/spool.rs:803 -->
+
+Operators may inspect spool internals during incident review, but should not manually delete `migration_exports/jobs/<uuid>` contents: deletion mechanics are code-owned, cancellation deletes export artifacts only through `delete_export_artifacts_if_present`, and production migration spool garbage collection is not automated until `ROADMAP.md` MIG-9 defines the owner. <!-- owner: engine/flapjack-http/src/handlers/migration/import.rs:957 --> <!-- owner: engine/flapjack-http/src/handlers/migration/spool.rs:1136 --> <!-- owner: engine/flapjack-http/src/handlers/migration/spool.rs:1195 --> <!-- owner: ROADMAP.md:37 -->
+
+Captured output examples from `docs/reference/research/20260720_rf4_migration_runbook_probe_transcript.md:320` through `:410`:
+
+```text
+POST /1/migrations/algolia -> HTTP 202, body capture: logs/migration-response.json
+GET /1/migrations/algolia/49807e7c-98db-4d53-843d-0b04a0d151fb -> HTTP 200, terminal body capture: logs/async-status.json
+terminal body: {"jobId":"49807e7c-98db-4d53-843d-0b04a0d151fb","phase":"activating","disposition":"succeeded","exportProgress":{"completed":4,"total":4},"createdAt":"2026-07-20T23:45:47.216757Z","updatedAt":"2026-07-20T23:45:59.590485Z","terminalAt":"2026-07-20T23:45:59.590485Z"}
+precommit POST /1/migrations/algolia/73da012a-fb7f-4934-abf6-14be04994250/cancel -> HTTP 200, body capture: logs/cancel-precommit-cancel.json
+terminal-cancelled body: {"jobId":"73da012a-fb7f-4934-abf6-14be04994250","phase":"activating","disposition":"cancelled","exportProgress":{"completed":2501,"total":2501},"createdAt":"2026-07-20T23:46:29.821562Z","updatedAt":"2026-07-20T23:46:37.815544Z","terminalAt":"2026-07-20T23:46:37.815544Z"}
+postcommit POST /1/migrations/algolia/6e69d2b6-44f8-4866-b6da-1f7a9de0a0c3/cancel -> HTTP 409, body capture: logs/cancel-postcommit-cancel.json
+cancel-too-late body: {"message":"Migration has already committed and cannot be cancelled","code":"cancel_too_late","status":409}
+terminal-success body: {"jobId":"6e69d2b6-44f8-4866-b6da-1f7a9de0a0c3","phase":"activating","disposition":"succeeded","exportProgress":{"completed":2501,"total":2501},"createdAt":"2026-07-20T23:46:38.874758Z","updatedAt":"2026-07-20T23:46:47.086956Z","terminalAt":"2026-07-20T23:46:47.086956Z"}
+invalid-key POST /1/migrations/algolia -> HTTP 202, body capture: manual_session/logs/failure-admission.json
+terminal-failed body: {"jobId":"12ab9764-eee1-45c8-9026-b28996ccdc5d","phase":"exporting","disposition":"failed","createdAt":"2026-07-20T23:47:08.525962Z","updatedAt":"2026-07-20T23:47:09.129694Z","terminalAt":"2026-07-20T23:47:09.129694Z"}
+restart GET /1/migrations/algolia/ef4c16f4-3281-42c8-b5f9-553b9f4a265d -> HTTP 200
+restart body: {"jobId":"ef4c16f4-3281-42c8-b5f9-553b9f4a265d","phase":"activating","disposition":"succeeded","exportProgress":{"completed":4,"total":4},"createdAt":"2026-07-20T23:47:12.499361Z","updatedAt":"2026-07-20T23:47:14.682685Z","terminalAt":"2026-07-20T23:47:14.682685Z"}
+```
+
 ### Snapshot export/import runtime offload
 
 Snapshot export and import offload their synchronous tar/gzip work onto a blocking worker via `tokio::task::spawn_blocking` in `engine/flapjack-http/src/handlers/snapshot.rs::export_snapshot` and `::import_snapshot`, so `/health` checks and task polling are not starved by those operations. The restore and import scenarios below cover the operator-visible outcomes.
@@ -234,6 +283,54 @@ Snapshot export and import offload their synchronous tar/gzip work onto a blocki
 **Diagnosis:** The induced peer-down window emitted either too few or too many `Failed to send request to node-b` events for the calibrated bound. The PL-12 v2 contract uses an absolute peer-down count, not a ratio against baseline; the calibration formula is the `CV > 0.30` high-variance fallback `ceil(max(max_observed * 2, 50))` (canonical owner `docs/reference/research/pl12_stage1_baseline.md`), and `DEFAULT_FAILURE_THRESHOLD=3` is intentionally retained rather than retuned in response to amplification deviations (rationale in `docs/reference/research/pl12v2_stage2_tune_plan.md`).
 **Recovery:** Re-run the probe against a stable emitter set with re-anchored windows; if deviation persists, recalibrate the bound from a fresh sample using the formula above (`ceil(max(max_observed * 2, 50))`, owner `docs/reference/research/pl12_stage1_baseline.md`) before changing circuit-breaker defaults.
 **Test (where applicable):** `bash engine/loadtest/tests/ha_peer_failed_amplification_acceptance.sh`
+
+### Scenario: Add or remove an HA node
+
+**Symptom:** Operators need to change HA membership while preserving catch-up
+safety and external load-balancer routing.
+**Diagnosis:** Membership is startup-loaded from `NodeConfig`: a valid
+`{DATA_DIR}/node.json` takes precedence over environment fallback and contains
+`{node_id, bind_addr, peers:[{node_id, addr}]}`. Without a valid `node.json`,
+`FLAPJACK_NODE_ID`, `FLAPJACK_BIND_ADDR`, and `FLAPJACK_PEERS` in
+`node_id=addr,...` form provide the fallback. `ReplicationManager::new` builds
+the peer clients at startup, so there is no runtime `add_peer` or `remove_peer`
+mutation path today; planned FP-2 dynamic membership API work is expected to
+remove the full-cluster restart requirement after it merges, but no such API is
+available for this runbook.
+**Recovery:**
+
+1. **ADD:** Provision the new node with every existing member in its peer list,
+   add the new `node_id=addr` to every existing node's persisted peer
+   configuration, then start the new node while it is still drained from the
+   external-LB. Keep strict bootstrap enabled: `run_pre_serve_catchup` runs
+   before serving, discovers tenants from peers, pulls oplog data or restores
+   snapshots as needed, and defaults to strict bootstrap. Setting
+   `FLAPJACK_STARTUP_CATCHUP_STRICT=0` or `false` permits startup after catch-up
+   or reachability failures and risks stale reads, so do not use it for this ADD
+   procedure. Wait for initial catch-up and a healthy check, rolling-restart the
+   existing nodes so they load the new peer, then restart the still-LB-drained
+   new node once more so strict pre-serve catch-up closes writes accepted during
+   that rollout. Only after that final catch-up reports healthy should the new
+   node be added to and reloaded in the external load balancer; do not route
+   client traffic to it earlier.
+2. **REMOVE:** Drain and remove the node from the external load balancer first,
+   reload the LB, stop the flapjack process, remove its `node_id=addr` from
+   every remaining node's persisted peer configuration, then rolling-restart the
+   remaining nodes. A stale removed-peer entry is not harmless under strict
+   bootstrap: an unreachable configured peer can make a restarted node refuse to
+   serve instead of risking stale reads.
+3. **LB:** Flapjack does not provide a built-in load balancer. Additions enter
+   the upstream list only after the post-rollout final catch-up and health
+   verification; removals leave it before process shutdown. The worked
+   external-LB example remains
+   [`engine/examples/ha-cluster/nginx.conf`](../../examples/ha-cluster/nginx.conf).
+
+**Test (where applicable):** Source-owned audit of
+`engine/flapjack-replication/src/config.rs`,
+`engine/flapjack-replication/src/manager.rs`,
+`engine/flapjack-http/src/server.rs`,
+`engine/flapjack-http/src/server_init.rs`, and
+`engine/flapjack-http/src/startup_catchup.rs`.
 
 ### Scenario: Rotate admin key online
 

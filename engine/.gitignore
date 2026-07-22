@@ -120,6 +120,7 @@ docs2/3_IMPLEMENTATION/decisions/active/*
 !docs2/3_IMPLEMENTATION/decisions/active/0003_search_ha_ownership_freshness.md
 !docs2/3_IMPLEMENTATION/decisions/active/0004_ha_convergence_reversal.md
 !docs2/3_IMPLEMENTATION/decisions/active/0005_nginx_restart_window_write_recovery.md
+!docs2/3_IMPLEMENTATION/decisions/active/0006_console_source_home.md
 docs2/6_TODO/
 docs2/Checklists/
 docs2/integrations/handoffs/

@@ -14,7 +14,9 @@ async fn auth_middleware_returns_algolia_error_shape_for_403_and_429() {
             "/1/indexes/products/query",
             post(|| async { (StatusCode::OK, "ok") }),
         )
-        .layer(axum::middleware::from_fn(authenticate_and_authorize))
+        .layer(axum::middleware::from_fn(|request, next| async move {
+            authenticate_and_authorize(request, next, false).await
+        }))
         .layer(Extension(key_store))
         .layer(Extension(RateLimiter::new()));
 
@@ -89,7 +91,9 @@ async fn auth_middleware_enforces_secured_key_restrict_sources() {
             "/1/indexes/products/query",
             post(|| async { (StatusCode::OK, "ok") }),
         )
-        .layer(axum::middleware::from_fn(authenticate_and_authorize))
+        .layer(axum::middleware::from_fn(|request, next| async move {
+            authenticate_and_authorize(request, next, false).await
+        }))
         .layer(Extension(key_store));
 
     let mut allowed_req = Request::builder()
@@ -142,7 +146,9 @@ async fn auth_middleware_internal_storage_requires_app_id_even_for_admin_key() {
 
     let app = Router::new()
         .route("/internal/storage", get(|| async { StatusCode::OK }))
-        .layer(axum::middleware::from_fn(authenticate_and_authorize))
+        .layer(axum::middleware::from_fn(|request, next| async move {
+            authenticate_and_authorize(request, next, false).await
+        }))
         .layer(Extension(key_store));
 
     let response = app
@@ -183,7 +189,9 @@ async fn auth_middleware_secured_key_restrict_sources_rejection_does_not_consume
             "/1/indexes/products/query",
             post(|| async { (StatusCode::OK, "ok") }),
         )
-        .layer(axum::middleware::from_fn(authenticate_and_authorize))
+        .layer(axum::middleware::from_fn(|request, next| async move {
+            authenticate_and_authorize(request, next, false).await
+        }))
         .layer(Extension(key_store))
         .layer(Extension(RateLimiter::new()));
 
@@ -235,7 +243,9 @@ async fn auth_middleware_invalid_key_does_not_consume_rate_limit() {
             "/1/indexes/products/query",
             post(|| async { (StatusCode::OK, "ok") }),
         )
-        .layer(axum::middleware::from_fn(authenticate_and_authorize))
+        .layer(axum::middleware::from_fn(|request, next| async move {
+            authenticate_and_authorize(request, next, false).await
+        }))
         .layer(Extension(key_store))
         .layer(Extension(RateLimiter::new()));
 
@@ -276,7 +286,9 @@ async fn auth_middleware_allows_non_admin_key_to_get_own_key_record() {
 
     let app = Router::new()
         .route("/1/keys/:key", get(|| async { StatusCode::OK }))
-        .layer(axum::middleware::from_fn(authenticate_and_authorize))
+        .layer(axum::middleware::from_fn(|request, next| async move {
+            authenticate_and_authorize(request, next, false).await
+        }))
         .layer(Extension(key_store));
 
     let response = app
@@ -301,7 +313,9 @@ async fn auth_middleware_rejects_non_admin_key_for_own_restore_route() {
 
     let app = Router::new()
         .route("/1/keys/:key/restore", post(|| async { StatusCode::OK }))
-        .layer(axum::middleware::from_fn(authenticate_and_authorize))
+        .layer(axum::middleware::from_fn(|request, next| async move {
+            authenticate_and_authorize(request, next, false).await
+        }))
         .layer(Extension(key_store));
 
     let response = app
@@ -333,7 +347,9 @@ async fn auth_middleware_rejects_protected_routes_when_keystore_is_missing() {
             "/1/indexes/products/query",
             post(|| async { StatusCode::OK }),
         )
-        .layer(axum::middleware::from_fn(authenticate_and_authorize));
+        .layer(axum::middleware::from_fn(|request, next| async move {
+            authenticate_and_authorize(request, next, false).await
+        }));
 
     let response = app
         .oneshot(

@@ -1,7 +1,3 @@
-//! Search helper functions extracted from search_phases/mod.rs.
-//!
-//! Contains the zero-limit search path, query parser construction, and
-//! execution-limit calculation used by `execute_search_query`.
 use super::super::*;
 use super::query_execution::{
     execute_expanded_queries, maybe_cache_facets, resolve_total_hits,
@@ -263,7 +259,8 @@ pub(super) fn build_execution_limits(
         .effective_params
         .limit
         .saturating_add(prepared.effective_params.offset)
-        .saturating_add(hidden_window_padding);
+        .saturating_add(hidden_window_padding)
+        .max(50);
     #[cfg(feature = "decompound")]
     let allow_split_alternatives =
         preprocessed.decompound_enabled || preprocessed.decompound_langs.is_empty();
@@ -273,4 +270,70 @@ pub(super) fn build_execution_limits(
     let _ = preprocessed;
 
     (effective_limit, allow_split_alternatives)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prepared_filters_with_window(limit: usize, offset: usize) -> PreparedSearchFilters {
+        let mut schema_builder = tantivy::schema::Schema::builder();
+        let json_search_field =
+            schema_builder.add_text_field("_json_search", tantivy::schema::TEXT);
+        let json_exact_field = schema_builder.add_text_field("_json_exact", tantivy::schema::TEXT);
+        let schema = schema_builder.build();
+
+        PreparedSearchFilters {
+            effective_params: EffectiveSearchParams {
+                filter: None,
+                limit,
+                offset,
+                restrict_searchable_attrs: None,
+                optional_filter_specs: None,
+                sum_or_filters_scores: false,
+                exact_on_single_word_query: "attribute".to_string(),
+                disable_exact_on_attributes: Vec::new(),
+                around_lat_lng: None,
+                around_radius: None,
+            },
+            query_text_rewritten: "pagination".to_string(),
+            parsed_query: "pagination".to_string(),
+            expanded_queries: vec!["pagination".to_string()],
+            searchable_paths: vec!["title".to_string()],
+            field_weights: vec![1.0],
+            schema,
+            json_search_field,
+            json_exact_field,
+            rule_effects: None,
+            synonym_store: None,
+        }
+    }
+
+    fn preprocessed_query() -> PreprocessedQuery {
+        PreprocessedQuery {
+            query_text_stopped: "pagination".to_string(),
+            plural_map: None,
+            custom_normalization: Vec::new(),
+            query_type: "prefixLast".to_string(),
+            effective_exact_on_single_word_query: "attribute".to_string(),
+            effective_disable_exact_on_attributes: Vec::new(),
+            #[cfg(feature = "decompound")]
+            decompound_enabled: false,
+            #[cfg(feature = "decompound")]
+            decompound_langs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn build_execution_limits_uses_minimum_candidate_floor_for_stable_pagination() {
+        let preprocessed = preprocessed_query();
+
+        let first_page = prepared_filters_with_window(10, 0);
+        let later_page = prepared_filters_with_window(10, 20);
+        let wider_page = prepared_filters_with_window(40, 20);
+
+        assert_eq!(build_execution_limits(&first_page, &preprocessed).0, 50);
+        assert_eq!(build_execution_limits(&later_page, &preprocessed).0, 50);
+        assert_eq!(build_execution_limits(&wider_page, &preprocessed).0, 60);
+    }
 }

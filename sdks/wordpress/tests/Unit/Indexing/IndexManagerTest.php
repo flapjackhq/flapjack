@@ -14,7 +14,9 @@ use PHPUnit\Framework\MockObject\MockObject;
 use Flapjack\WordPress\ClientFactory;
 use Flapjack\WordPress\Indexing\IndexManager;
 use Flapjack\WordPress\Tests\Traits\MakesTestPosts;
+use Flapjack\WordPress\Status\FailureReporter;
 use Flapjack\FlapjackSearch\Api\SearchClient;
+use Flapjack\FlapjackSearch\Exceptions\NotFoundException;
 
 class IndexManagerTest extends TestCase {
 
@@ -202,14 +204,18 @@ class IndexManagerTest extends TestCase {
 
     // ─── index_post ───────────────────────────────────────────
 
-    public function test_index_post_calls_save_object(): void {
+    public function test_index_post_calls_add_or_update_object_with_explicit_id(): void {
         $post = $this->make_post( [ 'ID' => 42, 'post_status' => 'publish', 'post_type' => 'post' ] );
 
         $this->search_client
             ->expects( $this->once() )
-            ->method( 'saveObject' )
-            ->with( 'wp_posts', $this->callback( fn( $record ) => $record['objectID'] === '42' ) )
-            ->willReturn( [ 'taskID' => 1 ] );
+            ->method( 'addOrUpdateObject' )
+            ->with(
+                'wp_posts',
+                '42',
+                $this->callback( fn( $record ) => $record['objectID'] === '42' )
+            )
+            ->willReturn( [ 'objectID' => '42', 'taskID' => 1 ] );
 
         $result = $this->index_manager->index_post( $post );
         $this->assertArrayHasKey( 'taskID', $result );
@@ -222,8 +228,9 @@ class IndexManagerTest extends TestCase {
 
         $this->search_client
             ->expects( $this->once() )
-            ->method( 'saveObject' )
-            ->willReturn( [ 'taskID' => 1 ] );
+            ->method( 'addOrUpdateObject' )
+            ->with( 'wp_posts', '55', $this->isType( 'array' ) )
+            ->willReturn( [ 'objectID' => '55', 'taskID' => 1 ] );
 
         $this->index_manager->index_post( 55 );
     }
@@ -258,25 +265,51 @@ class IndexManagerTest extends TestCase {
         $this->assertArrayHasKey( 'taskID', $result );
     }
 
-    public function test_delete_post_handles_404_gracefully(): void {
+    public function test_delete_post_treats_typed_not_found_as_idempotent_without_recording(): void {
         $this->search_client
             ->expects( $this->once() )
             ->method( 'deleteObject' )
-            ->willThrowException( new \RuntimeException( 'Object not found (404)' ) );
+            ->willThrowException( new NotFoundException( 'ObjectID does not exist', 404 ) );
 
         $result = $this->index_manager->delete_post( 999 );
+
         $this->assertTrue( $result['deleted'] );
+        // A typed not-found is not a failure — nothing should be recorded.
+        $this->assertNull( FailureReporter::latest() );
     }
 
-    public function test_delete_post_rethrows_non_404_errors(): void {
+    public function test_delete_post_records_and_rethrows_real_delete_failures(): void {
         $this->search_client
             ->expects( $this->once() )
             ->method( 'deleteObject' )
             ->willThrowException( new \RuntimeException( 'Connection refused' ) );
 
+        try {
+            $this->index_manager->delete_post( 42 );
+            $this->fail( 'delete_post() must rethrow non-not-found failures.' );
+        } catch ( \RuntimeException $e ) {
+            $this->assertSame( 'Connection refused', $e->getMessage() );
+        }
+
+        $failure = FailureReporter::latest();
+        $this->assertNotNull( $failure );
+        $this->assertSame( 'delete_post', $failure['operation'] );
+        $this->assertSame( 'index_manager', $failure['source'] );
+        $this->assertSame( 42, $failure['post_id'] );
+        $this->assertSame( 'wp_posts', $failure['index_name'] );
+        $this->assertSame( 'Connection refused', $failure['message'] );
+    }
+
+    public function test_delete_post_does_not_treat_message_404_as_not_found(): void {
+        // A generic exception whose message merely mentions 404 must be treated
+        // as a real failure now — the old substring match would have swallowed it.
+        $this->search_client
+            ->expects( $this->once() )
+            ->method( 'deleteObject' )
+            ->willThrowException( new \RuntimeException( 'Upstream returned 404 for unrelated reasons' ) );
+
         $this->expectException( \RuntimeException::class );
-        $this->expectExceptionMessage( 'Connection refused' );
-        $this->index_manager->delete_post( 42 );
+        $this->index_manager->delete_post( 7 );
     }
 
     // ─── get_index_stats ──────────────────────────────────────
@@ -379,9 +412,11 @@ class IndexManagerTest extends TestCase {
         $this->index_manager->configure_index_settings( 'wp_posts' );
     }
 
-    // ─── reindex_all ─────────────────────────────────────────
+    // ─── reindex_all (atomic temp-index + move) ──────────────
 
-    public function test_reindex_all_indexes_stored_posts(): void {
+    private const TEMP_INDEX_PATTERN = '/^wp_posts_tmp_\d+$/';
+
+    public function test_reindex_all_builds_temp_index_and_moves_to_live(): void {
         global $wp_posts_store;
 
         // Create 3 published posts.
@@ -394,11 +429,12 @@ class IndexManagerTest extends TestCase {
             ] );
         }
 
+        // Records are saved only to a temp index — never a direct live write.
         $this->search_client
             ->expects( $this->once() )
             ->method( 'saveObjects' )
             ->with(
-                'wp_posts',
+                $this->matchesRegularExpression( self::TEMP_INDEX_PATTERN ),
                 $this->callback( function ( array $records ) {
                     return count( $records ) === 3
                         && $records[0]['objectID'] === '1'
@@ -407,105 +443,19 @@ class IndexManagerTest extends TestCase {
             )
             ->willReturn( [ 'objectIDs' => [ '1', '2', '3' ] ] );
 
-        $this->search_client
-            ->method( 'setSettings' )
-            ->willReturn( [ 'taskID' => 1 ] );
-
-        $result = $this->index_manager->reindex_all();
-
-        $this->assertSame( 3, $result['total'] );
-        $this->assertSame( 1, $result['batches'] );
-    }
-
-    public function test_reindex_all_returns_zero_for_no_posts(): void {
-        $this->search_client
-            ->method( 'setSettings' )
-            ->willReturn( [ 'taskID' => 1 ] );
-
-        $result = $this->index_manager->reindex_all();
-
-        $this->assertSame( 0, $result['total'] );
-        $this->assertSame( 0, $result['batches'] );
-    }
-
-    // ─── reindex_atomic ─────────────────────────────────────
-
-    public function test_reindex_atomic_indexes_to_temp_index(): void {
-        global $wp_posts_store;
-
-        for ( $i = 1; $i <= 3; $i++ ) {
-            $wp_posts_store[ $i ] = $this->make_post( [
-                'ID'          => $i,
-                'post_title'  => "Post {$i}",
-                'post_status' => 'publish',
-                'post_type'   => 'post',
-            ] );
-        }
-
-        // saveObjects should be called with the tmp index name, not the live one.
-        $this->search_client
-            ->expects( $this->once() )
-            ->method( 'saveObjects' )
-            ->with(
-                $this->matchesRegularExpression( '/^wp_posts_tmp_\d+$/' ),
-                $this->callback( fn( $records ) => count( $records ) === 3 )
-            )
-            ->willReturn( [ 'objectIDs' => [ '1', '2', '3' ] ] );
-
-        $this->search_client
-            ->method( 'setSettings' )
-            ->willReturn( [ 'taskID' => 1 ] );
-
-        $this->search_client
-            ->expects( $this->once() )
-            ->method( 'operationIndex' )
-            ->willReturn( [ 'taskID' => 2 ] );
-
-        $result = $this->index_manager->reindex_atomic();
-
-        $this->assertSame( 3, $result['total'] );
-        $this->assertSame( 1, $result['batches'] );
-        $this->assertMatchesRegularExpression( '/^wp_posts_tmp_\d+$/', $result['tmp_index'] );
-    }
-
-    public function test_reindex_atomic_configures_settings_on_tmp_index(): void {
-        global $wp_posts_store;
-
-        $wp_posts_store[1] = $this->make_post( [
-            'ID' => 1, 'post_status' => 'publish', 'post_type' => 'post',
-        ] );
-
-        $this->search_client
-            ->method( 'saveObjects' )
-            ->willReturn( [ 'objectIDs' => [ '1' ] ] );
-
-        // setSettings should be called with the tmp index, not the live index.
+        // Settings applied only to the temp index.
         $this->search_client
             ->expects( $this->once() )
             ->method( 'setSettings' )
-            ->with(
-                $this->matchesRegularExpression( '/^wp_posts_tmp_\d+$/' ),
-                $this->isType( 'array' )
-            )
+            ->with( $this->matchesRegularExpression( self::TEMP_INDEX_PATTERN ), $this->isType( 'array' ) )
             ->willReturn( [ 'taskID' => 1 ] );
 
-        $this->search_client
-            ->method( 'operationIndex' )
-            ->willReturn( [ 'taskID' => 2 ] );
-
-        $this->index_manager->reindex_atomic();
-    }
-
-    public function test_reindex_atomic_moves_tmp_to_live(): void {
-        $this->search_client
-            ->method( 'setSettings' )
-            ->willReturn( [ 'taskID' => 1 ] );
-
+        // Publication is an atomic move of the temp index over the live index.
         $this->search_client
             ->expects( $this->once() )
             ->method( 'operationIndex' )
             ->with(
-                $this->matchesRegularExpression( '/^wp_posts_tmp_\d+$/' ),
+                $this->matchesRegularExpression( self::TEMP_INDEX_PATTERN ),
                 $this->callback( function ( array $params ) {
                     return $params['operation'] === 'move'
                         && $params['destination'] === 'wp_posts';
@@ -513,47 +463,58 @@ class IndexManagerTest extends TestCase {
             )
             ->willReturn( [ 'taskID' => 2 ] );
 
-        $this->index_manager->reindex_atomic();
+        $result = $this->index_manager->reindex_all();
+
+        $this->assertSame( 3, $result['total'] );
+        $this->assertSame( 1, $result['batches'] );
     }
 
-    public function test_reindex_atomic_returns_zero_for_no_posts(): void {
+    public function test_reindex_all_never_writes_directly_to_live_index(): void {
+        global $wp_posts_store;
+
+        $wp_posts_store[1] = $this->make_post( [
+            'ID' => 1, 'post_status' => 'publish', 'post_type' => 'post',
+        ] );
+
+        // The with() index constraint fails the test if 'wp_posts' (live) is
+        // ever passed to saveObjects.
         $this->search_client
+            ->expects( $this->once() )
+            ->method( 'saveObjects' )
+            ->with( $this->matchesRegularExpression( self::TEMP_INDEX_PATTERN ), $this->isType( 'array' ) )
+            ->willReturn( [ 'objectIDs' => [ '1' ] ] );
+
+        $this->search_client->method( 'setSettings' )->willReturn( [ 'taskID' => 1 ] );
+        $this->search_client->method( 'operationIndex' )->willReturn( [ 'taskID' => 2 ] );
+
+        $this->index_manager->reindex_all();
+    }
+
+    public function test_reindex_all_returns_zero_for_no_posts(): void {
+        // With no posts the temp index is still created (settings) and moved,
+        // making replacement exact — an empty store yields an empty live index.
+        $this->search_client
+            ->expects( $this->never() )
+            ->method( 'saveObjects' );
+
+        $this->search_client
+            ->expects( $this->once() )
             ->method( 'setSettings' )
+            ->with( $this->matchesRegularExpression( self::TEMP_INDEX_PATTERN ), $this->isType( 'array' ) )
             ->willReturn( [ 'taskID' => 1 ] );
 
         $this->search_client
+            ->expects( $this->once() )
             ->method( 'operationIndex' )
             ->willReturn( [ 'taskID' => 2 ] );
 
-        $result = $this->index_manager->reindex_atomic();
+        $result = $this->index_manager->reindex_all();
 
         $this->assertSame( 0, $result['total'] );
         $this->assertSame( 0, $result['batches'] );
-        $this->assertArrayHasKey( 'tmp_index', $result );
     }
 
-    public function test_reindex_atomic_tmp_index_name_contains_timestamp(): void {
-        $this->search_client
-            ->method( 'setSettings' )
-            ->willReturn( [ 'taskID' => 1 ] );
-
-        $this->search_client
-            ->method( 'operationIndex' )
-            ->willReturn( [ 'taskID' => 2 ] );
-
-        $before = time();
-        $result = $this->index_manager->reindex_atomic();
-        $after  = time();
-
-        // Extract timestamp from tmp_index name.
-        $parts     = explode( '_tmp_', $result['tmp_index'] );
-        $timestamp = (int) $parts[1];
-
-        $this->assertGreaterThanOrEqual( $before, $timestamp );
-        $this->assertLessThanOrEqual( $after, $timestamp );
-    }
-
-    public function test_reindex_atomic_uses_configured_post_types(): void {
+    public function test_reindex_all_uses_configured_post_types(): void {
         global $wp_posts_store;
 
         update_option( 'flapjack_post_types', [ 'page' ] );
@@ -570,7 +531,7 @@ class IndexManagerTest extends TestCase {
             ->expects( $this->once() )
             ->method( 'saveObjects' )
             ->with(
-                $this->isType( 'string' ),
+                $this->matchesRegularExpression( self::TEMP_INDEX_PATTERN ),
                 $this->callback( function ( array $records ) {
                     // Only the page should be indexed.
                     return count( $records ) === 1 && $records[0]['post_type'] === 'page';
@@ -578,15 +539,442 @@ class IndexManagerTest extends TestCase {
             )
             ->willReturn( [ 'objectIDs' => [ '2' ] ] );
 
+        $this->search_client->method( 'setSettings' )->willReturn( [ 'taskID' => 1 ] );
+        $this->search_client->method( 'operationIndex' )->willReturn( [ 'taskID' => 2 ] );
+
+        $result = $this->index_manager->reindex_all();
+        $this->assertSame( 1, $result['total'] );
+    }
+
+    // ─── reindex_all failure preservation ────────────────────
+
+    public function test_reindex_all_leaves_live_intact_when_save_fails(): void {
+        global $wp_posts_store;
+
+        $wp_posts_store[1] = $this->make_post( [
+            'ID' => 1, 'post_status' => 'publish', 'post_type' => 'post',
+        ] );
+
+        $this->search_client
+            ->method( 'saveObjects' )
+            ->willThrowException( new \RuntimeException( 'Batch upload failed' ) );
+
+        // The live index must never be published, and any cleanup deleteIndex
+        // must target only the orphaned temp index — never the live index.
+        $this->search_client->expects( $this->never() )->method( 'operationIndex' );
+        $this->search_client
+            ->method( 'deleteIndex' )
+            ->with( $this->matchesRegularExpression( self::TEMP_INDEX_PATTERN ) );
+
+        $this->expectException( \RuntimeException::class );
+        $this->expectExceptionMessage( 'Batch upload failed' );
+
+        $this->index_manager->reindex_all();
+    }
+
+    public function test_reindex_all_leaves_live_intact_when_settings_fail(): void {
+        global $wp_posts_store;
+
+        $wp_posts_store[1] = $this->make_post( [
+            'ID' => 1, 'post_status' => 'publish', 'post_type' => 'post',
+        ] );
+
+        $this->search_client->method( 'saveObjects' )->willReturn( [ 'objectIDs' => [ '1' ] ] );
         $this->search_client
             ->method( 'setSettings' )
+            ->willThrowException( new \RuntimeException( 'Settings rejected' ) );
+
+        // Settings failure happens before the move, so nothing is published; any
+        // cleanup deleteIndex targets only the temp index, never the live index.
+        $this->search_client->expects( $this->never() )->method( 'operationIndex' );
+        $this->search_client
+            ->method( 'deleteIndex' )
+            ->with( $this->matchesRegularExpression( self::TEMP_INDEX_PATTERN ) );
+
+        $this->expectException( \RuntimeException::class );
+        $this->expectExceptionMessage( 'Settings rejected' );
+
+        $this->index_manager->reindex_all();
+    }
+
+    // ─── cross-request rebuild helpers (background path) ─────
+
+    public function test_begin_rebuild_persists_canonical_temp_index_state(): void {
+        $temp = $this->index_manager->begin_rebuild();
+
+        $this->assertMatchesRegularExpression( self::TEMP_INDEX_PATTERN, $temp );
+
+        $state = get_transient( IndexManager::REBUILD_STATE_TRANSIENT );
+        $this->assertIsArray( $state );
+        $this->assertSame( $temp, $state['temp_index'] );
+        $this->assertSame( 'wp_posts', $state['live_index'] );
+    }
+
+    public function test_append_records_to_rebuild_saves_to_temp_index(): void {
+        $temp = $this->index_manager->begin_rebuild();
+
+        $this->search_client
+            ->expects( $this->once() )
+            ->method( 'saveObjects' )
+            ->with( $temp, $this->callback( fn( $records ) => count( $records ) === 2 ) )
+            ->willReturn( [ 'objectIDs' => [ '1', '2' ] ] );
+
+        $this->index_manager->append_records_to_rebuild( [
+            [ 'objectID' => '1' ],
+            [ 'objectID' => '2' ],
+        ] );
+    }
+
+    public function test_append_records_to_rebuild_skips_empty_batch(): void {
+        $this->index_manager->begin_rebuild();
+
+        $this->search_client->expects( $this->never() )->method( 'saveObjects' );
+
+        $this->index_manager->append_records_to_rebuild( [] );
+    }
+
+    public function test_publish_rebuild_moves_temp_to_live_and_clears_state(): void {
+        $temp = $this->index_manager->begin_rebuild();
+
+        $this->search_client
+            ->expects( $this->once() )
+            ->method( 'setSettings' )
+            ->with( $temp, $this->isType( 'array' ) )
             ->willReturn( [ 'taskID' => 1 ] );
 
         $this->search_client
+            ->expects( $this->once() )
+            ->method( 'operationIndex' )
+            ->with(
+                $temp,
+                $this->callback( fn( array $p ) => $p['operation'] === 'move' && $p['destination'] === 'wp_posts' )
+            )
+            ->willReturn( [ 'taskID' => 2 ] );
+
+        $this->index_manager->publish_rebuild();
+
+        $this->assertFalse( get_transient( IndexManager::REBUILD_STATE_TRANSIENT ) );
+    }
+
+    public function test_append_records_without_active_rebuild_throws(): void {
+        $this->expectException( \RuntimeException::class );
+        $this->index_manager->append_records_to_rebuild( [ [ 'objectID' => '1' ] ] );
+    }
+
+    public function test_publish_rebuild_without_active_rebuild_throws(): void {
+        $this->expectException( \RuntimeException::class );
+        $this->index_manager->publish_rebuild();
+    }
+
+    // ─── keyset enumeration ──────────────────────────────────
+
+    public function test_index_rebuild_batch_enumerates_by_keyset_cursor(): void {
+        global $wp_posts_store;
+
+        $this->index_manager->begin_rebuild();
+        for ( $i = 1; $i <= 3; $i++ ) {
+            $wp_posts_store[ $i ] = $this->make_post( [
+                'ID' => $i, 'post_status' => 'publish', 'post_type' => 'post',
+            ] );
+        }
+
+        $saved = [];
+        $this->search_client
+            ->method( 'saveObjects' )
+            ->willReturnCallback( function ( string $index, array $records ) use ( &$saved ) {
+                $saved[] = array_map( fn( $r ) => $r['objectID'], $records );
+                return [ 'objectIDs' => [] ];
+            } );
+
+        $first = $this->index_manager->index_rebuild_batch( 2 );
+        $this->assertSame( 2, $first['processed'] );
+        $this->assertFalse( $first['done'] );
+
+        $second = $this->index_manager->index_rebuild_batch( 2 );
+        $this->assertSame( 1, $second['processed'] );
+        $this->assertTrue( $second['done'] );
+
+        // The cursor advanced past the first page, so the two batches cover
+        // disjoint ascending ID ranges — no overlap and no skipped posts.
+        $this->assertSame( [ [ '1', '2' ], [ '3' ] ], $saved );
+
+        $state = get_transient( IndexManager::REBUILD_STATE_TRANSIENT );
+        $this->assertSame( 3, $state['cursor'] );
+    }
+
+    // ─── unique temp-index names ─────────────────────────────
+
+    public function test_begin_rebuild_generates_unique_temp_index_within_same_second(): void {
+        // Two rebuilds started back-to-back (same wall-clock second) must never
+        // share a temp index name, or their writes would collide.
+        $first  = $this->index_manager->begin_rebuild();
+        $second = $this->index_manager->begin_rebuild();
+
+        $this->assertMatchesRegularExpression( self::TEMP_INDEX_PATTERN, $first );
+        $this->assertMatchesRegularExpression( self::TEMP_INDEX_PATTERN, $second );
+        $this->assertNotSame( $first, $second );
+    }
+
+    // ─── abort cleanup (temp index only) ─────────────────────
+
+    public function test_reindex_all_cleans_up_temp_index_when_build_fails(): void {
+        global $wp_posts_store;
+
+        $wp_posts_store[1] = $this->make_post( [
+            'ID' => 1, 'post_status' => 'publish', 'post_type' => 'post',
+        ] );
+
+        $this->search_client
+            ->method( 'saveObjects' )
+            ->willThrowException( new \RuntimeException( 'Batch upload failed' ) );
+
+        // A failed rebuild deletes exactly the orphaned temp index.
+        $this->search_client
+            ->expects( $this->once() )
+            ->method( 'deleteIndex' )
+            ->with( $this->matchesRegularExpression( self::TEMP_INDEX_PATTERN ) );
+        $this->search_client->expects( $this->never() )->method( 'operationIndex' );
+
+        $this->expectException( \RuntimeException::class );
+        $this->expectExceptionMessage( 'Batch upload failed' );
+
+        $this->index_manager->reindex_all();
+    }
+
+    public function test_reindex_all_cleanup_failure_does_not_mask_original_error(): void {
+        global $wp_posts_store;
+
+        $wp_posts_store[1] = $this->make_post( [
+            'ID' => 1, 'post_status' => 'publish', 'post_type' => 'post',
+        ] );
+
+        $this->search_client
+            ->method( 'saveObjects' )
+            ->willThrowException( new \RuntimeException( 'Batch upload failed' ) );
+
+        // Even when temp-index cleanup itself fails, the original rebuild error
+        // is what surfaces — never the cleanup error.
+        $this->search_client
+            ->method( 'deleteIndex' )
+            ->willThrowException( new \RuntimeException( 'cleanup boom' ) );
+
+        $this->expectException( \RuntimeException::class );
+        $this->expectExceptionMessage( 'Batch upload failed' );
+
+        $this->index_manager->reindex_all();
+    }
+
+    // ─── mid-build mutation tracking (dirty IDs / tombstones) ─
+
+    public function test_index_post_during_rebuild_writes_live_and_records_dirty_id(): void {
+        $this->index_manager->begin_rebuild();
+
+        $post = $this->make_post( [ 'ID' => 42, 'post_status' => 'publish', 'post_type' => 'post' ] );
+
+        // The live single-post write still happens during a rebuild.
+        $this->search_client
+            ->expects( $this->once() )
+            ->method( 'addOrUpdateObject' )
+            ->with( 'wp_posts', '42', $this->isType( 'array' ) )
+            ->willReturn( [ 'objectID' => '42', 'taskID' => 1 ] );
+
+        $this->index_manager->index_post( $post );
+
+        $state = get_transient( IndexManager::REBUILD_STATE_TRANSIENT );
+        $this->assertContains( 42, $state['dirty_ids'] );
+        $this->assertNotContains( 42, $state['tombstones'] );
+    }
+
+    public function test_delete_post_during_rebuild_deletes_live_and_records_tombstone(): void {
+        $this->index_manager->begin_rebuild();
+
+        $this->search_client
+            ->expects( $this->once() )
+            ->method( 'deleteObject' )
+            ->with( 'wp_posts', '42' )
+            ->willReturn( [ 'taskID' => 1 ] );
+
+        $this->index_manager->delete_post( 42 );
+
+        $state = get_transient( IndexManager::REBUILD_STATE_TRANSIENT );
+        $this->assertContains( 42, $state['tombstones'] );
+        $this->assertNotContains( 42, $state['dirty_ids'] );
+    }
+
+    public function test_index_post_unpublish_during_rebuild_records_tombstone(): void {
+        $this->index_manager->begin_rebuild();
+
+        // A draft post routes through delete_post — it should be tombstoned, not
+        // marked dirty, so publication removes it from the temp index.
+        $post = $this->make_post( [ 'ID' => 42, 'post_status' => 'draft', 'post_type' => 'post' ] );
+
+        $this->search_client
+            ->expects( $this->once() )
+            ->method( 'deleteObject' )
+            ->with( 'wp_posts', '42' )
+            ->willReturn( [ 'taskID' => 1 ] );
+
+        $this->index_manager->index_post( $post );
+
+        $state = get_transient( IndexManager::REBUILD_STATE_TRANSIENT );
+        $this->assertContains( 42, $state['tombstones'] );
+        $this->assertNotContains( 42, $state['dirty_ids'] );
+    }
+
+    public function test_index_post_outside_rebuild_records_no_mutation_state(): void {
+        $post = $this->make_post( [ 'ID' => 42, 'post_status' => 'publish', 'post_type' => 'post' ] );
+
+        $this->search_client
+            ->method( 'addOrUpdateObject' )
+            ->willReturn( [ 'objectID' => '42', 'taskID' => 1 ] );
+
+        $this->index_manager->index_post( $post );
+
+        // With no rebuild in progress, no rebuild state is created.
+        $this->assertFalse( get_transient( IndexManager::REBUILD_STATE_TRANSIENT ) );
+    }
+
+    public function test_dirty_then_delete_moves_id_from_dirty_to_tombstone(): void {
+        $this->index_manager->begin_rebuild();
+
+        $post = $this->make_post( [ 'ID' => 42, 'post_status' => 'publish', 'post_type' => 'post' ] );
+        $this->search_client->method( 'addOrUpdateObject' )->willReturn( [ 'taskID' => 1 ] );
+        $this->search_client->method( 'deleteObject' )->willReturn( [ 'taskID' => 1 ] );
+
+        $this->index_manager->index_post( $post ); // dirty
+        $this->index_manager->delete_post( 42 );   // then removed
+
+        $state = get_transient( IndexManager::REBUILD_STATE_TRANSIENT );
+        $this->assertContains( 42, $state['tombstones'] );
+        $this->assertNotContains( 42, $state['dirty_ids'] );
+    }
+
+    // ─── mutation replay at publication ──────────────────────
+
+    public function test_publish_rebuild_replays_dirty_ids_onto_temp_before_move(): void {
+        global $wp_posts_store;
+
+        $temp = $this->index_manager->begin_rebuild();
+
+        // Post 5 was written live during the rebuild.
+        $wp_posts_store[5] = $this->make_post( [ 'ID' => 5, 'post_status' => 'publish', 'post_type' => 'post' ] );
+        $this->seed_mutation_state( $temp, [ 5 ], [] );
+
+        // The dirty post's current record is replayed onto the temp index.
+        $this->search_client
+            ->expects( $this->once() )
+            ->method( 'saveObjects' )
+            ->with( $temp, $this->callback( fn( $records ) => count( $records ) === 1 && $records[0]['objectID'] === '5' ) )
+            ->willReturn( [ 'objectIDs' => [ '5' ] ] );
+
+        $this->search_client->method( 'setSettings' )->willReturn( [ 'taskID' => 1 ] );
+        $this->search_client
+            ->expects( $this->once() )
             ->method( 'operationIndex' )
             ->willReturn( [ 'taskID' => 2 ] );
 
-        $result = $this->index_manager->reindex_atomic();
-        $this->assertSame( 1, $result['total'] );
+        $this->index_manager->publish_rebuild();
+    }
+
+    public function test_publish_rebuild_removes_tombstoned_ids_from_temp_before_move(): void {
+        $temp = $this->index_manager->begin_rebuild();
+        $this->seed_mutation_state( $temp, [], [ 9 ] );
+
+        $this->search_client
+            ->expects( $this->once() )
+            ->method( 'deleteObject' )
+            ->with( $temp, '9' )
+            ->willReturn( [ 'taskID' => 1 ] );
+
+        $this->search_client->method( 'setSettings' )->willReturn( [ 'taskID' => 1 ] );
+        $this->search_client
+            ->expects( $this->once() )
+            ->method( 'operationIndex' )
+            ->willReturn( [ 'taskID' => 2 ] );
+
+        $this->index_manager->publish_rebuild();
+    }
+
+    public function test_publish_rebuild_replays_dirty_id_as_delete_when_no_longer_indexable(): void {
+        // Dirty ID 7 has no live post (deleted after being marked dirty) — the
+        // replay must remove it from the temp index rather than re-add it.
+        $temp = $this->index_manager->begin_rebuild();
+        $this->seed_mutation_state( $temp, [ 7 ], [] );
+
+        $this->search_client->expects( $this->never() )->method( 'saveObjects' );
+        $this->search_client
+            ->expects( $this->once() )
+            ->method( 'deleteObject' )
+            ->with( $temp, '7' )
+            ->willReturn( [ 'taskID' => 1 ] );
+
+        $this->search_client->method( 'setSettings' )->willReturn( [ 'taskID' => 1 ] );
+        $this->search_client->method( 'operationIndex' )->willReturn( [ 'taskID' => 2 ] );
+
+        $this->index_manager->publish_rebuild();
+    }
+
+    // ─── explicit abort on unreconcilable mutation state ─────
+
+    public function test_publish_rebuild_aborts_move_when_mutations_over_limit(): void {
+        $temp = $this->index_manager->begin_rebuild();
+
+        // Simulate an overflowed mutation log — too many changes to trust a
+        // cheap replay, so publication must refuse the move.
+        set_transient( IndexManager::REBUILD_STATE_TRANSIENT, [
+            'temp_index' => $temp,
+            'live_index' => 'wp_posts',
+            'dirty_ids'  => [],
+            'tombstones' => [],
+            'overflow'   => true,
+        ], HOUR_IN_SECONDS );
+
+        // The move is refused and the temp index is cleaned up.
+        $this->search_client->expects( $this->never() )->method( 'operationIndex' );
+        $this->search_client
+            ->expects( $this->once() )
+            ->method( 'deleteIndex' )
+            ->with( $temp );
+
+        $this->expectException( \RuntimeException::class );
+
+        $this->index_manager->publish_rebuild();
+    }
+
+    public function test_mutation_log_flags_overflow_beyond_limit(): void {
+        $temp = $this->index_manager->begin_rebuild();
+
+        // Seed the log one short of the limit, then one more mutation tips it.
+        set_transient( IndexManager::REBUILD_STATE_TRANSIENT, [
+            'temp_index' => $temp,
+            'live_index' => 'wp_posts',
+            'dirty_ids'  => range( 1, IndexManager::MUTATION_LIMIT ),
+            'tombstones' => [],
+            'overflow'   => false,
+        ], HOUR_IN_SECONDS );
+
+        $this->search_client->method( 'deleteObject' )->willReturn( [ 'taskID' => 1 ] );
+
+        // One more distinct removal pushes the combined log past MUTATION_LIMIT.
+        $this->index_manager->delete_post( IndexManager::MUTATION_LIMIT + 1 );
+
+        $state = get_transient( IndexManager::REBUILD_STATE_TRANSIENT );
+        $this->assertTrue( $state['overflow'] );
+    }
+
+    /**
+     * Seed the mutation buckets of the active rebuild state.
+     *
+     * @param int[] $dirty_ids
+     * @param int[] $tombstones
+     */
+    private function seed_mutation_state( string $temp_index, array $dirty_ids, array $tombstones ): void {
+        set_transient( IndexManager::REBUILD_STATE_TRANSIENT, [
+            'temp_index' => $temp_index,
+            'live_index' => 'wp_posts',
+            'dirty_ids'  => $dirty_ids,
+            'tombstones' => $tombstones,
+            'overflow'   => false,
+        ], HOUR_IN_SECONDS );
     }
 }

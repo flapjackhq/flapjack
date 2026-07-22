@@ -247,12 +247,26 @@ async fn catchup_all_tenants(
 
 fn retention_gap_detected(local_seq: u64, response: &GetOpsResponse) -> bool {
     if local_seq == 0 {
-        return false;
+        return fresh_node_retention_gap_detected(response);
     }
 
     response
         .oldest_retained_seq
         .is_some_and(|oldest_retained| local_seq < oldest_retained)
+}
+
+fn fresh_node_retention_gap_detected(response: &GetOpsResponse) -> bool {
+    // A fresh node needs retained history starting at seq 1; otherwise only
+    // a snapshot can provide the compacted prefix.
+    if let Some(oldest_retained_seq) = response.oldest_retained_seq {
+        return oldest_retained_seq > 1;
+    }
+
+    match response.ops.first().map(|op| op.seq) {
+        Some(1) => false,
+        Some(_) => true,
+        None => response.current_seq > 0,
+    }
 }
 
 /// Downloads a snapshot from a replication peer and installs it as the tenant's
@@ -525,6 +539,86 @@ fn read_local_ops_since(
 }
 
 /// Retry pending local ops for peers that still show a recorded delivery error.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
+/// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.
 /// TODO: Document repush_failed_peer_ranges.
 #[allow(clippy::cognitive_complexity)] // Per-peer retry/strict-mode handling is centralized here to keep startup catch-up failure semantics in one place.
@@ -820,12 +914,18 @@ mod tests {
         let node_config = flapjack_replication::config::NodeConfig {
             node_id: "test-node".to_string(),
             bind_addr: "0.0.0.0:7700".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
             peers: vec![flapjack_replication::config::PeerConfig {
                 node_id: "unreachable-peer".to_string(),
                 addr: "http://127.0.0.1:19999".to_string(),
             }],
         };
-        let repl_mgr = flapjack_replication::manager::ReplicationManager::new(node_config, None);
+        let repl_mgr = flapjack_replication::manager::ReplicationManager::new(
+            node_config,
+            None,
+            tmp.path().to_path_buf(),
+        );
 
         // Override replication_manager on the built state.
         let state = crate::handlers::AppState {
@@ -897,6 +997,8 @@ mod tests {
             NodeConfig {
                 node_id: "test-node".to_string(),
                 bind_addr: "127.0.0.1:0".to_string(),
+                advertise_addr: None,
+                bootstrap_peer: None,
                 peers: vec![
                     PeerConfig {
                         node_id: "reachable-peer".to_string(),
@@ -909,6 +1011,7 @@ mod tests {
                 ],
             },
             None,
+            tmp.path().to_path_buf(),
         ));
         let state = crate::handlers::AppState { ..state };
 
@@ -997,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn retention_gap_false_for_brand_new_replica() {
+    fn retention_gap_true_for_brand_new_replica_when_peer_truncated() {
         let response = GetOpsResponse {
             tenant_id: "t1".to_string(),
             ops: Vec::new(),
@@ -1005,7 +1108,31 @@ mod tests {
             oldest_retained_seq: Some(200),
             node_current_seqs: std::collections::BTreeMap::new(),
         };
+        assert!(retention_gap_detected(0, &response));
+    }
+
+    #[test]
+    fn retention_gap_false_for_brand_new_replica_when_peer_retains_first_op() {
+        let response = GetOpsResponse {
+            tenant_id: "t1".to_string(),
+            ops: Vec::new(),
+            current_seq: 25,
+            oldest_retained_seq: Some(1),
+            node_current_seqs: std::collections::BTreeMap::new(),
+        };
         assert!(!retention_gap_detected(0, &response));
+    }
+
+    #[test]
+    fn retention_gap_true_for_brand_new_replica_when_metadata_missing_and_peer_has_history() {
+        let response = GetOpsResponse {
+            tenant_id: "t1".to_string(),
+            ops: Vec::new(),
+            current_seq: 25,
+            oldest_retained_seq: None,
+            node_current_seqs: std::collections::BTreeMap::new(),
+        };
+        assert!(retention_gap_detected(0, &response));
     }
 
     #[test]
@@ -1046,6 +1173,44 @@ mod tests {
         // local_seq > oldest_retained means we are ahead of the
         // oldest retained entry — definitely not a gap.
         assert!(!retention_gap_detected(250, &response));
+    }
+
+    #[test]
+    fn retention_gap_false_for_brand_new_replica_when_metadata_missing_but_first_op_is_present() {
+        let response = GetOpsResponse {
+            tenant_id: "t1".to_string(),
+            ops: vec![flapjack::index::oplog::OpLogEntry {
+                seq: 1,
+                tenant_id: "t1".to_string(),
+                node_id: "n1".to_string(),
+                op_type: "upsert".to_string(),
+                payload: serde_json::json!({"x": 1}),
+                timestamp_ms: 0,
+            }],
+            current_seq: 25,
+            oldest_retained_seq: None,
+            node_current_seqs: std::collections::BTreeMap::new(),
+        };
+        assert!(!retention_gap_detected(0, &response));
+    }
+
+    #[test]
+    fn retention_gap_true_for_brand_new_replica_when_metadata_missing_and_first_op_is_truncated() {
+        let response = GetOpsResponse {
+            tenant_id: "t1".to_string(),
+            ops: vec![flapjack::index::oplog::OpLogEntry {
+                seq: 8,
+                tenant_id: "t1".to_string(),
+                node_id: "n1".to_string(),
+                op_type: "upsert".to_string(),
+                payload: serde_json::json!({"x": 1}),
+                timestamp_ms: 0,
+            }],
+            current_seq: 25,
+            oldest_retained_seq: None,
+            node_current_seqs: std::collections::BTreeMap::new(),
+        };
+        assert!(retention_gap_detected(0, &response));
     }
     #[test]
     fn retention_gap_true_even_when_ops_present() {
@@ -1502,12 +1667,15 @@ mod tests {
             NodeConfig {
                 node_id: "node-a".to_string(),
                 bind_addr: "127.0.0.1:0".to_string(),
+                advertise_addr: None,
+                bootstrap_peer: None,
                 peers: vec![PeerConfig {
                     node_id: "peer-b".to_string(),
                     addr: format!("http://{}", peer_addr),
                 }],
             },
             None,
+            tmp_local.path().to_path_buf(),
         );
 
         let local_state = Arc::new(AppState {

@@ -9,6 +9,8 @@ declare(strict_types=1);
 
 namespace Flapjack\WordPress\Admin;
 
+use Flapjack\WordPress\Status\FailureReporter;
+
 class SettingsPage {
 
     public const OPTION_GROUP = 'flapjack_search_settings';
@@ -234,6 +236,66 @@ class SettingsPage {
                 </tr>
             </table>
 
+            <hr>
+            <h2><?php esc_html_e( 'Latest Indexing Failure', 'flapjack-search' ); ?></h2>
+            <?php $this->render_last_failure(); ?>
+
+        </div>
+        <?php
+    }
+
+    /**
+     * Render the reporter's latest failure (or an empty state). Reads the
+     * already-sanitized reporter record and escapes every value on output; the
+     * reporter is the single owner of failure state, so this method only formats
+     * it for display.
+     */
+    public function render_last_failure(): void {
+        $failure = FailureReporter::latest();
+
+        if ( null === $failure ) {
+            ?>
+            <p class="description" data-testid="flapjack-no-failure">
+                <?php esc_html_e( 'No indexing failures recorded.', 'flapjack-search' ); ?>
+            </p>
+            <?php
+            return;
+        }
+
+        $occurred_at = isset( $failure['occurred_at'] ) ? (int) $failure['occurred_at'] : 0;
+        $timestamp   = gmdate( 'Y-m-d H:i:s', $occurred_at ) . ' UTC';
+        ?>
+        <div class="notice notice-error inline" data-testid="flapjack-last-failure">
+            <table class="form-table">
+                <tr>
+                    <th scope="row"><?php esc_html_e( 'Operation', 'flapjack-search' ); ?></th>
+                    <td data-testid="flapjack-failure-operation"><?php echo esc_html( (string) ( $failure['operation'] ?? '' ) ); ?></td>
+                </tr>
+                <tr>
+                    <th scope="row"><?php esc_html_e( 'Source', 'flapjack-search' ); ?></th>
+                    <td data-testid="flapjack-failure-source"><?php echo esc_html( (string) ( $failure['source'] ?? '' ) ); ?></td>
+                </tr>
+                <?php if ( isset( $failure['post_id'] ) ) : ?>
+                <tr>
+                    <th scope="row"><?php esc_html_e( 'Post ID', 'flapjack-search' ); ?></th>
+                    <td data-testid="flapjack-failure-post-id"><?php echo esc_html( (string) $failure['post_id'] ); ?></td>
+                </tr>
+                <?php endif; ?>
+                <?php if ( isset( $failure['status_code'] ) ) : ?>
+                <tr>
+                    <th scope="row"><?php esc_html_e( 'Status Code', 'flapjack-search' ); ?></th>
+                    <td data-testid="flapjack-failure-status-code"><?php echo esc_html( (string) $failure['status_code'] ); ?></td>
+                </tr>
+                <?php endif; ?>
+                <tr>
+                    <th scope="row"><?php esc_html_e( 'Message', 'flapjack-search' ); ?></th>
+                    <td data-testid="flapjack-failure-message"><?php echo esc_html( (string) ( $failure['message'] ?? '' ) ); ?></td>
+                </tr>
+                <tr>
+                    <th scope="row"><?php esc_html_e( 'Occurred At', 'flapjack-search' ); ?></th>
+                    <td data-testid="flapjack-failure-timestamp"><?php echo esc_html( $timestamp ); ?></td>
+                </tr>
+            </table>
         </div>
         <?php
     }

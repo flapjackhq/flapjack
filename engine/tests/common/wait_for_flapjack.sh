@@ -15,7 +15,7 @@ EOF
 
 extract_port_from_log() {
   local log_path="$1"
-  sed -n 's/.*Local:.*http:\/\/127\.0\.0\.1:\([0-9]*\).*/\1/p' "$log_path" | head -1
+  sed -n -E 's/.*Local:.*http:\/\/(\[::\]|0\.0\.0\.0|127\.0\.0\.1):([0-9]+).*/\2/p' "$log_path" | head -1
 }
 
 print_failure_with_log() {
@@ -109,8 +109,11 @@ main() {
       fi
     fi
 
-    if [ -n "$resolved_health_url" ] && curl -sf "$resolved_health_url" >/dev/null 2>&1; then
-      return 0
+    if [ -n "$resolved_health_url" ]; then
+      health_status="$(curl -sS -o /dev/null -w '%{http_code}' "$resolved_health_url" 2>/dev/null || true)"
+      if [ "$health_status" = "200" ]; then
+        return 0
+      fi
     fi
 
     sleep "$interval_seconds"

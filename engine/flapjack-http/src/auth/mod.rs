@@ -5,7 +5,7 @@ mod route_acl;
 pub use key_store::*;
 pub use middleware::authenticate_and_authorize;
 #[cfg(test)]
-pub(crate) use middleware::{extract_index_name, is_public_path};
+pub(crate) use middleware::{extract_index_name, is_public_path, route_exposure, RouteExposure};
 pub(crate) use route_acl::is_acme_challenge_path;
 pub use route_acl::required_acl_for_route;
 

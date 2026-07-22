@@ -1,0 +1,18 @@
+parameters:
+    level: 5
+    # Default to the reindex owner files; the CI/checklist commands pass explicit
+    # paths for broader sweeps.
+    paths:
+        - includes/Indexing
+    # Reuse the PHPUnit bootstrap so PHPStan resolves the same WordPress /
+    # WooCommerce / WP-CLI symbols and plugin constants the tests rely on —
+    # one source of truth for stub definitions.
+    bootstrapFiles:
+        - tests/bootstrap.php
+    ignoreErrors:
+        # The WP-CLI stub hard-defines WP_CLI as `true` so unit tests can drive
+        # Commands. That makes `! WP_CLI` look statically unreachable, but the
+        # guard is correct production code (WP_CLI is only defined under WP-CLI).
+        -
+            message: '#Negated boolean expression is always false\.#'
+            path: includes/CLI/Commands.php

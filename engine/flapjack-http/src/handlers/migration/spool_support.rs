@@ -1,8 +1,9 @@
 use super::*;
 
 pub(super) fn public_view(manifest: &SpoolManifest) -> PublicExportView {
-    let completed = manifest.counters.total();
-    let total = manifest.denominators.total();
+    let progress = export_progress(manifest);
+    let completed = progress.completed;
+    let total = progress.total;
     let ratio = if total == 0 {
         1.0
     } else {
@@ -18,6 +19,13 @@ pub(super) fn public_view(manifest: &SpoolManifest) -> PublicExportView {
             total,
             ratio,
         },
+    }
+}
+
+pub(super) fn export_progress(manifest: &SpoolManifest) -> MigrationExportProgress {
+    MigrationExportProgress {
+        completed: manifest.counters.total(),
+        total: manifest.denominators.total(),
     }
 }
 
@@ -122,6 +130,43 @@ pub(super) fn hex_digest(bytes: &[u8]) -> String {
 }
 
 impl SpoolStore {
+    pub(super) fn build_accepted_reader(
+        &self,
+        job_uuid: Uuid,
+        manifest: &SpoolManifest,
+    ) -> SpoolResult<AcceptedSpoolReader> {
+        if manifest.lifecycle != LifecycleState::Accepted {
+            return Err(SpoolError::new(SpoolErrorKind::JobNotAccepted));
+        }
+
+        let mut settings = None;
+        let mut documents = Vec::new();
+        let mut rules = Vec::new();
+        let mut synonyms = Vec::new();
+        for artifact in visible_artifacts(manifest) {
+            validate_relative(&artifact.final_path)?;
+            match artifact.kind {
+                ArtifactKind::Settings => settings = Some(artifact.clone()),
+                ArtifactKind::DocumentPage => documents.push(artifact.clone()),
+                ArtifactKind::RulesPage => rules.push(artifact.clone()),
+                ArtifactKind::SynonymsPage => synonyms.push(artifact.clone()),
+                ArtifactKind::Config => {
+                    return Err(SpoolError::new(SpoolErrorKind::UnsupportedArtifactKind));
+                }
+            }
+        }
+
+        let settings = settings.ok_or_else(|| SpoolError::new(SpoolErrorKind::ManifestCorrupt))?;
+        Ok(AcceptedSpoolReader {
+            store: self.clone(),
+            job_uuid,
+            settings,
+            documents,
+            rules,
+            synonyms,
+        })
+    }
+
     pub(super) fn validate_artifact_limits(
         &self,
         manifest: &SpoolManifest,
@@ -260,7 +305,9 @@ impl SpoolStore {
     pub(super) fn global_committed_bytes(&self) -> SpoolResult<u64> {
         let mut total = 0;
         for job_uuid in self.job_uuids()? {
-            total += self.read_manifest(job_uuid)?.bytes_committed;
+            if let Some(manifest) = self.read_manifest_if_exists(job_uuid)? {
+                total += manifest.bytes_committed;
+            }
         }
         Ok(total)
     }
@@ -301,10 +348,100 @@ impl SpoolStore {
         serde_json::from_slice(&bytes).map_err(|_| SpoolError::new(SpoolErrorKind::ManifestCorrupt))
     }
 
+    pub(super) fn read_manifest_if_exists(
+        &self,
+        job_uuid: Uuid,
+    ) -> SpoolResult<Option<SpoolManifest>> {
+        let bytes = match fs::read(self.manifest_path(job_uuid)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(SpoolError::from(error)),
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| SpoolError::new(SpoolErrorKind::ManifestCorrupt))
+    }
+
     pub(super) fn commit_manifest(&self, manifest: &SpoolManifest) -> SpoolResult<()> {
+        self.commit_manifest_file(manifest)?;
+        self.refresh_migration_export_progress(manifest)
+    }
+
+    pub(super) fn commit_manifest_file(&self, manifest: &SpoolManifest) -> SpoolResult<()> {
         let bytes = serde_json::to_vec_pretty(manifest)
             .map_err(|_| SpoolError::new(SpoolErrorKind::ManifestCorrupt))?;
         write_atomic(&self.job_dir(manifest.job_uuid), MANIFEST_FILE, &bytes)
+    }
+
+    pub(super) fn commit_migration_phase(&self, record: &MigrationPhaseRecord) -> SpoolResult<()> {
+        #[cfg(test)]
+        {
+            let marker = self
+                .job_dir(record.job_uuid)
+                .join(FAIL_NEXT_MIGRATION_PHASE_COMMIT_FILE);
+            if marker.exists() {
+                let _ = fs::remove_file(marker);
+                return Err(SpoolError::from(io::Error::other(
+                    "injected migration phase commit failure",
+                )));
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(record)
+            .map_err(|_| SpoolError::new(SpoolErrorKind::ManifestCorrupt))?;
+        write_atomic(&self.job_dir(record.job_uuid), MIGRATION_PHASE_FILE, &bytes)
+    }
+
+    pub(super) fn commit_async_migration_metadata(
+        &self,
+        metadata: &AsyncMigrationMetadata,
+    ) -> SpoolResult<()> {
+        let bytes = serde_json::to_vec_pretty(metadata)
+            .map_err(|_| SpoolError::new(SpoolErrorKind::ManifestCorrupt))?;
+        write_atomic(
+            &self.job_dir(metadata.job_uuid),
+            ASYNC_MIGRATION_METADATA_FILE,
+            &bytes,
+        )
+    }
+
+    /// Override a running record's labeled export progress with the manifest's
+    /// counters — the single owner of that value — so a read after a crash between
+    /// the manifest write and the phase refresh cannot under-report. Terminal
+    /// records and jobs whose manifest is no longer accumulating (failed, deleting,
+    /// deleted) keep their durable snapshot, which then outlives the manifest.
+    pub(super) fn reconcile_export_progress(
+        &self,
+        record: &mut MigrationPhaseRecord,
+    ) -> SpoolResult<()> {
+        if record.disposition != MigrationDisposition::Running {
+            return Ok(());
+        }
+        if let Some(manifest) = self.read_manifest_if_exists(record.job_uuid)? {
+            if matches!(
+                manifest.lifecycle,
+                LifecycleState::Running | LifecycleState::Accepted
+            ) {
+                record.export_progress = Some(export_progress(&manifest));
+            }
+        }
+        Ok(())
+    }
+
+    fn refresh_migration_export_progress(&self, manifest: &SpoolManifest) -> SpoolResult<()> {
+        if !matches!(
+            manifest.lifecycle,
+            LifecycleState::Running | LifecycleState::Accepted
+        ) || !self.migration_phase_path(manifest.job_uuid).exists()
+        {
+            return Ok(());
+        }
+        let mut record = self.read_migration_phase(manifest.job_uuid)?;
+        if record.disposition != MigrationDisposition::Running {
+            return Ok(());
+        }
+        record.export_progress = Some(export_progress(manifest));
+        record.updated_at = self.now();
+        self.commit_migration_phase(&record)
     }
 
     pub(super) fn manifest_path(&self, job_uuid: Uuid) -> PathBuf {
@@ -332,5 +469,96 @@ impl SpoolStore {
 
     pub(super) fn lock_job(&self, job_uuid: Uuid) -> SpoolResult<LockGuard> {
         lock_file(&self.job_dir(job_uuid).join(JOB_LOCK_FILE))
+    }
+}
+
+impl AcceptedSpoolReader {
+    pub(crate) fn settings(&self) -> SpoolResult<serde_json::Value> {
+        let value = self
+            .store
+            .read_artifact_value(self.job_uuid, &self.settings)?;
+        if self.settings.item_count != 1 {
+            return Err(SpoolError::new(SpoolErrorKind::ManifestCorrupt));
+        }
+        Ok(value)
+    }
+
+    pub(crate) fn document_pages(&self) -> AcceptedSpoolPageIter<'_> {
+        self.page_iter(&self.documents)
+    }
+
+    pub(crate) fn rule_pages(&self) -> AcceptedSpoolPageIter<'_> {
+        self.page_iter(&self.rules)
+    }
+
+    pub(crate) fn synonym_pages(&self) -> AcceptedSpoolPageIter<'_> {
+        self.page_iter(&self.synonyms)
+    }
+
+    fn page_iter<'a>(&'a self, artifacts: &'a [ArtifactManifest]) -> AcceptedSpoolPageIter<'a> {
+        AcceptedSpoolPageIter {
+            store: &self.store,
+            job_uuid: self.job_uuid,
+            artifacts,
+            position: 0,
+        }
+    }
+}
+
+impl Iterator for AcceptedSpoolPageIter<'_> {
+    type Item = SpoolResult<AcceptedSpoolPage>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let artifact = self.artifacts.get(self.position)?;
+        let page_index = self.position;
+        self.position += 1;
+        Some(
+            self.store
+                .read_artifact_items(self.job_uuid, artifact)
+                .map(|items| AcceptedSpoolPage {
+                    page_index,
+                    manifest_count: artifact.item_count,
+                    items,
+                }),
+        )
+    }
+}
+
+impl SpoolStore {
+    fn read_artifact_items(
+        &self,
+        job_uuid: Uuid,
+        artifact: &ArtifactManifest,
+    ) -> SpoolResult<Vec<serde_json::Value>> {
+        let value = self.read_artifact_value(job_uuid, artifact)?;
+        let items = value
+            .as_array()
+            .ok_or_else(|| SpoolError::new(SpoolErrorKind::ManifestCorrupt))?
+            .clone();
+        if items.len() as u64 != artifact.item_count {
+            return Err(SpoolError::new(SpoolErrorKind::ManifestCorrupt));
+        }
+        Ok(items)
+    }
+
+    fn read_artifact_value(
+        &self,
+        job_uuid: Uuid,
+        artifact: &ArtifactManifest,
+    ) -> SpoolResult<serde_json::Value> {
+        validate_relative(&artifact.final_path)?;
+        let path = self.job_dir(job_uuid).join(&artifact.final_path);
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() || metadata.len() != artifact.compressed_bytes {
+            return Err(SpoolError::new(SpoolErrorKind::ManifestCorrupt));
+        }
+        let bytes = fs::read(&path)?;
+        if bytes.len() as u64 != artifact.compressed_bytes {
+            return Err(SpoolError::new(SpoolErrorKind::ManifestCorrupt));
+        }
+        if hex_digest(&bytes) != artifact.digest {
+            return Err(SpoolError::new(SpoolErrorKind::ResourceVerificationFailed));
+        }
+        serde_json::from_slice(&bytes).map_err(|_| SpoolError::new(SpoolErrorKind::ManifestCorrupt))
     }
 }

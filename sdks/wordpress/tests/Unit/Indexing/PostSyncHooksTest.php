@@ -7,12 +7,20 @@
 
 declare(strict_types=1);
 
-namespace Flapjack\WordPress\Tests\Unit\Indexing;
+namespace Flapjack\WordPress\Indexing {
+    function error_log( string $message ): bool {
+        $GLOBALS['flapjack_error_log_messages'][] = $message;
+        return true;
+    }
+}
+
+namespace Flapjack\WordPress\Tests\Unit\Indexing {
 
 use PHPUnit\Framework\TestCase;
 use PHPUnit\Framework\MockObject\MockObject;
 use Flapjack\WordPress\Indexing\IndexManager;
 use Flapjack\WordPress\Indexing\PostSyncHooks;
+use Flapjack\WordPress\Status\FailureReporter;
 use Flapjack\WordPress\Tests\Traits\MakesTestPosts;
 
 class PostSyncHooksTest extends TestCase {
@@ -24,6 +32,7 @@ class PostSyncHooksTest extends TestCase {
 
     protected function setUp(): void {
         wp_stubs_reset();
+        $GLOBALS['flapjack_error_log_messages'] = [];
 
         // Plugin must be configured for hooks to fire.
         update_option( 'flapjack_app_id', 'test-id' );
@@ -167,4 +176,88 @@ class PostSyncHooksTest extends TestCase {
         $this->assertTrue( true );
     }
 
+    public function test_save_post_persists_exact_failure_metadata_when_index_throws(): void {
+        $post = $this->make_post( [ 'ID' => 42, 'post_status' => 'publish' ] );
+
+        $this->index_manager
+            ->method( 'index_post' )
+            ->willThrowException( new \RuntimeException( 'Upstream 500 error' ) );
+
+        // Exercise the index path via a publish transition rather than
+        // on_save_post — an earlier test defines DOING_AUTOSAVE process-wide,
+        // which would short-circuit on_save_post.
+        $this->post_sync->on_status_transition( 'publish', 'draft', $post );
+
+        $failure = FailureReporter::latest();
+        $this->assertNotNull( $failure );
+        $this->assertSame( 'index_post', $failure['operation'] );
+        $this->assertSame( 'post_sync', $failure['source'] );
+        $this->assertSame( 42, $failure['post_id'] );
+        $this->assertSame( 'wp_posts', $failure['index_name'] );
+        $this->assertSame( 'Upstream 500 error', $failure['message'] );
+        $this->assertIsInt( $failure['occurred_at'] );
+    }
+
+    public function test_delete_persists_exact_failure_metadata_when_delete_throws(): void {
+        $this->index_manager
+            ->method( 'delete_post' )
+            ->willThrowException( new \RuntimeException( 'Connection refused' ) );
+
+        $this->post_sync->on_delete_post( 99 );
+
+        $failure = FailureReporter::latest();
+        $this->assertNotNull( $failure );
+        $this->assertSame( 'delete_post', $failure['operation'] );
+        $this->assertSame( 'post_sync', $failure['source'] );
+        $this->assertSame( 99, $failure['post_id'] );
+        $this->assertSame( 'wp_posts', $failure['index_name'] );
+        $this->assertSame( 'Connection refused', $failure['message'] );
+    }
+
+    public function test_debug_log_reuses_sanitized_failure_message(): void {
+        if ( ! defined( 'WP_DEBUG' ) ) {
+            define( 'WP_DEBUG', true );
+        }
+
+        $post = $this->make_post( [ 'ID' => 42, 'post_status' => 'publish' ] );
+        $this->index_manager
+            ->method( 'index_post' )
+            ->willThrowException( new \RuntimeException( 'Authorization: Bearer ShortSecret123 rejected' ) );
+
+        $this->post_sync->on_status_transition( 'publish', 'draft', $post );
+
+        $this->assertSame(
+            [ '[Flapjack Search] Failed to sync post 42: Authorization: [redacted] rejected' ],
+            $GLOBALS['flapjack_error_log_messages']
+        );
+    }
+
+    public function test_delete_debug_log_reuses_sanitized_failure_message(): void {
+        if ( ! defined( 'WP_DEBUG' ) ) {
+            define( 'WP_DEBUG', true );
+        }
+
+        $this->index_manager
+            ->method( 'delete_post' )
+            ->willThrowException( new \RuntimeException( 'Authorization: Bearer DeleteSecret456 rejected' ) );
+
+        $this->post_sync->on_delete_post( 99 );
+
+        $this->assertSame(
+            [ '[Flapjack Search] Failed to delete post 99 from index: Authorization: [redacted] rejected' ],
+            $GLOBALS['flapjack_error_log_messages']
+        );
+    }
+
+    public function test_no_failure_recorded_when_sync_succeeds(): void {
+        $post = $this->make_post( [ 'ID' => 7, 'post_status' => 'publish' ] );
+
+        $this->index_manager->method( 'index_post' )->willReturn( [ 'objectID' => '7' ] );
+
+        $this->post_sync->on_status_transition( 'publish', 'draft', $post );
+
+        $this->assertNull( FailureReporter::latest() );
+    }
+
+}
 }

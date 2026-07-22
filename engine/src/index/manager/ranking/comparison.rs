@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::index::settings::{parse_custom_ranking_token, CustomRankingDirection};
 
 #[derive(Debug, Clone)]
 pub(in crate::index::manager) struct CustomRankingSpec {
@@ -25,15 +26,10 @@ pub(in crate::index::manager) fn parse_custom_ranking_specs(
     };
 
     for spec in custom_ranking {
-        if let Some(attr) = spec.strip_prefix("desc(") {
+        if let Some(parsed) = parse_custom_ranking_token(spec) {
             specs.push(CustomRankingSpec {
-                field: attr.trim_end_matches(')').to_string(),
-                asc: false,
-            });
-        } else if let Some(attr) = spec.strip_prefix("asc(") {
-            specs.push(CustomRankingSpec {
-                field: attr.trim_end_matches(')').to_string(),
-                asc: true,
+                field: parsed.attribute,
+                asc: parsed.direction == CustomRankingDirection::Asc,
             });
         }
     }

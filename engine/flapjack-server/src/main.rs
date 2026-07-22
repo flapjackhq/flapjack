@@ -5,6 +5,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use flapjack_http::serve;
 
+mod ingest;
+
 /// Top-level CLI definition for the `flapjack` binary.
 ///
 /// Supports optional subcommands (`Uninstall`, `ResetAdminKey`) and server configuration
@@ -38,6 +40,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Ingest JSON or NDJSON records through the authenticated batch endpoint
+    Ingest(Box<ingest::IngestArgs>),
     /// Remove Flapjack binary and clean up shell PATH entries
     Uninstall,
     /// Generate a new admin API key (replaces the current one in keys.json)
@@ -164,6 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::from_arg_matches(&matches)?;
 
     match &cli.command {
+        Some(Command::Ingest(args)) => ingest::run(args),
         Some(Command::Uninstall) => run_uninstall(),
         Some(Command::ResetAdminKey) => {
             let data_dir = resolve_data_dir(&cli, &matches)

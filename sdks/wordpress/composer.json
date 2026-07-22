@@ -42,6 +42,7 @@
         "test": "phpunit",
         "test:unit": "phpunit --testsuite unit",
         "test:integration": "phpunit --testsuite integration",
+        "test:realstack": "phpunit --testsuite realstack",
         "phpstan": "phpstan analyse",
         "cs-fix": "php-cs-fixer fix"
     }

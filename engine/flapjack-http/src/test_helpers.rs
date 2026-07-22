@@ -93,6 +93,7 @@ pub(crate) struct TestStateBuilder<'tmp> {
     experiment_store: Option<Arc<ExperimentStore>>,
     geoip_reader: Option<Arc<GeoIpReader>>,
     replication_manager: Option<Arc<ReplicationManager>>,
+    migration_capacity: usize,
 }
 
 impl<'tmp> TestStateBuilder<'tmp> {
@@ -103,6 +104,7 @@ impl<'tmp> TestStateBuilder<'tmp> {
             experiment_store: None,
             geoip_reader: None,
             replication_manager: None,
+            migration_capacity: crate::handlers::migration::DEFAULT_ASYNC_MIGRATION_CAPACITY,
         }
     }
 
@@ -144,6 +146,11 @@ impl<'tmp> TestStateBuilder<'tmp> {
         self
     }
 
+    pub(crate) fn with_migration_capacity(mut self, capacity: usize) -> Self {
+        self.migration_capacity = capacity;
+        self
+    }
+
     pub(crate) fn build(self) -> AppState {
         let manager = flapjack::IndexManager::new(self.tmp.path());
         let dictionary_manager = Arc::new(flapjack::dictionaries::manager::DictionaryManager::new(
@@ -151,10 +158,17 @@ impl<'tmp> TestStateBuilder<'tmp> {
         ));
         manager.set_dictionary_manager(Arc::clone(&dictionary_manager));
 
+        let replication_manager = self.replication_manager;
+        let migration_runner = Arc::new(crate::handlers::migration::MigrationJobRunner::new(
+            Arc::clone(&manager),
+            replication_manager.clone(),
+            self.migration_capacity,
+        ));
+
         AppState {
             manager,
             key_store: None,
-            replication_manager: self.replication_manager,
+            replication_manager,
             ssl_manager: None,
             analytics_engine: self.analytics_engine,
             recommend_config: RecommendConfig::default(),
@@ -166,6 +180,7 @@ impl<'tmp> TestStateBuilder<'tmp> {
             notification_service: None,
             paused_indexes: crate::pause_registry::PausedIndexes::new(),
             geoip_reader: self.geoip_reader,
+            migration_runner,
             start_time: std::time::Instant::now(),
             conversation_store: crate::conversation_store::ConversationStore::default_shared(),
             embedder_store: Arc::new(crate::embedder_store::EmbedderStore::new()),
@@ -231,8 +246,11 @@ pub(crate) fn build_test_router_for_data_dir(
         key_store,
         analytics_collector,
         trusted_proxy_matcher,
-        crate::startup::CorsMode::LoopbackOnly,
         data_dir,
+        crate::router::RouterConfig {
+            cors_mode: crate::startup::CorsMode::LoopbackOnly,
+            disable_dashboard: false,
+        },
     )
 }
 

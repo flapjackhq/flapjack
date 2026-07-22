@@ -33,9 +33,20 @@ pub struct PreStagedActivationError {
     source: crate::error::FlapjackError,
 }
 
+/// How an activation may treat whatever already occupies the publication target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivationMode {
+    /// Replace any existing target tree, backing it up first so rollback can restore it.
+    Replace,
+    /// Publish only into a target name this activation reserved for itself, refusing
+    /// a target that already exists rather than replacing it.
+    CreateOnly,
+}
+
 struct ActivationContext<'a> {
     io: &'a PublicationIo<'a>,
     stage: &'a std::cell::Cell<PreStagedActivationStage>,
+    mode: ActivationMode,
 }
 
 impl PreStagedActivationError {
@@ -62,6 +73,22 @@ pub struct PreStagedPublication {
     target: PublicationTarget,
     transaction_id: PublicationTransactionId,
     generation: PublicationGenerationEvidence,
+}
+
+/// Remove an unjournaled transaction namespace for recovery code that only has
+/// durable metadata, not the original `PreStagedPublication` handle.
+pub fn abort_unjournaled_publication(
+    base: &Path,
+    target: PublicationTarget,
+    transaction_id: &PublicationTransactionId,
+) -> Result<()> {
+    let paths = PublicationPaths::new(base, &target, transaction_id);
+    if paths.journal.exists() {
+        return Err(invalid_publication(
+            "cannot abort a journaled publication transaction",
+        ));
+    }
+    discard_transaction_namespace(&paths)
 }
 
 impl PreStagedPublication {
@@ -95,6 +122,10 @@ impl PreStagedPublication {
         &self.paths
     }
 
+    pub fn transaction_id(&self) -> &PublicationTransactionId {
+        &self.transaction_id
+    }
+
     /// Remove only this transaction when no durable journal has been written.
     pub fn abort(self) -> Result<()> {
         if self.paths.journal.exists() {
@@ -102,17 +133,34 @@ impl PreStagedPublication {
                 "cannot abort a journaled publication transaction",
             ));
         }
-        let namespace = self.paths.staging.parent().ok_or_else(|| {
-            invalid_publication("publication staging path has no transaction namespace")
-        })?;
-        if namespace.exists() {
-            fs::remove_dir_all(namespace)?;
-        }
-        Ok(())
+        discard_transaction_namespace(&self.paths)
     }
 
-    /// Activate the validated staging tree with the snapshot sidecar policy.
+    /// Activate the validated staging tree with the snapshot sidecar policy,
+    /// replacing any tree that already occupies the target.
     pub fn activate(self) -> std::result::Result<PublicationJournal, PreStagedActivationError> {
+        self.activate_with_mode(ActivationMode::Replace)
+    }
+
+    /// Activate the validated staging tree only if the target name is still free.
+    ///
+    /// Unlike [`PreStagedPublication::activate`], this never replaces an existing
+    /// target: it atomically reserves the target name or fails with
+    /// [`crate::error::FlapjackError::IndexAlreadyExists`], leaving whatever is
+    /// already published there untouched. The reservation excludes concurrent
+    /// create-only activations, so exactly one of them can win a race for a name.
+    pub fn activate_create_only(
+        self,
+    ) -> std::result::Result<PublicationJournal, PreStagedActivationError> {
+        self.activate_with_mode(ActivationMode::CreateOnly)
+    }
+
+    fn activate_with_mode(
+        self,
+        mode: ActivationMode,
+    ) -> std::result::Result<PublicationJournal, PreStagedActivationError> {
+        // The inventory is collected before any reservation so it observes the real
+        // trees rather than this activation's own empty reservation directory.
         let inventory = TantivyManagedInventory::from_existing_trees([
             self.paths.target.as_path(),
             self.paths.staging.as_path(),
@@ -122,6 +170,17 @@ impl PreStagedPublication {
             stage: PreStagedActivationStage::Prepare,
             source,
         })?;
+        if mode == ActivationMode::CreateOnly {
+            if let Err(source) = reserve_publication_target(&self.paths.target, &self.target) {
+                // Losing the name is terminal for this transaction and nothing is
+                // journaled yet, so the staged tree is pure residue.
+                let _ = discard_transaction_namespace(&self.paths);
+                return Err(PreStagedActivationError {
+                    stage: PreStagedActivationStage::Prepare,
+                    source,
+                });
+            }
+        }
         let stage = std::cell::Cell::new(PreStagedActivationStage::Prepare);
         let io = PublicationIo::production();
         activate_publication_inner(
@@ -134,6 +193,7 @@ impl PreStagedPublication {
             &ActivationContext {
                 io: &io,
                 stage: &stage,
+                mode,
             },
         )
         .map_err(|source| PreStagedActivationError {
@@ -169,6 +229,7 @@ impl PreStagedPublication {
             &ActivationContext {
                 io: &io,
                 stage: &stage,
+                mode: ActivationMode::Replace,
             },
         )
         .map_err(|source| PreStagedActivationError {
@@ -176,6 +237,39 @@ impl PreStagedPublication {
             source,
         })
     }
+}
+
+/// Atomically claim an unused target name for a create-only activation.
+///
+/// `create_dir` is the exclusion primitive: the filesystem either creates the
+/// directory or reports `AlreadyExists`, so two concurrent activations can never
+/// both believe they own the name. This is why create-only never snapshots
+/// `exists()` — a snapshot can go stale between the check and the promote, while
+/// the reservation cannot.
+///
+/// The reserved directory is deliberately left empty and held until
+/// [`promote_staging`] renames the staged tree onto it, which POSIX `rename`
+/// permits precisely because the destination is an empty directory.
+fn reserve_publication_target(target_path: &Path, target: &PublicationTarget) -> Result<()> {
+    fs::create_dir_all(require_parent(target_path)?)?;
+    match fs::create_dir(target_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(
+            crate::error::FlapjackError::IndexAlreadyExists(target.as_str().to_string()),
+        ),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Remove a transaction's namespace. Only sound while no journal is durable.
+fn discard_transaction_namespace(paths: &PublicationPaths) -> Result<()> {
+    let namespace = paths.staging.parent().ok_or_else(|| {
+        invalid_publication("publication staging path has no transaction namespace")
+    })?;
+    if namespace.exists() {
+        fs::remove_dir_all(namespace)?;
+    }
+    Ok(())
 }
 
 /// Runtime root selector for journaled publication artifacts.
@@ -414,6 +508,7 @@ pub fn activate_publication(
         &ActivationContext {
             io: &io,
             stage: &stage,
+            mode: ActivationMode::Replace,
         },
     )
 }
@@ -441,6 +536,7 @@ pub(crate) fn activate_publication_for_test(
         &ActivationContext {
             io: &io,
             stage: &stage,
+            mode: ActivationMode::Replace,
         },
     )
 }
@@ -467,6 +563,7 @@ pub(crate) fn activate_publication_with_faults_for_test(
         &ActivationContext {
             io: &io,
             stage: &stage,
+            mode: ActivationMode::Replace,
         },
     )
 }
@@ -481,12 +578,19 @@ fn activate_publication_inner(
     context: &ActivationContext<'_>,
 ) -> Result<PublicationJournal> {
     let io = context.io;
-    let target_existed = paths.target.exists();
-    let evidence = prepare_digest_evidence(paths, &mut manifest, inventory, io);
+    let target_existed = match context.mode {
+        ActivationMode::Replace => paths.target.exists(),
+        // The caller holds an empty reservation at the target. It is this
+        // transaction's own state, never a prior tree, so it must not be digested,
+        // backed up, or restored as one — and this activation owns releasing it on
+        // every pre-commit failure below.
+        ActivationMode::CreateOnly => false,
+    };
+    let evidence = prepare_digest_evidence(paths, &mut manifest, inventory, target_existed, io);
     let (prior_digest, digest) = match evidence {
         Ok(evidence) => evidence,
         Err(error) => {
-            cleanup_unprepared_transaction(paths, &manifest, io)?;
+            cleanup_unprepared_transaction(paths, &manifest, context)?;
             return Err(error);
         }
     };
@@ -522,12 +626,16 @@ fn prepare_digest_evidence(
     paths: &PublicationPaths,
     manifest: &mut PublicationArtifactManifest,
     inventory: &TantivyManagedInventory,
+    target_existed: bool,
     io: &PublicationIo<'_>,
 ) -> Result<(Option<ContentDigest>, ContentDigest)> {
     validate_manifest_entries(&manifest.entries)?;
     populate_manifest_digests(manifest, io)?;
     io.checkpoint(PublicationFaultPoint::BeforeStagingDigest)?;
-    let prior_digest = if paths.target.exists() {
+    // `target_existed` is the single source of truth for whether a prior tree is
+    // there to digest; re-testing `exists()` here would be a second, independently
+    // stale answer to the same question.
+    let prior_digest = if target_existed {
         io.before_digest(&paths.target)?;
         Some(canonical_tenant_tree_digest(&paths.target, inventory)?)
     } else {
@@ -541,8 +649,15 @@ fn prepare_digest_evidence(
 fn cleanup_unprepared_transaction(
     paths: &PublicationPaths,
     manifest: &PublicationArtifactManifest,
-    io: &PublicationIo<'_>,
+    context: &ActivationContext<'_>,
 ) -> Result<()> {
+    let io = context.io;
+    if context.mode == ActivationMode::CreateOnly {
+        // Release the reservation this activation is holding. Gating on the mode
+        // rather than on `target_existed` matters: a replace activation must never
+        // remove a target it does not own, even when it observed none.
+        io.remove_if_exists(&paths.target)?;
+    }
     for entry in &manifest.entries {
         let (original, promoted) = resolved_artifact_paths(entry);
         if promoted != original {

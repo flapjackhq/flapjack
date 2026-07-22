@@ -8,6 +8,7 @@ use flapjack::types::{Document, FieldValue};
 use flapjack_http::analytics_cluster::AnalyticsClusterClient;
 use flapjack_http::startup::{
     cors_origins_from_value, validate_startup_auth_policy, CorsMode, StartupAuthValidationError,
+    StartupAuthValidationOutcome,
 };
 use flapjack_replication::config::NodeConfig;
 use flapjack_replication::manager::ReplicationManager;
@@ -332,7 +333,7 @@ fn a10_peer_address_intake_filters_only_localhost_and_metadata_destinations() {
     assert_eq!(config.peers[0].node_id, "priv");
     assert_eq!(config.peers[0].addr, "http://10.0.0.1:7700");
 
-    let repl = ReplicationManager::new(config.clone(), None);
+    let repl = ReplicationManager::new(config.clone(), None, temp_dir.path().to_path_buf());
     assert_eq!(
         repl.peer_count(),
         1,
@@ -1093,24 +1094,36 @@ async fn a04_auth_enabled_routes_fail_closed_without_credentials() {
 #[test]
 fn a04_production_bootstrap_rejects_missing_blank_or_short_admin_key() {
     assert_eq!(
-        validate_startup_auth_policy("production", false, None),
+        validate_startup_auth_policy("production", false, None, "127.0.0.1:7700", false),
         Err(StartupAuthValidationError::MissingAdminKeyInProduction)
     );
     assert_eq!(
-        validate_startup_auth_policy("production", false, Some("   ")),
+        validate_startup_auth_policy("production", false, Some("   "), "127.0.0.1:7700", false),
         Err(StartupAuthValidationError::MissingAdminKeyInProduction)
     );
     assert_eq!(
-        validate_startup_auth_policy("production", false, Some("short")),
+        validate_startup_auth_policy("production", false, Some("short"), "127.0.0.1:7700", false),
         Err(StartupAuthValidationError::AdminKeyTooShortInProduction)
     );
     assert_eq!(
-        validate_startup_auth_policy("production", true, Some("1234567890abcdef")),
+        validate_startup_auth_policy(
+            "production",
+            true,
+            Some("1234567890abcdef"),
+            "0.0.0.0:7700",
+            true
+        ),
         Err(StartupAuthValidationError::NoAuthInProduction)
     );
     assert_eq!(
-        validate_startup_auth_policy("production", false, Some("1234567890abcdef")),
-        Ok(())
+        validate_startup_auth_policy(
+            "production",
+            false,
+            Some("1234567890abcdef"),
+            "0.0.0.0:7700",
+            false
+        ),
+        Ok(StartupAuthValidationOutcome::Accepted)
     );
 }
 

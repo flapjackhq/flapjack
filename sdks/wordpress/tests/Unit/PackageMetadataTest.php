@@ -1,6 +1,6 @@
 <?php
 /**
- * Tests for package PHP-floor metadata.
+ * Tests for public package metadata.
  *
  * @package Flapjack\WordPress\Tests\Unit
  */
@@ -56,28 +56,46 @@ class PackageMetadataTest extends TestCase {
 		$this->assertStringContainsString( 'Requires PHP:      8.1', $metadata['plugin_contents'] );
 	}
 
-	public function test_readme_does_not_advertise_unreachable_atomic_reindexing(): void {
+	public function test_readme_advertises_atomic_full_reindex_through_canonical_entrypoint(): void {
 		$metadata = $this->read_package_metadata();
 
-		$this->assertDoesNotMatchRegularExpression(
-			'/(?:atomic reindex(?:ing)?|zero[- ]downtime)/i',
+		$this->assertStringContainsString(
+			'**Atomic full reindex** — Admin, WP-CLI, and REST rebuild into a temporary index and publish it over the live index only after the rebuild succeeds',
 			$metadata['readme_contents'],
-			'The readme must not advertise atomic or zero-downtime reindexing because no supported reindex entrypoint invokes reindex_atomic().'
+			'The readme must advertise the guarded atomic full-reindex behavior.'
 		);
+		$this->assertDoesNotMatchRegularExpression( '/zero[- ]downtime/i', $metadata['readme_contents'] );
+
+		$method_match_count = preg_match(
+			'/public function reindex_all\(\): array \{(?<body>.*?)^    \}/ms',
+			$metadata['index_manager_contents'],
+			$method_matches
+		);
+		$this->assertSame( 1, $method_match_count, 'IndexManager::reindex_all() must remain the canonical full-reindex entrypoint.' );
+		foreach ( [
+			'/\$this->begin_rebuild\(\);/',
+			'/\$counts\s*=\s*\$this->build_temp_index\(\);/',
+			'/\$this->publish_rebuild\(\);/',
+		] as $required_call_pattern ) {
+			$this->assertMatchesRegularExpression( $required_call_pattern, $method_matches['body'] );
+		}
+		$this->assertStringNotContainsString( 'reindex_atomic', $method_matches['body'] );
 	}
 
 	/**
-	 * @return array{composer_minimum: string, header_floor: string, readme_floor: string, plugin_contents: string, readme_contents: string}
+	 * @return array{composer_minimum: string, header_floor: string, readme_floor: string, plugin_contents: string, readme_contents: string, index_manager_contents: string}
 	 */
 	private function read_package_metadata(): array {
 		$plugin_root = dirname( __DIR__, 2 );
 		$composer_contents = file_get_contents( $plugin_root . '/composer.json' );
 		$plugin_contents = file_get_contents( $plugin_root . '/flapjack-search.php' );
 		$readme_contents = file_get_contents( $plugin_root . '/readme.txt' );
+		$index_manager_contents = file_get_contents( $plugin_root . '/includes/Indexing/IndexManager.php' );
 
 		$this->assertNotFalse( $composer_contents, 'Unable to read composer.json.' );
 		$this->assertNotFalse( $plugin_contents, 'Unable to read flapjack-search.php.' );
 		$this->assertNotFalse( $readme_contents, 'Unable to read readme.txt.' );
+		$this->assertNotFalse( $index_manager_contents, 'Unable to read IndexManager.php.' );
 
 		$composer = json_decode( $composer_contents, true );
 		$this->assertIsArray( $composer, 'composer.json must decode to an object.' );
@@ -95,11 +113,12 @@ class PackageMetadataTest extends TestCase {
 		$this->assertSame( 1, $readme_match_count, 'readme.txt must contain a Requires PHP declaration.' );
 
 		return [
-			'composer_minimum' => $composer_matches[1],
-			'header_floor'      => $header_matches[1],
-			'readme_floor'      => $readme_matches[1],
-			'plugin_contents'   => $plugin_contents,
-			'readme_contents'   => $readme_contents,
+			'composer_minimum'      => $composer_matches[1],
+			'header_floor'           => $header_matches[1],
+			'readme_floor'           => $readme_matches[1],
+			'plugin_contents'        => $plugin_contents,
+			'readme_contents'        => $readme_contents,
+			'index_manager_contents' => $index_manager_contents,
 		];
 	}
 }

@@ -309,8 +309,9 @@ async fn middleware_ignores_non_index_routes() {
 ///
 /// * `tmp` — Temporary directory used as the base path for `IndexManager` and `DictionaryManager`.
 fn make_app_state(tmp: &tempfile::TempDir) -> std::sync::Arc<crate::handlers::AppState> {
+    let manager = flapjack::IndexManager::new(tmp.path());
     std::sync::Arc::new(crate::handlers::AppState {
-        manager: flapjack::IndexManager::new(tmp.path()),
+        manager: std::sync::Arc::clone(&manager),
         key_store: None,
         replication_manager: None,
         ssl_manager: None,
@@ -326,6 +327,11 @@ fn make_app_state(tmp: &tempfile::TempDir) -> std::sync::Arc<crate::handlers::Ap
         paused_indexes: crate::pause_registry::PausedIndexes::new(),
         geoip_reader: None,
         notification_service: None,
+        migration_runner: std::sync::Arc::new(crate::handlers::migration::MigrationJobRunner::new(
+            manager,
+            None,
+            crate::handlers::migration::DEFAULT_ASYNC_MIGRATION_CAPACITY,
+        )),
         start_time: std::time::Instant::now(),
         conversation_store: crate::conversation_store::ConversationStore::default_shared(),
         embedder_store: std::sync::Arc::new(crate::embedder_store::EmbedderStore::new()),

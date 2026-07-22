@@ -300,6 +300,59 @@ fn client_policy_has_no_production_base_url_override() {
     );
 }
 
+// The replica-settings method reuses the exact index_path / plan_request /
+// execute_json_with_retry seam. This known-answer test proves the requested path
+// is percent-encoded for an arbitrary index name, the full settings JSON is
+// returned verbatim, and any non-2xx stays in the typed, scrubbed error owner.
+#[test]
+fn index_settings_encodes_arbitrary_name_returns_full_json_and_scrubs_errors() {
+    let replica_name = "réplica price/asc 2026";
+
+    let request = request_for_test("APP123", replica_name, AlgoliaMethod::Get, "settings")
+        .expect("valid replica index name should plan a request");
+    assert_eq!(
+        request.url,
+        "https://APP123-dsn.algolia.net/1/indexes/r%C3%A9plica%20price%2Fasc%202026/settings"
+    );
+
+    let full_settings = json!({
+        "ranking": ["desc(price)"],
+        "customRanking": ["asc(name)"],
+        "relevancyStrictness": 80,
+        "searchableAttributes": ["title", "brand"],
+        "primary": "products"
+    });
+    let mut ok_transport = ScriptedTransport::new(vec![ok(full_settings.clone())]);
+    let returned = scripted_json_for_test(
+        &mut ok_transport,
+        "APP123",
+        replica_name,
+        AlgoliaMethod::Get,
+        "settings",
+    )
+    .expect("2xx settings response should decode to the full JSON");
+    assert_eq!(returned, full_settings);
+
+    let mut missing_transport = ScriptedTransport::new(vec![status(404)]);
+    let error = scripted_json_for_test(
+        &mut missing_transport,
+        "APP123",
+        replica_name,
+        AlgoliaMethod::Get,
+        "settings",
+    )
+    .expect_err("a 404 missing replica must be a typed error");
+    assert_eq!(error.kind(), AlgoliaErrorKind::Upstream);
+    assert_eq!(
+        error.safe_message(),
+        "Algolia upstream rejected the request"
+    );
+    assert!(
+        !format!("{error:?}").contains("réplica"),
+        "typed errors must not echo the requested index name"
+    );
+}
+
 #[test]
 fn retry_policy_retries_transient_failures_and_stops_on_success() {
     let mut transport = ScriptedTransport::new(vec![

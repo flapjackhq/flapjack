@@ -1138,7 +1138,7 @@ async fn apply_ops_unknown_type_skipped() {
 use crate::test_helpers::TestStateBuilder;
 use axum::body::Body;
 use axum::http::Request;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use tower::ServiceExt;
 
@@ -1398,9 +1398,12 @@ async fn get_ops_success_includes_oldest_retained_seq_metadata() {
         flapjack_replication::config::NodeConfig {
             node_id: "test-node-local".to_string(),
             bind_addr: "127.0.0.1:0".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
             peers: vec![],
         },
         None,
+        tmp.path().to_path_buf(),
     ));
     let state = Arc::new(app_state);
     state.manager.create_tenant("products").unwrap();
@@ -2389,6 +2392,8 @@ async fn cluster_status_ha_returns_peer_list_with_correct_shape() {
     let node_config = flapjack_replication::config::NodeConfig {
         node_id: "test-node-a".to_string(),
         bind_addr: "127.0.0.1:7700".to_string(),
+        advertise_addr: None,
+        bootstrap_peer: None,
         peers: vec![
             flapjack_replication::config::PeerConfig {
                 node_id: "test-node-b".to_string(),
@@ -2400,7 +2405,11 @@ async fn cluster_status_ha_returns_peer_list_with_correct_shape() {
             },
         ],
     };
-    let repl_mgr = flapjack_replication::manager::ReplicationManager::new(node_config, None);
+    let repl_mgr = flapjack_replication::manager::ReplicationManager::new(
+        node_config,
+        None,
+        tmp.path().to_path_buf(),
+    );
     app_state.replication_manager = Some(repl_mgr);
 
     let state = Arc::new(app_state);
@@ -2419,7 +2428,16 @@ async fn cluster_status_ha_returns_peer_list_with_correct_shape() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = crate::test_helpers::body_json(resp).await;
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let typed: super::ClusterStatusResponse = serde_json::from_slice(&body_bytes).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+    assert_eq!(typed.node_id, "test-node-a");
+    assert_eq!(typed.peers.len(), 2);
+    assert_eq!(typed.peers[0].peer_id, "test-node-b");
+    assert_eq!(typed.peers[0].addr, "http://test-node-b:7700");
 
     // Top-level HA fields.
     assert_eq!(
@@ -2464,4 +2482,240 @@ async fn cluster_status_ha_returns_peer_list_with_correct_shape() {
     let peer_ids: Vec<&str> = peers.iter().filter_map(|p| p["peer_id"].as_str()).collect();
     assert!(peer_ids.contains(&"test-node-b"));
     assert!(peer_ids.contains(&"test-node-c"));
+}
+
+fn test_replication_manager_with_two_peers() -> (
+    TempDir,
+    std::sync::Arc<flapjack_replication::manager::ReplicationManager>,
+) {
+    let data_dir = TempDir::new().unwrap();
+    let node_config = flapjack_replication::config::NodeConfig {
+        node_id: "test-node-a".to_string(),
+        bind_addr: "127.0.0.1:7700".to_string(),
+        advertise_addr: None,
+        bootstrap_peer: None,
+        peers: vec![
+            flapjack_replication::config::PeerConfig {
+                node_id: "test-node-b".to_string(),
+                addr: "http://test-node-b:7700".to_string(),
+            },
+            flapjack_replication::config::PeerConfig {
+                node_id: "test-node-c".to_string(),
+                addr: "http://test-node-c:7700".to_string(),
+            },
+        ],
+    };
+    let manager = flapjack_replication::manager::ReplicationManager::new(
+        node_config,
+        None,
+        data_dir.path().to_path_buf(),
+    );
+    (data_dir, manager)
+}
+
+fn remove_peer_test_router(state: std::sync::Arc<AppState>) -> Router {
+    Router::new()
+        .route(
+            "/internal/cluster/peers/:node_id",
+            delete(super::remove_cluster_peer),
+        )
+        .route("/internal/cluster/status", get(super::cluster_status))
+        .with_state(state)
+}
+
+fn add_peer_test_router(state: std::sync::Arc<AppState>) -> Router {
+    Router::new()
+        .route("/internal/cluster/peers", post(super::add_cluster_peer))
+        .with_state(state)
+}
+
+async fn add_peer_request(app: Router, node_id: &str, addr: &str) -> Response {
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/internal/cluster/peers")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"node_id": node_id, "addr": addr}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn add_cluster_peer_retries_are_idempotent_but_address_changes_conflict() {
+    let tmp = TempDir::new().unwrap();
+    let (_repl_data_dir, repl_mgr) = test_replication_manager_with_two_peers();
+    let state = TestStateBuilder::new(&tmp)
+        .with_replication_manager(repl_mgr.clone())
+        .build_shared();
+    let app = add_peer_test_router(state);
+
+    let retry = add_peer_request(app.clone(), "test-node-b", "http://test-node-b:7700").await;
+    assert_eq!(retry.status(), StatusCode::OK);
+    let retry_body = crate::test_helpers::body_json(retry).await;
+    assert_eq!(retry_body["peers_total"], 2);
+    assert_eq!(repl_mgr.peer_count(), 2);
+
+    let conflict = add_peer_request(app, "test-node-b", "http://different-node-b:7700").await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(repl_mgr.peer_count(), 2);
+}
+
+#[tokio::test]
+async fn add_cluster_peer_persistence_failure_returns_non_leaking_500() {
+    let tmp = TempDir::new().unwrap();
+    let missing_data_dir = tmp.path().join("missing-data-dir");
+    let repl_mgr = flapjack_replication::manager::ReplicationManager::new(
+        flapjack_replication::config::NodeConfig {
+            node_id: "test-node-a".to_string(),
+            bind_addr: "127.0.0.1:7700".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
+            peers: Vec::new(),
+        },
+        None,
+        missing_data_dir,
+    );
+    let state = TestStateBuilder::new(&tmp)
+        .with_replication_manager(repl_mgr.clone())
+        .build_shared();
+
+    let response = add_peer_request(
+        add_peer_test_router(state),
+        "test-node-b",
+        "http://test-node-b:7700",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = crate::test_helpers::body_json(response).await;
+    assert_eq!(
+        body["message"],
+        "Failed to persist replication peer membership"
+    );
+    assert_eq!(repl_mgr.peer_count(), 0);
+}
+
+#[tokio::test]
+async fn remove_cluster_peer_persistence_failure_returns_non_leaking_500() {
+    let tmp = TempDir::new().unwrap();
+    let missing_data_dir = tmp.path().join("missing-data-dir");
+    let repl_mgr = flapjack_replication::manager::ReplicationManager::new(
+        flapjack_replication::config::NodeConfig {
+            node_id: "test-node-a".to_string(),
+            bind_addr: "127.0.0.1:7700".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
+            peers: vec![flapjack_replication::config::PeerConfig {
+                node_id: "test-node-b".to_string(),
+                addr: "http://test-node-b:7700".to_string(),
+            }],
+        },
+        None,
+        missing_data_dir,
+    );
+    let state = TestStateBuilder::new(&tmp)
+        .with_replication_manager(repl_mgr.clone())
+        .build_shared();
+
+    let response = remove_peer_test_router(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/internal/cluster/peers/test-node-b")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = crate::test_helpers::body_json(response).await;
+    assert_eq!(
+        body["message"],
+        "Failed to persist replication peer membership"
+    );
+    assert_eq!(repl_mgr.peer_count(), 1);
+}
+
+async fn cluster_status_body(app: &Router) -> serde_json::Value {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/internal/cluster/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    crate::test_helpers::body_json(resp).await
+}
+
+#[tokio::test]
+async fn remove_cluster_peer_known_peer_returns_200_and_removes_membership() {
+    let tmp = TempDir::new().unwrap();
+    let (_repl_data_dir, repl_mgr) = test_replication_manager_with_two_peers();
+    let state = TestStateBuilder::new(&tmp)
+        .with_replication_manager(repl_mgr.clone())
+        .build_shared();
+    let app = remove_peer_test_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/internal/cluster/peers/test-node-b")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = crate::test_helpers::body_json(resp).await;
+    assert_eq!(body["node_id"], "test-node-b");
+    assert_eq!(body["peers_total"], 1);
+    assert_eq!(repl_mgr.peer_count(), 1);
+
+    let status = cluster_status_body(&app).await;
+    assert_eq!(status["peers_total"], 1);
+    let peers = status["peers"].as_array().unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0]["peer_id"], "test-node-c");
+}
+
+#[tokio::test]
+async fn remove_cluster_peer_unknown_peer_returns_404_without_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let (_repl_data_dir, repl_mgr) = test_replication_manager_with_two_peers();
+    let state = TestStateBuilder::new(&tmp)
+        .with_replication_manager(repl_mgr.clone())
+        .build_shared();
+    let app = remove_peer_test_router(state);
+    let before_status = cluster_status_body(&app).await;
+    assert!(repl_mgr.get_peer_cursors("tenant-red").is_none());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/internal/cluster/peers/missing-node")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = crate::test_helpers::body_json(resp).await;
+    assert_eq!(body["status"], 404);
+    assert_eq!(body["message"], "Peer 'missing-node' not found");
+    assert_eq!(repl_mgr.peer_count(), 2);
+    assert_eq!(cluster_status_body(&app).await, before_status);
+    assert!(repl_mgr.get_peer_cursors("tenant-red").is_none());
 }

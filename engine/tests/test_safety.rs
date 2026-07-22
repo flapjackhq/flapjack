@@ -633,7 +633,7 @@ mod memory_safety {
         let manager = flapjack::IndexManager::new(temp_dir.path());
 
         let state = Arc::new(flapjack_http::handlers::AppState {
-            manager,
+            manager: Arc::clone(&manager),
             key_store: None,
             replication_manager: None,
             ssl_manager: None,
@@ -648,6 +648,13 @@ mod memory_safety {
             usage_persistence: None,
             geoip_reader: None,
             notification_service: None,
+            migration_runner: Arc::new(
+                flapjack_http::handlers::migration::MigrationJobRunner::new(
+                    manager,
+                    None,
+                    flapjack_http::handlers::migration::DEFAULT_ASYNC_MIGRATION_CAPACITY,
+                ),
+            ),
             start_time: std::time::Instant::now(),
             conversation_store:
                 flapjack_http::conversation_store::ConversationStore::default_shared(),

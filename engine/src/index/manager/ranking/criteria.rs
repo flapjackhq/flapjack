@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::index::settings::{classify_ranking_criterion_token, RankingCriterionToken};
 
 #[derive(Clone, Copy)]
 pub(super) enum RankingCriterion {
@@ -29,22 +30,25 @@ pub(super) fn parse_ranking_criteria(settings: Option<&IndexSettings>) -> Vec<Ra
         .and_then(|index_settings| index_settings.ranking.as_ref())
         .into_iter()
         .flatten()
-        .filter_map(|criterion| match criterion.as_str() {
-            "typo" => Some(RankingCriterion::Typo),
-            "geo" => Some(RankingCriterion::Geo),
-            "words" => Some(RankingCriterion::Words),
-            "filters" => Some(RankingCriterion::Filters),
-            "proximity" => Some(RankingCriterion::Proximity),
-            "attribute" => Some(RankingCriterion::Attribute),
-            "exact" => Some(RankingCriterion::Exact),
-            _ => None,
-        })
+        .filter_map(|criterion| classify_ranking_criterion_token(criterion).map(ranking_criterion))
         .collect();
 
     if criteria.is_empty() {
         DEFAULT_RANKING_CRITERIA.to_vec()
     } else {
         criteria
+    }
+}
+
+fn ranking_criterion(token: RankingCriterionToken) -> RankingCriterion {
+    match token {
+        RankingCriterionToken::Typo => RankingCriterion::Typo,
+        RankingCriterionToken::Geo => RankingCriterion::Geo,
+        RankingCriterionToken::Words => RankingCriterion::Words,
+        RankingCriterionToken::Filters => RankingCriterion::Filters,
+        RankingCriterionToken::Proximity => RankingCriterion::Proximity,
+        RankingCriterionToken::Attribute => RankingCriterion::Attribute,
+        RankingCriterionToken::Exact => RankingCriterion::Exact,
     }
 }
 

@@ -325,6 +325,8 @@ mod tests {
         let node_cfg = NodeConfig {
             node_id: "local".to_string(),
             bind_addr: "127.0.0.1:0".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
             peers: vec![PeerConfig {
                 node_id: "peer".to_string(),
                 addr: "http://127.0.0.1:19999".to_string(), // nothing listening
@@ -354,6 +356,8 @@ mod tests {
         let node_cfg = NodeConfig {
             node_id: "local".to_string(),
             bind_addr: "127.0.0.1:0".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
             peers: vec![PeerConfig {
                 node_id: "peer".to_string(),
                 addr: "http://127.0.0.1:19999".to_string(),

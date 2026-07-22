@@ -48,7 +48,7 @@ fn generated_layout_index_preserves_manifest_oracle_data() {
     assert_eq!(layout.journal_phase.as_deref(), Some("prepared"));
     assert_eq!(layout.disposition, "commit");
     assert_eq!(layout.cli.status, "clean");
-    assert_eq!(layout.visible.object, "new");
+    assert_eq!(layout.visible.object, "new-meta");
     assert_eq!(layout.residue.journal, "present");
     assert_eq!(
         layout.digests.get("target").map(String::as_str),
@@ -452,6 +452,43 @@ fn ambiguous_target_and_staging_mutation_materializes_both_trees() {
 }
 
 #[test]
+fn ambiguous_target_and_staging_manifest_expects_sidecar_backups() {
+    let manifest = load_scenario_manifest();
+    let mutation = manifest
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.id == "mutation_ambiguous_target_and_staging")
+        .unwrap();
+
+    for (name, values) in &mutation.sidecars {
+        assert_eq!(
+            values.get("backup"),
+            values.get("old"),
+            "{name} backup must preserve the original sidecar bytes during quarantine"
+        );
+    }
+}
+
+#[test]
+fn corrupt_journal_manifest_expects_absent_sidecar_targets() {
+    let manifest = load_scenario_manifest();
+    let mutation = manifest
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.id == "mutation_corrupt_journal")
+        .unwrap();
+
+    assert_eq!(mutation.visible.target, "absent");
+    for (name, values) in &mutation.sidecars {
+        assert_eq!(
+            values.get("target").map(String::as_str),
+            Some("absent"),
+            "{name} target sidecar must be absent when corrupt journal repair leaves no visible target"
+        );
+    }
+}
+
+#[test]
 fn pause_report_validation_rejects_pid_and_identity_mismatches() {
     let valid = PauseReport {
         pid: 42,
@@ -605,6 +642,123 @@ fn live_http_fixture_manifest_contract_rejects_missing_fixture() {
     assert!(error.to_string().contains("live_http_fixture"), "{error}");
 }
 
+/// Known-answer proof that the manifest highlight oracle is the production float
+/// rendering. Rust's `f64` Display keeps the sign of negative zero, never falls back
+/// to exponent notation, and prints the shortest round-tripping decimal — so the
+/// Python-native renderings (`0`, `1e-07`, the exact binary expansion of `1e300`)
+/// that a hand-written mirror produces are all wrong.
+#[test]
+fn live_http_fixture_expected_highlight_renders_floats_exactly_like_production() {
+    let body = serde_json::json!({
+        "objectID": "float-widget",
+        "integral": 7.0,
+        "negative_zero": -0.0,
+        "tiny": 1e-7,
+        "huge": 1e300
+    });
+
+    let rendered = repair_cli_manifest::production_highlight_value_strings(&body)
+        .expect("float body must build a document");
+
+    let expected = std::collections::BTreeMap::from([
+        ("integral".to_string(), "7".to_string()),
+        ("negative_zero".to_string(), "-0".to_string()),
+        ("tiny".to_string(), "0.0000001".to_string()),
+        ("huge".to_string(), format!("1{}", "0".repeat(300))),
+    ]);
+    assert_eq!(rendered, expected);
+}
+
+/// The oracle must reach every leaf the production highlighter emits, including
+/// array items and nested object fields, because the live helper asserts each one.
+#[test]
+fn live_http_fixture_expected_highlight_covers_nested_and_array_leaves() {
+    let body = serde_json::json!({
+        "objectID": "nested-widget",
+        "tags": ["alpha", 2.5],
+        "meta": {"score": -0.0, "label": "beta"}
+    });
+
+    let rendered = repair_cli_manifest::production_highlight_value_strings(&body)
+        .expect("nested body must build a document");
+
+    let expected = std::collections::BTreeMap::from([
+        ("tags[0]".to_string(), "alpha".to_string()),
+        ("tags[1]".to_string(), "2.5".to_string()),
+        ("meta.label".to_string(), "beta".to_string()),
+        ("meta.score".to_string(), "-0".to_string()),
+    ]);
+    assert_eq!(rendered, expected);
+}
+
+/// Values `Document::from_json` discards never reach the highlighter, so the oracle
+/// must omit them rather than invite the helper to assert a field the server drops.
+#[test]
+fn live_http_fixture_expected_highlight_omits_discarded_document_values() {
+    let body = serde_json::json!({
+        "objectID": "sparse-widget",
+        "flag": true,
+        "nothing": null,
+        "empty_list": [],
+        "empty_object": {},
+        "emptied_object": {"flag": false},
+        "kept": "value"
+    });
+
+    let rendered = repair_cli_manifest::production_highlight_value_strings(&body)
+        .expect("sparse body must build a document");
+
+    let expected =
+        std::collections::BTreeMap::from([("kept".to_string(), "value".to_string())]);
+    assert_eq!(rendered, expected);
+}
+
+#[test]
+fn live_http_fixture_manifest_contract_rejects_python_native_float_highlight_string() {
+    let mut manifest = manifest_with_base("base_001_create");
+    manifest.live_http_fixture.target_object.body["tiny"] = serde_json::json!(1e-7);
+    manifest
+        .live_http_fixture
+        .target_object
+        .expected_highlight
+        .insert("tiny".to_string(), "1e-07".to_string());
+
+    let panic = std::panic::catch_unwind(|| manifest.validate_shape())
+        .expect_err("a Python-native float rendering must fail closed");
+    let message = panic_message(panic);
+    assert!(message.contains("expected_highlight must match"), "{message}");
+}
+
+#[test]
+fn live_http_fixture_manifest_contract_rejects_missing_expected_highlight_entry() {
+    let mut manifest = manifest_with_base("base_001_create");
+    manifest
+        .live_http_fixture
+        .control_object
+        .expected_highlight
+        .remove("generation");
+
+    let panic = std::panic::catch_unwind(|| manifest.validate_shape())
+        .expect_err("a missing highlight leaf must fail closed");
+    let message = panic_message(panic);
+    assert!(message.contains("expected_highlight must match"), "{message}");
+}
+
+#[test]
+fn live_http_fixture_manifest_contract_rejects_extra_expected_highlight_entry() {
+    let mut manifest = manifest_with_base("base_001_create");
+    manifest
+        .live_http_fixture
+        .old_target_object
+        .expected_highlight
+        .insert("phantom".to_string(), "ghost".to_string());
+
+    let panic = std::panic::catch_unwind(|| manifest.validate_shape())
+        .expect_err("an unknown highlight leaf must fail closed");
+    let message = panic_message(panic);
+    assert!(message.contains("expected_highlight must match"), "{message}");
+}
+
 #[test]
 fn live_http_fixture_manifest_contract_rejects_unknown_expectation_key() {
     let mut manifest = manifest_with_base("base_001_create");
@@ -637,6 +791,186 @@ fn live_http_fixture_manifest_contract_rejects_unknown_visibility_value() {
         .expect_err("unknown live HTTP visibility values must fail closed");
     let message = panic_message(panic);
     assert!(message.contains("unknown value maybe"), "{message}");
+}
+
+#[test]
+fn live_http_fixture_manifest_contract_rejects_missing_surface_status() {
+    let mut manifest = manifest_with_base("base_001_create");
+    manifest
+        .live_http_fixture
+        .surface_statuses
+        .remove("object_unavailable");
+
+    let panic = std::panic::catch_unwind(|| manifest.validate_shape())
+        .expect_err("missing live HTTP surface status keys must fail closed");
+    let message = panic_message(panic);
+    assert!(message.contains("surface_statuses must be closed"), "{message}");
+}
+
+#[test]
+fn live_http_fixture_manifest_contract_rejects_inconsistent_surface_status_body() {
+    let mut manifest = manifest_with_base("base_001_create");
+    manifest
+        .live_http_fixture
+        .surface_statuses
+        .get_mut("search_unavailable")
+        .unwrap()
+        .body["status"] = serde_json::json!(404);
+
+    let panic = std::panic::catch_unwind(|| manifest.validate_shape())
+        .expect_err("surface status body/status mismatches must fail closed");
+    let message = panic_message(panic);
+    assert!(message.contains("body.status must match status"), "{message}");
+}
+
+#[test]
+fn live_http_fixture_manifest_contract_rejects_missing_target_projection() {
+    let mut manifest = manifest_with_base("base_001_create");
+    manifest
+        .live_http_fixture
+        .target_projections
+        .remove("old-meta");
+
+    let panic = std::panic::catch_unwind(|| manifest.validate_shape())
+        .expect_err("missing target projection keys must fail closed");
+    let message = panic_message(panic);
+    assert!(message.contains("target_projections must be closed"), "{message}");
+}
+
+#[test]
+fn live_http_fixture_manifest_contract_rejects_unknown_projection_fixture_refs() {
+    let mut manifest = manifest_with_base("base_001_create");
+    manifest
+        .live_http_fixture
+        .target_projections
+        .get_mut("new-meta")
+        .unwrap()
+        .object = "legacy_constant".to_string();
+
+    let panic = std::panic::catch_unwind(|| manifest.validate_shape())
+        .expect_err("projection refs must resolve to fixture-owned object/query data");
+    let message = panic_message(panic);
+    assert!(message.contains("unknown object fixture"), "{message}");
+}
+
+#[test]
+fn live_http_fixture_manifest_contract_rejects_unresolved_scenario_projection() {
+    let mut manifest = manifest_with_base("base_001_create");
+    manifest.scenarios[0].visible.object = "legacy-branch".to_string();
+
+    let panic = std::panic::catch_unwind(|| manifest.validate_shape())
+        .expect_err("scenario visible projections must resolve through live_http_fixture");
+    let message = panic_message(panic);
+    assert!(message.contains("unknown loadable object projection legacy-branch"), "{message}");
+}
+
+#[test]
+fn live_http_fixture_manifest_contract_rejects_duplicate_map_keys() {
+    let raw = r#"{
+        "target_index": "products",
+        "control_index": "control_products",
+        "target_object": {
+            "object_id": "new-widget",
+            "body": {"objectID": "new-widget"},
+            "expected_highlight": {}
+        },
+        "old_target_object": {
+            "object_id": "old-widget",
+            "body": {"objectID": "old-widget"},
+            "expected_highlight": {}
+        },
+        "control_object": {
+            "object_id": "control-widget",
+            "body": {"objectID": "control-widget"},
+            "expected_highlight": {}
+        },
+        "target_query": {"text": "modern", "ordered_hit_ids": ["new-widget"]},
+        "old_target_query": {"text": "legacy", "ordered_hit_ids": ["old-widget"]},
+        "control_query": {"text": "control", "ordered_hit_ids": ["control-widget"]},
+        "surface_statuses": {
+            "object_absent": {"status": 404, "body": {"status": 404, "message": "missing"}},
+            "object_absent": {"status": 410, "body": {"status": 410, "message": "gone"}},
+            "object_unavailable": {"status": 503, "body": {"status": 503, "message": "unavailable"}},
+            "search_unavailable": {"status": 503, "body": {"status": 503, "message": "unavailable"}}
+        },
+        "target_projections": {
+            "new-meta": {"object": "target_object", "query": "target_query"},
+            "old-meta": {"object": "old_target_object", "query": "old_target_query"}
+        },
+        "expectations": {
+            "target_present": {"target": "present", "object": "present", "search": "present"},
+            "target_absent": {"target": "absent", "object": "absent", "search": "absent"},
+            "target_unavailable": {"target": "absent", "object": "unavailable", "search": "unavailable"},
+            "control_present": {"target": "present", "object": "present", "search": "present"}
+        }
+    }"#;
+
+    let error = serde_json::from_str::<repair_cli_manifest::LiveHttpFixture>(raw)
+        .expect_err("duplicate live fixture map keys must fail during parsing");
+
+    assert!(error.to_string().contains("duplicate key object_absent"), "{error}");
+}
+
+#[tokio::test]
+async fn generated_old_target_projection_comes_from_manifest_fixture() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut manifest = load_scenario_manifest();
+    let scenario = manifest
+        .scenarios
+        .iter_mut()
+        .find(|scenario| scenario.id == "base_018_replacement")
+        .unwrap();
+    scenario.visible.object = "old-meta".to_string();
+    scenario.visible.search = "loadable".to_string();
+    manifest.live_http_fixture.old_target_object.body["title"] =
+        serde_json::json!("manifest-owned old title");
+
+    let layout = generate_base_scenario(tmp.path(), scenario);
+    let error = assert_generated_case_matches_manifest_with_fixture(
+        &case_root_for(tmp.path(), &scenario.id),
+        scenario,
+        &layout,
+        &manifest.live_http_fixture,
+    )
+    .expect_err("mutating the manifest old-target body must change the generated projection expectation");
+
+    assert!(error.contains("object body mismatch"), "{error}");
+}
+
+#[tokio::test]
+async fn generated_target_projection_uses_manifest_projection_map() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut manifest = load_scenario_manifest();
+    let scenario = manifest
+        .scenarios
+        .iter_mut()
+        .find(|scenario| scenario.id == "base_002_create")
+        .unwrap();
+    scenario.visible.object = "new-meta".to_string();
+    scenario.visible.search = "loadable".to_string();
+    manifest
+        .live_http_fixture
+        .target_projections
+        .get_mut("new-meta")
+        .unwrap()
+        .object = "old_target_object".to_string();
+    manifest
+        .live_http_fixture
+        .target_projections
+        .get_mut("new-meta")
+        .unwrap()
+        .query = "old_target_query".to_string();
+
+    let layout = generate_base_scenario(tmp.path(), scenario);
+    let error = assert_generated_case_matches_manifest_with_fixture(
+        &case_root_for(tmp.path(), &scenario.id),
+        scenario,
+        &layout,
+        &manifest.live_http_fixture,
+    )
+    .expect_err("rewiring the manifest projection map must change the target expectation");
+
+    assert!(error.contains("old-widget object was absent"), "{error}");
 }
 
 fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
@@ -688,7 +1022,7 @@ fn manifest_with_base(id: &str) -> ScenarioManifest {
             },
             "disposition": "commit",
             "cli": {"status": "clean", "action": "none", "exit_code": 0},
-            "visible": {"target": "present", "object": "new", "search": "new"},
+            "visible": {"target": "products", "object": "new-meta", "search": "loadable"},
             "residue": {
                 "staging": "absent",
                 "backup": "absent",
@@ -711,6 +1045,25 @@ fn live_http_fixture_json() -> serde_json::Value {
                 "title": "modern waffle iron",
                 "body": "new repair guide",
                 "generation": "new"
+            },
+            "expected_highlight": {
+                "title": "modern waffle iron",
+                "body": "new repair guide",
+                "generation": "new"
+            }
+        },
+        "old_target_object": {
+            "object_id": "old-widget",
+            "body": {
+                "objectID": "old-widget",
+                "title": "legacy waffle iron",
+                "body": "old repair guide",
+                "generation": "old"
+            },
+            "expected_highlight": {
+                "title": "legacy waffle iron",
+                "body": "old repair guide",
+                "generation": "old"
             }
         },
         "control_object": {
@@ -720,15 +1073,52 @@ fn live_http_fixture_json() -> serde_json::Value {
                 "title": "control waffle iron",
                 "body": "unchanged control guide",
                 "generation": "control"
+            },
+            "expected_highlight": {
+                "title": "control waffle iron",
+                "body": "unchanged control guide",
+                "generation": "control"
             }
         },
         "target_query": {
             "text": "modern",
             "ordered_hit_ids": ["new-widget"]
         },
+        "old_target_query": {
+            "text": "legacy",
+            "ordered_hit_ids": ["old-widget"]
+        },
         "control_query": {
             "text": "control",
             "ordered_hit_ids": ["control-widget"]
+        },
+        "surface_statuses": {
+            "object_absent": {
+                "status": 404,
+                "body": {"status": 404, "message": "Object not found"}
+            },
+            "object_unavailable": {
+                "status": 503,
+                "body": {"status": 503, "message": "Index unavailable"}
+            },
+            "search_unavailable": {
+                "status": 503,
+                "body": {"status": 503, "message": "Index unavailable"}
+            },
+            "index_absent": {
+                "status": 404,
+                "body": {"status": 404, "message": "Index 'products' does not exist"}
+            }
+        },
+        "target_projections": {
+            "new-meta": {
+                "object": "target_object",
+                "query": "target_query"
+            },
+            "old-meta": {
+                "object": "old_target_object",
+                "query": "old_target_query"
+            }
         },
         "expectations": {
             "target_present": {

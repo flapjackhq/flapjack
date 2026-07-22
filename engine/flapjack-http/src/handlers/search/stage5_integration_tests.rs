@@ -83,6 +83,9 @@ async fn post_search_simple(app: &Router, index: &str, body: Value) -> axum::htt
         .unwrap()
 }
 
+#[path = "stage5_integration_tests/search_pagination_known_answer.rs"]
+mod search_pagination_known_answer;
+
 // ── GeoIP + Search: handler-level integration ──
 
 /// Handler-level: aroundLatLngViaIP=true with geoip_reader=None degrades gracefully.

@@ -254,6 +254,8 @@ pub struct AlgoliaListAbTestsQuery {
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]
+    pub index_name: Option<String>,
+    #[serde(default)]
     pub index_prefix: Option<String>,
     #[serde(default)]
     pub index_suffix: Option<String>,

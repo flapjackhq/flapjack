@@ -243,6 +243,14 @@ fn acl_internal_ops_requires_admin() {
 }
 
 #[test]
+fn acl_internal_cluster_remove_peer_requires_admin() {
+    assert_eq!(
+        required_acl_for_route(&Method::DELETE, "/internal/cluster/peers/node-b"),
+        Some("admin")
+    );
+}
+
+#[test]
 fn acl_internal_pause_requires_admin() {
     assert_eq!(
         required_acl_for_route(&Method::POST, "/internal/pause/myindex"),
@@ -254,6 +262,14 @@ fn acl_internal_pause_requires_admin() {
 fn acl_internal_storage_requires_admin() {
     assert_eq!(
         required_acl_for_route(&Method::GET, "/internal/storage"),
+        Some("admin")
+    );
+}
+
+#[test]
+fn acl_internal_cluster_add_peer_requires_admin() {
+    assert_eq!(
+        required_acl_for_route(&Method::POST, "/internal/cluster/peers"),
         Some("admin")
     );
 }
@@ -279,6 +295,22 @@ fn acl_migration_proxy_endpoints_require_admin() {
 }
 
 #[test]
+fn acl_async_migration_routes_require_admin_with_segment_safe_prefix() {
+    assert_required_acl(Method::POST, "/1/migrations/algolia", "admin");
+    assert_required_acl(
+        Method::GET,
+        "/1/migrations/algolia/01890f8e-8b28-78e8-b542-8cfdcb2d4f24",
+        "admin",
+    );
+    assert_required_acl(
+        Method::POST,
+        "/1/migrations/algolia/01890f8e-8b28-78e8-b542-8cfdcb2d4f24/cancel",
+        "admin",
+    );
+    assert_public_route(Method::POST, "/1/migrations-evil/algolia");
+}
+
+#[test]
 fn acl_internal_acme_challenge_requires_admin() {
     // Only root-mounted ACME challenge routes are public. `/internal/*` stays admin-only.
     assert_required_acl(
@@ -299,17 +331,20 @@ fn acl_root_acme_challenge_is_public() {
 
 #[test]
 fn public_path_helper_includes_root_acme_route() {
-    assert!(is_public_path("/.well-known/acme-challenge/token-123"));
-    assert!(is_public_path("/health"));
-    assert!(!is_public_path("/internal/replicate"));
+    assert!(is_public_path(
+        "/.well-known/acme-challenge/token-123",
+        false
+    ));
+    assert!(is_public_path("/health", false));
+    assert!(!is_public_path("/internal/replicate", false));
 }
 
 #[test]
 fn readiness_health_route_is_public_while_metrics_remains_admin_only() {
     assert_public_route(Method::GET, "/health/ready");
-    assert!(is_public_path("/health/ready"));
+    assert!(is_public_path("/health/ready", false));
     assert_required_acl(Method::GET, "/metrics", "admin");
-    assert!(!is_public_path("/metrics"));
+    assert!(!is_public_path("/metrics", false));
 }
 
 #[test]
@@ -326,19 +361,46 @@ fn acme_challenge_path_helper_matches_root_route_only() {
 #[test]
 fn public_path_helper_excludes_internal_acme_route() {
     assert!(!is_public_path(
-        "/internal/.well-known/acme-challenge/token-123"
+        "/internal/.well-known/acme-challenge/token-123",
+        false
     ));
 }
 
 #[test]
 fn public_path_helper_only_exposes_dashboard_mount() {
-    assert!(is_public_path("/dashboard"));
-    assert!(is_public_path("/dashboard/"));
-    assert!(is_public_path("/dashboard/index.html"));
-    assert!(
-        !is_public_path("/dashboard-admin"),
-        "only /dashboard and /dashboard/* should bypass auth"
+    for path in [
+        "/dashboard",
+        "/dashboard/",
+        "/dashboard/index.html",
+        "/swagger-ui",
+        "/swagger-ui/",
+        "/api-docs/openapi.json",
+    ] {
+        assert_eq!(
+            route_exposure(path, false),
+            RouteExposure::Public,
+            "path: {path}"
+        );
+        assert!(is_public_path(path, false), "path: {path}");
+
+        assert_eq!(
+            route_exposure(path, true),
+            RouteExposure::Disabled,
+            "path: {path}"
+        );
+        assert!(!is_public_path(path, true), "path: {path}");
+    }
+
+    assert_eq!(
+        route_exposure("/dashboard-admin", false),
+        RouteExposure::Protected
     );
+    assert_eq!(
+        route_exposure("/dashboard-admin", true),
+        RouteExposure::Protected
+    );
+    assert!(!is_public_path("/dashboard-admin", false));
+    assert!(!is_public_path("/dashboard-admin", true));
 }
 #[test]
 fn acl_personalization_strategy_requires_personalization() {

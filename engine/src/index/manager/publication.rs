@@ -23,9 +23,9 @@ mod scanner;
 mod scanner_tests;
 pub use digest::canonical_tenant_tree_digest;
 pub use executor::{
-    activate_publication, PreStagedActivationError, PreStagedActivationStage, PreStagedPublication,
-    PublicationArtifactManifest, PublicationArtifactManifestEntry, PublicationArtifactPlan,
-    PublicationArtifactRoot,
+    abort_unjournaled_publication, activate_publication, PreStagedActivationError,
+    PreStagedActivationStage, PreStagedPublication, PublicationArtifactManifest,
+    PublicationArtifactManifestEntry, PublicationArtifactPlan, PublicationArtifactRoot,
 };
 #[cfg(test)]
 pub(crate) use executor::{

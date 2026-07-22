@@ -14,6 +14,7 @@ use PHPUnit\Framework\MockObject\MockObject;
 use Flapjack\WordPress\CLI\Commands;
 use Flapjack\WordPress\ClientFactory;
 use Flapjack\WordPress\Indexing\IndexManager;
+use Flapjack\WordPress\Status\FailureReporter;
 
 class CommandsTest extends TestCase {
 
@@ -145,6 +146,43 @@ class CommandsTest extends TestCase {
         $this->assertStringContainsString( 'test-app', $all_values );
         $this->assertStringContainsString( 'Yes', $all_values );
         $this->assertStringContainsString( '42', $all_values );
+    }
+
+    public function test_status_shows_none_when_no_failure_recorded(): void {
+        \cli\Table::reset();
+
+        $this->client_factory->method( 'is_configured' )->willReturn( true );
+        $this->client_factory->method( 'get_app_id' )->willReturn( 'test-app' );
+        $this->client_factory->method( 'get_host' )->willReturn( '' );
+        $this->client_factory->method( 'get_index_name' )->willReturn( 'wp_posts' );
+        $this->index_manager->method( 'get_index_stats' )
+            ->willReturn( [ 'exists' => true, 'count' => 0, 'name' => 'wp_posts' ] );
+
+        $this->commands->status( [], [] );
+
+        $all_values = implode( ' ', array_merge( ...array_map( 'array_values', \cli\Table::$last_instance->rows ) ) );
+        $this->assertStringContainsString( '(none)', $all_values );
+    }
+
+    public function test_status_surfaces_reporter_latest_failure(): void {
+        \cli\Table::reset();
+
+        FailureReporter::record(
+            new \RuntimeException( 'Connection refused' ),
+            [ 'operation' => 'delete_post', 'source' => 'post_sync', 'post_id' => 42 ]
+        );
+
+        $this->client_factory->method( 'is_configured' )->willReturn( true );
+        $this->client_factory->method( 'get_app_id' )->willReturn( 'test-app' );
+        $this->client_factory->method( 'get_host' )->willReturn( '' );
+        $this->client_factory->method( 'get_index_name' )->willReturn( 'wp_posts' );
+        $this->index_manager->method( 'get_index_stats' )
+            ->willReturn( [ 'exists' => true, 'count' => 0, 'name' => 'wp_posts' ] );
+
+        $this->commands->status( [], [] );
+
+        $all_values = implode( ' ', array_merge( ...array_map( 'array_values', \cli\Table::$last_instance->rows ) ) );
+        $this->assertStringContainsString( 'delete_post/post_sync: Connection refused', $all_values );
     }
 
     public function test_status_shows_not_configured_when_no_credentials(): void {

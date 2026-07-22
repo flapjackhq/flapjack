@@ -3,7 +3,7 @@ use axum::{
     extract::Request,
     http::{Method, StatusCode},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use std::net::IpAddr;
 
@@ -16,14 +16,43 @@ use super::{
     SecuredKeyRestrictions,
 };
 
-pub(crate) fn is_public_path(path: &str) -> bool {
-    path == "/health"
-        || path == "/health/ready"
-        || path == "/dashboard"
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteExposure {
+    Public,
+    Disabled,
+    Protected,
+}
+
+pub(crate) fn route_exposure(path: &str, disable_dashboard: bool) -> RouteExposure {
+    if is_always_public_path(path) {
+        return RouteExposure::Public;
+    }
+
+    if is_dashboard_or_docs_path(path) {
+        if disable_dashboard {
+            RouteExposure::Disabled
+        } else {
+            RouteExposure::Public
+        }
+    } else {
+        RouteExposure::Protected
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn is_public_path(path: &str, disable_dashboard: bool) -> bool {
+    route_exposure(path, disable_dashboard) == RouteExposure::Public
+}
+
+fn is_always_public_path(path: &str) -> bool {
+    path == "/health" || path == "/health/ready" || super::is_acme_challenge_path(path)
+}
+
+fn is_dashboard_or_docs_path(path: &str) -> bool {
+    path == "/dashboard"
         || path.starts_with("/dashboard/")
         || path.starts_with("/swagger-ui")
         || path.starts_with("/api-docs")
-        || super::is_acme_challenge_path(path)
 }
 
 fn is_own_key_read_request(method: &Method, path: &str, api_key_value: &str) -> bool {
@@ -248,6 +277,7 @@ fn ensure_index_access_is_allowed(
 pub async fn authenticate_and_authorize(
     request: Request,
     next: Next,
+    disable_dashboard: bool,
 ) -> Result<Response, Response> {
     if request.method() == Method::OPTIONS {
         return Ok(next.run(request).await);
@@ -255,9 +285,10 @@ pub async fn authenticate_and_authorize(
 
     let path = request.uri().path().to_string();
 
-    // Skip auth for public endpoints.
-    if is_public_path(&path) {
-        return Ok(next.run(request).await);
+    match route_exposure(&path, disable_dashboard) {
+        RouteExposure::Public => return Ok(next.run(request).await),
+        RouteExposure::Disabled => return Err(StatusCode::NOT_FOUND.into_response()),
+        RouteExposure::Protected => {}
     }
 
     let Some(key_store) = request.extensions().get::<std::sync::Arc<KeyStore>>() else {

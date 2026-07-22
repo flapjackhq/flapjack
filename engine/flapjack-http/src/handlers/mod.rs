@@ -72,6 +72,7 @@ pub struct AppState {
     pub paused_indexes: PausedIndexes,
     pub geoip_reader: Option<Arc<GeoIpReader>>,
     pub notification_service: Option<Arc<NotificationService>>,
+    pub migration_runner: Arc<migration::MigrationJobRunner>,
     pub start_time: std::time::Instant,
     pub conversation_store: Arc<ConversationStore>,
     pub embedder_store: Arc<crate::embedder_store::EmbedderStore>,
@@ -101,7 +102,10 @@ pub use keys::{
     create_key, delete_key, generate_secured_key, get_key, list_keys, restore_key, update_key,
 };
 pub use metrics::metrics_handler;
-pub use migration::{list_algolia_indexes, migrate_from_algolia};
+pub use migration::{
+    cancel_algolia_migration, get_algolia_migration_status, list_algolia_indexes,
+    migrate_from_algolia, submit_algolia_migration,
+};
 pub use objects::{
     add_documents, add_record_auto_id, delete_by_query, delete_object, get_object, get_objects,
     partial_update_object, put_object,

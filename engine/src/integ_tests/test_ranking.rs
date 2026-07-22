@@ -722,6 +722,73 @@ async fn test_custom_ranking_desc() {
     assert_eq!(results.documents[2].document.id, "1");
 }
 
+/// Empty-query browse must still honor customRanking: with
+/// `custom_ranking: ["desc(popularity)"]`, an empty query returns custom-ranked
+/// order, not the objectID-descending browse default. This is the sort-dropdown
+/// contract — replica indexes are browsed with an empty query
+/// (live L4 replica evidence 2026-07-19).
+#[tokio::test]
+async fn test_custom_ranking_applies_to_empty_query() {
+    let temp = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp.path());
+    manager.create_tenant("test").unwrap();
+
+    let settings = IndexSettings {
+        custom_ranking: Some(vec!["desc(popularity)".to_string()]),
+        ..Default::default()
+    };
+    settings
+        .save(temp.path().join("test/settings.json"))
+        .unwrap();
+
+    let docs = vec![
+        json!({"_id": "1", "name": "Product A", "popularity": 100}),
+        json!({"_id": "2", "name": "Product B", "popularity": 500}),
+        json!({"_id": "3", "name": "Product C", "popularity": 200}),
+    ];
+
+    let docs: Vec<_> = docs
+        .into_iter()
+        .map(|v| crate::types::Document::from_json(&v).unwrap())
+        .collect();
+    manager.add_documents_sync("test", docs).await.unwrap();
+
+    let results = manager.search("test", "", None, None, 10).unwrap();
+
+    assert_eq!(results.documents.len(), 3);
+    assert_eq!(results.documents[0].document.id, "2");
+    assert_eq!(results.documents[1].document.id, "3");
+    assert_eq!(results.documents[2].document.id, "1");
+}
+
+/// Without customRanking, empty-query browse keeps its stable objectID-descending
+/// default — the companion pin for the branch exercised above.
+#[tokio::test]
+async fn test_empty_query_without_custom_ranking_keeps_object_id_desc_default() {
+    let temp = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp.path());
+    manager.create_tenant("test").unwrap();
+
+    let docs = vec![
+        json!({"_id": "1", "name": "Product A", "popularity": 100}),
+        json!({"_id": "2", "name": "Product B", "popularity": 500}),
+        json!({"_id": "3", "name": "Product C", "popularity": 200}),
+    ];
+
+    let docs: Vec<_> = docs
+        .into_iter()
+        .map(|v| crate::types::Document::from_json(&v).unwrap())
+        .collect();
+    manager.add_documents_sync("test", docs).await.unwrap();
+
+    let results = manager.search("test", "", None, None, 10).unwrap();
+
+    assert_eq!(results.documents.len(), 3);
+    assert_eq!(results.documents[0].document.id, "3");
+    assert_eq!(results.documents[1].document.id, "2");
+    assert_eq!(results.documents[2].document.id, "1");
+}
+
 /// Verify that `custom_ranking: ["asc(price)"]` orders search results by ascending price when all documents match the query.
 #[tokio::test]
 async fn test_custom_ranking_asc() {

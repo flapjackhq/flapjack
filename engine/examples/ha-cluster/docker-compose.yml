@@ -10,6 +10,9 @@
 #   docker compose up -d --build
 #   ./test_ha.sh            # run HA tests (failover, replication, catch-up)
 #   docker compose down -v
+#
+# This local-only HA example intentionally combines no-auth with 0.0.0.0
+# container binds so nginx can route between nodes.
 
 services:
   node-a:
@@ -20,6 +23,7 @@ services:
       FLAPJACK_DATA_DIR: /data
       FLAPJACK_BIND_ADDR: "0.0.0.0:7700"
       FLAPJACK_NO_AUTH: "1"
+      FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND: "1"
       FLAPJACK_NODE_ID: node-a
       FLAPJACK_PEERS: "node-b=http://node-b:7700,node-c=http://node-c:7700"
       FLAPJACK_STARTUP_CATCHUP_STRICT: "0"
@@ -40,6 +44,7 @@ services:
       FLAPJACK_DATA_DIR: /data
       FLAPJACK_BIND_ADDR: "0.0.0.0:7700"
       FLAPJACK_NO_AUTH: "1"
+      FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND: "1"
       FLAPJACK_NODE_ID: node-b
       FLAPJACK_PEERS: "node-a=http://node-a:7700,node-c=http://node-c:7700"
       FLAPJACK_STARTUP_CATCHUP_STRICT: "0"
@@ -60,6 +65,7 @@ services:
       FLAPJACK_DATA_DIR: /data
       FLAPJACK_BIND_ADDR: "0.0.0.0:7700"
       FLAPJACK_NO_AUTH: "1"
+      FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND: "1"
       FLAPJACK_NODE_ID: node-c
       FLAPJACK_PEERS: "node-a=http://node-a:7700,node-b=http://node-b:7700"
       FLAPJACK_STARTUP_CATCHUP_STRICT: "0"

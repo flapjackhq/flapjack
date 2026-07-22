@@ -2,6 +2,9 @@
 /.git
 /.github
 /bin
+/CODE_MAP.md
+/DIRMAP.md
+/dist
 /node_modules
 /tests
 /vendor/phpunit
@@ -12,12 +15,15 @@
 /.gitignore
 /.php-cs-fixer.cache
 /.phpunit.result.cache
+/.wp-env.json
 /composer.json
 /composer.lock
 /package.json
 /package-lock.json
 /phpunit.xml
 /phpstan.neon
+/phpstan.neon.dist
+/playwright.config.js
 
 # Build scripts (vendor deps are pre-built in assets/vendor/)
 /scripts

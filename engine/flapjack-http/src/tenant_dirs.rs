@@ -20,9 +20,14 @@ fn visible_tenant_name_if_visible_directory(
     }
     // Skip hidden dirs (`.`-prefix), underscore-prefixed infrastructure dirs
     // (`_`-prefix convention for internal storage like `_usage`), and the
-    // legacy `analytics` dir (Parquet files, not a search index).
+    // legacy `analytics` dir (Parquet files, not a search index), and migration
+    // export spool storage.
     // Probing any of these as a tenant index would break the readiness probe.
-    if name.starts_with('.') || name.starts_with('_') || name == "analytics" {
+    if name.starts_with('.')
+        || name.starts_with('_')
+        || name == "analytics"
+        || name == "migration_exports"
+    {
         None
     } else {
         Some(name)
@@ -136,6 +141,17 @@ mod tests {
 
         let mut tenant_dirs = visible_tenant_dir_names(temp_dir.path()).unwrap();
         tenant_dirs.sort();
+
+        assert_eq!(tenant_dirs, vec!["products".to_string()]);
+    }
+
+    #[test]
+    fn visible_tenant_dir_names_skip_migration_export_spool() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::create_dir(temp_dir.path().join("products")).unwrap();
+        fs::create_dir(temp_dir.path().join("migration_exports")).unwrap();
+
+        let tenant_dirs = visible_tenant_dir_names(temp_dir.path()).unwrap();
 
         assert_eq!(tenant_dirs, vec!["products".to_string()]);
     }

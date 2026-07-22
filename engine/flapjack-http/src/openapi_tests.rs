@@ -1,10 +1,38 @@
 use super::*;
+use crate::openapi::{documented_openapi, DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS};
 use crate::openapi_test_helpers::{
-    assert_high_risk_mutation_contracts, schema_composition_refs, schema_ref,
+    assert_add_peer_openapi_contract, assert_high_risk_mutation_contracts,
+    assert_remove_peer_openapi_contract, schema_composition_refs, schema_ref,
 };
 
 fn openapi_json() -> serde_json::Value {
     serde_json::to_value(ApiDoc::openapi()).unwrap()
+}
+
+#[test]
+fn openapi_membership_add_contract_is_documented() {
+    assert_add_peer_openapi_contract(&openapi_json());
+}
+
+#[test]
+fn openapi_membership_remove_contract_is_documented() {
+    assert_remove_peer_openapi_contract(&openapi_json());
+}
+
+#[test]
+fn openapi_membership_paths_are_hidden_when_auth_is_disabled() {
+    let doc = serde_json::to_value(documented_openapi(false)).unwrap();
+    let paths = doc
+        .get("paths")
+        .and_then(|value| value.as_object())
+        .expect("spec must have paths");
+
+    for path in DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS {
+        assert!(
+            !paths.contains_key(path),
+            "no-auth OpenAPI should not advertise {path}"
+        );
+    }
 }
 
 fn schema_contains_type(schema: &serde_json::Value, expected_type: &str) -> bool {
@@ -265,6 +293,36 @@ fn experiments_endpoints_are_documented() {
     // Results
     assert_path_exists(&doc, "/2/abtests/{id}/results");
     assert_path_method(&doc, "/2/abtests/{id}/results", "get");
+}
+
+#[test]
+fn abtests_list_exposes_index_name_query_parameter() {
+    let doc = openapi_json();
+    let operation = doc
+        .pointer("/paths/~12~1abtests/get")
+        .expect("list experiments operation should exist");
+    let parameters = operation["parameters"]
+        .as_array()
+        .expect("list experiments parameters should be an array");
+    let index_name_parameters: Vec<_> = parameters
+        .iter()
+        .filter(|parameter| parameter["name"] == "indexName")
+        .collect();
+
+    let expected_summary = "Lists experiments with Algolia-compatible pagination and optional exact, prefix, or suffix index-name filtering.";
+    assert_eq!(
+        (index_name_parameters.len(), operation["summary"].as_str()),
+        (1, Some(expected_summary))
+    );
+    let index_name_parameter = index_name_parameters[0];
+    assert_eq!(index_name_parameter["in"], "query");
+    assert!(index_name_parameter
+        .get("required")
+        .is_none_or(|required| required == false));
+    assert!(schema_contains_type(
+        &index_name_parameter["schema"],
+        "string"
+    ));
 }
 
 #[test]
@@ -717,8 +775,16 @@ fn dictionaries_dictionary_name_param_uses_enum_schema() {
 fn stage7_typed_request_bodies_use_component_schemas() {
     let doc = openapi_json();
     assert_operation_uses_api_key(&doc, "/1/migrate-from-algolia");
+    assert_operation_uses_api_key(&doc, "/1/migrations/algolia");
     assert_operation_uses_api_key(&doc, "/1/algolia-list-indexes");
-    for schema_name in ["MigrateFromAlgoliaRequest", "ListAlgoliaIndexesRequest"] {
+    for schema_name in [
+        "MigrateFromAlgoliaRequest",
+        "ListAlgoliaIndexesRequest",
+        "AsyncMigrationStatusResponse",
+        "AsyncMigrationPhase",
+        "AsyncMigrationDisposition",
+        "AsyncMigrationExportProgress",
+    ] {
         assert_component_schema_exists(&doc, schema_name);
     }
 
@@ -758,6 +824,11 @@ fn stage7_typed_request_bodies_use_component_schemas() {
             Some("#/components/schemas/MigrateFromAlgoliaRequest")
         );
     assert_eq!(
+            doc.pointer("/paths/~11~1migrations~1algolia/post/requestBody/content/application~1json/schema/$ref")
+                .and_then(|v| v.as_str()),
+            Some("#/components/schemas/MigrateFromAlgoliaRequest")
+        );
+    assert_eq!(
             doc.pointer("/paths/~11~1algolia-list-indexes/post/requestBody/content/application~1json/schema/$ref")
                 .and_then(|v| v.as_str()),
             Some("#/components/schemas/ListAlgoliaIndexesRequest")
@@ -775,13 +846,56 @@ fn stage7_typed_responses_use_component_schemas() {
     let doc = openapi_json();
     for schema_name in [
         "MigrateFromAlgoliaResponse",
+        "MigrateWarning",
         "MigrateCount",
         "AlgoliaIndexInfo",
         "ListAlgoliaIndexesResponse",
+        "AsyncMigrationStatusResponse",
+        "AsyncMigrationPhase",
+        "AsyncMigrationDisposition",
+        "AsyncMigrationExportProgress",
     ] {
         assert_component_schema_exists(&doc, schema_name);
     }
 
+    assert_eq!(
+        schema_ref(
+            &doc,
+            "/components/schemas/AsyncMigrationStatusResponse/properties/exportProgress"
+        ),
+        Some("#/components/schemas/AsyncMigrationExportProgress")
+    );
+    assert_eq!(
+        schema_ref(
+            &doc,
+            "/components/schemas/AsyncMigrationStatusResponse/properties/phase"
+        ),
+        Some("#/components/schemas/AsyncMigrationPhase")
+    );
+    assert_eq!(
+        schema_ref(
+            &doc,
+            "/components/schemas/AsyncMigrationStatusResponse/properties/disposition"
+        ),
+        Some("#/components/schemas/AsyncMigrationDisposition")
+    );
+    assert!(
+        doc.pointer("/components/schemas/AsyncMigrationStatusResponse/properties/overallProgress")
+            .is_none(),
+        "async migration status schema must not expose overall progress"
+    );
+    assert!(
+        doc.pointer("/components/schemas/AsyncMigrationExportProgress/properties/ratio")
+            .is_none(),
+        "export progress schema must expose counts only"
+    );
+    assert_eq!(
+        doc.pointer(
+            "/components/schemas/MigrateFromAlgoliaResponse/properties/warnings/items/$ref"
+        )
+        .and_then(|v| v.as_str()),
+        Some("#/components/schemas/MigrateWarning")
+    );
     assert_eq!(
         doc.pointer("/paths/~11~1configs/get/responses/200/content/application~1json/schema/type")
             .and_then(|v| v.as_str()),
@@ -836,8 +950,17 @@ fn stage7_typed_responses_use_component_schemas() {
                 .and_then(|v| v.as_str()),
             Some("#/components/schemas/MutationResponse")
         );
-    // Migration import temporarily has no success response; the reachable
-    // response set is owned by openapi_tests_endpoints.rs.
+    // Migration import response-set coverage is owned by openapi_tests_endpoints.rs.
+    assert_eq!(
+            doc.pointer("/paths/~11~1migrations~1algolia/post/responses/202/content/application~1json/schema/$ref")
+                .and_then(|v| v.as_str()),
+            Some("#/components/schemas/AsyncMigrationStatusResponse")
+        );
+    assert_eq!(
+            doc.pointer("/paths/~11~1migrations~1algolia~1{job_id}/get/responses/200/content/application~1json/schema/$ref")
+                .and_then(|v| v.as_str()),
+            Some("#/components/schemas/AsyncMigrationStatusResponse")
+        );
     assert_eq!(
             doc.pointer("/paths/~11~1algolia-list-indexes/post/responses/200/content/application~1json/schema/$ref")
                 .and_then(|v| v.as_str()),
@@ -848,6 +971,23 @@ fn stage7_typed_responses_use_component_schemas() {
                 .and_then(|v| v.as_str()),
             Some("#/components/schemas/ChatResponse")
         );
+}
+
+#[test]
+fn migration_tag_is_registered_once() {
+    let doc = openapi_json();
+    let migration_tags = doc
+        .get("tags")
+        .and_then(|value| value.as_array())
+        .expect("spec must document tags")
+        .iter()
+        .filter(|tag| tag.get("name").and_then(|value| value.as_str()) == Some("migration"))
+        .count();
+
+    assert_eq!(
+        migration_tags, 1,
+        "migration tag should appear exactly once"
+    );
 }
 
 #[path = "openapi_tests_endpoints.rs"]

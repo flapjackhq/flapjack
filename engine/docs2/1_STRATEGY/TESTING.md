@@ -170,6 +170,23 @@ cargo nextest list                            # list without running
 cargo test --lib -p flapjack -- filter::tests # specific inline module
 ```
 
+### Migration scale proof
+Prerequisites: `gtimeout`, `jq`, a built local Flapjack binary or local build support, and the source-repo secret file at `/Users/stuart/repos/gridl-dev/flapjack_dev/engine/.secret/.env.secret`.
+
+```bash
+unset FJ_SCALE_REUSE_FIXTURE
+(cd engine && MIGRATION_IMPORT_CONTRACT_EVIDENCE_ROOT="$PWD/../build/scale-evidence" gtimeout --kill-after=60s 5400s bash tests/migration_import_contract.sh --expect-mode scale --two-point --secret-file /Users/stuart/repos/gridl-dev/flapjack_dev/engine/.secret/.env.secret)
+```
+
+Validate the newly preserved receipt, not stdout:
+
+```bash
+receipt="$(ls -1t build/scale-evidence/*/receipt.json | head -1)"
+jq -e '.status == "pass" and .scale.mode == "two-point" and .scale.conditions == [2000,20000] and (.checks | length) > 0 and all(.checks[]; .status != "fail")' "$receipt"
+```
+
+The public mirror job is opt-in on public mirrors. The local command is authoritative acceptance for this dev lane, and no dev-repo Actions run should be triggered.
+
 ### Multi-Language Fast Suite
 Use `--lib` for focused multi-language feature checks so we only execute inline/unit-style targets and avoid spawning unrelated integration binaries with zero tests.
 

@@ -11,7 +11,7 @@ End-to-end tests that validate Flapjack's Algolia API compatibility against real
 Proves a real customer can migrate from Algolia to Flapjack. Tests both migration paths:
 
 - **Manual migration** (Phase 3/4): Export settings/synonyms/objects from Algolia, import into Flapjack via individual API calls, compare search results.
-- **One-click migration** (Phase 3b/4b): exercises the `POST /1/migrate-from-algolia` endpoint. This path is **not available on `main`** — the import leg is unimplemented, so the endpoint returns `503 migration_import_unavailable` and writes no data; Phase 3b/4b are expected to fail. See the canonical status in [`FEATURES.md`](../docs2/FEATURES.md#algolia-migration-1migrate-from-algolia--not-connected-on-main).
+- **One-click migration** (Phase 3b/4b): exercises the `POST /1/migrate-from-algolia` endpoint. The create-only path is available on `main`: it exports a source index, imports into a fresh target index, and verifies the migrated search result. Existing-target overwrite, async status/cancel/resume, and HA-converging import remain deferred. See the canonical status in [`FEATURES.md`](../docs2/FEATURES.md#algolia-migration-1migrate-from-algolia--create-only-shipped).
 
 ```bash
 node test_algolia_migration.js           # run full migration test
@@ -58,4 +58,4 @@ POST /1/migrate-from-algolia
 }
 ```
 
-**Not available on `main`.** This endpoint is not connected end-to-end: the import leg is unimplemented, so it returns `503 migration_import_unavailable` and writes no data. It is intended to migrate an Algolia index (settings, synonyms, rules, objects) into Flapjack once the import leg lands. See the canonical status in [`FEATURES.md`](../docs2/FEATURES.md#algolia-migration-1migrate-from-algolia--not-connected-on-main).
+**Create-only migration is available on `main`.** This endpoint migrates an Algolia index (settings, synonyms, rules, objects) into a fresh Flapjack target index. Existing-target overwrite returns 409 until `MIG-5` lands; async status/cancel/resume waits on `MIG-6`; HA-converging import remains refused under `MIG-7`. See the canonical status in [`FEATURES.md`](../docs2/FEATURES.md#algolia-migration-1migrate-from-algolia--create-only-shipped).

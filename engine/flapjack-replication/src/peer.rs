@@ -57,6 +57,10 @@ impl PeerClient {
         &self.peer_id
     }
 
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub fn last_success_timestamp(&self) -> u64 {
         self.last_success.load(Ordering::Relaxed)
     }

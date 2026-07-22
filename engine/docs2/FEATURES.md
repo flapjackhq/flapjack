@@ -2,7 +2,7 @@
 
 Single maintained status ledger for Flapjack. Shipped feature status, current production-readiness state, and post-launch work are owned in this document.
 
-**Last updated: 2026-07-16 (Algolia-migration status truth-up: the export and dashboard halves are shipped but NOT joined — see "Algolia migration" below. Keep lane-state routing in `ROADMAP.md`.)**
+**Last updated: 2026-07-18 (Algolia create-only migration is shipped and joined; deferred overwrite, async jobs, and HA import remain routed through `ROADMAP.md`.)**
 
 - 2026-05-31 stage note: `FLAPJACK_WRITE_QUEUE_BATCH_SIZE` is now runtime-configurable with default-preserving behavior (`32` fallback). See [`3_IMPLEMENTATION/OPS_CONFIGURATION.md`](3_IMPLEMENTATION/OPS_CONFIGURATION.md) for full operator semantics.
 
@@ -145,6 +145,7 @@ All shipped capability status lives in the feature tables below (Search, Indexin
 | Feature | Status | Notes |
 |---|---|---|
 | Schemaless JSON upload | ✅ | Dual-field schema (search + filter), nested objects via dot notation |
+| `flapjack ingest` beta | ✅ | Streams JSON arrays, NDJSON files, and stdin-backed NDJSON/JSON into the authenticated `/1/indexes/{indexName}/batch` path. Upsert is the only durable mode; explicit `_action:"delete"` records delete by `objectID`. Source-side omissions do not delete target-only records. |
 | Single record CRUD | ✅ | |
 | Batch operations | ✅ | Up to 1000 ops, hybrid batching (10 ops or 100ms) |
 | Browse (full index scan) | ✅ | Cursor-based pagination |
@@ -153,6 +154,15 @@ All shipped capability status lives in the feature tables below (Search, Indexin
 | Index copy / move / clear | ✅ | |
 | Replicas | ✅ | Virtual + standard replicas |
 | Task status API | ✅ | Async task tracking |
+
+### `flapjack ingest` Beta Bounds
+
+- Inputs: JSON array files, NDJSON files, or `--source -` for stdin. The parser keeps memory bounded by `--batch-size` and reports `queue_high_watermark`.
+- Credentials: exactly one of `--api-key-env`, `--api-key-file`, or `--api-key-stdin` is accepted. `--api-key` is intentionally not a CLI option so secrets are not exposed through help text, shell history, or process listings.
+- Writes: the CLI sends bounded batch envelopes to the same authenticated batch endpoint used by normal clients. Upsert is default and preserves target-only records. Deletes happen only when a source record carries the configured action field with `delete` or `deleteObject`.
+- Retries: one serialized envelope owns one `x-flapjack-idempotency-key` across retry attempts. The beta retries transport failures plus HTTP `429` and `503`, caps `Retry-After`, and reports `retries`, `last_retry_after_ms`, `confirmed_committed`, and `outcome_unknown`.
+- Recovery: when the JSON report shows `outcome_unknown > 0`, rerun the same source with the same idempotent object IDs after checking the destination. Do not treat unknown envelopes as confirmed writes.
+- Replace mode: `--mode replace` returns the typed `replace_not_supported` refusal and performs zero mutations until the mutation-fence/publication contract ships.
 
 ## Index Settings
 
@@ -266,33 +276,36 @@ Env-var details for operational behavior are canonical in
 | InstantSearch iOS | ✅ | Via Swift client + Swift smoke |
 | Autocomplete.js | ✅ | |
 
-## Algolia migration (`/1/migrate-from-algolia`) — NOT CONNECTED on `main`
+## Algolia migration (`/1/migrate-from-algolia`) — CREATE-ONLY SHIPPED
 
-**Status as of 2026-07-16: the backend halves exist and the dashboard page exists, but they are not joined. The endpoint reports success without importing.** This section is the canonical status owner for the migration capability. Remediation is tracked in [`ROADMAP.md`](../../ROADMAP.md) rows `MIG-1` (honesty + HA refusal), `MIG-2` (translation), and `MIG-3` (import leg); `MIG-5`, `MIG-6`, and `MIG-7` record scope deferred by design. (`MIG-4` in that table is a separate publication-repair item, not part of this capability.)
+**Status as of 2026-07-18: create-only Algolia migration is joined end-to-end.** The synchronous endpoint exports a source index, translates documents/settings/synonyms/rules, publishes a fresh target index, and reports counts that are backed by the target index listing. `overwrite=true`, async status/cancel/resume, and HA-converging import remain deferred in [`ROADMAP.md`](../../ROADMAP.md) rows `MIG-5`, `MIG-6`, and `MIG-7`. `MIG-4` is a separate publication-repair proof row, not part of this migration capability.
 
 | Leg | Status | Owner |
 |---|---|---|
 | Source export: Algolia → durable on-disk spool (checkpointed, resumable) | ✅ Shipped | `engine/flapjack-http/src/handlers/migration/{algolia_client,source_reader,export,spool}.rs` |
-| Translation: spool → Flapjack documents/settings/synonyms/rules | ❌ Absent | Planned owner `handlers/migration/translation.rs` (`MIG-2`) |
-| Import: translated content → target index via staged publication | ❌ Absent | Planned; reuses `engine/src/index/manager/publication.rs::activate_publication` (`MIG-3`) |
+| Translation: spool → Flapjack documents/settings/synonyms/rules | ✅ Shipped | `engine/flapjack-http/src/handlers/migration/translation.rs` |
+| Import: translated content → target index via staged publication | ✅ Shipped for create-only targets | `engine/flapjack-http/src/handlers/migration/import.rs`; `engine/flapjack-http/src/handlers/migration/mod.rs::migrate_from_algolia` |
 | Staged publication primitive (crash-safe, node-local) | ✅ Shipped | `engine/src/index/manager/publication.rs` |
-| Dashboard `Migrate` page | ✅ Shipped (March) | `engine/dashboard/src/pages/Migrate.tsx` |
-| **Backend ↔ frontend joined end-to-end** | ❌ **No — and failure is silent** | `MIG-1` |
+| Dashboard `Migrate` page | ✅ Shipped and proven for create-only migration | `engine/dashboard/src/pages/Migrate.tsx`; `engine/dashboard/tests/e2e-ui/full/migrate-algolia.spec.ts` |
+| **Backend ↔ frontend joined end-to-end** | ✅ Create-only path proven with real Algolia credentials | `migrate_from_algolia`; `engine/dashboard/tests/e2e-ui/full/migrate-algolia.spec.ts` |
 
-**The defect.** On 2026-07-15, commit `728cde433` ("Replace destination import with spool-backed source export") deleted `prepare_target_index` and the `import_algolia_*` destination writers as a deliberate, checklist-scoped decomposition step; a later lane was to recompose the import. That lane has not run. Meanwhile `migrate_from_algolia` (`engine/flapjack-http/src/handlers/migration/mod.rs:156`) still returns `status: "complete"` with `objects.imported: N`, while `target_index` is validated and then discarded and no index write occurs. The lane's own regression test asserts the absence of any destination index (`export_tests.rs:181` — `assert!(!base_path.join(SOURCE).exists())`), so the endpoint provably does not import. The rustdoc on the handler and the OpenAPI `200 Migration completed` / `409 Target index already exists` responses still describe the deleted import behavior.
+Replica translation detects topology from the source primary, fetches every named replica's own settings, and carries the derived virtual topology plus translated per-replica settings in the create-only migration bundle. Materialization then creates each derived replica as a settings-only virtual sidecar (no physical copy, by design) whose sort order resolves at query time. This contract is live-proven: on 2026-07-19 a real Algolia application with one `virtual(...)` relevance replica and one standard replica migrated end-to-end with a passing machine-verified receipt (jul18_11am batch) covering fixture seeding, import, sort-order proofs on the primary and both replica indexes, sidecar structure, and exact source cleanup. Remaining fidelity limits stay owned by `ROADMAP.md` MIG-11 and surface as documented migration warnings: standard-replica exhaustive sorting is approximated as a virtual replica, and Algolia `relevancyStrictness` semantics differ from Flapjack's deterministic ranking.
 
-**User-visible consequence:** a user migrating from Algolia via the dashboard sees "complete" and a document count, and receives an empty index. The exported data sits in an internal spool with no user-reachable path.
+Migration warnings expose the remaining replica fidelity limits:
 
-**Blast radius:** `main` only. The last public release is v1.0.10 (2026-06-09), which predates the regression, so no released binary is affected. `MIG-1` restores fail-closed honesty before any release cut; the ban on releasing from `main` until `MIG-1` lands is recorded in [`ROADMAP.md`](../../ROADMAP.md).
+- Algolia standard-replica exhaustive sorting is approximated by blended Flapjack virtual ranking.
+- `asc()` and `desc()` tokens in replica `ranking` are lifted ahead of replica `customRanking`; unknown ranking tokens are ignored with warnings.
+- Matching-critical fields that diverge from the primary cannot be reproduced independently by a virtual replica.
+- Algolia and Flapjack use different `relevancyStrictness` scales, and `nbSortedHits` may differ for deterministic queries.
 
-**HA:** migration has no HA guard and the oplog carries no epoch field (`engine/src/index/oplog.rs:14-20`). Staged publication is explicitly node-local (`publication.rs:9-10` `NODE_LOCAL_GUARANTEE`). An import on an HA cluster cannot converge peers; `MIG-1` adds a typed fail-closed refusal so the hazard cannot return with the import.
+**Current boundary:** the shipped path is create-only. Existing target overwrite returns 409 unless and until `MIG-5` lands. The call is synchronous; no HTTP status, cancel, or resume route exists until `MIG-6`. HA import is refused because staged publication is node-local and no convergence epoch exists; that design remains under `MIG-7`.
 
 ## Dashboard UI
 
 22 user-facing routes are shipped, backed by 21 lazy-loaded page components, plus the `*` not-found catch-all. No stub pages remain.
 The route inventory spans overview, search/browse, settings, analytics, relevancy controls, security tooling, and migration workflows with no placeholder pages.
 
-**Caveat — route shipped ≠ capability working.** The `Migrate` route below is a shipped, non-stub page whose backend contract is currently broken; see the Algolia-migration section above. "Built" in this table means the route and its components are real and wired to an endpoint, not that the end-to-end capability is proven.
+**Caveat — route shipped ≠ every migration mode shipped.** The `Migrate` route is a proven browser path when credentials are supplied and `overwrite` is false. Existing-target overwrite, async jobs, and HA import remain deferred through [`ROADMAP.md`](../../ROADMAP.md) rows `MIG-5`, `MIG-6`, and `MIG-7`.
 
 | Status | Features |
 |---|---|

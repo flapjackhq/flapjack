@@ -159,21 +159,21 @@ test.describe('Migrate Page', () => {
   });
 
   test('submitting with invalid credentials shows error', async ({ page }) => {
-    const importUnavailableMessage =
-      'Migration import leg is not implemented; no data was written, and this endpoint will not report success it did not perform.';
+    const sourceIndex = `nonexistent-index-${Date.now()}`;
+    const upstreamFailureMessage =
+      `Algolia request failed: error sending request for url (https://fake-app-id-dsn.algolia.net/1/indexes/${sourceIndex}/settings)`;
 
     // Fill in fake credentials
     await page.getByLabel('Application ID').fill('fake-app-id');
     await page.getByLabel('Admin API Key').fill('fake-api-key');
-    await sourceIndexInput(page).fill('nonexistent-index');
+    await sourceIndexInput(page).fill(sourceIndex);
 
     // Click migrate
     await page.getByRole('button', { name: /migrate/i }).click();
 
     // Should show an error card after the request fails
     const errorCard = page.getByTestId('migration-error-card');
-    await expect(errorCard).toContainText(importUnavailableMessage, { timeout: 15_000 });
-    await expect(errorCard).toContainText('migration_import_unavailable');
+    await expect(errorCard).toContainText(upstreamFailureMessage, { timeout: 15_000 });
   });
 
   test('migration attempts do not expose Algolia API keys in API Logs', async ({ page }) => {

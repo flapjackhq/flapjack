@@ -354,7 +354,7 @@ async fn smoke_internal_endpoint() {
     let mgr = IndexManager::new(tmp.path());
 
     let state = std::sync::Arc::new(flapjack_http::handlers::AppState {
-        manager: mgr,
+        manager: std::sync::Arc::clone(&mgr),
         key_store: None,
         replication_manager: None,
         ssl_manager: None,
@@ -369,6 +369,13 @@ async fn smoke_internal_endpoint() {
         usage_persistence: None,
         geoip_reader: None,
         notification_service: None,
+        migration_runner: std::sync::Arc::new(
+            flapjack_http::handlers::migration::MigrationJobRunner::new(
+                mgr,
+                None,
+                flapjack_http::handlers::migration::DEFAULT_ASYNC_MIGRATION_CAPACITY,
+            ),
+        ),
         start_time: std::time::Instant::now(),
         conversation_store: flapjack_http::conversation_store::ConversationStore::default_shared(),
         experiment_store: None,
@@ -458,7 +465,7 @@ mod cors {
         let manager = flapjack::IndexManager::new(temp_dir.path());
 
         let state = Arc::new(flapjack_http::handlers::AppState {
-            manager,
+            manager: Arc::clone(&manager),
             key_store: None,
             replication_manager: None,
             ssl_manager: None,
@@ -473,6 +480,13 @@ mod cors {
             usage_persistence: None,
             geoip_reader: None,
             notification_service: None,
+            migration_runner: Arc::new(
+                flapjack_http::handlers::migration::MigrationJobRunner::new(
+                    manager,
+                    None,
+                    flapjack_http::handlers::migration::DEFAULT_ASYNC_MIGRATION_CAPACITY,
+                ),
+            ),
             start_time: std::time::Instant::now(),
             conversation_store:
                 flapjack_http::conversation_store::ConversationStore::default_shared(),

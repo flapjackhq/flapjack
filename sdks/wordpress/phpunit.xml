@@ -16,6 +16,9 @@
         <testsuite name="integration">
             <directory suffix="Test.php">tests/Integration</directory>
         </testsuite>
+        <testsuite name="realstack">
+            <directory suffix="Test.php">tests/RealStack</directory>
+        </testsuite>
     </testsuites>
 
     <source>

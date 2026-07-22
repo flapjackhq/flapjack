@@ -176,6 +176,7 @@ class ProductIntegration {
         // Add product-specific faceting attributes.
         $facets = $settings['attributesForFaceting'] ?? [];
         $product_facets = [
+            'taxonomy_product_cat',
             'filterOnly(price)',
             'filterOnly(on_sale)',
             'filterOnly(in_stock)',

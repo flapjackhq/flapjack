@@ -71,6 +71,8 @@ lerna-debug.log*
 
 # matt runtime state/logs
 .matt/
+.mike/
+.realstack_runner.*/
 
 node_modules
 dist

@@ -13,6 +13,12 @@ on:
     # Run at 2 AM UTC every day
     - cron: '0 2 * * *'
   workflow_dispatch: # Allow manual triggering
+    inputs:
+      run_migration_scale_contract:
+        description: 'Run opt-in migration scale contract'
+        type: boolean
+        required: false
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,9 +34,9 @@ jobs:
       - id: check
         run: |
           if [ "${{ github.repository }}" = "flapjackhq/flapjack" ] || [ "${{ github.repository }}" = "gridl-staging/flapjack" ]; then
-            echo "is-public-repo=true" >> $GITHUB_OUTPUT
+            echo "is-public-repo=true" >> "$GITHUB_OUTPUT"
           else
-            echo "is-public-repo=false" >> $GITHUB_OUTPUT
+            echo "is-public-repo=false" >> "$GITHUB_OUTPUT"
           fi
 
   # ============================================================================
@@ -192,6 +198,217 @@ jobs:
           name: flapjack-server
           path: engine/target/debug/flapjack
           retention-days: 1
+
+  migration-import-contract:
+    name: Migration import contract
+    needs: check-repo
+    if: needs.check-repo.outputs.is-public-repo == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: engine
+      - name: Create dashboard dist stub (for RustEmbed)
+        working-directory: engine
+        run: mkdir -p dashboard/dist && echo '<html></html>' > dashboard/dist/index.html
+      - name: Build release server
+        working-directory: engine
+        run: cargo build --release --locked --package flapjack-server --features vector-search
+      - name: Run scheduled migration import oracle
+        env:
+          ALGOLIA_APP_ID: ${{ secrets.ALGOLIA_APP_ID }}
+          ALGOLIA_ADMIN_KEY: ${{ secrets.ALGOLIA_ADMIN_KEY }}
+        run: |
+          set -euo pipefail
+
+          require_secret() {
+            local name="$1"
+            local value="$2"
+            if [ -z "$value" ]; then
+              printf 'ERROR: required secret is not configured: %s\n' "$name" >&2
+              return 1
+            fi
+          }
+
+          algolia_request() {
+            local method="$1"
+            local path="$2"
+            local body="${3:-}"
+            local out="$4"
+            local body_file=""
+            if [ -n "$body" ]; then
+              body_file="$(mktemp "$RUNNER_TEMP/algolia-body.XXXXXX")"
+              chmod 600 "$body_file"
+              printf '%s' "$body" >"$body_file"
+            fi
+            {
+              printf 'silent\n'
+              printf 'show-error\n'
+              printf 'fail\n'
+              printf 'request = "%s"\n' "$method"
+              printf 'url = "https://%s.algolia.net%s"\n' "$ALGOLIA_APP_ID" "$path"
+              printf 'header = "x-algolia-application-id: %s"\n' "$ALGOLIA_APP_ID"
+              printf 'header = "x-algolia-api-key: %s"\n' "$ALGOLIA_ADMIN_KEY"
+              printf 'header = "content-type: application/json"\n'
+              if [ -n "$body_file" ]; then
+                printf 'data-binary = "@%s"\n' "$body_file"
+              fi
+            } | curl --config - >"$out"
+            [ -z "$body_file" ] || rm -f "$body_file"
+          }
+
+          wait_algolia_task() {
+            local index="$1"
+            local task_id="$2"
+            local out="$RUNNER_TEMP/algolia-task-${task_id}.json"
+            local status=""
+            for _ in $(seq 1 60); do
+              algolia_request GET "/1/indexes/${index}/task/${task_id}" "" "$out"
+              status="$(jq -r '.status // empty' "$out")"
+              [ "$status" = "published" ] && return 0
+              sleep 1
+            done
+            printf 'ERROR: Algolia task %s for %s did not publish; last status=%s\n' "$task_id" "$index" "$status" >&2
+            return 1
+          }
+
+          cleanup_source_index() {
+            local rc=$?
+            if [ -n "${SOURCE_INDEX:-}" ]; then
+              local cleanup_out="$RUNNER_TEMP/algolia-cleanup.json"
+              algolia_request DELETE "/1/indexes/${SOURCE_INDEX}" "" "$cleanup_out"
+              local cleanup_task_id
+              cleanup_task_id="$(jq -er '.taskID' "$cleanup_out")"
+              wait_algolia_task "$SOURCE_INDEX" "$cleanup_task_id"
+            fi
+            return "$rc"
+          }
+
+          require_secret ALGOLIA_APP_ID "$ALGOLIA_APP_ID"
+          require_secret ALGOLIA_ADMIN_KEY "$ALGOLIA_ADMIN_KEY"
+          SECRET_FILE="$RUNNER_TEMP/migration_import_contract.env"
+          ORACLE_LOG="$RUNNER_TEMP/migration-import-contract.log"
+          : >"$ORACLE_LOG"
+          SEEDED_OBJECT_COUNT=2
+          INDEX_PREFIX="fj_migration_import_${{ github.run_id }}_${{ github.run_attempt }}"
+          SOURCE_INDEX="${INDEX_PREFIX}_source"
+          TARGET_INDEX="${INDEX_PREFIX}_target"
+          trap cleanup_source_index EXIT
+
+          {
+            printf 'ALGOLIA_APP_ID=%s\n' "$ALGOLIA_APP_ID"
+            printf 'ALGOLIA_ADMIN_KEY=%s\n' "$ALGOLIA_ADMIN_KEY"
+          } >"$SECRET_FILE"
+          chmod 600 "$SECRET_FILE"
+
+          seed_payload="$(jq -nc '{
+            requests: [
+              {action: "addObject", body: {objectID: "scheduled-001", title: "Nightly migration import fixture one", category: "contract"}},
+              {action: "addObject", body: {objectID: "scheduled-002", title: "Nightly migration import fixture two", category: "contract"}}
+            ]
+          }')"
+          seed_out="$RUNNER_TEMP/algolia-seed.json"
+          algolia_request POST "/1/indexes/${SOURCE_INDEX}/batch" "$seed_payload" "$seed_out"
+          seed_task_id="$(jq -er '.taskID' "$seed_out")"
+          wait_algolia_task "$SOURCE_INDEX" "$seed_task_id"
+
+          count_out="$RUNNER_TEMP/algolia-source-count.json"
+          algolia_request POST "/1/indexes/${SOURCE_INDEX}/query" '{"query":"","hitsPerPage":0}' "$count_out"
+          source_count="$(jq -er '.nbHits' "$count_out")"
+          if [ "$source_count" != "$SEEDED_OBJECT_COUNT" ]; then
+            printf 'ERROR: expected %s seeded Algolia objects, found %s\n' "$SEEDED_OBJECT_COUNT" "$source_count" >&2
+            exit 1
+          fi
+
+          FLAPJACK_BIN="$PWD/engine/target/release/flapjack" bash engine/tests/migration_import_contract.sh --expect-mode importing --secret-file "$SECRET_FILE" --source-index "$SOURCE_INDEX" --target-index "$TARGET_INDEX" 2>&1 | tee "$ORACLE_LOG"
+          receipt="$(grep -E '^\{"mode":' "$ORACLE_LOG" | tail -1)"
+          jq -e --arg expected "objects.imported=${SEEDED_OBJECT_COUNT}" \
+            '.checks[] | select(.name == "migration_import" and .detail == $expected)' \
+            <<<"$receipt" >/dev/null
+      - name: Upload migration import oracle evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: migration-import-contract-evidence
+          path: |
+            ${{ runner.temp }}/migration-import-contract.log
+            /tmp/flapjack_migration_import_contract_evidence_*
+          retention-days: 14
+
+  migration-scale-contract:
+    name: Migration scale contract
+    needs: [check-repo, build-server]
+    if: needs.check-repo.outputs.is-public-repo == 'true' && github.event_name == 'workflow_dispatch' && inputs.run_migration_scale_contract == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Download server binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: flapjack-server
+          path: /tmp/flapjack
+      # dispatch-only isolation avoids repeated 20,000-document vendor work on the fast nightly path.
+      - name: Run opt-in migration scale oracle
+        env:
+          ALGOLIA_APP_ID: ${{ secrets.ALGOLIA_APP_ID }}
+          ALGOLIA_ADMIN_KEY: ${{ secrets.ALGOLIA_ADMIN_KEY }}
+        run: |
+          set -euo pipefail
+
+          require_secret() {
+            local name="$1"
+            local value="$2"
+            if [ -z "$value" ]; then
+              printf 'ERROR: required secret is not configured: %s\n' "$name" >&2
+              return 1
+            fi
+          }
+
+          require_secret ALGOLIA_APP_ID "$ALGOLIA_APP_ID"
+          require_secret ALGOLIA_ADMIN_KEY "$ALGOLIA_ADMIN_KEY"
+
+          SECRET_FILE="$RUNNER_TEMP/migration_scale_contract.env"
+          ORACLE_LOG="$RUNNER_TEMP/migration-scale-contract.log"
+          MIGRATION_IMPORT_CONTRACT_EVIDENCE_ROOT="$RUNNER_TEMP/migration-scale-contract-evidence"
+          export MIGRATION_IMPORT_CONTRACT_EVIDENCE_ROOT
+          mkdir -p "$MIGRATION_IMPORT_CONTRACT_EVIDENCE_ROOT"
+          {
+            printf 'ALGOLIA_APP_ID=%s\n' "$ALGOLIA_APP_ID"
+            printf 'ALGOLIA_ADMIN_KEY=%s\n' "$ALGOLIA_ADMIN_KEY"
+          } >"$SECRET_FILE"
+          chmod 600 "$SECRET_FILE"
+
+          chmod +x /tmp/flapjack/flapjack
+          oracle_status=0
+          FLAPJACK_BIN="/tmp/flapjack/flapjack" timeout --kill-after=60s 5400s bash engine/tests/migration_import_contract.sh --expect-mode scale --two-point --secret-file "$SECRET_FILE" 2>&1 | tee "$ORACLE_LOG" || oracle_status=$?
+
+          shopt -s globstar nullglob
+          receipts=( "$MIGRATION_IMPORT_CONTRACT_EVIDENCE_ROOT"/**/receipt.json )
+          [ "${#receipts[@]}" = "1" ] || {
+            printf 'ERROR: expected exactly one scale receipt, found %s\n' "${#receipts[@]}" >&2
+            exit 1
+          }
+          cp "${receipts[0]}" "$RUNNER_TEMP/migration-scale-contract-receipt.json"
+          jq -e '
+            .status == "pass"
+            and .scale.mode == "two-point"
+            and .scale.conditions == [2000,20000]
+            and (.checks | length) > 0
+            and all(.checks[]; .status != "fail")
+          ' "$RUNNER_TEMP/migration-scale-contract-receipt.json" >/dev/null
+          [ "$oracle_status" = "0" ]
+      - name: Upload migration scale oracle evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: migration-scale-contract-evidence
+          path: |
+            ${{ runner.temp }}/migration-scale-contract.log
+            ${{ runner.temp }}/migration-scale-contract-receipt.json
+            ${{ runner.temp }}/migration-scale-contract-evidence
+          retention-days: 14
 
   # ============================================================================
   # SDK TESTS (ALL VERSIONS)
@@ -539,17 +756,19 @@ jobs:
     steps:
       - name: Check test results
         run: |
-          echo "## Nightly Test Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- Rust tests: ${{ needs.rust-all-tests.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Installer tests: ${{ needs.installer-all.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Dashboard tests: ${{ needs.dashboard-all.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- PHP SDK: ${{ needs.sdk-php-all.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Python SDK: ${{ needs.sdk-python-all.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- JavaScript SDK: ${{ needs.sdk-javascript-all.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Go SDK unit: ${{ needs.sdk-go-all.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Go SDK e2e: ${{ needs.sdk-go-e2e.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Ruby SDK: ${{ needs.sdk-ruby-all.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Java SDK: ${{ needs.sdk-java-all.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- C# SDK: ${{ needs.sdk-csharp-all.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- WordPress: ${{ needs.integration-wordpress-all.result }}" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Nightly Test Results"
+            echo ""
+            echo "- Rust tests: ${{ needs.rust-all-tests.result }}"
+            echo "- Installer tests: ${{ needs.installer-all.result }}"
+            echo "- Dashboard tests: ${{ needs.dashboard-all.result }}"
+            echo "- PHP SDK: ${{ needs.sdk-php-all.result }}"
+            echo "- Python SDK: ${{ needs.sdk-python-all.result }}"
+            echo "- JavaScript SDK: ${{ needs.sdk-javascript-all.result }}"
+            echo "- Go SDK unit: ${{ needs.sdk-go-all.result }}"
+            echo "- Go SDK e2e: ${{ needs.sdk-go-e2e.result }}"
+            echo "- Ruby SDK: ${{ needs.sdk-ruby-all.result }}"
+            echo "- Java SDK: ${{ needs.sdk-java-all.result }}"
+            echo "- C# SDK: ${{ needs.sdk-csharp-all.result }}"
+            echo "- WordPress: ${{ needs.integration-wordpress-all.result }}"
+          } >> "$GITHUB_STEP_SUMMARY"

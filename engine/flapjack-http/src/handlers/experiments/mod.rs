@@ -139,8 +139,7 @@ pub async fn create_experiment(
     algolia_action_response(numeric_id, index_name)
 }
 
-/// Lists experiments with Algolia-compatible pagination and optional index name
-/// prefix/suffix filtering.
+/// Lists experiments with Algolia-compatible pagination and optional exact, prefix, or suffix index-name filtering.
 #[utoipa::path(
     get,
     path = "/2/abtests",
@@ -148,6 +147,7 @@ pub async fn create_experiment(
     params(
         ("offset" = Option<usize>, Query, description = "Pagination offset"),
         ("limit" = Option<usize>, Query, description = "Maximum number of experiments to return"),
+        ("indexName" = Option<String>, Query, description = "Filter experiments by exact index name"),
         ("indexPrefix" = Option<String>, Query, description = "Filter experiments by index name prefix"),
         ("indexSuffix" = Option<String>, Query, description = "Filter experiments by index name suffix")
     ),
@@ -172,7 +172,12 @@ pub async fn list_experiments(
 
     let mut experiments = store.list(None);
 
-    // Apply Algolia-style index prefix/suffix filters.
+    // Apply Algolia-style index filters. Exact, prefix, and suffix filters compose
+    // by intersection here, before numeric-ID pairing, so that `count`, `total`, and
+    // the missing-match `abtests: null` semantics are all computed from the filtered set.
+    if let Some(ref name) = params.index_name {
+        experiments.retain(|e| e.index_name == *name);
+    }
     if let Some(ref prefix) = params.index_prefix {
         experiments.retain(|e| e.index_name.starts_with(prefix.as_str()));
     }

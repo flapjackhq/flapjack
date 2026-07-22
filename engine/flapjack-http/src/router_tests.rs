@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode};
+use axum::http::{header, Method, Request, StatusCode};
 use flapjack::analytics::{AnalyticsCollector, AnalyticsConfig};
 use flapjack::index::manager::publication::{
     ContentDigest, PublicationGenerationEvidence, PublicationJournal, PublicationPaths,
@@ -12,16 +12,25 @@ use std::collections::HashMap;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-use crate::auth::KeyStore;
+use crate::auth::{ApiKey, KeyStore};
+use crate::handlers::dashboard::{dashboard_test_asset_bytes, dashboard_test_index_bytes};
 use crate::middleware::REQUEST_ID_HEADER_NAME;
+use crate::openapi::{DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS, DOCUMENTED_MEMBERSHIP_SCHEMA_NAMES};
+use crate::openapi_test_helpers::{
+    assert_add_peer_openapi_contract, assert_remove_peer_openapi_contract,
+};
 use crate::test_helpers::{
     body_json, build_test_router, send_empty_request, send_json_request, TestStateBuilder,
 };
 
 fn build_auth_test_app() -> (TempDir, axum::Router) {
+    build_auth_test_app_with_dashboard_policy(false)
+}
+
+fn build_auth_test_app_with_dashboard_policy(disable_dashboard: bool) -> (TempDir, axum::Router) {
     let tmp = TempDir::new().unwrap();
     let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
-    let app = build_test_router(&tmp, Some(key_store));
+    let app = build_test_router_with_dashboard_policy(&tmp, Some(key_store), disable_dashboard);
     (tmp, app)
 }
 
@@ -29,6 +38,76 @@ fn build_no_auth_test_app() -> (TempDir, axum::Router) {
     let tmp = TempDir::new().unwrap();
     let app = build_test_router(&tmp, None);
     (tmp, app)
+}
+
+fn build_test_router_with_dashboard_policy(
+    tmp: &TempDir,
+    key_store: Option<Arc<KeyStore>>,
+    disable_dashboard: bool,
+) -> axum::Router {
+    let state = TestStateBuilder::new(tmp).with_analytics().build_shared();
+    let analytics_config = AnalyticsConfig {
+        enabled: false,
+        data_dir: tmp.path().join("analytics"),
+        flush_interval_secs: 60,
+        flush_size: 1000,
+        retention_days: 30,
+    };
+    let analytics_collector = AnalyticsCollector::new(analytics_config);
+    let trusted_proxy_matcher =
+        Arc::new(crate::middleware::TrustedProxyMatcher::from_optional_csv(None).unwrap());
+
+    crate::router::build_router(
+        state,
+        key_store,
+        analytics_collector,
+        trusted_proxy_matcher,
+        tmp.path(),
+        crate::router::RouterConfig {
+            cors_mode: crate::startup::CorsMode::LoopbackOnly,
+            disable_dashboard,
+        },
+    )
+}
+
+#[tokio::test]
+async fn openapi_membership_contract_is_served_when_auth_is_enabled() {
+    let (_tmp, app) = build_auth_test_app();
+    let response = send_empty_request(&app, Method::GET, "/api-docs/openapi.json").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let document = body_json(response).await;
+    assert_add_peer_openapi_contract(&document);
+    assert_remove_peer_openapi_contract(&document);
+}
+
+#[tokio::test]
+async fn openapi_membership_contract_is_hidden_when_auth_is_disabled() {
+    let (_tmp, app) = build_no_auth_test_app();
+    let response = send_empty_request(&app, Method::GET, "/api-docs/openapi.json").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let document = body_json(response).await;
+    let paths = document
+        .get("paths")
+        .and_then(|value| value.as_object())
+        .expect("served OpenAPI must have paths");
+
+    for path in DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS {
+        assert!(
+            !paths.contains_key(path),
+            "no-auth router should not serve OpenAPI for unavailable path {path}"
+        );
+    }
+
+    for schema in DOCUMENTED_MEMBERSHIP_SCHEMA_NAMES {
+        assert!(
+            document
+                .pointer(&format!("/components/schemas/{schema}"))
+                .is_none(),
+            "no-auth router should not serve unused membership schema {schema}"
+        );
+    }
 }
 
 fn build_no_auth_router_for_state(
@@ -51,8 +130,11 @@ fn build_no_auth_router_for_state(
         None,
         analytics_collector,
         trusted_proxy_matcher,
-        crate::startup::CorsMode::LoopbackOnly,
         tmp.path(),
+        crate::router::RouterConfig {
+            cors_mode: crate::startup::CorsMode::LoopbackOnly,
+            disable_dashboard: false,
+        },
     )
 }
 
@@ -150,6 +232,25 @@ fn search_only_key_value(key_store: &KeyStore) -> String {
         .value
 }
 
+fn create_test_key_with_acl(key_store: &KeyStore, acl: &str) -> String {
+    let key = ApiKey {
+        hash: String::new(),
+        salt: String::new(),
+        hmac_key: None,
+        created_at: 0,
+        acl: vec![acl.to_string()],
+        description: format!("{acl} test key"),
+        indexes: vec![],
+        max_hits_per_query: 0,
+        max_queries_per_ip_per_hour: 0,
+        query_parameters: String::new(),
+        referers: vec![],
+        restrict_sources: None,
+        validity: 0,
+    };
+    key_store.create_key(key).1
+}
+
 async fn assert_invalid_credentials_response(resp: axum::response::Response) {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert_eq!(
@@ -193,14 +294,43 @@ async fn post_json(
         .unwrap()
 }
 
+async fn get_request(
+    app: &axum::Router,
+    uri: &str,
+    api_key: Option<&str>,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method("GET").uri(uri);
+    if let Some(api_key) = api_key {
+        builder = builder
+            .header("x-algolia-api-key", api_key)
+            .header("x-algolia-application-id", "route-contract-app");
+    }
+    app.clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
+    axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec()
+}
+
 #[tokio::test]
 async fn migration_routes_preserve_admin_contract() {
     let tmp = TempDir::new().unwrap();
     let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
     let search_key = search_only_key_value(&key_store);
+    let write_key = create_test_key_with_acl(&key_store, "addObject");
     let app = build_test_router(&tmp, Some(key_store));
 
-    for path in ["/1/migrate-from-algolia", "/1/algolia-list-indexes"] {
+    for path in [
+        "/1/migrate-from-algolia",
+        "/1/algolia-list-indexes",
+        "/1/migrations/algolia",
+    ] {
         let valid_payload = if path == "/1/migrate-from-algolia" {
             serde_json::json!({
                 "appId": "APPID",
@@ -221,6 +351,58 @@ async fn migration_routes_preserve_admin_contract() {
         let non_admin = post_json(&app, path, Some(&search_key), valid_payload).await;
         assert_method_not_allowed_response(non_admin).await;
     }
+
+    let status_path = "/1/migrations/algolia/01890f8e-8b28-78e8-b542-8cfdcb2d4f24";
+    let missing_auth = get_request(&app, status_path, None).await;
+    assert_invalid_credentials_response(missing_auth).await;
+    for api_key in [&search_key, &write_key] {
+        let non_admin = get_request(&app, status_path, Some(api_key)).await;
+        assert_method_not_allowed_response(non_admin).await;
+    }
+    let cancel_path = "/1/migrations/algolia/01890f8e-8b28-78e8-b542-8cfdcb2d4f24/cancel";
+    let cancel_missing_auth = post_json(&app, cancel_path, None, serde_json::json!({})).await;
+    assert_invalid_credentials_response(cancel_missing_auth).await;
+    for api_key in [&search_key, &write_key] {
+        let non_admin = post_json(&app, cancel_path, Some(api_key), serde_json::json!({})).await;
+        assert_method_not_allowed_response(non_admin).await;
+    }
+    let cancel_missing_job =
+        post_json(&app, cancel_path, Some("admin-key"), serde_json::json!({})).await;
+    assert_eq!(cancel_missing_job.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        body_json(cancel_missing_job).await,
+        serde_json::json!({
+            "message": "Migration job not found",
+            "status": 404,
+            "code": "migration_job_not_found"
+        })
+    );
+    let post_missing_auth = post_json(
+        &app,
+        "/1/migrations/algolia",
+        None,
+        serde_json::json!({
+            "appId": "APPID",
+            "apiKey": "source-key",
+            "sourceIndex": "products",
+            "targetIndex": "products_copy"
+        }),
+    )
+    .await;
+    assert_invalid_credentials_response(post_missing_auth).await;
+    let post_write_only = post_json(
+        &app,
+        "/1/migrations/algolia",
+        Some(&write_key),
+        serde_json::json!({
+            "appId": "APPID",
+            "apiKey": "source-key",
+            "sourceIndex": "products",
+            "targetIndex": "products_copy"
+        }),
+    )
+    .await;
+    assert_method_not_allowed_response(post_write_only).await;
 
     let migrate_validation = post_json(
         &app,
@@ -305,14 +487,7 @@ async fn dashboard_route_is_public_and_serves_html() {
         "expected dashboard route to return HTML, got: {content_type}"
     );
 
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(
-        html.contains("<html"),
-        "dashboard body should contain HTML markup"
-    );
+    assert_eq!(body_bytes(resp).await, dashboard_test_index_bytes());
 }
 
 #[tokio::test]
@@ -332,14 +507,7 @@ async fn dashboard_trailing_slash_route_is_public_and_serves_html() {
         "expected dashboard trailing slash route to return HTML, got: {content_type}"
     );
 
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(
-        html.contains("<html"),
-        "dashboard trailing slash body should contain HTML markup"
-    );
+    assert_eq!(body_bytes(resp).await, dashboard_test_index_bytes());
 }
 
 #[tokio::test]
@@ -349,14 +517,73 @@ async fn dashboard_spa_fallback_route_is_public() {
     let resp = send_empty_request(&app, Method::GET, "/dashboard/settings/profile").await;
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(
-        html.contains("<html"),
-        "SPA fallback should return index HTML"
-    );
+    assert_eq!(body_bytes(resp).await, dashboard_test_index_bytes());
+}
+
+#[tokio::test]
+async fn dashboard_spa_fallback_serves_index_for_dotted_route_with_trailing_path() {
+    let (_tmp, app) = build_auth_test_app();
+
+    // Index names may legally contain dots and must remain SPA client routes.
+    let resp = send_empty_request(&app, Method::GET, "/dashboard/indexes/my.index/settings").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    assert_eq!(body_bytes(resp).await, dashboard_test_index_bytes());
+}
+
+#[tokio::test]
+async fn dashboard_spa_fallback_serves_index_for_dot_in_final_segment() {
+    let (_tmp, app) = build_auth_test_app();
+
+    let resp = send_empty_request(&app, Method::GET, "/dashboard/indexes/my.index").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    assert_eq!(body_bytes(resp).await, dashboard_test_index_bytes());
+}
+
+#[tokio::test]
+async fn dashboard_non_public_embedded_artifact_falls_back_to_index() {
+    let (_tmp, app) = build_auth_test_app();
+
+    let resp = send_empty_request(&app, Method::GET, "/dashboard/stats.html").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_bytes(resp).await, dashboard_test_index_bytes());
+}
+
+#[tokio::test]
+async fn dashboard_assets_prefix_cannot_traverse_to_non_public_artifact() {
+    let (_tmp, app) = build_auth_test_app();
+
+    for path in [
+        "/dashboard/assets/../stats.html",
+        "/dashboard/assets/..\\stats.html",
+    ] {
+        let resp = send_empty_request(&app, Method::GET, path).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "path: {path}");
+    }
+}
+
+#[tokio::test]
+async fn dashboard_missing_asset_under_assets_prefix_returns_404() {
+    let (_tmp, app) = build_auth_test_app();
+
+    // Missing content-hashed Vite assets are real 404s, not SPA fallbacks.
+    let resp =
+        send_empty_request(&app, Method::GET, "/dashboard/assets/index-DOESNOTEXIST.js").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn dashboard_root_static_file_returns_expected_static_result() {
+    let (_tmp, app) = build_auth_test_app();
+
+    // Real dashboard builds embed public files; fallback builds may not.
+    let expected_status = match dashboard_test_asset_bytes("favicon.ico") {
+        Some(_) => StatusCode::OK,
+        None => StatusCode::NOT_FOUND,
+    };
+    let resp = send_empty_request(&app, Method::GET, "/dashboard/favicon.ico").await;
+    assert_eq!(resp.status(), expected_status);
 }
 
 #[tokio::test]
@@ -365,6 +592,59 @@ async fn dashboard_prefix_without_separator_is_not_public() {
 
     let resp = send_empty_request(&app, Method::GET, "/dashboard-admin").await;
     assert_invalid_credentials_response(resp).await;
+}
+
+#[tokio::test]
+async fn dashboard_routes_follow_lockdown_policy() {
+    let (_tmp, locked_app) = build_auth_test_app_with_dashboard_policy(true);
+
+    for path in [
+        "/dashboard",
+        "/dashboard/",
+        "/dashboard/settings",
+        "/swagger-ui",
+        "/swagger-ui/",
+        "/api-docs/openapi.json",
+    ] {
+        let resp = send_empty_request(&locked_app, Method::GET, path).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "path: {path}");
+    }
+
+    for path in ["/health", "/health/ready"] {
+        let resp = send_empty_request(&locked_app, Method::GET, path).await;
+        assert_eq!(resp.status(), StatusCode::OK, "path: {path}");
+    }
+
+    let acme = send_empty_request(
+        &locked_app,
+        Method::GET,
+        "/.well-known/acme-challenge/token-123",
+    )
+    .await;
+    assert_eq!(acme.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        body_json(acme).await,
+        serde_json::json!({
+            "message": "Challenge not found",
+            "status": 404
+        })
+    );
+
+    let near_prefix = send_empty_request(&locked_app, Method::GET, "/dashboard-admin").await;
+    assert_invalid_credentials_response(near_prefix).await;
+
+    let (_tmp, default_app) = build_auth_test_app_with_dashboard_policy(false);
+    for path in ["/dashboard", "/swagger-ui/", "/api-docs/openapi.json"] {
+        let resp = send_empty_request(&default_app, Method::GET, path).await;
+        assert_eq!(resp.status(), StatusCode::OK, "path: {path}");
+    }
+
+    let swagger_redirect = send_empty_request(&default_app, Method::GET, "/swagger-ui").await;
+    assert_eq!(swagger_redirect.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        swagger_redirect.headers().get(header::LOCATION),
+        Some(&header::HeaderValue::from_static("/swagger-ui/"))
+    );
 }
 
 #[tokio::test]
@@ -454,6 +734,19 @@ async fn internal_replication_routes_remain_available_when_auth_disabled() {
         cluster_status.status(),
         StatusCode::OK,
         "no-auth mode must still expose /internal/cluster/status for HA checks"
+    );
+
+    let add_peer = send_json_request(
+        &app,
+        Method::POST,
+        "/internal/cluster/peers",
+        serde_json::json!({"node_id": "", "addr": "not-an-origin"}),
+    )
+    .await;
+    assert_eq!(
+        add_peer.status(),
+        StatusCode::NOT_FOUND,
+        "no-auth mode must not expose runtime membership mutation"
     );
 
     // Route-availability probe: malformed tenant IDs must reach handler validation

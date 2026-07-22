@@ -3,6 +3,8 @@ pub mod ai_provider;
 pub mod analytics_cluster;
 pub mod auth;
 pub mod conversation_store;
+#[cfg(test)]
+mod dashboard_build;
 pub mod dto;
 pub mod filter_parser;
 pub mod geoip;
@@ -26,6 +28,7 @@ pub mod startup_catchup;
 pub(crate) mod tenant_dirs;
 
 pub mod background_tasks;
+pub(crate) mod usage_capture;
 pub mod usage_middleware;
 pub mod usage_persistence;
 

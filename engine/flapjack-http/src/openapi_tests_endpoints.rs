@@ -22,24 +22,39 @@ fn migration_endpoints_are_documented() {
 
     assert_path_exists(&doc, "/1/migrate-from-algolia");
     assert_path_method(&doc, "/1/migrate-from-algolia", "post");
-    assert_migration_operation_uses_api_key(&doc, "/1/migrate-from-algolia");
+    assert_migration_operation_uses_api_key(&doc, "/1/migrate-from-algolia", "post");
     assert_migration_post_documents_admission_refusals(&doc);
+
+    assert_path_exists(&doc, "/1/migrations/algolia");
+    assert_path_method(&doc, "/1/migrations/algolia", "post");
+    assert_migration_operation_uses_api_key(&doc, "/1/migrations/algolia", "post");
+    assert_async_migration_post_documents_contract(&doc);
+
+    assert_path_exists(&doc, "/1/migrations/algolia/{job_id}");
+    assert_path_method(&doc, "/1/migrations/algolia/{job_id}", "get");
+    assert_migration_operation_uses_api_key(&doc, "/1/migrations/algolia/{job_id}", "get");
+    assert_async_migration_get_documents_contract(&doc);
+
+    assert_path_exists(&doc, "/1/migrations/algolia/{job_id}/cancel");
+    assert_path_method(&doc, "/1/migrations/algolia/{job_id}/cancel", "post");
+    assert_migration_operation_uses_api_key(&doc, "/1/migrations/algolia/{job_id}/cancel", "post");
+    assert_async_migration_cancel_documents_contract(&doc);
 
     assert_path_exists(&doc, "/1/algolia-list-indexes");
     assert_path_method(&doc, "/1/algolia-list-indexes", "post");
-    assert_migration_operation_uses_api_key(&doc, "/1/algolia-list-indexes");
+    assert_migration_operation_uses_api_key(&doc, "/1/algolia-list-indexes", "post");
 }
 
-fn assert_migration_operation_uses_api_key(doc: &serde_json::Value, path: &str) {
+fn assert_migration_operation_uses_api_key(doc: &serde_json::Value, path: &str, method: &str) {
     let escaped_path = path.replace('/', "~1");
     let security = doc
-        .pointer(&format!("/paths/{escaped_path}/post/security"))
+        .pointer(&format!("/paths/{escaped_path}/{method}/security"))
         .and_then(|value| value.as_array())
-        .unwrap_or_else(|| panic!("{path} POST should document operation security"));
+        .unwrap_or_else(|| panic!("{path} {method} should document operation security"));
 
     assert!(
         security.iter().any(|entry| entry.get("api_key").is_some()),
-        "{path} POST should require api_key security in OpenAPI"
+        "{path} {method} should require api_key security in OpenAPI"
     );
 }
 
@@ -49,14 +64,12 @@ fn assert_migration_post_documents_admission_refusals(doc: &serde_json::Value) {
         .and_then(|value| value.as_object())
         .expect("migration POST should document responses");
 
-    assert!(
-        responses.contains_key("400"),
-        "migration POST should keep invalid-request 400 response"
-    );
-    assert!(
-        responses.contains_key("503"),
-        "migration POST should document admission refusals"
-    );
+    for status in ["200", "400", "409", "502", "503"] {
+        assert!(
+            responses.contains_key(status),
+            "migration POST should document restored {status} response"
+        );
+    }
     let description = responses
         .get("503")
         .and_then(|response| response.get("description"))
@@ -67,16 +80,94 @@ fn assert_migration_post_documents_admission_refusals(doc: &serde_json::Value) {
         "migration POST 503 should document HA refusal code"
     );
     assert!(
-        description.contains("migration_import_unavailable"),
-        "migration POST 503 should document import-unavailable refusal code"
+        !description.contains("migration_import_unavailable"),
+        "migration POST 503 should not document removed import-unavailable refusal code"
     );
+}
 
-    for stale_status in ["200", "409", "502"] {
+fn assert_async_migration_post_documents_contract(doc: &serde_json::Value) {
+    let responses = doc
+        .pointer("/paths/~11~1migrations~1algolia/post/responses")
+        .and_then(|value| value.as_object())
+        .expect("async migration POST should document responses");
+
+    for status in ["202", "400", "500", "502", "503"] {
         assert!(
-            !responses.contains_key(stale_status),
-            "migration POST should not document unreachable {stale_status} response while import is unavailable"
+            responses.contains_key(status),
+            "async migration POST should document {status} response"
         );
     }
+    assert_eq!(
+        doc.pointer("/paths/~11~1migrations~1algolia/post/responses/202/content/application~1json/schema/$ref")
+            .and_then(|value| value.as_str()),
+        Some("#/components/schemas/AsyncMigrationStatusResponse")
+    );
+}
+
+fn assert_async_migration_get_documents_contract(doc: &serde_json::Value) {
+    let responses = doc
+        .pointer("/paths/~11~1migrations~1algolia~1{job_id}/get/responses")
+        .and_then(|value| value.as_object())
+        .expect("async migration GET should document responses");
+
+    for status in ["200", "400", "404", "500"] {
+        assert!(
+            responses.contains_key(status),
+            "async migration GET should document {status} response"
+        );
+    }
+    assert_eq!(
+        doc.pointer("/paths/~11~1migrations~1algolia~1{job_id}/get/responses/200/content/application~1json/schema/$ref")
+            .and_then(|value| value.as_str()),
+        Some("#/components/schemas/AsyncMigrationStatusResponse")
+    );
+
+    let parameters = doc
+        .pointer("/paths/~11~1migrations~1algolia~1{job_id}/get/parameters")
+        .and_then(|value| value.as_array())
+        .expect("async migration GET should document parameters");
+    let job_id = parameters
+        .iter()
+        .find(|parameter| parameter.get("name").and_then(|value| value.as_str()) == Some("job_id"))
+        .expect("async migration GET should document job_id path parameter");
+    assert_eq!(
+        job_id.get("in").and_then(|value| value.as_str()),
+        Some("path")
+    );
+    assert_eq!(
+        job_id
+            .pointer("/schema/format")
+            .and_then(|value| value.as_str()),
+        Some("uuid")
+    );
+}
+
+fn assert_async_migration_cancel_documents_contract(doc: &serde_json::Value) {
+    let responses = doc
+        .pointer("/paths/~11~1migrations~1algolia~1{job_id}~1cancel/post/responses")
+        .and_then(|value| value.as_object())
+        .expect("async migration cancel POST should document responses");
+
+    for status in ["200", "400", "404", "409", "500"] {
+        assert!(
+            responses.contains_key(status),
+            "async migration cancel POST should document {status} response"
+        );
+    }
+    assert_eq!(
+        doc.pointer("/paths/~11~1migrations~1algolia~1{job_id}~1cancel/post/responses/200/content/application~1json/schema/$ref")
+            .and_then(|value| value.as_str()),
+        Some("#/components/schemas/AsyncMigrationStatusResponse")
+    );
+    let conflict_description = responses
+        .get("409")
+        .and_then(|response| response.get("description"))
+        .and_then(serde_json::Value::as_str)
+        .expect("async migration cancel 409 should have a description");
+    assert!(
+        conflict_description.contains("cancel_too_late"),
+        "async migration cancel 409 should document cancel_too_late"
+    );
 }
 
 /// Stage 7: Verify usage endpoints appear in the generated spec.
@@ -417,25 +508,27 @@ fn health_endpoint_has_no_security_requirement() {
     }
 }
 
-/// Security review: no `/internal/*` paths should appear in the public OpenAPI spec.
-/// Internal endpoints are intentionally excluded from `ApiDoc` to avoid accidental exposure.
+/// Security review: only runtime membership management may appear under `/internal/*`.
 #[test]
-fn no_internal_paths_in_openapi_spec() {
+fn openapi_membership_paths_are_the_only_documented_internal_contracts() {
     let doc = openapi_json();
     let paths = doc
         .get("paths")
         .and_then(|p| p.as_object())
         .expect("spec must have paths");
 
-    let internal_paths: Vec<&String> = paths
+    let unexpected_internal_paths: Vec<&String> = paths
         .keys()
-        .filter(|k| k.starts_with("/internal/"))
+        .filter(|path| {
+            path.starts_with("/internal/")
+                && !crate::openapi::DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS.contains(&path.as_str())
+        })
         .collect();
 
     assert!(
-        internal_paths.is_empty(),
-        "internal paths must not appear in public spec, found: {:?}",
-        internal_paths
+        unexpected_internal_paths.is_empty(),
+        "only membership internal paths may appear in the public spec, found: {:?}",
+        unexpected_internal_paths
     );
 }
 

@@ -364,19 +364,34 @@ if ( ! class_exists( 'WP_Query' ) ) {
             $post_status   = $this->query_vars['post_status'] ?? 'publish';
             $per_page      = (int) ( $this->query_vars['posts_per_page'] ?? 10 );
             $paged         = max( 1, (int) ( $this->query_vars['paged'] ?? 1 ) );
+            // Keyset cursor: production honors this via a posts_where filter that
+            // appends `AND ID > flapjack_after_id`; the stub applies it directly
+            // so unit tests exercise the same seek-by-ID query contract.
+            $after_id      = (int) ( $this->query_vars['flapjack_after_id'] ?? 0 );
 
             // Filter posts from the store.
-            $matching = array_filter( $wp_posts_store, function ( $p ) use ( $post_types, $post_status ) {
+            $matching = array_filter( $wp_posts_store, function ( $p ) use ( $post_types, $post_status, $after_id ) {
                 if ( ! in_array( $p->post_type, $post_types, true ) ) {
                     return false;
                 }
                 if ( $post_status !== 'any' && $p->post_status !== $post_status ) {
                     return false;
                 }
+                if ( $after_id > 0 && (int) $p->ID <= $after_id ) {
+                    return false;
+                }
                 return true;
             } );
 
             $matching = array_values( $matching );
+
+            // Keyset enumeration relies on a stable ascending ID order.
+            if ( ( $this->query_vars['orderby'] ?? '' ) === 'ID' ) {
+                usort( $matching, fn( $a, $b ) => (int) $a->ID <=> (int) $b->ID );
+                if ( strtoupper( (string) ( $this->query_vars['order'] ?? 'ASC' ) ) === 'DESC' ) {
+                    $matching = array_reverse( $matching );
+                }
+            }
             $this->found_posts = count( $matching );
             $this->max_num_pages = $per_page > 0 ? (int) ceil( $this->found_posts / $per_page ) : 1;
 

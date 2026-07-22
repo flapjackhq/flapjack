@@ -10,6 +10,7 @@ declare(strict_types=1);
 namespace Flapjack\WordPress\Indexing;
 
 use Flapjack\WordPress\ClientFactory;
+use Flapjack\WordPress\Status\FailureReporter;
 
 class PostSyncHooks {
 
@@ -122,10 +123,17 @@ class PostSyncHooks {
         try {
             $this->index_manager->index_post( $post );
         } catch ( \Throwable $e ) {
-            // Log the error but don't break the post save flow.
-            if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-                error_log( sprintf( '[Flapjack Search] Failed to sync post %d: %s', $post->ID, $e->getMessage() ) );
-            }
+            // Persist the failure durably so it stays visible in status/admin
+            // instead of being observable only through WP_DEBUG. The post save
+            // flow must not break, so we swallow after recording.
+            FailureReporter::record( $e, [
+                'operation'  => 'index_post',
+                'source'     => 'post_sync',
+                'post_id'    => $post->ID,
+                'index_name' => $this->client_factory->get_index_name(),
+            ] );
+
+            $this->log_latest_failure( sprintf( '[Flapjack Search] Failed to sync post %d: ', $post->ID ) );
         }
     }
 
@@ -140,10 +148,35 @@ class PostSyncHooks {
         try {
             $this->index_manager->delete_post( $post_id );
         } catch ( \Throwable $e ) {
-            if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-                error_log( sprintf( '[Flapjack Search] Failed to delete post %d from index: %s', $post_id, $e->getMessage() ) );
-            }
+            // Persist the failure durably so a delete that fails during a
+            // WordPress delete/trash flow stays visible in status/admin. The
+            // delete flow must not break, so we swallow after recording.
+            FailureReporter::record( $e, [
+                'operation'  => 'delete_post',
+                'source'     => 'post_sync',
+                'post_id'    => $post_id,
+                'index_name' => $this->client_factory->get_index_name(),
+            ] );
+
+            $this->log_latest_failure( sprintf( '[Flapjack Search] Failed to delete post %d from index: ', $post_id ) );
         }
+    }
+
+    /**
+     * Log the canonical sanitized failure message when WordPress debug logging
+     * is enabled.
+     */
+    private function log_latest_failure( string $prefix ): void {
+        if ( ! defined( 'WP_DEBUG' ) || ! WP_DEBUG ) {
+            return;
+        }
+
+        $failure = FailureReporter::latest();
+        $message = is_array( $failure ) && isset( $failure['message'] )
+            ? (string) $failure['message']
+            : 'Indexing failed.';
+
+        error_log( $prefix . $message );
     }
 
     /**
