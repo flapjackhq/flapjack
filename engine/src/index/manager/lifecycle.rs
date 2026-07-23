@@ -53,6 +53,7 @@ impl super::IndexManager {
                     &custom_normalization,
                 )?,
             );
+            self.get_or_create_write_queue(tenant_id, &index)?;
             self.cache_loaded_index(tenant_id, index);
             #[cfg(feature = "vector-search")]
             self.load_vector_index(tenant_id, &path);
@@ -130,6 +131,7 @@ impl super::IndexManager {
             let _ = handle.await;
         }
 
+        self.admission_stores.remove(tenant_id);
         self.clear_tenant_runtime_state(tenant_id);
 
         let path = self.base_path.join(tenant_id);

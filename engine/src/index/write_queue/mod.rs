@@ -1,11 +1,14 @@
+pub(crate) mod admission;
 mod finalization;
 mod vectors;
 
 pub(crate) use finalization::PERSISTED_VECTORS_DIR;
 
 use crate::types::{DocFailure, Document, TaskInfo, TaskStatus};
+use admission::{reconcile_records, WriteAdmissionRecord, WriteAdmissionStore};
 use once_cell::sync::Lazy;
 use prometheus::{core::Collector, proto::MetricFamily, HistogramOpts, HistogramVec};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -16,12 +19,16 @@ use tokio::time::timeout_at;
 // docs/reference/research/pl10_write_bottleneck_20260528T033040Z_classification.md)
 // shows commit_writer_with_panic_guard nested inside commit_batch consuming
 // ~90% of in-batch wall time; WRITE_QUEUE_FLUSH_INTERVAL still caps tail
-// latency and WRITE_QUEUE_CHANNEL_CAPACITY still gates QueueFull admission.
+// latency and the resolved write queue channel capacity still gates QueueFull admission.
 const DEFAULT_WRITE_QUEUE_BATCH_SIZE: usize = 32;
 // Canonical runtime config key for write queue batching behavior.
 const WRITE_QUEUE_BATCH_SIZE_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_BATCH_SIZE";
+const DEFAULT_WRITER_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+const WRITER_ACQUIRE_TIMEOUT_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_MS";
 const WRITE_QUEUE_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
-const WRITE_QUEUE_CHANNEL_CAPACITY: usize = 2_000;
+const DEFAULT_WRITE_QUEUE_CHANNEL_CAPACITY: usize = 2_000;
+const WRITE_QUEUE_CHANNEL_CAPACITY_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_CHANNEL_CAPACITY";
+const WRITE_QUEUE_START_DELAY_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_START_DELAY_MS";
 const WRITE_QUEUE_PHASE_METRIC_NAME: &str = "flapjack_write_queue_phase_seconds";
 const WRITE_QUEUE_PHASE_METRIC_HELP: &str = "Write queue phase execution time in seconds";
 
@@ -82,6 +89,77 @@ fn write_queue_batch_size() -> usize {
     }
 }
 
+fn writer_acquire_timeout() -> Duration {
+    match std::env::var(WRITER_ACQUIRE_TIMEOUT_ENV_VAR) {
+        Ok(raw_value) => match raw_value.parse::<u64>() {
+            Ok(parsed) if parsed > 0 => Duration::from_millis(parsed),
+            Ok(_) => {
+                tracing::warn!(
+                    "{} must be greater than 0; falling back to {:?}",
+                    WRITER_ACQUIRE_TIMEOUT_ENV_VAR,
+                    DEFAULT_WRITER_ACQUIRE_TIMEOUT
+                );
+                DEFAULT_WRITER_ACQUIRE_TIMEOUT
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "failed to parse {}='{}' as milliseconds: {}; falling back to {:?}",
+                    WRITER_ACQUIRE_TIMEOUT_ENV_VAR,
+                    raw_value,
+                    error,
+                    DEFAULT_WRITER_ACQUIRE_TIMEOUT
+                );
+                DEFAULT_WRITER_ACQUIRE_TIMEOUT
+            }
+        },
+        Err(_) => DEFAULT_WRITER_ACQUIRE_TIMEOUT,
+    }
+}
+
+fn write_queue_channel_capacity() -> usize {
+    match std::env::var(WRITE_QUEUE_CHANNEL_CAPACITY_ENV_VAR) {
+        Ok(raw_value) => match raw_value.parse::<usize>() {
+            Ok(parsed) if parsed > 0 => parsed,
+            Ok(_) => {
+                tracing::warn!(
+                    "{} must be greater than 0; falling back to default {}",
+                    WRITE_QUEUE_CHANNEL_CAPACITY_ENV_VAR,
+                    DEFAULT_WRITE_QUEUE_CHANNEL_CAPACITY
+                );
+                DEFAULT_WRITE_QUEUE_CHANNEL_CAPACITY
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "failed to parse {}='{}' as usize: {}; falling back to default {}",
+                    WRITE_QUEUE_CHANNEL_CAPACITY_ENV_VAR,
+                    raw_value,
+                    error,
+                    DEFAULT_WRITE_QUEUE_CHANNEL_CAPACITY
+                );
+                DEFAULT_WRITE_QUEUE_CHANNEL_CAPACITY
+            }
+        },
+        Err(_) => DEFAULT_WRITE_QUEUE_CHANNEL_CAPACITY,
+    }
+}
+
+fn write_queue_start_delay() -> Option<Duration> {
+    let raw_value = std::env::var(WRITE_QUEUE_START_DELAY_ENV_VAR).ok()?;
+    match raw_value.parse::<u64>() {
+        Ok(0) => None,
+        Ok(parsed) => Some(Duration::from_millis(parsed)),
+        Err(error) => {
+            tracing::warn!(
+                "failed to parse {}='{}' as milliseconds: {}; ignoring start delay",
+                WRITE_QUEUE_START_DELAY_ENV_VAR,
+                raw_value,
+                error
+            );
+            None
+        }
+    }
+}
+
 pub fn gather_write_queue_phase_metric_families() -> Vec<MetricFamily> {
     WRITE_QUEUE_PHASE_SECONDS
         .collect()
@@ -92,6 +170,7 @@ pub fn gather_write_queue_phase_metric_families() -> Vec<MetricFamily> {
 
 /// Vector search context for the write queue.
 /// When `vector-search` feature is disabled, this is a zero-sized type.
+#[derive(Clone)]
 pub(crate) struct VectorWriteContext {
     #[cfg(feature = "vector-search")]
     pub vector_indices:
@@ -115,6 +194,7 @@ impl VectorWriteContext {
 }
 
 /// Shared context for write-queue lifecycle functions.
+#[derive(Clone)]
 pub(crate) struct WriteQueueContext {
     pub tenant_id: String,
     pub index: Arc<crate::index::Index>,
@@ -123,11 +203,13 @@ pub(crate) struct WriteQueueContext {
     pub tasks: Arc<dashmap::DashMap<String, TaskInfo>>,
     pub base_path: std::path::PathBuf,
     pub oplog: Option<Arc<crate::index::oplog::OpLog>>,
+    pub admission_store: Arc<WriteAdmissionStore>,
     pub facet_cache: super::FacetCacheMap,
     pub lww_map: super::LwwMap,
     pub vector_ctx: VectorWriteContext,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WriteAction {
     Add(Document),
     Upsert(Document),
@@ -140,6 +222,7 @@ pub enum WriteAction {
     Compact,
 }
 
+#[derive(Debug, Clone)]
 pub struct WriteOp {
     pub task_id: String,
     pub actions: Vec<WriteAction>,
@@ -224,6 +307,7 @@ struct WriteFinalizationContext<'a> {
     tasks: &'a Arc<dashmap::DashMap<String, TaskInfo>>,
     base_path: &'a std::path::Path,
     oplog: Option<&'a Arc<crate::index::oplog::OpLog>>,
+    admission_store: &'a Arc<WriteAdmissionStore>,
     facet_cache: &'a super::FacetCacheMap,
     lww_map: &'a super::LwwMap,
     #[cfg(feature = "vector-search")]
@@ -251,11 +335,11 @@ struct WriteFinalizationContext<'a> {
 /// A `(WriteQueue, JoinHandle)` tuple: the channel sender for submitting `WriteOp`s and the spawned task handle.
 pub(crate) fn create_write_queue(
     ctx: WriteQueueContext,
-) -> (
+) -> crate::error::Result<(
     WriteQueue,
     tokio::task::JoinHandle<crate::error::Result<()>>,
-) {
-    let (tx, rx) = mpsc::channel(WRITE_QUEUE_CHANNEL_CAPACITY);
+)> {
+    let (tx, rx) = mpsc::channel(write_queue_channel_capacity());
 
     if let Some(ref ol) = ctx.oplog {
         tracing::info!(
@@ -264,10 +348,70 @@ pub(crate) fn create_write_queue(
             ol.current_seq()
         );
     }
+    let committed_seq =
+        crate::index::oplog::read_committed_seq(ctx.base_path.join(&ctx.tenant_id).as_path());
+    let applied_task_ids = ctx
+        .oplog
+        .as_ref()
+        .map(|oplog| oplog.committed_task_ids(committed_seq))
+        .transpose()?
+        .unwrap_or_default();
+    let replay_records = reconcile_records(ctx.admission_store.as_ref(), &applied_task_ids)?;
+    for record in &replay_records {
+        let task = record.task_info();
+        ctx.tasks.insert(task.id.clone(), task.clone());
+        ctx.tasks.insert(task.numeric_id.to_string(), task);
+    }
+    run_replay_startup(&ctx, replay_records)?;
 
-    let handle = tokio::spawn(async move { process_writes(ctx, rx).await });
+    let handle = tokio::spawn(async move { process_writes(ctx, rx, Vec::new()).await });
 
-    (tx, handle)
+    Ok((tx, handle))
+}
+
+fn run_replay_startup(
+    ctx: &WriteQueueContext,
+    replay_records: Vec<WriteAdmissionRecord>,
+) -> crate::error::Result<()> {
+    if replay_records.is_empty() {
+        return Ok(());
+    }
+
+    let ctx = ctx.clone();
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let thread = std::thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                crate::error::FlapjackError::Tantivy(format!(
+                    "failed to create write replay runtime: {error}"
+                ))
+            })
+            .and_then(|runtime| {
+                runtime.block_on(async move {
+                    let mut pending = Vec::new();
+                    let resolved_batch_size = write_queue_batch_size();
+                    replay_admitted_writes(&ctx, &mut pending, replay_records, resolved_batch_size)
+                        .await?;
+                    if !pending.is_empty() {
+                        flush_pending_batch(&ctx, &mut pending).await?;
+                    }
+                    Ok(())
+                })
+            });
+        let _ = result_tx.send(result);
+    });
+
+    let result = result_rx.recv().map_err(|error| {
+        crate::error::FlapjackError::Tantivy(format!(
+            "write replay startup result channel closed: {error}"
+        ))
+    })?;
+    thread.join().map_err(|_| {
+        crate::error::FlapjackError::Tantivy("write replay startup panicked".to_string())
+    })?;
+    result
 }
 
 fn configure_merge_policy(writer: &mut crate::index::ManagedIndexWriter) {
@@ -285,7 +429,9 @@ async fn acquire_writer_for_queue(
     index: &Arc<crate::index::Index>,
     tenant_id: &str,
 ) -> crate::error::Result<crate::index::ManagedIndexWriter> {
-    const MAX_RETRIES: usize = 6_000; // 6 000 × 5 ms ≈ 30 s
+    const RETRY_INTERVAL: Duration = Duration::from_millis(5);
+    let acquire_timeout = writer_acquire_timeout();
+    let deadline = Instant::now() + acquire_timeout;
     let mut retries = 0usize;
     loop {
         match index.writer() {
@@ -295,12 +441,13 @@ async fn acquire_writer_for_queue(
             }
             Err(crate::error::FlapjackError::TooManyConcurrentWrites { current, max }) => {
                 retries += 1;
-                if retries >= MAX_RETRIES {
+                if Instant::now() >= deadline {
                     tracing::error!(
-                        "[WQ {}] giving up after {} retries (~30 s) waiting for writer slot \
+                        "[WQ {}] giving up after {} retries ({:?}) waiting for writer slot \
                          (active={}, max={})",
                         tenant_id,
                         retries,
+                        acquire_timeout,
                         current,
                         max
                     );
@@ -318,7 +465,7 @@ async fn acquire_writer_for_queue(
                         retries
                     );
                 }
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                tokio::time::sleep(RETRY_INTERVAL).await;
             }
             Err(e) => {
                 tracing::error!("[WQ {}] failed to create writer: {}", tenant_id, e);
@@ -346,7 +493,17 @@ async fn flush_pending_batch(
     }
     let index = &ctx.index;
     let tenant_id = &ctx.tenant_id;
-    let mut writer = acquire_writer_for_queue(index, tenant_id).await?;
+    let mut writer = match acquire_writer_for_queue(index, tenant_id).await {
+        Ok(writer) => writer,
+        Err(error) => {
+            let pending_task_ids = pending
+                .iter()
+                .map(|op| op.task_id.clone())
+                .collect::<Vec<_>>();
+            finalization::mark_tasks_failed(&ctx.tasks, &pending_task_ids, &error);
+            return Err(error);
+        }
+    };
     let result = commit_batch(ctx, pending, &mut writer).await;
     observe_write_queue_phase(PHASE_FLUSH_PENDING_BATCH, phase_start);
     result
@@ -364,6 +521,7 @@ async fn flush_pending_batch(
 async fn process_writes(
     ctx: WriteQueueContext,
     mut rx: mpsc::Receiver<WriteOp>,
+    replay_records: Vec<WriteAdmissionRecord>,
 ) -> crate::error::Result<()> {
     let phase_start = Instant::now();
     let tenant_id = &ctx.tenant_id;
@@ -375,8 +533,20 @@ async fn process_writes(
         resolved_batch_size,
         WRITE_QUEUE_BATCH_SIZE_ENV_VAR
     );
+    if let Some(delay) = write_queue_start_delay() {
+        tracing::warn!(
+            "[WQ {}] delaying write queue start by {:?}",
+            tenant_id,
+            delay
+        );
+        tokio::time::sleep(delay).await;
+    }
     let mut pending = Vec::new();
     let mut deadline = reset_write_queue_deadline();
+    replay_admitted_writes(&ctx, &mut pending, replay_records, resolved_batch_size).await?;
+    if !pending.is_empty() {
+        flush_pending_batch(&ctx, &mut pending).await?;
+    }
 
     loop {
         log_write_queue_state(tenant_id, pending.len(), deadline);
@@ -396,6 +566,18 @@ async fn process_writes(
         }
     }
     observe_write_queue_phase(PHASE_PROCESS_WRITES, phase_start);
+    Ok(())
+}
+
+async fn replay_admitted_writes(
+    ctx: &WriteQueueContext,
+    pending: &mut Vec<WriteOp>,
+    replay_records: Vec<WriteAdmissionRecord>,
+    resolved_batch_size: usize,
+) -> crate::error::Result<()> {
+    for record in replay_records {
+        handle_received_write_op(ctx, pending, record.write_op(), resolved_batch_size).await?;
+    }
     Ok(())
 }
 
@@ -467,6 +649,11 @@ async fn handle_received_write_op(
             &mut writer,
             tenant_id,
         )?;
+        if let Err(error) = ctx.admission_store.remove_task(&op.task_id) {
+            finalization::mark_tasks_failed(&ctx.tasks, std::slice::from_ref(&op.task_id), &error);
+            return Err(error);
+        }
+        finalization::mark_compact_task_succeeded(&ctx.tasks, &op.task_id);
         return Ok(true);
     }
 
@@ -625,6 +812,7 @@ async fn commit_batch(
         tasks: &ctx.tasks,
         base_path: ctx.base_path.as_path(),
         oplog: ctx.oplog.as_ref(),
+        admission_store: &ctx.admission_store,
         facet_cache: &ctx.facet_cache,
         lww_map: &ctx.lww_map,
         #[cfg(feature = "vector-search")]
@@ -678,6 +866,14 @@ async fn commit_batch(
     if let Err(error) =
         finalization::finalize_committed_batch(&finalization_context, &prepared_ops, build_secs)
     {
+        finalization::mark_tasks_failed(finalization_context.tasks, &batch_task_ids, &error);
+        return Err(error);
+    }
+    if let Err(error) = finalization_context.admission_store.remove_tasks(
+        prepared_ops
+            .iter()
+            .map(|prepared| prepared.task_id.as_str()),
+    ) {
         finalization::mark_tasks_failed(finalization_context.tasks, &batch_task_ids, &error);
         return Err(error);
     }
@@ -768,10 +964,11 @@ async fn stage_write_op_for_commit(
     let valid_docs_json = finalization::write_valid_documents(writer, &prepared.valid_docs)?;
     finalization::append_batch_to_oplog(
         context.oplog,
+        &prepared.task_id,
         &valid_docs_json,
         &prepared.deleted_ids,
         context.tenant_id,
-    );
+    )?;
     Ok(prepared)
 }
 

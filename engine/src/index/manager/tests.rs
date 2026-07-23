@@ -1,7 +1,288 @@
 use super::*;
+use crate::index::memory::{MemoryBudget, MemoryBudgetConfig};
 use crate::index::rules::GeneratedFacetFilter;
-use std::collections::BTreeMap;
+use crate::index::write_queue::admission::{WriteAdmissionRecord, WriteAdmissionStore};
+use crate::index::write_queue::WriteOp;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+const WRITE_DURABLE_TIMEOUT_ENV_VAR: &str = "FLAPJACK_WRITE_DURABLE_TIMEOUT_MS";
+const WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_ENV_VAR: &str =
+    "FLAPJACK_WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_MS";
+const WRITE_QUEUE_ADMISSION_FAILURE_PROBE_LIMIT: usize = 2_050;
+
+struct DurableWriteTimeoutEnvGuard {
+    previous_value: Option<String>,
+}
+
+impl DurableWriteTimeoutEnvGuard {
+    fn set(value: &str) -> Self {
+        let previous_value = std::env::var(WRITE_DURABLE_TIMEOUT_ENV_VAR).ok();
+        std::env::set_var(WRITE_DURABLE_TIMEOUT_ENV_VAR, value);
+        Self { previous_value }
+    }
+}
+
+impl Drop for DurableWriteTimeoutEnvGuard {
+    fn drop(&mut self) {
+        match &self.previous_value {
+            Some(value) => std::env::set_var(WRITE_DURABLE_TIMEOUT_ENV_VAR, value),
+            None => std::env::remove_var(WRITE_DURABLE_TIMEOUT_ENV_VAR),
+        }
+    }
+}
+
+struct WriteQueueWriterAcquireTimeoutEnvGuard {
+    previous_value: Option<String>,
+}
+
+impl WriteQueueWriterAcquireTimeoutEnvGuard {
+    fn set(value: &str) -> Self {
+        let previous_value = std::env::var(WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_ENV_VAR).ok();
+        std::env::set_var(WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_ENV_VAR, value);
+        Self { previous_value }
+    }
+}
+
+impl Drop for WriteQueueWriterAcquireTimeoutEnvGuard {
+    fn drop(&mut self) {
+        match &self.previous_value {
+            Some(value) => std::env::set_var(WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_ENV_VAR, value),
+            None => std::env::remove_var(WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_ENV_VAR),
+        }
+    }
+}
+
+struct TraversalEscapeDirGuard {
+    path: PathBuf,
+}
+
+impl TraversalEscapeDirGuard {
+    fn new(tmp: &TempDir, label: &str) -> (Self, String) {
+        let salt = tmp
+            .path()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "tmp".to_string());
+        let escape_name = format!("{label}_{salt}");
+        let path = tmp.path().join("..").join(&escape_name);
+        (Self { path }, format!("../{escape_name}"))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TraversalEscapeDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn write_queue_test_document(object_id: &str, title: &str) -> Document {
+    Document {
+        id: object_id.to_string(),
+        fields: HashMap::from([("title".to_string(), FieldValue::Text(title.to_string()))]),
+    }
+}
+
+fn tenant_task_key_snapshot(manager: &IndexManager, tenant_id: &str) -> BTreeSet<String> {
+    let prefix = format!("task_{}_", tenant_id);
+    manager
+        .tasks
+        .iter()
+        .filter(|entry| entry.value().id.starts_with(&prefix))
+        .map(|entry| entry.key().clone())
+        .collect()
+}
+
+fn tenant_task_snapshot_contains(manager: &IndexManager, tenant_id: &str, task_id: &str) -> bool {
+    manager
+        .tenant_tasks_snapshot_for_test(tenant_id)
+        .iter()
+        .any(|task| task.id == task_id)
+}
+
+fn tenant_admission_record_count(base_path: &Path, tenant_id: &str) -> usize {
+    let admission_path = base_path.join(tenant_id).join("write_admission");
+    if !admission_path.is_dir() {
+        return 0;
+    }
+    std::fs::read_dir(admission_path)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .count()
+}
+
+fn write_corrupt_complete_admission_record(base_path: &Path, tenant_id: &str) {
+    let admission_dir = base_path.join(tenant_id).join("write_admission");
+    std::fs::create_dir_all(&admission_dir).unwrap();
+    std::fs::write(
+        admission_dir.join("00000000000000000001.json"),
+        b"{not-json",
+    )
+    .unwrap();
+}
+
+#[test]
+fn write_admission_checksum_round_trips_nested_float_payloads() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_admission_float_checksum";
+    std::fs::create_dir_all(temp_dir.path().join(tenant_id)).unwrap();
+    let store = WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap();
+    let documents: Vec<Document> = (0..400)
+        .map(|doc_id| {
+            let points = (0..128)
+                .map(|offset| {
+                    let jitter = offset as f64 * 0.00001;
+                    FieldValue::Object(HashMap::from([
+                        (
+                            "lat".to_string(),
+                            FieldValue::Float(40.7128 + doc_id as f64 * 0.0001 + jitter),
+                        ),
+                        (
+                            "lng".to_string(),
+                            FieldValue::Float(-74.0060 + doc_id as f64 * 0.0001 - jitter),
+                        ),
+                    ]))
+                })
+                .collect();
+            Document {
+                id: format!("doc{doc_id}"),
+                fields: HashMap::from([
+                    (
+                        "title".to_string(),
+                        FieldValue::Text("hello world".to_string()),
+                    ),
+                    ("_geoloc".to_string(), FieldValue::Array(points)),
+                ]),
+            }
+        })
+        .collect();
+
+    store
+        .append_record(WriteAdmissionRecord::new(
+            "task_float_checksum".to_string(),
+            1,
+            400,
+            vec![WriteAction::Upsert(Document {
+                id: "batch".to_string(),
+                fields: HashMap::from([(
+                    "documents".to_string(),
+                    FieldValue::Array(
+                        documents
+                            .into_iter()
+                            .map(|document| FieldValue::Object(document.fields))
+                            .collect(),
+                    ),
+                )]),
+            })],
+        ))
+        .unwrap();
+
+    let records = store.load_records().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].task_id, "task_float_checksum");
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AdmissionCapacityEntryPoint {
+    Insert,
+    Upsert,
+    ReplicationAdd,
+    Delete,
+    ReplicationDelete,
+    Compact,
+}
+
+impl AdmissionCapacityEntryPoint {
+    fn admit(self, manager: &IndexManager, tenant_id: &str) -> Result<TaskInfo> {
+        match self {
+            Self::Insert => manager.add_documents_insert(
+                tenant_id,
+                vec![write_queue_test_document("insert_capacity_doc", "coverage")],
+            ),
+            Self::Upsert => manager.add_documents(
+                tenant_id,
+                vec![write_queue_test_document("upsert_capacity_doc", "coverage")],
+            ),
+            Self::ReplicationAdd => manager.add_documents_for_replication(
+                tenant_id,
+                vec![write_queue_test_document(
+                    "replication_add_capacity_doc",
+                    "coverage",
+                )],
+            ),
+            Self::Delete => {
+                manager.delete_documents(tenant_id, vec!["delete_capacity_missing_doc".to_string()])
+            }
+            Self::ReplicationDelete => manager.delete_documents_for_replication(
+                tenant_id,
+                vec!["replication_delete_capacity_missing_doc".to_string()],
+            ),
+            Self::Compact => manager.compact_index(tenant_id),
+        }
+    }
+}
+
+fn assert_queue_full_preserves_pre_admission_state(
+    entry_point: AdmissionCapacityEntryPoint,
+    temp_dir: &TempDir,
+) {
+    let tenant_id = "write_queue_capacity_table";
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+    fill_write_queue_without_admission(&manager, tenant_id);
+    let before_keys = tenant_task_key_snapshot(&manager, tenant_id);
+    let before_records = tenant_admission_record_count(temp_dir.path(), tenant_id);
+    let result = entry_point.admit(&manager, tenant_id);
+    assert!(
+        matches!(result, Err(FlapjackError::QueueFull)),
+        "expected QueueFull for {entry_point:?}, got {result:?}"
+    );
+    let after_keys = tenant_task_key_snapshot(&manager, tenant_id);
+    let after_records = tenant_admission_record_count(temp_dir.path(), tenant_id);
+    assert!(
+        manager.abort_tenant_write_task_for_test(tenant_id),
+        "tenant write_queue task should still be abortable after capacity probe"
+    );
+    let leaked_keys: Vec<_> = after_keys
+        .difference(&before_keys)
+        .take(4)
+        .cloned()
+        .collect();
+    assert!(
+        leaked_keys.is_empty(),
+        "{entry_point:?} QueueFull admission failure must not allocate a canonical task id or numeric alias; leaked task keys: {leaked_keys:?}"
+    );
+    assert_eq!(
+        after_records, before_records,
+        "{entry_point:?} QueueFull admission failure must leave zero new admission records"
+    );
+}
+
+fn fill_write_queue_without_admission(manager: &IndexManager, tenant_id: &str) {
+    let index = manager.get_or_load(tenant_id).unwrap();
+    let tx = manager
+        .get_or_create_write_queue(tenant_id, &index)
+        .unwrap();
+    for i in 0..=WRITE_QUEUE_ADMISSION_FAILURE_PROBE_LIMIT {
+        let result = tx.try_send(WriteOp {
+            task_id: format!("synthetic_capacity_task_{i}"),
+            actions: vec![WriteAction::Delete(format!("synthetic_missing_doc_{i}"))],
+        });
+        match result {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => return,
+            Err(error) => panic!("capacity prefill should only stop at Full, got {error:?}"),
+        }
+    }
+    panic!("capacity prefill did not reach QueueFull");
+}
 
 fn tenant_tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     fn collect(root: &Path, current: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
@@ -396,6 +677,794 @@ async fn wait_for_write_durable_reclaims_terminal_overflow_without_new_write() {
         !manager.tasks.contains_key(other_terminal_numeric_id),
         "reclaimed terminal overflow task must remove numeric alias as well"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn admitted_write_queue_task_replays_after_restart_window() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_queue_restart_replay";
+    let object_id = "write_queue_restart_replay_doc";
+
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+    let task = manager
+        .add_documents(
+            tenant_id,
+            vec![write_queue_test_document(
+                object_id,
+                "restart replay coverage",
+            )],
+        )
+        .unwrap();
+
+    assert!(
+        tenant_task_snapshot_contains(&manager, tenant_id, &task.id),
+        "accepted write_queue task must be inspectable before restart"
+    );
+    assert_eq!(
+        manager.get_task(&task.numeric_id.to_string()).unwrap().id,
+        task.id,
+        "numeric task alias must exist after admission"
+    );
+    assert!(
+        manager
+            .get_document(tenant_id, object_id)
+            .unwrap()
+            .is_none(),
+        "pre-restart index must not already report the admitted document as committed"
+    );
+    assert!(
+        manager.abort_tenant_write_task_for_test(tenant_id),
+        "tenant write_queue task must exist so the restart window is simulated before commit"
+    );
+    drop(manager);
+
+    let restarted_manager = IndexManager::new(temp_dir.path());
+    let replayed_document = wait_for_replayed_document(&restarted_manager, tenant_id, object_id)
+        .await
+        .expect("restart replay assertion: admitted write_queue task must exist after restart");
+    assert_eq!(
+        replayed_document.id, object_id,
+        "restart replay must preserve the admitted document objectID"
+    );
+    assert!(
+        matches!(
+            replayed_document.fields.get("title"),
+            Some(FieldValue::Text(title)) if title == "restart replay coverage"
+        ),
+        "restart replay must preserve the admitted document fields"
+    );
+}
+
+async fn wait_for_replayed_document(
+    manager: &IndexManager,
+    tenant_id: &str,
+    object_id: &str,
+) -> Option<Document> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(document) = manager
+            .get_document(tenant_id, object_id)
+            .expect("restart replay lookup must succeed")
+        {
+            return Some(document);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn add_documents_write_queue_full_does_not_allocate_task_aliases() {
+    let temp_dir = TempDir::new().unwrap();
+    assert_queue_full_preserves_pre_admission_state(AdmissionCapacityEntryPoint::Upsert, &temp_dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn delete_documents_write_queue_full_does_not_allocate_task_aliases() {
+    let temp_dir = TempDir::new().unwrap();
+    assert_queue_full_preserves_pre_admission_state(AdmissionCapacityEntryPoint::Delete, &temp_dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn closed_write_queue_preserves_queue_full_admission_contract() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "closed_write_queue_admission";
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+    manager
+        .add_documents(tenant_id, vec![write_queue_test_document("seed", "seed")])
+        .unwrap();
+    assert!(manager.abort_tenant_write_task_for_test(tenant_id));
+    tokio::task::yield_now().await;
+
+    let before_keys = tenant_task_key_snapshot(&manager, tenant_id);
+    let before_records = tenant_admission_record_count(temp_dir.path(), tenant_id);
+    let result = manager.delete_documents(tenant_id, vec!["seed".to_string()]);
+
+    assert!(
+        matches!(result, Err(FlapjackError::QueueFull)),
+        "closed write queue must retain the legacy retryable QueueFull contract, got {result:?}"
+    );
+    assert_eq!(tenant_task_key_snapshot(&manager, tenant_id), before_keys);
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        before_records
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn every_write_queue_entrypoint_reserves_capacity_before_task_or_admission_allocation() {
+    for entry_point in [
+        AdmissionCapacityEntryPoint::Insert,
+        AdmissionCapacityEntryPoint::Upsert,
+        AdmissionCapacityEntryPoint::ReplicationAdd,
+        AdmissionCapacityEntryPoint::Delete,
+        AdmissionCapacityEntryPoint::ReplicationDelete,
+        AdmissionCapacityEntryPoint::Compact,
+    ] {
+        let temp_dir = TempDir::new().unwrap();
+        assert_queue_full_preserves_pre_admission_state(entry_point, &temp_dir);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn write_queue_pre_admission_store_io_error_rolls_back_without_task_aliases() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_admission_file_boundary";
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+    let admission_path = temp_dir.path().join(tenant_id).join("write_admission");
+    std::fs::write(&admission_path, b"not a directory").unwrap();
+    let before_tasks = tenant_task_key_snapshot(&manager, tenant_id);
+
+    let error = manager
+        .add_documents(
+            tenant_id,
+            vec![write_queue_test_document(
+                "pre_admission_io_failure_doc",
+                "must not be admitted",
+            )],
+        )
+        .expect_err("regular file at write_admission must fail admission append");
+
+    assert!(
+        !matches!(error, FlapjackError::QueueFull),
+        "admission append failure must surface the underlying non-429 error"
+    );
+    assert_eq!(
+        tenant_task_key_snapshot(&manager, tenant_id),
+        before_tasks,
+        "pre-admission append failure must not insert canonical or numeric task aliases"
+    );
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        0,
+        "failed append must leave no complete replayable admission record"
+    );
+
+    std::fs::remove_file(&admission_path).unwrap();
+    let next_task = manager
+        .add_documents(
+            tenant_id,
+            vec![write_queue_test_document(
+                "pre_admission_slot_reuse_doc",
+                "slot must be reusable",
+            )],
+        )
+        .expect("released reservation must let the next valid operation enter the queue");
+    assert!(
+        tenant_task_snapshot_contains(&manager, tenant_id, &next_task.id),
+        "valid retry must be admitted after the failed append releases its permit"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn write_queue_oplog_open_failure_rejects_write_before_task_allocation() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_admission_oplog_open_failure";
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+    std::fs::write(
+        temp_dir.path().join(tenant_id).join("oplog"),
+        b"not a directory",
+    )
+    .unwrap();
+    let before_tasks = tenant_task_key_snapshot(&manager, tenant_id);
+
+    let error = manager
+        .add_documents(
+            tenant_id,
+            vec![write_queue_test_document(
+                "oplog_open_failure_doc",
+                "must not be admitted",
+            )],
+        )
+        .expect_err("oplog open failure must reject production write admission");
+
+    assert!(
+        !matches!(error, FlapjackError::QueueFull),
+        "oplog open failure is reconciliation evidence failure, not capacity backpressure"
+    );
+    assert_eq!(
+        tenant_task_key_snapshot(&manager, tenant_id),
+        before_tasks,
+        "oplog open failure must happen before canonical or numeric task allocation"
+    );
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        0,
+        "oplog open failure must not create admission records"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn write_queue_complete_admission_corruption_fails_tenant_open() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_queue_corrupt_admission";
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+    drop(manager);
+
+    write_corrupt_complete_admission_record(temp_dir.path(), tenant_id);
+
+    let restarted = IndexManager::new(temp_dir.path());
+    let error = restarted
+        .get_document(tenant_id, "any")
+        .expect_err("complete corrupt admission record must fail tenant open");
+    assert!(
+        matches!(error, FlapjackError::Json(_)),
+        "complete admission corruption must surface a startup/open error, got {error:?}"
+    );
+    assert_eq!(
+        restarted.loaded_count(),
+        0,
+        "failed admission startup validation must not leave the tenant cached as loaded"
+    );
+    let repeated_error = restarted
+        .get_document(tenant_id, "any")
+        .expect_err("complete corrupt admission record must keep failing tenant open");
+    assert!(
+        matches!(repeated_error, FlapjackError::Json(_)),
+        "complete admission corruption must remain a sticky startup/open error, got {repeated_error:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn write_queue_create_tenant_corrupt_admission_failure_is_not_cached() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_queue_create_tenant_corrupt_admission";
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+    drop(manager);
+
+    write_corrupt_complete_admission_record(temp_dir.path(), tenant_id);
+
+    let restarted = IndexManager::new(temp_dir.path());
+    let error = restarted
+        .create_tenant(tenant_id)
+        .expect_err("existing tenant create/load must validate corrupt admission records");
+    assert!(
+        matches!(error, FlapjackError::Json(_)),
+        "corrupt admission record must fail create_tenant startup validation, got {error:?}"
+    );
+    assert_eq!(
+        restarted.loaded_count(),
+        0,
+        "create_tenant failure must not cache the tenant as loaded"
+    );
+    let repeated_error = restarted
+        .get_document(tenant_id, "any")
+        .expect_err("failed create_tenant validation must not let later loads bypass admission");
+    assert!(
+        matches!(repeated_error, FlapjackError::Json(_)),
+        "later open must keep failing on corrupt admission, got {repeated_error:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn write_queue_incomplete_admission_tail_is_ignored_and_removed() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_queue_incomplete_admission";
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+    drop(manager);
+
+    let admission_dir = temp_dir.path().join(tenant_id).join("write_admission");
+    std::fs::create_dir_all(&admission_dir).unwrap();
+    let tail_path = admission_dir.join("00000000000000000001.tmp");
+    std::fs::write(&tail_path, b"incomplete").unwrap();
+
+    let restarted = IndexManager::new(temp_dir.path());
+    assert!(
+        restarted
+            .get_document(tenant_id, "missing")
+            .unwrap()
+            .is_none(),
+        "incomplete never-replayable admission tail must not block tenant open"
+    );
+    assert!(
+        !tail_path.exists(),
+        "incomplete admission tail should be removed during validation"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn write_queue_replay_failure_blocks_startup_before_live_admission() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_queue_replay_startup_failure";
+    let object_id = "replay_startup_failure_doc";
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+    drop(manager);
+
+    let store = WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap();
+    store
+        .append_record(WriteAdmissionRecord::new(
+            format!("task_{}_pending", tenant_id),
+            10_001,
+            1,
+            vec![WriteAction::Upsert(write_queue_test_document(
+                object_id,
+                "must not replay through corrupt settings",
+            ))],
+        ))
+        .unwrap();
+    std::fs::write(
+        temp_dir.path().join(tenant_id).join("settings.json"),
+        b"{not-json",
+    )
+    .unwrap();
+
+    let restarted = IndexManager::new(temp_dir.path());
+    let startup_error = restarted
+        .get_document(tenant_id, object_id)
+        .expect_err("replay startup failure must fail tenant open before returning a live queue");
+    assert!(
+        matches!(startup_error, FlapjackError::Json(_)),
+        "replay startup failure must surface its underlying error, got {startup_error:?}"
+    );
+    assert_eq!(
+        restarted.loaded_count(),
+        0,
+        "replay startup failure must not cache the tenant as loaded"
+    );
+
+    let before_records = tenant_admission_record_count(temp_dir.path(), tenant_id);
+    let live_error = restarted
+        .add_documents(
+            tenant_id,
+            vec![write_queue_test_document(
+                "live_after_replay_failure",
+                "must not be admitted",
+            )],
+        )
+        .expect_err("live write admission must stay blocked while replay startup fails");
+    assert!(
+        matches!(live_error, FlapjackError::Json(_)),
+        "live write must see the replay startup error, got {live_error:?}"
+    );
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        before_records,
+        "live write must not append a new admission record behind failed startup replay"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn write_admission_first_directory_create_requires_tenant_directory_sync() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_admission_first_parent_sync";
+    let tenant_path = temp_dir.path().join(tenant_id);
+    std::fs::create_dir_all(&tenant_path).unwrap();
+    let store = WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap();
+    std::fs::set_permissions(&tenant_path, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+    let result = store.append_record(WriteAdmissionRecord::new(
+        format!("task_{}_first", tenant_id),
+        20_001,
+        1,
+        vec![WriteAction::Delete("missing".to_string())],
+    ));
+    std::fs::set_permissions(&tenant_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(
+        result.is_err(),
+        "first write_admission directory creation must fail if the tenant directory cannot be synced"
+    );
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        0,
+        "failed first directory transition must not publish a replayable record"
+    );
+    assert!(
+        !tenant_path.join("write_admission").exists(),
+        "failed first directory transition must roll back the directory so retry repeats the parent sync"
+    );
+
+    let retry_task_id = format!("task_{}_retry", tenant_id);
+    let retry_record = store
+        .append_record(WriteAdmissionRecord::new(
+            retry_task_id.clone(),
+            20_002,
+            1,
+            vec![WriteAction::Delete("missing".to_string())],
+        ))
+        .expect("retry must durably admit after the tenant directory becomes syncable");
+    assert_eq!(retry_record.task_id, retry_task_id);
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        1,
+        "retry must publish exactly one replayable record"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn write_admission_last_directory_remove_requires_tenant_directory_sync() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_admission_last_parent_sync";
+    let tenant_path = temp_dir.path().join(tenant_id);
+    std::fs::create_dir_all(&tenant_path).unwrap();
+    let store = WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap();
+    store
+        .append_record(WriteAdmissionRecord::new(
+            format!("task_{}_last", tenant_id),
+            20_002,
+            1,
+            vec![WriteAction::Delete("missing".to_string())],
+        ))
+        .unwrap();
+    std::fs::set_permissions(&tenant_path, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+    let result = store.remove_task(&format!("task_{}_last", tenant_id));
+    std::fs::set_permissions(&tenant_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(
+        result.is_err(),
+        "last write_admission directory removal must fail if the tenant directory cannot be synced"
+    );
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        1,
+        "cleanup failure must preserve the replayable record for restart reconciliation"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn write_admission_batch_cleanup_failure_preserves_all_replayable_records() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_admission_batch_cleanup_failure";
+    let tenant_path = temp_dir.path().join(tenant_id);
+    std::fs::create_dir_all(&tenant_path).unwrap();
+    let store = WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap();
+    let task_ids = [
+        format!("task_{}_first", tenant_id),
+        format!("task_{}_second", tenant_id),
+    ];
+    for (offset, task_id) in task_ids.iter().enumerate() {
+        store
+            .append_record(WriteAdmissionRecord::new(
+                task_id.clone(),
+                30_000 + offset as i64,
+                1,
+                vec![WriteAction::Delete(format!("doc_{offset}"))],
+            ))
+            .unwrap();
+    }
+    std::fs::set_permissions(&tenant_path, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+    let result = store.remove_tasks(task_ids.iter().map(String::as_str));
+    std::fs::set_permissions(&tenant_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(
+        result.is_err(),
+        "batched cleanup must fail if the tenant directory cannot be synced"
+    );
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        task_ids.len(),
+        "batched cleanup failure must preserve every replayable record in the committed batch"
+    );
+}
+
+#[test]
+#[serial_test::serial(write_admission_directory_lifecycle)]
+fn write_queue_admission_append_and_last_record_removal_are_atomic() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_admission_concurrent_directory_lifecycle";
+    std::fs::create_dir_all(temp_dir.path().join(tenant_id)).unwrap();
+    let store = Arc::new(WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap());
+    let removed_task_id = format!("task_{tenant_id}_removed");
+    store
+        .append_record(WriteAdmissionRecord::new(
+            removed_task_id.clone(),
+            40_001,
+            1,
+            vec![WriteAction::Delete("old_document".to_string())],
+        ))
+        .unwrap();
+
+    let (removal_reached_tx, removal_reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_removal_tx, resume_removal_rx) = std::sync::mpsc::sync_channel(1);
+    store.set_before_empty_directory_remove_hook(move || {
+        removal_reached_tx.send(()).unwrap();
+        resume_removal_rx.recv().unwrap();
+    });
+
+    let removal_store = Arc::clone(&store);
+    let removal = std::thread::spawn(move || removal_store.remove_task(&removed_task_id));
+    removal_reached_rx.recv().unwrap();
+
+    let appended_task_id = format!("task_{tenant_id}_appended");
+    let append_store = Arc::clone(&store);
+    let append_task_id = appended_task_id.clone();
+    let (append_contended_tx, append_contended_rx) = std::sync::mpsc::sync_channel(1);
+    store.set_lifecycle_contention_hook(move || append_contended_tx.send(()).unwrap());
+    let append = std::thread::spawn(move || {
+        append_store.append_record(WriteAdmissionRecord::new(
+            append_task_id,
+            40_002,
+            1,
+            vec![WriteAction::Delete("new_document".to_string())],
+        ))
+    });
+    append_contended_rx
+        .recv()
+        .expect("append must contend while last-record removal owns the directory lifecycle");
+    resume_removal_tx.send(()).unwrap();
+    removal
+        .join()
+        .unwrap()
+        .expect("last-record removal must not fail when an append races it");
+    append
+        .join()
+        .unwrap()
+        .expect("append during last-record removal must succeed");
+
+    let records = store.load_records().unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.task_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![appended_task_id.as_str()],
+        "the removed record must stay removed and the concurrently appended record must remain live"
+    );
+    assert!(
+        temp_dir
+            .path()
+            .join(tenant_id)
+            .join("write_admission")
+            .is_dir(),
+        "a live admission record must retain its store directory"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(flapjack_write_durable_timeout_env)]
+async fn write_queue_committed_unpruned_admission_reconciles_without_reapplying() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_queue_committed_unpruned";
+    let object_id = "committed_unpruned_doc";
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+    let task = manager
+        .add_documents(
+            tenant_id,
+            vec![write_queue_test_document(
+                object_id,
+                "original committed value",
+            )],
+        )
+        .unwrap();
+    manager.wait_for_write_durable(&task.id).await.unwrap();
+    let seq_before = manager.get_oplog(tenant_id).unwrap().current_seq();
+
+    let store = WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap();
+    store
+        .append_record(WriteAdmissionRecord::new(
+            task.id.clone(),
+            task.numeric_id,
+            1,
+            vec![WriteAction::Upsert(write_queue_test_document(
+                object_id,
+                "replayed side effect",
+            ))],
+        ))
+        .unwrap();
+    assert_eq!(tenant_admission_record_count(temp_dir.path(), tenant_id), 1);
+    drop(manager);
+
+    let restarted = IndexManager::new(temp_dir.path());
+    let document = restarted
+        .get_document(tenant_id, object_id)
+        .unwrap()
+        .expect("committed document must remain visible after restart");
+    assert!(
+        matches!(
+            document.fields.get("title"),
+            Some(FieldValue::Text(title)) if title == "original committed value"
+        ),
+        "committed admission reconciliation must not replay duplicate side effects"
+    );
+    assert_eq!(
+        restarted.get_oplog(tenant_id).unwrap().current_seq(),
+        seq_before,
+        "reconciled committed admission must not append oplog side effects again"
+    );
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        0,
+        "committed admission record must be pruned during startup reconciliation"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(flapjack_write_durable_timeout_env)]
+async fn post_admission_write_queue_abort_returns_write_ack_timeout_and_keeps_task() {
+    let _timeout_guard = DurableWriteTimeoutEnvGuard::set("25");
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_queue_durable_timeout";
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+
+    let task = manager
+        .add_documents(
+            tenant_id,
+            vec![write_queue_test_document(
+                "write_queue_timeout_doc",
+                "post admission timeout coverage",
+            )],
+        )
+        .unwrap();
+    assert!(
+        tenant_task_snapshot_contains(&manager, tenant_id, &task.id),
+        "accepted write_queue task must be visible before aborting the consumer"
+    );
+    assert!(
+        manager.abort_tenant_write_task_for_test(tenant_id),
+        "tenant write_queue consumer must be aborted after admission"
+    );
+
+    let result = manager.wait_for_write_durable(&task.id).await;
+    assert!(
+        matches!(result, Err(FlapjackError::WriteAckTimeout)),
+        "stalled post-admission write_queue consumer must surface WriteAckTimeout, got {result:?}"
+    );
+    let canonical_task = manager
+        .get_task(&task.id)
+        .expect("accepted task must remain inspectable after durable timeout");
+    assert!(
+        matches!(canonical_task.status, TaskStatus::Enqueued),
+        "accepted task must remain pending after durable timeout, got {:?}",
+        canonical_task.status
+    );
+    assert_eq!(
+        manager.get_task(&task.numeric_id.to_string()).unwrap().id,
+        task.id,
+        "numeric task alias must remain inspectable after durable timeout"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(flapjack_write_durable_timeout_env)]
+async fn post_admission_write_queue_writer_slot_contention_returns_too_many_concurrent_writes() {
+    let _durable_timeout_guard = DurableWriteTimeoutEnvGuard::set("750");
+    let _writer_timeout_guard = WriteQueueWriterAcquireTimeoutEnvGuard::set("25");
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_queue_writer_slot_contention";
+    let tenant_path = temp_dir.path().join(tenant_id);
+    std::fs::create_dir_all(&tenant_path).unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let index = Arc::new(
+        Index::create_with_budget(
+            &tenant_path,
+            crate::index::schema::Schema::builder().build(),
+            Arc::new(MemoryBudget::new(MemoryBudgetConfig {
+                max_concurrent_writers: 1,
+                ..Default::default()
+            })),
+        )
+        .unwrap(),
+    );
+    manager
+        .loaded
+        .insert(tenant_id.to_string(), Arc::clone(&index));
+    let _held_writer = index
+        .writer()
+        .expect("test precondition: held writer must consume the tenant's only writer slot");
+
+    let task = manager
+        .add_documents(
+            tenant_id,
+            vec![write_queue_test_document(
+                "writer_slot_contention_doc",
+                "writer contention coverage",
+            )],
+        )
+        .expect("writer-slot contention is post-admission and must not reject as QueueFull");
+    assert!(
+        tenant_task_snapshot_contains(&manager, tenant_id, &task.id),
+        "task must be admitted before writer-slot contention is observed"
+    );
+
+    let result = manager.wait_for_write_durable(&task.id).await;
+    assert!(
+        matches!(
+            result,
+            Err(FlapjackError::TooManyConcurrentWrites { current: _, max: 1 })
+        ),
+        "post-admission writer-slot contention must surface TooManyConcurrentWrites/503, not QueueFull/429 or timeout; got {result:?}"
+    );
+    let failed_task = manager
+        .get_task(&task.id)
+        .expect("failed admitted task must remain inspectable by canonical task id");
+    assert!(
+        matches!(&failed_task.status, TaskStatus::Failed(message) if message.contains("Too many concurrent writes")),
+        "failed task must retain the writer-slot contention failure, got {:?}",
+        failed_task.status
+    );
+    assert_eq!(
+        manager.get_task(&task.numeric_id.to_string()).unwrap().id,
+        task.id,
+        "numeric task alias must remain inspectable after writer-slot contention"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn compact_admission_cleanup_failure_does_not_report_success() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "compact_cleanup_failure";
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+
+    let task = manager
+        .compact_index(tenant_id)
+        .expect("compact admission should succeed before cleanup failure");
+    let admission_dir = temp_dir.path().join(tenant_id).join("write_admission");
+    std::fs::set_permissions(&admission_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let status = wait_for_terminal_task_status(&manager, &task.id).await;
+    std::fs::set_permissions(&admission_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(
+        matches!(status, TaskStatus::Failed(_)),
+        "cleanup failure after compaction must fail the task instead of reporting success; got {status:?}"
+    );
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        1,
+        "failed admission cleanup must leave the replayable compact record for restart handling"
+    );
+}
+
+async fn wait_for_terminal_task_status(manager: &IndexManager, task_id: &str) -> TaskStatus {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let status = manager.get_task(task_id).unwrap().status;
+        if !matches!(status, TaskStatus::Enqueued | TaskStatus::Processing) {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task {task_id} did not reach a terminal status"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]
@@ -3683,36 +4752,36 @@ async fn read_side_getters_reject_path_traversal_tenant_ids() {
 
     // Create files in a sibling path that would be reachable via "../..."
     // if tenant IDs were not validated at read boundaries.
-    let escape_dir = tmp.path().join("../escape_getters_reject_path_traversal");
-    std::fs::create_dir_all(&escape_dir).unwrap();
+    let (escape_dir, bad_id) =
+        TraversalEscapeDirGuard::new(&tmp, "escape_getters_reject_path_traversal");
+    std::fs::create_dir_all(escape_dir.path()).unwrap();
     IndexSettings::default()
-        .save(escape_dir.join("settings.json"))
+        .save(escape_dir.path().join("settings.json"))
         .unwrap();
     RuleStore::new()
-        .save(&escape_dir.join("rules.json"))
+        .save(&escape_dir.path().join("rules.json"))
         .unwrap();
     SynonymStore::new()
-        .save(escape_dir.join("synonyms.json"))
+        .save(escape_dir.path().join("synonyms.json"))
         .unwrap();
 
-    let bad_id = "../escape_getters_reject_path_traversal";
-    assert!(manager.get_settings(bad_id).is_none());
-    assert!(manager.get_rules(bad_id).is_none());
-    assert!(manager.get_synonyms(bad_id).is_none());
+    assert!(manager.get_settings(&bad_id).is_none());
+    assert!(manager.get_rules(&bad_id).is_none());
+    assert!(manager.get_synonyms(&bad_id).is_none());
 }
 
 #[tokio::test]
 async fn delete_tenant_rejects_path_traversal_tenant_ids() {
     let tmp = TempDir::new().unwrap();
     let manager = IndexManager::new(tmp.path());
-    let escape_dir = tmp.path().join("../escape_delete_reject_path_traversal");
-    std::fs::create_dir_all(&escape_dir).unwrap();
+    let (escape_dir, bad_id) =
+        TraversalEscapeDirGuard::new(&tmp, "escape_delete_reject_path_traversal");
+    std::fs::create_dir_all(escape_dir.path()).unwrap();
 
-    let bad_id = "../escape_delete_reject_path_traversal".to_string();
     let result = manager.delete_tenant(&bad_id).await;
     assert!(result.is_err(), "delete_tenant should reject traversal IDs");
     assert!(
-        escape_dir.exists(),
+        escape_dir.path().exists(),
         "path traversal must not delete sibling paths"
     );
 }
@@ -3725,12 +4794,12 @@ async fn import_tenant_rejects_path_traversal_tenant_ids() {
     std::fs::create_dir_all(&src_path).unwrap();
     std::fs::write(src_path.join("settings.json"), "{}").unwrap();
 
-    let escape_dir = tmp.path().join("../escape_import_reject_path_traversal");
-    let bad_id = "../escape_import_reject_path_traversal".to_string();
+    let (escape_dir, bad_id) =
+        TraversalEscapeDirGuard::new(&tmp, "escape_import_reject_path_traversal");
     let result = manager.import_tenant(&bad_id, &src_path);
     assert!(result.is_err(), "import_tenant should reject traversal IDs");
     assert!(
-        !escape_dir.exists(),
+        !escape_dir.path().exists(),
         "path traversal must not create sibling destination paths"
     );
 }
@@ -3739,7 +4808,8 @@ async fn import_tenant_rejects_path_traversal_tenant_ids() {
 async fn export_tenant_rejects_path_traversal_tenant_ids() {
     let tmp = TempDir::new().unwrap();
     let manager = IndexManager::new(tmp.path());
-    let bad_id = "../escape_export_reject_path_traversal".to_string();
+    let (_escape_dir, bad_id) =
+        TraversalEscapeDirGuard::new(&tmp, "escape_export_reject_path_traversal");
     let result = manager.export_tenant(&bad_id, tmp.path().join("export_target"));
     assert!(result.is_err(), "export_tenant should reject traversal IDs");
 }
@@ -3748,15 +4818,14 @@ async fn export_tenant_rejects_path_traversal_tenant_ids() {
 async fn get_or_create_oplog_rejects_path_traversal_tenant_ids() {
     let tmp = TempDir::new().unwrap();
     let manager = IndexManager::new(tmp.path());
-    let bad_id = "../escape_oplog_reject_path_traversal";
+    let (escape_dir, bad_id) =
+        TraversalEscapeDirGuard::new(&tmp, "escape_oplog_reject_path_traversal");
     assert!(
-        manager.get_or_create_oplog(bad_id).is_none(),
+        manager.get_or_create_oplog(&bad_id).is_none(),
         "get_or_create_oplog should reject traversal IDs"
     );
     assert!(
-        !tmp.path()
-            .join("../escape_oplog_reject_path_traversal")
-            .exists(),
+        !escape_dir.path().exists(),
         "path traversal must not create sibling oplog directories"
     );
 }
@@ -3766,11 +4835,12 @@ async fn tenant_storage_bytes_rejects_path_traversal_tenant_ids() {
     let tmp = TempDir::new().unwrap();
     let manager = IndexManager::new(tmp.path());
 
-    let escape_dir = tmp.path().join("../escape_storage_reject_path_traversal");
-    std::fs::create_dir_all(&escape_dir).unwrap();
-    std::fs::write(escape_dir.join("marker.txt"), "leak").unwrap();
+    let (escape_dir, bad_id) =
+        TraversalEscapeDirGuard::new(&tmp, "escape_storage_reject_path_traversal");
+    std::fs::create_dir_all(escape_dir.path()).unwrap();
+    std::fs::write(escape_dir.path().join("marker.txt"), "leak").unwrap();
 
-    let leaked_bytes = manager.tenant_storage_bytes("../escape_storage_reject_path_traversal");
+    let leaked_bytes = manager.tenant_storage_bytes(&bad_id);
     assert_eq!(
         leaked_bytes, 0,
         "tenant_storage_bytes should not read outside base path"

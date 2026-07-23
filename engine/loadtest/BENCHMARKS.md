@@ -16,6 +16,65 @@
 - Acceptance gate: `MIN_PEER_DOWN <= raw_peer_down_count <= MAX_PEER_DOWN`.
 - Circuit-breaker threshold kept at default (`DEFAULT_FAILURE_THRESHOLD=3`) per Stage-3 like-for-like cap-hit evidence — `raw_peer_down_count` is not a monotonic proxy for queue-cap pressure, so there is no causal basis to retune from this sample.
 
+## PL-10 v1.1 Bounded-Lag Pair (July 22, 2026)
+
+### Hypothesis
+
+Persistent admission/replay was tested as a bounded-lag/backpressure first slice, not as a
+sustained-ceiling uplift. The offered load was fixed at `94` scheduled single-document write
+iterations per second for a `120s` measured window, above the `46.600000` writes/second lower bound
+recorded in [ADR 0007](../docs2/3_IMPLEMENTATION/decisions/active/0007_pl10_v11_write_path_design.md)
+and `engine/loadtest/results/20260720T170944Z-pl10-v11-single-writer-ceiling/README.md`.
+
+The predeclared confirming gates required both conditions to make exactly `11280` HTTP attempts with
+zero dropped iterations, zero non-429 4xx and 5xx responses, control accepted writes `>= 5592`,
+candidate accepted writes `>= control`, candidate accepted-200 p95 `<= 1.10 * control`, candidate
+oldest live admission record age always `< 30000ms`, candidate drain to zero records within `30s`,
+and at least one candidate 429 so the backpressure claim was non-vacuous.
+
+### Inputs
+
+| Field | Control | Candidate |
+|---|---|---|
+| Git SHA | `0a97907841ed6f7a6d4d1119df646f1053f1815b` | `ad02635106d0db4c0d6cecc8189de6fda865b933` |
+| Binary SHA-256 | `932d9ab32b40ec26f7db07d3794f4d575f54c6f45fad77b3d54f2c15ca91ce26` | `243aa389f0044e2a43c33876af4f6e2e56b23f4bdd9450af127b163b8a7e2c05` |
+| Proof directory | `engine/loadtest/results/20260722T201925Z-write-soak/` | `engine/loadtest/results/20260722T202145Z-write-soak/` |
+| Command shape | `FLAPJACK_LOADTEST_WRITE_CONDITION=control FLAPJACK_LOADTEST_WRITE_TARGET_RPS=94 FLAPJACK_LOADTEST_SOAK_DURATION=2m FLAPJACK_LOADTEST_WRITE_EXPECTED_ATTEMPTS=11280 bash soak_proof.sh --scenario write-soak` | `FLAPJACK_LOADTEST_WRITE_CONDITION=candidate FLAPJACK_LOADTEST_WRITE_TARGET_RPS=94 FLAPJACK_LOADTEST_SOAK_DURATION=2m FLAPJACK_LOADTEST_WRITE_EXPECTED_ATTEMPTS=11280 FLAPJACK_LOADTEST_WRITE_CONTROL_SUMMARY=results/20260722T201925Z-write-soak/summary.md bash soak_proof.sh --scenario write-soak` |
+
+Paired-run metadata and exact local commands are retained in
+`engine/loadtest/results/20260722T202511Z-pl10-v11-bounded-lag-pair/README.md`. The pair used release
+binaries, fresh server data directories, distinct loopback ports, one-second sampling, the seeded
+one-document `write-soak.js` payload, and an unset `FLAPJACK_WRITE_QUEUE_BATCH_SIZE`.
+
+### Measured Results
+
+| Metric | Control | Candidate | Gate |
+|---|---:|---:|---|
+| attempted HTTP writes | `11280` | `4076` | candidate FAIL |
+| dropped iterations | `0` | `7205` | candidate FAIL |
+| accepted 200 writes | `11280` | `3613` | candidate FAIL vs control |
+| QueueFull 429 responses | `0` | `0` | candidate FAIL, no observed backpressure |
+| unexpected 4xx responses | `0` | `2` | candidate FAIL |
+| 5xx responses | `0` | `460` | candidate FAIL |
+| dirty-error count | `0` | `462` | candidate FAIL |
+| accepted-only p95 | `358.736ms` | `42080.804ms` | candidate FAIL |
+| maximum oldest admission age | `0ms` | `30590ms` | candidate FAIL |
+| peak admission record count | `0` | `690` | diagnostic |
+| drain duration to zero records | `1s` | `1s` | PASS |
+| drain record count | `0` | `0` | PASS |
+| RSS KB start / peak / end | `109664 / 428960 / 405248` | `104608 / 259696 / 249840` | diagnostic |
+| heap bytes start / peak / end | `32245136 / 90431888 / 58606832` | `37451104 / 101792520 / 40523000` | diagnostic |
+
+### Verdict
+
+`FALSIFIED_UNBOUNDED_OR_REGRESSED`: the candidate failed the fixed-load bounded-lag gates for exact
+attempt count, dropped iterations, dirty errors, accepted count, accepted-only p95, admission age,
+and observed 429 backpressure. The candidate did drain admission records to zero within the timeout,
+but that single passing gate does not confirm bounded lag.
+
+This pair does not measure or prove a higher sustained write ceiling. It is same-machine evidence
+for the persistent-admission first slice under the predeclared fixed offered load only.
+
 ## PL-13 Single-doc Durable Write Throughput (May 28, 2026)
 
 ### Scenario Owner

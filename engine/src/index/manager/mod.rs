@@ -7,7 +7,8 @@ use crate::index::synonyms::{Synonym, SynonymStore};
 use crate::index::task_queue::TaskQueue;
 use crate::index::utils::copy_dir_recursive;
 use crate::index::write_queue::{
-    create_write_queue, VectorWriteContext, WriteAction, WriteOp, WriteQueue, WriteQueueContext,
+    admission::{WriteAdmissionRecord, WriteAdmissionStore},
+    create_write_queue, VectorWriteContext, WriteAction, WriteQueue, WriteQueueContext,
 };
 use crate::index::Index;
 use crate::query::algolia_filters::{
@@ -97,6 +98,7 @@ pub struct IndexManager {
     node_id: String,
     pub(crate) loaded: DashMap<TenantId, Arc<Index>>,
     tenant_load_locks: DashMap<TenantId, Arc<std::sync::Mutex<()>>>,
+    admission_stores: DashMap<TenantId, Arc<WriteAdmissionStore>>,
     pub(crate) writers:
         Arc<DashMap<TenantId, Arc<tokio::sync::Mutex<crate::index::ManagedIndexWriter>>>>,
     pub(crate) write_queues: DashMap<TenantId, WriteQueue>,
@@ -174,6 +176,7 @@ impl IndexManager {
                 node_id: node_id.into(),
                 loaded: DashMap::new(),
                 tenant_load_locks: DashMap::new(),
+                admission_stores: DashMap::new(),
                 writers: Arc::new(DashMap::new()),
                 write_queues: DashMap::new(),
                 write_task_handles: DashMap::new(),
@@ -411,7 +414,9 @@ impl IndexManager {
         self.recover_from_oplog(tenant_id, &index, &path)?;
         #[cfg(feature = "vector-search")]
         self.load_vector_index(tenant_id, &path);
-        Ok(self.cache_loaded_index(tenant_id, index))
+        self.get_or_create_write_queue(tenant_id, &index)?;
+        let loaded_index = self.cache_loaded_index(tenant_id, index);
+        Ok(loaded_index)
     }
 
     /// Get the number of loaded indexes.
@@ -509,9 +514,19 @@ impl IndexManager {
     /// Return the tenant's `OpLog`, creating and caching it on first access. Opens the
     /// oplog directory under the tenant path with the configured node ID.
     pub fn get_or_create_oplog(&self, tenant_id: &str) -> Option<Arc<OpLog>> {
+        match self.get_or_create_oplog_result(tenant_id) {
+            Ok(oplog) => Some(oplog),
+            Err(error) => {
+                tracing::error!("[OPLOG {}] open failed: {}", tenant_id, error);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn get_or_create_oplog_result(&self, tenant_id: &str) -> Result<Arc<OpLog>> {
         if let Err(error) = validate_index_name(tenant_id) {
             tracing::warn!("[OPLOG {}] invalid tenant id: {}", tenant_id, error);
-            return None;
+            return Err(error);
         }
         let entry = self
             .oplogs
@@ -526,8 +541,8 @@ impl IndexManager {
                     })
             });
         match entry {
-            Ok(e) => Some(Arc::clone(&e)),
-            Err(_) => None,
+            Ok(e) => Ok(Arc::clone(&e)),
+            Err(error) => Err(error.clone()),
         }
     }
 

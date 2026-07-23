@@ -391,10 +391,12 @@ impl axum::response::IntoResponse for AddDocumentsError {
                     .into_response();
                 // Mirror the retriable signal the default FlapjackError path
                 // attaches so task-aware responses preserve client retry behavior.
-                // WriteAckTimeout (503) and QueueFull (429) are both retryable.
+                // WriteAckTimeout, TooManyConcurrentWrites, and QueueFull are retryable.
                 if matches!(
                     source,
-                    FlapjackError::WriteAckTimeout | FlapjackError::QueueFull
+                    FlapjackError::WriteAckTimeout
+                        | FlapjackError::TooManyConcurrentWrites { .. }
+                        | FlapjackError::QueueFull
                 ) {
                     response
                         .headers_mut()

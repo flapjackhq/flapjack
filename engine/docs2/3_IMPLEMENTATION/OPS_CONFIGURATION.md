@@ -32,6 +32,45 @@ Verified separately from the harnesses above:
 - Request correlation (`x-request-id`) is always on and has no env flag.
 - Startup dependency summary logging is always on and has no env flag.
 
+## Migration spool payload retention
+
+The shipped MIG-9 owner parses `FLAPJACK_MIGRATION_SPOOL_GC_INTERVAL_SECS`
+once at startup as a positive-integer scheduling interval with default `300`.
+Absent, invalid, or zero values fall back to `300` to prevent a busy loop.
+This variable controls only how often the periodic pass runs.
+
+Payload retention eligibility starts from durable terminal state, not from the
+manifest admission timestamp. A terminal disposition is one of `Succeeded`,
+`Failed`, or `Cancelled` with `MigrationPhaseRecord::terminal_at` present, and
+payloads become reclaimable only when
+`now >= terminal_at + SpoolLimits::retention_seconds`. The
+`SpoolLimits::retention_seconds` value remains the sole retention duration and
+keeps the existing `86,400`-second default. `Running`, a missing `terminal_at`,
+a missing or corrupt `migration_phase.json`, or any disposition/timestamp
+inconsistency fails closed and is never permission to reclaim payloads.
+
+`expires_at` remains legacy manifest metadata written from admission time. It
+must not become a second retention knob, status-duration knob, or scheduler
+origin. Existing workflow-local cleanup paths may delete export payloads after
+successful activation or cancellation, while failures retain payloads until the
+future retention pass becomes eligible; those paths are not the future retention
+scheduler and do not define an alternate retention policy.
+
+The payload reclamation transaction removes manifest-listed visible artifacts,
+documents/rules/synonyms completion sidecars, and zeroes the manifest payload
+accounting while preserving the job directory. It keeps the durable control
+files `async_migration.json` and `migration_phase.json`: authenticated status
+ownership depends on `async_migration.json`, and the terminal response depends
+on `migration_phase.json`. Payload reclamation therefore introduces no
+time-based status 404.
+
+`collect_garbage` now performs temp cleanup, retention-based payload
+reclamation for eligible terminal jobs, and tombstoning of already-deleted
+manifests. `write_tombstone` and `recover` remain part of that manifest
+lifecycle. `recover_async_admissions` is separate because it removes only
+interrupted async admissions without a committed phase record, not retained
+terminal payloads or reclaimed jobs.
+
 ## `flapjack ingest` Beta Operations
 
 `flapjack ingest` is a packaged CLI import path for cron, systemd timers, and

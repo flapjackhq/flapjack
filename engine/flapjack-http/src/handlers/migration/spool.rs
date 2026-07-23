@@ -461,6 +461,14 @@ impl From<io::Error> for SpoolError {
 
 type SpoolResult<T> = Result<T, SpoolError>;
 
+fn warn_spool_garbage_collection_error(job_uuid: Uuid, error: &SpoolError) {
+    tracing::warn!(
+        job_uuid = %job_uuid,
+        error_kind = ?error.kind(),
+        "migration spool garbage collection skipped job"
+    );
+}
+
 struct LockGuard {
     file: File,
 }
@@ -1173,17 +1181,62 @@ impl SpoolStore {
 
     pub(crate) fn collect_garbage(&self) -> SpoolResult<()> {
         let _root_lock = self.lock_root()?;
-        for job_uuid in self.job_uuids()? {
-            let _job_lock = self.lock_job(job_uuid)?;
-            let Some(manifest) = self.read_manifest_if_exists(job_uuid)? else {
-                continue;
-            };
-            self.clean_store_temp_files(job_uuid)?;
-            if manifest.lifecycle == LifecycleState::Deleted && manifest.expires_at <= self.now() {
-                self.write_tombstone(&manifest)?;
+        let mut job_uuids = self.job_uuids()?;
+        job_uuids.sort_unstable();
+        for job_uuid in job_uuids {
+            if let Err(error) = self.collect_job_garbage(job_uuid) {
+                warn_spool_garbage_collection_error(job_uuid, &error);
             }
         }
         Ok(())
+    }
+
+    fn collect_job_garbage(&self, job_uuid: Uuid) -> SpoolResult<()> {
+        let _job_lock = self.lock_job(job_uuid)?;
+        self.clean_store_temp_files(job_uuid)?;
+        let Some(mut manifest) = self.read_manifest_if_exists(job_uuid)? else {
+            return Ok(());
+        };
+        if manifest.lifecycle == LifecycleState::Deleted {
+            if manifest.expires_at <= self.now() {
+                self.write_tombstone(&manifest)?;
+            }
+            return Ok(());
+        }
+        if self.phase_allows_payload_reclamation(job_uuid)? {
+            self.delete_manifest_artifacts(&mut manifest)?;
+        }
+        Ok(())
+    }
+
+    fn phase_allows_payload_reclamation(&self, job_uuid: Uuid) -> SpoolResult<bool> {
+        let record = self.read_migration_phase(job_uuid)?;
+        match (record.disposition, record.terminal_at) {
+            (MigrationDisposition::Running, None) => Ok(false),
+            (MigrationDisposition::Running, Some(_)) => {
+                Err(SpoolError::new(SpoolErrorKind::ManifestCorrupt))
+            }
+            (
+                MigrationDisposition::Succeeded
+                | MigrationDisposition::Failed
+                | MigrationDisposition::Cancelled,
+                Some(terminal_at),
+            ) => Ok(self.now() >= self.retention_deadline(terminal_at)?),
+            (
+                MigrationDisposition::Succeeded
+                | MigrationDisposition::Failed
+                | MigrationDisposition::Cancelled,
+                None,
+            ) => Err(SpoolError::new(SpoolErrorKind::ManifestCorrupt)),
+        }
+    }
+
+    fn retention_deadline(&self, terminal_at: DateTime<Utc>) -> SpoolResult<DateTime<Utc>> {
+        let retention = Duration::try_seconds(self.limits.retention_seconds)
+            .ok_or_else(|| SpoolError::new(SpoolErrorKind::ManifestCorrupt))?;
+        terminal_at
+            .checked_add_signed(retention)
+            .ok_or_else(|| SpoolError::new(SpoolErrorKind::ManifestCorrupt))
     }
 
     pub(crate) fn recover(&self) -> SpoolResult<()> {
@@ -1302,6 +1355,10 @@ use spool_lifecycle::*;
 #[cfg(test)]
 #[path = "spool_tests.rs"]
 mod spool_tests;
+
+#[cfg(test)]
+#[path = "spool_gc_probe_tests.rs"]
+mod spool_gc_probe_tests;
 
 #[cfg(test)]
 #[path = "export_resume_tests.rs"]

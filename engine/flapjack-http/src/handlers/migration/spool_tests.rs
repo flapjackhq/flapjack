@@ -5,11 +5,87 @@ use flapjack::index::manager::publication::{
 };
 use flapjack::index::manager::IndexManager;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io::Write;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use tempfile::TempDir;
+use tracing::{Event, Level, Subscriber};
+use tracing_subscriber::{
+    layer::{Context, SubscriberExt},
+    registry::LookupSpan,
+    Layer,
+};
 
 type ArtifactCorruption = Box<dyn Fn(&SpoolStore, uuid::Uuid)>;
+
+const GC_EXPECTED_RECLAIMED_BYTES_PER_JOB: u64 = 106;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CapturedSpoolWarning {
+    job_uuid: uuid::Uuid,
+    error_kind: String,
+}
+
+#[derive(Clone, Default)]
+struct CapturedSpoolWarnings {
+    events: Arc<Mutex<Vec<CapturedSpoolWarning>>>,
+}
+
+impl CapturedSpoolWarnings {
+    fn events(&self) -> Vec<CapturedSpoolWarning> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+impl<S> Layer<S> for CapturedSpoolWarnings
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        if *event.metadata().level() != Level::WARN {
+            return;
+        }
+        let mut visitor = SpoolWarningVisitor::default();
+        event.record(&mut visitor);
+        if let (Some(job_uuid), Some(error_kind)) = (visitor.job_uuid, visitor.error_kind) {
+            self.events.lock().unwrap().push(CapturedSpoolWarning {
+                job_uuid,
+                error_kind,
+            });
+        }
+    }
+}
+
+#[derive(Default)]
+struct SpoolWarningVisitor {
+    job_uuid: Option<uuid::Uuid>,
+    error_kind: Option<String>,
+}
+
+impl tracing::field::Visit for SpoolWarningVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.record_value(field.name(), value);
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let rendered = format!("{value:?}");
+        self.record_value(field.name(), rendered.trim_matches('"'));
+    }
+}
+
+impl SpoolWarningVisitor {
+    fn record_value(&mut self, name: &str, value: &str) {
+        match name {
+            "job_uuid" => self.job_uuid = uuid::Uuid::parse_str(value).ok(),
+            "error_kind" => self.error_kind = Some(value.to_string()),
+            _ => {}
+        }
+    }
+}
+
+fn spool_error_kind_name(kind: SpoolErrorKind) -> String {
+    format!("{kind:?}")
+}
 
 fn test_limits() -> SpoolLimits {
     SpoolLimits {
@@ -1300,13 +1376,7 @@ fn deletion_fence_is_digest_checked_and_blocks_future_commits() {
 fn garbage_collection_keeps_tombstone_and_does_not_scan_unregistered_paths() {
     let tmp = TempDir::new().unwrap();
     let store = fixed_store(&tmp);
-    let view = create_export_for_test(
-        &store,
-        uuid::Uuid::new_v4(),
-        &source_digest(),
-        denominators(),
-    )
-    .unwrap();
+    let job = create_gc_job(&store, uuid::Uuid::new_v4());
     let unrelated = tmp
         .path()
         .join("migration_exports")
@@ -1316,7 +1386,7 @@ fn garbage_collection_keeps_tombstone_and_does_not_scan_unregistered_paths() {
     std::fs::write(&outside, b"do not touch").unwrap();
 
     store
-        .delete_export_artifacts(view.job_uuid, &source_digest())
+        .delete_export_artifacts(job.job_uuid, &source_digest())
         .unwrap();
     let later = SpoolStore::new_for_tests(
         tmp.path(),
@@ -1329,11 +1399,383 @@ fn garbage_collection_keeps_tombstone_and_does_not_scan_unregistered_paths() {
     later.collect_garbage().unwrap();
 
     assert!(later
-        .tombstone_json(view.job_uuid)
+        .tombstone_json(job.job_uuid)
         .unwrap()
         .contains("deleted"));
+    assert_eq!(std::fs::read(&job.phase_path).unwrap(), job.phase_bytes);
+    assert_eq!(
+        std::fs::read(&job.async_metadata_path).unwrap(),
+        job.async_metadata_bytes
+    );
+    assert_eq!(
+        later.read_migration_phase(job.job_uuid).unwrap().job_uuid,
+        job.job_uuid
+    );
+    assert_eq!(
+        later
+            .read_async_migration_metadata(job.job_uuid)
+            .unwrap()
+            .job_uuid,
+        job.job_uuid
+    );
     assert!(unrelated.exists());
     assert!(outside.exists());
+}
+
+#[test]
+fn garbage_collection_reclaims_only_terminal_payloads_after_retention() {
+    let tmp = TempDir::new().unwrap();
+    let mut limits = test_limits();
+    limits.max_staged_artifacts = 8;
+    let now = fixed_now();
+    let store = SpoolStore::new_for_tests(tmp.path(), limits, now, 10_000).unwrap();
+    let eligible = [
+        (
+            uuid::Uuid::from_u128(0x10000000000000000000000000000001),
+            MigrationDisposition::Succeeded,
+            now - chrono::Duration::seconds(limits.retention_seconds),
+        ),
+        (
+            uuid::Uuid::from_u128(0x10000000000000000000000000000002),
+            MigrationDisposition::Failed,
+            now - chrono::Duration::seconds(limits.retention_seconds + 1),
+        ),
+        (
+            uuid::Uuid::from_u128(0x10000000000000000000000000000003),
+            MigrationDisposition::Cancelled,
+            now - chrono::Duration::seconds(limits.retention_seconds + 2),
+        ),
+    ];
+    let ineligible = [
+        (
+            uuid::Uuid::from_u128(0x10000000000000000000000000000004),
+            MigrationDisposition::Failed,
+            Some(now - chrono::Duration::seconds(limits.retention_seconds - 1)),
+        ),
+        (
+            uuid::Uuid::from_u128(0x10000000000000000000000000000005),
+            MigrationDisposition::Running,
+            None,
+        ),
+        (
+            uuid::Uuid::from_u128(0x10000000000000000000000000000006),
+            MigrationDisposition::Running,
+            Some(now - chrono::Duration::seconds(limits.retention_seconds + 30)),
+        ),
+        (
+            uuid::Uuid::from_u128(0x10000000000000000000000000000007),
+            MigrationDisposition::Succeeded,
+            None,
+        ),
+    ];
+
+    let mut eligible_jobs = Vec::new();
+    for (job_uuid, disposition, terminal_at) in eligible {
+        let mut job = create_gc_job(&store, job_uuid);
+        write_gc_phase(&store, job_uuid, disposition, Some(terminal_at));
+        refresh_gc_control_snapshot(&store, &mut job);
+        eligible_jobs.push(job);
+    }
+    let mut ineligible_snapshots = BTreeMap::new();
+    for (job_uuid, disposition, terminal_at) in ineligible {
+        create_gc_job(&store, job_uuid);
+        write_gc_phase(&store, job_uuid, disposition, terminal_at);
+        ineligible_snapshots.insert(job_uuid, snapshot_job_files(&store, job_uuid));
+    }
+
+    let expected_reclaimed = GC_EXPECTED_RECLAIMED_BYTES_PER_JOB * eligible_jobs.len() as u64;
+
+    store.collect_garbage().unwrap();
+
+    let mut actual_reclaimed = 0;
+    for job in eligible_jobs {
+        actual_reclaimed += job.reclaimable_bytes;
+        assert_eq!(
+            job.reclaimable_bytes, GC_EXPECTED_RECLAIMED_BYTES_PER_JOB,
+            "fixture should prove the hand-calculated payload byte total"
+        );
+        for path in job.deleted_paths {
+            assert!(
+                !path.exists(),
+                "eligible payload path should be deleted: {}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read(&job.phase_path).unwrap(),
+            job.phase_bytes,
+            "phase control file must survive byte-for-byte"
+        );
+        assert_eq!(
+            std::fs::read(&job.async_metadata_path).unwrap(),
+            job.async_metadata_bytes,
+            "async owner control file must survive byte-for-byte"
+        );
+        assert_eq!(
+            store.read_migration_phase(job.job_uuid).unwrap().job_uuid,
+            job.job_uuid
+        );
+        assert_eq!(
+            store
+                .read_async_migration_metadata(job.job_uuid)
+                .unwrap()
+                .job_uuid,
+            job.job_uuid
+        );
+        assert_manifest_payloads_reclaimed(&store, job.job_uuid);
+    }
+    assert_eq!(actual_reclaimed, expected_reclaimed);
+
+    for (job_uuid, before) in ineligible_snapshots {
+        assert_eq!(
+            snapshot_job_files(&store, job_uuid),
+            before,
+            "ineligible job {job_uuid} must be byte-for-byte unchanged"
+        );
+    }
+}
+
+#[test]
+fn garbage_collection_isolates_malformed_phase_and_continues_in_uuid_order() {
+    let tmp = TempDir::new().unwrap();
+    let mut limits = test_limits();
+    limits.max_staged_artifacts = 8;
+    let now = fixed_now();
+    let store = SpoolStore::new_for_tests(tmp.path(), limits, now, 10_000).unwrap();
+    let missing_phase = uuid::Uuid::from_u128(0x20000000000000000000000000000001);
+    let invalid_json = uuid::Uuid::from_u128(0x20000000000000000000000000000002);
+    let mismatched_uuid = uuid::Uuid::from_u128(0x20000000000000000000000000000003);
+    let eligible = uuid::Uuid::from_u128(0x20000000000000000000000000000004);
+
+    for job_uuid in [eligible, mismatched_uuid, invalid_json, missing_phase] {
+        create_gc_job(&store, job_uuid);
+        write_gc_phase(
+            &store,
+            job_uuid,
+            MigrationDisposition::Failed,
+            Some(now - chrono::Duration::seconds(limits.retention_seconds)),
+        );
+    }
+    std::fs::remove_file(store.migration_phase_path(missing_phase)).unwrap();
+    std::fs::write(store.migration_phase_path(invalid_json), b"not-json").unwrap();
+    let mut wrong_record = store.read_migration_phase(mismatched_uuid).unwrap();
+    wrong_record.job_uuid = uuid::Uuid::from_u128(0x29999999999999999999999999999999);
+    let wrong_bytes = serde_json::to_vec_pretty(&wrong_record).unwrap();
+    std::fs::write(store.migration_phase_path(mismatched_uuid), wrong_bytes).unwrap();
+
+    let bad_before = [missing_phase, invalid_json, mismatched_uuid]
+        .into_iter()
+        .map(|job_uuid| (job_uuid, snapshot_job_files(&store, job_uuid)))
+        .collect::<BTreeMap<_, _>>();
+    let expected_eligible_deleted = gc_deleted_paths(&store, eligible);
+    let captured = CapturedSpoolWarnings::default();
+    let subscriber = tracing_subscriber::registry().with(captured.clone());
+
+    tracing::subscriber::with_default(subscriber, || {
+        store.collect_garbage().unwrap();
+    });
+
+    assert_eq!(
+        captured.events(),
+        vec![
+            CapturedSpoolWarning {
+                job_uuid: missing_phase,
+                error_kind: spool_error_kind_name(SpoolErrorKind::JobNotFound),
+            },
+            CapturedSpoolWarning {
+                job_uuid: invalid_json,
+                error_kind: spool_error_kind_name(SpoolErrorKind::ManifestCorrupt),
+            },
+            CapturedSpoolWarning {
+                job_uuid: mismatched_uuid,
+                error_kind: spool_error_kind_name(SpoolErrorKind::ManifestCorrupt),
+            },
+        ],
+        "malformed phase warnings must follow lexical UUID order"
+    );
+    for (job_uuid, before) in bad_before {
+        assert_eq!(
+            snapshot_job_files(&store, job_uuid),
+            before,
+            "bad phase job {job_uuid} must fail closed"
+        );
+    }
+    for path in expected_eligible_deleted {
+        assert!(
+            !path.exists(),
+            "later eligible job should still be reclaimed: {}",
+            path.display()
+        );
+    }
+    assert_manifest_payloads_reclaimed(&store, eligible);
+
+    let post_first_pass = [missing_phase, invalid_json, mismatched_uuid, eligible]
+        .into_iter()
+        .map(|job_uuid| (job_uuid, snapshot_job_files(&store, job_uuid)))
+        .collect::<BTreeMap<_, _>>();
+    let post_first_accounting = [missing_phase, invalid_json, mismatched_uuid, eligible]
+        .into_iter()
+        .map(|job_uuid| (job_uuid, manifest_payload_accounting(&store, job_uuid)))
+        .collect::<BTreeMap<_, _>>();
+
+    store.collect_garbage().unwrap();
+
+    for (job_uuid, before) in post_first_pass {
+        assert_eq!(
+            snapshot_job_files(&store, job_uuid),
+            before,
+            "second pass should leave job files unchanged for {job_uuid}"
+        );
+    }
+    for (job_uuid, before) in post_first_accounting {
+        assert_eq!(
+            manifest_payload_accounting(&store, job_uuid),
+            before,
+            "second pass should leave manifest accounting unchanged for {job_uuid}"
+        );
+    }
+}
+
+#[derive(Debug)]
+struct GcJobFixture {
+    job_uuid: uuid::Uuid,
+    deleted_paths: Vec<std::path::PathBuf>,
+    reclaimable_bytes: u64,
+    phase_path: std::path::PathBuf,
+    phase_bytes: Vec<u8>,
+    async_metadata_path: std::path::PathBuf,
+    async_metadata_bytes: Vec<u8>,
+}
+
+fn create_gc_job(store: &SpoolStore, job_uuid: uuid::Uuid) -> GcJobFixture {
+    store
+        .create_async_migration_admission(job_uuid, "target-index")
+        .unwrap();
+    store
+        .create_export(
+            job_uuid,
+            &source_digest(),
+            ResourceDenominators {
+                settings: 1,
+                documents: 1,
+                rules: 1,
+                synonyms: 1,
+                config: 0,
+            },
+        )
+        .unwrap();
+    store
+        .commit_settings(job_uuid, br#"{"ranking":["typo"]}"#, 1)
+        .unwrap();
+    store
+        .commit_document_page_with_ids(job_uuid, br#"[{"objectID":"doc-1"}]"#, &["doc-1"])
+        .unwrap();
+    store
+        .commit_rule_page_with_ids(job_uuid, br#"[{"objectID":"rule-1"}]"#, &["rule-1"])
+        .unwrap();
+    store
+        .commit_synonym_page_with_ids(job_uuid, br#"[{"objectID":"syn-1"}]"#, &["syn-1"])
+        .unwrap();
+    GcJobFixture {
+        job_uuid,
+        deleted_paths: gc_deleted_paths(store, job_uuid),
+        reclaimable_bytes: gc_reclaimable_bytes(store, job_uuid),
+        phase_path: store.migration_phase_path(job_uuid),
+        phase_bytes: std::fs::read(store.migration_phase_path(job_uuid)).unwrap(),
+        async_metadata_path: store.async_migration_metadata_path(job_uuid),
+        async_metadata_bytes: std::fs::read(store.async_migration_metadata_path(job_uuid)).unwrap(),
+    }
+}
+
+fn refresh_gc_control_snapshot(store: &SpoolStore, job: &mut GcJobFixture) {
+    job.phase_bytes = std::fs::read(store.migration_phase_path(job.job_uuid)).unwrap();
+    job.async_metadata_bytes =
+        std::fs::read(store.async_migration_metadata_path(job.job_uuid)).unwrap();
+}
+
+fn write_gc_phase(
+    store: &SpoolStore,
+    job_uuid: uuid::Uuid,
+    disposition: MigrationDisposition,
+    terminal_at: Option<chrono::DateTime<Utc>>,
+) {
+    let mut record = store.read_migration_phase(job_uuid).unwrap();
+    record.disposition = disposition;
+    record.terminal_at = terminal_at;
+    record.updated_at = terminal_at.unwrap_or_else(fixed_now);
+    if disposition == MigrationDisposition::Succeeded {
+        record.phase = MigrationPhase::Activating;
+    }
+    if disposition == MigrationDisposition::Cancelled {
+        record.cancel_requested = true;
+    }
+    store.commit_migration_phase(&record).unwrap();
+}
+
+fn gc_deleted_paths(store: &SpoolStore, job_uuid: uuid::Uuid) -> Vec<std::path::PathBuf> {
+    let manifest = store.read_manifest(job_uuid).unwrap();
+    let mut paths = visible_artifacts(&manifest)
+        .map(|artifact| store.job_dir(job_uuid).join(&artifact.final_path))
+        .collect::<Vec<_>>();
+    paths.extend([
+        store.completed_sidecar_path(job_uuid),
+        store.resource_sidecar_path(job_uuid, ObjectResource::Rules),
+        store.resource_sidecar_path(job_uuid, ObjectResource::Synonyms),
+    ]);
+    paths
+}
+
+fn gc_reclaimable_bytes(store: &SpoolStore, job_uuid: uuid::Uuid) -> u64 {
+    gc_deleted_paths(store, job_uuid)
+        .into_iter()
+        .map(|path| std::fs::metadata(path).unwrap().len())
+        .sum()
+}
+
+fn snapshot_job_files(store: &SpoolStore, job_uuid: uuid::Uuid) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    for entry in std::fs::read_dir(store.job_dir(job_uuid)).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            files.insert(
+                entry.file_name().to_string_lossy().to_string(),
+                std::fs::read(entry.path()).unwrap(),
+            );
+        }
+    }
+    files
+}
+
+fn assert_manifest_payloads_reclaimed(store: &SpoolStore, job_uuid: uuid::Uuid) {
+    let manifest = store.read_manifest(job_uuid).unwrap();
+    assert_eq!(manifest.bytes_committed, 0);
+    assert_eq!(manifest.counters.total(), 0);
+    assert!(manifest.artifacts.is_empty());
+    assert_eq!(manifest.completed_objects, SidecarManifest::default());
+    assert_eq!(manifest.completed_rules, SidecarManifest::default());
+    assert_eq!(manifest.completed_synonyms, SidecarManifest::default());
+}
+
+fn manifest_payload_accounting(
+    store: &SpoolStore,
+    job_uuid: uuid::Uuid,
+) -> (
+    u64,
+    ResourceCounters,
+    usize,
+    SidecarManifest,
+    SidecarManifest,
+    SidecarManifest,
+) {
+    let manifest = store.read_manifest(job_uuid).unwrap();
+    (
+        manifest.bytes_committed,
+        manifest.counters,
+        manifest.artifacts.len(),
+        manifest.completed_objects,
+        manifest.completed_rules,
+        manifest.completed_synonyms,
+    )
 }
 
 #[test]

@@ -11,6 +11,20 @@ use std::time::{Duration, Instant};
 const DEFAULT_WRITE_DURABLE_TIMEOUT_MS: u64 = 30_000;
 
 impl super::IndexManager {
+    fn get_or_create_admission_store(&self, tenant_id: &str) -> Result<Arc<WriteAdmissionStore>> {
+        if let Some(store) = self.admission_stores.get(tenant_id) {
+            return Ok(Arc::clone(store.value()));
+        }
+
+        let store = Arc::new(WriteAdmissionStore::open(&self.base_path, tenant_id)?);
+        Ok(Arc::clone(
+            self.admission_stores
+                .entry(tenant_id.to_string())
+                .or_insert(store)
+                .value(),
+        ))
+    }
+
     /// Parse a canonical task key (`task_<tenant>_<suffix>`) and return the tenant id.
     ///
     /// Numeric aliases and malformed IDs return `None`.
@@ -24,15 +38,32 @@ impl super::IndexManager {
         }
     }
 
+    fn error_from_terminal_task_failure(message: &str) -> FlapjackError {
+        if let Some((current, max)) = parse_writer_contention_failure(message) {
+            return FlapjackError::TooManyConcurrentWrites { current, max };
+        }
+        FlapjackError::Tantivy(message.to_string())
+    }
+
     /// Get or create a write queue for the given tenant.
     ///
     /// DRY helper — all write paths (add, delete, compact) go through this.
     /// Handles oplog creation, write queue spawning, and vector context setup.
-    fn get_or_create_write_queue(&self, tenant_id: &str, index: &Arc<Index>) -> WriteQueue {
-        self.write_queues
+    pub(super) fn get_or_create_write_queue(
+        &self,
+        tenant_id: &str,
+        index: &Arc<Index>,
+    ) -> Result<WriteQueue> {
+        if let Some(queue) = self.write_queues.get(tenant_id) {
+            return Ok(queue.clone());
+        }
+
+        let oplog = self.get_or_create_oplog_result(tenant_id)?;
+        let admission_store = self.get_or_create_admission_store(tenant_id)?;
+        let entry = self
+            .write_queues
             .entry(tenant_id.to_string())
-            .or_insert_with(|| {
-                let oplog = self.get_or_create_oplog(tenant_id);
+            .or_try_insert_with(|| -> Result<WriteQueue> {
                 #[cfg(feature = "vector-search")]
                 let vector_ctx = VectorWriteContext::new(Arc::clone(&self.vector_indices));
                 #[cfg(not(feature = "vector-search"))]
@@ -43,16 +74,17 @@ impl super::IndexManager {
                     _writers: Arc::clone(&self.writers),
                     tasks: Arc::clone(&self.tasks),
                     base_path: self.base_path.clone(),
-                    oplog,
+                    oplog: Some(Arc::clone(&oplog)),
+                    admission_store: Arc::clone(&admission_store),
                     facet_cache: Arc::clone(&self.facet_cache),
                     lww_map: Arc::clone(&self.lww_map),
                     vector_ctx,
-                });
+                })?;
                 self.write_task_handles
                     .insert(tenant_id.to_string(), handle);
-                queue
-            })
-            .clone()
+                Ok(queue)
+            })?;
+        Ok(entry.clone())
     }
 
     /// Add documents to a tenant's index.
@@ -90,16 +122,6 @@ impl super::IndexManager {
     ) -> Result<TaskInfo> {
         let index = self.get_or_load(tenant_id)?;
 
-        let numeric_id = self.next_numeric_task_id();
-        let task_id = format!("task_{}_{}", tenant_id, uuid::Uuid::new_v4());
-        let task = TaskInfo::new(task_id.clone(), numeric_id, docs.len());
-        self.tasks.insert(task_id.clone(), task.clone());
-        self.tasks.insert(numeric_id.to_string(), task.clone());
-
-        self.evict_old_tasks(tenant_id, MAX_TASKS_PER_TENANT);
-
-        let tx = self.get_or_create_write_queue(tenant_id, &index);
-
         let actions = if upsert {
             if no_lww_update {
                 docs.into_iter()
@@ -111,21 +133,7 @@ impl super::IndexManager {
         } else {
             docs.into_iter().map(WriteAction::Add).collect()
         };
-        if tx
-            .try_send(WriteOp {
-                task_id: task_id.clone(),
-                actions,
-            })
-            .is_err()
-        {
-            self.tasks.alter(&task_id, |_, mut t| {
-                t.status = TaskStatus::Failed("Queue full".to_string());
-                t
-            });
-            return Err(FlapjackError::QueueFull);
-        }
-
-        Ok(task)
+        self.admit_write_actions(tenant_id, &index, actions)
     }
 
     /// Queue document deletions by object ID with LWW tracking. Creates a task
@@ -133,32 +141,8 @@ impl super::IndexManager {
     pub fn delete_documents(&self, tenant_id: &str, object_ids: Vec<String>) -> Result<TaskInfo> {
         let index = self.get_or_load(tenant_id)?;
 
-        let numeric_id = self.next_numeric_task_id();
-        let task_id = format!("task_{}_{}", tenant_id, uuid::Uuid::new_v4());
-        let task = TaskInfo::new(task_id.clone(), numeric_id, object_ids.len());
-        self.tasks.insert(task_id.clone(), task.clone());
-        self.tasks.insert(numeric_id.to_string(), task.clone());
-
-        self.evict_old_tasks(tenant_id, MAX_TASKS_PER_TENANT);
-
-        let tx = self.get_or_create_write_queue(tenant_id, &index);
-
         let actions = object_ids.into_iter().map(WriteAction::Delete).collect();
-        if tx
-            .try_send(WriteOp {
-                task_id: task_id.clone(),
-                actions,
-            })
-            .is_err()
-        {
-            self.tasks.alter(&task_id, |_, mut t| {
-                t.status = TaskStatus::Failed("Queue full".to_string());
-                t
-            });
-            return Err(FlapjackError::QueueFull);
-        }
-
-        Ok(task)
+        self.admit_write_actions(tenant_id, &index, actions)
     }
 
     /// Test-only seam: abort a tenant's write task to simulate a restart after
@@ -199,35 +183,11 @@ impl super::IndexManager {
     ) -> Result<TaskInfo> {
         let index = self.get_or_load(tenant_id)?;
 
-        let numeric_id = self.next_numeric_task_id();
-        let task_id = format!("task_{}_{}", tenant_id, uuid::Uuid::new_v4());
-        let task = TaskInfo::new(task_id.clone(), numeric_id, object_ids.len());
-        self.tasks.insert(task_id.clone(), task.clone());
-        self.tasks.insert(numeric_id.to_string(), task.clone());
-
-        self.evict_old_tasks(tenant_id, MAX_TASKS_PER_TENANT);
-
-        let tx = self.get_or_create_write_queue(tenant_id, &index);
-
         let actions = object_ids
             .into_iter()
             .map(WriteAction::DeleteNoLwwUpdate)
             .collect();
-        if tx
-            .try_send(WriteOp {
-                task_id: task_id.clone(),
-                actions,
-            })
-            .is_err()
-        {
-            self.tasks.alter(&task_id, |_, mut t| {
-                t.status = TaskStatus::Failed("Queue full".to_string());
-                t
-            });
-            return Err(FlapjackError::QueueFull);
-        }
-
-        Ok(task)
+        self.admit_write_actions(tenant_id, &index, actions)
     }
 
     /// Queue a segment compaction for the tenant. Creates a task and sends a
@@ -235,28 +195,36 @@ impl super::IndexManager {
     pub fn compact_index(&self, tenant_id: &str) -> Result<TaskInfo> {
         let index = self.get_or_load(tenant_id)?;
 
+        self.admit_write_actions(tenant_id, &index, vec![WriteAction::Compact])
+    }
+
+    fn admit_write_actions(
+        &self,
+        tenant_id: &str,
+        index: &Arc<Index>,
+        actions: Vec<WriteAction>,
+    ) -> Result<TaskInfo> {
+        let tx = self.get_or_create_write_queue(tenant_id, index)?;
+        // Preserve the pre-admission API contract from `try_send`: callers can retry
+        // both capacity pressure and a queue consumer that is being restarted.
+        let permit = tx.try_reserve().map_err(|_| FlapjackError::QueueFull)?;
+
         let numeric_id = self.next_numeric_task_id();
         let task_id = format!("task_{}_{}", tenant_id, uuid::Uuid::new_v4());
-        let task = TaskInfo::new(task_id.clone(), numeric_id, 0);
+        let received_documents = actions.len();
+        let admission_store = self.get_or_create_admission_store(tenant_id)?;
+        let record = admission_store.append_record(WriteAdmissionRecord::new(
+            task_id.clone(),
+            numeric_id,
+            received_documents,
+            actions,
+        ))?;
+        let task = record.task_info();
         self.tasks.insert(task_id.clone(), task.clone());
         self.tasks.insert(numeric_id.to_string(), task.clone());
+        self.evict_old_tasks(tenant_id, MAX_TASKS_PER_TENANT);
 
-        let tx = self.get_or_create_write_queue(tenant_id, &index);
-
-        if tx
-            .try_send(WriteOp {
-                task_id: task_id.clone(),
-                actions: vec![WriteAction::Compact],
-            })
-            .is_err()
-        {
-            self.tasks.alter(&task_id, |_, mut t| {
-                t.status = TaskStatus::Failed("Queue full".to_string());
-                t
-            });
-            return Err(FlapjackError::QueueFull);
-        }
-
+        permit.send(record.write_op());
         Ok(task)
     }
 
@@ -320,7 +288,7 @@ impl super::IndexManager {
                                 .insert(status.numeric_id.to_string(), status.clone());
                         }
                     }
-                    return Err(FlapjackError::Tantivy(e.clone()));
+                    return Err(Self::error_from_terminal_task_failure(e));
                 }
             }
         }
@@ -417,4 +385,10 @@ impl super::IndexManager {
         let task = self.delete_documents_for_replication(tenant_id, object_ids)?;
         self.await_task_terminal(&task.id, None).await
     }
+}
+
+fn parse_writer_contention_failure(message: &str) -> Option<(usize, usize)> {
+    let details = message.strip_prefix("Too many concurrent writes: ")?;
+    let (current, max) = details.split_once(" active, max ")?;
+    Some((current.parse().ok()?, max.parse().ok()?))
 }

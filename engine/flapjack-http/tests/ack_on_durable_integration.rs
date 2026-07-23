@@ -252,33 +252,28 @@ fn set_default_durable_timeout_env_for_test() -> DurableTimeoutEnvOverrideGuard 
 
 #[test]
 fn test_durable_timeout_env_override_requires_isolation() {
-    let (lock_held_tx, lock_held_rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        let _worker_override = set_durable_timeout_env_for_test(111);
-        lock_held_tx
-            .send(())
-            .expect("worker should signal once lock is held");
-        std::thread::sleep(Duration::from_millis(150));
-    });
-
-    lock_held_rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("worker should acquire lock before main-thread assertion");
-    let started = std::time::Instant::now();
-    let _main_override = set_durable_timeout_env_for_test(222);
-    let waited = started.elapsed();
+    let first_override = set_durable_timeout_env_for_test(111);
     let observed = std::env::var("FLAPJACK_WRITE_DURABLE_TIMEOUT_MS")
         .expect("timeout override should be visible while test holds it");
-    drop(_main_override);
-    worker.join().expect("worker thread should join");
+
+    assert_eq!(
+        observed, "111",
+        "first override should be visible while its guard is held"
+    );
+    assert!(
+        DURABLE_TIMEOUT_ENV_LOCK.try_lock().is_err(),
+        "override guard should hold the env lock until drop"
+    );
+    drop(first_override);
+
+    let second_override = set_durable_timeout_env_for_test(222);
+    let observed = std::env::var("FLAPJACK_WRITE_DURABLE_TIMEOUT_MS")
+        .expect("timeout override should be visible after reacquiring lock");
+    drop(second_override);
 
     assert_eq!(
         observed, "222",
-        "main thread should observe its own override value once it acquires the lock"
-    );
-    assert!(
-        waited >= Duration::from_millis(100),
-        "second override should block until first guard releases lock; waited={waited:?}"
+        "second override should be visible after the first guard releases the lock"
     );
 }
 
@@ -286,6 +281,10 @@ fn test_durable_timeout_env_override_requires_isolation() {
 fn set_tenant_permissions_read_only(base: &std::path::Path, tenant: &str) {
     use std::os::unix::fs::PermissionsExt;
     let tenant_path = base.join(tenant);
+    // Keep durable admission writable so this seam fails after the task is
+    // accepted, when Tantivy commits into the read-only tenant directory.
+    std::fs::create_dir_all(tenant_path.join("write_admission"))
+        .expect("write admission dir should exist before forcing commit failure");
     let mut perms = std::fs::metadata(&tenant_path)
         .expect("tenant dir metadata should exist")
         .permissions();

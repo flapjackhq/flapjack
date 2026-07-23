@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::FlapjackError;
 use crate::index::memory::{MemoryBudget, MemoryBudgetConfig};
 use once_cell::sync::Lazy;
 use prometheus::{Encoder, TextEncoder};
@@ -111,6 +112,8 @@ fn setup_write_queue_with_index(
     let vector_ctx = VectorWriteContext::new(Arc::new(dashmap::DashMap::new()));
     #[cfg(not(feature = "vector-search"))]
     let vector_ctx = VectorWriteContext::new();
+    let admission_store =
+        Arc::new(admission::WriteAdmissionStore::open(tmp.path(), tenant_id).unwrap());
 
     let (tx, handle) = create_write_queue(WriteQueueContext {
         tenant_id: tenant_id.to_string(),
@@ -119,10 +122,12 @@ fn setup_write_queue_with_index(
         tasks: Arc::clone(&tasks),
         base_path: tmp.path().to_path_buf(),
         oplog: None,
+        admission_store,
         facet_cache,
         lww_map,
         vector_ctx,
-    });
+    })
+    .unwrap();
 
     (tx, handle, tasks)
 }
@@ -340,6 +345,43 @@ async fn test_multiple_queues_progress_under_tight_writer_budget() {
 
     let count_b = indexed_document_count(index_b.as_ref());
     assert_eq!(count_b, 1, "index_b should contain 1 committed document");
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_acquire_writer_for_queue_returns_writer_contention_error_not_queue_full() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let shared_budget = Arc::new(MemoryBudget::new(MemoryBudgetConfig {
+        max_concurrent_writers: 1,
+        ..Default::default()
+    }));
+    let tenant_path = tmp.path().join("writer_contention_tenant");
+    std::fs::create_dir_all(&tenant_path).unwrap();
+    let schema = crate::index::schema::Schema::builder().build();
+    let index = Arc::new(
+        crate::index::Index::create_with_budget(&tenant_path, schema, shared_budget).unwrap(),
+    );
+    let _held_writer = index.writer().unwrap();
+
+    let acquire = tokio::spawn({
+        let index = Arc::clone(&index);
+        async move { acquire_writer_for_queue(&index, "writer_contention_tenant").await }
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(31)).await;
+
+    let result = acquire
+        .await
+        .expect("writer acquisition task must not panic");
+    let Err(error) = result else {
+        panic!("held writer slot must exhaust writer acquisition retries");
+    };
+    assert!(
+        matches!(
+            error,
+            FlapjackError::TooManyConcurrentWrites { current: _, max: 1 }
+        ),
+        "writer contention must surface TooManyConcurrentWrites, never QueueFull; got {error:?}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -692,6 +734,8 @@ async fn test_create_write_queue_with_vector_indices() {
     > = Arc::new(dashmap::DashMap::new());
 
     let vector_ctx = VectorWriteContext::new(vector_indices);
+    let admission_store =
+        Arc::new(admission::WriteAdmissionStore::open(tmp.path(), tenant_id).unwrap());
 
     let (tx, handle) = create_write_queue(WriteQueueContext {
         tenant_id: tenant_id.to_string(),
@@ -700,10 +744,12 @@ async fn test_create_write_queue_with_vector_indices() {
         tasks: Arc::clone(&tasks),
         base_path: tmp.path().to_path_buf(),
         oplog: None,
+        admission_store,
         facet_cache,
         lww_map,
         vector_ctx,
-    });
+    })
+    .unwrap();
 
     let task_id = register_task(tasks.as_ref(), "vec_task_1", 1, 1);
 
@@ -790,6 +836,8 @@ mod auto_embed_tests {
         let lww_map = Arc::new(dashmap::DashMap::new());
         let vector_indices: VectorIndicesMap = Arc::new(dashmap::DashMap::new());
         let vector_ctx = VectorWriteContext::new(Arc::clone(&vector_indices));
+        let admission_store =
+            Arc::new(admission::WriteAdmissionStore::open(tmp.path(), tenant_id).unwrap());
 
         let (tx, handle) = create_write_queue(WriteQueueContext {
             tenant_id: tenant_id.to_string(),
@@ -798,10 +846,12 @@ mod auto_embed_tests {
             tasks: Arc::clone(&tasks),
             base_path: tmp.path().to_path_buf(),
             oplog,
+            admission_store,
             facet_cache,
             lww_map,
             vector_ctx,
-        });
+        })
+        .unwrap();
 
         (tx, handle, tasks, vector_indices)
     }
@@ -1525,6 +1575,8 @@ mod auto_embed_tests {
         let lww_map = Arc::new(dashmap::DashMap::new());
         let vector_indices: VectorIndicesMap = Arc::new(dashmap::DashMap::new());
         let vector_ctx = VectorWriteContext::new(Arc::clone(&vector_indices));
+        let admission_store =
+            Arc::new(admission::WriteAdmissionStore::open(tmp.path(), tenant_id).unwrap());
 
         let (tx, handle) = create_write_queue(WriteQueueContext {
             tenant_id: tenant_id.to_string(),
@@ -1533,10 +1585,12 @@ mod auto_embed_tests {
             tasks: Arc::clone(&tasks),
             base_path: tmp.path().to_path_buf(),
             oplog: None,
+            admission_store,
             facet_cache,
             lww_map,
             vector_ctx,
-        });
+        })
+        .unwrap();
 
         let task_id = register_task(tasks.as_ref(), "strip_task", 1, 1);
 

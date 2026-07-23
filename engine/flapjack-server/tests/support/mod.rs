@@ -2,6 +2,7 @@
 
 use assert_cmd::Command;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const AUTO_PORT_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const AUTO_PORT_HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
-const FLAPJACK_AMBIENT_ENV_VARS: [&str; 10] = [
+const FLAPJACK_AMBIENT_ENV_VARS: [&str; 16] = [
     "FLAPJACK_ADMIN_KEY",
     "FLAPJACK_NO_AUTH",
     "FLAPJACK_ENV",
@@ -23,6 +24,12 @@ const FLAPJACK_AMBIENT_ENV_VARS: [&str; 10] = [
     "FLAPJACK_IDEMPOTENCY_TTL_SECS",
     "FLAPJACK_IDEMPOTENCY_PERSISTENT",
     "FLAPJACK_IDEMPOTENCY_PERSIST",
+    "FLAPJACK_MAX_CONCURRENT_WRITERS",
+    "FLAPJACK_WRITE_DURABLE_TIMEOUT_MS",
+    "FLAPJACK_WRITE_QUEUE_BATCH_SIZE",
+    "FLAPJACK_WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_MS",
+    "FLAPJACK_WRITE_QUEUE_CHANNEL_CAPACITY",
+    "FLAPJACK_WRITE_QUEUE_START_DELAY_MS",
 ];
 
 pub(crate) fn flapjack_cmd() -> Command {
@@ -217,6 +224,14 @@ impl RunningServer {
         Self { child, bind_addr }
     }
 
+    pub(crate) fn spawn_no_auth_auto_port_with_env(
+        data_dir: &str,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
+        let (child, bind_addr) = Self::start_auto_port_process_with_env(data_dir, true, extra_env);
+        Self { child, bind_addr }
+    }
+
     fn spawn_auto_port(data_dir: &str, no_auth: bool) -> Self {
         let (child, bind_addr) = Self::start_auto_port_process(data_dir, no_auth);
         Self { child, bind_addr }
@@ -304,6 +319,17 @@ impl RunningServer {
         self.bind_addr = bind_addr;
     }
 
+    pub(crate) fn kill_and_restart_no_auth_auto_port_with_env(
+        &mut self,
+        data_dir: &str,
+        extra_env: &[(&str, &str)],
+    ) {
+        self.kill_child();
+        let (child, bind_addr) = Self::start_auto_port_process_with_env(data_dir, true, extra_env);
+        self.child = child;
+        self.bind_addr = bind_addr;
+    }
+
     pub(crate) fn kill_and_restart_no_auth_auto_port_with_persistent_idempotency(
         &mut self,
         data_dir: &str,
@@ -356,6 +382,7 @@ pub(crate) fn run_auth_auto_port_startup_once(data_dir: &str, extra_env: &[(&str
 
 pub(crate) struct HttpResponse {
     pub(crate) status: u16,
+    pub(crate) headers: HashMap<String, String>,
     pub(crate) body: String,
 }
 
@@ -605,6 +632,38 @@ pub(crate) fn http_request(
     http_request_with_headers(bind_addr, method, path, &[], body)
 }
 
+pub(crate) fn http_request_with_read_timeout(
+    bind_addr: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+    read_timeout: Duration,
+) -> Result<HttpResponse, String> {
+    http_request_with_headers_and_read_timeout(bind_addr, method, path, headers, body, read_timeout)
+}
+
+pub(crate) fn open_http_request_with_read_timeout(
+    bind_addr: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+    read_timeout: Duration,
+) -> Result<TcpStream, String> {
+    let body = body.unwrap_or("");
+    let mut stream = TcpStream::connect(bind_addr)
+        .map_err(|e| format!("failed to connect to {}: {}", bind_addr, e))?;
+    stream
+        .set_read_timeout(Some(read_timeout))
+        .map_err(|e| format!("failed setting read timeout: {}", e))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|e| format!("failed setting write timeout: {}", e))?;
+    write_http_request(&mut stream, bind_addr, method, path, headers, body)?;
+    Ok(stream)
+}
+
 fn persistent_idempotency_env(ttl: Duration) -> [(&'static str, &'static str); 2] {
     let ttl_secs = ttl.as_secs().max(1);
     let ttl = Box::leak(ttl_secs.to_string().into_boxed_str());
@@ -685,32 +744,33 @@ pub(crate) fn http_request_with_headers(
     headers: &[(&str, &str)],
     body: Option<&str>,
 ) -> Result<HttpResponse, String> {
+    http_request_with_headers_and_read_timeout(
+        bind_addr,
+        method,
+        path,
+        headers,
+        body,
+        Duration::from_secs(2),
+    )
+}
+
+fn http_request_with_headers_and_read_timeout(
+    bind_addr: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+    read_timeout: Duration,
+) -> Result<HttpResponse, String> {
     let body = body.unwrap_or("");
-    let mut stream = TcpStream::connect(bind_addr)
-        .map_err(|e| format!("failed to connect to {}: {}", bind_addr, e))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .map_err(|e| format!("failed setting read timeout: {}", e))?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(2)))
-        .map_err(|e| format!("failed setting write timeout: {}", e))?;
-
-    let mut request = format!(
-        "{method} {path} HTTP/1.0\r\nHost: {bind_addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-        body.len()
-    );
-    for (header_name, header_value) in headers {
-        request.push_str(header_name);
-        request.push_str(": ");
-        request.push_str(header_value);
-        request.push_str("\r\n");
-    }
-    request.push_str("\r\n");
-    request.push_str(body);
-
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| format!("failed writing request to {}: {}", bind_addr, e))?;
+    let mut stream = open_http_request_with_read_timeout(
+        bind_addr,
+        method,
+        path,
+        headers,
+        Some(body),
+        read_timeout,
+    )?;
 
     let mut raw = Vec::new();
     stream
@@ -731,11 +791,46 @@ pub(crate) fn http_request_with_headers(
         .ok_or_else(|| format!("missing HTTP status code in line: {}", status_line))?
         .parse::<u16>()
         .map_err(|e| format!("invalid HTTP status in '{}': {}", status_line, e))?;
+    let headers = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        })
+        .collect();
 
     Ok(HttpResponse {
         status,
+        headers,
         body: payload.to_string(),
     })
+}
+
+fn write_http_request(
+    stream: &mut TcpStream,
+    bind_addr: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Result<(), String> {
+    let mut request = format!(
+        "{method} {path} HTTP/1.0\r\nHost: {bind_addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (header_name, header_value) in headers {
+        request.push_str(header_name);
+        request.push_str(": ");
+        request.push_str(header_value);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("failed writing request to {}: {}", bind_addr, e))
 }
 
 pub(crate) fn admin_auth_headers(api_key: &str) -> [(&'static str, &str); 2] {

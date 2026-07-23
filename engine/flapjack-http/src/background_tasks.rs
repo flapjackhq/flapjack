@@ -1,11 +1,16 @@
+use crate::handlers::migration::spool::{SpoolError, SpoolLimits, SpoolStore};
 use crate::handlers::AppState;
 use crate::server_init::InfrastructureState;
 use crate::tenant_dirs::{has_visible_tenant_dirs, visible_tenant_dir_names};
+use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 const HOUR_MS: i64 = 3_600_000;
+const MIGRATION_SPOOL_GC_INTERVAL_ENV: &str = "FLAPJACK_MIGRATION_SPOOL_GC_INTERVAL_SECS";
+const DEFAULT_MIGRATION_SPOOL_GC_INTERVAL_SECS: u64 = 300;
 
 /// Restore all tenant indexes from S3 snapshots when the data directory is empty.
 ///
@@ -213,9 +218,61 @@ pub(crate) fn spawn_background_tasks(state: &Arc<AppState>, infrastructure: &Inf
     spawn_analytics_tasks(infrastructure);
     spawn_s3_backup_task(infrastructure);
     spawn_replication_tasks(state, infrastructure);
+    spawn_migration_spool_gc_task(state);
     spawn_usage_rollup_task(state);
     spawn_metrics_refresh_task(state);
     spawn_usage_alert_task(state);
+}
+
+fn migration_spool_gc_interval_secs() -> u64 {
+    std::env::var(MIGRATION_SPOOL_GC_INTERVAL_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT_MIGRATION_SPOOL_GC_INTERVAL_SECS)
+}
+
+fn spawn_migration_spool_gc_task(state: &Arc<AppState>) {
+    let interval_secs = migration_spool_gc_interval_secs();
+    let store = match SpoolStore::new(&state.manager.base_path, SpoolLimits::default()) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!("[migration] Spool GC task disabled: {}", error);
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        run_migration_spool_gc_loop(Duration::from_secs(interval_secs), move || {
+            let store = store.clone();
+            async move { run_migration_spool_gc_pass(&store) }
+        })
+        .await;
+    });
+    tracing::info!("[migration] Spool GC enabled (interval={}s)", interval_secs);
+}
+
+async fn run_migration_spool_gc_loop<RunPass, PassFuture, PassError>(
+    interval_duration: Duration,
+    mut run_pass: RunPass,
+) where
+    RunPass: FnMut() -> PassFuture,
+    PassFuture: Future<Output = Result<(), PassError>>,
+    PassError: fmt::Display,
+{
+    let mut interval = tokio::time::interval(interval_duration);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        if let Err(error) = run_pass().await {
+            tracing::error!("[migration] Spool GC pass failed: {}", error);
+        }
+    }
+}
+
+fn run_migration_spool_gc_pass(store: &SpoolStore) -> Result<(), SpoolError> {
+    store.collect_garbage()
 }
 
 fn spawn_ssl_renewal(infrastructure: &InfrastructureState) {
@@ -525,252 +582,5 @@ fn spawn_usage_alert_task(state: &Arc<AppState>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        completed_utc_day, extract_s3_snapshot_tenant_id, rollup_window_bounds_ms,
-        run_usage_rollover, HOUR_MS,
-    };
-    use crate::test_helpers::{with_env_var, TestStateBuilder};
-    use crate::usage_persistence::UsagePersistence;
-    use chrono::TimeZone;
-    use std::sync::atomic::Ordering;
-
-    #[test]
-    fn completed_utc_day_returns_prior_day_at_and_after_midnight() {
-        let midnight = chrono::Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 0).unwrap();
-        assert_eq!(completed_utc_day(midnight), "2026-07-19");
-
-        let one_second_after = chrono::Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 1).unwrap();
-        assert_eq!(completed_utc_day(one_second_after), "2026-07-19");
-
-        let just_before_midnight = chrono::Utc
-            .with_ymd_and_hms(2026, 7, 19, 23, 59, 59)
-            .unwrap();
-        assert_eq!(completed_utc_day(just_before_midnight), "2026-07-18");
-    }
-
-    #[test]
-    fn s3_snapshot_tenant_prefix_rejects_path_traversal_components() {
-        assert_eq!(
-            extract_s3_snapshot_tenant_id("snapshots/products/"),
-            Some("products".to_string())
-        );
-        assert_eq!(
-            extract_s3_snapshot_tenant_id("snapshots/products_v2-2026/"),
-            Some("products_v2-2026".to_string())
-        );
-
-        for prefix in [
-            "snapshots/../",
-            "snapshots/./",
-            "snapshots//",
-            "snapshots/nested/index/",
-            "snapshots\\windows\\",
-            "not-snapshots/products/",
-        ] {
-            assert_eq!(
-                extract_s3_snapshot_tenant_id(prefix),
-                None,
-                "{prefix} must not become a local restore path component"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn one_shot_rollover_persists_completed_day_and_resets_counters() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let state = TestStateBuilder::new(&tmp).build_shared();
-        let persistence = UsagePersistence::new(tmp.path()).unwrap();
-        let gauges = state.metrics_state.as_ref().unwrap().storage_gauges.clone();
-
-        // Seed all seven counter fields with distinct non-zero values.
-        {
-            let entry = state
-                .usage_counters
-                .entry("products".to_string())
-                .or_default();
-            entry.search_count.store(11, Ordering::Relaxed);
-            entry.write_count.store(22, Ordering::Relaxed);
-            entry.read_count.store(33, Ordering::Relaxed);
-            entry.bytes_in.store(44, Ordering::Relaxed);
-            entry.search_results_total.store(55, Ordering::Relaxed);
-            entry.documents_indexed_total.store(66, Ordering::Relaxed);
-            entry.documents_deleted_total.store(77, Ordering::Relaxed);
-        }
-
-        // Wake just after midnight: the just-completed day is 2026-07-19.
-        let now = chrono::Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 5).unwrap();
-        let completed_day = run_usage_rollover(
-            now,
-            &persistence,
-            &state.usage_counters,
-            &state.manager,
-            Some(&gauges),
-        )
-        .unwrap();
-
-        assert_eq!(completed_day, "2026-07-19");
-        assert!(
-            tmp.path().join("_usage/2026-07-19.json").exists(),
-            "completed-day snapshot must be written"
-        );
-        assert!(
-            !tmp.path().join("_usage/2026-07-20.json").exists(),
-            "the newly-started day must not be persisted"
-        );
-
-        // Persisted snapshot preserves the exact seeded counter values.
-        let snapshot = persistence
-            .load_snapshot("2026-07-19")
-            .unwrap()
-            .expect("completed-day snapshot should load");
-        let products = &snapshot.indexes["products"];
-        assert_eq!(products.search_operations, 11);
-        assert_eq!(products.total_write_operations, 22);
-        assert_eq!(products.total_read_operations, 33);
-        assert_eq!(products.bytes_received, 44);
-        assert_eq!(products.search_results_total, 55);
-        assert_eq!(products.records, 66);
-        assert_eq!(products.documents_deleted, 77);
-
-        // Live atomics are reset to zero after the helper returns.
-        let entry = state.usage_counters.get("products").unwrap();
-        assert_eq!(entry.search_count.load(Ordering::Relaxed), 0);
-        assert_eq!(entry.write_count.load(Ordering::Relaxed), 0);
-        assert_eq!(entry.read_count.load(Ordering::Relaxed), 0);
-        assert_eq!(entry.bytes_in.load(Ordering::Relaxed), 0);
-        assert_eq!(entry.search_results_total.load(Ordering::Relaxed), 0);
-        assert_eq!(entry.documents_indexed_total.load(Ordering::Relaxed), 0);
-        assert_eq!(entry.documents_deleted_total.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn one_shot_rollover_unions_gauges_and_preserves_source() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let state = TestStateBuilder::new(&tmp).build_shared();
-        let persistence = UsagePersistence::new(tmp.path()).unwrap();
-        let gauges = state.metrics_state.as_ref().unwrap().storage_gauges.clone();
-        gauges.clear();
-
-        // "products": loaded with 3 documents and a storage gauge.
-        state.manager.create_tenant("products").unwrap();
-        state
-            .manager
-            .add_documents_sync(
-                "products",
-                (0..3u64)
-                    .map(|i| flapjack::types::Document {
-                        id: format!("products_{i}"),
-                        fields: std::collections::HashMap::new(),
-                    })
-                    .collect(),
-            )
-            .await
-            .unwrap();
-        gauges.insert("products".to_string(), 12_345);
-
-        // "storage_only": gauge-only index, not loaded — unions into the snapshot.
-        gauges.insert("storage_only".to_string(), 4_096);
-
-        // "empty": explicit-zero storage gauge, not loaded — Some(0) must survive.
-        gauges.insert("empty".to_string(), 0);
-
-        // "counter_only": counter-backed, not loaded, no gauge — gauges stay None.
-        {
-            let entry = state
-                .usage_counters
-                .entry("counter_only".to_string())
-                .or_default();
-            entry.search_count.store(11, Ordering::Relaxed);
-            entry.write_count.store(22, Ordering::Relaxed);
-            entry.read_count.store(33, Ordering::Relaxed);
-            entry.bytes_in.store(44, Ordering::Relaxed);
-            entry.search_results_total.store(55, Ordering::Relaxed);
-            entry.documents_indexed_total.store(66, Ordering::Relaxed);
-            entry.documents_deleted_total.store(77, Ordering::Relaxed);
-        }
-
-        let now = chrono::Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 5).unwrap();
-        run_usage_rollover(
-            now,
-            &persistence,
-            &state.usage_counters,
-            &state.manager,
-            Some(&gauges),
-        )
-        .unwrap();
-
-        let snapshot = persistence
-            .load_snapshot("2026-07-19")
-            .unwrap()
-            .expect("completed-day snapshot should load");
-
-        // Union of counter-backed and gauge-only indexes.
-        let mut names: Vec<_> = snapshot.indexes.keys().map(String::as_str).collect();
-        names.sort_unstable();
-        assert_eq!(
-            names,
-            vec!["counter_only", "empty", "products", "storage_only"]
-        );
-
-        let products = &snapshot.indexes["products"];
-        assert_eq!(products.documents_count, Some(3));
-        assert_eq!(products.storage_bytes, Some(12_345));
-
-        let storage_only = &snapshot.indexes["storage_only"];
-        assert_eq!(storage_only.documents_count, None);
-        assert_eq!(storage_only.storage_bytes, Some(4_096));
-
-        let empty = &snapshot.indexes["empty"];
-        assert_eq!(empty.documents_count, None);
-        assert_eq!(empty.storage_bytes, Some(0));
-
-        let counter_only = &snapshot.indexes["counter_only"];
-        assert_eq!(counter_only.documents_count, None);
-        assert_eq!(counter_only.storage_bytes, None);
-        assert_eq!(counter_only.search_operations, 11);
-
-        // The captured gauge source is not mutated by rollover.
-        assert_eq!(gauges.len(), 3);
-        assert_eq!(*gauges.get("products").unwrap().value(), 12_345);
-        assert_eq!(*gauges.get("storage_only").unwrap().value(), 4_096);
-        assert_eq!(*gauges.get("empty").unwrap().value(), 0);
-
-        // Only the seven usage counter atomics are reset.
-        let entry = state.usage_counters.get("counter_only").unwrap();
-        assert_eq!(entry.search_count.load(Ordering::Relaxed), 0);
-        assert_eq!(entry.write_count.load(Ordering::Relaxed), 0);
-        assert_eq!(entry.read_count.load(Ordering::Relaxed), 0);
-        assert_eq!(entry.bytes_in.load(Ordering::Relaxed), 0);
-        assert_eq!(entry.search_results_total.load(Ordering::Relaxed), 0);
-        assert_eq!(entry.documents_indexed_total.load(Ordering::Relaxed), 0);
-        assert_eq!(entry.documents_deleted_total.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn rollup_window_targets_last_completed_hour() {
-        let now_ms = (10 * HOUR_MS) + 123;
-        let (start_ms, end_ms) = rollup_window_bounds_ms(now_ms);
-        assert_eq!(start_ms, 9 * HOUR_MS);
-        assert_eq!(end_ms, 10 * HOUR_MS);
-    }
-
-    #[test]
-    fn rollup_window_uses_completed_override_window_when_override_is_valid() {
-        let _guard = with_env_var("FLAPJACK_ROLLUP_WINDOW_OVERRIDE_MS", "60000");
-        let now_ms = (10 * HOUR_MS) + (2 * 60_000) + 12_345;
-        let (start_ms, end_ms) = rollup_window_bounds_ms(now_ms);
-        assert_eq!(start_ms, (10 * HOUR_MS) + 60_000);
-        assert_eq!(end_ms, (10 * HOUR_MS) + (2 * 60_000));
-    }
-
-    #[test]
-    fn rollup_window_falls_back_to_hour_bounds_when_override_is_invalid() {
-        let now_ms = (10 * HOUR_MS) + 123;
-        for invalid_override in ["not-a-number", "0", "-60000"] {
-            let _guard = with_env_var("FLAPJACK_ROLLUP_WINDOW_OVERRIDE_MS", invalid_override);
-            let (start_ms, end_ms) = rollup_window_bounds_ms(now_ms);
-            assert_eq!(start_ms, 9 * HOUR_MS);
-            assert_eq!(end_ms, 10 * HOUR_MS);
-        }
-    }
+    include!("background_tasks_tests.rs");
 }

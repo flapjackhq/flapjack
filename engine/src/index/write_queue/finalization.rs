@@ -22,12 +22,13 @@ pub(super) fn write_valid_documents(
 /// if the oplog is `None` or if the batch is empty.
 pub(super) fn append_batch_to_oplog(
     oplog: Option<&Arc<crate::index::oplog::OpLog>>,
+    task_id: &str,
     valid_docs_json: &[(String, serde_json::Value)],
     deleted_ids: &[String],
     tenant_id: &str,
-) {
+) -> crate::error::Result<()> {
     let Some(oplog) = oplog else {
-        return;
+        return Ok(());
     };
 
     let mut batch_ops: Vec<(String, serde_json::Value)> = Vec::new();
@@ -41,12 +42,16 @@ pub(super) fn append_batch_to_oplog(
         batch_ops.push(("delete".into(), serde_json::json!({"objectID": deleted_id})));
     }
     if batch_ops.is_empty() {
-        return;
+        return Ok(());
     }
 
-    if let Err(error) = oplog.append_batch(&batch_ops) {
-        tracing::error!("[WQ {}] oplog append failed: {}", tenant_id, error);
-    }
+    oplog
+        .append_batch_for_task(task_id, &batch_ops)
+        .map(|_| ())
+        .map_err(|error| {
+            tracing::error!("[WQ {}] oplog append failed: {}", tenant_id, error);
+            error
+        })
 }
 
 /// Commit the Tantivy writer, catching panics via `catch_unwind` to prevent
@@ -268,6 +273,21 @@ pub(super) fn mark_task_succeeded(
     });
 }
 
+pub(super) fn mark_compact_task_succeeded(
+    tasks: &Arc<dashmap::DashMap<String, TaskInfo>>,
+    task_id: &str,
+) {
+    let numeric_id = numeric_task_id(tasks, task_id);
+    tasks.alter(task_id, |_, mut task| {
+        task.status = TaskStatus::Succeeded;
+        task
+    });
+    tasks.alter(&numeric_id, |_, mut task| {
+        task.status = TaskStatus::Succeeded;
+        task
+    });
+}
+
 fn numeric_task_id(tasks: &Arc<dashmap::DashMap<String, TaskInfo>>, task_id: &str) -> String {
     tasks
         .get(task_id)
@@ -362,20 +382,9 @@ pub(super) fn compact_segments(
         Ok(())
     })();
 
-    let numeric_id = numeric_task_id(tasks, task_id);
-
-    let status = match &result {
-        Ok(()) => TaskStatus::Succeeded,
-        Err(e) => TaskStatus::Failed(e.to_string()),
-    };
-    tasks.alter(task_id, |_, mut t| {
-        t.status = status.clone();
-        t
-    });
-    tasks.alter(&numeric_id, |_, mut t| {
-        t.status = status;
-        t
-    });
+    if let Err(error) = &result {
+        mark_tasks_failed(tasks, &[task_id.to_string()], error);
+    }
 
     result
 }
