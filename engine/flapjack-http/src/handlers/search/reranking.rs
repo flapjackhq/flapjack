@@ -93,6 +93,10 @@ pub(super) fn rerank_by_ctr(
 /// True if the field value matches the target, false otherwise.
 pub(super) fn optional_filter_matches_field_value(field_value: &FieldValue, target: &str) -> bool {
     match field_value {
+        FieldValue::Bool(value) => target
+            .parse::<bool>()
+            .map(|candidate| candidate == *value)
+            .unwrap_or(false),
         FieldValue::Text(text) | FieldValue::Facet(text) => text.eq_ignore_ascii_case(target),
         FieldValue::Integer(value) | FieldValue::Date(value) => target
             .parse::<i64>()

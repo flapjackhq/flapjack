@@ -206,6 +206,7 @@ impl FilterCompiler {
             crate::types::FieldValue::Array(_) => Err(crate::error::FlapjackError::InvalidQuery(
                 "Array values cannot be used in filters directly".to_string(),
             )),
+            crate::types::FieldValue::Bool(b) => Ok(b.to_string()),
             crate::types::FieldValue::Text(s) => Ok(self.format_text_value(s)),
             crate::types::FieldValue::Integer(i) => Ok(i.to_string()),
             crate::types::FieldValue::Float(f) => Ok(f.to_string()),
@@ -379,6 +380,20 @@ mod security_tests {
                 .format_value(&FieldValue::Facet("brand\\\"name".into()))
                 .unwrap(),
             "\"brand\\\\\\\"name\""
+        );
+    }
+
+    #[test]
+    fn bool_filter_values_serialize_without_quotes() {
+        let compiler = make_compiler();
+        let filter = Filter::Equals {
+            field: "featured".into(),
+            value: FieldValue::Bool(true),
+        };
+
+        assert_eq!(
+            compiler.to_query_string(&filter).unwrap(),
+            "_json_filter.featured:true"
         );
     }
 }

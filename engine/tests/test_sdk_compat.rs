@@ -2507,6 +2507,59 @@ async fn test_optional_filters_score_weight() {
     assert_eq!(hits[0]["objectID"].as_str().unwrap(), "b1");
 }
 
+#[tokio::test]
+async fn test_optional_filters_match_boolean_fields() {
+    let (addr, _dir) = spawn_server().await;
+    let client = algolia_client();
+    let base = format!("http://{}", addr);
+
+    let resp = h(client.put(format!("{}/1/indexes/products/settings", base)))
+        .json(&json!({"attributesForFaceting": ["featured"]}))
+        .send()
+        .await
+        .unwrap();
+    wait_for_response_task(&client, &addr, resp).await;
+
+    seed_index(
+        &base,
+        "products",
+        vec![
+            json!({"objectID": "featured-1", "name": "Widget Alpha", "featured": true}),
+            json!({"objectID": "featured-2", "name": "Widget Beta", "featured": false}),
+        ],
+    )
+    .await;
+
+    let res = h(client.post(format!("{}/1/indexes/products/query", base)))
+        .json(&json!({
+            "query": "widget",
+            "optionalFilters": ["featured:true"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let body: serde_json::Value = res.json().await.unwrap();
+    let hits = body["hits"].as_array().unwrap();
+
+    assert_eq!(
+        hits.len(),
+        2,
+        "optionalFilters should not exclude boolean mismatches"
+    );
+    let ids: Vec<&str> = hits
+        .iter()
+        .filter_map(|hit| hit["objectID"].as_str())
+        .collect();
+    assert_eq!(
+        ids[0], "featured-1",
+        "boolean optionalFilters should boost the true document first"
+    );
+    assert!(ids.contains(&"featured-2"));
+    assert_eq!(hits[0]["featured"], true);
+    assert_eq!(hits[1]["featured"], false);
+}
+
 // ── enableSynonyms toggle ────────────────────────────────────────────
 
 #[tokio::test]

@@ -3,13 +3,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
-const SCHEMA_VERSION: u32 = 1;
+// Schema version 2 carries ADR 0008 admission-incarnation fence evidence. Version
+// 1 predates that evidence entirely and is refused on read (see `from_json`).
+const SCHEMA_VERSION: u32 = 2;
+const LEGACY_PRE_FENCE_SCHEMA_VERSION: u32 = 1;
 const PUBLICATION_DIR: &str = ".publication";
 const QUARANTINE_DIR: &str = ".publication_quarantine";
 const NODE_LOCAL_GUARANTEE: &str =
     "NODE-LOCAL publication contract for one node only; it cannot make HA peers converge.";
 
 mod digest;
+mod epoch;
 mod executor;
 mod fault;
 mod fsops;
@@ -22,18 +26,25 @@ mod scanner;
 #[cfg(test)]
 mod scanner_tests;
 pub use digest::canonical_tenant_tree_digest;
+pub use epoch::{
+    compare_and_advance_publication_epoch, read_publication_epoch, PublicationEpoch,
+    PublicationEpochError, PublicationEpochFence, PublicationEpochPaths,
+};
 pub use executor::{
-    abort_unjournaled_publication, activate_publication, PreStagedActivationError,
-    PreStagedActivationStage, PreStagedPublication, PublicationArtifactManifest,
-    PublicationArtifactManifestEntry, PublicationArtifactPlan, PublicationArtifactRoot,
+    abort_unjournaled_publication, activate_publication, activate_publication_with_fence,
+    PreStagedActivationError, PreStagedActivationStage, PreStagedPublication,
+    PublicationActivationInputs, PublicationArtifactManifest, PublicationArtifactManifestEntry,
+    PublicationArtifactPlan, PublicationArtifactRoot,
 };
 #[cfg(test)]
 pub(crate) use executor::{
     activate_publication_for_test, activate_publication_with_faults_for_test,
+    activate_publication_with_fence_and_faults_for_test,
 };
 #[cfg(test)]
 pub(crate) use fault::{
-    PublicationCheckpoint, PublicationFaultPoint, PublicationFaultScript, PublicationOperation,
+    PublicationCheckpoint, PublicationFaultHook, PublicationFaultPoint, PublicationFaultScript,
+    PublicationOperation,
 };
 pub use fsops::{
     fsync_dir, fsync_file, reject_symlinked_managed_path, rename_with_transient_retry,
@@ -41,7 +52,7 @@ pub use fsops::{
 pub use policy::{artifact_policy_table, ArtifactDisposition, ArtifactPolicy};
 pub use repair::{
     decide_publication_repair, repair_publication, RepairArtifactEvidence, RepairDecision,
-    RepairEvidence, RepairJournalEvidence,
+    RepairEpochEvidence, RepairEvidence, RepairJournalEvidence,
 };
 #[cfg(test)]
 pub(crate) use repair::{repair_publication_for_test, repair_publication_with_faults_for_test};
@@ -167,6 +178,112 @@ impl PublicationGenerationEvidence {
     }
 }
 
+/// NODE-LOCAL staging-baseline evidence (ADR 0008): the committed sequence the
+/// replacement baseline was carried forward from. It must never exceed the drained
+/// watermark `W`, since staging cannot hold effects past the drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationStagingBaseline(pub u64);
+
+impl PublicationStagingBaseline {
+    /// NODE-LOCAL constructor for a staging-baseline sequence.
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// NODE-LOCAL baseline sequence value.
+    pub fn value(self) -> u64 {
+        self.0
+    }
+}
+
+/// NODE-LOCAL drained-watermark evidence (ADR 0008 `W`): the old generation's
+/// committed sequence captured after the drain and reproduced as the staged
+/// `committed_seq`. It is carried as evidence only; this stage never derives it
+/// from a live drain, `OpLog`, or `committed_seq`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationWatermark(pub u64);
+
+impl PublicationWatermark {
+    /// NODE-LOCAL constructor for a drained-watermark sequence.
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// NODE-LOCAL watermark sequence value.
+    pub fn value(self) -> u64 {
+        self.0
+    }
+}
+
+/// NODE-LOCAL ADR 0008 admission-incarnation fence evidence for one activation:
+/// the old and replacement incarnation epochs, the staging baseline, and the
+/// drained watermark `W`. The generation stays owned by the journal's existing
+/// `generation` field, so it is not duplicated here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationFenceEvidence {
+    epoch_old: PublicationEpoch,
+    epoch_new: PublicationEpoch,
+    staging_baseline: PublicationStagingBaseline,
+    watermark: PublicationWatermark,
+}
+
+impl PublicationFenceEvidence {
+    /// NODE-LOCAL constructor that validates the fence-evidence invariants before
+    /// the evidence can become durable: the replacement epoch is exactly one past
+    /// the old incarnation (`E_new = E_old + 1`), and the staging baseline is at or
+    /// below the drained watermark `W`.
+    pub fn new(
+        epoch_old: PublicationEpoch,
+        epoch_new: PublicationEpoch,
+        staging_baseline: PublicationStagingBaseline,
+        watermark: PublicationWatermark,
+    ) -> Result<Self> {
+        let evidence = Self {
+            epoch_old,
+            epoch_new,
+            staging_baseline,
+            watermark,
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        let expected_new = self
+            .epoch_old
+            .0
+            .checked_add(1)
+            .ok_or_else(|| invalid_publication("publication fence epoch would overflow u64"))?;
+        if self.epoch_new.0 != expected_new {
+            return Err(invalid_publication(
+                "publication fence replacement epoch must be exactly one past the old epoch",
+            ));
+        }
+        if self.staging_baseline.0 > self.watermark.0 {
+            return Err(invalid_publication(
+                "publication fence staging baseline cannot exceed the drained watermark",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn epoch_old(&self) -> PublicationEpoch {
+        self.epoch_old
+    }
+
+    pub fn epoch_new(&self) -> PublicationEpoch {
+        self.epoch_new
+    }
+
+    pub fn staging_baseline(&self) -> PublicationStagingBaseline {
+        self.staging_baseline
+    }
+
+    pub fn watermark(&self) -> PublicationWatermark {
+        self.watermark
+    }
+}
+
 /// NODE-LOCAL content digest evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentDigest(String);
@@ -249,6 +366,7 @@ pub struct PublicationJournal {
     pub generation: PublicationGenerationEvidence,
     pub digest: ContentDigest,
     pub prior_digest: Option<ContentDigest>,
+    pub fence_evidence: Option<PublicationFenceEvidence>,
     pub artifact_manifest: PublicationArtifactManifest,
     pub paths: PublicationPaths,
     pub transitions: Vec<PublicationTransition>,
@@ -274,6 +392,9 @@ impl PublicationJournal {
             generation,
             digest,
             prior_digest: None,
+            // Fence evidence is attached by the activation owner after `prepare`,
+            // mirroring how `prior_digest` and `artifact_manifest` are populated.
+            fence_evidence: None,
             artifact_manifest: PublicationArtifactManifest::default(),
             paths,
             transitions: vec![PublicationTransition {
@@ -291,17 +412,30 @@ impl PublicationJournal {
 
     /// NODE-LOCAL JSON parser that validates the full contract.
     pub fn from_json(value: &str) -> Result<Self> {
+        Self::from_json_with_policy(value, JournalReadPolicy::CurrentFenceContract)
+    }
+
+    pub(super) fn from_recovery_json(value: &str) -> Result<Self> {
+        Self::from_json_with_policy(value, JournalReadPolicy::RecoveryCompatible)
+    }
+
+    fn from_json_with_policy(value: &str, policy: JournalReadPolicy) -> Result<Self> {
         let raw: RawJournal = serde_json::from_str(value)?;
-        if raw.schema_version != SCHEMA_VERSION {
-            return Err(invalid_publication(
-                "unknown publication journal schema version",
-            ));
-        }
+        let schema_version =
+            policy.schema_version_for_read(raw.schema_version, raw.fence_evidence.is_some())?;
+        Self::from_raw(raw, schema_version)
+    }
+
+    fn from_raw(raw: RawJournal, schema_version: u32) -> Result<Self> {
         let transaction_id = PublicationTransactionId::new(raw.transaction_id)?;
         let target = PublicationTarget::new(raw.target)?;
         let generation = PublicationGenerationEvidence::new(raw.generation)?;
         let digest = ContentDigest::new(raw.digest)?;
         let prior_digest = raw.prior_digest.map(ContentDigest::new).transpose()?;
+        let fence_evidence = raw
+            .fence_evidence
+            .map(RawFenceEvidence::into_evidence)
+            .transpose()?;
         let phase = parse_phase(&raw.phase)?;
         let disposition = raw
             .disposition
@@ -311,12 +445,13 @@ impl PublicationJournal {
         validate_phase_disposition(phase, disposition)?;
         let transitions = validate_raw_transitions(raw.transitions, phase, disposition)?;
         Ok(Self {
-            schema_version: raw.schema_version,
+            schema_version,
             transaction_id,
             target,
             generation,
             digest,
             prior_digest,
+            fence_evidence,
             artifact_manifest: raw.artifact_manifest.into_manifest()?,
             paths: raw.paths.into_paths()?,
             transition_sequence: raw.transition_sequence,
@@ -336,6 +471,9 @@ impl PublicationJournal {
             "generation": self.generation.0,
             "digest": self.digest.0,
             "prior_digest": self.prior_digest.as_ref().map(|digest| digest.as_str()),
+            // Non-fence activations serialize absence explicitly as `null`; a bare
+            // zero watermark could be misread as a proven `W`, so it is never used.
+            "fence_evidence": self.fence_evidence,
             "artifact_manifest": self.artifact_manifest,
             "paths": path_evidence(&self.paths, &self.target, &self.transaction_id),
             "transitions": self.transitions,
@@ -378,6 +516,43 @@ impl PublicationJournal {
             disposition: Some(disposition),
             ..self
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum JournalReadPolicy {
+    CurrentFenceContract,
+    RecoveryCompatible,
+}
+
+impl JournalReadPolicy {
+    fn schema_version_for_read(
+        self,
+        raw_schema_version: u32,
+        has_fence_evidence: bool,
+    ) -> Result<u32> {
+        // Compatibility policy: schema-version 1 predates fence evidence. Normal
+        // parsing still refuses it so it cannot become MIG-5 fence proof; recovery
+        // may read phase/manifest state only and normalizes any later write to v2.
+        match (self, raw_schema_version) {
+            (Self::CurrentFenceContract, LEGACY_PRE_FENCE_SCHEMA_VERSION) => {
+                Err(invalid_publication(
+                    "legacy publication journal predates fence evidence and cannot be read as MIG-5 fence-proven",
+                ))
+            }
+            (Self::RecoveryCompatible, LEGACY_PRE_FENCE_SCHEMA_VERSION) => {
+                if has_fence_evidence {
+                    return Err(invalid_publication(
+                        "legacy publication journal must not contain fence evidence",
+                    ));
+                }
+                Ok(SCHEMA_VERSION)
+            }
+            (_, SCHEMA_VERSION) => Ok(SCHEMA_VERSION),
+            _ => Err(invalid_publication(
+                "unknown publication journal schema version",
+            )),
+        }
     }
 }
 
@@ -427,6 +602,7 @@ pub struct PublicationTombstone {
     pub target: PublicationTarget,
     pub generation: PublicationGenerationEvidence,
     pub digest: ContentDigest,
+    pub fence_evidence: Option<PublicationFenceEvidence>,
     pub outcome: PublicationDisposition,
     pub adopted: bool,
 }
@@ -462,6 +638,9 @@ impl PublicationTombstone {
             target: journal.target.clone(),
             generation: journal.generation.clone(),
             digest: journal.digest.clone(),
+            // Preserve the fence evidence through terminal compaction so the
+            // tombstone retains the same MIG-5 proof the committed journal carried.
+            fence_evidence: journal.fence_evidence.clone(),
             outcome: *disposition,
             adopted: true,
         })
@@ -602,6 +781,8 @@ struct RawJournal {
     #[serde(default)]
     prior_digest: Option<String>,
     #[serde(default)]
+    fence_evidence: Option<RawFenceEvidence>,
+    #[serde(default)]
     artifact_manifest: RawArtifactManifest,
     paths: RawPaths,
     #[serde(default)]
@@ -610,6 +791,27 @@ struct RawJournal {
     phase: String,
     disposition: Option<String>,
     recorded_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawFenceEvidence {
+    epoch_old: u64,
+    epoch_new: u64,
+    staging_baseline: u64,
+    watermark: u64,
+}
+
+impl RawFenceEvidence {
+    fn into_evidence(self) -> Result<PublicationFenceEvidence> {
+        // Re-validate the fence invariants on read so a hand-edited or corrupt
+        // journal cannot smuggle in `E_new != E_old + 1` or a baseline past `W`.
+        PublicationFenceEvidence::new(
+            PublicationEpoch(self.epoch_old),
+            PublicationEpoch(self.epoch_new),
+            PublicationStagingBaseline(self.staging_baseline),
+            PublicationWatermark(self.watermark),
+        )
+    }
 }
 
 #[derive(Default, Deserialize)]

@@ -1,4 +1,5 @@
 use super::digest::canonical_tenant_tree_digest;
+use super::epoch::{observe_publication_epoch, PublicationEpochObservation};
 use super::executor::{
     artifact_digest, capture_journaled_sidecars, cleanup_publication_residue, copy_path_durably,
     persist_journal, promote_journaled_sidecars, remove_path_if_exists, rename_path,
@@ -42,6 +43,18 @@ pub enum RepairArtifactEvidence {
     /// have been digested into `prior_digest`. An empty tree recorded against a
     /// prior digest is data loss, not a reservation, and stays [`Self::Mismatch`].
     Reservation,
+    /// The pre-journal mutation ordering proves the live target was never renamed,
+    /// but no canonical journal exists yet to provide old/new digest labels.
+    StructurallyProvenOld,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairEpochEvidence {
+    UnfencedOrLegacy,
+    FencedMatch,
+    FencedMissing,
+    FencedMismatch,
+    PreJournalAdvanced,
 }
 
 /// Immutable evidence consumed by the publication repair decision table.
@@ -54,6 +67,7 @@ pub struct RepairEvidence {
     pub staging: RepairArtifactEvidence,
     pub manifest_valid: bool,
     pub journal_temp_present: bool,
+    pub epoch: RepairEpochEvidence,
 }
 
 impl RepairEvidence {
@@ -72,6 +86,7 @@ impl RepairEvidence {
             staging,
             manifest_valid: true,
             journal_temp_present: false,
+            epoch: RepairEpochEvidence::UnfencedOrLegacy,
         }
     }
 }
@@ -94,7 +109,24 @@ pub(super) struct RepairOutcome {
 
 /// Select exactly one bounded repair action without mutating the filesystem.
 pub fn decide_publication_repair(evidence: RepairEvidence) -> RepairDecision {
+    if evidence.journal == RepairJournalEvidence::Missing
+        && (evidence.epoch == RepairEpochEvidence::PreJournalAdvanced
+            || (evidence.epoch == RepairEpochEvidence::UnfencedOrLegacy
+                && evidence.journal_temp_present))
+    {
+        // In the pre-journal window the live target was never renamed. That makes
+        // residue cleanup safe both for the unfenced legacy path and for the
+        // fenced path after `E_new` advanced but before the prepared journal
+        // became durable.
+        return decide_pre_journal_missing(evidence);
+    }
     if evidence.journal != RepairJournalEvidence::Valid || !evidence.manifest_valid {
+        return RepairDecision::Quarantine;
+    }
+    if matches!(
+        evidence.epoch,
+        RepairEpochEvidence::FencedMissing | RepairEpochEvidence::FencedMismatch
+    ) {
         return RepairDecision::Quarantine;
     }
     if [evidence.target, evidence.backup, evidence.staging]
@@ -136,6 +168,26 @@ pub(super) fn repair_publication_outcome(
     resolved_manifest: PublicationArtifactManifest,
     inventory: &TantivyManagedInventory,
 ) -> Result<RepairOutcome> {
+    let epoch = observe_publication_epoch(base, &target)
+        .map_err(|error| invalid_publication(error.to_string()))?;
+    repair_publication_outcome_with_epoch(
+        base,
+        target,
+        transaction_id,
+        resolved_manifest,
+        inventory,
+        epoch,
+    )
+}
+
+pub(super) fn repair_publication_outcome_with_epoch(
+    base: &Path,
+    target: PublicationTarget,
+    transaction_id: PublicationTransactionId,
+    resolved_manifest: PublicationArtifactManifest,
+    inventory: &TantivyManagedInventory,
+    epoch: PublicationEpochObservation,
+) -> Result<RepairOutcome> {
     let io = PublicationIo::production();
     repair_publication_inner(
         base,
@@ -143,6 +195,7 @@ pub(super) fn repair_publication_outcome(
         transaction_id,
         resolved_manifest,
         inventory,
+        epoch,
         &io,
     )
 }
@@ -158,12 +211,15 @@ pub(crate) fn repair_publication_for_test(
 ) -> Result<RepairDecision> {
     let faults = CheckpointFaultHook::new(fault);
     let io = PublicationIo::with_faults(&faults);
+    let epoch = observe_publication_epoch(base, &target)
+        .map_err(|error| invalid_publication(error.to_string()))?;
     repair_publication_inner(
         base,
         target,
         transaction_id,
         resolved_manifest,
         inventory,
+        epoch,
         &io,
     )
     .map(|outcome| outcome.decision)
@@ -179,12 +235,15 @@ pub(crate) fn repair_publication_with_faults_for_test(
     faults: &dyn PublicationFaultHook,
 ) -> Result<RepairDecision> {
     let io = PublicationIo::with_faults(faults);
+    let epoch = observe_publication_epoch(base, &target)
+        .map_err(|error| invalid_publication(error.to_string()))?;
     repair_publication_inner(
         base,
         target,
         transaction_id,
         resolved_manifest,
         inventory,
+        epoch,
         &io,
     )
     .map(|outcome| outcome.decision)
@@ -196,20 +255,22 @@ fn repair_publication_inner(
     transaction_id: PublicationTransactionId,
     resolved_manifest: PublicationArtifactManifest,
     inventory: &TantivyManagedInventory,
+    epoch: PublicationEpochObservation,
     io: &PublicationIo<'_>,
 ) -> Result<RepairOutcome> {
     let paths = PublicationPaths::new(base, &target, &transaction_id);
     let journal_temp = journal_temp_path(&paths);
     validate_repair_managed_paths(base, &paths, &journal_temp)?;
-    let inspected = inspect_publication_repair(
-        &paths,
-        &target,
-        &transaction_id,
-        &resolved_manifest,
+    let inspected = inspect_publication_repair(RepairInspectionContext {
+        paths: &paths,
+        target: &target,
+        transaction_id: &transaction_id,
+        resolved_manifest: &resolved_manifest,
         inventory,
-        journal_temp.exists(),
+        journal_temp_present: journal_temp.exists(),
+        epoch,
         io,
-    )?;
+    })?;
     let decision = decide_publication_repair(inspected.evidence);
     let live_target_mutated = match decision {
         RepairDecision::Complete => paths.staging.exists(),
@@ -219,6 +280,22 @@ fn repair_publication_inner(
     let target_was_proven = matches!(
         inspected.evidence.target,
         RepairArtifactEvidence::MatchesOld | RepairArtifactEvidence::MatchesNew
+    );
+    let pre_journal_target_proven = matches!(
+        (
+            inspected.evidence.epoch,
+            inspected.evidence.target,
+            inspected.evidence.journal_temp_present
+        ),
+        (
+            RepairEpochEvidence::PreJournalAdvanced,
+            RepairArtifactEvidence::StructurallyProvenOld,
+            _
+        ) | (
+            RepairEpochEvidence::UnfencedOrLegacy,
+            RepairArtifactEvidence::StructurallyProvenOld,
+            true
+        )
     );
     let prior_target_existed = inspected
         .journal
@@ -248,8 +325,11 @@ fn repair_publication_inner(
     let live_target_proven = match decision {
         RepairDecision::Complete => paths.target.exists(),
         RepairDecision::Rollback => prior_target_existed && paths.target.exists(),
-        RepairDecision::None | RepairDecision::Cleanup | RepairDecision::Quarantine => {
-            target_was_proven && paths.target.exists()
+        RepairDecision::None | RepairDecision::Cleanup => {
+            (target_was_proven || pre_journal_target_proven) && paths.target.exists()
+        }
+        RepairDecision::Quarantine => {
+            evidence_allows_quarantined_live_target(inspected.evidence) && paths.target.exists()
         }
     };
     Ok(RepairOutcome {
@@ -299,34 +379,51 @@ struct InspectedRepair {
     journal: Option<PublicationJournal>,
 }
 
-fn inspect_publication_repair(
-    paths: &PublicationPaths,
-    target: &PublicationTarget,
-    transaction_id: &PublicationTransactionId,
-    resolved_manifest: &PublicationArtifactManifest,
-    inventory: &TantivyManagedInventory,
+struct RepairInspectionContext<'a> {
+    paths: &'a PublicationPaths,
+    target: &'a PublicationTarget,
+    transaction_id: &'a PublicationTransactionId,
+    resolved_manifest: &'a PublicationArtifactManifest,
+    inventory: &'a TantivyManagedInventory,
     journal_temp_present: bool,
-    io: &PublicationIo<'_>,
-) -> Result<InspectedRepair> {
+    epoch: PublicationEpochObservation,
+    io: &'a PublicationIo<'a>,
+}
+
+fn inspect_publication_repair(context: RepairInspectionContext<'_>) -> Result<InspectedRepair> {
+    let RepairInspectionContext {
+        paths,
+        target,
+        transaction_id,
+        resolved_manifest,
+        inventory,
+        journal_temp_present,
+        epoch,
+        io,
+    } = context;
     let raw_journal = match fs::read_to_string(&paths.journal) {
         Ok(value) => value,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let target = classify_pre_journal_target(&paths.target, io);
+            let backup = classify_pre_journal_residue(&paths.backup, io);
+            let staging = classify_pre_journal_residue(&paths.staging, io);
             return Ok(InspectedRepair {
                 evidence: RepairEvidence {
                     journal: RepairJournalEvidence::Missing,
                     phase: PublicationPhase::Prepared,
-                    target: RepairArtifactEvidence::Missing,
-                    backup: RepairArtifactEvidence::Missing,
-                    staging: RepairArtifactEvidence::Missing,
-                    manifest_valid: false,
+                    target,
+                    backup,
+                    staging,
+                    manifest_valid: true,
                     journal_temp_present,
+                    epoch: pre_journal_epoch_evidence(epoch),
                 },
                 journal: None,
             });
         }
         Err(error) => return Err(error.into()),
     };
-    let journal = match PublicationJournal::from_json(&raw_journal) {
+    let journal = match PublicationJournal::from_recovery_json(&raw_journal) {
         Ok(journal) => journal,
         Err(_) => {
             return Ok(InspectedRepair {
@@ -338,6 +435,7 @@ fn inspect_publication_repair(
                     staging: RepairArtifactEvidence::Missing,
                     manifest_valid: false,
                     journal_temp_present,
+                    epoch: RepairEpochEvidence::UnfencedOrLegacy,
                 },
                 journal: None,
             });
@@ -379,6 +477,7 @@ fn inspect_publication_repair(
             staging,
             manifest_valid,
             journal_temp_present,
+            epoch: journal_epoch_evidence(epoch, &journal),
         },
         journal: Some(journal),
     })
@@ -419,23 +518,13 @@ fn validate_manifest_layout(
     journal: &PublicationArtifactManifest,
     resolved: &PublicationArtifactManifest,
 ) -> Result<()> {
-    if journal.entries.len() != resolved.entries.len() {
-        return Err(invalid_publication(
+    if journal.same_layout_as(resolved) {
+        Ok(())
+    } else {
+        Err(invalid_publication(
             "repair artifact manifest layout mismatch",
-        ));
+        ))
     }
-    for (left, right) in journal.entries.iter().zip(&resolved.entries) {
-        if left.policy_key != right.policy_key
-            || left.root != right.root
-            || left.original_relative_path != right.original_relative_path
-            || left.promoted_relative_path != right.promoted_relative_path
-        {
-            return Err(invalid_publication(
-                "repair artifact manifest layout mismatch",
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn validate_manifest_artifacts(
@@ -550,6 +639,46 @@ fn tree_is_empty(path: &Path) -> bool {
     fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
+fn classify_pre_journal_target(path: &Path, io: &PublicationIo<'_>) -> RepairArtifactEvidence {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => RepairArtifactEvidence::Unreadable,
+        Ok(metadata) if metadata.is_dir() => {
+            if reject_symlinked_managed_path(path, "publication repair artifact").is_err()
+                || io.before_digest(path).is_err()
+            {
+                RepairArtifactEvidence::Unreadable
+            } else {
+                RepairArtifactEvidence::StructurallyProvenOld
+            }
+        }
+        Ok(_) => RepairArtifactEvidence::Mismatch,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            RepairArtifactEvidence::Missing
+        }
+        Err(_) => RepairArtifactEvidence::Unreadable,
+    }
+}
+
+fn classify_pre_journal_residue(path: &Path, io: &PublicationIo<'_>) -> RepairArtifactEvidence {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => RepairArtifactEvidence::Unreadable,
+        Ok(metadata) if metadata.is_dir() => {
+            if reject_symlinked_managed_path(path, "publication repair artifact").is_err()
+                || io.before_digest(path).is_err()
+            {
+                RepairArtifactEvidence::Unreadable
+            } else {
+                RepairArtifactEvidence::Mismatch
+            }
+        }
+        Ok(_) => RepairArtifactEvidence::Mismatch,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            RepairArtifactEvidence::Missing
+        }
+        Err(_) => RepairArtifactEvidence::Unreadable,
+    }
+}
+
 fn complete_publication_repair(
     paths: &PublicationPaths,
     journal: Option<&PublicationJournal>,
@@ -647,6 +776,57 @@ fn journal_temp_path(paths: &PublicationPaths) -> PathBuf {
     paths.journal.with_extension("json.tmp")
 }
 
+fn pre_journal_epoch_evidence(epoch: PublicationEpochObservation) -> RepairEpochEvidence {
+    if epoch.has_sidecar_residue() {
+        return RepairEpochEvidence::FencedMissing;
+    }
+    match epoch.durable_epoch() {
+        Some(epoch) if epoch.0 > 0 => RepairEpochEvidence::PreJournalAdvanced,
+        _ => RepairEpochEvidence::UnfencedOrLegacy,
+    }
+}
+
+fn journal_epoch_evidence(
+    epoch: PublicationEpochObservation,
+    journal: &PublicationJournal,
+) -> RepairEpochEvidence {
+    let Some(fence) = journal.fence_evidence.as_ref() else {
+        return RepairEpochEvidence::UnfencedOrLegacy;
+    };
+    match epoch.durable_epoch() {
+        Some(durable) if durable == fence.epoch_new() => RepairEpochEvidence::FencedMatch,
+        Some(_) => RepairEpochEvidence::FencedMismatch,
+        None => RepairEpochEvidence::FencedMissing,
+    }
+}
+
+fn decide_pre_journal_missing(evidence: RepairEvidence) -> RepairDecision {
+    if !evidence.manifest_valid {
+        return RepairDecision::Quarantine;
+    }
+    if evidence.target != RepairArtifactEvidence::StructurallyProvenOld
+        || evidence.backup != RepairArtifactEvidence::Missing
+    {
+        return RepairDecision::Quarantine;
+    }
+    if matches!(evidence.staging, RepairArtifactEvidence::Unreadable) {
+        return RepairDecision::Quarantine;
+    }
+    if evidence.journal_temp_present || evidence.staging != RepairArtifactEvidence::Missing {
+        RepairDecision::Cleanup
+    } else {
+        RepairDecision::None
+    }
+}
+
+fn evidence_allows_quarantined_live_target(evidence: RepairEvidence) -> bool {
+    matches!(evidence.epoch, RepairEpochEvidence::UnfencedOrLegacy)
+        && matches!(
+            evidence.target,
+            RepairArtifactEvidence::MatchesOld | RepairArtifactEvidence::MatchesNew
+        )
+}
+
 fn decide_prepared(evidence: RepairEvidence) -> RepairDecision {
     use RepairArtifactEvidence::{MatchesNew as New, MatchesOld as Old, Missing, Reservation};
     match (evidence.target, evidence.backup, evidence.staging) {
@@ -680,5 +860,8 @@ fn decide_rolled_back(evidence: RepairEvidence) -> RepairDecision {
 }
 
 fn is_untrusted_artifact(evidence: RepairArtifactEvidence) -> bool {
-    matches!(evidence, RepairArtifactEvidence::Unreadable)
+    matches!(
+        evidence,
+        RepairArtifactEvidence::Unreadable | RepairArtifactEvidence::StructurallyProvenOld
+    )
 }

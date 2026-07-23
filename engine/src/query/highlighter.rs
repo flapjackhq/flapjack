@@ -582,6 +582,7 @@ impl Highlighter {
 
     fn field_value_to_string(&self, value: &FieldValue) -> String {
         match value {
+            FieldValue::Bool(b) => b.to_string(),
             FieldValue::Text(s) => s.clone(),
             FieldValue::Integer(i) => i.to_string(),
             FieldValue::Float(f) => f.to_string(),
@@ -934,5 +935,27 @@ mod tests {
         };
         let result = h().highlight_document(&doc, &["laptop".to_string()]);
         assert!(matches!(result.get("tags"), Some(HighlightValue::Array(_))));
+    }
+
+    #[test]
+    fn hl_document_bool_field_uses_boolean_string() {
+        use crate::types::{Document, FieldValue};
+        use std::collections::HashMap;
+
+        let mut fields = HashMap::new();
+        fields.insert("featured".to_string(), FieldValue::Bool(true));
+        let doc = Document {
+            id: "1".to_string(),
+            fields,
+        };
+
+        let result = h().highlight_document(&doc, &["false".to_string()]);
+        let highlight = match result.get("featured") {
+            Some(HighlightValue::Single(highlight)) => highlight,
+            other => panic!("expected single highlight for bool field, got {other:?}"),
+        };
+
+        assert_eq!(highlight.value, "true");
+        assert!(matches!(highlight.match_level, MatchLevel::None));
     }
 }

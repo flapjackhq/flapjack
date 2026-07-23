@@ -57,6 +57,14 @@ fn write_journal(
     paths
 }
 
+fn rewrite_as_legacy_v1_journal(paths: &PublicationPaths) {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&paths.journal).unwrap()).unwrap();
+    value["schema_version"] = serde_json::json!(1);
+    value.as_object_mut().unwrap().remove("fence_evidence");
+    std::fs::write(&paths.journal, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+}
+
 fn scan(base: &Path) -> Vec<PublicationRepairReport> {
     scan_and_repair_publications(base, &AnalyticsConfig::for_data_dir(base)).unwrap()
 }
@@ -121,6 +129,149 @@ fn target_scanner_reports_existing_empty_namespace_as_unresolved_evidence() {
     assert!(temp.path().join(".publication/products").exists());
 }
 
+#[test]
+fn scanner_reports_epoch_only_namespace_as_clean_loadable() {
+    let temp = TempDir::new().unwrap();
+    let target = PublicationTarget::new("products").unwrap();
+    let transaction = PublicationTransactionId::new("txn_unused").unwrap();
+    let paths = PublicationPaths::new(temp.path(), &target, &transaction);
+    std::fs::create_dir_all(paths.epoch_path().parent().unwrap()).unwrap();
+    std::fs::write(paths.epoch_path(), b"1").unwrap();
+    std::fs::write(paths.epoch_lock_path(), b"").unwrap();
+    write_tree(&paths.target, "live");
+
+    let targeted_report = scan_and_repair_publication_target(
+        temp.path(),
+        &AnalyticsConfig::for_data_dir(temp.path()),
+        target,
+    )
+    .unwrap();
+
+    assert_eq!(targeted_report.status, PublicationRepairStatus::Clean);
+    assert_eq!(targeted_report.action, PublicationScanAction::Clean);
+    assert_eq!(targeted_report.transactions, Vec::new());
+    assert_eq!(targeted_report.transaction_id, None);
+    assert_eq!(targeted_report.phase, None);
+    assert_eq!(targeted_report.evidence, None);
+    assert_eq!(
+        targeted_report.disposition,
+        PublicationTargetDisposition::Loadable
+    );
+    assert!(!targeted_report.live_target_mutated);
+
+    let reports = scan(temp.path());
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].target.as_str(), "products");
+    assert_eq!(reports[0].status, PublicationRepairStatus::Clean);
+    assert_eq!(reports[0].action, PublicationScanAction::Clean);
+    assert_eq!(
+        reports[0].disposition,
+        PublicationTargetDisposition::Loadable
+    );
+}
+
+#[test]
+fn scanner_rejects_corrupt_epoch_sidecar_before_clean_loadable_report() {
+    let temp = TempDir::new().unwrap();
+    let target = PublicationTarget::new("products").unwrap();
+    let transaction = PublicationTransactionId::new("txn_unused").unwrap();
+    let paths = PublicationPaths::new(temp.path(), &target, &transaction);
+    std::fs::create_dir_all(paths.epoch_path().parent().unwrap()).unwrap();
+    std::fs::write(paths.epoch_path(), b"1\n").unwrap();
+    write_tree(&paths.target, "live");
+
+    let error = scan_and_repair_publication_target(
+        temp.path(),
+        &AnalyticsConfig::for_data_dir(temp.path()),
+        target,
+    )
+    .expect_err("corrupt epoch sidecar must fail startup scan before clean reporting")
+    .to_string();
+
+    assert!(
+        error.contains("corrupt publication epoch state"),
+        "scanner must surface the publication epoch reader rejection, got: {error}"
+    );
+}
+
+#[test]
+fn scanner_reports_lock_only_epoch_namespace_without_live_target_unavailable() {
+    let temp = TempDir::new().unwrap();
+    let target = PublicationTarget::new("products").unwrap();
+    let transaction = PublicationTransactionId::new("txn_unused").unwrap();
+    let paths = PublicationPaths::new(temp.path(), &target, &transaction);
+    std::fs::create_dir_all(paths.epoch_lock_path().parent().unwrap()).unwrap();
+    std::fs::write(paths.epoch_lock_path(), b"").unwrap();
+
+    let targeted_report = scan_and_repair_publication_target(
+        temp.path(),
+        &AnalyticsConfig::for_data_dir(temp.path()),
+        target,
+    )
+    .unwrap();
+
+    assert_eq!(targeted_report.status, PublicationRepairStatus::Unresolved);
+    assert_eq!(targeted_report.action, PublicationScanAction::Unresolved);
+    assert_eq!(targeted_report.transactions, Vec::new());
+    assert_eq!(targeted_report.transaction_id, None);
+    assert_eq!(targeted_report.phase, None);
+    assert_eq!(
+        targeted_report.evidence,
+        Some(PathBuf::from(".publication/products"))
+    );
+    assert_eq!(
+        targeted_report.disposition,
+        PublicationTargetDisposition::Unavailable
+    );
+    assert!(!targeted_report.live_target_mutated);
+
+    let reports = scan(temp.path());
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].target.as_str(), "products");
+    assert_eq!(reports[0].status, PublicationRepairStatus::Unresolved);
+    assert_eq!(
+        reports[0].disposition,
+        PublicationTargetDisposition::Unavailable
+    );
+}
+
+#[test]
+fn scanner_rejects_corrupt_epoch_sidecar_in_namespace_with_transaction_directory() {
+    let temp = TempDir::new().unwrap();
+    let target = PublicationTarget::new("products").unwrap();
+    let transaction = PublicationTransactionId::new("txn_repair").unwrap();
+    let paths = PublicationPaths::new(temp.path(), &target, &transaction);
+    write_tree(&paths.target, "old");
+    write_tree(&paths.staging, "new");
+    write_journal(
+        temp.path(),
+        "products",
+        "txn_repair",
+        PublicationPhase::Prepared,
+        PublicationArtifactManifest::default(),
+    );
+    // Corrupt epoch sidecar sitting alongside a live publication transaction directory.
+    std::fs::write(paths.epoch_path(), b"1\n").unwrap();
+
+    let error = scan_and_repair_publication_target(
+        temp.path(),
+        &AnalyticsConfig::for_data_dir(temp.path()),
+        target,
+    )
+    .expect_err("corrupt epoch sidecar must fail startup scan even beside a transaction directory")
+    .to_string();
+
+    assert!(
+        error.contains("corrupt publication epoch state"),
+        "scanner must surface the publication epoch reader rejection, got: {error}"
+    );
+    // Failing closed before any repair mutation keeps the live target untouched.
+    assert_eq!(
+        std::fs::read_to_string(paths.target.join("settings.json")).unwrap(),
+        "old"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn target_scanner_reports_symlinked_live_tenant_without_namespace_as_unresolved() {
@@ -183,6 +334,32 @@ fn target_scanner_reports_symlinked_publication_namespace_as_unresolved_evidence
             .unwrap()
             .file_type()
             .is_symlink()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn scanner_reports_symlinked_publication_namespace_as_unresolved_in_full_scan() {
+    let temp = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    std::fs::create_dir_all(temp.path().join(".publication")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), temp.path().join(".publication/products")).unwrap();
+
+    let reports = scan(temp.path());
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].target.as_str(), "products");
+    assert_eq!(reports[0].status, PublicationRepairStatus::Unresolved);
+    assert_eq!(reports[0].action, PublicationScanAction::Unresolved);
+    assert_eq!(reports[0].transaction_id, None);
+    assert_eq!(reports[0].phase, None);
+    assert_eq!(
+        reports[0].evidence,
+        Some(PathBuf::from(".publication/products"))
+    );
+    assert_eq!(
+        reports[0].disposition,
+        PublicationTargetDisposition::Unavailable
     );
 }
 
@@ -397,6 +574,49 @@ fn scanner_repairs_prepared_replacement_and_reports_loadable_target() {
         std::fs::read_to_string(paths.target.join("settings.json")).unwrap(),
         "new"
     );
+}
+
+#[test]
+fn scanner_repairs_legacy_v1_prepared_replacement_without_quarantine() {
+    let temp = TempDir::new().unwrap();
+    let target = PublicationTarget::new("products").unwrap();
+    let transaction = PublicationTransactionId::new("txn_legacy").unwrap();
+    let paths = PublicationPaths::new(temp.path(), &target, &transaction);
+    write_tree(&paths.target, "old");
+    write_tree(&paths.staging, "new");
+    let paths = write_journal(
+        temp.path(),
+        "products",
+        "txn_legacy",
+        PublicationPhase::Prepared,
+        PublicationArtifactManifest::default(),
+    );
+    rewrite_as_legacy_v1_journal(&paths);
+
+    let reports = scan(temp.path());
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].target.as_str(), "products");
+    assert_eq!(reports[0].phase, Some(PublicationPhase::Prepared));
+    assert_eq!(
+        reports[0].action,
+        PublicationScanAction::Repaired(RepairDecision::Complete)
+    );
+    assert_eq!(
+        reports[0].disposition,
+        PublicationTargetDisposition::Loadable
+    );
+    assert_eq!(
+        std::fs::read_to_string(paths.target.join("settings.json")).unwrap(),
+        "new"
+    );
+    assert!(!paths.quarantine.join("journal.json").exists());
+
+    let committed =
+        PublicationJournal::from_json(&std::fs::read_to_string(&paths.journal).unwrap()).unwrap();
+    assert_eq!(committed.schema_version, 2);
+    assert_eq!(committed.phase, PublicationPhase::Committed);
+    assert_eq!(committed.fence_evidence, None);
 }
 
 #[test]

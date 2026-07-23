@@ -150,6 +150,19 @@ impl<'a> PublicationIo<'a> {
         self.sync_dir(require_parent(path)?)
     }
 
+    pub(super) fn remove_dir_if_empty(&self, path: &Path) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_dir() || fs::read_dir(path)?.next().transpose()?.is_some() {
+            return Ok(());
+        }
+        self.check(PublicationOperation::Remove(path.to_path_buf()))?;
+        fs::remove_dir(path)?;
+        self.sync_dir(require_parent(path)?)
+    }
+
     fn check(&self, operation: PublicationOperation) -> Result<()> {
         self.faults.before_operation(&operation)
     }

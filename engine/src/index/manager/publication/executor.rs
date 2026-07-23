@@ -6,8 +6,8 @@ use super::fsops::reject_symlinked_managed_path_components;
 use super::{
     artifact_policy_table, classify_external_relative_path, invalid_publication,
     validate_relative_path, ArtifactDisposition, ContentDigest, ExternalArtifactRoot,
-    PublicationEvent, PublicationGenerationEvidence, PublicationJournal, PublicationPaths,
-    PublicationTarget, PublicationTransactionId, Result, TantivyManagedInventory,
+    PublicationEvent, PublicationFenceEvidence, PublicationGenerationEvidence, PublicationJournal,
+    PublicationPaths, PublicationTarget, PublicationTransactionId, Result, TantivyManagedInventory,
 };
 use crate::analytics::config::{AnalyticsConfig, AnalyticsTargetArtifactPaths};
 use crate::query_suggestions::config::{QsConfigStore, QsTargetArtifactPaths};
@@ -47,6 +47,10 @@ struct ActivationContext<'a> {
     io: &'a PublicationIo<'a>,
     stage: &'a std::cell::Cell<PreStagedActivationStage>,
     mode: ActivationMode,
+    // Caller-supplied ADR 0008 fence evidence attached to the prepared journal.
+    // It lives here alongside the other run-scoped activation state (`io`,
+    // `stage`, `mode`) that `activate_publication_inner` threads through.
+    fence_evidence: Option<PublicationFenceEvidence>,
 }
 
 impl PreStagedActivationError {
@@ -184,16 +188,19 @@ impl PreStagedPublication {
         let stage = std::cell::Cell::new(PreStagedActivationStage::Prepare);
         let io = PublicationIo::production();
         activate_publication_inner(
-            &self.paths,
-            self.target,
-            self.transaction_id,
-            self.generation,
-            PublicationArtifactManifest::default(),
-            &inventory,
+            PublicationActivationInputs {
+                paths: &self.paths,
+                target: self.target,
+                transaction_id: self.transaction_id,
+                generation: self.generation,
+                manifest: PublicationArtifactManifest::default(),
+                inventory: &inventory,
+            },
             &ActivationContext {
                 io: &io,
                 stage: &stage,
                 mode,
+                fence_evidence: None,
             },
         )
         .map_err(|source| PreStagedActivationError {
@@ -220,16 +227,19 @@ impl PreStagedPublication {
         let faults = CheckpointFaultHook::new(fault);
         let io = PublicationIo::with_faults(&faults);
         activate_publication_inner(
-            &self.paths,
-            self.target,
-            self.transaction_id,
-            self.generation,
-            PublicationArtifactManifest::default(),
-            &inventory,
+            PublicationActivationInputs {
+                paths: &self.paths,
+                target: self.target,
+                transaction_id: self.transaction_id,
+                generation: self.generation,
+                manifest: PublicationArtifactManifest::default(),
+                inventory: &inventory,
+            },
             &ActivationContext {
                 io: &io,
                 stage: &stage,
                 mode: ActivationMode::Replace,
+                fence_evidence: None,
             },
         )
         .map_err(|source| PreStagedActivationError {
@@ -263,9 +273,7 @@ fn reserve_publication_target(target_path: &Path, target: &PublicationTarget) ->
 
 /// Remove a transaction's namespace. Only sound while no journal is durable.
 fn discard_transaction_namespace(paths: &PublicationPaths) -> Result<()> {
-    let namespace = paths.staging.parent().ok_or_else(|| {
-        invalid_publication("publication staging path has no transaction namespace")
-    })?;
+    let namespace = transaction_namespace(paths)?;
     if namespace.exists() {
         fs::remove_dir_all(namespace)?;
     }
@@ -431,6 +439,20 @@ impl PublicationArtifactManifest {
         Self::new(entries)
     }
 
+    pub(super) fn same_layout_as(&self, other: &Self) -> bool {
+        self.entries.len() == other.entries.len()
+            && self
+                .entries
+                .iter()
+                .zip(&other.entries)
+                .all(|(left, right)| {
+                    left.policy_key == right.policy_key
+                        && left.root == right.root
+                        && left.original_relative_path == right.original_relative_path
+                        && left.promoted_relative_path == right.promoted_relative_path
+                })
+    }
+
     /// Restore runtime roots for a persisted move manifest through canonical path owners.
     pub fn resolve_for_repair(
         base: &Path,
@@ -443,18 +465,7 @@ impl PublicationArtifactManifest {
             return Ok(Self::default());
         }
         let resolved = resolved_move_manifest(base, analytics, target, transaction)?;
-        let same_layout =
-            persisted
-                .entries
-                .iter()
-                .zip(&resolved.entries)
-                .all(|(persisted, resolved)| {
-                    persisted.policy_key == resolved.policy_key
-                        && persisted.root == resolved.root
-                        && persisted.original_relative_path == resolved.original_relative_path
-                        && persisted.promoted_relative_path == resolved.promoted_relative_path
-                });
-        if persisted.entries.len() != resolved.entries.len() || !same_layout {
+        if !persisted.same_layout_as(&resolved) {
             return Err(invalid_publication(
                 "persisted artifact manifest does not match canonical target paths",
             ));
@@ -487,96 +498,107 @@ fn publication_staging_key(transaction: &PublicationTransactionId) -> String {
     format!("publication_{}", transaction.as_str())
 }
 
-/// Execute one crash-safe staged publication using production filesystem behavior.
-pub fn activate_publication(
-    paths: &PublicationPaths,
-    target: PublicationTarget,
-    transaction_id: PublicationTransactionId,
-    generation: PublicationGenerationEvidence,
-    manifest: PublicationArtifactManifest,
-    inventory: &TantivyManagedInventory,
+/// The stable inputs every publication activation entry point needs: the on-disk
+/// paths, the target, the transaction id, generation evidence, the artifact
+/// manifest, and the managed inventory. Grouping them keeps every activation
+/// wrapper within the parameter limit and stops the four same-typed owned values
+/// (`target`/`transaction_id`/`generation`/`manifest`) from being transposed at a
+/// call site.
+pub struct PublicationActivationInputs<'a> {
+    pub paths: &'a PublicationPaths,
+    pub target: PublicationTarget,
+    pub transaction_id: PublicationTransactionId,
+    pub generation: PublicationGenerationEvidence,
+    pub manifest: PublicationArtifactManifest,
+    pub inventory: &'a TantivyManagedInventory,
+}
+
+/// Execute one crash-safe staged publication using production filesystem
+/// behavior, recording no fence evidence. This is the no-fence convenience over
+/// [`activate_publication_with_fence`]; both share the one activation owner and
+/// promotion path.
+pub fn activate_publication(inputs: PublicationActivationInputs<'_>) -> Result<PublicationJournal> {
+    activate_publication_with_fence(inputs, None)
+}
+
+/// Execute one crash-safe staged publication, durably recording ADR 0008 fence
+/// evidence in the prepared and committed journals. It reuses the same single
+/// activation owner and promotion path as [`activate_publication`], only threading
+/// caller-supplied `Option<PublicationFenceEvidence>` through to the journal.
+pub fn activate_publication_with_fence(
+    inputs: PublicationActivationInputs<'_>,
+    fence_evidence: Option<PublicationFenceEvidence>,
 ) -> Result<PublicationJournal> {
     let io = PublicationIo::production();
     let stage = std::cell::Cell::new(PreStagedActivationStage::Prepare);
     activate_publication_inner(
-        paths,
-        target,
-        transaction_id,
-        generation,
-        manifest,
-        inventory,
+        inputs,
         &ActivationContext {
             io: &io,
             stage: &stage,
             mode: ActivationMode::Replace,
+            fence_evidence,
         },
     )
 }
 
+/// Execute one activation under a single injected fault point. Delegates to
+/// [`activate_publication_with_faults_for_test`] with a checkpoint hook built from
+/// `fault`.
 #[cfg(test)]
 pub(crate) fn activate_publication_for_test(
-    paths: &PublicationPaths,
-    target: PublicationTarget,
-    transaction_id: PublicationTransactionId,
-    generation: PublicationGenerationEvidence,
-    manifest: PublicationArtifactManifest,
-    inventory: &TantivyManagedInventory,
+    inputs: PublicationActivationInputs<'_>,
     fault: PublicationFaultPoint,
 ) -> Result<PublicationJournal> {
     let faults = CheckpointFaultHook::new(fault);
-    let io = PublicationIo::with_faults(&faults);
-    let stage = std::cell::Cell::new(PreStagedActivationStage::Prepare);
-    activate_publication_inner(
-        paths,
-        target,
-        transaction_id,
-        generation,
-        manifest,
-        inventory,
-        &ActivationContext {
-            io: &io,
-            stage: &stage,
-            mode: ActivationMode::Replace,
-        },
-    )
+    activate_publication_with_faults_for_test(inputs, &faults)
 }
 
+/// Execute one activation under a recorded fault script, recording no fence
+/// evidence. This is the no-fence convenience over
+/// [`activate_publication_with_fence_and_faults_for_test`].
 #[cfg(test)]
 pub(crate) fn activate_publication_with_faults_for_test(
-    paths: &PublicationPaths,
-    target: PublicationTarget,
-    transaction_id: PublicationTransactionId,
-    generation: PublicationGenerationEvidence,
-    manifest: PublicationArtifactManifest,
-    inventory: &TantivyManagedInventory,
+    inputs: PublicationActivationInputs<'_>,
+    faults: &dyn PublicationFaultHook,
+) -> Result<PublicationJournal> {
+    activate_publication_with_fence_and_faults_for_test(inputs, None, faults)
+}
+
+/// Fence-bearing twin of [`activate_publication_with_faults_for_test`] used to
+/// prove the caller-supplied fence evidence is durable in the journal under the
+/// recorded filesystem fault script.
+#[cfg(test)]
+pub(crate) fn activate_publication_with_fence_and_faults_for_test(
+    inputs: PublicationActivationInputs<'_>,
+    fence_evidence: Option<PublicationFenceEvidence>,
     faults: &dyn PublicationFaultHook,
 ) -> Result<PublicationJournal> {
     let io = PublicationIo::with_faults(faults);
     let stage = std::cell::Cell::new(PreStagedActivationStage::Prepare);
     activate_publication_inner(
-        paths,
-        target,
-        transaction_id,
-        generation,
-        manifest,
-        inventory,
+        inputs,
         &ActivationContext {
             io: &io,
             stage: &stage,
             mode: ActivationMode::Replace,
+            fence_evidence,
         },
     )
 }
 
 fn activate_publication_inner(
-    paths: &PublicationPaths,
-    target: PublicationTarget,
-    transaction_id: PublicationTransactionId,
-    generation: PublicationGenerationEvidence,
-    mut manifest: PublicationArtifactManifest,
-    inventory: &TantivyManagedInventory,
+    inputs: PublicationActivationInputs<'_>,
     context: &ActivationContext<'_>,
 ) -> Result<PublicationJournal> {
+    let PublicationActivationInputs {
+        paths,
+        target,
+        transaction_id,
+        generation,
+        mut manifest,
+        inventory,
+    } = inputs;
     let io = context.io;
     let target_existed = match context.mode {
         ActivationMode::Replace => paths.target.exists(),
@@ -590,13 +612,20 @@ fn activate_publication_inner(
     let (prior_digest, digest) = match evidence {
         Ok(evidence) => evidence,
         Err(error) => {
-            cleanup_unprepared_transaction(paths, &manifest, context)?;
+            cleanup_unprepared_transaction(paths, &manifest, inventory, context)?;
             return Err(error);
         }
     };
+    if let Err(error) = validate_caller_fence_evidence(context.fence_evidence.as_ref()) {
+        cleanup_unprepared_transaction(paths, &manifest, inventory, context)?;
+        return Err(error);
+    }
     let mut journal =
         PublicationJournal::prepare(transaction_id, target, generation, digest, paths.clone());
     journal.prior_digest = prior_digest;
+    // Attach the caller-supplied fence evidence before the prepared journal is
+    // persisted; `apply` preserves it through commit, rollback, and quarantine.
+    journal.fence_evidence = context.fence_evidence.clone();
     journal.artifact_manifest = manifest.clone();
     let activation_result = (|| {
         io.checkpoint(PublicationFaultPoint::DuringStagingSync)?;
@@ -646,12 +675,27 @@ fn prepare_digest_evidence(
     Ok((prior_digest, digest))
 }
 
+fn validate_caller_fence_evidence(evidence: Option<&PublicationFenceEvidence>) -> Result<()> {
+    if let Some(evidence) = evidence {
+        evidence.validate()?;
+    }
+    Ok(())
+}
+
 fn cleanup_unprepared_transaction(
     paths: &PublicationPaths,
     manifest: &PublicationArtifactManifest,
+    inventory: &TantivyManagedInventory,
     context: &ActivationContext<'_>,
 ) -> Result<()> {
     let io = context.io;
+    let namespace = transaction_namespace(paths)?;
+    if paths.journal.exists() {
+        cleanup_journaled_retry_drift(paths, manifest, inventory, io)?;
+        return Err(invalid_publication(
+            "cannot clean up a journaled publication transaction",
+        ));
+    }
     if context.mode == ActivationMode::CreateOnly {
         // Release the reservation this activation is holding. Gating on the mode
         // rather than on `target_existed` matters: a replace activation must never
@@ -659,8 +703,7 @@ fn cleanup_unprepared_transaction(
         io.remove_if_exists(&paths.target)?;
     }
     for entry in &manifest.entries {
-        let (original, promoted) = resolved_artifact_paths(entry);
-        if promoted != original {
+        if let Some(promoted) = cleanup_candidate_promoted_path(entry) {
             io.remove_if_exists(&promoted)?;
         }
     }
@@ -668,7 +711,131 @@ fn cleanup_unprepared_transaction(
     io.remove_if_exists(&paths.backup)?;
     io.remove_if_exists(&sidecar_residue_root(paths))?;
     io.remove_if_exists(&paths.journal.with_extension("json.tmp"))?;
+    io.remove_if_exists(namespace)?;
+    if let Some(target_namespace) = namespace.parent() {
+        io.remove_dir_if_empty(target_namespace)?;
+    }
     Ok(())
+}
+
+fn cleanup_candidate_promoted_path(entry: &PublicationArtifactManifestEntry) -> Option<PathBuf> {
+    if entry.root_path.as_os_str().is_empty() {
+        return None;
+    }
+    if validate_relative_path(
+        "publication artifact original path",
+        &entry.original_relative_path,
+    )
+    .is_err()
+        || validate_relative_path(
+            "publication artifact promoted path",
+            &entry.promoted_relative_path,
+        )
+        .is_err()
+        || reject_path_escape(&entry.root_path, &entry.original_relative_path).is_err()
+        || reject_path_escape(&entry.root_path, &entry.promoted_relative_path).is_err()
+    {
+        return None;
+    }
+
+    let (original, promoted) = resolved_artifact_paths(entry);
+    if promoted == original {
+        None
+    } else {
+        Some(promoted)
+    }
+}
+
+fn cleanup_journaled_retry_drift(
+    paths: &PublicationPaths,
+    manifest: &PublicationArtifactManifest,
+    inventory: &TantivyManagedInventory,
+    io: &PublicationIo<'_>,
+) -> Result<()> {
+    let journal = PublicationJournal::from_recovery_json(&fs::read_to_string(&paths.journal)?)?;
+    let mut remove_staging = journaled_staging_is_retry_drift(paths, &journal, inventory);
+    if journaled_tree_is_retry_drift(&paths.backup, journal.prior_digest.as_ref(), inventory) {
+        io.remove_if_exists(&paths.backup)?;
+    }
+    if cleanup_journaled_sidecar_retry_drift(&journal.artifact_manifest, manifest, io)? {
+        remove_staging = true;
+    }
+    if remove_staging {
+        io.remove_if_exists(&paths.staging)?;
+    }
+    Ok(())
+}
+
+fn journaled_staging_is_retry_drift(
+    paths: &PublicationPaths,
+    journal: &PublicationJournal,
+    inventory: &TantivyManagedInventory,
+) -> bool {
+    if !paths.staging.exists() {
+        return false;
+    }
+    journaled_tree_is_retry_drift(&paths.staging, Some(&journal.digest), inventory)
+}
+
+fn journaled_tree_is_retry_drift(
+    path: &Path,
+    expected_digest: Option<&ContentDigest>,
+    inventory: &TantivyManagedInventory,
+) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let Some(expected_digest) = expected_digest else {
+        return true;
+    };
+    canonical_tenant_tree_digest(path, inventory)
+        .map(|observed_digest| &observed_digest != expected_digest)
+        .unwrap_or(true)
+}
+
+fn cleanup_journaled_sidecar_retry_drift(
+    journal_manifest: &PublicationArtifactManifest,
+    resolved_manifest: &PublicationArtifactManifest,
+    io: &PublicationIo<'_>,
+) -> Result<bool> {
+    if !journal_manifest.same_layout_as(resolved_manifest) {
+        return Ok(false);
+    }
+    let mut removed_promoted_evidence = false;
+    for (persisted, resolved) in journal_manifest
+        .entries
+        .iter()
+        .zip(&resolved_manifest.entries)
+    {
+        if persisted.original_relative_path == persisted.promoted_relative_path {
+            continue;
+        }
+        let (_, promoted) = resolved_artifact_paths(resolved);
+        if sidecar_artifact_is_retry_drift(&promoted, persisted.promoted_digest.as_ref()) {
+            io.remove_if_exists(&promoted)?;
+            removed_promoted_evidence |= persisted.promoted_digest.is_some();
+        }
+    }
+    Ok(removed_promoted_evidence)
+}
+
+fn sidecar_artifact_is_retry_drift(path: &Path, expected: Option<&ContentDigest>) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let Some(expected) = expected else {
+        return true;
+    };
+    artifact_digest(path)
+        .map(|observed| &observed != expected)
+        .unwrap_or(true)
+}
+
+fn transaction_namespace(paths: &PublicationPaths) -> Result<&Path> {
+    paths
+        .staging
+        .parent()
+        .ok_or_else(|| invalid_publication("publication staging path has no transaction namespace"))
 }
 
 fn resolve_failed_activation(

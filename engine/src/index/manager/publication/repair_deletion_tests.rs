@@ -26,14 +26,14 @@ fn committed_sidecar_deletion_remains_valid_during_repair() {
     .unwrap();
     let inventory = TantivyManagedInventory::new([PathBuf::from("index_meta.json")]).unwrap();
 
-    activate_publication(
-        &paths,
-        target.clone(),
-        transaction.clone(),
-        PublicationGenerationEvidence::new("move_generation").unwrap(),
-        manifest.clone(),
-        &inventory,
-    )
+    activate_publication(PublicationActivationInputs {
+        paths: &paths,
+        target: target.clone(),
+        transaction_id: transaction.clone(),
+        generation: PublicationGenerationEvidence::new("move_generation").unwrap(),
+        manifest: manifest.clone(),
+        inventory: &inventory,
+    })
     .unwrap();
 
     assert_eq!(

@@ -435,7 +435,7 @@ fn owned_value_to_fields(
 
 /// Convert a single Tantivy `OwnedValue` into a `FieldValue`.
 ///
-/// Returns `None` for `Null` and unrecognized variants. Booleans are converted to their string representation. `U64` values are cast to `i64`.
+/// Returns `None` for `Null` and unrecognized variants. `U64` values are cast to `i64`.
 fn owned_to_field_value(value: &OwnedValue) -> Option<FieldValue> {
     match value {
         OwnedValue::Null => None,
@@ -443,7 +443,7 @@ fn owned_to_field_value(value: &OwnedValue) -> Option<FieldValue> {
         OwnedValue::I64(i) => Some(FieldValue::Integer(*i)),
         OwnedValue::U64(u) => Some(FieldValue::Integer(*u as i64)),
         OwnedValue::F64(f) => Some(FieldValue::Float(*f)),
-        OwnedValue::Bool(b) => Some(FieldValue::Text(b.to_string())),
+        OwnedValue::Bool(b) => Some(FieldValue::Bool(*b)),
         OwnedValue::Array(arr) => {
             let items: Vec<FieldValue> = arr.iter().filter_map(owned_to_field_value).collect();
             if items.is_empty() {
@@ -632,9 +632,9 @@ mod tests {
     }
 
     #[test]
-    fn owned_bool_to_text() {
+    fn owned_bool_to_bool() {
         let v = owned_to_field_value(&OwnedValue::Bool(true));
-        assert_eq!(v, Some(FieldValue::Text("true".to_string())));
+        assert_eq!(v, Some(FieldValue::Bool(true)));
     }
 
     #[test]

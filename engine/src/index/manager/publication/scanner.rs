@@ -1,5 +1,6 @@
+use super::epoch::{observe_publication_epoch, publication_epoch_paths_for_target_path};
 use super::fsops::reject_symlinked_managed_path_components;
-use super::repair::repair_publication_outcome;
+use super::repair::repair_publication_outcome_with_epoch;
 use super::{
     invalid_publication, PublicationArtifactManifest, PublicationJournal, PublicationPaths,
     PublicationPhase, PublicationTarget, PublicationTransactionId, RepairDecision, Result,
@@ -92,7 +93,20 @@ pub struct PublicationRepairReport {
 
 enum TargetTransactionDiscovery {
     MissingNamespace,
-    Present(Vec<PublicationTransactionId>),
+    /// The namespace path exists but is a symlink or non-directory, so its
+    /// contents are never enumerated and it is reported as unresolved evidence.
+    NamespaceNotDirectory,
+    Present {
+        transactions: Vec<PublicationTransactionId>,
+        namespace_contents: TargetNamespaceContents,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetNamespaceContents {
+    Empty,
+    OnlyEpochSidecars,
+    OtherEntries,
 }
 
 /// Discover publication targets in stable lexical order without mutating storage.
@@ -103,12 +117,11 @@ pub fn publication_scan_targets(base: &Path) -> Result<Vec<PublicationTarget>> {
     let mut targets = Vec::new();
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            let name = entry.file_name().into_string().map_err(|_| {
-                invalid_publication("publication target directory name is not UTF-8")
-            })?;
-            targets.push(PublicationTarget::new(name)?);
-        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| invalid_publication("publication target directory name is not UTF-8"))?;
+        targets.push(PublicationTarget::new(name)?);
     }
     targets.sort_by(|left, right| left.as_str().cmp(right.as_str()));
     Ok(targets)
@@ -132,25 +145,51 @@ pub fn scan_and_repair_publication_target(
     target: PublicationTarget,
 ) -> Result<PublicationRepairReport> {
     let discovery = target_transactions(base, &target)?;
-    let transactions = match discovery {
+    match discovery {
         TargetTransactionDiscovery::MissingNamespace => {
             if clean_target_paths_are_proven(base, &target)? {
-                return Ok(PublicationRepairReport {
-                    target,
-                    transactions: Vec::new(),
-                    status: PublicationRepairStatus::Clean,
-                    action: PublicationScanAction::Clean,
-                    transaction_id: None,
-                    phase: None,
-                    evidence: None,
-                    disposition: PublicationTargetDisposition::Loadable,
-                    live_target_mutated: false,
-                });
+                return Ok(clean_target_report(target, Vec::new()));
             }
-            return Ok(unresolved_target_report(target, Vec::new(), None));
+            Ok(unresolved_target_report(target, Vec::new(), None))
         }
-        TargetTransactionDiscovery::Present(transactions) => transactions,
-    };
+        TargetTransactionDiscovery::NamespaceNotDirectory => Ok(unresolved_target_report(
+            target.clone(),
+            Vec::new(),
+            Some(target_namespace_evidence(&target)),
+        )),
+        TargetTransactionDiscovery::Present {
+            transactions,
+            namespace_contents,
+        } => {
+            // Fail closed on corrupt or unreadable epoch state before any repair
+            // decision, whether or not the namespace also holds transaction dirs.
+            let observed_epoch = observe_epoch_sidecar_state(base, &target)?;
+            if transactions.is_empty()
+                && namespace_contents == TargetNamespaceContents::OnlyEpochSidecars
+            {
+                if clean_target_paths_are_proven(base, &target)?
+                    && live_target_tree_is_proven(base, &target)?
+                {
+                    return Ok(clean_target_report(target, transactions));
+                }
+                return Ok(unresolved_target_report(
+                    target.clone(),
+                    transactions,
+                    Some(target_namespace_evidence(&target)),
+                ));
+            }
+            repair_discovered_target(base, analytics, target, transactions, observed_epoch)
+        }
+    }
+}
+
+fn repair_discovered_target(
+    base: &Path,
+    analytics: &AnalyticsConfig,
+    target: PublicationTarget,
+    transactions: Vec<PublicationTransactionId>,
+    observed_epoch: super::epoch::PublicationEpochObservation,
+) -> Result<PublicationRepairReport> {
     if transactions.is_empty() {
         return Ok(unresolved_target_report(
             target.clone(),
@@ -170,7 +209,7 @@ pub fn scan_and_repair_publication_target(
     reject_symlinked_managed_path_components(base, &paths.journal, "publication scan evidence")?;
     let phase = std::fs::read_to_string(&paths.journal)
         .ok()
-        .and_then(|raw| PublicationJournal::from_json(&raw).ok())
+        .and_then(|raw| PublicationJournal::from_recovery_json(&raw).ok())
         .map(|journal| journal.phase);
     let evidence = paths
         .journal
@@ -184,12 +223,13 @@ pub fn scan_and_repair_publication_target(
         paths.staging.as_path(),
         paths.backup.as_path(),
     ])?;
-    let outcome = repair_publication_outcome(
+    let outcome = repair_publication_outcome_with_epoch(
         base,
         target.clone(),
         transaction.clone(),
         manifest,
         &inventory,
+        observed_epoch,
     )?;
     let action = match outcome.decision {
         RepairDecision::None => PublicationScanAction::Clean,
@@ -237,6 +277,23 @@ fn unresolved_target_report(
     }
 }
 
+fn clean_target_report(
+    target: PublicationTarget,
+    transactions: Vec<PublicationTransactionId>,
+) -> PublicationRepairReport {
+    PublicationRepairReport {
+        target,
+        transactions,
+        status: PublicationRepairStatus::Clean,
+        action: PublicationScanAction::Clean,
+        transaction_id: None,
+        phase: None,
+        evidence: None,
+        disposition: PublicationTargetDisposition::Loadable,
+        live_target_mutated: false,
+    }
+}
+
 fn target_namespace_evidence(target: &PublicationTarget) -> PathBuf {
     PathBuf::from(super::PUBLICATION_DIR).join(target.as_str())
 }
@@ -253,6 +310,27 @@ fn clean_target_paths_are_proven(base: &Path, target: &PublicationTarget) -> Res
         }
     }
     Ok(true)
+}
+
+fn live_target_tree_is_proven(base: &Path, target: &PublicationTarget) -> Result<bool> {
+    let path = base.join(target.as_str());
+    match reject_symlinked_managed_path_components(base, &path, "publication repair managed") {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn observe_epoch_sidecar_state(
+    base: &Path,
+    target: &PublicationTarget,
+) -> Result<super::epoch::PublicationEpochObservation> {
+    observe_publication_epoch(base, target).map_err(|error| invalid_publication(error.to_string()))
 }
 
 fn validate_target_scan_roots(base: &Path, paths: &PublicationPaths) -> Result<()> {
@@ -278,20 +356,38 @@ fn target_transactions(
         Err(error) => return Err(error.into()),
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Ok(TargetTransactionDiscovery::Present(Vec::new()));
+        return Ok(TargetTransactionDiscovery::NamespaceNotDirectory);
     }
     let mut transactions = Vec::new();
-    for entry in std::fs::read_dir(root)? {
+    let mut entry_count = 0;
+    let mut namespace_contents = TargetNamespaceContents::OnlyEpochSidecars;
+    for entry in std::fs::read_dir(&root)? {
         let entry = entry?;
+        entry_count += 1;
         if entry.file_type()?.is_dir() {
             let name = entry.file_name().into_string().map_err(|_| {
                 invalid_publication("publication transaction directory name is not UTF-8")
             })?;
             transactions.push(PublicationTransactionId::new(name)?);
+            namespace_contents = TargetNamespaceContents::OtherEntries;
+        } else if epoch_sidecar_path(base, target, &entry.path()) {
+            reject_symlinked_managed_path_components(
+                base,
+                &entry.path(),
+                "publication epoch sidecar",
+            )?;
+        } else {
+            namespace_contents = TargetNamespaceContents::OtherEntries;
         }
     }
+    if entry_count == 0 {
+        namespace_contents = TargetNamespaceContents::Empty;
+    }
     transactions.sort();
-    Ok(TargetTransactionDiscovery::Present(transactions))
+    Ok(TargetTransactionDiscovery::Present {
+        transactions,
+        namespace_contents,
+    })
 }
 
 fn publication_root(base: &Path) -> Result<Option<PathBuf>> {
@@ -308,6 +404,11 @@ fn publication_root(base: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(root))
 }
 
+fn epoch_sidecar_path(base: &Path, target: &PublicationTarget, path: &Path) -> bool {
+    let paths = publication_epoch_paths_for_target_path(&base.join(target.as_str()));
+    path == paths.epoch || path == paths.temp || path == paths.lock
+}
+
 fn resolved_manifest(
     base: &Path,
     analytics: &AnalyticsConfig,
@@ -317,7 +418,7 @@ fn resolved_manifest(
 ) -> PublicationArtifactManifest {
     std::fs::read_to_string(&paths.journal)
         .ok()
-        .and_then(|raw| PublicationJournal::from_json(&raw).ok())
+        .and_then(|raw| PublicationJournal::from_recovery_json(&raw).ok())
         .and_then(|journal| {
             PublicationArtifactManifest::resolve_for_repair(
                 base,

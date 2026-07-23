@@ -17,6 +17,7 @@ WORKDIR /app
 
 # Copy manifests
 COPY engine/Cargo.toml engine/Cargo.lock ./
+COPY engine/build.rs ./build.rs
 
 # Copy workspace crates
 COPY engine/src ./src

@@ -691,10 +691,8 @@ fn live_http_fixture_expected_highlight_covers_nested_and_array_leaves() {
     assert_eq!(rendered, expected);
 }
 
-/// Values `Document::from_json` discards never reach the highlighter, so the oracle
-/// must omit them rather than invite the helper to assert a field the server drops.
 #[test]
-fn live_http_fixture_expected_highlight_omits_discarded_document_values() {
+fn live_http_fixture_expected_highlight_preserves_booleans_and_omits_empty_values() {
     let body = serde_json::json!({
         "objectID": "sparse-widget",
         "flag": true,
@@ -708,8 +706,11 @@ fn live_http_fixture_expected_highlight_omits_discarded_document_values() {
     let rendered = repair_cli_manifest::production_highlight_value_strings(&body)
         .expect("sparse body must build a document");
 
-    let expected =
-        std::collections::BTreeMap::from([("kept".to_string(), "value".to_string())]);
+    let expected = std::collections::BTreeMap::from([
+        ("emptied_object.flag".to_string(), "false".to_string()),
+        ("flag".to_string(), "true".to_string()),
+        ("kept".to_string(), "value".to_string()),
+    ]);
     assert_eq!(rendered, expected);
 }
 

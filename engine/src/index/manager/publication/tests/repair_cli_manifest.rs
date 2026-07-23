@@ -584,12 +584,14 @@ fn record_activation(kind: ActivationKind) -> Vec<ObservedBoundary> {
     };
     let recording = PublicationFaultScript::recording();
     activate_publication_with_faults_for_test(
-        &fixture.paths,
-        fixture.target.clone(),
-        fixture.transaction.clone(),
-        PublicationGenerationEvidence::new("generation_1").unwrap(),
-        manifest,
-        &fixture.inventory,
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest,
+            inventory: &fixture.inventory,
+        },
         &recording,
     )
     .unwrap();

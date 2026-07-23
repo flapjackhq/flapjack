@@ -140,7 +140,7 @@ fn public_surface_stays_node_local_and_rejects_cluster_atomicity() {
 fn journal_round_trip_preserves_exact_contract_values() {
     let journal = prepared_journal().apply(PublicationEvent::Commit).unwrap();
     let value = journal.to_json_value();
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["schema_version"], 2);
     assert_eq!(value["transaction_id"], "txn_001");
     assert_eq!(value["target"], "products");
     assert_eq!(value["generation"], "opaque_generation_7");
@@ -148,12 +148,77 @@ fn journal_round_trip_preserves_exact_contract_values() {
     assert_eq!(value["transition_sequence"], 2);
     assert_eq!(value["phase"], "committed");
     assert_eq!(value["disposition"], "committed");
+    // A non-fence activation must serialize the absence of fence evidence
+    // explicitly as null, never as a placeholder zero watermark.
+    assert!(value["fence_evidence"].is_null());
 
     let parsed = PublicationJournal::from_json(&value.to_string()).unwrap();
     assert_eq!(parsed.transaction_id.as_str(), "txn_001");
     assert_eq!(parsed.target.as_str(), "products");
     assert_eq!(parsed.phase, PublicationPhase::Committed);
     assert_eq!(parsed.disposition, Some(PublicationDisposition::Committed));
+    assert_eq!(parsed.fence_evidence, None);
+}
+
+/// Round-trips exact `E_old`, `E_new`, staging-baseline, and `W` values through the
+/// schema-version-2 journal for both serialization and parsing.
+#[test]
+fn journal_round_trip_preserves_exact_fence_evidence() {
+    let fence = PublicationFenceEvidence::new(
+        PublicationEpoch(6),
+        PublicationEpoch(7),
+        PublicationStagingBaseline(40),
+        PublicationWatermark(42),
+    )
+    .unwrap();
+    let mut journal = prepared_journal();
+    journal.fence_evidence = Some(fence.clone());
+    let journal = journal.apply(PublicationEvent::Commit).unwrap();
+
+    let value = journal.to_json_value();
+    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["fence_evidence"]["epoch_old"], 6);
+    assert_eq!(value["fence_evidence"]["epoch_new"], 7);
+    assert_eq!(value["fence_evidence"]["staging_baseline"], 40);
+    assert_eq!(value["fence_evidence"]["watermark"], 42);
+
+    let parsed = PublicationJournal::from_json(&value.to_string()).unwrap();
+    assert_eq!(parsed.fence_evidence, Some(fence));
+    assert_eq!(parsed.phase, PublicationPhase::Committed);
+}
+
+/// A journal mutated to an unknown future `schema_version` must fail closed rather
+/// than silently downgrade or read its future fence evidence.
+#[test]
+fn journal_parser_refuses_unknown_future_schema_version() {
+    let mut value = prepared_journal().to_json_value();
+    value["schema_version"] = serde_json::json!(3);
+    value["fence_evidence"] = serde_json::json!({
+        "epoch_old": 1,
+        "epoch_new": 2,
+        "staging_baseline": 0,
+        "watermark": 5,
+    });
+    let error = PublicationJournal::from_json(&value.to_string())
+        .expect_err("future schema versions must fail closed")
+        .to_string();
+    assert!(
+        error.contains("unknown publication journal schema version"),
+        "{error}"
+    );
+}
+
+/// Compatibility policy: a legacy `schema_version: 1` journal predates fence
+/// evidence and must be refused, never accepted as a fence-proven MIG-5 journal.
+#[test]
+fn journal_parser_refuses_legacy_v1_schema_without_fence_evidence() {
+    let mut value = prepared_journal().to_json_value();
+    value["schema_version"] = serde_json::json!(1);
+    value["fence_evidence"] = serde_json::Value::Null;
+    let error = PublicationJournal::from_json(&value.to_string())
+        .expect_err("legacy v1 journals must not be read as fence-proven")
+        .to_string();
+    assert!(error.contains("predates fence evidence"), "{error}");
 }
 
 #[test]
@@ -180,6 +245,27 @@ fn journal_rejects_invalid_schema_and_evidence() {
     let mut value = prepared_journal().to_json_value();
     value["generation"] = serde_json::json!("../writer");
     assert!(PublicationJournal::from_json(&value.to_string()).is_err());
+
+    // A replacement epoch that is not exactly one past the old incarnation is
+    // rejected on read, not silently accepted as fence-proven.
+    let mut value = prepared_journal().to_json_value();
+    value["fence_evidence"] = serde_json::json!({
+        "epoch_old": 3,
+        "epoch_new": 9,
+        "staging_baseline": 0,
+        "watermark": 5,
+    });
+    assert!(PublicationJournal::from_json(&value.to_string()).is_err());
+
+    // A staging baseline past the drained watermark `W` is impossible evidence.
+    let mut value = prepared_journal().to_json_value();
+    value["fence_evidence"] = serde_json::json!({
+        "epoch_old": 3,
+        "epoch_new": 4,
+        "staging_baseline": 9,
+        "watermark": 5,
+    });
+    assert!(PublicationJournal::from_json(&value.to_string()).is_err());
 }
 
 #[test]
@@ -198,7 +284,15 @@ fn legal_transition_table_rejects_arbitrary_phase_changes() {
 
 #[test]
 fn handoff_requires_publication_outcome_before_tombstone_retention() {
-    let prepared = prepared_journal();
+    let mut prepared = prepared_journal();
+    let fence = PublicationFenceEvidence::new(
+        PublicationEpoch(0),
+        PublicationEpoch(1),
+        PublicationStagingBaseline(3),
+        PublicationWatermark(3),
+    )
+    .unwrap();
+    prepared.fence_evidence = Some(fence.clone());
     let promoting = PublicationJobHandoff::promoting(prepared.transaction_id.clone());
     assert!(PublicationJobHandoff::adopt(&prepared).is_err());
     assert!(PublicationTombstone::from_adopted(&prepared, &promoting).is_err());
@@ -208,6 +302,8 @@ fn handoff_requires_publication_outcome_before_tombstone_retention() {
     let tombstone = PublicationTombstone::from_adopted(&committed, &adopted).unwrap();
     assert!(tombstone.retention_eligible());
     assert_eq!(tombstone.outcome, PublicationDisposition::Committed);
+    // Fence evidence must survive terminal compaction into the tombstone.
+    assert_eq!(tombstone.fence_evidence, Some(fence));
 }
 
 #[test]
@@ -380,12 +476,14 @@ fn activation_rejects_unknown_artifacts_before_mutation() {
     std::fs::write(fixture.paths.staging.join("mystery.bin"), b"new").unwrap();
 
     let error = activate_publication_for_test(
-        &fixture.paths,
-        fixture.target.clone(),
-        fixture.transaction.clone(),
-        PublicationGenerationEvidence::new("generation_1").unwrap(),
-        PublicationArtifactManifest::default(),
-        &fixture.inventory,
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest: PublicationArtifactManifest::default(),
+            inventory: &fixture.inventory,
+        },
         PublicationFaultPoint::NoFault,
     )
     .unwrap_err();
@@ -397,6 +495,42 @@ fn activation_rejects_unknown_artifacts_before_mutation() {
 }
 
 #[test]
+fn activation_rejects_invalid_manifest_without_deleting_outside_artifact_root() {
+    let fixture = ActivationFixture::new();
+    fixture.write_old_target();
+    fixture.write_new_staging();
+
+    let sidecar_root = fixture.base().join("artifact_root");
+    std::fs::create_dir_all(&sidecar_root).unwrap();
+    let victim = fixture.base().join("victim_sidecar.txt");
+    std::fs::write(&victim, b"keep").unwrap();
+    let manifest = PublicationArtifactManifest {
+        entries: vec![PublicationArtifactManifestEntry::journaled(
+            "query_suggestions_primary",
+            PublicationArtifactRoot::QuerySuggestions,
+            PathBuf::from("products.json"),
+            victim.clone(),
+            sidecar_root,
+        )],
+    };
+
+    let error = activate_publication(PublicationActivationInputs {
+        paths: &fixture.paths,
+        target: fixture.target.clone(),
+        transaction_id: fixture.transaction.clone(),
+        generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+        manifest,
+        inventory: &fixture.inventory,
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains("must be relative"));
+    assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+    assert!(!fixture.paths.journal.exists());
+    assert_eq!(fixture.read_target_file("index_meta.json"), b"old-meta");
+}
+
+#[test]
 fn replacement_activation_rolls_back_losslessly_after_promote_failure() {
     let fixture = ActivationFixture::new();
     fixture.write_old_target();
@@ -404,12 +538,14 @@ fn replacement_activation_rolls_back_losslessly_after_promote_failure() {
     fixture.write_external_sidecar(b"old-sidecar");
 
     let result = activate_publication_for_test(
-        &fixture.paths,
-        fixture.target.clone(),
-        fixture.transaction.clone(),
-        PublicationGenerationEvidence::new("generation_1").unwrap(),
-        fixture.external_manifest(),
-        &fixture.inventory,
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest: fixture.external_manifest(),
+            inventory: &fixture.inventory,
+        },
         PublicationFaultPoint::AfterStagingPromote,
     );
 
@@ -433,12 +569,14 @@ fn failed_create_removes_target_staging_backup_and_records_rollback() {
     fixture.write_new_staging();
 
     let result = activate_publication_for_test(
-        &fixture.paths,
-        fixture.target.clone(),
-        fixture.transaction.clone(),
-        PublicationGenerationEvidence::new("generation_1").unwrap(),
-        PublicationArtifactManifest::default(),
-        &fixture.inventory,
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest: PublicationArtifactManifest::default(),
+            inventory: &fixture.inventory,
+        },
         PublicationFaultPoint::AfterStagingPromote,
     );
 
@@ -480,12 +618,14 @@ fn ambiguous_failed_create_quarantines_digest_bearing_journal() {
     let expected_digest = fixture.new_digest();
 
     let result = activate_publication_for_test(
-        &fixture.paths,
-        fixture.target.clone(),
-        fixture.transaction.clone(),
-        PublicationGenerationEvidence::new("generation_1").unwrap(),
-        PublicationArtifactManifest::default(),
-        &fixture.inventory,
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest: PublicationArtifactManifest::default(),
+            inventory: &fixture.inventory,
+        },
         PublicationFaultPoint::AfterRollbackJournal,
     );
 
@@ -508,12 +648,14 @@ fn successful_activation_promotes_journaled_sidecar_and_records_digests() {
     fixture.write_promoted_sidecar(b"new-sidecar");
 
     let journal = activate_publication_for_test(
-        &fixture.paths,
-        fixture.target.clone(),
-        fixture.transaction.clone(),
-        PublicationGenerationEvidence::new("generation_1").unwrap(),
-        fixture.promoting_external_manifest(),
-        &fixture.inventory,
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest: fixture.promoting_external_manifest(),
+            inventory: &fixture.inventory,
+        },
         PublicationFaultPoint::NoFault,
     )
     .unwrap();
@@ -568,12 +710,14 @@ fn activation_rejects_symlinked_manifest_components_before_mutation() {
     std::fs::write(outside.join("products.json"), b"outside").unwrap();
 
     let error = activate_publication_for_test(
-        &fixture.paths,
-        fixture.target.clone(),
-        fixture.transaction.clone(),
-        PublicationGenerationEvidence::new("generation_1").unwrap(),
-        manifest,
-        &fixture.inventory,
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest,
+            inventory: &fixture.inventory,
+        },
         PublicationFaultPoint::NoFault,
     )
     .unwrap_err();
@@ -682,12 +826,14 @@ fn replacement_rollback_removes_sidecar_backup_residue() {
     fixture.write_promoted_sidecar(b"new-sidecar");
 
     let result = activate_publication_for_test(
-        &fixture.paths,
-        fixture.target.clone(),
-        fixture.transaction.clone(),
-        PublicationGenerationEvidence::new("generation_1").unwrap(),
-        fixture.promoting_external_manifest(),
-        &fixture.inventory,
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest: fixture.promoting_external_manifest(),
+            inventory: &fixture.inventory,
+        },
         PublicationFaultPoint::AfterStagingPromote,
     );
 
@@ -714,12 +860,14 @@ fn activation_fault_hook_covers_durability_boundaries_without_success() {
         fixture.write_old_target();
         fixture.write_new_staging();
         let result = activate_publication_for_test(
-            &fixture.paths,
-            fixture.target.clone(),
-            fixture.transaction.clone(),
-            PublicationGenerationEvidence::new("generation_1").unwrap(),
-            PublicationArtifactManifest::default(),
-            &fixture.inventory,
+            PublicationActivationInputs {
+                paths: &fixture.paths,
+                target: fixture.target.clone(),
+                transaction_id: fixture.transaction.clone(),
+                generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+                manifest: PublicationArtifactManifest::default(),
+                inventory: &fixture.inventory,
+            },
             fault,
         );
         assert!(result.is_err(), "{fault:?} unexpectedly succeeded");
@@ -728,12 +876,14 @@ fn activation_fault_hook_covers_durability_boundaries_without_success() {
     let fixture = ActivationFixture::new();
     fixture.write_new_staging();
     let result = activate_publication_for_test(
-        &fixture.paths,
-        fixture.target.clone(),
-        fixture.transaction.clone(),
-        PublicationGenerationEvidence::new("generation_1").unwrap(),
-        PublicationArtifactManifest::default(),
-        &fixture.inventory,
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest: PublicationArtifactManifest::default(),
+            inventory: &fixture.inventory,
+        },
         PublicationFaultPoint::DuringQuarantine,
     );
     assert!(result.is_err(), "DuringQuarantine unexpectedly succeeded");
@@ -753,12 +903,14 @@ fn replacement_faults_after_promotion_restore_the_exact_old_publication() {
         fixture.write_promoted_sidecar(b"new-sidecar");
 
         let result = activate_publication_for_test(
-            &fixture.paths,
-            fixture.target.clone(),
-            fixture.transaction.clone(),
-            PublicationGenerationEvidence::new("generation_1").unwrap(),
-            fixture.promoting_external_manifest(),
-            &fixture.inventory,
+            PublicationActivationInputs {
+                paths: &fixture.paths,
+                target: fixture.target.clone(),
+                transaction_id: fixture.transaction.clone(),
+                generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+                manifest: fixture.promoting_external_manifest(),
+                inventory: &fixture.inventory,
+            },
             fault,
         );
 
@@ -815,12 +967,14 @@ fn post_commit_faults_preserve_the_committed_publication() {
         fixture.write_promoted_sidecar(b"new-sidecar");
 
         let result = activate_publication_for_test(
-            &fixture.paths,
-            fixture.target.clone(),
-            fixture.transaction.clone(),
-            PublicationGenerationEvidence::new("generation_1").unwrap(),
-            fixture.promoting_external_manifest(),
-            &fixture.inventory,
+            PublicationActivationInputs {
+                paths: &fixture.paths,
+                target: fixture.target.clone(),
+                transaction_id: fixture.transaction.clone(),
+                generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+                manifest: fixture.promoting_external_manifest(),
+                inventory: &fixture.inventory,
+            },
             fault,
         );
 
@@ -843,6 +997,888 @@ fn post_commit_faults_preserve_the_committed_publication() {
     }
 }
 
+/// ADR 0008 fence evidence sized against the activation fixture: `E_new = E_old + 1`
+/// and a staging baseline at or below the drained watermark `W` (the fixture's old
+/// generation `committed_seq` is `7`).
+fn fixture_fence_evidence() -> PublicationFenceEvidence {
+    PublicationFenceEvidence::new(
+        PublicationEpoch(2),
+        PublicationEpoch(3),
+        PublicationStagingBaseline(7),
+        PublicationWatermark(7),
+    )
+    .unwrap()
+}
+
+#[test]
+fn activation_rejects_invalid_caller_supplied_fence_before_persistence() {
+    let fixture = ActivationFixture::new();
+    fixture.write_old_target();
+    fixture.write_new_staging();
+    let invalid_fence = PublicationFenceEvidence {
+        epoch_old: PublicationEpoch(2),
+        epoch_new: PublicationEpoch(9),
+        staging_baseline: PublicationStagingBaseline(8),
+        watermark: PublicationWatermark(7),
+    };
+
+    let error = activate_publication_with_fence_and_faults_for_test(
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest: PublicationArtifactManifest::default(),
+            inventory: &fixture.inventory,
+        },
+        Some(invalid_fence),
+        &PublicationFaultScript::recording(),
+    )
+    .expect_err("invalid caller-supplied fence evidence must not be persisted")
+    .to_string();
+
+    assert!(
+        error.contains("publication fence replacement epoch must be exactly one past the old epoch"),
+        "{error}"
+    );
+    assert!(!fixture.paths.journal.exists());
+    assert_eq!(fixture.read_target_file("index_meta.json"), b"old-meta");
+}
+
+#[test]
+fn activation_invalid_fence_cleanup_leaves_old_target_loadable() {
+    let fixture = ActivationFixture::new();
+    fixture.write_old_target();
+    fixture.write_new_staging();
+    fixture.write_external_sidecar(b"old-sidecar");
+    fixture.write_promoted_sidecar(b"new-sidecar");
+    let invalid_fence = PublicationFenceEvidence {
+        epoch_old: PublicationEpoch(2),
+        epoch_new: PublicationEpoch(9),
+        staging_baseline: PublicationStagingBaseline(8),
+        watermark: PublicationWatermark(7),
+    };
+
+    let error = activate_publication_with_fence_and_faults_for_test(
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest: fixture.promoting_external_manifest(),
+            inventory: &fixture.inventory,
+        },
+        Some(invalid_fence),
+        &PublicationFaultScript::recording(),
+    )
+    .expect_err("invalid caller-supplied fence evidence must abort before journaling")
+    .to_string();
+
+    assert!(
+        error.contains("publication fence replacement epoch must be exactly one past the old epoch"),
+        "{error}"
+    );
+    assert_eq!(fixture.read_target_file("index_meta.json"), b"old-meta");
+    assert_eq!(std::fs::read(fixture.sidecar_path()).unwrap(), b"old-sidecar");
+    assert!(!fixture.paths.journal.exists());
+    assert!(!fixture.paths.staging.exists());
+    assert!(!fixture.paths.backup.exists());
+    assert!(!fixture.journal_temp_path().exists());
+    assert!(!fixture.promoted_sidecar_path().exists());
+    assert!(!executor::sidecar_residue_root(&fixture.paths).exists());
+    assert!(!fixture.transaction_root().exists());
+
+    let report = scan_and_repair_publication_target(
+        fixture.base(),
+        &AnalyticsConfig::for_data_dir(fixture.base()),
+        fixture.target.clone(),
+    )
+    .unwrap();
+    assert_eq!(report.status, PublicationRepairStatus::Clean);
+    assert_eq!(report.action, PublicationScanAction::Clean);
+    assert_eq!(report.disposition, PublicationTargetDisposition::Loadable);
+}
+
+#[test]
+fn startup_repair_after_epoch_advance_before_journal_reopens_old_tree() {
+    let fixture = ActivationFixture::new();
+    fixture.write_old_target();
+    fixture.write_new_staging();
+    let old_bytes = collect_fixture_tree_bytes(&fixture.paths.target);
+    let old_digest = fixture.target_digest();
+    let guard = compare_and_advance_publication_epoch(
+        fixture.base(),
+        &fixture.target,
+        PublicationEpoch(0),
+    )
+    .unwrap();
+    let fence = PublicationFenceEvidence::new(
+        guard.previous(),
+        guard.advanced(),
+        PublicationStagingBaseline(7),
+        PublicationWatermark(7),
+    )
+    .unwrap();
+
+    let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        activate_publication_with_fence_and_faults_for_test(
+            PublicationActivationInputs {
+                paths: &fixture.paths,
+                target: fixture.target.clone(),
+                transaction_id: fixture.transaction.clone(),
+                generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+                manifest: PublicationArtifactManifest::default(),
+                inventory: &fixture.inventory,
+            },
+            Some(fence),
+            &PanicAtCheckpoint::new(PublicationFaultPoint::DuringPrepareJournalWrite),
+        )
+        .unwrap();
+    }));
+    assert!(crash.is_err(), "test crash hook must bypass activation rollback");
+    drop(guard);
+    assert_eq!(
+        read_publication_epoch(fixture.base(), &fixture.target).unwrap(),
+        PublicationEpoch(1)
+    );
+    assert!(!fixture.paths.journal.exists());
+    assert!(fixture.journal_temp_path().exists());
+    assert_eq!(collect_fixture_tree_bytes(&fixture.paths.target), old_bytes);
+    assert_eq!(fixture.target_digest(), old_digest);
+
+    let report = scan_and_repair_publication_target(
+        fixture.base(),
+        &AnalyticsConfig::for_data_dir(fixture.base()),
+        fixture.target.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(report.status, PublicationRepairStatus::Repaired);
+    assert_eq!(
+        report.action,
+        PublicationScanAction::Repaired(RepairDecision::Cleanup)
+    );
+    assert_eq!(report.disposition, PublicationTargetDisposition::Loadable);
+    assert!(!report.live_target_mutated);
+    assert_eq!(read_publication_epoch(fixture.base(), &fixture.target).unwrap(), PublicationEpoch(1));
+    assert!(!fixture.paths.journal.exists());
+    assert!(!fixture.paths.staging.exists());
+    assert!(!fixture.paths.backup.exists());
+    assert!(!fixture.journal_temp_path().exists());
+    assert_eq!(collect_fixture_tree_bytes(&fixture.paths.target), old_bytes);
+    assert_eq!(fixture.read_target_file("index_meta.json"), b"old-meta");
+}
+
+#[test]
+fn startup_repair_after_unfenced_prepare_crash_reopens_old_tree() {
+    let fixture = ActivationFixture::new();
+    fixture.write_old_target();
+    fixture.write_new_staging();
+    let old_bytes = collect_fixture_tree_bytes(&fixture.paths.target);
+    let old_digest = fixture.target_digest();
+
+    let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        activate_publication_with_faults_for_test(
+            fixture.activation_inputs(PublicationArtifactManifest::default()),
+            &PanicAtCheckpoint::new(PublicationFaultPoint::DuringPrepareJournalWrite),
+        )
+        .unwrap();
+    }));
+    assert!(crash.is_err(), "test crash hook must bypass activation rollback");
+    assert!(!fixture.paths.journal.exists());
+    assert!(fixture.journal_temp_path().exists());
+    assert_eq!(collect_fixture_tree_bytes(&fixture.paths.target), old_bytes);
+    assert_eq!(fixture.target_digest(), old_digest);
+
+    let report = scan_and_repair_publication_target(
+        fixture.base(),
+        &AnalyticsConfig::for_data_dir(fixture.base()),
+        fixture.target.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(report.status, PublicationRepairStatus::Repaired);
+    assert_eq!(
+        report.action,
+        PublicationScanAction::Repaired(RepairDecision::Cleanup)
+    );
+    assert_eq!(report.disposition, PublicationTargetDisposition::Loadable);
+    assert!(!report.live_target_mutated);
+    assert!(!fixture.paths.journal.exists());
+    assert!(!fixture.paths.staging.exists());
+    assert!(!fixture.paths.backup.exists());
+    assert!(!fixture.journal_temp_path().exists());
+    assert_eq!(collect_fixture_tree_bytes(&fixture.paths.target), old_bytes);
+    assert_eq!(fixture.read_target_file("index_meta.json"), b"old-meta");
+}
+
+#[test]
+fn startup_repair_epoch_only_window_negative_cases_fail_closed() {
+    #[derive(Clone, Copy)]
+    enum PreJournalNegativeCase {
+        AbsentEpoch,
+        CorruptEpoch,
+        LiveTargetSymlink,
+        MissingLiveTarget,
+        BackupResidue,
+    }
+
+    let cases = [
+        PreJournalNegativeCase::AbsentEpoch,
+        PreJournalNegativeCase::CorruptEpoch,
+        PreJournalNegativeCase::LiveTargetSymlink,
+        PreJournalNegativeCase::MissingLiveTarget,
+        PreJournalNegativeCase::BackupResidue,
+    ];
+
+    for case in cases {
+        let fixture = ActivationFixture::new();
+        fixture.write_old_target();
+        fixture.write_new_staging();
+        let guard = compare_and_advance_publication_epoch(
+            fixture.base(),
+            &fixture.target,
+            PublicationEpoch(0),
+        )
+        .unwrap();
+        let fence = PublicationFenceEvidence::new(
+            guard.previous(),
+            guard.advanced(),
+            PublicationStagingBaseline(7),
+            PublicationWatermark(7),
+        )
+        .unwrap();
+        let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            activate_publication_with_fence_and_faults_for_test(
+                PublicationActivationInputs {
+                    paths: &fixture.paths,
+                    target: fixture.target.clone(),
+                    transaction_id: fixture.transaction.clone(),
+                    generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+                    manifest: PublicationArtifactManifest::default(),
+                    inventory: &fixture.inventory,
+                },
+                Some(fence),
+                &PanicAtCheckpoint::new(PublicationFaultPoint::DuringPrepareJournalWrite),
+            )
+            .unwrap();
+        }));
+        assert!(crash.is_err());
+        drop(guard);
+
+        match case {
+            PreJournalNegativeCase::AbsentEpoch => {
+                std::fs::remove_file(fixture.paths.epoch_path()).unwrap();
+            }
+            PreJournalNegativeCase::CorruptEpoch => {
+                std::fs::write(fixture.paths.epoch_path(), b"1\n").unwrap();
+            }
+            PreJournalNegativeCase::LiveTargetSymlink => {
+                replace_path_with_symlink(&fixture.paths.target, &fixture.paths.staging);
+            }
+            PreJournalNegativeCase::MissingLiveTarget => {
+                std::fs::remove_dir_all(&fixture.paths.target).unwrap();
+            }
+            PreJournalNegativeCase::BackupResidue => {
+                fixture.write_old_backup();
+            }
+        }
+
+        let target_before = fixture
+            .paths
+            .target
+            .is_dir()
+            .then(|| collect_fixture_tree_bytes(&fixture.paths.target));
+        let result = scan_and_repair_publication_target(
+            fixture.base(),
+            &AnalyticsConfig::for_data_dir(fixture.base()),
+            fixture.target.clone(),
+        );
+
+        if matches!(
+            case,
+            PreJournalNegativeCase::CorruptEpoch | PreJournalNegativeCase::LiveTargetSymlink
+        ) {
+            let error = result.expect_err("invalid evidence must fail closed before mutation");
+            let message = error.to_string();
+            let expected = match case {
+                PreJournalNegativeCase::CorruptEpoch => "corrupt publication epoch state",
+                PreJournalNegativeCase::LiveTargetSymlink => "publication repair managed",
+                _ => unreachable!(),
+            };
+            assert!(message.contains(expected), "{message}");
+            assert!(fixture.paths.staging.exists());
+            assert!(fixture.journal_temp_path().exists());
+            continue;
+        }
+
+        let report = result.unwrap();
+        assert_eq!(report.status, PublicationRepairStatus::Quarantined);
+        assert_eq!(report.action, PublicationScanAction::Quarantined);
+        assert_eq!(report.disposition, PublicationTargetDisposition::Unavailable);
+        assert!(!report.live_target_mutated);
+        assert!(!fixture.paths.journal.exists());
+        assert!(
+            fixture.paths.quarantine.exists(),
+            "quarantine evidence must remain for diagnosis"
+        );
+        if let Some(bytes) = target_before {
+            assert_eq!(collect_fixture_tree_bytes(&fixture.paths.target), bytes);
+        }
+    }
+}
+
+#[test]
+fn startup_repair_converges_across_fenced_activation_crash_boundaries() {
+    let cases = [
+        PublicationFaultPoint::AfterPrepareJournal,
+        PublicationFaultPoint::AfterTargetBackup,
+        PublicationFaultPoint::AfterStagingPromote,
+    ];
+
+    for fault in cases {
+        let fixture = ActivationFixture::new();
+        fixture.write_old_target();
+        fixture.write_new_staging();
+        let old_bytes = collect_fixture_tree_bytes(&fixture.paths.target);
+        let new_bytes = collect_fixture_tree_bytes(&fixture.paths.staging);
+        let guard = compare_and_advance_publication_epoch(
+            fixture.base(),
+            &fixture.target,
+            PublicationEpoch(0),
+        )
+        .unwrap();
+        let fence = PublicationFenceEvidence::new(
+            guard.previous(),
+            guard.advanced(),
+            PublicationStagingBaseline(7),
+            PublicationWatermark(7),
+        )
+        .unwrap();
+        let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            activate_publication_with_fence_and_faults_for_test(
+                fixture.activation_inputs(PublicationArtifactManifest::default()),
+                Some(fence.clone()),
+                &PanicAtCheckpoint::new(fault),
+            )
+            .unwrap();
+        }));
+        assert!(crash.is_err(), "{fault:?} must simulate a process crash");
+        drop(guard);
+        let prepared = fixture.read_journal();
+        assert_eq!(prepared.phase, PublicationPhase::Prepared);
+        assert_eq!(prepared.fence_evidence, Some(fence.clone()));
+        assert_eq!(prepared.transition_sequence, 1);
+        assert_eq!(read_publication_epoch(fixture.base(), &fixture.target).unwrap(), PublicationEpoch(1));
+
+        let report = scan_and_repair_publication_target(
+            fixture.base(),
+            &AnalyticsConfig::for_data_dir(fixture.base()),
+            fixture.target.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(report.status, PublicationRepairStatus::Repaired, "{fault:?}");
+        assert_eq!(
+            report.action,
+            PublicationScanAction::Repaired(RepairDecision::Complete),
+            "{fault:?}"
+        );
+        assert_eq!(report.disposition, PublicationTargetDisposition::Loadable);
+        assert_eq!(collect_fixture_tree_bytes(&fixture.paths.target), new_bytes);
+        assert_ne!(collect_fixture_tree_bytes(&fixture.paths.target), old_bytes);
+        assert!(!fixture.paths.staging.exists());
+        assert!(!fixture.paths.backup.exists());
+        assert!(!fixture.journal_temp_path().exists());
+        let committed = fixture.read_journal();
+        assert_eq!(committed.phase, PublicationPhase::Committed);
+        assert_eq!(committed.fence_evidence, Some(fence));
+        assert_eq!(committed.transition_sequence, 2);
+
+        let second = scan_and_repair_publication_target(
+            fixture.base(),
+            &AnalyticsConfig::for_data_dir(fixture.base()),
+            fixture.target.clone(),
+        )
+        .unwrap();
+        assert_eq!(second.status, PublicationRepairStatus::Clean);
+        assert_eq!(second.action, PublicationScanAction::Clean);
+        assert_eq!(second.disposition, PublicationTargetDisposition::Loadable);
+        assert_eq!(collect_fixture_tree_bytes(&fixture.paths.target), new_bytes);
+    }
+}
+
+#[test]
+fn startup_repair_fenced_journals_without_matching_epoch_fail_closed() {
+    let faults = [
+        PublicationFaultPoint::AfterPrepareJournal,
+        PublicationFaultPoint::AfterTargetBackup,
+        PublicationFaultPoint::AfterStagingPromote,
+    ];
+    let mutations = [
+        EpochMutation::Absent,
+        EpochMutation::Corrupt,
+        EpochMutation::Old,
+        EpochMutation::Future,
+    ];
+
+    for fault in faults {
+        for mutation in mutations {
+            let fixture = ActivationFixture::new();
+            fixture.write_old_target();
+            fixture.write_new_staging();
+            let guard = compare_and_advance_publication_epoch(
+                fixture.base(),
+                &fixture.target,
+                PublicationEpoch(0),
+            )
+            .unwrap();
+            let fence = PublicationFenceEvidence::new(
+                guard.previous(),
+                guard.advanced(),
+                PublicationStagingBaseline(7),
+                PublicationWatermark(7),
+            )
+            .unwrap();
+            let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                activate_publication_with_fence_and_faults_for_test(
+                    fixture.activation_inputs(PublicationArtifactManifest::default()),
+                    Some(fence),
+                    &PanicAtCheckpoint::new(fault),
+                )
+                .unwrap();
+            }));
+            assert!(crash.is_err());
+            drop(guard);
+            let before_scan = PublicationLayoutSnapshot::capture(&fixture);
+            mutate_epoch_record(&fixture, mutation);
+
+            let result = scan_and_repair_publication_target(
+                fixture.base(),
+                &AnalyticsConfig::for_data_dir(fixture.base()),
+                fixture.target.clone(),
+            );
+
+            if matches!(mutation, EpochMutation::Corrupt) {
+                let error = result.expect_err("corrupt epoch must surface as a typed scan error");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("corrupt publication epoch state"),
+                    "{error}"
+                );
+                assert_eq!(PublicationLayoutSnapshot::capture(&fixture), before_scan);
+                continue;
+            }
+
+            let report = result.unwrap();
+            assert_eq!(report.status, PublicationRepairStatus::Quarantined);
+            assert_eq!(report.action, PublicationScanAction::Quarantined);
+            assert_eq!(report.disposition, PublicationTargetDisposition::Unavailable);
+            assert!(!report.live_target_mutated);
+            assert_eq!(PublicationLayoutSnapshot::capture(&fixture), before_scan);
+            assert!(fixture.paths.quarantine.join("journal.json").exists());
+        }
+    }
+}
+
+#[test]
+fn activation_invalid_fence_cleanup_preserves_existing_durable_journal() {
+    let fixture = ActivationFixture::new();
+    fixture.write_old_backup();
+    fixture.write_new_staging();
+    std::fs::create_dir_all(fixture.sidecar_backup_dir()).unwrap();
+    std::fs::write(
+        fixture.sidecar_backup_dir().join("products.json"),
+        b"old-sidecar",
+    )
+    .unwrap();
+    let prepared = fixture.prepared_journal_for_staging();
+    fixture.write_journal(prepared.clone());
+    let invalid_fence = PublicationFenceEvidence {
+        epoch_old: PublicationEpoch(2),
+        epoch_new: PublicationEpoch(9),
+        staging_baseline: PublicationStagingBaseline(8),
+        watermark: PublicationWatermark(7),
+    };
+
+    let error = activate_publication_with_fence_and_faults_for_test(
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest: PublicationArtifactManifest::default(),
+            inventory: &fixture.inventory,
+        },
+        Some(invalid_fence),
+        &PublicationFaultScript::recording(),
+    )
+    .expect_err("invalid retry must not clean a journaled transaction namespace")
+    .to_string();
+
+    assert!(
+        error.contains("cannot clean up a journaled publication transaction"),
+        "{error}"
+    );
+    assert!(fixture.paths.journal.exists());
+    assert!(fixture.paths.backup.exists());
+    assert!(fixture.paths.staging.exists());
+    assert!(!fixture.journal_temp_path().exists());
+    assert!(executor::sidecar_residue_root(&fixture.paths).exists());
+    assert!(fixture.transaction_root().exists());
+    let preserved = fixture.read_journal();
+    assert_eq!(preserved.phase, PublicationPhase::Prepared);
+    assert_eq!(preserved.transaction_id, prepared.transaction_id);
+    assert_eq!(preserved.digest, prepared.digest);
+    assert_eq!(preserved.prior_digest, prepared.prior_digest);
+    assert!(preserved.artifact_manifest.entries.is_empty());
+    assert_eq!(
+        fixture.read_target_file_from_root(&fixture.paths.backup, "index_meta.json"),
+        b"old-meta"
+    );
+
+    let report = scan_and_repair_publication_target(
+        fixture.base(),
+        &AnalyticsConfig::for_data_dir(fixture.base()),
+        fixture.target.clone(),
+    )
+    .unwrap();
+    assert_eq!(report.status, PublicationRepairStatus::Repaired);
+    assert_eq!(
+        report.action,
+        PublicationScanAction::Repaired(RepairDecision::Complete)
+    );
+    assert_eq!(report.disposition, PublicationTargetDisposition::Loadable);
+}
+
+#[test]
+fn activation_invalid_fence_cleanup_removes_retry_staging_drift() {
+    let fixture = ActivationFixture::new();
+    fixture.write_old_backup();
+    fixture.write_new_staging();
+    let prepared = fixture.prepared_journal_for_staging();
+    fixture.write_journal(prepared.clone());
+    std::fs::write(
+        fixture.paths.staging.join("index_meta.json"),
+        b"retry-drifted-meta",
+    )
+    .unwrap();
+    let invalid_fence = PublicationFenceEvidence {
+        epoch_old: PublicationEpoch(2),
+        epoch_new: PublicationEpoch(9),
+        staging_baseline: PublicationStagingBaseline(8),
+        watermark: PublicationWatermark(7),
+    };
+
+    let error = activate_publication_with_fence_and_faults_for_test(
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest: PublicationArtifactManifest::default(),
+            inventory: &fixture.inventory,
+        },
+        Some(invalid_fence),
+        &PublicationFaultScript::recording(),
+    )
+    .expect_err("invalid retry must not preserve drifted staging as recovery evidence")
+    .to_string();
+
+    assert!(
+        error.contains("cannot clean up a journaled publication transaction"),
+        "{error}"
+    );
+    assert!(fixture.paths.journal.exists());
+    assert!(fixture.paths.backup.exists());
+    assert!(!fixture.paths.staging.exists());
+    let preserved = fixture.read_journal();
+    assert_eq!(preserved.phase, PublicationPhase::Prepared);
+    assert_eq!(preserved.digest, prepared.digest);
+    assert_eq!(preserved.prior_digest, prepared.prior_digest);
+
+    let report = scan_and_repair_publication_target(
+        fixture.base(),
+        &AnalyticsConfig::for_data_dir(fixture.base()),
+        fixture.target.clone(),
+    )
+    .unwrap();
+    assert_eq!(report.status, PublicationRepairStatus::Repaired);
+    assert_eq!(
+        report.action,
+        PublicationScanAction::Repaired(RepairDecision::Rollback)
+    );
+    assert_eq!(report.disposition, PublicationTargetDisposition::Loadable);
+}
+
+#[test]
+fn activation_invalid_fence_cleanup_removes_retry_backup_drift() {
+    let fixture = ActivationFixture::new();
+    fixture.write_old_target();
+    fixture.write_new_staging();
+    let prepared = fixture.prepared_journal_for_staging();
+    fixture.write_journal(prepared.clone());
+    fixture.write_new_tree(&fixture.paths.backup);
+    let invalid_fence = PublicationFenceEvidence {
+        epoch_old: PublicationEpoch(2),
+        epoch_new: PublicationEpoch(9),
+        staging_baseline: PublicationStagingBaseline(8),
+        watermark: PublicationWatermark(7),
+    };
+
+    let error = activate_publication_with_fence_and_faults_for_test(
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest: PublicationArtifactManifest::default(),
+            inventory: &fixture.inventory,
+        },
+        Some(invalid_fence),
+        &PublicationFaultScript::recording(),
+    )
+    .expect_err("invalid retry must not preserve drifted backup as recovery evidence")
+    .to_string();
+
+    assert!(
+        error.contains("cannot clean up a journaled publication transaction"),
+        "{error}"
+    );
+    assert!(fixture.paths.journal.exists());
+    assert!(fixture.paths.staging.exists());
+    assert!(!fixture.paths.backup.exists());
+    let preserved = fixture.read_journal();
+    assert_eq!(preserved.phase, PublicationPhase::Prepared);
+    assert_eq!(preserved.digest, prepared.digest);
+    assert_eq!(preserved.prior_digest, prepared.prior_digest);
+
+    let report = scan_and_repair_publication_target(
+        fixture.base(),
+        &AnalyticsConfig::for_data_dir(fixture.base()),
+        fixture.target.clone(),
+    )
+    .unwrap();
+    assert_eq!(report.status, PublicationRepairStatus::Repaired);
+    assert_eq!(
+        report.action,
+        PublicationScanAction::Repaired(RepairDecision::Complete)
+    );
+    assert_eq!(report.disposition, PublicationTargetDisposition::Loadable);
+    assert_eq!(fixture.read_target_file("index_meta.json"), b"new-meta");
+}
+
+#[test]
+fn activation_invalid_fence_cleanup_removes_retry_sidecar_drift() {
+    let fixture = ActivationFixture::new();
+    fixture.write_old_backup();
+    fixture.write_new_staging();
+    fixture.write_external_sidecar(b"old-sidecar");
+    fixture.write_promoted_sidecar(b"new-sidecar");
+    let manifest = fixture.promoting_external_manifest();
+    let mut prepared = fixture.prepared_journal_for_staging();
+    prepared.artifact_manifest = fixture.with_current_sidecar_digests(manifest.clone());
+    fixture.write_journal(prepared.clone());
+    fixture.write_promoted_sidecar(b"retry-drifted-sidecar");
+    let invalid_fence = PublicationFenceEvidence {
+        epoch_old: PublicationEpoch(2),
+        epoch_new: PublicationEpoch(9),
+        staging_baseline: PublicationStagingBaseline(8),
+        watermark: PublicationWatermark(7),
+    };
+
+    let error = activate_publication_with_fence_and_faults_for_test(
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest,
+            inventory: &fixture.inventory,
+        },
+        Some(invalid_fence),
+        &PublicationFaultScript::recording(),
+    )
+    .expect_err("invalid retry must not preserve drifted sidecar as recovery evidence")
+    .to_string();
+
+    assert!(
+        error.contains("cannot clean up a journaled publication transaction"),
+        "{error}"
+    );
+    assert!(fixture.paths.journal.exists());
+    assert!(fixture.paths.backup.exists());
+    assert!(!fixture.paths.staging.exists());
+    assert!(!fixture.promoted_sidecar_path().exists());
+    assert_eq!(std::fs::read(fixture.sidecar_path()).unwrap(), b"old-sidecar");
+    let preserved = fixture.read_journal();
+    assert_eq!(preserved.phase, PublicationPhase::Prepared);
+    assert_eq!(preserved.digest, prepared.digest);
+    assert_eq!(preserved.prior_digest, prepared.prior_digest);
+    assert!(
+        preserved
+            .artifact_manifest
+            .same_layout_as(&prepared.artifact_manifest)
+    );
+    assert_eq!(
+        preserved
+            .artifact_manifest
+            .entries
+            .first()
+            .unwrap()
+            .original_digest,
+        prepared
+            .artifact_manifest
+            .entries
+            .first()
+            .unwrap()
+            .original_digest
+    );
+    assert_eq!(
+        preserved
+            .artifact_manifest
+            .entries
+            .first()
+            .unwrap()
+            .promoted_digest,
+        prepared
+            .artifact_manifest
+            .entries
+            .first()
+            .unwrap()
+            .promoted_digest
+    );
+
+    let decision = repair_publication(
+        fixture.base(),
+        fixture.target.clone(),
+        fixture.transaction.clone(),
+        fixture.promoting_external_manifest(),
+        &fixture.inventory,
+    )
+    .unwrap();
+    assert_eq!(decision, RepairDecision::Rollback);
+    assert_eq!(fixture.read_target_file("index_meta.json"), b"old-meta");
+    assert_eq!(std::fs::read(fixture.sidecar_path()).unwrap(), b"old-sidecar");
+}
+
+#[cfg(unix)]
+#[test]
+fn activation_invalid_fence_cleanup_removes_tampered_journaled_staging() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = ActivationFixture::new();
+    fixture.write_old_backup();
+    fixture.write_new_staging();
+    let prepared = fixture.prepared_journal_for_staging();
+    fixture.write_journal(prepared.clone());
+    symlink(
+        fixture.paths.staging.join("index_meta.json"),
+        fixture.paths.staging.join("retry_symlink"),
+    )
+    .unwrap();
+    let invalid_fence = PublicationFenceEvidence {
+        epoch_old: PublicationEpoch(2),
+        epoch_new: PublicationEpoch(9),
+        staging_baseline: PublicationStagingBaseline(8),
+        watermark: PublicationWatermark(7),
+    };
+
+    let error = activate_publication_with_fence_and_faults_for_test(
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest: PublicationArtifactManifest::default(),
+            inventory: &fixture.inventory,
+        },
+        Some(invalid_fence),
+        &PublicationFaultScript::recording(),
+    )
+    .expect_err("tampered retry staging must still return the bounded journaled refusal")
+    .to_string();
+
+    assert!(
+        error.contains("cannot clean up a journaled publication transaction"),
+        "{error}"
+    );
+    assert!(fixture.paths.journal.exists());
+    assert!(fixture.paths.backup.exists());
+    assert!(!fixture.paths.staging.exists());
+    let preserved = fixture.read_journal();
+    assert_eq!(preserved.phase, PublicationPhase::Prepared);
+    assert_eq!(preserved.digest, prepared.digest);
+    assert_eq!(preserved.prior_digest, prepared.prior_digest);
+
+    let report = scan_and_repair_publication_target(
+        fixture.base(),
+        &AnalyticsConfig::for_data_dir(fixture.base()),
+        fixture.target.clone(),
+    )
+    .unwrap();
+    assert_eq!(report.status, PublicationRepairStatus::Repaired);
+    assert_eq!(
+        report.action,
+        PublicationScanAction::Repaired(RepairDecision::Rollback)
+    );
+    assert_eq!(report.disposition, PublicationTargetDisposition::Loadable);
+}
+
+/// Fault hook that reads and parses the persisted journal at a chosen checkpoint,
+/// letting a test prove exactly which evidence was durable at that boundary.
+struct CaptureJournalAtCheckpoint {
+    at: PublicationCheckpoint,
+    journal_path: PathBuf,
+    captured: std::cell::RefCell<Option<PublicationJournal>>,
+}
+
+impl CaptureJournalAtCheckpoint {
+    fn new(at: PublicationCheckpoint, journal_path: PathBuf) -> Self {
+        Self {
+            at,
+            journal_path,
+            captured: std::cell::RefCell::new(None),
+        }
+    }
+
+    fn captured(&self) -> Option<PublicationJournal> {
+        self.captured.borrow().clone()
+    }
+}
+
+impl PublicationFaultHook for CaptureJournalAtCheckpoint {
+    fn before_operation(&self, operation: &PublicationOperation) -> Result<()> {
+        if *operation == PublicationOperation::Checkpoint(self.at) {
+            let journal =
+                PublicationJournal::from_json(&std::fs::read_to_string(&self.journal_path).unwrap())
+                    .unwrap();
+            *self.captured.borrow_mut() = Some(journal);
+        }
+        Ok(())
+    }
+}
+
+struct PanicAtCheckpoint {
+    checkpoint: PublicationCheckpoint,
+}
+
+impl PanicAtCheckpoint {
+    fn new(checkpoint: PublicationCheckpoint) -> Self {
+        Self { checkpoint }
+    }
+}
+
+impl PublicationFaultHook for PanicAtCheckpoint {
+    fn before_operation(&self, operation: &PublicationOperation) -> Result<()> {
+        if *operation == PublicationOperation::Checkpoint(self.checkpoint) {
+            panic!("simulated crash before {operation:?}");
+        }
+        Ok(())
+    }
+}
+
 #[test]
 fn activation_fault_hook_observes_every_durable_filesystem_boundary() {
     let fixture = ActivationFixture::new();
@@ -850,18 +1886,23 @@ fn activation_fault_hook_observes_every_durable_filesystem_boundary() {
     fixture.write_new_staging();
     fixture.write_external_sidecar(b"old-sidecar");
     fixture.write_promoted_sidecar(b"new-sidecar");
+    let fence = fixture_fence_evidence();
     let faults = PublicationFaultScript::recording();
 
-    activate_publication_with_faults_for_test(
-        &fixture.paths,
-        fixture.target.clone(),
-        fixture.transaction.clone(),
-        PublicationGenerationEvidence::new("generation_1").unwrap(),
-        fixture.promoting_external_manifest(),
-        &fixture.inventory,
+    let committed = activate_publication_with_fence_and_faults_for_test(
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest: fixture.promoting_external_manifest(),
+            inventory: &fixture.inventory,
+        },
+        Some(fence.clone()),
         &faults,
     )
     .unwrap();
+    assert_eq!(committed.fence_evidence, Some(fence.clone()));
 
     let operations = faults.operations();
     let journal_temp = fixture.journal_temp_path();
@@ -881,7 +1922,7 @@ fn activation_fault_hook_observes_every_durable_filesystem_boundary() {
         journal_temp.clone()
     )));
     assert!(operations.contains(&PublicationOperation::Rename {
-        from: journal_temp,
+        from: journal_temp.clone(),
         to: fixture.paths.journal.clone(),
     }));
     assert!(operations.contains(&PublicationOperation::SyncDirectory(
@@ -902,6 +1943,76 @@ fn activation_fault_hook_observes_every_durable_filesystem_boundary() {
     assert!(operations.contains(&PublicationOperation::Remove(
         fixture.paths.backup.clone()
     )));
+
+    // The prepared journal must be fully durable (write, sync, rename, dir sync)
+    // before the target backup and staging promotion touch the live target.
+    let position = |operation: &PublicationOperation| {
+        operations
+            .iter()
+            .position(|recorded| recorded == operation)
+            .unwrap_or_else(|| panic!("missing durable operation {operation:?}"))
+    };
+    let prepare_write = position(&PublicationOperation::WriteFile(journal_temp.clone()));
+    let prepare_sync = position(&PublicationOperation::SyncFile(journal_temp.clone()));
+    let prepare_rename = position(&PublicationOperation::Rename {
+        from: journal_temp.clone(),
+        to: fixture.paths.journal.clone(),
+    });
+    let prepare_dir_sync = position(&PublicationOperation::SyncDirectory(
+        fixture.paths.journal.parent().unwrap().to_path_buf(),
+    ));
+    let target_backup = position(&PublicationOperation::Rename {
+        from: fixture.paths.target.clone(),
+        to: fixture.paths.backup.clone(),
+    });
+    let staging_promote = position(&PublicationOperation::Rename {
+        from: fixture.paths.staging.clone(),
+        to: fixture.paths.target.clone(),
+    });
+    assert!(prepare_write < prepare_sync, "prepared journal synced before write");
+    assert!(prepare_sync < prepare_rename, "prepared journal renamed before sync");
+    assert!(
+        prepare_rename < prepare_dir_sync,
+        "prepared journal directory synced before rename"
+    );
+    assert!(
+        prepare_dir_sync < target_backup,
+        "target backed up before the prepared journal was durable"
+    );
+    assert!(
+        target_backup < staging_promote,
+        "staging promoted before the target was backed up"
+    );
+
+    // The persisted prepared journal itself must already carry the fence evidence
+    // at the AfterPrepareJournal boundary, before any later activation checkpoint.
+    let replay = ActivationFixture::new();
+    replay.write_old_target();
+    replay.write_new_staging();
+    replay.write_external_sidecar(b"old-sidecar");
+    replay.write_promoted_sidecar(b"new-sidecar");
+    let replay_capture = CaptureJournalAtCheckpoint::new(
+        PublicationCheckpoint::AfterPrepareJournal,
+        replay.paths.journal.clone(),
+    );
+    activate_publication_with_fence_and_faults_for_test(
+        PublicationActivationInputs {
+            paths: &replay.paths,
+            target: replay.target.clone(),
+            transaction_id: replay.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest: replay.promoting_external_manifest(),
+            inventory: &replay.inventory,
+        },
+        Some(fence.clone()),
+        &replay_capture,
+    )
+    .unwrap();
+    let prepared = replay_capture
+        .captured()
+        .expect("prepared journal must be persisted by the AfterPrepareJournal checkpoint");
+    assert_eq!(prepared.phase, PublicationPhase::Prepared);
+    assert_eq!(prepared.fence_evidence, Some(fence));
 }
 
 #[test]
@@ -913,12 +2024,14 @@ fn every_activation_filesystem_fault_restores_the_old_publication() {
     fixture.write_promoted_sidecar(b"new-sidecar");
     let recording = PublicationFaultScript::recording();
     activate_publication_with_faults_for_test(
-        &fixture.paths,
-        fixture.target.clone(),
-        fixture.transaction.clone(),
-        PublicationGenerationEvidence::new("generation_1").unwrap(),
-        fixture.promoting_external_manifest(),
-        &fixture.inventory,
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest: fixture.promoting_external_manifest(),
+            inventory: &fixture.inventory,
+        },
         &recording,
     )
     .unwrap();
@@ -940,12 +2053,14 @@ fn every_activation_filesystem_fault_restores_the_old_publication() {
         let faults = PublicationFaultScript::failing_at(operation_index);
 
         let result = activate_publication_with_faults_for_test(
-            &fixture.paths,
-            fixture.target.clone(),
-            fixture.transaction.clone(),
-            PublicationGenerationEvidence::new("generation_1").unwrap(),
-            fixture.promoting_external_manifest(),
-            &fixture.inventory,
+            PublicationActivationInputs {
+                paths: &fixture.paths,
+                target: fixture.target.clone(),
+                transaction_id: fixture.transaction.clone(),
+                generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+                manifest: fixture.promoting_external_manifest(),
+                inventory: &fixture.inventory,
+            },
             &faults,
         );
 
@@ -977,12 +2092,14 @@ fn every_activation_filesystem_fault_restores_the_old_publication() {
         let faults = PublicationFaultScript::failing_at(operation_index);
 
         let result = activate_publication_with_faults_for_test(
-            &fixture.paths,
-            fixture.target.clone(),
-            fixture.transaction.clone(),
-            PublicationGenerationEvidence::new("generation_1").unwrap(),
-            fixture.promoting_external_manifest(),
-            &fixture.inventory,
+            PublicationActivationInputs {
+                paths: &fixture.paths,
+                target: fixture.target.clone(),
+                transaction_id: fixture.transaction.clone(),
+                generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+                manifest: fixture.promoting_external_manifest(),
+                inventory: &fixture.inventory,
+            },
             &faults,
         );
 
@@ -1012,12 +2129,14 @@ fn every_precommit_create_fault_resolves_without_publication_residue() {
     fixture.write_new_staging();
     let recording = PublicationFaultScript::recording();
     activate_publication_with_faults_for_test(
-        &fixture.paths,
-        fixture.target.clone(),
-        fixture.transaction.clone(),
-        PublicationGenerationEvidence::new("generation_1").unwrap(),
-        PublicationArtifactManifest::default(),
-        &fixture.inventory,
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest: PublicationArtifactManifest::default(),
+            inventory: &fixture.inventory,
+        },
         &recording,
     )
     .unwrap();
@@ -1035,12 +2154,14 @@ fn every_precommit_create_fault_resolves_without_publication_residue() {
         fixture.write_new_staging();
         let faults = PublicationFaultScript::failing_at(operation_index);
         let result = activate_publication_with_faults_for_test(
-            &fixture.paths,
-            fixture.target.clone(),
-            fixture.transaction.clone(),
-            PublicationGenerationEvidence::new("generation_1").unwrap(),
-            PublicationArtifactManifest::default(),
-            &fixture.inventory,
+            PublicationActivationInputs {
+                paths: &fixture.paths,
+                target: fixture.target.clone(),
+                transaction_id: fixture.transaction.clone(),
+                generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+                manifest: PublicationArtifactManifest::default(),
+                inventory: &fixture.inventory,
+            },
             &faults,
         );
 
@@ -1272,32 +2393,36 @@ impl ActivationFixture {
     }
 
     fn read_target_file(&self, relative: &str) -> Vec<u8> {
+        self.read_target_file_from_root(&self.paths.target, relative)
+    }
+
+    fn read_target_file_from_root(&self, root: &Path, relative: &str) -> Vec<u8> {
         if relative == "settings.json" {
-            return match self.read_target_generation().as_deref() {
+            return match self.read_target_generation_from_root(root).as_deref() {
                 Some("old") => b"old-settings".to_vec(),
                 Some("new") => b"new-settings".to_vec(),
-                _ => std::fs::read(self.paths.target.join(relative)).unwrap(),
+                _ => std::fs::read(root.join(relative)).unwrap(),
             };
         }
         if relative == "oplog/segment_0001.jsonl" {
-            return match self.read_target_generation().as_deref() {
+            return match self.read_target_generation_from_root(root).as_deref() {
                 Some("old") => b"old-oplog".to_vec(),
                 Some("new") => b"new-oplog".to_vec(),
-                _ => std::fs::read(self.paths.target.join(relative)).unwrap(),
+                _ => std::fs::read(root.join(relative)).unwrap(),
             };
         }
         if relative == "committed_seq" {
-            return match self.read_target_generation().as_deref() {
+            return match self.read_target_generation_from_root(root).as_deref() {
                 Some("old") => b"7".to_vec(),
                 Some("new") => b"8".to_vec(),
-                _ => std::fs::read(self.paths.target.join(relative)).unwrap(),
+                _ => std::fs::read(root.join(relative)).unwrap(),
             };
         }
-        std::fs::read(self.paths.target.join(relative)).unwrap()
+        std::fs::read(root.join(relative)).unwrap()
     }
 
-    fn read_target_generation(&self) -> Option<String> {
-        match std::fs::read(self.paths.target.join("index_meta.json")).ok()?.as_slice() {
+    fn read_target_generation_from_root(&self, root: &Path) -> Option<String> {
+        match std::fs::read(root.join("index_meta.json")).ok()?.as_slice() {
             b"old-meta" => Some("old".to_string()),
             b"new-meta" => Some("new".to_string()),
             _ => None,
@@ -1362,6 +2487,70 @@ impl ActivationFixture {
 
     fn journal_temp_path(&self) -> PathBuf {
         self.paths.journal.with_extension("json.tmp")
+    }
+
+    fn transaction_root(&self) -> PathBuf {
+        self.paths.journal.parent().unwrap().to_path_buf()
+    }
+
+    fn activation_inputs(
+        &self,
+        manifest: PublicationArtifactManifest,
+    ) -> PublicationActivationInputs<'_> {
+        PublicationActivationInputs {
+            paths: &self.paths,
+            target: self.target.clone(),
+            transaction_id: self.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest,
+            inventory: &self.inventory,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PublicationLayoutSnapshot {
+    target: Option<BTreeMap<PathBuf, Vec<u8>>>,
+    staging: Option<BTreeMap<PathBuf, Vec<u8>>>,
+    backup: Option<BTreeMap<PathBuf, Vec<u8>>>,
+}
+
+impl PublicationLayoutSnapshot {
+    fn capture(fixture: &ActivationFixture) -> Self {
+        Self {
+            target: capture_tree_if_dir(&fixture.paths.target),
+            staging: capture_tree_if_dir(&fixture.paths.staging),
+            backup: capture_tree_if_dir(&fixture.paths.backup),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EpochMutation {
+    Absent,
+    Corrupt,
+    Old,
+    Future,
+}
+
+fn capture_tree_if_dir(path: &Path) -> Option<BTreeMap<PathBuf, Vec<u8>>> {
+    path.is_dir().then(|| collect_fixture_tree_bytes(path))
+}
+
+fn mutate_epoch_record(fixture: &ActivationFixture, mutation: EpochMutation) {
+    match mutation {
+        EpochMutation::Absent => {
+            std::fs::remove_file(fixture.paths.epoch_path()).unwrap();
+        }
+        EpochMutation::Corrupt => {
+            std::fs::write(fixture.paths.epoch_path(), b"1\n").unwrap();
+        }
+        EpochMutation::Old => {
+            std::fs::write(fixture.paths.epoch_path(), b"0").unwrap();
+        }
+        EpochMutation::Future => {
+            std::fs::write(fixture.paths.epoch_path(), b"2").unwrap();
+        }
     }
 }
 
@@ -1532,6 +2721,14 @@ fn write_fixture_tree_bytes(root: &Path, files: &BTreeMap<PathBuf, Vec<u8>>) {
     }
 }
 
+#[cfg(unix)]
+fn replace_path_with_symlink(path: &Path, target: &Path) {
+    if path.exists() {
+        std::fs::remove_dir_all(path).unwrap();
+    }
+    std::os::unix::fs::symlink(target, path).unwrap();
+}
+
 async fn write_fixture_control_index(base: &Path) {
     let manager = IndexManager::new(base);
     manager.create_tenant("control_products").unwrap();
@@ -1596,38 +2793,58 @@ fn repair_decision_table_is_total_for_every_phase_and_artifact_evidence() {
         RepairArtifactEvidence::Mismatch,
         RepairArtifactEvidence::Unreadable,
         RepairArtifactEvidence::Reservation,
+        RepairArtifactEvidence::StructurallyProvenOld,
+    ];
+    let epochs = [
+        RepairEpochEvidence::UnfencedOrLegacy,
+        RepairEpochEvidence::FencedMatch,
+        RepairEpochEvidence::FencedMissing,
+        RepairEpochEvidence::FencedMismatch,
     ];
 
     for phase in phases {
         for target in artifacts {
             for backup in artifacts {
                 for staging in artifacts {
-                    let evidence = RepairEvidence {
-                        journal: RepairJournalEvidence::Valid,
-                        phase,
-                        target,
-                        backup,
-                        staging,
-                        manifest_valid: true,
-                        journal_temp_present: false,
-                    };
-                    let decision = decide_publication_repair(evidence);
-                    assert!(
-                        matches!(
-                            decision,
-                            RepairDecision::None
-                                | RepairDecision::Complete
-                                | RepairDecision::Rollback
-                                | RepairDecision::Cleanup
-                                | RepairDecision::Quarantine
-                        ),
-                        "unclassified evidence: {evidence:?}"
-                    );
-                    if decision != RepairDecision::Quarantine {
+                    for epoch in epochs {
+                        let evidence = RepairEvidence {
+                            journal: RepairJournalEvidence::Valid,
+                            phase,
+                            target,
+                            backup,
+                            staging,
+                            manifest_valid: true,
+                            journal_temp_present: false,
+                            epoch,
+                        };
+                        let decision = decide_publication_repair(evidence);
                         assert!(
-                            repair_evidence_is_proven(evidence),
-                            "mutation selected for unproven evidence: {evidence:?} => {decision:?}"
+                            matches!(
+                                decision,
+                                RepairDecision::None
+                                    | RepairDecision::Complete
+                                    | RepairDecision::Rollback
+                                    | RepairDecision::Cleanup
+                                    | RepairDecision::Quarantine
+                            ),
+                            "unclassified evidence: {evidence:?}"
                         );
+                        if matches!(
+                            epoch,
+                            RepairEpochEvidence::FencedMissing | RepairEpochEvidence::FencedMismatch
+                        ) {
+                            assert_eq!(
+                                decision,
+                                RepairDecision::Quarantine,
+                                "fenced non-match must fail closed: {evidence:?}"
+                            );
+                        }
+                        if decision != RepairDecision::Quarantine {
+                            assert!(
+                                repair_evidence_is_proven(evidence),
+                                "mutation selected for unproven evidence: {evidence:?} => {decision:?}"
+                            );
+                        }
                     }
                 }
             }
@@ -1684,6 +2901,72 @@ fn repair_evidence_is_proven(evidence: RepairEvidence) -> bool {
                 RepairArtifactEvidence::Reservation,
             )
     )
+}
+
+#[test]
+fn repair_decision_table_gates_fenced_journals_on_epoch_match() {
+    let mut evidence = RepairEvidence::valid(
+        PublicationPhase::Prepared,
+        RepairArtifactEvidence::MatchesOld,
+        RepairArtifactEvidence::Missing,
+        RepairArtifactEvidence::MatchesNew,
+    );
+
+    evidence.epoch = RepairEpochEvidence::UnfencedOrLegacy;
+    assert_eq!(decide_publication_repair(evidence), RepairDecision::Complete);
+    evidence.epoch = RepairEpochEvidence::FencedMatch;
+    assert_eq!(decide_publication_repair(evidence), RepairDecision::Complete);
+    for epoch in [
+        RepairEpochEvidence::FencedMissing,
+        RepairEpochEvidence::FencedMismatch,
+    ] {
+        evidence.epoch = epoch;
+        assert_eq!(
+            decide_publication_repair(evidence),
+            RepairDecision::Quarantine
+        );
+    }
+}
+
+#[test]
+fn repair_decision_table_limits_pre_journal_epoch_cleanup() {
+    let mut evidence = RepairEvidence {
+        journal: RepairJournalEvidence::Missing,
+        phase: PublicationPhase::Prepared,
+        target: RepairArtifactEvidence::StructurallyProvenOld,
+        backup: RepairArtifactEvidence::Missing,
+        staging: RepairArtifactEvidence::Mismatch,
+        manifest_valid: true,
+        journal_temp_present: true,
+        epoch: RepairEpochEvidence::PreJournalAdvanced,
+    };
+    assert_eq!(decide_publication_repair(evidence), RepairDecision::Cleanup);
+    evidence.epoch = RepairEpochEvidence::UnfencedOrLegacy;
+    assert_eq!(decide_publication_repair(evidence), RepairDecision::Cleanup);
+    evidence.journal_temp_present = false;
+    assert_eq!(
+        decide_publication_repair(evidence),
+        RepairDecision::Quarantine
+    );
+    evidence.journal_temp_present = true;
+
+    evidence.backup = RepairArtifactEvidence::MatchesOld;
+    assert_eq!(
+        decide_publication_repair(evidence),
+        RepairDecision::Quarantine
+    );
+    evidence.backup = RepairArtifactEvidence::Missing;
+    evidence.target = RepairArtifactEvidence::Missing;
+    assert_eq!(
+        decide_publication_repair(evidence),
+        RepairDecision::Quarantine
+    );
+    evidence.target = RepairArtifactEvidence::StructurallyProvenOld;
+    evidence.epoch = RepairEpochEvidence::FencedMissing;
+    assert_eq!(
+        decide_publication_repair(evidence),
+        RepairDecision::Quarantine
+    );
 }
 
 #[test]
@@ -1984,12 +3267,14 @@ fn failed_create_removes_newly_promoted_sidecar() {
     fixture.write_promoted_sidecar(b"new-sidecar");
 
     let result = activate_publication_for_test(
-        &fixture.paths,
-        fixture.target.clone(),
-        fixture.transaction.clone(),
-        PublicationGenerationEvidence::new("generation_1").unwrap(),
-        fixture.promoting_external_manifest(),
-        &fixture.inventory,
+        PublicationActivationInputs {
+            paths: &fixture.paths,
+            target: fixture.target.clone(),
+            transaction_id: fixture.transaction.clone(),
+            generation: PublicationGenerationEvidence::new("generation_1").unwrap(),
+            manifest: fixture.promoting_external_manifest(),
+            inventory: &fixture.inventory,
+        },
         PublicationFaultPoint::AfterStagingPromote,
     );
 

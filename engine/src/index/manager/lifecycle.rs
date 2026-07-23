@@ -1,7 +1,8 @@
 use super::*;
 use publication::{
-    activate_publication, PublicationArtifactPlan, PublicationGenerationEvidence, PublicationPaths,
-    PublicationPhase, PublicationTarget, PublicationTransactionId, TantivyManagedInventory,
+    activate_publication, PublicationActivationInputs, PublicationArtifactPlan,
+    PublicationGenerationEvidence, PublicationPaths, PublicationPhase, PublicationTarget,
+    PublicationTransactionId, TantivyManagedInventory,
 };
 #[cfg(test)]
 use publication::{activate_publication_for_test, PublicationFaultPoint};
@@ -345,12 +346,14 @@ impl super::IndexManager {
         #[cfg(test)]
         if let Some(fault) = fault {
             let journal = activate_publication_for_test(
-                &paths,
-                target,
-                transaction,
-                generation,
-                manifest,
-                &inventory,
+                PublicationActivationInputs {
+                    paths: &paths,
+                    target,
+                    transaction_id: transaction,
+                    generation,
+                    manifest,
+                    inventory: &inventory,
+                },
                 fault,
             )?;
             ensure_committed_move(&journal)?;
@@ -365,14 +368,14 @@ impl super::IndexManager {
             std::fs::remove_dir_all(&src_path)?;
             return self.make_noop_task(destination);
         }
-        let journal = activate_publication(
-            &paths,
+        let journal = activate_publication(PublicationActivationInputs {
+            paths: &paths,
             target,
-            transaction,
+            transaction_id: transaction,
             generation,
             manifest,
-            &inventory,
-        )?;
+            inventory: &inventory,
+        })?;
         ensure_committed_move(&journal)?;
         if let Some(artifacts) = &artifacts {
             artifacts.remove_source()?;

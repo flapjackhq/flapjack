@@ -451,6 +451,7 @@ fn collect_values_for_path(value: &FieldValue, remaining_path: &[&str], out: &mu
 /// Recursively collect string representations of all terminal field values, flattening nested Array and Object structures.
 fn collect_terminal_values(value: &FieldValue, out: &mut Vec<String>) {
     match value {
+        FieldValue::Bool(b) => out.push(b.to_string()),
         FieldValue::Text(s) | FieldValue::Facet(s) => {
             if !s.is_empty() {
                 out.push(s.clone());

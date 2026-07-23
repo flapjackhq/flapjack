@@ -115,6 +115,7 @@ pub(in crate::index::manager) fn extract_custom_ranking_value(
         };
     }
     match current {
+        FieldValue::Bool(b) => RankingSortValue::Integer(i64::from(*b)),
         FieldValue::Integer(i) => RankingSortValue::Integer(*i),
         FieldValue::Date(i) => RankingSortValue::Integer(*i),
         FieldValue::Float(f) => RankingSortValue::Float(*f),
@@ -204,6 +205,10 @@ pub(in crate::index::manager) fn field_value_matches_optional_filter_value(
     expected: &str,
 ) -> bool {
     match value {
+        FieldValue::Bool(b) => expected
+            .parse::<bool>()
+            .map(|parsed| parsed == *b)
+            .unwrap_or(false),
         FieldValue::Text(s) | FieldValue::Facet(s) => s.eq_ignore_ascii_case(expected),
         FieldValue::Integer(i) | FieldValue::Date(i) => expected
             .parse::<i64>()
@@ -265,4 +270,37 @@ pub(in crate::index::manager) fn compute_optional_filter_score(
                 .unwrap_or(0.0)
         })
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn extract_custom_ranking_value_maps_bool_to_integer_sort_value() {
+        let mut fields = HashMap::new();
+        fields.insert("featured".to_string(), FieldValue::Bool(true));
+        let document = Document {
+            id: "doc-1".to_string(),
+            fields,
+        };
+
+        assert_eq!(
+            extract_custom_ranking_value(&document, "featured"),
+            RankingSortValue::Integer(1)
+        );
+    }
+
+    #[test]
+    fn optional_filter_value_matching_supports_bool_fields() {
+        assert!(field_value_matches_optional_filter_value(
+            &FieldValue::Bool(false),
+            "false"
+        ));
+        assert!(!field_value_matches_optional_filter_value(
+            &FieldValue::Bool(true),
+            "false"
+        ));
+    }
 }

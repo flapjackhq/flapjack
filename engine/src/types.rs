@@ -73,7 +73,7 @@ impl Document {
     }
 }
 
-/// Convert a JSON value to a FieldValue, recursively processing nested structures while skipping JSON null and boolean values.
+/// Convert a JSON value to a FieldValue, recursively processing nested structures while skipping JSON null values.
 ///
 /// # Arguments
 ///
@@ -81,9 +81,10 @@ impl Document {
 ///
 /// # Returns
 ///
-/// `Some(field_value)` if the value can be converted (string, number, non-empty array, or non-empty object); `None` if the value is JSON null, a boolean, or becomes empty after recursive filtering. Numeric JSON values are converted to Integer if they fit in i64; otherwise Float.
+/// `Some(field_value)` if the value can be converted (boolean, string, number, non-empty array, or non-empty object); `None` if the value is JSON null, or becomes empty after recursive filtering. Numeric JSON values are converted to Integer if they fit in i64; otherwise Float.
 pub fn json_value_to_field_value(val: &serde_json::Value) -> Option<FieldValue> {
     match val {
+        serde_json::Value::Bool(b) => Some(FieldValue::Bool(*b)),
         serde_json::Value::String(s) => Some(FieldValue::Text(s.clone())),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
@@ -114,7 +115,6 @@ pub fn json_value_to_field_value(val: &serde_json::Value) -> Option<FieldValue> 
             }
         }
         serde_json::Value::Null => None,
-        serde_json::Value::Bool(_) => None,
     }
 }
 
@@ -130,6 +130,7 @@ pub fn json_value_to_field_value(val: &serde_json::Value) -> Option<FieldValue> 
 pub fn field_value_to_json_value(field_value: &FieldValue) -> serde_json::Value {
     match field_value {
         FieldValue::Text(s) => serde_json::Value::String(s.clone()),
+        FieldValue::Bool(b) => serde_json::Value::Bool(*b),
         FieldValue::Integer(i) => serde_json::json!(i),
         FieldValue::Float(f) => serde_json::json!(f),
         FieldValue::Date(d) => serde_json::json!(d),
@@ -154,6 +155,7 @@ pub fn field_value_to_json_value(field_value: &FieldValue) -> serde_json::Value 
 pub enum FieldValue {
     Object(std::collections::HashMap<String, FieldValue>),
     Array(Vec<FieldValue>),
+    Bool(bool),
     Text(String),
     Integer(i64),
     Float(f64),
@@ -165,6 +167,13 @@ impl FieldValue {
     pub fn as_text(&self) -> Option<&str> {
         match self {
             FieldValue::Text(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            FieldValue::Bool(b) => Some(*b),
             _ => None,
         }
     }
@@ -427,13 +436,33 @@ mod tests {
     }
 
     #[test]
-    fn from_json_null_and_bool_skipped() {
+    fn from_json_null_skipped_and_bool_preserved() {
         let json =
             serde_json::json!({"objectID": "1", "active": true, "deleted": null, "name": "ok"});
         let doc = Document::from_json(&json).unwrap();
-        assert!(!doc.fields.contains_key("active"));
+        assert_eq!(doc.fields.get("active"), Some(&FieldValue::Bool(true)));
         assert!(!doc.fields.contains_key("deleted"));
         assert!(doc.fields.contains_key("name"));
+    }
+
+    #[test]
+    fn document_from_json_preserves_boolean_fields() {
+        let document = Document::from_json(&serde_json::json!({
+            "objectID": "helm-live-a",
+            "name": "Amber Wrench",
+            "price": 17,
+            "featured": true,
+        }))
+        .unwrap();
+
+        assert_eq!(
+            document.fields.get("featured"),
+            Some(&FieldValue::Bool(true))
+        );
+        assert_eq!(
+            field_value_to_json_value(document.fields.get("featured").unwrap()),
+            serde_json::json!(true)
+        );
     }
 
     // --- Document::to_json roundtrip ---
@@ -482,8 +511,11 @@ mod tests {
     }
 
     #[test]
-    fn json_bool_returns_none() {
-        assert_eq!(json_value_to_field_value(&serde_json::json!(true)), None);
+    fn json_bool_to_bool() {
+        assert_eq!(
+            json_value_to_field_value(&serde_json::json!(true)),
+            Some(FieldValue::Bool(true))
+        );
     }
 
     #[test]
@@ -502,6 +534,12 @@ mod tests {
     fn text_roundtrip() {
         let fv = FieldValue::Text("hello".to_string());
         assert_eq!(field_value_to_json_value(&fv), serde_json::json!("hello"));
+    }
+
+    #[test]
+    fn bool_roundtrip() {
+        let fv = FieldValue::Bool(false);
+        assert_eq!(field_value_to_json_value(&fv), serde_json::json!(false));
     }
 
     #[test]
@@ -587,6 +625,16 @@ mod tests {
     #[test]
     fn as_text_none_for_integer() {
         assert_eq!(FieldValue::Integer(1).as_text(), None);
+    }
+
+    #[test]
+    fn as_bool_some() {
+        assert_eq!(FieldValue::Bool(true).as_bool(), Some(true));
+    }
+
+    #[test]
+    fn as_bool_none_for_text() {
+        assert_eq!(FieldValue::Text("true".to_string()).as_bool(), None);
     }
 
     #[test]
