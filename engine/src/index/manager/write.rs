@@ -212,13 +212,8 @@ impl super::IndexManager {
         let numeric_id = self.next_numeric_task_id();
         let task_id = format!("task_{}_{}", tenant_id, uuid::Uuid::new_v4());
         let received_documents = actions.len();
-        let admission_store = self.get_or_create_admission_store(tenant_id)?;
-        let record = admission_store.append_record(WriteAdmissionRecord::new(
-            task_id.clone(),
-            numeric_id,
-            received_documents,
-            actions,
-        ))?;
+        let record =
+            WriteAdmissionRecord::new(task_id.clone(), numeric_id, received_documents, actions);
         let task = record.task_info();
         self.tasks.insert(task_id.clone(), task.clone());
         self.tasks.insert(numeric_id.to_string(), task.clone());

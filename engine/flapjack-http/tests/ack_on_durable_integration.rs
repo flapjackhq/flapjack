@@ -26,10 +26,6 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::time::{sleep, Instant};
 
-// Stage-1 contract anchor: engine/src/index/write_queue/mod.rs defines
-// WRITE_QUEUE_CHANNEL_CAPACITY as 2_000 at HEAD, but that constant is private
-// to the crate and inaccessible from integration tests.
-const WRITE_QUEUE_CHANNEL_CAPACITY: usize = 2_000;
 const DEFAULT_WRITE_DURABLE_TIMEOUT_MS_FOR_TEST: u64 = 30_000;
 static DURABLE_TIMEOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -190,6 +186,33 @@ fn make_doc(id: usize) -> Document {
             FieldValue::Text(format!("queued-{id}")),
         )]),
     }
+}
+
+fn enqueue_until_queue_full(
+    manager: &Arc<IndexManager>,
+    tenant: &str,
+    context: &str,
+) -> FlapjackError {
+    const MAX_ENQUEUE_ATTEMPTS: usize = 10_000;
+
+    for i in 0..MAX_ENQUEUE_ATTEMPTS {
+        match manager.add_documents(tenant, vec![make_doc(i)]) {
+            Ok(_) => continue,
+            Err(error) => {
+                assert!(
+                    matches!(error, FlapjackError::QueueFull),
+                    "{context}: first enqueue failure must stay on the QueueFull boundary, got {error:?}"
+                );
+                assert!(
+                    i > 0,
+                    "{context}: queue should admit at least one write before saturating"
+                );
+                return error;
+            }
+        }
+    }
+
+    panic!("{context}: queue did not report QueueFull within {MAX_ENQUEUE_ATTEMPTS} enqueues");
 }
 
 fn configure_primary_standard_replica(base: &std::path::Path, primary: &str, replica: &str) {
@@ -364,22 +387,7 @@ async fn test_queue_full_returns_429_retry_after() {
         .create_tenant(tenant)
         .expect("tenant should create");
 
-    let mut overflow_error: Option<FlapjackError> = None;
-
-    for i in 0..=WRITE_QUEUE_CHANNEL_CAPACITY {
-        let result = state.manager.add_documents(tenant, vec![make_doc(i)]);
-        if i < WRITE_QUEUE_CHANNEL_CAPACITY {
-            assert!(
-                result.is_ok(),
-                "enqueue {} should succeed before capacity is exceeded; got {result:?}",
-                i + 1
-            );
-        } else {
-            overflow_error = result.err();
-        }
-    }
-
-    let error = overflow_error.expect("capacity+1 enqueue must fail with QueueFull");
+    let error = enqueue_until_queue_full(&state.manager, tenant, "queue full guardrail");
     assert!(
         matches!(error, FlapjackError::QueueFull),
         "overflow must return QueueFull (429 path), got {error:?}"
@@ -643,20 +651,7 @@ async fn test_delete_object_replica_queue_full_preserves_task_id_and_retry_after
         "replica write task should be abortable before forcing QueueFull"
     );
 
-    let mut overflow_error: Option<FlapjackError> = None;
-    for i in 0..=WRITE_QUEUE_CHANNEL_CAPACITY {
-        let result = manager.add_documents(replica, vec![make_doc(i)]);
-        if i < WRITE_QUEUE_CHANNEL_CAPACITY {
-            assert!(
-                result.is_ok(),
-                "replica enqueue {} should succeed before capacity is exceeded; got {result:?}",
-                i + 1
-            );
-        } else {
-            overflow_error = result.err();
-        }
-    }
-    let error = overflow_error.expect("replica capacity+1 enqueue must fail with QueueFull");
+    let error = enqueue_until_queue_full(&manager, replica, "replica queue full probe");
     assert!(
         matches!(error, FlapjackError::QueueFull),
         "replica overflow must return QueueFull, got {error:?}"

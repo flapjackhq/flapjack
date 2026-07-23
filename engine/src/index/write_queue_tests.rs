@@ -6,6 +6,7 @@ use prometheus::{Encoder, TextEncoder};
 use std::{collections::HashMap, sync::Mutex, time::Duration};
 
 const WRITE_QUEUE_BATCH_SIZE_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_BATCH_SIZE";
+const JULY_22_TIMEOUT_RISK_PENDING_ADMISSIONS: usize = 690;
 static WRITE_QUEUE_ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 struct WriteQueueBatchSizeEnvRestoreGuard {
@@ -32,11 +33,46 @@ impl Drop for WriteQueueBatchSizeEnvRestoreGuard {
     }
 }
 
+struct WriteQueueChannelCapacityEnvRestoreGuard {
+    previous_value: Option<String>,
+}
+
+impl WriteQueueChannelCapacityEnvRestoreGuard {
+    fn apply(env_value: Option<&str>) -> Self {
+        let previous_value = std::env::var(WRITE_QUEUE_CHANNEL_CAPACITY_ENV_VAR).ok();
+        match env_value {
+            Some(value) => std::env::set_var(WRITE_QUEUE_CHANNEL_CAPACITY_ENV_VAR, value),
+            None => std::env::remove_var(WRITE_QUEUE_CHANNEL_CAPACITY_ENV_VAR),
+        }
+        Self { previous_value }
+    }
+}
+
+impl Drop for WriteQueueChannelCapacityEnvRestoreGuard {
+    fn drop(&mut self) {
+        match &self.previous_value {
+            Some(value) => std::env::set_var(WRITE_QUEUE_CHANNEL_CAPACITY_ENV_VAR, value),
+            None => std::env::remove_var(WRITE_QUEUE_CHANNEL_CAPACITY_ENV_VAR),
+        }
+    }
+}
+
 fn with_write_queue_batch_size_env<T>(env_value: Option<&str>, test_body: impl FnOnce() -> T) -> T {
     let _guard = WRITE_QUEUE_ENV_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     with_write_queue_batch_size_env_locked(env_value, test_body)
+}
+
+fn with_write_queue_channel_capacity_env<T>(
+    env_value: Option<&str>,
+    test_body: impl FnOnce() -> T,
+) -> T {
+    let _guard = WRITE_QUEUE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _restore_guard = WriteQueueChannelCapacityEnvRestoreGuard::apply(env_value);
+    test_body()
 }
 
 /// Applies a temporary batch-size env value while the caller holds WRITE_QUEUE_ENV_LOCK.
@@ -271,6 +307,16 @@ fn test_write_queue_batch_size_falls_back_on_zero_env() {
     });
 }
 
+#[test]
+fn default_write_queue_channel_capacity_stays_below_timeout_risk_depth() {
+    with_write_queue_channel_capacity_env(None, || {
+        assert!(
+            write_queue_channel_capacity() < JULY_22_TIMEOUT_RISK_PENDING_ADMISSIONS,
+            "default write queue channel capacity must reject before the July 22 observed {JULY_22_TIMEOUT_RISK_PENDING_ADMISSIONS} pending-admission timeout-risk depth"
+        );
+    });
+}
+
 #[tokio::test]
 async fn test_multiple_queues_progress_under_tight_writer_budget() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -387,7 +433,9 @@ async fn test_acquire_writer_for_queue_returns_writer_contention_error_not_queue
 #[tokio::test(flavor = "current_thread")]
 async fn test_write_queue_absorbs_1500_op_burst_without_queue_full() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let (tx, handle, tasks) = setup_write_queue(&tmp, "burst_tenant");
+    let (tx, handle, tasks) = with_write_queue_channel_capacity_env(Some("1500"), || {
+        setup_write_queue(&tmp, "burst_tenant")
+    });
 
     // Warm up the queue using shared helpers so this regression stays on the
     // same lifecycle path as existing write-queue tests.

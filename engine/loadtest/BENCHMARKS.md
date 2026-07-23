@@ -625,3 +625,314 @@ Loadtest scripts and configuration are in the `engine/loadtest/` directory. This
 
 ## Evidence Sources
 - Run artifacts (import, search, k6 scenarios) stored locally under `engine/loadtest/results/` (gitignored)
+
+## PL-10 Stage 3 Admission Hot-Path Repair Gap (July 23, 2026)
+
+### Experiment Identity and Fixed Frame
+
+Stage 3 retained the predeclared fixed-load frame and did not produce a control/candidate
+verdict. The control was commit `0a97907841ed6f7a6d4d1119df646f1053f1815b`, binary
+SHA-256 `b525499dd41472537bcdf6d3e32f9dc4124871c56dc3d8701973a629f81f17f9`.
+The unrun candidate was the post-Stage-2 commit
+`7bd6fbade3f55f74211f5b88484cd596a066d21c`, binary SHA-256
+`8aab1b868e7f58745ef6d72b567e0afc61134e6ff08ef6492b6b82c8efa88837`.
+Later commits through the experiment-session HEAD changed only orchestration artifacts,
+not engine or loadtest source.
+
+The control command shape was:
+
+```bash
+env -u FLAPJACK_WRITE_QUEUE_BATCH_SIZE \
+  -u FLAPJACK_WRITE_QUEUE_CHANNEL_CAPACITY \
+  -u FLAPJACK_WRITE_QUEUE_START_DELAY_MS \
+  -u FLAPJACK_LOADTEST_WRITE_CONTROL_SUMMARY \
+  FLAPJACK_LOADTEST_SERVER_BINARY=<control-binary> \
+  FLAPJACK_LOADTEST_WRITE_CONDITION=control \
+  FLAPJACK_LOADTEST_WRITE_TARGET_RPS=94 \
+  FLAPJACK_LOADTEST_SOAK_DURATION=2m \
+  FLAPJACK_LOADTEST_WRITE_EXPECTED_ATTEMPTS=11280 \
+  bash soak_proof.sh --scenario write-soak
+```
+
+The candidate command was predeclared with the candidate binary and a valid control
+`summary.md`; it was not run because no control met the exact-attempt precondition. The
+forced-saturation command was likewise not run after the gap arm stopped live experiments.
+
+### Fixed-Load Control Results
+
+| Proof directory | Attempts / expected | Dropped | 200 | 429 | unexpected 4xx | 5xx / dirty | accepted p95 | admission max age / peak | drain duration / count | Classifier | Invalid reason |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| `engine/loadtest/results/20260723T024737Z-write-soak/` | `6910 / 11280` | `4370` | `5760` | `0` | `0` | `1150 / 1150` | `24425.800ms` | `0ms / 0` | `0s / 0` | `FALSIFIED_UNBOUNDED_OR_REGRESSED` | host-noisy, incomplete schedule |
+| `engine/loadtest/results/20260723T025403Z-write-soak/` | `8227 / 11280` | `3054` | `7765` | `0` | `0` | `462 / 462` | `21738.293ms` | `0ms / 0` | `0s / 0` | `FALSIFIED_UNBOUNDED_OR_REGRESSED` | host-noisy, incomplete schedule |
+| `engine/loadtest/results/20260723T044930Z-write-soak/` | `11281 / 11280` | `0` | `11281` | `0` | `0` | `0 / 0` | `295.713ms` | `0ms / 0` | `0s / 0` | `FALSIFIED_UNBOUNDED_OR_REGRESSED` | exact-attempt boundary miss by `+1` |
+| `engine/loadtest/results/20260723T045956Z-write-soak/` | `11281 / 11280` | `0` | `11281` | `0` | `0` | `0 / 0` | `447.152ms` | `0ms / 0` | `0s / 0` | `FALSIFIED_UNBOUNDED_OR_REGRESSED` | repeated exact-attempt boundary miss by `+1` |
+
+The two exact-count failures ran after consecutive quiescence samples with approximately
+`80%` to `87%` idle CPU. Their accepted p95 values were `0.824x` and `1.246x` the recorded
+`358.736ms` control baseline, the same order of magnitude, with zero drops, timeouts,
+unexpected responses, dirty errors, or admission records. This is useful proxy evidence
+that host quiescence restored the control's latency scale, but its bias is explicit: the
+local k6 runner scheduled one extra boundary iteration in both trials, while the oracle's
+tolerance is exactly zero. It cannot be promoted to a valid baseline.
+
+The runner was `/opt/homebrew/bin/k6`, reported
+`k6 v2.0.0 (commit/devel, go1.26.3, darwin/arm64)`, SHA-256
+`456c2685afb9e7e2a915c8420d81df50ac9caaf9bd77cfcaed9882ccb359be29`.
+Grafana's constant-arrival-rate documentation describes fractionally spaced starts rather
+than an exact total-attempt guarantee, and its API load-testing example shows `1501`
+iterations for a nominal `50/s * 30s = 1500` frame. That behavior matches both observed
+`11281` results; the experiment did not relax `FLAPJACK_LOADTEST_WRITE_EXPECTED_ATTEMPTS`.
+
+### Candidate and Saturation Results
+
+| Probe | Result | Reason |
+|---|---|---|
+| fixed-load candidate | `NOT RUN` | no valid exact-`11280` control summary existed |
+| forced saturation | `NOT RUN` | live experiment stopped under the harness-gap arm |
+
+Valid pair count is `0`; discarded control count is `4`; candidate and saturation verdict
+count is `0`. All discarded proof directories remain intact.
+
+### Gap and Required Repair
+
+The failed precondition is deterministic exact attempt accounting from the installed k6
+constant-arrival-rate runner. The smallest separate repair belongs at
+`engine/loadtest/scenarios/write-soak.js::buildWriteSoakScenario`: make the fixed-load
+executor contract produce the predeclared exact total deterministically, with a
+known-answer integration test against the supported k6 binary. The classifier in
+`engine/loadtest/soak_proof.sh::classify_write_soak_metrics` must remain strict; accepting
+`11281` here would change the experiment after seeing results.
+
+There is no Stage 3 control/candidate or forced-saturation verdict. PL-10 remains open for
+Stage 3/4 until the executor precondition is repaired separately and the unchanged
+control, candidate, and saturation probes are rerun.
+
+## PL-10 Stage 3 Exact-Attempt Cap Repair Follow-Up (July 23, 2026)
+
+Commit `645ccdd1d5a0b0a906e7e94d1ee0d4f7da08d17f` repaired the Stage 3
+fixed-rate write-soak harness gap without changing the offered-load frame. The scenario
+now reads `FLAPJACK_LOADTEST_WRITE_EXPECTED_ATTEMPTS`, skips HTTP after the exact-attempt
+cap, and records `write_extra_iterations_after_expected_attempts` with a `count<=1`
+threshold so a single k6 duration-boundary iteration is visible but excessive executor
+overshoot still fails.
+
+The repaired harness was validated before the live retry with:
+
+```bash
+cd engine/loadtest && bash tests/throughput_acceptance.sh
+git diff --check engine/loadtest/lib/config.js engine/loadtest/lib/throughput.js \
+  engine/loadtest/scenarios/write-soak.js engine/loadtest/tests/throughput_acceptance.sh
+cd engine/loadtest && bash tests/soak_proof_write_acceptance.sh
+cd engine && cargo build --release -p flapjack-server
+```
+
+The rebuilt candidate binary at commit `645ccdd1d5a0b0a906e7e94d1ee0d4f7da08d17f`
+had SHA-256 `23c5496940fc744c698e0e1b746d5b5fccb1f0ffc8398f28e584cf7b11864df4`.
+The control binary remained commit `0a97907841ed6f7a6d4d1119df646f1053f1815b`,
+SHA-256 `b525499dd41472537bcdf6d3e32f9dc4124871c56dc3d8701973a629f81f17f9`.
+
+The fixed-load control command shape remained unchanged:
+
+```bash
+env -u FLAPJACK_WRITE_QUEUE_BATCH_SIZE \
+  -u FLAPJACK_WRITE_QUEUE_CHANNEL_CAPACITY \
+  -u FLAPJACK_WRITE_QUEUE_START_DELAY_MS \
+  -u FLAPJACK_LOADTEST_WRITE_CONTROL_SUMMARY \
+  FLAPJACK_LOADTEST_SERVER_BINARY=<control-binary> \
+  FLAPJACK_LOADTEST_WRITE_CONDITION=control \
+  FLAPJACK_LOADTEST_WRITE_TARGET_RPS=94 \
+  FLAPJACK_LOADTEST_SOAK_DURATION=2m \
+  FLAPJACK_LOADTEST_WRITE_EXPECTED_ATTEMPTS=11280 \
+  bash soak_proof.sh --scenario write-soak
+```
+
+| Proof directory | Attempts / expected | Dropped | 200 | 429 | unexpected 4xx | 5xx / dirty | accepted p95 | admission max age / peak | drain duration / count | Extra-boundary skips | Classifier | Invalid reason |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| `engine/loadtest/results/20260723T051445Z-write-soak/` | `10344 / 11280` | `937` | `10344` | `0` | `0` | `0 / 0` | `19684.469ms` | `0ms / 0` | `0s / 0` | `0` | `FALSIFIED_UNBOUNDED_OR_REGRESSED` | host-noisy, incomplete schedule |
+
+This retry proves the exact-attempt cap removed the prior `+1` boundary miss for this
+run (`write_extra_iterations_after_expected_attempts=0`), but it does not produce a valid
+control baseline. The host was not quiescent: the pre-run sample showed load averages
+`15.36 / 12.40 / 12.31` with a VM, Playwright, `node`, and system security services active;
+post-run samples stayed noisy and included VM, browser, Rust compiler/linker, and
+`syspolicyd` activity. The control reached k6's `752` VU ceiling, dropped `937`
+iterations, and inflated accepted-only p95 to `19684.469ms`, far outside the `358.736ms`
+baseline order needed for a comparable control.
+
+No candidate or forced-saturation probe was run after this invalid control. The valid pair
+count remains `0`; discarded control count is now `5`; candidate and saturation verdict
+count remains `0`. PL-10 remains open for Stage 3/4 until a quiet-host control produces
+`11280` exact attempts, zero drops, zero dirty errors, and baseline-order accepted p95
+under the unchanged frame.
+
+## PL-10 Stage 3 Completed Fixed-Load Pair and Saturation (July 23, 2026)
+
+After the exact-attempt cap repair, a quieter host window produced a valid unchanged
+control baseline and allowed the predeclared candidate and saturation probes to run without
+retuning RPS, duration, expected attempts, or binary identities.
+
+Control binary: commit `0a97907841ed6f7a6d4d1119df646f1053f1815b`, SHA-256
+`b525499dd41472537bcdf6d3e32f9dc4124871c56dc3d8701973a629f81f17f9`.
+
+Candidate binary: product-code commit `645ccdd1d5a0b0a906e7e94d1ee0d4f7da08d17f`, SHA-256
+`23c5496940fc744c698e0e1b746d5b5fccb1f0ffc8398f28e584cf7b11864df4`. The repository HEAD
+for this evidence addendum was `ae5d2023b6d1c6016fc07994aa5ebc5614f86dfe`; the only file
+changed after the candidate binary build was `engine/loadtest/BENCHMARKS.md`.
+
+The valid control command used the unchanged fixed-load frame:
+
+```bash
+env -u FLAPJACK_WRITE_QUEUE_BATCH_SIZE \
+  -u FLAPJACK_WRITE_QUEUE_CHANNEL_CAPACITY \
+  -u FLAPJACK_WRITE_QUEUE_START_DELAY_MS \
+  -u FLAPJACK_LOADTEST_WRITE_CONTROL_SUMMARY \
+  FLAPJACK_LOADTEST_SERVER_BINARY=<control-binary> \
+  FLAPJACK_LOADTEST_WRITE_CONDITION=control \
+  FLAPJACK_LOADTEST_WRITE_TARGET_RPS=94 \
+  FLAPJACK_LOADTEST_SOAK_DURATION=2m \
+  FLAPJACK_LOADTEST_WRITE_EXPECTED_ATTEMPTS=11280 \
+  bash soak_proof.sh --scenario write-soak
+```
+
+The candidate command used the valid control summary
+`engine/loadtest/results/20260723T052406Z-write-soak/summary.md`:
+
+```bash
+env -u FLAPJACK_WRITE_QUEUE_BATCH_SIZE \
+  -u FLAPJACK_WRITE_QUEUE_CHANNEL_CAPACITY \
+  -u FLAPJACK_WRITE_QUEUE_START_DELAY_MS \
+  FLAPJACK_LOADTEST_SERVER_BINARY=<candidate-binary> \
+  FLAPJACK_LOADTEST_WRITE_CONDITION=candidate \
+  FLAPJACK_LOADTEST_WRITE_TARGET_RPS=94 \
+  FLAPJACK_LOADTEST_SOAK_DURATION=2m \
+  FLAPJACK_LOADTEST_WRITE_EXPECTED_ATTEMPTS=11280 \
+  FLAPJACK_LOADTEST_WRITE_CONTROL_SUMMARY=<control-summary> \
+  bash soak_proof.sh --scenario write-soak
+```
+
+| Proof directory | Condition | Attempts / expected | Dropped | 200 | 429 | unexpected 4xx | 5xx / dirty | accepted p95 | admission max age / peak | drain duration / count | RSS KB start / peak / end | Heap bytes start / peak / end | Classifier |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `engine/loadtest/results/20260723T052406Z-write-soak/` | control | `11280 / 11280` | `0` | `11280` | `0` | `0` | `0 / 0` | `298.911ms` | `0ms / 0` | `0s / 0` | `105616 / 400992 / 400992` | `28958704 / 74642240 / 56951248` | `PASS` |
+| `engine/loadtest/results/20260723T052650Z-write-soak/` | candidate | `11280 / 11280` | `0` | `7594` | `3686` | `0` | `0 / 0` | `9381.424ms` | `9536ms / 539` | `0s / 0` | `109024 / 208352 / 208352` | `31953128 / 92512584 / 41677408` | `FALSIFIED_UNBOUNDED_OR_REGRESSED` |
+
+The fixed-load verdict is `FALSIFIED_UNBOUNDED_OR_REGRESSED`: the candidate preserved exact
+attempt accounting and avoided dirty errors, but accepted only `7594` writes versus the
+control's `11280`, returned `3686` QueueFull 429 responses at the nominal PL-10 fixed load,
+and inflated accepted-only p95 from `298.911ms` to `9381.424ms`. This is not a host-noise
+discard: the control in the same run window passed with p95 `0.833x` of the recorded
+`358.736ms` baseline.
+
+The forced-saturation command used the required overload knobs:
+
+```bash
+env -u FLAPJACK_WRITE_QUEUE_BATCH_SIZE \
+  -u FLAPJACK_LOADTEST_WRITE_CONTROL_SUMMARY \
+  FLAPJACK_LOADTEST_SERVER_BINARY=<candidate-binary> \
+  FLAPJACK_WRITE_QUEUE_CHANNEL_CAPACITY=32 \
+  FLAPJACK_WRITE_QUEUE_START_DELAY_MS=5000 \
+  FLAPJACK_LOADTEST_WRITE_CONDITION=candidate \
+  FLAPJACK_LOADTEST_WRITE_TARGET_RPS=94 \
+  FLAPJACK_LOADTEST_SOAK_DURATION=30s \
+  FLAPJACK_LOADTEST_WRITE_EXPECTED_ATTEMPTS=2820 \
+  bash soak_proof.sh --scenario write-soak
+```
+
+| Proof directory | Attempts / expected | Dropped | 200 | QueueFull 429 | unexpected 4xx | 5xx / dirty | accepted p95 | admission max age / peak | drain duration / count | RSS KB start / peak / end | Heap bytes start / peak / end | Classifier |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `engine/loadtest/results/20260723T053027Z-write-soak/` | `2820 / 2820` | `0` | `1401` | `1419` | `0` | `0 / 0` | `1241.145ms` | `762ms / 33` | `0s / 0` | `109072 / 167792 / 167792` | `34007912 / 55046816 / 38045792` | `CONFIRMED_BOUNDED_LAG` |
+
+The forced-saturation verdict is healthy for the overload surface: QueueFull 429
+backpressure was reachable, there were no timeouts, unexpected 4xx, 5xx, or dirty errors,
+attempted-request accounting was exact, admission age stayed bounded, and shutdown drained
+admission records to zero. k6 exited `99` because generic write latency thresholds were
+crossed under deliberate overload; the classifier still returned `CONFIRMED_BOUNDED_LAG`.
+
+Final Stage 3 accounting: valid fixed-load pair count `1`, discarded control count `5`,
+fixed-load candidate verdict count `1`, forced-saturation verdict count `1`. The two-probe
+Stage 3 verdict is mixed: the overload surface is bounded and healthy, but the repaired
+candidate does not restore the PL-10 fixed-load oracle.
+
+## PL-10 Stage 4 Terminal Disposition (July 23, 2026)
+
+Stage 4 selected the terminal disposition `withdraw` for new live admission
+persistence. The Stage 3 oracle justified one crash-safe group-commit retry because
+fixed-load throughput was flat rather than degrading with backlog depth, admission age
+stayed bounded, and the latency regression matched serialized directory-sync cost. The
+single fixed-load retry validly falsified again, so Stage 4 stopped retry work and
+withdrew live persistence instead of relaxing durability or adding another retry.
+
+### Implementation Identities
+
+| Role | Git SHA | Binary SHA-256 | Notes |
+|---|---|---|---|
+| Stage 3 control | `0a97907841ed6f7a6d4d1119df646f1053f1815b` | `b525499dd41472537bcdf6d3e32f9dc4124871c56dc3d8701973a629f81f17f9` | Valid unchanged-frame control from `engine/loadtest/results/20260723T052406Z-write-soak/` |
+| Stage 3 candidate | `645ccdd1d5a0b0a906e7e94d1ee0d4f7da08d17f` | `23c5496940fc744c698e0e1b746d5b5fccb1f0ffc8398f28e584cf7b11864df4` | Stage 1+2 admission repair plus exact-attempt harness repair |
+| Stage 4 retry candidate | `f3d8a1d6211fc55f2ec6bda862c808bc51bb8f43` | `82ed9aa64fd9a9c7e5ffb18d421aa00deb44c8b24b21be6c57529e884b5f69b0` | Group-commit retry implementation |
+| Stage 4 withdrawal code | `250ff89c2a1fab3686c720f46015690983b60cb8` | N/A | Live `IndexManager::admit_write_actions` now constructs `WriteAdmissionRecord` in memory and does not call `WriteAdmissionStore::append_record` |
+
+### Retry Evidence
+
+The valid fixed-load retry used the unchanged Stage 3 frame with the committed control
+summary `engine/loadtest/results/20260723T052406Z-write-soak/summary.md`:
+
+```bash
+env -u FLAPJACK_WRITE_QUEUE_BATCH_SIZE \
+  -u FLAPJACK_WRITE_QUEUE_CHANNEL_CAPACITY \
+  -u FLAPJACK_WRITE_QUEUE_START_DELAY_MS \
+  FLAPJACK_LOADTEST_WRITE_CONDITION=candidate \
+  FLAPJACK_LOADTEST_WRITE_CONTROL_SUMMARY=results/20260723T052406Z-write-soak/summary.md \
+  FLAPJACK_LOADTEST_WRITE_TARGET_RPS=94 \
+  FLAPJACK_LOADTEST_SOAK_DURATION=2m \
+  FLAPJACK_LOADTEST_WRITE_EXPECTED_ATTEMPTS=11280 \
+  bash soak_proof.sh --scenario write-soak
+```
+
+| Proof directory | Candidate | Attempts / expected | Dropped | 200 | QueueFull 429 | unexpected 4xx | 5xx / dirty | accepted p95 | admission max age / peak | drain duration / count | Classifier |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `engine/loadtest/results/20260723T052650Z-write-soak/` | pre-retry | `11280 / 11280` | `0` | `7594` | `3686` | `0` | `0 / 0` | `9381.424ms` | `9536ms / 539` | `0s / 0` | `FALSIFIED_UNBOUNDED_OR_REGRESSED` |
+| `engine/loadtest/results/20260723T062314Z-write-soak/` | group-commit retry | `11280 / 11280` | `0` | `8253` | `3027` | `0` | `0 / 0` | `9293.393ms` | `8784ms / 531` | `0s / 0` | `FALSIFIED_UNBOUNDED_OR_REGRESSED` |
+
+The retry improved accepted writes from `7594` to `8253`, but it still accepted fewer
+than the control's `11280` writes and kept accepted-only p95 at `9293.393ms`, far above
+the control's `298.911ms`. This is a valid retry falsification: exact attempts, dropped
+iterations, status accounting, dirty-error count, admission samples, and drain all passed.
+The single fixed-load retry attempt count is `1`; no second fixed-load retry was run.
+
+The corrected forced-saturation retry used the Stage 3 saturation frame, with the control
+summary explicitly unset:
+
+```bash
+env -u FLAPJACK_WRITE_QUEUE_BATCH_SIZE \
+  -u FLAPJACK_LOADTEST_WRITE_CONTROL_SUMMARY \
+  FLAPJACK_WRITE_QUEUE_CHANNEL_CAPACITY=32 \
+  FLAPJACK_WRITE_QUEUE_START_DELAY_MS=5000 \
+  FLAPJACK_LOADTEST_WRITE_CONDITION=candidate \
+  FLAPJACK_LOADTEST_WRITE_TARGET_RPS=94 \
+  FLAPJACK_LOADTEST_SOAK_DURATION=30s \
+  FLAPJACK_LOADTEST_WRITE_EXPECTED_ATTEMPTS=2820 \
+  bash soak_proof.sh --scenario write-soak
+```
+
+| Proof directory | Attempts / expected | Dropped | 200 | QueueFull 429 | unexpected 4xx | 5xx / dirty | accepted p95 | admission max age / peak | drain duration / count | Classifier |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `engine/loadtest/results/20260723T062811Z-write-soak/` | `2820 / 2820` | `0` | `1856` | `964` | `0` | `0 / 0` | `977.412ms` | `578ms / 32` | `0s / 0` | `CONFIRMED_BOUNDED_LAG` |
+
+Invalid retry accounting: `engine/loadtest/results/20260723T062627Z-write-soak/` is
+discarded because the forced-saturation command accidentally included
+`FLAPJACK_LOADTEST_WRITE_CONTROL_SUMMARY`, turning the saturation probe into a control
+parity check. It is not terminal evidence and was not used for the verdict.
+
+Final Stage 4 accounting: valid fixed-load retry count `1`, valid forced-saturation
+retry count `1`, invalid retry-command count `1`, additional fixed-load retry count `0`.
+
+### Terminal Verdict
+
+`withdraw`: new live writes keep the single admission entry point
+`engine/src/index/manager/write.rs::IndexManager::admit_write_actions`, preserve task
+aliases, QueueFull-before-allocation, synchronous durable ACK behavior, and successful
+indexing, but no longer call `WriteAdmissionStore::append_record` or create a new
+`write_admission/*.json` record. `WriteAdmissionStore` remains the owner for startup
+reconciliation, cleanup, and previously persisted admission records. PL-10 remains open
+for the single-writer Tantivy bottleneck and cross-node fanout; this terminal disposition
+closes only the bounded-lag correctness question for the persistent-admission hot-path
+slice.

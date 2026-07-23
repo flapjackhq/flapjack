@@ -680,43 +680,28 @@ async fn wait_for_write_durable_reclaims_terminal_overflow_without_new_write() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn admitted_write_queue_task_replays_after_restart_window() {
+async fn legacy_persistent_admission_task_replays_after_restart_window() {
     let temp_dir = TempDir::new().unwrap();
     let tenant_id = "write_queue_restart_replay";
     let object_id = "write_queue_restart_replay_doc";
 
     let manager = IndexManager::new(temp_dir.path());
     manager.create_tenant(tenant_id).unwrap();
-    let task = manager
-        .add_documents(
-            tenant_id,
-            vec![write_queue_test_document(
+    let task_id = format!("task_{tenant_id}_legacy_replay");
+    let numeric_id = 42;
+    let store = WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap();
+    store
+        .append_record(WriteAdmissionRecord::new(
+            task_id,
+            numeric_id,
+            1,
+            vec![WriteAction::Upsert(write_queue_test_document(
                 object_id,
                 "restart replay coverage",
-            )],
-        )
+            ))],
+        ))
         .unwrap();
-
-    assert!(
-        tenant_task_snapshot_contains(&manager, tenant_id, &task.id),
-        "accepted write_queue task must be inspectable before restart"
-    );
-    assert_eq!(
-        manager.get_task(&task.numeric_id.to_string()).unwrap().id,
-        task.id,
-        "numeric task alias must exist after admission"
-    );
-    assert!(
-        manager
-            .get_document(tenant_id, object_id)
-            .unwrap()
-            .is_none(),
-        "pre-restart index must not already report the admitted document as committed"
-    );
-    assert!(
-        manager.abort_tenant_write_task_for_test(tenant_id),
-        "tenant write_queue task must exist so the restart window is simulated before commit"
-    );
+    assert_eq!(tenant_admission_record_count(temp_dir.path(), tenant_id), 1);
     drop(manager);
 
     let restarted_manager = IndexManager::new(temp_dir.path());
@@ -733,6 +718,11 @@ async fn admitted_write_queue_task_replays_after_restart_window() {
             Some(FieldValue::Text(title)) if title == "restart replay coverage"
         ),
         "restart replay must preserve the admitted document fields"
+    );
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        0,
+        "startup reconciliation must clean up the replayed legacy admission record"
     );
 }
 
@@ -766,6 +756,134 @@ async fn add_documents_write_queue_full_does_not_allocate_task_aliases() {
 async fn delete_documents_write_queue_full_does_not_allocate_task_aliases() {
     let temp_dir = TempDir::new().unwrap();
     assert_queue_full_preserves_pre_admission_state(AdmissionCapacityEntryPoint::Delete, &temp_dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(flapjack_write_durable_timeout_env)]
+async fn live_write_admission_bypasses_persistence_and_keeps_manager_contract() {
+    let _writer_timeout_guard = WriteQueueWriterAcquireTimeoutEnvGuard::set("5000");
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "live_admission_withdrawal";
+    let object_id = "live_admission_doc";
+    let tenant_path = temp_dir.path().join(tenant_id);
+    std::fs::create_dir_all(&tenant_path).unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let index = Arc::new(
+        Index::create_with_budget(
+            &tenant_path,
+            crate::index::schema::Schema::builder().build(),
+            Arc::new(MemoryBudget::new(MemoryBudgetConfig {
+                max_concurrent_writers: 1,
+                ..Default::default()
+            })),
+        )
+        .unwrap(),
+    );
+    manager
+        .loaded
+        .insert(tenant_id.to_string(), Arc::clone(&index));
+    let held_writer = index
+        .writer()
+        .expect("test precondition: held writer must keep the queued write pending");
+
+    let task = manager
+        .add_documents(
+            tenant_id,
+            vec![write_queue_test_document(
+                object_id,
+                "live withdrawal coverage",
+            )],
+        )
+        .expect("live admission must still enter through the manager write path");
+
+    assert!(
+        tenant_task_snapshot_contains(&manager, tenant_id, &task.id),
+        "live admission must preserve the canonical task alias"
+    );
+    assert_eq!(
+        manager.get_task(&task.numeric_id.to_string()).unwrap().id,
+        task.id,
+        "live admission must preserve the numeric task alias"
+    );
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        0,
+        "new live admissions must not create persistent admission records"
+    );
+
+    drop(held_writer);
+    manager.wait_for_write_durable(&task.id).await.unwrap();
+    let document = manager
+        .get_document(tenant_id, object_id)
+        .unwrap()
+        .expect("durable live admission must be indexed successfully");
+    assert!(
+        matches!(
+            document.fields.get("title"),
+            Some(FieldValue::Text(title)) if title == "live withdrawal coverage"
+        ),
+        "durable live admission must preserve the indexed document fields"
+    );
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        0,
+        "successful live admission cleanup must not depend on a persistent record"
+    );
+
+    let capacity_temp_dir = TempDir::new().unwrap();
+    assert_queue_full_preserves_pre_admission_state(
+        AdmissionCapacityEntryPoint::Upsert,
+        &capacity_temp_dir,
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_add_documents_write_queue_full_returns_queue_full_before_ack_wait() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "durable_write_queue_capacity";
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+    fill_write_queue_without_admission(&manager, tenant_id);
+    let before_keys = tenant_task_key_snapshot(&manager, tenant_id);
+    let before_records = tenant_admission_record_count(temp_dir.path(), tenant_id);
+
+    let result = manager
+        .add_documents_durable(
+            tenant_id,
+            vec![write_queue_test_document(
+                "durable_capacity_doc",
+                "durable queue capacity coverage",
+            )],
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(FlapjackError::QueueFull)),
+        "durable write must return pre-admission QueueFull before ACK wait, got {result:?}"
+    );
+    if let Err(error) = &result {
+        assert_eq!(error.status_code(), http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            !matches!(
+                error,
+                FlapjackError::WriteAckTimeout
+                    | FlapjackError::TooManyConcurrentWrites { .. }
+                    | FlapjackError::Tantivy(_)
+                    | FlapjackError::Io(_)
+            ),
+            "durable full-channel admission must not surface a 5xx-path error, got {error:?}"
+        );
+    }
+    assert_eq!(tenant_task_key_snapshot(&manager, tenant_id), before_keys);
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        before_records,
+        "durable QueueFull must not allocate a new admission record"
+    );
+    assert!(
+        manager.abort_tenant_write_task_for_test(tenant_id),
+        "tenant write_queue task should still be abortable after durable capacity probe"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1053,6 +1171,54 @@ async fn write_queue_replay_failure_blocks_startup_before_live_admission() {
     );
 }
 
+#[test]
+fn write_admission_append_uses_recovered_sequence_state_without_scanning() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_admission_recovered_sequence";
+    std::fs::create_dir_all(temp_dir.path().join(tenant_id)).unwrap();
+
+    let initial_store = WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap();
+    initial_store
+        .append_record(WriteAdmissionRecord::new(
+            format!("task_{tenant_id}_recovered"),
+            19_999,
+            1,
+            vec![WriteAction::Delete("recovered_document".to_string())],
+        ))
+        .unwrap();
+    drop(initial_store);
+
+    let recovered_store = WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap();
+    let recovery_load_count = recovered_store.load_records_unlocked_call_count_for_test();
+    assert_eq!(
+        recovery_load_count, 1,
+        "open must perform one recovery scan"
+    );
+
+    let appended_sequences = ["first", "second"]
+        .into_iter()
+        .enumerate()
+        .map(|(offset, suffix)| {
+            recovered_store
+                .append_record(WriteAdmissionRecord::new(
+                    format!("task_{tenant_id}_{suffix}"),
+                    20_000 + offset as i64,
+                    1,
+                    vec![WriteAction::Delete(format!("document_{offset}"))],
+                ))
+                .unwrap()
+                .sequence
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(appended_sequences, vec![2, 3]);
+    assert_eq!(
+        recovered_store.load_records_unlocked_call_count_for_test(),
+        recovery_load_count,
+        "successful appends must use recovered sequence state without rescanning admission records"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn write_admission_first_directory_create_requires_tenant_directory_sync() {
@@ -1098,6 +1264,10 @@ fn write_admission_first_directory_create_requires_tenant_directory_sync() {
         .expect("retry must durably admit after the tenant directory becomes syncable");
     assert_eq!(retry_record.task_id, retry_task_id);
     assert_eq!(
+        retry_record.sequence, 2,
+        "failed append sequence must remain consumed because gaps are harmless"
+    );
+    assert_eq!(
         tenant_admission_record_count(temp_dir.path(), tenant_id),
         1,
         "retry must publish exactly one replayable record"
@@ -1138,6 +1308,48 @@ fn write_admission_last_directory_remove_requires_tenant_directory_sync() {
     );
 }
 
+#[test]
+fn write_admission_remove_directory_failure_restores_record() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_admission_remove_directory_failure";
+    std::fs::create_dir_all(temp_dir.path().join(tenant_id)).unwrap();
+    let store = WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap();
+    let task_id = format!("task_{tenant_id}_last");
+    store
+        .append_record(WriteAdmissionRecord::new(
+            task_id.clone(),
+            25_001,
+            1,
+            vec![WriteAction::Delete("missing".to_string())],
+        ))
+        .unwrap();
+
+    let admission_dir = temp_dir.path().join(tenant_id).join("write_admission");
+    let unexpected_path = admission_dir.join("unexpected");
+    let hook_path = unexpected_path.clone();
+    store.set_before_empty_directory_remove_hook(move || {
+        std::fs::write(hook_path, b"blocks directory removal").unwrap();
+    });
+
+    store
+        .remove_task(&task_id)
+        .expect_err("non-empty admission directory must fail last-record cleanup");
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        1,
+        "directory cleanup failure must restore the removed admission record"
+    );
+
+    std::fs::remove_file(unexpected_path).unwrap();
+    store
+        .remove_task(&task_id)
+        .expect("cleanup retry must remove the restored record");
+    assert!(
+        !admission_dir.exists(),
+        "cleanup retry must remove the now-empty admission directory"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn write_admission_batch_cleanup_failure_preserves_all_replayable_records() {
@@ -1175,6 +1387,19 @@ fn write_admission_batch_cleanup_failure_preserves_all_replayable_records() {
         tenant_admission_record_count(temp_dir.path(), tenant_id),
         task_ids.len(),
         "batched cleanup failure must preserve every replayable record in the committed batch"
+    );
+
+    store
+        .remove_tasks(task_ids.iter().map(String::as_str))
+        .expect("cleanup retry must use the unchanged live-record state");
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        0,
+        "cleanup retry must durably remove every restored admission record"
+    );
+    assert!(
+        !tenant_path.join("write_admission").exists(),
+        "cleanup retry must remove the admission directory after its last live records"
     );
 }
 
@@ -1248,6 +1473,89 @@ fn write_queue_admission_append_and_last_record_removal_are_atomic() {
             .join("write_admission")
             .is_dir(),
         "a live admission record must retain its store directory"
+    );
+}
+
+/// Group-commit contract: concurrent admissions that are all staged (renamed into
+/// place) before any of them publishes must share a single directory flush, and no
+/// caller may return until its own record is crash-safe on disk. The `after_stage`
+/// barrier makes the coalescing deterministic — instrumentation, not timing — so the
+/// flush count is an exact `1`, not a flaky "usually fewer".
+#[test]
+fn write_queue_admission_concurrent_appends_coalesce_into_one_durable_flush() {
+    const CONCURRENT_ADMISSIONS: usize = 4;
+
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_admission_group_commit_flush";
+    std::fs::create_dir_all(temp_dir.path().join(tenant_id)).unwrap();
+    let store = Arc::new(WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap());
+
+    // Hold every appender at a barrier after it has staged (renamed) its record but
+    // before it publishes, so all renames are on disk before the first flush leader
+    // captures its "all tickets up to here" bound.
+    let staged_barrier = Arc::new(std::sync::Barrier::new(CONCURRENT_ADMISSIONS));
+    store.set_after_stage_hook({
+        let staged_barrier = Arc::clone(&staged_barrier);
+        move || {
+            staged_barrier.wait();
+        }
+    });
+
+    let admissions = (0..CONCURRENT_ADMISSIONS)
+        .map(|offset| {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                store.append_record(WriteAdmissionRecord::new(
+                    format!("task_group_commit_{offset}"),
+                    50_000 + offset as i64,
+                    1,
+                    vec![WriteAction::Delete(format!("group_doc_{offset}"))],
+                ))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let admitted_sequences = admissions
+        .into_iter()
+        .map(|handle| {
+            handle
+                .join()
+                .unwrap()
+                .expect("admission must not return before its record is crash-safe")
+                .sequence
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        store.directory_flush_call_count_for_test(),
+        1,
+        "concurrent admissions staged behind a shared barrier must coalesce into exactly one directory flush"
+    );
+
+    // Every admission that returned must be durably readable — proving no caller was
+    // handed an admitted task before its own record was crash-safe.
+    let mut recovered_task_ids = store
+        .load_records()
+        .unwrap()
+        .into_iter()
+        .map(|record| record.task_id)
+        .collect::<Vec<_>>();
+    recovered_task_ids.sort();
+    let mut expected_task_ids = (0..CONCURRENT_ADMISSIONS)
+        .map(|offset| format!("task_group_commit_{offset}"))
+        .collect::<Vec<_>>();
+    expected_task_ids.sort();
+    assert_eq!(
+        recovered_task_ids, expected_task_ids,
+        "every returned admission must be durably persisted on disk"
+    );
+
+    let mut sorted_sequences = admitted_sequences;
+    sorted_sequences.sort_unstable();
+    assert_eq!(
+        sorted_sequences,
+        (1..=CONCURRENT_ADMISSIONS as u64).collect::<Vec<_>>(),
+        "each concurrent admission must receive a unique gap-free sequence"
     );
 }
 
@@ -1424,47 +1732,53 @@ async fn post_admission_write_queue_writer_slot_contention_returns_too_many_conc
 
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
-async fn compact_admission_cleanup_failure_does_not_report_success() {
+async fn legacy_compact_admission_cleanup_failure_does_not_report_success() {
     use std::os::unix::fs::PermissionsExt;
 
     let temp_dir = TempDir::new().unwrap();
     let tenant_id = "compact_cleanup_failure";
-    let manager = IndexManager::new(temp_dir.path());
-    manager.create_tenant(tenant_id).unwrap();
+    let initial_manager = IndexManager::new(temp_dir.path());
+    initial_manager.create_tenant(tenant_id).unwrap();
+    drop(initial_manager);
 
-    let task = manager
-        .compact_index(tenant_id)
-        .expect("compact admission should succeed before cleanup failure");
+    let task_id = format!("task_{tenant_id}_legacy_compact");
+    let numeric_id = 42;
+    let store = WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap();
+    store
+        .append_record(WriteAdmissionRecord::new(
+            task_id.clone(),
+            numeric_id,
+            0,
+            vec![WriteAction::Compact],
+        ))
+        .unwrap();
     let admission_dir = temp_dir.path().join(tenant_id).join("write_admission");
+    assert_eq!(tenant_admission_record_count(temp_dir.path(), tenant_id), 1);
     std::fs::set_permissions(&admission_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-    let status = wait_for_terminal_task_status(&manager, &task.id).await;
+    let restarted = IndexManager::new(temp_dir.path());
+    let result = restarted.get_or_load(tenant_id);
     std::fs::set_permissions(&admission_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     assert!(
+        result.is_err(),
+        "cleanup failure during legacy compact replay must fail tenant open instead of reporting success"
+    );
+    let status = restarted.get_task(&task_id).unwrap().status;
+    assert!(
         matches!(status, TaskStatus::Failed(_)),
-        "cleanup failure after compaction must fail the task instead of reporting success; got {status:?}"
+        "cleanup failure after legacy compact replay must fail the task instead of reporting success; got {status:?}"
+    );
+    assert_eq!(
+        restarted.get_task(&numeric_id.to_string()).unwrap().id,
+        task_id,
+        "failed legacy compact task must keep its numeric alias inspectable"
     );
     assert_eq!(
         tenant_admission_record_count(temp_dir.path(), tenant_id),
         1,
-        "failed admission cleanup must leave the replayable compact record for restart handling"
+        "failed legacy compact cleanup must leave the replayable compact record for restart handling"
     );
-}
-
-async fn wait_for_terminal_task_status(manager: &IndexManager, task_id: &str) -> TaskStatus {
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        let status = manager.get_task(task_id).unwrap().status;
-        if !matches!(status, TaskStatus::Enqueued | TaskStatus::Processing) {
-            return status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "task {task_id} did not reach a terminal status"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
 }
 
 #[tokio::test]
