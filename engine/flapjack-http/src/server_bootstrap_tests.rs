@@ -146,6 +146,16 @@ async fn bootstrap_join_posts_identity_merges_status_and_persists_membership() {
             }
         ]
     });
+    let legacy_status: crate::handlers::internal::ClusterStatusResponse =
+        serde_json::from_value(status.clone()).unwrap();
+    let crate::handlers::internal::ClusterStatusResponse::Ha(legacy_status) = legacy_status else {
+        panic!("legacy HA cluster-status payload should deserialize to HA branch");
+    };
+    assert!(!legacy_status.autoheal_enabled);
+    assert!(
+        legacy_status.autoheal_peers.is_empty(),
+        "legacy cluster-status payloads must not synthesize lifecycle membership"
+    );
     let (bootstrap_peer, client, server) = spawn_fake_bootstrap(vec![
         (200, serde_json::json!({"ok": true}).to_string()),
         (200, status.to_string()),

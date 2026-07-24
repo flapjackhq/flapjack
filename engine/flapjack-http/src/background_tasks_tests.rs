@@ -1,6 +1,7 @@
     use super::{
-        completed_utc_day, extract_s3_snapshot_tenant_id, migration_spool_gc_interval_secs,
-        rollup_window_bounds_ms, run_migration_spool_gc_loop, run_usage_rollover, HOUR_MS,
+        autoheal_enabled_from_env, completed_utc_day, extract_s3_snapshot_tenant_id,
+        migration_spool_gc_interval_secs, parse_autoheal_enabled, rollup_window_bounds_ms,
+        run_migration_spool_gc_loop, run_usage_rollover, HOUR_MS, AUTOHEAL_ENABLED_ENV,
         MIGRATION_SPOOL_GC_INTERVAL_ENV,
     };
     use crate::handlers::migration::spool::{
@@ -86,6 +87,44 @@
         let _guard = with_env_var(MIGRATION_SPOOL_GC_INTERVAL_ENV, "42");
 
         assert_eq!(migration_spool_gc_interval_secs(), 42);
+    }
+
+    #[test]
+    fn autoheal_enabled_parser_defaults_false_when_absent() {
+        assert_eq!(parse_autoheal_enabled(None), Ok(false));
+    }
+
+    #[test]
+    fn autoheal_enabled_parser_accepts_trimmed_ascii_case_insensitive_values() {
+        for value in ["false", " FALSE ", "FaLsE", "\tfalse\n"] {
+            assert_eq!(parse_autoheal_enabled(Some(value)), Ok(false));
+        }
+        for value in ["true", " TRUE ", "TrUe", "\ttrue\n"] {
+            assert_eq!(parse_autoheal_enabled(Some(value)), Ok(true));
+        }
+    }
+
+    #[test]
+    fn autoheal_enabled_parser_rejects_invalid_values() {
+        for value in ["", "1", "0", "yes", "enabled", "true false"] {
+            assert_eq!(
+                parse_autoheal_enabled(Some(value)),
+                Err(value.to_string()),
+                "{value:?} must not be accepted as an auto-heal boolean"
+            );
+        }
+    }
+
+    #[test]
+    fn autoheal_enabled_env_reader_uses_parser_for_true_and_invalid_values() {
+        {
+            let _guard = with_env_var(AUTOHEAL_ENABLED_ENV, " TRUE ");
+            assert!(autoheal_enabled_from_env());
+        }
+        {
+            let _guard = with_env_var(AUTOHEAL_ENABLED_ENV, "1");
+            assert!(!autoheal_enabled_from_env());
+        }
     }
 
     #[tokio::test]

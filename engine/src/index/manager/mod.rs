@@ -7,8 +7,8 @@ use crate::index::synonyms::{Synonym, SynonymStore};
 use crate::index::task_queue::TaskQueue;
 use crate::index::utils::copy_dir_recursive;
 use crate::index::write_queue::{
-    admission::{WriteAdmissionRecord, WriteAdmissionStore},
-    create_write_queue, VectorWriteContext, WriteAction, WriteQueue, WriteQueueContext,
+    admission::{WriteAdmissionRecord, WriteAdmissionStore, WriteAdmissionTicket},
+    create_write_queue, VectorWriteContext, WriteAction, WriteOp, WriteQueue, WriteQueueContext,
 };
 use crate::index::Index;
 use crate::query::algolia_filters::{
@@ -37,6 +37,86 @@ const MAX_INDEX_NAME_BYTES: usize = 256;
 use super::OptionalFilterSpecs;
 use super::SearchOptions;
 use crate::index::settings::strip_unordered_prefix;
+
+#[derive(Clone)]
+pub(crate) struct WriteTaskHandle {
+    inner: Arc<WriteTaskHandleInner>,
+}
+
+struct WriteTaskHandleInner {
+    state: std::sync::Mutex<WriteTaskHandleState>,
+    completion: tokio::sync::Notify,
+}
+
+enum WriteTaskHandleState {
+    Running(JoinHandle<Result<()>>),
+    Draining,
+    Finished(Result<()>),
+}
+
+impl WriteTaskHandle {
+    pub(crate) fn new(handle: JoinHandle<Result<()>>) -> Self {
+        Self {
+            inner: Arc::new(WriteTaskHandleInner {
+                state: std::sync::Mutex::new(WriteTaskHandleState::Running(handle)),
+                completion: tokio::sync::Notify::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn abort(&self) {
+        if let WriteTaskHandleState::Running(handle) = &*self.inner.state.lock().unwrap() {
+            handle.abort();
+        }
+    }
+
+    pub(crate) async fn drain(&self, tenant_id: TenantId) -> Result<()> {
+        self.start_drain_monitor(tenant_id);
+        loop {
+            let notified = self.inner.completion.notified();
+            if let WriteTaskHandleState::Finished(result) = &*self.inner.state.lock().unwrap() {
+                return result.clone();
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn same_handle(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn start_drain_monitor(&self, tenant_id: TenantId) {
+        let handle = {
+            let mut state_guard = self.inner.state.lock().unwrap();
+            match std::mem::replace(&mut *state_guard, WriteTaskHandleState::Draining) {
+                WriteTaskHandleState::Running(handle) => Some(handle),
+                previous @ (WriteTaskHandleState::Draining | WriteTaskHandleState::Finished(_)) => {
+                    *state_guard = previous;
+                    None
+                }
+            }
+        };
+
+        if let Some(handle) = handle {
+            let inner = Arc::clone(&self.inner);
+            tokio::spawn(async move {
+                let result = match handle.await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(write_queue_drain_error(&tenant_id, error)),
+                    Err(error) => Err(write_queue_drain_error(&tenant_id, error)),
+                };
+                *inner.state.lock().unwrap() = WriteTaskHandleState::Finished(result);
+                inner.completion.notify_waiters();
+            });
+        }
+    }
+}
+
+fn write_queue_drain_error(tenant_id: &str, error: impl std::fmt::Display) -> FlapjackError {
+    FlapjackError::Tantivy(format!(
+        "destination write queue drain failed for {tenant_id}: {error}"
+    ))
+}
 
 /// Validate that a tenant/index name is safe for use as a filesystem path component.
 /// Rejects path traversal attempts, empty names, and names with unsafe characters.
@@ -102,7 +182,7 @@ pub struct IndexManager {
     pub(crate) writers:
         Arc<DashMap<TenantId, Arc<tokio::sync::Mutex<crate::index::ManagedIndexWriter>>>>,
     pub(crate) write_queues: DashMap<TenantId, WriteQueue>,
-    pub(crate) write_task_handles: DashMap<TenantId, JoinHandle<Result<()>>>,
+    pub(crate) write_task_handles: DashMap<TenantId, WriteTaskHandle>,
     pub(crate) oplogs: DashMap<TenantId, Arc<OpLog>>,
     tasks: Arc<DashMap<String, TaskInfo>>,
     task_queue: TaskQueue,

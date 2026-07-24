@@ -14,6 +14,8 @@ const NODE_LOCAL_GUARANTEE: &str =
 
 mod digest;
 mod epoch;
+#[cfg(test)]
+mod epoch_tests;
 mod executor;
 mod fault;
 mod fsops;
@@ -26,9 +28,11 @@ mod scanner;
 #[cfg(test)]
 mod scanner_tests;
 pub use digest::canonical_tenant_tree_digest;
+pub(crate) use epoch::{capture_publication_epoch, try_validate_publication_epoch_admission};
 pub use epoch::{
     compare_and_advance_publication_epoch, read_publication_epoch, PublicationEpoch,
-    PublicationEpochError, PublicationEpochFence, PublicationEpochPaths,
+    PublicationEpochAdmissionError, PublicationEpochAdmissionGuard, PublicationEpochError,
+    PublicationEpochFence, PublicationEpochPaths,
 };
 pub use executor::{
     abort_unjournaled_publication, activate_publication, activate_publication_with_fence,
@@ -1045,6 +1049,43 @@ fn starts_with_known_tenant_dir(relative_path: &Path) -> bool {
         || relative_path.starts_with(crate::index::write_queue::PERSISTED_VECTORS_DIR)
         || relative_path.starts_with(crate::dictionaries::persistence::DICTIONARIES_DIR)
         || relative_path.starts_with(crate::recommend::rules::RECOMMEND_RULES_DIR)
+}
+
+/// NODE-LOCAL strict committed-sequence reader for MIG-5 watermark proof.
+///
+/// Unlike `oplog::read_committed_seq`, which is intentionally fail-open (missing,
+/// unreadable, non-regular, or malformed all map to `0`), this reader fails
+/// closed: the sidecar must be a regular file holding exactly one parseable
+/// `u64`. Any other state is a `FlapjackError`, never a silent `0` that could
+/// masquerade as a proven watermark. Recovery keeps using the fail-open reader;
+/// only publication watermark proof uses this strict one.
+pub(super) fn read_strict_committed_seq(tenant_path: &Path) -> Result<u64> {
+    let path = tenant_path.join(crate::index::oplog::COMMITTED_SEQ_FILE);
+    let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+        invalid_publication(format!(
+            "committed_seq sidecar is not durable at {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(invalid_publication(format!(
+            "committed_seq sidecar at {} is not a regular file",
+            path.display()
+        )));
+    }
+    let contents = std::fs::read_to_string(&path).map_err(|error| {
+        invalid_publication(format!(
+            "committed_seq sidecar at {} is unreadable: {error}",
+            path.display()
+        ))
+    })?;
+    contents.trim().parse::<u64>().map_err(|error| {
+        invalid_publication(format!(
+            "committed_seq sidecar at {} is not a u64 (got {:?}): {error}",
+            path.display(),
+            contents.trim()
+        ))
+    })
 }
 
 pub(super) fn invalid_publication(message: impl Into<String>) -> FlapjackError {

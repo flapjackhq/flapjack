@@ -340,10 +340,14 @@ fn build_internal_routes(state: Arc<AppState>, auth_enabled: bool) -> Router {
         )
         .with_state(state.clone());
 
-    // Peer-health routes are always available (needed for HA probing even in no-auth mode)
-    let peer_health_routes = Router::new()
+    // Internal status and capability reads remain available in no-auth mode.
+    let internal_read_routes = Router::new()
         .route("/internal/status", get(internal::replication_status))
         .route("/internal/cluster/status", get(internal::cluster_status))
+        .route(
+            "/internal/snapshots/capability",
+            get(handlers::snapshot::snapshot_capability),
+        )
         .with_state(state.clone());
 
     // Replication read/write transport must stay reachable in no-auth HA
@@ -383,13 +387,13 @@ fn build_internal_routes(state: Arc<AppState>, auth_enabled: bool) -> Router {
             )
             .with_state(state.clone());
         Router::new()
-            .merge(peer_health_routes)
+            .merge(internal_read_routes)
             .merge(replication_mesh_routes)
             .merge(admin_internal_routes)
     } else {
         // No-auth mode still needs replication/catch-up routes for HA convergence.
         Router::new()
-            .merge(peer_health_routes)
+            .merge(internal_read_routes)
             .merge(replication_mesh_routes)
     };
 

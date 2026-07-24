@@ -12,8 +12,57 @@ use flapjack::error::FlapjackError;
 use flapjack::index::s3::S3Config;
 use flapjack::index::snapshot::export_to_bytes;
 use std::{path::PathBuf, sync::Arc};
+use utoipa::ToSchema;
 
 const SNAPSHOT_EXPORT_MAX_ATTEMPTS: usize = 3;
+
+#[derive(serde::Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotBackend {
+    S3,
+}
+
+#[derive(serde::Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotCapabilityState {
+    NotConfigured,
+    /// Configuration is present, but credentials, bucket existence, and
+    /// backend reachability have not been verified.
+    ConfiguredUnverified,
+}
+
+#[derive(serde::Serialize, ToSchema)]
+pub struct SnapshotCapabilityResponse {
+    backend: SnapshotBackend,
+    state: SnapshotCapabilityState,
+    #[schema(required)]
+    bucket: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/internal/snapshots/capability",
+    tag = "internal",
+    responses(
+        (status = 200, description = "Snapshot backend capability", body = SnapshotCapabilityResponse)
+    ),
+    security(("api_key" = []))
+)]
+pub async fn snapshot_capability() -> Json<SnapshotCapabilityResponse> {
+    let (state, bucket) = match S3Config::from_env() {
+        None => (SnapshotCapabilityState::NotConfigured, None),
+        Some(config) => (
+            SnapshotCapabilityState::ConfiguredUnverified,
+            Some(config.bucket_name),
+        ),
+    };
+
+    Json(SnapshotCapabilityResponse {
+        backend: SnapshotBackend::S3,
+        state,
+        bucket,
+    })
+}
 
 fn s3_config_or_error(message: &'static str) -> Result<S3Config, Box<Response>> {
     S3Config::from_env().ok_or_else(|| {
@@ -369,8 +418,11 @@ pub async fn list_s3_snapshots(ValidatedIndexName(index_name): ValidatedIndexNam
 
 #[cfg(test)]
 mod tests {
-    use super::{export_snapshot, import_snapshot, validate_restore_key_override};
-    use crate::test_helpers::{body_json, TestStateBuilder};
+    use super::{
+        export_snapshot, import_snapshot, list_s3_snapshots, snapshot_capability,
+        validate_restore_key_override,
+    };
+    use crate::test_helpers::{body_json, EnvVarRestoreGuard, TestStateBuilder, ENV_MUTEX};
     use axum::{
         body::Body,
         http::{Request, StatusCode},
@@ -384,6 +436,115 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::TempDir;
     use tower::ServiceExt;
+
+    // The process-global environment lock must span each asynchronous handler
+    // call so another test cannot change S3 configuration mid-request.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn snapshot_capability_unconfigured_returns_exact_closed_contract() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let _bucket = EnvVarRestoreGuard::remove("FLAPJACK_S3_BUCKET");
+
+        let response_body = serde_json::to_value(snapshot_capability().await.0).unwrap();
+
+        assert_eq!(
+            response_body,
+            serde_json::json!({
+                "backend": "s3",
+                "state": "not_configured",
+                "bucket": null
+            })
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn snapshot_capability_configured_unverified_preserves_bucket_without_leaking_configuration(
+    ) {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let _bucket = EnvVarRestoreGuard::set("FLAPJACK_S3_BUCKET", "snapshot-bucket");
+        let _region = EnvVarRestoreGuard::set("FLAPJACK_S3_REGION", "sentinel-region");
+        let _endpoint =
+            EnvVarRestoreGuard::set("FLAPJACK_S3_ENDPOINT", "http://127.0.0.1:9/unreachable");
+        let _access_key = EnvVarRestoreGuard::set("AWS_ACCESS_KEY_ID", "sentinel-access-key");
+        let _secret_key = EnvVarRestoreGuard::set("AWS_SECRET_ACCESS_KEY", "sentinel-secret-key");
+
+        let response_body = serde_json::to_value(snapshot_capability().await.0).unwrap();
+        let unconfigured_body = serde_json::json!({
+            "backend": "s3",
+            "state": "not_configured",
+            "bucket": null
+        });
+
+        assert_eq!(
+            response_body,
+            serde_json::json!({
+                "backend": "s3",
+                "state": "configured_unverified",
+                "bucket": "snapshot-bucket"
+            })
+        );
+        assert_ne!(response_body, unconfigured_body);
+
+        let serialized = serde_json::to_string(&response_body).unwrap();
+        for sentinel in [
+            "sentinel-region",
+            "http://127.0.0.1:9/unreachable",
+            "sentinel-access-key",
+            "sentinel-secret-key",
+        ] {
+            assert!(
+                !serialized.contains(sentinel),
+                "capability response leaked configuration value {sentinel}"
+            );
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn snapshot_capability_preserves_empty_configured_bucket() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let _bucket = EnvVarRestoreGuard::set("FLAPJACK_S3_BUCKET", "");
+
+        let response_body = serde_json::to_value(snapshot_capability().await.0).unwrap();
+
+        assert_eq!(
+            response_body,
+            serde_json::json!({
+                "backend": "s3",
+                "state": "configured_unverified",
+                "bucket": ""
+            })
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn list_s3_snapshots_without_bucket_preserves_exact_service_unavailable_contract() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let _bucket = EnvVarRestoreGuard::remove("FLAPJACK_S3_BUCKET");
+        let app = Router::new().route("/1/indexes/:indexName/snapshots", get(list_s3_snapshots));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/1/indexes/products/snapshots")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({
+                "message": "S3 not configured",
+                "status": 503
+            })
+        );
+    }
+
     #[tokio::test]
     async fn export_snapshot_missing_index_returns_json_without_router_error_wrapper() {
         let tmp = TempDir::new().unwrap();

@@ -32,6 +32,9 @@ pub enum RepairArtifactEvidence {
     Missing,
     MatchesOld,
     MatchesNew,
+    /// The tree matches the journaled new-content digest, but its strict
+    /// `committed_seq` does not equal the fenced publication watermark.
+    StrictWatermarkMismatch,
     Mismatch,
     Unreadable,
     /// An empty tree where the journal records no prior target. In the target
@@ -447,27 +450,9 @@ fn inspect_publication_repair(context: RepairInspectionContext<'_>) -> Result<In
         .and_then(|_| validate_manifest_layout(&journal.artifact_manifest, resolved_manifest))
         .and_then(|_| validate_manifest_artifacts(paths, &journal, resolved_manifest, io))
         .is_ok();
-    let target = classify_tree_evidence(
-        &paths.target,
-        &journal.digest,
-        journal.prior_digest.as_ref(),
-        inventory,
-        io,
-    );
-    let backup = classify_tree_evidence(
-        &paths.backup,
-        &journal.digest,
-        journal.prior_digest.as_ref(),
-        inventory,
-        io,
-    );
-    let staging = classify_tree_evidence(
-        &paths.staging,
-        &journal.digest,
-        journal.prior_digest.as_ref(),
-        inventory,
-        io,
-    );
+    let target = classify_tree_evidence(&paths.target, &journal, inventory, io);
+    let backup = classify_tree_evidence(&paths.backup, &journal, inventory, io);
+    let staging = classify_tree_evidence(&paths.staging, &journal, inventory, io);
     Ok(InspectedRepair {
         evidence: RepairEvidence {
             journal: RepairJournalEvidence::Valid,
@@ -610,8 +595,7 @@ fn observed_artifact_digest(path: &Path, io: &PublicationIo<'_>) -> Result<Optio
 
 fn classify_tree_evidence(
     path: &Path,
-    new_digest: &ContentDigest,
-    old_digest: Option<&ContentDigest>,
+    journal: &PublicationJournal,
     inventory: &TantivyManagedInventory,
     io: &PublicationIo<'_>,
 ) -> RepairArtifactEvidence {
@@ -625,12 +609,32 @@ fn classify_tree_evidence(
         return RepairArtifactEvidence::Unreadable;
     }
     match canonical_tenant_tree_digest(path, inventory) {
-        Ok(digest) if &digest == new_digest => RepairArtifactEvidence::MatchesNew,
-        Ok(digest) if old_digest == Some(&digest) => RepairArtifactEvidence::MatchesOld,
+        Ok(digest) if digest == journal.digest => classify_digest_matching_new_tree(path, journal),
+        Ok(digest) if journal.prior_digest.as_ref() == Some(&digest) => {
+            RepairArtifactEvidence::MatchesOld
+        }
         // Ordered after both digest matches so a tree that is genuinely the old or
         // new content is never reclassified as a reservation.
-        Ok(_) if old_digest.is_none() && tree_is_empty(path) => RepairArtifactEvidence::Reservation,
+        Ok(_) if journal.prior_digest.is_none() && tree_is_empty(path) => {
+            RepairArtifactEvidence::Reservation
+        }
         Ok(_) => RepairArtifactEvidence::Mismatch,
+        Err(_) => RepairArtifactEvidence::Unreadable,
+    }
+}
+
+fn classify_digest_matching_new_tree(
+    path: &Path,
+    journal: &PublicationJournal,
+) -> RepairArtifactEvidence {
+    let Some(fence) = journal.fence_evidence.as_ref() else {
+        return RepairArtifactEvidence::MatchesNew;
+    };
+    match super::read_strict_committed_seq(path) {
+        Ok(committed_seq) if committed_seq == fence.watermark().value() => {
+            RepairArtifactEvidence::MatchesNew
+        }
+        Ok(_) => RepairArtifactEvidence::StrictWatermarkMismatch,
         Err(_) => RepairArtifactEvidence::Unreadable,
     }
 }
@@ -862,6 +866,8 @@ fn decide_rolled_back(evidence: RepairEvidence) -> RepairDecision {
 fn is_untrusted_artifact(evidence: RepairArtifactEvidence) -> bool {
     matches!(
         evidence,
-        RepairArtifactEvidence::Unreadable | RepairArtifactEvidence::StructurallyProvenOld
+        RepairArtifactEvidence::StrictWatermarkMismatch
+            | RepairArtifactEvidence::Unreadable
+            | RepairArtifactEvidence::StructurallyProvenOld
     )
 }

@@ -1,4 +1,11 @@
+use std::collections::BTreeSet;
+
 use super::*;
+
+const CLUSTER_STATUS_RESPONSE_SCHEMA: &str = "#/components/schemas/ClusterStatusResponse";
+const CLUSTER_STATUS_STANDALONE_SCHEMA: &str =
+    "#/components/schemas/ClusterStatusStandaloneResponse";
+const CLUSTER_STATUS_HA_SCHEMA: &str = "#/components/schemas/ClusterStatusHaResponse";
 
 /// Stage 7: Verify insights endpoints appear in the generated spec.
 #[test]
@@ -486,6 +493,399 @@ fn analytics_endpoints_use_shared_response_schemas() {
     }
 }
 
+#[test]
+fn health_endpoint_publishes_exact_response_schema() {
+    let doc = openapi_json();
+
+    assert_get_response_ref(&doc, "/health", "#/components/schemas/HealthResponse");
+    assert_exact_property_set(
+        &doc,
+        "/components/schemas/HealthResponse",
+        &[
+            "status",
+            "version",
+            "build",
+            "uptime_secs",
+            "capabilities",
+            "active_writers",
+            "max_concurrent_writers",
+            "facet_cache_entries",
+            "facet_cache_cap",
+            "heap_allocated_mb",
+            "system_limit_mb",
+            "pressure_level",
+            "allocator",
+            "tenants_loaded",
+        ],
+    );
+    assert_eq!(
+        schema_ref(&doc, "/components/schemas/HealthResponse/properties/build"),
+        Some("#/components/schemas/PublicBuildInfo"),
+        "/health build field must use the public-safe build schema"
+    );
+    assert_required_fields(
+        &doc,
+        "/components/schemas/PublicBuildInfo",
+        &["schemaVersion", "version", "profile", "capabilities"],
+    );
+    assert_exact_property_set(
+        &doc,
+        "/components/schemas/PublicBuildInfo",
+        &["schemaVersion", "version", "profile", "capabilities"],
+    );
+    for property in [
+        "revision",
+        "revisionKnown",
+        "dirty",
+        "dirtyKnown",
+        "workspaceDigest",
+        "target",
+        "features",
+    ] {
+        assert!(
+            doc.pointer(&format!(
+                "/components/schemas/PublicBuildInfo/properties/{property}"
+            ))
+            .is_none(),
+            "public /health build schema must not publish {property}"
+        );
+    }
+    assert_no_operation_security(&doc, "/health", "get");
+}
+
+#[test]
+fn replication_status_endpoint_publishes_exact_response_schema() {
+    let doc = openapi_json();
+
+    assert_get_response_ref(
+        &doc,
+        "/internal/status",
+        "#/components/schemas/ReplicationStatusResponse",
+    );
+    assert_exact_property_set(
+        &doc,
+        "/components/schemas/ReplicationStatusResponse",
+        &[
+            "node_id",
+            "replication_enabled",
+            "peer_count",
+            "ssl_renewal",
+            "storage_total_bytes",
+            "tenant_count",
+            "vector_memory_bytes",
+        ],
+    );
+    assert_required_fields(
+        &doc,
+        "/components/schemas/ReplicationStatusResponse",
+        &[
+            "node_id",
+            "replication_enabled",
+            "peer_count",
+            "ssl_renewal",
+            "storage_total_bytes",
+            "tenant_count",
+            "vector_memory_bytes",
+        ],
+    );
+    assert_required_fields(
+        &doc,
+        "/components/schemas/SslRenewalStatus",
+        &[
+            "enabled",
+            "status",
+            "error",
+            "cert_expires_in_days",
+            "next_check",
+        ],
+    );
+    for property in ["error", "cert_expires_in_days", "next_check"] {
+        assert_nullable_schema(
+            &doc,
+            &format!("/components/schemas/SslRenewalStatus/properties/{property}"),
+        );
+    }
+}
+
+#[test]
+fn snapshot_capability_endpoint_publishes_exact_response_schema() {
+    let doc = openapi_json();
+
+    assert_get_response_ref(
+        &doc,
+        "/internal/snapshots/capability",
+        "#/components/schemas/SnapshotCapabilityResponse",
+    );
+    assert_exact_property_set(
+        &doc,
+        "/components/schemas/SnapshotCapabilityResponse",
+        &["backend", "state", "bucket"],
+    );
+    assert_required_fields(
+        &doc,
+        "/components/schemas/SnapshotCapabilityResponse",
+        &["backend", "state", "bucket"],
+    );
+    assert_nullable_schema(
+        &doc,
+        "/components/schemas/SnapshotCapabilityResponse/properties/bucket",
+    );
+}
+
+#[test]
+fn operations_internal_read_endpoints_require_api_key() {
+    let doc = openapi_json();
+
+    for path in [
+        "/internal/status",
+        "/internal/cluster/status",
+        "/internal/snapshots/capability",
+    ] {
+        assert_get_operation_uses_api_key(&doc, path);
+    }
+}
+
+#[test]
+fn cluster_status_endpoint_publishes_boolean_discriminated_union() {
+    let doc = openapi_json();
+
+    assert_get_response_ref(
+        &doc,
+        "/internal/cluster/status",
+        CLUSTER_STATUS_RESPONSE_SCHEMA,
+    );
+    let variants = schema_composition_refs(&doc, "/components/schemas/ClusterStatusResponse");
+    assert_eq!(
+        variants,
+        vec![CLUSTER_STATUS_STANDALONE_SCHEMA, CLUSTER_STATUS_HA_SCHEMA],
+        "cluster status must publish exactly standalone and HA branches"
+    );
+
+    assert_exact_property_set(
+        &doc,
+        "/components/schemas/ClusterStatusStandaloneResponse",
+        &[
+            "node_id",
+            "replication_enabled",
+            "peers",
+            "autoheal_enabled",
+            "autoheal_peers",
+        ],
+    );
+    assert_required_fields(
+        &doc,
+        "/components/schemas/ClusterStatusStandaloneResponse",
+        &["node_id", "replication_enabled", "peers"],
+    );
+    assert_fixed_bool_property(
+        &doc,
+        "/components/schemas/ClusterStatusStandaloneResponse",
+        "replication_enabled",
+        false,
+    );
+    assert_eq!(
+        doc.pointer(
+            "/components/schemas/ClusterStatusStandaloneResponse/properties/peers/maxItems"
+        )
+        .and_then(|value| value.as_u64()),
+        Some(0),
+        "standalone cluster branch must constrain peers to zero rows"
+    );
+    assert_eq!(
+        schema_ref(
+            &doc,
+            "/components/schemas/ClusterStatusStandaloneResponse/properties/autoheal_peers/items"
+        ),
+        Some("#/components/schemas/AutohealPeerLifecycleResponse"),
+        "standalone branch auto-heal rows must reuse AutohealPeerLifecycleResponse"
+    );
+    assert!(
+        doc.pointer("/components/schemas/ClusterStatusStandaloneResponse/properties/peers_total")
+            .is_none(),
+        "standalone branch must not document peers_total"
+    );
+    assert!(
+        doc.pointer("/components/schemas/ClusterStatusStandaloneResponse/properties/peers_healthy")
+            .is_none(),
+        "standalone branch must not document peers_healthy"
+    );
+
+    assert_exact_property_set(
+        &doc,
+        "/components/schemas/ClusterStatusHaResponse",
+        &[
+            "node_id",
+            "replication_enabled",
+            "peers_total",
+            "peers_healthy",
+            "peers",
+            "autoheal_enabled",
+            "autoheal_peers",
+        ],
+    );
+    assert_required_fields(
+        &doc,
+        "/components/schemas/ClusterStatusHaResponse",
+        &[
+            "node_id",
+            "replication_enabled",
+            "peers_total",
+            "peers_healthy",
+            "peers",
+        ],
+    );
+    assert_fixed_bool_property(
+        &doc,
+        "/components/schemas/ClusterStatusHaResponse",
+        "replication_enabled",
+        true,
+    );
+    assert_eq!(
+        schema_ref(
+            &doc,
+            "/components/schemas/ClusterStatusHaResponse/properties/peers/items"
+        ),
+        Some("#/components/schemas/ClusterPeerStatus"),
+        "HA branch peer rows must reuse ClusterPeerStatus"
+    );
+    assert_eq!(
+        schema_ref(
+            &doc,
+            "/components/schemas/ClusterStatusHaResponse/properties/autoheal_peers/items"
+        ),
+        Some("#/components/schemas/AutohealPeerLifecycleResponse"),
+        "HA branch auto-heal rows must reuse AutohealPeerLifecycleResponse"
+    );
+    assert_exact_property_set(
+        &doc,
+        "/components/schemas/ClusterPeerStatus",
+        &["peer_id", "addr", "status", "last_success_secs_ago"],
+    );
+    assert_required_fields(
+        &doc,
+        "/components/schemas/ClusterPeerStatus",
+        &["peer_id", "addr", "status", "last_success_secs_ago"],
+    );
+    assert_nullable_schema(
+        &doc,
+        "/components/schemas/ClusterPeerStatus/properties/last_success_secs_ago",
+    );
+}
+
+fn assert_get_response_ref(doc: &serde_json::Value, path: &str, expected_schema: &str) {
+    let escaped_path = path.replace('/', "~1");
+    assert_eq!(
+        doc.pointer(&format!(
+            "/paths/{escaped_path}/get/responses/200/content/application~1json/schema/$ref"
+        ))
+        .and_then(|value| value.as_str()),
+        Some(expected_schema),
+        "GET {path} 200 response must reference {expected_schema}"
+    );
+}
+
+fn assert_get_operation_uses_api_key(doc: &serde_json::Value, path: &str) {
+    let escaped_path = path.replace('/', "~1");
+    let security = doc
+        .pointer(&format!("/paths/{escaped_path}/get/security"))
+        .and_then(|value| value.as_array())
+        .unwrap_or_else(|| panic!("GET {path} should document operation security"));
+
+    assert!(
+        security.iter().any(|entry| entry.get("api_key").is_some()),
+        "GET {path} should require api_key security in OpenAPI"
+    );
+}
+
+fn assert_no_operation_security(doc: &serde_json::Value, path: &str, method: &str) {
+    let escaped_path = path.replace('/', "~1");
+    match doc.pointer(&format!("/paths/{escaped_path}/{method}/security")) {
+        None => {}
+        Some(value) => assert!(
+            value.as_array().is_some_and(Vec::is_empty),
+            "{method} {path} should not document security"
+        ),
+    }
+}
+
+fn assert_exact_property_set(doc: &serde_json::Value, schema_pointer: &str, expected: &[&str]) {
+    let actual = doc
+        .pointer(&format!("{schema_pointer}/properties"))
+        .and_then(|value| value.as_object())
+        .unwrap_or_else(|| panic!("{schema_pointer} should expose properties"))
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        actual, expected,
+        "{schema_pointer} should expose exactly the expected properties"
+    );
+}
+
+fn assert_required_fields(doc: &serde_json::Value, schema_pointer: &str, expected: &[&str]) {
+    let actual = doc
+        .pointer(&format!("{schema_pointer}/required"))
+        .and_then(|value| value.as_array())
+        .unwrap_or_else(|| panic!("{schema_pointer} should declare required fields"))
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("required field names must be strings")
+        })
+        .collect::<BTreeSet<_>>();
+    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        actual, expected,
+        "{schema_pointer} should require exactly the expected fields"
+    );
+}
+
+fn assert_fixed_bool_property(
+    doc: &serde_json::Value,
+    schema_pointer: &str,
+    property: &str,
+    expected: bool,
+) {
+    let property_schema_pointer = format!("{schema_pointer}/properties/{property}");
+    let property_schema = doc
+        .pointer(&property_schema_pointer)
+        .unwrap_or_else(|| panic!("{property_schema_pointer} should exist"));
+    let enum_values = property_schema
+        .get("enum")
+        .and_then(|value| value.as_array())
+        .map(Vec::as_slice)
+        .or_else(|| property_schema.get("const").map(std::slice::from_ref));
+
+    assert!(
+        enum_values.is_some_and(|values| values == [serde_json::Value::Bool(expected)]),
+        "{property_schema_pointer} must be fixed to {expected}; got {property_schema:?}"
+    );
+}
+
+fn assert_nullable_schema(doc: &serde_json::Value, schema_pointer: &str) {
+    let schema = doc
+        .pointer(schema_pointer)
+        .unwrap_or_else(|| panic!("{schema_pointer} should exist"));
+    let nullable = schema
+        .get("nullable")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        || schema
+            .get("type")
+            .and_then(|value| value.as_array())
+            .is_some_and(|types| types.iter().any(|value| value.as_str() == Some("null")))
+        || schema
+            .get("anyOf")
+            .and_then(|value| value.as_array())
+            .is_some_and(|variants| variants.iter().any(serde_json::Value::is_null));
+
+    assert!(nullable, "{schema_pointer} should allow null");
+}
+
 // --- Stage 7 Security Review: regression guards for auth-correct OpenAPI exposure ---
 
 #[test]
@@ -508,9 +908,9 @@ fn health_endpoint_has_no_security_requirement() {
     }
 }
 
-/// Security review: only runtime membership management may appear under `/internal/*`.
+/// Security review: only explicitly supported internal contracts may appear under `/internal/*`.
 #[test]
-fn openapi_membership_paths_are_the_only_documented_internal_contracts() {
+fn openapi_documents_only_canonical_internal_contracts() {
     let doc = openapi_json();
     let paths = doc
         .get("paths")
@@ -521,13 +921,13 @@ fn openapi_membership_paths_are_the_only_documented_internal_contracts() {
         .keys()
         .filter(|path| {
             path.starts_with("/internal/")
-                && !crate::openapi::DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS.contains(&path.as_str())
+                && !crate::openapi::DOCUMENTED_INTERNAL_PATHS.contains(&path.as_str())
         })
         .collect();
 
     assert!(
         unexpected_internal_paths.is_empty(),
-        "only membership internal paths may appear in the public spec, found: {:?}",
+        "only canonical internal paths may appear in the public spec, found: {:?}",
         unexpected_internal_paths
     );
 }

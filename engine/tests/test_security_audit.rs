@@ -1267,7 +1267,12 @@ async fn a05_public_health_uses_explicit_metadata_denylist() {
     assert_eq!(body["status"], json!("ok"));
     assert_eq!(
         body["build"],
-        serde_json::to_value(flapjack::build_info()).unwrap()
+        json!({
+            "schemaVersion": flapjack::build_info().schema_version,
+            "version": flapjack::build_info().version,
+            "profile": flapjack::build_info().profile,
+            "capabilities": flapjack::build_info().capabilities,
+        })
     );
     assert_eq!(body["version"], body["build"]["version"]);
     assert!(body["active_writers"].is_number());

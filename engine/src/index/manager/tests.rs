@@ -1,7 +1,10 @@
+use super::write::WriteAdmissionCheckpoint;
 use super::*;
 use crate::index::memory::{MemoryBudget, MemoryBudgetConfig};
 use crate::index::rules::GeneratedFacetFilter;
-use crate::index::write_queue::admission::{WriteAdmissionRecord, WriteAdmissionStore};
+use crate::index::write_queue::admission::{
+    WriteAdmissionRecord, WriteAdmissionStore, WriteAdmissionTicket,
+};
 use crate::index::write_queue::WriteOp;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -118,6 +121,10 @@ fn tenant_admission_record_count(base_path: &Path, tenant_id: &str) -> usize {
         .count()
 }
 
+fn write_admission_ticket(tenant_id: &str) -> WriteAdmissionTicket {
+    WriteAdmissionTicket::new(tenant_id.to_string(), publication::PublicationEpoch(0))
+}
+
 fn write_corrupt_complete_admission_record(base_path: &Path, tenant_id: &str) {
     let admission_dir = base_path.join(tenant_id).join("write_admission");
     std::fs::create_dir_all(&admission_dir).unwrap();
@@ -166,6 +173,7 @@ fn write_admission_checksum_round_trips_nested_float_payloads() {
 
     store
         .append_record(WriteAdmissionRecord::new(
+            write_admission_ticket(tenant_id),
             "task_float_checksum".to_string(),
             1,
             400,
@@ -229,6 +237,12 @@ impl AdmissionCapacityEntryPoint {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum InvalidEpochAdmission {
+    Closed,
+    Stale,
+}
+
 fn assert_queue_full_preserves_pre_admission_state(
     entry_point: AdmissionCapacityEntryPoint,
     temp_dir: &TempDir,
@@ -265,6 +279,84 @@ fn assert_queue_full_preserves_pre_admission_state(
     );
 }
 
+fn advance_epoch_after_first_capture(
+    base_path: &Path,
+    tenant_id: &str,
+    target: publication::PublicationTarget,
+) -> super::write::WriteAdmissionCheckpointHookGuard {
+    let advanced = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let base_path = base_path.to_path_buf();
+    let tenant_id = tenant_id.to_string();
+    IndexManager::set_write_admission_checkpoint_hook_for_test({
+        let advanced = std::sync::Arc::clone(&advanced);
+        move |checkpoint_tenant, checkpoint| {
+            if checkpoint_tenant == tenant_id
+                && checkpoint == WriteAdmissionCheckpoint::Captured
+                && !advanced.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let fence = publication::compare_and_advance_publication_epoch(
+                    &base_path,
+                    &target,
+                    publication::PublicationEpoch(0),
+                )
+                .unwrap();
+                drop(fence);
+            }
+        }
+    })
+}
+
+fn assert_queue_full_wins_over_invalid_epoch(invalid_epoch: InvalidEpochAdmission) {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_queue_full_invalid_epoch";
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+    fill_write_queue_without_admission(&manager, tenant_id);
+    let target = publication::PublicationTarget::new(tenant_id).unwrap();
+    let _hook = match invalid_epoch {
+        InvalidEpochAdmission::Closed => None,
+        InvalidEpochAdmission::Stale => Some(advance_epoch_after_first_capture(
+            temp_dir.path(),
+            tenant_id,
+            target.clone(),
+        )),
+    };
+    let _fence = match invalid_epoch {
+        InvalidEpochAdmission::Closed => Some(
+            publication::compare_and_advance_publication_epoch(
+                temp_dir.path(),
+                &target,
+                publication::PublicationEpoch(0),
+            )
+            .unwrap(),
+        ),
+        InvalidEpochAdmission::Stale => None,
+    };
+    let before_keys = tenant_task_key_snapshot(&manager, tenant_id);
+    let before_records = tenant_admission_record_count(temp_dir.path(), tenant_id);
+
+    let result = manager.delete_documents(tenant_id, vec!["full_invalid_epoch_doc".to_string()]);
+
+    assert!(
+        matches!(result, Err(FlapjackError::QueueFull)),
+        "QueueFull must win over {invalid_epoch:?} epoch rejection when the existing queue is already full, got {result:?}"
+    );
+    assert_eq!(
+        tenant_task_key_snapshot(&manager, tenant_id),
+        before_keys,
+        "QueueFull precedence failure must not allocate task aliases"
+    );
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        before_records,
+        "QueueFull precedence failure must not append admission records"
+    );
+    assert!(
+        manager.abort_tenant_write_task_for_test(tenant_id),
+        "capacity precedence probe must use the existing tenant write_queue"
+    );
+}
+
 fn fill_write_queue_without_admission(manager: &IndexManager, tenant_id: &str) {
     let index = manager.get_or_load(tenant_id).unwrap();
     let tx = manager
@@ -282,6 +374,130 @@ fn fill_write_queue_without_admission(manager: &IndexManager, tenant_id: &str) {
         }
     }
     panic!("capacity prefill did not reach QueueFull");
+}
+
+struct EpochAdmissionConcurrencyHarness {
+    first_validated_rx: std::sync::mpsc::Receiver<()>,
+    release_first_tx: std::sync::mpsc::Sender<()>,
+    stale_captured_rx: std::sync::mpsc::Receiver<()>,
+    release_stale_tx: std::sync::mpsc::Sender<()>,
+    admitted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    refused: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    _hook: super::write::WriteAdmissionCheckpointHookGuard,
+}
+
+impl EpochAdmissionConcurrencyHarness {
+    fn new(tenant_id: &'static str) -> Self {
+        let (first_validated_tx, first_validated_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let release_first_rx = std::sync::Arc::new(std::sync::Mutex::new(release_first_rx));
+        let (stale_captured_tx, stale_captured_rx) = std::sync::mpsc::channel();
+        let (release_stale_tx, release_stale_rx) = std::sync::mpsc::channel();
+        let release_stale_rx = std::sync::Arc::new(std::sync::Mutex::new(release_stale_rx));
+        let target_captures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let target_validations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refused = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook = IndexManager::set_write_admission_checkpoint_hook_for_test({
+            let release_first_rx = std::sync::Arc::clone(&release_first_rx);
+            let release_stale_rx = std::sync::Arc::clone(&release_stale_rx);
+            let target_captures = std::sync::Arc::clone(&target_captures);
+            let target_validations = std::sync::Arc::clone(&target_validations);
+            move |checkpoint_tenant, checkpoint| {
+                if checkpoint_tenant != tenant_id {
+                    return;
+                }
+                match checkpoint {
+                    WriteAdmissionCheckpoint::Captured => {
+                        if target_captures.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                            stale_captured_tx.send(()).unwrap();
+                            release_stale_rx.lock().unwrap().recv().unwrap();
+                        }
+                    }
+                    WriteAdmissionCheckpoint::Validated => {
+                        if target_validations.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                        {
+                            first_validated_tx.send(()).unwrap();
+                            release_first_rx.lock().unwrap().recv().unwrap();
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            first_validated_rx,
+            release_first_tx,
+            stale_captured_rx,
+            release_stale_tx,
+            admitted,
+            refused,
+            _hook: hook,
+        }
+    }
+
+    fn wait_for_first_validated_guard(&self) {
+        self.first_validated_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first admission must pause while holding a validated guard");
+    }
+
+    fn wait_for_stale_old_epoch_capture(&self) {
+        self.stale_captured_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second admission must pause after capturing the old epoch");
+    }
+
+    fn release_first_admission(&self) {
+        self.release_first_tx.send(()).unwrap();
+    }
+
+    fn release_stale_admission(&self) {
+        self.release_stale_tx.send(()).unwrap();
+    }
+
+    fn record_admitted(&self) {
+        self.admitted
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn record_refused(&self) {
+        self.refused
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn assert_nonzero_class_counts(&self) {
+        assert!(
+            self.admitted.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "admitted class denominator must be non-zero"
+        );
+        assert!(
+            self.refused.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "refused class denominator must be non-zero"
+        );
+    }
+}
+
+fn spawn_epoch_advance(
+    base_path: PathBuf,
+    tenant_id: &'static str,
+) -> (
+    std::sync::mpsc::Receiver<publication::PublicationEpoch>,
+    std::thread::JoinHandle<()>,
+) {
+    let target = publication::PublicationTarget::new(tenant_id).unwrap();
+    let (advance_tx, advance_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let fence = publication::compare_and_advance_publication_epoch(
+            &base_path,
+            &target,
+            publication::PublicationEpoch(0),
+        )
+        .unwrap();
+        let advanced = fence.advanced();
+        drop(fence);
+        advance_tx.send(advanced).unwrap();
+    });
+    (advance_rx, handle)
 }
 
 fn tenant_tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
@@ -692,6 +908,7 @@ async fn legacy_persistent_admission_task_replays_after_restart_window() {
     let store = WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap();
     store
         .append_record(WriteAdmissionRecord::new(
+            write_admission_ticket(tenant_id),
             task_id,
             numeric_id,
             1,
@@ -838,6 +1055,147 @@ async fn live_write_admission_bypasses_persistence_and_keeps_manager_contract() 
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(flapjack_write_durable_timeout_env)]
+async fn durable_add_documents_persists_replayable_admission_until_commit() {
+    let _writer_timeout_guard = WriteQueueWriterAcquireTimeoutEnvGuard::set("5000");
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "durable_admission_until_commit";
+    let object_id = "durable_admission_doc";
+    let expected_title = "durable admission coverage";
+    let tenant_path = temp_dir.path().join(tenant_id);
+    std::fs::create_dir_all(&tenant_path).unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let index = Arc::new(
+        Index::create_with_budget(
+            &tenant_path,
+            crate::index::schema::Schema::builder().build(),
+            Arc::new(MemoryBudget::new(MemoryBudgetConfig {
+                max_concurrent_writers: 1,
+                ..Default::default()
+            })),
+        )
+        .unwrap(),
+    );
+    manager
+        .loaded
+        .insert(tenant_id.to_string(), Arc::clone(&index));
+    let held_writer = index
+        .writer()
+        .expect("test precondition: held writer must keep durable commit pending");
+
+    let durable_write = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        async move {
+            manager
+                .add_documents_durable(
+                    tenant_id,
+                    vec![write_queue_test_document(object_id, expected_title)],
+                )
+                .await
+        }
+    });
+
+    let task = wait_for_single_enqueued_tenant_task(&manager, tenant_id).await;
+    let store = WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap();
+    let records = store.load_records().unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "durable admission must persist exactly one replayable record before commit"
+    );
+    let record = records.first().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let record_path = temp_dir
+            .path()
+            .join(tenant_id)
+            .join("write_admission")
+            .join(format!("{:020}.json", record.sequence));
+        let mode = std::fs::metadata(&record_path)
+            .expect("durable admission record must remain present before commit")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "durable admission records contain full document bodies and must not be group- or world-readable; mode was {mode:o}"
+        );
+    }
+    assert_eq!(
+        record.task_id, task.id,
+        "durable admission record must use the enqueued canonical task id"
+    );
+    assert_eq!(
+        record.numeric_id, task.numeric_id,
+        "durable admission record must use the enqueued numeric task id"
+    );
+    assert_eq!(record.received_documents, 1);
+    match record.actions.as_slice() {
+        [WriteAction::Upsert(document)] => {
+            assert_eq!(
+                document.id, object_id,
+                "durable admission record must preserve the upsert object id"
+            );
+            assert!(
+                matches!(
+                    document.fields.get("title"),
+                    Some(FieldValue::Text(title)) if title == expected_title
+                ),
+                "durable admission record must preserve the upsert document fields"
+            );
+        }
+        actions => panic!("durable admission must persist one Upsert action, got {actions:?}"),
+    }
+
+    drop(held_writer);
+    let committed_task = durable_write
+        .await
+        .expect("durable write task must not panic")
+        .expect("durable write must succeed after writer release");
+    assert_eq!(committed_task.id, task.id);
+    let document = manager
+        .get_document(tenant_id, object_id)
+        .unwrap()
+        .expect("durable write must index the document after writer release");
+    assert!(
+        matches!(
+            document.fields.get("title"),
+            Some(FieldValue::Text(title)) if title == expected_title
+        ),
+        "durable write must preserve the indexed document fields"
+    );
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        0,
+        "successful durable commit must clean up its admission record"
+    );
+}
+
+async fn wait_for_single_enqueued_tenant_task(manager: &IndexManager, tenant_id: &str) -> TaskInfo {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let tasks = manager.tenant_tasks_snapshot_for_test(tenant_id);
+        if tasks.len() == 1 {
+            let task = tasks.into_iter().next().unwrap();
+            assert!(
+                matches!(task.status, TaskStatus::Enqueued),
+                "durable admission checkpoint must observe one enqueued task before writer release, got {:?}",
+                task.status
+            );
+            return task;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for one durable admission task; observed {} tasks",
+            tasks.len()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn durable_add_documents_write_queue_full_returns_queue_full_before_ack_wait() {
     let temp_dir = TempDir::new().unwrap();
     let tenant_id = "durable_write_queue_capacity";
@@ -926,6 +1284,205 @@ async fn every_write_queue_entrypoint_reserves_capacity_before_task_or_admission
         let temp_dir = TempDir::new().unwrap();
         assert_queue_full_preserves_pre_admission_state(entry_point, &temp_dir);
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(write_admission_checkpoint_hook)]
+async fn full_write_queue_preserves_queue_full_over_invalid_epoch_rejection() {
+    for invalid_epoch in [InvalidEpochAdmission::Closed, InvalidEpochAdmission::Stale] {
+        assert_queue_full_wins_over_invalid_epoch(invalid_epoch);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn every_write_queue_entrypoint_rejects_closed_epoch_before_task_or_admission_allocation() {
+    for entry_point in [
+        AdmissionCapacityEntryPoint::Insert,
+        AdmissionCapacityEntryPoint::Upsert,
+        AdmissionCapacityEntryPoint::ReplicationAdd,
+        AdmissionCapacityEntryPoint::Delete,
+        AdmissionCapacityEntryPoint::ReplicationDelete,
+        AdmissionCapacityEntryPoint::Compact,
+    ] {
+        let temp_dir = TempDir::new().unwrap();
+        let tenant_id = "write_queue_epoch_closed_table";
+        let manager = IndexManager::new(temp_dir.path());
+        manager.create_tenant(tenant_id).unwrap();
+        let target = publication::PublicationTarget::new(tenant_id).unwrap();
+        let fence = publication::compare_and_advance_publication_epoch(
+            temp_dir.path(),
+            &target,
+            publication::PublicationEpoch(0),
+        )
+        .unwrap();
+        let before_keys = tenant_task_key_snapshot(&manager, tenant_id);
+        let before_records = tenant_admission_record_count(temp_dir.path(), tenant_id);
+
+        let result = entry_point.admit(&manager, tenant_id);
+
+        assert!(
+            matches!(result, Err(FlapjackError::IndexPaused(ref index)) if index == tenant_id),
+            "{entry_point:?} must map a closed epoch fence to IndexPaused before task allocation, got {result:?}"
+        );
+        assert_eq!(
+            tenant_task_key_snapshot(&manager, tenant_id),
+            before_keys,
+            "{entry_point:?} closed epoch fence must not allocate task aliases"
+        );
+        assert_eq!(
+            tenant_admission_record_count(temp_dir.path(), tenant_id),
+            before_records,
+            "{entry_point:?} closed epoch fence must not append an admission record"
+        );
+        assert!(
+            !manager.abort_tenant_write_task_for_test(tenant_id),
+            "closed-fence rejection must not create or spawn the tenant write_queue"
+        );
+        drop(fence);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(write_admission_checkpoint_hook)]
+async fn every_write_queue_entrypoint_rejects_stale_epoch_before_task_or_admission_allocation() {
+    for entry_point in [
+        AdmissionCapacityEntryPoint::Insert,
+        AdmissionCapacityEntryPoint::Upsert,
+        AdmissionCapacityEntryPoint::ReplicationAdd,
+        AdmissionCapacityEntryPoint::Delete,
+        AdmissionCapacityEntryPoint::ReplicationDelete,
+        AdmissionCapacityEntryPoint::Compact,
+    ] {
+        let temp_dir = TempDir::new().unwrap();
+        let tenant_id = "write_queue_epoch_stale_table";
+        let manager = IndexManager::new(temp_dir.path());
+        manager.create_tenant(tenant_id).unwrap();
+        let target = publication::PublicationTarget::new(tenant_id).unwrap();
+        let advanced = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _hook = IndexManager::set_write_admission_checkpoint_hook_for_test({
+            let base_path = temp_dir.path().to_path_buf();
+            let target = target.clone();
+            let advanced = std::sync::Arc::clone(&advanced);
+            move |checkpoint_tenant, checkpoint| {
+                if checkpoint_tenant == tenant_id
+                    && checkpoint == WriteAdmissionCheckpoint::Captured
+                    && !advanced.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    let fence = publication::compare_and_advance_publication_epoch(
+                        &base_path,
+                        &target,
+                        publication::PublicationEpoch(0),
+                    )
+                    .unwrap();
+                    drop(fence);
+                }
+            }
+        });
+        let before_keys = tenant_task_key_snapshot(&manager, tenant_id);
+        let before_records = tenant_admission_record_count(temp_dir.path(), tenant_id);
+
+        let result = entry_point.admit(&manager, tenant_id);
+
+        assert!(
+            matches!(result, Err(FlapjackError::IndexPaused(ref index)) if index == tenant_id),
+            "{entry_point:?} must map a stale epoch observation to IndexPaused before task allocation, got {result:?}"
+        );
+        assert_eq!(
+            tenant_task_key_snapshot(&manager, tenant_id),
+            before_keys,
+            "{entry_point:?} stale epoch must not allocate task aliases"
+        );
+        assert_eq!(
+            tenant_admission_record_count(temp_dir.path(), tenant_id),
+            before_records,
+            "{entry_point:?} stale epoch must not append an admission record"
+        );
+        assert!(
+            !manager.abort_tenant_write_task_for_test(tenant_id),
+            "stale-fence rejection must not create or spawn the tenant write_queue"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(write_admission_checkpoint_hook)]
+async fn write_queue_epoch_admission_linearizes_between_stale_capture_and_exclusive_advance() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_queue_epoch_concurrency";
+    let unrelated_tenant = "write_queue_epoch_unrelated";
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+    manager.create_tenant(unrelated_tenant).unwrap();
+    let harness = EpochAdmissionConcurrencyHarness::new(tenant_id);
+
+    let first_manager = std::sync::Arc::clone(&manager);
+    let first = tokio::task::spawn(async move {
+        first_manager.add_documents(
+            tenant_id,
+            vec![write_queue_test_document("first_epoch_doc", "old epoch")],
+        )
+    });
+    harness.wait_for_first_validated_guard();
+
+    let (advance_rx, advance) = spawn_epoch_advance(temp_dir.path().to_path_buf(), tenant_id);
+    assert!(
+        advance_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "exclusive epoch advance must wait behind a validated admission guard"
+    );
+
+    let stale_manager = std::sync::Arc::clone(&manager);
+    let stale = tokio::task::spawn(async move {
+        stale_manager.add_documents(
+            tenant_id,
+            vec![write_queue_test_document("stale_epoch_doc", "stale epoch")],
+        )
+    });
+    harness.wait_for_stale_old_epoch_capture();
+
+    let unrelated = manager
+        .add_documents(
+            unrelated_tenant,
+            vec![write_queue_test_document(
+                "unrelated_epoch_doc",
+                "unrelated target",
+            )],
+        )
+        .expect("unrelated target admission must not wait on another target epoch");
+    assert!(tenant_task_snapshot_contains(
+        &manager,
+        unrelated_tenant,
+        &unrelated.id
+    ));
+    harness.record_admitted();
+
+    harness.release_first_admission();
+    let first_task = first.await.unwrap().unwrap();
+    assert!(tenant_task_snapshot_contains(
+        &manager,
+        tenant_id,
+        &first_task.id
+    ));
+    harness.record_admitted();
+    assert_eq!(
+        advance_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        publication::PublicationEpoch(1)
+    );
+    advance.join().unwrap();
+
+    let target_keys_before_stale_validation = tenant_task_key_snapshot(&manager, tenant_id);
+    harness.release_stale_admission();
+    let stale_result = stale.await.unwrap();
+    assert!(
+        matches!(stale_result, Err(FlapjackError::IndexPaused(ref index)) if index == tenant_id),
+        "stale admission must be refused as IndexPaused with no task ID, got {stale_result:?}"
+    );
+    harness.record_refused();
+    assert_eq!(
+        tenant_task_key_snapshot(&manager, tenant_id),
+        target_keys_before_stale_validation,
+        "stale admission must not allocate task aliases after epoch advance"
+    );
+    harness.assert_nonzero_class_counts();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1121,6 +1678,7 @@ async fn write_queue_replay_failure_blocks_startup_before_live_admission() {
     let store = WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap();
     store
         .append_record(WriteAdmissionRecord::new(
+            write_admission_ticket(tenant_id),
             format!("task_{}_pending", tenant_id),
             10_001,
             1,
@@ -1180,6 +1738,7 @@ fn write_admission_append_uses_recovered_sequence_state_without_scanning() {
     let initial_store = WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap();
     initial_store
         .append_record(WriteAdmissionRecord::new(
+            write_admission_ticket(tenant_id),
             format!("task_{tenant_id}_recovered"),
             19_999,
             1,
@@ -1201,6 +1760,7 @@ fn write_admission_append_uses_recovered_sequence_state_without_scanning() {
         .map(|(offset, suffix)| {
             recovered_store
                 .append_record(WriteAdmissionRecord::new(
+                    write_admission_ticket(tenant_id),
                     format!("task_{tenant_id}_{suffix}"),
                     20_000 + offset as i64,
                     1,
@@ -1232,6 +1792,7 @@ fn write_admission_first_directory_create_requires_tenant_directory_sync() {
     std::fs::set_permissions(&tenant_path, std::fs::Permissions::from_mode(0o300)).unwrap();
 
     let result = store.append_record(WriteAdmissionRecord::new(
+        write_admission_ticket(tenant_id),
         format!("task_{}_first", tenant_id),
         20_001,
         1,
@@ -1256,6 +1817,7 @@ fn write_admission_first_directory_create_requires_tenant_directory_sync() {
     let retry_task_id = format!("task_{}_retry", tenant_id);
     let retry_record = store
         .append_record(WriteAdmissionRecord::new(
+            write_admission_ticket(tenant_id),
             retry_task_id.clone(),
             20_002,
             1,
@@ -1286,6 +1848,7 @@ fn write_admission_last_directory_remove_requires_tenant_directory_sync() {
     let store = WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap();
     store
         .append_record(WriteAdmissionRecord::new(
+            write_admission_ticket(tenant_id),
             format!("task_{}_last", tenant_id),
             20_002,
             1,
@@ -1317,6 +1880,7 @@ fn write_admission_remove_directory_failure_restores_record() {
     let task_id = format!("task_{tenant_id}_last");
     store
         .append_record(WriteAdmissionRecord::new(
+            write_admission_ticket(tenant_id),
             task_id.clone(),
             25_001,
             1,
@@ -1367,6 +1931,7 @@ fn write_admission_batch_cleanup_failure_preserves_all_replayable_records() {
     for (offset, task_id) in task_ids.iter().enumerate() {
         store
             .append_record(WriteAdmissionRecord::new(
+                write_admission_ticket(tenant_id),
                 task_id.clone(),
                 30_000 + offset as i64,
                 1,
@@ -1413,6 +1978,7 @@ fn write_queue_admission_append_and_last_record_removal_are_atomic() {
     let removed_task_id = format!("task_{tenant_id}_removed");
     store
         .append_record(WriteAdmissionRecord::new(
+            write_admission_ticket(tenant_id),
             removed_task_id.clone(),
             40_001,
             1,
@@ -1438,6 +2004,7 @@ fn write_queue_admission_append_and_last_record_removal_are_atomic() {
     store.set_lifecycle_contention_hook(move || append_contended_tx.send(()).unwrap());
     let append = std::thread::spawn(move || {
         append_store.append_record(WriteAdmissionRecord::new(
+            write_admission_ticket(tenant_id),
             append_task_id,
             40_002,
             1,
@@ -1506,6 +2073,7 @@ fn write_queue_admission_concurrent_appends_coalesce_into_one_durable_flush() {
             let store = Arc::clone(&store);
             std::thread::spawn(move || {
                 store.append_record(WriteAdmissionRecord::new(
+                    write_admission_ticket(tenant_id),
                     format!("task_group_commit_{offset}"),
                     50_000 + offset as i64,
                     1,
@@ -1582,6 +2150,7 @@ async fn write_queue_committed_unpruned_admission_reconciles_without_reapplying(
     let store = WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap();
     store
         .append_record(WriteAdmissionRecord::new(
+            write_admission_ticket(tenant_id),
             task.id.clone(),
             task.numeric_id,
             1,
@@ -1746,6 +2315,7 @@ async fn legacy_compact_admission_cleanup_failure_does_not_report_success() {
     let store = WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap();
     store
         .append_record(WriteAdmissionRecord::new(
+            write_admission_ticket(tenant_id),
             task_id.clone(),
             numeric_id,
             0,

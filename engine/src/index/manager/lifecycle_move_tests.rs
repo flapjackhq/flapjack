@@ -151,6 +151,64 @@ async fn move_index_removes_destination_sidecars_absent_from_source() {
 }
 
 #[tokio::test]
+async fn move_index_replaces_destination_documents_without_replaying_destination_tail() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant("source").unwrap();
+    manager.create_tenant("destination").unwrap();
+    manager
+        .add_documents_sync(
+            "source",
+            vec![Document {
+                id: "source_document".to_string(),
+                fields: HashMap::from([(
+                    "title".to_string(),
+                    FieldValue::Text("source searchable".to_string()),
+                )]),
+            }],
+        )
+        .await
+        .unwrap();
+    manager
+        .add_documents_sync(
+            "destination",
+            vec![Document {
+                id: "destination_seed".to_string(),
+                fields: HashMap::from([(
+                    "title".to_string(),
+                    FieldValue::Text("destination seed".to_string()),
+                )]),
+            }],
+        )
+        .await
+        .unwrap();
+    manager
+        .add_documents_sync(
+            "destination",
+            vec![Document {
+                id: "destination_tail".to_string(),
+                fields: HashMap::from([(
+                    "title".to_string(),
+                    FieldValue::Text("destination tail".to_string()),
+                )]),
+            }],
+        )
+        .await
+        .unwrap();
+
+    manager.move_index("source", "destination").await.unwrap();
+
+    assert!(manager
+        .get_document("destination", "source_document")
+        .unwrap()
+        .is_some());
+    assert!(manager
+        .get_document("destination", "destination_tail")
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn replace_index_contents_preserves_destination_target_keyed_sidecars() {
     let temp_dir = TempDir::new().unwrap();
     let manager = IndexManager::new(temp_dir.path());
@@ -158,9 +216,12 @@ async fn replace_index_contents_preserves_destination_target_keyed_sidecars() {
     create_tenant(&manager, "destination", "old").await;
     write_sidecars(temp_dir.path(), "destination", "control");
     let expected_sidecars = sidecar_bytes(temp_dir.path(), "destination");
+    let staging_baseline = manager
+        .capture_replacement_staging_baseline("destination")
+        .unwrap();
 
     manager
-        .replace_index_contents("staging", "destination")
+        .replace_index_contents("staging", "destination", staging_baseline)
         .await
         .unwrap();
 

@@ -2,7 +2,7 @@
 
 Single maintained status ledger for Flapjack. Shipped feature status, current production-readiness state, and post-launch work are owned in this document.
 
-**Last updated: 2026-07-18 (Algolia create-only migration is shipped and joined; deferred overwrite, async jobs, and HA import remain routed through `ROADMAP.md`.)**
+**Last updated: 2026-07-23 (dead-node auto-heal is documented as a bounded default-off HA engine capability; prior 2026-07-18 context: Algolia create-only migration is shipped and joined, with deferred overwrite, async jobs, and HA import routed through `ROADMAP.md`.)**
 
 - 2026-05-31 stage note: `FLAPJACK_WRITE_QUEUE_BATCH_SIZE` is now runtime-configurable with default-preserving behavior (`32` fallback). See [`3_IMPLEMENTATION/OPS_CONFIGURATION.md`](3_IMPLEMENTATION/OPS_CONFIGURATION.md) for full operator semantics.
 
@@ -140,6 +140,12 @@ All shipped capability status lives in the feature tables below (Search, Indexin
 | CJK tokenization | ✅ | |
 | Language-specific stemming | ✅ | |
 
+## High Availability
+
+| Feature | Status | Notes |
+|---|---|---|
+| Dead-node auto-heal | ✅ Bounded / default-off | Opt-in with `FLAPJACK_AUTOHEAL_ENABLED=true`. The engine evicts at most one sustained-unreachable peer after the fixed three-observation threshold only when the local quorum guard remains satisfied, records refusals/evictions/readmissions in `${FLAPJACK_DATA_DIR}/autoheal_decisions.jsonl`, readmits returning healthy candidates with startup catch-up before authoritative reads, and exposes `autoheal_enabled` plus `autoheal_peers` on admin-only `/internal/cluster/status`. See [Dead-node auto-heal](3_IMPLEMENTATION/OPERATIONS.md#scenario-dead-node-auto-heal) and [Replication configuration](3_IMPLEMENTATION/OPS_CONFIGURATION.md#replication). Excludes consensus, majority writes, arbitrary partition healing, simultaneous majority-loss recovery, UI workflow, and CRD/controller lifecycle management. |
+
 ## Indexing & Records
 
 | Feature | Status | Notes |
@@ -192,7 +198,7 @@ All shipped capability status lives in the feature tables below (Search, Indexin
 | Analytics API (top queries, no-results, no-clicks) | ✅ | |
 | Events / Insights API | ✅ | click, conversion, view events with position tracking |
 | Event Debugger | ✅ | Per-index event stream inspection |
-| A/B Testing (experiments) | ✅ | Traffic split, variant tracking, winner selection |
+| A/B Testing (experiments) | ✅ | Traffic split, variant tracking, winner selection. List filtering uses exact `indexName` matching separately from `indexPrefix`/`indexSuffix`; owner: `engine/flapjack-http/src/handlers/experiments/mod.rs::list_experiments`. |
 | Usage metering | ✅ | Per-key, per-index operation counts |
 | Analytics retention cleanup | ✅ | Partition-based retention cleanup is configurable with `FLAPJACK_ANALYTICS_RETENTION_DAYS`, defaults to 90 days, skips malformed/non-partition paths, and is covered by deterministic cutoff tests. |
 | Durable analytics rollup storage | ✅ | Rollup writer + query planner fallback + certified-coverage retention gate are shipped. Proof: `engine/src/analytics/writer.rs` (rollup writer), `engine/src/analytics/query/mod.rs` (rollup planner with raw fallback), `engine/src/analytics/retention.rs` + `engine/src/analytics/manifest.rs` (certified-coverage delete gate), `engine/loadtest/soak_proof.sh` (soak evidence flow). Rollout design and test-citation details are retained in private stage evidence. |
@@ -235,6 +241,7 @@ All shipped capability status lives in the feature tables below (Search, Indexin
 | Multi-tenant isolation | ✅ | Per-tenant memory limits (31 MB buffer, 40 concurrent writers) |
 | Oplog replication + startup catch-up | ✅ | Peer oplog replication with pre-serve catch-up (`run_pre_serve_catchup`) |
 | S3 snapshots | ✅ | Single-node snapshot APIs with scheduled backups and empty-dir auto-restore. Verified via MinIO harness in `engine/examples/s3-snapshot/`. |
+| Published operations APIs | ✅ | Engine-owned consumer contract is published in [`operations_consumer_contract.md`](operations_consumer_contract.md) for `/health`, `/internal/status`, `/internal/cluster/status`, and `/internal/snapshots/capability`. Snapshot capability reports `not_configured` or `configured_unverified`; `configured_unverified` means config exists, not that credentials, bucket existence, or reachability were verified. |
 | SSL / TLS | ✅ | Let's Encrypt ACME automation |
 | OpenAPI spec | ✅ | Auto-generated via utoipa; includes recommend, personalization, and experiments routes with coverage in both `openapi_export_tests` and `openapi::tests`. |
 | Memory safety | ✅ | OOM-proof: BufferSizeExceeded → 429, DocumentTooLarge → drop |
@@ -276,18 +283,18 @@ Env-var details for operational behavior are canonical in
 | InstantSearch iOS | ✅ | Via Swift client + Swift smoke |
 | Autocomplete.js | ✅ | |
 
-## Algolia migration (`/1/migrate-from-algolia`) — CREATE-ONLY SHIPPED
+## Algolia migration (`/1/migrate-from-algolia`) — NODE-LOCAL SYNC OVERWRITE SHIPPED
 
-**Status as of 2026-07-18: create-only Algolia migration is joined end-to-end.** The synchronous endpoint exports a source index, translates documents/settings/synonyms/rules, publishes a fresh target index, and reports counts that are backed by the target index listing. `overwrite=true`, async status/cancel/resume, and HA-converging import remain deferred in [`ROADMAP.md`](../../ROADMAP.md) rows `MIG-5`, `MIG-6`, and `MIG-7`. `MIG-4` is a separate publication-repair proof row, not part of this migration capability.
+**Status as of 2026-07-24: node-local synchronous Algolia migration supports create-only import and `overwrite=true` replacement.** The synchronous endpoint exports a source index, translates documents/settings/synonyms/rules, publishes a fresh target index by default, replaces an existing target only on the node-local synchronous path when `overwrite=true`, and reports counts backed by the target index listing. Async overwrite and HA import remain refused; resume and HA-converging import remain deferred in [`ROADMAP.md`](../../ROADMAP.md) rows `MIG-6` and `MIG-7`. `MIG-4` is a separate publication-repair proof row, not part of this migration capability.
 
 | Leg | Status | Owner |
 |---|---|---|
 | Source export: Algolia → durable on-disk spool (checkpointed, resumable) | ✅ Shipped | `engine/flapjack-http/src/handlers/migration/{algolia_client,source_reader,export,spool}.rs` |
 | Translation: spool → Flapjack documents/settings/synonyms/rules | ✅ Shipped | `engine/flapjack-http/src/handlers/migration/translation.rs` |
-| Import: translated content → target index via staged publication | ✅ Shipped for create-only targets | `engine/flapjack-http/src/handlers/migration/import.rs`; `engine/flapjack-http/src/handlers/migration/mod.rs::migrate_from_algolia` |
+| Import: translated content → target index via staged publication | ✅ Shipped for create-only and node-local synchronous overwrite | `engine/flapjack-http/src/handlers/migration/import.rs`; `engine/flapjack-http/src/handlers/migration/mod.rs::migrate_from_algolia` |
 | Staged publication primitive (crash-safe, node-local) | ✅ Shipped | `engine/src/index/manager/publication.rs` |
 | Dashboard `Migrate` page | ✅ Shipped and proven for create-only migration | `engine/dashboard/src/pages/Migrate.tsx`; `engine/dashboard/tests/e2e-ui/full/migrate-algolia.spec.ts` |
-| **Backend ↔ frontend joined end-to-end** | ✅ Create-only path proven with real Algolia credentials | `migrate_from_algolia`; `engine/dashboard/tests/e2e-ui/full/migrate-algolia.spec.ts` |
+| **Backend ↔ frontend joined end-to-end** | ✅ Create-only path proven with real Algolia credentials; node-local sync overwrite shipped at the backend contract | `migrate_from_algolia`; `engine/dashboard/tests/e2e-ui/full/migrate-algolia.spec.ts` |
 
 Replica translation detects topology from the source primary, fetches every named replica's own settings, and carries the derived virtual topology plus translated per-replica settings in the create-only migration bundle. Materialization then creates each derived replica as a settings-only virtual sidecar (no physical copy, by design) whose sort order resolves at query time. This contract is live-proven: on 2026-07-19 a real Algolia application with one `virtual(...)` relevance replica and one standard replica migrated end-to-end with a passing machine-verified receipt (jul18_11am batch) covering fixture seeding, import, sort-order proofs on the primary and both replica indexes, sidecar structure, and exact source cleanup. Remaining fidelity limits stay owned by `ROADMAP.md` MIG-11 and surface as documented migration warnings: standard-replica exhaustive sorting is approximated as a virtual replica, and Algolia `relevancyStrictness` semantics differ from Flapjack's deterministic ranking.
 
@@ -298,14 +305,14 @@ Migration warnings expose the remaining replica fidelity limits:
 - Matching-critical fields that diverge from the primary cannot be reproduced independently by a virtual replica.
 - Algolia and Flapjack use different `relevancyStrictness` scales, and `nbSortedHits` may differ for deterministic queries.
 
-**Current boundary:** the shipped path is create-only. Existing target overwrite returns 409 unless and until `MIG-5` lands. The call is synchronous; no HTTP status, cancel, or resume route exists until `MIG-6`. HA import is refused because staged publication is node-local and no convergence epoch exists; that design remains under `MIG-7`.
+**Current boundary:** node-local synchronous import can create a fresh target or replace an existing target with `overwrite=true`. Async overwrite is refused before job artifacts are created. The async status/cancel route exists, but resume remains deferred to `MIG-6`. HA import is refused because staged publication is node-local and no convergence epoch exists; that design remains under `MIG-7`.
 
 ## Dashboard UI
 
 22 user-facing routes are shipped, backed by 21 lazy-loaded page components, plus the `*` not-found catch-all. No stub pages remain.
 The route inventory spans overview, search/browse, settings, analytics, relevancy controls, security tooling, and migration workflows with no placeholder pages.
 
-**Caveat — route shipped ≠ every migration mode shipped.** The `Migrate` route is a proven browser path when credentials are supplied and `overwrite` is false. Existing-target overwrite, async jobs, and HA import remain deferred through [`ROADMAP.md`](../../ROADMAP.md) rows `MIG-5`, `MIG-6`, and `MIG-7`.
+**Caveat — route shipped ≠ every migration mode shipped.** The `Migrate` route is a proven browser path when credentials are supplied and `overwrite` is false; the backend also ships node-local synchronous `overwrite=true`. Async overwrite, resume, and HA import remain deferred through [`ROADMAP.md`](../../ROADMAP.md) rows `MIG-6` and `MIG-7`.
 
 | Status | Features |
 |---|---|

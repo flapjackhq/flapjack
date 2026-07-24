@@ -1,4 +1,5 @@
 use crate::error::{FlapjackError, Result};
+use crate::index::manager::publication::PublicationEpoch;
 use crate::index::write_queue::{WriteAction, WriteOp};
 use crate::types::{TaskInfo, TaskStatus};
 use serde::{Deserialize, Serialize};
@@ -6,20 +7,53 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::Condvar;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 type LifecycleHook = Box<dyn FnOnce() + Send>;
 
 pub(crate) const WRITE_ADMISSION_DIR: &str = "write_admission";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WriteAdmissionTicket {
+    target: String,
+    observed_epoch: PublicationEpoch,
+}
+
+impl WriteAdmissionTicket {
+    pub(crate) fn new(target: String, observed_epoch: PublicationEpoch) -> Self {
+        Self {
+            target,
+            observed_epoch,
+        }
+    }
+
+    fn evidence(&self) -> WriteAdmissionEpochEvidence {
+        WriteAdmissionEpochEvidence::Observed {
+            target: self.target.clone(),
+            epoch: self.observed_epoch,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum WriteAdmissionEpochEvidence {
+    Observed {
+        target: String,
+        epoch: PublicationEpoch,
+    },
+    #[default]
+    LegacyUnproven,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct WriteAdmissionRecord {
@@ -28,11 +62,14 @@ pub(crate) struct WriteAdmissionRecord {
     pub numeric_id: i64,
     pub received_documents: usize,
     pub created_at_ms: u64,
+    #[serde(default)]
+    pub epoch_evidence: WriteAdmissionEpochEvidence,
     pub actions: Vec<WriteAction>,
 }
 
 impl WriteAdmissionRecord {
     pub(crate) fn new(
+        ticket: WriteAdmissionTicket,
         task_id: String,
         numeric_id: i64,
         received_documents: usize,
@@ -44,6 +81,7 @@ impl WriteAdmissionRecord {
             numeric_id,
             received_documents,
             created_at_ms: system_time_ms(SystemTime::now()),
+            epoch_evidence: ticket.evidence(),
             actions,
         }
     }
@@ -79,7 +117,6 @@ struct WriteAdmissionEnvelope {
 /// flush covers its rename; `append_record` does not return it until then. This
 /// lets concurrent admissions share one directory flush (group commit) instead of
 /// each paying an independent, serialized directory fsync.
-#[cfg(test)]
 struct PendingPublish {
     /// Monotonic publish ticket assigned when the rename completed. A directory
     /// flush that begins after this ticket was staged makes the record durable.
@@ -92,73 +129,53 @@ struct PendingPublish {
 }
 
 struct AdmissionState {
-    #[cfg(test)]
     next_sequence: u64,
     live_record_count: usize,
     /// Monotonic counter of staged records. Assigned under the lifecycle lock so a
     /// directory-flush leader can capture an exact "all renames up to here" bound.
-    #[cfg(test)]
     next_ticket: u64,
     /// Records staged but not yet confirmed durable by a directory flush.
-    #[cfg(test)]
     pending: Vec<PendingPublish>,
     /// Whether a directory flush is currently in progress. Set under the lifecycle
     /// lock before the leader releases it to fsync, so followers wait instead of
     /// issuing a redundant flush.
-    #[cfg(test)]
     flush_in_progress: bool,
 }
 
 impl AdmissionState {
     fn empty() -> Self {
         Self {
-            #[cfg(test)]
             next_sequence: 1,
             live_record_count: 0,
-            #[cfg(test)]
             next_ticket: 0,
-            #[cfg(test)]
             pending: Vec::new(),
-            #[cfg(test)]
             flush_in_progress: false,
         }
     }
 
     fn recovered(records: &[WriteAdmissionRecord]) -> Result<Self> {
-        #[cfg(not(test))]
-        {
-            Ok(Self {
-                live_record_count: records.len(),
-            })
-        }
-
-        #[cfg(test)]
-        {
-            let Some(recovered_max_sequence) = records.iter().map(|record| record.sequence).max()
-            else {
-                return Ok(Self::empty());
-            };
-            let next_sequence = recovered_max_sequence.checked_add(1).ok_or_else(|| {
-                FlapjackError::Io("write admission sequence space is exhausted".to_string())
-            })?;
-            Ok(Self {
-                next_sequence,
-                live_record_count: records.len(),
-                next_ticket: 0,
-                pending: Vec::new(),
-                flush_in_progress: false,
-            })
-        }
+        let Some(recovered_max_sequence) = records.iter().map(|record| record.sequence).max()
+        else {
+            return Ok(Self::empty());
+        };
+        let next_sequence = recovered_max_sequence.checked_add(1).ok_or_else(|| {
+            FlapjackError::Io("write admission sequence space is exhausted".to_string())
+        })?;
+        Ok(Self {
+            next_sequence,
+            live_record_count: records.len(),
+            next_ticket: 0,
+            pending: Vec::new(),
+            flush_in_progress: false,
+        })
     }
 
     /// Assign the next publish ticket for a freshly renamed record.
-    #[cfg(test)]
     fn take_next_ticket(&mut self) -> u64 {
         self.next_ticket += 1;
         self.next_ticket
     }
 
-    #[cfg(test)]
     fn take_next_sequence(&mut self) -> Result<u64> {
         let sequence = self.next_sequence;
         self.next_sequence = sequence.checked_add(1).ok_or_else(|| {
@@ -173,7 +190,6 @@ pub(crate) struct WriteAdmissionStore {
     lifecycle_lock: Mutex<AdmissionState>,
     /// Signalled when a directory flush completes so waiting appenders can observe
     /// their record becoming durable (or take over as the next flush leader).
-    #[cfg(test)]
     flush_condvar: Condvar,
     #[cfg(test)]
     load_records_unlocked_calls: AtomicUsize,
@@ -199,7 +215,6 @@ impl WriteAdmissionStore {
         let store = Self {
             path,
             lifecycle_lock: Mutex::new(AdmissionState::empty()),
-            #[cfg(test)]
             flush_condvar: Condvar::new(),
             #[cfg(test)]
             load_records_unlocked_calls: AtomicUsize::new(0),
@@ -219,7 +234,6 @@ impl WriteAdmissionStore {
     /// Durably admit a write record. The record is staged (temp-write, data-sync,
     /// rename) under the lifecycle lock, then a directory flush makes its rename
     /// crash-safe before this returns. Concurrent admissions share one flush.
-    #[cfg(test)]
     pub(crate) fn append_record(
         &self,
         mut record: WriteAdmissionRecord,
@@ -237,7 +251,6 @@ impl WriteAdmissionStore {
     /// is the job of `publish_record`. On any staging failure the partial state is
     /// rolled back exactly as the pre-group-commit path did and the error is
     /// returned before any pending publish is recorded.
-    #[cfg(test)]
     fn stage_record(&self, record: &mut WriteAdmissionRecord) -> Result<u64> {
         let mut state = self.lock_lifecycle()?;
         record.sequence = state.take_next_sequence()?;
@@ -255,10 +268,7 @@ impl WriteAdmissionStore {
             if admission_directory_needs_parent_sync {
                 sync_parent_directory(&self.path)?;
             }
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)?;
+            let mut file = private_write_options().create_new(true).open(&tmp_path)?;
             file.write_all(&contents)?;
             file.write_all(b"\n")?;
             file.sync_all()?;
@@ -294,7 +304,6 @@ impl WriteAdmissionStore {
     /// every rename staged before it (ticket `<= target`) durable at once, so the
     /// per-record directory fsync cost is amortized across the batch. A caller only
     /// returns once its own rename is covered by a completed flush.
-    #[cfg(test)]
     fn publish_record(&self, ticket: u64) -> Result<()> {
         let mut state = self.lock_lifecycle()?;
         loop {
@@ -334,7 +343,6 @@ impl WriteAdmissionStore {
     /// this caller's own record (`ticket`) is then removed and `Ok` returned. On
     /// failure only this caller's record is rolled back and the error returned;
     /// other pending records stay staged for a later flush attempt.
-    #[cfg(test)]
     fn resolve_flush_outcome(
         &self,
         state: &mut AdmissionState,
@@ -365,7 +373,6 @@ impl WriteAdmissionStore {
     /// Remove a staged-but-undurable record after a failed directory flush,
     /// deleting its file and — if this stage created the admission directory and no
     /// other live or pending records remain — the now-empty directory.
-    #[cfg(test)]
     fn roll_back_pending(&self, state: &mut AdmissionState, ticket: u64) {
         let Some(position) = state
             .pending
@@ -467,10 +474,7 @@ impl WriteAdmissionStore {
         // not yet completed still have files on disk and are not counted live. The
         // admission directory is therefore only empty — and only safe to remove —
         // when no such pending publishes remain.
-        #[cfg(test)]
         let has_pending_publishes = state.pending.iter().any(|pending| !pending.durable);
-        #[cfg(not(test))]
-        let has_pending_publishes = false;
         let cleanup_result = (|| -> Result<()> {
             for (path, _) in &records_to_remove {
                 fs::remove_file(path)?;
@@ -494,7 +498,6 @@ impl WriteAdmissionStore {
         Ok(())
     }
 
-    #[cfg(test)]
     fn record_path(&self, sequence: u64) -> PathBuf {
         self.path.join(format!("{sequence:020}.json"))
     }
@@ -514,11 +517,12 @@ impl WriteAdmissionStore {
         let admission_directory_existed = self.path.exists();
         fs::create_dir_all(&self.path)?;
         for (path, record_bytes) in removed_records {
-            let mut file = OpenOptions::new()
-                .write(true)
+            let mut file = private_write_options()
                 .create(true)
                 .truncate(true)
                 .open(path)?;
+            #[cfg(unix)]
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
             file.write_all(record_bytes)?;
             file.sync_all()?;
         }
@@ -626,7 +630,6 @@ pub(crate) fn reconcile_records(
 
 /// Whether the pending publish for `ticket` has been marked durable by a completed
 /// directory flush (its own or a batch leader's).
-#[cfg(test)]
 fn pending_is_durable(state: &AdmissionState, ticket: u64) -> bool {
     state
         .pending
@@ -635,7 +638,6 @@ fn pending_is_durable(state: &AdmissionState, ticket: u64) -> bool {
 }
 
 /// Serialize a record into its on-disk envelope bytes (checksum + record JSON).
-#[cfg(test)]
 fn serialize_record_envelope(record: &WriteAdmissionRecord) -> Result<Vec<u8>> {
     let record_value = serde_json::to_value(record).map_err(|error| {
         FlapjackError::Json(format!(
@@ -723,6 +725,14 @@ fn system_time_ms(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn private_write_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
 }
 
 fn sync_directory(path: &Path) -> Result<()> {

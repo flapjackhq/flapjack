@@ -13,14 +13,18 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use chrono::{DateTime, Utc};
 use flapjack::index::oplog::{OpLog, OpLogEntry};
 use flapjack::index::snapshot::export_to_bytes;
 use flapjack::{validate_index_name, IndexManager};
 use flapjack_replication::config::{NodeConfig, PeerConfig};
-use flapjack_replication::manager::AddPeerError;
+use flapjack_replication::manager::{
+    AddPeerError, AutohealLifecycleProjection, AutohealPeerLifecycle,
+};
 use flapjack_replication::types::{
     GetOpsQuery, GetOpsResponse, ListTenantsResponse, ReplicateOpsRequest, ReplicateOpsResponse,
 };
+use flapjack_ssl::manager::RenewalStatus;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -373,7 +377,18 @@ fn find_moved_source_ops(
 
 /// GET /internal/status
 /// Return basic replication status for monitoring
-pub async fn replication_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+#[utoipa::path(
+    get,
+    path = "/internal/status",
+    tag = "internal",
+    responses(
+        (status = 200, description = "Replication and storage status", body = ReplicationStatusResponse)
+    ),
+    security(("api_key" = []))
+)]
+pub async fn replication_status(
+    State(state): State<Arc<AppState>>,
+) -> Json<ReplicationStatusResponse> {
     let (node_id, replication_enabled, peer_count) = match &state.replication_manager {
         Some(repl_mgr) => (repl_mgr.node_id().to_string(), true, repl_mgr.peer_count()),
         None => (
@@ -403,36 +418,46 @@ pub async fn replication_status(State(state): State<Arc<AppState>>) -> impl Into
     #[cfg(not(feature = "vector-search"))]
     let vector_memory_bytes = 0usize;
 
-    let response = serde_json::json!({
-        "node_id": node_id,
-        "replication_enabled": replication_enabled,
-        "peer_count": peer_count,
-        "ssl_renewal": ssl_renewal,
-        "storage_total_bytes": storage_total_bytes,
-        "tenant_count": tenant_count,
-        "vector_memory_bytes": vector_memory_bytes,
-    });
-
-    (StatusCode::OK, Json(response)).into_response()
+    Json(ReplicationStatusResponse {
+        node_id,
+        replication_enabled,
+        peer_count,
+        ssl_renewal: ssl_renewal.map(SslRenewalStatus::from),
+        storage_total_bytes,
+        tenant_count,
+        vector_memory_bytes,
+    })
 }
 
 /// GET /internal/cluster/status
 /// Return health status of all peers based on last_success timestamps.
 /// Provides quick cluster health overview without active probing.
+#[utoipa::path(
+    get,
+    path = "/internal/cluster/status",
+    tag = "cluster",
+    responses(
+        (status = 200, description = "Cluster membership and auto-heal lifecycle status", body = ClusterStatusResponse),
+        (status = 403, description = "Admin API key is required")
+    ),
+    security(("api_key" = []))
+)]
 pub async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let repl_mgr = match &state.replication_manager {
         Some(r) => r,
         None => {
             return (
                 StatusCode::OK,
-                Json(ClusterStatusResponse {
-                    node_id: std::env::var("FLAPJACK_NODE_ID")
-                        .unwrap_or_else(|_| "unknown".to_string()),
-                    replication_enabled: false,
-                    peers_total: None,
-                    peers_healthy: None,
-                    peers: Vec::new(),
-                }),
+                Json(ClusterStatusResponse::Standalone(
+                    ClusterStatusStandaloneResponse {
+                        node_id: std::env::var("FLAPJACK_NODE_ID")
+                            .unwrap_or_else(|_| "unknown".to_string()),
+                        replication_enabled: false,
+                        peers: Vec::new(),
+                        autoheal_enabled: false,
+                        autoheal_peers: Vec::new(),
+                    },
+                )),
             )
                 .into_response();
         }
@@ -451,37 +476,236 @@ pub async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResp
 
     let healthy_count = peers.iter().filter(|peer| peer.status == "healthy").count();
     let peers_total = peers.len();
+    let autoheal = autoheal_lifecycle_response(repl_mgr.autoheal_lifecycle_projection());
 
     (
         StatusCode::OK,
-        Json(ClusterStatusResponse {
+        Json(ClusterStatusResponse::Ha(ClusterStatusHaResponse {
             node_id: repl_mgr.node_id().to_string(),
             replication_enabled: true,
-            peers_total: Some(peers_total),
-            peers_healthy: Some(healthy_count),
+            peers_total,
+            peers_healthy: healthy_count,
             peers,
-        }),
+            autoheal_enabled: autoheal.autoheal_enabled,
+            autoheal_peers: autoheal.peers,
+        })),
     )
         .into_response()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterPeerHealthStatus {
+    Healthy,
+    Stale,
+    Unhealthy,
+    CircuitOpen,
+    NeverContacted,
+}
+
+impl ClusterPeerHealthStatus {
+    pub const WIRE_TOKENS: [&'static str; 5] = [
+        "healthy",
+        "stale",
+        "unhealthy",
+        "circuit_open",
+        "never_contacted",
+    ];
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 pub struct ClusterPeerStatus {
     pub peer_id: String,
     pub addr: String,
+    #[schema(value_type = ClusterPeerHealthStatus)]
     pub status: String,
+    #[schema(required)]
     pub last_success_secs_ago: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ClusterStatusResponse {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterStatusStandaloneResponse {
     pub node_id: String,
     pub replication_enabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub peers_total: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub peers_healthy: Option<usize>,
     pub peers: Vec<ClusterPeerStatus>,
+    #[serde(default)]
+    pub autoheal_enabled: bool,
+    #[serde(default)]
+    pub autoheal_peers: Vec<AutohealPeerLifecycleResponse>,
+}
+
+struct AutohealLifecycleResponse {
+    autoheal_enabled: bool,
+    peers: Vec<AutohealPeerLifecycleResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct AutohealPeerLifecycleResponse {
+    pub peer_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub addr: Option<String>,
+    pub observation_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object)]
+    pub decision: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<AutohealActionResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct AutohealActionResponse {
+    pub phase: String,
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+fn autoheal_lifecycle_response(
+    projection: AutohealLifecycleProjection,
+) -> AutohealLifecycleResponse {
+    AutohealLifecycleResponse {
+        autoheal_enabled: projection.autoheal_enabled,
+        peers: projection
+            .peers
+            .into_iter()
+            .map(autoheal_peer_lifecycle_response)
+            .collect(),
+    }
+}
+
+fn autoheal_peer_lifecycle_response(peer: AutohealPeerLifecycle) -> AutohealPeerLifecycleResponse {
+    AutohealPeerLifecycleResponse {
+        peer_id: peer.peer_id,
+        addr: peer.addr,
+        observation_count: peer.observation_count,
+        decision: peer
+            .last_decision
+            .map(|decision| serde_json::to_value(decision).expect("decision should serialize")),
+        action: peer.last_action.map(|action| AutohealActionResponse {
+            phase: action.phase,
+            outcome: action.outcome,
+            error: action.error,
+        }),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterStatusHaResponse {
+    pub node_id: String,
+    pub replication_enabled: bool,
+    pub peers_total: usize,
+    pub peers_healthy: usize,
+    pub peers: Vec<ClusterPeerStatus>,
+    #[serde(default)]
+    pub autoheal_enabled: bool,
+    #[serde(default)]
+    pub autoheal_peers: Vec<AutohealPeerLifecycleResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, ToSchema)]
+#[serde(untagged)]
+pub enum ClusterStatusResponse {
+    Standalone(ClusterStatusStandaloneResponse),
+    Ha(ClusterStatusHaResponse),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClusterStatusResponseFields {
+    node_id: String,
+    replication_enabled: bool,
+    peers_total: Option<usize>,
+    peers_healthy: Option<usize>,
+    peers: Vec<ClusterPeerStatus>,
+    #[serde(default)]
+    autoheal_enabled: bool,
+    #[serde(default)]
+    autoheal_peers: Vec<AutohealPeerLifecycleResponse>,
+}
+
+impl<'de> Deserialize<'de> for ClusterStatusResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let fields = ClusterStatusResponseFields::deserialize(deserializer)?;
+        if fields.replication_enabled {
+            let peers_total = fields.peers_total.unwrap_or(fields.peers.len());
+            let peers_healthy = fields.peers_healthy.unwrap_or_else(|| {
+                fields
+                    .peers
+                    .iter()
+                    .filter(|peer| peer.status == "healthy")
+                    .count()
+            });
+            return Ok(Self::Ha(ClusterStatusHaResponse {
+                node_id: fields.node_id,
+                replication_enabled: true,
+                peers_total,
+                peers_healthy,
+                peers: fields.peers,
+                autoheal_enabled: fields.autoheal_enabled,
+                autoheal_peers: fields.autoheal_peers,
+            }));
+        }
+
+        if fields.peers_total.is_some() || fields.peers_healthy.is_some() {
+            return Err(serde::de::Error::custom(
+                "standalone cluster status cannot include peer counts",
+            ));
+        }
+        if !fields.peers.is_empty() {
+            return Err(serde::de::Error::custom(
+                "standalone cluster status cannot include peer rows",
+            ));
+        }
+
+        Ok(Self::Standalone(ClusterStatusStandaloneResponse {
+            node_id: fields.node_id,
+            replication_enabled: false,
+            peers: fields.peers,
+            autoheal_enabled: fields.autoheal_enabled,
+            autoheal_peers: fields.autoheal_peers,
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct SslRenewalStatus {
+    pub enabled: bool,
+    pub status: String,
+    #[schema(required)]
+    pub error: Option<String>,
+    #[schema(required)]
+    pub cert_expires_in_days: Option<i64>,
+    #[schema(required)]
+    pub next_check: Option<DateTime<Utc>>,
+}
+
+impl From<RenewalStatus> for SslRenewalStatus {
+    fn from(status: RenewalStatus) -> Self {
+        Self {
+            enabled: status.enabled,
+            status: status.status,
+            error: status.error,
+            cert_expires_in_days: status.cert_expires_in_days,
+            next_check: status.next_check,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct ReplicationStatusResponse {
+    pub node_id: String,
+    pub replication_enabled: bool,
+    pub peer_count: usize,
+    #[schema(required)]
+    pub ssl_renewal: Option<SslRenewalStatus>,
+    pub storage_total_bytes: u64,
+    pub tenant_count: usize,
+    pub vector_memory_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]

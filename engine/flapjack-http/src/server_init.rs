@@ -329,9 +329,9 @@ fn merge_bootstrap_membership(
     bootstrap_peer: &str,
     status: ClusterStatusResponse,
 ) -> Result<Vec<PeerConfig>, String> {
-    if !status.replication_enabled {
+    let ClusterStatusResponse::Ha(status) = status else {
         return Err("bootstrap peer reported replication disabled".to_string());
-    }
+    };
 
     let mut members = BTreeMap::new();
     insert_bootstrap_member(

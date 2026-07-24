@@ -1,8 +1,9 @@
 use super::*;
 use crate::openapi::{documented_openapi, DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS};
 use crate::openapi_test_helpers::{
-    assert_add_peer_openapi_contract, assert_high_risk_mutation_contracts,
-    assert_remove_peer_openapi_contract, schema_composition_refs, schema_ref,
+    assert_add_peer_openapi_contract, assert_cluster_status_openapi_contract,
+    assert_high_risk_mutation_contracts, assert_remove_peer_openapi_contract,
+    schema_composition_refs, schema_ref,
 };
 
 fn openapi_json() -> serde_json::Value {
@@ -17,6 +18,11 @@ fn openapi_membership_add_contract_is_documented() {
 #[test]
 fn openapi_membership_remove_contract_is_documented() {
     assert_remove_peer_openapi_contract(&openapi_json());
+}
+
+#[test]
+fn openapi_cluster_status_contract_is_documented() {
+    assert_cluster_status_openapi_contract(&openapi_json());
 }
 
 #[test]

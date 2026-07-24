@@ -3,7 +3,7 @@ use super::spool::{
     AsyncMigrationMetadata, MigrationDisposition, MigrationPhaseRecord, SpoolError, SpoolLimits,
     SpoolStore,
 };
-use super::{admit_migration_payload, algolia_error, import, migration_capacity_exhausted};
+use super::{admit_async_migration_payload, algolia_error, import, migration_capacity_exhausted};
 use super::{MigrateError, MigrateFromAlgoliaRequest};
 use dashmap::DashMap;
 use flapjack::index::manager::publication::{
@@ -75,7 +75,8 @@ impl MigrationJobRunner {
         ) -> Result<R, super::algolia_client::AlgoliaClientError>,
         R: MigrationSourceReader + Send + 'static,
     {
-        let target_index = admit_migration_payload(self.replication_manager.as_ref(), &payload)?;
+        let target_index =
+            admit_async_migration_payload(self.replication_manager.as_ref(), &payload)?;
         let permit = self
             .capacity
             .clone()
@@ -127,7 +128,8 @@ impl MigrationJobRunner {
         ) -> Result<R, super::algolia_client::AlgoliaClientError>,
         R: MigrationSourceReader + Send + 'static,
     {
-        let target_index = admit_migration_payload(self.replication_manager.as_ref(), &payload)?;
+        let target_index =
+            admit_async_migration_payload(self.replication_manager.as_ref(), &payload)?;
         let permit = self
             .capacity
             .clone()

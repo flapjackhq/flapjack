@@ -4,6 +4,7 @@ use axum::{
     Router,
 };
 use flapjack_http::startup::CorsMode;
+use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,10 +28,14 @@ pub struct TestNode {
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     stopped_rx: Option<std::sync::mpsc::Receiver<()>>,
     handle: tokio::task::JoinHandle<()>,
+    health_probe_managers: Vec<Arc<ReplicationManager>>,
 }
 
 impl TestNode {
     fn begin_shutdown(&mut self) {
+        for manager in &self.health_probe_managers {
+            manager.stop_health_probe();
+        }
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
@@ -1155,7 +1160,265 @@ fn serve_with_shutdown(listener: TcpListener, app: Router) -> TestNode {
         shutdown_tx: Some(tx),
         stopped_rx: Some(stopped_rx),
         handle,
+        health_probe_managers: Vec::new(),
     }
+}
+
+fn serve_with_shutdown_and_health_probe(
+    listener: TcpListener,
+    app: Router,
+    replication_manager: Arc<ReplicationManager>,
+) -> TestNode {
+    let mut node = serve_with_shutdown(listener, app);
+    node.health_probe_managers.push(replication_manager);
+    node
+}
+
+pub struct AutohealRetainedTriplet {
+    pub node_a_addr: String,
+    pub node_b_addr: String,
+    node_a: Option<TestNode>,
+    node_b: Option<TestNode>,
+    node_c: Option<TestNode>,
+    temp_dir_a: TempDir,
+    temp_dir_b: TempDir,
+    temp_dir_c: TempDir,
+}
+
+impl AutohealRetainedTriplet {
+    pub fn node_a_peer_ids(&self) -> Vec<String> {
+        retained_peer_ids(self.temp_dir_a.path())
+    }
+
+    pub fn node_b_peer_ids(&self) -> Vec<String> {
+        retained_peer_ids(self.temp_dir_b.path())
+    }
+
+    pub fn node_c_peer_ids(&self) -> Vec<String> {
+        retained_peer_ids(self.temp_dir_c.path())
+    }
+
+    pub fn node_c_dir(&self) -> &Path {
+        self.temp_dir_c.path()
+    }
+
+    pub async fn stop_node_c(&mut self) {
+        let node = self
+            .node_c
+            .take()
+            .expect("autoheal retained triplet node C should be running");
+        node.stop().await;
+    }
+
+    pub async fn stop_survivors(mut self) {
+        if let Some(node) = self.node_a.take() {
+            node.stop().await;
+        }
+        if let Some(node) = self.node_b.take() {
+            node.stop().await;
+        }
+    }
+}
+
+impl Drop for AutohealRetainedTriplet {
+    fn drop(&mut self) {
+        stop_node_option_blocking(&mut self.node_a);
+        stop_node_option_blocking(&mut self.node_b);
+        stop_node_option_blocking(&mut self.node_c);
+    }
+}
+
+fn stop_node_option_blocking(node: &mut Option<TestNode>) {
+    if let Some(mut node) = node.take() {
+        node.begin_shutdown();
+        if !node.wait_for_exit_blocking(SERVER_SHUTDOWN_TIMEOUT) {
+            node.handle.abort();
+        }
+    }
+}
+
+fn retained_peer_ids(data_dir: &Path) -> Vec<String> {
+    let mut peer_ids = NodeConfig::load_or_default(data_dir)
+        .peers
+        .into_iter()
+        .map(|peer| peer.node_id)
+        .collect::<Vec<_>>();
+    peer_ids.sort();
+    peer_ids
+}
+
+fn peer_url(addr: SocketAddr) -> String {
+    format!("http://{addr}")
+}
+
+fn peer_config(node_id: &str, addr: SocketAddr) -> PeerConfig {
+    PeerConfig {
+        node_id: node_id.to_string(),
+        addr: peer_url(addr),
+    }
+}
+
+fn persist_retained_node_config(
+    data_dir: &Path,
+    node_id: &str,
+    bind_addr: SocketAddr,
+    peers: Vec<PeerConfig>,
+) -> NodeConfig {
+    let config = NodeConfig {
+        node_id: node_id.to_string(),
+        bind_addr: bind_addr.to_string(),
+        advertise_addr: Some(peer_url(bind_addr)),
+        bootstrap_peer: None,
+        peers: peers.clone(),
+    };
+    config
+        .persist_peers(data_dir, peers)
+        .expect("retained node.json should be writable");
+    let loaded = NodeConfig::load_or_default(data_dir);
+    assert_eq!(loaded.node_id, node_id);
+    assert_eq!(loaded.bind_addr, bind_addr.to_string());
+    assert_eq!(
+        loaded.advertise_addr.as_deref(),
+        Some(peer_url(bind_addr).as_str())
+    );
+    loaded
+}
+
+fn replication_manager_from_retained_node_json(data_dir: &Path) -> Arc<ReplicationManager> {
+    let config = NodeConfig::load_or_default(data_dir);
+    assert!(
+        !config.peers.is_empty(),
+        "retained replication node should load persisted peers"
+    );
+    ReplicationManager::new(config, None, data_dir.to_path_buf())
+}
+
+async fn bind_retained_listener(lan_ip: std::net::IpAddr, node_name: &str) -> TcpListener {
+    match TcpListener::bind(SocketAddr::new(lan_ip, 0)).await {
+        Ok(listener) => listener,
+        Err(error) => panic_no_routable_interface(format!("{node_name} LAN bind failed: {error}")),
+    }
+}
+
+fn start_autoheal_probe(replication_manager: &Arc<ReplicationManager>) {
+    replication_manager.start_health_probe(1, true);
+}
+
+pub async fn spawn_autoheal_retained_triplet() -> AutohealRetainedTriplet {
+    let lan_ip = validator_accepted_lan_ip()
+        .unwrap_or_else(|| panic_no_routable_interface("no validator-accepted LAN interface"));
+    let listener_a = bind_retained_listener(lan_ip, "node A").await;
+    let listener_b = bind_retained_listener(lan_ip, "node B").await;
+    let listener_c = bind_retained_listener(lan_ip, "node C").await;
+    let addr_a = listener_a.local_addr().unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let addr_c = listener_c.local_addr().unwrap();
+
+    let temp_dir_a = TempDir::new().unwrap();
+    let temp_dir_b = TempDir::new().unwrap();
+    let temp_dir_c = TempDir::new().unwrap();
+
+    persist_retained_node_config(
+        temp_dir_a.path(),
+        "node-a",
+        addr_a,
+        vec![peer_config("node-b", addr_b), peer_config("node-c", addr_c)],
+    );
+    persist_retained_node_config(
+        temp_dir_b.path(),
+        "node-b",
+        addr_b,
+        vec![peer_config("node-a", addr_a), peer_config("node-c", addr_c)],
+    );
+    persist_retained_node_config(
+        temp_dir_c.path(),
+        "node-c",
+        addr_c,
+        vec![peer_config("node-a", addr_a), peer_config("node-b", addr_b)],
+    );
+
+    let repl_a = replication_manager_from_retained_node_json(temp_dir_a.path());
+    let repl_b = replication_manager_from_retained_node_json(temp_dir_b.path());
+    let repl_c = replication_manager_from_retained_node_json(temp_dir_c.path());
+
+    let state_a = make_test_app_state(
+        temp_dir_a.path(),
+        None,
+        None,
+        Some(repl_a.clone()),
+        None,
+        None,
+        None,
+    );
+    let state_b = make_test_app_state(
+        temp_dir_b.path(),
+        None,
+        None,
+        Some(repl_b.clone()),
+        None,
+        None,
+        None,
+    );
+    let state_c = make_test_app_state(
+        temp_dir_c.path(),
+        None,
+        None,
+        Some(repl_c.clone()),
+        None,
+        None,
+        None,
+    );
+
+    start_autoheal_probe(&repl_a);
+    start_autoheal_probe(&repl_b);
+    start_autoheal_probe(&repl_c);
+
+    let node_a =
+        serve_with_shutdown_and_health_probe(listener_a, build_node_router(state_a), repl_a);
+    let node_b =
+        serve_with_shutdown_and_health_probe(listener_b, build_node_router(state_b), repl_b);
+    let node_c =
+        serve_with_shutdown_and_health_probe(listener_c, build_node_router(state_c), repl_c);
+    let node_a_addr = node_a.addr.clone();
+    let node_b_addr = node_b.addr.clone();
+    let node_c_addr = node_c.addr.clone();
+    wait_for_health(&[&node_a_addr, &node_b_addr, &node_c_addr], 500).await;
+
+    AutohealRetainedTriplet {
+        node_a_addr,
+        node_b_addr,
+        node_a: Some(node_a),
+        node_b: Some(node_b),
+        node_c: Some(node_c),
+        temp_dir_a,
+        temp_dir_b,
+        temp_dir_c,
+    }
+}
+
+pub async fn spawn_retained_node_from_node_json(data_dir: &Path) -> Result<TestNode, String> {
+    let config = NodeConfig::load_or_default(data_dir);
+    let bind_addr = config.bind_addr.clone();
+    let repl_mgr = ReplicationManager::new(config, None, data_dir.to_path_buf());
+    let state = make_test_app_state(
+        data_dir,
+        None,
+        None,
+        Some(repl_mgr.clone()),
+        None,
+        None,
+        None,
+    );
+
+    flapjack_http::startup_catchup::run_pre_serve_catchup(&state).await?;
+
+    let listener = TcpListener::bind(&bind_addr)
+        .await
+        .map_err(|error| format!("failed to bind retained node at {bind_addr}: {error}"))?;
+    start_autoheal_probe(&repl_mgr);
+    let node = serve_with_shutdown_and_health_probe(listener, build_node_router(state), repl_mgr);
+    wait_for_health(&[&node.addr], 100).await;
+    Ok(node)
 }
 
 pub async fn spawn_stoppable_replication_pair(

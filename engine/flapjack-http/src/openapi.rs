@@ -1,11 +1,34 @@
 use utoipa::OpenApi;
 
-pub(crate) const DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS: [&str; 2] = [
+pub const DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS: [&str; 3] = [
     "/internal/cluster/peers",
     "/internal/cluster/peers/{node_id}",
+    "/internal/cluster/status",
 ];
-pub(crate) const DOCUMENTED_MEMBERSHIP_SCHEMA_NAMES: [&str; 3] =
-    ["AddPeerRequest", "AddPeerResponse", "RemovePeerResponse"];
+pub(crate) const DOCUMENTED_MEMBERSHIP_SCHEMA_NAMES: [&str; 10] = [
+    "AddPeerRequest",
+    "AddPeerResponse",
+    "RemovePeerResponse",
+    "ClusterStatusResponse",
+    "ClusterStatusStandaloneResponse",
+    "ClusterStatusHaResponse",
+    "ClusterPeerStatus",
+    "ClusterPeerHealthStatus",
+    "AutohealPeerLifecycleResponse",
+    "AutohealActionResponse",
+];
+pub const DOCUMENTED_INTERNAL_READ_PATHS: [&str; 3] = [
+    "/internal/status",
+    "/internal/cluster/status",
+    "/internal/snapshots/capability",
+];
+pub const DOCUMENTED_INTERNAL_PATHS: [&str; 5] = [
+    "/internal/cluster/peers",
+    "/internal/cluster/peers/{node_id}",
+    "/internal/status",
+    "/internal/cluster/status",
+    "/internal/snapshots/capability",
+];
 
 #[derive(OpenApi)]
 #[openapi(
@@ -25,6 +48,8 @@ pub(crate) const DOCUMENTED_MEMBERSHIP_SCHEMA_NAMES: [&str; 3] =
     ),
     paths(
         crate::handlers::health::health,
+        crate::handlers::internal::replication_status,
+        crate::handlers::internal::cluster_status,
         crate::handlers::internal::add_cluster_peer,
         crate::handlers::internal::remove_cluster_peer,
         crate::handlers::indices::create_index,
@@ -74,6 +99,7 @@ pub(crate) const DOCUMENTED_MEMBERSHIP_SCHEMA_NAMES: [&str; 3] =
         crate::handlers::snapshot::snapshot_to_s3,
         crate::handlers::snapshot::restore_from_s3,
         crate::handlers::snapshot::list_s3_snapshots,
+        crate::handlers::snapshot::snapshot_capability,
         crate::handlers::security_sources::get_security_sources,
         crate::handlers::security_sources::replace_security_sources,
         crate::handlers::security_sources::append_security_source,
@@ -163,6 +189,19 @@ pub(crate) const DOCUMENTED_MEMBERSHIP_SCHEMA_NAMES: [&str; 3] =
             crate::handlers::internal::AddPeerRequest,
             crate::handlers::internal::AddPeerResponse,
             crate::handlers::internal::RemovePeerResponse,
+            crate::handlers::health::HealthResponse,
+            crate::handlers::health::PublicBuildInfo,
+            flapjack::BuildCapabilities,
+            crate::handlers::internal::ReplicationStatusResponse,
+            crate::handlers::internal::SslRenewalStatus,
+            crate::handlers::internal::ClusterStatusResponse,
+            crate::handlers::internal::ClusterStatusStandaloneResponse,
+            crate::handlers::internal::ClusterStatusHaResponse,
+            crate::handlers::internal::ClusterPeerStatus,
+            crate::handlers::internal::ClusterPeerHealthStatus,
+            crate::handlers::snapshot::SnapshotCapabilityResponse,
+            crate::handlers::snapshot::SnapshotBackend,
+            crate::handlers::snapshot::SnapshotCapabilityState,
             crate::dto::CreateIndexRequest,
             crate::dto::IndexSchema,
             crate::dto::CreateIndexResponse,
@@ -360,7 +399,7 @@ pub(crate) const DOCUMENTED_MEMBERSHIP_SCHEMA_NAMES: [&str; 3] =
         (name = "usage", description = "Usage statistics endpoints"),
         (name = "chat", description = "AI chat endpoints"),
     ),
-    modifiers(&SecurityAddon, &ChatSseAddon),
+    modifiers(&SecurityAddon, &OpsSchemaConstraintsAddon, &ChatSseAddon),
 )]
 pub struct ApiDoc;
 
@@ -397,6 +436,69 @@ impl utoipa::Modify for SecurityAddon {
                 ),
             );
         }
+    }
+}
+
+struct OpsSchemaConstraintsAddon;
+
+impl utoipa::Modify for OpsSchemaConstraintsAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        set_schema_property_bool_enum(
+            openapi,
+            "ClusterStatusStandaloneResponse",
+            "replication_enabled",
+            false,
+        );
+        set_schema_property_bool_enum(
+            openapi,
+            "ClusterStatusHaResponse",
+            "replication_enabled",
+            true,
+        );
+        set_schema_property_array_max_items(openapi, "ClusterStatusStandaloneResponse", "peers", 0);
+    }
+}
+
+fn set_schema_property_bool_enum(
+    openapi: &mut utoipa::openapi::OpenApi,
+    schema_name: &str,
+    property_name: &str,
+    value: bool,
+) {
+    if let Some(utoipa::openapi::schema::Schema::Object(property)) =
+        schema_property_mut(openapi, schema_name, property_name)
+    {
+        property.enum_values = Some(vec![serde_json::Value::Bool(value)]);
+    }
+}
+
+fn set_schema_property_array_max_items(
+    openapi: &mut utoipa::openapi::OpenApi,
+    schema_name: &str,
+    property_name: &str,
+    max_items: usize,
+) {
+    if let Some(utoipa::openapi::schema::Schema::Array(property)) =
+        schema_property_mut(openapi, schema_name, property_name)
+    {
+        property.max_items = Some(max_items);
+    }
+}
+
+fn schema_property_mut<'a>(
+    openapi: &'a mut utoipa::openapi::OpenApi,
+    schema_name: &str,
+    property_name: &str,
+) -> Option<&'a mut utoipa::openapi::schema::Schema> {
+    let components = openapi.components.as_mut()?;
+    let schema = components.schemas.get_mut(schema_name)?;
+    let utoipa::openapi::RefOr::T(utoipa::openapi::schema::Schema::Object(object)) = schema else {
+        return None;
+    };
+    let property = object.properties.get_mut(property_name)?;
+    match property {
+        utoipa::openapi::RefOr::T(schema) => Some(schema),
+        utoipa::openapi::RefOr::Ref(_) => None,
     }
 }
 

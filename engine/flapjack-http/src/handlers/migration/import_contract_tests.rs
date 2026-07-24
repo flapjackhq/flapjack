@@ -28,8 +28,11 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use flapjack::error::FlapjackError;
 use flapjack::index::manager::publication::{PublicationPaths, PublicationTarget};
+use flapjack::{
+    error::FlapjackError,
+    types::{Document, FieldValue},
+};
 use flapjack_replication::{
     config::{NodeConfig, PeerConfig},
     manager::ReplicationManager,
@@ -820,9 +823,11 @@ async fn async_import_ha_state_is_refused_by_shared_admission_owner() {
         .with_replication_manager(repl_mgr)
         .build_shared();
     let source_factory_invoked = Arc::new(AtomicBool::new(false));
+    let mut request = valid_request();
+    request.overwrite = false;
     let refused = state
         .migration_runner
-        .submit_algolia_import(valid_request(), {
+        .submit_algolia_import(request, {
             let source_factory_invoked = Arc::clone(&source_factory_invoked);
             move |_| {
                 source_factory_invoked.store(true, Ordering::SeqCst);
@@ -1211,10 +1216,12 @@ async fn migrate_refuses_ha_cluster_before_import_admission() {
         .build_shared();
     let source_factory_invoked = Arc::new(AtomicBool::new(false));
     let source_factory_invoked_by_handler = Arc::clone(&source_factory_invoked);
+    let mut request = valid_request();
+    request.overwrite = false;
 
     let response = migrate_from_algolia_with_test_source_factory(
         State(Arc::clone(&state)),
-        Json(valid_request()),
+        Json(request),
         move |_| {
             source_factory_invoked_by_handler.store(true, Ordering::SeqCst);
             Ok(hermetic_source_reader())
@@ -1277,6 +1284,139 @@ async fn migrate_overwrite_true_is_refused_before_admission() {
         "overwrite refusal must happen before any source reader is constructed"
     );
     assert_no_migration_artifacts(&state);
+}
+
+#[tokio::test]
+async fn migrate_overwrite_true_node_local_sync_is_admitted_after_fence_contract() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    seed_preexisting_target_resources(&state, TARGET_INDEX).await;
+    assert_preexisting_target_resources(&state, TARGET_INDEX).await;
+    let source_factory_invoked = Arc::new(AtomicBool::new(false));
+    let source_factory_invoked_by_handler = Arc::clone(&source_factory_invoked);
+
+    let response = migrate_from_algolia_with_test_source_factory(
+        State(Arc::clone(&state)),
+        Json(MigrateFromAlgoliaRequest {
+            overwrite: true,
+            ..valid_request()
+        }),
+        move |_| {
+            source_factory_invoked_by_handler.store(true, Ordering::SeqCst);
+            Ok(hermetic_source_reader())
+        },
+    )
+    .await;
+
+    assert_import_reported_equals_target_contents(&state, response).await;
+    assert!(
+        source_factory_invoked.load(Ordering::SeqCst),
+        "node-local overwrite admission must construct the hermetic source reader"
+    );
+    assert_eq!(
+        query_hit_count(&state, TARGET_INDEX, "Cedar Caliper").await,
+        0,
+        "overwrite=true must replace, not merge with, preexisting target contents"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migrate_overwrite_with_acknowledged_pre_activation_write_completes() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    seed_preexisting_target_resources(&state, TARGET_INDEX).await;
+
+    let activation_reached = Arc::new(Barrier::new(2));
+    let activation_release = Arc::new(Barrier::new(2));
+    let hook_reached = Arc::clone(&activation_reached);
+    let hook_release = Arc::clone(&activation_release);
+    let hooks = ImportTestHooks::default().with_before_activation(move || {
+        hook_reached.wait();
+        hook_release.wait();
+    });
+    let migration_state = Arc::clone(&state);
+    let migration = tokio::spawn(async move {
+        migrate_from_algolia_with_test_source_factory_and_hooks(
+            State(migration_state),
+            Json(MigrateFromAlgoliaRequest {
+                overwrite: true,
+                ..valid_request()
+            }),
+            |_| Ok(hermetic_source_reader()),
+            hooks,
+        )
+        .await
+    });
+
+    tokio::task::spawn_blocking(move || activation_reached.wait())
+        .await
+        .expect("migration must reach the pre-activation barrier");
+    state
+        .manager
+        .add_documents_durable(
+            TARGET_INDEX,
+            vec![Document {
+                id: "overlap-1".to_string(),
+                fields: HashMap::from([
+                    (
+                        "title".to_string(),
+                        FieldValue::Text("Acknowledged Overlap".to_string()),
+                    ),
+                    (
+                        "category".to_string(),
+                        FieldValue::Text("concurrent".to_string()),
+                    ),
+                ]),
+            }],
+        )
+        .await
+        .expect("overlapping write must publish before activation");
+    tokio::task::spawn_blocking(move || activation_release.wait())
+        .await
+        .expect("migration activation barrier must release");
+
+    let response = tokio::time::timeout(Duration::from_secs(30), migration)
+        .await
+        .expect("migration must complete without hanging")
+        .expect("migration task must not panic")
+        .expect("acknowledged overlap must not turn successful activation into HTTP 500")
+        .0;
+    assert_eq!(response.status, "complete");
+    assert_eq!(response.objects.imported, EXPECTED_DOCUMENTS.len());
+    assert_eq!(response.rules.imported, 0);
+    assert_eq!(response.synonyms.imported, 0);
+
+    let Json(indices) = list_indices(State(Arc::clone(&state)), Query(HashMap::new()))
+        .await
+        .expect("replacement target should remain listable");
+    let target = indices
+        .items
+        .iter()
+        .find(|item| item.name == TARGET_INDEX)
+        .expect("replacement target should exist");
+    assert_eq!(
+        target.entries,
+        (EXPECTED_DOCUMENTS.len() + 1) as u64,
+        "target must contain exactly the replacement source plus the acknowledged overlap"
+    );
+    for (object_id, title, category) in EXPECTED_DOCUMENTS {
+        assert_query_returns_document(&state, TARGET_INDEX, title, object_id, title, category)
+            .await;
+    }
+    assert_query_returns_document(
+        &state,
+        TARGET_INDEX,
+        "Acknowledged Overlap",
+        "overlap-1",
+        "Acknowledged Overlap",
+        "concurrent",
+    )
+    .await;
+    assert_eq!(
+        query_hit_count(&state, TARGET_INDEX, "Cedar Caliper").await,
+        0,
+        "seeded stale document must not survive replacement"
+    );
 }
 
 #[tokio::test]

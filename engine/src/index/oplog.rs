@@ -164,6 +164,21 @@ impl OpLog {
         self.current_seq.load(Ordering::SeqCst)
     }
 
+    pub fn advance_current_seq_floor(&self, floor: u64) {
+        let mut current = self.current_seq.load(Ordering::SeqCst);
+        while current < floor {
+            match self.current_seq.compare_exchange(
+                current,
+                floor,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return,
+                Err(updated) => current = updated,
+            }
+        }
+    }
+
     /// Return the sequence number of the oldest retained operation, if any.
     pub fn oldest_seq(&self) -> Option<u64> {
         let mut segment = self.segment.lock().ok()?;

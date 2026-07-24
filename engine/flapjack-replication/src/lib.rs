@@ -1,3 +1,4 @@
+pub mod autoheal;
 pub mod circuit_breaker;
 pub mod config;
 pub mod manager;

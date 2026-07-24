@@ -45,6 +45,7 @@ const WORKSPACE_DIGEST_EXCLUDED_PATH_PREFIXES: &[&str] = &[
 const WORKSPACE_DIGEST_EXCLUDED_FILE_NAMES: &[&str] = &[".DS_Store"];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct BuildCapabilities {
     pub vector_search: bool,
@@ -52,12 +53,15 @@ pub struct BuildCapabilities {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct BuildInfo {
     pub schema_version: u8,
     pub version: String,
+    #[cfg_attr(feature = "openapi", schema(required))]
     pub revision: Option<String>,
     pub revision_known: bool,
+    #[cfg_attr(feature = "openapi", schema(required))]
     pub dirty: Option<bool>,
     pub dirty_known: bool,
     pub workspace_digest: String,

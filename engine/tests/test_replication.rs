@@ -25,6 +25,8 @@ mod common;
 use common::state::make_test_app_state;
 use flapjack::types::Document;
 use flapjack::IndexManager;
+use serde_json::Value;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -2491,6 +2493,177 @@ async fn test_restart_refuses_to_serve_when_peer_is_unreachable() {
 
     drop(tmp_a);
     drop(tmp_b);
+}
+
+async fn add_single_object(
+    client: &reqwest::Client,
+    node_addr: &str,
+    tenant: &str,
+    object_id: &str,
+) {
+    let response = client
+        .post(format!("http://{node_addr}/1/indexes/{tenant}/batch"))
+        .json(&serde_json::json!({
+            "requests": [{
+                "action": "addObject",
+                "body": {"objectID": object_id, "kind": "canary"}
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    common::wait_for_response_task(client, node_addr, response).await;
+}
+
+async fn query_object_ids(
+    client: &reqwest::Client,
+    node_addr: &str,
+    tenant: &str,
+) -> BTreeSet<String> {
+    let response = client
+        .post(format!("http://{node_addr}/1/indexes/{tenant}/query"))
+        .json(&serde_json::json!({"query": ""}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Value = response.json().await.unwrap();
+    assert!(
+        status.is_success(),
+        "query on {node_addr}/{tenant} failed with {status}: {body}"
+    );
+    body["hits"]
+        .as_array()
+        .unwrap_or_else(|| panic!("query response should include hits: {body}"))
+        .iter()
+        .filter_map(|hit| hit["objectID"].as_str().map(str::to_string))
+        .collect()
+}
+
+async fn query_object_ids_if_index_exists(
+    client: &reqwest::Client,
+    node_addr: &str,
+    tenant: &str,
+) -> Option<BTreeSet<String>> {
+    let response = client
+        .post(format!("http://{node_addr}/1/indexes/{tenant}/query"))
+        .json(&serde_json::json!({"query": ""}))
+        .send()
+        .await
+        .unwrap();
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return None;
+    }
+    let status = response.status();
+    let body: Value = response.json().await.unwrap();
+    assert!(
+        status.is_success(),
+        "query on {node_addr}/{tenant} failed with {status}: {body}"
+    );
+    Some(
+        body["hits"]
+            .as_array()
+            .unwrap_or_else(|| panic!("query response should include hits: {body}"))
+            .iter()
+            .filter_map(|hit| hit["objectID"].as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
+async fn wait_for_object_id(
+    client: &reqwest::Client,
+    node_addr: &str,
+    tenant: &str,
+    object_id: &str,
+) {
+    for _ in 0..200 {
+        if query_object_ids_if_index_exists(client, node_addr, tenant)
+            .await
+            .unwrap_or_default()
+            .contains(object_id)
+        {
+            return;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for {tenant}/{object_id} on {node_addr}");
+}
+
+async fn cluster_peer_ids(client: &reqwest::Client, node_addr: &str) -> BTreeSet<String> {
+    let status: Value = client
+        .get(format!("http://{node_addr}/internal/cluster/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let peers = status["peers"]
+        .as_array()
+        .expect("cluster status peers should be an array");
+    assert_eq!(
+        status["peers_total"].as_u64().unwrap(),
+        peers.len() as u64,
+        "peers_total must remain the active membership count"
+    );
+    peers
+        .iter()
+        .map(|peer| {
+            peer["peer_id"]
+                .as_str()
+                .expect("cluster peer should include peer_id")
+                .to_string()
+        })
+        .collect()
+}
+
+async fn wait_for_cluster_peer_ids(client: &reqwest::Client, node_addr: &str, expected: &[&str]) {
+    let expected = expected.iter().map(|value| value.to_string()).collect();
+    for _ in 0..300 {
+        let actual = cluster_peer_ids(client, node_addr).await;
+        if actual == expected {
+            return;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for cluster peers {expected:?} on {node_addr}");
+}
+
+#[tokio::test]
+async fn autoheal_rejoin_retained_node_converges_before_serving() {
+    let client = reqwest::Client::new();
+    let tenant = "autoheal_rejoin_retained";
+    let canary_id = "returner-was-away";
+
+    let mut cluster = common::state::spawn_autoheal_retained_triplet().await;
+
+    assert_eq!(cluster.node_a_peer_ids(), ["node-b", "node-c"]);
+    assert_eq!(cluster.node_b_peer_ids(), ["node-a", "node-c"]);
+    assert_eq!(cluster.node_c_peer_ids(), ["node-a", "node-b"]);
+
+    cluster.stop_node_c().await;
+
+    wait_for_cluster_peer_ids(&client, &cluster.node_a_addr, &["node-b"]).await;
+    wait_for_cluster_peer_ids(&client, &cluster.node_b_addr, &["node-a"]).await;
+
+    add_single_object(&client, &cluster.node_a_addr, tenant, canary_id).await;
+    wait_for_object_id(&client, &cluster.node_b_addr, tenant, canary_id).await;
+
+    let node_c_restarted = common::state::spawn_retained_node_from_node_json(cluster.node_c_dir())
+        .await
+        .expect("retained node should catch up before serving");
+
+    let first_read = query_object_ids(&client, &node_c_restarted.addr, tenant).await;
+    assert!(
+        first_read.contains(canary_id),
+        "first successful read from the returner must include the absent-write canary"
+    );
+
+    wait_for_cluster_peer_ids(&client, &cluster.node_a_addr, &["node-b", "node-c"]).await;
+    wait_for_cluster_peer_ids(&client, &cluster.node_b_addr, &["node-a", "node-c"]).await;
+
+    node_c_restarted.stop().await;
+    cluster.stop_survivors().await;
 }
 
 /// Retention-gap restart: if node-b's durable seq falls behind node-a's retained

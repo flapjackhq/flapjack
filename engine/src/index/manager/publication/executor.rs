@@ -5,9 +5,10 @@ use super::fault::{PublicationFaultPoint, PublicationIo};
 use super::fsops::reject_symlinked_managed_path_components;
 use super::{
     artifact_policy_table, classify_external_relative_path, invalid_publication,
-    validate_relative_path, ArtifactDisposition, ContentDigest, ExternalArtifactRoot,
-    PublicationEvent, PublicationFenceEvidence, PublicationGenerationEvidence, PublicationJournal,
-    PublicationPaths, PublicationTarget, PublicationTransactionId, Result, TantivyManagedInventory,
+    read_strict_committed_seq, validate_relative_path, ArtifactDisposition, ContentDigest,
+    ExternalArtifactRoot, PublicationEvent, PublicationFenceEvidence,
+    PublicationGenerationEvidence, PublicationJournal, PublicationPaths, PublicationTarget,
+    PublicationTransactionId, Result, TantivyManagedInventory,
 };
 use crate::analytics::config::{AnalyticsConfig, AnalyticsTargetArtifactPaths};
 use crate::query_suggestions::config::{QsConfigStore, QsTargetArtifactPaths};
@@ -156,12 +157,27 @@ impl PreStagedPublication {
     pub fn activate_create_only(
         self,
     ) -> std::result::Result<PublicationJournal, PreStagedActivationError> {
-        self.activate_with_mode(ActivationMode::CreateOnly)
+        self.activate_with_mode_and_fence(ActivationMode::CreateOnly, None)
+    }
+
+    pub(crate) fn activate_with_fence(
+        self,
+        fence_evidence: PublicationFenceEvidence,
+    ) -> std::result::Result<PublicationJournal, PreStagedActivationError> {
+        self.activate_with_mode_and_fence(ActivationMode::Replace, Some(fence_evidence))
     }
 
     fn activate_with_mode(
         self,
         mode: ActivationMode,
+    ) -> std::result::Result<PublicationJournal, PreStagedActivationError> {
+        self.activate_with_mode_and_fence(mode, None)
+    }
+
+    fn activate_with_mode_and_fence(
+        self,
+        mode: ActivationMode,
+        fence_evidence: Option<PublicationFenceEvidence>,
     ) -> std::result::Result<PublicationJournal, PreStagedActivationError> {
         // The inventory is collected before any reservation so it observes the real
         // trees rather than this activation's own empty reservation directory.
@@ -200,7 +216,7 @@ impl PreStagedPublication {
                 io: &io,
                 stage: &stage,
                 mode,
-                fence_evidence: None,
+                fence_evidence,
             },
         )
         .map_err(|source| PreStagedActivationError {
@@ -616,7 +632,11 @@ fn activate_publication_inner(
             return Err(error);
         }
     };
-    if let Err(error) = validate_caller_fence_evidence(context.fence_evidence.as_ref()) {
+    if let Err(error) =
+        validate_caller_fence_evidence(context.fence_evidence.as_ref()).and_then(|()| {
+            verify_staged_committed_seq_watermark(paths, context.fence_evidence.as_ref())
+        })
+    {
         cleanup_unprepared_transaction(paths, &manifest, inventory, context)?;
         return Err(error);
     }
@@ -678,6 +698,33 @@ fn prepare_digest_evidence(
 fn validate_caller_fence_evidence(evidence: Option<&PublicationFenceEvidence>) -> Result<()> {
     if let Some(evidence) = evidence {
         evidence.validate()?;
+    }
+    Ok(())
+}
+
+/// Prove, before any target mutation, that the staged tree carries a durable
+/// `committed_seq` sidecar equal to the drained watermark `W`. This uses the
+/// strict, fail-closed reader (never the recovery fail-open one): a missing,
+/// non-regular, unreadable, malformed, or mismatched sidecar refuses promotion
+/// rather than certifying stale content as `W`. Non-fence activations (move,
+/// create-only) carry no watermark and skip the proof.
+fn verify_staged_committed_seq_watermark(
+    paths: &PublicationPaths,
+    evidence: Option<&PublicationFenceEvidence>,
+) -> Result<()> {
+    let Some(evidence) = evidence else {
+        return Ok(());
+    };
+    let watermark = evidence.watermark().value();
+    let staged = read_strict_committed_seq(&paths.staging).map_err(|error| {
+        invalid_publication(format!(
+            "strict committed_seq watermark proof requires a durable staged sidecar: {error}"
+        ))
+    })?;
+    if staged != watermark {
+        return Err(invalid_publication(format!(
+            "strict committed_seq watermark proof mismatch: staged committed_seq {staged} does not equal drained watermark {watermark}"
+        )));
     }
     Ok(())
 }

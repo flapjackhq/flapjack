@@ -2,6 +2,8 @@ use super::circuit_breaker::CircuitBreaker;
 use super::types::{
     GetOpsQuery, GetOpsResponse, ListTenantsResponse, ReplicateOpsRequest, ReplicateOpsResponse,
 };
+use std::error::Error;
+use std::io::ErrorKind;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +20,13 @@ pub struct PeerClient {
     admin_key: Option<String>,
     last_success: Arc<AtomicU64>, // Unix timestamp in seconds
     circuit_breaker: CircuitBreaker,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerHealthCheck {
+    Healthy,
+    Unreachable { reason: String },
+    Indeterminate { reason: String },
 }
 
 impl PeerClient {
@@ -63,6 +72,11 @@ impl PeerClient {
 
     pub fn last_success_timestamp(&self) -> u64 {
         self.last_success.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_last_success_timestamp_for_test(&self, timestamp_secs: u64) {
+        self.last_success.store(timestamp_secs, Ordering::Relaxed);
     }
 
     /// Check if this peer's circuit breaker allows requests.
@@ -195,18 +209,21 @@ impl PeerClient {
     }
 
     /// Ping this peer's status endpoint (for active health probing).
-    /// Returns Ok(()) on success, Err on failure. Updates circuit breaker.
-    pub async fn health_check(&self) -> Result<(), String> {
+    pub async fn health_check(&self) -> PeerHealthCheck {
         let url = format!("{}/internal/status", self.base_url);
 
-        let response = self
-            .with_auth(self.http_client.get(&url))
-            .send()
-            .await
-            .map_err(|e| {
+        let response = match self.with_auth(self.http_client.get(&url)).send().await {
+            Ok(response) => response,
+            Err(error) => {
                 self.circuit_breaker.record_failure();
-                format!("Health check failed for {}: {}", self.peer_id, e)
-            })?;
+                let reason = format!("Health check failed for {}: {}", self.peer_id, error);
+                return if transport_error_proves_unreachable(&error) {
+                    PeerHealthCheck::Unreachable { reason }
+                } else {
+                    PeerHealthCheck::Indeterminate { reason }
+                };
+            }
+        };
 
         if response.status().is_success() {
             let now = std::time::SystemTime::now()
@@ -215,14 +232,16 @@ impl PeerClient {
                 .as_secs();
             self.last_success.store(now, Ordering::Relaxed);
             self.circuit_breaker.record_success();
-            Ok(())
+            PeerHealthCheck::Healthy
         } else {
             self.circuit_breaker.record_failure();
-            Err(format!(
-                "Health check for {} returned {}",
-                self.peer_id,
-                response.status()
-            ))
+            PeerHealthCheck::Indeterminate {
+                reason: format!(
+                    "Health check for {} returned {}",
+                    self.peer_id,
+                    response.status()
+                ),
+            }
         }
     }
 
@@ -264,10 +283,45 @@ impl PeerClient {
     }
 }
 
+fn transport_error_proves_unreachable(error: &reqwest::Error) -> bool {
+    error.is_timeout()
+        || error_source_has_kind(error, ErrorKind::ConnectionRefused)
+        || error_source_text_proves_unreachable(error)
+}
+
+fn error_source_has_kind(error: &(dyn Error + 'static), kind: ErrorKind) -> bool {
+    let mut current = Some(error);
+    while let Some(source) = current {
+        if source
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == kind)
+        {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
+fn error_source_text_proves_unreachable(error: &(dyn Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(source) = current {
+        let message = source.to_string();
+        if message.contains("dns error") || message.contains("failed to lookup address information")
+        {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::circuit_breaker::CircuitState;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_peer_client_creation() {
@@ -303,5 +357,97 @@ mod tests {
         );
         assert!(peer.is_available());
         assert_eq!(peer.circuit_breaker().state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn transport_error_text_classifies_dns_failure_as_unreachable() {
+        let error = std::io::Error::other(
+            "dns error: failed to lookup address information: nodename nor servname provided, or not known",
+        );
+
+        assert!(error_source_text_proves_unreachable(&error));
+    }
+
+    async fn spawn_status_peer(status: &str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response =
+            format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    #[tokio::test]
+    async fn health_check_classifies_success_as_healthy() {
+        let (base_url, handle) = spawn_status_peer("200 OK").await;
+        let peer = PeerClient::new("node-b".to_string(), base_url, None);
+
+        let outcome = peer.health_check().await;
+        handle.await.unwrap();
+
+        assert_eq!(outcome, PeerHealthCheck::Healthy);
+        assert!(peer.last_success_timestamp() > 0);
+        assert_eq!(peer.circuit_breaker().state(), CircuitState::Closed);
+    }
+
+    #[tokio::test]
+    async fn health_check_classifies_connection_refusal_as_unreachable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let peer = PeerClient::new("node-b".to_string(), format!("http://{}", addr), None);
+
+        let outcome = peer.health_check().await;
+
+        assert!(matches!(
+            outcome,
+            PeerHealthCheck::Unreachable { reason } if reason.contains("node-b")
+        ));
+    }
+
+    #[tokio::test]
+    async fn health_check_classifies_tls_connect_setup_failure_as_indeterminate() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n")
+                .await;
+            let _ = socket.shutdown().await;
+        });
+        let peer = PeerClient::new("node-b".to_string(), format!("https://{}", addr), None);
+
+        let outcome = peer.health_check().await;
+        handle.await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            PeerHealthCheck::Indeterminate { reason } if reason.contains("node-b")
+        ));
+    }
+
+    #[tokio::test]
+    async fn health_check_classifies_http_failure_as_indeterminate() {
+        let (base_url, handle) = spawn_status_peer("500 Internal Server Error").await;
+        let peer = PeerClient::new("node-b".to_string(), base_url, None);
+
+        let outcome = peer.health_check().await;
+        handle.await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PeerHealthCheck::Indeterminate {
+                reason: "Health check for node-b returned 500 Internal Server Error".to_string()
+            }
+        );
     }
 }

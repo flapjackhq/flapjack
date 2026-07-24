@@ -270,6 +270,55 @@ Snapshot export and import offload their synchronous tar/gzip work onto a blocki
 **Recovery:** Resolve network/auth/timeout issues before restarting replicas that must catch up.
 **Test (where applicable):** `cargo test -p flapjack-http handlers::internal::tests::cluster_status_ha_returns_peer_list_with_correct_shape -- --exact`; `cargo test -p flapjack-replication manager::tests::test_peer_statuses_initially_never_contacted -- --exact`
 
+### Scenario: Dead-node auto-heal
+
+**Symptom:** An HA peer is unreachable long enough that operators need to know
+whether Flapjack will retain it, evict it, or readmit it.
+**Diagnosis:** Auto-heal is default-off. Enable it only with
+`FLAPJACK_AUTOHEAL_ENABLED=true`; any other value, including an invalid trimmed
+case-insensitive boolean, behaves as `false` and logs a warning as documented in
+[OPS_CONFIGURATION.md](./OPS_CONFIGURATION.md#replication). When enabled, the
+replication health-probe loop uses the fixed threshold of three consecutive
+unreachable observations and can take at most one eviction action per
+membership-scoped probe pass. The decision owner is
+`engine/flapjack-replication/src/autoheal.rs::decide`: `hold`,
+`refuse_disabled`, `refuse_would_break_quorum`, `refuse_indeterminate`, or
+`evict`.
+
+The quorum guard uses `N = peer_count_at_observation_start + 1`,
+`required = floor(N / 2) + 1`, and compares `N - unavailable_peer_count` with
+`required`. Healthy or indeterminate observations reset or refuse the candidate
+instead of accumulating toward eviction; membership changes replace the active
+observation window; process restart starts a fresh in-memory window. Majority
+peer loss is refused as possible local isolation. This is a local eviction
+safety rule, not leader election, a majority write path, consensus, arbitrary
+partition healing, or quorum recovery.
+
+**Recovery:**
+
+1. Query every reachable survivor with the admin-only status endpoint:
+   `curl -sS -H "x-algolia-api-key: $FLAPJACK_ADMIN_KEY" "$NODE/internal/cluster/status"`.
+   Check `autoheal_enabled`, then each `autoheal_peers[]` entry's
+   `peer_id`, `addr`, `observation_count`, exact `decision`, and `action`
+   `phase`/`outcome`/`error`.
+2. Inspect `${FLAPJACK_DATA_DIR}/autoheal_decisions.jsonl` on survivors for the
+   ordered decision IDs, membership snapshots, candidates, intent records, and
+   outcomes. `decision_recorded/not_required` means no action was required;
+   `eviction_outcome/success` means membership was removed through
+   `ReplicationManager::remove_peer`; `eviction_outcome/failure`,
+   `readmission_outcome/failure`, or `outcome_unknown` means the operator should
+   preserve evidence and investigate storage, membership persistence, or peer
+   reachability before issuing manual membership changes.
+3. For repeated `refuse_would_break_quorum` or `refuse_indeterminate`, assume
+   the local node may be isolated or the observation set is unsafe. Restore
+   network/auth reachability and compare survivor status before removing peers.
+4. A successfully evicted candidate keeps its address in the journal. When that
+   node returns healthy, survivor-side auto-heal readmission uses
+   `ReplicationManager::add_peer`; the returning node must still complete
+   startup catch-up before authoritative reads.
+
+**Test (where applicable):** `cd engine && timeout 600 cargo test -p flapjack-replication --no-fail-fast -- autoheal`; `cd engine && timeout 600 cargo test -p flapjack-http --no-fail-fast -- cluster_status`; `sh deploy/helm/flapjack/test_live_cluster.sh`
+
 ### Scenario: Replica bootstrap refusal when peer is unreachable
 
 **Symptom:** Restarted replica refuses to serve and logs peer fetch failures (`Failed to fetch tenants`, `Failed to fetch ops`, or circuit-breaker trips), including `pre-serve catch-up timed out after <n>s; refusing to serve stale data`.
@@ -292,33 +341,30 @@ safety and external load-balancer routing.
 `{DATA_DIR}/node.json` takes precedence over environment fallback and contains
 `{node_id, bind_addr, peers:[{node_id, addr}]}`. Without a valid `node.json`,
 `FLAPJACK_NODE_ID`, `FLAPJACK_BIND_ADDR`, and `FLAPJACK_PEERS` in
-`node_id=addr,...` form provide the fallback. `ReplicationManager::new` builds
-the peer clients at startup, so there is no runtime `add_peer` or `remove_peer`
-mutation path today; planned FP-2 dynamic membership API work is expected to
-remove the full-cluster restart requirement after it merges, but no such API is
-available for this runbook.
+`node_id=addr,...` form provide the fallback. Runtime membership changes use
+the admin-only `/internal/cluster/peers` add/remove endpoints, which persist
+through `ReplicationManager::{add_peer,remove_peer}` and the existing
+`node.json` owner.
 **Recovery:**
 
-1. **ADD:** Provision the new node with every existing member in its peer list,
-   add the new `node_id=addr` to every existing node's persisted peer
-   configuration, then start the new node while it is still drained from the
-   external-LB. Keep strict bootstrap enabled: `run_pre_serve_catchup` runs
-   before serving, discovers tenants from peers, pulls oplog data or restores
-   snapshots as needed, and defaults to strict bootstrap. Setting
+1. **ADD:** Start the new node while it is still drained from the external-LB,
+   with either a static peer list or `FLAPJACK_BOOTSTRAP_PEER` pointed at a
+   running survivor so strict startup catch-up has a discovery source. Keep
+   strict bootstrap enabled: `run_pre_serve_catchup` runs before serving,
+   discovers tenants from peers, pulls oplog data or restores snapshots as
+   needed, and defaults to strict bootstrap. Setting
    `FLAPJACK_STARTUP_CATCHUP_STRICT=0` or `false` permits startup after catch-up
-   or reachability failures and risks stale reads, so do not use it for this ADD
-   procedure. Wait for initial catch-up and a healthy check, rolling-restart the
-   existing nodes so they load the new peer, then restart the still-LB-drained
-   new node once more so strict pre-serve catch-up closes writes accepted during
-   that rollout. Only after that final catch-up reports healthy should the new
-   node be added to and reloaded in the external load balancer; do not route
-   client traffic to it earlier.
+   or reachability failures and risks stale reads. After the node is healthy,
+   add it through the admin-only `/internal/cluster/peers` endpoint on each
+   existing member and verify `/internal/cluster/status` reports the same peer
+   set before routing client traffic to it.
 2. **REMOVE:** Drain and remove the node from the external load balancer first,
-   reload the LB, stop the flapjack process, remove its `node_id=addr` from
-   every remaining node's persisted peer configuration, then rolling-restart the
-   remaining nodes. A stale removed-peer entry is not harmless under strict
-   bootstrap: an unreachable configured peer can make a restarted node refuse to
-   serve instead of risking stale reads.
+   reload the LB, then delete it through the admin-only
+   `/internal/cluster/peers/:node_id` endpoint on each survivor. Verify
+   `/internal/cluster/status` no longer lists the removed peer before stopping
+   it. A stale removed-peer entry is not harmless under strict bootstrap: an
+   unreachable configured peer can make a restarted node refuse to serve instead
+   of risking stale reads.
 3. **LB:** Flapjack does not provide a built-in load balancer. Additions enter
    the upstream list only after the post-rollout final catch-up and health
    verification; removals leave it before process shutdown. The worked

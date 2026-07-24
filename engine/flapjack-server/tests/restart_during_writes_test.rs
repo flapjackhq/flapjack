@@ -75,21 +75,51 @@ fn acknowledged_writes_remain_searchable_across_restart_during_active_traffic() 
         .join()
         .expect("writer thread should join cleanly after restart proof");
 
-    let acknowledged_count = acknowledged_ids
+    let acknowledged_ids = acknowledged_ids
         .lock()
         .expect("writer ids mutex poisoned")
-        .len();
+        .clone();
+    let acknowledged_count = acknowledged_ids.len();
     assert!(
         acknowledged_count >= target_acknowledged_docs,
         "expected at least {target_acknowledged_docs} acknowledged docs across restart, got {acknowledged_count}"
     );
 
-    let post_restart_search = server.search(index_name, json!({ "query": shared_query_token }));
-    assert_eq!(
-        post_restart_search["nbHits"],
-        json!(acknowledged_count),
-        "all acknowledged docs must remain searchable after restart: {post_restart_search}"
+    // A write can become durable immediately before SIGKILL prevents the client
+    // from observing its response. Prove every acknowledged ID survived without
+    // treating such correctly replayed, outcome-unknown writes as data corruption.
+    let post_restart_search = server.search(
+        index_name,
+        json!({
+            "query": shared_query_token,
+            "hitsPerPage": 1000
+        }),
     );
+    let post_restart_count = post_restart_search["nbHits"]
+        .as_u64()
+        .expect("post-restart search must report an integer nbHits")
+        as usize;
+    let searchable_ids = post_restart_search["hits"]
+        .as_array()
+        .expect("post-restart search must report hits")
+        .iter()
+        .map(|hit| {
+            hit["objectID"]
+                .as_str()
+                .expect("post-restart hit must report an objectID")
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        searchable_ids.len(),
+        post_restart_count,
+        "hitsPerPage must expose every post-restart hit: {post_restart_search}"
+    );
+    for acknowledged_id in &acknowledged_ids {
+        assert!(
+            searchable_ids.contains(acknowledged_id.as_str()),
+            "acknowledged document {acknowledged_id} must remain searchable after restart: {post_restart_search}"
+        );
+    }
 
     let final_task_id = server.add_documents_batch(
         index_name,
@@ -114,7 +144,7 @@ fn acknowledged_writes_remain_searchable_across_restart_during_active_traffic() 
     let final_search = server.search(index_name, json!({ "query": shared_query_token }));
     assert_eq!(
         final_search["nbHits"],
-        json!(acknowledged_count + 1),
+        json!(post_restart_count + 1),
         "server must keep accepting writes after the restart-under-load proof: {final_search}"
     );
 }

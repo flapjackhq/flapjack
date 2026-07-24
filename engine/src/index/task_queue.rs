@@ -113,24 +113,21 @@ async fn process_export(
 
     _manager.write_queues.remove(&_tenant_id);
 
-    if let Some((_, handle)) = _manager.write_task_handles.remove(&_tenant_id) {
-        match handle.await {
-            Ok(Ok(())) => (),
-            Ok(Err(e)) => {
-                _tasks.alter(&_task_id, |_, mut t| {
-                    t.status = TaskStatus::Failed(format!("Commit failed: {}", e));
-                    t
-                });
-                return;
-            }
-            Err(e) => {
-                _tasks.alter(&_task_id, |_, mut t| {
-                    t.status = TaskStatus::Failed(format!("Write task panicked: {:?}", e));
-                    t
-                });
-                return;
-            }
+    if let Some(handle) = _manager
+        .write_task_handles
+        .get(&_tenant_id)
+        .map(|entry| entry.value().clone())
+    {
+        if let Err(error) = handle.drain(_tenant_id.clone()).await {
+            _tasks.alter(&_task_id, |_, mut t| {
+                t.status = TaskStatus::Failed(format!("Commit failed: {}", error));
+                t
+            });
+            return;
         }
+        _manager
+            .write_task_handles
+            .remove_if(&_tenant_id, |_, current| current.same_handle(&handle));
     }
 
     let src = _manager.base_path.join(&_tenant_id);

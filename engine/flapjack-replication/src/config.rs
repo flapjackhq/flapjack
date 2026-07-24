@@ -18,7 +18,7 @@ pub struct NodeConfig {
     pub bootstrap_peer: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerConfig {
     pub node_id: String,
     pub addr: String, // e.g., "http://10.0.1.2:7700" or "http://node-b:7700"

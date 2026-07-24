@@ -240,7 +240,7 @@ fn aggregate_source_item_hashes(mut item_hashes: Vec<(String, String)>) -> Strin
         hasher.update(stable_id.as_bytes());
         hasher.update([0]);
         hasher.update(item_hash.as_bytes());
-        hasher.update([b'\n']);
+        hasher.update(*b"\n");
     }
     hex::encode(hasher.finalize())
 }

@@ -154,7 +154,17 @@ fn create_algolia_experiment_body(index_name: &str) -> serde_json::Value {
 }
 
 async fn seed_exact_index_collision_fixture(app: &Router) {
-    for index_name in ["products", "Products", "products_staging", "orders"] {
+    // `products`, `products_staging`, and `products_v2` all share the `products`
+    // prefix (and `Products` collides only under case-insensitive matching), so an
+    // exact `indexName=products` filter must return exactly one experiment while a
+    // `indexPrefix=products` filter returns all three prefix collisions.
+    for index_name in [
+        "products",
+        "Products",
+        "products_staging",
+        "orders",
+        "products_v2",
+    ] {
         let response = send_json_request(
             app,
             Method::POST,
@@ -1835,13 +1845,24 @@ async fn list_experiments_filter_applied_before_pagination() {
     assert_eq!(json["count"], 3);
 }
 
+/// Regression-pin that exact `indexName` filtering is exact, never prefix.
+///
+/// The collision fixture seeds three `products`-prefixed control indexes
+/// (`products`, `products_staging`, `products_v2`). Against the same fixture:
+/// - `indexName=products` must return only the exactly-named index (count 1).
+/// - `indexPrefix=products` must return all three prefix collisions (count 3).
+///
+/// If exact matching silently degraded into prefix matching, the exact query
+/// would return 3 instead of 1 and this test would fail — that divergence is the
+/// mutation-sensitive proof that the two filters cannot behave identically.
 #[tokio::test]
-async fn list_experiments_filters_by_exact_index_name() {
+async fn list_experiments_index_name_is_exact_not_prefix() {
     let tmp = TempDir::new().unwrap();
     let state = make_experiments_state(&tmp);
     let app = app_router(state);
     seed_exact_index_collision_fixture(&app).await;
 
+    // Exact match: only the experiment whose control index is exactly `products`.
     let response = send_empty_request(&app, Method::GET, "/2/abtests?indexName=products").await;
     assert_eq!(response.status(), StatusCode::OK);
     let json = body_json(response).await;
@@ -1852,6 +1873,36 @@ async fn list_experiments_filters_by_exact_index_name() {
         .expect("abtests must be an array");
     assert_eq!(abtests.len(), 1);
     assert_eq!(abtests[0]["variants"][0]["index"], "products");
+
+    // Prefix match against the same fixture: every control index starting with
+    // `products`, i.e. `products`, `products_staging`, and `products_v2`.
+    let response = send_empty_request(&app, Method::GET, "/2/abtests?indexPrefix=products").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["count"], 3);
+    assert_eq!(json["total"], 3);
+    let abtests = json["abtests"]
+        .as_array()
+        .expect("abtests must be an array");
+    assert_eq!(abtests.len(), 3);
+    let mut control_indexes: Vec<String> = abtests
+        .iter()
+        .map(|t| {
+            t["variants"][0]["index"]
+                .as_str()
+                .expect("control variant index must be a string")
+                .to_string()
+        })
+        .collect();
+    control_indexes.sort();
+    assert_eq!(
+        control_indexes,
+        vec![
+            "products".to_string(),
+            "products_staging".to_string(),
+            "products_v2".to_string(),
+        ]
+    );
 }
 
 #[tokio::test]

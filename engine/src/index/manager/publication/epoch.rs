@@ -3,10 +3,14 @@ use super::fsops::{
 };
 use super::{PublicationPaths, PublicationTarget};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 
 const PUBLICATION_DIR: &str = ".publication";
 const EPOCH_FILE: &str = "epoch";
@@ -38,10 +42,127 @@ pub enum PublicationEpochError {
 }
 
 #[derive(Debug)]
+pub enum PublicationEpochAdmissionError {
+    Busy,
+    Stale {
+        observed: PublicationEpoch,
+        current: PublicationEpoch,
+    },
+    Epoch(PublicationEpochError),
+}
+
+#[derive(Debug)]
 pub struct PublicationEpochFence {
     _lock: File,
+    _pending_advance: PublicationEpochPendingAdvance,
     previous: PublicationEpoch,
     advanced: PublicationEpoch,
+}
+
+#[derive(Debug)]
+pub struct PublicationEpochAdmissionGuard {
+    _lock: File,
+    observed: PublicationEpoch,
+}
+
+#[derive(Debug)]
+struct PublicationEpochPendingAdvance {
+    lock_path: PathBuf,
+}
+
+static PENDING_EPOCH_ADVANCES: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+type PublicationEpochAdvanceCheckpointHook =
+    Arc<dyn Fn(&PublicationTarget, PublicationEpoch) + Send + Sync + 'static>;
+
+#[cfg(test)]
+type PublicationEpochAdmissionLockCheckpointHook = Arc<dyn Fn(&Path) + Send + Sync + 'static>;
+
+#[cfg(test)]
+type PublicationEpochAdmissionPreLockCheckpointHook = Arc<dyn Fn(&Path) + Send + Sync + 'static>;
+
+#[cfg(test)]
+type PublicationEpochOpenLockFileCheckpointHook = Arc<dyn Fn(&Path) + Send + Sync + 'static>;
+
+#[cfg(test)]
+static PUBLICATION_EPOCH_ADVANCE_CHECKPOINT_HOOK: OnceLock<
+    Mutex<Option<PublicationEpochAdvanceCheckpointHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static PUBLICATION_EPOCH_ADMISSION_LOCK_CHECKPOINT_HOOK: OnceLock<
+    Mutex<Option<PublicationEpochAdmissionLockCheckpointHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static PUBLICATION_EPOCH_ADMISSION_PRE_LOCK_CHECKPOINT_HOOK: OnceLock<
+    Mutex<Option<PublicationEpochAdmissionPreLockCheckpointHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static PUBLICATION_EPOCH_OPEN_LOCK_FILE_CHECKPOINT_HOOK: OnceLock<
+    Mutex<Option<PublicationEpochOpenLockFileCheckpointHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct PublicationEpochAdvanceCheckpointHookGuard {
+    previous: Option<PublicationEpochAdvanceCheckpointHook>,
+}
+
+#[cfg(test)]
+pub(crate) struct PublicationEpochAdmissionLockCheckpointHookGuard {
+    previous: Option<PublicationEpochAdmissionLockCheckpointHook>,
+}
+
+#[cfg(test)]
+pub(crate) struct PublicationEpochAdmissionPreLockCheckpointHookGuard {
+    previous: Option<PublicationEpochAdmissionPreLockCheckpointHook>,
+}
+
+#[cfg(test)]
+pub(crate) struct PublicationEpochOpenLockFileCheckpointHookGuard {
+    previous: Option<PublicationEpochOpenLockFileCheckpointHook>,
+}
+
+#[cfg(test)]
+impl Drop for PublicationEpochAdvanceCheckpointHookGuard {
+    fn drop(&mut self) {
+        *publication_epoch_advance_checkpoint_hook().lock().unwrap() = self.previous.take();
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublicationEpochAdmissionLockCheckpointHookGuard {
+    fn drop(&mut self) {
+        *publication_epoch_admission_lock_checkpoint_hook()
+            .lock()
+            .unwrap() = self.previous.take();
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublicationEpochAdmissionPreLockCheckpointHookGuard {
+    fn drop(&mut self) {
+        *publication_epoch_admission_pre_lock_checkpoint_hook()
+            .lock()
+            .unwrap() = self.previous.take();
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublicationEpochOpenLockFileCheckpointHookGuard {
+    fn drop(&mut self) {
+        *publication_epoch_open_lock_file_checkpoint_hook()
+            .lock()
+            .unwrap() = self.previous.take();
+    }
+}
+
+impl PublicationEpochAdmissionGuard {
+    pub fn observed(&self) -> PublicationEpoch {
+        self.observed
+    }
 }
 
 impl PublicationEpochFence {
@@ -108,6 +229,31 @@ pub fn read_publication_epoch(
     observe_publication_epoch(base, target).map(PublicationEpochObservation::value)
 }
 
+pub(crate) fn capture_publication_epoch(
+    base: &Path,
+    target: &PublicationTarget,
+) -> Result<PublicationEpoch, PublicationEpochAdmissionError> {
+    read_publication_epoch(base, target).map_err(PublicationEpochAdmissionError::Epoch)
+}
+
+pub(crate) fn try_validate_publication_epoch_admission(
+    base: &Path,
+    target: &PublicationTarget,
+    observed: PublicationEpoch,
+) -> Result<PublicationEpochAdmissionGuard, PublicationEpochAdmissionError> {
+    let paths = publication_epoch_paths(base, target);
+    let lock = try_acquire_epoch_admission_lock(base, &paths)?;
+    let current =
+        read_publication_epoch(base, target).map_err(PublicationEpochAdmissionError::Epoch)?;
+    if current != observed {
+        return Err(PublicationEpochAdmissionError::Stale { observed, current });
+    }
+    Ok(PublicationEpochAdmissionGuard {
+        _lock: lock,
+        observed,
+    })
+}
+
 pub(super) fn observe_publication_epoch(
     base: &Path,
     target: &PublicationTarget,
@@ -142,6 +288,8 @@ pub fn compare_and_advance_publication_epoch(
     expected: PublicationEpoch,
 ) -> Result<PublicationEpochFence, PublicationEpochError> {
     let paths = publication_epoch_paths(base, target);
+    let pending_advance = PublicationEpochPendingAdvance::register(paths.lock.clone());
+    run_publication_epoch_advance_checkpoint_for_test(target, expected);
     let lock = acquire_epoch_lock(base, &paths)?;
     let previous = read_publication_epoch(base, target)?;
     if previous != expected {
@@ -164,10 +312,144 @@ pub fn compare_and_advance_publication_epoch(
 
     Ok(PublicationEpochFence {
         _lock: lock,
+        _pending_advance: pending_advance,
         previous,
         advanced,
     })
 }
+
+#[cfg(test)]
+pub(crate) fn set_publication_epoch_advance_checkpoint_hook_for_test(
+    hook: impl Fn(&PublicationTarget, PublicationEpoch) + Send + Sync + 'static,
+) -> PublicationEpochAdvanceCheckpointHookGuard {
+    let mut slot = publication_epoch_advance_checkpoint_hook().lock().unwrap();
+    PublicationEpochAdvanceCheckpointHookGuard {
+        previous: slot.replace(Arc::new(hook)),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_publication_epoch_admission_lock_checkpoint_hook_for_test(
+    hook: impl Fn(&Path) + Send + Sync + 'static,
+) -> PublicationEpochAdmissionLockCheckpointHookGuard {
+    let mut slot = publication_epoch_admission_lock_checkpoint_hook()
+        .lock()
+        .unwrap();
+    PublicationEpochAdmissionLockCheckpointHookGuard {
+        previous: slot.replace(Arc::new(hook)),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_publication_epoch_admission_pre_lock_checkpoint_hook_for_test(
+    hook: impl Fn(&Path) + Send + Sync + 'static,
+) -> PublicationEpochAdmissionPreLockCheckpointHookGuard {
+    let mut slot = publication_epoch_admission_pre_lock_checkpoint_hook()
+        .lock()
+        .unwrap();
+    PublicationEpochAdmissionPreLockCheckpointHookGuard {
+        previous: slot.replace(Arc::new(hook)),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_publication_epoch_open_lock_file_checkpoint_hook_for_test(
+    hook: impl Fn(&Path) + Send + Sync + 'static,
+) -> PublicationEpochOpenLockFileCheckpointHookGuard {
+    let mut slot = publication_epoch_open_lock_file_checkpoint_hook()
+        .lock()
+        .unwrap();
+    PublicationEpochOpenLockFileCheckpointHookGuard {
+        previous: slot.replace(Arc::new(hook)),
+    }
+}
+
+#[cfg(test)]
+fn publication_epoch_advance_checkpoint_hook(
+) -> &'static Mutex<Option<PublicationEpochAdvanceCheckpointHook>> {
+    PUBLICATION_EPOCH_ADVANCE_CHECKPOINT_HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn publication_epoch_admission_lock_checkpoint_hook(
+) -> &'static Mutex<Option<PublicationEpochAdmissionLockCheckpointHook>> {
+    PUBLICATION_EPOCH_ADMISSION_LOCK_CHECKPOINT_HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn publication_epoch_admission_pre_lock_checkpoint_hook(
+) -> &'static Mutex<Option<PublicationEpochAdmissionPreLockCheckpointHook>> {
+    PUBLICATION_EPOCH_ADMISSION_PRE_LOCK_CHECKPOINT_HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn publication_epoch_open_lock_file_checkpoint_hook(
+) -> &'static Mutex<Option<PublicationEpochOpenLockFileCheckpointHook>> {
+    PUBLICATION_EPOCH_OPEN_LOCK_FILE_CHECKPOINT_HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn run_publication_epoch_advance_checkpoint_for_test(
+    target: &PublicationTarget,
+    expected: PublicationEpoch,
+) {
+    let hook = publication_epoch_advance_checkpoint_hook()
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some(hook) = hook {
+        hook(target, expected);
+    }
+}
+
+#[cfg(test)]
+fn run_publication_epoch_admission_lock_checkpoint_for_test(lock_path: &Path) {
+    let hook = publication_epoch_admission_lock_checkpoint_hook()
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some(hook) = hook {
+        hook(lock_path);
+    }
+}
+
+#[cfg(test)]
+fn run_publication_epoch_admission_pre_lock_checkpoint_for_test(lock_path: &Path) {
+    let hook = publication_epoch_admission_pre_lock_checkpoint_hook()
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some(hook) = hook {
+        hook(lock_path);
+    }
+}
+
+#[cfg(test)]
+fn run_publication_epoch_open_lock_file_checkpoint_for_test(lock_path: &Path) {
+    let hook = publication_epoch_open_lock_file_checkpoint_hook()
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some(hook) = hook {
+        hook(lock_path);
+    }
+}
+
+#[cfg(not(test))]
+fn run_publication_epoch_advance_checkpoint_for_test(
+    _target: &PublicationTarget,
+    _expected: PublicationEpoch,
+) {
+}
+
+#[cfg(not(test))]
+fn run_publication_epoch_admission_lock_checkpoint_for_test(_lock_path: &Path) {}
+
+#[cfg(not(test))]
+fn run_publication_epoch_admission_pre_lock_checkpoint_for_test(_lock_path: &Path) {}
+
+#[cfg(not(test))]
+fn run_publication_epoch_open_lock_file_checkpoint_for_test(_lock_path: &Path) {}
 
 impl PublicationPaths {
     pub fn epoch_path(&self) -> PathBuf {
@@ -285,7 +567,20 @@ fn acquire_epoch_lock(
     base: &Path,
     paths: &PublicationEpochPaths,
 ) -> Result<File, PublicationEpochError> {
+    let file = open_epoch_lock_file(base, paths)?;
+    file.lock().map_err(|source| PublicationEpochError::Io {
+        path: paths.lock.clone(),
+        source,
+    })?;
+    Ok(file)
+}
+
+fn open_epoch_lock_file(
+    base: &Path,
+    paths: &PublicationEpochPaths,
+) -> Result<File, PublicationEpochError> {
     reject_epoch_managed_paths(base, paths, &paths.lock)?;
+    run_publication_epoch_open_lock_file_checkpoint_for_test(&paths.lock);
     if let Some(parent) = paths.lock.parent() {
         fs::create_dir_all(parent).map_err(|source| PublicationEpochError::Io {
             path: parent.to_path_buf(),
@@ -293,7 +588,7 @@ fn acquire_epoch_lock(
         })?;
     }
     reject_epoch_managed_paths(base, paths, &paths.lock)?;
-    let file = OpenOptions::new()
+    OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
@@ -302,12 +597,56 @@ fn acquire_epoch_lock(
         .map_err(|source| PublicationEpochError::Io {
             path: paths.lock.clone(),
             source,
-        })?;
-    file.lock().map_err(|source| PublicationEpochError::Io {
-        path: paths.lock.clone(),
-        source,
+        })
+}
+
+fn try_acquire_epoch_admission_lock(
+    base: &Path,
+    paths: &PublicationEpochPaths,
+) -> Result<File, PublicationEpochAdmissionError> {
+    let file = open_epoch_lock_file(base, paths).map_err(PublicationEpochAdmissionError::Epoch)?;
+    let pending_advances = pending_epoch_advances().lock().unwrap();
+    if pending_advances.contains_key(&paths.lock) {
+        return Err(PublicationEpochAdmissionError::Busy);
+    }
+    run_publication_epoch_admission_pre_lock_checkpoint_for_test(&paths.lock);
+    file.try_lock_shared().map_err(|source| match source {
+        std::fs::TryLockError::WouldBlock => PublicationEpochAdmissionError::Busy,
+        std::fs::TryLockError::Error(source) => {
+            PublicationEpochAdmissionError::Epoch(PublicationEpochError::Io {
+                path: paths.lock.clone(),
+                source,
+            })
+        }
     })?;
+    drop(pending_advances);
+    run_publication_epoch_admission_lock_checkpoint_for_test(&paths.lock);
     Ok(file)
+}
+
+impl PublicationEpochPendingAdvance {
+    fn register(lock_path: PathBuf) -> Self {
+        let mut pending = pending_epoch_advances().lock().unwrap();
+        *pending.entry(lock_path.clone()).or_insert(0) += 1;
+        Self { lock_path }
+    }
+}
+
+impl Drop for PublicationEpochPendingAdvance {
+    fn drop(&mut self) {
+        let mut pending = pending_epoch_advances().lock().unwrap();
+        let Some(count) = pending.get_mut(&self.lock_path) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            pending.remove(&self.lock_path);
+        }
+    }
+}
+
+fn pending_epoch_advances() -> &'static Mutex<BTreeMap<PathBuf, usize>> {
+    PENDING_EPOCH_ADVANCES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 fn persist_epoch(
@@ -383,358 +722,4 @@ fn reject_epoch_managed_paths(
 
 fn epoch_sidecar_residue_exists(paths: &PublicationEpochPaths) -> bool {
     paths.temp.exists() || paths.lock.exists()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::index::manager::publication::PublicationTransactionId;
-    use std::fs;
-    use std::io;
-    use std::sync::{mpsc, Arc, Barrier};
-    use std::time::Duration;
-    use tempfile::TempDir;
-
-    fn target(name: &str) -> PublicationTarget {
-        PublicationTarget::new(name).unwrap()
-    }
-
-    fn transaction(id: &str) -> PublicationTransactionId {
-        PublicationTransactionId::new(id).unwrap()
-    }
-
-    #[test]
-    fn epoch_paths_are_per_target_and_transaction_independent() {
-        let tmp = TempDir::new().unwrap();
-        let products = target("products");
-        let users = target("users");
-        let first = PublicationPaths::new(tmp.path(), &products, &transaction("txn_001"));
-        let second = PublicationPaths::new(tmp.path(), &products, &transaction("txn_002"));
-        let other = PublicationPaths::new(tmp.path(), &users, &transaction("txn_001"));
-
-        assert_eq!(
-            first.epoch_path(),
-            tmp.path().join(".publication/products/epoch")
-        );
-        assert_eq!(
-            first.epoch_temp_path(),
-            tmp.path().join(".publication/products/epoch.tmp")
-        );
-        assert_eq!(
-            first.epoch_lock_path(),
-            tmp.path().join(".publication/products/epoch.lock")
-        );
-        assert_eq!(first.epoch_path(), second.epoch_path());
-        assert_eq!(first.epoch_temp_path(), second.epoch_temp_path());
-        assert_eq!(first.epoch_lock_path(), second.epoch_lock_path());
-        assert_ne!(first.epoch_path(), other.epoch_path());
-        assert_ne!(first.epoch_lock_path(), other.epoch_lock_path());
-    }
-
-    #[test]
-    fn missing_epoch_reads_as_initial_zero() {
-        let tmp = TempDir::new().unwrap();
-
-        assert_eq!(
-            read_publication_epoch(tmp.path(), &target("products")).unwrap(),
-            PublicationEpoch(0)
-        );
-    }
-
-    #[test]
-    fn missing_epoch_with_lock_residue_still_reads_zero_but_observes_sidecar_state() {
-        let tmp = TempDir::new().unwrap();
-        let target = target("products");
-        let paths = publication_epoch_paths_for_target_path(&tmp.path().join("products"));
-        fs::create_dir_all(paths.lock.parent().unwrap()).unwrap();
-        fs::write(&paths.lock, b"").unwrap();
-
-        assert_eq!(
-            read_publication_epoch(tmp.path(), &target).unwrap(),
-            PublicationEpoch(0)
-        );
-        assert_eq!(
-            observe_publication_epoch(tmp.path(), &target).unwrap(),
-            PublicationEpochObservation::AbsentWithSidecars
-        );
-    }
-
-    #[test]
-    fn epoch_reader_rejects_noncanonical_or_overflowing_state_with_typed_error() {
-        let tmp = TempDir::new().unwrap();
-        let target = target("products");
-        let paths = publication_epoch_paths_for_target_path(&tmp.path().join("products"));
-        fs::create_dir_all(paths.epoch.parent().unwrap()).unwrap();
-
-        for bytes in [
-            b"".as_slice(),
-            b"-1".as_slice(),
-            b" 1".as_slice(),
-            b"1 ".as_slice(),
-            b"1\n".as_slice(),
-            b"01".as_slice(),
-            b"1x".as_slice(),
-            &[0xff, b'1'],
-            b"18446744073709551616".as_slice(),
-        ] {
-            fs::write(&paths.epoch, bytes).unwrap();
-            match read_publication_epoch(tmp.path(), &target) {
-                Err(PublicationEpochError::CorruptState { path }) => {
-                    assert_eq!(path, paths.epoch);
-                }
-                other => panic!("expected corrupt epoch state for {bytes:?}, got {other:?}"),
-            }
-        }
-
-        fs::write(&paths.epoch, b"18446744073709551615").unwrap();
-        assert_eq!(
-            read_publication_epoch(tmp.path(), &target).unwrap(),
-            PublicationEpoch(u64::MAX)
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn epoch_reader_rejects_oversized_state_before_loading_contents() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = TempDir::new().unwrap();
-        let target = target("products");
-        let paths = publication_epoch_paths_for_target_path(&tmp.path().join("products"));
-        fs::create_dir_all(paths.epoch.parent().unwrap()).unwrap();
-        fs::write(&paths.epoch, b"184467440737095516150").unwrap();
-        fs::set_permissions(&paths.epoch, fs::Permissions::from_mode(0o000)).unwrap();
-
-        let result = read_publication_epoch(tmp.path(), &target);
-
-        fs::set_permissions(&paths.epoch, fs::Permissions::from_mode(0o600)).unwrap();
-        match result {
-            Err(PublicationEpochError::CorruptState { path }) => {
-                assert_eq!(path, paths.epoch);
-            }
-            other => {
-                panic!("expected oversized epoch state to fail closed as corrupt, got {other:?}")
-            }
-        }
-    }
-
-    #[test]
-    fn epoch_io_rejects_symlinked_managed_components_without_external_mutation() {
-        let tmp = TempDir::new().unwrap();
-        let external = TempDir::new().unwrap();
-        fs::create_dir_all(tmp.path().join(".publication")).unwrap();
-        symlink_dir(external.path(), tmp.path().join(".publication/products")).unwrap();
-
-        match read_publication_epoch(tmp.path(), &target("products")) {
-            Err(PublicationEpochError::Io { path, source }) => {
-                assert_eq!(path, tmp.path().join(".publication/products/epoch"));
-                assert_eq!(source.kind(), io::ErrorKind::InvalidInput);
-            }
-            other => panic!("expected symlink rejection for epoch read, got {other:?}"),
-        }
-
-        match compare_and_advance_publication_epoch(
-            tmp.path(),
-            &target("products"),
-            PublicationEpoch(0),
-        ) {
-            Err(PublicationEpochError::Io { path, source }) => {
-                assert_eq!(path, tmp.path().join(".publication/products/epoch.lock"));
-                assert_eq!(source.kind(), io::ErrorKind::InvalidInput);
-            }
-            other => panic!("expected symlink rejection for lock open, got {other:?}"),
-        }
-
-        assert!(!external.path().join("epoch").exists());
-        assert!(!external.path().join("epoch.tmp").exists());
-        assert!(!external.path().join("epoch.lock").exists());
-    }
-
-    #[test]
-    fn epoch_advance_persists_monotonic_value_and_survives_reopen() {
-        let tmp = TempDir::new().unwrap();
-        let target = target("products");
-
-        let guard = compare_and_advance_publication_epoch(tmp.path(), &target, PublicationEpoch(0))
-            .unwrap();
-        assert_eq!(guard.previous(), PublicationEpoch(0));
-        assert_eq!(guard.advanced(), PublicationEpoch(1));
-        drop(guard);
-
-        assert_eq!(
-            read_publication_epoch(tmp.path(), &target).unwrap(),
-            PublicationEpoch(1)
-        );
-        let guard = compare_and_advance_publication_epoch(tmp.path(), &target, PublicationEpoch(1))
-            .unwrap();
-        assert_eq!(guard.previous(), PublicationEpoch(1));
-        assert_eq!(guard.advanced(), PublicationEpoch(2));
-    }
-
-    #[test]
-    fn epoch_advance_rejects_stale_expected_value_without_mutation() {
-        let tmp = TempDir::new().unwrap();
-        let target = target("products");
-        drop(compare_and_advance_publication_epoch(
-            tmp.path(),
-            &target,
-            PublicationEpoch(0),
-        ));
-
-        match compare_and_advance_publication_epoch(tmp.path(), &target, PublicationEpoch(0)) {
-            Err(PublicationEpochError::ExpectedMismatch { expected, actual }) => {
-                assert_eq!(expected, PublicationEpoch(0));
-                assert_eq!(actual, PublicationEpoch(1));
-            }
-            other => panic!("expected stale epoch mismatch, got {other:?}"),
-        }
-        assert_eq!(
-            read_publication_epoch(tmp.path(), &target).unwrap(),
-            PublicationEpoch(1)
-        );
-    }
-
-    #[test]
-    fn concurrent_epoch_advances_have_exactly_one_winner() {
-        let tmp = TempDir::new().unwrap();
-        let base = Arc::new(tmp.path().to_path_buf());
-        let barrier = Arc::new(Barrier::new(2));
-        let (tx, rx) = mpsc::channel();
-
-        for _ in 0..2 {
-            let base = Arc::clone(&base);
-            let barrier = Arc::clone(&barrier);
-            let tx = tx.clone();
-            std::thread::spawn(move || {
-                let target = target("products");
-                barrier.wait();
-                tx.send(compare_and_advance_publication_epoch(
-                    &base,
-                    &target,
-                    PublicationEpoch(0),
-                ))
-                .unwrap();
-            });
-        }
-        drop(tx);
-
-        let mut winners = 0;
-        let mut stale = 0;
-        for _ in 0..2 {
-            let result = rx.recv().unwrap();
-            match result {
-                Ok(guard) => {
-                    assert_eq!(guard.previous(), PublicationEpoch(0));
-                    assert_eq!(guard.advanced(), PublicationEpoch(1));
-                    winners += 1;
-                    drop(guard);
-                }
-                Err(PublicationEpochError::ExpectedMismatch { expected, actual }) => {
-                    assert_eq!(expected, PublicationEpoch(0));
-                    assert_eq!(actual, PublicationEpoch(1));
-                    stale += 1;
-                }
-                other => panic!("unexpected concurrent advance result: {other:?}"),
-            }
-        }
-        assert_eq!(winners, 1);
-        assert_eq!(stale, 1);
-        assert_eq!(
-            read_publication_epoch(&base, &target("products")).unwrap(),
-            PublicationEpoch(1)
-        );
-    }
-
-    #[test]
-    fn epoch_fence_stays_exclusive_until_returned_guard_is_dropped() {
-        let tmp = TempDir::new().unwrap();
-        let base = tmp.path().to_path_buf();
-        let products = target("products");
-        let guard =
-            compare_and_advance_publication_epoch(&base, &products, PublicationEpoch(0)).unwrap();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let base_for_thread = base.clone();
-
-        let handle = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            let result = compare_and_advance_publication_epoch(
-                &base_for_thread,
-                &target("products"),
-                PublicationEpoch(1),
-            );
-            done_tx.send(result.map(|guard| guard.advanced())).unwrap();
-        });
-
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
-        drop(guard);
-
-        assert_eq!(
-            done_rx
-                .recv_timeout(Duration::from_secs(2))
-                .unwrap()
-                .unwrap(),
-            PublicationEpoch(2)
-        );
-        handle.join().unwrap();
-        assert_eq!(
-            read_publication_epoch(&base, &target("products")).unwrap(),
-            PublicationEpoch(2)
-        );
-    }
-
-    #[test]
-    fn epoch_advance_rejects_u64_overflow_without_mutation() {
-        let tmp = TempDir::new().unwrap();
-        let target = target("products");
-        let paths = publication_epoch_paths_for_target_path(&tmp.path().join("products"));
-        fs::create_dir_all(paths.epoch.parent().unwrap()).unwrap();
-        fs::write(&paths.epoch, u64::MAX.to_string()).unwrap();
-
-        match compare_and_advance_publication_epoch(tmp.path(), &target, PublicationEpoch(u64::MAX))
-        {
-            Err(PublicationEpochError::Overflow { current }) => {
-                assert_eq!(current, PublicationEpoch(u64::MAX));
-            }
-            other => panic!("expected overflow rejection, got {other:?}"),
-        }
-        assert_eq!(
-            read_publication_epoch(tmp.path(), &target).unwrap(),
-            PublicationEpoch(u64::MAX)
-        );
-    }
-
-    #[test]
-    fn epoch_advance_io_failure_returns_typed_error_without_success() {
-        let tmp = TempDir::new().unwrap();
-        let target = target("products");
-        let paths = publication_epoch_paths_for_target_path(&tmp.path().join("products"));
-        fs::create_dir_all(&paths.temp).unwrap();
-
-        match compare_and_advance_publication_epoch(tmp.path(), &target, PublicationEpoch(0)) {
-            Err(PublicationEpochError::Io { path, source }) => {
-                assert_eq!(path, paths.temp);
-                assert!(matches!(
-                    source.kind(),
-                    io::ErrorKind::IsADirectory | io::ErrorKind::PermissionDenied
-                ));
-            }
-            other => panic!("expected temp write I/O failure, got {other:?}"),
-        }
-        assert_eq!(
-            read_publication_epoch(tmp.path(), &target).unwrap(),
-            PublicationEpoch(0)
-        );
-    }
-
-    #[cfg(unix)]
-    fn symlink_dir(target: &Path, link: PathBuf) -> io::Result<()> {
-        std::os::unix::fs::symlink(target, link)
-    }
-
-    #[cfg(windows)]
-    fn symlink_dir(target: &Path, link: PathBuf) -> io::Result<()> {
-        std::os::windows::fs::symlink_dir(target, link)
-    }
 }

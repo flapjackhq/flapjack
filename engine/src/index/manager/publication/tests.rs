@@ -1010,6 +1010,179 @@ fn fixture_fence_evidence() -> PublicationFenceEvidence {
     .unwrap()
 }
 
+const MUTATION_FENCE_WATERMARK: u64 = 7;
+
+fn mutation_fence_strict_watermark() -> PublicationFenceEvidence {
+    PublicationFenceEvidence::new(
+        PublicationEpoch(2),
+        PublicationEpoch(3),
+        PublicationStagingBaseline(MUTATION_FENCE_WATERMARK),
+        PublicationWatermark(MUTATION_FENCE_WATERMARK),
+    )
+    .unwrap()
+}
+
+fn staged_committed_seq_path(fixture: &ActivationFixture) -> PathBuf {
+    fixture
+        .paths
+        .staging
+        .join(crate::index::oplog::COMMITTED_SEQ_FILE)
+}
+
+fn write_staged_committed_seq(fixture: &ActivationFixture, bytes: &[u8]) {
+    std::fs::write(staged_committed_seq_path(fixture), bytes).unwrap();
+}
+
+async fn expect_mutation_fence_strict_watermark_refusal(
+    label: &str,
+    configure_sidecar: impl FnOnce(&ActivationFixture),
+) {
+    let fixture = ActivationFixture::new();
+    fixture.write_old_target();
+    fixture.write_new_staging();
+    write_fixture_control_index(fixture.base()).await;
+    let old_target = PublicationLayoutSnapshot::capture(&fixture).target;
+    configure_sidecar(&fixture);
+
+    let error = activate_publication_with_fence(
+        fixture.activation_inputs(PublicationArtifactManifest::default()),
+        Some(mutation_fence_strict_watermark()),
+    )
+    .expect_err(label)
+    .to_string();
+
+    assert!(
+        error.contains("strict committed_seq watermark proof"),
+        "{label} returned the wrong refusal: {error}"
+    );
+    assert_eq!(
+        fixture.read_target_file("index_meta.json"),
+        b"old-meta",
+        "{label} must abort before target mutation"
+    );
+    assert_eq!(PublicationLayoutSnapshot::capture(&fixture).target, old_target);
+    assert!(!fixture.paths.journal.exists(), "{label}");
+    assert!(!fixture.journal_temp_path().exists(), "{label}");
+    assert!(!fixture.paths.backup.exists(), "{label}");
+
+    let report = scan_and_repair_publication_target(
+        fixture.base(),
+        &AnalyticsConfig::for_data_dir(fixture.base()),
+        fixture.target.clone(),
+    )
+    .unwrap();
+    assert_eq!(report.status, PublicationRepairStatus::Clean, "{label}");
+    assert_eq!(report.disposition, PublicationTargetDisposition::Loadable);
+    assert_fixture_generation_reopenable(fixture.base(), fixture.target.as_str(), FixtureTreeKind::Old);
+    assert_fixture_control_reopenable(fixture.base());
+}
+
+#[test]
+fn mutation_fence_read_committed_seq_default_is_not_strict_watermark_proof() {
+    let tmp = TempDir::new().unwrap();
+    let zero = tmp.path().join("zero");
+    let missing = tmp.path().join("missing");
+    let malformed = tmp.path().join("malformed");
+    let non_regular = tmp.path().join("non_regular");
+    std::fs::create_dir_all(&zero).unwrap();
+    std::fs::create_dir_all(&missing).unwrap();
+    std::fs::create_dir_all(&malformed).unwrap();
+    std::fs::create_dir_all(&non_regular).unwrap();
+    std::fs::write(zero.join(crate::index::oplog::COMMITTED_SEQ_FILE), b"0").unwrap();
+    std::fs::write(
+        malformed.join(crate::index::oplog::COMMITTED_SEQ_FILE),
+        b"not-a-sequence",
+    )
+    .unwrap();
+    std::fs::create_dir(non_regular.join(crate::index::oplog::COMMITTED_SEQ_FILE)).unwrap();
+
+    assert_eq!(crate::index::oplog::read_committed_seq(&zero), 0);
+    assert_eq!(crate::index::oplog::read_committed_seq(&missing), 0);
+    assert_eq!(crate::index::oplog::read_committed_seq(&malformed), 0);
+    assert_eq!(crate::index::oplog::read_committed_seq(&non_regular), 0);
+}
+
+#[test]
+fn mutation_fence_exact_staged_committed_seq_w_remains_eligible() {
+    let fixture = ActivationFixture::new();
+    fixture.write_old_target();
+    fixture.write_new_staging();
+    write_staged_committed_seq(&fixture, MUTATION_FENCE_WATERMARK.to_string().as_bytes());
+
+    let committed = activate_publication_with_fence(
+        fixture.activation_inputs(PublicationArtifactManifest::default()),
+        Some(mutation_fence_strict_watermark()),
+    )
+    .expect("exact staged committed_seq = W must remain eligible");
+
+    assert_eq!(committed.phase, PublicationPhase::Committed);
+    assert_eq!(fixture.read_target_file("index_meta.json"), b"new-meta");
+}
+
+#[tokio::test]
+async fn mutation_fence_missing_committed_seq_must_not_fail_open_as_w() {
+    expect_mutation_fence_strict_watermark_refusal(
+        "missing committed_seq must not prove strict W",
+        |fixture| {
+            std::fs::remove_file(staged_committed_seq_path(fixture)).unwrap();
+            assert_eq!(
+                crate::index::oplog::read_committed_seq(&fixture.paths.staging),
+                0,
+                "read_committed_seq fail-open default is not strict W proof"
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mutation_fence_non_regular_committed_seq_must_not_fail_open_as_w() {
+    expect_mutation_fence_strict_watermark_refusal(
+        "non-regular committed_seq must not prove strict W",
+        |fixture| {
+            std::fs::remove_file(staged_committed_seq_path(fixture)).unwrap();
+            std::fs::create_dir(staged_committed_seq_path(fixture)).unwrap();
+            assert_eq!(
+                crate::index::oplog::read_committed_seq(&fixture.paths.staging),
+                0,
+                "read_committed_seq unreadable/non-regular default is not strict W proof"
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mutation_fence_malformed_committed_seq_must_not_fail_open_as_w() {
+    expect_mutation_fence_strict_watermark_refusal(
+        "malformed committed_seq must not prove strict W",
+        |fixture| {
+            write_staged_committed_seq(fixture, b"not-a-sequence");
+            assert_eq!(
+                crate::index::oplog::read_committed_seq(&fixture.paths.staging),
+                0,
+                "read_committed_seq malformed default is not strict W proof"
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mutation_fence_numeric_committed_seq_mismatch_must_not_count_as_w() {
+    expect_mutation_fence_strict_watermark_refusal(
+        "numeric committed_seq mismatch must not prove strict W",
+        |fixture| {
+            write_staged_committed_seq(fixture, b"6");
+            assert_eq!(
+                crate::index::oplog::read_committed_seq(&fixture.paths.staging),
+                6
+            );
+        },
+    )
+    .await;
+}
+
 #[test]
 fn activation_rejects_invalid_caller_supplied_fence_before_persistence() {
     let fixture = ActivationFixture::new();
@@ -1099,11 +1272,15 @@ fn activation_invalid_fence_cleanup_leaves_old_target_loadable() {
     assert_eq!(report.disposition, PublicationTargetDisposition::Loadable);
 }
 
-#[test]
-fn startup_repair_after_epoch_advance_before_journal_reopens_old_tree() {
+#[tokio::test]
+async fn startup_repair_after_epoch_advance_before_journal_reopens_old_tree() {
     let fixture = ActivationFixture::new();
     fixture.write_old_target();
     fixture.write_new_staging();
+    write_fixture_control_index(fixture.base()).await;
+    // A valid fence carries the drained watermark; the staged tree must therefore
+    // present a strict `committed_seq = W` before activation proceeds past its proof.
+    write_staged_committed_seq(&fixture, b"7");
     let old_bytes = collect_fixture_tree_bytes(&fixture.paths.target);
     let old_digest = fixture.target_digest();
     let guard = compare_and_advance_publication_epoch(
@@ -1167,6 +1344,9 @@ fn startup_repair_after_epoch_advance_before_journal_reopens_old_tree() {
     assert!(!fixture.journal_temp_path().exists());
     assert_eq!(collect_fixture_tree_bytes(&fixture.paths.target), old_bytes);
     assert_eq!(fixture.read_target_file("index_meta.json"), b"old-meta");
+    assert_eq!(read_strict_committed_seq(&fixture.paths.target).unwrap(), 0);
+    assert_fixture_generation_reopenable(fixture.base(), fixture.target.as_str(), FixtureTreeKind::Old);
+    assert_fixture_control_reopenable(fixture.base());
 }
 
 #[test]
@@ -1235,6 +1415,8 @@ fn startup_repair_epoch_only_window_negative_cases_fail_closed() {
         let fixture = ActivationFixture::new();
         fixture.write_old_target();
         fixture.write_new_staging();
+        // A valid fence requires strict staged `committed_seq = W` before activation.
+        write_staged_committed_seq(&fixture, b"7");
         let guard = compare_and_advance_publication_epoch(
             fixture.base(),
             &fixture.target,
@@ -1328,8 +1510,39 @@ fn startup_repair_epoch_only_window_negative_cases_fail_closed() {
     }
 }
 
-#[test]
-fn startup_repair_converges_across_fenced_activation_crash_boundaries() {
+fn crash_fenced_activation_at_checkpoint(
+    fixture: &ActivationFixture,
+    fault: PublicationFaultPoint,
+    watermark: u64,
+) -> PublicationFenceEvidence {
+    let guard = compare_and_advance_publication_epoch(
+        fixture.base(),
+        &fixture.target,
+        PublicationEpoch(0),
+    )
+    .unwrap();
+    let fence = PublicationFenceEvidence::new(
+        guard.previous(),
+        guard.advanced(),
+        PublicationStagingBaseline(watermark),
+        PublicationWatermark(watermark),
+    )
+    .unwrap();
+    let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        activate_publication_with_fence_and_faults_for_test(
+            fixture.activation_inputs(PublicationArtifactManifest::default()),
+            Some(fence.clone()),
+            &PanicAtCheckpoint::new(fault),
+        )
+        .unwrap();
+    }));
+    assert!(crash.is_err(), "{fault:?} must simulate a process crash");
+    drop(guard);
+    fence
+}
+
+#[tokio::test]
+async fn startup_repair_converges_across_fenced_activation_crash_boundaries() {
     let cases = [
         PublicationFaultPoint::AfterPrepareJournal,
         PublicationFaultPoint::AfterTargetBackup,
@@ -1340,34 +1553,20 @@ fn startup_repair_converges_across_fenced_activation_crash_boundaries() {
         let fixture = ActivationFixture::new();
         fixture.write_old_target();
         fixture.write_new_staging();
+        write_fixture_control_index(fixture.base()).await;
+        // A valid fence requires strict staged `committed_seq = W`; stage it before
+        // capturing the expected promoted bytes so target and staging stay identical.
+        write_staged_committed_seq(&fixture, b"0");
         let old_bytes = collect_fixture_tree_bytes(&fixture.paths.target);
         let new_bytes = collect_fixture_tree_bytes(&fixture.paths.staging);
-        let guard = compare_and_advance_publication_epoch(
-            fixture.base(),
-            &fixture.target,
-            PublicationEpoch(0),
-        )
-        .unwrap();
-        let fence = PublicationFenceEvidence::new(
-            guard.previous(),
-            guard.advanced(),
-            PublicationStagingBaseline(7),
-            PublicationWatermark(7),
-        )
-        .unwrap();
-        let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            activate_publication_with_fence_and_faults_for_test(
-                fixture.activation_inputs(PublicationArtifactManifest::default()),
-                Some(fence.clone()),
-                &PanicAtCheckpoint::new(fault),
-            )
-            .unwrap();
-        }));
-        assert!(crash.is_err(), "{fault:?} must simulate a process crash");
-        drop(guard);
+        let old_digest = fixture.target_digest();
+        let new_digest = fixture.new_digest();
+        let fence = crash_fenced_activation_at_checkpoint(&fixture, fault, 0);
         let prepared = fixture.read_journal();
         assert_eq!(prepared.phase, PublicationPhase::Prepared);
         assert_eq!(prepared.fence_evidence, Some(fence.clone()));
+        assert_eq!(prepared.prior_digest, Some(old_digest));
+        assert_eq!(prepared.digest, new_digest);
         assert_eq!(prepared.transition_sequence, 1);
         assert_eq!(read_publication_epoch(fixture.base(), &fixture.target).unwrap(), PublicationEpoch(1));
 
@@ -1394,6 +1593,7 @@ fn startup_repair_converges_across_fenced_activation_crash_boundaries() {
         assert_eq!(committed.phase, PublicationPhase::Committed);
         assert_eq!(committed.fence_evidence, Some(fence));
         assert_eq!(committed.transition_sequence, 2);
+        assert_eq!(read_strict_committed_seq(&fixture.paths.target).unwrap(), 0);
 
         let second = scan_and_repair_publication_target(
             fixture.base(),
@@ -1405,6 +1605,73 @@ fn startup_repair_converges_across_fenced_activation_crash_boundaries() {
         assert_eq!(second.action, PublicationScanAction::Clean);
         assert_eq!(second.disposition, PublicationTargetDisposition::Loadable);
         assert_eq!(collect_fixture_tree_bytes(&fixture.paths.target), new_bytes);
+        assert_fixture_generation_reopenable(
+            fixture.base(),
+            fixture.target.as_str(),
+            FixtureTreeKind::New,
+        );
+        assert_fixture_control_reopenable(fixture.base());
+    }
+}
+
+#[tokio::test]
+async fn startup_repair_rejects_digest_valid_fenced_watermark_mismatch() {
+    for fault in [
+        PublicationFaultPoint::AfterPrepareJournal,
+        PublicationFaultPoint::AfterTargetBackup,
+        PublicationFaultPoint::AfterStagingPromote,
+    ] {
+        let fixture = ActivationFixture::new();
+        fixture.write_old_target();
+        fixture.write_new_staging();
+        write_fixture_control_index(fixture.base()).await;
+        write_staged_committed_seq(&fixture, b"6");
+        crash_fenced_activation_at_checkpoint(&fixture, fault, 6);
+
+        let mut journal = fixture.read_journal();
+        journal.fence_evidence = Some(
+            PublicationFenceEvidence::new(
+                PublicationEpoch(0),
+                PublicationEpoch(1),
+                PublicationStagingBaseline(6),
+                PublicationWatermark(7),
+            )
+            .unwrap(),
+        );
+        fixture.write_journal(journal);
+        let persisted = fixture.read_journal();
+        let digest_matching_new_tree = match fault {
+            PublicationFaultPoint::AfterStagingPromote => &fixture.paths.target,
+            _ => &fixture.paths.staging,
+        };
+        assert_eq!(
+            canonical_tenant_tree_digest(digest_matching_new_tree, &fixture.inventory).unwrap(),
+            persisted.digest,
+            "{fault:?} must isolate strict-watermark evidence from digest evidence"
+        );
+        assert_eq!(
+            read_strict_committed_seq(digest_matching_new_tree).unwrap(),
+            6
+        );
+        assert_eq!(
+            persisted.fence_evidence.as_ref().unwrap().watermark(),
+            PublicationWatermark(7)
+        );
+        let before_scan = PublicationLayoutSnapshot::capture(&fixture);
+
+        let report = scan_and_repair_publication_target(
+            fixture.base(),
+            &AnalyticsConfig::for_data_dir(fixture.base()),
+            fixture.target.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(report.status, PublicationRepairStatus::Quarantined, "{fault:?}");
+        assert_eq!(report.action, PublicationScanAction::Quarantined, "{fault:?}");
+        assert_eq!(report.disposition, PublicationTargetDisposition::Unavailable);
+        assert!(!report.live_target_mutated);
+        assert_eq!(PublicationLayoutSnapshot::capture(&fixture), before_scan);
+        assert_fixture_control_reopenable(fixture.base());
     }
 }
 
@@ -1427,6 +1694,8 @@ fn startup_repair_fenced_journals_without_matching_epoch_fail_closed() {
             let fixture = ActivationFixture::new();
             fixture.write_old_target();
             fixture.write_new_staging();
+            // A valid fence requires strict staged `committed_seq = W`.
+            write_staged_committed_seq(&fixture, b"7");
             let guard = compare_and_advance_publication_epoch(
                 fixture.base(),
                 &fixture.target,
@@ -1884,6 +2153,8 @@ fn activation_fault_hook_observes_every_durable_filesystem_boundary() {
     let fixture = ActivationFixture::new();
     fixture.write_old_target();
     fixture.write_new_staging();
+    // A valid fence requires strict staged `committed_seq = W` before activation.
+    write_staged_committed_seq(&fixture, b"7");
     fixture.write_external_sidecar(b"old-sidecar");
     fixture.write_promoted_sidecar(b"new-sidecar");
     let fence = fixture_fence_evidence();
@@ -1989,6 +2260,8 @@ fn activation_fault_hook_observes_every_durable_filesystem_boundary() {
     let replay = ActivationFixture::new();
     replay.write_old_target();
     replay.write_new_staging();
+    // A valid fence requires strict staged `committed_seq = W` before activation.
+    write_staged_committed_seq(&replay, b"7");
     replay.write_external_sidecar(b"old-sidecar");
     replay.write_promoted_sidecar(b"new-sidecar");
     let replay_capture = CaptureJournalAtCheckpoint::new(
@@ -2778,6 +3051,44 @@ fn assert_reopenable_fixture_tree(
     assert_eq!(hits, expected_hits);
 }
 
+fn assert_fixture_generation_reopenable(
+    base: &Path,
+    tenant: &str,
+    kind: FixtureTreeKind,
+) {
+    assert_reopenable_fixture_tree(
+        base,
+        tenant,
+        kind.object_id(),
+        serde_json::json!({
+            "_id": kind.object_id(),
+            "objectID": kind.object_id(),
+            "title": kind.title(),
+            "body": kind.body(),
+            "generation": kind.generation()
+        }),
+        kind.generation(),
+        &[kind.object_id()],
+    );
+}
+
+fn assert_fixture_control_reopenable(base: &Path) {
+    assert_reopenable_fixture_tree(
+        base,
+        "control_products",
+        "control-widget",
+        serde_json::json!({
+            "_id": "control-widget",
+            "objectID": "control-widget",
+            "title": "control waffle iron",
+            "body": "unchanged control guide",
+            "generation": "control"
+        }),
+        "control",
+        &["control-widget"],
+    );
+}
+
 #[test]
 fn repair_decision_table_is_total_for_every_phase_and_artifact_evidence() {
     let phases = [
@@ -2790,6 +3101,7 @@ fn repair_decision_table_is_total_for_every_phase_and_artifact_evidence() {
         RepairArtifactEvidence::Missing,
         RepairArtifactEvidence::MatchesOld,
         RepairArtifactEvidence::MatchesNew,
+        RepairArtifactEvidence::StrictWatermarkMismatch,
         RepairArtifactEvidence::Mismatch,
         RepairArtifactEvidence::Unreadable,
         RepairArtifactEvidence::Reservation,
@@ -3025,6 +3337,7 @@ fn repair_decision_table_only_allows_digest_proven_mutations() {
 
     for unsafe_artifact in [
         RepairArtifactEvidence::Mismatch,
+        RepairArtifactEvidence::StrictWatermarkMismatch,
         RepairArtifactEvidence::Unreadable,
     ] {
         let evidence = RepairEvidence::valid(

@@ -126,6 +126,65 @@ pub(crate) fn assert_remove_peer_openapi_contract(doc: &serde_json::Value) {
     );
 }
 
+pub(crate) fn assert_cluster_status_openapi_contract(doc: &serde_json::Value) {
+    let path = DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS[2];
+    const CONTEXT: &str = "GET /internal/cluster/status";
+    let operation = operation(doc, path, "get");
+
+    assert_schema_ref(
+        operation,
+        "/responses/200/content/application~1json/schema/$ref",
+        "#/components/schemas/ClusterStatusResponse",
+        CONTEXT,
+    );
+    assert_response_statuses(operation, &["200", "403"], CONTEXT);
+    assert_api_key_security(operation, CONTEXT);
+
+    for schema in [
+        "ClusterStatusResponse",
+        "ClusterStatusStandaloneResponse",
+        "ClusterStatusHaResponse",
+        "ClusterPeerStatus",
+        "ClusterPeerHealthStatus",
+        "AutohealPeerLifecycleResponse",
+        "AutohealActionResponse",
+    ] {
+        assert!(
+            doc.pointer(&format!("/components/schemas/{schema}"))
+                .is_some(),
+            "{CONTEXT} should register {schema}"
+        );
+    }
+
+    assert_eq!(
+        schema_ref(
+            doc,
+            "/components/schemas/ClusterStatusStandaloneResponse/properties/autoheal_peers/items",
+        ),
+        Some("#/components/schemas/AutohealPeerLifecycleResponse")
+    );
+    assert_eq!(
+        schema_ref(
+            doc,
+            "/components/schemas/ClusterStatusHaResponse/properties/autoheal_peers/items",
+        ),
+        Some("#/components/schemas/AutohealPeerLifecycleResponse")
+    );
+    assert_eq!(
+        schema_ref(
+            doc,
+            "/components/schemas/AutohealPeerLifecycleResponse/properties/action",
+        ),
+        Some("#/components/schemas/AutohealActionResponse")
+    );
+    assert!(doc
+        .pointer("/components/schemas/AutohealPeerLifecycleResponse/properties/observation_count")
+        .is_some());
+    assert!(doc
+        .pointer("/components/schemas/AutohealPeerLifecycleResponse/properties/decision")
+        .is_some());
+}
+
 pub(crate) fn schema_ref<'a>(doc: &'a serde_json::Value, schema_pointer: &str) -> Option<&'a str> {
     if let Some(reference) = doc
         .pointer(&format!("{schema_pointer}/$ref"))

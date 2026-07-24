@@ -267,6 +267,14 @@ fn acl_internal_storage_requires_admin() {
 }
 
 #[test]
+fn acl_internal_snapshot_capability_requires_admin() {
+    assert_eq!(
+        required_acl_for_route(&Method::GET, "/internal/snapshots/capability"),
+        Some("admin")
+    );
+}
+
+#[test]
 fn acl_internal_cluster_add_peer_requires_admin() {
     assert_eq!(
         required_acl_for_route(&Method::POST, "/internal/cluster/peers"),

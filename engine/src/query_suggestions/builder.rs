@@ -1,5 +1,6 @@
 use super::config::{BuildStatus, LogEntry, QsConfig, QsConfigStore};
 use crate::analytics::AnalyticsQueryEngine;
+use crate::index::oplog::write_committed_seq;
 use crate::types::{Document, FieldValue};
 use crate::IndexManager;
 use std::collections::HashMap;
@@ -45,6 +46,16 @@ pub async fn build_suggestions_index(
     analytics_engine: &Arc<AnalyticsQueryEngine>,
 ) -> Result<usize, String> {
     let staging_name = format!("{}__building", config.index_name);
+    let destination_path = manager.base_path.join(&config.index_name);
+    if !destination_path.exists() {
+        manager
+            .create_tenant(&config.index_name)
+            .map_err(|e| e.to_string())?;
+        write_committed_seq(&destination_path, 0).map_err(|e| e.to_string())?;
+    }
+    let staging_baseline = manager
+        .capture_replacement_staging_baseline(&config.index_name)
+        .map_err(|e| e.to_string())?;
 
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let thirty_days_ago = (chrono::Utc::now() - chrono::Duration::days(30))
@@ -225,7 +236,7 @@ pub async fn build_suggestions_index(
     // Atomic replacement: publish the rebuilt tenant while keeping the live
     // index's query-suggestions and analytics control sidecars under its key.
     manager
-        .replace_index_contents(&staging_name, &config.index_name)
+        .replace_index_contents(&staging_name, &config.index_name, staging_baseline)
         .await
         .map_err(|e| e.to_string())?;
 

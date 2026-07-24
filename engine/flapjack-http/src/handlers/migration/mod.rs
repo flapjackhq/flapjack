@@ -3,6 +3,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use flapjack::index::manager::publication::PublicationStagingBaseline;
 use flapjack::validate_index_name;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -45,9 +46,9 @@ const MIGRATION_CANCEL_TOO_LATE_MESSAGE: &str =
 /// Request payload for migrating an index from Algolia to Flapjack.
 ///
 /// Contains Algolia credentials, the source index name, and optional target
-/// index settings. Valid requests on HA clusters are refused before import
-/// admission; standalone requests synchronously export, translate, stage, and
-/// create-only publish the target index.
+/// index settings. HA imports are refused before import admission. Standalone
+/// synchronous requests create a fresh target by default; `overwrite=true`
+/// replaces an existing target through the node-local fenced publication path.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct MigrateFromAlgoliaRequest {
     #[serde(rename = "appId")]
@@ -62,8 +63,8 @@ pub struct MigrateFromAlgoliaRequest {
     #[serde(rename = "targetIndex")]
     pub target_index: Option<String>,
 
-    /// Reserved for a future replacement lane. The synchronous import path is
-    /// create-only and refuses overwrite requests before import admission.
+    /// Replace the target index only on the node-local synchronous endpoint.
+    /// Async migration and HA imports still refuse overwrite requests.
     #[serde(default)]
     pub overwrite: bool,
 }
@@ -255,13 +256,29 @@ pub async fn list_algolia_indexes(
 
 type MigrateError = (StatusCode, Json<serde_json::Value>);
 
+#[derive(Clone, Copy)]
+pub(super) enum MigrationPublicationMode {
+    CreateOnly,
+    ReplaceExisting {
+        staging_baseline: PublicationStagingBaseline,
+    },
+}
+
+pub(super) struct AdmittedMigration {
+    target_index: String,
+    publication_mode: MigrationPublicationMode,
+}
+
 /// One-click migration from Algolia to Flapjack.
 ///
-/// Validates the requested source and target shape, refuses overwrite and HA
-/// requests before import admission, then synchronously imports the Algolia
-/// source into a create-only Flapjack target. A successful response reports the
-/// counts read back from the activated target; this lane has no durable async
-/// job id and returns a fixed `taskID` of `0`.
+/// Validates the requested source and target shape, refuses HA requests before
+/// import admission, then synchronously imports the Algolia source into a
+/// Flapjack target. The default path is create-only; node-local
+/// `overwrite=true` replaces an existing target through the fenced publication
+/// owner. A successful response reports the imported source counts after
+/// reading back the activated target; an overwrite target can additionally
+/// contain acknowledged writes replayed during activation. This lane has no
+/// durable async job id and returns a fixed `taskID` of `0`.
 #[utoipa::path(
     post,
     path = "/1/migrate-from-algolia",
@@ -285,9 +302,8 @@ pub async fn migrate_from_algolia(
 
 /// Additive async Algolia migration submission endpoint.
 ///
-/// This route admits the same create-only migration request as the synchronous
-/// `/1/migrate-from-algolia` endpoint, immediately returns the durable
-/// admission snapshot, and leaves the synchronous endpoint unchanged.
+/// This route admits create-only migration requests, immediately returns the
+/// durable admission snapshot, and explicitly refuses `overwrite=true`.
 #[utoipa::path(
     post,
     path = "/1/migrations/algolia",
@@ -449,10 +465,16 @@ where
     F: FnOnce(&MigrateFromAlgoliaRequest) -> Result<R, AlgoliaClientError>,
     R: source_reader::MigrationSourceReader + Send,
 {
-    let target_index = admit_migration_request(&state, &payload)?;
+    let admitted = admit_migration_request(&state, &payload)?;
     let mut reader = source_factory(&payload).map_err(algolia_error)?;
-    import::import_from_source_with_test_hooks(&state.manager, target_index, &mut reader, hooks)
-        .await
+    import::import_from_source_with_test_hooks(
+        &state.manager,
+        admitted.target_index,
+        admitted.publication_mode,
+        &mut reader,
+        hooks,
+    )
+    .await
 }
 
 async fn migrate_from_algolia_impl<F, R>(
@@ -464,32 +486,63 @@ where
     F: FnOnce(&MigrateFromAlgoliaRequest) -> Result<R, AlgoliaClientError>,
     R: source_reader::MigrationSourceReader + Send,
 {
-    let target_index = admit_migration_request(&state, &payload)?;
+    let admitted = admit_migration_request(&state, &payload)?;
     let mut reader = source_factory(&payload).map_err(algolia_error)?;
-    import::import_from_source(&state.manager, target_index, &mut reader).await
+    import::import_from_source(
+        &state.manager,
+        admitted.target_index,
+        admitted.publication_mode,
+        &mut reader,
+    )
+    .await
 }
 
 fn admit_migration_request(
     state: &AppState,
     payload: &MigrateFromAlgoliaRequest,
-) -> Result<String, MigrateError> {
-    admit_migration_payload(state.replication_manager.as_ref(), payload)
+) -> Result<AdmittedMigration, MigrateError> {
+    admit_sync_migration_payload(&state.manager, state.replication_manager.as_ref(), payload)
 }
 
-fn admit_migration_payload(
+fn admit_sync_migration_payload(
+    manager: &Arc<flapjack::IndexManager>,
+    replication_manager: Option<&Arc<flapjack_replication::manager::ReplicationManager>>,
+    payload: &MigrateFromAlgoliaRequest,
+) -> Result<AdmittedMigration, MigrateError> {
+    validate_migration_request(payload)?;
+    let target_index = migration_target_index(payload).to_string();
+    if payload.overwrite {
+        if replication_manager.is_some_and(|manager| manager.peer_count() > 0) {
+            return Err(migration_overwrite_unsupported());
+        }
+        let staging_baseline = manager
+            .capture_replacement_staging_baseline(&target_index)
+            .map_err(|error| json_error_parts(StatusCode::BAD_REQUEST, error.to_string()))?;
+        return Ok(AdmittedMigration {
+            target_index,
+            publication_mode: MigrationPublicationMode::ReplaceExisting { staging_baseline },
+        });
+    }
+    // Persistent v1 HA safety boundary. This guard remains unless ROADMAP.md
+    // MIG-7 supplies a costed convergence protocol for the node-local
+    // publication guarantee in engine/src/index/manager/publication.rs:11.
+    if replication_manager.is_some_and(|manager| manager.peer_count() > 0) {
+        return Err(migration_ha_unsupported());
+    }
+    Ok(AdmittedMigration {
+        target_index,
+        publication_mode: MigrationPublicationMode::CreateOnly,
+    })
+}
+
+pub(super) fn admit_async_migration_payload(
     replication_manager: Option<&Arc<flapjack_replication::manager::ReplicationManager>>,
     payload: &MigrateFromAlgoliaRequest,
 ) -> Result<String, MigrateError> {
     validate_migration_request(payload)?;
     if payload.overwrite {
-        return Err(json_error_parts(
-            StatusCode::BAD_REQUEST,
-            "overwrite=true is not supported by Algolia migration import",
-        ));
+        return Err(migration_overwrite_unsupported());
     }
-    // Persistent v1 HA safety boundary. This guard remains unless ROADMAP.md
-    // MIG-7 supplies a costed convergence protocol for the node-local
-    // publication guarantee in engine/src/index/manager/publication.rs:11.
     if replication_manager.is_some_and(|manager| manager.peer_count() > 0) {
         return Err(migration_ha_unsupported());
     }
@@ -534,6 +587,13 @@ fn migration_ha_unsupported() -> MigrateError {
         StatusCode::SERVICE_UNAVAILABLE,
         MIGRATION_HA_UNSUPPORTED_CODE,
         MIGRATION_HA_UNSUPPORTED_MESSAGE,
+    )
+}
+
+pub(super) fn migration_overwrite_unsupported() -> MigrateError {
+    json_error_parts(
+        StatusCode::BAD_REQUEST,
+        "overwrite=true is not supported by Algolia migration import",
     )
 }
 

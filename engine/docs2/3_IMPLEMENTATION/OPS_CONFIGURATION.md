@@ -167,6 +167,7 @@ Operational bounds:
 | `FLAPJACK_BOOTSTRAP_PEER` | HTTP(S) origin | unset | Single running member used by a fresh node to join an HA cluster when no static peer list is configured. |
 | `FLAPJACK_STARTUP_CATCHUP_TIMEOUT_SECS` | Integer seconds | `30` | Startup catch-up timeout before serving. |
 | `FLAPJACK_SYNC_INTERVAL_SECS` | Integer seconds | `60` | Periodic replication catch-up interval. |
+| `FLAPJACK_AUTOHEAL_ENABLED` | `true` or `false` | `false` | Enables quorum-preserving auto-heal eviction from the replication health-probe loop after three consecutive unreachable observations. Values are trimmed and matched ASCII-case-insensitively; invalid values warn and behave as `false`. See [Dead-node auto-heal](./OPERATIONS.md#scenario-dead-node-auto-heal). |
 
 Topology source precedence is owned by `NodeConfig::load_or_default`. An
 existing `${FLAPJACK_DATA_DIR}/node.json` wins over topology environment
@@ -190,6 +191,29 @@ Runtime membership is restart-durable through the existing `node.json` owner.
 `ReplicationManager::{add_peer,remove_peer,replace_peers}` persist membership
 mutations, and a restarted node reloads peers from `node.json` without requiring
 `FLAPJACK_PEERS` or `FLAPJACK_BOOTSTRAP_PEER`.
+
+Auto-heal is disabled unless `FLAPJACK_AUTOHEAL_ENABLED=true` is set at startup.
+When enabled, the existing replication health-probe supervisor observes one
+membership-scoped pass at a time and evicts at most one peer after the fixed
+three-observation sustained-unreachable threshold, only when the Stage 1 quorum
+rule remains satisfied with `N = peer_count_at_observation_start + 1`. A
+two-node cluster therefore refuses to evict its only peer, and simultaneous peer
+loss that may indicate local isolation is recorded as an indeterminate refusal
+rather than a removal. Operators should inspect `/internal/cluster/status`
+`autoheal_enabled` and `autoheal_peers` for live lifecycle state; the day-2
+procedure is owned by [Dead-node auto-heal](./OPERATIONS.md#scenario-dead-node-auto-heal).
+
+Auto-heal persists readable decision state at
+`${FLAPJACK_DATA_DIR}/autoheal_decisions.jsonl`. The journal records decision
+IDs, timestamps, membership snapshots, candidates, exact refusal or eviction
+decisions, and action intent/outcome records. It does not persist observation
+counters; every process restart begins a fresh observation window. A restart
+after a synced eviction intent but before a synced outcome records
+`outcome_unknown` and waits for fresh probe evidence instead of retrying the
+ambiguous action. Healthy returning auto-heal candidates are retained in the
+journal and can be readmitted by the survivor-side health probe through the
+existing `ReplicationManager::add_peer` path; startup catch-up still runs before
+authoritative reads on the returning node.
 
 ## Analytics
 

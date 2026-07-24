@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -36,6 +36,14 @@ pub(crate) fn flapjack_cmd() -> Command {
     let mut command = Command::cargo_bin("flapjack").unwrap();
     strip_flapjack_ambient_env_from_assert_cmd(&mut command);
     command
+}
+
+pub(crate) fn flapjack_cmd_executable() -> PathBuf {
+    flapjack_cmd().get_program().into()
+}
+
+pub(crate) fn server_spawn_executable() -> &'static Path {
+    Path::new(env!("CARGO_BIN_EXE_flapjack"))
 }
 
 fn with_each_flapjack_ambient_env_var(mut apply: impl FnMut(&str)) {
@@ -488,7 +496,7 @@ fn spawn_flapjack_process_with_env(
     stdout: Stdio,
     stderr: Stdio,
 ) -> Child {
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_flapjack"));
+    let mut command = std::process::Command::new(server_spawn_executable());
     if no_auth {
         command.arg("--no-auth");
     }

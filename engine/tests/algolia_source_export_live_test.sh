@@ -43,8 +43,12 @@ write_stub_runtime() {
   cat >"$runtime/fake-flapjack" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s\n' "$FLAPJACK_DATA_DIR" >"$ALGOLIA_LIVE_TEST_STUB_DIR/data_dir"
+if [ ! -f "$ALGOLIA_LIVE_TEST_STUB_DIR/data_dir" ]; then
+  printf '%s\n' "$FLAPJACK_DATA_DIR" >"$ALGOLIA_LIVE_TEST_STUB_DIR/data_dir"
+fi
+printf '%s\n' "$FLAPJACK_DATA_DIR" >>"$ALGOLIA_LIVE_TEST_STUB_DIR/data_dirs"
 printf '%s\n' "$$" >"$ALGOLIA_LIVE_TEST_STUB_DIR/server_pid"
+printf '%s\n' "${ALGOLIA_LIVE_TEST_SERVER_LABEL:-standalone}" >"$ALGOLIA_LIVE_TEST_STUB_DIR/server_label"
 printf 'Local: http://127.0.0.1:54321\n'
 while :; do sleep 1; done
 SH
@@ -63,6 +67,9 @@ from pathlib import Path
 state = Path(os.environ["ALGOLIA_LIVE_TEST_STUB_DIR"])
 mode = os.environ.get("ALGOLIA_LIVE_TEST_STUB_MODE", "success")
 state.mkdir(parents=True, exist_ok=True)
+body_to_stdout = True
+body_output_path = None
+headers_output_path = None
 
 def append(name, value):
     with (state / name).open("a", encoding="utf-8") as f:
@@ -75,13 +82,23 @@ def read_lines(name):
     return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 def respond(payload, code=200):
-    if isinstance(payload, str):
-        sys.stdout.write(payload)
-    else:
-        sys.stdout.write(json.dumps(payload, separators=(",", ":")))
+    global body_to_stdout, body_output_path, headers_output_path
+    body = payload if isinstance(payload, str) else json.dumps(payload, separators=(",", ":"))
+    if headers_output_path:
+        headers = [f"HTTP/1.1 {code} stub"]
+        if code == 503 and mode != "mig5_refusal_header_drift":
+            headers.append("Retry-After: 1")
+        Path(headers_output_path).write_text("\r\n".join(headers) + "\r\n\r\n", encoding="utf-8")
+    if body_output_path:
+        Path(body_output_path).write_text(body, encoding="utf-8")
+    if not body_to_stdout:
+        sys.stdout.write(str(code))
+        return
+    sys.stdout.write(body)
     sys.stdout.write("\n" + str(code))
 
 def parse_args(argv):
+    global body_to_stdout, body_output_path, headers_output_path
     method = "GET"
     data = ""
     url = ""
@@ -93,6 +110,13 @@ def parse_args(argv):
             i += 2
         elif arg == "--data":
             data = argv[i + 1]
+            i += 2
+        elif arg == "-o":
+            body_to_stdout = False
+            body_output_path = argv[i + 1]
+            i += 2
+        elif arg == "-D":
+            headers_output_path = argv[i + 1]
             i += 2
         elif arg in ("-w", "-H"):
             i += 2
@@ -149,12 +173,34 @@ def fixture_rules():
 def fixture_synonyms():
     return [
         {"objectID": "syn-1", "type": "synonym", "synonyms": ["sneaker", "trainer"]},
-        {"objectID": "syn-2", "type": "oneWaySynonym", "input": "tee", "synonyms": ["tshirt", "t-shirt"]},
-        {"objectID": "syn-3", "type": "altCorrection1", "word": "flapjack", "corrections": ["flapjacks"]},
+        {"objectID": "syn-2", "type": "synonym", "synonyms": ["tee", "tshirt", "t-shirt"]},
+        {"objectID": "syn-3", "type": "synonym", "synonyms": ["flapjack", "flapjacks"]},
     ]
 
 def data_dir():
     return Path((state / "data_dir").read_text(encoding="utf-8").strip())
+
+def server_label():
+    path = state / "server_label"
+    return path.read_text(encoding="utf-8").strip() if path.exists() else "standalone"
+
+def target_path(index):
+    return state / ("target_" + urllib.parse.quote(index, safe="") + ".json")
+
+def read_target(index):
+    path = target_path(index)
+    if not path.exists():
+        return []
+    return json.loads(path.read_text(encoding="utf-8"))
+
+def write_target(index, docs):
+    target_path(index).write_text(json.dumps(docs, separators=(",", ":"), sort_keys=True), encoding="utf-8")
+
+def task_id():
+    path = state / "next_task_id"
+    value = int(path.read_text(encoding="utf-8")) if path.exists() else 2000
+    path.write_text(str(value + 1), encoding="utf-8")
+    return value
 
 def drift_barrier_dir():
     raw = os.environ.get("FLAPJACK_ALGOLIA_LIVE_TEST_DRIFT_BARRIER_DIR", "")
@@ -210,22 +256,100 @@ query = urllib.parse.parse_qs(parsed.query)
 append("curl_calls.log", f"{method} {path}?{parsed.query}")
 
 if parsed.netloc.startswith("127.0.0.1:"):
-    if method == "GET" and path == "/1/indexes":
+    if method == "GET" and path == "/health":
+        respond({"status": "ok"})
+    elif method == "GET" and path == "/1/indexes":
         items = []
         if mode == "destination_leak" and (state / "destination_leaked").exists():
             items.append({"name": "unexpected_destination"})
+        for file in sorted(state.glob("target_*.json")):
+            index = urllib.parse.unquote(file.name[len("target_"):-len(".json")])
+            items.append({"name": index, "entries": len(json.loads(file.read_text(encoding="utf-8")))})
         respond({"items": items})
+    elif method == "POST" and path.startswith("/1/indexes/") and path.endswith("/batch"):
+        index = decode_index(path)
+        requests = json.loads(body).get("requests", [])
+        if (state / "mig5_inflight").exists():
+            if mode == "mig5_refusal_header_drift":
+                respond({"message": "Index is temporarily unavailable", "status": 503}, 503)
+            elif mode == "mig5_refusal_body_drift":
+                respond({"message": "wrong", "status": 503}, 503)
+            else:
+                docs = read_target(index)
+                by_id = {doc["objectID"]: doc for doc in docs}
+                for request in requests:
+                    request_body = request.get("body") or {}
+                    if "objectID" in request_body:
+                        by_id[request_body["objectID"]] = request_body
+                        append("mig5_overlap_success_ids.txt", request_body["objectID"])
+                write_target(index, list(by_id.values()))
+                respond({"taskID": task_id()})
+        else:
+            docs = read_target(index)
+            by_id = {doc["objectID"]: doc for doc in docs}
+            for request in requests:
+                request_body = request.get("body") or {}
+                if "objectID" in request_body:
+                    by_id[request_body["objectID"]] = request_body
+            write_target(index, list(by_id.values()))
+            respond({"taskID": task_id()})
+    elif method == "GET" and "/task/" in path:
+        respond({"status": "published", "pendingTask": False})
+    elif method == "POST" and path.startswith("/1/indexes/") and path.endswith("/query"):
+        index = decode_index(path)
+        request = json.loads(body or "{}")
+        page = int(request.get("page", 0))
+        hits_per_page = int(request.get("hitsPerPage", 100))
+        docs = sorted(read_target(index), key=lambda doc: doc["objectID"])
+        nb_hits = len(docs)
+        nb_pages = (nb_hits + hits_per_page - 1) // hits_per_page if hits_per_page else 0
+        start = page * hits_per_page
+        respond({"hits": docs[start:start + hits_per_page], "nbHits": nb_hits, "nbPages": nb_pages})
+    elif method == "POST" and path == "/1/migrations/algolia":
+        payload = json.loads(body)
+        if payload.get("overwrite") is True:
+            if mode == "mig5_async_job_count_increase":
+                bad = data_dir() / "migration_exports" / "jobs" / "bad-async-job"
+                bad.mkdir(parents=True, exist_ok=True)
+                (bad / "manifest.json").write_text("{}", encoding="utf-8")
+            respond({"message": "overwrite=true is not supported by Algolia migration import", "status": 400}, 400)
+        else:
+            respond({"jobID": "stub-job", "phase": "submitted"}, 202)
     elif method == "POST" and path == "/1/migrate-from-algolia":
         payload = json.loads(body)
         source = payload["sourceIndex"]
         key = payload["apiKey"]
+        if server_label() == "ha":
+            if payload.get("overwrite") is True:
+                respond({"message": "overwrite=true is not supported by Algolia migration import", "status": 400}, 400)
+            else:
+                respond({"code": "migration_ha_unsupported", "message": "Algolia migration import is unavailable on HA clusters until MIG-7 supplies a costed convergence protocol.", "status": 503}, 503)
+            sys.exit(0)
         if key == "stub-permitted-secret-canary":
             append("migration_key_roles.txt", "permitted")
         elif key == "stub-denied-secret-canary":
             append("migration_key_roles.txt", "denied")
         else:
             append("migration_key_roles.txt", "unexpected")
-        if source.endswith("_drift"):
+        if source.endswith("_mig5_source"):
+            target = payload["targetIndex"]
+            barrier = Path(os.environ.get("FLAPJACK_ALGOLIA_LIVE_TEST_IMPORT_PRE_ACTIVATION_BARRIER_DIR", ""))
+            if barrier:
+                barrier.mkdir(parents=True, exist_ok=True)
+                (barrier / "observed").write_text("stub-mig5-job", encoding="utf-8")
+            (state / "mig5_inflight").write_text("1", encoding="utf-8")
+            for _ in range(200):
+                if barrier and (barrier / "release").exists():
+                    break
+                time.sleep(0.05)
+            (state / "mig5_inflight").unlink(missing_ok=True)
+            docs = fixture_docs()
+            if mode != "mig5_successful_race_missing_final_target":
+                for object_id in read_lines("mig5_overlap_success_ids.txt"):
+                    docs.append({"objectID": object_id, "title": f"overlap {object_id}", "mig5_overlap": True})
+            write_target(target, docs)
+            respond({"status": "complete", "settings": True, "objects": {"imported": 1005}, "rules": {"imported": 3}, "synonyms": {"imported": 3}, "taskID": 0})
+        elif source.endswith("_drift"):
             (state / "drift_request_started").write_text("1", encoding="utf-8")
             time.sleep(0.25)
             create_failed_spool()
@@ -242,11 +366,12 @@ if parsed.netloc.startswith("127.0.0.1:"):
             else:
                 respond({"status": "complete", "settings": True, "objects": {"imported": 2500}, "rules": {"imported": 0}, "synonyms": {"imported": 0}, "taskID": 0})
         elif "denied" in key:
+            if mode == "destination_leak":
+                (state / "destination_leaked").write_text("1", encoding="utf-8")
+                append("local_extra_indexes.txt", "stub-denied-destination-leak")
             respond({"message": "Algolia key cannot export unretrievable attributes", "status": 400}, 400)
         else:
             create_accepted_spool()
-            if mode == "destination_leak":
-                (state / "destination_leaked").write_text("1", encoding="utf-8")
             respond({"status": "complete", "settings": True, "objects": {"imported": 1005}, "rules": {"imported": 3}, "synonyms": {"imported": 3}, "taskID": 0})
     else:
         respond({"message": "unexpected local request", "path": path}, 500)
@@ -295,7 +420,7 @@ elif method == "GET" and path == "/1/indexes":
         os.kill(driver_pid, signal.SIGINT if mode == "self_int" else signal.SIGTERM)
         sys.exit(130 if mode == "self_int" else 143)
     else:
-        visible = [idx for idx in seeded if idx not in deleted]
+        visible = [idx for idx in seeded + read_lines("local_extra_indexes.txt") if idx not in deleted]
         if query.get("hitsPerPage") == ["1"]:
             page = int(query.get("page", ["0"])[0])
             items = [{"name": visible[page]}] if page < len(visible) else []
@@ -370,7 +495,7 @@ exact_owned_cleanup_completed() {
 json_output_has_checks() {
   local out="$1"
   sed '/^INFO: /,$d' "$out" \
-    | jq -e '[.expected_observed[].name] | index("vendor_setup") and index("vendor_pagination") and index("migration_acl_and_spool") and index("drift_refusal")' >/dev/null
+    | jq -e '[.expected_observed[].name] | index("vendor_setup") and index("vendor_pagination") and index("migration_acl_and_spool") and index("drift_refusal") and index("mig5_overwrite_exact_membership") and index("mig5_async_overwrite_refusal") and index("mig5_ha_refusals")' >/dev/null
 }
 
 evidence_is_private_and_sanitized() {
@@ -401,10 +526,12 @@ assert_stubbed_success_cleanup() {
     && json_output_has_checks "$out" \
     && evidence_is_private_and_sanitized "$evidence" "$runtime/secret.env" \
     && [ -d "$evidence/migration_exports/jobs" ] \
+    && jq -e '[.checks[] | select(.name | startswith("server_cleanup_")) | .name] == ["server_cleanup_server","server_cleanup_cleanup"]' "$evidence/receipt.json" >/dev/null \
+    && [ "$(wc -l <"$evidence/logs/server-cleanup-status.txt" | tr -d ' ')" = "2" ] \
     && [ ! -e "$data_dir" ] \
     && exact_owned_cleanup_completed "$runtime" \
     && [ -f "$runtime/state/migration_key_roles.txt" ] \
-    && cmp -s <(printf 'permitted\ndenied\npermitted\n') "$runtime/state/migration_key_roles.txt" \
+    && cmp -s <(printf 'permitted\ndenied\npermitted\npermitted\n') "$runtime/state/migration_key_roles.txt" \
     && [ -f "$runtime/state/drift_mutation_after_barrier" ] \
     && [ "$(cat "$runtime/state/drift_barrier_observed" 2>/dev/null)" = "$expected_observation" ] \
     && [ ! -e "$runtime/state/drift_mutation_before_barrier" ] \
@@ -412,8 +539,14 @@ assert_stubbed_success_cleanup() {
     rm -rf "$evidence"
     pass 'stubbed success uses exact permitted/denied key sequence, orders drift mutation, and cleans owned resources'
   else
+    local evidence_ok data_exists cleanup_ok roles
+    evidence_ok="$(evidence_is_private_and_sanitized "$evidence" "$runtime/secret.env" && echo yes || echo no)"
+    data_exists="$([ -e "$data_dir" ] && echo yes || echo no)"
+    cleanup_ok="$(exact_owned_cleanup_completed "$runtime" && echo yes || echo no)"
+    roles="$(tr '\n' ',' <"$runtime/state/migration_key_roles.txt" 2>/dev/null || true)"
     [ -z "$evidence" ] || rm -rf "$evidence"
-    fail 'stubbed success uses exact permitted/denied key sequence, orders drift mutation, and cleans owned resources' "rc=$rc output=$(cat "$out")"
+    fail 'stubbed success uses exact permitted/denied key sequence, orders drift mutation, and cleans owned resources' \
+      "rc=$rc evidence=${evidence:-} evidence_ok=${evidence_ok} data_exists=${data_exists} exact_cleanup=${cleanup_ok} roles=${roles} output=$(cat "$out")"
   fi
 }
 
@@ -428,7 +561,7 @@ assert_stubbed_failure_preserves_evidence_before_cleanup() {
   if [ "$rc" != "0" ] \
     && [ -n "$evidence" ] \
     && evidence_is_private_and_sanitized "$evidence" "$runtime/secret.env" \
-    && jq -e '.created_indexes | length == 4' "$evidence/receipt.json" >/dev/null \
+    && jq -e '.created_indexes | length == 5' "$evidence/receipt.json" >/dev/null \
     && [ ! -e "$data_dir" ] \
     && exact_owned_cleanup_completed "$runtime" \
     && ! grep -Eq 'ADMIN_SECRET_CANARY|stub-(permitted|denied)-secret-canary' "$out"; then
@@ -518,6 +651,39 @@ assert_stubbed_signal_cleanup() {
   fi
 }
 
+assert_stubbed_mig5_mutation_fails_closed() {
+  local mode="$1" expected="$2" runtime out rc evidence
+  runtime="$WORK_DIR/stub-${mode}"
+  out="$runtime.out"
+  write_stub_runtime "$runtime"
+  rc="$(run_driver_with_stub "$mode" "$out" "$runtime")"
+  evidence="$(extract_evidence_path "$out")"
+  if [ "$rc" != "0" ] \
+    && grep -Fq "$expected" "$out" \
+    && evidence_is_private_and_sanitized "$evidence" "$runtime/secret.env"; then
+    rm -rf "$evidence"
+    pass "stubbed ${mode} mutation fails closed"
+  else
+    [ -z "$evidence" ] || rm -rf "$evidence"
+    fail "stubbed ${mode} mutation fails closed" "rc=$rc expected=$expected output=$(cat "$out")"
+  fi
+}
+
+assert_stubbed_mig5_mutations_fail_closed() {
+  assert_stubbed_mig5_mutation_fails_closed \
+    "mig5_successful_race_missing_final_target" \
+    "success-acknowledged-but-absent IDs"
+  assert_stubbed_mig5_mutation_fails_closed \
+    "mig5_refusal_header_drift" \
+    "overlap 503 missing Retry-After: 1"
+  assert_stubbed_mig5_mutation_fails_closed \
+    "mig5_refusal_body_drift" \
+    "overlap 503 body did not match IndexPaused JSON identity"
+  assert_stubbed_mig5_mutation_fails_closed \
+    "mig5_async_job_count_increase" \
+    "async overwrite refusal created a migration job artifact"
+}
+
 assert_usage_requires_secret_file() {
   local out rc
   out="$WORK_DIR/usage.out"
@@ -574,10 +740,12 @@ assert_sources_only_required_loader() {
 }
 
 assert_server_lifecycle_contract() {
-  if grep -Fq 'FLAPJACK_DATA_DIR="$DATA_DIR"' "$DRIVER" \
+  if grep -Fq 'cargo run -p flapjack-server --bin flapjack -- --data-dir "$data_dir" --auto-port' "$DRIVER" \
     && grep -Fq '"$BIN_PATH" --auto-port' "$DRIVER" \
-    && grep -Fq '"$WAIT_HELPER" --pid "$SERVER_PID" --host 127.0.0.1 --port auto' "$DRIVER" \
-    && grep -Fq 'kill "$SERVER_PID"' "$DRIVER" \
+    && grep -Fq '"$WAIT_HELPER" --pid "$SERVER_LAUNCH_PID" --host 127.0.0.1 --port auto' "$DRIVER" \
+    && grep -Fq 'discover_serving_pid "$SERVER_LAUNCH_PID"' "$DRIVER" \
+    && grep -Fq 'kill "$SERVER_SERVING_PID"' "$DRIVER" \
+    && grep -Fq 'kill "$SERVER_LAUNCH_PID"' "$DRIVER" \
     && grep -Fq 'FLAPJACK_BIN' "$DRIVER"; then
     pass 'driver owns a narrow local-server lifecycle with exact PID cleanup'
   else
@@ -626,6 +794,27 @@ assert_contract_arms_present() {
   fi
 }
 
+assert_mig5_overwrite_contract_arms_present() {
+  if grep -Fq 'run_mig5_overwrite_scenario' "$DRIVER" \
+    && grep -Fq 'cargo run -p flapjack-server --bin flapjack -- --data-dir "$data_dir" --auto-port' "$DRIVER" \
+    && grep -Fq 'runtime_override:false' "$DRIVER" \
+    && grep -Fq '"paginationLimitedTo": 2000' "$DRIVER" \
+    && grep -Fq 'overlap_attempted' "$DRIVER" \
+    && grep -Fq 'overlap_completed' "$DRIVER" \
+    && grep -Fq 'loose hit-count checks are forbidden' "$DRIVER" \
+    && grep -Fq 'success-acknowledged-but-absent IDs' "$DRIVER" \
+    && grep -Fq 'Retry-After: 1' "$DRIVER" \
+    && grep -Fq 'Index is temporarily unavailable' "$DRIVER" \
+    && grep -Fq 'async overwrite refusal created a migration job artifact' "$DRIVER" \
+    && grep -Fq 'transcript_metadata' "$DRIVER" \
+    && grep -Fq 'unrelated PID cleanup is forbidden' "$DRIVER" \
+    && ! grep -Eq 'pkill|killall|ps aux \| grep|xargs kill' "$DRIVER"; then
+    pass 'driver contains MIG-5 overwrite live-proof contract arms'
+  else
+    fail 'driver contains MIG-5 overwrite live-proof contract arms'
+  fi
+}
+
 assert_no_subcommand_bypasses_normal_usage() {
   local out rc
   out="$WORK_DIR/subcommand.out"
@@ -651,12 +840,14 @@ main() {
   assert_cleanup_and_evidence_ordering
   assert_owned_resource_cleanup_contract
   assert_contract_arms_present
+  assert_mig5_overwrite_contract_arms_present
   assert_no_subcommand_bypasses_normal_usage
   assert_stubbed_success_cleanup
   assert_stubbed_failure_preserves_evidence_before_cleanup
   assert_stubbed_destination_leak_fails_closed
   assert_stubbed_later_page_residue_fails_cleanup
   assert_stubbed_signal_cleanup
+  assert_stubbed_mig5_mutations_fail_closed
 
   printf '\nResults: %d/%d passed\n' "$TESTS_PASSED" "$TESTS_RUN"
   if [ "$TESTS_FAILED" -gt 0 ]; then

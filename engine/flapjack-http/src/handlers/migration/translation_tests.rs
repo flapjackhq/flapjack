@@ -1503,7 +1503,17 @@ fn supported_synonym_payloads_resolve_to_schema_rows() {
 
 #[test]
 fn translates_complete_spool_payload_and_preserves_resource_order() {
-    let payload = spool_payload(
+    let translated = translated(complete_spool_payload());
+
+    assert_complete_spool_documents(&translated);
+    assert_complete_spool_settings(&translated);
+    assert_complete_spool_replica_settings(&translated);
+    assert_complete_spool_rules_and_synonyms(&translated);
+    assert_complete_spool_report(&translated);
+}
+
+fn complete_spool_payload() -> SpoolTranslationInput {
+    let mut payload = spool_payload(
         json!({
             "searchableAttributes": ["title", "brand"],
             "attributesForFaceting": ["brand", "category"],
@@ -1541,8 +1551,6 @@ fn translates_complete_spool_payload_and_preserves_resource_order() {
             }),
         ]],
     );
-
-    let mut payload = payload;
     payload.replica_settings = BTreeMap::from([
         (
             "products_price_desc".to_string(),
@@ -1560,23 +1568,28 @@ fn translates_complete_spool_payload_and_preserves_resource_order() {
             }),
         ),
     ]);
-    let translated = translated(payload);
+    payload
+}
 
+fn assert_complete_spool_documents(translated: &TranslatedSpoolPayload) {
     assert_eq!(
-        translated_documents(&translated)
+        translated_documents(translated)
             .into_iter()
             .map(|document| document.id.as_str())
             .collect::<Vec<_>>(),
         vec!["doc-1", "doc-2", "doc-3"]
     );
     assert_eq!(
-        translated_documents(&translated)[0].fields["title"],
+        translated_documents(translated)[0].fields["title"],
         FieldValue::Text("Trail Shoe".to_string())
     );
     assert_eq!(
-        translated_documents(&translated)[0].fields["private_cost"],
+        translated_documents(translated)[0].fields["private_cost"],
         FieldValue::Integer(42)
     );
+}
+
+fn assert_complete_spool_settings(translated: &TranslatedSpoolPayload) {
     assert_eq!(
         translated.bundle.settings.searchable_attributes,
         Some(vec!["title".to_string(), "brand".to_string()])
@@ -1605,6 +1618,9 @@ fn translates_complete_spool_payload_and_preserves_resource_order() {
         ])
     );
     assert!(translated.bundle.settings.relevancy_strictness.is_none());
+}
+
+fn assert_complete_spool_replica_settings(translated: &TranslatedSpoolPayload) {
     assert_eq!(translated.bundle.replica_settings.len(), 2);
     assert_eq!(
         translated.bundle.replica_settings[0].source_name,
@@ -1636,6 +1652,9 @@ fn translates_complete_spool_payload_and_preserves_resource_order() {
         translated.bundle.replica_settings[1].source_relevancy_strictness,
         Some(50)
     );
+}
+
+fn assert_complete_spool_rules_and_synonyms(translated: &TranslatedSpoolPayload) {
     assert_eq!(
         translated
             .bundle
@@ -1663,7 +1682,9 @@ fn translates_complete_spool_payload_and_preserves_resource_order() {
             ["automaticFacetFilters"][0],
         json!({"facet": "brand", "score": 4})
     );
+}
 
+fn assert_complete_spool_report(translated: &TranslatedSpoolPayload) {
     assert!(translated
         .report
         .entries
@@ -1925,7 +1946,13 @@ fn exact_document_and_settings_rows_persist_payload_values() {
     assert_eq!(document_attribute.disposition, Disposition::Exact);
     assert_eq!(document_attribute.target_owner, TargetOwner::DocumentJson);
 
-    let translated = translated(spool_payload(
+    let translated = translated(exact_document_and_settings_payload());
+    assert_exact_settings_payload_values(&translated);
+    assert_exact_document_payload_values(&translated);
+}
+
+fn exact_document_and_settings_payload() -> SpoolTranslationInput {
+    spool_payload(
         json!({
             "attributesForFaceting": ["brand"],
             "searchableAttributes": ["title"],
@@ -1963,8 +1990,15 @@ fn exact_document_and_settings_rows_persist_payload_values() {
         })]],
         vec![],
         vec![],
-    ));
+    )
+}
 
+fn assert_exact_settings_payload_values(translated: &TranslatedSpoolPayload) {
+    assert_exact_settings_payload_core_values(translated);
+    assert_exact_settings_payload_advanced_values(translated);
+}
+
+fn assert_exact_settings_payload_core_values(translated: &TranslatedSpoolPayload) {
     let settings = &translated.bundle.settings;
     assert_eq!(settings.attributes_for_faceting, vec!["brand"]);
     assert_eq!(
@@ -1993,6 +2027,10 @@ fn exact_document_and_settings_rows_persist_payload_values() {
     assert_eq!(settings.query_type, "prefixLast");
     assert_eq!(settings.enable_personalization, Some(true));
     assert_eq!(settings.user_data, Some(json!({"owner": "migration"})));
+}
+
+fn assert_exact_settings_payload_advanced_values(translated: &TranslatedSpoolPayload) {
+    let settings = &translated.bundle.settings;
     assert_eq!(settings.enable_rules, Some(false));
     assert_eq!(
         settings.advanced_syntax_features,
@@ -2024,14 +2062,16 @@ fn exact_document_and_settings_rows_persist_payload_values() {
         settings.numeric_attributes_for_filtering,
         Some(vec!["price".to_string()])
     );
+}
 
-    assert_eq!(translated_documents(&translated)[0].id, "doc-1");
+fn assert_exact_document_payload_values(translated: &TranslatedSpoolPayload) {
+    assert_eq!(translated_documents(translated)[0].id, "doc-1");
     assert_eq!(
-        translated_documents(&translated)[0].fields["title"],
+        translated_documents(translated)[0].fields["title"],
         FieldValue::Text("Trail Shoe".to_string())
     );
     assert_eq!(
-        translated_documents(&translated)[0].fields["price"],
+        translated_documents(translated)[0].fields["price"],
         FieldValue::Integer(129)
     );
 }
@@ -3193,8 +3233,16 @@ fn live_mutation_oracle_rejects_extra_hard_rejections() {
 fn assert_positive_live_translation(input: SpoolTranslationInput) {
     let translated = translated(input);
 
+    assert_positive_live_documents(&translated);
+    assert_positive_live_settings(&translated);
+    assert_positive_live_rules(&translated);
+    assert_positive_live_synonyms(&translated);
+    assert_positive_live_report(&translated);
+}
+
+fn assert_positive_live_documents(translated: &TranslatedSpoolPayload) {
     assert_eq!(
-        translated_documents(&translated)
+        translated_documents(translated)
             .into_iter()
             .map(|document| document.to_json())
             .collect::<Vec<_>>(),
@@ -3214,6 +3262,14 @@ fn assert_positive_live_translation(input: SpoolTranslationInput) {
             }),
         ]
     );
+}
+
+fn assert_positive_live_settings(translated: &TranslatedSpoolPayload) {
+    assert_positive_live_filter_settings(translated);
+    assert_positive_live_ranking_settings(translated);
+}
+
+fn assert_positive_live_filter_settings(translated: &TranslatedSpoolPayload) {
     assert_eq!(
         translated.bundle.settings.searchable_attributes,
         Some(vec!["title".to_string(), "brand".to_string()])
@@ -3255,6 +3311,9 @@ fn assert_positive_live_translation(input: SpoolTranslationInput) {
         "attribute"
     );
     assert_eq!(translated.bundle.settings.synonyms, None);
+}
+
+fn assert_positive_live_ranking_settings(translated: &TranslatedSpoolPayload) {
     assert_eq!(
         translated.bundle.settings.ranking,
         Some(vec![
@@ -3288,6 +3347,9 @@ fn assert_positive_live_translation(input: SpoolTranslationInput) {
         vec!["ignorePlurals", "singleWordSynonym"]
     );
     assert!(translated.bundle.settings.optional_words.is_empty());
+}
+
+fn assert_positive_live_rules(translated: &TranslatedSpoolPayload) {
     assert_eq!(
         translated
             .bundle
@@ -3307,6 +3369,9 @@ fn assert_positive_live_translation(input: SpoolTranslationInput) {
             "enabled": true
         })]
     );
+}
+
+fn assert_positive_live_synonyms(translated: &TranslatedSpoolPayload) {
     assert_eq!(
         translated
             .bundle
@@ -3319,6 +3384,9 @@ fn assert_positive_live_translation(input: SpoolTranslationInput) {
             json!({"type": "synonym", "objectID": "live-syn-1", "synonyms": ["sneaker", "trainer"]}),
         ]
     );
+}
+
+fn assert_positive_live_report(translated: &TranslatedSpoolPayload) {
     assert_eq!(
         report_entry_contract(&translated.report.entries),
         vec![

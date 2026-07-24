@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 const HOUR_MS: i64 = 3_600_000;
 const MIGRATION_SPOOL_GC_INTERVAL_ENV: &str = "FLAPJACK_MIGRATION_SPOOL_GC_INTERVAL_SECS";
 const DEFAULT_MIGRATION_SPOOL_GC_INTERVAL_SECS: u64 = 300;
+const AUTOHEAL_ENABLED_ENV: &str = "FLAPJACK_AUTOHEAL_ENABLED";
 
 /// Restore all tenant indexes from S3 snapshots when the data directory is empty.
 ///
@@ -110,25 +111,53 @@ async fn restore_tenant_from_s3(
     tid: &str,
     data_path: &std::path::Path,
 ) {
-    if extract_s3_snapshot_tenant_id(&format!("snapshots/{tid}/")).is_none() {
-        tracing::warn!("S3 auto-restore: refusing path-unsafe tenant id {:?}", tid);
+    if !is_path_safe_snapshot_tenant_id(tid) {
         return;
     }
+
+    let Some((key, data)) = download_latest_tenant_snapshot(s3_config, tid).await else {
+        return;
+    };
+    if import_tenant_snapshot(tid, data_path, &data).is_none() {
+        return;
+    }
+    tracing::info!(
+        "S3 auto-restore: restored {} from {} ({} bytes)",
+        tid,
+        key,
+        data.len()
+    );
+}
+
+fn is_path_safe_snapshot_tenant_id(tid: &str) -> bool {
+    if extract_s3_snapshot_tenant_id(&format!("snapshots/{tid}/")).is_some() {
+        return true;
+    }
+    tracing::warn!("S3 auto-restore: refusing path-unsafe tenant id {:?}", tid);
+    false
+}
+
+async fn download_latest_tenant_snapshot(
+    s3_config: &flapjack::index::s3::S3Config,
+    tid: &str,
+) -> Option<(String, Vec<u8>)> {
     match flapjack::index::s3::download_latest_snapshot(s3_config, tid).await {
-        Ok((key, data)) => {
-            let index_path = data_path.join(tid);
-            if let Err(e) = flapjack::index::snapshot::import_from_bytes(&data, &index_path) {
-                tracing::error!("S3 auto-restore: failed to import {}: {}", tid, e);
-                return;
-            }
-            tracing::info!(
-                "S3 auto-restore: restored {} from {} ({} bytes)",
-                tid,
-                key,
-                data.len()
-            );
+        Ok(snapshot) => Some(snapshot),
+        Err(error) => {
+            tracing::warn!("S3 auto-restore: no snapshot for {}: {}", tid, error);
+            None
         }
-        Err(e) => tracing::warn!("S3 auto-restore: no snapshot for {}: {}", tid, e),
+    }
+}
+
+fn import_tenant_snapshot(tid: &str, data_path: &std::path::Path, data: &[u8]) -> Option<()> {
+    let index_path = data_path.join(tid);
+    match flapjack::index::snapshot::import_from_bytes(data, &index_path) {
+        Ok(()) => Some(()),
+        Err(error) => {
+            tracing::error!("S3 auto-restore: failed to import {}: {}", tid, error);
+            None
+        }
     }
 }
 
@@ -230,6 +259,31 @@ fn migration_spool_gc_interval_secs() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
         .unwrap_or(DEFAULT_MIGRATION_SPOOL_GC_INTERVAL_SECS)
+}
+
+fn parse_autoheal_enabled(value: Option<&str>) -> Result<bool, String> {
+    let Some(raw_value) = value else {
+        return Ok(false);
+    };
+    match raw_value.trim() {
+        value if value.eq_ignore_ascii_case("true") => Ok(true),
+        value if value.eq_ignore_ascii_case("false") => Ok(false),
+        _ => Err(raw_value.to_string()),
+    }
+}
+
+fn autoheal_enabled_from_env() -> bool {
+    match parse_autoheal_enabled(std::env::var(AUTOHEAL_ENABLED_ENV).ok().as_deref()) {
+        Ok(enabled) => enabled,
+        Err(value) => {
+            tracing::warn!(
+                "[autoheal] ignoring invalid {} value {:?}; using false",
+                AUTOHEAL_ENABLED_ENV,
+                value
+            );
+            false
+        }
+    }
 }
 
 fn spawn_migration_spool_gc_task(state: &Arc<AppState>) {
@@ -443,7 +497,9 @@ fn spawn_s3_backup_task(infrastructure: &InfrastructureState) {
 /// Spawns replication health probe and periodic peer-sync tasks.
 fn spawn_replication_tasks(state: &Arc<AppState>, infrastructure: &InfrastructureState) {
     if let Some(replication_manager) = infrastructure.replication_manager.as_ref() {
-        replication_manager.start_health_probe(10);
+        let autoheal_enabled = autoheal_enabled_from_env();
+        replication_manager.start_health_probe(10, autoheal_enabled);
+        tracing::info!("[autoheal] enabled={}", autoheal_enabled);
         // NOTE: One-shot startup catch-up moved to server.rs as a pre-serve barrier
         // (run_pre_serve_catchup). Only periodic sync remains as a background task.
         let sync_interval: u64 = std::env::var("FLAPJACK_SYNC_INTERVAL_SECS")

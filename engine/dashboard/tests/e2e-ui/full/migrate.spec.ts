@@ -160,20 +160,22 @@ test.describe('Migrate Page', () => {
 
   test('submitting with invalid credentials shows error', async ({ page }) => {
     const sourceIndex = `nonexistent-index-${Date.now()}`;
-    const upstreamFailureMessage =
-      `Algolia request failed: error sending request for url (https://fake-app-id-dsn.algolia.net/1/indexes/${sourceIndex}/settings)`;
+    const fakeApiKey = 'fake-api-key';
+    const rawUpstreamUrl = `https://fake-app-id-dsn.algolia.net/1/indexes/${sourceIndex}/settings`;
 
     // Fill in fake credentials
     await page.getByLabel('Application ID').fill('fake-app-id');
-    await page.getByLabel('Admin API Key').fill('fake-api-key');
+    await page.getByLabel('Admin API Key').fill(fakeApiKey);
     await sourceIndexInput(page).fill(sourceIndex);
 
     // Click migrate
     await page.getByRole('button', { name: /migrate/i }).click();
 
-    // Should show an error card after the request fails
+    // Should show a sanitized error card after the request fails.
     const errorCard = page.getByTestId('migration-error-card');
-    await expect(errorCard).toContainText(upstreamFailureMessage, { timeout: 15_000 });
+    await expect(errorCard).toContainText('Algolia appId is invalid', { timeout: 15_000 });
+    await expect(errorCard).not.toContainText(fakeApiKey);
+    await expect(errorCard).not.toContainText(rawUpstreamUrl);
   });
 
   test('migration attempts do not expose Algolia API keys in API Logs', async ({ page }) => {

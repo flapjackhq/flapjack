@@ -2,10 +2,56 @@
 
 mod support;
 
+use flapjack_http::handlers::health::PublicBuildInfo;
 use predicates::str::contains;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::io::Read;
+use std::path::Path;
 use std::time::Duration;
-use support::{flapjack_cmd, http_request, RunningServer, TempDir};
+use support::{
+    flapjack_cmd, flapjack_cmd_executable, http_request, server_spawn_executable, RunningServer,
+    TempDir,
+};
+
+#[test]
+fn cli_and_server_helpers_select_same_executable_artifact() {
+    let cli_path = std::fs::canonicalize(flapjack_cmd_executable())
+        .expect("assert_cmd-selected flapjack executable should be canonicalizable");
+    let server_path = std::fs::canonicalize(server_spawn_executable())
+        .expect("server-spawn flapjack executable should be canonicalizable");
+    let cli_digest = sha256_file(&cli_path);
+    let server_digest = sha256_file(&server_path);
+    let artifact_identity = format!(
+        "CLI path: {cli_path:?}\n\
+         CLI SHA-256: {cli_digest}\n\
+         server path: {server_path:?}\n\
+         server SHA-256: {server_digest}"
+    );
+    eprintln!("{artifact_identity}");
+
+    assert!(
+        cli_path == server_path && cli_digest == server_digest,
+        "CLI and live-server helpers must select one executable artifact\n{artifact_identity}"
+    );
+}
+
+fn sha256_file(path: &Path) -> String {
+    let mut file = std::fs::File::open(path)
+        .unwrap_or_else(|error| panic!("failed to open executable {path:?}: {error}"));
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let bytes_read = file
+            .read(&mut buffer)
+            .unwrap_or_else(|error| panic!("failed to read executable {path:?}: {error}"));
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    format!("{:x}", hasher.finalize())
+}
 
 #[test]
 fn build_info_json_outputs_canonical_build_info() {
@@ -92,7 +138,8 @@ fn cli_build_info_matches_live_health_build_info() {
         .get_output()
         .stdout
         .clone();
-    let cli_build: Value = serde_json::from_slice(&cli_output).unwrap();
+    let cli_build_info: flapjack::BuildInfo = serde_json::from_slice(&cli_output).unwrap();
+    let cli_build = serde_json::to_value(&cli_build_info).unwrap();
 
     let tmp = TempDir::new("fj_test_build_info_health");
     let server = RunningServer::spawn_no_auth_auto_port(tmp.path());
@@ -101,13 +148,34 @@ fn cli_build_info_matches_live_health_build_info() {
     assert_eq!(response.status, 200);
     let health: Value = serde_json::from_str(&response.body).unwrap();
 
-    assert_eq!(cli_build, health["build"]);
+    let expected_public_build =
+        serde_json::to_value(PublicBuildInfo::from(&cli_build_info)).unwrap();
+    assert_eq!(
+        health["build"], expected_public_build,
+        "live health build must equal the public CLI build projection\n\
+         full CLI build: {cli_build}\n\
+         live health build: {}",
+        health["build"]
+    );
     assert_no_migration_capability_spellings(&cli_build);
     assert_no_migration_capability_spellings(&health["capabilities"]);
     assert_known_flag_matches_nullable_value(&cli_build, "revision", "revisionKnown");
     assert_known_flag_matches_nullable_value(&cli_build, "dirty", "dirtyKnown");
-    assert_known_flag_matches_nullable_value(&health["build"], "revision", "revisionKnown");
-    assert_known_flag_matches_nullable_value(&health["build"], "dirty", "dirtyKnown");
+    for field in [
+        "revision",
+        "revisionKnown",
+        "dirty",
+        "dirtyKnown",
+        "workspaceDigest",
+        "target",
+        "features",
+    ] {
+        assert!(
+            health["build"].get(field).is_none(),
+            "public health build must omit private CLI field {field}: {}",
+            health["build"]
+        );
+    }
 }
 
 fn assert_no_migration_capability_spellings(value: &Value) {

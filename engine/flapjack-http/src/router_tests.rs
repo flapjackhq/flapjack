@@ -17,10 +17,12 @@ use crate::handlers::dashboard::{dashboard_test_asset_bytes, dashboard_test_inde
 use crate::middleware::REQUEST_ID_HEADER_NAME;
 use crate::openapi::{DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS, DOCUMENTED_MEMBERSHIP_SCHEMA_NAMES};
 use crate::openapi_test_helpers::{
-    assert_add_peer_openapi_contract, assert_remove_peer_openapi_contract,
+    assert_add_peer_openapi_contract, assert_cluster_status_openapi_contract,
+    assert_remove_peer_openapi_contract,
 };
 use crate::test_helpers::{
-    body_json, build_test_router, send_empty_request, send_json_request, TestStateBuilder,
+    body_json, build_test_router, send_empty_request, send_json_request, EnvVarRestoreGuard,
+    TestStateBuilder, ENV_MUTEX,
 };
 
 fn build_auth_test_app() -> (TempDir, axum::Router) {
@@ -79,6 +81,7 @@ async fn openapi_membership_contract_is_served_when_auth_is_enabled() {
     let document = body_json(response).await;
     assert_add_peer_openapi_contract(&document);
     assert_remove_peer_openapi_contract(&document);
+    assert_cluster_status_openapi_contract(&document);
 }
 
 #[tokio::test]
@@ -316,6 +319,56 @@ async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
         .await
         .unwrap()
         .to_vec()
+}
+
+// The process-global environment lock must span each asynchronous router
+// request so another test cannot change S3 configuration mid-fixture.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn internal_snapshot_capability_requires_admin_authentication() {
+    let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+    let _bucket = EnvVarRestoreGuard::remove("FLAPJACK_S3_BUCKET");
+    let tmp = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let search_key = search_only_key_value(&key_store);
+    let app = build_test_router(&tmp, Some(key_store));
+
+    let missing_credentials = get_request(&app, "/internal/snapshots/capability", None).await;
+    assert_invalid_credentials_response(missing_credentials).await;
+
+    let search_only = get_request(&app, "/internal/snapshots/capability", Some(&search_key)).await;
+    assert_method_not_allowed_response(search_only).await;
+
+    let admin = get_request(&app, "/internal/snapshots/capability", Some("admin-key")).await;
+    assert_eq!(admin.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(admin).await,
+        serde_json::json!({
+            "backend": "s3",
+            "state": "not_configured",
+            "bucket": null
+        })
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn internal_snapshot_capability_remains_available_without_authentication() {
+    let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+    let _bucket = EnvVarRestoreGuard::remove("FLAPJACK_S3_BUCKET");
+    let (_tmp, app) = build_no_auth_test_app();
+
+    let response = get_request(&app, "/internal/snapshots/capability", None).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(response).await,
+        serde_json::json!({
+            "backend": "s3",
+            "state": "not_configured",
+            "bucket": null
+        })
+    );
 }
 
 #[tokio::test]

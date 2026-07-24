@@ -1,4 +1,6 @@
 pub(crate) mod admission;
+#[cfg(test)]
+mod admission_tests;
 mod finalization;
 mod vectors;
 
@@ -526,27 +528,12 @@ async fn process_writes(
     let phase_start = Instant::now();
     let tenant_id = &ctx.tenant_id;
     let resolved_batch_size = write_queue_batch_size();
-    tracing::info!("Write queue started for tenant {}", tenant_id);
-    tracing::info!(
-        "[WQ {}] using resolved batch size {} from {}",
-        tenant_id,
-        resolved_batch_size,
-        WRITE_QUEUE_BATCH_SIZE_ENV_VAR
-    );
-    if let Some(delay) = write_queue_start_delay() {
-        tracing::warn!(
-            "[WQ {}] delaying write queue start by {:?}",
-            tenant_id,
-            delay
-        );
-        tokio::time::sleep(delay).await;
-    }
+    log_write_queue_start(tenant_id, resolved_batch_size);
+    apply_write_queue_start_delay(tenant_id).await;
     let mut pending = Vec::new();
     let mut deadline = reset_write_queue_deadline();
-    replay_admitted_writes(&ctx, &mut pending, replay_records, resolved_batch_size).await?;
-    if !pending.is_empty() {
-        flush_pending_batch(&ctx, &mut pending).await?;
-    }
+    replay_and_flush_admitted_writes(&ctx, &mut pending, replay_records, resolved_batch_size)
+        .await?;
 
     loop {
         log_write_queue_state(tenant_id, pending.len(), deadline);
@@ -566,6 +553,40 @@ async fn process_writes(
         }
     }
     observe_write_queue_phase(PHASE_PROCESS_WRITES, phase_start);
+    Ok(())
+}
+
+fn log_write_queue_start(tenant_id: &str, resolved_batch_size: usize) {
+    tracing::info!("Write queue started for tenant {}", tenant_id);
+    tracing::info!(
+        "[WQ {}] using resolved batch size {} from {}",
+        tenant_id,
+        resolved_batch_size,
+        WRITE_QUEUE_BATCH_SIZE_ENV_VAR
+    );
+}
+
+async fn apply_write_queue_start_delay(tenant_id: &str) {
+    if let Some(delay) = write_queue_start_delay() {
+        tracing::warn!(
+            "[WQ {}] delaying write queue start by {:?}",
+            tenant_id,
+            delay
+        );
+        tokio::time::sleep(delay).await;
+    }
+}
+
+async fn replay_and_flush_admitted_writes(
+    ctx: &WriteQueueContext,
+    pending: &mut Vec<WriteOp>,
+    replay_records: Vec<WriteAdmissionRecord>,
+    resolved_batch_size: usize,
+) -> crate::error::Result<()> {
+    replay_admitted_writes(ctx, pending, replay_records, resolved_batch_size).await?;
+    if !pending.is_empty() {
+        flush_pending_batch(ctx, pending).await?;
+    }
     Ok(())
 }
 

@@ -113,7 +113,7 @@ impl IndexManager {
         Ok(())
     }
 
-    fn is_document_recovery_op(op_type: &str) -> bool {
+    pub(super) fn is_document_recovery_op(op_type: &str) -> bool {
         matches!(op_type, "upsert" | "delete" | "clear")
     }
 

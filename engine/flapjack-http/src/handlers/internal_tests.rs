@@ -1135,7 +1135,7 @@ async fn apply_ops_unknown_type_skipped() {
 
 // ── /internal/storage endpoint tests ──
 
-use crate::test_helpers::TestStateBuilder;
+use crate::test_helpers::{EnvVarRestoreGuard, TestStateBuilder, ENV_MUTEX};
 use axum::body::Body;
 use axum::http::Request;
 use axum::routing::{delete, get, post};
@@ -1765,9 +1765,12 @@ async fn storage_all_includes_doc_count() {
 
 // ── /internal/status enhancements ──
 
-/// Verify that GET `/internal/status` includes `storage_total_bytes` and `tenant_count` fields reflecting the loaded tenants.
+/// Pin the standalone `/internal/status` response consumed by the System screen.
 #[tokio::test]
-async fn status_includes_storage_total_and_tenant_count() {
+#[allow(clippy::await_holding_lock)] // Process-global env guard must span the request.
+async fn ops_contract_internal_status_standalone_exact_fields() {
+    let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+    let _node_id = EnvVarRestoreGuard::remove("FLAPJACK_NODE_ID");
     let tmp = TempDir::new().unwrap();
     let state = TestStateBuilder::new(&tmp).build_shared();
 
@@ -1795,18 +1798,25 @@ async fn status_includes_storage_total_and_tenant_count() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
+    let storage_total_bytes = json["storage_total_bytes"]
+        .as_u64()
+        .expect("storage_total_bytes must be an unsigned integer");
     assert!(
-        json["storage_total_bytes"].as_u64().is_some(),
-        "should have storage_total_bytes"
-    );
-    assert!(
-        json["storage_total_bytes"].as_u64().unwrap() > 0,
+        storage_total_bytes > 0,
         "total bytes should be > 0 with 2 tenants"
     );
     assert_eq!(
-        json["tenant_count"].as_u64().unwrap(),
-        2,
-        "should have 2 tenants loaded"
+        json,
+        serde_json::json!({
+            "node_id": "unknown",
+            "replication_enabled": false,
+            "peer_count": 0,
+            "ssl_renewal": null,
+            "storage_total_bytes": storage_total_bytes,
+            "tenant_count": 2,
+            "vector_memory_bytes": 0,
+        }),
+        "standalone status must keep the exact seven-field wire contract"
     );
 }
 
@@ -2332,10 +2342,12 @@ fn contains_document_replication_ops_detects_upsert_and_delete() {
 
 // ── Cluster status endpoint tests ──
 
-/// GET /internal/cluster/status without a ReplicationManager (standalone mode)
-/// should return replication_enabled=false, empty peers, and a node_id.
+/// Pin the standalone branch of GET `/internal/cluster/status`.
 #[tokio::test]
-async fn cluster_status_standalone_returns_disabled_with_empty_peers() {
+#[allow(clippy::await_holding_lock)] // Process-global env guard must span the request.
+async fn ops_contract_cluster_status_standalone_exact_branch() {
+    let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+    let _node_id = EnvVarRestoreGuard::remove("FLAPJACK_NODE_ID");
     let tmp = TempDir::new().unwrap();
     // Default TestStateBuilder has replication_manager: None → standalone mode.
     let state = TestStateBuilder::new(&tmp).build_shared();
@@ -2358,43 +2370,288 @@ async fn cluster_status_standalone_returns_disabled_with_empty_peers() {
     let body = crate::test_helpers::body_json(resp).await;
 
     assert_eq!(
-        body["replication_enabled"], false,
-        "standalone node must report replication_enabled=false"
+        body,
+        serde_json::json!({
+            "node_id": "unknown",
+            "replication_enabled": false,
+            "peers": [],
+            "autoheal_enabled": false,
+            "autoheal_peers": [],
+        }),
+        "standalone cluster status must keep the exact auto-heal-aware branch"
     );
-    assert!(
-        body["peers"].as_array().is_some_and(|p| p.is_empty()),
-        "standalone node must return empty peers array"
-    );
-    assert!(
-        body["node_id"].is_string(),
-        "standalone response must include node_id"
-    );
-    // Standalone response must NOT include HA-specific aggregate fields.
-    assert!(
-        body.get("peers_total").is_none(),
-        "standalone response must not include peers_total"
-    );
-    assert!(
-        body.get("peers_healthy").is_none(),
-        "standalone response must not include peers_healthy"
+    assert_eq!(body["autoheal_enabled"], false);
+    assert_eq!(
+        body["autoheal_peers"],
+        serde_json::json!([]),
+        "standalone status should expose an empty auto-heal lifecycle array"
     );
 }
 
-/// GET /internal/cluster/status with a ReplicationManager (HA mode) should return
-/// replication_enabled=true, peer counts, and a populated peers array with
-/// the correct shape per peer.
+/// Pin the HA branch of GET `/internal/cluster/status`.
 #[tokio::test]
-async fn cluster_status_ha_returns_peer_list_with_correct_shape() {
+async fn ops_contract_cluster_status_ha_exact_branch() {
     let tmp = TempDir::new().unwrap();
-    let mut app_state = TestStateBuilder::new(&tmp).build();
+    let (_replication_data_dir, repl_mgr) = test_replication_manager_with_two_peers();
+    let state = TestStateBuilder::new(&tmp)
+        .with_replication_manager(repl_mgr)
+        .build_shared();
+    let app = Router::new()
+        .route("/internal/cluster/status", get(super::cluster_status))
+        .with_state(state);
 
-    // Create a ReplicationManager with two configured peers.
-    let node_config = flapjack_replication::config::NodeConfig {
-        node_id: "test-node-a".to_string(),
-        bind_addr: "127.0.0.1:7700".to_string(),
-        advertise_addr: None,
-        bootstrap_peer: None,
+    let body = cluster_status_body(&app).await;
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "node_id": "test-node-a",
+            "replication_enabled": true,
+            "peers_total": 2,
+            "peers_healthy": 0,
+            "autoheal_enabled": false,
+            "autoheal_peers": [],
+            "peers": [
+                {
+                    "peer_id": "test-node-b",
+                    "addr": "http://test-node-b:7700",
+                    "status": "never_contacted",
+                    "last_success_secs_ago": null,
+                },
+                {
+                    "peer_id": "test-node-c",
+                    "addr": "http://test-node-c:7700",
+                    "status": "never_contacted",
+                    "last_success_secs_ago": null,
+                },
+            ],
+        }),
+        "HA cluster status must keep the exact auto-heal-aware branch and peer values"
+    );
+
+    let peers = body["peers"]
+        .as_array()
+        .expect("HA response must include peers array");
+    for peer in peers {
+        let object = peer.as_object().expect("each peer must be an object");
+        assert_eq!(object.len(), 4, "each peer must have exactly four fields");
+        for field in ["peer_id", "addr", "status", "last_success_secs_ago"] {
+            assert!(object.contains_key(field), "peer must include {field}");
+        }
+    }
+
+    let peers_total = body["peers_total"].as_u64().unwrap() as usize;
+    let peers_healthy = body["peers_healthy"].as_u64().unwrap() as usize;
+    assert_eq!(
+        peers_total,
+        peers.len(),
+        "backend-owned peers_total must match the returned rows"
+    );
+    assert!(
+        peers_healthy <= peers_total,
+        "backend-owned healthy count must be within the total"
+    );
+    let peer_ids: Vec<&str> = peers.iter().filter_map(|p| p["peer_id"].as_str()).collect();
+    assert!(peer_ids.contains(&"test-node-b"));
+    assert!(peer_ids.contains(&"test-node-c"));
+    assert_eq!(
+        body["autoheal_peers"],
+        serde_json::json!([]),
+        "disabled auto-heal should not fabricate lifecycle observations"
+    );
+}
+
+/// Pin every peer-health wire token and the exact serialized peer shape.
+#[tokio::test]
+async fn ops_contract_cluster_peer_status_wire_tokens() {
+    let expected_tokens = [
+        "healthy",
+        "stale",
+        "unhealthy",
+        "circuit_open",
+        "never_contacted",
+    ];
+    let peer =
+        |index: usize, status: &str, last_success_secs_ago: Option<u64>| super::ClusterPeerStatus {
+            peer_id: format!("peer-{index}"),
+            addr: format!("http://peer-{index}:7700"),
+            status: status.to_string(),
+            last_success_secs_ago,
+        };
+    let response = super::ClusterStatusResponse::Ha(super::ClusterStatusHaResponse {
+        node_id: "contract-node".to_string(),
+        replication_enabled: true,
+        peers_total: expected_tokens.len(),
+        peers_healthy: 1,
         peers: vec![
+            peer(0, "healthy", Some(0)),
+            peer(1, "stale", Some(60)),
+            peer(2, "unhealthy", Some(300)),
+            peer(3, "circuit_open", Some(1)),
+            peer(4, "never_contacted", None),
+        ],
+        autoheal_enabled: false,
+        autoheal_peers: Vec::new(),
+    });
+
+    let serialized = serde_json::to_value(response).unwrap();
+    let peers = serialized["peers"].as_array().unwrap();
+    let emitted_tokens: Vec<&str> = peers
+        .iter()
+        .map(|peer| peer["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(emitted_tokens, expected_tokens);
+    for peer in peers {
+        let object = peer.as_object().expect("each peer must be an object");
+        assert_eq!(object.len(), 4, "each peer must have exactly four fields");
+        for field in ["peer_id", "addr", "status", "last_success_secs_ago"] {
+            assert!(object.contains_key(field), "peer must include {field}");
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let (_replication_data_dir, repl_mgr) = test_replication_manager_with_two_peers();
+    let state = TestStateBuilder::new(&tmp)
+        .with_replication_manager(repl_mgr)
+        .build_shared();
+    let app = Router::new()
+        .route("/internal/cluster/status", get(super::cluster_status))
+        .with_state(state);
+    let observed = cluster_status_body(&app).await;
+    for status in observed["peers"].as_array().unwrap().iter().map(|peer| {
+        peer["status"]
+            .as_str()
+            .expect("real HA endpoint status must be a string")
+    }) {
+        assert!(
+            expected_tokens.contains(&status),
+            "real HA endpoint emitted unknown peer status {status}"
+        );
+    }
+}
+
+#[test]
+fn ops_contract_cluster_peer_status_schema_tokens_match_wire_tokens() {
+    use utoipa::PartialSchema;
+
+    let expected_tokens = super::ClusterPeerHealthStatus::WIRE_TOKENS;
+    let schema = serde_json::to_value(super::ClusterPeerHealthStatus::schema()).unwrap();
+    let schema_tokens = schema
+        .pointer("/enum")
+        .and_then(|value| value.as_array())
+        .expect("ClusterPeerHealthStatus schema must declare enum values")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("peer status enum values must be strings")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(schema_tokens, expected_tokens);
+}
+
+#[test]
+fn ssl_renewal_status_projection_preserves_canonical_fields() {
+    let next_check = chrono::Utc::now();
+    let canonical = flapjack_ssl::manager::RenewalStatus {
+        enabled: false,
+        status: "failed".to_string(),
+        error: Some("certificate expired".to_string()),
+        cert_expires_in_days: Some(-1),
+        next_check: Some(next_check),
+    };
+
+    let projected = super::SslRenewalStatus::from(canonical.clone());
+
+    assert_eq!(projected.enabled, canonical.enabled);
+    assert_eq!(projected.status, canonical.status);
+    assert_eq!(projected.error, canonical.error);
+    assert_eq!(
+        projected.cert_expires_in_days,
+        canonical.cert_expires_in_days
+    );
+    assert_eq!(projected.next_check, canonical.next_check);
+}
+
+#[test]
+fn cluster_status_deserialization_uses_replication_enabled_discriminator() {
+    let ha_without_counts = serde_json::json!({
+        "node_id": "bootstrap-a",
+        "replication_enabled": true,
+        "peers": [{
+            "peer_id": "peer-a",
+            "addr": "http://peer-a:7700",
+            "status": "healthy",
+            "last_success_secs_ago": 1
+        }]
+    });
+    let decoded: super::ClusterStatusResponse = serde_json::from_value(ha_without_counts).unwrap();
+    let super::ClusterStatusResponse::Ha(decoded) = decoded else {
+        panic!("replication_enabled=true must deserialize to the HA branch");
+    };
+    assert_eq!(decoded.peers_total, 1);
+    assert_eq!(decoded.peers_healthy, 1);
+
+    let impossible_standalone = serde_json::json!({
+        "node_id": "standalone",
+        "replication_enabled": false,
+        "peers_total": 1,
+        "peers_healthy": 0,
+        "peers": []
+    });
+    assert!(
+        serde_json::from_value::<super::ClusterStatusResponse>(impossible_standalone).is_err(),
+        "replication_enabled=false must reject HA count fields"
+    );
+}
+
+fn cluster_status_test_router(state: std::sync::Arc<AppState>) -> Router {
+    Router::new()
+        .route("/internal/cluster/status", get(super::cluster_status))
+        .with_state(state)
+}
+
+fn replication_manager_in(
+    data_dir: &Path,
+    peers: Vec<flapjack_replication::config::PeerConfig>,
+) -> std::sync::Arc<flapjack_replication::manager::ReplicationManager> {
+    flapjack_replication::manager::ReplicationManager::new(
+        flapjack_replication::config::NodeConfig {
+            node_id: "test-node-a".to_string(),
+            bind_addr: "127.0.0.1:7700".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
+            peers,
+        },
+        None,
+        data_dir.to_path_buf(),
+    )
+}
+
+fn cluster_peer<'a>(body: &'a serde_json::Value, peer_id: &str) -> &'a serde_json::Value {
+    body["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|peer| peer["peer_id"] == peer_id)
+        .unwrap_or_else(|| panic!("expected active peer {peer_id} in cluster status"))
+}
+
+fn autoheal_peer<'a>(body: &'a serde_json::Value, peer_id: &str) -> &'a serde_json::Value {
+    body["autoheal_peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|peer| peer["peer_id"] == peer_id)
+        .unwrap_or_else(|| panic!("expected auto-heal peer {peer_id} in lifecycle status"))
+}
+
+#[tokio::test]
+async fn cluster_status_autoheal_enabled_before_observation_reports_zero_counts() {
+    let tmp = TempDir::new().unwrap();
+    let repl_mgr = replication_manager_in(
+        tmp.path(),
+        vec![
             flapjack_replication::config::PeerConfig {
                 node_id: "test-node-b".to_string(),
                 addr: "http://test-node-b:7700".to_string(),
@@ -2404,84 +2661,173 @@ async fn cluster_status_ha_returns_peer_list_with_correct_shape() {
                 addr: "http://test-node-c:7700".to_string(),
             },
         ],
-    };
-    let repl_mgr = flapjack_replication::manager::ReplicationManager::new(
-        node_config,
-        None,
-        tmp.path().to_path_buf(),
     );
-    app_state.replication_manager = Some(repl_mgr);
+    repl_mgr.start_health_probe(60, true);
+    let state = TestStateBuilder::new(&tmp)
+        .with_replication_manager(repl_mgr.clone())
+        .build_shared();
 
-    let state = Arc::new(app_state);
-    let app = Router::new()
-        .route("/internal/cluster/status", get(super::cluster_status))
-        .with_state(state);
+    let body = cluster_status_body(&cluster_status_test_router(state)).await;
 
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/internal/cluster/status")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let typed: super::ClusterStatusResponse = serde_json::from_slice(&body_bytes).unwrap();
-    let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-
-    assert_eq!(typed.node_id, "test-node-a");
-    assert_eq!(typed.peers.len(), 2);
-    assert_eq!(typed.peers[0].peer_id, "test-node-b");
-    assert_eq!(typed.peers[0].addr, "http://test-node-b:7700");
-
-    // Top-level HA fields.
-    assert_eq!(
-        body["replication_enabled"], true,
-        "HA node must report replication_enabled=true"
-    );
-    assert_eq!(body["node_id"], "test-node-a");
-    assert_eq!(
-        body["peers_total"], 2,
-        "peers_total must match configured peer count"
-    );
-    // Neither peer has ever been contacted, so peers_healthy should be 0.
-    assert_eq!(
-        body["peers_healthy"], 0,
-        "never-contacted peers should not count as healthy"
-    );
-
-    // Peer array shape validation.
-    let peers = body["peers"]
-        .as_array()
-        .expect("HA response must include peers array");
-    assert_eq!(peers.len(), 2);
-
-    // Each peer must have the expected fields.
-    for peer in peers {
-        assert!(peer["peer_id"].is_string(), "peer must include peer_id");
-        assert!(peer["addr"].is_string(), "peer must include addr");
-        assert!(peer["status"].is_string(), "peer must include status");
-        // Never-contacted peers should have status "never_contacted"
-        // and null last_success_secs_ago.
-        assert_eq!(
-            peer["status"], "never_contacted",
-            "peers that have never been probed should be never_contacted"
-        );
-        assert!(
-            peer["last_success_secs_ago"].is_null(),
-            "never-contacted peers should have null last_success_secs_ago"
-        );
+    repl_mgr.stop_health_probe();
+    assert_eq!(body["autoheal_enabled"], true);
+    assert_eq!(body["peers_total"], 2);
+    assert_eq!(body["peers"].as_array().unwrap().len(), 2);
+    assert_eq!(body["autoheal_peers"].as_array().unwrap().len(), 2);
+    for peer_id in ["test-node-b", "test-node-c"] {
+        let peer = autoheal_peer(&body, peer_id);
+        assert_eq!(peer["observation_count"], 0);
+        assert!(peer.get("decision").is_none());
+        assert!(peer.get("action").is_none());
     }
+}
 
-    // Verify specific peer identities.
-    let peer_ids: Vec<&str> = peers.iter().filter_map(|p| p["peer_id"].as_str()).collect();
-    assert!(peer_ids.contains(&"test-node-b"));
-    assert!(peer_ids.contains(&"test-node-c"));
+#[tokio::test]
+async fn cluster_status_autoheal_lifecycle_reports_hold_refusal_eviction_and_readmission() {
+    let tmp = TempDir::new().unwrap();
+    {
+        let mut journal =
+            flapjack_replication::autoheal::AutohealJournal::with_max_bytes(tmp.path(), 16 * 1024)
+                .unwrap();
+        journal
+            .record_decision(
+                &["test-node-b".to_string(), "test-node-c".to_string()],
+                "test-node-b",
+                flapjack_replication::autoheal::EvictionDecision::Hold {
+                    observations_remaining: 1,
+                },
+            )
+            .unwrap();
+        journal
+            .record_decision(
+                &["test-node-b".to_string(), "test-node-c".to_string()],
+                "test-node-c",
+                flapjack_replication::autoheal::EvictionDecision::RefuseWouldBreakQuorum {
+                    current: 1,
+                    required: 2,
+                },
+            )
+            .unwrap();
+        journal
+            .record_eviction(
+                &["test-node-b".to_string(), "test-node-c".to_string()],
+                "test-node-b",
+                Some(flapjack_replication::config::PeerConfig {
+                    node_id: "test-node-b".to_string(),
+                    addr: "http://test-node-b:7700".to_string(),
+                }),
+                flapjack_replication::autoheal::EvictionDecision::Evict {
+                    node_id: "test-node-b".to_string(),
+                    reason: "sustained health probe failures reached threshold 3".to_string(),
+                },
+                || Ok(()),
+            )
+            .unwrap();
+        journal
+            .record_readmission::<(), flapjack_replication::manager::AddPeerError, _>(
+                &["test-node-c".to_string()],
+                &flapjack_replication::config::PeerConfig {
+                    node_id: "test-node-b".to_string(),
+                    addr: "http://test-node-b:7700".to_string(),
+                },
+                "autoheal-0000000000000003".to_string(),
+                || Ok(()),
+            )
+            .unwrap();
+    }
+    let repl_mgr = replication_manager_in(
+        tmp.path(),
+        vec![
+            flapjack_replication::config::PeerConfig {
+                node_id: "test-node-b".to_string(),
+                addr: "http://test-node-b:7700".to_string(),
+            },
+            flapjack_replication::config::PeerConfig {
+                node_id: "test-node-c".to_string(),
+                addr: "http://test-node-c:7700".to_string(),
+            },
+        ],
+    );
+    repl_mgr.start_health_probe(60, true);
+    let state = TestStateBuilder::new(&tmp)
+        .with_replication_manager(repl_mgr.clone())
+        .build_shared();
+
+    let body = cluster_status_body(&cluster_status_test_router(state)).await;
+
+    repl_mgr.stop_health_probe();
+    assert_eq!(body["autoheal_enabled"], true);
+    assert_eq!(body["peers_total"], body["peers"].as_array().unwrap().len());
+    assert_eq!(
+        cluster_peer(&body, "test-node-b")["addr"],
+        "http://test-node-b:7700"
+    );
+    let readmitted = autoheal_peer(&body, "test-node-b");
+    assert_eq!(readmitted["observation_count"], 0);
+    assert_eq!(readmitted["decision"]["kind"], "evict");
+    assert_eq!(readmitted["action"]["phase"], "readmission_outcome");
+    assert_eq!(readmitted["action"]["outcome"], "success");
+    let refused = autoheal_peer(&body, "test-node-c");
+    assert_eq!(refused["decision"]["kind"], "refuse_would_break_quorum");
+    assert_eq!(refused["action"]["phase"], "decision_recorded");
+    assert_eq!(refused["action"]["outcome"], "not_required");
+}
+
+#[tokio::test]
+async fn cluster_status_autoheal_keeps_evicted_candidates_out_of_active_membership() {
+    let tmp = TempDir::new().unwrap();
+    {
+        let mut journal =
+            flapjack_replication::autoheal::AutohealJournal::with_max_bytes(tmp.path(), 16 * 1024)
+                .unwrap();
+        journal
+            .record_eviction(
+                &["test-node-b".to_string(), "test-node-c".to_string()],
+                "test-node-b",
+                Some(flapjack_replication::config::PeerConfig {
+                    node_id: "test-node-b".to_string(),
+                    addr: "http://test-node-b:7700".to_string(),
+                }),
+                flapjack_replication::autoheal::EvictionDecision::Evict {
+                    node_id: "test-node-b".to_string(),
+                    reason: "sustained health probe failures reached threshold 3".to_string(),
+                },
+                || Ok(()),
+            )
+            .unwrap();
+    }
+    let repl_mgr = replication_manager_in(
+        tmp.path(),
+        vec![flapjack_replication::config::PeerConfig {
+            node_id: "test-node-c".to_string(),
+            addr: "http://test-node-c:7700".to_string(),
+        }],
+    );
+    repl_mgr.start_health_probe(60, true);
+    let state = TestStateBuilder::new(&tmp)
+        .with_replication_manager(repl_mgr.clone())
+        .build_shared();
+
+    let body = cluster_status_body(&cluster_status_test_router(state)).await;
+
+    repl_mgr.stop_health_probe();
+    assert_eq!(body["peers_total"], 1);
+    assert_eq!(body["peers"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        cluster_peer(&body, "test-node-c")["addr"],
+        "http://test-node-c:7700"
+    );
+    assert!(body["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|peer| peer["peer_id"] != "test-node-b"));
+    let evicted = autoheal_peer(&body, "test-node-b");
+    assert_eq!(evicted["addr"], "http://test-node-b:7700");
+    assert_eq!(evicted["observation_count"], 0);
+    assert_eq!(evicted["decision"]["kind"], "evict");
+    assert_eq!(evicted["action"]["phase"], "eviction_outcome");
+    assert_eq!(evicted["action"]["outcome"], "success");
 }
 
 fn test_replication_manager_with_two_peers() -> (

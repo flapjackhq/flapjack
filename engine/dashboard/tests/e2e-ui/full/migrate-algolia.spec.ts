@@ -7,6 +7,7 @@ import {
   cleanupMigrationIndexes,
   type AlgoliaTestContext,
 } from '../../fixtures/algolia.fixture';
+import { searchIndex } from '../../fixtures/api-helpers';
 import { EXPECTED_COUNTS, PRODUCTS } from '../../fixtures/test-data';
 
 /**
@@ -54,7 +55,7 @@ test.describe('Algolia Migration (real browser)', () => {
     });
   });
 
-  test('migrate Algolia index via UI: fill form → migrate → verify success → browse', async ({ page }) => {
+  test('migrate Algolia index via UI: fill form → migrate → verify success → browse', async ({ page, request }) => {
     const algoliaCtx = requireAlgoliaContext();
 
     // Navigate to Migrate page
@@ -111,7 +112,14 @@ test.describe('Algolia Migration (real browser)', () => {
     const knownDocument = page.getByTestId('document-card').filter({ hasText: PRODUCTS[0].objectID });
     await expect(knownDocument).toHaveCount(1, { timeout: 10_000 });
     await expect(knownDocument).toContainText(PRODUCTS[0].name);
-    await expect(knownDocument).toContainText(PRODUCTS[0].description);
+
+    const importedSearch = await searchIndex(request, algoliaCtx.targetIndexName, PRODUCTS[0].name, {
+      hitsPerPage: 1,
+    });
+    expect(importedSearch.hits?.[0]).toEqual(expect.objectContaining({
+      objectID: PRODUCTS[0].objectID,
+      description: PRODUCTS[0].description,
+    }));
   });
 
   test('invalid credentials show error state in UI', async ({ page }) => {
@@ -119,7 +127,8 @@ test.describe('Algolia Migration (real browser)', () => {
 
     await page.goto('/migrate');
     await page.getByLabel('Application ID').fill(algoliaCtx.appId);
-    await page.getByLabel('Admin API Key').fill('invalid_key_0000000000');
+    const invalidApiKey = 'invalid_key_0000000000';
+    await page.getByLabel('Admin API Key').fill(invalidApiKey);
     await page.getByLabel('Source Index (Algolia)').fill(algoliaCtx.indexName);
     await page.getByLabel(/Target Index \(Flapjack\)/).fill(algoliaCtx.invalidTargetIndexName);
 
@@ -128,7 +137,8 @@ test.describe('Algolia Migration (real browser)', () => {
 
     const errorCard = page.getByTestId('migration-error-card');
     await expect(errorCard).toContainText('Migration failed', { timeout: 15_000 });
-    await expect(errorCard).toContainText('Algolia returned 403 Forbidden');
-    await expect(errorCard).toContainText('Invalid Application-ID or API key');
+    await expect(errorCard).toContainText('Algolia upstream rejected the request');
+    await expect(errorCard).not.toContainText(invalidApiKey);
+    await expect(errorCard).not.toContainText('Invalid Application-ID or API key');
   });
 });

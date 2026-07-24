@@ -419,17 +419,19 @@ pub(super) fn assert_source_oracles(scenario: &Scenario) -> std::result::Result<
     assert_tenant_source_digest(scenario, "old", Some(oracles.old_tenant.as_str()))?;
     assert_tenant_source_digest(scenario, "new", Some(oracles.new_tenant.as_str()))?;
     for field in ["target", "staging", "backup"] {
+        let expected = if scenario
+            .digests
+            .get(field)
+            .is_some_and(|value| value == oracles.old_tenant.as_str())
+        {
+            oracles.old_tenant.as_str()
+        } else {
+            oracles.new_tenant.as_str()
+        };
         assert_tenant_source_digest(
             scenario,
             field,
-            Some(oracles.old_tenant.as_str())
-                .filter(|_| {
-                    scenario
-                        .digests
-                        .get(field)
-                        .is_some_and(|value| value == oracles.old_tenant.as_str())
-                })
-                .or(Some(oracles.new_tenant.as_str())),
+            Some(expected),
         )?;
     }
     for (name, sidecar) in &oracles.sidecars {

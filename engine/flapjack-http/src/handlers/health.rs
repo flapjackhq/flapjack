@@ -1,7 +1,47 @@
 use axum::{extract::State, Json};
+use serde::Serialize;
 use std::sync::Arc;
+use utoipa::ToSchema;
 
 use super::AppState;
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicBuildInfo {
+    schema_version: u8,
+    version: String,
+    profile: String,
+    capabilities: flapjack::BuildCapabilities,
+}
+
+impl From<&flapjack::BuildInfo> for PublicBuildInfo {
+    fn from(build: &flapjack::BuildInfo) -> Self {
+        Self {
+            schema_version: build.schema_version,
+            version: build.version.clone(),
+            profile: build.profile.clone(),
+            capabilities: build.capabilities.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HealthResponse {
+    status: &'static str,
+    version: String,
+    build: PublicBuildInfo,
+    uptime_secs: u64,
+    capabilities: flapjack::BuildCapabilities,
+    active_writers: usize,
+    max_concurrent_writers: usize,
+    facet_cache_entries: usize,
+    facet_cache_cap: usize,
+    heap_allocated_mb: usize,
+    system_limit_mb: usize,
+    pressure_level: String,
+    allocator: &'static str,
+    tenants_loaded: usize,
+}
 
 /// Health check endpoint
 #[utoipa::path(
@@ -9,31 +49,34 @@ use super::AppState;
     path = "/health",
     tag = "health",
     responses(
-        (status = 200, description = "Server is healthy", body = serde_json::Value)
+        (status = 200, description = "Server is healthy", body = HealthResponse)
     )
 )]
-pub async fn health(State(_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+pub async fn health(State(_state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let build = flapjack::build_info();
     let budget = flapjack::get_global_budget();
     let observer = flapjack::MemoryObserver::global();
     let mem_stats = observer.stats();
 
-    Json(serde_json::json!({
-        "status": "ok",
-        "version": build.version,
-        "build": build,
-        "uptime_secs": _state.start_time.elapsed().as_secs(),
-        "capabilities": build.capabilities,
-        "active_writers": budget.active_writers(),
-        "max_concurrent_writers": budget.max_concurrent_writers(),
-        "facet_cache_entries": _state.manager.facet_cache.len(),
-        "facet_cache_cap": _state.manager.facet_cache_cap.load(std::sync::atomic::Ordering::Relaxed),
-        "heap_allocated_mb": mem_stats.heap_allocated_bytes / (1024 * 1024),
-        "system_limit_mb": mem_stats.system_limit_bytes / (1024 * 1024),
-        "pressure_level": mem_stats.pressure_level.to_string(),
-        "allocator": mem_stats.allocator,
-        "tenants_loaded": _state.manager.loaded_count(),
-    }))
+    Json(HealthResponse {
+        status: "ok",
+        version: build.version.clone(),
+        build: PublicBuildInfo::from(build),
+        uptime_secs: _state.start_time.elapsed().as_secs(),
+        capabilities: build.capabilities.clone(),
+        active_writers: budget.active_writers(),
+        max_concurrent_writers: budget.max_concurrent_writers(),
+        facet_cache_entries: _state.manager.facet_cache.len(),
+        facet_cache_cap: _state
+            .manager
+            .facet_cache_cap
+            .load(std::sync::atomic::Ordering::Relaxed),
+        heap_allocated_mb: mem_stats.heap_allocated_bytes / (1024 * 1024),
+        system_limit_mb: mem_stats.system_limit_bytes / (1024 * 1024),
+        pressure_level: mem_stats.pressure_level.to_string(),
+        allocator: mem_stats.allocator,
+        tenants_loaded: _state.manager.loaded_count(),
+    })
 }
 
 #[cfg(test)]
@@ -55,35 +98,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_exposes_canonical_build_info() {
+    async fn health_omits_sensitive_build_fingerprint_fields() {
         let tmp = TempDir::new().unwrap();
         let state = TestStateBuilder::new(&tmp).build_shared();
 
         let json = request_health_json(state).await;
-        let expected_build = serde_json::to_value(flapjack::build_info()).unwrap();
 
-        assert_eq!(json["build"], expected_build);
         assert_eq!(json["build"]["schemaVersion"], 1);
-        assert!(json["build"]["version"].is_string());
         assert_eq!(
-            json["build"]["revision"].is_null(),
-            !json["build"]["revisionKnown"].as_bool().unwrap()
+            json["build"]["version"],
+            serde_json::to_value(&flapjack::build_info().version).unwrap()
         );
-        assert_eq!(
-            json["build"]["dirty"].is_null(),
-            !json["build"]["dirtyKnown"].as_bool().unwrap()
-        );
-        assert!(json["build"]["workspaceDigest"].is_string());
         assert!(json["build"]["profile"].is_string());
-        assert!(json["build"]["target"].is_string());
-        assert_eq!(
-            json["build"]["features"],
-            serde_json::to_value(&flapjack::build_info().features).unwrap()
-        );
         assert_eq!(
             json["build"]["capabilities"],
             serde_json::to_value(&flapjack::build_info().capabilities).unwrap()
         );
+        for field in [
+            "revision",
+            "revisionKnown",
+            "dirty",
+            "dirtyKnown",
+            "workspaceDigest",
+            "target",
+            "features",
+        ] {
+            assert!(
+                json["build"].get(field).is_none(),
+                "public /health must not expose build fingerprint field: {field}"
+            );
+        }
     }
 
     async fn request_health_json(state: Arc<AppState>) -> serde_json::Value {
@@ -103,39 +147,75 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
-    /// Verify the public health contract keeps required compatibility fields.
+    /// Pin the `/health` fields consumed by the System screen.
     #[tokio::test]
-    async fn health_keeps_required_compatibility_fields() {
+    async fn ops_contract_health_matches_system_consumer_fields() {
         let tmp = TempDir::new().unwrap();
         let state = TestStateBuilder::new(&tmp).build_shared();
         state.manager.create_tenant("t1").unwrap();
         state.manager.create_tenant("t2").unwrap();
 
-        let json = request_health_json(state).await;
-        let expected_build = serde_json::to_value(flapjack::build_info()).unwrap();
+        let uptime_before = state.start_time.elapsed().as_secs();
+        let expected_facet_cache_cap = state
+            .manager
+            .facet_cache_cap
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let expected_max_concurrent_writers =
+            flapjack::get_global_budget().max_concurrent_writers();
+        let expected_system_limit_mb = flapjack::MemoryObserver::global()
+            .stats()
+            .system_limit_bytes
+            / (1024 * 1024);
+
+        let json = request_health_json(Arc::clone(&state)).await;
+
+        let uptime_after = state.start_time.elapsed().as_secs();
+        let active_writers = json["active_writers"].as_u64().unwrap();
+        let max_concurrent_writers = json["max_concurrent_writers"].as_u64().unwrap();
 
         assert_eq!(json["status"], "ok");
-        assert_eq!(json["version"], expected_build["version"]);
-        assert_eq!(json["build"], expected_build);
-        assert!(json["active_writers"].is_number());
-        assert!(json["max_concurrent_writers"].is_number());
-        assert!(json["facet_cache_entries"].is_number());
-        assert!(json["facet_cache_cap"].is_number());
-        assert!(json["heap_allocated_mb"].is_number());
-        assert!(json["system_limit_mb"].is_number());
-        assert!(json["pressure_level"].is_string());
-        assert!(json["allocator"].is_string());
-        assert!(json["uptime_secs"].is_number());
+        assert_eq!(
+            json["version"],
+            serde_json::to_value(&flapjack::build_info().version).unwrap()
+        );
         assert_eq!(
             json["capabilities"],
             serde_json::to_value(&flapjack::build_info().capabilities).unwrap()
         );
+        assert!(
+            active_writers <= max_concurrent_writers,
+            "active writer telemetry must not exceed the configured writer budget"
+        );
+        assert_eq!(
+            max_concurrent_writers, expected_max_concurrent_writers as u64,
+            "writer budget telemetry must expose the configured writer limit"
+        );
+        assert_eq!(json["facet_cache_entries"], 0);
+        assert_eq!(json["facet_cache_cap"], expected_facet_cache_cap);
         assert_eq!(json["tenants_loaded"], serde_json::json!(2));
+        assert!(
+            (uptime_before..=uptime_after).contains(&json["uptime_secs"].as_u64().unwrap()),
+            "reported uptime must be sampled during the request"
+        );
+        assert!(json["heap_allocated_mb"].as_u64().is_some());
+        assert_eq!(
+            json["system_limit_mb"],
+            serde_json::json!(expected_system_limit_mb),
+            "memory telemetry must expose the observer's effective system limit"
+        );
+        assert!(
+            ["normal", "elevated", "critical"].contains(&json["pressure_level"].as_str().unwrap()),
+            "pressure telemetry must use the closed wire token set"
+        );
+        assert_eq!(
+            json["allocator"],
+            flapjack::MemoryObserver::allocator_name()
+        );
     }
 
     /// Verify public /health keeps only the intended top-level metadata surface.
     #[tokio::test]
-    async fn health_uses_explicit_top_level_metadata_allowlist() {
+    async fn ops_contract_health_uses_explicit_top_level_metadata_allowlist() {
         let tmp = TempDir::new().unwrap();
         let state = TestStateBuilder::new(&tmp).build_shared();
 
