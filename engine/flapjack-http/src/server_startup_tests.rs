@@ -1,6 +1,7 @@
 use super::*;
 use crate::handlers::migration::spool::{
-    MigrationDisposition, MigrationPhase, SpoolLimits, SpoolStore,
+    AsyncMigrationPublicationSemantic, MigrationDisposition, MigrationPhase, SpoolLimits,
+    SpoolStore,
 };
 use flapjack::index::manager::publication::{
     canonical_tenant_tree_digest, PublicationArtifactManifest, PublicationArtifactManifestEntry,
@@ -199,7 +200,11 @@ async fn pre_serve_barrier_recovers_async_migrations_before_catchup_future() {
     let spool = SpoolStore::new(&state.manager.base_path, SpoolLimits::default()).unwrap();
     let job_uuid = uuid::Uuid::new_v4();
     spool
-        .create_async_migration_admission(job_uuid, "async_before_catchup")
+        .create_async_migration_admission(
+            job_uuid,
+            "async_before_catchup",
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
         .unwrap();
     spool
         .transition_migration_phase(job_uuid, MigrationPhase::Exporting)

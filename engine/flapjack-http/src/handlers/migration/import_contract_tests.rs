@@ -1,4 +1,5 @@
 use super::{
+    acknowledge_algolia_migration, authenticated_owner_identity,
     import::{
         wait_for_live_import_barrier_with_timeout, ImportTestHooks, LiveImportBarrier,
         PrivacyScrubBoundary, PrivacyScrubTestHooks, LIVE_IMPORT_BARRIER_OBSERVED_FILE,
@@ -7,10 +8,11 @@ use super::{
         LIVE_IMPORT_PRE_ACTIVATION_SOURCE_ENV,
     },
     migrate_from_algolia_with_test_source_factory,
-    migrate_from_algolia_with_test_source_factory_and_hooks, MigrateFromAlgoliaRequest,
-    MigrateFromAlgoliaResponse, MIGRATION_HA_UNSUPPORTED_CODE, MIGRATION_HA_UNSUPPORTED_MESSAGE,
+    migrate_from_algolia_with_test_source_factory_and_hooks, AsyncMigrationStatusResponse,
+    MigrateFromAlgoliaRequest, MigrateFromAlgoliaResponse, MIGRATION_HA_UNSUPPORTED_CODE,
+    MIGRATION_HA_UNSUPPORTED_MESSAGE,
 };
-use crate::auth::{ApiKey, KeyStore, PRIVATE_MIGRATION_ACL};
+use crate::auth::{ApiKey, AuthenticatedAppId, KeyStore, PRIVATE_MIGRATION_ACL};
 use crate::handlers::indices::list_indices;
 use crate::handlers::migration::algolia_client::{
     AlgoliaClientError, AlgoliaErrorKind, AlgoliaIndexRecord,
@@ -18,7 +20,10 @@ use crate::handlers::migration::algolia_client::{
 use crate::handlers::migration::source_reader::{
     MigrationSourceReader, PageConsumer, SourceFuture,
 };
-use crate::handlers::migration::source_test_support::ScriptedSourceReader;
+use crate::handlers::migration::source_test_support::{
+    sorted_exact_hits_by_object_id, ScriptedSourceReader,
+};
+use crate::handlers::migration::spool::AsyncMigrationPublicationSemantic;
 use crate::handlers::migration::spool::{
     MigrationCancelRequest, MigrationDisposition, MigrationExportProgress, MigrationPhase,
     MigrationPhaseRecord, SpoolErrorKind, SpoolLimits, SpoolStore,
@@ -27,7 +32,7 @@ use crate::test_helpers::{body_json, EnvVarRestoreGuard, TestStateBuilder, ENV_M
 use axum::{
     body::Body,
     extract::{Extension, Query, State},
-    http::{Method, Request, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, Request, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -79,9 +84,27 @@ const SOURCE_APP_ID: &str = "LOCALMIGRATIONTEST";
 const SOURCE_API_KEY: &str = "hermetic-source-key-not-used";
 const SOURCE_INDEX: &str = "source_products";
 const TARGET_INDEX: &str = "migrated_products";
+const ASYNC_REPLACE_TARGET: &str = "async_replace_products";
+const ASYNC_REPLACE_OWNER_APP_ID: &str = "async-replace-owner";
+const ASYNC_REPLACE_OWNER_API_KEY: &str = "async-replace-owner-key";
 const EXPECTED_DOCUMENTS: [(&str, &str, &str); 2] = [
     ("doc-1", "Quartz adapter", "hardware"),
     ("doc-2", "Velvet compass", "navigation"),
+];
+const ASYNC_REPLACE_INITIAL_DOCUMENTS: [(&str, &str, &str, &str); 3] = [
+    ("doc-1", "Quartz adapter", "hardware", "initial"),
+    ("doc-2", "Velvet compass", "navigation", "initial"),
+    ("doc-3", "Cedar caliper", "hardware", "initial"),
+];
+const ASYNC_REPLACE_FINAL_DOCUMENTS: [(&str, &str, &str, &str); 3] = [
+    ("doc-1", "Quartz adapter", "hardware", "replacement"),
+    (
+        "doc-2",
+        "Velvet compass revised",
+        "navigation",
+        "replacement",
+    ),
+    ("doc-4", "Ivory beacon", "navigation", "replacement"),
 ];
 const LIVE_IMPORT_BARRIER_SOURCE: &str = "live-import-barrier-source";
 const PRIVACY_SCRUB_ROUTE: &str = "/1/migrations/privacy-scrub";
@@ -168,6 +191,7 @@ fn seed_privacy_scrub_intent_fixture(
             job_uuid,
             PRIVACY_SCRUB_TARGET,
             Some(owner_identity),
+            AsyncMigrationPublicationSemantic::CreateOnly,
         )
         .unwrap();
     for next_phase in [
@@ -1020,6 +1044,69 @@ fn hermetic_source_reader_with_settings_and_pages(
     reader
 }
 
+fn async_replace_source_reader(
+    documents: [(&'static str, &'static str, &'static str, &'static str); 3],
+) -> ScriptedSourceReader {
+    hermetic_source_reader_with_settings_and_pages(
+        json!({
+            "searchableAttributes": ["title"],
+            "attributesForFaceting": ["category"],
+        }),
+        vec![documents
+            .into_iter()
+            .map(|(object_id, title, category, revision)| {
+                json!({
+                    "objectID": object_id,
+                    "title": title,
+                    "category": category,
+                    "revision": revision,
+                })
+            })
+            .collect()],
+    )
+}
+
+async fn sorted_async_replace_hits(
+    state: &Arc<crate::handlers::AppState>,
+) -> Vec<(String, String, String, String)> {
+    sorted_exact_hits_by_object_id(
+        state,
+        ASYNC_REPLACE_TARGET,
+        10,
+        "async replacement target should be queryable",
+        |hit| {
+            (
+                hit["objectID"]
+                    .as_str()
+                    .expect("hit should contain objectID")
+                    .to_string(),
+                hit["title"]
+                    .as_str()
+                    .expect("hit should contain title")
+                    .to_string(),
+                hit["category"]
+                    .as_str()
+                    .expect("hit should contain category")
+                    .to_string(),
+                hit["revision"]
+                    .as_str()
+                    .expect("hit should contain revision")
+                    .to_string(),
+            )
+        },
+    )
+    .await
+}
+
+fn async_replace_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-algolia-api-key",
+        HeaderValue::from_static(ASYNC_REPLACE_OWNER_API_KEY),
+    );
+    headers
+}
+
 fn replication_manager_with_peers(peers: Vec<PeerConfig>) -> (TempDir, Arc<ReplicationManager>) {
     let data_dir = TempDir::new().unwrap();
     let manager = ReplicationManager::new(
@@ -1122,6 +1209,157 @@ async fn async_import_submission_returns_uuid_while_source_is_blocked_then_succe
     assert_eq!(
         query_hit_count(&state, "migrated_products_again", "Quartz adapter").await,
         1
+    );
+}
+
+#[tokio::test]
+async fn async_import_create_then_overwrite_replaces_exact_target() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let owner_headers = async_replace_headers();
+    let owner_identity =
+        authenticated_owner_identity(ASYNC_REPLACE_OWNER_APP_ID.to_string(), &owner_headers);
+    let initial_request = MigrateFromAlgoliaRequest {
+        target_index: Some(ASYNC_REPLACE_TARGET.to_string()),
+        ..valid_request()
+    };
+
+    let (initial_job_uuid, _) = state
+        .migration_runner
+        .submit_algolia_import_for_owner(initial_request, Some(owner_identity.clone()), |_| {
+            Ok(async_replace_source_reader(ASYNC_REPLACE_INITIAL_DOCUMENTS))
+        })
+        .await
+        .expect("initial async create should be admitted");
+    wait_for_terminal_phase(&state, initial_job_uuid, MigrationDisposition::Succeeded).await;
+    let initial_terminal = read_migration_phase_at(&state.manager.base_path, initial_job_uuid);
+    assert_eq!(initial_terminal.phase, MigrationPhase::Activating);
+    assert_eq!(
+        initial_terminal.disposition,
+        MigrationDisposition::Succeeded
+    );
+    assert!(initial_terminal.terminal_at.is_some());
+    assert_eq!(
+        sorted_async_replace_hits(&state).await,
+        ASYNC_REPLACE_INITIAL_DOCUMENTS
+            .into_iter()
+            .map(|(object_id, title, category, revision)| (
+                object_id.to_string(),
+                title.to_string(),
+                category.to_string(),
+                revision.to_string(),
+            ))
+            .collect::<Vec<_>>()
+    );
+
+    for attempt in 1..=2 {
+        let status = acknowledge_algolia_migration(
+            State(Arc::clone(&state)),
+            Extension(AuthenticatedAppId(ASYNC_REPLACE_OWNER_APP_ID.to_string())),
+            owner_headers.clone(),
+            axum::extract::Path(initial_job_uuid.to_string()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("initial authenticated ACK {attempt} failed: {error:?}"));
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            read_migration_phase_at(&state.manager.base_path, initial_job_uuid),
+            initial_terminal,
+            "authenticated ACK {attempt} must not mutate the terminal phase"
+        );
+    }
+
+    let replacement_request = MigrateFromAlgoliaRequest {
+        target_index: Some(ASYNC_REPLACE_TARGET.to_string()),
+        overwrite: true,
+        ..valid_request()
+    };
+    let (replacement_job_uuid, _) = state
+        .migration_runner
+        .submit_algolia_import_for_owner(replacement_request, Some(owner_identity), |_| {
+            Ok(async_replace_source_reader(ASYNC_REPLACE_FINAL_DOCUMENTS))
+        })
+        .await
+        .expect("overwrite=true async replacement should be admitted");
+    assert_ne!(
+        replacement_job_uuid, initial_job_uuid,
+        "replacement must receive a distinct durable job UUID"
+    );
+
+    wait_for_terminal_phase(
+        &state,
+        replacement_job_uuid,
+        MigrationDisposition::Succeeded,
+    )
+    .await;
+    let replacement_terminal =
+        read_migration_phase_at(&state.manager.base_path, replacement_job_uuid);
+    assert_eq!(replacement_terminal.phase, MigrationPhase::Activating);
+    assert_eq!(
+        replacement_terminal.disposition,
+        MigrationDisposition::Succeeded
+    );
+    assert!(replacement_terminal.terminal_at.is_some());
+
+    let wire_status = serde_json::to_value(AsyncMigrationStatusResponse::from(
+        replacement_terminal.clone(),
+    ))
+    .expect("terminal async status should serialize");
+    for forbidden_key in [
+        "resumeHandle",
+        "checkpointHandle",
+        "resume",
+        "resumable",
+        "operation",
+    ] {
+        assert!(
+            wire_status.get(forbidden_key).is_none(),
+            "non-resumable async status must not advertise {forbidden_key}"
+        );
+    }
+
+    for attempt in 1..=2 {
+        let status = acknowledge_algolia_migration(
+            State(Arc::clone(&state)),
+            Extension(AuthenticatedAppId(ASYNC_REPLACE_OWNER_APP_ID.to_string())),
+            owner_headers.clone(),
+            axum::extract::Path(replacement_job_uuid.to_string()),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("replacement authenticated ACK {attempt} failed: {error:?}")
+        });
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            read_migration_phase_at(&state.manager.base_path, replacement_job_uuid),
+            replacement_terminal,
+            "authenticated ACK {attempt} must not mutate the replacement terminal phase"
+        );
+    }
+
+    let final_hits = sorted_async_replace_hits(&state).await;
+    assert_eq!(final_hits.len(), 3);
+    assert_eq!(
+        final_hits,
+        ASYNC_REPLACE_FINAL_DOCUMENTS
+            .into_iter()
+            .map(|(object_id, title, category, revision)| (
+                object_id.to_string(),
+                title.to_string(),
+                category.to_string(),
+                revision.to_string(),
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert!(final_hits.iter().all(|hit| hit.0 != "doc-3"));
+    assert!(final_hits.iter().any(|hit| hit.0 == "doc-4"));
+    assert_eq!(
+        final_hits
+            .iter()
+            .find(|hit| hit.0 == "doc-2")
+            .expect("replacement must retain doc-2")
+            .3,
+        "replacement"
     );
 }
 
@@ -1552,11 +1790,12 @@ async fn async_import_capacity_refusal_is_retryable_and_writes_no_new_job_artifa
 }
 
 #[tokio::test]
-async fn async_import_overwrite_true_is_refused_before_job_creation() {
+async fn async_import_overwrite_true_records_replacement_semantic() {
     let tmp = TempDir::new().unwrap();
     let state = TestStateBuilder::new(&tmp).build_shared();
+    seed_preexisting_target_resources(&state, TARGET_INDEX).await;
     let source_factory_invoked = Arc::new(AtomicBool::new(false));
-    let refused = state
+    let (job_uuid, _) = state
         .migration_runner
         .submit_algolia_import(
             MigrateFromAlgoliaRequest {
@@ -1572,11 +1811,19 @@ async fn async_import_overwrite_true_is_refused_before_job_creation() {
             },
         )
         .await
-        .expect_err("overwrite=true should be refused before async admission");
+        .expect("node-local overwrite=true async migration should be admitted");
 
-    assert_eq!(refused.0, StatusCode::BAD_REQUEST);
-    assert!(!source_factory_invoked.load(Ordering::SeqCst));
-    assert_no_migration_artifacts(&state);
+    wait_for_terminal_phase(&state, job_uuid, MigrationDisposition::Succeeded).await;
+    wait_for_active_count(&state, 0).await;
+    assert!(source_factory_invoked.load(Ordering::SeqCst));
+    let metadata = SpoolStore::new(&state.manager.base_path, SpoolLimits::default())
+        .unwrap()
+        .read_async_migration_metadata(job_uuid)
+        .unwrap();
+    assert_eq!(
+        metadata.publication_semantic,
+        AsyncMigrationPublicationSemantic::ReplaceExisting
+    );
 }
 
 #[tokio::test]
@@ -1618,7 +1865,11 @@ fn async_admission_recovery_removes_metadata_only_partial_and_preserves_sync_pha
     let synchronous_job = uuid::Uuid::new_v4();
 
     store
-        .create_async_metadata_only_admission_for_test(partial_async_job, TARGET_INDEX)
+        .create_async_metadata_only_admission_for_test(
+            partial_async_job,
+            TARGET_INDEX,
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
         .unwrap();
     store.create_migration_phase(synchronous_job).unwrap();
 
@@ -2012,7 +2263,7 @@ async fn migrate_refuses_ha_cluster_before_import_admission() {
 }
 
 #[tokio::test]
-async fn migrate_overwrite_true_is_refused_before_admission() {
+async fn migrate_overwrite_true_ha_is_refused_before_admission() {
     let tmp = TempDir::new().unwrap();
     let (_repl_data_dir, repl_mgr) = peer_configured_replication_manager();
     let state = TestStateBuilder::new(&tmp)
@@ -2033,15 +2284,12 @@ async fn migrate_overwrite_true_is_refused_before_admission() {
     )
     .await;
 
-    let error = response.expect_err("overwrite=true should be refused before HA admission");
+    let error = response.expect_err("overwrite=true should be refused by HA admission guard");
 
-    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         body_json(error.1.into_response()).await,
-        json!({
-            "message": "overwrite=true is not supported by Algolia migration import",
-            "status": 400
-        })
+        json!({"message": MIGRATION_HA_UNSUPPORTED_MESSAGE, "status": 503, "code": MIGRATION_HA_UNSUPPORTED_CODE})
     );
     assert!(
         !source_factory_invoked.load(Ordering::SeqCst),

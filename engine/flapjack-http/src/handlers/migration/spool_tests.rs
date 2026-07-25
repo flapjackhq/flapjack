@@ -124,6 +124,79 @@ fn privacy_scrub_intent(scrub_id: &str) -> PrivacyScrubIntent {
 }
 
 #[test]
+fn async_replacement_admission_persists_explicit_publication_semantic() {
+    let tmp = TempDir::new().unwrap();
+    let store = fixed_store(&tmp);
+    let job_uuid = fixed_job_uuid();
+
+    store
+        .create_async_migration_admission_for_owner(
+            job_uuid,
+            "products",
+            Some("owner-app"),
+            AsyncMigrationPublicationSemantic::ReplaceExisting,
+        )
+        .unwrap();
+
+    let raw: Value = serde_json::from_slice(
+        &std::fs::read(store.async_migration_metadata_path(job_uuid)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(raw["publication_semantic"], "replaceExisting");
+    let metadata = store.read_async_migration_metadata(job_uuid).unwrap();
+    assert_eq!(
+        metadata.publication_semantic,
+        AsyncMigrationPublicationSemantic::ReplaceExisting
+    );
+}
+
+#[test]
+fn async_metadata_without_publication_semantic_deserializes_as_create_only() {
+    let job_uuid = fixed_job_uuid();
+    let metadata: AsyncMigrationMetadata = serde_json::from_value(json!({
+        "job_uuid": job_uuid,
+        "target_index": "legacy-products"
+    }))
+    .unwrap();
+
+    assert_eq!(metadata.job_uuid, job_uuid);
+    assert_eq!(metadata.target_index, "legacy-products");
+    assert_eq!(
+        metadata.publication_semantic,
+        AsyncMigrationPublicationSemantic::CreateOnly
+    );
+}
+
+#[test]
+fn async_create_admission_preserves_historical_metadata_shape() {
+    let tmp = TempDir::new().unwrap();
+    let store = fixed_store(&tmp);
+    let job_uuid = fixed_job_uuid();
+
+    store
+        .create_async_migration_admission(
+            job_uuid,
+            "products",
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
+        .unwrap();
+
+    let serialized = std::fs::read(store.async_migration_metadata_path(job_uuid)).unwrap();
+    let historical_metadata = concat!(
+        "{\n",
+        "  \"job_uuid\": \"12345678-1234-5678-1234-567812345678\",\n",
+        "  \"target_index\": \"products\"\n",
+        "}"
+    );
+    assert_eq!(serialized, historical_metadata.as_bytes());
+    let metadata = store.read_async_migration_metadata(job_uuid).unwrap();
+    assert_eq!(
+        metadata.publication_semantic,
+        AsyncMigrationPublicationSemantic::CreateOnly
+    );
+}
+
+#[test]
 fn privacy_scrub_intent_admission_is_atomic_and_idempotent() {
     let tmp = TempDir::new().unwrap();
     let store = fixed_store(&tmp);
@@ -195,7 +268,12 @@ fn privacy_scrub_intent_collision_and_corruption_fail_closed() {
 
     let corrupt_job = uuid::Uuid::new_v4();
     store
-        .create_async_migration_admission_for_owner(corrupt_job, "products", Some("app_1"))
+        .create_async_migration_admission_for_owner(
+            corrupt_job,
+            "products",
+            Some("app_1"),
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
         .unwrap();
     std::fs::write(store.privacy_scrub_intent_path(corrupt_job), b"not json").unwrap();
     let corrupt = store
@@ -637,7 +715,11 @@ fn request_async_migration_cancel_is_idempotent_for_running_jobs() {
     let store = fixed_store(&tmp);
     let job_uuid = fixed_job_uuid();
     store
-        .create_async_migration_admission(job_uuid, "cancel_idempotent")
+        .create_async_migration_admission(
+            job_uuid,
+            "cancel_idempotent",
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
         .unwrap();
 
     let first = requested_cancel_record(store.request_async_migration_cancel(job_uuid).unwrap());
@@ -657,15 +739,27 @@ fn request_async_migration_cancel_is_noop_for_terminal_jobs() {
     let succeeded = uuid::Uuid::new_v4();
 
     store
-        .create_async_migration_admission(cancelled, "terminal_cancelled")
+        .create_async_migration_admission(
+            cancelled,
+            "terminal_cancelled",
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
         .unwrap();
     let cancelled_before = store.cancel_migration(cancelled).unwrap();
     store
-        .create_async_migration_admission(failed, "terminal_failed")
+        .create_async_migration_admission(
+            failed,
+            "terminal_failed",
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
         .unwrap();
     let failed_before = store.fail_migration(failed).unwrap();
     store
-        .create_async_migration_admission(succeeded, "terminal_succeeded")
+        .create_async_migration_admission(
+            succeeded,
+            "terminal_succeeded",
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
         .unwrap();
     for phase in [
         MigrationPhase::Exporting,
@@ -698,7 +792,11 @@ fn request_async_migration_cancel_detects_post_commit_boundary() {
     let target_index = "post_commit_target";
     let transaction_id = PublicationTransactionId::new("post_commit_tx").unwrap();
     store
-        .create_async_migration_admission(job_uuid, target_index)
+        .create_async_migration_admission(
+            job_uuid,
+            target_index,
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
         .unwrap();
     for phase in [
         MigrationPhase::Exporting,
@@ -744,7 +842,11 @@ fn request_async_migration_cancel_allows_preexisting_target_before_journal() {
     let target_index = "preexisting_target";
     let transaction_id = PublicationTransactionId::new("prepared_tx").unwrap();
     store
-        .create_async_migration_admission(job_uuid, target_index)
+        .create_async_migration_admission(
+            job_uuid,
+            target_index,
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
         .unwrap();
     for phase in [
         MigrationPhase::Exporting,
@@ -1782,7 +1884,11 @@ struct GcJobFixture {
 
 fn create_gc_job(store: &SpoolStore, job_uuid: uuid::Uuid) -> GcJobFixture {
     store
-        .create_async_migration_admission(job_uuid, "target-index")
+        .create_async_migration_admission(
+            job_uuid,
+            "target-index",
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
         .unwrap();
     store
         .create_export(

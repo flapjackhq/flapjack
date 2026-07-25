@@ -1,7 +1,9 @@
 use super::algolia_client::{AlgoliaClientError, AlgoliaErrorKind, AlgoliaIndexRecord};
 use super::source_reader::{MigrationSourceReader, PageConsumer, SourceExportSink, SourceFuture};
+use crate::dto::SearchRequest;
+use axum::{extract::State, Json};
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 
 pub(super) struct ScriptedSourceReader {
     pub(super) app_id: String,
@@ -234,4 +236,42 @@ pub(super) fn page_object_ids(page: &[Value]) -> Vec<String> {
                 .to_string()
         })
         .collect()
+}
+
+pub(super) async fn sorted_exact_hits_by_object_id<T>(
+    state: &Arc<crate::handlers::AppState>,
+    target_index: &str,
+    hits_per_page: usize,
+    queryable_message: &str,
+    extract_hit: impl FnMut(&Value) -> T,
+) -> Vec<T> {
+    let Json(search_response) = crate::handlers::search::search_single(
+        State(Arc::clone(state)),
+        target_index.to_string(),
+        SearchRequest {
+            query: String::new(),
+            hits_per_page: Some(hits_per_page),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect(queryable_message);
+    let hits = search_response["hits"]
+        .as_array()
+        .expect("search response should contain a hit array");
+    assert_eq!(
+        search_response["nbHits"],
+        hits.len(),
+        "reported hit count must equal the exact returned set"
+    );
+
+    let mut sorted_hits = hits.iter().collect::<Vec<_>>();
+    sorted_hits.sort_by(|left, right| exact_hit_object_id(left).cmp(exact_hit_object_id(right)));
+    sorted_hits.into_iter().map(extract_hit).collect()
+}
+
+fn exact_hit_object_id(hit: &Value) -> &str {
+    hit["objectID"]
+        .as_str()
+        .expect("hit should contain string objectID")
 }

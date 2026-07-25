@@ -30,6 +30,8 @@ SCALE_REQUEST_BUDGET_MAX_MILLISECONDS=900000
 SCALE_REQUEST_BUDGET_MILLISECONDS="${MIGRATION_IMPORT_CONTRACT_REQUEST_BUDGET_MS:-$SCALE_REQUEST_BUDGET_MAX_MILLISECONDS}"
 SCALE_REQUEST_BUDGET_SECONDS=900
 SCALE_REWRITE_GROWTH_CEILING=75
+SCALE_SAMPLER_INTERVAL_SECONDS="${MIGRATION_IMPORT_CONTRACT_SCALE_SAMPLER_INTERVAL_SECONDS:-0.01}"
+READY_POLL_INTERVAL_SECONDS="${MIGRATION_IMPORT_CONTRACT_READY_POLL_INTERVAL_SECONDS:-0.5}"
 SOURCE_APP_ID=""
 SOURCE_API_KEY=""
 
@@ -621,7 +623,8 @@ start_server() {
   fi
   SERVER_PID=$!
 
-  "$WAIT_HELPER" --pid "$SERVER_PID" --host 127.0.0.1 --port auto --log-path "$SERVER_LOG" --retries 80 --interval-seconds 0.5
+  "$WAIT_HELPER" --pid "$SERVER_PID" --host 127.0.0.1 --port auto --log-path "$SERVER_LOG" \
+    --retries 80 --interval-seconds "$READY_POLL_INTERVAL_SECONDS"
   local port
   port="$(sed -n 's/.*Local:.*http:\/\/127\.0\.0\.1:\([0-9]*\).*/\1/p' "$SERVER_LOG" | head -1)"
   [ -n "$port" ] || die "server became ready but no auto-port was found"
@@ -757,9 +760,10 @@ commit_scale_trial_artifact_pair() {
 
 sample_scale_trial() {
   local marker="$1" out="$2" jobs_dir="$DATA_DIR/migration_exports/jobs"
-  local peak_rss=0 rss job_dir="" sidecar="" size last_size="" error="" interval_ms=10
+  local peak_rss=0 rss job_dir="" sidecar="" size last_size="" error="" interval_ms
   local sizes_file="${out}.sizes"
   local candidate_dir="${out}.candidates"
+  interval_ms="$(awk -v interval="$SCALE_SAMPLER_INTERVAL_SECONDS" 'BEGIN { printf "%d", interval * 1000 }')"
   mkdir "$candidate_dir"
   : >"$sizes_file"
   while [ -f "$marker" ]; do
@@ -792,7 +796,7 @@ sample_scale_trial() {
         fi
       fi
     fi
-    sleep 0.01
+    sleep "$SCALE_SAMPLER_INTERVAL_SECONDS"
   done
   if [ -z "$error" ] && [ -d "$jobs_dir" ] && [ "$(job_dir_count)" = "1" ]; then
     job_dir="$(single_job_dir)"

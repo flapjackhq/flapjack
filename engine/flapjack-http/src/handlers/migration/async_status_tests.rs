@@ -4,16 +4,19 @@ use crate::handlers::migration::algolia_client::AlgoliaIndexRecord;
 use crate::handlers::migration::source_reader::{
     MigrationSourceReader, PageConsumer, SourceFuture,
 };
-use crate::handlers::migration::source_test_support::ScriptedSourceReader;
+use crate::handlers::migration::source_test_support::{
+    sorted_exact_hits_by_object_id, ScriptedSourceReader,
+};
 use crate::handlers::migration::spool::{
-    MigrationDisposition, MigrationExportProgress, MigrationPhase, MigrationPhaseRecord,
+    AsyncMigrationPublicationSemantic, MigrationDisposition, MigrationExportProgress,
+    MigrationPhase, MigrationPhaseRecord,
 };
 use crate::test_helpers::{body_json, TestStateBuilder};
 use axum::body::Body;
 use axum::extract::Path as AxumPath;
-use axum::http::{Request, Response};
+use axum::http::{Method, Request, Response};
 use axum::response::IntoResponse;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::Router;
 use chrono::{TimeZone, Utc};
 use serde_json::json;
@@ -140,7 +143,9 @@ async fn async_submit_returns_admission_snapshot_and_status_reads_durable_phase(
     assert!(current.terminal_at.is_none());
 
     release_documents.notify_waiters();
-    wait_for_async_terminal(&state, submitted.job_id).await;
+    let terminal = wait_for_async_terminal(&state, submitted.job_id, "async-owner-app", None).await;
+    assert_eq!(terminal.phase, AsyncMigrationPhase::Activating);
+    assert_eq!(terminal.disposition, AsyncMigrationDisposition::Succeeded);
 }
 
 #[tokio::test]
@@ -227,6 +232,7 @@ async fn async_cancel_running_job_returns_status_without_exposing_internal_flag(
             job_uuid,
             "cancel_running",
             Some("async-owner-app"),
+            AsyncMigrationPublicationSemantic::CreateOnly,
         )
         .unwrap();
 
@@ -266,6 +272,7 @@ async fn async_cancel_terminal_jobs_returns_existing_terminal_status() {
             cancelled,
             "already_cancelled",
             Some("async-owner-app"),
+            AsyncMigrationPublicationSemantic::CreateOnly,
         )
         .unwrap();
     let cancelled_before = spool.cancel_migration(cancelled).unwrap();
@@ -274,6 +281,7 @@ async fn async_cancel_terminal_jobs_returns_existing_terminal_status() {
             failed,
             "already_failed",
             Some("async-owner-app"),
+            AsyncMigrationPublicationSemantic::CreateOnly,
         )
         .unwrap();
     let failed_before = spool.fail_migration(failed).unwrap();
@@ -282,6 +290,7 @@ async fn async_cancel_terminal_jobs_returns_existing_terminal_status() {
             succeeded,
             "already_succeeded",
             Some("async-owner-app"),
+            AsyncMigrationPublicationSemantic::CreateOnly,
         )
         .unwrap();
     spool
@@ -328,6 +337,7 @@ async fn async_acknowledge_terminal_job_returns_no_content_and_preserves_phase()
             job_uuid,
             "acknowledged_terminal",
             Some("async-owner-app"),
+            AsyncMigrationPublicationSemantic::CreateOnly,
         )
         .unwrap();
     spool
@@ -362,7 +372,7 @@ async fn async_acknowledge_uses_authenticated_header_owner_identity() {
     let tmp = TempDir::new().unwrap();
     let state = TestStateBuilder::new(&tmp).build_shared();
     let spool = import::spool_for_manager(&state.manager).unwrap();
-    let app = acknowledge_route(Arc::clone(&state));
+    let app = migration_job_route(Arc::clone(&state));
     let job_uuid = Uuid::new_v4();
     let not_found_body = json!({
         "message": "Migration job not found",
@@ -377,6 +387,7 @@ async fn async_acknowledge_uses_authenticated_header_owner_identity() {
             Some(
                 "async-owner-app:85dbe15d75ef9308c7ae0f33c7a324cc6f4bf519a2ed2f3027bd33c140a4f9aa",
             ),
+            AsyncMigrationPublicationSemantic::CreateOnly,
         )
         .unwrap();
     spool
@@ -428,7 +439,7 @@ async fn async_acknowledge_running_job_fails_closed_without_mutating_phase() {
     let tmp = TempDir::new().unwrap();
     let state = TestStateBuilder::new(&tmp).build_shared();
     let spool = import::spool_for_manager(&state.manager).unwrap();
-    let app = acknowledge_route(Arc::clone(&state));
+    let app = migration_job_route(Arc::clone(&state));
     let job_uuid = Uuid::new_v4();
 
     spool
@@ -438,6 +449,7 @@ async fn async_acknowledge_running_job_fails_closed_without_mutating_phase() {
             Some(
                 "async-owner-app:85dbe15d75ef9308c7ae0f33c7a324cc6f4bf519a2ed2f3027bd33c140a4f9aa",
             ),
+            AsyncMigrationPublicationSemantic::CreateOnly,
         )
         .unwrap();
     let running = spool.read_migration_phase(job_uuid).unwrap();
@@ -456,11 +468,19 @@ async fn async_acknowledge_running_job_fails_closed_without_mutating_phase() {
     assert_eq!(spool.read_migration_phase(job_uuid).unwrap(), running);
 }
 
-fn acknowledge_route(state: Arc<AppState>) -> Router {
+fn migration_job_route(state: Arc<AppState>) -> Router {
     Router::new()
+        .route(
+            "/1/migrations/algolia/:job_id",
+            get(get_algolia_migration_status_http),
+        )
         .route(
             "/1/migrations/algolia/:job_id/acknowledge",
             post(acknowledge_algolia_migration),
+        )
+        .route(
+            "/1/migrations/algolia/:job_id/cancel",
+            post(cancel_algolia_migration_http),
         )
         .with_state(state)
 }
@@ -471,9 +491,62 @@ async fn send_acknowledge_request(
     authenticated_app_id: &str,
     api_key: &str,
 ) -> Response<Body> {
+    send_migration_job_request(
+        app,
+        job_uuid,
+        authenticated_app_id,
+        api_key,
+        Method::POST,
+        "/acknowledge",
+    )
+    .await
+}
+
+async fn send_status_request(
+    app: &Router,
+    job_uuid: Uuid,
+    authenticated_app_id: &str,
+    api_key: &str,
+) -> Response<Body> {
+    send_migration_job_request(
+        app,
+        job_uuid,
+        authenticated_app_id,
+        api_key,
+        Method::GET,
+        "",
+    )
+    .await
+}
+
+async fn send_cancel_request(
+    app: &Router,
+    job_uuid: Uuid,
+    authenticated_app_id: &str,
+    api_key: &str,
+) -> Response<Body> {
+    send_migration_job_request(
+        app,
+        job_uuid,
+        authenticated_app_id,
+        api_key,
+        Method::POST,
+        "/cancel",
+    )
+    .await
+}
+
+async fn send_migration_job_request(
+    app: &Router,
+    job_uuid: Uuid,
+    authenticated_app_id: &str,
+    api_key: &str,
+    method: Method,
+    suffix: &str,
+) -> Response<Body> {
     let mut request = Request::builder()
-        .method("POST")
-        .uri(format!("/1/migrations/algolia/{job_uuid}/acknowledge"))
+        .method(method)
+        .uri(format!("/1/migrations/algolia/{job_uuid}{suffix}"))
         .header("x-algolia-api-key", api_key)
         .body(Body::empty())
         .unwrap();
@@ -522,7 +595,12 @@ async fn async_status_and_cancel_hide_foreign_job_uuids() {
     let spool = import::spool_for_manager(&state.manager).unwrap();
     let job_uuid = Uuid::new_v4();
     spool
-        .create_async_migration_admission_for_owner(job_uuid, "owned_target", Some("owner-app"))
+        .create_async_migration_admission_for_owner(
+            job_uuid,
+            "owned_target",
+            Some("owner-app"),
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
         .unwrap();
 
     let status_error = get_algolia_migration_status(
@@ -568,6 +646,144 @@ async fn async_status_and_cancel_hide_foreign_job_uuids() {
     );
 }
 
+#[tokio::test]
+async fn async_runner_created_job_is_isolated_by_authenticated_app_and_key() {
+    const OWNER_APP: &str = "runner-owner-app";
+    const OWNER_KEY: &str = "runner-owner-key";
+    const TARGET: &str = "runner_owned_target";
+
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let spool = import::spool_for_manager(&state.manager).unwrap();
+    let app = migration_job_route(Arc::clone(&state));
+    let owner_headers = migration_owner_headers(Some(OWNER_KEY));
+    let owner_identity = authenticated_owner_identity(OWNER_APP.to_string(), &owner_headers);
+    let request = MigrateFromAlgoliaRequest {
+        target_index: Some(TARGET.to_string()),
+        ..valid_async_request()
+    };
+
+    let (job_uuid, _) = state
+        .migration_runner
+        .submit_algolia_import_for_owner(request, Some(owner_identity), |_| {
+            Ok(async_hermetic_source_reader())
+        })
+        .await
+        .expect("runner-created owned async job should be admitted");
+    let rightful_status =
+        wait_for_async_terminal(&state, job_uuid, OWNER_APP, Some(OWNER_KEY)).await;
+    assert_eq!(rightful_status.phase, AsyncMigrationPhase::Activating);
+    assert_eq!(
+        rightful_status.disposition,
+        AsyncMigrationDisposition::Succeeded
+    );
+    assert!(rightful_status.terminal_at.is_some());
+
+    let terminal_before = spool.read_migration_phase(job_uuid).unwrap();
+    assert_eq!(terminal_before.phase, MigrationPhase::Activating);
+    assert_eq!(terminal_before.disposition, MigrationDisposition::Succeeded);
+    assert!(terminal_before.terminal_at.is_some());
+    let expected_hits = vec![
+        (
+            "doc-1".to_string(),
+            "Quartz adapter".to_string(),
+            "hardware".to_string(),
+        ),
+        (
+            "doc-2".to_string(),
+            "Velvet compass".to_string(),
+            "navigation".to_string(),
+        ),
+    ];
+    assert_eq!(
+        sorted_async_target_hits(&state, TARGET).await,
+        expected_hits
+    );
+
+    for (case, foreign_app, foreign_key) in [
+        ("different app", "other-runner-app", OWNER_KEY),
+        ("same app with different key", OWNER_APP, "wrong-runner-key"),
+    ] {
+        let status = send_status_request(&app, job_uuid, foreign_app, foreign_key).await;
+        assert_migration_job_not_found(status, &format!("{case} status")).await;
+
+        let acknowledge = send_acknowledge_request(&app, job_uuid, foreign_app, foreign_key).await;
+        assert_migration_job_not_found(acknowledge, &format!("{case} ACK")).await;
+
+        let cancel = send_cancel_request(&app, job_uuid, foreign_app, foreign_key).await;
+        assert_migration_job_not_found(cancel, &format!("{case} cancel")).await;
+
+        assert_eq!(
+            spool.read_migration_phase(job_uuid).unwrap(),
+            terminal_before,
+            "{case} must not advance or mutate the durable phase"
+        );
+        assert_eq!(
+            sorted_async_target_hits(&state, TARGET).await,
+            expected_hits,
+            "{case} must not mutate the exact target contents"
+        );
+    }
+
+    let status = send_status_request(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
+    assert_eq!(status.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(status).await,
+        serde_json::to_value(AsyncMigrationStatusResponse::from(terminal_before.clone())).unwrap()
+    );
+
+    for attempt in 1..=2 {
+        let acknowledge = send_acknowledge_request(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
+        assert_eq!(
+            acknowledge.status(),
+            StatusCode::NO_CONTENT,
+            "rightful authenticated ACK {attempt} should be idempotent"
+        );
+        assert_eq!(
+            spool.read_migration_phase(job_uuid).unwrap(),
+            terminal_before,
+            "rightful authenticated ACK {attempt} must preserve the terminal phase"
+        );
+    }
+}
+
+async fn assert_migration_job_not_found(response: Response<Body>, operation: &str) {
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "{operation} must hide the owned job UUID"
+    );
+    assert_eq!(
+        body_json(response).await,
+        json!({
+            "message": "Migration job not found",
+            "status": 404,
+            "code": "migration_job_not_found"
+        }),
+        "{operation} must return the stable owner-isolation response"
+    );
+}
+
+async fn sorted_async_target_hits(
+    state: &Arc<AppState>,
+    target: &str,
+) -> Vec<(String, String, String)> {
+    sorted_exact_hits_by_object_id(
+        state,
+        target,
+        10,
+        "runner-created target should remain queryable",
+        |hit| {
+            (
+                hit["objectID"].as_str().unwrap().to_string(),
+                hit["title"].as_str().unwrap().to_string(),
+                hit["category"].as_str().unwrap().to_string(),
+            )
+        },
+    )
+    .await
+}
+
 fn valid_async_request() -> MigrateFromAlgoliaRequest {
     MigrateFromAlgoliaRequest {
         app_id: "LOCALMIGRATIONTEST".to_string(),
@@ -587,41 +803,53 @@ fn async_hermetic_source_reader() -> ScriptedSourceReader {
         pending_task: false,
     };
     reader.push_quiescent(source_record.clone());
-    reader.push_pass(
-        json!({
-            "searchableAttributes": ["title"],
-            "attributesForFaceting": ["category"]
-        }),
-        vec![vec![
-            json!({"objectID": "doc-1", "title": "Quartz adapter", "category": "hardware"}),
-            json!({"objectID": "doc-2", "title": "Velvet compass", "category": "navigation"}),
-        ]],
-        vec![],
-        vec![],
-    );
+    let settings = json!({
+        "searchableAttributes": ["title"],
+        "attributesForFaceting": ["category"]
+    });
+    let document_pages = vec![vec![
+        json!({"objectID": "doc-1", "title": "Quartz adapter", "category": "hardware"}),
+        json!({"objectID": "doc-2", "title": "Velvet compass", "category": "navigation"}),
+    ]];
+    reader.push_pass(settings.clone(), document_pages.clone(), vec![], vec![]);
+    reader.push_pass(settings, document_pages, vec![], vec![]);
     reader.push_quiescent(source_record);
     reader
 }
 
-async fn wait_for_async_terminal(state: &Arc<AppState>, job_uuid: Uuid) {
+async fn wait_for_async_terminal(
+    state: &Arc<AppState>,
+    job_uuid: Uuid,
+    authenticated_app_id: &str,
+    api_key: Option<&str>,
+) -> AsyncMigrationStatusResponse {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            let Json(current) = get_algolia_migration_status(
+            let Json(current) = get_algolia_migration_status_http(
                 State(Arc::clone(state)),
-                axum::extract::Extension(AuthenticatedAppId("async-owner-app".to_string())),
+                axum::extract::Extension(AuthenticatedAppId(authenticated_app_id.to_string())),
+                migration_owner_headers(api_key),
                 AxumPath(job_uuid.to_string()),
             )
             .await
             .expect("status should remain readable");
             if current.disposition != AsyncMigrationDisposition::Running {
                 assert!(current.terminal_at.is_some());
-                break;
+                break current;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("async import should finish after release");
+    .expect("async import should finish after release")
+}
+
+fn migration_owner_headers(api_key: Option<&str>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Some(api_key) = api_key {
+        headers.insert("x-algolia-api-key", api_key.parse().unwrap());
+    }
+    headers
 }
 
 struct BlockingDocumentReadSourceReader {

@@ -284,6 +284,7 @@ pub(super) async fn import_from_admitted_source<R>(
     state_manager: &Arc<IndexManager>,
     job_uuid: Uuid,
     target_index: String,
+    publication_mode: MigrationPublicationMode,
     reader: &mut R,
 ) -> Result<Json<MigrateFromAlgoliaResponse>, MigrateError>
 where
@@ -294,7 +295,7 @@ where
         &spool_for_manager(state_manager)?,
         job_uuid,
         target_index,
-        MigrationPublicationMode::CreateOnly,
+        publication_mode,
         reader,
         #[cfg(test)]
         ImportTestHooks::default(),
@@ -307,6 +308,7 @@ pub(super) async fn import_from_admitted_source_with_test_hooks<R>(
     state_manager: &Arc<IndexManager>,
     job_uuid: Uuid,
     target_index: String,
+    publication_mode: MigrationPublicationMode,
     reader: &mut R,
     hooks: ImportTestHooks,
 ) -> Result<Json<MigrateFromAlgoliaResponse>, MigrateError>
@@ -318,7 +320,7 @@ where
         &spool_for_manager(state_manager)?,
         job_uuid,
         target_index,
-        MigrationPublicationMode::CreateOnly,
+        publication_mode,
         reader,
         hooks,
     )

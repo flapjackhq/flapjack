@@ -218,10 +218,29 @@ pub(crate) struct MigrationPhaseRecord {
 pub(crate) struct AsyncMigrationMetadata {
     pub job_uuid: Uuid,
     pub target_index: String,
+    #[serde(
+        default,
+        skip_serializing_if = "AsyncMigrationPublicationSemantic::is_create_only"
+    )]
+    pub publication_semantic: AsyncMigrationPublicationSemantic,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authenticated_app_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub publication_transaction_id: Option<PublicationTransactionId>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum AsyncMigrationPublicationSemantic {
+    #[default]
+    CreateOnly,
+    ReplaceExisting,
+}
+
+impl AsyncMigrationPublicationSemantic {
+    fn is_create_only(&self) -> bool {
+        *self == Self::CreateOnly
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -634,8 +653,14 @@ impl SpoolStore {
         &self,
         job_uuid: Uuid,
         target_index: &str,
+        publication_semantic: AsyncMigrationPublicationSemantic,
     ) -> SpoolResult<MigrationPhaseRecord> {
-        self.create_async_migration_admission_for_owner(job_uuid, target_index, None)
+        self.create_async_migration_admission_for_owner(
+            job_uuid,
+            target_index,
+            None,
+            publication_semantic,
+        )
     }
 
     pub(crate) fn create_async_migration_admission_for_owner(
@@ -643,6 +668,7 @@ impl SpoolStore {
         job_uuid: Uuid,
         target_index: &str,
         authenticated_app_id: Option<&str>,
+        publication_semantic: AsyncMigrationPublicationSemantic,
     ) -> SpoolResult<MigrationPhaseRecord> {
         let _root_lock = self.lock_root()?;
         let job_dir = self.job_dir(job_uuid);
@@ -650,12 +676,12 @@ impl SpoolStore {
             return Err(SpoolError::new(SpoolErrorKind::JobTerminal));
         }
         create_private_dir(&job_dir)?;
-        let metadata = AsyncMigrationMetadata {
+        let metadata = self.async_migration_metadata(
             job_uuid,
-            target_index: target_index.to_string(),
-            authenticated_app_id: authenticated_app_id.map(str::to_owned),
-            publication_transaction_id: None,
-        };
+            target_index,
+            authenticated_app_id,
+            publication_semantic,
+        );
         self.commit_async_migration_metadata(&metadata)?;
         let record = self.initial_migration_phase_record(job_uuid);
         self.commit_migration_phase(&record)?;
@@ -687,12 +713,12 @@ impl SpoolStore {
             return Err(SpoolError::new(SpoolErrorKind::JobTerminal));
         }
         create_private_dir(&job_dir)?;
-        let metadata = AsyncMigrationMetadata {
+        let metadata = self.async_migration_metadata(
             job_uuid,
-            target_index: requested.tenant.clone(),
-            authenticated_app_id: Some(requested.authenticated_app_id.clone()),
-            publication_transaction_id: None,
-        };
+            &requested.tenant,
+            Some(&requested.authenticated_app_id),
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        );
         self.commit_async_migration_metadata(&metadata)?;
         self.commit_privacy_scrub_intent(&requested, job_uuid)?;
         let phase = self.initial_migration_phase_record(job_uuid);
@@ -709,6 +735,7 @@ impl SpoolStore {
         &self,
         job_uuid: Uuid,
         target_index: &str,
+        publication_semantic: AsyncMigrationPublicationSemantic,
     ) -> SpoolResult<()> {
         let _root_lock = self.lock_root()?;
         let job_dir = self.job_dir(job_uuid);
@@ -716,13 +743,25 @@ impl SpoolStore {
             return Err(SpoolError::new(SpoolErrorKind::JobTerminal));
         }
         create_private_dir(&job_dir)?;
-        let metadata = AsyncMigrationMetadata {
+        let metadata =
+            self.async_migration_metadata(job_uuid, target_index, None, publication_semantic);
+        self.commit_async_migration_metadata(&metadata)
+    }
+
+    fn async_migration_metadata(
+        &self,
+        job_uuid: Uuid,
+        target_index: &str,
+        authenticated_app_id: Option<&str>,
+        publication_semantic: AsyncMigrationPublicationSemantic,
+    ) -> AsyncMigrationMetadata {
+        AsyncMigrationMetadata {
             job_uuid,
             target_index: target_index.to_string(),
-            authenticated_app_id: None,
+            publication_semantic,
+            authenticated_app_id: authenticated_app_id.map(str::to_owned),
             publication_transaction_id: None,
-        };
-        self.commit_async_migration_metadata(&metadata)
+        }
     }
 
     pub(crate) fn recover_async_admissions(&self) -> SpoolResult<Vec<Uuid>> {

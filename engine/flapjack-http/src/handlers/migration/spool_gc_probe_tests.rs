@@ -135,6 +135,7 @@ fn seed_probe_job(
                     job_id,
                     &format!("migration_probe_target_{job_id}"),
                     Some(authenticated_app_id),
+                    AsyncMigrationPublicationSemantic::CreateOnly,
                 )
                 .expect("async migration admission should be created");
         }

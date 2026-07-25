@@ -2921,8 +2921,8 @@
         "tags": [
           "migration"
         ],
-        "summary": "Additive async Algolia migration submission endpoint.",
-        "description": "This route admits create-only migration requests, immediately returns the\ndurable admission snapshot, and explicitly refuses `overwrite=true`.",
+        "summary": "Async Algolia migration submission endpoint.",
+        "description": "This route admits node-local create or replace migration requests and\nimmediately returns the durable admission snapshot.",
         "operationId": "submit_algolia_migration",
         "requestBody": {
           "content": {
@@ -8971,7 +8971,7 @@
           },
           "overwrite": {
             "type": "boolean",
-            "description": "Replace the target index only on the node-local synchronous endpoint.\nAsync migration and HA imports still refuse overwrite requests."
+            "description": "Replace the target index only on node-local migration endpoints. HA\nimports still refuse overwrite requests."
           },
           "sourceIndex": {
             "type": "string"

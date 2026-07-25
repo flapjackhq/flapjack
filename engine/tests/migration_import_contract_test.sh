@@ -8,6 +8,9 @@ ORACLE="$SCRIPT_DIR/migration_import_contract.sh"
 NIGHTLY_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/nightly.yml"
 SCALE_EVIDENCE_HEAD="bbfd59bf64dae52626ee584e39bb7bff0b580494"
 
+export MIGRATION_IMPORT_CONTRACT_SCALE_SAMPLER_INTERVAL_SECONDS="${MIGRATION_IMPORT_CONTRACT_SCALE_SAMPLER_INTERVAL_SECONDS:-0.001}"
+export MIGRATION_IMPORT_CONTRACT_READY_POLL_INTERVAL_SECONDS="${MIGRATION_IMPORT_CONTRACT_READY_POLL_INTERVAL_SECONDS:-0.01}"
+
 TESTS_RUN=0
 TESTS_PASSED=0
 TESTS_FAILED=0
@@ -382,7 +385,7 @@ cleanup() {
       wait "$pid" 2>/dev/null || true
     fi
   done
-  rm -rf "$WORK_DIR"
+  rm -rf "$WORK_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -409,7 +412,7 @@ printf '%s\n' "${FLAPJACK_ALGOLIA_LIVE_TEST_IMPORT_POST_COMMIT_BARRIER_DIR:-}" >
 mkdir -p "$FLAPJACK_DATA_DIR/migration_exports/jobs"
 printf 'Local: http://127.0.0.1:54321\n'
 trap 'exit 0' TERM INT
-while :; do sleep 1; done
+while :; do sleep 0.05; done
 SH
   chmod +x "$runtime/fake-flapjack"
 
@@ -496,27 +499,75 @@ def append(name, value):
     with (state / name).open("a", encoding="utf-8") as f:
         f.write(value + "\n")
 
+def safe_path_component(name):
+    if not isinstance(name, str):
+        raise TypeError("path component must be a string")
+    if name == "" or "/" in name or "\\" in name or "\x00" in name or name in (".", ".."):
+        raise ValueError(f"unsafe path component: {name!r}")
+    return name
+
+def state_marker(prefix, name):
+    return state / f"{prefix}{safe_path_component(name)}"
+
 def active_corpus_size():
     size_file = state / "fixture_corpus_size"
     if size_file.exists():
         return int(size_file.read_text(encoding="utf-8").strip())
     return 20000
 
+class ScaleFixtureError(RuntimeError):
+    pass
+
+
+def wait_for_sampled_sidecar_size(data_dir, corpus_size, trial_number, expected_size):
+    observed_size = (
+        data_dir.parent / "logs" / "scale-trials" / str(corpus_size)
+        / f"trial-{trial_number}" / "sampler.json.candidates" / "observed_size"
+    )
+    deadline = time.monotonic() + 2
+    expected_text = str(expected_size)
+    while time.monotonic() < deadline:
+        try:
+            if observed_size.read_text(encoding="utf-8").strip() == expected_text:
+                return
+        except FileNotFoundError:
+            pass
+        time.sleep(0.01)
+    raise ScaleFixtureError(
+        f"timed out waiting for sampled sidecar size {expected_size} for scale trial {trial_number} at n={corpus_size}"
+    )
+
+
+def wait_for_sampled_manifest_snapshot(data_dir, corpus_size, trial_number):
+    sampled_manifest = (
+        data_dir.parent / "logs" / "scale-trials" / str(corpus_size)
+        / f"trial-{trial_number}" / "sampler.json.candidates" / "manifest.0.json"
+    )
+    deadline = time.monotonic() + 5
+    while not sampled_manifest.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if sampled_manifest.exists():
+        return
+    raise ScaleFixtureError(
+        f"timed out waiting for sampled manifest snapshot for scale trial {trial_number} at n={corpus_size}"
+    )
+
 def write_fake_job(target, corpus_size):
     data_dir_file = state / "data_dir"
     if not data_dir_file.exists():
         return
+    target_component = safe_path_component(target)
     data_dir = Path(data_dir_file.read_text(encoding="utf-8").strip())
     jobs_dir = data_dir / "migration_exports" / "jobs"
     jobs_dir.mkdir(parents=True, exist_ok=True)
-    job_dir = jobs_dir / f"fake-job-{target}"
+    job_dir = jobs_dir / f"fake-job-{target_component}"
     job_dir.mkdir(parents=True, exist_ok=True)
     if scenario == "scale_multiple_jobs":
-        (jobs_dir / f"extra-job-{target}").mkdir(parents=True, exist_ok=True)
+        (jobs_dir / f"extra-job-{target_component}").mkdir(parents=True, exist_ok=True)
     trial_number = 1
-    if "_trial_" in target:
+    if "_trial_" in target_component:
         try:
-            trial_number = int(target.rsplit("_trial_", 1)[1])
+            trial_number = int(target_component.rsplit("_trial_", 1)[1])
         except ValueError:
             trial_number = 1
     if scenario == "scale_median_four_trials":
@@ -524,29 +575,33 @@ def write_fake_job(target, corpus_size):
     sidecar = job_dir / "completed_object_ids"
     sidecar_tmp = job_dir / "completed_object_ids.tmp"
     expected_page_count = (corpus_size + 999) // 1000
-    page_count = expected_page_count
+    minimum_distinct_count = expected_page_count if expected_page_count <= 2 else (expected_page_count // 2) + 1
+    page_count = minimum_distinct_count
     if scenario == "scale_sidecar_incomplete":
-        page_count = max(1, page_count - 1)
+        page_count = max(1, minimum_distinct_count - 1)
     if scenario == "scale_large_sidecar_undersampled" and corpus_size == 20000:
-        page_count = expected_page_count // 2
-    size_unit = 50 if scenario == "scale_growth_breach" and corpus_size <= 2000 else 100
-    time.sleep(0.2)
-    for page in range(1, page_count + 1):
-        sidecar_tmp.write_text("x" * (page * size_unit), encoding="utf-8")
+        page_count = max(1, minimum_distinct_count - 1)
+    size_unit = 5 if scenario == "scale_growth_breach" and corpus_size <= 2000 else 100
+    if corpus_size == 20000 and page_count == minimum_distinct_count:
+        sidecar_sizes = [page * size_unit for page in range(1, page_count)]
+        sidecar_sizes.append(21000 - sum(sidecar_sizes))
+    else:
+        sidecar_sizes = [page * size_unit for page in range(1, page_count + 1)]
+    for expected_size in sidecar_sizes:
+        sidecar_tmp.write_text("x" * expected_size, encoding="utf-8")
         sidecar_tmp.replace(sidecar)
-        delay = 0.5
-        if scenario == "scale_growth_breach" and corpus_size <= 2000:
-            delay = 0.8
-        if scenario in ("scale_manifest_generation_drift", "scale_manifest_count_drift", "scale_manifest_length_drift"):
-            delay = 0.8
+        if "_trial_" in target_component and scenario not in ("scale_sidecar_incomplete", "scale_large_sidecar_undersampled"):
+            wait_for_sampled_sidecar_size(data_dir, corpus_size, trial_number, expected_size)
+        delay = 0
         if scenario == "scale_median_four_trials":
-            delay = 0.80 + (trial_number * 0.05)
-        time.sleep(delay)
+            delay = 0.005 + (trial_number * 0.001)
+        if delay:
+            time.sleep(delay)
     manifest = {
         "completed_objects": {
             "generation": expected_page_count,
             "count": corpus_size,
-            "length": page_count * size_unit,
+            "length": sidecar_sizes[-1],
         }
     }
     if scenario == "scale_manifest_generation_drift":
@@ -558,13 +613,7 @@ def write_fake_job(target, corpus_size):
     manifest_path = job_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, separators=(",", ":")), encoding="utf-8")
     if scenario == "scale_manifest_deleted_snapshot":
-        sampled_manifest = (
-            data_dir.parent / "logs" / "scale-trials" / str(corpus_size)
-            / f"trial-{trial_number}" / "sampler.json.candidates" / "manifest.0.json"
-        )
-        deadline = time.monotonic() + 5
-        while not sampled_manifest.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
+        wait_for_sampled_manifest_snapshot(data_dir, corpus_size, trial_number)
         manifest_path.write_text(json.dumps({
             "lifecycle": "Deleted",
             "completed_objects": {"generation": 0, "count": 0, "length": 0},
@@ -674,18 +723,18 @@ if fixture_scenario and parsed.path.startswith("/1/indexes/"):
         else:
             respond({"hits": [], "nbHits": 2000}, 200)
     elif method == "DELETE":
-        (state / f"active_{index_name}").unlink(missing_ok=True)
+        state_marker("active_", index_name).unlink(missing_ok=True)
         append("deleted_indices.log", index_name)
         respond({"taskID": 300}, 200)
     elif method == "GET":
-        code = 404 if not (state / f"active_{index_name}").exists() else 200
+        code = 404 if not state_marker("active_", index_name).exists() else 200
         respond({"name": index_name}, code)
     else:
         respond({"message": "unexpected fixture request", "method": method, "path": parsed.path}, 500)
     sys.exit(0)
 
 def marker(name):
-    return state / f"active_{name}"
+    return state_marker("active_", name)
 
 def activate(name):
     marker(name).write_text("active", encoding="utf-8")
@@ -715,7 +764,7 @@ def write_sidecar(index_name, settings):
         settings = dict(settings)
         settings["customRanking"] = ["asc(stale_rank)"]
     data_dir = Path(data_dir_file.read_text(encoding="utf-8").strip())
-    index_dir = data_dir / index_name
+    index_dir = data_dir / safe_path_component(index_name)
     index_dir.mkdir(parents=True, exist_ok=True)
     (index_dir / "settings.json").write_text(json.dumps(settings, separators=(",", ":")), encoding="utf-8")
     if scenario == "importing_replicas_physical_replica_data":
@@ -796,7 +845,7 @@ if async_scenario and is_vendor_request:
     elif method == "POST" and parsed.path.endswith("/batch"):
         documents = [request["body"] for request in json.loads(body)["requests"]]
         (state / "seeded_documents.json").write_text(json.dumps(documents), encoding="utf-8")
-        (state / f"vendor_active_{index_name}").write_text("active", encoding="utf-8")
+        state_marker("vendor_active_", index_name).write_text("active", encoding="utf-8")
         respond({"taskID": 700}, 200)
     elif method == "GET" and "/task/" in parsed.path:
         append("vendor_waited_tasks.log", parsed.path.rsplit("/", 1)[1])
@@ -808,10 +857,10 @@ if async_scenario and is_vendor_request:
             respond({"message": "vendor refused deletion"}, 500)
         elif scenario == "async_delete_malformed_success" and index_name == "fj_async_meta_target":
             respond({"deletedAt": iso_now()}, 200)
-        elif scenario == "async_ok" and not (state / f"vendor_active_{index_name}").exists():
+        elif scenario == "async_ok" and not state_marker("vendor_active_", index_name).exists():
             respond({"message": "Index does not exist"}, 404)
         else:
-            (state / f"vendor_active_{index_name}").unlink(missing_ok=True)
+            state_marker("vendor_active_", index_name).unlink(missing_ok=True)
             append("deleted_indices.log", index_name)
             respond({"taskID": 701}, 200)
     else:
@@ -836,7 +885,7 @@ if cancel_scenario and is_vendor_request:
     elif method == "POST" and parsed.path.endswith("/batch"):
         documents = [request["body"] for request in json.loads(body)["requests"]]
         (state / "seeded_documents.json").write_text(json.dumps(documents), encoding="utf-8")
-        (state / f"vendor_active_{index_name}").write_text("active", encoding="utf-8")
+        state_marker("vendor_active_", index_name).write_text("active", encoding="utf-8")
         respond({"taskID": 800}, 200)
     elif method == "GET" and "/task/" in parsed.path:
         append("vendor_waited_tasks.log", parsed.path.rsplit("/", 1)[1])
@@ -849,7 +898,7 @@ if cancel_scenario and is_vendor_request:
             append("deleted_indices.log", index_name)
             respond({"taskID": 801}, 200)
         else:
-            (state / f"vendor_active_{index_name}").unlink(missing_ok=True)
+            state_marker("vendor_active_", index_name).unlink(missing_ok=True)
             append("deleted_indices.log", index_name)
             respond({"taskID": 801}, 200)
     else:
@@ -1025,16 +1074,16 @@ if cancel_scenario:
         index_name = urllib.parse.unquote(parts[3])
         object_id = urllib.parse.unquote(parts[4]) if len(parts) > 4 else "sentinel-object"
         activate(index_name)
-        target_dir = data_dir / index_name
+        target_dir = data_dir / safe_path_component(index_name)
         target_dir.mkdir(parents=True, exist_ok=True)
         (target_dir / "sentinel.json").write_text(body or "{}", encoding="utf-8")
-        (state / f"object_{index_name}_{object_id}").write_text(body or "{}", encoding="utf-8")
+        state_marker(f"object_{safe_path_component(index_name)}_", object_id).write_text(body or "{}", encoding="utf-8")
         respond({"taskID": 2, "updatedAt": iso_now()}, 200)
     elif method == "GET" and parsed.path.startswith("/1/indexes/"):
         parts = parsed.path.split("/")
         index_name = urllib.parse.unquote(parts[3])
         object_id = urllib.parse.unquote(parts[4]) if len(parts) > 4 else ""
-        object_path = state / f"object_{index_name}_{object_id}"
+        object_path = state_marker(f"object_{safe_path_component(index_name)}_", object_id)
         if object_path.exists():
             if scenario == "cancel_sentinel_field_order" and (state / "pre_cancel_seen").exists():
                 respond({"objectID": "sentinel-object", "count": 1, "sentinel": "preserve-me"}, 200)
@@ -1098,7 +1147,11 @@ if parsed.path == "/1/migrate-from-algolia" and method == "POST":
             imported_count = active_corpus_size() if scale_scenario else 7
             synonym_count = 9 if scenario == "importing_verified_bad_counts" else 1
             if scale_scenario:
-                write_fake_job(request_target, imported_count)
+                try:
+                    write_fake_job(request_target, imported_count)
+                except ScaleFixtureError as exc:
+                    respond({"message": str(exc)}, 500)
+                    sys.exit(0)
             respond({
                 "status": "complete",
                 "settings": True,
@@ -1229,13 +1282,16 @@ elif (scenario.startswith("importing_verified") or scale_scenario) and parsed.pa
             page_size = query_payload["hitsPerPage"]
             page = query_payload.get("page", 0)
             corpus_size = active_corpus_size()
-            object_ids = [f"scale-{number:06d}" for number in range(1, corpus_size + 1)]
-            if scenario == "scale_duplicate_object_ids":
-                object_ids[-2] = object_ids[0]
-            if scenario == "scale_missing_final_page":
-                object_ids = object_ids[:-1]
             start = page * page_size
-            ids = object_ids[start:start + page_size]
+            stop = min(start + page_size, corpus_size)
+            ids = []
+            for number in range(start + 1, stop + 1):
+                if scenario == "scale_missing_final_page" and number == corpus_size:
+                    continue
+                if scenario == "scale_duplicate_object_ids" and number == corpus_size - 1:
+                    ids.append("scale-000001")
+                else:
+                    ids.append(f"scale-{number:06d}")
             respond({"hits": [{"objectID": object_id} for object_id in ids], "nbHits": corpus_size}, 200)
         elif query == manifest["known_answers_query"]:
             hits = [{**hit, "_highlightResult": {}} for hit in manifest["known_answers"]]
@@ -1438,6 +1494,8 @@ run_oracle_with_stub() {
     FLAPJACK_BIN="$runtime/fake-flapjack" \
     MIGRATION_IMPORT_CONTRACT_STUB_DIR="$runtime/state" \
     MIGRATION_IMPORT_CONTRACT_SCENARIO="$scenario" \
+    MIGRATION_IMPORT_CONTRACT_READY_POLL_INTERVAL_SECONDS=0.01 \
+    MIGRATION_IMPORT_CONTRACT_SCALE_SAMPLER_INTERVAL_SECONDS=0.001 \
     MIGRATION_IMPORT_CONTRACT_TEST_GENERATOR="$SCRIPT_DIR/common/generate_algolia_corpus.sh" \
     FJ_SCALE_FIXTURE_BIN="$runtime/bin/algolia_corpus_fixture.sh" \
     bash "$ORACLE" "$@" >"$out" 2>&1
@@ -2193,10 +2251,10 @@ assert_success_evidence_scenario() {
     && [ -n "$data_dir" ] \
     && [ ! -e "$data_dir" ] \
     && ! grep -Eq 'ADMIN_SECRET_CANARY|APPID_CANARY' "$out" "$evidence"/* "$evidence"/logs/* 2>/dev/null; then
-    rm -rf "$evidence_root"
+    rm -rf "$evidence_root" 2>/dev/null || true
     pass 'opt-in success evidence preserves receipt metadata and counts'
   else
-    [ -z "$evidence_root" ] || rm -rf "$evidence_root"
+    [ -z "$evidence_root" ] || rm -rf "$evidence_root" 2>/dev/null || true
     fail 'opt-in success evidence preserves receipt metadata and counts' "rc=$rc evidence=$evidence output=$(cat "$out")"
   fi
 }
@@ -2237,10 +2295,10 @@ assert_verified_success_scenario() {
     && [ ! -e "$runtime/state/active_target_products" ] \
     && [ ! -e "$runtime/state/active_target_products_conflict" ] \
     && [ ! -e "$runtime/state/active_target_products_invalid_key" ]; then
-    rm -rf "$evidence_root"
+    rm -rf "$evidence_root" 2>/dev/null || true
     pass 'verified importing proves content, behavior, negative arms, and target cleanup'
   else
-    [ -z "$evidence_root" ] || rm -rf "$evidence_root"
+    [ -z "$evidence_root" ] || rm -rf "$evidence_root" 2>/dev/null || true
     fail 'verified importing proves content, behavior, negative arms, and target cleanup' "rc=$rc evidence=$evidence output=$(cat "$out")"
   fi
 }
@@ -2287,10 +2345,10 @@ assert_scale_success_scenario() {
     ' "$evidence/receipt.json" >/dev/null \
     && [ "$(cat "$runtime/state/fixture_source_count_index" 2>/dev/null)" = "fj_scale_stub_source" ] \
     && [ -f "$evidence/logs/source-manifest.json" ]; then
-    rm -rf "$evidence_root"
+    rm -rf "$evidence_root" 2>/dev/null || true
     pass 'scale mode prepares fixture, assigns manifest before gate, records ledger, and cleans up'
   else
-    [ -z "$evidence_root" ] || rm -rf "$evidence_root"
+    [ -z "$evidence_root" ] || rm -rf "$evidence_root" 2>/dev/null || true
     fail 'scale mode prepares fixture, assigns manifest before gate, records ledger, and cleans up' "rc=$rc evidence=$evidence output=$(cat "$out")"
   fi
 }
@@ -2346,10 +2404,10 @@ assert_scale_two_point_success_scenario() {
     && evidence_scale_sampled_archives_resolve "$evidence" \
     && { [ "$scenario" != "scale_manifest_deleted_snapshot" ] \
       || evidence_scale_deleted_archives_preserve_authentic_state "$evidence"; }; then
-    rm -rf "$evidence_root"
+    rm -rf "$evidence_root" 2>/dev/null || true
     pass "$label"
   else
-    [ -z "$evidence_root" ] || rm -rf "$evidence_root"
+    [ -z "$evidence_root" ] || rm -rf "$evidence_root" 2>/dev/null || true
     fail "$label" "rc=$rc evidence=$evidence output=$(cat "$out")"
   fi
 }
@@ -2452,10 +2510,10 @@ assert_scale_two_point_receipt_reports_accepted_trial_count() {
       and all(.scale.conditions_observed[]; (.trials | length) == 4)
       and (.checks | map(select(.name | startswith("scale_trial_"))) | length) == 8
     ' "$evidence/receipt.json" >/dev/null; then
-    rm -rf "$evidence_root"
+    rm -rf "$evidence_root" 2>/dev/null || true
     pass 'scale two-point receipt reports the accepted trial count'
   else
-    rm -rf "$evidence_root"
+    rm -rf "$evidence_root" 2>/dev/null || true
     fail 'scale two-point receipt reports the accepted trial count' "rc=$rc evidence=$evidence output=$(cat "$out")"
   fi
 }
@@ -2510,10 +2568,10 @@ assert_scale_two_point_even_trial_medians() {
         and .summary.wall_clock_milliseconds.median == ([.trials[].wall_clock_milliseconds] | median)
         and .summary.peak_rss_kb.median == ([.trials[].peak_rss_kb] | median))
     ' "$evidence/receipt.json" >/dev/null; then
-    rm -rf "$evidence_root"
+    rm -rf "$evidence_root" 2>/dev/null || true
     pass 'scale two-point computes mathematical medians for four accepted trials'
   else
-    rm -rf "$evidence_root"
+    rm -rf "$evidence_root" 2>/dev/null || true
     fail 'scale two-point computes mathematical medians for four accepted trials' "rc=$rc evidence=$evidence output=$(cat "$out")"
   fi
 }
@@ -2664,10 +2722,10 @@ assert_replica_success_scenario() {
     && cmp -s <(printf 'fj_replica_source_products\nfj_replica_source_products_relevance\nfj_replica_source_products_standard_rank\n') "$runtime/state/settings_indices.log" \
     && cmp -s <(printf 'fj_replica_source_products\nfj_replica_source_products_relevance\nfj_replica_source_products_standard_rank\n') "$runtime/state/deleted_indices.log" \
     && ! grep -Fq 'virtual(' "$runtime/state/source_api_indices.log"; then
-    rm -rf "$evidence_root"
+    rm -rf "$evidence_root" 2>/dev/null || true
     pass 'replica scenario proves public order, sidecars, receipt, and exact cleanup'
   else
-    [ -z "$evidence_root" ] || rm -rf "$evidence_root"
+    [ -z "$evidence_root" ] || rm -rf "$evidence_root" 2>/dev/null || true
     fail 'replica scenario proves public order, sidecars, receipt, and exact cleanup' "rc=$rc evidence=$evidence output=$(cat "$out")"
   fi
 }

@@ -1,10 +1,10 @@
 use super::source_reader::MigrationSourceReader;
 use super::spool::{
-    AsyncMigrationMetadata, MigrationDisposition, MigrationPhaseRecord, SpoolError, SpoolLimits,
-    SpoolStore,
+    AsyncMigrationMetadata, AsyncMigrationPublicationSemantic, MigrationDisposition,
+    MigrationPhaseRecord, SpoolError, SpoolLimits, SpoolStore,
 };
 use super::{admit_async_migration_payload, algolia_error, import, migration_capacity_exhausted};
-use super::{MigrateError, MigrateFromAlgoliaRequest};
+use super::{MigrateError, MigrateFromAlgoliaRequest, MigrationPublicationMode};
 use dashmap::DashMap;
 use flapjack::index::manager::publication::{
     abort_unjournaled_publication, PublicationPhase, PublicationRepairReport, PublicationTarget,
@@ -75,8 +75,11 @@ impl MigrationJobRunner {
         ) -> Result<R, super::algolia_client::AlgoliaClientError>,
         R: MigrationSourceReader + Send + 'static,
     {
-        let target_index =
-            admit_async_migration_payload(self.replication_manager.as_ref(), &payload)?;
+        let admitted = admit_async_migration_payload(
+            &self.manager,
+            self.replication_manager.as_ref(),
+            &payload,
+        )?;
         let permit = self
             .capacity
             .clone()
@@ -85,15 +88,23 @@ impl MigrationJobRunner {
         let spool = import::spool_for_manager(&self.manager)?;
         let reader = source_factory(&payload).map_err(algolia_error)?;
         let job_uuid = Uuid::new_v4();
+        let publication_semantic = async_publication_semantic(admitted.publication_mode);
         let phase_record = spool
             .create_async_migration_admission_for_owner(
                 job_uuid,
-                &target_index,
+                &admitted.target_index,
                 authenticated_app_id.as_deref(),
+                publication_semantic,
             )
             .map_err(import::spool_error)?;
 
-        self.spawn_import(job_uuid, target_index, reader, permit);
+        self.spawn_import(
+            job_uuid,
+            admitted.target_index,
+            admitted.publication_mode,
+            reader,
+            permit,
+        );
         Ok((job_uuid, phase_record))
     }
 
@@ -128,8 +139,11 @@ impl MigrationJobRunner {
         ) -> Result<R, super::algolia_client::AlgoliaClientError>,
         R: MigrationSourceReader + Send + 'static,
     {
-        let target_index =
-            admit_async_migration_payload(self.replication_manager.as_ref(), &payload)?;
+        let admitted = admit_async_migration_payload(
+            &self.manager,
+            self.replication_manager.as_ref(),
+            &payload,
+        )?;
         let permit = self
             .capacity
             .clone()
@@ -138,15 +152,24 @@ impl MigrationJobRunner {
         let spool = import::spool_for_manager(&self.manager)?;
         let reader = source_factory(&payload).map_err(algolia_error)?;
         let job_uuid = Uuid::new_v4();
+        let publication_semantic = async_publication_semantic(admitted.publication_mode);
         let phase_record = spool
             .create_async_migration_admission_for_owner(
                 job_uuid,
-                &target_index,
+                &admitted.target_index,
                 authenticated_app_id.as_deref(),
+                publication_semantic,
             )
             .map_err(import::spool_error)?;
 
-        self.spawn_import_with_hooks(job_uuid, target_index, reader, permit, hooks);
+        self.spawn_import_with_hooks(
+            job_uuid,
+            admitted.target_index,
+            admitted.publication_mode,
+            reader,
+            permit,
+            hooks,
+        );
         Ok((job_uuid, phase_record))
     }
 
@@ -155,6 +178,7 @@ impl MigrationJobRunner {
         &self,
         job_uuid: Uuid,
         target_index: String,
+        publication_mode: MigrationPublicationMode,
         mut reader: R,
         permit: OwnedSemaphorePermit,
     ) where
@@ -169,6 +193,7 @@ impl MigrationJobRunner {
                 &import_manager,
                 job_uuid,
                 target_index,
+                publication_mode,
                 &mut reader,
             )
             .await
@@ -198,6 +223,7 @@ impl MigrationJobRunner {
         &self,
         job_uuid: Uuid,
         target_index: String,
+        publication_mode: MigrationPublicationMode,
         mut reader: R,
         permit: OwnedSemaphorePermit,
         hooks: import::ImportTestHooks,
@@ -213,6 +239,7 @@ impl MigrationJobRunner {
                 &import_manager,
                 job_uuid,
                 target_index,
+                publication_mode,
                 &mut reader,
                 hooks,
             )
@@ -298,6 +325,25 @@ impl MigrationJobRunner {
                 .recover_cancel_requested_async_job(spool, job_uuid, metadata, publication_reports)
                 .await;
         }
+        if metadata.publication_semantic == AsyncMigrationPublicationSemantic::ReplaceExisting {
+            return self.recover_replacement_async_job(
+                spool,
+                job_uuid,
+                metadata,
+                publication_reports,
+            );
+        }
+        self.recover_create_async_job(spool, job_uuid, metadata, publication_reports)
+            .await
+    }
+
+    async fn recover_create_async_job(
+        &self,
+        spool: &SpoolStore,
+        job_uuid: Uuid,
+        metadata: &AsyncMigrationMetadata,
+        publication_reports: &[PublicationRepairReport],
+    ) -> Result<(), String> {
         let Some(transaction_id) = &metadata.publication_transaction_id else {
             spool
                 .fail_migration(job_uuid)
@@ -306,11 +352,9 @@ impl MigrationJobRunner {
         };
         let report = proven_committed_report(metadata, publication_reports)?;
         if report.transaction_id.as_ref() != Some(transaction_id) {
-            return Err(format!(
-                "async migration recovery refused target '{}' for job {}: publication transaction mismatch",
-                metadata.target_index, job_uuid
-            ));
+            return Err(publication_transaction_mismatch(metadata, job_uuid));
         }
+        validate_recovery_index_name(&metadata.target_index, "target")?;
         self.remove_job_owned_replicas(&metadata.target_index)
             .await?;
         self.manager
@@ -328,7 +372,64 @@ impl MigrationJobRunner {
         Ok(())
     }
 
+    fn recover_replacement_async_job(
+        &self,
+        spool: &SpoolStore,
+        job_uuid: Uuid,
+        metadata: &AsyncMigrationMetadata,
+        publication_reports: &[PublicationRepairReport],
+    ) -> Result<(), String> {
+        let Some(transaction_id) = &metadata.publication_transaction_id else {
+            spool
+                .fail_migration(job_uuid)
+                .map_err(recovery_spool_error)?;
+            return Ok(());
+        };
+        if let Some(report) = publication_report_for_target(metadata, publication_reports) {
+            if report.transaction_id.as_ref() == Some(transaction_id)
+                && report_is_committed_loadable(report)
+            {
+                spool
+                    .fail_migration(job_uuid)
+                    .map_err(recovery_spool_error)?;
+                return Ok(());
+            }
+            if report.transaction_id.is_some() {
+                return Err(publication_transaction_mismatch(metadata, job_uuid));
+            }
+        }
+        abort_async_publication_transaction(&self.manager, metadata, job_uuid, transaction_id)?;
+        spool
+            .fail_migration(job_uuid)
+            .map_err(recovery_spool_error)?;
+        Ok(())
+    }
+
     async fn recover_cancel_requested_async_job(
+        &self,
+        spool: &SpoolStore,
+        job_uuid: Uuid,
+        metadata: &AsyncMigrationMetadata,
+        publication_reports: &[PublicationRepairReport],
+    ) -> Result<(), String> {
+        if metadata.publication_semantic == AsyncMigrationPublicationSemantic::ReplaceExisting {
+            return self.recover_cancel_requested_replacement_async_job(
+                spool,
+                job_uuid,
+                metadata,
+                publication_reports,
+            );
+        }
+        self.recover_cancel_requested_create_async_job(
+            spool,
+            job_uuid,
+            metadata,
+            publication_reports,
+        )
+        .await
+    }
+
+    async fn recover_cancel_requested_create_async_job(
         &self,
         spool: &SpoolStore,
         job_uuid: Uuid,
@@ -346,34 +447,50 @@ impl MigrationJobRunner {
             .find(|report| report.target.as_str() == metadata.target_index)
         {
             if report.transaction_id.as_ref() != Some(transaction_id) {
-                return Err(format!(
-                    "async migration recovery refused target '{}' for job {}: publication transaction mismatch",
-                    metadata.target_index, job_uuid
-                ));
+                return Err(publication_transaction_mismatch(metadata, job_uuid));
             }
-            if report.disposition == PublicationTargetDisposition::Loadable
-                && report.phase == Some(PublicationPhase::Committed)
-            {
+            if report_is_committed_loadable(report) {
                 spool
                     .succeed_migration(job_uuid)
                     .map_err(recovery_spool_error)?;
                 return Ok(());
             }
         }
-        let target = PublicationTarget::new(metadata.target_index.clone()).map_err(|error| {
-            format!(
-                "async migration recovery refused target '{}' for job {}: {error}",
-                metadata.target_index, job_uuid
-            )
-        })?;
-        abort_unjournaled_publication(&self.manager.base_path, target, transaction_id).map_err(
-            |error| {
-                format!(
-                    "async migration recovery failed aborting unjournaled publication '{}' for job {}: {error}",
-                    metadata.target_index, job_uuid
-                )
-            },
-        )?;
+        abort_async_publication_transaction(&self.manager, metadata, job_uuid, transaction_id)?;
+        spool
+            .cancel_migration(job_uuid)
+            .map_err(recovery_spool_error)?;
+        Ok(())
+    }
+
+    fn recover_cancel_requested_replacement_async_job(
+        &self,
+        spool: &SpoolStore,
+        job_uuid: Uuid,
+        metadata: &AsyncMigrationMetadata,
+        publication_reports: &[PublicationRepairReport],
+    ) -> Result<(), String> {
+        let Some(transaction_id) = &metadata.publication_transaction_id else {
+            spool
+                .cancel_migration(job_uuid)
+                .map_err(recovery_spool_error)?;
+            return Ok(());
+        };
+        if let Some(report) = publication_report_for_target(metadata, publication_reports) {
+            if report.transaction_id.as_ref() == Some(transaction_id) {
+                if report_is_committed_loadable(report) {
+                    spool
+                        .succeed_migration(job_uuid)
+                        .map_err(recovery_spool_error)?;
+                    return Ok(());
+                }
+                return Err(publication_transaction_mismatch(metadata, job_uuid));
+            }
+            if report.transaction_id.is_some() && !report_is_committed_loadable(report) {
+                return Err(publication_transaction_mismatch(metadata, job_uuid));
+            }
+        }
+        abort_async_publication_transaction(&self.manager, metadata, job_uuid, transaction_id)?;
         spool
             .cancel_migration(job_uuid)
             .map_err(recovery_spool_error)?;
@@ -403,18 +520,13 @@ fn proven_committed_report<'a>(
     metadata: &AsyncMigrationMetadata,
     publication_reports: &'a [PublicationRepairReport],
 ) -> Result<&'a PublicationRepairReport, String> {
-    let report = publication_reports
-        .iter()
-        .find(|report| report.target.as_str() == metadata.target_index)
-        .ok_or_else(|| {
-            format!(
-                "async migration recovery refused target '{}': missing publication repair report",
-                metadata.target_index
-            )
-        })?;
-    if report.disposition != PublicationTargetDisposition::Loadable
-        || report.phase != Some(PublicationPhase::Committed)
-    {
+    let report = publication_report_for_target(metadata, publication_reports).ok_or_else(|| {
+        format!(
+            "async migration recovery refused target '{}': missing publication repair report",
+            metadata.target_index
+        )
+    })?;
+    if !report_is_committed_loadable(report) {
         return Err(format!(
             "async migration recovery refused target '{}': publication evidence is not a committed loadable target",
             metadata.target_index
@@ -423,10 +535,63 @@ fn proven_committed_report<'a>(
     Ok(report)
 }
 
+fn report_is_committed_loadable(report: &PublicationRepairReport) -> bool {
+    report.disposition == PublicationTargetDisposition::Loadable
+        && report.phase == Some(PublicationPhase::Committed)
+}
+
+fn publication_report_for_target<'a>(
+    metadata: &AsyncMigrationMetadata,
+    publication_reports: &'a [PublicationRepairReport],
+) -> Option<&'a PublicationRepairReport> {
+    publication_reports
+        .iter()
+        .find(|report| report.target.as_str() == metadata.target_index)
+}
+
+fn publication_transaction_mismatch(metadata: &AsyncMigrationMetadata, job_uuid: Uuid) -> String {
+    format!(
+        "async migration recovery refused target '{}' for job {}: publication transaction mismatch",
+        metadata.target_index, job_uuid
+    )
+}
+
+fn abort_async_publication_transaction(
+    manager: &Arc<IndexManager>,
+    metadata: &AsyncMigrationMetadata,
+    job_uuid: Uuid,
+    transaction_id: &flapjack::index::manager::publication::PublicationTransactionId,
+) -> Result<(), String> {
+    let target = PublicationTarget::new(metadata.target_index.clone()).map_err(|error| {
+        format!(
+            "async migration recovery refused target '{}' for job {}: {error}",
+            metadata.target_index, job_uuid
+        )
+    })?;
+    abort_unjournaled_publication(&manager.base_path, target, transaction_id).map_err(|error| {
+        format!(
+            "async migration recovery failed aborting unjournaled publication '{}' for job {}: {error}",
+            metadata.target_index, job_uuid
+        )
+    })
+}
+
+fn async_publication_semantic(
+    publication_mode: MigrationPublicationMode,
+) -> AsyncMigrationPublicationSemantic {
+    match publication_mode {
+        MigrationPublicationMode::CreateOnly => AsyncMigrationPublicationSemantic::CreateOnly,
+        MigrationPublicationMode::ReplaceExisting { .. } => {
+            AsyncMigrationPublicationSemantic::ReplaceExisting
+        }
+    }
+}
+
 fn replica_names_for_primary(
     manager: &Arc<IndexManager>,
     primary: &str,
 ) -> Result<Vec<String>, String> {
+    validate_recovery_index_name(primary, "primary")?;
     let settings_path = manager.base_path.join(primary).join("settings.json");
     let settings = IndexSettings::load(&settings_path).map_err(|error| {
         format!("async migration recovery could not read primary settings for '{primary}': {error}")
@@ -436,13 +601,15 @@ fn replica_names_for_primary(
         .unwrap_or_default()
         .into_iter()
         .map(|entry| {
-            parse_replica_entry(&entry)
+            let name = parse_replica_entry(&entry)
                 .map(|parsed| parsed.name().to_string())
                 .map_err(|error| {
                     format!(
                         "async migration recovery refused primary '{primary}': invalid replica entry '{entry}': {error}"
                     )
-                })
+                })?;
+            validate_recovery_index_name(&name, "replica")?;
+            Ok(name)
         })
         .collect()
 }
@@ -452,6 +619,8 @@ fn replica_is_job_owned(
     replica_name: &str,
     primary: &str,
 ) -> Result<bool, String> {
+    validate_recovery_index_name(replica_name, "replica")?;
+    validate_recovery_index_name(primary, "primary")?;
     let replica_path = manager.base_path.join(replica_name);
     if !replica_path.exists() {
         return Ok(false);
@@ -469,6 +638,12 @@ fn replica_is_job_owned(
         format!("async migration recovery could not read replica '{replica_name}': {error}")
     })?;
     Ok(settings.primary.as_deref() == Some(primary))
+}
+
+fn validate_recovery_index_name(name: &str, role: &str) -> Result<(), String> {
+    PublicationTarget::new(name.to_string())
+        .map(|_| ())
+        .map_err(|error| format!("async migration recovery refused {role} '{name}': {error}"))
 }
 
 fn directory_is_empty(path: &std::path::Path) -> io::Result<bool> {
@@ -576,5 +751,42 @@ mod tests {
             "a submission that never returned 202 must not persist a hidden async job"
         );
         assert_eq!(runner.active_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn replica_names_for_primary_rejects_path_traversal_names() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = Arc::new(IndexManager::new(temp_dir.path()));
+        let escaped_primary = temp_dir.path().join("escaped-primary");
+        std::fs::create_dir(&escaped_primary).unwrap();
+        IndexSettings::default()
+            .save(escaped_primary.join("settings.json"))
+            .unwrap();
+
+        let error = replica_names_for_primary(&manager, "../escaped-primary")
+            .expect_err("recovery should reject traversal before reading sibling paths");
+
+        assert!(error.contains("refused primary '../escaped-primary'"));
+        assert!(escaped_primary.join("settings.json").exists());
+    }
+
+    #[tokio::test]
+    async fn replica_is_job_owned_rejects_path_traversal_names() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = Arc::new(IndexManager::new(temp_dir.path()));
+        let escaped_replica = temp_dir.path().join("escaped-replica");
+        std::fs::create_dir(&escaped_replica).unwrap();
+        IndexSettings {
+            primary: Some("primary".to_string()),
+            ..Default::default()
+        }
+        .save(escaped_replica.join("settings.json"))
+        .unwrap();
+
+        let error = replica_is_job_owned(&manager, "../escaped-replica", "primary")
+            .expect_err("recovery should reject traversal before inspecting sibling replicas");
+
+        assert!(error.contains("refused replica '../escaped-replica'"));
+        assert!(escaped_replica.join("settings.json").exists());
     }
 }

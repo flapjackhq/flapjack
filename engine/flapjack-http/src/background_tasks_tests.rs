@@ -5,7 +5,8 @@
         MIGRATION_SPOOL_GC_INTERVAL_ENV,
     };
     use crate::handlers::migration::spool::{
-        MigrationDisposition, ResourceDenominators, SpoolLimits, SpoolStore,
+        AsyncMigrationPublicationSemantic, MigrationDisposition, ResourceDenominators, SpoolLimits,
+        SpoolStore,
     };
     use crate::test_helpers::{restore_env_var, with_env_var, TestStateBuilder, ENV_MUTEX};
     use crate::usage_persistence::UsagePersistence;
@@ -265,7 +266,7 @@
 
     fn seed_expired_gc_job(store: &SpoolStore, job_uuid: uuid::Uuid) -> GcJobFixture {
         store
-            .create_async_migration_admission(job_uuid, "target-index")
+            .create_async_migration_admission(job_uuid, "target-index", AsyncMigrationPublicationSemantic::CreateOnly)
             .unwrap();
         store
             .create_export(

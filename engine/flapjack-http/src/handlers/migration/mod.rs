@@ -78,8 +78,8 @@ pub struct MigrateFromAlgoliaRequest {
     #[serde(rename = "targetIndex")]
     pub target_index: Option<String>,
 
-    /// Replace the target index only on the node-local synchronous endpoint.
-    /// Async migration and HA imports still refuse overwrite requests.
+    /// Replace the target index only on node-local migration endpoints. HA
+    /// imports still refuse overwrite requests.
     #[serde(default)]
     pub overwrite: bool,
 }
@@ -337,10 +337,10 @@ pub async fn migrate_from_algolia(
     migrate_from_algolia_impl(state, payload, algolia_source_reader).await
 }
 
-/// Additive async Algolia migration submission endpoint.
+/// Async Algolia migration submission endpoint.
 ///
-/// This route admits create-only migration requests, immediately returns the
-/// durable admission snapshot, and explicitly refuses `overwrite=true`.
+/// This route admits node-local create or replace migration requests and
+/// immediately returns the durable admission snapshot.
 #[utoipa::path(
     post,
     path = "/1/migrations/algolia",
@@ -777,20 +777,20 @@ fn admit_migration_request(
     state: &AppState,
     payload: &MigrateFromAlgoliaRequest,
 ) -> Result<AdmittedMigration, MigrateError> {
-    admit_sync_migration_payload(&state.manager, state.replication_manager.as_ref(), payload)
+    admit_migration_payload(&state.manager, state.replication_manager.as_ref(), payload)
 }
 
-fn admit_sync_migration_payload(
+fn admit_migration_payload(
     manager: &Arc<flapjack::IndexManager>,
     replication_manager: Option<&Arc<flapjack_replication::manager::ReplicationManager>>,
     payload: &MigrateFromAlgoliaRequest,
 ) -> Result<AdmittedMigration, MigrateError> {
     validate_migration_request(payload)?;
     let target_index = migration_target_index(payload).to_string();
+    if replication_manager.is_some_and(|manager| manager.peer_count() > 0) {
+        return Err(migration_ha_unsupported());
+    }
     if payload.overwrite {
-        if replication_manager.is_some_and(|manager| manager.peer_count() > 0) {
-            return Err(migration_overwrite_unsupported());
-        }
         let staging_baseline = manager
             .capture_replacement_staging_baseline(&target_index)
             .map_err(|error| json_error_parts(StatusCode::BAD_REQUEST, error.to_string()))?;
@@ -799,12 +799,6 @@ fn admit_sync_migration_payload(
             publication_mode: MigrationPublicationMode::ReplaceExisting { staging_baseline },
         });
     }
-    // Persistent v1 HA safety boundary. This guard remains unless ROADMAP.md
-    // MIG-7 supplies a costed convergence protocol for the node-local
-    // publication guarantee in engine/src/index/manager/publication.rs:11.
-    if replication_manager.is_some_and(|manager| manager.peer_count() > 0) {
-        return Err(migration_ha_unsupported());
-    }
     Ok(AdmittedMigration {
         target_index,
         publication_mode: MigrationPublicationMode::CreateOnly,
@@ -812,17 +806,11 @@ fn admit_sync_migration_payload(
 }
 
 pub(super) fn admit_async_migration_payload(
+    manager: &Arc<flapjack::IndexManager>,
     replication_manager: Option<&Arc<flapjack_replication::manager::ReplicationManager>>,
     payload: &MigrateFromAlgoliaRequest,
-) -> Result<String, MigrateError> {
-    validate_migration_request(payload)?;
-    if payload.overwrite {
-        return Err(migration_overwrite_unsupported());
-    }
-    if replication_manager.is_some_and(|manager| manager.peer_count() > 0) {
-        return Err(migration_ha_unsupported());
-    }
-    Ok(migration_target_index(payload).to_string())
+) -> Result<AdmittedMigration, MigrateError> {
+    admit_migration_payload(manager, replication_manager, payload)
 }
 
 fn algolia_source_reader(
@@ -863,13 +851,6 @@ fn migration_ha_unsupported() -> MigrateError {
         StatusCode::SERVICE_UNAVAILABLE,
         MIGRATION_HA_UNSUPPORTED_CODE,
         MIGRATION_HA_UNSUPPORTED_MESSAGE,
-    )
-}
-
-pub(super) fn migration_overwrite_unsupported() -> MigrateError {
-    json_error_parts(
-        StatusCode::BAD_REQUEST,
-        "overwrite=true is not supported by Algolia migration import",
     )
 }
 
