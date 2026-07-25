@@ -81,7 +81,7 @@ impl Document {
 ///
 /// # Returns
 ///
-/// `Some(field_value)` if the value can be converted (boolean, string, number, non-empty array, or non-empty object); `None` if the value is JSON null, or becomes empty after recursive filtering. Numeric JSON values are converted to Integer if they fit in i64; otherwise Float.
+/// `Some(field_value)` if the value can be converted (boolean, string, number, array, or non-empty object); `None` if the value is JSON null, or becomes empty after recursive filtering. Explicit empty arrays are preserved as customer content. Numeric JSON values are converted to Integer if they fit in i64; otherwise Float.
 pub fn json_value_to_field_value(val: &serde_json::Value) -> Option<FieldValue> {
     match val {
         serde_json::Value::Bool(b) => Some(FieldValue::Bool(*b)),
@@ -94,6 +94,10 @@ pub fn json_value_to_field_value(val: &serde_json::Value) -> Option<FieldValue> 
             }
         }
         serde_json::Value::Array(arr) => {
+            // This conversion owner treats an explicit customer `[]` as content.
+            if arr.is_empty() {
+                return Some(FieldValue::Array(Vec::new()));
+            }
             let items: Vec<FieldValue> = arr.iter().filter_map(json_value_to_field_value).collect();
             if items.is_empty() {
                 None
@@ -519,8 +523,16 @@ mod tests {
     }
 
     #[test]
-    fn json_empty_array_returns_none() {
-        assert_eq!(json_value_to_field_value(&serde_json::json!([])), None);
+    fn json_empty_array_preserves_customer_content() {
+        assert_eq!(
+            json_value_to_field_value(&serde_json::json!([])),
+            Some(FieldValue::Array(Vec::new()))
+        );
+    }
+
+    #[test]
+    fn json_array_with_only_nulls_returns_none() {
+        assert_eq!(json_value_to_field_value(&serde_json::json!([null])), None);
     }
 
     #[test]

@@ -435,7 +435,9 @@ fn owned_value_to_fields(
 
 /// Convert a single Tantivy `OwnedValue` into a `FieldValue`.
 ///
-/// Returns `None` for `Null` and unrecognized variants. `U64` values are cast to `i64`.
+/// Returns `None` for `Null`, unrecognized variants, and nonempty arrays or objects
+/// reduced to empty by recursive filtering. Explicit empty arrays are preserved as
+/// customer content. `U64` values are cast to `i64`.
 fn owned_to_field_value(value: &OwnedValue) -> Option<FieldValue> {
     match value {
         OwnedValue::Null => None,
@@ -445,6 +447,10 @@ fn owned_to_field_value(value: &OwnedValue) -> Option<FieldValue> {
         OwnedValue::F64(f) => Some(FieldValue::Float(*f)),
         OwnedValue::Bool(b) => Some(FieldValue::Bool(*b)),
         OwnedValue::Array(arr) => {
+            // This conversion owner treats an explicit customer `[]` as content.
+            if arr.is_empty() {
+                return Some(FieldValue::Array(Vec::new()));
+            }
             let items: Vec<FieldValue> = arr.iter().filter_map(owned_to_field_value).collect();
             if items.is_empty() {
                 None
@@ -654,9 +660,12 @@ mod tests {
     }
 
     #[test]
-    fn owned_empty_array_returns_none() {
+    fn owned_empty_array_preserves_customer_content() {
         let arr = OwnedValue::Array(vec![]);
-        assert!(owned_to_field_value(&arr).is_none());
+        assert_eq!(
+            owned_to_field_value(&arr),
+            Some(FieldValue::Array(Vec::new()))
+        );
     }
 
     #[test]

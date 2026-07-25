@@ -75,3 +75,51 @@ async fn empty_query_search_preserves_boolean_fields() {
     assert_eq!(hits_by_id["helm-live-b"]["price"], 29);
     assert_eq!(hits_by_id["helm-live-b"]["featured"], false);
 }
+
+#[tokio::test]
+async fn empty_query_search_preserves_empty_array_fields() {
+    let (app, _dir) = build_test_app_for_local_requests(None);
+
+    let (write_status, write_body) = send_json(
+        &app,
+        Method::POST,
+        "/1/indexes/empty_array_roundtrip/batch",
+        "test-key",
+        Some(json!({
+            "requests": [
+                {
+                    "action": "addObject",
+                    "body": {
+                        "objectID": "empty-array-contract",
+                        "name": "Empty Array Contract",
+                        "tags": []
+                    }
+                }
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    wait_for_task_local(&app, extract_task_id(&write_body)).await;
+
+    let (search_status, search_body) = send_json(
+        &app,
+        Method::POST,
+        "/1/indexes/empty_array_roundtrip/query",
+        "test-key",
+        Some(json!({"query": ""})),
+    )
+    .await;
+    assert_eq!(search_status, StatusCode::OK);
+    assert_eq!(search_body["nbHits"], 1);
+
+    let hits = search_body["hits"]
+        .as_array()
+        .expect("hits must be an array");
+    assert_eq!(hits.len(), 1, "search must return exactly one hit");
+    let hit = hits.first().expect("one hit must be returned");
+
+    assert_eq!(hit["objectID"], "empty-array-contract");
+    assert_eq!(hit["name"], "Empty Array Contract");
+    assert_eq!(hit.get("tags"), Some(&json!([])));
+}
