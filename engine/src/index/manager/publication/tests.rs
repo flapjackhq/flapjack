@@ -40,6 +40,82 @@ fn prepared_journal() -> PublicationJournal {
     )
 }
 
+fn write_generation_journal(
+    base: &std::path::Path,
+    target_name: &str,
+    transaction_name: &str,
+    generation: &str,
+    event: Option<PublicationEvent>,
+) -> PublicationPaths {
+    let target = PublicationTarget::new(target_name).unwrap();
+    let transaction = PublicationTransactionId::new(transaction_name).unwrap();
+    let paths = PublicationPaths::new(base, &target, &transaction);
+    let mut journal = PublicationJournal::prepare(
+        transaction,
+        target,
+        PublicationGenerationEvidence::new(generation).unwrap(),
+        digest(),
+        paths.clone(),
+    );
+    if let Some(event) = event {
+        journal = journal.apply(event).unwrap();
+    }
+    std::fs::create_dir_all(paths.journal.parent().unwrap()).unwrap();
+    std::fs::write(paths.journal.clone(), journal.to_json_value().to_string()).unwrap();
+    paths
+}
+
+#[test]
+fn privacy_scrub_generation_evidence_requires_one_committed_current_journal() {
+    let tmp = TempDir::new().unwrap();
+    let target = PublicationTarget::new("products").unwrap();
+    let expected = PublicationGenerationEvidence::new("generation_1").unwrap();
+
+    let missing = verify_current_generation_evidence(tmp.path(), &target, &expected)
+        .expect_err("missing journal evidence must fail closed")
+        .to_string();
+    assert!(missing.contains("missing current journal"), "{missing}");
+
+    let prepared =
+        write_generation_journal(tmp.path(), "products", "txn_prepared", "generation_1", None);
+    let non_committed = verify_current_generation_evidence(tmp.path(), &target, &expected)
+        .expect_err("prepared journal evidence must fail closed")
+        .to_string();
+    assert!(non_committed.contains("not committed"), "{non_committed}");
+    std::fs::remove_dir_all(prepared.journal.parent().unwrap()).unwrap();
+
+    write_generation_journal(
+        tmp.path(),
+        "products",
+        "txn_committed",
+        "generation_1",
+        Some(PublicationEvent::Commit),
+    );
+    verify_current_generation_evidence(tmp.path(), &target, &expected)
+        .expect("one committed matching journal should be accepted");
+
+    let stale = PublicationGenerationEvidence::new("generation_2").unwrap();
+    let stale_error = verify_current_generation_evidence(tmp.path(), &target, &stale)
+        .expect_err("stale generation evidence must fail closed")
+        .to_string();
+    assert!(stale_error.contains("stale generation"), "{stale_error}");
+
+    write_generation_journal(
+        tmp.path(),
+        "products",
+        "txn_second",
+        "generation_1",
+        Some(PublicationEvent::Commit),
+    );
+    let ambiguous = verify_current_generation_evidence(tmp.path(), &target, &expected)
+        .expect_err("ambiguous committed journals must fail closed")
+        .to_string();
+    assert!(
+        ambiguous.contains("expected exactly one committed current journal"),
+        "{ambiguous}"
+    );
+}
+
 #[test]
 fn reserved_namespace_classifier_recognizes_publication_evidence_paths() {
     for relative in [

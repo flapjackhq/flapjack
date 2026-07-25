@@ -25,6 +25,8 @@ use flapjack::types::Document;
 use flapjack::IndexManager;
 use serde_json::Value;
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -36,6 +38,8 @@ use std::sync::Barrier;
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+#[cfg(test)]
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 const MIGRATION_CANCELLED_CODE: &str = "migration_cancelled";
@@ -70,6 +74,85 @@ pub(super) struct ImportTestHooks {
     before_document_batch_write: Option<BeforeDocumentBatchWriteHook>,
     before_activation: Option<BeforeActivationHook>,
     before_replica_materialization: Option<BeforeReplicaMaterializationHook>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PrivacyScrubBoundary {
+    PreIntent,
+    PostIntent,
+    EngineCommit,
+    PreAck,
+    ResponseLoss,
+    Restart,
+    AckReplay,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct PrivacyScrubBoundaryControl {
+    pub(super) observed: Notify,
+    pub(super) release: Notify,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub struct PrivacyScrubTestHooks {
+    enabled: HashSet<PrivacyScrubBoundary>,
+    pre_intent: PrivacyScrubBoundaryControl,
+    post_intent: PrivacyScrubBoundaryControl,
+    engine_commit: PrivacyScrubBoundaryControl,
+    pre_ack: PrivacyScrubBoundaryControl,
+    response_loss: PrivacyScrubBoundaryControl,
+    restart: PrivacyScrubBoundaryControl,
+    ack_replay: PrivacyScrubBoundaryControl,
+}
+
+#[cfg(test)]
+impl PrivacyScrubBoundary {
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::PreIntent => "pre_intent",
+            Self::PostIntent => "post_intent",
+            Self::EngineCommit => "engine_commit",
+            Self::PreAck => "pre_ack",
+            Self::ResponseLoss => "response_loss",
+            Self::Restart => "restart",
+            Self::AckReplay => "ack_replay",
+        }
+    }
+}
+
+#[cfg(test)]
+impl PrivacyScrubTestHooks {
+    pub(super) fn with_boundaries(
+        mut self,
+        boundaries: impl IntoIterator<Item = PrivacyScrubBoundary>,
+    ) -> Self {
+        self.enabled.extend(boundaries);
+        self
+    }
+
+    pub(super) fn control(&self, boundary: PrivacyScrubBoundary) -> &PrivacyScrubBoundaryControl {
+        match boundary {
+            PrivacyScrubBoundary::PreIntent => &self.pre_intent,
+            PrivacyScrubBoundary::PostIntent => &self.post_intent,
+            PrivacyScrubBoundary::EngineCommit => &self.engine_commit,
+            PrivacyScrubBoundary::PreAck => &self.pre_ack,
+            PrivacyScrubBoundary::ResponseLoss => &self.response_loss,
+            PrivacyScrubBoundary::Restart => &self.restart,
+            PrivacyScrubBoundary::AckReplay => &self.ack_replay,
+        }
+    }
+
+    pub(super) async fn wait_at(&self, boundary: PrivacyScrubBoundary) {
+        if !self.enabled.contains(&boundary) {
+            return;
+        }
+        let control = self.control(boundary);
+        control.observed.notify_one();
+        control.release.notified().await;
+    }
 }
 
 #[cfg(test)]
@@ -1083,7 +1166,8 @@ pub(super) fn spool_error(error: SpoolError) -> MigrateError {
         | SpoolErrorKind::JobTerminal
         | SpoolErrorKind::JobNotAccepted
         | SpoolErrorKind::UnsupportedArtifactKind
-        | SpoolErrorKind::InvalidPhaseTransition => StatusCode::BAD_REQUEST,
+        | SpoolErrorKind::InvalidPhaseTransition
+        | SpoolErrorKind::PrivacyScrubIntentCollision => StatusCode::BAD_REQUEST,
         SpoolErrorKind::JobDeleting => StatusCode::CONFLICT,
         SpoolErrorKind::Io | SpoolErrorKind::ManifestCorrupt => StatusCode::INTERNAL_SERVER_ERROR,
     };

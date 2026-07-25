@@ -6,6 +6,42 @@ const CLUSTER_STATUS_RESPONSE_SCHEMA: &str = "#/components/schemas/ClusterStatus
 const CLUSTER_STATUS_STANDALONE_SCHEMA: &str =
     "#/components/schemas/ClusterStatusStandaloneResponse";
 const CLUSTER_STATUS_HA_SCHEMA: &str = "#/components/schemas/ClusterStatusHaResponse";
+const BATCH_SIZE_LIMIT_DESCRIPTION: &str = "Batch or record exceeds configured size limits";
+const RECORD_SIZE_LIMIT_DESCRIPTION: &str = "Record exceeds configured size limit";
+
+#[test]
+fn request_size_413_responses_are_documented() {
+    let doc = openapi_json();
+    let expectations = [
+        (
+            "/1/indexes/{indexName}/batch",
+            "413",
+            BATCH_SIZE_LIMIT_DESCRIPTION,
+        ),
+        (
+            "/1/indexes/{indexName}",
+            "413",
+            RECORD_SIZE_LIMIT_DESCRIPTION,
+        ),
+    ];
+    let mismatches = expectations
+        .iter()
+        .filter_map(|(path, status, expected_description)| {
+            let actual = post_response_description(&doc, path, status);
+            (actual != Some(*expected_description)).then(|| {
+                format!(
+                    "POST {path} {status} response description was {actual:?}, expected {expected_description:?}"
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        mismatches.is_empty(),
+        "OpenAPI request-size response mismatches: {}",
+        mismatches.join("; ")
+    );
+}
 
 /// Stage 7: Verify insights endpoints appear in the generated spec.
 #[test]
@@ -47,9 +83,57 @@ fn migration_endpoints_are_documented() {
     assert_migration_operation_uses_api_key(&doc, "/1/migrations/algolia/{job_id}/cancel", "post");
     assert_async_migration_cancel_documents_contract(&doc);
 
+    assert_path_exists(&doc, "/1/migrations/algolia/{job_id}/acknowledge");
+    assert_path_method(&doc, "/1/migrations/algolia/{job_id}/acknowledge", "post");
+    assert_migration_operation_uses_api_key(
+        &doc,
+        "/1/migrations/algolia/{job_id}/acknowledge",
+        "post",
+    );
+
     assert_path_exists(&doc, "/1/algolia-list-indexes");
     assert_path_method(&doc, "/1/algolia-list-indexes", "post");
     assert_migration_operation_uses_api_key(&doc, "/1/algolia-list-indexes", "post");
+}
+
+#[test]
+fn privacy_scrub_auth_openapi_uses_private_migration_security_only() {
+    let doc = openapi_json();
+    let path = "/1/migrations/privacy-scrub";
+
+    if doc
+        .pointer("/paths/~11~1migrations~1privacy-scrub")
+        .is_none()
+    {
+        return;
+    }
+
+    assert_path_method(&doc, path, "post");
+
+    let security = doc
+        .pointer("/paths/~11~1migrations~1privacy-scrub/post/security")
+        .and_then(|value| value.as_array())
+        .expect("privacy scrub operation should document its private security requirement");
+    assert!(
+        !security.is_empty(),
+        "privacy scrub must not document anonymous access with an empty security array"
+    );
+    assert!(
+        security.iter().all(|entry| {
+            entry.as_object().is_some_and(|requirement| {
+                requirement.len() == 1
+                    && requirement.get("private_migration").is_some_and(|scopes| {
+                        scopes.as_array().is_some_and(|scopes| scopes.is_empty())
+                    })
+            })
+        }),
+        "every privacy scrub security alternative must require only private_migration; empty or public alternatives would permit unintended access"
+    );
+    assert!(
+        doc.pointer("/components/securitySchemes/private_migration")
+            .is_some(),
+        "documented privacy scrub security must reference a defined private_migration scheme"
+    );
 }
 
 fn assert_migration_operation_uses_api_key(doc: &serde_json::Value, path: &str, method: &str) {
@@ -784,6 +868,18 @@ fn assert_get_response_ref(doc: &serde_json::Value, path: &str, expected_schema:
     );
 }
 
+fn post_response_description<'a>(
+    doc: &'a serde_json::Value,
+    path: &str,
+    status: &str,
+) -> Option<&'a str> {
+    let escaped_path = path.replace('/', "~1");
+    doc.pointer(&format!(
+        "/paths/{escaped_path}/post/responses/{status}/description"
+    ))
+    .and_then(|value| value.as_str())
+}
+
 fn assert_get_operation_uses_api_key(doc: &serde_json::Value, path: &str) {
     let escaped_path = path.replace('/', "~1");
     let security = doc
@@ -932,8 +1028,9 @@ fn openapi_documents_only_canonical_internal_contracts() {
     );
 }
 
-/// Security review: all documented customer-facing endpoints (everything except `/health`)
-/// must declare a security requirement referencing the `api_key` scheme.
+/// Security review: every documented non-health endpoint must declare its expected
+/// security scheme. Customer-facing endpoints use `api_key`; the optional private
+/// privacy-scrub command uses only `private_migration`.
 #[test]
 fn all_non_health_endpoints_require_api_key_security() {
     let doc = openapi_json();
@@ -955,27 +1052,36 @@ fn all_non_health_endpoints_require_api_key_security() {
             {
                 continue;
             }
-            let has_api_key = operation
+            let expected_scheme = if path_key == "/1/migrations/privacy-scrub" {
+                "private_migration"
+            } else {
+                "api_key"
+            };
+            let has_expected_security = operation
                 .get("security")
                 .and_then(|s| s.as_array())
                 .map(|arr| {
                     arr.iter().any(|item| {
                         item.as_object()
-                            .map(|obj| obj.contains_key("api_key"))
+                            .map(|obj| obj.contains_key(expected_scheme))
                             .unwrap_or(false)
                     })
                 })
                 .unwrap_or(false);
 
-            if !has_api_key {
-                missing_security.push(format!("{} {}", method.to_uppercase(), path_key));
+            if !has_expected_security {
+                missing_security.push(format!(
+                    "{} {} ({expected_scheme})",
+                    method.to_uppercase(),
+                    path_key
+                ));
             }
         }
     }
 
     assert!(
         missing_security.is_empty(),
-        "endpoints missing api_key security requirement: {:?}",
+        "endpoints missing their expected security requirement: {:?}",
         missing_security
     );
 }

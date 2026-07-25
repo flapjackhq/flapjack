@@ -156,8 +156,8 @@ impl FlapjackError {
     // IndexAlreadyExists                                      | 409  | Conflict with existing resource
     // InvalidQuery, QueryTooComplex, InvalidSchema,           | 400  | Client payload/query contract violation
     // MissingField, TypeMismatch, FieldNotFound,              |      |
-    // BufferSizeExceeded, DocumentTooLarge, BatchTooLarge,    |      |
-    // InvalidDocument, QueryParse, Json                       |      |
+    // BufferSizeExceeded, InvalidDocument, QueryParse, Json   |      |
+    // DocumentTooLarge, BatchTooLarge                         | 413  | Request-size contract violation
     // QueueFull                                               | 429  | Backpressure/rate limiting
     // Forbidden                                               | 403  | Authenticated but not authorized
     // TooManyConcurrentWrites, MemoryPressure, IndexPaused,   | 503  | Temporary service unavailability/retryable
@@ -169,6 +169,7 @@ impl FlapjackError {
     /// - **404** — missing resource (`TenantNotFound`, `TaskNotFound`, `ObjectNotFound`)
     /// - **409** — conflict (`IndexAlreadyExists`)
     /// - **400** — client contract violations (invalid query, schema, document, parse errors)
+    /// - **413** — request-size violations (`DocumentTooLarge`, `BatchTooLarge`)
     /// - **429** — backpressure (`QueueFull`)
     /// - **403** — authorization failure (`Forbidden`)
     /// - **503** — temporary unavailability (`TooManyConcurrentWrites`, `MemoryPressure`, `IndexPaused`)
@@ -189,8 +190,8 @@ impl FlapjackError {
             FlapjackError::FieldNotFound(_) => StatusCode::BAD_REQUEST,
             FlapjackError::TooManyConcurrentWrites { .. } => StatusCode::SERVICE_UNAVAILABLE,
             FlapjackError::BufferSizeExceeded { .. } => StatusCode::BAD_REQUEST,
-            FlapjackError::DocumentTooLarge { .. } => StatusCode::BAD_REQUEST,
-            FlapjackError::BatchTooLarge { .. } => StatusCode::BAD_REQUEST,
+            FlapjackError::DocumentTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            FlapjackError::BatchTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             FlapjackError::TaskNotFound(_) => StatusCode::NOT_FOUND,
             FlapjackError::ObjectNotFound => StatusCode::NOT_FOUND,
             FlapjackError::QueueFull => StatusCode::TOO_MANY_REQUESTS,
@@ -273,12 +274,21 @@ mod tests {
     }
 
     #[test]
-    fn document_too_large_is_400() {
+    fn document_too_large_is_413() {
         let e = FlapjackError::DocumentTooLarge {
             size: 4_000_000,
             max: 3_145_728,
         };
-        assert_eq!(e.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(e.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn batch_too_large_is_413() {
+        let e = FlapjackError::BatchTooLarge {
+            size: 10_001,
+            max: 10_000,
+        };
+        assert_eq!(e.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]

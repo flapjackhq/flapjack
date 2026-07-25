@@ -1,14 +1,16 @@
 use super::{
     import::{
         wait_for_live_import_barrier_with_timeout, ImportTestHooks, LiveImportBarrier,
-        LIVE_IMPORT_BARRIER_OBSERVED_FILE, LIVE_IMPORT_BARRIER_RELEASE_FILE,
-        LIVE_IMPORT_POST_COMMIT_BARRIER_DIR_ENV, LIVE_IMPORT_POST_COMMIT_SOURCE_ENV,
-        LIVE_IMPORT_PRE_ACTIVATION_BARRIER_DIR_ENV, LIVE_IMPORT_PRE_ACTIVATION_SOURCE_ENV,
+        PrivacyScrubBoundary, PrivacyScrubTestHooks, LIVE_IMPORT_BARRIER_OBSERVED_FILE,
+        LIVE_IMPORT_BARRIER_RELEASE_FILE, LIVE_IMPORT_POST_COMMIT_BARRIER_DIR_ENV,
+        LIVE_IMPORT_POST_COMMIT_SOURCE_ENV, LIVE_IMPORT_PRE_ACTIVATION_BARRIER_DIR_ENV,
+        LIVE_IMPORT_PRE_ACTIVATION_SOURCE_ENV,
     },
     migrate_from_algolia_with_test_source_factory,
     migrate_from_algolia_with_test_source_factory_and_hooks, MigrateFromAlgoliaRequest,
     MigrateFromAlgoliaResponse, MIGRATION_HA_UNSUPPORTED_CODE, MIGRATION_HA_UNSUPPORTED_MESSAGE,
 };
+use crate::auth::{ApiKey, KeyStore, PRIVATE_MIGRATION_ACL};
 use crate::handlers::indices::list_indices;
 use crate::handlers::migration::algolia_client::{
     AlgoliaClientError, AlgoliaErrorKind, AlgoliaIndexRecord,
@@ -23,12 +25,17 @@ use crate::handlers::migration::spool::{
 };
 use crate::test_helpers::{body_json, EnvVarRestoreGuard, TestStateBuilder, ENV_MUTEX};
 use axum::{
-    extract::{Query, State},
-    http::StatusCode,
+    body::Body,
+    extract::{Extension, Query, State},
+    http::{Method, Request, StatusCode},
     response::IntoResponse,
     Json,
 };
-use flapjack::index::manager::publication::{PublicationPaths, PublicationTarget};
+use flapjack::analytics::{AnalyticsCollector, AnalyticsConfig};
+use flapjack::index::manager::publication::{
+    ContentDigest, PublicationEvent, PublicationGenerationEvidence, PublicationJournal,
+    PublicationPaths, PublicationTarget, PublicationTransactionId,
+};
 use flapjack::{
     error::FlapjackError,
     types::{Document, FieldValue},
@@ -38,6 +45,7 @@ use flapjack_replication::{
     manager::ReplicationManager,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -51,6 +59,7 @@ use std::{
 };
 use tempfile::TempDir;
 use tokio::sync::Notify;
+use tower::ServiceExt;
 
 #[path = "import_contract_recovery_tests.rs"]
 mod import_contract_recovery_tests;
@@ -60,9 +69,10 @@ mod import_contract_replica_tests;
 mod import_contract_test_support;
 use import_contract_test_support::{
     assert_no_retained_accepted_spool_document_artifacts, assert_object_fields,
-    assert_preexisting_target_resources, assert_query_returns_document,
-    assert_spool_lifecycle_with_artifacts, assert_target_absent_from_disk_and_list,
-    directory_snapshot, query_hit_count, seed_preexisting_target_resources,
+    assert_preexisting_target_resources, assert_preexisting_target_resources_exactly_absent,
+    assert_query_returns_document, assert_spool_lifecycle_with_artifacts,
+    assert_target_absent_from_disk_and_list, directory_snapshot, query_hit_count,
+    seed_preexisting_target_resources,
 };
 
 const SOURCE_APP_ID: &str = "LOCALMIGRATIONTEST";
@@ -74,6 +84,13 @@ const EXPECTED_DOCUMENTS: [(&str, &str, &str); 2] = [
     ("doc-2", "Velvet compass", "navigation"),
 ];
 const LIVE_IMPORT_BARRIER_SOURCE: &str = "live-import-barrier-source";
+const PRIVACY_SCRUB_ROUTE: &str = "/1/migrations/privacy-scrub";
+const PRIVACY_SCRUB_ID: &str = "privacy-scrub-stable-contract-id";
+const PRIVACY_SCRUB_TARGET: &str = "privacy_scrub_contract_target";
+const PRIVACY_SCRUB_CURRENT_GENERATION: &str = "generation-current";
+const PRIVACY_SCRUB_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(2);
+const PRIVACY_SCRUB_OWNER_APP_ID: &str = "privacy-scrub-contract-app";
+const PRIVACY_SCRUB_INTENT_FILE: &str = "privacy_scrub_intent.json";
 
 // Closed crash-safety matrix (5/5 public/test-local failure seams):
 // 1. translation hard rejection;
@@ -81,6 +98,753 @@ const LIVE_IMPORT_BARRIER_SOURCE: &str = "live-import-barrier-source";
 // 3. staging document writer failure;
 // 4. source read failure after a committed page;
 // 5. prepared staging handle dropped by a pre-activation unwind.
+
+fn privacy_scrub_payload(scrub_id: &str, expected_generation: &str) -> serde_json::Value {
+    json!({
+        "scrubId": scrub_id,
+        "tenant": PRIVACY_SCRUB_TARGET,
+        "expectedGeneration": expected_generation,
+        "objectIDs": ["kept-1"],
+        "synonymIDs": ["kept-synonym"],
+        "ruleIDs": ["kept-rule"]
+    })
+}
+
+fn privacy_scrub_private_key(key_store: &KeyStore) -> String {
+    let key = ApiKey {
+        hash: String::new(),
+        salt: String::new(),
+        hmac_key: None,
+        created_at: 0,
+        acl: vec![PRIVATE_MIGRATION_ACL.to_string()],
+        description: "Private privacy scrub test key".to_string(),
+        indexes: vec![],
+        max_hits_per_query: 0,
+        max_queries_per_ip_per_hour: 0,
+        query_parameters: String::new(),
+        referers: vec![],
+        restrict_sources: None,
+        validity: 0,
+    };
+    key_store.create_key(key).1
+}
+
+fn privacy_scrub_owner_identity(api_key: &str) -> String {
+    format!(
+        "{PRIVACY_SCRUB_OWNER_APP_ID}:{}",
+        hex::encode(Sha256::digest(api_key.as_bytes()))
+    )
+}
+
+fn write_current_generation_evidence(base: &Path, target_index: &str, generation: &str) {
+    let target = PublicationTarget::new(target_index).unwrap();
+    let transaction = PublicationTransactionId::new(format!("{target_index}_current_gen")).unwrap();
+    let paths = PublicationPaths::new(base, &target, &transaction);
+    let journal = PublicationJournal::prepare(
+        transaction,
+        target,
+        PublicationGenerationEvidence::new(generation).unwrap(),
+        ContentDigest::new(format!("sha256:{}", "0".repeat(64))).unwrap(),
+        paths.clone(),
+    )
+    .apply(PublicationEvent::Commit)
+    .unwrap();
+
+    fs::create_dir_all(paths.journal.parent().unwrap()).unwrap();
+    fs::write(paths.journal, journal.to_json_value().to_string()).unwrap();
+}
+
+fn seed_privacy_scrub_intent_fixture(
+    base: &Path,
+    owner_identity: &str,
+    scrub_id: &str,
+    expected_generation: &str,
+    phase: MigrationPhase,
+) -> uuid::Uuid {
+    let spool = SpoolStore::new(base, SpoolLimits::default()).unwrap();
+    let job_uuid = uuid::Uuid::new_v4();
+    spool
+        .create_async_migration_admission_for_owner(
+            job_uuid,
+            PRIVACY_SCRUB_TARGET,
+            Some(owner_identity),
+        )
+        .unwrap();
+    for next_phase in [
+        MigrationPhase::Exporting,
+        MigrationPhase::Preparing,
+        MigrationPhase::Staging,
+        MigrationPhase::Activating,
+    ] {
+        if next_phase.order_for_privacy_scrub_test() > phase.order_for_privacy_scrub_test() {
+            break;
+        }
+        spool
+            .transition_migration_phase(job_uuid, next_phase)
+            .unwrap();
+    }
+    let intent = json!({
+        "kind": "privacy_scrub_intent",
+        "scrubId": scrub_id,
+        "tenant": PRIVACY_SCRUB_TARGET,
+        "expectedGeneration": expected_generation,
+        "objectIDs": ["kept-1"],
+        "synonymIDs": ["kept-synonym"],
+        "ruleIDs": ["kept-rule"],
+        "authenticatedAppId": owner_identity,
+        "createdAt": "2026-07-24T00:00:00Z"
+    });
+    fs::write(
+        spool.job_dir(job_uuid).join(PRIVACY_SCRUB_INTENT_FILE),
+        intent.to_string(),
+    )
+    .unwrap();
+    job_uuid
+}
+
+fn read_privacy_scrub_intent(spool: &SpoolStore, job_uuid: uuid::Uuid) -> serde_json::Value {
+    let bytes = fs::read(spool.job_dir(job_uuid).join(PRIVACY_SCRUB_INTENT_FILE))
+        .expect("privacy scrub intent must be durable in the migration spool");
+    serde_json::from_slice(&bytes).expect("privacy scrub intent must be valid JSON")
+}
+
+fn assert_privacy_scrub_intent(
+    intent: &serde_json::Value,
+    owner_identity: &str,
+    scrub_id: &str,
+    expected_generation: &str,
+) {
+    assert_eq!(intent["kind"], "privacy_scrub_intent");
+    assert_eq!(intent["scrubId"], scrub_id);
+    assert_eq!(intent["tenant"], PRIVACY_SCRUB_TARGET);
+    assert_eq!(intent["expectedGeneration"], expected_generation);
+    assert_eq!(intent["objectIDs"], json!(["kept-1"]));
+    assert_eq!(intent["synonymIDs"], json!(["kept-synonym"]));
+    assert_eq!(intent["ruleIDs"], json!(["kept-rule"]));
+    assert_eq!(
+        intent["authenticatedAppId"], owner_identity,
+        "durable scrub intent must retain its authenticated owner"
+    );
+    let created_at = intent["createdAt"]
+        .as_str()
+        .expect("durable scrub intent must contain a timestamp");
+    chrono::DateTime::parse_from_rfc3339(created_at)
+        .expect("durable scrub intent timestamp must be RFC 3339");
+}
+
+trait PrivacyScrubPhaseOrder {
+    fn order_for_privacy_scrub_test(self) -> u8;
+}
+
+impl PrivacyScrubPhaseOrder for MigrationPhase {
+    fn order_for_privacy_scrub_test(self) -> u8 {
+        match self {
+            MigrationPhase::Submitted => 0,
+            MigrationPhase::Exporting => 1,
+            MigrationPhase::Preparing => 2,
+            MigrationPhase::Staging => 3,
+            MigrationPhase::Activating => 4,
+        }
+    }
+}
+
+fn privacy_scrub_test_router(
+    tmp: &TempDir,
+    state: Arc<crate::handlers::AppState>,
+    key_store: Arc<KeyStore>,
+) -> axum::Router {
+    let analytics_config = AnalyticsConfig {
+        enabled: false,
+        data_dir: tmp.path().join("analytics"),
+        flush_interval_secs: 60,
+        flush_size: 1000,
+        retention_days: 30,
+    };
+    let analytics_collector = AnalyticsCollector::new(analytics_config);
+    let trusted_proxy_matcher =
+        Arc::new(crate::middleware::TrustedProxyMatcher::from_optional_csv(None).unwrap());
+
+    crate::router::build_router(
+        state,
+        Some(key_store),
+        analytics_collector,
+        trusted_proxy_matcher,
+        tmp.path(),
+        crate::router::RouterConfig {
+            cors_mode: crate::startup::CorsMode::LoopbackOnly,
+            disable_dashboard: false,
+        },
+    )
+}
+
+fn privacy_scrub_test_router_with_hooks(
+    tmp: &TempDir,
+    state: Arc<crate::handlers::AppState>,
+    key_store: Arc<KeyStore>,
+    hooks: Arc<PrivacyScrubTestHooks>,
+) -> axum::Router {
+    privacy_scrub_test_router(tmp, state, key_store).layer(Extension(hooks))
+}
+
+async fn post_privacy_scrub(
+    app: &axum::Router,
+    api_key: &str,
+    payload: serde_json::Value,
+) -> axum::response::Response {
+    post_privacy_scrub_with_credentials(
+        app,
+        Some(PRIVACY_SCRUB_OWNER_APP_ID),
+        Some(api_key),
+        payload,
+    )
+    .await
+}
+
+async fn post_privacy_scrub_with_credentials(
+    app: &axum::Router,
+    app_id: Option<&str>,
+    api_key: Option<&str>,
+    payload: serde_json::Value,
+) -> axum::response::Response {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(PRIVACY_SCRUB_ROUTE)
+        .header("content-type", "application/json");
+    if let Some(app_id) = app_id {
+        request = request.header("x-algolia-application-id", app_id);
+    }
+    if let Some(api_key) = api_key {
+        request = request.header("x-algolia-api-key", api_key);
+    }
+
+    app.clone()
+        .oneshot(request.body(Body::from(payload.to_string())).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn privacy_scrub_auth_failures_leave_no_intent_or_target_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).with_analytics().build_shared();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let private_key = privacy_scrub_private_key(&key_store);
+    seed_preexisting_target_resources(&state, PRIVACY_SCRUB_TARGET).await;
+    let app = privacy_scrub_test_router(&tmp, Arc::clone(&state), key_store);
+    let payload = privacy_scrub_payload(PRIVACY_SCRUB_ID, "generation-auth-refusal");
+
+    let refusal_credentials = [
+        ("missing credentials", None, None),
+        (
+            "wrong credentials",
+            Some(PRIVACY_SCRUB_OWNER_APP_ID),
+            Some("wrong-key"),
+        ),
+        ("incomplete app material", None, Some(private_key.as_str())),
+        (
+            "ordinary admin credentials",
+            Some(PRIVACY_SCRUB_OWNER_APP_ID),
+            Some("admin-key"),
+        ),
+    ];
+
+    for (case, app_id, api_key) in refusal_credentials {
+        let response =
+            post_privacy_scrub_with_credentials(&app, app_id, api_key, payload.clone()).await;
+
+        assert_preexisting_target_resources(&state, PRIVACY_SCRUB_TARGET).await;
+        assert!(
+            privacy_scrub_spool_jobs(&state.manager.base_path).is_empty(),
+            "{case} must not create a durable scrub intent"
+        );
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{case} must fail closed at the real migration router before reaching the scrub handler"
+        );
+    }
+}
+
+#[tokio::test]
+async fn privacy_scrub_rejects_same_scrub_id_from_different_private_key() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).with_analytics().build_shared();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let first_private_key = privacy_scrub_private_key(&key_store);
+    let second_private_key = privacy_scrub_private_key(&key_store);
+    seed_preexisting_target_resources(&state, PRIVACY_SCRUB_TARGET).await;
+    write_current_generation_evidence(
+        &state.manager.base_path,
+        PRIVACY_SCRUB_TARGET,
+        "generation-owner-fingerprint",
+    );
+    let app = privacy_scrub_test_router(&tmp, Arc::clone(&state), key_store);
+    let payload = privacy_scrub_payload(PRIVACY_SCRUB_ID, "generation-owner-fingerprint");
+
+    let first = post_privacy_scrub(&app, &first_private_key, payload.clone()).await;
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let first_ack = body_json(first).await;
+    assert_eq!(first_ack["scrubId"], PRIVACY_SCRUB_ID);
+    assert_eq!(first_ack["disposition"], "acknowledged");
+
+    let second = post_privacy_scrub(&app, &second_private_key, payload).await;
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(second).await,
+        json!({
+            "message": "Privacy scrub intent identity does not match",
+            "status": 409,
+            "code": "privacy_scrub_mismatched_intent"
+        })
+    );
+
+    let spool = SpoolStore::new(&state.manager.base_path, SpoolLimits::default()).unwrap();
+    assert_eq!(
+        spool.job_uuids().unwrap().len(),
+        1,
+        "a second private key must not be able to replay or duplicate another key's scrub ownership"
+    );
+}
+
+#[tokio::test]
+async fn privacy_scrub_durability_ack_is_idempotent_after_exact_absence() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).with_analytics().build_shared();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let private_key = privacy_scrub_private_key(&key_store);
+    seed_preexisting_target_resources(&state, PRIVACY_SCRUB_TARGET).await;
+    write_current_generation_evidence(
+        &state.manager.base_path,
+        PRIVACY_SCRUB_TARGET,
+        "generation-exact-absence",
+    );
+    assert_preexisting_target_resources(&state, PRIVACY_SCRUB_TARGET).await;
+    let app = privacy_scrub_test_router(&tmp, Arc::clone(&state), key_store);
+    let payload = privacy_scrub_payload(PRIVACY_SCRUB_ID, "generation-exact-absence");
+
+    let first = post_privacy_scrub(&app, &private_key, payload.clone()).await;
+    assert_eq!(
+        first.status(),
+        StatusCode::ACCEPTED,
+        "first scrub delivery must durably admit the private command"
+    );
+    let first_ack = body_json(first).await;
+    assert_eq!(first_ack["scrubId"], PRIVACY_SCRUB_ID);
+    assert_eq!(first_ack["disposition"], "acknowledged");
+    assert_preexisting_target_resources_exactly_absent(&state, PRIVACY_SCRUB_TARGET).await;
+
+    let duplicate = post_privacy_scrub(&app, &private_key, payload).await;
+    assert_eq!(
+        duplicate.status(),
+        StatusCode::ACCEPTED,
+        "duplicate delivery for the same scrub ID must replay the earned ACK"
+    );
+    assert_eq!(body_json(duplicate).await, first_ack);
+}
+
+#[tokio::test]
+async fn privacy_scrub_durability_concurrent_duplicate_gets_no_false_ack() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).with_analytics().build_shared();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let private_key = privacy_scrub_private_key(&key_store);
+    seed_preexisting_target_resources(&state, PRIVACY_SCRUB_TARGET).await;
+    write_current_generation_evidence(
+        &state.manager.base_path,
+        PRIVACY_SCRUB_TARGET,
+        "generation-concurrent-duplicate",
+    );
+    let hooks = Arc::new(
+        PrivacyScrubTestHooks::default().with_boundaries([PrivacyScrubBoundary::PostIntent]),
+    );
+    let app = privacy_scrub_test_router_with_hooks(
+        &tmp,
+        Arc::clone(&state),
+        key_store,
+        Arc::clone(&hooks),
+    );
+    let payload = privacy_scrub_payload(PRIVACY_SCRUB_ID, "generation-concurrent-duplicate");
+    let first_app = app.clone();
+    let first_key = private_key.clone();
+    let first_payload = payload.clone();
+    let mut first =
+        tokio::spawn(
+            async move { post_privacy_scrub(&first_app, &first_key, first_payload).await },
+        );
+
+    observe_privacy_scrub_boundary(&mut first, &hooks, PrivacyScrubBoundary::PostIntent).await;
+    let spool = SpoolStore::new(&state.manager.base_path, SpoolLimits::default()).unwrap();
+    let jobs = spool.job_uuids().unwrap();
+    assert_eq!(
+        jobs.len(),
+        1,
+        "first delivery must own the only durable job"
+    );
+    assert_eq!(
+        spool.read_migration_phase(jobs[0]).unwrap().disposition,
+        MigrationDisposition::Running
+    );
+    assert_preexisting_target_resources(&state, PRIVACY_SCRUB_TARGET).await;
+
+    let duplicate = post_privacy_scrub(&app, &private_key, payload).await;
+    assert_eq!(
+        duplicate.status(),
+        StatusCode::CONFLICT,
+        "duplicate delivery while the first scrub is running must not ACK"
+    );
+    assert_eq!(
+        body_json(duplicate).await["code"],
+        "privacy_scrub_interrupted_retryable"
+    );
+    assert_eq!(
+        SpoolStore::new(&state.manager.base_path, SpoolLimits::default())
+            .unwrap()
+            .job_uuids()
+            .unwrap(),
+        jobs,
+        "running duplicate must not create a second durable job"
+    );
+    assert_preexisting_target_resources(&state, PRIVACY_SCRUB_TARGET).await;
+
+    release_privacy_scrub_boundary(&hooks, PrivacyScrubBoundary::PostIntent);
+    let first = tokio::time::timeout(PRIVACY_SCRUB_BOUNDARY_TIMEOUT, first)
+        .await
+        .expect("first scrub must finish after duplicate refusal")
+        .expect("first scrub task must not panic");
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    assert_preexisting_target_resources_exactly_absent(&state, PRIVACY_SCRUB_TARGET).await;
+}
+
+#[tokio::test]
+async fn privacy_scrub_durability_refuses_stale_unknown_and_mismatched_intents() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).with_analytics().build_shared();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let private_key = privacy_scrub_private_key(&key_store);
+    let owner_identity = privacy_scrub_owner_identity(&private_key);
+    seed_preexisting_target_resources(&state, PRIVACY_SCRUB_TARGET).await;
+    write_current_generation_evidence(
+        &state.manager.base_path,
+        PRIVACY_SCRUB_TARGET,
+        PRIVACY_SCRUB_CURRENT_GENERATION,
+    );
+    seed_privacy_scrub_intent_fixture(
+        &state.manager.base_path,
+        &owner_identity,
+        PRIVACY_SCRUB_ID,
+        PRIVACY_SCRUB_CURRENT_GENERATION,
+        MigrationPhase::Submitted,
+    );
+    let interrupted_job = seed_privacy_scrub_intent_fixture(
+        &state.manager.base_path,
+        &owner_identity,
+        "interrupted-retryable-scrub",
+        PRIVACY_SCRUB_CURRENT_GENERATION,
+        MigrationPhase::Staging,
+    );
+    let app = privacy_scrub_test_router(&tmp, Arc::clone(&state), key_store);
+
+    for (payload, expected_code) in [
+        (
+            privacy_scrub_payload("unknown-target-scrub", "generation-current")
+                .as_object()
+                .cloned()
+                .map(|mut body| {
+                    body.insert("tenant".to_string(), json!("missing_privacy_tenant"));
+                    serde_json::Value::Object(body)
+                })
+                .unwrap(),
+            "privacy_scrub_unknown_target",
+        ),
+        (
+            privacy_scrub_payload("stale-generation-scrub", "stale-generation"),
+            "privacy_scrub_stale_generation",
+        ),
+        (
+            privacy_scrub_payload("different-id-same-intent", "generation-current"),
+            "privacy_scrub_mismatched_intent",
+        ),
+    ] {
+        let response = post_privacy_scrub(&app, &private_key, payload).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "refused privacy scrub must remain retryable and never claim success"
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["code"], expected_code);
+    }
+
+    let spool_before = SpoolStore::new(&state.manager.base_path, SpoolLimits::default()).unwrap();
+    let phase_before = spool_before.read_migration_phase(interrupted_job).unwrap();
+    let intent_before = read_privacy_scrub_intent(&spool_before, interrupted_job);
+    assert_eq!(phase_before.phase, MigrationPhase::Staging);
+    assert_eq!(phase_before.disposition, MigrationDisposition::Running);
+    assert!(
+        phase_before.terminal_at.is_none(),
+        "interrupted fixture must start nonterminal and retryable"
+    );
+    assert_privacy_scrub_intent(
+        &intent_before,
+        &owner_identity,
+        "interrupted-retryable-scrub",
+        PRIVACY_SCRUB_CURRENT_GENERATION,
+    );
+
+    let interrupted_payload = privacy_scrub_payload(
+        "interrupted-retryable-scrub",
+        PRIVACY_SCRUB_CURRENT_GENERATION,
+    );
+    for attempt in 1..=2 {
+        let response = post_privacy_scrub(&app, &private_key, interrupted_payload.clone()).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "interrupted privacy scrub attempt {attempt} must refuse without terminalizing"
+        );
+        assert_eq!(
+            body_json(response).await["code"],
+            "privacy_scrub_interrupted_retryable"
+        );
+
+        let reopened = SpoolStore::new(&state.manager.base_path, SpoolLimits::default()).unwrap();
+        let retry_phase = reopened.read_migration_phase(interrupted_job).unwrap();
+        assert_eq!(retry_phase.job_uuid, interrupted_job);
+        assert_eq!(
+            retry_phase.phase,
+            MigrationPhase::Staging,
+            "refusal attempt {attempt} must preserve the interrupted retry phase"
+        );
+        assert_eq!(
+            retry_phase.disposition,
+            MigrationDisposition::Running,
+            "refusal attempt {attempt} must remain nonterminal"
+        );
+        assert!(
+            retry_phase.terminal_at.is_none(),
+            "refusal attempt {attempt} must not terminalize the retryable scrub"
+        );
+        assert!(
+            !retry_phase.cancel_requested,
+            "refusal attempt {attempt} must not cancel the retryable scrub"
+        );
+        assert_eq!(
+            retry_phase.created_at, phase_before.created_at,
+            "refusal attempt {attempt} must preserve the original durable admission"
+        );
+        assert_eq!(
+            read_privacy_scrub_intent(&reopened, interrupted_job),
+            intent_before,
+            "refusal attempt {attempt} must preserve the durable scrub identity"
+        );
+    }
+
+    assert_preexisting_target_resources(&state, PRIVACY_SCRUB_TARGET).await;
+}
+
+#[tokio::test]
+async fn privacy_scrub_boundary_persists_intent_before_mutation_and_outcome_before_ack() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).with_analytics().build_shared();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let private_key = privacy_scrub_private_key(&key_store);
+    let owner_identity = privacy_scrub_owner_identity(&private_key);
+    seed_preexisting_target_resources(&state, PRIVACY_SCRUB_TARGET).await;
+    write_current_generation_evidence(
+        &state.manager.base_path,
+        PRIVACY_SCRUB_TARGET,
+        "generation-boundary",
+    );
+    let hooks = Arc::new(PrivacyScrubTestHooks::default().with_boundaries([
+        PrivacyScrubBoundary::PreIntent,
+        PrivacyScrubBoundary::PostIntent,
+        PrivacyScrubBoundary::EngineCommit,
+        PrivacyScrubBoundary::PreAck,
+        PrivacyScrubBoundary::ResponseLoss,
+        PrivacyScrubBoundary::Restart,
+        PrivacyScrubBoundary::AckReplay,
+    ]));
+    let app = privacy_scrub_test_router_with_hooks(
+        &tmp,
+        Arc::clone(&state),
+        key_store,
+        Arc::clone(&hooks),
+    );
+    let payload = privacy_scrub_payload(PRIVACY_SCRUB_ID, "generation-boundary");
+
+    let request_app = app.clone();
+    let replay_private_key = private_key.clone();
+    let mut request =
+        tokio::spawn(async move { post_privacy_scrub(&request_app, &private_key, payload).await });
+
+    observe_privacy_scrub_boundary(&mut request, &hooks, PrivacyScrubBoundary::PreIntent).await;
+    assert_eq!(
+        privacy_scrub_spool_jobs(&state.manager.base_path).len(),
+        0,
+        "pre-intent boundary must occur before any durable scrub intent is admitted"
+    );
+    release_privacy_scrub_boundary(&hooks, PrivacyScrubBoundary::PreIntent);
+
+    observe_privacy_scrub_boundary(&mut request, &hooks, PrivacyScrubBoundary::PostIntent).await;
+    let spool = SpoolStore::new(&state.manager.base_path, SpoolLimits::default()).unwrap();
+    let jobs = spool.job_uuids().unwrap();
+    assert_eq!(jobs.len(), 1);
+    let intent_phase = spool.read_migration_phase(jobs[0]).unwrap();
+    assert_eq!(intent_phase.phase, MigrationPhase::Submitted);
+    assert_eq!(intent_phase.disposition, MigrationDisposition::Running);
+    assert!(
+        intent_phase.terminal_at.is_none(),
+        "intent must be durable in the migration spool before any scrub mutation"
+    );
+    assert_privacy_scrub_intent(
+        &read_privacy_scrub_intent(&spool, jobs[0]),
+        &owner_identity,
+        PRIVACY_SCRUB_ID,
+        "generation-boundary",
+    );
+    assert_preexisting_target_resources(&state, PRIVACY_SCRUB_TARGET).await;
+    release_privacy_scrub_boundary(&hooks, PrivacyScrubBoundary::PostIntent);
+
+    observe_privacy_scrub_boundary(&mut request, &hooks, PrivacyScrubBoundary::EngineCommit).await;
+    assert_preexisting_target_resources_exactly_absent(&state, PRIVACY_SCRUB_TARGET).await;
+    release_privacy_scrub_boundary(&hooks, PrivacyScrubBoundary::EngineCommit);
+
+    observe_privacy_scrub_boundary(&mut request, &hooks, PrivacyScrubBoundary::PreAck).await;
+    let terminal_phase = SpoolStore::new(&state.manager.base_path, SpoolLimits::default())
+        .unwrap()
+        .read_migration_phase(jobs[0])
+        .unwrap();
+    assert_eq!(terminal_phase.disposition, MigrationDisposition::Succeeded);
+    assert!(
+        terminal_phase.terminal_at.is_some(),
+        "durable engine outcome must be terminal before the ACK is written"
+    );
+    release_privacy_scrub_boundary(&hooks, PrivacyScrubBoundary::PreAck);
+
+    observe_privacy_scrub_boundary(&mut request, &hooks, PrivacyScrubBoundary::ResponseLoss).await;
+    request.abort();
+    release_privacy_scrub_boundary(&hooks, PrivacyScrubBoundary::ResponseLoss);
+    let cancelled = tokio::time::timeout(PRIVACY_SCRUB_BOUNDARY_TIMEOUT, request)
+        .await
+        .expect("aborted response-loss request must settle")
+        .expect_err("response-loss request must be cancelled before its ACK is consumed");
+    assert!(cancelled.is_cancelled());
+    drop(app);
+    drop(state);
+
+    let rebuilt_state = TestStateBuilder::new(&tmp).with_analytics().build_shared();
+    let rebuilt_key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let restart_state = Arc::clone(&rebuilt_state);
+    let restart_hooks = Arc::clone(&hooks);
+    let mut restart = tokio::spawn(async move {
+        restart_hooks.wait_at(PrivacyScrubBoundary::Restart).await;
+        let reports = restart_state
+            .manager
+            .repair_publications_before_serve()
+            .unwrap();
+        restart_state
+            .migration_runner
+            .recover_async_jobs_before_serve(&reports)
+            .await
+    });
+    observe_privacy_scrub_boundary(&mut restart, &hooks, PrivacyScrubBoundary::Restart).await;
+    let restart_spool =
+        SpoolStore::new(&rebuilt_state.manager.base_path, SpoolLimits::default()).unwrap();
+    assert_eq!(
+        restart_spool.read_migration_phase(jobs[0]).unwrap(),
+        terminal_phase,
+        "restart boundary must expose the same durable terminal outcome before recovery"
+    );
+    assert_privacy_scrub_intent(
+        &read_privacy_scrub_intent(&restart_spool, jobs[0]),
+        &owner_identity,
+        PRIVACY_SCRUB_ID,
+        "generation-boundary",
+    );
+    assert_preexisting_target_resources_exactly_absent(&rebuilt_state, PRIVACY_SCRUB_TARGET).await;
+    release_privacy_scrub_boundary(&hooks, PrivacyScrubBoundary::Restart);
+    tokio::time::timeout(PRIVACY_SCRUB_BOUNDARY_TIMEOUT, restart)
+        .await
+        .expect("restart recovery must finish after release")
+        .expect("restart recovery task must not panic")
+        .expect("restart recovery must reconcile the durable scrub job");
+
+    let replay_app = privacy_scrub_test_router_with_hooks(
+        &tmp,
+        Arc::clone(&rebuilt_state),
+        rebuilt_key_store,
+        Arc::clone(&hooks),
+    );
+    let replay_request_app = replay_app.clone();
+    let mut replay = tokio::spawn(async move {
+        post_privacy_scrub(
+            &replay_request_app,
+            &replay_private_key,
+            privacy_scrub_payload(PRIVACY_SCRUB_ID, "generation-boundary"),
+        )
+        .await
+    });
+    observe_privacy_scrub_boundary(&mut replay, &hooks, PrivacyScrubBoundary::AckReplay).await;
+    let replay_spool =
+        SpoolStore::new(&rebuilt_state.manager.base_path, SpoolLimits::default()).unwrap();
+    assert_eq!(
+        replay_spool.read_migration_phase(jobs[0]).unwrap(),
+        terminal_phase,
+        "ACK replay must not rewrite the terminal scrub outcome"
+    );
+    assert_privacy_scrub_intent(
+        &read_privacy_scrub_intent(&replay_spool, jobs[0]),
+        &owner_identity,
+        PRIVACY_SCRUB_ID,
+        "generation-boundary",
+    );
+    assert_preexisting_target_resources_exactly_absent(&rebuilt_state, PRIVACY_SCRUB_TARGET).await;
+    release_privacy_scrub_boundary(&hooks, PrivacyScrubBoundary::AckReplay);
+    let replay = tokio::time::timeout(PRIVACY_SCRUB_BOUNDARY_TIMEOUT, replay)
+        .await
+        .expect("ACK replay must finish after release")
+        .expect("ACK replay request task must not panic");
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    let ack = body_json(replay).await;
+    assert_eq!(ack["scrubId"], PRIVACY_SCRUB_ID);
+    assert_eq!(ack["disposition"], "acknowledged");
+}
+
+fn privacy_scrub_spool_jobs(base_path: &Path) -> Vec<uuid::Uuid> {
+    SpoolStore::new(base_path, SpoolLimits::default())
+        .unwrap()
+        .job_uuids()
+        .unwrap()
+}
+
+async fn observe_privacy_scrub_boundary<T>(
+    task: &mut tokio::task::JoinHandle<T>,
+    hooks: &PrivacyScrubTestHooks,
+    boundary: PrivacyScrubBoundary,
+) {
+    let observed = hooks.control(boundary).observed.notified();
+    tokio::select! {
+        result = tokio::time::timeout(PRIVACY_SCRUB_BOUNDARY_TIMEOUT, observed) => {
+            result.unwrap_or_else(|_| {
+                panic!(
+                    "privacy scrub must observe boundary {} before timeout",
+                    boundary.name()
+                )
+            });
+        }
+        result = task => {
+            result.expect("privacy scrub boundary task must not panic");
+            panic!(
+                "privacy scrub task completed before observing boundary {}",
+                boundary.name()
+            );
+        }
+    }
+}
+
+fn release_privacy_scrub_boundary(hooks: &PrivacyScrubTestHooks, boundary: PrivacyScrubBoundary) {
+    hooks.control(boundary).release.notify_one();
+}
 
 #[test]
 fn live_import_barriers_are_inert_without_environment() {

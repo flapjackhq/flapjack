@@ -180,6 +180,92 @@ impl PublicationGenerationEvidence {
         validate_opaque_component("publication generation evidence", &value)?;
         Ok(Self(value))
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+pub fn verify_current_generation_evidence(
+    base: &Path,
+    target: &PublicationTarget,
+    expected_generation: &PublicationGenerationEvidence,
+) -> Result<()> {
+    let journals = committed_generation_journals(base, target)?;
+    if journals.len() != 1 {
+        return Err(invalid_publication(format!(
+            "expected exactly one committed current journal for target '{}', found {}",
+            target.as_str(),
+            journals.len()
+        )));
+    }
+    let journal = &journals[0];
+    if &journal.generation != expected_generation {
+        return Err(invalid_publication(format!(
+            "stale generation evidence for target '{}'",
+            target.as_str()
+        )));
+    }
+    Ok(())
+}
+
+fn committed_generation_journals(
+    base: &Path,
+    target: &PublicationTarget,
+) -> Result<Vec<PublicationJournal>> {
+    let root = base.join(PUBLICATION_DIR).join(target.as_str());
+    let mut journals = Vec::new();
+    let entries = std::fs::read_dir(&root).map_err(|error| {
+        invalid_publication(format!(
+            "missing current journal for target '{}': {error}",
+            target.as_str()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            invalid_publication(format!(
+                "could not read current journal namespace for target '{}': {error}",
+                target.as_str()
+            ))
+        })?;
+        if !entry
+            .file_type()
+            .map_err(|error| {
+                invalid_publication(format!(
+                    "could not inspect current journal namespace for target '{}': {error}",
+                    target.as_str()
+                ))
+            })?
+            .is_dir()
+        {
+            continue;
+        }
+        let journal_path = entry.path().join("journal.json");
+        let raw = std::fs::read_to_string(&journal_path).map_err(|error| {
+            invalid_publication(format!(
+                "missing current journal for target '{}': {error}",
+                target.as_str()
+            ))
+        })?;
+        let journal = PublicationJournal::from_json(&raw)?;
+        if journal.target != *target {
+            return Err(invalid_publication(format!(
+                "current journal target mismatch for '{}'",
+                target.as_str()
+            )));
+        }
+        if journal.phase == PublicationPhase::Committed
+            && journal.disposition == Some(PublicationDisposition::Committed)
+        {
+            journals.push(journal);
+        } else {
+            return Err(invalid_publication(format!(
+                "current journal for target '{}' is not committed",
+                target.as_str()
+            )));
+        }
+    }
+    Ok(journals)
 }
 
 /// NODE-LOCAL staging-baseline evidence (ADR 0008): the committed sequence the

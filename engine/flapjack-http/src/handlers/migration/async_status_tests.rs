@@ -312,6 +312,82 @@ async fn async_cancel_terminal_jobs_returns_existing_terminal_status() {
 }
 
 #[tokio::test]
+async fn async_acknowledge_terminal_job_returns_no_content_and_preserves_phase() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let spool = import::spool_for_manager(&state.manager).unwrap();
+    let job_uuid = Uuid::new_v4();
+
+    spool
+        .create_async_migration_admission_for_owner(
+            job_uuid,
+            "acknowledged_terminal",
+            Some("async-owner-app"),
+        )
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Exporting)
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Preparing)
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Staging)
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Activating)
+        .unwrap();
+    let terminal = spool.succeed_migration(job_uuid).unwrap();
+
+    let status = acknowledge_algolia_migration(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(AuthenticatedAppId("async-owner-app".to_string())),
+        AxumPath(job_uuid.to_string()),
+    )
+    .await
+    .expect("terminal ACK should be accepted");
+
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(spool.read_migration_phase(job_uuid).unwrap(), terminal);
+}
+
+#[tokio::test]
+async fn async_acknowledge_running_job_fails_closed_without_mutating_phase() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let spool = import::spool_for_manager(&state.manager).unwrap();
+    let job_uuid = Uuid::new_v4();
+
+    spool
+        .create_async_migration_admission_for_owner(
+            job_uuid,
+            "acknowledge_too_early",
+            Some("async-owner-app"),
+        )
+        .unwrap();
+    let running = spool.read_migration_phase(job_uuid).unwrap();
+
+    let error = acknowledge_algolia_migration(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(AuthenticatedAppId("async-owner-app".to_string())),
+        AxumPath(job_uuid.to_string()),
+    )
+    .await
+    .expect_err("running migration ACK must fail closed");
+
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(error.1.into_response()).await,
+        json!({
+            "message": "Migration job must be terminal before it can be acknowledged",
+            "status": 409,
+            "code": "migration_ack_too_early"
+        })
+    );
+    assert_eq!(spool.read_migration_phase(job_uuid).unwrap(), running);
+}
+
+#[tokio::test]
 async fn async_submit_spool_failure_returns_sanitized_500_without_spawning_source() {
     let tmp = TempDir::new().unwrap();
     std::fs::write(tmp.path().join("migration_exports"), b"not a directory").unwrap();

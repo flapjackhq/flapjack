@@ -404,6 +404,16 @@ impl SpoolStore {
         )
     }
 
+    pub(super) fn commit_privacy_scrub_intent(
+        &self,
+        intent: &PrivacyScrubIntent,
+        job_uuid: Uuid,
+    ) -> SpoolResult<()> {
+        let bytes = serde_json::to_vec_pretty(intent)
+            .map_err(|_| SpoolError::new(SpoolErrorKind::ManifestCorrupt))?;
+        write_atomic(&self.job_dir(job_uuid), PRIVACY_SCRUB_INTENT_FILE, &bytes)
+    }
+
     /// Override a running record's labeled export progress with the manifest's
     /// counters — the single owner of that value — so a read after a crash between
     /// the manifest write and the phase refresh cannot under-report. Terminal
@@ -446,6 +456,10 @@ impl SpoolStore {
 
     pub(super) fn manifest_path(&self, job_uuid: Uuid) -> PathBuf {
         self.job_dir(job_uuid).join(MANIFEST_FILE)
+    }
+
+    pub(crate) fn privacy_scrub_intent_path(&self, job_uuid: Uuid) -> PathBuf {
+        self.job_dir(job_uuid).join(PRIVACY_SCRUB_INTENT_FILE)
     }
 
     pub(crate) fn job_uuids(&self) -> SpoolResult<Vec<Uuid>> {

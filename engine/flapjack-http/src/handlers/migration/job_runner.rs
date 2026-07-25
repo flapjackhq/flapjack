@@ -286,6 +286,13 @@ impl MigrationJobRunner {
         if phase.disposition != MigrationDisposition::Running || phase.terminal_at.is_some() {
             return Ok(());
         }
+        if spool
+            .read_privacy_scrub_intent_if_exists(job_uuid)
+            .map_err(recovery_spool_error)?
+            .is_some()
+        {
+            return Ok(());
+        }
         if phase.cancel_requested {
             return self
                 .recover_cancel_requested_async_job(spool, job_uuid, metadata, publication_reports)

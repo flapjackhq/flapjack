@@ -235,8 +235,8 @@ authoritative reads on the returning node.
 | Name | Type / Values | Default | Description |
 |---|---|---|---|
 | `FLAPJACK_MAX_BODY_MB` | Integer MB | `100` | Global HTTP request body size limit. |
-| `FLAPJACK_MAX_BATCH_SIZE` | Integer operation count | `10000` | Max object operations per batch request. |
-| `FLAPJACK_MAX_RECORD_BYTES` | Integer bytes | `102400` | Max serialized size per individual record. |
+| `FLAPJACK_MAX_BATCH_SIZE` | Integer operation count | `10000` | Max object operations per batch request. Exceeding this limit returns HTTP 413. |
+| `FLAPJACK_MAX_RECORD_BYTES` | Integer bytes | `102400` | Max serialized size per individual record. Exceeding this limit returns HTTP 413. |
 | `FLAPJACK_MAX_BUFFER_MB` | Integer MB | `31` | In-memory write buffer budget. |
 | `FLAPJACK_MAX_CONCURRENT_WRITERS` | Integer | `40` | Max concurrent writer tasks per tenant manager. |
 | `FLAPJACK_WRITE_QUEUE_BATCH_SIZE` | Positive integer operation count | `32` | Runtime write-queue commit threshold. Invalid values (non-integer or `<=0`) fall back to `32`. Higher values usually improve sustained write throughput by amortizing commit cost, while lower values generally reduce per-op flush latency. |

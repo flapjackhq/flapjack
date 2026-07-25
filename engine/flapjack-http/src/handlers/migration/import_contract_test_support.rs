@@ -11,6 +11,7 @@ use crate::handlers::synonyms::get_synonym;
 use crate::test_helpers::body_json;
 use axum::{
     extract::{Path as AxumPath, Query, State},
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
@@ -120,6 +121,55 @@ pub(super) async fn assert_preexisting_target_resources(
     assert_eq!(
         serde_json::to_value(rule).unwrap(),
         serde_json::to_value(preexisting_rule()).unwrap()
+    );
+}
+
+pub(super) async fn assert_preexisting_target_resources_exactly_absent(
+    state: &Arc<crate::handlers::AppState>,
+    target_index: &str,
+) {
+    assert_eq!(
+        query_hit_count(state, target_index, PREEXISTING_DOCUMENT_TITLE).await,
+        0,
+        "scrub ACK must not be earned until the named document is absent from search"
+    );
+    let object_response = get_object(
+        State(Arc::clone(state)),
+        AxumPath((
+            target_index.to_string(),
+            PREEXISTING_DOCUMENT_ID.to_string(),
+        )),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        object_response.status(),
+        StatusCode::NOT_FOUND,
+        "scrub ACK must require the named object read to return a precise 404, not an internal/read error"
+    );
+
+    let synonym_response = get_synonym(
+        State(Arc::clone(state)),
+        AxumPath((target_index.to_string(), PREEXISTING_SYNONYM_ID.to_string())),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        synonym_response.status(),
+        StatusCode::NOT_FOUND,
+        "scrub ACK must require the named synonym read to return a precise 404, not an internal/read error"
+    );
+
+    let rule_response = get_rule(
+        State(Arc::clone(state)),
+        AxumPath((target_index.to_string(), PREEXISTING_RULE_ID.to_string())),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        rule_response.status(),
+        StatusCode::NOT_FOUND,
+        "scrub ACK must require the named rule read to return a precise 404, not an internal/read error"
     );
 }
 

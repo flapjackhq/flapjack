@@ -1,5 +1,23 @@
 use super::*;
 
+fn test_api_key_with_acl(acl: &str, description: &str) -> ApiKey {
+    ApiKey {
+        hash: String::new(),
+        salt: String::new(),
+        hmac_key: None,
+        created_at: 0,
+        acl: vec![acl.to_string()],
+        description: description.to_string(),
+        indexes: vec![],
+        max_hits_per_query: 0,
+        max_queries_per_ip_per_hour: 0,
+        query_parameters: String::new(),
+        referers: vec![],
+        validity: 0,
+        restrict_sources: None,
+    }
+}
+
 /// Verify that authentication middleware returns 403 Forbidden and 429 Too Many Requests responses in Algolia-compatible JSON format with `message` and `status` fields.
 #[tokio::test]
 async fn auth_middleware_returns_algolia_error_shape_for_403_and_429() {
@@ -170,6 +188,84 @@ async fn auth_middleware_internal_storage_requires_app_id_even_for_admin_key() {
             "message": "Invalid Application-ID or API key",
             "status": 403
         })
+    );
+}
+
+#[tokio::test]
+async fn privacy_scrub_auth_rejects_normal_admin_and_incomplete_app_material() {
+    let temp_dir = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(temp_dir.path(), "admin-key"));
+    let (_, private_migration_key) = key_store.create_key(test_api_key_with_acl(
+        "privateMigration",
+        "Private migration command test key",
+    ));
+
+    let app = Router::new()
+        .route(
+            "/1/migrations/privacy-scrub",
+            post(|| async { (StatusCode::OK, "scrub accepted") }),
+        )
+        .layer(axum::middleware::from_fn(|request, next| async move {
+            authenticate_and_authorize(request, next, false).await
+        }))
+        .layer(Extension(key_store));
+
+    let missing_app = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/1/migrations/privacy-scrub")
+                .header("x-algolia-api-key", "admin-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_app.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        body_json(missing_app).await,
+        serde_json::json!({
+            "message": "Invalid Application-ID or API key",
+            "status": 403
+        })
+    );
+
+    let ordinary_admin = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/1/migrations/privacy-scrub")
+                .header("x-algolia-application-id", "public-admin-app")
+                .header("x-algolia-api-key", "admin-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ordinary_admin.status(),
+        StatusCode::FORBIDDEN,
+        "privacy scrub must require the private migration credential, not a normal Algolia admin key"
+    );
+
+    let private_credential = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/1/migrations/privacy-scrub")
+                .header("x-algolia-application-id", "private-migration-app")
+                .header("x-algolia-api-key", private_migration_key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        private_credential.status(),
+        StatusCode::OK,
+        "the same auth seam must admit a key carrying the privateMigration ACL"
     );
 }
 #[tokio::test]

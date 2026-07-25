@@ -649,42 +649,115 @@ fn make_ingest_app(state: Arc<AppState>) -> Router {
     )
 }
 
-/// Verify that the batch endpoint returns 400 when any individual record exceeds `max_record_bytes()`.
+async fn post_ingest_json(
+    app: Router,
+    uri: &str,
+    body: serde_json::Value,
+) -> axum::http::Response<Body> {
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+fn delete_object_requests(count: usize) -> Vec<serde_json::Value> {
+    (0..count)
+        .map(|i| {
+            serde_json::json!({
+                "action": "deleteObject",
+                "body": { "objectID": format!("missing-{i}") }
+            })
+        })
+        .collect()
+}
+
 #[tokio::test]
-async fn batch_rejects_oversized_record() {
+async fn request_size_batch_count_over_default_returns_413() {
+    assert!(
+        std::env::var_os("FLAPJACK_MAX_BATCH_SIZE").is_none(),
+        "default boundary test requires FLAPJACK_MAX_BATCH_SIZE to be unset"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let state = make_write_guard_state(&tmp);
+    let app = make_ingest_app(state);
+    let body = serde_json::json!({ "requests": delete_object_requests(10_001) });
+
+    let resp = post_ingest_json(app, "/1/indexes/count/batch", body).await;
+
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let json = crate::test_helpers::body_json(resp).await;
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "message": "Batch size 10001 exceeds max 10000 documents",
+            "status": 413
+        })
+    );
+}
+
+#[tokio::test]
+async fn request_size_batch_count_at_default_is_accepted() {
+    assert!(
+        std::env::var_os("FLAPJACK_MAX_BATCH_SIZE").is_none(),
+        "default boundary test requires FLAPJACK_MAX_BATCH_SIZE to be unset"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let state = make_write_guard_state(&tmp);
+    let app = make_ingest_app(state);
+    let body = serde_json::json!({ "requests": delete_object_requests(10_000) });
+
+    let resp = post_ingest_json(app, "/1/indexes/count/batch", body).await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Verify that the batch endpoint returns 413 when any individual record exceeds `max_record_bytes()`.
+#[tokio::test]
+async fn request_size_batch_rejects_oversized_record() {
+    assert!(
+        std::env::var_os("FLAPJACK_MAX_RECORD_BYTES").is_none(),
+        "default boundary test requires FLAPJACK_MAX_RECORD_BYTES to be unset"
+    );
+
     let tmp = TempDir::new().unwrap();
     let state = make_write_guard_state(&tmp);
     let app = make_ingest_app(state);
 
     let limit = max_record_bytes();
-    // Build a value that is definitely over the limit
     let big_value: String = "x".repeat(limit + 1000);
+    let record = serde_json::json!({ "objectID": "big1", "data": big_value });
+    let record_size = serde_json::to_vec(&record).unwrap().len();
     let body = serde_json::json!({
         "requests": [{
             "action": "addObject",
-            "body": { "objectID": "big1", "data": big_value }
+            "body": record
         }]
     });
 
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/1/indexes/test/batch")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let resp = post_ingest_json(app, "/1/indexes/test/batch", body).await;
 
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let json = crate::test_helpers::body_json(resp).await;
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "message": format!("Document size {record_size} exceeds max 102400 bytes"),
+            "status": 413
+        })
+    );
 }
 
 /// Verify that `deleteObject` batch operations skip the record size check and succeed even though delete bodies are trivially small.
 #[tokio::test]
-async fn batch_delete_bypasses_size_check() {
-    // deleteObject carries only an ID — size check must NOT fire
+async fn request_size_batch_delete_bypasses_size_check() {
     let tmp = TempDir::new().unwrap();
     let state = make_write_guard_state(&tmp);
     let app = make_ingest_app(state);
@@ -696,25 +769,19 @@ async fn batch_delete_bypasses_size_check() {
         }]
     });
 
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/1/indexes/test/batch")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let resp = post_ingest_json(app, "/1/indexes/test/batch", body).await;
 
-    // Should be 200 (or at worst 404), never 400 from size check
-    assert_ne!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
-/// Verify that the auto-ID endpoint returns 400 when the record exceeds `max_record_bytes()`.
+/// Verify that the auto-ID endpoint returns 413 when the record exceeds `max_record_bytes()`.
 #[tokio::test]
-async fn auto_id_rejects_oversized_record() {
+async fn request_size_auto_id_rejects_oversized_record() {
+    assert!(
+        std::env::var_os("FLAPJACK_MAX_RECORD_BYTES").is_none(),
+        "default boundary test requires FLAPJACK_MAX_RECORD_BYTES to be unset"
+    );
+
     let tmp = TempDir::new().unwrap();
     let state = make_write_guard_state(&tmp);
     let app = make_ingest_app(state);
@@ -722,20 +789,19 @@ async fn auto_id_rejects_oversized_record() {
     let limit = max_record_bytes();
     let big_value: String = "x".repeat(limit + 1000);
     let body = serde_json::json!({ "data": big_value });
+    let record_size = serde_json::to_vec(&body).unwrap().len();
 
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/1/indexes/test")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let resp = post_ingest_json(app, "/1/indexes/test", body).await;
 
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let json = crate::test_helpers::body_json(resp).await;
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "message": format!("Document size {record_size} exceeds max 102400 bytes"),
+            "status": 413
+        })
+    );
 }
 
 mod stage4_multi_index {
@@ -1243,19 +1309,25 @@ mod content_hash_and_idempotency {
         idem_key: Option<&str>,
         app_id_override: Option<&str>,
     ) -> (StatusCode, Value) {
-        let (status, raw_bytes) = post_batch_raw(app, index, body, idem_key, app_id_override).await;
+        let (status, _headers, raw_bytes) =
+            post_batch_raw(app, index, body, idem_key, app_id_override).await;
         let json: Value =
             serde_json::from_slice(&raw_bytes).expect("batch response should be json");
         (status, json)
     }
 
+    /// Drive the batch endpoint and return the raw status, response headers, and
+    /// body bytes. Headers are captured before the body is consumed so callers can
+    /// assert on the `x-flapjack-idempotency-replayed` marker alongside the exact
+    /// replayed bytes. This is the single owner of batch request construction and
+    /// idempotency/app-id header setup; `post_batch` delegates here.
     async fn post_batch_raw(
         app: &Router,
         index: &str,
         body: Value,
         idem_key: Option<&str>,
         app_id_override: Option<&str>,
-    ) -> (StatusCode, Vec<u8>) {
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
         let mut builder = Request::builder()
             .method("POST")
             .uri(format!("/1/indexes/{}/batch", index))
@@ -1273,11 +1345,12 @@ mod content_hash_and_idempotency {
         }
         let resp = app.clone().oneshot(request).await.unwrap();
         let status = resp.status();
+        let headers = resp.headers().clone();
         let raw = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("batch response body should be readable")
             .to_vec();
-        (status, raw)
+        (status, headers, raw)
     }
 
     fn install_idempotency_store_failure_trigger(state: &Arc<AppState>) {
@@ -1530,15 +1603,155 @@ mod content_hash_and_idempotency {
             ]
         });
         let key = "multi-index-envelope-key";
-        let (s1, raw1) =
+        let (s1, _h1, raw1) =
             post_batch_raw(&app, "*", request_body.clone(), Some(key), Some("app-a")).await;
-        let (s2, raw2) = post_batch_raw(&app, "*", request_body, Some(key), Some("app-a")).await;
+        let (s2, _h2, raw2) =
+            post_batch_raw(&app, "*", request_body, Some(key), Some("app-a")).await;
 
         assert_eq!(s1, StatusCode::OK);
         assert_eq!(s2, StatusCode::OK);
         assert_eq!(
             raw1, raw2,
             "multi-index envelope replay must return byte-for-byte identical cached response body"
+        );
+    }
+
+    /// A retried single-index batch with the same idempotency key must replay the
+    /// first write's exact response, mark it with `x-flapjack-idempotency-replayed:
+    /// true`, and never apply the second (different) body. This is the core connector
+    /// retry contract: a repeat is a replay, not a second write.
+    #[tokio::test]
+    async fn test_batch_idempotency_replay_marks_and_replays_first_response() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_write_guard_state(&tmp);
+        let app = make_app(state.clone());
+
+        let key = "batch-retry-key";
+        let first_object_id = "idem-first";
+        let second_body_object_id = "idem-second";
+        let first_body = json!({
+            "requests": [
+                { "action": "addObject", "body": { "objectID": first_object_id, "title": "first" } }
+            ]
+        });
+        let second_body = json!({
+            "requests": [
+                { "action": "addObject", "body": { "objectID": second_body_object_id, "title": "second" } }
+            ]
+        });
+
+        let (s1, h1, raw1) =
+            post_batch_raw(&app, "idem", first_body, Some(key), Some("app-a")).await;
+        assert_eq!(s1, StatusCode::OK);
+        assert!(
+            h1.get("x-flapjack-idempotency-replayed").is_none(),
+            "the first write must not be marked as a replay"
+        );
+        let parsed1: Value = serde_json::from_slice(&raw1).expect("first batch response is json");
+        let first_task_id = parsed1["taskID"].clone();
+        let first_object_ids = parsed1["objectIDs"].clone();
+        assert_eq!(first_object_ids[0], first_object_id);
+
+        let (s2, h2, raw2) =
+            post_batch_raw(&app, "idem", second_body, Some(key), Some("app-a")).await;
+        assert_eq!(s2, StatusCode::OK);
+        assert_eq!(
+            h2.get("x-flapjack-idempotency-replayed")
+                .expect("replay must carry the replayed marker header"),
+            "true",
+            "the retried write must be marked as a replay"
+        );
+        assert_eq!(
+            raw1, raw2,
+            "replay must return the first response's bytes exactly, unchanged by the second body"
+        );
+        let parsed2: Value =
+            serde_json::from_slice(&raw2).expect("replayed batch response is json");
+        assert_eq!(
+            parsed2["taskID"], first_task_id,
+            "replay must reuse the first taskID, proving the second body was not enqueued"
+        );
+        assert_eq!(
+            parsed2["objectIDs"], first_object_ids,
+            "replay must report the first objectIDs, not the second body's"
+        );
+
+        // The second body must never have been applied — only the first document lands.
+        assert!(
+            state
+                .manager
+                .get_document("idem", first_object_id)
+                .unwrap()
+                .is_some(),
+            "first write's document must be persisted"
+        );
+        assert!(
+            state
+                .manager
+                .get_document("idem", second_body_object_id)
+                .unwrap()
+                .is_none(),
+            "second body must not be applied on a replayed request"
+        );
+        assert_eq!(
+            index_document_count(&state, "idem"),
+            1,
+            "an idempotent replay must leave exactly one document in the index"
+        );
+    }
+
+    /// The batch replay scope is per application: the same idempotency key against
+    /// the same index from a different app must be a fresh write, not a cross-app
+    /// replay, so both explicit objectIDs land.
+    #[tokio::test]
+    async fn test_batch_idempotency_key_isolated_across_applications() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_write_guard_state(&tmp);
+        let app = make_app(state.clone());
+
+        let index = "batch_app_scope_idx";
+        let key = "batch-shared-key-across-apps";
+        let body_a = json!({
+            "requests": [
+                { "action": "addObject", "body": { "objectID": "app-a-doc", "title": "from app a" } }
+            ]
+        });
+        let body_b = json!({
+            "requests": [
+                { "action": "addObject", "body": { "objectID": "app-b-doc", "title": "from app b" } }
+            ]
+        });
+
+        let (s1, _h1, raw1) = post_batch_raw(&app, index, body_a, Some(key), Some("app-a")).await;
+        let (s2, h2, raw2) = post_batch_raw(&app, index, body_b, Some(key), Some("app-b")).await;
+
+        assert_eq!(s1, StatusCode::OK);
+        assert_eq!(s2, StatusCode::OK);
+        assert!(
+            h2.get("x-flapjack-idempotency-replayed").is_none(),
+            "the same key from a different app must not replay"
+        );
+        let parsed1: Value = serde_json::from_slice(&raw1).unwrap();
+        let parsed2: Value = serde_json::from_slice(&raw2).unwrap();
+        assert_ne!(
+            parsed1["taskID"], parsed2["taskID"],
+            "cross-app writes must enqueue distinct tasks"
+        );
+
+        assert!(state
+            .manager
+            .get_document(index, "app-a-doc")
+            .unwrap()
+            .is_some());
+        assert!(state
+            .manager
+            .get_document(index, "app-b-doc")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            index_document_count(&state, index),
+            2,
+            "same idempotency key across different applications must persist both batch documents"
         );
     }
 

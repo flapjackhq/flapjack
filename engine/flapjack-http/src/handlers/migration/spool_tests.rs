@@ -110,6 +110,139 @@ fn fixed_store(tmp: &TempDir) -> SpoolStore {
         .expect("test store should initialize")
 }
 
+fn privacy_scrub_intent(scrub_id: &str) -> PrivacyScrubIntent {
+    PrivacyScrubIntent::from_fields(PrivacyScrubIntentFields {
+        scrub_id: scrub_id.to_string(),
+        tenant: "products".to_string(),
+        expected_generation: "generation_1".to_string(),
+        object_ids: vec!["doc_1".to_string()],
+        synonym_ids: vec!["syn_1".to_string()],
+        rule_ids: vec!["rule_1".to_string()],
+        authenticated_app_id: "app_1".to_string(),
+        created_at: fixed_now(),
+    })
+}
+
+#[test]
+fn privacy_scrub_intent_admission_is_atomic_and_idempotent() {
+    let tmp = TempDir::new().unwrap();
+    let store = fixed_store(&tmp);
+    let job_uuid = uuid::Uuid::new_v4();
+    let intent = privacy_scrub_intent("scrub_1");
+
+    let first = store
+        .admit_privacy_scrub_intent(job_uuid, intent.clone())
+        .expect("first scrub intent should be admitted");
+    let PrivacyScrubAdmission::Created {
+        job_uuid: created,
+        phase,
+        intent: durable,
+    } = first
+    else {
+        panic!("first admission must create a job");
+    };
+    assert_eq!(created, job_uuid);
+    assert_eq!(phase.phase, MigrationPhase::Submitted);
+    assert_eq!(phase.disposition, MigrationDisposition::Running);
+    assert_eq!(durable, intent);
+    assert_eq!(store.read_privacy_scrub_intent(job_uuid).unwrap(), intent);
+    assert_eq!(store.job_uuids().unwrap(), vec![job_uuid]);
+
+    let duplicate = store
+        .admit_privacy_scrub_intent(uuid::Uuid::new_v4(), privacy_scrub_intent("scrub_1"))
+        .expect("exact duplicate should reuse the first job");
+    let PrivacyScrubAdmission::Duplicate {
+        job_uuid: replayed,
+        phase,
+        intent: durable,
+    } = duplicate
+    else {
+        panic!("duplicate admission must replay the existing job");
+    };
+    assert_eq!(replayed, job_uuid);
+    assert_eq!(phase.phase, MigrationPhase::Submitted);
+    assert_eq!(durable, intent);
+    assert_eq!(store.job_uuids().unwrap(), vec![job_uuid]);
+}
+
+#[test]
+fn privacy_scrub_intent_collision_and_corruption_fail_closed() {
+    let tmp = TempDir::new().unwrap();
+    let store = fixed_store(&tmp);
+    store
+        .admit_privacy_scrub_intent(uuid::Uuid::new_v4(), privacy_scrub_intent("scrub_1"))
+        .unwrap();
+
+    let mut same_id_different_owner = privacy_scrub_intent("scrub_1");
+    same_id_different_owner.authenticated_app_id = "app_2".to_string();
+    let same_id_collision = store
+        .admit_privacy_scrub_intent(uuid::Uuid::new_v4(), same_id_different_owner)
+        .expect_err("same scrub ID under a different owner must fail closed");
+    assert_eq!(
+        same_id_collision.kind(),
+        SpoolErrorKind::PrivacyScrubIntentCollision
+    );
+    assert_eq!(store.job_uuids().unwrap().len(), 1);
+
+    let collision = store
+        .admit_privacy_scrub_intent(uuid::Uuid::new_v4(), privacy_scrub_intent("scrub_2"))
+        .expect_err("same identity under a different scrub ID must fail closed");
+    assert_eq!(
+        collision.kind(),
+        SpoolErrorKind::PrivacyScrubIntentCollision
+    );
+    assert_eq!(store.job_uuids().unwrap().len(), 1);
+
+    let corrupt_job = uuid::Uuid::new_v4();
+    store
+        .create_async_migration_admission_for_owner(corrupt_job, "products", Some("app_1"))
+        .unwrap();
+    std::fs::write(store.privacy_scrub_intent_path(corrupt_job), b"not json").unwrap();
+    let corrupt = store
+        .admit_privacy_scrub_intent(uuid::Uuid::new_v4(), privacy_scrub_intent("scrub_3"))
+        .expect_err("corrupt scrub intent must block new admission");
+    assert_eq!(corrupt.kind(), SpoolErrorKind::ManifestCorrupt);
+}
+
+#[test]
+fn privacy_scrub_terminal_replay_preserves_phase() {
+    let tmp = TempDir::new().unwrap();
+    let store = fixed_store(&tmp);
+    let job_uuid = uuid::Uuid::new_v4();
+    let intent = privacy_scrub_intent("scrub_1");
+    store
+        .admit_privacy_scrub_intent(job_uuid, intent.clone())
+        .unwrap();
+    for phase in [
+        MigrationPhase::Exporting,
+        MigrationPhase::Preparing,
+        MigrationPhase::Staging,
+        MigrationPhase::Activating,
+    ] {
+        store.transition_migration_phase(job_uuid, phase).unwrap();
+    }
+    store.succeed_migration(job_uuid).unwrap();
+    let terminal = store.read_migration_phase(job_uuid).unwrap();
+    assert_eq!(terminal.disposition, MigrationDisposition::Succeeded);
+    assert!(terminal.terminal_at.is_some());
+
+    let replay = store
+        .admit_privacy_scrub_intent(uuid::Uuid::new_v4(), intent)
+        .expect("terminal duplicate should replay the original job");
+    let PrivacyScrubAdmission::Duplicate {
+        job_uuid: replayed,
+        phase: replay_phase,
+        ..
+    } = replay
+    else {
+        panic!("terminal replay must not create a second job");
+    };
+    assert_eq!(replayed, job_uuid);
+    assert_eq!(replay_phase, terminal);
+    assert_eq!(store.read_migration_phase(job_uuid).unwrap(), terminal);
+    assert_eq!(store.job_uuids().unwrap(), vec![job_uuid]);
+}
+
 fn default_limit_export() -> (TempDir, SpoolStore, SpoolManifest) {
     let tmp = TempDir::new().unwrap();
     let limits = SpoolLimits::default();

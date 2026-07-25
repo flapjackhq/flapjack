@@ -38,6 +38,8 @@ fn create_non_admin_test_key(description: &str) -> (TempDir, Arc<KeyStore>, Stri
     (temp_dir, key_store, plaintext_key)
 }
 
+#[path = "auth_tests/batch_acl_tests.rs"]
+mod batch_acl_tests;
 #[path = "auth_tests/key_store_tests.rs"]
 mod key_store_tests;
 #[path = "auth_tests/middleware_tests.rs"]

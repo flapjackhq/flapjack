@@ -315,7 +315,22 @@ fn acl_async_migration_routes_require_admin_with_segment_safe_prefix() {
         "/1/migrations/algolia/01890f8e-8b28-78e8-b542-8cfdcb2d4f24/cancel",
         "admin",
     );
+    assert_required_acl(
+        Method::POST,
+        "/1/migrations/algolia/01890f8e-8b28-78e8-b542-8cfdcb2d4f24/acknowledge",
+        "admin",
+    );
     assert_public_route(Method::POST, "/1/migrations-evil/algolia");
+}
+
+#[test]
+fn privacy_scrub_auth_private_command_requires_private_migration_acl() {
+    assert_required_acl(
+        Method::POST,
+        "/1/migrations/privacy-scrub",
+        "privateMigration",
+    );
+    assert_public_route(Method::POST, "/1/migrations-privacy-scrub");
 }
 
 #[test]

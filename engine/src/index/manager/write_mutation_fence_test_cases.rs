@@ -1,6 +1,7 @@
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Mutex;
+    use std::time::Duration;
     use tempfile::TempDir;
     use tokio::sync::Barrier;
 
@@ -8,6 +9,8 @@
     const ACKED_BEFORE_REPLACEMENT: usize = 12;
     const OVERLAPPING_MUTATIONS: usize = ATTEMPTED_MUTATIONS - ACKED_BEFORE_REPLACEMENT;
     const ADMISSION_WAIT_YIELDS: usize = 10_000;
+    const ADMISSION_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
+    const ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(10);
     const CONTROL_TENANT_ID: &str = "mutation_fence_control";
 
     #[derive(Debug)]
@@ -405,15 +408,19 @@
         tenant_id: &str,
         expected_mutations: usize,
     ) -> usize {
-        let mut admitted_tasks = 0usize;
-        for _ in 0..ADMISSION_WAIT_YIELDS {
-            admitted_tasks = admitted_mutation_task_count(manager, tenant_id);
+        let deadline = tokio::time::Instant::now() + ADMISSION_WAIT_TIMEOUT;
+        loop {
+            let admitted_tasks = admitted_mutation_task_count(manager, tenant_id);
             if admitted_tasks == expected_mutations {
                 return admitted_tasks;
             }
-            tokio::task::yield_now().await;
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for admitted mutation tasks: observed {admitted_tasks}/{expected_mutations}"
+                );
+            }
+            tokio::time::sleep(ADMISSION_POLL_INTERVAL).await;
         }
-        admitted_tasks
     }
 
     fn admitted_mutation_task_count(manager: &IndexManager, tenant_id: &str) -> usize {

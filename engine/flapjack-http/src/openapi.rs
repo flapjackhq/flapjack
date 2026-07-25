@@ -177,6 +177,8 @@ pub const DOCUMENTED_INTERNAL_PATHS: [&str; 5] = [
         crate::handlers::migration::submit_algolia_migration,
         crate::handlers::migration::get_algolia_migration_status,
         crate::handlers::migration::cancel_algolia_migration,
+        crate::handlers::migration::submit_privacy_scrub,
+        crate::handlers::migration::acknowledge_algolia_migration,
         crate::handlers::migration::list_algolia_indexes,
         // Stage 7: Usage
         crate::handlers::usage::usage_global,
@@ -370,6 +372,8 @@ pub const DOCUMENTED_INTERNAL_PATHS: [&str; 5] = [
             crate::handlers::migration::ListAlgoliaIndexesRequest,
             crate::handlers::migration::AlgoliaIndexInfo,
             crate::handlers::migration::ListAlgoliaIndexesResponse,
+            crate::handlers::migration::PrivacyScrubRequest,
+            crate::handlers::migration::PrivacyScrubAck,
             // Stage 7: Chat
             crate::handlers::chat::ChatRequest,
             crate::handlers::chat::ChatResponse,
@@ -429,6 +433,14 @@ impl utoipa::Modify for SecurityAddon {
         if let Some(components) = openapi.components.as_mut() {
             components.add_security_scheme(
                 "api_key",
+                utoipa::openapi::security::SecurityScheme::ApiKey(
+                    utoipa::openapi::security::ApiKey::Header(
+                        utoipa::openapi::security::ApiKeyValue::new("x-algolia-api-key"),
+                    ),
+                ),
+            );
+            components.add_security_scheme(
+                "private_migration",
                 utoipa::openapi::security::SecurityScheme::ApiKey(
                     utoipa::openapi::security::ApiKey::Header(
                         utoipa::openapi::security::ApiKeyValue::new("x-algolia-api-key"),

@@ -28,6 +28,7 @@ use std::time::Instant;
 use crate::error_response::json_error;
 
 pub(crate) const INVALID_API_CREDENTIALS_MESSAGE: &str = "Invalid Application-ID or API key";
+pub(crate) const PRIVATE_MIGRATION_ACL: &str = "privateMigration";
 
 pub(super) fn invalid_api_credentials_error() -> Response {
     json_error(StatusCode::FORBIDDEN, INVALID_API_CREDENTIALS_MESSAGE)

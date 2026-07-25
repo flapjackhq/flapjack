@@ -1555,7 +1555,7 @@ cancel_preflight_sweep() {
   cancel_vendor_json read GET "/1/indexes" "" "$listing"
   jq -e '(.items | type) == "array"' "$listing" >/dev/null \
     || die "cancel Algolia GET /1/indexes response was missing an items array"
-  record_check "cancel_vendor_reachable" "pass" "GET https://${ALGOLIA_APP_ID}-dsn.algolia.net/1/indexes returned 200"
+  record_check "cancel_vendor_reachable" "pass" "GET /1/indexes returned 200"
 
   while IFS=$'\t' read -r disposition index; do
     [ -n "$index" ] || continue

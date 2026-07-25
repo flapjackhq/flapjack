@@ -55,7 +55,7 @@ See: docs2/3_IMPLEMENTATION/ARCHITECTURE.md
 
 - Per-tenant buffer: 31MB enforced
 - Concurrent writers: 40 system-wide enforced
-- Record size (HTTP layer): 100KB default, configurable via `FLAPJACK_MAX_RECORD_BYTES` → HTTP 400
+- Record size (HTTP layer): 100KB default, configurable via `FLAPJACK_MAX_RECORD_BYTES` → HTTP 413
 - Document size (write queue backstop): 3MB enforced
 - No OOM crashes (Meilisearch/Algolia pain point)
 

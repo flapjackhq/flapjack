@@ -1,3 +1,4 @@
+use super::PRIVATE_MIGRATION_ACL;
 use axum::http::Method;
 
 pub(crate) fn is_acme_challenge_path(path: &str) -> bool {
@@ -44,6 +45,9 @@ pub fn required_acl_for_route(method: &Method, path: &str) -> Option<&'static st
 /// Resolves ACL for non-index routes: keys, usage, analytics, personalization, logs,
 /// configs, metrics, internal endpoints, A/B tests, events, and user-token deletion.
 fn fixed_path_acl(method: &Method, path: &str) -> Option<&'static str> {
+    if *method == Method::POST && path == "/1/migrations/privacy-scrub" {
+        return Some(PRIVATE_MIGRATION_ACL);
+    }
     if path == "/1/migrate-from-algolia" || path == "/1/algolia-list-indexes" {
         return Some("admin");
     }

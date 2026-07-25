@@ -16,6 +16,10 @@ use crate::auth::{
 use crate::handlers;
 use crate::handlers::analytics;
 use crate::handlers::insights::GdprDeleteState;
+use crate::handlers::migration::{
+    cancel_algolia_migration_http, get_algolia_migration_status_http,
+    submit_algolia_migration_http, submit_privacy_scrub_http,
+};
 use crate::handlers::{
     add_documents, add_record_auto_id, append_security_source, batch_search, browse_index,
     chat_index, clear_index, clear_rules, clear_synonyms, compact_index, create_index,
@@ -58,7 +62,11 @@ pub fn build_router(
     let app = Router::new()
         .merge(build_health_routes(state.clone()))
         .merge(build_key_routes(key_store.clone()))
-        .merge(build_protected_routes(state.clone(), data_dir))
+        .merge(build_protected_routes(
+            state.clone(),
+            data_dir,
+            auth_enabled,
+        ))
         .merge(build_analytics_routes(
             state.clone(),
             Arc::clone(&analytics_collector),
@@ -121,8 +129,8 @@ fn build_key_routes(key_store: Option<Arc<KeyStore>>) -> Router {
 }
 
 /// Builds all auth-protected routes: indexing, search, objects, settings, synonyms, rules.
-fn build_protected_routes(state: Arc<AppState>, data_dir: &Path) -> Router {
-    let protected = Router::new()
+fn build_protected_routes(state: Arc<AppState>, data_dir: &Path, auth_enabled: bool) -> Router {
+    let mut protected = Router::new()
         .route("/1/indexes", post(create_index).get(list_indices))
         .route("/1/indexes/:indexName/browse", post(browse_index))
         .route("/1/indexes/:indexName/chat", post(chat_index))
@@ -223,17 +231,18 @@ fn build_protected_routes(state: Arc<AppState>, data_dir: &Path) -> Router {
                 .delete(delete_index),
         )
         .route("/1/migrate-from-algolia", post(migrate_from_algolia))
-        .route(
-            "/1/migrations/algolia",
-            post(handlers::submit_algolia_migration),
-        )
+        .route("/1/migrations/algolia", post(submit_algolia_migration_http))
         .route(
             "/1/migrations/algolia/:job_id",
-            get(handlers::get_algolia_migration_status),
+            get(get_algolia_migration_status_http),
         )
         .route(
             "/1/migrations/algolia/:job_id/cancel",
-            post(handlers::cancel_algolia_migration),
+            post(cancel_algolia_migration_http),
+        )
+        .route(
+            "/1/migrations/algolia/:job_id/acknowledge",
+            post(handlers::acknowledge_algolia_migration),
         )
         .route("/1/usage/:statistic", get(handlers::usage::usage_global))
         .route(
@@ -309,8 +318,16 @@ fn build_protected_routes(state: Arc<AppState>, data_dir: &Path) -> Router {
         .route(
             "/1/indexes/:_wildcard/recommendations",
             post(handlers::recommend::recommend),
-        )
-        .with_state(state.clone());
+        );
+
+    if auth_enabled {
+        protected = protected.route(
+            "/1/migrations/privacy-scrub",
+            post(submit_privacy_scrub_http),
+        );
+    }
+
+    let protected = protected.with_state(state.clone());
 
     let security_sources_matcher = Arc::new(SecuritySourcesMatcher::new(data_dir));
     let protected = protected.layer(middleware::from_fn(

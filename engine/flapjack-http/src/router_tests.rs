@@ -4,8 +4,8 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use flapjack::analytics::{AnalyticsCollector, AnalyticsConfig};
 use flapjack::index::manager::publication::{
-    ContentDigest, PublicationGenerationEvidence, PublicationJournal, PublicationPaths,
-    PublicationTarget, PublicationTransactionId,
+    ContentDigest, PublicationEvent, PublicationGenerationEvidence, PublicationJournal,
+    PublicationPaths, PublicationTarget, PublicationTransactionId,
 };
 use flapjack::{Document, FieldValue, IndexManager};
 use std::collections::HashMap;
@@ -141,6 +141,35 @@ fn build_no_auth_router_for_state(
     )
 }
 
+fn build_auth_router_for_state(
+    tmp: &TempDir,
+    state: Arc<crate::handlers::AppState>,
+    key_store: Arc<KeyStore>,
+) -> axum::Router {
+    let analytics_config = AnalyticsConfig {
+        enabled: false,
+        data_dir: tmp.path().join("analytics"),
+        flush_interval_secs: 60,
+        flush_size: 1000,
+        retention_days: 30,
+    };
+    let analytics_collector = AnalyticsCollector::new(analytics_config);
+    let trusted_proxy_matcher =
+        Arc::new(crate::middleware::TrustedProxyMatcher::from_optional_csv(None).unwrap());
+
+    crate::router::build_router(
+        state,
+        Some(key_store),
+        analytics_collector,
+        trusted_proxy_matcher,
+        tmp.path(),
+        crate::router::RouterConfig {
+            cors_mode: crate::startup::CorsMode::LoopbackOnly,
+            disable_dashboard: false,
+        },
+    )
+}
+
 fn publication_digest() -> ContentDigest {
     ContentDigest::new(format!("sha256:{}", "b".repeat(64))).unwrap()
 }
@@ -197,6 +226,27 @@ async fn create_journaled_publication_evidence(
     .unwrap();
 
     paths
+}
+
+fn write_committed_generation_evidence(
+    base: &std::path::Path,
+    target_name: &str,
+    generation: &str,
+) {
+    let target = PublicationTarget::new(target_name).unwrap();
+    let transaction = PublicationTransactionId::new(format!("{target_name}_current_gen")).unwrap();
+    let paths = PublicationPaths::new(base, &target, &transaction);
+    let journal = PublicationJournal::prepare(
+        transaction,
+        target,
+        PublicationGenerationEvidence::new(generation).unwrap(),
+        publication_digest(),
+        paths.clone(),
+    )
+    .apply(PublicationEvent::Commit)
+    .unwrap();
+    std::fs::create_dir_all(paths.journal.parent().unwrap()).unwrap();
+    std::fs::write(paths.journal, journal.to_json_value().to_string()).unwrap();
 }
 
 fn item_names(body: &serde_json::Value) -> Vec<String> {
@@ -430,6 +480,31 @@ async fn migration_routes_preserve_admin_contract() {
             "code": "migration_job_not_found"
         })
     );
+    let acknowledge_path = "/1/migrations/algolia/01890f8e-8b28-78e8-b542-8cfdcb2d4f24/acknowledge";
+    let acknowledge_missing_auth =
+        post_json(&app, acknowledge_path, None, serde_json::json!({})).await;
+    assert_invalid_credentials_response(acknowledge_missing_auth).await;
+    for api_key in [&search_key, &write_key] {
+        let non_admin =
+            post_json(&app, acknowledge_path, Some(api_key), serde_json::json!({})).await;
+        assert_method_not_allowed_response(non_admin).await;
+    }
+    let acknowledge_missing_job = post_json(
+        &app,
+        acknowledge_path,
+        Some("admin-key"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(acknowledge_missing_job.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        body_json(acknowledge_missing_job).await,
+        serde_json::json!({
+            "message": "Migration job not found",
+            "status": 404,
+            "code": "migration_job_not_found"
+        })
+    );
     let post_missing_auth = post_json(
         &app,
         "/1/migrations/algolia",
@@ -496,6 +571,86 @@ async fn migration_routes_preserve_admin_contract() {
             "status": 400
         })
     );
+}
+
+#[tokio::test]
+async fn privacy_scrub_router_is_private_and_not_publicly_reachable() {
+    let tmp = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let private_migration_key = create_test_key_with_acl(&key_store, "privateMigration");
+    let search_key = search_only_key_value(&key_store);
+    let state = TestStateBuilder::new(&tmp).with_analytics().build_shared();
+    state
+        .manager
+        .create_tenant("route_contract_tenant")
+        .unwrap();
+    write_committed_generation_evidence(
+        &state.manager.base_path,
+        "route_contract_tenant",
+        "generation-route-contract",
+    );
+    let app = build_auth_router_for_state(&tmp, Arc::clone(&state), Arc::clone(&key_store));
+    let no_auth_app = build_no_auth_router_for_state(&tmp, state);
+    let scrub_body = serde_json::json!({
+        "scrubId": "privacy-scrub-router-stable-id",
+        "tenant": "route_contract_tenant",
+        "objectIDs": ["doc-private"],
+        "expectedGeneration": "generation-route-contract"
+    });
+
+    let health_probe = send_empty_request(&app, Method::GET, "/health").await;
+    assert_eq!(
+        health_probe.status(),
+        StatusCode::OK,
+        "public health remains the only no-credential surface in this probe"
+    );
+
+    let no_auth_probe = post_json(
+        &no_auth_app,
+        "/1/migrations/privacy-scrub",
+        None,
+        scrub_body.clone(),
+    )
+    .await;
+    assert_eq!(
+        no_auth_probe.status(),
+        StatusCode::NOT_FOUND,
+        "privacy scrub must not be exposed by the no-auth/public router"
+    );
+
+    let search_key_probe = post_json(
+        &app,
+        "/1/migrations/privacy-scrub",
+        Some(&search_key),
+        scrub_body.clone(),
+    )
+    .await;
+    assert_method_not_allowed_response(search_key_probe).await;
+
+    let ordinary_admin_probe = post_json(
+        &app,
+        "/1/migrations/privacy-scrub",
+        Some("admin-key"),
+        scrub_body.clone(),
+    )
+    .await;
+    assert_method_not_allowed_response(ordinary_admin_probe).await;
+
+    let private_probe = post_json(
+        &app,
+        "/1/migrations/privacy-scrub",
+        Some(&private_migration_key),
+        scrub_body,
+    )
+    .await;
+    assert_eq!(
+        private_probe.status(),
+        StatusCode::ACCEPTED,
+        "authenticated private migration command should be routed to the scrub handler"
+    );
+    let ack = body_json(private_probe).await;
+    assert_eq!(ack["scrubId"], "privacy-scrub-router-stable-id");
+    assert_eq!(ack["disposition"], "acknowledged");
 }
 
 #[tokio::test]

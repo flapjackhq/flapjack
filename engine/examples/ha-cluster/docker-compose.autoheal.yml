@@ -1,0 +1,12 @@
+services:
+  node-a:
+    environment:
+      FLAPJACK_AUTOHEAL_ENABLED: "true"
+
+  node-b:
+    environment:
+      FLAPJACK_AUTOHEAL_ENABLED: "true"
+
+  node-c:
+    environment:
+      FLAPJACK_AUTOHEAL_ENABLED: "true"

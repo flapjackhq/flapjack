@@ -20,6 +20,7 @@ const JOBS_DIR: &str = "jobs";
 const MANIFEST_FILE: &str = "manifest.json";
 const MIGRATION_PHASE_FILE: &str = "migration_phase.json";
 const ASYNC_MIGRATION_METADATA_FILE: &str = "async_migration.json";
+const PRIVACY_SCRUB_INTENT_FILE: &str = "privacy_scrub_intent.json";
 const ROOT_LOCK_FILE: &str = ".root.lock";
 const JOB_LOCK_FILE: &str = ".job.lock";
 #[cfg(test)]
@@ -223,6 +224,67 @@ pub(crate) struct AsyncMigrationMetadata {
     pub publication_transaction_id: Option<PublicationTransactionId>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PrivacyScrubIntent {
+    pub kind: String,
+    #[serde(rename = "scrubId")]
+    pub scrub_id: String,
+    pub tenant: String,
+    #[serde(rename = "expectedGeneration")]
+    pub expected_generation: String,
+    #[serde(rename = "objectIDs")]
+    pub object_ids: Vec<String>,
+    #[serde(rename = "synonymIDs")]
+    pub synonym_ids: Vec<String>,
+    #[serde(rename = "ruleIDs")]
+    pub rule_ids: Vec<String>,
+    #[serde(rename = "authenticatedAppId")]
+    pub authenticated_app_id: String,
+    #[serde(rename = "createdAt")]
+    pub created_at: DateTime<Utc>,
+}
+
+pub(crate) struct PrivacyScrubIntentFields {
+    pub scrub_id: String,
+    pub tenant: String,
+    pub expected_generation: String,
+    pub object_ids: Vec<String>,
+    pub synonym_ids: Vec<String>,
+    pub rule_ids: Vec<String>,
+    pub authenticated_app_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl PrivacyScrubIntent {
+    pub(crate) fn from_fields(fields: PrivacyScrubIntentFields) -> Self {
+        Self {
+            kind: "privacy_scrub_intent".to_string(),
+            scrub_id: fields.scrub_id,
+            tenant: fields.tenant,
+            expected_generation: fields.expected_generation,
+            object_ids: fields.object_ids,
+            synonym_ids: fields.synonym_ids,
+            rule_ids: fields.rule_ids,
+            authenticated_app_id: fields.authenticated_app_id,
+            created_at: fields.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PrivacyScrubAdmission {
+    Created {
+        job_uuid: Uuid,
+        phase: MigrationPhaseRecord,
+        intent: PrivacyScrubIntent,
+    },
+    Duplicate {
+        job_uuid: Uuid,
+        phase: MigrationPhaseRecord,
+        intent: PrivacyScrubIntent,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MigrationCancelRequest {
     Requested(MigrationPhaseRecord),
@@ -414,6 +476,7 @@ pub(crate) enum SpoolErrorKind {
     JobNotAccepted,
     UnsupportedArtifactKind,
     InvalidPhaseTransition,
+    PrivacyScrubIntentCollision,
 }
 
 #[derive(Debug)]
@@ -486,6 +549,34 @@ pub(crate) struct SpoolStore {
     fixed_now: Option<DateTime<Utc>>,
     free_bytes: Option<u64>,
     completed_ids: Arc<Mutex<CompletedIdCache>>,
+}
+
+fn privacy_scrub_identity_matches(
+    existing: &PrivacyScrubIntent,
+    requested: &PrivacyScrubIntent,
+) -> bool {
+    existing.scrub_id == requested.scrub_id
+        && privacy_scrub_core_identity_matches(existing, requested)
+}
+
+fn privacy_scrub_identity_without_id_matches(
+    existing: &PrivacyScrubIntent,
+    requested: &PrivacyScrubIntent,
+) -> bool {
+    existing.scrub_id != requested.scrub_id
+        && privacy_scrub_core_identity_matches(existing, requested)
+}
+
+fn privacy_scrub_core_identity_matches(
+    existing: &PrivacyScrubIntent,
+    requested: &PrivacyScrubIntent,
+) -> bool {
+    existing.authenticated_app_id == requested.authenticated_app_id
+        && existing.tenant == requested.tenant
+        && existing.expected_generation == requested.expected_generation
+        && existing.object_ids == requested.object_ids
+        && existing.synonym_ids == requested.synonym_ids
+        && existing.rule_ids == requested.rule_ids
 }
 
 impl SpoolStore {
@@ -569,6 +660,48 @@ impl SpoolStore {
         let record = self.initial_migration_phase_record(job_uuid);
         self.commit_migration_phase(&record)?;
         Ok(record)
+    }
+
+    pub(crate) fn admit_privacy_scrub_intent(
+        &self,
+        job_uuid: Uuid,
+        requested: PrivacyScrubIntent,
+    ) -> SpoolResult<PrivacyScrubAdmission> {
+        let _root_lock = self.lock_root()?;
+        if let Some((existing_job_uuid, existing_intent)) =
+            self.find_privacy_scrub_intent_locked(&requested)?
+        {
+            let phase = self.read_migration_phase(existing_job_uuid)?;
+            if privacy_scrub_identity_matches(&existing_intent, &requested) {
+                return Ok(PrivacyScrubAdmission::Duplicate {
+                    job_uuid: existing_job_uuid,
+                    phase,
+                    intent: existing_intent,
+                });
+            }
+            return Err(SpoolError::new(SpoolErrorKind::PrivacyScrubIntentCollision));
+        }
+
+        let job_dir = self.job_dir(job_uuid);
+        if job_dir.exists() {
+            return Err(SpoolError::new(SpoolErrorKind::JobTerminal));
+        }
+        create_private_dir(&job_dir)?;
+        let metadata = AsyncMigrationMetadata {
+            job_uuid,
+            target_index: requested.tenant.clone(),
+            authenticated_app_id: Some(requested.authenticated_app_id.clone()),
+            publication_transaction_id: None,
+        };
+        self.commit_async_migration_metadata(&metadata)?;
+        self.commit_privacy_scrub_intent(&requested, job_uuid)?;
+        let phase = self.initial_migration_phase_record(job_uuid);
+        self.commit_migration_phase(&phase)?;
+        Ok(PrivacyScrubAdmission::Created {
+            job_uuid,
+            phase,
+            intent: requested,
+        })
     }
 
     #[cfg(test)]
@@ -669,6 +802,69 @@ impl SpoolStore {
             return Err(SpoolError::new(SpoolErrorKind::ManifestCorrupt));
         }
         Ok(metadata)
+    }
+
+    pub(crate) fn read_privacy_scrub_intent(
+        &self,
+        job_uuid: Uuid,
+    ) -> SpoolResult<PrivacyScrubIntent> {
+        let bytes = match fs::read(self.privacy_scrub_intent_path(job_uuid)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(SpoolError::new(SpoolErrorKind::JobNotFound));
+            }
+            Err(error) => return Err(SpoolError::from(error)),
+        };
+        let intent: PrivacyScrubIntent = serde_json::from_slice(&bytes)
+            .map_err(|_| SpoolError::new(SpoolErrorKind::ManifestCorrupt))?;
+        if intent.kind != "privacy_scrub_intent" {
+            return Err(SpoolError::new(SpoolErrorKind::ManifestCorrupt));
+        }
+        Ok(intent)
+    }
+
+    pub(crate) fn read_privacy_scrub_intent_if_exists(
+        &self,
+        job_uuid: Uuid,
+    ) -> SpoolResult<Option<PrivacyScrubIntent>> {
+        match self.read_privacy_scrub_intent(job_uuid) {
+            Ok(intent) => Ok(Some(intent)),
+            Err(error) if error.kind() == SpoolErrorKind::JobNotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn find_privacy_scrub_intent_locked(
+        &self,
+        requested: &PrivacyScrubIntent,
+    ) -> SpoolResult<Option<(Uuid, PrivacyScrubIntent)>> {
+        let mut intents = Vec::new();
+        for candidate in self.job_uuids()? {
+            let Some(intent) = self.read_privacy_scrub_intent_if_exists(candidate)? else {
+                continue;
+            };
+            intents.push((candidate, intent));
+        }
+        for (candidate, intent) in &intents {
+            if intent.authenticated_app_id == requested.authenticated_app_id
+                && intent.scrub_id == requested.scrub_id
+            {
+                return Ok(Some((*candidate, intent.clone())));
+            }
+        }
+        for (_candidate, intent) in &intents {
+            if intent.scrub_id == requested.scrub_id
+                && intent.authenticated_app_id != requested.authenticated_app_id
+            {
+                return Err(SpoolError::new(SpoolErrorKind::PrivacyScrubIntentCollision));
+            }
+        }
+        for (_candidate, intent) in &intents {
+            if privacy_scrub_identity_without_id_matches(intent, requested) {
+                return Err(SpoolError::new(SpoolErrorKind::PrivacyScrubIntentCollision));
+            }
+        }
+        Ok(None)
     }
 
     pub(crate) fn read_async_migration_metadata_if_exists(

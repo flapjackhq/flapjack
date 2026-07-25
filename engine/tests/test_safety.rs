@@ -573,10 +573,10 @@ mod memory_safety {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 400, "Expected 400 for batch too large");
+        assert_eq!(resp.status(), 413, "Expected 413 for batch too large");
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(body["message"].as_str().unwrap().contains("Batch size"));
-        assert_eq!(body["status"], 400);
+        assert_eq!(body["status"], 413);
     }
 
     #[tokio::test]

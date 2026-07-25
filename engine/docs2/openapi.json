@@ -836,6 +836,9 @@
                 }
               }
             }
+          },
+          "413": {
+            "description": "Record exceeds configured size limit"
           }
         },
         "security": [
@@ -923,6 +926,9 @@
           },
           "400": {
             "description": "Invalid request"
+          },
+          "413": {
+            "description": "Batch or record exceeds configured size limits"
           }
         },
         "security": [
@@ -3007,6 +3013,50 @@
         ]
       }
     },
+    "/1/migrations/algolia/{job_id}/acknowledge": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Confirm that the control plane has durably observed a terminal migration.",
+        "description": "The acknowledgement is intentionally an idempotent no-op in the engine:\nfjcloud owns its retained outbox and only needs an authenticated terminal\nreceipt before releasing the destination reservation.",
+        "operationId": "acknowledge_algolia_migration",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Migration job UUID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Terminal migration acknowledged"
+          },
+          "400": {
+            "description": "Invalid migration job UUID"
+          },
+          "404": {
+            "description": "No durable migration phase record is currently retained for the UUID"
+          },
+          "409": {
+            "description": "migration_ack_too_early"
+          },
+          "500": {
+            "description": "Migration status record could not be read"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
     "/1/migrations/algolia/{job_id}/cancel": {
       "post": {
         "tags": [
@@ -3054,6 +3104,50 @@
         "security": [
           {
             "api_key": []
+          }
+        ]
+      }
+    },
+    "/1/migrations/privacy-scrub": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "operationId": "submit_privacy_scrub",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrivacyScrubRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Privacy scrub exact-absence ACK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrivacyScrubAck"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid privacy scrub request"
+          },
+          "403": {
+            "description": "Private migration credential required"
+          },
+          "409": {
+            "description": "Privacy scrub refused or retryable"
+          }
+        },
+        "security": [
+          {
+            "private_migration": []
           }
         ]
       }
@@ -9098,6 +9192,58 @@
           "abandonmentRate"
         ]
       },
+      "PrivacyScrubAck": {
+        "type": "object",
+        "required": [
+          "scrubId",
+          "disposition"
+        ],
+        "properties": {
+          "disposition": {
+            "type": "string"
+          },
+          "scrubId": {
+            "type": "string"
+          }
+        }
+      },
+      "PrivacyScrubRequest": {
+        "type": "object",
+        "required": [
+          "scrubId",
+          "tenant",
+          "expectedGeneration"
+        ],
+        "properties": {
+          "expectedGeneration": {
+            "type": "string"
+          },
+          "objectIDs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "ruleIDs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "scrubId": {
+            "type": "string"
+          },
+          "synonymIDs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "tenant": {
+            "type": "string"
+          }
+        }
+      },
       "PublicBuildInfo": {
         "type": "object",
         "required": [
@@ -11197,6 +11343,11 @@
     },
     "securitySchemes": {
       "api_key": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-algolia-api-key"
+      },
+      "private_migration": {
         "type": "apiKey",
         "in": "header",
         "name": "x-algolia-api-key"

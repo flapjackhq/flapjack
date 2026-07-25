@@ -274,7 +274,8 @@ pub(super) fn merge_partial_update(
     request_body(content = serde_json::Value, description = "Batch operations or single document"),
     responses(
         (status = 200, description = "Documents added successfully", body = BatchWriteResponse),
-        (status = 400, description = "Invalid request")
+        (status = 400, description = "Invalid request"),
+        (status = 413, description = "Batch or record exceeds configured size limits")
     ),
     security(
         ("api_key" = [])
@@ -908,7 +909,8 @@ pub async fn delete_by_query(
     ),
     request_body(content = serde_json::Value, description = "Object data (objectID is auto-generated)"),
     responses(
-        (status = 201, description = "Object created successfully", body = SaveObjectResponse)
+        (status = 201, description = "Object created successfully", body = SaveObjectResponse),
+        (status = 413, description = "Record exceeds configured size limit")
     ),
     security(
         ("api_key" = [])

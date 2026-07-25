@@ -105,6 +105,9 @@ scale_request_budget_ceiling
 scale_accepted_trial_count
 scale_even_trial_medians
 scale_repository_receipt
+privacy_scrub_transport_receipt_exact_head
+privacy_scrub_transport_receipt_rejects_stale_head
+privacy_scrub_transport_receipt_rejects_empty_commands
 inventory_rejects_missing_stage3_id
 verified_importing_bad_counts
 verified_importing_bad_known_answers
@@ -263,6 +266,9 @@ scenario_id_for_label() {
     'scale two-point receipt reports the accepted trial count') printf '%s\n' 'scale_accepted_trial_count' ;;
     'scale two-point computes mathematical medians for four accepted trials') printf '%s\n' 'scale_even_trial_medians' ;;
     'repository selected scale receipt is clean-head and archive-resolving') printf '%s\n' 'scale_repository_receipt' ;;
+    'privacy scrub transport receipt validates the reviewed merge baseline') printf '%s\n' 'privacy_scrub_transport_receipt_exact_head' ;;
+    'privacy scrub transport receipt rejects stale validated-head evidence') printf '%s\n' 'privacy_scrub_transport_receipt_rejects_stale_head' ;;
+    'privacy scrub transport receipt rejects empty validation command evidence') printf '%s\n' 'privacy_scrub_transport_receipt_rejects_empty_commands' ;;
     'scenario inventory rejects a missing Stage 3 scenario ID') printf '%s\n' 'inventory_rejects_missing_stage3_id' ;;
     'verified importing rejects response count drift') printf '%s\n' 'verified_importing_bad_counts' ;;
     'verified importing rejects known-answer field drift') printf '%s\n' 'verified_importing_bad_known_answers' ;;
@@ -616,6 +622,9 @@ method, body, url, fail_health = parse_args(sys.argv[1:])
 parsed = urllib.parse.urlparse(url)
 
 if fail_health and parsed.path == "/health":
+    sys.exit(0)
+if parsed.path == "/health":
+    sys.stdout.write("200")
     sys.exit(0)
 
 append("request_order.log", f"{method} {parsed.path}")
@@ -1627,6 +1636,65 @@ assert_repository_scale_evidence_contract() {
   else
     fail 'repository selected scale receipt is clean-head and archive-resolving' "receipt=$receipt_rel"
   fi
+}
+
+assert_privacy_scrub_transport_receipt_contract() {
+  local repo_dir receipt_path script_path runtime backup pass_out stale_out empty_out
+  repo_dir="$(cd "$SCRIPT_DIR/../.." && pwd)"
+  receipt_path="$repo_dir/engine/docs2/4_EVIDENCE/privacy_scrub_transport_receipt.json"
+  script_path="$repo_dir/scripts/update_algolia_migration_engine_contract.sh"
+  runtime="$WORK_DIR/privacy-scrub-transport-receipt"
+  backup="$runtime/original.json"
+  pass_out="$runtime/pass.out"
+  stale_out="$runtime/stale-head.out"
+  empty_out="$runtime/empty-commands.out"
+  mkdir -p "$runtime"
+  cp "$receipt_path" "$backup"
+
+  if (
+    cd "$repo_dir"
+    bash "$script_path" --check >"$pass_out" 2>&1
+  ); then
+    pass 'privacy scrub transport receipt validates the reviewed merge baseline'
+  else
+    fail 'privacy scrub transport receipt validates the reviewed merge baseline' "output=$(cat "$pass_out")"
+  fi
+
+  python3 - "$backup" "$runtime/stale-head.json" <<'PY'
+import json, sys
+source_path, out_path = sys.argv[1], sys.argv[2]
+receipt = json.load(open(source_path))
+receipt["validated_head_sha"] = "a50ed95a45c2a4b04a86815a192f18b39a1a5bd2"
+json.dump(receipt, open(out_path, "w"))
+PY
+  cp "$runtime/stale-head.json" "$receipt_path"
+  if ! (
+    cd "$repo_dir"
+    bash "$script_path" --check >"$stale_out" 2>&1
+  ) && grep -Fq 'validated_head_sha' "$stale_out"; then
+    pass 'privacy scrub transport receipt rejects stale validated-head evidence'
+  else
+    fail 'privacy scrub transport receipt rejects stale validated-head evidence' "output=$(cat "$stale_out" 2>/dev/null || true)"
+  fi
+  cp "$backup" "$receipt_path"
+
+  python3 - "$backup" "$runtime/empty-commands.json" <<'PY'
+import json, sys
+source_path, out_path = sys.argv[1], sys.argv[2]
+receipt = json.load(open(source_path))
+receipt["validation_commands"] = {}
+json.dump(receipt, open(out_path, "w"))
+PY
+  cp "$runtime/empty-commands.json" "$receipt_path"
+  if ! (
+    cd "$repo_dir"
+    bash "$script_path" --check >"$empty_out" 2>&1
+  ) && grep -Fq 'validation_commands is empty' "$empty_out"; then
+    pass 'privacy scrub transport receipt rejects empty validation command evidence'
+  else
+    fail 'privacy scrub transport receipt rejects empty validation command evidence' "output=$(cat "$empty_out" 2>/dev/null || true)"
+  fi
+  cp "$backup" "$receipt_path"
 }
 
 assert_generator_contract() {
@@ -3180,6 +3248,7 @@ main() {
   assert_scale_two_point_receipt_reports_accepted_trial_count
   assert_scale_two_point_even_trial_medians
   assert_repository_scale_evidence_contract
+  assert_privacy_scrub_transport_receipt_contract
   assert_scenario_inventory_rejects_missing_stage3_id
   assert_replica_success_scenario
 
