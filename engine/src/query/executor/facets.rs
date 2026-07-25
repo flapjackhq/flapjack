@@ -2,6 +2,7 @@
 use super::QueryExecutor;
 use crate::error::Result;
 use crate::types::{FacetCount, FacetRequest, FacetStats, SearchResult, Sort};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use tantivy::collector::{Count, FacetCollector, TopDocs};
 use tantivy::query::Query as TantivyQuery;
@@ -406,7 +407,7 @@ impl QueryExecutor {
                         leaf.to_lowercase().contains(vq)
                     })
                     .collect();
-                matches.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.path.cmp(&b.path)));
+                matches.sort_by(compare_facet_counts);
                 if matches.len() > limit {
                     value_query_truncated = true;
                     matches.truncate(limit);
@@ -424,7 +425,7 @@ impl QueryExecutor {
             };
 
             let mut counts = counts;
-            counts.sort_by_key(|b| std::cmp::Reverse(b.count));
+            counts.sort_by(compare_facet_counts);
             result
                 .entry(req.field.clone())
                 .or_insert_with(Vec::new)
@@ -490,6 +491,10 @@ fn clean_facet_path(req: &FacetRequest, facet: &tantivy::schema::Facet) -> Strin
     let trimmed = path_str.trim_start_matches('/');
     let prefix = format!("{}/", req.path.trim_start_matches('/'));
     trimmed.strip_prefix(&prefix).unwrap_or(trimmed).to_string()
+}
+
+fn compare_facet_counts(a: &FacetCount, b: &FacetCount) -> Ordering {
+    b.count.cmp(&a.count).then_with(|| a.path.cmp(&b.path))
 }
 
 #[cfg(test)]

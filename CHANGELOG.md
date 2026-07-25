@@ -7,6 +7,14 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Oversized ingestion requests now return HTTP `413 Payload Too Large` instead of `400 Bad Request` for both per-document (`DocumentTooLarge`) and per-batch (`BatchTooLarge`) size-limit rejections, letting ingestion clients distinguish "chunk and retry" from a malformed request.
+
+### Fixed
+
+- Explicit empty arrays (`[]`) in customer document fields are now preserved on write instead of being dropped, keeping customer-supplied content intact.
+
 ## [1.0.10] - 2026-06-09
 
 ### Fixed

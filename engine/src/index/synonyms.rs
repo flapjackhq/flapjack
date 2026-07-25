@@ -193,8 +193,8 @@ impl SynonymStore {
             .collect();
 
         let total = filtered.len();
-        let start = page * hits_per_page;
-        let end = (start + hits_per_page).min(total);
+        let start = page.saturating_mul(hits_per_page);
+        let end = start.saturating_add(hits_per_page).min(total);
 
         let page_items = if start < total {
             filtered[start..end].to_vec()
@@ -418,6 +418,18 @@ mod tests {
 
         let (page_oob, _) = store.search("", None, 10, 2);
         assert!(page_oob.is_empty(), "out-of-bounds page should be empty");
+    }
+
+    #[test]
+    fn search_pagination_extreme_page_does_not_panic() {
+        let mut store = SynonymStore::new();
+        for i in 0..5 {
+            store.insert(regular(&format!("syn-{i}"), &[&format!("word-{i}")]));
+        }
+
+        let (results, total) = store.search("", None, usize::MAX, 2);
+        assert_eq!(total, 5);
+        assert!(results.is_empty());
     }
 
     // -- expand_query --

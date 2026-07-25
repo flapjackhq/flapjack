@@ -394,8 +394,8 @@ impl RuleStore {
         matching.sort_by(|a, b| a.object_id.cmp(&b.object_id));
 
         let total = matching.len();
-        let start = page * hits_per_page;
-        let end = (start + hits_per_page).min(total);
+        let start = page.saturating_mul(hits_per_page);
+        let end = start.saturating_add(hits_per_page).min(total);
 
         let hits = if start < total {
             matching[start..end].to_vec()

@@ -9,8 +9,12 @@ use crate::handlers::migration::spool::{
     MigrationDisposition, MigrationExportProgress, MigrationPhase, MigrationPhaseRecord,
 };
 use crate::test_helpers::{body_json, TestStateBuilder};
+use axum::body::Body;
 use axum::extract::Path as AxumPath;
+use axum::http::{Request, Response};
 use axum::response::IntoResponse;
+use axum::routing::post;
+use axum::Router;
 use chrono::{TimeZone, Utc};
 use serde_json::json;
 use std::sync::{
@@ -19,6 +23,7 @@ use std::sync::{
 };
 use tempfile::TempDir;
 use tokio::sync::Notify;
+use tower::ServiceExt;
 use uuid::Uuid;
 
 #[test]
@@ -342,6 +347,7 @@ async fn async_acknowledge_terminal_job_returns_no_content_and_preserves_phase()
     let status = acknowledge_algolia_migration(
         State(Arc::clone(&state)),
         axum::extract::Extension(AuthenticatedAppId("async-owner-app".to_string())),
+        HeaderMap::new(),
         AxumPath(job_uuid.to_string()),
     )
     .await
@@ -352,32 +358,95 @@ async fn async_acknowledge_terminal_job_returns_no_content_and_preserves_phase()
 }
 
 #[tokio::test]
+async fn async_acknowledge_uses_authenticated_header_owner_identity() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let spool = import::spool_for_manager(&state.manager).unwrap();
+    let app = acknowledge_route(Arc::clone(&state));
+    let job_uuid = Uuid::new_v4();
+    let not_found_body = json!({
+        "message": "Migration job not found",
+        "status": 404,
+        "code": "migration_job_not_found"
+    });
+
+    spool
+        .create_async_migration_admission_for_owner(
+            job_uuid,
+            "acknowledged_terminal_header_owner",
+            Some(
+                "async-owner-app:85dbe15d75ef9308c7ae0f33c7a324cc6f4bf519a2ed2f3027bd33c140a4f9aa",
+            ),
+        )
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Exporting)
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Preparing)
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Staging)
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Activating)
+        .unwrap();
+    let terminal_before = spool.succeed_migration(job_uuid).unwrap();
+
+    let first = send_acknowledge_request(&app, job_uuid, "async-owner-app", "secret-key").await;
+    assert_eq!(first.status(), StatusCode::NO_CONTENT);
+    let terminal_between = spool.read_migration_phase(job_uuid).unwrap();
+    assert_eq!(terminal_between, terminal_before);
+
+    let second = send_acknowledge_request(&app, job_uuid, "async-owner-app", "secret-key").await;
+    assert_eq!(second.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        spool.read_migration_phase(job_uuid).unwrap(),
+        terminal_before
+    );
+
+    let wrong_key =
+        send_acknowledge_request(&app, job_uuid, "async-owner-app", "wrong-secret-key").await;
+    assert_eq!(wrong_key.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(wrong_key).await, not_found_body);
+    assert_eq!(
+        spool.read_migration_phase(job_uuid).unwrap(),
+        terminal_before
+    );
+
+    let wrong_app = send_acknowledge_request(&app, job_uuid, "other-owner-app", "secret-key").await;
+    assert_eq!(wrong_app.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(wrong_app).await, not_found_body);
+    assert_eq!(
+        spool.read_migration_phase(job_uuid).unwrap(),
+        terminal_before
+    );
+}
+
+#[tokio::test]
 async fn async_acknowledge_running_job_fails_closed_without_mutating_phase() {
     let tmp = TempDir::new().unwrap();
     let state = TestStateBuilder::new(&tmp).build_shared();
     let spool = import::spool_for_manager(&state.manager).unwrap();
+    let app = acknowledge_route(Arc::clone(&state));
     let job_uuid = Uuid::new_v4();
 
     spool
         .create_async_migration_admission_for_owner(
             job_uuid,
             "acknowledge_too_early",
-            Some("async-owner-app"),
+            Some(
+                "async-owner-app:85dbe15d75ef9308c7ae0f33c7a324cc6f4bf519a2ed2f3027bd33c140a4f9aa",
+            ),
         )
         .unwrap();
     let running = spool.read_migration_phase(job_uuid).unwrap();
 
-    let error = acknowledge_algolia_migration(
-        State(Arc::clone(&state)),
-        axum::extract::Extension(AuthenticatedAppId("async-owner-app".to_string())),
-        AxumPath(job_uuid.to_string()),
-    )
-    .await
-    .expect_err("running migration ACK must fail closed");
+    let response = send_acknowledge_request(&app, job_uuid, "async-owner-app", "secret-key").await;
 
-    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     assert_eq!(
-        body_json(error.1.into_response()).await,
+        body_json(response).await,
         json!({
             "message": "Migration job must be terminal before it can be acknowledged",
             "status": 409,
@@ -385,6 +454,33 @@ async fn async_acknowledge_running_job_fails_closed_without_mutating_phase() {
         })
     );
     assert_eq!(spool.read_migration_phase(job_uuid).unwrap(), running);
+}
+
+fn acknowledge_route(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route(
+            "/1/migrations/algolia/:job_id/acknowledge",
+            post(acknowledge_algolia_migration),
+        )
+        .with_state(state)
+}
+
+async fn send_acknowledge_request(
+    app: &Router,
+    job_uuid: Uuid,
+    authenticated_app_id: &str,
+    api_key: &str,
+) -> Response<Body> {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(format!("/1/migrations/algolia/{job_uuid}/acknowledge"))
+        .header("x-algolia-api-key", api_key)
+        .body(Body::empty())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(AuthenticatedAppId(authenticated_app_id.to_string()));
+    app.clone().oneshot(request).await.unwrap()
 }
 
 #[tokio::test]

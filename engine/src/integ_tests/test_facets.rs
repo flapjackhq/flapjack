@@ -1415,6 +1415,48 @@ async fn test_facet_search_sorted_by_count_desc() {
     }
 }
 
+/// Verify that plain facet count ties use path order independent of document insertion order.
+#[tokio::test]
+async fn test_plain_facet_tied_counts_sort_by_path() {
+    let index_a_docs = vec![
+        doc("a1", vec![("brand", text("Acme")), ("name", text("A1"))]),
+        doc("a2", vec![("brand", text("Acme")), ("name", text("A2"))]),
+        doc("a3", vec![("brand", text("Bolt")), ("name", text("A3"))]),
+        doc("a4", vec![("brand", text("Bolt")), ("name", text("A4"))]),
+    ];
+    let index_b_docs = vec![
+        doc("b1", vec![("brand", text("Bolt")), ("name", text("B1"))]),
+        doc("b2", vec![("brand", text("Bolt")), ("name", text("B2"))]),
+        doc("b3", vec![("brand", text("Acme")), ("name", text("B3"))]),
+        doc("b4", vec![("brand", text("Acme")), ("name", text("B4"))]),
+    ];
+    let (_tmp_a, mgr_a) = setup_with_settings(vec!["brand"], index_a_docs).await;
+    let (_tmp_b, mgr_b) = setup_with_settings(vec!["brand"], index_b_docs).await;
+
+    for mgr in [&mgr_a, &mgr_b] {
+        let result = mgr
+            .search_full(
+                "test",
+                "",
+                None,
+                None,
+                0,
+                0,
+                Some(&[facet_req("brand")]),
+                None,
+                Some(1000),
+            )
+            .unwrap();
+        let brands = result.facets.get("brand").expect("brand facets");
+        let actual: Vec<_> = brands
+            .iter()
+            .map(|facet| (facet.path.as_str(), facet.count))
+            .collect();
+
+        assert_eq!(actual, vec![("Acme", 2), ("Bolt", 2)]);
+    }
+}
+
 /// Verify that facet count ordering is preserved through JSON serialization and deserialization round-trip.
 #[tokio::test]
 async fn test_facet_json_serialization_preserves_count_order() {

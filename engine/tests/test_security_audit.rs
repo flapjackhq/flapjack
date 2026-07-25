@@ -1829,19 +1829,28 @@ fn a08_archive_with_patched_path(path: &str, contents: &[u8]) -> Vec<u8> {
     encoder.finish().expect("must finalize gzip stream")
 }
 
-fn a08_archive_with_symlink(link_path: &str, target: &str, payload_path: &str) -> Vec<u8> {
+// Build a gzipped tar carrying a single link entry (symlink or hard link,
+// selected by `entry_type`) followed by a regular payload entry. Both symlink
+// and hard-link entries are written through `append_link`, so parameterizing by
+// `EntryType` keeps one source of truth for the crafted link-escape fixture.
+fn a08_archive_with_link(
+    entry_type: EntryType,
+    link_path: &str,
+    target: &str,
+    payload_path: &str,
+) -> Vec<u8> {
     let mut archive = Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
 
-    let mut symlink_header = Header::new_gnu();
-    symlink_header.set_entry_type(EntryType::Symlink);
-    symlink_header.set_size(0);
-    symlink_header.set_mode(0o777);
-    symlink_header.set_cksum();
+    let mut link_header = Header::new_gnu();
+    link_header.set_entry_type(entry_type);
+    link_header.set_size(0);
+    link_header.set_mode(0o777);
+    link_header.set_cksum();
     archive
-        .append_link(&mut symlink_header, link_path, target)
-        .expect("must build symlink entry");
+        .append_link(&mut link_header, link_path, target)
+        .expect("must build link entry");
 
-    let payload = b"symlink-escape-probe";
+    let payload = b"link-escape-probe";
     let mut payload_header = Header::new_gnu();
     payload_header.set_entry_type(EntryType::Regular);
     payload_header.set_size(payload.len() as u64);
@@ -1858,6 +1867,36 @@ fn a08_archive_with_symlink(link_path: &str, target: &str, payload_path: &str) -
         .expect("must finalize gzip stream")
 }
 
+// Assert a crafted snapshot archive is rejected by the Flapjack guard itself.
+// Checking `expected_guard_error` proves the rejection came from
+// `validate_archive_entries` rather than incidental `tar::Archive::unpack`
+// behavior, and `!outside_path.exists()` proves nothing escaped the destination.
+fn a08_assert_snapshot_import_rejected(
+    archive: &[u8],
+    dest: &Path,
+    outside_path: &Path,
+    expected_guard_error: &str,
+) {
+    let result = flapjack::index::snapshot::import_from_bytes(archive, dest);
+    assert!(
+        result.is_err(),
+        "snapshot import must reject the crafted archive entry"
+    );
+    let message = result
+        .expect_err("snapshot import rejection must surface an error")
+        .to_string();
+    assert!(
+        message.contains(expected_guard_error),
+        "rejection must come from the Flapjack snapshot guard, not incidental tar unpack \
+         behavior; expected error containing {expected_guard_error:?}, got: {message}"
+    );
+    assert!(
+        !outside_path.exists(),
+        "rejected archive must not write outside destination: {}",
+        outside_path.display()
+    );
+}
+
 #[test]
 fn a08_snapshot_import_rejects_parent_dir_traversal_entries() {
     let sandbox = TempDir::new().expect("sandbox tempdir");
@@ -1865,14 +1904,11 @@ fn a08_snapshot_import_rejects_parent_dir_traversal_entries() {
     let outside_path = sandbox.path().join("outside.txt");
     let archive = a08_archive_with_patched_path("../outside.txt", b"escaped");
 
-    let result = flapjack::index::snapshot::import_from_bytes(&archive, &dest);
-    assert!(
-        result.is_err(),
-        "snapshot import must reject parent-dir traversal entries"
-    );
-    assert!(
-        !outside_path.exists(),
-        "rejected traversal archive must not write outside destination"
+    a08_assert_snapshot_import_rejected(
+        &archive,
+        &dest,
+        &outside_path,
+        "snapshot entry path escapes destination",
     );
 }
 
@@ -1884,14 +1920,11 @@ fn a08_snapshot_import_rejects_absolute_path_entries() {
     let absolute_entry = outside_path.to_string_lossy().to_string();
     let archive = a08_archive_with_patched_path(&absolute_entry, b"escaped");
 
-    let result = flapjack::index::snapshot::import_from_bytes(&archive, &dest);
-    assert!(
-        result.is_err(),
-        "snapshot import must reject absolute-path entries"
-    );
-    assert!(
-        !outside_path.exists(),
-        "rejected absolute-path archive must not write outside destination"
+    a08_assert_snapshot_import_rejected(
+        &archive,
+        &dest,
+        &outside_path,
+        "snapshot entry path must be relative",
     );
 }
 
@@ -1900,15 +1933,40 @@ fn a08_snapshot_import_rejects_symlink_escape_pivots() {
     let sandbox = TempDir::new().expect("sandbox tempdir");
     let dest = sandbox.path().join("dest");
     let outside_path = sandbox.path().join("escaped_via_symlink.txt");
-    let archive = a08_archive_with_symlink("pivot", "..", "pivot/escaped_via_symlink.txt");
-
-    let result = flapjack::index::snapshot::import_from_bytes(&archive, &dest);
-    assert!(
-        result.is_err(),
-        "snapshot import must reject symlink entries that can pivot writes outside destination"
+    let archive = a08_archive_with_link(
+        EntryType::Symlink,
+        "pivot",
+        "..",
+        "pivot/escaped_via_symlink.txt",
     );
-    assert!(
-        !outside_path.exists(),
-        "rejected symlink-pivot archive must not write outside destination"
+
+    a08_assert_snapshot_import_rejected(
+        &archive,
+        &dest,
+        &outside_path,
+        "snapshot archive contains unsupported link entry",
+    );
+}
+
+#[test]
+fn a08_snapshot_import_rejects_hardlink_escape_pivots() {
+    let sandbox = TempDir::new().expect("sandbox tempdir");
+    let dest = sandbox.path().join("dest");
+    let outside_path = sandbox.path().join("escaped_via_hardlink.txt");
+    // A hard-link entry whose target resolves outside `dest` would, at unpack
+    // time, pivot writes into the parent tree. The guard must reject it before
+    // any unpacking happens.
+    let archive = a08_archive_with_link(
+        EntryType::Link,
+        "pivot",
+        "../escaped_via_hardlink.txt",
+        "pivot/escaped_via_hardlink.txt",
+    );
+
+    a08_assert_snapshot_import_rejected(
+        &archive,
+        &dest,
+        &outside_path,
+        "snapshot archive contains unsupported link entry",
     );
 }

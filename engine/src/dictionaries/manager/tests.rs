@@ -352,6 +352,50 @@ fn test_search_pagination() {
     assert_eq!(page2.page, 2);
 }
 
+#[test]
+fn test_search_pagination_extreme_page_does_not_panic() {
+    let (_tmp, mgr) = make_manager();
+    let requests = (0..5)
+        .map(|i| {
+            add_entry_req(serde_json::json!({
+                "objectID": format!("sw-{i:03}"),
+                "language": "en",
+                "word": format!("word{i}"),
+                "state": "enabled",
+                "type": "custom"
+            }))
+        })
+        .collect();
+
+    mgr.batch(
+        "t1",
+        DictionaryName::Stopwords,
+        &BatchDictionaryRequest {
+            clear_existing_dictionary_entries: false,
+            requests,
+        },
+    )
+    .unwrap();
+
+    let response = mgr
+        .search(
+            "t1",
+            DictionaryName::Stopwords,
+            &DictionarySearchRequest {
+                query: "".into(),
+                language: None,
+                page: Some(usize::MAX),
+                hits_per_page: Some(2),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(response.nb_hits, 5);
+    assert_eq!(response.nb_pages, 3);
+    assert_eq!(response.page, usize::MAX);
+    assert!(response.hits.is_empty());
+}
+
 /// Verify that a `hits_per_page` of zero is clamped to 1, returning at least one result per page.
 #[test]
 fn test_search_hits_per_page_zero_is_clamped() {

@@ -691,12 +691,17 @@ pub(crate) async fn cancel_algolia_migration_http(
 pub async fn acknowledge_algolia_migration(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
+    headers: HeaderMap,
     AxumPath(job_id): AxumPath<String>,
 ) -> Result<StatusCode, MigrateError> {
     let job_uuid = Uuid::parse_str(&job_id)
         .map_err(|_| json_error_parts(StatusCode::BAD_REQUEST, "job_id must be a valid UUID"))?;
     let spool = import::spool_for_manager(&state.manager)?;
-    ensure_async_migration_owner(&spool, job_uuid, &authenticated_app_id)?;
+    ensure_async_migration_owner(
+        &spool,
+        job_uuid,
+        &authenticated_owner_identity(authenticated_app_id, &headers),
+    )?;
     let phase_record = spool
         .read_migration_phase(job_uuid)
         .map_err(migration_status_spool_error)?;

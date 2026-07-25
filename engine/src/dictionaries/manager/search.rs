@@ -61,7 +61,7 @@ impl DictionaryManager {
         };
 
         // Paginate
-        let start = page * hits_per_page;
+        let start = page.saturating_mul(hits_per_page);
         let page_hits = if start < nb_hits {
             hits[start..(start + hits_per_page).min(nb_hits)].to_vec()
         } else {

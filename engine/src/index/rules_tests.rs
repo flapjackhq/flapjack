@@ -508,6 +508,18 @@ fn search_pagination() {
 }
 
 #[test]
+fn search_pagination_extreme_page_does_not_panic() {
+    let mut store = RuleStore::new();
+    for i in 0..5 {
+        store.insert(bare_rule(&format!("rule-{i}")));
+    }
+
+    let (hits, total) = store.search("", usize::MAX, 2);
+    assert_eq!(total, 5);
+    assert!(hits.is_empty());
+}
+
+#[test]
 fn search_past_end_returns_empty() {
     let mut store = RuleStore::new();
     store.insert(bare_rule("only-one"));

@@ -239,7 +239,7 @@ pub fn search_rules(
     };
 
     let total = matched.len();
-    let start = page * hits_per_page;
+    let start = page.saturating_mul(hits_per_page);
     let hits = if start >= total {
         Vec::new()
     } else {
@@ -533,6 +533,20 @@ mod tests {
 
         // Page 3 (beyond)
         let (hits, _) = search_rules(base, "my-index", "related-products", "", 3, 2).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn search_rules_pagination_extreme_page_does_not_panic() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let rules = (0..5).map(|i| sample_rule(&format!("rule-{i}"))).collect();
+
+        save_rules_batch(base, "my-index", "related-products", rules, false).unwrap();
+
+        let (hits, total) =
+            search_rules(base, "my-index", "related-products", "", usize::MAX, 2).unwrap();
+        assert_eq!(total, 5);
         assert!(hits.is_empty());
     }
 
