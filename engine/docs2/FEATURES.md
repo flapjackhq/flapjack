@@ -1,8 +1,9 @@
-# Flapjack Product Status & Roadmap
+# Flapjack Shipped Product Status
 
-Single maintained status ledger for Flapjack. Shipped feature status, current production-readiness state, and post-launch work are owned in this document.
+Canonical shipped capability and production-readiness snapshot for Flapjack.
+Open and future work is owned only by [`ROADMAP.md`](../../ROADMAP.md).
 
-**Last updated: 2026-07-23 (dead-node auto-heal is documented as a bounded default-off HA engine capability; prior 2026-07-18 context: Algolia create-only migration is shipped and joined, with deferred overwrite, async jobs, and HA import routed through `ROADMAP.md`.)**
+**Last updated: 2026-07-26 (node-local synchronous and authenticated async Algolia create/overwrite migration are shipped; successful async status carries durable outcomes; resume and HA import remain routed through `ROADMAP.md`.)**
 
 - 2026-05-31 stage note: `FLAPJACK_WRITE_QUEUE_BATCH_SIZE` is now runtime-configurable with default-preserving behavior (`32` fallback). See [`3_IMPLEMENTATION/OPS_CONFIGURATION.md`](3_IMPLEMENTATION/OPS_CONFIGURATION.md) for full operator semantics.
 

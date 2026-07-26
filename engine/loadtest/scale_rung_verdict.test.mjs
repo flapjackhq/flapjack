@@ -8,11 +8,18 @@ import {
 } from "./lib/scale_rung_verdict.mjs";
 
 function specimen(nameP95, blendedP95) {
+  const summary = { count: 30, p50: 10, p95: 20, p99: 30 };
   return {
     queryTypes: {
-      text: { p50: 10, p95: nameP95, p99: 20 },
+      text: { ...summary, p95: nameP95 },
+      typo: summary,
+      multi_word: summary,
+      facet: summary,
+      filter: summary,
+      geo: summary,
+      highlight: summary,
     },
-    overall: { p50: 20, p95: blendedP95, p99: 30 },
+    overall: { count: 210, p50: 20, p95: blendedP95, p99: 30 },
   };
 }
 
@@ -56,4 +63,21 @@ test("rung verdict fails closed on missing or non-finite latency evidence", () =
   const nonFinite = evaluateScaleRung(specimen(5, Number.POSITIVE_INFINITY));
   assert.equal(nonFinite.verdict, "INVALID");
   assert.deepEqual(nonFinite.reasons, ["blendedP95"]);
+});
+
+test("rung verdict requires exactly 30 measured requests for all seven query types", () => {
+  const missingType = specimen(5, 10);
+  delete missingType.queryTypes.highlight;
+  assert.deepEqual(evaluateScaleRung(missingType), {
+    verdict: "INVALID",
+    reasons: ["queryTypes.highlight.count", "overall.count"],
+  });
+
+  const shortType = specimen(5, 10);
+  shortType.queryTypes.geo = { ...shortType.queryTypes.geo, count: 29 };
+  shortType.overall.count = 209;
+  assert.deepEqual(evaluateScaleRung(shortType), {
+    verdict: "INVALID",
+    reasons: ["queryTypes.geo.count", "overall.count"],
+  });
 });

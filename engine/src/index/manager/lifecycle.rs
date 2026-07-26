@@ -225,25 +225,19 @@ impl super::IndexManager {
     /// for polling.
     pub fn export_tenant(&self, tenant_id: &TenantId, dest_path: PathBuf) -> Result<String> {
         validate_index_name(tenant_id)?;
+        if dest_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(FlapjackError::InvalidQuery(
+                "export destination must not contain '..' path traversal".into(),
+            ));
+        }
         let numeric_id = self.next_numeric_task_id();
         let task_id = format!("export_{}_{}", tenant_id, uuid::Uuid::new_v4());
         let task = TaskInfo::new(task_id.clone(), numeric_id, 0);
-        self.tasks.insert(task_id.clone(), task.clone());
-        self.tasks.insert(numeric_id.to_string(), task.clone());
-
-        let tenant_id_clone = tenant_id.clone();
-        let sender = self.task_queue.sender.clone();
-        let task_id_clone = task_id.clone();
-
-        tokio::spawn(async move {
-            let _ = sender
-                .send(crate::index::task_queue::TaskCommand::Export {
-                    task_id: task_id_clone,
-                    tenant_id: tenant_id_clone,
-                    dest_path,
-                })
-                .await;
-        });
+        self.task_queue
+            .enqueue_export(task, tenant_id.clone(), dest_path)?;
 
         Ok(task_id)
     }

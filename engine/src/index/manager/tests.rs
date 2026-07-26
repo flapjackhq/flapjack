@@ -109,6 +109,14 @@ fn tenant_task_snapshot_contains(manager: &IndexManager, tenant_id: &str, task_i
         .any(|task| task.id == task_id)
 }
 
+fn task_key_snapshot(manager: &IndexManager) -> BTreeMap<String, TaskInfo> {
+    manager
+        .tasks
+        .iter()
+        .map(|entry| (entry.key().clone(), entry.value().clone()))
+        .collect()
+}
+
 fn tenant_admission_record_count(base_path: &Path, tenant_id: &str) -> usize {
     let admission_path = base_path.join(tenant_id).join("write_admission");
     if !admission_path.is_dir() {
@@ -5696,6 +5704,167 @@ async fn export_tenant_rejects_path_traversal_tenant_ids() {
         TraversalEscapeDirGuard::new(&tmp, "escape_export_reject_path_traversal");
     let result = manager.export_tenant(&bad_id, tmp.path().join("export_target"));
     assert!(result.is_err(), "export_tenant should reject traversal IDs");
+}
+
+#[tokio::test]
+async fn export_tenant_rejects_parent_traversal_destinations_without_task_leaks() {
+    let tmp = TempDir::new().unwrap();
+    let tenant_id = "tenant_a".to_string();
+    let manager = IndexManager::new(tmp.path());
+    manager.create_tenant(&tenant_id).unwrap();
+    let (escape_dir, escaped_destination) =
+        TraversalEscapeDirGuard::new(&tmp, "escape_export_reject_destination_traversal");
+    let before_tasks = task_key_snapshot(&manager);
+
+    let result = manager.export_tenant(&tenant_id, PathBuf::from(&escaped_destination));
+    let after_tasks = task_key_snapshot(&manager);
+    let leaked_task_keys: Vec<_> = after_tasks
+        .keys()
+        .filter(|key| !before_tasks.contains_key(*key))
+        .cloned()
+        .collect();
+
+    assert!(
+        matches!(result, Err(FlapjackError::InvalidQuery(_))),
+        "export_tenant should reject parent traversal in destination paths, got {result:?}"
+    );
+    assert_eq!(
+        leaked_task_keys,
+        Vec::<String>::new(),
+        "destination-path rejection must not register export tasks; leaked {leaked_task_keys:?}"
+    );
+    assert!(
+        !escape_dir.path().exists(),
+        "destination-path traversal must not create sibling export directories"
+    );
+}
+
+#[tokio::test]
+async fn closed_export_channel_rejects_without_registering_task_aliases() {
+    let tmp = TempDir::new().unwrap();
+    let tenant_id = "tenant_a".to_string();
+    let manager = IndexManager::new(tmp.path());
+    manager.create_tenant(&tenant_id).unwrap();
+    let mut manager = match Arc::try_unwrap(manager) {
+        Ok(manager) => manager,
+        Err(_) => panic!("test precondition: manager must have exactly one strong reference"),
+    };
+    manager.task_queue =
+        crate::index::task_queue::TaskQueue::closed_for_test(manager.tasks.clone());
+    let manager = Arc::new(manager);
+
+    let before_tasks = task_key_snapshot(&manager);
+    let result = manager.export_tenant(&tenant_id, tmp.path().join("closed_export"));
+    let after_tasks = task_key_snapshot(&manager);
+    let new_tasks: BTreeMap<_, _> = after_tasks
+        .iter()
+        .filter(|(key, _)| !before_tasks.contains_key(*key))
+        .map(|(key, task)| (key.clone(), task.clone()))
+        .collect();
+    let export_prefix = format!("export_{tenant_id}_");
+    let canonical_export_keys: Vec<_> = new_tasks
+        .keys()
+        .filter(|key| key.starts_with(&export_prefix))
+        .cloned()
+        .collect();
+    let numeric_export_aliases: Vec<_> = new_tasks
+        .iter()
+        .filter(|(key, task)| {
+            task.id.starts_with(&export_prefix) && **key == task.numeric_id.to_string()
+        })
+        .map(|(key, task)| (key.clone(), task.id.clone()))
+        .collect();
+    let pending_tasks: Vec<_> = new_tasks
+        .iter()
+        .filter(|(_, task)| matches!(task.status, TaskStatus::Enqueued | TaskStatus::Processing))
+        .map(|(key, task)| (key.clone(), task.id.clone(), task.status.clone()))
+        .collect();
+
+    assert!(
+        matches!(result, Err(FlapjackError::QueueFull)),
+        "closed export queue must reject admission with QueueFull, got {result:?}"
+    );
+    assert!(
+        canonical_export_keys.is_empty(),
+        "closed export queue must not publish canonical export task keys; leaked {canonical_export_keys:?}"
+    );
+    assert!(
+        numeric_export_aliases.is_empty(),
+        "closed export queue must not publish numeric export aliases; leaked {numeric_export_aliases:?}"
+    );
+    assert!(
+        pending_tasks.is_empty(),
+        "closed export queue must not add new Enqueued or Processing tasks; leaked {pending_tasks:?}"
+    );
+}
+
+#[tokio::test]
+async fn export_enqueue_success_registers_and_delivers_exact_command() {
+    let tmp = TempDir::new().unwrap();
+    let tenant_id = "tenant_a".to_string();
+    let manager = IndexManager::new(tmp.path());
+    manager.create_tenant(&tenant_id).unwrap();
+
+    let marker_name = "export_marker.txt";
+    let marker_contents = "known export marker contents\n";
+    std::fs::write(
+        manager.base_path.join(&tenant_id).join(marker_name),
+        marker_contents,
+    )
+    .unwrap();
+
+    let export_root = tmp.path().join("exports");
+    let export_dest = export_root.join("export_success");
+    let sibling_dest = export_root.join("export_sibling");
+    let task_id = manager
+        .export_tenant(&tenant_id, export_dest.clone())
+        .unwrap();
+
+    assert!(
+        task_id.starts_with("export_tenant_a_"),
+        "canonical export task id should be tenant-scoped, got {task_id}"
+    );
+    let canonical = manager.get_task(&task_id).unwrap();
+    let numeric_alias = manager.get_task(&canonical.numeric_id.to_string()).unwrap();
+    assert_eq!(numeric_alias.id, canonical.id);
+    assert_eq!(numeric_alias.numeric_id, canonical.numeric_id);
+    assert_eq!(
+        numeric_alias.received_documents,
+        canonical.received_documents
+    );
+    assert_eq!(canonical.received_documents, 0);
+
+    let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let task = manager.get_task(&task_id).unwrap();
+            if !matches!(task.status, TaskStatus::Enqueued | TaskStatus::Processing) {
+                break task;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("canonical export task must reach a terminal status");
+    assert_eq!(
+        terminal.status,
+        TaskStatus::Succeeded,
+        "healthy export should succeed through the real worker"
+    );
+    assert_eq!(terminal.id, canonical.id);
+    assert_eq!(terminal.numeric_id, canonical.numeric_id);
+    assert_eq!(terminal.received_documents, canonical.received_documents);
+    let terminal_numeric_alias = manager.get_task(&terminal.numeric_id.to_string()).unwrap();
+    assert_eq!(terminal_numeric_alias.status, TaskStatus::Succeeded);
+    assert_eq!(terminal_numeric_alias.id, terminal.id);
+    assert_eq!(terminal_numeric_alias.numeric_id, terminal.numeric_id);
+    assert_eq!(
+        std::fs::read_to_string(export_dest.join(marker_name)).unwrap(),
+        marker_contents
+    );
+    assert!(
+        !sibling_dest.exists(),
+        "healthy export must write only the requested destination"
+    );
 }
 
 #[tokio::test]

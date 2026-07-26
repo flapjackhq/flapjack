@@ -11,8 +11,11 @@ Successful async status now carries the durable import outcome
 fabricating zeroes; resume remains the only MIG-6 deferral and HA import remains
 refused under MIG-7. Track A's measured single-machine text record ceiling and its
 limits are published in
-[`engine/loadtest/BENCHMARKS.md#single-machine-text-record-ceiling-july-25-2026`](engine/loadtest/BENCHMARKS.md#single-machine-text-record-ceiling-july-25-2026);
-that benchmark section is the sole owner of the curve and Guaranteed value. Reconciliation against
+[`engine/loadtest/BENCHMARKS.md#single-machine-text-record-ceiling-follow-up-july-26-2026`](engine/loadtest/BENCHMARKS.md#single-machine-text-record-ceiling-follow-up-july-26-2026):
+1,000,000 compact and 1,000,000 standard records pass every frozen gate. That
+benchmark section is the sole owner of the current curve and Guaranteed value;
+the July 25 failures remain historical evidence, not an active profiling
+premise. Fjcloud A3's real-Algolia consumer receipt is merged. Reconciliation against
 `origin/main` after the jul24–25 ingestion/privacy/migration-reliability lanes: merged and
 code-verified on `main`: **B1** ingestion adapter seam — hardened push/batch API (write-scope
 enforcement, `413` size limits) plus the pull-connector framework decision record
@@ -36,7 +39,7 @@ history is routed to `implemented/2026_06_05_history.md`.
 **Last shipped release:** [v1.0.10](https://github.com/flapjackhq/flapjack/releases/tag/v1.0.10) (2026-06-09). Detailed release history lives in [`CHANGELOG.md`](CHANGELOG.md).
 
 **ID prefixes:** `RF-*` = foundational refinement track; `PL-*` =
-launch-hardening / operational-polish track; `MIG-*` = Algolia-migration
+launch-hardening / operational-polish track; `MIG-*` = source-migration
 capability track. IDs are stable identifiers, not priority rank.
 
 ## Active
@@ -58,6 +61,9 @@ capability track. IDs are stable identifiers, not priority rank.
 
 | ID | Work Item | Planned Direction | Evidence / Owner |
 |----|-----------|-------------------|------------------|
+| MIG-12 | Provider-neutral source-migration core | Pre-launch. Extract one genuine source-adapter contract while preserving the existing spool, job runner, status/cancel/ACK, and fenced publication owners. Keep recurring ingestion connectors separate. Preserve Algolia routes as compatibility aliases, use one provider-discriminated wire contract, and settle arbitrary self-hosted endpoint SSRF/TLS/redirect/DNS-rebinding policy before implementation. | M0 architecture owner: Fjcloud `chats/icg/jul26_am_11_source_migration_architecture_security.md`; current shared owners: `engine/flapjack-http/src/handlers/migration/{export,import,job_runner,spool}.rs`; outbound policy: `engine/src/security.rs`. |
+| MIG-13 | Meilisearch source migration | Pre-launch, gated on MIG-12 and a pinned local exact-value KAT. Map documents, configured/inferred primary keys, settings, synonyms, tasks/quiescence, permissions, pagination/export ceilings, and warnings without fabricating Algolia types. Remote enablement remains default-off and later. | M0 contract/KAT owner: `chats/icg/jul26_am_12_meilisearch_migration_contract_kat.md`. |
+| MIG-14 | Typesense source migration | Pre-launch, gated on MIG-12 and a pinned local exact-value KAT. Map typed collection schema, document IDs, exports, aliases, synonyms/curations, quiescence, permissions, version bounds, and warnings without copying the migration lifecycle. Remote enablement remains default-off and later. | M0 contract/KAT owner: `chats/icg/jul26_am_13_typesense_migration_contract_kat.md`. |
 | ING-2 | Next ingestion connector and compatibility catalog | Deferred until a named demand and concrete cost/auth/scale gate exists. PostgreSQL/Supabase, MySQL, object storage, crawler/ecommerce sources, and BigQuery/GA4 remain catalog entries, not shipped connectors; BigQuery is explicitly a named parity gap rather than a free-floating work item. | This row owns the future connector catalog; preserve the shipped CLI boundary in `engine/docs2/FEATURES.md#flapjack-ingest-beta-bounds` rather than expanding ING-1. |
 | ADR-0005 OQ4 | Cross-node failover idempotency dedup | v1.1 design resolved. Node-local restart-durable idempotency remains at `${FLAPJACK_DATA_DIR}/_idempotency/cache.db`; cross-node single execution requires a quorum-durable reservation before mutation, a quorum-durable completed result before success acknowledgment, and fail-closed handling of pending or indeterminate claims. | [ADR 0010](engine/docs2/3_IMPLEMENTATION/decisions/active/0010_oq4_cross_node_idempotency_dedup_design.md) |
 | PL-11 | Public mirror Laravel Scout CI cleanup | Remove the always-green `integration-laravel-scout` job from the public mirror CI once the Debbie flow reaches the mirror, so CI no longer advertises an unsourced integration stub. | Target: `.github/workflows/ci.yml`; owner: mirror/debbie flow; private-development context: `docs/reference/research/20260718_stage5_framework_integration_portfolio_disposition.md` |

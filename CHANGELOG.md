@@ -16,9 +16,11 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Successful asynchronous migration status now carries durable settings,
   synonym, rule, and warning outcomes; running, failed, and cancelled jobs omit
   those outcomes instead of presenting fabricated zeroes.
-- The single-machine scale record now documents the measured one-million-record
-  latency miss and the 2,145,002-record exact-count timeout so follow-up
-  optimization is grounded in reproducible local specimens.
+- The repaired single-machine scale contract now proves 1,000,000 compact and
+  1,000,000 standard records through every frozen correctness, liveness,
+  locality, evidence, and text-search latency gate. The July 25 latency/count
+  failures remain immutable historical evidence rather than the current
+  Guaranteed result.
 
 ### Fixed
 

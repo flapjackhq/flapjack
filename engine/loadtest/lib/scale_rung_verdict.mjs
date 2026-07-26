@@ -6,6 +6,16 @@ import { fileURLToPath } from "node:url";
 
 export const NAME_PREFIX_P95_LIMIT_MS = 50;
 export const BLENDED_P95_LIMIT_MS = 100;
+export const SEARCH_SAMPLES_PER_TYPE = 30;
+export const REQUIRED_QUERY_TYPES = Object.freeze([
+  "text",
+  "typo",
+  "multi_word",
+  "facet",
+  "filter",
+  "geo",
+  "highlight",
+]);
 
 function validLatency(value) {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
@@ -21,6 +31,29 @@ export function evaluateScaleRung(searchArtifact) {
   }
   if (!validLatency(blendedP95Ms)) {
     invalidFields.push("blendedP95");
+  }
+  if (invalidFields.length > 0) {
+    return {
+      verdict: "INVALID",
+      reasons: invalidFields,
+    };
+  }
+
+  let summedQueryCount = 0;
+  for (const queryType of REQUIRED_QUERY_TYPES) {
+    if (searchArtifact?.queryTypes?.[queryType]?.count !== SEARCH_SAMPLES_PER_TYPE) {
+      invalidFields.push(`queryTypes.${queryType}.count`);
+    } else {
+      summedQueryCount += searchArtifact.queryTypes[queryType].count;
+    }
+  }
+  const expectedOverallCount = REQUIRED_QUERY_TYPES.length * SEARCH_SAMPLES_PER_TYPE;
+  if (
+    searchArtifact?.overall?.count !== expectedOverallCount ||
+    summedQueryCount !== expectedOverallCount ||
+    searchArtifact?.overall?.count !== summedQueryCount
+  ) {
+    invalidFields.push("overall.count");
   }
   if (invalidFields.length > 0) {
     return {

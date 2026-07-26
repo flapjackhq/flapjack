@@ -8,7 +8,9 @@ IMPORT_SCRIPT="$SCRIPT_DIR/import_benchmark.sh"
 SEARCH_SCRIPT="${FLAPJACK_SCALE_SEARCH_SCRIPT:-$SCRIPT_DIR/search_benchmark.sh}"
 HELPERS="$SCRIPT_DIR/lib/loadtest_shell_helpers.sh"
 CAPACITY_HELPER="$SCRIPT_DIR/lib/scale_capacity.mjs"
+CAPACITY_OBSERVATION_HELPER="$SCRIPT_DIR/lib/scale_capacity_observation.mjs"
 RUNG_VERDICT_HELPER="$SCRIPT_DIR/lib/scale_rung_verdict.mjs"
+SEARCH_SAMPLES_PER_TYPE=30
 
 # shellcheck source=lib/loadtest_shell_helpers.sh
 source "$HELPERS"
@@ -25,6 +27,8 @@ SERVER_DATA_DIR=""
 RUN_SUCCEEDED=0
 INTERRUPTED_EXIT_CODE=0
 CLEANUP_COMPLETE=0
+ACTIVE_RUNG=0
+FAILURE_OUTCOME="FAILED"
 
 fail() {
   echo "FAIL: $1" >&2
@@ -173,6 +177,30 @@ memory_capacity_bytes() {
   printf '%s\n' "$capacity_bytes"
 }
 
+capacity_source_bytes_per_record() {
+  if [[ "$PROFILE" == "compact" ]]; then
+    printf '%s\n' "${SCALE_SOURCE_BYTES_PER_RECORD:-512}"
+  else
+    printf '%s\n' "${SCALE_SOURCE_BYTES_PER_RECORD:-2048}"
+  fi
+}
+
+capacity_index_bytes_per_record() {
+  if [[ "$PROFILE" == "compact" ]]; then
+    printf '%s\n' "${SCALE_INDEX_BYTES_PER_RECORD:-16384}"
+  else
+    printf '%s\n' "${SCALE_INDEX_BYTES_PER_RECORD:-32768}"
+  fi
+}
+
+capacity_rss_bytes_per_record() {
+  if [[ "$PROFILE" == "compact" ]]; then
+    printf '%s\n' "${SCALE_RSS_BYTES_PER_RECORD:-4096}"
+  else
+    printf '%s\n' "${SCALE_RSS_BYTES_PER_RECORD:-8192}"
+  fi
+}
+
 run_capacity_preflight() {
   local starting_count="$1"
   local target_count="$2"
@@ -188,15 +216,9 @@ run_capacity_preflight() {
   local helper_exit_code=0
   local verdict
 
-  if [[ "$PROFILE" == "compact" ]]; then
-    source_bytes_per_record="${SCALE_SOURCE_BYTES_PER_RECORD:-512}"
-    index_bytes_per_record="${SCALE_INDEX_BYTES_PER_RECORD:-16384}"
-    rss_bytes_per_record="${SCALE_RSS_BYTES_PER_RECORD:-4096}"
-  else
-    source_bytes_per_record="${SCALE_SOURCE_BYTES_PER_RECORD:-2048}"
-    index_bytes_per_record="${SCALE_INDEX_BYTES_PER_RECORD:-32768}"
-    rss_bytes_per_record="${SCALE_RSS_BYTES_PER_RECORD:-8192}"
-  fi
+  source_bytes_per_record="$(capacity_source_bytes_per_record)"
+  index_bytes_per_record="$(capacity_index_bytes_per_record)"
+  rss_bytes_per_record="$(capacity_rss_bytes_per_record)"
 
   free_disk="$(disk_free_bytes "$SERVER_DATA_DIR")" || return 1
   memory_capacity="$(memory_capacity_bytes)" || return 1
@@ -237,6 +259,34 @@ run_capacity_preflight() {
   fi
 }
 
+run_capacity_observation() {
+  local target_count="$1"
+  local index_bytes="$2"
+  local rss_bytes="$3"
+  local receipt_path="$4"
+  local input_json
+
+  input_json="$(
+    jq -cn \
+      --arg profile "$PROFILE" \
+      --argjson target_count "$target_count" \
+      --argjson index_bytes "$index_bytes" \
+      --argjson rss_bytes "$rss_bytes" \
+      --argjson index_allowance "$(capacity_index_bytes_per_record)" \
+      --argjson rss_allowance "$(capacity_rss_bytes_per_record)" \
+      '{
+        profile: $profile,
+        targetCount: $target_count,
+        indexBytes: $index_bytes,
+        rssBytes: $rss_bytes,
+        indexBytesPerRecordAllowance: $index_allowance,
+        rssBytesPerRecordAllowance: $rss_allowance
+      }'
+  )" || return 2
+
+  node "$CAPACITY_OBSERVATION_HELPER" --input-json "$input_json" > "$receipt_path"
+}
+
 write_run_receipt() {
   local outcome="$1"
   local terminal_rung="${2:-0}"
@@ -262,9 +312,15 @@ write_run_receipt() {
       terminalRung: (if $terminal_rung > 0 then $terminal_rung else null end),
       terminalMetricsPath: (if $terminal_metrics_path != "" then $terminal_metrics_path else null end)
     }' > "$RESULTS_DIR/run_receipt.json"
-  [[ "$remaining_generated_dataset_dirs" -eq 0 ]] || {
-    fail "green ladder retained ${remaining_generated_dataset_dirs} generated dataset directories"
-  }
+  case "$outcome" in
+    FAILED|LIVENESS_FAILED|IMPORT_FAILED)
+      ;;
+    *)
+      [[ "$remaining_generated_dataset_dirs" -eq 0 ]] || {
+        fail "green ladder retained ${remaining_generated_dataset_dirs} generated dataset directories"
+      }
+      ;;
+  esac
 }
 
 current_run_purpose() {
@@ -294,7 +350,7 @@ write_checkpoint() {
     --argjson rungs "$RUNGS_JSON" \
     --argjson last_completed_rung "$completed_rung" \
     '{
-      version: 3,
+      version: 4,
       profile: $profile,
       purpose: $purpose,
       rungs: $rungs,
@@ -306,7 +362,7 @@ write_checkpoint() {
       metricsPath: $metrics_path,
       timestamp: $timestamp
     }' > "$checkpoint_tmp"
-  jq -e '.version == 3 and .batchSize > 0 and .lastCompletedRung > 0' "$checkpoint_tmp" >/dev/null || {
+  jq -e '.version == 4 and .batchSize > 0 and .lastCompletedRung > 0' "$checkpoint_tmp" >/dev/null || {
     fail "new checkpoint is missing required fields"
   }
   mv "$checkpoint_tmp" "$CHECKPOINT_PATH"
@@ -328,7 +384,7 @@ validate_resume_checkpoint() {
     --argjson batch_size "$BATCH_SIZE" \
     --argjson rungs "$RUNGS_JSON" \
     '
-      .version == 3 and
+      .version == 4 and
       .profile == $profile and
       .purpose == $purpose and
       .rungs == $rungs and
@@ -359,6 +415,7 @@ validate_resume_checkpoint() {
       .targetCount == $expected_count and
       .finalCount == $expected_count and
       .sentinels == "PASS" and
+      .capacityObservation.verdict == "PASS" and
       (
         $purpose == "throughput_probe" or
         .rungVerdict == "PASS"
@@ -485,6 +542,7 @@ exercise_negative_controls() {
 
 cleanup() {
   local script_exit_code=$?
+  local receipt_runner_tmp_dir=""
   if [[ "$CLEANUP_COMPLETE" -eq 1 ]]; then
     return
   fi
@@ -497,11 +555,20 @@ cleanup() {
     if [[ -n "$RESULTS_DIR" ]]; then
       {
         echo "outcome=FAIL"
+        echo "failure_outcome=${FAILURE_OUTCOME}"
         echo "script_exit_code=${script_exit_code}"
         echo "interrupted_exit_code=${INTERRUPTED_EXIT_CODE}"
         echo "runner_state=${RUNNER_TMP_DIR}"
         echo "server_data=${SERVER_DATA_DIR}"
       } > "$RESULTS_DIR/failure_evidence.txt"
+    fi
+    if [[ -n "$RESULTS_DIR" && -n "$RUNNER_TMP_DIR" ]]; then
+      receipt_runner_tmp_dir="$(
+        jq -er '.runnerTmpDir' "$RESULTS_DIR/run_receipt.json" 2>/dev/null || true
+      )"
+      if [[ "$receipt_runner_tmp_dir" != "$RUNNER_TMP_DIR" ]]; then
+        write_run_receipt "$FAILURE_OUTCOME" "$ACTIVE_RUNG"
+      fi
     fi
     if [[ -n "$RUNNER_TMP_DIR" ]]; then
       echo "INFO: preserving failure runner state at ${RUNNER_TMP_DIR}" >&2
@@ -720,6 +787,7 @@ for rung in "${RUNGS[@]}"; do
   if (( rung <= starting_count )); then
     continue
   fi
+  ACTIVE_RUNG="$rung"
   rung_dir="$RESULTS_DIR/rung_${rung}"
   dataset_dir="$RUNNER_TMP_DIR/rung_${rung}_dataset"
   mkdir -p "$rung_dir" "$dataset_dir"
@@ -754,9 +822,11 @@ for rung in "${RUNGS[@]}"; do
   if ! wait_for_count_or_stall "$BASE_URL" "$index_name" "$rung" "$STALL_SECONDS"; then
     kill "$import_pid" 2>/dev/null || true
     wait "$import_pid" 2>/dev/null || true
+    FAILURE_OUTCOME="LIVENESS_FAILED"
     fail "rung ${rung} stalled before reaching its exact target"
   fi
   if ! wait "$import_pid"; then
+    FAILURE_OUTCOME="IMPORT_FAILED"
     fail "rung ${rung} import worker failed; see ${rung_dir}/import.stdout.txt"
   fi
 
@@ -797,6 +867,7 @@ for rung in "${RUNGS[@]}"; do
     FLAPJACK_LOADTEST_BASE_URL="$BASE_URL" \
     FLAPJACK_LOADTEST_BENCHMARK_INDEX="$index_name" \
     LOADTEST_RESULTS_BASE_DIR="$search_results_dir" \
+    SEARCH_BENCHMARK_SAMPLES_PER_TYPE="$SEARCH_SAMPLES_PER_TYPE" \
     bash "$SEARCH_SCRIPT" \
     > "$rung_dir/search_benchmark.stdout.txt" 2>&1
   search_artifact=""
@@ -834,6 +905,16 @@ for rung in "${RUNGS[@]}"; do
   rss_bytes="$(server_rss_bytes "$SERVER_PID")" || {
     fail "rung ${rung} RSS is missing, zero, or non-numeric"
   }
+  capacity_observation_path="$rung_dir/capacity_observation.json"
+  capacity_observation_exit=0
+  run_capacity_observation "$rung" "$index_bytes" "$rss_bytes" "$capacity_observation_path" \
+    || capacity_observation_exit=$?
+  capacity_observation_verdict="$(
+    jq -er '.verdict | select(. == "PASS" or . == "FAIL" or . == "INVALID")' \
+      "$capacity_observation_path" 2>/dev/null
+  )" || {
+    fail "rung ${rung} capacity observation is missing or unparseable"
+  }
 
   jq -n \
     --arg profile "$PROFILE" \
@@ -848,7 +929,9 @@ for rung in "${RUNGS[@]}"; do
     --argjson rss_bytes "$rss_bytes" \
     --arg negative_controls "$negative_controls" \
     --arg run_purpose "$run_purpose" \
+    --arg capacity_observation_verdict "$capacity_observation_verdict" \
     --slurpfile latency "$latency_verdict_path" \
+    --slurpfile capacity_observation "$capacity_observation_path" \
     --slurpfile import "$import_artifact" \
     --slurpfile search "$search_artifact" \
     '{
@@ -867,7 +950,13 @@ for rung in "${RUNGS[@]}"; do
       rssBytes: $rss_bytes,
       sentinels: "PASS",
       negativeControls: $negative_controls,
-      rungVerdict: $latency[0].verdict,
+      rungVerdict: (
+        if $capacity_observation_verdict == "PASS"
+        then $latency[0].verdict
+        else "FAIL"
+        end
+      ),
+      capacityObservation: $capacity_observation[0],
       latency: $latency[0],
       queryTypes: $search[0].queryTypes,
       overallSearch: $search[0].overall
@@ -875,6 +964,10 @@ for rung in "${RUNGS[@]}"; do
 
   remove_completed_dataset "$dataset_dir" "$rung_dir/dataset_cleanup.json"
   starting_count="$final_count"
+  if [[ "$capacity_observation_exit" -ne 0 || "$capacity_observation_verdict" != "PASS" ]]; then
+    write_run_receipt "CAPACITY_CALIBRATION_FAILED" "$rung" "$rung_dir/metrics.json"
+    fail "rung ${rung} exceeded or invalidated the frozen capacity calibration"
+  fi
   if [[ "$latency_verdict" == "FAIL" && "$THROUGHPUT_PROBE" -ne 1 ]]; then
     write_run_receipt "CEILING_REACHED" "$rung" "$rung_dir/metrics.json"
     RUN_SUCCEEDED=1

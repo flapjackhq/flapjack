@@ -7,6 +7,11 @@ ENGINE_DIR="$(cd "$LOADTEST_DIR/.." && pwd)"
 LADDER_SCRIPT="${FLAPJACK_SCALE_LADDER_SCRIPT:-$LOADTEST_DIR/scale_ladder.sh}"
 SERVER_BINARY="${FLAPJACK_SCALE_SERVER_BINARY:-$ENGINE_DIR/target/release/flapjack}"
 
+# The campaign calibration starts at 1M. Keep this 10K plumbing fixture above fixed process/index
+# overhead; the dedicated negative control below overrides both values to one byte per record.
+export SCALE_INDEX_BYTES_PER_RECORD="${SCALE_INDEX_BYTES_PER_RECORD:-100000}"
+export SCALE_RSS_BYTES_PER_RECORD="${SCALE_RSS_BYTES_PER_RECORD:-100000}"
+
 fail() {
   echo "FAIL: $1" >&2
   exit 1
@@ -36,7 +41,7 @@ timeout 900 bash "$LADDER_SCRIPT" \
   --results-dir "$results_dir"
 
 jq -e '
-  .version == 3 and
+  .version == 4 and
   .profile == "compact" and
   .purpose == "throughput_probe" and
   .batchSize == 1000 and
@@ -59,7 +64,7 @@ if SCALE_DISK_RESERVE_BYTES=1048576 \
     --results-dir "$results_dir"; then
   fail "mismatched batch-size checkpoint negative control unexpectedly passed"
 fi
-jq -e '.version == 3 and .batchSize == 1000 and .lastCompletedRung == 10000' \
+jq -e '.version == 4 and .batchSize == 1000 and .lastCompletedRung == 10000' \
   "$results_dir/checkpoint.json" >/dev/null || {
   fail "mismatched batch-size resume altered the last valid checkpoint"
 }
@@ -108,7 +113,11 @@ jq -e '
   (.importLatencyWindows.lastToFirstP50Ratio | type == "number") and
   .indexBytes > 0 and
   .rssBytes > 0 and
-  .sentinels == "PASS"
+  .sentinels == "PASS" and
+  .capacityObservation.verdict == "PASS" and
+  .capacityObservation.targetCount == 10000 and
+  ([.queryTypes[] | .count] | all(. == 30)) and
+  .overallSearch.count == 210
 ' "${metrics_paths[0]}" >/dev/null || fail "first rung metrics are not exact and non-zero"
 
 jq -e '
@@ -119,12 +128,13 @@ jq -e '
   .indexBytes > 0 and
   .rssBytes > 0 and
   .sentinels == "PASS" and
+  .capacityObservation.verdict == "PASS" and
   .runPurpose == "throughput_probe" and
   (.rungVerdict == "PASS" or .rungVerdict == "FAIL") and
   (.latency.verdict == "PASS" or .latency.verdict == "FAIL") and
   .negativeControls == "PASS" and
-  (.queryTypes | ["text", "typo", "facet", "filter", "geo"] - keys | length == 0) and
-  ([.queryTypes.text, .queryTypes.typo, .queryTypes.facet, .queryTypes.filter, .queryTypes.geo]
+  (.queryTypes | ["text", "typo", "multi_word", "facet", "filter", "geo", "highlight"] - keys | length == 0) and
+  ([.queryTypes.text, .queryTypes.typo, .queryTypes.multi_word, .queryTypes.facet, .queryTypes.filter, .queryTypes.geo, .queryTypes.highlight]
     | all(has("p50") and has("p95") and has("p99")))
 ' "${metrics_paths[1]}" >/dev/null || fail "final rung metrics/per-type latency block is incomplete"
 
@@ -222,6 +232,14 @@ failure_root="$(mktemp -d)"
 failure_data_dir="$failure_root/server_data"
 failure_results_dir="$failure_root/results"
 failure_base_url="http://127.0.0.1:$((port + 1))"
+mkdir -p "$failure_results_dir"
+jq -n '{
+  outcome: "PAUSED",
+  runnerTmpDir: "/tmp/stale_prior_run",
+  remainingGeneratedDatasetDirs: 0,
+  terminalRung: null,
+  terminalMetricsPath: null
+}' > "$failure_results_dir/run_receipt.json"
 if SCALE_DISK_RESERVE_BYTES=1048576 \
   SCALE_MEMORY_RESERVE_BYTES=1048576 \
   timeout 180 bash "$LADDER_SCRIPT" \
@@ -242,6 +260,14 @@ fi
 }
 [[ -s "$failure_results_dir/server.log" ]] || fail "non-PASS run did not preserve its server log"
 [[ -d "$failure_data_dir" ]] || fail "non-PASS run removed caller-owned server data"
+jq -e '
+  .outcome == "FAILED" and
+  .terminalRung == 10 and
+  .remainingGeneratedDatasetDirs == 1 and
+  .runnerTmpDir != "/tmp/stale_prior_run"
+' "$failure_results_dir/run_receipt.json" >/dev/null || {
+  fail "non-PASS run left a stale prior receipt instead of recording its active failure"
+}
 failure_runner_state="$(awk -F= '$1 == "runner_state" { print $2 }' "$failure_results_dir/failure_evidence.txt")"
 [[ -n "$failure_runner_state" && -d "$failure_runner_state" ]] || {
   fail "non-PASS run did not preserve generated runner state before teardown"
@@ -264,13 +290,15 @@ jq -n --arg index "$FLAPJACK_LOADTEST_BENCHMARK_INDEX" '{
   docCount: 10,
   wallClockMs: 1,
   queryTypes: {
-    text: {count: 1, p50: 51, p95: 51, p99: 51},
-    typo: {count: 1, p50: 1, p95: 1, p99: 1},
-    facet: {count: 1, p50: 1, p95: 1, p99: 1},
-    filter: {count: 1, p50: 1, p95: 1, p99: 1},
-    geo: {count: 1, p50: 1, p95: 1, p99: 1}
+    text: {count: 30, p50: 51, p95: 51, p99: 51},
+    typo: {count: 30, p50: 1, p95: 1, p99: 1},
+    multi_word: {count: 30, p50: 1, p95: 1, p99: 1},
+    facet: {count: 30, p50: 1, p95: 1, p99: 1},
+    filter: {count: 30, p50: 1, p95: 1, p99: 1},
+    geo: {count: 30, p50: 1, p95: 1, p99: 1},
+    highlight: {count: 30, p50: 1, p95: 1, p99: 1}
   },
-  overall: {count: 5, p50: 1, p95: 100, p99: 100}
+  overall: {count: 210, p50: 1, p95: 100, p99: 100}
 }' >"$artifact_dir/search_benchmark.json"
 echo "name/prefix"
 echo "blended overall"
@@ -279,6 +307,9 @@ chmod +x "$latency_stub"
 
 SCALE_DISK_RESERVE_BYTES=1048576 \
 SCALE_MEMORY_RESERVE_BYTES=1048576 \
+SCALE_INDEX_BYTES_PER_RECORD=100000000 \
+SCALE_RSS_BYTES_PER_RECORD=100000000 \
+SCALE_MEMORY_CAPACITY_BYTES_OVERRIDE=2000000000 \
 FLAPJACK_SCALE_SEARCH_SCRIPT="$latency_stub" \
 timeout 180 bash "$LADDER_SCRIPT" \
   --profile compact \
@@ -306,6 +337,43 @@ jq -e '
 }
 [[ ! -e "$latency_results_dir/checkpoint.json" ]] || {
   fail "latency-failed first rung was incorrectly saved as a green checkpoint"
+}
+
+capacity_failure_root="$(mktemp -d)"
+capacity_failure_data_dir="$capacity_failure_root/server_data"
+capacity_failure_results_dir="$capacity_failure_root/results"
+if SCALE_DISK_RESERVE_BYTES=1048576 \
+  SCALE_MEMORY_RESERVE_BYTES=1048576 \
+  SCALE_INDEX_BYTES_PER_RECORD=1 \
+  SCALE_RSS_BYTES_PER_RECORD=1 \
+  FLAPJACK_SCALE_SEARCH_SCRIPT="$latency_stub" \
+  timeout 180 bash "$LADDER_SCRIPT" \
+    --profile compact \
+    --rungs 10 \
+    --batch-size 10 \
+    --stall-seconds 10 \
+    --base-url "http://127.0.0.1:$((port + 5))" \
+    --server-binary "$SERVER_BINARY" \
+    --data-dir "$capacity_failure_data_dir" \
+    --results-dir "$capacity_failure_results_dir"; then
+  fail "forced post-rung capacity-calibration failure unexpectedly passed"
+fi
+jq -e '
+  .outcome == "CAPACITY_CALIBRATION_FAILED" and
+  .terminalRung == 10
+' "$capacity_failure_results_dir/run_receipt.json" >/dev/null || {
+  fail "forced capacity failure did not preserve its terminal run receipt"
+}
+jq -e '
+  .rungVerdict == "FAIL" and
+  .capacityObservation.verdict == "FAIL" and
+  ((.capacityObservation.reasons | index("indexBytesPerRecord")) != null) and
+  ((.capacityObservation.reasons | index("rssBytesPerRecord")) != null)
+' "$capacity_failure_results_dir/rung_10/metrics.json" >/dev/null || {
+  fail "forced capacity failure did not preserve the exact failed observations"
+}
+[[ ! -e "$capacity_failure_results_dir/checkpoint.json" ]] || {
+  fail "capacity-failed rung was incorrectly saved as a green checkpoint"
 }
 
 echo "PASS: scale ladder grows 10k to 20k with exact counts, sentinels, metrics, and negative controls"

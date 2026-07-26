@@ -1,5 +1,117 @@
 # Flapjack Loadtest Evidence
 
+## Competitor-Headroom Scale Campaign (July 26, 2026)
+
+### Result
+
+**Operational-headroom verdict: `NOT_PROVEN`. Guaranteed: 1,000,000 compact text records and
+2,000,000 standard text records on the reference machine below.** Guaranteed is the largest exact
+rung for each profile that passed every frozen correctness, liveness, locality, capacity, evidence,
+and latency gate. The campaign stopped each profile at its first terminal condition, so it did not
+dispatch unapproved larger rungs.
+
+The target was frozen before candidate measurements: at least 60,000,000 records, or 1.5 times the
+largest cited comparable operational count of 40,000,000, with 64,000,000 as the candidate rung.
+Neither profile reached that target:
+
+- compact passed 1M, then reached an exact 2M with rank-1 sentinels but failed both latency bars and
+  the frozen index-bytes-per-record allowance;
+- standard passed 1M and 2M, then its live count request exceeded the five-second bound while the
+  4M import was still progressing, after the last successful observation at 3,950,002 records.
+
+The standard 4M attempt is a terminal liveness failure under the frozen contract, not a completed
+4M result. It has no search-latency or capacity verdict. The saved 3,950,002 observation is
+diagnostic evidence only.
+
+### Competitor comparison
+
+The official statements were rechecked on 2026-07-26:
+
+| Product | Official statement | Classification | Campaign conclusion |
+|---|---:|---|---|
+| Typesense | [28M-book measured search benchmark](https://typesense.org/docs/overview/benchmarks.html) | operational search specimen | Not exceeded by a green Flapjack rung |
+| Meilisearch | [Importer handles datasets up to 40+ million documents](https://www.meilisearch.com/docs/getting_started/integrations/meilisearch_importer) | operational import claim, not a search SLO | Frozen 60M headroom target not reached |
+| Meilisearch | [Approximately 4.3B documents per index](https://www.meilisearch.com/docs/resources/help/faq) | structural limit, not an operational specimen | Not comparable to this campaign and not exceeded |
+
+These statements use different records, hardware, concurrency, and success criteria. Even a green
+64M Flapjack specimen would have supported only the narrow operational statement frozen in
+[`COMPETITOR_HEADROOM_CONTRACT_2026_07_26.md`](COMPETITOR_HEADROOM_CONTRACT_2026_07_26.md), not a
+generic claim that Flapjack supports more documents than Meilisearch. This campaign permits no
+competitor-superiority claim.
+
+### Frozen gates
+
+- Exact cumulative document count and rank-1 sentinels.
+- Name/prefix p95 at most 50 ms and blended p95 at most 100 ms.
+- Exactly 30 measured requests for each of seven query types.
+- Compact cumulative index/RSS allowances of 2,457/951 bytes per record.
+- Standard cumulative index/RSS allowances of 6,003/1,635 bytes per record.
+- Proven `i4i.4xlarge` local-NVMe locality, bounded liveness/runtime, and durable evidence.
+
+Missing, partial, projected, or indeterminate evidence is never green.
+
+### Reference machine and implementation
+
+| Field | Value |
+|---|---|
+| EC2 instance / type / region | `i-094ff7776c0f6b10b`, `i4i.4xlarge`, `us-east-1` |
+| CPU | 16 vCPU, Intel Xeon Platinum 8375C |
+| RAM | 132,916,662,272 bytes |
+| OS / kernel | Ubuntu 24.04, Linux `6.17.0-1019-aws`, x86_64 |
+| Index filesystem | XFS at `/srv/flapjack-scale` |
+| Index device | `/dev/nvme1n1`, `Amazon EC2 NVMe Instance Storage`, 3,750,000,000,000 bytes |
+| Root device | separate `Amazon Elastic Block Store` NVMe device |
+| Git SHA | `7c07223e3fd3a63342a409e04435b5ad185fb9ac` |
+| Release binary SHA-256 | `0e8d173a4c3edda80161bb29078fb28a1633cecee8b26e94ce2c99bb5c29303b` |
+| Import batch size | 10,000 records |
+
+The automated locality assessment returned `GO`; the data path resolved to local instance-store
+NVMe rather than EBS.
+
+### Compact curve
+
+Import time and throughput cover the newly added tranche. Index and RSS bytes are cumulative.
+
+| Records | Tranche | Import time | Docs/s | Index bytes | Index B/record | RSS bytes | RSS B/record | Name p95 | Blended p95 | Verdict |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1,000,000 | 1,000,000 | 131.224s | 7,620.557 | 1,907,187,712 | 1,908 | 648,994,816 | 649 | 29.051ms | 52.685ms | **PASS** |
+| 2,000,000 | 1,000,000 | 200.723s | 4,981.990 | 5,056,671,744 | 2,529 | 1,148,104,704 | 575 | 58.778ms | 103.923ms | **FAIL — capacity and latency** |
+
+The exact 2M compact result exceeded the 2,457 index-bytes-per-record allowance and both latency
+bars. No compact rung above 2M was dispatched.
+
+### Standard curve
+
+| Records | Tranche | Import time | Docs/s | Index bytes | Index B/record | RSS bytes | RSS B/record | Name p95 | Blended p95 | Verdict |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1,000,000 | 1,000,000 | 229.477s | 4,357.735 | 4,066,795,520 | 4,067 | 1,035,440,128 | 1,036 | 29.313ms | 52.277ms | **PASS** |
+| 2,000,000 | 1,000,000 | 293.652s | 3,405.391 | 11,695,218,688 | 5,848 | 1,873,297,408 | 937 | 44.182ms | 83.830ms | **PASS** |
+| 4,000,000 attempted | 2,000,000 planned | incomplete | incomplete | incomplete | incomplete | incomplete | incomplete | not run | not run | **FAIL — liveness at 3,950,002 observed** |
+
+The final successful standard count observation was 3,950,002. The next count request timed out
+after five seconds even though the importer had completed 196 of 201 input batches. The harness
+stopped only its own processes and retained the active input, logs, checkpoint, and server data.
+
+### Evidence and limits
+
+- Private versioned evidence prefix:
+  `s3://flapjack-scale-ceiling-213880904778-us-east-1-20260726/competitor_headroom/`.
+- Full standard terminal-state archive: 3,558,386,622 bytes.
+- Terminal archive SHA-256:
+  `061e6f6de9c9ec2b1f4a59fa091d7f791f7d9d72e21a18c4fac21f72820e54d7`.
+- S3 version ID: `pWu6Lx9eGU3Gv84wiXR5brUx6.ApGhWJ`.
+- The encrypted object was independently streamed back from S3 and matched the source and sidecar
+  SHA-256 exactly.
+- The final 119-file campaign manifest covers 986,404 bytes. Its aggregate archive SHA-256 is
+  `4556ecc979b0fe9ee35eded86c3846da44d73b1a2b264c00f30599e5d5075786` (S3 version
+  `HFjFr55iDeettGihqsMvPKqSrkXm4CUx`); an independent download, extraction, and strict-manifest
+  verification passed.
+
+This campaign measures text search on one named machine and one exact binary. It does not establish
+a vector, multi-node, hardware-independent, or structural document limit. The failed rungs identify
+contract boundaries for this configuration; they do not prove that every other configuration must
+fail at the same counts.
+
 ## Single-Machine Text Record Ceiling Follow-up (July 26, 2026)
 
 ### Result

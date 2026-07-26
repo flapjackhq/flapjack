@@ -36,6 +36,11 @@ follow-up that replaces full-search liveness with the usage gauge, compares lega
 batches at 250k, and localizes the compact and standard crossings on intermediate rungs. It does
 not revise the original contract or its July 25 result.
 
+[`COMPETITOR_HEADROOM_CONTRACT_2026_07_26.md`](COMPETITOR_HEADROOM_CONTRACT_2026_07_26.md) owns the
+subsequent 1M → 64M campaign. It freezes 60M as the operational comparison threshold, keeps that
+claim separate from Meilisearch's structural per-index limit, requires exactly 30 measured requests
+for all seven query types, and adds a post-rung observed-capacity gate before every checkpoint.
+
 The ladder starts its own loopback-only release server, grows one index incrementally, and fails
 closed on insufficient capacity, a flat document count, an inexact final count, missing rank-1
 sentinels, invalid latency evidence, or an unsafe resume checkpoint:
@@ -43,11 +48,31 @@ sentinels, invalid latency evidence, or an unsafe resume checkpoint:
 ```bash
 bash scale_ladder.sh \
   --profile compact \
-  --rungs 1000000,4000000,16000000,32000000,64000000 \
+  --rungs 1000000,2000000,4000000,8000000,16000000,32000000,64000000 \
+  --batch-size 10000 \
   --data-dir /srv/flapjack-scale/compact_ladder_data \
   --results-dir /durable/compact_ladder \
   --server-binary ../target/release/flapjack
 ```
+
+For the dated competitor-headroom campaign, pass its frozen 1.5x calibration values:
+
+```bash
+# compact
+SCALE_SOURCE_BYTES_PER_RECORD=512 \
+SCALE_INDEX_BYTES_PER_RECORD=2457 \
+SCALE_RSS_BYTES_PER_RECORD=951 \
+bash scale_ladder.sh ...
+
+# standard
+SCALE_SOURCE_BYTES_PER_RECORD=2048 \
+SCALE_INDEX_BYTES_PER_RECORD=6003 \
+SCALE_RSS_BYTES_PER_RECORD=1635 \
+bash scale_ladder.sh ...
+```
+
+The same values drive both the preflight projection and `capacity_observation.json`; a completed
+rung whose observed cumulative bytes per record exceeds either allowance cannot be checkpointed.
 
 Before a paid ladder, run the purpose-tagged `1M,4M,8M` compact probe with
 `--throughput-probe`, then evaluate its three exact `metrics.json` files with

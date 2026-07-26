@@ -1,6 +1,6 @@
 # Flapjack - Project Overview
 
-**Last updated:** 2026-07-18
+**Last updated:** 2026-07-26
 
 ## Mission
 
@@ -19,12 +19,12 @@ Public paid beta is shipped. The current strategic order is:
 2. **PL-10 - write-path saturation under sustained load.** The v1.0.4 batch-size
    tuning knob and v1.0.5 `TUNABLE_VERIFIED` harness gate are shipped, but the
    single-writer Tantivy ceiling remains the architectural constraint for v1.1.
-   Track A now also measures a customer-visible scale ceiling: one million
-   compact records imported exactly but missed text/prefix latency, and the next
-   import stopped at 2,145,002 when an exact count search exceeded five seconds.
-   Profile and remediate those local owners before another reference-machine
-   run. Current evidence routing lives in [`ROADMAP.md`](ROADMAP.md) and the
-   canonical curve lives in
+   The repaired July 26 reference contract now proves 1,000,000 compact and
+   1,000,000 standard records through every frozen text-search gate. Do not
+   profile the superseded July 25 liveness/latency failures as current product
+   defects; further scale work needs a new falsifiable question beyond the
+   verified floor. Current open work lives in [`ROADMAP.md`](ROADMAP.md), and
+   measured curves live only in
    [`engine/loadtest/BENCHMARKS.md`](engine/loadtest/BENCHMARKS.md).
 3. **Post-ship HA/test-signal hygiene.** HA snapshot flake remediation is
    verified, and the remaining signal-protection work is tracked in
@@ -33,7 +33,9 @@ Public paid beta is shipped. The current strategic order is:
    existing-target overwrite are shipped on the synchronous and authenticated
    async paths. Resume is the remaining async-control gap, while HA-converging
    import remains refused; [`ROADMAP.md`](ROADMAP.md) rows `MIG-6` and `MIG-7`
-   own those boundaries.
+   own those boundaries. Pre-launch source migration is expanding to
+   Meilisearch and Typesense through one provider-neutral lifecycle; M0
+   contract/security work must land before product adapters.
 5. **ADR-0005 OQ4 - cross-node failover idempotency dedup.** Node-local
    restart-durable idempotency is shipped; cross-node dedup remains a v1.1
    planned item.
@@ -45,6 +47,9 @@ does not duplicate that status ledger.
 ## Scope
 
 - Maintain Algolia API compatibility for existing client integrations.
+- Provide one-time migration into Flapjack from Algolia, Meilisearch, and
+  Typesense through shared lifecycle/publication owners and source-specific
+  adapters.
 - Keep search latency low and memory usage bounded under realistic workloads.
 - Extend analytics, vector search, HA, and operational tooling without increasing
   operator complexity.
