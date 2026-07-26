@@ -1,5 +1,82 @@
 # Flapjack Loadtest Evidence
 
+## Single-Machine Text Record Ceiling (July 25, 2026)
+
+### Result
+
+**Guaranteed: 10,000 compact text records on the reference machine below.** This is the largest
+saved reference-machine specimen that passed every frozen correctness and latency gate. It is a
+verified floor, not a claim that failure begins at 10,001 records.
+
+The exact 1,000,000-record specimen imported correctly and passed its rank-1 sentinels, but failed
+both frozen search bars. The next incremental import then failed its live-count liveness guard at
+2,145,002 records, before reaching 4,000,000. Therefore:
+
+- there is no green official `1M` ladder rung;
+- the measured compact ceiling is between the green 10k preflight and the failed 1M specimen;
+- 32M and 64M remain unproven targets, not Guaranteed results;
+- the required `1M,4M,8M` projection is `INVALID` because the import/liveness ceiling prevented
+  complete 4M and 8M probe evidence;
+- the compact and standard reference ladders were not forced after the predeclared stop condition.
+
+### Frozen gates
+
+- Name/prefix p95 ≤ 50 ms.
+- Blended-all-query-types p95 ≤ 100 ms.
+- Exact final document count and rank-1 sentinels must pass.
+- A live count request that cannot complete within its five-second request bound fails closed; a
+  partial import or projection cannot establish Guaranteed.
+
+The full policy is owned by
+[`SCALE_CEILING_CONTRACT.md`](SCALE_CEILING_CONTRACT.md).
+
+### Reference machine and implementation
+
+| Field | Value |
+|---|---|
+| EC2 type | `i4i.4xlarge` |
+| CPU | 16 vCPU, Intel Xeon Platinum 8375C |
+| RAM | 132,916,662,272 bytes |
+| OS / kernel | Ubuntu 24.04, Linux `6.17.0-1019-aws`, x86_64 |
+| Index filesystem | XFS at `/srv/flapjack-scale` |
+| Index device | `/dev/nvme1n1`, `Amazon EC2 NVMe Instance Storage`, 3,750,000,000,000 bytes |
+| Root/evidence device | separate `Amazon Elastic Block Store` NVMe device |
+| Git SHA | `f0772498d01efa78a95f3d77b3ff79d421ce0bb1` |
+| Release binary SHA-256 | `5de996d002afd69e89fffef90a90e55d02ecd208ca934333dd67a5c7af8b6348` |
+
+The automated locality evaluator returned `GO`; an EBS-backed index would have returned
+`INVALID`.
+
+### Compact curve
+
+| Attempt | Purpose | Final/observed docs | Import time | Docs/s | Index bytes | RSS bytes | Name p95 | Blended p95 | Verdict |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| 10k | reference preflight | 10,000 exact | 4.243s | 2,356.823 | 13,910,016 | 158,982,144 | 7.698ms | 25.469ms | **PASS** |
+| 1M | throughput probe | 1,000,000 exact | 787.881s | 1,269.227 | 4,284,788,736 | 1,226,792,960 | 191.123ms | 425.360ms | **FAIL — latency** |
+| 4M | incremental probe | 2,145,002 observed | incomplete | incomplete | incomplete | incomplete | not run | not run | **FAIL — liveness** |
+
+The incomplete 4M tranche is still useful diagnostic evidence, but not a benchmark result. Its
+first batches took roughly 0.4 seconds per 1,000 records; the last retained batches took roughly
+2.5–3.5 seconds. While imports were still advancing, the live document-count request exceeded its
+five-second bound. The harness stopped its own importer and server, retained the active 3M tranche
+input and 7.7 GiB server state, and marked the 32M/64M projection `INVALID`.
+
+### Evidence and limits
+
+- Local proof root (gitignored):
+  `engine/loadtest/results/20260725T224008Z_track_a_reference/`
+- Stage 4 strict manifest: 15 files, 2,558,063 bytes.
+- Failed probe strict manifest: 22 files, 544,417,904 bytes.
+- Full failed-state archive SHA-256:
+  `06832bb0708bed28cbe14c94f29965b90053229e2ef1b56448a14b45a8b750cc`.
+- The archive was uploaded with AES-256 server-side encryption, downloaded independently, hashed
+  again, extracted, and passed the same strict evidence manifest.
+
+This run measures text search only, on one named machine and one exact binary. It does not establish
+a vector ceiling, a multi-node ceiling, or a hardware-independent SLO. The standard record profile
+has no new result: the frozen compact stop condition ended Track A before the standard ladder could
+be dispatched safely.
+
 ## PL-12 v2 HA Peer-Failed Amplification Contract (May 29, 2026)
 
 ### Scenario Owner
