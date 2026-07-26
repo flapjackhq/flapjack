@@ -175,7 +175,6 @@ impl BatchExecutionState {
         } = operation;
         let body = operation_body(&action, body)?;
 
-        tracing::info!("Batch operation: action={}", action);
         validate_operation_body_size(&action, &body)?;
 
         match action.as_str() {
@@ -425,6 +424,14 @@ pub(super) async fn add_documents_batch_impl(
 
     let operations = batch_operations_from_request(req);
     validate_batch_size(operations.len())?;
+    // Keep production logs proportional to HTTP requests, not record count.
+    // The previous event lived inside `apply_operation` and produced one line
+    // per object (2,148,002 lines in the July 25 reference specimen).
+    tracing::info!(
+        index_name = %index_name,
+        operation_count = operations.len(),
+        "Batch request"
+    );
 
     let mut execution = BatchExecutionState::default();
     for operation in operations {
@@ -553,8 +560,40 @@ pub(super) fn trigger_replication(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Clone, Default)]
+    struct TestWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl TestWriter {
+        fn output(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl Write for TestWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for TestWriter {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     fn legacy_doc(id: &str) -> HashMap<String, serde_json::Value> {
         HashMap::from([(
@@ -600,5 +639,60 @@ mod tests {
         assert_eq!(drained.explicit_delete_count, 1);
         assert_eq!(drained.operation_count, 1);
         assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn multi_object_request_emits_one_batch_info_summary() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
+        let writer = TestWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(writer.clone()),
+        );
+        let request = AddDocumentsRequest::Batch {
+            requests: vec![
+                BatchOperation {
+                    action: "addObject".to_string(),
+                    index_name: None,
+                    body: Some(legacy_doc("one")),
+                    create_if_not_exists: None,
+                },
+                BatchOperation {
+                    action: "addObject".to_string(),
+                    index_name: None,
+                    body: Some(legacy_doc("two")),
+                    create_if_not_exists: None,
+                },
+                BatchOperation {
+                    action: "addObject".to_string(),
+                    index_name: None,
+                    body: Some(legacy_doc("three")),
+                    create_if_not_exists: None,
+                },
+            ],
+        };
+
+        let result = add_documents_batch_impl(State(state), "log_contract".to_string(), request)
+            .with_subscriber(subscriber)
+            .await;
+        assert!(result.is_ok(), "batch fixture must commit successfully");
+
+        let output = writer.output();
+        assert_eq!(
+            output.matches("Batch request").count(),
+            1,
+            "one HTTP batch must emit exactly one INFO summary: {output}",
+        );
+        assert!(
+            output.contains("operation_count=3") && output.contains("index_name=log_contract"),
+            "summary must retain useful batch cardinality and index context: {output}",
+        );
+        assert!(
+            !output.contains("Batch operation:"),
+            "the prior per-object INFO event must not survive: {output}",
+        );
     }
 }

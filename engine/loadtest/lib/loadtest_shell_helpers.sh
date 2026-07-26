@@ -289,17 +289,22 @@ index_doc_count() {
   if [[ ${#LOADTEST_AUTH_HEADERS[@]} -gt 0 ]]; then
     curl_args+=("${LOADTEST_AUTH_HEADERS[@]}")
   fi
-  curl_args+=("${base_url}/1/indexes/${encoded_index_name}?query=&hitsPerPage=0")
+  # The usage gauge reads the current searcher's segment metadata directly.
+  # A full empty query is not a count API and can exceed the liveness deadline
+  # while indexing, which caused the July 25 reference run's false ceiling.
+  curl_args+=("${base_url}/1/usage/documents_count/${encoded_index_name}")
 
   response="$("${curl_args[@]}")" || {
     echo "FAIL: unable to read doc count for index ${index_name}." >&2
     return 1
   }
   jq -er '
-    .nbHits
+    .documents_count
+    | select(type == "array" and length > 0)
+    | .[-1].v
     | select(type == "number" and . >= 0 and floor == .)
   ' <<<"$response" || {
-    echo "FAIL: search response for index ${index_name} has no integer nbHits." >&2
+    echo "FAIL: usage response for index ${index_name} has no current integer document count." >&2
     return 1
   }
 }

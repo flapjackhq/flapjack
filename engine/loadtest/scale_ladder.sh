@@ -290,13 +290,15 @@ write_checkpoint() {
     --arg index_name "$index_name" \
     --arg metrics_path "$metrics_path" \
     --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --argjson batch_size "$BATCH_SIZE" \
     --argjson rungs "$RUNGS_JSON" \
     --argjson last_completed_rung "$completed_rung" \
     '{
-      version: 2,
+      version: 3,
       profile: $profile,
       purpose: $purpose,
       rungs: $rungs,
+      batchSize: $batch_size,
       dataDir: $data_dir,
       resultsDir: $results_dir,
       indexName: $index_name,
@@ -304,7 +306,7 @@ write_checkpoint() {
       metricsPath: $metrics_path,
       timestamp: $timestamp
     }' > "$checkpoint_tmp"
-  jq -e '.version == 2 and .lastCompletedRung > 0' "$checkpoint_tmp" >/dev/null || {
+  jq -e '.version == 3 and .batchSize > 0 and .lastCompletedRung > 0' "$checkpoint_tmp" >/dev/null || {
     fail "new checkpoint is missing required fields"
   }
   mv "$checkpoint_tmp" "$CHECKPOINT_PATH"
@@ -323,12 +325,14 @@ validate_resume_checkpoint() {
     --arg data_dir "$SERVER_DATA_DIR" \
     --arg results_dir "$RESULTS_DIR" \
     --arg index_name "$index_name" \
+    --argjson batch_size "$BATCH_SIZE" \
     --argjson rungs "$RUNGS_JSON" \
     '
-      .version == 2 and
+      .version == 3 and
       .profile == $profile and
       .purpose == $purpose and
       .rungs == $rungs and
+      .batchSize == $batch_size and
       .dataDir == $data_dir and
       .resultsDir == $results_dir and
       .indexName == $index_name and
@@ -337,7 +341,7 @@ validate_resume_checkpoint() {
         $results_dir + "/rung_" + (.lastCompletedRung | tostring) + "/metrics.json"
       )
     ' "$CHECKPOINT_PATH" >/dev/null || {
-      fail "resume checkpoint does not exactly match profile, rungs, data dir, results dir, and index"
+      fail "resume checkpoint does not exactly match profile, rungs, batch size, data dir, results dir, and index"
     }
 
   last_completed_rung="$(jq -er '.lastCompletedRung' "$CHECKPOINT_PATH")"
@@ -604,6 +608,7 @@ done
 [[ -n "$RUNGS_CSV" ]] || fail "--rungs is required"
 [[ -n "$SERVER_DATA_DIR" ]] || fail "--data-dir is required"
 [[ "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || fail "--batch-size must be a positive integer"
+(( BATCH_SIZE <= 10000 )) || fail "--batch-size cannot exceed the server maximum of 10000"
 [[ -x "$SERVER_BINARY" ]] || fail "missing executable server binary: $SERVER_BINARY"
 if [[ "$RESUME" -eq 1 && "$RESULTS_DIR_EXPLICIT" -ne 1 ]]; then
   fail "--resume requires an explicit --results-dir"
@@ -761,7 +766,15 @@ for rung in "${RUNGS[@]}"; do
   }
   jq -e \
     --argjson expected_docs "$tranche_size" \
-    '.errorCount == 0 and .totalDocs == $expected_docs and .wallClockMs > 0' \
+    '.
+    | .errorCount == 0 and
+      .totalDocs == $expected_docs and
+      .wallClockMs > 0 and
+      .latencyWindows != null and
+      .latencyWindows.first.count > 0 and
+      .latencyWindows.middle.count > 0 and
+      .latencyWindows.last.count > 0 and
+      (.latencyWindows.lastToFirstP50Ratio | type == "number")' \
     "$import_artifact" >/dev/null || {
       fail "rung ${rung} import artifact is missing exact non-zero evidence"
     }
@@ -830,11 +843,13 @@ for rung in "${RUNGS[@]}"; do
     --argjson final_count "$final_count" \
     --argjson docs_per_second "$docs_per_second" \
     --argjson import_wall_clock_ms "$wall_clock_ms" \
+    --argjson batch_size "$BATCH_SIZE" \
     --argjson index_bytes "$index_bytes" \
     --argjson rss_bytes "$rss_bytes" \
     --arg negative_controls "$negative_controls" \
     --arg run_purpose "$run_purpose" \
     --slurpfile latency "$latency_verdict_path" \
+    --slurpfile import "$import_artifact" \
     --slurpfile search "$search_artifact" \
     '{
       profile: $profile,
@@ -845,6 +860,9 @@ for rung in "${RUNGS[@]}"; do
       finalCount: $final_count,
       docsPerSecond: $docs_per_second,
       importWallClockMs: $import_wall_clock_ms,
+      batchSize: $batch_size,
+      importLatency: $import[0].latency,
+      importLatencyWindows: $import[0].latencyWindows,
       indexBytes: $index_bytes,
       rssBytes: $rss_bytes,
       sentinels: "PASS",

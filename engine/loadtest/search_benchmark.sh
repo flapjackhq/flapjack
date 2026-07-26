@@ -17,7 +17,19 @@ epoch_ms() {
 
 emit_query_catalog_json() {
   local index_name="$1"
-  node "$SEARCH_HELPER" --catalog --index-name "$index_name"
+  local samples_per_type="$2"
+  node "$SEARCH_HELPER" \
+    --catalog \
+    --index-name "$index_name" \
+    --samples-per-type "$samples_per_type"
+}
+
+resolve_search_samples_per_type() {
+  local samples_per_type="${SEARCH_BENCHMARK_SAMPLES_PER_TYPE:-6}"
+  if [[ ! "$samples_per_type" =~ ^[1-9][0-9]*$ ]]; then
+    fail "SEARCH_BENCHMARK_SAMPLES_PER_TYPE must be a positive integer"
+  fi
+  printf '%s\n' "$samples_per_type"
 }
 
 validate_query_catalog_json() {
@@ -203,7 +215,9 @@ main() {
   echo "INFO: benchmark index '$index_name' has $BENCHMARK_DOC_COUNT documents"
 
   local catalog_json
-  catalog_json="$(emit_query_catalog_json "$index_name")"
+  local samples_per_type
+  samples_per_type="$(resolve_search_samples_per_type)"
+  catalog_json="$(emit_query_catalog_json "$index_name" "$samples_per_type")"
   if ! validate_query_catalog_json "$catalog_json"; then
     fail "query catalog helper returned unexpected output"
   fi

@@ -527,6 +527,50 @@ async fn usage_documents_count_explicit_zero_is_emitted() {
     assert_eq!(arr[0]["v"].as_u64().unwrap(), 0);
 }
 
+#[tokio::test]
+async fn usage_documents_count_per_index_loads_existing_index_after_restart() {
+    let tmp = TempDir::new().unwrap();
+    {
+        let initial_state = make_state(&tmp);
+        seed_loaded_documents(&initial_state, "durable_products", 3).await;
+    }
+
+    let restarted_state = make_state(&tmp);
+    assert_eq!(
+        restarted_state.manager.loaded_count(),
+        0,
+        "restart fixture must begin without a cached tenant"
+    );
+    let durable_path = tmp.path().join("durable_products");
+    let missing_path = tmp.path().join("missing_products");
+    assert!(durable_path.is_dir());
+    assert!(!missing_path.exists());
+
+    let app = usage_router(Arc::clone(&restarted_state));
+    let resp = get_usage(app.clone(), "/1/usage/documents_count/durable_products").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(
+        json["documents_count"][0]["v"].as_u64(),
+        Some(3),
+        "the per-index count must load and read the durable segment set"
+    );
+    assert_eq!(restarted_state.manager.loaded_count(), 1);
+
+    let missing_resp = get_usage(app, "/1/usage/documents_count/missing_products").await;
+    assert_eq!(missing_resp.status(), StatusCode::OK);
+    let missing_json = body_json(missing_resp).await;
+    assert_eq!(
+        missing_json["documents_count"].as_array().unwrap().len(),
+        0,
+        "a missing tenant must remain an absent gauge"
+    );
+    assert!(
+        !missing_path.exists(),
+        "reading a missing tenant's gauge must never create it"
+    );
+}
+
 /// Verify explicit zero storage cache entries are emitted instead of treated as missing.
 #[tokio::test]
 async fn usage_storage_bytes_explicit_zero_is_emitted() {

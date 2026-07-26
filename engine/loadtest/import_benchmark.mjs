@@ -48,11 +48,11 @@ function nearestRankPercentile(sorted, percentile) {
 }
 
 /**
- * Summarize an array of latency values (in ms) into count, avg, min, max, p95, p99.
+ * Summarize an array of latency values (in ms) with nearest-rank percentiles.
  */
 export function summarizeBatchLatencies(latenciesMs) {
   if (latenciesMs.length === 0) {
-    return { count: 0, avg: 0, min: 0, max: 0, p95: 0, p99: 0 };
+    return { count: 0, avg: 0, min: 0, max: 0, p50: 0, p95: 0, p99: 0 };
   }
 
   const sorted = [...latenciesMs].sort((a, b) => a - b);
@@ -64,8 +64,40 @@ export function summarizeBatchLatencies(latenciesMs) {
     avg,
     min: sorted[0],
     max: sorted[sorted.length - 1],
+    p50: nearestRankPercentile(sorted, 50),
     p95: nearestRankPercentile(sorted, 95),
     p99: nearestRankPercentile(sorted, 99),
+  };
+}
+
+/**
+ * Compare equally sized first, middle, and last deciles without sorting away
+ * run order. Small specimens use one sample per window so the diagnostic never
+ * becomes silently empty.
+ */
+export function buildLatencyWindows(latenciesMs) {
+  if (latenciesMs.length === 0) {
+    throw new Error("latency windows require at least one successful batch latency");
+  }
+
+  const windowSize = Math.max(1, Math.floor(latenciesMs.length / 10));
+  const middleStart = Math.floor((latenciesMs.length - windowSize) / 2);
+  const firstValues = latenciesMs.slice(0, windowSize);
+  const middleValues = latenciesMs.slice(middleStart, middleStart + windowSize);
+  const lastValues = latenciesMs.slice(latenciesMs.length - windowSize);
+  const first = summarizeBatchLatencies(firstValues);
+  const middle = summarizeBatchLatencies(middleValues);
+  const last = summarizeBatchLatencies(lastValues);
+
+  return {
+    windowSize,
+    first,
+    middle,
+    last,
+    lastToFirstP50Ratio:
+      first.p50 > 0
+        ? Math.round((last.p50 / first.p50) * 1000) / 1000
+        : null,
   };
 }
 
@@ -90,5 +122,6 @@ export function buildResultArtifact({
     errorCount,
     wallClockMs,
     latency: summarizeBatchLatencies(latenciesMs),
+    latencyWindows: latenciesMs.length > 0 ? buildLatencyWindows(latenciesMs) : null,
   };
 }

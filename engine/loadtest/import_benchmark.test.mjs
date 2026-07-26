@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  buildLatencyWindows,
   listBatchFiles,
   summarizeBatchLatencies,
   buildResultArtifact,
@@ -109,6 +110,7 @@ test("summarizeBatchLatencies computes avg/p95/p99 from latency array", () => {
   assert.equal(summary.p95, 95);
   // p99 = value at 99th percentile index: ceil(0.99 * 100) = 99th element = 99
   assert.equal(summary.p99, 99);
+  assert.equal(summary.p50, 50);
 });
 
 test("summarizeBatchLatencies handles single-element array", () => {
@@ -119,6 +121,7 @@ test("summarizeBatchLatencies handles single-element array", () => {
   assert.equal(summary.max, 42.5);
   assert.equal(summary.p95, 42.5);
   assert.equal(summary.p99, 42.5);
+  assert.equal(summary.p50, 42.5);
 });
 
 test("summarizeBatchLatencies handles empty array", () => {
@@ -129,6 +132,58 @@ test("summarizeBatchLatencies handles empty array", () => {
   assert.equal(summary.max, 0);
   assert.equal(summary.p95, 0);
   assert.equal(summary.p99, 0);
+  assert.equal(summary.p50, 0);
+});
+
+test("buildLatencyWindows reports hand-calculated first middle and last deciles", () => {
+  // Twenty ordered batches produce two-sample windows. The middle window is
+  // centered at values 10 and 11, so this fixture pins both slicing and
+  // nearest-rank percentile semantics.
+  const latencies = Array.from({ length: 20 }, (_, index) => (index + 1) * 100);
+  const windows = buildLatencyWindows(latencies);
+
+  assert.equal(windows.windowSize, 2);
+  assert.deepEqual(
+    {
+      count: windows.first.count,
+      p50: windows.first.p50,
+      p95: windows.first.p95,
+    },
+    { count: 2, p50: 100, p95: 200 },
+  );
+  assert.deepEqual(
+    {
+      count: windows.middle.count,
+      p50: windows.middle.p50,
+      p95: windows.middle.p95,
+    },
+    { count: 2, p50: 1000, p95: 1100 },
+  );
+  assert.deepEqual(
+    {
+      count: windows.last.count,
+      p50: windows.last.p50,
+      p95: windows.last.p95,
+    },
+    { count: 2, p50: 1900, p95: 2000 },
+  );
+  assert.equal(windows.lastToFirstP50Ratio, 19);
+});
+
+test("buildLatencyWindows stays determinate for a single successful batch", () => {
+  const windows = buildLatencyWindows([250]);
+  assert.equal(windows.windowSize, 1);
+  assert.equal(windows.first.p50, 250);
+  assert.equal(windows.middle.p50, 250);
+  assert.equal(windows.last.p50, 250);
+  assert.equal(windows.lastToFirstP50Ratio, 1);
+});
+
+test("buildLatencyWindows fails closed for no successful latency samples", () => {
+  assert.throws(
+    () => buildLatencyWindows([]),
+    /at least one successful batch latency/,
+  );
 });
 
 test("summarizeBatchLatencies rounds avg to 1 decimal place", () => {
@@ -172,6 +227,10 @@ test("buildResultArtifact produces valid schema with all required fields", () =>
   assert.equal(typeof artifact.latency.p99, "number");
   assert.equal(artifact.latency.min, 100);
   assert.equal(artifact.latency.max, 200);
+  assert.equal(artifact.latencyWindows.first.count, 1);
+  assert.equal(artifact.latencyWindows.middle.count, 1);
+  assert.equal(artifact.latencyWindows.last.count, 1);
+  assert.equal(artifact.latencyWindows.lastToFirstP50Ratio, 1.2);
 });
 
 test("buildResultArtifact with zero errors and empty latencies", () => {
@@ -188,6 +247,7 @@ test("buildResultArtifact with zero errors and empty latencies", () => {
   assert.equal(artifact.errorCount, 0);
   assert.equal(artifact.latency.count, 0);
   assert.equal(artifact.latency.avg, 0);
+  assert.equal(artifact.latencyWindows, null);
 });
 
 // --- result artifact schema stability ---
@@ -212,9 +272,10 @@ test("buildResultArtifact schema has exactly the expected keys", () => {
     "errorCount",
     "wallClockMs",
     "latency",
+    "latencyWindows",
   ].sort();
   assert.deepEqual(Object.keys(artifact).sort(), expectedTopKeys);
 
-  const expectedLatencyKeys = ["count", "avg", "min", "max", "p95", "p99"].sort();
+  const expectedLatencyKeys = ["count", "avg", "min", "max", "p50", "p95", "p99"].sort();
   assert.deepEqual(Object.keys(artifact.latency).sort(), expectedLatencyKeys);
 });

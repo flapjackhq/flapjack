@@ -26,7 +26,10 @@ impl UsageGaugeSelection {
 
 /// Capture current live gauge values for all loaded indexes.
 ///
-/// Document counts come from loaded tenants with successful `tenant_doc_count`.
+/// Document counts come from successful `tenant_doc_count` reads. A filtered
+/// per-index request first loads an existing durable tenant so a server restart
+/// does not turn a real index into an absent gauge; missing tenants are never
+/// created. Unfiltered capture remains bounded to already loaded tenants.
 /// Storage bytes come from the background metrics cache (`storage_gauges`).
 /// Missing storage remains `None`; explicit `0` remains `Some(0)`.
 /// No manager-wide storage or directory walk is performed.
@@ -77,11 +80,13 @@ fn capture_document_counts(
 ) {
     match index_filter {
         Some(index_name) => {
-            if let Some(value) = manager.tenant_doc_count(index_name) {
-                captured
-                    .entry(index_name.to_string())
-                    .or_default()
-                    .documents_count = Some(value);
+            if manager.get_or_load(index_name).is_ok() {
+                if let Some(value) = manager.tenant_doc_count(index_name) {
+                    captured
+                        .entry(index_name.to_string())
+                        .or_default()
+                        .documents_count = Some(value);
+                }
             }
         }
         None => {

@@ -10,10 +10,22 @@ and this project follows [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - Oversized ingestion requests now return HTTP `413 Payload Too Large` instead of `400 Bad Request` for both per-document (`DocumentTooLarge`) and per-batch (`BatchTooLarge`) size-limit rejections, letting ingestion clients distinguish "chunk and retry" from a malformed request.
+- Authenticated asynchronous Algolia migration now supports fenced
+  `overwrite=true` replacement through the same crash-safe publication owner as
+  the synchronous path.
+- Successful asynchronous migration status now carries durable settings,
+  synonym, rule, and warning outcomes; running, failed, and cancelled jobs omit
+  those outcomes instead of presenting fabricated zeroes.
+- The single-machine scale record now documents the measured one-million-record
+  latency miss and the 2,145,002-record exact-count timeout so follow-up
+  optimization is grounded in reproducible local specimens.
 
 ### Fixed
 
 - Explicit empty arrays (`[]`) in customer document fields are now preserved on write instead of being dropped, keeping customer-supplied content intact.
+- Async replacement now survives cancel/failure boundaries and idempotent owner
+  ACK replay without leaving the replaced target in an indeterminate
+  publication state.
 
 ## [1.0.10] - 2026-06-09
 

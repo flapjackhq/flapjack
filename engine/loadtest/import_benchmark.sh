@@ -97,10 +97,19 @@ print_summary() {
     "Errors:         " + (.errorCount | tostring),
     "Wall clock:     " + (.wallClockMs | tostring) + " ms",
     "Latency avg:    " + (.latency.avg | tostring) + " ms",
+    "Latency p50:    " + (.latency.p50 | tostring) + " ms",
     "Latency p95:    " + (.latency.p95 | tostring) + " ms",
     "Latency p99:    " + (.latency.p99 | tostring) + " ms",
     "Latency min:    " + (.latency.min | tostring) + " ms",
-    "Latency max:    " + (.latency.max | tostring) + " ms"
+    "Latency max:    " + (.latency.max | tostring) + " ms",
+    (if .latencyWindows == null then
+      "Latency windows: unavailable (no successful batches)"
+    else
+      "First/middle/last p50: " +
+      ([.latencyWindows.first.p50, .latencyWindows.middle.p50, .latencyWindows.last.p50]
+        | map(tostring) | join(" / ")) +
+      " ms; last/first=" + (.latencyWindows.lastToFirstP50Ratio | tostring)
+    end)
   ' < "$result_file"
   echo "================================"
 }

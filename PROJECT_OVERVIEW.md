@@ -19,13 +19,21 @@ Public paid beta is shipped. The current strategic order is:
 2. **PL-10 - write-path saturation under sustained load.** The v1.0.4 batch-size
    tuning knob and v1.0.5 `TUNABLE_VERIFIED` harness gate are shipped, but the
    single-writer Tantivy ceiling remains the architectural constraint for v1.1.
-   Current evidence routing lives in [`ROADMAP.md`](ROADMAP.md).
+   Track A now also measures a customer-visible scale ceiling: one million
+   compact records imported exactly but missed text/prefix latency, and the next
+   import stopped at 2,145,002 when an exact count search exceeded five seconds.
+   Profile and remediate those local owners before another reference-machine
+   run. Current evidence routing lives in [`ROADMAP.md`](ROADMAP.md) and the
+   canonical curve lives in
+   [`engine/loadtest/BENCHMARKS.md`](engine/loadtest/BENCHMARKS.md).
 3. **Post-ship HA/test-signal hygiene.** HA snapshot flake remediation is
    verified, and the remaining signal-protection work is tracked in
    [`ROADMAP.md`](ROADMAP.md).
-4. **Migration deferred-scope follow-through.** Create-only Algolia migration is
-   shipped; existing-target overwrite, async job control, and HA-converging import
-   remain open in [`ROADMAP.md`](ROADMAP.md) rows `MIG-5`, `MIG-6`, and `MIG-7`.
+4. **Migration deferred-scope follow-through.** Create-only and fenced
+   existing-target overwrite are shipped on the synchronous and authenticated
+   async paths. Resume is the remaining async-control gap, while HA-converging
+   import remains refused; [`ROADMAP.md`](ROADMAP.md) rows `MIG-6` and `MIG-7`
+   own those boundaries.
 5. **ADR-0005 OQ4 - cross-node failover idempotency dedup.** Node-local
    restart-durable idempotency is shipped; cross-node dedup remains a v1.1
    planned item.

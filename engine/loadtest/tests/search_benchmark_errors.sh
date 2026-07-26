@@ -356,6 +356,41 @@ test_summary_surfaces_name_prefix_percentiles() {
   rm -rf "$tmp_dir"
 }
 
+test_reference_sample_count_override() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  local sourceable_script="$tmp_dir/sourceable_search_benchmark.sh"
+  make_sourceable_script "$sourceable_script"
+
+  assert_output_equals \
+    "accepts the frozen 30-sample reference override" \
+    "30" \
+    bash -lc '
+      source "$1"
+      SEARCH_BENCHMARK_SAMPLES_PER_TYPE=30
+      resolve_search_samples_per_type
+    ' bash "$sourceable_script"
+
+  assert_exit_nonzero \
+    "rejects a zero sample-count override" \
+    bash -lc '
+      source "$1"
+      SEARCH_BENCHMARK_SAMPLES_PER_TYPE=0
+      resolve_search_samples_per_type
+    ' bash "$sourceable_script"
+
+  assert_output_contains \
+    "invalid sample-count failure is explicit" \
+    "positive integer" \
+    bash -lc '
+      source "$1"
+      SEARCH_BENCHMARK_SAMPLES_PER_TYPE=not-a-number
+      resolve_search_samples_per_type
+    ' bash "$sourceable_script"
+
+  rm -rf "$tmp_dir"
+}
+
 echo "=== search_benchmark.sh error-path tests ==="
 test_missing_index_fails
 test_zero_doc_index_fails
@@ -364,6 +399,7 @@ test_empty_query_catalog_fails
 test_search_request_failure_fails
 test_summary_surfaces_name_prefix_percentiles
 test_search_latency_uses_curl_transport_time
+test_reference_sample_count_override
 
 echo ""
 echo "Results: $TEST_PASS passed, $TEST_FAIL failed"

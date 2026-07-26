@@ -30,6 +30,12 @@ Set these variables when overriding defaults:
 bars, and stop conditions. [`AWS_SCALE_CEILING_RUNBOOK.md`](AWS_SCALE_CEILING_RUNBOOK.md) owns the
 reference-machine locality and evidence-preservation procedure.
 
+The dated
+[`SCALE_CEILING_CONTRACT_2026_07_26.md`](SCALE_CEILING_CONTRACT_2026_07_26.md) owns the independent
+follow-up that replaces full-search liveness with the usage gauge, compares legal 1k and 10k HTTP
+batches at 250k, and localizes the compact and standard crossings on intermediate rungs. It does
+not revise the original contract or its July 25 result.
+
 The ladder starts its own loopback-only release server, grows one index incrementally, and fails
 closed on insufficient capacity, a flat document count, an inexact final count, missing rank-1
 sentinels, invalid latency evidence, or an unsafe resume checkpoint:

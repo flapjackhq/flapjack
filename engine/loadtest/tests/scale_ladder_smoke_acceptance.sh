@@ -36,12 +36,33 @@ timeout 900 bash "$LADDER_SCRIPT" \
   --results-dir "$results_dir"
 
 jq -e '
-  .version == 2 and
+  .version == 3 and
   .profile == "compact" and
   .purpose == "throughput_probe" and
+  .batchSize == 1000 and
   .rungs == [10000, 20000] and
   .lastCompletedRung == 10000
 ' "$results_dir/checkpoint.json" >/dev/null || fail "planned pause did not write the exact checkpoint"
+
+if SCALE_DISK_RESERVE_BYTES=1048576 \
+  SCALE_MEMORY_RESERVE_BYTES=1048576 \
+  timeout 60 bash "$LADDER_SCRIPT" \
+    --profile compact \
+    --rungs 10000,20000 \
+    --throughput-probe \
+    --resume \
+    --batch-size 999 \
+    --stall-seconds 10 \
+    --base-url "$base_url" \
+    --server-binary "$SERVER_BINARY" \
+    --data-dir "$data_dir" \
+    --results-dir "$results_dir"; then
+  fail "mismatched batch-size checkpoint negative control unexpectedly passed"
+fi
+jq -e '.version == 3 and .batchSize == 1000 and .lastCompletedRung == 10000' \
+  "$results_dir/checkpoint.json" >/dev/null || {
+  fail "mismatched batch-size resume altered the last valid checkpoint"
+}
 
 SCALE_DISK_RESERVE_BYTES=1048576 \
 SCALE_MEMORY_RESERVE_BYTES=1048576 \
@@ -79,6 +100,12 @@ jq -e '
   .targetCount == 10000 and
   .finalCount == 10000 and
   .docsPerSecond > 0 and
+  .batchSize == 1000 and
+  .importLatency.count > 0 and
+  .importLatencyWindows.first.count > 0 and
+  .importLatencyWindows.middle.count > 0 and
+  .importLatencyWindows.last.count > 0 and
+  (.importLatencyWindows.lastToFirstP50Ratio | type == "number") and
   .indexBytes > 0 and
   .rssBytes > 0 and
   .sentinels == "PASS"

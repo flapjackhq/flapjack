@@ -1,5 +1,101 @@
 # Flapjack Loadtest Evidence
 
+## Single-Machine Text Record Ceiling Follow-up (July 26, 2026)
+
+### Result
+
+**Guaranteed: 1,000,000 compact text records and 1,000,000 standard text records on the reference
+machine below.** These are the largest saved reference-machine specimens that passed every frozen
+correctness, liveness, locality, evidence, and latency gate. The contract ended at 1,000,000, so
+this is a verified floor: it is not a claim that either profile fails at 1,000,001 records, and no
+result above 1,000,000 is inferred.
+
+Both profiles passed every cumulative rung from 10,000 through 1,000,000. No latency crossing was
+observed inside the contracted range. Each rung ended at the exact target count, passed its
+rank-1 sentinels, and used 30 measured requests for each of seven query types. Name/prefix p95
+remained at or below 50 ms and blended p95 remained at or below 100 ms.
+
+The independently frozen policy is owned by
+[`SCALE_CEILING_CONTRACT_2026_07_26.md`](SCALE_CEILING_CONTRACT_2026_07_26.md). The July 25 result
+below remains immutable and is not retroactively reinterpreted as a specimen under this contract.
+
+### Repair and reference batch selection
+
+The follow-up repaired two diagnostic bottlenecks before collecting candidate data:
+
+- import liveness now reads the existing per-index usage document gauge instead of issuing a full
+  empty-query search;
+- single-index imports emit one INFO summary per HTTP batch instead of one INFO event per object.
+
+The frozen A/B rule compared two fresh 250,000-record compact imports on the reference machine and
+selected 10,000 only if it was not slower than the 1,000-record control and both specimens passed
+correctness.
+
+| Batch | Import time | Docs/s | First / middle / last p50 | Last/first | Name p95 | Blended p95 | Verdict |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 1,000 | 104.349s | 2,395.806 | 284 / 300 / 343 ms | 1.208 | 22.677ms | 61.504ms | **PASS** |
+| 10,000 | 32.873s | 7,605.025 | 230 / 1,147 / 1,180 ms | 5.130 | 10.950ms | 28.822ms | **PASS — selected** |
+
+The 10,000-record candidate delivered 3.174307 times the control throughput. It is within the
+existing server limit; this track did not raise that limit.
+
+### Reference machine and implementation
+
+| Field | Value |
+|---|---|
+| EC2 type / region | `i4i.4xlarge`, `us-east-1` |
+| CPU | 16 vCPU, Intel Xeon Platinum 8375C |
+| RAM | 132,916,670,464 bytes |
+| OS / kernel | Ubuntu 24.04, Linux `6.17.0-1019-aws`, x86_64 |
+| Index filesystem | XFS at `/srv/flapjack-scale` |
+| Index device | `/dev/nvme1n1`, `Amazon EC2 NVMe Instance Storage`, 3,750,000,000,000 bytes |
+| Root device | separate `Amazon Elastic Block Store` NVMe device |
+| Git SHA | `41c8314b43bad48de4531d76032bf831e3744a5e` |
+| Release binary SHA-256 | `95c23666df21df4c2dadf10ce14ab402bfa190c7144b2fcd15c21faf0b3e3eb0` |
+| Import batch size | 10,000 records |
+
+The automated locality evaluator returned `GO`; an EBS-backed index would have returned
+`INVALID`.
+
+### Compact curve
+
+Import latency columns are first, middle, and last decile-window p50 values. Import time and
+throughput cover only the newly added tranche; index and RSS bytes are cumulative at the rung.
+
+| Records | Tranche | Import time | Docs/s | Import p50 F/M/L | Last/first | Index bytes | RSS bytes | Name p95 | Blended p95 | Verdict |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 10,000 | 10,000 | 1.744s | 5,733.945 | 233 / 233 / 1,166 ms | 5.004 | 11,091,968 | 174,735,360 | 7.388ms | 26.318ms | **PASS** |
+| 50,000 | 40,000 | 5.490s | 7,285.974 | 183 / 1,139 / 1,064 ms | 5.814 | 29,511,680 | 157,253,632 | 8.618ms | 26.672ms | **PASS** |
+| 100,000 | 50,000 | 6.809s | 7,343.222 | 135 / 1,130 / 1,131 ms | 8.378 | 49,270,784 | 171,425,792 | 9.773ms | 27.185ms | **PASS** |
+| 250,000 | 150,000 | 19.897s | 7,538.825 | 164 / 1,094 / 1,153 ms | 7.030 | 174,604,288 | 306,163,712 | 12.965ms | 28.743ms | **PASS** |
+| 500,000 | 250,000 | 34.634s | 7,218.340 | 152 / 1,193 / 1,161 ms | 7.638 | 583,761,920 | 425,598,976 | 15.653ms | 31.105ms | **PASS** |
+| 1,000,000 | 500,000 | 76.246s | 6,557.721 | 1,240 / 1,371 / 1,418 ms | 1.144 | 1,637,871,616 | 633,356,288 | 34.241ms | 58.091ms | **PASS** |
+
+### Standard curve
+
+| Records | Tranche | Import time | Docs/s | Import p50 F/M/L | Last/first | Index bytes | RSS bytes | Name p95 | Blended p95 | Verdict |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 10,000 | 10,000 | 2.814s | 3,553.660 | 230 / 230 / 2,172 ms | 9.443 | 16,850,944 | 206,163,968 | 11.141ms | 50.664ms | **PASS** |
+| 50,000 | 40,000 | 10.209s | 3,918.111 | 230 / 2,188 / 2,271 ms | 9.874 | 43,094,016 | 220,762,112 | 11.660ms | 50.995ms | **PASS** |
+| 100,000 | 50,000 | 12.533s | 3,989.468 | 132 / 2,269 / 2,164 ms | 16.394 | 80,379,904 | 275,095,552 | 12.473ms | 51.347ms | **PASS** |
+| 250,000 | 150,000 | 37.167s | 4,035.838 | 207 / 2,169 / 2,298 ms | 11.101 | 327,168,000 | 395,120,640 | 14.331ms | 51.822ms | **PASS** |
+| 500,000 | 250,000 | 63.788s | 3,919.232 | 187 / 2,296 / 2,239 ms | 11.973 | 1,258,438,656 | 612,212,736 | 25.673ms | 53.311ms | **PASS** |
+| 1,000,000 | 500,000 | 132.865s | 3,763.218 | 2,284 / 2,388 / 2,440 ms | 1.068 | 4,001,333,248 | 1,089,536,000 | 36.239ms | 57.137ms | **PASS** |
+
+### Evidence and limits
+
+- The strict aggregate manifest covers 159 files and 584,423 bytes.
+- Full reference archive SHA-256:
+  `3156f6223caa038347ddfbcecb6e5d77697527d2d3479cc6f1300fccb216bcc3`.
+- Durable private evidence:
+  `s3://flapjack-scale-ceiling-213880904778-us-east-1-20260726/track_a_followup/`.
+- The archive uses AES-256 server-side encryption. It was downloaded independently from S3,
+  hashed again, extracted, and passed the same strict manifest.
+
+This run measures text search only, on one named machine and one exact binary. It does not establish
+a vector ceiling, a multi-node ceiling, a hardware-independent SLO, or performance above the
+contracted 1,000,000-record maximum.
+
 ## Single-Machine Text Record Ceiling (July 25, 2026)
 
 ### Result
