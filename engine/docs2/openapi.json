@@ -6946,6 +6946,32 @@
           "phase": {
             "$ref": "#/components/schemas/AsyncMigrationPhase"
           },
+          "rulesImported": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MigrateCount"
+              }
+            ]
+          },
+          "settingsApplied": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "synonymsImported": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MigrateCount"
+              }
+            ]
+          },
           "terminalAt": {
             "type": [
               "string",
@@ -6956,6 +6982,12 @@
           "updatedAt": {
             "type": "string",
             "format": "date-time"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MigrateWarning"
+            }
           }
         }
       },

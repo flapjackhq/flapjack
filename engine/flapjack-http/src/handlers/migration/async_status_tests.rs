@@ -9,7 +9,7 @@ use crate::handlers::migration::source_test_support::{
 };
 use crate::handlers::migration::spool::{
     AsyncMigrationPublicationSemantic, MigrationDisposition, MigrationExportProgress,
-    MigrationPhase, MigrationPhaseRecord,
+    MigrationImportOutcome, MigrationImportWarning, MigrationPhase, MigrationPhaseRecord,
 };
 use crate::test_helpers::{body_json, TestStateBuilder};
 use axum::body::Body;
@@ -20,6 +20,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use chrono::{TimeZone, Utc};
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -28,6 +29,13 @@ use tempfile::TempDir;
 use tokio::sync::Notify;
 use tower::ServiceExt;
 use uuid::Uuid;
+
+fn assert_import_outcome_fields_absent(body: &serde_json::Value) {
+    assert!(body.get("settingsApplied").is_none());
+    assert!(body.get("synonymsImported").is_none());
+    assert!(body.get("rulesImported").is_none());
+    assert!(body.get("warnings").is_none());
+}
 
 #[test]
 fn async_migration_status_response_wire_contract_has_no_overall_progress() {
@@ -44,6 +52,7 @@ fn async_migration_status_response_wire_contract_has_no_overall_progress() {
         created_at: Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).unwrap(),
         updated_at: Utc.with_ymd_and_hms(2026, 7, 15, 12, 1, 0).unwrap(),
         terminal_at: None,
+        import_outcome: None,
     };
 
     let body = serde_json::to_value(AsyncMigrationStatusResponse::from(record)).unwrap();
@@ -68,6 +77,43 @@ fn async_migration_status_response_wire_contract_has_no_overall_progress() {
     assert!(body.get("cancelRequested").is_none());
     assert!(body.get("cancel_requested").is_none());
     assert!(body["exportProgress"].get("ratio").is_none());
+    assert_import_outcome_fields_absent(&body);
+}
+
+#[test]
+fn async_running_status_hides_pre_recorded_import_outcome() {
+    let job_uuid = Uuid::parse_str("01890f8e-8b28-78e8-b542-8cfdcb2d4f24").unwrap();
+    let record = MigrationPhaseRecord {
+        job_uuid,
+        phase: MigrationPhase::Activating,
+        disposition: MigrationDisposition::Running,
+        cancel_requested: false,
+        export_progress: None,
+        created_at: Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).unwrap(),
+        updated_at: Utc.with_ymd_and_hms(2026, 7, 15, 12, 1, 0).unwrap(),
+        terminal_at: None,
+        import_outcome: Some(MigrationImportOutcome {
+            settings_applied: true,
+            synonyms_imported: 1,
+            rules_imported: 2,
+            warnings: vec![MigrationImportWarning {
+                code: "PersistedNoBehaviorSetting".to_string(),
+                message:
+                    "Source setting is preserved for compatibility but has no Flapjack behavior."
+                        .to_string(),
+                resource: "Settings".to_string(),
+                page_index: None,
+                item_index: None,
+                json_path: "$.hitsPerPage".to_string(),
+            }],
+        }),
+    };
+
+    let body = serde_json::to_value(AsyncMigrationStatusResponse::from(record)).unwrap();
+
+    assert_eq!(body["phase"], "activating");
+    assert_eq!(body["disposition"], "running");
+    assert_import_outcome_fields_absent(&body);
 }
 
 #[test]
@@ -83,6 +129,7 @@ fn async_migration_status_response_serializes_cancelled_terminal_disposition() {
         created_at: Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).unwrap(),
         updated_at: terminal_at,
         terminal_at: Some(terminal_at),
+        import_outcome: None,
     };
 
     let body = serde_json::to_value(AsyncMigrationStatusResponse::from(record)).unwrap();
@@ -91,6 +138,7 @@ fn async_migration_status_response_serializes_cancelled_terminal_disposition() {
     assert_eq!(body["terminalAt"], "2026-07-15T12:02:00Z");
     assert!(body.get("cancelRequested").is_none());
     assert!(body.get("cancel_requested").is_none());
+    assert_import_outcome_fields_absent(&body);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -146,6 +194,86 @@ async fn async_submit_returns_admission_snapshot_and_status_reads_durable_phase(
     let terminal = wait_for_async_terminal(&state, submitted.job_id, "async-owner-app", None).await;
     assert_eq!(terminal.phase, AsyncMigrationPhase::Activating);
     assert_eq!(terminal.disposition, AsyncMigrationDisposition::Succeeded);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_terminal_status_reports_import_outcome_counts_and_warnings() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+
+    let (status, Json(submitted)) = submit_algolia_migration_with_test_source_factory(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(AuthenticatedAppId("async-owner-app".to_string())),
+        Json(valid_async_request()),
+        |_| Ok(async_source_reader_with_import_outcome()),
+    )
+    .await
+    .expect("async submission should be admitted");
+
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let terminal = wait_for_async_terminal(&state, submitted.job_id, "async-owner-app", None).await;
+    assert_eq!(terminal.phase, AsyncMigrationPhase::Activating);
+    assert_eq!(terminal.disposition, AsyncMigrationDisposition::Succeeded);
+    assert_eq!(terminal.settings_applied, Some(true));
+    assert_eq!(
+        terminal.synonyms_imported,
+        Some(MigrateCount { imported: 1 })
+    );
+    assert_eq!(terminal.rules_imported, Some(MigrateCount { imported: 2 }));
+
+    let warning_codes = terminal
+        .warnings
+        .iter()
+        .map(|warning| warning.code.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        warning_codes,
+        BTreeSet::from([
+            "ReplicaExhaustiveSortApproximated",
+            "ReplicaMatchingCriticalFieldDiverges",
+            "ReplicaRelevancyStrictnessSemanticMismatch",
+        ])
+    );
+    assert_eq!(
+        terminal.warnings.len(),
+        3,
+        "async status must not expose extra translation warnings"
+    );
+    let exhaustive_warning = terminal
+        .warnings
+        .iter()
+        .find(|warning| warning.code == "ReplicaExhaustiveSortApproximated")
+        .expect("status should expose the exhaustive-sort approximation warning");
+    assert_eq!(
+        exhaustive_warning.message,
+        "Algolia standard replica exhaustive sorting is approximated as a Flapjack virtual replica."
+    );
+    assert_eq!(exhaustive_warning.json_path, "$.replicas[0]");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_terminal_status_reports_zero_rule_and_synonym_counts() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+
+    let (status, Json(submitted)) = submit_algolia_migration_with_test_source_factory(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(AuthenticatedAppId("async-owner-app".to_string())),
+        Json(valid_async_request()),
+        |_| Ok(async_hermetic_source_reader()),
+    )
+    .await
+    .expect("async submission should be admitted");
+
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let terminal = wait_for_async_terminal(&state, submitted.job_id, "async-owner-app", None).await;
+    assert_eq!(terminal.phase, AsyncMigrationPhase::Activating);
+    assert_eq!(terminal.disposition, AsyncMigrationDisposition::Succeeded);
+    assert_eq!(terminal.rules_imported, Some(MigrateCount { imported: 0 }));
+    assert_eq!(
+        terminal.synonyms_imported,
+        Some(MigrateCount { imported: 0 })
+    );
 }
 
 #[tokio::test]
@@ -256,6 +384,7 @@ async fn async_cancel_running_job_returns_status_without_exposing_internal_flag(
     let body = serde_json::to_value(status).unwrap();
     assert!(body.get("cancelRequested").is_none());
     assert!(body.get("cancel_requested").is_none());
+    assert_import_outcome_fields_absent(&body);
 }
 
 #[tokio::test]
@@ -305,7 +434,7 @@ async fn async_cancel_terminal_jobs_returns_existing_terminal_status() {
     spool
         .transition_migration_phase(succeeded, MigrationPhase::Activating)
         .unwrap();
-    let succeeded_before = spool.succeed_migration(succeeded).unwrap();
+    let succeeded_before = spool.succeed_migration(succeeded, None).unwrap();
 
     for (job_uuid, expected) in [
         (cancelled, cancelled_before),
@@ -352,7 +481,7 @@ async fn async_acknowledge_terminal_job_returns_no_content_and_preserves_phase()
     spool
         .transition_migration_phase(job_uuid, MigrationPhase::Activating)
         .unwrap();
-    let terminal = spool.succeed_migration(job_uuid).unwrap();
+    let terminal = spool.succeed_migration(job_uuid, None).unwrap();
 
     let status = acknowledge_algolia_migration(
         State(Arc::clone(&state)),
@@ -402,7 +531,7 @@ async fn async_acknowledge_uses_authenticated_header_owner_identity() {
     spool
         .transition_migration_phase(job_uuid, MigrationPhase::Activating)
         .unwrap();
-    let terminal_before = spool.succeed_migration(job_uuid).unwrap();
+    let terminal_before = spool.succeed_migration(job_uuid, None).unwrap();
 
     let first = send_acknowledge_request(&app, job_uuid, "async-owner-app", "secret-key").await;
     assert_eq!(first.status(), StatusCode::NO_CONTENT);
@@ -813,6 +942,74 @@ fn async_hermetic_source_reader() -> ScriptedSourceReader {
     ]];
     reader.push_pass(settings.clone(), document_pages.clone(), vec![], vec![]);
     reader.push_pass(settings, document_pages, vec![], vec![]);
+    reader.push_quiescent(source_record);
+    reader
+}
+
+fn async_source_reader_with_import_outcome() -> ScriptedSourceReader {
+    let mut reader = ScriptedSourceReader::new("LOCALMIGRATIONTEST", "source_products");
+    let source_record = AlgoliaIndexRecord {
+        name: "source_products".to_string(),
+        entries: 2,
+        updated_at: "2026-07-16T00:00:00Z".to_string(),
+        pending_task: false,
+    };
+    reader.push_quiescent(source_record.clone());
+    let settings = json!({
+        "searchableAttributes": ["title"],
+        "attributesForFaceting": ["category"],
+        "replicas": ["replica_idx"]
+    });
+    let document_pages = vec![vec![
+        json!({"objectID": "doc-1", "title": "Quartz adapter", "category": "hardware"}),
+        json!({"objectID": "doc-2", "title": "Velvet compass", "category": "navigation"}),
+    ]];
+    let rule_pages = vec![vec![
+        json!({
+            "objectID": "rule-promote",
+            "conditions": [{"pattern": "sale", "anchoring": "contains"}],
+            "consequence": {
+                "promote": [{"objectID": "doc-1", "position": 1}],
+                "params": {
+                    "query": {"remove": ["cheap"], "edits": [{"type": "remove", "delete": "cheap"}]},
+                    "automaticFacetFilters": [{"facet": "brand", "score": 4}]
+                }
+            },
+            "enabled": true
+        }),
+        json!({
+            "objectID": "rule-hide",
+            "conditions": [{"pattern": "sale", "anchoring": "contains"}],
+            "consequence": {
+                "promote": [{"objectID": "doc-1", "position": 1}],
+                "params": {
+                    "query": {"remove": ["cheap"], "edits": [{"type": "remove", "delete": "cheap"}]},
+                    "automaticFacetFilters": [{"facet": "brand", "score": 4}]
+                }
+            },
+            "enabled": true
+        }),
+    ]];
+    let synonym_pages = vec![vec![json!({
+        "objectID": "synonym-shoes",
+        "type": "synonym",
+        "synonyms": ["sneaker", "trainer"]
+    })]];
+    reader.push_pass(
+        settings.clone(),
+        document_pages.clone(),
+        rule_pages.clone(),
+        synonym_pages.clone(),
+    );
+    reader.push_pass(settings, document_pages, rule_pages, synonym_pages);
+    reader.push_index_settings(
+        "replica_idx",
+        Ok(json!({
+            "ranking": ["desc(price)"],
+            "relevancyStrictness": 80,
+            "searchableAttributes": ["title"]
+        })),
+    );
     reader.push_quiescent(source_record);
     reader
 }

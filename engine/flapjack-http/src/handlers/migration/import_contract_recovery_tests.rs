@@ -1,5 +1,7 @@
 use super::*;
-use crate::handlers::migration::spool::AsyncMigrationPublicationSemantic;
+use crate::handlers::migration::spool::{
+    AsyncMigrationPublicationSemantic, MigrationImportOutcome, MigrationImportWarning,
+};
 use flapjack::index::manager::publication::{
     PreStagedPublication, PublicationPhase, PublicationTarget, PublicationTargetDisposition,
 };
@@ -298,7 +300,7 @@ async fn async_recovery_leaves_terminal_jobs_untouched() {
         )
         .unwrap();
     advance_to_activating(&spool, succeeded);
-    spool.succeed_migration(succeeded).unwrap();
+    spool.succeed_migration(succeeded, None).unwrap();
     let failed_before = spool.read_migration_phase(failed).unwrap();
     let succeeded_before = spool.read_migration_phase(succeeded).unwrap();
 
@@ -451,7 +453,8 @@ async fn async_recovery_treats_cancel_requested_committed_publication_as_succeed
     let reports = repair_publications(&state);
     recover_jobs(&state, &reports).await;
 
-    assert_terminal_phase(&spool, job_uuid, MigrationDisposition::Succeeded);
+    let phase = assert_terminal_phase(&spool, job_uuid, MigrationDisposition::Succeeded);
+    assert_eq!(phase.import_outcome, Some(recovery_import_outcome()));
     assert_eq!(
         directory_snapshot(&state.manager.base_path.join("cancel_committed_primary")),
         before,
@@ -623,6 +626,14 @@ async fn assert_committed_replacement_recovery(
         "{disposition_message}"
     );
     assert_eq!(
+        phase.import_outcome,
+        if expected_disposition == MigrationDisposition::Succeeded {
+            Some(recovery_import_outcome())
+        } else {
+            None
+        }
+    );
+    assert_eq!(
         directory_snapshot(&state.manager.base_path.join(TARGET_INDEX)),
         before,
         "{snapshot_message}"
@@ -788,6 +799,9 @@ async fn create_committed_async_replacement_job(
         .replace_index_contents_from_pre_staged(publication, target_index, staging_baseline)
         .await
         .unwrap();
+    spool
+        .record_import_outcome(job_uuid, recovery_import_outcome())
+        .unwrap();
     state.manager.unload(&target_index.to_string()).unwrap();
     job_uuid
 }
@@ -826,8 +840,28 @@ async fn create_committed_async_job(
         .transition_migration_phase(job_uuid, MigrationPhase::Activating)
         .unwrap();
     publication.activate_create_only().unwrap();
+    spool
+        .record_import_outcome(job_uuid, recovery_import_outcome())
+        .unwrap();
     state.manager.unload(&target_index.to_string()).unwrap();
     job_uuid
+}
+
+fn recovery_import_outcome() -> MigrationImportOutcome {
+    MigrationImportOutcome {
+        settings_applied: true,
+        synonyms_imported: 1,
+        rules_imported: 0,
+        warnings: vec![MigrationImportWarning {
+            code: "PersistedNoBehaviorSetting".to_string(),
+            message: "Source setting is preserved for compatibility but has no Flapjack behavior."
+                .to_string(),
+            resource: "Settings".to_string(),
+            page_index: None,
+            item_index: None,
+            json_path: "$.hitsPerPage".to_string(),
+        }],
+    }
 }
 
 async fn create_unjournaled_async_publication(

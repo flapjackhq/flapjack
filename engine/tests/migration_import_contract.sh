@@ -347,13 +347,15 @@ load_credentials() {
 
   # shellcheck source=engine/tests/common/load_named_secrets.sh disable=SC1091
   source "$SECRET_HELPER"
-  local loader_output
-  loader_output="$(mktemp)"
-  if ! load_named_secrets "$SECRET_FILE" ALGOLIA_APP_ID ALGOLIA_ADMIN_KEY >"$loader_output" 2>&1; then
-    rm -f "$loader_output"
+  local loaded_app_id loaded_admin_key
+  if ! loaded_app_id="$(read_secret_env_value "$SECRET_FILE" ALGOLIA_APP_ID)" || [ -z "$loaded_app_id" ]; then
     die "required Algolia credentials could not be loaded"
   fi
-  rm -f "$loader_output"
+  if ! loaded_admin_key="$(read_secret_env_value "$SECRET_FILE" ALGOLIA_ADMIN_KEY)" || [ -z "$loaded_admin_key" ]; then
+    die "required Algolia credentials could not be loaded"
+  fi
+  export ALGOLIA_APP_ID="$loaded_app_id"
+  export ALGOLIA_ADMIN_KEY="$loaded_admin_key"
   SOURCE_APP_ID="$ALGOLIA_APP_ID"
   SOURCE_API_KEY="$ALGOLIA_ADMIN_KEY"
 }
@@ -1265,6 +1267,111 @@ async_fixture_document_count() {
   async_fixture_documents | jq 'length'
 }
 
+async_fixture_rule_anchor_object_id() {
+  printf '%s\n' "fj-async-1"
+}
+
+async_fixture_settings() {
+  jq -cn --argjson pagination_limited_to "$(async_fixture_document_count)" '
+    {
+      searchableAttributes:["name","description","category"],
+      customRanking:["desc(popularity)"],
+      attributesForFaceting:["category","color"],
+      paginationLimitedTo:$pagination_limited_to
+    }'
+}
+
+async_fixture_synonyms() {
+  cat <<'JSON'
+[
+  {"objectID":"synonym-trainer","type":"synonym","synonyms":["trainer","sneaker"]}
+]
+JSON
+}
+
+async_fixture_synonym_count() {
+  async_fixture_synonyms | jq 'length'
+}
+
+async_fixture_rules() {
+  jq -cn --arg rule_object_id "$(async_fixture_rule_anchor_object_id)" '
+    [
+      {
+        objectID:"rule-promote",
+        conditions:[{pattern:"trail",anchoring:"is"}],
+        consequence:{promote:[{objectID:$rule_object_id,position:0}]}
+      },
+      {
+        objectID:"rule-hide",
+        conditions:[{pattern:"rain",anchoring:"is"}],
+        consequence:{hide:[{objectID:$rule_object_id}]}
+      }
+    ]'
+}
+
+async_fixture_rule_count() {
+  async_fixture_rules | jq 'length'
+}
+
+async_expected_status_warnings() {
+  cat <<'JSON'
+[
+  {
+    "code": "PersistedNoBehaviorSetting",
+    "message": "Source setting is preserved for compatibility but has no Flapjack behavior.",
+    "resource": "Settings",
+    "jsonPath": "$.attributesToHighlight"
+  },
+  {
+    "code": "PersistedNoBehaviorSetting",
+    "message": "Source setting is preserved for compatibility but has no Flapjack behavior.",
+    "resource": "Settings",
+    "jsonPath": "$.attributesToSnippet"
+  },
+  {
+    "code": "PersistedNoBehaviorSetting",
+    "message": "Source setting is preserved for compatibility but has no Flapjack behavior.",
+    "resource": "Settings",
+    "jsonPath": "$.highlightPostTag"
+  },
+  {
+    "code": "PersistedNoBehaviorSetting",
+    "message": "Source setting is preserved for compatibility but has no Flapjack behavior.",
+    "resource": "Settings",
+    "jsonPath": "$.highlightPreTag"
+  },
+  {
+    "code": "PersistedNoBehaviorSetting",
+    "message": "Source setting is preserved for compatibility but has no Flapjack behavior.",
+    "resource": "Settings",
+    "jsonPath": "$.hitsPerPage"
+  },
+  {
+    "code": "PersistedNoBehaviorSetting",
+    "message": "Source setting is preserved for compatibility but has no Flapjack behavior.",
+    "resource": "Settings",
+    "jsonPath": "$.optionalWords"
+  },
+  {
+    "code": "ReadOnlySourceField",
+    "message": "Source field is read-only in Flapjack and is not applied during migration.",
+    "resource": "Settings",
+    "jsonPath": "$.synonyms"
+  },
+  {
+    "code": "ReadOnlySourceField",
+    "message": "Source field is read-only in Flapjack and is not applied during migration.",
+    "resource": "Settings",
+    "jsonPath": "$.version"
+  }
+]
+JSON
+}
+
+async_expected_status_warning_count() {
+  async_expected_status_warnings | jq 'length'
+}
+
 # Resolves one index name from its flag and environment inputs into
 # ASYNC_RESOLVED_INDEX. Assigning a global rather than printing keeps `die` fatal:
 # inside a command substitution the exit would only kill the subshell.
@@ -1442,6 +1549,7 @@ async_seed_source_index() {
   local encoded out task
   encoded="$(algolia_vendor_url_encode "$SOURCE_INDEX")"
   async_register_algolia_index "$SOURCE_INDEX"
+
   out="$LOG_DIR/async-seed-batch.json"
   async_vendor_json write POST "/1/indexes/${encoded}/batch" \
     "$(async_fixture_documents | jq -c '{requests: [.[] | {action:"addObject", body:.}]}')" "$out"
@@ -1449,23 +1557,76 @@ async_seed_source_index() {
     || die "async seeding response did not carry a valid taskID"
   algolia_vendor_wait_task "$SOURCE_INDEX" "$task" "$LOG_DIR/async-seed-task.json" \
     || die "async seeding task did not publish"
+
+  out="$LOG_DIR/async-seed-settings.json"
+  async_vendor_json write PUT "/1/indexes/${encoded}/settings" \
+    "$(async_fixture_settings)" "$out"
+  task="$(async_vendor_task_id "$out")" \
+    || die "async settings response did not carry a valid taskID"
+  algolia_vendor_wait_task "$SOURCE_INDEX" "$task" "$LOG_DIR/async-settings-task.json" \
+    || die "async settings task did not publish"
+
+  out="$LOG_DIR/async-seed-synonyms.json"
+  async_vendor_json write POST "/1/indexes/${encoded}/synonyms/batch" \
+    "$(async_fixture_synonyms | jq -c '.')" "$out"
+  task="$(async_vendor_task_id "$out")" \
+    || die "async synonym response did not carry a valid taskID"
+  algolia_vendor_wait_task "$SOURCE_INDEX" "$task" "$LOG_DIR/async-synonyms-task.json" \
+    || die "async synonym task did not publish"
+
+  out="$LOG_DIR/async-seed-rules.json"
+  async_vendor_json write POST "/1/indexes/${encoded}/rules/batch" \
+    "$(async_fixture_rules | jq -c '.')" "$out"
+  task="$(async_vendor_task_id "$out")" \
+    || die "async rule response did not carry a valid taskID"
+  algolia_vendor_wait_task "$SOURCE_INDEX" "$task" "$LOG_DIR/async-rules-task.json" \
+    || die "async rule task did not publish"
 }
 
 # Asks the vendor itself how many documents the fixture holds. Without this a
 # zero-document source would let the whole contract pass by absence.
 async_assert_source_seeded() {
-  local expected observed out
+  local encoded expected observed out expected_settings expected_synonyms expected_rules observed_synonyms observed_rules
+  encoded="$(algolia_vendor_url_encode "$SOURCE_INDEX")"
   expected="$(async_fixture_document_count)"
   [ "$expected" -gt 0 ] || die "async fixture document set is empty"
   out="$LOG_DIR/async-source-count.json"
   async_vendor_json write POST \
-    "/1/indexes/$(algolia_vendor_url_encode "$SOURCE_INDEX")/query" \
+    "/1/indexes/${encoded}/query" \
     '{"query":"","hitsPerPage":0}' "$out"
   observed="$(jq -er '
     if (.nbHits | type) == "number" and (.nbHits | floor) == .nbHits then .nbHits else empty end
   ' "$out")" || die "async source count response was malformed"
   [ "$observed" = "$expected" ] \
     || die "async source fixture held ${observed} documents, expected ${expected}"
+
+  expected_settings="$LOG_DIR/async-source-settings-expected.json"
+  async_fixture_settings >"$expected_settings"
+  async_vendor_json write GET "/1/indexes/${encoded}/settings" "" "$LOG_DIR/async-source-settings.json"
+  jq -e --slurpfile expected "$expected_settings" '
+    .searchableAttributes == $expected[0].searchableAttributes
+    and .customRanking == $expected[0].customRanking
+    and .attributesForFaceting == $expected[0].attributesForFaceting
+    and .paginationLimitedTo == $expected[0].paginationLimitedTo
+  ' "$LOG_DIR/async-source-settings.json" >/dev/null \
+    || die "async source settings did not match seeded fixture"
+
+  expected_synonyms="$(async_fixture_synonyms | jq -S -c 'sort_by(.objectID)')"
+  async_vendor_json write POST "/1/indexes/${encoded}/synonyms/search" \
+    '{"query":"","hitsPerPage":1000}' "$LOG_DIR/async-source-synonyms.json"
+  observed_synonyms="$(jq -S -c '[.hits[]? | {objectID, type, synonyms}] | sort_by(.objectID)' "$LOG_DIR/async-source-synonyms.json")" \
+    || die "async source synonym search response was malformed"
+  [ "$observed_synonyms" = "$expected_synonyms" ] \
+    || die "async source synonyms did not match seeded fixture"
+
+  expected_rules="$(async_fixture_rules | jq -S -c 'sort_by(.objectID)')"
+  async_vendor_json write POST "/1/indexes/${encoded}/rules/search" \
+    '{"query":"","hitsPerPage":1000}' "$LOG_DIR/async-source-rules.json"
+  observed_rules="$(jq -S -c '[.hits[]? | {objectID, conditions, consequence}] | sort_by(.objectID)' "$LOG_DIR/async-source-rules.json")" \
+    || die "async source rule search response was malformed"
+  [ "$observed_rules" = "$expected_rules" ] \
+    || die "async source rules did not match seeded fixture"
+
   record_check "async_source_seeded" "pass" "nbHits=${observed}"
 }
 
@@ -2071,6 +2232,12 @@ poll_async_job_until_terminal() {
         printf '%s\n' "$ASYNC_PHASE_SEQUENCE" >"$LOG_DIR/async-phase-sequence.txt"
         export_progress="$(jq -c '.exportProgress // null' "$out")"
         printf '%s\n' "$export_progress" >"$LOG_DIR/async-export-progress.json"
+        jq -c '{
+          settingsApplied:(.settingsApplied // null),
+          synonymsImported:(.synonymsImported // null),
+          rulesImported:(.rulesImported // null),
+          warnings:(.warnings // [])
+        }' "$out" >"$LOG_DIR/async-import-status-counts.json"
         record_check "async_phase_sequence" "pass" "$ASYNC_PHASE_SEQUENCE"
         return 0
         ;;
@@ -2118,9 +2285,30 @@ assert_async_target_activated() {
   record_check "async_target_documents" "pass" "${expected} documents matched seeded content exactly"
 }
 
+assert_async_status_import_counts() {
+  local synonym_count rule_count warning_count expected_warnings
+  synonym_count="$(async_fixture_synonym_count)"
+  rule_count="$(async_fixture_rule_count)"
+  warning_count="$(async_expected_status_warning_count)"
+  expected_warnings="$(async_expected_status_warnings)"
+  jq -e \
+    --argjson synonym_count "$synonym_count" \
+    --argjson rule_count "$rule_count" \
+    --argjson expected_warnings "$expected_warnings" '
+    .settingsApplied == true
+    and .synonymsImported.imported == $synonym_count
+    and .rulesImported.imported == $rule_count
+    and .warnings == $expected_warnings
+  ' "$LOG_DIR/async-status.json" >/dev/null \
+    || die "async terminal status import counts did not match the seeded fixture"
+  record_check "async_status_import_counts" "pass" \
+    "settings=true synonyms=${synonym_count} rules=${rule_count} warnings=${warning_count}"
+}
+
 assert_async_job() {
   submit_async_migration "$(migration_payload)"
   poll_async_job_until_terminal
+  assert_async_status_import_counts
   assert_async_target_activated
 }
 

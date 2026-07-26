@@ -70,6 +70,10 @@ async_delete_malformed_success
 async_cleanup_stale_dsn_listing
 async_terminal_success_without_target
 async_phase_regression
+async_missing_warnings
+async_empty_warnings
+async_extra_warning
+async_wrong_warning_path
 cancel_positive_control
 cancel_preflight_sweep_scope
 cancel_zero_source_rejected
@@ -231,6 +235,10 @@ scenario_id_for_label() {
     'async cleanup deletes owned source when DSN listing is stale') printf '%s\n' 'async_cleanup_stale_dsn_listing' ;;
     'async terminal success without a present target fails closed') printf '%s\n' 'async_terminal_success_without_target' ;;
     'async backward phase movement fails closed') printf '%s\n' 'async_phase_regression' ;;
+    'async terminal status rejects missing warnings') printf '%s\n' 'async_missing_warnings' ;;
+    'async terminal status rejects empty warnings') printf '%s\n' 'async_empty_warnings' ;;
+    'async terminal status rejects extra warning') printf '%s\n' 'async_extra_warning' ;;
+    'async terminal status rejects wrong warning path') printf '%s\n' 'async_wrong_warning_path' ;;
     'cancel scenario proves pre-commit cancel and post-commit cancel_too_late') printf '%s\n' 'cancel_positive_control' ;;
     'cancel preflight sweeps owned and stale names but skips other prefixes') printf '%s\n' 'cancel_preflight_sweep_scope' ;;
     'cancel scenario rejects a zero-document source') printf '%s\n' 'cancel_zero_source_rejected' ;;
@@ -711,7 +719,7 @@ if fixture_scenario and parsed.path.startswith("/1/indexes/"):
         respond({"taskID": 102}, 200)
     elif method == "POST" and parsed.path.endswith("/rules/batch"):
         respond({"taskID": 103}, 200)
-    elif method == "POST" and parsed.path.endswith("/batch"):
+    elif method == "POST" and parsed.path.endswith("/batch") and "/synonyms/" not in parsed.path and "/rules/" not in parsed.path:
         respond({"taskID": 200}, 200)
     elif method == "GET" and "/task/" in parsed.path:
         task_id = parts[-1]
@@ -803,6 +811,34 @@ def seeded_documents():
     path = state / "seeded_documents.json"
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
 
+def async_expected_status_warnings():
+    warnings = [
+        ("PersistedNoBehaviorSetting", "Source setting is preserved for compatibility but has no Flapjack behavior.", "$.attributesToHighlight"),
+        ("PersistedNoBehaviorSetting", "Source setting is preserved for compatibility but has no Flapjack behavior.", "$.attributesToSnippet"),
+        ("PersistedNoBehaviorSetting", "Source setting is preserved for compatibility but has no Flapjack behavior.", "$.highlightPostTag"),
+        ("PersistedNoBehaviorSetting", "Source setting is preserved for compatibility but has no Flapjack behavior.", "$.highlightPreTag"),
+        ("PersistedNoBehaviorSetting", "Source setting is preserved for compatibility but has no Flapjack behavior.", "$.hitsPerPage"),
+        ("PersistedNoBehaviorSetting", "Source setting is preserved for compatibility but has no Flapjack behavior.", "$.optionalWords"),
+        ("ReadOnlySourceField", "Source field is read-only in Flapjack and is not applied during migration.", "$.synonyms"),
+        ("ReadOnlySourceField", "Source field is read-only in Flapjack and is not applied during migration.", "$.version"),
+    ]
+    return [
+        {"code": code, "message": message, "resource": "Settings", "jsonPath": json_path}
+        for code, message, json_path in warnings
+    ]
+
+def async_status_warnings_for_scenario():
+    warnings = async_expected_status_warnings()
+    if scenario == "async_missing_warnings":
+        return None
+    if scenario == "async_empty_warnings":
+        return []
+    if scenario == "async_extra_warning":
+        return warnings + [{"code": "ReplicaSidecarNotMaterialized", "message": "sidecar missing"}]
+    if scenario == "async_wrong_warning_path":
+        warnings[0] = {**warnings[0], "jsonPath": "$.wrongPath"}
+    return warnings
+
 # The preflight listing is the whole point of the sweep contract: it mixes this
 # run's own names, a provably stale leftover, a recent leftover, a leftover with
 # no parseable freshness evidence, and a foreign-prefix index. An implementation
@@ -842,11 +878,34 @@ if async_scenario and is_vendor_request:
                 for path in state.glob("vendor_active_*")
             ]
             respond({"items": items}, 200)
-    elif method == "POST" and parsed.path.endswith("/batch"):
+    elif method == "POST" and parsed.path.endswith("/batch") and "/synonyms/" not in parsed.path and "/rules/" not in parsed.path:
         documents = [request["body"] for request in json.loads(body)["requests"]]
         (state / "seeded_documents.json").write_text(json.dumps(documents), encoding="utf-8")
         state_marker("vendor_active_", index_name).write_text("active", encoding="utf-8")
         respond({"taskID": 700}, 200)
+    elif method == "PUT" and parsed.path.endswith("/settings"):
+        (state / f"settings_{safe_path_component(index_name)}.json").write_text(body or "{}", encoding="utf-8")
+        state_marker("vendor_active_", index_name).write_text("active", encoding="utf-8")
+        respond({"taskID": 702}, 200)
+    elif method == "GET" and parsed.path.endswith("/settings"):
+        settings_path = state / f"settings_{safe_path_component(index_name)}.json"
+        respond(json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}, 200)
+    elif method == "POST" and parsed.path.endswith("/synonyms/batch"):
+        (state / f"synonyms_{safe_path_component(index_name)}.json").write_text(body or "[]", encoding="utf-8")
+        state_marker("vendor_active_", index_name).write_text("active", encoding="utf-8")
+        respond({"taskID": 703}, 200)
+    elif method == "POST" and parsed.path.endswith("/synonyms/search"):
+        synonyms_path = state / f"synonyms_{safe_path_component(index_name)}.json"
+        hits = json.loads(synonyms_path.read_text(encoding="utf-8")) if synonyms_path.exists() else []
+        respond({"hits": hits, "nbHits": len(hits)}, 200)
+    elif method == "POST" and parsed.path.endswith("/rules/batch"):
+        (state / f"rules_{safe_path_component(index_name)}.json").write_text(body or "[]", encoding="utf-8")
+        state_marker("vendor_active_", index_name).write_text("active", encoding="utf-8")
+        respond({"taskID": 704}, 200)
+    elif method == "POST" and parsed.path.endswith("/rules/search"):
+        rules_path = state / f"rules_{safe_path_component(index_name)}.json"
+        hits = json.loads(rules_path.read_text(encoding="utf-8")) if rules_path.exists() else []
+        respond({"hits": hits, "nbHits": len(hits)}, 200)
     elif method == "GET" and "/task/" in parsed.path:
         append("vendor_waited_tasks.log", parsed.path.rsplit("/", 1)[1])
         respond({"status": "published"}, 200)
@@ -922,6 +981,10 @@ ASYNC_STATUS_SCRIPTS = {
     "async_cleanup_stale_dsn_listing": [("activating", "succeeded")],
     "async_success_target_absent": [("exporting", "running"), ("activating", "succeeded")],
     "async_phase_regression": [("staging", "running"), ("exporting", "succeeded")],
+    "async_missing_warnings": [("activating", "succeeded")],
+    "async_empty_warnings": [("activating", "succeeded")],
+    "async_extra_warning": [("activating", "succeeded")],
+    "async_wrong_warning_path": [("activating", "succeeded")],
 }
 
 if async_scenario:
@@ -942,7 +1005,7 @@ if async_scenario:
         phase, disposition = script[min(poll, len(script) - 1)]
         if disposition == "succeeded" and scenario != "async_success_target_absent":
             activate(target)
-        respond({
+        payload = {
             "jobId": job_id,
             "phase": phase,
             "disposition": disposition,
@@ -950,7 +1013,15 @@ if async_scenario:
             "createdAt": iso_now(-5),
             "updatedAt": iso_now(),
             "terminalAt": iso_now() if disposition != "running" else None,
-        }, 200)
+            "settingsApplied": True,
+            "synonymsImported": {"imported": 1},
+            "rulesImported": {"imported": 2},
+        }
+        if disposition == "succeeded":
+            warnings = async_status_warnings_for_scenario()
+            if warnings is not None:
+                payload["warnings"] = warnings
+        respond(payload, 200)
     elif parsed.path == "/1/indexes" and method == "GET":
         items = [
             {"name": path.name.removeprefix("active_"), "entries": len(seeded_documents())}
@@ -2945,6 +3016,7 @@ assert_async_positive_control() {
       and ([.checks[] | select(.status != "pass")] | length == 0)
       and ([.checks[] | select(.name == "async_source_seeded")] | length == 1)
       and ([.checks[] | select(.name == "async_submission")] | length == 1)
+      and ([.checks[] | select(.name == "async_status_import_counts" and .detail == "settings=true synonyms=1 rules=2 warnings=8")] | length == 1)
       and ([.checks[] | select(.name == "async_target_documents")] | length == 1)
       and ([.checks[] | select(.name == "async_fixture_cleanup")] | length == 1)
       and ([.checks[] | select(.name == "async_export_progress")] | length == 0)
@@ -2953,6 +3025,21 @@ assert_async_positive_control() {
     ' "$evidence/receipt.json" >/dev/null \
     && jq -e '.completed == 3 and .total == 3' \
       "$evidence/logs/async-export-progress.json" >/dev/null \
+    && jq -e '
+      .settingsApplied == true
+      and .synonymsImported.imported == 1
+      and .rulesImported.imported == 2
+      and ([.warnings[] | {code, resource, jsonPath}] == [
+        {"code":"PersistedNoBehaviorSetting","resource":"Settings","jsonPath":"$.attributesToHighlight"},
+        {"code":"PersistedNoBehaviorSetting","resource":"Settings","jsonPath":"$.attributesToSnippet"},
+        {"code":"PersistedNoBehaviorSetting","resource":"Settings","jsonPath":"$.highlightPostTag"},
+        {"code":"PersistedNoBehaviorSetting","resource":"Settings","jsonPath":"$.highlightPreTag"},
+        {"code":"PersistedNoBehaviorSetting","resource":"Settings","jsonPath":"$.hitsPerPage"},
+        {"code":"PersistedNoBehaviorSetting","resource":"Settings","jsonPath":"$.optionalWords"},
+        {"code":"ReadOnlySourceField","resource":"Settings","jsonPath":"$.synonyms"},
+        {"code":"ReadOnlySourceField","resource":"Settings","jsonPath":"$.version"}
+      ])
+    ' "$evidence/logs/async-import-status-counts.json" >/dev/null \
     && ! grep -Fq "DELETE /1/indexes/${target}" "$vendor_request_log" \
     && ! grep -Eq 'ADMIN_SECRET_CANARY|APPID_CANARY' "$out"; then
     rm -rf "$evidence"
@@ -3238,7 +3325,8 @@ assert_static_contract() {
   fi
   [ -x "$ORACLE" ] && pass 'oracle is executable' || fail 'oracle is executable'
   grep -Fq 'set -euo pipefail' "$ORACLE" && pass 'oracle enables strict mode' || fail 'oracle enables strict mode'
-  grep -Fq 'load_named_secrets "$SECRET_FILE" ALGOLIA_APP_ID ALGOLIA_ADMIN_KEY' "$ORACLE" \
+  grep -Fq 'read_secret_env_value "$SECRET_FILE" ALGOLIA_APP_ID' "$ORACLE" \
+    && grep -Fq 'read_secret_env_value "$SECRET_FILE" ALGOLIA_ADMIN_KEY' "$ORACLE" \
     && pass 'oracle loads only required Algolia secrets in importing mode' \
     || fail 'oracle loads only required Algolia secrets in importing mode'
   grep -Fq '/1/indexes"' "$ORACLE" \
@@ -3358,6 +3446,14 @@ main() {
     async_success_target_absent 'async scenario expected exactly one target index listing'
   assert_async_failure_scenario 'async backward phase movement fails closed' \
     async_phase_regression 'async migration phase regressed to exporting'
+  assert_async_failure_scenario 'async terminal status rejects missing warnings' \
+    async_missing_warnings 'async terminal status import counts did not match the seeded fixture'
+  assert_async_failure_scenario 'async terminal status rejects empty warnings' \
+    async_empty_warnings 'async terminal status import counts did not match the seeded fixture'
+  assert_async_failure_scenario 'async terminal status rejects extra warning' \
+    async_extra_warning 'async terminal status import counts did not match the seeded fixture'
+  assert_async_failure_scenario 'async terminal status rejects wrong warning path' \
+    async_wrong_warning_path 'async terminal status import counts did not match the seeded fixture'
   assert_cancel_positive_control
   assert_cancel_preflight_sweep_scope
   assert_cancel_failure_scenario 'cancel scenario rejects a zero-document source' \

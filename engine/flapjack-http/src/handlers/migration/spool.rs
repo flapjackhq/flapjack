@@ -199,6 +199,33 @@ pub(crate) struct MigrationExportProgress {
     pub total: u64,
 }
 
+/// Durable snapshot of a successful import's activation facts. These counts and
+/// warnings are computed once by `activated_response` in the import pipeline and
+/// only carried here for persistence; the spool never recomputes them, which is
+/// why this type is independent of the HTTP response types in `mod.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct MigrationImportOutcome {
+    pub settings_applied: bool,
+    pub synonyms_imported: usize,
+    pub rules_imported: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<MigrationImportWarning>,
+}
+
+/// One import translation or sidecar warning, mirrored field-for-field from the
+/// import pipeline's `MigrateWarning` so it can round-trip through job state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct MigrationImportWarning {
+    pub code: String,
+    pub message: String,
+    pub resource: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_index: Option<usize>,
+    pub json_path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct MigrationPhaseRecord {
     pub job_uuid: Uuid,
@@ -212,6 +239,10 @@ pub(crate) struct MigrationPhaseRecord {
     pub updated_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_at: Option<DateTime<Utc>>,
+    // Only a successful import activation carries an outcome. Running, failed,
+    // cancelled, and non-import (privacy-scrub) jobs leave this `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_outcome: Option<MigrationImportOutcome>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -797,6 +828,7 @@ impl SpoolStore {
             created_at: now,
             updated_at: now,
             terminal_at: None,
+            import_outcome: None,
         }
     }
 
@@ -1024,22 +1056,47 @@ impl SpoolStore {
         Ok(record.cancel_requested)
     }
 
-    pub(crate) fn succeed_migration(&self, job_uuid: Uuid) -> SpoolResult<MigrationPhaseRecord> {
-        self.settle_migration(job_uuid, MigrationDisposition::Succeeded)
+    pub(crate) fn succeed_migration(
+        &self,
+        job_uuid: Uuid,
+        import_outcome: Option<MigrationImportOutcome>,
+    ) -> SpoolResult<MigrationPhaseRecord> {
+        self.settle_migration(job_uuid, MigrationDisposition::Succeeded, import_outcome)
+    }
+
+    pub(crate) fn record_import_outcome(
+        &self,
+        job_uuid: Uuid,
+        import_outcome: MigrationImportOutcome,
+    ) -> SpoolResult<MigrationPhaseRecord> {
+        let _root_lock = self.lock_root()?;
+        let _job_lock = self.lock_job(job_uuid)?;
+        let mut record = self.read_migration_phase(job_uuid)?;
+        if record.disposition != MigrationDisposition::Running || record.terminal_at.is_some() {
+            return Err(SpoolError::new(SpoolErrorKind::JobTerminal));
+        }
+        if record.phase != MigrationPhase::Activating {
+            return Err(SpoolError::new(SpoolErrorKind::InvalidPhaseTransition));
+        }
+        record.import_outcome = Some(import_outcome);
+        record.updated_at = self.now();
+        self.commit_migration_phase(&record)?;
+        Ok(record)
     }
 
     pub(crate) fn fail_migration(&self, job_uuid: Uuid) -> SpoolResult<MigrationPhaseRecord> {
-        self.settle_migration(job_uuid, MigrationDisposition::Failed)
+        self.settle_migration(job_uuid, MigrationDisposition::Failed, None)
     }
 
     pub(crate) fn cancel_migration(&self, job_uuid: Uuid) -> SpoolResult<MigrationPhaseRecord> {
-        self.settle_migration(job_uuid, MigrationDisposition::Cancelled)
+        self.settle_migration(job_uuid, MigrationDisposition::Cancelled, None)
     }
 
     fn settle_migration(
         &self,
         job_uuid: Uuid,
         disposition: MigrationDisposition,
+        import_outcome: Option<MigrationImportOutcome>,
     ) -> SpoolResult<MigrationPhaseRecord> {
         let _root_lock = self.lock_root()?;
         let _job_lock = self.lock_job(job_uuid)?;
@@ -1052,6 +1109,8 @@ impl SpoolStore {
         }
         // Success is the activation fence: it may only be recorded once the
         // destination is being activated, never straight from an earlier phase.
+        // The import outcome may be snapshotted slightly earlier, but only a
+        // succeeded terminal settlement is allowed to retain it.
         if disposition == MigrationDisposition::Succeeded
             && record.phase != MigrationPhase::Activating
         {
@@ -1061,6 +1120,13 @@ impl SpoolStore {
         record.disposition = disposition;
         if disposition == MigrationDisposition::Cancelled {
             record.cancel_requested = true;
+        }
+        if disposition == MigrationDisposition::Succeeded {
+            if let Some(import_outcome) = import_outcome {
+                record.import_outcome = Some(import_outcome);
+            }
+        } else {
+            record.import_outcome = None;
         }
         record.updated_at = now;
         record.terminal_at = Some(now);

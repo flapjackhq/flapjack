@@ -1,6 +1,9 @@
 use super::export::{export_algolia_source_for_import, AcceptedExport, ExportError};
 use super::source_reader::MigrationSourceReader;
-use super::spool::{MigrationPhase, SpoolError, SpoolErrorKind, SpoolLimits, SpoolStore};
+use super::spool::{
+    MigrationImportOutcome, MigrationImportWarning, MigrationPhase, SpoolError, SpoolErrorKind,
+    SpoolLimits, SpoolStore,
+};
 use super::translation::{
     translate_accepted_spool_payload, translate_accepted_spool_settings, warning_message,
     SettingsTranslationOutcome, TranslationOutcome, TranslationReport, TranslationReportEntry,
@@ -461,9 +464,44 @@ where
             sidecar_warnings,
         ),
     )?;
-    spool.succeed_migration(job_uuid).map_err(spool_error)?;
+    // Carry the already computed activation facts into durable job state so the
+    // async status endpoint can report them; `activated_response` remains the
+    // sole owner of these counts and warnings.
+    let outcome = import_outcome_from_response(&response);
+    spool
+        .record_import_outcome(job_uuid, outcome)
+        .map_err(spool_error)?;
+    spool
+        .succeed_migration(job_uuid, None)
+        .map_err(spool_error)?;
     let _ = spool.delete_export_artifacts(export.job_uuid, &export.source_identity_digest);
     Ok(Json(response))
+}
+
+/// Snapshot the successful import response into the spool-owned persistence type.
+/// This copies the counts and warnings verbatim; it never recomputes them.
+fn import_outcome_from_response(response: &MigrateFromAlgoliaResponse) -> MigrationImportOutcome {
+    MigrationImportOutcome {
+        settings_applied: response.settings,
+        synonyms_imported: response.synonyms.imported,
+        rules_imported: response.rules.imported,
+        warnings: response
+            .warnings
+            .iter()
+            .map(import_outcome_warning)
+            .collect(),
+    }
+}
+
+fn import_outcome_warning(warning: &MigrateWarning) -> MigrationImportWarning {
+    MigrationImportWarning {
+        code: warning.code.clone(),
+        message: warning.message.clone(),
+        resource: warning.resource.clone(),
+        page_index: warning.page_index,
+        item_index: warning.item_index,
+        json_path: warning.json_path.clone(),
+    }
 }
 
 async fn activate_staged_publication(

@@ -451,7 +451,7 @@ impl MigrationJobRunner {
             }
             if report_is_committed_loadable(report) {
                 spool
-                    .succeed_migration(job_uuid)
+                    .succeed_migration(job_uuid, None)
                     .map_err(recovery_spool_error)?;
                 return Ok(());
             }
@@ -480,7 +480,7 @@ impl MigrationJobRunner {
             if report.transaction_id.as_ref() == Some(transaction_id) {
                 if report_is_committed_loadable(report) {
                     spool
-                        .succeed_migration(job_uuid)
+                        .succeed_migration(job_uuid, None)
                         .map_err(recovery_spool_error)?;
                     return Ok(());
                 }

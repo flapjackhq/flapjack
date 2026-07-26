@@ -35,9 +35,9 @@ use crate::handlers::index_resource_store::{delete_resource_item, load_existing_
 use algolia_client::{AlgoliaClient, AlgoliaClientError, AlgoliaErrorKind};
 pub use job_runner::{MigrationJobRunner, DEFAULT_ASYNC_MIGRATION_CAPACITY};
 use spool::{
-    MigrationCancelRequest, MigrationDisposition, MigrationExportProgress, MigrationPhase,
-    MigrationPhaseRecord, PrivacyScrubAdmission, PrivacyScrubIntent, PrivacyScrubIntentFields,
-    SpoolErrorKind,
+    MigrationCancelRequest, MigrationDisposition, MigrationExportProgress, MigrationImportWarning,
+    MigrationPhase, MigrationPhaseRecord, PrivacyScrubAdmission, PrivacyScrubIntent,
+    PrivacyScrubIntentFields, SpoolErrorKind,
 };
 
 const MIGRATION_HA_UNSUPPORTED_CODE: &str = "migration_ha_unsupported";
@@ -97,7 +97,7 @@ pub struct MigrateFromAlgoliaResponse {
     pub task_id: i64,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct MigrateWarning {
     pub code: String,
     pub message: String,
@@ -110,7 +110,7 @@ pub struct MigrateWarning {
     pub json_path: String,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct MigrateCount {
     pub imported: usize,
 }
@@ -185,10 +185,53 @@ pub struct AsyncMigrationStatusResponse {
     pub updated_at: chrono::DateTime<chrono::Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_at: Option<chrono::DateTime<chrono::Utc>>,
+    // Present only for a successfully activated import; carried verbatim from the
+    // durable outcome, never fabricated as zeros for running/failed/cancelled jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings_applied: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub synonyms_imported: Option<MigrateCount>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules_imported: Option<MigrateCount>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<MigrateWarning>,
+}
+
+impl From<MigrationImportWarning> for MigrateWarning {
+    fn from(warning: MigrationImportWarning) -> Self {
+        Self {
+            code: warning.code,
+            message: warning.message,
+            resource: warning.resource,
+            page_index: warning.page_index,
+            item_index: warning.item_index,
+            json_path: warning.json_path,
+        }
+    }
 }
 
 impl From<MigrationPhaseRecord> for AsyncMigrationStatusResponse {
     fn from(record: MigrationPhaseRecord) -> Self {
+        let show_import_outcome =
+            record.disposition == MigrationDisposition::Succeeded && record.terminal_at.is_some();
+        let (settings_applied, synonyms_imported, rules_imported, warnings) =
+            match (show_import_outcome, record.import_outcome) {
+                (true, Some(outcome)) => (
+                    Some(outcome.settings_applied),
+                    Some(MigrateCount {
+                        imported: outcome.synonyms_imported,
+                    }),
+                    Some(MigrateCount {
+                        imported: outcome.rules_imported,
+                    }),
+                    outcome
+                        .warnings
+                        .into_iter()
+                        .map(MigrateWarning::from)
+                        .collect(),
+                ),
+                _ => (None, None, None, Vec::new()),
+            };
         Self {
             job_id: record.job_uuid,
             phase: record.phase.into(),
@@ -197,6 +240,10 @@ impl From<MigrationPhaseRecord> for AsyncMigrationStatusResponse {
             created_at: record.created_at,
             updated_at: record.updated_at,
             terminal_at: record.terminal_at,
+            settings_applied,
+            synonyms_imported,
+            rules_imported,
+            warnings,
         }
     }
 }
@@ -1045,7 +1092,7 @@ fn settle_privacy_scrub_success(
             .map_err(privacy_scrub_spool_error)?;
     }
     spool
-        .succeed_migration(job_uuid)
+        .succeed_migration(job_uuid, None)
         .map_err(privacy_scrub_spool_error)?;
     Ok(())
 }

@@ -299,7 +299,7 @@ fn privacy_scrub_terminal_replay_preserves_phase() {
     ] {
         store.transition_migration_phase(job_uuid, phase).unwrap();
     }
-    store.succeed_migration(job_uuid).unwrap();
+    store.succeed_migration(job_uuid, None).unwrap();
     let terminal = store.read_migration_phase(job_uuid).unwrap();
     assert_eq!(terminal.disposition, MigrationDisposition::Succeeded);
     assert!(terminal.terminal_at.is_some());
@@ -769,7 +769,7 @@ fn request_async_migration_cancel_is_noop_for_terminal_jobs() {
     ] {
         store.transition_migration_phase(succeeded, phase).unwrap();
     }
-    let succeeded_before = store.succeed_migration(succeeded).unwrap();
+    let succeeded_before = store.succeed_migration(succeeded, None).unwrap();
 
     for (job_uuid, expected) in [
         (cancelled, cancelled_before),
@@ -1184,7 +1184,7 @@ fn succeed_migration_requires_activating_phase() {
 
     // Success may not be recorded before the destination is being activated.
     assert_eq!(
-        store.succeed_migration(job_uuid).unwrap_err().kind(),
+        store.succeed_migration(job_uuid, None).unwrap_err().kind(),
         SpoolErrorKind::InvalidPhaseTransition
     );
 
@@ -1195,7 +1195,7 @@ fn succeed_migration_requires_activating_phase() {
     ] {
         store.transition_migration_phase(job_uuid, phase).unwrap();
     }
-    let settled = store.succeed_migration(job_uuid).unwrap();
+    let settled = store.succeed_migration(job_uuid, None).unwrap();
     assert_eq!(settled.disposition, MigrationDisposition::Succeeded);
     assert_eq!(settled.phase, MigrationPhase::Activating);
     assert!(settled.terminal_at.is_some());
@@ -1204,6 +1204,115 @@ fn succeed_migration_requires_activating_phase() {
         store.cancel_migration(job_uuid).unwrap_err().kind(),
         SpoolErrorKind::JobTerminal
     );
+}
+
+#[test]
+fn succeed_migration_round_trips_exact_import_outcome() {
+    let tmp = TempDir::new().unwrap();
+    let job_uuid = fixed_job_uuid();
+    let store = fixed_store(&tmp);
+    create_export_for_test(&store, job_uuid, &source_digest(), denominators()).unwrap();
+    for phase in [
+        MigrationPhase::Preparing,
+        MigrationPhase::Staging,
+        MigrationPhase::Activating,
+    ] {
+        store.transition_migration_phase(job_uuid, phase).unwrap();
+    }
+
+    let outcome = MigrationImportOutcome {
+        settings_applied: true,
+        synonyms_imported: 1,
+        rules_imported: 2,
+        warnings: vec![MigrationImportWarning {
+            code: "ReplicaExhaustiveSortApproximated".to_string(),
+            message: "Algolia standard replica exhaustive sorting is approximated \
+                as a Flapjack virtual replica."
+                .to_string(),
+            resource: "replicas".to_string(),
+            page_index: None,
+            item_index: Some(3),
+            json_path: "$.replicas[0]".to_string(),
+        }],
+    };
+
+    let recorded = store
+        .record_import_outcome(job_uuid, outcome.clone())
+        .unwrap();
+    assert_eq!(recorded.import_outcome, Some(outcome.clone()));
+
+    let settled = store.succeed_migration(job_uuid, None).unwrap();
+    assert_eq!(settled.import_outcome, Some(outcome.clone()));
+
+    // The exact nonzero outcome survives a full on-disk serialize/deserialize
+    // round-trip when a fresh store reopens the durable phase file.
+    let reopened = fixed_store(&tmp);
+    let persisted = reopened.read_migration_phase(job_uuid).unwrap();
+    assert_eq!(persisted.import_outcome, Some(outcome));
+}
+
+#[test]
+fn fail_migration_clears_pre_recorded_import_outcome() {
+    let tmp = TempDir::new().unwrap();
+    let job_uuid = fixed_job_uuid();
+    let store = fixed_store(&tmp);
+    create_export_for_test(&store, job_uuid, &source_digest(), denominators()).unwrap();
+    for phase in [
+        MigrationPhase::Preparing,
+        MigrationPhase::Staging,
+        MigrationPhase::Activating,
+    ] {
+        store.transition_migration_phase(job_uuid, phase).unwrap();
+    }
+
+    store
+        .record_import_outcome(
+            job_uuid,
+            MigrationImportOutcome {
+                settings_applied: true,
+                synonyms_imported: 1,
+                rules_imported: 2,
+                warnings: vec![],
+            },
+        )
+        .unwrap();
+
+    let failed = store.fail_migration(job_uuid).unwrap();
+    assert_eq!(failed.import_outcome, None);
+    assert_eq!(
+        store.read_migration_phase(job_uuid).unwrap().import_outcome,
+        None
+    );
+}
+
+#[test]
+fn legacy_phase_record_without_import_outcome_field_reads_as_none() {
+    let record = MigrationPhaseRecord {
+        job_uuid: fixed_job_uuid(),
+        phase: MigrationPhase::Activating,
+        disposition: MigrationDisposition::Succeeded,
+        cancel_requested: false,
+        export_progress: None,
+        created_at: fixed_now(),
+        updated_at: fixed_now(),
+        terminal_at: Some(fixed_now()),
+        import_outcome: None,
+    };
+
+    // A record persisted before this field existed omits the key entirely; the
+    // `None` outcome must skip serialization so legacy bytes look identical.
+    let mut value = serde_json::to_value(&record).unwrap();
+    assert!(
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("import_outcome")
+            .is_none(),
+        "a None import_outcome must not be serialized"
+    );
+
+    let legacy: MigrationPhaseRecord = serde_json::from_value(value).unwrap();
+    assert_eq!(legacy.import_outcome, None);
 }
 
 #[test]
@@ -1240,6 +1349,7 @@ fn read_migration_phase_reconciles_stale_progress_from_manifest() {
         created_at: fixed_now(),
         updated_at: fixed_now(),
         terminal_at: None,
+        import_outcome: None,
     };
     store.commit_migration_phase(&stale).unwrap();
 
