@@ -6,6 +6,7 @@ use crate::query::parser::ShortQueryPlaceholder;
 use crate::types::{Filter, ScoredDocument, SearchResult};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 use tantivy::query::{BooleanQuery, BoostQuery, Occur, Query as TantivyQuery, TermQuery};
 use tantivy::schema::IndexRecordOption;
 use tantivy::Searcher;
@@ -15,11 +16,22 @@ use tantivy::Searcher;
 type SettingsRef = Option<Arc<IndexSettings>>;
 
 mod facets;
+mod metrics;
+#[cfg(test)]
+mod metrics_tests;
+#[cfg(test)]
+mod parity_fixtures;
+#[cfg(test)]
+mod parity_tests;
 mod relevance;
 mod rules;
 mod sorting;
 
 pub use facets::FacetSearchParams;
+#[cfg(test)]
+pub(crate) use metrics::capture_query_phase_reports;
+pub use metrics::{gather_query_phase_metric_families, QueryPhaseReport};
+use metrics::{QueryExecutionPath, QueryPhase, QueryPhaseCell, QueryPhaseGuard};
 
 pub struct QueryExecutor {
     pub(crate) converter: Arc<DocumentConverter>,
@@ -32,6 +44,7 @@ pub struct QueryExecutor {
     pub(crate) unordered_paths: HashSet<String>,
     pub(crate) query_text: String,
     pub(crate) max_values_per_facet: Option<usize>,
+    phase_cell: QueryPhaseCell,
 }
 
 impl QueryExecutor {
@@ -51,6 +64,7 @@ impl QueryExecutor {
             unordered_paths: HashSet::new(),
             query_text: String::new(),
             max_values_per_facet: None,
+            phase_cell: QueryPhaseCell::default(),
         }
     }
 
@@ -98,6 +112,46 @@ impl QueryExecutor {
         limit: usize,
     ) -> Result<SearchResult> {
         self.execute_with_sort(searcher, query, filter, None, limit, false)
+    }
+
+    pub fn phase_report(&self) -> QueryPhaseReport {
+        self.phase_cell.report()
+    }
+
+    /// Begin a serialized phase report for one execute call. The returned
+    /// guard holds the executor's execution lock and finishes the report on
+    /// drop, so concurrent executions cannot interleave counters.
+    pub(in crate::query::executor) fn begin_phase_report(
+        &self,
+        searcher: &Searcher,
+        execution_path: QueryExecutionPath,
+    ) -> QueryPhaseGuard<'_> {
+        self.phase_cell
+            .begin(&self.converter, searcher, execution_path)
+    }
+
+    pub(in crate::query::executor) fn set_execution_path(
+        &self,
+        execution_path: QueryExecutionPath,
+    ) {
+        self.phase_cell.set_execution_path(execution_path);
+    }
+
+    pub(in crate::query::executor) fn observe_phase(&self, phase: QueryPhase, started_at: Instant) {
+        self.phase_cell.observe(phase, started_at.elapsed());
+    }
+
+    pub(in crate::query::executor) fn set_matched_docs(&self, matched_docs: usize) {
+        self.phase_cell.set_matched_docs(matched_docs);
+    }
+
+    pub(in crate::query::executor) fn set_candidates_collected(&self, candidates_collected: usize) {
+        self.phase_cell
+            .set_candidates_collected(candidates_collected);
+    }
+
+    pub(in crate::query::executor) fn add_facet_cardinality(&self, facet_cardinality: usize) {
+        self.phase_cell.add_facet_cardinality(facet_cardinality);
     }
 
     pub(crate) fn apply_filter(
@@ -160,6 +214,18 @@ impl QueryExecutor {
         query: Box<dyn TantivyQuery>,
         searcher: &Searcher,
     ) -> Result<Box<dyn TantivyQuery>> {
+        self.phase_cell.ensure_started();
+        let started_at = Instant::now();
+        let result = self.expand_short_query(query, searcher);
+        self.observe_phase(QueryPhase::Prepare, started_at);
+        result
+    }
+
+    fn expand_short_query(
+        &self,
+        query: Box<dyn TantivyQuery>,
+        searcher: &Searcher,
+    ) -> Result<Box<dyn TantivyQuery>> {
         let query_any = query.as_any();
 
         if let Some(placeholder) = query_any.downcast_ref::<ShortQueryPlaceholder>() {
@@ -181,7 +247,7 @@ impl QueryExecutor {
                     new_clauses.push((*occur, expanded));
                     changed = true;
                 } else if sub_query.as_any().is::<BooleanQuery>() {
-                    let expanded = self.expand_short_query_with_searcher(
+                    let expanded = self.expand_short_query(
                         Box::new(
                             sub_query
                                 .as_any()

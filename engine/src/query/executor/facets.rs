@@ -1,4 +1,5 @@
 //! Facet collection and distinct deduplication for search results. Executes queries with tantivy collectors, extracts and trims facet counts, and deduplicates documents by attribute value with configurable group limits.
+use super::metrics::{QueryExecutionPath, QueryPhase};
 use super::QueryExecutor;
 use crate::error::Result;
 use crate::types::{FacetCount, FacetRequest, FacetStats, SearchResult, Sort};
@@ -36,86 +37,110 @@ impl QueryExecutor {
         filter: Option<&crate::types::Filter>,
         params: &FacetSearchParams<'_>,
     ) -> Result<SearchResult> {
-        let tf0 = std::time::Instant::now();
-        let final_query = self.apply_filter(query, filter)?;
-        let tf1 = tf0.elapsed();
+        self.execute_with_facets_and_optional_boosts(searcher, query, filter, params, &[])
+    }
 
-        if let Some(facets) = params.facet_requests {
-            if facets.is_empty() {
-                return Err(crate::error::FlapjackError::InvalidQuery(
-                    "Empty facet request array".to_string(),
-                ));
+    /// Execute a faceted search while attributing optional-query boosts to the
+    /// same invocation-local prepare phase as short-query expansion and filters.
+    pub(crate) fn execute_with_facets_and_optional_boosts(
+        &self,
+        searcher: &Searcher,
+        query: Box<dyn TantivyQuery>,
+        filter: Option<&crate::types::Filter>,
+        params: &FacetSearchParams<'_>,
+        optional_boosts: &[(String, String, f32)],
+    ) -> Result<SearchResult> {
+        let count_only = params.limit == 0 && params.offset == 0;
+        let facet_requests = params
+            .facet_requests
+            .filter(|requests| !requests.is_empty());
+        let execution_path = match (count_only, facet_requests, params.sort) {
+            (true, _, _) => QueryExecutionPath::CountOnly,
+            (false, Some(_), _) => QueryExecutionPath::RelevanceFacets,
+            (false, None, None | Some(Sort::ByRelevance)) => QueryExecutionPath::Relevance,
+            (false, None, Some(Sort::ByField { .. })) if params.has_text_query => {
+                QueryExecutionPath::SortFallback
+            }
+            (false, None, Some(Sort::ByField { .. })) => QueryExecutionPath::SortFast,
+        };
+        let _phase_guard = self.begin_phase_report(searcher, execution_path);
+        (|| {
+            let expanded_query = self.expand_short_query_with_searcher(query, searcher)?;
+            let prepare_started_at = std::time::Instant::now();
+            let boosted_query = self.apply_optional_boosts(expanded_query, optional_boosts)?;
+            let final_query = self.apply_filter(boosted_query, filter)?;
+            self.observe_phase(QueryPhase::Prepare, prepare_started_at);
+
+            if let Some(facets) = facet_requests {
+                return self.execute_with_facets_internal(searcher, final_query, facets, params);
+            }
+            if count_only {
+                let collect_started_at = std::time::Instant::now();
+                let count = searcher.search(final_query.as_ref(), &Count)?;
+                self.observe_phase(QueryPhase::Collect, collect_started_at);
+                self.set_matched_docs(count);
+                self.set_candidates_collected(0);
+                let (documents, total) =
+                    self.apply_distinct_if_requested(Vec::new(), count, params.distinct_count)?;
+                return Ok(SearchResult {
+                    documents,
+                    total,
+                    facets: HashMap::new(),
+                    facets_stats: HashMap::new(),
+                    user_data: Vec::new(),
+                    applied_rules: Vec::new(),
+                    parsed_query: self.query_text.clone(),
+                    exhaustive_facet_values: true,
+                    exhaustive_rules_match: true,
+                    query_after_removal: None,
+                    rendering_content: None,
+                    effective_around_lat_lng: None,
+                    effective_around_radius: None,
+                });
             }
 
-            return self.execute_with_facets_internal(searcher, final_query, facets, params);
-        }
-
-        let tf2 = tf0.elapsed();
-        let (documents, total) = match params.sort {
-            None | Some(Sort::ByRelevance) => {
-                let (docs, count) = self.execute_relevance_sort(
+            let (documents, total) = match params.sort {
+                None | Some(Sort::ByRelevance) => {
+                    self.execute_relevance_sort(searcher, final_query, params.limit, params.offset)?
+                }
+                Some(Sort::ByField { field, order }) if params.has_text_query => self
+                    .execute_relevance_first_sort(
+                        searcher,
+                        final_query,
+                        field,
+                        order,
+                        params.limit,
+                        params.offset,
+                    )?,
+                Some(Sort::ByField { field, order }) => self.execute_pure_sort(
                     searcher,
                     final_query,
+                    field,
+                    order,
                     params.limit,
                     params.offset,
-                )?;
-                tracing::debug!(
-                    "[EXEC] filter={:?} relevance_sort={:?}",
-                    tf1,
-                    tf0.elapsed().saturating_sub(tf2)
-                );
-                (docs, count)
-            }
-            Some(Sort::ByField { field, order }) => {
-                if params.has_text_query {
-                    let (docs, count) = self.execute_relevance_first_sort(
-                        searcher,
-                        final_query,
-                        field,
-                        order,
-                        params.limit,
-                        params.offset,
-                    )?;
-                    (docs, count)
-                } else {
-                    let (docs, count) = self.execute_pure_sort(
-                        searcher,
-                        final_query,
-                        field,
-                        order,
-                        params.limit,
-                        params.offset,
-                    )?;
-                    (docs, count)
-                }
-            }
-        };
+                )?,
+            };
 
-        let (documents, total) = if let Some(distinct) = params.distinct_count {
-            if distinct > 0 {
-                self.apply_distinct(documents, total, distinct)?
-            } else {
-                (documents, total)
-            }
-        } else {
-            (documents, total)
-        };
+            let (documents, total) =
+                self.apply_distinct_if_requested(documents, total, params.distinct_count)?;
 
-        Ok(SearchResult {
-            documents,
-            total,
-            facets: HashMap::new(),
-            facets_stats: HashMap::new(),
-            user_data: Vec::new(),
-            applied_rules: Vec::new(),
-            parsed_query: self.query_text.clone(),
-            exhaustive_facet_values: true,
-            exhaustive_rules_match: true,
-            query_after_removal: None,
-            rendering_content: None,
-            effective_around_lat_lng: None,
-            effective_around_radius: None,
-        })
+            Ok(SearchResult {
+                documents,
+                total,
+                facets: HashMap::new(),
+                facets_stats: HashMap::new(),
+                user_data: Vec::new(),
+                applied_rules: Vec::new(),
+                parsed_query: self.query_text.clone(),
+                exhaustive_facet_values: true,
+                exhaustive_rules_match: true,
+                query_after_removal: None,
+                rendering_content: None,
+                effective_around_lat_lng: None,
+                effective_around_radius: None,
+            })
+        })()
     }
 
     /// Execute a search with facet collection and optional distinct deduplication. Handles both relevance-based and field-based sorting with optional custom ranking, applies pagination with document reconstruction, and extracts count-based and numeric statistics for facets. When limit and offset are both 0, skips document reconstruction but still collects complete facet data.
@@ -155,18 +180,17 @@ impl QueryExecutor {
         );
 
         if limit == 0 && offset == 0 {
+            let collect_started_at = std::time::Instant::now();
             let (count, facets) = searcher.search(query.as_ref(), &(Count, facet_collector))?;
-            let (documents, total) = if let Some(distinct) = distinct_count {
-                if distinct > 0 {
-                    self.apply_distinct(Vec::new(), count, distinct)?
-                } else {
-                    (Vec::new(), count)
-                }
-            } else {
-                (Vec::new(), count)
-            };
+            self.observe_phase(QueryPhase::Collect, collect_started_at);
+            self.set_matched_docs(count);
+            self.set_candidates_collected(0);
+            let (documents, total) =
+                self.apply_distinct_if_requested(Vec::new(), count, distinct_count)?;
+            let facet_started_at = std::time::Instant::now();
             let (facets, facets_stats, exhaustive_facet_values) =
                 self.extract_facet_counts_and_stats(&facets, facet_requests);
+            self.observe_phase(QueryPhase::FacetExtract, facet_started_at);
             return Ok(SearchResult {
                 documents,
                 total,
@@ -186,7 +210,6 @@ impl QueryExecutor {
 
         let (documents, total, facet_counts) = match sort {
             None | Some(Sort::ByRelevance) => {
-                let fi0 = std::time::Instant::now();
                 let prelim_limit = if self
                     .settings
                     .as_ref()
@@ -198,23 +221,30 @@ impl QueryExecutor {
                     limit + offset
                 };
                 let top_collector = TopDocs::with_limit(prelim_limit).order_by_score();
+                let collect_started_at = std::time::Instant::now();
                 let (count, mut top_docs, facets) =
                     searcher.search(query.as_ref(), &(Count, top_collector, facet_collector))?;
-                let fi1 = fi0.elapsed();
+                self.observe_phase(QueryPhase::Collect, collect_started_at);
+                self.set_matched_docs(count);
+                self.set_candidates_collected(top_docs.len());
+                let rank_started_at = std::time::Instant::now();
                 let query_terms: Vec<String> = self
                     .query_text
                     .split_whitespace()
                     .map(|s| s.to_lowercase())
                     .collect();
                 top_docs = self.apply_tier2_and_custom_ranking(searcher, top_docs, &query_terms)?;
-                let fi2 = fi0.elapsed();
+                self.observe_phase(QueryPhase::Rank, rank_started_at);
                 let final_docs = top_docs.into_iter().skip(offset).take(limit).collect();
+                let fetch_started_at = std::time::Instant::now();
                 let docs = self.reconstruct_documents(searcher, final_docs)?;
+                self.observe_phase(QueryPhase::Fetch, fetch_started_at);
+                let report = self.phase_report();
                 tracing::debug!(
                     "[FACET_INT] search={:?} tier2={:?} reconstruct={:?} prelim_limit={} count={}",
-                    fi1,
-                    fi2.saturating_sub(fi1),
-                    fi0.elapsed().saturating_sub(fi2),
+                    std::time::Duration::from_nanos(report.collect_ns),
+                    std::time::Duration::from_nanos(report.rank_ns),
+                    std::time::Duration::from_nanos(report.fetch_ns),
                     prelim_limit,
                     count
                 );
@@ -226,11 +256,20 @@ impl QueryExecutor {
                     let top_collector = TopDocs::with_limit(prelim_limit)
                         .and_offset(offset)
                         .order_by_score();
+                    let collect_started_at = std::time::Instant::now();
                     let (count, prelim, facets) = searcher
                         .search(query.as_ref(), &(Count, top_collector, facet_collector))?;
+                    self.observe_phase(QueryPhase::Collect, collect_started_at);
+                    self.set_matched_docs(count);
+                    self.set_candidates_collected(prelim.len());
+                    let rank_started_at = std::time::Instant::now();
                     let sorted =
                         self.sort_docs_by_json_field(searcher, prelim, field, order, limit, 0)?;
-                    (self.reconstruct_documents(searcher, sorted)?, count, facets)
+                    self.observe_phase(QueryPhase::Rank, rank_started_at);
+                    let fetch_started_at = std::time::Instant::now();
+                    let documents = self.reconstruct_documents(searcher, sorted)?;
+                    self.observe_phase(QueryPhase::Fetch, fetch_started_at);
+                    (documents, count, facets)
                 } else {
                     self.execute_pure_sort_internal(
                         searcher,
@@ -247,18 +286,13 @@ impl QueryExecutor {
             }
         };
 
-        let (documents, total) = if let Some(distinct) = distinct_count {
-            if distinct > 0 {
-                self.apply_distinct(documents, total, distinct)?
-            } else {
-                (documents, total)
-            }
-        } else {
-            (documents, total)
-        };
+        let (documents, total) =
+            self.apply_distinct_if_requested(documents, total, distinct_count)?;
 
+        let facet_started_at = std::time::Instant::now();
         let (facets, facets_stats, exhaustive_facet_values) =
             self.extract_facet_counts_and_stats(&facet_counts, facet_requests);
+        self.observe_phase(QueryPhase::FacetExtract, facet_started_at);
         Ok(SearchResult {
             documents,
             total,
@@ -274,6 +308,20 @@ impl QueryExecutor {
             effective_around_lat_lng: None,
             effective_around_radius: None,
         })
+    }
+
+    /// Deduplicate documents by attribute value when a positive distinct count
+    /// is requested; otherwise pass the documents and total through unchanged.
+    fn apply_distinct_if_requested(
+        &self,
+        documents: Vec<crate::types::ScoredDocument>,
+        total: usize,
+        distinct_count: Option<u32>,
+    ) -> Result<(Vec<crate::types::ScoredDocument>, usize)> {
+        match distinct_count {
+            Some(distinct) if distinct > 0 => self.apply_distinct(documents, total, distinct),
+            _ => Ok((documents, total)),
+        }
     }
 
     /// Deduplicate documents by attribute value, keeping at most distinct_count documents per group. Skips documents missing the distinct attribute. Returns group count as total.
@@ -460,6 +508,7 @@ impl QueryExecutor {
                     }
                 }
             }
+            self.add_facet_cardinality(unique_count);
 
             if value_query.is_some() {
                 if value_query_truncated {

@@ -129,46 +129,7 @@ pub(super) fn execute_zero_limit_search(
         Some((count, facets, stats, exhaustive_facets)) => {
             (count, facets, stats, exhaustive_facets)
         }
-        None => {
-            let primary_query = crate::types::Query {
-                text: prepared.query_text_rewritten.clone(),
-            };
-            let parsed = parser.parse(&primary_query)?;
-            let executor = QueryExecutor::new(resolved.index.converter(), prepared.schema.clone())
-                .with_settings(resolved.settings.clone())
-                .with_query(prepared.query_text_rewritten.clone())
-                .with_max_values_per_facet(context.max_values_per_facet);
-            let expanded = executor.expand_short_query_with_searcher(parsed, &resolved.searcher)?;
-            let final_query =
-                executor.apply_filter(expanded, prepared.effective_params.filter.as_ref())?;
-
-            if let Some(facet_reqs) = context.facets {
-                let mut facet_collector = tantivy::collector::FacetCollector::for_field("_facets");
-                for req in facet_reqs {
-                    facet_collector.add_facet(&req.path);
-                }
-                let (count, facet_counts) = resolved.searcher.search(
-                    final_query.as_ref(),
-                    &(tantivy::collector::Count, facet_collector),
-                )?;
-                let (facets_map, facets_stats, exhaustive_facets) =
-                    executor.extract_facet_counts_and_stats(&facet_counts, facet_reqs);
-                maybe_cache_facets(
-                    manager,
-                    context.facet_cache_key,
-                    count,
-                    &facets_map,
-                    &facets_stats,
-                    exhaustive_facets,
-                );
-                (count, facets_map, facets_stats, exhaustive_facets)
-            } else {
-                let count = resolved
-                    .searcher
-                    .search(final_query.as_ref(), &tantivy::collector::Count)?;
-                (count, HashMap::new(), HashMap::new(), true)
-            }
-        }
+        None => execute_uncached_zero_limit_search(manager, resolved, prepared, parser, &context)?,
     };
 
     Ok(SearchResult {
@@ -186,6 +147,54 @@ pub(super) fn execute_zero_limit_search(
         effective_around_lat_lng: context.effective_around_lat_lng,
         effective_around_radius: context.effective_around_radius,
     })
+}
+
+fn execute_uncached_zero_limit_search(
+    manager: &IndexManager,
+    resolved: &ResolvedSearch,
+    prepared: &PreparedSearchFilters,
+    parser: &QueryParser,
+    context: &ZeroLimitSearchContext<'_>,
+) -> Result<FacetResultCache> {
+    let primary_query = crate::types::Query {
+        text: prepared.query_text_rewritten.clone(),
+    };
+    let parsed = parser.parse(&primary_query)?;
+    let executor = QueryExecutor::new(resolved.index.converter(), prepared.schema.clone())
+        .with_settings(resolved.settings.clone())
+        .with_query(prepared.query_text_rewritten.clone())
+        .with_max_values_per_facet(context.max_values_per_facet);
+    let result = executor.execute_with_facets(
+        &resolved.searcher,
+        parsed,
+        prepared.effective_params.filter.as_ref(),
+        &crate::query::executor::FacetSearchParams {
+            sort: None,
+            limit: 0,
+            offset: 0,
+            has_text_query: !prepared.query_text_rewritten.trim().is_empty(),
+            facet_requests: context.facets,
+            distinct_count: None,
+        },
+    )?;
+
+    if context.facets.is_some() {
+        maybe_cache_facets(
+            manager,
+            context.facet_cache_key,
+            result.total,
+            &result.facets,
+            &result.facets_stats,
+            result.exhaustive_facet_values,
+        );
+    }
+
+    Ok((
+        result.total,
+        result.facets,
+        result.facets_stats,
+        result.exhaustive_facet_values,
+    ))
 }
 
 pub(super) fn execute_ranked_search(
@@ -275,6 +284,9 @@ pub(super) fn build_execution_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    const METRICS_TENANT_ID: &str = "tenant_zero_limit_metrics";
 
     fn prepared_filters_with_window(limit: usize, offset: usize) -> PreparedSearchFilters {
         let mut schema_builder = tantivy::schema::Schema::builder();
@@ -324,6 +336,53 @@ mod tests {
         }
     }
 
+    fn metrics_document(id: &str, title: &str, brand: &str) -> crate::types::Document {
+        crate::types::Document {
+            id: id.to_string(),
+            fields: HashMap::from([
+                (
+                    "title".to_string(),
+                    crate::types::FieldValue::Text(title.to_string()),
+                ),
+                (
+                    "brand".to_string(),
+                    crate::types::FieldValue::Text(brand.to_string()),
+                ),
+            ]),
+        }
+    }
+
+    async fn build_zero_limit_metrics_manager() -> (TempDir, Arc<IndexManager>, IndexSettings) {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = super::super::IndexManager::new(temp_dir.path());
+        manager.create_tenant(METRICS_TENANT_ID).unwrap();
+        let settings = IndexSettings {
+            attributes_for_faceting: vec!["brand".to_string()],
+            searchable_attributes: Some(vec!["title".to_string()]),
+            ..IndexSettings::default()
+        };
+        settings
+            .save(
+                &temp_dir
+                    .path()
+                    .join(METRICS_TENANT_ID)
+                    .join(super::super::config::SETTINGS_FILE),
+            )
+            .unwrap();
+        manager.invalidate_settings_cache(METRICS_TENANT_ID);
+        manager
+            .add_documents_sync(
+                METRICS_TENANT_ID,
+                vec![
+                    metrics_document("one", "running shoe", "Nike"),
+                    metrics_document("two", "trail shoe", "Adidas"),
+                ],
+            )
+            .await
+            .unwrap();
+        (temp_dir, manager, settings)
+    }
+
     #[test]
     fn build_execution_limits_uses_minimum_candidate_floor_for_stable_pagination() {
         let preprocessed = preprocessed_query();
@@ -335,5 +394,144 @@ mod tests {
         assert_eq!(build_execution_limits(&first_page, &preprocessed).0, 50);
         assert_eq!(build_execution_limits(&later_page, &preprocessed).0, 50);
         assert_eq!(build_execution_limits(&wider_page, &preprocessed).0, 60);
+    }
+
+    #[tokio::test]
+    async fn zero_limit_production_searches_emit_count_only_query_phase_metrics() {
+        let (_temp_dir, manager, settings) = build_zero_limit_metrics_manager().await;
+
+        let (count_result, count_reports) =
+            crate::query::executor::capture_query_phase_reports(|| {
+                manager.search_with_options(
+                    METRICS_TENANT_ID,
+                    "shoe",
+                    &SearchOptions {
+                        limit: 0,
+                        settings_override: Some(&settings),
+                        ..SearchOptions::default()
+                    },
+                )
+            });
+        let count_result = count_result.unwrap();
+
+        assert!(count_result.documents.is_empty());
+        assert_eq!(count_result.total, 2);
+        assert_eq!(count_reports.len(), 1);
+        assert_eq!(count_reports[0].execution_path, "count_only");
+        assert_eq!(count_reports[0].matched_docs, 2);
+        assert!(count_reports[0].collect_ns > 0);
+        assert_eq!(count_reports[0].facet_extract_ns, 0);
+
+        let facet_requests = vec![crate::types::FacetRequest {
+            field: "brand".to_string(),
+            path: "/brand".to_string(),
+            value_query: None,
+        }];
+        let (facet_result, facet_reports) =
+            crate::query::executor::capture_query_phase_reports(|| {
+                manager.search_with_options(
+                    METRICS_TENANT_ID,
+                    "shoe",
+                    &SearchOptions {
+                        limit: 0,
+                        facets: Some(&facet_requests),
+                        settings_override: Some(&settings),
+                        ..SearchOptions::default()
+                    },
+                )
+            });
+        let facet_result = facet_result.unwrap();
+
+        assert!(facet_result.documents.is_empty());
+        assert_eq!(facet_result.total, 2);
+        assert_eq!(facet_result.facets["brand"].len(), 2);
+        assert_eq!(facet_reports.len(), 1);
+        assert_eq!(facet_reports[0].execution_path, "count_only");
+        assert_eq!(facet_reports[0].matched_docs, 2);
+        assert!(facet_reports[0].collect_ns > 0);
+        assert!(facet_reports[0].facet_extract_ns > 0);
+    }
+
+    #[tokio::test]
+    async fn zero_limit_empty_facet_slice_preserves_count_only_result() {
+        let (_temp_dir, manager, settings) = build_zero_limit_metrics_manager().await;
+        let empty_facet_requests = [];
+
+        let result = manager
+            .search_with_options(
+                METRICS_TENANT_ID,
+                "shoe",
+                &SearchOptions {
+                    limit: 0,
+                    facets: Some(&empty_facet_requests),
+                    settings_override: Some(&settings),
+                    ..SearchOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert!(result.documents.is_empty());
+        assert_eq!(result.total, 2);
+        assert!(result.facets.is_empty());
+        assert!(result.facets_stats.is_empty());
+        assert!(result.exhaustive_facet_values);
+    }
+
+    #[tokio::test]
+    async fn production_ranked_search_phase_report_reconciles_short_query() {
+        const OPTIONAL_FILTER_COUNT: usize = 20_000;
+
+        let (_temp_dir, manager, settings) = build_zero_limit_metrics_manager().await;
+        let optional_filter_groups = (0..OPTIONAL_FILTER_COUNT)
+            .map(|index| vec![("brand".to_string(), format!("missing_{index}"), 1.0)])
+            .collect::<Vec<_>>();
+
+        let (result, reports) = crate::query::executor::capture_query_phase_reports(|| {
+            manager.search_with_options(
+                METRICS_TENANT_ID,
+                "sh",
+                &SearchOptions {
+                    limit: 2,
+                    optional_filter_specs: Some(&optional_filter_groups),
+                    settings_override: Some(&settings),
+                    ..SearchOptions::default()
+                },
+            )
+        });
+        let result = result.unwrap();
+
+        assert_eq!(result.total, 2);
+        assert_eq!(reports.len(), 1);
+        let report = reports[0];
+        assert_eq!(report.execution_path, "relevance");
+        assert_eq!(report.matched_docs, 2);
+        assert_eq!(report.visited_segments, 1);
+        assert_eq!(report.candidates_collected, 2);
+        assert!(report.prepare_ns > 0);
+        assert!(report.collect_ns > 0);
+        assert!(report.fetch_ns > 0);
+        let attributed_ns = report
+            .prepare_ns
+            .checked_add(report.collect_ns)
+            .and_then(|total| total.checked_add(report.rank_ns))
+            .and_then(|total| total.checked_add(report.fetch_ns))
+            .and_then(|total| total.checked_add(report.facet_extract_ns))
+            .expect("attributed query phases must not overflow");
+        let unattributed_ns = report
+            .total_ns
+            .checked_sub(attributed_ns)
+            .expect("attributed query phases must not exceed total time");
+        assert_eq!(
+            attributed_ns + unattributed_ns,
+            report.total_ns,
+            "ranked production report must reconcile exactly"
+        );
+        // Scheduler jitter below 2ms is noise; slower queries allow at most 5%.
+        let residual_budget_ns = 2_000_000_u64.max(report.total_ns / 20);
+        assert!(
+            unattributed_ns <= residual_budget_ns,
+            "production ranked-search unattributed {unattributed_ns}ns exceeds \
+             {residual_budget_ns}ns for report {report:?}"
+        );
     }
 }

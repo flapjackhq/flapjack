@@ -1,3 +1,4 @@
+use super::metrics::QueryPhase;
 use super::sorting::SortValue;
 use super::QueryExecutor;
 use crate::error::Result;
@@ -26,7 +27,6 @@ impl QueryExecutor {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<ScoredDocument>, usize)> {
-        let tr0 = std::time::Instant::now();
         let prelim_limit = if self
             .settings
             .as_ref()
@@ -38,27 +38,34 @@ impl QueryExecutor {
             limit + offset
         };
 
+        let collect_started_at = std::time::Instant::now();
         let (total, mut top_docs) = searcher.search(
             query.as_ref(),
             &(Count, TopDocs::with_limit(prelim_limit).order_by_score()),
         )?;
-        let tr1 = tr0.elapsed();
+        self.observe_phase(QueryPhase::Collect, collect_started_at);
+        self.set_matched_docs(total);
+        self.set_candidates_collected(top_docs.len());
 
+        let rank_started_at = std::time::Instant::now();
         let query_terms: Vec<String> = self
             .query_text
             .split_whitespace()
             .map(|s| s.to_lowercase())
             .collect();
         top_docs = self.apply_tier2_and_custom_ranking(searcher, top_docs, &query_terms)?;
-        let tr2 = tr0.elapsed();
+        self.observe_phase(QueryPhase::Rank, rank_started_at);
 
         let final_docs = top_docs.into_iter().skip(offset).take(limit).collect();
+        let fetch_started_at = std::time::Instant::now();
         let documents = self.reconstruct_documents(searcher, final_docs)?;
+        self.observe_phase(QueryPhase::Fetch, fetch_started_at);
+        let report = self.phase_report();
         tracing::debug!(
             "[REL] search={:?} tier2={:?} reconstruct={:?} total_hits={}",
-            tr1,
-            tr2.saturating_sub(tr1),
-            tr0.elapsed().saturating_sub(tr2),
+            std::time::Duration::from_nanos(report.collect_ns),
+            std::time::Duration::from_nanos(report.rank_ns),
+            std::time::Duration::from_nanos(report.fetch_ns),
             total
         );
         Ok((documents, total))

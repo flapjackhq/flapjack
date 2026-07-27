@@ -1,4 +1,5 @@
 //! Query result sorting using tantivy fast columnar fields with JSON extraction fallback and cross-type value ordering (Integer < Float < Text).
+use super::metrics::{QueryExecutionPath, QueryPhase};
 use super::QueryExecutor;
 use crate::error::Result;
 use crate::types::{ScoredDocument, SearchResult, Sort, SortOrder};
@@ -25,29 +26,40 @@ impl QueryExecutor {
         limit: usize,
         has_text_query: bool,
     ) -> Result<SearchResult> {
-        let final_query = self.apply_filter(query, filter)?;
-
-        let (documents, total) = match sort {
-            None | Some(Sort::ByRelevance) => {
-                self.execute_relevance_sort(searcher, final_query, limit, 0)?
-            }
-            Some(Sort::ByField { field, order }) => {
-                if has_text_query {
-                    self.execute_relevance_first_sort(
-                        searcher,
-                        final_query,
-                        field,
-                        order,
-                        limit,
-                        0,
-                    )?
-                } else {
-                    self.execute_pure_sort_fast(searcher, final_query, field, order, limit, 0)?
-                }
-            }
+        let execution_path = match sort {
+            None | Some(Sort::ByRelevance) => QueryExecutionPath::Relevance,
+            Some(Sort::ByField { .. }) if has_text_query => QueryExecutionPath::SortFallback,
+            Some(Sort::ByField { .. }) => QueryExecutionPath::SortFast,
         };
+        let _phase_guard = self.begin_phase_report(searcher, execution_path);
+        (|| {
+            let expanded_query = self.expand_short_query_with_searcher(query, searcher)?;
+            let prepare_started_at = std::time::Instant::now();
+            let final_query = self.apply_filter(expanded_query, filter)?;
+            self.observe_phase(QueryPhase::Prepare, prepare_started_at);
 
-        Ok(self.build_result(documents, total))
+            let (documents, total) = match sort {
+                None | Some(Sort::ByRelevance) => {
+                    self.execute_relevance_sort(searcher, final_query, limit, 0)?
+                }
+                Some(Sort::ByField { field, order }) => {
+                    if has_text_query {
+                        self.execute_relevance_first_sort(
+                            searcher,
+                            final_query,
+                            field,
+                            order,
+                            limit,
+                            0,
+                        )?
+                    } else {
+                        self.execute_pure_sort_fast(searcher, final_query, field, order, limit, 0)?
+                    }
+                }
+            };
+
+            Ok(self.build_result(documents, total))
+        })()
     }
 
     /// Hybrid sort that fetches a large preliminary set (100× limit+offset, minimum 1000), sorts by field values, and returns the offset-limited slice. Used when both text query and field sorting are specified.
@@ -64,10 +76,18 @@ impl QueryExecutor {
         let collector = TopDocs::with_limit(prelim_limit)
             .and_offset(offset)
             .order_by_score();
+        let collect_started_at = std::time::Instant::now();
         let (total, prelim_results) = searcher.search(query.as_ref(), &(Count, collector))?;
+        self.observe_phase(QueryPhase::Collect, collect_started_at);
+        self.set_matched_docs(total);
+        self.set_candidates_collected(prelim_results.len());
+        let rank_started_at = std::time::Instant::now();
         let sorted_docs =
             self.sort_docs_by_json_field(searcher, prelim_results, field, order, limit, 0)?;
+        self.observe_phase(QueryPhase::Rank, rank_started_at);
+        let fetch_started_at = std::time::Instant::now();
         let documents = self.reconstruct_documents(searcher, sorted_docs)?;
+        self.observe_phase(QueryPhase::Fetch, fetch_started_at);
         Ok((documents, total))
     }
 
@@ -108,13 +128,19 @@ impl QueryExecutor {
                 },
             );
 
+            let collect_started_at = std::time::Instant::now();
             let (total, top_docs) = searcher.search(query.as_ref(), &(Count, collector))?;
+            self.observe_phase(QueryPhase::Collect, collect_started_at);
+            self.set_matched_docs(total);
+            self.set_candidates_collected(top_docs.len());
 
             let docs_to_skip = offset.min(top_docs.len());
             let doc_addresses: Vec<(f32, tantivy::DocAddress)> =
                 top_docs.into_iter().skip(docs_to_skip).collect();
 
+            let fetch_started_at = std::time::Instant::now();
             let documents = self.reconstruct_documents(searcher, doc_addresses)?;
+            self.observe_phase(QueryPhase::Fetch, fetch_started_at);
             return Ok((documents, total));
         }
 
@@ -137,6 +163,7 @@ impl QueryExecutor {
                 "[SORT] No fast column for {}, using fallback",
                 fast_field_path
             );
+            self.set_execution_path(QueryExecutionPath::SortFallback);
             return self.execute_pure_sort_fallback(searcher, query, field, order, limit, offset);
         }
 
@@ -167,13 +194,19 @@ impl QueryExecutor {
             },
         );
 
+        let collect_started_at = std::time::Instant::now();
         let (total, top_docs) = searcher.search(query.as_ref(), &(Count, collector))?;
+        self.observe_phase(QueryPhase::Collect, collect_started_at);
+        self.set_matched_docs(total);
+        self.set_candidates_collected(top_docs.len());
 
         let docs_to_skip = offset.min(top_docs.len());
         let doc_addresses: Vec<(f32, tantivy::DocAddress)> =
             top_docs.into_iter().skip(docs_to_skip).collect();
 
+        let fetch_started_at = std::time::Instant::now();
         let documents = self.reconstruct_documents(searcher, doc_addresses)?;
+        self.observe_phase(QueryPhase::Fetch, fetch_started_at);
         Ok((documents, total))
     }
 
@@ -189,10 +222,18 @@ impl QueryExecutor {
     ) -> Result<(Vec<ScoredDocument>, usize)> {
         let fetch_limit = (limit + offset).saturating_mul(3).max(100);
         let collector = TopDocs::with_limit(fetch_limit).order_by_score();
+        let collect_started_at = std::time::Instant::now();
         let (total, prelim_results) = searcher.search(query.as_ref(), &(Count, collector))?;
+        self.observe_phase(QueryPhase::Collect, collect_started_at);
+        self.set_matched_docs(total);
+        self.set_candidates_collected(prelim_results.len());
+        let rank_started_at = std::time::Instant::now();
         let sorted_docs =
             self.sort_docs_by_json_field(searcher, prelim_results, field, order, limit, offset)?;
+        self.observe_phase(QueryPhase::Rank, rank_started_at);
+        let fetch_started_at = std::time::Instant::now();
         let documents = self.reconstruct_documents(searcher, sorted_docs)?;
+        self.observe_phase(QueryPhase::Fetch, fetch_started_at);
         Ok((documents, total))
     }
 
@@ -243,6 +284,7 @@ impl QueryExecutor {
                 },
             );
 
+            let collect_started_at = std::time::Instant::now();
             let (total, top_docs, facets) = if let Some(fc) = facet_collector {
                 let (count, docs, f) = searcher.search(query.as_ref(), &(Count, collector, fc))?;
                 (count, docs, f)
@@ -250,12 +292,17 @@ impl QueryExecutor {
                 let (count, docs) = searcher.search(query.as_ref(), &(Count, collector))?;
                 (count, docs, tantivy::collector::FacetCounts::default())
             };
+            self.observe_phase(QueryPhase::Collect, collect_started_at);
+            self.set_matched_docs(total);
+            self.set_candidates_collected(top_docs.len());
 
             let docs_to_skip = offset.min(top_docs.len());
             let doc_addresses: Vec<(f32, tantivy::DocAddress)> =
                 top_docs.into_iter().skip(docs_to_skip).collect();
 
+            let fetch_started_at = std::time::Instant::now();
             let documents = self.reconstruct_documents(searcher, doc_addresses)?;
+            self.observe_phase(QueryPhase::Fetch, fetch_started_at);
             return Ok((documents, total, facets));
         }
 
@@ -299,6 +346,7 @@ impl QueryExecutor {
                 },
             );
 
+            let collect_started_at = std::time::Instant::now();
             let (total, top_docs, facets) = if let Some(fc) = facet_collector {
                 let (count, docs, f) = searcher.search(query.as_ref(), &(Count, collector, fc))?;
                 (count, docs, f)
@@ -306,12 +354,17 @@ impl QueryExecutor {
                 let (count, docs) = searcher.search(query.as_ref(), &(Count, collector))?;
                 (count, docs, tantivy::collector::FacetCounts::default())
             };
+            self.observe_phase(QueryPhase::Collect, collect_started_at);
+            self.set_matched_docs(total);
+            self.set_candidates_collected(top_docs.len());
 
             let docs_to_skip = offset.min(top_docs.len());
             let doc_addresses: Vec<(f32, tantivy::DocAddress)> =
                 top_docs.into_iter().skip(docs_to_skip).collect();
 
+            let fetch_started_at = std::time::Instant::now();
             let documents = self.reconstruct_documents(searcher, doc_addresses)?;
+            self.observe_phase(QueryPhase::Fetch, fetch_started_at);
             return Ok((documents, total, facets));
         }
 
@@ -322,6 +375,7 @@ impl QueryExecutor {
         let fetch_limit = (limit + offset).saturating_mul(3).max(100);
         let collector = TopDocs::with_limit(fetch_limit).order_by_score();
 
+        let collect_started_at = std::time::Instant::now();
         let (total, prelim_results, facets) = if let Some(fc) = facet_collector {
             let (count, docs, f) = searcher.search(query.as_ref(), &(Count, collector, fc))?;
             (count, docs, f)
@@ -329,10 +383,17 @@ impl QueryExecutor {
             let (count, docs) = searcher.search(query.as_ref(), &(Count, collector))?;
             (count, docs, tantivy::collector::FacetCounts::default())
         };
+        self.observe_phase(QueryPhase::Collect, collect_started_at);
+        self.set_matched_docs(total);
+        self.set_candidates_collected(prelim_results.len());
 
+        let rank_started_at = std::time::Instant::now();
         let sorted_docs =
             self.sort_docs_by_json_field(searcher, prelim_results, field, order, limit, offset)?;
+        self.observe_phase(QueryPhase::Rank, rank_started_at);
+        let fetch_started_at = std::time::Instant::now();
         let documents = self.reconstruct_documents(searcher, sorted_docs)?;
+        self.observe_phase(QueryPhase::Fetch, fetch_started_at);
 
         Ok((documents, total, facets))
     }

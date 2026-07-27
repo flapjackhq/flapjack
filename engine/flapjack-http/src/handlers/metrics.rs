@@ -281,6 +281,7 @@ fn encode_registry_response(registry: &Registry) -> Response {
     metric_families.extend(crate::latency_middleware::gather_latency_metric_families());
     metric_families
         .extend(flapjack::index::write_queue::gather_write_queue_phase_metric_families());
+    metric_families.extend(flapjack::query::executor::gather_query_phase_metric_families());
     let mut buffer = Vec::new();
     if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
         return (
@@ -612,6 +613,32 @@ mod tests {
                 }),
                 "missing flapjack_write_queue_phase_seconds_count phase series for {phase}\n{text}"
             );
+        }
+
+        for phase in [
+            "prepare",
+            "collect",
+            "rank",
+            "fetch",
+            "facet_extract",
+            "unattributed",
+        ] {
+            for execution_path in [
+                "relevance",
+                "relevance_facets",
+                "sort_fast",
+                "sort_fallback",
+                "count_only",
+            ] {
+                assert!(
+                    text.lines().any(|line| {
+                        line.starts_with("flapjack_query_phase_seconds_count")
+                            && line.contains(&format!("phase=\"{phase}\""))
+                            && line.contains(&format!("execution_path=\"{execution_path}\""))
+                    }),
+                    "missing query phase series for {phase}/{execution_path}\n{text}"
+                );
+            }
         }
     }
 

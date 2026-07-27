@@ -166,8 +166,8 @@ pub(super) fn execute_expanded_queries(
     Ok((all_results, query_totals, facet_result))
 }
 
-/// Execute one expanded query: parse, expand short queries, apply optional filter
-/// boosts, then run against Tantivy with facets (first query only) and distinct.
+/// Execute one expanded query: parse it, then let `QueryExecutor` own expansion,
+/// optional boosts, filtering, collection, and phase attribution as one invocation.
 fn execute_single_expanded_query(
     expanded_query: &str,
     query_idx: usize,
@@ -186,18 +186,12 @@ fn execute_single_expanded_query(
         .with_query(expanded_query.to_string())
         .with_max_values_per_facet(context.max_values_per_facet);
 
-    let expanded_parsed =
-        executor.expand_short_query_with_searcher(parsed_query, context.searcher)?;
-    let boosted_query =
-        apply_optional_filter_boosts(expanded_parsed, context.optional_filter_specs, &executor)?;
-
-    let tq2 = tq0.elapsed();
-    tracing::debug!(
-        "[QUERY_PREP] parse={:?} expand={:?} query='{}'",
-        tq1,
-        tq2.saturating_sub(tq1),
-        expanded_query
-    );
+    let optional_boosts = context
+        .optional_filter_specs
+        .into_iter()
+        .flatten()
+        .flat_map(|group| group.iter().cloned())
+        .collect::<Vec<_>>();
 
     let inline_facets = if query_idx == 0 && !has_cached_facets {
         context.facets
@@ -205,9 +199,9 @@ fn execute_single_expanded_query(
         None
     };
 
-    executor.execute_with_facets(
+    let result = executor.execute_with_facets_and_optional_boosts(
         context.searcher,
-        boosted_query,
+        parsed_query,
         context.effective_filter,
         &crate::query::executor::FacetSearchParams {
             sort: context.effective_sort,
@@ -221,30 +215,16 @@ fn execute_single_expanded_query(
                 None
             },
         },
-    )
-}
-
-/// Flatten optional filter groups into boost specs and apply them to the query via
-/// `QueryExecutor::apply_optional_boosts`. No-ops when no optional filters are set.
-fn apply_optional_filter_boosts(
-    query: Box<dyn tantivy::query::Query>,
-    optional_filter_specs: Option<&[OptionalFilterGroup]>,
-    executor: &QueryExecutor,
-) -> Result<Box<dyn tantivy::query::Query>> {
-    let Some(groups) = optional_filter_specs else {
-        return Ok(query);
-    };
-
-    let flat_specs: Vec<(String, String, f32)> = groups
-        .iter()
-        .flat_map(|group| group.iter().cloned())
-        .collect();
-
-    if flat_specs.is_empty() {
-        Ok(query)
-    } else {
-        executor.apply_optional_boosts(query, &flat_specs)
-    }
+        &optional_boosts,
+    )?;
+    let report = executor.phase_report();
+    tracing::debug!(
+        "[QUERY_PREP] parse={:?} executor_prepare={:?} query='{}'",
+        tq1,
+        std::time::Duration::from_nanos(report.prepare_ns),
+        expanded_query
+    );
+    Ok(result)
 }
 
 /// Generate word-split alternatives for each base query (e.g. "shoerack" → "shoe
