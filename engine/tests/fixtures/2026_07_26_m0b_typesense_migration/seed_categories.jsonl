@@ -1,0 +1,2 @@
+{"id":"cat_kitchen","name":"Kitchen","priority":10,"active":true,"labels":["home","cooking"],"parent":null}
+{"id":"cat_coffee","name":"Coffee Gear","priority":20,"active":true,"labels":["coffee","café"],"parent":"cat_kitchen"}

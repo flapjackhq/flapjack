@@ -1,0 +1,26 @@
+[
+  {
+    "sku": "SKU-001",
+    "title": "Alpha Wrench",
+    "category": "tools",
+    "price": 10,
+    "color": "red",
+    "rank": 2
+  },
+  {
+    "sku": "SKU-002",
+    "title": "Beta Hammer",
+    "category": "tools",
+    "price": 15,
+    "color": "blue",
+    "rank": 1
+  },
+  {
+    "sku": "SKU-003",
+    "title": "Gamma Saw",
+    "category": "garden",
+    "price": 20,
+    "color": "red",
+    "rank": 3
+  }
+]

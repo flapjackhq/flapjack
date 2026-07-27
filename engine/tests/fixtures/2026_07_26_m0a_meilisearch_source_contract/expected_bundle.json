@@ -1,0 +1,296 @@
+{
+  "source": {
+    "image": "getmeili/meilisearch@sha256:9694a59df43ee3f54b3fda9c5de381a3ee9852678e3e31cadf37d6bddea7fc1b",
+    "imageDigest": "sha256:9694a59df43ee3f54b3fda9c5de381a3ee9852678e3e31cadf37d6bddea7fc1b",
+    "version": {
+      "commitSha": "2ecfd54ca7f3dd1c76d304efce86c9b8af9f82aa",
+      "commitDate": "unknown",
+      "pkgVersion": "1.50.0"
+    }
+  },
+  "indexes": {
+    "configured": {
+      "uid": "configured_pk",
+      "primaryKey": "sku"
+    },
+    "inferred": {
+      "uid": "inferred_pk",
+      "primaryKey": "book_id"
+    },
+    "ambiguous": {
+      "uid": "ambiguous_pk",
+      "primaryKey": null
+    }
+  },
+  "expectedPrimaryKeys": {
+    "configured_pk": "sku",
+    "inferred_pk": "book_id",
+    "ambiguous_pk": null
+  },
+  "documents": {
+    "beforeMutation": [
+      {
+        "sku": "SKU-001",
+        "title": "Alpha Wrench",
+        "category": "tools",
+        "price": 10,
+        "color": "red",
+        "rank": 2
+      },
+      {
+        "sku": "SKU-002",
+        "title": "Beta Hammer",
+        "category": "tools",
+        "price": 15,
+        "color": "blue",
+        "rank": 1
+      },
+      {
+        "sku": "SKU-003",
+        "title": "Gamma Saw",
+        "category": "garden",
+        "price": 20,
+        "color": "red",
+        "rank": 3
+      }
+    ],
+    "mutation": {
+      "sku": "SKU-004",
+      "title": "Delta Rake",
+      "category": "garden",
+      "price": 12,
+      "color": "green",
+      "rank": 4
+    },
+    "afterMutation": [
+      {
+        "sku": "SKU-001",
+        "title": "Alpha Wrench",
+        "category": "tools",
+        "price": 10,
+        "color": "red",
+        "rank": 2
+      },
+      {
+        "sku": "SKU-002",
+        "title": "Beta Hammer",
+        "category": "tools",
+        "price": 15,
+        "color": "blue",
+        "rank": 1
+      },
+      {
+        "sku": "SKU-003",
+        "title": "Gamma Saw",
+        "category": "garden",
+        "price": 20,
+        "color": "red",
+        "rank": 3
+      },
+      {
+        "sku": "SKU-004",
+        "title": "Delta Rake",
+        "category": "garden",
+        "price": 12,
+        "color": "green",
+        "rank": 4
+      }
+    ],
+    "inferred": [
+      {
+        "book_id": "B-001",
+        "title": "First Book"
+      },
+      {
+        "book_id": "B-002",
+        "title": "Second Book"
+      }
+    ],
+    "stableIds": [
+      "SKU-001",
+      "SKU-002",
+      "SKU-003"
+    ],
+    "countBefore": 3,
+    "countAfter": 4,
+    "hashBefore": "130f0e4b01a3029917f5bbc0ce5930fafd352c8943cd0ffbe4119c386fd62b3e",
+    "hashAfter": "1a4dce2fa85fabbf33e398065faee733df2f3d0afae9f401d4170d3df9614c52",
+    "databaseSizeBefore": 507904,
+    "databaseSizeAfter": 573440,
+    "fieldDistributionBefore": {
+      "category": 3,
+      "color": 3,
+      "price": 3,
+      "rank": 3,
+      "sku": 3,
+      "title": 3
+    },
+    "fieldDistributionAfter": {
+      "category": 4,
+      "color": 4,
+      "price": 4,
+      "rank": 4,
+      "sku": 4,
+      "title": 4
+    }
+  },
+  "settings": {
+    "displayedAttributes": [
+      "sku",
+      "title",
+      "category",
+      "price",
+      "color",
+      "rank"
+    ],
+    "searchableAttributes": [
+      "title",
+      "category"
+    ],
+    "filterableAttributes": [
+      "category",
+      "color",
+      "price"
+    ],
+    "sortableAttributes": [
+      "price",
+      "rank"
+    ],
+    "rankingRules": [
+      "words",
+      "typo",
+      "proximity",
+      "attribute",
+      "sort",
+      "exactness"
+    ],
+    "stopWords": [
+      "the"
+    ],
+    "synonyms": {
+      "saw": [
+        "cutter"
+      ],
+      "wrench": [
+        "spanner"
+      ]
+    },
+    "pagination": {
+      "maxTotalHits": 50
+    },
+    "faceting": {
+      "maxValuesPerFacet": 25,
+      "sortFacetValuesBy": {
+        "*": "alpha"
+      }
+    },
+    "typoTolerance": {
+      "enabled": true,
+      "minWordSizeForTypos": {
+        "oneTypo": 5,
+        "twoTypos": 9
+      },
+      "disableOnWords": [
+        "sku"
+      ],
+      "disableOnAttributes": [
+        "sku"
+      ],
+      "disableOnNumbers": false
+    },
+    "distinctAttribute": "sku",
+    "proximityPrecision": "byWord",
+    "separatorTokens": [
+      "-"
+    ],
+    "nonSeparatorTokens": [
+      "_"
+    ],
+    "dictionary": [
+      "flapjack"
+    ],
+    "embedders": {},
+    "localizedAttributes": null,
+    "facetSearch": true
+  },
+  "synonyms": {
+    "saw": [
+      "cutter"
+    ],
+    "wrench": [
+      "spanner"
+    ]
+  },
+  "tasks": {
+    "terminalStatuses": [
+      "succeeded",
+      "failed",
+      "canceled"
+    ],
+    "taskPollLimit": 120,
+    "ambiguous": {
+      "uid": 6,
+      "status": "failed",
+      "failureCode": "index_primary_key_multiple_candidates_found"
+    },
+    "mutation": {
+      "uid": 7,
+      "status": "succeeded",
+      "type": "documentAdditionOrUpdate"
+    },
+    "dump": {
+      "uid": 8,
+      "status": "succeeded",
+      "type": "dumpCreation"
+    },
+    "snapshot": {
+      "uid": 9,
+      "status": "succeeded",
+      "type": "snapshotCreation"
+    }
+  },
+  "requiredActions": [
+    "indexes.get",
+    "documents.get",
+    "settings.get",
+    "tasks.get",
+    "version",
+    "stats.get",
+    "search",
+    "dumps.create",
+    "snapshots.create"
+  ],
+  "pagination": {
+    "documentExportMethod": "POST",
+    "documentExportPath": "/indexes/configured_pk/documents/fetch",
+    "offsets": [
+      0,
+      2
+    ],
+    "limit": 2,
+    "total": 3,
+    "pageCounts": [
+      2,
+      1
+    ]
+  },
+  "warningIdentifiers": [
+    "meili_primary_key_ambiguous_candidates",
+    "meili_document_order_not_contractual",
+    "meili_search_pagination_bound_not_document_export_bound",
+    "meili_setting_value_normalized",
+    "meili_trailing_slash_redirect_unknown"
+  ],
+  "cleanup": {
+    "containerName": "flapjack_stage2_meilisearch_source_contract",
+    "tempDir": "tests/flapjack_stage2_meilisearch_source_contract_tmp",
+    "loopbackHost": "127.0.0.1",
+    "hostPort": 17747,
+    "residueExpected": {
+      "containerPresent": false,
+      "tempDirPresent": false,
+      "rawLogsPresent": false,
+      "credentialFilesPresent": false
+    }
+  }
+}

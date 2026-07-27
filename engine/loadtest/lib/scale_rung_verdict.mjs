@@ -6,6 +6,9 @@ import { fileURLToPath } from "node:url";
 
 export const NAME_PREFIX_P95_LIMIT_MS = 50;
 export const BLENDED_P95_LIMIT_MS = 100;
+// Frozen independent-per-family bar; Stage 4 records it in
+// engine/loadtest/SCALE_REMEDIATION_CONTRACT_2026_07_26.md.
+export const PER_QUERY_TYPE_P95_LIMIT_MS = 100;
 export const SEARCH_SAMPLES_PER_TYPE = 30;
 export const REQUIRED_QUERY_TYPES = Object.freeze([
   "text",
@@ -44,6 +47,11 @@ export function evaluateScaleRung(searchArtifact) {
     if (searchArtifact?.queryTypes?.[queryType]?.count !== SEARCH_SAMPLES_PER_TYPE) {
       invalidFields.push(`queryTypes.${queryType}.count`);
     } else {
+      // This placement is load-bearing: an absent family must report only its
+      // .count reason, as covered by scale_rung_verdict.test.mjs:69-74.
+      if (!validLatency(searchArtifact.queryTypes[queryType].p95)) {
+        invalidFields.push(`queryTypes.${queryType}.p95`);
+      }
       summedQueryCount += searchArtifact.queryTypes[queryType].count;
     }
   }
@@ -66,9 +74,23 @@ export function evaluateScaleRung(searchArtifact) {
   if (namePrefixP95Ms > NAME_PREFIX_P95_LIMIT_MS) {
     reasons.push("namePrefixP95");
   }
+  for (const queryType of REQUIRED_QUERY_TYPES) {
+    // The blend alone missed the 83.830ms / 315.727ms standard-2M specimen.
+    // text is already owned by the stricter 50ms name/prefix gate.
+    if (queryType === "text") {
+      continue;
+    }
+    if (searchArtifact.queryTypes[queryType].p95 > PER_QUERY_TYPE_P95_LIMIT_MS) {
+      reasons.push(`queryTypes.${queryType}.p95`);
+    }
+  }
   if (blendedP95Ms > BLENDED_P95_LIMIT_MS) {
     reasons.push("blendedP95");
   }
+
+  const observedQueryTypeP95Ms = Object.fromEntries(
+    REQUIRED_QUERY_TYPES.map((queryType) => [queryType, searchArtifact.queryTypes[queryType].p95]),
+  );
 
   return {
     verdict: reasons.length === 0 ? "PASS" : "FAIL",
@@ -76,11 +98,13 @@ export function evaluateScaleRung(searchArtifact) {
     limits: {
       namePrefixP95Ms: NAME_PREFIX_P95_LIMIT_MS,
       blendedP95Ms: BLENDED_P95_LIMIT_MS,
+      perQueryTypeP95Ms: PER_QUERY_TYPE_P95_LIMIT_MS,
     },
     observed: {
       namePrefixP95Ms,
       blendedP95Ms,
     },
+    observedQueryTypeP95Ms,
   };
 }
 

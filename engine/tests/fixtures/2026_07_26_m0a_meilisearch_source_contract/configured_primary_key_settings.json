@@ -1,0 +1,75 @@
+{
+  "displayedAttributes": [
+    "sku",
+    "title",
+    "category",
+    "price",
+    "color",
+    "rank"
+  ],
+  "searchableAttributes": [
+    "title",
+    "category"
+  ],
+  "filterableAttributes": [
+    "category",
+    "color",
+    "price"
+  ],
+  "sortableAttributes": [
+    "price",
+    "rank"
+  ],
+  "rankingRules": [
+    "words",
+    "typo",
+    "proximity",
+    "attribute",
+    "sort",
+    "exactness"
+  ],
+  "stopWords": [
+    "the"
+  ],
+  "synonyms": {
+    "wrench": [
+      "spanner"
+    ],
+    "saw": [
+      "cutter"
+    ]
+  },
+  "pagination": {
+    "maxTotalHits": 50
+  },
+  "faceting": {
+    "maxValuesPerFacet": 25,
+    "sortFacetValuesBy": {
+      "*": "alpha"
+    }
+  },
+  "typoTolerance": {
+    "enabled": true,
+    "minWordSizeForTypos": {
+      "oneTypo": 5,
+      "twoTypos": 9
+    },
+    "disableOnWords": [
+      "SKU"
+    ],
+    "disableOnAttributes": [
+      "sku"
+    ]
+  },
+  "distinctAttribute": "sku",
+  "proximityPrecision": "byWord",
+  "separatorTokens": [
+    "-"
+  ],
+  "nonSeparatorTokens": [
+    "_"
+  ],
+  "dictionary": [
+    "flapjack"
+  ]
+}

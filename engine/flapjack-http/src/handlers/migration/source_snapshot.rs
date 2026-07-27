@@ -213,7 +213,7 @@ fn object_resource_snapshot(
     Ok(accumulator.finish())
 }
 
-fn object_stable_id(item: &Value) -> Result<String, SourceSnapshotSchemaViolationKind> {
+pub(super) fn object_stable_id(item: &Value) -> Result<String, SourceSnapshotSchemaViolationKind> {
     let object = item
         .as_object()
         .ok_or(SourceSnapshotSchemaViolationKind::MalformedPayload)?;
@@ -237,12 +237,20 @@ fn aggregate_source_item_hashes(mut item_hashes: Vec<(String, String)>) -> Strin
     item_hashes.sort_by(|left, right| left.0.cmp(&right.0));
     let mut hasher = Sha256::new();
     for (stable_id, item_hash) in item_hashes {
-        hasher.update(stable_id.as_bytes());
-        hasher.update([0]);
-        hasher.update(item_hash.as_bytes());
-        hasher.update(*b"\n");
+        update_source_item_hash_digest(&mut hasher, &stable_id, &item_hash);
     }
     hex::encode(hasher.finalize())
+}
+
+pub(super) fn update_source_item_hash_digest(
+    hasher: &mut Sha256,
+    stable_id: &str,
+    item_hash: &str,
+) {
+    hasher.update(stable_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(item_hash.as_bytes());
+    hasher.update(*b"\n");
 }
 
 pub(super) fn canonical_json_bytes(value: &Value) -> Vec<u8> {

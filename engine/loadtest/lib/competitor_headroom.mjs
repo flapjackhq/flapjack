@@ -1,4 +1,13 @@
-import { pathToFileURL } from "node:url";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+import { FINAL_CERTIFICATION_TARGET } from "./scale_latency_projection.mjs";
+
+export const HEADROOM_CONTRACT_ID = "flapjack-competitor-headroom-2026-07-26";
+export const REMEDIATION_CONTRACT_ID =
+  "flapjack-scale-remediation-64m-standard-2026-07-26";
+export const REMEDIATION_REQUIRED_PROFILE = "standard";
+export const REMEDIATION_REQUIRED_TARGET = FINAL_CERTIFICATION_TARGET;
 
 export const LARGEST_OPERATIONAL_CLAIM = 40_000_000;
 export const OPERATIONAL_TARGET = 60_000_000;
@@ -51,7 +60,17 @@ function verdictFor(profiles, minimumTarget, comparisonCount) {
   };
 }
 
-export function evaluateCompetitorHeadroom(profileResults) {
+export function evaluateCompetitorHeadroom(profileResults, options = {}) {
+  const requestedContractId = options?.contractId;
+  if (
+    requestedContractId !== undefined &&
+    requestedContractId !== HEADROOM_CONTRACT_ID &&
+    requestedContractId !== REMEDIATION_CONTRACT_ID
+  ) {
+    // Unknown regimes must not silently fall back to historical receipt qualification.
+    throw new RangeError(`unknown competitor headroom contract ID: ${requestedContractId}`);
+  }
+
   const supplied =
     profileResults !== null && typeof profileResults === "object" ? profileResults : {};
   const orderedNames = [
@@ -60,15 +79,28 @@ export function evaluateCompetitorHeadroom(profileResults) {
       .filter((name) => !PROFILE_ORDER.includes(name))
       .sort(),
   ];
-  const green = orderedNames
+  const eligibleNames =
+    requestedContractId === REMEDIATION_CONTRACT_ID
+      ? orderedNames.filter(
+          (name) =>
+            name === REMEDIATION_REQUIRED_PROFILE &&
+            supplied[name]?.contractId === REMEDIATION_CONTRACT_ID &&
+            supplied[name]?.targetCount >= REMEDIATION_REQUIRED_TARGET,
+        )
+      : orderedNames;
+  const green = eligibleNames
     .filter((name) => isExactGreenProfile(supplied[name]))
     .map((name) => ({ name, specimen: supplied[name] }));
 
-  return {
+  const result = {
     greenProfiles: green.map(({ name }) => name),
     operational: verdictFor(green, OPERATIONAL_TARGET, LARGEST_OPERATIONAL_CLAIM),
     literalLimit: verdictFor(green, LITERAL_LIMIT_TARGET, LITERAL_LIMIT_CLAIM),
   };
+  // The omitted-ID path is frozen for byte-shape compatibility with historical consumers.
+  return requestedContractId === undefined
+    ? result
+    : { ...result, contractId: requestedContractId };
 }
 
 function parseArgs(argv) {
@@ -79,7 +111,9 @@ function parseArgs(argv) {
   return JSON.parse(argv[inputIndex + 1]);
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+const currentFilePath = fileURLToPath(import.meta.url);
+const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : "";
+if (currentFilePath === invokedPath) {
   try {
     process.stdout.write(`${JSON.stringify(evaluateCompetitorHeadroom(parseArgs(process.argv.slice(2))), null, 2)}\n`);
   } catch (error) {

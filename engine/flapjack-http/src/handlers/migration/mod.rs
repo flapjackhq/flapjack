@@ -21,6 +21,7 @@ mod algolia_client;
 mod export;
 mod import;
 mod job_runner;
+mod source_identity_partitions;
 mod source_reader;
 mod source_snapshot;
 #[cfg(test)]
@@ -1370,6 +1371,10 @@ mod async_status_tests;
 #[cfg(test)]
 #[path = "source_snapshot_tests.rs"]
 mod source_snapshot_tests;
+
+#[cfg(test)]
+#[path = "source_identity_partitions_tests.rs"]
+mod source_identity_partitions_tests;
 
 #[cfg(test)]
 #[path = "import_contract_tests.rs"]

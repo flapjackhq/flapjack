@@ -1,0 +1,469 @@
+{
+  "contract": {
+    "capture_requires_write_freeze": true,
+    "fixture_version": "2026_07_26_m0b_typesense_migration",
+    "image_digest": "sha256:610f2d34b1f93d00762869da2c67736775e5798d19a2c8b91b014b8a0cc1e110",
+    "image_reference": "typesense/typesense:30.2",
+    "least_privilege_actions": [
+      "collections:list",
+      "collections:get",
+      "documents:export",
+      "aliases:list",
+      "aliases:get",
+      "synonym_sets:list",
+      "synonym_sets:get",
+      "synonym_sets/items:list",
+      "synonym_sets/items:get",
+      "curation_sets:list",
+      "curation_sets:get",
+      "curation_sets/items:list",
+      "curation_sets/items:get",
+      "debug:list"
+    ],
+    "unsupported_codes": [
+      "typesense_api_keys_unsupported",
+      "typesense_vectors_unsupported",
+      "typesense_references_unsupported",
+      "typesense_analytics_unsupported",
+      "typesense_quiescence_requires_write_freeze"
+    ],
+    "warning_codes": [
+      "typesense_schema_requires_translation",
+      "typesense_alias_requires_translation",
+      "typesense_synonym_sets_require_translation",
+      "typesense_curation_sets_require_translation",
+      "typesense_export_stream_not_newline_counted"
+    ]
+  },
+  "source": {
+    "aliases": [
+      {
+        "name": "fj_ts_migration_catalog",
+        "collection_name": "fj_ts_migration_products"
+      }
+    ],
+    "collections": [
+      {
+        "name": "fj_ts_migration_categories",
+        "default_sorting_field": "priority",
+        "enable_nested_fields": false,
+        "token_separators": [],
+        "symbols_to_index": [],
+        "synonym_sets": [],
+        "curation_sets": [],
+        "fields": [
+          {
+            "name": "name",
+            "type": "string",
+            "facet": false,
+            "optional": false,
+            "index": true,
+            "store": true,
+            "sort": false
+          },
+          {
+            "name": "priority",
+            "type": "int32",
+            "facet": false,
+            "optional": false,
+            "index": true,
+            "store": true,
+            "sort": true
+          },
+          {
+            "name": "active",
+            "type": "bool",
+            "facet": true,
+            "optional": false,
+            "index": true,
+            "store": true,
+            "sort": true
+          },
+          {
+            "name": "labels",
+            "type": "string[]",
+            "facet": true,
+            "optional": false,
+            "index": true,
+            "store": true,
+            "sort": false
+          },
+          {
+            "name": "parent",
+            "type": "string",
+            "facet": false,
+            "optional": true,
+            "index": true,
+            "store": true,
+            "sort": false
+          }
+        ],
+        "documents": [
+          {
+            "active": true,
+            "id": "cat_coffee",
+            "labels": [
+              "coffee",
+              "café"
+            ],
+            "name": "Coffee Gear",
+            "parent": "cat_kitchen",
+            "priority": 20
+          },
+          {
+            "active": true,
+            "id": "cat_kitchen",
+            "labels": [
+              "home",
+              "cooking"
+            ],
+            "name": "Kitchen",
+            "priority": 10
+          }
+        ]
+      },
+      {
+        "name": "fj_ts_migration_products",
+        "default_sorting_field": "price",
+        "enable_nested_fields": true,
+        "token_separators": [
+          "-"
+        ],
+        "symbols_to_index": [
+          "#"
+        ],
+        "synonym_sets": [
+          "fj_ts_migration_synonyms"
+        ],
+        "curation_sets": [
+          "fj_ts_migration_curations"
+        ],
+        "fields": [
+          {
+            "name": "title",
+            "type": "string",
+            "facet": false,
+            "optional": false,
+            "index": true,
+            "store": true,
+            "sort": false
+          },
+          {
+            "name": "sku",
+            "type": "string",
+            "facet": false,
+            "optional": false,
+            "index": true,
+            "store": true,
+            "sort": false
+          },
+          {
+            "name": "price",
+            "type": "float",
+            "facet": true,
+            "optional": false,
+            "index": true,
+            "store": true,
+            "sort": true
+          },
+          {
+            "name": "inventory",
+            "type": "int32",
+            "facet": false,
+            "optional": false,
+            "index": true,
+            "store": true,
+            "sort": true
+          },
+          {
+            "name": "available",
+            "type": "bool",
+            "facet": true,
+            "optional": false,
+            "index": true,
+            "store": true,
+            "sort": true
+          },
+          {
+            "name": "tags",
+            "type": "string[]",
+            "facet": true,
+            "optional": false,
+            "index": true,
+            "store": true,
+            "sort": false
+          },
+          {
+            "name": "metadata",
+            "type": "object",
+            "facet": false,
+            "optional": true,
+            "index": true,
+            "store": true,
+            "sort": false
+          },
+          {
+            "name": "metadata.color",
+            "type": "string",
+            "facet": true,
+            "optional": true,
+            "index": true,
+            "store": true,
+            "sort": false
+          },
+          {
+            "name": "nullable_note",
+            "type": "string",
+            "facet": false,
+            "optional": true,
+            "index": false,
+            "store": true,
+            "sort": false
+          },
+          {
+            "name": "secret_note",
+            "type": "string",
+            "facet": false,
+            "optional": true,
+            "index": false,
+            "store": false,
+            "sort": false
+          },
+          {
+            "name": "embedding",
+            "type": "float[]",
+            "facet": false,
+            "optional": true,
+            "index": true,
+            "store": true,
+            "sort": false,
+            "num_dim": 3,
+            "vec_dist": "cosine"
+          },
+          {
+            "name": "category_id",
+            "type": "string",
+            "facet": false,
+            "optional": true,
+            "index": true,
+            "store": true,
+            "sort": false,
+            "reference": "fj_ts_migration_categories.id"
+          },
+          {
+            "name": "metadata.rating",
+            "type": "float",
+            "facet": false,
+            "optional": true,
+            "index": true,
+            "store": true,
+            "sort": true
+          },
+          {
+            "name": "metadata.dimensions.width_cm",
+            "type": "int64",
+            "facet": false,
+            "optional": true,
+            "index": true,
+            "store": true,
+            "sort": true
+          },
+          {
+            "name": "metadata.dimensions.height_cm",
+            "type": "int64",
+            "facet": false,
+            "optional": true,
+            "index": true,
+            "store": true,
+            "sort": true
+          }
+        ],
+        "documents": [
+          {
+            "available": true,
+            "category_id": "cat_coffee",
+            "embedding": [
+              0.125,
+              0.25,
+              0.5
+            ],
+            "id": "prod_001",
+            "inventory": 42,
+            "metadata": {
+              "color": "brushed steel",
+              "dimensions": {
+                "height_cm": 24,
+                "width_cm": 12
+              },
+              "rating": 4.75
+            },
+            "price": 129.95,
+            "sku": "CAF-001",
+            "tags": [
+              "coffee",
+              "kitchen",
+              "unicode"
+            ],
+            "title": "Café Espresso Grinder"
+          },
+          {
+            "available": false,
+            "category_id": "cat_kitchen",
+            "embedding": [
+              0.75,
+              0.5,
+              0.25
+            ],
+            "id": "prod_002",
+            "inventory": 0,
+            "metadata": {
+              "color": "cobalt",
+              "dimensions": {
+                "height_cm": 18,
+                "width_cm": 20
+              },
+              "rating": 4.1
+            },
+            "nullable_note": "backorder",
+            "price": 54.5,
+            "sku": "TEA-002",
+            "tags": [
+              "tea",
+              "kitchen"
+            ],
+            "title": "Tea Kettle Deluxe"
+          },
+          {
+            "available": true,
+            "category_id": "cat_kitchen",
+            "embedding": [
+              0.33,
+              0.66,
+              0.99
+            ],
+            "id": "prod_003",
+            "inventory": 7,
+            "metadata": {
+              "color": "vermillion",
+              "dimensions": {
+                "height_cm": 9,
+                "width_cm": 16
+              },
+              "rating": 4.9
+            },
+            "price": 31.25,
+            "sku": "BEN-003",
+            "tags": [
+              "lunch",
+              "日本語"
+            ],
+            "title": "Nested Bento Box"
+          }
+        ]
+      }
+    ],
+    "synonym_sets": [
+      {
+        "name": "fj_ts_migration_synonyms",
+        "items": [
+          {
+            "id": "espresso_synonym",
+            "root": "espresso",
+            "synonyms": [
+              "coffee",
+              "café"
+            ]
+          }
+        ]
+      }
+    ],
+    "curation_sets": [
+      {
+        "name": "fj_ts_migration_curations",
+        "items": [
+          {
+            "id": "pin_espresso",
+            "rule": {
+              "match": "exact",
+              "query": "espresso",
+              "stem": false,
+              "synonyms": false
+            },
+            "includes": [
+              {
+                "id": "prod_001",
+                "position": 1
+              }
+            ],
+            "excludes": [
+              {
+                "id": "prod_002"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "provider_evidence": {
+      "health": {
+        "ok": true
+      },
+      "debug": {
+        "state": 1,
+        "version": "30.2"
+      },
+      "global_resource_visibility": {
+        "unrelated_synonym_set": "outside_stage2_global_synonyms",
+        "visible_to_capture_key": true,
+        "returned_synonym_set_names": [
+          "fj_ts_migration_synonyms",
+          "outside_stage2_global_synonyms"
+        ]
+      }
+    },
+    "unsupported_findings": [
+      {
+        "code": "typesense_api_keys_unsupported",
+        "detail": "Capture and export key values are created only for permission controls and are redacted from bundles and evidence."
+      },
+      {
+        "code": "typesense_vectors_unsupported",
+        "detail": "Vector field sentinel is preserved as unsupported provider metadata only."
+      },
+      {
+        "code": "typesense_references_unsupported",
+        "detail": "Reference field sentinel is preserved as unsupported provider metadata only."
+      },
+      {
+        "code": "typesense_analytics_unsupported",
+        "detail": "Analytics APIs are not part of the source capture contract."
+      },
+      {
+        "code": "typesense_quiescence_requires_write_freeze",
+        "detail": "A green capture requires explicit write-freeze attestation; counts and timestamps are diagnostics only."
+      }
+    ],
+    "warning_findings": [
+      {
+        "code": "typesense_schema_requires_translation",
+        "detail": "Provider schema is captured exactly; target mapping is a later policy decision."
+      },
+      {
+        "code": "typesense_alias_requires_translation",
+        "detail": "Alias target is captured without assuming target-side alias lifecycle."
+      },
+      {
+        "code": "typesense_synonym_sets_require_translation",
+        "detail": "Global synonym set identity and linked collection membership must be preserved."
+      },
+      {
+        "code": "typesense_curation_sets_require_translation",
+        "detail": "Global curation set identity and linked collection membership must be preserved."
+      },
+      {
+        "code": "typesense_export_stream_not_newline_counted",
+        "detail": "Document export is parsed as JSON values and may omit a terminal newline."
+      }
+    ]
+  }
+}

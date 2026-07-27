@@ -1,0 +1,58 @@
+{
+  "probes": [
+    {
+      "action": "indexes.get",
+      "method": "GET",
+      "path": "/indexes?limit=10"
+    },
+    {
+      "action": "documents.get",
+      "method": "POST",
+      "path": "/indexes/configured_pk/documents/fetch",
+      "body": {
+        "offset": 0,
+        "limit": 1
+      }
+    },
+    {
+      "action": "settings.get",
+      "method": "GET",
+      "path": "/indexes/configured_pk/settings"
+    },
+    {
+      "action": "tasks.get",
+      "method": "GET",
+      "path": "/tasks?limit=1"
+    },
+    {
+      "action": "version",
+      "method": "GET",
+      "path": "/version"
+    },
+    {
+      "action": "stats.get",
+      "method": "GET",
+      "path": "/stats"
+    },
+    {
+      "action": "search",
+      "method": "POST",
+      "path": "/indexes/configured_pk/search",
+      "body": {
+        "q": "rake"
+      }
+    },
+    {
+      "action": "dumps.create",
+      "method": "POST",
+      "path": "/dumps",
+      "body": {}
+    },
+    {
+      "action": "snapshots.create",
+      "method": "POST",
+      "path": "/snapshots",
+      "body": {}
+    }
+  ]
+}

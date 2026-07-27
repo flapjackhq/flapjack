@@ -41,6 +41,9 @@ subsequent 1M → 64M campaign. It freezes 60M as the operational comparison thr
 claim separate from Meilisearch's structural per-index limit, requires exactly 30 measured requests
 for all seven query types, and adds a post-rung observed-capacity gate before every checkpoint.
 
+[`SCALE_REMEDIATION_CONTRACT_2026_07_26.md`](SCALE_REMEDIATION_CONTRACT_2026_07_26.md) governs only
+the stricter repaired 64M standard-profile campaign.
+
 The ladder starts its own loopback-only release server, grows one index incrementally, and fails
 closed on insufficient capacity, a flat document count, an inexact final count, missing rank-1
 sentinels, invalid latency evidence, or an unsafe resume checkpoint:

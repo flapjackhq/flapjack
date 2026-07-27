@@ -1,0 +1,10 @@
+[
+  {
+    "book_id": "B-001",
+    "title": "First Book"
+  },
+  {
+    "book_id": "B-002",
+    "title": "Second Book"
+  }
+]
