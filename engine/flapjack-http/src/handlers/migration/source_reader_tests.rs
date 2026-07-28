@@ -1,10 +1,17 @@
 use super::algolia_client::{AlgoliaClientError, AlgoliaErrorKind, AlgoliaIndexRecord};
+use super::source_identity_partitions::SourceIdentityVersion;
 use super::source_reader::{
     accept_source_export, collect_quiescent_source_snapshot, collect_replica_settings,
     AlgoliaSourceReader, MigrationSourceReader,
 };
-use super::source_test_support::{RecordingSink, ScriptedSourceReader};
+use super::source_snapshot::{
+    canonical_json_bytes, source_item_hash, update_source_item_hash_digest, SourceResourceSnapshot,
+};
+use super::source_test_support::{
+    expected_document_v2_digest, RecordingSink, ScriptedSourceReader,
+};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 
 fn stable_reader() -> ScriptedSourceReader {
@@ -44,13 +51,107 @@ async fn source_reader_identity_is_order_independent_and_uses_canonical_source_i
     assert_eq!(first_identity.digest(), reordered_identity.digest());
     assert_eq!(
         first_identity.digest(),
-        "a11a1b23f8e9ca312bad89867fedf170a9a807df34bbaa9a30f8e60d9ef163e9"
+        expected_source_identity_digest(
+            "APPID",
+            "products",
+            &stable_record(),
+            &first_identity.snapshot().settings,
+            &first_identity.snapshot().documents,
+            &first_identity.snapshot().rules,
+            &first_identity.snapshot().synonyms,
+        )
     );
     assert_eq!(first_identity.updated_at(), "2026-07-15T00:00:00Z");
     assert_eq!(first_identity.document_metadata_count(), 2);
     assert_eq!(first_identity.snapshot().documents.count, 2);
+    assert_eq!(
+        first_identity.snapshot().documents.version,
+        SourceIdentityVersion::V2
+    );
+    assert!(first_identity.snapshot().documents.ids.is_empty());
     assert_eq!(first.acl_checks, 1);
     assert_eq!(reordered.acl_checks, 1);
+}
+
+#[tokio::test]
+async fn source_reader_document_identity_uses_v2_digest_and_versioned_top_level_preimage() {
+    let mut reader = stable_reader();
+
+    let identity = collect_quiescent_source_snapshot(&mut reader)
+        .await
+        .expect("stable source should snapshot");
+
+    let snapshot = identity.snapshot();
+    assert_eq!(snapshot.documents.version, SourceIdentityVersion::V2);
+    assert_eq!(
+        snapshot.documents.hash,
+        expected_document_v2_digest(vec![document_one(), document_two()], 2048)
+    );
+    assert_eq!(
+        identity.digest(),
+        expected_source_identity_digest(
+            "APPID",
+            "products",
+            &stable_record(),
+            &snapshot.settings,
+            &snapshot.documents,
+            &snapshot.rules,
+            &snapshot.synonyms,
+        )
+    );
+
+    let v1_document_resource = SourceResourceSnapshot {
+        count: 2,
+        hash: expected_v1_aggregate_digest(vec![document_one(), document_two()]),
+        ids: ["doc-1".to_string(), "doc-2".to_string()].into(),
+        version: SourceIdentityVersion::V1,
+    };
+    assert_ne!(
+        identity.digest(),
+        expected_source_identity_digest(
+            "APPID",
+            "products",
+            &stable_record(),
+            &snapshot.settings,
+            &v1_document_resource,
+            &snapshot.rules,
+            &snapshot.synonyms,
+        ),
+        "top-level identity must include resource identity version in the preimage"
+    );
+}
+
+#[tokio::test]
+async fn source_reader_document_identity_changes_for_insert_delete_and_in_place_update() {
+    let baseline = source_identity_for_documents(document_pages_in_order()).await;
+    let inserted = source_identity_for_documents(vec![vec![
+        document_one(),
+        document_two(),
+        json!({"objectID": "doc-3", "title": "Mouse"}),
+    ]])
+    .await;
+    let deleted = source_identity_for_documents(vec![vec![document_one()]]).await;
+    let changed = source_identity_for_documents(vec![vec![
+        document_one(),
+        json!({"objectID": "doc-2", "title": "Monitor"}),
+    ]])
+    .await;
+
+    assert_ne!(baseline.digest(), inserted.digest());
+    assert_ne!(baseline.digest(), deleted.digest());
+    assert_ne!(baseline.digest(), changed.digest());
+    assert_ne!(
+        baseline.snapshot().documents.hash,
+        inserted.snapshot().documents.hash
+    );
+    assert_ne!(
+        baseline.snapshot().documents.hash,
+        deleted.snapshot().documents.hash
+    );
+    assert_ne!(
+        baseline.snapshot().documents.hash,
+        changed.snapshot().documents.hash
+    );
 }
 
 #[test]
@@ -81,7 +182,15 @@ async fn source_reader_two_pass_accepts_same_membership_with_page_order_changes(
 
     assert_eq!(
         accepted.identity().digest(),
-        "a11a1b23f8e9ca312bad89867fedf170a9a807df34bbaa9a30f8e60d9ef163e9"
+        expected_source_identity_digest(
+            "APPID",
+            "products",
+            &stable_record(),
+            &accepted.identity().snapshot().settings,
+            &accepted.identity().snapshot().documents,
+            &accepted.identity().snapshot().rules,
+            &accepted.identity().snapshot().synonyms,
+        )
     );
     assert_eq!(sink.settings, vec![settings_fixture()]);
     assert_eq!(sink.document_pages, vec![vec!["doc-2"], vec!["doc-1"]]);
@@ -308,4 +417,80 @@ fn rule_one() -> Value {
 
 fn synonym_one() -> Value {
     json!({"objectID": "syn-1", "type": "synonym", "synonyms": ["tee", "shirt"]})
+}
+
+async fn source_identity_for_documents(
+    document_pages: Vec<Vec<Value>>,
+) -> super::source_reader::SourceIdentity {
+    let document_count = document_pages.iter().map(Vec::len).sum::<usize>() as u64;
+    let mut record = stable_record();
+    record.entries = document_count;
+    let mut reader = ScriptedSourceReader::new("APPID", "products");
+    reader.push_quiescent(record);
+    reader.push_pass(
+        settings_fixture(),
+        document_pages,
+        vec![vec![rule_one()]],
+        vec![vec![synonym_one()]],
+    );
+    collect_quiescent_source_snapshot(&mut reader)
+        .await
+        .expect("stable source should snapshot")
+}
+
+fn expected_v1_aggregate_digest(items: Vec<Value>) -> String {
+    let mut tuples = items
+        .into_iter()
+        .map(|item| {
+            (
+                item["objectID"].as_str().unwrap().to_string(),
+                source_item_hash(&item),
+            )
+        })
+        .collect::<Vec<_>>();
+    tuples.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    for (object_id, item_hash) in tuples {
+        update_source_item_hash_digest(&mut hasher, &object_id, &item_hash);
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn expected_source_identity_digest(
+    app_id: &str,
+    source_name: &str,
+    metadata: &AlgoliaIndexRecord,
+    settings: &SourceResourceSnapshot,
+    documents: &SourceResourceSnapshot,
+    rules: &SourceResourceSnapshot,
+    synonyms: &SourceResourceSnapshot,
+) -> String {
+    let identity = json!({
+        "appID": app_id,
+        "sourceIndex": source_name,
+        "updatedAt": metadata.updated_at,
+        "documentMetadataCount": metadata.entries,
+        "resources": {
+            "settings": expected_resource_identity(settings),
+            "documents": expected_resource_identity(documents),
+            "rules": expected_resource_identity(rules),
+            "synonyms": expected_resource_identity(synonyms),
+        }
+    });
+    hex::encode(Sha256::digest(canonical_json_bytes(&identity)))
+}
+
+fn expected_resource_identity(resource: &SourceResourceSnapshot) -> Value {
+    json!({
+        "count": resource.count,
+        "hash": resource.hash,
+        "version": expected_version_name(resource.version),
+    })
+}
+
+fn expected_version_name(version: SourceIdentityVersion) -> &'static str {
+    match version {
+        SourceIdentityVersion::V1 => "v1",
+        SourceIdentityVersion::V2 => "v2",
+    }
 }

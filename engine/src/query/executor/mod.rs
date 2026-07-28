@@ -4,17 +4,24 @@ use crate::index::settings::{strip_unordered_prefix, IndexSettings};
 use crate::query::filter::FilterCompiler;
 use crate::query::parser::ShortQueryPlaceholder;
 use crate::types::{Filter, ScoredDocument, SearchResult};
-use std::collections::HashSet;
-use std::sync::Arc;
+use once_cell::sync::Lazy;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use tantivy::query::{BooleanQuery, BoostQuery, Occur, Query as TantivyQuery, TermQuery};
+use tantivy::collector::Collector;
+use tantivy::query::{
+    BooleanQuery, BoostQuery, EnableScoring, Occur, Query as TantivyQuery, TermQuery,
+};
 use tantivy::schema::IndexRecordOption;
-use tantivy::Searcher;
+use tantivy::{Executor, Searcher};
 
 /// Type alias: QueryExecutor stores settings as Arc to avoid cloning the
 /// full IndexSettings struct on every search (it can be 1+ KB).
 type SettingsRef = Option<Arc<IndexSettings>>;
 
+#[cfg(test)]
+mod bounded_tests;
 mod facets;
 mod metrics;
 #[cfg(test)]
@@ -32,6 +39,17 @@ pub use facets::FacetSearchParams;
 pub(crate) use metrics::capture_query_phase_reports;
 pub use metrics::{gather_query_phase_metric_families, QueryPhaseReport};
 use metrics::{QueryExecutionPath, QueryPhase, QueryPhaseCell, QueryPhaseGuard};
+
+// Benchmark seams re-exported crate-internally so the executor performance
+// harness in `crate::integ_tests::test_perf` measures the same frozen fixture,
+// frozen query families, and thread-count knob the parity and bounded suites
+// own — no second corpus, catalog, or env guard.
+#[cfg(test)]
+pub(crate) use bounded_tests::SearchThreadsEnvGuard;
+#[cfg(test)]
+pub(crate) use parity_fixtures::{build_parity_fixture, ExecutorParityFixture};
+#[cfg(test)]
+pub(crate) use parity_tests::{run_frozen_family, FrozenFamily};
 
 pub struct QueryExecutor {
     pub(crate) converter: Arc<DocumentConverter>,
@@ -350,6 +368,34 @@ impl QueryExecutor {
         Ok(documents)
     }
 
+    /// Run one collector expression against `searcher` on the bounded executor.
+    ///
+    /// This is the single production entry point for collector-based search.
+    /// Callers build their collector tuples exactly as they would for
+    /// `Searcher::search`; only the dispatch is centralized here, so executor
+    /// selection, pool reuse, and the in-flight budget have one owner.
+    ///
+    /// Any degraded resolution — a single-thread request, an unavailable pool,
+    /// or an exhausted budget — runs the identical collector on the caller's
+    /// own thread instead. Results therefore never depend on which path a
+    /// given search took; only latency does.
+    pub(in crate::query::executor) fn search_bounded<C: Collector>(
+        &self,
+        searcher: &Searcher,
+        query: &dyn TantivyQuery,
+        collector: &C,
+    ) -> Result<C::Fruit> {
+        match acquire_bounded_execution() {
+            Some(permit) => Ok(searcher.search_with_executor(
+                query,
+                collector,
+                permit.executor(),
+                enable_scoring_for(searcher, collector),
+            )?),
+            None => Ok(searcher.search(query, collector)?),
+        }
+    }
+
     /// Assemble scored documents and total hit count into a `SearchResult`.
     pub(crate) fn build_result(
         &self,
@@ -371,5 +417,258 @@ impl QueryExecutor {
             effective_around_lat_lng: None,
             effective_around_radius: None,
         }
+    }
+}
+
+/// Environment variable selecting how many Tantivy worker threads a single
+/// search may fan out across.
+///
+/// Resolution contract, owned by [`resolve_search_threads`]:
+/// - unset -> [`DEFAULT_SEARCH_THREADS`]
+/// - not a base-10 unsigned integer (empty, negative, fractional, overflowing)
+///   -> `1`
+/// - `0` -> `1`
+/// - `1` -> `Executor::single_thread()`, i.e. collection on the caller thread
+/// - `n > 1` -> the one cached `Executor::multi_thread(n, ..)` pool for `n`
+///
+/// Beyond resolution, execution falls back to `Executor::single_thread()`
+/// whenever the pool is unavailable or its in-flight budget is exhausted. A
+/// degraded executor never turns into a failed query, so this variable can only
+/// change latency, never results.
+const SEARCH_THREADS_ENV: &str = "FLAPJACK_SEARCH_THREADS";
+
+/// Worker-thread count used when [`SEARCH_THREADS_ENV`] is unset.
+///
+/// `1` keeps the default path byte-identical to the pre-bounded-executor
+/// engine. Stage 3's frozen-matrix benchmark found no reliable multithread win
+/// at the measured load level, so the production default remains single-threaded.
+/// Future measurements can change only this constant; no call site, resolver
+/// branch, or cache key depends on its value.
+const DEFAULT_SEARCH_THREADS: usize = 1;
+
+/// Concurrent multithread searches admitted per pool worker thread.
+///
+/// Beyond this ceiling a search collects single-threaded on its own caller
+/// thread rather than queueing behind the shared pool. That bounds pool
+/// oversubscription — and therefore tail latency — without ever rejecting a
+/// search.
+///
+/// `pub(crate)` so the executor benchmark can record the budget arm it measured
+/// as row provenance; the value stays owned here.
+pub(crate) const IN_FLIGHT_SEARCHES_PER_WORKER_THREAD: usize = 1;
+
+/// Thread-name prefix for pool workers, so bounded search threads are
+/// identifiable in stack dumps and profiles.
+const SEARCH_POOL_THREAD_PREFIX: &str = "flapjack-search-";
+
+/// Pool cache keyed only by resolved worker-thread count, so executor
+/// ownership has exactly one source of truth: at most one pool build is
+/// attempted per thread count for the lifetime of the process. Successful
+/// pools are shared by every index and query; unavailable counts stay on the
+/// single-thread path without retrying thread creation on every search.
+static SEARCH_POOLS: Lazy<RwLock<HashMap<usize, SearchPoolCacheEntry>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+enum SearchPoolCacheEntry {
+    Available(Arc<BoundedSearchPool>),
+    Unavailable,
+}
+
+impl SearchPoolCacheEntry {
+    fn pool(&self) -> Option<Arc<BoundedSearchPool>> {
+        match self {
+            SearchPoolCacheEntry::Available(pool) => Some(Arc::clone(pool)),
+            SearchPoolCacheEntry::Unavailable => None,
+        }
+    }
+}
+
+/// One process-global Tantivy thread pool paired with the in-flight budget that
+/// keeps concurrent searches from oversubscribing it.
+///
+/// The counters are always maintained rather than compiled out under `cfg(test)`
+/// so the budget path under test is the same code production runs; only the
+/// accessors that read them are test-only.
+struct BoundedSearchPool {
+    executor: Executor,
+    budget: usize,
+    in_flight: AtomicUsize,
+    in_flight_high_water: AtomicUsize,
+    multithread_executions: AtomicUsize,
+}
+
+impl BoundedSearchPool {
+    fn new(executor: Executor, thread_count: usize) -> Self {
+        BoundedSearchPool {
+            executor,
+            budget: thread_count.saturating_mul(IN_FLIGHT_SEARCHES_PER_WORKER_THREAD),
+            in_flight: AtomicUsize::new(0),
+            in_flight_high_water: AtomicUsize::new(0),
+            multithread_executions: AtomicUsize::new(0),
+        }
+    }
+
+    /// Reserve one in-flight slot, or return `None` when the budget is already
+    /// fully committed. The returned permit releases the slot on drop, so every
+    /// exit from a search — normal return, `?` propagation, or unwind — frees
+    /// it exactly once.
+    fn try_acquire(self: &Arc<Self>) -> Option<InFlightPermit> {
+        let mut observed = self.in_flight.load(AtomicOrdering::Acquire);
+        loop {
+            if observed >= self.budget {
+                return None;
+            }
+            match self.in_flight.compare_exchange_weak(
+                observed,
+                observed + 1,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.in_flight_high_water
+                        .fetch_max(observed + 1, AtomicOrdering::AcqRel);
+                    self.multithread_executions
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    return Some(InFlightPermit {
+                        pool: Arc::clone(self),
+                    });
+                }
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+}
+
+/// RAII reservation of one bounded multithread execution slot. Holding this
+/// permit is what makes a search eligible for the shared pool; dropping it
+/// returns the slot to the budget.
+struct InFlightPermit {
+    pool: Arc<BoundedSearchPool>,
+}
+
+impl InFlightPermit {
+    fn executor(&self) -> &Executor {
+        &self.pool.executor
+    }
+}
+
+impl Drop for InFlightPermit {
+    fn drop(&mut self) {
+        self.pool.in_flight.fetch_sub(1, AtomicOrdering::AcqRel);
+    }
+}
+
+/// Resolve the requested worker-thread count from [`SEARCH_THREADS_ENV`].
+/// See that constant's documentation for the full contract.
+fn resolve_search_threads() -> usize {
+    match std::env::var(SEARCH_THREADS_ENV) {
+        Ok(raw) => raw.trim().parse::<usize>().unwrap_or(1).max(1),
+        Err(_) => DEFAULT_SEARCH_THREADS,
+    }
+}
+
+/// Return the shared pool for `thread_count`, building it on first use.
+///
+/// `None` means the pool is unavailable — the worker threads could not be
+/// spawned, or the cache lock was poisoned by a panicking writer — and the
+/// caller must collect on its own thread instead.
+fn bounded_pool(thread_count: usize) -> Option<Arc<BoundedSearchPool>> {
+    bounded_pool_with(
+        thread_count,
+        |thread_count, thread_prefix| match Executor::multi_thread(thread_count, thread_prefix) {
+            Ok(executor) => Some(executor),
+            Err(error) => {
+                tracing::warn!(
+                    thread_count,
+                    error = %error,
+                    "bounded search pool unavailable; using caller-thread execution"
+                );
+                None
+            }
+        },
+    )
+}
+
+fn bounded_pool_with(
+    thread_count: usize,
+    create_executor: impl FnOnce(usize, &'static str) -> Option<Executor>,
+) -> Option<Arc<BoundedSearchPool>> {
+    if let Some(entry) = SEARCH_POOLS.read().ok()?.get(&thread_count) {
+        return entry.pool();
+    }
+    let mut pools = SEARCH_POOLS.write().ok()?;
+    // Another thread may have inserted between the read lock being released
+    // and the write lock being taken; reuse either its pool or its memoized
+    // unavailable state rather than attempting another build.
+    if let Some(entry) = pools.get(&thread_count) {
+        return entry.pool();
+    }
+    let entry = match create_executor(thread_count, SEARCH_POOL_THREAD_PREFIX) {
+        Some(executor) => SearchPoolCacheEntry::Available(Arc::new(BoundedSearchPool::new(
+            executor,
+            thread_count,
+        ))),
+        None => SearchPoolCacheEntry::Unavailable,
+    };
+    let pool = entry.pool();
+    pools.insert(thread_count, entry);
+    pool
+}
+
+/// Reserve bounded multithread execution for one search, or `None` when the
+/// caller should collect on its own thread. `None` covers every degraded
+/// resolution: a single-thread request, an unavailable pool, and an exhausted
+/// in-flight budget.
+fn acquire_bounded_execution() -> Option<InFlightPermit> {
+    let thread_count = resolve_search_threads();
+    if thread_count <= 1 {
+        return None;
+    }
+    bounded_pool(thread_count)?.try_acquire()
+}
+
+/// Mirror `Searcher::search`'s own scoring decision so a bounded search scores
+/// identically to the single-thread call it replaces.
+fn enable_scoring_for<'a, C: Collector>(
+    searcher: &'a Searcher,
+    collector: &C,
+) -> EnableScoring<'a> {
+    if collector.requires_scoring() {
+        EnableScoring::enabled_from_searcher(searcher)
+    } else {
+        EnableScoring::disabled_from_searcher(searcher)
+    }
+}
+
+/// Snapshot of one pool's budget accounting, used by tests to prove the
+/// in-flight ceiling holds and that the bounded path was actually taken.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoundedPoolCounters {
+    budget: usize,
+    in_flight: usize,
+    in_flight_high_water: usize,
+    multithread_executions: usize,
+}
+
+#[cfg(test)]
+impl BoundedSearchPool {
+    fn counters(&self) -> BoundedPoolCounters {
+        BoundedPoolCounters {
+            budget: self.budget,
+            in_flight: self.in_flight.load(AtomicOrdering::Acquire),
+            in_flight_high_water: self.in_flight_high_water.load(AtomicOrdering::Acquire),
+            multithread_executions: self.multithread_executions.load(AtomicOrdering::Acquire),
+        }
+    }
+
+    /// Clear the observation counters so one test's high-water reading cannot
+    /// be inflated by an earlier test sharing the same cached pool. The live
+    /// `in_flight` count is budget state, not an observation, so it is left
+    /// alone.
+    fn reset_counters(&self) {
+        self.in_flight_high_water.store(0, AtomicOrdering::Release);
+        self.multithread_executions
+            .store(0, AtomicOrdering::Release);
     }
 }

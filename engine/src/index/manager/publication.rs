@@ -214,7 +214,10 @@ fn committed_generation_journals(
     target: &PublicationTarget,
 ) -> Result<Vec<PublicationJournal>> {
     let root = base.join(PUBLICATION_DIR).join(target.as_str());
+    fsops::reject_symlinked_managed_path_components(base, &root, "publication generation evidence")
+        .map_err(|error| invalid_publication(error.to_string()))?;
     let mut journals = Vec::new();
+    let mut non_committed_journal_seen = false;
     let entries = std::fs::read_dir(&root).map_err(|error| {
         invalid_publication(format!(
             "missing current journal for target '{}': {error}",
@@ -241,12 +244,22 @@ fn committed_generation_journals(
             continue;
         }
         let journal_path = entry.path().join("journal.json");
-        let raw = std::fs::read_to_string(&journal_path).map_err(|error| {
-            invalid_publication(format!(
-                "missing current journal for target '{}': {error}",
-                target.as_str()
-            ))
-        })?;
+        fsops::reject_symlinked_managed_path_components(
+            base,
+            &journal_path,
+            "publication generation evidence",
+        )
+        .map_err(|error| invalid_publication(error.to_string()))?;
+        let raw = match std::fs::read_to_string(&journal_path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(invalid_publication(format!(
+                    "could not read current journal for target '{}': {error}",
+                    target.as_str()
+                )))
+            }
+        };
         let journal = PublicationJournal::from_json(&raw)?;
         if journal.target != *target {
             return Err(invalid_publication(format!(
@@ -259,11 +272,14 @@ fn committed_generation_journals(
         {
             journals.push(journal);
         } else {
-            return Err(invalid_publication(format!(
-                "current journal for target '{}' is not committed",
-                target.as_str()
-            )));
+            non_committed_journal_seen = true;
         }
+    }
+    if non_committed_journal_seen {
+        return Err(invalid_publication(format!(
+            "current journal for target '{}' is not committed",
+            target.as_str()
+        )));
     }
     Ok(journals)
 }

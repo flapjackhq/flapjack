@@ -77,7 +77,8 @@ impl QueryExecutor {
             .and_offset(offset)
             .order_by_score();
         let collect_started_at = std::time::Instant::now();
-        let (total, prelim_results) = searcher.search(query.as_ref(), &(Count, collector))?;
+        let (total, prelim_results) =
+            self.search_bounded(searcher, query.as_ref(), &(Count, collector))?;
         self.observe_phase(QueryPhase::Collect, collect_started_at);
         self.set_matched_docs(total);
         self.set_candidates_collected(prelim_results.len());
@@ -129,7 +130,8 @@ impl QueryExecutor {
             );
 
             let collect_started_at = std::time::Instant::now();
-            let (total, top_docs) = searcher.search(query.as_ref(), &(Count, collector))?;
+            let (total, top_docs) =
+                self.search_bounded(searcher, query.as_ref(), &(Count, collector))?;
             self.observe_phase(QueryPhase::Collect, collect_started_at);
             self.set_matched_docs(total);
             self.set_candidates_collected(top_docs.len());
@@ -195,7 +197,8 @@ impl QueryExecutor {
         );
 
         let collect_started_at = std::time::Instant::now();
-        let (total, top_docs) = searcher.search(query.as_ref(), &(Count, collector))?;
+        let (total, top_docs) =
+            self.search_bounded(searcher, query.as_ref(), &(Count, collector))?;
         self.observe_phase(QueryPhase::Collect, collect_started_at);
         self.set_matched_docs(total);
         self.set_candidates_collected(top_docs.len());
@@ -223,7 +226,8 @@ impl QueryExecutor {
         let fetch_limit = (limit + offset).saturating_mul(3).max(100);
         let collector = TopDocs::with_limit(fetch_limit).order_by_score();
         let collect_started_at = std::time::Instant::now();
-        let (total, prelim_results) = searcher.search(query.as_ref(), &(Count, collector))?;
+        let (total, prelim_results) =
+            self.search_bounded(searcher, query.as_ref(), &(Count, collector))?;
         self.observe_phase(QueryPhase::Collect, collect_started_at);
         self.set_matched_docs(total);
         self.set_candidates_collected(prelim_results.len());
@@ -286,10 +290,12 @@ impl QueryExecutor {
 
             let collect_started_at = std::time::Instant::now();
             let (total, top_docs, facets) = if let Some(fc) = facet_collector {
-                let (count, docs, f) = searcher.search(query.as_ref(), &(Count, collector, fc))?;
+                let (count, docs, f) =
+                    self.search_bounded(searcher, query.as_ref(), &(Count, collector, fc))?;
                 (count, docs, f)
             } else {
-                let (count, docs) = searcher.search(query.as_ref(), &(Count, collector))?;
+                let (count, docs) =
+                    self.search_bounded(searcher, query.as_ref(), &(Count, collector))?;
                 (count, docs, tantivy::collector::FacetCounts::default())
             };
             self.observe_phase(QueryPhase::Collect, collect_started_at);
@@ -348,10 +354,12 @@ impl QueryExecutor {
 
             let collect_started_at = std::time::Instant::now();
             let (total, top_docs, facets) = if let Some(fc) = facet_collector {
-                let (count, docs, f) = searcher.search(query.as_ref(), &(Count, collector, fc))?;
+                let (count, docs, f) =
+                    self.search_bounded(searcher, query.as_ref(), &(Count, collector, fc))?;
                 (count, docs, f)
             } else {
-                let (count, docs) = searcher.search(query.as_ref(), &(Count, collector))?;
+                let (count, docs) =
+                    self.search_bounded(searcher, query.as_ref(), &(Count, collector))?;
                 (count, docs, tantivy::collector::FacetCounts::default())
             };
             self.observe_phase(QueryPhase::Collect, collect_started_at);
@@ -377,10 +385,12 @@ impl QueryExecutor {
 
         let collect_started_at = std::time::Instant::now();
         let (total, prelim_results, facets) = if let Some(fc) = facet_collector {
-            let (count, docs, f) = searcher.search(query.as_ref(), &(Count, collector, fc))?;
+            let (count, docs, f) =
+                self.search_bounded(searcher, query.as_ref(), &(Count, collector, fc))?;
             (count, docs, f)
         } else {
-            let (count, docs) = searcher.search(query.as_ref(), &(Count, collector))?;
+            let (count, docs) =
+                self.search_bounded(searcher, query.as_ref(), &(Count, collector))?;
             (count, docs, tantivy::collector::FacetCounts::default())
         };
         self.observe_phase(QueryPhase::Collect, collect_started_at);

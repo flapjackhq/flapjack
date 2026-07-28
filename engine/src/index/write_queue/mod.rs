@@ -1,16 +1,34 @@
+//! Durable per-tenant write admission, batching, commit, and lifecycle ownership.
+//!
+//! Each tenant worker owns at most one live [`ManagedIndexWriter`](crate::index::ManagedIndexWriter)
+//! in its processing loop. The writer is opened lazily, reused across commits, and closed only
+//! through `writer_lifecycle`, which also owns memory-budget release and close telemetry. Segment
+//! and file-state reporting comes from `segment_observation`; commit/finalization code consumes
+//! that observer instead of maintaining a second view of Tantivy state.
 pub(crate) mod admission;
 #[cfg(test)]
 mod admission_tests;
+pub(crate) mod backpressure;
 mod finalization;
+pub(crate) mod segment_observation;
 mod vectors;
+mod writer_lifecycle;
 
+#[cfg(test)]
+pub(crate) use finalization::fail_next_commit_for_test;
 pub(crate) use finalization::PERSISTED_VECTORS_DIR;
 
 use crate::types::{DocFailure, Document, TaskInfo, TaskStatus};
 use admission::{reconcile_records, WriteAdmissionRecord, WriteAdmissionStore};
 use once_cell::sync::Lazy;
-use prometheus::{core::Collector, proto::MetricFamily, HistogramOpts, HistogramVec};
+use prometheus::{
+    core::Collector, proto::MetricFamily, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec,
+    Opts,
+};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -27,18 +45,53 @@ const DEFAULT_WRITE_QUEUE_BATCH_SIZE: usize = 32;
 const WRITE_QUEUE_BATCH_SIZE_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_BATCH_SIZE";
 const DEFAULT_WRITER_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITER_ACQUIRE_TIMEOUT_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_MS";
+const WRITE_QUEUE_MIN_MERGE_SEGMENTS_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_MIN_MERGE_SEGMENTS";
+const WRITE_QUEUE_MAX_DOCS_BEFORE_MERGE_ENV_VAR: &str =
+    "FLAPJACK_WRITE_QUEUE_MAX_DOCS_BEFORE_MERGE";
 const WRITE_QUEUE_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_WRITE_QUEUE_CHANNEL_CAPACITY: usize = 512;
 const WRITE_QUEUE_CHANNEL_CAPACITY_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_CHANNEL_CAPACITY";
 const WRITE_QUEUE_START_DELAY_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_START_DELAY_MS";
+pub(crate) const SELECTED_MERGE_POLICY_MIN_NUM_SEGMENTS: usize = 8;
+pub(crate) const SELECTED_MERGE_POLICY_MAX_DOCS_BEFORE_MERGE: usize = 10_000_000;
+pub(crate) const SELECTED_MERGE_POLICY_SETTLED_SEGMENT_BAND: (usize, usize) = (2, 4);
 const WRITE_QUEUE_PHASE_METRIC_NAME: &str = "flapjack_write_queue_phase_seconds";
 const WRITE_QUEUE_PHASE_METRIC_HELP: &str = "Write queue phase execution time in seconds";
+const WRITE_QUEUE_WRITER_OPENS_METRIC_NAME: &str = "flapjack_write_queue_writer_opens_total";
+const WRITE_QUEUE_COMMITS_METRIC_NAME: &str = "flapjack_write_queue_commits_total";
+const WRITE_QUEUE_WRITER_CLOSES_METRIC_NAME: &str = "flapjack_write_queue_writer_closes_total";
+const WRITE_QUEUE_LIVE_SEGMENTS_METRIC_NAME: &str = "flapjack_write_queue_live_segments";
+const WRITE_QUEUE_LIVE_DOCS_METRIC_NAME: &str = "flapjack_write_queue_live_docs";
+const WRITE_QUEUE_DOCUMENTS_PER_SEGMENT_METRIC_NAME: &str =
+    "flapjack_write_queue_documents_per_segment";
+const WRITE_QUEUE_INDEX_FILES_METRIC_NAME: &str = "flapjack_write_queue_index_files";
+const WRITE_QUEUE_INDEX_BYTES_METRIC_NAME: &str = "flapjack_write_queue_index_bytes";
+const WRITE_QUEUE_ORPHAN_FILE_SETS_METRIC_NAME: &str = "flapjack_write_queue_orphan_file_sets";
+const WRITE_QUEUE_WRITER_LIFETIME_METRIC_NAME: &str =
+    "flapjack_write_queue_writer_lifetime_seconds";
+const WRITE_QUEUE_WRITER_MERGE_WAIT_METRIC_NAME: &str =
+    "flapjack_write_queue_writer_merge_wait_seconds";
+const WRITE_QUEUE_GC_REMOVED_FILES_METRIC_NAME: &str =
+    "flapjack_write_queue_gc_removed_files_total";
+const WRITE_QUEUE_SETTLED_INDEX_BYTES_METRIC_NAME: &str =
+    "flapjack_write_queue_settled_index_bytes";
 
 const PHASE_PROCESS_WRITES: &str = "process_writes";
 const PHASE_FLUSH_PENDING_BATCH: &str = "flush_pending_batch";
 const PHASE_COMMIT_BATCH: &str = "commit_batch";
 pub(super) const PHASE_COMMIT_WRITER_WITH_PANIC_GUARD: &str = "commit_writer_with_panic_guard";
 pub(super) const PHASE_FINALIZE_COMMITTED_BATCH: &str = "finalize_committed_batch";
+const PHASE_DOCUMENT_CONVERSION: &str = "document_conversion";
+const PHASE_DELETE_STAGING: &str = "delete_staging";
+const PHASE_ADD_STAGING: &str = "add_staging";
+pub(super) const PHASE_WRITER_COMMIT: &str = "writer_commit";
+pub(super) const PHASE_READER_RELOAD: &str = "reader_reload";
+pub(super) const PHASE_METADATA_PERSISTENCE: &str = "metadata_persistence";
+pub(super) const PHASE_LWW_UPDATE: &str = "lww_update";
+pub(super) const PHASE_OPLOG_APPEND: &str = "oplog_append";
+pub(super) const PHASE_OPLOG_COMMIT_STATE_PERSISTENCE: &str = "oplog_commit_state_persistence";
+#[cfg(feature = "vector-search")]
+pub(super) const PHASE_VECTOR_SAVE: &str = "vector_save";
 
 static WRITE_QUEUE_PHASE_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     let histogram = HistogramVec::new(
@@ -52,16 +105,312 @@ static WRITE_QUEUE_PHASE_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
         PHASE_COMMIT_BATCH,
         PHASE_COMMIT_WRITER_WITH_PANIC_GUARD,
         PHASE_FINALIZE_COMMITTED_BATCH,
+        PHASE_DOCUMENT_CONVERSION,
+        PHASE_DELETE_STAGING,
+        PHASE_ADD_STAGING,
+        PHASE_WRITER_COMMIT,
+        PHASE_READER_RELOAD,
+        PHASE_METADATA_PERSISTENCE,
+        PHASE_LWW_UPDATE,
+        PHASE_OPLOG_APPEND,
+        PHASE_OPLOG_COMMIT_STATE_PERSISTENCE,
+        #[cfg(feature = "vector-search")]
+        PHASE_VECTOR_SAVE,
     ] {
         histogram.with_label_values(&[phase]);
     }
     histogram
 });
 
+static WRITE_QUEUE_WRITER_OPENS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            WRITE_QUEUE_WRITER_OPENS_METRIC_NAME,
+            "Total write queue writer opens by tenant",
+        ),
+        &["tenant"],
+    )
+    .expect("write queue writer-open counter should be constructible")
+});
+
+static WRITE_QUEUE_COMMITS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            WRITE_QUEUE_COMMITS_METRIC_NAME,
+            "Total successful write queue commits by tenant",
+        ),
+        &["tenant"],
+    )
+    .expect("write queue commit counter should be constructible")
+});
+
+static WRITE_QUEUE_WRITER_CLOSES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            WRITE_QUEUE_WRITER_CLOSES_METRIC_NAME,
+            "Total write queue writer closes by tenant and reason",
+        ),
+        &["tenant", "reason"],
+    )
+    .expect("write queue writer-close counter should be constructible")
+});
+
+static WRITE_QUEUE_LIVE_SEGMENTS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            WRITE_QUEUE_LIVE_SEGMENTS_METRIC_NAME,
+            "Current live searchable segments by tenant",
+        ),
+        &["tenant"],
+    )
+    .expect("write queue live-segment gauge should be constructible")
+});
+
+static WRITE_QUEUE_LIVE_DOCS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            WRITE_QUEUE_LIVE_DOCS_METRIC_NAME,
+            "Current live searchable documents by tenant",
+        ),
+        &["tenant"],
+    )
+    .expect("write queue live-doc gauge should be constructible")
+});
+
+static WRITE_QUEUE_DOCUMENTS_PER_SEGMENT: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            WRITE_QUEUE_DOCUMENTS_PER_SEGMENT_METRIC_NAME,
+            "Current live searchable documents by tenant and segment",
+        ),
+        &["tenant", "segment"],
+    )
+    .expect("write queue documents-per-segment gauge should be constructible")
+});
+
+static WRITE_QUEUE_INDEX_FILES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            WRITE_QUEUE_INDEX_FILES_METRIC_NAME,
+            "Current managed index file count by tenant",
+        ),
+        &["tenant"],
+    )
+    .expect("write queue index-file gauge should be constructible")
+});
+
+static WRITE_QUEUE_INDEX_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            WRITE_QUEUE_INDEX_BYTES_METRIC_NAME,
+            "Current index directory bytes by tenant",
+        ),
+        &["tenant"],
+    )
+    .expect("write queue index-byte gauge should be constructible")
+});
+
+static WRITE_QUEUE_ORPHAN_FILE_SETS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            WRITE_QUEUE_ORPHAN_FILE_SETS_METRIC_NAME,
+            "Current stale or orphan segment file-set count by tenant",
+        ),
+        &["tenant"],
+    )
+    .expect("write queue orphan-file-set gauge should be constructible")
+});
+
+static WRITE_QUEUE_WRITER_LIFETIME_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    HistogramVec::new(
+        HistogramOpts::new(
+            WRITE_QUEUE_WRITER_LIFETIME_METRIC_NAME,
+            "Write queue writer lifetime in seconds by tenant",
+        ),
+        &["tenant"],
+    )
+    .expect("write queue writer-lifetime histogram should be constructible")
+});
+
+static WRITE_QUEUE_WRITER_MERGE_WAIT_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    HistogramVec::new(
+        HistogramOpts::new(
+            WRITE_QUEUE_WRITER_MERGE_WAIT_METRIC_NAME,
+            "Write queue writer close merge wait in seconds by tenant and close reason",
+        ),
+        &["tenant", "reason"],
+    )
+    .expect("write queue writer-merge-wait histogram should be constructible")
+});
+
+static WRITE_QUEUE_GC_REMOVED_FILES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            WRITE_QUEUE_GC_REMOVED_FILES_METRIC_NAME,
+            "Total index files removed by write-queue garbage collection",
+        ),
+        &["tenant"],
+    )
+    .expect("write queue gc-removed-files counter should be constructible")
+});
+
+static WRITE_QUEUE_SETTLED_INDEX_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            WRITE_QUEUE_SETTLED_INDEX_BYTES_METRIC_NAME,
+            "Index bytes after write-queue compaction and cleanup by tenant",
+        ),
+        &["tenant"],
+    )
+    .expect("write queue settled-index-byte gauge should be constructible")
+});
+
+static WRITE_QUEUE_SEGMENT_LABELS_BY_TENANT: Lazy<dashmap::DashMap<String, BTreeSet<String>>> =
+    Lazy::new(dashmap::DashMap::new);
+
+#[cfg(test)]
+struct WriteQueuePhaseCapture {
+    phase: String,
+    count: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static WRITE_QUEUE_PHASE_CAPTURE: RefCell<Option<WriteQueuePhaseCapture>> =
+        const { RefCell::new(None) };
+}
+
 pub(super) fn observe_write_queue_phase(phase: &str, started_at: Instant) {
     WRITE_QUEUE_PHASE_SECONDS
         .with_label_values(&[phase])
         .observe(started_at.elapsed().as_secs_f64());
+    #[cfg(test)]
+    record_write_queue_phase_for_test(phase);
+}
+
+#[cfg(test)]
+fn record_write_queue_phase_for_test(phase: &str) {
+    WRITE_QUEUE_PHASE_CAPTURE.with(|capture| {
+        let mut capture = capture.borrow_mut();
+        let Some(capture) = capture.as_mut() else {
+            return;
+        };
+        if capture.phase == phase {
+            capture.count += 1;
+        }
+    });
+}
+
+#[cfg(test)]
+fn count_write_queue_phase_observations_for_test<T>(
+    phase: &str,
+    test_body: impl FnOnce() -> T,
+) -> (T, u64) {
+    WRITE_QUEUE_PHASE_CAPTURE.with(|capture| {
+        let previous = capture.replace(Some(WriteQueuePhaseCapture {
+            phase: phase.to_string(),
+            count: 0,
+        }));
+        let result = test_body();
+        let active_capture = capture
+            .replace(previous)
+            .expect("phase capture should be installed for test body");
+        (result, active_capture.count)
+    })
+}
+
+fn observe_write_queue_writer_opened(tenant_id: &str) {
+    WRITE_QUEUE_WRITER_OPENS_TOTAL
+        .with_label_values(&[tenant_id])
+        .inc();
+}
+
+pub(super) fn observe_write_queue_commit_succeeded(tenant_id: &str) {
+    WRITE_QUEUE_COMMITS_TOTAL
+        .with_label_values(&[tenant_id])
+        .inc();
+}
+
+pub(super) fn observe_write_queue_writer_lifetime(tenant_id: &str, lifetime: Duration) {
+    WRITE_QUEUE_WRITER_LIFETIME_SECONDS
+        .with_label_values(&[tenant_id])
+        .observe(lifetime.as_secs_f64());
+}
+
+pub(super) fn observe_write_queue_writer_merge_wait(
+    tenant_id: &str,
+    reason: &str,
+    merge_wait: Duration,
+) {
+    WRITE_QUEUE_WRITER_MERGE_WAIT_SECONDS
+        .with_label_values(&[tenant_id, reason])
+        .observe(merge_wait.as_secs_f64());
+}
+
+pub(super) fn observe_write_queue_segment_health(
+    tenant_id: &str,
+    observation: &segment_observation::SegmentObservation,
+) {
+    WRITE_QUEUE_LIVE_SEGMENTS
+        .with_label_values(&[tenant_id])
+        .set(observation.live_segment_count as i64);
+    WRITE_QUEUE_LIVE_DOCS
+        .with_label_values(&[tenant_id])
+        .set(observation.live_docs as i64);
+    WRITE_QUEUE_INDEX_FILES
+        .with_label_values(&[tenant_id])
+        .set(observation.managed_index_file_count as i64);
+    WRITE_QUEUE_INDEX_BYTES
+        .with_label_values(&[tenant_id])
+        .set(observation.index_bytes as i64);
+    WRITE_QUEUE_ORPHAN_FILE_SETS
+        .with_label_values(&[tenant_id])
+        .set(observation.orphan_file_set_ids.len() as i64);
+    replace_documents_per_segment_labels(tenant_id, &observation.per_segment_doc_counts);
+}
+
+pub(super) fn observe_write_queue_gc_removed_files(tenant_id: &str, removed_file_count: u64) {
+    WRITE_QUEUE_GC_REMOVED_FILES_TOTAL
+        .with_label_values(&[tenant_id])
+        .inc_by(removed_file_count);
+}
+
+pub(super) fn observe_write_queue_settled_index_bytes(
+    tenant_id: &str,
+    observation: &segment_observation::SegmentObservation,
+) {
+    WRITE_QUEUE_SETTLED_INDEX_BYTES
+        .with_label_values(&[tenant_id])
+        .set(observation.index_bytes as i64);
+}
+
+fn observe_write_queue_writer_closed(tenant_id: &str, reason: &str) {
+    WRITE_QUEUE_WRITER_CLOSES_TOTAL
+        .with_label_values(&[tenant_id, reason])
+        .inc();
+}
+
+fn replace_documents_per_segment_labels(
+    tenant_id: &str,
+    per_segment_doc_counts: &std::collections::BTreeMap<String, u64>,
+) {
+    if let Some((_, old_segment_ids)) =
+        WRITE_QUEUE_SEGMENT_LABELS_BY_TENANT.remove(&tenant_id.to_string())
+    {
+        for segment_id in old_segment_ids {
+            let label_values = [tenant_id, segment_id.as_str()];
+            let _ = WRITE_QUEUE_DOCUMENTS_PER_SEGMENT.remove_label_values(&label_values);
+        }
+    }
+
+    let mut segment_ids = BTreeSet::new();
+    for (segment_id, doc_count) in per_segment_doc_counts {
+        WRITE_QUEUE_DOCUMENTS_PER_SEGMENT
+            .with_label_values(&[tenant_id, segment_id])
+            .set(*doc_count as i64);
+        segment_ids.insert(segment_id.clone());
+    }
+    WRITE_QUEUE_SEGMENT_LABELS_BY_TENANT.insert(tenant_id.to_string(), segment_ids);
 }
 
 fn write_queue_batch_size() -> usize {
@@ -163,9 +512,25 @@ fn write_queue_start_delay() -> Option<Duration> {
 }
 
 pub fn gather_write_queue_phase_metric_families() -> Vec<MetricFamily> {
-    WRITE_QUEUE_PHASE_SECONDS
-        .collect()
+    let collectors: [&dyn Collector; 14] = [
+        &*WRITE_QUEUE_PHASE_SECONDS,
+        &*WRITE_QUEUE_WRITER_OPENS_TOTAL,
+        &*WRITE_QUEUE_COMMITS_TOTAL,
+        &*WRITE_QUEUE_WRITER_CLOSES_TOTAL,
+        &*WRITE_QUEUE_LIVE_SEGMENTS,
+        &*WRITE_QUEUE_LIVE_DOCS,
+        &*WRITE_QUEUE_DOCUMENTS_PER_SEGMENT,
+        &*WRITE_QUEUE_INDEX_FILES,
+        &*WRITE_QUEUE_INDEX_BYTES,
+        &*WRITE_QUEUE_ORPHAN_FILE_SETS,
+        &*WRITE_QUEUE_WRITER_LIFETIME_SECONDS,
+        &*WRITE_QUEUE_WRITER_MERGE_WAIT_SECONDS,
+        &*WRITE_QUEUE_GC_REMOVED_FILES_TOTAL,
+        &*WRITE_QUEUE_SETTLED_INDEX_BYTES,
+    ];
+    collectors
         .into_iter()
+        .flat_map(Collector::collect)
         .filter(|family| !family.get_metric().is_empty())
         .collect()
 }
@@ -200,8 +565,6 @@ impl VectorWriteContext {
 pub(crate) struct WriteQueueContext {
     pub tenant_id: String,
     pub index: Arc<crate::index::Index>,
-    pub _writers:
-        Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<crate::index::ManagedIndexWriter>>>>,
     pub tasks: Arc<dashmap::DashMap<String, TaskInfo>>,
     pub base_path: std::path::PathBuf,
     pub oplog: Option<Arc<crate::index::oplog::OpLog>>,
@@ -209,6 +572,18 @@ pub(crate) struct WriteQueueContext {
     pub facet_cache: super::FacetCacheMap,
     pub lww_map: super::LwwMap,
     pub vector_ctx: VectorWriteContext,
+    pub queue_metrics_id: u64,
+    #[cfg(test)]
+    pub test_overrides: WriteQueueTestOverrides,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct WriteQueueTestOverrides {
+    pub batch_size: Option<usize>,
+    pub min_merge_segments: Option<usize>,
+    pub max_docs_before_merge: Option<usize>,
+    pub writer_idle_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,7 +699,6 @@ struct WriteFinalizationContext<'a> {
 ///
 /// * `tenant_id` - Tenant identifier used for logging, path resolution, and LWW map keying.
 /// * `index` - Shared Tantivy index to write documents into.
-/// * `writers` - Global writer registry (currently unused; writer is acquired per batch).
 /// * `tasks` - Shared task-status map updated as operations are processed.
 /// * `base_path` - Root data directory; tenant subdirectories contain settings, oplog, and vector files.
 /// * `oplog` - Optional operation log for durable write-ahead recording.
@@ -336,12 +710,16 @@ struct WriteFinalizationContext<'a> {
 ///
 /// A `(WriteQueue, JoinHandle)` tuple: the channel sender for submitting `WriteOp`s and the spawned task handle.
 pub(crate) fn create_write_queue(
-    ctx: WriteQueueContext,
+    mut ctx: WriteQueueContext,
 ) -> crate::error::Result<(
     WriteQueue,
     tokio::task::JoinHandle<crate::error::Result<()>>,
 )> {
     let (tx, rx) = mpsc::channel(write_queue_channel_capacity());
+    // This guard spans startup replay and the steady-state worker so every
+    // exit path retires any per-tenant metric series it created.
+    let tenant_metrics = writer_lifecycle::WriteQueueTenantMetrics::for_queue(&ctx.tenant_id);
+    ctx.queue_metrics_id = tenant_metrics.queue_metrics_id();
 
     if let Some(ref ol) = ctx.oplog {
         tracing::info!(
@@ -366,7 +744,10 @@ pub(crate) fn create_write_queue(
     }
     run_replay_startup(&ctx, replay_records)?;
 
-    let handle = tokio::spawn(async move { process_writes(ctx, rx, Vec::new()).await });
+    let handle = tokio::spawn(async move {
+        let _tenant_metrics = tenant_metrics;
+        process_writes(ctx, rx, Vec::new()).await
+    });
 
     Ok((tx, handle))
 }
@@ -393,13 +774,29 @@ fn run_replay_startup(
             .and_then(|runtime| {
                 runtime.block_on(async move {
                     let mut pending = Vec::new();
-                    let resolved_batch_size = write_queue_batch_size();
-                    replay_admitted_writes(&ctx, &mut pending, replay_records, resolved_batch_size)
+                    // Replay runs to completion before the steady-state worker
+                    // is spawned, so this short-lived writer cannot coexist
+                    // with the tenant worker's persistent writer.
+                    let mut writer = None;
+                    let resolved_batch_size = resolved_write_queue_batch_size(&ctx);
+                    let replay_result: crate::error::Result<()> = async {
+                        replay_admitted_writes(
+                            &ctx,
+                            &mut writer,
+                            &mut pending,
+                            replay_records,
+                            resolved_batch_size,
+                        )
                         .await?;
-                    if !pending.is_empty() {
-                        flush_pending_batch(&ctx, &mut pending).await?;
+                        if !pending.is_empty() {
+                            flush_pending_batch(&ctx, &mut writer, &mut pending).await?;
+                        }
+                        Ok(())
                     }
-                    Ok(())
+                    .await;
+                    let close_result =
+                        writer_lifecycle::close_startup_replay_writer(&ctx, &mut writer);
+                    replay_result.and(close_result)
                 })
             });
         let _ = result_tx.send(result);
@@ -416,11 +813,66 @@ fn run_replay_startup(
     result
 }
 
-fn configure_merge_policy(writer: &mut crate::index::ManagedIndexWriter) {
-    // Reclaim disk space steadily when many tombstones accumulate.
+fn configure_merge_policy(_ctx: &WriteQueueContext, writer: &mut crate::index::ManagedIndexWriter) {
+    // Stage 5 selected Tantivy 0.26.1 LogMergePolicy defaults on 2026-07-27:
+    // min_num_segments=8, max_docs_before_merge=10_000_000, del_docs_ratio=0.3.
+    // The ordered matrix's first passing candidate was the default row: 128
+    // one-doc writes settled from 599497 bytes/128 segments to 140723 bytes/2
+    // segments, and the larger 256-doc rerun settled from 1198051 bytes/256
+    // segments to 263020 bytes/4 segments, both with exact query parity and no
+    // settled orphan file sets. Later override rows also passed but were not
+    // first in the fixed order.
     let mut merge_policy = tantivy::merge_policy::LogMergePolicy::default();
+    merge_policy.set_min_num_segments(SELECTED_MERGE_POLICY_MIN_NUM_SEGMENTS);
+    merge_policy.set_max_docs_before_merge(SELECTED_MERGE_POLICY_MAX_DOCS_BEFORE_MERGE);
     merge_policy.set_del_docs_ratio_before_merge(0.3);
+    apply_usize_merge_policy_override(
+        &mut merge_policy,
+        #[cfg(test)]
+        _ctx.test_overrides.min_merge_segments,
+        WRITE_QUEUE_MIN_MERGE_SEGMENTS_ENV_VAR,
+        "minimum merge segment count",
+        tantivy::merge_policy::LogMergePolicy::set_min_num_segments,
+    );
+    apply_usize_merge_policy_override(
+        &mut merge_policy,
+        #[cfg(test)]
+        _ctx.test_overrides.max_docs_before_merge,
+        WRITE_QUEUE_MAX_DOCS_BEFORE_MERGE_ENV_VAR,
+        "maximum docs before merge",
+        tantivy::merge_policy::LogMergePolicy::set_max_docs_before_merge,
+    );
+    // Stage 5 will select production policy values from measured evidence; the
+    // Stage 2 env overrides exist only to make lifecycle behavior observable.
     writer.set_merge_policy(Box::new(merge_policy));
+}
+
+fn apply_usize_merge_policy_override(
+    merge_policy: &mut tantivy::merge_policy::LogMergePolicy,
+    #[cfg(test)] test_override: Option<usize>,
+    env_var: &str,
+    description: &str,
+    apply: fn(&mut tantivy::merge_policy::LogMergePolicy, usize),
+) {
+    #[cfg(test)]
+    if let Some(parsed) = test_override {
+        apply(merge_policy, parsed);
+        return;
+    }
+
+    if let Ok(raw_value) = std::env::var(env_var) {
+        match raw_value.parse::<usize>() {
+            Ok(parsed) if parsed > 0 => apply(merge_policy, parsed),
+            Ok(_) => {
+                tracing::warn!("{env_var} must be greater than 0; ignoring {description} override");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "failed to parse {env_var}='{raw_value}' as usize: {error}; ignoring {description} override"
+                );
+            }
+        }
+    }
 }
 
 /// Try to acquire a writer slot, retrying on contention for up to 30 seconds.
@@ -435,13 +887,15 @@ async fn acquire_writer_for_queue(
     let acquire_timeout = writer_acquire_timeout();
     let deadline = Instant::now() + acquire_timeout;
     let mut retries = 0usize;
+    let mut writer_waiter = None;
     loop {
         match index.writer() {
-            Ok(mut writer) => {
-                configure_merge_policy(&mut writer);
+            Ok(writer) => {
+                observe_write_queue_writer_opened(tenant_id);
                 return Ok(writer);
             }
             Err(crate::error::FlapjackError::TooManyConcurrentWrites { current, max }) => {
+                writer_waiter.get_or_insert_with(|| index.memory_budget().register_writer_waiter());
                 retries += 1;
                 if Instant::now() >= deadline {
                     tracing::error!(
@@ -486,6 +940,7 @@ async fn acquire_writer_for_queue(
 /// Returns an error if the writer slot cannot be acquired within the retry deadline or if the batch commit fails.
 async fn flush_pending_batch(
     ctx: &WriteQueueContext,
+    writer: &mut Option<crate::index::ManagedIndexWriter>,
     pending: &mut Vec<WriteOp>,
 ) -> crate::error::Result<()> {
     let phase_start = Instant::now();
@@ -493,20 +948,41 @@ async fn flush_pending_batch(
         observe_write_queue_phase(PHASE_FLUSH_PENDING_BATCH, phase_start);
         return Ok(());
     }
-    let index = &ctx.index;
-    let tenant_id = &ctx.tenant_id;
-    let mut writer = match acquire_writer_for_queue(index, tenant_id).await {
-        Ok(writer) => writer,
+    let result = {
+        let active_writer = match writer_lifecycle::writer_for_queue(ctx, writer).await {
+            Ok(active_writer) => active_writer,
+            Err(error) => {
+                let pending_task_ids = pending
+                    .iter()
+                    .map(|op| op.task_id.clone())
+                    .collect::<Vec<_>>();
+                finalization::mark_tasks_failed(&ctx.tasks, &pending_task_ids, &error);
+                return Err(error);
+            }
+        };
+        commit_batch(ctx, pending, active_writer).await
+    };
+    let result = match result {
+        Ok(()) => {
+            backpressure::sample_after_worker_event(ctx);
+            // A successful commit is a safe yield boundary: Tantivy has accepted
+            // the batch, and merge quiescence preserves its background merge owner
+            // before a real waiter receives the global writer permit.
+            writer_lifecycle::yield_writer_to_waiter_after_merge_quiescence(ctx, writer)
+        }
         Err(error) => {
-            let pending_task_ids = pending
-                .iter()
-                .map(|op| op.task_id.clone())
-                .collect::<Vec<_>>();
-            finalization::mark_tasks_failed(&ctx.tasks, &pending_task_ids, &error);
-            return Err(error);
+            if let Err(close_error) =
+                writer_lifecycle::close_writer_after_commit_failure(ctx, writer)
+            {
+                tracing::error!(
+                    "[WQ {}] failed to quiesce writer after commit error: {}",
+                    ctx.tenant_id,
+                    close_error
+                );
+            }
+            Err(error)
         }
     };
-    let result = commit_batch(ctx, pending, &mut writer).await;
     observe_write_queue_phase(PHASE_FLUSH_PENDING_BATCH, phase_start);
     result
 }
@@ -527,33 +1003,68 @@ async fn process_writes(
 ) -> crate::error::Result<()> {
     let phase_start = Instant::now();
     let tenant_id = &ctx.tenant_id;
-    let resolved_batch_size = write_queue_batch_size();
+    let resolved_batch_size = resolved_write_queue_batch_size(&ctx);
     log_write_queue_start(tenant_id, resolved_batch_size);
     apply_write_queue_start_delay(tenant_id).await;
     let mut pending = Vec::new();
+    // The writer slot starts empty so queues that never receive writes do not
+    // consume memory budget. Active commits reuse one writer while uncontended;
+    // safe post-commit boundaries yield its global slot to a real waiter.
+    let mut writer = None;
     let mut deadline = reset_write_queue_deadline();
-    replay_and_flush_admitted_writes(&ctx, &mut pending, replay_records, resolved_batch_size)
-        .await?;
+    replay_and_flush_admitted_writes(
+        &ctx,
+        &mut writer,
+        &mut pending,
+        replay_records,
+        resolved_batch_size,
+    )
+    .await?;
+    let mut writer_idle_since = writer.as_ref().map(|_| Instant::now());
 
     loop {
         log_write_queue_state(tenant_id, pending.len(), deadline);
         match next_write_queue_event(deadline, &mut rx).await {
             WriteQueueEvent::Received(op) => {
-                if handle_received_write_op(&ctx, &mut pending, op, resolved_batch_size).await? {
+                if handle_received_write_op(
+                    &ctx,
+                    &mut writer,
+                    &mut pending,
+                    op,
+                    resolved_batch_size,
+                )
+                .await?
+                {
                     deadline = reset_write_queue_deadline();
+                    writer_idle_since = writer.as_ref().map(|_| Instant::now());
                 }
             }
             WriteQueueEvent::ChannelClosed => {
-                flush_pending_on_channel_close(&ctx, &mut pending).await?;
+                writer_lifecycle::drain_writer_on_channel_close(&ctx, &mut writer, &mut pending)
+                    .await?;
                 break;
             }
             WriteQueueEvent::DeadlineElapsed => {
-                deadline = handle_write_queue_timeout(&ctx, &mut pending).await?;
+                deadline = handle_write_queue_timeout(
+                    &ctx,
+                    &mut writer,
+                    &mut pending,
+                    &mut writer_idle_since,
+                )
+                .await?;
             }
         }
     }
     observe_write_queue_phase(PHASE_PROCESS_WRITES, phase_start);
     Ok(())
+}
+
+fn resolved_write_queue_batch_size(_ctx: &WriteQueueContext) -> usize {
+    #[cfg(test)]
+    if let Some(batch_size) = _ctx.test_overrides.batch_size {
+        return batch_size;
+    }
+    write_queue_batch_size()
 }
 
 fn log_write_queue_start(tenant_id: &str, resolved_batch_size: usize) {
@@ -579,25 +1090,28 @@ async fn apply_write_queue_start_delay(tenant_id: &str) {
 
 async fn replay_and_flush_admitted_writes(
     ctx: &WriteQueueContext,
+    writer: &mut Option<crate::index::ManagedIndexWriter>,
     pending: &mut Vec<WriteOp>,
     replay_records: Vec<WriteAdmissionRecord>,
     resolved_batch_size: usize,
 ) -> crate::error::Result<()> {
-    replay_admitted_writes(ctx, pending, replay_records, resolved_batch_size).await?;
+    replay_admitted_writes(ctx, writer, pending, replay_records, resolved_batch_size).await?;
     if !pending.is_empty() {
-        flush_pending_batch(ctx, pending).await?;
+        flush_pending_batch(ctx, writer, pending).await?;
     }
     Ok(())
 }
 
 async fn replay_admitted_writes(
     ctx: &WriteQueueContext,
+    writer: &mut Option<crate::index::ManagedIndexWriter>,
     pending: &mut Vec<WriteOp>,
     replay_records: Vec<WriteAdmissionRecord>,
     resolved_batch_size: usize,
 ) -> crate::error::Result<()> {
     for record in replay_records {
-        handle_received_write_op(ctx, pending, record.write_op(), resolved_batch_size).await?;
+        handle_received_write_op(ctx, writer, pending, record.write_op(), resolved_batch_size)
+            .await?;
     }
     Ok(())
 }
@@ -645,6 +1159,7 @@ async fn next_write_queue_event(
 /// Returns `true` when a flush occurred and the deadline should be reset.
 async fn handle_received_write_op(
     ctx: &WriteQueueContext,
+    writer: &mut Option<crate::index::ManagedIndexWriter>,
     pending: &mut Vec<WriteOp>,
     op: WriteOp,
     resolved_batch_size: usize,
@@ -661,15 +1176,11 @@ async fn handle_received_write_op(
     );
 
     if is_compact {
-        flush_pending_batch(ctx, pending).await?;
-        let mut writer = acquire_writer_for_queue(&ctx.index, tenant_id).await?;
-        finalization::compact_segments(
-            &ctx.index,
-            &ctx.tasks,
-            &op.task_id,
-            &mut writer,
-            tenant_id,
-        )?;
+        flush_pending_batch(ctx, writer, pending).await?;
+        let writer = writer_lifecycle::writer_for_queue(ctx, writer).await?;
+        // Compact reuses the tenant worker writer so background merge
+        // ownership stays single-source instead of racing a second writer.
+        finalization::compact_segments(&ctx.index, &ctx.tasks, &op.task_id, writer, tenant_id)?;
         if let Err(error) = ctx.admission_store.remove_task(&op.task_id) {
             finalization::mark_tasks_failed(&ctx.tasks, std::slice::from_ref(&op.task_id), &error);
             return Err(error);
@@ -688,7 +1199,7 @@ async fn handle_received_write_op(
         tenant_id,
         pending.len()
     );
-    flush_pending_batch(ctx, pending).await?;
+    flush_pending_batch(ctx, writer, pending).await?;
     Ok(true)
 }
 
@@ -696,33 +1207,30 @@ fn should_flush_pending_batch(pending_len: usize, resolved_batch_size: usize) ->
     pending_len >= resolved_batch_size
 }
 
-async fn flush_pending_on_channel_close(
-    ctx: &WriteQueueContext,
-    pending: &mut Vec<WriteOp>,
-) -> crate::error::Result<()> {
-    if pending.is_empty() {
-        return Ok(());
-    }
-
-    tracing::info!(
-        "[WQ {}] channel closed, flushing {} pending",
-        ctx.tenant_id,
-        pending.len()
-    );
-    flush_pending_batch(ctx, pending).await
-}
-
 async fn handle_write_queue_timeout(
     ctx: &WriteQueueContext,
+    writer: &mut Option<crate::index::ManagedIndexWriter>,
     pending: &mut Vec<WriteOp>,
+    writer_idle_since: &mut Option<Instant>,
 ) -> crate::error::Result<Instant> {
-    if !pending.is_empty() {
+    if pending.is_empty() {
+        // No write arrived for a full interval. Yield only to a real waiter so
+        // an uncontended writer remains alive to own background merges. A
+        // contended yield waits for Tantivy merges before releasing the writer.
+        writer_lifecycle::yield_writer_to_waiter_after_merge_quiescence(ctx, writer)?;
+        writer_lifecycle::close_idle_writer_after_timeout(ctx, writer, *writer_idle_since)?;
+        backpressure::sample_after_worker_event(ctx);
+        if writer.is_none() {
+            *writer_idle_since = None;
+        }
+    } else {
         tracing::debug!(
             "[WQ {}] timeout, flushing {} pending",
             ctx.tenant_id,
             pending.len()
         );
-        flush_pending_batch(ctx, pending).await?;
+        flush_pending_batch(ctx, writer, pending).await?;
+        *writer_idle_since = writer.as_ref().map(|_| Instant::now());
     }
     Ok(reset_write_queue_deadline())
 }
@@ -1065,11 +1573,13 @@ fn prepare_delete_action(
     object_id: String,
     track_primary_delete: bool,
 ) {
+    let phase_start = Instant::now();
     writer.delete_term(tantivy::Term::from_field_text(id_field, &object_id));
     if track_primary_delete {
         prepared.primary_delete_ids.push(object_id.clone());
     }
     prepared.deleted_ids.push(object_id);
+    observe_write_queue_phase(PHASE_DELETE_STAGING, phase_start);
 }
 
 /// Validate a document (size limit, vector schema, Tantivy conversion), strip
@@ -1112,19 +1622,24 @@ fn prepare_document_write(
     }
 
     if document_write_mode.deletes_existing() {
+        let phase_start = Instant::now();
         preparation_context
             .writer
             .delete_term(tantivy::Term::from_field_text(
                 preparation_context.id_field,
                 &doc.id,
             ));
+        observe_write_queue_phase(PHASE_DELETE_STAGING, phase_start);
     }
 
-    match preparation_context
+    let conversion_start = Instant::now();
+    let conversion_result = preparation_context
         .index
         .converter()
-        .to_tantivy(&doc, preparation_context.settings)
-    {
+        .to_tantivy(&doc, preparation_context.settings);
+    observe_write_queue_phase(PHASE_DOCUMENT_CONVERSION, conversion_start);
+
+    match conversion_result {
         Ok(tantivy_doc) => {
             if document_write_mode.tracks_primary() {
                 prepared.primary_upsert_ids.push(doc.id.clone());

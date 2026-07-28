@@ -30,7 +30,7 @@ pub(crate) use node_id::configured_node_id;
 use schema::Schema;
 use settings::IndexSettings;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use synonyms::SynonymStore;
 use tantivy::Index as TantivyIndex;
@@ -214,6 +214,7 @@ pub fn reset_global_budget_for_test() {
 /// ```
 pub struct Index {
     inner: TantivyIndex,
+    path: PathBuf,
     reader: tantivy::IndexReader,
     schema: Schema,
     converter: Arc<DocumentConverter>,
@@ -445,7 +446,8 @@ impl Index {
             Self::stemmer_language_for_index(index_languages)
         };
         let tantivy_schema = schema.to_tantivy();
-        let inner = TantivyIndex::create_in_dir(path, tantivy_schema.clone())?;
+        let path = path.as_ref().to_path_buf();
+        let inner = TantivyIndex::create_in_dir(&path, tantivy_schema.clone())?;
 
         Self::register_tokenizers(
             &inner,
@@ -464,6 +466,7 @@ impl Index {
         let converter = Arc::new(DocumentConverter::new(&schema, &tantivy_schema)?);
         Ok(Index {
             inner,
+            path,
             reader,
             schema,
             converter,
@@ -479,7 +482,8 @@ impl Index {
         budget: Arc<MemoryBudget>,
     ) -> Result<Self> {
         let tantivy_schema = schema.to_tantivy();
-        let inner = TantivyIndex::create_in_dir(path, tantivy_schema.clone())?;
+        let path = path.as_ref().to_path_buf();
+        let inner = TantivyIndex::create_in_dir(&path, tantivy_schema.clone())?;
 
         Self::register_tokenizers(&inner, true, &[], "", &[], None);
 
@@ -493,6 +497,7 @@ impl Index {
         let converter = Arc::new(DocumentConverter::new(&schema, &tantivy_schema)?);
         Ok(Index {
             inner,
+            path,
             reader,
             schema,
             converter,
@@ -548,7 +553,8 @@ impl Index {
         } else {
             Self::stemmer_language_for_index(index_languages)
         };
-        let inner = TantivyIndex::open_in_dir(path)?;
+        let path = path.as_ref().to_path_buf();
+        let inner = TantivyIndex::open_in_dir(&path)?;
 
         Self::register_tokenizers(
             &inner,
@@ -569,6 +575,7 @@ impl Index {
         let converter = Arc::new(DocumentConverter::new(&schema, &tantivy_schema)?);
         Ok(Index {
             inner,
+            path,
             reader,
             schema,
             converter,
@@ -579,7 +586,8 @@ impl Index {
 
     /// Open an existing index with an explicit memory budget.
     pub fn open_with_budget<P: AsRef<Path>>(path: P, budget: Arc<MemoryBudget>) -> Result<Self> {
-        let inner = TantivyIndex::open_in_dir(path)?;
+        let path = path.as_ref().to_path_buf();
+        let inner = TantivyIndex::open_in_dir(&path)?;
 
         Self::register_tokenizers(&inner, true, &[], "", &[], None);
 
@@ -595,6 +603,7 @@ impl Index {
         let converter = Arc::new(DocumentConverter::new(&schema, &tantivy_schema)?);
         Ok(Index {
             inner,
+            path,
             reader,
             schema,
             converter,
@@ -632,6 +641,10 @@ impl Index {
     /// Access the underlying Tantivy index.
     pub fn inner(&self) -> &TantivyIndex {
         &self.inner
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Get the document converter for this index.

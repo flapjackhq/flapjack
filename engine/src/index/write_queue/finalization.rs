@@ -1,4 +1,6 @@
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 use crate::types::{TaskInfo, TaskStatus};
 
@@ -6,13 +8,75 @@ use super::{PreparedWriteDocument, PreparedWriteOperation, WriteFinalizationCont
 
 pub(crate) const PERSISTED_VECTORS_DIR: &str = "vectors";
 
+#[cfg(test)]
+static COMMIT_FAILURE_TENANT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+#[cfg(test)]
+static COMMITS_IN_PROGRESS: once_cell::sync::Lazy<dashmap::DashSet<String>> =
+    once_cell::sync::Lazy::new(dashmap::DashSet::new);
+
+#[cfg(test)]
+struct CommitInProgressGuard<'a> {
+    tenant_id: &'a str,
+}
+
+#[cfg(test)]
+impl Drop for CommitInProgressGuard<'_> {
+    fn drop(&mut self) {
+        COMMITS_IN_PROGRESS.remove(self.tenant_id);
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct CommitFailureHookGuard {
+    previous_tenant: Option<String>,
+}
+
+#[cfg(test)]
+impl Drop for CommitFailureHookGuard {
+    fn drop(&mut self) {
+        *commit_failure_tenant().lock().unwrap() = self.previous_tenant.take();
+    }
+}
+
+#[cfg(test)]
+fn commit_failure_tenant() -> &'static Mutex<Option<String>> {
+    COMMIT_FAILURE_TENANT.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_commit_for_test(tenant_id: &str) -> CommitFailureHookGuard {
+    let mut target = commit_failure_tenant().lock().unwrap();
+    CommitFailureHookGuard {
+        previous_tenant: target.replace(tenant_id.to_string()),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn commit_is_in_progress_for_test(tenant_id: &str) -> bool {
+    COMMITS_IN_PROGRESS.contains(tenant_id)
+}
+
+#[cfg(test)]
+fn injected_commit_failure(tenant_id: &str) -> Option<crate::error::FlapjackError> {
+    let mut target = commit_failure_tenant().lock().unwrap();
+    if target.as_deref() != Some(tenant_id) {
+        return None;
+    }
+    target.take();
+    Some(crate::error::FlapjackError::Tantivy(
+        "injected write-queue commit failure".to_string(),
+    ))
+}
+
 pub(super) fn write_valid_documents(
     writer: &mut crate::index::ManagedIndexWriter,
     valid_docs: &[PreparedWriteDocument],
 ) -> crate::error::Result<Vec<(String, serde_json::Value)>> {
     let mut valid_docs_json = Vec::new();
     for (doc_id, doc_json, tantivy_doc) in valid_docs {
+        let phase_start = std::time::Instant::now();
         writer.add_document(tantivy_doc.clone())?;
+        super::observe_write_queue_phase(super::PHASE_ADD_STAGING, phase_start);
         valid_docs_json.push((doc_id.clone(), doc_json.clone()));
     }
     Ok(valid_docs_json)
@@ -45,13 +109,16 @@ pub(super) fn append_batch_to_oplog(
         return Ok(());
     }
 
-    oplog
+    let phase_start = std::time::Instant::now();
+    let result = oplog
         .append_batch_for_task(task_id, &batch_ops)
         .map(|_| ())
         .map_err(|error| {
             tracing::error!("[WQ {}] oplog append failed: {}", tenant_id, error);
             error
-        })
+        });
+    super::observe_write_queue_phase(super::PHASE_OPLOG_APPEND, phase_start);
+    result
 }
 
 /// Commit the Tantivy writer, catching panics via `catch_unwind` to prevent
@@ -72,9 +139,20 @@ pub(super) fn commit_writer_with_panic_guard(
         deleted_count,
         rejected_count
     );
+    #[cfg(test)]
+    if let Some(error) = injected_commit_failure(tenant_id) {
+        return Err(error);
+    }
+    #[cfg(test)]
+    let _commit_in_progress = {
+        COMMITS_IN_PROGRESS.insert(tenant_id.to_string());
+        CommitInProgressGuard { tenant_id }
+    };
     let commit_start = std::time::Instant::now();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| writer.commit())) {
         Ok(Ok(_opstamp)) => {
+            super::observe_write_queue_phase(super::PHASE_WRITER_COMMIT, commit_start);
+            super::observe_write_queue_commit_succeeded(tenant_id);
             super::observe_write_queue_phase(
                 super::PHASE_COMMIT_WRITER_WITH_PANIC_GUARD,
                 phase_start,
@@ -105,14 +183,28 @@ pub(super) fn finalize_committed_batch(
     build_secs: u64,
 ) -> crate::error::Result<()> {
     let phase_start = std::time::Instant::now();
+    let metadata_start = std::time::Instant::now();
     persist_index_metadata(context.base_path, context.tenant_id, build_secs);
+    super::observe_write_queue_phase(super::PHASE_METADATA_PERSISTENCE, metadata_start);
+    let reload_start = std::time::Instant::now();
     refresh_search_state(context.index, context.facet_cache, context.tenant_id)?;
+    super::observe_write_queue_phase(super::PHASE_READER_RELOAD, reload_start);
     #[cfg(feature = "vector-search")]
-    save_vector_index(context, prepared_ops);
-    for prepared in prepared_ops {
-        update_lww_state(context.lww_map, context.tenant_id, prepared);
+    {
+        save_vector_index(context, prepared_ops);
     }
+    for prepared in prepared_ops {
+        let lww_start = std::time::Instant::now();
+        update_lww_state(context.lww_map, context.tenant_id, prepared);
+        super::observe_write_queue_phase(super::PHASE_LWW_UPDATE, lww_start);
+    }
+    let oplog_state_start = std::time::Instant::now();
     persist_oplog_commit_state(context.oplog, context.base_path, context.tenant_id);
+    super::observe_write_queue_phase(
+        super::PHASE_OPLOG_COMMIT_STATE_PERSISTENCE,
+        oplog_state_start,
+    );
+    record_segment_health(context.tenant_id, context.index);
     super::observe_write_queue_phase(super::PHASE_FINALIZE_COMMITTED_BATCH, phase_start);
     Ok(())
 }
@@ -168,16 +260,19 @@ fn save_vector_index(
         return;
     };
 
+    let vector_start = std::time::Instant::now();
     if let Err(error) = guard.save(&vectors_dir) {
         tracing::error!(
             "[WQ {}] failed to save vector index: {}",
             context.tenant_id,
             error
         );
+        super::observe_write_queue_phase(super::PHASE_VECTOR_SAVE, vector_start);
         return;
     }
 
     if context.embedder_configs.is_empty() {
+        super::observe_write_queue_phase(super::PHASE_VECTOR_SAVE, vector_start);
         return;
     }
 
@@ -192,6 +287,7 @@ fn save_vector_index(
             error
         );
     }
+    super::observe_write_queue_phase(super::PHASE_VECTOR_SAVE, vector_start);
 }
 
 /// Record the current timestamp and node ID in the LWW map for every primary
@@ -376,9 +472,16 @@ pub(super) fn compact_segments(
             tenant_id,
             gc_result.deleted_files.len()
         );
+        super::observe_write_queue_gc_removed_files(
+            tenant_id,
+            gc_result.deleted_files.len() as u64,
+        );
 
         index.reader().reload()?;
         index.invalidate_searchable_paths_cache();
+        if let Some(observation) = record_segment_health(tenant_id, index) {
+            super::observe_write_queue_settled_index_bytes(tenant_id, &observation);
+        }
         Ok(())
     })();
 
@@ -387,6 +490,26 @@ pub(super) fn compact_segments(
     }
 
     result
+}
+
+pub(super) fn record_segment_health(
+    tenant_id: &str,
+    index: &Arc<crate::index::Index>,
+) -> Option<super::segment_observation::SegmentObservation> {
+    match super::segment_observation::observe_segments(index) {
+        Ok(observation) => {
+            super::observe_write_queue_segment_health(tenant_id, &observation);
+            Some(observation)
+        }
+        Err(error) => {
+            tracing::warn!(
+                "[WQ {}] failed to observe segment health: {}",
+                tenant_id,
+                error
+            );
+            None
+        }
+    }
 }
 
 /// Get or create a VectorIndex for a tenant. Uses actual vector length for dimensions.

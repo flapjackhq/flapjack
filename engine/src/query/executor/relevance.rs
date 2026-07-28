@@ -39,7 +39,8 @@ impl QueryExecutor {
         };
 
         let collect_started_at = std::time::Instant::now();
-        let (total, mut top_docs) = searcher.search(
+        let (total, mut top_docs) = self.search_bounded(
+            searcher,
             query.as_ref(),
             &(Count, TopDocs::with_limit(prelim_limit).order_by_score()),
         )?;

@@ -9,7 +9,14 @@ use super::translation_report::{
 };
 use super::translation_schema::{validate_rule_page, validate_synonym_page};
 use super::{push_typed_failure, validate_settings_payload};
-use crate::handlers::migration::source_snapshot::SourceSnapshotBuilder;
+use crate::handlers::migration::source_identity_partitions::{
+    SourceIdentityConfig, SourceIdentityError,
+};
+use crate::handlers::migration::source_snapshot::{
+    document_violation_from_identity_error, SourceSnapshotBuilder,
+};
+#[cfg(test)]
+use crate::handlers::migration::source_test_support::identity_config_for_test;
 use crate::handlers::migration::spool::{AcceptedSpoolPage, AcceptedSpoolReader, SpoolError};
 use flapjack::index::settings::IndexSettings;
 use flapjack::types::Document;
@@ -64,6 +71,7 @@ pub(in crate::handlers::migration) enum TranslationStreamError<E> {
     Spool(SpoolError),
     Emit(E),
     Cancelled,
+    Identity(SourceIdentityError),
 }
 
 impl<E> From<SpoolError> for TranslationStreamError<E> {
@@ -104,6 +112,9 @@ pub(in crate::handlers::migration) fn translate_spool_payload(
         Err(TranslationStreamError::Emit(_)) => unreachable!(),
         Err(TranslationStreamError::Cancelled) => {
             panic!("in-memory translation cannot observe migration cancellation")
+        }
+        Err(TranslationStreamError::Identity(error)) => {
+            panic!("in-memory translation identity infrastructure failed: {error:?}")
         }
     }
 }
@@ -188,6 +199,11 @@ struct TranslationPageStreams<DocumentPages, RulePages, SynonymPages> {
     synonyms: SynonymPages,
 }
 
+struct TranslationSessionOptions {
+    identity_config: SourceIdentityConfig,
+    retain_document_batches: bool,
+}
+
 fn translate_initial_settings(settings: Value) -> InitialSettingsTranslation {
     let mut entries = non_portable_product_entries();
     validate_settings_payload(&settings, &mut entries);
@@ -215,13 +231,22 @@ where
     RulePages: IntoIterator<Item = Result<AcceptedSpoolPage, SpoolError>>,
     SynonymPages: IntoIterator<Item = Result<AcceptedSpoolPage, SpoolError>>,
 {
+    #[cfg(not(test))]
+    let identity_config =
+        SourceIdentityConfig::from_env().map_err(TranslationStreamError::Identity)?;
+    #[cfg(test)]
+    let (_identity_spool_root, identity_config) =
+        identity_config_for_test().map_err(TranslationStreamError::Identity)?;
     let mut session = TranslationSession::new(
         settings_input,
-        retain_document_batches,
+        TranslationSessionOptions {
+            identity_config,
+            retain_document_batches,
+        },
         instrumentation,
         should_cancel,
         &mut emit_documents,
-    );
+    )?;
     session.consume_document_pages(page_streams.documents)?;
     session.consume_rule_pages(page_streams.rules)?;
     session.consume_synonym_pages(page_streams.synonyms)?;
@@ -245,7 +270,7 @@ where
     F: FnMut(Vec<Document>) -> Result<(), E>,
 {
     entries: Vec<TranslationReportEntry>,
-    snapshot_builder: SourceSnapshotBuilder,
+    snapshot_builder: Option<SourceSnapshotBuilder>,
     settings: Option<flapjack::index::settings::IndexSettings>,
     replica_settings: Vec<ReplicaSettingsTranslation>,
     rules: Vec<flapjack::index::rules::Rule>,
@@ -264,11 +289,11 @@ where
 {
     fn new(
         settings_input: TranslationSettingsInput,
-        retain_document_batches: bool,
+        options: TranslationSessionOptions,
         instrumentation: &'a mut TranslationSessionInstrumentation,
         should_cancel: impl FnMut() -> Result<bool, SpoolError> + 'a,
         emit_documents: &'a mut F,
-    ) -> Self {
+    ) -> TranslationStreamResult<Self, E> {
         let TranslationSettingsInput {
             source_index_name,
             target_index_name,
@@ -280,7 +305,8 @@ where
         instrumentation.replica_settings_count = replica_settings.len();
 
         let mut entries = non_portable_product_entries();
-        let mut snapshot_builder = SourceSnapshotBuilder::new();
+        let mut snapshot_builder = SourceSnapshotBuilder::new(options.identity_config)
+            .map_err(TranslationStreamError::Identity)?;
         snapshot_builder.record_settings(&settings);
         validate_settings_payload(&settings, &mut entries);
 
@@ -302,20 +328,20 @@ where
             translated_replica_settings = replica_application.replica_settings;
         }
 
-        Self {
+        Ok(Self {
             entries,
-            snapshot_builder,
+            snapshot_builder: Some(snapshot_builder),
             settings: translated_settings,
             replica_settings: translated_replica_settings,
             rules: Vec::new(),
             synonyms: Vec::new(),
             document_batch: Vec::with_capacity(MAX_DOCUMENT_BATCH_SIZE),
             document_batches: Vec::new(),
-            retain_document_batches,
+            retain_document_batches: options.retain_document_batches,
             instrumentation,
             should_cancel: Box::new(should_cancel),
             emit_documents,
-        }
+        })
     }
 
     fn consume_document_pages(
@@ -332,12 +358,13 @@ where
 
     fn consume_document_page(&mut self, page: AcceptedSpoolPage) -> TranslationStreamResult<(), E> {
         self.instrumentation.enter_document_page();
-        if let Err(violation) = self
+        if let Err(error) = self
             .snapshot_builder
+            .as_mut()
+            .expect("snapshot builder exists until finish")
             .record_documents_page(page.page_index, &page.items)
         {
-            self.entries
-                .push(source_snapshot_violation_entry(violation));
+            self.push_document_identity_error(error)?;
         }
         for (item_index, document) in page.items.iter().enumerate() {
             let mut failures = Vec::new();
@@ -367,6 +394,8 @@ where
             self.instrumentation.enter_artifact_page();
             if let Err(violation) = self
                 .snapshot_builder
+                .as_mut()
+                .expect("snapshot builder exists until finish")
                 .record_rules_page(page.page_index, &page.items)
             {
                 self.entries
@@ -395,6 +424,8 @@ where
             self.instrumentation.enter_artifact_page();
             if let Err(violation) = self
                 .snapshot_builder
+                .as_mut()
+                .expect("snapshot builder exists until finish")
                 .record_synonyms_page(page.page_index, &page.items)
             {
                 self.entries
@@ -455,6 +486,13 @@ where
 
     fn finish(mut self) -> TranslationStreamResult<TranslationOutcome, E> {
         self.flush_documents()?;
+        let snapshot_builder = self
+            .snapshot_builder
+            .take()
+            .expect("snapshot builder exists until finish");
+        if let Err(error) = snapshot_builder.finish() {
+            self.push_document_identity_error(error)?;
+        }
         if contains_hard_rejection(&self.entries) {
             return Ok(TranslationOutcome::Rejected(finalize_report(self.entries)));
         }
@@ -473,6 +511,20 @@ where
                 report: finalize_report(self.entries),
             },
         )))
+    }
+
+    fn push_document_identity_error(
+        &mut self,
+        error: SourceIdentityError,
+    ) -> TranslationStreamResult<(), E> {
+        if error.is_infrastructure() {
+            return Err(TranslationStreamError::Identity(error));
+        }
+        if let Some(violation) = document_violation_from_identity_error(&error) {
+            self.entries
+                .push(source_snapshot_violation_entry(violation));
+        }
+        Ok(())
     }
 }
 

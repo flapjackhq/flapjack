@@ -3,7 +3,12 @@
 use super::algolia_client::{
     AlgoliaClient, AlgoliaClientError, AlgoliaErrorKind, AlgoliaIndexRecord, BrowseError,
 };
+#[cfg(not(test))]
+use super::source_identity_partitions::SourceIdentityConfig;
+use super::source_identity_partitions::SourceIdentityVersion;
 use super::source_snapshot::{canonical_json_bytes, SourceSnapshot, SourceSnapshotBuilder};
+#[cfg(test)]
+use super::source_test_support::identity_config_for_test;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -300,7 +305,11 @@ where
     R: MigrationSourceReader,
     S: SourceExportSink + Send,
 {
-    let mut builder = SourceSnapshotBuilder::new();
+    #[cfg(not(test))]
+    let identity_config = SourceIdentityConfig::from_env()?;
+    #[cfg(test)]
+    let (_identity_spool_root, identity_config) = identity_config_for_test()?;
+    let mut builder = SourceSnapshotBuilder::new(identity_config)?;
     let settings = reader.read_settings().await?;
     reader.require_unretrievable_access(&settings).await?;
     builder.record_settings(&settings);
@@ -328,7 +337,7 @@ where
         reader.read_synonyms(&mut consume_page).await?;
     }
 
-    builder.finish()
+    builder.finish().map_err(AlgoliaClientError::from)
 }
 
 fn validate_metadata(
@@ -373,7 +382,15 @@ fn resource_identity(resource: &super::source_snapshot::SourceResourceSnapshot) 
     json!({
         "count": resource.count,
         "hash": resource.hash,
+        "version": source_identity_version_name(resource.version),
     })
+}
+
+fn source_identity_version_name(version: SourceIdentityVersion) -> &'static str {
+    match version {
+        SourceIdentityVersion::V1 => "v1",
+        SourceIdentityVersion::V2 => "v2",
+    }
 }
 
 pub(super) fn source_drift_error() -> AlgoliaClientError {

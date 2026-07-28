@@ -2307,6 +2307,61 @@ async fn post_admission_write_queue_writer_slot_contention_returns_too_many_conc
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(write_queue_commit_failure_hook)]
+async fn failed_commit_does_not_change_searcher_count() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "failed_commit_searcher_count";
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+    let initial_task = manager
+        .add_documents(
+            tenant_id,
+            vec![write_queue_test_document(
+                "committed_before_failure",
+                "stable searchable document",
+            )],
+        )
+        .unwrap();
+    manager
+        .wait_for_write_durable(&initial_task.id)
+        .await
+        .unwrap();
+    let count_before_failure = manager
+        .tenant_doc_count(tenant_id)
+        .expect("loaded tenant must expose its searcher-backed count");
+    assert_eq!(count_before_failure, 1);
+
+    let _commit_failure = crate::index::write_queue::fail_next_commit_for_test(tenant_id);
+    let failed_task = manager
+        .add_documents(
+            tenant_id,
+            vec![write_queue_test_document(
+                "must_not_become_searchable",
+                "injected commit failure",
+            )],
+        )
+        .unwrap();
+    let durable_result = manager.wait_for_write_durable(&failed_task.id).await;
+
+    assert!(
+        matches!(durable_result, Err(FlapjackError::Tantivy(_))),
+        "the injected commit failure must reach the durable caller, got {durable_result:?}"
+    );
+    assert_eq!(
+        manager.tenant_doc_count(tenant_id),
+        Some(count_before_failure),
+        "a failed commit must leave the searcher-backed count byte-identical"
+    );
+    assert!(
+        matches!(
+            manager.get_task(&failed_task.id).map(|task| task.status),
+            Ok(TaskStatus::Failed(_))
+        ),
+        "the task associated with the failed commit must be terminal Failed"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn legacy_compact_admission_cleanup_failure_does_not_report_success() {

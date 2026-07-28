@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "layout_count": 71,
+  "layout_count": 73,
   "live_http_fixture": {
     "target_index": "products",
     "control_index": "control_products",
@@ -4374,6 +4374,130 @@
         "journal": "absent",
         "quarantine": "present",
         "staging": "present"
+      }
+    },
+    {
+      "id": "base_069_create",
+      "kind": "base",
+      "activation": "create",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "committed",
+      "boundary": {
+        "identity": "create|sync_dir:.publication/products|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "absent",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "absent",
+          "new": "absent",
+          "target": "absent",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "none",
+        "exit_code": 0,
+        "status": "clean"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
+      }
+    },
+    {
+      "id": "base_070_replacement",
+      "kind": "base",
+      "activation": "replacement",
+      "tenant": "products",
+      "transaction": "txn_001",
+      "journal_phase": "committed",
+      "boundary": {
+        "identity": "replacement|sync_dir:.publication/products|1"
+      },
+      "policy_keys": [
+        "analytics",
+        "dictionaries",
+        "index_metadata",
+        "oplog",
+        "query_suggestions",
+        "recommend_rules",
+        "settings_rules_synonyms",
+        "tenant_tantivy",
+        "vectors"
+      ],
+      "digests": {
+        "old": "sha256:80ab62e7d3584d9e657a1fdc4e4ca3a8727059c916a5d1caee2c40a71478acaa",
+        "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+        "staging": "absent",
+        "backup": "absent"
+      },
+      "sidecars": {
+        "query_suggestions": {
+          "old": "sha256:db15d26e9989cf5d94647a2946bda0135a1c5b82f6b3ba15e4614a390b75528d",
+          "new": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "target": "sha256:abb861e9aa034b44aea9d5364c859b2f4cabed3fbbe5bd9acffecd9cacb2111d",
+          "staging": "absent",
+          "backup": "absent"
+        },
+        "analytics": {
+          "old": "sha256:0207e79d1135904b210e966b0c3ba45f525c7e701642fc4e91815ebbad77378d",
+          "new": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "target": "sha256:017dcadb9e269c46f41295ce195d45b3243c12bdc353017bcc39f74e24072334",
+          "staging": "absent",
+          "backup": "absent"
+        }
+      },
+      "disposition": "commit",
+      "cli": {
+        "action": "none",
+        "exit_code": 0,
+        "status": "clean"
+      },
+      "visible": {
+        "object": "new-meta",
+        "search": "loadable",
+        "target": "products"
+      },
+      "residue": {
+        "backup": "absent",
+        "journal": "present",
+        "quarantine": "absent",
+        "staging": "absent"
       }
     },
     {

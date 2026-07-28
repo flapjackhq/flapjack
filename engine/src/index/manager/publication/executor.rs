@@ -5,10 +5,10 @@ use super::fault::{PublicationFaultPoint, PublicationIo};
 use super::fsops::reject_symlinked_managed_path_components;
 use super::{
     artifact_policy_table, classify_external_relative_path, invalid_publication,
-    read_strict_committed_seq, validate_relative_path, ArtifactDisposition, ContentDigest,
-    ExternalArtifactRoot, PublicationEvent, PublicationFenceEvidence,
-    PublicationGenerationEvidence, PublicationJournal, PublicationPaths, PublicationTarget,
-    PublicationTransactionId, Result, TantivyManagedInventory,
+    read_strict_committed_seq, relative_path_evidence, validate_relative_path, ArtifactDisposition,
+    ContentDigest, ExternalArtifactRoot, PublicationDisposition, PublicationEvent,
+    PublicationFenceEvidence, PublicationGenerationEvidence, PublicationJournal, PublicationPaths,
+    PublicationPhase, PublicationTarget, PublicationTransactionId, Result, TantivyManagedInventory,
 };
 use crate::analytics::config::{AnalyticsConfig, AnalyticsTargetArtifactPaths};
 use crate::query_suggestions::config::{QsConfigStore, QsTargetArtifactPaths};
@@ -129,6 +129,10 @@ impl PreStagedPublication {
 
     pub fn transaction_id(&self) -> &PublicationTransactionId {
         &self.transaction_id
+    }
+
+    pub fn generation(&self) -> &PublicationGenerationEvidence {
+        &self.generation
     }
 
     /// Remove only this transaction when no durable journal has been written.
@@ -662,6 +666,9 @@ fn activate_publication_inner(
         Ok(committed) => {
             let _ = io.checkpoint(PublicationFaultPoint::CommitDurable);
             let _ = io.checkpoint(PublicationFaultPoint::AfterCommitJournal);
+            if context.mode == ActivationMode::Replace {
+                let _ = cleanup_superseded_committed_journals(paths, &committed.target, io);
+            }
             let _ = cleanup_publication_residue(paths, io);
             Ok(committed)
         }
@@ -669,6 +676,40 @@ fn activate_publication_inner(
             resolve_failed_activation(paths, &manifest, target_existed, journal, io, error)
         }
     }
+}
+
+fn cleanup_superseded_committed_journals(
+    paths: &PublicationPaths,
+    target: &PublicationTarget,
+    io: &PublicationIo<'_>,
+) -> Result<()> {
+    let current_namespace = require_parent(&paths.journal)?;
+    let Some(target_root) = current_namespace.parent() else {
+        return Ok(());
+    };
+    for entry in fs::read_dir(target_root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == current_namespace || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let journal_path = path.join("journal.json");
+        let Ok(raw) = fs::read_to_string(&journal_path) else {
+            continue;
+        };
+        let journal = PublicationJournal::from_recovery_json(&raw)?;
+        // Identity mismatches are repair evidence, not superseded state this
+        // activation owns. Delete only a journal bound to this exact namespace.
+        if journal.target == *target
+            && journal.paths == relative_path_evidence(target, &journal.transaction_id)
+            && path.file_name() == Some(std::ffi::OsStr::new(journal.transaction_id.as_str()))
+            && journal.phase == PublicationPhase::Committed
+            && journal.disposition == Some(PublicationDisposition::Committed)
+        {
+            io.remove_if_exists(&path)?;
+        }
+    }
+    io.sync_dir(target_root)
 }
 
 fn prepare_digest_evidence(

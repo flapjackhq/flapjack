@@ -1,5 +1,6 @@
-use super::parity_fixtures::build_parity_fixture;
-use super::FacetSearchParams;
+use super::bounded_tests::{wait_for_pool_quiescence, SearchThreadsEnvGuard, TEST_THREAD_COUNT};
+use super::parity_fixtures::{build_parity_fixture, ExecutorParityFixture};
+use super::{FacetSearchParams, QueryPhaseReport};
 use crate::query::geo::{AroundPrecisionConfig, AroundRadius, GeoParams, GeoPoint};
 use crate::query::highlighter::{HighlightValue, Highlighter, MatchLevel};
 use crate::types::{FacetRequest, FieldValue, Filter, Sort, SortOrder};
@@ -40,30 +41,49 @@ fn facet_requests() -> Vec<FacetRequest> {
     ]
 }
 
-#[test]
-fn parity_fixture_records_deterministic_segment_count() {
-    let fixture = build_parity_fixture();
-    let second_fixture = build_parity_fixture();
-
-    assert_eq!(
-        fixture.segment_count(),
-        super::parity_fixtures::EXPECTED_SEGMENT_COUNT
-    );
-    assert!(fixture.segment_count() >= 2);
-    assert_eq!(
-        second_fixture.segment_count(),
-        super::parity_fixtures::EXPECTED_SEGMENT_COUNT
-    );
+fn pager_filter() -> Filter {
+    Filter::Equals {
+        field: "category".to_string(),
+        value: FieldValue::Text("Pager".to_string()),
+    }
 }
 
-#[test]
-fn text_family_matches_frozen_benchmark_terms() {
-    let fixture = build_parity_fixture();
+/// The result-defining subset of `QueryPhaseReport`, captured per execute call.
+///
+/// Timing fields and `cold` are deliberately excluded: they are wall-clock and
+/// reader-generation dependent, so they legitimately differ between two runs of
+/// the same query and cannot witness an executor parity regression. Everything
+/// retained here is derived from what the collectors saw, so it must be
+/// identical on the single-thread and bounded multithread paths.
+#[derive(Debug, PartialEq, Eq)]
+struct PhaseFingerprint {
+    label: &'static str,
+    execution_path: &'static str,
+    matched_docs: usize,
+    visited_segments: usize,
+    candidates_collected: usize,
+    facet_cardinality: usize,
+}
+
+fn fingerprint(label: &'static str, executor: &crate::QueryExecutor) -> PhaseFingerprint {
+    let report = executor.phase_report();
+    PhaseFingerprint {
+        label,
+        execution_path: report.execution_path,
+        matched_docs: report.matched_docs,
+        visited_segments: report.visited_segments,
+        candidates_collected: report.candidates_collected,
+        facet_cardinality: report.facet_cardinality,
+    }
+}
+
+fn assert_text_family(fixture: &ExecutorParityFixture) -> Vec<PhaseFingerprint> {
     let sort = object_id_sort();
+    let mut fingerprints = Vec::new();
 
     for spec in super::parity_fixtures::TEXT_SPECS {
-        let result = fixture
-            .executor(spec.query)
+        let executor = fixture.executor(spec.query);
+        let result = executor
             .execute_with_sort(
                 fixture.searcher(),
                 fixture.text_query(spec),
@@ -76,17 +96,19 @@ fn text_family_matches_frozen_benchmark_terms() {
 
         assert_eq!(ids(&result), spec.expected_ids, "{}", spec.name);
         assert_eq!(result.total, spec.expected_total, "{}", spec.name);
+        fingerprints.push(fingerprint(spec.name, &executor));
     }
+
+    fingerprints
 }
 
-#[test]
-fn typo_family_matches_frozen_benchmark_typos() {
-    let fixture = build_parity_fixture();
+fn assert_typo_family(fixture: &ExecutorParityFixture) -> Vec<PhaseFingerprint> {
     let sort = object_id_sort();
+    let mut fingerprints = Vec::new();
 
     for spec in super::parity_fixtures::TYPO_SPECS {
-        let result = fixture
-            .executor(spec.query)
+        let executor = fixture.executor(spec.query);
+        let result = executor
             .execute_with_sort(
                 fixture.searcher(),
                 fixture.text_query(spec),
@@ -99,17 +121,19 @@ fn typo_family_matches_frozen_benchmark_typos() {
 
         assert_eq!(ids(&result), spec.expected_ids, "{}", spec.name);
         assert_eq!(result.total, spec.expected_total, "{}", spec.name);
+        fingerprints.push(fingerprint(spec.name, &executor));
     }
+
+    fingerprints
 }
 
-#[test]
-fn multi_word_family_matches_frozen_benchmark_phrases() {
-    let fixture = build_parity_fixture();
+fn assert_multi_word_family(fixture: &ExecutorParityFixture) -> Vec<PhaseFingerprint> {
     let sort = object_id_sort();
+    let mut fingerprints = Vec::new();
 
     for spec in super::parity_fixtures::MULTI_WORD_SPECS {
-        let result = fixture
-            .executor(spec.query)
+        let executor = fixture.executor(spec.query);
+        let result = executor
             .execute_with_sort(
                 fixture.searcher(),
                 fixture.text_query(spec),
@@ -122,16 +146,17 @@ fn multi_word_family_matches_frozen_benchmark_phrases() {
 
         assert_eq!(ids(&result), spec.expected_ids, "{}", spec.name);
         assert_eq!(result.total, spec.expected_total, "{}", spec.name);
+        fingerprints.push(fingerprint(spec.name, &executor));
     }
+
+    fingerprints
 }
 
-#[test]
-fn facet_family_asserts_counts_ordering_and_constant_scores() {
-    let fixture = build_parity_fixture();
+fn assert_facet_family(fixture: &ExecutorParityFixture) -> Vec<PhaseFingerprint> {
     let requests = facet_requests();
     let spec = &super::parity_fixtures::FACET_QUERY;
-    let result = fixture
-        .executor(spec.query)
+    let executor = fixture.executor(spec.query);
+    let result = executor
         .execute_with_facets(
             fixture.searcher(),
             Box::new(AllQuery),
@@ -161,8 +186,8 @@ fn facet_family_asserts_counts_ordering_and_constant_scores() {
         assert_eq!(actual, expected.values, "{}", expected.field);
     }
 
-    let all_query_result = fixture
-        .executor("")
+    let all_query_executor = fixture.executor("");
+    let all_query_result = all_query_executor
         .execute_with_facets(
             fixture.searcher(),
             Box::new(AllQuery),
@@ -186,11 +211,14 @@ fn facet_family_asserts_counts_ordering_and_constant_scores() {
             super::parity_fixtures::ALL_QUERY_FILTER_SCORE_BITS
         );
     }
+
+    vec![
+        fingerprint("facet/wireless", &executor),
+        fingerprint("facet/all_query_filter_scores", &all_query_executor),
+    ]
 }
 
-#[test]
-fn filter_family_returns_exact_hand_counted_hits() {
-    let fixture = build_parity_fixture();
+fn assert_filter_family(fixture: &ExecutorParityFixture) -> Vec<PhaseFingerprint> {
     let sort = object_id_sort();
     let filter = laptop_filter();
     let spec = super::parity_fixtures::QuerySpec {
@@ -201,8 +229,8 @@ fn filter_family_returns_exact_hand_counted_hits() {
         expected_total: super::parity_fixtures::FILTER_TOTAL,
     };
 
-    let result = fixture
-        .executor(spec.query)
+    let executor = fixture.executor(spec.query);
+    let result = executor
         .execute_with_sort(
             fixture.searcher(),
             fixture.text_query(&spec),
@@ -215,24 +243,22 @@ fn filter_family_returns_exact_hand_counted_hits() {
 
     assert_eq!(ids(&result), spec.expected_ids);
     assert_eq!(result.total, spec.expected_total);
+
+    vec![fingerprint("filter/laptop", &executor)]
 }
 
-#[test]
-fn pagination_family_uses_offset_capable_facet_path() {
-    let fixture = build_parity_fixture();
+fn assert_pagination_family(fixture: &ExecutorParityFixture) -> Vec<PhaseFingerprint> {
     let requests = facet_requests();
-    let filter = Filter::Equals {
-        field: "category".to_string(),
-        value: FieldValue::Text("Pager".to_string()),
-    };
+    let filter = pager_filter();
     let mut concatenated = Vec::new();
+    let mut fingerprints = Vec::new();
 
     for (page_idx, expected_ids) in super::parity_fixtures::PAGINATION_EXPECTED_PAGES
         .iter()
         .enumerate()
     {
-        let result = fixture
-            .executor("")
+        let executor = fixture.executor("");
+        let result = executor
             .execute_with_facets(
                 fixture.searcher(),
                 Box::new(AllQuery),
@@ -252,6 +278,7 @@ fn pagination_family_uses_offset_capable_facet_path() {
         assert_eq!(actual_ids, *expected_ids, "page {page_idx}");
         assert_eq!(result.total, super::parity_fixtures::PAGINATION_TOTAL);
         concatenated.extend(actual_ids.into_iter().map(String::from));
+        fingerprints.push(fingerprint("pagination/page", &executor));
     }
 
     let expected: Vec<String> = super::parity_fixtures::PAGINATION_EXPECTED_PAGES
@@ -263,11 +290,11 @@ fn pagination_family_uses_offset_capable_facet_path() {
     deduped.dedup();
     assert_eq!(deduped, expected);
     assert_eq!(concatenated, expected);
+
+    fingerprints
 }
 
-#[test]
-fn exact_nb_hits_family_keeps_total_exact_above_requested_limit() {
-    let fixture = build_parity_fixture();
+fn assert_exact_nb_hits_family(fixture: &ExecutorParityFixture) -> Vec<PhaseFingerprint> {
     let sort = object_id_sort();
     let spec = super::parity_fixtures::QuerySpec {
         name: "exactprobe",
@@ -276,8 +303,8 @@ fn exact_nb_hits_family_keeps_total_exact_above_requested_limit() {
         expected_ids: &[],
         expected_total: 13,
     };
-    let result = fixture
-        .executor(spec.query)
+    let executor = fixture.executor(spec.query);
+    let result = executor
         .execute_with_sort(
             fixture.searcher(),
             fixture.text_query(&spec),
@@ -291,15 +318,15 @@ fn exact_nb_hits_family_keeps_total_exact_above_requested_limit() {
     // Tripwire against later approximate nbHits: this count is hand-enumerated and exceeds the returned hit limit.
     assert_eq!(result.total, spec.expected_total);
     assert!(result.total > super::parity_fixtures::EXACT_NB_HITS_LIMIT);
+
+    vec![fingerprint("exact_nb_hits/exactprobe", &executor)]
 }
 
-#[test]
-fn geo_family_filters_executor_results_with_precise_distances() {
-    let fixture = build_parity_fixture();
+fn assert_geo_family(fixture: &ExecutorParityFixture) -> Vec<PhaseFingerprint> {
     let sort = object_id_sort();
     let spec = &super::parity_fixtures::GEO_QUERY;
-    let result = fixture
-        .executor(spec.query)
+    let executor = fixture.executor(spec.query);
+    let result = executor
         .execute_with_sort(
             fixture.searcher(),
             fixture.text_query(spec),
@@ -346,11 +373,11 @@ fn geo_family_filters_executor_results_with_precise_distances() {
             "{actual_id}: {actual_distance} != {expected_distance}"
         );
     }
+
+    vec![fingerprint("geo/around_origin", &executor)]
 }
 
-#[test]
-fn highlight_family_asserts_exact_em_strings_and_match_levels() {
-    let fixture = build_parity_fixture();
+fn assert_highlight_family(fixture: &ExecutorParityFixture) -> Vec<PhaseFingerprint> {
     let sort = object_id_sort();
     let spec = super::parity_fixtures::QuerySpec {
         name: "highlightprobe target",
@@ -359,8 +386,8 @@ fn highlight_family_asserts_exact_em_strings_and_match_levels() {
         expected_ids: &[super::parity_fixtures::HIGHLIGHT_EXPECTATION.document_id],
         expected_total: 1,
     };
-    let result = fixture
-        .executor(spec.query)
+    let executor = fixture.executor(spec.query);
+    let result = executor
         .execute_with_sort(
             fixture.searcher(),
             fixture.text_query(&spec),
@@ -388,14 +415,14 @@ fn highlight_family_asserts_exact_em_strings_and_match_levels() {
         }
         _ => panic!("expected single highlight value"),
     }
+
+    vec![fingerprint("highlight/target", &executor)]
 }
 
-#[test]
-fn custom_ranking_family_uses_doc_id_tiebreak_for_equal_keys() {
-    let fixture = build_parity_fixture();
+fn assert_custom_ranking_family(fixture: &ExecutorParityFixture) -> Vec<PhaseFingerprint> {
     let spec = &super::parity_fixtures::CUSTOM_RANKING_QUERY;
-    let result = fixture
-        .custom_ranking_executor(spec.query)
+    let executor = fixture.custom_ranking_executor(spec.query);
+    let result = executor
         .execute_with_sort(
             fixture.searcher(),
             fixture.text_query(spec),
@@ -408,6 +435,282 @@ fn custom_ranking_family_uses_doc_id_tiebreak_for_equal_keys() {
 
     assert_eq!(ids(&result), spec.expected_ids);
     assert_eq!(result.total, spec.expected_total);
+
+    vec![fingerprint("custom_ranking/tiebreak", &executor)]
+}
+
+fn assert_count_only_path(fixture: &ExecutorParityFixture) -> PhaseFingerprint {
+    let executor = fixture.executor("");
+    let result = executor
+        .execute_with_facets(
+            fixture.searcher(),
+            Box::new(AllQuery),
+            Some(&pager_filter()),
+            &FacetSearchParams {
+                sort: None,
+                limit: 0,
+                offset: 0,
+                has_text_query: false,
+                facet_requests: None,
+                distinct_count: None,
+            },
+        )
+        .unwrap();
+
+    assert!(result.documents.is_empty());
+    assert_eq!(result.total, super::parity_fixtures::PAGINATION_TOTAL);
+    let fingerprint = fingerprint("execution_path/count_only", &executor);
+    assert_eq!(fingerprint.execution_path, "count_only");
+    fingerprint
+}
+
+fn assert_sort_fast_path(fixture: &ExecutorParityFixture) -> PhaseFingerprint {
+    let sort = object_id_sort();
+    let executor = fixture.executor("");
+    let result = executor
+        .execute_with_sort(
+            fixture.searcher(),
+            Box::new(AllQuery),
+            Some(&pager_filter()),
+            Some(&sort),
+            super::parity_fixtures::PAGE_LIMIT,
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(
+        ids(&result),
+        super::parity_fixtures::PAGINATION_EXPECTED_PAGES[0]
+    );
+    assert_eq!(result.total, super::parity_fixtures::PAGINATION_TOTAL);
+    let fingerprint = fingerprint("execution_path/sort_fast", &executor);
+    assert_eq!(fingerprint.execution_path, "sort_fast");
+    fingerprint
+}
+
+/// Run every frozen query family plus the otherwise-unreached count-only and
+/// pure-sort paths against one fixture. Sharing a single fixture keeps the
+/// eight-segment layout — and therefore the segment merge order under test —
+/// fixed across executor configurations and repeated rounds.
+fn assert_all_parity_families(fixture: &ExecutorParityFixture) -> Vec<PhaseFingerprint> {
+    let mut fingerprints = Vec::new();
+    fingerprints.extend(assert_text_family(fixture));
+    fingerprints.extend(assert_typo_family(fixture));
+    fingerprints.extend(assert_multi_word_family(fixture));
+    fingerprints.extend(assert_facet_family(fixture));
+    fingerprints.extend(assert_filter_family(fixture));
+    fingerprints.extend(assert_pagination_family(fixture));
+    fingerprints.extend(assert_exact_nb_hits_family(fixture));
+    fingerprints.extend(assert_geo_family(fixture));
+    fingerprints.extend(assert_highlight_family(fixture));
+    fingerprints.extend(assert_custom_ranking_family(fixture));
+    fingerprints.push(assert_count_only_path(fixture));
+    fingerprints.push(assert_sort_fast_path(fixture));
+    fingerprints
+}
+
+/// The ten frozen query families Stage 2 locked down, addressed as one
+/// benchmarkable catalog so the executor performance harness measures exactly
+/// the queries the parity suite already asserts — never a second corpus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrozenFamily {
+    Text,
+    Typo,
+    MultiWord,
+    Facet,
+    Filter,
+    Pagination,
+    ExactNbHits,
+    Geo,
+    Highlight,
+    CustomRanking,
+}
+
+impl FrozenFamily {
+    /// Every frozen family, in the fixed order the parity sweep runs them.
+    pub(crate) const ALL: &'static [FrozenFamily] = &[
+        FrozenFamily::Text,
+        FrozenFamily::Typo,
+        FrozenFamily::MultiWord,
+        FrozenFamily::Facet,
+        FrozenFamily::Filter,
+        FrozenFamily::Pagination,
+        FrozenFamily::ExactNbHits,
+        FrozenFamily::Geo,
+        FrozenFamily::Highlight,
+        FrozenFamily::CustomRanking,
+    ];
+
+    /// Stable machine-readable family label for benchmark rows.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            FrozenFamily::Text => "text",
+            FrozenFamily::Typo => "typo",
+            FrozenFamily::MultiWord => "multi_word",
+            FrozenFamily::Facet => "facet",
+            FrozenFamily::Filter => "filter",
+            FrozenFamily::Pagination => "pagination",
+            FrozenFamily::ExactNbHits => "exact_nb_hits",
+            FrozenFamily::Geo => "geo",
+            FrozenFamily::Highlight => "highlight",
+            FrozenFamily::CustomRanking => "custom_ranking",
+        }
+    }
+
+    fn assert_family(self, fixture: &ExecutorParityFixture) -> Vec<PhaseFingerprint> {
+        match self {
+            FrozenFamily::Text => assert_text_family(fixture),
+            FrozenFamily::Typo => assert_typo_family(fixture),
+            FrozenFamily::MultiWord => assert_multi_word_family(fixture),
+            FrozenFamily::Facet => assert_facet_family(fixture),
+            FrozenFamily::Filter => assert_filter_family(fixture),
+            FrozenFamily::Pagination => assert_pagination_family(fixture),
+            FrozenFamily::ExactNbHits => assert_exact_nb_hits_family(fixture),
+            FrozenFamily::Geo => assert_geo_family(fixture),
+            FrozenFamily::Highlight => assert_highlight_family(fixture),
+            FrozenFamily::CustomRanking => assert_custom_ranking_family(fixture),
+        }
+    }
+}
+
+/// Run one frozen family under the current `FLAPJACK_SEARCH_THREADS` arm and
+/// return each execute's `QueryPhaseReport` paired with the query label the
+/// parity suite assigns it.
+///
+/// This reuses the `assert_*_family` owners verbatim — so the benchmark
+/// measures the asserted queries and nothing else — and pairs their
+/// per-execute fingerprints with the reports captured for the same executes.
+/// Both are produced in execution order, one per execute, so the zip is exact.
+pub(crate) fn run_frozen_family(
+    family: FrozenFamily,
+    fixture: &ExecutorParityFixture,
+) -> Vec<(&'static str, QueryPhaseReport)> {
+    let (fingerprints, reports) =
+        super::capture_query_phase_reports(|| family.assert_family(fixture));
+    assert_eq!(
+        fingerprints.len(),
+        reports.len(),
+        "each frozen-family execute must emit exactly one captured phase report"
+    );
+    fingerprints
+        .into_iter()
+        .map(|fingerprint| fingerprint.label)
+        .zip(reports)
+        .collect()
+}
+
+#[test]
+fn parity_fixture_records_deterministic_segment_count() {
+    let fixture = build_parity_fixture();
+    let second_fixture = build_parity_fixture();
+
+    assert_eq!(
+        fixture.segment_count(),
+        super::parity_fixtures::EXPECTED_SEGMENT_COUNT
+    );
+    assert!(fixture.segment_count() >= 2);
+    assert_eq!(
+        second_fixture.segment_count(),
+        super::parity_fixtures::EXPECTED_SEGMENT_COUNT
+    );
+}
+
+#[test]
+fn text_family_matches_frozen_benchmark_terms() {
+    assert_text_family(&build_parity_fixture());
+}
+
+#[test]
+fn typo_family_matches_frozen_benchmark_typos() {
+    assert_typo_family(&build_parity_fixture());
+}
+
+#[test]
+fn multi_word_family_matches_frozen_benchmark_phrases() {
+    assert_multi_word_family(&build_parity_fixture());
+}
+
+#[test]
+fn facet_family_asserts_counts_ordering_and_constant_scores() {
+    assert_facet_family(&build_parity_fixture());
+}
+
+#[test]
+fn filter_family_returns_exact_hand_counted_hits() {
+    assert_filter_family(&build_parity_fixture());
+}
+
+#[test]
+fn pagination_family_uses_offset_capable_facet_path() {
+    assert_pagination_family(&build_parity_fixture());
+}
+
+#[test]
+fn exact_nb_hits_family_keeps_total_exact_above_requested_limit() {
+    assert_exact_nb_hits_family(&build_parity_fixture());
+}
+
+#[test]
+fn geo_family_filters_executor_results_with_precise_distances() {
+    assert_geo_family(&build_parity_fixture());
+}
+
+#[test]
+fn highlight_family_asserts_exact_em_strings_and_match_levels() {
+    assert_highlight_family(&build_parity_fixture());
+}
+
+#[test]
+fn custom_ranking_family_uses_doc_id_tiebreak_for_equal_keys() {
+    assert_custom_ranking_family(&build_parity_fixture());
+}
+
+/// Full ten-family sweeps executed on the bounded multithread path. Repetition
+/// is what turns a one-shot equality check into a stability check: per-segment
+/// task scheduling differs between rounds, so a merge-order-dependent
+/// regression that hides on the first round surfaces on a later one.
+const BOUNDED_PARITY_ROUNDS: usize = 3;
+
+#[test]
+#[serial_test::serial(flapjack_search_threads_env)]
+fn executor_parallelism_is_bounded_and_deterministic() {
+    let fixture = build_parity_fixture();
+
+    // Every family below also asserts against the frozen single-thread
+    // benchmark constants, so this baseline additionally pins the phase-report
+    // fields those constants do not cover.
+    let single_thread_fingerprints = {
+        let _env = SearchThreadsEnvGuard::set("1");
+        assert_all_parity_families(&fixture)
+    };
+
+    let _env = SearchThreadsEnvGuard::set(&TEST_THREAD_COUNT.to_string());
+    let pool = super::bounded_pool(TEST_THREAD_COUNT).expect("bounded pool for 2 threads");
+    pool.reset_counters();
+
+    for round in 0..BOUNDED_PARITY_ROUNDS {
+        let bounded_fingerprints = assert_all_parity_families(&fixture);
+        assert_eq!(
+            bounded_fingerprints, single_thread_fingerprints,
+            "bounded round {round} diverged from the single-thread phase reports"
+        );
+    }
+
+    let counters = wait_for_pool_quiescence(&pool);
+    assert_eq!(counters.budget, TEST_THREAD_COUNT);
+    assert!(
+        counters.multithread_executions > 0,
+        "no search took the bounded multithread path, so this parity sweep proved nothing"
+    );
+    assert_eq!(
+        counters.in_flight, 0,
+        "every permit must be released once the sweep finishes"
+    );
+    assert!(
+        counters.in_flight_high_water <= TEST_THREAD_COUNT,
+        "in-flight high water {} exceeded the budget of {TEST_THREAD_COUNT}",
+        counters.in_flight_high_water
+    );
 }
 
 fn laptop_filter() -> Filter {

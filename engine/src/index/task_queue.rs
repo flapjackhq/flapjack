@@ -115,8 +115,8 @@ async fn process_tasks(
 ///
 /// Flushes in-flight writes by draining the tenant's write queue and awaiting
 /// its write-task handle, then copies the on-disk index directory to
-/// `dest_path` using a blocking filesystem copy. The tenant's writer and
-/// loaded-index entries are removed from the manager regardless of outcome.
+/// `dest_path` using a blocking filesystem copy. The tenant's loaded-index
+/// entry is removed from the manager regardless of outcome.
 /// Task status in `tasks` is updated to `Processing`, then to `Succeeded` or
 /// `Failed` at each stage.
 ///
@@ -125,7 +125,7 @@ async fn process_tasks(
 /// * `task_id` — Unique identifier used to update status in the shared task map.
 /// * `tenant_id` — Tenant whose index is being exported.
 /// * `dest_path` — Target directory for the recursive copy.
-/// * `manager` — Shared `IndexManager` used to flush writers and locate source data.
+/// * `manager` — Shared `IndexManager` used to drain writes and locate source data.
 /// * `tasks` — Shared map of task metadata, mutated with progress and outcome.
 async fn process_export(
     task_id: String,
@@ -165,7 +165,6 @@ async fn process_export(
     })
     .await;
 
-    manager.writers.remove(&tenant_id);
     manager.loaded.remove(&tenant_id);
 
     match copy_result {

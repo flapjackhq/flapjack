@@ -2,7 +2,7 @@
 // Stage 2 builds this migration-local persistence owner before later stages wire callers.
 use chrono::{DateTime, Duration, Utc};
 use flapjack::index::manager::publication::{
-    PublicationPaths, PublicationTarget, PublicationTransactionId,
+    PublicationGenerationEvidence, PublicationPaths, PublicationTarget, PublicationTransactionId,
 };
 use fs2::{available_space, FileExt};
 use serde::{Deserialize, Serialize};
@@ -248,6 +248,11 @@ pub(crate) struct MigrationPhaseRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct AsyncMigrationMetadata {
     pub job_uuid: Uuid,
+    #[serde(
+        default,
+        skip_serializing_if = "super::AsyncMigrationSourceProvider::is_algolia"
+    )]
+    pub source_provider: super::AsyncMigrationSourceProvider,
     pub target_index: String,
     #[serde(
         default,
@@ -258,6 +263,8 @@ pub(crate) struct AsyncMigrationMetadata {
     pub authenticated_app_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub publication_transaction_id: Option<PublicationTransactionId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_publication_generation: Option<PublicationGenerationEvidence>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -516,6 +523,7 @@ pub(crate) enum SpoolErrorKind {
     StagedArtifactBytesExceeded,
     InvalidRelativePath,
     InvalidSourceIdentityDigest,
+    InvalidCompletedResourceId,
     CheckpointHandleNotFound,
     SourceIdentityMismatch,
     ResourceVerificationFailed,
@@ -788,10 +796,12 @@ impl SpoolStore {
     ) -> AsyncMigrationMetadata {
         AsyncMigrationMetadata {
             job_uuid,
+            source_provider: super::AsyncMigrationSourceProvider::Algolia,
             target_index: target_index.to_string(),
             publication_semantic,
             authenticated_app_id: authenticated_app_id.map(str::to_owned),
             publication_transaction_id: None,
+            expected_publication_generation: None,
         }
     }
 
@@ -954,12 +964,22 @@ impl SpoolStore {
         job_uuid: Uuid,
         transaction_id: PublicationTransactionId,
     ) -> SpoolResult<()> {
+        self.record_async_publication_receipt_if_present(job_uuid, transaction_id, None)
+    }
+
+    pub(crate) fn record_async_publication_receipt_if_present(
+        &self,
+        job_uuid: Uuid,
+        transaction_id: PublicationTransactionId,
+        expected_generation: Option<PublicationGenerationEvidence>,
+    ) -> SpoolResult<()> {
         let _root_lock = self.lock_root()?;
         let _job_lock = self.lock_job(job_uuid)?;
         let Some(mut metadata) = self.read_async_migration_metadata_if_exists(job_uuid)? else {
             return Ok(());
         };
         metadata.publication_transaction_id = Some(transaction_id);
+        metadata.expected_publication_generation = expected_generation;
         self.commit_async_migration_metadata(&metadata)
     }
 
@@ -1376,6 +1396,9 @@ impl SpoolStore {
         self.ensure_writable(&manifest)?;
         let path = self.completed_sidecar_path(job_uuid);
         let existing = self.completed_object_ids_from_manifest(job_uuid, &manifest)?;
+        for object_id in object_ids {
+            validate_completed_resource_id(object_id)?;
+        }
         let mut next = existing.clone();
         let mut file = OpenOptions::new()
             .create(true)
@@ -1641,6 +1664,13 @@ impl SpoolStore {
     }
 }
 
+fn validate_completed_resource_id(value: &str) -> SpoolResult<()> {
+    if value.is_empty() || value.chars().any(|ch| matches!(ch, '\n' | '\r' | '\0')) {
+        return Err(SpoolError::new(SpoolErrorKind::InvalidCompletedResourceId));
+    }
+    Ok(())
+}
+
 #[path = "spool_support.rs"]
 mod spool_support;
 use spool_support::*;
@@ -1664,3 +1694,52 @@ mod spool_gc_probe_tests;
 #[cfg(test)]
 #[path = "export_resume_tests.rs"]
 mod export_resume_tests;
+
+#[cfg(test)]
+mod completed_id_security_tests {
+    use super::*;
+    use chrono::Utc;
+    use tempfile::TempDir;
+
+    fn admitted_export_store() -> (TempDir, SpoolStore, Uuid) {
+        let tmp = TempDir::new().unwrap();
+        let store =
+            SpoolStore::new_for_tests(tmp.path(), SpoolLimits::default(), Utc::now(), u64::MAX)
+                .unwrap();
+        let job_uuid = Uuid::new_v4();
+        store.create_migration_phase(job_uuid).unwrap();
+        store
+            .create_export(
+                job_uuid,
+                &"a".repeat(64),
+                ResourceDenominators {
+                    settings: 0,
+                    documents: 0,
+                    rules: 0,
+                    synonyms: 0,
+                    config: 0,
+                },
+            )
+            .unwrap();
+        (tmp, store, job_uuid)
+    }
+
+    #[test]
+    fn completed_object_ids_reject_control_delimited_ids() {
+        let (_tmp, store, job_uuid) = admitted_export_store();
+
+        let error = store
+            .mark_completed_object_ids(job_uuid, &["safe-id\nforged-id"])
+            .expect_err("newline-delimited object ids must fail closed");
+
+        assert_eq!(error.kind(), SpoolErrorKind::InvalidCompletedResourceId);
+        assert!(
+            !store.completed_sidecar_path(job_uuid).exists(),
+            "failed validation must not leave a completion sidecar behind"
+        );
+        assert!(
+            store.completed_object_ids(job_uuid).unwrap().is_empty(),
+            "rejected ids must not poison the completion ledger"
+        );
+    }
+}

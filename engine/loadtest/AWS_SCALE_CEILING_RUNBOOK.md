@@ -32,10 +32,25 @@ Use the secret file from the source repository, not a worktree copy:
 
 ```bash
 TRACK_A_SECRET_FILE="/Users/stuart/repos/gridl-dev/flapjack_dev/engine/.secret/.env.secret"
-test -s "$TRACK_A_SECRET_FILE"
-source "$TRACK_A_SECRET_FILE"
-aws sts get-caller-identity
+bash engine/loadtest/aws_credential_preflight.sh "$TRACK_A_SECRET_FILE"
 ```
+
+Run the preflight FIRST and treat a non-zero exit as a hard stop. Do not fall back to a bare
+`source` + `aws sts get-caller-identity`, and do not run `aws login`.
+
+**Why this replaced the bare source (2026-07-27).** The secret files across every repo used bare
+`NAME=value` assignments with no `export` — 370 of them, zero exported. `source` therefore set SHELL
+variables that never reached the `aws` child process, so the CLI silently resolved
+`~/.aws/config`'s `[default]` browser-token profile instead and reported
+`Your session has expired. Please reauthenticate using 'aws login'`. That message named neither real
+fault: the environment was not being passed at all, and underneath it the long-lived `AKIA` keys were
+themselves invalid. One fault masked the other and a paid measurement lane failed its identity gate
+without ever provisioning. The preflight separates the cases and exits `1` (not exported), `2` (keys
+rejected — plumbing fine), `3` (a browser/SSO session is still winning over the environment), `4`
+(secret file missing), `5` (no `aws` CLI).
+
+Prefer a dedicated long-lived IAM user scoped to EC2 + S3 for scale runs. A browser/SSO session is
+not usable for unattended work: it expires and its refresh is interactive.
 
 Resolve the instance by its Name tag on every connection attempt. Never use a cached IP or a local
 state file:

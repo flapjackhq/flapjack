@@ -54,6 +54,7 @@ pub struct MemoryBudget {
     max_concurrent_writers: usize,
     max_document_size_bytes: usize,
     active_writers: Arc<AtomicUsize>,
+    waiting_writers: Arc<AtomicUsize>,
 }
 
 impl MemoryBudget {
@@ -64,6 +65,7 @@ impl MemoryBudget {
             max_concurrent_writers: max_writers,
             max_document_size_bytes: max_doc,
             active_writers: Arc::new(AtomicUsize::new(0)),
+            waiting_writers: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -111,8 +113,20 @@ impl MemoryBudget {
         self.max_concurrent_writers
     }
 
+    pub(crate) fn register_writer_waiter(&self) -> WriterWaiter {
+        self.waiting_writers.fetch_add(1, Ordering::SeqCst);
+        WriterWaiter {
+            waiting_writers: Arc::clone(&self.waiting_writers),
+        }
+    }
+
+    pub(crate) fn has_writer_waiters(&self) -> bool {
+        self.waiting_writers.load(Ordering::SeqCst) > 0
+    }
+
     pub fn reset_for_test(&self) {
         self.active_writers.store(0, Ordering::SeqCst);
+        self.waiting_writers.store(0, Ordering::SeqCst);
     }
 }
 
@@ -123,6 +137,7 @@ impl Clone for MemoryBudget {
             max_concurrent_writers: self.max_concurrent_writers,
             max_document_size_bytes: self.max_document_size_bytes,
             active_writers: Arc::clone(&self.active_writers),
+            waiting_writers: Arc::clone(&self.waiting_writers),
         }
     }
 }
@@ -134,6 +149,16 @@ pub struct WriterGuard {
 impl Drop for WriterGuard {
     fn drop(&mut self) {
         self.active_writers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+pub(crate) struct WriterWaiter {
+    waiting_writers: Arc<AtomicUsize>,
+}
+
+impl Drop for WriterWaiter {
+    fn drop(&mut self) {
+        self.waiting_writers.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

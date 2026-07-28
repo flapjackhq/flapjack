@@ -19,6 +19,10 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
 use chrono::{TimeZone, Utc};
+use flapjack::index::manager::publication::{
+    ContentDigest, PublicationEvent, PublicationGenerationEvidence, PublicationJournal,
+    PublicationPaths, PublicationTarget, PublicationTransactionId,
+};
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::sync::{
@@ -597,25 +601,203 @@ async fn async_acknowledge_running_job_fails_closed_without_mutating_phase() {
     assert_eq!(spool.read_migration_phase(job_uuid).unwrap(), running);
 }
 
-fn migration_job_route(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route(
-            "/1/migrations/algolia/:job_id",
-            get(get_algolia_migration_status_http),
+#[tokio::test]
+async fn async_acknowledge_failed_and_cancelled_jobs_preserve_terminal_compatibility() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let spool = import::spool_for_manager(&state.manager).unwrap();
+    let cancelled_job = Uuid::new_v4();
+    let failed_job = Uuid::new_v4();
+
+    spool
+        .create_async_migration_admission_for_owner(
+            cancelled_job,
+            "ack_cancelled_terminal",
+            Some("async-owner-app"),
+            AsyncMigrationPublicationSemantic::CreateOnly,
         )
-        .route(
-            "/1/migrations/algolia/:job_id/acknowledge",
-            post(acknowledge_algolia_migration),
+        .unwrap();
+    let cancelled_terminal = spool.cancel_migration(cancelled_job).unwrap();
+
+    spool
+        .create_async_migration_admission_for_owner(
+            failed_job,
+            "ack_failed_terminal",
+            Some("async-owner-app"),
+            AsyncMigrationPublicationSemantic::CreateOnly,
         )
-        .route(
-            "/1/migrations/algolia/:job_id/cancel",
-            post(cancel_algolia_migration_http),
+        .unwrap();
+    let failed_terminal = spool.fail_migration(failed_job).unwrap();
+
+    for (job_uuid, terminal) in [
+        (cancelled_job, cancelled_terminal),
+        (failed_job, failed_terminal),
+    ] {
+        let status = acknowledge_algolia_migration(
+            State(Arc::clone(&state)),
+            axum::extract::Extension(AuthenticatedAppId("async-owner-app".to_string())),
+            HeaderMap::new(),
+            AxumPath(job_uuid.to_string()),
         )
-        .with_state(state)
+        .await
+        .expect("failed and cancelled ACKs should remain idempotent no-ops");
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(spool.read_migration_phase(job_uuid).unwrap(), terminal);
+    }
+}
+
+#[tokio::test]
+async fn async_acknowledge_published_terminal_job_requires_generation_evidence() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let spool = import::spool_for_manager(&state.manager).unwrap();
+    let job_uuid = Uuid::new_v4();
+
+    spool
+        .create_async_migration_admission_for_owner(
+            job_uuid,
+            "ack_terminal_missing_generation",
+            Some("async-owner-app"),
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
+        .unwrap();
+    spool
+        .record_async_publication_transaction_if_present(
+            job_uuid,
+            PublicationTransactionId::new("ack_terminal_missing_generation_txn").unwrap(),
+        )
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Exporting)
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Preparing)
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Staging)
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Activating)
+        .unwrap();
+    let terminal = spool.succeed_migration(job_uuid, None).unwrap();
+
+    let response = acknowledge_algolia_migration(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(AuthenticatedAppId("async-owner-app".to_string())),
+        HeaderMap::new(),
+        AxumPath(job_uuid.to_string()),
+    )
+    .await
+    .expect_err("published successes must fail closed when generation evidence is missing");
+
+    assert_eq!(response.0, StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(response.1.into_response()).await,
+        json!({
+            "message": "Migration publication generation evidence is stale or unavailable",
+            "status": 409,
+            "code": "migration_ack_stale_generation"
+        })
+    );
+    assert_eq!(spool.read_migration_phase(job_uuid).unwrap(), terminal);
+}
+
+#[tokio::test]
+async fn async_acknowledge_published_terminal_job_accepts_current_generation() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let spool = import::spool_for_manager(&state.manager).unwrap();
+    let job_uuid = Uuid::new_v4();
+
+    spool
+        .create_async_migration_admission_for_owner(
+            job_uuid,
+            "ack_published_terminal",
+            Some("async-owner-app"),
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
+        .unwrap();
+    seed_ack_generation_evidence(&state, &spool, job_uuid, "ack_published_terminal");
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Exporting)
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Preparing)
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Staging)
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Activating)
+        .unwrap();
+    let terminal = spool.succeed_migration(job_uuid, None).unwrap();
+
+    let status = acknowledge_algolia_migration(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(AuthenticatedAppId("async-owner-app".to_string())),
+        HeaderMap::new(),
+        AxumPath(job_uuid.to_string()),
+    )
+    .await
+    .expect("published terminal ACK should accept matching current generation evidence");
+
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(spool.read_migration_phase(job_uuid).unwrap(), terminal);
+}
+
+const ALGOLIA_MIGRATION_PROVIDER: &str = "algolia";
+const TEST_ONLY_SECOND_PROVIDER: &str = "test_only_second_provider";
+
+/// Migration job lifecycle wire surface owned by one source provider.
+///
+/// The provider is part of the job-lifecycle URL, so status, cancel, and ACK
+/// requests are addressed through the provider that owns the route instead of
+/// through a hard-coded Algolia path. Tests that need to prove an any-provider
+/// contract mount a second provider's routes and drive both.
+struct MigrationLifecycleRoutes {
+    provider: &'static str,
+    router: Router,
+}
+
+impl MigrationLifecycleRoutes {
+    /// Mount one provider's lifecycle handlers under its own migration prefix.
+    fn mounted(provider: &'static str, provider_routes: Router) -> Self {
+        Self {
+            provider,
+            router: Router::new().nest(&format!("/1/migrations/{provider}"), provider_routes),
+        }
+    }
+
+    fn job_uri(&self, job_uuid: Uuid, suffix: &str) -> String {
+        format!("/1/migrations/{}/{job_uuid}{suffix}", self.provider)
+    }
+}
+
+fn migration_job_route(state: Arc<AppState>) -> MigrationLifecycleRoutes {
+    MigrationLifecycleRoutes::mounted(
+        ALGOLIA_MIGRATION_PROVIDER,
+        Router::new()
+            .route("/:job_id", get(get_algolia_migration_status_http))
+            .route("/:job_id/acknowledge", post(acknowledge_algolia_migration))
+            .route("/:job_id/cancel", post(cancel_algolia_migration_http))
+            .with_state(state),
+    )
+}
+
+fn test_only_second_provider_migration_job_route(state: Arc<AppState>) -> MigrationLifecycleRoutes {
+    MigrationLifecycleRoutes::mounted(
+        TEST_ONLY_SECOND_PROVIDER,
+        Router::new()
+            .route("/:job_id", get(get_algolia_migration_status_http))
+            .route("/:job_id/acknowledge", post(acknowledge_algolia_migration))
+            .route("/:job_id/cancel", post(cancel_algolia_migration_http))
+            .with_state(state),
+    )
 }
 
 async fn send_acknowledge_request(
-    app: &Router,
+    app: &MigrationLifecycleRoutes,
     job_uuid: Uuid,
     authenticated_app_id: &str,
     api_key: &str,
@@ -632,7 +814,7 @@ async fn send_acknowledge_request(
 }
 
 async fn send_status_request(
-    app: &Router,
+    app: &MigrationLifecycleRoutes,
     job_uuid: Uuid,
     authenticated_app_id: &str,
     api_key: &str,
@@ -649,7 +831,7 @@ async fn send_status_request(
 }
 
 async fn send_cancel_request(
-    app: &Router,
+    app: &MigrationLifecycleRoutes,
     job_uuid: Uuid,
     authenticated_app_id: &str,
     api_key: &str,
@@ -666,7 +848,7 @@ async fn send_cancel_request(
 }
 
 async fn send_migration_job_request(
-    app: &Router,
+    app: &MigrationLifecycleRoutes,
     job_uuid: Uuid,
     authenticated_app_id: &str,
     api_key: &str,
@@ -675,14 +857,14 @@ async fn send_migration_job_request(
 ) -> Response<Body> {
     let mut request = Request::builder()
         .method(method)
-        .uri(format!("/1/migrations/algolia/{job_uuid}{suffix}"))
+        .uri(app.job_uri(job_uuid, suffix))
         .header("x-algolia-api-key", api_key)
         .body(Body::empty())
         .unwrap();
     request
         .extensions_mut()
         .insert(AuthenticatedAppId(authenticated_app_id.to_string()));
-    app.clone().oneshot(request).await.unwrap()
+    app.router.clone().oneshot(request).await.unwrap()
 }
 
 #[tokio::test]
@@ -876,6 +1058,360 @@ async fn async_runner_created_job_is_isolated_by_authenticated_app_and_key() {
     }
 }
 
+#[tokio::test]
+async fn async_metadata_source_provider_defaults_and_reads_as_algolia() {
+    let job_uuid = Uuid::new_v4();
+    let legacy: spool::AsyncMigrationMetadata = serde_json::from_value(json!({
+        "job_uuid": job_uuid,
+        "target_index": "legacy-provider-target"
+    }))
+    .unwrap();
+    assert_eq!(
+        legacy.source_provider,
+        AsyncMigrationSourceProvider::Algolia
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let spool = import::spool_for_manager(&state.manager).unwrap();
+    spool
+        .create_async_migration_admission_for_owner(
+            job_uuid,
+            "provider-target",
+            Some("provider-owner"),
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
+        .unwrap();
+    let admitted = spool.read_async_migration_metadata(job_uuid).unwrap();
+    assert_eq!(
+        admitted.source_provider,
+        AsyncMigrationSourceProvider::Algolia
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_source_providers_share_one_migration_job_runner_and_spool() {
+    const OWNER_APP: &str = "shared-runner-owner";
+    const OWNER_KEY: &str = "shared-runner-key";
+
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp)
+        .with_migration_capacity(1)
+        .build_shared();
+    let app = migration_job_route(Arc::clone(&state));
+    let reached_documents = Arc::new(Notify::new());
+    let release_documents = Arc::new(Notify::new());
+    let owner_identity = authenticated_owner_identity(
+        OWNER_APP.to_string(),
+        &migration_owner_headers(Some(OWNER_KEY)),
+    );
+
+    let (job_uuid, _) = state
+        .migration_runner
+        .submit_algolia_import_for_owner(valid_async_request(), Some(owner_identity), {
+            let reached_documents = Arc::clone(&reached_documents);
+            let release_documents = Arc::clone(&release_documents);
+            move |_| {
+                Ok(BlockingDocumentReadSourceReader::new(
+                    async_hermetic_source_reader(),
+                    reached_documents,
+                    release_documents,
+                ))
+            }
+        })
+        .await
+        .expect("provider admission should flow through the shared lifecycle owner");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reached_documents.notified(),
+    )
+    .await
+    .expect("shared runner should reach document export");
+
+    let shared_runner_active_jobs = state.migration_runner.active_count_for_test();
+    let second_admission = state
+        .migration_runner
+        .submit_algolia_import_for_owner(valid_async_request(), None, |_| {
+            Ok(async_hermetic_source_reader())
+        })
+        .await
+        .expect_err("shared provider admission must respect the one shared capacity limit");
+    assert_eq!(second_admission.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        send_status_request(&app, job_uuid, OWNER_APP, OWNER_KEY)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send_acknowledge_request(&app, job_uuid, OWNER_APP, OWNER_KEY)
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        send_cancel_request(&app, job_uuid, OWNER_APP, OWNER_KEY)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    release_documents.notify_waiters();
+    let terminal = wait_for_async_terminal(&state, job_uuid, OWNER_APP, Some(OWNER_KEY)).await;
+    assert_eq!(terminal.disposition, AsyncMigrationDisposition::Cancelled);
+
+    assert_eq!(
+        shared_runner_active_jobs, 1,
+        "provider-private runner forked lifecycle ownership: the shared runner did not account for its admitted job"
+    );
+}
+
+#[tokio::test]
+async fn shared_migration_lifecycle_has_no_duplicate_owner_seams() {
+    let sources = production_rust_sources();
+
+    let expected_owners: &[(&str, &[(&str, usize)])] = &[
+        (
+            "MigrationJobRunner::new(",
+            &[
+                ("flapjack-http/src/handlers/migration/job_runner.rs", 1),
+                ("flapjack-http/src/handlers/replicas.rs", 1),
+                ("flapjack-http/src/server_init.rs", 1),
+            ],
+        ),
+        (
+            "SpoolStore::new(",
+            &[
+                ("flapjack-http/src/background_tasks.rs", 1),
+                ("flapjack-http/src/handlers/migration/import.rs", 1),
+                ("flapjack-http/src/handlers/migration/job_runner.rs", 1),
+            ],
+        ),
+        (
+            "create_async_migration_admission_for_owner(",
+            &[
+                ("flapjack-http/src/handlers/migration/job_runner.rs", 2),
+                ("flapjack-http/src/handlers/migration/spool.rs", 2),
+            ],
+        ),
+        (
+            "record_async_publication_receipt_if_present(",
+            &[
+                ("flapjack-http/src/handlers/migration/import.rs", 1),
+                ("flapjack-http/src/handlers/migration/spool.rs", 2),
+            ],
+        ),
+        (
+            "request_async_migration_cancel(",
+            &[
+                ("flapjack-http/src/handlers/migration/mod.rs", 1),
+                ("flapjack-http/src/handlers/migration/spool.rs", 1),
+            ],
+        ),
+        (
+            "read_migration_phase(",
+            &[
+                ("flapjack-http/src/handlers/migration/job_runner.rs", 1),
+                ("flapjack-http/src/handlers/migration/mod.rs", 4),
+                ("flapjack-http/src/handlers/migration/spool.rs", 10),
+                ("flapjack-http/src/handlers/migration/spool_support.rs", 1),
+            ],
+        ),
+        (
+            "owned_async_migration_job(",
+            &[("flapjack-http/src/handlers/migration/mod.rs", 4)],
+        ),
+        (
+            "async fn get_source_migration_status(",
+            &[("flapjack-http/src/handlers/migration/mod.rs", 1)],
+        ),
+        (
+            "async fn cancel_source_migration(",
+            &[("flapjack-http/src/handlers/migration/mod.rs", 1)],
+        ),
+        (
+            "async fn acknowledge_source_migration(",
+            &[("flapjack-http/src/handlers/migration/mod.rs", 1)],
+        ),
+        (
+            "pub migration_runner: Arc<migration::MigrationJobRunner>",
+            &[("flapjack-http/src/handlers/mod.rs", 1)],
+        ),
+        (
+            "pub struct MigrationJobRunner",
+            &[("flapjack-http/src/handlers/migration/job_runner.rs", 1)],
+        ),
+        (
+            "pub(crate) struct SpoolStore",
+            &[("flapjack-http/src/handlers/migration/spool.rs", 1)],
+        ),
+        (
+            "persist_journal(",
+            &[
+                ("src/index/manager/publication/executor.rs", 4),
+                ("src/index/manager/publication/repair.rs", 2),
+            ],
+        ),
+        (
+            "io.write_file(",
+            &[
+                ("src/index/manager/publication/executor.rs", 2),
+                ("src/index/manager/publication/repair.rs", 1),
+            ],
+        ),
+    ];
+
+    assert_exact_source_owners(&sources, expected_owners);
+}
+
+fn assert_exact_source_owners(
+    sources: &[(String, String)],
+    expected_owners: &[(&str, &[(&str, usize)])],
+) {
+    for (marker, expected) in expected_owners {
+        let actual: Vec<(&str, usize)> = sources
+            .iter()
+            .filter_map(|(path, source)| {
+                let count = source.matches(marker).count();
+                (count > 0).then_some((path.as_str(), count))
+            })
+            .collect();
+        assert_eq!(
+            actual, *expected,
+            "shared migration lifecycle owner drift for marker {marker}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_generation_cannot_mutate_terminal_or_ack_state_for_any_provider() {
+    const OWNER_APP: &str = "stale-generation-owner";
+    const OWNER_KEY: &str = "stale-generation-key";
+
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let spool = import::spool_for_manager(&state.manager).unwrap();
+    let owner_identity = authenticated_owner_identity(
+        OWNER_APP.to_string(),
+        &migration_owner_headers(Some(OWNER_KEY)),
+    );
+    let mut stale_ack_statuses = Vec::new();
+
+    // Both specimens are admitted by the one shared runner that
+    // `all_source_providers_share_one_migration_job_runner_and_spool` pins, and
+    // then driven over their own provider's lifecycle routes: the guard under
+    // test has to hold for every provider wire entry, not just Algolia's.
+    for app in [
+        migration_job_route(Arc::clone(&state)),
+        test_only_second_provider_migration_job_route(Arc::clone(&state)),
+    ] {
+        let source_provider = app.provider;
+        let target_index = format!("{source_provider}_stale_generation_target");
+        let request = MigrateFromAlgoliaRequest {
+            target_index: Some(target_index.clone()),
+            ..valid_async_request()
+        };
+        let (job_uuid, _) = state
+            .migration_runner
+            .submit_algolia_import_for_owner(request, Some(owner_identity.clone()), |_| {
+                Ok(async_hermetic_source_reader())
+            })
+            .await
+            .expect("provider specimen should reach the current shared lifecycle");
+        wait_for_async_terminal(&state, job_uuid, OWNER_APP, Some(OWNER_KEY)).await;
+        let terminal_before = spool.read_migration_phase(job_uuid).unwrap();
+        let metadata = spool.read_async_migration_metadata(job_uuid).unwrap();
+        let transaction_id = metadata
+            .publication_transaction_id
+            .expect("terminal import should retain its publication transaction");
+        let target = PublicationTarget::new(target_index).unwrap();
+        let journal_path =
+            PublicationPaths::new(&state.manager.base_path, &target, &transaction_id).journal;
+        let mut journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        journal["generation"] = json!(format!("stale-replacement-{source_provider}"));
+        std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+        assert_eq!(
+            send_status_request(&app, job_uuid, OWNER_APP, OWNER_KEY)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send_cancel_request(&app, job_uuid, OWNER_APP, OWNER_KEY)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let acknowledge = send_acknowledge_request(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
+        stale_ack_statuses.push((source_provider, acknowledge.status()));
+        assert_eq!(
+            spool.read_migration_phase(job_uuid).unwrap(),
+            terminal_before
+        );
+    }
+
+    assert_eq!(
+        stale_ack_statuses,
+        vec![
+            (ALGOLIA_MIGRATION_PROVIDER, StatusCode::CONFLICT),
+            (TEST_ONLY_SECOND_PROVIDER, StatusCode::CONFLICT),
+        ],
+        "stale generation ACK mutated ACK-visible state: every provider must fail closed before acknowledging a superseded terminal generation"
+    );
+}
+
+fn production_rust_sources() -> Vec<(String, String)> {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let engine_root = manifest_dir
+        .parent()
+        .expect("flapjack-http must live under engine");
+    let mut sources = Vec::new();
+    collect_production_rust_sources(&manifest_dir.join("src"), engine_root, &mut sources);
+    collect_production_rust_sources(
+        &engine_root.join("src/index/manager/publication"),
+        engine_root,
+        &mut sources,
+    );
+    sources.sort_by(|left, right| left.0.cmp(&right.0));
+    sources
+}
+
+fn collect_production_rust_sources(
+    directory: &std::path::Path,
+    engine_root: &std::path::Path,
+    sources: &mut Vec<(String, String)>,
+) {
+    for entry in std::fs::read_dir(directory).expect("production source directory must be readable")
+    {
+        let path = entry
+            .expect("production source entry must be readable")
+            .path();
+        if path.is_dir() {
+            collect_production_rust_sources(&path, engine_root, sources);
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs")
+            || file_name.contains("_test")
+            || file_name.starts_with("test_")
+        {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(engine_root)
+            .expect("source must stay under engine")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source =
+            std::fs::read_to_string(&path).expect("production Rust source must be readable");
+        sources.push((relative, source));
+    }
+}
+
 async fn assert_migration_job_not_found(response: Response<Body>, operation: &str) {
     assert_eq!(
         response.status(),
@@ -1047,6 +1583,35 @@ fn migration_owner_headers(api_key: Option<&str>) -> HeaderMap {
         headers.insert("x-algolia-api-key", api_key.parse().unwrap());
     }
     headers
+}
+
+fn seed_ack_generation_evidence(
+    state: &Arc<AppState>,
+    spool: &spool::SpoolStore,
+    job_uuid: Uuid,
+    target_index: &str,
+) {
+    let target = PublicationTarget::new(target_index).unwrap();
+    let transaction_id =
+        PublicationTransactionId::new(format!("async_status_{job_uuid}_current_gen")).unwrap();
+    let generation =
+        PublicationGenerationEvidence::new(format!("async_status_{job_uuid}_generation")).unwrap();
+    let paths = PublicationPaths::new(&state.manager.base_path, &target, &transaction_id);
+    let journal = PublicationJournal::prepare(
+        transaction_id.clone(),
+        target,
+        generation.clone(),
+        ContentDigest::new(format!("sha256:{}", "0".repeat(64))).unwrap(),
+        paths.clone(),
+    )
+    .apply(PublicationEvent::Commit)
+    .unwrap();
+
+    std::fs::create_dir_all(paths.journal.parent().unwrap()).unwrap();
+    std::fs::write(paths.journal, journal.to_json_value().to_string()).unwrap();
+    spool
+        .record_async_publication_receipt_if_present(job_uuid, transaction_id, Some(generation))
+        .unwrap();
 }
 
 struct BlockingDocumentReadSourceReader {

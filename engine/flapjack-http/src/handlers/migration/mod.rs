@@ -58,6 +58,9 @@ const PRIVACY_SCRUB_INTERRUPTED_RETRYABLE_CODE: &str = "privacy_scrub_interrupte
 const MIGRATION_ACK_TOO_EARLY_CODE: &str = "migration_ack_too_early";
 const MIGRATION_ACK_TOO_EARLY_MESSAGE: &str =
     "Migration job must be terminal before it can be acknowledged";
+const MIGRATION_ACK_STALE_GENERATION_CODE: &str = "migration_ack_stale_generation";
+const MIGRATION_ACK_STALE_GENERATION_MESSAGE: &str =
+    "Migration publication generation evidence is stale or unavailable";
 
 /// Request payload for migrating an index from Algolia to Flapjack.
 ///
@@ -83,6 +86,19 @@ pub struct MigrateFromAlgoliaRequest {
     /// imports still refuse overwrite requests.
     #[serde(default)]
     pub overwrite: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AsyncMigrationSourceProvider {
+    #[default]
+    Algolia,
+}
+
+impl AsyncMigrationSourceProvider {
+    fn is_algolia(&self) -> bool {
+        *self == Self::Algolia
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -610,14 +626,7 @@ pub async fn get_algolia_migration_status(
     Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
     AxumPath(job_id): AxumPath<String>,
 ) -> Result<Json<AsyncMigrationStatusResponse>, MigrateError> {
-    let job_uuid = Uuid::parse_str(&job_id)
-        .map_err(|_| json_error_parts(StatusCode::BAD_REQUEST, "job_id must be a valid UUID"))?;
-    let spool = import::spool_for_manager(&state.manager)?;
-    ensure_async_migration_owner(&spool, job_uuid, &authenticated_app_id)?;
-    let phase_record = spool
-        .read_migration_phase(job_uuid)
-        .map_err(migration_status_spool_error)?;
-    Ok(Json(AsyncMigrationStatusResponse::from(phase_record)))
+    get_source_migration_status(state, authenticated_app_id, job_id).await
 }
 
 pub(crate) async fn get_algolia_migration_status_http(
@@ -626,18 +635,12 @@ pub(crate) async fn get_algolia_migration_status_http(
     headers: HeaderMap,
     AxumPath(job_id): AxumPath<String>,
 ) -> Result<Json<AsyncMigrationStatusResponse>, MigrateError> {
-    let job_uuid = Uuid::parse_str(&job_id)
-        .map_err(|_| json_error_parts(StatusCode::BAD_REQUEST, "job_id must be a valid UUID"))?;
-    let spool = import::spool_for_manager(&state.manager)?;
-    ensure_async_migration_owner(
-        &spool,
-        job_uuid,
-        &authenticated_owner_identity(authenticated_app_id, &headers),
-    )?;
-    let phase_record = spool
-        .read_migration_phase(job_uuid)
-        .map_err(migration_status_spool_error)?;
-    Ok(Json(AsyncMigrationStatusResponse::from(phase_record)))
+    get_source_migration_status(
+        state,
+        authenticated_owner_identity(authenticated_app_id, &headers),
+        job_id,
+    )
+    .await
 }
 
 /// Request cooperative cancellation for an async Algolia migration job.
@@ -667,23 +670,7 @@ pub async fn cancel_algolia_migration(
     Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
     AxumPath(job_id): AxumPath<String>,
 ) -> Result<Json<AsyncMigrationStatusResponse>, MigrateError> {
-    let job_uuid = Uuid::parse_str(&job_id)
-        .map_err(|_| json_error_parts(StatusCode::BAD_REQUEST, "job_id must be a valid UUID"))?;
-    let spool = import::spool_for_manager(&state.manager)?;
-    ensure_async_migration_owner(&spool, job_uuid, &authenticated_app_id)?;
-    match spool
-        .request_async_migration_cancel(job_uuid)
-        .map_err(migration_status_spool_error)?
-    {
-        MigrationCancelRequest::Requested(record) => {
-            Ok(Json(AsyncMigrationStatusResponse::from(record)))
-        }
-        MigrationCancelRequest::TooLate(_) => Err(json_error_parts_with_code(
-            StatusCode::CONFLICT,
-            MIGRATION_CANCEL_TOO_LATE_CODE,
-            MIGRATION_CANCEL_TOO_LATE_MESSAGE,
-        )),
-    }
+    cancel_source_migration(state, authenticated_app_id, job_id).await
 }
 
 pub(crate) async fn cancel_algolia_migration_http(
@@ -692,14 +679,32 @@ pub(crate) async fn cancel_algolia_migration_http(
     headers: HeaderMap,
     AxumPath(job_id): AxumPath<String>,
 ) -> Result<Json<AsyncMigrationStatusResponse>, MigrateError> {
-    let job_uuid = Uuid::parse_str(&job_id)
-        .map_err(|_| json_error_parts(StatusCode::BAD_REQUEST, "job_id must be a valid UUID"))?;
-    let spool = import::spool_for_manager(&state.manager)?;
-    ensure_async_migration_owner(
-        &spool,
-        job_uuid,
-        &authenticated_owner_identity(authenticated_app_id, &headers),
-    )?;
+    cancel_source_migration(
+        state,
+        authenticated_owner_identity(authenticated_app_id, &headers),
+        job_id,
+    )
+    .await
+}
+
+async fn get_source_migration_status(
+    state: Arc<AppState>,
+    owner_identity: String,
+    job_id: String,
+) -> Result<Json<AsyncMigrationStatusResponse>, MigrateError> {
+    let (spool, job_uuid) = owned_async_migration_job(&state, &owner_identity, &job_id)?;
+    let phase_record = spool
+        .read_migration_phase(job_uuid)
+        .map_err(migration_status_spool_error)?;
+    Ok(Json(AsyncMigrationStatusResponse::from(phase_record)))
+}
+
+async fn cancel_source_migration(
+    state: Arc<AppState>,
+    owner_identity: String,
+    job_id: String,
+) -> Result<Json<AsyncMigrationStatusResponse>, MigrateError> {
+    let (spool, job_uuid) = owned_async_migration_job(&state, &owner_identity, &job_id)?;
     match spool
         .request_async_migration_cancel(job_uuid)
         .map_err(migration_status_spool_error)?
@@ -742,14 +747,20 @@ pub async fn acknowledge_algolia_migration(
     headers: HeaderMap,
     AxumPath(job_id): AxumPath<String>,
 ) -> Result<StatusCode, MigrateError> {
-    let job_uuid = Uuid::parse_str(&job_id)
-        .map_err(|_| json_error_parts(StatusCode::BAD_REQUEST, "job_id must be a valid UUID"))?;
-    let spool = import::spool_for_manager(&state.manager)?;
-    ensure_async_migration_owner(
-        &spool,
-        job_uuid,
-        &authenticated_owner_identity(authenticated_app_id, &headers),
-    )?;
+    acknowledge_source_migration(
+        state,
+        authenticated_owner_identity(authenticated_app_id, &headers),
+        job_id,
+    )
+    .await
+}
+
+async fn acknowledge_source_migration(
+    state: Arc<AppState>,
+    owner_identity: String,
+    job_id: String,
+) -> Result<StatusCode, MigrateError> {
+    let (spool, job_uuid) = owned_async_migration_job(&state, &owner_identity, &job_id)?;
     let phase_record = spool
         .read_migration_phase(job_uuid)
         .map_err(migration_status_spool_error)?;
@@ -762,6 +773,7 @@ pub async fn acknowledge_algolia_migration(
             MIGRATION_ACK_TOO_EARLY_MESSAGE,
         ));
     }
+    verify_async_migration_ack_generation(&state, &spool, job_uuid, &phase_record)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -946,6 +958,50 @@ fn ensure_async_migration_owner(
         MIGRATION_JOB_NOT_FOUND_CODE,
         MIGRATION_JOB_NOT_FOUND_MESSAGE,
     ))
+}
+
+fn owned_async_migration_job(
+    state: &AppState,
+    owner_identity: &str,
+    job_id: &str,
+) -> Result<(spool::SpoolStore, Uuid), MigrateError> {
+    let job_uuid = Uuid::parse_str(job_id)
+        .map_err(|_| json_error_parts(StatusCode::BAD_REQUEST, "job_id must be a valid UUID"))?;
+    let spool = import::spool_for_manager(&state.manager)?;
+    ensure_async_migration_owner(&spool, job_uuid, owner_identity)?;
+    Ok((spool, job_uuid))
+}
+
+fn verify_async_migration_ack_generation(
+    state: &AppState,
+    spool: &spool::SpoolStore,
+    job_uuid: Uuid,
+    phase_record: &MigrationPhaseRecord,
+) -> Result<(), MigrateError> {
+    if phase_record.disposition != MigrationDisposition::Succeeded {
+        return Ok(());
+    }
+    let metadata = spool
+        .read_async_migration_metadata(job_uuid)
+        .map_err(migration_status_spool_error)?;
+    if metadata.publication_transaction_id.is_none() {
+        return Ok(());
+    }
+    let target = PublicationTarget::new(metadata.target_index)
+        .map_err(|_| stale_async_migration_ack_generation())?;
+    let Some(expected_generation) = metadata.expected_publication_generation else {
+        return Err(stale_async_migration_ack_generation());
+    };
+    verify_current_generation_evidence(&state.manager.base_path, &target, &expected_generation)
+        .map_err(|_| stale_async_migration_ack_generation())
+}
+
+fn stale_async_migration_ack_generation() -> MigrateError {
+    json_error_parts_with_code(
+        StatusCode::CONFLICT,
+        MIGRATION_ACK_STALE_GENERATION_CODE,
+        MIGRATION_ACK_STALE_GENERATION_MESSAGE,
+    )
 }
 
 fn validate_privacy_scrub_request(payload: &PrivacyScrubRequest) -> Result<(), MigrateError> {

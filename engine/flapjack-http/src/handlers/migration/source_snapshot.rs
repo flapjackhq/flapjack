@@ -1,6 +1,9 @@
 #![allow(dead_code)]
 
 use super::algolia_client::{AlgoliaClientError, AlgoliaErrorKind};
+use super::source_identity_partitions::{
+    SourceIdentityConfig, SourceIdentityError, SourceIdentityPartitions, SourceIdentityVersion,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,35 +21,43 @@ pub(super) struct SourceResourceSnapshot {
     pub(super) count: usize,
     pub(super) hash: String,
     pub(super) ids: BTreeSet<String>,
+    pub(super) version: SourceIdentityVersion,
 }
 
 impl SourceSnapshot {
-    pub(super) fn from_raw(
+    #[cfg(test)]
+    pub(super) fn from_raw_with_identity_config(
         settings: Value,
         documents: Vec<Value>,
         rules: Vec<Value>,
         synonyms: Vec<Value>,
+        identity_config: SourceIdentityConfig,
     ) -> Result<Self, AlgoliaClientError> {
-        Ok(Self {
-            settings: settings_resource_snapshot(&settings),
-            documents: object_resource_snapshot(SourceSnapshotResource::Document, &documents)?,
-            rules: object_resource_snapshot(SourceSnapshotResource::Rule, &rules)?,
-            synonyms: object_resource_snapshot(SourceSnapshotResource::Synonym, &synonyms)?,
-        })
+        let mut builder = SourceSnapshotBuilder::new(identity_config)?;
+        builder.record_settings(&settings);
+        builder.record_documents(&documents)?;
+        builder.record_rules(&rules)?;
+        builder.record_synonyms(&synonyms)?;
+        builder.finish().map_err(AlgoliaClientError::from)
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct SourceSnapshotBuilder {
     settings: Option<SourceResourceSnapshot>,
-    documents: SourceResourceAccumulator,
+    documents: SourceIdentityPartitions,
     rules: SourceResourceAccumulator,
     synonyms: SourceResourceAccumulator,
 }
 
 impl SourceSnapshotBuilder {
-    pub(super) fn new() -> Self {
-        Self::default()
+    pub(super) fn new(identity_config: SourceIdentityConfig) -> Result<Self, SourceIdentityError> {
+        Ok(Self {
+            settings: None,
+            documents: SourceIdentityPartitions::new(identity_config)?,
+            rules: SourceResourceAccumulator::default(),
+            synonyms: SourceResourceAccumulator::default(),
+        })
     }
 
     pub(super) fn record_settings(&mut self, settings: &Value) {
@@ -72,9 +83,11 @@ impl SourceSnapshotBuilder {
         &mut self,
         page_index: usize,
         page: &[Value],
-    ) -> Result<(), SourceSnapshotSchemaViolation> {
-        self.documents
-            .record_items(SourceSnapshotResource::Document, page_index, page)
+    ) -> Result<(), SourceIdentityError> {
+        for (item_index, item) in page.iter().enumerate() {
+            self.documents.record_item(item, page_index, item_index)?;
+        }
+        Ok(())
     }
 
     pub(super) fn record_rules_page(
@@ -95,13 +108,19 @@ impl SourceSnapshotBuilder {
             .record_items(SourceSnapshotResource::Synonym, page_index, page)
     }
 
-    pub(super) fn finish(self) -> Result<SourceSnapshot, AlgoliaClientError> {
-        let settings = self.settings.ok_or_else(|| {
-            source_snapshot_schema_error("Algolia source settings were not captured")
+    pub(super) fn finish(self) -> Result<SourceSnapshot, SourceIdentityError> {
+        let settings = self.settings.ok_or(SourceIdentityError::InvalidConfig {
+            name: "source snapshot settings",
         })?;
+        let documents = self.documents.finish()?;
         Ok(SourceSnapshot {
             settings,
-            documents: self.documents.finish(),
+            documents: SourceResourceSnapshot {
+                count: documents.count,
+                hash: documents.digest,
+                ids: BTreeSet::new(),
+                version: documents.version,
+            },
             rules: self.rules.finish(),
             synonyms: self.synonyms.finish(),
         })
@@ -141,6 +160,26 @@ impl From<SourceSnapshotSchemaViolation> for AlgoliaClientError {
             }
             SourceSnapshotSchemaViolationKind::MalformedPayload => {
                 source_snapshot_schema_error("Algolia source item was not a JSON object")
+            }
+        }
+    }
+}
+
+impl From<SourceIdentityError> for AlgoliaClientError {
+    fn from(error: SourceIdentityError) -> Self {
+        let message = error.safe_message();
+        match error {
+            SourceIdentityError::InvalidObjectId { .. } => source_snapshot_schema_error(message),
+            SourceIdentityError::Duplicate { .. } => source_snapshot_schema_error(message),
+            SourceIdentityError::MalformedPayload { .. } => source_snapshot_schema_error(message),
+            SourceIdentityError::PartitionBudgetExceeded { .. } => {
+                AlgoliaClientError::new(AlgoliaErrorKind::Limit, message)
+            }
+            SourceIdentityError::InvalidConfig { .. } => {
+                AlgoliaClientError::new(AlgoliaErrorKind::Validation, message)
+            }
+            SourceIdentityError::Io(_) => {
+                AlgoliaClientError::new(AlgoliaErrorKind::Transport, message)
             }
         }
     }
@@ -188,6 +227,7 @@ impl SourceResourceAccumulator {
             count: self.ids.len(),
             hash: aggregate_source_item_hashes(self.item_hashes),
             ids: self.ids.into_keys().collect(),
+            version: SourceIdentityVersion::V1,
         }
     }
 }
@@ -199,6 +239,7 @@ fn settings_resource_snapshot(settings: &Value) -> SourceResourceSnapshot {
         count: 1,
         hash: aggregate_source_item_hashes(vec![(id.clone(), item_hash)]),
         ids: BTreeSet::from([id]),
+        version: SourceIdentityVersion::V1,
     }
 }
 
@@ -223,6 +264,43 @@ pub(super) fn object_stable_id(item: &Value) -> Result<String, SourceSnapshotSch
         .filter(|object_id| !object_id.is_empty())
         .map(str::to_string)
         .ok_or(SourceSnapshotSchemaViolationKind::InvalidObjectId)
+}
+
+pub(super) fn document_violation_from_identity_error(
+    error: &SourceIdentityError,
+) -> Option<SourceSnapshotSchemaViolation> {
+    let (kind, page_index, item_index) = match error {
+        SourceIdentityError::Duplicate { second, .. } => (
+            SourceSnapshotSchemaViolationKind::DuplicateObjectId,
+            second.0,
+            second.1,
+        ),
+        SourceIdentityError::InvalidObjectId {
+            page_index,
+            item_index,
+        } => (
+            SourceSnapshotSchemaViolationKind::InvalidObjectId,
+            *page_index,
+            *item_index,
+        ),
+        SourceIdentityError::MalformedPayload {
+            page_index,
+            item_index,
+        } => (
+            SourceSnapshotSchemaViolationKind::MalformedPayload,
+            *page_index,
+            *item_index,
+        ),
+        SourceIdentityError::PartitionBudgetExceeded { .. }
+        | SourceIdentityError::InvalidConfig { .. }
+        | SourceIdentityError::Io(_) => return None,
+    };
+    Some(SourceSnapshotSchemaViolation {
+        resource: SourceSnapshotResource::Document,
+        kind,
+        page_index,
+        item_index,
+    })
 }
 
 fn source_snapshot_schema_error(message: &'static str) -> AlgoliaClientError {

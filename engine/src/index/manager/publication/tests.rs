@@ -117,6 +117,97 @@ fn privacy_scrub_generation_evidence_requires_one_committed_current_journal() {
 }
 
 #[test]
+fn privacy_scrub_generation_evidence_distinguishes_unjournaled_and_prepared_siblings() {
+    let tmp = TempDir::new().unwrap();
+    let target = PublicationTarget::new("products").unwrap();
+    let expected = PublicationGenerationEvidence::new("generation_1").unwrap();
+
+    write_generation_journal(
+        tmp.path(),
+        "products",
+        "txn_committed",
+        "generation_1",
+        Some(PublicationEvent::Commit),
+    );
+    std::fs::create_dir_all(
+        tmp.path()
+            .join(".publication")
+            .join("products")
+            .join("txn_inflight")
+            .join("staging"),
+    )
+    .unwrap();
+
+    verify_current_generation_evidence(tmp.path(), &target, &expected)
+        .expect("current generation proof should ignore an unjournaled staging namespace");
+
+    write_generation_journal(tmp.path(), "products", "txn_prepared", "generation_2", None);
+    let error = verify_current_generation_evidence(tmp.path(), &target, &expected)
+        .expect_err("a prepared sibling makes the current generation indeterminate")
+        .to_string();
+    assert!(
+        error.contains("not committed"),
+        "prepared sibling must fail closed: {error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn privacy_scrub_generation_evidence_rejects_symlinked_publication_root() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let target = PublicationTarget::new("products").unwrap();
+    let expected = PublicationGenerationEvidence::new("generation_1").unwrap();
+
+    write_generation_journal(
+        outside.path(),
+        "products",
+        "txn_committed",
+        "generation_1",
+        Some(PublicationEvent::Commit),
+    );
+    symlink(outside.path().join(".publication"), tmp.path().join(".publication")).unwrap();
+
+    let error = verify_current_generation_evidence(tmp.path(), &target, &expected)
+        .expect_err("symlinked publication roots must fail closed")
+        .to_string();
+    assert!(error.contains("symlink"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn privacy_scrub_generation_evidence_rejects_symlinked_journal() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let target = PublicationTarget::new("products").unwrap();
+    let expected = PublicationGenerationEvidence::new("generation_1").unwrap();
+
+    let external = write_generation_journal(
+        outside.path(),
+        "products",
+        "txn_external",
+        "generation_1",
+        Some(PublicationEvent::Commit),
+    );
+    let local = PublicationPaths::new(
+        tmp.path(),
+        &target,
+        &PublicationTransactionId::new("txn_local").unwrap(),
+    );
+    std::fs::create_dir_all(local.journal.parent().unwrap()).unwrap();
+    symlink(&external.journal, &local.journal).unwrap();
+
+    let error = verify_current_generation_evidence(tmp.path(), &target, &expected)
+        .expect_err("symlinked journals must fail closed")
+        .to_string();
+    assert!(error.contains("symlink"), "{error}");
+}
+
+#[test]
 fn reserved_namespace_classifier_recognizes_publication_evidence_paths() {
     for relative in [
         ".publication",

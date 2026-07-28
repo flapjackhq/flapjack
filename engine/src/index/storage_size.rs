@@ -1,6 +1,6 @@
 //! Per-tenant disk usage calculator providing a recursive, symlink-safe directory size function used by metrics and internal storage endpoints.
 
-use std::io;
+use std::io::{self, ErrorKind};
 use std::path::Path;
 
 /// Recursively sum the sizes of all regular files under `path`.
@@ -12,16 +12,33 @@ pub fn dir_size_bytes(path: &Path) -> io::Result<u64> {
     if !path.is_dir() {
         return Ok(0);
     }
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let ft = entry.file_type()?;
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let ft = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
         if ft.is_symlink() {
             continue;
         }
         if ft.is_dir() {
             total += dir_size_bytes(&entry.path())?;
         } else if ft.is_file() {
-            total += entry.metadata()?.len();
+            match entry.metadata() {
+                Ok(metadata) => total += metadata.len(),
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
     }
     Ok(total)

@@ -5,10 +5,13 @@ use super::source_identity_partitions::{
     SourceIdentityPartitions, SourceIdentityReceipt, SourceIdentityVersion,
 };
 use super::source_snapshot::update_source_item_hash_digest;
+use super::source_test_support::duplicate_ids_in_different_identity_partitions;
 use serde_json::json;
 use serial_test::serial;
 use sha2::{Digest, Sha256};
 use std::{ffi::OsString, fs::OpenOptions, io::Write, mem};
+#[cfg(unix)]
+use std::{fs, os::unix::fs::PermissionsExt};
 use tempfile::TempDir;
 
 fn config_for_test(
@@ -96,6 +99,112 @@ fn implicit_temp_spool_root_is_removed_with_validator() {
         !implicit_spool_root.exists(),
         "validator must remove the implicit temp root it owns"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn identity_spool_artifacts_are_owner_only_on_unix() {
+    let spool_root = TempDir::new().expect("temp spool root should be created");
+    let config = config_for_test(&spool_root, 2048, 8);
+    let mut partitions =
+        SourceIdentityPartitions::new(config).expect("test partitioner should initialize");
+    let instance_dir = partitions
+        .partition_path_for_test(0)
+        .parent()
+        .expect("partition path should have an instance directory")
+        .to_path_buf();
+
+    let dir_mode = fs::metadata(&instance_dir)
+        .expect("instance directory should exist")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(dir_mode, 0o700);
+
+    let mut partition_file = None;
+    for index in 0..64 {
+        let object_id = format!("doc-{index:04}");
+        let item_hash = format!("{index:064x}");
+        partitions
+            .record(&object_id, &item_hash, index / 8, index % 8)
+            .expect("fixture tuple should record");
+
+        partition_file = fs::read_dir(&instance_dir)
+            .expect("instance directory should stay readable")
+            .find_map(|entry| {
+                let path = entry.ok()?.path();
+                path.is_file().then_some(path)
+            });
+        if partition_file.is_some() {
+            break;
+        }
+    }
+
+    let partition_file = partition_file.expect("fixture should flush at least one partition file");
+    let file_mode = fs::metadata(&partition_file)
+        .expect("partition file should exist")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(file_mode, 0o600);
+}
+
+#[test]
+fn caller_provided_instance_directory_is_removed_for_finish_error_and_drop() {
+    let successful_root = TempDir::new().expect("successful spool root should be created");
+    let successful_config = config_for_test(&successful_root, 4096, 8);
+    let mut successful =
+        SourceIdentityPartitions::new(successful_config).expect("partitioner should initialize");
+    let successful_instance = successful
+        .partition_path_for_test(0)
+        .parent()
+        .expect("partition path should have an instance directory")
+        .to_path_buf();
+    successful
+        .record("doc-0000", &"0".repeat(64), 0, 0)
+        .expect("successful fixture should record");
+    successful
+        .finish()
+        .expect("successful fixture should finish");
+    assert!(!successful_instance.exists());
+    assert!(successful_root.path().is_dir());
+
+    let error_root = TempDir::new().expect("error spool root should be created");
+    let error_config = config_for_test(&error_root, 4096, 8);
+    let mut erroring =
+        SourceIdentityPartitions::new(error_config).expect("partitioner should initialize");
+    let error_instance = erroring
+        .partition_path_for_test(0)
+        .parent()
+        .expect("partition path should have an instance directory")
+        .to_path_buf();
+    record_documents(&mut erroring, 27).expect("over-budget phase-two fixture should record");
+    let error = erroring
+        .finish()
+        .expect_err("one-partition phase-two fixture should exceed the budget");
+    assert_eq!(
+        error,
+        SourceIdentityError::PartitionBudgetExceeded {
+            partition: 0,
+            bytes: 27 * (104 + 6 * mem::size_of::<usize>()),
+            budget_bytes: 4096,
+        }
+    );
+    assert!(!error_instance.exists());
+    assert!(error_root.path().is_dir());
+
+    let dropped_root = TempDir::new().expect("dropped spool root should be created");
+    let dropped_config = config_for_test(&dropped_root, 4096, 8);
+    let dropped =
+        SourceIdentityPartitions::new(dropped_config).expect("partitioner should initialize");
+    let dropped_instance = dropped
+        .partition_path_for_test(0)
+        .parent()
+        .expect("partition path should have an instance directory")
+        .to_path_buf();
+    drop(dropped);
+    assert!(!dropped_instance.exists());
+    assert!(dropped_root.path().is_dir());
 }
 
 #[test]
@@ -251,7 +360,7 @@ fn compare_receipt_covers_version_precedence_digest_mismatch_and_match() {
 #[test]
 fn duplicate_validator_is_exact_across_hash_partitions() {
     let spool_root = TempDir::new().expect("temp spool root should be created");
-    let config = config_for_test(&spool_root, 4096, 1024);
+    let config = config_for_test(&spool_root, 8192, 2048);
     let mut partitions =
         SourceIdentityPartitions::new(config).expect("test partitioner should initialize");
 
@@ -291,6 +400,76 @@ fn duplicate_validator_is_exact_across_hash_partitions() {
 }
 
 #[test]
+fn duplicate_validator_reports_first_and_second_for_cross_page_duplicate() {
+    let spool_root = TempDir::new().expect("temp spool root should be created");
+    let config = config_for_test(&spool_root, 4096, 8);
+    let mut partitions =
+        SourceIdentityPartitions::new(config).expect("test partitioner should initialize");
+
+    partitions
+        .record("shared-doc", "hash-first", 0, 2)
+        .expect("first occurrence should record");
+    partitions
+        .record("other-doc", "hash-other", 1, 0)
+        .expect("other document should record");
+    partitions
+        .record("shared-doc", "hash-second", 4, 7)
+        .expect("second occurrence should record before finish detects duplicates");
+
+    let error = partitions
+        .finish()
+        .expect_err("cross-page duplicate objectID must fail exactly");
+
+    assert_eq!(
+        error,
+        SourceIdentityError::Duplicate {
+            first: (0, 2),
+            second: (4, 7),
+        }
+    );
+}
+
+#[test]
+fn duplicate_validator_selects_lowest_partition_then_sorted_object_id() {
+    let spool_root = TempDir::new().expect("temp spool root should be created");
+    let config = config_for_test(&spool_root, 4096, 1024);
+    let mut partitions =
+        SourceIdentityPartitions::new(config).expect("test partitioner should initialize");
+    let partition_count = partitions.partition_count();
+    let (lower_id, lower_partition, higher_id, higher_partition) =
+        duplicate_ids_in_different_identity_partitions(partition_count);
+
+    partitions
+        .record(&higher_id, "higher-a", 0, 0)
+        .expect("higher first should record");
+    partitions
+        .record(&higher_id, "higher-b", 0, 1)
+        .expect("higher second should record");
+    partitions
+        .record(&lower_id, "lower-a", 1, 0)
+        .expect("lower first should record");
+    partitions
+        .record(&lower_id, "lower-b", 2, 0)
+        .expect("lower second should record");
+
+    let error = partitions
+        .finish()
+        .expect_err("the lowest duplicate partition should be selected first");
+
+    assert!(
+        lower_partition < higher_partition,
+        "test fixture must exercise different ordered partitions"
+    );
+    assert_eq!(
+        error,
+        SourceIdentityError::Duplicate {
+            first: (1, 0),
+            second: (2, 0),
+        }
+    );
+}
+
+#[test]
 fn validator_peak_memory_is_bounded_by_partition_not_corpus() {
     // budget_bytes = 4096, certified_max_items = 1024 -> 32 planning tuples
     // -> ceil(1024*4/32) = 128 partitions; fixture tuple = 8 + 64 + 16 = 88 bytes
@@ -316,6 +495,13 @@ fn validator_peak_memory_is_bounded_by_partition_not_corpus() {
         .finish()
         .expect("run B should finish without duplicates");
 
+    println!(
+        "validator residency run-A: bytes={} tuples={}; run-B: bytes={} tuples={}; budget=4096 bytes",
+        run_a.max_resident_bytes_observed(),
+        run_a.max_resident_tuples_observed(),
+        run_b.max_resident_bytes_observed(),
+        run_b.max_resident_tuples_observed(),
+    );
     assert!(run_a.max_resident_bytes_observed() <= 4096);
     assert!(run_b.max_resident_bytes_observed() <= 4096);
     assert!(run_b.max_resident_tuples_observed() <= 46);

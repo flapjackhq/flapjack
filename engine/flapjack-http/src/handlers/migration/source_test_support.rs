@@ -1,9 +1,27 @@
 use super::algolia_client::{AlgoliaClientError, AlgoliaErrorKind, AlgoliaIndexRecord};
+use super::source_identity_partitions::{
+    SourceIdentityConfig, SourceIdentityError, CERTIFIED_MAX_ITEMS, DEFAULT_IDENTITY_BUDGET_BYTES,
+    IDENTITY_V2_DOMAIN,
+};
 use super::source_reader::{MigrationSourceReader, PageConsumer, SourceExportSink, SourceFuture};
+use super::source_snapshot::{source_item_hash, update_source_item_hash_digest};
 use crate::dto::SearchRequest;
 use axum::{extract::State, Json};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{collections::VecDeque, sync::Arc};
+use tempfile::TempDir;
+
+pub(super) fn identity_config_for_test(
+) -> Result<(TempDir, SourceIdentityConfig), SourceIdentityError> {
+    let spool_root = TempDir::new().map_err(SourceIdentityError::Io)?;
+    let config = SourceIdentityConfig::for_test(
+        spool_root.path(),
+        DEFAULT_IDENTITY_BUDGET_BYTES,
+        CERTIFIED_MAX_ITEMS,
+    );
+    Ok((spool_root, config))
+}
 
 pub(super) struct ScriptedSourceReader {
     pub(super) app_id: String,
@@ -236,6 +254,64 @@ pub(super) fn page_object_ids(page: &[Value]) -> Vec<String> {
                 .to_string()
         })
         .collect()
+}
+
+pub(super) fn expected_document_v2_digest(items: Vec<Value>, partition_count: u32) -> String {
+    let mut partitions = vec![Vec::<(String, String)>::new(); partition_count as usize];
+    for item in items {
+        let object_id = item["objectID"].as_str().unwrap().to_string();
+        let item_hash = source_item_hash(&item);
+        let partition = expected_identity_partition(&object_id, partition_count);
+        partitions[partition as usize].push((object_id, item_hash));
+    }
+
+    let mut identity = Sha256::new();
+    identity.update(IDENTITY_V2_DOMAIN);
+    identity.update(partition_count.to_string().as_bytes());
+    identity.update(*b"\n");
+    for (partition, tuples) in partitions.iter_mut().enumerate() {
+        if tuples.is_empty() {
+            continue;
+        }
+        tuples.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut partition_hasher = Sha256::new();
+        for (object_id, item_hash) in tuples {
+            update_source_item_hash_digest(&mut partition_hasher, object_id, item_hash);
+        }
+        identity.update(partition.to_string().as_bytes());
+        identity.update([0]);
+        identity.update(hex::encode(partition_hasher.finalize()).as_bytes());
+        identity.update(*b"\n");
+    }
+    hex::encode(identity.finalize())
+}
+
+pub(super) fn duplicate_ids_in_different_identity_partitions(
+    partition_count: u32,
+) -> (String, u32, String, u32) {
+    let mut seen = Vec::new();
+    for index in 0..10_000 {
+        let object_id = format!("partitioned-dup-{index}");
+        let partition = expected_identity_partition(&object_id, partition_count);
+        if let Some((other_id, other_partition)) = seen
+            .iter()
+            .find(|(_, other_partition)| *other_partition != partition)
+            .cloned()
+        {
+            if other_partition < partition {
+                return (other_id, other_partition, object_id, partition);
+            }
+            return (object_id, partition, other_id, other_partition);
+        }
+        seen.push((object_id, partition));
+    }
+    panic!("expected fixture search to find IDs in different partitions");
+}
+
+fn expected_identity_partition(object_id: &str, partition_count: u32) -> u32 {
+    let digest = Sha256::digest(object_id.as_bytes());
+    let first_eight = digest[..8].try_into().unwrap();
+    (u64::from_be_bytes(first_eight) % u64::from(partition_count)) as u32
 }
 
 pub(super) async fn sorted_exact_hits_by_object_id<T>(

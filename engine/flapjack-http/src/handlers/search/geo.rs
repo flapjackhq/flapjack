@@ -2,63 +2,9 @@ use std::sync::Arc;
 
 use crate::dto::SearchRequest;
 
-use flapjack::types::FieldValue;
-
-/// Extracts a `(lat, lng)` pair from a `FieldValue` geo object.
-pub(super) fn extract_single_geoloc(value: &FieldValue) -> Option<(f64, f64)> {
-    match value {
-        FieldValue::Object(map) => {
-            let lat = match map.get("lat")? {
-                FieldValue::Float(f) => *f,
-                FieldValue::Integer(i) => *i as f64,
-                _ => return None,
-            };
-            let lng = match map.get("lng")? {
-                FieldValue::Float(f) => *f,
-                FieldValue::Integer(i) => *i as f64,
-                _ => return None,
-            };
-            Some((lat, lng))
-        }
-        _ => None,
-    }
-}
-
-pub(super) fn extract_all_geolocs(geoloc: Option<&FieldValue>) -> Vec<(f64, f64)> {
-    match geoloc {
-        None => vec![],
-        Some(FieldValue::Object(_)) => extract_single_geoloc(geoloc.unwrap()).into_iter().collect(),
-        Some(FieldValue::Array(arr)) => arr.iter().filter_map(extract_single_geoloc).collect(),
-        _ => vec![],
-    }
-}
-
-/// Selects the best geo point from a document's `_geoloc` array: the point closest
-/// to the `aroundLatLng` center that also passes the geo filter, or the first passing point.
-pub(super) fn best_geoloc_for_filter(
-    points: &[(f64, f64)],
-    geo_params: &flapjack::query::geo::GeoParams,
-) -> Option<(f64, f64)> {
-    if points.is_empty() {
-        return None;
-    }
-    if let Some(ref center) = geo_params.around {
-        points
-            .iter()
-            .filter(|(lat, lng)| geo_params.filter_point(*lat, *lng))
-            .min_by(|(lat_a, lng_a), (lat_b, lng_b)| {
-                let da = flapjack::query::geo::haversine(center.lat, center.lng, *lat_a, *lng_a);
-                let db = flapjack::query::geo::haversine(center.lat, center.lng, *lat_b, *lng_b);
-                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .copied()
-    } else {
-        points
-            .iter()
-            .find(|(lat, lng)| geo_params.filter_point(*lat, *lng))
-            .copied()
-    }
-}
+#[cfg(test)]
+pub(super) use flapjack::query::geo::extract_single_geoloc;
+pub(super) use flapjack::query::geo::{best_geoloc_for_filter, extract_all_geolocs};
 
 /// Applies query-rule-injected geo parameters (`aroundLatLng`, `aroundRadius`) on top
 /// of the request's geo params, clearing bounding box/polygon filters when a rule center is set.

@@ -12,6 +12,10 @@ use crate::integ_tests::search_compat::SearchCompat;
 /// Run regression guards:
 ///   cargo test --release --lib -p flapjack regression_ -- --nocapture
 // ─── Quick latency measurement ──────────────────────────────────────────────
+use crate::query::executor::{
+    build_parity_fixture, run_frozen_family, ExecutorParityFixture, FrozenFamily, QueryPhaseReport,
+    SearchThreadsEnvGuard, IN_FLIGHT_SEARCHES_PER_WORKER_THREAD,
+};
 use crate::{Document, FacetRequest, FieldValue, Filter, IndexManager, Sort, SortOrder};
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -556,4 +560,216 @@ fn regression_typeahead_sequence_slow() {
             "typeahead P99 regression: {p99}us > {P99_TYPEAHEAD_TOTAL_US}us (6 keystrokes)"
         );
     });
+}
+
+// ─── Bounded-executor frozen-matrix benchmark ───────────────────────────────
+//
+// Measures the bounded search executor on the same frozen fixture and frozen
+// query families the parity suite owns, sweeping only the existing thread-count
+// knob (`FLAPJACK_SEARCH_THREADS`). Stage 3 uses the machine-readable rows this
+// emits to choose `DEFAULT_SEARCH_THREADS` and the in-flight budget from
+// measured data rather than intuition. Nothing here defines a second corpus,
+// catalog, or budget concept.
+
+/// One benchmark measurement: a single frozen-family execute under one
+/// thread/budget arm and sample index, carrying its full phase report.
+struct BenchRecord {
+    family: &'static str,
+    query_label: &'static str,
+    threads: usize,
+    budget_per_worker: usize,
+    sample: usize,
+    report: QueryPhaseReport,
+}
+
+/// The execution paths the query executor can report. A benchmark row must
+/// carry exactly one of these, so every cold/warm row stays attributable to a
+/// real collector path.
+const KNOWN_EXECUTION_PATHS: [&str; 5] = [
+    "relevance",
+    "relevance_facets",
+    "sort_fast",
+    "sort_fallback",
+    "count_only",
+];
+
+/// Measure every frozen family under each thread-count arm.
+///
+/// A fresh fixture per (arm, family) makes sample 0's first execute a cold
+/// searcher generation and every later execute on that fixture warm, so cold
+/// and warm rows stay separable rather than blended. A dropped fixture keeps
+/// its index-identity allocation reserved through the metrics tracker's weak
+/// reference until the next observe purges it, so a freshly built fixture can
+/// never reuse a still-tracked identity and be misread as warm.
+fn collect_frozen_matrix_records(thread_arms: &[usize], samples: usize) -> Vec<BenchRecord> {
+    let mut records = Vec::new();
+    for &threads in thread_arms {
+        let _env = SearchThreadsEnvGuard::set(&threads.to_string());
+        for &family in FrozenFamily::ALL {
+            let fixture: ExecutorParityFixture = build_parity_fixture();
+            for sample in 0..samples {
+                for (query_label, report) in run_frozen_family(family, &fixture) {
+                    records.push(BenchRecord {
+                        family: family.label(),
+                        query_label,
+                        threads,
+                        budget_per_worker: IN_FLIGHT_SEARCHES_PER_WORKER_THREAD,
+                        sample,
+                        report,
+                    });
+                }
+            }
+        }
+    }
+    records
+}
+
+/// Print the frozen-matrix measurements as tab-separated rows: one header line
+/// then one `bench_row` per record with the family, thread/budget arm, sample,
+/// cold flag, execution path, wall time (`total_ns`), and every phase field.
+fn print_frozen_matrix_rows(records: &[BenchRecord]) {
+    println!(
+        "bench_col\tfamily\tquery\tthreads\tbudget_per_worker\tsample\tcold\texecution_path\ttotal_ns\tprepare_ns\tcollect_ns\trank_ns\tfetch_ns\tfacet_extract_ns\tunattributed_ns\tmatched_docs\tvisited_segments\tcandidates_collected\tfacet_cardinality"
+    );
+    for record in records {
+        let phase = &record.report;
+        println!(
+            "bench_row\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            record.family,
+            record.query_label,
+            record.threads,
+            record.budget_per_worker,
+            record.sample,
+            phase.cold,
+            phase.execution_path,
+            phase.total_ns,
+            phase.prepare_ns,
+            phase.collect_ns,
+            phase.rank_ns,
+            phase.fetch_ns,
+            phase.facet_extract_ns,
+            phase.unattributed_ns,
+            phase.matched_docs,
+            phase.visited_segments,
+            phase.candidates_collected,
+            phase.facet_cardinality,
+        );
+    }
+}
+
+/// Ignored release benchmark: measure the bounded executor across the frozen
+/// query families at each thread-count arm and print machine-readable rows.
+///
+/// Kept `#[ignore]` so routine `cargo test -p flapjack --lib` never runs the
+/// release matrix. Run it explicitly with:
+///   cd engine && timeout 900 cargo test --release -p flapjack --lib -- \
+///     bounded_executor_frozen_matrix_benchmark_slow --ignored --nocapture
+#[test]
+#[ignore]
+#[serial_test::serial(flapjack_search_threads_env)]
+fn bounded_executor_frozen_matrix_benchmark_slow() {
+    const THREAD_ARMS: [usize; 3] = [1, 2, 4];
+    const SAMPLES: usize = 30;
+
+    let records = collect_frozen_matrix_records(&THREAD_ARMS, SAMPLES);
+    println!(
+        "# bounded_executor_frozen_matrix_benchmark thread_arms={:?} samples={} budget_per_worker={} records={}",
+        THREAD_ARMS,
+        SAMPLES,
+        IN_FLIGHT_SEARCHES_PER_WORKER_THREAD,
+        records.len(),
+    );
+    print_frozen_matrix_rows(&records);
+}
+
+/// Fast guard on the benchmark record shape: it must emit one record per frozen
+/// query per sample, preserve each report's `execution_path`, and keep cold and
+/// warm samples separated rather than blended.
+#[test]
+#[serial_test::serial(flapjack_search_threads_env)]
+fn frozen_matrix_benchmark_emits_one_record_per_family_sample_and_separates_cold_warm() {
+    let thread_arms = [1usize];
+    let samples = 2usize;
+    let records = collect_frozen_matrix_records(&thread_arms, samples);
+    assert!(!records.is_empty(), "benchmark must emit records");
+
+    for record in &records {
+        assert!(
+            KNOWN_EXECUTION_PATHS.contains(&record.report.execution_path),
+            "{}/{} carried unknown execution_path {:?}",
+            record.family,
+            record.query_label,
+            record.report.execution_path,
+        );
+        assert!(!record.family.is_empty(), "family label must be present");
+        assert!(
+            !record.query_label.is_empty(),
+            "query label must be present"
+        );
+    }
+
+    for &threads in &thread_arms {
+        for family in FrozenFamily::ALL {
+            let group: Vec<&BenchRecord> = records
+                .iter()
+                .filter(|record| record.threads == threads && record.family == family.label())
+                .collect();
+            assert!(
+                !group.is_empty(),
+                "no records for {} arm {}",
+                family.label(),
+                threads
+            );
+
+            // One record per query per sample: every sample index yields the
+            // same per-family record count.
+            let per_sample = group.iter().filter(|record| record.sample == 0).count();
+            assert!(
+                per_sample >= 1,
+                "{} arm {}: empty sample 0",
+                family.label(),
+                threads
+            );
+            for sample in 0..samples {
+                let count = group
+                    .iter()
+                    .filter(|record| record.sample == sample)
+                    .count();
+                assert_eq!(
+                    count,
+                    per_sample,
+                    "{} arm {}: sample {} record count diverged",
+                    family.label(),
+                    threads,
+                    sample
+                );
+            }
+
+            // Cold/warm separation: exactly one cold specimen — the first
+            // execute of sample 0 — and no warm sample is misreported cold.
+            let cold_count = group.iter().filter(|record| record.report.cold).count();
+            assert_eq!(
+                cold_count,
+                1,
+                "{} arm {}: expected exactly one cold specimen",
+                family.label(),
+                threads
+            );
+            assert!(
+                group[0].report.cold && group[0].sample == 0,
+                "{} arm {}: cold specimen must be the first sample-0 execute",
+                family.label(),
+                threads
+            );
+            for warm in group.iter().filter(|record| record.sample > 0) {
+                assert!(
+                    !warm.report.cold,
+                    "{} arm {}: warm sample {} marked cold",
+                    family.label(),
+                    threads,
+                    warm.sample
+                );
+            }
+        }
+    }
 }

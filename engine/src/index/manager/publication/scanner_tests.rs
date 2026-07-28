@@ -512,6 +512,64 @@ fn prestaged_publication_allocates_activates_and_aborts_its_own_namespace() {
     );
 }
 
+#[test]
+fn replacement_activation_preserves_sibling_inflight_namespace() {
+    let temp = TempDir::new().unwrap();
+    let target = PublicationTarget::new("products").unwrap();
+    write_tree(&temp.path().join("products"), "old");
+
+    let committed = PreStagedPublication::prepare(temp.path(), target.clone()).unwrap();
+    write_tree(&committed.paths().staging, "committed");
+
+    let in_flight = PreStagedPublication::prepare(temp.path(), target).unwrap();
+    write_tree(&in_flight.paths().staging, "in-flight");
+    let in_flight_namespace = in_flight.paths().staging.parent().unwrap().to_path_buf();
+    let in_flight_settings = in_flight.paths().staging.join("settings.json");
+
+    committed.activate().unwrap();
+
+    assert!(
+        in_flight_namespace.exists(),
+        "a committed replace must not delete a sibling transaction namespace"
+    );
+    assert_eq!(
+        std::fs::read_to_string(in_flight_settings).unwrap(),
+        "in-flight"
+    );
+}
+
+#[test]
+fn replacement_activation_preserves_mismatched_committed_journal_for_repair() {
+    let temp = TempDir::new().unwrap();
+    let products = PublicationTarget::new("products").unwrap();
+    write_tree(&temp.path().join("products"), "old");
+
+    let first_publication = PreStagedPublication::prepare(temp.path(), products.clone()).unwrap();
+    write_tree(&first_publication.paths().staging, "first");
+    let first_namespace = first_publication
+        .paths()
+        .staging
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    first_publication.activate().unwrap();
+
+    let misplaced_namespace = first_namespace
+        .parent()
+        .unwrap()
+        .join("mismatched_transaction_namespace");
+    std::fs::rename(&first_namespace, &misplaced_namespace).unwrap();
+
+    let replacement = PreStagedPublication::prepare(temp.path(), products).unwrap();
+    write_tree(&replacement.paths().staging, "replacement");
+    replacement.activate().unwrap();
+
+    assert!(
+        misplaced_namespace.exists(),
+        "cleanup must preserve mismatched committed evidence for repair"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn prestaged_publication_rejects_symlinked_namespace_parent() {

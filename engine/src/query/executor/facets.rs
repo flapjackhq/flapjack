@@ -76,7 +76,7 @@ impl QueryExecutor {
             }
             if count_only {
                 let collect_started_at = std::time::Instant::now();
-                let count = searcher.search(final_query.as_ref(), &Count)?;
+                let count = self.search_bounded(searcher, final_query.as_ref(), &Count)?;
                 self.observe_phase(QueryPhase::Collect, collect_started_at);
                 self.set_matched_docs(count);
                 self.set_candidates_collected(0);
@@ -181,7 +181,8 @@ impl QueryExecutor {
 
         if limit == 0 && offset == 0 {
             let collect_started_at = std::time::Instant::now();
-            let (count, facets) = searcher.search(query.as_ref(), &(Count, facet_collector))?;
+            let (count, facets) =
+                self.search_bounded(searcher, query.as_ref(), &(Count, facet_collector))?;
             self.observe_phase(QueryPhase::Collect, collect_started_at);
             self.set_matched_docs(count);
             self.set_candidates_collected(0);
@@ -222,8 +223,11 @@ impl QueryExecutor {
                 };
                 let top_collector = TopDocs::with_limit(prelim_limit).order_by_score();
                 let collect_started_at = std::time::Instant::now();
-                let (count, mut top_docs, facets) =
-                    searcher.search(query.as_ref(), &(Count, top_collector, facet_collector))?;
+                let (count, mut top_docs, facets) = self.search_bounded(
+                    searcher,
+                    query.as_ref(),
+                    &(Count, top_collector, facet_collector),
+                )?;
                 self.observe_phase(QueryPhase::Collect, collect_started_at);
                 self.set_matched_docs(count);
                 self.set_candidates_collected(top_docs.len());
@@ -257,8 +261,11 @@ impl QueryExecutor {
                         .and_offset(offset)
                         .order_by_score();
                     let collect_started_at = std::time::Instant::now();
-                    let (count, prelim, facets) = searcher
-                        .search(query.as_ref(), &(Count, top_collector, facet_collector))?;
+                    let (count, prelim, facets) = self.search_bounded(
+                        searcher,
+                        query.as_ref(),
+                        &(Count, top_collector, facet_collector),
+                    )?;
                     self.observe_phase(QueryPhase::Collect, collect_started_at);
                     self.set_matched_docs(count);
                     self.set_candidates_collected(prelim.len());

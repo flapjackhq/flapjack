@@ -4,6 +4,7 @@ use super::super::spool::{
 };
 use super::translation_bundle::{translate_replica_settings, translate_replica_topology};
 use super::*;
+use crate::handlers::migration::source_test_support::duplicate_ids_in_different_identity_partitions;
 use flapjack::index::replica::ReplicaEntry;
 use flapjack::index::settings::DistinctValue;
 use flapjack::types::{Document, FieldValue};
@@ -2619,6 +2620,105 @@ fn rejects_invalid_and_duplicate_ids_with_page_coordinates() {
         assert_eq!(entry.item_index, item);
         assert_eq!(entry.json_path, "$.objectID");
     }
+}
+
+#[test]
+fn cross_page_document_duplicate_reports_one_entry_at_second_occurrence() {
+    let report = rejected(spool_payload(
+        minimal_valid_settings(),
+        vec![
+            vec![json!({"objectID": "dup", "title": "first"})],
+            vec![json!({"objectID": "other", "title": "other"})],
+            vec![json!({"objectID": "dup", "title": "second"})],
+        ],
+        vec![],
+        vec![],
+    ));
+
+    assert_eq!(hard_codes(&report), vec![ReportCode::DuplicateObjectId]);
+    assert_eq!(
+        entries_for_code(&report, ReportCode::DuplicateObjectId).len(),
+        1
+    );
+    let entry = entry_for_code(&report, ReportCode::DuplicateObjectId);
+    assert_eq!(entry.severity, ReportSeverity::HardRejection);
+    assert_eq!(entry.resource, ReportResource::Document);
+    assert_eq!(entry.page_index, Some(2));
+    assert_eq!(entry.item_index, Some(0));
+    assert_eq!(entry.json_path, "$.objectID");
+}
+
+#[test]
+fn document_duplicate_report_selects_lowest_partition_stably_across_page_orderings() {
+    let (lower_id, lower_partition, higher_id, higher_partition) =
+        duplicate_ids_in_different_identity_partitions(2048);
+    assert!(lower_partition < higher_partition);
+
+    let first_order = rejected(spool_payload(
+        minimal_valid_settings(),
+        vec![
+            vec![
+                json!({"objectID": lower_id, "title": "lower first"}),
+                json!({"objectID": higher_id, "title": "higher first"}),
+            ],
+            vec![json!({"objectID": higher_id, "title": "higher second"})],
+            vec![json!({"objectID": lower_id, "title": "lower second"})],
+        ],
+        vec![],
+        vec![],
+    ));
+    let second_order = rejected(spool_payload(
+        minimal_valid_settings(),
+        vec![
+            vec![json!({"objectID": higher_id, "title": "higher first"})],
+            vec![
+                json!({"objectID": lower_id, "title": "lower first"}),
+                json!({"objectID": lower_id, "title": "lower second"}),
+            ],
+            vec![json!({"objectID": higher_id, "title": "higher second"})],
+        ],
+        vec![],
+        vec![],
+    ));
+
+    assert_eq!(
+        hard_codes(&first_order),
+        vec![ReportCode::DuplicateObjectId]
+    );
+    assert_eq!(
+        hard_codes(&second_order),
+        vec![ReportCode::DuplicateObjectId]
+    );
+    let first_entry = entry_for_code(&first_order, ReportCode::DuplicateObjectId);
+    assert_eq!(first_entry.page_index, Some(2));
+    assert_eq!(first_entry.item_index, Some(0));
+    let second_entry = entry_for_code(&second_order, ReportCode::DuplicateObjectId);
+    assert_eq!(second_entry.page_index, Some(1));
+    assert_eq!(second_entry.item_index, Some(1));
+}
+
+#[test]
+fn malformed_document_page_emits_one_snapshot_violation_and_skips_page_identity_remainder() {
+    let report = rejected(spool_payload(
+        minimal_valid_settings(),
+        vec![vec![
+            json!({"title": "missing objectID"}),
+            json!({"objectID": "dup", "title": "first skipped"}),
+            json!({"objectID": "dup", "title": "second skipped"}),
+        ]],
+        vec![],
+        vec![],
+    ));
+
+    assert_eq!(hard_codes(&report), vec![ReportCode::InvalidObjectId]);
+    assert_eq!(
+        entries_for_code(&report, ReportCode::InvalidObjectId).len(),
+        1
+    );
+    assert!(
+        entries_for_code(&report, ReportCode::DuplicateObjectId).is_empty(),
+        "items after the first page-level identity violation must not be recorded"
+    );
 }
 
 #[test]

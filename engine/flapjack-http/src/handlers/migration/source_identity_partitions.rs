@@ -3,6 +3,8 @@
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::{
     cmp::Ordering,
     fs::{self, File, OpenOptions},
@@ -104,6 +106,8 @@ impl SourceIdentityConfig {
 
     // partition_count raw = ceil(certified_max_items * PARTITION_SKEW_HEADROOM
     // / (budget_bytes / IDENTITY_TUPLE_BYTES)), rounded up to the next power of two, minimum 1.
+    // The count is part of the v2 digest domain; changing the budget-derived partition layout
+    // changes every digest instead of pretending cross-layout receipts are comparable.
     // Defaults give 16 MiB/128 = 131_072 -> 64_000_000*4/131_072 = 1953.125 -> 1954
     // -> next_power_of_two = 2048.
     pub(super) fn partition_count(&self) -> u32 {
@@ -149,7 +153,7 @@ impl SourceIdentityPartitions {
             }
             SpoolRootOwnership::Implicit => spool_root,
         };
-        fs::create_dir_all(&spool_dir).map_err(SourceIdentityError::Io)?;
+        create_spool_dir(&spool_dir).map_err(SourceIdentityError::Io)?;
         let buffers = std::iter::repeat_with(|| None)
             .take(partition_count as usize)
             .collect::<Box<[_]>>();
@@ -182,11 +186,15 @@ impl SourceIdentityPartitions {
     ) -> Result<(), SourceIdentityError> {
         let partition = self.partition_for(object_id);
         let tuple_bytes = buffered_tuple_bytes(object_id, item_hash);
+        // Flush before adding the tuple so the resident-byte high-water is a hard upper bound,
+        // not an add-then-check approximation that can temporarily exceed the configured budget.
         if self.resident_bytes.saturating_add(tuple_bytes) > self.budget_bytes {
             self.flush_all()?;
         }
         let bytes = self.resident_bytes.saturating_add(tuple_bytes);
         if bytes > self.budget_bytes {
+            // A tuple that cannot fit after flushing means the configured memory proof is false;
+            // reject fatally rather than silently continuing with an unvalidated identity.
             return Err(SourceIdentityError::PartitionBudgetExceeded {
                 partition,
                 bytes,
@@ -241,6 +249,8 @@ impl SourceIdentityPartitions {
             if !path.exists() {
                 continue;
             }
+            // Phase two loads exactly one stable SHA-256 partition at a time. The measured
+            // resident bytes and tuple offsets are the complete retained state for this phase.
             let partition_load = read_partition_tuples(&path, partition, self.budget_bytes)?;
             self.update_high_water(
                 partition_load.resident_bytes,
@@ -294,6 +304,8 @@ impl SourceIdentityPartitions {
     }
 
     fn partition_for(&self, object_id: &str) -> u32 {
+        // SHA-256 gives a process- and platform-stable partition assignment; DefaultHasher would
+        // make receipt/digest behavior depend on randomized hash seeds.
         let digest = Sha256::digest(object_id.as_bytes());
         let first_eight = digest[..8]
             .try_into()
@@ -323,6 +335,8 @@ impl SourceIdentityPartitions {
 
 impl Drop for SourceIdentityPartitions {
     fn drop(&mut self) {
+        // The spool directory is per-validator, so Drop can remove it on success, schema error,
+        // infrastructure error, or cancellation without coordinating with another owner.
         let _ = fs::remove_dir_all(&self.spool_dir);
     }
 }
@@ -479,6 +493,8 @@ pub(super) fn compare_receipt(
     receipt: &SourceIdentityReceipt,
     current: &SourceIdentityOutcome,
 ) -> Result<(), IdentityComparisonError> {
+    // Version mismatch is checked before digest bytes because v1 and v2 digests have different
+    // preimages; a digest comparison across versions would be meaningless.
     if receipt.version != current.version {
         return Err(IdentityComparisonError::VersionMismatch {
             receipt: receipt.version,
@@ -630,11 +646,37 @@ fn encoded_tuple_bytes(object_id: &str, item_hash: &str) -> usize {
 }
 
 fn append_partition_file(path: &Path) -> Result<File, SourceIdentityError> {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(SourceIdentityError::Io)
+    open_partition_file_for_append(path).map_err(SourceIdentityError::Io)
+}
+
+fn create_spool_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
+fn open_partition_file_for_append(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        OpenOptions::new().create(true).append(true).open(path)
+    }
 }
 
 fn encode_tuple(
@@ -644,7 +686,8 @@ fn encode_tuple(
     item_index: usize,
 ) -> Result<Box<[u8]>, SourceIdentityError> {
     // Length prefixes keep every validated JSON string reversible, including embedded newlines
-    // and NULs. One exact encoded allocation replaces per-tuple String and Vec capacity overhead.
+    // and NULs, and make the tuple boundary unambiguous without reserving a separator byte.
+    // One exact encoded allocation replaces per-tuple String and Vec capacity overhead.
     let mut encoded = vec![0; encoded_tuple_bytes(object_id, item_hash)].into_boxed_slice();
     let mut cursor = io::Cursor::new(encoded.as_mut());
     write_length_prefixed_string(&mut cursor, object_id)

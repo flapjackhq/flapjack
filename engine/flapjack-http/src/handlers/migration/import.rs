@@ -30,16 +30,20 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::HashSet;
+#[cfg(test)]
 use std::env;
 use std::error::Error;
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{SendError, SyncSender};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Barrier;
+#[cfg(test)]
 use std::thread;
 use std::thread::JoinHandle;
+#[cfg(test)]
 use std::time::{Duration, Instant};
 #[cfg(test)]
 use tokio::sync::Notify;
@@ -47,16 +51,23 @@ use uuid::Uuid;
 
 const MIGRATION_CANCELLED_CODE: &str = "migration_cancelled";
 const MIGRATION_CANCELLED_MESSAGE: &str = "Algolia migration cancellation was requested";
+#[cfg(test)]
 pub(super) const LIVE_IMPORT_PRE_ACTIVATION_SOURCE_ENV: &str =
     "FLAPJACK_ALGOLIA_LIVE_TEST_IMPORT_PRE_ACTIVATION_SOURCE";
+#[cfg(test)]
 pub(super) const LIVE_IMPORT_PRE_ACTIVATION_BARRIER_DIR_ENV: &str =
     "FLAPJACK_ALGOLIA_LIVE_TEST_IMPORT_PRE_ACTIVATION_BARRIER_DIR";
+#[cfg(test)]
 pub(super) const LIVE_IMPORT_POST_COMMIT_SOURCE_ENV: &str =
     "FLAPJACK_ALGOLIA_LIVE_TEST_IMPORT_POST_COMMIT_SOURCE";
+#[cfg(test)]
 pub(super) const LIVE_IMPORT_POST_COMMIT_BARRIER_DIR_ENV: &str =
     "FLAPJACK_ALGOLIA_LIVE_TEST_IMPORT_POST_COMMIT_BARRIER_DIR";
+#[cfg(test)]
 pub(super) const LIVE_IMPORT_BARRIER_OBSERVED_FILE: &str = "observed";
+#[cfg(test)]
 pub(super) const LIVE_IMPORT_BARRIER_RELEASE_FILE: &str = "release";
+#[cfg(test)]
 const LIVE_IMPORT_BARRIER_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[cfg(test)]
@@ -563,9 +574,10 @@ fn prepare_import_publication(
         spool,
         job_uuid,
         spool
-            .record_async_publication_transaction_if_present(
+            .record_async_publication_receipt_if_present(
                 job_uuid,
                 publication.transaction_id().clone(),
+                Some(publication.generation().clone()),
             )
             .map_err(spool_error),
     )?;
@@ -1026,6 +1038,7 @@ pub(super) enum LiveImportBarrier {
 }
 
 impl LiveImportBarrier {
+    #[cfg(test)]
     fn env_names(self) -> (&'static str, &'static str) {
         match self {
             Self::PreActivation => (
@@ -1040,6 +1053,16 @@ impl LiveImportBarrier {
     }
 }
 
+#[cfg(not(test))]
+fn wait_for_live_import_barrier(
+    _source_name: &str,
+    _job_uuid: Uuid,
+    _barrier: LiveImportBarrier,
+) -> Result<(), MigrateError> {
+    Ok(())
+}
+
+#[cfg(test)]
 fn wait_for_live_import_barrier(
     source_name: &str,
     job_uuid: Uuid,
@@ -1053,6 +1076,7 @@ fn wait_for_live_import_barrier(
     )
 }
 
+#[cfg(test)]
 pub(super) fn wait_for_live_import_barrier_with_timeout(
     source_name: &str,
     job_uuid: Uuid,
@@ -1093,6 +1117,7 @@ pub(super) fn wait_for_live_import_barrier_with_timeout(
     Err(live_import_barrier_error())
 }
 
+#[cfg(test)]
 fn live_import_barrier_error() -> MigrateError {
     json_error_parts(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1198,6 +1223,7 @@ pub(super) fn spool_error(error: SpoolError) -> MigrateError {
         | SpoolErrorKind::StagedArtifactBytesExceeded
         | SpoolErrorKind::InvalidRelativePath
         | SpoolErrorKind::InvalidSourceIdentityDigest
+        | SpoolErrorKind::InvalidCompletedResourceId
         | SpoolErrorKind::SourceIdentityMismatch
         | SpoolErrorKind::ResourceVerificationFailed
         | SpoolErrorKind::ResourceComplete
@@ -1225,6 +1251,9 @@ fn translation_error(error: TranslationStreamError<SendError<Vec<Document>>>) ->
         TranslationStreamError::Cancelled => migration_cancelled_error(),
         TranslationStreamError::Emit(_) => {
             json_error_parts(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+        }
+        TranslationStreamError::Identity(error) => {
+            json_error_parts(StatusCode::INTERNAL_SERVER_ERROR, error.safe_message())
         }
     }
 }
@@ -1302,8 +1331,11 @@ struct StagedImport {
 
 #[cfg(test)]
 mod tests {
-    use super::ReplicaNameReservation;
+    use super::{translation_error, ReplicaNameReservation};
+    use crate::handlers::migration::source_identity_partitions::SourceIdentityError;
+    use crate::handlers::migration::translation::TranslationStreamError;
     use axum::http::StatusCode;
+    use std::io;
     use tempfile::TempDir;
 
     #[test]
@@ -1321,5 +1353,20 @@ mod tests {
             !escaped_path.exists(),
             "reservation must not create directories outside the base path"
         );
+    }
+
+    #[test]
+    fn translation_identity_infrastructure_error_is_scrubbed_http_failure() {
+        let error = translation_error(TranslationStreamError::Identity(SourceIdentityError::Io(
+            io::Error::other("secret-spool-path"),
+        )));
+
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.1 .0["status"], 500);
+        assert_eq!(
+            error.1 .0["message"],
+            "source identity partition I/O failed"
+        );
+        assert!(!error.1 .0.to_string().contains("secret-spool-path"));
     }
 }

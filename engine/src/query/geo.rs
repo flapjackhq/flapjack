@@ -1,3 +1,5 @@
+use crate::types::FieldValue;
+
 const EARTH_RADIUS_M: f64 = 6_371_000.0;
 
 pub fn haversine(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f64 {
@@ -165,6 +167,55 @@ impl GeoParams {
         self.around
             .as_ref()
             .map(|c| haversine(c.lat, c.lng, lat, lng))
+    }
+}
+
+pub fn extract_single_geoloc(value: &FieldValue) -> Option<(f64, f64)> {
+    match value {
+        FieldValue::Object(map) => {
+            let lat = match map.get("lat")? {
+                FieldValue::Float(f) => *f,
+                FieldValue::Integer(i) => *i as f64,
+                _ => return None,
+            };
+            let lng = match map.get("lng")? {
+                FieldValue::Float(f) => *f,
+                FieldValue::Integer(i) => *i as f64,
+                _ => return None,
+            };
+            Some((lat, lng))
+        }
+        _ => None,
+    }
+}
+
+pub fn extract_all_geolocs(geoloc: Option<&FieldValue>) -> Vec<(f64, f64)> {
+    match geoloc {
+        Some(FieldValue::Object(_)) => geoloc.and_then(extract_single_geoloc).into_iter().collect(),
+        Some(FieldValue::Array(arr)) => arr.iter().filter_map(extract_single_geoloc).collect(),
+        _ => Vec::new(),
+    }
+}
+
+pub fn best_geoloc_for_filter(points: &[(f64, f64)], geo_params: &GeoParams) -> Option<(f64, f64)> {
+    if points.is_empty() {
+        return None;
+    }
+    if let Some(ref center) = geo_params.around {
+        points
+            .iter()
+            .filter(|(lat, lng)| geo_params.filter_point(*lat, *lng))
+            .min_by(|(lat_a, lng_a), (lat_b, lng_b)| {
+                let da = haversine(center.lat, center.lng, *lat_a, *lng_a);
+                let db = haversine(center.lat, center.lng, *lat_b, *lng_b);
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .copied()
+    } else {
+        points
+            .iter()
+            .find(|(lat, lng)| geo_params.filter_point(*lat, *lng))
+            .copied()
     }
 }
 

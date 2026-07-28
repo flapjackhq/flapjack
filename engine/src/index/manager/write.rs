@@ -132,7 +132,6 @@ impl super::IndexManager {
                 let (queue, handle) = create_write_queue(WriteQueueContext {
                     tenant_id: tenant_id.to_string(),
                     index: Arc::clone(index),
-                    _writers: Arc::clone(&self.writers),
                     tasks: Arc::clone(&self.tasks),
                     base_path: self.base_path.clone(),
                     oplog: Some(Arc::clone(&oplog)),
@@ -140,6 +139,9 @@ impl super::IndexManager {
                     facet_cache: Arc::clone(&self.facet_cache),
                     lww_map: Arc::clone(&self.lww_map),
                     vector_ctx,
+                    queue_metrics_id: 0,
+                    #[cfg(test)]
+                    test_overrides: Default::default(),
                 })?;
                 self.write_task_handles
                     .insert(tenant_id.to_string(), WriteTaskHandle::new(handle));
@@ -279,6 +281,10 @@ impl super::IndexManager {
             tenant_id,
             WriteAdmissionCheckpoint::Captured,
         );
+        crate::index::write_queue::backpressure::ensure_bulk_admission_allowed(
+            &self.base_path,
+            tenant_id,
+        )?;
         if let Some(tx) = self.write_queues.get(tenant_id).map(|queue| queue.clone()) {
             // Preserve the pre-admission API contract from `try_send`: callers can retry
             // both capacity pressure and a queue consumer that is being restarted.

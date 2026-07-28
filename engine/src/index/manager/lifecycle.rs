@@ -141,7 +141,6 @@ impl super::IndexManager {
     /// Removes the index from the cache, closing all file handles.
     /// Required before export/migration to ensure clean state.
     fn clear_tenant_runtime_state(&self, tenant_id: &TenantId) {
-        self.writers.remove(tenant_id);
         self.oplogs.remove(tenant_id);
         self.loaded.remove(tenant_id);
         self.tenant_load_locks.remove(tenant_id);
@@ -217,6 +216,7 @@ impl super::IndexManager {
         if let Some(e) = last_err {
             return Err(e.into());
         }
+        crate::index::write_queue::backpressure::remove_tenant_state(&self.base_path, tenant_id);
         Ok(())
     }
 
@@ -410,7 +410,9 @@ impl super::IndexManager {
         let publication_epoch_fence =
             self.advance_destination_publication_epoch(destination, &target)?;
 
-        self.unload(&source.to_string())?;
+        self.drain_target_write_queue(&source.to_string()).await?;
+        self.invalidate_facet_cache(source);
+        self.clear_tenant_runtime_state(&source.to_string());
         self.drain_target_write_queue(&destination.to_string())
             .await?;
         // After the target drain, no old-epoch mutation can still transition to

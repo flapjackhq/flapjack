@@ -179,8 +179,6 @@ pub struct IndexManager {
     pub(crate) loaded: DashMap<TenantId, Arc<Index>>,
     tenant_load_locks: DashMap<TenantId, Arc<std::sync::Mutex<()>>>,
     admission_stores: DashMap<TenantId, Arc<WriteAdmissionStore>>,
-    pub(crate) writers:
-        Arc<DashMap<TenantId, Arc<tokio::sync::Mutex<crate::index::ManagedIndexWriter>>>>,
     pub(crate) write_queues: DashMap<TenantId, WriteQueue>,
     pub(crate) write_task_handles: DashMap<TenantId, WriteTaskHandle>,
     pub(crate) oplogs: DashMap<TenantId, Arc<OpLog>>,
@@ -257,7 +255,6 @@ impl IndexManager {
                 loaded: DashMap::new(),
                 tenant_load_locks: DashMap::new(),
                 admission_stores: DashMap::new(),
-                writers: Arc::new(DashMap::new()),
                 write_queues: DashMap::new(),
                 write_task_handles: DashMap::new(),
                 oplogs: DashMap::new(),

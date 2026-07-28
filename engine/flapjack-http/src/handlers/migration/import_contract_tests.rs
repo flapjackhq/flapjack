@@ -1452,6 +1452,8 @@ async fn async_import_cancel_during_document_staging_drains_writer_and_releases_
     let staging_job_uuid = Arc::clone(&captured_job_uuid);
     let first_batch_seen = Arc::new(AtomicBool::new(false));
     let first_batch_seen_by_hook = Arc::clone(&first_batch_seen);
+    let cancellation_persisted = Arc::new(Notify::new());
+    let cancellation_persisted_by_hook = Arc::clone(&cancellation_persisted);
     let hooks = ImportTestHooks::default()
         .with_after_accepted_export(move |_spool, job_uuid| {
             *hook_job_uuid.lock().unwrap() = Some(job_uuid);
@@ -1466,6 +1468,7 @@ async fn async_import_cancel_during_document_staging_drains_writer_and_releases_
                     .unwrap()
                     .request_migration_cancel(job_uuid)
                     .expect("cancel request should persist during staging");
+                cancellation_persisted_by_hook.notify_one();
             }
             Ok(())
         });
@@ -1493,6 +1496,12 @@ async fn async_import_cancel_during_document_staging_drains_writer_and_releases_
         .expect("async import should be admitted")
         .0;
 
+    tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        cancellation_persisted.notified(),
+    )
+    .await
+    .expect("document staging hook should persist cancellation before terminal settlement");
     wait_for_terminal_phase(&state, job_uuid, MigrationDisposition::Cancelled).await;
     wait_for_active_count(&state, 0).await;
     assert!(first_batch_seen.load(Ordering::SeqCst));

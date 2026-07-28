@@ -1,8 +1,14 @@
 //! Canonical source snapshot hash and membership contracts.
 use super::algolia_client::AlgoliaErrorKind;
+use super::source_identity_partitions::{
+    SourceIdentityConfig, SourceIdentityError, SourceIdentityVersion,
+};
 use super::source_snapshot::{canonical_json_bytes, source_item_hash, SourceSnapshot};
+use super::source_test_support::expected_document_v2_digest;
 use serde_json::json;
 use std::collections::BTreeSet;
+use std::io;
+use tempfile::TempDir;
 
 fn settings_fixture() -> serde_json::Value {
     json!({
@@ -38,6 +44,23 @@ fn btree_set(items: &[&str]) -> BTreeSet<String> {
     items.iter().map(|item| (*item).to_string()).collect()
 }
 
+fn snapshot_from_raw(
+    settings: serde_json::Value,
+    documents: Vec<serde_json::Value>,
+    rules: Vec<serde_json::Value>,
+    synonyms: Vec<serde_json::Value>,
+) -> SourceSnapshot {
+    let spool_root = TempDir::new().expect("identity spool root should be created");
+    SourceSnapshot::from_raw_with_identity_config(
+        settings,
+        documents,
+        rules,
+        synonyms,
+        SourceIdentityConfig::for_test(spool_root.path(), 4096, 8),
+    )
+    .expect("valid snapshot should build")
+}
+
 #[test]
 fn source_snapshot_canonical_orders_object_keys_recursively_without_reordering_arrays() {
     let value = settings_fixture();
@@ -54,14 +77,13 @@ fn source_snapshot_canonical_orders_object_keys_recursively_without_reordering_a
 
 #[test]
 fn source_snapshot_canonical_hashes_counts_and_membership_independent_of_item_order() {
-    let first = SourceSnapshot::from_raw(
+    let first = snapshot_from_raw(
         settings_fixture(),
         vec![document_one(), document_two()],
         vec![rule_one()],
         vec![synonym_one()],
-    )
-    .expect("valid snapshot should build");
-    let reordered = SourceSnapshot::from_raw(
+    );
+    let reordered = snapshot_from_raw(
         json!({
             "c": {"a": "x", "b": false},
             "b": [{"y": null, "z": 2}, 1],
@@ -86,8 +108,7 @@ fn source_snapshot_canonical_hashes_counts_and_membership_independent_of_item_or
             "type": "synonym",
             "synonyms": ["tee", "shirt"]
         })],
-    )
-    .expect("reordered snapshot should build");
+    );
 
     assert_eq!(first, reordered);
     assert_eq!(first.settings.count, 1);
@@ -97,18 +118,24 @@ fn source_snapshot_canonical_hashes_counts_and_membership_independent_of_item_or
         "e650339378b616bfa703025ec0a57325d958a2d227b1abed63091dbc4d8157d1"
     );
     assert_eq!(first.documents.count, 2);
-    assert_eq!(first.documents.ids, btree_set(&["doc-1", "doc-2"]));
+    assert_eq!(first.documents.version, SourceIdentityVersion::V2);
+    assert!(
+        first.documents.ids.is_empty(),
+        "document snapshots must not retain exact IDs in resident memory"
+    );
     assert_eq!(
         first.documents.hash,
-        "c29e809a377d2ebc3671961603f66843489049c485899c70ee9b1ccc9283ff9c"
+        expected_document_v2_digest(vec![document_one(), document_two()], 1)
     );
     assert_eq!(first.rules.count, 1);
+    assert_eq!(first.rules.version, SourceIdentityVersion::V1);
     assert_eq!(first.rules.ids, btree_set(&["rule-1"]));
     assert_eq!(
         first.rules.hash,
         "6b1f5a494454d147f67a81b6cf25b38bf425aa29fe86ba5240509340f75b5967"
     );
     assert_eq!(first.synonyms.count, 1);
+    assert_eq!(first.synonyms.version, SourceIdentityVersion::V1);
     assert_eq!(first.synonyms.ids, btree_set(&["syn-1"]));
     assert_eq!(
         first.synonyms.hash,
@@ -118,14 +145,13 @@ fn source_snapshot_canonical_hashes_counts_and_membership_independent_of_item_or
 
 #[test]
 fn source_snapshot_canonical_changes_for_value_insertions_and_deletions() {
-    let baseline = SourceSnapshot::from_raw(
+    let baseline = snapshot_from_raw(
         settings_fixture(),
         vec![document_one(), document_two()],
         vec![rule_one()],
         vec![synonym_one()],
-    )
-    .expect("valid snapshot should build");
-    let changed_value = SourceSnapshot::from_raw(
+    );
+    let changed_value = snapshot_from_raw(
         settings_fixture(),
         vec![
             json!({"objectID": "doc-1", "title": "Keyboard Pro", "nested": {"a": 1, "b": 2}, "tags": ["z", "a"], "flag": true}),
@@ -133,9 +159,8 @@ fn source_snapshot_canonical_changes_for_value_insertions_and_deletions() {
         ],
         vec![rule_one()],
         vec![synonym_one()],
-    )
-    .expect("changed value should still build");
-    let inserted = SourceSnapshot::from_raw(
+    );
+    let inserted = snapshot_from_raw(
         settings_fixture(),
         vec![
             document_one(),
@@ -144,15 +169,13 @@ fn source_snapshot_canonical_changes_for_value_insertions_and_deletions() {
         ],
         vec![rule_one()],
         vec![synonym_one()],
-    )
-    .expect("inserted document should still build");
-    let deleted = SourceSnapshot::from_raw(
+    );
+    let deleted = snapshot_from_raw(
         settings_fixture(),
         vec![document_one()],
         vec![rule_one()],
         vec![synonym_one()],
-    )
-    .expect("deleted document snapshot should still build");
+    );
 
     for changed_hash in [
         &changed_value.documents.hash,
@@ -161,8 +184,9 @@ fn source_snapshot_canonical_changes_for_value_insertions_and_deletions() {
     ] {
         assert_ne!(&baseline.documents.hash, changed_hash);
     }
-    assert_ne!(baseline.documents.ids, inserted.documents.ids);
-    assert_ne!(baseline.documents.ids, deleted.documents.ids);
+    assert!(baseline.documents.ids.is_empty());
+    assert!(inserted.documents.ids.is_empty());
+    assert!(deleted.documents.ids.is_empty());
     assert_ne!(baseline.documents.count, inserted.documents.count);
     assert_ne!(baseline.documents.count, deleted.documents.count);
 }
@@ -177,15 +201,51 @@ fn source_snapshot_canonical_rejects_missing_and_duplicate_object_ids() {
         ],
         vec![json!({"objectID": 7, "title": "wrong type"})],
     ] {
-        let error = SourceSnapshot::from_raw(
+        let spool_root = TempDir::new().expect("identity spool root should be created");
+        let error = SourceSnapshot::from_raw_with_identity_config(
             settings_fixture(),
             invalid_documents,
             vec![rule_one()],
             vec![synonym_one()],
+            SourceIdentityConfig::for_test(spool_root.path(), 4096, 8),
         )
         .expect_err("invalid objectID membership must fail");
 
         assert_eq!(error.kind(), AlgoliaErrorKind::Schema);
         assert!(!error.safe_message().contains("doc-1"));
+    }
+}
+
+#[test]
+fn source_identity_infrastructure_errors_map_to_scrubbed_client_errors() {
+    let cases = [
+        (
+            SourceIdentityError::PartitionBudgetExceeded {
+                partition: 7,
+                bytes: 8192,
+                budget_bytes: 4096,
+            },
+            AlgoliaErrorKind::Limit,
+            "source identity partition exceeded memory budget",
+        ),
+        (
+            SourceIdentityError::InvalidConfig {
+                name: "secret-config-name",
+            },
+            AlgoliaErrorKind::Validation,
+            "source identity configuration was invalid",
+        ),
+        (
+            SourceIdentityError::Io(io::Error::other("secret-spool-path")),
+            AlgoliaErrorKind::Transport,
+            "source identity partition I/O failed",
+        ),
+    ];
+
+    for (identity_error, expected_kind, expected_message) in cases {
+        let client_error = super::algolia_client::AlgoliaClientError::from(identity_error);
+        assert_eq!(client_error.kind(), expected_kind);
+        assert_eq!(client_error.safe_message(), expected_message);
+        assert!(!format!("{client_error:?}").contains("secret"));
     }
 }

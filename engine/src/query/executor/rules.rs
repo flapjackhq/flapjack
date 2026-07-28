@@ -64,6 +64,12 @@ impl QueryExecutor {
                     } else {
                         id_query
                     };
+                // Deliberately not routed through `QueryExecutor::search_bounded`:
+                // this is a single-document lookup by `_id` that matches at most
+                // one doc in one segment, so fanning it across a worker pool
+                // costs more in dispatch than it saves, and it runs once per pin
+                // rather than once per query phase. The bounded seam owns the
+                // result-set collectors; this stays a direct single lookup.
                 let top_docs = searcher.search(
                     lookup_query.as_ref(),
                     &tantivy::collector::TopDocs::with_limit(1).order_by_score(),

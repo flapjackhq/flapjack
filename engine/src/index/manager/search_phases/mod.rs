@@ -567,11 +567,16 @@ fn apply_rule_effects(
 
 fn finalize_search_result(
     prepared: &PreparedSearchFilters,
-    ruled_result: RuleEffectsResult,
+    mut ruled_result: RuleEffectsResult,
     facet_result: Option<FacetResultCache>,
     effective_around_lat_lng: Option<String>,
     effective_around_radius: Option<serde_json::Value>,
 ) -> SearchResult {
+    apply_rule_geo_filter(
+        &mut ruled_result,
+        effective_around_lat_lng.as_deref(),
+        effective_around_radius.as_ref(),
+    );
     let ruled_count = ruled_result.documents.len();
     let start = prepared.effective_params.offset.min(ruled_count);
     let end = (start + prepared.effective_params.limit).min(ruled_count);
@@ -596,6 +601,47 @@ fn finalize_search_result(
         effective_around_lat_lng,
         effective_around_radius,
     }
+}
+
+fn apply_rule_geo_filter(
+    ruled_result: &mut RuleEffectsResult,
+    effective_around_lat_lng: Option<&str>,
+    effective_around_radius: Option<&serde_json::Value>,
+) {
+    let Some(around) = effective_around_lat_lng.and_then(crate::query::geo::parse_around_lat_lng)
+    else {
+        return;
+    };
+    let geo_params = crate::query::geo::GeoParams {
+        around: Some(around),
+        around_radius: effective_around_radius.and_then(crate::query::geo::parse_around_radius),
+        bounding_boxes: Vec::new(),
+        polygons: Vec::new(),
+        around_precision: crate::query::geo::AroundPrecisionConfig::default(),
+        minimum_around_radius: None,
+    };
+
+    let mut geo_docs = ruled_result
+        .documents
+        .drain(..)
+        .filter_map(|scored_doc| {
+            let points =
+                crate::query::geo::extract_all_geolocs(scored_doc.document.fields.get("_geoloc"));
+            let (lat, lng) = crate::query::geo::best_geoloc_for_filter(&points, &geo_params)?;
+            let distance = geo_params.distance_from_center(lat, lng);
+            Some((scored_doc, distance))
+        })
+        .collect::<Vec<_>>();
+    geo_docs.sort_by(|(_, left), (_, right)| {
+        left.unwrap_or(f64::MAX)
+            .partial_cmp(&right.unwrap_or(f64::MAX))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ruled_result.documents = geo_docs
+        .into_iter()
+        .map(|(scored_doc, _)| scored_doc)
+        .collect();
+    ruled_result.total = ruled_result.documents.len();
 }
 
 /// Filter the searchable paths and weights to only include attributes listed in
