@@ -145,11 +145,14 @@ async fn reads_stay_live_while_bulk_admission_is_paused() {
         )
         .await
         .unwrap();
-    backpressure::clear_for_test(tmp.path(), tenant_id);
+    let tenant_id = tenant_id.to_string();
+    let quiesce = manager.quiesce_tenant(&tenant_id).await.unwrap();
+    drop(quiesce);
+    backpressure::clear_for_test(tmp.path(), &tenant_id);
     for bytes in [20_000, 20_000, 20_000] {
         record_stage_6_observation(
             &tmp,
-            tenant_id,
+            &tenant_id,
             Ok(stage_6_segment_observation(
                 SELECTED_MERGE_POLICY_SETTLED_SEGMENT_BAND.1 + 2,
                 bytes,
@@ -159,16 +162,16 @@ async fn reads_stay_live_while_bulk_admission_is_paused() {
     }
 
     assert_stage_6_backpressure_error(manager.add_documents(
-        tenant_id,
+        &tenant_id,
         vec![text_document("paused_doc", "title", "stage6 paused")],
     ));
     assert_eq!(
-        manager.tenant_doc_count(tenant_id),
+        manager.tenant_doc_count(&tenant_id),
         Some(1),
         "pause must not hide committed documents from read counters"
     );
     let result = manager
-        .search(tenant_id, "stage6 searchable", None, None, 10)
+        .search(&tenant_id, "stage6 searchable", None, None, 10)
         .unwrap();
     assert_eq!(result.total, 1);
     assert_eq!(result.documents[0].document.id, "live_doc");

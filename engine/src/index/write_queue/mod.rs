@@ -14,9 +14,16 @@ pub(crate) mod segment_observation;
 mod vectors;
 mod writer_lifecycle;
 
-#[cfg(test)]
-pub(crate) use finalization::fail_next_commit_for_test;
 pub(crate) use finalization::PERSISTED_VECTORS_DIR;
+#[cfg(any(test, feature = "fault-injection"))]
+pub(crate) use finalization::{
+    fail_next_commit_for_test, fail_next_finalization_for_test, FinalizationFaultPoint,
+};
+#[cfg(any(debug_assertions, test))]
+pub use writer_lifecycle::{
+    clear_writer_lifecycle_test_events, record_writer_lifecycle_publication_checkpoint,
+    writer_lifecycle_test_events, WriterLifecycleTestEvent,
+};
 
 use crate::types::{DocFailure, Document, TaskInfo, TaskStatus};
 use admission::{reconcile_records, WriteAdmissionRecord, WriteAdmissionStore};
@@ -31,7 +38,7 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::timeout_at;
 
 // Raised from 10 to amortize the dominant Tantivy commit fixed-cost over more
@@ -52,9 +59,24 @@ const WRITE_QUEUE_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_WRITE_QUEUE_CHANNEL_CAPACITY: usize = 512;
 const WRITE_QUEUE_CHANNEL_CAPACITY_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_CHANNEL_CAPACITY";
 const WRITE_QUEUE_START_DELAY_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_START_DELAY_MS";
+#[cfg(any(debug_assertions, test))]
+const WRITE_QUEUE_TEST_COMMIT_DELAY_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_TEST_COMMIT_DELAY_MS";
+#[cfg(test)]
+static WRITE_QUEUE_TEST_COMMIT_DELAY_BY_TENANT: Lazy<dashmap::DashMap<String, Duration>> =
+    Lazy::new(dashmap::DashMap::new);
 pub(crate) const SELECTED_MERGE_POLICY_MIN_NUM_SEGMENTS: usize = 8;
 pub(crate) const SELECTED_MERGE_POLICY_MAX_DOCS_BEFORE_MERGE: usize = 10_000_000;
-pub(crate) const SELECTED_MERGE_POLICY_SETTLED_SEGMENT_BAND: (usize, usize) = (2, 4);
+// The canonical band spans both measured settled shapes: Stage 5's 128/256-document
+// online specimens (2/4 segments) and Stage 6's 50k/100k staged bulk builds (8/9).
+//
+// This is NOT a test-only expectation: `backpressure::sample_is_at_or_below_selected_ceiling`
+// and `all_samples_above_selected_ceiling` read `.1` as the live-segment ceiling that
+// admission pauses above, so widening the band to cover the staged-bulk regime also
+// raised that runtime ceiling. That direction is required — a bulk build that legitimately
+// settles at 8-9 segments must not be paused as unhealthy — but it does mean the online
+// path pauses later than it did at (2, 4). The online settled shape is pinned separately
+// by `ONLINE_SPECIMEN_SETTLED_MAX` in write_queue_tests.rs so a regression there still fails.
+pub(crate) const SELECTED_MERGE_POLICY_SETTLED_SEGMENT_BAND: (usize, usize) = (2, 9);
 const WRITE_QUEUE_PHASE_METRIC_NAME: &str = "flapjack_write_queue_phase_seconds";
 const WRITE_QUEUE_PHASE_METRIC_HELP: &str = "Write queue phase execution time in seconds";
 const WRITE_QUEUE_WRITER_OPENS_METRIC_NAME: &str = "flapjack_write_queue_writer_opens_total";
@@ -87,7 +109,7 @@ const PHASE_ADD_STAGING: &str = "add_staging";
 pub(super) const PHASE_WRITER_COMMIT: &str = "writer_commit";
 pub(super) const PHASE_READER_RELOAD: &str = "reader_reload";
 pub(super) const PHASE_METADATA_PERSISTENCE: &str = "metadata_persistence";
-pub(super) const PHASE_LWW_UPDATE: &str = "lww_update";
+pub(super) const PHASE_VERSION_STORE_UPDATE: &str = "version_store_update";
 pub(super) const PHASE_OPLOG_APPEND: &str = "oplog_append";
 pub(super) const PHASE_OPLOG_COMMIT_STATE_PERSISTENCE: &str = "oplog_commit_state_persistence";
 #[cfg(feature = "vector-search")]
@@ -111,7 +133,7 @@ static WRITE_QUEUE_PHASE_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
         PHASE_WRITER_COMMIT,
         PHASE_READER_RELOAD,
         PHASE_METADATA_PERSISTENCE,
-        PHASE_LWW_UPDATE,
+        PHASE_VERSION_STORE_UPDATE,
         PHASE_OPLOG_APPEND,
         PHASE_OPLOG_COMMIT_STATE_PERSISTENCE,
         #[cfg(feature = "vector-search")]
@@ -511,6 +533,79 @@ fn write_queue_start_delay() -> Option<Duration> {
     }
 }
 
+/// Removes the tenant's injected commit stall when the registering test finishes.
+#[cfg(test)]
+pub(crate) struct WriteQueueTestCommitDelayGuard {
+    tenant_id: String,
+    previous_delay: Option<Duration>,
+}
+
+#[cfg(test)]
+impl Drop for WriteQueueTestCommitDelayGuard {
+    fn drop(&mut self) {
+        match self.previous_delay {
+            Some(delay) => {
+                WRITE_QUEUE_TEST_COMMIT_DELAY_BY_TENANT.insert(self.tenant_id.clone(), delay);
+            }
+            None => {
+                WRITE_QUEUE_TEST_COMMIT_DELAY_BY_TENANT.remove(&self.tenant_id);
+            }
+        }
+    }
+}
+
+/// Stalls one tenant's commits so an in-crate test can hold a commit window open.
+///
+/// The `FLAPJACK_WRITE_QUEUE_TEST_COMMIT_DELAY_MS` fallback below stalls every write queue in
+/// the process, which is only safe for the out-of-crate integration binaries that own their
+/// whole process. Lib tests share one process with hundreds of others, so they register the
+/// stall against their own tenant instead of exporting it to unrelated queues.
+#[cfg(test)]
+pub(crate) fn delay_commits_for_test(
+    tenant_id: &str,
+    delay: Duration,
+) -> WriteQueueTestCommitDelayGuard {
+    let previous_delay =
+        WRITE_QUEUE_TEST_COMMIT_DELAY_BY_TENANT.insert(tenant_id.to_string(), delay);
+    WriteQueueTestCommitDelayGuard {
+        tenant_id: tenant_id.to_string(),
+        previous_delay,
+    }
+}
+
+#[cfg(test)]
+fn tenant_scoped_test_commit_delay(tenant_id: &str) -> Option<Duration> {
+    WRITE_QUEUE_TEST_COMMIT_DELAY_BY_TENANT
+        .get(tenant_id)
+        .map(|delay| *delay)
+}
+
+#[cfg(all(debug_assertions, not(test)))]
+fn tenant_scoped_test_commit_delay(_tenant_id: &str) -> Option<Duration> {
+    None
+}
+
+#[cfg(any(debug_assertions, test))]
+fn write_queue_test_commit_delay(tenant_id: &str) -> Option<Duration> {
+    if let Some(delay) = tenant_scoped_test_commit_delay(tenant_id) {
+        return Some(delay);
+    }
+    let raw_value = std::env::var(WRITE_QUEUE_TEST_COMMIT_DELAY_ENV_VAR).ok()?;
+    match raw_value.parse::<u64>() {
+        Ok(0) => None,
+        Ok(parsed) => Some(Duration::from_millis(parsed)),
+        Err(error) => {
+            tracing::warn!(
+                "failed to parse {}='{}' as milliseconds: {}; ignoring test commit delay",
+                WRITE_QUEUE_TEST_COMMIT_DELAY_ENV_VAR,
+                raw_value,
+                error
+            );
+            None
+        }
+    }
+}
+
 pub fn gather_write_queue_phase_metric_families() -> Vec<MetricFamily> {
     let collectors: [&dyn Collector; 14] = [
         &*WRITE_QUEUE_PHASE_SECONDS,
@@ -533,6 +628,21 @@ pub fn gather_write_queue_phase_metric_families() -> Vec<MetricFamily> {
         .flat_map(Collector::collect)
         .filter(|family| !family.get_metric().is_empty())
         .collect()
+}
+
+/// Read-only counts of `_id` delete terms staged while preparing one write task.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeleteTermObservation {
+    pub explicit_delete_actions: usize,
+    pub document_write_delete_terms: usize,
+}
+
+/// Returns the delete-term work observed for one task without affecting write behavior.
+pub fn delete_term_observation(task: &TaskInfo) -> DeleteTermObservation {
+    DeleteTermObservation {
+        explicit_delete_actions: task.explicit_delete_term_count,
+        document_write_delete_terms: task.document_write_delete_term_count,
+    }
 }
 
 /// Vector search context for the write queue.
@@ -570,32 +680,97 @@ pub(crate) struct WriteQueueContext {
     pub oplog: Option<Arc<crate::index::oplog::OpLog>>,
     pub admission_store: Arc<WriteAdmissionStore>,
     pub facet_cache: super::FacetCacheMap,
-    pub lww_map: super::LwwMap,
     pub vector_ctx: VectorWriteContext,
     pub queue_metrics_id: u64,
+    pub writer_buffer_size: usize,
     #[cfg(test)]
     pub test_overrides: WriteQueueTestOverrides,
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct WriteQueueTestOverrides {
     pub batch_size: Option<usize>,
     pub min_merge_segments: Option<usize>,
     pub max_docs_before_merge: Option<usize>,
     pub writer_idle_timeout: Option<Duration>,
+    pub worker_start_gate: Option<Arc<WriteQueueWorkerGate>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct WriteQueueWorkerGate {
+    released: std::sync::Mutex<bool>,
+    release_notification: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl WriteQueueWorkerGate {
+    pub(crate) fn closed() -> Self {
+        Self {
+            released: std::sync::Mutex::new(false),
+            release_notification: std::sync::Condvar::new(),
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        *self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        self.release_notification.notify_all();
+    }
+
+    fn wait_until_released(&self) {
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*released {
+            released = self
+                .release_notification
+                .wait(released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicatedWriteOrigin {
+    pub timestamp_ms: u64,
+    pub node_id: String,
+}
+
+impl ReplicatedWriteOrigin {
+    pub fn new(timestamp_ms: u64, node_id: String) -> Self {
+        Self {
+            timestamp_ms,
+            node_id,
+        }
+    }
+
+    fn into_oplog_origin(self) -> crate::index::oplog::OpLogOrigin {
+        crate::index::oplog::OpLogOrigin::new(self.timestamp_ms, self.node_id)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WriteAction {
     Add(Document),
     Upsert(Document),
-    /// Like Upsert but skips lww_map update — used by apply_ops_to_manager which
-    /// has already recorded the correct op timestamp in lww_map before queuing.
+    /// Legacy replicated upsert with no recoverable origin tuple.
     UpsertNoLwwUpdate(Document),
+    UpsertWithOrigin {
+        doc: Document,
+        origin: ReplicatedWriteOrigin,
+    },
     Delete(String),
-    /// Like Delete but skips lww_map update — same rationale as UpsertNoLwwUpdate.
+    /// Legacy replicated delete with no recoverable origin tuple.
     DeleteNoLwwUpdate(String),
+    DeleteWithOrigin {
+        object_id: String,
+        origin: ReplicatedWriteOrigin,
+    },
     Compact,
 }
 
@@ -607,6 +782,21 @@ pub struct WriteOp {
 
 pub type WriteQueue = mpsc::Sender<WriteOp>;
 
+#[derive(Clone)]
+pub(crate) struct WriteQueueCancellation {
+    sender: watch::Sender<bool>,
+}
+
+impl WriteQueueCancellation {
+    pub(crate) fn cancel(&self) {
+        let _ = self.sender.send(true);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self.sender.borrow()
+    }
+}
+
 type PreparedWriteDocument = (String, serde_json::Value, tantivy::TantivyDocument);
 
 struct PreparedWriteOperation {
@@ -615,8 +805,10 @@ struct PreparedWriteOperation {
     valid_docs: Vec<PreparedWriteDocument>,
     rejected: Vec<DocFailure>,
     deleted_ids: Vec<String>,
-    primary_upsert_ids: Vec<String>,
-    primary_delete_ids: Vec<String>,
+    oplog_ops: Vec<crate::index::oplog::OpLogOperation>,
+    oplog_receipts: Vec<crate::index::oplog::OpLogReceipt>,
+    explicit_delete_term_count: usize,
+    document_write_delete_term_count: usize,
     #[cfg(feature = "vector-search")]
     doc_vectors: Vec<Option<std::collections::HashMap<String, Vec<f32>>>>,
     #[cfg(feature = "vector-search")]
@@ -631,8 +823,10 @@ impl PreparedWriteOperation {
             valid_docs: Vec::new(),
             rejected: Vec::new(),
             deleted_ids: Vec::new(),
-            primary_upsert_ids: Vec::new(),
-            primary_delete_ids: Vec::new(),
+            oplog_ops: Vec::new(),
+            oplog_receipts: Vec::new(),
+            explicit_delete_term_count: 0,
+            document_write_delete_term_count: 0,
             #[cfg(feature = "vector-search")]
             doc_vectors: Vec::new(),
             #[cfg(feature = "vector-search")]
@@ -652,20 +846,31 @@ impl PreparedWriteOperation {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum DocumentWriteMode {
     Add,
     PrimaryUpsert,
-    ReplicatedUpsert,
+    ReplicatedUpsert(Option<ReplicatedWriteOrigin>),
+}
+
+#[derive(Clone)]
+enum OplogWriteOrigin {
+    Local,
+    Replicated(ReplicatedWriteOrigin),
+    LegacyUnproven,
 }
 
 impl DocumentWriteMode {
-    fn deletes_existing(self) -> bool {
-        matches!(self, Self::PrimaryUpsert | Self::ReplicatedUpsert)
+    fn deletes_existing(&self) -> bool {
+        matches!(self, Self::PrimaryUpsert | Self::ReplicatedUpsert(_))
     }
 
-    fn tracks_primary(self) -> bool {
-        matches!(self, Self::Add | Self::PrimaryUpsert)
+    fn oplog_origin(&self) -> OplogWriteOrigin {
+        match self {
+            Self::ReplicatedUpsert(Some(origin)) => OplogWriteOrigin::Replicated(origin.clone()),
+            Self::ReplicatedUpsert(None) => OplogWriteOrigin::LegacyUnproven,
+            Self::Add | Self::PrimaryUpsert => OplogWriteOrigin::Local,
+        }
     }
 }
 
@@ -686,7 +891,6 @@ struct WriteFinalizationContext<'a> {
     oplog: Option<&'a Arc<crate::index::oplog::OpLog>>,
     admission_store: &'a Arc<WriteAdmissionStore>,
     facet_cache: &'a super::FacetCacheMap,
-    lww_map: &'a super::LwwMap,
     #[cfg(feature = "vector-search")]
     vector_ctx: &'a VectorWriteContext,
     #[cfg(feature = "vector-search")]
@@ -697,25 +901,28 @@ struct WriteFinalizationContext<'a> {
 ///
 /// # Arguments
 ///
-/// * `tenant_id` - Tenant identifier used for logging, path resolution, and LWW map keying.
+/// * `tenant_id` - Tenant identifier used for logging and path resolution.
 /// * `index` - Shared Tantivy index to write documents into.
 /// * `tasks` - Shared task-status map updated as operations are processed.
 /// * `base_path` - Root data directory; tenant subdirectories contain settings, oplog, and vector files.
 /// * `oplog` - Optional operation log for durable write-ahead recording.
 /// * `facet_cache` - Shared facet cache invalidated after each commit.
-/// * `lww_map` - Last-writer-wins map for primary write conflict resolution.
 /// * `vector_ctx` - Vector index context for embedding and storing document vectors.
 ///
 /// # Returns
 ///
-/// A `(WriteQueue, JoinHandle)` tuple: the channel sender for submitting `WriteOp`s and the spawned task handle.
+/// A `(WriteQueue, JoinHandle, WriteQueueCancellation)` tuple: the channel sender
+/// for submitting `WriteOp`s, the worker completion handle, and the cancellation
+/// signal stored by the canonical `WriteTaskHandle`.
 pub(crate) fn create_write_queue(
     mut ctx: WriteQueueContext,
 ) -> crate::error::Result<(
     WriteQueue,
     tokio::task::JoinHandle<crate::error::Result<()>>,
+    WriteQueueCancellation,
 )> {
     let (tx, rx) = mpsc::channel(write_queue_channel_capacity());
+    let (cancellation, cancellation_rx) = write_queue_cancellation_channel();
     // This guard spans startup replay and the steady-state worker so every
     // exit path retires any per-tenant metric series it created.
     let tenant_metrics = writer_lifecycle::WriteQueueTenantMetrics::for_queue(&ctx.tenant_id);
@@ -742,25 +949,94 @@ pub(crate) fn create_write_queue(
         ctx.tasks.insert(task.id.clone(), task.clone());
         ctx.tasks.insert(task.numeric_id.to_string(), task);
     }
-    run_replay_startup(&ctx, replay_records)?;
+    run_replay_startup(&ctx, replay_records, &cancellation)?;
 
-    let handle = tokio::spawn(async move {
-        let _tenant_metrics = tenant_metrics;
-        process_writes(ctx, rx, Vec::new()).await
-    });
+    let handle = spawn_dedicated_write_worker(
+        ctx,
+        rx,
+        cancellation.clone(),
+        cancellation_rx,
+        tenant_metrics,
+    )?;
 
-    Ok((tx, handle))
+    Ok((tx, handle, cancellation))
+}
+
+fn write_queue_cancellation_channel() -> (WriteQueueCancellation, watch::Receiver<bool>) {
+    let (sender, receiver) = watch::channel(false);
+    (WriteQueueCancellation { sender }, receiver)
+}
+
+fn spawn_dedicated_write_worker(
+    ctx: WriteQueueContext,
+    rx: mpsc::Receiver<WriteOp>,
+    cancellation: WriteQueueCancellation,
+    cancellation_rx: watch::Receiver<bool>,
+    tenant_metrics: writer_lifecycle::WriteQueueTenantMetrics,
+) -> crate::error::Result<tokio::task::JoinHandle<crate::error::Result<()>>> {
+    let tenant_id = ctx.tenant_id.clone();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name(format!("flapjack-write-{tenant_id}"))
+        .spawn(move || {
+            let result = run_dedicated_write_worker_runtime(
+                ctx,
+                rx,
+                cancellation,
+                cancellation_rx,
+                tenant_metrics,
+            );
+            let _ = result_tx.send(result);
+        })
+        .map_err(|error| {
+            crate::error::FlapjackError::Tantivy(format!(
+                "failed to spawn dedicated write queue worker for {tenant_id}: {error}"
+            ))
+        })?;
+
+    Ok(tokio::spawn(async move {
+        result_rx.await.map_err(|error| {
+            crate::error::FlapjackError::Tantivy(format!(
+                "write queue worker for {tenant_id} stopped before reporting completion: {error}"
+            ))
+        })?
+    }))
+}
+
+fn run_dedicated_write_worker_runtime(
+    ctx: WriteQueueContext,
+    rx: mpsc::Receiver<WriteOp>,
+    cancellation: WriteQueueCancellation,
+    cancellation_rx: watch::Receiver<bool>,
+    tenant_metrics: writer_lifecycle::WriteQueueTenantMetrics,
+) -> crate::error::Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            crate::error::FlapjackError::Tantivy(format!(
+                "failed to create dedicated write queue runtime: {error}"
+            ))
+        })?
+        .block_on(async move {
+            // Tokio is local to this dedicated writer thread. Blocking Tantivy
+            // commit work no longer runs on the shared server runtime.
+            let _tenant_metrics = tenant_metrics;
+            process_writes(ctx, rx, cancellation, cancellation_rx, Vec::new()).await
+        })
 }
 
 fn run_replay_startup(
     ctx: &WriteQueueContext,
     replay_records: Vec<WriteAdmissionRecord>,
+    cancellation: &WriteQueueCancellation,
 ) -> crate::error::Result<()> {
     if replay_records.is_empty() {
         return Ok(());
     }
 
     let ctx = ctx.clone();
+    let cancellation = cancellation.clone();
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
     let thread = std::thread::spawn(move || {
         let result = tokio::runtime::Builder::new_current_thread()
@@ -786,10 +1062,12 @@ fn run_replay_startup(
                             &mut pending,
                             replay_records,
                             resolved_batch_size,
+                            &cancellation,
                         )
                         .await?;
                         if !pending.is_empty() {
-                            flush_pending_batch(&ctx, &mut writer, &mut pending).await?;
+                            flush_pending_batch(&ctx, &mut writer, &mut pending, &cancellation)
+                                .await?;
                         }
                         Ok(())
                     }
@@ -882,6 +1160,7 @@ fn apply_usize_merge_policy_override(
 async fn acquire_writer_for_queue(
     index: &Arc<crate::index::Index>,
     tenant_id: &str,
+    writer_buffer_size: usize,
 ) -> crate::error::Result<crate::index::ManagedIndexWriter> {
     const RETRY_INTERVAL: Duration = Duration::from_millis(5);
     let acquire_timeout = writer_acquire_timeout();
@@ -889,7 +1168,7 @@ async fn acquire_writer_for_queue(
     let mut retries = 0usize;
     let mut writer_waiter = None;
     loop {
-        match index.writer() {
+        match index.writer_with_size(writer_buffer_size) {
             Ok(writer) => {
                 observe_write_queue_writer_opened(tenant_id);
                 return Ok(writer);
@@ -921,7 +1200,7 @@ async fn acquire_writer_for_queue(
                         retries
                     );
                 }
-                tokio::time::sleep(RETRY_INTERVAL).await;
+                std::thread::sleep(RETRY_INTERVAL);
             }
             Err(e) => {
                 tracing::error!("[WQ {}] failed to create writer: {}", tenant_id, e);
@@ -942,6 +1221,7 @@ async fn flush_pending_batch(
     ctx: &WriteQueueContext,
     writer: &mut Option<crate::index::ManagedIndexWriter>,
     pending: &mut Vec<WriteOp>,
+    cancellation: &WriteQueueCancellation,
 ) -> crate::error::Result<()> {
     let phase_start = Instant::now();
     if pending.is_empty() {
@@ -968,7 +1248,11 @@ async fn flush_pending_batch(
             // A successful commit is a safe yield boundary: Tantivy has accepted
             // the batch, and merge quiescence preserves its background merge owner
             // before a real waiter receives the global writer permit.
-            writer_lifecycle::yield_writer_to_waiter_after_merge_quiescence(ctx, writer)
+            writer_lifecycle::yield_writer_to_waiter_after_merge_quiescence(
+                ctx,
+                writer,
+                cancellation,
+            )
         }
         Err(error) => {
             if let Err(close_error) =
@@ -999,6 +1283,8 @@ async fn flush_pending_batch(
 async fn process_writes(
     ctx: WriteQueueContext,
     mut rx: mpsc::Receiver<WriteOp>,
+    cancellation: WriteQueueCancellation,
+    mut cancellation_rx: watch::Receiver<bool>,
     replay_records: Vec<WriteAdmissionRecord>,
 ) -> crate::error::Result<()> {
     let phase_start = Instant::now();
@@ -1006,6 +1292,8 @@ async fn process_writes(
     let resolved_batch_size = resolved_write_queue_batch_size(&ctx);
     log_write_queue_start(tenant_id, resolved_batch_size);
     apply_write_queue_start_delay(tenant_id).await;
+    #[cfg(test)]
+    wait_for_test_worker_start_gate(&ctx);
     let mut pending = Vec::new();
     // The writer slot starts empty so queues that never receive writes do not
     // consume memory budget. Active commits reuse one writer while uncontended;
@@ -1018,13 +1306,14 @@ async fn process_writes(
         &mut pending,
         replay_records,
         resolved_batch_size,
+        &cancellation,
     )
     .await?;
     let mut writer_idle_since = writer.as_ref().map(|_| Instant::now());
 
     loop {
         log_write_queue_state(tenant_id, pending.len(), deadline);
-        match next_write_queue_event(deadline, &mut rx).await {
+        match next_write_queue_event(deadline, &mut rx, &mut cancellation_rx).await {
             WriteQueueEvent::Received(op) => {
                 if handle_received_write_op(
                     &ctx,
@@ -1032,6 +1321,7 @@ async fn process_writes(
                     &mut pending,
                     op,
                     resolved_batch_size,
+                    &cancellation,
                 )
                 .await?
                 {
@@ -1040,8 +1330,17 @@ async fn process_writes(
                 }
             }
             WriteQueueEvent::ChannelClosed => {
-                writer_lifecycle::drain_writer_on_channel_close(&ctx, &mut writer, &mut pending)
-                    .await?;
+                writer_lifecycle::drain_writer_on_channel_close(
+                    &ctx,
+                    &mut writer,
+                    &mut pending,
+                    &cancellation,
+                )
+                .await?;
+                break;
+            }
+            WriteQueueEvent::Cancelled => {
+                writer_lifecycle::close_writer_after_cancellation(&ctx, &mut writer)?;
                 break;
             }
             WriteQueueEvent::DeadlineElapsed => {
@@ -1050,6 +1349,7 @@ async fn process_writes(
                     &mut writer,
                     &mut pending,
                     &mut writer_idle_since,
+                    &cancellation,
                 )
                 .await?;
             }
@@ -1057,6 +1357,13 @@ async fn process_writes(
     }
     observe_write_queue_phase(PHASE_PROCESS_WRITES, phase_start);
     Ok(())
+}
+
+#[cfg(test)]
+fn wait_for_test_worker_start_gate(ctx: &WriteQueueContext) {
+    if let Some(gate) = &ctx.test_overrides.worker_start_gate {
+        gate.wait_until_released();
+    }
 }
 
 fn resolved_write_queue_batch_size(_ctx: &WriteQueueContext) -> usize {
@@ -1084,7 +1391,7 @@ async fn apply_write_queue_start_delay(tenant_id: &str) {
             tenant_id,
             delay
         );
-        tokio::time::sleep(delay).await;
+        std::thread::sleep(delay);
     }
 }
 
@@ -1094,10 +1401,19 @@ async fn replay_and_flush_admitted_writes(
     pending: &mut Vec<WriteOp>,
     replay_records: Vec<WriteAdmissionRecord>,
     resolved_batch_size: usize,
+    cancellation: &WriteQueueCancellation,
 ) -> crate::error::Result<()> {
-    replay_admitted_writes(ctx, writer, pending, replay_records, resolved_batch_size).await?;
+    replay_admitted_writes(
+        ctx,
+        writer,
+        pending,
+        replay_records,
+        resolved_batch_size,
+        cancellation,
+    )
+    .await?;
     if !pending.is_empty() {
-        flush_pending_batch(ctx, writer, pending).await?;
+        flush_pending_batch(ctx, writer, pending, cancellation).await?;
     }
     Ok(())
 }
@@ -1108,10 +1424,18 @@ async fn replay_admitted_writes(
     pending: &mut Vec<WriteOp>,
     replay_records: Vec<WriteAdmissionRecord>,
     resolved_batch_size: usize,
+    cancellation: &WriteQueueCancellation,
 ) -> crate::error::Result<()> {
     for record in replay_records {
-        handle_received_write_op(ctx, writer, pending, record.write_op(), resolved_batch_size)
-            .await?;
+        handle_received_write_op(
+            ctx,
+            writer,
+            pending,
+            record.write_op(),
+            resolved_batch_size,
+            cancellation,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1119,6 +1443,7 @@ async fn replay_admitted_writes(
 enum WriteQueueEvent {
     Received(WriteOp),
     ChannelClosed,
+    Cancelled,
     DeadlineElapsed,
 }
 
@@ -1145,11 +1470,24 @@ fn log_write_queue_state(tenant_id: &str, pending_len: usize, deadline: Instant)
 async fn next_write_queue_event(
     deadline: Instant,
     rx: &mut mpsc::Receiver<WriteOp>,
+    cancellation_rx: &mut watch::Receiver<bool>,
 ) -> WriteQueueEvent {
-    match timeout_at(deadline.into(), rx.recv()).await {
-        Ok(Some(op)) => WriteQueueEvent::Received(op),
-        Ok(None) => WriteQueueEvent::ChannelClosed,
-        Err(_timeout) => WriteQueueEvent::DeadlineElapsed,
+    if *cancellation_rx.borrow() {
+        return WriteQueueEvent::Cancelled;
+    }
+
+    tokio::select! {
+        maybe_op = rx.recv() => match maybe_op {
+            Some(op) => WriteQueueEvent::Received(op),
+            None => WriteQueueEvent::ChannelClosed,
+        },
+        changed = cancellation_rx.changed() => match changed {
+            Ok(()) => WriteQueueEvent::Cancelled,
+            Err(_) => WriteQueueEvent::Cancelled,
+        },
+        _ = timeout_at(deadline.into(), std::future::pending::<()>()) => {
+            WriteQueueEvent::DeadlineElapsed
+        }
     }
 }
 
@@ -1163,6 +1501,7 @@ async fn handle_received_write_op(
     pending: &mut Vec<WriteOp>,
     op: WriteOp,
     resolved_batch_size: usize,
+    cancellation: &WriteQueueCancellation,
 ) -> crate::error::Result<bool> {
     let tenant_id = &ctx.tenant_id;
     let action_count = op.actions.len();
@@ -1176,7 +1515,7 @@ async fn handle_received_write_op(
     );
 
     if is_compact {
-        flush_pending_batch(ctx, writer, pending).await?;
+        flush_pending_batch(ctx, writer, pending, cancellation).await?;
         let writer = writer_lifecycle::writer_for_queue(ctx, writer).await?;
         // Compact reuses the tenant worker writer so background merge
         // ownership stays single-source instead of racing a second writer.
@@ -1199,7 +1538,7 @@ async fn handle_received_write_op(
         tenant_id,
         pending.len()
     );
-    flush_pending_batch(ctx, writer, pending).await?;
+    flush_pending_batch(ctx, writer, pending, cancellation).await?;
     Ok(true)
 }
 
@@ -1212,12 +1551,13 @@ async fn handle_write_queue_timeout(
     writer: &mut Option<crate::index::ManagedIndexWriter>,
     pending: &mut Vec<WriteOp>,
     writer_idle_since: &mut Option<Instant>,
+    cancellation: &WriteQueueCancellation,
 ) -> crate::error::Result<Instant> {
     if pending.is_empty() {
         // No write arrived for a full interval. Yield only to a real waiter so
         // an uncontended writer remains alive to own background merges. A
         // contended yield waits for Tantivy merges before releasing the writer.
-        writer_lifecycle::yield_writer_to_waiter_after_merge_quiescence(ctx, writer)?;
+        writer_lifecycle::yield_writer_to_waiter_after_merge_quiescence(ctx, writer, cancellation)?;
         writer_lifecycle::close_idle_writer_after_timeout(ctx, writer, *writer_idle_since)?;
         backpressure::sample_after_worker_event(ctx);
         if writer.is_none() {
@@ -1229,7 +1569,7 @@ async fn handle_write_queue_timeout(
             ctx.tenant_id,
             pending.len()
         );
-        flush_pending_batch(ctx, writer, pending).await?;
+        flush_pending_batch(ctx, writer, pending, cancellation).await?;
         *writer_idle_since = writer.as_ref().map(|_| Instant::now());
     }
     Ok(reset_write_queue_deadline())
@@ -1343,7 +1683,6 @@ async fn commit_batch(
         oplog: ctx.oplog.as_ref(),
         admission_store: &ctx.admission_store,
         facet_cache: &ctx.facet_cache,
-        lww_map: &ctx.lww_map,
         #[cfg(feature = "vector-search")]
         vector_ctx: &ctx.vector_ctx,
         #[cfg(feature = "vector-search")]
@@ -1379,6 +1718,14 @@ async fn commit_batch(
         prepared_ops.push(prepared);
     }
 
+    #[cfg(any(debug_assertions, test))]
+    if let Some(delay) = write_queue_test_commit_delay(ctx.tenant_id.as_str()) {
+        // A yielding sleep would hide the shared-runtime blocking reproduced only by
+        // single_worker_runtime_serves_count_during_injected_two_second_commit in
+        // engine/flapjack-http/tests/write_runtime_isolation.rs.
+        std::thread::sleep(delay);
+    }
+
     let build_secs = match finalization::commit_writer_with_panic_guard(
         writer,
         ctx.tenant_id.as_str(),
@@ -1392,6 +1739,14 @@ async fn commit_batch(
             return Err(error);
         }
     };
+    #[cfg(any(test, feature = "fault-injection"))]
+    if let Err(error) = finalization::inject_finalization_fault(
+        ctx.tenant_id.as_str(),
+        finalization::FinalizationFaultPoint::AfterTantivyCommitBeforeVersionReceipts,
+    ) {
+        finalization::mark_tasks_failed(finalization_context.tasks, &batch_task_ids, &error);
+        return Err(error);
+    }
     if let Err(error) =
         finalization::finalize_committed_batch(&finalization_context, &prepared_ops, build_secs)
     {
@@ -1406,12 +1761,30 @@ async fn commit_batch(
         finalization::mark_tasks_failed(finalization_context.tasks, &batch_task_ids, &error);
         return Err(error);
     }
+    finalization::forget_finalized_tasks(
+        finalization_context.base_path,
+        finalization_context.tenant_id,
+        &prepared_ops,
+    );
     for prepared in &prepared_ops {
+        record_delete_term_observation(finalization_context.tasks, prepared);
         finalization::mark_task_succeeded(finalization_context.tasks, prepared);
     }
 
     observe_write_queue_phase(PHASE_COMMIT_BATCH, phase_start);
     Ok(())
+}
+
+fn record_delete_term_observation(
+    tasks: &Arc<dashmap::DashMap<String, TaskInfo>>,
+    prepared: &PreparedWriteOperation,
+) {
+    for task_id in [&prepared.task_id, &prepared.numeric_id] {
+        if let Some(mut task) = tasks.get_mut(task_id) {
+            task.explicit_delete_term_count = prepared.explicit_delete_term_count;
+            task.document_write_delete_term_count = prepared.document_write_delete_term_count;
+        }
+    }
 }
 
 fn load_write_settings(
@@ -1466,7 +1839,8 @@ fn parse_embedder_configs(
 
 /// Process one `WriteOp` end-to-end: mark the task as processing, prepare
 /// documents and deletes, embed vectors, write to Tantivy, commit, run
-/// post-commit finalization (oplog, caches, LWW, vectors), and mark succeeded.
+/// post-commit finalization (oplog, caches, durable versions, vectors), and mark
+/// succeeded.
 async fn stage_write_op_for_commit(
     context: &WriteFinalizationContext<'_>,
     settings: Option<&crate::index::settings::IndexSettings>,
@@ -1490,13 +1864,17 @@ async fn stage_write_op_for_commit(
     #[cfg(feature = "vector-search")]
     vectors::process_vectors_for_write_op(context, &mut prepared).await;
 
-    let valid_docs_json = finalization::write_valid_documents(writer, &prepared.valid_docs)?;
-    finalization::append_batch_to_oplog(
+    let _valid_docs_json = finalization::write_valid_documents(writer, &prepared.valid_docs)?;
+    prepared.oplog_receipts = finalization::append_batch_to_oplog(
         context.oplog,
         &prepared.task_id,
-        &valid_docs_json,
-        &prepared.deleted_ids,
+        &prepared.oplog_ops,
         context.tenant_id,
+    )?;
+    #[cfg(any(test, feature = "fault-injection"))]
+    finalization::inject_finalization_fault(
+        context.tenant_id,
+        finalization::FinalizationFaultPoint::AfterOplogAppendBeforeTantivyCommit,
     )?;
     Ok(prepared)
 }
@@ -1513,9 +1891,7 @@ fn mark_task_processing(tasks: &Arc<dashmap::DashMap<String, TaskInfo>>, task_id
     numeric_id
 }
 
-/// Dispatch each `WriteAction` to the appropriate handler: delete (with or
-/// without LWW tracking), add, upsert, or replicated-upsert document
-/// preparation.
+/// Dispatch each `WriteAction` to delete, add, upsert, or replicated document preparation.
 fn prepare_write_actions(
     preparation_context: &mut WritePreparationContext<'_>,
     prepared: &mut PreparedWriteOperation,
@@ -1529,7 +1905,7 @@ fn prepare_write_actions(
                     preparation_context.writer,
                     preparation_context.id_field,
                     object_id,
-                    true,
+                    OplogWriteOrigin::Local,
                 );
             }
             WriteAction::DeleteNoLwwUpdate(object_id) => {
@@ -1538,7 +1914,16 @@ fn prepare_write_actions(
                     preparation_context.writer,
                     preparation_context.id_field,
                     object_id,
-                    false,
+                    OplogWriteOrigin::LegacyUnproven,
+                );
+            }
+            WriteAction::DeleteWithOrigin { object_id, origin } => {
+                prepare_delete_action(
+                    prepared,
+                    preparation_context.writer,
+                    preparation_context.id_field,
+                    object_id,
+                    OplogWriteOrigin::Replicated(origin),
                 );
             }
             WriteAction::Add(doc) => {
@@ -1557,7 +1942,15 @@ fn prepare_write_actions(
                     preparation_context,
                     prepared,
                     doc,
-                    DocumentWriteMode::ReplicatedUpsert,
+                    DocumentWriteMode::ReplicatedUpsert(None),
+                );
+            }
+            WriteAction::UpsertWithOrigin { doc, origin } => {
+                prepare_document_write(
+                    preparation_context,
+                    prepared,
+                    doc,
+                    DocumentWriteMode::ReplicatedUpsert(Some(origin)),
                 );
             }
             WriteAction::Compact => {}
@@ -1571,13 +1964,18 @@ fn prepare_delete_action(
     writer: &mut crate::index::ManagedIndexWriter,
     id_field: tantivy::schema::Field,
     object_id: String,
-    track_primary_delete: bool,
+    origin: OplogWriteOrigin,
 ) {
     let phase_start = Instant::now();
     writer.delete_term(tantivy::Term::from_field_text(id_field, &object_id));
-    if track_primary_delete {
-        prepared.primary_delete_ids.push(object_id.clone());
+    if let Some(operation) = oplog_operation(
+        "delete",
+        serde_json::json!({"objectID": object_id.clone()}),
+        origin,
+    ) {
+        prepared.oplog_ops.push(operation);
     }
+    prepared.explicit_delete_term_count += 1;
     prepared.deleted_ids.push(object_id);
     observe_write_queue_phase(PHASE_DELETE_STAGING, phase_start);
 }
@@ -1629,6 +2027,7 @@ fn prepare_document_write(
                 preparation_context.id_field,
                 &doc.id,
             ));
+        prepared.document_write_delete_term_count += 1;
         observe_write_queue_phase(PHASE_DELETE_STAGING, phase_start);
     }
 
@@ -1641,8 +2040,12 @@ fn prepare_document_write(
 
     match conversion_result {
         Ok(tantivy_doc) => {
-            if document_write_mode.tracks_primary() {
-                prepared.primary_upsert_ids.push(doc.id.clone());
+            if let Some(operation) = oplog_operation(
+                "upsert",
+                serde_json::json!({"objectID": doc.id.clone(), "body": doc_json.clone()}),
+                document_write_mode.oplog_origin(),
+            ) {
+                prepared.oplog_ops.push(operation);
             }
             prepared
                 .valid_docs
@@ -1657,6 +2060,29 @@ fn prepare_document_write(
                 message: error.to_string(),
             });
         }
+    }
+}
+
+fn oplog_operation(
+    op_type: &'static str,
+    payload: serde_json::Value,
+    origin: OplogWriteOrigin,
+) -> Option<crate::index::oplog::OpLogOperation> {
+    match origin {
+        OplogWriteOrigin::Local => {
+            Some(crate::index::oplog::OpLogOperation::local(op_type, payload))
+        }
+        OplogWriteOrigin::Replicated(origin) => {
+            Some(crate::index::oplog::OpLogOperation::replicated(
+                op_type,
+                payload,
+                origin.into_oplog_origin(),
+            ))
+        }
+        // Old admission records intentionally carried no origin tuple. Replaying
+        // their Tantivy mutation is idempotent, but publishing invented conflict
+        // evidence would poison the durable owner and downstream peers.
+        OplogWriteOrigin::LegacyUnproven => None,
     }
 }
 

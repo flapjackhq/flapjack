@@ -73,6 +73,7 @@ pub struct AppState {
     pub geoip_reader: Option<Arc<GeoIpReader>>,
     pub notification_service: Option<Arc<NotificationService>>,
     pub migration_runner: Arc<migration::MigrationJobRunner>,
+    pub bulk_replace_max_bytes: u64,
     pub start_time: std::time::Instant,
     pub conversation_store: Arc<ConversationStore>,
     pub embedder_store: Arc<crate::embedder_store::EmbedderStore>,

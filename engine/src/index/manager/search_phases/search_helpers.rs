@@ -7,11 +7,12 @@ use super::{
     apply_rule_effects, sort_with_stage2_ranking, PreprocessedQuery, ResolvedSearch,
     RuleEffectsResult,
 };
+use crate::index::FacetCacheKey;
 
 pub(super) struct ZeroLimitSearchContext<'a> {
     pub facets: Option<&'a [crate::types::FacetRequest]>,
     pub max_values_per_facet: Option<usize>,
-    pub facet_cache_key: Option<&'a String>,
+    pub facet_cache_key: Option<&'a FacetCacheKey>,
     pub facet_result: Option<FacetResultCache>,
     pub effective_around_lat_lng: Option<String>,
     pub effective_around_radius: Option<serde_json::Value>,
@@ -24,7 +25,7 @@ pub(super) struct RankedSearchContext<'a, 'b> {
     pub distinct: Option<u32>,
     pub max_values_per_facet: Option<usize>,
     pub query_text: &'a str,
-    pub facet_cache_key: Option<&'a String>,
+    pub facet_cache_key: Option<&'a FacetCacheKey>,
     pub facet_result: Option<FacetResultCache>,
     pub effective_limit: usize,
     pub allow_split_alternatives: bool,

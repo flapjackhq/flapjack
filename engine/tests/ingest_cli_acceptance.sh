@@ -184,7 +184,7 @@ EOF
   fi
 
   cat >"$TMP_DATA/replace_source.ndjson" <<'EOF'
-{"objectID":"doc_replace","title":"Should Not Land"}
+{"objectID":"doc_replace","title":"Atomic Replacement"}
 EOF
 
   printf '%s\n' "$ADMIN_KEY" >"$TMP_DATA/api_key.txt"
@@ -224,7 +224,7 @@ seed_replace_sentinel() {
     fail 'seed replace sentinel through batch endpoint' "$body"
     return 1
   fi
-  wait_for_query 'replace sentinel is visible before refusal' '.hits | map(.objectID) | index("sentinel") != null'
+  wait_for_query 'replace sentinel is visible before replacement' '.hits | map(.objectID) | index("sentinel") != null'
 }
 
 run_acceptance() {
@@ -257,7 +257,6 @@ run_acceptance() {
     '.hits | map(.objectID) | index("doc_delete") == null'
 
   seed_replace_sentinel
-  set +e
   "$BIN" ingest \
     --endpoint "$BASE" \
     --index "$INDEX_NAME" \
@@ -266,15 +265,9 @@ run_acceptance() {
     --api-key-stdin \
     --mode replace \
     --report-json >"$TMP_DATA/replace_report.json" 2>"$TMP_DATA/replace_stderr.log" <<<"$ADMIN_KEY"
-  local replace_exit=$?
-  set -e
-  if [ "$replace_exit" -ne 0 ] && jq -e '.failure_classification == "replace_not_supported" and .attempted == 0 and .confirmed_committed == 0 and .outcome_unknown == 0' "$TMP_DATA/replace_report.json" >/dev/null; then
-    pass 'replace mode returns typed zero-mutation refusal'
-  else
-    fail 'replace mode returns typed zero-mutation refusal' "exit=${replace_exit} report=$(cat "$TMP_DATA/replace_report.json" 2>/dev/null || true) stderr=$(cat "$TMP_DATA/replace_stderr.log" 2>/dev/null || true)"
-  fi
-  wait_for_query 'replace refusal leaves sentinel unchanged and source absent' \
-    '.hits | map({key: .objectID, value: .title}) | from_entries | .sentinel == "Keep Me" and (has("doc_replace") | not)'
+  assert_report_counts "$TMP_DATA/replace_report.json" 1 1 0
+  wait_for_query 'replace removes the sentinel and publishes the exact replacement' \
+    '.nbHits == 1 and .hits[0].objectID == "doc_replace" and .hits[0].title == "Atomic Replacement"'
 
   printf '\nResults: %d/%d passed\n' "$TESTS_PASSED" "$TESTS_RUN"
   [ "$TESTS_FAILED" -eq 0 ]

@@ -1,39 +1,9 @@
 use super::*;
-use crate::index::oplog::{read_committed_seq, write_committed_seq, OpLogEntry};
-
-#[derive(Default)]
-struct ReplayDocumentStats {
-    replayed: usize,
-    failed: usize,
-}
-
-impl ReplayDocumentStats {
-    fn record(&mut self, outcome: ReplayDocumentOutcome) {
-        self.replayed += outcome.replayed;
-        self.failed += outcome.failed;
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ReplayDocumentOutcome {
-    replayed: usize,
-    failed: usize,
-}
-
-impl ReplayDocumentOutcome {
-    const SKIPPED: Self = Self {
-        replayed: 0,
-        failed: 0,
-    };
-    const REPLAYED: Self = Self {
-        replayed: 1,
-        failed: 0,
-    };
-    const FAILED: Self = Self {
-        replayed: 0,
-        failed: 1,
-    };
-}
+#[cfg(test)]
+use crate::index::oplog::read_committed_seq;
+use crate::index::oplog::{
+    read_checked_committed_seq, write_committed_seq, OpLogEntry, OpLogReceipt,
+};
 
 #[derive(Clone, Copy)]
 pub(super) struct RecoverySeqWindow {
@@ -41,18 +11,29 @@ pub(super) struct RecoverySeqWindow {
     pub(super) final_seq: u64,
 }
 
-struct ReplayCommitContext<'a> {
+pub(super) struct RecoveryDocumentContext<'a> {
+    pub(super) tenant_id: &'a str,
+    pub(super) index: &'a Arc<Index>,
+    pub(super) tenant_path: &'a Path,
+    pub(super) seq_window: RecoverySeqWindow,
+    pub(super) settings: Option<&'a IndexSettings>,
+}
+
+struct RecoveryWriterContext<'a> {
     tenant_id: &'a str,
     index: &'a Arc<Index>,
-    tenant_path: &'a Path,
-    seq_window: RecoverySeqWindow,
+    settings: Option<&'a IndexSettings>,
+    writer: &'a mut crate::index::ManagedIndexWriter,
+    id_field: tantivy::schema::Field,
 }
 
 impl IndexManager {
-    /// Replay uncommitted oplog entries for a tenant after startup. Rebuilds the LWW map
-    /// from all retained entries, replays config ops (settings), then replays document ops
-    /// (upsert/delete/clear) with a fresh Tantivy writer. Rebuilds the vector index when
-    /// the `vector-search` feature is enabled.
+    /// Recover the uncommitted oplog tail for a tenant after startup.
+    ///
+    /// Config changes are restored first. Document changes then commit to Tantivy,
+    /// update the durable object-version store in one transaction, and finally
+    /// advance `committed_seq`. Any error before the final step leaves the tail
+    /// replayable on the next startup.
     pub(super) fn recover_from_oplog(
         &self,
         tenant_id: &str,
@@ -63,17 +44,16 @@ impl IndexManager {
         if !oplog_dir.exists() {
             return Ok(());
         }
-        let committed_seq = read_committed_seq(tenant_path);
+        let committed_seq = read_checked_committed_seq(tenant_path)?.unwrap_or(0);
 
         let node_id = crate::index::configured_node_id();
         let oplog = OpLog::open(&oplog_dir, tenant_id, &node_id)?;
-
-        self.rebuild_lww_map(tenant_id, &oplog)?;
 
         let ops = oplog.read_since(committed_seq)?;
         if ops.is_empty() {
             return Ok(());
         }
+        Self::validate_recovery_sequence(tenant_id, committed_seq, &ops)?;
 
         tracing::info!(
             "[RECOVERY {}] replaying {} ops from seq {} (committed_seq={})",
@@ -98,13 +78,15 @@ impl IndexManager {
             self.finish_config_only_recovery(tenant_id, tenant_path, seq_window)?;
             return Ok(());
         }
-        self.replay_document_ops(
-            tenant_id,
-            index,
-            tenant_path,
+        self.recover_document_ops(
+            RecoveryDocumentContext {
+                tenant_id,
+                index,
+                tenant_path,
+                seq_window,
+                settings: settings.as_ref(),
+            },
             &document_ops,
-            seq_window,
-            settings.as_ref(),
         )?;
 
         #[cfg(feature = "vector-search")]
@@ -115,6 +97,38 @@ impl IndexManager {
 
     pub(super) fn is_document_recovery_op(op_type: &str) -> bool {
         matches!(op_type, "upsert" | "delete" | "clear")
+    }
+
+    fn validate_recovery_sequence(
+        tenant_id: &str,
+        committed_seq: u64,
+        ops: &[OpLogEntry],
+    ) -> Result<()> {
+        let Some(first_entry) = ops.first() else {
+            return Ok(());
+        };
+        if first_entry.seq <= committed_seq {
+            return Err(FlapjackError::Tantivy(format!(
+                "[RECOVERY {tenant_id}] oplog tail starts at seq {} at or before committed seq {committed_seq}",
+                first_entry.seq
+            )));
+        }
+        for entries in ops.windows(2) {
+            let expected_seq = entries[0].seq.checked_add(1).ok_or_else(|| {
+                FlapjackError::Tantivy(format!(
+                    "[RECOVERY {tenant_id}] oplog sequence overflow after {}",
+                    entries[0].seq
+                ))
+            })?;
+            let entry = &entries[1];
+            if entry.seq != expected_seq {
+                return Err(FlapjackError::Tantivy(format!(
+                    "[RECOVERY {tenant_id}] non-contiguous oplog tail: expected seq {expected_seq}, found {}",
+                    entry.seq
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Advance the committed sequence number when only config ops were replayed (no
@@ -135,41 +149,6 @@ impl IndexManager {
             tenant_id,
             seq_window.final_seq
         );
-        Ok(())
-    }
-
-    /// Rebuild the LWW (last-writer-wins) map from all retained oplog entries, tracking
-    /// the highest `(timestamp_ms, node_id)` pair per object ID. Runs on every startup
-    /// so stale replicated ops arriving after restart are correctly rejected.
-    pub(super) fn rebuild_lww_map(&self, tenant_id: &str, oplog: &OpLog) -> Result<()> {
-        // P3: Rebuild lww_map from ALL retained oplog entries (read from seq=0).
-        // This runs on every startup — crash or normal — so that stale replicated ops
-        // arriving after any restart are correctly rejected by the LWW check in
-        // apply_ops_to_manager. We track the highest (timestamp_ms, node_id) per
-        // object so out-of-order oplog entries (clock skew / replication) are handled.
-        let all_ops = oplog.read_since(0)?;
-        for entry in &all_ops {
-            let obj_id = match entry.op_type.as_str() {
-                "upsert" | "delete" => entry.payload.get("objectID").and_then(|v| v.as_str()),
-                _ => None,
-            };
-            if let Some(obj_id) = obj_id {
-                let incoming = (entry.timestamp_ms, entry.node_id.clone());
-                if self
-                    .get_lww(tenant_id, obj_id)
-                    .is_none_or(|existing| incoming > existing)
-                {
-                    self.record_lww(tenant_id, obj_id, entry.timestamp_ms, entry.node_id.clone());
-                }
-            }
-        }
-        if !all_ops.is_empty() {
-            tracing::info!(
-                "[RECOVERY {}] rebuilt lww_map from {} oplog entries",
-                tenant_id,
-                all_ops.len()
-            );
-        }
         Ok(())
     }
 
@@ -234,214 +213,139 @@ impl IndexManager {
         }
     }
 
-    /// Replay document operations (upsert, delete, clear) through a fresh Tantivy writer.
-    /// Acquires a writer, replays all entries, commits, reloads the reader, and advances
-    /// the committed sequence number.
-    pub(super) fn replay_document_ops(
+    /// Recover document operations through the durable Tantivy/version/watermark order.
+    pub(super) fn recover_document_ops(
         &self,
-        tenant_id: &str,
-        index: &Arc<Index>,
-        tenant_path: &Path,
+        context: RecoveryDocumentContext<'_>,
         ops: &[OpLogEntry],
-        seq_window: RecoverySeqWindow,
-        settings: Option<&IndexSettings>,
     ) -> Result<()> {
-        let mut writer = index.writer()?;
-        let schema = index.inner().schema();
+        let mut writer = context.index.writer()?;
+        let schema = context.index.inner().schema();
         let id_field = schema.get_field("_id").unwrap();
-        let stats =
-            self.replay_document_entries(tenant_id, index, ops, settings, &mut writer, id_field)?;
-        self.finish_replay_document_ops(
-            ReplayCommitContext {
-                tenant_id,
-                index,
-                tenant_path,
-                seq_window,
+        let receipts = self.recover_document_entries(
+            RecoveryWriterContext {
+                tenant_id: context.tenant_id,
+                index: context.index,
+                settings: context.settings,
+                writer: &mut writer,
+                id_field,
             },
-            &mut writer,
-            stats,
-        )
-    }
-
-    /// Iterate over document oplog entries and dispatch each to `replay_document_entry`,
-    /// accumulating replay and failure counts.
-    fn replay_document_entries(
-        &self,
-        tenant_id: &str,
-        index: &Arc<Index>,
-        ops: &[OpLogEntry],
-        settings: Option<&IndexSettings>,
-        writer: &mut crate::index::ManagedIndexWriter,
-        id_field: tantivy::schema::Field,
-    ) -> Result<ReplayDocumentStats> {
-        let mut stats = ReplayDocumentStats::default();
-        for entry in ops {
-            let outcome =
-                self.replay_document_entry(tenant_id, index, entry, settings, writer, id_field)?;
-            stats.record(outcome);
-        }
-        Ok(stats)
-    }
-
-    /// Dispatch a single oplog entry by op type: upsert converts JSON to a Tantivy
-    /// document, delete removes by object ID term, clear deletes all documents.
-    /// Unknown op types are skipped with a warning.
-    fn replay_document_entry(
-        &self,
-        tenant_id: &str,
-        index: &Arc<Index>,
-        entry: &OpLogEntry,
-        settings: Option<&IndexSettings>,
-        writer: &mut crate::index::ManagedIndexWriter,
-        id_field: tantivy::schema::Field,
-    ) -> Result<ReplayDocumentOutcome> {
-        match entry.op_type.as_str() {
-            "upsert" => {
-                self.replay_upsert_entry(tenant_id, index, entry, settings, writer, id_field)
-            }
-            "delete" => Ok(Self::replay_delete_entry(entry, writer, id_field)),
-            "settings" | "synonyms" | "rules" => Ok(ReplayDocumentOutcome::REPLAYED),
-            "clear" => {
-                writer.delete_all_documents()?;
-                Ok(ReplayDocumentOutcome::REPLAYED)
-            }
-            _ => {
-                tracing::warn!(
-                    "[RECOVERY {}] unknown op_type '{}' at seq {}, skipping",
-                    tenant_id,
-                    entry.op_type,
-                    entry.seq
-                );
-                Ok(ReplayDocumentOutcome::SKIPPED)
-            }
-        }
-    }
-
-    /// Replay a single upsert: delete the existing term for the object ID, parse the
-    /// JSON body into a `Document`, convert to a Tantivy document, and add to the writer.
-    fn replay_upsert_entry(
-        &self,
-        tenant_id: &str,
-        index: &Arc<Index>,
-        entry: &OpLogEntry,
-        settings: Option<&IndexSettings>,
-        writer: &mut crate::index::ManagedIndexWriter,
-        id_field: tantivy::schema::Field,
-    ) -> Result<ReplayDocumentOutcome> {
-        let Some(obj_id) = entry
-            .payload
-            .get("objectID")
-            .and_then(|value| value.as_str())
-        else {
-            return Ok(ReplayDocumentOutcome::SKIPPED);
-        };
-
-        writer.delete_term(tantivy::Term::from_field_text(id_field, obj_id));
-
-        let Some(body) = entry.payload.get("body") else {
-            return Ok(ReplayDocumentOutcome::SKIPPED);
-        };
-
-        let doc = match crate::types::Document::from_json(body) {
-            Ok(doc) => doc,
-            Err(error) => {
-                tracing::warn!(
-                    "[RECOVERY {}] failed to parse doc {}: {}",
-                    tenant_id,
-                    obj_id,
-                    error
-                );
-                return Ok(ReplayDocumentOutcome::FAILED);
-            }
-        };
-
-        match index.converter().to_tantivy(&doc, settings) {
-            Ok(tantivy_doc) => {
-                writer.add_document(tantivy_doc)?;
-                Ok(ReplayDocumentOutcome::REPLAYED)
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "[RECOVERY {}] failed to_tantivy for {}: {}",
-                    tenant_id,
-                    obj_id,
-                    error
-                );
-                Ok(ReplayDocumentOutcome::FAILED)
-            }
-        }
-    }
-
-    /// Replay a single delete: remove the document matching the object ID from the
-    /// Tantivy writer via term deletion.
-    fn replay_delete_entry(
-        entry: &OpLogEntry,
-        writer: &mut crate::index::ManagedIndexWriter,
-        id_field: tantivy::schema::Field,
-    ) -> ReplayDocumentOutcome {
-        let Some(obj_id) = entry
-            .payload
-            .get("objectID")
-            .and_then(|value| value.as_str())
-        else {
-            return ReplayDocumentOutcome::SKIPPED;
-        };
-
-        writer.delete_term(tantivy::Term::from_field_text(id_field, obj_id));
-        ReplayDocumentOutcome::REPLAYED
-    }
-
-    /// Commit the Tantivy writer after document replay, reload the reader, invalidate
-    /// the searchable-paths cache, and advance the committed sequence number on disk.
-    /// Logs a warning if any entries failed conversion.
-    fn finish_replay_document_ops(
-        &self,
-        commit_context: ReplayCommitContext<'_>,
-        writer: &mut crate::index::ManagedIndexWriter,
-        stats: ReplayDocumentStats,
-    ) -> Result<()> {
-        if stats.replayed == 0 {
-            return Ok(());
-        }
+            ops,
+        )?;
 
         writer.commit()?;
-        commit_context.index.reader().reload()?;
-        commit_context.index.invalidate_searchable_paths_cache();
+        context.index.reader().reload()?;
+        context.index.invalidate_searchable_paths_cache();
 
-        if let Err(error) = write_committed_seq(
-            commit_context.tenant_path,
-            commit_context.seq_window.final_seq,
-        ) {
-            tracing::warn!(
-                "[RECOVERY {}] failed to write committed_seq: {}",
-                commit_context.tenant_id,
-                error
-            );
-        }
-
-        if stats.failed > 0 {
-            tracing::warn!(
-                "[RECOVERY {}] replayed {}/{} ops successfully ({} failed), new committed_seq={}",
-                commit_context.tenant_id,
-                stats.replayed,
-                commit_context
-                    .seq_window
-                    .final_seq
-                    .saturating_sub(commit_context.seq_window.committed_seq)
-                    as usize,
-                stats.failed,
-                commit_context.seq_window.final_seq
-            );
-        } else {
-            tracing::info!(
-                "[RECOVERY {}] replayed {} ops, new committed_seq={}",
-                commit_context.tenant_id,
-                stats.replayed,
-                commit_context.seq_window.final_seq
-            );
-        }
-
+        let version_store = crate::index::version_store::VersionStore::open(context.tenant_path)?;
+        version_store.apply_receipts(&receipts)?;
+        write_committed_seq(context.tenant_path, context.seq_window.final_seq)?;
+        tracing::info!(
+            "[RECOVERY {}] recovered {} document ops, new committed_seq={}",
+            context.tenant_id,
+            receipts.len(),
+            context.seq_window.final_seq
+        );
         Ok(())
+    }
+
+    fn recover_document_entries(
+        &self,
+        mut context: RecoveryWriterContext<'_>,
+        ops: &[OpLogEntry],
+    ) -> Result<Vec<OpLogReceipt>> {
+        let mut receipts = Vec::with_capacity(ops.len());
+        for entry in ops {
+            receipts.push(self.recover_document_entry(&mut context, entry)?);
+        }
+        Ok(receipts)
+    }
+
+    fn recover_document_entry(
+        &self,
+        context: &mut RecoveryWriterContext<'_>,
+        entry: &OpLogEntry,
+    ) -> Result<OpLogReceipt> {
+        let object_id = match entry.op_type.as_str() {
+            "upsert" => Some(self.recover_upsert_entry(context, entry)?),
+            "delete" => Some(Self::recover_delete_entry(context, entry)?),
+            "clear" => {
+                context.writer.delete_all_documents()?;
+                None
+            }
+            _ => {
+                return Err(FlapjackError::Tantivy(format!(
+                    "[RECOVERY {}] non-document op '{}' reached document recovery at seq {}",
+                    context.tenant_id, entry.op_type, entry.seq
+                )));
+            }
+        };
+        Ok(OpLogReceipt {
+            seq: entry.seq,
+            object_id,
+            timestamp_ms: entry.timestamp_ms,
+            node_id: entry.node_id.clone(),
+            is_tombstone: entry.op_type == "delete",
+        })
+    }
+
+    fn recover_upsert_entry(
+        &self,
+        context: &mut RecoveryWriterContext<'_>,
+        entry: &OpLogEntry,
+    ) -> Result<String> {
+        let body = entry
+            .payload
+            .get("body")
+            .ok_or_else(|| Self::invalid_recovery_entry(context.tenant_id, entry, "body"))?;
+        let document = crate::types::Document::from_json(body).map_err(|error| {
+            FlapjackError::Tantivy(format!(
+                "[RECOVERY {}] failed to parse document at seq {}: {}",
+                context.tenant_id, entry.seq, error
+            ))
+        })?;
+        let object_id = document.id.clone();
+        let tantivy_document = context
+            .index
+            .converter()
+            .to_tantivy(&document, context.settings)
+            .map_err(|error| {
+                FlapjackError::Tantivy(format!(
+                    "[RECOVERY {}] failed to convert document '{}' at seq {}: {}",
+                    context.tenant_id, object_id, entry.seq, error
+                ))
+            })?;
+        context
+            .writer
+            .delete_term(tantivy::Term::from_field_text(context.id_field, &object_id));
+        context.writer.add_document(tantivy_document)?;
+        Ok(object_id)
+    }
+
+    fn recover_delete_entry(
+        context: &mut RecoveryWriterContext<'_>,
+        entry: &OpLogEntry,
+    ) -> Result<String> {
+        let object_id = entry
+            .payload
+            .get("objectID")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| Self::invalid_recovery_entry(context.tenant_id, entry, "objectID"))?;
+        context
+            .writer
+            .delete_term(tantivy::Term::from_field_text(context.id_field, object_id));
+        Ok(object_id.to_string())
+    }
+
+    fn invalid_recovery_entry(
+        tenant_id: &str,
+        entry: &OpLogEntry,
+        missing_field: &str,
+    ) -> FlapjackError {
+        FlapjackError::Tantivy(format!(
+            "[RECOVERY {tenant_id}] {} at seq {} is missing required {missing_field}",
+            entry.op_type, entry.seq
+        ))
     }
 
     /// Rebuild the in-memory VectorIndex by replaying all oplog entries (upsert, delete,
@@ -598,6 +502,255 @@ impl IndexManager {
             "[RECOVERY {}] rebuilt vector index from oplog ({} vectors)",
             tenant_id,
             vector_count
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::oplog::{OpLogOperation, OpLogOrigin};
+    use crate::index::version_store::{VersionRecord, VersionStore};
+    use tempfile::TempDir;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_replays_after_committed_seq_into_version_store() {
+        let temp_dir = TempDir::new().unwrap();
+        let tenant_id = "durable_recovery";
+        let tenant_path = temp_dir.path().join(tenant_id);
+        std::fs::create_dir_all(&tenant_path).unwrap();
+        let schema = crate::index::schema::Schema::builder().build();
+        let index = Arc::new(crate::index::Index::create(&tenant_path, schema).unwrap());
+        IndexSettings::default()
+            .save(tenant_path.join("settings.json"))
+            .unwrap();
+
+        let oplog = OpLog::open(&tenant_path.join("oplog"), tenant_id, "local-node").unwrap();
+        oplog
+            .append_operations_for_task(
+                "recovery-task",
+                vec![
+                    OpLogOperation::replicated(
+                        "upsert",
+                        serde_json::json!({
+                            "objectID": "already-committed",
+                            "body": {"objectID": "already-committed", "title": "Committed"}
+                        }),
+                        OpLogOrigin::new(1000, "node-a"),
+                    ),
+                    OpLogOperation::replicated(
+                        "upsert",
+                        serde_json::json!({
+                            "objectID": "recovered-upsert",
+                            "body": {"objectID": "recovered-upsert", "title": "Recovered"}
+                        }),
+                        OpLogOrigin::new(5000, "node-b"),
+                    ),
+                    OpLogOperation::replicated(
+                        "delete",
+                        serde_json::json!({"objectID": "recovered-delete"}),
+                        OpLogOrigin::new(6000, "node-c"),
+                    ),
+                ],
+            )
+            .unwrap();
+        write_committed_seq(&tenant_path, 1).unwrap();
+        let version_store = VersionStore::open(&tenant_path).unwrap();
+        assert!(version_store
+            .upsert(
+                "already-committed",
+                &VersionRecord::new(1000, "node-a", false, 1),
+            )
+            .unwrap());
+        drop(version_store);
+        drop(oplog);
+
+        let manager = IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+        manager
+            .recover_from_oplog(tenant_id, &index, &tenant_path)
+            .unwrap();
+
+        let recovered_store = VersionStore::open(&tenant_path).unwrap();
+        assert_eq!(
+            recovered_store.get("already-committed").unwrap(),
+            Some(VersionRecord::new(1000, "node-a", false, 1))
+        );
+        assert_eq!(
+            recovered_store.get("recovered-upsert").unwrap(),
+            Some(VersionRecord::new(5000, "node-b", false, 2))
+        );
+        assert_eq!(
+            recovered_store.get("recovered-delete").unwrap(),
+            Some(VersionRecord::new(6000, "node-c", true, 3))
+        );
+        assert_eq!(read_committed_seq(&tenant_path), 3);
+        let retained = OpLog::open(&tenant_path.join("oplog"), tenant_id, "local-node")
+            .unwrap()
+            .read_since(0)
+            .unwrap();
+        assert_eq!(
+            retained.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "recovery must not discard retained oplog evidence"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn malformed_document_recovery_fails_without_advancing_durable_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let tenant_id = "malformed_recovery";
+        let tenant_path = temp_dir.path().join(tenant_id);
+        std::fs::create_dir_all(&tenant_path).unwrap();
+        let schema = crate::index::schema::Schema::builder().build();
+        let index = Arc::new(crate::index::Index::create(&tenant_path, schema).unwrap());
+        IndexSettings::default()
+            .save(tenant_path.join("settings.json"))
+            .unwrap();
+        let oplog = OpLog::open(&tenant_path.join("oplog"), tenant_id, "local-node").unwrap();
+        oplog
+            .append_operations_for_task(
+                "malformed-task",
+                vec![OpLogOperation::replicated(
+                    "upsert",
+                    serde_json::json!({"objectID": "missing-body"}),
+                    OpLogOrigin::new(7000, "node-z"),
+                )],
+            )
+            .unwrap();
+        drop(oplog);
+
+        let manager = IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+        let result = manager.recover_from_oplog(tenant_id, &index, &tenant_path);
+
+        assert!(
+            result.is_err(),
+            "malformed document replay must fail closed"
+        );
+        assert_eq!(read_committed_seq(&tenant_path), 0);
+        assert_eq!(
+            VersionStore::open(&tenant_path)
+                .unwrap()
+                .get("missing-body")
+                .unwrap(),
+            None,
+            "failed decoding must not publish version rows"
+        );
+        assert_eq!(
+            index.reader().searcher().num_docs(),
+            0,
+            "failed decoding must not commit a partial Tantivy batch"
+        );
+        assert_eq!(
+            OpLog::open(&tenant_path.join("oplog"), tenant_id, "local-node")
+                .unwrap()
+                .read_since(0)
+                .unwrap()
+                .iter()
+                .map(|entry| entry.seq)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn malformed_committed_seq_refuses_recovery_without_mutating_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let tenant_id = "malformed_watermark";
+        let tenant_path = temp_dir.path().join(tenant_id);
+        std::fs::create_dir_all(&tenant_path).unwrap();
+        let schema = crate::index::schema::Schema::builder().build();
+        let index = Arc::new(crate::index::Index::create(&tenant_path, schema).unwrap());
+        IndexSettings::default()
+            .save(tenant_path.join("settings.json"))
+            .unwrap();
+        let oplog = OpLog::open(&tenant_path.join("oplog"), tenant_id, "local-node").unwrap();
+        oplog
+            .append_operations_for_task(
+                "watermark-task",
+                vec![OpLogOperation::replicated(
+                    "upsert",
+                    serde_json::json!({
+                        "objectID": "must-not-replay",
+                        "body": {"objectID": "must-not-replay", "title": "Uncommitted"}
+                    }),
+                    OpLogOrigin::new(7000, "node-z"),
+                )],
+            )
+            .unwrap();
+        std::fs::write(
+            tenant_path.join(crate::index::oplog::COMMITTED_SEQ_FILE),
+            "not-a-sequence",
+        )
+        .unwrap();
+        drop(oplog);
+
+        let manager = IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+        let error = manager
+            .recover_from_oplog(tenant_id, &index, &tenant_path)
+            .expect_err("corrupt watermark evidence must fail recovery closed");
+
+        assert!(
+            error.to_string().contains("not a u64"),
+            "recovery error must identify malformed sequence evidence: {error}"
+        );
+        assert_eq!(index.reader().searcher().num_docs(), 0);
+        assert_eq!(
+            VersionStore::open(&tenant_path)
+                .unwrap()
+                .get("must-not-replay")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            std::fs::read_to_string(tenant_path.join(crate::index::oplog::COMMITTED_SEQ_FILE))
+                .unwrap(),
+            "not-a-sequence",
+            "failed recovery must not replace corrupt watermark evidence"
+        );
+    }
+
+    #[test]
+    fn recovery_accepts_retained_leading_gap_before_replay() {
+        let retained_tail = OpLogEntry {
+            seq: 3,
+            timestamp_ms: 2000,
+            node_id: "node-a".to_string(),
+            tenant_id: "retained-tail".to_string(),
+            op_type: "clear".to_string(),
+            payload: serde_json::json!({}),
+        };
+
+        IndexManager::validate_recovery_sequence("retained-tail", 1, &[retained_tail])
+            .expect("retention may remove committed history before the first surviving tail entry");
+    }
+
+    #[test]
+    fn recovery_rejects_gap_inside_retained_tail() {
+        let retained_tail = [
+            OpLogEntry {
+                seq: 3,
+                timestamp_ms: 2000,
+                node_id: "node-a".to_string(),
+                tenant_id: "internal-gap".to_string(),
+                op_type: "clear".to_string(),
+                payload: serde_json::json!({}),
+            },
+            OpLogEntry {
+                seq: 5,
+                timestamp_ms: 3000,
+                node_id: "node-a".to_string(),
+                tenant_id: "internal-gap".to_string(),
+                op_type: "clear".to_string(),
+                payload: serde_json::json!({}),
+            },
+        ];
+
+        let error = IndexManager::validate_recovery_sequence("internal-gap", 1, &retained_tail)
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("expected seq 4, found 5"),
+            "sequence failure must identify the exact missing local sequence: {error}"
         );
     }
 }

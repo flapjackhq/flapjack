@@ -1,4 +1,4 @@
-//! Helpers for resolving the process node identifier used in oplog and LWW state.
+//! Helpers for resolving the process node identifier used in oplog version receipts.
 
 fn normalized_node_id(configured_node_id: Option<String>) -> String {
     configured_node_id

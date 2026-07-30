@@ -1,6 +1,6 @@
 use crate::index::settings::IndexSettings;
 use crate::query::parser::QueryParser;
-use crate::types::Query;
+use crate::types::{FieldValue, Filter, Query, ScoredDocument};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tantivy::query::Query as TantivyQuery;
@@ -120,15 +120,24 @@ impl ExecutorParityFixture {
 pub fn build_parity_fixture() -> ExecutorParityFixture {
     let temp_dir = TempDir::new().unwrap();
     let index = crate::Index::create_in_dir(temp_dir.path()).unwrap();
+    let settings = Arc::new(parity_settings());
+    let converter = index.converter();
     let batches = parity_batches();
     for batch in batches {
-        index.add_documents_simple(&batch).unwrap();
+        let mut writer = index.writer().unwrap();
+        for json_doc in batch {
+            let document = crate::types::Document::from_json(&json_doc).unwrap();
+            let tantivy_doc = converter
+                .to_tantivy(&document, Some(settings.as_ref()))
+                .unwrap();
+            writer.add_document(tantivy_doc).unwrap();
+        }
+        writer.commit().unwrap();
     }
 
     let reader = index.reader();
     reader.reload().unwrap();
     let searcher = reader.searcher();
-    let settings = Arc::new(parity_settings());
     let searchable_paths = settings.searchable_attributes.clone().unwrap();
 
     ExecutorParityFixture {
@@ -147,6 +156,7 @@ fn parity_settings() -> IndexSettings {
             "brand".to_string(),
             "tags".to_string(),
             "facetGroup".to_string(),
+            "price".to_string(),
         ],
         searchable_attributes: Some(vec![
             "title".to_string(),
@@ -617,6 +627,17 @@ pub const FACET_EXPECTATIONS: &[FacetExpectation] = &[
         field: "tags",
         values: &[("bluetooth", 3), ("noise-cancelling", 2), ("spatial", 1)],
     },
+    FacetExpectation {
+        field: "price",
+        values: &[
+            ("120", 1),
+            ("180", 1),
+            ("199", 1),
+            ("250", 1),
+            ("330", 1),
+            ("45", 1),
+        ],
+    },
 ];
 
 pub const FILTER_EXPECTED_IDS: &[&str] = &[
@@ -635,6 +656,8 @@ pub const FILTER_EXPECTED_IDS: &[&str] = &[
 ];
 pub const FILTER_TOTAL: usize = 12;
 pub const EXACT_NB_HITS_LIMIT: usize = 5;
+pub const EXACT_NB_HITS_EXPECTED_IDS: &[&str] =
+    &["exact_01", "exact_02", "exact_03", "exact_04", "exact_05"];
 
 pub const PAGINATION_EXPECTED_PAGES: &[&[&str]] = &[
     &["page_01", "page_02", "page_03"],
@@ -670,3 +693,33 @@ pub const CUSTOM_RANKING_QUERY: QuerySpec = QuerySpec {
     expected_ids: &["rank_01", "rank_02", "rank_03"],
     expected_total: 3,
 };
+
+pub(super) fn laptop_filter() -> Filter {
+    Filter::And(vec![
+        Filter::GreaterThanOrEqual {
+            field: "price".to_string(),
+            value: FieldValue::Integer(500),
+        },
+        Filter::LessThanOrEqual {
+            field: "price".to_string(),
+            value: FieldValue::Integer(2500),
+        },
+        Filter::Equals {
+            field: "inStock".to_string(),
+            value: FieldValue::Bool(true),
+        },
+        Filter::Equals {
+            field: "releaseYear".to_string(),
+            value: FieldValue::Integer(2024),
+        },
+    ])
+}
+
+pub(super) fn geoloc(document: &ScoredDocument) -> Option<(f64, f64)> {
+    let FieldValue::Object(point) = document.document.fields.get("_geoloc")? else {
+        return None;
+    };
+    let lat = point.get("lat")?.as_float()?;
+    let lng = point.get("lng")?.as_float()?;
+    Some((lat, lng))
+}

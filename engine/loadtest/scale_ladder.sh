@@ -10,6 +10,7 @@ HELPERS="$SCRIPT_DIR/lib/loadtest_shell_helpers.sh"
 CAPACITY_HELPER="$SCRIPT_DIR/lib/scale_capacity.mjs"
 CAPACITY_OBSERVATION_HELPER="$SCRIPT_DIR/lib/scale_capacity_observation.mjs"
 RUNG_VERDICT_HELPER="$SCRIPT_DIR/lib/scale_rung_verdict.mjs"
+SCALE_BULK_BUILD_HELPER="$SCRIPT_DIR/lib/scale_bulk_build_probe.sh"
 SEARCH_SAMPLES_PER_TYPE=30
 
 # shellcheck source=lib/loadtest_shell_helpers.sh
@@ -18,6 +19,8 @@ source "$HELPERS"
 # invoking import_benchmark.sh's reset-oriented main entrypoint.
 # shellcheck source=import_benchmark.sh
 source "$IMPORT_SCRIPT"
+# shellcheck source=lib/scale_bulk_build_probe.sh
+source "$SCALE_BULK_BUILD_HELPER"
 
 SENTINELS_PER_RUNG=2
 SERVER_PID=""
@@ -29,6 +32,7 @@ INTERRUPTED_EXIT_CODE=0
 CLEANUP_COMPLETE=0
 ACTIVE_RUNG=0
 FAILURE_OUTCOME="FAILED"
+export RESOURCE_MONITOR_PID=""
 
 fail() {
   echo "FAIL: $1" >&2
@@ -49,6 +53,7 @@ Options:
   --resume                         Continue from an exact saved checkpoint
   --stop-after-rung <n>            Exit green after checkpointing this rung
   --throughput-probe               Continue past latency failures for the dedicated 1M/4M/8M probe
+  --bulk-build-throughput-probe    Rebuild each target through the atomic bulk-replace path
   --exercise-negative-controls     Delete a sentinel and probe a wrong index, then restore state
 
 Capacity estimates can be overridden with SCALE_SOURCE_BYTES_PER_RECORD,
@@ -103,6 +108,12 @@ process.stdout.write(files.join("\n"));
 if [[ "${1:-}" == "--import-worker" ]]; then
   [[ $# -eq 4 ]] || fail "--import-worker requires dataset-dir, index-name, and result-file"
   run_import_worker "$2" "$3" "$4"
+  exit $?
+fi
+
+if [[ "${1:-}" == "--bulk-build-worker" ]]; then
+  [[ $# -eq 4 ]] || fail "--bulk-build-worker requires dataset-dir, index-name, and result-file"
+  run_scale_bulk_build_worker "$2" "$3" "$4"
   exit $?
 fi
 
@@ -324,7 +335,9 @@ write_run_receipt() {
 }
 
 current_run_purpose() {
-  if [[ "$THROUGHPUT_PROBE" -eq 1 ]]; then
+  if [[ "$WORKLOAD" == "bulk_build" ]]; then
+    printf 'bulk_build_throughput_probe\n'
+  elif [[ "$THROUGHPUT_PROBE" -eq 1 ]]; then
     printf 'throughput_probe\n'
   else
     printf 'reference_ladder\n'
@@ -341,6 +354,7 @@ write_checkpoint() {
   jq -n \
     --arg profile "$PROFILE" \
     --arg purpose "$purpose" \
+    --arg workload "$WORKLOAD" \
     --arg data_dir "$SERVER_DATA_DIR" \
     --arg results_dir "$RESULTS_DIR" \
     --arg index_name "$index_name" \
@@ -352,6 +366,7 @@ write_checkpoint() {
     '{
       version: 4,
       profile: $profile,
+      workload: $workload,
       purpose: $purpose,
       rungs: $rungs,
       batchSize: $batch_size,
@@ -378,6 +393,7 @@ validate_resume_checkpoint() {
   jq -e \
     --arg profile "$PROFILE" \
     --arg purpose "$purpose" \
+    --arg workload "$WORKLOAD" \
     --arg data_dir "$SERVER_DATA_DIR" \
     --arg results_dir "$RESULTS_DIR" \
     --arg index_name "$index_name" \
@@ -386,6 +402,7 @@ validate_resume_checkpoint() {
     '
       .version == 4 and
       .profile == $profile and
+      (.workload // "import") == $workload and
       .purpose == $purpose and
       .rungs == $rungs and
       .batchSize == $batch_size and
@@ -408,9 +425,11 @@ validate_resume_checkpoint() {
   jq -e \
     --arg profile "$PROFILE" \
     --arg purpose "$purpose" \
+    --arg workload "$WORKLOAD" \
     --argjson expected_count "$last_completed_rung" \
     '
       .profile == $profile and
+      (.workload // "import") == $workload and
       .runPurpose == $purpose and
       .targetCount == $expected_count and
       .finalCount == $expected_count and
@@ -547,6 +566,7 @@ cleanup() {
     return
   fi
   CLEANUP_COMPLETE=1
+  stop_scale_build_resource_monitor
 
   # Results and server logs already live outside RUNNER_TMP_DIR. SERVER_DATA_DIR
   # is caller-owned and is never deleted. On failure the generated tranche data
@@ -596,6 +616,7 @@ MIN_DOCS_PER_SECOND=1
 SERVER_BINARY="$ENGINE_DIR/target/release/flapjack"
 EXERCISE_NEGATIVE_CONTROLS=0
 THROUGHPUT_PROBE=0
+WORKLOAD="import"
 RESUME=0
 RESUME_START_COUNT=0
 STOP_AFTER_RUNG=""
@@ -653,6 +674,11 @@ while [[ $# -gt 0 ]]; do
       ;;
     --throughput-probe)
       THROUGHPUT_PROBE=1
+      shift
+      ;;
+    --bulk-build-throughput-probe)
+      THROUGHPUT_PROBE=1
+      WORKLOAD="bulk_build"
       shift
       ;;
     --exercise-negative-controls)
@@ -720,6 +746,9 @@ mkdir -p "$RESULTS_DIR"
 RESULTS_DIR="$(cd "$RESULTS_DIR" && pwd)"
 
 index_name="scale_ceiling_${PROFILE}"
+if [[ "$WORKLOAD" == "bulk_build" ]]; then
+  index_name="${index_name}_bulk_build"
+fi
 RUNGS_JSON="$(printf '%s\n' "${RUNGS[@]}" | jq -s 'map(tonumber)')"
 CHECKPOINT_PATH="$RESULTS_DIR/checkpoint.json"
 preflight_start_count=0
@@ -727,7 +756,11 @@ preflight_target=""
 
 if [[ "$RESUME" -eq 1 ]]; then
   validate_resume_checkpoint
-  preflight_start_count="$RESUME_START_COUNT"
+  if [[ "$WORKLOAD" == "bulk_build" ]]; then
+    preflight_start_count=0
+  else
+    preflight_start_count="$RESUME_START_COUNT"
+  fi
 else
   RESUME_START_COUNT=0
 fi
@@ -778,8 +811,16 @@ if [[ "$RESUME" -eq 1 ]]; then
 else
   reset_loadtest_index "$index_name"
   apply_loadtest_index_settings "$index_name"
+  if [[ "$WORKLOAD" == "bulk_build" ]]; then
+    seed_scale_bulk_build_destination "$index_name"
+  fi
   initial_count="$(index_doc_count "$BASE_URL" "$index_name")"
-  [[ "$initial_count" -eq 0 ]] || fail "fresh ladder index started with ${initial_count} docs"
+  expected_initial_count=0
+  if [[ "$WORKLOAD" == "bulk_build" ]]; then
+    expected_initial_count=1
+  fi
+  [[ "$initial_count" -eq "$expected_initial_count" ]] ||
+    fail "fresh ladder index started with ${initial_count} docs, expected ${expected_initial_count}"
 fi
 
 starting_count="$RESUME_START_COUNT"
@@ -791,12 +832,16 @@ for rung in "${RUNGS[@]}"; do
   rung_dir="$RESULTS_DIR/rung_${rung}"
   dataset_dir="$RUNNER_TMP_DIR/rung_${rung}_dataset"
   mkdir -p "$rung_dir" "$dataset_dir"
-  tranche_size=$((rung - starting_count))
+  evidence_starting_count="$starting_count"
+  if [[ "$WORKLOAD" == "bulk_build" ]]; then
+    evidence_starting_count=0
+  fi
+  tranche_size=$((rung - evidence_starting_count))
   generated_count=$((tranche_size - SENTINELS_PER_RUNG))
   capacity_receipt="$rung_dir/capacity_preflight.json"
 
   if [[ ! -s "$capacity_receipt" ]]; then
-    run_capacity_preflight "$starting_count" "$rung" "$capacity_receipt" || {
+    run_capacity_preflight "$evidence_starting_count" "$rung" "$capacity_receipt" || {
       fail "capacity preflight rejected rung ${rung} before generation"
     }
   fi
@@ -807,28 +852,38 @@ for rung in "${RUNGS[@]}"; do
     --count "$generated_count" \
     --batch-size "$BATCH_SIZE" \
     --profile "$PROFILE" \
-    --start-at "$starting_count" \
+    --start-at "$evidence_starting_count" \
     --output-dir "$dataset_dir" \
     > "$rung_dir/generate.stdout.txt" 2>&1
   sentinel_batch="$dataset_dir/batch_000.json"
   create_sentinel_batch "$sentinel_batch" "$rung"
 
   import_artifact="$rung_dir/import_benchmark.json"
+  worker_mode="--import-worker"
+  if [[ "$WORKLOAD" == "bulk_build" ]]; then
+    worker_mode="--bulk-build-worker"
+  fi
+  start_scale_build_resource_monitor "$SERVER_PID" "$SERVER_DATA_DIR" \
+    "$rung_dir/build_resource_observation.json"
   timeout "$IMPORT_TIMEOUT_SECONDS" bash "$SCRIPT_DIR/scale_ladder.sh" \
-    --import-worker "$dataset_dir" "$index_name" "$import_artifact" \
-    > "$rung_dir/import.stdout.txt" 2>&1 &
+    "$worker_mode" "$dataset_dir" "$index_name" "$import_artifact" \
+    >"$rung_dir/import.stdout.txt" 2>&1 &
   import_pid=$!
 
-  if ! wait_for_count_or_stall "$BASE_URL" "$index_name" "$rung" "$STALL_SECONDS"; then
+  if [[ "$WORKLOAD" != "bulk_build" ]] &&
+    ! wait_for_count_or_stall "$BASE_URL" "$index_name" "$rung" "$STALL_SECONDS"; then
     kill "$import_pid" 2>/dev/null || true
     wait "$import_pid" 2>/dev/null || true
+    stop_scale_build_resource_monitor
     FAILURE_OUTCOME="LIVENESS_FAILED"
     fail "rung ${rung} stalled before reaching its exact target"
   fi
   if ! wait "$import_pid"; then
+    stop_scale_build_resource_monitor
     FAILURE_OUTCOME="IMPORT_FAILED"
     fail "rung ${rung} import worker failed; see ${rung_dir}/import.stdout.txt"
   fi
+  stop_scale_build_resource_monitor
 
   final_count="$(index_doc_count "$BASE_URL" "$index_name")"
   [[ "$final_count" -eq "$rung" ]] || {
@@ -905,6 +960,15 @@ for rung in "${RUNGS[@]}"; do
   rss_bytes="$(server_rss_bytes "$SERVER_PID")" || {
     fail "rung ${rung} RSS is missing, zero, or non-numeric"
   }
+  peak_rss_bytes="$(jq -er '.peakRssBytes' "$rung_dir/build_resource_observation.json")"
+  peak_build_disk_bytes="$(
+    jq -er '.peakBuildDiskBytes' "$rung_dir/build_resource_observation.json"
+  )"
+  (( rss_bytes > peak_rss_bytes )) && peak_rss_bytes="$rss_bytes"
+  (( index_bytes > peak_build_disk_bytes )) && peak_build_disk_bytes="$index_bytes"
+  live_segment_count="$(scale_live_segment_count "$SERVER_DATA_DIR" "$index_name")" || {
+    fail "rung ${rung} live segment count is missing or zero"
+  }
   capacity_observation_path="$rung_dir/capacity_observation.json"
   capacity_observation_exit=0
   run_capacity_observation "$rung" "$index_bytes" "$rss_bytes" "$capacity_observation_path" \
@@ -918,7 +982,8 @@ for rung in "${RUNGS[@]}"; do
 
   jq -n \
     --arg profile "$PROFILE" \
-    --argjson starting_count "$starting_count" \
+    --arg workload "$WORKLOAD" \
+    --argjson starting_count "$evidence_starting_count" \
     --argjson target_count "$rung" \
     --argjson tranche_size "$tranche_size" \
     --argjson final_count "$final_count" \
@@ -927,6 +992,9 @@ for rung in "${RUNGS[@]}"; do
     --argjson batch_size "$BATCH_SIZE" \
     --argjson index_bytes "$index_bytes" \
     --argjson rss_bytes "$rss_bytes" \
+    --argjson peak_rss_bytes "$peak_rss_bytes" \
+    --argjson peak_build_disk_bytes "$peak_build_disk_bytes" \
+    --argjson live_segment_count "$live_segment_count" \
     --arg negative_controls "$negative_controls" \
     --arg run_purpose "$run_purpose" \
     --arg capacity_observation_verdict "$capacity_observation_verdict" \
@@ -936,6 +1004,7 @@ for rung in "${RUNGS[@]}"; do
     --slurpfile search "$search_artifact" \
     '{
       profile: $profile,
+      workload: $workload,
       runPurpose: $run_purpose,
       startingCount: $starting_count,
       targetCount: $target_count,
@@ -948,6 +1017,10 @@ for rung in "${RUNGS[@]}"; do
       importLatencyWindows: $import[0].latencyWindows,
       indexBytes: $index_bytes,
       rssBytes: $rss_bytes,
+      peakRssBytes: $peak_rss_bytes,
+      peakBuildDiskBytes: $peak_build_disk_bytes,
+      settledDiskBytes: $index_bytes,
+      liveSegmentCount: $live_segment_count,
       sentinels: "PASS",
       negativeControls: $negative_controls,
       rungVerdict: (

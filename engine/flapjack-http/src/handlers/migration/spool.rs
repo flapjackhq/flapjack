@@ -206,6 +206,8 @@ pub(crate) struct MigrationExportProgress {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct MigrationImportOutcome {
     pub settings_applied: bool,
+    #[serde(default)]
+    pub objects_imported: usize,
     pub synonyms_imported: usize,
     pub rules_imported: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -254,6 +256,8 @@ pub(crate) struct AsyncMigrationMetadata {
     )]
     pub source_provider: super::AsyncMigrationSourceProvider,
     pub target_index: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology: Option<super::MigrationTopology>,
     #[serde(
         default,
         skip_serializing_if = "AsyncMigrationPublicationSemantic::is_create_only"
@@ -720,6 +724,35 @@ impl SpoolStore {
             target_index,
             authenticated_app_id,
             publication_semantic,
+            super::AsyncMigrationSourceProvider::Algolia,
+            None,
+        );
+        self.commit_async_migration_metadata(&metadata)?;
+        let record = self.initial_migration_phase_record(job_uuid);
+        self.commit_migration_phase(&record)?;
+        Ok(record)
+    }
+
+    pub(crate) fn create_bulk_replace_admission_for_owner(
+        &self,
+        job_uuid: Uuid,
+        target_index: &str,
+        authenticated_app_id: &str,
+        publication_semantic: AsyncMigrationPublicationSemantic,
+    ) -> SpoolResult<MigrationPhaseRecord> {
+        let _root_lock = self.lock_root()?;
+        let job_dir = self.job_dir(job_uuid);
+        if job_dir.exists() {
+            return Err(SpoolError::new(SpoolErrorKind::JobTerminal));
+        }
+        create_private_dir(&job_dir)?;
+        let metadata = self.async_migration_metadata(
+            job_uuid,
+            target_index,
+            Some(authenticated_app_id),
+            publication_semantic,
+            super::AsyncMigrationSourceProvider::BulkReplace,
+            Some(super::MigrationTopology::SingleNodeOnly),
         );
         self.commit_async_migration_metadata(&metadata)?;
         let record = self.initial_migration_phase_record(job_uuid);
@@ -757,6 +790,8 @@ impl SpoolStore {
             &requested.tenant,
             Some(&requested.authenticated_app_id),
             AsyncMigrationPublicationSemantic::CreateOnly,
+            super::AsyncMigrationSourceProvider::Algolia,
+            None,
         );
         self.commit_async_migration_metadata(&metadata)?;
         self.commit_privacy_scrub_intent(&requested, job_uuid)?;
@@ -782,8 +817,14 @@ impl SpoolStore {
             return Err(SpoolError::new(SpoolErrorKind::JobTerminal));
         }
         create_private_dir(&job_dir)?;
-        let metadata =
-            self.async_migration_metadata(job_uuid, target_index, None, publication_semantic);
+        let metadata = self.async_migration_metadata(
+            job_uuid,
+            target_index,
+            None,
+            publication_semantic,
+            super::AsyncMigrationSourceProvider::Algolia,
+            None,
+        );
         self.commit_async_migration_metadata(&metadata)
     }
 
@@ -793,11 +834,14 @@ impl SpoolStore {
         target_index: &str,
         authenticated_app_id: Option<&str>,
         publication_semantic: AsyncMigrationPublicationSemantic,
+        source_provider: super::AsyncMigrationSourceProvider,
+        topology: Option<super::MigrationTopology>,
     ) -> AsyncMigrationMetadata {
         AsyncMigrationMetadata {
             job_uuid,
-            source_provider: super::AsyncMigrationSourceProvider::Algolia,
+            source_provider,
             target_index: target_index.to_string(),
+            topology,
             publication_semantic,
             authenticated_app_id: authenticated_app_id.map(str::to_owned),
             publication_transaction_id: None,
@@ -1471,6 +1515,22 @@ impl SpoolStore {
         Ok(true)
     }
 
+    pub(crate) fn delete_job_if_terminal(&self, job_uuid: Uuid) -> SpoolResult<bool> {
+        let _root_lock = self.lock_root()?;
+        let _job_lock = self.lock_job(job_uuid)?;
+        let job_dir = self.job_dir(job_uuid);
+        if !job_dir.exists() {
+            return Ok(false);
+        }
+        let record = self.read_migration_phase(job_uuid)?;
+        if record.disposition == MigrationDisposition::Running || record.terminal_at.is_none() {
+            return Ok(false);
+        }
+        fs::remove_dir_all(&job_dir)?;
+        sync_dir(&self.root.join(JOBS_DIR))?;
+        Ok(true)
+    }
+
     fn delete_manifest_artifacts(&self, manifest: &mut SpoolManifest) -> SpoolResult<()> {
         manifest.lifecycle = LifecycleState::Deleting;
         manifest.deleted_at = Some(self.now());
@@ -1610,6 +1670,52 @@ impl SpoolStore {
         Ok(visible_artifacts(&manifest)
             .map(|artifact| artifact.final_path.clone())
             .collect())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_accepted_document_pages_for_test(
+        &self,
+        job_uuid: Uuid,
+        pages: &[Vec<serde_json::Value>],
+    ) -> SpoolResult<()> {
+        let _root_lock = self.lock_root()?;
+        let _job_lock = self.lock_job(job_uuid)?;
+        let mut manifest = self.read_manifest(job_uuid)?;
+        if manifest.lifecycle != LifecycleState::Accepted {
+            return Err(SpoolError::new(SpoolErrorKind::JobNotAccepted));
+        }
+
+        let document_artifact_indices = manifest
+            .artifacts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, artifact)| {
+                (artifact.kind == ArtifactKind::DocumentPage
+                    && artifact.state == ArtifactState::Visible)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if document_artifact_indices.len() != pages.len() {
+            return Err(SpoolError::new(SpoolErrorKind::ManifestCorrupt));
+        }
+
+        let job_dir = self.job_dir(job_uuid);
+        for (artifact_index, page) in document_artifact_indices.into_iter().zip(pages) {
+            let bytes = serde_json::to_vec(page)
+                .map_err(|_| SpoolError::new(SpoolErrorKind::ManifestCorrupt))?;
+            let artifact = &mut manifest.artifacts[artifact_index];
+            validate_relative(&artifact.final_path)?;
+            write_atomic(&job_dir, &artifact.final_path, &bytes)?;
+            artifact.compressed_bytes = bytes.len() as u64;
+            artifact.decompressed_bytes = bytes.len() as u64;
+            artifact.item_count = page.len() as u64;
+            artifact.digest = hex_digest(&bytes);
+        }
+        manifest.counters = ResourceCounters::from_visible_artifacts(visible_artifacts(&manifest));
+        manifest.bytes_committed = visible_artifacts(&manifest)
+            .map(|artifact| artifact.compressed_bytes)
+            .sum();
+        self.commit_manifest(&manifest)
     }
 
     pub(crate) fn accepted_artifacts(&self, job_uuid: Uuid) -> SpoolResult<AcceptedSpoolReader> {

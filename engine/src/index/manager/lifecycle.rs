@@ -1,8 +1,11 @@
-use super::recovery::RecoverySeqWindow;
+use super::recovery::{RecoveryDocumentContext, RecoverySeqWindow};
 use super::*;
 use crate::index::oplog::{read_committed_seq, write_committed_seq, OpLog, OpLogEntry, OPLOG_DIR};
+use crate::index::version_store::{VersionStore, VersionStoreError, VERSION_STORE_DIR};
 #[cfg(test)]
-use publication::{activate_publication_for_test, PublicationFaultPoint};
+use publication::activate_publication_for_test;
+#[cfg(any(test, feature = "test-support"))]
+use publication::PublicationFaultPoint;
 use publication::{
     activate_publication_with_fence, invalid_publication, read_publication_epoch,
     read_strict_committed_seq, PreStagedActivationError, PreStagedPublication,
@@ -23,8 +26,20 @@ static REPLACEMENT_REOPEN_PROOF_HOOK: StdOnceLock<StdMutex<Option<ReplacementReo
     StdOnceLock::new();
 
 #[cfg(test)]
+type ImportStagingProofHook = StdArc<dyn Fn(&str) + Send + Sync>;
+
+#[cfg(test)]
+static IMPORT_STAGING_PROOF_HOOK: StdOnceLock<StdMutex<Option<ImportStagingProofHook>>> =
+    StdOnceLock::new();
+
+#[cfg(test)]
 pub(crate) struct ReplacementReopenProofHookGuard {
     previous: Option<ReplacementReopenProofHook>,
+}
+
+#[cfg(test)]
+pub(crate) struct ImportStagingProofHookGuard {
+    previous: Option<ImportStagingProofHook>,
 }
 
 #[cfg(test)]
@@ -35,14 +50,62 @@ impl Drop for ReplacementReopenProofHookGuard {
 }
 
 #[cfg(test)]
+impl Drop for ImportStagingProofHookGuard {
+    fn drop(&mut self) {
+        *import_staging_proof_hook().lock().unwrap() = self.previous.take();
+    }
+}
+
+#[cfg(test)]
 fn replacement_reopen_proof_hook() -> &'static StdMutex<Option<ReplacementReopenProofHook>> {
     REPLACEMENT_REOPEN_PROOF_HOOK.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn import_staging_proof_hook() -> &'static StdMutex<Option<ImportStagingProofHook>> {
+    IMPORT_STAGING_PROOF_HOOK.get_or_init(|| StdMutex::new(None))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PublicationArtifactMode {
     MoveWithSource,
     PreserveDestination,
+}
+
+enum TenantQuiesceFence {
+    Admission {
+        _fence: publication::PublicationAdmissionFence,
+    },
+    Epoch(publication::PublicationEpochFence),
+}
+
+struct ReplacementTenantQuiesce {
+    quiesce: TenantQuiesce,
+}
+
+impl ReplacementTenantQuiesce {
+    fn epoch_fence(&self) -> &publication::PublicationEpochFence {
+        match &self.quiesce._publication_fence {
+            TenantQuiesceFence::Epoch(fence) => fence,
+            TenantQuiesceFence::Admission { .. } => {
+                unreachable!("replacement quiesce always owns an epoch fence")
+            }
+        }
+    }
+}
+
+enum DestinationPublicationFence {
+    Move(publication::PublicationEpochFence),
+    Replacement(ReplacementTenantQuiesce),
+}
+
+impl DestinationPublicationFence {
+    fn epoch_fence(&self) -> &publication::PublicationEpochFence {
+        match self {
+            Self::Move(fence) => fence,
+            Self::Replacement(quiesce) => quiesce.epoch_fence(),
+        }
+    }
 }
 
 impl PublicationArtifactMode {
@@ -64,6 +127,16 @@ impl super::IndexManager {
     ) -> ReplacementReopenProofHookGuard {
         let mut slot = replacement_reopen_proof_hook().lock().unwrap();
         ReplacementReopenProofHookGuard {
+            previous: slot.replace(StdArc::new(hook)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_import_staging_proof_hook_for_test(
+        hook: impl Fn(&str) + Send + Sync + 'static,
+    ) -> ImportStagingProofHookGuard {
+        let mut slot = import_staging_proof_hook().lock().unwrap();
+        ImportStagingProofHookGuard {
             previous: slot.replace(StdArc::new(hook)),
         }
     }
@@ -99,10 +172,7 @@ impl super::IndexManager {
                     &custom_normalization,
                 )?,
             );
-            self.get_or_create_write_queue(tenant_id, &index)?;
-            self.cache_loaded_index(tenant_id, index);
-            #[cfg(feature = "vector-search")]
-            self.load_vector_index(tenant_id, &path);
+            self.publish_loaded_runtime_state_if_unfenced(tenant_id, index)?;
             return Ok(());
         }
 
@@ -120,6 +190,7 @@ impl super::IndexManager {
 
         // Persist index creation metadata
         crate::index::index_metadata::IndexMetadata::load_or_create(&path)?;
+        write_committed_seq(&path, 0)?;
 
         Ok(())
     }
@@ -160,7 +231,10 @@ impl super::IndexManager {
 
     /// Delete a tenant's index and all on-disk files, removing it from all runtime caches.
     ///
-    /// Unloads the tenant, stops its write task, and removes the directory. Retries removal up to 10 times (50ms intervals) to handle Tantivy merge threads that may still be writing after the IndexWriter is dropped.
+    /// Quiesces the tenant (draining and merge-quiescing the persistent writer,
+    /// then clearing runtime caches) and removes the directory. The removal retry
+    /// loop is only defense in depth against transient filesystem errors now that
+    /// quiesce guarantees no merge thread is still writing segment files.
     ///
     /// # Arguments
     ///
@@ -171,30 +245,28 @@ impl super::IndexManager {
     /// Ok(()) on successful deletion, or an error if the tenant doesn't exist or removal fails after retries.
     pub async fn delete_tenant(&self, tenant_id: &TenantId) -> Result<()> {
         validate_index_name(tenant_id)?;
-        self.invalidate_facet_cache(tenant_id);
-        self.write_queues.remove(tenant_id);
-
-        if let Some(handle) = self
-            .write_task_handles
-            .get(tenant_id)
-            .map(|entry| entry.value().clone())
-        {
-            let _ = handle.drain(tenant_id.clone()).await;
-            self.write_task_handles
-                .remove_if(tenant_id, |_, current| current.same_handle(&handle));
-        }
-
-        self.admission_stores.remove(tenant_id);
-        self.clear_tenant_runtime_state(tenant_id);
-
         let path = self.base_path.join(tenant_id);
         if !path.exists() {
             return Err(FlapjackError::TenantNotFound(tenant_id.to_string()));
         }
 
-        // Retry remove_dir_all to handle Tantivy merge threads that may still
-        // be writing segment files after the IndexWriter is dropped. The drop
-        // signals merge threads to stop but doesn't wait for them to finish.
+        // Quiesce is the canonical guarantee that no persistent writer or merge
+        // thread is still writing into the tree before we remove it. A failed
+        // drain must abort deletion because no safe removal guarantee exists.
+        let _quiesce = self.quiesce_tenant(tenant_id).await?;
+        self.admission_stores.remove(tenant_id);
+
+        #[cfg(debug_assertions)]
+        crate::index::write_queue::record_writer_lifecycle_publication_checkpoint(
+            tenant_id,
+            "manager_delete_publication",
+        );
+
+        // `quiesce_tenant` above is now the guarantee that the persistent writer
+        // and its merge threads have already finished. This retry loop remains
+        // only as defense in depth against transient filesystem errors (a slow
+        // antivirus scan, a lingering external handle) and no longer relies on
+        // merge threads still draining after the writer was dropped.
         let mut last_err = None;
         for _ in 0..10 {
             match std::fs::remove_dir_all(&path) {
@@ -259,16 +331,57 @@ impl super::IndexManager {
 
     /// Import a tenant's index from a source path.
     ///
-    /// Copies the directory to the base path under the tenant ID.
-    /// Does NOT load the index (caller must call get_or_load).
-    pub fn import_tenant(&self, tenant_id: &TenantId, src_path: &Path) -> Result<()> {
+    /// Quiesces any live destination writer through the canonical
+    /// [`Self::quiesce_tenant`] contract, replaces the destination directory with
+    /// the source contents, and leaves the tenant unloaded so the next access
+    /// reopens exactly the imported generation. Draining the destination writer
+    /// before publication is why this must be async: the persistent writer can
+    /// only merge-quiesce by yielding to the runtime.
+    pub async fn import_tenant(&self, tenant_id: &TenantId, src_path: &Path) -> Result<()> {
         validate_index_name(tenant_id)?;
-        let dest_path = self.base_path.join(tenant_id);
-        std::fs::create_dir_all(&dest_path)?;
+        let base_path = self.base_path.clone();
+        let target_tenant = tenant_id.clone();
+        let source = src_path.to_path_buf();
+        let publication = tokio::task::spawn_blocking(move || {
+            stage_tenant_import(&base_path, target_tenant, &source)
+        })
+        .await
+        .map_err(|error| {
+            FlapjackError::Io(format!(
+                "tenant import staging task failed for {tenant_id}: {error}"
+            ))
+        })??;
 
-        copy_dir_recursive(src_path, &dest_path)?;
+        // Stage before fencing so a source-copy failure neither lengthens the
+        // destination outage nor leaves a lock-only namespace for an absent
+        // tenant. Activation still holds the quiesce guard throughout.
+        let _quiesce = match self.quiesce_tenant(tenant_id).await {
+            Ok(quiesce) => quiesce,
+            Err(error) => {
+                return Err(
+                    abort_import_after_quiesce_failure(publication, tenant_id, error).await,
+                );
+            }
+        };
 
-        Ok(())
+        #[cfg(debug_assertions)]
+        crate::index::write_queue::record_writer_lifecycle_publication_checkpoint(
+            tenant_id,
+            "manager_import_publication",
+        );
+
+        tokio::task::spawn_blocking(move || {
+            publication
+                .activate()
+                .map_err(pre_staged_activation_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| {
+            FlapjackError::Io(format!(
+                "tenant import activation task failed for {tenant_id}: {error}"
+            ))
+        })?
     }
 
     /// Move an index from source to destination path, cleaning up existing state.
@@ -321,16 +434,48 @@ impl super::IndexManager {
         destination: &str,
         staging_baseline: PublicationStagingBaseline,
     ) -> Result<TaskInfo> {
+        self.replace_index_contents_from_pre_staged_inner(
+            publication,
+            destination,
+            staging_baseline,
+            #[cfg(feature = "test-support")]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn replace_index_contents_from_pre_staged_with_publication_fault_for_test_support(
+        &self,
+        publication: PreStagedPublication,
+        destination: &str,
+        staging_baseline: PublicationStagingBaseline,
+        fault: PublicationFaultPoint,
+    ) -> Result<TaskInfo> {
+        self.replace_index_contents_from_pre_staged_inner(
+            publication,
+            destination,
+            staging_baseline,
+            Some(fault),
+        )
+        .await
+    }
+
+    async fn replace_index_contents_from_pre_staged_inner(
+        &self,
+        publication: PreStagedPublication,
+        destination: &str,
+        staging_baseline: PublicationStagingBaseline,
+        #[cfg(feature = "test-support")] publication_fault: Option<PublicationFaultPoint>,
+    ) -> Result<TaskInfo> {
         validate_index_name(destination)?;
         let source_path = publication.paths().staging.clone();
         if !source_path.exists() {
             return self.make_noop_task(destination);
         }
         let target = PublicationTarget::new(destination)?;
-        let publication_epoch_fence =
-            self.advance_destination_publication_epoch(destination, &target)?;
-
-        self.drain_target_write_queue(&destination.to_string())
+        let replacement_quiesce = self
+            .quiesce_replacement_tenant(destination, &target)
             .await?;
         let destination_path = self.base_path.join(destination);
         let watermark = self.stage_replacement_from_drained_destination(
@@ -341,25 +486,34 @@ impl super::IndexManager {
             staging_baseline,
         )?;
         let fence_evidence = PublicationFenceEvidence::new(
-            publication_epoch_fence.previous(),
-            publication_epoch_fence.advanced(),
+            replacement_quiesce.epoch_fence().previous(),
+            replacement_quiesce.epoch_fence().advanced(),
             staging_baseline,
             PublicationWatermark::new(watermark),
         )?;
-        self.invalidate_facet_cache(destination);
-        self.clear_tenant_runtime_state(&destination.to_string());
 
-        let mut journal = publication
-            .activate_with_fence(fence_evidence)
-            .map_err(pre_staged_activation_error)?;
+        #[cfg(debug_assertions)]
+        crate::index::write_queue::record_writer_lifecycle_publication_checkpoint(
+            destination,
+            "manager_replace_publication",
+        );
+        #[cfg(feature = "test-support")]
+        let activation = match publication_fault {
+            Some(fault) => publication
+                .activate_with_fence_and_checkpoint_panic_for_test_support(fence_evidence, fault),
+            None => publication.activate_with_fence(fence_evidence),
+        };
+        #[cfg(not(feature = "test-support"))]
+        let activation = publication.activate_with_fence(fence_evidence);
+        let mut journal = activation.map_err(pre_staged_activation_error)?;
         ensure_committed_move(&journal)?;
+        self.clear_tenant_runtime_state(&destination.to_string());
         self.run_replacement_reopen_proof_hook(destination, &mut journal);
         self.certify_replacement_reopen(
             destination,
             PublicationArtifactMode::PreserveDestination,
             &journal,
         )?;
-        drop(publication_epoch_fence);
         self.make_noop_task(destination)
     }
 
@@ -407,14 +561,25 @@ impl super::IndexManager {
         }
 
         let target = PublicationTarget::new(destination)?;
-        let publication_epoch_fence =
-            self.advance_destination_publication_epoch(destination, &target)?;
+        let destination_publication_fence = match artifact_mode {
+            PublicationArtifactMode::MoveWithSource => DestinationPublicationFence::Move(
+                self.advance_destination_publication_epoch(destination, &target)?,
+            ),
+            PublicationArtifactMode::PreserveDestination => {
+                DestinationPublicationFence::Replacement(
+                    self.quiesce_replacement_tenant(destination, &target)
+                        .await?,
+                )
+            }
+        };
 
         self.drain_target_write_queue(&source.to_string()).await?;
         self.invalidate_facet_cache(source);
         self.clear_tenant_runtime_state(&source.to_string());
-        self.drain_target_write_queue(&destination.to_string())
-            .await?;
+        if artifact_mode == PublicationArtifactMode::MoveWithSource {
+            self.drain_target_write_queue(&destination.to_string())
+                .await?;
+        }
         // After the target drain, no old-epoch mutation can still transition to
         // succeeded. Stage 3 proves the strict `committed_seq = W` replacement
         // contract against the quiesced destination and carries the resulting
@@ -424,10 +589,12 @@ impl super::IndexManager {
             destination,
             artifact_mode,
             staging_baseline,
-            &publication_epoch_fence,
+            destination_publication_fence.epoch_fence(),
         )?;
-        self.invalidate_facet_cache(destination);
-        self.clear_tenant_runtime_state(&destination.to_string());
+        if artifact_mode == PublicationArtifactMode::MoveWithSource {
+            self.invalidate_facet_cache(destination);
+            self.clear_tenant_runtime_state(&destination.to_string());
+        }
 
         let operation_name = artifact_mode.operation_name();
         let transaction = PublicationTransactionId::new(format!(
@@ -473,6 +640,9 @@ impl super::IndexManager {
             fault,
         )?;
         ensure_committed_move(&journal)?;
+        if artifact_mode == PublicationArtifactMode::PreserveDestination {
+            self.clear_tenant_runtime_state(&destination.to_string());
+        }
         self.run_replacement_reopen_proof_hook(destination, &mut journal);
         self.certify_replacement_reopen(destination, artifact_mode, &journal)?;
         #[cfg(test)]
@@ -485,7 +655,7 @@ impl super::IndexManager {
             artifacts.remove_source()?;
         }
         std::fs::remove_dir_all(&src_path)?;
-        drop(publication_epoch_fence);
+        drop(destination_publication_fence);
         self.make_noop_task(destination)
     }
 
@@ -758,16 +928,18 @@ impl super::IndexManager {
         }
         let source_index = self.open_tenant_index_without_write_queue(source_path)?;
         let settings = self.load_settings_after_config(source, source_path)?;
-        self.replay_document_ops(
-            destination,
-            &source_index,
-            source_path,
-            &document_ops,
-            RecoverySeqWindow {
-                committed_seq: baseline,
-                final_seq: watermark,
+        self.recover_document_ops(
+            RecoveryDocumentContext {
+                tenant_id: destination,
+                index: &source_index,
+                tenant_path: source_path,
+                seq_window: RecoverySeqWindow {
+                    committed_seq: baseline,
+                    final_seq: watermark,
+                },
+                settings: settings.as_ref(),
             },
-            settings.as_ref(),
+            &document_ops,
         )?;
         #[cfg(feature = "vector-search")]
         {
@@ -795,10 +967,19 @@ impl super::IndexManager {
     ) -> Result<()> {
         self.oplogs.remove(source);
         let staged_oplog_dir = source_path.join(OPLOG_DIR);
-        if staged_oplog_dir.exists() {
-            std::fs::remove_dir_all(&staged_oplog_dir)?;
+        replace_directory(&destination_path.join(OPLOG_DIR), &staged_oplog_dir)?;
+
+        let source_version_store_dir = source_path.join(VERSION_STORE_DIR);
+        let destination_version_store_dir = destination_path.join(VERSION_STORE_DIR);
+        if source_version_store_dir.exists() || destination_version_store_dir.exists() {
+            let staged_store =
+                VersionStore::open(source_path).map_err(version_store_alignment_error)?;
+            let destination_store =
+                VersionStore::open(destination_path).map_err(version_store_alignment_error)?;
+            staged_store
+                .merge_destination_evidence(&destination_store, watermark)
+                .map_err(version_store_alignment_error)?;
         }
-        copy_dir_recursive(&destination_path.join(OPLOG_DIR), &staged_oplog_dir)?;
         write_committed_seq(source_path, watermark)?;
         Ok(())
     }
@@ -916,11 +1097,20 @@ impl super::IndexManager {
     /// Drops all write queue senders (triggering final batch flush in each
     /// write task), then awaits every write task handle to completion.
     pub async fn graceful_shutdown(&self) {
+        let _ = self.drain_all_write_queues().await;
+    }
+
+    /// Drain every write queue and surface the first worker failure.
+    ///
+    /// This is the result-bearing form of [`Self::graceful_shutdown`] for
+    /// publication paths that must abort instead of logging and continuing.
+    pub async fn drain_all_write_queues(&self) -> Result<()> {
         let handles: Vec<_> = self
             .write_task_handles
             .iter()
             .map(|r| r.key().clone())
             .collect();
+        let mut first_error = None;
         for tenant_id in handles {
             if let Err(error) = self.drain_target_write_queue(&tenant_id).await {
                 tracing::error!(
@@ -928,8 +1118,12 @@ impl super::IndexManager {
                     tenant_id,
                     error
                 );
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
         }
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn drain_target_write_queue(&self, tenant_id: &TenantId) -> Result<()> {
@@ -951,6 +1145,216 @@ impl super::IndexManager {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Canonical tenant quiesce contract shared by every path that removes,
+    /// replaces, exports, imports, or publishes over a tenant directory.
+    ///
+    /// The ordered sequence is: stop write admission by dropping the write-queue
+    /// sender, await the write worker's merge-quiescent close through
+    /// [`Self::drain_target_write_queue`] (which retires the drained handle after
+    /// merge threads finish), then clear every loaded runtime cache so the next
+    /// access reopens the tenant from the freshly published on-disk generation.
+    /// The worker's retained `channel_closed` / `merge_quiesced` writer-lifecycle
+    /// event makes the ordered drain observable to callers and tests, and must be
+    /// recorded before any publication checkpoint the caller emits.
+    ///
+    /// Runtime state is cleared even when the drain reports an error so a failed
+    /// commit cannot leave a stale cached generation behind; the drain error is
+    /// returned so every caller aborts before reading, publishing, or removing
+    /// the tenant directory without the quiesce guarantee.
+    ///
+    /// The returned [`TenantQuiesce`] guard is the closing-worker admission
+    /// handoff: admission stays fenced until the caller finishes reading,
+    /// replacing, or removing the tenant tree and drops it.
+    pub async fn quiesce_tenant(&self, tenant_id: &TenantId) -> Result<TenantQuiesce> {
+        let target = PublicationTarget::new(tenant_id.as_str())?;
+        // Fence admission *before* dropping the sender. Between sender removal and
+        // the worker's merge-quiescent close there is no queue for a write to land
+        // in, so an unfenced admission would spawn a replacement writer behind the
+        // drain and race the caller's read/replace/remove of the same tree.
+        let admission_fence = self
+            .fence_quiesce_publication_admission(tenant_id, target)
+            .await?;
+        self.finish_tenant_quiesce(
+            tenant_id,
+            TenantQuiesceFence::Admission {
+                _fence: admission_fence,
+            },
+        )
+        .await
+    }
+
+    async fn quiesce_replacement_tenant(
+        &self,
+        tenant_id: &str,
+        target: &PublicationTarget,
+    ) -> Result<ReplacementTenantQuiesce> {
+        let epoch_fence = self.advance_destination_publication_epoch(tenant_id, target)?;
+        let tenant_id = tenant_id.to_string();
+        let quiesce = self
+            .finish_tenant_quiesce_preserving_runtime(
+                &tenant_id,
+                TenantQuiesceFence::Epoch(epoch_fence),
+            )
+            .await?;
+        Ok(ReplacementTenantQuiesce { quiesce })
+    }
+
+    async fn finish_tenant_quiesce(
+        &self,
+        tenant_id: &TenantId,
+        publication_fence: TenantQuiesceFence,
+    ) -> Result<TenantQuiesce> {
+        self.invalidate_facet_cache(tenant_id);
+        let drain_result = self.drain_until_no_live_writer(tenant_id).await;
+        self.clear_tenant_runtime_state(tenant_id);
+        #[cfg(debug_assertions)]
+        crate::index::write_queue::record_writer_lifecycle_publication_checkpoint(
+            tenant_id,
+            "manager_quiesce_admission_fenced",
+        );
+        drain_result.map(|()| TenantQuiesce {
+            #[cfg(feature = "vector-search")]
+            tenant_id: tenant_id.clone(),
+            _publication_fence: publication_fence,
+            #[cfg(feature = "vector-search")]
+            vector_indices: Arc::clone(&self.vector_indices),
+        })
+    }
+
+    async fn finish_tenant_quiesce_preserving_runtime(
+        &self,
+        tenant_id: &TenantId,
+        publication_fence: TenantQuiesceFence,
+    ) -> Result<TenantQuiesce> {
+        self.invalidate_facet_cache(tenant_id);
+        self.drain_until_no_live_writer(tenant_id).await?;
+        #[cfg(debug_assertions)]
+        crate::index::write_queue::record_writer_lifecycle_publication_checkpoint(
+            tenant_id,
+            "manager_quiesce_admission_fenced",
+        );
+        Ok(TenantQuiesce {
+            #[cfg(feature = "vector-search")]
+            tenant_id: tenant_id.clone(),
+            _publication_fence: publication_fence,
+            #[cfg(feature = "vector-search")]
+            vector_indices: Arc::clone(&self.vector_indices),
+        })
+    }
+
+    /// Drain the tenant until it has no live write worker at all.
+    ///
+    /// A read that loads the tenant creates its write queue eagerly, and it can pass
+    /// its fence check in the instant before the fence is registered — so a single
+    /// drain can retire the worker it saw while a straggler is still being inserted.
+    /// The fence bounds this: no admission and no further load-path creation can
+    /// start once it is held, so the loop converges on the workers that were already
+    /// in flight when it was taken.
+    async fn drain_until_no_live_writer(&self, tenant_id: &TenantId) -> Result<()> {
+        loop {
+            self.drain_target_write_queue(tenant_id).await?;
+            if !self.write_task_handles.contains_key(tenant_id) {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn fence_quiesce_publication_admission(
+        &self,
+        tenant_id: &TenantId,
+        target: PublicationTarget,
+    ) -> Result<publication::PublicationAdmissionFence> {
+        let base_path = self.base_path.clone();
+        let fence_tenant_id = tenant_id.clone();
+        tokio::task::spawn_blocking(move || {
+            publication::fence_publication_admission(&base_path, &target).map_err(|error| {
+                FlapjackError::Io(format!(
+                    "tenant quiesce admission fence failed for {fence_tenant_id}: {error}"
+                ))
+            })
+        })
+        .await
+        .map_err(|error| {
+            FlapjackError::Io(format!(
+                "tenant quiesce admission fence task failed for {tenant_id}: {error}"
+            ))
+        })?
+    }
+}
+
+fn replace_directory(source: &Path, destination: &Path) -> Result<()> {
+    if destination.exists() {
+        std::fs::remove_dir_all(destination)?;
+    }
+    copy_dir_recursive(source, destination)
+}
+
+fn version_store_alignment_error(error: VersionStoreError) -> FlapjackError {
+    FlapjackError::Io(format!("version-store alignment failed: {error}"))
+}
+
+fn stage_tenant_import(
+    base_path: &Path,
+    tenant_id: TenantId,
+    source: &Path,
+) -> Result<PreStagedPublication> {
+    let target = PublicationTarget::new(tenant_id.clone())?;
+    let publication = PreStagedPublication::prepare(base_path, target)?;
+    #[cfg(test)]
+    let hook = import_staging_proof_hook().lock().unwrap().clone();
+    #[cfg(test)]
+    if let Some(hook) = hook {
+        hook(&tenant_id);
+    }
+    if let Err(error) = copy_dir_recursive(source, &publication.paths().staging) {
+        if let Err(cleanup_error) = publication.abort() {
+            return Err(FlapjackError::Io(format!(
+                "tenant import staging failed: {error}; staging cleanup failed: {cleanup_error}"
+            )));
+        }
+        return Err(error);
+    }
+    Ok(publication)
+}
+
+async fn abort_import_after_quiesce_failure(
+    publication: PreStagedPublication,
+    tenant_id: &str,
+    quiesce_error: FlapjackError,
+) -> FlapjackError {
+    match tokio::task::spawn_blocking(move || publication.abort()).await {
+        Ok(Ok(())) => quiesce_error,
+        Ok(Err(cleanup_error)) => FlapjackError::Io(format!(
+            "tenant import quiesce failed for {tenant_id}: {quiesce_error}; staging cleanup failed: {cleanup_error}"
+        )),
+        Err(join_error) => FlapjackError::Io(format!(
+            "tenant import quiesce failed for {tenant_id}: {quiesce_error}; staging cleanup task failed: {join_error}"
+        )),
+    }
+}
+
+/// RAII proof that a tenant is quiesced.
+///
+/// While this guard is alive the tenant has no live persistent writer and its
+/// write admission is fenced, so the holder can read, replace, or remove the tenant
+/// tree knowing no writer can appear behind it. Dropping the guard re-opens
+/// admission; the next admitted write creates the replacement worker.
+#[must_use = "the tenant is only quiesced while this guard is held"]
+pub struct TenantQuiesce {
+    #[cfg(feature = "vector-search")]
+    tenant_id: TenantId,
+    _publication_fence: TenantQuiesceFence,
+    #[cfg(feature = "vector-search")]
+    vector_indices:
+        Arc<DashMap<TenantId, Arc<std::sync::RwLock<crate::vector::index::VectorIndex>>>>,
+}
+
+#[cfg(feature = "vector-search")]
+impl Drop for TenantQuiesce {
+    fn drop(&mut self) {
+        self.vector_indices.remove(&self.tenant_id);
     }
 }
 

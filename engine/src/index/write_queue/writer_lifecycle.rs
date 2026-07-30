@@ -6,16 +6,96 @@
 //! lifetime and merge-wait metrics, refreshes settled segment health, emits the close reason,
 //! and finally releases the writer's memory-budget permit.
 
-use super::{acquire_writer_for_queue, configure_merge_policy, WriteQueueContext};
+use super::{
+    acquire_writer_for_queue, configure_merge_policy, WriteQueueCancellation, WriteQueueContext,
+};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(debug_assertions, test))]
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 static NEXT_QUEUE_METRICS_ID: AtomicU64 = AtomicU64::new(1);
 static LIVE_QUEUE_METRICS: Lazy<DashMap<String, BTreeSet<u64>>> = Lazy::new(DashMap::new);
+#[cfg(any(debug_assertions, test))]
+static WRITER_LIFECYCLE_TEST_LOG: Lazy<Mutex<WriterLifecycleTestLog>> =
+    Lazy::new(|| Mutex::new(WriterLifecycleTestLog::default()));
+#[cfg(any(debug_assertions, test))]
+const WRITER_LIFECYCLE_TEST_EVENT_LIMIT: usize = 4096;
+#[cfg(any(debug_assertions, test))]
+const WRITER_LIFECYCLE_TEST_TENANT_LIMIT: usize = 4096;
+
+#[cfg(any(debug_assertions, test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WriterLifecycleTestEvent {
+    pub tenant_id: String,
+    pub reason: String,
+    pub phase: &'static str,
+    pub sequence: u64,
+}
+
+#[cfg(any(debug_assertions, test))]
+#[derive(Default)]
+struct WriterLifecycleTestLog {
+    events_by_tenant: BTreeMap<String, Vec<WriterLifecycleTestEvent>>,
+    next_sequence_by_tenant: BTreeMap<String, u64>,
+    tenant_order: VecDeque<String>,
+}
+
+#[cfg(any(debug_assertions, test))]
+impl WriterLifecycleTestLog {
+    fn clear(&mut self) {
+        self.events_by_tenant.clear();
+        self.next_sequence_by_tenant.clear();
+        self.tenant_order.clear();
+    }
+
+    fn push(&mut self, tenant_id: &str, reason: &str, phase: &'static str) {
+        if !self.events_by_tenant.contains_key(tenant_id) {
+            self.tenant_order.push_back(tenant_id.to_string());
+            if self.tenant_order.len() > WRITER_LIFECYCLE_TEST_TENANT_LIMIT {
+                if let Some(expired_tenant) = self.tenant_order.pop_front() {
+                    self.events_by_tenant.remove(&expired_tenant);
+                    self.next_sequence_by_tenant.remove(&expired_tenant);
+                }
+            }
+        }
+        let sequence = self
+            .next_sequence_by_tenant
+            .entry(tenant_id.to_string())
+            .or_default();
+        *sequence += 1;
+        let events = self
+            .events_by_tenant
+            .entry(tenant_id.to_string())
+            .or_default();
+        events.push(WriterLifecycleTestEvent {
+            tenant_id: tenant_id.to_string(),
+            reason: reason.to_string(),
+            phase,
+            sequence: *sequence,
+        });
+        let excess = events
+            .len()
+            .saturating_sub(WRITER_LIFECYCLE_TEST_EVENT_LIMIT);
+        if excess > 0 {
+            events.drain(..excess);
+        }
+    }
+
+    fn events_for_tenant(&self, tenant_id: &str) -> Vec<WriterLifecycleTestEvent> {
+        self.events_by_tenant
+            .get(tenant_id)
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct WriterOpenState {
     queue_metrics_id: u64,
@@ -23,15 +103,22 @@ struct WriterOpenState {
 }
 
 static WRITER_OPENED_AT_BY_TENANT: Lazy<DashMap<String, WriterOpenState>> = Lazy::new(DashMap::new);
-const DEFAULT_WRITER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+// Stage 6 selected 30s with:
+// `timeout 600 cargo test -p flapjack --lib -- index::write_queue::tests::writer_idle_timeout_candidate_matrix_selects_default --ignored --nocapture`.
+// n=1 per candidate/gap: 30s retained 10s/25s burst gaps, 15s reopened at
+// 25s, and 60s retained 35s but delayed one-slot admission by about 60s.
+pub(super) const DEFAULT_WRITER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITER_IDLE_TIMEOUT_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_WRITER_IDLE_TIMEOUT_MS";
 const WRITER_CLOSE_REASON_CHANNEL_CLOSED: &str = "channel_closed";
+const WRITER_CLOSE_REASON_CANCELLED: &str = "cancelled";
 const WRITER_CLOSE_REASON_COMMIT_FAILURE: &str = "commit_failure";
 const WRITER_CLOSE_REASON_IDLE_TIMEOUT: &str = "idle_timeout";
 const WRITER_CLOSE_REASON_STARTUP_REPLAY: &str = "startup_replay";
 const WRITER_CLOSE_REASON_WAITER_YIELD: &str = "waiter_yield";
-const WRITER_CLOSE_REASONS: [&str; 5] = [
+const WRITER_WAITER_HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const WRITER_CLOSE_REASONS: [&str; 6] = [
     WRITER_CLOSE_REASON_CHANNEL_CLOSED,
+    WRITER_CLOSE_REASON_CANCELLED,
     WRITER_CLOSE_REASON_COMMIT_FAILURE,
     WRITER_CLOSE_REASON_IDLE_TIMEOUT,
     WRITER_CLOSE_REASON_STARTUP_REPLAY,
@@ -123,7 +210,8 @@ pub(super) async fn writer_for_queue<'a>(
     writer: &'a mut Option<crate::index::ManagedIndexWriter>,
 ) -> crate::error::Result<&'a mut crate::index::ManagedIndexWriter> {
     if writer.is_none() {
-        let mut opened = acquire_writer_for_queue(&ctx.index, &ctx.tenant_id).await?;
+        let mut opened =
+            acquire_writer_for_queue(&ctx.index, &ctx.tenant_id, ctx.writer_buffer_size).await?;
         // Merge policy is installed once when the tenant worker opens its
         // writer; keeping the writer alive keeps that merge owner alive too.
         configure_merge_policy(ctx, &mut opened);
@@ -138,12 +226,162 @@ pub(super) async fn writer_for_queue<'a>(
 pub(super) fn yield_writer_to_waiter_after_merge_quiescence(
     ctx: &WriteQueueContext,
     writer: &mut Option<crate::index::ManagedIndexWriter>,
+    cancellation: &WriteQueueCancellation,
 ) -> crate::error::Result<()> {
-    if !ctx.index.memory_budget().has_writer_waiters() {
+    let Some(handoff) = ctx.index.memory_budget().writer_waiter_handoff() else {
         return Ok(());
+    };
+
+    let close_result =
+        close_writer_after_merge_quiescence(ctx, writer, WRITER_CLOSE_REASON_WAITER_YIELD);
+    if close_result.is_ok() {
+        wait_for_registered_writer_waiter_handoff(&handoff, cancellation);
+    }
+    close_result
+}
+
+fn wait_for_registered_writer_waiter_handoff(
+    handoff: &crate::index::memory::WriterWaiterHandoff,
+    cancellation: &WriteQueueCancellation,
+) {
+    // Every captured waiter owns a bounded writer-acquire attempt, so normal
+    // completion remains bounded by that contract. Explicit queue cancellation
+    // lets abort wake this worker immediately instead of weakening fairness.
+    while !handoff.is_complete() && !cancellation.is_cancelled() {
+        std::thread::sleep(WRITER_WAITER_HANDOFF_POLL_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::memory::{MemoryBudget, MemoryBudgetConfig};
+
+    #[test]
+    fn prior_writer_waiter_handoff_does_not_expire_after_fixed_timeout() {
+        let budget = MemoryBudget::new(MemoryBudgetConfig {
+            max_concurrent_writers: 1,
+            ..Default::default()
+        });
+        let first_waiter = budget.register_writer_waiter();
+        let second_waiter = budget.register_writer_waiter();
+        let handoff = budget
+            .writer_waiter_handoff()
+            .expect("handoff should capture both prior waiters");
+        let (cancellation, _cancellation_rx) = super::super::write_queue_cancellation_channel();
+        let (handoff_complete_tx, handoff_complete_rx) = std::sync::mpsc::channel();
+
+        let wait_thread = std::thread::spawn(move || {
+            wait_for_registered_writer_waiter_handoff(&handoff, &cancellation);
+            handoff_complete_tx.send(()).unwrap();
+        });
+
+        assert!(
+            matches!(
+                handoff_complete_rx.recv_timeout(Duration::from_millis(125)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the yielding tenant must remain outside writer acquisition while captured prior waiters remain registered"
+        );
+
+        drop(first_waiter);
+        drop(second_waiter);
+        handoff_complete_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("handoff should complete after all captured prior waiters retire");
+        wait_thread.join().unwrap();
     }
 
-    close_writer_after_merge_quiescence(ctx, writer, WRITER_CLOSE_REASON_WAITER_YIELD)
+    #[test]
+    fn cancellation_ends_a_pending_writer_waiter_handoff() {
+        let budget = MemoryBudget::new(MemoryBudgetConfig::default());
+        let _prior_waiter = budget.register_writer_waiter();
+        let handoff = budget
+            .writer_waiter_handoff()
+            .expect("handoff should capture the prior waiter");
+        let (cancellation, _cancellation_rx) = super::super::write_queue_cancellation_channel();
+        let cancellation_for_wait = cancellation.clone();
+        let (handoff_complete_tx, handoff_complete_rx) = std::sync::mpsc::channel();
+
+        let wait_thread = std::thread::spawn(move || {
+            wait_for_registered_writer_waiter_handoff(&handoff, &cancellation_for_wait);
+            handoff_complete_tx.send(()).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(10));
+
+        cancellation.cancel();
+
+        handoff_complete_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("cancellation should wake a yielding worker without waiting for prior waiters");
+        wait_thread.join().unwrap();
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn writer_lifecycle_sequence_is_scoped_per_tenant() {
+        record_writer_lifecycle_test_event(
+            "tenant_with_prior_events",
+            "channel_closed",
+            "merge_quiesced",
+        );
+        record_writer_lifecycle_test_event(
+            "tenant_with_prior_events",
+            "publication",
+            "publication_checkpoint",
+        );
+        record_writer_lifecycle_test_event(
+            "tenant_with_independent_sequence",
+            "channel_closed",
+            "merge_quiesced",
+        );
+
+        let events = writer_lifecycle_test_events("tenant_with_independent_sequence");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].sequence, 1,
+            "retained lifecycle sequence must be assigned inside the tenant scope"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn writer_lifecycle_test_events_are_bounded_in_debug_builds() {
+        record_writer_lifecycle_test_event(
+            "unrelated_retained_tenant",
+            "channel_closed",
+            "merge_quiesced",
+        );
+
+        for index in 0..5000 {
+            record_writer_lifecycle_test_event(
+                "bounded_retention",
+                "channel_closed",
+                if index % 2 == 0 {
+                    "merge_quiesced"
+                } else {
+                    "publication_checkpoint"
+                },
+            );
+        }
+
+        let events = writer_lifecycle_test_events("bounded_retention");
+        assert!(
+            events.len() <= 4096,
+            "debug writer-lifecycle retention must be bounded, got {} events",
+            events.len()
+        );
+        assert_eq!(
+            events.last().map(|event| event.sequence),
+            Some(5000),
+            "bounded retention should keep the newest lifecycle evidence"
+        );
+        assert_eq!(
+            writer_lifecycle_test_events("unrelated_retained_tenant").len(),
+            1,
+            "one tenant's high event volume must not evict another parallel test's evidence"
+        );
+    }
 }
 
 pub(super) fn close_idle_writer_after_timeout(
@@ -165,6 +403,7 @@ pub(super) async fn drain_writer_on_channel_close(
     ctx: &WriteQueueContext,
     writer: &mut Option<crate::index::ManagedIndexWriter>,
     pending: &mut Vec<super::WriteOp>,
+    cancellation: &WriteQueueCancellation,
 ) -> crate::error::Result<()> {
     let flush_result = if pending.is_empty() {
         Ok(())
@@ -174,7 +413,7 @@ pub(super) async fn drain_writer_on_channel_close(
             ctx.tenant_id,
             pending.len()
         );
-        super::flush_pending_batch(ctx, writer, pending).await
+        super::flush_pending_batch(ctx, writer, pending, cancellation).await
     };
     let close_result =
         close_writer_after_merge_quiescence(ctx, writer, WRITER_CLOSE_REASON_CHANNEL_CLOSED);
@@ -187,6 +426,13 @@ pub(super) fn close_startup_replay_writer(
     writer: &mut Option<crate::index::ManagedIndexWriter>,
 ) -> crate::error::Result<()> {
     close_writer_after_merge_quiescence(ctx, writer, WRITER_CLOSE_REASON_STARTUP_REPLAY)
+}
+
+pub(super) fn close_writer_after_cancellation(
+    ctx: &WriteQueueContext,
+    writer: &mut Option<crate::index::ManagedIndexWriter>,
+) -> crate::error::Result<()> {
+    close_writer_after_merge_quiescence(ctx, writer, WRITER_CLOSE_REASON_CANCELLED)
 }
 
 pub(super) fn close_writer_after_commit_failure(
@@ -213,6 +459,9 @@ fn close_writer_after_merge_quiescence(
             super::observe_write_queue_writer_lifetime(&ctx.tenant_id, opened_at.elapsed());
         }
         super::observe_write_queue_writer_merge_wait(&ctx.tenant_id, reason, merge_wait);
+        if close_result.is_ok() {
+            record_writer_lifecycle_test_event(&ctx.tenant_id, reason, "merge_quiesced");
+        }
         super::finalization::record_segment_health(&ctx.tenant_id, &ctx.index);
         super::observe_write_queue_writer_closed(&ctx.tenant_id, reason);
         tracing::debug!(
@@ -223,6 +472,38 @@ fn close_writer_after_merge_quiescence(
         close_result?;
     }
     Ok(())
+}
+
+#[cfg(any(debug_assertions, test))]
+fn record_writer_lifecycle_test_event(tenant_id: &str, reason: &str, phase: &'static str) {
+    WRITER_LIFECYCLE_TEST_LOG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(tenant_id, reason, phase);
+}
+
+#[cfg(not(any(debug_assertions, test)))]
+fn record_writer_lifecycle_test_event(_tenant_id: &str, _reason: &str, _phase: &'static str) {}
+
+#[cfg(any(debug_assertions, test))]
+pub fn record_writer_lifecycle_publication_checkpoint(tenant_id: &str, phase: &'static str) {
+    record_writer_lifecycle_test_event(tenant_id, "publication", phase);
+}
+
+#[cfg(any(debug_assertions, test))]
+pub fn clear_writer_lifecycle_test_events() {
+    WRITER_LIFECYCLE_TEST_LOG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+#[cfg(any(debug_assertions, test))]
+pub fn writer_lifecycle_test_events(tenant_id: &str) -> Vec<WriterLifecycleTestEvent> {
+    WRITER_LIFECYCLE_TEST_LOG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .events_for_tenant(tenant_id)
 }
 
 fn record_writer_open_state(tenant_id: &str, queue_metrics_id: u64, opened_at: Instant) {

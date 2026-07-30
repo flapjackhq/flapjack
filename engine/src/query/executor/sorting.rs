@@ -1,4 +1,5 @@
 //! Query result sorting using tantivy fast columnar fields with JSON extraction fallback and cross-type value ordering (Integer < Float < Text).
+use super::facet_collector::{PreparedFacetCollector, PreparedFacetCounts};
 use super::metrics::{QueryExecutionPath, QueryPhase};
 use super::QueryExecutor;
 use crate::error::Result;
@@ -259,8 +260,8 @@ impl QueryExecutor {
         searcher: &Searcher,
         query: Box<dyn TantivyQuery>,
         sort_params: &SortExecutionParams<'_>,
-        facet_collector: Option<tantivy::collector::FacetCollector>,
-    ) -> Result<(Vec<ScoredDocument>, usize, tantivy::collector::FacetCounts)> {
+        facet_collector: Option<PreparedFacetCollector>,
+    ) -> Result<(Vec<ScoredDocument>, usize, PreparedFacetCounts)> {
         let field = sort_params.field;
         let order = sort_params.order;
         let limit = sort_params.limit;
@@ -296,7 +297,7 @@ impl QueryExecutor {
             } else {
                 let (count, docs) =
                     self.search_bounded(searcher, query.as_ref(), &(Count, collector))?;
-                (count, docs, tantivy::collector::FacetCounts::default())
+                (count, docs, PreparedFacetCounts::default())
             };
             self.observe_phase(QueryPhase::Collect, collect_started_at);
             self.set_matched_docs(total);
@@ -360,7 +361,7 @@ impl QueryExecutor {
             } else {
                 let (count, docs) =
                     self.search_bounded(searcher, query.as_ref(), &(Count, collector))?;
-                (count, docs, tantivy::collector::FacetCounts::default())
+                (count, docs, PreparedFacetCounts::default())
             };
             self.observe_phase(QueryPhase::Collect, collect_started_at);
             self.set_matched_docs(total);
@@ -391,7 +392,7 @@ impl QueryExecutor {
         } else {
             let (count, docs) =
                 self.search_bounded(searcher, query.as_ref(), &(Count, collector))?;
-            (count, docs, tantivy::collector::FacetCounts::default())
+            (count, docs, PreparedFacetCounts::default())
         };
         self.observe_phase(QueryPhase::Collect, collect_started_at);
         self.set_matched_docs(total);

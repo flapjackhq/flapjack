@@ -560,38 +560,63 @@ pub(super) fn trigger_replication(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::io::Write;
     use std::sync::{Arc, Mutex};
 
     use super::*;
     use tracing::instrument::WithSubscriber;
-    use tracing_subscriber::layer::SubscriberExt;
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::{registry::LookupSpan, Layer};
 
     #[derive(Clone, Default)]
-    struct TestWriter(Arc<Mutex<Vec<u8>>>);
+    struct CapturedBatchEvents(Arc<Mutex<Vec<CapturedBatchEvent>>>);
 
-    impl TestWriter {
-        fn output(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    #[derive(Clone, Debug, Default)]
+    struct CapturedBatchEvent {
+        message: Option<String>,
+        index_name: Option<String>,
+        operation_count: Option<u64>,
+    }
+
+    impl CapturedBatchEvents {
+        fn events(&self) -> Vec<CapturedBatchEvent> {
+            self.0.lock().unwrap().clone()
         }
     }
 
-    impl Write for TestWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
+    impl<S> Layer<S> for CapturedBatchEvents
+    where
+        S: Subscriber + for<'span> LookupSpan<'span>,
+    {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            let mut captured = CapturedBatchEvent::default();
+            event.record(&mut captured);
+            self.0.lock().unwrap().push(captured);
         }
     }
 
-    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for TestWriter {
-        type Writer = Self;
+    impl tracing::field::Visit for CapturedBatchEvent {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            match field.name() {
+                "message" => self.message = Some(value.to_string()),
+                "index_name" => self.index_name = Some(value.to_string()),
+                _ => {}
+            }
+        }
 
-        fn make_writer(&'writer self) -> Self::Writer {
-            self.clone()
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            if field.name() == "operation_count" {
+                self.operation_count = Some(value);
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let value = format!("{value:?}").trim_matches('"').to_string();
+            match field.name() {
+                "message" if self.message.is_none() => self.message = Some(value),
+                "index_name" if self.index_name.is_none() => self.index_name = Some(value),
+                _ => {}
+            }
         }
     }
 
@@ -645,13 +670,8 @@ mod tests {
     async fn multi_object_request_emits_one_batch_info_summary() {
         let tmp = tempfile::TempDir::new().unwrap();
         let state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
-        let writer = TestWriter::default();
-        let subscriber = tracing_subscriber::registry().with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .without_time()
-                .with_writer(writer.clone()),
-        );
+        let captured = CapturedBatchEvents::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
         let request = AddDocumentsRequest::Batch {
             requests: vec![
                 BatchOperation {
@@ -680,19 +700,32 @@ mod tests {
             .await;
         assert!(result.is_ok(), "batch fixture must commit successfully");
 
-        let output = writer.output();
+        let events = captured.events();
+        let summaries: Vec<_> = events
+            .iter()
+            .filter(|event| event.message.as_deref() == Some("Batch request"))
+            .collect();
         assert_eq!(
-            output.matches("Batch request").count(),
+            summaries.len(),
             1,
-            "one HTTP batch must emit exactly one INFO summary: {output}",
+            "one HTTP batch must emit exactly one INFO summary: {events:?}",
+        );
+        let summary = summaries[0];
+        assert_eq!(
+            summary.operation_count,
+            Some(3),
+            "summary must retain useful batch cardinality: {events:?}",
+        );
+        assert_eq!(
+            summary.index_name.as_deref(),
+            Some("log_contract"),
+            "summary must retain index context: {events:?}",
         );
         assert!(
-            output.contains("operation_count=3") && output.contains("index_name=log_contract"),
-            "summary must retain useful batch cardinality and index context: {output}",
-        );
-        assert!(
-            !output.contains("Batch operation:"),
-            "the prior per-object INFO event must not survive: {output}",
+            !events
+                .iter()
+                .any(|event| event.message.as_deref() == Some("Batch operation:")),
+            "the prior per-object INFO event must not survive: {events:?}",
         );
     }
 }

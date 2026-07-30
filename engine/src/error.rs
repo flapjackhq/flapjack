@@ -111,6 +111,12 @@ impl From<std::io::Error> for FlapjackError {
     }
 }
 
+impl From<crate::index::version_store::VersionStoreError> for FlapjackError {
+    fn from(error: crate::index::version_store::VersionStoreError) -> Self {
+        FlapjackError::Io(error.to_string())
+    }
+}
+
 impl From<tantivy::TantivyError> for FlapjackError {
     fn from(e: tantivy::TantivyError) -> Self {
         FlapjackError::Tantivy(e.to_string())

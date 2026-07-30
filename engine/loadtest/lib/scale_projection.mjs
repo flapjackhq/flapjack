@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 export const REQUIRED_PROBE_TARGETS = Object.freeze([1_000_000, 4_000_000, 8_000_000]);
 export const REQUIRED_PROJECTION_TARGETS = Object.freeze([32_000_000, 64_000_000]);
 export const DEFAULT_IMPORT_BUDGET_SECONDS = 12 * 60 * 60;
+export const PROBE_WORKLOADS = Object.freeze(["import", "bulk_build"]);
 
 const EXPECTED_INSTANCE_TYPE = "i4i.4xlarge";
 const EXPECTED_BACKING_MODEL = "Amazon EC2 NVMe Instance Storage";
@@ -44,6 +45,10 @@ export function evaluateScaleProjection(input) {
   if (!Array.isArray(input?.probes)) {
     return invalid("probeTargets");
   }
+  const workload = input?.workload ?? "import";
+  if (!PROBE_WORKLOADS.includes(workload)) {
+    return invalid("workload");
+  }
   const probeTargets = input.probes.map((probe) => probe?.targetCount);
   if (!sameNumbers(probeTargets, REQUIRED_PROBE_TARGETS)) {
     return invalid("probeTargets");
@@ -57,15 +62,20 @@ export function evaluateScaleProjection(input) {
 
   let expectedStart = 0;
   for (const probe of input.probes) {
+    const expectedProbeStart = workload === "bulk_build" ? 0 : expectedStart;
     const evidenceIsExact =
       probe?.profile === input.profile &&
-      probe?.runPurpose === "throughput_probe" &&
-      probe?.startingCount === expectedStart &&
+      probeRunPurposeMatchesWorkload(probe?.runPurpose, workload) &&
+      (probe?.workload ?? "import") === workload &&
+      probe?.startingCount === expectedProbeStart &&
       probe?.trancheSize === probe.targetCount - probe.startingCount &&
       probe?.finalCount === probe.targetCount &&
       typeof probe?.docsPerSecond === "number" &&
       Number.isFinite(probe.docsPerSecond) &&
       probe.docsPerSecond > 0 &&
+      typeof probe?.importWallClockMs === "number" &&
+      Number.isFinite(probe.importWallClockMs) &&
+      probe.importWallClockMs > 0 &&
       probe?.sentinels === "PASS";
     if (!evidenceIsExact) {
       return invalid("probeEvidence");
@@ -91,18 +101,28 @@ export function evaluateScaleProjection(input) {
   // from erasing an earlier degradation signal.
   const baseDocsPerSecond = Math.min(...input.probes.map((probe) => probe.docsPerSecond));
   const baseCount = REQUIRED_PROBE_TARGETS.at(-1);
+  const observedSeconds =
+    workload === "bulk_build"
+      ? input.probes.at(-1).importWallClockMs / 1000
+      : input.probes.reduce((sum, probe) => sum + probe.importWallClockMs, 0) / 1000;
 
   const projections = input.targets.map((targetCount) => {
     const projectedTargetDocsPerSecond =
       baseDocsPerSecond * (targetCount / baseCount) ** -degradationExponent;
-    const remainingRecords = targetCount - baseCount;
+    const remainingRecords = workload === "bulk_build" ? targetCount : targetCount - baseCount;
     // Charge the whole remaining tranche at its projected terminal rate. This is
     // deliberately more conservative than integrating the faster early portion.
-    const projectedSeconds = remainingRecords / projectedTargetDocsPerSecond;
+    const projectedRemainingSeconds = remainingRecords / projectedTargetDocsPerSecond;
+    const projectedSeconds =
+      workload === "bulk_build"
+        ? projectedRemainingSeconds
+        : observedSeconds + projectedRemainingSeconds;
     return {
       targetCount,
       remainingRecords,
       projectedTargetDocsPerSecond: round(projectedTargetDocsPerSecond),
+      projectedRemainingSeconds: round(projectedRemainingSeconds),
+      projectedTotalSeconds: round(projectedSeconds),
       projectedSeconds: round(projectedSeconds),
       verdict: projectedSeconds <= input.budgetSeconds ? "GO" : "NO_GO",
     };
@@ -116,14 +136,23 @@ export function evaluateScaleProjection(input) {
       .filter((projection) => projection.verdict === "NO_GO")
       .map((projection) => `target:${projection.targetCount}`),
     profile: input.profile,
+    workload,
     budgetSeconds: input.budgetSeconds,
     probeTargets,
     baseCount,
     baseDocsPerSecond: round(baseDocsPerSecond),
+    observedSeconds: round(observedSeconds),
     degradationDetected: degradationExponent > 0,
     degradationExponent: round(degradationExponent),
     projections,
   };
+}
+
+function probeRunPurposeMatchesWorkload(runPurpose, workload) {
+  if (workload === "import") {
+    return runPurpose === "throughput_probe";
+  }
+  return runPurpose === "bulk_build_throughput_probe";
 }
 
 function runCli() {

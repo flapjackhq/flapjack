@@ -1,6 +1,4 @@
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::{Mutex, OnceLock};
 
 use crate::types::{TaskInfo, TaskStatus};
 
@@ -8,8 +6,10 @@ use super::{PreparedWriteDocument, PreparedWriteOperation, WriteFinalizationCont
 
 pub(crate) const PERSISTED_VECTORS_DIR: &str = "vectors";
 
-#[cfg(test)]
-static COMMIT_FAILURE_TENANT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+#[cfg(any(test, feature = "fault-injection"))]
+static FINALIZATION_FAULTS: once_cell::sync::Lazy<
+    dashmap::DashMap<String, FinalizationFaultPoint>,
+> = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 #[cfg(test)]
 static COMMITS_IN_PROGRESS: once_cell::sync::Lazy<dashmap::DashSet<String>> =
     once_cell::sync::Lazy::new(dashmap::DashSet::new);
@@ -26,29 +26,48 @@ impl Drop for CommitInProgressGuard<'_> {
     }
 }
 
-#[cfg(test)]
-pub(crate) struct CommitFailureHookGuard {
-    previous_tenant: Option<String>,
+#[cfg(any(test, feature = "fault-injection"))]
+pub(crate) struct FinalizationFaultGuard {
+    tenant_id: String,
 }
 
-#[cfg(test)]
-impl Drop for CommitFailureHookGuard {
+#[cfg(any(test, feature = "fault-injection"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinalizationFaultPoint {
+    BeforeTantivyCommit,
+    AfterOplogAppendBeforeTantivyCommit,
+    AfterTantivyCommitBeforeVersionReceipts,
+    AfterFirstVersionReceiptStatement,
+    AfterVersionTransactionBeforeCommittedSeq,
+    AfterCommittedSeqBeforeOplogTruncation,
+    AfterOplogTruncationBeforeAdmissionAck,
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+impl Drop for FinalizationFaultGuard {
     fn drop(&mut self) {
-        *commit_failure_tenant().lock().unwrap() = self.previous_tenant.take();
+        FINALIZATION_FAULTS.remove(&self.tenant_id);
     }
 }
 
-#[cfg(test)]
-fn commit_failure_tenant() -> &'static Mutex<Option<String>> {
-    COMMIT_FAILURE_TENANT.get_or_init(|| Mutex::new(None))
+#[cfg(any(test, feature = "fault-injection"))]
+pub(crate) fn fail_next_commit_for_test(tenant_id: &str) -> FinalizationFaultGuard {
+    fail_next_finalization_for_test(tenant_id, FinalizationFaultPoint::BeforeTantivyCommit)
 }
 
-#[cfg(test)]
-pub(crate) fn fail_next_commit_for_test(tenant_id: &str) -> CommitFailureHookGuard {
-    let mut target = commit_failure_tenant().lock().unwrap();
-    CommitFailureHookGuard {
-        previous_tenant: target.replace(tenant_id.to_string()),
-    }
+#[cfg(any(test, feature = "fault-injection"))]
+pub(crate) fn fail_next_finalization_for_test(
+    tenant_id: &str,
+    fault_point: FinalizationFaultPoint,
+) -> FinalizationFaultGuard {
+    let tenant_id = tenant_id.to_string();
+    assert!(
+        FINALIZATION_FAULTS
+            .insert(tenant_id.clone(), fault_point)
+            .is_none(),
+        "a finalization failure is already armed for tenant {tenant_id}"
+    );
+    FinalizationFaultGuard { tenant_id }
 }
 
 #[cfg(test)]
@@ -56,16 +75,26 @@ pub(crate) fn commit_is_in_progress_for_test(tenant_id: &str) -> bool {
     COMMITS_IN_PROGRESS.contains(tenant_id)
 }
 
-#[cfg(test)]
-fn injected_commit_failure(tenant_id: &str) -> Option<crate::error::FlapjackError> {
-    let mut target = commit_failure_tenant().lock().unwrap();
-    if target.as_deref() != Some(tenant_id) {
-        return None;
+#[cfg(any(test, feature = "fault-injection"))]
+pub(super) fn inject_finalization_fault(
+    tenant_id: &str,
+    fault_point: FinalizationFaultPoint,
+) -> crate::error::Result<()> {
+    let should_inject = FINALIZATION_FAULTS
+        .get(tenant_id)
+        .is_some_and(|armed| *armed.value() == fault_point);
+    if !should_inject {
+        return Ok(());
     }
-    target.take();
-    Some(crate::error::FlapjackError::Tantivy(
-        "injected write-queue commit failure".to_string(),
-    ))
+    FINALIZATION_FAULTS.remove(tenant_id);
+    if fault_point == FinalizationFaultPoint::BeforeTantivyCommit {
+        return Err(crate::error::FlapjackError::Tantivy(
+            "injected write-queue commit failure".to_string(),
+        ));
+    }
+    Err(crate::error::FlapjackError::Tantivy(format!(
+        "injected write-queue finalization failure at {fault_point:?}"
+    )))
 }
 
 pub(super) fn write_valid_documents(
@@ -87,32 +116,20 @@ pub(super) fn write_valid_documents(
 pub(super) fn append_batch_to_oplog(
     oplog: Option<&Arc<crate::index::oplog::OpLog>>,
     task_id: &str,
-    valid_docs_json: &[(String, serde_json::Value)],
-    deleted_ids: &[String],
+    batch_ops: &[crate::index::oplog::OpLogOperation],
     tenant_id: &str,
-) -> crate::error::Result<()> {
+) -> crate::error::Result<Vec<crate::index::oplog::OpLogReceipt>> {
     let Some(oplog) = oplog else {
-        return Ok(());
+        return Ok(Vec::new());
     };
 
-    let mut batch_ops: Vec<(String, serde_json::Value)> = Vec::new();
-    for (doc_id, doc_json) in valid_docs_json {
-        batch_ops.push((
-            "upsert".into(),
-            serde_json::json!({"objectID": doc_id, "body": doc_json}),
-        ));
-    }
-    for deleted_id in deleted_ids {
-        batch_ops.push(("delete".into(), serde_json::json!({"objectID": deleted_id})));
-    }
     if batch_ops.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let phase_start = std::time::Instant::now();
     let result = oplog
-        .append_batch_for_task(task_id, &batch_ops)
-        .map(|_| ())
+        .append_operations_for_task(task_id, batch_ops.to_vec())
         .map_err(|error| {
             tracing::error!("[WQ {}] oplog append failed: {}", tenant_id, error);
             error
@@ -139,10 +156,8 @@ pub(super) fn commit_writer_with_panic_guard(
         deleted_count,
         rejected_count
     );
-    #[cfg(test)]
-    if let Some(error) = injected_commit_failure(tenant_id) {
-        return Err(error);
-    }
+    #[cfg(any(test, feature = "fault-injection"))]
+    inject_finalization_fault(tenant_id, FinalizationFaultPoint::BeforeTantivyCommit)?;
     #[cfg(test)]
     let _commit_in_progress = {
         COMMITS_IN_PROGRESS.insert(tenant_id.to_string());
@@ -177,6 +192,12 @@ pub(super) fn commit_writer_with_panic_guard(
     }
 }
 
+/// Publish all post-Tantivy state for a committed write batch.
+///
+/// Per-object versions are committed in one SQLite transaction before the
+/// oplog watermark advances. Any error leaves admission records and task
+/// acknowledgements untouched so the tenant writer exits and recovery can
+/// replay the durable oplog receipts.
 pub(super) fn finalize_committed_batch(
     context: &WriteFinalizationContext<'_>,
     prepared_ops: &[PreparedWriteOperation],
@@ -186,24 +207,28 @@ pub(super) fn finalize_committed_batch(
     let metadata_start = std::time::Instant::now();
     persist_index_metadata(context.base_path, context.tenant_id, build_secs);
     super::observe_write_queue_phase(super::PHASE_METADATA_PERSISTENCE, metadata_start);
-    let reload_start = std::time::Instant::now();
-    refresh_search_state(context.index, context.facet_cache, context.tenant_id)?;
-    super::observe_write_queue_phase(super::PHASE_READER_RELOAD, reload_start);
     #[cfg(feature = "vector-search")]
     {
         save_vector_index(context, prepared_ops);
     }
-    for prepared in prepared_ops {
-        let lww_start = std::time::Instant::now();
-        update_lww_state(context.lww_map, context.tenant_id, prepared);
-        super::observe_write_queue_phase(super::PHASE_LWW_UPDATE, lww_start);
-    }
+    let version_start = std::time::Instant::now();
+    let committed_watermark =
+        apply_version_receipts(context.base_path, context.tenant_id, prepared_ops)?;
+    super::observe_write_queue_phase(super::PHASE_VERSION_STORE_UPDATE, version_start);
     let oplog_state_start = std::time::Instant::now();
-    persist_oplog_commit_state(context.oplog, context.base_path, context.tenant_id);
+    persist_oplog_commit_state(
+        context.oplog,
+        context.base_path,
+        context.tenant_id,
+        committed_watermark,
+    )?;
     super::observe_write_queue_phase(
         super::PHASE_OPLOG_COMMIT_STATE_PERSISTENCE,
         oplog_state_start,
     );
+    let reload_start = std::time::Instant::now();
+    refresh_search_state(context.index, context.facet_cache, context.tenant_id)?;
+    super::observe_write_queue_phase(super::PHASE_READER_RELOAD, reload_start);
     record_segment_health(context.tenant_id, context.index);
     super::observe_write_queue_phase(super::PHASE_FINALIZE_COMMITTED_BATCH, phase_start);
     Ok(())
@@ -230,7 +255,7 @@ fn refresh_search_state(
 ) -> crate::error::Result<()> {
     index.reader().reload()?;
     index.invalidate_searchable_paths_cache();
-    facet_cache.retain(|cache_key, _| !cache_key.starts_with(&format!("{}:", tenant_id)));
+    facet_cache.retain(|cache_key, _| !cache_key.belongs_to_tenant(tenant_id));
     Ok(())
 }
 
@@ -290,30 +315,83 @@ fn save_vector_index(
     super::observe_write_queue_phase(super::PHASE_VECTOR_SAVE, vector_start);
 }
 
-/// Record the current timestamp and node ID in the LWW map for every primary
-/// upsert and delete, enabling last-writer-wins conflict resolution during
-/// replication.
-fn update_lww_state(
-    lww_map: &super::super::LwwMap,
+fn apply_version_receipts(
+    base_path: &std::path::Path,
     tenant_id: &str,
-    prepared: &PreparedWriteOperation,
-) {
-    if prepared.primary_upsert_ids.is_empty() && prepared.primary_delete_ids.is_empty() {
-        return;
-    }
+    prepared_ops: &[PreparedWriteOperation],
+) -> crate::error::Result<Option<u64>> {
+    let receipts: Vec<_> = prepared_ops
+        .iter()
+        .flat_map(|prepared| prepared.oplog_receipts.iter().cloned())
+        .collect();
+    let finalized_task_ids: Vec<_> = prepared_ops
+        .iter()
+        .map(|prepared| prepared.task_id.as_str())
+        .collect();
+    let Some(committed_watermark) = receipts.last().map(|receipt| receipt.seq) else {
+        return Ok(None);
+    };
+    let tenant_path = base_path.join(tenant_id);
+    let version_store = crate::index::version_store::VersionStore::open(&tenant_path)?;
+    version_store.apply_receipts_and_tasks_with_hook(
+        &receipts,
+        &finalized_task_ids,
+        |_applied_statement_count| {
+            #[cfg(any(test, feature = "fault-injection"))]
+            if _applied_statement_count == 1 {
+                inject_finalization_fault(
+                    tenant_id,
+                    FinalizationFaultPoint::AfterFirstVersionReceiptStatement,
+                )
+                .map_err(|error| {
+                    crate::index::version_store::VersionStoreError::Injected(error.to_string())
+                })?;
+            }
+            Ok(())
+        },
+    )?;
+    #[cfg(any(test, feature = "fault-injection"))]
+    inject_finalization_fault(
+        tenant_id,
+        FinalizationFaultPoint::AfterVersionTransactionBeforeCommittedSeq,
+    )?;
+    Ok(Some(committed_watermark))
+}
 
-    let now_ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let node_id = crate::index::configured_node_id();
-    let tenant_map = lww_map.entry(tenant_id.to_string()).or_default();
-    for doc_id in &prepared.primary_upsert_ids {
-        tenant_map.insert(doc_id.clone(), (now_ts, node_id.clone()));
+pub(super) fn forget_finalized_tasks(
+    base_path: &std::path::Path,
+    tenant_id: &str,
+    prepared_ops: &[PreparedWriteOperation],
+) {
+    let task_ids: Vec<_> = prepared_ops
+        .iter()
+        .map(|prepared| prepared.task_id.as_str())
+        .collect();
+    let tenant_path = base_path.join(tenant_id);
+    let result = crate::index::version_store::VersionStore::open(&tenant_path)
+        .and_then(|store| store.remove_finalized_tasks(&task_ids));
+    if let Err(error) = result {
+        tracing::warn!("[WQ {tenant_id}] failed to prune finalized admission evidence: {error}");
     }
-    for doc_id in &prepared.primary_delete_ids {
-        tenant_map.insert(doc_id.clone(), (now_ts, node_id.clone()));
+}
+
+fn oplog_retention() -> u64 {
+    std::env::var("FLAPJACK_OPLOG_RETENTION")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1000)
+}
+
+fn truncate_committed_oplog(
+    oplog: &crate::index::oplog::OpLog,
+    committed_seq: u64,
+) -> crate::error::Result<()> {
+    let retention = oplog_retention();
+    if committed_seq >= retention {
+        let before_seq = committed_seq.saturating_sub(retention).saturating_add(1);
+        oplog.truncate_before(before_seq)?;
     }
+    Ok(())
 }
 
 /// Write the committed sequence number to disk and truncate oplog entries older
@@ -322,28 +400,36 @@ fn persist_oplog_commit_state(
     oplog: Option<&Arc<crate::index::oplog::OpLog>>,
     base_path: &std::path::Path,
     tenant_id: &str,
-) {
-    let Some(oplog) = oplog else {
-        return;
+    committed_watermark: Option<u64>,
+) -> crate::error::Result<()> {
+    let Some(committed_seq) = committed_watermark else {
+        return Ok(());
     };
-
-    let seq = oplog.current_seq();
+    let oplog = oplog.ok_or_else(|| {
+        crate::error::FlapjackError::Io(format!(
+            "committed receipts for tenant {tenant_id} have no oplog owner"
+        ))
+    })?;
     let tenant_path = base_path.join(tenant_id);
-    if let Err(error) = crate::index::oplog::write_committed_seq(&tenant_path, seq) {
-        tracing::error!(
-            "[WQ {}] failed to write committed_seq: {}",
-            tenant_id,
-            error
-        );
+    crate::index::oplog::write_committed_seq(&tenant_path, committed_seq)?;
+    #[cfg(any(test, feature = "fault-injection"))]
+    inject_finalization_fault(
+        tenant_id,
+        FinalizationFaultPoint::AfterCommittedSeqBeforeOplogTruncation,
+    )?;
+    #[cfg(any(test, feature = "fault-injection"))]
+    if FINALIZATION_FAULTS.get(tenant_id).is_some_and(|armed| {
+        *armed.value() == FinalizationFaultPoint::AfterOplogTruncationBeforeAdmissionAck
+    }) {
+        oplog.rotate_segment_for_test()?;
     }
-
-    let retention = std::env::var("FLAPJACK_OPLOG_RETENTION")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(1000);
-    if seq > retention {
-        let _ = oplog.truncate_before(seq - retention);
-    }
+    truncate_committed_oplog(oplog, committed_seq)?;
+    #[cfg(any(test, feature = "fault-injection"))]
+    inject_finalization_fault(
+        tenant_id,
+        FinalizationFaultPoint::AfterOplogTruncationBeforeAdmissionAck,
+    )?;
+    Ok(())
 }
 
 /// Update the task status to `Succeeded` with indexed and rejected document
@@ -538,55 +624,118 @@ mod tests {
     use super::*;
 
     #[test]
-    fn update_lww_state_no_primary_changes_keeps_map_unchanged() {
-        let lww_map: super::super::super::LwwMap = Arc::new(dashmap::DashMap::new());
-        let prepared = PreparedWriteOperation::new("task-1".to_string(), "1".to_string());
-
-        update_lww_state(&lww_map, "tenant_a", &prepared);
+    #[serial_test::serial(write_queue_commit_failure_hook)]
+    fn commit_failure_hooks_are_isolated_by_tenant() {
+        let _tenant_a_hook = fail_next_commit_for_test("fault_hook_tenant_a");
+        let _tenant_b_hook = fail_next_commit_for_test("fault_hook_tenant_b");
 
         assert!(
-            lww_map.get("tenant_a").is_none(),
-            "tenants with no primary upsert/delete ids should not create LWW state entries"
+            inject_finalization_fault(
+                "fault_hook_tenant_a",
+                FinalizationFaultPoint::BeforeTantivyCommit,
+            )
+            .is_err(),
+            "arming tenant B must not overwrite tenant A's pending failure"
+        );
+        assert!(
+            inject_finalization_fault(
+                "fault_hook_tenant_b",
+                FinalizationFaultPoint::BeforeTantivyCommit,
+            )
+            .is_err(),
+            "each tenant must retain its own one-shot failure"
+        );
+        assert!(
+            inject_finalization_fault(
+                "fault_hook_tenant_a",
+                FinalizationFaultPoint::BeforeTantivyCommit,
+            )
+            .is_ok(),
+            "tenant-scoped failures must be consumed exactly once"
         );
     }
+
     #[test]
-    fn update_lww_state_tracks_primary_upserts_and_deletes() {
-        let lww_map: super::super::super::LwwMap = Arc::new(dashmap::DashMap::new());
-        let mut prepared = PreparedWriteOperation::new("task-2".to_string(), "2".to_string());
-        prepared.primary_upsert_ids = vec!["doc_a".to_string(), "doc_b".to_string()];
-        prepared.primary_delete_ids = vec!["doc_c".to_string()];
+    fn finalization_applies_version_receipts_before_advancing_committed_seq() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let tenant_id = "durable_finalization";
+        let tenant_path = temp_dir.path().join(tenant_id);
+        std::fs::create_dir_all(&tenant_path).unwrap();
+        let schema = crate::index::schema::Schema::builder().build();
+        let index = Arc::new(crate::index::Index::create(&tenant_path, schema).unwrap());
+        let oplog = Arc::new(
+            crate::index::oplog::OpLog::open(&tenant_path.join("oplog"), tenant_id, "local-node")
+                .unwrap(),
+        );
+        let receipts = oplog
+            .append_operations_for_task(
+                "task-1",
+                vec![
+                    crate::index::oplog::OpLogOperation::replicated(
+                        "upsert",
+                        serde_json::json!({"objectID": "doc-a", "body": {"objectID": "doc-a"}}),
+                        crate::index::oplog::OpLogOrigin::new(5000, "node-a"),
+                    ),
+                    crate::index::oplog::OpLogOperation::replicated(
+                        "delete",
+                        serde_json::json!({"objectID": "doc-b"}),
+                        crate::index::oplog::OpLogOrigin::new(6000, "node-b"),
+                    ),
+                ],
+            )
+            .unwrap();
+        let mut prepared = PreparedWriteOperation::new("task-1".to_string(), "1".to_string());
+        prepared.oplog_receipts = receipts;
+        let tasks = Arc::new(dashmap::DashMap::new());
+        let admission_store = Arc::new(
+            super::super::admission::WriteAdmissionStore::open(temp_dir.path(), tenant_id).unwrap(),
+        );
+        let facet_cache = Arc::new(dashmap::DashMap::new());
+        #[cfg(feature = "vector-search")]
+        let vector_ctx = super::super::VectorWriteContext::new(Arc::new(dashmap::DashMap::new()));
+        let context = WriteFinalizationContext {
+            tenant_id,
+            index: &index,
+            tasks: &tasks,
+            base_path: temp_dir.path(),
+            oplog: Some(&oplog),
+            admission_store: &admission_store,
+            facet_cache: &facet_cache,
+            #[cfg(feature = "vector-search")]
+            vector_ctx: &vector_ctx,
+            #[cfg(feature = "vector-search")]
+            embedder_configs: &[],
+        };
 
-        update_lww_state(&lww_map, "tenant_b", &prepared);
+        finalize_committed_batch(&context, &[prepared], 0).unwrap();
 
-        let tenant_map = lww_map
-            .get("tenant_b")
-            .expect("expected tenant LWW map after primary changes");
+        let version_store = crate::index::version_store::VersionStore::open(&tenant_path).unwrap();
         assert_eq!(
-            tenant_map.len(),
-            3,
-            "all upserts/deletes should be recorded"
-        );
-
-        let a = tenant_map.get("doc_a").expect("missing doc_a");
-        let b = tenant_map.get("doc_b").expect("missing doc_b");
-        let c = tenant_map.get("doc_c").expect("missing doc_c");
-
-        assert!(a.value().0 > 0, "timestamp should be populated");
-        assert_eq!(
-            a.value().0,
-            b.value().0,
-            "all entries from one batch should share a consistent timestamp"
+            version_store.get("doc-a").unwrap(),
+            Some(crate::index::version_store::VersionRecord::new(
+                5000, "node-a", false, 1,
+            ))
         );
         assert_eq!(
-            b.value().0,
-            c.value().0,
-            "delete entries should use the same batch timestamp as upserts"
+            version_store.get("doc-b").unwrap(),
+            Some(crate::index::version_store::VersionRecord::new(
+                6000, "node-b", true, 2,
+            ))
         );
-        assert!(
-            !a.value().1.is_empty(),
-            "node id should always be recorded in LWW entries"
+        assert_eq!(
+            crate::index::oplog::read_committed_seq(&tenant_path),
+            2,
+            "the durable version transaction must complete before the watermark advances"
         );
-        assert_eq!(a.value().1, b.value().1);
-        assert_eq!(b.value().1, c.value().1);
+        assert_eq!(
+            oplog
+                .read_since(0)
+                .unwrap()
+                .iter()
+                .map(|entry| entry.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "freshly committed oplog rows must remain retained"
+        );
     }
 }

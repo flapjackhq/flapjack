@@ -5,54 +5,61 @@ use crate::index::rules::GeneratedFacetFilter;
 use crate::index::write_queue::admission::{
     WriteAdmissionRecord, WriteAdmissionStore, WriteAdmissionTicket,
 };
-use crate::index::write_queue::WriteOp;
+use crate::index::write_queue::{FinalizationFaultPoint, ReplicatedWriteOrigin, WriteOp};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const WRITE_DURABLE_TIMEOUT_ENV_VAR: &str = "FLAPJACK_WRITE_DURABLE_TIMEOUT_MS";
 const WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_ENV_VAR: &str =
     "FLAPJACK_WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_MS";
-const WRITE_QUEUE_ADMISSION_FAILURE_PROBE_LIMIT: usize = 2_050;
+
+struct TestEnvVarGuard {
+    name: &'static str,
+    previous_value: Option<std::ffi::OsString>,
+}
+
+impl TestEnvVarGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        let previous_value = std::env::var_os(name);
+        std::env::set_var(name, value);
+        Self {
+            name,
+            previous_value,
+        }
+    }
+}
+
+impl Drop for TestEnvVarGuard {
+    fn drop(&mut self) {
+        match self.previous_value.take() {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
 
 struct DurableWriteTimeoutEnvGuard {
-    previous_value: Option<String>,
+    _inner: TestEnvVarGuard,
 }
 
 impl DurableWriteTimeoutEnvGuard {
     fn set(value: &str) -> Self {
-        let previous_value = std::env::var(WRITE_DURABLE_TIMEOUT_ENV_VAR).ok();
-        std::env::set_var(WRITE_DURABLE_TIMEOUT_ENV_VAR, value);
-        Self { previous_value }
-    }
-}
-
-impl Drop for DurableWriteTimeoutEnvGuard {
-    fn drop(&mut self) {
-        match &self.previous_value {
-            Some(value) => std::env::set_var(WRITE_DURABLE_TIMEOUT_ENV_VAR, value),
-            None => std::env::remove_var(WRITE_DURABLE_TIMEOUT_ENV_VAR),
+        Self {
+            _inner: TestEnvVarGuard::set(WRITE_DURABLE_TIMEOUT_ENV_VAR, value),
         }
     }
 }
 
 struct WriteQueueWriterAcquireTimeoutEnvGuard {
-    previous_value: Option<String>,
+    _inner: TestEnvVarGuard,
 }
 
 impl WriteQueueWriterAcquireTimeoutEnvGuard {
     fn set(value: &str) -> Self {
-        let previous_value = std::env::var(WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_ENV_VAR).ok();
-        std::env::set_var(WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_ENV_VAR, value);
-        Self { previous_value }
-    }
-}
-
-impl Drop for WriteQueueWriterAcquireTimeoutEnvGuard {
-    fn drop(&mut self) {
-        match &self.previous_value {
-            Some(value) => std::env::set_var(WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_ENV_VAR, value),
-            None => std::env::remove_var(WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_ENV_VAR),
+        Self {
+            _inner: TestEnvVarGuard::set(WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_ENV_VAR, value),
         }
     }
 }
@@ -90,6 +97,133 @@ fn write_queue_test_document(object_id: &str, title: &str) -> Document {
         id: object_id.to_string(),
         fields: HashMap::from([("title".to_string(), FieldValue::Text(title.to_string()))]),
     }
+}
+
+fn retained_channel_closed_count(tenant_id: &str) -> usize {
+    crate::index::write_queue::writer_lifecycle_test_events(tenant_id)
+        .iter()
+        .filter(|event| event.reason == "channel_closed" && event.phase == "merge_quiesced")
+        .count()
+}
+
+fn assert_retained_channel_closed_delta(tenant_id: &str, before: usize, message: &str) {
+    let after = retained_channel_closed_count(tenant_id);
+    assert_eq!(after, before + 1, "{message}");
+}
+
+fn assert_quiescence_before_publication(tenant_id: &str, publication_phase: &'static str) {
+    let events = crate::index::write_queue::writer_lifecycle_test_events(tenant_id);
+    let quiesced_sequence = events
+        .iter()
+        .find(|event| event.reason == "channel_closed" && event.phase == "merge_quiesced")
+        .map(|event| event.sequence)
+        .unwrap_or_else(|| {
+            panic!(
+                "tenant {tenant_id} must retain a channel_closed merge-quiesced event: {events:?}"
+            )
+        });
+    let publication_sequence = events
+        .iter()
+        .find(|event| event.phase == publication_phase)
+        .map(|event| event.sequence)
+        .unwrap_or_else(|| {
+            panic!(
+                "tenant {tenant_id} must retain publication event {publication_phase}: {events:?}"
+            )
+        });
+    assert!(
+        quiesced_sequence < publication_sequence,
+        "tenant {tenant_id} must merge-quiesce before {publication_phase}; events: {events:?}"
+    );
+}
+
+fn assert_document_title(manager: &IndexManager, tenant_id: &str, object_id: &str, title: &str) {
+    let document = manager
+        .get_document(tenant_id, object_id)
+        .unwrap()
+        .unwrap_or_else(|| panic!("tenant {tenant_id} must contain document {object_id}"));
+    assert_eq!(
+        document.fields.get("title"),
+        Some(&FieldValue::Text(title.to_string()))
+    );
+}
+
+fn assert_tenant_document_count(manager: &IndexManager, tenant_id: &str, expected_count: usize) {
+    let result = manager
+        .search(tenant_id, "", None, None, expected_count + 1)
+        .unwrap();
+    assert_eq!(
+        result.total, expected_count,
+        "tenant {tenant_id} must expose exactly {expected_count} documents"
+    );
+}
+
+fn assert_tenant_titles(manager: &IndexManager, tenant_id: &str, expected: &[(&str, &str)]) {
+    assert_tenant_document_count(manager, tenant_id, expected.len());
+    for (object_id, title) in expected {
+        assert_document_title(manager, tenant_id, object_id, title);
+    }
+}
+
+fn assert_searcher_count(manager: &IndexManager, tenant_id: &str, expected: u64) {
+    assert_eq!(
+        manager.tenant_doc_count(tenant_id),
+        Some(expected),
+        "tenant_doc_count must remain backed by the currently published searcher"
+    );
+}
+
+fn tenant_root_files(root: &Path) -> BTreeSet<PathBuf> {
+    std::fs::read_dir(root)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_file()))
+        .map(|entry| PathBuf::from(entry.file_name()))
+        .collect()
+}
+
+fn tenant_managed_files(manager: &IndexManager, tenant_id: &str) -> BTreeSet<PathBuf> {
+    manager
+        .get_or_load(tenant_id)
+        .unwrap()
+        .inner()
+        .directory()
+        .list_managed_files()
+        .into_iter()
+        .filter(|path| path != Path::new("meta.json"))
+        .collect()
+}
+
+fn assert_no_stale_destination_root_files(
+    destination_path: &Path,
+    old_destination_files: &BTreeSet<PathBuf>,
+) {
+    let current_files = tenant_root_files(destination_path);
+    let stale_files = current_files
+        .intersection(old_destination_files)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        stale_files.is_empty(),
+        "replacement must not leave old destination segment files outside meta.json: {stale_files:?}"
+    );
+}
+
+async fn wait_for_task_processing(manager: &IndexManager, task_id: &str) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let task = manager.get_task(task_id).unwrap();
+            match task.status {
+                TaskStatus::Processing => return,
+                TaskStatus::Succeeded | TaskStatus::Failed(_) => {
+                    panic!("task {task_id} reached terminal state before the active-write window")
+                }
+                TaskStatus::Enqueued => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("task must enter Processing before the active-write window times out");
 }
 
 fn tenant_task_key_snapshot(manager: &IndexManager, tenant_id: &str) -> BTreeSet<String> {
@@ -365,23 +499,48 @@ fn assert_queue_full_wins_over_invalid_epoch(invalid_epoch: InvalidEpochAdmissio
     );
 }
 
+/// Install a live single-slot queue with its only capacity permit occupied.
 fn fill_write_queue_without_admission(manager: &IndexManager, tenant_id: &str) {
-    let index = manager.get_or_load(tenant_id).unwrap();
-    let tx = manager
-        .get_or_create_write_queue(tenant_id, &index)
-        .unwrap();
-    for i in 0..=WRITE_QUEUE_ADMISSION_FAILURE_PROBE_LIMIT {
-        let result = tx.try_send(WriteOp {
-            task_id: format!("synthetic_capacity_task_{i}"),
-            actions: vec![WriteAction::Delete(format!("synthetic_missing_doc_{i}"))],
-        });
-        match result {
-            Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => return,
-            Err(error) => panic!("capacity prefill should only stop at Full, got {error:?}"),
-        }
-    }
-    panic!("capacity prefill did not reach QueueFull");
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    tx.try_send(WriteOp {
+        task_id: "synthetic_capacity_task".to_string(),
+        actions: vec![WriteAction::Delete("synthetic_missing_doc".to_string())],
+    })
+    .expect("single-slot capacity queue should accept the first synthetic write");
+    manager.write_queues.insert(tenant_id.to_string(), tx);
+    manager.write_task_handles.insert(
+        tenant_id.to_string(),
+        WriteTaskHandle::new(tokio::spawn(async move {
+            let _receiver = rx;
+            std::future::pending().await
+        })),
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fill_write_queue_without_admission_keeps_a_live_channel_at_capacity() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "write_queue_live_capacity_fixture";
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+
+    fill_write_queue_without_admission(&manager, tenant_id);
+
+    let queue = manager
+        .write_queues
+        .get(tenant_id)
+        .expect("capacity fixture should install the tenant queue");
+    assert_eq!(
+        queue.capacity(),
+        0,
+        "capacity fixture should occupy the channel's only slot"
+    );
+    assert!(
+        !queue.is_closed(),
+        "capacity fixture must retain a live receiver so it exercises pressure rather than disconnection"
+    );
+    drop(queue);
+    assert!(manager.abort_tenant_write_task_for_test(tenant_id));
 }
 
 struct EpochAdmissionConcurrencyHarness {
@@ -557,7 +716,475 @@ async fn create_move_fixture(manager: &IndexManager, tenant: &str, marker: &str)
     std::fs::create_dir_all(path.join("oplog")).unwrap();
     std::fs::write(path.join("oplog/move_test.jsonl"), marker).unwrap();
     std::fs::write(path.join("committed_seq"), "41").unwrap();
+    let version = crate::index::version_store::VersionRecord::new(41, marker, false, 41);
+    let version_store = crate::index::version_store::VersionStore::open(&path).unwrap();
+    assert!(version_store.upsert("move-object", &version).unwrap());
     manager.unload(&tenant.to_string()).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(stage_4_manager_quiesce)]
+async fn export_and_import_during_active_write_round_trip_exactly() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let source_tenant = "stage4_source_export_quiesce";
+    let destination_tenant = "stage4_destination_import_quiesce";
+    // Scope the injected commit stall to this test's own source tenant: the
+    // FLAPJACK_WRITE_QUEUE_TEST_COMMIT_DELAY_MS env var would stall every write queue in the
+    // shared lib-test process and fail unrelated tests running in parallel.
+    let _source_commit_delay = crate::index::write_queue::delay_commits_for_test(
+        source_tenant,
+        Duration::from_millis(250),
+    );
+    manager.create_tenant(source_tenant).unwrap();
+    manager.create_tenant(destination_tenant).unwrap();
+    manager
+        .add_documents_sync(
+            source_tenant,
+            vec![
+                write_queue_test_document("source_one", "source first"),
+                write_queue_test_document("source_two", "source second"),
+            ],
+        )
+        .await
+        .unwrap();
+    manager
+        .add_documents_sync(
+            destination_tenant,
+            vec![write_queue_test_document(
+                "stale_destination",
+                "stale cached",
+            )],
+        )
+        .await
+        .unwrap();
+    let source_version =
+        crate::index::version_store::VersionRecord::new(301, "source-node", false, 3);
+    {
+        let source_store =
+            crate::index::version_store::VersionStore::open(&temp_dir.path().join(source_tenant))
+                .unwrap();
+        assert!(source_store
+            .upsert("source-version", &source_version)
+            .unwrap());
+        let destination_store = crate::index::version_store::VersionStore::open(
+            &temp_dir.path().join(destination_tenant),
+        )
+        .unwrap();
+        assert!(destination_store
+            .upsert(
+                "stale-version",
+                &crate::index::version_store::VersionRecord::new(99, "destination-node", true, 1,),
+            )
+            .unwrap());
+    }
+    assert_document_title(
+        &manager,
+        destination_tenant,
+        "stale_destination",
+        "stale cached",
+    );
+
+    let active_source_task = manager
+        .add_documents(
+            source_tenant,
+            vec![write_queue_test_document("source_three", "source third")],
+        )
+        .unwrap();
+    wait_for_task_processing(&manager, &active_source_task.id).await;
+
+    let export_path = temp_dir.path().join("source_export");
+    let source_merge_wait_before = retained_channel_closed_count(source_tenant);
+    manager
+        .export_tenant_wait(&source_tenant.to_string(), export_path.clone())
+        .await
+        .unwrap();
+    assert_retained_channel_closed_delta(
+        source_tenant,
+        source_merge_wait_before,
+        "export_tenant_wait must close the source writer through merge quiescence before reading files",
+    );
+    assert_quiescence_before_publication(source_tenant, "manager_export_publication");
+
+    let destination_merge_wait_before = retained_channel_closed_count(destination_tenant);
+    manager
+        .import_tenant(&destination_tenant.to_string(), &export_path)
+        .await
+        .unwrap();
+    assert_retained_channel_closed_delta(
+        destination_tenant,
+        destination_merge_wait_before,
+        "import_tenant must close the destination writer through merge quiescence before replacing files"
+    );
+    assert_quiescence_before_publication(destination_tenant, "manager_import_publication");
+    manager
+        .wait_for_write_durable(&active_source_task.id)
+        .await
+        .unwrap();
+
+    assert_tenant_titles(
+        &manager,
+        destination_tenant,
+        &[
+            ("source_one", "source first"),
+            ("source_two", "source second"),
+            ("source_three", "source third"),
+        ],
+    );
+    assert!(
+        manager
+            .get_document(destination_tenant, "stale_destination")
+            .unwrap()
+            .is_none(),
+        "import must reload/replace the cached destination generation exactly"
+    );
+    let imported_store =
+        crate::index::version_store::VersionStore::open(&temp_dir.path().join(destination_tenant))
+            .unwrap();
+    assert_eq!(
+        imported_store.get("source-version").unwrap(),
+        Some(source_version)
+    );
+    assert_eq!(imported_store.get("stale-version").unwrap(), None);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn import_tenant_preserves_existing_destination_when_source_copy_fails() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let tenant_id = "import_copy_failure_preserves_destination";
+    manager.create_tenant(tenant_id).unwrap();
+    manager
+        .add_documents_sync(
+            tenant_id,
+            vec![write_queue_test_document(
+                "existing",
+                "existing destination",
+            )],
+        )
+        .await
+        .unwrap();
+    let tenant_path = temp_dir.path().join(tenant_id);
+    // Close the persistent writer before snapshotting the destination tree.
+    // While a writer is live it rewrites its runtime backpressure-state file
+    // (`write_backpressure_pause.json`) in the background, which mutates the tree
+    // between the two snapshots and flakes this byte-for-byte comparison under
+    // parallel load. A failed import must neither reopen the writer nor touch the
+    // tree, so the quiesced snapshot is the correct stable baseline.
+    drop(
+        manager
+            .quiesce_tenant(&tenant_id.to_string())
+            .await
+            .expect("quiescing the destination writer must succeed"),
+    );
+    let before = tenant_tree_bytes(&tenant_path);
+    let missing_source = temp_dir.path().join("missing_import_source");
+
+    manager
+        .import_tenant(&tenant_id.to_string(), &missing_source)
+        .await
+        .expect_err("a missing import source must fail");
+
+    assert_eq!(
+        tenant_tree_bytes(&tenant_path),
+        before,
+        "a staging failure must leave the prior destination generation byte-for-byte intact"
+    );
+    assert_document_title(&manager, tenant_id, "existing", "existing destination");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn import_tenant_staging_does_not_block_the_async_runtime() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = Arc::new(IndexManager::new(temp_dir.path()));
+    let tenant_id = "import_staging_runtime_isolation";
+    let source = temp_dir.path().join("import_staging_source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("marker"), "staged").unwrap();
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered_tx = Arc::new(std::sync::Mutex::new(Some(entered_tx)));
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+    let hook_tenant = tenant_id.to_string();
+    let _hook = IndexManager::set_import_staging_proof_hook_for_test({
+        let entered_tx = Arc::clone(&entered_tx);
+        let release_rx = Arc::clone(&release_rx);
+        move |observed_tenant| {
+            if observed_tenant != hook_tenant {
+                return;
+            }
+            entered_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }
+    });
+
+    let watchdog_release = release_tx.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(2));
+        let _ = watchdog_release.send(());
+    });
+    let started_at = Instant::now();
+    let import_manager = Arc::clone(&manager);
+    let import_tenant = tenant_id.to_string();
+    let import_task =
+        tokio::spawn(async move { import_manager.import_tenant(&import_tenant, &source).await });
+
+    entered_rx
+        .await
+        .expect("blocking-pool import staging should reach the proof hook");
+    assert!(
+        started_at.elapsed() < Duration::from_secs(1),
+        "import staging blocked the current-thread Tokio runtime"
+    );
+    release_tx.send(()).unwrap();
+    import_task.await.unwrap().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(temp_dir.path().join(tenant_id).join("marker")).unwrap(),
+        "staged"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn delete_tenant_preserves_directory_when_quiesce_fails() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let tenant_id = "delete_quiesce_failure";
+
+    manager.create_tenant(tenant_id).unwrap();
+    if let Some((_, handle)) = manager.write_task_handles.remove(tenant_id) {
+        handle.abort();
+    }
+    manager.write_task_handles.insert(
+        tenant_id.to_string(),
+        WriteTaskHandle::new(tokio::spawn(async {
+            Err(FlapjackError::Tantivy(
+                "injected delete drain failure".to_string(),
+            ))
+        })),
+    );
+
+    let error = manager
+        .delete_tenant(&tenant_id.to_string())
+        .await
+        .expect_err("delete must abort before directory removal when quiesce fails");
+
+    assert!(
+        error.to_string().contains("injected delete drain failure"),
+        "delete must propagate the quiesce failure, got {error}"
+    );
+    assert!(
+        temp_dir.path().join(tenant_id).is_dir(),
+        "failed quiesce must leave the tenant directory intact"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn deleting_absent_tenant_does_not_leave_publication_fence_residue() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let tenant_id = "absent_delete_target";
+
+    let error = manager
+        .delete_tenant(&tenant_id.to_string())
+        .await
+        .expect_err("deleting an absent tenant must report TenantNotFound");
+    assert!(matches!(error, FlapjackError::TenantNotFound(_)));
+
+    let epoch_paths =
+        publication::publication_epoch_paths_for_target_path(&temp_dir.path().join(tenant_id));
+    assert!(
+        !epoch_paths.lock.exists(),
+        "an absent delete must not leave an epoch lock that poisons later publication repair"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(stage_4_manager_quiesce)]
+async fn index_deletion_and_replacement_quiesce_the_persistent_writer() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let budget = crate::index::get_global_budget();
+    let delete_target = "stage4_delete_target_quiesce";
+    let replace_target = "stage4_replace_target_quiesce";
+    let replace_source = "stage4_replace_source_quiesce";
+
+    manager.create_tenant(delete_target).unwrap();
+    manager
+        .add_documents_sync(
+            delete_target,
+            vec![write_queue_test_document("delete_seed", "delete seed")],
+        )
+        .await
+        .unwrap();
+    let delete_merge_wait_before = retained_channel_closed_count(delete_target);
+
+    manager
+        .delete_tenant(&delete_target.to_string())
+        .await
+        .unwrap();
+
+    assert_retained_channel_closed_delta(
+        delete_target,
+        delete_merge_wait_before,
+        "delete_tenant must close the persistent writer through merge quiescence",
+    );
+    assert_quiescence_before_publication(delete_target, "manager_delete_publication");
+    assert!(
+        !temp_dir.path().join(delete_target).exists(),
+        "delete_tenant must remove the destination tree"
+    );
+
+    for tenant_offset in 0..=budget.max_concurrent_writers() {
+        let tenant_id = format!("stage4_delete_readmit_{tenant_offset}");
+        manager.create_tenant(&tenant_id).unwrap();
+        manager
+            .add_documents_sync(
+                &tenant_id,
+                vec![write_queue_test_document(
+                    &format!("delete_readmit_doc_{tenant_offset}"),
+                    "readmission after delete",
+                )],
+            )
+            .await
+            .unwrap();
+        manager.delete_tenant(&tenant_id).await.unwrap();
+    }
+
+    manager.create_tenant(replace_target).unwrap();
+    manager.create_tenant(replace_source).unwrap();
+    manager
+        .add_documents_sync(
+            replace_target,
+            vec![write_queue_test_document(
+                "old_generation",
+                "old generation",
+            )],
+        )
+        .await
+        .unwrap();
+    manager
+        .add_documents_sync(
+            replace_source,
+            vec![write_queue_test_document(
+                "new_generation",
+                "new generation",
+            )],
+        )
+        .await
+        .unwrap();
+    let destination_version =
+        crate::index::version_store::VersionRecord::new(401, "shared-node", true, 17);
+    let source_version =
+        crate::index::version_store::VersionRecord::new(401, "shared-node", true, 2);
+    let source_only_version =
+        crate::index::version_store::VersionRecord::new(302, "source-node", true, 2);
+    let destination_older_version =
+        crate::index::version_store::VersionRecord::new(450, "source-wins", false, 55);
+    let source_newer_version =
+        crate::index::version_store::VersionRecord::new(451, "source-wins", true, 2);
+    {
+        let destination_store =
+            crate::index::version_store::VersionStore::open(&temp_dir.path().join(replace_target))
+                .unwrap();
+        assert!(destination_store
+            .upsert("replacement-version", &destination_version)
+            .unwrap());
+        assert!(destination_store
+            .upsert("source-newer-version", &destination_older_version)
+            .unwrap());
+        let source_store =
+            crate::index::version_store::VersionStore::open(&temp_dir.path().join(replace_source))
+                .unwrap();
+        assert!(source_store
+            .upsert("replacement-version", &source_version)
+            .unwrap());
+        assert!(source_store
+            .upsert("source-newer-version", &source_newer_version)
+            .unwrap());
+        assert!(source_store
+            .upsert("source-only-version", &source_only_version)
+            .unwrap());
+    }
+    let replacement_merge_wait_before = retained_channel_closed_count(replace_target);
+    let old_destination_files = tenant_managed_files(&manager, replace_target);
+    assert!(
+        !old_destination_files.is_empty(),
+        "replacement fixture must create destination segment files before publication"
+    );
+    let staging_baseline = manager
+        .capture_replacement_staging_baseline(replace_target)
+        .unwrap();
+    let publication = publication::PreStagedPublication::prepare(
+        temp_dir.path(),
+        publication::PublicationTarget::new(replace_target).unwrap(),
+    )
+    .unwrap();
+    let snapshot_bytes =
+        crate::index::snapshot::export_to_bytes(&temp_dir.path().join(replace_source)).unwrap();
+    crate::index::snapshot::import_from_bytes(&snapshot_bytes, &publication.paths().staging)
+        .unwrap();
+
+    manager
+        .replace_index_contents_from_pre_staged(publication, replace_target, staging_baseline)
+        .await
+        .unwrap();
+
+    assert_retained_channel_closed_delta(
+        replace_target,
+        replacement_merge_wait_before,
+        "replacement must drain and merge-quiesce the destination writer",
+    );
+    assert_quiescence_before_publication(replace_target, "manager_replace_publication");
+    assert_document_title(&manager, replace_target, "new_generation", "new generation");
+    assert!(
+        manager
+            .get_document(replace_target, "old_generation")
+            .unwrap()
+            .is_none(),
+        "replacement must remove destination generation documents"
+    );
+    assert_no_stale_destination_root_files(
+        &temp_dir.path().join(replace_target),
+        &old_destination_files,
+    );
+    let promoted_store =
+        crate::index::version_store::VersionStore::open(&temp_dir.path().join(replace_target))
+            .unwrap();
+    let promoted_watermark = std::fs::read_to_string(
+        temp_dir
+            .path()
+            .join(replace_target)
+            .join(crate::index::oplog::COMMITTED_SEQ_FILE),
+    )
+    .unwrap()
+    .parse::<u64>()
+    .unwrap();
+    assert_eq!(
+        promoted_store.get("replacement-version").unwrap(),
+        Some(destination_version),
+        "replacement must align the staged version store to the drained destination generation"
+    );
+    assert_eq!(
+        promoted_store.get("source-only-version").unwrap(),
+        Some(crate::index::version_store::VersionRecord::new(
+            source_only_version.timestamp_ms,
+            source_only_version.node_id,
+            source_only_version.tombstone,
+            promoted_watermark,
+        )),
+        "replacement must preserve staged-only rows with a destination-local sequence"
+    );
+    assert_eq!(
+        promoted_store.get("source-newer-version").unwrap(),
+        Some(crate::index::version_store::VersionRecord::new(
+            source_newer_version.timestamp_ms,
+            source_newer_version.node_id,
+            source_newer_version.tombstone,
+            promoted_watermark,
+        )),
+        "replacement must preserve staged-newer rows with a destination-local sequence"
+    );
 }
 
 #[tokio::test]
@@ -586,6 +1213,18 @@ async fn move_index_replaces_destination_and_preserves_complete_source_tree() {
     assert_eq!(
         std::fs::read_to_string(temp_dir.path().join("destination/committed_seq")).unwrap(),
         "41"
+    );
+    let moved_store =
+        crate::index::version_store::VersionStore::open(&temp_dir.path().join("destination"))
+            .unwrap();
+    assert_eq!(
+        moved_store.get("move-object").unwrap(),
+        Some(crate::index::version_store::VersionRecord::new(
+            41,
+            "source_marker",
+            false,
+            41,
+        ))
     );
     let search = manager
         .search("destination", "source", None, None, 10)
@@ -2362,6 +3001,383 @@ async fn failed_commit_does_not_change_searcher_count() {
     );
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FinalizationBoundarySpec {
+    name: &'static str,
+    fault_point: FinalizationFaultPoint,
+    expected_count_after_recovery: u64,
+}
+
+fn finalization_boundary_specs() -> [FinalizationBoundarySpec; 6] {
+    [
+        FinalizationBoundarySpec {
+            name: "b1_after_oplog_append_before_tantivy_commit",
+            fault_point: FinalizationFaultPoint::AfterOplogAppendBeforeTantivyCommit,
+            expected_count_after_recovery: 3,
+        },
+        FinalizationBoundarySpec {
+            name: "b2_after_tantivy_commit_before_version_receipts",
+            fault_point: FinalizationFaultPoint::AfterTantivyCommitBeforeVersionReceipts,
+            expected_count_after_recovery: 3,
+        },
+        FinalizationBoundarySpec {
+            name: "b3_inside_version_receipt_transaction",
+            fault_point: FinalizationFaultPoint::AfterFirstVersionReceiptStatement,
+            expected_count_after_recovery: 3,
+        },
+        FinalizationBoundarySpec {
+            name: "b4_after_version_transaction_before_committed_seq",
+            fault_point: FinalizationFaultPoint::AfterVersionTransactionBeforeCommittedSeq,
+            expected_count_after_recovery: 3,
+        },
+        FinalizationBoundarySpec {
+            name: "b5_after_committed_seq_before_oplog_truncation",
+            fault_point: FinalizationFaultPoint::AfterCommittedSeqBeforeOplogTruncation,
+            expected_count_after_recovery: 3,
+        },
+        FinalizationBoundarySpec {
+            name: "b6_after_oplog_truncation_before_admission_ack",
+            fault_point: FinalizationFaultPoint::AfterOplogTruncationBeforeAdmissionAck,
+            expected_count_after_recovery: 3,
+        },
+    ]
+}
+
+fn replicated_doc(object_id: &str, title: &str) -> Document {
+    write_queue_test_document(object_id, title)
+}
+
+fn assert_version_tuple(
+    manager: &IndexManager,
+    tenant_id: &str,
+    object_id: &str,
+    expected: &crate::index::version_store::VersionRecord,
+) {
+    assert_eq!(
+        manager.get_object_version(tenant_id, object_id).unwrap(),
+        Some(expected.clone()),
+        "{object_id} must retain the exact expected conflict tuple"
+    );
+}
+
+async fn create_failed_boundary_run(
+    temp_dir: &TempDir,
+    tenant_id: &str,
+    spec: FinalizationBoundarySpec,
+) -> FailedBoundaryRun {
+    let manager = IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+    manager.create_tenant(tenant_id).unwrap();
+    manager
+        .add_documents_sync(
+            tenant_id,
+            vec![write_queue_test_document("baseline", "published")],
+        )
+        .await
+        .unwrap();
+    assert_searcher_count(&manager, tenant_id, 1);
+
+    let _fault =
+        crate::index::write_queue::fail_next_finalization_for_test(tenant_id, spec.fault_point);
+    let task = manager
+        .admit_replicated_documents_durable_for_test(
+            tenant_id,
+            vec![
+                (
+                    replicated_doc("boundary-a", "first durable receipt"),
+                    ReplicatedWriteOrigin::new(10_000, "node-a".to_string()),
+                ),
+                (
+                    replicated_doc("boundary-b", "second durable receipt"),
+                    ReplicatedWriteOrigin::new(20_000, "node-b".to_string()),
+                ),
+            ],
+        )
+        .unwrap();
+    assert!(manager.wait_for_write_durable(&task.id).await.is_err());
+    let target_receipt_seq = manager
+        .get_oplog(tenant_id)
+        .unwrap()
+        .current_seq()
+        .checked_sub(1)
+        .expect("multi-receipt boundary batch must have a first target receipt");
+    FailedBoundaryRun {
+        manager,
+        task,
+        target_receipt_seq,
+    }
+}
+
+struct FailedBoundaryRun {
+    manager: Arc<IndexManager>,
+    task: TaskInfo,
+    target_receipt_seq: u64,
+}
+
+fn assert_failed_boundary_storage(
+    temp_dir: &TempDir,
+    tenant_id: &str,
+    spec: FinalizationBoundarySpec,
+    run: &FailedBoundaryRun,
+) {
+    assert!(!matches!(
+        run.manager.get_task(&run.task.id).unwrap().status,
+        TaskStatus::Succeeded
+    ));
+    assert_searcher_count(&run.manager, tenant_id, 1);
+    assert_eq!(tenant_admission_record_count(temp_dir.path(), tenant_id), 1);
+
+    if spec.fault_point == FinalizationFaultPoint::AfterFirstVersionReceiptStatement {
+        let store =
+            crate::index::version_store::VersionStore::open(&temp_dir.path().join(tenant_id))
+                .unwrap();
+        assert_eq!(store.get("boundary-a").unwrap(), None);
+        assert_eq!(store.get("boundary-b").unwrap(), None);
+        assert!(!store.contains_finalized_task(&run.task.id).unwrap());
+    }
+    let oldest_seq = run.manager.get_oplog(tenant_id).unwrap().oldest_seq();
+    if spec.fault_point == FinalizationFaultPoint::AfterCommittedSeqBeforeOplogTruncation {
+        assert!(oldest_seq.unwrap() <= run.target_receipt_seq);
+    }
+    if spec.fault_point == FinalizationFaultPoint::AfterOplogTruncationBeforeAdmissionAck {
+        assert!(oldest_seq.is_none_or(|oldest| oldest > run.target_receipt_seq));
+    }
+}
+
+async fn assert_failed_boundary_refuses_writes(
+    temp_dir: &TempDir,
+    tenant_id: &str,
+    spec: FinalizationBoundarySpec,
+    manager: &IndexManager,
+) {
+    let drained_worker_result = manager
+        .write_task_handles
+        .get(tenant_id)
+        .expect("failed durable batch must retain the tenant write worker handle to drain")
+        .drain(tenant_id.to_string())
+        .await;
+    assert!(drained_worker_result.is_err());
+    if matches!(
+        spec.fault_point,
+        FinalizationFaultPoint::AfterTantivyCommitBeforeVersionReceipts
+            | FinalizationFaultPoint::AfterFirstVersionReceiptStatement
+            | FinalizationFaultPoint::AfterVersionTransactionBeforeCommittedSeq
+            | FinalizationFaultPoint::AfterCommittedSeqBeforeOplogTruncation
+    ) {
+        let refused_write = manager.add_documents(
+            tenant_id,
+            vec![write_queue_test_document(
+                "must_wait_for_recovery",
+                "must not finalize on a failed worker",
+            )],
+        );
+        assert!(matches!(refused_write, Err(FlapjackError::QueueFull)));
+        assert_eq!(tenant_admission_record_count(temp_dir.path(), tenant_id), 1);
+    }
+    assert_searcher_count(manager, tenant_id, 1);
+}
+
+async fn assert_boundary_recovered(
+    temp_dir: &TempDir,
+    tenant_id: &str,
+    spec: FinalizationBoundarySpec,
+    target_receipt_seq: u64,
+) {
+    let restarted = IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+    restarted.get_or_load(tenant_id).unwrap();
+    assert_searcher_count(&restarted, tenant_id, spec.expected_count_after_recovery);
+    assert_version_tuple(
+        &restarted,
+        tenant_id,
+        "boundary-a",
+        &crate::index::version_store::VersionRecord::new(10_000, "node-a", false, 2),
+    );
+    assert_version_tuple(
+        &restarted,
+        tenant_id,
+        "boundary-b",
+        &crate::index::version_store::VersionRecord::new(20_000, "node-b", false, 3),
+    );
+    assert_eq!(tenant_admission_record_count(temp_dir.path(), tenant_id), 0);
+    if spec.fault_point == FinalizationFaultPoint::AfterCommittedSeqBeforeOplogTruncation {
+        restarted
+            .get_oplog(tenant_id)
+            .unwrap()
+            .rotate_segment_for_test()
+            .unwrap();
+        restarted
+            .add_documents_sync(
+                tenant_id,
+                vec![write_queue_test_document("b5_resume", "resumes truncation")],
+            )
+            .await
+            .unwrap();
+        let oldest_after_resume = restarted.get_oplog(tenant_id).unwrap().oldest_seq();
+        assert!(oldest_after_resume.is_none_or(|oldest| oldest > target_receipt_seq));
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(write_queue_commit_failure_hook)]
+async fn finalization_crash_boundaries_recover_without_early_success() {
+    let _retention_guard = TestEnvVarGuard::set("FLAPJACK_OPLOG_RETENTION", "0");
+    let covered_boundaries = finalization_boundary_specs();
+    assert_eq!(covered_boundaries.len(), 6, "six boundaries enumerated");
+
+    for spec in covered_boundaries {
+        let temp_dir = TempDir::new().unwrap();
+        let tenant_id = format!("finalization_boundary_{}", spec.name);
+        let run = create_failed_boundary_run(&temp_dir, &tenant_id, spec).await;
+        assert_failed_boundary_storage(&temp_dir, &tenant_id, spec, &run);
+        assert_failed_boundary_refuses_writes(&temp_dir, &tenant_id, spec, &run.manager).await;
+        run.manager.unload(&tenant_id).unwrap();
+        drop(run.manager);
+        assert_boundary_recovered(&temp_dir, &tenant_id, spec, run.target_receipt_seq).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(write_queue_commit_failure_hook)]
+async fn primary_b6_retry_preserves_committed_conflict_tuple() {
+    let _retention_guard = TestEnvVarGuard::set("FLAPJACK_OPLOG_RETENTION", "0");
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "primary_b6_retry";
+    let manager = IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+    manager.create_tenant(tenant_id).unwrap();
+
+    let _fault = crate::index::write_queue::fail_next_finalization_for_test(
+        tenant_id,
+        FinalizationFaultPoint::AfterOplogTruncationBeforeAdmissionAck,
+    );
+    let task = manager
+        .admit_documents_durable(
+            tenant_id,
+            vec![write_queue_test_document(
+                "primary-boundary",
+                "committed before acknowledgement",
+            )],
+        )
+        .unwrap();
+    assert!(manager.wait_for_write_durable(&task.id).await.is_err());
+
+    let committed_version = manager
+        .get_object_version(tenant_id, "primary-boundary")
+        .unwrap()
+        .expect("B6 must commit the primary version before failing");
+    let tenant_path = temp_dir.path().join(tenant_id);
+    assert!(
+        crate::index::version_store::VersionStore::open(&tenant_path)
+            .unwrap()
+            .contains_finalized_task(&task.id)
+            .unwrap(),
+        "B6 must retain durable task evidence until admission reconciliation"
+    );
+    assert_eq!(manager.tenant_doc_count(tenant_id), Some(0));
+    assert_eq!(tenant_admission_record_count(temp_dir.path(), tenant_id), 1);
+    std::thread::sleep(Duration::from_millis(2));
+
+    manager.unload(&tenant_id.to_string()).unwrap();
+    drop(manager);
+    let restarted = IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+    restarted.get_or_load(tenant_id).unwrap();
+
+    assert_eq!(restarted.tenant_doc_count(tenant_id), Some(1));
+    assert_eq!(
+        restarted
+            .get_object_version(tenant_id, "primary-boundary")
+            .unwrap(),
+        Some(committed_version),
+        "replaying the same admitted primary write must not mint a new conflict tuple"
+    );
+    assert_eq!(tenant_admission_record_count(temp_dir.path(), tenant_id), 0);
+    assert!(
+        !crate::index::version_store::VersionStore::open(&tenant_path)
+            .unwrap()
+            .contains_finalized_task(&task.id)
+            .unwrap(),
+        "reconciliation must reclaim transient finalized-task evidence"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn successful_finalization_prunes_transient_task_evidence() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "finalized_task_evidence_cleanup";
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+    let task = manager
+        .admit_documents_durable(
+            tenant_id,
+            vec![write_queue_test_document("cleanup", "success")],
+        )
+        .unwrap();
+
+    manager.wait_for_write_durable(&task.id).await.unwrap();
+
+    let store =
+        crate::index::version_store::VersionStore::open(&temp_dir.path().join(tenant_id)).unwrap();
+    assert!(!store.contains_finalized_task(&task.id).unwrap());
+    assert_eq!(tenant_admission_record_count(temp_dir.path(), tenant_id), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(flapjack_write_durable_timeout_env)]
+async fn post_commit_finalization_failure_keeps_admission_and_never_succeeds_task() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "failed_post_commit_finalization";
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+    let tenant_path = temp_dir.path().join(tenant_id);
+    let committed_seq_path = tenant_path.join("committed_seq");
+    assert!(std::fs::symlink_metadata(&committed_seq_path)
+        .unwrap()
+        .file_type()
+        .is_file());
+    std::fs::remove_file(&committed_seq_path).unwrap();
+    std::fs::create_dir(&committed_seq_path).unwrap();
+
+    let task = manager
+        .admit_documents_durable(
+            tenant_id,
+            vec![write_queue_test_document(
+                "committed_without_ack",
+                "sidecar failure after Tantivy commit",
+            )],
+        )
+        .unwrap();
+    let durable_result = manager.wait_for_write_durable(&task.id).await;
+
+    assert!(
+        durable_result.is_err(),
+        "a committed_seq publication failure must reach the durable caller"
+    );
+    assert!(
+        matches!(
+            manager.get_task(&task.id).map(|task| task.status),
+            Ok(TaskStatus::Failed(_))
+        ),
+        "partial finalization must never acknowledge the task as Succeeded"
+    );
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        1,
+        "partial finalization must retain the admission record for recovery"
+    );
+    assert_eq!(
+        manager.tenant_doc_count(tenant_id),
+        Some(0),
+        "search publication must wait until durable finalization completes"
+    );
+    assert_eq!(
+        crate::index::version_store::VersionStore::open(&tenant_path)
+            .unwrap()
+            .get("committed_without_ack")
+            .unwrap()
+            .map(|record| record.oplog_seq),
+        Some(1),
+        "the version transaction must complete before the injected sidecar failure"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn legacy_compact_admission_cleanup_failure_does_not_report_success() {
@@ -2425,7 +3441,6 @@ async fn recovery_phase_helpers_are_callable() {
     let ops = oplog.read_since(0).unwrap();
     let index = manager.get_or_load("recovery_helpers").unwrap();
 
-    manager.rebuild_lww_map("recovery_helpers", &oplog).unwrap();
     manager
         .replay_config_ops("recovery_helpers", &tenant_path, &ops)
         .unwrap();
@@ -2433,16 +3448,18 @@ async fn recovery_phase_helpers_are_callable() {
         .load_settings_after_config("recovery_helpers", &tenant_path)
         .unwrap();
     manager
-        .replay_document_ops(
-            "recovery_helpers",
-            &index,
-            &tenant_path,
-            &ops,
-            super::recovery::RecoverySeqWindow {
-                committed_seq: 0,
-                final_seq: ops.last().map(|entry| entry.seq).unwrap_or(0),
+        .recover_document_ops(
+            super::recovery::RecoveryDocumentContext {
+                tenant_id: "recovery_helpers",
+                index: &index,
+                tenant_path: &tenant_path,
+                seq_window: super::recovery::RecoverySeqWindow {
+                    committed_seq: 0,
+                    final_seq: ops.last().map(|entry| entry.seq).unwrap_or(0),
+                },
+                settings: settings.as_ref(),
             },
-            settings.as_ref(),
+            &ops,
         )
         .unwrap();
     #[cfg(feature = "vector-search")]
@@ -2472,6 +3489,41 @@ async fn replay_config_ops_surfaces_settings_write_failures() {
         result.is_err(),
         "settings replay should fail when tenant path does not exist"
     );
+}
+
+#[tokio::test]
+async fn synchronous_metadata_oplog_appends_advance_committed_seq() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let tenant_id = "metadata_committed_seq";
+    let tenant_path = temp_dir.path().join(tenant_id);
+    manager.create_tenant(tenant_id).unwrap();
+
+    for (op_type, payload) in [
+        (
+            "settings",
+            serde_json::json!({"searchableAttributes": ["title"]}),
+        ),
+        ("save_synonym", serde_json::json!({"objectID": "syn_1"})),
+        ("save_synonyms", serde_json::json!({"synonyms": []})),
+        ("delete_synonym", serde_json::json!({"objectID": "syn_1"})),
+        ("clear_synonyms", serde_json::json!({})),
+        ("save_rule", serde_json::json!({"objectID": "rule_1"})),
+        ("save_rules", serde_json::json!({"rules": []})),
+        ("delete_rule", serde_json::json!({"objectID": "rule_1"})),
+        ("clear_rules", serde_json::json!({})),
+    ] {
+        manager.append_oplog(tenant_id, op_type, payload);
+        let current_seq = manager
+            .get_or_create_oplog_result(tenant_id)
+            .unwrap()
+            .current_seq();
+        assert_eq!(
+            crate::index::oplog::read_committed_seq(&tenant_path),
+            current_seq,
+            "{op_type} is a synchronous metadata write and must advance committed_seq"
+        );
+    }
 }
 
 #[tokio::test]
@@ -4376,6 +5428,49 @@ async fn tenant_doc_count_returns_correct_count() {
 }
 
 #[tokio::test]
+async fn searcher_count_matches_insert_upsert_delete_compact_restart() {
+    let tmp = TempDir::new().unwrap();
+    let tenant_id = "searcher_count_lifecycle";
+    let manager = IndexManager::new(tmp.path());
+    manager.create_tenant(tenant_id).unwrap();
+
+    manager
+        .add_documents_insert_sync(
+            tenant_id,
+            vec![
+                write_queue_test_document("d1", "one"),
+                write_queue_test_document("d2", "two"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_searcher_count(&manager, tenant_id, 2);
+
+    manager
+        .add_documents_sync(
+            tenant_id,
+            vec![write_queue_test_document("d2", "two updated")],
+        )
+        .await
+        .unwrap();
+    assert_searcher_count(&manager, tenant_id, 2);
+
+    manager
+        .delete_documents_sync(tenant_id, vec!["d1".to_string()])
+        .await
+        .unwrap();
+    assert_searcher_count(&manager, tenant_id, 1);
+
+    manager.compact_index_sync(tenant_id).await.unwrap();
+    assert_searcher_count(&manager, tenant_id, 1);
+
+    manager.unload(&tenant_id.to_string()).unwrap();
+    assert_eq!(manager.tenant_doc_count(tenant_id), None);
+    manager.get_or_load(tenant_id).unwrap();
+    assert_searcher_count(&manager, tenant_id, 1);
+}
+
+#[tokio::test]
 async fn tenant_doc_count_returns_none_for_unloaded() {
     let tmp = TempDir::new().unwrap();
     let manager = IndexManager::new(tmp.path());
@@ -5743,7 +6838,7 @@ async fn import_tenant_rejects_path_traversal_tenant_ids() {
 
     let (escape_dir, bad_id) =
         TraversalEscapeDirGuard::new(&tmp, "escape_import_reject_path_traversal");
-    let result = manager.import_tenant(&bad_id, &src_path);
+    let result = manager.import_tenant(&bad_id, &src_path).await;
     assert!(result.is_err(), "import_tenant should reject traversal IDs");
     assert!(
         !escape_dir.path().exists(),
@@ -6580,4 +7675,328 @@ async fn test_decompound_isolation_no_cross_tenant_bleed() {
         "t1 search must use t1 decompound dictionary"
     );
     assert_eq!(result.documents[0].document.id, "d1");
+}
+
+/// A tenant quiesce must fence write admission for as long as the caller holds the
+/// quiesce guard. Without the fence, a write (or a read that loads the tenant)
+/// arriving after the write-queue sender is dropped spawns a replacement writer
+/// behind the drain, so export/delete/import would operate on a tenant that has a
+/// second live writer appending to it.
+#[tokio::test]
+async fn tenant_quiesce_fences_write_admission_until_the_guard_drops() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let tenant_id = "quiesce_admission_handoff".to_string();
+
+    manager.create_tenant(&tenant_id).unwrap();
+    manager
+        .add_documents_sync(
+            &tenant_id,
+            vec![write_queue_test_document("seed", "seed document")],
+        )
+        .await
+        .unwrap();
+    assert!(
+        manager.write_task_handles.contains_key(&tenant_id),
+        "seeded tenant must have a live persistent writer before quiesce"
+    );
+
+    let quiesce = manager.quiesce_tenant(&tenant_id).await.unwrap();
+
+    assert!(
+        !manager.write_task_handles.contains_key(&tenant_id),
+        "quiesce must retire the drained write worker"
+    );
+    let admission_error = manager
+        .add_documents(
+            &tenant_id,
+            vec![write_queue_test_document("racing", "racing write")],
+        )
+        .expect_err("write admission must be fenced while the tenant is quiesced");
+    assert!(
+        matches!(&admission_error, FlapjackError::IndexPaused(paused) if paused == &tenant_id),
+        "quiesced admission must be a retriable IndexPaused, got {admission_error:?}"
+    );
+    manager
+        .get_or_load(&tenant_id)
+        .expect("reads must still load a quiesced tenant");
+    assert!(
+        !manager.write_queues.contains_key(&tenant_id),
+        "no replacement write queue may be created while the tenant is quiesced"
+    );
+    assert!(
+        !manager.write_task_handles.contains_key(&tenant_id),
+        "no replacement write worker may race the quiesced tenant"
+    );
+
+    drop(quiesce);
+
+    manager
+        .add_documents_sync(
+            &tenant_id,
+            vec![write_queue_test_document("after", "after quiesce")],
+        )
+        .await
+        .expect("dropping the quiesce guard must re-open write admission");
+    assert!(
+        manager.write_task_handles.contains_key(&tenant_id),
+        "the first write after quiesce must create the replacement worker"
+    );
+    assert_eq!(
+        manager
+            .search(&tenant_id, "", None, None, 10)
+            .unwrap()
+            .total,
+        2,
+        "the replacement writer must append to the quiesced generation"
+    );
+}
+
+/// A tenant load that already passed the pre-fence check must not be able to
+/// publish a replacement write worker after quiesce has observed no live handles.
+#[tokio::test]
+async fn tenant_quiesce_retire_load_that_raced_the_fence() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = Arc::new(IndexManager::new(temp_dir.path()));
+    let tenant_id = "quiesce_load_handoff".to_string();
+
+    manager.create_tenant(&tenant_id).unwrap();
+    manager
+        .add_documents_sync(
+            &tenant_id,
+            vec![write_queue_test_document("seed", "seed document")],
+        )
+        .await
+        .unwrap();
+    let initial_quiesce = manager.quiesce_tenant(&tenant_id).await.unwrap();
+    drop(initial_quiesce);
+
+    let (load_reached_handoff_tx, load_reached_handoff_rx) = mpsc::channel();
+    let (release_load_tx, release_load_rx) = mpsc::channel();
+    let release_load_rx = std::sync::Mutex::new(release_load_rx);
+    let _hook = IndexManager::set_load_write_queue_checkpoint_hook_for_test({
+        let tenant_id = tenant_id.clone();
+        move |loaded_tenant| {
+            if loaded_tenant == tenant_id {
+                load_reached_handoff_tx.send(()).unwrap();
+                release_load_rx.lock().unwrap().recv().unwrap();
+            }
+        }
+    });
+
+    let loading_manager = Arc::clone(&manager);
+    let loading_tenant = tenant_id.clone();
+    let (load_result_tx, load_result_rx) = mpsc::channel();
+    let (release_load_runtime_tx, release_load_runtime_rx) = mpsc::channel();
+    let load_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _runtime_guard = runtime.enter();
+        let result = loading_manager.get_or_load(&loading_tenant);
+        load_result_tx.send(result).unwrap();
+        release_load_runtime_rx.recv().unwrap();
+    });
+
+    load_reached_handoff_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("load must pause after observing no publication fence");
+
+    let (quiesce_result_tx, quiesce_result_rx) = mpsc::channel();
+    let quiescing_manager = Arc::clone(&manager);
+    let quiescing_tenant = tenant_id.clone();
+    let quiesce_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(quiescing_manager.quiesce_tenant(&quiescing_tenant));
+        quiesce_result_tx.send(result).ok();
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    if quiesce_result_rx.try_recv().is_ok() {
+        release_load_tx.send(()).ok();
+        release_load_runtime_tx.send(()).ok();
+        load_thread.join().ok();
+        panic!("quiesce must wait for the load handoff that already observed no fence");
+    }
+
+    release_load_tx.send(()).unwrap();
+    load_result_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("load that raced the fence must finish")
+        .expect("load that raced the fence must still return the tenant index");
+    let quiesce = quiesce_result_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("quiesce must drain the worker created by the racing load")
+        .unwrap();
+    release_load_runtime_tx.send(()).unwrap();
+    load_thread.join().unwrap();
+    quiesce_thread.join().unwrap();
+
+    assert!(
+        !manager.write_queues.contains_key(&tenant_id),
+        "load that raced the fence must not leave a replacement queue behind the guard"
+    );
+    assert!(
+        !manager.write_task_handles.contains_key(&tenant_id),
+        "load that raced the fence must not leave a replacement worker behind the guard"
+    );
+
+    drop(_hook);
+    drop(quiesce);
+
+    manager
+        .add_documents_sync(
+            &tenant_id,
+            vec![write_queue_test_document("after", "after quiesce")],
+        )
+        .await
+        .expect("admission must re-open after the quiesce guard drops");
+    assert!(
+        manager.write_task_handles.contains_key(&tenant_id),
+        "first post-quiesce write must create the replacement worker"
+    );
+}
+
+#[tokio::test]
+async fn tenant_quiesce_does_not_cache_a_fenced_load() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let tenant_id = "quiesce_fenced_load_cache".to_string();
+
+    manager.create_tenant(&tenant_id).unwrap();
+    manager
+        .add_documents_sync(
+            &tenant_id,
+            vec![write_queue_test_document("before", "before publication")],
+        )
+        .await
+        .unwrap();
+
+    let quiesce = manager.quiesce_tenant(&tenant_id).await.unwrap();
+    assert!(
+        !manager.loaded.contains_key(&tenant_id),
+        "quiesce must clear the pre-publication cached generation"
+    );
+
+    let _loaded_during_quiesce = manager
+        .get_or_load(&tenant_id)
+        .expect("reads must remain available while publication is fenced");
+    assert_eq!(
+        manager
+            .search(&tenant_id, "", None, None, 10)
+            .unwrap()
+            .total,
+        1,
+        "the fenced read must still observe the on-disk generation"
+    );
+    assert!(
+        !manager.loaded.contains_key(&tenant_id),
+        "a fenced read must not republish the pre-publication index into the cache"
+    );
+
+    drop(quiesce);
+}
+
+#[cfg(feature = "vector-search")]
+#[tokio::test]
+async fn tenant_quiesce_fenced_load_publishes_read_only_vector_runtime() {
+    use usearch::ffi::MetricKind;
+
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "quiesce_fenced_load_vectors".to_string();
+    let tenant_path = temp_dir.path().join(&tenant_id);
+
+    std::fs::create_dir_all(&tenant_path).unwrap();
+    let schema = crate::index::schema::Schema::builder().build();
+    let _index = crate::index::Index::create(&tenant_path, schema).unwrap();
+    let settings = crate::index::settings::IndexSettings {
+        embedders: Some(HashMap::from([(
+            "default".to_string(),
+            serde_json::json!({
+                "source": "userProvided",
+                "dimensions": 3
+            }),
+        )])),
+        ..Default::default()
+    };
+    settings.save(tenant_path.join("settings.json")).unwrap();
+    let mut vectors = crate::vector::index::VectorIndex::new(3, MetricKind::Cos).unwrap();
+    vectors.add("before", &[1.0, 0.0, 0.0]).unwrap();
+    vectors.save(&tenant_path.join("vectors")).unwrap();
+
+    let manager = IndexManager::new(temp_dir.path());
+    let quiesce = manager.quiesce_tenant(&tenant_id).await.unwrap();
+
+    let _loaded_during_quiesce = manager
+        .get_or_load(&tenant_id)
+        .expect("reads must still load a quiesced tenant");
+    assert!(
+        !manager.loaded.contains_key(&tenant_id),
+        "the fenced load must not publish the pre-publication Tantivy index"
+    );
+    let vector_index = manager
+        .get_vector_index(&tenant_id)
+        .expect("fenced loads must still publish read-only vector runtime");
+    let vector_guard = vector_index.read().unwrap();
+    assert_eq!(vector_guard.len(), 1);
+    let results = vector_guard.search(&[1.0, 0.0, 0.0], 1).unwrap();
+    assert_eq!(results[0].doc_id, "before");
+    drop(vector_guard);
+
+    drop(quiesce);
+    assert!(
+        manager.get_vector_index(&tenant_id).is_none(),
+        "vector runtime loaded during quiesce must not survive after admission reopens"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(publication_epoch_open_lock_file_checkpoint_hook)]
+async fn tenant_quiesce_fence_acquisition_does_not_block_async_runtime() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = Arc::new(IndexManager::new(temp_dir.path()));
+    let tenant_id = "quiesce_blocking_fence".to_string();
+    let expected_lock_path = temp_dir
+        .path()
+        .join(".publication/quiesce_blocking_fence/epoch.lock");
+
+    manager.create_tenant(&tenant_id).unwrap();
+    let (entered_lock_open_tx, entered_lock_open_rx) = mpsc::channel();
+    let (release_lock_open_tx, release_lock_open_rx) = mpsc::channel();
+    let release_lock_open_rx = std::sync::Mutex::new(release_lock_open_rx);
+    let _hook = publication::set_publication_epoch_open_lock_file_checkpoint_hook_for_test(
+        move |lock_path| {
+            if lock_path == expected_lock_path {
+                entered_lock_open_tx.send(()).unwrap();
+                release_lock_open_rx.lock().unwrap().recv().unwrap();
+            }
+        },
+    );
+    let release_thread = std::thread::spawn(move || {
+        entered_lock_open_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("quiesce must reach epoch.lock acquisition");
+        std::thread::sleep(Duration::from_millis(200));
+        release_lock_open_tx.send(()).unwrap();
+    });
+
+    let quiescing_manager = Arc::clone(&manager);
+    let quiescing_tenant = tenant_id.clone();
+    let quiesce_task =
+        tokio::spawn(async move { quiescing_manager.quiesce_tenant(&quiescing_tenant).await });
+    let started = Instant::now();
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        started.elapsed() < Duration::from_millis(150),
+        "contended quiesce fence acquisition must not block the async runtime"
+    );
+
+    let quiesce = quiesce_task.await.unwrap().unwrap();
+    drop(quiesce);
+    release_thread.join().unwrap();
 }

@@ -23,7 +23,7 @@ const AUTOHEAL_ENABLED_ENV: &str = "FLAPJACK_AUTOHEAL_ENABLED";
 pub(crate) async fn auto_restore_from_s3(
     data_dir: &str,
     s3_config: &flapjack::index::s3::S3Config,
-    _manager: &std::sync::Arc<flapjack::IndexManager>,
+    manager: &std::sync::Arc<flapjack::IndexManager>,
 ) {
     let data_path = std::path::Path::new(data_dir);
     let has_tenants = has_visible_tenant_dirs(data_path).unwrap_or(false);
@@ -39,7 +39,7 @@ pub(crate) async fn auto_restore_from_s3(
     };
 
     for tid in &tenant_ids {
-        restore_tenant_from_s3(s3_config, tid, data_path).await;
+        restore_tenant_from_s3(manager, s3_config, tid).await;
     }
 }
 
@@ -107,9 +107,9 @@ fn extract_s3_snapshot_tenant_id(prefix: &str) -> Option<String> {
 /// Downloads and imports the latest S3 snapshot for a tenant during startup,
 /// logging errors but not failing the boot sequence.
 async fn restore_tenant_from_s3(
+    manager: &Arc<flapjack::IndexManager>,
     s3_config: &flapjack::index::s3::S3Config,
     tid: &str,
-    data_path: &std::path::Path,
 ) {
     if !is_path_safe_snapshot_tenant_id(tid) {
         return;
@@ -118,14 +118,15 @@ async fn restore_tenant_from_s3(
     let Some((key, data)) = download_latest_tenant_snapshot(s3_config, tid).await else {
         return;
     };
-    if import_tenant_snapshot(tid, data_path, &data).is_none() {
+    let data_len = data.len();
+    if import_tenant_snapshot(manager, tid, data).await.is_none() {
         return;
     }
     tracing::info!(
         "S3 auto-restore: restored {} from {} ({} bytes)",
         tid,
         key,
-        data.len()
+        data_len
     );
 }
 
@@ -150,12 +151,20 @@ async fn download_latest_tenant_snapshot(
     }
 }
 
-fn import_tenant_snapshot(tid: &str, data_path: &std::path::Path, data: &[u8]) -> Option<()> {
-    let index_path = data_path.join(tid);
-    match flapjack::index::snapshot::import_from_bytes(data, &index_path) {
+async fn import_tenant_snapshot(
+    manager: &Arc<flapjack::IndexManager>,
+    tid: &str,
+    data: Vec<u8>,
+) -> Option<()> {
+    match crate::startup_catchup::restore_snapshot_bytes(manager, tid, data).await {
         Ok(()) => Some(()),
-        Err(error) => {
-            tracing::error!("S3 auto-restore: failed to import {}: {}", tid, error);
+        Err((step, error)) => {
+            tracing::error!(
+                "S3 auto-restore: failed to install {} at {}: {}",
+                tid,
+                step.as_tag(),
+                error
+            );
             None
         }
     }
@@ -165,7 +174,7 @@ fn import_tenant_snapshot(tid: &str, data_path: &std::path::Path, data: &[u8]) -
 pub(crate) async fn scheduled_s3_backups(
     data_dir: String,
     s3_config: flapjack::index::s3::S3Config,
-    _manager: std::sync::Arc<flapjack::IndexManager>,
+    manager: std::sync::Arc<flapjack::IndexManager>,
     interval_secs: u64,
 ) {
     let data_path = std::path::PathBuf::from(data_dir);
@@ -173,13 +182,14 @@ pub(crate) async fn scheduled_s3_backups(
     interval.tick().await;
     loop {
         interval.tick().await;
-        run_scheduled_s3_backup_pass(&s3_config, data_path.as_path()).await;
+        run_scheduled_s3_backup_pass(&manager, &s3_config, data_path.as_path()).await;
     }
 }
 
 /// Runs a single scheduled S3 backup pass: iterates all tenant directories and
 /// uploads a fresh snapshot for each to the configured S3 bucket.
 async fn run_scheduled_s3_backup_pass(
+    manager: &Arc<flapjack::IndexManager>,
     s3_config: &flapjack::index::s3::S3Config,
     data_path: &std::path::Path,
 ) {
@@ -194,7 +204,7 @@ async fn run_scheduled_s3_backup_pass(
     };
 
     for tenant in &tenant_dirs {
-        backup_tenant_to_s3(s3_config, tenant, data_path).await;
+        backup_tenant_to_s3(manager, s3_config, tenant, data_path).await;
     }
 
     tracing::info!(
@@ -205,11 +215,12 @@ async fn run_scheduled_s3_backup_pass(
 
 /// Backs up a single tenant's index data to S3 via snapshot.
 async fn backup_tenant_to_s3(
+    manager: &Arc<flapjack::IndexManager>,
     s3_config: &flapjack::index::s3::S3Config,
     tenant: &str,
     data_path: &std::path::Path,
 ) {
-    let bytes = match export_tenant_snapshot(tenant, data_path) {
+    let bytes = match export_tenant_snapshot(manager, tenant, data_path).await {
         Some(b) => b,
         None => return,
     };
@@ -222,12 +233,35 @@ async fn backup_tenant_to_s3(
     }
 }
 
-fn export_tenant_snapshot(tenant: &str, data_path: &std::path::Path) -> Option<Vec<u8>> {
+async fn export_tenant_snapshot(
+    manager: &Arc<flapjack::IndexManager>,
+    tenant: &str,
+    data_path: &std::path::Path,
+) -> Option<Vec<u8>> {
+    // Drain and merge-quiesce any live writer so the scheduled backup captures a
+    // quiesced generation, then run the blocking gzip/tar export off the async
+    // worker pool through the shared byte seam.
+    let _quiesce = match manager.quiesce_tenant(&tenant.to_string()).await {
+        Ok(quiesce) => quiesce,
+        Err(error) => {
+            tracing::error!("[BACKUP] quiesce {} failed: {}", tenant, error);
+            return None;
+        }
+    };
     let index_path = data_path.join(tenant);
-    match flapjack::index::snapshot::export_to_bytes(&index_path) {
-        Ok(b) => Some(b),
-        Err(e) => {
+    let tenant_owned = tenant.to_string();
+    match tokio::task::spawn_blocking(move || {
+        crate::snapshot_byte_ops::export_snapshot_bytes(&index_path, &tenant_owned)
+    })
+    .await
+    {
+        Ok(Ok(b)) => Some(b),
+        Ok(Err(e)) => {
             tracing::error!("[BACKUP] export {} failed: {}", tenant, e);
+            None
+        }
+        Err(join_error) => {
+            tracing::error!("[BACKUP] export {} task failed: {}", tenant, join_error);
             None
         }
     }
@@ -473,6 +507,50 @@ fn discover_rollup_indexes(analytics_config: &flapjack::analytics::AnalyticsConf
     indexes.sort();
     indexes.dedup();
     indexes
+}
+
+#[cfg(test)]
+mod snapshot_restore_tests {
+    use super::import_tenant_snapshot;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn s3_auto_restore_rejects_foreign_tenant_snapshot_without_live_residue() {
+        let source_tmp = TempDir::new().unwrap();
+        let source_manager = flapjack::IndexManager::new(source_tmp.path());
+        source_manager.create_tenant("foreign_source").unwrap();
+        source_manager
+            .add_documents_sync(
+                "foreign_source",
+                vec![flapjack::types::Document::from_json(&serde_json::json!({
+                    "objectID": "foreign_doc",
+                    "title": "foreign generation"
+                }))
+                .unwrap()],
+            )
+            .await
+            .unwrap();
+        source_manager.graceful_shutdown().await;
+        let snapshot = flapjack::index::snapshot::export_to_bytes(
+            &source_manager.base_path.join("foreign_source"),
+        )
+        .unwrap();
+
+        let destination_tmp = TempDir::new().unwrap();
+        let destination_manager = Arc::new(flapjack::IndexManager::new(destination_tmp.path()));
+
+        assert!(
+            import_tenant_snapshot(&destination_manager, "expected_target", snapshot)
+            .await
+            .is_none(),
+            "auto-restore must reject a snapshot whose retained tenant identity does not match the S3 prefix"
+        );
+        assert!(
+            !destination_tmp.path().join("expected_target").exists(),
+            "a rejected S3 snapshot must not leave a partial live tenant tree"
+        );
+    }
 }
 
 /// Spawns a periodic S3 snapshot backup task for all tenants.

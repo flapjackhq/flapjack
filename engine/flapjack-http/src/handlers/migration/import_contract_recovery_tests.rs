@@ -1,9 +1,11 @@
 use super::*;
+use crate::dto::SearchRequest;
 use crate::handlers::migration::spool::{
     AsyncMigrationPublicationSemantic, MigrationImportOutcome, MigrationImportWarning,
 };
 use flapjack::index::manager::publication::{
-    PreStagedPublication, PublicationPhase, PublicationTarget, PublicationTargetDisposition,
+    PreStagedPublication, PublicationFaultPoint, PublicationPhase, PublicationScanAction,
+    PublicationTarget, PublicationTargetDisposition,
 };
 use flapjack::index::settings::IndexSettings;
 use flapjack::types::Document;
@@ -11,6 +13,32 @@ use flapjack::types::Document;
 type SharedAppState = Arc<crate::handlers::AppState>;
 type ReplacementDocument = (&'static str, &'static str, &'static str, &'static str);
 type ReplacementDocuments = [ReplacementDocument; 3];
+type BulkReplaceDocument = (&'static str, &'static str, &'static str, i64);
+
+const BULK_REPLACE_TARGET: &str = "stage4_bulk_replace_target";
+const BULK_REPLACE_SOURCE: &str = "stage4_bulk_replace_source";
+const BULK_REPLACE_OLD: &[BulkReplaceDocument] = &[
+    ("old-rank-1", "old bulk generation", "old", 100),
+    ("old-rank-2", "old bulk generation", "old", 10),
+];
+const BULK_REPLACE_NEW: &[BulkReplaceDocument] = &[
+    ("new-rank-1", "new bulk generation", "new", 100),
+    ("new-rank-2", "new bulk generation", "new", 20),
+    ("new-rank-3", "new bulk generation", "new", 10),
+];
+
+struct InterruptedBulkReplace {
+    tmp: TempDir,
+    job_uuid: uuid::Uuid,
+    transaction_id: flapjack::index::manager::publication::PublicationTransactionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicBulkGeneration {
+    count: usize,
+    rank_1_object_id: String,
+    generation: String,
+}
 
 struct InterruptedPrivacyScrub {
     tmp: TempDir,
@@ -516,7 +544,7 @@ async fn async_recovery_removes_committed_job_owned_primary_and_replica_sidecars
 }
 
 #[tokio::test]
-async fn async_recovery_fails_closed_on_mismatched_publication_transaction() {
+async fn replacement_recovery_accepts_stale_clean_report_for_old_generation() {
     let tmp = TempDir::new().unwrap();
     let state = TestStateBuilder::new(&tmp).build_shared();
     create_committed_target_publication(
@@ -536,21 +564,19 @@ async fn async_recovery_fails_closed_on_mismatched_publication_transaction() {
     .await;
     let before = directory_snapshot(&state.manager.base_path.join("mismatch_primary"));
 
-    let error = state
+    state
         .migration_runner
         .recover_async_jobs_before_serve(&reports)
         .await
-        .expect_err("mismatched ownership evidence must stop startup recovery");
+        .expect("stale clean report describes the old replacement generation");
 
-    assert!(error.contains("mismatch_primary"));
-    assert!(error.contains("publication transaction mismatch"));
     assert!(state.manager.base_path.join("mismatch_primary").exists());
     let phase = spool.read_migration_phase(job_uuid).unwrap();
-    assert_eq!(phase.disposition, MigrationDisposition::Running);
-    assert!(phase.terminal_at.is_none());
+    assert_eq!(phase.disposition, MigrationDisposition::Failed);
+    assert!(phase.terminal_at.is_some());
     assert!(
-        transaction_namespace.exists(),
-        "mismatched replacement recovery must not delete the job-owned staging transaction"
+        !transaction_namespace.exists(),
+        "replacement recovery must delete the interrupted job-owned staging transaction"
     );
     assert_eq!(
         directory_snapshot(&state.manager.base_path.join("mismatch_primary")),
@@ -563,6 +589,116 @@ async fn async_recovery_fails_closed_on_mismatched_publication_transaction() {
         ASYNC_REPLACE_INITIAL_DOCUMENTS,
     )
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replace_crash_before_activation_preserves_old_index() {
+    for fault in [
+        PublicationFaultPoint::BeforeStagingDigest,
+        PublicationFaultPoint::DuringPrepareJournalWrite,
+    ] {
+        let interrupted = interrupt_bulk_replace_at(fault, Some(BULK_REPLACE_OLD)).await;
+        let restart_state = restart_bulk_replace_state(&interrupted.tmp);
+        let reports = repair_publications(&restart_state);
+        recover_jobs(&restart_state, &reports).await;
+
+        assert_eq!(
+            public_bulk_generation(&restart_state).await,
+            expected_bulk_generation(BULK_REPLACE_OLD),
+            "{fault:?} must preserve the old public generation after recovery"
+        );
+        assert_no_replacement_transaction_residue(
+            &restart_state,
+            BULK_REPLACE_TARGET,
+            &interrupted.transaction_id,
+        );
+        let spool = spool_for_state(&restart_state);
+        assert_terminal_phase(&spool, interrupted.job_uuid, MigrationDisposition::Failed);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replace_crash_after_intent_recovers_one_complete_generation() {
+    for fault in [
+        PublicationFaultPoint::AfterPrepareJournal,
+        PublicationFaultPoint::BeforeCommitJournal,
+        PublicationFaultPoint::AfterCommitJournalRename,
+    ] {
+        let interrupted = interrupt_bulk_replace_at(fault, None).await;
+        let restart_state = restart_bulk_replace_state(&interrupted.tmp);
+        let reports = repair_publications(&restart_state);
+        assert_repair_report_matches_checkpoint(&reports, fault);
+        recover_jobs(&restart_state, &reports).await;
+
+        let observed = public_bulk_generation(&restart_state).await;
+        assert!(
+            observed == expected_bulk_generation(BULK_REPLACE_OLD)
+                || observed == expected_bulk_generation(BULK_REPLACE_NEW),
+            "{fault:?} recovered partial or mismatched generation: {observed:?}"
+        );
+        assert_ne!(
+            observed.count,
+            BULK_REPLACE_OLD.len() + BULK_REPLACE_NEW.len(),
+            "{fault:?} must never expose an old-plus-new union"
+        );
+        assert_no_replacement_transaction_residue(
+            &restart_state,
+            BULK_REPLACE_TARGET,
+            &interrupted.transaction_id,
+        );
+        let spool = spool_for_state(&restart_state);
+        let phase =
+            assert_terminal_phase(&spool, interrupted.job_uuid, MigrationDisposition::Failed);
+        assert_eq!(
+            phase.import_outcome, None,
+            "{fault:?} failed recovery must not fabricate a successful import outcome"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replace_ack_implies_exact_count_after_restart() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    seed_bulk_replace_generation(&state, BULK_REPLACE_OLD).await;
+    let job_uuid = submit_bulk_replace_import(&state, ImportTestHooks::default()).await;
+    wait_for_terminal_phase(&state, job_uuid, MigrationDisposition::Succeeded).await;
+    wait_for_active_count(&state, 0).await;
+
+    assert_eq!(
+        public_bulk_generation(&state).await,
+        expected_bulk_generation(BULK_REPLACE_NEW),
+        "observable ACK must follow exact replacement activation"
+    );
+    let spool = spool_for_state(&state);
+    let phase = assert_terminal_phase(&spool, job_uuid, MigrationDisposition::Succeeded);
+    let outcome = phase
+        .import_outcome
+        .expect("successful ACK must persist activated response counts");
+    assert!(outcome.settings_applied);
+    assert_eq!(outcome.synonyms_imported, 0);
+    assert_eq!(outcome.rules_imported, 0);
+    let metadata = spool.read_async_migration_metadata(job_uuid).unwrap();
+    assert_eq!(
+        metadata.publication_semantic,
+        AsyncMigrationPublicationSemantic::ReplaceExisting
+    );
+    assert!(metadata.publication_transaction_id.is_some());
+    assert!(metadata.expected_publication_generation.is_some());
+    drop(spool);
+    drop(state);
+
+    let restart_state = restart_bulk_replace_state(&tmp);
+    let reports = repair_publications(&restart_state);
+    recover_jobs(&restart_state, &reports).await;
+
+    assert_eq!(
+        public_bulk_generation(&restart_state).await,
+        expected_bulk_generation(BULK_REPLACE_NEW),
+        "restart after ACK must reopen exactly the acknowledged replacement generation"
+    );
+    let restart_spool = spool_for_state(&restart_state);
+    assert_terminal_phase(&restart_spool, job_uuid, MigrationDisposition::Succeeded);
 }
 
 async fn assert_uncommitted_replacement_recovery(
@@ -700,6 +836,270 @@ async fn assert_async_replacement_exact_state(
             ))
             .collect::<Vec<_>>()
     );
+}
+
+async fn interrupt_bulk_replace_at(
+    fault: PublicationFaultPoint,
+    expected_after_crash: Option<&[BulkReplaceDocument]>,
+) -> InterruptedBulkReplace {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    seed_bulk_replace_generation(&state, BULK_REPLACE_OLD).await;
+    let before_activation_state = Arc::clone(&state);
+    let hooks = ImportTestHooks::default()
+        .with_before_activation(move || {
+            assert_eq!(
+                public_bulk_generation_sync(&before_activation_state),
+                expected_bulk_generation(BULK_REPLACE_OLD),
+                "{fault:?} pre-activation hook must still see the old public generation"
+            );
+        })
+        .with_replacement_publication_fault(fault);
+    let job_uuid = uuid::Uuid::new_v4();
+    let spool = spool_for_state(&state);
+    spool
+        .create_async_migration_admission(
+            job_uuid,
+            BULK_REPLACE_TARGET,
+            AsyncMigrationPublicationSemantic::ReplaceExisting,
+        )
+        .unwrap();
+    let staging_baseline = state
+        .manager
+        .capture_replacement_staging_baseline(BULK_REPLACE_TARGET)
+        .unwrap();
+    let import_manager = Arc::clone(&state.manager);
+    let mut reader = bulk_replace_source_reader();
+    let import_task = tokio::spawn(async move {
+        crate::handlers::migration::import::import_from_admitted_source_with_test_hooks(
+            &import_manager,
+            job_uuid,
+            BULK_REPLACE_TARGET.to_string(),
+            crate::handlers::migration::MigrationPublicationMode::ReplaceExisting {
+                staging_baseline,
+            },
+            &mut reader,
+            hooks,
+        )
+        .await
+    });
+    let crash = import_task
+        .await
+        .expect_err("simulated crash must panic before migration settlement");
+    assert!(
+        crash.is_panic(),
+        "{fault:?} fixture must bypass normal async failure settlement"
+    );
+
+    if let Some(expected_documents) = expected_after_crash {
+        assert_eq!(
+            public_bulk_generation(&state).await,
+            expected_bulk_generation(expected_documents),
+            "{fault:?} must preserve the expected public generation before restart"
+        );
+    }
+    let phase = spool.read_migration_phase(job_uuid).unwrap();
+    assert_eq!(
+        phase.disposition,
+        MigrationDisposition::Running,
+        "{fault:?} crash fixture must preserve a durable running replacement job"
+    );
+    assert!(
+        phase.terminal_at.is_none(),
+        "{fault:?} crash fixture must not settle the job before restart recovery"
+    );
+    let metadata = spool.read_async_migration_metadata(job_uuid).unwrap();
+    assert_eq!(
+        metadata.publication_semantic,
+        AsyncMigrationPublicationSemantic::ReplaceExisting
+    );
+    assert!(metadata.expected_publication_generation.is_some());
+    let transaction_id = metadata
+        .publication_transaction_id
+        .expect("publication transaction must be recorded before activation");
+    drop(spool);
+    drop(state);
+
+    InterruptedBulkReplace {
+        tmp,
+        job_uuid,
+        transaction_id,
+    }
+}
+
+async fn submit_bulk_replace_import(state: &SharedAppState, hooks: ImportTestHooks) -> uuid::Uuid {
+    let request = MigrateFromAlgoliaRequest {
+        target_index: Some(BULK_REPLACE_TARGET.to_string()),
+        source_index: BULK_REPLACE_SOURCE.to_string(),
+        overwrite: true,
+        ..valid_request()
+    };
+    state
+        .migration_runner
+        .submit_algolia_import_with_test_hooks(request, |_| Ok(bulk_replace_source_reader()), hooks)
+        .await
+        .expect("overwrite=true async replacement should be admitted")
+        .0
+}
+
+async fn seed_bulk_replace_generation(state: &SharedAppState, documents: &[BulkReplaceDocument]) {
+    state.manager.create_tenant(BULK_REPLACE_TARGET).unwrap();
+    write_bulk_replace_settings(&state.manager.base_path.join(BULK_REPLACE_TARGET));
+    state
+        .manager
+        .add_documents_durable(BULK_REPLACE_TARGET, bulk_replace_documents(documents))
+        .await
+        .unwrap();
+    state
+        .manager
+        .unload(&BULK_REPLACE_TARGET.to_string())
+        .unwrap();
+}
+
+fn bulk_replace_source_reader() -> ScriptedSourceReader {
+    hermetic_source_reader_with_settings_and_pages(
+        bulk_replace_settings_json(),
+        vec![bulk_replace_document_values(BULK_REPLACE_NEW)],
+    )
+}
+
+fn bulk_replace_documents(documents: &[BulkReplaceDocument]) -> Vec<Document> {
+    documents
+        .iter()
+        .map(|(object_id, title, generation, rank)| {
+            Document::from_json(&json!({
+                "objectID": object_id,
+                "title": title,
+                "generation": generation,
+                "rank": rank,
+            }))
+            .unwrap()
+        })
+        .collect()
+}
+
+fn bulk_replace_document_values(documents: &[BulkReplaceDocument]) -> Vec<serde_json::Value> {
+    documents
+        .iter()
+        .map(|(object_id, title, generation, rank)| {
+            json!({
+                "objectID": object_id,
+                "title": title,
+                "generation": generation,
+                "rank": rank,
+            })
+        })
+        .collect()
+}
+
+fn write_bulk_replace_settings(index_path: &std::path::Path) {
+    let settings: IndexSettings = serde_json::from_value(bulk_replace_settings_json()).unwrap();
+    settings.save(index_path.join("settings.json")).unwrap();
+}
+
+fn bulk_replace_settings_json() -> serde_json::Value {
+    json!({
+        "searchableAttributes": ["title"],
+        "ranking": ["custom"],
+        "customRanking": ["desc(rank)"],
+        "attributesForFaceting": ["generation"],
+    })
+}
+
+async fn public_bulk_generation(state: &SharedAppState) -> PublicBulkGeneration {
+    let Json(search_response) = crate::handlers::search::search_single(
+        State(Arc::clone(state)),
+        BULK_REPLACE_TARGET.to_string(),
+        SearchRequest {
+            query: String::new(),
+            hits_per_page: Some(10),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("bulk replacement target should be queryable");
+    let hits = search_response["hits"].as_array().unwrap();
+    PublicBulkGeneration {
+        count: search_response["nbHits"].as_u64().unwrap() as usize,
+        rank_1_object_id: hits[0]["objectID"].as_str().unwrap().to_string(),
+        generation: hits[0]["generation"].as_str().unwrap().to_string(),
+    }
+}
+
+fn public_bulk_generation_sync(state: &SharedAppState) -> PublicBulkGeneration {
+    let result = state
+        .manager
+        .search(BULK_REPLACE_TARGET, "", None, None, 10)
+        .expect("bulk replacement target should be queryable");
+    let first = result
+        .documents
+        .first()
+        .expect("bulk replacement target should contain at least one hit");
+    let generation = first
+        .document
+        .fields
+        .get("generation")
+        .and_then(|value| value.as_text())
+        .expect("rank-1 hit should contain a text generation")
+        .to_string();
+    PublicBulkGeneration {
+        count: result.total,
+        rank_1_object_id: first.document.id.clone(),
+        generation,
+    }
+}
+
+fn expected_bulk_generation(documents: &[BulkReplaceDocument]) -> PublicBulkGeneration {
+    let (rank_1_object_id, _, generation, _) = documents
+        .iter()
+        .max_by_key(|(_, _, _, rank)| *rank)
+        .unwrap();
+    PublicBulkGeneration {
+        count: documents.len(),
+        rank_1_object_id: (*rank_1_object_id).to_string(),
+        generation: (*generation).to_string(),
+    }
+}
+
+fn restart_bulk_replace_state(tmp: &TempDir) -> SharedAppState {
+    TestStateBuilder::new(tmp).build_shared()
+}
+
+fn assert_no_replacement_transaction_residue(
+    state: &SharedAppState,
+    target_index: &str,
+    transaction_id: &flapjack::index::manager::publication::PublicationTransactionId,
+) {
+    let target = PublicationTarget::new(target_index).unwrap();
+    let paths = flapjack::index::manager::publication::PublicationPaths::new(
+        &state.manager.base_path,
+        &target,
+        transaction_id,
+    );
+    assert!(!paths.staging.exists(), "staging residue must be removed");
+    assert!(!paths.backup.exists(), "backup residue must be removed");
+}
+
+fn assert_repair_report_matches_checkpoint(
+    reports: &[flapjack::index::manager::publication::PublicationRepairReport],
+    fault: PublicationFaultPoint,
+) {
+    let report = reports
+        .iter()
+        .find(|report| report.target.as_str() == BULK_REPLACE_TARGET)
+        .unwrap_or_else(|| panic!("{fault:?} must produce a target-scoped repair report"));
+    assert_eq!(report.disposition, PublicationTargetDisposition::Loadable);
+    assert!(
+        matches!(
+            report.action,
+            PublicationScanAction::Clean | PublicationScanAction::Repaired(_)
+        ),
+        "{fault:?} must classify to a loadable clean or repaired target: {:?}",
+        report.action
+    );
+    if matches!(report.phase, Some(PublicationPhase::Committed)) {
+        assert!(report.transaction_id.is_some());
+    }
 }
 
 fn async_replacement_documents(documents: ReplacementDocuments) -> Vec<Document> {
@@ -850,6 +1250,7 @@ async fn create_committed_async_job(
 fn recovery_import_outcome() -> MigrationImportOutcome {
     MigrationImportOutcome {
         settings_applied: true,
+        objects_imported: 0,
         synonyms_imported: 1,
         rules_imported: 0,
         warnings: vec![MigrationImportWarning {
@@ -974,6 +1375,9 @@ async fn populate_staging_index_with_documents(
         .await
         .unwrap();
     manager.unload(&staging_tenant.to_string()).unwrap();
+    manager
+        .scrub_transient_runtime_artifacts(staging_tenant)
+        .unwrap();
 }
 
 fn write_replica_sidecar(state: &SharedAppState, replica_name: &str, primary_name: &str) {

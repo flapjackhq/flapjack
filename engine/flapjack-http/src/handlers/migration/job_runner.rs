@@ -29,6 +29,8 @@ pub struct MigrationJobRunner {
     replication_manager: Option<Arc<ReplicationManager>>,
     capacity: Arc<Semaphore>,
     active: Arc<DashMap<Uuid, JoinHandle<()>>>,
+    #[cfg(test)]
+    bulk_replace_test_hooks: Arc<std::sync::Mutex<super::bulk_build::BulkBuildTestHooks>>,
 }
 
 impl MigrationJobRunner {
@@ -42,7 +44,74 @@ impl MigrationJobRunner {
             replication_manager,
             capacity: Arc::new(Semaphore::new(capacity)),
             active: Arc::new(DashMap::new()),
+            #[cfg(test)]
+            bulk_replace_test_hooks: Arc::new(std::sync::Mutex::new(Default::default())),
         }
+    }
+
+    pub(super) fn acquire_bulk_replace_permit(
+        &self,
+    ) -> Result<OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+        self.capacity.clone().try_acquire_owned()
+    }
+
+    pub(super) fn spawn_bulk_replace(
+        &self,
+        job_uuid: Uuid,
+        target_index: String,
+        publication_mode: MigrationPublicationMode,
+        permit: OwnedSemaphorePermit,
+    ) {
+        let manager = Arc::clone(&self.manager);
+        let monitor_manager = Arc::clone(&self.manager);
+        let active = Arc::clone(&self.active);
+        #[cfg(test)]
+        let test_hooks = self.bulk_replace_test_hooks.lock().unwrap().clone();
+        let (published, published_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            super::bulk_replace::run_bulk_replace(
+                &manager,
+                job_uuid,
+                target_index,
+                publication_mode,
+                #[cfg(test)]
+                test_hooks,
+            )
+            .await
+        });
+        let monitor = tokio::spawn(async move {
+            let task_result = task.await;
+            if !matches!(&task_result, Ok(Ok(()))) {
+                tracing::error!(%job_uuid, result = ?task_result, "async bulk replacement failed");
+                if let Ok(spool) = import::spool_for_manager(&monitor_manager) {
+                    if spool.cancel_requested(job_uuid).unwrap_or(false) {
+                        let _ = spool.cancel_migration(job_uuid);
+                    } else {
+                        let _ = spool.fail_migration(job_uuid);
+                    }
+                }
+            }
+            drop(permit);
+            let _ = published_rx.await;
+            active.remove(&job_uuid);
+        });
+        self.active.insert(job_uuid, monitor);
+        let _ = published.send(());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_bulk_replace_prepublication_hook_for_test(
+        &self,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) {
+        let hooks =
+            super::bulk_build::BulkBuildTestHooks::default().with_event_hook(move |event| {
+                if event == super::bulk_build::BulkBuildTestEvent::PrepublicationValidationStarting
+                {
+                    hook();
+                }
+            });
+        *self.bulk_replace_test_hooks.lock().unwrap() = hooks;
     }
 
     /// Admit and spawn an async Algolia import, returning the durable admission
@@ -96,7 +165,7 @@ impl MigrationJobRunner {
                 authenticated_app_id.as_deref(),
                 publication_semantic,
             )
-            .map_err(import::spool_error)?;
+            .map_err(super::spool_error)?;
 
         self.spawn_import(
             job_uuid,
@@ -160,7 +229,7 @@ impl MigrationJobRunner {
                 authenticated_app_id.as_deref(),
                 publication_semantic,
             )
-            .map_err(import::spool_error)?;
+            .map_err(super::spool_error)?;
 
         self.spawn_import_with_hooks(
             job_uuid,
@@ -387,14 +456,19 @@ impl MigrationJobRunner {
         };
         if let Some(report) = publication_report_for_target(metadata, publication_reports) {
             if report.transaction_id.as_ref() == Some(transaction_id)
-                && report_is_committed_loadable(report)
+                && report_is_journaled_loadable(report)
             {
                 spool
                     .fail_migration(job_uuid)
                     .map_err(recovery_spool_error)?;
                 return Ok(());
             }
-            if report.transaction_id.is_some() {
+            if report
+                .transaction_id
+                .as_ref()
+                .is_some_and(|id| id != transaction_id)
+                && !report_is_committed_loadable(report)
+            {
                 return Err(publication_transaction_mismatch(metadata, job_uuid));
             }
         }
@@ -538,6 +612,10 @@ fn proven_committed_report<'a>(
 fn report_is_committed_loadable(report: &PublicationRepairReport) -> bool {
     report.disposition == PublicationTargetDisposition::Loadable
         && report.phase == Some(PublicationPhase::Committed)
+}
+
+fn report_is_journaled_loadable(report: &PublicationRepairReport) -> bool {
+    report.disposition == PublicationTargetDisposition::Loadable && report.phase.is_some()
 }
 
 fn publication_report_for_target<'a>(

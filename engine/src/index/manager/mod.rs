@@ -8,8 +8,10 @@ use crate::index::task_queue::TaskQueue;
 use crate::index::utils::copy_dir_recursive;
 use crate::index::write_queue::{
     admission::{WriteAdmissionRecord, WriteAdmissionStore, WriteAdmissionTicket},
-    create_write_queue, VectorWriteContext, WriteAction, WriteOp, WriteQueue, WriteQueueContext,
+    create_write_queue, ReplicatedWriteOrigin, VectorWriteContext, WriteAction, WriteOp,
+    WriteQueue, WriteQueueCancellation, WriteQueueContext,
 };
+use crate::index::BulkBuildWriterConfig;
 use crate::index::Index;
 use crate::query::algolia_filters::{
     facet_filters_to_ast, numeric_filters_to_ast, parse_optional_filters_grouped,
@@ -46,6 +48,7 @@ pub(crate) struct WriteTaskHandle {
 struct WriteTaskHandleInner {
     state: std::sync::Mutex<WriteTaskHandleState>,
     completion: tokio::sync::Notify,
+    cancellation: Option<WriteQueueCancellation>,
 }
 
 enum WriteTaskHandleState {
@@ -55,18 +58,40 @@ enum WriteTaskHandleState {
 }
 
 impl WriteTaskHandle {
+    #[cfg(test)]
     pub(crate) fn new(handle: JoinHandle<Result<()>>) -> Self {
         Self {
             inner: Arc::new(WriteTaskHandleInner {
                 state: std::sync::Mutex::new(WriteTaskHandleState::Running(handle)),
                 completion: tokio::sync::Notify::new(),
+                cancellation: None,
+            }),
+        }
+    }
+
+    pub(crate) fn new_with_cancellation(
+        handle: JoinHandle<Result<()>>,
+        cancellation: WriteQueueCancellation,
+    ) -> Self {
+        Self {
+            inner: Arc::new(WriteTaskHandleInner {
+                state: std::sync::Mutex::new(WriteTaskHandleState::Running(handle)),
+                completion: tokio::sync::Notify::new(),
+                cancellation: Some(cancellation),
             }),
         }
     }
 
     pub(crate) fn abort(&self) {
+        if let Some(cancellation) = &self.inner.cancellation {
+            // Dedicated write workers stop at the next write-loop event
+            // boundary after committing any work already inside commit_batch.
+            cancellation.cancel();
+        }
         if let WriteTaskHandleState::Running(handle) = &*self.inner.state.lock().unwrap() {
-            handle.abort();
+            if self.inner.cancellation.is_none() {
+                handle.abort();
+            }
         }
     }
 
@@ -116,6 +141,21 @@ fn write_queue_drain_error(tenant_id: &str, error: impl std::fmt::Display) -> Fl
     FlapjackError::Tantivy(format!(
         "destination write queue drain failed for {tenant_id}: {error}"
     ))
+}
+
+fn is_synchronous_metadata_oplog_op(op_type: &str) -> bool {
+    matches!(
+        op_type,
+        "settings"
+            | "save_synonym"
+            | "save_synonyms"
+            | "delete_synonym"
+            | "clear_synonyms"
+            | "save_rule"
+            | "save_rules"
+            | "delete_rule"
+            | "clear_rules"
+    )
 }
 
 /// Validate that a tenant/index name is safe for use as a filesystem path component.
@@ -189,10 +229,6 @@ pub struct IndexManager {
     synonyms_cache: DashMap<TenantId, Arc<SynonymStore>>,
     pub facet_cache: super::FacetCacheMap,
     pub facet_cache_cap: std::sync::atomic::AtomicUsize,
-    /// LWW (last-writer-wins) tracking for replicated ops.
-    /// Maps tenant_id -> (object_id -> (timestamp_ms, node_id)).
-    /// Shared with write_queue so primary writes also populate LWW state.
-    pub(crate) lww_map: super::LwwMap,
     /// Vector indices per tenant. Uses std::sync::RwLock (not tokio) because
     /// vector search is called from spawn_blocking. Read lock for search,
     /// write lock for add/remove (stage 7). Wrapped in Arc for sharing with
@@ -203,12 +239,14 @@ pub struct IndexManager {
     /// Optional dictionary manager for custom stopwords/plurals/compounds in the query pipeline.
     dictionary_manager: OnceLock<Arc<crate::dictionaries::manager::DictionaryManager>>,
     analytics_config: OnceLock<crate::analytics::AnalyticsConfig>,
+    bulk_build_writer_config: BulkBuildWriterConfig,
 }
 
 const DEFAULT_FACET_CACHE_CAP: usize = 500;
 
 mod config;
 mod lifecycle;
+pub use lifecycle::TenantQuiesce;
 #[cfg(test)]
 mod lifecycle_move_tests;
 pub mod publication;
@@ -247,6 +285,18 @@ impl IndexManager {
         base_path: P,
         node_id: S,
     ) -> Arc<Self> {
+        Self::new_with_node_id_and_bulk_build_config(
+            base_path,
+            node_id,
+            BulkBuildWriterConfig::default(),
+        )
+    }
+
+    fn new_with_node_id_and_bulk_build_config<P: AsRef<Path>, S: Into<String>>(
+        base_path: P,
+        node_id: S,
+        bulk_build_writer_config: BulkBuildWriterConfig,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|weak| {
             let tasks = Arc::new(DashMap::new());
             IndexManager {
@@ -265,13 +315,29 @@ impl IndexManager {
                 synonyms_cache: DashMap::new(),
                 facet_cache: Arc::new(DashMap::new()),
                 facet_cache_cap: std::sync::atomic::AtomicUsize::new(DEFAULT_FACET_CACHE_CAP),
-                lww_map: Arc::new(DashMap::new()),
                 #[cfg(feature = "vector-search")]
                 vector_indices: Arc::new(DashMap::new()),
                 dictionary_manager: OnceLock::new(),
                 analytics_config: OnceLock::new(),
+                bulk_build_writer_config,
             }
         })
+    }
+
+    /// Create an IndexManager for bulk-build staging with bulk-only writer sizing.
+    pub fn new_for_bulk_build<P: AsRef<Path>>(
+        base_path: P,
+        config: BulkBuildWriterConfig,
+    ) -> Arc<Self> {
+        Self::new_with_node_id_and_bulk_build_config(
+            base_path,
+            crate::index::configured_node_id(),
+            config,
+        )
+    }
+
+    pub(crate) fn write_queue_writer_buffer_size(&self) -> usize {
+        self.bulk_build_writer_config.writer_buffer_size
     }
 
     /// Set the dictionary manager for custom stopwords/plurals/compounds support.
@@ -304,21 +370,36 @@ impl IndexManager {
         self.oplogs.get(tenant_id).map(|r| Arc::clone(&r))
     }
 
-    /// Get the LWW (last-writer-wins) state for a specific document.
-    /// Returns (timestamp_ms, node_id) of the highest-priority op seen so far, or None.
-    pub fn get_lww(&self, tenant_id: &str, object_id: &str) -> Option<(u64, String)> {
-        self.lww_map
-            .get(tenant_id)
-            .and_then(|m| m.get(object_id).map(|v| v.clone()))
+    /// Read the committed conflict version for one tenant object.
+    pub fn get_object_version(
+        &self,
+        tenant_id: &str,
+        object_id: &str,
+    ) -> Result<Option<crate::index::version_store::VersionRecord>> {
+        validate_index_name(tenant_id)?;
+        crate::index::version_store::VersionStore::open(&self.base_path.join(tenant_id))?
+            .get(object_id)
+            .map_err(Into::into)
     }
 
-    /// Record that an op for (tenant_id, object_id) with the given (timestamp_ms, node_id)
-    /// was applied. Used by apply_ops_to_manager to track LWW state.
-    pub fn record_lww(&self, tenant_id: &str, object_id: &str, ts: u64, node_id: String) {
-        self.lww_map
-            .entry(tenant_id.to_string())
-            .or_default()
-            .insert(object_id.to_string(), (ts, node_id));
+    /// Arm one tenant's next write-queue commit to fail.
+    ///
+    /// This control exists only in explicit fault-injection builds.
+    #[cfg(feature = "fault-injection")]
+    pub fn fail_next_commit_for_test(&self, tenant_id: &str) -> impl Drop {
+        crate::index::write_queue::fail_next_commit_for_test(tenant_id)
+    }
+
+    /// Arm one tenant's next write-queue finalization boundary to fail.
+    ///
+    /// This control exists only in explicit fault-injection builds.
+    #[cfg(feature = "fault-injection")]
+    pub fn fail_next_finalization_for_test(
+        &self,
+        tenant_id: &str,
+        fault_point: crate::index::write_queue::FinalizationFaultPoint,
+    ) -> impl Drop {
+        crate::index::write_queue::fail_next_finalization_for_test(tenant_id, fault_point)
     }
 
     pub fn get_task(&self, task_id: &str) -> Result<TaskInfo> {
@@ -489,11 +570,7 @@ impl IndexManager {
             }
         };
         self.recover_from_oplog(tenant_id, &index, &path)?;
-        #[cfg(feature = "vector-search")]
-        self.load_vector_index(tenant_id, &path);
-        self.get_or_create_write_queue(tenant_id, &index)?;
-        let loaded_index = self.cache_loaded_index(tenant_id, index);
-        Ok(loaded_index)
+        self.publish_loaded_runtime_state_if_unfenced(tenant_id, index)
     }
 
     /// Get the number of loaded indexes.
@@ -512,6 +589,20 @@ impl IndexManager {
         }
         let path = self.base_path.join(tenant_id);
         crate::index::storage_size::dir_size_bytes(&path).unwrap_or(0)
+    }
+
+    /// Remove writer-local control artifacts that must not enter publication manifests.
+    pub fn scrub_transient_runtime_artifacts(&self, tenant_id: &str) -> Result<()> {
+        validate_index_name(tenant_id)?;
+        let pause_artifact = crate::index::write_queue::backpressure::pause_artifact_path(
+            &self.base_path,
+            tenant_id,
+        );
+        match std::fs::remove_file(&pause_artifact) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Return the document count for a loaded tenant's index.
@@ -625,8 +716,21 @@ impl IndexManager {
 
     pub fn append_oplog(&self, tenant_id: &str, op_type: &str, payload: serde_json::Value) {
         if let Some(ol) = self.get_or_create_oplog(tenant_id) {
-            if let Err(e) = ol.append(op_type, payload) {
-                tracing::error!("[OPLOG {}] append failed: {}", tenant_id, e);
+            match ol.append(op_type, payload) {
+                Ok(seq) if is_synchronous_metadata_oplog_op(op_type) => {
+                    if let Err(error) = write_committed_seq(&self.base_path.join(tenant_id), seq) {
+                        tracing::error!(
+                            "[OPLOG {}] committed_seq advance failed after {} append: {}",
+                            tenant_id,
+                            op_type,
+                            error
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!("[OPLOG {}] append failed: {}", tenant_id, e);
+                }
             }
         }
     }

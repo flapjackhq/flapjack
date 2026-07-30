@@ -15,6 +15,78 @@ fail() {
 LOADTEST_AUTH_HEADERS=()
 COUNT_POLL_INTERVAL_SECONDS=0.05
 
+liveness_distribution_rejects_one_fast_probe_and_one_five_second_stall() (
+  local fixture_dir
+  local fast_output
+  fixture_dir="$(mktemp -d)"
+  trap 'rm -rf "$fixture_dir"' EXIT
+
+  printf 'health\tok\t10\ncount\tok\t20\nhealth\tok\t30\ncount\tok\t40\n' \
+    >"$fixture_dir/fast.tsv"
+  fast_output="$(liveness_distribution "$fixture_dir/fast.tsv" 250 5000)" || {
+    fail "all-fast liveness distribution must pass: $fast_output"
+  }
+  [[ "$fast_output" == *"endpoint=health samples=2 p99_ms=30 max_ms=30 verdict=pass"* ]] || {
+    fail "health evidence must report the exact fast distribution: $fast_output"
+  }
+  [[ "$fast_output" == *"endpoint=count samples=2 p99_ms=40 max_ms=40 verdict=pass"* ]] || {
+    fail "count evidence must report the exact fast distribution: $fast_output"
+  }
+  if liveness_distribution "$fixture_dir/missing.tsv" 250 5000 >/dev/null 2>&1; then
+    fail "an unreadable sample file must fail closed"
+  fi
+  if liveness_distribution "$fixture_dir/fast.tsv" invalid 5000 >/dev/null 2>&1; then
+    fail "a nonnumeric p99 limit must fail closed"
+  fi
+  if liveness_distribution "$fixture_dir/fast.tsv" 250 0 >/dev/null 2>&1; then
+    fail "a nonpositive stall limit must fail closed"
+  fi
+
+  printf 'health\tok\t10\ncount\tok\t20\nhealth\ttimeout\t5000\n' \
+    >"$fixture_dir/stall.tsv"
+  if liveness_distribution "$fixture_dir/stall.tsv" 250 5000 >/dev/null 2>&1; then
+    fail "one five-second stall must fail the liveness distribution"
+  fi
+
+  printf 'health\tok\t5000\ncount\tok\t20\n' >"$fixture_dir/ok_at_stall_limit.tsv"
+  printf 'health\tok\t251\ncount\tok\t20\n' >"$fixture_dir/p99_over_limit.tsv"
+  printf 'health\ttimeout\t20\ncount\tok\t20\n' >"$fixture_dir/timeout_without_stall.tsv"
+  : >"$fixture_dir/empty.tsv"
+  printf 'health\tok\t10\n' >"$fixture_dir/missing_endpoint.tsv"
+  printf 'search\tok\t10\ncount\tok\t20\n' >"$fixture_dir/unknown_endpoint.tsv"
+  printf 'health\tok\t10\ncount\tunknown\t20\n' >"$fixture_dir/unknown_status.tsv"
+  printf 'health\tok\t10\textra\ncount\tok\t20\n' >"$fixture_dir/malformed.tsv"
+  printf 'health\tok\tfast\ncount\tok\t20\n' >"$fixture_dir/nonnumeric.tsv"
+
+  local invalid_fixture
+  for invalid_fixture in \
+    ok_at_stall_limit \
+    p99_over_limit \
+    timeout_without_stall \
+    empty \
+    missing_endpoint \
+    unknown_endpoint \
+    unknown_status \
+    malformed \
+    nonnumeric; do
+    if liveness_distribution "$fixture_dir/${invalid_fixture}.tsv" 250 5000 \
+      >/dev/null 2>&1; then
+      fail "invalid liveness distribution unexpectedly passed: $invalid_fixture"
+    fi
+  done
+
+  printf '%s\n' "$fast_output"
+)
+
+liveness_case_failed=0
+liveness_case_output=""
+echo "RUN: liveness_distribution_rejects_one_fast_probe_and_one_five_second_stall"
+if ! liveness_case_output="$(
+  liveness_distribution_rejects_one_fast_probe_and_one_five_second_stall 2>&1
+)"; then
+  liveness_case_failed=1
+fi
+
 fixed_count() {
   printf '0\n'
 }
@@ -98,4 +170,9 @@ fi
   fail "missing-sentinel failure must explain the rank-1 contract: $sentinel_output"
 }
 
+if ((liveness_case_failed)); then
+  fail "liveness_distribution_rejects_one_fast_probe_and_one_five_second_stall: $liveness_case_output"
+fi
+
+printf '%s\n' "$liveness_case_output"
 echo "PASS: liveness uses the live usage gauge and fails against malformed, fixed-count, and missing-sentinel controls"

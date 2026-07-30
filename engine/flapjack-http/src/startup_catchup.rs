@@ -287,7 +287,10 @@ async fn restore_tenant_from_snapshot(
         }
     };
 
-    if let Err((step, error)) = install_snapshot_bytes(&state.manager, tenant_id, &snapshot_bytes) {
+    let snapshot_len = snapshot_bytes.len();
+    if let Err((step, error)) =
+        restore_snapshot_bytes(&state.manager, tenant_id, snapshot_bytes).await
+    {
         return Err(format!(
             "[{}] failed to install snapshot for tenant '{}' at step '{}': {}",
             log_prefix,
@@ -301,7 +304,7 @@ async fn restore_tenant_from_snapshot(
         "[{}] Restored tenant '{}' from peer snapshot ({} bytes)",
         log_prefix,
         tenant_id,
-        snapshot_bytes.len()
+        snapshot_len
     );
     Ok(())
 }
@@ -371,11 +374,21 @@ impl SnapshotInstallStep {
 /// missing state. The renames at lines 325/336 use a bounded retry loop to
 /// absorb transient `EBUSY`/`ENOTEMPTY` from concurrent `unload_tenant` /
 /// lingering file handles.
+#[cfg(test)]
 pub(crate) fn install_snapshot_bytes(
     manager: &flapjack::IndexManager,
     tenant_id: &str,
     snapshot_bytes: &[u8],
 ) -> Result<(), (SnapshotInstallStep, String)> {
+    let publication = stage_snapshot_bytes(manager, tenant_id, snapshot_bytes)?;
+    activate_snapshot_publication(manager, tenant_id, publication)
+}
+
+fn stage_snapshot_bytes(
+    manager: &flapjack::IndexManager,
+    tenant_id: &str,
+    snapshot_bytes: &[u8],
+) -> Result<PreStagedPublication, (SnapshotInstallStep, String)> {
     validate_tenant_id(tenant_id)
         .map_err(|error| (SnapshotInstallStep::ValidateTenantId, error))?;
     let repair = manager
@@ -407,13 +420,119 @@ pub(crate) fn install_snapshot_bytes(
         let _ = publication.abort();
         return Err((SnapshotInstallStep::ValidateSnapshotTenantContent, error));
     }
+    Ok(publication)
+}
 
-    unload_for_snapshot_publication(manager, tenant_id)?;
+fn activate_snapshot_publication(
+    manager: &flapjack::IndexManager,
+    tenant_id: &str,
+    publication: PreStagedPublication,
+) -> Result<(), (SnapshotInstallStep, String)> {
+    // The destination writer is quiesced by `restore_snapshot_bytes` before this
+    // synchronous install runs, so the drain is no longer masqueraded by an
+    // `unload` here — the `snapshot_restore_publication` checkpoint is reached
+    // only after that manager-owned merge-quiescent drain.
+    #[cfg(debug_assertions)]
+    flapjack::index::write_queue::record_writer_lifecycle_publication_checkpoint(
+        tenant_id,
+        "snapshot_restore_publication",
+    );
     let activation = publication
         .activate()
         .map_err(|error| (snapshot_activation_step(error.stage()), error.to_string()));
     unload_for_snapshot_publication(manager, tenant_id)?;
     activation.map(|_| ())
+}
+
+/// Stage and validate a snapshot off the async runtime, quiesce its destination,
+/// then activate the staged generation off the async runtime.
+///
+/// An existing destination is fenced before repair and staging because its live
+/// writer must not race recovery. An absent destination is staged first so an
+/// invalid archive cannot leave a lock-only publication namespace; it is always
+/// fenced before activation, so a concurrent first write is drained before the
+/// staged generation replaces the tree. This is the single async restore entry
+/// point for HTTP import, S3 restore, and replication startup catchup.
+pub(crate) async fn restore_snapshot_bytes(
+    manager: &Arc<flapjack::IndexManager>,
+    tenant_id: &str,
+    snapshot_bytes: Vec<u8>,
+) -> Result<(), (SnapshotInstallStep, String)> {
+    let (_quiesce, publication) =
+        prepare_snapshot_restore(manager, tenant_id, snapshot_bytes).await?;
+
+    let manager = Arc::clone(manager);
+    let tenant = tenant_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        activate_snapshot_publication(&manager, &tenant, publication)
+    })
+    .await
+    .map_err(|join_error| {
+        (
+            SnapshotInstallStep::RenameStagingToTenant,
+            join_error.to_string(),
+        )
+    })?
+}
+
+async fn prepare_snapshot_restore(
+    manager: &Arc<flapjack::IndexManager>,
+    tenant_id: &str,
+    snapshot_bytes: Vec<u8>,
+) -> Result<
+    (
+        flapjack::index::manager::TenantQuiesce,
+        PreStagedPublication,
+    ),
+    (SnapshotInstallStep, String),
+> {
+    validate_tenant_id(tenant_id)
+        .map_err(|error| (SnapshotInstallStep::ValidateTenantId, error))?;
+    if manager.base_path.join(tenant_id).exists() {
+        let quiesce = quiesce_snapshot_destination(manager, tenant_id).await?;
+        let publication =
+            stage_snapshot_bytes_off_runtime(manager, tenant_id, snapshot_bytes).await?;
+        return Ok((quiesce, publication));
+    }
+
+    let publication = stage_snapshot_bytes_off_runtime(manager, tenant_id, snapshot_bytes).await?;
+    match quiesce_snapshot_destination(manager, tenant_id).await {
+        Ok(quiesce) => Ok((quiesce, publication)),
+        Err(error) => {
+            abort_staged_snapshot(publication).await;
+            Err(error)
+        }
+    }
+}
+
+async fn stage_snapshot_bytes_off_runtime(
+    manager: &Arc<flapjack::IndexManager>,
+    tenant_id: &str,
+    snapshot_bytes: Vec<u8>,
+) -> Result<PreStagedPublication, (SnapshotInstallStep, String)> {
+    let manager = Arc::clone(manager);
+    let tenant = tenant_id.to_string();
+    tokio::task::spawn_blocking(move || stage_snapshot_bytes(&manager, &tenant, &snapshot_bytes))
+        .await
+        .map_err(|join_error| (SnapshotInstallStep::ImportExtract, join_error.to_string()))?
+}
+
+async fn quiesce_snapshot_destination(
+    manager: &Arc<flapjack::IndexManager>,
+    tenant_id: &str,
+) -> Result<flapjack::index::manager::TenantQuiesce, (SnapshotInstallStep, String)> {
+    manager
+        .quiesce_tenant(&tenant_id.to_string())
+        .await
+        .map_err(|error| (SnapshotInstallStep::RecoverInterrupted, error.to_string()))
+}
+
+async fn abort_staged_snapshot(publication: PreStagedPublication) {
+    match tokio::task::spawn_blocking(move || publication.abort()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::error!("snapshot staging cleanup failed: {error}"),
+        Err(error) => tracing::error!("snapshot staging cleanup task failed: {error}"),
+    }
 }
 
 fn snapshot_repair_step(error: &flapjack::FlapjackError) -> SnapshotInstallStep {
@@ -719,7 +838,10 @@ async fn apply_and_log_ops(
 
 #[cfg(test)]
 mod tests {
-    use super::{install_snapshot_bytes, parse_strict_bootstrap_override, retention_gap_detected};
+    use super::{
+        install_snapshot_bytes, parse_strict_bootstrap_override, prepare_snapshot_restore,
+        retention_gap_detected,
+    };
     use crate::handlers::AppState;
     use axum::{extract::State, routing::get, routing::post, Json, Router};
     use flapjack::index::snapshot::export_to_bytes;
@@ -737,6 +859,44 @@ mod tests {
         Directory,
         File(Vec<u8>),
         Symlink(PathBuf),
+    }
+
+    #[tokio::test]
+    async fn absent_snapshot_destination_is_fenced_before_installation() {
+        let tenant_id = "absent_restore_admission_fence";
+        let source_tmp = TempDir::new().unwrap();
+        let source_manager = flapjack::IndexManager::new(source_tmp.path());
+        source_manager.create_tenant(tenant_id).unwrap();
+        source_manager
+            .add_documents_sync(
+                tenant_id,
+                vec![flapjack::types::Document::from_json(&serde_json::json!({
+                    "objectID": "snapshot_doc",
+                    "title": "snapshot generation"
+                }))
+                .unwrap()],
+            )
+            .await
+            .unwrap();
+        let snapshot_bytes = export_to_bytes(&source_manager.base_path.join(tenant_id)).unwrap();
+
+        let destination_tmp = TempDir::new().unwrap();
+        let manager = Arc::new(flapjack::IndexManager::new(destination_tmp.path()));
+        let (quiesce, publication) = prepare_snapshot_restore(&manager, tenant_id, snapshot_bytes)
+            .await
+            .expect("an absent destination should still acquire an admission fence");
+        let target =
+            flapjack::index::manager::publication::PublicationTarget::new(tenant_id).unwrap();
+
+        assert!(
+            flapjack::index::manager::publication::publication_admission_is_fenced(
+                &manager.base_path,
+                &target,
+            ),
+            "snapshot activation must fence a concurrent first write even when the tenant tree is initially absent"
+        );
+        publication.abort().unwrap();
+        drop(quiesce);
     }
 
     fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, SnapshotTreeEntry> {
@@ -1160,8 +1320,10 @@ mod tests {
         let tenant_id = "restore_target";
         manager.create_tenant(tenant_id).unwrap();
         assert!(manager.get_or_create_oplog(tenant_id).is_some());
+        let facet_cache_key =
+            flapjack::index::FacetCacheKey::new(tenant_id, "", "", vec!["facets".to_string()]);
         manager.facet_cache.insert(
-            format!("{tenant_id}:facets"),
+            facet_cache_key.clone(),
             std::sync::Arc::new((
                 std::time::Instant::now(),
                 1,
@@ -1185,9 +1347,7 @@ mod tests {
         );
         assert!(manager.loaded_tenant_ids().iter().any(|id| id == tenant_id));
         assert!(manager.get_oplog(tenant_id).is_some());
-        assert!(manager
-            .facet_cache
-            .contains_key(&format!("{tenant_id}:facets")));
+        assert!(manager.facet_cache.contains_key(&facet_cache_key));
         assert_unjournaled_snapshot_transaction_removed(&manager, tenant_id);
     }
     #[tokio::test]

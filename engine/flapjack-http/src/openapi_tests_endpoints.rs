@@ -97,6 +97,33 @@ fn migration_endpoints_are_documented() {
 }
 
 #[test]
+fn bulk_replace_endpoint_is_documented() {
+    let doc = openapi_json();
+    let path = "/1/migrations/bulk-replace";
+
+    assert_path_exists(&doc, path);
+    assert_path_method(&doc, path, "post");
+    assert_migration_operation_uses_api_key(&doc, path, "post");
+    assert_eq!(
+        post_response_description(&doc, path, "401"),
+        None,
+        "bulk replace inherits the router's 403-only auth contract"
+    );
+    assert_eq!(
+        post_response_description(&doc, path, "403"),
+        Some("Missing, invalid, or non-admin API key")
+    );
+    assert_eq!(
+        post_response_description(&doc, path, "413"),
+        Some("Bulk replacement payload exceeds the configured limit")
+    );
+    assert_eq!(
+        post_response_description(&doc, path, "503"),
+        Some("Bulk replacement is unavailable while replication peers are configured")
+    );
+}
+
+#[test]
 fn privacy_scrub_auth_openapi_uses_private_migration_security_only() {
     let doc = openapi_json();
     let path = "/1/migrations/privacy-scrub";

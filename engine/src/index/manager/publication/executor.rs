@@ -1,4 +1,6 @@
 use super::digest::canonical_tenant_tree_digest;
+#[cfg(feature = "test-support")]
+use super::fault::PanicAtCheckpoint;
 #[cfg(test)]
 use super::fault::{CheckpointFaultHook, PublicationFaultHook};
 use super::fault::{PublicationFaultPoint, PublicationIo};
@@ -183,6 +185,16 @@ impl PreStagedPublication {
         mode: ActivationMode,
         fence_evidence: Option<PublicationFenceEvidence>,
     ) -> std::result::Result<PublicationJournal, PreStagedActivationError> {
+        let io = PublicationIo::production();
+        self.activate_with_mode_fence_and_io(mode, fence_evidence, &io)
+    }
+
+    fn activate_with_mode_fence_and_io(
+        self,
+        mode: ActivationMode,
+        fence_evidence: Option<PublicationFenceEvidence>,
+        io: &PublicationIo<'_>,
+    ) -> std::result::Result<PublicationJournal, PreStagedActivationError> {
         // The inventory is collected before any reservation so it observes the real
         // trees rather than this activation's own empty reservation directory.
         let inventory = TantivyManagedInventory::from_existing_trees([
@@ -206,7 +218,6 @@ impl PreStagedPublication {
             }
         }
         let stage = std::cell::Cell::new(PreStagedActivationStage::Prepare);
-        let io = PublicationIo::production();
         activate_publication_inner(
             PublicationActivationInputs {
                 paths: &self.paths,
@@ -217,7 +228,7 @@ impl PreStagedPublication {
                 inventory: &inventory,
             },
             &ActivationContext {
-                io: &io,
+                io,
                 stage: &stage,
                 mode,
                 fence_evidence,
@@ -227,6 +238,17 @@ impl PreStagedPublication {
             stage: stage.get(),
             source,
         })
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn activate_with_fence_and_checkpoint_panic_for_test_support(
+        self,
+        fence_evidence: PublicationFenceEvidence,
+        fault: PublicationFaultPoint,
+    ) -> std::result::Result<PublicationJournal, PreStagedActivationError> {
+        let faults = PanicAtCheckpoint::new(fault);
+        let io = PublicationIo::with_faults(&faults);
+        self.activate_with_mode_fence_and_io(ActivationMode::Replace, Some(fence_evidence), &io)
     }
 
     #[cfg(test)]

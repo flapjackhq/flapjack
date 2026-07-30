@@ -1,4 +1,6 @@
 //! Inline performance tests providing manual latency measurement and P99 regression guards for core search operations.
+use crate::index::settings::IndexSettings;
+use crate::index::SearchOptions;
 use crate::integ_tests::search_compat::SearchCompat;
 /// Performance tests moved inline from engine/tests/test_perf.rs.
 ///
@@ -16,8 +18,10 @@ use crate::query::executor::{
     build_parity_fixture, run_frozen_family, ExecutorParityFixture, FrozenFamily, QueryPhaseReport,
     SearchThreadsEnvGuard, IN_FLIGHT_SEARCHES_PER_WORKER_THREAD,
 };
+use crate::query::highlighter::Highlighter;
 use crate::{Document, FacetRequest, FieldValue, Filter, IndexManager, Sort, SortOrder};
 use std::collections::HashMap;
+use sysinfo::{get_current_pid, System};
 use tempfile::TempDir;
 
 /// Populate a "bench" tenant with `num_docs` synthetic product documents for latency measurement.
@@ -80,7 +84,35 @@ fn setup_quick(manager: &IndexManager, rt: &tokio::runtime::Runtime, num_docs: u
 /// * `label` - Human-readable name printed alongside the results.
 /// * `iterations` - Number of timed iterations after warmup.
 /// * `f` - Closure to benchmark (called `iterations + 3` times total).
-fn measure(label: &str, iterations: usize, f: impl Fn()) {
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[must_use]
+struct LatencySummary {
+    avg_us: f64,
+    p50_us: f64,
+    p95_us: f64,
+    p99_us: f64,
+}
+
+fn summarize_latencies(mut times: Vec<f64>) -> LatencySummary {
+    assert!(
+        !times.is_empty(),
+        "latency summary needs at least one sample"
+    );
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let percentile = |fraction: f64| {
+        let rank = (times.len() as f64 * fraction).ceil() as usize;
+        times[rank.saturating_sub(1).min(times.len() - 1)]
+    };
+    LatencySummary {
+        avg_us: times.iter().sum::<f64>() / times.len() as f64,
+        p50_us: percentile(0.50),
+        p95_us: percentile(0.95),
+        p99_us: percentile(0.99),
+    }
+}
+
+fn measure(label: &str, iterations: usize, f: impl Fn()) -> LatencySummary {
+    assert!(iterations > 0, "measure needs at least one timed iteration");
     // Warmup
     for _ in 0..3 {
         f();
@@ -91,14 +123,12 @@ fn measure(label: &str, iterations: usize, f: impl Fn()) {
         f();
         times.push(start.elapsed().as_micros() as f64);
     }
-    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p50 = times[times.len() / 2];
-    let p99 = times[(times.len() as f64 * 0.99) as usize];
-    let avg = times.iter().sum::<f64>() / times.len() as f64;
+    let summary = summarize_latencies(times);
     println!(
         "  {:<35} avg={:>8.0}us  p50={:>8.0}us  p99={:>8.0}us",
-        label, avg, p50, p99
+        label, summary.avg_us, summary.p50_us, summary.p99_us
     );
+    summary
 }
 
 /// Manual latency measurement across ten search scenarios on a 10 K document corpus.
@@ -124,22 +154,22 @@ fn test_search_latency_slow() {
     let iters = 100;
     println!("\n=== Search Latency ({} iterations each) ===", iters);
 
-    measure("text_only (laptop)", iters, || {
+    let _ = measure("text_only (laptop)", iters, || {
         let _ = manager.search("bench", "laptop", None, None, 20);
     });
-    measure("text_only (samsung)", iters, || {
+    let _ = measure("text_only (samsung)", iters, || {
         let _ = manager.search("bench", "samsung", None, None, 20);
     });
-    measure("short_query (l)", iters, || {
+    let _ = measure("short_query (l)", iters, || {
         let _ = manager.search("bench", "l", None, None, 20);
     });
-    measure("multi_word (laptop gaming)", iters, || {
+    let _ = measure("multi_word (laptop gaming)", iters, || {
         let _ = manager.search("bench", "laptop gaming", None, None, 20);
     });
-    measure("long_query (samsung galaxy premium)", iters, || {
+    let _ = measure("long_query (samsung galaxy premium)", iters, || {
         let _ = manager.search("bench", "samsung galaxy premium display", None, None, 20);
     });
-    measure("text + filter", iters, || {
+    let _ = measure("text + filter", iters, || {
         let filter = Filter::Range {
             field: "price".to_string(),
             min: 200.0,
@@ -147,14 +177,14 @@ fn test_search_latency_slow() {
         };
         let _ = manager.search("bench", "laptop", Some(&filter), None, 20);
     });
-    measure("text + sort", iters, || {
+    let _ = measure("text + sort", iters, || {
         let sort = Sort::ByField {
             field: "price".to_string(),
             order: SortOrder::Asc,
         };
         let _ = manager.search("bench", "laptop", None, Some(&sort), 20);
     });
-    measure("text + facets", iters, || {
+    let _ = measure("text + facets", iters, || {
         let facet = FacetRequest {
             field: "category".to_string(),
             path: "/cat".to_string(),
@@ -162,7 +192,7 @@ fn test_search_latency_slow() {
         };
         let _ = manager.search_with_facets("bench", "laptop", None, None, 20, 0, Some(&[facet]));
     });
-    measure("full_stack (text+filter+sort+facets)", iters, || {
+    let _ = measure("full_stack (text+filter+sort+facets)", iters, || {
         let filter = Filter::Range {
             field: "price".to_string(),
             min: 200.0,
@@ -187,7 +217,7 @@ fn test_search_latency_slow() {
             Some(&[facet]),
         );
     });
-    measure("empty_query + facets", iters, || {
+    let _ = measure("empty_query + facets", iters, || {
         let facet = FacetRequest {
             field: "category".to_string(),
             path: "/cat".to_string(),
@@ -197,6 +227,724 @@ fn test_search_latency_slow() {
     });
 
     println!();
+}
+
+#[test]
+fn latency_summary_uses_nearest_rank_percentiles() {
+    let summary = summarize_latencies((1..=100).map(f64::from).collect());
+    assert_eq!(summary.avg_us, 50.5);
+    assert_eq!(summary.p50_us, 50.0);
+    assert_eq!(summary.p95_us, 95.0);
+    assert_eq!(summary.p99_us, 99.0);
+}
+
+#[test]
+#[serial_test::serial(flapjack_search_threads_env)]
+fn local_standard_search_threads_ignore_ambient_override() {
+    let _ambient_override = SearchThreadsEnvGuard::set("2");
+    {
+        let _local_standard_threads = SearchThreadsEnvGuard::unset();
+        assert_eq!(
+            std::env::var("FLAPJACK_SEARCH_THREADS"),
+            Err(std::env::VarError::NotPresent)
+        );
+    }
+    assert_eq!(std::env::var("FLAPJACK_SEARCH_THREADS").as_deref(), Ok("2"));
+}
+
+// ─── Local standard-profile calibration and frozen-gate consumers ──────────
+//
+// This fixture reproduces a local latency regime only. Its numbers are not
+// reference-locality rung evidence and must never support a capacity claim.
+
+const LOCAL_STANDARD_TENANT: &str = "local_standard";
+const LOCAL_STANDARD_DEFAULT_DOCS: usize = 25_000;
+const LOCAL_STANDARD_SAMPLES: usize = 30;
+const NAME_PREFIX_P95_LIMIT_MS: f64 = 50.0;
+const PER_QUERY_TYPE_P95_LIMIT_MS: f64 = 100.0;
+const LOCAL_STANDARD_GATE_FAMILIES: &[FrozenFamily] = &[
+    FrozenFamily::Text,
+    FrozenFamily::Typo,
+    FrozenFamily::MultiWord,
+    FrozenFamily::Facet,
+    FrozenFamily::Filter,
+    FrozenFamily::Geo,
+    FrozenFamily::Highlight,
+];
+
+#[derive(Clone, Copy, Debug)]
+struct StandardBuildSummary {
+    elapsed_seconds: f64,
+    commits: usize,
+}
+
+fn env_usize_or_default(name: &str, default: usize) -> usize {
+    match std::env::var(name) {
+        Ok(raw) => raw
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| panic!("{name} must be a positive integer, got {raw:?}")),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => panic!("cannot read {name}: {error}"),
+    }
+}
+
+fn standard_profile_document(index: usize) -> Document {
+    const BRANDS: [&str; 8] = [
+        "Apple", "Dell", "Lenovo", "ASUS", "HP", "Samsung", "Sony", "Razer",
+    ];
+    const CATEGORIES: [&str; 12] = [
+        "Laptops",
+        "Tablets",
+        "Smartphones",
+        "Audio",
+        "Accessories",
+        "Wearables",
+        "Gaming",
+        "Monitors",
+        "Networking",
+        "Home Office",
+        "Smart Home",
+        "Storage",
+    ];
+    const SUBCATEGORIES: [&str; 8] = [
+        "Professional",
+        "Business",
+        "Gaming",
+        "Budget",
+        "Ultrabook",
+        "Creator",
+        "Wireless",
+        "Performance",
+    ];
+    const COLORS: [&str; 8] = [
+        "Space Black",
+        "Midnight Blue",
+        "Arctic White",
+        "Titan Gray",
+        "Graphite",
+        "Forest Green",
+        "Silver",
+        "Rose Gold",
+    ];
+
+    let category = CATEGORIES[index % CATEGORIES.len()];
+    let subcategory = SUBCATEGORIES[(index * 7) % SUBCATEGORIES.len()];
+    let brand = BRANDS[(index * 5) % BRANDS.len()];
+    let color = COLORS[(index * 3) % COLORS.len()];
+    let topic = if index % 3 == 0 {
+        "wireless"
+    } else {
+        "professional"
+    };
+    let mut geoloc = HashMap::new();
+    geoloc.insert(
+        "lat".to_string(),
+        FieldValue::Float(37.70 + (index % 100) as f64 * 0.0001),
+    );
+    geoloc.insert(
+        "lng".to_string(),
+        FieldValue::Float(-122.50 + (index % 100) as f64 * 0.0001),
+    );
+
+    let fields = HashMap::from([
+        (
+            "name".to_string(),
+            FieldValue::Text(format!(
+                "{brand} {category} {topic} Edition {}",
+                index % 512
+            )),
+        ),
+        (
+            "description".to_string(),
+            FieldValue::Text(format!(
+                "{topic} {subcategory} product with durable battery and premium display {}",
+                index % 2048
+            )),
+        ),
+        ("brand".to_string(), FieldValue::Text(brand.to_string())),
+        (
+            "category".to_string(),
+            FieldValue::Text(category.to_string()),
+        ),
+        (
+            "subcategory".to_string(),
+            FieldValue::Text(subcategory.to_string()),
+        ),
+        (
+            "price".to_string(),
+            FieldValue::Float(100.0 + (index % 3000) as f64),
+        ),
+        (
+            "rating".to_string(),
+            FieldValue::Float(1.0 + (index % 41) as f64 / 10.0),
+        ),
+        (
+            "reviewCount".to_string(),
+            FieldValue::Integer((index % 20_000) as i64),
+        ),
+        ("inStock".to_string(), FieldValue::Bool(index % 6 != 0)),
+        (
+            "tags".to_string(),
+            FieldValue::Array(vec![
+                FieldValue::Text(topic.to_string()),
+                FieldValue::Text(format!("series-{}", index % 8192)),
+                // The production standard profile contains high-cardinality
+                // product variants. A deterministic SKU tag keeps the local
+                // facet traversal in that regime instead of benchmarking only
+                // the 12-value category field.
+                FieldValue::Text(format!("sku-{index:08}")),
+            ]),
+        ),
+        ("color".to_string(), FieldValue::Text(color.to_string())),
+        (
+            "releaseYear".to_string(),
+            FieldValue::Integer((2020 + index % 6) as i64),
+        ),
+        ("_geoloc".to_string(), FieldValue::Object(geoloc)),
+    ]);
+
+    Document {
+        id: format!("bench-{index:08}"),
+        fields,
+    }
+}
+
+fn save_local_standard_geo_rule(manager: &IndexManager) {
+    let rule = serde_json::json!({
+        "objectID": "local-standard-geo",
+        "conditions": [{"pattern": "wireless", "anchoring": "contains"}],
+        "consequence": {
+            "params": {
+                "aroundLatLng": "37.70,-122.50",
+                "aroundRadius": 50000
+            }
+        }
+    });
+    let rules_path = manager
+        .base_path
+        .join(LOCAL_STANDARD_TENANT)
+        .join("rules.json");
+    std::fs::write(rules_path, serde_json::to_string(&vec![rule]).unwrap()).unwrap();
+}
+
+fn setup_local_standard_specimen(
+    manager: &IndexManager,
+    rt: &tokio::runtime::Runtime,
+    num_docs: usize,
+) -> StandardBuildSummary {
+    manager.create_tenant(LOCAL_STANDARD_TENANT).unwrap();
+    let settings = IndexSettings {
+        attributes_for_faceting: vec![
+            "brand".to_string(),
+            "category".to_string(),
+            "subcategory".to_string(),
+            "tags".to_string(),
+            "color".to_string(),
+        ],
+        searchable_attributes: Some(vec![
+            "name".to_string(),
+            "description".to_string(),
+            "brand".to_string(),
+            "category".to_string(),
+            "subcategory".to_string(),
+            "tags".to_string(),
+        ]),
+        ..Default::default()
+    };
+    settings
+        .save(
+            manager
+                .base_path
+                .join(LOCAL_STANDARD_TENANT)
+                .join("settings.json"),
+        )
+        .unwrap();
+    save_local_standard_geo_rule(manager);
+
+    const BATCH_SIZE: usize = 5_000;
+    let started = std::time::Instant::now();
+    let mut commits = 0;
+    for start in (0..num_docs).step_by(BATCH_SIZE) {
+        let end = (start + BATCH_SIZE).min(num_docs);
+        let docs = (start..end).map(standard_profile_document).collect();
+        rt.block_on(manager.add_documents_sync(LOCAL_STANDARD_TENANT, docs))
+            .unwrap();
+        commits += 1;
+    }
+    StandardBuildSummary {
+        elapsed_seconds: started.elapsed().as_secs_f64(),
+        commits,
+    }
+}
+
+fn local_standard_doc_count() -> usize {
+    env_usize_or_default("FLAPJACK_LOCAL_STANDARD_DOCS", LOCAL_STANDARD_DEFAULT_DOCS)
+}
+
+fn facet_requests() -> [FacetRequest; 3] {
+    [
+        FacetRequest {
+            field: "category".to_string(),
+            path: "/category".to_string(),
+            value_query: None,
+        },
+        FacetRequest {
+            field: "brand".to_string(),
+            path: "/brand".to_string(),
+            value_query: None,
+        },
+        FacetRequest {
+            field: "tags".to_string(),
+            path: "/tags".to_string(),
+            value_query: None,
+        },
+    ]
+}
+
+fn search_local_standard(
+    manager: &IndexManager,
+    query: &str,
+    options: &SearchOptions<'_>,
+) -> crate::types::SearchResult {
+    let result = manager
+        .search_with_options(LOCAL_STANDARD_TENANT, query, options)
+        .unwrap();
+    assert!(
+        result.total > 0,
+        "local standard query {query:?} must match documents"
+    );
+    result
+}
+
+fn execute_local_standard_geo(manager: &IndexManager) {
+    let result = search_local_standard(manager, "wireless", &SearchOptions::with_limit(20));
+    assert_eq!(
+        result.effective_around_lat_lng.as_deref(),
+        Some("37.70,-122.50"),
+        "geo family must drive the search owner path that resolves aroundLatLng"
+    );
+    assert_eq!(
+        result.effective_around_radius,
+        Some(serde_json::json!(50000)),
+        "geo family must drive the search owner path that resolves aroundRadius"
+    );
+}
+
+fn execute_local_standard_highlight(manager: &IndexManager) {
+    let result = search_local_standard(manager, "wireless premium", &SearchOptions::with_limit(20));
+    let query_words = vec!["wireless".to_string(), "premium".to_string()];
+    let highlighter = Highlighter::default();
+    let highlighted_fields = result
+        .documents
+        .iter()
+        .map(|document| {
+            highlighter
+                .highlight_document(&document.document, &query_words)
+                .len()
+        })
+        .sum::<usize>();
+    assert!(
+        highlighted_fields > 0,
+        "highlight family must transform returned fields"
+    );
+}
+
+fn execute_local_standard_family(manager: &IndexManager, family: FrozenFamily) {
+    match family {
+        FrozenFamily::Text => {
+            search_local_standard(
+                manager,
+                "wirel",
+                &SearchOptions {
+                    query_type: Some("prefixLast"),
+                    ..SearchOptions::with_limit(20)
+                },
+            );
+        }
+        FrozenFamily::Typo => {
+            search_local_standard(
+                manager,
+                "wireles",
+                &SearchOptions {
+                    query_type: Some("prefixNone"),
+                    typo_tolerance: Some(true),
+                    ..SearchOptions::with_limit(20)
+                },
+            );
+        }
+        FrozenFamily::MultiWord => {
+            search_local_standard(
+                manager,
+                "wireless durable battery",
+                &SearchOptions::with_limit(20),
+            );
+        }
+        FrozenFamily::Facet => {
+            let requests = facet_requests();
+            let result = search_local_standard(
+                manager,
+                "wireless",
+                &SearchOptions {
+                    facets: Some(&requests),
+                    max_values_per_facet: Some(25),
+                    ..SearchOptions::with_limit(20)
+                },
+            );
+            assert!(
+                result
+                    .facets
+                    .get("tags")
+                    .is_some_and(|values| !values.is_empty()),
+                "facet family must exercise high-cardinality tag extraction"
+            );
+        }
+        FrozenFamily::Filter => {
+            let filter = Filter::And(vec![
+                Filter::Range {
+                    field: "price".to_string(),
+                    min: 100.0,
+                    max: 2_500.0,
+                },
+                Filter::Equals {
+                    field: "inStock".to_string(),
+                    value: FieldValue::Bool(true),
+                },
+            ]);
+            search_local_standard(
+                manager,
+                "professional",
+                &SearchOptions {
+                    filter: Some(&filter),
+                    ..SearchOptions::with_limit(20)
+                },
+            );
+        }
+        FrozenFamily::Geo => execute_local_standard_geo(manager),
+        FrozenFamily::Highlight => execute_local_standard_highlight(manager),
+        _ => unreachable!("local gate catalog contains only evaluator families"),
+    }
+}
+
+fn measure_local_facet(manager: &IndexManager, cold: bool) -> LatencySummary {
+    let requests = facet_requests();
+    measure(
+        if cold {
+            "local_standard facet cold"
+        } else {
+            "local_standard facet warm"
+        },
+        LOCAL_STANDARD_SAMPLES,
+        || {
+            if cold {
+                manager.invalidate_facet_cache(LOCAL_STANDARD_TENANT);
+            }
+            let result = manager
+                .search_with_options(
+                    LOCAL_STANDARD_TENANT,
+                    "wireless",
+                    &SearchOptions {
+                        facets: Some(&requests),
+                        limit: 20,
+                        max_values_per_facet: Some(25),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert!(
+                result.total > 0,
+                "facet specimen query must match documents"
+            );
+            assert!(
+                result
+                    .facets
+                    .get("tags")
+                    .is_some_and(|values| !values.is_empty()),
+                "facet specimen must exercise high-cardinality tag extraction"
+            );
+        },
+    )
+}
+
+fn measure_local_family(
+    manager: &IndexManager,
+    family: FrozenFamily,
+    cold_primary: bool,
+) -> LatencySummary {
+    let label = format!(
+        "local_standard {} {}",
+        family.label(),
+        if cold_primary { "cold" } else { "warm" }
+    );
+    measure(&label, LOCAL_STANDARD_SAMPLES, || {
+        if cold_primary && family == FrozenFamily::Facet {
+            manager.invalidate_facet_cache(LOCAL_STANDARD_TENANT);
+        }
+        execute_local_standard_family(manager, family);
+    })
+}
+
+#[derive(Debug)]
+struct LocalFamilyMeasurement {
+    family: FrozenFamily,
+    warm: LatencySummary,
+    cold_primary: LatencySummary,
+}
+
+fn measure_local_gate_matrix(manager: &IndexManager) -> Vec<LocalFamilyMeasurement> {
+    LOCAL_STANDARD_GATE_FAMILIES
+        .iter()
+        .copied()
+        .map(|family| LocalFamilyMeasurement {
+            family,
+            warm: measure_local_family(manager, family, false),
+            cold_primary: measure_local_family(manager, family, true),
+        })
+        .collect()
+}
+
+fn parse_exported_limit(source: &str, name: &str) -> f64 {
+    let prefix = format!("export const {name} = ");
+    source
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix(&prefix)
+                .and_then(|value| value.strip_suffix(';'))
+                .and_then(|value| value.parse::<f64>().ok())
+        })
+        .unwrap_or_else(|| panic!("missing or invalid {name} in scale_rung_verdict.mjs"))
+}
+
+#[test]
+fn frozen_per_query_gate_constants_match_loadtest_owner() {
+    let owner_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("loadtest/lib/scale_rung_verdict.mjs");
+    let owner = std::fs::read_to_string(&owner_path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", owner_path.display()));
+    assert_eq!(
+        parse_exported_limit(&owner, "NAME_PREFIX_P95_LIMIT_MS"),
+        NAME_PREFIX_P95_LIMIT_MS
+    );
+    assert_eq!(
+        parse_exported_limit(&owner, "PER_QUERY_TYPE_P95_LIMIT_MS"),
+        PER_QUERY_TYPE_P95_LIMIT_MS
+    );
+}
+
+#[test]
+fn local_standard_gate_uses_exact_evaluator_families() {
+    let labels = LOCAL_STANDARD_GATE_FAMILIES
+        .iter()
+        .map(|family| family.label())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        labels,
+        [
+            "text",
+            "typo",
+            "multi_word",
+            "facet",
+            "filter",
+            "geo",
+            "highlight",
+        ]
+    );
+}
+
+#[test]
+fn local_standard_gate_families_execute_non_vacuously() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let temp = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp.path());
+    setup_local_standard_specimen(&manager, &rt, 256);
+
+    for family in LOCAL_STANDARD_GATE_FAMILIES {
+        execute_local_standard_family(&manager, *family);
+    }
+}
+
+#[test]
+fn local_standard_geo_family_filters_through_search_owner_path() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let temp = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp.path());
+    manager.create_tenant(LOCAL_STANDARD_TENANT).unwrap();
+    let docs = vec![
+        Document {
+            id: "near".to_string(),
+            fields: HashMap::from([
+                (
+                    "name".to_string(),
+                    FieldValue::Text("wireless local standard near".to_string()),
+                ),
+                (
+                    "_geoloc".to_string(),
+                    FieldValue::Object(HashMap::from([
+                        ("lat".to_string(), FieldValue::Float(37.70)),
+                        ("lng".to_string(), FieldValue::Float(-122.50)),
+                    ])),
+                ),
+            ]),
+        },
+        Document {
+            id: "far".to_string(),
+            fields: HashMap::from([
+                (
+                    "name".to_string(),
+                    FieldValue::Text("wireless local standard far".to_string()),
+                ),
+                (
+                    "_geoloc".to_string(),
+                    FieldValue::Object(HashMap::from([
+                        ("lat".to_string(), FieldValue::Float(34.0522)),
+                        ("lng".to_string(), FieldValue::Float(-118.2437)),
+                    ])),
+                ),
+            ]),
+        },
+    ];
+    rt.block_on(manager.add_documents_sync(LOCAL_STANDARD_TENANT, docs))
+        .unwrap();
+    save_local_standard_geo_rule(&manager);
+
+    execute_local_standard_geo(&manager);
+    let result = search_local_standard(&manager, "wireless", &SearchOptions::with_limit(20));
+    assert_eq!(result.total, 1);
+    assert_eq!(result.documents[0].document.id, "near");
+}
+
+/// Local-only seven-family gate. Only the facet family has a production cache,
+/// so its cold-primary samples invalidate that cache before every query. These
+/// results describe the current machine, not a reference-locality capacity rung.
+#[test]
+#[ignore]
+#[serial_test::serial(local_standard_perf_env, flapjack_search_threads_env)]
+fn facet_p95_meets_frozen_per_query_gate_on_local_standard_specimen_very_slow() {
+    let _search_threads = SearchThreadsEnvGuard::unset();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let temp = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp.path());
+    let doc_count = local_standard_doc_count();
+    let build = setup_local_standard_specimen(&manager, &rt, doc_count);
+    let measurements = measure_local_gate_matrix(&manager);
+    let mut breaches = Vec::new();
+    for measurement in measurements {
+        let limit_ms = if measurement.family == FrozenFamily::Text {
+            NAME_PREFIX_P95_LIMIT_MS
+        } else {
+            PER_QUERY_TYPE_P95_LIMIT_MS
+        };
+        let warm_p95_ms = measurement.warm.p95_us / 1000.0;
+        let cold_p95_ms = measurement.cold_primary.p95_us / 1000.0;
+        let verdict = if cold_p95_ms <= limit_ms {
+            "inside"
+        } else {
+            breaches.push(format!(
+                "{}={cold_p95_ms:.3}ms>{limit_ms:.3}ms",
+                measurement.family.label()
+            ));
+            "breach"
+        };
+        eprintln!(
+            "local_standard_family family={} docs={doc_count} warm_p95_ms={warm_p95_ms:.3} cold_primary_p95_ms={cold_p95_ms:.3} consumed_limit_ms={limit_ms:.3} verdict={verdict}",
+            measurement.family.label(),
+        );
+    }
+    eprintln!(
+        "local_standard_gate docs={doc_count} build_s={:.3} commits={}",
+        build.elapsed_seconds, build.commits,
+    );
+    assert!(
+        breaches.is_empty(),
+        "local standard family gate breaches on {doc_count} documents: {}",
+        breaches.join(", "),
+    );
+}
+
+/// Cold-primary companion to the headline gate. Explicit invalidation before
+/// every sample prevents the existing five-second facet cache from hiding the
+/// executor cost; no production cache-disable knob is introduced.
+#[test]
+#[ignore]
+#[serial_test::serial(local_standard_perf_env, flapjack_search_threads_env)]
+fn result_cache_disabled_still_meets_scale_gate_very_slow() {
+    let _search_threads = SearchThreadsEnvGuard::unset();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let temp = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp.path());
+    let doc_count = local_standard_doc_count();
+    let build = setup_local_standard_specimen(&manager, &rt, doc_count);
+    let cold = measure_local_facet(&manager, true);
+    eprintln!(
+        "local_standard_cold_primary docs={doc_count} build_s={:.3} commits={} cold_p95_ms={:.3}",
+        build.elapsed_seconds,
+        build.commits,
+        cold.p95_us / 1000.0,
+    );
+    assert!(
+        cold.p95_us / 1000.0 <= PER_QUERY_TYPE_P95_LIMIT_MS,
+        "cache-disabled facet p95 {:.3}ms exceeds consumed {:.3}ms gate on {doc_count}-document local standard specimen",
+        cold.p95_us / 1000.0,
+        PER_QUERY_TYPE_P95_LIMIT_MS,
+    );
+}
+
+/// Emit the machine-readable p95-vs-corpus-size curve after the required
+/// same-locality throughput probe. Override sizes with
+/// `FLAPJACK_LOCAL_STANDARD_SWEEP=25000,50000,100000,200000`.
+#[test]
+#[ignore]
+#[serial_test::serial(local_standard_perf_env, flapjack_search_threads_env)]
+fn local_standard_specimen_calibration_curve_very_slow() {
+    let _search_threads = SearchThreadsEnvGuard::unset();
+    let sizes = std::env::var("FLAPJACK_LOCAL_STANDARD_SWEEP")
+        .unwrap_or_else(|_| "25000,50000,100000,200000".to_string())
+        .split(',')
+        .map(|raw| {
+            raw.parse::<usize>()
+                .ok()
+                .filter(|value| *value > 0)
+                .unwrap_or_else(|| panic!("invalid calibration size {raw:?}"))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        sizes.len() >= 4,
+        "calibration curve requires at least four sizes"
+    );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut points = Vec::new();
+    for doc_count in sizes {
+        let temp = TempDir::new().unwrap();
+        let manager = IndexManager::new(temp.path());
+        let build = setup_local_standard_specimen(&manager, &rt, doc_count);
+        let samples_started = std::time::Instant::now();
+        let warm = measure_local_facet(&manager, false);
+        let cold = measure_local_facet(&manager, true);
+        let sample_seconds = samples_started.elapsed().as_secs_f64();
+        points.push(serde_json::json!({
+            "docs": doc_count,
+            "build_seconds": build.elapsed_seconds,
+            "docs_per_second": doc_count as f64 / build.elapsed_seconds,
+            "commits": build.commits,
+            "seconds_per_commit": build.elapsed_seconds / build.commits as f64,
+            "facet_sample_seconds": sample_seconds,
+            "warm_facet_p95_ms": warm.p95_us / 1000.0,
+            "cold_facet_p95_ms": cold.p95_us / 1000.0,
+        }));
+    }
+    println!(
+        "calibration_json={}",
+        serde_json::to_string(&points).unwrap()
+    );
 }
 
 // ─── Regression guards (release-only) ───────────────────────────────────────
@@ -582,6 +1330,162 @@ struct BenchRecord {
     report: QueryPhaseReport,
 }
 
+/// Process resources measured over one thread arm of the frozen matrix.
+struct BenchResourceMeasurement {
+    threads: usize,
+    elapsed_ns: u128,
+    cpu_usage_percent: f32,
+    rss_before_bytes: u64,
+    rss_after_bytes: u64,
+}
+
+struct BenchResourceMonitor {
+    system: System,
+    pid: sysinfo::Pid,
+}
+
+struct LocalThreadArmMeasurement {
+    threads: usize,
+    family: FrozenFamily,
+    warm: LatencySummary,
+    cold_primary: LatencySummary,
+}
+
+impl BenchResourceMonitor {
+    fn new() -> Self {
+        let mut system = System::new();
+        let pid = get_current_pid().expect("current process id");
+        assert!(
+            system.refresh_process(pid),
+            "current process must be visible to sysinfo"
+        );
+        Self { system, pid }
+    }
+
+    fn begin_arm(&mut self) -> u64 {
+        assert!(
+            self.system.refresh_process(self.pid),
+            "current process must be visible to sysinfo"
+        );
+        self.current_process().memory()
+    }
+
+    fn finish_arm(
+        &mut self,
+        threads: usize,
+        elapsed_ns: u128,
+        rss_before_bytes: u64,
+    ) -> BenchResourceMeasurement {
+        assert!(
+            self.system.refresh_process(self.pid),
+            "current process must be visible to sysinfo"
+        );
+        let process = self.current_process();
+        BenchResourceMeasurement {
+            threads,
+            elapsed_ns,
+            cpu_usage_percent: process.cpu_usage(),
+            rss_before_bytes,
+            rss_after_bytes: process.memory(),
+        }
+    }
+
+    fn current_process(&self) -> &sysinfo::Process {
+        self.system
+            .process(self.pid)
+            .expect("refreshed current process")
+    }
+}
+
+fn collect_frozen_matrix_arm(threads: usize, samples: usize) -> Vec<BenchRecord> {
+    let mut records = Vec::new();
+    let _env = SearchThreadsEnvGuard::set(&threads.to_string());
+    for &family in FrozenFamily::ALL {
+        let fixture: ExecutorParityFixture = build_parity_fixture();
+        for sample in 0..samples {
+            for (query_label, report) in run_frozen_family(family, &fixture) {
+                records.push(BenchRecord {
+                    family: family.label(),
+                    query_label,
+                    threads,
+                    budget_per_worker: IN_FLIGHT_SEARCHES_PER_WORKER_THREAD,
+                    sample,
+                    report,
+                });
+            }
+        }
+    }
+    records
+}
+
+fn collect_bounded_executor_ab(
+    local_standard_manager: &IndexManager,
+    thread_arms: &[usize],
+    samples: usize,
+) -> (
+    Vec<BenchRecord>,
+    Vec<LocalThreadArmMeasurement>,
+    Vec<BenchResourceMeasurement>,
+) {
+    let mut monitor = BenchResourceMonitor::new();
+    let mut records = Vec::new();
+    let mut local_measurements = Vec::new();
+    let mut resources = Vec::with_capacity(thread_arms.len());
+    for &threads in thread_arms {
+        let _env = SearchThreadsEnvGuard::set(&threads.to_string());
+        let rss_before_bytes = monitor.begin_arm();
+        let started = std::time::Instant::now();
+        let arm_records = collect_frozen_matrix_arm(threads, samples);
+        local_measurements.extend(
+            measure_local_gate_matrix(local_standard_manager)
+                .into_iter()
+                .map(|measurement| LocalThreadArmMeasurement {
+                    threads,
+                    family: measurement.family,
+                    warm: measurement.warm,
+                    cold_primary: measurement.cold_primary,
+                }),
+        );
+        let arm_resources =
+            monitor.finish_arm(threads, started.elapsed().as_nanos(), rss_before_bytes);
+        records.extend(arm_records);
+        resources.push(arm_resources);
+    }
+    (records, local_measurements, resources)
+}
+
+fn print_resource_measurements(measurements: &[BenchResourceMeasurement]) {
+    println!(
+        "bench_resource_col\tthreads\telapsed_ns\tcpu_usage_percent\trss_before_bytes\trss_after_bytes\trss_delta_bytes"
+    );
+    for measurement in measurements {
+        let rss_delta_bytes =
+            i128::from(measurement.rss_after_bytes) - i128::from(measurement.rss_before_bytes);
+        println!(
+            "bench_resource\t{}\t{}\t{:.3}\t{}\t{}\t{}",
+            measurement.threads,
+            measurement.elapsed_ns,
+            measurement.cpu_usage_percent,
+            measurement.rss_before_bytes,
+            measurement.rss_after_bytes,
+            rss_delta_bytes,
+        );
+    }
+}
+
+fn print_local_thread_arm_measurements(measurements: &[LocalThreadArmMeasurement]) {
+    println!("local_ab_col\tthreads\tfamily\twarm_p95_ms\tcold_primary_p95_ms");
+    for measurement in measurements {
+        println!(
+            "local_ab\t{}\t{}\t{:.3}\t{:.3}",
+            measurement.threads,
+            measurement.family.label(),
+            measurement.warm.p95_us / 1000.0,
+            measurement.cold_primary.p95_us / 1000.0,
+        );
+    }
+}
+
 /// The execution paths the query executor can report. A benchmark row must
 /// carry exactly one of these, so every cold/warm row stays attributable to a
 /// real collector path.
@@ -604,22 +1508,7 @@ const KNOWN_EXECUTION_PATHS: [&str; 5] = [
 fn collect_frozen_matrix_records(thread_arms: &[usize], samples: usize) -> Vec<BenchRecord> {
     let mut records = Vec::new();
     for &threads in thread_arms {
-        let _env = SearchThreadsEnvGuard::set(&threads.to_string());
-        for &family in FrozenFamily::ALL {
-            let fixture: ExecutorParityFixture = build_parity_fixture();
-            for sample in 0..samples {
-                for (query_label, report) in run_frozen_family(family, &fixture) {
-                    records.push(BenchRecord {
-                        family: family.label(),
-                        query_label,
-                        threads,
-                        budget_per_worker: IN_FLIGHT_SEARCHES_PER_WORKER_THREAD,
-                        sample,
-                        report,
-                    });
-                }
-            }
-        }
+        records.extend(collect_frozen_matrix_arm(threads, samples));
     }
     records
 }
@@ -671,14 +1560,25 @@ fn bounded_executor_frozen_matrix_benchmark_slow() {
     const THREAD_ARMS: [usize; 3] = [1, 2, 4];
     const SAMPLES: usize = 30;
 
-    let records = collect_frozen_matrix_records(&THREAD_ARMS, SAMPLES);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let temp = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp.path());
+    let doc_count = local_standard_doc_count();
+    let build = setup_local_standard_specimen(&manager, &rt, doc_count);
+    let (records, local_measurements, resources) =
+        collect_bounded_executor_ab(&manager, &THREAD_ARMS, SAMPLES);
     println!(
-        "# bounded_executor_frozen_matrix_benchmark thread_arms={:?} samples={} budget_per_worker={} records={}",
+        "# bounded_executor_frozen_matrix_benchmark thread_arms={:?} samples={} budget_per_worker={} records={} local_standard_docs={} local_standard_build_s={:.3}",
         THREAD_ARMS,
         SAMPLES,
         IN_FLIGHT_SEARCHES_PER_WORKER_THREAD,
         records.len(),
+        doc_count,
+        build.elapsed_seconds,
     );
+    print_resource_measurements(&resources);
+    print_local_thread_arm_measurements(&local_measurements);
     print_frozen_matrix_rows(&records);
 }
 

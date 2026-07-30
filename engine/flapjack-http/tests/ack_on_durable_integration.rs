@@ -57,6 +57,7 @@ fn make_state(tmp: &TempDir) -> Arc<AppState> {
             None,
             DEFAULT_ASYNC_MIGRATION_CAPACITY,
         )),
+        bulk_replace_max_bytes: 4 * 1024 * 1024 * 1024,
         idempotency_cache: Arc::new(IdempotencyCache::new(Duration::from_secs(300))),
     })
 }

@@ -94,6 +94,7 @@ pub(crate) struct TestStateBuilder<'tmp> {
     geoip_reader: Option<Arc<GeoIpReader>>,
     replication_manager: Option<Arc<ReplicationManager>>,
     migration_capacity: usize,
+    bulk_replace_max_bytes: u64,
 }
 
 impl<'tmp> TestStateBuilder<'tmp> {
@@ -105,6 +106,8 @@ impl<'tmp> TestStateBuilder<'tmp> {
             geoip_reader: None,
             replication_manager: None,
             migration_capacity: crate::handlers::migration::DEFAULT_ASYNC_MIGRATION_CAPACITY,
+            bulk_replace_max_bytes: crate::handlers::migration::spool::SpoolLimits::default()
+                .max_bytes_per_job,
         }
     }
 
@@ -151,6 +154,11 @@ impl<'tmp> TestStateBuilder<'tmp> {
         self
     }
 
+    pub(crate) fn with_bulk_replace_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.bulk_replace_max_bytes = max_bytes;
+        self
+    }
+
     pub(crate) fn build(self) -> AppState {
         let manager = flapjack::IndexManager::new(self.tmp.path());
         let dictionary_manager = Arc::new(flapjack::dictionaries::manager::DictionaryManager::new(
@@ -181,6 +189,7 @@ impl<'tmp> TestStateBuilder<'tmp> {
             paused_indexes: crate::pause_registry::PausedIndexes::new(),
             geoip_reader: self.geoip_reader,
             migration_runner,
+            bulk_replace_max_bytes: self.bulk_replace_max_bytes,
             start_time: std::time::Instant::now(),
             conversation_store: crate::conversation_store::ConversationStore::default_shared(),
             embedder_store: Arc::new(crate::embedder_store::EmbedderStore::new()),
@@ -278,6 +287,59 @@ pub(crate) async fn send_empty_request(
         )
         .await
         .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// Writer-quiesce assertions over retained writer-lifecycle events
+// ---------------------------------------------------------------------------
+
+/// Number of retained `channel_closed` / `merge_quiesced` writer-lifecycle events
+/// for the tenant. Each one is a persistent writer that was closed only after its
+/// merge threads finished.
+pub(crate) fn retained_channel_closed_count(tenant_id: &str) -> usize {
+    flapjack::index::write_queue::writer_lifecycle_test_events(tenant_id)
+        .iter()
+        .filter(|event| event.reason == "channel_closed" && event.phase == "merge_quiesced")
+        .count()
+}
+
+/// Assert the operation under test drained exactly one persistent writer through
+/// merge quiescence.
+pub(crate) fn assert_retained_channel_closed_delta(tenant_id: &str, before: usize, message: &str) {
+    let after = retained_channel_closed_count(tenant_id);
+    assert_eq!(after, before + 1, "{message}");
+}
+
+/// Assert the tenant's merge-quiescent writer close was recorded *before* the named
+/// publication checkpoint, i.e. that quiesce fences the publication rather than
+/// trailing it.
+pub(crate) fn assert_quiescence_before_publication(
+    tenant_id: &str,
+    publication_phase: &'static str,
+) {
+    let events = flapjack::index::write_queue::writer_lifecycle_test_events(tenant_id);
+    let quiesced_sequence = events
+        .iter()
+        .find(|event| event.reason == "channel_closed" && event.phase == "merge_quiesced")
+        .map(|event| event.sequence)
+        .unwrap_or_else(|| {
+            panic!(
+                "tenant {tenant_id} must retain a channel_closed merge-quiesced event: {events:?}"
+            )
+        });
+    let publication_sequence = events
+        .iter()
+        .find(|event| event.phase == publication_phase)
+        .map(|event| event.sequence)
+        .unwrap_or_else(|| {
+            panic!(
+                "tenant {tenant_id} must retain publication event {publication_phase}: {events:?}"
+            )
+        });
+    assert!(
+        quiesced_sequence < publication_sequence,
+        "tenant {tenant_id} must merge-quiesce before {publication_phase}; events: {events:?}"
+    );
 }
 
 #[cfg(test)]

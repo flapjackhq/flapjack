@@ -1,5 +1,5 @@
 use super::bounded_tests::{wait_for_pool_quiescence, SearchThreadsEnvGuard, TEST_THREAD_COUNT};
-use super::parity_fixtures::{build_parity_fixture, ExecutorParityFixture};
+use super::parity_fixtures::{build_parity_fixture, geoloc, laptop_filter, ExecutorParityFixture};
 use super::{FacetSearchParams, QueryPhaseReport};
 use crate::query::geo::{AroundPrecisionConfig, AroundRadius, GeoParams, GeoPoint};
 use crate::query::highlighter::{HighlightValue, Highlighter, MatchLevel};
@@ -38,6 +38,11 @@ fn facet_requests() -> Vec<FacetRequest> {
             path: "/tags".to_string(),
             value_query: None,
         },
+        FacetRequest {
+            field: "price".to_string(),
+            path: "/price".to_string(),
+            value_query: None,
+        },
     ]
 }
 
@@ -46,6 +51,85 @@ fn pager_filter() -> Filter {
         field: "category".to_string(),
         value: FieldValue::Text("Pager".to_string()),
     }
+}
+
+fn wireless_filter() -> Filter {
+    Filter::Equals {
+        field: "facetGroup".to_string(),
+        value: FieldValue::Text("wireless".to_string()),
+    }
+}
+
+fn brand_request(value_query: Option<&str>) -> [FacetRequest; 1] {
+    [FacetRequest {
+        field: "brand".to_string(),
+        path: "/brand".to_string(),
+        value_query: value_query.map(str::to_string),
+    }]
+}
+
+fn execute_all_query_with_facets(
+    fixture: &ExecutorParityFixture,
+    executor: &crate::QueryExecutor,
+    filter: Option<&Filter>,
+    requests: &[FacetRequest],
+    limit: usize,
+) -> crate::types::SearchResult {
+    executor
+        .execute_with_facets(
+            fixture.searcher(),
+            Box::new(AllQuery),
+            filter,
+            &FacetSearchParams {
+                sort: None,
+                limit,
+                offset: 0,
+                has_text_query: false,
+                facet_requests: Some(requests),
+                distinct_count: None,
+            },
+        )
+        .unwrap()
+}
+
+fn assert_facet_values(
+    result: &crate::types::SearchResult,
+    field: &str,
+    expected: &[(&str, u64)],
+    context: &str,
+) {
+    let actual: Vec<(&str, u64)> = result.facets[field]
+        .iter()
+        .map(|count| (count.path.as_str(), count.count))
+        .collect();
+    assert_eq!(actual, expected, "{context}");
+}
+
+fn assert_price_stats(result: &crate::types::SearchResult) {
+    let price_stats = result
+        .facets_stats
+        .get("price")
+        .expect("wireless price facet stats");
+    assert_eq!(price_stats.min, 45.0);
+    assert_eq!(price_stats.max, 330.0);
+    assert_eq!(price_stats.sum, 1124.0);
+    assert!((price_stats.avg - (1124.0 / 6.0)).abs() < 1e-12);
+}
+
+fn assert_wireless_brand_case(
+    fixture: &ExecutorParityFixture,
+    label: &'static str,
+    value_query: Option<&str>,
+    expected: &[(&str, u64)],
+    exhaustive: bool,
+) -> PhaseFingerprint {
+    let requests = brand_request(value_query);
+    let filter = wireless_filter();
+    let executor = fixture.executor("").with_max_values_per_facet(Some(2));
+    let result = execute_all_query_with_facets(fixture, &executor, Some(&filter), &requests, 0);
+    assert_facet_values(&result, "brand", expected, label);
+    assert_eq!(result.exhaustive_facet_values, exhaustive, "{label}");
+    fingerprint(label, &executor)
 }
 
 /// The result-defining subset of `QueryPhaseReport`, captured per execute call.
@@ -155,56 +239,26 @@ fn assert_multi_word_family(fixture: &ExecutorParityFixture) -> Vec<PhaseFingerp
 fn assert_facet_family(fixture: &ExecutorParityFixture) -> Vec<PhaseFingerprint> {
     let requests = facet_requests();
     let spec = &super::parity_fixtures::FACET_QUERY;
+    let filter = wireless_filter();
     let executor = fixture.executor(spec.query);
-    let result = executor
-        .execute_with_facets(
-            fixture.searcher(),
-            Box::new(AllQuery),
-            Some(&Filter::Equals {
-                field: "facetGroup".to_string(),
-                value: FieldValue::Text("wireless".to_string()),
-            }),
-            &FacetSearchParams {
-                sort: None,
-                limit: 5,
-                offset: 0,
-                has_text_query: false,
-                facet_requests: Some(&requests),
-                distinct_count: None,
-            },
-        )
-        .unwrap();
+    let result = execute_all_query_with_facets(fixture, &executor, Some(&filter), &requests, 5);
 
     assert_eq!(ids(&result), spec.expected_ids);
     assert_eq!(result.total, spec.expected_total);
     assert!(result.exhaustive_facet_values);
     for expected in super::parity_fixtures::FACET_EXPECTATIONS {
-        let actual: Vec<(&str, u64)> = result.facets[expected.field]
-            .iter()
-            .map(|count| (count.path.as_str(), count.count))
-            .collect();
-        assert_eq!(actual, expected.values, "{}", expected.field);
+        assert_facet_values(&result, expected.field, expected.values, expected.field);
     }
+    assert_price_stats(&result);
 
     let all_query_executor = fixture.executor("");
-    let all_query_result = all_query_executor
-        .execute_with_facets(
-            fixture.searcher(),
-            Box::new(AllQuery),
-            Some(&Filter::Equals {
-                field: "category".to_string(),
-                value: FieldValue::Text("Pager".to_string()),
-            }),
-            &FacetSearchParams {
-                sort: None,
-                limit: 3,
-                offset: 0,
-                has_text_query: false,
-                facet_requests: Some(&requests[0..1]),
-                distinct_count: None,
-            },
-        )
-        .unwrap();
+    let all_query_result = execute_all_query_with_facets(
+        fixture,
+        &all_query_executor,
+        Some(&pager_filter()),
+        &requests[0..1],
+        3,
+    );
     for doc in all_query_result.documents {
         assert_eq!(
             doc.score.to_bits(),
@@ -214,6 +268,27 @@ fn assert_facet_family(fixture: &ExecutorParityFixture) -> Vec<PhaseFingerprint>
 
     vec![
         fingerprint("facet/wireless", &executor),
+        assert_wireless_brand_case(
+            fixture,
+            "facet/limited",
+            None,
+            &[("Sony", 3), ("Apple", 1)],
+            false,
+        ),
+        assert_wireless_brand_case(
+            fixture,
+            "facet/value_query_exact",
+            Some("sony"),
+            &[("Sony", 3)],
+            true,
+        ),
+        assert_wireless_brand_case(
+            fixture,
+            "facet/value_query_truncated",
+            Some("o"),
+            &[("Sony", 3), ("Bose", 1)],
+            false,
+        ),
         fingerprint("facet/all_query_filter_scores", &all_query_executor),
     ]
 }
@@ -316,6 +391,10 @@ fn assert_exact_nb_hits_family(fixture: &ExecutorParityFixture) -> Vec<PhaseFing
         .unwrap();
 
     // Tripwire against later approximate nbHits: this count is hand-enumerated and exceeds the returned hit limit.
+    assert_eq!(
+        ids(&result),
+        super::parity_fixtures::EXACT_NB_HITS_EXPECTED_IDS
+    );
     assert_eq!(result.total, spec.expected_total);
     assert!(result.total > super::parity_fixtures::EXACT_NB_HITS_LIMIT);
 
@@ -669,16 +748,14 @@ fn custom_ranking_family_uses_doc_id_tiebreak_for_equal_keys() {
 /// is what turns a one-shot equality check into a stability check: per-segment
 /// task scheduling differs between rounds, so a merge-order-dependent
 /// regression that hides on the first round surfaces on a later one.
-const BOUNDED_PARITY_ROUNDS: usize = 3;
-
 #[test]
 #[serial_test::serial(flapjack_search_threads_env)]
 fn executor_parallelism_is_bounded_and_deterministic() {
     let fixture = build_parity_fixture();
 
     // Every family below also asserts against the frozen single-thread
-    // benchmark constants, so this baseline additionally pins the phase-report
-    // fields those constants do not cover.
+    // benchmark constants: hit IDs, surfaced score bits, total hits, facet
+    // ordering, and exact phase fingerprints all share one frozen owner.
     let single_thread_fingerprints = {
         let _env = SearchThreadsEnvGuard::set("1");
         assert_all_parity_families(&fixture)
@@ -688,7 +765,7 @@ fn executor_parallelism_is_bounded_and_deterministic() {
     let pool = super::bounded_pool(TEST_THREAD_COUNT).expect("bounded pool for 2 threads");
     pool.reset_counters();
 
-    for round in 0..BOUNDED_PARITY_ROUNDS {
+    for round in 0..3 {
         let bounded_fingerprints = assert_all_parity_families(&fixture);
         assert_eq!(
             bounded_fingerprints, single_thread_fingerprints,
@@ -711,34 +788,4 @@ fn executor_parallelism_is_bounded_and_deterministic() {
         "in-flight high water {} exceeded the budget of {TEST_THREAD_COUNT}",
         counters.in_flight_high_water
     );
-}
-
-fn laptop_filter() -> Filter {
-    Filter::And(vec![
-        Filter::GreaterThanOrEqual {
-            field: "price".to_string(),
-            value: FieldValue::Integer(500),
-        },
-        Filter::LessThanOrEqual {
-            field: "price".to_string(),
-            value: FieldValue::Integer(2500),
-        },
-        Filter::Equals {
-            field: "inStock".to_string(),
-            value: FieldValue::Bool(true),
-        },
-        Filter::Equals {
-            field: "releaseYear".to_string(),
-            value: FieldValue::Integer(2024),
-        },
-    ])
-}
-
-fn geoloc(doc: &crate::types::ScoredDocument) -> Option<(f64, f64)> {
-    let FieldValue::Object(point) = doc.document.fields.get("_geoloc")? else {
-        return None;
-    };
-    let lat = point.get("lat")?.as_float()?;
-    let lng = point.get("lng")?.as_float()?;
-    Some((lat, lng))
 }

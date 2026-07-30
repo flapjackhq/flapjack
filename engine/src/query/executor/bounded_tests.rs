@@ -14,7 +14,7 @@ use super::{
 };
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Barrier,
 };
 use tantivy::Executor;
 
@@ -59,7 +59,7 @@ impl SearchThreadsEnvGuard {
         Self { previous_value }
     }
 
-    pub(super) fn unset() -> Self {
+    pub(crate) fn unset() -> Self {
         let previous_value = std::env::var(SEARCH_THREADS_ENV).ok();
         std::env::remove_var(SEARCH_THREADS_ENV);
         Self { previous_value }
@@ -289,5 +289,59 @@ fn concurrent_searches_never_exceed_the_resolved_in_flight_budget() {
         counters.in_flight_high_water <= TEST_THREAD_COUNT,
         "in-flight high water {} exceeded the budget of {TEST_THREAD_COUNT}",
         counters.in_flight_high_water
+    );
+}
+
+#[test]
+#[serial_test::serial(flapjack_search_threads_env)]
+fn bounded_aggregate_concurrency_across_simultaneous_requests() {
+    const WORKERS: usize = 16;
+    const SEARCHES_PER_WORKER: usize = 25;
+
+    let _env = SearchThreadsEnvGuard::set(&TEST_THREAD_COUNT.to_string());
+    let fixture = build_parity_fixture();
+    let pool =
+        bounded_pool(TEST_THREAD_COUNT).expect("bounded pool for aggregate-concurrency test");
+    wait_for_pool_quiescence(&pool);
+    pool.reset_counters();
+
+    let start = Arc::new(Barrier::new(WORKERS));
+    std::thread::scope(|scope| {
+        for worker in 0..WORKERS {
+            let start = Arc::clone(&start);
+            let fixture = &fixture;
+            scope.spawn(move || {
+                start.wait();
+                for spec in TEXT_SPECS
+                    .iter()
+                    .cycle()
+                    .skip(worker % TEXT_SPECS.len())
+                    .take(SEARCHES_PER_WORKER)
+                {
+                    fixture
+                        .executor(spec.query)
+                        .execute(
+                            fixture.searcher(),
+                            fixture.text_query(spec),
+                            None,
+                            SEARCH_LIMIT,
+                        )
+                        .unwrap();
+                }
+            });
+        }
+    });
+
+    let counters = wait_for_pool_quiescence(&pool);
+    assert_eq!(counters.budget, TEST_THREAD_COUNT);
+    assert_eq!(counters.in_flight, 0);
+    assert!(
+        counters.multithread_executions >= WORKERS,
+        "too few requests reached the bounded executor: {:?}",
+        counters
+    );
+    assert_eq!(
+        counters.in_flight_high_water, TEST_THREAD_COUNT,
+        "simultaneous requests must saturate but not exceed the aggregate budget"
     );
 }

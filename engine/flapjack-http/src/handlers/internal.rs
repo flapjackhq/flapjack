@@ -3,7 +3,7 @@ use crate::handlers::internal_ops::{
     apply_clear_index_op, apply_clear_rules_op, apply_clear_synonyms_op, apply_copy_index_op,
     apply_delete_op, apply_delete_rule_op, apply_delete_synonym_op, apply_move_index_op,
     apply_save_rule_op, apply_save_rules_op, apply_save_synonym_op, apply_save_synonyms_op,
-    apply_upsert_op, flush_document_batch,
+    apply_upsert_op, flush_document_batch, ReplicatedDocumentBatch,
 };
 use crate::handlers::AppState;
 use axum::{
@@ -15,7 +15,6 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use flapjack::index::oplog::{OpLog, OpLogEntry};
-use flapjack::index::snapshot::export_to_bytes;
 use flapjack::{validate_index_name, IndexManager};
 use flapjack_replication::config::{NodeConfig, PeerConfig};
 use flapjack_replication::manager::{
@@ -26,17 +25,15 @@ use flapjack_replication::types::{
 };
 use flapjack_ssl::manager::RenewalStatus;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
 /// Core apply logic: parse ops and write to IndexManager.
 /// Returns the highest sequence number applied, or an error string.
 ///
-/// Implements LWW (last-writer-wins) conflict resolution:
-/// - For upserts: (timestamp_ms, node_id) tuples are compared; higher wins.
-/// - For deletes: only applied if no newer upsert has been recorded for the doc.
-/// - LWW state is tracked in-memory in IndexManager::lww_map.
+/// Conflict admission compares `(timestamp_ms, node_id)` tuples against the
+/// durable version store and an invocation-scoped overlay.
 pub async fn apply_ops_to_manager(
     manager: &IndexManager,
     tenant_id: &str,
@@ -44,40 +41,36 @@ pub async fn apply_ops_to_manager(
 ) -> Result<u64, String> {
     validate_index_name(tenant_id).map_err(|e| e.to_string())?;
 
-    bootstrap_document_lww_state(manager, tenant_id, ops);
+    bootstrap_document_version_state(manager, tenant_id, ops)?;
 
     let mut max_seq = 0u64;
-    let mut upserts = Vec::new();
-    let mut deletes = Vec::new();
-    let mut final_op_type: HashMap<String, &str> = HashMap::new();
+    let mut document_batch = ReplicatedDocumentBatch::default();
 
     for op_entry in ops {
         max_seq = max_seq.max(op_entry.seq);
         let incoming = (op_entry.timestamp_ms, op_entry.node_id.clone());
-        apply_replication_op(
-            manager,
-            tenant_id,
-            op_entry,
-            incoming,
-            &mut upserts,
-            &mut deletes,
-            &mut final_op_type,
-        )
-        .await;
+        apply_replication_op(manager, tenant_id, op_entry, incoming, &mut document_batch).await?;
     }
 
-    flush_document_batch(manager, tenant_id, upserts, deletes, final_op_type).await?;
+    flush_document_batch(manager, tenant_id, document_batch).await?;
     Ok(max_seq)
 }
 
-fn bootstrap_document_lww_state(manager: &IndexManager, tenant_id: &str, ops: &[OpLogEntry]) {
+fn bootstrap_document_version_state(
+    manager: &IndexManager,
+    tenant_id: &str,
+    ops: &[OpLogEntry],
+) -> Result<(), String> {
     if !contains_document_replication_ops(ops) {
-        return;
+        return Ok(());
     }
     if manager.get_or_load(tenant_id).is_ok() {
-        return;
+        return Ok(());
     }
-    let _ = manager.create_tenant(tenant_id);
+    manager
+        .create_tenant(tenant_id)
+        .map(|_| ())
+        .map_err(|error| format!("failed to initialize replication tenant: {error}"))
 }
 
 fn contains_document_replication_ops(ops: &[OpLogEntry]) -> bool {
@@ -91,30 +84,14 @@ async fn apply_replication_op(
     tenant_id: &str,
     op_entry: &OpLogEntry,
     incoming: (u64, String),
-    upserts: &mut Vec<flapjack::types::Document>,
-    deletes: &mut Vec<String>,
-    final_op_type: &mut HashMap<String, &str>,
-) {
+    document_batch: &mut ReplicatedDocumentBatch,
+) -> Result<(), String> {
     match op_entry.op_type.as_str() {
         "upsert" => {
-            apply_upsert_op(
-                manager,
-                tenant_id,
-                op_entry,
-                incoming,
-                upserts,
-                final_op_type,
-            );
+            apply_upsert_op(manager, tenant_id, op_entry, incoming, document_batch)?;
         }
         "delete" => {
-            apply_delete_op(
-                manager,
-                tenant_id,
-                op_entry,
-                incoming,
-                deletes,
-                final_op_type,
-            );
+            apply_delete_op(manager, tenant_id, op_entry, incoming, document_batch)?;
         }
         "move_index" => {
             log_op_error(apply_move_index_op(manager, tenant_id, op_entry).await);
@@ -140,6 +117,7 @@ async fn apply_replication_op(
             op_entry.seq
         ),
     }
+    Ok(())
 }
 
 fn log_op_error(result: Result<(), String>) {
@@ -276,7 +254,33 @@ pub async fn internal_snapshot(
         return Err(HandlerError::not_found("Tenant not found"));
     }
 
-    let bytes = export_to_bytes(&tenant_path).map_err(|error| {
+    // A replica catching up from these bytes must not inherit a mid-commit
+    // generation, so this takes the same quiesce and the same blocking byte seam as
+    // every other snapshot producer. The guard is held across the read.
+    let _quiesce = state
+        .manager
+        .quiesce_tenant(&tenant_id.to_string())
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                "[REPL {}] failed to quiesce before internal snapshot: {}",
+                tenant_id,
+                error
+            );
+            HandlerError::from(error)
+        })?;
+
+    let export_tenant_id = tenant_id.clone();
+    let bytes = tokio::task::spawn_blocking(move || {
+        crate::snapshot_byte_ops::export_snapshot_bytes(&tenant_path, &export_tenant_id)
+    })
+    .await
+    .map_err(|join_error| {
+        HandlerError::internal(format!(
+            "[REPL {tenant_id}] internal snapshot export task failed: {join_error}"
+        ))
+    })?
+    .map_err(|error| {
         tracing::error!(
             "[REPL {}] failed to export internal snapshot: {}",
             tenant_id,

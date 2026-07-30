@@ -5,7 +5,9 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use flapjack_http::serve;
 
+mod credentials;
 mod ingest;
+mod migrate;
 
 /// Top-level CLI definition for the `flapjack` binary.
 ///
@@ -42,6 +44,8 @@ struct Cli {
 enum Command {
     /// Ingest JSON or NDJSON records through the authenticated batch endpoint
     Ingest(Box<ingest::IngestArgs>),
+    /// Submit and monitor an Algolia migration on an existing Flapjack server
+    Migrate(Box<migrate::MigrateArgs>),
     /// Remove Flapjack binary and clean up shell PATH entries
     Uninstall,
     /// Generate a new admin API key (replaces the current one in keys.json)
@@ -169,6 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match &cli.command {
         Some(Command::Ingest(args)) => ingest::run(args),
+        Some(Command::Migrate(args)) => migrate::run(args),
         Some(Command::Uninstall) => run_uninstall(),
         Some(Command::ResetAdminKey) => {
             let data_dir = resolve_data_dir(&cli, &matches)

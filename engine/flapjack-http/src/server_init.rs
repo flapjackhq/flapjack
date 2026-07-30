@@ -548,6 +548,9 @@ pub(crate) fn initialize_state(
             infrastructure.replication_manager.clone(),
             crate::handlers::migration::DEFAULT_ASYNC_MIGRATION_CAPACITY,
         )),
+        bulk_replace_max_bytes: crate::handlers::migration::bulk_replace::configured_bulk_cap(
+            crate::handlers::migration::spool::SpoolLimits::default().max_bytes_per_job,
+        )?,
         start_time: startup_start,
         conversation_store: ConversationStore::default_shared(),
         embedder_store: Arc::new(crate::embedder_store::EmbedderStore::new()),

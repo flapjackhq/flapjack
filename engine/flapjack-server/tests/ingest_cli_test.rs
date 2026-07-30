@@ -695,43 +695,101 @@ fn api_key_with_http_delimiters_is_rejected_before_connecting() {
 }
 
 #[test]
-fn replace_mode_refuses_typed_zero_mutation() {
-    let data = TempDir::new("ingest_replace_refusal");
-    let server = RunningServer::spawn_no_auth_auto_port(data.path());
-    let task_id = server.add_documents_batch(
-        "products",
-        json!({"requests":[{"action":"addObject","body":{"objectID":"sentinel","name":"Keep"}}]}),
-    );
-    server.wait_for_task_published("products", task_id, Duration::from_secs(5));
+fn replace_mode_submits_bulk_replace_job_and_reports_confirmed() {
+    let job_id = "2fd16c8a-9b40-46d9-b252-c0d22ae6d27c";
+    let sink = FakeBatchSink::start(vec![
+        SinkResponse::status_with_body(
+            202,
+            &json!({
+                "jobID": job_id,
+                "targetIndex": "products",
+                "topology": "single_node_only",
+                "phase": "submitted",
+                "disposition": "running"
+            })
+            .to_string(),
+        ),
+        SinkResponse::status_with_body(
+            200,
+            &json!({
+                "jobID": job_id,
+                "targetIndex": "products",
+                "topology": "single_node_only",
+                "phase": "activating",
+                "disposition": "succeeded",
+                "objectsImported": {"imported": 2}
+            })
+            .to_string(),
+        ),
+    ]);
     let source = write_source(
-        "replace_refusal_source",
-        r#"[{"objectID":"incoming","name":"Must Not Land"}]"#,
+        "replace_success_source",
+        r#"[{"objectID":"incoming-1","name":"First"},{"objectID":"incoming-2","name":"Second"}]"#,
     );
 
-    let output = ingest_cmd(
-        format!("http://{}", server.bind_addr()),
-        source.source_path(),
-    )
-    .arg("--mode")
-    .arg("replace")
-    .assert()
-    .code(2)
-    .get_output()
-    .clone();
+    let output = ingest_cmd(sink.endpoint(), source.source_path())
+        .arg("--mode")
+        .arg("replace")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
 
     let report = json_stdout(&output.stdout);
-    assert_eq!(report["attempted"], json!(0));
+    assert_eq!(report["attempted"], json!(2));
+    assert_eq!(report["confirmed_committed"], json!(2));
+    assert_eq!(report["outcome_unknown"], json!(0));
+    assert_eq!(report["failure_classification"], Value::Null);
+
+    let submit = sink.next_request();
+    assert_eq!(submit.path, "/1/migrations/bulk-replace?indexName=products");
+    assert_eq!(
+        submit.header("content-type").as_deref(),
+        Some("application/x-ndjson")
+    );
+    assert_eq!(
+        submit.body,
+        json!([
+            {"objectID":"incoming-1","name":"First"},
+            {"objectID":"incoming-2","name":"Second"}
+        ])
+    );
+    let status = sink.next_request();
+    assert_eq!(status.path, format!("/1/migrations/bulk-replace/{job_id}"));
+}
+
+#[test]
+fn replace_mode_reports_server_refusal_without_confirming_mutation() {
+    let sink = FakeBatchSink::start(vec![SinkResponse::status_with_body(
+        503,
+        r#"{"message":"Migration is only supported when no replication peers are configured","status":503,"code":"migration_ha_unsupported"}"#,
+    )]);
+    let source = write_source(
+        "replace_server_refusal_source",
+        "{\"objectID\":\"incoming\",\"name\":\"Must Not Be Confirmed\"}\n",
+    );
+
+    let output = ingest_cmd(sink.endpoint(), source.source_path())
+        .arg("--mode")
+        .arg("replace")
+        .assert()
+        .code(2)
+        .get_output()
+        .clone();
+
+    let report = json_stdout(&output.stdout);
+    assert_eq!(report["attempted"], json!(1));
     assert_eq!(report["confirmed_committed"], json!(0));
     assert_eq!(report["outcome_unknown"], json!(0));
     assert_eq!(
         report["failure_classification"],
         json!("replace_not_supported")
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("replace_not_supported"));
-
-    let search = wait_for_search_hits(&server, "products", 1);
-    assert!(search_hit_with(&search, "sentinel", "name", json!("Keep")));
-    assert!(!search_hit_object_id(&search, "incoming"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("migration_ha_unsupported"));
+    assert_eq!(
+        sink.next_request().path,
+        "/1/migrations/bulk-replace?indexName=products"
+    );
 }
 
 fn ingest_cmd(endpoint: String, source: &str) -> assert_cmd::Command {
@@ -1073,7 +1131,22 @@ fn handle_fake_sink_connection(
         .unwrap_or(0);
     let mut body_bytes = vec![0; content_length];
     reader.read_exact(&mut body_bytes).unwrap();
-    let body = serde_json::from_slice(&body_bytes).unwrap();
+    let body = if headers
+        .get("content-type")
+        .is_some_and(|value| value.starts_with("application/x-ndjson"))
+    {
+        Value::Array(
+            body_bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect(),
+        )
+    } else if body_bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body_bytes).unwrap()
+    };
     tx.send(RecordedRequest {
         path,
         headers,

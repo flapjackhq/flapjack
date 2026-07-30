@@ -18,6 +18,8 @@ use uuid::Uuid;
 
 #[allow(dead_code)]
 mod algolia_client;
+mod bulk_build;
+pub mod bulk_replace;
 mod export;
 mod import;
 mod job_runner;
@@ -34,13 +36,19 @@ use crate::auth::AuthenticatedAppId;
 use crate::error_response::{json_error_parts, json_error_parts_with_code};
 use crate::handlers::index_resource_store::{delete_resource_item, load_existing_store};
 use algolia_client::{AlgoliaClient, AlgoliaClientError, AlgoliaErrorKind};
+pub use bulk_replace::{
+    cancel_bulk_replace_http, get_bulk_replace_status_http, submit_bulk_replace_http,
+    BulkReplaceReceipt,
+};
 pub use job_runner::{MigrationJobRunner, DEFAULT_ASYNC_MIGRATION_CAPACITY};
 use spool::{
     MigrationCancelRequest, MigrationDisposition, MigrationExportProgress, MigrationImportWarning,
     MigrationPhase, MigrationPhaseRecord, PrivacyScrubAdmission, PrivacyScrubIntent,
-    PrivacyScrubIntentFields, SpoolErrorKind,
+    PrivacyScrubIntentFields, SpoolError, SpoolErrorKind,
 };
 
+const MIGRATION_CANCELLED_CODE: &str = "migration_cancelled";
+const MIGRATION_CANCELLED_MESSAGE: &str = "Algolia migration cancellation was requested";
 const MIGRATION_HA_UNSUPPORTED_CODE: &str = "migration_ha_unsupported";
 const MIGRATION_HA_UNSUPPORTED_MESSAGE: &str = "Algolia migration import is unavailable on HA clusters until MIG-7 supplies a costed convergence protocol.";
 const MIGRATION_CAPACITY_EXHAUSTED_CODE: &str = "migration_capacity_exhausted";
@@ -93,12 +101,19 @@ pub struct MigrateFromAlgoliaRequest {
 pub(crate) enum AsyncMigrationSourceProvider {
     #[default]
     Algolia,
+    BulkReplace,
 }
 
 impl AsyncMigrationSourceProvider {
     fn is_algolia(&self) -> bool {
         *self == Self::Algolia
     }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationTopology {
+    SingleNodeOnly,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -197,6 +212,10 @@ pub struct AsyncMigrationStatusResponse {
     pub phase: AsyncMigrationPhase,
     pub disposition: AsyncMigrationDisposition,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_index: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology: Option<MigrationTopology>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub export_progress: Option<AsyncMigrationExportProgress>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -206,6 +225,8 @@ pub struct AsyncMigrationStatusResponse {
     // durable outcome, never fabricated as zeros for running/failed/cancelled jobs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settings_applied: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub objects_imported: Option<MigrateCount>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub synonyms_imported: Option<MigrateCount>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -231,10 +252,13 @@ impl From<MigrationPhaseRecord> for AsyncMigrationStatusResponse {
     fn from(record: MigrationPhaseRecord) -> Self {
         let show_import_outcome =
             record.disposition == MigrationDisposition::Succeeded && record.terminal_at.is_some();
-        let (settings_applied, synonyms_imported, rules_imported, warnings) =
+        let (settings_applied, objects_imported, synonyms_imported, rules_imported, warnings) =
             match (show_import_outcome, record.import_outcome) {
                 (true, Some(outcome)) => (
                     Some(outcome.settings_applied),
+                    Some(MigrateCount {
+                        imported: outcome.objects_imported,
+                    }),
                     Some(MigrateCount {
                         imported: outcome.synonyms_imported,
                     }),
@@ -247,21 +271,36 @@ impl From<MigrationPhaseRecord> for AsyncMigrationStatusResponse {
                         .map(MigrateWarning::from)
                         .collect(),
                 ),
-                _ => (None, None, None, Vec::new()),
+                _ => (None, None, None, None, Vec::new()),
             };
         Self {
             job_id: record.job_uuid,
             phase: record.phase.into(),
             disposition: record.disposition.into(),
+            target_index: None,
+            topology: None,
             export_progress: record.export_progress.map(Into::into),
             created_at: record.created_at,
             updated_at: record.updated_at,
             terminal_at: record.terminal_at,
             settings_applied,
+            objects_imported,
             synonyms_imported,
             rules_imported,
             warnings,
         }
+    }
+}
+
+impl AsyncMigrationStatusResponse {
+    fn with_metadata(
+        record: MigrationPhaseRecord,
+        metadata: &spool::AsyncMigrationMetadata,
+    ) -> Self {
+        let mut response = Self::from(record);
+        response.target_index = Some(metadata.target_index.clone());
+        response.topology = metadata.topology;
+        response
     }
 }
 
@@ -687,7 +726,7 @@ pub(crate) async fn cancel_algolia_migration_http(
     .await
 }
 
-async fn get_source_migration_status(
+pub(super) async fn get_source_migration_status(
     state: Arc<AppState>,
     owner_identity: String,
     job_id: String,
@@ -696,10 +735,16 @@ async fn get_source_migration_status(
     let phase_record = spool
         .read_migration_phase(job_uuid)
         .map_err(migration_status_spool_error)?;
-    Ok(Json(AsyncMigrationStatusResponse::from(phase_record)))
+    let metadata = spool
+        .read_async_migration_metadata(job_uuid)
+        .map_err(migration_status_spool_error)?;
+    Ok(Json(AsyncMigrationStatusResponse::with_metadata(
+        phase_record,
+        &metadata,
+    )))
 }
 
-async fn cancel_source_migration(
+pub(super) async fn cancel_source_migration(
     state: Arc<AppState>,
     owner_identity: String,
     job_id: String,
@@ -710,7 +755,12 @@ async fn cancel_source_migration(
         .map_err(migration_status_spool_error)?
     {
         MigrationCancelRequest::Requested(record) => {
-            Ok(Json(AsyncMigrationStatusResponse::from(record)))
+            let metadata = spool
+                .read_async_migration_metadata(job_uuid)
+                .map_err(migration_status_spool_error)?;
+            Ok(Json(AsyncMigrationStatusResponse::with_metadata(
+                record, &metadata,
+            )))
         }
         MigrationCancelRequest::TooLate(_) => Err(json_error_parts_with_code(
             StatusCode::CONFLICT,
@@ -931,6 +981,51 @@ fn algolia_error(error: AlgoliaClientError) -> (StatusCode, Json<serde_json::Val
     json_error_parts(status, error.safe_message())
 }
 
+fn migration_cancelled_error() -> MigrateError {
+    json_error_parts_with_code(
+        StatusCode::CONFLICT,
+        MIGRATION_CANCELLED_CODE,
+        MIGRATION_CANCELLED_MESSAGE,
+    )
+}
+
+fn spool_error(error: SpoolError) -> MigrateError {
+    let status = match error.kind() {
+        SpoolErrorKind::JobNotFound
+        | SpoolErrorKind::PublicHandleNotFound
+        | SpoolErrorKind::CheckpointHandleNotFound => StatusCode::NOT_FOUND,
+        SpoolErrorKind::CompressedPageBytesExceeded
+        | SpoolErrorKind::DecompressedPageBytesExceeded
+        | SpoolErrorKind::ResourceItemCountExceeded
+        | SpoolErrorKind::JobBytesExceeded
+        | SpoolErrorKind::GlobalBytesExceeded
+        | SpoolErrorKind::FreeSpaceFloor
+        | SpoolErrorKind::StagedArtifactCountExceeded
+        | SpoolErrorKind::StagedArtifactBytesExceeded
+        | SpoolErrorKind::InvalidRelativePath
+        | SpoolErrorKind::InvalidSourceIdentityDigest
+        | SpoolErrorKind::InvalidCompletedResourceId
+        | SpoolErrorKind::SourceIdentityMismatch
+        | SpoolErrorKind::ResourceVerificationFailed
+        | SpoolErrorKind::ResourceComplete
+        | SpoolErrorKind::ResourcesIncomplete
+        | SpoolErrorKind::CancelRequested
+        | SpoolErrorKind::JobTerminal
+        | SpoolErrorKind::JobNotAccepted
+        | SpoolErrorKind::UnsupportedArtifactKind
+        | SpoolErrorKind::InvalidPhaseTransition
+        | SpoolErrorKind::PrivacyScrubIntentCollision => StatusCode::BAD_REQUEST,
+        SpoolErrorKind::JobDeleting => StatusCode::CONFLICT,
+        SpoolErrorKind::Io | SpoolErrorKind::ManifestCorrupt => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
+        "Internal server error".to_string()
+    } else {
+        error.to_string()
+    };
+    json_error_parts(status, message)
+}
+
 fn migration_status_spool_error(error: spool::SpoolError) -> MigrateError {
     if error.kind() == SpoolErrorKind::JobNotFound {
         return json_error_parts_with_code(
@@ -939,7 +1034,7 @@ fn migration_status_spool_error(error: spool::SpoolError) -> MigrateError {
             MIGRATION_JOB_NOT_FOUND_MESSAGE,
         );
     }
-    import::spool_error(error)
+    spool_error(error)
 }
 
 fn ensure_async_migration_owner(
@@ -1279,7 +1374,7 @@ fn privacy_scrub_spool_error(error: spool::SpoolError) -> MigrateError {
             "Privacy scrub intent identity does not match",
         );
     }
-    import::spool_error(error)
+    spool_error(error)
 }
 
 #[cfg(test)]

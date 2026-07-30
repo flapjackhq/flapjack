@@ -369,6 +369,7 @@ async fn smoke_internal_endpoint() {
         usage_persistence: None,
         geoip_reader: None,
         notification_service: None,
+        bulk_replace_max_bytes: 4 * 1024 * 1024 * 1024,
         migration_runner: std::sync::Arc::new(
             flapjack_http::handlers::migration::MigrationJobRunner::new(
                 mgr,
@@ -480,6 +481,7 @@ mod cors {
             usage_persistence: None,
             geoip_reader: None,
             notification_service: None,
+            bulk_replace_max_bytes: 4 * 1024 * 1024 * 1024,
             migration_runner: Arc::new(
                 flapjack_http::handlers::migration::MigrationJobRunner::new(
                     manager,

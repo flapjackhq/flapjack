@@ -586,6 +586,71 @@
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(replacement_reopen_proof_hook)]
+    async fn replacement_holds_quiesce_admission_fence_through_reopen_proof() {
+        let temp_dir = TempDir::new().unwrap();
+        let destination_id = "quiesced_replacement_live";
+        let staging_id = "quiesced_replacement_staging";
+        let manager = IndexManager::new(temp_dir.path());
+        manager.create_tenant(destination_id).unwrap();
+        manager.create_tenant(staging_id).unwrap();
+        manager
+            .add_documents_sync(
+                destination_id,
+                vec![document("destination_seed", "destination generation")],
+            )
+            .await
+            .unwrap();
+        manager
+            .add_documents_sync(
+                staging_id,
+                vec![document("staging_seed", "replacement generation")],
+            )
+            .await
+            .unwrap();
+        let staging_baseline = manager
+            .capture_replacement_staging_baseline(destination_id)
+            .unwrap();
+        let _hook = IndexManager::set_replacement_reopen_proof_hook_for_test(
+            move |manager, observed, _| {
+                if observed != destination_id {
+                    return;
+                }
+                let error = manager
+                    .add_documents(
+                        observed,
+                        vec![document("racing_write", "must remain fenced")],
+                    )
+                    .expect_err("replacement must keep write admission fenced until reopen proof");
+                assert!(
+                    matches!(error, FlapjackError::IndexPaused(ref tenant) if tenant == observed),
+                    "replacement admission fence must return IndexPaused, got {error:?}"
+                );
+            },
+        );
+
+        manager
+            .replace_index_contents(staging_id, destination_id, staging_baseline)
+            .await
+            .unwrap();
+        let lifecycle_events =
+            crate::index::write_queue::writer_lifecycle_test_events(destination_id);
+        assert!(
+            lifecycle_events
+                .iter()
+                .any(|event| event.phase == "manager_quiesce_admission_fenced"),
+            "replacement must traverse the canonical tenant quiesce owner: {lifecycle_events:?}"
+        );
+        manager
+            .add_documents_sync(
+                destination_id,
+                vec![document("post_replacement", "admission reopens after replacement")],
+            )
+            .await
+            .expect("replacement must release the quiesce fence when it returns");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(replacement_reopen_proof_hook)]
     async fn replace_index_contents_refuses_reopen_when_committed_journal_loses_fence_evidence() {
         assert_post_commit_reopen_proof_refusal(
             "journal_evidence_live",
@@ -698,6 +763,38 @@
         NonRegular,
         Malformed,
         NumericMismatch,
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replace_index_contents_accepts_pristine_empty_destination() {
+        let temp_dir = TempDir::new().unwrap();
+        let destination_id = "empty_destination";
+        let staging_id = "empty_destination_staging";
+        let manager = IndexManager::new(temp_dir.path());
+        manager.create_tenant(destination_id).unwrap();
+        manager.create_tenant(staging_id).unwrap();
+        let staging_baseline = manager
+            .capture_replacement_staging_baseline(destination_id)
+            .unwrap();
+        manager
+            .add_documents_sync(
+                staging_id,
+                vec![document("staging_seed", "replacement generation seed")],
+            )
+            .await
+            .unwrap();
+
+        manager
+            .replace_index_contents(staging_id, destination_id, staging_baseline)
+            .await
+            .unwrap();
+
+        assert_document_title(
+            &manager,
+            destination_id,
+            "staging_seed",
+            "replacement generation seed",
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

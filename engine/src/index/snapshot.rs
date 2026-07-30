@@ -124,6 +124,7 @@ pub fn import_from_bytes(data: &[u8], dest_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::version_store::{VersionRecord, VersionStore};
     use std::fs;
     use tempfile::TempDir;
 
@@ -168,6 +169,26 @@ mod tests {
             fs::read_to_string(restored.path().join("data.json")).unwrap(),
             r#"{"key": "value"}"#
         );
+    }
+
+    #[test]
+    fn version_store_survives_snapshot_export_import_roundtrip() {
+        let source = TempDir::new().unwrap();
+        let live = VersionRecord::new(1_700_000_000_001, "node-a", false, 17);
+        let deleted = VersionRecord::new(1_700_000_000_002, "node-b", true, 18);
+        {
+            let store = VersionStore::open(source.path()).unwrap();
+            assert!(store.upsert("live-object", &live).unwrap());
+            assert!(store.upsert("deleted-object", &deleted).unwrap());
+        }
+
+        let bytes = export_to_bytes(source.path()).unwrap();
+        let restored = TempDir::new().unwrap();
+        import_from_bytes(&bytes, restored.path()).unwrap();
+
+        let store = VersionStore::open(restored.path()).unwrap();
+        assert_eq!(store.get("live-object").unwrap(), Some(live));
+        assert_eq!(store.get("deleted-object").unwrap(), Some(deleted));
     }
 
     #[test]

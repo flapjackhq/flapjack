@@ -1,6 +1,35 @@
 use super::*;
 
 impl SpoolStore {
+    pub(crate) fn seal_bulk_replace_export(
+        &self,
+        job_uuid: Uuid,
+        source_identity_digest: &str,
+        document_count: u64,
+    ) -> SpoolResult<()> {
+        validate_source_identity_digest(source_identity_digest)?;
+        let _root_lock = self.lock_root()?;
+        let _job_lock = self.lock_job(job_uuid)?;
+        let mut manifest = self.read_manifest(job_uuid)?;
+        self.ensure_writable(&manifest)?;
+        if manifest.counters.settings != 1
+            || manifest.counters.documents != document_count
+            || manifest.counters.rules != 0
+            || manifest.counters.synonyms != 0
+        {
+            return Err(SpoolError::new(SpoolErrorKind::ResourceVerificationFailed));
+        }
+        manifest.source_identity_digest = source_identity_digest.to_string();
+        manifest.denominators = ResourceDenominators {
+            settings: 1,
+            documents: document_count,
+            rules: 0,
+            synonyms: 0,
+            config: 0,
+        };
+        self.commit_manifest(&manifest)
+    }
+
     pub(crate) fn commit_settings_once(
         &self,
         job_uuid: Uuid,

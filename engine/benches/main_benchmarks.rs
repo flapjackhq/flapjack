@@ -209,6 +209,10 @@ fn bench_indexing(c: &mut Criterion) {
 /// Measures `export_tenant` and `import_tenant` throughput using fresh
 /// temporary directories for each iteration to avoid cache effects.
 fn bench_migration(c: &mut Criterion) {
+    // `import_tenant` quiesces the destination writer through the async merge-
+    // quiescence contract, so it now returns a future that must be driven on a
+    // runtime.
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let temp = TempDir::new().unwrap();
     let manager = IndexManager::new(temp.path());
     setup_tenant(&manager, "bench", 5000);
@@ -240,8 +244,7 @@ fn bench_migration(c: &mut Criterion) {
                 (import_temp, import_manager)
             },
             |(temp, import_manager)| {
-                import_manager
-                    .import_tenant(&"bench".to_string(), &export_path)
+                rt.block_on(import_manager.import_tenant(&"bench".to_string(), &export_path))
                     .unwrap();
                 drop(temp);
             },

@@ -309,6 +309,137 @@ index_doc_count() {
   }
 }
 
+_evaluate_liveness_distribution() {
+  awk -F '\t' \
+    -v p99_limit_ms="$2" \
+    -v stall_limit_ms="$3" \
+    -v min_samples_per_endpoint="$4" '
+    function report_error(message) {
+      print "ERROR: liveness_distribution " message > "/dev/stderr"
+      invalid = 1
+    }
+    function sort_values(values, count,   i, j, temporary) {
+      for (i = 2; i <= count; i++) {
+        temporary = values[i]
+        j = i - 1
+        while (j >= 1 && values[j] > temporary) {
+          values[j + 1] = values[j]
+          j--
+        }
+        values[j + 1] = temporary
+      }
+    }
+    function nearest_rank_p99(values, count,   rank) {
+      rank = int((99 * count + 99) / 100)
+      return values[rank]
+    }
+    {
+      if (NF != 3) {
+        report_error("row " NR " must contain exactly three tab-separated fields")
+        next
+      }
+      endpoint = $1
+      status = $2
+      latency = $3
+      if (endpoint != "health" && endpoint != "count") {
+        report_error("row " NR " has unknown endpoint: " endpoint)
+        next
+      }
+      if (status != "ok" && status != "timeout") {
+        report_error("row " NR " has unknown status: " status)
+        next
+      }
+      if (latency !~ /^[0-9]+$/) {
+        report_error("row " NR " latency must be a non-negative integer: " latency)
+        next
+      }
+
+      if (endpoint == "health") {
+        health_values[++health_count] = latency + 0
+        health_timeouts += status == "timeout"
+        health_ok += status == "ok"
+      } else {
+        count_values[++count_count] = latency + 0
+        count_timeouts += status == "timeout"
+        count_ok += status == "ok"
+      }
+    }
+    END {
+      if (NR == 0) {
+        report_error("sample file is empty")
+      }
+      if (invalid) {
+        exit 1
+      }
+      if (health_count == 0 || count_count == 0) {
+        report_error("samples must include both health and count endpoints")
+        exit 1
+      }
+      if (health_ok == 0 || count_ok == 0) {
+        report_error("both endpoints require at least one determinate ok sample")
+        exit 1
+      }
+      if (health_count < min_samples_per_endpoint || count_count < min_samples_per_endpoint) {
+        report_error("each endpoint requires at least " min_samples_per_endpoint " samples")
+        exit 1
+      }
+      sort_values(health_values, health_count)
+      sort_values(count_values, count_count)
+      health_p99 = nearest_rank_p99(health_values, health_count)
+      count_p99 = nearest_rank_p99(count_values, count_count)
+      health_max = health_values[health_count]
+      count_max = count_values[count_count]
+      health_failed = health_timeouts > 0 \
+        || health_max >= stall_limit_ms \
+        || health_p99 > p99_limit_ms
+      count_failed = count_timeouts > 0 \
+        || count_max >= stall_limit_ms \
+        || count_p99 > p99_limit_ms
+      printf "endpoint=health samples=%d p99_ms=%d max_ms=%d verdict=%s\n", \
+        health_count, health_p99, health_max, health_failed ? "fail" : "pass"
+      printf "endpoint=count samples=%d p99_ms=%d max_ms=%d verdict=%s\n", \
+        count_count, count_p99, count_max, count_failed ? "fail" : "pass"
+      if (health_timeouts > 0 || count_timeouts > 0) {
+        report_error("timeout samples are not allowed")
+      }
+      if (health_max >= stall_limit_ms || count_max >= stall_limit_ms) {
+        report_error("sample latency reached the stall limit")
+      }
+      if (health_p99 > p99_limit_ms || count_p99 > p99_limit_ms) {
+        report_error("endpoint p99 exceeded the supplied limit")
+      }
+      exit invalid ? 1 : 0
+    }
+  ' "$1"
+}
+
+liveness_distribution() {
+  local sample_file="${1:-}"
+  local p99_limit_ms="${2:-}"
+  local stall_limit_ms="${3:-}"
+  local min_samples_per_endpoint="${LIVENESS_MIN_SAMPLES_PER_ENDPOINT:-1}"
+
+  [[ -r "$sample_file" ]] || {
+    echo "ERROR: liveness_distribution sample file is not readable: ${sample_file}" >&2
+    return 1
+  }
+  [[ "$p99_limit_ms" =~ ^[0-9]+$ ]] || {
+    echo "ERROR: liveness_distribution p99 limit must be a non-negative integer: ${p99_limit_ms}" >&2
+    return 1
+  }
+  [[ "$stall_limit_ms" =~ ^[1-9][0-9]*$ ]] || {
+    echo "ERROR: liveness_distribution stall limit must be a positive integer: ${stall_limit_ms}" >&2
+    return 1
+  }
+  [[ "$min_samples_per_endpoint" =~ ^[1-9][0-9]*$ ]] || {
+    echo "ERROR: liveness_distribution minimum sample count must be a positive integer: ${min_samples_per_endpoint}" >&2
+    return 1
+  }
+
+  _evaluate_liveness_distribution \
+    "$sample_file" "$p99_limit_ms" "$stall_limit_ms" "$min_samples_per_endpoint"
+}
+
 wait_for_count_or_stall() {
   local base_url="$1"
   local index_name="$2"

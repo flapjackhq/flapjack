@@ -6,8 +6,8 @@ use super::epoch::{
     try_validate_publication_epoch_admission, PublicationEpochAdmissionError,
 };
 use super::{
-    compare_and_advance_publication_epoch, PublicationEpoch, PublicationEpochError,
-    PublicationTarget,
+    compare_and_advance_publication_epoch, run_if_publication_admission_unfenced, PublicationEpoch,
+    PublicationEpochError, PublicationTarget,
 };
 use std::fs;
 use std::sync::{mpsc, Mutex};
@@ -124,6 +124,60 @@ fn pending_exclusive_fence_request_fails_same_target_admission_fast() {
     drop(active_admission);
     let fence = advance.join().unwrap().unwrap();
     assert_eq!(fence.advanced(), PublicationEpoch(1));
+}
+
+#[test]
+fn epoch_advance_waits_for_preexisting_unfenced_operation() {
+    let tmp = TempDir::new().unwrap();
+    let products = target("reserved_load_products");
+    let (reservation_started_tx, reservation_started_rx) = mpsc::channel();
+    let (release_reservation_tx, release_reservation_rx) = mpsc::channel();
+    let reservation_base = tmp.path().to_path_buf();
+    let reservation_target = products.clone();
+    let reservation = std::thread::spawn(move || {
+        run_if_publication_admission_unfenced(&reservation_base, &reservation_target, || {
+            reservation_started_tx.send(()).unwrap();
+            release_reservation_rx.recv().unwrap();
+        })
+        .expect("the pre-existing load operation must reserve the unfenced path");
+    });
+    reservation_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the load reservation must become active");
+
+    let (advance_result_tx, advance_result_rx) = mpsc::channel();
+    let advance_base = tmp.path().to_path_buf();
+    let advance_target = products.clone();
+    let advance = std::thread::spawn(move || {
+        advance_result_tx
+            .send(
+                compare_and_advance_publication_epoch(
+                    &advance_base,
+                    &advance_target,
+                    PublicationEpoch(0),
+                )
+                .map(|fence| fence.advanced()),
+            )
+            .unwrap();
+    });
+
+    let premature_result = advance_result_rx.recv_timeout(Duration::from_millis(100));
+    let advanced_before_release = premature_result.is_ok();
+    release_reservation_tx.send(()).unwrap();
+    reservation.join().unwrap();
+    let advance_result = match premature_result {
+        Ok(result) => result,
+        Err(_) => advance_result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("epoch advance must finish after the load reservation releases"),
+    };
+    advance.join().unwrap();
+
+    assert!(
+        !advanced_before_release,
+        "epoch advance must wait for a load that reserved the unfenced path first"
+    );
+    assert_eq!(advance_result.unwrap(), PublicationEpoch(1));
 }
 
 #[test]

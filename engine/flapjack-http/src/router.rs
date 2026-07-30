@@ -17,8 +17,9 @@ use crate::handlers;
 use crate::handlers::analytics;
 use crate::handlers::insights::GdprDeleteState;
 use crate::handlers::migration::{
-    cancel_algolia_migration_http, get_algolia_migration_status_http,
-    submit_algolia_migration_http, submit_privacy_scrub_http,
+    cancel_algolia_migration_http, cancel_bulk_replace_http, get_algolia_migration_status_http,
+    get_bulk_replace_status_http, submit_algolia_migration_http, submit_bulk_replace_http,
+    submit_privacy_scrub_http,
 };
 use crate::handlers::{
     add_documents, add_record_auto_id, append_security_source, batch_search, browse_index,
@@ -232,6 +233,18 @@ fn build_protected_routes(state: Arc<AppState>, data_dir: &Path, auth_enabled: b
         )
         .route("/1/migrate-from-algolia", post(migrate_from_algolia))
         .route("/1/migrations/algolia", post(submit_algolia_migration_http))
+        .route(
+            "/1/migrations/bulk-replace",
+            post(submit_bulk_replace_http).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/1/migrations/bulk-replace/:job_id",
+            get(get_bulk_replace_status_http),
+        )
+        .route(
+            "/1/migrations/bulk-replace/:job_id/cancel",
+            post(cancel_bulk_replace_http),
+        )
         .route(
             "/1/migrations/algolia/:job_id",
             get(get_algolia_migration_status_http),

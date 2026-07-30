@@ -21,10 +21,25 @@ and this project follows [Semantic Versioning](https://semver.org/).
   locality, evidence, and text-search latency gate. The July 25 latency/count
   failures remain immutable historical evidence rather than the current
   Guaranteed result.
+- Node-local bulk replacement now owns bulk-only writer-buffer and document
+  checkpoint knobs, and the scale projector accepts bulk-build throughput probe
+  evidence only under the existing reference-locality gate.
+- The node-local bulk-build writer buffer (20,000,000 bytes) and document
+  checkpoint interval (1,000 documents) are frozen at the behavior-preserving
+  baseline with a recorded local-locality gate measurement. Raising the
+  bulk-only budget requires a reference-locality (`i4i.4xlarge` NVMe) sweep,
+  which is a paid AWS scale run deferred to the named successor "paid reference
+  ladder" batch; no new capacity or throughput claim is published.
 
 ### Fixed
 
 - Explicit empty arrays (`[]`) in customer document fields are now preserved on write instead of being dropped, keeping customer-supplied content intact.
+- Staged bulk builds now await their write worker and Tantivy merge threads before
+  validation, settled-metrics capture, or publication.
+- Write-admission backpressure no longer pauses a tenant whose live segment count
+  settles into the staged-bulk range. The selected settled segment band now spans
+  both measured regimes (online and staged bulk), so a large bulk build that settles
+  above the online shape is no longer treated as an unhealthy segment ceiling.
 - Async replacement now survives cancel/failure boundaries and idempotent owner
   ACK replay without leaving the replaced target in an indeterminate
   publication state.

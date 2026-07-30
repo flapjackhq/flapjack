@@ -1,3 +1,4 @@
+use crate::credentials::{validate_http_header_value, SecretSource};
 use clap::{Args, ValueEnum};
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -7,6 +8,9 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[path = "ingest_replace.rs"]
+mod ingest_replace;
 
 const DEFAULT_BATCH_SIZE: usize = 1_000;
 const DEFAULT_ACTION_FIELD: &str = "_action";
@@ -63,7 +67,7 @@ pub(crate) struct IngestArgs {
     #[arg(long, default_value = DEFAULT_ACTION_FIELD)]
     action_field: String,
 
-    /// Ingestion mode. replace is reserved until atomic publication support ships.
+    /// Ingestion mode. replace atomically publishes through the node-local bulk job API.
     #[arg(long, value_enum, default_value_t = IngestMode::Upsert)]
     mode: IngestMode,
 
@@ -161,6 +165,14 @@ struct HttpSink<'a> {
     next_batch_id: usize,
 }
 
+trait OperationSink {
+    fn submit_operations(
+        &mut self,
+        operations: Vec<RecordOperation>,
+        report: &mut IngestReport,
+    ) -> Result<(), IngestError>;
+}
+
 pub(crate) fn run(args: &IngestArgs) -> Result<(), Box<dyn std::error::Error>> {
     let result = run_ingest(args);
     match result {
@@ -213,16 +225,23 @@ struct IngestError {
 fn run_ingest(args: &IngestArgs) -> Result<IngestReport, IngestFailure> {
     validate_args(args)?;
     let api_key = read_api_key(args)?;
-    if args.mode == IngestMode::Replace {
-        return Err(IngestFailure {
-            message: "replace_not_supported: --mode replace requires the MIG-5 mutation-fence/publication contract and is not available in this beta".to_string(),
-            api_key,
-            classification: FailureClassification::ReplaceNotSupported,
-            report: Box::default(),
-        });
-    }
     let endpoint =
         parse_endpoint(&args.endpoint).map_err(|message| input_error(message, &api_key))?;
+    if args.mode == IngestMode::Replace {
+        return std::thread::scope(|scope| {
+            scope
+                .spawn(move || ingest_replace::run(args, endpoint, api_key))
+                .join()
+                .unwrap_or_else(|_| {
+                    Err(IngestFailure {
+                        message: "bulk replacement client thread panicked".to_string(),
+                        api_key: String::new(),
+                        classification: FailureClassification::OutcomeUnknown,
+                        report: Box::default(),
+                    })
+                })
+        });
+    }
     let mut report = IngestReport::default();
     let mut sink = HttpSink {
         endpoint,
@@ -254,27 +273,15 @@ fn validate_args(args: &IngestArgs) -> Result<(), IngestFailure> {
             "--source - cannot be combined with --api-key-stdin; both consume stdin",
         ));
     }
-    let sources = usize::from(args.api_key_env.is_some())
-        + usize::from(args.api_key_file.is_some())
-        + usize::from(args.api_key_stdin);
-    if sources != 1 {
-        return Err(config_error(
-            "exactly one of --api-key-env, --api-key-file, or --api-key-stdin is required",
-        ));
-    }
+    api_key_source(args)
+        .validate_exactly_one("--api-key-env, --api-key-file, or --api-key-stdin")
+        .map_err(|message| config_error(&message))?;
     validate_http_header_value("--application-id", &args.application_id)
         .map_err(|message| config_error(&message))?;
     validate_http_header_value("--idempotency-key-prefix", &args.idempotency_key_prefix)
         .map_err(|message| config_error(&message))?;
     validate_request_target_value("--index", &args.index)
         .map_err(|message| config_error(&message))?;
-    Ok(())
-}
-
-fn validate_http_header_value(name: &str, value: &str) -> Result<(), String> {
-    if value.bytes().any(|byte| byte.is_ascii_control()) {
-        return Err(format!("{name} cannot contain HTTP control characters"));
-    }
     Ok(())
 }
 
@@ -309,30 +316,22 @@ fn input_error(message: String, api_key: &str) -> IngestFailure {
 }
 
 fn read_api_key(args: &IngestArgs) -> Result<String, IngestFailure> {
-    let key = if let Some(env_var) = &args.api_key_env {
-        std::env::var(env_var)
-            .map_err(|_| config_error("API key environment variable is not set"))?
-    } else if let Some(path) = &args.api_key_file {
-        std::fs::read_to_string(path)
-            .map_err(|error| config_error(&format!("failed to read API key file: {}", error)))?
-    } else {
-        let mut key = String::new();
-        io::stdin().read_to_string(&mut key).map_err(|error| {
-            config_error(&format!("failed to read API key from stdin: {error}"))
-        })?;
-        key
-    };
-    let key = key.trim().to_string();
-    if key.is_empty() {
-        return Err(config_error("API key cannot be empty"));
-    }
-    validate_http_header_value("API key", &key).map_err(|message| config_error(&message))?;
-    Ok(key)
+    api_key_source(args)
+        .read("API key")
+        .map_err(|message| config_error(&message))
 }
 
-fn process_source(
+fn api_key_source(args: &IngestArgs) -> SecretSource<'_> {
+    SecretSource::new(
+        args.api_key_env.as_deref(),
+        args.api_key_file.as_deref(),
+        args.api_key_stdin,
+    )
+}
+
+fn process_source<S: OperationSink>(
     args: &IngestArgs,
-    sink: &mut HttpSink<'_>,
+    sink: &mut S,
     report: &mut IngestReport,
 ) -> Result<(), IngestError> {
     let mut reader = BufReader::new(open_source(&args.source)?);
@@ -366,10 +365,10 @@ fn first_non_ws_byte(reader: &mut BufReader<Box<dyn Read>>) -> Result<Option<u8>
         .find(|byte| !byte.is_ascii_whitespace()))
 }
 
-fn process_json_array(
+fn process_json_array<S: OperationSink>(
     reader: BufReader<Box<dyn Read>>,
     args: &IngestArgs,
-    sink: &mut HttpSink<'_>,
+    sink: &mut S,
     report: &mut IngestReport,
 ) -> Result<(), IngestError> {
     let mut deserializer = serde_json::Deserializer::from_reader(reader);
@@ -382,10 +381,10 @@ fn process_json_array(
         .map_err(|error| input_ingest_error(format!("trailing JSON array data: {error}")))
 }
 
-fn process_ndjson(
+fn process_ndjson<S: OperationSink>(
     reader: BufReader<Box<dyn Read>>,
     args: &IngestArgs,
-    sink: &mut HttpSink<'_>,
+    sink: &mut S,
     report: &mut IngestReport,
 ) -> Result<(), IngestError> {
     let mut pending = Vec::with_capacity(args.batch_size);
@@ -400,19 +399,19 @@ fn process_ndjson(
             .map_err(|error| input_ingest_error(format!("malformed NDJSON record: {error}")))?;
         pending.push(record_from_raw(record, args).map_err(input_ingest_error)?);
         if pending.len() == args.batch_size {
-            send_batch(&mut pending, sink, report)?;
+            flush_operations(&mut pending, sink, report)?;
         }
     }
-    send_batch(&mut pending, sink, report)
+    flush_operations(&mut pending, sink, report)
 }
 
-struct JsonArrayVisitor<'a, 'b> {
+struct JsonArrayVisitor<'a, S> {
     args: &'a IngestArgs,
-    sink: &'a mut HttpSink<'b>,
+    sink: &'a mut S,
     report: &'a mut IngestReport,
 }
 
-impl<'de> Visitor<'de> for JsonArrayVisitor<'_, '_> {
+impl<'de, S: OperationSink> Visitor<'de> for JsonArrayVisitor<'_, S> {
     type Value = Result<(), IngestError>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -431,12 +430,12 @@ impl<'de> Visitor<'de> for JsonArrayVisitor<'_, '_> {
             };
             pending.push(operation);
             if pending.len() == self.args.batch_size {
-                if let Err(message) = send_batch(&mut pending, self.sink, self.report) {
+                if let Err(message) = flush_operations(&mut pending, self.sink, self.report) {
                     return Ok(Err(message));
                 }
             }
         }
-        Ok(send_batch(&mut pending, self.sink, self.report))
+        Ok(flush_operations(&mut pending, self.sink, self.report))
     }
 }
 
@@ -515,52 +514,61 @@ fn resolve_object_id(body: &Map<String, Value>, args: &IngestArgs) -> Result<Str
         })
 }
 
-fn send_batch(
+fn flush_operations<S: OperationSink>(
     pending: &mut Vec<RecordOperation>,
-    sink: &mut HttpSink<'_>,
+    sink: &mut S,
     report: &mut IngestReport,
 ) -> Result<(), IngestError> {
     if pending.is_empty() {
         return Ok(());
     }
-    let operations = std::mem::take(pending);
-    report.attempted += operations.len();
-    report.queue_high_watermark = report.queue_high_watermark.max(operations.len());
-    for envelope in homogeneous_envelopes(operations) {
-        let count = envelope.requests.len();
-        match sink.send(&envelope, report) {
-            Ok(()) => report.confirmed_committed += count,
-            Err(SendError {
-                kind: SendErrorKind::Unknown,
-                message,
-            }) => {
-                report.outcome_unknown += count;
-                return Err(IngestError {
+    sink.submit_operations(std::mem::take(pending), report)
+}
+
+impl OperationSink for HttpSink<'_> {
+    fn submit_operations(
+        &mut self,
+        operations: Vec<RecordOperation>,
+        report: &mut IngestReport,
+    ) -> Result<(), IngestError> {
+        report.attempted += operations.len();
+        report.queue_high_watermark = report.queue_high_watermark.max(operations.len());
+        for envelope in homogeneous_envelopes(operations) {
+            let count = envelope.requests.len();
+            match self.send(&envelope, report) {
+                Ok(()) => report.confirmed_committed += count,
+                Err(SendError {
+                    kind: SendErrorKind::Unknown,
                     message,
-                    classification: FailureClassification::OutcomeUnknown,
-                });
-            }
-            Err(SendError {
-                kind: SendErrorKind::RetryExhaustedBeforeSend,
-                message,
-            }) => {
-                return Err(IngestError {
+                }) => {
+                    report.outcome_unknown += count;
+                    return Err(IngestError {
+                        message,
+                        classification: FailureClassification::OutcomeUnknown,
+                    });
+                }
+                Err(SendError {
+                    kind: SendErrorKind::RetryExhaustedBeforeSend,
                     message,
-                    classification: FailureClassification::RetryExhausted,
-                });
-            }
-            Err(SendError {
-                kind: SendErrorKind::Permanent,
-                message,
-            }) => {
-                return Err(IngestError {
+                }) => {
+                    return Err(IngestError {
+                        message,
+                        classification: FailureClassification::RetryExhausted,
+                    });
+                }
+                Err(SendError {
+                    kind: SendErrorKind::Permanent,
                     message,
-                    classification: FailureClassification::PermanentHttpRejection,
-                });
+                }) => {
+                    return Err(IngestError {
+                        message,
+                        classification: FailureClassification::PermanentHttpRejection,
+                    });
+                }
             }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 fn input_ingest_error(message: String) -> IngestError {

@@ -112,6 +112,175 @@ Operational bounds:
 - `--mode replace` is currently a typed zero-mutation refusal with
   `failure_classification:"replace_not_supported"`.
 
+## `flapjack migrate`
+
+`flapjack migrate` copies an Algolia index into an existing Flapjack server. It
+is a pure authenticated HTTP client: it submits
+`POST /1/migrations/algolia`, polls the returned durable job to a terminal
+state, and never starts a server or binds a listener.
+
+Set the two credential environment variables in the calling environment, then
+submit:
+
+```bash
+flapjack migrate \
+  --endpoint http://127.0.0.1:7700 \
+  --application-id acme-store \
+  --api-key-env FLAPJACK_ADMIN_KEY \
+  --app-id ALGOLIAAPP123 \
+  --algolia-key-env ALGOLIA_ADMIN_KEY \
+  --source-index products \
+  --target-index products_v2 \
+  --overwrite \
+  --poll-interval 500ms \
+  --timeout 1h \
+  --json
+```
+
+The bare `flapjack migrate` invocation is both submit and monitor: after
+admission it polls until the job succeeds, fails, is cancelled, or reaches the
+client timeout. There is no `status` subcommand. For out-of-band monitoring,
+send an authenticated `GET /1/migrations/algolia/{job_id}` request to the same
+Flapjack server.
+
+Cancellation is cooperative. A successful cancel request prints the
+server-returned status:
+
+```bash
+flapjack migrate \
+  --endpoint http://127.0.0.1:7700 \
+  --application-id acme-store \
+  --api-key-env FLAPJACK_ADMIN_KEY \
+  cancel --job-id 01890f8e-8b28-78e8-b542-8cfdcb2d4f24
+```
+
+After a job is terminal, acknowledge it with:
+
+```bash
+flapjack migrate \
+  --endpoint http://127.0.0.1:7700 \
+  --application-id acme-store \
+  --api-key-env FLAPJACK_ADMIN_KEY \
+  ack --job-id 01890f8e-8b28-78e8-b542-8cfdcb2d4f24
+```
+
+### Credentials
+
+The Flapjack owner key must have the `admin` ACL. Supply it on submit, cancel,
+and ack through exactly one of `--api-key-env`, `--api-key-file`, or
+`--api-key-stdin`. There is deliberately no flag that accepts the key value:
+command-line arguments can be visible to other users of the host.
+
+For any non-loopback Flapjack endpoint, use `https://`. The CLI rejects
+cleartext remote `http://` endpoints so the Flapjack owner key and Algolia
+source key are not sent without TLS. Plain HTTP is accepted only for
+`localhost` and loopback IPs such as `127.0.0.1` during local development.
+
+Submission also requires the Algolia source key through exactly one of
+`--algolia-key-env`, `--algolia-key-file`, or `--algolia-key-stdin`. These
+Algolia-key flags are submit-only. The CLI rejects all submit-only flags on
+`cancel` and `ack`, and rejects a submit that combines `--api-key-stdin` with
+`--algolia-key-stdin` because both would consume the same stream.
+
+The Algolia Admin API key is the simple supported choice; keep it confidential.
+For a least-privilege source key, match the permissions to the requests the
+importer actually issues:
+
+| Importer request | When issued | Required Algolia ACL |
+|---|---|---|
+| `GET /1/indexes` | Always, including source-quiescence checks | [`listIndexes`](https://www.algolia.com/doc/rest-api/search/list-indices) |
+| `GET /1/indexes/{index}/settings` | Always for the source, and for referenced replicas | [`settings`](https://www.algolia.com/doc/rest-api/search/get-settings) |
+| `POST /1/indexes/{index}/browse` | Always to export records | [`browse`](https://www.algolia.com/doc/rest-api/search/browse) |
+| `POST /1/indexes/{index}/synonyms/search` | Always to export synonyms | [`settings`](https://www.algolia.com/doc/rest-api/search/search-synonyms) |
+| `POST /1/indexes/{index}/rules/search` | Always to export rules | [`settings`](https://www.algolia.com/doc/rest-api/search/search-rules) |
+| `GET /1/keys/{key}` | Only when source settings contain non-empty `unretrievableAttributes` | [`search`](https://www.algolia.com/doc/rest-api/search/get-api-key) |
+
+Therefore `listIndexes`, `settings`, and `browse` are always required. If the
+source has `unretrievableAttributes`, the key also needs `search` so the
+importer can inspect that key's permissions, plus
+[`seeUnretrievableAttributes`](https://www.algolia.com/doc/guides/security/api-keys)
+so browse responses can include those attributes. The migration fails rather
+than silently omitting protected attributes.
+
+### Application IDs and job ownership
+
+The similarly named ID flags belong to different systems:
+
+| Flag | Identity | Where it is sent | Validation/default |
+|---|---|---|---|
+| `--application-id` | Flapjack tenant and job owner namespace | `x-algolia-application-id` request header | Defaults to `flapjack` |
+| `--app-id` | Source Algolia application | `appId` submission body field | Required; ASCII letters and digits only |
+
+Job ownership combines the Flapjack application ID with a SHA-256 digest of the
+submitting Flapjack key. Use the same `--application-id` and the same Flapjack
+key when polling, cancelling, acknowledging, or sending the out-of-band status
+GET. A different Flapjack key yields HTTP 404, not 403; this intentionally does
+not reveal that another owner has the job.
+
+### Output and exit status
+
+Without `--json`, a status is one space-delimited line. The first three fields
+are always `job_id`, `phase`, and `disposition`; available target, topology,
+settings, and import counts follow. Each warning is printed on its own
+`warning=<json-value>` line. For example:
+
+```text
+job_id=01890f8e-8b28-78e8-b542-8cfdcb2d4f24 phase=activating disposition=succeeded target_index=products_v2 topology=single_node_only settings_applied=true objects_imported=3 synonyms_imported=2 rules_imported=1
+```
+
+With `--json`, the CLI prints the server status object in camelCase. Optional
+progress, timestamp, count, and warning fields appear only when supplied by the
+server:
+
+```json
+{"jobId":"01890f8e-8b28-78e8-b542-8cfdcb2d4f24","phase":"activating","disposition":"succeeded","targetIndex":"products_v2","topology":"single_node_only","exportProgress":{"completed":10,"total":10},"createdAt":"2026-07-29T16:00:00Z","updatedAt":"2026-07-29T16:00:03Z","terminalAt":"2026-07-29T16:00:03Z","settingsApplied":true,"objectsImported":{"imported":3},"synonymsImported":{"imported":2},"rulesImported":{"imported":1}}
+```
+
+Successful acknowledgement output is exactly
+`job_id=<job_id> acknowledged=true`, or with `--json`:
+
+```json
+{"jobId":"01890f8e-8b28-78e8-b542-8cfdcb2d4f24","acknowledged":true}
+```
+
+JSON failures without a status use
+`{"errorType":"<label>","message":"<message>","exitCode":<code>}`. If a status
+is available, those three failure fields are added to the status object.
+
+| Exit code | `errorType` label | Operator meaning |
+|---:|---|---|
+| 2 | `config` | Invalid arguments, credential source, endpoint, or local configuration |
+| 3 | `http_rejection` | Transport failure, rejected HTTP response, or incompatible server response |
+| 4 | `timeout` | A request timed out or the polling deadline expired |
+| 5 | `failed_job` | The job reached the `failed` disposition |
+| 6 | `cancelled_job` | The monitored job reached the `cancelled` disposition |
+| 7 | `cancel_too_late` | Cancellation reached the server after its commit boundary |
+| 8 | `migration_ack_too_early` | Acknowledgement was attempted before the job became terminal |
+
+A successful terminal migration or acknowledgement exits 0. Every
+non-success terminal state exits nonzero.
+
+Resume is not available. An interrupted migration must be run again from the
+start; the CLI exposes no resume flag.
+
+Operational bounds:
+
+- `--endpoint` is required and must be an absolute HTTP or HTTPS URL. Remote
+  endpoints must use HTTPS; plain HTTP is accepted only for `localhost` and
+  loopback IPs. `--poll-interval` accepts a positive whole duration with an
+  `ms`, `s`, `m`, or `h` suffix, defaults to `250ms`, and is capped at 60
+  seconds. `--timeout` uses the same syntax, defaults to `1h`, and is capped at
+  24 hours.
+- `--target-index` defaults to `--source-index`.
+- Without `--overwrite`, publication is create-only. Work can be exported and
+  staged, but publication fails if the target already exists.
+- With `--overwrite`, publication uses replacement semantics and captures the
+  target's staging baseline. The target does not have to exist: a missing
+  target has a compatibility baseline sequence of zero. Durable async
+  migrations accept `--overwrite` through this same admission path.
+- A node with configured replication peers refuses migration imports with HTTP
+  503 and code `migration_ha_unsupported`.
+
 ## Server
 
 | Name | Type / Values | Default | Description |

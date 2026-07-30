@@ -10,7 +10,7 @@ use super::types::{
 };
 use dashmap::DashMap;
 use flapjack::index::oplog::OpLogEntry;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -743,7 +743,9 @@ impl ReplicationManager {
         let mut merged_current_seq = 0_u64;
         let mut merged_oldest_retained_seq: Option<u64> = None;
         let mut merged_node_current_seqs = BTreeMap::new();
-        let mut merged_ops: HashMap<(String, u64), OpLogEntry> = HashMap::new();
+        // Peer-local sequence domains are independent. Ordered keys provide a
+        // deterministic final tie-break when retained origin tuples are equal.
+        let mut merged_ops: BTreeMap<(String, u64), OpLogEntry> = BTreeMap::new();
         for peer in peers {
             if !peer.is_available() {
                 let error = format!("peer {} unavailable (circuit breaker open)", peer.peer_id());
@@ -792,7 +794,7 @@ impl ReplicationManager {
                     }
 
                     for op in resp.ops {
-                        let key = (op.node_id.clone(), op.seq);
+                        let key = (peer.peer_id().to_string(), op.seq);
                         if let Some(existing) = merged_ops.get(&key) {
                             if existing.timestamp_ms != op.timestamp_ms
                                 || existing.op_type != op.op_type
@@ -801,14 +803,12 @@ impl ReplicationManager {
                             {
                                 if require_all_peers {
                                     return Err(format!(
-                                        "peer {} returned conflicting payload for op ({}, {}) while strict catch-up was requested",
-                                        peer.peer_id(),
-                                        key.0,
-                                        key.1
+                                        "peer {} returned conflicting payloads for local seq {} while strict catch-up was requested",
+                                        key.0, key.1
                                     ));
                                 }
                                 tracing::warn!(
-                                    "[REPL {}] conflicting payload for key ({}, {}) across peers; keeping first seen op",
+                                    "[REPL {}] peer {} returned conflicting payloads for local seq {}; keeping first seen op",
                                     tenant_id,
                                     key.0,
                                     key.1
@@ -3609,7 +3609,7 @@ mod tests {
             tenant_id: "tenant-red".to_string(),
             ops: vec![OpLogEntry {
                 seq: 1,
-                timestamp_ms: 200,
+                timestamp_ms: 100,
                 node_id: "node-c".to_string(),
                 tenant_id: "tenant-red".to_string(),
                 op_type: "upsert".to_string(),
@@ -3839,8 +3839,10 @@ mod tests {
         );
     }
 
+    /// Destination-local sequences from different peers are independent even
+    /// when both entries preserve the same origin node ID.
     #[tokio::test]
-    async fn test_catch_up_from_peer_with_metadata_strict_rejects_conflicting_duplicate_ops() {
+    async fn strict_catch_up_keeps_peer_local_seq_collisions_with_same_origin() {
         let first_peer_response = GetOpsResponse {
             tenant_id: "tenant-red".to_string(),
             ops: vec![OpLogEntry {
@@ -3894,17 +3896,70 @@ mod tests {
             None,
         );
 
-        let error = manager
+        let merged = manager
             .catch_up_from_peer_with_metadata_strict("tenant-red", 0)
             .await
-            .expect_err("strict catch-up must fail closed on conflicting peer payloads");
+            .expect("peer-local sequence collisions must not conflate independent streams");
         let _ = first_peer_handle.await;
         let _ = conflicting_peer_handle.await;
 
+        assert_eq!(merged.ops.len(), 2);
+        assert_eq!(merged.ops[0].payload["body"]["title"], "first");
+        assert_eq!(merged.ops[1].payload["body"]["title"], "second");
+    }
+
+    #[tokio::test]
+    async fn strict_catch_up_rejects_conflicting_duplicate_seq_from_one_peer() {
+        let peer_response = GetOpsResponse {
+            tenant_id: "tenant-red".to_string(),
+            ops: vec![
+                OpLogEntry {
+                    seq: 1,
+                    timestamp_ms: 100,
+                    node_id: "node-a".to_string(),
+                    tenant_id: "tenant-red".to_string(),
+                    op_type: "upsert".to_string(),
+                    payload: serde_json::json!({"objectID": "a1", "body": {"_id": "a1", "title": "first"}}),
+                },
+                OpLogEntry {
+                    seq: 1,
+                    timestamp_ms: 200,
+                    node_id: "node-a".to_string(),
+                    tenant_id: "tenant-red".to_string(),
+                    op_type: "upsert".to_string(),
+                    payload: serde_json::json!({"objectID": "a1", "body": {"_id": "a1", "title": "second"}}),
+                },
+            ],
+            current_seq: 1,
+            oldest_retained_seq: Some(1),
+            node_current_seqs: BTreeMap::from([(String::from("node-a"), 1)]),
+        };
+        let (peer_url, peer_handle) = spawn_single_response_peer(peer_response).await;
+        let manager = new_test_manager(
+            NodeConfig {
+                node_id: "node-c".to_string(),
+                bind_addr: "127.0.0.1:0".to_string(),
+                advertise_addr: None,
+                bootstrap_peer: None,
+                peers: vec![PeerConfig {
+                    node_id: "node-a".to_string(),
+                    addr: peer_url,
+                }],
+            },
+            None,
+        );
+
+        let error = manager
+            .catch_up_from_peer_with_metadata_strict("tenant-red", 0)
+            .await
+            .expect_err("one peer must not claim two payloads for one local sequence");
+        let _ = peer_handle.await;
+
         assert!(
-            error.contains("conflicting payload") && error.contains("(node-a, 1)"),
-            "strict conflict error should identify the duplicate op key, got: {}",
-            error
+            error.contains("conflicting payload")
+                && error.contains("node-a")
+                && error.contains('1'),
+            "strict conflict error should identify the peer-local duplicate: {error}"
         );
     }
 

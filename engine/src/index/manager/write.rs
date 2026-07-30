@@ -30,12 +30,24 @@ type WriteAdmissionCheckpointHook =
     Arc<dyn Fn(&str, WriteAdmissionCheckpoint) + Send + Sync + 'static>;
 
 #[cfg(test)]
+type LoadWriteQueueCheckpointHook = Arc<dyn Fn(&str) + Send + Sync + 'static>;
+
+#[cfg(test)]
 static WRITE_ADMISSION_CHECKPOINT_HOOK: OnceLock<Mutex<Option<WriteAdmissionCheckpointHook>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static LOAD_WRITE_QUEUE_CHECKPOINT_HOOK: OnceLock<Mutex<Option<LoadWriteQueueCheckpointHook>>> =
     OnceLock::new();
 
 #[cfg(test)]
 pub(crate) struct WriteAdmissionCheckpointHookGuard {
     previous: Option<WriteAdmissionCheckpointHook>,
+}
+
+#[cfg(test)]
+pub(crate) struct LoadWriteQueueCheckpointHookGuard {
+    previous: Option<LoadWriteQueueCheckpointHook>,
 }
 
 #[cfg(test)]
@@ -46,8 +58,20 @@ impl Drop for WriteAdmissionCheckpointHookGuard {
 }
 
 #[cfg(test)]
+impl Drop for LoadWriteQueueCheckpointHookGuard {
+    fn drop(&mut self) {
+        *load_write_queue_checkpoint_hook().lock().unwrap() = self.previous.take();
+    }
+}
+
+#[cfg(test)]
 fn write_admission_checkpoint_hook() -> &'static Mutex<Option<WriteAdmissionCheckpointHook>> {
     WRITE_ADMISSION_CHECKPOINT_HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn load_write_queue_checkpoint_hook() -> &'static Mutex<Option<LoadWriteQueueCheckpointHook>> {
+    LOAD_WRITE_QUEUE_CHECKPOINT_HOOK.get_or_init(|| Mutex::new(None))
 }
 
 impl super::IndexManager {
@@ -62,6 +86,16 @@ impl super::IndexManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_load_write_queue_checkpoint_hook_for_test(
+        hook: impl Fn(&str) + Send + Sync + 'static,
+    ) -> LoadWriteQueueCheckpointHookGuard {
+        let mut slot = load_write_queue_checkpoint_hook().lock().unwrap();
+        LoadWriteQueueCheckpointHookGuard {
+            previous: slot.replace(Arc::new(hook)),
+        }
+    }
+
+    #[cfg(test)]
     fn run_write_admission_checkpoint_for_test(
         tenant_id: &str,
         checkpoint: WriteAdmissionCheckpoint,
@@ -69,6 +103,14 @@ impl super::IndexManager {
         let hook = write_admission_checkpoint_hook().lock().unwrap().clone();
         if let Some(hook) = hook {
             hook(tenant_id, checkpoint);
+        }
+    }
+
+    #[cfg(test)]
+    fn run_load_write_queue_checkpoint_for_test(tenant_id: &str) {
+        let hook = load_write_queue_checkpoint_hook().lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(tenant_id);
         }
     }
 
@@ -106,6 +148,40 @@ impl super::IndexManager {
         FlapjackError::Tantivy(message.to_string())
     }
 
+    /// Publish runtime state for a loaded tenant unless publication is fenced.
+    ///
+    /// Loading is not a write, so a fenced search still receives its opened index.
+    /// The reservation covers eager writer creation and cache publication as one
+    /// operation: a later fence waits for both, while a load that observes an
+    /// existing fence returns without leaving pre-publication runtime state behind.
+    /// The write side needs no such check because admission already holds the
+    /// publication epoch admission guard.
+    pub(super) fn publish_loaded_runtime_state_if_unfenced(
+        &self,
+        tenant_id: &str,
+        index: Arc<Index>,
+    ) -> Result<Arc<Index>> {
+        let Ok(target) = publication::PublicationTarget::new(tenant_id) else {
+            return Ok(index);
+        };
+        let runtime_index = Arc::clone(&index);
+        match publication::run_if_publication_admission_unfenced(&self.base_path, &target, || {
+            #[cfg(test)]
+            Self::run_load_write_queue_checkpoint_for_test(tenant_id);
+            self.get_or_create_write_queue(tenant_id, &runtime_index)?;
+            #[cfg(feature = "vector-search")]
+            self.load_vector_index(tenant_id, &self.base_path.join(tenant_id));
+            Ok(self.cache_loaded_index(tenant_id, runtime_index))
+        }) {
+            Some(result) => result,
+            None => {
+                #[cfg(feature = "vector-search")]
+                self.load_vector_index(tenant_id, &self.base_path.join(tenant_id));
+                Ok(index)
+            }
+        }
+    }
+
     /// Get or create a write queue for the given tenant.
     ///
     /// DRY helper — all write paths (add, delete, compact) go through this.
@@ -129,7 +205,7 @@ impl super::IndexManager {
                 let vector_ctx = VectorWriteContext::new(Arc::clone(&self.vector_indices));
                 #[cfg(not(feature = "vector-search"))]
                 let vector_ctx = VectorWriteContext::new();
-                let (queue, handle) = create_write_queue(WriteQueueContext {
+                let (queue, handle, cancellation) = create_write_queue(WriteQueueContext {
                     tenant_id: tenant_id.to_string(),
                     index: Arc::clone(index),
                     tasks: Arc::clone(&self.tasks),
@@ -137,14 +213,16 @@ impl super::IndexManager {
                     oplog: Some(Arc::clone(&oplog)),
                     admission_store: Arc::clone(&admission_store),
                     facet_cache: Arc::clone(&self.facet_cache),
-                    lww_map: Arc::clone(&self.lww_map),
                     vector_ctx,
                     queue_metrics_id: 0,
+                    writer_buffer_size: self.write_queue_writer_buffer_size(),
                     #[cfg(test)]
                     test_overrides: Default::default(),
                 })?;
-                self.write_task_handles
-                    .insert(tenant_id.to_string(), WriteTaskHandle::new(handle));
+                self.write_task_handles.insert(
+                    tenant_id.to_string(),
+                    WriteTaskHandle::new_with_cancellation(handle, cancellation),
+                );
                 Ok(queue)
             })?;
         Ok(entry.clone())
@@ -162,9 +240,10 @@ impl super::IndexManager {
         self.add_documents_inner(tenant_id, docs, true, false)
     }
 
-    /// Like `add_documents` but uses `UpsertNoLwwUpdate` so the write_queue does NOT
-    /// overwrite lww_map entries — for use by replication (apply_ops_to_manager) which
-    /// has already recorded the correct op timestamp in lww_map before calling this.
+    /// Queue replicated documents whose legacy admission format has no origin tuple.
+    ///
+    /// New replication writes use `add_documents_for_replication_with_origins`;
+    /// this path remains for durable replay compatibility.
     pub fn add_documents_for_replication(
         &self,
         tenant_id: &str,
@@ -173,20 +252,33 @@ impl super::IndexManager {
         self.add_documents_inner(tenant_id, docs, true, true)
     }
 
+    pub fn add_documents_for_replication_with_origins(
+        &self,
+        tenant_id: &str,
+        docs: Vec<(Document, ReplicatedWriteOrigin)>,
+    ) -> Result<TaskInfo> {
+        let index = self.get_or_load(tenant_id)?;
+        let actions = docs
+            .into_iter()
+            .map(|(doc, origin)| WriteAction::UpsertWithOrigin { doc, origin })
+            .collect();
+        self.admit_write_actions(tenant_id, &index, actions, WriteAdmissionMode::Live)
+    }
+
     /// Core document-add path: load the tenant index, create a task, evict stale
-    /// tasks, and send an Add/Upsert/UpsertNoLwwUpdate `WriteOp` to the write
+    /// tasks, and send the selected add/upsert `WriteOp` to the write
     /// queue. Returns `QueueFull` on backpressure.
     fn add_documents_inner(
         &self,
         tenant_id: &str,
         docs: Vec<Document>,
         upsert: bool,
-        no_lww_update: bool,
+        legacy_replication_without_origin: bool,
     ) -> Result<TaskInfo> {
         let index = self.get_or_load(tenant_id)?;
 
         let actions = if upsert {
-            if no_lww_update {
+            if legacy_replication_without_origin {
                 docs.into_iter()
                     .map(WriteAction::UpsertNoLwwUpdate)
                     .collect()
@@ -199,8 +291,8 @@ impl super::IndexManager {
         self.admit_write_actions(tenant_id, &index, actions, WriteAdmissionMode::Live)
     }
 
-    /// Queue document deletions by object ID with LWW tracking. Creates a task
-    /// and sends `Delete` actions to the tenant's write queue.
+    /// Queue document deletions by object ID. Creates a task and sends `Delete`
+    /// actions to the tenant's write queue.
     pub fn delete_documents(&self, tenant_id: &str, object_ids: Vec<String>) -> Result<TaskInfo> {
         let index = self.get_or_load(tenant_id)?;
 
@@ -237,8 +329,10 @@ impl super::IndexManager {
         tasks
     }
 
-    /// Queue document deletions without updating the LWW map — the caller
-    /// (replication) has already recorded the correct timestamps before queuing.
+    /// Queue replicated deletes whose legacy admission format has no origin tuple.
+    ///
+    /// New replication writes use `delete_documents_for_replication_with_origins`;
+    /// this path remains for durable replay compatibility.
     pub fn delete_documents_for_replication(
         &self,
         tenant_id: &str,
@@ -249,6 +343,20 @@ impl super::IndexManager {
         let actions = object_ids
             .into_iter()
             .map(WriteAction::DeleteNoLwwUpdate)
+            .collect();
+        self.admit_write_actions(tenant_id, &index, actions, WriteAdmissionMode::Live)
+    }
+
+    pub fn delete_documents_for_replication_with_origins(
+        &self,
+        tenant_id: &str,
+        deletes: Vec<(String, ReplicatedWriteOrigin)>,
+    ) -> Result<TaskInfo> {
+        let index = self.get_or_load(tenant_id)?;
+
+        let actions = deletes
+            .into_iter()
+            .map(|(object_id, origin)| WriteAction::DeleteWithOrigin { object_id, origin })
             .collect();
         self.admit_write_actions(tenant_id, &index, actions, WriteAdmissionMode::Live)
     }
@@ -469,6 +577,32 @@ impl super::IndexManager {
             .await
     }
 
+    /// Persist the write-admission record and enqueue the documents without
+    /// waiting for the worker's terminal acknowledgement.
+    pub(super) fn admit_documents_durable(
+        &self,
+        tenant_id: &str,
+        docs: Vec<Document>,
+    ) -> Result<TaskInfo> {
+        let index = self.get_or_load(tenant_id)?;
+        let actions = docs.into_iter().map(WriteAction::Upsert).collect();
+        self.admit_write_actions(tenant_id, &index, actions, WriteAdmissionMode::Durable)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admit_replicated_documents_durable_for_test(
+        &self,
+        tenant_id: &str,
+        docs: Vec<(Document, ReplicatedWriteOrigin)>,
+    ) -> Result<TaskInfo> {
+        let index = self.get_or_load(tenant_id)?;
+        let actions = docs
+            .into_iter()
+            .map(|(doc, origin)| WriteAction::UpsertWithOrigin { doc, origin })
+            .collect();
+        self.admit_write_actions(tenant_id, &index, actions, WriteAdmissionMode::Durable)
+    }
+
     /// Add documents and wait until the write queue has durably committed them to
     /// Tantivy, bounded by `FLAPJACK_WRITE_DURABLE_TIMEOUT_MS` (default 30s).
     ///
@@ -477,15 +611,29 @@ impl super::IndexManager {
     /// an enqueued-but-uncommitted write was ACKed before the consumer committed it.
     /// Returns [`FlapjackError::QueueFull`] (429) on backpressure,
     /// [`FlapjackError::WriteAckTimeout`] (503) if the consumer does not ack in time,
-    /// or the underlying commit error (5xx). Replication paths intentionally keep
-    /// using the fire-and-forget variant and are not routed through here.
+    /// or the underlying commit error (5xx). Replication uses its origin-aware
+    /// terminal-wait helpers so a peer is acknowledged only after finalization.
     pub async fn add_documents_durable(
         &self,
         tenant_id: &str,
         docs: Vec<Document>,
     ) -> Result<TaskInfo> {
+        let task = self.admit_documents_durable(tenant_id, docs)?;
+        self.wait_for_write_durable(&task.id).await?;
+        Ok(task)
+    }
+
+    /// Insert documents without upsert delete terms and wait for durable commit.
+    ///
+    /// Staged bulk builds already require unique object IDs, so they need durable
+    /// acknowledgement without paying the delete-term work of online upserts.
+    pub async fn add_documents_insert_durable(
+        &self,
+        tenant_id: &str,
+        docs: Vec<Document>,
+    ) -> Result<TaskInfo> {
         let index = self.get_or_load(tenant_id)?;
-        let actions = docs.into_iter().map(WriteAction::Upsert).collect();
+        let actions = docs.into_iter().map(WriteAction::Add).collect();
         let task =
             self.admit_write_actions(tenant_id, &index, actions, WriteAdmissionMode::Durable)?;
         self.wait_for_write_durable(&task.id).await?;
@@ -532,6 +680,15 @@ impl super::IndexManager {
         self.await_task_terminal(&task.id, None).await
     }
 
+    pub async fn add_documents_sync_for_replication_with_origins(
+        &self,
+        tenant_id: &str,
+        docs: Vec<(Document, ReplicatedWriteOrigin)>,
+    ) -> Result<()> {
+        let task = self.add_documents_for_replication_with_origins(tenant_id, docs)?;
+        self.await_task_terminal(&task.id, None).await
+    }
+
     /// Delete documents and poll until the task succeeds or fails. Async wrapper
     /// around `delete_documents`.
     pub async fn delete_documents_sync(
@@ -543,13 +700,22 @@ impl super::IndexManager {
         self.await_task_terminal(&task.id, None).await
     }
 
-    /// Like `delete_documents_sync` but skips lww_map update in write_queue — for replication.
+    /// Await a legacy replicated delete which carries no origin tuple.
     pub async fn delete_documents_sync_for_replication(
         &self,
         tenant_id: &str,
         object_ids: Vec<String>,
     ) -> Result<()> {
         let task = self.delete_documents_for_replication(tenant_id, object_ids)?;
+        self.await_task_terminal(&task.id, None).await
+    }
+
+    pub async fn delete_documents_sync_for_replication_with_origins(
+        &self,
+        tenant_id: &str,
+        deletes: Vec<(String, ReplicatedWriteOrigin)>,
+    ) -> Result<()> {
+        let task = self.delete_documents_for_replication_with_origins(tenant_id, deletes)?;
         self.await_task_terminal(&task.id, None).await
     }
 }

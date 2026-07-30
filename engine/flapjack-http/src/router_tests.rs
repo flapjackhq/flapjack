@@ -8,12 +8,17 @@ use flapjack::index::manager::publication::{
     PublicationPaths, PublicationTarget, PublicationTransactionId,
 };
 use flapjack::{Document, FieldValue, IndexManager};
+use flapjack_replication::{
+    config::{NodeConfig, PeerConfig},
+    manager::ReplicationManager,
+};
 use std::collections::HashMap;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
 use crate::auth::{ApiKey, KeyStore};
 use crate::handlers::dashboard::{dashboard_test_asset_bytes, dashboard_test_index_bytes};
+use crate::handlers::migration::spool::{SpoolLimits, SpoolStore};
 use crate::middleware::REQUEST_ID_HEADER_NAME;
 use crate::openapi::{DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS, DOCUMENTED_MEMBERSHIP_SCHEMA_NAMES};
 use crate::openapi_test_helpers::{
@@ -347,6 +352,44 @@ async fn post_json(
         .unwrap()
 }
 
+async fn post_ndjson(
+    app: &axum::Router,
+    uri: &str,
+    api_key: Option<&str>,
+    body: &str,
+) -> axum::response::Response {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/x-ndjson");
+    if let Some(api_key) = api_key {
+        builder = builder
+            .header("x-algolia-api-key", api_key)
+            .header("x-algolia-application-id", "route-contract-app");
+    }
+    app.clone()
+        .oneshot(builder.body(Body::from(body.to_owned())).unwrap())
+        .await
+        .unwrap()
+}
+
+fn peer_configured_replication_manager(data_dir: &std::path::Path) -> Arc<ReplicationManager> {
+    ReplicationManager::new(
+        NodeConfig {
+            node_id: "bulk-replace-local".to_string(),
+            bind_addr: "127.0.0.1:7700".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
+            peers: vec![PeerConfig {
+                node_id: "bulk-replace-peer".to_string(),
+                addr: "http://127.0.0.1:7701".to_string(),
+            }],
+        },
+        None,
+        data_dir.to_path_buf(),
+    )
+}
+
 async fn get_request(
     app: &axum::Router,
     uri: &str,
@@ -570,6 +613,295 @@ async fn migration_routes_preserve_admin_contract() {
             "message": "appId and apiKey are required",
             "status": 400
         })
+    );
+}
+
+#[tokio::test]
+async fn bulk_replace_rejects_unauthenticated_use() {
+    let tmp = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let search_key = search_only_key_value(&key_store);
+    let state = TestStateBuilder::new(&tmp).with_analytics().build_shared();
+    let app = build_auth_router_for_state(&tmp, Arc::clone(&state), key_store);
+    let uri = "/1/migrations/bulk-replace?indexName=bulk_replace_auth_target";
+    let payload = "{\"objectID\":\"authorized-replacement\"}\n";
+
+    let missing_auth = post_ndjson(&app, uri, None, payload).await;
+    assert_invalid_credentials_response(missing_auth).await;
+    assert!(!state
+        .manager
+        .base_path
+        .join("bulk_replace_auth_target")
+        .exists());
+
+    let non_admin = post_ndjson(&app, uri, Some(&search_key), payload).await;
+    assert_method_not_allowed_response(non_admin).await;
+    assert!(!state
+        .manager
+        .base_path
+        .join("bulk_replace_auth_target")
+        .exists());
+
+    let admin = post_ndjson(&app, uri, Some("admin-key"), payload).await;
+    assert_eq!(
+        admin.status(),
+        StatusCode::ACCEPTED,
+        "the admin control request must prove the protected route exists"
+    );
+}
+
+#[tokio::test]
+async fn bulk_replace_rejects_peer_routed_use() {
+    let tmp = TempDir::new().unwrap();
+    let replication_dir = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let state = TestStateBuilder::new(&tmp)
+        .with_analytics()
+        .with_replication_manager(peer_configured_replication_manager(replication_dir.path()))
+        .build_shared();
+    seed_document(
+        &state.manager,
+        "bulk_replace_peer_target",
+        "sentinel",
+        "original",
+    )
+    .await;
+    let app = build_auth_router_for_state(&tmp, Arc::clone(&state), key_store);
+
+    let response = post_ndjson(
+        &app,
+        "/1/migrations/bulk-replace?indexName=bulk_replace_peer_target",
+        Some("admin-key"),
+        "{\"objectID\":\"replacement\"}\n",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body_json(response).await,
+        serde_json::json!({
+            "message": "Migration is only supported when no replication peers are configured",
+            "status": 503,
+            "code": "migration_ha_unsupported"
+        })
+    );
+    let sentinel = state
+        .manager
+        .get_document("bulk_replace_peer_target", "sentinel")
+        .unwrap();
+    assert!(
+        sentinel.is_some(),
+        "peer refusal must preserve the original target generation"
+    );
+    assert!(
+        state
+            .manager
+            .get_document("bulk_replace_peer_target", "replacement")
+            .unwrap()
+            .is_none(),
+        "peer refusal must not publish the request body"
+    );
+}
+
+#[tokio::test]
+async fn bulk_replace_receipt_states_single_node_topology() {
+    let tmp = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let app = build_test_router(&tmp, Some(key_store));
+
+    let response = post_ndjson(
+        &app,
+        "/1/migrations/bulk-replace?indexName=bulk_replace_receipt_target",
+        Some("admin-key"),
+        "{\"objectID\":\"one\",\"title\":\"First\"}\n{\"objectID\":\"two\",\"title\":\"Second\"}\n",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let receipt = body_json(response).await;
+    assert_eq!(receipt["topology"], "single_node_only");
+    assert_eq!(receipt["targetIndex"], "bulk_replace_receipt_target");
+    assert_eq!(receipt["disposition"], "running");
+    assert!(
+        receipt["jobID"].as_str().is_some(),
+        "receipt must expose the durable job identifier"
+    );
+    let job_id = receipt["jobID"].as_str().unwrap();
+    let terminal = poll_bulk_replace_terminal(&app, job_id).await;
+    assert_eq!(terminal["topology"], "single_node_only");
+    assert_eq!(terminal["targetIndex"], "bulk_replace_receipt_target");
+    assert_eq!(terminal["disposition"], "succeeded");
+    assert_eq!(
+        terminal["objectsImported"],
+        serde_json::json!({"imported": 2})
+    );
+}
+
+#[tokio::test]
+async fn bulk_replace_rejects_payload_over_configured_cap_without_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let state = TestStateBuilder::new(&tmp)
+        .with_analytics()
+        .with_bulk_replace_max_bytes(32)
+        .build_shared();
+    let app = build_auth_router_for_state(&tmp, Arc::clone(&state), key_store);
+    assert_eq!(count_bulk_replace_jobs(&state), 0);
+
+    let response = post_ndjson(
+        &app,
+        "/1/migrations/bulk-replace?indexName=over_cap_target",
+        Some("admin-key"),
+        "{\"objectID\":\"too-large\",\"payload\":\"exceeds-cap\"}\n",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(!state.manager.base_path.join("over_cap_target").exists());
+    assert_eq!(
+        count_bulk_replace_jobs(&state),
+        0,
+        "admission-time rejection must not leave an unreachable durable job behind"
+    );
+}
+
+async fn poll_bulk_replace_terminal(app: &axum::Router, job_id: &str) -> serde_json::Value {
+    let mut last_status = serde_json::Value::Null;
+    for _ in 0..200 {
+        let response = get_request(
+            app,
+            &format!("/1/migrations/bulk-replace/{job_id}"),
+            Some("admin-key"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let status = body_json(response).await;
+        if status["disposition"] != "running" {
+            return status;
+        }
+        last_status = status;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("bulk replacement did not reach a terminal state: {last_status}");
+}
+
+fn pause_next_bulk_replace_at_prepublication(
+    state: &crate::handlers::AppState,
+) -> (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>) {
+    let reached = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    state
+        .migration_runner
+        .set_bulk_replace_prepublication_hook_for_test({
+            let reached = Arc::clone(&reached);
+            let release = Arc::clone(&release);
+            move || {
+                reached.wait();
+                release.wait();
+            }
+        });
+    (reached, release)
+}
+
+fn bulk_replace_staging_path(
+    state: &crate::handlers::AppState,
+    target_index: &str,
+    job_id: &str,
+) -> std::path::PathBuf {
+    let job_uuid = uuid::Uuid::parse_str(job_id).unwrap();
+    let spool = SpoolStore::new(&state.manager.base_path, SpoolLimits::default()).unwrap();
+    let transaction_id = spool
+        .read_async_migration_metadata(job_uuid)
+        .unwrap()
+        .publication_transaction_id
+        .expect("paused build must have saved its publication receipt");
+    PublicationPaths::new(
+        &state.manager.base_path,
+        &PublicationTarget::new(target_index).unwrap(),
+        &transaction_id,
+    )
+    .staging
+}
+
+fn count_bulk_replace_jobs(state: &crate::handlers::AppState) -> usize {
+    let spool = SpoolStore::new(&state.manager.base_path, SpoolLimits::default()).unwrap();
+    let jobs_root = spool
+        .job_dir(uuid::Uuid::nil())
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::fs::read_dir(jobs_root).unwrap().count()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_build_removes_only_its_own_staging_generation_after_saving_its_receipt() {
+    let tmp = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let state = TestStateBuilder::new(&tmp)
+        .with_analytics()
+        .with_migration_capacity(2)
+        .build_shared();
+    let app = build_auth_router_for_state(&tmp, Arc::clone(&state), key_store);
+    let payload = "{\"objectID\":\"doc-1\",\"ordinal\":1}\n";
+
+    let (cancelled_reached, cancelled_release) = pause_next_bulk_replace_at_prepublication(&state);
+    let cancelled_submit = post_ndjson(
+        &app,
+        "/1/migrations/bulk-replace?indexName=cancelled_bulk_replace",
+        Some("admin-key"),
+        &payload,
+    )
+    .await;
+    assert_eq!(cancelled_submit.status(), StatusCode::ACCEPTED);
+    let cancelled_receipt = body_json(cancelled_submit).await;
+    let cancelled_job = cancelled_receipt["jobID"].as_str().unwrap();
+    cancelled_reached.wait();
+    let cancelled_staging =
+        bulk_replace_staging_path(&state, "cancelled_bulk_replace", cancelled_job);
+
+    let (surviving_reached, surviving_release) = pause_next_bulk_replace_at_prepublication(&state);
+    let surviving_submit = post_ndjson(
+        &app,
+        "/1/migrations/bulk-replace?indexName=surviving_bulk_replace",
+        Some("admin-key"),
+        &payload,
+    )
+    .await;
+    assert_eq!(surviving_submit.status(), StatusCode::ACCEPTED);
+    let surviving_receipt = body_json(surviving_submit).await;
+    let surviving_job = surviving_receipt["jobID"].as_str().unwrap();
+    surviving_reached.wait();
+    let surviving_staging =
+        bulk_replace_staging_path(&state, "surviving_bulk_replace", surviving_job);
+    assert!(cancelled_staging.exists());
+    assert!(surviving_staging.exists());
+
+    let cancel = post_json(
+        &app,
+        &format!("/1/migrations/bulk-replace/{cancelled_job}/cancel"),
+        Some("admin-key"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(cancel.status(), StatusCode::ACCEPTED);
+    cancelled_release.wait();
+
+    let cancelled_status = poll_bulk_replace_terminal(&app, cancelled_job).await;
+    assert_eq!(cancelled_status["disposition"], "cancelled");
+    let cancelled_staging_was_removed = !cancelled_staging.exists();
+    let surviving_staging_was_preserved = surviving_staging.exists();
+
+    surviving_release.wait();
+    let surviving_status = poll_bulk_replace_terminal(&app, surviving_job).await;
+    assert_eq!(surviving_status["disposition"], "succeeded");
+
+    assert!(
+        cancelled_staging_was_removed,
+        "cancelled build must remove its job-owned staging generation"
+    );
+    assert!(
+        surviving_staging_was_preserved,
+        "cancelling one build must preserve another build's staging generation"
     );
 }
 

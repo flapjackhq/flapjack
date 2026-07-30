@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 const PUBLICATION_DIR: &str = ".publication";
 const EPOCH_FILE: &str = "epoch";
@@ -59,6 +59,21 @@ pub struct PublicationEpochFence {
     advanced: PublicationEpoch,
 }
 
+/// Exclusive admission fence over a publication target that does **not** advance
+/// the durable epoch.
+///
+/// Tenant quiesce needs the same admission stop a publication advance gets — every
+/// concurrent [`try_validate_publication_epoch_admission`] must fail fast with
+/// `Busy` — but a quiesce publishes no new generation, so bumping the durable epoch
+/// would record a publication that never happened. Both fences rest on the same two
+/// owners: the in-process pending-advance registry (fast-fail for admission) and the
+/// exclusive `epoch.lock` file lock (cross-process exclusion).
+#[derive(Debug)]
+pub struct PublicationAdmissionFence {
+    _lock: File,
+    _pending_advance: PublicationEpochPendingAdvance,
+}
+
 #[derive(Debug)]
 pub struct PublicationEpochAdmissionGuard {
     _lock: File,
@@ -70,7 +85,19 @@ struct PublicationEpochPendingAdvance {
     lock_path: PathBuf,
 }
 
-static PENDING_EPOCH_ADVANCES: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
+#[derive(Debug, Default)]
+struct PublicationAdmissionRegistry {
+    pending_advances: BTreeMap<PathBuf, usize>,
+    unfenced_operations: BTreeMap<PathBuf, usize>,
+}
+
+#[derive(Debug)]
+struct PublicationUnfencedOperation {
+    lock_path: PathBuf,
+}
+
+static PUBLICATION_ADMISSION_REGISTRY: OnceLock<(Mutex<PublicationAdmissionRegistry>, Condvar)> =
+    OnceLock::new();
 
 #[cfg(test)]
 type PublicationEpochAdvanceCheckpointHook =
@@ -282,6 +309,57 @@ pub(super) fn observe_publication_epoch(
     parse_epoch_bytes(&paths.epoch, &bytes).map(PublicationEpochObservation::Durable)
 }
 
+/// Fence write admission for `target` without advancing the durable epoch.
+///
+/// Registering the pending advance before taking the lock is what makes concurrent
+/// admission fail fast instead of queueing behind the exclusive lock; see
+/// [`try_acquire_epoch_admission_lock`]. The returned fence releases both on drop.
+pub fn fence_publication_admission(
+    base: &Path,
+    target: &PublicationTarget,
+) -> Result<PublicationAdmissionFence, PublicationEpochError> {
+    let paths = publication_epoch_paths(base, target);
+    let pending_advance = PublicationEpochPendingAdvance::register(paths.lock.clone());
+    wait_for_unfenced_publication_operations(&paths.lock);
+    let lock = acquire_epoch_lock(base, &paths)?;
+    Ok(PublicationAdmissionFence {
+        _lock: lock,
+        _pending_advance: pending_advance,
+    })
+}
+
+/// True while any in-process publication fence — an epoch advance or a tenant
+/// quiesce — is registered for `target`.
+///
+/// This reads the same registry [`try_acquire_epoch_admission_lock`] fails fast on,
+/// so write admission and write-side runtime state creation agree on one fact:
+/// whether the target is currently fenced.
+pub fn publication_admission_is_fenced(base: &Path, target: &PublicationTarget) -> bool {
+    let paths = publication_epoch_paths(base, target);
+    publication_admission_registry()
+        .0
+        .lock()
+        .unwrap()
+        .pending_advances
+        .contains_key(&paths.lock)
+}
+
+/// Run `operation` only when no publication admission fence is registered.
+///
+/// A short reservation records that the load path already observed "unfenced".
+/// A later tenant quiesce fence registers itself first, blocking new
+/// reservations, then waits for existing reservations to finish before it drains
+/// live writers.
+pub(crate) fn run_if_publication_admission_unfenced<T>(
+    base: &Path,
+    target: &PublicationTarget,
+    operation: impl FnOnce() -> T,
+) -> Option<T> {
+    let paths = publication_epoch_paths(base, target);
+    let _reservation = PublicationUnfencedOperation::try_register(paths.lock)?;
+    Some(operation())
+}
+
 pub fn compare_and_advance_publication_epoch(
     base: &Path,
     target: &PublicationTarget,
@@ -290,6 +368,7 @@ pub fn compare_and_advance_publication_epoch(
     let paths = publication_epoch_paths(base, target);
     let pending_advance = PublicationEpochPendingAdvance::register(paths.lock.clone());
     run_publication_epoch_advance_checkpoint_for_test(target, expected);
+    wait_for_unfenced_publication_operations(&paths.lock);
     let lock = acquire_epoch_lock(base, &paths)?;
     let previous = read_publication_epoch(base, target)?;
     if previous != expected {
@@ -605,8 +684,8 @@ fn try_acquire_epoch_admission_lock(
     paths: &PublicationEpochPaths,
 ) -> Result<File, PublicationEpochAdmissionError> {
     let file = open_epoch_lock_file(base, paths).map_err(PublicationEpochAdmissionError::Epoch)?;
-    let pending_advances = pending_epoch_advances().lock().unwrap();
-    if pending_advances.contains_key(&paths.lock) {
+    let registry = publication_admission_registry().0.lock().unwrap();
+    if registry.pending_advances.contains_key(&paths.lock) {
         return Err(PublicationEpochAdmissionError::Busy);
     }
     run_publication_epoch_admission_pre_lock_checkpoint_for_test(&paths.lock);
@@ -619,34 +698,81 @@ fn try_acquire_epoch_admission_lock(
             })
         }
     })?;
-    drop(pending_advances);
+    drop(registry);
     run_publication_epoch_admission_lock_checkpoint_for_test(&paths.lock);
     Ok(file)
 }
 
 impl PublicationEpochPendingAdvance {
     fn register(lock_path: PathBuf) -> Self {
-        let mut pending = pending_epoch_advances().lock().unwrap();
-        *pending.entry(lock_path.clone()).or_insert(0) += 1;
+        let mut registry = publication_admission_registry().0.lock().unwrap();
+        *registry
+            .pending_advances
+            .entry(lock_path.clone())
+            .or_insert(0) += 1;
         Self { lock_path }
     }
 }
 
 impl Drop for PublicationEpochPendingAdvance {
     fn drop(&mut self) {
-        let mut pending = pending_epoch_advances().lock().unwrap();
-        let Some(count) = pending.get_mut(&self.lock_path) else {
+        let (registry, condvar) = publication_admission_registry();
+        let mut registry = registry.lock().unwrap();
+        let Some(count) = registry.pending_advances.get_mut(&self.lock_path) else {
             return;
         };
         *count -= 1;
         if *count == 0 {
-            pending.remove(&self.lock_path);
+            registry.pending_advances.remove(&self.lock_path);
         }
+        condvar.notify_all();
     }
 }
 
-fn pending_epoch_advances() -> &'static Mutex<BTreeMap<PathBuf, usize>> {
-    PENDING_EPOCH_ADVANCES.get_or_init(|| Mutex::new(BTreeMap::new()))
+impl PublicationUnfencedOperation {
+    fn try_register(lock_path: PathBuf) -> Option<Self> {
+        let mut registry = publication_admission_registry().0.lock().unwrap();
+        if registry.pending_advances.contains_key(&lock_path) {
+            return None;
+        }
+        *registry
+            .unfenced_operations
+            .entry(lock_path.clone())
+            .or_insert(0) += 1;
+        Some(Self { lock_path })
+    }
+}
+
+impl Drop for PublicationUnfencedOperation {
+    fn drop(&mut self) {
+        let (registry, condvar) = publication_admission_registry();
+        let mut registry = registry.lock().unwrap();
+        let Some(count) = registry.unfenced_operations.get_mut(&self.lock_path) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            registry.unfenced_operations.remove(&self.lock_path);
+        }
+        condvar.notify_all();
+    }
+}
+
+fn wait_for_unfenced_publication_operations(lock_path: &Path) {
+    let (registry, condvar) = publication_admission_registry();
+    let mut registry = registry.lock().unwrap();
+    while registry.unfenced_operations.contains_key(lock_path) {
+        registry = condvar.wait(registry).unwrap();
+    }
+}
+
+fn publication_admission_registry() -> &'static (Mutex<PublicationAdmissionRegistry>, Condvar) {
+    PUBLICATION_ADMISSION_REGISTRY.get_or_init(|| {
+        (
+            Mutex::new(PublicationAdmissionRegistry::default()),
+            Condvar::new(),
+        )
+    })
 }
 
 fn persist_epoch(

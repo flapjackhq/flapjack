@@ -113,10 +113,10 @@ async fn process_tasks(
 
 /// Execute a full index export for a single tenant.
 ///
-/// Flushes in-flight writes by draining the tenant's write queue and awaiting
-/// its write-task handle, then copies the on-disk index directory to
-/// `dest_path` using a blocking filesystem copy. The tenant's loaded-index
-/// entry is removed from the manager regardless of outcome.
+/// Quiesces the tenant through the canonical [`IndexManager::quiesce_tenant`]
+/// contract — draining and merge-quiescing the persistent writer and clearing
+/// runtime caches — then copies the on-disk index directory to `dest_path`
+/// using a blocking filesystem copy off the async runtime.
 /// Task status in `tasks` is updated to `Processing`, then to `Succeeded` or
 /// `Failed` at each stage.
 ///
@@ -136,14 +136,16 @@ async fn process_export(
 ) {
     update_export_status(&tasks, &task_id, TaskStatus::Processing);
 
-    manager.write_queues.remove(&tenant_id);
-
-    if let Some(handle) = manager
-        .write_task_handles
-        .get(&tenant_id)
-        .map(|entry| entry.value().clone())
-    {
-        if let Err(error) = handle.drain(tenant_id.clone()).await {
+    // Stop admission, drain the persistent writer through merge quiescence, and
+    // drop the cached generation before reading files off disk. This is the same
+    // canonical quiesce contract used by delete/import/replace so the export
+    // tarball reflects a merge-quiesced generation.
+    // The guard is held across the blocking copy below: without it, admission
+    // re-opens the moment quiesce returns and a replacement writer could commit
+    // into the tree while it is being read.
+    let _quiesce = match manager.quiesce_tenant(&tenant_id).await {
+        Ok(quiesce) => quiesce,
+        Err(error) => {
             update_export_status(
                 &tasks,
                 &task_id,
@@ -151,21 +153,23 @@ async fn process_export(
             );
             return;
         }
-        manager
-            .write_task_handles
-            .remove_if(&tenant_id, |_, current| current.same_handle(&handle));
-    }
+    };
 
     let src = manager.base_path.join(&tenant_id);
     let dest = dest_path.clone();
+    #[cfg(debug_assertions)]
+    let checkpoint_tenant_id = tenant_id.clone();
 
     let copy_result = tokio::task::spawn_blocking(move || {
+        #[cfg(debug_assertions)]
+        crate::index::write_queue::record_writer_lifecycle_publication_checkpoint(
+            &checkpoint_tenant_id,
+            "manager_export_publication",
+        );
         std::fs::create_dir_all(&dest)?;
         crate::index::utils::copy_dir_recursive(&src, &dest)
     })
     .await;
-
-    manager.loaded.remove(&tenant_id);
 
     match copy_result {
         Ok(Ok(())) => {

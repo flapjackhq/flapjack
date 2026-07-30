@@ -23,6 +23,7 @@ pub mod router;
 pub mod security_sources;
 pub mod server;
 pub mod server_init;
+pub mod snapshot_byte_ops;
 pub mod startup;
 pub mod startup_catchup;
 pub(crate) mod tenant_dirs;

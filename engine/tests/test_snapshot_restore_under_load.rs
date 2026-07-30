@@ -7,11 +7,14 @@
 //! `KEY=value` measurement lines required by Stage 2 to stdout and to
 //! `engine/target/dr_proof/latest/measurements.txt`.
 
+#![cfg(debug_assertions)]
+
 mod common;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -23,6 +26,31 @@ const BATCH_SIZE: u64 = 50;
 // snapshot window; small enough to keep the test fast (~seconds).
 const TOTAL_BATCHES: u64 = 40;
 const SNAPSHOT_AFTER_BATCHES: u64 = 10;
+const WRITE_QUEUE_TEST_COMMIT_DELAY_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_TEST_COMMIT_DELAY_MS";
+
+static ENV_MUTEX: StdMutex<()> = StdMutex::new(());
+
+struct EnvVarGuard {
+    name: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(name);
+        std::env::set_var(name, value);
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
 
 struct SnapshotSearchCapture {
     hits: Vec<serde_json::Value>,
@@ -46,6 +74,44 @@ fn batch_payload(start_id: u64) -> serde_json::Value {
         .map(|id| json!({ "action": "addObject", "body": make_doc(id) }))
         .collect();
     json!({ "requests": requests })
+}
+
+fn retained_channel_closed_count(tenant_id: &str) -> usize {
+    flapjack::index::write_queue::writer_lifecycle_test_events(tenant_id)
+        .iter()
+        .filter(|event| event.reason == "channel_closed" && event.phase == "merge_quiesced")
+        .count()
+}
+
+fn assert_retained_channel_closed_delta(tenant_id: &str, before: usize, message: &str) {
+    let after = retained_channel_closed_count(tenant_id);
+    assert_eq!(after - before, 1, "{message}");
+}
+
+fn assert_quiescence_before_publication(tenant_id: &str, publication_phase: &'static str) {
+    let events = flapjack::index::write_queue::writer_lifecycle_test_events(tenant_id);
+    let quiesced_sequence = events
+        .iter()
+        .find(|event| event.reason == "channel_closed" && event.phase == "merge_quiesced")
+        .map(|event| event.sequence)
+        .unwrap_or_else(|| {
+            panic!(
+                "tenant {tenant_id} must retain a channel_closed merge-quiesced event: {events:?}"
+            )
+        });
+    let publication_sequence = events
+        .iter()
+        .find(|event| event.phase == publication_phase)
+        .map(|event| event.sequence)
+        .unwrap_or_else(|| {
+            panic!(
+                "tenant {tenant_id} must retain publication event {publication_phase}: {events:?}"
+            )
+        });
+    assert!(
+        quiesced_sequence < publication_sequence,
+        "tenant {tenant_id} must merge-quiesce before {publication_phase}; events: {events:?}"
+    );
 }
 
 async fn post_batch_and_wait(
@@ -73,6 +139,27 @@ async fn post_batch_and_wait(
         .ok_or_else(|| format!("missing taskID in batch response at {start_id}: {body}"))?;
     common::wait_for_task(client, addr, task_id).await;
     Ok(())
+}
+
+async fn post_batch_without_wait(client: &reqwest::Client, addr: &str, start_id: u64) -> i64 {
+    let resp = client
+        .post(format!("http://{addr}/1/indexes/{INDEX_NAME}/batch"))
+        .json(&batch_payload(start_id))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("batch send failed at {start_id}: {error}"));
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .unwrap_or_else(|error| panic!("batch body parse failed at {start_id}: {error}"));
+    assert!(
+        status.is_success(),
+        "batch failed at {start_id}: {status} {body}"
+    );
+    body.get("taskID")
+        .and_then(|value| value.as_i64())
+        .unwrap_or_else(|| panic!("missing taskID in batch response at {start_id}: {body}"))
 }
 
 /// Background writer: loops sending batches until either `TOTAL_BATCHES`
@@ -392,6 +479,59 @@ async fn take_snapshot_under_lock(
         rpo_measured_ms,
         snapshot_search,
     )
+}
+
+async fn export_snapshot_without_pause_lock(
+    client: &reqwest::Client,
+    addr_a: &str,
+) -> (Vec<u8>, u64) {
+    let t_snapshot_start = Instant::now();
+    let export_resp = client
+        .get(format!("http://{addr_a}/1/indexes/{INDEX_NAME}/export"))
+        .send()
+        .await
+        .expect("export send failed");
+    assert!(
+        export_resp.status().is_success(),
+        "export non-2xx: {}",
+        export_resp.status()
+    );
+    let snapshot_bytes = export_resp
+        .bytes()
+        .await
+        .expect("export body read failed")
+        .to_vec();
+    assert!(
+        !snapshot_bytes.is_empty(),
+        "exported snapshot bytes were empty"
+    );
+    (
+        snapshot_bytes,
+        t_snapshot_start.elapsed().as_millis() as u64,
+    )
+}
+
+async fn capture_search_parity(client: &reqwest::Client, addr_a: &str) -> SnapshotSearchCapture {
+    let parity_query = json!({
+        "query": "",
+        "filters": "bucket:b3",
+        "hitsPerPage": 1000,
+    });
+    let parity_resp = client
+        .post(format!("http://{addr_a}/1/indexes/{INDEX_NAME}/query"))
+        .json(&parity_query)
+        .send()
+        .await
+        .expect("snapshot-moment parity query on A failed");
+    assert!(parity_resp.status().is_success());
+    let parity_body: serde_json::Value = parity_resp.json().await.unwrap();
+    SnapshotSearchCapture {
+        hits: parity_body["hits"]
+            .as_array()
+            .expect("no hits array in snapshot-moment query")
+            .clone(),
+        total_hits: parity_body["nbHits"].as_u64().unwrap(),
+    }
 }
 
 /// Import the captured bytes into server B, poll until queryable at the
@@ -791,6 +931,7 @@ fn emit_and_verify_measurements(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(snapshot_under_load_shared_state)]
 async fn snapshot_export_under_load_restores_with_exact_doc_count_and_record_parity() {
     let (addr_a, _tmp_a) = common::spawn_server_with_key(None).await;
     let client = reqwest::Client::new();
@@ -853,6 +994,88 @@ async fn snapshot_export_under_load_restores_with_exact_doc_count_and_record_par
         rpo_measured_ms,
         rto_measured_ms,
         doc_count_at_snapshot,
+        doc_count_at_restore,
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(snapshot_under_load_shared_state)]
+async fn snapshot_during_active_write_restores_exact_record_parity() {
+    let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+    flapjack::index::write_queue::clear_writer_lifecycle_test_events();
+    let _commit_delay = EnvVarGuard::set(WRITE_QUEUE_TEST_COMMIT_DELAY_ENV_VAR, "250");
+    let (addr_a, _tmp_a) = common::spawn_server_with_key(None).await;
+    let client = reqwest::Client::new();
+    create_index(&client, &addr_a).await;
+
+    let expected_snapshot_count = SNAPSHOT_AFTER_BATCHES * BATCH_SIZE + BATCH_SIZE;
+    assert!(
+        expected_snapshot_count < TOTAL_BATCHES * BATCH_SIZE,
+        "active snapshot specimen must remain mid-stream rather than consuming every configured batch"
+    );
+    for batch in 0..SNAPSHOT_AFTER_BATCHES {
+        post_batch_and_wait(&client, &addr_a, batch * BATCH_SIZE)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        fetch_total_hits(&client, &addr_a).await,
+        SNAPSHOT_AFTER_BATCHES * BATCH_SIZE,
+        "fixture must publish exactly the first 10 batches before opening the active snapshot window"
+    );
+
+    let active_batch = tokio::spawn({
+        let client = client.clone();
+        let addr_a = addr_a.clone();
+        async move {
+            post_batch_without_wait(&client, &addr_a, SNAPSHOT_AFTER_BATCHES * BATCH_SIZE).await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !active_batch.is_finished(),
+        "fixture must keep the batch request in flight when snapshot export starts"
+    );
+    let merge_wait_before = retained_channel_closed_count(INDEX_NAME);
+    let (snapshot_bytes, rpo_measured_ms) =
+        export_snapshot_without_pause_lock(&client, &addr_a).await;
+    assert_retained_channel_closed_delta(
+        INDEX_NAME,
+        merge_wait_before,
+        "snapshot export must drain and merge-quiesce the active writer before reading files",
+    );
+    assert_quiescence_before_publication(INDEX_NAME, "snapshot_export_read");
+    let active_task_id = active_batch
+        .await
+        .expect("active batch request task must not panic");
+    common::wait_for_task(&client, &addr_a, active_task_id).await;
+
+    let visible_after_task = fetch_total_hits(&client, &addr_a).await;
+    assert_eq!(
+        visible_after_task, expected_snapshot_count,
+        "setup must make the extra active batch visible before parity assertions"
+    );
+    let snapshot_search = capture_search_parity(&client, &addr_a).await;
+
+    let (addr_b, tmp_b) = common::spawn_server_with_key(None).await;
+    let (doc_count_at_restore, rto_measured_ms) =
+        restore_and_verify_count(&client, &addr_b, snapshot_bytes, expected_snapshot_count).await;
+
+    assert_record_parity(&client, &addr_a, &addr_b, expected_snapshot_count).await;
+    assert_search_parity(&client, &addr_b, &snapshot_search, expected_snapshot_count).await;
+    assert_restart_durability_after_import(
+        &client,
+        &addr_a,
+        tmp_b.path(),
+        &snapshot_search,
+        expected_snapshot_count,
+    )
+    .await;
+
+    emit_and_verify_measurements(
+        rpo_measured_ms,
+        rto_measured_ms,
+        expected_snapshot_count,
         doc_count_at_restore,
     );
 }

@@ -10,7 +10,7 @@ use super::translation_report::{
 use super::translation_schema::{validate_rule_page, validate_synonym_page};
 use super::{push_typed_failure, validate_settings_payload};
 use crate::handlers::migration::source_identity_partitions::{
-    SourceIdentityConfig, SourceIdentityError,
+    SourceIdentityConfig, SourceIdentityError, SourceIdentityValidation,
 };
 use crate::handlers::migration::source_snapshot::{
     document_violation_from_identity_error, SourceSnapshotBuilder,
@@ -25,7 +25,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 
-const MAX_DOCUMENT_BATCH_SIZE: usize = 1_000;
+const MAX_DOCUMENT_BATCH_SIZE: usize =
+    flapjack::index::DEFAULT_BULK_BUILD_DOCUMENT_CHECKPOINT_INTERVAL;
 
 /// The settings inputs a translation session opens with: the primary source
 /// settings it translates, plus the transient replica-owned settings it observes
@@ -85,6 +86,7 @@ pub(in crate::handlers::migration) struct TranslatedSpoolPayload {
     pub(in crate::handlers::migration) bundle: TranslationBundle,
     pub(in crate::handlers::migration) document_batches: Vec<Vec<Document>>,
     pub(in crate::handlers::migration) report: TranslationReport,
+    pub(in crate::handlers::migration) source_identity_validation: SourceIdentityValidation,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -202,6 +204,7 @@ struct TranslationPageStreams<DocumentPages, RulePages, SynonymPages> {
 struct TranslationSessionOptions {
     identity_config: SourceIdentityConfig,
     retain_document_batches: bool,
+    document_batch_size: usize,
 }
 
 fn translate_initial_settings(settings: Value) -> InitialSettingsTranslation {
@@ -242,6 +245,8 @@ where
         TranslationSessionOptions {
             identity_config,
             retain_document_batches,
+            document_batch_size: flapjack::index::BulkBuildWriterConfig::from_env()
+                .document_checkpoint_interval,
         },
         instrumentation,
         should_cancel,
@@ -278,6 +283,7 @@ where
     document_batch: Vec<Document>,
     document_batches: Vec<Vec<Document>>,
     retain_document_batches: bool,
+    document_batch_size: usize,
     instrumentation: &'a mut TranslationSessionInstrumentation,
     should_cancel: Box<dyn FnMut() -> Result<bool, SpoolError> + 'a>,
     emit_documents: &'a mut F,
@@ -338,6 +344,7 @@ where
             document_batch: Vec::with_capacity(MAX_DOCUMENT_BATCH_SIZE),
             document_batches: Vec::new(),
             retain_document_batches: options.retain_document_batches,
+            document_batch_size: options.document_batch_size,
             instrumentation,
             should_cancel: Box::new(should_cancel),
             emit_documents,
@@ -374,7 +381,7 @@ where
                 self.document_batch.push(document);
                 self.instrumentation
                     .observe_pending_documents(self.document_batch.len());
-                if self.document_batch.len() == MAX_DOCUMENT_BATCH_SIZE {
+                if self.document_batch.len() == self.document_batch_size {
                     self.flush_documents()?;
                 }
             }
@@ -490,9 +497,16 @@ where
             .snapshot_builder
             .take()
             .expect("snapshot builder exists until finish");
-        if let Err(error) = snapshot_builder.finish() {
-            self.push_document_identity_error(error)?;
-        }
+        let source_identity_validation = match snapshot_builder.finish() {
+            Ok(_) => SourceIdentityValidation::Unique,
+            Err(error) => match SourceIdentityValidation::from_duplicate_error(&error) {
+                Some(validation) => validation,
+                None => {
+                    self.push_document_identity_error(error)?;
+                    SourceIdentityValidation::Unique
+                }
+            },
+        };
         if contains_hard_rejection(&self.entries) {
             return Ok(TranslationOutcome::Rejected(finalize_report(self.entries)));
         }
@@ -509,6 +523,7 @@ where
                 },
                 document_batches: self.document_batches,
                 report: finalize_report(self.entries),
+                source_identity_validation,
             },
         )))
     }

@@ -1,11 +1,12 @@
 //! Facet collection and distinct deduplication for search results. Executes queries with tantivy collectors, extracts and trims facet counts, and deduplicates documents by attribute value with configurable group limits.
+use super::facet_collector::{PreparedFacetCollector, PreparedFacetCounts};
 use super::metrics::{QueryExecutionPath, QueryPhase};
 use super::QueryExecutor;
 use crate::error::Result;
 use crate::types::{FacetCount, FacetRequest, FacetStats, SearchResult, Sort};
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use tantivy::collector::{Count, FacetCollector, TopDocs};
+use tantivy::collector::{Count, TopDocs};
 use tantivy::query::Query as TantivyQuery;
 use tantivy::Searcher;
 
@@ -166,7 +167,7 @@ impl QueryExecutor {
         let has_text_query = params.has_text_query;
         let distinct_count = params.distinct_count;
 
-        let mut facet_collector = FacetCollector::for_field("_facets");
+        let mut facet_collector = PreparedFacetCollector::for_field("_facets");
         for req in facet_requests {
             facet_collector.add_facet(&req.path);
         }
@@ -393,48 +394,35 @@ impl QueryExecutor {
         facets: HashMap<String, Vec<FacetCount>>,
         _requests: &[FacetRequest],
     ) -> HashMap<String, Vec<FacetCount>> {
-        let limit = self
-            .max_values_per_facet
-            .or_else(|| {
-                self.settings
-                    .as_ref()
-                    .map(|s| s.max_values_per_facet as usize)
-            })
-            .unwrap_or(100)
-            .min(1000);
+        let limit = self.facet_value_limit();
         facets
             .into_iter()
             .map(|(k, v)| (k, v.into_iter().take(limit).collect()))
             .collect()
     }
 
-    /// Extract facet counts and numeric statistics from search results. For numeric facets, calculates min, max, sum, and average. Sets exhaustive_facet_values to false if any facet has more unique values than the limit.
-    ///
-    /// # Arguments
-    /// - `facet_counts`: Tantivy facet counts from search
-    /// - `requests`: Facet requests specifying paths and field names
-    ///
-    /// # Returns
-    /// Tuple of (facet counts map, facet stats map, exhaustive_facet_values flag).
+    fn facet_value_limit(&self) -> usize {
+        self.max_values_per_facet
+            .or_else(|| {
+                self.settings
+                    .as_ref()
+                    .map(|settings| settings.max_values_per_facet as usize)
+            })
+            .unwrap_or(100)
+            .min(1000)
+    }
+
+    /// Extract exact facet counts and numeric statistics from collected child values.
     pub(crate) fn extract_facet_counts_and_stats(
         &self,
-        facet_counts: &tantivy::collector::FacetCounts,
+        facet_counts: &PreparedFacetCounts,
         requests: &[FacetRequest],
     ) -> (
         HashMap<String, Vec<FacetCount>>,
         HashMap<String, FacetStats>,
         bool,
     ) {
-        let limit = self
-            .max_values_per_facet
-            .or_else(|| {
-                self.settings
-                    .as_ref()
-                    .map(|s| s.max_values_per_facet as usize)
-            })
-            .unwrap_or(100)
-            .min(1000);
-
+        let limit = self.facet_value_limit();
         let mut result = HashMap::new();
         let mut stats = HashMap::new();
         let mut exhaustive_facet_values = true;
@@ -445,96 +433,30 @@ impl QueryExecutor {
                 .as_deref()
                 .filter(|q| !q.is_empty())
                 .map(str::to_lowercase);
-            let mut value_query_truncated = false;
+            let all_counts: Vec<FacetCount> = facet_counts
+                .get(&req.path)
+                .map(|(facet, count)| FacetCount {
+                    path: clean_facet_path(req, facet),
+                    count,
+                })
+                .collect();
+            let unique_count = all_counts.len();
+            self.add_facet_cardinality(unique_count);
 
-            let counts: Vec<FacetCount> = if let Some(vq) = &value_query {
-                // searchForFacetValues: scan ALL distinct values (same full
-                // iteration the stats loop below already does), so matches
-                // outside the top-`limit` by count are still found.
-                let mut matches: Vec<FacetCount> = facet_counts
-                    .get(&req.path)
-                    .map(|(facet, count)| FacetCount {
-                        path: clean_facet_path(req, facet),
-                        count,
-                    })
-                    .filter(|fc| {
-                        let leaf = fc.path.rsplit(" > ").next().unwrap_or(&fc.path);
-                        leaf.to_lowercase().contains(vq)
-                    })
-                    .collect();
-                matches.sort_by(compare_facet_counts);
-                if matches.len() > limit {
-                    value_query_truncated = true;
-                    matches.truncate(limit);
-                }
-                matches
-            } else {
-                facet_counts
-                    .top_k(&req.path, limit)
-                    .into_iter()
-                    .map(|(facet, count)| FacetCount {
-                        path: clean_facet_path(req, facet),
-                        count,
-                    })
-                    .collect()
-            };
-
-            let mut counts = counts;
-            counts.sort_by(compare_facet_counts);
+            if let Some(facet_stats) = numeric_facet_stats(&all_counts) {
+                stats.insert(req.field.clone(), facet_stats);
+            }
+            let (counts, truncated) =
+                filter_and_limit_facet_counts(all_counts, value_query.as_deref(), limit);
             result
                 .entry(req.field.clone())
                 .or_insert_with(Vec::new)
                 .extend(counts);
 
-            let mut all_numeric = true;
-            let mut min = f64::INFINITY;
-            let mut max = f64::NEG_INFINITY;
-            let mut sum = 0.0_f64;
-            let mut total_count = 0_u64;
-            let mut unique_count = 0_usize;
-
-            for (facet, count) in facet_counts.get(&req.path) {
-                unique_count += 1;
-                if !all_numeric {
-                    continue;
-                }
-                let raw = clean_facet_path(req, facet);
-                match raw.parse::<f64>() {
-                    Ok(val) if val.is_finite() => {
-                        if val < min {
-                            min = val;
-                        }
-                        if val > max {
-                            max = val;
-                        }
-                        sum += val * count as f64;
-                        total_count += count;
-                    }
-                    _ => {
-                        all_numeric = false;
-                    }
-                }
-            }
-            self.add_facet_cardinality(unique_count);
-
-            if value_query.is_some() {
-                if value_query_truncated {
-                    exhaustive_facet_values = false;
-                }
-            } else if unique_count > limit {
+            if (value_query.is_some() && truncated)
+                || (value_query.is_none() && unique_count > limit)
+            {
                 exhaustive_facet_values = false;
-            }
-
-            if all_numeric && total_count > 0 {
-                stats.insert(
-                    req.field.clone(),
-                    FacetStats {
-                        min,
-                        max,
-                        avg: sum / total_count as f64,
-                        sum,
-                    },
-                );
             }
         }
 
@@ -551,6 +473,62 @@ fn clean_facet_path(req: &FacetRequest, facet: &tantivy::schema::Facet) -> Strin
 
 fn compare_facet_counts(a: &FacetCount, b: &FacetCount) -> Ordering {
     b.count.cmp(&a.count).then_with(|| a.path.cmp(&b.path))
+}
+
+fn filter_and_limit_facet_counts(
+    all_counts: Vec<FacetCount>,
+    value_query: Option<&str>,
+    limit: usize,
+) -> (Vec<FacetCount>, bool) {
+    let mut counts = match value_query {
+        Some(query) => all_counts
+            .into_iter()
+            .filter(|facet_count| {
+                let leaf = facet_count
+                    .path
+                    .rsplit(" > ")
+                    .next()
+                    .unwrap_or(&facet_count.path);
+                leaf.to_lowercase().contains(query)
+            })
+            .collect(),
+        None => all_counts,
+    };
+    let truncated = counts.len() > limit;
+    sort_and_truncate_facet_counts(&mut counts, limit);
+    (counts, truncated)
+}
+
+fn sort_and_truncate_facet_counts(counts: &mut Vec<FacetCount>, limit: usize) {
+    if counts.len() > limit {
+        counts.select_nth_unstable_by(limit, compare_facet_counts);
+        counts.truncate(limit);
+    }
+    counts.sort_by(compare_facet_counts);
+}
+
+fn numeric_facet_stats(counts: &[FacetCount]) -> Option<FacetStats> {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut sum = 0.0;
+    let mut total_count = 0_u64;
+
+    for facet_count in counts {
+        let value = facet_count.path.parse::<f64>().ok()?;
+        if !value.is_finite() {
+            return None;
+        }
+        min = min.min(value);
+        max = max.max(value);
+        sum += value * facet_count.count as f64;
+        total_count += facet_count.count;
+    }
+    (total_count > 0).then_some(FacetStats {
+        min,
+        max,
+        avg: sum / total_count as f64,
+        sum,
+    })
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 
 use crate::index::settings::IndexSettings;
 use crate::integ_tests::search_compat::SearchCompat;
-use crate::types::{Document, FacetRequest, FieldValue};
+use crate::types::{Document, FacetRequest, FieldValue, Filter};
 use crate::IndexManager;
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -75,6 +75,218 @@ async fn setup_with_settings(
 
     manager.add_documents_sync("test", docs).await.unwrap();
     (temp_dir, manager)
+}
+
+async fn setup_brand_cache_fixture(
+    test_docs: Vec<Document>,
+    other_docs: Vec<Document>,
+) -> (TempDir, std::sync::Arc<IndexManager>) {
+    let (temp_dir, manager) = setup_with_settings(vec!["brand"], test_docs).await;
+    manager.create_tenant("other").unwrap();
+    IndexSettings {
+        attributes_for_faceting: vec!["brand".to_string()],
+        ..Default::default()
+    }
+    .save(temp_dir.path().join("other/settings.json"))
+    .unwrap();
+    manager
+        .add_documents_sync("other", other_docs)
+        .await
+        .unwrap();
+    (temp_dir, manager)
+}
+
+fn brand_filter(brand: &str) -> Filter {
+    Filter::Equals {
+        field: "brand".to_string(),
+        value: text(brand),
+    }
+}
+
+fn brand_or_filter(first: &str, second: &str) -> Filter {
+    Filter::Or(vec![brand_filter(first), brand_filter(second)])
+}
+
+fn search_brand_facets(
+    manager: &std::sync::Arc<IndexManager>,
+    tenant: &str,
+    filter: Option<&Filter>,
+    brand_request: &[FacetRequest],
+) -> crate::types::SearchResult {
+    manager
+        .search_with_facets(tenant, "", filter, None, 0, 0, Some(brand_request))
+        .unwrap()
+}
+
+fn assert_brand_facets(
+    manager: &std::sync::Arc<IndexManager>,
+    tenant: &str,
+    filter: Option<&Filter>,
+    brand_request: &[FacetRequest],
+    expected_total: usize,
+    expected: &[(&str, u64)],
+    context: &str,
+) {
+    let result = search_brand_facets(manager, tenant, filter, brand_request);
+    assert_eq!(result.total, expected_total, "{context}");
+    assert_eq!(
+        result.facets["brand"]
+            .iter()
+            .map(|count| (count.path.as_str(), count.count))
+            .collect::<Vec<_>>(),
+        expected,
+        "{context}"
+    );
+}
+
+fn tenant_cache_entry_count(manager: &std::sync::Arc<IndexManager>, tenant: &str) -> usize {
+    manager
+        .facet_cache
+        .iter()
+        .filter(|entry| entry.key().belongs_to_tenant(tenant))
+        .count()
+}
+
+fn assert_two_tenant_brand_cache_isolation(
+    manager: &std::sync::Arc<IndexManager>,
+    brand_request: &[FacetRequest],
+    apple_filter: &Filter,
+    samsung_filter: &Filter,
+    context: &str,
+) {
+    assert_brand_facets(
+        manager,
+        "test",
+        Some(apple_filter),
+        brand_request,
+        2,
+        &[("Apple", 2)],
+        "test tenant Apple filter",
+    );
+    assert_brand_facets(
+        manager,
+        "test",
+        Some(samsung_filter),
+        brand_request,
+        1,
+        &[("Samsung", 1)],
+        "test tenant Samsung filter",
+    );
+    assert_brand_facets(
+        manager,
+        "other",
+        Some(apple_filter),
+        brand_request,
+        1,
+        &[("Apple", 1)],
+        "other tenant Apple filter",
+    );
+    assert_brand_facets(
+        manager,
+        "other",
+        Some(samsung_filter),
+        brand_request,
+        2,
+        &[("Samsung", 2)],
+        "other tenant Samsung filter",
+    );
+    assert_eq!(
+        manager.facet_cache.len(),
+        4,
+        "{context}: two filter hashes across two tenants must own four cache entries"
+    );
+}
+
+fn assert_pre_write_brand_cache_state(
+    manager: &std::sync::Arc<IndexManager>,
+    brand_request: &[FacetRequest],
+    apple_or_sony_filter: &Filter,
+    samsung_or_sony_filter: &Filter,
+) {
+    assert_brand_facets(
+        manager,
+        "test",
+        None,
+        brand_request,
+        2,
+        &[("Apple", 1), ("Samsung", 1)],
+        "pre-write unfiltered",
+    );
+    assert_brand_facets(
+        manager,
+        "test",
+        Some(apple_or_sony_filter),
+        brand_request,
+        1,
+        &[("Apple", 1)],
+        "pre-write Apple-or-Sony filter",
+    );
+    assert_brand_facets(
+        manager,
+        "test",
+        Some(samsung_or_sony_filter),
+        brand_request,
+        1,
+        &[("Samsung", 1)],
+        "pre-write Samsung-or-Sony filter",
+    );
+    assert_brand_facets(
+        manager,
+        "other",
+        None,
+        brand_request,
+        1,
+        &[("Acme", 1)],
+        "pre-write other tenant",
+    );
+}
+
+fn capture_unfiltered_cache_entry(
+    manager: &std::sync::Arc<IndexManager>,
+) -> (crate::index::FacetCacheKey, crate::index::FacetCacheEntry) {
+    let unfiltered_key =
+        crate::index::FacetCacheKey::new("test", "", "", vec!["brand".to_string()]);
+    let stale_unfiltered_entry = manager
+        .facet_cache
+        .get(&unfiltered_key)
+        .map(|entry| std::sync::Arc::clone(entry.value()))
+        .expect("cached pre-write facet result");
+    (unfiltered_key, stale_unfiltered_entry)
+}
+
+fn assert_post_write_brand_cache_state(
+    manager: &std::sync::Arc<IndexManager>,
+    brand_request: &[FacetRequest],
+    apple_or_sony_filter: &Filter,
+    samsung_or_sony_filter: &Filter,
+) {
+    assert_brand_facets(
+        manager,
+        "test",
+        None,
+        brand_request,
+        4,
+        &[("Sony", 2), ("Apple", 1), ("Samsung", 1)],
+        "post-write unfiltered",
+    );
+    assert_brand_facets(
+        manager,
+        "test",
+        Some(apple_or_sony_filter),
+        brand_request,
+        3,
+        &[("Sony", 2), ("Apple", 1)],
+        "post-write Apple-or-Sony filter",
+    );
+    assert_brand_facets(
+        manager,
+        "test",
+        Some(samsung_or_sony_filter),
+        brand_request,
+        3,
+        &[("Sony", 2), ("Samsung", 1)],
+        "post-write Samsung-or-Sony filter",
+    );
 }
 
 /// Create a temporary index pre-loaded with 8 electronics-store documents across 5 brands and 5 categories.
@@ -1047,6 +1259,389 @@ async fn test_facet_cache_invalidated_on_write() {
         Some(2)
     );
     assert_eq!(r2.total, 4);
+}
+
+#[tokio::test]
+async fn facet_cache_separates_counts_for_different_queries() {
+    let docs = vec![
+        doc(
+            "1",
+            vec![("brand", text("Apple")), ("name", text("iPhone"))],
+        ),
+        doc(
+            "2",
+            vec![("brand", text("Samsung")), ("name", text("Galaxy"))],
+        ),
+    ];
+    let (_tmp, manager) = setup_with_settings(vec!["brand"], docs).await;
+    let brand_request = [facet_req("brand")];
+
+    let iphone = manager
+        .search_with_facets("test", "iphone", None, None, 0, 0, Some(&brand_request))
+        .unwrap();
+    assert_eq!(iphone.total, 1);
+    assert_eq!(
+        iphone
+            .facets
+            .get("brand")
+            .expect("iPhone brand facets")
+            .iter()
+            .map(|count| (count.path.as_str(), count.count))
+            .collect::<Vec<_>>(),
+        vec![("Apple", 1)]
+    );
+
+    let galaxy = manager
+        .search_with_facets("test", "galaxy", None, None, 0, 0, Some(&brand_request))
+        .unwrap();
+    assert_eq!(galaxy.total, 1);
+    assert_eq!(
+        galaxy
+            .facets
+            .get("brand")
+            .expect("Galaxy brand facets")
+            .iter()
+            .map(|count| (count.path.as_str(), count.count))
+            .collect::<Vec<_>>(),
+        vec![("Samsung", 1)]
+    );
+    assert_eq!(
+        manager.facet_cache.len(),
+        2,
+        "each normalized query must own an independent facet cache entry"
+    );
+}
+
+#[tokio::test]
+async fn facet_cache_separates_max_values_per_facet_limits() {
+    use crate::index::SearchOptions;
+
+    let docs = vec![
+        doc("1", vec![("brand", text("Alpha")), ("name", text("First"))]),
+        doc("2", vec![("brand", text("Beta")), ("name", text("Second"))]),
+        doc("3", vec![("brand", text("Gamma")), ("name", text("Third"))]),
+    ];
+    let (_tmp, manager) = setup_with_settings(vec!["brand"], docs).await;
+    let brand_request = [facet_req("brand")];
+
+    let one_value = manager
+        .search_with_options(
+            "test",
+            "",
+            &SearchOptions {
+                limit: 0,
+                facets: Some(&brand_request),
+                max_values_per_facet: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        one_value.facets["brand"]
+            .iter()
+            .map(|count| count.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Alpha"]
+    );
+
+    let three_values = manager
+        .search_with_options(
+            "test",
+            "",
+            &SearchOptions {
+                limit: 0,
+                facets: Some(&brand_request),
+                max_values_per_facet: Some(3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        three_values.facets["brand"]
+            .iter()
+            .map(|count| count.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Alpha", "Beta", "Gamma"],
+        "a low-limit warm cache entry must not truncate a later larger request"
+    );
+    assert_eq!(
+        manager.facet_cache.len(),
+        2,
+        "each maxValuesPerFacet limit must own an independent cache entry"
+    );
+}
+
+#[tokio::test]
+async fn facet_cache_does_not_cross_query_semantic_overrides() {
+    use crate::index::SearchOptions;
+
+    let docs = vec![
+        doc(
+            "1",
+            vec![("brand", text("Exact")), ("name", text("iphnoe"))],
+        ),
+        doc(
+            "2",
+            vec![("brand", text("Corrected")), ("name", text("iphone"))],
+        ),
+    ];
+    let (_tmp, manager) = setup_with_settings(vec!["brand"], docs).await;
+    let brand_request = [facet_req("brand")];
+
+    let typo_enabled = manager
+        .search_with_options(
+            "test",
+            "iphnoe",
+            &SearchOptions {
+                limit: 0,
+                facets: Some(&brand_request),
+                typo_tolerance: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        typo_enabled.facets["brand"]
+            .iter()
+            .map(|count| count.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Corrected", "Exact"],
+        "the fixture must prove typo tolerance expands the result set"
+    );
+
+    let typo_disabled = manager
+        .search_with_options(
+            "test",
+            "iphnoe",
+            &SearchOptions {
+                limit: 0,
+                facets: Some(&brand_request),
+                typo_tolerance: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        typo_disabled.facets["brand"]
+            .iter()
+            .map(|count| count.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Exact"],
+        "a cached typo-enabled result must not leak into a typo-disabled request"
+    );
+    assert!(
+        manager.facet_cache.is_empty(),
+        "requests with semantic overrides must bypass the shared facet cache"
+    );
+}
+
+#[tokio::test]
+async fn facet_cache_key_separates_query_and_facet_field_boundaries() {
+    let docs = vec![
+        doc(
+            "1",
+            vec![
+                ("name", text("foo")),
+                ("brand:x", text("Alpha")),
+                ("x", text("One")),
+            ],
+        ),
+        doc(
+            "2",
+            vec![
+                ("name", text("foo brand")),
+                ("brand:x", text("Beta")),
+                ("x", text("Two")),
+            ],
+        ),
+    ];
+    let (_tmp, manager) = setup_with_settings(vec!["brand:x", "x"], docs).await;
+
+    let foo = manager
+        .search_with_facets(
+            "test",
+            "foo",
+            None,
+            None,
+            0,
+            0,
+            Some(&[facet_req("brand:x")]),
+        )
+        .unwrap();
+    assert_eq!(foo.total, 2);
+    assert_eq!(
+        foo.facets["brand:x"]
+            .iter()
+            .map(|count| (count.path.as_str(), count.count))
+            .collect::<Vec<_>>(),
+        vec![("Alpha", 1), ("Beta", 1)]
+    );
+
+    let foo_brand = manager
+        .search_with_facets(
+            "test",
+            "foo:brand",
+            None,
+            None,
+            0,
+            0,
+            Some(&[facet_req("x")]),
+        )
+        .unwrap();
+    assert_eq!(foo_brand.total, 1);
+    assert_eq!(
+        foo_brand.facets["x"]
+            .iter()
+            .map(|count| (count.path.as_str(), count.count))
+            .collect::<Vec<_>>(),
+        vec![("Two", 1)]
+    );
+    assert_eq!(
+        manager.facet_cache.len(),
+        2,
+        "structured query and facet dimensions must own independent entries"
+    );
+}
+
+#[tokio::test]
+async fn facet_cache_key_isolates_two_filters_across_two_tenants() {
+    let test_docs = vec![
+        doc(
+            "1",
+            vec![("brand", text("Apple")), ("name", text("iPhone"))],
+        ),
+        doc(
+            "2",
+            vec![("brand", text("Apple")), ("name", text("MacBook"))],
+        ),
+        doc(
+            "3",
+            vec![("brand", text("Samsung")), ("name", text("Galaxy"))],
+        ),
+    ];
+    let other_docs = vec![
+        doc(
+            "other-1",
+            vec![("brand", text("Apple")), ("name", text("Watch"))],
+        ),
+        doc(
+            "other-2",
+            vec![("brand", text("Samsung")), ("name", text("Tablet"))],
+        ),
+        doc(
+            "other-3",
+            vec![("brand", text("Samsung")), ("name", text("Phone"))],
+        ),
+    ];
+    let (_temp_dir, manager) = setup_brand_cache_fixture(test_docs, other_docs).await;
+
+    let apple_filter = brand_filter("Apple");
+    let samsung_filter = brand_filter("Samsung");
+    let brand_request = [facet_req("brand")];
+    assert_two_tenant_brand_cache_isolation(
+        &manager,
+        &brand_request,
+        &apple_filter,
+        &samsung_filter,
+        "cold cache run",
+    );
+
+    // Every entry is now warm. Rerun all four so an incorrect cache-key owner
+    // cannot hide behind the first uncached computation.
+    assert_two_tenant_brand_cache_isolation(
+        &manager,
+        &brand_request,
+        &apple_filter,
+        &samsung_filter,
+        "warm cache rerun",
+    );
+}
+
+/// Prove commit invalidation removes every cache-key variant for only the
+/// written tenant, and that retaining a prior entry would return stale counts.
+#[tokio::test]
+async fn facet_cache_generation_change_invalidates_old_counts() {
+    let test_docs = vec![
+        doc(
+            "1",
+            vec![("brand", text("Apple")), ("name", text("iPhone"))],
+        ),
+        doc(
+            "2",
+            vec![("brand", text("Samsung")), ("name", text("Galaxy"))],
+        ),
+    ];
+    let other_docs = vec![doc(
+        "other-1",
+        vec![("brand", text("Acme")), ("name", text("Widget"))],
+    )];
+    let (_temp_dir, mgr) = setup_brand_cache_fixture(test_docs, other_docs).await;
+
+    let brand_request = [facet_req("brand")];
+    let apple_or_sony_filter = brand_or_filter("Apple", "Sony");
+    let samsung_or_sony_filter = brand_or_filter("Samsung", "Sony");
+    assert_pre_write_brand_cache_state(
+        &mgr,
+        &brand_request,
+        &apple_or_sony_filter,
+        &samsung_or_sony_filter,
+    );
+    let (unfiltered_key, stale_unfiltered_entry) = capture_unfiltered_cache_entry(&mgr);
+    assert_eq!(
+        tenant_cache_entry_count(&mgr, "test"),
+        3,
+        "filter hash must distinguish unfiltered and both filtered entries"
+    );
+    assert_eq!(
+        tenant_cache_entry_count(&mgr, "other"),
+        1,
+        "other tenant must own an independent cache entry"
+    );
+
+    mgr.add_documents_sync(
+        "test",
+        vec![
+            doc("3", vec![("brand", text("Sony")), ("name", text("Xperia"))]),
+            doc("4", vec![("brand", text("Sony")), ("name", text("TV"))]),
+        ],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        tenant_cache_entry_count(&mgr, "test"),
+        0,
+        "commit-time invalidation must remove every filter variant"
+    );
+    assert_eq!(
+        tenant_cache_entry_count(&mgr, "other"),
+        1,
+        "per-tenant invalidation must preserve unrelated tenants"
+    );
+
+    // Negative control: reinsert the exact pre-write entry to simulate broken
+    // commit invalidation. The live lookup must then expose the stale total and
+    // counts, proving this fixture would catch the defect instead of passing on
+    // a cache miss.
+    mgr.facet_cache
+        .insert(unfiltered_key, stale_unfiltered_entry);
+    assert_brand_facets(
+        &mgr,
+        "test",
+        None,
+        &brand_request,
+        2,
+        &[("Apple", 1), ("Samsung", 1)],
+        "deliberately stale unfiltered cache entry",
+    );
+
+    mgr.invalidate_facet_cache("test");
+    assert_post_write_brand_cache_state(
+        &mgr,
+        &brand_request,
+        &apple_or_sony_filter,
+        &samsung_or_sony_filter,
+    );
 }
 
 // ============================================================

@@ -21,6 +21,65 @@ pub struct OpLogEntry {
     pub payload: serde_json::Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpLogOrigin {
+    pub timestamp_ms: u64,
+    pub node_id: String,
+}
+
+impl OpLogOrigin {
+    pub fn new(timestamp_ms: u64, node_id: impl Into<String>) -> Self {
+        Self {
+            timestamp_ms,
+            node_id: node_id.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OpLogOperation {
+    pub op_type: String,
+    pub payload: serde_json::Value,
+    pub origin: Option<OpLogOrigin>,
+}
+
+impl OpLogOperation {
+    pub fn local(op_type: impl Into<String>, payload: serde_json::Value) -> Self {
+        Self {
+            op_type: op_type.into(),
+            payload,
+            origin: None,
+        }
+    }
+
+    pub fn replicated(
+        op_type: impl Into<String>,
+        payload: serde_json::Value,
+        origin: OpLogOrigin,
+    ) -> Self {
+        Self {
+            op_type: op_type.into(),
+            payload,
+            origin: Some(origin),
+        }
+    }
+}
+
+impl From<(String, serde_json::Value)> for OpLogOperation {
+    fn from((op_type, payload): (String, serde_json::Value)) -> Self {
+        Self::local(op_type, payload)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpLogReceipt {
+    pub seq: u64,
+    pub object_id: Option<String>,
+    pub timestamp_ms: u64,
+    pub node_id: String,
+    pub is_tombstone: bool,
+}
+
 struct ActiveSegment {
     writer: BufWriter<File>,
     path: PathBuf,
@@ -40,14 +99,46 @@ fn committed_seq_path(tenant_path: &Path) -> PathBuf {
     tenant_path.join(COMMITTED_SEQ_FILE)
 }
 
-/// Read the durable committed sequence number for a tenant.
-/// Returns 0 when the sidecar is missing, unreadable, or malformed.
-pub fn read_committed_seq(tenant_path: &Path) -> u64 {
+/// Read and validate the durable committed sequence sidecar.
+///
+/// A missing sidecar is represented as `None` because a crash after the first
+/// oplog append and before the first watermark write is a valid recovery state.
+/// Existing but unreadable, non-regular, or malformed evidence fails closed.
+pub(crate) fn read_checked_committed_seq(tenant_path: &Path) -> std::io::Result<Option<u64>> {
     let path = committed_seq_path(tenant_path);
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .trim()
-        .parse()
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let contents = std::fs::read_to_string(&path)?;
+    let sequence = contents.trim().parse::<u64>().map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} is not a u64 (got {:?}): {error}",
+                path.display(),
+                contents.trim()
+            ),
+        )
+    })?;
+    Ok(Some(sequence))
+}
+
+/// Read the durable committed sequence number for a tenant.
+///
+/// This compatibility reader intentionally maps missing or invalid evidence to
+/// zero. Durability-sensitive owners must use [`read_checked_committed_seq`].
+pub fn read_committed_seq(tenant_path: &Path) -> u64 {
+    read_checked_committed_seq(tenant_path)
+        .ok()
+        .flatten()
         .unwrap_or(0)
 }
 
@@ -249,44 +340,67 @@ impl OpLog {
     ///
     /// * `ops` - Slice of `(op_type, payload)` pairs to append.
     pub fn append_batch(&self, ops: &[(String, serde_json::Value)]) -> crate::error::Result<u64> {
-        self.append_batch_with_task_id(None, ops)
+        Ok(self
+            .append_operations_with_task_id(None, ops.iter().cloned().map(Into::into))?
+            .last()
+            .map(|receipt| receipt.seq)
+            .unwrap_or_else(|| self.current_seq.load(Ordering::SeqCst)))
     }
 
     pub fn append_batch_for_task(
         &self,
         task_id: &str,
         ops: &[(String, serde_json::Value)],
-    ) -> crate::error::Result<u64> {
-        self.append_batch_with_task_id(Some(task_id), ops)
+    ) -> crate::error::Result<Vec<OpLogReceipt>> {
+        self.append_operations_with_task_id(Some(task_id), ops.iter().cloned().map(Into::into))
     }
 
-    fn append_batch_with_task_id(
+    pub fn append_operations_for_task(
+        &self,
+        task_id: &str,
+        ops: Vec<OpLogOperation>,
+    ) -> crate::error::Result<Vec<OpLogReceipt>> {
+        self.append_operations_with_task_id(Some(task_id), ops)
+    }
+
+    /// TODO: Document OpLog.append_batch_with_task_id.
+    fn append_operations_with_task_id<I>(
         &self,
         task_id: Option<&str>,
-        ops: &[(String, serde_json::Value)],
-    ) -> crate::error::Result<u64> {
+        ops: I,
+    ) -> crate::error::Result<Vec<OpLogReceipt>>
+    where
+        I: IntoIterator<Item = OpLogOperation>,
+    {
         let mut last_seq = self.current_seq.load(Ordering::SeqCst);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
+        let mut receipts = Vec::new();
 
         let mut seg = self.segment.lock().unwrap();
-        for (op_type, payload) in ops {
+        for op in ops {
             last_seq += 1;
-            let mut payload = payload.clone();
+            let mut payload = op.payload;
             if let (Some(task_id), Some(object)) = (task_id, payload.as_object_mut()) {
                 object.insert(
                     OPLOG_TASK_ID_FIELD.to_string(),
                     serde_json::Value::String(task_id.to_string()),
                 );
             }
-            let entry = OpLogEntry {
-                seq: last_seq,
+            let origin = op.origin.unwrap_or_else(|| OpLogOrigin {
                 timestamp_ms: now,
                 node_id: self.node_id.clone(),
+            });
+            let object_id = payload_object_id(&payload).map(str::to_string);
+            let is_tombstone = op.op_type == "delete";
+            let entry = OpLogEntry {
+                seq: last_seq,
+                timestamp_ms: origin.timestamp_ms,
+                node_id: origin.node_id.clone(),
                 tenant_id: self.tenant_id.clone(),
-                op_type: op_type.clone(),
+                op_type: op.op_type,
                 payload,
             };
             let line = serde_json::to_string(&entry)
@@ -294,6 +408,13 @@ impl OpLog {
             seg.writer.write_all(line.as_bytes())?;
             seg.writer.write_all(b"\n")?;
             seg.size += line.len() as u64 + 1;
+            receipts.push(OpLogReceipt {
+                seq: last_seq,
+                object_id,
+                timestamp_ms: origin.timestamp_ms,
+                node_id: origin.node_id,
+                is_tombstone,
+            });
         }
         seg.writer.flush()?;
         if task_id.is_some() {
@@ -305,7 +426,7 @@ impl OpLog {
             self.rotate_segment_locked(&mut seg)?;
         }
 
-        Ok(last_seq)
+        Ok(receipts)
     }
 
     pub(crate) fn committed_task_ids(
@@ -338,6 +459,12 @@ impl OpLog {
         seg.path = new_path;
         seg.size = 0;
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub(crate) fn rotate_segment_for_test(&self) -> crate::error::Result<()> {
+        let mut seg = self.segment.lock().unwrap();
+        self.rotate_segment_locked(&mut seg)
     }
 
     /// Read all entries with a sequence number strictly greater than `since_seq`.
@@ -415,6 +542,19 @@ impl OpLog {
     }
 }
 
+fn payload_object_id(payload: &serde_json::Value) -> Option<&str> {
+    payload
+        .get("objectID")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            payload
+                .get("body")
+                .and_then(|body| body.get("_id"))
+                .and_then(|value| value.as_str())
+        })
+        .filter(|object_id| !object_id.is_empty())
+}
+
 fn sorted_segment_entries(dir: &Path) -> std::io::Result<Vec<std::fs::DirEntry>> {
     let mut entries: Vec<_> = fs::read_dir(dir)?
         .filter_map(|entry| entry.ok())
@@ -478,65 +618,6 @@ mod tests {
 
         let all = oplog.read_since(0).unwrap();
         assert_eq!(all.len(), 3);
-    }
-
-    #[test]
-    fn committed_task_ids_exclude_logged_but_uncommitted_entries() {
-        let tmp = TempDir::new().unwrap();
-        let oplog = OpLog::open(tmp.path(), "t1", "node1").unwrap();
-        oplog
-            .append_batch_for_task(
-                "committed_task",
-                &[(
-                    "upsert".into(),
-                    serde_json::json!({"objectID": "a", "body": {"objectID": "a"}}),
-                )],
-            )
-            .unwrap();
-        oplog
-            .append_batch_for_task(
-                "logged_uncommitted_task",
-                &[(
-                    "upsert".into(),
-                    serde_json::json!({"objectID": "b", "body": {"objectID": "b"}}),
-                )],
-            )
-            .unwrap();
-
-        assert_eq!(
-            oplog.committed_task_ids(1).unwrap(),
-            BTreeSet::from(["committed_task".to_string()]),
-            "admission reconciliation must not treat pre-commit oplog append as durable completion"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn task_tagged_append_rejects_unsyncable_segment_before_advancing_seq() {
-        use std::os::unix::fs::symlink;
-
-        let tmp = TempDir::new().unwrap();
-        let segment_path = tmp.path().join("segment_0001.jsonl");
-        symlink("/dev/null", &segment_path).unwrap();
-        let oplog = OpLog::open(tmp.path(), "t1", "node1").unwrap();
-
-        let result = oplog.append_batch_for_task(
-            "crash_boundary_task",
-            &[(
-                "upsert".into(),
-                serde_json::json!({"objectID": "a", "body": {"objectID": "a"}}),
-            )],
-        );
-
-        assert!(
-            result.is_err(),
-            "task-tagged append must fail when the segment cannot be synced"
-        );
-        assert_eq!(
-            oplog.current_seq(),
-            0,
-            "task-tagged append must not publish a sequence before durable sync succeeds"
-        );
     }
 
     #[cfg(unix)]
@@ -710,3 +791,7 @@ mod tests {
         assert_eq!(read_committed_seq(&tenant_path), 100);
     }
 }
+
+#[cfg(test)]
+#[path = "oplog_receipt_tests.rs"]
+mod receipt_tests;

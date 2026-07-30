@@ -145,6 +145,47 @@ grep -q 'blended overall' "$results_dir/rung_20000/search_benchmark.stdout.txt" 
   fail "final rung search report does not contain blended overall"
 }
 
+bulk_root="$(mktemp -d)"
+bulk_data_dir="$bulk_root/server_data"
+bulk_results_dir="$bulk_root/results"
+SCALE_DISK_RESERVE_BYTES=1048576 \
+SCALE_MEMORY_RESERVE_BYTES=1048576 \
+timeout 900 bash "$LADDER_SCRIPT" \
+  --profile compact \
+  --rungs 10000 \
+  --bulk-build-throughput-probe \
+  --batch-size 1000 \
+  --base-url "http://127.0.0.1:$((port + 6))" \
+  --server-binary "$SERVER_BINARY" \
+  --data-dir "$bulk_data_dir" \
+  --results-dir "$bulk_results_dir"
+
+jq -e '
+  .workload == "bulk_build" and
+  .runPurpose == "bulk_build_throughput_probe" and
+  .startingCount == 0 and
+  .targetCount == 10000 and
+  .trancheSize == 10000 and
+  .finalCount == 10000 and
+  .docsPerSecond > 0 and
+  .importWallClockMs > 0 and
+  .peakRssBytes >= .rssBytes and
+  .peakBuildDiskBytes >= .settledDiskBytes and
+  .settledDiskBytes == .indexBytes and
+  .liveSegmentCount > 0 and
+  .sentinels == "PASS"
+' "$bulk_results_dir/rung_10000/metrics.json" >/dev/null || {
+  fail "bulk-build probe did not emit the exact shared evidence shape"
+}
+jq -e '
+  .version == 4 and
+  .workload == "bulk_build" and
+  .purpose == "bulk_build_throughput_probe" and
+  .lastCompletedRung == 10000
+' "$bulk_results_dir/checkpoint.json" >/dev/null || {
+  fail "bulk-build probe checkpoint did not preserve workload identity"
+}
+
 if SCALE_DISK_RESERVE_BYTES=1048576 \
   SCALE_MEMORY_RESERVE_BYTES=1048576 \
   timeout 60 bash "$LADDER_SCRIPT" \

@@ -1,5 +1,6 @@
 use super::{
     acknowledge_algolia_migration, authenticated_owner_identity,
+    bulk_build::{BulkBuildService, BulkBuildTestEvent},
     import::{
         wait_for_live_import_barrier_with_timeout, ImportTestHooks, LiveImportBarrier,
         PrivacyScrubBoundary, PrivacyScrubTestHooks, LIVE_IMPORT_BARRIER_OBSERVED_FILE,
@@ -28,10 +29,12 @@ use crate::handlers::migration::spool::{
     MigrationCancelRequest, MigrationDisposition, MigrationExportProgress, MigrationPhase,
     MigrationPhaseRecord, SpoolErrorKind, SpoolLimits, SpoolStore,
 };
+use crate::handlers::rules::get_rule;
+use crate::handlers::synonyms::get_synonym;
 use crate::test_helpers::{body_json, EnvVarRestoreGuard, TestStateBuilder, ENV_MUTEX};
 use axum::{
     body::Body,
-    extract::{Extension, Query, State},
+    extract::{Extension, Path as AxumPath, Query, State},
     http::{HeaderMap, HeaderValue, Method, Request, StatusCode},
     response::IntoResponse,
     Json,
@@ -41,6 +44,7 @@ use flapjack::index::manager::publication::{
     ContentDigest, PublicationEvent, PublicationGenerationEvidence, PublicationJournal,
     PublicationPaths, PublicationTarget, PublicationTransactionId,
 };
+use flapjack::index::write_queue::{delete_term_observation, DeleteTermObservation};
 use flapjack::{
     error::FlapjackError,
     types::{Document, FieldValue},
@@ -1044,6 +1048,42 @@ fn hermetic_source_reader_with_settings_and_pages(
     reader
 }
 
+fn duplicate_source_reader() -> ScriptedSourceReader {
+    hermetic_source_reader_with_settings_and_pages(
+        json!({
+            "searchableAttributes": ["title"],
+            "attributesForFaceting": ["category"],
+        }),
+        vec![
+            vec![json!({
+                "objectID": "source-document-1",
+                "title": "First source",
+                "category": "original",
+            })],
+            vec![json!({
+                "objectID": "source-document-2",
+                "title": "Second source",
+                "category": "replacement",
+            })],
+        ],
+    )
+}
+
+fn duplicate_document_pages() -> Vec<Vec<serde_json::Value>> {
+    vec![
+        vec![json!({
+            "objectID": "duplicate-document",
+            "title": "First duplicate",
+            "category": "original",
+        })],
+        vec![json!({
+            "objectID": "duplicate-document",
+            "title": "Second duplicate",
+            "category": "replacement",
+        })],
+    ]
+}
+
 fn async_replace_source_reader(
     documents: [(&'static str, &'static str, &'static str, &'static str); 3],
 ) -> ScriptedSourceReader {
@@ -1487,7 +1527,7 @@ async fn async_import_cancel_during_document_staging_drains_writer_and_releases_
                         "searchableAttributes": ["title"],
                         "attributesForFaceting": ["category"],
                     }),
-                    vec![document_page(0, 1001)],
+                    vec![document_page(0, 1)],
                 ))
             },
             hooks,
@@ -2197,6 +2237,314 @@ async fn migrate_reported_counts_imply_target_contains_documents() {
         "implemented migration must use the hermetic source fixture"
     );
     assert_import_reported_equals_target_contents(&state, response).await;
+}
+
+#[tokio::test]
+async fn bulk_build_service_owns_migration_staging_generation() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let mut reader = ScriptedSourceReader::new(SOURCE_APP_ID, SOURCE_INDEX);
+    let source_record = AlgoliaIndexRecord {
+        name: SOURCE_INDEX.to_string(),
+        entries: EXPECTED_DOCUMENTS.len() as u64,
+        updated_at: "2026-07-28T00:00:00Z".to_string(),
+        pending_task: false,
+    };
+    let settings = json!({
+        "searchableAttributes": ["title"],
+        "attributesForFaceting": ["category"],
+    });
+    let document_pages = vec![scripted_documents(EXPECTED_DOCUMENTS)];
+    let rule_pages = vec![vec![json!({
+        "objectID": "bulk-rule",
+        "conditions": [{"pattern": "adapter", "anchoring": "contains"}],
+        "consequence": {}
+    })]];
+    let synonym_pages = vec![vec![json!({
+        "objectID": "bulk-synonym",
+        "type": "synonym",
+        "synonyms": ["adapter", "connector"]
+    })]];
+    reader.push_quiescent(source_record.clone());
+    reader.push_pass(
+        settings.clone(),
+        document_pages.clone(),
+        rule_pages.clone(),
+        synonym_pages.clone(),
+    );
+    reader.push_pass(settings, document_pages, rule_pages, synonym_pages);
+    reader.push_quiescent(source_record);
+
+    assert_eq!(
+        std::any::type_name::<BulkBuildService>(),
+        "flapjack_http::handlers::migration::bulk_build::BulkBuildService<'_>"
+    );
+    let response = migrate_from_algolia_with_test_source_factory(
+        State(Arc::clone(&state)),
+        Json(valid_request()),
+        |_| Ok(reader),
+    )
+    .await
+    .expect("the shared bulk-build owner should publish the staged generation")
+    .0;
+
+    assert_eq!(response.status, "complete");
+    assert!(response.settings);
+    assert_eq!(response.objects.imported, 2);
+    assert_eq!(response.rules.imported, 1);
+    assert_eq!(response.synonyms.imported, 1);
+    let Json(indices) = list_indices(State(Arc::clone(&state)), Query(HashMap::new()))
+        .await
+        .expect("the activated target should be listable");
+    let targets = indices
+        .items
+        .iter()
+        .filter(|index| index.name == TARGET_INDEX)
+        .collect::<Vec<_>>();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].entries, 2);
+    for (object_id, title, category) in EXPECTED_DOCUMENTS {
+        assert_query_returns_document(&state, TARGET_INDEX, title, object_id, title, category)
+            .await;
+    }
+    let Json(rule) = get_rule(
+        State(Arc::clone(&state)),
+        AxumPath((TARGET_INDEX.to_string(), "bulk-rule".to_string())),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("the staged rule should activate with the target"));
+    assert_eq!(rule.object_id, "bulk-rule");
+    let Json(synonym) = get_synonym(
+        State(Arc::clone(&state)),
+        AxumPath((TARGET_INDEX.to_string(), "bulk-synonym".to_string())),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("the staged synonym should activate with the target"));
+    assert_eq!(synonym.object_id(), "bulk-synonym");
+}
+
+#[tokio::test]
+async fn replace_build_does_not_issue_delete_terms_for_unique_input() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    seed_preexisting_target_resources(&state, TARGET_INDEX).await;
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let captured_observations = Arc::clone(&observations);
+    let hooks = ImportTestHooks::default().with_after_document_batch_write(move |task| {
+        captured_observations
+            .lock()
+            .unwrap()
+            .push((task.received_documents, delete_term_observation(task)));
+    });
+    let request = MigrateFromAlgoliaRequest {
+        overwrite: true,
+        ..valid_request()
+    };
+
+    assert_import_reported_equals_target_contents(
+        &state,
+        migrate_from_algolia_with_test_source_factory_and_hooks(
+            State(Arc::clone(&state)),
+            Json(request),
+            |_| Ok(hermetic_source_reader()),
+            hooks,
+        )
+        .await,
+    )
+    .await;
+
+    let observations = observations.lock().unwrap();
+    let received_documents = observations
+        .iter()
+        .map(|(received, _)| received)
+        .sum::<usize>();
+    let delete_terms = observations.iter().map(|(_, observed)| *observed).fold(
+        DeleteTermObservation::default(),
+        |total, observed| DeleteTermObservation {
+            explicit_delete_actions: total.explicit_delete_actions
+                + observed.explicit_delete_actions,
+            document_write_delete_terms: total.document_write_delete_terms
+                + observed.document_write_delete_terms,
+        },
+    );
+    assert!(
+        received_documents > 0,
+        "the proof must observe at least one staged document write"
+    );
+    assert_eq!(delete_terms.explicit_delete_actions, 0);
+    assert_eq!(
+        delete_terms.document_write_delete_terms, 0,
+        "known-unique staged documents must not pay upsert delete-term work"
+    );
+}
+
+#[test]
+fn bulk_build_uses_insert_action_not_upsert() {
+    let bulk_build_source = include_str!("bulk_build.rs");
+    let manager_write_source = include_str!("../../../../src/index/manager/write.rs");
+    assert_eq!(
+        bulk_build_source
+            .matches(".add_documents_insert_durable(")
+            .count(),
+        1,
+        "the bulk-build writer must use the durable insert API exactly once"
+    );
+    assert_eq!(
+        bulk_build_source.matches(".add_documents_durable(").count(),
+        0,
+        "the bulk-build writer must not use the durable upsert API"
+    );
+
+    let method = manager_write_source
+        .split("pub async fn add_documents_insert_durable")
+        .nth(1)
+        .and_then(|tail| tail.split("/// Delete documents").next())
+        .expect("IndexManager must own the durable insert method beside durable upsert");
+    assert!(method.contains("map(WriteAction::Add)"));
+    assert!(method.contains("WriteAdmissionMode::Durable"));
+    assert!(method.contains("wait_for_write_durable"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_id_in_replace_input_fails_before_publication() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    seed_preexisting_target_resources(&state, TARGET_INDEX).await;
+    assert_preexisting_target_resources(&state, TARGET_INDEX).await;
+
+    let validation_reached = Arc::new(Barrier::new(2));
+    let validation_release = Arc::new(Barrier::new(2));
+    let activation_reached = Arc::new(AtomicBool::new(false));
+    let hook_validation_reached = Arc::clone(&validation_reached);
+    let hook_validation_release = Arc::clone(&validation_release);
+    let hook_activation_reached = Arc::clone(&activation_reached);
+    let hooks = ImportTestHooks::default()
+        .with_after_accepted_export(|spool, job_uuid| {
+            // The migration export has its own earlier duplicate guard. Rewriting
+            // this accepted test artifact models another shared-service caller
+            // and proves the bulk-build boundary independently rejects duplicates.
+            spool
+                .replace_accepted_document_pages_for_test(job_uuid, &duplicate_document_pages())
+                .expect("accepted duplicate fixture must remain internally consistent");
+        })
+        .with_bulk_build_event_hook(move |event| match event {
+            BulkBuildTestEvent::PrepublicationValidationStarting => {
+                hook_validation_reached.wait();
+                hook_validation_release.wait();
+            }
+            BulkBuildTestEvent::StagingWriterMergeQuiesced => {}
+            BulkBuildTestEvent::PrepublicationValidationVerdict => {}
+            BulkBuildTestEvent::ActivationFence => {
+                hook_activation_reached.store(true, Ordering::SeqCst);
+            }
+        });
+    let migration_state = Arc::clone(&state);
+    let migration = tokio::spawn(async move {
+        migrate_from_algolia_with_test_source_factory_and_hooks(
+            State(migration_state),
+            Json(MigrateFromAlgoliaRequest {
+                overwrite: true,
+                ..valid_request()
+            }),
+            |_| Ok(duplicate_source_reader()),
+            hooks,
+        )
+        .await
+    });
+
+    tokio::task::spawn_blocking(move || validation_reached.wait())
+        .await
+        .expect("duplicate input must reach pre-publication validation");
+    assert_preexisting_target_resources(&state, TARGET_INDEX).await;
+    tokio::task::spawn_blocking(move || validation_release.wait())
+        .await
+        .expect("pre-publication validation barrier must release");
+
+    let error = tokio::time::timeout(Duration::from_secs(30), migration)
+        .await
+        .expect("duplicate validation must finish without hanging")
+        .expect("migration task must not panic")
+        .expect_err("duplicate source objectIDs must reject publication");
+    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    let body = body_json(error.1.into_response()).await;
+    let message = body["message"]
+        .as_str()
+        .expect("duplicate rejection must include a safe message");
+    assert!(message.contains("page 0, item 0"), "{message}");
+    assert!(message.contains("page 1, item 0"), "{message}");
+    assert!(
+        !activation_reached.load(Ordering::SeqCst),
+        "duplicate rejection must not enter the activation fence"
+    );
+    assert_preexisting_target_resources(&state, TARGET_INDEX).await;
+}
+
+#[tokio::test]
+async fn bulk_build_quiesces_staging_writer_before_activation() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed_events = Arc::clone(&events);
+    let hooks = ImportTestHooks::default().with_bulk_build_event_hook(move |event| {
+        observed_events.lock().unwrap().push(event);
+    });
+
+    assert_import_reported_equals_target_contents(
+        &state,
+        migrate_from_algolia_with_test_source_factory_and_hooks(
+            State(Arc::clone(&state)),
+            Json(valid_request()),
+            |_| Ok(hermetic_source_reader()),
+            hooks,
+        )
+        .await,
+    )
+    .await;
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            BulkBuildTestEvent::StagingWriterMergeQuiesced,
+            BulkBuildTestEvent::PrepublicationValidationStarting,
+            BulkBuildTestEvent::PrepublicationValidationVerdict,
+            BulkBuildTestEvent::ActivationFence,
+        ],
+        "staging must reach merge quiescence before validation and activation"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_validation_runs_before_any_activation_fence() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed_events = Arc::clone(&events);
+    let hooks = ImportTestHooks::default().with_bulk_build_event_hook(move |event| {
+        observed_events.lock().unwrap().push(event);
+    });
+
+    assert_import_reported_equals_target_contents(
+        &state,
+        migrate_from_algolia_with_test_source_factory_and_hooks(
+            State(Arc::clone(&state)),
+            Json(valid_request()),
+            |_| Ok(hermetic_source_reader()),
+            hooks,
+        )
+        .await,
+    )
+    .await;
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            BulkBuildTestEvent::StagingWriterMergeQuiesced,
+            BulkBuildTestEvent::PrepublicationValidationStarting,
+            BulkBuildTestEvent::PrepublicationValidationVerdict,
+            BulkBuildTestEvent::ActivationFence,
+        ],
+        "the default service wiring must validate exactly once before activation"
+    );
 }
 
 #[tokio::test]
@@ -3067,8 +3415,8 @@ async fn wait_for_terminal_phase(
     if result.is_err() {
         let phase = read_migration_phase_at(&state.manager.base_path, job_uuid);
         panic!(
-            "async migration {job_uuid} should reach {expected:?}; observed phase {:?}, disposition {:?}, terminal_at {:?}",
-            phase.phase, phase.disposition, phase.terminal_at
+            "async migration {job_uuid} should reach {expected:?}; observed phase {:?}, disposition {:?}, terminal_at {:?}, cancel_requested {:?}",
+            phase.phase, phase.disposition, phase.terminal_at, phase.cancel_requested
         );
     }
 }

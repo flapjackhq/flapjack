@@ -332,6 +332,8 @@ fn make_app_state(tmp: &tempfile::TempDir) -> std::sync::Arc<crate::handlers::Ap
             None,
             crate::handlers::migration::DEFAULT_ASYNC_MIGRATION_CAPACITY,
         )),
+        bulk_replace_max_bytes: crate::handlers::migration::spool::SpoolLimits::default()
+            .max_bytes_per_job,
         start_time: std::time::Instant::now(),
         conversation_store: crate::conversation_store::ConversationStore::default_shared(),
         embedder_store: std::sync::Arc::new(crate::embedder_store::EmbedderStore::new()),

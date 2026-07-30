@@ -91,9 +91,8 @@ impl super::IndexManager {
     }
 
     pub fn invalidate_facet_cache(&self, tenant_id: &str) {
-        let prefix = format!("{}:", tenant_id);
         self.facet_cache
-            .retain(|cache_key, _| !cache_key.starts_with(&prefix));
+            .retain(|cache_key, _| !cache_key.belongs_to_tenant(tenant_id));
     }
 
     /// Read `indexLanguages` from settings.json at the given index path, for tokenizer selection.

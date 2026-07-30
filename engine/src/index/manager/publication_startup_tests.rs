@@ -38,8 +38,10 @@ async fn clean_target_repair_preserves_runtime_state_without_publication_evidenc
     let manager = IndexManager::new(temp.path());
     manager.create_tenant("products").unwrap();
     assert!(manager.get_or_create_oplog("products").is_some());
+    let facet_cache_key =
+        crate::index::FacetCacheKey::new("products", "", "", vec!["facets".to_string()]);
     manager.facet_cache.insert(
-        "products:facets".to_string(),
+        facet_cache_key.clone(),
         std::sync::Arc::new((
             std::time::Instant::now(),
             1,
@@ -54,7 +56,7 @@ async fn clean_target_repair_preserves_runtime_state_without_publication_evidenc
     assert_eq!(report.disposition, PublicationTargetDisposition::Loadable);
     assert!(manager.loaded.contains_key("products"));
     assert!(manager.oplogs.contains_key("products"));
-    assert!(manager.facet_cache.contains_key("products:facets"));
+    assert!(manager.facet_cache.contains_key(&facet_cache_key));
 }
 
 #[tokio::test]
@@ -63,8 +65,10 @@ async fn quarantined_repair_without_live_byte_mutation_preserves_runtime_state()
     let manager = IndexManager::new(temp.path());
     manager.create_tenant("products").unwrap();
     assert!(manager.get_or_create_oplog("products").is_some());
+    let facet_cache_key =
+        crate::index::FacetCacheKey::new("products", "", "", vec!["facets".to_string()]);
     manager.facet_cache.insert(
-        "products:facets".to_string(),
+        facet_cache_key.clone(),
         std::sync::Arc::new((
             std::time::Instant::now(),
             1,
@@ -85,7 +89,7 @@ async fn quarantined_repair_without_live_byte_mutation_preserves_runtime_state()
     assert_eq!(report.action, PublicationScanAction::Quarantined);
     assert!(manager.loaded.contains_key("products"));
     assert!(manager.oplogs.contains_key("products"));
-    assert!(manager.facet_cache.contains_key("products:facets"));
+    assert!(manager.facet_cache.contains_key(&facet_cache_key));
     assert_eq!(
         std::fs::read_to_string(paths.target.join("live_marker.txt")).unwrap(),
         "live"

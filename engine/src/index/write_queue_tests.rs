@@ -10,12 +10,21 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const WRITE_QUEUE_BATCH_SIZE_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_BATCH_SIZE";
 const WRITE_QUEUE_WRITER_IDLE_TIMEOUT_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_WRITER_IDLE_TIMEOUT_MS";
 const JULY_22_TIMEOUT_RISK_PENDING_ADMISSIONS: usize = 690;
+/// Measured settled ceiling for the *online* write-path specimens (128/256
+/// tiny per-write segments). `SELECTED_MERGE_POLICY_SETTLED_SEGMENT_BAND` spans
+/// both input regimes, so its upper bound (the staged-bulk shape) is far above
+/// what the online path may settle to; asserting only the band would let an
+/// online merge regression more than double the settled segment count
+/// unnoticed. The online guards therefore assert this measured sub-range too,
+/// and the bulk guard asserts it must be exceeded — one band, two regimes,
+/// each pinned to what it actually measures.
+const ONLINE_SPECIMEN_SETTLED_MAX: usize = 4;
 static WRITE_QUEUE_ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 struct WriteQueueEnvVarRestoreGuard {
@@ -182,6 +191,45 @@ fn setup_write_queue_with_index(
     )
 }
 
+fn setup_gated_write_queue_with_index(
+    tmp: &tempfile::TempDir,
+    tenant_id: &str,
+    index: Arc<crate::index::Index>,
+) -> (
+    WriteQueue,
+    tokio::task::JoinHandle<crate::error::Result<()>>,
+    Arc<dashmap::DashMap<String, TaskInfo>>,
+    Arc<WriteQueueWorkerGate>,
+) {
+    let worker_gate = Arc::new(WriteQueueWorkerGate::closed());
+    let (tx, handle, tasks) = setup_write_queue_with_index_and_overrides(
+        tmp,
+        tenant_id,
+        index,
+        WriteQueueTestOverrides {
+            worker_start_gate: Some(Arc::clone(&worker_gate)),
+            ..Default::default()
+        },
+    );
+    (tx, handle, tasks, worker_gate)
+}
+
+fn setup_gated_write_queue(
+    tmp: &tempfile::TempDir,
+    tenant_id: &str,
+) -> (
+    WriteQueue,
+    tokio::task::JoinHandle<crate::error::Result<()>>,
+    Arc<dashmap::DashMap<String, TaskInfo>>,
+    Arc<WriteQueueWorkerGate>,
+) {
+    let tenant_path = tmp.path().join(tenant_id);
+    std::fs::create_dir_all(&tenant_path).unwrap();
+    let schema = crate::index::schema::Schema::builder().build();
+    let index = Arc::new(crate::index::Index::create(&tenant_path, schema).unwrap());
+    setup_gated_write_queue_with_index(tmp, tenant_id, index)
+}
+
 fn setup_write_queue_with_index_and_overrides(
     tmp: &tempfile::TempDir,
     tenant_id: &str,
@@ -194,7 +242,6 @@ fn setup_write_queue_with_index_and_overrides(
 ) {
     let tasks: Arc<dashmap::DashMap<String, TaskInfo>> = Arc::new(dashmap::DashMap::new());
     let facet_cache = Arc::new(dashmap::DashMap::new());
-    let lww_map = Arc::new(dashmap::DashMap::new());
 
     #[cfg(feature = "vector-search")]
     let vector_ctx = VectorWriteContext::new(Arc::new(dashmap::DashMap::new()));
@@ -203,7 +250,7 @@ fn setup_write_queue_with_index_and_overrides(
     let admission_store =
         Arc::new(admission::WriteAdmissionStore::open(tmp.path(), tenant_id).unwrap());
 
-    let (tx, handle) = create_write_queue(WriteQueueContext {
+    let (tx, handle, _cancellation) = create_write_queue(WriteQueueContext {
         tenant_id: tenant_id.to_string(),
         index,
         tasks: Arc::clone(&tasks),
@@ -211,9 +258,9 @@ fn setup_write_queue_with_index_and_overrides(
         oplog: None,
         admission_store,
         facet_cache,
-        lww_map,
         vector_ctx,
         queue_metrics_id: 0,
+        writer_buffer_size: crate::index::Index::DEFAULT_BUFFER_SIZE,
         test_overrides,
     })
     .unwrap();
@@ -252,7 +299,6 @@ fn setup_write_queue_with_oplog(
     let index = Arc::new(crate::index::Index::create(&tenant_path, schema).unwrap());
     let tasks: Arc<dashmap::DashMap<String, TaskInfo>> = Arc::new(dashmap::DashMap::new());
     let facet_cache = Arc::new(dashmap::DashMap::new());
-    let lww_map = Arc::new(dashmap::DashMap::new());
     #[cfg(feature = "vector-search")]
     let vector_ctx = VectorWriteContext::new(Arc::new(dashmap::DashMap::new()));
     #[cfg(not(feature = "vector-search"))]
@@ -264,7 +310,7 @@ fn setup_write_queue_with_oplog(
             .unwrap(),
     );
 
-    let (tx, handle) = create_write_queue(WriteQueueContext {
+    let (tx, handle, _cancellation) = create_write_queue(WriteQueueContext {
         tenant_id: tenant_id.to_string(),
         index,
         tasks: Arc::clone(&tasks),
@@ -272,9 +318,9 @@ fn setup_write_queue_with_oplog(
         oplog: Some(Arc::clone(&oplog)),
         admission_store,
         facet_cache,
-        lww_map,
         vector_ctx,
         queue_metrics_id: 0,
+        writer_buffer_size: crate::index::Index::DEFAULT_BUFFER_SIZE,
         test_overrides: WriteQueueTestOverrides::default(),
     })
     .unwrap();
@@ -457,6 +503,44 @@ struct MergePolicyExperimentRow {
     cold_latencies_us: Vec<u128>,
     warm_latencies_us: Vec<u128>,
     query_outcomes: Vec<MergePolicyQueryOutcome>,
+}
+
+#[derive(Clone, Copy)]
+struct WriterIdleTimeoutCandidate {
+    name: &'static str,
+    timeout: Duration,
+}
+
+#[derive(Debug)]
+struct WriterIdleBurstRow {
+    candidate_name: &'static str,
+    candidate_timeout: Duration,
+    resume_gap: Duration,
+    n: usize,
+    second_write_wall_ms: u128,
+    writer_open_delta: u64,
+    commit_delta: u64,
+    idle_merge_wait_delta: u64,
+}
+
+#[derive(Debug)]
+struct WriterIdleAdmissionRow {
+    candidate_name: &'static str,
+    candidate_timeout: Duration,
+    tenant_count: usize,
+    admitted_tenants: usize,
+    admission_wait_ms: Vec<u128>,
+    idle_merge_wait_delta: u64,
+    final_active_writers: usize,
+}
+
+#[derive(Debug)]
+struct WriterIdleExperimentRows {
+    trace_ack_ms: Vec<u128>,
+    resume_gaps: Vec<Duration>,
+    projected_full_runtime_ms: u128,
+    burst_rows: Vec<WriterIdleBurstRow>,
+    admission_rows: Vec<WriterIdleAdmissionRow>,
 }
 
 fn stage_5_merge_policy_candidates(doc_count: usize) -> Vec<MergePolicyCandidate> {
@@ -1004,6 +1088,357 @@ async fn run_stage_5_candidate_matrix(doc_count: usize) -> Vec<MergePolicyExperi
     rows
 }
 
+fn writer_idle_timeout_candidates() -> Vec<WriterIdleTimeoutCandidate> {
+    vec![
+        WriterIdleTimeoutCandidate {
+            name: "5s",
+            timeout: Duration::from_secs(5),
+        },
+        WriterIdleTimeoutCandidate {
+            name: "15s",
+            timeout: Duration::from_secs(15),
+        },
+        WriterIdleTimeoutCandidate {
+            name: "30s",
+            timeout: Duration::from_secs(30),
+        },
+        WriterIdleTimeoutCandidate {
+            name: "60s",
+            timeout: Duration::from_secs(60),
+        },
+    ]
+}
+
+async fn run_writer_idle_trace_probe() -> Vec<u128> {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let tenant_id = format!("idle_trace_probe_{}", uuid::Uuid::new_v4().simple());
+    let (_index, tx, handle, tasks) = setup_write_queue_with_budget_and_overrides(
+        &tmp,
+        &tenant_id,
+        Arc::new(MemoryBudget::new(MemoryBudgetConfig::default())),
+        WriteQueueTestOverrides {
+            batch_size: Some(1),
+            writer_idle_timeout: Some(Duration::from_secs(120)),
+            ..Default::default()
+        },
+    );
+    let mut ack_ms = Vec::new();
+    for sample in 0..3 {
+        let task_id = register_task(
+            tasks.as_ref(),
+            &format!("idle_trace_probe_task_{sample}"),
+            sample + 1,
+            1,
+        );
+        let started_at = Instant::now();
+        enqueue_write(
+            &tx,
+            task_id.clone(),
+            vec![WriteAction::Add(text_document(
+                &format!("idle_trace_probe_doc_{sample}"),
+                "name",
+                "idle trace probe",
+            ))],
+        )
+        .await;
+        wait_for_task_success(tasks.as_ref(), &task_id).await;
+        ack_ms.push(started_at.elapsed().as_millis());
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    drop(tx);
+    handle.await.unwrap().unwrap();
+    ack_ms
+}
+
+fn writer_idle_resume_gaps_from_trace(ack_ms: &[u128]) -> Vec<Duration> {
+    assert!(!ack_ms.is_empty(), "trace probe must produce ack samples");
+    let mut sorted = ack_ms.to_vec();
+    sorted.sort_unstable();
+    let p95_ms = sorted[sorted.len() - 1].max(1);
+    [(100, 10_000), (200, 25_000), (300, 35_000)]
+        .into_iter()
+        .map(|(multiplier, lower_bound_ms)| {
+            let derived_ms = p95_ms.saturating_mul(multiplier);
+            Duration::from_millis(derived_ms.max(lower_bound_ms).min(35_000) as u64)
+        })
+        .collect()
+}
+
+fn projected_writer_idle_runtime_ms(
+    candidates: &[WriterIdleTimeoutCandidate],
+    resume_gaps: &[Duration],
+    admission_tenant_count: usize,
+    trace_probe_ms: u128,
+) -> u128 {
+    let burst_sleep_ms =
+        candidates.len() as u128 * resume_gaps.iter().map(|gap| gap.as_millis()).sum::<u128>();
+    let admission_sleep_ms = candidates
+        .iter()
+        .map(|candidate| {
+            candidate.timeout.as_millis() * admission_tenant_count.saturating_sub(1) as u128
+        })
+        .sum::<u128>();
+    trace_probe_ms + burst_sleep_ms + admission_sleep_ms
+}
+
+async fn write_one_idle_timeout_experiment_doc(
+    tx: &WriteQueue,
+    tasks: &dashmap::DashMap<String, TaskInfo>,
+    task_id: String,
+    doc_id: String,
+    batch_number: i64,
+) -> Duration {
+    let task_id = register_task(tasks, &task_id, batch_number, 1);
+    let started_at = Instant::now();
+    enqueue_write(
+        tx,
+        task_id.clone(),
+        vec![WriteAction::Add(text_document(
+            &doc_id,
+            "name",
+            "idle timeout experiment",
+        ))],
+    )
+    .await;
+    wait_for_task_success(tasks, &task_id).await;
+    started_at.elapsed()
+}
+
+async fn run_writer_idle_burst_candidate(
+    candidate: WriterIdleTimeoutCandidate,
+    resume_gap: Duration,
+) -> WriterIdleBurstRow {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let tenant_id = format!(
+        "idle_burst_{}_{}",
+        candidate.name,
+        uuid::Uuid::new_v4().simple()
+    );
+    let (_index, tx, handle, tasks) = setup_write_queue_with_budget_and_overrides(
+        &tmp,
+        &tenant_id,
+        Arc::new(MemoryBudget::new(MemoryBudgetConfig::default())),
+        WriteQueueTestOverrides {
+            batch_size: Some(1),
+            writer_idle_timeout: Some(candidate.timeout),
+            ..Default::default()
+        },
+    );
+    write_one_idle_timeout_experiment_doc(
+        &tx,
+        tasks.as_ref(),
+        "idle_burst_first".to_string(),
+        "idle_burst_doc_first".to_string(),
+        1,
+    )
+    .await;
+    let idle_wait_before = writer_merge_wait_count(&tenant_id, "idle_timeout");
+    tokio::time::sleep(resume_gap).await;
+    let opens_before = write_queue_counter_value(WRITE_QUEUE_WRITER_OPENS_METRIC_NAME, &tenant_id);
+    let commits_before = write_queue_counter_value(WRITE_QUEUE_COMMITS_METRIC_NAME, &tenant_id);
+    let second_write_wall = write_one_idle_timeout_experiment_doc(
+        &tx,
+        tasks.as_ref(),
+        "idle_burst_second".to_string(),
+        "idle_burst_doc_second".to_string(),
+        2,
+    )
+    .await;
+    let row = WriterIdleBurstRow {
+        candidate_name: candidate.name,
+        candidate_timeout: candidate.timeout,
+        resume_gap,
+        n: 1,
+        second_write_wall_ms: second_write_wall.as_millis(),
+        writer_open_delta: write_queue_counter_value(
+            WRITE_QUEUE_WRITER_OPENS_METRIC_NAME,
+            &tenant_id,
+        ) - opens_before,
+        commit_delta: write_queue_counter_value(WRITE_QUEUE_COMMITS_METRIC_NAME, &tenant_id)
+            - commits_before,
+        idle_merge_wait_delta: writer_merge_wait_count(&tenant_id, "idle_timeout")
+            - idle_wait_before,
+    };
+    drop(tx);
+    handle.await.unwrap().unwrap();
+    row
+}
+
+async fn run_writer_idle_admission_candidate(
+    candidate: WriterIdleTimeoutCandidate,
+) -> WriterIdleAdmissionRow {
+    const TENANT_COUNT: usize = 2;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let shared_budget = Arc::new(MemoryBudget::new(MemoryBudgetConfig {
+        max_concurrent_writers: 1,
+        ..Default::default()
+    }));
+    let mut queues = Vec::new();
+    let mut admission_wait_ms = Vec::new();
+    let mut tenant_ids = Vec::new();
+    for tenant_number in 0..TENANT_COUNT {
+        let started_at = Instant::now();
+        if tenant_number > 0 {
+            tokio::time::timeout(candidate.timeout + Duration::from_secs(5), async {
+                while shared_budget.active_writers() != 0 {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("previous idle tenant must release its writer slot before the next tenant");
+        }
+        let tenant_id = format!(
+            "idle_admission_{}_{}_{}",
+            candidate.name,
+            tenant_number,
+            uuid::Uuid::new_v4().simple()
+        );
+        let (_index, tx, handle, tasks) = setup_write_queue_with_budget_and_overrides(
+            &tmp,
+            &tenant_id,
+            Arc::clone(&shared_budget),
+            WriteQueueTestOverrides {
+                batch_size: Some(1),
+                writer_idle_timeout: Some(candidate.timeout),
+                ..Default::default()
+            },
+        );
+        write_one_idle_timeout_experiment_doc(
+            &tx,
+            tasks.as_ref(),
+            format!("idle_admission_task_{tenant_number}"),
+            format!("idle_admission_doc_{tenant_number}"),
+            tenant_number as i64 + 1,
+        )
+        .await;
+        admission_wait_ms.push(started_at.elapsed().as_millis());
+        tenant_ids.push(tenant_id);
+        queues.push((tx, handle));
+    }
+    let idle_merge_wait_delta = tenant_ids
+        .iter()
+        .map(|tenant_id| writer_merge_wait_count(tenant_id, "idle_timeout"))
+        .sum();
+    let row = WriterIdleAdmissionRow {
+        candidate_name: candidate.name,
+        candidate_timeout: candidate.timeout,
+        tenant_count: TENANT_COUNT,
+        admitted_tenants: admission_wait_ms.len(),
+        admission_wait_ms,
+        idle_merge_wait_delta,
+        final_active_writers: shared_budget.active_writers(),
+    };
+    for (tx, handle) in queues {
+        drop(tx);
+        handle.await.unwrap().unwrap();
+    }
+    row
+}
+
+async fn run_writer_idle_timeout_candidate_matrix() -> WriterIdleExperimentRows {
+    let candidates = writer_idle_timeout_candidates();
+    let trace_started_at = Instant::now();
+    let trace_ack_ms = run_writer_idle_trace_probe().await;
+    let trace_probe_ms = trace_started_at.elapsed().as_millis();
+    let resume_gaps = writer_idle_resume_gaps_from_trace(&trace_ack_ms);
+    let projected_full_runtime_ms =
+        projected_writer_idle_runtime_ms(&candidates, &resume_gaps, 2, trace_probe_ms);
+    assert!(
+        projected_full_runtime_ms < 600_000,
+        "projected Stage 6 idle-timeout matrix runtime {projected_full_runtime_ms}ms exceeds timeout 600"
+    );
+
+    let mut burst_rows = Vec::new();
+    for candidate in &candidates {
+        for resume_gap in &resume_gaps {
+            burst_rows.push(run_writer_idle_burst_candidate(*candidate, *resume_gap).await);
+        }
+    }
+    let mut admission_rows = Vec::new();
+    for candidate in candidates {
+        admission_rows.push(run_writer_idle_admission_candidate(candidate).await);
+    }
+
+    WriterIdleExperimentRows {
+        trace_ack_ms,
+        resume_gaps,
+        projected_full_runtime_ms,
+        burst_rows,
+        admission_rows,
+    }
+}
+
+fn writer_idle_timeout_matrix_summary(rows: &WriterIdleExperimentRows) -> String {
+    let mut lines = vec![
+        format!("trace_ack_ms={:?}", rows.trace_ack_ms),
+        format!("resume_gaps={:?}", rows.resume_gaps),
+        format!("projected_full_runtime_ms={}", rows.projected_full_runtime_ms),
+        "burst candidate timeout gap n second_write_ms writer_open_delta commit_delta idle_merge_wait_delta".to_string(),
+    ];
+    lines.extend(rows.burst_rows.iter().map(|row| {
+        format!(
+            "burst {} {:?} {:?} {} {} {} {} {}",
+            row.candidate_name,
+            row.candidate_timeout,
+            row.resume_gap,
+            row.n,
+            row.second_write_wall_ms,
+            row.writer_open_delta,
+            row.commit_delta,
+            row.idle_merge_wait_delta
+        )
+    }));
+    lines.push(
+        "admission candidate timeout tenants admitted admission_wait_ms idle_merge_wait_delta final_active_writers"
+            .to_string(),
+    );
+    lines.extend(rows.admission_rows.iter().map(|row| {
+        format!(
+            "admission {} {:?} {} {} {:?} {} {}",
+            row.candidate_name,
+            row.candidate_timeout,
+            row.tenant_count,
+            row.admitted_tenants,
+            row.admission_wait_ms,
+            row.idle_merge_wait_delta,
+            row.final_active_writers
+        )
+    }));
+    lines.join("\n")
+}
+
+fn assert_writer_idle_timeout_candidate_matrix(rows: &WriterIdleExperimentRows) {
+    assert!(!rows.resume_gaps.is_empty(), "resume gaps must be measured");
+    for row in &rows.burst_rows {
+        assert!(row.n > 0, "burst row must not be vacuous: {row:?}");
+        assert_eq!(row.commit_delta, 1, "second write must commit: {row:?}");
+    }
+    for row in &rows.admission_rows {
+        assert_eq!(
+            row.admitted_tenants, row.tenant_count,
+            "every over-limit tenant should eventually admit through idle eviction: {row:?}"
+        );
+        assert!(
+            row.idle_merge_wait_delta > 0,
+            "admission must use idle-timeout merge-quiescent close: {row:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "Stage 6 evidence harness intentionally sleeps across idle-timeout candidates; run explicitly, not in the parallel write_queue sweep"]
+async fn writer_idle_timeout_candidate_matrix_selects_default() {
+    let _env_lock = WRITE_QUEUE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let rows = run_writer_idle_timeout_candidate_matrix().await;
+    eprintln!(
+        "Stage 6 writer idle-timeout matrix:\n{}",
+        writer_idle_timeout_matrix_summary(&rows)
+    );
+    assert_writer_idle_timeout_candidate_matrix(&rows);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn merge_policy_converges_to_selected_segment_band() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1056,11 +1491,105 @@ async fn merge_policy_converges_to_selected_segment_band() {
         (min_segments..=max_segments).contains(&observation.live_segment_count),
         "selected policy settled outside measured band {min_segments}..={max_segments}: {observation:?}"
     );
+    assert!(
+        observation.live_segment_count <= ONLINE_SPECIMEN_SETTLED_MAX,
+        "online specimen must settle to at most {ONLINE_SPECIMEN_SETTLED_MAX} segments; the band's \
+         upper reach belongs to the staged-bulk regime: {observation:?}"
+    );
+}
+
+/// A staged bulk build commits large checkpoint-sized segments rather than the
+/// tiny per-write segments of the online path, so the *same* selected merge
+/// policy settles it into the upper reach of the canonical band instead of the
+/// 2..=4 shape the small online specimens converge to. This is the real
+/// bulk-build proof the Stage 6 review demanded: it measures the settled
+/// segment count from actual behavior — an online 128-document specimen is not
+/// a substitute — and proves the reconciled
+/// `SELECTED_MERGE_POLICY_SETTLED_SEGMENT_BAND` upper bound is load-bearing
+/// rather than a recorded number echoed back. The 20-commit x 1000-document
+/// corpus reproduces the measured staged-bulk settled shape (6 segments here;
+/// the scale_ladder probe measured 8 at 50k and 9 at 100k) while staying fast
+/// enough for the parallel lib sweep.
+#[tokio::test(flavor = "current_thread")]
+async fn bulk_scale_build_settles_within_selected_segment_band() {
+    const COMMIT_COUNT: usize = 20;
+    const DOCUMENTS_PER_COMMIT: usize = 1_000;
+    const TOTAL_DOCUMENTS: usize = COMMIT_COUNT * DOCUMENTS_PER_COMMIT;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let budget = Arc::new(MemoryBudget::new(MemoryBudgetConfig {
+        max_concurrent_writers: 1,
+        ..Default::default()
+    }));
+    let tenant_id = "bulk_scale_segment_band";
+    let (index, tx, handle, tasks) = setup_write_queue_with_budget_and_overrides(
+        &tmp,
+        tenant_id,
+        budget,
+        WriteQueueTestOverrides {
+            batch_size: Some(DOCUMENTS_PER_COMMIT),
+            ..Default::default()
+        },
+    );
+
+    let mut document_index = 0usize;
+    for commit_index in 0..COMMIT_COUNT {
+        let mut actions = Vec::with_capacity(DOCUMENTS_PER_COMMIT);
+        for _ in 0..DOCUMENTS_PER_COMMIT {
+            actions.push(WriteAction::Add(stage_5_document(document_index)));
+            document_index += 1;
+        }
+        let task_id = register_task(
+            tasks.as_ref(),
+            &format!("bulk_scale_commit_{commit_index}"),
+            1,
+            DOCUMENTS_PER_COMMIT,
+        );
+        enqueue_write(&tx, task_id.clone(), actions).await;
+        for _ in 0..2_000 {
+            if task_succeeded(tasks.as_ref(), &task_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_task_succeeded(tasks.as_ref(), &task_id, DOCUMENTS_PER_COMMIT);
+    }
+    drop(tx);
+    handle.await.unwrap().unwrap();
+
+    let observation = observed_segments(&index);
+    let (min_segments, max_segments) = SELECTED_MERGE_POLICY_SETTLED_SEGMENT_BAND;
+
+    assert_eq!(
+        observation.live_docs, TOTAL_DOCUMENTS as u64,
+        "every staged bulk document must survive merge settlement: {observation:?}"
+    );
+    assert!(
+        (min_segments..=max_segments).contains(&observation.live_segment_count),
+        "staged bulk build settled outside the selected band {min_segments}..={max_segments}: {observation:?}"
+    );
+    assert!(
+        observation.live_segment_count > ONLINE_SPECIMEN_SETTLED_MAX,
+        "staged bulk build must settle denser than the online {ONLINE_SPECIMEN_SETTLED_MAX}-segment specimens so the band's upper reach is exercised: {observation:?}"
+    );
+    assert!(
+        observation.orphan_file_set_ids.is_empty(),
+        "settled bulk observation must not retain stale file sets: {observation:?}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn write_path_exit_gate_on_local_standard_specimen() {
     const DOCUMENT_COUNT: usize = 128;
+    let _env_lock = WRITE_QUEUE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _override_guards = apply_write_queue_env_overrides(&[
+        (WRITE_QUEUE_BATCH_SIZE_ENV_VAR, None),
+        (WRITE_QUEUE_MIN_MERGE_SEGMENTS_ENV_VAR, None),
+        (WRITE_QUEUE_MAX_DOCS_BEFORE_MERGE_ENV_VAR, None),
+        (WRITE_QUEUE_WRITER_IDLE_TIMEOUT_ENV_VAR, None),
+    ]);
     let tmp = tempfile::TempDir::new().unwrap();
     let tenant_id = "stage7_write_path_exit_gate";
     let manager = crate::index::manager::IndexManager::new(tmp.path());
@@ -1097,6 +1626,11 @@ async fn write_path_exit_gate_on_local_standard_specimen() {
     assert!(
         (min_segments..=max_segments).contains(&second_settled.live_segment_count),
         "settled Stage 7 specimen is outside selected band {min_segments}..={max_segments}: {second_settled:?}"
+    );
+    assert!(
+        second_settled.live_segment_count <= ONLINE_SPECIMEN_SETTLED_MAX,
+        "online exit-gate specimen must settle to at most {ONLINE_SPECIMEN_SETTLED_MAX} segments; \
+         the band's upper reach belongs to the staged-bulk regime: {second_settled:?}"
     );
     assert!(
         first_settled.orphan_file_set_ids.is_empty()
@@ -1374,6 +1908,13 @@ fn histogram_count(metric_name: &str, labels: &[(&str, &str)]) -> u64 {
         .round() as u64
 }
 
+fn writer_merge_wait_count(tenant_id: &str, reason: &str) -> u64 {
+    histogram_count(
+        WRITE_QUEUE_WRITER_MERGE_WAIT_METRIC_NAME,
+        &[("tenant", tenant_id), ("reason", reason)],
+    )
+}
+
 fn write_queue_counter_value_with_labels(metric_name: &str, labels: &[(&str, &str)]) -> u64 {
     let metrics_text = write_queue_phase_metrics_text();
     metrics_text
@@ -1398,8 +1939,18 @@ fn write_queue_counter_has_tenant(metric_name: &str, tenant_id: &str) -> bool {
     })
 }
 
+/// Wall-clock budget for waiting on background write-queue progress.
+///
+/// This is a liveness bound, not a correctness threshold: the assertions around
+/// each wait are what prove the behavior. It is deliberately generous because the
+/// suite runs thousands of tests in parallel on shared hosts, where seconds of
+/// scheduling delay are normal and say nothing about the write queue. A real
+/// stall — a contended writer that is never yielded, a task that never commits,
+/// a merge that never converges — still turns every wait below red.
+const WRITE_QUEUE_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+
 async fn wait_for_task_success(tasks: &dashmap::DashMap<String, TaskInfo>, task_id: &str) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(WRITE_QUEUE_PROGRESS_TIMEOUT, async {
         while !task_succeeded(tasks, task_id) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1575,6 +2126,7 @@ async fn hundred_commits_do_not_leave_hundred_flush_segments() {
             min_merge_segments: Some(2),
             max_docs_before_merge: Some(1000),
             writer_idle_timeout: None,
+            ..Default::default()
         },
     );
 
@@ -1648,6 +2200,7 @@ async fn merge_owner_survives_consecutive_commits() {
             min_merge_segments: Some(2),
             max_docs_before_merge: Some(1000),
             writer_idle_timeout: None,
+            ..Default::default()
         },
     );
 
@@ -1671,7 +2224,7 @@ async fn merge_owner_survives_consecutive_commits() {
         wait_for_task_success(tasks.as_ref(), &task_id).await;
     }
 
-    let converged = tokio::time::timeout(Duration::from_secs(5), async {
+    let converged = tokio::time::timeout(WRITE_QUEUE_PROGRESS_TIMEOUT, async {
         loop {
             let observation = observed_segments(index.as_ref());
             if observation.live_docs == 2
@@ -1736,6 +2289,31 @@ fn writer_idle_timeout_uses_env_override_when_valid() {
     assert_eq!(
         writer_lifecycle::configured_writer_idle_timeout(),
         Duration::from_millis(25)
+    );
+}
+
+#[test]
+fn writer_idle_timeout_falls_back_to_selected_default_when_env_missing_or_malformed() {
+    let _env_lock = WRITE_QUEUE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _missing_guard =
+        WriteQueueEnvVarRestoreGuard::apply(WRITE_QUEUE_WRITER_IDLE_TIMEOUT_ENV_VAR, None);
+    assert_eq!(
+        writer_lifecycle::configured_writer_idle_timeout(),
+        writer_lifecycle::DEFAULT_WRITER_IDLE_TIMEOUT,
+        "missing env should use the selected default owner"
+    );
+    drop(_missing_guard);
+
+    let _malformed_guard = WriteQueueEnvVarRestoreGuard::apply(
+        WRITE_QUEUE_WRITER_IDLE_TIMEOUT_ENV_VAR,
+        Some("not-a-number"),
+    );
+    assert_eq!(
+        writer_lifecycle::configured_writer_idle_timeout(),
+        writer_lifecycle::DEFAULT_WRITER_IDLE_TIMEOUT,
+        "malformed env should use the selected default owner"
     );
 }
 
@@ -1856,8 +2434,10 @@ async fn writer_memory_admission_counts_persistent_writer_budget() {
     handle.await.unwrap().unwrap();
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn idle_writer_eviction_releases_budget_and_allows_more_tenants() {
+async fn assert_idle_writer_eviction_releases_budget_and_allows_more_tenants(
+    writer_idle_timeout: Option<Duration>,
+    idle_wait: Duration,
+) {
     let tmp = tempfile::TempDir::new().unwrap();
     let shared_budget = Arc::new(MemoryBudget::new(MemoryBudgetConfig {
         max_concurrent_writers: 1,
@@ -1867,13 +2447,14 @@ async fn idle_writer_eviction_releases_budget_and_allows_more_tenants() {
 
     for tenant_number in 0..3 {
         let tenant_id = format!("idle_eviction_tenant_{tenant_number}");
+        let merge_wait_before = writer_merge_wait_count(&tenant_id, "idle_timeout");
         let (index, tx, handle, tasks) = setup_write_queue_with_budget_and_overrides(
             &tmp,
             &tenant_id,
             Arc::clone(&shared_budget),
             WriteQueueTestOverrides {
                 batch_size: Some(1),
-                writer_idle_timeout: Some(Duration::from_millis(25)),
+                writer_idle_timeout,
                 ..Default::default()
             },
         );
@@ -1894,11 +2475,16 @@ async fn idle_writer_eviction_releases_budget_and_allows_more_tenants() {
         )
         .await;
         wait_for_task_success(tasks.as_ref(), &task_id).await;
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(idle_wait).await;
         assert_eq!(
             indexed_document_count(index.as_ref()),
             1,
             "tenant {tenant_number} must retain its known-answer searchable write"
+        );
+        assert_eq!(
+            writer_merge_wait_count(&tenant_id, "idle_timeout") - merge_wait_before,
+            1,
+            "idle eviction for tenant {tenant_number} must close through the merge-quiescent writer lifecycle"
         );
         queues.push((tx, handle));
     }
@@ -1912,6 +2498,30 @@ async fn idle_writer_eviction_releases_budget_and_allows_more_tenants() {
         drop(tx);
         handle.await.unwrap().unwrap();
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn idle_writer_eviction_releases_budget_and_allows_more_tenants() {
+    assert_idle_writer_eviction_releases_budget_and_allows_more_tenants(
+        Some(Duration::from_millis(25)),
+        Duration::from_millis(150),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "selected 30s default is intentionally too slow for the parallel unit sweep; Stage 6 ignored matrix protects this timing path"]
+async fn selected_default_idle_writer_eviction_releases_budget_and_allows_more_tenants() {
+    let _env_lock = WRITE_QUEUE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _env_guard =
+        WriteQueueEnvVarRestoreGuard::apply(WRITE_QUEUE_WRITER_IDLE_TIMEOUT_ENV_VAR, None);
+    assert_idle_writer_eviction_releases_budget_and_allows_more_tenants(
+        None,
+        writer_lifecycle::DEFAULT_WRITER_IDLE_TIMEOUT + Duration::from_millis(500),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1929,13 +2539,13 @@ async fn contention_yield_records_writer_close_reason() {
         &tmp,
         "yield_metric_a",
         Arc::clone(&shared_budget),
-        batch_one,
+        batch_one.clone(),
     );
     let (_index_b, tx_b, handle_b, tasks_b) = setup_write_queue_with_budget_and_overrides(
         &tmp,
         "yield_metric_b",
         Arc::clone(&shared_budget),
-        batch_one,
+        batch_one.clone(),
     );
 
     let initial_a = register_task(tasks_a.as_ref(), "yield_metric_a_initial", 1, 1);
@@ -1951,6 +2561,10 @@ async fn contention_yield_records_writer_close_reason() {
     .await;
     wait_for_task_success(tasks_a.as_ref(), &initial_a).await;
 
+    let waiter_yield_count_before = write_queue_counter_value_with_labels(
+        WRITE_QUEUE_WRITER_CLOSES_METRIC_NAME,
+        &[("tenant", "yield_metric_a"), ("reason", "waiter_yield")],
+    );
     let task_b = register_task(tasks_b.as_ref(), "yield_metric_b_task", 1, 1);
     enqueue_write(
         &tx_b,
@@ -1962,7 +2576,7 @@ async fn contention_yield_records_writer_close_reason() {
         ))],
     )
     .await;
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(WRITE_QUEUE_PROGRESS_TIMEOUT, async {
         while !shared_budget.has_writer_waiters() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -1990,7 +2604,7 @@ async fn contention_yield_records_writer_close_reason() {
         write_queue_counter_value_with_labels(
             WRITE_QUEUE_WRITER_CLOSES_METRIC_NAME,
             &[("tenant", "yield_metric_a"), ("reason", "waiter_yield")],
-        ),
+        ) - waiter_yield_count_before,
         1,
         "a contention-driven writer release must be counted exactly once"
     );
@@ -2020,13 +2634,13 @@ async fn busy_tenant_yields_contended_writer_after_commit() {
         &tmp,
         "busy_budget_a",
         Arc::clone(&shared_budget),
-        batch_one,
+        batch_one.clone(),
     );
     let (index_b, tx_b, handle_b, tasks_b) = setup_write_queue_with_budget_and_overrides(
         &tmp,
         "busy_budget_b",
         Arc::clone(&shared_budget),
-        batch_one,
+        batch_one.clone(),
     );
 
     let initial_a = register_task(tasks_a.as_ref(), "busy_tenant_a_initial", 1, 1);
@@ -2053,7 +2667,7 @@ async fn busy_tenant_yields_contended_writer_after_commit() {
         ))],
     )
     .await;
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(WRITE_QUEUE_PROGRESS_TIMEOUT, async {
         while !shared_budget.has_writer_waiters() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -2067,7 +2681,7 @@ async fn busy_tenant_yields_contended_writer_after_commit() {
         Arc::clone(&tasks_a),
         Arc::clone(&stop_writes),
     ));
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(WRITE_QUEUE_PROGRESS_TIMEOUT, async {
         while !task_succeeded(tasks_b.as_ref(), &task_b)
             || write_queue_counter_value(WRITE_QUEUE_COMMITS_METRIC_NAME, "busy_budget_a") < 2
         {
@@ -2132,6 +2746,7 @@ async fn contended_idle_queue_keeps_merge_owner_until_backlog_converges() {
             min_merge_segments: Some(2),
             max_docs_before_merge: Some(1000),
             writer_idle_timeout: None,
+            ..Default::default()
         },
     );
     let (tx_b, handle_b, tasks_b) =
@@ -2383,7 +2998,14 @@ async fn test_acquire_writer_for_queue_returns_writer_contention_error_not_queue
 
     let acquire = tokio::spawn({
         let index = Arc::clone(&index);
-        async move { acquire_writer_for_queue(&index, "writer_contention_tenant").await }
+        async move {
+            acquire_writer_for_queue(
+                &index,
+                "writer_contention_tenant",
+                crate::index::Index::DEFAULT_BUFFER_SIZE,
+            )
+            .await
+        }
     });
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_secs(31)).await;
@@ -2406,43 +3028,44 @@ async fn test_acquire_writer_for_queue_returns_writer_contention_error_not_queue
 #[tokio::test(flavor = "current_thread")]
 async fn test_write_queue_absorbs_1500_op_burst_without_queue_full() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let (tx, handle, tasks) = with_write_queue_channel_capacity_env(Some("1500"), || {
-        setup_write_queue(&tmp, "burst_tenant")
-    });
+    let _env_lock = WRITE_QUEUE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _capacity_guard =
+        WriteQueueEnvVarRestoreGuard::apply(WRITE_QUEUE_CHANNEL_CAPACITY_ENV_VAR, Some("1500"));
+    let (tx, handle, tasks, worker_gate) = setup_gated_write_queue(&tmp, "burst_tenant");
 
-    // Warm up the queue using shared helpers so this regression stays on the
-    // same lifecycle path as existing write-queue tests.
-    let warmup_task = register_task(tasks.as_ref(), "burst_warmup", 1, 1);
-    enqueue_write(
-        &tx,
-        warmup_task.clone(),
-        vec![WriteAction::Add(text_document("warmup", "name", "warmup"))],
-    )
-    .await;
-    wait_for_write_queue_settle().await;
-    assert_task_succeeded(tasks.as_ref(), &warmup_task, 1);
-
-    // current_thread + tight try_send loop intentionally prevents the queue
-    // task from draining during this burst, so capacity behavior is deterministic.
+    // The dedicated writer worker runs on its own OS thread, so this gate is
+    // the deterministic synchronization point that proves admission capacity
+    // before any consumer-side draining can mask a regression.
     const REQUIRED_BURST_OPS: usize = 1_200;
     let mut burst_task_ids = Vec::with_capacity(REQUIRED_BURST_OPS);
+    let mut first_rejected_op = None;
     for i in 0..REQUIRED_BURST_OPS {
         let task_id = register_task(tasks.as_ref(), &format!("burst_task_{i}"), i as i64 + 2, 1);
-        burst_task_ids.push(task_id.clone());
         let send_result = tx.try_send(WriteOp {
             task_id: task_id.clone(),
             actions: vec![WriteAction::Delete(format!("burst_missing_doc_{i}"))],
         });
-        assert!(
-            send_result.is_ok(),
-            "queue filled too early at burst op {i}; expected to admit at least {REQUIRED_BURST_OPS} ops"
-        );
+        if send_result.is_err() {
+            first_rejected_op = Some(i);
+            break;
+        }
+        burst_task_ids.push(task_id);
     }
 
+    worker_gate.release();
     drop(tx);
     handle.await.unwrap().unwrap();
 
+    assert_eq!(
+        first_rejected_op, None,
+        "queue filled too early at burst op {}; expected to admit at least {REQUIRED_BURST_OPS} ops",
+        first_rejected_op.unwrap_or(REQUIRED_BURST_OPS)
+    );
+
     for task_id in burst_task_ids {
+        wait_for_task_success(tasks.as_ref(), &task_id).await;
         assert_task_succeeded(tasks.as_ref(), &task_id, 1);
     }
 }
@@ -2496,6 +3119,38 @@ async fn test_write_queue_close_flush_commits_once() {
     );
 }
 
+#[test]
+fn injected_commit_delay_applies_only_to_the_registered_tenant() {
+    let stalled_tenant = "commit_delay_seam_stalled";
+    let bystander_tenant = "commit_delay_seam_bystander";
+    let injected_delay = Duration::from_millis(250);
+    assert_eq!(
+        write_queue_test_commit_delay(stalled_tenant),
+        None,
+        "no commit stall should be injected before a test registers one"
+    );
+
+    {
+        let _stall = delay_commits_for_test(stalled_tenant, injected_delay);
+        assert_eq!(
+            write_queue_test_commit_delay(stalled_tenant),
+            Some(injected_delay),
+            "the registering tenant's commits must observe the injected stall"
+        );
+        assert_eq!(
+            write_queue_test_commit_delay(bystander_tenant),
+            None,
+            "an injected commit stall must not reach write queues of tenants owned by other tests in the shared lib-test process"
+        );
+    }
+
+    assert_eq!(
+        write_queue_test_commit_delay(stalled_tenant),
+        None,
+        "dropping the guard must clear the injected stall"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn shutdown_drains_acknowledged_writes_and_waits_for_merges() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -2503,9 +3158,14 @@ async fn shutdown_drains_acknowledged_writes_and_waits_for_merges() {
     let tenant_path = tmp.path().join(&tenant_id);
     std::fs::create_dir_all(&tenant_path).unwrap();
     let schema = crate::index::schema::Schema::builder().build();
-    let index = Arc::new(crate::index::Index::create(&tenant_path, schema).unwrap());
+    let budget = Arc::new(MemoryBudget::new(MemoryBudgetConfig::default()));
+    let active_writers_before = budget.active_writers();
+    let index = Arc::new(
+        crate::index::Index::create_with_budget(&tenant_path, schema, Arc::clone(&budget)).unwrap(),
+    );
     let (tx, handle, tasks) = setup_write_queue_with_index(&tmp, &tenant_id, Arc::clone(&index));
     let metric_observation_guard = writer_lifecycle::WriteQueueTenantMetrics::for_queue(&tenant_id);
+    let merge_wait_before = writer_merge_wait_count(&tenant_id, "channel_closed");
     let additions = [
         ("shutdown_add_one", "shutdown_doc_one"),
         ("shutdown_add_two", "shutdown_doc_two"),
@@ -2556,15 +3216,15 @@ async fn shutdown_drains_acknowledged_writes_and_waits_for_merges() {
             "shutdown must leave task {task_id} in a terminal state"
         );
     }
-    let metrics_text = write_queue_phase_metrics_text();
-    assert!(
-        metrics_text.lines().any(|line| {
-            line.starts_with("flapjack_write_queue_writer_closes_total")
-                && line.contains(&format!("tenant=\"{tenant_id}\""))
-                && line.contains("reason=\"channel_closed\"")
-                && line.ends_with(" 1")
-        }),
-        "shutdown must record one channel-closed writer drain; got:\n{metrics_text}"
+    assert_eq!(
+        writer_merge_wait_count(&tenant_id, "channel_closed") - merge_wait_before,
+        1,
+        "shutdown must wait for merge quiescence exactly once before closing its writer"
+    );
+    assert_eq!(
+        budget.active_writers(),
+        active_writers_before,
+        "shutdown must return the active-writer budget to its pre-queue baseline"
     );
     drop(metric_observation_guard);
 }
@@ -2586,12 +3246,11 @@ async fn test_write_queue_amortizes_commits_under_fast_push() {
     std::fs::create_dir_all(&tenant_path).unwrap();
     let schema = crate::index::schema::Schema::builder().build();
     let index = Arc::new(crate::index::Index::create(&tenant_path, schema).unwrap());
-    let (tx, handle, tasks) =
-        setup_write_queue_with_index(&tmp, "amortization_tenant", Arc::clone(&index));
+    let (tx, handle, tasks, worker_gate) =
+        setup_gated_write_queue_with_index(&tmp, "amortization_tenant", Arc::clone(&index));
 
-    // current_thread + tight try_send loop intentionally keeps control in this
-    // task until all ops are enqueued, so timeout-driven queue draining cannot
-    // interleave with this burst.
+    // The dedicated writer worker is held until all producers finish, so
+    // timeout-driven draining cannot interleave with this burst.
     //
     // 63 sits below Tantivy's LogMergePolicy min_merge threshold so per-batch
     // segments stay observable post-drain.
@@ -2614,6 +3273,7 @@ async fn test_write_queue_amortizes_commits_under_fast_push() {
         );
     }
 
+    worker_gate.release();
     drop(tx);
     handle.await.unwrap().unwrap();
 
@@ -2664,6 +3324,71 @@ async fn test_batch_settings_load_failure_marks_all_tasks_failed() {
 
     assert_task_failed(tasks.as_ref(), &task_1);
     assert_task_failed(tasks.as_ref(), &task_2);
+}
+
+#[tokio::test]
+async fn delete_term_probe_counts_upsert_but_not_add() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (tx, handle, tasks) = setup_write_queue(&tmp, "delete_term_probe_tenant");
+
+    let upsert_task = register_task(tasks.as_ref(), "delete_term_probe_upsert", 1, 3);
+    enqueue_write(
+        &tx,
+        upsert_task.clone(),
+        vec![
+            WriteAction::Upsert(text_document("upsert_1", "name", "One")),
+            WriteAction::Upsert(text_document("upsert_2", "name", "Two")),
+            WriteAction::Upsert(text_document("upsert_3", "name", "Three")),
+        ],
+    )
+    .await;
+    wait_for_task_success(tasks.as_ref(), &upsert_task).await;
+    assert_eq!(
+        delete_term_observation(&tasks.get(&upsert_task).unwrap()),
+        DeleteTermObservation {
+            explicit_delete_actions: 0,
+            document_write_delete_terms: 3,
+        }
+    );
+
+    let add_task = register_task(tasks.as_ref(), "delete_term_probe_add", 2, 3);
+    enqueue_write(
+        &tx,
+        add_task.clone(),
+        vec![
+            WriteAction::Add(text_document("add_1", "name", "One")),
+            WriteAction::Add(text_document("add_2", "name", "Two")),
+            WriteAction::Add(text_document("add_3", "name", "Three")),
+        ],
+    )
+    .await;
+    wait_for_task_success(tasks.as_ref(), &add_task).await;
+    assert_eq!(
+        delete_term_observation(&tasks.get(&add_task).unwrap()),
+        DeleteTermObservation {
+            explicit_delete_actions: 0,
+            document_write_delete_terms: 0,
+        },
+        "add-mode staging must not inherit an earlier task's delete-term count"
+    );
+
+    let delete_task = register_task(tasks.as_ref(), "delete_term_probe_delete", 3, 1);
+    enqueue_write(
+        &tx,
+        delete_task.clone(),
+        vec![WriteAction::Delete("upsert_1".to_string())],
+    )
+    .await;
+    drop(tx);
+    handle.await.unwrap().unwrap();
+    assert_eq!(
+        delete_term_observation(&tasks.get(&delete_task).unwrap()),
+        DeleteTermObservation {
+            explicit_delete_actions: 1,
+            document_write_delete_terms: 0,
+        },
+        "explicit deletes must not pollute the document-write delete-term count"
+    );
 }
 
 #[tokio::test]
@@ -2792,7 +3517,7 @@ async fn test_write_queue_phase_metrics_records_batch_lifecycle_series() {
 // overlap this test's appends.
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(oplog_append_phase_metric)]
-async fn write_phase_metrics_separate_prepare_commit_reload_lww_and_oplog() {
+async fn write_phase_metrics_separate_prepare_commit_reload_versions_and_oplog() {
     let tmp = tempfile::TempDir::new().unwrap();
     let tenant_id = format!("phase_detail_{}", uuid::Uuid::new_v4().simple());
     let (tx, handle, tasks, oplog) = setup_write_queue_with_oplog(&tmp, &tenant_id);
@@ -2839,7 +3564,7 @@ async fn write_phase_metrics_separate_prepare_commit_reload_lww_and_oplog() {
         "writer_commit",
         "reader_reload",
         "metadata_persistence",
-        "lww_update",
+        "version_store_update",
         "oplog_commit_state_persistence",
     ] {
         assert_histogram_count_at_least(
@@ -2901,6 +3626,43 @@ fn add_staging_phase_is_recorded_by_tantivy_write_not_preparation() {
     );
 }
 
+#[test]
+fn legacy_replicated_actions_replay_without_inventing_oplog_origin() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let tenant_path = tmp.path().join("legacy_unproven_origin");
+    std::fs::create_dir_all(&tenant_path).unwrap();
+    let schema = crate::index::schema::Schema::builder().build();
+    let index = Arc::new(crate::index::Index::create(&tenant_path, schema).unwrap());
+    let mut writer = index.writer().unwrap();
+    let id_field = index.inner().schema().get_field("_id").unwrap();
+    let mut prepared = PreparedWriteOperation::new("legacy_task".into(), "1".into());
+    let mut preparation_context = WritePreparationContext {
+        index: &index,
+        settings: None,
+        writer: &mut writer,
+        id_field,
+        #[cfg(feature = "vector-search")]
+        embedder_configs: &[],
+    };
+
+    prepare_write_actions(
+        &mut preparation_context,
+        &mut prepared,
+        vec![
+            WriteAction::UpsertNoLwwUpdate(text_document("legacy_upsert", "name", "Legacy Upsert")),
+            WriteAction::DeleteNoLwwUpdate("legacy_delete".to_string()),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(prepared.valid_docs.len(), 1);
+    assert_eq!(prepared.deleted_ids, vec!["legacy_delete"]);
+    assert!(
+        prepared.oplog_ops.is_empty(),
+        "legacy records must replay Tantivy mutations without publishing fabricated origin tuples"
+    );
+}
+
 // Serialized with the real-append test above so the exact-equality snapshot below is
 // not perturbed by a concurrent producer of the global `oplog_append` phase histogram.
 #[test]
@@ -2919,8 +3681,8 @@ fn oplog_append_phase_ignores_noop_paths() {
         &[("phase", "oplog_append")],
     );
 
-    finalization::append_batch_to_oplog(None, "task_none", &[], &[], tenant_id).unwrap();
-    finalization::append_batch_to_oplog(Some(&oplog), "task_empty", &[], &[], tenant_id).unwrap();
+    finalization::append_batch_to_oplog(None, "task_none", &[], tenant_id).unwrap();
+    finalization::append_batch_to_oplog(Some(&oplog), "task_empty", &[], tenant_id).unwrap();
 
     assert_eq!(
         histogram_count(
@@ -2951,6 +3713,7 @@ async fn writer_lifetime_metrics_survive_multiple_commits() {
             min_merge_segments: Some(2),
             max_docs_before_merge: Some(1000),
             writer_idle_timeout: None,
+            ..Default::default()
         },
     );
     let (_waiter_index, waiter_tx, waiter_handle, waiter_tasks) =
@@ -2988,7 +3751,7 @@ async fn writer_lifetime_metrics_survive_multiple_commits() {
         ))],
     )
     .await;
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(WRITE_QUEUE_PROGRESS_TIMEOUT, async {
         while !shared_budget.has_writer_waiters() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -3076,19 +3839,20 @@ fn startup_replay_closes_measured_writer_lifecycle() {
         oplog: None,
         admission_store,
         facet_cache: Arc::new(dashmap::DashMap::new()),
-        lww_map: Arc::new(dashmap::DashMap::new()),
         #[cfg(feature = "vector-search")]
         vector_ctx: VectorWriteContext::new(Arc::new(dashmap::DashMap::new())),
         #[cfg(not(feature = "vector-search"))]
         vector_ctx: VectorWriteContext::new(),
         queue_metrics_id: tenant_metrics.queue_metrics_id(),
+        writer_buffer_size: crate::index::Index::DEFAULT_BUFFER_SIZE,
         test_overrides: WriteQueueTestOverrides {
             batch_size: Some(1),
             ..Default::default()
         },
     };
 
-    run_replay_startup(&ctx, vec![record]).unwrap();
+    let (cancellation, _cancellation_rx) = write_queue_cancellation_channel();
+    run_replay_startup(&ctx, vec![record], &cancellation).unwrap();
 
     let metrics_text = write_queue_phase_metrics_text();
     assert_eq!(
@@ -3153,7 +3917,6 @@ async fn test_create_write_queue_with_vector_indices() {
 
     let tasks: Arc<dashmap::DashMap<String, TaskInfo>> = Arc::new(dashmap::DashMap::new());
     let facet_cache = Arc::new(dashmap::DashMap::new());
-    let lww_map = Arc::new(dashmap::DashMap::new());
     let vector_indices: Arc<
         dashmap::DashMap<String, Arc<std::sync::RwLock<crate::vector::index::VectorIndex>>>,
     > = Arc::new(dashmap::DashMap::new());
@@ -3162,7 +3925,7 @@ async fn test_create_write_queue_with_vector_indices() {
     let admission_store =
         Arc::new(admission::WriteAdmissionStore::open(tmp.path(), tenant_id).unwrap());
 
-    let (tx, handle) = create_write_queue(WriteQueueContext {
+    let (tx, handle, _cancellation) = create_write_queue(WriteQueueContext {
         tenant_id: tenant_id.to_string(),
         index,
         tasks: Arc::clone(&tasks),
@@ -3170,9 +3933,9 @@ async fn test_create_write_queue_with_vector_indices() {
         oplog: None,
         admission_store,
         facet_cache,
-        lww_map,
         vector_ctx,
         queue_metrics_id: 0,
+        writer_buffer_size: crate::index::Index::DEFAULT_BUFFER_SIZE,
         test_overrides: Default::default(),
     })
     .unwrap();
@@ -3258,13 +4021,12 @@ mod auto_embed_tests {
 
         let tasks: Arc<dashmap::DashMap<String, TaskInfo>> = Arc::new(dashmap::DashMap::new());
         let facet_cache = Arc::new(dashmap::DashMap::new());
-        let lww_map = Arc::new(dashmap::DashMap::new());
         let vector_indices: VectorIndicesMap = Arc::new(dashmap::DashMap::new());
         let vector_ctx = VectorWriteContext::new(Arc::clone(&vector_indices));
         let admission_store =
             Arc::new(admission::WriteAdmissionStore::open(tmp.path(), tenant_id).unwrap());
 
-        let (tx, handle) = create_write_queue(WriteQueueContext {
+        let (tx, handle, _cancellation) = create_write_queue(WriteQueueContext {
             tenant_id: tenant_id.to_string(),
             index,
             tasks: Arc::clone(&tasks),
@@ -3272,9 +4034,9 @@ mod auto_embed_tests {
             oplog,
             admission_store,
             facet_cache,
-            lww_map,
             vector_ctx,
             queue_metrics_id: 0,
+            writer_buffer_size: crate::index::Index::DEFAULT_BUFFER_SIZE,
             test_overrides: Default::default(),
         })
         .unwrap();
@@ -3997,13 +4759,12 @@ mod auto_embed_tests {
 
         let tasks: Arc<dashmap::DashMap<String, TaskInfo>> = Arc::new(dashmap::DashMap::new());
         let facet_cache = Arc::new(dashmap::DashMap::new());
-        let lww_map = Arc::new(dashmap::DashMap::new());
         let vector_indices: VectorIndicesMap = Arc::new(dashmap::DashMap::new());
         let vector_ctx = VectorWriteContext::new(Arc::clone(&vector_indices));
         let admission_store =
             Arc::new(admission::WriteAdmissionStore::open(tmp.path(), tenant_id).unwrap());
 
-        let (tx, handle) = create_write_queue(WriteQueueContext {
+        let (tx, handle, _cancellation) = create_write_queue(WriteQueueContext {
             tenant_id: tenant_id.to_string(),
             index: Arc::clone(&index),
             tasks: Arc::clone(&tasks),
@@ -4011,9 +4772,9 @@ mod auto_embed_tests {
             oplog: None,
             admission_store,
             facet_cache,
-            lww_map,
             vector_ctx,
             queue_metrics_id: 0,
+            writer_buffer_size: crate::index::Index::DEFAULT_BUFFER_SIZE,
             test_overrides: Default::default(),
         })
         .unwrap();

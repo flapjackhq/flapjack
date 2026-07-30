@@ -9,7 +9,8 @@ use utoipa::ToSchema;
 
 use super::AppState;
 use flapjack::error::FlapjackError;
-use flapjack::types::TaskStatus;
+use flapjack::index::write_queue::{delete_term_observation, DeleteTermObservation};
+use flapjack::types::{TaskInfo, TaskStatus};
 
 #[derive(Debug, Serialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +40,7 @@ pub async fn get_task(
     Path(task_id): Path<String>,
 ) -> Result<Json<AlgoliaTaskResponse>, FlapjackError> {
     let task = state.manager.get_task(&task_id)?;
+    trace_delete_term_observation(&task);
     Ok(Json(map_task_status_to_algolia(&task.status)))
 }
 
@@ -83,7 +85,19 @@ pub async fn get_task_for_index(
         return Err(FlapjackError::TaskNotFound(task_id));
     }
 
+    trace_delete_term_observation(&task);
     Ok(Json(map_task_status_to_algolia(&task.status)))
+}
+
+fn trace_delete_term_observation(task: &TaskInfo) -> DeleteTermObservation {
+    let observation = delete_term_observation(task);
+    tracing::debug!(
+        task_id = task.id,
+        explicit_delete_actions = observation.explicit_delete_actions,
+        document_write_delete_terms = observation.document_write_delete_terms,
+        "task write-preparation observation"
+    );
+    observation
 }
 
 fn map_task_status_to_algolia(task_status: &TaskStatus) -> AlgoliaTaskResponse {
@@ -124,5 +138,17 @@ mod tests {
         let failed = map_task_status_to_algolia(&TaskStatus::Failed("boom".to_string()));
         assert_eq!(failed.status, "published");
         assert!(!failed.pending_task);
+    }
+
+    #[test]
+    fn task_observation_consumer_accepts_public_typed_seam() {
+        let task = TaskInfo::new("task_observation".to_string(), 1, 0);
+        assert_eq!(
+            trace_delete_term_observation(&task),
+            DeleteTermObservation {
+                explicit_delete_actions: 0,
+                document_write_delete_terms: 0,
+            }
+        );
     }
 }

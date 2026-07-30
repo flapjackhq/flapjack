@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::index::FacetCacheKey;
 
 pub(super) type FacetResultCache = (
     usize,
@@ -41,7 +42,7 @@ pub(super) struct ExpandedQueryExecutionContext<'a> {
     pub distinct: Option<u32>,
     pub max_values_per_facet: Option<usize>,
     pub effective_limit: usize,
-    pub facet_cache_key: Option<&'a String>,
+    pub facet_cache_key: Option<&'a FacetCacheKey>,
     pub allow_split_alternatives: bool,
     pub query_text: &'a str,
     pub json_exact_field: tantivy::schema::Field,
@@ -52,7 +53,7 @@ pub(super) struct ExpandedQueryExecutionContext<'a> {
 /// when the cache is at capacity. No-ops when no cache key is provided.
 pub(super) fn maybe_cache_facets(
     manager: &super::super::IndexManager,
-    facet_cache_key: Option<&String>,
+    facet_cache_key: Option<&FacetCacheKey>,
     total: usize,
     facets_map: &HashMap<String, Vec<crate::types::FacetCount>>,
     facets_stats: &HashMap<String, crate::types::FacetStats>,
@@ -331,7 +332,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let manager = super::super::IndexManager::new(temp_dir.path());
         let (facets_map, facets_stats) = sample_facet_data();
-        let cache_key = "facet:k1".to_string();
+        let cache_key = FacetCacheKey::new("tenant", "", "query", vec!["facet".to_string()]);
 
         maybe_cache_facets(
             &manager,
@@ -375,8 +376,8 @@ mod tests {
             .facet_cache_cap
             .store(1, std::sync::atomic::Ordering::Relaxed);
         let (facets_map, facets_stats) = sample_facet_data();
-        let first_key = "facet:first".to_string();
-        let second_key = "facet:second".to_string();
+        let first_key = FacetCacheKey::new("tenant", "", "query", vec!["first".to_string()]);
+        let second_key = FacetCacheKey::new("tenant", "", "query", vec!["second".to_string()]);
 
         maybe_cache_facets(
             &manager,

@@ -98,6 +98,7 @@ fn async_running_status_hides_pre_recorded_import_outcome() {
         terminal_at: None,
         import_outcome: Some(MigrationImportOutcome {
             settings_applied: true,
+            objects_imported: 0,
             synonyms_imported: 1,
             rules_imported: 2,
             warnings: vec![MigrationImportWarning {
@@ -440,10 +441,10 @@ async fn async_cancel_terminal_jobs_returns_existing_terminal_status() {
         .unwrap();
     let succeeded_before = spool.succeed_migration(succeeded, None).unwrap();
 
-    for (job_uuid, expected) in [
-        (cancelled, cancelled_before),
-        (failed, failed_before),
-        (succeeded, succeeded_before),
+    for (job_uuid, expected, target_index) in [
+        (cancelled, cancelled_before, "already_cancelled"),
+        (failed, failed_before, "already_failed"),
+        (succeeded, succeeded_before, "already_succeeded"),
     ] {
         let Json(status) = cancel_algolia_migration(
             State(Arc::clone(&state)),
@@ -453,7 +454,9 @@ async fn async_cancel_terminal_jobs_returns_existing_terminal_status() {
         .await
         .expect("terminal cancel should be a no-op status read");
 
-        assert_eq!(status, AsyncMigrationStatusResponse::from(expected.clone()));
+        let mut expected_status = AsyncMigrationStatusResponse::from(expected.clone());
+        expected_status.target_index = Some(target_index.to_string());
+        assert_eq!(status, expected_status);
         assert_eq!(spool.read_migration_phase(job_uuid).unwrap(), expected);
     }
 }
@@ -1038,9 +1041,11 @@ async fn async_runner_created_job_is_isolated_by_authenticated_app_and_key() {
 
     let status = send_status_request(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
     assert_eq!(status.status(), StatusCode::OK);
+    let mut expected_status = AsyncMigrationStatusResponse::from(terminal_before.clone());
+    expected_status.target_index = Some(TARGET.to_string());
     assert_eq!(
         body_json(status).await,
-        serde_json::to_value(AsyncMigrationStatusResponse::from(terminal_before.clone())).unwrap()
+        serde_json::to_value(expected_status).unwrap()
     );
 
     for attempt in 1..=2 {
@@ -1196,7 +1201,7 @@ async fn shared_migration_lifecycle_has_no_duplicate_owner_seams() {
         (
             "record_async_publication_receipt_if_present(",
             &[
-                ("flapjack-http/src/handlers/migration/import.rs", 1),
+                ("flapjack-http/src/handlers/migration/bulk_build.rs", 1),
                 ("flapjack-http/src/handlers/migration/spool.rs", 2),
             ],
         ),
@@ -1212,7 +1217,7 @@ async fn shared_migration_lifecycle_has_no_duplicate_owner_seams() {
             &[
                 ("flapjack-http/src/handlers/migration/job_runner.rs", 1),
                 ("flapjack-http/src/handlers/migration/mod.rs", 4),
-                ("flapjack-http/src/handlers/migration/spool.rs", 10),
+                ("flapjack-http/src/handlers/migration/spool.rs", 11),
                 ("flapjack-http/src/handlers/migration/spool_support.rs", 1),
             ],
         ),

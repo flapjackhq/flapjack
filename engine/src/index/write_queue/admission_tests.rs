@@ -77,7 +77,15 @@ fn legacy_records_decode_as_unproven_epoch_evidence_without_fabrication() {
         "numeric_id": 1,
         "received_documents": 1,
         "created_at_ms": 0,
-        "actions": [{"Delete": "legacy_doc"}]
+        "actions": [
+            {
+                "UpsertNoLwwUpdate": {
+                    "id": "legacy_upsert",
+                    "fields": {}
+                }
+            },
+            {"DeleteNoLwwUpdate": "legacy_delete"}
+        ]
     });
     let envelope = json!({
         "checksum": checksum(&record),
@@ -94,6 +102,16 @@ fn legacy_records_decode_as_unproven_epoch_evidence_without_fabrication() {
     assert_eq!(
         records[0].epoch_evidence,
         WriteAdmissionEpochEvidence::LegacyUnproven
+    );
+    assert!(
+        matches!(
+            records[0].actions.as_slice(),
+            [
+                WriteAction::UpsertNoLwwUpdate(document),
+                WriteAction::DeleteNoLwwUpdate(object_id)
+            ] if document.id == "legacy_upsert" && object_id == "legacy_delete"
+        ),
+        "legacy no-origin variants must decode without inventing replicated provenance"
     );
 }
 

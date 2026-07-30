@@ -8,13 +8,9 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use flapjack::error::FlapjackError;
 use flapjack::index::s3::S3Config;
-use flapjack::index::snapshot::export_to_bytes;
 use std::{path::PathBuf, sync::Arc};
 use utoipa::ToSchema;
-
-const SNAPSHOT_EXPORT_MAX_ATTEMPTS: usize = 3;
 
 #[derive(serde::Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -111,33 +107,6 @@ fn snapshot_install_error(
         .into_response()
 }
 
-fn should_retry_export_error(error: &FlapjackError) -> bool {
-    matches!(error, FlapjackError::Io(_))
-}
-
-fn export_with_retry(
-    mut export_once: impl FnMut() -> Result<Vec<u8>, FlapjackError>,
-) -> Result<Vec<u8>, FlapjackError> {
-    let mut attempt = 1usize;
-    loop {
-        match export_once() {
-            Ok(bytes) => return Ok(bytes),
-            Err(error) => {
-                if attempt >= SNAPSHOT_EXPORT_MAX_ATTEMPTS || !should_retry_export_error(&error) {
-                    return Err(error);
-                }
-                tracing::warn!(
-                    attempt,
-                    max_attempts = SNAPSHOT_EXPORT_MAX_ATTEMPTS,
-                    error = %error,
-                    "Transient snapshot export failed; retrying"
-                );
-                attempt += 1;
-            }
-        }
-    }
-}
-
 fn snapshot_retention() -> usize {
     std::env::var("FLAPJACK_SNAPSHOT_RETENTION")
         .ok()
@@ -217,13 +186,24 @@ pub async fn export_snapshot(
         Err(response) => return *response,
     };
 
+    // Drain and merge-quiesce the persistent writer so the gzip/tar read sees a
+    // quiesced generation rather than a mid-commit snapshot. The guard stays held
+    // across the blocking read so no replacement writer can commit into the tree
+    // while it is being packed.
+    let _quiesce = match state.manager.quiesce_tenant(&index_name.to_string()).await {
+        Ok(quiesce) => quiesce,
+        Err(error) => return internal_error("Export quiesce failed", error),
+    };
+
     // Synchronous gzip+tar I/O is moved off the tokio worker pool so it
     // cannot starve sibling async tasks (health checks, task polling) on
     // CPU-constrained runners. Stage 1 RCA:
     // engine/docs/research/jun02_snapshot_flake_stage1.md (defect 1).
-    let export_result =
-        tokio::task::spawn_blocking(move || export_with_retry(|| export_to_bytes(&index_path)))
-            .await;
+    let export_index_name = index_name.clone();
+    let export_result = tokio::task::spawn_blocking(move || {
+        crate::snapshot_byte_ops::export_snapshot_bytes(&index_path, &export_index_name)
+    })
+    .await;
 
     match export_result {
         Ok(Ok(bytes)) => {
@@ -263,24 +243,17 @@ pub async fn import_snapshot(
     ValidatedIndexName(index_name): ValidatedIndexName,
     body: Bytes,
 ) -> Response {
-    // Synchronous gzip+tar decode and directory-rename plumbing is moved
-    // off the tokio worker pool so it cannot starve sibling async tasks
-    // (health checks, task polling) on CPU-constrained runners. Stage 1
-    // RCA: engine/docs/research/jun02_snapshot_flake_stage1.md (defect 1).
-    let manager = state.manager.clone();
-    let install_result = tokio::task::spawn_blocking(move || {
-        crate::startup_catchup::install_snapshot_bytes(&manager, &index_name, &body)
-    })
-    .await;
-
-    match install_result {
-        Ok(Ok(())) => Json(serde_json::json!({ "status": "imported" })).into_response(),
-        Ok(Err((step, error))) => snapshot_install_error("Import failed", step, error),
-        Err(join_error) => snapshot_install_error(
-            "Import failed",
-            crate::startup_catchup::SnapshotInstallStep::ImportExtract,
-            join_error,
-        ),
+    // The destination writer is drained and merge-quiesced before the snapshot
+    // is installed; the synchronous gzip+tar decode and directory-rename
+    // plumbing then run off the tokio worker pool inside `restore_snapshot_bytes`
+    // so they cannot starve sibling async tasks (health checks, task polling) on
+    // CPU-constrained runners. Stage 1 RCA:
+    // engine/docs/research/jun02_snapshot_flake_stage1.md (defect 1).
+    match crate::startup_catchup::restore_snapshot_bytes(&state.manager, &index_name, body.to_vec())
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({ "status": "imported" })).into_response(),
+        Err((step, error)) => snapshot_install_error("Import failed", step, error),
     }
 }
 
@@ -316,10 +289,24 @@ pub async fn snapshot_to_s3(
         Err(response) => return *response,
     };
 
-    let bytes = match export_to_bytes(&index_path) {
-        Ok(b) => b,
-        Err(e) => return internal_error("Export failed", e),
+    // Drain and merge-quiesce the persistent writer, then run the synchronous
+    // gzip+tar export off the async worker pool through the shared byte seam. The
+    // guard is held across the read so no replacement writer can race the pack.
+    let quiesce = match state.manager.quiesce_tenant(&index_name.to_string()).await {
+        Ok(quiesce) => quiesce,
+        Err(error) => return internal_error("Export quiesce failed", error),
     };
+    let export_index_name = index_name.clone();
+    let bytes = match tokio::task::spawn_blocking(move || {
+        crate::snapshot_byte_ops::export_snapshot_bytes(&index_path, &export_index_name)
+    })
+    .await
+    {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => return internal_error("Export failed", e),
+        Err(join_error) => return internal_error("Export failed (join)", join_error),
+    };
+    drop(quiesce);
 
     match flapjack::index::s3::upload_snapshot(&s3_config, &index_name, &bytes).await {
         Ok(key) => {
@@ -377,7 +364,9 @@ pub async fn restore_from_s3(
     };
 
     let data_len = data.len();
-    match crate::startup_catchup::install_snapshot_bytes(&state.manager, &index_name, &data) {
+    // Quiesce the destination writer and run the synchronous install off the
+    // async worker pool via the shared restore path.
+    match crate::startup_catchup::restore_snapshot_bytes(&state.manager, &index_name, data).await {
         Ok(()) => Json(serde_json::json!({
             "status": "restored",
             "key": key,
@@ -419,10 +408,14 @@ pub async fn list_s3_snapshots(ValidatedIndexName(index_name): ValidatedIndexNam
 #[cfg(test)]
 mod tests {
     use super::{
-        export_snapshot, import_snapshot, list_s3_snapshots, snapshot_capability,
+        export_snapshot, import_snapshot, list_s3_snapshots, snapshot_capability, snapshot_to_s3,
         validate_restore_key_override,
     };
-    use crate::test_helpers::{body_json, EnvVarRestoreGuard, TestStateBuilder, ENV_MUTEX};
+    use crate::handlers::AppState;
+    use crate::test_helpers::{
+        assert_quiescence_before_publication, assert_retained_channel_closed_delta, body_json,
+        retained_channel_closed_count, EnvVarRestoreGuard, TestStateBuilder, ENV_MUTEX,
+    };
     use axum::{
         body::Body,
         http::{Request, StatusCode},
@@ -432,10 +425,29 @@ mod tests {
     };
     use flapjack::index::snapshot::export_to_bytes;
     use flapjack::types::{Document, FieldValue};
-    use flapjack::FlapjackError;
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Arc};
     use tempfile::TempDir;
     use tower::ServiceExt;
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+    fn test_document(id: &str, title: &str) -> Document {
+        Document {
+            id: id.to_string(),
+            fields: HashMap::from([("title".to_string(), FieldValue::Text(title.to_string()))]),
+        }
+    }
+
+    fn assert_document_title(state: &Arc<AppState>, tenant_id: &str, object_id: &str, title: &str) {
+        let document = state
+            .manager
+            .get_document(tenant_id, object_id)
+            .unwrap()
+            .unwrap_or_else(|| panic!("tenant {tenant_id} must contain document {object_id}"));
+        assert_eq!(
+            document.fields.get("title"),
+            Some(&FieldValue::Text(title.to_string()))
+        );
+    }
 
     // The process-global environment lock must span each asynchronous handler
     // call so another test cannot change S3 configuration mid-request.
@@ -600,7 +612,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let snapshot_bytes = export_to_bytes(&state.manager.base_path.join("products")).unwrap();
+        let snapshot_bytes = crate::snapshot_byte_ops::export_snapshot_bytes(
+            &state.manager.base_path.join("products"),
+            "products",
+        )
+        .unwrap();
 
         let app = Router::new()
             .route("/1/indexes/:indexName/import", post(import_snapshot))
@@ -632,6 +648,207 @@ mod tests {
             serde_json::json!({
                 "status": "imported"
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn import_snapshot_into_absent_tenant_survives_quiesce_fence_repair() {
+        let source_tmp = TempDir::new().unwrap();
+        let source = TestStateBuilder::new(&source_tmp).build_shared();
+        source.manager.create_tenant("products").unwrap();
+        source
+            .manager
+            .add_documents_sync(
+                "products",
+                vec![Document {
+                    id: "1".to_string(),
+                    fields: HashMap::from([(
+                        "title".to_string(),
+                        FieldValue::Text("snapshot source".to_string()),
+                    )]),
+                }],
+            )
+            .await
+            .unwrap();
+        let snapshot_bytes = export_to_bytes(&source.manager.base_path.join("products")).unwrap();
+
+        let destination_tmp = TempDir::new().unwrap();
+        let destination = TestStateBuilder::new(&destination_tmp).build_shared();
+        assert!(
+            !destination.manager.base_path.join("products").exists(),
+            "destination specimen must begin without a live tenant tree"
+        );
+        let app = Router::new()
+            .route("/1/indexes/:indexName/import", post(import_snapshot))
+            .with_state(Arc::clone(&destination));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/1/indexes/products/import")
+                    .body(Body::from(snapshot_bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({
+                "status": "imported"
+            })
+        );
+        let restored = destination
+            .manager
+            .search("products", "", None, None, 10)
+            .unwrap();
+        assert_eq!(restored.total, 1);
+        assert_document_title(&destination, "products", "1", "snapshot source");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn snapshot_to_s3_reopens_write_admission_before_upload_completes() {
+        let s3 = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+            .mount(&s3)
+            .await;
+
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let _bucket = EnvVarRestoreGuard::set("FLAPJACK_S3_BUCKET", "snapshot-bucket");
+        let _region = EnvVarRestoreGuard::set("FLAPJACK_S3_REGION", "us-east-1");
+        let _endpoint = EnvVarRestoreGuard::set("FLAPJACK_S3_ENDPOINT", &s3.uri());
+        let _access_key = EnvVarRestoreGuard::set("AWS_ACCESS_KEY_ID", "test-access-key");
+        let _secret_key = EnvVarRestoreGuard::set("AWS_SECRET_ACCESS_KEY", "test-secret-key");
+
+        let tmp = TempDir::new().unwrap();
+        let state = TestStateBuilder::new(&tmp).build_shared();
+        let tenant_id = "s3_guard_lifetime";
+        state.manager.create_tenant(tenant_id).unwrap();
+        state
+            .manager
+            .add_documents_sync(tenant_id, vec![test_document("before", "before snapshot")])
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route("/1/indexes/:indexName/snapshot", post(snapshot_to_s3))
+            .with_state(Arc::clone(&state));
+        let request_task = tokio::spawn(
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/1/indexes/{tenant_id}/snapshot"))
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if s3
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.method.as_str() == "PUT")
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("snapshot upload must begin after local export completes");
+
+        let write_result = state
+            .manager
+            .add_documents_sync(
+                tenant_id,
+                vec![test_document("during_upload", "during upload")],
+            )
+            .await;
+        request_task.abort();
+        let _ = request_task.await;
+
+        write_result
+            .expect("tenant write admission must reopen while the completed snapshot bytes upload");
+        assert_document_title(&state, tenant_id, "during_upload", "during upload");
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_into_tenant_with_live_writer_quiesces_before_rename() {
+        let tmp = TempDir::new().unwrap();
+        let state = TestStateBuilder::new(&tmp).build_shared();
+        let tenant_id = "stage4_snapshot_restore_quiesce";
+        state.manager.create_tenant(tenant_id).unwrap();
+        state
+            .manager
+            .add_documents_sync(
+                tenant_id,
+                vec![
+                    test_document("restored_one", "restored first"),
+                    test_document("restored_two", "restored second"),
+                ],
+            )
+            .await
+            .unwrap();
+        let snapshot_bytes = export_to_bytes(&state.manager.base_path.join(tenant_id)).unwrap();
+        state
+            .manager
+            .add_documents_sync(
+                tenant_id,
+                vec![test_document("stale_live_writer", "stale live writer")],
+            )
+            .await
+            .unwrap();
+        let merge_wait_before = retained_channel_closed_count(tenant_id);
+
+        let app = Router::new()
+            .route("/1/indexes/:indexName/import", post(import_snapshot))
+            .with_state(Arc::clone(&state));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/1/indexes/{tenant_id}/import"))
+                    .body(Body::from(snapshot_bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({
+                "status": "imported"
+            })
+        );
+        assert_retained_channel_closed_delta(
+            tenant_id,
+            merge_wait_before,
+            "snapshot restore must drain and merge-quiesce the destination writer before rename",
+        );
+        assert_quiescence_before_publication(tenant_id, "snapshot_restore_publication");
+        let restored = state.manager.search(tenant_id, "", None, None, 10).unwrap();
+        assert_eq!(
+            restored.total, 2,
+            "snapshot restore must expose exactly the restored generation"
+        );
+        assert_document_title(&state, tenant_id, "restored_one", "restored first");
+        assert_document_title(&state, tenant_id, "restored_two", "restored second");
+        assert!(
+            state
+                .manager
+                .get_document(tenant_id, "stale_live_writer")
+                .unwrap()
+                .is_none(),
+            "snapshot restore must remove stale live-writer documents"
         );
     }
 
@@ -702,36 +919,5 @@ mod tests {
             "snapshots/products/20260329T120000Z.tar.gz"
         )
         .is_ok());
-    }
-
-    #[test]
-    fn export_with_retry_retries_transient_io_errors() {
-        let mut attempts = 0usize;
-        let bytes = super::export_with_retry(|| {
-            attempts += 1;
-            if attempts < 3 {
-                Err(FlapjackError::Io("transient".to_string()))
-            } else {
-                Ok(vec![1, 2, 3])
-            }
-        })
-        .expect("third attempt should succeed");
-        assert_eq!(bytes, vec![1, 2, 3]);
-        assert_eq!(attempts, 3, "must retry transient IO errors");
-    }
-
-    #[test]
-    fn export_with_retry_does_not_retry_non_io_errors() {
-        let mut attempts = 0usize;
-        let error = super::export_with_retry(|| {
-            attempts += 1;
-            Err(FlapjackError::Config("not transient".to_string()))
-        })
-        .expect_err("non-IO errors should fail immediately");
-        assert!(matches!(error, FlapjackError::Config(_)));
-        assert_eq!(
-            attempts, 1,
-            "non-IO errors should not be retried because they are not transient file-churn failures"
-        );
     }
 }

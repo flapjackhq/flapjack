@@ -30,6 +30,27 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use tempfile::TempDir;
 
+async fn apply_replicated_op_and_wait(
+    manager: &IndexManager,
+    tenant_id: &str,
+    operation: &flapjack::index::oplog::OpLogEntry,
+    timeout_message: &str,
+) {
+    flapjack_http::handlers::internal::apply_ops_to_manager(
+        manager,
+        tenant_id,
+        std::slice::from_ref(operation),
+    )
+    .await
+    .unwrap();
+    assert!(
+        manager
+            .wait_for_pending_tasks(std::time::Duration::from_secs(5))
+            .await,
+        "{timeout_message}"
+    );
+}
+
 #[test]
 fn test_replication_uses_shared_app_state_constructor_only() {
     let source = include_str!("test_replication.rs");
@@ -679,6 +700,175 @@ async fn test_apply_ops_to_manager_upsert() {
         .search("test-apply", "Beta", None, None, 10)
         .unwrap();
     assert_eq!(results2.total, 1, "doc2 should be indexed");
+}
+
+#[tokio::test]
+async fn oplog_append_preserves_replicated_origin_tuple() {
+    let temp = TempDir::new().unwrap();
+    let tenant_id = "replicated_origin_tuple";
+    let manager = IndexManager::new_with_node_id(temp.path(), "node-a");
+    let incoming = flapjack::index::oplog::OpLogEntry {
+        seq: 41,
+        timestamp_ms: 1000,
+        node_id: "node-b".to_string(),
+        tenant_id: tenant_id.to_string(),
+        op_type: "upsert".to_string(),
+        payload: serde_json::json!({
+            "objectID": "doc-1",
+            "body": {"_id": "doc-1", "title": "Replicated"}
+        }),
+    };
+
+    apply_replicated_op_and_wait(
+        &manager,
+        tenant_id,
+        &incoming,
+        "replicated write must reach a terminal task state",
+    )
+    .await;
+
+    let entries = manager
+        .get_or_create_oplog(tenant_id)
+        .expect("tenant oplog should exist")
+        .read_since(0)
+        .unwrap();
+    let reappended = entries
+        .iter()
+        .find(|entry| {
+            entry.op_type == "upsert"
+                && entry.payload["objectID"] == serde_json::Value::String("doc-1".to_string())
+        })
+        .expect("replicated upsert should be re-appended locally");
+
+    assert_eq!(
+        reappended.seq, 1,
+        "local oplog should assign a new sequence"
+    );
+    assert_ne!(
+        reappended.seq, incoming.seq,
+        "incoming sequence must not replace the local sequence"
+    );
+    // RED: finalization::append_batch_to_oplog currently replaces replicated provenance.
+    assert_eq!(
+        (reappended.timestamp_ms, reappended.node_id.as_str()),
+        (1000, "node-b"),
+        "re-appended operations must retain their origin tuple"
+    );
+}
+
+async fn seed_newer_version_then_truncate(temp: &TempDir, tenant_id: &str) {
+    let manager = IndexManager::new_with_node_id(temp.path(), "node-a");
+    let original = flapjack::index::oplog::OpLogEntry {
+        seq: 17,
+        timestamp_ms: 2000,
+        node_id: "node-a".to_string(),
+        tenant_id: tenant_id.to_string(),
+        op_type: "upsert".to_string(),
+        payload: serde_json::json!({
+            "objectID": "doc-1",
+            "body": {"_id": "doc-1", "title": "Newer"}
+        }),
+    };
+    apply_replicated_op_and_wait(
+        &manager,
+        tenant_id,
+        &original,
+        "original replicated write must commit before truncation",
+    )
+    .await;
+    assert_eq!(manager.tenant_doc_count(tenant_id), Some(1));
+
+    let oplog = manager
+        .get_or_create_oplog(tenant_id)
+        .expect("tenant oplog should exist");
+    let original_seq = oplog
+        .read_since(0)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.payload["objectID"] == "doc-1")
+        .expect("original document operation should be logged")
+        .seq;
+    let oversized_payload = "x".repeat(11 * 1024 * 1024);
+    oplog
+        .append(
+            "noop",
+            serde_json::json!({"marker": "segment-rotate", "blob": oversized_payload}),
+        )
+        .expect("forcing segment rotation should succeed");
+    let retained_seq = oplog
+        .append("noop", serde_json::json!({"marker": "retained"}))
+        .expect("appending retained entry should succeed");
+    let removed_segments = oplog
+        .truncate_before(retained_seq)
+        .expect("truncate_before should succeed");
+    assert!(
+        removed_segments > 0,
+        "truncation must remove the segment containing doc-1's version"
+    );
+    assert!(
+        oplog.oldest_seq().is_some_and(|seq| seq > original_seq),
+        "oldest retained seq must be newer than doc-1's original seq"
+    );
+    drop(oplog);
+    manager.graceful_shutdown().await;
+}
+
+#[tokio::test]
+async fn stale_replication_after_oplog_truncation_and_restart_is_rejected() {
+    let temp = TempDir::new().unwrap();
+    let tenant_id = "truncated_version_restart";
+    seed_newer_version_then_truncate(&temp, tenant_id).await;
+    let manager = IndexManager::new_with_node_id(temp.path(), "node-a");
+    let before = manager
+        .get_document(tenant_id, "doc-1")
+        .unwrap()
+        .expect("committed document should survive restart");
+    assert!(
+        matches!(
+            before.fields.get("title"),
+            Some(flapjack::types::FieldValue::Text(value)) if value == "Newer"
+        ),
+        "restart precondition must preserve the exact newer body"
+    );
+    assert_eq!(manager.tenant_doc_count(tenant_id), Some(1));
+
+    let stale = flapjack::index::oplog::OpLogEntry {
+        seq: 99,
+        timestamp_ms: 1000,
+        node_id: "node-b".to_string(),
+        tenant_id: tenant_id.to_string(),
+        op_type: "upsert".to_string(),
+        payload: serde_json::json!({
+            "objectID": "doc-1",
+            "body": {"_id": "doc-1", "title": "Older"}
+        }),
+    };
+    apply_replicated_op_and_wait(
+        &manager,
+        tenant_id,
+        &stale,
+        "stale replicated write must reach a terminal task state",
+    )
+    .await;
+
+    let after = manager
+        .get_document(tenant_id, "doc-1")
+        .unwrap()
+        .expect("stale replication must not delete doc-1");
+    // RED: recovery::rebuild_lww_map loses versions whose oplog segment was removed.
+    assert!(
+        matches!(
+            after.fields.get("title"),
+            Some(flapjack::types::FieldValue::Text(value)) if value == "Newer"
+        ),
+        "stale replication changed the exact body after truncation and restart: {:?}",
+        after.fields.get("title")
+    );
+    assert_eq!(
+        manager.tenant_doc_count(tenant_id),
+        Some(1),
+        "stale replication must leave the exact document count unchanged"
+    );
 }
 
 // test_apply_ops_to_manager_returns_max_seq removed — redundant with apply_ops_returns_max_seq in internal.rs

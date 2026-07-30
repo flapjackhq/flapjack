@@ -1,6 +1,31 @@
 # Flapjack - Roadmap
 
-**Last updated:** 2026-07-26 — reconciliation against `origin/main` after the
+**Last updated:** 2026-07-29 — Stage 6 of the atomic bulk build/replace lane
+froze the node-local bulk-only writer buffer (20,000,000 bytes) and document
+checkpoint interval (1,000 documents) at the behavior-preserving baseline,
+against a local-locality gate measurement of 50,000- and 100,000-document
+staged bulk builds, both passing with 3/3 crash proofs. The exact specimens
+(throughput, peak RSS, peak build disk, settled disk, live segment count) are
+recorded once, at their owner
+`engine/src/index/mod.rs::BULK_BUILD_CONFIGURATION_MEASUREMENT`, and in
+`engine/docs2/4_EVIDENCE/2026_07_29_jul26_8pm_7_stage6_bulk_constant_freeze.md`;
+they are deliberately not restated here, so there is one place to update when
+they are re-measured. The reference-locality (`i4i.4xlarge` NVMe) sweep that could
+justify a larger bulk-only budget is a paid AWS scale run held out of this batch
+by its no-AWS-provisioning posture and assigned to the named successor "paid
+reference ladder" batch; the single-machine scale/capacity row stays OPEN and no
+new Guaranteed or throughput claim is published. Prior revision (2026-07-28)
+follows verbatim.
+
+**Last updated:** 2026-07-28 — the admin-authenticated node-local
+`POST /1/migrations/bulk-replace` job API now streams NDJSON through the durable
+migration spool into the canonical fenced replacement owner. Its shared durable
+status/cancel contract states `single_node_only`, and admission fails closed with
+`503 migration_ha_unsupported` whenever replication peers are configured.
+`flapjack ingest --mode replace` is a pure client of that API: it uses bounded
+disk-backed normalization, streams the request body, polls durable job status,
+and reports only the server-confirmed committed count.
+Reconciliation against `origin/main` after the
 async replacement and status-count lanes. Authenticated async
 `overwrite=true` now ships through the existing fenced replacement/publication
 owner, with create→replace, durable ACK replay, cancel/failure recovery, and
@@ -47,7 +72,7 @@ capability track. IDs are stable identifiers, not priority rank.
 | ID | Work Item | Current State | Evidence / Owner |
 |----|-----------|---------------|------------------|
 | ING-1 | OSS ingestion CLI and control-plane progression | In progress. The shipped beta is a client-side `flapjack ingest` slice for JSON arrays, NDJSON files, and stdin, with upsert plus explicit object-ID deletes; it is not the parked hosted scheduler/worker control plane. | Runtime owner: `engine/flapjack-server/src/ingest.rs`; executable contract: `engine/flapjack-server/tests/ingest_cli_test.rs`; public bounds: `engine/docs2/FEATURES.md#flapjack-ingest-beta-bounds`. |
-| MIG-5 | Migration `overwrite=true` into an existing target | Shipped for node-local synchronous and authenticated async migration. Both paths route through the canonical fenced replacement owner after validating the committed journal generation, durable target epoch `E_new`, and promoted target `committed_seq = W`; HA import remains refused under MIG-7. Real-server synchronous evidence: [node-local overwrite summary](engine/docs2/evidence/2026_07_24_mig5b_node_local_overwrite/summary.md). Async known-answer evidence: [replacement/publication repair receipt](engine/docs2/4_EVIDENCE/2026_07_25_jul25_am_4_async_migration_replace_publication_repair_receipt.md). | Design reference: [ADR 0008](engine/docs2/3_IMPLEMENTATION/decisions/active/0008_mig5_overwrite_mutation_fence_design.md). Replacement owner: `engine/src/index/manager/lifecycle.rs`; publication owners: `engine/src/index/manager/publication.rs` and `engine/src/index/manager/publication/**`; mutation fence owners: `engine/src/index/manager/write.rs`, `engine/src/index/write_queue/`; migration routing owners: `engine/flapjack-http/src/handlers/migration/mod.rs`, `engine/flapjack-http/src/handlers/migration/import.rs`, `engine/flapjack-http/src/handlers/migration/job_runner.rs`. |
+| MIG-5 | Migration `overwrite=true` into an existing target | Shipped for node-local synchronous and authenticated async migration, including streamed NDJSON admission at `POST /1/migrations/bulk-replace`. All paths route through the canonical fenced replacement owner after validating the committed journal generation, durable target epoch `E_new`, and promoted target `committed_seq = W`; the bulk endpoint's receipt and status state `single_node_only`, and HA admission returns `503 migration_ha_unsupported`. Real-server synchronous evidence: [node-local overwrite summary](engine/docs2/evidence/2026_07_24_mig5b_node_local_overwrite/summary.md). Async known-answer evidence: [replacement/publication repair receipt](engine/docs2/4_EVIDENCE/2026_07_25_jul25_am_4_async_migration_replace_publication_repair_receipt.md). | Design reference: [ADR 0008](engine/docs2/3_IMPLEMENTATION/decisions/active/0008_mig5_overwrite_mutation_fence_design.md). Replacement owner: `engine/src/index/manager/lifecycle.rs`; publication owners: `engine/src/index/manager/publication.rs` and `engine/src/index/manager/publication/**`; mutation fence owners: `engine/src/index/manager/write.rs`, `engine/src/index/write_queue/`; migration routing owners: `engine/flapjack-http/src/handlers/migration/{bulk_replace,job_runner,spool}.rs`. |
 | MIG-6 | Async migration job contract (status / cancel / resume) | Partially shipped — **resume is the only remaining deferral.** `POST /1/migrations/algolia` admits create and fenced replacement asynchronously; `GET /1/migrations/algolia/{job_id}` reads the retained `MigrationPhaseRecord` and, only for terminal success, projects the durable import outcome (`settings_applied`, synonym/rule imported counts, and warnings). Cancel enforces owner identity and maps too-late requests to 409. Resume remains deliberately unavailable: no route consumes a durable checkpoint, so any served `resumable=true` claim is a defect. | Owners: `engine/flapjack-http/src/handlers/migration/mod.rs`, `engine/flapjack-http/src/handlers/migration/job_runner.rs`, `engine/flapjack-http/src/handlers/migration/spool.rs`; status-count contract: `engine/flapjack-http/src/handlers/migration/async_status_tests.rs`. |
 | MIG-7 | HA-converging import | Refused by design, not planned for v1. [ADR 0009](engine/docs2/3_IMPLEMENTATION/decisions/active/0009_mig7_ha_converging_import_design.md) records the corrected baseline: `move_index` / `move_index_with_publication` preserves the source oplog and `committed_seq`; the HA gap is node-local publication plus no durable cross-node convergence epoch, exclusive promotion rule, or peer adoption receipt. Reopen only with the costed pull-snapshot adoption design in ADR 0009. | `engine/src/index/manager/publication.rs`; refusal owner: `engine/flapjack-http/src/handlers/migration/mod.rs::admit_migration_request` |
 | RF-4 | Runbooks iteration | Open-ended operational follow-through. Continue refining runbooks from incident learnings. On 2026-07-21, the [Migration jobs](engine/docs2/3_IMPLEMENTATION/OPERATIONS.md#migration-jobs) operations runbook landed; no next RF-4 runbook candidate surfaced during the migration probe. | [`engine/docs2/3_IMPLEMENTATION/OPERATIONS.md`](engine/docs2/3_IMPLEMENTATION/OPERATIONS.md) |

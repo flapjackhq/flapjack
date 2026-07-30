@@ -28,9 +28,16 @@ mod scanner;
 #[cfg(test)]
 mod scanner_tests;
 pub use digest::canonical_tenant_tree_digest;
-pub(crate) use epoch::{capture_publication_epoch, try_validate_publication_epoch_admission};
+#[cfg(test)]
+pub(crate) use epoch::set_publication_epoch_open_lock_file_checkpoint_hook_for_test;
+pub(crate) use epoch::{
+    capture_publication_epoch, run_if_publication_admission_unfenced,
+    try_validate_publication_epoch_admission,
+};
 pub use epoch::{
-    compare_and_advance_publication_epoch, read_publication_epoch, PublicationEpoch,
+    compare_and_advance_publication_epoch, fence_publication_admission,
+    publication_admission_is_fenced, publication_epoch_paths_for_target_path,
+    read_publication_epoch, PublicationAdmissionFence, PublicationEpoch,
     PublicationEpochAdmissionError, PublicationEpochAdmissionGuard, PublicationEpochError,
     PublicationEpochFence, PublicationEpochPaths,
 };
@@ -45,10 +52,11 @@ pub(crate) use executor::{
     activate_publication_for_test, activate_publication_with_faults_for_test,
     activate_publication_with_fence_and_faults_for_test,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use fault::PublicationFaultPoint;
 #[cfg(test)]
 pub(crate) use fault::{
-    PublicationCheckpoint, PublicationFaultHook, PublicationFaultPoint, PublicationFaultScript,
-    PublicationOperation,
+    PublicationCheckpoint, PublicationFaultHook, PublicationFaultScript, PublicationOperation,
 };
 pub use fsops::{
     fsync_dir, fsync_file, reject_symlinked_managed_path, rename_with_transient_retry,
@@ -1144,10 +1152,15 @@ fn is_known_tenant_file(relative_path: &Path) -> bool {
         || relative_path == Path::new(super::config::RULES_FILE)
         || relative_path == Path::new(super::config::SYNONYMS_FILE)
         || relative_path == Path::new(crate::index::oplog::COMMITTED_SEQ_FILE)
+        || relative_path
+            == Path::new(
+                crate::index::write_queue::backpressure::WRITE_BACKPRESSURE_PAUSE_FILE_NAME,
+            )
 }
 
 fn starts_with_known_tenant_dir(relative_path: &Path) -> bool {
     relative_path.starts_with(crate::index::oplog::OPLOG_DIR)
+        || relative_path.starts_with(crate::index::version_store::VERSION_STORE_DIR)
         || relative_path.starts_with(crate::index::write_queue::PERSISTED_VECTORS_DIR)
         || relative_path.starts_with(crate::dictionaries::persistence::DICTIONARIES_DIR)
         || relative_path.starts_with(crate::recommend::rules::RECOMMEND_RULES_DIR)
@@ -1155,39 +1168,24 @@ fn starts_with_known_tenant_dir(relative_path: &Path) -> bool {
 
 /// NODE-LOCAL strict committed-sequence reader for MIG-5 watermark proof.
 ///
-/// Unlike `oplog::read_committed_seq`, which is intentionally fail-open (missing,
-/// unreadable, non-regular, or malformed all map to `0`), this reader fails
-/// closed: the sidecar must be a regular file holding exactly one parseable
-/// `u64`. Any other state is a `FlapjackError`, never a silent `0` that could
-/// masquerade as a proven watermark. Recovery keeps using the fail-open reader;
-/// only publication watermark proof uses this strict one.
+/// Unlike `oplog::read_committed_seq`, which is intentionally fail-open for
+/// compatibility, publication requires the checked owner to return a present
+/// value. Missing and invalid evidence can never masquerade as a proven
+/// watermark.
 pub(super) fn read_strict_committed_seq(tenant_path: &Path) -> Result<u64> {
-    let path = tenant_path.join(crate::index::oplog::COMMITTED_SEQ_FILE);
-    let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
-        invalid_publication(format!(
-            "committed_seq sidecar is not durable at {}: {error}",
-            path.display()
-        ))
-    })?;
-    if !metadata.file_type().is_file() {
-        return Err(invalid_publication(format!(
-            "committed_seq sidecar at {} is not a regular file",
-            path.display()
-        )));
-    }
-    let contents = std::fs::read_to_string(&path).map_err(|error| {
-        invalid_publication(format!(
-            "committed_seq sidecar at {} is unreadable: {error}",
-            path.display()
-        ))
-    })?;
-    contents.trim().parse::<u64>().map_err(|error| {
-        invalid_publication(format!(
-            "committed_seq sidecar at {} is not a u64 (got {:?}): {error}",
-            path.display(),
-            contents.trim()
-        ))
-    })
+    crate::index::oplog::read_checked_committed_seq(tenant_path)
+        .map_err(|error| {
+            invalid_publication(format!(
+                "committed_seq sidecar is invalid at {}: {error}",
+                tenant_path.display()
+            ))
+        })?
+        .ok_or_else(|| {
+            invalid_publication(format!(
+                "committed_seq sidecar is missing at {}",
+                tenant_path.display()
+            ))
+        })
 }
 
 pub(super) fn invalid_publication(message: impl Into<String>) -> FlapjackError {

@@ -153,6 +153,7 @@ All shipped capability status lives in the feature tables below (Search, Indexin
 |---|---|---|
 | Schemaless JSON upload | ✅ | Dual-field schema (search + filter), nested objects via dot notation |
 | `flapjack ingest` beta | ✅ | Streams JSON arrays, NDJSON files, and stdin-backed NDJSON/JSON into the authenticated `/1/indexes/{indexName}/batch` path. Upsert is the only durable mode; explicit `_action:"delete"` records delete by `objectID`. Source-side omissions do not delete target-only records. |
+| Atomic bulk-replace job API | ✅ Node-local | Admin-authenticated `POST /1/migrations/bulk-replace?indexName=...` streams NDJSON into the durable migration spool and publishes one replacement generation atomically. Durable status and cooperative cancellation use `/1/migrations/bulk-replace/{jobID}`. Admission returns `503 migration_ha_unsupported` whenever replication peers are configured. |
 | Single record CRUD | ✅ | |
 | Batch operations | ✅ | Up to 1000 ops, hybrid batching (10 ops or 100ms) |
 | Browse (full index scan) | ✅ | Cursor-based pagination |
@@ -169,7 +170,8 @@ All shipped capability status lives in the feature tables below (Search, Indexin
 - Writes: the CLI sends bounded batch envelopes to the same authenticated batch endpoint used by normal clients. Upsert is default and preserves target-only records. Deletes happen only when a source record carries the configured action field with `delete` or `deleteObject`.
 - Retries: one serialized envelope owns one `x-flapjack-idempotency-key` across retry attempts. The beta retries transport failures plus HTTP `429` and `503`, caps `Retry-After`, and reports `retries`, `last_retry_after_ms`, `confirmed_committed`, and `outcome_unknown`.
 - Recovery: when the JSON report shows `outcome_unknown > 0`, rerun the same source with the same idempotent object IDs after checking the destination. Do not treat unknown envelopes as confirmed writes.
-- Replace mode: `--mode replace` returns the typed `replace_not_supported` refusal and performs zero mutations until the mutation-fence/publication contract ships.
+- Replace mode: `--mode replace` normalizes the source into bounded temporary storage, streams it to the admin-authenticated bulk-replace job API, polls durable status to a terminal disposition, and reports the server-confirmed committed count. It is node-local only; peer-routed and older-server refusals remain typed `replace_not_supported` failures with zero confirmed mutations.
+- Bulk replace tuning: staged bulk builds use bulk-only writer and document-checkpoint knobs (`FLAPJACK_BULK_BUILD_WRITER_BUFFER_SIZE`, `FLAPJACK_BULK_BUILD_DOCUMENT_CHECKPOINT_INTERVAL`) without changing the online write queue defaults. Both are frozen at the behavior-preserving baseline (20,000,000-byte writer buffer, 1,000-document checkpoint) with a recorded local-locality gate measurement; raising the bulk-only budget requires a reference-locality (`i4i.4xlarge` NVMe) sweep that is a paid AWS scale run deferred to the named successor "paid reference ladder" batch.
 
 ## Index Settings
 

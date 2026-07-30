@@ -151,6 +151,9 @@ util/handoff_session*
 validation_cache.jsonl
 validation_summary.md
 
+# HA runtime evidence is preserved locally by the harness, not committed.
+engine/examples/ha-cluster/results/
+
 # scrai incremental scan caches — derived from source code; nothing outside scrai reads them
 .scrai/state.json
 .scrai/summaries.json

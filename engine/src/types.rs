@@ -325,6 +325,10 @@ pub struct TaskInfo {
     pub rejected_documents: Vec<DocFailure>,
     pub rejected_count: usize,
     pub created_at: std::time::SystemTime,
+    #[serde(skip)]
+    pub(crate) explicit_delete_term_count: usize,
+    #[serde(skip)]
+    pub(crate) document_write_delete_term_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -354,6 +358,8 @@ impl TaskInfo {
             rejected_documents: Vec::new(),
             rejected_count: 0,
             created_at: std::time::SystemTime::now(),
+            explicit_delete_term_count: 0,
+            document_write_delete_term_count: 0,
         }
     }
 }

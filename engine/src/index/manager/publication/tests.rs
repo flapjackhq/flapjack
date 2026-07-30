@@ -501,6 +501,25 @@ fn tenant_inventory_classifies_only_owner_known_artifacts() {
 }
 
 #[test]
+fn version_store_sidecar_is_classified_by_publication_policy() {
+    let inventory = TantivyManagedInventory::new(Vec::new()).unwrap();
+    let database = crate::index::version_store::VersionStore::database_path(Path::new(""));
+    let wal = database.with_file_name(format!(
+        "{}-wal",
+        database.file_name().unwrap().to_string_lossy()
+    ));
+
+    for relative in [database, wal] {
+        assert_eq!(
+            classify_tenant_relative_path(&relative, &inventory).unwrap(),
+            ArtifactDisposition::Preserve,
+            "{} must travel with its tenant generation",
+            relative.display()
+        );
+    }
+}
+
+#[test]
 fn external_inventory_fails_closed_and_excludes_global_experiments() {
     let known_qs = vec![
         PathBuf::from("products.json"),

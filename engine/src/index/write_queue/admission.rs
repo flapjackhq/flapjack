@@ -1,5 +1,6 @@
 use crate::error::{FlapjackError, Result};
 use crate::index::manager::publication::PublicationEpoch;
+use crate::index::version_store::VersionStore;
 use crate::index::write_queue::{WriteAction, WriteOp};
 use crate::types::{TaskInfo, TaskStatus};
 use serde::{Deserialize, Serialize};
@@ -502,6 +503,15 @@ impl WriteAdmissionStore {
         self.path.join(format!("{sequence:020}.json"))
     }
 
+    fn tenant_path(&self) -> Result<&Path> {
+        self.path.parent().ok_or_else(|| {
+            FlapjackError::Io(format!(
+                "write admission path {} has no tenant parent",
+                self.path.display()
+            ))
+        })
+    }
+
     fn sorted_record_paths(&self) -> Result<Vec<PathBuf>> {
         if !self.path.exists() {
             return Ok(Vec::new());
@@ -618,14 +628,83 @@ pub(crate) fn reconcile_records(
     applied_task_ids: &BTreeSet<String>,
 ) -> Result<Vec<WriteAdmissionRecord>> {
     let mut pending = Vec::new();
-    for record in store.load_records()? {
-        if applied_task_ids.contains(&record.task_id) {
+    let records = store.load_records()?;
+    let version_store = VersionStore::open(store.tenant_path()?)?;
+    for record in records {
+        let committed_by_task_id = applied_task_ids.contains(&record.task_id);
+        let committed_by_finalization = if committed_by_task_id {
+            true
+        } else {
+            version_store.contains_finalized_task(&record.task_id)?
+                || record_is_committed_by_version_store(&version_store, &record)?
+        };
+        if committed_by_finalization {
             store.remove_task(&record.task_id)?;
         } else {
             pending.push(record);
         }
     }
+    // Finalized-task rows are transient crash-reconciliation evidence. Every
+    // durable admission record has now either consumed its marker or remained
+    // pending, so any leftover marker belongs to an admission already removed
+    // before a crash and can be reclaimed safely.
+    version_store.clear_finalized_tasks()?;
     Ok(pending)
+}
+
+fn record_is_committed_by_version_store(
+    version_store: &VersionStore,
+    record: &WriteAdmissionRecord,
+) -> Result<bool> {
+    if record.actions.is_empty() {
+        return Ok(false);
+    }
+    for action in &record.actions {
+        if !action_is_committed_by_version_store(version_store, action)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn action_is_committed_by_version_store(
+    version_store: &VersionStore,
+    action: &WriteAction,
+) -> Result<bool> {
+    let Some(expected) = replicated_action_version(action) else {
+        return Ok(false);
+    };
+    let Some(actual) = version_store.get(expected.object_id)? else {
+        return Ok(false);
+    };
+    Ok(actual.timestamp_ms == expected.timestamp_ms
+        && actual.node_id == expected.node_id
+        && actual.tombstone == expected.tombstone)
+}
+
+struct ExpectedActionVersion<'a> {
+    object_id: &'a str,
+    timestamp_ms: u64,
+    node_id: &'a str,
+    tombstone: bool,
+}
+
+fn replicated_action_version(action: &WriteAction) -> Option<ExpectedActionVersion<'_>> {
+    match action {
+        WriteAction::UpsertWithOrigin { doc, origin } => Some(ExpectedActionVersion {
+            object_id: doc.id.as_str(),
+            timestamp_ms: origin.timestamp_ms,
+            node_id: &origin.node_id,
+            tombstone: false,
+        }),
+        WriteAction::DeleteWithOrigin { object_id, origin } => Some(ExpectedActionVersion {
+            object_id: object_id.as_str(),
+            timestamp_ms: origin.timestamp_ms,
+            node_id: &origin.node_id,
+            tombstone: true,
+        }),
+        _ => None,
+    }
 }
 
 /// Whether the pending publish for `ticket` has been marked durable by a completed

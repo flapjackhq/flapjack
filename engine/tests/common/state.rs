@@ -220,6 +220,7 @@ pub fn make_test_app_state(
         usage_persistence: None,
         geoip_reader: None,
         notification_service: None,
+        bulk_replace_max_bytes: 4 * 1024 * 1024 * 1024,
         migration_runner: Arc::new(flapjack_http::handlers::migration::MigrationJobRunner::new(
             manager,
             replication_manager,

@@ -3108,6 +3108,166 @@
         ]
       }
     },
+    "/1/migrations/bulk-replace": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Admit a node-local atomic replacement from an NDJSON request body.",
+        "operationId": "submit_bulk_replace_http",
+        "parameters": [
+          {
+            "name": "indexName",
+            "in": "query",
+            "description": "Target index to replace atomically",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "One JSON object per line; every object requires a non-empty objectID",
+          "content": {
+            "application/x-ndjson": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Node-local bulk replacement job admitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkReplaceReceipt"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid target index or NDJSON document"
+          },
+          "403": {
+            "description": "Missing, invalid, or non-admin API key"
+          },
+          "413": {
+            "description": "Bulk replacement payload exceeds the configured limit"
+          },
+          "429": {
+            "description": "Migration job capacity is exhausted"
+          },
+          "503": {
+            "description": "Bulk replacement is unavailable while replication peers are configured"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/1/migrations/bulk-replace/{job_id}": {
+      "get": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Return durable status for a node-local bulk replacement job.",
+        "operationId": "get_bulk_replace_status_http",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Bulk replacement job UUID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Durable bulk replacement job status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsyncMigrationStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid bulk replacement job UUID"
+          },
+          "404": {
+            "description": "No owned durable migration record is retained for the UUID"
+          },
+          "500": {
+            "description": "Migration status record could not be read"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/1/migrations/bulk-replace/{job_id}/cancel": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Request cooperative cancellation of a node-local bulk replacement job.",
+        "operationId": "cancel_bulk_replace_http",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Bulk replacement job UUID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Durable bulk replacement status after cancellation request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsyncMigrationStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid bulk replacement job UUID"
+          },
+          "404": {
+            "description": "No owned durable migration record is retained for the UUID"
+          },
+          "409": {
+            "description": "Cancellation arrived after the publication commit boundary"
+          },
+          "500": {
+            "description": "Migration cancellation could not be persisted"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
     "/1/migrations/privacy-scrub": {
       "post": {
         "tags": [
@@ -6943,6 +7103,16 @@
             "type": "string",
             "format": "uuid"
           },
+          "objectsImported": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MigrateCount"
+              }
+            ]
+          },
           "phase": {
             "$ref": "#/components/schemas/AsyncMigrationPhase"
           },
@@ -6972,12 +7142,28 @@
               }
             ]
           },
+          "targetIndex": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "terminalAt": {
             "type": [
               "string",
               "null"
             ],
             "format": "date-time"
+          },
+          "topology": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MigrationTopology"
+              }
+            ]
           },
           "updatedAt": {
             "type": "string",
@@ -7245,6 +7431,34 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "BulkReplaceReceipt": {
+        "type": "object",
+        "required": [
+          "jobID",
+          "targetIndex",
+          "topology",
+          "phase",
+          "disposition"
+        ],
+        "properties": {
+          "disposition": {
+            "$ref": "#/components/schemas/AsyncMigrationDisposition"
+          },
+          "jobID": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "phase": {
+            "$ref": "#/components/schemas/AsyncMigrationPhase"
+          },
+          "targetIndex": {
+            "type": "string"
+          },
+          "topology": {
+            "$ref": "#/components/schemas/MigrationTopology"
           }
         }
       },
@@ -9090,6 +9304,12 @@
             "type": "string"
           }
         }
+      },
+      "MigrationTopology": {
+        "type": "string",
+        "enum": [
+          "single_node_only"
+        ]
       },
       "MutationResponse": {
         "type": "object",

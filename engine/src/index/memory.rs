@@ -1,7 +1,8 @@
 use crate::error::{FlapjackError, Result};
+use std::collections::BTreeSet;
 use std::env;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 pub struct MemoryBudgetConfig {
@@ -54,7 +55,13 @@ pub struct MemoryBudget {
     max_concurrent_writers: usize,
     max_document_size_bytes: usize,
     active_writers: Arc<AtomicUsize>,
-    waiting_writers: Arc<AtomicUsize>,
+    writer_waiters: Arc<Mutex<WriterWaiterState>>,
+}
+
+#[derive(Default)]
+struct WriterWaiterState {
+    next_generation: u64,
+    active_generations: BTreeSet<u64>,
 }
 
 impl MemoryBudget {
@@ -65,7 +72,7 @@ impl MemoryBudget {
             max_concurrent_writers: max_writers,
             max_document_size_bytes: max_doc,
             active_writers: Arc::new(AtomicUsize::new(0)),
-            waiting_writers: Arc::new(AtomicUsize::new(0)),
+            writer_waiters: Arc::new(Mutex::new(WriterWaiterState::default())),
         }
     }
 
@@ -114,19 +121,50 @@ impl MemoryBudget {
     }
 
     pub(crate) fn register_writer_waiter(&self) -> WriterWaiter {
-        self.waiting_writers.fetch_add(1, Ordering::SeqCst);
+        let generation = {
+            let mut state = self
+                .writer_waiters
+                .lock()
+                .expect("writer waiter state poisoned");
+            let generation = state.next_generation;
+            state.next_generation += 1;
+            state.active_generations.insert(generation);
+            generation
+        };
         WriterWaiter {
-            waiting_writers: Arc::clone(&self.waiting_writers),
+            writer_waiters: Arc::clone(&self.writer_waiters),
+            generation,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn has_writer_waiters(&self) -> bool {
-        self.waiting_writers.load(Ordering::SeqCst) > 0
+        !self
+            .writer_waiters
+            .lock()
+            .expect("writer waiter state poisoned")
+            .active_generations
+            .is_empty()
+    }
+
+    pub(crate) fn writer_waiter_handoff(&self) -> Option<WriterWaiterHandoff> {
+        let state = self
+            .writer_waiters
+            .lock()
+            .expect("writer waiter state poisoned");
+        let max_generation = state.active_generations.iter().next_back().copied()?;
+        Some(WriterWaiterHandoff {
+            writer_waiters: Arc::clone(&self.writer_waiters),
+            max_generation,
+        })
     }
 
     pub fn reset_for_test(&self) {
         self.active_writers.store(0, Ordering::SeqCst);
-        self.waiting_writers.store(0, Ordering::SeqCst);
+        *self
+            .writer_waiters
+            .lock()
+            .expect("writer waiter state poisoned") = WriterWaiterState::default();
     }
 }
 
@@ -137,7 +175,7 @@ impl Clone for MemoryBudget {
             max_concurrent_writers: self.max_concurrent_writers,
             max_document_size_bytes: self.max_document_size_bytes,
             active_writers: Arc::clone(&self.active_writers),
-            waiting_writers: Arc::clone(&self.waiting_writers),
+            writer_waiters: Arc::clone(&self.writer_waiters),
         }
     }
 }
@@ -153,12 +191,35 @@ impl Drop for WriterGuard {
 }
 
 pub(crate) struct WriterWaiter {
-    waiting_writers: Arc<AtomicUsize>,
+    writer_waiters: Arc<Mutex<WriterWaiterState>>,
+    generation: u64,
 }
 
 impl Drop for WriterWaiter {
     fn drop(&mut self) {
-        self.waiting_writers.fetch_sub(1, Ordering::SeqCst);
+        self.writer_waiters
+            .lock()
+            .expect("writer waiter state poisoned")
+            .active_generations
+            .remove(&self.generation);
+    }
+}
+
+pub(crate) struct WriterWaiterHandoff {
+    writer_waiters: Arc<Mutex<WriterWaiterState>>,
+    max_generation: u64,
+}
+
+impl WriterWaiterHandoff {
+    pub(crate) fn is_complete(&self) -> bool {
+        let state = self
+            .writer_waiters
+            .lock()
+            .expect("writer waiter state poisoned");
+        !state
+            .active_generations
+            .iter()
+            .any(|generation| *generation <= self.max_generation)
     }
 }
 
@@ -258,6 +319,40 @@ mod tests {
             assert_eq!(budget.active_writers(), 1);
         }
         assert_eq!(budget.active_writers(), 0);
+    }
+
+    #[test]
+    fn writer_waiter_handoff_waits_past_timeout_for_all_prior_waiters_only() {
+        let budget = MemoryBudget::new(MemoryBudgetConfig {
+            max_concurrent_writers: 1,
+            ..Default::default()
+        });
+        let _active_writer = budget.acquire_writer().unwrap();
+        let first_waiter = budget.register_writer_waiter();
+        let second_waiter = budget.register_writer_waiter();
+        let handoff = budget
+            .writer_waiter_handoff()
+            .expect("handoff should capture registered waiters");
+
+        let later_waiter = budget.register_writer_waiter();
+        drop(first_waiter);
+        std::thread::sleep(std::time::Duration::from_millis(125));
+        assert!(
+            !handoff.is_complete(),
+            "handoff must keep the yielding tenant out beyond the old 100 ms poll while an older waiter remains"
+        );
+
+        drop(second_waiter);
+        assert!(
+            handoff.is_complete(),
+            "handoff must complete after all waiters registered before release retire"
+        );
+        assert!(
+            budget.has_writer_waiters(),
+            "later arrivals remain tracked without extending the captured handoff"
+        );
+        drop(later_waiter);
+        assert!(!budget.has_writer_waiters());
     }
 
     #[test]

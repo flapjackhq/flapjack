@@ -1,4 +1,5 @@
 use super::*;
+use crate::index::FacetCacheKey;
 
 mod plural_expansion;
 mod query_execution;
@@ -334,14 +335,8 @@ pub(super) fn execute_search_query(
         };
     let effective_sort: Option<&Sort> = sort.or(default_sort_owned.as_ref());
     let parser = build_search_parser(resolved, preprocessed, prepared, opts);
-    let (facet_cache_key, facet_result) = lookup_cached_facets(
-        manager,
-        tenant_id,
-        resolved,
-        prepared,
-        facets,
-        max_values_per_facet,
-    );
+    let (facet_cache_key, facet_result) =
+        lookup_cached_facets(manager, tenant_id, resolved, prepared, opts);
 
     let effective_around_lat_lng = effective_params.around_lat_lng.clone();
     let effective_around_radius = effective_params.around_radius.clone();
@@ -407,15 +402,18 @@ fn lookup_cached_facets(
     tenant_id: &str,
     resolved: &ResolvedSearch,
     prepared: &PreparedSearchFilters,
-    facets: Option<&[crate::types::FacetRequest]>,
-    max_values_per_facet: Option<usize>,
-) -> (Option<String>, Option<FacetResultCache>) {
-    let Some(facet_reqs) = facets else {
+    opts: &SearchOptions<'_>,
+) -> (Option<FacetCacheKey>, Option<FacetResultCache>) {
+    let Some(facet_reqs) = opts.facets else {
         return (None, None);
     };
 
-    // Cached entries are trimmed to maxValuesPerFacet and keyed without the
-    // value query — a facet-value search must always scan the full value set.
+    if !facet_cache_supports_options(opts) {
+        return (None, None);
+    };
+
+    // Cached entries are trimmed to maxValuesPerFacet. A facet-value search
+    // must always scan the full value set instead of using a trimmed entry.
     if facet_reqs
         .iter()
         .any(|req| req.value_query.as_deref().is_some_and(|q| !q.is_empty()))
@@ -423,15 +421,15 @@ fn lookup_cached_facets(
         return (None, None);
     }
 
-    let mut facet_keys: Vec<String> = facet_reqs.iter().map(|req| req.field.clone()).collect();
-    facet_keys.sort();
-    let filter_hash = prepared
-        .effective_params
-        .filter
-        .as_ref()
-        .map(|filter| format!("{filter:?}"))
-        .unwrap_or_default();
-    let cache_key = format!("{}:{}:{}", tenant_id, filter_hash, facet_keys.join(","));
+    let facet_fields = facet_reqs.iter().map(|req| req.field.clone()).collect();
+    let filter_identity = facet_cache_filter_identity(&prepared.effective_params);
+    let cache_key = FacetCacheKey::new(
+        tenant_id,
+        filter_identity,
+        prepared.query_text_rewritten.clone(),
+        facet_fields,
+    )
+    .with_max_values_per_facet(opts.max_values_per_facet);
     let cached_result = manager.facet_cache.get(&cache_key).and_then(|cached| {
         let (timestamp, count, facets_map, facets_stats, cached_exhaustive_facets) =
             cached.as_ref();
@@ -450,7 +448,7 @@ fn lookup_cached_facets(
         let executor = QueryExecutor::new(resolved.index.converter(), prepared.schema.clone())
             .with_settings(resolved.settings.clone())
             .with_query(prepared.query_text_rewritten.clone())
-            .with_max_values_per_facet(max_values_per_facet);
+            .with_max_values_per_facet(opts.max_values_per_facet);
         let trimmed = executor.trim_facet_counts(facets_map.clone(), facet_reqs);
         let trimmed_further = facets_map.iter().any(|(field, original_counts)| {
             let trimmed_len = trimmed.get(field).map(|values| values.len()).unwrap_or(0);
@@ -465,6 +463,85 @@ fn lookup_cached_facets(
     });
 
     (Some(cache_key), cached_result)
+}
+
+fn facet_cache_filter_identity(
+    effective_params: &crate::index::manager::query::EffectiveSearchParams,
+) -> String {
+    let filter = effective_params
+        .filter
+        .as_ref()
+        .map(|filter| format!("{filter:?}"));
+    if filter.is_none()
+        && effective_params.around_lat_lng.is_none()
+        && effective_params.around_radius.is_none()
+    {
+        return String::new();
+    }
+
+    serde_json::json!({
+        "filter": filter,
+        "aroundLatLng": effective_params.around_lat_lng,
+        "aroundRadius": effective_params.around_radius,
+    })
+    .to_string()
+}
+
+fn facet_cache_supports_options(opts: &SearchOptions<'_>) -> bool {
+    let SearchOptions {
+        filter: _,
+        sort: _,
+        limit: _,
+        offset: _,
+        facets: _,
+        distinct,
+        max_values_per_facet: _,
+        remove_stop_words,
+        ignore_plurals,
+        query_languages,
+        query_type,
+        typo_tolerance,
+        advanced_syntax,
+        remove_words_if_no_results,
+        advanced_syntax_features,
+        exact_on_single_word_query,
+        disable_exact_on_attributes,
+        enable_synonyms,
+        enable_rules,
+        rule_contexts,
+        restrict_searchable_attrs,
+        optional_filter_specs: _,
+        sum_or_filters_scores: _,
+        secured_hits_per_page_cap: _,
+        decompound_query,
+        settings_override,
+        dictionary_lookup_tenant,
+        all_query_words_optional,
+        relevancy_strictness: _,
+        min_proximity: _,
+        ranking_synonym_store: _,
+        ranking_plural_map: _,
+    } = opts;
+
+    distinct.is_none()
+        && remove_stop_words.is_none()
+        && ignore_plurals.is_none()
+        && query_languages.is_none()
+        && query_type.is_none()
+        && typo_tolerance.is_none()
+        && advanced_syntax.is_none()
+        && remove_words_if_no_results.is_none()
+        && advanced_syntax_features.is_none()
+        && exact_on_single_word_query.is_none()
+        && disable_exact_on_attributes.is_none()
+        && enable_synonyms.is_none()
+        && enable_rules.is_none()
+        && rule_contexts.is_none()
+        && restrict_searchable_attrs.is_none()
+        && decompound_query.is_none()
+        && settings_override.is_none()
+        && dictionary_lookup_tenant.is_none()
+        && !all_query_words_optional
 }
 
 fn sort_with_stage2_ranking(
@@ -816,7 +893,8 @@ mod tests {
         )
         .unwrap();
 
-        let expected_cache_key = format!("{tenant_id}::brand");
+        let expected_cache_key =
+            FacetCacheKey::new(tenant_id, "", query_text, vec!["brand".to_string()]);
         let cached_facets = HashMap::from([(
             "brand".to_string(),
             vec![crate::types::FacetCount {
@@ -836,14 +914,8 @@ mod tests {
             )),
         );
 
-        let (cache_key, cache_result) = lookup_cached_facets(
-            &manager,
-            tenant_id,
-            &resolved,
-            &prepared,
-            opts.facets,
-            opts.max_values_per_facet,
-        );
+        let (cache_key, cache_result) =
+            lookup_cached_facets(&manager, tenant_id, &resolved, &prepared, &opts);
 
         assert_eq!(cache_key, Some(expected_cache_key));
         let (count, facets, stats, exhaustive) = cache_result.expect("expected cached facets");
@@ -851,5 +923,105 @@ mod tests {
         assert_eq!(facets["brand"][0].path, "Nike");
         assert_eq!(stats, cached_stats);
         assert!(exhaustive);
+    }
+
+    #[tokio::test]
+    async fn lookup_cached_facets_separates_geo_rule_constraints() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = super::super::IndexManager::new(temp_dir.path());
+        let tenant_id = "tenant_lookup_cached_facets_geo";
+        manager.create_tenant(tenant_id).unwrap();
+
+        let facet_requests = vec![crate::types::FacetRequest {
+            field: "brand".to_string(),
+            path: "/brand".to_string(),
+            value_query: None,
+        }];
+        let opts = SearchOptions {
+            facets: Some(&facet_requests),
+            ..SearchOptions::default()
+        };
+        let query_text = "shoe";
+
+        let resolved = manager.resolve_search_settings(tenant_id, None).unwrap();
+        let preprocessed = preprocess_query(
+            tenant_id,
+            &resolved.settings,
+            query_text,
+            &opts,
+            manager.dictionary_manager(),
+        );
+        let mut cached_prepared = prepare_search_filters(
+            &manager,
+            tenant_id,
+            query_text,
+            &resolved,
+            &preprocessed,
+            &opts,
+        )
+        .unwrap();
+        cached_prepared.effective_params.around_lat_lng = Some("40.7128,-74.0060".to_string());
+        cached_prepared.effective_params.around_radius = Some(serde_json::json!(1000));
+
+        let cached_key = FacetCacheKey::new(
+            tenant_id,
+            facet_cache_filter_identity(&cached_prepared.effective_params),
+            query_text,
+            vec!["brand".to_string()],
+        );
+        manager.facet_cache.insert(
+            cached_key.clone(),
+            Arc::new((
+                std::time::Instant::now(),
+                1,
+                HashMap::from([(
+                    "brand".to_string(),
+                    vec![crate::types::FacetCount {
+                        path: "Near".to_string(),
+                        count: 1,
+                    }],
+                )]),
+                HashMap::new(),
+                true,
+            )),
+        );
+
+        let mut different_geo_prepared = prepare_search_filters(
+            &manager,
+            tenant_id,
+            query_text,
+            &resolved,
+            &preprocessed,
+            &opts,
+        )
+        .unwrap();
+        different_geo_prepared.effective_params.around_lat_lng =
+            Some("34.0522,-118.2437".to_string());
+        different_geo_prepared.effective_params.around_radius = Some(serde_json::json!(5000));
+
+        let (hit_key, hit_result) =
+            lookup_cached_facets(&manager, tenant_id, &resolved, &cached_prepared, &opts);
+        assert_eq!(hit_key, Some(cached_key.clone()));
+        assert!(
+            hit_result.is_some(),
+            "matching geo constraints must reuse the warm entry"
+        );
+
+        let (miss_key, miss_result) = lookup_cached_facets(
+            &manager,
+            tenant_id,
+            &resolved,
+            &different_geo_prepared,
+            &opts,
+        );
+        assert_ne!(
+            miss_key,
+            Some(cached_key),
+            "geo-constrained searches must not share a facet cache key"
+        );
+        assert!(
+            miss_result.is_none(),
+            "a warm cache entry from one geo scope must not satisfy a different geo scope"
+        );
     }
 }

@@ -1,5 +1,6 @@
 use super::*;
 use flapjack::index::oplog::OpLogEntry;
+use flapjack::index::version_store::{VersionRecord, VersionStore};
 use flapjack::IndexManager;
 use std::path::Path;
 use tempfile::TempDir;
@@ -9,7 +10,7 @@ use tempfile::TempDir;
 /// # Arguments
 ///
 /// * `seq` - Sequence number.
-/// * `ts` - Timestamp in milliseconds (used for LWW conflict resolution).
+/// * `ts` - Timestamp in milliseconds (used for conflict resolution).
 /// * `node` - Originating node ID.
 /// * `tenant` - Tenant/index name.
 /// * `id` - Document object ID.
@@ -257,6 +258,20 @@ async fn wait_for_field(
     );
 }
 
+/// Wait until every queued write reaches a terminal task state, which the write
+/// queue marks only after `finalize_committed_batch` has written the durable
+/// VersionStore and published the Tantivy searcher. Assertions that cover the
+/// complete finalization contract drain here rather than synchronizing on only
+/// one observable side effect.
+async fn wait_for_finalization(manager: &IndexManager) {
+    assert!(
+        manager
+            .wait_for_pending_tasks(std::time::Duration::from_secs(5))
+            .await,
+        "queued writes must finalize before reading the durable version store"
+    );
+}
+
 // ── Basic apply ──
 
 #[tokio::test]
@@ -328,11 +343,95 @@ async fn apply_ops_clear_index_rejects_path_traversal_name() {
     );
 }
 
-// ── LWW: newer timestamp wins ──
+// ── Durable versions: newer timestamp wins ──
 
-/// Verify that a newer upsert (higher timestamp) wins over an older upsert for the same document via LWW conflict resolution.
+#[cfg(feature = "fault-injection")]
 #[tokio::test]
-async fn lww_newer_timestamp_overwrites_older() {
+async fn replicated_commit_failure_does_not_advance_version() {
+    use flapjack::types::TaskStatus;
+    use std::collections::HashSet;
+
+    let tmp = TempDir::new().unwrap();
+    let tenant_id = "replicated_commit_failure";
+    let manager = IndexManager::new_with_node_id(tmp.path(), "node-a");
+    manager.create_tenant(tenant_id).unwrap();
+    let original_task_ids: HashSet<String> = manager
+        .tenant_tasks_snapshot_for_test(tenant_id)
+        .into_iter()
+        .map(|task| task.id)
+        .collect();
+    let replicated = make_upsert_op(1, 1000, "node-b", tenant_id, "doc-1", "RetryMustLand");
+
+    let _commit_failure = manager.fail_next_commit_for_test(tenant_id);
+    let error = apply_ops_to_manager(&manager, tenant_id, std::slice::from_ref(&replicated))
+        .await
+        .expect_err("replication must not acknowledge a failed durable commit");
+    assert!(
+        error.contains("injected write-queue commit failure"),
+        "replication refusal must expose the terminal commit failure: {error}"
+    );
+    assert!(
+        manager
+            .wait_for_pending_tasks(std::time::Duration::from_secs(5))
+            .await,
+        "failed replicated commit must reach a terminal task state"
+    );
+
+    let tasks_after_failure = manager.tenant_tasks_snapshot_for_test(tenant_id);
+    let failed_tasks: Vec<_> = tasks_after_failure
+        .iter()
+        .filter(|task| !original_task_ids.contains(&task.id))
+        .collect();
+    assert_eq!(
+        failed_tasks.len(),
+        1,
+        "the failed attempt must create exactly one observable task"
+    );
+    assert!(
+        matches!(&failed_tasks[0].status, TaskStatus::Failed(message) if message.contains("injected write-queue commit failure")),
+        "the newly created task must reach the expected Failed state: {:?}",
+        failed_tasks[0].status
+    );
+    assert_eq!(
+        manager.tenant_doc_count(tenant_id),
+        Some(0),
+        "failed commit must leave the exact document count unchanged"
+    );
+    assert!(
+        manager.get_document(tenant_id, "doc-1").unwrap().is_none(),
+        "failed commit must not publish the replicated body"
+    );
+    assert_eq!(
+        manager.get_object_version(tenant_id, "doc-1").unwrap(),
+        None,
+        "failed commit must not publish a durable conflict version"
+    );
+
+    manager.graceful_shutdown().await;
+    drop(manager);
+
+    let restarted = IndexManager::new_with_node_id(tmp.path(), "node-a");
+    let document = restarted
+        .get_document(tenant_id, "doc-1")
+        .unwrap()
+        .expect("restart recovery must replay the durably admitted document");
+    assert!(
+        matches!(
+            document.fields.get("name"),
+            Some(flapjack::types::FieldValue::Text(value)) if value == "RetryMustLand"
+        ),
+        "restart recovery must publish the exact replicated body"
+    );
+    assert_eq!(restarted.tenant_doc_count(tenant_id), Some(1));
+    assert_eq!(
+        restarted.get_object_version(tenant_id, "doc-1").unwrap(),
+        Some(VersionRecord::new(1000, "node-b", false, 1))
+    );
+}
+
+/// Verify that a newer upsert wins over an older upsert for the same document.
+#[tokio::test]
+async fn durable_version_newer_timestamp_overwrites_older() {
     let tmp = TempDir::new().unwrap();
     let manager = IndexManager::new(tmp.path());
 
@@ -349,8 +448,12 @@ async fn lww_newer_timestamp_overwrites_older() {
         .await
         .unwrap();
     wait_for_field(&manager, "t1", "doc1", "name", "NewerAlice").await;
+    // Establish the newer version durably before the conflicting op is admitted:
+    // admission reads the durable VersionStore, which finalization writes only
+    // after the searcher is refreshed.
+    wait_for_finalization(&manager).await;
 
-    // Apply op at ts=1000 (older) — REJECTED by LWW immediately, no async work
+    // Apply op at ts=1000 (older) — rejected before any async work is queued.
     let op_older = vec![make_upsert_op(
         2,
         1000,
@@ -370,11 +473,50 @@ async fn lww_newer_timestamp_overwrites_older() {
         "newer write should win; got: {:?}",
         doc.fields.get("name")
     );
+    assert_eq!(manager.tenant_doc_count("t1"), Some(1));
+    assert_eq!(
+        manager.get_object_version("t1", "doc1").unwrap(),
+        Some(VersionRecord::new(2000, "node-a", false, 1))
+    );
+}
+
+#[tokio::test]
+async fn durable_version_read_failure_refuses_replicated_document() {
+    let tmp = TempDir::new().unwrap();
+    let manager = IndexManager::new(tmp.path());
+    manager.create_tenant("t1").unwrap();
+    let version_store_directory = tmp.path().join("t1").join("version_store");
+    if version_store_directory.exists() {
+        std::fs::remove_dir_all(&version_store_directory).unwrap();
+    }
+    std::fs::write(&version_store_directory, b"not a directory").unwrap();
+
+    let error = apply_ops_to_manager(
+        &manager,
+        "t1",
+        &[make_upsert_op(
+            1,
+            1000,
+            "node-a",
+            "t1",
+            "doc1",
+            "MustNotQueue",
+        )],
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        error.contains("failed to read durable object version"),
+        "storage failure must be surfaced as a replication refusal: {error}"
+    );
+    assert_eq!(manager.tenant_doc_count("t1"), Some(0));
+    assert!(manager.get_document("t1", "doc1").unwrap().is_none());
 }
 
 /// Verify that when a batch contains both a newer and an older upsert for the same document, only the newer version is persisted.
 #[tokio::test]
-async fn lww_older_upsert_does_not_overwrite_newer() {
+async fn replicated_batch_with_out_of_order_tuples_keeps_the_newest_body() {
     let tmp = TempDir::new().unwrap();
     let manager = IndexManager::new(tmp.path());
 
@@ -388,19 +530,28 @@ async fn lww_older_upsert_does_not_overwrite_newer() {
     wait_for_field(&manager, "t1", "doc1", "name", "Final").await;
 
     let doc = manager.get_document("t1", "doc1").unwrap().unwrap();
-    let name = doc.fields.get("name");
     assert!(
-        matches!(name, Some(flapjack::types::FieldValue::Text(s)) if s == "Final"),
+        matches!(
+            doc.fields.get("name"),
+            Some(flapjack::types::FieldValue::Text(value)) if value == "Final"
+        ),
         "stale op should not overwrite newer; got: {:?}",
         doc.fields.get("name")
     );
+    assert_eq!(manager.tenant_doc_count("t1"), Some(1));
+    wait_for_finalization(&manager).await;
+    let versions = VersionStore::open(&tmp.path().join("t1")).unwrap();
+    assert_eq!(
+        versions.get("doc1").unwrap(),
+        Some(VersionRecord::new(5000, "node-a", false, 1))
+    );
 }
 
-// ── LWW: tie-break by node_id ──
+// ── Durable versions: tie-break by node_id ──
 
-/// Verify that when two upserts share the same timestamp, the one with the lexicographically higher node ID wins the LWW tie-break.
+/// Verify that equal timestamps are resolved by lexicographically ordered node ID.
 #[tokio::test]
-async fn lww_same_timestamp_higher_node_id_wins() {
+async fn durable_version_same_timestamp_higher_node_id_wins() {
     let tmp = TempDir::new().unwrap();
     let manager = IndexManager::new(tmp.path());
 
@@ -408,6 +559,8 @@ async fn lww_same_timestamp_higher_node_id_wins() {
     let op_z = vec![make_upsert_op(1, 1000, "z-node", "t1", "doc1", "ZNode")];
     apply_ops_to_manager(&manager, "t1", &op_z).await.unwrap();
     wait_for_field(&manager, "t1", "doc1", "name", "ZNode").await;
+    // Establish z-node's version durably before the tie-break op is admitted.
+    wait_for_finalization(&manager).await;
 
     // "a-node" at same ts=1000 — REJECTED (z > a lexicographically), no async work
     let op_a = vec![make_upsert_op(2, 1000, "a-node", "t1", "doc1", "ANode")];
@@ -420,13 +573,18 @@ async fn lww_same_timestamp_higher_node_id_wins() {
         "z-node (higher lexicographic) should win tie-break; got: {:?}",
         doc.fields.get("name")
     );
+    assert_eq!(manager.tenant_doc_count("t1"), Some(1));
+    assert_eq!(
+        manager.get_object_version("t1", "doc1").unwrap(),
+        Some(VersionRecord::new(1000, "z-node", false, 1))
+    );
 }
 
-// ── LWW: stale delete is rejected ──
+// ── Durable versions: stale delete is rejected ──
 
-/// Verify that a delete with an older timestamp is rejected by LWW and does not remove a document written with a newer timestamp.
+/// Verify that an older delete does not remove a document written by a newer upsert.
 #[tokio::test]
-async fn lww_stale_delete_does_not_remove_newer_upsert() {
+async fn durable_version_stale_delete_does_not_remove_newer_upsert() {
     let tmp = TempDir::new().unwrap();
     let manager = IndexManager::new(tmp.path());
 
@@ -434,20 +592,28 @@ async fn lww_stale_delete_does_not_remove_newer_upsert() {
     let upsert = vec![make_upsert_op(1, 2000, "node-a", "t1", "doc1", "Alice")];
     apply_ops_to_manager(&manager, "t1", &upsert).await.unwrap();
     wait_for_doc_exists(&manager, "t1", "doc1").await;
+    // Establish the newer upsert's version durably before the stale delete is
+    // admitted: the delete gate reads the durable VersionStore.
+    wait_for_finalization(&manager).await;
 
-    // Try to delete with stale ts=1000 — REJECTED immediately by LWW, no async work
+    // Try to delete with stale ts=1000 — rejected before any async work is queued.
     let del = vec![make_delete_op(2, 1000, "node-b", "t1", "doc1")];
     apply_ops_to_manager(&manager, "t1", &del).await.unwrap();
 
     let doc = manager.get_document("t1", "doc1").unwrap();
     assert!(doc.is_some(), "stale delete should not remove a newer doc");
+    assert_eq!(manager.tenant_doc_count("t1"), Some(1));
+    assert_eq!(
+        manager.get_object_version("t1", "doc1").unwrap(),
+        Some(VersionRecord::new(2000, "node-a", false, 1))
+    );
 }
 
-// ── LWW: same-node ops always apply in sequence ──
+// ── Durable versions: same-node ops apply in sequence ──
 
 /// Verify that sequential upserts from the same node with increasing timestamps are all applied in order.
 #[tokio::test]
-async fn lww_same_node_sequential_ops_always_apply() {
+async fn durable_version_same_node_sequential_ops_always_apply() {
     let tmp = TempDir::new().unwrap();
     let manager = IndexManager::new(tmp.path());
 
@@ -468,15 +634,19 @@ async fn lww_same_node_sequential_ops_always_apply() {
         "sequential ops from same node should apply in order; got: {:?}",
         doc.fields.get("name")
     );
+    assert_eq!(manager.tenant_doc_count("t1"), Some(1));
+    wait_for_finalization(&manager).await;
+    assert_eq!(
+        manager.get_object_version("t1", "doc1").unwrap(),
+        Some(VersionRecord::new(2000, "node-a", false, 2))
+    );
 }
 
-// ── LWW: primary write blocks stale replicated op ──
-// This test validates the fix for the "known limitation" from session 23:
-// primary-written docs must populate lww_map so stale replicated ops are rejected.
+// ── Durable version: primary write blocks stale replicated op ──
 
-/// Verify that a document written via the primary path populates the LWW map, causing a stale replicated upsert with an older timestamp to be rejected.
+/// Verify that a primary write publishes durable conflict evidence which blocks an older replicated upsert.
 #[tokio::test]
-async fn lww_primary_write_blocks_stale_replicated_op() {
+async fn durable_version_primary_write_blocks_stale_replicated_op() {
     let tmp = TempDir::new().unwrap();
     let manager = IndexManager::new(tmp.path());
 
@@ -495,20 +665,27 @@ async fn lww_primary_write_blocks_stale_replicated_op() {
     manager.create_tenant("t1").unwrap();
     manager.add_documents_sync("t1", vec![doc]).await.unwrap();
 
-    // Confirm lww_map was populated by the write_queue
-    let lww = manager.get_lww("t1", "doc1");
-    assert!(
-        lww.is_some(),
-        "primary write must populate lww_map; got None"
+    let primary_entry = manager
+        .get_or_create_oplog("t1")
+        .unwrap()
+        .read_since(0)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.op_type == "upsert")
+        .expect("primary write must append an upsert");
+    let primary_version = VersionRecord::new(
+        primary_entry.timestamp_ms,
+        &primary_entry.node_id,
+        false,
+        primary_entry.seq,
     );
-    let (primary_ts, _) = lww.unwrap();
-    assert!(
-        primary_ts > 0,
-        "primary_ts should be a real system timestamp"
+    assert_eq!(
+        manager.get_object_version("t1", "doc1").unwrap(),
+        Some(primary_version.clone())
     );
 
     // Now try to replicate a stale op with ts=1 (much older than primary write).
-    // LWW rejects this before queuing — no async work, result is immediately visible.
+    // Durable conflict admission rejects this before queuing any async work.
     let stale_op = vec![make_upsert_op(99, 1, "remote-node", "t1", "doc1", "Stale")];
     apply_ops_to_manager(&manager, "t1", &stale_op)
         .await
@@ -522,13 +699,18 @@ async fn lww_primary_write_blocks_stale_replicated_op() {
         "stale replicated op must not overwrite primary write; got: {:?}",
         name
     );
+    assert_eq!(manager.tenant_doc_count("t1"), Some(1));
+    assert_eq!(
+        manager.get_object_version("t1", "doc1").unwrap(),
+        Some(primary_version)
+    );
 }
 
-// ── LWW: primary delete blocks stale replicated upsert ──
+// ── Durable version: primary delete blocks stale replicated upsert ──
 
-/// Verify that a primary-path delete populates the LWW map, preventing a stale replicated upsert from reviving the deleted document.
+/// Verify that a primary delete publishes a durable tombstone which blocks an older replicated upsert.
 #[tokio::test]
-async fn lww_primary_delete_blocks_stale_replicated_upsert() {
+async fn durable_version_primary_delete_blocks_stale_replicated_upsert() {
     let tmp = TempDir::new().unwrap();
     let manager = IndexManager::new(tmp.path());
 
@@ -553,11 +735,26 @@ async fn lww_primary_delete_blocks_stale_replicated_upsert() {
         .await
         .unwrap();
 
-    // Confirm lww_map records the delete timestamp
-    let lww = manager.get_lww("t1", "doc1");
-    assert!(lww.is_some(), "primary delete must populate lww_map");
+    let delete_entry = manager
+        .get_or_create_oplog("t1")
+        .unwrap()
+        .read_since(0)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.op_type == "delete")
+        .expect("primary delete must append a tombstone");
+    let delete_version = VersionRecord::new(
+        delete_entry.timestamp_ms,
+        &delete_entry.node_id,
+        true,
+        delete_entry.seq,
+    );
+    assert_eq!(
+        manager.get_object_version("t1", "doc1").unwrap(),
+        Some(delete_version.clone())
+    );
 
-    // Now try to replicate a stale upsert with ts=1 — REJECTED by LWW immediately.
+    // Now try to replicate a stale upsert with ts=1 — rejected immediately.
     // No async work queued; result is visible without waiting.
     let stale_upsert = vec![make_upsert_op(
         99,
@@ -576,20 +773,23 @@ async fn lww_primary_delete_blocks_stale_replicated_upsert() {
         doc.is_none(),
         "stale replicated upsert must not revive a primary-deleted doc"
     );
+    assert_eq!(manager.tenant_doc_count("t1"), Some(0));
+    assert_eq!(
+        manager.get_object_version("t1", "doc1").unwrap(),
+        Some(delete_version)
+    );
 }
 
-// ── LWW: lww_map rebuilt from oplog on restart (P3) ──
-// Without P3: after restart lww_map is empty → stale replicated ops bypass LWW
-// With P3:    recover_from_oplog rebuilds lww_map → stale ops correctly rejected
+// ── Durable version survives restart ──
 
-/// Verify that after a crash-style restart, the LWW map is rebuilt from the oplog so a stale replicated upsert with an older timestamp is correctly rejected.
+/// Verify that a durable version survives restart and blocks an older replicated upsert.
 #[tokio::test]
-async fn lww_map_rebuilt_from_oplog_blocks_stale_op_after_restart() {
+async fn durable_version_blocks_stale_op_after_restart() {
     let tmp = TempDir::new().unwrap();
     let base = tmp.path().to_path_buf();
 
-    // PHASE 1: Primary write — establishes LWW state in oplog
-    let primary_ts;
+    // PHASE 1: Primary write establishes durable version state through the oplog.
+    let primary_version;
     {
         let manager = IndexManager::new(&base);
         manager.create_tenant("t_restart").unwrap();
@@ -609,29 +809,38 @@ async fn lww_map_rebuilt_from_oplog_blocks_stale_op_after_restart() {
             .await
             .unwrap();
 
-        // Capture oplog timestamp — this is what LWW must be rebuilt from
+        // Capture the oplog tuple that recovery must preserve.
         let oplog = manager.get_or_create_oplog("t_restart").unwrap();
         let ops = oplog.read_since(0).unwrap();
         let upsert_op = ops
             .iter()
             .find(|o| o.op_type == "upsert")
             .expect("should have upsert in oplog after primary write");
-        primary_ts = upsert_op.timestamp_ms;
-        assert!(primary_ts > 0, "oplog should record a real timestamp");
+        assert!(
+            upsert_op.timestamp_ms > 0,
+            "oplog should record a real timestamp"
+        );
+        primary_version = VersionRecord::new(
+            upsert_op.timestamp_ms,
+            &upsert_op.node_id,
+            false,
+            upsert_op.seq,
+        );
+        assert_eq!(
+            manager.get_object_version("t_restart", "doc1").unwrap(),
+            Some(primary_version.clone())
+        );
 
         manager.graceful_shutdown().await;
     }
 
-    // PHASE 2: Restart (new IndexManager = fresh empty lww_map until P3 fix)
+    // PHASE 2: Restart and consult the durable version owner.
     {
         let manager = IndexManager::new(&base);
 
-        // Try to apply a stale replicated op (1ms before the primary write).
-        // With P3: lww_map rebuilt from oplog → REJECTED immediately.
-        // Without P3: would be accepted (queued async) — we poll briefly to detect that case.
         let stale_op = vec![make_upsert_op(
             99,
-            primary_ts.saturating_sub(1),
+            primary_version.timestamp_ms.saturating_sub(1),
             "remote-node",
             "t_restart",
             "doc1",
@@ -641,10 +850,8 @@ async fn lww_map_rebuilt_from_oplog_blocks_stale_op_after_restart() {
             .await
             .unwrap();
 
-        // Poll briefly — if P3 is broken the write queue would commit "StaleOverwrite"
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-        // P3: lww_map rebuilt from oplog → stale op rejected → "Original" survives
         let fetched = manager.get_document("t_restart", "doc1").unwrap();
         assert!(
             fetched.is_some(),
@@ -653,25 +860,28 @@ async fn lww_map_rebuilt_from_oplog_blocks_stale_op_after_restart() {
         let name = fetched.unwrap().fields.get("name").cloned();
         assert!(
             matches!(&name, Some(flapjack::types::FieldValue::Text(s)) if s == "Original"),
-            "stale replicated op must not overwrite after restart; lww_map must be rebuilt from oplog. got: {:?}",
+            "stale replicated op must not overwrite after restart; got: {:?}",
             name
+        );
+        assert_eq!(manager.tenant_doc_count("t_restart"), Some(1));
+        assert_eq!(
+            manager.get_object_version("t_restart", "doc1").unwrap(),
+            Some(primary_version)
         );
 
         manager.graceful_shutdown().await;
     }
 }
 
-// ── LWW: lww_map rebuilt for normal restart (no uncommitted ops) ──
-// Covers the case where committed_seq is current (normal shutdown, not crash).
-// recover_from_oplog must still rebuild lww_map even when there's nothing to replay.
+// ── Durable version survives a clean restart ──
 
-/// Verify that after a clean shutdown (no uncommitted ops), restarting rebuilds the LWW map from the oplog so stale replicated ops are still rejected.
+/// Verify that a clean restart retains durable conflict evidence with no replay tail.
 #[tokio::test]
-async fn lww_map_rebuilt_on_normal_restart_no_uncommitted_ops() {
+async fn durable_version_survives_normal_restart_without_uncommitted_ops() {
     let tmp = TempDir::new().unwrap();
     let base = tmp.path().to_path_buf();
 
-    let primary_ts;
+    let primary_version;
     {
         let manager = IndexManager::new(&base);
         manager.create_tenant("t_normal_restart").unwrap();
@@ -693,25 +903,35 @@ async fn lww_map_rebuilt_on_normal_restart_no_uncommitted_ops() {
 
         let oplog = manager.get_or_create_oplog("t_normal_restart").unwrap();
         let ops = oplog.read_since(0).unwrap();
-        primary_ts = ops
+        let primary_entry = ops
             .iter()
             .find(|o| o.op_type == "upsert")
-            .map(|o| o.timestamp_ms)
-            .unwrap_or(0);
-        assert!(primary_ts > 0);
+            .expect("primary upsert must be retained");
+        assert!(primary_entry.timestamp_ms > 0);
+        primary_version = VersionRecord::new(
+            primary_entry.timestamp_ms,
+            &primary_entry.node_id,
+            false,
+            primary_entry.seq,
+        );
+        assert_eq!(
+            manager
+                .get_object_version("t_normal_restart", "docA")
+                .unwrap(),
+            Some(primary_version.clone())
+        );
 
         // Normal clean shutdown: committed_seq is updated, no uncommitted ops
         manager.graceful_shutdown().await;
     }
 
-    // Restart: committed_seq is current → no document replay needed.
-    // But lww_map must still be rebuilt so stale ops are rejected.
+    // Restart: committed_seq is current, so no document replay is needed.
     {
         let manager = IndexManager::new(&base);
 
         let stale_op = vec![make_upsert_op(
             99,
-            primary_ts.saturating_sub(1),
+            primary_version.timestamp_ms.saturating_sub(1),
             "remote-node",
             "t_normal_restart",
             "docA",
@@ -721,8 +941,6 @@ async fn lww_map_rebuilt_on_normal_restart_no_uncommitted_ops() {
             .await
             .unwrap();
 
-        // Stale upsert is rejected by LWW (P3 correct). If P3 were broken the write
-        // queue would commit "ShouldBeRejected" asynchronously — wait briefly to detect that.
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         let fetched = manager.get_document("t_normal_restart", "docA").unwrap();
@@ -733,22 +951,27 @@ async fn lww_map_rebuilt_on_normal_restart_no_uncommitted_ops() {
             "stale op must be rejected even after clean shutdown restart; got: {:?}",
             name
         );
+        assert_eq!(
+            manager
+                .get_object_version("t_normal_restart", "docA")
+                .unwrap(),
+            Some(primary_version)
+        );
 
         manager.graceful_shutdown().await;
     }
 }
 
-/// Verify that restart rebuilds LWW state before any replay early-return path,
-/// so a tenant with current committed_seq still has in-memory LWW entries.
+/// Verify that restart exposes the committed durable version before any replay early return.
 #[tokio::test]
-async fn lww_map_rebuilt_populates_state_when_committed_seq_is_current() {
+async fn durable_version_is_readable_when_committed_seq_is_current() {
     let tmp = TempDir::new().unwrap();
     let base = tmp.path().to_path_buf();
 
-    let (primary_ts, primary_node_id);
+    let primary_version;
     {
         let manager = IndexManager::new(&base);
-        manager.create_tenant("t_lww_populate").unwrap();
+        manager.create_tenant("t_version_populate").unwrap();
         let doc = flapjack::types::Document {
             id: "doc1".to_string(),
             fields: {
@@ -761,48 +984,47 @@ async fn lww_map_rebuilt_populates_state_when_committed_seq_is_current() {
             },
         };
         manager
-            .add_documents_sync("t_lww_populate", vec![doc])
+            .add_documents_sync("t_version_populate", vec![doc])
             .await
             .unwrap();
 
-        let oplog = manager.get_or_create_oplog("t_lww_populate").unwrap();
+        let oplog = manager.get_or_create_oplog("t_version_populate").unwrap();
         let upsert = oplog
             .read_since(0)
             .unwrap()
             .into_iter()
             .find(|entry| entry.op_type == "upsert")
             .expect("expected upsert in oplog");
-        primary_ts = upsert.timestamp_ms;
-        primary_node_id = upsert.node_id;
+        primary_version =
+            VersionRecord::new(upsert.timestamp_ms, upsert.node_id, false, upsert.seq);
 
         manager.graceful_shutdown().await;
     }
 
     {
         let manager = IndexManager::new(&base);
-        let _ = manager.get_document("t_lww_populate", "doc1").unwrap();
+        let _ = manager.get_document("t_version_populate", "doc1").unwrap();
 
-        let rebuilt = manager
-            .get_lww("t_lww_populate", "doc1")
-            .expect("lww_map should be rebuilt on restart");
-        assert_eq!(rebuilt.0, primary_ts);
-        assert_eq!(rebuilt.1, primary_node_id);
+        assert_eq!(
+            manager
+                .get_object_version("t_version_populate", "doc1")
+                .unwrap(),
+            Some(primary_version)
+        );
 
         manager.graceful_shutdown().await;
     }
 }
 
-// ── LWW: lww_map rebuild blocks stale DELETE after restart (P3) ──
-// Variant of the P3 crash test but with a stale DELETE instead of a stale UPSERT.
-// A stale replicated delete arriving after restart must NOT remove a newer primary write.
+// ── Durable version blocks stale DELETE after restart ──
 
-/// Verify that after restart the rebuilt LWW map blocks a stale replicated delete from removing a document that was written with a newer timestamp before shutdown.
+/// Verify that after restart durable conflict evidence blocks an older replicated delete.
 #[tokio::test]
-async fn lww_map_rebuilt_from_oplog_blocks_stale_delete_after_restart() {
+async fn durable_version_blocks_stale_delete_after_restart() {
     let tmp = TempDir::new().unwrap();
     let base = tmp.path().to_path_buf();
 
-    let primary_ts;
+    let primary_version;
     {
         let manager = IndexManager::new(&base);
         manager.create_tenant("t_del_restart").unwrap();
@@ -824,23 +1046,28 @@ async fn lww_map_rebuilt_from_oplog_blocks_stale_delete_after_restart() {
 
         let oplog = manager.get_or_create_oplog("t_del_restart").unwrap();
         let ops = oplog.read_since(0).unwrap();
-        primary_ts = ops
+        let primary_entry = ops
             .iter()
             .find(|o| o.op_type == "upsert")
-            .map(|o| o.timestamp_ms)
             .expect("should have upsert in oplog");
-        assert!(primary_ts > 0);
+        assert!(primary_entry.timestamp_ms > 0);
+        primary_version = VersionRecord::new(
+            primary_entry.timestamp_ms,
+            &primary_entry.node_id,
+            false,
+            primary_entry.seq,
+        );
 
         manager.graceful_shutdown().await;
     }
 
-    // Restart: lww_map is rebuilt from oplog → stale delete ts=primary_ts-1 must be rejected
+    // Restart: the durable tuple blocks a delete one millisecond older.
     {
         let manager = IndexManager::new(&base);
 
         let stale_delete = vec![make_delete_op(
             99,
-            primary_ts.saturating_sub(1),
+            primary_version.timestamp_ms.saturating_sub(1),
             "remote-node",
             "t_del_restart",
             "doc1",
@@ -849,13 +1076,15 @@ async fn lww_map_rebuilt_from_oplog_blocks_stale_delete_after_restart() {
             .await
             .unwrap();
 
-        // Stale delete is rejected by LWW (P3 correct). If P3 were broken, the delete
-        // runs synchronously via delete_documents_sync_for_replication (also .awaited),
-        // so the outcome is committed before apply_ops_to_manager returns — no sleep needed.
         let fetched = manager.get_document("t_del_restart", "doc1").unwrap();
         assert!(
             fetched.is_some(),
-            "stale delete must not remove doc after restart; lww_map must be rebuilt from oplog"
+            "stale delete must not remove doc after restart"
+        );
+        assert_eq!(manager.tenant_doc_count("t_del_restart"), Some(1));
+        assert_eq!(
+            manager.get_object_version("t_del_restart", "doc1").unwrap(),
+            Some(primary_version)
         );
 
         manager.graceful_shutdown().await;
@@ -3064,4 +3293,72 @@ async fn remove_cluster_peer_unknown_peer_returns_404_without_mutation() {
     assert_eq!(repl_mgr.peer_count(), 2);
     assert_eq!(cluster_status_body(&app).await, before_status);
     assert!(repl_mgr.get_peer_cursors("tenant-red").is_none());
+}
+
+/// The internal replication snapshot endpoint reads the tenant directory with the
+/// same guarantee as every other snapshot producer: the persistent writer is
+/// drained through merge quiescence first, so a replica never catches up from a
+/// mid-commit generation.
+#[tokio::test]
+async fn internal_snapshot_quiesces_the_persistent_writer_before_reading_bytes() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let tenant_id = "internal_snapshot_quiesce";
+    state.manager.create_tenant(tenant_id).unwrap();
+    state
+        .manager
+        .add_documents_sync(
+            tenant_id,
+            vec![flapjack::types::Document {
+                id: "replicated_one".to_string(),
+                fields: std::collections::HashMap::from([(
+                    "title".to_string(),
+                    flapjack::types::FieldValue::Text("replicated first".to_string()),
+                )]),
+            }],
+        )
+        .await
+        .unwrap();
+    let merge_wait_before = crate::test_helpers::retained_channel_closed_count(tenant_id);
+
+    let app = Router::new()
+        .route(
+            "/internal/snapshot/:indexName",
+            get(super::internal_snapshot),
+        )
+        .with_state(std::sync::Arc::clone(&state));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/internal/snapshot/{tenant_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    crate::test_helpers::assert_retained_channel_closed_delta(
+        tenant_id,
+        merge_wait_before,
+        "internal snapshot export must drain and merge-quiesce the persistent writer before reading bytes",
+    );
+    crate::test_helpers::assert_quiescence_before_publication(tenant_id, "snapshot_export_read");
+
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let restore_dir = TempDir::new().unwrap();
+    let restored = restore_dir.path().join(tenant_id);
+    flapjack::index::snapshot::import_from_bytes(&bytes, &restored).unwrap();
+    let restored_manager = IndexManager::new(restore_dir.path());
+    assert_eq!(
+        restored_manager
+            .search(tenant_id, "", None, None, 10)
+            .unwrap()
+            .total,
+        1,
+        "internal snapshot bytes must contain the committed generation"
+    );
 }

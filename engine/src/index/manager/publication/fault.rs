@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 /// Deterministic publication checkpoint used by the shared fault hook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PublicationFaultPoint {
+pub enum PublicationFaultPoint {
     #[cfg(test)]
     NoFault,
     BeforeStagingDigest,
@@ -73,7 +73,7 @@ impl PublicationIo<'static> {
 }
 
 impl<'a> PublicationIo<'a> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn with_faults(faults: &'a dyn PublicationFaultHook) -> Self {
         Self { faults }
     }
@@ -165,6 +165,28 @@ impl<'a> PublicationIo<'a> {
 
     fn check(&self, operation: PublicationOperation) -> Result<()> {
         self.faults.before_operation(&operation)
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) struct PanicAtCheckpoint {
+    fault: PublicationFaultPoint,
+}
+
+#[cfg(feature = "test-support")]
+impl PanicAtCheckpoint {
+    pub(crate) fn new(fault: PublicationFaultPoint) -> Self {
+        Self { fault }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl PublicationFaultHook for PanicAtCheckpoint {
+    fn before_operation(&self, operation: &PublicationOperation) -> Result<()> {
+        if matches!(operation, PublicationOperation::Checkpoint(actual) if *actual == self.fault) {
+            panic!("simulated publication crash at {:?}", self.fault);
+        }
+        Ok(())
     }
 }
 

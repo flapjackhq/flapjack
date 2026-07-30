@@ -392,6 +392,38 @@ pub(super) enum SourceIdentityError {
     Io(io::Error),
 }
 
+/// Exact duplicate-validation verdict carried from the bounded identity owner
+/// to the staged publication fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SourceIdentityValidation {
+    Unique,
+    Duplicate {
+        first: (usize, usize),
+        second: (usize, usize),
+    },
+}
+
+impl SourceIdentityValidation {
+    pub(super) fn from_duplicate_error(error: &SourceIdentityError) -> Option<Self> {
+        match error {
+            SourceIdentityError::Duplicate { first, second } => Some(Self::Duplicate {
+                first: *first,
+                second: *second,
+            }),
+            _ => None,
+        }
+    }
+
+    pub(super) fn into_result(self) -> Result<(), SourceIdentityError> {
+        match self {
+            Self::Unique => Ok(()),
+            Self::Duplicate { first, second } => {
+                Err(SourceIdentityError::Duplicate { first, second })
+            }
+        }
+    }
+}
+
 impl SourceIdentityError {
     pub(super) fn safe_message(&self) -> &'static str {
         match self {

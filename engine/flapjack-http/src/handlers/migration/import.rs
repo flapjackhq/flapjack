@@ -1,8 +1,13 @@
+use super::bulk_build::{flapjack_error, BulkBuildCounts, BulkBuildService};
+#[cfg(test)]
+use super::bulk_build::{
+    AfterDocumentBatchWriteHook, BeforeDocumentBatchWriteHook, BulkBuildTestEvent,
+    BulkBuildTestHooks,
+};
 use super::export::{export_algolia_source_for_import, AcceptedExport, ExportError};
 use super::source_reader::MigrationSourceReader;
 use super::spool::{
-    MigrationImportOutcome, MigrationImportWarning, MigrationPhase, SpoolError, SpoolErrorKind,
-    SpoolLimits, SpoolStore,
+    MigrationImportOutcome, MigrationImportWarning, MigrationPhase, SpoolLimits, SpoolStore,
 };
 use super::translation::{
     translate_accepted_spool_payload, translate_accepted_spool_settings, warning_message,
@@ -10,17 +15,17 @@ use super::translation::{
     TranslationSessionInstrumentation, TranslationStreamError,
 };
 use super::{
-    algolia_error, MigrateCount, MigrateError, MigrateFromAlgoliaResponse, MigrateWarning,
-    MigrationPublicationMode,
+    algolia_error, migration_cancelled_error, spool_error, MigrateCount, MigrateError,
+    MigrateFromAlgoliaResponse, MigrateWarning, MigrationPublicationMode,
 };
-use crate::error_response::{json_error_parts, json_error_parts_with_code};
-use crate::handlers::index_resource_store::{save_resource_batch, IndexResourceStore};
+use crate::error_response::json_error_parts;
+use crate::handlers::index_resource_store::save_resource_batch;
 use crate::handlers::settings::persist_index_settings;
 use axum::{http::StatusCode, Json};
 use flapjack::error::FlapjackError;
-use flapjack::index::manager::publication::{
-    PreStagedActivationError, PreStagedPublication, PublicationTarget,
-};
+use flapjack::index::manager::publication::PreStagedPublication;
+#[cfg(test)]
+use flapjack::index::manager::publication::PublicationFaultPoint;
 use flapjack::index::manager::validate_index_name;
 use flapjack::index::rules::RuleStore;
 use flapjack::index::synonyms::SynonymStore;
@@ -32,25 +37,21 @@ use std::collections::BTreeMap;
 use std::collections::HashSet;
 #[cfg(test)]
 use std::env;
-use std::error::Error;
 #[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{SendError, SyncSender};
+use std::sync::mpsc::SendError;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Barrier;
 #[cfg(test)]
 use std::thread;
-use std::thread::JoinHandle;
 #[cfg(test)]
 use std::time::{Duration, Instant};
 #[cfg(test)]
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-const MIGRATION_CANCELLED_CODE: &str = "migration_cancelled";
-const MIGRATION_CANCELLED_MESSAGE: &str = "Algolia migration cancellation was requested";
 #[cfg(test)]
 pub(super) const LIVE_IMPORT_PRE_ACTIVATION_SOURCE_ENV: &str =
     "FLAPJACK_ALGOLIA_LIVE_TEST_IMPORT_PRE_ACTIVATION_SOURCE";
@@ -73,9 +74,6 @@ const LIVE_IMPORT_BARRIER_TIMEOUT: Duration = Duration::from_secs(120);
 #[cfg(test)]
 type AfterAcceptedExportHook = Arc<dyn Fn(&SpoolStore, Uuid) + Send + Sync>;
 #[cfg(test)]
-type BeforeDocumentBatchWriteHook =
-    Arc<dyn Fn(&[Document]) -> Result<(), FlapjackError> + Send + Sync>;
-#[cfg(test)]
 type BeforeActivationHook = Arc<dyn Fn() + Send + Sync>;
 #[cfg(test)]
 type BeforeReplicaMaterializationHook =
@@ -86,8 +84,10 @@ type BeforeReplicaMaterializationHook =
 pub(super) struct ImportTestHooks {
     after_accepted_export: Option<AfterAcceptedExportHook>,
     before_document_batch_write: Option<BeforeDocumentBatchWriteHook>,
+    after_document_batch_write: Option<AfterDocumentBatchWriteHook>,
     before_activation: Option<BeforeActivationHook>,
     before_replica_materialization: Option<BeforeReplicaMaterializationHook>,
+    bulk_build: BulkBuildTestHooks,
 }
 
 #[cfg(test)]
@@ -187,11 +187,41 @@ impl ImportTestHooks {
         self
     }
 
+    pub(super) fn with_after_document_batch_write(
+        mut self,
+        hook: impl Fn(&flapjack::types::TaskInfo) + Send + Sync + 'static,
+    ) -> Self {
+        self.after_document_batch_write = Some(Arc::new(hook));
+        self
+    }
+
     pub(super) fn with_before_activation(
         mut self,
         hook: impl Fn() + Send + Sync + 'static,
     ) -> Self {
         self.before_activation = Some(Arc::new(hook));
+        self
+    }
+
+    pub(super) fn with_bulk_build_event_hook(
+        mut self,
+        hook: impl Fn(BulkBuildTestEvent) + Send + Sync + 'static,
+    ) -> Self {
+        self.bulk_build = self.bulk_build.with_event_hook(hook);
+        self
+    }
+
+    pub(super) fn with_replacement_publication_fault(
+        mut self,
+        fault: PublicationFaultPoint,
+    ) -> Self {
+        self.bulk_build = self.bulk_build.with_replacement_publication_fault(fault);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn without_prepublication_validation(mut self) -> Self {
+        self.bulk_build = self.bulk_build.without_prepublication_validation();
         self
     }
 
@@ -217,11 +247,12 @@ impl ImportTestHooks {
         }
     }
 
-    fn run_before_document_batch_write(&self, batch: &[Document]) -> Result<(), FlapjackError> {
-        if let Some(hook) = &self.before_document_batch_write {
-            hook(batch)?;
-        }
-        Ok(())
+    fn before_document_batch_write(&self) -> Option<BeforeDocumentBatchWriteHook> {
+        self.before_document_batch_write.clone()
+    }
+
+    fn after_document_batch_write(&self) -> Option<AfterDocumentBatchWriteHook> {
+        self.after_document_batch_write.clone()
     }
 
     fn run_before_activation(&self) {
@@ -235,6 +266,10 @@ impl ImportTestHooks {
             hook(derived_name)?;
         }
         Ok(())
+    }
+
+    fn bulk_build_hooks(&self) -> BulkBuildTestHooks {
+        self.bulk_build.clone()
     }
 }
 
@@ -359,7 +394,17 @@ async fn import_from_admitted_source_inner<R>(
 where
     R: MigrationSourceReader,
 {
-    let cancellation = MigrationCancellationCheck::new(spool, job_uuid);
+    #[cfg(not(test))]
+    let bulk_build = BulkBuildService::new(state_manager, spool, job_uuid, target_index.as_str());
+    #[cfg(test)]
+    let bulk_build = BulkBuildService::new(
+        state_manager,
+        spool,
+        job_uuid,
+        target_index.as_str(),
+        hooks.bulk_build_hooks(),
+    );
+    let cancellation = bulk_build.cancellation();
     let export = settle_import_result(
         spool,
         job_uuid,
@@ -370,7 +415,7 @@ where
     #[cfg(test)]
     hooks.run_after_accepted_export(spool, export.job_uuid);
     settle_import_result(spool, job_uuid, cancellation.check())?;
-    let publication = prepare_import_publication(state_manager, &target_index, spool, job_uuid)?;
+    let publication = settle_import_result(spool, job_uuid, bulk_build.prepare_publication())?;
 
     let ((), publication) = abort_publication_on_error(
         spool,
@@ -379,11 +424,11 @@ where
         publication,
     )?;
     let staging_result = stage_import_export(
+        &bulk_build,
         spool,
         &publication,
         &export,
         &target_index,
-        cancellation.clone(),
         #[cfg(test)]
         hooks.clone(),
     )
@@ -429,15 +474,11 @@ where
     // abort the unjournaled transaction; once journaled, `abort()` must refuse.
     let ((), publication) =
         abort_publication_on_error(spool, job_uuid, cancellation.check(), publication)?;
-    activate_staged_publication(
-        state_manager,
+    settle_import_result(
         spool,
         job_uuid,
-        publication,
-        &target_index,
-        publication_mode,
-    )
-    .await?;
+        bulk_build.activate(publication, publication_mode).await,
+    )?;
     settle_import_result(
         spool,
         job_uuid,
@@ -455,6 +496,7 @@ where
         job_uuid,
         refresh_target(state_manager, &target_index),
     )?;
+    let activated_counts = settle_import_result(spool, job_uuid, bulk_build.activated_counts())?;
 
     let sidecar_warnings = materialize_replica_sidecars(
         state_manager,
@@ -467,13 +509,7 @@ where
     let response = settle_import_result(
         spool,
         job_uuid,
-        activated_response(
-            state_manager,
-            &target_index,
-            staged,
-            publication_mode,
-            sidecar_warnings,
-        ),
+        activated_response(staged, activated_counts, publication_mode, sidecar_warnings),
     )?;
     // Carry the already computed activation facts into durable job state so the
     // async status endpoint can report them; `activated_response` remains the
@@ -494,6 +530,7 @@ where
 fn import_outcome_from_response(response: &MigrateFromAlgoliaResponse) -> MigrationImportOutcome {
     MigrationImportOutcome {
         settings_applied: response.settings,
+        objects_imported: response.objects.imported,
         synonyms_imported: response.synonyms.imported,
         rules_imported: response.rules.imported,
         warnings: response
@@ -515,84 +552,16 @@ fn import_outcome_warning(warning: &MigrateWarning) -> MigrationImportWarning {
     }
 }
 
-async fn activate_staged_publication(
-    state_manager: &Arc<IndexManager>,
-    spool: &SpoolStore,
-    job_uuid: Uuid,
-    publication: PreStagedPublication,
-    target_index: &str,
-    publication_mode: MigrationPublicationMode,
-) -> Result<(), MigrateError> {
-    match publication_mode {
-        MigrationPublicationMode::CreateOnly => {
-            settle_import_result(
-                spool,
-                job_uuid,
-                publication.activate_create_only().map_err(activation_error),
-            )?;
-        }
-        MigrationPublicationMode::ReplaceExisting { staging_baseline } => {
-            settle_import_result(
-                spool,
-                job_uuid,
-                state_manager
-                    .replace_index_contents_from_pre_staged(
-                        publication,
-                        target_index,
-                        staging_baseline,
-                    )
-                    .await
-                    .map_err(flapjack_error),
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn prepare_import_publication(
-    state_manager: &Arc<IndexManager>,
-    target_index: &str,
-    spool: &SpoolStore,
-    job_uuid: Uuid,
-) -> Result<PreStagedPublication, MigrateError> {
-    let target = settle_import_result(
-        spool,
-        job_uuid,
-        PublicationTarget::new(target_index.to_string()).map_err(flapjack_error),
-    )?;
-    settle_import_result(
-        spool,
-        job_uuid,
-        transition_import_phase(spool, job_uuid, MigrationPhase::Preparing),
-    )?;
-    let publication = settle_import_result(
-        spool,
-        job_uuid,
-        PreStagedPublication::prepare(&state_manager.base_path, target).map_err(flapjack_error),
-    )?;
-    settle_import_result(
-        spool,
-        job_uuid,
-        spool
-            .record_async_publication_receipt_if_present(
-                job_uuid,
-                publication.transaction_id().clone(),
-                Some(publication.generation().clone()),
-            )
-            .map_err(spool_error),
-    )?;
-    Ok(publication)
-}
-
 async fn stage_import_export(
+    bulk_build: &BulkBuildService<'_>,
     spool: &SpoolStore,
     publication: &PreStagedPublication,
     export: &AcceptedExport,
     target_index: &str,
-    cancellation: MigrationCancellationCheck,
     #[cfg(test)] hooks: ImportTestHooks,
 ) -> Result<StagedImport, MigrateError> {
     stage_export(
+        bulk_build,
         spool,
         publication,
         StageExportInput {
@@ -601,40 +570,48 @@ async fn stage_import_export(
             job_uuid: export.job_uuid,
             replica_settings: export.replica_settings.clone(),
         },
-        cancellation,
         #[cfg(test)]
         hooks,
     )
     .await
 }
 
+pub(super) async fn stage_accepted_bulk_replace(
+    bulk_build: &BulkBuildService<'_>,
+    spool: &SpoolStore,
+    publication: &PreStagedPublication,
+    job_uuid: Uuid,
+    target_index: &str,
+) -> Result<BulkBuildCounts, MigrateError> {
+    let staged = stage_export(
+        bulk_build,
+        spool,
+        publication,
+        StageExportInput {
+            source_index_name: target_index,
+            target_index,
+            job_uuid,
+            replica_settings: BTreeMap::new(),
+        },
+        #[cfg(test)]
+        ImportTestHooks::default(),
+    )
+    .await?;
+    Ok(staged.counts)
+}
+
 async fn stage_export(
+    bulk_build: &BulkBuildService<'_>,
     spool: &SpoolStore,
     publication: &PreStagedPublication,
     input: StageExportInput<'_>,
-    cancellation: MigrationCancellationCheck,
     #[cfg(test)] hooks: ImportTestHooks,
 ) -> Result<StagedImport, MigrateError> {
+    let cancellation = bulk_build.cancellation();
     cancellation.check()?;
-    let staging_parent = publication
-        .paths()
-        .staging
-        .parent()
-        .expect("publication staging path should have a transaction namespace");
-    let staging_tenant = publication
-        .paths()
-        .staging
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            json_error_parts(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
-        })?
-        .to_string();
-    let staging_manager = IndexManager::new(staging_parent);
-    cancellation.check()?;
-    staging_manager
-        .create_tenant(&staging_tenant)
-        .map_err(flapjack_error)?;
+    let staging = bulk_build.create_staging(publication)?;
+    let staging_manager = staging.manager();
+    let staging_tenant = staging.tenant();
     cancellation.check()?;
     let accepted = spool
         .accepted_artifacts(input.job_uuid)
@@ -648,23 +625,18 @@ async fn stage_export(
             }
         };
     cancellation.check()?;
-    persist_translated_settings(&staging_manager, &staging_tenant, &translated_settings).map_err(
+    persist_translated_settings(staging_manager, staging_tenant, &translated_settings).map_err(
         |_| json_error_parts(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
     )?;
     let mut instrumentation = TranslationSessionInstrumentation::default();
     #[cfg(test)]
-    let (document_sender, document_writer) = spawn_staging_document_writer(
-        Arc::clone(&staging_manager),
-        staging_tenant.clone(),
-        cancellation.clone(),
-        hooks,
+    let (document_sender, document_writer) = bulk_build.spawn_document_writer(
+        &staging,
+        hooks.before_document_batch_write(),
+        hooks.after_document_batch_write(),
     );
     #[cfg(not(test))]
-    let (document_sender, document_writer) = spawn_staging_document_writer(
-        Arc::clone(&staging_manager),
-        staging_tenant.clone(),
-        cancellation.clone(),
-    );
+    let (document_sender, document_writer) = bulk_build.spawn_document_writer(&staging);
     let translation_result = translate_accepted_spool_payload(
         accepted,
         input.source_index_name.to_string(),
@@ -675,7 +647,9 @@ async fn stage_export(
         |batch| document_sender.send(batch),
     );
     drop(document_sender);
-    join_document_writer(document_writer).map_err(flapjack_error)?;
+    bulk_build
+        .join_document_writer(document_writer)
+        .map_err(flapjack_error)?;
     let outcome = translation_result.map_err(translation_error)?;
     let translated = match outcome {
         TranslationOutcome::Translated(translated) => translated,
@@ -687,14 +661,13 @@ async fn stage_export(
     cancellation.check()?;
     let report = translated.report.clone();
     let replica_settings = translated.bundle.replica_settings.clone();
-    persist_translated_resources(&staging_manager, &staging_tenant, translated).map_err(|_| {
+    let source_identity_validation = translated.source_identity_validation;
+    persist_translated_resources(staging_manager, staging_tenant, translated).map_err(|_| {
         json_error_parts(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
     })?;
-    staging_manager
-        .unload(&staging_tenant)
-        .map_err(flapjack_error)?;
-    cancellation.check()?;
-    let counts = verify_staged_counts(&staging_manager, &staging_tenant, input.target_index)?;
+    let counts = bulk_build
+        .finish_staging(&staging, source_identity_validation)
+        .await?;
     Ok(StagedImport {
         counts,
         report,
@@ -749,94 +722,20 @@ fn persist_translated_resources(
     Ok(())
 }
 
-fn spawn_staging_document_writer(
-    staging_manager: Arc<IndexManager>,
-    staging_tenant: String,
-    cancellation: MigrationCancellationCheck,
-    #[cfg(test)] hooks: ImportTestHooks,
-) -> (
-    SyncSender<Vec<Document>>,
-    JoinHandle<Result<(), FlapjackError>>,
-) {
-    let (document_sender, document_receiver) = std::sync::mpsc::sync_channel::<Vec<Document>>(1);
-    let writer = std::thread::spawn(move || -> Result<(), FlapjackError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        while let Ok(batch) = document_receiver.recv() {
-            #[cfg(test)]
-            hooks.run_before_document_batch_write(&batch)?;
-            if cancellation
-                .cancel_requested()
-                .map_err(|error| FlapjackError::Io(error.to_string()))?
-            {
-                continue;
-            }
-            runtime
-                .block_on(staging_manager.add_documents_durable(&staging_tenant, batch))
-                .map(|_| ())?;
-        }
-        Ok(())
-    });
-    (document_sender, writer)
-}
-
-fn join_document_writer(
-    document_writer: JoinHandle<Result<(), FlapjackError>>,
-) -> Result<(), FlapjackError> {
-    document_writer
-        .join()
-        .map_err(|_| FlapjackError::Io("migration staging document writer panicked".to_string()))?
-}
-
-fn verify_staged_counts(
-    staging_manager: &Arc<IndexManager>,
-    staging_tenant: &str,
-    target_index: &str,
-) -> Result<StagedCounts, MigrateError> {
-    let documents = document_count(staging_manager, staging_tenant)?;
-    let rules = resource_count::<RuleStore>(staging_manager, staging_tenant)?;
-    let synonyms = resource_count::<SynonymStore>(staging_manager, staging_tenant)?;
-    let settings = staging_manager.get_settings(staging_tenant).is_some();
-    if !settings {
-        return Err(json_error_parts(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal server error",
-        ));
-    }
-    tracing::debug!(
-        target_index,
-        documents,
-        rules,
-        synonyms,
-        "validated staged migration import counts"
-    );
-    Ok(StagedCounts {
-        settings,
-        documents,
-        rules,
-        synonyms,
-    })
-}
-
 fn activated_response(
-    manager: &Arc<IndexManager>,
-    target_index: &str,
     staged: StagedImport,
+    activated: BulkBuildCounts,
     publication_mode: MigrationPublicationMode,
     sidecar_warnings: Vec<MigrateWarning>,
 ) -> Result<MigrateFromAlgoliaResponse, MigrateError> {
-    let objects = document_count(manager, target_index)?;
-    let rules = resource_count::<RuleStore>(manager, target_index)?;
-    let synonyms = resource_count::<SynonymStore>(manager, target_index)?;
     // Replacement activation replays acknowledged mutations from
     // `(baseline_seq, write_watermark]` after installing the staged source.
     // Its reopened target can therefore legitimately differ from the source
     // object count. Create-only publication has no replay window.
     if (matches!(publication_mode, MigrationPublicationMode::CreateOnly)
-        && objects != staged.counts.documents)
-        || rules != staged.counts.rules
-        || synonyms != staged.counts.synonyms
+        && activated.documents != staged.counts.documents)
+        || activated.rules != staged.counts.rules
+        || activated.synonyms != staged.counts.synonyms
     {
         return Err(json_error_parts(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1009,7 +908,10 @@ fn report_variant_string<T: serde::Serialize>(value: T) -> String {
         .unwrap_or_default()
 }
 
-fn refresh_target(manager: &Arc<IndexManager>, target_index: &str) -> Result<(), MigrateError> {
+pub(super) fn refresh_target(
+    manager: &Arc<IndexManager>,
+    target_index: &str,
+) -> Result<(), MigrateError> {
     manager
         .unload(&target_index.to_string())
         .map_err(flapjack_error)?;
@@ -1133,7 +1035,7 @@ fn settle_import_result<T>(
     result.map_err(|error| settle_failed_or_cancelled_migration(spool, job_uuid, error))
 }
 
-fn abort_publication_on_error<T>(
+pub(super) fn abort_publication_on_error<T>(
     spool: &SpoolStore,
     job_uuid: Uuid,
     result: Result<T, MigrateError>,
@@ -1183,66 +1085,12 @@ fn fail_migration(spool: &SpoolStore, job_uuid: Uuid, error: MigrateError) -> Mi
     }
 }
 
-fn document_count(manager: &Arc<IndexManager>, index_name: &str) -> Result<usize, MigrateError> {
-    let index = manager.get_or_load(index_name).map_err(flapjack_error)?;
-    Ok(index.reader().searcher().num_docs() as usize)
-}
-
-fn resource_count<S>(manager: &Arc<IndexManager>, index_name: &str) -> Result<usize, MigrateError>
-where
-    S: IndexResourceStore,
-{
-    Ok(
-        crate::handlers::index_resource_store::load_existing_store::<S>(manager, index_name)
-            .map_err(flapjack_error)?
-            .map(|store| store.count())
-            .unwrap_or(0),
-    )
-}
-
 fn export_error(error: ExportError) -> MigrateError {
     match error {
         ExportError::Source(error) => algolia_error(error),
         ExportError::Spool(error) => spool_error(error),
         ExportError::Cancelled => migration_cancelled_error(),
     }
-}
-
-pub(super) fn spool_error(error: SpoolError) -> MigrateError {
-    let status = match error.kind() {
-        SpoolErrorKind::JobNotFound
-        | SpoolErrorKind::PublicHandleNotFound
-        | SpoolErrorKind::CheckpointHandleNotFound => StatusCode::NOT_FOUND,
-        SpoolErrorKind::CompressedPageBytesExceeded
-        | SpoolErrorKind::DecompressedPageBytesExceeded
-        | SpoolErrorKind::ResourceItemCountExceeded
-        | SpoolErrorKind::JobBytesExceeded
-        | SpoolErrorKind::GlobalBytesExceeded
-        | SpoolErrorKind::FreeSpaceFloor
-        | SpoolErrorKind::StagedArtifactCountExceeded
-        | SpoolErrorKind::StagedArtifactBytesExceeded
-        | SpoolErrorKind::InvalidRelativePath
-        | SpoolErrorKind::InvalidSourceIdentityDigest
-        | SpoolErrorKind::InvalidCompletedResourceId
-        | SpoolErrorKind::SourceIdentityMismatch
-        | SpoolErrorKind::ResourceVerificationFailed
-        | SpoolErrorKind::ResourceComplete
-        | SpoolErrorKind::ResourcesIncomplete
-        | SpoolErrorKind::CancelRequested
-        | SpoolErrorKind::JobTerminal
-        | SpoolErrorKind::JobNotAccepted
-        | SpoolErrorKind::UnsupportedArtifactKind
-        | SpoolErrorKind::InvalidPhaseTransition
-        | SpoolErrorKind::PrivacyScrubIntentCollision => StatusCode::BAD_REQUEST,
-        SpoolErrorKind::JobDeleting => StatusCode::CONFLICT,
-        SpoolErrorKind::Io | SpoolErrorKind::ManifestCorrupt => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
-        "Internal server error".to_string()
-    } else {
-        error.to_string()
-    };
-    json_error_parts(status, message)
 }
 
 fn translation_error(error: TranslationStreamError<SendError<Vec<Document>>>) -> MigrateError {
@@ -1258,73 +1106,14 @@ fn translation_error(error: TranslationStreamError<SendError<Vec<Document>>>) ->
     }
 }
 
-fn migration_cancelled_error() -> MigrateError {
-    json_error_parts_with_code(
-        StatusCode::CONFLICT,
-        MIGRATION_CANCELLED_CODE,
-        MIGRATION_CANCELLED_MESSAGE,
-    )
-}
-
 fn is_migration_cancelled_error(error: &MigrateError) -> bool {
-    error.1 .0.get("code").and_then(serde_json::Value::as_str) == Some(MIGRATION_CANCELLED_CODE)
-}
-
-#[derive(Clone)]
-struct MigrationCancellationCheck {
-    spool: SpoolStore,
-    job_uuid: Uuid,
-}
-
-impl MigrationCancellationCheck {
-    fn new(spool: &SpoolStore, job_uuid: Uuid) -> Self {
-        Self {
-            spool: spool.clone(),
-            job_uuid,
-        }
-    }
-
-    fn cancel_requested(&self) -> Result<bool, SpoolError> {
-        self.spool.cancel_requested(self.job_uuid)
-    }
-
-    fn check(&self) -> Result<(), MigrateError> {
-        match self.cancel_requested() {
-            Ok(false) => Ok(()),
-            Ok(true) => Err(migration_cancelled_error()),
-            Err(error) => Err(spool_error(error)),
-        }
-    }
-}
-
-fn activation_error(error: PreStagedActivationError) -> MigrateError {
-    let mut source = error.source();
-    while let Some(error_source) = source {
-        if let Some(error) = error_source.downcast_ref::<FlapjackError>() {
-            if matches!(error, FlapjackError::IndexAlreadyExists(_)) {
-                return flapjack_error(error.clone());
-            }
-        }
-        source = error_source.source();
-    }
-    json_error_parts(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
-}
-
-fn flapjack_error(error: FlapjackError) -> MigrateError {
-    json_error_parts(error.status_code(), error.api_message())
-}
-
-#[derive(Debug, Clone, Copy)]
-struct StagedCounts {
-    settings: bool,
-    documents: usize,
-    rules: usize,
-    synonyms: usize,
+    error.1 .0.get("code").and_then(serde_json::Value::as_str)
+        == Some(super::MIGRATION_CANCELLED_CODE)
 }
 
 #[derive(Debug, Clone)]
 struct StagedImport {
-    counts: StagedCounts,
+    counts: BulkBuildCounts,
     report: TranslationReport,
     replica_settings: Vec<super::translation::ReplicaSettingsTranslation>,
 }

@@ -1222,6 +1222,7 @@ fn succeed_migration_round_trips_exact_import_outcome() {
 
     let outcome = MigrationImportOutcome {
         settings_applied: true,
+        objects_imported: 0,
         synonyms_imported: 1,
         rules_imported: 2,
         warnings: vec![MigrationImportWarning {
@@ -1270,6 +1271,7 @@ fn fail_migration_clears_pre_recorded_import_outcome() {
             job_uuid,
             MigrationImportOutcome {
                 settings_applied: true,
+                objects_imported: 0,
                 synonyms_imported: 1,
                 rules_imported: 2,
                 warnings: vec![],

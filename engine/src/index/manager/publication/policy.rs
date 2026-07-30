@@ -158,7 +158,7 @@ static ARTIFACT_POLICIES: [ArtifactPolicy; 13] = [
         "engine/src/index/manager/mod.rs",
         ArtifactDisposition::PostcommitRebuild,
         "IndexManager runtime maps",
-        "loaded, writer, queue, oplog, cache, LWW, and vector maps are in-memory state.",
+        "loaded, writer, queue, oplog, cache, and vector maps are in-memory state.",
         "process memory",
         "not durable",
         "rebuilt after commit",

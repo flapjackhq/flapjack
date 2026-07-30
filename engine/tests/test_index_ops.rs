@@ -1131,7 +1131,7 @@ mod oplog_replay {
         let seg_path = seg_files[0].path();
         let mut content = std::fs::read_to_string(&seg_path).unwrap();
         content.push_str("{this is not valid json\n");
-        content.push_str("{\"seq\":999,\"timestamp_ms\":1,\"node_id\":\"n\",\"tenant_id\":\"replay_corrupt\",\"op_type\":\"upsert\",\"payload\":{\"objectID\":\"2\",\"body\":{\"_id\":\"2\",\"name\":\"AfterCorrupt\"}}}\n");
+        content.push_str("{\"seq\":2,\"timestamp_ms\":1,\"node_id\":\"n\",\"tenant_id\":\"replay_corrupt\",\"op_type\":\"upsert\",\"payload\":{\"objectID\":\"2\",\"body\":{\"_id\":\"2\",\"name\":\"AfterCorrupt\"}}}\n");
         std::fs::write(&seg_path, content).unwrap();
 
         nuke_and_recreate_index(&base.join("replay_corrupt"));
@@ -1139,12 +1139,16 @@ mod oplog_replay {
 
         {
             let mgr = IndexManager::new(&base);
-            let r = mgr.search("replay_corrupt", "", None, None, 100).unwrap();
-            assert!(
-                r.total >= 1,
-                "should recover at least the valid entries, got {}",
-                r.total
-            );
+            let all = mgr.search("replay_corrupt", "", None, None, 100).unwrap();
+            assert_eq!(all.total, 2, "both valid entries should recover");
+            let before_corruption = mgr
+                .search("replay_corrupt", "Good", None, None, 100)
+                .unwrap();
+            assert_eq!(before_corruption.total, 1);
+            let after_corruption = mgr
+                .search("replay_corrupt", "AfterCorrupt", None, None, 100)
+                .unwrap();
+            assert_eq!(after_corruption.total, 1);
         }
     }
 
@@ -1478,9 +1482,13 @@ mod oplog_replay {
         let committed_seq_path = base.join("replay_config_only").join("committed_seq");
         assert_eq!(
             std::fs::read_to_string(&committed_seq_path).unwrap().trim(),
-            "2",
-            "document commits should not eagerly advance over config-only oplog entries"
+            "5",
+            "two document commits plus three synchronously persisted config appends must advance the applied-op watermark to 5"
         );
+        // Rewind to the document-commit boundary to model a crash after the config
+        // oplog appends but before their applied watermark became durable. The
+        // restart below must replay that exact config-only suffix and restore 5.
+        std::fs::write(&committed_seq_path, "2").unwrap();
 
         {
             let mgr = IndexManager::new(&base);
@@ -1518,7 +1526,7 @@ mod oplog_replay {
         assert_eq!(
             std::fs::read_to_string(&committed_seq_path).unwrap().trim(),
             "5",
-            "config-only recovery should advance committed_seq without a document rewrite"
+            "config-only recovery must advance the applied-op watermark through the replayed suffix"
         );
     }
 

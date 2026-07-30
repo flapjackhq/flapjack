@@ -9,6 +9,7 @@ mod common;
 mod cold_start_cache_bounds {
     use super::common::faceted_search_options;
     use flapjack::index::settings::IndexSettings;
+    use flapjack::index::FacetCacheKey;
     use flapjack::types::{Document, FacetRequest, FieldValue};
     use flapjack::IndexManager;
     use std::collections::HashMap;
@@ -147,7 +148,7 @@ mod cold_start_cache_bounds {
 
         for i in 0..20 {
             manager.facet_cache.insert(
-                format!("t1:q{}:category", i),
+                FacetCacheKey::new("t1", "", format!("q{i}"), vec!["category".to_string()]),
                 std::sync::Arc::new((
                     std::time::Instant::now(),
                     0,
@@ -185,17 +186,31 @@ mod cold_start_cache_bounds {
             value_query: None,
         }];
 
-        for i in 0..20 {
+        // Each distinct query text is its own cache key, so 20 searches warm 20
+        // entries. The cap is 50, so this stays strictly under it and nothing may
+        // be evicted.
+        let query_count = 20;
+        for i in 0..query_count {
             let query = format!("q{}", i);
             let options = faceted_search_options(None, None, 1, 0, Some(&facets));
-            let _ = manager.search_with_options("t1", &query, &options);
+            manager
+                .search_with_options("t1", &query, &options)
+                .unwrap_or_else(|e| panic!("search for {} should succeed: {}", query, e));
         }
+
+        let cap = manager.facet_cache_cap.load(Ordering::Relaxed);
+        assert_eq!(cap, 50, "fixture cap");
+        assert!(
+            query_count < cap,
+            "fixture must stay under the cap to test the no-eviction path"
+        );
 
         let cache_len = manager.facet_cache.len();
         assert_eq!(
-            cache_len, 1,
-            "all queries with same facets/filter should share one cache entry, got {}",
-            cache_len
+            cache_len, query_count,
+            "each distinct query keeps its own facet counts, and nothing is evicted \
+             below the cap of {}, got {}",
+            cap, cache_len
         );
     }
 
@@ -648,6 +663,7 @@ mod memory_safety {
             usage_persistence: None,
             geoip_reader: None,
             notification_service: None,
+            bulk_replace_max_bytes: 4 * 1024 * 1024 * 1024,
             migration_runner: Arc::new(
                 flapjack_http::handlers::migration::MigrationJobRunner::new(
                     manager,
