@@ -562,6 +562,11 @@ exercise_negative_controls() {
 cleanup() {
   local script_exit_code=$?
   local receipt_runner_tmp_dir=""
+  local -a backpressure_pause_sources=()
+  local -a backpressure_pause_receipt_lines=()
+  local backpressure_pause_artifact_count=0
+  local backpressure_pause_source_count=0
+  local pause_source pause_relative pause_parent pause_destination pause_decision pause_i
   if [[ "$CLEANUP_COMPLETE" -eq 1 ]]; then
     return
   fi
@@ -572,15 +577,60 @@ cleanup() {
   # is caller-owned and is never deleted. On failure the generated tranche data
   # is retained at RUNNER_TMP_DIR before the server is stopped.
   if [[ "$RUN_SUCCEEDED" -ne 1 || "$script_exit_code" -ne 0 || "$INTERRUPTED_EXIT_CODE" -ne 0 ]]; then
+    # jul26_8pm_9 lost this pause evidence, but full ladder data snapshots are too
+    # large at the 1,000,000-record rung. Preserve only the decision artifacts.
+    if [[ -n "$RESULTS_DIR" && -n "$SERVER_DATA_DIR" && -d "$SERVER_DATA_DIR" ]]; then
+      while IFS= read -r -d '' pause_source; do
+        backpressure_pause_sources+=("$pause_source")
+      done < <(
+        find "$SERVER_DATA_DIR" -type f -name 'write_backpressure_pause.json' -print0 ||
+          echo "ERROR: failed to discover backpressure pause artifacts in ${SERVER_DATA_DIR}" >&2
+      )
+    fi
+    backpressure_pause_source_count="${#backpressure_pause_sources[@]}"
+    # Guard the iteration: under `set -u`, bash 3.2 (the macOS system bash) treats
+    # "${arr[@]}" on an empty array as an unbound variable and aborts cleanup() before
+    # failure_evidence.txt is written and the server is stopped — the exact evidence loss
+    # this path exists to prevent. The zero-artifact case is common (e.g. capacity NO_GO
+    # rejects a rung before any tenant writes a pause artifact).
+    for ((pause_i = 0; pause_i < backpressure_pause_source_count; pause_i++)); do
+      pause_source="${backpressure_pause_sources[pause_i]}"
+      pause_relative="${pause_source#"$SERVER_DATA_DIR"/}"
+      pause_parent="${pause_relative%/write_backpressure_pause.json}"
+      pause_destination="$RESULTS_DIR/backpressure_pause_artifacts/$pause_relative"
+      if ! mkdir -p "${pause_destination%/*}"; then
+        echo "ERROR: failed to create directory for backpressure pause artifact ${pause_relative}" >&2
+      elif ! cp "$pause_source" "$pause_destination"; then
+        echo "ERROR: failed to preserve backpressure pause artifact ${pause_relative}" >&2
+      else
+        pause_decision="unknown"
+        if ! pause_decision="$(jq -r '.decision // "unknown"' "$pause_destination" 2>/dev/null)"; then
+          echo "ERROR: failed to read decision from preserved artifact ${pause_relative}" >&2
+          pause_decision="unknown"
+        fi
+        backpressure_pause_artifact_count=$((backpressure_pause_artifact_count + 1))
+        backpressure_pause_receipt_lines+=(
+          "backpressure_pause_artifact=${pause_parent}:${pause_decision}:backpressure_pause_artifacts/${pause_relative}"
+        )
+      fi
+    done
     if [[ -n "$RESULTS_DIR" ]]; then
-      {
+      if ! {
         echo "outcome=FAIL"
         echo "failure_outcome=${FAILURE_OUTCOME}"
         echo "script_exit_code=${script_exit_code}"
         echo "interrupted_exit_code=${INTERRUPTED_EXIT_CODE}"
         echo "runner_state=${RUNNER_TMP_DIR}"
         echo "server_data=${SERVER_DATA_DIR}"
-      } > "$RESULTS_DIR/failure_evidence.txt"
+        echo "backpressure_pause_artifact_count=${backpressure_pause_artifact_count}"
+        if [[ "$backpressure_pause_source_count" -eq 0 ]]; then
+          echo "backpressure_pause_artifacts=none present"
+        elif [[ "$backpressure_pause_artifact_count" -gt 0 ]]; then
+          printf '%s\n' "${backpressure_pause_receipt_lines[@]}"
+        fi
+      } > "$RESULTS_DIR/failure_evidence.txt"; then
+        echo "ERROR: failed to write failure evidence receipt in ${RESULTS_DIR}" >&2
+      fi
     fi
     if [[ -n "$RESULTS_DIR" && -n "$RUNNER_TMP_DIR" ]]; then
       receipt_runner_tmp_dir="$(

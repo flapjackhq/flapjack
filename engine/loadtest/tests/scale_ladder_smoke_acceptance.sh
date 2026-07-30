@@ -2,23 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOADTEST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-ENGINE_DIR="$(cd "$LOADTEST_DIR/.." && pwd)"
-LADDER_SCRIPT="${FLAPJACK_SCALE_LADDER_SCRIPT:-$LOADTEST_DIR/scale_ladder.sh}"
-SERVER_BINARY="${FLAPJACK_SCALE_SERVER_BINARY:-$ENGINE_DIR/target/release/flapjack}"
-
-# The campaign calibration starts at 1M. Keep this 10K plumbing fixture above fixed process/index
-# overhead; the dedicated negative control below overrides both values to one byte per record.
-export SCALE_INDEX_BYTES_PER_RECORD="${SCALE_INDEX_BYTES_PER_RECORD:-100000}"
-export SCALE_RSS_BYTES_PER_RECORD="${SCALE_RSS_BYTES_PER_RECORD:-100000}"
-
-fail() {
-  echo "FAIL: $1" >&2
-  exit 1
-}
-
-[[ -x "$LADDER_SCRIPT" ]] || fail "scale ladder driver missing or not executable: $LADDER_SCRIPT"
-[[ -x "$SERVER_BINARY" ]] || fail "release server binary missing: $SERVER_BINARY"
+# shellcheck source=lib/scale_ladder_acceptance_harness.sh
+source "$SCRIPT_DIR/lib/scale_ladder_acceptance_harness.sh"
+require_ladder_binaries
 
 test_root="$(mktemp -d)"
 data_dir="$test_root/server_data"
@@ -273,28 +259,8 @@ failure_root="$(mktemp -d)"
 failure_data_dir="$failure_root/server_data"
 failure_results_dir="$failure_root/results"
 failure_base_url="http://127.0.0.1:$((port + 1))"
-mkdir -p "$failure_results_dir"
-jq -n '{
-  outcome: "PAUSED",
-  runnerTmpDir: "/tmp/stale_prior_run",
-  remainingGeneratedDatasetDirs: 0,
-  terminalRung: null,
-  terminalMetricsPath: null
-}' > "$failure_results_dir/run_receipt.json"
-if SCALE_DISK_RESERVE_BYTES=1048576 \
-  SCALE_MEMORY_RESERVE_BYTES=1048576 \
-  timeout 180 bash "$LADDER_SCRIPT" \
-  --profile compact \
-  --rungs 10 \
-  --batch-size 10 \
-  --stall-seconds 10 \
-  --min-docs-per-second 999999999 \
-  --base-url "$failure_base_url" \
-  --server-binary "$SERVER_BINARY" \
-  --data-dir "$failure_data_dir" \
-  --results-dir "$failure_results_dir"; then
-  fail "impossible throughput floor should force a non-PASS outcome"
-fi
+seed_stale_run_receipt "$failure_results_dir"
+run_ladder_expecting_failure "$failure_base_url" "$failure_data_dir" "$failure_results_dir"
 
 [[ -s "$failure_results_dir/failure_evidence.txt" ]] || {
   fail "non-PASS run did not preserve its failure evidence receipt"
