@@ -212,6 +212,24 @@ pub(crate) async fn body_json(resp: axum::http::Response<Body>) -> serde_json::V
     serde_json::from_slice(&bytes).unwrap()
 }
 
+pub(crate) async fn quiesced_snapshot_bytes(
+    manager: &flapjack::IndexManager,
+    tenant_id: &str,
+) -> Vec<u8> {
+    let index_path = manager.base_path.join(tenant_id);
+    let _quiesce = manager
+        .quiesce_tenant(&tenant_id.to_string())
+        .await
+        .expect("snapshot fixture export must quiesce the tenant");
+    let export_tenant_id = tenant_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::snapshot_byte_ops::export_snapshot_bytes(&index_path, &export_tenant_id)
+    })
+    .await
+    .expect("snapshot fixture export task must not panic")
+    .expect("snapshot fixture bytes must export from a quiesced tenant")
+}
+
 /// Send a JSON request through a router and return the raw response.
 pub(crate) async fn send_json_request(
     app: &axum::Router,

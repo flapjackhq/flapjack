@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1091,SC2034,SC2329
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -85,6 +86,131 @@ if ! liveness_case_output="$(
   liveness_distribution_rejects_one_fast_probe_and_one_five_second_stall 2>&1
 )"; then
   liveness_case_failed=1
+fi
+
+liveness_sampler_lifecycle_uses_caller_owned_pid() {
+  local fixture_dir
+  local sample_path
+  local fixture_base_url="http://fixture.invalid"
+  local fixture_index_name="live index"
+  local watch_pid
+  local sampler_pid=""
+  local pid_var_name=""
+  local current_sampler_pid=""
+  local started_sampler_pid
+  local sampler_child_pid=""
+  local first_rows
+
+  fixture_dir="$(mktemp -d)"
+  sample_path="$fixture_dir/liveness_samples.tsv"
+  sleep 30 &
+  watch_pid=$!
+
+  cleanup_lifecycle_fixture() {
+    stop_liveness_sampler sampler_pid 2>/dev/null || true
+    kill "$watch_pid" 2>/dev/null || true
+    wait "$watch_pid" 2>/dev/null || true
+    rm -rf "$fixture_dir"
+  }
+  trap cleanup_lifecycle_fixture RETURN
+
+  sample_liveness_endpoint() {
+    local endpoint="$1"
+    local url="$2"
+
+    case "${endpoint} ${url}" in
+      "health ${fixture_base_url}/health")
+        printf 'health\tok\t11\n'
+        ;;
+      "count ${fixture_base_url}/1/usage/documents_count/live%20index")
+        printf 'count\tok\t22\n'
+        ;;
+      *)
+        fail "unexpected liveness probe: endpoint=${endpoint} url=${url}"
+        ;;
+    esac
+  }
+
+  start_liveness_sampler \
+    sampler_pid \
+    "$fixture_base_url" \
+    "$fixture_index_name" \
+    "$sample_path" \
+    "$watch_pid" \
+    30
+  [[ -n "$sampler_pid" ]] || fail "start_liveness_sampler must assign the caller PID variable"
+  started_sampler_pid="$sampler_pid"
+  jobs -pr | grep -Fxq "$started_sampler_pid" || \
+    fail "sampler PID must be owned by the calling shell job table"
+
+  for _ in $(seq 1 100); do
+    if [[ "$(wc -l <"$sample_path" 2>/dev/null || printf '0')" -ge 2 ]]; then
+      break
+    fi
+    sleep 0.02
+  done
+  first_rows="$(sed -n '1,2p' "$sample_path")"
+  [[ "$first_rows" == $'health\tok\t11\ncount\tok\t22' ]] || \
+    fail "sampler must write exact health/count rows to the requested file, got: ${first_rows}"
+
+  for _ in $(seq 1 100); do
+    sampler_child_pid="$(
+      ps -eo pid=,ppid= |
+        awk -v parent_pid="$started_sampler_pid" '$2 == parent_pid { print $1; exit }'
+    )"
+    [[ -n "$sampler_child_pid" ]] && break
+    sleep 0.02
+  done
+  [[ -n "$sampler_child_pid" ]] || fail "sampler must have an active child before shutdown"
+  kill -0 "$sampler_child_pid" 2>/dev/null || \
+    fail "captured sampler child must be alive before shutdown"
+
+  stop_liveness_sampler sampler_pid
+  [[ -z "$sampler_pid" ]] || fail "stop_liveness_sampler must clear the caller PID variable"
+  ! jobs -pr | grep -Fxq "$started_sampler_pid" || \
+    fail "stop_liveness_sampler must reap the sampler job"
+  ! kill -0 "$sampler_child_pid" 2>/dev/null || \
+    fail "stop_liveness_sampler must terminate the sampler's active child"
+
+  start_liveness_sampler \
+    pid_var_name \
+    "$fixture_base_url" \
+    "$fixture_index_name" \
+    "$sample_path" \
+    "$watch_pid" \
+    30
+  [[ -n "$pid_var_name" ]] || \
+    fail "start_liveness_sampler must assign caller variable named pid_var_name"
+  started_sampler_pid="$pid_var_name"
+  stop_liveness_sampler pid_var_name
+  [[ -z "$pid_var_name" ]] || \
+    fail "stop_liveness_sampler must clear caller variable named pid_var_name"
+  ! jobs -pr | grep -Fxq "$started_sampler_pid" || \
+    fail "stop_liveness_sampler must reap sampler job for pid_var_name"
+
+  start_liveness_sampler \
+    current_sampler_pid \
+    "$fixture_base_url" \
+    "$fixture_index_name" \
+    "$sample_path" \
+    "$watch_pid" \
+    30
+  [[ -n "$current_sampler_pid" ]] || \
+    fail "start_liveness_sampler must assign caller variable named current_sampler_pid"
+  started_sampler_pid="$current_sampler_pid"
+  stop_liveness_sampler current_sampler_pid
+  [[ -z "$current_sampler_pid" ]] || \
+    fail "stop_liveness_sampler must clear caller variable named current_sampler_pid"
+  ! jobs -pr | grep -Fxq "$started_sampler_pid" || \
+    fail "stop_liveness_sampler must reap sampler job for current_sampler_pid"
+}
+
+liveness_sampler_output=""
+echo "RUN: liveness_sampler_lifecycle_uses_caller_owned_pid"
+if ! liveness_sampler_output="$(
+  liveness_sampler_lifecycle_uses_caller_owned_pid 2>&1
+)"; then
+  fail "liveness_sampler_lifecycle_uses_caller_owned_pid: $liveness_sampler_output"
 fi
 
 fixed_count() {

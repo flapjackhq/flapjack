@@ -241,13 +241,7 @@ async fn export_tenant_snapshot(
     // Drain and merge-quiesce any live writer so the scheduled backup captures a
     // quiesced generation, then run the blocking gzip/tar export off the async
     // worker pool through the shared byte seam.
-    let _quiesce = match manager.quiesce_tenant(&tenant.to_string()).await {
-        Ok(quiesce) => quiesce,
-        Err(error) => {
-            tracing::error!("[BACKUP] quiesce {} failed: {}", tenant, error);
-            return None;
-        }
-    };
+    let _quiesce = quiesce_backup_tenant(manager, tenant).await?;
     let index_path = data_path.join(tenant);
     let tenant_owned = tenant.to_string();
     match tokio::task::spawn_blocking(move || {
@@ -262,6 +256,19 @@ async fn export_tenant_snapshot(
         }
         Err(join_error) => {
             tracing::error!("[BACKUP] export {} task failed: {}", tenant, join_error);
+            None
+        }
+    }
+}
+
+async fn quiesce_backup_tenant(
+    manager: &Arc<flapjack::IndexManager>,
+    tenant: &str,
+) -> Option<flapjack::index::manager::TenantQuiesce> {
+    match manager.quiesce_tenant(&tenant.to_string()).await {
+        Ok(quiesce) => Some(quiesce),
+        Err(error) => {
+            tracing::error!("[BACKUP] quiesce {} failed: {}", tenant, error);
             None
         }
     }

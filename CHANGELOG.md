@@ -7,6 +7,48 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Runtime HA membership management: `POST /internal/cluster/peers` adds a peer and
+  `DELETE /internal/cluster/peers/{node_id}` removes one, both admin-gated, so cluster
+  membership changes no longer require a restart.
+- Dead-node auto-heal as a bounded, default-off engine capability
+  (`FLAPJACK_AUTOHEAL_ENABLED=true`). The engine evicts at most one sustained-unreachable
+  peer after a fixed three-observation threshold, only while the local quorum guard holds,
+  readmits returning healthy peers through startup catch-up, and records every refusal,
+  eviction, and readmission in `${FLAPJACK_DATA_DIR}/autoheal_decisions.jsonl`.
+  `autoheal_enabled` and `autoheal_peers` are reported on admin-only
+  `/internal/cluster/status`.
+- Official Helm chart for multi-node deployment (`deploy/helm/flapjack/`) with a
+  StatefulSet and automatic peer wiring.
+- Published operations consumer contract for `/health`, `/internal/status`,
+  `/internal/cluster/status`, and `/internal/snapshots/capability`
+  (`engine/docs2/operations_consumer_contract.md`), so external operators have a stable,
+  documented shape to build against.
+- Admin-authenticated atomic bulk-replace job API:
+  `POST /1/migrations/bulk-replace?indexName=...` streams NDJSON through the durable
+  migration spool and publishes one replacement generation atomically, with durable status
+  and cooperative cancellation at `/1/migrations/bulk-replace/{jobID}`. It is node-local
+  only; admission returns `503 migration_ha_unsupported` when replication peers are
+  configured.
+- `flapjack migrate` operator CLI for one-time Algolia migration: submit, poll durable
+  status, and cancel from the command line. Source and destination credentials are accepted
+  only through `--*-env`, `--*-file`, or `--*-stdin` — never as argv — so keys stay out of
+  help text, shell history, and process listings. Distinct non-zero exit codes classify
+  configuration, transport, and terminal-job failures.
+- Cooperative cancellation for asynchronous migration jobs, with owner-identity enforcement
+  and a `409` for cancel requests that arrive too late to take effect.
+- Algolia replica topology is carried through migration: replicas named by the source
+  primary are created as settings-only virtual sidecars whose sort order resolves at query
+  time, with the remaining fidelity limits surfaced as explicit migration warnings.
+- Daily usage snapshots now persist the two usage gauges, so the historical series survives
+  restarts.
+- The migration API now declares one closed `source_provider` union (`algolia`,
+  `meilisearch`, `typesense`) with provider-parameterised routes at
+  `/1/migrations/{provider}` and matching OpenAPI paths. Providers without a shipped adapter
+  fail closed with a stable `source_provider_unsupported` error instead of being silently
+  absent. Meilisearch and Typesense adapters are not shipped yet.
+
 ### Changed
 
 - Oversized ingestion requests now return HTTP `413 Payload Too Large` instead of `400 Bad Request` for both per-document (`DocumentTooLarge`) and per-batch (`BatchTooLarge`) size-limit rejections, letting ingestion clients distinguish "chunk and retry" from a malformed request.

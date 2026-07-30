@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016,SC2034
 
 LOADTEST_HELPER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOADTEST_AUTH_HEADERS=()
@@ -170,7 +171,7 @@ stop_loadtest_server() {
 load_shared_loadtest_config() {
   local config_json
   config_json="$(
-    cd "$LOADTEST_HELPER_DIR"
+    cd "$LOADTEST_HELPER_DIR" || exit
     node -e 'import("./config.js").then(({ sharedLoadtestConfig }) => { console.log(JSON.stringify(sharedLoadtestConfig)); }).catch((error) => { console.error(error); process.exit(1); });'
   )"
 
@@ -309,6 +310,99 @@ index_doc_count() {
   }
 }
 
+sample_liveness_endpoint() {
+  local endpoint="$1"
+  local url="$2"
+  local request_timeout_seconds="${FLAPJACK_LOADTEST_LIVENESS_TIMEOUT_SECONDS:-5}"
+  local curl_status
+  local curl_metrics
+  local http_status
+  local time_total_seconds
+  local extra_metric
+  local latency_ms
+  local status="timeout"
+  local -a curl_args
+
+  curl_args=(
+    curl -sS -o /dev/null -w $'%{http_code}\t%{time_total}'
+    --max-time "$request_timeout_seconds"
+  )
+  if [[ ${#LOADTEST_AUTH_HEADERS[@]} -gt 0 ]]; then
+    curl_args+=("${LOADTEST_AUTH_HEADERS[@]}")
+  fi
+  curl_args+=("$url")
+
+  if curl_metrics="$("${curl_args[@]}" 2>/dev/null)"; then
+    curl_status=0
+  else
+    curl_status=$?
+  fi
+  IFS=$'\t' read -r http_status time_total_seconds extra_metric <<<"$curl_metrics"
+  # If curl cannot emit a parseable time_total, preserve it as a full-timeout latency sample.
+  if [[ -n "$extra_metric" || ! "$time_total_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    time_total_seconds="$request_timeout_seconds"
+  fi
+  latency_ms="$(
+    awk -v seconds="$time_total_seconds" 'BEGIN { printf "%.0f", seconds * 1000 }'
+  )"
+  if [[ "$curl_status" -eq 0 && "$http_status" == "200" ]]; then
+    status="ok"
+  fi
+
+  printf '%s\t%s\t%s\n' "$endpoint" "$status" "$latency_ms"
+}
+
+append_liveness_samples() {
+  local base_url="$1"
+  local index_name="$2"
+  local sample_file="$3"
+  local encoded_index_name
+
+  encoded_index_name="$(loadtest_encode_path_component "$index_name")"
+  {
+    sample_liveness_endpoint "health" "$base_url/health"
+    sample_liveness_endpoint \
+      "count" \
+      "$base_url/1/usage/documents_count/${encoded_index_name}"
+  } >>"$sample_file"
+}
+
+_run_liveness_sampler() {
+  while [[ -n "$4" ]] && kill -0 "$4" 2>/dev/null; do
+    append_liveness_samples "$1" "$2" "$3"
+    sleep "${5:-${FLAPJACK_LOADTEST_LIVENESS_SAMPLE_INTERVAL_SECONDS:-1}}"
+  done
+}
+
+start_liveness_sampler() {
+  : >"$4"
+  # Monitor mode isolates the background sampler and its active probe or sleep child.
+  if [[ "$-" == *m* ]]; then
+    _run_liveness_sampler "$2" "$3" "$4" "$5" "${6:-}" &
+    printf -v "$1" '%s' "$!"
+    return
+  fi
+
+  set -m
+  _run_liveness_sampler "$2" "$3" "$4" "$5" "${6:-}" &
+  printf -v "$1" '%s' "$!"
+  set +m
+}
+
+stop_liveness_sampler() {
+  if [[ -z "${!1:-}" ]]; then
+    return 0
+  fi
+
+  if kill -0 -- "-${!1}" 2>/dev/null; then
+    kill -TERM -- "-${!1}" 2>/dev/null || true
+  elif kill -0 "${!1}" 2>/dev/null; then
+    kill "${!1}" 2>/dev/null || true
+  fi
+  wait "${!1}" 2>/dev/null || true
+  printf -v "$1" '%s' ""
+}
+
 _evaluate_liveness_distribution() {
   awk -F '\t' \
     -v p99_limit_ms="$2" \
@@ -400,6 +494,7 @@ _evaluate_liveness_distribution() {
       printf "endpoint=count samples=%d p99_ms=%d max_ms=%d verdict=%s\n", \
         count_count, count_p99, count_max, count_failed ? "fail" : "pass"
       if (health_timeouts > 0 || count_timeouts > 0) {
+        # Connection failures can return faster than the budget; only a recorded 5000 timeout row proves a true timeout.
         report_error("timeout samples are not allowed")
       }
       if (health_max >= stall_limit_ms || count_max >= stall_limit_ms) {
@@ -582,7 +677,7 @@ load_dashboard_seed_settings() {
   local loadtest_root="${1:-$LOADTEST_HELPER_DIR/..}"
 
   LOADTEST_SETTINGS_JSON="$(
-    cd "$loadtest_root"
+    cd "$loadtest_root" || exit
     node -e 'import("../dashboard/tour/product-seed-data.mjs").then(({ seedSettings }) => { process.stdout.write(JSON.stringify(seedSettings)); }).catch((error) => { console.error(error); process.exit(1); });'
   )"
 }

@@ -8,6 +8,10 @@
 //! `engine/target/dr_proof/latest/measurements.txt`.
 
 #![cfg(debug_assertions)]
+// The guard intentionally serializes process-environment changes across the
+// complete async snapshot specimen; releasing it at an await would reintroduce
+// cross-test environment races.
+#![allow(clippy::await_holding_lock)]
 
 mod common;
 

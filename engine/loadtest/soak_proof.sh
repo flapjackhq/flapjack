@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1091,SC2016,SC2034
 set -euo pipefail
 
 # PL-9 contract: when FLAPJACK_LOADTEST_ROLLUP_WINDOW_MS is set, this soak
@@ -159,7 +160,8 @@ start_server() {
 
   # PL-9: rename the loadtest-scoped knob to the engine's test-only override
   # so the soak and rollup writer derive boundaries from the same width.
-  export FLAPJACK_ROLLUP_WINDOW_OVERRIDE_MS="$(resolve_loadtest_rollup_window_ms)"
+  FLAPJACK_ROLLUP_WINDOW_OVERRIDE_MS="$(resolve_loadtest_rollup_window_ms)"
+  export FLAPJACK_ROLLUP_WINDOW_OVERRIDE_MS
   export FLAPJACK_ROLLUP_INTERVAL_SECS="${FLAPJACK_LOADTEST_ROLLUP_INTERVAL_SECS:-10}"
   "$SERVER_BINARY" --no-auth --bind-addr "$FLAPJACK_BIND_ADDR" --data-dir "$SERVER_DATA_DIR" \
     >"$SERVER_LOG_PATH" 2>&1 &
@@ -602,86 +604,6 @@ stop_sampler() {
   fi
   wait "$SAMPLER_PID" 2>/dev/null || true
   SAMPLER_PID=""
-}
-
-sample_liveness_endpoint() {
-  local endpoint="$1"
-  local url="$2"
-  local request_timeout_seconds="${FLAPJACK_LOADTEST_LIVENESS_TIMEOUT_SECONDS:-5}"
-  local curl_status
-  local curl_metrics
-  local http_status
-  local time_total_seconds
-  local extra_metric
-  local latency_ms
-  local status="timeout"
-  local -a curl_args
-
-  curl_args=(
-    curl -sS -o /dev/null -w $'%{http_code}\t%{time_total}'
-    --max-time "$request_timeout_seconds"
-  )
-  if [[ ${#LOADTEST_AUTH_HEADERS[@]} -gt 0 ]]; then
-    curl_args+=("${LOADTEST_AUTH_HEADERS[@]}")
-  fi
-  curl_args+=("$url")
-
-  if curl_metrics="$("${curl_args[@]}" 2>/dev/null)"; then
-    curl_status=0
-  else
-    curl_status=$?
-  fi
-  IFS=$'\t' read -r http_status time_total_seconds extra_metric <<<"$curl_metrics"
-  if [[ -n "$extra_metric" || ! "$time_total_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-    time_total_seconds="$request_timeout_seconds"
-  fi
-  latency_ms="$(
-    awk -v seconds="$time_total_seconds" 'BEGIN { printf "%.0f", seconds * 1000 }'
-  )"
-  if [[ "$curl_status" -eq 0 && "$http_status" == "200" ]]; then
-    status="ok"
-  fi
-
-  printf '%s\t%s\t%s\n' "$endpoint" "$status" "$latency_ms"
-}
-
-append_liveness_samples() {
-  local encoded_index_name
-
-  encoded_index_name="$(loadtest_encode_path_component "$FLAPJACK_WRITE_INDEX")"
-  sample_liveness_endpoint "health" "$FLAPJACK_BASE_URL/health"
-  sample_liveness_endpoint \
-    "count" \
-    "$FLAPJACK_BASE_URL/1/usage/documents_count/${encoded_index_name}"
-}
-
-start_liveness_sampler() {
-  local sample_interval_seconds="${FLAPJACK_LOADTEST_LIVENESS_SAMPLE_INTERVAL_SECONDS:-1}"
-
-  if [[ "$SCENARIO_NAME" != "write-soak" ]]; then
-    return 0
-  fi
-
-  : >"$LIVENESS_SAMPLE_PATH"
-  {
-    while [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; do
-      append_liveness_samples
-      sleep "$sample_interval_seconds"
-    done
-  } >>"$LIVENESS_SAMPLE_PATH" &
-  LIVENESS_SAMPLER_PID=$!
-}
-
-stop_liveness_sampler() {
-  if [[ -z "$LIVENESS_SAMPLER_PID" ]]; then
-    return 0
-  fi
-
-  if kill -0 "$LIVENESS_SAMPLER_PID" 2>/dev/null; then
-    kill "$LIVENESS_SAMPLER_PID" 2>/dev/null || true
-  fi
-  wait "$LIVENESS_SAMPLER_PID" 2>/dev/null || true
-  LIVENESS_SAMPLER_PID=""
 }
 
 run_soak_scenario() {
@@ -1430,7 +1352,9 @@ cleanup() {
   if [[ "$INTERRUPTED_EXIT_CODE" -ne 0 ]]; then
     effective_exit_code="$INTERRUPTED_EXIT_CODE"
   fi
-  stop_liveness_sampler
+  if declare -F stop_liveness_sampler >/dev/null; then
+    stop_liveness_sampler LIVENESS_SAMPLER_PID
+  fi
   stop_sampler
   stop_server
 
@@ -1511,9 +1435,16 @@ main() {
   "$SEED_SCRIPT"
 
   start_sampler
-  start_liveness_sampler
+  if [[ "$SCENARIO_NAME" == "write-soak" ]]; then
+    start_liveness_sampler \
+      LIVENESS_SAMPLER_PID \
+      "$FLAPJACK_BASE_URL" \
+      "$FLAPJACK_WRITE_INDEX" \
+      "$LIVENESS_SAMPLE_PATH" \
+      "$SERVER_PID"
+  fi
   run_soak_scenario
-  stop_liveness_sampler
+  stop_liveness_sampler LIVENESS_SAMPLER_PID
   stop_sampler
   poll_write_admission_drain || true
   if scenario_requires_analytics_proof; then

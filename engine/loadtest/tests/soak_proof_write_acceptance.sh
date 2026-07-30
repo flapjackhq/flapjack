@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1091,SC2016,SC2030,SC2031,SC2034,SC2129,SC2329
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOAK_SCRIPT="$ROOT_DIR/soak_proof.sh"
+LOADTEST_HELPERS="$ROOT_DIR/lib/loadtest_shell_helpers.sh"
 
 fail() {
   echo "FAIL: $1"
@@ -10,6 +12,7 @@ fail() {
 }
 
 [[ -f "$SOAK_SCRIPT" ]] || fail "missing $SOAK_SCRIPT"
+[[ -f "$LOADTEST_HELPERS" ]] || fail "missing $LOADTEST_HELPERS"
 grep -q 'scenario_requires_analytics_proof' "$SOAK_SCRIPT" || \
   fail "soak_proof.sh must gate analytics proof to analytics-bearing scenarios"
 grep -q 'if scenario_requires_analytics_proof; then' "$SOAK_SCRIPT" || \
@@ -22,8 +25,8 @@ grep -q 'start_liveness_sampler' "$SOAK_SCRIPT" || \
   fail "write-soak must start a dedicated health/count liveness sampler"
 grep -Fq 'liveness_distribution "$LIVENESS_SAMPLE_PATH" 250 5000' "$SOAK_SCRIPT" || \
   fail "write-soak must use the shared liveness_distribution verdict owner"
-grep -Fq '/1/usage/documents_count/${encoded_index_name}' "$SOAK_SCRIPT" || \
-  fail "write-soak must sample the live usage count endpoint"
+grep -Fq '/1/usage/documents_count/${encoded_index_name}' "$LOADTEST_HELPERS" || \
+  fail "shared liveness helper must sample the live usage count endpoint"
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/soak_proof_write_acceptance.XXXXXX")"
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -332,9 +335,8 @@ fi
 require_summary_value "$WORK_DIR/liveness_insufficient/summary.md" "write liveness verdict" "FAIL"
 
 (
-  export FLAPJACK_SOAK_PROOF_SKIP_MAIN=1
-  # shellcheck source=../soak_proof.sh
-  source "$SOAK_SCRIPT"
+  # shellcheck source=../lib/loadtest_shell_helpers.sh
+  source "$LOADTEST_HELPERS"
   LOADTEST_AUTH_HEADERS=()
   curl() {
     printf '200\t0.042'

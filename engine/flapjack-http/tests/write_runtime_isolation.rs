@@ -31,6 +31,7 @@ const COMMIT_DELAY_MS: u64 = 2_000;
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
 const REQUIRED_SAMPLE_COUNT: usize = 100;
 const LATENCY_LIMIT_MS: u128 = 250;
+const COUNT_STALL_RED_THRESHOLD_MS: u128 = 1_000;
 const INDEX_NAME: &str = "runtime_isolation";
 
 struct EnvVarGuard(&'static str);
@@ -52,15 +53,23 @@ impl Drop for EnvVarGuard {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct LivenessSample {
     endpoint: &'static str,
     latency_ms: u128,
+    batch_incomplete_at_start: bool,
+}
+
+#[derive(Clone, Copy)]
+enum LivenessTiming {
+    ScheduledDeadline,
+    RequestStart,
 }
 
 struct BatchOutcome {
     response: Response<Body>,
     elapsed: Duration,
+    completed_at: Instant,
 }
 
 fn make_state(tmp: &TempDir) -> Arc<AppState> {
@@ -159,11 +168,11 @@ async fn sample_liveness(
     app: axum::Router,
     batch_complete: Arc<AtomicBool>,
     ready: oneshot::Sender<()>,
+    timing: LivenessTiming,
 ) -> Vec<LivenessSample> {
     let schedule_start = Instant::now();
     ready.send(()).expect("test waits for sampler readiness");
     let mut samples = Vec::new();
-
     while samples.len() < REQUIRED_SAMPLE_COUNT || !batch_complete.load(Ordering::Acquire) {
         let scheduled_deadline = schedule_start + SAMPLE_INTERVAL * samples.len() as u32;
         tokio::time::sleep_until(scheduled_deadline).await;
@@ -172,19 +181,41 @@ async fn sample_liveness(
         } else {
             ("count", format!("/1/usage/documents_count/{INDEX_NAME}"))
         };
+        let request_started = Instant::now();
+        let batch_incomplete_at_start = !batch_complete.load(Ordering::Acquire);
         let response = request(&app, Method::GET, &uri, None).await;
         assert!(
             response.status().is_success(),
             "{endpoint} sampler request failed with {}",
             response.status()
         );
+        let observed_at = Instant::now();
         samples.push(LivenessSample {
             endpoint,
-            latency_ms: scheduled_deadline.elapsed().as_millis(),
+            latency_ms: liveness_latency_ms(
+                timing,
+                scheduled_deadline,
+                request_started,
+                observed_at,
+            ),
+            batch_incomplete_at_start,
         });
     }
 
     samples
+}
+
+fn liveness_latency_ms(
+    timing: LivenessTiming,
+    scheduled_deadline: Instant,
+    request_started: Instant,
+    observed_at: Instant,
+) -> u128 {
+    match timing {
+        LivenessTiming::ScheduledDeadline => observed_at.duration_since(scheduled_deadline),
+        LivenessTiming::RequestStart => observed_at.duration_since(request_started),
+    }
+    .as_millis()
 }
 
 fn endpoint_distribution(samples: &[LivenessSample], endpoint: &str) -> Vec<u128> {
@@ -195,6 +226,14 @@ fn endpoint_distribution(samples: &[LivenessSample], endpoint: &str) -> Vec<u128
         .collect();
     distribution.sort_unstable();
     distribution
+}
+
+fn samples_during_batch_overlap(samples: &[LivenessSample]) -> Vec<LivenessSample> {
+    samples
+        .iter()
+        .filter(|sample| sample.batch_incomplete_at_start)
+        .cloned()
+        .collect()
 }
 
 fn p99(distribution: &[u128]) -> u128 {
@@ -217,11 +256,106 @@ fn assert_liveness_distribution(samples: &[LivenessSample]) {
             && count_p99 <= LATENCY_LIMIT_MS
             && health_max <= LATENCY_LIMIT_MS
             && count_max <= LATENCY_LIMIT_MS,
-        "scheduled liveness exceeded {LATENCY_LIMIT_MS}ms: \
+        "route liveness exceeded {LATENCY_LIMIT_MS}ms: \
          health_samples={} health_p99={health_p99} health_max={health_max} health={health:?}; \
          count_samples={} count_p99={count_p99} count_max={count_max} count={count:?}",
         health.len(),
         count.len(),
+    );
+}
+
+fn assert_route_characterization(samples: &[LivenessSample]) -> (Vec<u128>, Vec<u128>) {
+    let health = endpoint_distribution(samples, "health");
+    let count = endpoint_distribution(samples, "count");
+    let health_max = *health.last().expect("health must have liveness samples");
+    let count_max = *count.last().expect("count must have liveness samples");
+    assert!(
+        health_max <= LATENCY_LIMIT_MS,
+        "health route exceeded control threshold: {health:?}"
+    );
+    assert!(
+        count_max <= COUNT_STALL_RED_THRESHOLD_MS,
+        "count route crossed the Stage 1 red threshold: {count:?}"
+    );
+    (health, count)
+}
+
+#[test]
+fn route_characterization_accepts_count_latency_below_red_threshold() {
+    let mut samples = [
+        LivenessSample {
+            endpoint: "health",
+            latency_ms: LATENCY_LIMIT_MS,
+            batch_incomplete_at_start: true,
+        },
+        LivenessSample {
+            endpoint: "count",
+            latency_ms: COUNT_STALL_RED_THRESHOLD_MS,
+            batch_incomplete_at_start: true,
+        },
+    ];
+    assert_route_characterization(&samples);
+    for endpoint_index in [1, 0] {
+        samples[endpoint_index].latency_ms += 1;
+        assert!(std::panic::catch_unwind(|| assert_route_characterization(&samples)).is_err());
+        samples[endpoint_index].latency_ms -= 1;
+    }
+}
+
+#[test]
+fn route_characterization_ignores_samples_started_after_batch_completion() {
+    let samples = [
+        LivenessSample {
+            endpoint: "health",
+            latency_ms: LATENCY_LIMIT_MS,
+            batch_incomplete_at_start: true,
+        },
+        LivenessSample {
+            endpoint: "count",
+            latency_ms: COUNT_STALL_RED_THRESHOLD_MS,
+            batch_incomplete_at_start: true,
+        },
+        LivenessSample {
+            endpoint: "health",
+            latency_ms: LATENCY_LIMIT_MS + 1,
+            batch_incomplete_at_start: false,
+        },
+        LivenessSample {
+            endpoint: "count",
+            latency_ms: COUNT_STALL_RED_THRESHOLD_MS + 1,
+            batch_incomplete_at_start: false,
+        },
+    ];
+
+    let overlap_samples = samples_during_batch_overlap(&samples);
+
+    assert_eq!(overlap_samples.len(), 2);
+    assert_route_characterization(&overlap_samples);
+}
+
+#[test]
+fn single_worker_timing_includes_scheduler_starvation_before_request_start() {
+    let scheduled_deadline = Instant::now();
+    let request_started = scheduled_deadline + Duration::from_millis(COMMIT_DELAY_MS);
+    let observed_at = request_started + Duration::from_millis(1);
+
+    assert_eq!(
+        liveness_latency_ms(
+            LivenessTiming::ScheduledDeadline,
+            scheduled_deadline,
+            request_started,
+            observed_at,
+        ),
+        u128::from(COMMIT_DELAY_MS + 1),
+    );
+    assert_eq!(
+        liveness_latency_ms(
+            LivenessTiming::RequestStart,
+            scheduled_deadline,
+            request_started,
+            observed_at,
+        ),
+        1,
     );
 }
 
@@ -263,6 +397,25 @@ async fn prepare_index(app: &axum::Router) {
     assert!(count.status().is_success(), "count setup probe");
 }
 
+async fn wait_for_batch_processing(state: &Arc<AppState>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if state
+            .manager
+            .tenant_tasks_snapshot_for_test(INDEX_NAME)
+            .iter()
+            .any(|task| task.status == TaskStatus::Processing)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "delayed batch never entered processing"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 fn spawn_delayed_batch(
     app: axum::Router,
     batch_complete: Arc<AtomicBool>,
@@ -282,9 +435,11 @@ fn spawn_delayed_batch(
         )
         .await;
         batch_complete.store(true, Ordering::Release);
+        let completed_at = Instant::now();
         BatchOutcome {
             response,
-            elapsed: started.elapsed(),
+            elapsed: completed_at.duration_since(started),
+            completed_at,
         }
     })
 }
@@ -319,6 +474,7 @@ async fn liveness_join_surfaces_batch_panic_without_waiting_for_sampler() {
         BatchOutcome {
             response: Response::new(Body::empty()),
             elapsed: Duration::ZERO,
+            completed_at: Instant::now(),
         }
     });
     let joined = tokio::spawn(join_liveness_and_batch(sampler, batch));
@@ -361,6 +517,7 @@ async fn assert_committed_batch(app: &axum::Router, state: &Arc<AppState>, outco
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial_test::serial]
 async fn single_worker_runtime_serves_count_during_injected_two_second_commit() {
     let tmp = TempDir::new().expect("temporary data directory");
     let (app, state) = make_router(&tmp);
@@ -373,6 +530,7 @@ async fn single_worker_runtime_serves_count_during_injected_two_second_commit() 
         app.clone(),
         Arc::clone(&batch_complete),
         ready_tx,
+        LivenessTiming::ScheduledDeadline,
     ));
     ready_rx.await.expect("separate sampler task became ready");
     let batch = spawn_delayed_batch(app.clone(), batch_complete);
@@ -380,4 +538,76 @@ async fn single_worker_runtime_serves_count_during_injected_two_second_commit() 
     let (samples, outcome) = join_liveness_and_batch(sampler, batch).await;
     assert_committed_batch(&app, &state, outcome).await;
     assert_liveness_distribution(&samples);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn routes_stay_live_while_backpressure_pause_and_commit_overlap() {
+    let tmp = TempDir::new().expect("temporary data directory");
+    let (app, state) = make_router(&tmp);
+    prepare_index(&app).await;
+
+    state.manager.unload_tenant(INDEX_NAME);
+    assert_eq!(
+        latest_document_count(&app).await,
+        0,
+        "the count route must reload the durable tenant through get_or_load"
+    );
+
+    let _delay_guard = EnvVarGuard::set(COMMIT_DELAY_ENV_VAR, &COMMIT_DELAY_MS.to_string());
+    let batch_complete = Arc::new(AtomicBool::new(false));
+    let batch = spawn_delayed_batch(app.clone(), Arc::clone(&batch_complete));
+    wait_for_batch_processing(&state).await;
+    let _pause_guard = state
+        .manager
+        .hold_write_backpressure_pause_for_test_support(INDEX_NAME)
+        .expect("existing backpressure owner holds the tenant pause");
+
+    let overlap_started = Instant::now();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let sampler = tokio::spawn(sample_liveness(
+        app.clone(),
+        Arc::clone(&batch_complete),
+        ready_tx,
+        LivenessTiming::RequestStart,
+    ));
+    ready_rx.await.expect("overlap sampler became ready");
+
+    let (samples, outcome) = join_liveness_and_batch(sampler, batch).await;
+    let overlap_elapsed = outcome
+        .completed_at
+        .saturating_duration_since(overlap_started);
+    assert_committed_batch(&app, &state, outcome).await;
+    let overlap_samples = samples_during_batch_overlap(&samples);
+    assert!(
+        overlap_samples.len() >= REQUIRED_SAMPLE_COUNT,
+        "verified overlap sample denominator too small: overlap_samples={} total_samples={} overlap_ms={}",
+        overlap_samples.len(),
+        samples.len(),
+        overlap_elapsed.as_millis()
+    );
+    let (health, count) = assert_route_characterization(&overlap_samples);
+    let health_p99 = p99(&health);
+    let count_p99 = p99(&count);
+    let health_max = *health.last().expect("health distribution is non-empty");
+    let count_max = *count.last().expect("count distribution is non-empty");
+    let count_stall_detected =
+        count_max > COUNT_STALL_RED_THRESHOLD_MS && health_max <= LATENCY_LIMIT_MS;
+    eprintln!(
+        "Stage 1 route pause+commit characterization: total_samples={} overlap_samples={} overlap_ms={} health_samples={} health_p99_ms={} health_max_ms={} count_samples={} count_p99_ms={} count_max_ms={} count_stall_detected={}",
+        samples.len(),
+        overlap_samples.len(),
+        overlap_elapsed.as_millis(),
+        health.len(),
+        health_p99,
+        health_max,
+        count.len(),
+        count_p99,
+        count_max,
+        count_stall_detected,
+    );
+    assert!(
+        !count_stall_detected,
+        "count route crossed the Stage 1 red threshold while health stayed live"
+    );
 }

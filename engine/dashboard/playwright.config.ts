@@ -43,7 +43,14 @@ export default defineConfig({
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
   workers: process.env.CI ? 1 : (localWorkersOverride ?? 3),
-  reporter: 'html',
+  // Never auto-serve the HTML report. Playwright resolves `open` as
+  // PLAYWRIGHT_HTML_OPEN || options.open || 'on-failure', and on a red run whose stdin
+  // is a TTY it then serves the report and waits for Ctrl+C instead of exiting — which
+  // is why `./s/test --dashboard-full` stopped returning and had to be killed by PID.
+  // A human who wants the report opened sets Playwright's own PLAYWRIGHT_HTML_OPEN,
+  // which still takes precedence over this value; `npm run test:report` is unaffected
+  // because the report is still written to disk either way.
+  reporter: [['html', { open: 'never' }]],
 
   use: {
     baseURL: instance.dashboardBaseUrl,

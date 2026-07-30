@@ -132,6 +132,26 @@ describe('playwright.config startup contracts', () => {
     expect(config.workers).toBe(1)
   })
 
+  it('pins the HTML reporter to open: never so a red run returns unattended', async () => {
+    // Playwright resolves the reporter's `open` as
+    //   PLAYWRIGHT_HTML_OPEN || options.open || 'on-failure'
+    // (playwright/lib/reporters/html.js). With no explicit option, a red run whose
+    // stdin is a TTY serves the report and blocks forever instead of exiting, which
+    // is how `./s/test --dashboard-full` stopped returning. Pinning 'never' here is
+    // what makes the canonical runner terminate; the env var still overrides it, so
+    // a human keeps the old behaviour without a second Flapjack-owned flag.
+    // The end-to-end behaviour is proven separately by a PTY-based probe under
+    // _dev/testing/ (internal tooling, not part of the published dashboard).
+    const config = await loadPlaywrightConfig('')
+
+    expect(Array.isArray(config.reporter)).toBe(true)
+    const reporters = config.reporter as Array<[string, Record<string, unknown>?]>
+    const htmlReporter = reporters.find(([name]) => name === 'html')
+
+    expect(htmlReporter).toBeDefined()
+    expect(htmlReporter?.[1]?.open).toBe('never')
+  })
+
   it('runs Lane C evidence-only specs only when the bundle directory is explicit', async () => {
     const defaultConfig = await loadPlaywrightConfig('')
     const defaultUiProject = findProject(defaultConfig.projects, 'e2e-ui')

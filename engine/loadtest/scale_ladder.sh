@@ -117,6 +117,28 @@ if [[ "${1:-}" == "--bulk-build-worker" ]]; then
   exit $?
 fi
 
+evaluate_rung_liveness() {
+  local rung_dir="$1"
+  local sample_path="$2"
+  local summary_path="${rung_dir}/liveness_summary.txt"
+  local distribution_output
+
+  mkdir -p "$rung_dir"
+  # The helper owns the minimum-sample contract; its default fails empty and endpoint-missing samples closed.
+  if distribution_output="$(liveness_distribution "$sample_path" 250 5000 2>&1)"; then
+    printf '%s\n' "$distribution_output" > "$summary_path"
+    printf 'LIVENESS_PASSED\n'
+    return 0
+  fi
+
+  printf '%s\n' "$distribution_output" > "$summary_path"
+  if ! grep -Eq '(^|[[:space:]])verdict=fail([[:space:]]|$)' "$summary_path"; then
+    printf 'verdict=fail reason=liveness_distribution_failed\n' >> "$summary_path"
+  fi
+  printf 'LIVENESS_FAILED\n'
+  return 1
+}
+
 portable_dir_size_bytes() {
   local directory="$1"
   local size_bytes
@@ -564,8 +586,11 @@ cleanup() {
   local receipt_runner_tmp_dir=""
   local -a backpressure_pause_sources=()
   local -a backpressure_pause_receipt_lines=()
+  local -a liveness_evidence_receipt_lines=()
   local backpressure_pause_artifact_count=0
   local backpressure_pause_source_count=0
+  local liveness_evidence_count=0
+  local active_liveness_path active_liveness_relative active_liveness_i
   local pause_source pause_relative pause_parent pause_destination pause_decision pause_i
   if [[ "$CLEANUP_COMPLETE" -eq 1 ]]; then
     return
@@ -614,6 +639,17 @@ cleanup() {
         )
       fi
     done
+    if [[ -n "$RESULTS_DIR" && "$ACTIVE_RUNG" -gt 0 ]]; then
+      for active_liveness_path in \
+        "$RESULTS_DIR/rung_${ACTIVE_RUNG}/liveness_samples.tsv" \
+        "$RESULTS_DIR/rung_${ACTIVE_RUNG}/liveness_summary.txt"; do
+        if [[ -e "$active_liveness_path" ]]; then
+          active_liveness_relative="${active_liveness_path#"$RESULTS_DIR"/}"
+          liveness_evidence_count=$((liveness_evidence_count + 1))
+          liveness_evidence_receipt_lines+=("liveness_evidence=${active_liveness_relative}")
+        fi
+      done
+    fi
     if [[ -n "$RESULTS_DIR" ]]; then
       if ! {
         echo "outcome=FAIL"
@@ -627,6 +663,14 @@ cleanup() {
           echo "backpressure_pause_artifacts=none present"
         elif [[ "$backpressure_pause_artifact_count" -gt 0 ]]; then
           printf '%s\n' "${backpressure_pause_receipt_lines[@]}"
+        fi
+        echo "liveness_evidence_count=${liveness_evidence_count}"
+        if [[ "$liveness_evidence_count" -eq 0 ]]; then
+          echo "liveness_evidence=none present"
+        else
+          for ((active_liveness_i = 0; active_liveness_i < liveness_evidence_count; active_liveness_i++)); do
+            printf '%s\n' "${liveness_evidence_receipt_lines[active_liveness_i]}"
+          done
         fi
       } > "$RESULTS_DIR/failure_evidence.txt"; then
         echo "ERROR: failed to write failure evidence receipt in ${RESULTS_DIR}" >&2
@@ -652,6 +696,8 @@ cleanup() {
     rm -rf "$RUNNER_TMP_DIR"
   fi
 }
+
+if [[ "${FLAPJACK_SCALE_LADDER_SKIP_MAIN:-0}" != "1" ]]; then
 
 trap cleanup EXIT
 trap 'INTERRUPTED_EXIT_CODE=130; exit 130' INT
@@ -909,12 +955,23 @@ for rung in "${RUNGS[@]}"; do
   create_sentinel_batch "$sentinel_batch" "$rung"
 
   import_artifact="$rung_dir/import_benchmark.json"
+  liveness_sample_path="$rung_dir/liveness_samples.tsv"
+  liveness_sampler_pid=""
+  count_stall_status=0
+  import_wait_status=0
+  liveness_status=0
   worker_mode="--import-worker"
   if [[ "$WORKLOAD" == "bulk_build" ]]; then
     worker_mode="--bulk-build-worker"
   fi
   start_scale_build_resource_monitor "$SERVER_PID" "$SERVER_DATA_DIR" \
     "$rung_dir/build_resource_observation.json"
+  start_liveness_sampler \
+    liveness_sampler_pid \
+    "$BASE_URL" \
+    "$index_name" \
+    "$liveness_sample_path" \
+    "$SERVER_PID"
   timeout "$IMPORT_TIMEOUT_SECONDS" bash "$SCRIPT_DIR/scale_ladder.sh" \
     "$worker_mode" "$dataset_dir" "$index_name" "$import_artifact" \
     >"$rung_dir/import.stdout.txt" 2>&1 &
@@ -922,18 +979,23 @@ for rung in "${RUNGS[@]}"; do
 
   if [[ "$WORKLOAD" != "bulk_build" ]] &&
     ! wait_for_count_or_stall "$BASE_URL" "$index_name" "$rung" "$STALL_SECONDS"; then
+    count_stall_status=1
     kill "$import_pid" 2>/dev/null || true
     wait "$import_pid" 2>/dev/null || true
-    stop_scale_build_resource_monitor
-    FAILURE_OUTCOME="LIVENESS_FAILED"
-    fail "rung ${rung} stalled before reaching its exact target"
+  elif ! wait "$import_pid"; then
+    import_wait_status=$?
   fi
-  if ! wait "$import_pid"; then
-    stop_scale_build_resource_monitor
+  stop_liveness_sampler liveness_sampler_pid
+  stop_scale_build_resource_monitor
+  evaluate_rung_liveness "$rung_dir" "$liveness_sample_path" || liveness_status=$?
+  if [[ "$count_stall_status" -ne 0 || "$liveness_status" -ne 0 ]]; then
+    FAILURE_OUTCOME="LIVENESS_FAILED"
+    fail "rung ${rung} liveness gate failed; see ${rung_dir}/liveness_summary.txt"
+  fi
+  if [[ "$import_wait_status" -ne 0 ]]; then
     FAILURE_OUTCOME="IMPORT_FAILED"
     fail "rung ${rung} import worker failed; see ${rung_dir}/import.stdout.txt"
   fi
-  stop_scale_build_resource_monitor
 
   final_count="$(index_doc_count "$BASE_URL" "$index_name")"
   [[ "$final_count" -eq "$rung" ]] || {
@@ -1114,3 +1176,5 @@ done
 write_run_receipt "COMPLETED"
 RUN_SUCCEEDED=1
 echo "PASS: scale ladder completed at ${starting_count} documents"
+
+fi

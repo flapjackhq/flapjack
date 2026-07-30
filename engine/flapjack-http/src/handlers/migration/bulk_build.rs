@@ -20,7 +20,14 @@ use std::error::Error;
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+// Backpressure can remain sticky across several 30-second observation samples while
+// already-admitted writes drain and merge. Keep the migration-local retry budget
+// high enough for the real staged writer to observe recovery instead of settling
+// a transient pause as a terminal import failure.
+pub(super) const DOCUMENT_WRITE_RETRY_CAP: Duration = Duration::from_secs(900);
 
 #[cfg(test)]
 pub(super) type BeforeDocumentBatchWriteHook =
@@ -142,6 +149,75 @@ impl BulkBuildStaging {
     }
 }
 
+struct RetryingDocumentBatchWriter {
+    staging_manager: Arc<IndexManager>,
+    staging_tenant: String,
+    cancellation: MigrationCancellationCheck,
+    retry_cap: Duration,
+    #[cfg(test)]
+    before_write: Option<BeforeDocumentBatchWriteHook>,
+}
+
+impl RetryingDocumentBatchWriter {
+    fn write(
+        &self,
+        runtime: &tokio::runtime::Runtime,
+        batch: &[Document],
+    ) -> Result<Option<flapjack::types::TaskInfo>, FlapjackError> {
+        let started_at = Instant::now();
+        let mut retry_attempt = 0usize;
+
+        loop {
+            match self.write_once(runtime, batch) {
+                Ok(task) => return Ok(task),
+                Err(error) => {
+                    let Some(retry_after) = error.retry_after() else {
+                        return Err(error);
+                    };
+                    let elapsed = started_at.elapsed();
+                    if elapsed.saturating_add(retry_after) > self.retry_cap {
+                        return Err(error);
+                    }
+                    retry_attempt += 1;
+                    tracing::warn!(
+                        attempt = retry_attempt,
+                        elapsed = ?elapsed,
+                        retry_cap = ?self.retry_cap,
+                        staging_tenant = %self.staging_tenant,
+                        error = %error,
+                        "flapjack.migration.bulk_build.backpressure_retry"
+                    );
+                    std::thread::sleep(retry_after);
+                }
+            }
+        }
+    }
+
+    fn write_once(
+        &self,
+        runtime: &tokio::runtime::Runtime,
+        batch: &[Document],
+    ) -> Result<Option<flapjack::types::TaskInfo>, FlapjackError> {
+        #[cfg(test)]
+        if let Some(hook) = &self.before_write {
+            hook(batch)?;
+        }
+        if self
+            .cancellation
+            .cancel_requested()
+            .map_err(|error| FlapjackError::Io(error.to_string()))?
+        {
+            return Ok(None);
+        }
+        runtime
+            .block_on(
+                self.staging_manager
+                    .add_documents_insert_durable(&self.staging_tenant, batch.to_vec()),
+            )
+            .map(Some)
+    }
+}
+
 /// Coordinates preparation, staging lifecycle, verification, and activation.
 pub(super) struct BulkBuildService<'a> {
     state_manager: &'a Arc<IndexManager>,
@@ -225,6 +301,7 @@ impl<'a> BulkBuildService<'a> {
         staging: &BulkBuildStaging,
         #[cfg(test)] before_write: Option<BeforeDocumentBatchWriteHook>,
         #[cfg(test)] after_write: Option<AfterDocumentBatchWriteHook>,
+        #[cfg(test)] retry_cap: Option<Duration>,
     ) -> (
         SyncSender<Vec<Document>>,
         JoinHandle<Result<(), FlapjackError>>,
@@ -234,27 +311,29 @@ impl<'a> BulkBuildService<'a> {
         let staging_manager = Arc::clone(&staging.manager);
         let staging_tenant = staging.tenant.clone();
         let cancellation = self.cancellation.clone();
+        #[cfg(test)]
+        let retry_cap = retry_cap.unwrap_or(DOCUMENT_WRITE_RETRY_CAP);
+        #[cfg(not(test))]
+        let retry_cap = DOCUMENT_WRITE_RETRY_CAP;
         let writer = std::thread::spawn(move || -> Result<(), FlapjackError> {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            while let Ok(batch) = document_receiver.recv() {
+            let batch_writer = RetryingDocumentBatchWriter {
+                staging_manager,
+                staging_tenant,
+                cancellation,
+                retry_cap,
                 #[cfg(test)]
-                if let Some(hook) = &before_write {
-                    hook(&batch)?;
-                }
-                if cancellation
-                    .cancel_requested()
-                    .map_err(|error| FlapjackError::Io(error.to_string()))?
-                {
+                before_write,
+            };
+            while let Ok(batch) = document_receiver.recv() {
+                let Some(task) = batch_writer.write(&runtime, &batch)? else {
                     continue;
-                }
-                let task = runtime.block_on(
-                    staging_manager.add_documents_insert_durable(&staging_tenant, batch),
-                )?;
+                };
                 #[cfg(test)]
                 if let Some(hook) = &after_write {
-                    let committed_task = staging_manager.get_task(&task.id)?;
+                    let committed_task = batch_writer.staging_manager.get_task(&task.id)?;
                     hook(&committed_task);
                 }
                 #[cfg(not(test))]
@@ -269,7 +348,7 @@ impl<'a> BulkBuildService<'a> {
             // path's own quiescence gate before validation and activation. Removing either one
             // breaks staged bulk builds — verified: deleting this drain fails 10 migration
             // tests including `bulk_build_quiesces_staging_writer_before_activation`.
-            runtime.block_on(staging_manager.drain_all_write_queues())?;
+            runtime.block_on(batch_writer.staging_manager.drain_all_write_queues())?;
             Ok(())
         });
         (document_sender, writer)

@@ -2921,8 +2921,7 @@
         "tags": [
           "migration"
         ],
-        "summary": "Async Algolia migration submission endpoint.",
-        "description": "This route admits node-local create or replace migration requests and\nimmediately returns the durable admission snapshot.",
+        "summary": "Submit an asynchronous source migration.",
         "operationId": "submit_algolia_migration",
         "requestBody": {
           "content": {
@@ -2936,7 +2935,7 @@
         },
         "responses": {
           "202": {
-            "description": "Async Algolia migration admitted",
+            "description": "Async source migration admitted",
             "content": {
               "application/json": {
                 "schema": {
@@ -2952,7 +2951,7 @@
             "description": "Migration admission persistence failed"
           },
           "502": {
-            "description": "Upstream Algolia request failed"
+            "description": "Upstream source provider request failed"
           },
           "503": {
             "description": "migration_ha_unsupported or migration_capacity_exhausted"
@@ -2970,8 +2969,7 @@
         "tags": [
           "migration"
         ],
-        "summary": "Return the durable status for an async Algolia migration job.",
-        "description": "A 404 means no durable phase record is currently retained for the UUID; it\nis not proof that the UUID never existed because future MIG-9 retention may\nremove old records.",
+        "summary": "Return the durable status for an asynchronous source migration.",
         "operationId": "get_algolia_migration_status",
         "parameters": [
           {
@@ -2987,7 +2985,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Durable async Algolia migration status",
+            "description": "Durable async source migration status",
             "content": {
               "application/json": {
                 "schema": {
@@ -3018,8 +3016,7 @@
         "tags": [
           "migration"
         ],
-        "summary": "Confirm that the control plane has durably observed a terminal migration.",
-        "description": "The acknowledgement is intentionally an idempotent no-op in the engine:\nfjcloud owns its retained outbox and only needs an authenticated terminal\nreceipt before releasing the destination reservation.",
+        "summary": "Confirm that the control plane observed a terminal source migration.",
         "operationId": "acknowledge_algolia_migration",
         "parameters": [
           {
@@ -3062,8 +3059,7 @@
         "tags": [
           "migration"
         ],
-        "summary": "Request cooperative cancellation for an async Algolia migration job.",
-        "description": "Cancellation is durable and cooperative. Jobs that have not reached the\npublication commit boundary observe the request at their next checkpoint;\nterminal jobs are returned unchanged, and post-commit running jobs are too\nlate to cancel because Stage 2 never rolls back a committed target.",
+        "summary": "Request cooperative cancellation for an asynchronous source migration.",
         "operationId": "cancel_algolia_migration",
         "parameters": [
           {
@@ -3079,7 +3075,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Durable async Algolia migration status after cancel request",
+            "description": "Durable async source migration status after cancel request",
             "content": {
               "application/json": {
                 "schema": {
@@ -3171,28 +3167,26 @@
         ]
       }
     },
-    "/1/migrations/bulk-replace/{job_id}": {
-      "get": {
+    "/1/migrations/meilisearch": {
+      "post": {
         "tags": [
           "migration"
         ],
-        "summary": "Return durable status for a node-local bulk replacement job.",
-        "operationId": "get_bulk_replace_status_http",
-        "parameters": [
-          {
-            "name": "job_id",
-            "in": "path",
-            "description": "Bulk replacement job UUID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
+        "summary": "Submit an asynchronous source migration.",
+        "operationId": "submit_meilisearch_migration",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MigrateFromAlgoliaRequest"
+              }
             }
-          }
-        ],
+          },
+          "required": true
+        },
         "responses": {
-          "200": {
-            "description": "Durable bulk replacement job status",
+          "202": {
+            "description": "Async source migration admitted",
             "content": {
               "application/json": {
                 "schema": {
@@ -3202,10 +3196,60 @@
             }
           },
           "400": {
-            "description": "Invalid bulk replacement job UUID"
+            "description": "Invalid migration request or unsupported source payload"
+          },
+          "500": {
+            "description": "Migration admission persistence failed"
+          },
+          "502": {
+            "description": "Upstream source provider request failed"
+          },
+          "503": {
+            "description": "migration_ha_unsupported or migration_capacity_exhausted"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/1/migrations/meilisearch/{job_id}": {
+      "get": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Return the durable status for an asynchronous source migration.",
+        "operationId": "get_meilisearch_migration_status",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Migration job UUID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Durable async source migration status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsyncMigrationStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid migration job UUID"
           },
           "404": {
-            "description": "No owned durable migration record is retained for the UUID"
+            "description": "No durable migration phase record is currently retained for the UUID"
           },
           "500": {
             "description": "Migration status record could not be read"
@@ -3218,18 +3262,18 @@
         ]
       }
     },
-    "/1/migrations/bulk-replace/{job_id}/cancel": {
+    "/1/migrations/meilisearch/{job_id}/acknowledge": {
       "post": {
         "tags": [
           "migration"
         ],
-        "summary": "Request cooperative cancellation of a node-local bulk replacement job.",
-        "operationId": "cancel_bulk_replace_http",
+        "summary": "Confirm that the control plane observed a terminal source migration.",
+        "operationId": "acknowledge_meilisearch_migration",
         "parameters": [
           {
             "name": "job_id",
             "in": "path",
-            "description": "Bulk replacement job UUID",
+            "description": "Migration job UUID",
             "required": true,
             "schema": {
               "type": "string",
@@ -3238,8 +3282,51 @@
           }
         ],
         "responses": {
-          "202": {
-            "description": "Durable bulk replacement status after cancellation request",
+          "204": {
+            "description": "Terminal migration acknowledged"
+          },
+          "400": {
+            "description": "Invalid migration job UUID"
+          },
+          "404": {
+            "description": "No durable migration phase record is currently retained for the UUID"
+          },
+          "409": {
+            "description": "migration_ack_too_early"
+          },
+          "500": {
+            "description": "Migration status record could not be read"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/1/migrations/meilisearch/{job_id}/cancel": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Request cooperative cancellation for an asynchronous source migration.",
+        "operationId": "cancel_meilisearch_migration",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Migration job UUID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Durable async source migration status after cancel request",
             "content": {
               "application/json": {
                 "schema": {
@@ -3249,16 +3336,16 @@
             }
           },
           "400": {
-            "description": "Invalid bulk replacement job UUID"
+            "description": "Invalid migration job UUID"
           },
           "404": {
-            "description": "No owned durable migration record is retained for the UUID"
+            "description": "No durable migration phase record is currently retained for the UUID"
           },
           "409": {
-            "description": "Cancellation arrived after the publication commit boundary"
+            "description": "cancel_too_late"
           },
           "500": {
-            "description": "Migration cancellation could not be persisted"
+            "description": "Migration cancel request could not be persisted"
           }
         },
         "security": [
@@ -3308,6 +3395,194 @@
         "security": [
           {
             "private_migration": []
+          }
+        ]
+      }
+    },
+    "/1/migrations/typesense": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Submit an asynchronous source migration.",
+        "operationId": "submit_typesense_migration",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MigrateFromAlgoliaRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Async source migration admitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsyncMigrationStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid migration request or unsupported source payload"
+          },
+          "500": {
+            "description": "Migration admission persistence failed"
+          },
+          "502": {
+            "description": "Upstream source provider request failed"
+          },
+          "503": {
+            "description": "migration_ha_unsupported or migration_capacity_exhausted"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/1/migrations/typesense/{job_id}": {
+      "get": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Return the durable status for an asynchronous source migration.",
+        "operationId": "get_typesense_migration_status",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Migration job UUID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Durable async source migration status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsyncMigrationStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid migration job UUID"
+          },
+          "404": {
+            "description": "No durable migration phase record is currently retained for the UUID"
+          },
+          "500": {
+            "description": "Migration status record could not be read"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/1/migrations/typesense/{job_id}/acknowledge": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Confirm that the control plane observed a terminal source migration.",
+        "operationId": "acknowledge_typesense_migration",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Migration job UUID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Terminal migration acknowledged"
+          },
+          "400": {
+            "description": "Invalid migration job UUID"
+          },
+          "404": {
+            "description": "No durable migration phase record is currently retained for the UUID"
+          },
+          "409": {
+            "description": "migration_ack_too_early"
+          },
+          "500": {
+            "description": "Migration status record could not be read"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/1/migrations/typesense/{job_id}/cancel": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Request cooperative cancellation for an asynchronous source migration.",
+        "operationId": "cancel_typesense_migration",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Migration job UUID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Durable async source migration status after cancel request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsyncMigrationStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid migration job UUID"
+          },
+          "404": {
+            "description": "No durable migration phase record is currently retained for the UUID"
+          },
+          "409": {
+            "description": "cancel_too_late"
+          },
+          "500": {
+            "description": "Migration cancel request could not be persisted"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
           }
         ]
       }

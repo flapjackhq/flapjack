@@ -168,6 +168,9 @@ fn parity_settings() -> IndexSettings {
     }
 }
 
+// This fixture constructor mirrors the nine-column ProductSeed table above;
+// keeping the columns explicit makes call-site specimens auditable.
+#[allow(clippy::too_many_arguments)]
 fn product_doc(
     id: &str,
     title: &str,
@@ -253,7 +256,7 @@ fn filler_doc(batch: usize, idx: usize) -> Value {
         "FillerBrand",
         "filler",
         10 + idx as i64,
-        idx % 2 == 0,
+        idx.is_multiple_of(2),
         2020 + (idx % 4) as i64,
         idx as i64,
     )

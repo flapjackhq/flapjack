@@ -191,6 +191,10 @@ fn async_create_admission_preserves_historical_metadata_shape() {
     assert_eq!(serialized, historical_metadata.as_bytes());
     let metadata = store.read_async_migration_metadata(job_uuid).unwrap();
     assert_eq!(
+        metadata.operation_kind,
+        AsyncMigrationOperationKind::SourceImport
+    );
+    assert_eq!(
         metadata.publication_semantic,
         AsyncMigrationPublicationSemantic::CreateOnly
     );

@@ -392,6 +392,7 @@ impl super::IndexManager {
         crate::index::write_queue::backpressure::ensure_bulk_admission_allowed(
             &self.base_path,
             tenant_id,
+            index,
         )?;
         if let Some(tx) = self.write_queues.get(tenant_id).map(|queue| queue.clone()) {
             // Preserve the pre-admission API contract from `try_send`: callers can retry

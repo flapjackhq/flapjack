@@ -843,6 +843,7 @@ mod tests {
         retention_gap_detected,
     };
     use crate::handlers::AppState;
+    use crate::test_helpers::{assert_quiescence_before_publication, quiesced_snapshot_bytes};
     use axum::{extract::State, routing::get, routing::post, Json, Router};
     use flapjack::index::snapshot::export_to_bytes;
     use flapjack_replication::config::{NodeConfig, PeerConfig};
@@ -863,6 +864,7 @@ mod tests {
 
     #[tokio::test]
     async fn absent_snapshot_destination_is_fenced_before_installation() {
+        flapjack::index::write_queue::clear_writer_lifecycle_test_events();
         let tenant_id = "absent_restore_admission_fence";
         let source_tmp = TempDir::new().unwrap();
         let source_manager = flapjack::IndexManager::new(source_tmp.path());
@@ -878,7 +880,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let snapshot_bytes = export_to_bytes(&source_manager.base_path.join(tenant_id)).unwrap();
+        source_manager.graceful_shutdown().await;
+        let snapshot_bytes = quiesced_snapshot_bytes(&source_manager, tenant_id).await;
+        assert_quiescence_before_publication(tenant_id, "snapshot_export_read");
 
         let destination_tmp = TempDir::new().unwrap();
         let manager = Arc::new(flapjack::IndexManager::new(destination_tmp.path()));

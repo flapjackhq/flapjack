@@ -749,15 +749,11 @@ async fn async_acknowledge_published_terminal_job_accepts_current_generation() {
     assert_eq!(spool.read_migration_phase(job_uuid).unwrap(), terminal);
 }
 
-const ALGOLIA_MIGRATION_PROVIDER: &str = "algolia";
-const TEST_ONLY_SECOND_PROVIDER: &str = "test_only_second_provider";
-
 /// Migration job lifecycle wire surface owned by one source provider.
 ///
 /// The provider is part of the job-lifecycle URL, so status, cancel, and ACK
 /// requests are addressed through the provider that owns the route instead of
-/// through a hard-coded Algolia path. Tests that need to prove an any-provider
-/// contract mount a second provider's routes and drive both.
+/// through a hard-coded Algolia path.
 struct MigrationLifecycleRoutes {
     provider: &'static str,
     router: Router,
@@ -778,25 +774,58 @@ impl MigrationLifecycleRoutes {
 }
 
 fn migration_job_route(state: Arc<AppState>) -> MigrationLifecycleRoutes {
-    MigrationLifecycleRoutes::mounted(
-        ALGOLIA_MIGRATION_PROVIDER,
-        Router::new()
-            .route("/:job_id", get(get_algolia_migration_status_http))
-            .route("/:job_id/acknowledge", post(acknowledge_algolia_migration))
-            .route("/:job_id/cancel", post(cancel_algolia_migration_http))
-            .with_state(state),
+    migration_job_route_for_provider(
+        AsyncMigrationSourceProvider::Algolia.as_str().unwrap(),
+        state,
     )
 }
 
-fn test_only_second_provider_migration_job_route(state: Arc<AppState>) -> MigrationLifecycleRoutes {
-    MigrationLifecycleRoutes::mounted(
-        TEST_ONLY_SECOND_PROVIDER,
-        Router::new()
-            .route("/:job_id", get(get_algolia_migration_status_http))
-            .route("/:job_id/acknowledge", post(acknowledge_algolia_migration))
-            .route("/:job_id/cancel", post(cancel_algolia_migration_http))
-            .with_state(state),
-    )
+fn migration_job_route_for_provider(
+    provider: &'static str,
+    state: Arc<AppState>,
+) -> MigrationLifecycleRoutes {
+    let provider_routes = Router::new()
+        .route("/", post(submit_algolia_migration_http))
+        .route("/:job_id", get(get_algolia_migration_status_http))
+        .route(
+            "/:job_id/acknowledge",
+            post(acknowledge_algolia_migration_http),
+        )
+        .route("/:job_id/cancel", post(cancel_algolia_migration_http))
+        .with_state(state);
+    let provider_routes = match AsyncMigrationSourceProvider::parse(provider) {
+        Some(provider) => provider_routes.layer(axum::extract::Extension(provider)),
+        None => provider_routes,
+    };
+    MigrationLifecycleRoutes::mounted(provider, provider_routes)
+}
+
+fn public_provider_migration_routes(state: &Arc<AppState>) -> Vec<MigrationLifecycleRoutes> {
+    AsyncMigrationSourceProvider::PUBLIC
+        .into_iter()
+        .map(|provider| {
+            migration_job_route_for_provider(provider.as_str().unwrap(), Arc::clone(state))
+        })
+        .collect()
+}
+
+async fn send_submit_request(
+    app: &MigrationLifecycleRoutes,
+    authenticated_app_id: &str,
+    api_key: &str,
+    payload: serde_json::Value,
+) -> Response<Body> {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/1/migrations/{}", app.provider))
+        .header("content-type", "application/json")
+        .header("x-algolia-api-key", api_key)
+        .body(Body::from(payload.to_string()))
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(AuthenticatedAppId(authenticated_app_id.to_string()));
+    app.router.clone().oneshot(request).await.unwrap()
 }
 
 async fn send_acknowledge_request(
@@ -1063,34 +1092,413 @@ async fn async_runner_created_job_is_isolated_by_authenticated_app_and_key() {
     }
 }
 
-#[tokio::test]
-async fn async_metadata_source_provider_defaults_and_reads_as_algolia() {
+#[test]
+fn async_metadata_legacy_algolia_omission_decodes_as_source_import() {
     let job_uuid = Uuid::new_v4();
     let legacy: spool::AsyncMigrationMetadata = serde_json::from_value(json!({
         "job_uuid": job_uuid,
         "target_index": "legacy-provider-target"
     }))
     .unwrap();
+
+    assert_eq!(legacy.job_uuid, job_uuid);
+    assert_eq!(legacy.target_index, "legacy-provider-target");
     assert_eq!(
         legacy.source_provider,
         AsyncMigrationSourceProvider::Algolia
     );
+    assert_eq!(
+        legacy.publication_semantic,
+        AsyncMigrationPublicationSemantic::CreateOnly
+    );
+    assert_eq!(legacy.topology, None);
+    assert_eq!(
+        serde_json::to_value(&legacy).unwrap(),
+        json!({
+            "job_uuid": job_uuid,
+            "target_index": "legacy-provider-target"
+        })
+    );
+}
+
+#[test]
+fn async_metadata_legacy_bulk_replace_source_provider_decodes_as_internal_operation() {
+    let job_uuid = Uuid::new_v4();
+    let legacy: spool::AsyncMigrationMetadata = serde_json::from_value(json!({
+        "job_uuid": job_uuid,
+        "source_provider": "bulk_replace",
+        "target_index": "legacy-bulk-replace-target",
+        "topology": "single_node_only",
+        "publication_semantic": "replaceExisting",
+        "authenticated_app_id": "legacy-owner"
+    }))
+    .unwrap();
+
+    assert_eq!(legacy.job_uuid, job_uuid);
+    assert_eq!(legacy.target_index, "legacy-bulk-replace-target");
+    assert_eq!(
+        legacy.source_provider,
+        AsyncMigrationSourceProvider::Algolia,
+        "legacy bulk_replace rows must normalize public source_provider to Algolia"
+    );
+    assert_eq!(
+        AsyncMigrationSourceProvider::parse("bulk_replace"),
+        None,
+        "bulk_replace compatibility decoding must not widen the public parser"
+    );
+    assert_eq!(
+        legacy.publication_semantic,
+        AsyncMigrationPublicationSemantic::ReplaceExisting
+    );
+    assert_eq!(legacy.topology, Some(MigrationTopology::SingleNodeOnly));
+    assert_eq!(legacy.authenticated_app_id.as_deref(), Some("legacy-owner"));
+    assert_eq!(
+        serde_json::to_value(&legacy).unwrap(),
+        json!({
+            "job_uuid": job_uuid,
+            "operation_kind": "bulk_replace",
+            "target_index": "legacy-bulk-replace-target",
+            "topology": "single_node_only",
+            "publication_semantic": "replaceExisting",
+            "authenticated_app_id": "legacy-owner"
+        })
+    );
+}
+
+#[tokio::test]
+async fn async_metadata_new_bulk_replace_write_uses_internal_operation_kind() {
+    let job_uuid = Uuid::new_v4();
 
     let tmp = TempDir::new().unwrap();
     let state = TestStateBuilder::new(&tmp).build_shared();
     let spool = import::spool_for_manager(&state.manager).unwrap();
     spool
-        .create_async_migration_admission_for_owner(
+        .create_bulk_replace_admission_for_owner(
             job_uuid,
-            "provider-target",
-            Some("provider-owner"),
-            AsyncMigrationPublicationSemantic::CreateOnly,
+            "provider-bulk-replace-target",
+            "provider-owner",
+            AsyncMigrationPublicationSemantic::ReplaceExisting,
         )
         .unwrap();
     let admitted = spool.read_async_migration_metadata(job_uuid).unwrap();
+
+    assert_eq!(admitted.job_uuid, job_uuid);
+    assert_eq!(admitted.target_index, "provider-bulk-replace-target");
     assert_eq!(
         admitted.source_provider,
-        AsyncMigrationSourceProvider::Algolia
+        AsyncMigrationSourceProvider::Algolia,
+        "new bulk-replace metadata must keep the public source_provider normalized"
+    );
+    assert_eq!(
+        admitted.publication_semantic,
+        AsyncMigrationPublicationSemantic::ReplaceExisting
+    );
+    assert_eq!(admitted.topology, Some(MigrationTopology::SingleNodeOnly));
+    assert_eq!(
+        admitted.authenticated_app_id.as_deref(),
+        Some("provider-owner")
+    );
+
+    let wire: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(spool.async_migration_metadata_path(job_uuid)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        wire,
+        json!({
+            "job_uuid": job_uuid,
+            "operation_kind": "bulk_replace",
+            "target_index": "provider-bulk-replace-target",
+            "topology": "single_node_only",
+            "publication_semantic": "replaceExisting",
+            "authenticated_app_id": "provider-owner"
+        })
+    );
+    assert_ne!(wire.get("source_provider"), Some(&json!("bulk_replace")));
+}
+
+#[test]
+fn async_migration_source_provider_parser_rejects_non_members() {
+    assert_eq!(AsyncMigrationSourceProvider::parse("bulk_replace"), None);
+    assert_eq!(AsyncMigrationSourceProvider::parse("not_a_provider"), None);
+}
+
+#[test]
+fn async_migration_source_provider_parser_pins_closed_public_union() {
+    let parsed_public_providers: BTreeSet<&'static str> = ["algolia", "meilisearch", "typesense"]
+        .into_iter()
+        .filter_map(AsyncMigrationSourceProvider::parse)
+        .filter_map(AsyncMigrationSourceProvider::as_str)
+        .collect();
+
+    let public_provider_routes: BTreeSet<&'static str> = AsyncMigrationSourceProvider::PUBLIC
+        .into_iter()
+        .map(|provider| provider.as_str().unwrap())
+        .collect();
+
+    assert_eq!(
+        parsed_public_providers,
+        BTreeSet::from(["algolia", "meilisearch", "typesense"]),
+        "source_provider parser must expose exactly the closed public migration provider union"
+    );
+    assert_eq!(
+        public_provider_routes, parsed_public_providers,
+        "public route providers must stay in lockstep with parser-accepted providers"
+    );
+}
+
+async fn assert_unsupported_provider_skips_source_factory(
+    source_provider: AsyncMigrationSourceProvider,
+    state: Arc<AppState>,
+) {
+    let source_factory_observed = Arc::new(AtomicBool::new(false));
+    let factory_error = submit_source_migration_with_test_source_factory(
+        source_provider,
+        State(state),
+        axum::extract::Extension(AuthenticatedAppId("unsupported-provider-owner".to_string())),
+        Json(valid_async_request()),
+        {
+            let source_factory_observed = Arc::clone(&source_factory_observed);
+            move |_| -> Result<ScriptedSourceReader, AlgoliaClientError> {
+                source_factory_observed.store(true, Ordering::SeqCst);
+                Err(AlgoliaClientError::new(
+                    AlgoliaErrorKind::Validation,
+                    "unsupported provider reached source construction",
+                ))
+            }
+        },
+    )
+    .await
+    .expect_err("recognized unsupported providers must fail before source construction");
+    let (factory_error_status, Json(factory_error_body)) = factory_error;
+
+    assert_eq!(
+        (
+            source_factory_observed.load(Ordering::SeqCst),
+            factory_error_status,
+            factory_error_body["code"].as_str(),
+        ),
+        (
+            false,
+            StatusCode::BAD_REQUEST,
+            Some(SOURCE_PROVIDER_UNSUPPORTED_CODE),
+        ),
+        "{} must not construct an outbound source reader",
+        source_provider.as_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn unsupported_source_provider_admission_refuses_before_persistence_or_source_use() {
+    const SPOOL_POISON: &[u8] = b"unsupported provider must not access the migration spool";
+
+    let tmp = TempDir::new().unwrap();
+    let spool_root = tmp.path().join("migration_exports");
+    std::fs::write(&spool_root, SPOOL_POISON).unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+
+    for app in public_provider_migration_routes(&state)
+        .into_iter()
+        .filter(|app| app.provider != AsyncMigrationSourceProvider::Algolia.as_str().unwrap())
+    {
+        let source_provider = AsyncMigrationSourceProvider::parse(app.provider).unwrap();
+        assert_unsupported_provider_skips_source_factory(source_provider, Arc::clone(&state)).await;
+
+        let response = send_submit_request(
+            &app,
+            "unsupported-provider-owner",
+            "unsupported-provider-key",
+            json!({
+                "appId": "unused_app",
+                "apiKey": "unused_key",
+                "sourceIndex": "source",
+                "targetIndex": format!("{}_target", app.provider)
+            }),
+        )
+        .await;
+
+        assert_eq!(state.migration_runner.active_count_for_test(), 0);
+        assert_eq!(
+            std::fs::read(&spool_root).expect("poisoned spool root must remain readable"),
+            SPOOL_POISON,
+            "{} admission must not replace or mutate the poisoned spool root",
+            app.provider
+        );
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{} must be refused before credential use or durable admission",
+            app.provider
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["code"], SOURCE_PROVIDER_UNSUPPORTED_CODE);
+        assert_eq!(body["message"], SOURCE_PROVIDER_UNSUPPORTED_MESSAGE);
+        assert_eq!(body["status"], 400);
+    }
+}
+
+#[tokio::test]
+async fn unknown_source_provider_submit_route_remains_unmapped() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let router = public_provider_migration_routes(&state)
+        .into_iter()
+        .fold(Router::new(), |router, app| router.merge(app.router));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/1/migrations/not-a-provider")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            response.status(),
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+        ),
+        "unknown providers must remain route misses"
+    );
+    let response_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let response_code = serde_json::from_slice::<serde_json::Value>(&response_bytes)
+        .ok()
+        .and_then(|body| body["code"].as_str().map(str::to_owned));
+    assert_ne!(
+        response_code.as_deref(),
+        Some(SOURCE_PROVIDER_UNSUPPORTED_CODE),
+        "an unknown route must not be classified as a recognized unsupported provider"
+    );
+}
+
+fn bind_job_specimen_to_provider(
+    spool: &spool::SpoolStore,
+    job_uuid: Uuid,
+    source_provider: AsyncMigrationSourceProvider,
+) {
+    let path = spool.async_migration_metadata_path(job_uuid);
+    let mut wire: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    match source_provider.as_str().unwrap() {
+        "algolia" => {
+            wire.as_object_mut().unwrap().remove("source_provider");
+        }
+        provider => {
+            wire["source_provider"] = json!(provider);
+        }
+    }
+    std::fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+    assert_eq!(
+        spool
+            .read_async_migration_metadata(job_uuid)
+            .unwrap()
+            .source_provider,
+        source_provider
+    );
+}
+
+#[tokio::test]
+async fn source_migration_job_lifecycle_rejects_wrong_provider_route() {
+    const OWNER_APP: &str = "provider-binding-owner";
+    const OWNER_KEY: &str = "provider-binding-key";
+
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let spool = import::spool_for_manager(&state.manager).unwrap();
+    let owner_identity = authenticated_owner_identity(
+        OWNER_APP.to_string(),
+        &migration_owner_headers(Some(OWNER_KEY)),
+    );
+    let (job_uuid, _) = state
+        .migration_runner
+        .submit_algolia_import_for_owner(valid_async_request(), Some(owner_identity), |_| {
+            Ok(async_hermetic_source_reader())
+        })
+        .await
+        .expect("Algolia admission should create the provider-bound job specimen");
+    let wrong_provider_route = migration_job_route_for_provider(
+        AsyncMigrationSourceProvider::Meilisearch.as_str().unwrap(),
+        Arc::clone(&state),
+    );
+
+    assert_eq!(
+        send_status_request(&wrong_provider_route, job_uuid, OWNER_APP, OWNER_KEY)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND,
+        "status must not reveal jobs through a different provider alias"
+    );
+    assert_eq!(
+        send_cancel_request(&wrong_provider_route, job_uuid, OWNER_APP, OWNER_KEY)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND,
+        "cancel must not mutate jobs through a different provider alias"
+    );
+    assert!(
+        !spool
+            .read_migration_phase(job_uuid)
+            .unwrap()
+            .cancel_requested,
+        "wrong-provider cancel must leave the owned job unchanged"
+    );
+    assert_eq!(
+        send_acknowledge_request(&wrong_provider_route, job_uuid, OWNER_APP, OWNER_KEY)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND,
+        "acknowledge must not observe jobs through a different provider alias"
+    );
+}
+
+#[tokio::test]
+async fn source_migration_job_lifecycle_rejects_bulk_replace_jobs() {
+    const OWNER_APP: &str = "bulk-replace-route-owner";
+    const OWNER_KEY: &str = "bulk-replace-route-key";
+
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let spool = import::spool_for_manager(&state.manager).unwrap();
+    let owner_identity = authenticated_owner_identity(
+        OWNER_APP.to_string(),
+        &migration_owner_headers(Some(OWNER_KEY)),
+    );
+    let job_uuid = Uuid::new_v4();
+    spool
+        .create_bulk_replace_admission_for_owner(
+            job_uuid,
+            "public_alias_hidden_bulk_replace",
+            &owner_identity,
+            AsyncMigrationPublicationSemantic::ReplaceExisting,
+        )
+        .unwrap();
+    let phase_before = spool.read_migration_phase(job_uuid).unwrap();
+    let public_algolia_route = migration_job_route(Arc::clone(&state));
+
+    assert_migration_job_not_found(
+        send_status_request(&public_algolia_route, job_uuid, OWNER_APP, OWNER_KEY).await,
+        "public Algolia status for bulk_replace",
+    )
+    .await;
+    assert_migration_job_not_found(
+        send_cancel_request(&public_algolia_route, job_uuid, OWNER_APP, OWNER_KEY).await,
+        "public Algolia cancel for bulk_replace",
+    )
+    .await;
+    assert_migration_job_not_found(
+        send_acknowledge_request(&public_algolia_route, job_uuid, OWNER_APP, OWNER_KEY).await,
+        "public Algolia ACK for bulk_replace",
+    )
+    .await;
+    assert_eq!(
+        spool.read_migration_phase(job_uuid).unwrap(),
+        phase_before,
+        "public source-provider aliases must not mutate internal bulk_replace lifecycle state"
     );
 }
 
@@ -1103,7 +1511,6 @@ async fn all_source_providers_share_one_migration_job_runner_and_spool() {
     let state = TestStateBuilder::new(&tmp)
         .with_migration_capacity(1)
         .build_shared();
-    let app = migration_job_route(Arc::clone(&state));
     let reached_documents = Arc::new(Notify::new());
     let release_documents = Arc::new(Notify::new());
     let owner_identity = authenticated_owner_identity(
@@ -1142,23 +1549,41 @@ async fn all_source_providers_share_one_migration_job_runner_and_spool() {
         .await
         .expect_err("shared provider admission must respect the one shared capacity limit");
     assert_eq!(second_admission.0, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        send_status_request(&app, job_uuid, OWNER_APP, OWNER_KEY)
-            .await
-            .status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        send_acknowledge_request(&app, job_uuid, OWNER_APP, OWNER_KEY)
-            .await
-            .status(),
-        StatusCode::CONFLICT
-    );
-    assert_eq!(
-        send_cancel_request(&app, job_uuid, OWNER_APP, OWNER_KEY)
-            .await
-            .status(),
-        StatusCode::OK
+    for app in public_provider_migration_routes(&state) {
+        bind_job_specimen_to_provider(
+            &import::spool_for_manager(&state.manager).unwrap(),
+            job_uuid,
+            AsyncMigrationSourceProvider::parse(app.provider).unwrap(),
+        );
+        assert_eq!(
+            send_status_request(&app, job_uuid, OWNER_APP, OWNER_KEY)
+                .await
+                .status(),
+            StatusCode::OK,
+            "{} status must use the shared spool",
+            app.provider
+        );
+        assert_eq!(
+            send_acknowledge_request(&app, job_uuid, OWNER_APP, OWNER_KEY)
+                .await
+                .status(),
+            StatusCode::CONFLICT,
+            "{} ACK must observe the shared running state",
+            app.provider
+        );
+        assert_eq!(
+            send_cancel_request(&app, job_uuid, OWNER_APP, OWNER_KEY)
+                .await
+                .status(),
+            StatusCode::OK,
+            "{} cancel must mutate the shared spool",
+            app.provider
+        );
+    }
+    bind_job_specimen_to_provider(
+        &import::spool_for_manager(&state.manager).unwrap(),
+        job_uuid,
+        AsyncMigrationSourceProvider::Algolia,
     );
     release_documents.notify_waiters();
     let terminal = wait_for_async_terminal(&state, job_uuid, OWNER_APP, Some(OWNER_KEY)).await;
@@ -1301,14 +1726,11 @@ async fn stale_generation_cannot_mutate_terminal_or_ack_state_for_any_provider()
     );
     let mut stale_ack_statuses = Vec::new();
 
-    // Both specimens are admitted by the one shared runner that
+    // Every specimen is admitted by the one shared runner that
     // `all_source_providers_share_one_migration_job_runner_and_spool` pins, and
     // then driven over their own provider's lifecycle routes: the guard under
     // test has to hold for every provider wire entry, not just Algolia's.
-    for app in [
-        migration_job_route(Arc::clone(&state)),
-        test_only_second_provider_migration_job_route(Arc::clone(&state)),
-    ] {
+    for app in public_provider_migration_routes(&state) {
         let source_provider = app.provider;
         let target_index = format!("{source_provider}_stale_generation_target");
         let request = MigrateFromAlgoliaRequest {
@@ -1323,6 +1745,11 @@ async fn stale_generation_cannot_mutate_terminal_or_ack_state_for_any_provider()
             .await
             .expect("provider specimen should reach the current shared lifecycle");
         wait_for_async_terminal(&state, job_uuid, OWNER_APP, Some(OWNER_KEY)).await;
+        bind_job_specimen_to_provider(
+            &spool,
+            job_uuid,
+            AsyncMigrationSourceProvider::parse(app.provider).unwrap(),
+        );
         let terminal_before = spool.read_migration_phase(job_uuid).unwrap();
         let metadata = spool.read_async_migration_metadata(job_uuid).unwrap();
         let transaction_id = metadata
@@ -1358,10 +1785,10 @@ async fn stale_generation_cannot_mutate_terminal_or_ack_state_for_any_provider()
 
     assert_eq!(
         stale_ack_statuses,
-        vec![
-            (ALGOLIA_MIGRATION_PROVIDER, StatusCode::CONFLICT),
-            (TEST_ONLY_SECOND_PROVIDER, StatusCode::CONFLICT),
-        ],
+        AsyncMigrationSourceProvider::PUBLIC
+            .into_iter()
+            .map(|provider| (provider.as_str().unwrap(), StatusCode::CONFLICT))
+            .collect::<Vec<_>>(),
         "stale generation ACK mutated ACK-visible state: every provider must fail closed before acknowledging a superseded terminal generation"
     );
 }
@@ -1566,6 +1993,7 @@ async fn wait_for_async_terminal(
             let Json(current) = get_algolia_migration_status_http(
                 State(Arc::clone(state)),
                 axum::extract::Extension(AuthenticatedAppId(authenticated_app_id.to_string())),
+                None,
                 migration_owner_headers(api_key),
                 AxumPath(job_uuid.to_string()),
             )

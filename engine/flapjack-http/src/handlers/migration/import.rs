@@ -85,6 +85,7 @@ pub(super) struct ImportTestHooks {
     after_accepted_export: Option<AfterAcceptedExportHook>,
     before_document_batch_write: Option<BeforeDocumentBatchWriteHook>,
     after_document_batch_write: Option<AfterDocumentBatchWriteHook>,
+    document_write_retry_cap: Option<Duration>,
     before_activation: Option<BeforeActivationHook>,
     before_replica_materialization: Option<BeforeReplicaMaterializationHook>,
     bulk_build: BulkBuildTestHooks,
@@ -187,6 +188,11 @@ impl ImportTestHooks {
         self
     }
 
+    pub(super) fn with_document_write_retry_cap(mut self, retry_cap: Duration) -> Self {
+        self.document_write_retry_cap = Some(retry_cap);
+        self
+    }
+
     pub(super) fn with_after_document_batch_write(
         mut self,
         hook: impl Fn(&flapjack::types::TaskInfo) + Send + Sync + 'static,
@@ -253,6 +259,10 @@ impl ImportTestHooks {
 
     fn after_document_batch_write(&self) -> Option<AfterDocumentBatchWriteHook> {
         self.after_document_batch_write.clone()
+    }
+
+    fn document_write_retry_cap(&self) -> Option<Duration> {
+        self.document_write_retry_cap
     }
 
     fn run_before_activation(&self) {
@@ -634,6 +644,7 @@ async fn stage_export(
         &staging,
         hooks.before_document_batch_write(),
         hooks.after_document_batch_write(),
+        hooks.document_write_retry_cap(),
     );
     #[cfg(not(test))]
     let (document_sender, document_writer) = bulk_build.spawn_document_writer(&staging);

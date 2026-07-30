@@ -253,6 +253,10 @@ fn wait_for_registered_writer_waiter_handoff(
 }
 
 #[cfg(test)]
+// The lifecycle tests sit beside the private handoff seam they exercise; the
+// production close helpers remain below so their operational sequence stays
+// contiguous.
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::index::memory::{MemoryBudget, MemoryBudgetConfig};

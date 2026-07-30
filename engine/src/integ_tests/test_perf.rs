@@ -333,7 +333,7 @@ fn standard_profile_document(index: usize) -> Document {
     let subcategory = SUBCATEGORIES[(index * 7) % SUBCATEGORIES.len()];
     let brand = BRANDS[(index * 5) % BRANDS.len()];
     let color = COLORS[(index * 3) % COLORS.len()];
-    let topic = if index % 3 == 0 {
+    let topic = if index.is_multiple_of(3) {
         "wireless"
     } else {
         "professional"
@@ -384,7 +384,10 @@ fn standard_profile_document(index: usize) -> Document {
             "reviewCount".to_string(),
             FieldValue::Integer((index % 20_000) as i64),
         ),
-        ("inStock".to_string(), FieldValue::Bool(index % 6 != 0)),
+        (
+            "inStock".to_string(),
+            FieldValue::Bool(!index.is_multiple_of(6)),
+        ),
         (
             "tags".to_string(),
             FieldValue::Array(vec![

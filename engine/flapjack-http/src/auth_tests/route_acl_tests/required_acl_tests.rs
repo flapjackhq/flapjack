@@ -304,25 +304,19 @@ fn acl_migration_proxy_endpoints_require_admin() {
 
 #[test]
 fn acl_async_migration_routes_require_admin_with_segment_safe_prefix() {
-    assert_required_acl(Method::POST, "/1/migrations/algolia", "admin");
+    for source_provider in crate::handlers::migration::AsyncMigrationSourceProvider::PUBLIC {
+        let provider = source_provider.as_str().unwrap();
+        let provider_path = format!("/1/migrations/{provider}");
+        let job_path = format!("{provider_path}/01890f8e-8b28-78e8-b542-8cfdcb2d4f24");
+
+        assert_required_acl(Method::POST, &provider_path, "admin");
+        assert_required_acl(Method::GET, &job_path, "admin");
+        assert_required_acl(Method::POST, &format!("{job_path}/cancel"), "admin");
+        assert_required_acl(Method::POST, &format!("{job_path}/acknowledge"), "admin");
+    }
     assert_eq!(
         required_acl_for_route(&Method::POST, "/1/migrations/bulk-replace"),
         Some("admin")
-    );
-    assert_required_acl(
-        Method::GET,
-        "/1/migrations/algolia/01890f8e-8b28-78e8-b542-8cfdcb2d4f24",
-        "admin",
-    );
-    assert_required_acl(
-        Method::POST,
-        "/1/migrations/algolia/01890f8e-8b28-78e8-b542-8cfdcb2d4f24/cancel",
-        "admin",
-    );
-    assert_required_acl(
-        Method::POST,
-        "/1/migrations/algolia/01890f8e-8b28-78e8-b542-8cfdcb2d4f24/acknowledge",
-        "admin",
     );
     assert_public_route(Method::POST, "/1/migrations-evil/algolia");
 }

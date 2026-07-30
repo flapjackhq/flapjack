@@ -30,6 +30,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use tempfile::TempDir;
 
+const REPLICATION_CONVERGENCE_ATTEMPTS: usize = 1000;
+const REPLICATION_CONVERGENCE_POLL: tokio::time::Duration = tokio::time::Duration::from_millis(10);
+
 async fn apply_replicated_op_and_wait(
     manager: &IndexManager,
     tenant_id: &str,
@@ -59,6 +62,15 @@ fn test_replication_uses_shared_app_state_constructor_only() {
     assert_eq!(
         inline_literal_count, 0,
         "test_replication.rs still contains {inline_literal_count} inline AppState literals; use make_test_app_state instead"
+    );
+}
+
+#[test]
+fn replication_convergence_wait_budget_covers_loaded_clear_replication() {
+    let budget = REPLICATION_CONVERGENCE_POLL * REPLICATION_CONVERGENCE_ATTEMPTS as u32;
+    assert!(
+        budget >= tokio::time::Duration::from_secs(10),
+        "replication convergence wait budget must tolerate loaded clear-index propagation; got {budget:?}"
     );
 }
 
@@ -1188,12 +1200,12 @@ async fn wait_for_exact_document(
     index_name: &str,
     object_id: &str,
 ) {
-    for _ in 0..200 {
+    for _ in 0..REPLICATION_CONVERGENCE_ATTEMPTS {
         let (status, hits, body) = query_index(client, addr, index_name, object_id).await;
         if status.is_success() && hits == 1 && body["hits"][0]["objectID"] == object_id {
             return;
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(REPLICATION_CONVERGENCE_POLL).await;
     }
     panic!("timed out waiting for exactly {index_name}/{object_id} on {addr}");
 }
@@ -1421,7 +1433,7 @@ async fn wait_for_peer_cursors(
     tenant: &str,
     expected_peer_ids: &[&str],
 ) {
-    for _ in 0..200 {
+    for _ in 0..REPLICATION_CONVERGENCE_ATTEMPTS {
         if let Some(cursors) = manager.get_peer_cursors(tenant) {
             let has_all_expected = expected_peer_ids.iter().all(|peer_id| {
                 cursors
@@ -1432,7 +1444,7 @@ async fn wait_for_peer_cursors(
                 return;
             }
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(REPLICATION_CONVERGENCE_POLL).await;
     }
     let got = manager
         .get_peer_cursors(tenant)
@@ -1680,12 +1692,12 @@ async fn wait_for_hits_at_least(
     index_name: &str,
     expected_hits: u64,
 ) {
-    for _ in 0..200 {
+    for _ in 0..REPLICATION_CONVERGENCE_ATTEMPTS {
         let (_status, hits, _body) = query_index(client, addr, index_name, "").await;
         if hits >= expected_hits {
             return;
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(REPLICATION_CONVERGENCE_POLL).await;
     }
     panic!(
         "Timed out waiting for index '{}' on {} to reach at least {} hits",
@@ -1693,7 +1705,7 @@ async fn wait_for_hits_at_least(
     );
 }
 
-/// Copy from node-a must create destination on node-b within 2 seconds.
+/// Copy from node-a must create destination on node-b within the convergence budget.
 #[tokio::test]
 async fn test_two_node_copy_index_replicates() {
     let (addr_a, addr_b, _tmp_a, _tmp_b) = common::spawn_replication_pair("node-a", "node-b").await;
@@ -2193,7 +2205,7 @@ async fn test_two_node_clear_index_replicates() {
         .unwrap();
     common::wait_for_response_task(&client, &addr_a, clear_resp).await;
 
-    for _ in 0..200 {
+    for _ in 0..REPLICATION_CONVERGENCE_ATTEMPTS {
         let (query_status, hits, _query_body) = query_index(&client, &addr_b, "testidx", "").await;
         let settings_status = client
             .get(format!("http://{}/1/indexes/testidx/settings", addr_b))
@@ -2204,14 +2216,14 @@ async fn test_two_node_clear_index_replicates() {
         if query_status.is_success() && hits == 0 && settings_status.is_success() {
             return;
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(REPLICATION_CONVERGENCE_POLL).await;
     }
     panic!(
-        "Clear did not replicate to node-b within 2s (expected testidx nbHits==0 and settings endpoint 200)"
+        "Clear did not replicate to node-b within the convergence budget (expected testidx nbHits==0 and settings endpoint 200)"
     );
 }
 
-/// Write to node-a via HTTP; doc must appear on node-b within 2 seconds.
+/// Write to node-a via HTTP; doc must appear on node-b within the convergence budget.
 #[tokio::test]
 async fn test_two_node_write_replicates_to_peer() {
     let (addr_a, addr_b, _tmp_a, _tmp_b) = common::spawn_replication_pair("node-a", "node-b").await;

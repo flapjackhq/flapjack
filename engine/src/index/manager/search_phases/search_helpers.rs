@@ -364,7 +364,7 @@ mod tests {
         };
         settings
             .save(
-                &temp_dir
+                temp_dir
                     .path()
                     .join(METRICS_TENANT_ID)
                     .join(super::super::config::SETTINGS_FILE),

@@ -36,8 +36,8 @@ independent `100 ms` gate. A green historical 1M rung is not progress past that 
 | Forward latency projection | GO through 64,000,000 records | `FINAL_CERTIFICATION_TARGET` at `engine/loadtest/lib/scale_latency_projection.mjs:14` and `evaluateScaleLatencyProjection()` |
 | Forward import-runtime projection | ≤ 12 h | `engine/loadtest/lib/scale_projection.mjs` |
 | Capacity allowances per record | As frozen | `engine/loadtest/lib/scale_capacity_observation.mjs` plus `engine/loadtest/COMPETITOR_HEADROOM_CONTRACT_2026_07_26.md:84-99` |
-| Count/health p99 during import | ≤ 250 ms | **NOT YET IMPLEMENTED** — no enforcement exists in this repo today |
-| Five-second count timeouts during import | zero | Partially owned by `COUNT_REQUEST_TIMEOUT_SECONDS:-5` in `engine/loadtest/lib/loadtest_shell_helpers.sh:289` and `:387`; **zero-timeout accounting is NOT YET IMPLEMENTED** |
+| Count/health p99 during import | ≤ 250 ms | `liveness_distribution()` in `engine/loadtest/lib/loadtest_shell_helpers.sh`, called by `evaluate_rung_liveness()` in `engine/loadtest/scale_ladder.sh`, with contract coverage in `engine/loadtest/tests/scale_ladder_liveness_gate_acceptance.sh` |
+| Five-second count timeouts during import | zero | `FLAPJACK_LOADTEST_LIVENESS_TIMEOUT_SECONDS:-5` in `sample_liveness_endpoint()` in `engine/loadtest/lib/loadtest_shell_helpers.sh` owns the sampling timeout; `liveness_distribution()` owns zero-timeout accounting, called by `evaluate_rung_liveness()` in `engine/loadtest/scale_ladder.sh`, with contract coverage in `engine/loadtest/tests/scale_ladder_liveness_gate_acceptance.sh` |
 
 Each completed rung must still provide an exact final count, passing rank-1 sentinels, valid
 same-locality evidence, durable evidence, and green capacity observation. Missing, partial,

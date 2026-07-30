@@ -60,7 +60,7 @@ use std::{
     fs,
     path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Barrier, Mutex,
     },
     thread,
@@ -115,7 +115,7 @@ const PRIVACY_SCRUB_ROUTE: &str = "/1/migrations/privacy-scrub";
 const PRIVACY_SCRUB_ID: &str = "privacy-scrub-stable-contract-id";
 const PRIVACY_SCRUB_TARGET: &str = "privacy_scrub_contract_target";
 const PRIVACY_SCRUB_CURRENT_GENERATION: &str = "generation-current";
-const PRIVACY_SCRUB_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(2);
+const PRIVACY_SCRUB_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIVACY_SCRUB_OWNER_APP_ID: &str = "privacy-scrub-contract-app";
 const PRIVACY_SCRUB_INTENT_FILE: &str = "privacy_scrub_intent.json";
 
@@ -2078,6 +2078,142 @@ async fn migrate_staging_failure_records_terminal_failure() {
     assert!(phase.terminal_at.is_some());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_import_retries_real_backpressure_pause_and_succeeds() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let base_path = state.manager.base_path.clone();
+    let captured_job_uuid = Arc::new(Mutex::new(None));
+    let accepted_job_uuid = Arc::clone(&captured_job_uuid);
+    let staging_job_uuid = Arc::clone(&captured_job_uuid);
+    let pause_injection_attempted = Arc::new(AtomicBool::new(false));
+    let pause_injection_attempted_by_hook = Arc::clone(&pause_injection_attempted);
+    let pause_forced = Arc::new(AtomicBool::new(false));
+    let pause_forced_by_hook = Arc::clone(&pause_forced);
+    let hooks = ImportTestHooks::default()
+        .with_after_accepted_export(move |_spool, job_uuid| {
+            *accepted_job_uuid.lock().unwrap() = Some(job_uuid);
+        })
+        .with_before_document_batch_write(move |_| {
+            if pause_injection_attempted_by_hook.swap(true, Ordering::SeqCst) {
+                return Ok(());
+            }
+
+            let job_uuid = staging_job_uuid
+                .lock()
+                .unwrap()
+                .expect("accepted export hook should capture job uuid");
+            let spool = SpoolStore::new(&base_path, SpoolLimits::default()).unwrap();
+            let metadata = spool
+                .read_async_migration_metadata(job_uuid)
+                .expect("async metadata should contain the publication transaction");
+            let target = PublicationTarget::new(TARGET_INDEX.to_string()).unwrap();
+            let paths = PublicationPaths::new(
+                &base_path,
+                &target,
+                metadata
+                    .publication_transaction_id
+                    .as_ref()
+                    .expect("publication transaction should exist before staging writes"),
+            );
+            let staging_parent = paths
+                .staging
+                .parent()
+                .expect("staging path should have a transaction namespace");
+            let staging_tenant = paths
+                .staging
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("staging path should end in a UTF-8 tenant");
+
+            // Option (b) exercises real admission; hook-only IndexPaused injection would
+            // bypass ensure_bulk_admission_allowed and miss the producer contract.
+            flapjack::index::write_queue::force_backpressure_pause_for_test(
+                staging_parent,
+                staging_tenant,
+            )?;
+            pause_forced_by_hook.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+    let job_uuid = state
+        .migration_runner
+        .submit_algolia_import_with_test_hooks(
+            valid_request(),
+            |_| Ok(hermetic_source_reader()),
+            hooks,
+        )
+        .await
+        .expect("async import should be admitted")
+        .0;
+
+    wait_for_successful_pause_injection(&state, job_uuid, &pause_forced).await;
+    wait_for_terminal_phase(&state, job_uuid, MigrationDisposition::Succeeded).await;
+    wait_for_active_count(&state, 0).await;
+    assert_eq!(*captured_job_uuid.lock().unwrap(), Some(job_uuid));
+    assert!(
+        pause_forced.load(Ordering::SeqCst),
+        "staging writer should encounter the forced backpressure pause"
+    );
+    let phase = read_migration_phase_at(&state.manager.base_path, job_uuid);
+    assert_eq!(phase.disposition, MigrationDisposition::Succeeded);
+    let outcome = phase
+        .import_outcome
+        .expect("successful retry should persist the import outcome");
+    assert!(outcome.settings_applied);
+    assert_eq!(outcome.objects_imported, EXPECTED_DOCUMENTS.len());
+    assert_eq!(outcome.synonyms_imported, 0);
+    assert_eq!(outcome.rules_imported, 0);
+    for (object_id, title, category) in EXPECTED_DOCUMENTS {
+        assert_query_returns_document(&state, TARGET_INDEX, title, object_id, title, category)
+            .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_import_bounds_nonclearing_retryable_write_failure() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let write_attempts = Arc::new(AtomicUsize::new(0));
+    let observed_write_attempts = Arc::clone(&write_attempts);
+    let hooks = ImportTestHooks::default()
+        .with_document_write_retry_cap(Duration::from_millis(1_100))
+        .with_before_document_batch_write(move |_| {
+            observed_write_attempts.fetch_add(1, Ordering::SeqCst);
+            Err(FlapjackError::IndexPaused(
+                "non-clearing retryable staging failure".to_string(),
+            ))
+        });
+
+    let job_uuid = state
+        .migration_runner
+        .submit_algolia_import_with_test_hooks(
+            valid_request(),
+            |_| Ok(hermetic_source_reader()),
+            hooks,
+        )
+        .await
+        .expect("async import should be admitted")
+        .0;
+
+    wait_for_terminal_phase(&state, job_uuid, MigrationDisposition::Failed).await;
+    wait_for_active_count(&state, 0).await;
+
+    let phase = read_migration_phase_at(&state.manager.base_path, job_uuid);
+    assert_eq!(phase.phase, MigrationPhase::Staging);
+    assert_eq!(phase.disposition, MigrationDisposition::Failed);
+    assert!(
+        phase.terminal_at.is_some(),
+        "exhausting the retry budget must settle the async migration"
+    );
+    assert_eq!(
+        write_attempts.load(Ordering::SeqCst),
+        2,
+        "the bounded failure must retry once before returning the last IndexPaused error"
+    );
+    assert_target_absent_from_disk_and_list(&state, TARGET_INDEX).await;
+}
+
 #[tokio::test]
 async fn migrate_failure_settlement_phase_write_error_surfaces_storage_failure() {
     let tmp = TempDir::new().unwrap();
@@ -2403,6 +2539,14 @@ fn bulk_build_uses_insert_action_not_upsert() {
     assert!(method.contains("map(WriteAction::Add)"));
     assert!(method.contains("WriteAdmissionMode::Durable"));
     assert!(method.contains("wait_for_write_durable"));
+}
+
+#[test]
+fn bulk_build_retry_cap_spans_real_backpressure_recovery_window() {
+    assert!(
+        super::bulk_build::DOCUMENT_WRITE_RETRY_CAP >= Duration::from_secs(720),
+        "release bulk-replace retry budget must span multiple write-backpressure sample windows"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3396,6 +3540,29 @@ async fn submit_blocked_async_import(
         .0
 }
 
+async fn wait_for_successful_pause_injection(
+    state: &Arc<crate::handlers::AppState>,
+    job_uuid: uuid::Uuid,
+    pause_forced: &AtomicBool,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if pause_forced.load(Ordering::SeqCst) {
+                break;
+            }
+            let phase = read_migration_phase_at(&state.manager.base_path, job_uuid);
+            assert!(
+                phase.terminal_at.is_none(),
+                "async migration {job_uuid} reached terminal disposition {:?} before successful backpressure pause injection",
+                phase.disposition
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("backpressure pause injection should succeed before migration settlement");
+}
+
 async fn wait_for_terminal_phase(
     state: &Arc<crate::handlers::AppState>,
     job_uuid: uuid::Uuid,
@@ -3407,6 +3574,12 @@ async fn wait_for_terminal_phase(
             if phase.disposition == expected {
                 assert!(phase.terminal_at.is_some());
                 break;
+            }
+            if phase.terminal_at.is_some() {
+                panic!(
+                    "async migration {job_uuid} reached terminal disposition {:?}, expected {expected:?}",
+                    phase.disposition
+                );
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }

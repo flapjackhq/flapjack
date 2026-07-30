@@ -5,7 +5,7 @@ use flapjack::index::manager::publication::{
     PublicationGenerationEvidence, PublicationPaths, PublicationTarget, PublicationTransactionId,
 };
 use fs2::{available_space, FileExt};
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -247,7 +247,21 @@ pub(crate) struct MigrationPhaseRecord {
     pub import_outcome: Option<MigrationImportOutcome>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AsyncMigrationOperationKind {
+    #[default]
+    SourceImport,
+    BulkReplace,
+}
+
+impl AsyncMigrationOperationKind {
+    fn is_source_import(&self) -> bool {
+        *self == Self::SourceImport
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct AsyncMigrationMetadata {
     pub job_uuid: Uuid,
     #[serde(
@@ -255,6 +269,8 @@ pub(crate) struct AsyncMigrationMetadata {
         skip_serializing_if = "super::AsyncMigrationSourceProvider::is_algolia"
     )]
     pub source_provider: super::AsyncMigrationSourceProvider,
+    #[serde(skip_serializing_if = "AsyncMigrationOperationKind::is_source_import")]
+    pub operation_kind: AsyncMigrationOperationKind,
     pub target_index: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology: Option<super::MigrationTopology>,
@@ -269,6 +285,81 @@ pub(crate) struct AsyncMigrationMetadata {
     pub publication_transaction_id: Option<PublicationTransactionId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_publication_generation: Option<PublicationGenerationEvidence>,
+}
+
+impl<'de> Deserialize<'de> for AsyncMigrationMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct MetadataWire {
+            job_uuid: Uuid,
+            #[serde(default)]
+            source_provider: Option<String>,
+            #[serde(default)]
+            operation_kind: AsyncMigrationOperationKind,
+            target_index: String,
+            #[serde(default)]
+            topology: Option<super::MigrationTopology>,
+            #[serde(default)]
+            publication_semantic: AsyncMigrationPublicationSemantic,
+            #[serde(default)]
+            authenticated_app_id: Option<String>,
+            #[serde(default)]
+            publication_transaction_id: Option<PublicationTransactionId>,
+            #[serde(default)]
+            expected_publication_generation: Option<PublicationGenerationEvidence>,
+        }
+
+        let wire = MetadataWire::deserialize(deserializer)?;
+        let (source_provider, operation_kind) =
+            decode_async_metadata_provider(wire.source_provider.as_deref(), wire.operation_kind)
+                .map_err(de::Error::custom)?;
+        Ok(Self {
+            job_uuid: wire.job_uuid,
+            source_provider,
+            operation_kind,
+            target_index: wire.target_index,
+            topology: wire.topology,
+            publication_semantic: wire.publication_semantic,
+            authenticated_app_id: wire.authenticated_app_id,
+            publication_transaction_id: wire.publication_transaction_id,
+            expected_publication_generation: wire.expected_publication_generation,
+        })
+    }
+}
+
+fn decode_async_metadata_provider(
+    source_provider: Option<&str>,
+    operation_kind: AsyncMigrationOperationKind,
+) -> Result<
+    (
+        super::AsyncMigrationSourceProvider,
+        AsyncMigrationOperationKind,
+    ),
+    String,
+> {
+    match source_provider {
+        None => Ok((super::AsyncMigrationSourceProvider::Algolia, operation_kind)),
+        Some("bulk_replace") => Ok((
+            super::AsyncMigrationSourceProvider::Algolia,
+            AsyncMigrationOperationKind::BulkReplace,
+        )),
+        Some(provider) => super::AsyncMigrationSourceProvider::parse(provider)
+            .map(|parsed| (parsed, operation_kind))
+            .ok_or_else(|| format!("unknown source_provider '{provider}'")),
+    }
+}
+
+struct AsyncMigrationMetadataFields<'a> {
+    job_uuid: Uuid,
+    target_index: &'a str,
+    authenticated_app_id: Option<&'a str>,
+    publication_semantic: AsyncMigrationPublicationSemantic,
+    source_provider: super::AsyncMigrationSourceProvider,
+    operation_kind: AsyncMigrationOperationKind,
+    topology: Option<super::MigrationTopology>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -719,14 +810,15 @@ impl SpoolStore {
             return Err(SpoolError::new(SpoolErrorKind::JobTerminal));
         }
         create_private_dir(&job_dir)?;
-        let metadata = self.async_migration_metadata(
+        let metadata = self.async_migration_metadata(AsyncMigrationMetadataFields {
             job_uuid,
             target_index,
             authenticated_app_id,
             publication_semantic,
-            super::AsyncMigrationSourceProvider::Algolia,
-            None,
-        );
+            source_provider: super::AsyncMigrationSourceProvider::Algolia,
+            operation_kind: AsyncMigrationOperationKind::SourceImport,
+            topology: None,
+        });
         self.commit_async_migration_metadata(&metadata)?;
         let record = self.initial_migration_phase_record(job_uuid);
         self.commit_migration_phase(&record)?;
@@ -746,14 +838,15 @@ impl SpoolStore {
             return Err(SpoolError::new(SpoolErrorKind::JobTerminal));
         }
         create_private_dir(&job_dir)?;
-        let metadata = self.async_migration_metadata(
+        let metadata = self.async_migration_metadata(AsyncMigrationMetadataFields {
             job_uuid,
             target_index,
-            Some(authenticated_app_id),
+            authenticated_app_id: Some(authenticated_app_id),
             publication_semantic,
-            super::AsyncMigrationSourceProvider::BulkReplace,
-            Some(super::MigrationTopology::SingleNodeOnly),
-        );
+            source_provider: super::AsyncMigrationSourceProvider::Algolia,
+            operation_kind: AsyncMigrationOperationKind::BulkReplace,
+            topology: Some(super::MigrationTopology::SingleNodeOnly),
+        });
         self.commit_async_migration_metadata(&metadata)?;
         let record = self.initial_migration_phase_record(job_uuid);
         self.commit_migration_phase(&record)?;
@@ -785,14 +878,15 @@ impl SpoolStore {
             return Err(SpoolError::new(SpoolErrorKind::JobTerminal));
         }
         create_private_dir(&job_dir)?;
-        let metadata = self.async_migration_metadata(
+        let metadata = self.async_migration_metadata(AsyncMigrationMetadataFields {
             job_uuid,
-            &requested.tenant,
-            Some(&requested.authenticated_app_id),
-            AsyncMigrationPublicationSemantic::CreateOnly,
-            super::AsyncMigrationSourceProvider::Algolia,
-            None,
-        );
+            target_index: &requested.tenant,
+            authenticated_app_id: Some(&requested.authenticated_app_id),
+            publication_semantic: AsyncMigrationPublicationSemantic::CreateOnly,
+            source_provider: super::AsyncMigrationSourceProvider::Algolia,
+            operation_kind: AsyncMigrationOperationKind::SourceImport,
+            topology: None,
+        });
         self.commit_async_migration_metadata(&metadata)?;
         self.commit_privacy_scrub_intent(&requested, job_uuid)?;
         let phase = self.initial_migration_phase_record(job_uuid);
@@ -817,33 +911,30 @@ impl SpoolStore {
             return Err(SpoolError::new(SpoolErrorKind::JobTerminal));
         }
         create_private_dir(&job_dir)?;
-        let metadata = self.async_migration_metadata(
+        let metadata = self.async_migration_metadata(AsyncMigrationMetadataFields {
             job_uuid,
             target_index,
-            None,
+            authenticated_app_id: None,
             publication_semantic,
-            super::AsyncMigrationSourceProvider::Algolia,
-            None,
-        );
+            source_provider: super::AsyncMigrationSourceProvider::Algolia,
+            operation_kind: AsyncMigrationOperationKind::SourceImport,
+            topology: None,
+        });
         self.commit_async_migration_metadata(&metadata)
     }
 
     fn async_migration_metadata(
         &self,
-        job_uuid: Uuid,
-        target_index: &str,
-        authenticated_app_id: Option<&str>,
-        publication_semantic: AsyncMigrationPublicationSemantic,
-        source_provider: super::AsyncMigrationSourceProvider,
-        topology: Option<super::MigrationTopology>,
+        fields: AsyncMigrationMetadataFields<'_>,
     ) -> AsyncMigrationMetadata {
         AsyncMigrationMetadata {
-            job_uuid,
-            source_provider,
-            target_index: target_index.to_string(),
-            topology,
-            publication_semantic,
-            authenticated_app_id: authenticated_app_id.map(str::to_owned),
+            job_uuid: fields.job_uuid,
+            source_provider: fields.source_provider,
+            operation_kind: fields.operation_kind,
+            target_index: fields.target_index.to_string(),
+            topology: fields.topology,
+            publication_semantic: fields.publication_semantic,
+            authenticated_app_id: fields.authenticated_app_id.map(str::to_owned),
             publication_transaction_id: None,
             expected_publication_generation: None,
         }

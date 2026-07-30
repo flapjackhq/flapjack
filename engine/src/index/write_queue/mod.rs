@@ -14,6 +14,8 @@ pub(crate) mod segment_observation;
 mod vectors;
 mod writer_lifecycle;
 
+#[cfg(any(debug_assertions, test))]
+pub use backpressure::force_backpressure_pause_for_test;
 pub(crate) use finalization::PERSISTED_VECTORS_DIR;
 #[cfg(any(test, feature = "fault-injection"))]
 pub(crate) use finalization::{

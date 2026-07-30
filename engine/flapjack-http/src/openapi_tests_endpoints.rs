@@ -68,28 +68,12 @@ fn migration_endpoints_are_documented() {
     assert_migration_operation_uses_api_key(&doc, "/1/migrate-from-algolia", "post");
     assert_migration_post_documents_admission_refusals(&doc);
 
-    assert_path_exists(&doc, "/1/migrations/algolia");
-    assert_path_method(&doc, "/1/migrations/algolia", "post");
-    assert_migration_operation_uses_api_key(&doc, "/1/migrations/algolia", "post");
-    assert_async_migration_post_documents_contract(&doc);
-
-    assert_path_exists(&doc, "/1/migrations/algolia/{job_id}");
-    assert_path_method(&doc, "/1/migrations/algolia/{job_id}", "get");
-    assert_migration_operation_uses_api_key(&doc, "/1/migrations/algolia/{job_id}", "get");
-    assert_async_migration_get_documents_contract(&doc);
-
-    assert_path_exists(&doc, "/1/migrations/algolia/{job_id}/cancel");
-    assert_path_method(&doc, "/1/migrations/algolia/{job_id}/cancel", "post");
-    assert_migration_operation_uses_api_key(&doc, "/1/migrations/algolia/{job_id}/cancel", "post");
-    assert_async_migration_cancel_documents_contract(&doc);
-
-    assert_path_exists(&doc, "/1/migrations/algolia/{job_id}/acknowledge");
-    assert_path_method(&doc, "/1/migrations/algolia/{job_id}/acknowledge", "post");
-    assert_migration_operation_uses_api_key(
-        &doc,
-        "/1/migrations/algolia/{job_id}/acknowledge",
-        "post",
-    );
+    for source_provider in crate::handlers::migration::AsyncMigrationSourceProvider::PUBLIC {
+        let provider = source_provider
+            .as_str()
+            .expect("every public migration provider must have an OpenAPI path segment");
+        assert_async_migration_lifecycle_is_documented(&doc, provider);
+    }
 
     assert_path_exists(&doc, "/1/algolia-list-indexes");
     assert_path_method(&doc, "/1/algolia-list-indexes", "post");
@@ -176,6 +160,55 @@ fn assert_migration_operation_uses_api_key(doc: &serde_json::Value, path: &str, 
     );
 }
 
+fn assert_async_migration_lifecycle_is_documented(doc: &serde_json::Value, provider: &str) {
+    let submit_path = format!("/1/migrations/{provider}");
+    assert_path_exists(doc, &submit_path);
+    assert_path_method(doc, &submit_path, "post");
+    assert_migration_operation_uses_api_key(doc, &submit_path, "post");
+    assert_async_migration_post_documents_contract(doc, &submit_path);
+
+    let status_path = format!("{submit_path}/{{job_id}}");
+    assert_path_exists(doc, &status_path);
+    assert_path_method(doc, &status_path, "get");
+    assert_migration_operation_uses_api_key(doc, &status_path, "get");
+    assert_async_migration_get_documents_contract(doc, &status_path);
+
+    let cancel_path = format!("{status_path}/cancel");
+    assert_path_exists(doc, &cancel_path);
+    assert_path_method(doc, &cancel_path, "post");
+    assert_migration_operation_uses_api_key(doc, &cancel_path, "post");
+    assert_async_migration_cancel_documents_contract(doc, &cancel_path);
+
+    let acknowledge_path = format!("{status_path}/acknowledge");
+    assert_path_exists(doc, &acknowledge_path);
+    assert_path_method(doc, &acknowledge_path, "post");
+    assert_migration_operation_uses_api_key(doc, &acknowledge_path, "post");
+    assert_async_migration_acknowledge_documents_contract(doc, &acknowledge_path);
+}
+
+fn operation_responses<'a>(
+    doc: &'a serde_json::Value,
+    path: &str,
+    method: &str,
+) -> &'a serde_json::Map<String, serde_json::Value> {
+    let escaped_path = path.replace('/', "~1");
+    doc.pointer(&format!("/paths/{escaped_path}/{method}/responses"))
+        .and_then(|value| value.as_object())
+        .unwrap_or_else(|| panic!("{path} {method} should document responses"))
+}
+
+fn response_schema_ref<'a>(
+    doc: &'a serde_json::Value,
+    path: &str,
+    method: &str,
+    status: &str,
+) -> Option<&'a str> {
+    operation_responses(doc, path, method)
+        .get(status)
+        .and_then(|response| response.pointer("/content/application~1json/schema/$ref"))
+        .and_then(serde_json::Value::as_str)
+}
+
 fn assert_migration_post_documents_admission_refusals(doc: &serde_json::Value) {
     let responses = doc
         .pointer("/paths/~11~1migrate-from-algolia/post/responses")
@@ -203,51 +236,46 @@ fn assert_migration_post_documents_admission_refusals(doc: &serde_json::Value) {
     );
 }
 
-fn assert_async_migration_post_documents_contract(doc: &serde_json::Value) {
-    let responses = doc
-        .pointer("/paths/~11~1migrations~1algolia/post/responses")
-        .and_then(|value| value.as_object())
-        .expect("async migration POST should document responses");
+fn assert_async_migration_post_documents_contract(doc: &serde_json::Value, path: &str) {
+    let responses = operation_responses(doc, path, "post");
 
     for status in ["202", "400", "500", "502", "503"] {
         assert!(
             responses.contains_key(status),
-            "async migration POST should document {status} response"
+            "{path} POST should document {status} response"
         );
     }
     assert_eq!(
-        doc.pointer("/paths/~11~1migrations~1algolia/post/responses/202/content/application~1json/schema/$ref")
-            .and_then(|value| value.as_str()),
-        Some("#/components/schemas/AsyncMigrationStatusResponse")
+        response_schema_ref(doc, path, "post", "202"),
+        Some("#/components/schemas/AsyncMigrationStatusResponse"),
+        "{path} POST 202 should return AsyncMigrationStatusResponse"
     );
 }
 
-fn assert_async_migration_get_documents_contract(doc: &serde_json::Value) {
-    let responses = doc
-        .pointer("/paths/~11~1migrations~1algolia~1{job_id}/get/responses")
-        .and_then(|value| value.as_object())
-        .expect("async migration GET should document responses");
+fn assert_async_migration_get_documents_contract(doc: &serde_json::Value, path: &str) {
+    let responses = operation_responses(doc, path, "get");
 
     for status in ["200", "400", "404", "500"] {
         assert!(
             responses.contains_key(status),
-            "async migration GET should document {status} response"
+            "{path} GET should document {status} response"
         );
     }
     assert_eq!(
-        doc.pointer("/paths/~11~1migrations~1algolia~1{job_id}/get/responses/200/content/application~1json/schema/$ref")
-            .and_then(|value| value.as_str()),
-        Some("#/components/schemas/AsyncMigrationStatusResponse")
+        response_schema_ref(doc, path, "get", "200"),
+        Some("#/components/schemas/AsyncMigrationStatusResponse"),
+        "{path} GET 200 should return AsyncMigrationStatusResponse"
     );
 
+    let escaped_path = path.replace('/', "~1");
     let parameters = doc
-        .pointer("/paths/~11~1migrations~1algolia~1{job_id}/get/parameters")
+        .pointer(&format!("/paths/{escaped_path}/get/parameters"))
         .and_then(|value| value.as_array())
-        .expect("async migration GET should document parameters");
+        .unwrap_or_else(|| panic!("{path} GET should document parameters"));
     let job_id = parameters
         .iter()
         .find(|parameter| parameter.get("name").and_then(|value| value.as_str()) == Some("job_id"))
-        .expect("async migration GET should document job_id path parameter");
+        .unwrap_or_else(|| panic!("{path} GET should document job_id path parameter"));
     assert_eq!(
         job_id.get("in").and_then(|value| value.as_str()),
         Some("path")
@@ -260,22 +288,19 @@ fn assert_async_migration_get_documents_contract(doc: &serde_json::Value) {
     );
 }
 
-fn assert_async_migration_cancel_documents_contract(doc: &serde_json::Value) {
-    let responses = doc
-        .pointer("/paths/~11~1migrations~1algolia~1{job_id}~1cancel/post/responses")
-        .and_then(|value| value.as_object())
-        .expect("async migration cancel POST should document responses");
+fn assert_async_migration_cancel_documents_contract(doc: &serde_json::Value, path: &str) {
+    let responses = operation_responses(doc, path, "post");
 
     for status in ["200", "400", "404", "409", "500"] {
         assert!(
             responses.contains_key(status),
-            "async migration cancel POST should document {status} response"
+            "{path} POST should document {status} response"
         );
     }
     assert_eq!(
-        doc.pointer("/paths/~11~1migrations~1algolia~1{job_id}~1cancel/post/responses/200/content/application~1json/schema/$ref")
-            .and_then(|value| value.as_str()),
-        Some("#/components/schemas/AsyncMigrationStatusResponse")
+        response_schema_ref(doc, path, "post", "200"),
+        Some("#/components/schemas/AsyncMigrationStatusResponse"),
+        "{path} POST 200 should return AsyncMigrationStatusResponse"
     );
     let conflict_description = responses
         .get("409")
@@ -285,6 +310,31 @@ fn assert_async_migration_cancel_documents_contract(doc: &serde_json::Value) {
     assert!(
         conflict_description.contains("cancel_too_late"),
         "async migration cancel 409 should document cancel_too_late"
+    );
+}
+
+fn assert_async_migration_acknowledge_documents_contract(doc: &serde_json::Value, path: &str) {
+    let responses = operation_responses(doc, path, "post");
+
+    for status in ["204", "400", "404", "409", "500"] {
+        assert!(
+            responses.contains_key(status),
+            "{path} POST should document {status} response"
+        );
+    }
+    assert_eq!(
+        response_schema_ref(doc, path, "post", "204"),
+        None,
+        "{path} POST 204 must not document a response body"
+    );
+    let conflict_description = responses
+        .get("409")
+        .and_then(|response| response.get("description"))
+        .and_then(serde_json::Value::as_str)
+        .expect("async migration acknowledge 409 should have a description");
+    assert!(
+        conflict_description.contains("migration_ack_too_early"),
+        "async migration acknowledge 409 should document migration_ack_too_early"
     );
 }
 

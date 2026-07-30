@@ -59,6 +59,8 @@ const MIGRATION_JOB_NOT_FOUND_MESSAGE: &str = "Migration job not found";
 const MIGRATION_CANCEL_TOO_LATE_CODE: &str = "cancel_too_late";
 const MIGRATION_CANCEL_TOO_LATE_MESSAGE: &str =
     "Migration job has already reached the publication commit boundary";
+const SOURCE_PROVIDER_UNSUPPORTED_CODE: &str = "source_provider_unsupported";
+const SOURCE_PROVIDER_UNSUPPORTED_MESSAGE: &str = "Source provider is not supported";
 const PRIVACY_SCRUB_UNKNOWN_TARGET_CODE: &str = "privacy_scrub_unknown_target";
 const PRIVACY_SCRUB_STALE_GENERATION_CODE: &str = "privacy_scrub_stale_generation";
 const PRIVACY_SCRUB_MISMATCHED_INTENT_CODE: &str = "privacy_scrub_mismatched_intent";
@@ -101,10 +103,31 @@ pub struct MigrateFromAlgoliaRequest {
 pub(crate) enum AsyncMigrationSourceProvider {
     #[default]
     Algolia,
-    BulkReplace,
+    Meilisearch,
+    Typesense,
 }
 
 impl AsyncMigrationSourceProvider {
+    pub(crate) const PUBLIC: [Self; 3] = [Self::Algolia, Self::Meilisearch, Self::Typesense];
+
+    #[allow(dead_code)]
+    pub(crate) fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::Algolia => Some("algolia"),
+            Self::Meilisearch => Some("meilisearch"),
+            Self::Typesense => Some("typesense"),
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "algolia" => Some(Self::Algolia),
+            "meilisearch" => Some(Self::Meilisearch),
+            "typesense" => Some(Self::Typesense),
+            _ => None,
+        }
+    }
+
     fn is_algolia(&self) -> bool {
         *self == Self::Algolia
     }
@@ -440,39 +463,172 @@ pub async fn migrate_from_algolia(
     migrate_from_algolia_impl(state, payload, algolia_source_reader).await
 }
 
-/// Async Algolia migration submission endpoint.
-///
-/// This route admits node-local create or replace migration requests and
-/// immediately returns the durable admission snapshot.
-#[utoipa::path(
-    post,
-    path = "/1/migrations/algolia",
-    tag = "migration",
-    request_body = MigrateFromAlgoliaRequest,
-    responses(
-        (status = 202, description = "Async Algolia migration admitted", body = AsyncMigrationStatusResponse),
-        (status = 400, description = "Invalid migration request or unsupported source payload"),
-        (status = 500, description = "Migration admission persistence failed"),
-        (status = 502, description = "Upstream Algolia request failed"),
-        (status = 503, description = "migration_ha_unsupported or migration_capacity_exhausted")
-    ),
-    security(("api_key" = []))
-)]
-pub async fn submit_algolia_migration(
-    State(state): State<Arc<AppState>>,
-    Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
-    Json(payload): Json<MigrateFromAlgoliaRequest>,
-) -> Result<(StatusCode, Json<AsyncMigrationStatusResponse>), MigrateError> {
-    submit_algolia_migration_impl(state, authenticated_app_id, payload, algolia_source_reader).await
+macro_rules! define_source_migration_openapi_lifecycle {
+    (
+        $provider:ident,
+        submit: $submit_fn:ident => $submit_path:literal,
+        status: $status_fn:ident => $status_path:literal,
+        cancel: $cancel_fn:ident => $cancel_path:literal,
+        acknowledge: $acknowledge_fn:ident => $acknowledge_path:literal
+    ) => {
+        /// Submit an asynchronous source migration.
+        #[utoipa::path(
+            post,
+            path = $submit_path,
+            tag = "migration",
+            request_body = MigrateFromAlgoliaRequest,
+            responses(
+                (status = 202, description = "Async source migration admitted", body = AsyncMigrationStatusResponse),
+                (status = 400, description = "Invalid migration request or unsupported source payload"),
+                (status = 500, description = "Migration admission persistence failed"),
+                (status = 502, description = "Upstream source provider request failed"),
+                (status = 503, description = "migration_ha_unsupported or migration_capacity_exhausted")
+            ),
+            security(("api_key" = []))
+        )]
+        pub async fn $submit_fn(
+            State(state): State<Arc<AppState>>,
+            Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
+            Json(payload): Json<MigrateFromAlgoliaRequest>,
+        ) -> Result<(StatusCode, Json<AsyncMigrationStatusResponse>), MigrateError> {
+            submit_algolia_migration_impl(
+                AsyncMigrationSourceProvider::$provider,
+                state,
+                authenticated_app_id,
+                payload,
+                algolia_source_reader,
+            )
+            .await
+        }
+
+        /// Return the durable status for an asynchronous source migration.
+        #[utoipa::path(
+            get,
+            path = $status_path,
+            tag = "migration",
+            params(
+                ("job_id" = Uuid, Path, description = "Migration job UUID")
+            ),
+            responses(
+                (status = 200, description = "Durable async source migration status", body = AsyncMigrationStatusResponse),
+                (status = 400, description = "Invalid migration job UUID"),
+                (status = 404, description = "No durable migration phase record is currently retained for the UUID"),
+                (status = 500, description = "Migration status record could not be read")
+            ),
+            security(("api_key" = []))
+        )]
+        pub async fn $status_fn(
+            State(state): State<Arc<AppState>>,
+            Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
+            AxumPath(job_id): AxumPath<String>,
+        ) -> Result<Json<AsyncMigrationStatusResponse>, MigrateError> {
+            get_source_migration_status(
+                state,
+                authenticated_app_id,
+                job_id,
+                Some(AsyncMigrationSourceProvider::$provider),
+            )
+            .await
+        }
+
+        /// Request cooperative cancellation for an asynchronous source migration.
+        #[utoipa::path(
+            post,
+            path = $cancel_path,
+            tag = "migration",
+            params(
+                ("job_id" = Uuid, Path, description = "Migration job UUID")
+            ),
+            responses(
+                (status = 200, description = "Durable async source migration status after cancel request", body = AsyncMigrationStatusResponse),
+                (status = 400, description = "Invalid migration job UUID"),
+                (status = 404, description = "No durable migration phase record is currently retained for the UUID"),
+                (status = 409, description = "cancel_too_late"),
+                (status = 500, description = "Migration cancel request could not be persisted")
+            ),
+            security(("api_key" = []))
+        )]
+        pub async fn $cancel_fn(
+            State(state): State<Arc<AppState>>,
+            Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
+            AxumPath(job_id): AxumPath<String>,
+        ) -> Result<Json<AsyncMigrationStatusResponse>, MigrateError> {
+            cancel_source_migration(
+                state,
+                authenticated_app_id,
+                job_id,
+                Some(AsyncMigrationSourceProvider::$provider),
+            )
+            .await
+        }
+
+        /// Confirm that the control plane observed a terminal source migration.
+        #[utoipa::path(
+            post,
+            path = $acknowledge_path,
+            tag = "migration",
+            params(
+                ("job_id" = Uuid, Path, description = "Migration job UUID")
+            ),
+            responses(
+                (status = 204, description = "Terminal migration acknowledged"),
+                (status = 400, description = "Invalid migration job UUID"),
+                (status = 404, description = "No durable migration phase record is currently retained for the UUID"),
+                (status = 409, description = "migration_ack_too_early"),
+                (status = 500, description = "Migration status record could not be read")
+            ),
+            security(("api_key" = []))
+        )]
+        pub async fn $acknowledge_fn(
+            State(state): State<Arc<AppState>>,
+            Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
+            headers: HeaderMap,
+            AxumPath(job_id): AxumPath<String>,
+        ) -> Result<StatusCode, MigrateError> {
+            acknowledge_source_migration(
+                state,
+                authenticated_owner_identity(authenticated_app_id, &headers),
+                job_id,
+                Some(AsyncMigrationSourceProvider::$provider),
+            )
+            .await
+        }
+    };
 }
+
+define_source_migration_openapi_lifecycle!(
+    Algolia,
+    submit: submit_algolia_migration => "/1/migrations/algolia",
+    status: get_algolia_migration_status => "/1/migrations/algolia/{job_id}",
+    cancel: cancel_algolia_migration => "/1/migrations/algolia/{job_id}/cancel",
+    acknowledge: acknowledge_algolia_migration => "/1/migrations/algolia/{job_id}/acknowledge"
+);
+define_source_migration_openapi_lifecycle!(
+    Meilisearch,
+    submit: submit_meilisearch_migration => "/1/migrations/meilisearch",
+    status: get_meilisearch_migration_status => "/1/migrations/meilisearch/{job_id}",
+    cancel: cancel_meilisearch_migration => "/1/migrations/meilisearch/{job_id}/cancel",
+    acknowledge: acknowledge_meilisearch_migration => "/1/migrations/meilisearch/{job_id}/acknowledge"
+);
+define_source_migration_openapi_lifecycle!(
+    Typesense,
+    submit: submit_typesense_migration => "/1/migrations/typesense",
+    status: get_typesense_migration_status => "/1/migrations/typesense/{job_id}",
+    cancel: cancel_typesense_migration => "/1/migrations/typesense/{job_id}/cancel",
+    acknowledge: acknowledge_typesense_migration => "/1/migrations/typesense/{job_id}/acknowledge"
+);
 
 pub(crate) async fn submit_algolia_migration_http(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
+    source_provider: Option<Extension<AsyncMigrationSourceProvider>>,
     headers: HeaderMap,
     Json(payload): Json<MigrateFromAlgoliaRequest>,
 ) -> Result<(StatusCode, Json<AsyncMigrationStatusResponse>), MigrateError> {
     submit_algolia_migration_impl(
+        source_provider
+            .map(|Extension(provider)| provider)
+            .unwrap_or_default(),
         state,
         authenticated_owner_identity(authenticated_app_id, &headers),
         payload,
@@ -492,10 +648,40 @@ where
     F: FnOnce(&MigrateFromAlgoliaRequest) -> Result<R, AlgoliaClientError>,
     R: source_reader::MigrationSourceReader + Send + 'static,
 {
-    submit_algolia_migration_impl(state, authenticated_app_id, payload, source_factory).await
+    submit_source_migration_with_test_source_factory(
+        AsyncMigrationSourceProvider::Algolia,
+        State(state),
+        Extension(AuthenticatedAppId(authenticated_app_id)),
+        Json(payload),
+        source_factory,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn submit_source_migration_with_test_source_factory<F, R>(
+    source_provider: AsyncMigrationSourceProvider,
+    State(state): State<Arc<AppState>>,
+    Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
+    Json(payload): Json<MigrateFromAlgoliaRequest>,
+    source_factory: F,
+) -> Result<(StatusCode, Json<AsyncMigrationStatusResponse>), MigrateError>
+where
+    F: FnOnce(&MigrateFromAlgoliaRequest) -> Result<R, AlgoliaClientError>,
+    R: source_reader::MigrationSourceReader + Send + 'static,
+{
+    submit_algolia_migration_impl(
+        source_provider,
+        state,
+        authenticated_app_id,
+        payload,
+        source_factory,
+    )
+    .await
 }
 
 async fn submit_algolia_migration_impl<F, R>(
+    source_provider: AsyncMigrationSourceProvider,
     state: Arc<AppState>,
     authenticated_app_id: String,
     payload: MigrateFromAlgoliaRequest,
@@ -505,6 +691,7 @@ where
     F: FnOnce(&MigrateFromAlgoliaRequest) -> Result<R, AlgoliaClientError>,
     R: source_reader::MigrationSourceReader + Send + 'static,
 {
+    ensure_source_provider_supported(source_provider)?;
     let (_job_uuid, phase_record) = state
         .migration_runner
         .submit_algolia_import_for_owner(payload, Some(authenticated_app_id), source_factory)
@@ -640,37 +827,10 @@ async fn submit_privacy_scrub_impl(
     Ok(privacy_scrub_ack(&intent.scrub_id))
 }
 
-/// Return the durable status for an async Algolia migration job.
-///
-/// A 404 means no durable phase record is currently retained for the UUID; it
-/// is not proof that the UUID never existed because future MIG-9 retention may
-/// remove old records.
-#[utoipa::path(
-    get,
-    path = "/1/migrations/algolia/{job_id}",
-    tag = "migration",
-    params(
-        ("job_id" = Uuid, Path, description = "Migration job UUID")
-    ),
-    responses(
-        (status = 200, description = "Durable async Algolia migration status", body = AsyncMigrationStatusResponse),
-        (status = 400, description = "Invalid migration job UUID"),
-        (status = 404, description = "No durable migration phase record is currently retained for the UUID"),
-        (status = 500, description = "Migration status record could not be read")
-    ),
-    security(("api_key" = []))
-)]
-pub async fn get_algolia_migration_status(
-    State(state): State<Arc<AppState>>,
-    Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
-    AxumPath(job_id): AxumPath<String>,
-) -> Result<Json<AsyncMigrationStatusResponse>, MigrateError> {
-    get_source_migration_status(state, authenticated_app_id, job_id).await
-}
-
 pub(crate) async fn get_algolia_migration_status_http(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
+    source_provider: Option<Extension<AsyncMigrationSourceProvider>>,
     headers: HeaderMap,
     AxumPath(job_id): AxumPath<String>,
 ) -> Result<Json<AsyncMigrationStatusResponse>, MigrateError> {
@@ -678,43 +838,19 @@ pub(crate) async fn get_algolia_migration_status_http(
         state,
         authenticated_owner_identity(authenticated_app_id, &headers),
         job_id,
+        Some(
+            source_provider
+                .map(|Extension(provider)| provider)
+                .unwrap_or(AsyncMigrationSourceProvider::Algolia),
+        ),
     )
     .await
-}
-
-/// Request cooperative cancellation for an async Algolia migration job.
-///
-/// Cancellation is durable and cooperative. Jobs that have not reached the
-/// publication commit boundary observe the request at their next checkpoint;
-/// terminal jobs are returned unchanged, and post-commit running jobs are too
-/// late to cancel because Stage 2 never rolls back a committed target.
-#[utoipa::path(
-    post,
-    path = "/1/migrations/algolia/{job_id}/cancel",
-    tag = "migration",
-    params(
-        ("job_id" = Uuid, Path, description = "Migration job UUID")
-    ),
-    responses(
-        (status = 200, description = "Durable async Algolia migration status after cancel request", body = AsyncMigrationStatusResponse),
-        (status = 400, description = "Invalid migration job UUID"),
-        (status = 404, description = "No durable migration phase record is currently retained for the UUID"),
-        (status = 409, description = "cancel_too_late"),
-        (status = 500, description = "Migration cancel request could not be persisted")
-    ),
-    security(("api_key" = []))
-)]
-pub async fn cancel_algolia_migration(
-    State(state): State<Arc<AppState>>,
-    Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
-    AxumPath(job_id): AxumPath<String>,
-) -> Result<Json<AsyncMigrationStatusResponse>, MigrateError> {
-    cancel_source_migration(state, authenticated_app_id, job_id).await
 }
 
 pub(crate) async fn cancel_algolia_migration_http(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
+    source_provider: Option<Extension<AsyncMigrationSourceProvider>>,
     headers: HeaderMap,
     AxumPath(job_id): AxumPath<String>,
 ) -> Result<Json<AsyncMigrationStatusResponse>, MigrateError> {
@@ -722,6 +858,11 @@ pub(crate) async fn cancel_algolia_migration_http(
         state,
         authenticated_owner_identity(authenticated_app_id, &headers),
         job_id,
+        Some(
+            source_provider
+                .map(|Extension(provider)| provider)
+                .unwrap_or(AsyncMigrationSourceProvider::Algolia),
+        ),
     )
     .await
 }
@@ -730,13 +871,15 @@ pub(super) async fn get_source_migration_status(
     state: Arc<AppState>,
     owner_identity: String,
     job_id: String,
+    expected_source_provider: Option<AsyncMigrationSourceProvider>,
 ) -> Result<Json<AsyncMigrationStatusResponse>, MigrateError> {
     let (spool, job_uuid) = owned_async_migration_job(&state, &owner_identity, &job_id)?;
-    let phase_record = spool
-        .read_migration_phase(job_uuid)
-        .map_err(migration_status_spool_error)?;
     let metadata = spool
         .read_async_migration_metadata(job_uuid)
+        .map_err(migration_status_spool_error)?;
+    ensure_expected_source_provider(&metadata, expected_source_provider)?;
+    let phase_record = spool
+        .read_migration_phase(job_uuid)
         .map_err(migration_status_spool_error)?;
     Ok(Json(AsyncMigrationStatusResponse::with_metadata(
         phase_record,
@@ -748,20 +891,20 @@ pub(super) async fn cancel_source_migration(
     state: Arc<AppState>,
     owner_identity: String,
     job_id: String,
+    expected_source_provider: Option<AsyncMigrationSourceProvider>,
 ) -> Result<Json<AsyncMigrationStatusResponse>, MigrateError> {
     let (spool, job_uuid) = owned_async_migration_job(&state, &owner_identity, &job_id)?;
+    let metadata = spool
+        .read_async_migration_metadata(job_uuid)
+        .map_err(migration_status_spool_error)?;
+    ensure_expected_source_provider(&metadata, expected_source_provider)?;
     match spool
         .request_async_migration_cancel(job_uuid)
         .map_err(migration_status_spool_error)?
     {
-        MigrationCancelRequest::Requested(record) => {
-            let metadata = spool
-                .read_async_migration_metadata(job_uuid)
-                .map_err(migration_status_spool_error)?;
-            Ok(Json(AsyncMigrationStatusResponse::with_metadata(
-                record, &metadata,
-            )))
-        }
+        MigrationCancelRequest::Requested(record) => Ok(Json(
+            AsyncMigrationStatusResponse::with_metadata(record, &metadata),
+        )),
         MigrationCancelRequest::TooLate(_) => Err(json_error_parts_with_code(
             StatusCode::CONFLICT,
             MIGRATION_CANCEL_TOO_LATE_CODE,
@@ -770,30 +913,10 @@ pub(super) async fn cancel_source_migration(
     }
 }
 
-/// Confirm that the control plane has durably observed a terminal migration.
-///
-/// The acknowledgement is intentionally an idempotent no-op in the engine:
-/// fjcloud owns its retained outbox and only needs an authenticated terminal
-/// receipt before releasing the destination reservation.
-#[utoipa::path(
-    post,
-    path = "/1/migrations/algolia/{job_id}/acknowledge",
-    tag = "migration",
-    params(
-        ("job_id" = Uuid, Path, description = "Migration job UUID")
-    ),
-    responses(
-        (status = 204, description = "Terminal migration acknowledged"),
-        (status = 400, description = "Invalid migration job UUID"),
-        (status = 404, description = "No durable migration phase record is currently retained for the UUID"),
-        (status = 409, description = "migration_ack_too_early"),
-        (status = 500, description = "Migration status record could not be read")
-    ),
-    security(("api_key" = []))
-)]
-pub async fn acknowledge_algolia_migration(
+pub(crate) async fn acknowledge_algolia_migration_http(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
+    source_provider: Option<Extension<AsyncMigrationSourceProvider>>,
     headers: HeaderMap,
     AxumPath(job_id): AxumPath<String>,
 ) -> Result<StatusCode, MigrateError> {
@@ -801,6 +924,11 @@ pub async fn acknowledge_algolia_migration(
         state,
         authenticated_owner_identity(authenticated_app_id, &headers),
         job_id,
+        Some(
+            source_provider
+                .map(|Extension(provider)| provider)
+                .unwrap_or(AsyncMigrationSourceProvider::Algolia),
+        ),
     )
     .await
 }
@@ -809,8 +937,13 @@ async fn acknowledge_source_migration(
     state: Arc<AppState>,
     owner_identity: String,
     job_id: String,
+    expected_source_provider: Option<AsyncMigrationSourceProvider>,
 ) -> Result<StatusCode, MigrateError> {
     let (spool, job_uuid) = owned_async_migration_job(&state, &owner_identity, &job_id)?;
+    let metadata = spool
+        .read_async_migration_metadata(job_uuid)
+        .map_err(migration_status_spool_error)?;
+    ensure_expected_source_provider(&metadata, expected_source_provider)?;
     let phase_record = spool
         .read_migration_phase(job_uuid)
         .map_err(migration_status_spool_error)?;
@@ -981,6 +1114,24 @@ fn algolia_error(error: AlgoliaClientError) -> (StatusCode, Json<serde_json::Val
     json_error_parts(status, error.safe_message())
 }
 
+fn ensure_source_provider_supported(
+    source_provider: AsyncMigrationSourceProvider,
+) -> Result<(), MigrateError> {
+    if source_provider.is_algolia() {
+        Ok(())
+    } else {
+        Err(source_provider_unsupported())
+    }
+}
+
+fn source_provider_unsupported() -> MigrateError {
+    json_error_parts_with_code(
+        StatusCode::BAD_REQUEST,
+        SOURCE_PROVIDER_UNSUPPORTED_CODE,
+        SOURCE_PROVIDER_UNSUPPORTED_MESSAGE,
+    )
+}
+
 fn migration_cancelled_error() -> MigrateError {
     json_error_parts_with_code(
         StatusCode::CONFLICT,
@@ -1048,11 +1199,30 @@ fn ensure_async_migration_owner(
     if metadata.authenticated_app_id.as_deref() == Some(owner_identity) {
         return Ok(());
     }
-    Err(json_error_parts_with_code(
+    Err(migration_job_not_found())
+}
+
+fn ensure_expected_source_provider(
+    metadata: &spool::AsyncMigrationMetadata,
+    expected_source_provider: Option<AsyncMigrationSourceProvider>,
+) -> Result<(), MigrateError> {
+    let Some(expected) = expected_source_provider else {
+        return Ok(());
+    };
+    if metadata.source_provider == expected
+        && metadata.operation_kind == spool::AsyncMigrationOperationKind::SourceImport
+    {
+        return Ok(());
+    }
+    Err(migration_job_not_found())
+}
+
+fn migration_job_not_found() -> MigrateError {
+    json_error_parts_with_code(
         StatusCode::NOT_FOUND,
         MIGRATION_JOB_NOT_FOUND_CODE,
         MIGRATION_JOB_NOT_FOUND_MESSAGE,
-    ))
+    )
 }
 
 fn owned_async_migration_job(

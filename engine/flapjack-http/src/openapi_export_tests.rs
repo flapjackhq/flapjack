@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::openapi_test_helpers::{schema_composition_refs, schema_ref};
@@ -132,6 +133,33 @@ fn export_output_covers_recommend_personalization_and_experiments_routes() {
             "expected exported openapi to include operation at {pointer}"
         );
     }
+}
+
+#[test]
+fn export_output_declares_closed_source_provider_status_paths() {
+    let doc = exported_openapi_doc();
+    let expected_status_paths = BTreeSet::from([
+        "/1/migrations/algolia/{job_id}",
+        "/1/migrations/meilisearch/{job_id}",
+        "/1/migrations/typesense/{job_id}",
+    ]);
+    let actual_status_paths: BTreeSet<&str> = doc
+        .get("paths")
+        .and_then(|paths| paths.as_object())
+        .expect("exported openapi must contain paths")
+        .iter()
+        .filter_map(|(path, operation)| operation.get("get").is_some().then_some(path.as_str()))
+        .filter(|path| {
+            path.strip_prefix("/1/migrations/")
+                .and_then(|tail| tail.strip_suffix("/{job_id}"))
+                .is_some_and(|provider| !provider.contains('/'))
+        })
+        .collect();
+
+    assert_eq!(
+        actual_status_paths, expected_status_paths,
+        "fjcloud derives the closed source_provider union from provider-specific status GET paths"
+    );
 }
 #[test]
 fn export_output_includes_federated_batch_contract_components() {

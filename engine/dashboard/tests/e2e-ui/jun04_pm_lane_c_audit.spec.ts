@@ -1,7 +1,6 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { APIRequestContext } from '@playwright/test';
 import { test, expect } from '../fixtures/auth.fixture';
 import {
   assertDashboardRouteCoverage,
@@ -17,64 +16,11 @@ import {
   seedMoviesIndex,
   validateMovieCorpus,
 } from '../fixtures/lane_c_movies';
-
-type MockApiResponseBody = Record<string, unknown>;
+import { buildMovieSeedRequest } from '../fixtures/lane_c_movies_mock_backend';
 
 const MOCK_BUNDLE_BASELINE_NAME = 'jun98_am_lane_c_baseline';
 const MOCK_BUNDLE_TIMESTAMP = '20260605T000000Z';
 const MOVIES_SEED_VERIFY_FILE = 'movies_seed_verify.json';
-
-function buildMockApiResponse(body: MockApiResponseBody): {
-  json: () => Promise<MockApiResponseBody>;
-  ok: () => boolean;
-  status: () => number;
-  text: () => Promise<string>;
-} {
-  return {
-    json: async () => body,
-    ok: () => true,
-    status: () => 200,
-    text: async () => JSON.stringify(body),
-  };
-}
-
-function buildMovieSeedRequest(initialHits: readonly Record<string, unknown>[]): {
-  addedDocuments: () => readonly Record<string, unknown>[];
-  deleteCount: () => number;
-  request: APIRequestContext;
-} {
-  let storedDocuments = [...initialHits];
-  let addedDocuments: Record<string, unknown>[] = [];
-  let deleteCount = 0;
-
-  const request = {
-    delete: async () => {
-      deleteCount += 1;
-      storedDocuments = [];
-      return buildMockApiResponse({});
-    },
-    post: async (url: string, options?: { data?: unknown }) => {
-      if (url.endsWith('/query')) {
-        return buildMockApiResponse({ hits: storedDocuments, nbHits: storedDocuments.length });
-      }
-
-      if (url.endsWith('/batch')) {
-        const data = options?.data as { requests?: Array<{ body?: Record<string, unknown> }> };
-        addedDocuments = data.requests?.map((entry) => entry.body ?? {}) ?? [];
-        storedDocuments = [...addedDocuments];
-        return buildMockApiResponse({});
-      }
-
-      throw new Error(`Unexpected mock request URL: ${url}`);
-    },
-  } as APIRequestContext;
-
-  return {
-    addedDocuments: () => addedDocuments,
-    deleteCount: () => deleteCount,
-    request,
-  };
-}
 
 function createRepoLaneCBundleDir(baselineName: string, bundleName: string): string {
   const repoLiveStateRoot = path.resolve(process.cwd(), '../../docs/live-state');

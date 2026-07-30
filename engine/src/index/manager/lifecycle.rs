@@ -200,6 +200,20 @@ impl super::IndexManager {
         self.loaded.remove(tenant_id);
     }
 
+    /// Hold this tenant in the production write-backpressure registry for an
+    /// integration test, clearing the pause when the returned guard is dropped.
+    #[cfg(feature = "test-support")]
+    pub fn hold_write_backpressure_pause_for_test_support(
+        &self,
+        tenant_id: &str,
+    ) -> Result<impl Drop> {
+        validate_index_name(tenant_id)?;
+        crate::index::write_queue::backpressure::hold_non_improving_pause_for_test(
+            &self.base_path,
+            tenant_id,
+        )
+    }
+
     pub(super) fn cache_loaded_index(&self, tenant_id: &str, index: Arc<Index>) -> Arc<Index> {
         let _ = index.searchable_paths();
         self.loaded

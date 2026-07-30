@@ -1901,7 +1901,22 @@ async fn closed_write_queue_preserves_queue_full_admission_contract() {
         .add_documents(tenant_id, vec![write_queue_test_document("seed", "seed")])
         .unwrap();
     assert!(manager.abort_tenant_write_task_for_test(tenant_id));
-    tokio::task::yield_now().await;
+    let closure_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let queue = manager
+            .write_queues
+            .get(tenant_id)
+            .expect("aborted writer queue must remain retained for the closed-channel probe");
+        if queue.is_closed() {
+            break;
+        }
+        drop(queue);
+        assert!(
+            Instant::now() < closure_deadline,
+            "aborted writer queue did not close before the bounded admission probe"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 
     let before_keys = tenant_task_key_snapshot(&manager, tenant_id);
     let before_records = tenant_admission_record_count(temp_dir.path(), tenant_id);

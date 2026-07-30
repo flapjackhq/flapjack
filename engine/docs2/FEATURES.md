@@ -290,6 +290,8 @@ Env-var details for operational behavior are canonical in
 
 **Status as of 2026-07-26: node-local synchronous and authenticated async Algolia migration support create-only import and `overwrite=true` replacement.** Both replacement paths use the fenced publication owner. Successful async status projects the durable settings/synonym/rule outcome and warnings; non-success states omit that outcome rather than fabricating zeroes. Resume and HA-converging import remain deferred in [`ROADMAP.md`](../../ROADMAP.md) rows `MIG-6` and `MIG-7`. `MIG-4` is a separate publication-repair proof row, not part of this migration capability.
 
+**Operator CLI:** `flapjack migrate` submits and monitors authenticated async migrations; `flapjack migrate cancel --job-id <uuid>` requests cooperative cancellation, and `flapjack migrate ack --job-id <uuid>` acknowledges terminal jobs. Secret values are accepted only from environment, file, or stdin sources, and non-success terminal states use distinct non-zero exit codes. Interrupted-job resume is not shipped.
+
 | Leg | Status | Owner |
 |---|---|---|
 | Source export: Algolia → durable on-disk spool (checkpointed, resumable) | ✅ Shipped | `engine/flapjack-http/src/handlers/migration/{algolia_client,source_reader,export,spool}.rs` |

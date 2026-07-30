@@ -54,7 +54,11 @@ pub(super) async fn process_vectors_for_write_op(
     ) {
         prepared.vectors_modified = true;
     }
-    inject_computed_vectors(&mut prepared.valid_docs, &computed_vectors);
+    inject_computed_vectors(
+        &mut prepared.valid_docs,
+        &mut prepared.oplog_ops,
+        &computed_vectors,
+    );
 }
 
 #[cfg(feature = "vector-search")]
@@ -294,6 +298,7 @@ fn apply_vector_deletes(
 #[cfg(feature = "vector-search")]
 fn inject_computed_vectors(
     valid_docs: &mut [PreparedWriteDocument],
+    oplog_ops: &mut [crate::index::oplog::OpLogOperation],
     computed_vectors: &ComputedVectors,
 ) {
     if computed_vectors.is_empty() {
@@ -304,19 +309,46 @@ fn inject_computed_vectors(
         let Some(embedder_vectors) = computed_vectors.get(doc_id.as_str()) else {
             continue;
         };
-        let vectors_obj = doc_json
-            .as_object_mut()
-            .unwrap()
-            .entry("_vectors")
-            .or_insert_with(|| serde_json::json!({}));
-        if let Some(obj) = vectors_obj.as_object_mut() {
-            for (embedder_name, vector) in embedder_vectors {
-                let json_vec: Vec<serde_json::Value> = vector
-                    .iter()
-                    .map(|&value| serde_json::Value::from(value as f64))
-                    .collect();
-                obj.insert(embedder_name.clone(), serde_json::Value::Array(json_vec));
-            }
+        inject_embedder_vectors(doc_json, embedder_vectors);
+    }
+
+    for operation in oplog_ops {
+        if operation.op_type != "upsert" {
+            continue;
+        }
+        let Some(doc_id) = operation
+            .payload
+            .get("objectID")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let Some(embedder_vectors) = computed_vectors.get(doc_id) else {
+            continue;
+        };
+        if let Some(body) = operation.payload.get_mut("body") {
+            inject_embedder_vectors(body, embedder_vectors);
+        }
+    }
+}
+
+#[cfg(feature = "vector-search")]
+fn inject_embedder_vectors(
+    doc_json: &mut serde_json::Value,
+    embedder_vectors: &HashMap<String, Vec<f32>>,
+) {
+    let vectors_obj = doc_json
+        .as_object_mut()
+        .expect("prepared document JSON must be an object")
+        .entry("_vectors")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(obj) = vectors_obj.as_object_mut() {
+        for (embedder_name, vector) in embedder_vectors {
+            let json_vec: Vec<serde_json::Value> = vector
+                .iter()
+                .map(|&value| serde_json::Value::from(value as f64))
+                .collect();
+            obj.insert(embedder_name.clone(), serde_json::Value::Array(json_vec));
         }
     }
 }

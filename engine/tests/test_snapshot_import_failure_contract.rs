@@ -5,6 +5,7 @@ use axum::{
 use flapjack_http::startup_catchup::snapshot_install_step_tags;
 use serde_json::json;
 use std::sync::Arc;
+use tempfile::TempDir;
 
 mod common;
 
@@ -19,6 +20,82 @@ async fn query_hits(
         &format!("/1/indexes/{index_name}/query"),
         &[("content-type", "application/json")],
         Body::from(json!({ "query": query }).to_string()),
+    )
+    .await
+}
+
+fn assert_snapshot_export_read_after_quiescence(index_name: &str) {
+    let events = flapjack::index::write_queue::writer_lifecycle_test_events(index_name);
+    let quiesced_sequence = events
+        .iter()
+        .find(|event| event.reason == "channel_closed" && event.phase == "merge_quiesced")
+        .map(|event| event.sequence)
+        .unwrap_or_else(|| {
+            panic!(
+                "tenant {index_name} must retain a channel_closed merge-quiesced event: {events:?}"
+            )
+        });
+    let export_sequence = events
+        .iter()
+        .find(|event| event.phase == "snapshot_export_read")
+        .map(|event| event.sequence)
+        .unwrap_or_else(|| {
+            panic!(
+                "tenant {index_name} must retain publication event snapshot_export_read: {events:?}"
+            )
+        });
+
+    assert!(
+        quiesced_sequence < export_sequence,
+        "tenant {index_name} must merge-quiesce before snapshot_export_read; events: {events:?}"
+    );
+}
+
+async fn snapshot_fixture_bytes(app: &axum::Router, index_name: &str) -> Vec<u8> {
+    // Raw export_to_bytes is only safe for an already-quiesced directory; this
+    // live HTTP fixture must use the route that owns IndexManager quiescence.
+    let response = common::send_oneshot(
+        app,
+        Method::GET,
+        &format!("/1/indexes/{index_name}/export"),
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "snapshot fixture export route must succeed"
+    );
+    axum::body::to_bytes(response.into_body(), 100_000_000)
+        .await
+        .expect("snapshot fixture response body must be readable")
+        .to_vec()
+}
+
+async fn post_batch_without_wait(
+    app: &axum::Router,
+    index_name: &str,
+    start_id: usize,
+) -> axum::http::Response<Body> {
+    let requests: Vec<serde_json::Value> = (start_id..start_id + 100)
+        .map(|id| {
+            json!({
+                "action": "addObject",
+                "body": {
+                    "objectID": format!("active-doc-{id}"),
+                    "name": format!("active write {id}")
+                }
+            })
+        })
+        .collect();
+
+    common::send_oneshot(
+        app,
+        Method::POST,
+        &format!("/1/indexes/{index_name}/batch"),
+        &[("content-type", "application/json")],
+        Body::from(json!({ "requests": requests }).to_string()),
     )
     .await
 }
@@ -109,6 +186,46 @@ async fn invalid_snapshot_import_returns_500_json_and_preserves_existing_index_d
     assert_eq!(after_restart_body["hits"][0]["objectID"], json!("doc-1"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_fixture_bytes_quiesce_active_writer_before_export() {
+    flapjack::index::write_queue::clear_writer_lifecycle_test_events();
+    let (app, _tmp) = common::build_test_app_for_local_requests(None);
+    let app = Arc::new(app);
+    let index_name = "snapshot-fixture-quiesce-contract";
+
+    common::seed_doc_local(&app, index_name).await;
+
+    let write_app = Arc::clone(&app);
+    let active_batch =
+        tokio::spawn(async move { post_batch_without_wait(&write_app, index_name, 0).await });
+    tokio::task::yield_now().await;
+
+    let snapshot_bytes = snapshot_fixture_bytes(&app, index_name).await;
+    let restore_dir = TempDir::new().unwrap();
+    flapjack::index::snapshot::import_from_bytes(&snapshot_bytes, restore_dir.path())
+        .expect("snapshot fixture bytes must be reusable and importable");
+
+    let batch_response = active_batch
+        .await
+        .expect("active batch task must not panic");
+    match batch_response.status() {
+        StatusCode::OK => {
+            let batch_body = common::parse_response_json(batch_response).await;
+            common::wait_for_task_local(&app, common::extract_task_id(&batch_body)).await;
+        }
+        StatusCode::SERVICE_UNAVAILABLE => {
+            let batch_body = common::parse_response_json(batch_response).await;
+            assert_eq!(
+                batch_body["message"],
+                json!("Index is temporarily unavailable")
+            );
+        }
+        status => panic!("active batch request returned unexpected status {status}"),
+    }
+
+    assert_snapshot_export_read_after_quiescence(index_name);
+}
+
 /// Hostile concurrent-import regression test for the HA snapshot-restore-under-load
 /// flake diagnosed in Stage 1 (`docs/reference/research/may31_pm_ha_snapshot_flake_diagnosis.md`).
 ///
@@ -126,17 +243,13 @@ async fn invalid_snapshot_import_returns_500_json_and_preserves_existing_index_d
 /// failing branch. A missing `sub_step` on a 500 fails the test outright.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_imports_against_warm_server_pin_install_snapshot_step() {
-    let (app, tmp) = common::build_test_app_for_local_requests(None);
+    let (app, _tmp) = common::build_test_app_for_local_requests(None);
     let app = Arc::new(app);
     let index_name = "snapshot-concurrent-import-contract";
 
     common::seed_doc_local(&app, index_name).await;
 
-    // Produce valid tar.gz snapshot bytes by reusing the existing on-disk
-    // export surface — same fixture pattern as the inline `import_snapshot`
-    // success test in `handlers/snapshot.rs`.
-    let snapshot_bytes = flapjack::index::snapshot::export_to_bytes(&tmp.path().join(index_name))
-        .expect("export_to_bytes against the seeded tenant must succeed");
+    let snapshot_bytes = snapshot_fixture_bytes(&app, index_name).await;
     let snapshot_bytes = Arc::new(snapshot_bytes);
 
     const CONCURRENT: usize = 8;

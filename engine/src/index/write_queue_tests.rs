@@ -1,3 +1,7 @@
+// These guards intentionally serialize process-environment overrides across
+// complete async specimens; releasing them at awaits would make the tests race.
+#![allow(clippy::await_holding_lock)]
+
 use super::*;
 use crate::error::FlapjackError;
 use crate::index::memory::{MemoryBudget, MemoryBudgetConfig};
@@ -26,6 +30,28 @@ const JULY_22_TIMEOUT_RISK_PENDING_ADMISSIONS: usize = 690;
 /// each pinned to what it actually measures.
 const ONLINE_SPECIMEN_SETTLED_MAX: usize = 4;
 static WRITE_QUEUE_ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+type WriteQueueHandle = tokio::task::JoinHandle<crate::error::Result<()>>;
+type WriteQueueTasks = Arc<dashmap::DashMap<String, TaskInfo>>;
+type WriteQueueSetup = (WriteQueue, WriteQueueHandle, WriteQueueTasks);
+type GatedWriteQueueSetup = (
+    WriteQueue,
+    WriteQueueHandle,
+    WriteQueueTasks,
+    Arc<WriteQueueWorkerGate>,
+);
+type OplogWriteQueueSetup = (
+    WriteQueue,
+    WriteQueueHandle,
+    WriteQueueTasks,
+    Arc<crate::index::oplog::OpLog>,
+);
+type BudgetedWriteQueueSetup = (
+    Arc<crate::index::Index>,
+    WriteQueue,
+    WriteQueueHandle,
+    WriteQueueTasks,
+);
 
 struct WriteQueueEnvVarRestoreGuard {
     name: &'static str,
@@ -178,11 +204,7 @@ fn setup_write_queue_with_index(
     tmp: &tempfile::TempDir,
     tenant_id: &str,
     index: Arc<crate::index::Index>,
-) -> (
-    WriteQueue,
-    tokio::task::JoinHandle<crate::error::Result<()>>,
-    Arc<dashmap::DashMap<String, TaskInfo>>,
-) {
+) -> WriteQueueSetup {
     setup_write_queue_with_index_and_overrides(
         tmp,
         tenant_id,
@@ -195,12 +217,7 @@ fn setup_gated_write_queue_with_index(
     tmp: &tempfile::TempDir,
     tenant_id: &str,
     index: Arc<crate::index::Index>,
-) -> (
-    WriteQueue,
-    tokio::task::JoinHandle<crate::error::Result<()>>,
-    Arc<dashmap::DashMap<String, TaskInfo>>,
-    Arc<WriteQueueWorkerGate>,
-) {
+) -> GatedWriteQueueSetup {
     let worker_gate = Arc::new(WriteQueueWorkerGate::closed());
     let (tx, handle, tasks) = setup_write_queue_with_index_and_overrides(
         tmp,
@@ -214,15 +231,7 @@ fn setup_gated_write_queue_with_index(
     (tx, handle, tasks, worker_gate)
 }
 
-fn setup_gated_write_queue(
-    tmp: &tempfile::TempDir,
-    tenant_id: &str,
-) -> (
-    WriteQueue,
-    tokio::task::JoinHandle<crate::error::Result<()>>,
-    Arc<dashmap::DashMap<String, TaskInfo>>,
-    Arc<WriteQueueWorkerGate>,
-) {
+fn setup_gated_write_queue(tmp: &tempfile::TempDir, tenant_id: &str) -> GatedWriteQueueSetup {
     let tenant_path = tmp.path().join(tenant_id);
     std::fs::create_dir_all(&tenant_path).unwrap();
     let schema = crate::index::schema::Schema::builder().build();
@@ -235,11 +244,7 @@ fn setup_write_queue_with_index_and_overrides(
     tenant_id: &str,
     index: Arc<crate::index::Index>,
     test_overrides: WriteQueueTestOverrides,
-) -> (
-    WriteQueue,
-    tokio::task::JoinHandle<crate::error::Result<()>>,
-    Arc<dashmap::DashMap<String, TaskInfo>>,
-) {
+) -> WriteQueueSetup {
     let tasks: Arc<dashmap::DashMap<String, TaskInfo>> = Arc::new(dashmap::DashMap::new());
     let facet_cache = Arc::new(dashmap::DashMap::new());
 
@@ -269,14 +274,7 @@ fn setup_write_queue_with_index_and_overrides(
 }
 
 /// Convenience helper: create an index in a tenant subdirectory and wire up a queue.
-fn setup_write_queue(
-    tmp: &tempfile::TempDir,
-    tenant_id: &str,
-) -> (
-    WriteQueue,
-    tokio::task::JoinHandle<crate::error::Result<()>>,
-    Arc<dashmap::DashMap<String, TaskInfo>>,
-) {
+fn setup_write_queue(tmp: &tempfile::TempDir, tenant_id: &str) -> WriteQueueSetup {
     let tenant_path = tmp.path().join(tenant_id);
     std::fs::create_dir_all(&tenant_path).unwrap();
     let schema = crate::index::schema::Schema::builder().build();
@@ -284,15 +282,7 @@ fn setup_write_queue(
     setup_write_queue_with_index(tmp, tenant_id, index)
 }
 
-fn setup_write_queue_with_oplog(
-    tmp: &tempfile::TempDir,
-    tenant_id: &str,
-) -> (
-    WriteQueue,
-    tokio::task::JoinHandle<crate::error::Result<()>>,
-    Arc<dashmap::DashMap<String, TaskInfo>>,
-    Arc<crate::index::oplog::OpLog>,
-) {
+fn setup_write_queue_with_oplog(tmp: &tempfile::TempDir, tenant_id: &str) -> OplogWriteQueueSetup {
     let tenant_path = tmp.path().join(tenant_id);
     std::fs::create_dir_all(&tenant_path).unwrap();
     let schema = crate::index::schema::Schema::builder().build();
@@ -332,12 +322,7 @@ fn setup_write_queue_with_budget(
     tmp: &tempfile::TempDir,
     tenant_id: &str,
     budget: Arc<MemoryBudget>,
-) -> (
-    Arc<crate::index::Index>,
-    WriteQueue,
-    tokio::task::JoinHandle<crate::error::Result<()>>,
-    Arc<dashmap::DashMap<String, TaskInfo>>,
-) {
+) -> BudgetedWriteQueueSetup {
     setup_write_queue_with_budget_and_overrides(
         tmp,
         tenant_id,
@@ -351,12 +336,7 @@ fn setup_write_queue_with_budget_and_overrides(
     tenant_id: &str,
     budget: Arc<MemoryBudget>,
     test_overrides: WriteQueueTestOverrides,
-) -> (
-    Arc<crate::index::Index>,
-    WriteQueue,
-    tokio::task::JoinHandle<crate::error::Result<()>>,
-    Arc<dashmap::DashMap<String, TaskInfo>>,
-) {
+) -> BudgetedWriteQueueSetup {
     let tenant_path = tmp.path().join(tenant_id);
     std::fs::create_dir_all(&tenant_path).unwrap();
     let schema = crate::index::schema::Schema::builder().build();

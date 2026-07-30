@@ -18,7 +18,10 @@ use tower::ServiceExt;
 
 use crate::auth::{ApiKey, KeyStore};
 use crate::handlers::dashboard::{dashboard_test_asset_bytes, dashboard_test_index_bytes};
-use crate::handlers::migration::spool::{SpoolLimits, SpoolStore};
+use crate::handlers::migration::{
+    spool::{SpoolLimits, SpoolStore},
+    AsyncMigrationSourceProvider,
+};
 use crate::middleware::REQUEST_ID_HEADER_NAME;
 use crate::openapi::{DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS, DOCUMENTED_MEMBERSHIP_SCHEMA_NAMES};
 use crate::openapi_test_helpers::{
@@ -331,6 +334,91 @@ async fn assert_method_not_allowed_response(resp: axum::response::Response) {
     );
 }
 
+async fn assert_migration_job_not_found_response(resp: axum::response::Response) {
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        body_json(resp).await,
+        serde_json::json!({
+            "message": "Migration job not found",
+            "status": 404,
+            "code": "migration_job_not_found"
+        })
+    );
+}
+
+async fn assert_source_migration_alias_admin_contract(
+    app: &axum::Router,
+    source_provider: AsyncMigrationSourceProvider,
+    non_admin_keys: [&str; 2],
+) {
+    let provider = source_provider.as_str().unwrap();
+    let submit_path = format!("/1/migrations/{provider}");
+    let submit_payload = serde_json::json!({
+        "appId": "APPID",
+        "apiKey": "source-key",
+        "sourceIndex": "products",
+        "targetIndex": "products_copy"
+    });
+    assert_invalid_credentials_response(
+        post_json(app, &submit_path, None, submit_payload.clone()).await,
+    )
+    .await;
+    for api_key in non_admin_keys {
+        assert_method_not_allowed_response(
+            post_json(app, &submit_path, Some(api_key), submit_payload.clone()).await,
+        )
+        .await;
+    }
+
+    let job_path = format!("/1/migrations/{provider}/01890f8e-8b28-78e8-b542-8cfdcb2d4f24");
+    assert_invalid_credentials_response(get_request(app, &job_path, None).await).await;
+    for api_key in non_admin_keys {
+        assert_method_not_allowed_response(get_request(app, &job_path, Some(api_key)).await).await;
+    }
+    assert_migration_job_not_found_response(get_request(app, &job_path, Some("admin-key")).await)
+        .await;
+
+    assert_migration_job_action_contract(app, &job_path, non_admin_keys).await;
+
+    if source_provider != AsyncMigrationSourceProvider::Algolia {
+        let recognized_provider =
+            post_json(app, &submit_path, Some("admin-key"), submit_payload).await;
+        assert_eq!(recognized_provider.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(recognized_provider).await,
+            serde_json::json!({
+                "message": "Source provider is not supported",
+                "status": 400,
+                "code": "source_provider_unsupported"
+            })
+        );
+    }
+}
+
+async fn assert_migration_job_action_contract(
+    app: &axum::Router,
+    job_path: &str,
+    non_admin_keys: [&str; 2],
+) {
+    for action in ["cancel", "acknowledge"] {
+        let action_path = format!("{job_path}/{action}");
+        assert_invalid_credentials_response(
+            post_json(app, &action_path, None, serde_json::json!({})).await,
+        )
+        .await;
+        for api_key in non_admin_keys {
+            assert_method_not_allowed_response(
+                post_json(app, &action_path, Some(api_key), serde_json::json!({})).await,
+            )
+            .await;
+        }
+        assert_migration_job_not_found_response(
+            post_json(app, &action_path, Some("admin-key"), serde_json::json!({})).await,
+        )
+        .await;
+    }
+}
+
 async fn post_json(
     app: &axum::Router,
     uri: &str,
@@ -472,11 +560,7 @@ async fn migration_routes_preserve_admin_contract() {
     let write_key = create_test_key_with_acl(&key_store, "addObject");
     let app = build_test_router(&tmp, Some(key_store));
 
-    for path in [
-        "/1/migrate-from-algolia",
-        "/1/algolia-list-indexes",
-        "/1/migrations/algolia",
-    ] {
+    for path in ["/1/migrate-from-algolia", "/1/algolia-list-indexes"] {
         let valid_payload = if path == "/1/migrate-from-algolia" {
             serde_json::json!({
                 "appId": "APPID",
@@ -498,82 +582,23 @@ async fn migration_routes_preserve_admin_contract() {
         assert_method_not_allowed_response(non_admin).await;
     }
 
-    let status_path = "/1/migrations/algolia/01890f8e-8b28-78e8-b542-8cfdcb2d4f24";
-    let missing_auth = get_request(&app, status_path, None).await;
-    assert_invalid_credentials_response(missing_auth).await;
-    for api_key in [&search_key, &write_key] {
-        let non_admin = get_request(&app, status_path, Some(api_key)).await;
-        assert_method_not_allowed_response(non_admin).await;
+    for source_provider in AsyncMigrationSourceProvider::PUBLIC {
+        assert_source_migration_alias_admin_contract(
+            &app,
+            source_provider,
+            [&search_key, &write_key],
+        )
+        .await;
     }
-    let cancel_path = "/1/migrations/algolia/01890f8e-8b28-78e8-b542-8cfdcb2d4f24/cancel";
-    let cancel_missing_auth = post_json(&app, cancel_path, None, serde_json::json!({})).await;
-    assert_invalid_credentials_response(cancel_missing_auth).await;
-    for api_key in [&search_key, &write_key] {
-        let non_admin = post_json(&app, cancel_path, Some(api_key), serde_json::json!({})).await;
-        assert_method_not_allowed_response(non_admin).await;
-    }
-    let cancel_missing_job =
-        post_json(&app, cancel_path, Some("admin-key"), serde_json::json!({})).await;
-    assert_eq!(cancel_missing_job.status(), StatusCode::NOT_FOUND);
-    assert_eq!(
-        body_json(cancel_missing_job).await,
-        serde_json::json!({
-            "message": "Migration job not found",
-            "status": 404,
-            "code": "migration_job_not_found"
-        })
-    );
-    let acknowledge_path = "/1/migrations/algolia/01890f8e-8b28-78e8-b542-8cfdcb2d4f24/acknowledge";
-    let acknowledge_missing_auth =
-        post_json(&app, acknowledge_path, None, serde_json::json!({})).await;
-    assert_invalid_credentials_response(acknowledge_missing_auth).await;
-    for api_key in [&search_key, &write_key] {
-        let non_admin =
-            post_json(&app, acknowledge_path, Some(api_key), serde_json::json!({})).await;
-        assert_method_not_allowed_response(non_admin).await;
-    }
-    let acknowledge_missing_job = post_json(
+
+    let unknown_provider = post_json(
         &app,
-        acknowledge_path,
+        "/1/migrations/not-a-provider",
         Some("admin-key"),
         serde_json::json!({}),
     )
     .await;
-    assert_eq!(acknowledge_missing_job.status(), StatusCode::NOT_FOUND);
-    assert_eq!(
-        body_json(acknowledge_missing_job).await,
-        serde_json::json!({
-            "message": "Migration job not found",
-            "status": 404,
-            "code": "migration_job_not_found"
-        })
-    );
-    let post_missing_auth = post_json(
-        &app,
-        "/1/migrations/algolia",
-        None,
-        serde_json::json!({
-            "appId": "APPID",
-            "apiKey": "source-key",
-            "sourceIndex": "products",
-            "targetIndex": "products_copy"
-        }),
-    )
-    .await;
-    assert_invalid_credentials_response(post_missing_auth).await;
-    let post_write_only = post_json(
-        &app,
-        "/1/migrations/algolia",
-        Some(&write_key),
-        serde_json::json!({
-            "appId": "APPID",
-            "apiKey": "source-key",
-            "sourceIndex": "products",
-            "targetIndex": "products_copy"
-        }),
-    )
-    .await;
-    assert_method_not_allowed_response(post_write_only).await;
+    assert_eq!(unknown_provider.status(), StatusCode::NOT_FOUND);
 
     let migrate_validation = post_json(
         &app,
@@ -849,7 +874,7 @@ async fn cancelled_build_removes_only_its_own_staging_generation_after_saving_it
         &app,
         "/1/migrations/bulk-replace?indexName=cancelled_bulk_replace",
         Some("admin-key"),
-        &payload,
+        payload,
     )
     .await;
     assert_eq!(cancelled_submit.status(), StatusCode::ACCEPTED);
@@ -864,7 +889,7 @@ async fn cancelled_build_removes_only_its_own_staging_generation_after_saving_it
         &app,
         "/1/migrations/bulk-replace?indexName=surviving_bulk_replace",
         Some("admin-key"),
-        &payload,
+        payload,
     )
     .await;
     assert_eq!(surviving_submit.status(), StatusCode::ACCEPTED);

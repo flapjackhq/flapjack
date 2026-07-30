@@ -178,6 +178,7 @@ pub async fn get_bulk_replace_status_http(
         state,
         authenticated_owner_identity(authenticated_app_id, &headers),
         job_id,
+        None,
     )
     .await
 }
@@ -209,6 +210,7 @@ pub async fn cancel_bulk_replace_http(
         state,
         authenticated_owner_identity(authenticated_app_id, &headers),
         job_id,
+        None,
     )
     .await?;
     Ok((StatusCode::ACCEPTED, response))

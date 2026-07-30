@@ -135,6 +135,40 @@ export async function seedMoviesDocumentActionsIndex(
   return seedMoviesIndex(request);
 }
 
+/**
+ * Resolve the Lane C bundle directory to *write* evidence into, or null.
+ *
+ * Deliberately narrower than `resolveLaneCBundleDir`, which falls back to the newest
+ * bundle under the tracked baseline root when no candidate is given. That fallback is
+ * correct for reads, but as a write destination it meant a default
+ * `./s/test --dashboard-full` rewrote the tracked
+ * `movies_seed_verify.json` inside `docs/live-state/jun04_pm_lane_c_baseline` on every run.
+ * The file records `processingTimeMS`, `serverTimeMS` and `serverUsed`, so the rewrite
+ * always differed — and a dirty shared clone makes `batman land` exit 1 for every
+ * worker in this repo. Evidence writes are therefore opt-in: they happen only when
+ * `LANE_C_BUNDLE_DIR` explicitly names a bundle, which is already how the
+ * evidence-only Lane C specs run. Same idiom as
+ * `tests/e2e-ui/full/readme-screenshots.spec.ts`, which gates its tracked-PNG refresh
+ * behind `UPDATE_README_SCREENSHOTS`.
+ *
+ * An explicit candidate still goes through every `resolveLaneCBundleDir` guard
+ * (inside-baseline-root, no symlink escape).
+ */
+export function resolveExplicitLaneCBundleDir(
+  candidate: string | undefined = process.env.LANE_C_BUNDLE_DIR,
+): string | null {
+  if (!candidate) {
+    return null;
+  }
+
+  return resolveLaneCBundleDir(candidate);
+}
+
+/**
+ * Resolve the Lane C bundle directory to *read* from: the explicit candidate when one
+ * is given, otherwise the newest bundle under the tracked baseline root. Callers that
+ * write must use `resolveExplicitLaneCBundleDir` instead.
+ */
 export function resolveLaneCBundleDir(
   candidate: string | undefined,
   baselineRoot: string = resolveLaneCBaselineRoot(candidate),
@@ -264,7 +298,7 @@ async function withMovieSeedLock<T>(seed: () => Promise<T>): Promise<T> {
 }
 
 function resolveMovieSeedLockDir(): string {
-  const bundleDir = resolveLaneCBundleDir(process.env.LANE_C_BUNDLE_DIR);
+  const bundleDir = resolveExplicitLaneCBundleDir();
   const lockRoot = bundleDir ?? path.join(process.env.TMPDIR || '/tmp', 'flapjack_lane_c_movies');
 
   fs.mkdirSync(lockRoot, { recursive: true });
@@ -379,7 +413,7 @@ async function waitForMoviesReady(
 }
 
 function writeSeedVerification(response: SearchIndexResponse, verificationFileName: string): void {
-  const bundleDir = resolveLaneCBundleDir(process.env.LANE_C_BUNDLE_DIR);
+  const bundleDir = resolveExplicitLaneCBundleDir();
   if (!bundleDir) {
     return;
   }

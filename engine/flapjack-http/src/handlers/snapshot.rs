@@ -414,7 +414,8 @@ mod tests {
     use crate::handlers::AppState;
     use crate::test_helpers::{
         assert_quiescence_before_publication, assert_retained_channel_closed_delta, body_json,
-        retained_channel_closed_count, EnvVarRestoreGuard, TestStateBuilder, ENV_MUTEX,
+        quiesced_snapshot_bytes, retained_channel_closed_count, EnvVarRestoreGuard,
+        TestStateBuilder, ENV_MUTEX,
     };
     use axum::{
         body::Body,
@@ -423,7 +424,6 @@ mod tests {
         routing::{get, post},
         Router,
     };
-    use flapjack::index::snapshot::export_to_bytes;
     use flapjack::types::{Document, FieldValue};
     use std::{collections::HashMap, sync::Arc};
     use tempfile::TempDir;
@@ -595,6 +595,7 @@ mod tests {
     }
     #[tokio::test]
     async fn import_snapshot_success_returns_json_without_router_error_wrapper() {
+        flapjack::index::write_queue::clear_writer_lifecycle_test_events();
         let tmp = TempDir::new().unwrap();
         let state = TestStateBuilder::new(&tmp).build_shared();
         state.manager.create_tenant("products").unwrap();
@@ -612,11 +613,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let snapshot_bytes = crate::snapshot_byte_ops::export_snapshot_bytes(
-            &state.manager.base_path.join("products"),
-            "products",
-        )
-        .unwrap();
+        let snapshot_bytes = quiesced_snapshot_bytes(&state.manager, "products").await;
+        assert_quiescence_before_publication("products", "snapshot_export_read");
 
         let app = Router::new()
             .route("/1/indexes/:indexName/import", post(import_snapshot))
@@ -653,6 +651,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_snapshot_into_absent_tenant_survives_quiesce_fence_repair() {
+        flapjack::index::write_queue::clear_writer_lifecycle_test_events();
         let source_tmp = TempDir::new().unwrap();
         let source = TestStateBuilder::new(&source_tmp).build_shared();
         source.manager.create_tenant("products").unwrap();
@@ -670,7 +669,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let snapshot_bytes = export_to_bytes(&source.manager.base_path.join("products")).unwrap();
+        let snapshot_bytes = quiesced_snapshot_bytes(&source.manager, "products").await;
+        assert_quiescence_before_publication("products", "snapshot_export_read");
 
         let destination_tmp = TempDir::new().unwrap();
         let destination = TestStateBuilder::new(&destination_tmp).build_shared();
@@ -781,6 +781,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_restore_into_tenant_with_live_writer_quiesces_before_rename() {
+        flapjack::index::write_queue::clear_writer_lifecycle_test_events();
         let tmp = TempDir::new().unwrap();
         let state = TestStateBuilder::new(&tmp).build_shared();
         let tenant_id = "stage4_snapshot_restore_quiesce";
@@ -796,7 +797,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let snapshot_bytes = export_to_bytes(&state.manager.base_path.join(tenant_id)).unwrap();
+        let snapshot_bytes = quiesced_snapshot_bytes(&state.manager, tenant_id).await;
+        assert_quiescence_before_publication(tenant_id, "snapshot_export_read");
         state
             .manager
             .add_documents_sync(

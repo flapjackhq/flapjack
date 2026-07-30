@@ -32,6 +32,10 @@ impl TenantBackpressureState {
 #[derive(Clone)]
 struct PauseState {
     reason: String,
+    peak_live_segment_count: Option<usize>,
+    admission_rejected: bool,
+    #[cfg(any(debug_assertions, test))]
+    clear_after_rejection: bool,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -102,13 +106,6 @@ impl ObservationSample {
         }
     }
 
-    fn index_bytes(&self) -> Option<u64> {
-        match self {
-            Self::Determinate { index_bytes, .. } => Some(*index_bytes),
-            Self::Indeterminate { .. } => None,
-        }
-    }
-
     fn orphan_file_set_count(&self) -> Option<usize> {
         match self {
             Self::Determinate {
@@ -141,18 +138,65 @@ pub(crate) fn pause_artifact_path(base_path: &Path, tenant_id: &str) -> PathBuf 
 pub(crate) fn ensure_bulk_admission_allowed(
     base_path: &Path,
     tenant_id: &str,
+    index: &crate::index::Index,
 ) -> crate::error::Result<()> {
     let key = tenant_key(base_path, tenant_id);
-    let Some(state) = BACKPRESSURE_STATE.get(&key) else {
+    let Some(mut state) = BACKPRESSURE_STATE.get_mut(&key) else {
         return Ok(());
     };
-    let Some(pause) = &state.pause else {
+    let Some(pause) = &mut state.pause else {
         return Ok(());
     };
-    Err(FlapjackError::IndexPaused(format!(
-        "{tenant_id} write backpressure: {}",
-        pause.reason
-    )))
+    let reason = pause.reason.clone();
+    if !pause.admission_rejected {
+        pause.admission_rejected = true;
+        #[cfg(any(debug_assertions, test))]
+        if pause.clear_after_rejection {
+            state.pause = None;
+        }
+        drop(state);
+        return Err(backpressure_error(tenant_id, &reason));
+    }
+    #[cfg(any(debug_assertions, test))]
+    let clear_after_rejection = pause.clear_after_rejection;
+    #[cfg(any(debug_assertions, test))]
+    let should_resample = !clear_after_rejection;
+    #[cfg(not(any(debug_assertions, test)))]
+    let should_resample = true;
+    drop(state);
+    if should_resample {
+        record_observation_result(
+            base_path,
+            tenant_id,
+            super::segment_observation::observe_segments(index),
+        )?;
+        if !tenant_is_paused(base_path, tenant_id) {
+            return Ok(());
+        }
+    }
+    #[cfg(any(debug_assertions, test))]
+    if clear_after_rejection {
+        if let Some(mut state) = BACKPRESSURE_STATE.get_mut(&key) {
+            if state
+                .pause
+                .as_ref()
+                .is_some_and(|pause| pause.clear_after_rejection)
+            {
+                state.pause = None;
+            }
+        }
+    }
+    Err(backpressure_error(tenant_id, &reason))
+}
+
+fn backpressure_error(tenant_id: &str, reason: &str) -> FlapjackError {
+    FlapjackError::IndexPaused(format!("{tenant_id} write backpressure: {reason}"))
+}
+
+fn tenant_is_paused(base_path: &Path, tenant_id: &str) -> bool {
+    BACKPRESSURE_STATE
+        .get(&tenant_key(base_path, tenant_id))
+        .is_some_and(|state| state.pause.is_some())
 }
 
 pub(crate) fn remove_tenant_state(base_path: &Path, tenant_id: &str) {
@@ -232,6 +276,13 @@ fn update_state(
         let reason = "segment observation is indeterminate".to_string();
         state.pause = Some(PauseState {
             reason: reason.clone(),
+            peak_live_segment_count: None,
+            admission_rejected: state
+                .pause
+                .as_ref()
+                .is_some_and(|pause| pause.admission_rejected),
+            #[cfg(any(debug_assertions, test))]
+            clear_after_rejection: false,
         });
         return Some((
             BackpressureDecision::PauseIndeterminate,
@@ -241,22 +292,49 @@ fn update_state(
         ));
     }
 
+    if state.pause.is_some() {
+        if !state
+            .pause
+            .as_ref()
+            .is_some_and(|pause| pause.admission_rejected)
+        {
+            return None;
+        }
+        if state
+            .observations
+            .back()
+            .is_some_and(sample_is_at_or_below_selected_ceiling)
+        {
+            state.pause = None;
+            return Some((
+                BackpressureDecision::Admit,
+                "segment count returned to or below the selected ceiling".to_string(),
+                "at_or_below_ceiling",
+                state.observations.iter().cloned().collect(),
+            ));
+        }
+        if recover_paused_state_when_segment_growth_stops(&mut state) {
+            return Some((
+                BackpressureDecision::Admit,
+                "segment count stopped growing at or below the paused-window peak".to_string(),
+                "not_above_paused_peak",
+                state.observations.iter().cloned().collect(),
+            ));
+        }
+        return None;
+    }
+
     if state
         .observations
         .back()
         .is_some_and(sample_is_at_or_below_selected_ceiling)
     {
-        state.pause = None;
         return Some((
             BackpressureDecision::Admit,
             "segment count returned to or below the selected ceiling".to_string(),
             "at_or_below_ceiling",
             state.observations.iter().cloned().collect(),
         ));
-    }
-
-    if state.pause.is_some() {
-        return None;
     }
 
     if state.observations.len() == BACKPRESSURE_WINDOW_SIZE
@@ -268,6 +346,10 @@ fn update_state(
                 .to_string();
             state.pause = Some(PauseState {
                 reason: reason.clone(),
+                peak_live_segment_count: observed_segment_peak(&state.observations),
+                admission_rejected: false,
+                #[cfg(any(debug_assertions, test))]
+                clear_after_rejection: false,
             });
             return Some((
                 BackpressureDecision::Pause,
@@ -279,6 +361,44 @@ fn update_state(
     }
 
     None
+}
+
+fn recover_paused_state_when_segment_growth_stops(state: &mut TenantBackpressureState) -> bool {
+    let mut determinate_segment_counts = state
+        .observations
+        .iter()
+        .rev()
+        .filter_map(ObservationSample::live_segment_count);
+    let Some(current) = determinate_segment_counts.next() else {
+        return false;
+    };
+    let Some(previous) = determinate_segment_counts.next() else {
+        return false;
+    };
+    let Some(pause) = state.pause.as_mut() else {
+        return false;
+    };
+    let growth_stopped = current <= previous
+        && pause
+            .peak_live_segment_count
+            .is_some_and(|paused_peak| current <= paused_peak);
+    if growth_stopped {
+        state.pause = None;
+    } else {
+        pause.peak_live_segment_count = Some(
+            pause
+                .peak_live_segment_count
+                .map_or(current, |paused_peak| paused_peak.max(current)),
+        );
+    }
+    growth_stopped
+}
+
+fn observed_segment_peak(samples: &VecDeque<ObservationSample>) -> Option<usize> {
+    samples
+        .iter()
+        .filter_map(ObservationSample::live_segment_count)
+        .max()
 }
 
 fn push_sample(samples: &mut VecDeque<ObservationSample>, sample: ObservationSample) {
@@ -318,12 +438,6 @@ fn sample_pair_is_improving(previous: &ObservationSample, current: &ObservationS
     let Some(current_segments) = current.live_segment_count() else {
         return false;
     };
-    let Some(previous_bytes) = previous.index_bytes() else {
-        return false;
-    };
-    let Some(current_bytes) = current.index_bytes() else {
-        return false;
-    };
     let Some(previous_orphans) = previous.orphan_file_set_count() else {
         return false;
     };
@@ -331,9 +445,7 @@ fn sample_pair_is_improving(previous: &ObservationSample, current: &ObservationS
         return false;
     };
 
-    current_segments < previous_segments
-        && current_bytes <= previous_bytes
-        && current_orphans <= previous_orphans
+    current_segments < previous_segments && current_orphans <= previous_orphans
 }
 
 fn persist_decision_artifact(
@@ -377,6 +489,116 @@ fn current_time_ms() -> u64 {
         .as_millis() as u64
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn segment_observation_for_test(
+    live_segment_count: usize,
+    index_bytes: u64,
+    orphan_file_set_count: usize,
+) -> super::segment_observation::SegmentObservation {
+    let live_segment_ids = (0..live_segment_count)
+        .map(|index| format!("{index:032x}"))
+        .collect::<std::collections::BTreeSet<_>>();
+    let per_segment_doc_counts = live_segment_ids
+        .iter()
+        .map(|segment_id| (segment_id.clone(), 1))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let orphan_file_set_ids = (0..orphan_file_set_count)
+        .map(|index| format!("{:032x}", index + 10_000))
+        .collect::<std::collections::BTreeSet<_>>();
+
+    super::segment_observation::SegmentObservation {
+        live_segment_count,
+        live_segment_ids,
+        live_docs: live_segment_count as u64,
+        per_segment_doc_counts,
+        managed_index_file_count: live_segment_count as u64,
+        index_bytes,
+        orphan_file_set_ids,
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct TestBackpressurePauseGuard {
+    base_path: PathBuf,
+    tenant_id: String,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for TestBackpressurePauseGuard {
+    fn drop(&mut self) {
+        clear_for_test(&self.base_path, &self.tenant_id);
+    }
+}
+
+/// Hold the production write-backpressure state using the same bounded,
+/// non-improving observation rule as the live sampler.
+///
+/// Existing test state is cleared first so the synthetic observation window is
+/// deterministic. Any setup error drops the guard and clears partial state.
+///
+/// HTTP integration tests cannot manufacture `SegmentObservation` because its
+/// fields are intentionally crate-private. Keeping the fixture here makes the
+/// backpressure owner the single source of truth for how a deterministic pause
+/// is established and cleared.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn hold_non_improving_pause_for_test(
+    base_path: &Path,
+    tenant_id: &str,
+) -> crate::error::Result<TestBackpressurePauseGuard> {
+    clear_for_test(base_path, tenant_id);
+    let pause_guard = TestBackpressurePauseGuard {
+        base_path: base_path.to_path_buf(),
+        tenant_id: tenant_id.to_string(),
+    };
+    let live_segment_count = super::SELECTED_MERGE_POLICY_SETTLED_SEGMENT_BAND.1 + 2;
+
+    for _ in 0..BACKPRESSURE_WINDOW_SIZE {
+        record_observation_result(
+            base_path,
+            tenant_id,
+            Ok(segment_observation_for_test(live_segment_count, 40_000, 0)),
+        )?;
+    }
+
+    let key = tenant_key(base_path, tenant_id);
+    let Some(mut state) = BACKPRESSURE_STATE.get_mut(&key) else {
+        return Err(FlapjackError::Tantivy(
+            "test-support observations did not establish write backpressure".to_string(),
+        ));
+    };
+    let Some(pause) = &mut state.pause else {
+        return Err(FlapjackError::Tantivy(
+            "test-support observations did not establish write backpressure".to_string(),
+        ));
+    };
+    #[cfg(any(debug_assertions, test))]
+    {
+        pause.clear_after_rejection = false;
+    }
+
+    Ok(pause_guard)
+}
+
+#[cfg(any(debug_assertions, test))]
+pub fn force_backpressure_pause_for_test(
+    base_path: &Path,
+    tenant_id: &str,
+) -> crate::error::Result<()> {
+    record_observation_result(
+        base_path,
+        tenant_id,
+        Err(FlapjackError::Io(
+            "forced indeterminate segment observation".to_string(),
+        )),
+    )?;
+    if let Some(mut state) = BACKPRESSURE_STATE.get_mut(&tenant_key(base_path, tenant_id)) {
+        if let Some(pause) = &mut state.pause {
+            pause.clear_after_rejection = true;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn record_observation_result_for_test(
     base_path: &Path,
@@ -387,6 +609,11 @@ pub(crate) fn record_observation_result_for_test(
 }
 
 #[cfg(test)]
+pub(crate) fn tenant_is_paused_for_test(base_path: &Path, tenant_id: &str) -> bool {
+    tenant_is_paused(base_path, tenant_id)
+}
+
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn clear_for_test(base_path: &Path, tenant_id: &str) {
     remove_tenant_state(base_path, tenant_id);
     let _ = std::fs::remove_file(pause_artifact_path(base_path, tenant_id));

@@ -1,4 +1,5 @@
 use http::StatusCode;
+use std::time::Duration;
 use thiserror::Error;
 
 /// Unified error type for the Flapjack engine.
@@ -214,6 +215,21 @@ impl FlapjackError {
             FlapjackError::MemoryPressure { .. } => StatusCode::SERVICE_UNAVAILABLE,
             FlapjackError::IndexPaused(_) => StatusCode::SERVICE_UNAVAILABLE,
             FlapjackError::Forbidden(_) => StatusCode::FORBIDDEN,
+        }
+    }
+
+    /// Return the delay callers should observe before retrying this error.
+    ///
+    /// This is the canonical retryability contract for both HTTP clients and
+    /// internal producers that still own the original error variant.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            FlapjackError::MemoryPressure { .. } => Some(Duration::from_secs(5)),
+            FlapjackError::IndexPaused(_)
+            | FlapjackError::QueueFull
+            | FlapjackError::TooManyConcurrentWrites { .. }
+            | FlapjackError::WriteAckTimeout => Some(Duration::from_secs(1)),
+            _ => None,
         }
     }
 }
@@ -446,6 +462,54 @@ mod tests {
             "message should contain index name 'foo': {}",
             msg
         );
+    }
+
+    #[test]
+    fn retry_after_returns_exact_delay_for_every_retryable_error() {
+        let one_second = std::time::Duration::from_secs(1);
+        let five_seconds = std::time::Duration::from_secs(5);
+        let cases = [
+            (FlapjackError::IndexPaused("products".into()), one_second),
+            (FlapjackError::QueueFull, one_second),
+            (
+                FlapjackError::TooManyConcurrentWrites { current: 5, max: 4 },
+                one_second,
+            ),
+            (FlapjackError::WriteAckTimeout, one_second),
+            (
+                FlapjackError::MemoryPressure {
+                    allocated_mb: 900,
+                    limit_mb: 1000,
+                    level: "warning".into(),
+                },
+                five_seconds,
+            ),
+        ];
+
+        for (error, expected_delay) in cases {
+            assert_eq!(
+                error.retry_after(),
+                Some(expected_delay),
+                "{error:?} must retain its exact retry delay"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_returns_none_for_hard_failures() {
+        let cases = [
+            FlapjackError::TenantNotFound("missing".into()),
+            FlapjackError::InvalidDocument("invalid objectID".into()),
+            FlapjackError::Io("disk failure".into()),
+        ];
+
+        for error in cases {
+            assert_eq!(
+                error.retry_after(),
+                None,
+                "{error:?} must remain non-retryable"
+            );
+        }
     }
 
     // ── into_response() HTTP status correctness ──────────────────────────
@@ -811,9 +875,8 @@ impl IntoResponse for FlapjackError {
     /// Produces a response with:
     /// - HTTP status from [`status_code`](Self::status_code)
     /// - JSON body containing only `message` and `status` fields
-    /// - `Retry-After: 5` header for `MemoryPressure` variants
-    /// - `Retry-After: 1` header for `IndexPaused`, `QueueFull`,
-    ///   `TooManyConcurrentWrites`, and `WriteAckTimeout` variants
+    /// - `Retry-After` header for variants covered by
+    ///   [`retry_after`](Self::retry_after)
     ///   (PL-8 / ADR 0005: transient backpressure must invite client
     ///   retry so writes lost during nginx upstream failover are
     ///   recoverable; PL-13: a durable-write ack timeout is retriable
@@ -845,30 +908,15 @@ impl IntoResponse for FlapjackError {
         };
 
         let mut response = (status, Json(error_response)).into_response();
-        if matches!(&self, FlapjackError::MemoryPressure { .. }) {
+        if let Some(retry_after) = self.retry_after() {
+            let retry_after = retry_after
+                .as_secs()
+                .to_string()
+                .parse()
+                .expect("retry delay seconds must form a valid HTTP header value");
             response
                 .headers_mut()
-                .insert("Retry-After", "5".parse().unwrap());
-        }
-        if matches!(&self, FlapjackError::IndexPaused(_)) {
-            response
-                .headers_mut()
-                .insert("Retry-After", "1".parse().unwrap());
-        }
-        if matches!(&self, FlapjackError::QueueFull) {
-            response
-                .headers_mut()
-                .insert("Retry-After", "1".parse().unwrap());
-        }
-        if matches!(&self, FlapjackError::TooManyConcurrentWrites { .. }) {
-            response
-                .headers_mut()
-                .insert("Retry-After", "1".parse().unwrap());
-        }
-        if matches!(&self, FlapjackError::WriteAckTimeout) {
-            response
-                .headers_mut()
-                .insert("Retry-After", "1".parse().unwrap());
+                .insert(http::header::RETRY_AFTER, retry_after);
         }
         response
     }

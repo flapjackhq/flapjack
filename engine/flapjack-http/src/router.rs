@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use axum::{
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, Extension},
     middleware,
     routing::{delete, get, post},
     Router,
@@ -17,9 +17,9 @@ use crate::handlers;
 use crate::handlers::analytics;
 use crate::handlers::insights::GdprDeleteState;
 use crate::handlers::migration::{
-    cancel_algolia_migration_http, cancel_bulk_replace_http, get_algolia_migration_status_http,
-    get_bulk_replace_status_http, submit_algolia_migration_http, submit_bulk_replace_http,
-    submit_privacy_scrub_http,
+    acknowledge_algolia_migration_http, cancel_algolia_migration_http, cancel_bulk_replace_http,
+    get_algolia_migration_status_http, get_bulk_replace_status_http, submit_algolia_migration_http,
+    submit_bulk_replace_http, submit_privacy_scrub_http, AsyncMigrationSourceProvider,
 };
 use crate::handlers::{
     add_documents, add_record_auto_id, append_security_source, batch_search, browse_index,
@@ -129,6 +129,35 @@ fn build_key_routes(key_store: Option<Arc<KeyStore>>) -> Router {
     }
 }
 
+fn register_source_migration_routes(mut router: Router<Arc<AppState>>) -> Router<Arc<AppState>> {
+    for source_provider in AsyncMigrationSourceProvider::PUBLIC {
+        let provider = source_provider
+            .as_str()
+            .expect("every public migration provider must have a route segment");
+        let provider_path = format!("/1/migrations/{provider}");
+        let job_path = format!("{provider_path}/:job_id");
+
+        router = router
+            .route(
+                &provider_path,
+                post(submit_algolia_migration_http).layer(Extension(source_provider)),
+            )
+            .route(
+                &job_path,
+                get(get_algolia_migration_status_http).layer(Extension(source_provider)),
+            )
+            .route(
+                &format!("{job_path}/cancel"),
+                post(cancel_algolia_migration_http).layer(Extension(source_provider)),
+            )
+            .route(
+                &format!("{job_path}/acknowledge"),
+                post(acknowledge_algolia_migration_http).layer(Extension(source_provider)),
+            );
+    }
+    router
+}
+
 /// Builds all auth-protected routes: indexing, search, objects, settings, synonyms, rules.
 fn build_protected_routes(state: Arc<AppState>, data_dir: &Path, auth_enabled: bool) -> Router {
     let mut protected = Router::new()
@@ -232,7 +261,6 @@ fn build_protected_routes(state: Arc<AppState>, data_dir: &Path, auth_enabled: b
                 .delete(delete_index),
         )
         .route("/1/migrate-from-algolia", post(migrate_from_algolia))
-        .route("/1/migrations/algolia", post(submit_algolia_migration_http))
         .route(
             "/1/migrations/bulk-replace",
             post(submit_bulk_replace_http).layer(DefaultBodyLimit::disable()),
@@ -244,18 +272,6 @@ fn build_protected_routes(state: Arc<AppState>, data_dir: &Path, auth_enabled: b
         .route(
             "/1/migrations/bulk-replace/:job_id/cancel",
             post(cancel_bulk_replace_http),
-        )
-        .route(
-            "/1/migrations/algolia/:job_id",
-            get(get_algolia_migration_status_http),
-        )
-        .route(
-            "/1/migrations/algolia/:job_id/cancel",
-            post(cancel_algolia_migration_http),
-        )
-        .route(
-            "/1/migrations/algolia/:job_id/acknowledge",
-            post(handlers::acknowledge_algolia_migration),
         )
         .route("/1/usage/:statistic", get(handlers::usage::usage_global))
         .route(
@@ -332,6 +348,8 @@ fn build_protected_routes(state: Arc<AppState>, data_dir: &Path, auth_enabled: b
             "/1/indexes/:_wildcard/recommendations",
             post(handlers::recommend::recommend),
         );
+
+    protected = register_source_migration_routes(protected);
 
     if auth_enabled {
         protected = protected.route(
