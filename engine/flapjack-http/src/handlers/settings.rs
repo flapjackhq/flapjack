@@ -21,6 +21,9 @@ use super::replicas::{
 use super::AppState;
 use crate::error_response::HandlerError;
 use crate::extractors::ValidatedIndexName;
+use crate::security_audit::{
+    emit_set_settings_action, Actor, AuditIndexName, Outcome, SettingsChangedFields, Target,
+};
 use flapjack::index::{
     settings::{IndexMode, IndexSettings, SemanticSearchSettings},
     SearchOptions,
@@ -280,6 +283,75 @@ fn unsupported_settings_params(payload: &SetSettingsRequest) -> Vec<String> {
     unsupported
 }
 
+macro_rules! push_changed_setting_names {
+    ($target:ident, $payload:ident, $( $field:ident => $name:literal ),+ $(,)?) => {
+        $(
+            if $payload.$field.is_some() {
+                $target.push($name);
+            }
+        )+
+    };
+}
+
+#[allow(clippy::cognitive_complexity)] // The macro expands a flat field-presence table; splitting it would duplicate the canonical setting-name map.
+fn settings_changed_fields(payload: &SetSettingsRequest) -> SettingsChangedFields {
+    let mut names = Vec::new();
+    push_changed_setting_names!(
+        names,
+        payload,
+        attributes_for_faceting => "attributesForFaceting",
+        searchable_attributes => "searchableAttributes",
+        ranking => "ranking",
+        custom_ranking => "customRanking",
+        attributes_to_retrieve => "attributesToRetrieve",
+        unretrievable_attributes => "unretrievableAttributes",
+        attributes_to_highlight => "attributesToHighlight",
+        attributes_to_snippet => "attributesToSnippet",
+        highlight_pre_tag => "highlightPreTag",
+        highlight_post_tag => "highlightPostTag",
+        hits_per_page => "hitsPerPage",
+        min_word_size_for_1_typo => "minWordSizefor1Typo",
+        min_word_size_for_2_typos => "minWordSizefor2Typos",
+        max_values_per_facet => "maxValuesPerFacet",
+        pagination_limited_to => "paginationLimitedTo",
+        attribute_for_distinct => "attributeForDistinct",
+        distinct => "distinct",
+        remove_stop_words => "removeStopWords",
+        ignore_plurals => "ignorePlurals",
+        query_languages => "queryLanguages",
+        query_type => "queryType",
+        exact_on_single_word_query => "exactOnSingleWordQuery",
+        remove_words_if_no_results => "removeWordsIfNoResults",
+        separators_to_index => "separatorsToIndex",
+        alternatives_as_exact => "alternativesAsExact",
+        optional_words => "optionalWords",
+        embedders => "embedders",
+        mode => "mode",
+        semantic_search => "semanticSearch",
+        enable_personalization => "enablePersonalization",
+        rendering_content => "renderingContent",
+        user_data => "userData",
+        enable_rules => "enableRules",
+        advanced_syntax_features => "advancedSyntaxFeatures",
+        sort_facet_values_by => "sortFacetValuesBy",
+        snippet_ellipsis_text => "snippetEllipsisText",
+        restrict_highlight_and_snippet_arrays => "restrictHighlightAndSnippetArrays",
+        min_proximity => "minProximity",
+        disable_exact_on_attributes => "disableExactOnAttributes",
+        replace_synonyms_in_highlight => "replaceSynonymsInHighlight",
+        attribute_criteria_computed_by_min_proximity => "attributeCriteriaComputedByMinProximity",
+        enable_re_ranking => "enableReRanking",
+        disable_typo_tolerance_on_words => "disableTypoToleranceOnWords",
+        disable_typo_tolerance_on_attributes => "disableTypoToleranceOnAttributes",
+        replicas => "replicas",
+        numeric_attributes_for_filtering => "numericAttributesForFiltering",
+        attributes_to_index => "attributesToIndex",
+        allow_compression_of_integer_array => "allowCompressionOfIntegerArray",
+        relevancy_strictness => "relevancyStrictness",
+    );
+    SettingsChangedFields::from_static_names(names)
+}
+
 fn faceting_configuration_changed(
     previous_settings: &IndexSettings,
     next_settings: &IndexSettings,
@@ -384,6 +456,90 @@ pub(super) fn parse_bool_query_param(
         .map(|value| value.unwrap_or(false))
 }
 
+struct SettingsMutationPlan {
+    settings: IndexSettings,
+    previous_replicas: Option<Vec<String>>,
+    validated_replicas: Option<Vec<flapjack::index::replica::ReplicaEntry>>,
+    unsupported: Vec<String>,
+    forward_to_replicas: bool,
+    attributes_for_faceting_provided: bool,
+    query_languages_provided: bool,
+    faceting_changed: bool,
+    is_virtual_settings_only: bool,
+    #[cfg(feature = "vector-search")]
+    embedders_updated: bool,
+}
+
+async fn persist_settings_mutation(
+    state: &Arc<AppState>,
+    index_name: &str,
+    settings_path: &Path,
+    plan: SettingsMutationPlan,
+) -> Result<(StatusCode, Json<SetSettingsResponse>), HandlerError> {
+    save_settings(&plan.settings, settings_path)?;
+    state.manager.invalidate_settings_cache(index_name);
+    state.manager.invalidate_facet_cache(index_name);
+
+    if let Some(ref replicas) = plan.validated_replicas {
+        clear_removed_replica_primary_links(
+            state,
+            index_name,
+            plan.previous_replicas.as_deref(),
+            replicas,
+        )
+        .map_err(|error| HandlerError::from(error.to_string()))?;
+        persist_replica_primary_links(state, index_name, replicas)
+            .map_err(|error| HandlerError::from(error.to_string()))?;
+    }
+
+    if plan.forward_to_replicas {
+        forward_settings_to_replicas(
+            state,
+            &plan.settings,
+            plan.attributes_for_faceting_provided,
+            plan.query_languages_provided,
+        )
+        .map_err(|error| HandlerError::from(error.to_string()))?;
+    }
+
+    if plan.faceting_changed && !plan.is_virtual_settings_only {
+        rebuild_documents_for_updated_faceting(state, index_name).await?;
+        if plan.forward_to_replicas {
+            for replica_name in standard_replicas_for_primary(state, index_name)
+                .map_err(|error| HandlerError::from(error.to_string()))?
+            {
+                rebuild_documents_for_updated_faceting(state, &replica_name).await?;
+            }
+        }
+    }
+
+    #[cfg(feature = "vector-search")]
+    if plan.embedders_updated {
+        state.embedder_store.invalidate(index_name);
+    }
+
+    state.manager.append_oplog(
+        index_name,
+        "settings",
+        serde_json::to_value(&plan.settings).unwrap_or_default(),
+    );
+    let noop_task = state
+        .manager
+        .make_noop_task(index_name)
+        .map_err(|error| HandlerError::from(error.to_string()))?;
+    let response = SetSettingsResponse {
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        task_id: noop_task.numeric_id,
+        unsupported_params: (!plan.unsupported.is_empty()).then_some(plan.unsupported),
+    };
+    let status = if response.unsupported_params.is_some() {
+        StatusCode::MULTI_STATUS
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(response)))
+}
+
 /// Update the settings for the specified index.
 #[utoipa::path(
     post,
@@ -407,6 +563,7 @@ pub async fn set_settings(
     Query(query_params): Query<HashMap<String, String>>,
     Json(payload): Json<SetSettingsRequest>,
 ) -> Result<impl IntoResponse, HandlerError> {
+    let changed_fields = settings_changed_fields(&payload);
     let is_virtual_settings_only = is_virtual_settings_only_index(&state, &index_name);
     if payload.relevancy_strictness.is_some() && !is_virtual_settings_only {
         return Err(HandlerError::bad_request(
@@ -436,6 +593,7 @@ pub async fn set_settings(
 
     let validated_replicas = merge_settings_payload(&mut settings, payload, &index_name)
         .map_err(|(status, message)| HandlerError::Custom { status, message })?;
+    let audit_target = Target::index_settings(&AuditIndexName::from_validated(&index_name));
     settings.restore_redacted_response_secrets(&previous_settings);
     settings
         .validate_embedders()
@@ -443,75 +601,38 @@ pub async fn set_settings(
     log_embedder_changes(&old_embedders, &settings);
     let faceting_changed = faceting_configuration_changed(&previous_settings, &settings);
 
-    save_settings(&settings, &settings_path)?;
-    state.manager.invalidate_settings_cache(&index_name);
-    state.manager.invalidate_facet_cache(&index_name);
-
-    if let Some(ref replicas) = validated_replicas {
-        clear_removed_replica_primary_links(
-            &state,
-            &index_name,
-            previous_replicas.as_deref(),
-            replicas,
-        )
-        .map_err(|error| HandlerError::from(error.to_string()))?;
-        persist_replica_primary_links(&state, &index_name, replicas)
-            .map_err(|error| HandlerError::from(error.to_string()))?;
-    }
-
-    if forward_to_replicas {
-        forward_settings_to_replicas(
-            &state,
-            &settings,
+    let mutation_result = persist_settings_mutation(
+        &state,
+        &index_name,
+        &settings_path,
+        SettingsMutationPlan {
+            settings,
+            previous_replicas,
+            validated_replicas,
+            unsupported,
+            forward_to_replicas,
             attributes_for_faceting_provided,
             query_languages_provided,
-        )
-        .map_err(|error| HandlerError::from(error.to_string()))?;
-    }
-
-    if faceting_changed && !is_virtual_settings_only {
-        rebuild_documents_for_updated_faceting(&state, &index_name).await?;
-
-        if forward_to_replicas {
-            for replica_name in standard_replicas_for_primary(&state, &index_name)
-                .map_err(|error| HandlerError::from(error.to_string()))?
-            {
-                rebuild_documents_for_updated_faceting(&state, &replica_name).await?;
-            }
-        }
-    }
-
-    #[cfg(feature = "vector-search")]
-    if embedders_updated {
-        state.embedder_store.invalidate(&index_name);
-    }
-
-    state.manager.append_oplog(
-        &index_name,
-        "settings",
-        serde_json::to_value(&settings).unwrap_or_default(),
-    );
-
-    let noop_task = state
-        .manager
-        .make_noop_task(&index_name)
-        .map_err(|error| HandlerError::from(error.to_string()))?;
-    let response = SetSettingsResponse {
-        updated_at: chrono::Utc::now().to_rfc3339(),
-        task_id: noop_task.numeric_id,
-        unsupported_params: if unsupported.is_empty() {
-            None
-        } else {
-            Some(unsupported)
+            faceting_changed,
+            is_virtual_settings_only,
+            #[cfg(feature = "vector-search")]
+            embedders_updated,
         },
-    };
-
-    let status = if response.unsupported_params.is_some() {
-        StatusCode::MULTI_STATUS
+    )
+    .await;
+    let outcome = if mutation_result.is_ok() {
+        Outcome::Success
     } else {
-        StatusCode::OK
+        Outcome::Failure
     };
-    Ok((status, Json(response)))
+    emit_set_settings_action(
+        Actor::admin_api_key(),
+        audit_target,
+        outcome,
+        changed_fields,
+        None,
+    );
+    mutation_result
 }
 
 #[utoipa::path(

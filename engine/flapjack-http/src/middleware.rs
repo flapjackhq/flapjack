@@ -1,6 +1,6 @@
 use axum::{
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue},
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -13,6 +13,7 @@ use crate::error_response::json_error;
 
 pub const DEFAULT_TRUSTED_PROXY_CIDRS: &str = "127.0.0.0/8,::1/128";
 pub const REQUEST_ID_HEADER_NAME: &str = "x-request-id";
+pub const REQUEST_TIMEOUT_MESSAGE: &str = "Request timed out";
 
 #[derive(Clone, Debug)]
 pub struct RequestId(pub String);
@@ -202,6 +203,11 @@ pub async fn ensure_json_errors(request: Request, next: Next) -> Response {
         .unwrap_or_default();
     let message =
         String::from_utf8(body_bytes.to_vec()).unwrap_or_else(|_| "Unknown error".to_string());
+    let message = if status == StatusCode::REQUEST_TIMEOUT && message.is_empty() {
+        REQUEST_TIMEOUT_MESSAGE.to_string()
+    } else {
+        message
+    };
 
     json_error(status, message)
 }

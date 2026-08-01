@@ -7,7 +7,46 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **Fixed a panic in the API key parser on malformed input.** A secured API key whose
+  decoded bytes did not fall on a UTF-8 character boundary would panic the request handler.
+  Malformed keys are now rejected as `400`. Reachable by any unauthenticated caller and
+  present in released binaries — operators should upgrade. Availability only: no key
+  material, index data, or credentials were exposed.
+- **Route authorization is now fail-closed.** A request path matching no ACL rule was
+  previously allowed through to its handler; it is now denied. All 124 currently registered
+  route/method pairs were swept before the flip, and none changed behavior.
+- **Admin credentials are no longer accepted in the query string.** Admin-ACL routes read
+  the key only from the `x-algolia-api-key` header, keeping admin keys out of server logs,
+  shell history, and proxy access logs. Search-scoped keys keep query-string support, so
+  browser and InstantSearch clients are unaffected.
+- **Analytics no longer persist full client IP addresses.** Addresses are coarsened before
+  the Parquet write — IPv4 to /24, IPv6 to /48. Existing Parquet files remain readable;
+  historical data is not rewritten.
+- **The Docker image runs as a non-root user.** Fixed `flapjack:flapjack` at UID/GID
+  `10001:10001`, with image-time `/data` ownership. The numeric identity is pinned so
+  base-image upgrades cannot silently shift ownership of persisted volumes. The container
+  now exits non-zero with an actionable message when a pre-existing `/data` volume is not
+  writable, instead of starting and failing later.
+- CI now gates the bundled dashboard on a high-and-above production `npm audit`, with a
+  deliberately vulnerable fixture proving the gate can fail.
+- The embedded dashboard, API, Swagger UI, and generated error responses now receive a
+  strict default security-header set, including CSP frame protection; HSTS remains tied to
+  the separate TLS-listener work.
+- Request handling now has configurable execution timeout, queued global concurrency, and
+  panic-to-JSON containment boundaries, so timeout and panic paths preserve the canonical
+  JSON error shape.
+
 ### Added
+
+- Resume for interrupted Algolia migration jobs:
+  `POST /1/migrations/{provider}/{job_id}/resume` claims a job whose pre-publication export
+  was interrupted, using fresh request-only credentials that are never persisted, logged, or
+  echoed. Positive status now carries `resumable`, `operation`, and `resumeHandle`. An
+  interrupted job inherits its original `expires_at` retention deadline. Continuation is
+  exactly-once across a full process restart. Meilisearch and Typesense resume are not
+  supported.
 
 - Runtime HA membership management: `POST /internal/cluster/peers` adds a peer and
   `DELETE /internal/cluster/peers/{node_id}` removes one, both admin-gated, so cluster

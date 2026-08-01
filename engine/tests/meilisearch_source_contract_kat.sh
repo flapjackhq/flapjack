@@ -20,6 +20,7 @@ usage() {
 Usage:
   bash tests/meilisearch_source_contract_kat.sh --stub-response-dir DIR [--fixture-dir DIR]
   bash tests/meilisearch_source_contract_kat.sh --live [--fixture-dir DIR]
+  bash tests/meilisearch_source_contract_kat.sh --preview-live [--fixture-dir DIR]
 
 Modes:
   --stub-response-dir DIR
@@ -29,6 +30,11 @@ Modes:
       Run the positive control against the pinned Meilisearch v1.50.0 image.
       Refuses the performance lease, exact-name collisions, non-loopback binds,
       and preserves credential-free failure evidence before cleanup.
+
+  --preview-live
+      Run the positive control and then invoke the ignored production-route
+      preview probe while the seeded source is still live. Cleanup remains
+      owned by this script.
 
 The live command is:
   cd engine && bash tests/meilisearch_source_contract_kat.sh --live
@@ -53,6 +59,11 @@ parse_args() {
       --live)
         [[ -z "$MODE" ]] || die "choose exactly one mode"
         MODE=live
+        shift
+        ;;
+      --preview-live)
+        [[ -z "$MODE" ]] || die "choose exactly one mode"
+        MODE=preview_live
         shift
         ;;
       --fixture-dir)
@@ -96,6 +107,10 @@ require_tools_and_fixture() {
     command -v docker >/dev/null || die "docker is required for --live"
     command -v curl >/dev/null || die "curl is required for --live"
     command -v lsof >/dev/null || die "lsof is required for --live"
+    if [[ "$MODE" == preview_live ]]; then
+      command -v cargo >/dev/null || die "cargo is required for --preview-live"
+      command -v timeout >/dev/null || die "timeout is required for --preview-live"
+    fi
   fi
 }
 
@@ -397,7 +412,7 @@ validate_pre_mutation_stats() {
 validate_controlled_mutation() {
   local before_snapshot="$1" task after_index after_page after_stats after_tasks
   local documents hash configured_uid configured_primary_key
-  if [[ "$MODE" == live ]]; then
+  if [[ "$MODE" != stub ]]; then
     task="$(submit_and_poll_task mutation POST \
       /indexes/configured_pk/documents \
       "[$(jq -c '.documents.mutation' "$EXPECTED")]")" || return $?
@@ -475,7 +490,7 @@ validate_restricted_task() {
 validate_restricted_actions() {
   local expected_actions full_key=stub-key probe action method path body label response
   expected_actions="$(jq -c '.requiredActions' "$EXPECTED")"
-  if [[ "$MODE" == live ]]; then
+  if [[ "$MODE" != stub ]]; then
     create_restricted_key "$expected_actions"
     full_key="$RESTRICTED_KEY"
   fi
@@ -498,7 +513,7 @@ validate_restricted_actions() {
     body="$(jq -c '.body // empty' <<<"$probe")"
     label="$(probe_label_for_action "$action")"
     denied_key=stub-denied-key
-    if [[ "$MODE" == live ]]; then
+    if [[ "$MODE" != stub ]]; then
       denied_actions="$(jq -cn --argjson actions "$expected_actions" \
         --arg action "$action" '$actions - [$action]')"
       create_restricted_key "$denied_actions" || return $?
@@ -559,7 +574,7 @@ container_inspection_state() {
 }
 
 cleanup_live() {
-  [[ "$MODE" == live ]] || return 0
+  [[ "$MODE" != stub ]] || return 0
   [[ "$LIVE_CLEANED" -eq 0 ]] || return 0
   LIVE_CLEANED=1
   local cleanup_failed=0 container_state
@@ -755,11 +770,42 @@ emit_receipt() {
     }'
 }
 
+run_preview_probe() {
+  [[ "$MODE" == preview_live ]] || return 0
+  local expected_records output status
+  expected_records="$(jq -er '.documents.countAfter' "$EXPECTED")" \
+    || die "preview record count fixture is missing"
+  [[ "$expected_records" =~ ^[1-9][0-9]*$ ]] \
+    || die "preview record count fixture must be positive"
+
+  if output="$(
+    FJ_MEILISEARCH_PREVIEW_ENDPOINT="$BASE_URL" \
+      FJ_MEILISEARCH_PREVIEW_API_KEY="$MASTER_KEY" \
+      FJ_MEILISEARCH_PREVIEW_EXPECTED_RECORDS="$expected_records" \
+      timeout 600 cargo test -p flapjack-http -- \
+        handlers::migration::preview_tests::meilisearch_live_preview_reports_exact_seeded_counts_and_codes \
+        --ignored --exact --nocapture 2>&1
+  )"; then
+    printf '%s\n' "$output"
+  else
+    status=$?
+    printf '%s\n' "$output" >&2
+    [[ "$status" -ne 124 ]] \
+      || die "preview probe timed out after 600 seconds"
+    die "preview probe test failed (exit=$status)"
+  fi
+
+  grep -Eq 'test result: ok\. 1 passed;' <<<"$output" \
+    || die "preview probe did not execute exactly one passing test"
+  grep -Fq '"previewProof":"PASS"' <<<"$output" \
+    || die "preview probe PASS receipt is missing"
+}
+
 main() {
   parse_args "$@"
   require_tools_and_fixture
   validate_oracle_structure
-  if [[ "$MODE" == live ]]; then
+  if [[ "$MODE" != stub ]]; then
     trap cleanup_on_exit EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -769,7 +815,8 @@ main() {
 
   local sorted_ids
   sorted_ids="$(validate_contract)" || return $?
-  if [[ "$MODE" == live ]]; then
+  run_preview_probe
+  if [[ "$MODE" != stub ]]; then
     stage_sanitized_failure_evidence
     cleanup_live || die "cleanup residue detected"
     [[ ! -e "$TEMP_DIR" ]] || die "cleanup residue detected"

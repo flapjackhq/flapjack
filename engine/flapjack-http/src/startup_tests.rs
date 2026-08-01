@@ -53,7 +53,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestWriter {
 fn capture_log_output(action: impl FnOnce()) -> String {
     let writer = TestWriter::new();
     let subscriber =
-        tracing_subscriber::registry().with(build_log_layer_with_writer(writer.clone()));
+        tracing_subscriber::registry().with(build_log_layer_with_writer(writer.clone(), false));
 
     tracing::subscriber::with_default(subscriber, action);
 
@@ -93,7 +93,7 @@ fn flapjack_log_format_env_selects_json_layer() {
     with_log_format_env(Some("json"), || {
         let writer = TestWriter::new();
         let subscriber =
-            tracing_subscriber::registry().with(build_log_layer_with_writer(writer.clone()));
+            tracing_subscriber::registry().with(build_log_layer_with_writer(writer.clone(), false));
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!("env-selected json logging");
@@ -114,7 +114,7 @@ fn flapjack_log_format_env_defaults_to_text_layer_for_invalid_values() {
     with_log_format_env(Some("bogus"), || {
         let writer = TestWriter::new();
         let subscriber =
-            tracing_subscriber::registry().with(build_log_layer_with_writer(writer.clone()));
+            tracing_subscriber::registry().with(build_log_layer_with_writer(writer.clone(), false));
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!("env-selected text logging");
@@ -128,6 +128,59 @@ fn flapjack_log_format_env_defaults_to_text_layer_for_invalid_values() {
         assert!(
             output.contains("env-selected text logging"),
             "text output must include the logged message"
+        );
+    });
+}
+
+/// A non-terminal sink (log file, journald, pipe) must receive plain,
+/// field-greppable text so downstream security-audit event scrapers can match
+/// `field="value"` pairs. ANSI escape codes between the field name and `=`
+/// would defeat that, so `text_ansi=false` must produce escape-free output.
+#[test]
+fn text_log_layer_omits_ansi_when_not_a_terminal() {
+    with_log_format_env(None, || {
+        let writer = TestWriter::new();
+        let subscriber =
+            tracing_subscriber::registry().with(build_log_layer_with_writer(writer.clone(), false));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                event = "ansi_probe_event",
+                actor = "admin_api_key",
+                "security event: admin action"
+            );
+        });
+
+        let output = writer.output();
+        assert!(
+            !output.contains('\u{1b}'),
+            "non-terminal text logs must contain no ANSI escape codes, got: {output:?}"
+        );
+        assert!(
+            output.contains("event=\"ansi_probe_event\""),
+            "audit event fields must be greppable as field=\"value\" in text logs, got: {output:?}"
+        );
+    });
+}
+
+/// The complementary arm: at an interactive terminal (`text_ansi=true`) the
+/// text format keeps ANSI color. This proves the omission above is caused by
+/// the flag, not by an unrelated formatter change.
+#[test]
+fn text_log_layer_keeps_ansi_for_a_terminal() {
+    with_log_format_env(None, || {
+        let writer = TestWriter::new();
+        let subscriber =
+            tracing_subscriber::registry().with(build_log_layer_with_writer(writer.clone(), true));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(event = "ansi_probe_event", "security event");
+        });
+
+        let output = writer.output();
+        assert!(
+            output.contains('\u{1b}'),
+            "terminal text logs should retain ANSI color, got: {output:?}"
         );
     });
 }

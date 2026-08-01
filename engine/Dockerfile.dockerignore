@@ -37,10 +37,13 @@ engine/dashboard/SESSION_*
 # Test data
 engine/data/
 engine/data-*/
+engine/tests/*.sh
 engine/tests/data/
+engine/tests/results/
 engine/.cache/
 engine/sdk_test/.cache/
 engine/sdk_test/data/
+engine/dashboard/scripts/
 
 # Logs and ephemeral files
 *.log

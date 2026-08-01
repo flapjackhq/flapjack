@@ -760,13 +760,11 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────────────────
-    // T4.10 Error format: 404 for unknown route is JSON not plain text
+    // T4.10 Error format: authenticated unknown protected routes fail closed
     // ──────────────────────────────────────────────────────────────────────────
 
-    /// Ensure that requests to unknown routes return a 404 response with `application/json` content type and the standard `{message, status}` error envelope.
-    ///
-    /// Guards against the default plain-text "Not Found" body that frameworks
-    /// typically emit for unmatched routes.
+    /// Ensure that authenticated requests to unknown protected routes return the
+    /// fail-closed 403 response in the standard `{message, status}` envelope.
     #[tokio::test]
     async fn not_found_error_is_json_not_plain_text() {
         let tmp = TempDir::new().unwrap();
@@ -791,8 +789,8 @@ mod tests {
 
         assert_eq!(
             resp.status(),
-            StatusCode::NOT_FOUND,
-            "unknown route should return 404"
+            StatusCode::FORBIDDEN,
+            "authenticated unknown protected routes must fail closed"
         );
         let ct = resp
             .headers()
@@ -801,20 +799,20 @@ mod tests {
             .unwrap_or("");
         assert!(
             ct.contains("application/json"),
-            "404 should be application/json, got: {}",
+            "403 should be application/json, got: {}",
             ct
         );
 
         let json = body_json(resp).await;
-        assert!(
-            json["message"].is_string(),
-            "404 should have 'message' field, got: {}",
-            json
+        assert_eq!(
+            json["message"].as_str(),
+            Some("Method not allowed with this API key"),
+            "403 should use the canonical ACL denial message"
         );
         assert_eq!(
             json["status"].as_i64(),
-            Some(404),
-            "404 JSON status field should be 404"
+            Some(403),
+            "403 JSON status field should be 403"
         );
     }
 

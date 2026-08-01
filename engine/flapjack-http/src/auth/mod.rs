@@ -445,14 +445,18 @@ pub fn validate_secured_key(
     key_store: &KeyStore,
 ) -> Option<(ApiKey, SecuredKeyRestrictions)> {
     let decoded = BASE64.decode(encoded.as_bytes()).ok()?;
-    let decoded_str = String::from_utf8(decoded).ok()?;
 
-    if decoded_str.len() < 64 {
+    if decoded.len() < 64 {
         return None;
     }
 
-    let hmac_bytes = hex::decode(&decoded_str[..64]).ok()?;
-    let params = &decoded_str[64..];
+    // 64 is a byte offset: the first 64 bytes are the ASCII hex HMAC prefix, so
+    // split on raw bytes and only UTF-8-validate the parameter suffix. Slicing a
+    // decoded String at byte 64 would panic when a multi-byte char straddles the
+    // offset (SEC-G1); the parameter suffix is the only part that must be text.
+    let (hmac_hex, params_bytes) = decoded.split_at(64);
+    let hmac_bytes = hex::decode(hmac_hex).ok()?;
+    let params = std::str::from_utf8(params_bytes).ok()?;
 
     let data = key_store.data.read().unwrap();
     for key in &data.keys {

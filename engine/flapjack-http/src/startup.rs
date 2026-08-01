@@ -1,6 +1,7 @@
 use axum::http::HeaderValue;
 use fs2::FileExt;
 use std::fs::OpenOptions;
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::Path;
 use tracing_subscriber::layer::SubscriberExt;
@@ -210,14 +211,29 @@ pub(crate) fn shutdown_timeout_secs_from_env() -> u64 {
     )
 }
 
-fn build_log_layer_with_writer<S, W>(writer: W) -> Box<dyn Layer<S> + Send + Sync + 'static>
+/// Build the fmt layer for the configured `FLAPJACK_LOG_FORMAT`.
+///
+/// `text_ansi` controls ANSI color for the human-readable text format only;
+/// the JSON format is never colorized. Color is desirable at an interactive
+/// terminal but corrupts non-terminal sinks (files, journald, pipes) that
+/// downstream log scrapers — including the security-audit event pipeline —
+/// parse field-by-field, so callers pass `stdout().is_terminal()` and plain
+/// text is emitted whenever stdout is redirected.
+fn build_log_layer_with_writer<S, W>(
+    writer: W,
+    text_ansi: bool,
+) -> Box<dyn Layer<S> + Send + Sync + 'static>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
     W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
 {
     match log_format_from_env() {
         LogFormat::Json => Box::new(tracing_subscriber::fmt::layer().json().with_writer(writer)),
-        LogFormat::Text => Box::new(tracing_subscriber::fmt::layer().with_writer(writer)),
+        LogFormat::Text => Box::new(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(text_ansi)
+                .with_writer(writer),
+        ),
     }
 }
 
@@ -240,7 +256,10 @@ where
 {
     let subscriber = tracing_subscriber::registry()
         .with(build_env_filter())
-        .with(build_log_layer_with_writer(make_writer));
+        .with(build_log_layer_with_writer(
+            make_writer,
+            std::io::stdout().is_terminal(),
+        ));
     tracing::Dispatch::new(subscriber)
 }
 
@@ -257,7 +276,10 @@ where
 
     let subscriber = tracing_subscriber::registry()
         .with(build_env_filter())
-        .with(build_log_layer_with_writer(make_writer))
+        .with(build_log_layer_with_writer(
+            make_writer,
+            std::io::stdout().is_terminal(),
+        ))
         .with(otel_layer);
 
     (tracing::Dispatch::new(subscriber), guard)

@@ -93,6 +93,32 @@ async fn openapi_membership_contract_is_served_when_auth_is_enabled() {
 }
 
 #[tokio::test]
+async fn openapi_migration_status_schema_includes_resume_fields() {
+    let (_tmp, app) = build_auth_test_app();
+    let response = send_empty_request(&app, Method::GET, "/api-docs/openapi.json").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let document = body_json(response).await;
+    let properties = document
+        .pointer("/components/schemas/AsyncMigrationStatusResponse/properties")
+        .and_then(serde_json::Value::as_object)
+        .expect("AsyncMigrationStatusResponse schema must expose its properties");
+
+    assert_eq!(
+        properties.get("resumable"),
+        Some(&serde_json::json!({"type": ["boolean", "null"]}))
+    );
+    assert_eq!(
+        properties.get("operation"),
+        Some(&serde_json::json!({"type": ["string", "null"]}))
+    );
+    assert_eq!(
+        properties.get("resumeHandle"),
+        Some(&serde_json::json!({"type": ["string", "null"]}))
+    );
+}
+
+#[tokio::test]
 async fn openapi_membership_contract_is_hidden_when_auth_is_disabled() {
     let (_tmp, app) = build_no_auth_test_app();
     let response = send_empty_request(&app, Method::GET, "/api-docs/openapi.json").await;
@@ -346,6 +372,18 @@ async fn assert_migration_job_not_found_response(resp: axum::response::Response)
     );
 }
 
+async fn assert_migration_resume_not_available_response(resp: axum::response::Response) {
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(resp).await,
+        serde_json::json!({
+            "message": "Migration resume is not available",
+            "status": 409,
+            "code": "migration_resume_not_available"
+        })
+    );
+}
+
 async fn assert_source_migration_alias_admin_contract(
     app: &axum::Router,
     source_provider: AsyncMigrationSourceProvider,
@@ -378,9 +416,9 @@ async fn assert_source_migration_alias_admin_contract(
     assert_migration_job_not_found_response(get_request(app, &job_path, Some("admin-key")).await)
         .await;
 
-    assert_migration_job_action_contract(app, &job_path, non_admin_keys).await;
+    assert_migration_job_action_contract(app, &job_path, non_admin_keys, source_provider).await;
 
-    if source_provider != AsyncMigrationSourceProvider::Algolia {
+    if source_provider == AsyncMigrationSourceProvider::Typesense {
         let recognized_provider =
             post_json(app, &submit_path, Some("admin-key"), submit_payload).await;
         assert_eq!(recognized_provider.status(), StatusCode::BAD_REQUEST);
@@ -399,23 +437,41 @@ async fn assert_migration_job_action_contract(
     app: &axum::Router,
     job_path: &str,
     non_admin_keys: [&str; 2],
+    source_provider: AsyncMigrationSourceProvider,
 ) {
-    for action in ["cancel", "acknowledge"] {
+    let mut actions = vec![
+        ("cancel", serde_json::json!({}), false),
+        ("acknowledge", serde_json::json!({}), false),
+    ];
+    if source_provider == AsyncMigrationSourceProvider::Algolia {
+        actions.push((
+            "resume",
+            serde_json::json!({
+                "appId": "APPID",
+                "apiKey": "source-key",
+                "sourceIndex": "products"
+            }),
+            true,
+        ));
+    }
+    for (action, payload, resume_not_available_for_missing_job) in actions {
         let action_path = format!("{job_path}/{action}");
         assert_invalid_credentials_response(
-            post_json(app, &action_path, None, serde_json::json!({})).await,
+            post_json(app, &action_path, None, payload.clone()).await,
         )
         .await;
         for api_key in non_admin_keys {
             assert_method_not_allowed_response(
-                post_json(app, &action_path, Some(api_key), serde_json::json!({})).await,
+                post_json(app, &action_path, Some(api_key), payload.clone()).await,
             )
             .await;
         }
-        assert_migration_job_not_found_response(
-            post_json(app, &action_path, Some("admin-key"), serde_json::json!({})).await,
-        )
-        .await;
+        let missing_job_response = post_json(app, &action_path, Some("admin-key"), payload).await;
+        if resume_not_available_for_missing_job {
+            assert_migration_resume_not_available_response(missing_job_response).await;
+        } else {
+            assert_migration_job_not_found_response(missing_job_response).await;
+        }
     }
 }
 
@@ -637,6 +693,113 @@ async fn migration_routes_preserve_admin_contract() {
         serde_json::json!({
             "message": "appId and apiKey are required",
             "status": 400
+        })
+    );
+}
+
+#[tokio::test]
+async fn migration_preview_route_preserves_admin_contract() {
+    let tmp = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let search_key = search_only_key_value(&key_store);
+    let write_key = create_test_key_with_acl(&key_store, "addObject");
+    let app = build_test_router(&tmp, Some(key_store));
+    let payload = serde_json::json!({
+        "appId": "APPID",
+        "apiKey": "source-key",
+        "sourceIndex": "products",
+        "targetIndex": "products_copy"
+    });
+
+    for source_provider in AsyncMigrationSourceProvider::PUBLIC {
+        let provider = source_provider.as_str().unwrap();
+        let path = format!("/1/migrations/{provider}/preview");
+        assert_invalid_credentials_response(post_json(&app, &path, None, payload.clone()).await)
+            .await;
+        for api_key in [&search_key, &write_key] {
+            assert_method_not_allowed_response(
+                post_json(&app, &path, Some(api_key), payload.clone()).await,
+            )
+            .await;
+        }
+    }
+
+    for source_provider in AsyncMigrationSourceProvider::PUBLIC {
+        let provider = source_provider.as_str().unwrap();
+        // Only supported source providers reach body validation. The async submit
+        // lifecycle rejects recognized-but-unsupported providers (typesense) with
+        // `source_provider_unsupported` before parsing the request body, so their
+        // preview lane never reaches the "Invalid migration request body" contract.
+        // That closed refusal is asserted separately by
+        // `migration_preview_refuses_typesense_and_unknown_source_providers`.
+        if !matches!(
+            source_provider,
+            AsyncMigrationSourceProvider::Algolia | AsyncMigrationSourceProvider::Meilisearch
+        ) {
+            continue;
+        }
+        let routed_admin_request = post_json(
+            &app,
+            &format!("/1/migrations/{provider}/preview"),
+            Some("admin-key"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(
+            routed_admin_request.status(),
+            StatusCode::BAD_REQUEST,
+            "{provider} preview must route admin-key requests to body validation"
+        );
+        assert_eq!(
+            body_json(routed_admin_request).await,
+            serde_json::json!({
+                "message": "Invalid migration request body",
+                "status": 400
+            }),
+            "{provider} preview must share the migration body validation contract"
+        );
+    }
+}
+
+#[tokio::test]
+async fn migration_preview_refuses_typesense_and_unknown_source_providers() {
+    let tmp = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let app = build_test_router(&tmp, Some(key_store));
+    let payload = serde_json::json!({
+        "appId": "APPID",
+        "apiKey": "source-key",
+        "sourceIndex": "products",
+        "targetIndex": "products_copy"
+    });
+
+    let unknown = post_json(
+        &app,
+        "/1/migrations/not-a-provider/preview",
+        Some("admin-key"),
+        payload.clone(),
+    )
+    .await;
+    assert_eq!(
+        unknown.status(),
+        StatusCode::NOT_FOUND,
+        "unknown provider segments must remain outside the closed migration router"
+    );
+
+    let typesense = post_json(
+        &app,
+        "/1/migrations/typesense/preview",
+        Some("admin-key"),
+        payload,
+    )
+    .await;
+    assert_eq!(typesense.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(typesense).await,
+        serde_json::json!({
+            "message": "Source provider is not supported",
+            "status": 400,
+            "code": "source_provider_unsupported"
         })
     );
 }

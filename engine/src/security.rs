@@ -48,6 +48,23 @@ pub struct VettedOutboundUrlTarget {
     pub resolved_ips: Vec<std::net::IpAddr>,
 }
 
+impl VettedOutboundUrlTarget {
+    /// Return the already-vetted socket addresses a client must pin.
+    ///
+    /// Callers should pass this complete set to their HTTP client's resolver
+    /// override instead of performing another DNS lookup after validation.
+    pub fn socket_addrs(&self) -> Vec<std::net::SocketAddr> {
+        let port = self
+            .port
+            .expect("vetted outbound URL targets always have a known port");
+        self.resolved_ips
+            .iter()
+            .copied()
+            .map(|ip| std::net::SocketAddr::new(ip, port))
+            .collect()
+    }
+}
+
 /// Parse and vet an outbound URL target under the shared policy.
 ///
 /// Returns `Ok(None)` when hostname resolution is unavailable so callers keep
@@ -83,6 +100,72 @@ pub fn vet_outbound_url_target(
         port,
         resolved_ips,
     }))
+}
+
+/// Vet a strict vendor endpoint and return the addresses to pin in the client.
+///
+/// The accepted host list is deliberately supplied by the vendor-fact owner.
+/// An empty list therefore provides a conservative fail-closed constructor
+/// while a hostname contract is still unknown.
+pub fn vet_strict_vendor_url_target(
+    raw_url: &str,
+    accepted_hosts: &[&str],
+) -> Result<VettedOutboundUrlTarget, &'static str> {
+    const ENDPOINT_ERROR: &str = "Vendor endpoint is not allowed";
+    const DNS_ERROR: &str = "Vendor endpoint DNS validation failed";
+
+    let parsed = reqwest::Url::parse(raw_url).map_err(|_| ENDPOINT_ERROR)?;
+    if parsed.scheme() != "https"
+        || parsed.port_or_known_default() != Some(443)
+        || parsed.port().is_some_and(|port| port != 443)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+    {
+        return Err(ENDPOINT_ERROR);
+    }
+
+    let host = parsed.host_str().ok_or(ENDPOINT_ERROR)?;
+    if host.parse::<std::net::IpAddr>().is_ok()
+        || !accepted_hosts
+            .iter()
+            .any(|accepted| strict_vendor_host_matches(host, accepted))
+    {
+        return Err(ENDPOINT_ERROR);
+    }
+
+    let resolved_ips = resolve_outbound_host_ips(host, Some(443))
+        .filter(|ips| !ips.is_empty())
+        .ok_or(DNS_ERROR)?;
+    if resolved_ips.iter().any(|ip| !is_public_vendor_ip(ip)) {
+        return Err(DNS_ERROR);
+    }
+
+    Ok(VettedOutboundUrlTarget {
+        host: host.to_ascii_lowercase(),
+        port: Some(443),
+        resolved_ips,
+    })
+}
+
+/// Vet a Typesense Cloud endpoint and return the pinned addresses clients must use.
+pub fn vet_typesense_cloud_url_target(
+    raw_url: &str,
+) -> Result<VettedOutboundUrlTarget, &'static str> {
+    const TYPESENSE_CLOUD_HOST_SUFFIX: &str = ".typesense.net";
+    vet_strict_vendor_url_target(raw_url, &[TYPESENSE_CLOUD_HOST_SUFFIX])
+}
+
+fn strict_vendor_host_matches(host: &str, accepted: &str) -> bool {
+    if let Some(suffix) = accepted.strip_prefix('.') {
+        return host.eq_ignore_ascii_case(suffix)
+            || host
+                .to_ascii_lowercase()
+                .ends_with(&format!(".{}", suffix.to_ascii_lowercase()));
+    }
+    host.eq_ignore_ascii_case(accepted)
 }
 
 /// Returns the first blocked destination IP for `host`, checking both literal
@@ -152,6 +235,29 @@ fn is_local_network_ip(ip: &std::net::IpAddr) -> bool {
                 || v6
                     .to_ipv4_mapped()
                     .is_some_and(|v4| v4.is_loopback() || v4.is_private())
+        }
+    }
+}
+
+fn is_public_vendor_ip(ip: &std::net::IpAddr) -> bool {
+    if outbound_ip_block_reason(ip, false).is_some() {
+        return false;
+    }
+
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !(ip.is_documentation()
+                || ip.is_multicast()
+                || octets[0] == 100 && (64..=127).contains(&octets[1])
+                || octets[0] == 198 && (18..=19).contains(&octets[1])
+                || octets[0] >= 224)
+        }
+        std::net::IpAddr::V6(ip) => {
+            !(ip.is_multicast() || ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0db8)
+                && ip
+                    .to_ipv4_mapped()
+                    .is_none_or(|mapped| is_public_vendor_ip(&std::net::IpAddr::V4(mapped)))
         }
     }
 }

@@ -1,4 +1,6 @@
-use axum::http::{Method, StatusCode};
+use axum::body::Body;
+use axum::extract::connect_info::ConnectInfo;
+use axum::http::{Method, Request, StatusCode};
 use base64::Engine as _;
 use flapjack::analytics::schema::SearchEvent;
 use flapjack::analytics::{AnalyticsCollector, AnalyticsConfig, AnalyticsQueryEngine};
@@ -6,6 +8,11 @@ use flapjack::analytics::{AnalyticsCollector, AnalyticsConfig, AnalyticsQueryEng
 use flapjack::index::settings::IndexSettings;
 use flapjack::types::{Document, FieldValue};
 use flapjack_http::analytics_cluster::AnalyticsClusterClient;
+use flapjack_http::auth::{
+    generate_secured_api_key, index_pattern_matches, referer_matches,
+    validate_restrict_sources_csv, validate_restrict_sources_entries, validate_secured_key,
+    KeyStore,
+};
 use flapjack_http::startup::{
     cors_origins_from_value, validate_startup_auth_policy, CorsMode, StartupAuthValidationError,
     StartupAuthValidationOutcome,
@@ -15,9 +22,11 @@ use flapjack_replication::manager::ReplicationManager;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::io;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +37,10 @@ use tar::{Builder, EntryType, Header};
 use tempfile::TempDir;
 use tower::ServiceExt;
 use tracing_subscriber::prelude::*;
+use wiremock::{
+    matchers::{method, path},
+    Mock, MockServer, ResponseTemplate,
+};
 
 mod common;
 
@@ -376,6 +389,170 @@ async fn malformed_secured_keys_return_canonical_403_without_decode_leaks() {
             "malformed secured key must not leak decode/parse internals in error payload",
         );
     }
+}
+
+/// SEC-G1 regression: a byte length >= 64 does not imply byte offset 64 is a
+/// UTF-8 char boundary. The parser must split the fixed-width ASCII HMAC prefix
+/// as bytes before validating the parameter suffix as UTF-8.
+///
+/// The pre-auth contract is that any malformed key is rejected (returns `None`)
+/// without crashing the parser. This test prevents regressions to fixed-offset
+/// `str` slicing.
+#[test]
+fn a07_secured_key_validation_survives_non_char_boundary_payload() {
+    // Layout: 63 ASCII bytes, then `é` (2 UTF-8 bytes at offsets 63 and 64),
+    // then trailing ASCII. Byte offset 64 lands on the `é` continuation byte,
+    // so it is NOT a char boundary even though the string is well past 64 bytes.
+    let payload = format!("{}{}{}", "a".repeat(63), 'é', "trailing_ascii_params");
+    assert!(
+        !payload.is_char_boundary(64),
+        "reproducer invariant: byte offset 64 must fall off a UTF-8 char boundary",
+    );
+
+    let tmp = TempDir::new().expect("keystore tempdir");
+    let key_store = KeyStore::load_or_create(tmp.path(), ADMIN_KEY);
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
+
+    // catch_unwind so the panic at the byte-index slice becomes an assertable
+    // Err(..) rather than aborting the test binary. Ok(None) is the only
+    // acceptable outcome: parsed, rejected, no crash.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        validate_secured_key(&encoded, &key_store)
+    }));
+
+    assert!(
+        matches!(result, Ok(None)),
+        "validate_secured_key must reject a non-char-boundary secured key by \
+         returning None, not panic at the decoded_str[..64] byte slice (SEC-G1)",
+    );
+}
+
+#[test]
+fn a07_secured_key_validation_rejects_invalid_utf8_parameters() {
+    let tmp = TempDir::new().expect("keystore tempdir");
+    let key_store = KeyStore::load_or_create(tmp.path(), ADMIN_KEY);
+    let search_key = key_store
+        .list_all()
+        .into_iter()
+        .find_map(|key| key.hmac_key)
+        .expect("default search key must retain HMAC material");
+
+    // Make the HMAC valid for the lossy interpretation of 0xFF. A parser that
+    // silently replaces invalid UTF-8 would therefore accept this credential.
+    let mut payload = base64::engine::general_purpose::STANDARD
+        .decode(generate_secured_api_key(&search_key, "\u{FFFD}"))
+        .expect("generated secured key must be valid base64");
+    payload.truncate(64);
+    payload.push(0xFF);
+    assert!(
+        payload[..64].iter().all(u8::is_ascii_hexdigit),
+        "fixture HMAC prefix must reach parameter UTF-8 validation",
+    );
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        validate_secured_key(&encoded, &key_store)
+    }));
+
+    assert!(
+        matches!(result, Ok(None)),
+        "invalid UTF-8 parameters must be rejected, not replaced or accepted",
+    );
+}
+
+// Stage 3 parser sweep: auth public seams. These keep private secured-key and
+// referer helpers private while exercising hostile inputs through stable API
+// boundaries.
+#[test]
+fn stage3_secured_key_restrictions_round_trip_multibyte_and_empty_values() {
+    let tmp = TempDir::new().expect("keystore tempdir");
+    let key_store = KeyStore::load_or_create(tmp.path(), ADMIN_KEY);
+    let search_key = key_store
+        .list_all()
+        .into_iter()
+        .find_map(|key| key.hmac_key)
+        .expect("default search key must retain HMAC material");
+
+    let params = concat!(
+        "filters=category%3Acr%C3%A8me+br%C3%BBl%C3%A9e",
+        "&restrictIndices=%5B%22prod_cafe_%C3%A9%22%2C%22tenant_%E6%9D%B1%E4%BA%AC%22%5D",
+        "&userToken=%E7%94%A8%E6%88%B7-123",
+        "&hitsPerPage=184467440737095516160",
+        "&restrictSources="
+    );
+    let secured_key = generate_secured_api_key(&search_key, params);
+
+    let (_api_key, restrictions) =
+        validate_secured_key(&secured_key, &key_store).expect("valid HMAC must parse");
+    assert_eq!(
+        restrictions.filters.as_deref(),
+        Some("category:crème brûlée")
+    );
+    assert_eq!(restrictions.user_token.as_deref(), Some("用户-123"));
+    assert_eq!(
+        restrictions.restrict_indices,
+        Some(vec!["prod_cafe_é".to_string(), "tenant_東京".to_string()])
+    );
+    assert_eq!(
+        restrictions.hits_per_page, None,
+        "overflowing unsigned hitsPerPage must be ignored rather than wrapped"
+    );
+    assert_eq!(restrictions.restrict_sources.as_deref(), Some(""));
+}
+
+#[test]
+fn stage3_secured_key_rejects_empty_and_one_byte_short_decoded_values() {
+    let tmp = TempDir::new().expect("keystore tempdir");
+    let key_store = KeyStore::load_or_create(tmp.path(), ADMIN_KEY);
+
+    for decoded in [Vec::new(), vec![b'a'; 63]] {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(decoded);
+        assert!(
+            validate_secured_key(&encoded, &key_store).is_none(),
+            "short decoded secured-key payloads must reject without panic"
+        );
+    }
+}
+
+#[test]
+fn stage3_referer_and_index_globs_handle_multibyte_and_empty_inputs() {
+    let referer_patterns = vec![
+        "https://shop.example.com/*".to_string(),
+        "*пример.рф".to_string(),
+    ];
+    assert!(referer_matches(
+        "https://shop.example.com/café?item=東京",
+        &referer_patterns
+    ));
+    assert!(referer_matches("https://пример.рф/путь", &referer_patterns));
+    assert!(!referer_matches("", &referer_patterns));
+    assert!(referer_matches("", &[]));
+
+    let index_patterns = vec!["prod_*".to_string(), "*東京".to_string()];
+    assert!(index_pattern_matches(&index_patterns, "prod_café"));
+    assert!(index_pattern_matches(&index_patterns, "tenant_東京"));
+    assert!(!index_pattern_matches(&index_patterns, ""));
+    assert!(index_pattern_matches(&[], ""));
+}
+
+#[test]
+fn stage3_restrict_sources_public_validators_reject_hostile_entries() {
+    assert!(validate_restrict_sources_csv(" ,127.0.0.1, 10.0.0.0/8 ").is_ok());
+    assert_eq!(
+        validate_restrict_sources_csv("../keys").unwrap_err(),
+        "../keys"
+    );
+
+    let entries = vec![
+        "192.168.1.0/24".to_string(),
+        "https://shop.example.com/*".to_string(),
+        "bad source".to_string(),
+    ];
+    assert_eq!(
+        validate_restrict_sources_entries(&entries).unwrap_err(),
+        "bad source"
+    );
 }
 
 #[tokio::test]
@@ -1470,6 +1647,235 @@ fn a09_capture_dispatch(log_buffer: A09LogBuffer) -> tracing::Dispatch {
     )
 }
 
+fn a09_matching_security_event_line<'a>(
+    logs: &'a str,
+    event: &str,
+    action: &str,
+    target: &str,
+    outcome: &str,
+    additional_fields: &[&str],
+) -> Option<&'a str> {
+    let canonical_fields = [
+        format!("event=\"{event}\""),
+        "actor=\"admin_api_key\"".to_string(),
+        format!("action=\"{action}\""),
+        format!("target=\"{target}\""),
+        format!("outcome=\"{outcome}\""),
+    ];
+
+    logs.lines().find(|line| {
+        canonical_fields.iter().all(|field| line.contains(field))
+            && additional_fields.iter().all(|field| line.contains(field))
+    })
+}
+
+fn a09_assert_security_event<'a>(
+    logs: &'a str,
+    event: &str,
+    action: &str,
+    target: &str,
+    outcome: &str,
+    additional_fields: &[&str],
+) -> &'a str {
+    a09_matching_security_event_line(
+        logs,
+        event,
+        action,
+        target,
+        outcome,
+        additional_fields,
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "no single audit record contains the canonical fields for event `{event}`, action `{action}`, target `{target}`, and outcome `{outcome}`; logs={logs}"
+        )
+    })
+}
+
+fn a09_api_key_target(key_value: &str) -> String {
+    let digest = Sha256::digest(key_value.as_bytes());
+    format!("api_key:{}", hex::encode(&digest[..8]))
+}
+
+fn a09_assert_no_forbidden(logs: &str, forbidden: &[&str]) {
+    for value in forbidden {
+        assert!(
+            !value.is_empty(),
+            "forbidden leak specimen must be nonempty before testing absence"
+        );
+        assert!(
+            !logs.contains(value),
+            "security audit logs must not leak sensitive material `{value}`; logs={logs}"
+        );
+    }
+}
+
+fn a09_assert_nonempty_key(body: &serde_json::Value, context: &str) -> String {
+    let key = body["key"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{context} response must include plaintext key"))
+        .to_string();
+    assert!(
+        !key.is_empty(),
+        "{context} response key must be nonempty before leak assertions"
+    );
+    key
+}
+
+fn a09_nonempty_secret_specimen(value: &str, context: &str) -> String {
+    let specimen = value.to_string();
+    assert!(
+        !specimen.is_empty(),
+        "{context} must be nonempty before leak assertions"
+    );
+    specimen
+}
+
+fn a09_authed_body_request(
+    method: Method,
+    uri: &str,
+    key: &str,
+    content_type: &str,
+    body: Body,
+) -> axum::http::Request<Body> {
+    let mut req = axum::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-algolia-api-key", key)
+        .header("x-algolia-application-id", "test")
+        .header("content-type", content_type)
+        .body(body)
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
+    req
+}
+
+async fn a09_seed_single_doc(app: &axum::Router, index_name: &str) {
+    common::seed_docs(
+        app,
+        index_name,
+        ADMIN_KEY,
+        vec![json!({"objectID": "doc-1", "name": "alpha"})],
+    )
+    .await;
+}
+
+async fn a09_snapshot_bytes(app: &axum::Router, index_name: &str) -> Vec<u8> {
+    a09_seed_single_doc(app, index_name).await;
+    let response = app
+        .clone()
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/1/indexes/{index_name}/export"),
+            ADMIN_KEY,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "snapshot export fixture must succeed"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), 100_000_000)
+        .await
+        .expect("snapshot export body must be readable")
+        .to_vec();
+    assert!(
+        !bytes.is_empty(),
+        "snapshot export fixture must be nonempty before import audit assertions"
+    );
+    bytes
+}
+
+async fn a09_captured_json_response(
+    app: &axum::Router,
+    dispatch: &tracing::Dispatch,
+    request: Request<Body>,
+) -> (StatusCode, serde_json::Value) {
+    let response = {
+        let _guard = tracing::dispatcher::set_default(dispatch);
+        app.clone().oneshot(request).await.unwrap()
+    };
+    let status = response.status();
+    (status, common::body_json(response).await)
+}
+
+fn a09_capture_s3_env() -> A10EnvRestore {
+    A10EnvRestore::capture(&[
+        "FLAPJACK_S3_BUCKET",
+        "FLAPJACK_S3_REGION",
+        "FLAPJACK_S3_ENDPOINT",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+    ])
+}
+
+fn a09_configure_s3_env(s3: &MockServer) {
+    std::env::set_var("FLAPJACK_S3_BUCKET", "snapshot-bucket");
+    std::env::set_var("FLAPJACK_S3_REGION", "us-east-1");
+    std::env::set_var("FLAPJACK_S3_ENDPOINT", s3.uri());
+    std::env::set_var("AWS_ACCESS_KEY_ID", "test-access-key");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret-key");
+}
+
+async fn a09_mount_s3_snapshot(s3: &MockServer, key: &str, body: Vec<u8>) {
+    Mock::given(method("GET"))
+        .and(path(format!("/snapshot-bucket/{key}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(s3)
+        .await;
+}
+
+async fn a09_restore_s3_response(
+    app: &axum::Router,
+    dispatch: &tracing::Dispatch,
+    index_name: &str,
+    key: &str,
+) -> (StatusCode, serde_json::Value) {
+    a09_captured_json_response(
+        app,
+        dispatch,
+        authed_request(
+            Method::POST,
+            &format!("/1/indexes/{index_name}/restore"),
+            ADMIN_KEY,
+            Some(json!({ "key": key })),
+        ),
+    )
+    .await
+}
+
+fn a09_assert_control_index_events(logs: &str, escaped_index_name: &str) {
+    let index_target = format!("index:{escaped_index_name}");
+    let settings_target = format!("{index_target}:settings");
+    let snapshot_target = format!("{index_target}:snapshot");
+    for (action, target, outcome) in [
+        ("set_settings", settings_target.as_str(), "success"),
+        ("import_snapshot", snapshot_target.as_str(), "failure"),
+        (
+            "restore_snapshot_from_s3",
+            snapshot_target.as_str(),
+            "failure",
+        ),
+        ("delete_index", index_target.as_str(), "success"),
+    ] {
+        let event_line = a09_assert_security_event(
+            logs,
+            "security_audit_admin_action",
+            action,
+            target,
+            outcome,
+            &[],
+        );
+        assert!(
+            !event_line.contains('\n') && !event_line.contains('\r') && !event_line.contains('\t'),
+            "audit target for {action} must stay single-line; line={event_line:?}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn a09_failed_direct_key_auth_emits_audit_event_without_secret_or_query_leaks() {
     let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
@@ -1709,6 +2115,1015 @@ async fn a09_rotate_admin_key_success_emits_audit_event_without_key_leaks() {
             "admin action logs must not leak secret key material `{forbidden}`; logs={logs}"
         );
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a09_create_key_emits_audit_event_without_plaintext_key() {
+    let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
+    let log_buffer = A09LogBuffer::default();
+    let dispatch = a09_capture_dispatch(log_buffer.clone());
+
+    let response = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        app.clone()
+            .oneshot(authed_request(
+                Method::POST,
+                "/1/keys",
+                ADMIN_KEY,
+                Some(json!({
+                    "acl": ["search"],
+                    "indexes": ["a09_create_key_index"],
+                    "description": "a09 create key audit"
+                })),
+            ))
+            .await
+            .unwrap()
+    };
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = common::body_json(response).await;
+    let created_key = a09_assert_nonempty_key(&body, "create key");
+    let logs = log_buffer.contents();
+
+    a09_assert_security_event(
+        &logs,
+        "security_audit_admin_action",
+        "create_key",
+        &a09_api_key_target(&created_key),
+        "success",
+        &[],
+    );
+    a09_assert_no_forbidden(&logs, &[created_key.as_str(), "x-algolia-api-key"]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a09_update_key_emits_audit_event_without_key_in_target() {
+    let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
+    let create_resp = app
+        .clone()
+        .oneshot(authed_request(
+            Method::POST,
+            "/1/keys",
+            ADMIN_KEY,
+            Some(json!({
+                "acl": ["search"],
+                "indexes": ["a09_update_key_index"],
+                "description": "a09 update key audit before"
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::OK);
+    let key_value = a09_assert_nonempty_key(&common::body_json(create_resp).await, "create key");
+
+    let log_buffer = A09LogBuffer::default();
+    let dispatch = a09_capture_dispatch(log_buffer.clone());
+    let response = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        app.clone()
+            .oneshot(authed_request(
+                Method::PUT,
+                &format!("/1/keys/{key_value}"),
+                ADMIN_KEY,
+                Some(json!({
+                    "acl": ["search"],
+                    "indexes": ["a09_update_key_index"],
+                    "description": "a09 update key audit after"
+                })),
+            ))
+            .await
+            .unwrap()
+    };
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = common::body_json(response).await;
+    assert_eq!(
+        body["key"].as_str(),
+        Some(key_value.as_str()),
+        "update response must identify the path key before log non-leak assertion"
+    );
+    let logs = log_buffer.contents();
+
+    a09_assert_security_event(
+        &logs,
+        "security_audit_admin_action",
+        "update_key",
+        &a09_api_key_target(&key_value),
+        "success",
+        &[],
+    );
+
+    let missing_key = a09_nonempty_secret_specimen("a09_update_missing_key_probe", "missing key");
+    let missing_response = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        app.clone()
+            .oneshot(authed_request(
+                Method::PUT,
+                &format!("/1/keys/{missing_key}"),
+                ADMIN_KEY,
+                Some(json!({
+                    "acl": ["search"],
+                    "indexes": ["a09_update_key_index"],
+                    "description": "a09 update missing key audit"
+                })),
+            ))
+            .await
+            .unwrap()
+    };
+
+    assert_eq!(missing_response.status(), StatusCode::NOT_FOUND);
+    let _body = common::assert_error_contract_from_oneshot(missing_response, 404).await;
+    let logs = log_buffer.contents();
+
+    a09_assert_security_event(
+        &logs,
+        "security_audit_admin_action",
+        "update_key",
+        &a09_api_key_target(&missing_key),
+        "failure",
+        &["reason=\"key_not_found\""],
+    );
+    a09_assert_no_forbidden(
+        &logs,
+        &[
+            key_value.as_str(),
+            missing_key.as_str(),
+            "x-algolia-api-key",
+        ],
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a09_generate_secured_key_emits_audit_event_without_parent_or_generated_key_or_restrictions(
+) {
+    let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
+    let create_resp = app
+        .clone()
+        .oneshot(authed_request(
+            Method::POST,
+            "/1/keys",
+            ADMIN_KEY,
+            Some(json!({
+                "acl": ["search"],
+                "indexes": ["a09_secured_key_index"],
+                "description": "a09 secured-key parent"
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::OK);
+    let parent_key =
+        a09_assert_nonempty_key(&common::body_json(create_resp).await, "secured-key parent");
+    let filter_probe = "a09_generate_secured_filter_probe";
+    let user_token_probe = "a09_generate_secured_user_token_probe";
+    let source_probe = "192.0.2.42";
+    let log_buffer = A09LogBuffer::default();
+    let dispatch = a09_capture_dispatch(log_buffer.clone());
+
+    let response = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        app.clone()
+            .oneshot(authed_request(
+                Method::POST,
+                "/1/keys/generateSecuredApiKey",
+                ADMIN_KEY,
+                Some(json!({
+                    "parentApiKey": parent_key,
+                    "restrictions": {
+                        "filters": format!("tenant:{filter_probe}"),
+                        "userToken": user_token_probe,
+                        "restrictSources": source_probe
+                    }
+                })),
+            ))
+            .await
+            .unwrap()
+    };
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = common::body_json(response).await;
+    let generated_key = body["securedApiKey"]
+        .as_str()
+        .expect("generate secured key response must include securedApiKey")
+        .to_string();
+    assert!(
+        !generated_key.is_empty(),
+        "securedApiKey must be nonempty before leak assertions"
+    );
+    let logs = log_buffer.contents();
+
+    a09_assert_security_event(
+        &logs,
+        "security_audit_admin_action",
+        "generate_secured_key",
+        &a09_api_key_target(&parent_key),
+        "success",
+        &[],
+    );
+    a09_assert_no_forbidden(
+        &logs,
+        &[
+            parent_key.as_str(),
+            generated_key.as_str(),
+            filter_probe,
+            user_token_probe,
+            source_probe,
+            "x-algolia-api-key",
+        ],
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a09_delete_key_failure_outcomes_are_distinguishable() {
+    let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
+    let unknown_key =
+        a09_nonempty_secret_specimen("a09_unknown_delete_key_probe", "unknown delete key");
+    let log_buffer = A09LogBuffer::default();
+    let dispatch = a09_capture_dispatch(log_buffer.clone());
+
+    let admin_response = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        app.clone()
+            .oneshot(authed_request(
+                Method::DELETE,
+                &format!("/1/keys/{ADMIN_KEY}"),
+                ADMIN_KEY,
+                None,
+            ))
+            .await
+            .unwrap()
+    };
+    assert_eq!(admin_response.status(), StatusCode::FORBIDDEN);
+    let _body = common::assert_error_contract_from_oneshot(admin_response, 403).await;
+
+    let unknown_response = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        app.clone()
+            .oneshot(authed_request(
+                Method::DELETE,
+                &format!("/1/keys/{unknown_key}"),
+                ADMIN_KEY,
+                None,
+            ))
+            .await
+            .unwrap()
+    };
+    assert_eq!(unknown_response.status(), StatusCode::NOT_FOUND);
+    let _body = common::assert_error_contract_from_oneshot(unknown_response, 404).await;
+    let logs = log_buffer.contents();
+
+    a09_assert_security_event(
+        &logs,
+        "security_audit_admin_action",
+        "delete_key",
+        &a09_api_key_target(ADMIN_KEY),
+        "failure",
+        &["reason=\"cannot_delete_admin_key\""],
+    );
+    a09_assert_security_event(
+        &logs,
+        "security_audit_admin_action",
+        "delete_key",
+        &a09_api_key_target(&unknown_key),
+        "failure",
+        &["reason=\"key_not_found\""],
+    );
+    a09_assert_no_forbidden(
+        &logs,
+        &[ADMIN_KEY, unknown_key.as_str(), "x-algolia-api-key"],
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a09_restore_key_emits_audit_event() {
+    let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
+    let create_resp = app
+        .clone()
+        .oneshot(authed_request(
+            Method::POST,
+            "/1/keys",
+            ADMIN_KEY,
+            Some(json!({
+                "acl": ["search"],
+                "indexes": ["a09_restore_key_index"],
+                "description": "a09 restore key audit"
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::OK);
+    let key_value = a09_assert_nonempty_key(&common::body_json(create_resp).await, "create key");
+
+    let delete_resp = app
+        .clone()
+        .oneshot(authed_request(
+            Method::DELETE,
+            &format!("/1/keys/{key_value}"),
+            ADMIN_KEY,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_resp.status(), StatusCode::OK);
+
+    let log_buffer = A09LogBuffer::default();
+    let dispatch = a09_capture_dispatch(log_buffer.clone());
+    let response = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        app.clone()
+            .oneshot(authed_request(
+                Method::POST,
+                &format!("/1/keys/{key_value}/restore"),
+                ADMIN_KEY,
+                None,
+            ))
+            .await
+            .unwrap()
+    };
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = common::body_json(response).await;
+    assert_eq!(
+        body["key"].as_str(),
+        Some(key_value.as_str()),
+        "restore response must identify the raw path key before log non-leak assertion"
+    );
+    let logs = log_buffer.contents();
+
+    a09_assert_security_event(
+        &logs,
+        "security_audit_admin_action",
+        "restore_key",
+        &a09_api_key_target(&key_value),
+        "success",
+        &[],
+    );
+    a09_assert_no_forbidden(&logs, &[key_value.as_str(), "x-algolia-api-key"]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a09_restore_missing_key_emits_failure_audit_event() {
+    let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
+    let key_value =
+        a09_nonempty_secret_specimen("a09_restore_missing_key_probe", "restore missing key");
+    let log_buffer = A09LogBuffer::default();
+    let dispatch = a09_capture_dispatch(log_buffer.clone());
+
+    let response = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        app.clone()
+            .oneshot(authed_request(
+                Method::POST,
+                &format!("/1/keys/{key_value}/restore"),
+                ADMIN_KEY,
+                None,
+            ))
+            .await
+            .unwrap()
+    };
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let _body = common::assert_error_contract_from_oneshot(response, 404).await;
+    let logs = log_buffer.contents();
+
+    a09_assert_security_event(
+        &logs,
+        "security_audit_admin_action",
+        "restore_key",
+        &a09_api_key_target(&key_value),
+        "failure",
+        &["reason=\"key_not_found\""],
+    );
+    a09_assert_no_forbidden(&logs, &[key_value.as_str(), "x-algolia-api-key"]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a09_delete_index_emits_audit_event_on_success_and_failure() {
+    let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
+    let index_name = "a09_delete_index";
+    a09_seed_single_doc(&app, index_name).await;
+    let missing_index = "a09_delete_index_missing";
+    let log_buffer = A09LogBuffer::default();
+    let dispatch = a09_capture_dispatch(log_buffer.clone());
+
+    let success = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        app.clone()
+            .oneshot(authed_request(
+                Method::DELETE,
+                &format!("/1/indexes/{index_name}"),
+                ADMIN_KEY,
+                None,
+            ))
+            .await
+            .unwrap()
+    };
+    assert_eq!(success.status(), StatusCode::OK);
+    let success_body = common::body_json(success).await;
+    common::wait_for_task_local_with_key(&app, common::extract_task_id(&success_body), ADMIN_KEY)
+        .await;
+
+    let failure = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        app.clone()
+            .oneshot(authed_request(
+                Method::DELETE,
+                &format!("/1/indexes/{missing_index}"),
+                ADMIN_KEY,
+                None,
+            ))
+            .await
+            .unwrap()
+    };
+    assert_eq!(failure.status(), StatusCode::NOT_FOUND);
+    let _body = common::assert_error_contract_from_oneshot(failure, 404).await;
+    let logs = log_buffer.contents();
+
+    a09_assert_security_event(
+        &logs,
+        "security_audit_admin_action",
+        "delete_index",
+        &format!("index:{index_name}"),
+        "success",
+        &[],
+    );
+    a09_assert_security_event(
+        &logs,
+        "security_audit_admin_action",
+        "delete_index",
+        &format!("index:{missing_index}"),
+        "failure",
+        &[],
+    );
+    a09_assert_no_forbidden(&logs, &["x-algolia-api-key"]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a09_set_settings_emits_audit_event_naming_fields_not_values() {
+    let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
+    let index_name = "a09_settings_index";
+    a09_seed_single_doc(&app, index_name).await;
+    let probe_token = "a09_settings_nested_probe_token";
+    let log_buffer = A09LogBuffer::default();
+    let dispatch = a09_capture_dispatch(log_buffer.clone());
+
+    let response = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        app.clone()
+            .oneshot(authed_request(
+                Method::PUT,
+                &format!("/1/indexes/{index_name}/settings"),
+                ADMIN_KEY,
+                Some(json!({
+                    "userData": {
+                        "nested": {
+                            "probe": probe_token
+                        }
+                    }
+                })),
+            ))
+            .await
+            .unwrap()
+    };
+
+    assert!(
+        response.status().is_success(),
+        "settings update must return 2xx before audit log assertions"
+    );
+    let body = common::body_json(response).await;
+    common::wait_for_task_local_with_key(&app, common::extract_task_id(&body), ADMIN_KEY).await;
+    let logs = log_buffer.contents();
+
+    a09_assert_security_event(
+        &logs,
+        "security_audit_admin_action",
+        "set_settings",
+        &format!("index:{index_name}:settings"),
+        "success",
+        &["changed_fields=\"userData\""],
+    );
+    a09_assert_no_forbidden(&logs, &[probe_token, "x-algolia-api-key"]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a09_set_settings_post_save_failure_does_not_emit_success_audit() {
+    let (app, tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
+    let index_name = "a09_settings_post_save_failure";
+    let replica_name = "a09_settings_blocked_replica";
+    a09_seed_single_doc(&app, index_name).await;
+    std::fs::write(tmp.path().join(replica_name), b"not a directory")
+        .expect("replica collision fixture must be written before settings request");
+    let log_buffer = A09LogBuffer::default();
+    let dispatch = a09_capture_dispatch(log_buffer.clone());
+
+    let response = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        app.clone()
+            .oneshot(authed_request(
+                Method::PUT,
+                &format!("/1/indexes/{index_name}/settings"),
+                ADMIN_KEY,
+                Some(json!({
+                    "replicas": [format!("virtual({replica_name})")],
+                    "userData": {"probe": "a09-post-save-failure-value"}
+                })),
+            ))
+            .await
+            .unwrap()
+    };
+
+    let status = response.status();
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let _body = common::body_json(response).await;
+    assert!(
+        tmp.path().join(index_name).join("settings.json").exists(),
+        "fixture must reach the post-save failure seam before returning {status}"
+    );
+    let logs = log_buffer.contents();
+    assert!(
+        a09_matching_security_event_line(
+            &logs,
+            "security_audit_admin_action",
+            "set_settings",
+            &format!("index:{index_name}:settings"),
+            "success",
+            &[],
+        )
+        .is_none(),
+        "failed set_settings responses must not emit success audit events; logs={logs}"
+    );
+    a09_assert_security_event(
+        &logs,
+        "security_audit_admin_action",
+        "set_settings",
+        &format!("index:{index_name}:settings"),
+        "failure",
+        &["changed_fields=\"userData,replicas\""],
+    );
+    a09_assert_no_forbidden(&logs, &["a09-post-save-failure-value", "x-algolia-api-key"]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a09_import_snapshot_emits_audit_event_on_success_and_failure() {
+    let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
+    let source_index = "a09_snapshot_source";
+    let invalid_index = "a09_snapshot_invalid";
+    let snapshot_bytes = a09_snapshot_bytes(&app, source_index).await;
+    let log_buffer = A09LogBuffer::default();
+    let dispatch = a09_capture_dispatch(log_buffer.clone());
+
+    let success = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        app.clone()
+            .oneshot(a09_authed_body_request(
+                Method::POST,
+                &format!("/1/indexes/{source_index}/import"),
+                ADMIN_KEY,
+                "application/gzip",
+                Body::from(snapshot_bytes),
+            ))
+            .await
+            .unwrap()
+    };
+    assert_eq!(success.status(), StatusCode::OK);
+    let success_body = common::body_json(success).await;
+    assert_eq!(success_body["status"], json!("imported"));
+
+    let failure = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        app.clone()
+            .oneshot(a09_authed_body_request(
+                Method::POST,
+                &format!("/1/indexes/{invalid_index}/import"),
+                ADMIN_KEY,
+                "application/gzip",
+                Body::from("a09 invalid snapshot bytes".as_bytes().to_vec()),
+            ))
+            .await
+            .unwrap()
+    };
+    assert_eq!(failure.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let _body = common::body_json(failure).await;
+    let logs = log_buffer.contents();
+
+    a09_assert_security_event(
+        &logs,
+        "security_audit_admin_action",
+        "import_snapshot",
+        &format!("index:{source_index}:snapshot"),
+        "success",
+        &[],
+    );
+    a09_assert_security_event(
+        &logs,
+        "security_audit_admin_action",
+        "import_snapshot",
+        &format!("index:{invalid_index}:snapshot"),
+        "failure",
+        &[],
+    );
+    a09_assert_no_forbidden(&logs, &["x-algolia-api-key"]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn a09_restore_snapshot_from_s3_emits_audit_event_without_s3_key() {
+    let _env_guard = a10_env_lock().lock().unwrap();
+    let _env_restore = a09_capture_s3_env();
+    let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
+    let success_index = "a09_s3_restore_success";
+    let failure_index = "a09_s3_restore_failure";
+    let missing_index = "a09_s3_restore_missing";
+    let rejected_index = "a09_s3_restore_rejected";
+    let success_key = format!("snapshots/{success_index}/a09-success.tar.gz");
+    let failure_key = format!("snapshots/{failure_index}/a09-failure.tar.gz");
+    let missing_key = format!("snapshots/{missing_index}/a09-missing-private-marker.tar.gz");
+    let rejected_key = "snapshots/another-index/a09-rejected-private-marker.tar.gz";
+    let snapshot_bytes = a09_snapshot_bytes(&app, success_index).await;
+    let s3 = MockServer::start().await;
+    a09_mount_s3_snapshot(&s3, &success_key, snapshot_bytes).await;
+    a09_mount_s3_snapshot(&s3, &failure_key, b"a09 invalid s3 snapshot bytes".to_vec()).await;
+    a09_configure_s3_env(&s3);
+    let log_buffer = A09LogBuffer::default();
+    let dispatch = a09_capture_dispatch(log_buffer.clone());
+
+    let (success_status, success_body) =
+        a09_restore_s3_response(&app, &dispatch, success_index, &success_key).await;
+    assert_eq!(success_status, StatusCode::OK);
+    assert_eq!(success_body["status"], json!("restored"));
+
+    let (failure_status, _) =
+        a09_restore_s3_response(&app, &dispatch, failure_index, &failure_key).await;
+    assert_eq!(failure_status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    let (missing_status, missing_body) =
+        a09_restore_s3_response(&app, &dispatch, missing_index, &missing_key).await;
+    assert_eq!(missing_status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(missing_body["message"], json!("Internal server error"));
+
+    let (rejected_status, rejected_body) =
+        a09_restore_s3_response(&app, &dispatch, rejected_index, rejected_key).await;
+    assert_eq!(rejected_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        rejected_body["message"],
+        json!("key must reference a snapshot for the requested index")
+    );
+    let logs = log_buffer.contents();
+
+    a09_assert_security_event(
+        &logs,
+        "security_audit_admin_action",
+        "restore_snapshot_from_s3",
+        &format!("index:{success_index}:snapshot"),
+        "success",
+        &[],
+    );
+    a09_assert_security_event(
+        &logs,
+        "security_audit_admin_action",
+        "restore_snapshot_from_s3",
+        &format!("index:{failure_index}:snapshot"),
+        "failure",
+        &[],
+    );
+    a09_assert_security_event(
+        &logs,
+        "security_audit_admin_action",
+        "restore_snapshot_from_s3",
+        &format!("index:{missing_index}:snapshot"),
+        "failure",
+        &[],
+    );
+    a09_assert_security_event(
+        &logs,
+        "security_audit_admin_action",
+        "restore_snapshot_from_s3",
+        &format!("index:{rejected_index}:snapshot"),
+        "failure",
+        &[],
+    );
+    a09_assert_no_forbidden(
+        &logs,
+        &[
+            success_key.as_str(),
+            failure_key.as_str(),
+            missing_key.as_str(),
+            rejected_key,
+        ],
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn a09_control_character_index_name_keeps_mutation_audit_events() {
+    let _env_guard = a10_env_lock().lock().unwrap();
+    let _env_restore = a09_capture_s3_env();
+    let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
+    let raw_index_name = "a09_control\tindex";
+    let encoded_index_name = "a09_control%09index";
+    let audit_log_index_name = "a09_control\\\\tindex";
+    let snapshot_source = "a09_control_snapshot_source";
+    let snapshot_bytes = a09_snapshot_bytes(&app, snapshot_source).await;
+    let s3_key = "snapshots/a09_control\tindex/success.tar.gz";
+    let s3 = MockServer::start().await;
+    a09_mount_s3_snapshot(
+        &s3,
+        &format!("snapshots/{encoded_index_name}/success.tar.gz"),
+        snapshot_bytes.clone(),
+    )
+    .await;
+    a09_configure_s3_env(&s3);
+    let log_buffer = A09LogBuffer::default();
+    let dispatch = a09_capture_dispatch(log_buffer.clone());
+
+    let (settings_status, settings_body) = a09_captured_json_response(
+        &app,
+        &dispatch,
+        authed_request(
+            Method::PUT,
+            &format!("/1/indexes/{encoded_index_name}/settings"),
+            ADMIN_KEY,
+            Some(json!({"userData": {"probe": "a09-control-settings-value"}})),
+        ),
+    )
+    .await;
+    assert_eq!(
+        settings_status,
+        StatusCode::OK,
+        "settings body={}",
+        settings_body
+    );
+    common::wait_for_task_local_with_key(&app, common::extract_task_id(&settings_body), ADMIN_KEY)
+        .await;
+
+    let (import_status, _) = a09_captured_json_response(
+        &app,
+        &dispatch,
+        a09_authed_body_request(
+            Method::POST,
+            &format!("/1/indexes/{encoded_index_name}/import"),
+            ADMIN_KEY,
+            "application/gzip",
+            Body::from(snapshot_bytes),
+        ),
+    )
+    .await;
+    assert_eq!(import_status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    let (restore_status, _) =
+        a09_restore_s3_response(&app, &dispatch, encoded_index_name, s3_key).await;
+    assert_eq!(restore_status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    let (delete_status, delete_body) = a09_captured_json_response(
+        &app,
+        &dispatch,
+        authed_request(
+            Method::DELETE,
+            &format!("/1/indexes/{encoded_index_name}"),
+            ADMIN_KEY,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(delete_status, StatusCode::OK);
+    common::wait_for_task_local_with_key(&app, common::extract_task_id(&delete_body), ADMIN_KEY)
+        .await;
+    assert!(
+        !_tmp.path().join(raw_index_name).exists(),
+        "delete_index must preserve storage deletion semantics for manager-valid decoded names"
+    );
+    let logs = log_buffer.contents();
+
+    a09_assert_control_index_events(&logs, audit_log_index_name);
+    a09_assert_no_forbidden(
+        &logs,
+        &[s3_key, "a09-control-settings-value", "x-algolia-api-key"],
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a09_successful_admin_auth_emits_event() {
+    let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
+    let log_buffer = A09LogBuffer::default();
+    let dispatch = a09_capture_dispatch(log_buffer.clone());
+
+    let response = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        app.clone()
+            .oneshot(authed_request(Method::GET, "/1/keys", ADMIN_KEY, None))
+            .await
+            .unwrap()
+    };
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _body = common::body_json(response).await;
+    let logs = log_buffer.contents();
+
+    a09_assert_security_event(
+        &logs,
+        "security_audit_auth_success",
+        "authenticate",
+        "route:/1/keys",
+        "success",
+        &[],
+    );
+    a09_assert_no_forbidden(&logs, &["x-algolia-api-key"]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a09_auth_audit_base_routes_use_live_route_targets() {
+    let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
+    let index_name = "a09_base_route_target";
+    let bad_key = "a09_base_route_bad_key";
+    let log_buffer = A09LogBuffer::default();
+    let dispatch = a09_capture_dispatch(log_buffer.clone());
+
+    let delete_index_response = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        app.clone()
+            .oneshot(authed_request(
+                Method::DELETE,
+                &format!("/1/indexes/{index_name}"),
+                bad_key,
+                None,
+            ))
+            .await
+            .unwrap()
+    };
+    assert_eq!(delete_index_response.status(), StatusCode::FORBIDDEN);
+    let _body = common::assert_error_contract_from_oneshot(delete_index_response, 403).await;
+
+    let security_sources_response = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        app.clone()
+            .oneshot(authed_request(
+                Method::GET,
+                "/1/security/sources",
+                ADMIN_KEY,
+                None,
+            ))
+            .await
+            .unwrap()
+    };
+    assert_eq!(security_sources_response.status(), StatusCode::OK);
+    let _body = common::body_json(security_sources_response).await;
+    let logs = log_buffer.contents();
+
+    a09_assert_security_event(
+        &logs,
+        "security_audit_auth_failure",
+        "authenticate",
+        "route:/1/indexes/{index}",
+        "failure",
+        &[],
+    );
+    a09_assert_security_event(
+        &logs,
+        "security_audit_auth_success",
+        "authenticate",
+        "route:/1/security/sources",
+        "success",
+        &[],
+    );
+    a09_assert_no_forbidden(&logs, &[index_name, bad_key, "x-algolia-api-key"]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a09_successful_search_auth_emits_no_auth_success_event() {
+    let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
+    let index_name = "a09_search_auth_index";
+    a09_seed_single_doc(&app, index_name).await;
+
+    let create_resp = app
+        .clone()
+        .oneshot(authed_request(
+            Method::POST,
+            "/1/keys",
+            ADMIN_KEY,
+            Some(json!({
+                "acl": ["search"],
+                "indexes": [index_name],
+                "description": "a09 search auth key"
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::OK);
+    let search_key = a09_assert_nonempty_key(&common::body_json(create_resp).await, "search key");
+
+    let precheck = app
+        .clone()
+        .oneshot(authed_request(
+            Method::POST,
+            &format!("/1/indexes/{index_name}/query"),
+            &search_key,
+            Some(json!({"query": "alpha"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(precheck.status(), StatusCode::OK);
+    let precheck_body = common::body_json(precheck).await;
+    assert_eq!(precheck_body["nbHits"], json!(1));
+
+    let log_buffer = A09LogBuffer::default();
+    let dispatch = a09_capture_dispatch(log_buffer.clone());
+    let response = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        app.clone()
+            .oneshot(authed_request(
+                Method::POST,
+                &format!("/1/indexes/{index_name}/query"),
+                &search_key,
+                Some(json!({"query": "alpha"})),
+            ))
+            .await
+            .unwrap()
+    };
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = common::body_json(response).await;
+    assert_eq!(body["nbHits"], json!(1));
+    let logs = log_buffer.contents();
+    let auth_success_count = logs
+        .matches("event=\"security_audit_auth_success\"")
+        .count();
+    assert_eq!(
+        auth_success_count, 0,
+        "successful search-only auth must not emit admin auth-success events; logs={logs}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a09_failed_key_path_auth_failure_does_not_log_raw_key() {
+    let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
+    let raw_url_key = a09_nonempty_secret_specimen("a09_raw_url_key_probe", "raw URL key specimen");
+    let bad_header_key =
+        a09_nonempty_secret_specimen("a09_bad_header_key_probe", "bad header key specimen");
+    let log_buffer = A09LogBuffer::default();
+    let dispatch = a09_capture_dispatch(log_buffer.clone());
+
+    let response = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        app.clone()
+            .oneshot(authed_request(
+                Method::DELETE,
+                &format!("/1/keys/{raw_url_key}"),
+                &bad_header_key,
+                None,
+            ))
+            .await
+            .unwrap()
+    };
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let _body = common::assert_error_contract_from_oneshot(response, 403).await;
+    let logs = log_buffer.contents();
+
+    a09_assert_security_event(
+        &logs,
+        "security_audit_auth_failure",
+        "authenticate",
+        "route:/1/keys/{key}",
+        "failure",
+        &[],
+    );
+    a09_assert_no_forbidden(
+        &logs,
+        &[
+            raw_url_key.as_str(),
+            bad_header_key.as_str(),
+            "x-algolia-api-key",
+        ],
+    );
+}
+
+#[test]
+fn security_audit_event_matcher_rejects_fields_split_across_records() {
+    let split_logs = concat!(
+        "event=\"security_audit_admin_action\" actor=\"admin_api_key\" action=\"delete_index\"\n",
+        "target=\"index:split_fields\" outcome=\"success\"\n",
+    );
+
+    assert!(
+        a09_matching_security_event_line(
+            split_logs,
+            "security_audit_admin_action",
+            "delete_index",
+            "index:split_fields",
+            "success",
+            &[],
+        )
+        .is_none(),
+        "canonical audit fields split across records must not satisfy the event contract"
+    );
+}
+
+#[test]
+fn security_audit_key_target_uses_known_sha256_prefix() {
+    assert_eq!(
+        a09_api_key_target("key-target-known-answer"),
+        "api_key:4e38e2aa63786ebc"
+    );
 }
 
 fn a08_assert_in_order(haystack: &str, ordered_needles: &[&str], context: &str) {

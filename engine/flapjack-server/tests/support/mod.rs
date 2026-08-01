@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const AUTO_PORT_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const AUTO_PORT_HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
-const FLAPJACK_AMBIENT_ENV_VARS: [&str; 16] = [
+const FLAPJACK_AMBIENT_ENV_VARS: [&str; 17] = [
     "FLAPJACK_ADMIN_KEY",
     "FLAPJACK_NO_AUTH",
     "FLAPJACK_ENV",
@@ -30,6 +30,7 @@ const FLAPJACK_AMBIENT_ENV_VARS: [&str; 16] = [
     "FLAPJACK_WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_MS",
     "FLAPJACK_WRITE_QUEUE_CHANNEL_CAPACITY",
     "FLAPJACK_WRITE_QUEUE_START_DELAY_MS",
+    "FLAPJACK_TEST_ALGOLIA_BASE_URL",
 ];
 
 pub(crate) fn flapjack_cmd() -> Command {
@@ -223,6 +224,14 @@ impl RunningServer {
         Self::spawn_auto_port(data_dir, false)
     }
 
+    pub(crate) fn spawn_auth_auto_port_with_env(
+        data_dir: &str,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
+        let (child, bind_addr) = Self::start_auto_port_process_with_env(data_dir, false, extra_env);
+        Self { child, bind_addr }
+    }
+
     pub(crate) fn spawn_no_auth_auto_port_with_persistent_idempotency(
         data_dir: &str,
         ttl: Duration,
@@ -346,6 +355,17 @@ impl RunningServer {
         self.kill_child();
         let env = persistent_idempotency_env(ttl);
         let (child, bind_addr) = Self::start_auto_port_process_with_env(data_dir, true, &env);
+        self.child = child;
+        self.bind_addr = bind_addr;
+    }
+
+    pub(crate) fn kill_and_restart_auth_auto_port_with_env(
+        &mut self,
+        data_dir: &str,
+        extra_env: &[(&str, &str)],
+    ) {
+        self.kill_child();
+        let (child, bind_addr) = Self::start_auto_port_process_with_env(data_dir, false, extra_env);
         self.child = child;
         self.bind_addr = bind_addr;
     }

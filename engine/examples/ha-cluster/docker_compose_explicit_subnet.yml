@@ -1,0 +1,5 @@
+networks:
+  fj-net:
+    ipam:
+      config:
+        - subnet: "${FLAPJACK_HA_NETWORK_SUBNET:?FLAPJACK_HA_NETWORK_SUBNET must be set}"

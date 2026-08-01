@@ -1,8 +1,19 @@
 use super::PRIVATE_MIGRATION_ACL;
 use axum::http::Method;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteAcl {
+    Required(&'static str),
+    Public,
+    Unmapped,
+}
+
 pub(crate) fn is_acme_challenge_path(path: &str) -> bool {
     path.starts_with("/.well-known/acme-challenge/")
+}
+
+fn is_read_method(method: &Method) -> bool {
+    *method == Method::GET || *method == Method::HEAD
 }
 
 fn read_or_write_acl(
@@ -10,36 +21,38 @@ fn read_or_write_acl(
     read_acl: &'static str,
     write_acl: &'static str,
 ) -> Option<&'static str> {
-    Some(if *method == Method::GET {
+    Some(if is_read_method(method) {
         read_acl
     } else {
         write_acl
     })
 }
 
-/// Maps an HTTP method and path to the ACL permission string required for access.
-/// Returns `None` for public paths (ACME challenges) that need no authentication.
-pub fn required_acl_for_route(method: &Method, path: &str) -> Option<&'static str> {
+/// Maps an HTTP method and path to its authorization requirement.
+pub fn required_acl_for_route(method: &Method, path: &str) -> RouteAcl {
     if is_acme_challenge_path(path) {
-        return None;
+        // Route exposure normally short-circuits public ACME requests before ACL
+        // evaluation. Keep this defensive result so direct mapper callers cannot
+        // mistake a public route for an unmapped protected route.
+        return RouteAcl::Public;
     }
 
     if let Some(acl) = fixed_path_acl(method, path) {
-        return Some(acl);
+        return RouteAcl::Required(acl);
     }
 
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    if let Some(acl) = indexes_acl(method, &parts) {
-        return acl;
+    if let Some(indexes_acl) = indexes_acl(method, &parts) {
+        return indexes_acl.map_or(RouteAcl::Unmapped, RouteAcl::Required);
     }
     if let Some(acl) = dictionaries_acl(method, &parts) {
-        return Some(acl);
+        return RouteAcl::Required(acl);
     }
     if tasks_acl(&parts) {
-        return Some("search");
+        return RouteAcl::Required("search");
     }
 
-    None
+    RouteAcl::Unmapped
 }
 
 /// Resolves ACL for non-index routes: keys, usage, analytics, personalization, logs,
@@ -79,7 +92,7 @@ fn fixed_path_acl(method: &Method, path: &str) -> Option<&'static str> {
         return Some("admin");
     }
     if path.starts_with("/2/abtests") {
-        return Some(if path == "/2/abtests/estimate" || *method == Method::GET {
+        return Some(if path == "/2/abtests/estimate" || is_read_method(method) {
             "analytics"
         } else {
             "editSettings"
@@ -102,7 +115,7 @@ fn fixed_path_acl(method: &Method, path: &str) -> Option<&'static str> {
 fn indexes_acl(method: &Method, parts: &[&str]) -> Option<Option<&'static str>> {
     if parts.len() == 2 && parts[0] == "1" && parts[1] == "indexes" {
         return Some(match *method {
-            Method::GET => Some("listIndexes"),
+            Method::GET | Method::HEAD => Some("listIndexes"),
             Method::POST => Some("addObject"),
             _ => None,
         });
@@ -114,7 +127,7 @@ fn indexes_acl(method: &Method, parts: &[&str]) -> Option<Option<&'static str>> 
 
     if parts.len() == 3 && !parts[2].is_empty() {
         return Some(match *method {
-            Method::GET => Some("search"),
+            Method::GET | Method::HEAD => Some("search"),
             Method::DELETE => Some("deleteIndex"),
             Method::POST => Some("addObject"),
             _ => None,
@@ -152,7 +165,7 @@ fn index_nested_acl(method: &Method, parts: &[&str]) -> Option<&'static str> {
         "settings" | "synonyms" | "rules" => read_or_write_acl(method, "settings", "editSettings"),
         "recommendations" => Some("recommendation"),
         _ if parts.len() == 4 => match *method {
-            Method::GET => Some("search"),
+            Method::GET | Method::HEAD => Some("search"),
             Method::PUT => Some("addObject"),
             Method::DELETE => Some("deleteObject"),
             _ => Some("admin"),

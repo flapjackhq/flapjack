@@ -1,14 +1,20 @@
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{DefaultBodyLimit, Extension},
+    http::{header, HeaderName, HeaderValue, Request},
     middleware,
+    response::Response,
     routing::{delete, get, post},
     Router,
 };
+use tower::limit::GlobalConcurrencyLimitLayer;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::timeout::TimeoutLayer;
 
 use crate::auth::{
     authenticate_and_authorize, request_application_id, AuthenticatedAppId, KeyStore, RateLimiter,
@@ -18,7 +24,8 @@ use crate::handlers::analytics;
 use crate::handlers::insights::GdprDeleteState;
 use crate::handlers::migration::{
     acknowledge_algolia_migration_http, cancel_algolia_migration_http, cancel_bulk_replace_http,
-    get_algolia_migration_status_http, get_bulk_replace_status_http, submit_algolia_migration_http,
+    get_algolia_migration_status_http, get_bulk_replace_status_http,
+    preview_algolia_migration_http, resume_algolia_migration_http, submit_algolia_migration_http,
     submit_bulk_replace_http, submit_privacy_scrub_http, AsyncMigrationSourceProvider,
 };
 use crate::handlers::{
@@ -48,6 +55,54 @@ pub struct RouterConfig {
     pub disable_dashboard: bool,
 }
 
+pub(crate) const DEFAULT_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
+const CONTENT_SECURITY_POLICY_ENV: &str = "FLAPJACK_CONTENT_SECURITY_POLICY";
+const REFERRER_POLICY_VALUE: &str = "no-referrer";
+const PERMISSIONS_POLICY: HeaderName = HeaderName::from_static("permissions-policy");
+const PERMISSIONS_POLICY_VALUE: &str = "camera=(), microphone=(), geolocation=()";
+const REQUEST_TIMEOUT_SECS_ENV: &str = "FLAPJACK_REQUEST_TIMEOUT_SECS";
+const MAX_CONCURRENT_REQUESTS_ENV: &str = "FLAPJACK_MAX_CONCURRENT_REQUESTS";
+pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
+pub(crate) const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 1024;
+#[cfg(feature = "fault-injection")]
+pub(crate) const FAULT_SLEEP_LOG_MARKER: &str = "FLAPJACK_FAULT_SLEEP_STARTED";
+#[cfg(feature = "fault-injection")]
+pub(crate) const FAULT_SLEEP_DURATION: Duration = Duration::from_secs(2);
+
+#[derive(Clone)]
+struct SecurityHeaderPolicy {
+    content_security_policy: HeaderValue,
+}
+
+#[derive(Clone, Copy)]
+struct ResourceBounds {
+    request_timeout: Duration,
+    max_concurrent_requests: usize,
+}
+
+impl ResourceBounds {
+    fn from_env() -> Self {
+        Self {
+            request_timeout: Duration::from_secs(request_timeout_secs_from_value(
+                std::env::var(REQUEST_TIMEOUT_SECS_ENV).ok().as_deref(),
+            )),
+            max_concurrent_requests: max_concurrent_requests_from_value(
+                std::env::var(MAX_CONCURRENT_REQUESTS_ENV).ok().as_deref(),
+            ),
+        }
+    }
+}
+
+impl SecurityHeaderPolicy {
+    fn from_env() -> Self {
+        Self {
+            content_security_policy: content_security_policy_from_value(
+                std::env::var(CONTENT_SECURITY_POLICY_ENV).ok().as_deref(),
+            ),
+        }
+    }
+}
+
 /// Constructs the full Axum router: mounts all route groups (index CRUD, search,
 /// keys, analytics, experiments, internal ops), applies middleware, and attaches
 /// the dashboard and OpenAPI/Swagger UI.
@@ -58,6 +113,26 @@ pub fn build_router(
     trusted_proxy_matcher: Arc<TrustedProxyMatcher>,
     data_dir: &Path,
     config: RouterConfig,
+) -> Router {
+    build_router_with_resource_bounds(
+        state,
+        key_store,
+        analytics_collector,
+        trusted_proxy_matcher,
+        data_dir,
+        config,
+        ResourceBounds::from_env(),
+    )
+}
+
+fn build_router_with_resource_bounds(
+    state: Arc<AppState>,
+    key_store: Option<Arc<KeyStore>>,
+    analytics_collector: Arc<AnalyticsCollector>,
+    trusted_proxy_matcher: Arc<TrustedProxyMatcher>,
+    data_dir: &Path,
+    config: RouterConfig,
+    resource_bounds: ResourceBounds,
 ) -> Router {
     let auth_enabled = key_store.is_some();
     let app = Router::new()
@@ -87,7 +162,14 @@ pub fn build_router(
         .nest("/dashboard", Router::new().fallback(get(dashboard_handler)))
     };
 
-    apply_middleware(app, state, trusted_proxy_matcher, key_store, &config)
+    apply_middleware(
+        app,
+        state,
+        trusted_proxy_matcher,
+        key_store,
+        &config,
+        resource_bounds,
+    )
 }
 
 fn build_health_routes(state: Arc<AppState>) -> Router {
@@ -135,9 +217,14 @@ fn register_source_migration_routes(mut router: Router<Arc<AppState>>) -> Router
             .as_str()
             .expect("every public migration provider must have a route segment");
         let provider_path = format!("/1/migrations/{provider}");
+        let preview_path = format!("{provider_path}/preview");
         let job_path = format!("{provider_path}/:job_id");
 
         router = router
+            .route(
+                &preview_path,
+                post(preview_algolia_migration_http).layer(Extension(source_provider)),
+            )
             .route(
                 &provider_path,
                 post(submit_algolia_migration_http).layer(Extension(source_provider)),
@@ -153,6 +240,10 @@ fn register_source_migration_routes(mut router: Router<Arc<AppState>>) -> Router
             .route(
                 &format!("{job_path}/acknowledge"),
                 post(acknowledge_algolia_migration_http).layer(Extension(source_provider)),
+            )
+            .route(
+                &format!("{job_path}/resume"),
+                post(resume_algolia_migration_http).layer(Extension(source_provider)),
             );
     }
     router
@@ -434,6 +525,8 @@ fn build_internal_routes(state: Arc<AppState>, auth_enabled: bool) -> Router {
                 post(internal::rotate_admin_key),
             )
             .with_state(state.clone());
+        #[cfg(feature = "fault-injection")]
+        let admin_internal_routes = admin_internal_routes.merge(build_fault_routes(state.clone()));
         Router::new()
             .merge(internal_read_routes)
             .merge(replication_mesh_routes)
@@ -446,6 +539,26 @@ fn build_internal_routes(state: Arc<AppState>, auth_enabled: bool) -> Router {
     };
 
     public_routes.merge(internal_routes)
+}
+
+#[cfg(feature = "fault-injection")]
+fn build_fault_routes(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/internal/fault/sleep", get(fault_sleep))
+        .route("/internal/fault/panic", get(fault_panic))
+        .with_state(state)
+}
+
+#[cfg(feature = "fault-injection")]
+async fn fault_sleep() -> &'static str {
+    tracing::info!(marker = FAULT_SLEEP_LOG_MARKER, "fault sleep route started");
+    tokio::time::sleep(FAULT_SLEEP_DURATION).await;
+    "ok"
+}
+
+#[cfg(feature = "fault-injection")]
+async fn fault_panic() -> &'static str {
+    panic!("fault injection panic route");
 }
 
 /// Builds analytics API routes for top searches, click-through, and conversion rates.
@@ -624,6 +737,78 @@ pub(crate) fn max_body_mb_from_value(raw: Option<&str>) -> usize {
     raw.and_then(|value| value.parse().ok()).unwrap_or(100)
 }
 
+/// Parse `FLAPJACK_REQUEST_TIMEOUT_SECS`-style values.
+///
+/// Missing, empty, invalid, or non-positive values use 300s. That is above the
+/// durable write acknowledgement default and keeps migration admission/uploads
+/// bounded without cutting off normal long-running setup work.
+pub(crate) fn request_timeout_secs_from_value(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS)
+}
+
+/// Parse `FLAPJACK_MAX_CONCURRENT_REQUESTS`-style values.
+///
+/// Missing, empty, invalid, or non-positive values use 1024 admitted in-flight
+/// requests. The cap is global across routes; excess requests queue in
+/// `poll_ready` rather than receiving a shed-load response.
+pub(crate) fn max_concurrent_requests_from_value(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS)
+}
+
+fn content_security_policy_from_value(raw: Option<&str>) -> HeaderValue {
+    let Some(policy) = raw.map(str::trim).filter(|policy| !policy.is_empty()) else {
+        return HeaderValue::from_static(DEFAULT_CONTENT_SECURITY_POLICY);
+    };
+
+    HeaderValue::from_str(policy)
+        .unwrap_or_else(|_| HeaderValue::from_static(DEFAULT_CONTENT_SECURITY_POLICY))
+}
+
+async fn insert_security_headers(
+    request: Request<axum::body::Body>,
+    next: middleware::Next,
+    policy: SecurityHeaderPolicy,
+) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+
+    // Stage 1 recorded Swagger UI as same-origin external scripts only, so it
+    // needs no route-specific CSP. `frame-ancestors` is the canonical frame
+    // protection owner instead of a duplicate path helper or X-Frame-Options.
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        policy.content_security_policy.clone(),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static(REFERRER_POLICY_VALUE),
+    );
+    headers.insert(
+        PERMISSIONS_POLICY,
+        HeaderValue::from_static(PERMISSIONS_POLICY_VALUE),
+    );
+
+    // Strict-Transport-Security is deliberately omitted while this server has
+    // no HTTPS listener; advertising HSTS on an HTTP-only endpoint would be a
+    // misleading transport guarantee.
+    response
+}
+
+fn panic_json_response(_panic: Box<dyn std::any::Any + Send + 'static>) -> Response {
+    crate::error_response::json_error(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "Internal server error",
+    )
+}
+
 pub(crate) fn app_id_layer(app: Router) -> Router {
     app.layer(middleware::from_fn(
         |mut request: axum::extract::Request, next: middleware::Next| async move {
@@ -647,9 +832,11 @@ fn apply_middleware(
     trusted_proxy_matcher: Arc<TrustedProxyMatcher>,
     key_store: Option<Arc<KeyStore>>,
     config: &RouterConfig,
+    resource_bounds: ResourceBounds,
 ) -> Router {
     let max_body_mb: usize =
         max_body_mb_from_value(std::env::var("FLAPJACK_MAX_BODY_MB").ok().as_deref());
+    let security_header_policy = SecurityHeaderPolicy::from_env();
 
     let mgr_for_pressure = Arc::clone(&state.manager);
     let default_facet_cache_cap = state
@@ -701,11 +888,25 @@ fn apply_middleware(
         .layer(memory_middleware)
         .layer(DefaultBodyLimit::max(max_body_mb * 1024 * 1024))
         .layer(middleware::from_fn(normalize_content_type))
+        // GlobalConcurrencyLimitLayer queues in poll_ready with one shared
+        // semaphore across cloned routes. TimeoutLayer delegates poll_ready and
+        // starts its clock in call, so it bounds admitted request execution, not
+        // queue wait. This stage intentionally does not shed load.
+        .layer(GlobalConcurrencyLimitLayer::new(
+            resource_bounds.max_concurrent_requests,
+        ))
+        .layer(TimeoutLayer::new(resource_bounds.request_timeout))
         .layer(middleware::from_fn(ensure_json_errors))
         .layer(build_cors_layer(&config.cors_mode))
         .layer(middleware::from_fn(allow_private_network))
         .layer(middleware::from_fn(observe_request_latency))
+        // Catch panics inside request_id_middleware so the canonical 500 JSON
+        // response still receives x-request-id.
+        .layer(CatchPanicLayer::custom(panic_json_response))
         .layer(middleware::from_fn(request_id_middleware))
+        .layer(middleware::from_fn(move |request, next| {
+            insert_security_headers(request, next, security_header_policy.clone())
+        }))
 }
 
 #[cfg(test)]

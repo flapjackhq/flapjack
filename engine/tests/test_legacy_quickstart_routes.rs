@@ -21,6 +21,25 @@ async fn assert_404(resp: reqwest::Response, context: &str) {
     );
 }
 
+async fn assert_fail_closed_403(resp: reqwest::Response, context: &str) {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status.as_u16(),
+        403,
+        "{} should fail closed with 403, got {} body={}",
+        context,
+        status,
+        body
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).expect("403 body must be JSON"),
+        json!({"message": "Method not allowed with this API key", "status": 403}),
+        "{} should use the canonical fail-closed denial envelope",
+        context
+    );
+}
+
 #[tokio::test]
 async fn legacy_quickstart_routes_are_removed_in_open_mode() {
     let (addr, _temp) = common::spawn_server().await;
@@ -91,7 +110,7 @@ async fn legacy_quickstart_routes_are_removed_even_with_valid_auth() {
     let base = format!("http://{}", addr);
     let api_key = "admin_secret_123";
 
-    assert_404(
+    assert_fail_closed_403(
         with_auth(client.get(format!("{}/indexes", base)), api_key)
             .send()
             .await
@@ -100,7 +119,7 @@ async fn legacy_quickstart_routes_are_removed_even_with_valid_auth() {
     )
     .await;
 
-    assert_404(
+    assert_fail_closed_403(
         with_auth(
             client.post(format!("{}/indexes/products/documents", base)),
             api_key,
@@ -113,7 +132,7 @@ async fn legacy_quickstart_routes_are_removed_even_with_valid_auth() {
     )
     .await;
 
-    assert_404(
+    assert_fail_closed_403(
         with_auth(client.post(format!("{}/migrate", base)), api_key)
             .json(&json!({
                 "appId": "any",

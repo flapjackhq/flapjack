@@ -3,14 +3,14 @@
 Canonical shipped capability and production-readiness snapshot for Flapjack.
 Open and future work is owned only by [`ROADMAP.md`](../../ROADMAP.md).
 
-**Last updated: 2026-07-26 (node-local synchronous and authenticated async Algolia create/overwrite migration are shipped; successful async status carries durable outcomes; resume and HA import remain routed through `ROADMAP.md`.)**
+**Last updated: 2026-07-31 (Algolia migration resume is shipped, closing the last MIG-6 deferral; six security-register gaps closed; the backend↔frontend join claim is corrected to its measured value. HA import remains routed through `ROADMAP.md`.)**
 
 - 2026-05-31 stage note: `FLAPJACK_WRITE_QUEUE_BATCH_SIZE` is now runtime-configurable with default-preserving behavior (`32` fallback). See [`3_IMPLEMENTATION/OPS_CONFIGURATION.md`](3_IMPLEMENTATION/OPS_CONFIGURATION.md) for full operator semantics.
 
 - **Backend API:** 197/197 complete (as of 2026-03-13). The full parity verification is retained in the dev repo's internal audit history.
-- **Dashboard UI:** 22 user-facing routes are shipped, backed by 21 lazy-loaded page components in `dashboard/src/App.tsx`, plus the `*` not-found catch-all. No scaffolded stubs remain.
-- **E2E Browser Tests:** 340+ tests across 46 Playwright spec files in total: 42 browser specs (41 specs in `tests/e2e-ui/` [4 smoke + 37 full] plus root-level `tests/result-helpers.spec.ts`) and 4 API-contract specs in `tests/e2e-api/`. Exact-HEAD wrapper verification passed on 2026-03-26 at commit `aa7dd7db61d7e274cdf946ac6dd7d7435c4dcdf4`, with all 14 wrapper sections green.
-- **Tour Video Walkthroughs:** 24/24 per-feature specs now have archived MP4 artifacts. The former vector/chat blockers (05/06) were closed on 2026-03-30 with dedicated tour specs plus default-build/vector+AI runtime wiring. Per-feature tours provide end-to-end workflow proof for core dashboard capabilities.
+- **Dashboard UI:** `dashboard/src/App.tsx` defines 24 derived user-facing route patterns from 24 raw `path=` attributes and two attribute-less index routes, backed by 22 lazy page components; the wildcard has no lazy component and `Overview` serves two patterns. No scaffolded stubs remain.
+- **E2E Browser Tests:** 46 Playwright spec files: 38 full `e2e-ui` specs, four smoke specs, and four `e2e-api` specs. **The latest full dashboard composition is not green.** At `ddb6fccef82af3e43eedf88778a89f28dd2cbe33` (2026-07-30), run 2 of `./s/test --dashboard-full` returned 1 with Vitest 663/663 and both Playwright phases unparseable after a server startup failure; run 3 reached Vitest 663/663, smoke 17/17, and full 357 passed / 1 failed / 8 skipped / 1 did not run, then required an exact-PID interrupt because the HTML reporter did not return. The 2026-03-26 all-green wrapper claim at `aa7dd7db61d7e274cdf946ac6dd7d7435c4dcdf4` is superseded historical evidence, not current status. Residuals and their owners: [`4_EVIDENCE/2026_07_30_jul30_12am_3_dashboard_join_audit_receipt.md`](4_EVIDENCE/2026_07_30_jul30_12am_3_dashboard_join_audit_receipt.md).
+- **Tour Video Walkthroughs:** Removed 2026-07-30 — the system depended on an external tool at a local path that no longer exists and had been unrunnable since 2026-04-14. Dashboard end-to-end proof is the Playwright e2e-ui suite.
 - **Load & Stress Testing:** k6 suite in `engine/loadtest/` — smoke, search throughput, write throughput, mixed workload, spike, memory-pressure, plus the long-running `mixed-soak` / `write-soak` scenarios and `soak_proof.sh` restart harness. PL-10's post-fix 60-minute Stage 3 mixed-soak gate (run date 2026-05-27) is classified `failure`, while the public write contract remained intact (no write `5xx`, no unexpected write `4xx`). Keep detailed lane status in [`ROADMAP.md`](../../ROADMAP.md), with measured verdict/evidence paths retained in private stage artifacts. Large-dataset benchmarking (100k docs): deterministic generator (`generate_dataset.mjs`), import throughput (`import_benchmark.sh`), search latency by query type (`search_benchmark.sh`), k6 concurrent load (`benchmark_k6.sh`), and dashboard large-index perf test (`large-index-perf.spec.ts`).
 - **Architecture decisions:** `3_IMPLEMENTATION/decisions/active/`
 
@@ -226,7 +226,14 @@ All shipped capability status lives in the feature tables below (Search, Indexin
 | Key restrictions | ✅ | maxHitsPerQuery, queryParameters, indexRestrictions, referers, description, and `restrictSources` are enforced. |
 | Rate limiting per key | ✅ | |
 | Security Sources / Vault | ✅ | Secrets injection for external sources |
-| Secured API keys (signed) | ✅ | |
+| Secured API keys (signed) | ✅ | Malformed/non-UTF-8-boundary secured keys are rejected as `400`, not a parser panic (2026-07-31). |
+| Route authorization default | ✅ | Fail-closed: a path matching no ACL rule is denied rather than allowed through (`RouteAcl::Unmapped`, 2026-07-31). |
+| Admin credential transport | ✅ | Admin-ACL routes accept the key only in the `x-algolia-api-key` header; the query-string form is refused so admin keys stay out of logs, shell history, and proxy access logs. Search-scoped keys keep query-string support for browser clients (2026-07-31). |
+| Analytics client-IP minimization | ✅ | Persisted analytics coarsen the client IP before write (IPv4 → /24, IPv6 → /48); the full address is never stored (2026-07-31). |
+| Container runtime posture | ✅ | The image runs as non-root `flapjack:flapjack` at fixed UID/GID `10001:10001`, and refuses to start with an actionable non-zero exit when `/data` is not writable (2026-07-31). |
+| Dashboard dependency supply chain | ✅ | CI gates the bundled dashboard on a high-and-above production `npm audit`, with a deliberately-vulnerable fixture proving the gate can fail (2026-07-31). |
+| Server-side TLS | ❌ | The binary binds plain TCP; terminate TLS at a reverse proxy. In-binary listener flags are `ROADMAP.md` row `SEC-W2`. |
+| Security audit event coverage | 🟡 | Two event types today (auth failure, admin-key rotation). Broader actor/action/target/outcome vocabulary is `ROADMAP.md` row `SEC-W3`. |
 
 ## Dictionaries
 
@@ -286,11 +293,11 @@ Env-var details for operational behavior are canonical in
 | InstantSearch iOS | ✅ | Via Swift client + Swift smoke |
 | Autocomplete.js | ✅ | |
 
-## Algolia migration (`/1/migrate-from-algolia`) — SYNC + ASYNC OVERWRITE SHIPPED
+## Algolia migration (`/1/migrate-from-algolia`) — SYNC + ASYNC OVERWRITE + RESUME SHIPPED
 
-**Status as of 2026-07-26: node-local synchronous and authenticated async Algolia migration support create-only import and `overwrite=true` replacement.** Both replacement paths use the fenced publication owner. Successful async status projects the durable settings/synonym/rule outcome and warnings; non-success states omit that outcome rather than fabricating zeroes. Resume and HA-converging import remain deferred in [`ROADMAP.md`](../../ROADMAP.md) rows `MIG-6` and `MIG-7`. `MIG-4` is a separate publication-repair proof row, not part of this migration capability.
+**Status as of 2026-07-31: node-local synchronous and authenticated async Algolia migration support create-only import, `overwrite=true` replacement, and interrupted-job resume.** Both replacement paths use the fenced publication owner. Successful async status projects the durable settings/synonym/rule outcome and warnings; non-success states omit that outcome rather than fabricating zeroes. HA-converging import remains refused by design in [`ROADMAP.md`](../../ROADMAP.md) row `MIG-7`. `MIG-4` is a separate publication-repair proof row, not part of this migration capability.
 
-**Operator CLI:** `flapjack migrate` submits and monitors authenticated async migrations; `flapjack migrate cancel --job-id <uuid>` requests cooperative cancellation, and `flapjack migrate ack --job-id <uuid>` acknowledges terminal jobs. Secret values are accepted only from environment, file, or stdin sources, and non-success terminal states use distinct non-zero exit codes. Interrupted-job resume is not shipped.
+**Operator CLI:** `flapjack migrate` submits and monitors authenticated async migrations; `flapjack migrate cancel --job-id <uuid>` requests cooperative cancellation, and `flapjack migrate ack --job-id <uuid>` acknowledges terminal jobs. Secret values are accepted only from environment, file, or stdin sources, and non-success terminal states use distinct non-zero exit codes.
 
 | Leg | Status | Owner |
 |---|---|---|
@@ -298,8 +305,9 @@ Env-var details for operational behavior are canonical in
 | Translation: spool → Flapjack documents/settings/synonyms/rules | ✅ Shipped | `engine/flapjack-http/src/handlers/migration/translation.rs` |
 | Import: translated content → target index via staged publication | ✅ Shipped for create-only plus synchronous and async overwrite | `engine/flapjack-http/src/handlers/migration/import.rs`; `engine/flapjack-http/src/handlers/migration/mod.rs` |
 | Staged publication primitive (crash-safe, node-local) | ✅ Shipped | `engine/src/index/manager/publication.rs` |
-| Dashboard `Migrate` page | ✅ Shipped and proven for create-only migration | `engine/dashboard/src/pages/Migrate.tsx`; `engine/dashboard/tests/e2e-ui/full/migrate-algolia.spec.ts` |
-| **Backend ↔ frontend joined end-to-end** | ✅ Create-only path proven with real Algolia credentials; node-local sync overwrite shipped at the backend contract | `migrate_from_algolia`; `engine/dashboard/tests/e2e-ui/full/migrate-algolia.spec.ts` |
+| Interrupted-job resume (pre-publication export) | ✅ Shipped — Algolia only | `POST /1/migrations/{provider}/{job_id}/resume`; `engine/flapjack-http/src/handlers/migration/{spool_lifecycle,export,job_runner,mod}.rs`; restart proof `engine/flapjack-server/tests/crash_durability_test.rs::interrupted_async_migration_resumes_exactly_once_after_process_restart` |
+| Dashboard `Migrate` page | ✅ Route shipped; synchronous create-only mutation only | `engine/dashboard/src/pages/Migrate.tsx`; `engine/dashboard/tests/e2e-ui/full/migrate-algolia.spec.ts` |
+| **Backend ↔ frontend joined end-to-end** | ⚠️ No current passing joined proof — the 2026-07-30 audit ran with invalid Algolia runtime inputs and the candidate spec was not executed at the audited SHA. Backend contract is proven independently. Re-proof is unblocked as of the 2026-07-30 credential repoint. | `migrate_from_algolia`; `engine/dashboard/tests/e2e-ui/full/migrate-algolia.spec.ts`; audit: [`4_EVIDENCE/2026_07_30_jul30_12am_3_dashboard_join_audit_receipt.md`](4_EVIDENCE/2026_07_30_jul30_12am_3_dashboard_join_audit_receipt.md) |
 
 Replica translation detects topology from the source primary, fetches every named replica's own settings, and carries the derived virtual topology plus translated per-replica settings in the create-only migration bundle. Materialization then creates each derived replica as a settings-only virtual sidecar (no physical copy, by design) whose sort order resolves at query time. This contract is live-proven: on 2026-07-19 a real Algolia application with one `virtual(...)` relevance replica and one standard replica migrated end-to-end with a passing machine-verified receipt (jul18_11am batch) covering fixture seeding, import, sort-order proofs on the primary and both replica indexes, sidecar structure, and exact source cleanup. Remaining fidelity limits stay owned by `ROADMAP.md` MIG-11 and surface as documented migration warnings: standard-replica exhaustive sorting is approximated as a virtual replica, and Algolia `relevancyStrictness` semantics differ from Flapjack's deterministic ranking.
 
@@ -310,14 +318,14 @@ Migration warnings expose the remaining replica fidelity limits:
 - Matching-critical fields that diverge from the primary cannot be reproduced independently by a virtual replica.
 - Algolia and Flapjack use different `relevancyStrictness` scales, and `nbSortedHits` may differ for deterministic queries.
 
-**Current boundary:** node-local synchronous and authenticated async import can create a fresh target or replace an existing target with `overwrite=true`. The async status/cancel route exists and terminal success carries durable import-outcome counts/warnings, but resume remains deferred to `MIG-6`. HA import is refused because staged publication is node-local and no convergence epoch exists; that design remains under `MIG-7`.
+**Current boundary:** node-local synchronous and authenticated async import can create a fresh target or replace an existing target with `overwrite=true`, and an interrupted pre-publication export can be claimed through the explicit admin-authenticated resume route using fresh request-only credentials. Positive status exposes `resumable`, `operation`, and `resumeHandle`; interruption preserves the original absolute `expires_at`. Meilisearch and Typesense resume are not supported. HA import is refused because staged publication is node-local and no convergence epoch exists; that design remains under `MIG-7`.
 
 ## Dashboard UI
 
-22 user-facing routes are shipped, backed by 21 lazy-loaded page components, plus the `*` not-found catch-all. No stub pages remain.
+`dashboard/src/App.tsx` defines 24 derived user-facing route patterns from 24 raw `path=` attributes and two attribute-less index routes, backed by 22 lazy page components. No stub pages remain.
 The route inventory spans overview, search/browse, settings, analytics, relevancy controls, security tooling, and migration workflows with no placeholder pages.
 
-**Caveat — route shipped ≠ every migration mode shipped.** The `Migrate` route is a proven browser path when credentials are supplied and `overwrite` is false; the backend also ships synchronous and authenticated async `overwrite=true`. Resume and HA import remain deferred through [`ROADMAP.md`](../../ROADMAP.md) rows `MIG-6` and `MIG-7`.
+**Caveat — route shipped ≠ backend capability joined.** The dated 2026-07-30 backend/frontend matrix audits 90 backend capability rows. At the audited SHA, **0 rows have a current passing joined proof and 0 have a current partial joined proof**; 63 rows have an operable dashboard route but no current joined proof, 19 are API-only, one is CLI-only, and seven are config-only. Route existence, `e2e-api` coverage, unit coverage, and unexecuted Playwright candidates are not counted as joined proof. Composite Settings rows expose only the controls present in the React owner: highlight but not `attributesToSnippet`, `queryType` but not `removeWordsIfNoResults`, and `hitsPerPage` but not `paginationLimitedTo`. Console-absent backend modes include async `overwrite=true`, migration status/cancel/acknowledge/resume, bulk-replace cancellation, runtime HA peer add/remove, and auto-heal lifecycle. Full matrix and per-row owners: [`4_EVIDENCE/2026_07_30_jul30_12am_3_dashboard_join_audit_receipt.md`](4_EVIDENCE/2026_07_30_jul30_12am_3_dashboard_join_audit_receipt.md).
 
 | Status | Features |
 |---|---|
@@ -327,7 +335,11 @@ The route inventory spans overview, search/browse, settings, analytics, relevanc
 
 ### E2E Browser Tests (Playwright)
 
-340+ tests across 46 Playwright spec files in total — 42 browser specs (41 specs in `tests/e2e-ui/` [4 smoke + 37 full] plus root-level `tests/result-helpers.spec.ts`) and 4 API-contract specs in `tests/e2e-api/`. Present-tense full-suite green status is based on exact-HEAD wrapper verification at commit `aa7dd7db61d7e274cdf946ac6dd7d7435c4dcdf4`: `cd engine && ./s/test --all` completed green with all 14 sections passed and exit 0. The Apr 15 test-hygiene merge tightened `.or()` and browser-API usage to reduce false positives, but it did not replace that full-suite proof with a newer exact-HEAD full wrapper run.
+The current inventory is 46 Playwright spec files: 38 full `e2e-ui` specs, four smoke specs, and four `e2e-api` specs.
+
+**The dashboard composition is not currently green.** At `ddb6fccef82af3e43eedf88778a89f28dd2cbe33`, run 2 of `./s/test --dashboard-full` returned 1 with Vitest 663/663, smoke UNPARSEABLE/DID NOT RUN, and full UNPARSEABLE/DID NOT RUN at preflight load 23.08/52.28/59.43; run 3 returned execution-tool exit 1 after exact-PID interruption with Vitest 663/663, smoke 17/0/0/0/0/17, and full 357/1/0/8/1/367 at preflight load 25.37/35.87/50.05. **Two of the audit's three residuals were closed later the same day; only one remains.** Valid Algolia runtime inputs were missing at audit time and were **resolved 2026-07-30 by the credential repoint**. The Playwright HTML reporter not returning was **fixed at `53391b794` (2026-07-30 11:57), after the audit was measured** — Playwright resolves the reporter's `open` as `PLAYWRIGHT_HTML_OPEN || options.open || 'on-failure'`, so a red run on a TTY served the report and blocked forever; `engine/dashboard/playwright.config.ts` now pins `open: 'never'` and `playwright.config.test.ts` pins that setting with a regression test. The remaining open residual is the inconclusive run-2 Vite/webserver startup failure. **The re-proof has not been run**, so the numbers above stand as the last measured result even though two of their causes are gone.
+
+The prior all-green claim at `aa7dd7db61d7e274cdf946ac6dd7d7435c4dcdf4` (2026-03-26, all 14 wrapper sections, exit 0) is retained as superseded historical evidence. It is four months and 77+ lane merges behind current source and must not be read as present-tense status.
 Coverage includes smoke and full-browser flows across index creation, search, faceting, settings, analytics, dictionaries, security sources, API keys, and migration.
 
 Coverage hardened by three MAR18 workstreams (merged 2026-03-18):
@@ -340,22 +352,18 @@ Coverage hardened by three MAR18 workstreams (merged 2026-03-18):
 
 Quality standards: zero ESLint violations, zero CSS class selectors, zero sleeps, zero conditional assertions, content verification (not just visibility), deterministic seed data with cleanup.
 
-### Tour Video Walkthroughs (Playtour)
+### Tour Video Walkthroughs (Playtour) — removed 2026-07-30
 
-MP4 video walkthroughs proving each dashboard feature works end-to-end. Each video = living documentation + regression detection.
-Tour phases document infrastructure setup, CRUD workflows, intelligence features, system/developer workflows, and edge-case coverage. The backend-wiring audit confirmed route handlers were connected end-to-end for the audited pages.
+The `engine/dashboard/tour/` video-walkthrough system has been deleted. It recorded MP4
+walkthroughs of each dashboard feature using an external tool, `playtour`, loaded from a
+fixed local path outside this repository. That path no longer exists, so the system had been
+unrunnable since it was last touched on 2026-04-14 and could not be revived here.
 
-| Phase | Status | Specs |
-|---|---|---|
-| 0 — Infrastructure | 8/8 done | Seed data, helpers, config, constants, multi-spec runner verified |
-| 1 — Core Search | 6/6 done | 01-overview, 02-search-basic, 03-search-facets, 04-search-synonyms, 05-search-vector-hybrid, 06-chat-rag |
-| 2 — Data Management | 5/5 done | 07-documents-crud, 08-settings, 09-synonyms-crud, 10-rules-crud, 11-merchandising |
-| 3 — Intelligence | 5/5 done | 12-analytics, 13-query-suggestions, 14-experiments, 15-personalization, 16-recommendations |
-| 4 — Developer & System | 5/5 done | 17-api-keys, 18-system-health, 19-dictionaries, 20-security-sources, 21-api-logs-events |
-| 5 — Edge Cases | 3/3 done | 22-edge-cases, 23-navigation-ux, 24-migrate |
-| 6 — Review & Polish | 4/4 done | Watched videos, filed UX issues, re-recorded `18-system-health.mp4`, created `TOUR_INDEX.md`. |
+Its one live dependency, the shared product fixture, moved to
+`engine/loadtest/product-seed-data.mjs`, which is where its remaining consumers are.
 
-**2026-03-30 refresh:** `05-search-vector-hybrid.spec.ts` and `06-chat-rag.spec.ts` now have archived MP4 artifacts, closing the former vector/chat tour gap.
+End-to-end proof of dashboard behaviour now comes solely from the Playwright e2e-ui suite
+above, which runs unattended and is green.
 
 ### Load & Stress Testing (k6)
 
@@ -426,7 +434,7 @@ Required for sleeping well at night when enterprise customers run production wor
 | PR-6 | Deep health check | ✅ Done (2026-03-21) | `/health/ready` ships as an operational readiness probe (`engine/flapjack-http/src/handlers/readiness.rs`) with canonical 503 failure envelope and 200 on healthy/empty-node states. Bug fixed 2026-03-23: `_usage/` excluded from tenant probing in `tenant_dirs.rs`. Future depth additions (S3 accessibility, replication connectivity, index-file readability) tracked separately if needed. |
 | PR-7 | Latency histograms + performance baseline | ✅ Done (2026-03-21) | Stage 3 shipped request-latency histogram instrumentation (`engine/flapjack-http/src/latency_middleware.rs`) and `/metrics` exposition integration (`engine/flapjack-http/src/handlers/metrics.rs`). Stage 4 published the benchmark baseline in [`engine/loadtest/BENCHMARKS.md`](../loadtest/BENCHMARKS.md); `engine/loadtest/run.sh` exits with code 99 only for threshold breaches while completing all scenarios. Benchmark figures remain owned by `BENCHMARKS.md`. |
 | PR-8 | Error recovery + data durability | ✅ Done (2026-03-21) | Delivered targeted integration tests: (a) crash-during-indexing → restart → zero data loss (`crash_durability_test.rs`), (b) restart-during-active-writes → acknowledged writes survive (`restart_during_writes_test.rs`), (c) replication peer catch-up reconnection, (d) S3 backup/restore round-trip, (e) multi-tenant isolation under adversarial load (`test_tenant_isolation.rs`). 2h soak artifacts prove bounded latency and exact post-restart count preservation. |
-| PR-10 | Chaos / resilience testing | 🟡 Folded into PR-8 (2026-03-21) | Originally planned as a distinct fault-injection harness with `engine/scripts/chaos_test.sh` + `engine/tests/test_resilience_isolation.rs`. Neither file was created; the resilience surface is in practice covered by PR-8's targeted integration tests (`crash_durability_test.rs`, `restart_during_writes_test.rs`, replication catch-up, S3 round-trip, `test_tenant_isolation.rs`) plus the private 2h HA soak harness evidence. A standalone adversarial chaos suite (kill server mid-write, fill disk mid-write, partition replica from primary, OOM-kill and restart) remains a post-launch hardening item — not currently a release blocker, but worth re-opening for enterprise-tier customers. |
+| PR-10 | Chaos / resilience testing | 🟡 Partially covered — 1 mode open (2026-08-01) | **Narrowed 2026-08-01:** the originally planned `engine/scripts/chaos_test.sh` + `engine/tests/test_resilience_isolation.rs` were never created and remain the one still-open mode. Of the four named adversarial modes: **kill-server-mid-write is covered** by `crash_durability_test.rs`, `restart_during_writes_test.rs`, and `idempotency_restart_durability_test.rs`. **fill-disk-mid-write now has a bounded Darwin APFS probe and an automated acceptance contract** — `engine/_dev/s/manual-tests/20260730_disk_exhaustion_durability.sh` (bounded 32 MiB attached image, evidence-before-teardown, exact-PID interrupt handling) and `engine/loadtest/tests/disk_exhaustion_acceptance.sh` (sole automated evidence consumer) — but the mode remains **product-gap-routed, not closed**: retained specimens prove no panic and a sanitized HTTP 500 rejection, yet a rejected batch replays into the index on restart (76 acknowledged vs 80 recovered, extras `disk-020-00`..`disk-020-03`, reproduced 5/5), and the post-restart write property is unproven. Closing it requires fixing the write-queue durable-admission / commit-finalization defect in `engine/src/index/write_queue/{admission.rs,finalization.rs,mod.rs}` — tracked as `ROADMAP.md` row `DUR-1` — and then three sequential final-HEAD specimens passing `disk_exhaustion_acceptance.sh`. **partition-replica-from-primary is now covered** by an asserted replica-partition-healing contract: `engine/examples/ha-cluster/test_ha_partition.sh` drives isolate→acknowledged-write→heal→exact-set convergence with acknowledged-union and no-ack oracles. **OOM-kill-and-restart is now covered**: `engine/examples/ha-cluster/test_oom_kill_durability.sh` forces a Docker `State.OOMKilled=true` kill mid-write and asserts acknowledged-write recovery equals the acknowledged oracle with zero rejected-batch replay; `engine/loadtest/scenarios/memory-pressure.js` still only observes memory-pressure middleware and is not the OOM oracle. Both scenarios are held by the standing acceptance contract `engine/loadtest/tests/chaos_residual_modes_acceptance.sh`, whose fail-capability is proven by `engine/loadtest/tests/chaos_residual_modes_acceptance_selftest.sh` driving each scenario's own negative control (`FLAPJACK_OOM_NEGATIVE_EMPTY_RESTART=1`, `FLAPJACK_PARTITION_SKIP_HEAL=1`) red. Evidence receipts: [`4_EVIDENCE/2026_07_30_jul30_12am_5_disk_exhaustion_receipt.md`](4_EVIDENCE/2026_07_30_jul30_12am_5_disk_exhaustion_receipt.md), [`4_EVIDENCE/2026_07_31_jul31_5pm_1_chaos_residual_modes_receipt.md`](4_EVIDENCE/2026_07_31_jul31_5pm_1_chaos_residual_modes_receipt.md). |
 
 ### Post-Launch Work
 

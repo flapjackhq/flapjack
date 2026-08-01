@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { baseProducts, seedSettings } from "../dashboard/tour/product-seed-data.mjs";
+import { baseProducts, seedSettings } from "./product-seed-data.mjs";
 import { summarizeBatchLatencies } from "./import_benchmark.mjs";
 
 export const QUERY_TYPES = Object.freeze([

@@ -229,7 +229,7 @@ main() {
   load_dashboard_seed_settings "$SCRIPT_DIR"
 
   local index_name="$FLAPJACK_BENCHMARK_INDEX"
-  local settings_source="engine/dashboard/tour/product-seed-data.mjs::seedSettings"
+  local settings_source="engine/loadtest/product-seed-data.mjs::seedSettings"
 
   discover_benchmark_batches
 

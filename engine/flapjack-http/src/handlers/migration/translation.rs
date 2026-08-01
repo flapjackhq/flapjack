@@ -1,5 +1,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
+#[path = "meilisearch_settings.rs"]
+mod meilisearch_settings;
 #[path = "translation_bundle.rs"]
 mod translation_bundle;
 #[path = "translation_report.rs"]
@@ -9,25 +11,26 @@ mod translation_schema;
 #[path = "translation_session.rs"]
 mod translation_session;
 
-pub(super) use self::translation_bundle::ReplicaSettingsTranslation;
 use self::translation_bundle::TypedTranslationFailure;
-use self::translation_report::{hard_entry, warning_entry, ReportCode, ReportResource};
+pub(super) use self::translation_bundle::{
+    translate_settings_for_provider, ReplicaSettingsTranslation, SettingsSourceProvider,
+};
+use self::translation_report::{hard_entry, warning_entry};
 pub(super) use self::translation_report::{
-    warning_message, TranslationReport, TranslationReportEntry,
+    warning_message, ReportCode, ReportResource, ReportSeverity, TranslationReport,
+    TranslationReportEntry, TranslationReportSummary,
 };
 #[cfg(test)]
 pub(super) use self::translation_session::translate_spool_input;
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(super) use self::translation_session::{
     translate_accepted_spool_payload, translate_accepted_spool_settings, translate_spool_payload,
-    SettingsTranslationOutcome, SpoolTranslationInput, TranslatedSpoolPayload, TranslationOutcome,
-    TranslationSessionInstrumentation, TranslationStreamError,
+    translate_spool_report, SettingsTranslationOutcome, SpoolTranslationInput,
+    TranslatedSpoolPayload, TranslationOutcome, TranslationSessionInstrumentation,
+    TranslationStreamError,
 };
 use crate::handlers::settings::payload_merge::parse_distinct_value_strict;
 use serde_json::Value;
-
-#[cfg(test)]
-use self::translation_report::ReportSeverity;
 
 const FIELD_PRECEDENCE: u16 = 10;
 const SCHEMA_PRECEDENCE: u16 = 20;
@@ -660,7 +663,7 @@ fn resolve_matching_row(
 // Algolia standard and virtual replicas both migrate as Flapjack virtual replicas.
 // Flapjack sorts at query time, so a physical replica would duplicate the corpus without benefit.
 static STAGE1_MATRIX: &[CompatibilityRow] = &[
-    exact_settings("attributesForFaceting"),
+    persisted_no_behavior_setting("attributesForFaceting"),
     exact_settings("searchableAttributes"),
     transformed_settings("attributesToIndex"),
     exact_settings("ranking"),
@@ -771,4 +774,4 @@ static STAGE1_MATRIX: &[CompatibilityRow] = &[
 
 #[cfg(test)]
 #[path = "translation_tests.rs"]
-mod tests;
+pub(super) mod tests;

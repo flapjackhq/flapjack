@@ -10,8 +10,8 @@ use super::{
     },
     migrate_from_algolia_with_test_source_factory,
     migrate_from_algolia_with_test_source_factory_and_hooks, AsyncMigrationStatusResponse,
-    MigrateFromAlgoliaRequest, MigrateFromAlgoliaResponse, MIGRATION_HA_UNSUPPORTED_CODE,
-    MIGRATION_HA_UNSUPPORTED_MESSAGE,
+    MigrateFromAlgoliaRequest, MigrateFromAlgoliaResponse, TestMigrationSourceReaderFactory,
+    MIGRATION_HA_UNSUPPORTED_CODE, MIGRATION_HA_UNSUPPORTED_MESSAGE,
 };
 use crate::auth::{ApiKey, AuthenticatedAppId, KeyStore, PRIVATE_MIGRATION_ACL};
 use crate::handlers::indices::list_indices;
@@ -27,7 +27,7 @@ use crate::handlers::migration::source_test_support::{
 use crate::handlers::migration::spool::AsyncMigrationPublicationSemantic;
 use crate::handlers::migration::spool::{
     MigrationCancelRequest, MigrationDisposition, MigrationExportProgress, MigrationPhase,
-    MigrationPhaseRecord, SpoolErrorKind, SpoolLimits, SpoolStore,
+    MigrationPhaseRecord, ResourceDenominators, SpoolErrorKind, SpoolLimits, SpoolStore,
 };
 use crate::handlers::rules::get_rule;
 use crate::handlers::synonyms::get_synonym;
@@ -56,7 +56,7 @@ use flapjack_replication::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     path::Path,
     sync::{
@@ -1084,6 +1084,462 @@ fn duplicate_document_pages() -> Vec<Vec<serde_json::Value>> {
     ]
 }
 
+fn resume_expected_target_ids() -> HashSet<String> {
+    HashSet::from([
+        "resume-object-001".to_string(),
+        "resume-object-002".to_string(),
+        "resume-object-003".to_string(),
+        "resume-object-004".to_string(),
+        "resume-object-005".to_string(),
+        "resume-object-006".to_string(),
+    ])
+}
+
+fn resume_initial_completed_ids() -> HashSet<String> {
+    HashSet::from([
+        "resume-object-001".to_string(),
+        "resume-object-004".to_string(),
+    ])
+}
+
+fn resume_document(object_id: &str) -> serde_json::Value {
+    json!({
+        "objectID": object_id,
+        "title": format!("Resume fixture {object_id}"),
+        "category": "resume"
+    })
+}
+
+struct ResumeContractCounters {
+    traversal_starts: AtomicUsize,
+    second_traversal_pages_served: AtomicUsize,
+}
+
+impl ResumeContractCounters {
+    fn new() -> Self {
+        Self {
+            traversal_starts: AtomicUsize::new(0),
+            second_traversal_pages_served: AtomicUsize::new(0),
+        }
+    }
+}
+
+fn interrupted_resume_source_reader(starts: Arc<AtomicUsize>) -> ScriptedSourceReader {
+    starts.fetch_add(1, Ordering::SeqCst);
+    interrupted_resume_source_reader_script()
+}
+
+fn interrupted_resume_source_reader_with_counters(
+    counters: Arc<ResumeContractCounters>,
+) -> ScriptedSourceReader {
+    counters.traversal_starts.fetch_add(1, Ordering::SeqCst);
+    interrupted_resume_source_reader_script()
+}
+
+fn interrupted_resume_source_reader_script() -> ScriptedSourceReader {
+    let mut reader = ScriptedSourceReader::new(SOURCE_APP_ID, SOURCE_INDEX);
+    let source_record = AlgoliaIndexRecord {
+        name: SOURCE_INDEX.to_string(),
+        entries: 6,
+        updated_at: "2026-07-30T00:00:00Z".to_string(),
+        pending_task: false,
+    };
+    let settings = json!({
+        "searchableAttributes": ["title"],
+        "attributesForFaceting": ["category"]
+    });
+    reader.push_quiescent(source_record);
+    reader.push_pass(
+        settings.clone(),
+        vec![vec![
+            resume_document("resume-object-001"),
+            resume_document("resume-object-002"),
+            resume_document("resume-object-003"),
+            resume_document("resume-object-004"),
+            resume_document("resume-object-005"),
+            resume_document("resume-object-006"),
+        ]],
+        vec![],
+        vec![],
+    );
+    reader.push_document_pass_failing_after_page(
+        settings,
+        vec![
+            vec![
+                resume_document("resume-object-001"),
+                resume_document("resume-object-004"),
+            ],
+            vec![
+                resume_document("resume-object-003"),
+                resume_document("resume-object-002"),
+            ],
+        ],
+        1,
+        AlgoliaClientError::new(
+            AlgoliaErrorKind::Transport,
+            "resume contract transient transport failure after committed page",
+        ),
+    );
+    reader
+}
+
+struct ResumedResumeSourceReader {
+    source_records: VecDeque<AlgoliaIndexRecord>,
+    settings_passes: VecDeque<serde_json::Value>,
+    document_passes: VecDeque<Vec<Vec<serde_json::Value>>>,
+    counters: Arc<ResumeContractCounters>,
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    quiescence_checks: usize,
+    document_traversals: usize,
+}
+
+impl ResumedResumeSourceReader {
+    fn new(
+        counters: Arc<ResumeContractCounters>,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    ) -> Self {
+        counters.traversal_starts.fetch_add(1, Ordering::SeqCst);
+        let source_record = AlgoliaIndexRecord {
+            name: SOURCE_INDEX.to_string(),
+            entries: 6,
+            updated_at: "2026-07-30T00:00:00Z".to_string(),
+            pending_task: false,
+        };
+        let settings = json!({
+            "searchableAttributes": ["title"],
+            "attributesForFaceting": ["category"]
+        });
+        let shifted_pages = vec![
+            vec![
+                resume_document("resume-object-003"),
+                resume_document("resume-object-001"),
+            ],
+            vec![
+                resume_document("resume-object-006"),
+                resume_document("resume-object-002"),
+            ],
+            vec![
+                resume_document("resume-object-004"),
+                resume_document("resume-object-005"),
+            ],
+        ];
+        Self {
+            source_records: VecDeque::from([source_record.clone(), source_record]),
+            settings_passes: VecDeque::from([settings.clone(), settings]),
+            document_passes: VecDeque::from([shifted_pages.clone(), shifted_pages]),
+            counters,
+            started,
+            release,
+            quiescence_checks: 0,
+            document_traversals: 0,
+        }
+    }
+}
+
+impl MigrationSourceReader for ResumedResumeSourceReader {
+    fn app_id(&self) -> &str {
+        SOURCE_APP_ID
+    }
+
+    fn source_name(&self) -> &str {
+        SOURCE_INDEX
+    }
+
+    fn wait_for_quiescent_source(&mut self) -> SourceFuture<'_, AlgoliaIndexRecord> {
+        Box::pin(async move {
+            self.quiescence_checks += 1;
+            if self.quiescence_checks == 2 {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            self.source_records.pop_front().ok_or_else(|| {
+                AlgoliaClientError::new(
+                    AlgoliaErrorKind::Progress,
+                    "resume source quiescent record already consumed",
+                )
+            })
+        })
+    }
+
+    fn read_settings(&mut self) -> SourceFuture<'_, serde_json::Value> {
+        Box::pin(async move {
+            self.settings_passes.pop_front().ok_or_else(|| {
+                AlgoliaClientError::new(
+                    AlgoliaErrorKind::Progress,
+                    "resume source settings already consumed",
+                )
+            })
+        })
+    }
+
+    fn read_index_settings<'a>(
+        &'a mut self,
+        _index_name: &'a str,
+    ) -> SourceFuture<'a, serde_json::Value> {
+        Box::pin(async {
+            Err(AlgoliaClientError::new(
+                AlgoliaErrorKind::Progress,
+                "resume source fixture should not read replica settings",
+            ))
+        })
+    }
+
+    fn require_unretrievable_access<'a>(
+        &'a mut self,
+        _settings: &'a serde_json::Value,
+    ) -> SourceFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn read_documents<'a>(
+        &'a mut self,
+        consume_page: &'a mut PageConsumer<'a>,
+    ) -> SourceFuture<'a, ()> {
+        Box::pin(async move {
+            self.document_traversals += 1;
+            let pages = self.document_passes.pop_front().ok_or_else(|| {
+                AlgoliaClientError::new(
+                    AlgoliaErrorKind::Progress,
+                    "resume source document pages already consumed",
+                )
+            })?;
+            for page in pages {
+                if self.document_traversals == 2 {
+                    self.counters
+                        .second_traversal_pages_served
+                        .fetch_add(1, Ordering::SeqCst);
+                }
+                consume_page(page)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn read_rules<'a>(
+        &'a mut self,
+        _consume_page: &'a mut PageConsumer<'a>,
+    ) -> SourceFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn read_synonyms<'a>(
+        &'a mut self,
+        _consume_page: &'a mut PageConsumer<'a>,
+    ) -> SourceFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+async fn post_resume_request(
+    app: &axum::Router,
+    api_key: &str,
+    job_uuid: uuid::Uuid,
+    payload: serde_json::Value,
+) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/1/migrations/algolia/{job_uuid}/resume"))
+                .header("content-type", "application/json")
+                .header("x-algolia-application-id", ASYNC_REPLACE_OWNER_APP_ID)
+                .header("x-algolia-api-key", api_key)
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn resume_not_available_body(
+    response: axum::response::Response,
+    job_uuid: uuid::Uuid,
+    case_name: &str,
+) -> serde_json::Value {
+    assert_eq!(
+        response.status(),
+        StatusCode::CONFLICT,
+        "{case_name} must return the owner-safe resume refusal"
+    );
+    let body = body_json(response).await;
+    assert_eq!(
+        body.get("status"),
+        Some(&json!(StatusCode::CONFLICT.as_u16())),
+        "{case_name} must serialize the HTTP status in the structured error"
+    );
+    assert_eq!(
+        body.get("code"),
+        Some(&json!("migration_resume_not_available")),
+        "{case_name} must return the stable resume refusal code"
+    );
+    assert!(
+        body.get("message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| !message.is_empty()),
+        "{case_name} must return a non-empty safe message"
+    );
+    assert_eq!(
+        body.as_object()
+            .expect("resume refusal must be a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect::<HashSet<_>>(),
+        HashSet::from(["code", "message", "status"]),
+        "{case_name} must not expose job metadata in extra response fields"
+    );
+    let serialized = body.to_string();
+    for secret_or_identifier in [
+        job_uuid.to_string(),
+        "fresh-resume-key".to_string(),
+        SOURCE_APP_ID.to_string(),
+        SOURCE_INDEX.to_string(),
+        TARGET_INDEX.to_string(),
+    ] {
+        assert!(
+            !serialized.contains(&secret_or_identifier),
+            "{case_name} must not expose credentials or source/job identity"
+        );
+    }
+    body
+}
+
+fn resume_contract_router(
+    tmp: &TempDir,
+    state: Arc<crate::handlers::AppState>,
+    key_store: Arc<KeyStore>,
+    counters: Arc<ResumeContractCounters>,
+    resume_started: Arc<Notify>,
+    resume_release: Arc<Notify>,
+) -> axum::Router {
+    privacy_scrub_test_router(tmp, state, key_store).layer(Extension(
+        TestMigrationSourceReaderFactory::new(move |source_provider| {
+            assert_eq!(
+                source_provider,
+                super::AsyncMigrationSourceProvider::Algolia,
+                "resume contract must use the Algolia provider route"
+            );
+            Ok(Box::new(ResumedResumeSourceReader::new(
+                Arc::clone(&counters),
+                Arc::clone(&resume_started),
+                Arc::clone(&resume_release),
+            )) as Box<dyn MigrationSourceReader + Send>)
+        }),
+    ))
+}
+
+fn resume_owner_identity_for_admin_key() -> String {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-algolia-api-key", HeaderValue::from_static("admin-key"));
+    authenticated_owner_identity(ASYNC_REPLACE_OWNER_APP_ID.to_string(), &headers)
+}
+
+fn resume_refusal_denominators() -> ResourceDenominators {
+    ResourceDenominators {
+        settings: 1,
+        documents: 0,
+        rules: 0,
+        synonyms: 0,
+        config: 0,
+    }
+}
+
+fn seed_resume_refusal_job(
+    state: &Arc<crate::handlers::AppState>,
+    owner_identity: &str,
+    case_name: &str,
+    lifecycle: &str,
+) -> uuid::Uuid {
+    let spool = SpoolStore::new(&state.manager.base_path, SpoolLimits::default()).unwrap();
+    let job_uuid = uuid::Uuid::new_v4();
+    spool
+        .create_async_migration_admission_for_owner(
+            job_uuid,
+            TARGET_INDEX,
+            Some(owner_identity),
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
+        .unwrap();
+    let source_digest = hex::encode(Sha256::digest(format!("resume-refusal-{case_name}")));
+    let view = spool
+        .create_export(job_uuid, &source_digest, resume_refusal_denominators())
+        .unwrap();
+    spool
+        .commit_settings_once(view.job_uuid, b"{}", &hex::encode(Sha256::digest(b"{}")))
+        .unwrap();
+    spool
+        .complete_documents(view.job_uuid, 0, &hex::encode(Sha256::digest(b"documents")))
+        .unwrap();
+    spool
+        .complete_rules(view.job_uuid, 0, &hex::encode(Sha256::digest(b"rules")))
+        .unwrap();
+    spool
+        .complete_synonyms(view.job_uuid, 0, &hex::encode(Sha256::digest(b"synonyms")))
+        .unwrap();
+
+    match lifecycle {
+        "Running" => {
+            spool
+                .transition_migration_phase(job_uuid, MigrationPhase::Exporting)
+                .unwrap();
+        }
+        "Accepted" => spool.accept_export(job_uuid).unwrap(),
+        "Failed" => spool.fail_export(job_uuid).unwrap(),
+        "Deleted" => {
+            assert!(spool
+                .delete_export_artifacts(job_uuid, &source_digest)
+                .unwrap());
+        }
+        "Deleting" => set_resume_refusal_manifest_lifecycle(&spool, job_uuid, "Deleting"),
+        other => panic!("unknown resume refusal lifecycle fixture {other}"),
+    }
+    job_uuid
+}
+
+fn set_resume_refusal_manifest_lifecycle(
+    spool: &SpoolStore,
+    job_uuid: uuid::Uuid,
+    lifecycle: &str,
+) {
+    let manifest_path = spool.job_dir(job_uuid).join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["lifecycle"] = json!(lifecycle);
+    fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+}
+
+async fn resume_status_json_for_owner(
+    state: &Arc<crate::handlers::AppState>,
+    owner_identity: &str,
+    job_uuid: uuid::Uuid,
+) -> serde_json::Value {
+    let status = super::get_source_migration_status(
+        Arc::clone(state),
+        owner_identity.to_string(),
+        job_uuid.to_string(),
+        Some(super::AsyncMigrationSourceProvider::Algolia),
+    )
+    .await
+    .expect("fixture owner should be able to read migration status");
+    serde_json::to_value(status.0).expect("migration status should serialize")
+}
+
+fn assert_resume_projection_absent(case_name: &str, status_json: &serde_json::Value) {
+    for forbidden_key in [
+        "resumeHandle",
+        "checkpointHandle",
+        "resume",
+        "resumable",
+        "operation",
+    ] {
+        assert!(
+            status_json.get(forbidden_key).is_none(),
+            "{case_name} status must omit {forbidden_key}, not serialize null"
+        );
+    }
+}
+
 fn async_replace_source_reader(
     documents: [(&'static str, &'static str, &'static str, &'static str); 3],
 ) -> ScriptedSourceReader {
@@ -2032,8 +2488,8 @@ async fn migrate_phase_observed_during_staging_keeps_export_progress_nonterminal
     assert_eq!(
         observed.export_progress,
         Some(MigrationExportProgress {
-            completed: 3,
-            total: 3,
+            completed: 2,
+            total: 2,
         })
     );
 }
@@ -2345,8 +2801,8 @@ async fn migrate_success_records_terminal_success_after_artifact_deletion() {
     assert_eq!(
         phase.export_progress,
         Some(MigrationExportProgress {
-            completed: 3,
-            total: 3
+            completed: 2,
+            total: 2
         })
     );
 }
@@ -3191,6 +3647,570 @@ async fn migrate_mid_document_export_failure_fails_job_without_activating_target
     assert_spool_lifecycle_with_artifacts(&state, "Failed");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_migration_resume_after_committed_page_has_exact_target_id_set() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).with_analytics().build_shared();
+    let counters = Arc::new(ResumeContractCounters::new());
+    let counters_for_first_reader = Arc::clone(&counters);
+    let resume_started = Arc::new(Notify::new());
+    let resume_release = Arc::new(Notify::new());
+    let expected_target_ids = resume_expected_target_ids();
+
+    let job_uuid = state
+        .migration_runner
+        .submit_algolia_import(valid_request(), move |_| {
+            Ok(interrupted_resume_source_reader_with_counters(Arc::clone(
+                &counters_for_first_reader,
+            )))
+        })
+        .await
+        .expect("async source import should be admitted before source interruption")
+        .0;
+    wait_for_resume_interruption(&state, job_uuid).await;
+    let interrupted_phase = read_migration_phase_at(&state.manager.base_path, job_uuid);
+    assert_eq!(
+        interrupted_phase.disposition,
+        MigrationDisposition::Running,
+        "allowlisted transient source errors must commit Running -> Interrupted instead of terminal Failed"
+    );
+
+    let spool = SpoolStore::new(&state.manager.base_path, SpoolLimits::default()).unwrap();
+    let (_, checkpoint_handle) = spool
+        .handles(job_uuid)
+        .expect("interrupted export must retain public and checkpoint handles");
+    let wrong_source_digest = hex::encode(Sha256::digest(b"unused"));
+    let checkpoint = spool
+        .checkpoint(&checkpoint_handle, &wrong_source_digest)
+        .unwrap_err();
+    assert_eq!(
+        checkpoint.kind(),
+        SpoolErrorKind::SourceIdentityMismatch,
+        "checkpoint lookup must still be protected by source identity before resume"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&spool.manifest_json(job_uuid).unwrap()).unwrap();
+    assert_eq!(
+        manifest["lifecycle"],
+        json!("Interrupted"),
+        "allowlisted transient source errors must commit Running -> Interrupted instead of terminal Failed"
+    );
+    assert_eq!(
+        spool
+            .completed_document_ids(job_uuid)
+            .unwrap()
+            .into_iter()
+            .collect::<HashSet<_>>(),
+        resume_initial_completed_ids(),
+        "first traversal must durably commit the exact page-boundary document IDs before interruption"
+    );
+
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let app = resume_contract_router(
+        &tmp,
+        Arc::clone(&state),
+        key_store,
+        Arc::clone(&counters),
+        Arc::clone(&resume_started),
+        Arc::clone(&resume_release),
+    );
+    let first_resume_app = app.clone();
+    let first_resume = tokio::spawn(async move {
+        post_resume_request(
+            &first_resume_app,
+            "admin-key",
+            job_uuid,
+            json!({
+                "appId": SOURCE_APP_ID,
+                "apiKey": "fresh-resume-key",
+                "sourceIndex": SOURCE_INDEX
+            }),
+        )
+        .await
+    });
+    let resume_response = tokio::time::timeout(Duration::from_secs(5), first_resume)
+        .await
+        .expect("resume claim response must not wait for the resumed traversal to finish")
+        .expect("resume claim task must not panic");
+    assert_eq!(
+        resume_response.status(),
+        StatusCode::ACCEPTED,
+        "resume route must claim the same interrupted job before rerunning traversal"
+    );
+    tokio::time::timeout(Duration::from_secs(5), resume_started.notified())
+        .await
+        .expect("resumed traversal must start before the duplicate claim probe");
+    let claimed_phase = read_migration_phase_at(&state.manager.base_path, job_uuid);
+    assert_eq!(claimed_phase.job_uuid, job_uuid);
+    assert_eq!(
+        claimed_phase.disposition,
+        MigrationDisposition::Running,
+        "resume claim must reopen the same job as Running rather than replacing it"
+    );
+    assert!(
+        claimed_phase.terminal_at.is_none(),
+        "claimed resume job must be nonterminal while traversal two is running"
+    );
+
+    let loser = post_resume_request(
+        &app,
+        "admin-key",
+        job_uuid,
+        json!({
+            "appId": SOURCE_APP_ID,
+            "apiKey": "fresh-resume-key",
+            "sourceIndex": SOURCE_INDEX
+        }),
+    )
+    .await;
+    assert_eq!(
+        loser.status(),
+        StatusCode::CONFLICT,
+        "a simultaneous resume loser must not claim a job already reopened by the winner"
+    );
+    assert_eq!(
+        body_json(loser).await["code"],
+        json!("migration_resume_claim_conflict")
+    );
+
+    resume_release.notify_waiters();
+    wait_for_terminal_phase(&state, job_uuid, MigrationDisposition::Succeeded).await;
+    wait_for_active_count(&state, 0).await;
+    let target = state.manager.get_or_load(TARGET_INDEX).unwrap();
+    assert_eq!(
+        target.reader().searcher().num_docs(),
+        expected_target_ids.len() as u64,
+        "resumed target must contain no documents beyond the literal expected ID set"
+    );
+    let actual_ids = expected_target_ids
+        .iter()
+        .map(|object_id| {
+            state
+                .manager
+                .get_document(TARGET_INDEX, object_id)
+                .unwrap_or_else(|error| panic!("failed to read {object_id}: {error}"))
+                .unwrap_or_else(|| panic!("resumed target must contain {object_id}"))
+                .id
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(actual_ids, expected_target_ids);
+    assert_eq!(counters.traversal_starts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        counters
+            .second_traversal_pages_served
+            .load(Ordering::SeqCst),
+        3,
+        "traversal two must serve the three shifted resume pages"
+    );
+
+    let owner_identity = resume_owner_identity_for_admin_key();
+    for (case_name, lifecycle) in [
+        ("running", "Running"),
+        ("accepted", "Accepted"),
+        ("failed", "Failed"),
+        ("deleting", "Deleting"),
+        ("deleted", "Deleted"),
+    ] {
+        let refusal_job_uuid =
+            seed_resume_refusal_job(&state, &owner_identity, case_name, lifecycle);
+        let before_refusal = directory_snapshot(&state.manager.base_path);
+        let refusal = post_resume_request(
+            &app,
+            "admin-key",
+            refusal_job_uuid,
+            json!({
+                "appId": SOURCE_APP_ID,
+                "apiKey": "fresh-resume-key",
+                "sourceIndex": SOURCE_INDEX
+            }),
+        )
+        .await;
+        resume_not_available_body(refusal, refusal_job_uuid, lifecycle).await;
+        assert_eq!(
+            directory_snapshot(&state.manager.base_path),
+            before_refusal,
+            "{lifecycle} resume refusal must not mutate manifest, artifacts, sidecars, counters, or lifecycle"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_resume_claim_conflict_loser_returns_stable_code() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).with_analytics().build_shared();
+    let counters = Arc::new(ResumeContractCounters::new());
+    let counters_for_first_reader = Arc::clone(&counters);
+    let resume_started = Arc::new(Notify::new());
+    let resume_release = Arc::new(Notify::new());
+
+    let job_uuid = state
+        .migration_runner
+        .submit_algolia_import(valid_request(), move |_| {
+            Ok(interrupted_resume_source_reader_with_counters(Arc::clone(
+                &counters_for_first_reader,
+            )))
+        })
+        .await
+        .expect("async source import should be admitted before source interruption")
+        .0;
+    wait_for_resume_interruption(&state, job_uuid).await;
+
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let app = resume_contract_router(
+        &tmp,
+        Arc::clone(&state),
+        key_store,
+        Arc::clone(&counters),
+        Arc::clone(&resume_started),
+        Arc::clone(&resume_release),
+    );
+    let first_resume_app = app.clone();
+    let first_resume = tokio::spawn(async move {
+        post_resume_request(
+            &first_resume_app,
+            "admin-key",
+            job_uuid,
+            json!({
+                "appId": SOURCE_APP_ID,
+                "apiKey": "fresh-resume-key",
+                "sourceIndex": SOURCE_INDEX
+            }),
+        )
+        .await
+    });
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), first_resume)
+            .await
+            .expect("resume claim response must not wait for traversal completion")
+            .expect("resume claim task must not panic")
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    tokio::time::timeout(Duration::from_secs(5), resume_started.notified())
+        .await
+        .expect("resumed traversal must start before duplicate claim");
+
+    let loser = post_resume_request(
+        &app,
+        "admin-key",
+        job_uuid,
+        json!({
+            "appId": SOURCE_APP_ID,
+            "apiKey": "fresh-resume-key",
+            "sourceIndex": SOURCE_INDEX
+        }),
+    )
+    .await;
+    assert_eq!(loser.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(loser).await["code"],
+        json!("migration_resume_claim_conflict")
+    );
+
+    resume_release.notify_waiters();
+    wait_for_terminal_phase(&state, job_uuid, MigrationDisposition::Succeeded).await;
+    wait_for_active_count(&state, 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_resume_invalid_fresh_credentials_preserve_interrupted_job() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).with_analytics().build_shared();
+    let traversal_starts = Arc::new(AtomicUsize::new(0));
+    let starts_for_reader = Arc::clone(&traversal_starts);
+    let job_uuid = state
+        .migration_runner
+        .submit_algolia_import(valid_request(), move |_| {
+            Ok(interrupted_resume_source_reader(Arc::clone(
+                &starts_for_reader,
+            )))
+        })
+        .await
+        .expect("async source import should be admitted before source interruption")
+        .0;
+    wait_for_resume_interruption(&state, job_uuid).await;
+    wait_for_active_count(&state, 0).await;
+
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let app = privacy_scrub_test_router(&tmp, Arc::clone(&state), key_store);
+    let before_refusal = directory_snapshot(&state.manager.base_path);
+    let response = post_resume_request(
+        &app,
+        "admin-key",
+        job_uuid,
+        json!({
+            "appId": "invalid/app-id",
+            "apiKey": "invalid-fresh-resume-key",
+            "sourceIndex": SOURCE_INDEX
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(response).await,
+        json!({"message": "Algolia appId is invalid", "status": 400})
+    );
+    assert_eq!(
+        directory_snapshot(&state.manager.base_path),
+        before_refusal,
+        "credential refusal must preserve the interrupted manifest, artifacts, sidecars, counters, and lifecycle"
+    );
+    assert_eq!(traversal_starts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_migration_resume_status_is_positive_only_for_interrupted_export() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let traversal_starts = Arc::new(AtomicUsize::new(0));
+    let starts_for_reader = Arc::clone(&traversal_starts);
+    let owner_headers = async_replace_headers();
+    let owner_identity =
+        authenticated_owner_identity(ASYNC_REPLACE_OWNER_APP_ID.to_string(), &owner_headers);
+
+    let (job_uuid, _) = state
+        .migration_runner
+        .submit_algolia_import_for_owner(valid_request(), Some(owner_identity.clone()), move |_| {
+            Ok(interrupted_resume_source_reader(Arc::clone(
+                &starts_for_reader,
+            )))
+        })
+        .await
+        .expect("async import should be admitted before status projection");
+    wait_for_resume_interruption(&state, job_uuid).await;
+
+    let spool = SpoolStore::new(&state.manager.base_path, SpoolLimits::default()).unwrap();
+    let (public_handle, checkpoint_handle) = spool
+        .handles(job_uuid)
+        .expect("interrupted export must retain both opaque handles");
+    let status_json = resume_status_json_for_owner(&state, &owner_identity, job_uuid).await;
+    assert_eq!(
+        status_json["disposition"],
+        json!("running"),
+        "interrupted export remains a running workflow projection, not terminal failed"
+    );
+    assert_eq!(status_json["resumable"], json!(true));
+    assert_eq!(status_json["operation"], json!("resume"));
+    assert_eq!(
+        status_json["resumeHandle"],
+        json!(checkpoint_handle),
+        "resumeHandle must be the manifest-owned checkpoint handle"
+    );
+    assert_ne!(
+        status_json["resumeHandle"],
+        json!(public_handle),
+        "the public handle is not a substitute for the checkpoint handle"
+    );
+    assert!(
+        status_json.get("checkpointHandle").is_none() && status_json.get("resume").is_none(),
+        "the positive arm must use only the canonical resumeHandle wire name"
+    );
+    let serialized_status = status_json.to_string();
+    let serialized_manifest = spool
+        .manifest_json(job_uuid)
+        .expect("interrupted export manifest must remain readable");
+    for credential in [SOURCE_API_KEY, ASYNC_REPLACE_OWNER_API_KEY] {
+        assert!(
+            !serialized_status.contains(credential) && !serialized_manifest.contains(credential),
+            "source and owner credentials must remain request-only"
+        );
+    }
+
+    for forbidden_key in [
+        "resumeHandle",
+        "checkpointHandle",
+        "resume",
+        "resumable",
+        "operation",
+    ] {
+        let terminal =
+            serde_json::to_value(AsyncMigrationStatusResponse::from(MigrationPhaseRecord {
+                disposition: MigrationDisposition::Failed,
+                terminal_at: Some(chrono::Utc::now()),
+                ..read_migration_phase_at(&state.manager.base_path, job_uuid)
+            }))
+            .expect("terminal async status should serialize");
+        assert!(
+            terminal.get(forbidden_key).is_none(),
+            "terminal failed status must omit {forbidden_key}, not serialize null"
+        );
+    }
+
+    spool
+        .record_async_publication_transaction_if_present(
+            job_uuid,
+            PublicationTransactionId::new("resume_status_publication_evidence").unwrap(),
+        )
+        .unwrap();
+    let publication_status = resume_status_json_for_owner(&state, &owner_identity, job_uuid).await;
+    assert_resume_projection_absent("publication-evidence", &publication_status);
+
+    for (case_name, lifecycle) in [
+        ("manifest-running", "Running"),
+        ("manifest-accepted", "Accepted"),
+        ("manifest-failed", "Failed"),
+        ("manifest-deleting", "Deleting"),
+        ("manifest-deleted", "Deleted"),
+    ] {
+        let lifecycle_job = seed_resume_refusal_job(&state, &owner_identity, case_name, lifecycle);
+        let lifecycle_status =
+            resume_status_json_for_owner(&state, &owner_identity, lifecycle_job).await;
+        assert_resume_projection_absent(case_name, &lifecycle_status);
+    }
+
+    let no_manifest_job = uuid::Uuid::new_v4();
+    spool
+        .create_async_migration_admission_for_owner(
+            no_manifest_job,
+            "resume_status_without_export_manifest",
+            Some(&owner_identity),
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
+        .unwrap();
+    let no_manifest_status =
+        resume_status_json_for_owner(&state, &owner_identity, no_manifest_job).await;
+    assert_resume_projection_absent("missing-export-manifest", &no_manifest_status);
+
+    let preparing_job =
+        seed_resume_refusal_job(&state, &owner_identity, "non-export-phase", "Running");
+    spool
+        .transition_migration_phase(preparing_job, MigrationPhase::Preparing)
+        .unwrap();
+    let preparing_status =
+        resume_status_json_for_owner(&state, &owner_identity, preparing_job).await;
+    assert_resume_projection_absent("non-export-preparing-phase", &preparing_status);
+
+    for (case_name, terminal_disposition) in [
+        ("terminal-succeeded", MigrationDisposition::Succeeded),
+        ("terminal-failed", MigrationDisposition::Failed),
+        ("terminal-cancelled", MigrationDisposition::Cancelled),
+    ] {
+        let terminal_job = uuid::Uuid::new_v4();
+        spool
+            .create_async_migration_admission_for_owner(
+                terminal_job,
+                &format!("resume_status_{case_name}"),
+                Some(&owner_identity),
+                AsyncMigrationPublicationSemantic::CreateOnly,
+            )
+            .unwrap();
+        match terminal_disposition {
+            MigrationDisposition::Succeeded => {
+                for phase in [
+                    MigrationPhase::Exporting,
+                    MigrationPhase::Preparing,
+                    MigrationPhase::Staging,
+                    MigrationPhase::Activating,
+                ] {
+                    spool
+                        .transition_migration_phase(terminal_job, phase)
+                        .unwrap();
+                }
+                spool.succeed_migration(terminal_job, None).unwrap();
+            }
+            MigrationDisposition::Failed => {
+                spool.fail_migration(terminal_job).unwrap();
+            }
+            MigrationDisposition::Cancelled => {
+                spool.cancel_migration(terminal_job).unwrap();
+            }
+            MigrationDisposition::Running => unreachable!("terminal fixture must be terminal"),
+        }
+        let terminal_status =
+            resume_status_json_for_owner(&state, &owner_identity, terminal_job).await;
+        assert_resume_projection_absent(case_name, &terminal_status);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_migration_resume_reclaimed_or_absent_is_not_available() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).with_analytics().build_shared();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let app = privacy_scrub_test_router(&tmp, Arc::clone(&state), key_store);
+    let missing_job_uuid = uuid::Uuid::new_v4();
+    let before = directory_snapshot(&state.manager.base_path);
+
+    let absent = post_resume_request(
+        &app,
+        "admin-key",
+        missing_job_uuid,
+        json!({
+            "appId": SOURCE_APP_ID,
+            "apiKey": "fresh-resume-key",
+            "sourceIndex": SOURCE_INDEX
+        }),
+    )
+    .await;
+    let absent_body =
+        resume_not_available_body(absent, missing_job_uuid, "never-existing resume").await;
+    assert_eq!(
+        directory_snapshot(&state.manager.base_path),
+        before,
+        "absent resume refusal must not create phase, manifest, artifact, sidecar, or counter files"
+    );
+
+    let traversal_starts = Arc::new(AtomicUsize::new(0));
+    let starts_for_reader = Arc::clone(&traversal_starts);
+    let reclaimed_job_uuid = state
+        .migration_runner
+        .submit_algolia_import(valid_request(), move |_| {
+            Ok(interrupted_resume_source_reader(Arc::clone(
+                &starts_for_reader,
+            )))
+        })
+        .await
+        .expect("async import should be admitted before reclaimed-resume refusal")
+        .0;
+    wait_for_resume_interruption(&state, reclaimed_job_uuid).await;
+    let interrupted_phase = read_migration_phase_at(&state.manager.base_path, reclaimed_job_uuid);
+    assert_eq!(
+        interrupted_phase.disposition,
+        MigrationDisposition::Running,
+        "allowlisted transient source errors must commit Running -> Interrupted before GC can reclaim the job"
+    );
+    SpoolStore::new(&state.manager.base_path, SpoolLimits::default())
+        .unwrap()
+        .fail_migration(reclaimed_job_uuid)
+        .unwrap();
+    let gc = SpoolStore::new_for_tests(
+        &state.manager.base_path,
+        SpoolLimits {
+            retention_seconds: 0,
+            ..SpoolLimits::default()
+        },
+        chrono::Utc::now(),
+        100_000,
+    )
+    .unwrap();
+    gc.collect_garbage().unwrap();
+    let after_reclaim = directory_snapshot(&state.manager.base_path);
+
+    let reclaimed = post_resume_request(
+        &app,
+        "admin-key",
+        reclaimed_job_uuid,
+        json!({
+            "appId": SOURCE_APP_ID,
+            "apiKey": "fresh-resume-key",
+            "sourceIndex": SOURCE_INDEX
+        }),
+    )
+    .await;
+    let reclaimed_body =
+        resume_not_available_body(reclaimed, reclaimed_job_uuid, "reclaimed resume").await;
+    assert_eq!(
+        reclaimed_body, absent_body,
+        "absent and reclaimed jobs must return an indistinguishable owner-safe response"
+    );
+    assert_eq!(
+        directory_snapshot(&state.manager.base_path),
+        after_reclaim,
+        "reclaimed resume refusal must not recreate phase, manifest, artifact, sidecar, or counter files"
+    );
+}
+
 #[tokio::test]
 async fn migrate_pre_activation_unwind_drops_staging_without_activating_target() {
     let tmp = TempDir::new().unwrap();
@@ -3592,6 +4612,37 @@ async fn wait_for_terminal_phase(
             phase.phase, phase.disposition, phase.terminal_at, phase.cancel_requested
         );
     }
+}
+
+async fn wait_for_resume_interruption(
+    state: &Arc<crate::handlers::AppState>,
+    job_uuid: uuid::Uuid,
+) {
+    let spool = SpoolStore::new(&state.manager.base_path, SpoolLimits::default()).unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if let Ok(raw_manifest) = spool.manifest_json(job_uuid) {
+                let manifest: serde_json::Value = serde_json::from_str(&raw_manifest)
+                    .expect("production-written resume manifest must remain valid JSON");
+                if manifest["lifecycle"] == json!("Interrupted") {
+                    break;
+                }
+            }
+            let phase = read_migration_phase_at(&state.manager.base_path, job_uuid);
+            assert!(
+                phase.terminal_at.is_none(),
+                "allowlisted transient source error must persist lifecycle Interrupted before terminal settlement; observed phase {:?}, disposition {:?}",
+                phase.phase,
+                phase.disposition
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "allowlisted transient source error must persist lifecycle Interrupted within the bounded wait"
+    );
 }
 
 async fn wait_for_active_count(state: &Arc<crate::handlers::AppState>, expected: usize) {

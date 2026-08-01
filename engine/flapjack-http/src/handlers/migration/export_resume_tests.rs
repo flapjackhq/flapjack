@@ -39,7 +39,11 @@ fn create_export_for_test(
     source_identity_digest: &str,
     denominators: ResourceDenominators,
 ) -> SpoolResult<PublicExportView> {
-    store.create_migration_phase(job_uuid)?;
+    store.create_async_migration_admission(
+        job_uuid,
+        "resume-owner-test-target",
+        AsyncMigrationPublicationSemantic::CreateOnly,
+    )?;
     store.create_export(job_uuid, source_identity_digest, denominators)
 }
 
@@ -432,6 +436,124 @@ fn export_resume_nonempty_resource_completion_persists_verified_counts_and_hashe
     assert_eq!(checkpoint.resources.synonyms.hash, synonyms_hash);
     assert_eq!(checkpoint.progress.completed, 8);
     assert_eq!(checkpoint.progress.total, 8);
+}
+
+#[test]
+fn interrupted_export_is_reclaimed_at_original_absolute_expiry() {
+    let tmp = TempDir::new().unwrap();
+    let store = export_resume_store(&tmp);
+    let source_digest = hex_digest(b"interrupted-source");
+    let view = create_export_for_test(
+        &store,
+        uuid::Uuid::new_v4(),
+        &source_digest,
+        export_resume_denominators(),
+    )
+    .unwrap();
+    store
+        .commit_document_page_with_ids(
+            view.job_uuid,
+            br#"[{"objectID":"resume-object-001"},{"objectID":"resume-object-004"}]"#,
+            &["resume-object-001", "resume-object-004"],
+        )
+        .unwrap();
+    store
+        .interrupt_export(view.job_uuid, &source_digest)
+        .expect("Running -> Interrupted transition must commit before retention is tested");
+    let checkpoint = store
+        .checkpoint(&view.checkpoint_handle, &source_digest)
+        .unwrap();
+    assert_eq!(
+        checkpoint.state, "Interrupted",
+        "allowlisted interruption must persist the existing checkpoint as Interrupted before GC can test retention"
+    );
+    let before_expiry_manifest = store.manifest_json(view.job_uuid).unwrap();
+    let before_expiry_artifacts = store.visible_artifacts(view.job_uuid).unwrap();
+    assert!(!before_expiry_artifacts.is_empty());
+    let before_expiry_artifact_bytes = before_expiry_artifacts
+        .iter()
+        .map(|relative_path| {
+            (
+                relative_path.clone(),
+                std::fs::read(store.job_dir(view.job_uuid).join(relative_path)).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let completed_sidecar = store.completed_sidecar_path(view.job_uuid);
+    let before_expiry_sidecar_bytes = std::fs::read(&completed_sidecar).unwrap();
+    let original_expires_at = serde_json::from_str::<serde_json::Value>(&before_expiry_manifest)
+        .unwrap()["expires_at"]
+        .clone();
+    assert_eq!(
+        original_expires_at,
+        serde_json::json!("2026-07-15T12:01:00Z"),
+        "admission must stamp the hand-calculated original absolute expiry"
+    );
+
+    let pre_deadline = SpoolStore::new_for_tests(
+        tmp.path(),
+        SpoolLimits {
+            retention_seconds: 60,
+            ..SpoolLimits::default()
+        },
+        Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 59).unwrap(),
+        100_000,
+    )
+    .unwrap();
+    pre_deadline.collect_garbage().unwrap();
+    assert_eq!(
+        pre_deadline.manifest_json(view.job_uuid).unwrap(),
+        before_expiry_manifest
+    );
+    assert_eq!(
+        pre_deadline.visible_artifacts(view.job_uuid).unwrap(),
+        before_expiry_artifacts
+    );
+    for (relative_path, expected_bytes) in &before_expiry_artifact_bytes {
+        assert_eq!(
+            std::fs::read(pre_deadline.job_dir(view.job_uuid).join(relative_path)).unwrap(),
+            *expected_bytes,
+            "pre-deadline GC must preserve artifact bytes at {relative_path}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(&completed_sidecar).unwrap(),
+        before_expiry_sidecar_bytes,
+        "pre-deadline GC must preserve completion-sidecar bytes"
+    );
+
+    let expired = SpoolStore::new_for_tests(
+        tmp.path(),
+        SpoolLimits {
+            retention_seconds: 60,
+            ..SpoolLimits::default()
+        },
+        Utc.with_ymd_and_hms(2026, 7, 15, 12, 1, 0).unwrap(),
+        100_000,
+    )
+    .unwrap();
+    expired.collect_garbage().unwrap();
+    assert!(
+        expired.visible_artifacts(view.job_uuid).unwrap().is_empty(),
+        "expired interrupted exports must be reclaimed by collect_job_garbage at the original expires_at deadline"
+    );
+    assert!(
+        before_expiry_artifact_bytes
+            .iter()
+            .all(|(relative_path, _)| !expired.job_dir(view.job_uuid).join(relative_path).exists()),
+        "the expiry sweep must delete every visible payload artifact"
+    );
+    assert!(
+        !completed_sidecar.exists(),
+        "the expiry sweep must delete the completed-document sidecar"
+    );
+    let expired_manifest: serde_json::Value =
+        serde_json::from_str(&expired.manifest_json(view.job_uuid).unwrap()).unwrap();
+    assert_eq!(expired_manifest["lifecycle"], serde_json::json!("Deleted"));
+    assert_eq!(
+        expired_manifest["expires_at"], original_expires_at,
+        "interruption and reclamation must not refresh the admission-stamped absolute expiry"
+    );
 }
 
 fn commit_one(store: &SpoolStore, job_uuid: Uuid, resource: ObjectResource, id: &str) {

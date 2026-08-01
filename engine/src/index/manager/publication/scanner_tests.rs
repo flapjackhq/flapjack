@@ -236,6 +236,28 @@ fn scanner_reports_lock_only_epoch_namespace_without_live_target_unavailable() {
 }
 
 #[test]
+fn scanner_reports_durable_epoch_without_live_target_vacant() {
+    let temp = TempDir::new().unwrap();
+    let target = PublicationTarget::new("products").unwrap();
+    let observed = read_publication_epoch(temp.path(), &target).unwrap();
+    let fence = compare_and_advance_publication_epoch(temp.path(), &target, observed).unwrap();
+    drop(fence);
+
+    let report = scan_and_repair_publication_target(
+        temp.path(),
+        &AnalyticsConfig::for_data_dir(temp.path()),
+        target,
+    )
+    .unwrap();
+
+    assert_eq!(report.status, PublicationRepairStatus::Clean);
+    assert_eq!(report.action, PublicationScanAction::Clean);
+    assert_eq!(report.transactions, Vec::new());
+    assert_eq!(report.disposition, PublicationTargetDisposition::Vacant);
+    assert!(!report.live_target_mutated);
+}
+
+#[test]
 fn scanner_rejects_corrupt_epoch_sidecar_in_namespace_with_transaction_directory() {
     let temp = TempDir::new().unwrap();
     let target = PublicationTarget::new("products").unwrap();

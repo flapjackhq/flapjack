@@ -160,12 +160,38 @@ fn assert_migration_operation_uses_api_key(doc: &serde_json::Value, path: &str, 
     );
 }
 
+fn expected_async_migration_request_schema(provider: &str) -> &'static str {
+    match provider {
+        "algolia" | "typesense" => "#/components/schemas/MigrateFromAlgoliaRequest",
+        "meilisearch" => "#/components/schemas/MigrateFromMeilisearchRequest",
+        provider => {
+            panic!("{provider} must declare its provider-specific migration request schema")
+        }
+    }
+}
+
 fn assert_async_migration_lifecycle_is_documented(doc: &serde_json::Value, provider: &str) {
     let submit_path = format!("/1/migrations/{provider}");
     assert_path_exists(doc, &submit_path);
     assert_path_method(doc, &submit_path, "post");
     assert_migration_operation_uses_api_key(doc, &submit_path, "post");
     assert_async_migration_post_documents_contract(doc, &submit_path);
+
+    let preview_path = format!("{submit_path}/preview");
+    assert_path_exists(doc, &preview_path);
+    assert_path_method(doc, &preview_path, "post");
+    assert_migration_operation_uses_api_key(doc, &preview_path, "post");
+    assert_eq!(
+        schema_ref(
+            doc,
+            &format!(
+                "/paths/{}/post/requestBody/content/application~1json/schema",
+                preview_path.replace('/', "~1")
+            )
+        ),
+        Some(expected_async_migration_request_schema(provider)),
+        "{preview_path} POST should document its provider-specific JSON request body schema"
+    );
 
     let status_path = format!("{submit_path}/{{job_id}}");
     assert_path_exists(doc, &status_path);
@@ -184,6 +210,12 @@ fn assert_async_migration_lifecycle_is_documented(doc: &serde_json::Value, provi
     assert_path_method(doc, &acknowledge_path, "post");
     assert_migration_operation_uses_api_key(doc, &acknowledge_path, "post");
     assert_async_migration_acknowledge_documents_contract(doc, &acknowledge_path);
+
+    let resume_path = format!("{status_path}/resume");
+    assert_path_exists(doc, &resume_path);
+    assert_path_method(doc, &resume_path, "post");
+    assert_migration_operation_uses_api_key(doc, &resume_path, "post");
+    assert_async_migration_resume_documents_contract(doc, &resume_path);
 }
 
 fn operation_responses<'a>(
@@ -335,6 +367,32 @@ fn assert_async_migration_acknowledge_documents_contract(doc: &serde_json::Value
     assert!(
         conflict_description.contains("migration_ack_too_early"),
         "async migration acknowledge 409 should document migration_ack_too_early"
+    );
+}
+
+fn assert_async_migration_resume_documents_contract(doc: &serde_json::Value, path: &str) {
+    let responses = operation_responses(doc, path, "post");
+
+    for status in ["202", "400", "404", "409", "500"] {
+        assert!(
+            responses.contains_key(status),
+            "{path} POST should document {status} response"
+        );
+    }
+    assert_eq!(
+        response_schema_ref(doc, path, "post", "202"),
+        Some("#/components/schemas/AsyncMigrationStatusResponse"),
+        "{path} POST 202 should return AsyncMigrationStatusResponse"
+    );
+    let conflict_description = responses
+        .get("409")
+        .and_then(|response| response.get("description"))
+        .and_then(serde_json::Value::as_str)
+        .expect("async migration resume 409 should have a description");
+    assert!(
+        conflict_description.contains("migration_resume_claim_conflict")
+            && conflict_description.contains("migration_resume_not_available"),
+        "async migration resume 409 should document stable resume refusal codes"
     );
 }
 

@@ -22,13 +22,36 @@ HOST_PORT="${HOST_PORT:-17700}"
 BASE_URL="http://127.0.0.1:${HOST_PORT}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 EXPECTED_VERSION="${EXPECTED_VERSION:-1.0.0}"
+EXPECTED_RUNTIME_UID="${EXPECTED_RUNTIME_UID:-10001}"
+EXPECTED_RUNTIME_GID="${EXPECTED_RUNTIME_GID:-10001}"
 
 TESTS_RUN=0
 TESTS_PASSED=0
 TESTS_FAILED=0
 FIRST_FAILURE=""
+TMP_WORK_DIR=""
+CONTAINER_STARTED="false"
+RUNTIME_UID=""
+RUNTIME_GID=""
+
+# Docker volume names are daemon-global. Keep both fixtures in the same
+# caller-controlled namespace as the containers so concurrent harness runs
+# with distinct CONTAINER_NAME values cannot remove each other's fixtures.
+MAIN_DATA_VOLUME="${CONTAINER_NAME}_vol_main"
+WRITABLE_VOLUME="${CONTAINER_NAME}_vol_writable"
+UNWRITABLE_VOLUME="${CONTAINER_NAME}_vol_unwritable"
+WRITABLE_CONTAINER_NAME="${CONTAINER_NAME}_vol_writable"
+UNWRITABLE_CONTAINER_NAME="${CONTAINER_NAME}_vol_unwritable"
+WRITABLE_MARKER="flapjack-sec-g11-writable-v1"
+UNWRITABLE_MARKER="flapjack-sec-g11-unwritable-v1"
 
 timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+redact_sensitive_output() {
+  # Expected failure logs are committed as RED evidence. Never persist the
+  # generated admin credential printed during first boot.
+  sed -E 's/fj_admin_[[:alnum:]_-]+/[REDACTED_ADMIN_KEY]/g'
+}
 
 pass() {
   TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -51,26 +74,37 @@ fail() {
   fi
 }
 
-TMP_DATA_DIR=""
-CONTAINER_STARTED="false"
-
 cleanup() {
   local script_exit_code=$?
-  # Best-effort container teardown. The container was started with --rm so a
-  # stop/kill is sufficient to remove it.
-  if [ "$CONTAINER_STARTED" = "true" ]; then
-    docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
-    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-  fi
-  if [ -n "$TMP_DATA_DIR" ] && [ -d "$TMP_DATA_DIR" ]; then
+  # This is the single teardown owner for the main container and both
+  # namespaced upgrade fixtures, including leftovers from interrupted runs.
+  docker rm -f \
+    "$CONTAINER_NAME" \
+    "$WRITABLE_CONTAINER_NAME" \
+    "$UNWRITABLE_CONTAINER_NAME" >/dev/null 2>&1 || true
+  CONTAINER_STARTED="false"
+  if [ -n "$TMP_WORK_DIR" ] && [ -d "$TMP_WORK_DIR" ]; then
     if [ "$TESTS_FAILED" -gt 0 ] || [ "$script_exit_code" -ne 0 ]; then
       local failure_snapshot="/tmp/flapjack_docker_runtime_e2e_failure_${$}_$(date +%s)"
-      cp -R "$TMP_DATA_DIR" "$failure_snapshot" 2>/dev/null || true
-      printf "INFO: preserving docker e2e host data dir for triage: %s\n" "$TMP_DATA_DIR"
+      mkdir -p "$failure_snapshot"
+      cp -R "$TMP_WORK_DIR" "$failure_snapshot/host_work_dir" 2>/dev/null || true
+      if docker volume inspect "$MAIN_DATA_VOLUME" >/dev/null 2>&1; then
+        mkdir -p "$failure_snapshot/main_data_volume"
+        docker run --rm \
+          -v "${MAIN_DATA_VOLUME}:/from:ro" \
+          -v "${failure_snapshot}:/to" \
+          --entrypoint /bin/sh \
+          "$IMAGE" -c 'cp -a /from/. /to/main_data_volume/' >/dev/null 2>&1 || true
+      fi
+      printf "INFO: preserving docker e2e artifacts for triage: %s\n" "$failure_snapshot"
     else
-      rm -rf "$TMP_DATA_DIR" 2>/dev/null || true
+      rm -rf "$TMP_WORK_DIR" 2>/dev/null || true
     fi
   fi
+  docker volume rm -f \
+    "$MAIN_DATA_VOLUME" \
+    "$WRITABLE_VOLUME" \
+    "$UNWRITABLE_VOLUME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -91,23 +125,86 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 pass "docker-available"
 
-# Remove any stale container with our exact name (idempotent run).
-if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
-  printf "Removing stale container %s before start\n" "$CONTAINER_NAME"
-  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+# Remove every stale container and named volume through the same cleanup owner
+# used by the EXIT trap, so repeated and interrupted runs start deterministically.
+cleanup
+
+# Probe the image's runtime identity once. The same observed UID:GID owns
+# writable fixtures below, avoiding test-only values that could drift from the
+# image contract.
+RUNTIME_IDENTITY=$(docker run --rm \
+  --platform "$PLATFORM" \
+  --entrypoint /bin/sh \
+  "$IMAGE" \
+  -c 'printf "%s:%s" "$(id -u)" "$(id -g)"' \
+  2>/tmp/flapjack_runtime_identity.err) && RUNTIME_IDENTITY_EXIT=0 || RUNTIME_IDENTITY_EXIT=$?
+RUNTIME_UID="${RUNTIME_IDENTITY%%:*}"
+RUNTIME_GID="${RUNTIME_IDENTITY#*:}"
+
+if [ "$RUNTIME_IDENTITY_EXIT" -eq 0 ] && [ -n "$RUNTIME_UID" ] && [ "$RUNTIME_UID" != "0" ]; then
+  pass "non-root-uid"
+else
+  fail "non-root-uid" "non-empty UID other than 0" \
+    "uid=${RUNTIME_UID:-<empty>} gid=${RUNTIME_GID:-<empty>} exit=$RUNTIME_IDENTITY_EXIT"
+fi
+
+if [ "$RUNTIME_IDENTITY_EXIT" -eq 0 ] && [ "$RUNTIME_UID" = "$EXPECTED_RUNTIME_UID" ]; then
+  pass "runtime-uid-pinned (${EXPECTED_RUNTIME_UID})"
+else
+  fail "runtime-uid-pinned" "$EXPECTED_RUNTIME_UID" \
+    "${RUNTIME_UID:-<empty>} (gid=${RUNTIME_GID:-<empty>} exit=$RUNTIME_IDENTITY_EXIT)"
+fi
+
+if [ "$RUNTIME_IDENTITY_EXIT" -eq 0 ] && [ "$RUNTIME_GID" = "$EXPECTED_RUNTIME_GID" ]; then
+  pass "runtime-gid-pinned (${EXPECTED_RUNTIME_GID})"
+else
+  fail "runtime-gid-pinned" "$EXPECTED_RUNTIME_GID" \
+    "${RUNTIME_GID:-<empty>} (uid=${RUNTIME_UID:-<empty>} exit=$RUNTIME_IDENTITY_EXIT)"
+fi
+
+if [ "$RUNTIME_IDENTITY_EXIT" -ne 0 ] || [ -z "$RUNTIME_UID" ] || [ -z "$RUNTIME_GID" ]; then
+  printf "Runtime identity probe stderr:\n"
+  cat /tmp/flapjack_runtime_identity.err 2>/dev/null || true
+  printf "\nAborting: image runtime identity could not be observed.\n"
+  exit 1
 fi
 
 # ── Step 1: Start published image ────────────────────────────────────────────
 
 printf '\n%s\n' "--- Step 1: Start published image ---"
-TMP_DATA_DIR=$(mktemp -d)
-printf "Host data dir: %s\n" "$TMP_DATA_DIR"
+TMP_WORK_DIR=$(mktemp -d)
+printf "Host work dir: %s\n" "$TMP_WORK_DIR"
+printf "Main data volume: %s\n" "$MAIN_DATA_VOLUME"
+# The main container uses a named volume instead of a host bind mount because
+# macOS/Colima ownership translation can reject writes from the pinned runtime
+# UID even after host-side chmod. Prepare the volume with the observed runtime
+# identity so the start probe measures Flapjack, not the host filesystem.
+docker volume create "$MAIN_DATA_VOLUME" >/dev/null 2>&1 && \
+  docker run --rm \
+    --platform "$PLATFORM" \
+    --user 0 \
+    --entrypoint /bin/sh \
+    -v "${MAIN_DATA_VOLUME}:/data" \
+    "$IMAGE" \
+    -c 'chown -R "$1:$2" /data && chmod 0775 /data' \
+    sh "$RUNTIME_UID" "$RUNTIME_GID" \
+    >/tmp/flapjack_main_prepare.out 2>&1 && MAIN_VOLUME_PREP_EXIT=0 || MAIN_VOLUME_PREP_EXIT=$?
+
+if [ "$MAIN_VOLUME_PREP_EXIT" -eq 0 ]; then
+  pass "main-data-volume-prepared"
+else
+  fail "main-data-volume-prepared" \
+    "named /data volume prepared for ${RUNTIME_UID}:${RUNTIME_GID}" \
+    "exit $MAIN_VOLUME_PREP_EXIT"
+  cat /tmp/flapjack_main_prepare.out 2>/dev/null || true
+  exit 1
+fi
 
 docker run -d --rm \
   --platform "$PLATFORM" \
   --name "$CONTAINER_NAME" \
   -p "${HOST_PORT}:7700" \
-  -v "${TMP_DATA_DIR}:/data" \
+  -v "${MAIN_DATA_VOLUME}:/data" \
   "$IMAGE" > /tmp/docker_run.out 2>&1 && RUN_EXIT=0 || RUN_EXIT=$?
 
 printf "docker run exit: %d\n" "$RUN_EXIT"
@@ -144,7 +241,7 @@ if [ "$HEALTH_OK" = "true" ]; then
 else
   fail "server-starts" "/health HTTP 200 within 30s" "timeout"
   printf "Container logs:\n"
-  docker logs "$CONTAINER_NAME" 2>&1 | tail -40 || true
+  docker logs "$CONTAINER_NAME" 2>&1 | redact_sensitive_output | tail -40 || true
   printf "\nAborting: server did not become healthy.\n"
   exit 1
 fi
@@ -183,6 +280,122 @@ else
   fail "image-architecture-match" "$PLATFORM" "${ACTUAL_PLATFORM:-inspect failed (exit $INSPECT_EXIT)}"
 fi
 
+# ── Step 2c: Pre-existing /data upgrade fixtures ─────────────────────────────
+
+printf '\n%s\n' "--- Step 2c: Pre-existing /data upgrade fixtures ---"
+# Operators upgrading from older Flapjack images already have root-created
+# /data volumes. A correctly prepared writable volume must keep serving without
+# losing data, while an unwritable root-owned volume must refuse loudly rather
+# than start and later fail persistence. Refusing every volume is also a
+# data-availability incident, so both cases are load-bearing.
+
+docker volume create "$WRITABLE_VOLUME" >/dev/null 2>&1 && \
+  docker run --rm \
+    --platform "$PLATFORM" \
+    --user 0 \
+      --entrypoint /bin/sh \
+      -v "${WRITABLE_VOLUME}:/data" \
+      "$IMAGE" \
+      -c 'printf "%s" "$1" > /data/secg11_marker && chown -R "$2:$3" /data' \
+      sh "$WRITABLE_MARKER" "$RUNTIME_UID" "$RUNTIME_GID" \
+      >/tmp/flapjack_writable_prepare.out 2>&1 && WRITABLE_PREP_EXIT=0 || WRITABLE_PREP_EXIT=$?
+
+if [ "$WRITABLE_PREP_EXIT" -eq 0 ]; then
+  docker run -d \
+    --platform "$PLATFORM" \
+    --name "$WRITABLE_CONTAINER_NAME" \
+    -v "${WRITABLE_VOLUME}:/data" \
+    "$IMAGE" >/tmp/flapjack_writable_start.out 2>&1 && WRITABLE_START_EXIT=0 || WRITABLE_START_EXIT=$?
+else
+  WRITABLE_START_EXIT=1
+fi
+
+WRITABLE_HEALTH_OK="false"
+WRITABLE_MARKER_ACTUAL=""
+if [ "$WRITABLE_START_EXIT" -eq 0 ]; then
+  for _i in $(seq 1 60); do
+    if docker exec "$WRITABLE_CONTAINER_NAME" \
+      curl -fsS http://127.0.0.1:7700/health >/dev/null 2>&1; then
+      WRITABLE_HEALTH_OK="true"
+      break
+    fi
+    sleep 0.5
+  done
+  WRITABLE_MARKER_ACTUAL=$(docker exec "$WRITABLE_CONTAINER_NAME" \
+    cat /data/secg11_marker 2>/dev/null) || true
+fi
+
+if [ "$WRITABLE_PREP_EXIT" -eq 0 ] && \
+  [ "$WRITABLE_START_EXIT" -eq 0 ] && \
+  [ "$WRITABLE_HEALTH_OK" = "true" ] && \
+  [ "$WRITABLE_MARKER_ACTUAL" = "$WRITABLE_MARKER" ]; then
+  pass "data-volume-writable-starts"
+else
+  fail "data-volume-writable-starts" \
+    "prepared volume reaches /health and preserves marker '$WRITABLE_MARKER'" \
+    "prepare=$WRITABLE_PREP_EXIT start=$WRITABLE_START_EXIT health=$WRITABLE_HEALTH_OK marker=${WRITABLE_MARKER_ACTUAL:-<missing>}"
+  printf "Writable fixture prepare/start output:\n"
+  cat /tmp/flapjack_writable_prepare.out /tmp/flapjack_writable_start.out 2>/dev/null || true
+  printf "Writable fixture container logs:\n"
+  docker logs "$WRITABLE_CONTAINER_NAME" 2>&1 | redact_sensitive_output || true
+fi
+docker rm -f "$WRITABLE_CONTAINER_NAME" >/dev/null 2>&1 || true
+
+docker volume create "$UNWRITABLE_VOLUME" >/dev/null 2>&1 && \
+  docker run --rm \
+    --platform "$PLATFORM" \
+    --user 0 \
+    --entrypoint /bin/sh \
+    -v "${UNWRITABLE_VOLUME}:/data" \
+    "$IMAGE" \
+    -c 'printf "%s" "$1" > /data/secg11_marker && chown -R 0:0 /data && chmod 0755 /data && chmod 0644 /data/secg11_marker' \
+    sh "$UNWRITABLE_MARKER" \
+    >/tmp/flapjack_unwritable_prepare.out 2>&1 && UNWRITABLE_PREP_EXIT=0 || UNWRITABLE_PREP_EXIT=$?
+
+if [ "$UNWRITABLE_PREP_EXIT" -eq 0 ]; then
+  docker run -d \
+    --platform "$PLATFORM" \
+    --name "$UNWRITABLE_CONTAINER_NAME" \
+    -v "${UNWRITABLE_VOLUME}:/data" \
+    "$IMAGE" >/tmp/flapjack_unwritable_start.out 2>&1 && UNWRITABLE_START_EXIT=0 || UNWRITABLE_START_EXIT=$?
+else
+  UNWRITABLE_START_EXIT=1
+fi
+
+UNWRITABLE_STOPPED="false"
+UNWRITABLE_EXIT_CODE=""
+if [ "$UNWRITABLE_START_EXIT" -eq 0 ]; then
+  for _i in $(seq 1 60); do
+    UNWRITABLE_RUNNING=$(docker inspect --format '{{.State.Running}}' \
+      "$UNWRITABLE_CONTAINER_NAME" 2>/dev/null) || UNWRITABLE_RUNNING=""
+    if [ "$UNWRITABLE_RUNNING" = "false" ]; then
+      UNWRITABLE_STOPPED="true"
+      UNWRITABLE_EXIT_CODE=$(docker inspect --format '{{.State.ExitCode}}' \
+        "$UNWRITABLE_CONTAINER_NAME" 2>/dev/null) || UNWRITABLE_EXIT_CODE=""
+      break
+    fi
+    sleep 0.5
+  done
+fi
+UNWRITABLE_LOGS=$(docker logs "$UNWRITABLE_CONTAINER_NAME" 2>&1 | redact_sensitive_output) || true
+
+if [ "$UNWRITABLE_PREP_EXIT" -eq 0 ] && \
+  [ "$UNWRITABLE_START_EXIT" -eq 0 ] && \
+  [ "$UNWRITABLE_STOPPED" = "true" ] && \
+  [ -n "$UNWRITABLE_EXIT_CODE" ] && \
+  [ "$UNWRITABLE_EXIT_CODE" -ne 0 ] 2>/dev/null && \
+  printf '%s' "$UNWRITABLE_LOGS" | grep -qE 'docker run .*chown .* /data'; then
+  pass "data-volume-unwritable-refuses"
+else
+  fail "data-volume-unwritable-refuses" \
+    "non-zero exit within 30s and operator-actionable docker run ... chown ... /data log" \
+    "prepare=$UNWRITABLE_PREP_EXIT start=$UNWRITABLE_START_EXIT stopped=$UNWRITABLE_STOPPED exit=${UNWRITABLE_EXIT_CODE:-<running-or-missing>}"
+  printf "Unwritable fixture prepare/start output:\n"
+  cat /tmp/flapjack_unwritable_prepare.out /tmp/flapjack_unwritable_start.out 2>/dev/null || true
+  printf "Unwritable fixture container logs:\n%s\n" "$UNWRITABLE_LOGS"
+fi
+docker rm -f "$UNWRITABLE_CONTAINER_NAME" >/dev/null 2>&1 || true
+
 # ── Step 3: Admin key discovery via docker exec on /data/.admin_key ──────────
 
 printf '\n%s\n' "--- Step 3: Admin key discovery ---"
@@ -211,7 +424,7 @@ printf '\n%s\n' "--- Step 4: Batch ingest ---"
 # (matches engine/tests/test_macos_e2e.sh:200).
 BATCH_BODY='{"requests":[{"action":"addObject","body":{"objectID":"1","title":"The Matrix","year":1999}},{"action":"addObject","body":{"objectID":"2","title":"Inception","year":2010}}]}'
 
-BATCH_RESP_FILE="${TMP_DATA_DIR}/batch_resp.json"
+BATCH_RESP_FILE="${TMP_WORK_DIR}/batch_resp.json"
 BATCH_HTTP_CODE=$(curl -s -o "$BATCH_RESP_FILE" -w "%{http_code}" \
   -X POST "${BASE_URL}/1/indexes/test_movies/batch" \
   -H "Content-Type: application/json" \
@@ -289,7 +502,7 @@ fi
 # ── Step 7: Auth contract — missing X-Algolia-Application-Id => 403 ──────────
 
 printf '\n%s\n' "--- Step 7: Auth contract ---"
-AUTH_RESP_FILE="${TMP_DATA_DIR}/auth_resp.json"
+AUTH_RESP_FILE="${TMP_WORK_DIR}/auth_resp.json"
 AUTH_HTTP_CODE=$(curl -s -o "$AUTH_RESP_FILE" -w "%{http_code}" \
   -X POST "${BASE_URL}/1/indexes/test_movies/query" \
   -H "Content-Type: application/json" \

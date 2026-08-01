@@ -20,6 +20,7 @@ pub mod openapi_export;
 pub mod pause_registry;
 pub mod rollup_broadcaster;
 pub mod router;
+pub mod security_audit;
 pub mod security_sources;
 pub mod server;
 pub mod server_init;

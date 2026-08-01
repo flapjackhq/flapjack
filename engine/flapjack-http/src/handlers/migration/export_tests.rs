@@ -7,7 +7,8 @@ use crate::handlers::migration::algolia_client::AlgoliaIndexRecord;
 use crate::handlers::migration::source_reader::collect_quiescent_source_snapshot;
 use crate::handlers::migration::source_test_support::ScriptedSourceReader;
 use crate::handlers::migration::spool::{
-    PublicExportView, ResourceDenominators, SpoolError, SpoolErrorKind, SpoolLimits, SpoolStore,
+    AsyncMigrationPublicationSemantic, PublicExportView, ResourceDenominators, SpoolError,
+    SpoolErrorKind, SpoolLimits, SpoolStore,
 };
 use crate::test_helpers::{EnvVarRestoreGuard, TestStateBuilder, ENV_MUTEX};
 use serde_json::{json, Value};
@@ -104,7 +105,11 @@ fn create_export_for_test(
     source_identity_digest: &str,
     denominators: ResourceDenominators,
 ) -> Result<PublicExportView, SpoolError> {
-    store.create_migration_phase(job_uuid)?;
+    store.create_async_migration_admission(
+        job_uuid,
+        "resume-owner-test-target",
+        AsyncMigrationPublicationSemantic::CreateOnly,
+    )?;
     store.create_export(job_uuid, source_identity_digest, denominators)
 }
 
@@ -458,6 +463,7 @@ async fn export_resume_skips_completed_ids_through_checkpoint_handle() {
 
     let reopened = store_at(tmp.path());
     reopened.recover().unwrap();
+    reopened.interrupt_export(view.job_uuid, &digest).unwrap();
     let mut reader = full_reader();
     let accepted = resume_algolia_source(&reopened, &mut reader, &view.checkpoint_handle)
         .await
@@ -518,6 +524,7 @@ async fn export_resume_accepts_reordered_inserted_source_and_refuses_mutation() 
         synonyms(),
     );
     reader.push_quiescent(record_with_entries(4));
+    store.interrupt_export(view.job_uuid, &digest).unwrap();
 
     let accepted = resume_algolia_source(&store, &mut reader, &view.checkpoint_handle)
         .await
@@ -555,6 +562,9 @@ async fn export_resume_accepts_reordered_inserted_source_and_refuses_mutation() 
             br#"[{"objectID":"doc-1"}]"#,
             &["doc-1"],
         )
+        .unwrap();
+    store
+        .interrupt_export(mutation_view.job_uuid, &digest)
         .unwrap();
     let artifacts_before = store
         .visible_artifacts(mutation_view.job_uuid)
@@ -601,7 +611,7 @@ async fn export_resume_accepts_reordered_inserted_source_and_refuses_mutation() 
             .checkpoint(&mutation_view.checkpoint_handle, &digest)
             .unwrap()
             .state,
-        "Running"
+        "Interrupted"
     );
 }
 
@@ -614,6 +624,7 @@ async fn export_resume_refuses_mutated_source_without_new_artifacts() {
     store
         .commit_document_page_with_ids(view.job_uuid, br#"[{"objectID":"doc-1"}]"#, &["doc-1"])
         .unwrap();
+    store.interrupt_export(view.job_uuid, &digest).unwrap();
     let artifacts_before = store.visible_artifacts(view.job_uuid).unwrap().len();
 
     // A reader whose documents mutate produces a different source identity.
@@ -641,7 +652,7 @@ async fn export_resume_refuses_mutated_source_without_new_artifacts() {
         artifacts_before
     );
     let checkpoint = store.checkpoint(&view.checkpoint_handle, &digest).unwrap();
-    assert_eq!(checkpoint.state, "Running");
+    assert_eq!(checkpoint.state, "Interrupted");
 }
 
 #[tokio::test]

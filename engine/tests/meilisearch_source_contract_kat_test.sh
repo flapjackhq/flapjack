@@ -44,6 +44,9 @@ truncated_pagination
 cleanup_residue
 search_limit_as_export
 http_status_only_correctness
+preview_fixture_count
+preview_zero_match
+preview_timeout
 '
 
 TMP_DIR=""
@@ -99,6 +102,9 @@ scenario_id_for_label() {
     'cleanup residue') printf '%s\n' cleanup_residue ;;
     'search limit as export') printf '%s\n' search_limit_as_export ;;
     'HTTP status only correctness') printf '%s\n' http_status_only_correctness ;;
+    'preview fixture count') printf '%s\n' preview_fixture_count ;;
+    'preview zero match') printf '%s\n' preview_zero_match ;;
+    'preview timeout') printf '%s\n' preview_timeout ;;
     'missing port probe tool') printf '%s\n' missing_port_probe_tool ;;
     *) die "unmapped scenario label: $1" ;;
   esac
@@ -149,13 +155,16 @@ cleanup residue
 search limit as export
 HTTP status only correctness
 missing port probe tool
+preview fixture count
+preview zero match
+preview timeout
 EOF
   )"
   expected="$(printf '%s\n' "$EXPECTED_SCENARIO_IDS" | sed '/^$/d')"
   [[ "$(printf '%s\n' "$mapped" | sort)" == "$(printf '%s\n' "$expected" | sort)" ]] \
     || die "scenario denominator does not match EXPECTED_SCENARIO_IDS"
-  [[ "$(printf '%s\n' "$mapped" | sort -u | wc -l | tr -d ' ')" == 39 ]] \
-    || die "scenario denominator must contain 39 unique cases"
+  [[ "$(printf '%s\n' "$mapped" | sort -u | wc -l | tr -d ' ')" == 42 ]] \
+    || die "scenario denominator must contain 42 unique cases"
 }
 
 write_response() {
@@ -750,6 +759,90 @@ exit 7'
     || die "ORACLE_WRONG_FAILURE: inspection failure did not fail closed"
 }
 
+assert_preview_probe_contract() {
+  local scenario="$1" case_dir tool_dir output harness expected_records shim_mode status
+  case_dir="$TMP_DIR/$scenario"
+  tool_dir="$case_dir/tools"
+  output="$case_dir/output"
+  harness="$case_dir/preview_probe_harness"
+  expected_records="$(jq -er '.documents.countAfter' "$FIXTURE_DIR/expected_bundle.json")"
+  mkdir -p "$tool_dir"
+
+  # Expansions belong to the generated timeout shim, not this process.
+  # shellcheck disable=SC2016
+  write_preflight_tool_shim "$tool_dir" timeout '
+[[ "${1:-}" == "600" && "${2:-}" == "cargo" ]] || exit 8
+case "${PREVIEW_SHIM_MODE:?}" in
+  success)
+    [[ "${FJ_MEILISEARCH_PREVIEW_EXPECTED_RECORDS:-}" == "${PREVIEW_EXPECTED_RECORDS:?}" ]] \
+      || exit 9
+    printf "%s\n" \
+      "running 1 test" \
+      "{\"previewProof\":\"PASS\",\"sourceCounts\":{\"indexes\":1,\"records\":${PREVIEW_EXPECTED_RECORDS}}}" \
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured"
+    ;;
+  zero_match)
+    printf "%s\n" \
+      "running 0 tests" \
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured"
+    ;;
+  timed_out)
+    exit 124
+    ;;
+  *) exit 10 ;;
+esac'
+
+  cat >"$harness" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source "${PREVIEW_RUNNER:?}"
+MODE=preview_live
+EXPECTED="${PREVIEW_EXPECTED_FIXTURE:?}"
+BASE_URL="http://127.0.0.1:7700"
+MASTER_KEY="preview-contract-key"
+run_preview_probe
+EOF
+  chmod +x "$harness"
+
+  case "$scenario" in
+    preview_fixture_count) shim_mode=success ;;
+    preview_zero_match) shim_mode=zero_match ;;
+    preview_timeout) shim_mode=timed_out ;;
+    *) die "unknown preview probe scenario: $scenario" ;;
+  esac
+
+  set +e
+  PATH="$tool_dir:$PATH" \
+    PREVIEW_RUNNER="$RUNNER" \
+    PREVIEW_EXPECTED_FIXTURE="$FIXTURE_DIR/expected_bundle.json" \
+    PREVIEW_EXPECTED_RECORDS="$expected_records" \
+    PREVIEW_SHIM_MODE="$shim_mode" \
+    bash "$harness" >"$output" 2>&1
+  status=$?
+  set -e
+
+  case "$scenario" in
+    preview_fixture_count)
+      [[ "$status" -eq 0 ]] \
+        || die "ORACLE_WRONG_FAILURE: fixture count probe failed: $(tail -20 "$output")"
+      grep -Fq "\"records\":${expected_records}" "$output" \
+        || die "ORACLE_NOT_LOAD_BEARING: fixture count did not reach the preview probe"
+      ;;
+    preview_zero_match)
+      [[ "$status" -ne 0 ]] \
+        || die "ORACLE_NOT_LOAD_BEARING: zero-match preview probe remained green"
+      grep -Fq 'preview probe did not execute exactly one passing test' "$output" \
+        || die "ORACLE_WRONG_FAILURE: zero-match guard did not own the failure"
+      ;;
+    preview_timeout)
+      [[ "$status" -ne 0 ]] \
+        || die "ORACLE_NOT_LOAD_BEARING: timed-out preview probe remained green"
+      grep -Fq 'preview probe timed out after 600 seconds' "$output" \
+        || die "ORACLE_WRONG_FAILURE: timeout guard did not own the failure"
+      ;;
+  esac
+}
+
 record_pass() {
   TESTS_RUN=$((TESTS_RUN + 1))
   TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -779,12 +872,15 @@ main() {
         ;;
       partial_container_launch_cleanup) assert_partial_container_launch_cleanup ;;
       indeterminate_container_inspection) assert_indeterminate_container_inspection_rejected ;;
+      preview_fixture_count|preview_zero_match|preview_timeout)
+        assert_preview_probe_contract "$scenario"
+        ;;
       *) assert_mutation_rejected "$scenario" ;;
     esac
     record_pass "$scenario"
   done <<<"$EXPECTED_SCENARIO_IDS"
 
-  [[ "$TESTS_RUN" -eq 39 && "$TESTS_PASSED" -eq 39 ]] \
+  [[ "$TESTS_RUN" -eq 42 && "$TESTS_PASSED" -eq 42 ]] \
     || die "meta-suite denominator mismatch: ${TESTS_PASSED}/${TESTS_RUN}"
   printf 'PASS denominator=%s/%s\n' "$TESTS_PASSED" "$TESTS_RUN"
 }

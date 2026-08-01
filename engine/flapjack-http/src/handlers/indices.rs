@@ -10,6 +10,7 @@ use super::replicas::{
 };
 use super::AppState;
 use crate::dto::{CreateIndexRequest, CreateIndexResponse, DeleteIndexResponse};
+use crate::security_audit::{emit_admin_action, Action, Actor, AuditIndexName, Outcome, Target};
 use flapjack::error::FlapjackError;
 
 /// Recursively compute total size of all files in a directory.
@@ -167,7 +168,30 @@ pub async fn delete_index(
     State(state): State<Arc<AppState>>,
     Path(index_name): Path<String>,
 ) -> Result<Json<DeleteIndexResponse>, FlapjackError> {
-    state.manager.delete_tenant(&index_name).await?;
+    match state.manager.delete_tenant(&index_name).await {
+        Ok(()) => {
+            let audit_index_name = AuditIndexName::from_validated(&index_name);
+            emit_admin_action(
+                Actor::admin_api_key(),
+                Action::DeleteIndex,
+                Target::index(&audit_index_name),
+                Outcome::Success,
+                None,
+            );
+        }
+        Err(error) => {
+            if let Ok(audit_index_name) = AuditIndexName::new(&index_name) {
+                emit_admin_action(
+                    Actor::admin_api_key(),
+                    Action::DeleteIndex,
+                    Target::index(&audit_index_name),
+                    Outcome::Failure,
+                    None,
+                );
+            }
+            return Err(error);
+        }
+    }
     let task = state.manager.make_noop_task(&index_name)?;
     Ok(Json(DeleteIndexResponse {
         task_id: task.numeric_id,

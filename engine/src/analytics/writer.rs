@@ -908,6 +908,23 @@ fn write_parquet_file_atomic(path: &Path, batch: RecordBatch) -> Result<(), Stri
     Ok(())
 }
 
+/// GeoIP enrichment has already run at this persistence boundary, so `/24` for
+/// IPv4 and `/48` for IPv6 are the analytics coarsening levels stored on disk.
+fn truncate_user_ip_for_analytics(user_ip: Option<&str>) -> Option<String> {
+    let user_ip = user_ip?.parse::<std::net::IpAddr>().ok()?;
+    let truncated = match user_ip {
+        std::net::IpAddr::V4(address) => {
+            let [first, second, third, _] = address.octets();
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(first, second, third, 0))
+        }
+        std::net::IpAddr::V6(address) => {
+            let [first, second, third, _, _, _, _, _] = address.segments();
+            std::net::IpAddr::V6(std::net::Ipv6Addr::new(first, second, third, 0, 0, 0, 0, 0))
+        }
+    };
+    Some(truncated.to_string())
+}
+
 /// Convert a slice of search events into an Arrow `RecordBatch`.
 ///
 /// Maps each `SearchEvent` field to a typed Arrow array column, preserving nullability for optional fields.
@@ -959,7 +976,7 @@ pub(crate) fn search_events_to_batch(
             Some(t) => user_token.append_value(t),
             None => user_token.append_null(),
         }
-        match &e.user_ip {
+        match truncate_user_ip_for_analytics(e.user_ip.as_deref()) {
             Some(ip) => user_ip.append_value(ip),
             None => user_ip.append_null(),
         }
@@ -1334,6 +1351,35 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
+
+    #[test]
+    fn truncates_user_ip_to_analytics_coarsening_level() {
+        assert_eq!(
+            truncate_user_ip_for_analytics(Some("203.0.113.47")),
+            Some("203.0.113.0".to_string())
+        );
+        assert_eq!(
+            truncate_user_ip_for_analytics(Some("2001:db8:1234:5678::1")),
+            Some("2001:db8:1234::".to_string())
+        );
+    }
+
+    #[test]
+    fn truncated_user_ip_is_nullable_idempotent_and_rejects_invalid_text() {
+        assert_eq!(truncate_user_ip_for_analytics(None), None);
+        assert_eq!(
+            truncate_user_ip_for_analytics(Some("203.0.113.0")),
+            Some("203.0.113.0".to_string())
+        );
+        assert_eq!(
+            truncate_user_ip_for_analytics(Some("2001:db8:1234::")),
+            Some("2001:db8:1234::".to_string())
+        );
+        assert_eq!(
+            truncate_user_ip_for_analytics(Some("not-an-ip-address")),
+            None
+        );
+    }
 
     #[test]
     fn partitioned_parquet_path_disambiguates_same_timestamp() {

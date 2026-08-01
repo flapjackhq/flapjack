@@ -1,4 +1,5 @@
 use super::*;
+use crate::handlers::migration::AsyncMigrationSourceProvider;
 use chrono::{TimeZone, Utc};
 use flapjack::index::manager::publication::{
     PublicationPaths, PublicationTarget, PublicationTransactionId,
@@ -668,7 +669,7 @@ fn migration_phase_record_uses_caller_uuid_and_survives_reopen() {
         phase.export_progress,
         Some(MigrationExportProgress {
             completed: 0,
-            total: 8
+            total: 3
         })
     );
 
@@ -943,8 +944,8 @@ fn migration_phase_progress_is_labeled_export_progress_not_completion() {
     assert_eq!(
         phase.export_progress,
         Some(MigrationExportProgress {
-            completed: 5,
-            total: 5
+            completed: 2,
+            total: 2
         })
     );
     assert_eq!(phase.phase, MigrationPhase::Exporting);
@@ -1006,8 +1007,8 @@ fn migration_phase_record_survives_export_artifact_deletion() {
     assert_eq!(
         phase.export_progress,
         Some(MigrationExportProgress {
-            completed: 1,
-            total: 8
+            completed: 0,
+            total: 3
         })
     );
 }
@@ -1211,6 +1212,46 @@ fn succeed_migration_requires_activating_phase() {
 }
 
 #[test]
+fn interrupted_exports_are_algolia_only() {
+    let tmp = TempDir::new().unwrap();
+    let store = fixed_store(&tmp);
+    let job_uuid = fixed_job_uuid();
+    let digest = source_digest();
+    store
+        .create_async_migration_admission_for_provider_owner(
+            job_uuid,
+            "products",
+            Some("owner-app"),
+            AsyncMigrationSourceProvider::Meilisearch,
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
+        .unwrap();
+    store
+        .transition_migration_phase(job_uuid, MigrationPhase::Exporting)
+        .unwrap();
+    let view = store
+        .create_export(job_uuid, &digest, denominators())
+        .unwrap();
+
+    assert!(!store.source_error_can_interrupt_export(job_uuid).unwrap());
+    assert_eq!(
+        store
+            .interrupt_export(job_uuid, &digest)
+            .unwrap_err()
+            .kind(),
+        SpoolErrorKind::JobTerminal
+    );
+    assert_eq!(store.resumable_export_handle(job_uuid).unwrap(), None);
+    assert_eq!(
+        store
+            .checkpoint(&view.checkpoint_handle, &digest)
+            .unwrap()
+            .state,
+        "Running"
+    );
+}
+
+#[test]
 fn succeed_migration_round_trips_exact_import_outcome() {
     let tmp = TempDir::new().unwrap();
     let job_uuid = fixed_job_uuid();
@@ -1350,7 +1391,7 @@ fn read_migration_phase_reconciles_stale_progress_from_manifest() {
         cancel_requested: false,
         export_progress: Some(MigrationExportProgress {
             completed: 0,
-            total: accepted_reader_denominators().total(),
+            total: accepted_reader_denominators().documents,
         }),
         created_at: fixed_now(),
         updated_at: fixed_now(),
@@ -1367,7 +1408,7 @@ fn read_migration_phase_reconciles_stale_progress_from_manifest() {
         reconciled.export_progress,
         Some(MigrationExportProgress {
             completed: 2,
-            total: accepted_reader_denominators().total()
+            total: accepted_reader_denominators().documents
         })
     );
 
@@ -1382,7 +1423,7 @@ fn read_migration_phase_reconciles_stale_progress_from_manifest() {
         persisted.export_progress,
         Some(MigrationExportProgress {
             completed: 2,
-            total: accepted_reader_denominators().total()
+            total: accepted_reader_denominators().documents
         })
     );
 }

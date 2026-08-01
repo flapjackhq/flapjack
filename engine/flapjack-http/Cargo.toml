@@ -24,8 +24,8 @@ axum = "0.7"
 dashmap = "6.0"
 tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }
 tokio-stream = "0.1"
-tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.5", features = ["trace", "cors"] }
+tower = { version = "0.4", features = ["util", "limit"] }
+tower-http = { version = "0.5", features = ["trace", "cors", "timeout", "catch-panic"] }
 rust-embed = "8"
 mime_guess = "2"
 serde = { version = "1.0", features = ["derive"] }

@@ -43,11 +43,113 @@ Proof surfaces:
 - malformed or invalid credentials return the same canonical
   `{"message":"Invalid Application-ID or API key","status":403}` shape
 - malformed secured keys do not leak decode/parse internals in the response
+- secured-key credential parsing is hardened against malformed input; invalid
+  credentials are rejected without destabilizing request handling.
 
 Proof surfaces:
 
-- `cargo test -p flapjack --test test_security_audit`
 - `engine/flapjack-http/src/auth/mod.rs`
+- `engine/tests/credential_parser_http_probe.sh` — served-boundary probe against
+  a real running binary, not just the library function
+
+### Route authorization default
+
+- a request path matching no ACL rule is **denied**, not passed through to its
+  handler. Adding a route without an ACL entry therefore fails closed.
+- the index-collection `HEAD` route uses the same list-indexes ACL as the
+  corresponding collection read.
+
+Proof surfaces:
+
+- `engine/flapjack-http/src/auth/route_acl.rs::required_acl_for_route`
+- `engine/flapjack-http/src/auth_tests/middleware_tests.rs::route_acl_denies_unmapped_route_by_default`
+- `engine/flapjack-http/src/auth_tests/middleware_tests.rs::head_indexes_collection_honors_list_indexes_acl`
+- `engine/tests/authorization_boundary_http_probe.sh`
+
+### Admin credential transport
+
+- admin-ACL routes accept the API key **only** in the `x-algolia-api-key`
+  request header. The query-string credential form is refused on those routes.
+- search-scoped keys keep query-string support, so browser and InstantSearch
+  clients are unaffected.
+
+Proof surfaces:
+
+- `engine/flapjack-http/src/auth/middleware.rs`
+- `engine/flapjack-http/src/auth_tests/middleware_tests.rs::admin_api_key_in_query_string_is_rejected_for_key_routes`
+- `engine/flapjack-http/src/auth_tests/middleware_tests.rs::search_api_key_in_query_string_still_allows_search_route`
+- `engine/tests/authorization_boundary_http_probe.sh`
+
+### Analytics client-IP minimization
+
+- persisted analytics coarsen the client IP before the Parquet write: IPv4 to
+  /24 and IPv6 to /48. The full address is never written to disk (2026-07-31).
+- unparseable addresses are stored as null rather than as raw text.
+- existing Parquet files stay readable; historical data is not rewritten.
+
+Proof surfaces:
+
+- `engine/src/analytics/writer.rs::truncate_user_ip_for_analytics`
+- `engine/tests/test_analytics_ip_e2e.rs::served_search_persists_only_minimized_client_ip`
+
+### Container runtime posture
+
+- images built from `engine/Dockerfile` run as non-root `flapjack:flapjack` at
+  fixed UID/GID `10001:10001`. The numeric identity is pinned so base-image
+  upgrades cannot silently shift ownership of persisted volumes.
+- a pre-existing `/data` volume that is not writable by that identity causes an
+  actionable non-zero exit at startup rather than a later runtime failure.
+
+Proof surfaces:
+
+- `engine/Dockerfile`, `engine/entrypoint.sh`
+- `engine/tests/test_docker_runtime_e2e.sh`
+
+### Response security headers
+
+- API, embedded-dashboard, Swagger, and generated-error responses set a strict
+  content security policy, MIME-sniffing protection, a no-referrer policy, and
+  a restrictive permissions policy.
+- dashboard credential storage remains outside this verified claim; response
+  headers do not establish that browser-held credentials are safely stored.
+
+Proof surfaces:
+
+- `engine/flapjack-http/src/router.rs::insert_security_headers`
+- `engine/flapjack-http/src/router_inline_tests.rs::health_surface_has_expected_security_headers`
+- `engine/flapjack-http/src/router_inline_tests.rs::dashboard_surface_has_expected_security_headers`
+- `engine/flapjack-http/src/router_inline_tests.rs::swagger_surface_has_expected_security_headers`
+- `engine/tests/security_headers_http_probe.sh`
+
+### Request resource bounds
+
+- admitted requests share a configurable execution timeout and one global
+  concurrency limit; an excess request waits while an admitted request owns
+  the available slot.
+- panics crossing the router boundary are converted into canonical JSON error
+  responses carrying the request ID.
+
+Proof surfaces:
+
+- `engine/flapjack-http/src/router.rs::apply_middleware`
+- `engine/flapjack-http/src/middleware.rs::ensure_json_errors`
+- `engine/flapjack-http/src/router_inline_tests.rs::fault_sleep_times_out_with_canonical_json_error`
+- `engine/flapjack-http/src/router_inline_tests.rs::fault_panic_returns_canonical_json_error_with_request_id`
+- `engine/flapjack-http/src/router_inline_tests.rs::global_concurrency_limit_queues_health_while_fault_sleep_owns_slot`
+- `engine/tests/resource_bounds_http_probe.sh`
+
+### Dashboard dependency audit policy
+
+- the production dashboard dependency audit gate fails on high and critical
+  advisories and fails closed when its audit result cannot be validated.
+- production moderate advisories remain below this gate; this bounded control
+  does not claim that the remaining dashboard dependency risk is closed.
+
+Proof surfaces:
+
+- `.github/workflows/ci.yml`
+- `engine/dashboard/scripts/audit_gate.sh`
+- `engine/dashboard/scripts/audit_gate_fixture_test.sh`
 
 ### `restrictSources` coverage
 

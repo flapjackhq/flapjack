@@ -11,12 +11,50 @@ use flapjack::experiments::store::ExperimentStore;
 use flapjack::recommend::RecommendConfig;
 use flapjack_replication::manager::ReplicationManager;
 use std::ffi::OsString;
-use std::sync::Arc;
+use std::io;
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tower::ServiceExt;
+use tracing_subscriber::fmt::MakeWriter;
 
 use crate::geoip::GeoIpReader;
 use crate::handlers::AppState;
+
+#[derive(Clone, Default)]
+pub(crate) struct SharedLogBuffer {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedLogBuffer {
+    pub(crate) fn contents(&self) -> String {
+        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap()
+    }
+}
+
+pub(crate) struct SharedLogWriter {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl io::Write for SharedLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.buffer.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for SharedLogBuffer {
+    type Writer = SharedLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        SharedLogWriter {
+            buffer: Arc::clone(&self.buffer),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Process-global env-var mutation helper

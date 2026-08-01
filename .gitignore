@@ -130,11 +130,6 @@ sdks/javascript/.yarn/releases/
 
 .hashbrown
 
-# Tour video artifacts — stored in GitHub Releases, not in git
-# See: https://github.com/griddlehq/flapjack/releases/tag/tour-videos
-engine/dashboard/tour/videos/*.webm
-engine/dashboard/tour/videos/*.mp4
-
 chatting/
 
 # Stage 1 internal artifact untracking guards

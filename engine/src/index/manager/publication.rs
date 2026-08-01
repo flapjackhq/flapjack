@@ -41,6 +41,7 @@ pub use epoch::{
     PublicationEpochAdmissionError, PublicationEpochAdmissionGuard, PublicationEpochError,
     PublicationEpochFence, PublicationEpochPaths,
 };
+pub(crate) use executor::retire_committed_publication_journals;
 pub use executor::{
     abort_unjournaled_publication, activate_publication, activate_publication_with_fence,
     PreStagedActivationError, PreStagedActivationStage, PreStagedPublication,

@@ -1,19 +1,22 @@
 use super::*;
 use crate::auth::AuthenticatedAppId;
+use crate::handlers::indices::list_indices;
 use crate::handlers::migration::algolia_client::AlgoliaIndexRecord;
 use crate::handlers::migration::source_reader::{
-    MigrationSourceReader, PageConsumer, SourceFuture,
+    MeilisearchSourceReader, MigrationSourceReader, PageConsumer, SourceFuture,
+    TypesenseSourceReader,
 };
 use crate::handlers::migration::source_test_support::{
-    sorted_exact_hits_by_object_id, ScriptedSourceReader,
+    meilisearch_observation, sorted_exact_hits_by_object_id, typesense_observation,
+    ScriptedMeilisearchSource, ScriptedSourceReader, ScriptedTypesenseSource,
 };
 use crate::handlers::migration::spool::{
     AsyncMigrationPublicationSemantic, MigrationDisposition, MigrationExportProgress,
     MigrationImportOutcome, MigrationImportWarning, MigrationPhase, MigrationPhaseRecord,
 };
-use crate::test_helpers::{body_json, TestStateBuilder};
+use crate::test_helpers::{body_json, SharedLogBuffer, TestStateBuilder};
 use axum::body::Body;
-use axum::extract::Path as AxumPath;
+use axum::extract::{Path as AxumPath, Query};
 use axum::http::{Method, Request, Response};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -24,7 +27,8 @@ use flapjack::index::manager::publication::{
     PublicationPaths, PublicationTarget, PublicationTransactionId,
 };
 use serde_json::json;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -32,7 +36,11 @@ use std::sync::{
 use tempfile::TempDir;
 use tokio::sync::Notify;
 use tower::ServiceExt;
+use tracing_subscriber::layer::SubscriberExt;
 use uuid::Uuid;
+
+const ASYNC_STATUS_TERMINAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const ASYNC_LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn assert_import_outcome_fields_absent(body: &serde_json::Value) {
     assert!(body.get("settingsApplied").is_none());
@@ -177,12 +185,9 @@ async fn async_submit_returns_admission_snapshot_and_status_reads_durable_phase(
     assert_eq!(submitted.disposition, AsyncMigrationDisposition::Running);
     assert!(submitted.export_progress.is_none());
 
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        reached_documents.notified(),
-    )
-    .await
-    .expect("background import should reach document export");
+    tokio::time::timeout(ASYNC_LIFECYCLE_TIMEOUT, reached_documents.notified())
+        .await
+        .expect("background import should reach document export");
     let Json(current) = get_algolia_migration_status(
         State(Arc::clone(&state)),
         axum::extract::Extension(AuthenticatedAppId("async-owner-app".to_string())),
@@ -234,6 +239,7 @@ async fn async_terminal_status_reports_import_outcome_counts_and_warnings() {
     assert_eq!(
         warning_codes,
         BTreeSet::from([
+            "PersistedNoBehaviorSetting",
             "ReplicaExhaustiveSortApproximated",
             "ReplicaMatchingCriticalFieldDiverges",
             "ReplicaRelevancyStrictnessSemanticMismatch",
@@ -241,7 +247,7 @@ async fn async_terminal_status_reports_import_outcome_counts_and_warnings() {
     );
     assert_eq!(
         terminal.warnings.len(),
-        3,
+        4,
         "async status must not expose extra translation warnings"
     );
     let exhaustive_warning = terminal
@@ -784,6 +790,14 @@ fn migration_job_route_for_provider(
     provider: &'static str,
     state: Arc<AppState>,
 ) -> MigrationLifecycleRoutes {
+    migration_job_route_for_provider_with_test_source_factory(provider, state, None)
+}
+
+fn migration_job_route_for_provider_with_test_source_factory(
+    provider: &'static str,
+    state: Arc<AppState>,
+    test_source_factory: Option<TestMigrationSourceReaderFactory>,
+) -> MigrationLifecycleRoutes {
     let provider_routes = Router::new()
         .route("/", post(submit_algolia_migration_http))
         .route("/:job_id", get(get_algolia_migration_status_http))
@@ -793,6 +807,10 @@ fn migration_job_route_for_provider(
         )
         .route("/:job_id/cancel", post(cancel_algolia_migration_http))
         .with_state(state);
+    let provider_routes = match test_source_factory {
+        Some(factory) => provider_routes.layer(axum::extract::Extension(factory)),
+        None => provider_routes,
+    };
     let provider_routes = match AsyncMigrationSourceProvider::parse(provider) {
         Some(provider) => provider_routes.layer(axum::extract::Extension(provider)),
         None => provider_routes,
@@ -821,6 +839,69 @@ async fn send_submit_request(
         .header("content-type", "application/json")
         .header("x-algolia-api-key", api_key)
         .body(Body::from(payload.to_string()))
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(AuthenticatedAppId(authenticated_app_id.to_string()));
+    app.router.clone().oneshot(request).await.unwrap()
+}
+
+fn algolia_submit_payload(target_index: &str) -> serde_json::Value {
+    json!({
+        "appId": "LOCALMIGRATIONTEST",
+        "apiKey": "hermetic-source-key-not-used",
+        "sourceIndex": "source_products",
+        "targetIndex": target_index,
+        "overwrite": false
+    })
+}
+
+fn meilisearch_submit_payload(target_index: &str) -> serde_json::Value {
+    json!({
+        "endpoint": "https://your-instance.meilisearch.io",
+        "apiKey": "hermetic-meilisearch-key-not-used",
+        "sourceIndex": "source_products",
+        "targetIndex": target_index,
+        "overwrite": false
+    })
+}
+
+fn typesense_submit_payload(target_index: &str) -> serde_json::Value {
+    typesense_submit_payload_with_key(target_index, "hermetic-typesense-key-not-used")
+}
+
+fn typesense_submit_payload_with_key(target_index: &str, api_key: &str) -> serde_json::Value {
+    json!({
+        "node": "https://tenant.typesense.net",
+        "apiKey": api_key,
+        "sourceIndex": "source_products",
+        "targetIndex": target_index,
+        "overwrite": false
+    })
+}
+
+async fn job_uuid_from_submit_response(response: Response<Body>) -> Uuid {
+    let body = body_json(response).await;
+    Uuid::parse_str(
+        body["jobId"]
+            .as_str()
+            .expect("submit response must include jobId"),
+    )
+    .unwrap()
+}
+
+async fn send_raw_submit_request(
+    app: &MigrationLifecycleRoutes,
+    authenticated_app_id: &str,
+    api_key: &str,
+    body: &'static str,
+) -> Response<Body> {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/1/migrations/{}", app.provider))
+        .header("content-type", "application/json")
+        .header("x-algolia-api-key", api_key)
+        .body(Body::from(body))
         .unwrap();
     request
         .extensions_mut()
@@ -900,7 +981,33 @@ async fn send_migration_job_request(
 }
 
 #[tokio::test]
-async fn async_submit_spool_failure_returns_sanitized_500_without_spawning_source() {
+async fn algolia_malformed_submit_body_keeps_json_error_contract() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let app = migration_job_route_for_provider("algolia", Arc::clone(&state));
+
+    let response = send_raw_submit_request(
+        &app,
+        "malformed-body-owner",
+        "malformed-body-key",
+        "{\"appId\":\"LOCALMIGRATIONTEST\"",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(response).await,
+        json!({
+            "message": "Invalid migration request body",
+            "status": 400
+        }),
+        "Algolia malformed submit bodies must keep the existing JSON error envelope"
+    );
+    assert_eq!(state.migration_runner.active_count_for_test(), 0);
+}
+
+#[tokio::test]
+async fn async_submit_spool_failure_returns_sanitized_500_without_spawning_import() {
     let tmp = TempDir::new().unwrap();
     std::fs::write(tmp.path().join("migration_exports"), b"not a directory").unwrap();
     let state = TestStateBuilder::new(&tmp).build_shared();
@@ -927,7 +1034,10 @@ async fn async_submit_spool_failure_returns_sanitized_500_without_spawning_sourc
             "status": 500
         })
     );
-    assert!(!source_factory_invoked.load(Ordering::SeqCst));
+    assert!(
+        source_factory_invoked.load(Ordering::SeqCst),
+        "reader construction must precede spool initialization so construction failure leaves no spool residue"
+    );
     assert_eq!(state.migration_runner.active_count_for_test(), 0);
 }
 
@@ -1247,94 +1357,417 @@ fn async_migration_source_provider_parser_pins_closed_public_union() {
     );
 }
 
-async fn assert_unsupported_provider_skips_source_factory(
-    source_provider: AsyncMigrationSourceProvider,
-    state: Arc<AppState>,
-) {
-    let source_factory_observed = Arc::new(AtomicBool::new(false));
-    let factory_error = submit_source_migration_with_test_source_factory(
-        source_provider,
-        State(state),
-        axum::extract::Extension(AuthenticatedAppId("unsupported-provider-owner".to_string())),
-        Json(valid_async_request()),
-        {
-            let source_factory_observed = Arc::clone(&source_factory_observed);
-            move |_| -> Result<ScriptedSourceReader, AlgoliaClientError> {
-                source_factory_observed.store(true, Ordering::SeqCst);
-                Err(AlgoliaClientError::new(
-                    AlgoliaErrorKind::Validation,
-                    "unsupported provider reached source construction",
-                ))
-            }
-        },
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn valid_typesense_submission_is_admitted_through_shared_lifecycle() {
+    const OWNER_APP: &str = "typesense-admission-owner";
+    const OWNER_KEY: &str = "typesense-admission-key";
+    const TARGET_INDEX: &str = "typesense_admission_target";
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let spool = import::spool_for_manager(&state.manager).unwrap();
+    let app = migration_job_route_for_provider_with_test_source_factory(
+        "typesense",
+        Arc::clone(&state),
+        Some(TestMigrationSourceReaderFactory::new(|source_provider| {
+            assert_eq!(source_provider, AsyncMigrationSourceProvider::Typesense);
+            Ok(Box::new(async_hermetic_typesense_source_reader()))
+        })),
+    );
+
+    let response = send_submit_request(
+        &app,
+        OWNER_APP,
+        OWNER_KEY,
+        typesense_submit_payload(TARGET_INDEX),
     )
-    .await
-    .expect_err("recognized unsupported providers must fail before source construction");
-    let (factory_error_status, Json(factory_error_body)) = factory_error;
+    .await;
 
     assert_eq!(
-        (
-            source_factory_observed.load(Ordering::SeqCst),
-            factory_error_status,
-            factory_error_body["code"].as_str(),
-        ),
-        (
-            false,
-            StatusCode::BAD_REQUEST,
-            Some(SOURCE_PROVIDER_UNSUPPORTED_CODE),
-        ),
-        "{} must not construct an outbound source reader",
-        source_provider.as_str().unwrap()
+        response.status(),
+        StatusCode::ACCEPTED,
+        "valid Typesense submissions must enter the shared async lifecycle"
+    );
+    let job_uuid = job_uuid_from_submit_response(response).await;
+    let metadata = spool.read_async_migration_metadata(job_uuid).unwrap();
+    assert_eq!(
+        metadata.source_provider,
+        AsyncMigrationSourceProvider::Typesense
+    );
+    assert_eq!(metadata.target_index, TARGET_INDEX);
+    let terminal = wait_for_route_terminal(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
+    assert_eq!(terminal["disposition"], "succeeded");
+
+    for wrong_provider in ["algolia", "meilisearch"] {
+        let wrong_provider_route =
+            migration_job_route_for_provider(wrong_provider, Arc::clone(&state));
+        assert_migration_job_not_found(
+            send_status_request(&wrong_provider_route, job_uuid, OWNER_APP, OWNER_KEY).await,
+            "wrong-provider status",
+        )
+        .await;
+        assert_migration_job_not_found(
+            send_cancel_request(&wrong_provider_route, job_uuid, OWNER_APP, OWNER_KEY).await,
+            "wrong-provider cancel",
+        )
+        .await;
+        assert_migration_job_not_found(
+            send_acknowledge_request(&wrong_provider_route, job_uuid, OWNER_APP, OWNER_KEY).await,
+            "wrong-provider acknowledge",
+        )
+        .await;
+    }
+
+    assert_eq!(
+        send_cancel_request(&app, job_uuid, OWNER_APP, OWNER_KEY)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send_acknowledge_request(&app, job_uuid, OWNER_APP, OWNER_KEY)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
     );
 }
 
 #[tokio::test]
-async fn unsupported_source_provider_admission_refuses_before_persistence_or_source_use() {
-    const SPOOL_POISON: &[u8] = b"unsupported provider must not access the migration spool";
+async fn malformed_meilisearch_payloads_reject_before_persistence_or_source_use() {
+    const SPOOL_POISON: &[u8] = b"invalid payload must not access the migration spool";
 
     let tmp = TempDir::new().unwrap();
     let spool_root = tmp.path().join("migration_exports");
     std::fs::write(&spool_root, SPOOL_POISON).unwrap();
     let state = TestStateBuilder::new(&tmp).build_shared();
+    let app = migration_job_route_for_provider("meilisearch", Arc::clone(&state));
 
-    for app in public_provider_migration_routes(&state)
-        .into_iter()
-        .filter(|app| app.provider != AsyncMigrationSourceProvider::Algolia.as_str().unwrap())
-    {
-        let source_provider = AsyncMigrationSourceProvider::parse(app.provider).unwrap();
-        assert_unsupported_provider_skips_source_factory(source_provider, Arc::clone(&state)).await;
-
+    for (target_index, payload) in [
+        (
+            "meilisearch_wrong_shape_target",
+            json!({
+                "appId": "algolia-shaped-app",
+                "apiKey": "unused-key-canary",
+                "sourceIndex": "source",
+                "targetIndex": "meilisearch_wrong_shape_target"
+            }),
+        ),
+        (
+            "meilisearch_mixed_shape_target",
+            json!({
+                "endpoint": "https://your-instance.meilisearch.io",
+                "apiKey": "meilisearch-secret-canary",
+                "sourceIndex": "source_products",
+                "targetIndex": "meilisearch_mixed_shape_target",
+                "overwrite": false,
+                "appId": "algolia-app-canary"
+            }),
+        ),
+    ] {
+        let residue_before = rejected_admission_residue_snapshot(&state, target_index);
         let response = send_submit_request(
             &app,
-            "unsupported-provider-owner",
-            "unsupported-provider-key",
-            json!({
-                "appId": "unused_app",
-                "apiKey": "unused_key",
-                "sourceIndex": "source",
-                "targetIndex": format!("{}_target", app.provider)
-            }),
+            "malformed-provider-owner",
+            "malformed-provider-key",
+            payload,
         )
         .await;
 
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(state.migration_runner.active_count_for_test(), 0);
         assert_eq!(
-            std::fs::read(&spool_root).expect("poisoned spool root must remain readable"),
-            SPOOL_POISON,
-            "{} admission must not replace or mutate the poisoned spool root",
-            app.provider
+            rejected_admission_residue_snapshot(&state, target_index),
+            residue_before
         );
-        assert_eq!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
-            "{} must be refused before credential use or durable admission",
-            app.provider
-        );
-        let body = body_json(response).await;
-        assert_eq!(body["code"], SOURCE_PROVIDER_UNSUPPORTED_CODE);
-        assert_eq!(body["message"], SOURCE_PROVIDER_UNSUPPORTED_MESSAGE);
-        assert_eq!(body["status"], 400);
+        let body = body_json(response).await.to_string();
+        assert!(!body.contains("unused-key-canary"));
+        assert!(!body.contains("meilisearch-secret-canary"));
+        assert!(!body.contains("algolia-app-canary"));
     }
+
+    assert_eq!(std::fs::read(spool_root).unwrap(), SPOOL_POISON);
+}
+
+async fn assert_target_not_listed(state: &Arc<AppState>, target_index: &str, reason: &str) {
+    assert!(
+        !state.manager.base_path.join(target_index).exists(),
+        "{reason}: target directory {target_index:?} exists"
+    );
+    let Json(indices) = list_indices(State(Arc::clone(state)), Query(HashMap::new()))
+        .await
+        .expect("index list should remain readable while checking rejected migration residue");
+    assert!(
+        indices.items.iter().all(|item| item.name != target_index),
+        "{reason}: target index {target_index:?} is listable"
+    );
+}
+
+fn rejected_admission_residue_snapshot(
+    state: &Arc<AppState>,
+    target_index: &str,
+) -> BTreeMap<&'static str, PathSnapshot> {
+    let mut snapshot = target_publication_residue_snapshot(state, target_index);
+    snapshot.insert(
+        "publication_receipt_spool",
+        path_snapshot(&state.manager.base_path.join("migration_exports")),
+    );
+    snapshot
+}
+
+fn target_publication_residue_snapshot(
+    state: &Arc<AppState>,
+    target_index: &str,
+) -> BTreeMap<&'static str, PathSnapshot> {
+    BTreeMap::from([
+        (
+            "target_index",
+            path_snapshot(&state.manager.base_path.join(target_index)),
+        ),
+        (
+            "publication_target_namespace",
+            path_snapshot(
+                &state
+                    .manager
+                    .base_path
+                    .join(".publication")
+                    .join(target_index),
+            ),
+        ),
+        (
+            "publication_quarantine_namespace",
+            path_snapshot(
+                &state
+                    .manager
+                    .base_path
+                    .join(".publication_quarantine")
+                    .join(target_index),
+            ),
+        ),
+    ])
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PathSnapshot {
+    Missing,
+    File(Vec<u8>),
+    Directory(BTreeMap<PathBuf, Vec<u8>>),
+}
+
+fn path_snapshot(path: &Path) -> PathSnapshot {
+    if !path.exists() {
+        return PathSnapshot::Missing;
+    }
+    if path.is_file() {
+        return PathSnapshot::File(std::fs::read(path).unwrap());
+    }
+    let mut files = BTreeMap::new();
+    collect_path_snapshot(path, path, &mut files);
+    PathSnapshot::Directory(files)
+}
+
+fn collect_path_snapshot(root: &Path, current: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+    let mut entries = std::fs::read_dir(current)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            collect_path_snapshot(root, &path, files);
+        } else {
+            files.insert(
+                path.strip_prefix(root).unwrap().to_path_buf(),
+                std::fs::read(path).unwrap(),
+            );
+        }
+    }
+}
+
+fn capture_logs(logs: &SharedLogBuffer) -> tracing::subscriber::DefaultGuard {
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .without_time()
+            .with_writer(logs.clone()),
+    );
+    tracing::subscriber::set_default(subscriber)
+}
+
+fn assert_secret_absent(secret: &str, surfaces: &[(&str, &str)]) {
+    for (surface_name, surface) in surfaces {
+        assert!(
+            !surface.contains(secret),
+            "Typesense credential leaked through {surface_name}: {surface}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn typesense_provider_payload_mismatch_rejects_before_persistence() {
+    const TARGET_INDEX: &str = "typesense_payload_mismatch_target";
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let source_factory_observed = Arc::new(AtomicBool::new(false));
+    let app = migration_job_route_for_provider_with_test_source_factory(
+        "typesense",
+        Arc::clone(&state),
+        Some(TestMigrationSourceReaderFactory::new({
+            let source_factory_observed = Arc::clone(&source_factory_observed);
+            move |_| {
+                source_factory_observed.store(true, Ordering::SeqCst);
+                Ok(Box::new(async_hermetic_source_reader()))
+            }
+        })),
+    );
+    let residue_before = rejected_admission_residue_snapshot(&state, TARGET_INDEX);
+    let response = send_submit_request(
+        &app,
+        "typesense-owner",
+        "typesense-owner-key",
+        meilisearch_submit_payload(TARGET_INDEX),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(response).await,
+        json!({
+            "message": "Typesense payload does not match source_provider",
+            "status": 400,
+            "code": "source_provider_payload_mismatch"
+        })
+    );
+    assert_eq!(state.migration_runner.active_count_for_test(), 0);
+    assert!(!source_factory_observed.load(Ordering::SeqCst));
+    assert_target_not_listed(
+        &state,
+        TARGET_INDEX,
+        "payload mismatch must reject before target creation",
+    )
+    .await;
+    assert_eq!(
+        rejected_admission_residue_snapshot(&state, TARGET_INDEX),
+        residue_before,
+        "payload mismatch must reject before runner, spool, target, publication, receipt, or quarantine persistence"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn typesense_credentials_never_reach_logs_errors_spool_or_public_json() {
+    const TYPESENSE_KEY_CANARY: &str = "typesense-stage1-secret-key-canary";
+    const TARGET_INDEX: &str = "typesense_secret_residue_target";
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let logs = SharedLogBuffer::default();
+    let _subscriber_guard = capture_logs(&logs);
+    let source_error = AlgoliaClientError::new(
+        AlgoliaErrorKind::Transport,
+        "Typesense endpoint is unreachable",
+    );
+    let error_debug = format!("{source_error:?}");
+    let app = migration_job_route_for_provider_with_test_source_factory(
+        "typesense",
+        Arc::clone(&state),
+        Some(TestMigrationSourceReaderFactory::new(move |_| {
+            Err(source_error.clone())
+        })),
+    );
+    let residue_before = rejected_admission_residue_snapshot(&state, TARGET_INDEX);
+    let response = send_submit_request(
+        &app,
+        "typesense-owner",
+        "typesense-owner-key",
+        typesense_submit_payload_with_key(TARGET_INDEX, TYPESENSE_KEY_CANARY),
+    )
+    .await;
+    let response_debug = format!("{response:?}");
+    let response_status = response.status();
+    let body = body_json(response).await;
+    let public_json = serde_json::to_string(&body).unwrap();
+    let residue_after = rejected_admission_residue_snapshot(&state, TARGET_INDEX);
+    let durable_status_debug = format!("{residue_after:?}");
+    let captured_logs = logs.contents();
+
+    assert_secret_absent(
+        TYPESENSE_KEY_CANARY,
+        &[
+            ("response debug", response_debug.as_str()),
+            ("source error debug", error_debug.as_str()),
+            ("public error JSON", public_json.as_str()),
+            ("durable status/spool debug", durable_status_debug.as_str()),
+            ("captured logs", captured_logs.as_str()),
+        ],
+    );
+    assert_eq!(response_status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        body,
+        json!({
+            "message": "Typesense endpoint is unreachable",
+            "status": 502
+        })
+    );
+    assert_eq!(state.migration_runner.active_count_for_test(), 0);
+    assert_target_not_listed(
+        &state,
+        TARGET_INDEX,
+        "source-construction failure must not create a target",
+    )
+    .await;
+    assert_eq!(
+        residue_after, residue_before,
+        "source-construction failure must not persist job status, spool, target, publication, receipt, or quarantine residue"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn typesense_changed_source_after_export_blocks_publication() {
+    const TARGET_INDEX: &str = "typesense_changed_source_target";
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let logs = SharedLogBuffer::default();
+    let _subscriber_guard = capture_logs(&logs);
+    let app = migration_job_route_for_provider_with_test_source_factory(
+        "typesense",
+        Arc::clone(&state),
+        Some(TestMigrationSourceReaderFactory::new(|provider| {
+            assert_eq!(provider, AsyncMigrationSourceProvider::Typesense);
+            Ok(Box::new(async_source_reader_with_final_drift()))
+        })),
+    );
+    let publication_before = target_publication_residue_snapshot(&state, TARGET_INDEX);
+    let response = send_submit_request(
+        &app,
+        "typesense-owner",
+        "typesense-owner-key",
+        typesense_submit_payload(TARGET_INDEX),
+    )
+    .await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::ACCEPTED,
+        "Typesense drift must be exercised after shared lifecycle admission"
+    );
+    let job_uuid = job_uuid_from_submit_response(response).await;
+    let terminal =
+        wait_for_route_terminal(&app, job_uuid, "typesense-owner", "typesense-owner-key").await;
+    state.migration_runner.drain_active_imports().await;
+
+    assert_eq!(terminal["disposition"], "failed");
+    assert_import_outcome_fields_absent(&terminal);
+    assert_target_not_listed(
+        &state,
+        TARGET_INDEX,
+        "source drift must block target publication",
+    )
+    .await;
+    assert_eq!(
+        target_publication_residue_snapshot(&state, TARGET_INDEX),
+        publication_before,
+        "source drift must leave target, publication, and quarantine namespaces absent"
+    );
+    assert!(
+        logs.contents().contains("Source changed during export"),
+        "source drift must retain the shared scrubbed error in captured logs"
+    );
 }
 
 #[tokio::test]
@@ -1373,32 +1806,6 @@ async fn unknown_source_provider_submit_route_remains_unmapped() {
         response_code.as_deref(),
         Some(SOURCE_PROVIDER_UNSUPPORTED_CODE),
         "an unknown route must not be classified as a recognized unsupported provider"
-    );
-}
-
-fn bind_job_specimen_to_provider(
-    spool: &spool::SpoolStore,
-    job_uuid: Uuid,
-    source_provider: AsyncMigrationSourceProvider,
-) {
-    let path = spool.async_migration_metadata_path(job_uuid);
-    let mut wire: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    match source_provider.as_str().unwrap() {
-        "algolia" => {
-            wire.as_object_mut().unwrap().remove("source_provider");
-        }
-        provider => {
-            wire["source_provider"] = json!(provider);
-        }
-    }
-    std::fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
-    assert_eq!(
-        spool
-            .read_async_migration_metadata(job_uuid)
-            .unwrap()
-            .source_provider,
-        source_provider
     );
 }
 
@@ -1513,85 +1920,299 @@ async fn all_source_providers_share_one_migration_job_runner_and_spool() {
         .build_shared();
     let reached_documents = Arc::new(Notify::new());
     let release_documents = Arc::new(Notify::new());
+    let factory_reached = Arc::clone(&reached_documents);
+    let factory_release = Arc::clone(&release_documents);
+    let source_factory =
+        TestMigrationSourceReaderFactory::new(move |source_provider| match source_provider {
+            AsyncMigrationSourceProvider::Algolia => {
+                Ok(Box::new(BlockingDocumentReadSourceReader::new(
+                    async_hermetic_source_reader(),
+                    Arc::clone(&factory_reached),
+                    Arc::clone(&factory_release),
+                )))
+            }
+            AsyncMigrationSourceProvider::Meilisearch => {
+                Ok(Box::new(async_hermetic_meilisearch_source_reader()))
+            }
+            AsyncMigrationSourceProvider::Typesense => {
+                Ok(Box::new(async_hermetic_typesense_source_reader()))
+            }
+        });
+
+    let algolia_app = migration_job_route_for_provider_with_test_source_factory(
+        "algolia",
+        Arc::clone(&state),
+        Some(source_factory.clone()),
+    );
+    let algolia_submit = send_submit_request(
+        &algolia_app,
+        OWNER_APP,
+        OWNER_KEY,
+        algolia_submit_payload("async_migrated_products"),
+    )
+    .await;
+    assert_eq!(algolia_submit.status(), StatusCode::ACCEPTED);
+    let algolia_job_uuid = job_uuid_from_submit_response(algolia_submit).await;
+    tokio::time::timeout(ASYNC_LIFECYCLE_TIMEOUT, reached_documents.notified())
+        .await
+        .expect("shared runner should reach document export");
+
+    let shared_runner_active_jobs = state.migration_runner.active_count_for_test();
+    for (provider, payload) in [
+        (
+            "meilisearch",
+            meilisearch_submit_payload("meilisearch_capacity_probe"),
+        ),
+        (
+            "typesense",
+            typesense_submit_payload("typesense_capacity_probe"),
+        ),
+    ] {
+        let competing_app = migration_job_route_for_provider_with_test_source_factory(
+            provider,
+            Arc::clone(&state),
+            Some(source_factory.clone()),
+        );
+        let competing_admission =
+            send_submit_request(&competing_app, OWNER_APP, OWNER_KEY, payload).await;
+        assert_eq!(
+            competing_admission.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{provider} must consume the shared capacity-one runner"
+        );
+    }
+    assert_eq!(
+        send_status_request(&algolia_app, algolia_job_uuid, OWNER_APP, OWNER_KEY)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send_acknowledge_request(&algolia_app, algolia_job_uuid, OWNER_APP, OWNER_KEY)
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        send_cancel_request(&algolia_app, algolia_job_uuid, OWNER_APP, OWNER_KEY)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    release_documents.notify_waiters();
+    let terminal =
+        wait_for_route_terminal(&algolia_app, algolia_job_uuid, OWNER_APP, OWNER_KEY).await;
+    assert_eq!(terminal["disposition"], "cancelled");
+    state.migration_runner.drain_active_imports().await;
+
+    assert_eq!(
+        shared_runner_active_jobs, 1,
+        "provider-private runner forked lifecycle ownership: the shared runner did not account for its admitted job"
+    );
+
+    for (provider, payload) in [
+        (
+            "meilisearch",
+            meilisearch_submit_payload("meili_shared_runner_target"),
+        ),
+        (
+            "typesense",
+            typesense_submit_payload("typesense_shared_runner_target"),
+        ),
+    ] {
+        let app = migration_job_route_for_provider_with_test_source_factory(
+            provider,
+            Arc::clone(&state),
+            Some(source_factory.clone()),
+        );
+        let submit = send_submit_request(&app, OWNER_APP, OWNER_KEY, payload).await;
+        assert_eq!(submit.status(), StatusCode::ACCEPTED);
+        let job_uuid = job_uuid_from_submit_response(submit).await;
+        assert_eq!(
+            send_status_request(&app, job_uuid, OWNER_APP, OWNER_KEY)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let terminal = wait_for_route_terminal(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
+        assert_eq!(terminal["disposition"], "succeeded");
+        state.migration_runner.drain_active_imports().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scripted_meilisearch_submission_persists_provider_through_shared_lifecycle() {
+    const OWNER_APP: &str = "meili-shared-owner";
+    const OWNER_KEY: &str = "meili-shared-key";
+    const TARGET: &str = "meili_async_products";
+
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let spool = import::spool_for_manager(&state.manager).unwrap();
     let owner_identity = authenticated_owner_identity(
         OWNER_APP.to_string(),
         &migration_owner_headers(Some(OWNER_KEY)),
     );
 
-    let (job_uuid, _) = state
+    let (job_uuid, submitted) = state
         .migration_runner
-        .submit_algolia_import_for_owner(valid_async_request(), Some(owner_identity), {
-            let reached_documents = Arc::clone(&reached_documents);
-            let release_documents = Arc::clone(&release_documents);
-            move |_| {
-                Ok(BlockingDocumentReadSourceReader::new(
-                    async_hermetic_source_reader(),
-                    reached_documents,
-                    release_documents,
-                ))
-            }
-        })
+        .submit_meilisearch_import_for_owner(
+            valid_meilisearch_async_request(TARGET),
+            Some(owner_identity),
+            |_| Ok(async_hermetic_meilisearch_source_reader()),
+        )
         .await
-        .expect("provider admission should flow through the shared lifecycle owner");
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        reached_documents.notified(),
-    )
-    .await
-    .expect("shared runner should reach document export");
+        .expect("scripted Meilisearch submission should be admitted by the shared runner");
+    assert_eq!(submitted.phase, MigrationPhase::Submitted);
+    assert_eq!(submitted.disposition, MigrationDisposition::Running);
+    assert_eq!(state.migration_runner.active_count_for_test(), 1);
 
-    let shared_runner_active_jobs = state.migration_runner.active_count_for_test();
-    let second_admission = state
-        .migration_runner
-        .submit_algolia_import_for_owner(valid_async_request(), None, |_| {
-            Ok(async_hermetic_source_reader())
-        })
-        .await
-        .expect_err("shared provider admission must respect the one shared capacity limit");
-    assert_eq!(second_admission.0, StatusCode::SERVICE_UNAVAILABLE);
-    for app in public_provider_migration_routes(&state) {
-        bind_job_specimen_to_provider(
-            &import::spool_for_manager(&state.manager).unwrap(),
-            job_uuid,
-            AsyncMigrationSourceProvider::parse(app.provider).unwrap(),
-        );
-        assert_eq!(
-            send_status_request(&app, job_uuid, OWNER_APP, OWNER_KEY)
-                .await
-                .status(),
-            StatusCode::OK,
-            "{} status must use the shared spool",
-            app.provider
-        );
-        assert_eq!(
-            send_acknowledge_request(&app, job_uuid, OWNER_APP, OWNER_KEY)
-                .await
-                .status(),
-            StatusCode::CONFLICT,
-            "{} ACK must observe the shared running state",
-            app.provider
-        );
-        assert_eq!(
-            send_cancel_request(&app, job_uuid, OWNER_APP, OWNER_KEY)
-                .await
-                .status(),
-            StatusCode::OK,
-            "{} cancel must mutate the shared spool",
-            app.provider
-        );
-    }
-    bind_job_specimen_to_provider(
-        &import::spool_for_manager(&state.manager).unwrap(),
-        job_uuid,
-        AsyncMigrationSourceProvider::Algolia,
-    );
-    release_documents.notify_waiters();
-    let terminal = wait_for_async_terminal(&state, job_uuid, OWNER_APP, Some(OWNER_KEY)).await;
-    assert_eq!(terminal.disposition, AsyncMigrationDisposition::Cancelled);
-
+    let metadata = spool.read_async_migration_metadata(job_uuid).unwrap();
     assert_eq!(
-        shared_runner_active_jobs, 1,
-        "provider-private runner forked lifecycle ownership: the shared runner did not account for its admitted job"
+        metadata.source_provider,
+        AsyncMigrationSourceProvider::Meilisearch
+    );
+    assert_eq!(
+        metadata.operation_kind,
+        spool::AsyncMigrationOperationKind::SourceImport
+    );
+    assert_eq!(metadata.target_index, TARGET);
+
+    let app = migration_job_route_for_provider("meilisearch", Arc::clone(&state));
+    let status = send_status_request(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
+    assert_eq!(status.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(status).await["targetIndex"],
+        json!(TARGET),
+        "status must read Meilisearch metadata from the shared spool"
+    );
+
+    let terminal = wait_for_route_terminal(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
+    assert_eq!(terminal["disposition"], "succeeded");
+    assert!(terminal.get("terminalAt").is_some());
+    assert_eq!(
+        spool
+            .read_async_migration_metadata(job_uuid)
+            .unwrap()
+            .source_provider,
+        AsyncMigrationSourceProvider::Meilisearch
+    );
+
+    let wrong_alias = migration_job_route(Arc::clone(&state));
+    assert_migration_job_not_found(
+        send_status_request(&wrong_alias, job_uuid, OWNER_APP, OWNER_KEY).await,
+        "Algolia status for Meilisearch job",
+    )
+    .await;
+
+    let acknowledge = send_acknowledge_request(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
+    assert_eq!(acknowledge.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meilisearch_http_submission_uses_shared_cancel_recovery_ack_and_gc_lifecycle() {
+    const OWNER_APP: &str = "meili-http-owner";
+    const OWNER_KEY: &str = "meili-http-key";
+    const TARGET: &str = "meili_http_cancel_products";
+
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let reached_documents = Arc::new(Notify::new());
+    let release_documents = Arc::new(Notify::new());
+    let factory_reached = Arc::clone(&reached_documents);
+    let factory_release = Arc::clone(&release_documents);
+    let source_factory = TestMigrationSourceReaderFactory::new(move |source_provider| {
+        assert_eq!(source_provider, AsyncMigrationSourceProvider::Meilisearch);
+        Ok(Box::new(BlockingDocumentReadSourceReader::new(
+            async_hermetic_meilisearch_source_reader(),
+            Arc::clone(&factory_reached),
+            Arc::clone(&factory_release),
+        )))
+    });
+    let app = migration_job_route_for_provider_with_test_source_factory(
+        "meilisearch",
+        Arc::clone(&state),
+        Some(source_factory),
+    );
+
+    let submit = send_submit_request(
+        &app,
+        OWNER_APP,
+        OWNER_KEY,
+        json!({
+            "endpoint": "https://your-instance.meilisearch.io",
+            "apiKey": "meili-http-secret-not-used",
+            "sourceIndex": "source_products",
+            "targetIndex": TARGET,
+            "overwrite": false
+        }),
+    )
+    .await;
+    assert_eq!(submit.status(), StatusCode::ACCEPTED);
+    let submitted = body_json(submit).await;
+    let job_uuid = Uuid::parse_str(
+        submitted["jobId"]
+            .as_str()
+            .expect("submit response must include jobId"),
+    )
+    .unwrap();
+    assert_eq!(submitted["disposition"], "running");
+
+    tokio::time::timeout(ASYNC_LIFECYCLE_TIMEOUT, reached_documents.notified())
+        .await
+        .expect("HTTP-submitted Meilisearch job should reach shared document export");
+    let spool = import::spool_for_manager(&state.manager).unwrap();
+    assert_eq!(
+        spool
+            .read_async_migration_metadata(job_uuid)
+            .unwrap()
+            .source_provider,
+        AsyncMigrationSourceProvider::Meilisearch
+    );
+
+    let cancel = send_cancel_request(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
+    assert_eq!(cancel.status(), StatusCode::OK);
+    assert_eq!(body_json(cancel).await["disposition"], "running");
+    release_documents.notify_waiters();
+    let terminal = wait_for_route_terminal(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
+    assert_eq!(terminal["disposition"], "cancelled");
+    assert!(terminal.get("terminalAt").is_some());
+    state.migration_runner.drain_active_imports().await;
+
+    let reopened = spool::SpoolStore::new(&state.manager.base_path, spool::SpoolLimits::default())
+        .expect("shared spool must reopen after HTTP Meilisearch submit");
+    assert_eq!(
+        reopened
+            .read_async_migration_metadata(job_uuid)
+            .unwrap()
+            .source_provider,
+        AsyncMigrationSourceProvider::Meilisearch
+    );
+    let wrong_alias = migration_job_route(Arc::clone(&state));
+    assert_migration_job_not_found(
+        send_status_request(&wrong_alias, job_uuid, OWNER_APP, OWNER_KEY).await,
+        "Algolia status for HTTP-submitted Meilisearch job",
+    )
+    .await;
+
+    let acknowledge = send_acknowledge_request(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
+    assert_eq!(acknowledge.status(), StatusCode::NO_CONTENT);
+    let limits = spool::SpoolLimits {
+        retention_seconds: 0,
+        ..Default::default()
+    };
+    let gc_store = spool::SpoolStore::new_for_tests(
+        tmp.path(),
+        limits,
+        Utc::now() + chrono::Duration::seconds(1),
+        10_000,
+    )
+    .unwrap();
+    gc_store.collect_garbage().unwrap();
+    assert_eq!(
+        gc_store.read_migration_phase(job_uuid).unwrap().disposition,
+        MigrationDisposition::Cancelled,
+        "terminal GC must follow the shared retention owner and keep control-plane phase readable"
     );
 }
 
@@ -1599,6 +2220,87 @@ async fn all_source_providers_share_one_migration_job_runner_and_spool() {
 async fn shared_migration_lifecycle_has_no_duplicate_owner_seams() {
     let sources = production_rust_sources();
 
+    assert_shared_migration_lifecycle_owners(&sources);
+}
+
+#[test]
+fn shared_migration_lifecycle_rejects_provider_private_meilisearch_owner_mutations() {
+    let mutations = [
+        (
+            "provider-private runner",
+            "flapjack-http/src/handlers/migration/meilisearch_runner.rs",
+            "MigrationJobRunner::new(",
+        ),
+        (
+            "provider-private spool",
+            "flapjack-http/src/handlers/migration/meilisearch_spool.rs",
+            "SpoolStore::new(",
+        ),
+        (
+            "provider-private status handler",
+            "flapjack-http/src/handlers/migration/meilisearch_status.rs",
+            "async fn get_source_migration_status(",
+        ),
+        (
+            "provider-private cancel handler",
+            "flapjack-http/src/handlers/migration/meilisearch_cancel.rs",
+            "async fn cancel_source_migration(",
+        ),
+        (
+            "provider-private ACK handler",
+            "flapjack-http/src/handlers/migration/meilisearch_ack.rs",
+            "async fn acknowledge_source_migration(",
+        ),
+        (
+            "provider-private publication receipt",
+            "flapjack-http/src/handlers/migration/meilisearch_publication_receipt.rs",
+            "record_async_publication_receipt_if_present(",
+        ),
+        (
+            "provider-private publication journal",
+            "src/index/manager/publication/meilisearch_journal.rs",
+            "persist_journal(",
+        ),
+        (
+            "provider-private publication journal write",
+            "src/index/manager/publication/meilisearch_journal.rs",
+            "io.write_file(",
+        ),
+    ];
+
+    for (label, path, marker) in mutations {
+        let mut sources = production_rust_sources();
+        sources.push((path.to_string(), marker.to_string()));
+
+        let rejected =
+            std::panic::catch_unwind(|| assert_shared_migration_lifecycle_owners(&sources));
+
+        let panic_message = panic_message(
+            rejected
+                .expect_err("provider-private mutation must be rejected by the exact-owner guard"),
+        );
+        assert!(
+            panic_message.contains(path),
+            "{label} mutation must name injected path {path}; panic was {panic_message}"
+        );
+        assert!(
+            panic_message.contains(marker),
+            "{label} mutation must name injected marker {marker}; panic was {panic_message}"
+        );
+    }
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+fn assert_shared_migration_lifecycle_owners(sources: &[(String, String)]) {
     let expected_owners: &[(&str, &[(&str, usize)])] = &[
         (
             "MigrationJobRunner::new(",
@@ -1619,7 +2321,14 @@ async fn shared_migration_lifecycle_has_no_duplicate_owner_seams() {
         (
             "create_async_migration_admission_for_owner(",
             &[
-                ("flapjack-http/src/handlers/migration/job_runner.rs", 2),
+                ("flapjack-http/src/handlers/migration/job_runner.rs", 1),
+                ("flapjack-http/src/handlers/migration/spool.rs", 2),
+            ],
+        ),
+        (
+            "create_async_migration_admission_for_provider_owner(",
+            &[
+                ("flapjack-http/src/handlers/migration/job_runner.rs", 1),
                 ("flapjack-http/src/handlers/migration/spool.rs", 2),
             ],
         ),
@@ -1640,9 +2349,10 @@ async fn shared_migration_lifecycle_has_no_duplicate_owner_seams() {
         (
             "read_migration_phase(",
             &[
-                ("flapjack-http/src/handlers/migration/job_runner.rs", 1),
-                ("flapjack-http/src/handlers/migration/mod.rs", 4),
+                ("flapjack-http/src/handlers/migration/job_runner.rs", 2),
+                ("flapjack-http/src/handlers/migration/mod.rs", 5),
                 ("flapjack-http/src/handlers/migration/spool.rs", 11),
+                ("flapjack-http/src/handlers/migration/spool_lifecycle.rs", 2),
                 ("flapjack-http/src/handlers/migration/spool_support.rs", 1),
             ],
         ),
@@ -1690,7 +2400,7 @@ async fn shared_migration_lifecycle_has_no_duplicate_owner_seams() {
         ),
     ];
 
-    assert_exact_source_owners(&sources, expected_owners);
+    assert_exact_source_owners(sources, expected_owners);
 }
 
 fn assert_exact_source_owners(
@@ -1720,36 +2430,49 @@ async fn stale_generation_cannot_mutate_terminal_or_ack_state_for_any_provider()
     let tmp = TempDir::new().unwrap();
     let state = TestStateBuilder::new(&tmp).build_shared();
     let spool = import::spool_for_manager(&state.manager).unwrap();
-    let owner_identity = authenticated_owner_identity(
-        OWNER_APP.to_string(),
-        &migration_owner_headers(Some(OWNER_KEY)),
-    );
     let mut stale_ack_statuses = Vec::new();
+    let source_factory =
+        TestMigrationSourceReaderFactory::new(|source_provider| match source_provider {
+            AsyncMigrationSourceProvider::Algolia => Ok(Box::new(async_hermetic_source_reader())),
+            AsyncMigrationSourceProvider::Meilisearch => {
+                Ok(Box::new(async_hermetic_meilisearch_source_reader()))
+            }
+            AsyncMigrationSourceProvider::Typesense => {
+                Ok(Box::new(async_hermetic_typesense_source_reader()))
+            }
+        });
 
-    // Every specimen is admitted by the one shared runner that
-    // `all_source_providers_share_one_migration_job_runner_and_spool` pins, and
-    // then driven over their own provider's lifecycle routes: the guard under
-    // test has to hold for every provider wire entry, not just Algolia's.
-    for app in public_provider_migration_routes(&state) {
+    // Every public source specimen is admitted by the one shared runner
+    // that `all_source_providers_share_one_migration_job_runner_and_spool`
+    // pins, and then driven over its own provider lifecycle route.
+    for app in [
+        migration_job_route_for_provider_with_test_source_factory(
+            "algolia",
+            Arc::clone(&state),
+            Some(source_factory.clone()),
+        ),
+        migration_job_route_for_provider_with_test_source_factory(
+            "meilisearch",
+            Arc::clone(&state),
+            Some(source_factory.clone()),
+        ),
+        migration_job_route_for_provider_with_test_source_factory(
+            "typesense",
+            Arc::clone(&state),
+            Some(source_factory.clone()),
+        ),
+    ] {
         let source_provider = app.provider;
         let target_index = format!("{source_provider}_stale_generation_target");
-        let request = MigrateFromAlgoliaRequest {
-            target_index: Some(target_index.clone()),
-            ..valid_async_request()
+        let payload = match AsyncMigrationSourceProvider::parse(source_provider).unwrap() {
+            AsyncMigrationSourceProvider::Algolia => algolia_submit_payload(&target_index),
+            AsyncMigrationSourceProvider::Meilisearch => meilisearch_submit_payload(&target_index),
+            AsyncMigrationSourceProvider::Typesense => typesense_submit_payload(&target_index),
         };
-        let (job_uuid, _) = state
-            .migration_runner
-            .submit_algolia_import_for_owner(request, Some(owner_identity.clone()), |_| {
-                Ok(async_hermetic_source_reader())
-            })
-            .await
-            .expect("provider specimen should reach the current shared lifecycle");
-        wait_for_async_terminal(&state, job_uuid, OWNER_APP, Some(OWNER_KEY)).await;
-        bind_job_specimen_to_provider(
-            &spool,
-            job_uuid,
-            AsyncMigrationSourceProvider::parse(app.provider).unwrap(),
-        );
+        let submit = send_submit_request(&app, OWNER_APP, OWNER_KEY, payload).await;
+        assert_eq!(submit.status(), StatusCode::ACCEPTED);
+        let job_uuid = job_uuid_from_submit_response(submit).await;
+        wait_for_route_terminal(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
         let terminal_before = spool.read_migration_phase(job_uuid).unwrap();
         let metadata = spool.read_async_migration_metadata(job_uuid).unwrap();
         let transaction_id = metadata
@@ -1785,10 +2508,11 @@ async fn stale_generation_cannot_mutate_terminal_or_ack_state_for_any_provider()
 
     assert_eq!(
         stale_ack_statuses,
-        AsyncMigrationSourceProvider::PUBLIC
-            .into_iter()
-            .map(|provider| (provider.as_str().unwrap(), StatusCode::CONFLICT))
-            .collect::<Vec<_>>(),
+        vec![
+            ("algolia", StatusCode::CONFLICT),
+            ("meilisearch", StatusCode::CONFLICT),
+            ("typesense", StatusCode::CONFLICT)
+        ],
         "stale generation ACK mutated ACK-visible state: every provider must fail closed before acknowledging a superseded terminal generation"
     );
 }
@@ -1891,7 +2615,25 @@ fn valid_async_request() -> MigrateFromAlgoliaRequest {
     }
 }
 
+fn valid_meilisearch_async_request(target_index: &str) -> MigrateFromMeilisearchRequest {
+    MigrateFromMeilisearchRequest {
+        endpoint: "https://your-instance.meilisearch.io".to_string(),
+        api_key: "hermetic-meilisearch-key-not-used".to_string(),
+        source_index: "source_products".to_string(),
+        target_index: Some(target_index.to_string()),
+        overwrite: false,
+    }
+}
+
 fn async_hermetic_source_reader() -> ScriptedSourceReader {
+    async_source_reader_with_final_updated_at("2026-07-16T00:00:00Z")
+}
+
+fn async_source_reader_with_final_drift() -> ScriptedSourceReader {
+    async_source_reader_with_final_updated_at("2026-07-16T00:01:00Z")
+}
+
+fn async_source_reader_with_final_updated_at(final_updated_at: &str) -> ScriptedSourceReader {
     let mut reader = ScriptedSourceReader::new("LOCALMIGRATIONTEST", "source_products");
     let source_record = AlgoliaIndexRecord {
         name: "source_products".to_string(),
@@ -1910,8 +2652,58 @@ fn async_hermetic_source_reader() -> ScriptedSourceReader {
     ]];
     reader.push_pass(settings.clone(), document_pages.clone(), vec![], vec![]);
     reader.push_pass(settings, document_pages, vec![], vec![]);
-    reader.push_quiescent(source_record);
+    reader.push_quiescent(AlgoliaIndexRecord {
+        updated_at: final_updated_at.to_string(),
+        ..source_record
+    });
     reader
+}
+
+fn async_hermetic_meilisearch_source_reader() -> MeilisearchSourceReader<ScriptedMeilisearchSource>
+{
+    let bundle = read_meilisearch_fixture_json("expected_bundle.json");
+    let settings = bundle["settings"].clone();
+    let documents = bundle["documents"]["beforeMutation"]
+        .as_array()
+        .unwrap()
+        .to_vec();
+    let document_pages = vec![documents[..2].to_vec(), documents[2..].to_vec()];
+    let source = ScriptedMeilisearchSource::with_passes(
+        meilisearch_observation("source_products", "sku", 3),
+        settings,
+        vec![document_pages.clone(), document_pages],
+    );
+    MeilisearchSourceReader::from_source("source_products", source)
+}
+
+fn async_hermetic_typesense_source_reader() -> TypesenseSourceReader<ScriptedTypesenseSource> {
+    let settings = json!({
+        "default_sorting_field": "price",
+        "enable_nested_fields": true,
+        "token_separators": ["-"],
+        "symbols_to_index": ["#"]
+    });
+    let document_pages = vec![vec![
+        json!({"id": "doc-1", "title": "Quartz adapter", "category": "hardware"}),
+        json!({"id": "doc-2", "title": "Velvet compass", "category": "navigation"}),
+    ]];
+    let source = ScriptedTypesenseSource::with_passes(
+        typesense_observation("source_products", 2),
+        settings,
+        vec![document_pages.clone(), document_pages],
+    );
+    TypesenseSourceReader::from_source("source_products", source)
+}
+
+fn read_meilisearch_fixture_json(name: &str) -> serde_json::Value {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../tests/fixtures/2026_07_26_m0a_meilisearch_source_contract")
+        .join(name);
+    serde_json::from_slice(
+        &std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("fixture {} must be readable: {error}", path.display())),
+    )
+    .unwrap_or_else(|error| panic!("fixture {} must be JSON: {error}", path.display()))
 }
 
 fn async_source_reader_with_import_outcome() -> ScriptedSourceReader {
@@ -1988,7 +2780,7 @@ async fn wait_for_async_terminal(
     authenticated_app_id: &str,
     api_key: Option<&str>,
 ) -> AsyncMigrationStatusResponse {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(ASYNC_STATUS_TERMINAL_TIMEOUT, async {
         loop {
             let Json(current) = get_algolia_migration_status_http(
                 State(Arc::clone(state)),
@@ -2002,6 +2794,28 @@ async fn wait_for_async_terminal(
             if current.disposition != AsyncMigrationDisposition::Running {
                 assert!(current.terminal_at.is_some());
                 break current;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("async import should finish after release")
+}
+
+async fn wait_for_route_terminal(
+    app: &MigrationLifecycleRoutes,
+    job_uuid: Uuid,
+    authenticated_app_id: &str,
+    api_key: &str,
+) -> serde_json::Value {
+    tokio::time::timeout(ASYNC_STATUS_TERMINAL_TIMEOUT, async {
+        loop {
+            let response = send_status_request(app, job_uuid, authenticated_app_id, api_key).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+            if body["disposition"] != "running" {
+                assert!(body.get("terminalAt").is_some());
+                break body;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -2047,19 +2861,15 @@ fn seed_ack_generation_evidence(
         .unwrap();
 }
 
-struct BlockingDocumentReadSourceReader {
-    inner: ScriptedSourceReader,
+struct BlockingDocumentReadSourceReader<R> {
+    inner: R,
     reached_documents: Arc<Notify>,
     release_documents: Arc<Notify>,
     blocked_once: bool,
 }
 
-impl BlockingDocumentReadSourceReader {
-    fn new(
-        inner: ScriptedSourceReader,
-        reached_documents: Arc<Notify>,
-        release_documents: Arc<Notify>,
-    ) -> Self {
+impl<R> BlockingDocumentReadSourceReader<R> {
+    fn new(inner: R, reached_documents: Arc<Notify>, release_documents: Arc<Notify>) -> Self {
         Self {
             inner,
             reached_documents,
@@ -2069,7 +2879,10 @@ impl BlockingDocumentReadSourceReader {
     }
 }
 
-impl MigrationSourceReader for BlockingDocumentReadSourceReader {
+impl<R> MigrationSourceReader for BlockingDocumentReadSourceReader<R>
+where
+    R: MigrationSourceReader + Send,
+{
     fn app_id(&self) -> &str {
         self.inner.app_id()
     }

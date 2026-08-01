@@ -550,6 +550,55 @@ mod tests {
         assert!(hits.is_empty());
     }
 
+    #[test]
+    fn stage3_load_rules_reports_malformed_json() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let dir = rules_dir(base, "my-index", "related-products").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("rules.json"), "{not json").unwrap();
+
+        let err = load_rules(base, "my-index", "related-products")
+            .expect_err("malformed rules JSON must be reported");
+        assert!(
+            err.contains("Failed to parse rules file"),
+            "error should name parse failure: {err}"
+        );
+    }
+
+    #[test]
+    fn stage3_rules_preserve_multibyte_object_ids_and_descriptions_in_search() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let mut cafe = sample_rule("prod-é");
+        cafe.description = Some("Crème brûlée recommendation".to_string());
+        let mut tokyo = sample_rule("東京-2");
+        tokyo.description = Some("東京 launch shelf".to_string());
+
+        save_rules_batch(
+            base,
+            "my-index",
+            "related-products",
+            vec![cafe.clone(), tokyo.clone()],
+            false,
+        )
+        .unwrap();
+
+        let loaded = load_rules(base, "my-index", "related-products").unwrap();
+        assert_eq!(loaded, vec![cafe.clone(), tokyo.clone()]);
+
+        let (hits, total) =
+            search_rules(base, "my-index", "related-products", "brûlée", 0, 10).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(hits[0], cafe);
+
+        let (hits, total) =
+            search_rules(base, "my-index", "related-products", "東京", 0, 10).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(hits[0], tokyo);
+    }
+
     /// Verify that rules for different models (related-products, bought-together, etc.) remain isolated from each other.
     #[test]
     fn rules_are_model_scoped() {

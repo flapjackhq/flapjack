@@ -89,6 +89,43 @@ fn keeps_recent_partitions() {
 }
 
 #[test]
+fn retention_removes_only_expired_legacy_full_ip_partition() {
+    let tmp = TempDir::new().unwrap();
+    let config = crate::analytics::config::AnalyticsConfig {
+        enabled: true,
+        data_dir: tmp.path().to_path_buf(),
+        flush_interval_secs: 1,
+        flush_size: 100,
+        retention_days: 30,
+    };
+    let old_path = super::test_analytics_io::write_legacy_search_parquet(
+        &config,
+        "products",
+        "2024-03-01",
+        &["203.0.113.47"],
+    );
+    let recent_path = super::test_analytics_io::write_legacy_search_parquet(
+        &config,
+        "products",
+        "2024-04-01",
+        &["198.51.100.23"],
+    );
+
+    let removed = cleanup_old_partitions_at(
+        tmp.path(),
+        30,
+        chrono::DateTime::parse_from_rfc3339("2024-04-10T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+    )
+    .unwrap();
+
+    assert_eq!(removed, 1);
+    assert!(!old_path.parent().unwrap().exists());
+    assert!(recent_path.parent().unwrap().exists());
+}
+
+#[test]
 fn handles_missing_directory() {
     let tmp = TempDir::new().unwrap();
     let removed = cleanup_old_partitions(&tmp.path().join("nonexistent"), 90).unwrap();

@@ -266,6 +266,9 @@ jobs:
       - name: Install dependencies
         working-directory: engine/dashboard
         run: npm install
+      - name: Audit production dependencies
+        working-directory: engine/dashboard
+        run: bash scripts/audit_gate.sh
       - name: Type check & build
         working-directory: engine/dashboard
         run: npm run build

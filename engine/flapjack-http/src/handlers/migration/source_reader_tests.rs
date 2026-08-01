@@ -1,18 +1,355 @@
 use super::algolia_client::{AlgoliaClientError, AlgoliaErrorKind, AlgoliaIndexRecord};
+use super::meilisearch_client::{MeilisearchClientError, MeilisearchErrorKind};
 use super::source_identity_partitions::SourceIdentityVersion;
 use super::source_reader::{
     accept_source_export, collect_quiescent_source_snapshot, collect_replica_settings,
-    AlgoliaSourceReader, MigrationSourceReader,
+    AlgoliaSourceReader, MeilisearchSourceReader, MigrationSourceReader, TypesenseSourceReader,
 };
 use super::source_snapshot::{
     canonical_json_bytes, source_item_hash, update_source_item_hash_digest, SourceResourceSnapshot,
 };
 use super::source_test_support::{
-    expected_document_v2_digest, RecordingSink, ScriptedSourceReader,
+    expected_document_v2_digest, meilisearch_observation, typesense_observation, RecordingSink,
+    ScriptedMeilisearchSource, ScriptedSourceReader, ScriptedTypesenseSource,
 };
+use super::typesense_client::{TypesenseClientError, TypesenseErrorKind};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
+
+fn meilisearch_settings() -> Value {
+    json!({
+        "searchableAttributes": ["title", "category"],
+        "pagination": {"maxTotalHits": 50},
+        "synonyms": {
+            "saw": ["cutter"],
+            "wrench": ["spanner"]
+        }
+    })
+}
+
+fn typesense_settings() -> Value {
+    json!({
+        "default_sorting_field": "price",
+        "enable_nested_fields": true,
+        "token_separators": ["-"],
+        "symbols_to_index": ["#"]
+    })
+}
+
+#[tokio::test]
+async fn meilisearch_reader_normalizes_configured_primary_key_without_rewriting_source_fields() {
+    let pages = vec![
+        vec![
+            json!({"sku": "SKU-001", "title": "Alpha Wrench"}),
+            json!({"sku": "SKU-002", "title": "Beta Hammer"}),
+        ],
+        vec![json!({"sku": "SKU-003", "title": "Gamma Saw"})],
+    ];
+    let source = ScriptedMeilisearchSource::with_passes(
+        meilisearch_observation("configured_pk", "sku", 3),
+        meilisearch_settings(),
+        vec![pages],
+    );
+    let mut reader = MeilisearchSourceReader::from_source("configured_pk", source);
+    reader.wait_for_quiescent_source().await.unwrap();
+    let settings = reader.read_settings().await.unwrap();
+    reader
+        .require_unretrievable_access(&settings)
+        .await
+        .unwrap();
+
+    let mut observed_pages = Vec::new();
+    reader
+        .read_documents(&mut |page| {
+            observed_pages.push(page);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        observed_pages.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![2, 1]
+    );
+    assert_eq!(observed_pages[0][0]["objectID"], "SKU-001");
+    assert_eq!(observed_pages[0][0]["sku"], "SKU-001");
+    assert_eq!(observed_pages[0][0]["title"], "Alpha Wrench");
+    assert_eq!(observed_pages[1][0]["objectID"], "SKU-003");
+}
+
+#[tokio::test]
+async fn meilisearch_reader_normalizes_inferred_primary_key_and_synonyms_deterministically() {
+    let documents = vec![vec![
+        json!({"book_id": "B-001", "title": "First Book"}),
+        json!({"book_id": "B-002", "title": "Second Book"}),
+    ]];
+    let source = ScriptedMeilisearchSource::with_passes(
+        meilisearch_observation("inferred_pk", "book_id", 2),
+        meilisearch_settings(),
+        vec![documents],
+    );
+    let mut reader = MeilisearchSourceReader::from_source("inferred_pk", source);
+    reader.wait_for_quiescent_source().await.unwrap();
+    let _settings = reader.read_settings().await.unwrap();
+
+    let mut normalized = Vec::new();
+    reader
+        .read_documents(&mut |page| {
+            normalized.extend(page);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let mut synonyms = Vec::new();
+    reader
+        .read_synonyms(&mut |page| {
+            synonyms.extend(page);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(normalized[0]["objectID"], "B-001");
+    assert_eq!(normalized[0]["book_id"], "B-001");
+    assert_eq!(normalized[1]["objectID"], "B-002");
+    assert_eq!(
+        synonyms,
+        vec![
+            json!({
+                "objectID": "meilisearch:saw",
+                "type": "synonym",
+                "synonyms": ["saw", "cutter"]
+            }),
+            json!({
+                "objectID": "meilisearch:wrench",
+                "type": "synonym",
+                "synonyms": ["wrench", "spanner"]
+            })
+        ]
+    );
+}
+
+#[tokio::test]
+async fn meilisearch_reader_rejects_invalid_or_duplicate_stable_ids_with_sanitized_errors() {
+    for (documents, expected_message) in [
+        (
+            vec![json!({"title": "missing"})],
+            "Meilisearch document primary key is invalid",
+        ),
+        (
+            vec![json!({"sku": 123, "title": "non-string"})],
+            "Meilisearch document primary key is invalid",
+        ),
+        (
+            vec![json!({"sku": "SKU-001"}), json!({"sku": "SKU-001"})],
+            "duplicate source objectID",
+        ),
+    ] {
+        let source = ScriptedMeilisearchSource::with_passes(
+            meilisearch_observation("configured_pk", "sku", documents.len() as u64),
+            meilisearch_settings(),
+            vec![vec![documents]],
+        );
+        let mut reader = MeilisearchSourceReader::from_source("configured_pk", source);
+        let error = collect_quiescent_source_snapshot(&mut reader)
+            .await
+            .unwrap_err();
+        assert_eq!(error.safe_message(), expected_message);
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("http://127.0.0.1:17747"));
+        assert!(!debug.contains("meili-source-key-canary"));
+    }
+}
+
+#[tokio::test]
+async fn meilisearch_reader_rejects_restricted_credentials_before_accepting_snapshot() {
+    let source = ScriptedMeilisearchSource::with_passes(
+        meilisearch_observation("configured_pk", "sku", 1),
+        meilisearch_settings(),
+        vec![vec![vec![json!({"sku": "SKU-001"})]]],
+    )
+    .with_access_error(MeilisearchClientError::new(
+        MeilisearchErrorKind::Upstream,
+        "Meilisearch source credentials lack required read access",
+    ));
+    let mut reader = MeilisearchSourceReader::from_source("configured_pk", source);
+    let mut sink = RecordingSink::default();
+
+    let error = accept_source_export(&mut reader, &mut sink)
+        .await
+        .expect_err("restricted credentials must fail before accepting any artifact");
+
+    assert_eq!(error.kind(), AlgoliaErrorKind::Upstream);
+    assert_eq!(
+        error.safe_message(),
+        "Meilisearch source credentials lack required read access"
+    );
+    assert!(sink.settings.is_empty());
+    assert!(sink.raw_document_pages.is_empty());
+    let debug = format!("{error:?}");
+    assert!(!debug.contains("meili-source-key-canary"));
+    assert!(!debug.contains("http://127.0.0.1:17747"));
+}
+
+#[tokio::test]
+async fn meilisearch_reader_rejects_drift_with_provider_neutral_diagnostic() {
+    let initial = meilisearch_observation("configured_pk", "sku", 1);
+    let mut changed = initial.clone();
+    changed.updated_at = "2026-07-26T19:21:26Z".to_string();
+    let source = ScriptedMeilisearchSource::with_passes(
+        initial.clone(),
+        meilisearch_settings(),
+        vec![vec![vec![json!({"sku": "SKU-001"})]]],
+    )
+    .with_observations(vec![initial, changed]);
+    let mut reader = MeilisearchSourceReader::from_source("configured_pk", source);
+    let mut sink = RecordingSink::default();
+
+    let error = accept_source_export(&mut reader, &mut sink)
+        .await
+        .expect_err("changed Meilisearch metadata must fail closed");
+
+    assert_eq!(error.kind(), AlgoliaErrorKind::Progress);
+    assert_eq!(error.safe_message(), "Source changed during export");
+    assert!(!format!("{error:?}").contains("Algolia"));
+}
+
+#[tokio::test]
+async fn typesense_reader_normalizes_document_id_without_rewriting_source_fields() {
+    let pages = vec![
+        vec![
+            json!({"id": "prod_001", "title": "Alpha Wrench"}),
+            json!({"id": "prod_002", "title": "Beta Hammer"}),
+        ],
+        vec![json!({"id": "prod_003", "title": "Gamma Saw"})],
+    ];
+    let source = ScriptedTypesenseSource::with_passes(
+        typesense_observation("products", 3),
+        typesense_settings(),
+        vec![pages],
+    );
+    let mut reader = TypesenseSourceReader::from_source("products", source);
+    reader.wait_for_quiescent_source().await.unwrap();
+    let settings = reader.read_settings().await.unwrap();
+    reader
+        .require_unretrievable_access(&settings)
+        .await
+        .unwrap();
+
+    let mut observed_pages = Vec::new();
+    reader
+        .read_documents(&mut |page| {
+            observed_pages.push(page);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        observed_pages.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![2, 1]
+    );
+    assert_eq!(observed_pages[0][0]["objectID"], "prod_001");
+    assert_eq!(observed_pages[0][0]["id"], "prod_001");
+    assert_eq!(observed_pages[0][0]["title"], "Alpha Wrench");
+    assert_eq!(observed_pages[1][0]["objectID"], "prod_003");
+}
+
+#[tokio::test]
+async fn typesense_reader_rejects_invalid_ids_with_sanitized_errors() {
+    for documents in [
+        vec![json!({"title": "missing"})],
+        vec![json!({"id": 123, "title": "non-string"})],
+        vec![json!({"id": "prod_001"}), json!({"id": "prod_001"})],
+    ] {
+        let source = ScriptedTypesenseSource::with_passes(
+            typesense_observation("products", documents.len() as u64),
+            typesense_settings(),
+            vec![vec![documents]],
+        );
+        let mut reader = TypesenseSourceReader::from_source("products", source);
+        let error = collect_quiescent_source_snapshot(&mut reader)
+            .await
+            .unwrap_err();
+        assert_eq!(error.safe_message(), "Typesense document id is invalid");
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("typesense-source-key-canary"));
+        assert!(!debug.contains("http://127.0.0.1:18108"));
+    }
+}
+
+#[tokio::test]
+async fn typesense_reader_rejects_restricted_credentials_before_accepting_snapshot() {
+    let source = ScriptedTypesenseSource::with_passes(
+        typesense_observation("products", 1),
+        typesense_settings(),
+        vec![vec![vec![json!({"id": "prod_001"})]]],
+    )
+    .with_access_error(TypesenseClientError::new(
+        TypesenseErrorKind::Upstream,
+        "Typesense source credentials lack required read access",
+    ));
+    let mut reader = TypesenseSourceReader::from_source("products", source);
+    let mut sink = RecordingSink::default();
+
+    let error = accept_source_export(&mut reader, &mut sink)
+        .await
+        .expect_err("restricted credentials must fail before accepting any artifact");
+
+    assert_eq!(error.kind(), AlgoliaErrorKind::Upstream);
+    assert_eq!(
+        error.safe_message(),
+        "Typesense source credentials lack required read access"
+    );
+    assert!(sink.settings.is_empty());
+    assert!(sink.raw_document_pages.is_empty());
+    assert!(!format!("{error:?}").contains("typesense-source-key-canary"));
+}
+
+#[tokio::test]
+async fn typesense_reader_rejects_observation_name_mismatch() {
+    let source = ScriptedTypesenseSource::with_passes(
+        typesense_observation("products_v2", 1),
+        typesense_settings(),
+        vec![vec![vec![json!({"id": "prod_001"})]]],
+    );
+    let mut reader = TypesenseSourceReader::from_source("products", source);
+
+    let error = reader
+        .wait_for_quiescent_source()
+        .await
+        .expect_err("an observed collection name must match the requested collection");
+
+    assert_eq!(error.kind(), AlgoliaErrorKind::Schema);
+    assert_eq!(
+        error.safe_message(),
+        "Typesense source response schema is invalid"
+    );
+}
+
+#[tokio::test]
+async fn typesense_reader_rejects_drift_with_provider_neutral_diagnostic() {
+    let initial = typesense_observation("products", 1);
+    let mut changed = initial.clone();
+    changed.updated_at = "1785020401".to_string();
+    let source = ScriptedTypesenseSource::with_passes(
+        initial.clone(),
+        typesense_settings(),
+        vec![vec![vec![json!({"id": "prod_001"})]]],
+    )
+    .with_observations(vec![initial, changed]);
+    let mut reader = TypesenseSourceReader::from_source("products", source);
+    let mut sink = RecordingSink::default();
+
+    let error = accept_source_export(&mut reader, &mut sink)
+        .await
+        .expect_err("changed Typesense metadata must fail closed");
+
+    assert_eq!(error.kind(), AlgoliaErrorKind::Progress);
+    assert_eq!(error.safe_message(), "Source changed during export");
+    assert!(!format!("{error:?}").contains("Typesense"));
+}
 
 fn stable_reader() -> ScriptedSourceReader {
     let mut reader = ScriptedSourceReader::new("APPID", "products");
@@ -216,7 +553,7 @@ async fn source_reader_two_pass_rejects_drift_with_scrubbed_error() {
         .expect_err("changed source hash must be rejected");
 
     assert_eq!(error.kind(), AlgoliaErrorKind::Progress);
-    assert_eq!(error.safe_message(), "Algolia source changed during export");
+    assert_eq!(error.safe_message(), "Source changed during export");
     let rendered = format!("{:?}", error);
     for secret in [
         "APPID",
@@ -246,7 +583,28 @@ async fn source_reader_two_pass_rejects_final_metadata_drift() {
         .expect_err("changed final metadata must be rejected");
 
     assert_eq!(error.kind(), AlgoliaErrorKind::Progress);
-    assert_eq!(error.safe_message(), "Algolia source changed during export");
+    assert_eq!(error.safe_message(), "Source changed during export");
+}
+
+#[tokio::test]
+async fn source_reader_final_drift_is_detected_after_sink_capture() {
+    let mut changed_record = stable_record();
+    changed_record.updated_at = "2026-07-26T19:21:26Z".to_string();
+    let mut reader = stable_reader();
+    add_export_pass(&mut reader, document_pages_in_order());
+    reader.push_quiescent(changed_record);
+    let mut sink = RecordingSink::default();
+
+    let error = accept_source_export(&mut reader, &mut sink)
+        .await
+        .expect_err("changed source must be rejected after capture");
+
+    assert_eq!(error.kind(), AlgoliaErrorKind::Progress);
+    assert_eq!(error.safe_message(), "Source changed during export");
+    assert_eq!(sink.settings, vec![settings_fixture()]);
+    assert_eq!(sink.document_pages, vec![vec!["doc-1"], vec!["doc-2"]]);
+    assert_eq!(sink.rule_pages, vec![vec!["rule-1"]]);
+    assert_eq!(sink.synonym_pages, vec![vec!["syn-1"]]);
 }
 
 // --- Replica settings collector ---------------------------------------------

@@ -355,6 +355,19 @@ mod tests {
     }
 
     #[test]
+    fn stage3_load_config_reports_invalid_data_for_malformed_json() {
+        let tmp = TempDir::new().unwrap();
+        let store = QsConfigStore::new(tmp.path());
+        store.ensure_dir().unwrap();
+        std::fs::write(store.dir.join("broken.json"), "{not json").unwrap();
+
+        let err = store
+            .load_config("broken")
+            .expect_err("malformed config JSON must surface InvalidData");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn list_configs_returns_all() {
         let tmp = TempDir::new().unwrap();
         let store = QsConfigStore::new(tmp.path());
@@ -362,6 +375,32 @@ mod tests {
         store.save_config(&make_config("b", "src_b")).unwrap();
         let list = store.list_configs().unwrap();
         assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn stage3_list_configs_skips_only_malformed_configs() {
+        let tmp = TempDir::new().unwrap();
+        let store = QsConfigStore::new(tmp.path());
+        store
+            .save_config(&make_config("valid", "src_valid"))
+            .unwrap();
+        store.ensure_dir().unwrap();
+        std::fs::write(store.dir.join("malformed.json"), "{not json").unwrap();
+        std::fs::write(
+            store.dir.join("valid.status.json"),
+            serde_json::to_string(&BuildStatus {
+                index_name: "valid".to_string(),
+                is_running: true,
+                last_built_at: None,
+                last_successful_built_at: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let list = store.list_configs().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].index_name, "valid");
     }
 
     #[test]
@@ -380,6 +419,20 @@ mod tests {
         let status = store.load_status("no_build_yet");
         assert!(!status.is_running);
         assert!(status.last_built_at.is_none());
+    }
+
+    #[test]
+    fn stage3_load_status_returns_default_for_malformed_json() {
+        let tmp = TempDir::new().unwrap();
+        let store = QsConfigStore::new(tmp.path());
+        store.ensure_dir().unwrap();
+        std::fs::write(store.dir.join("broken.status.json"), "{not json").unwrap();
+
+        let status = store.load_status("broken");
+        assert_eq!(status.index_name, "broken");
+        assert!(!status.is_running);
+        assert!(status.last_built_at.is_none());
+        assert!(status.last_successful_built_at.is_none());
     }
 
     #[test]
@@ -422,6 +475,39 @@ mod tests {
         assert_eq!(logs[0].message, "Build started");
     }
 
+    #[test]
+    fn stage3_read_logs_keeps_valid_lines_and_omits_malformed_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let store = QsConfigStore::new(tmp.path());
+        store.ensure_dir().unwrap();
+        let valid_one = LogEntry {
+            timestamp: "2026-07-31T00:00:00Z".to_string(),
+            level: "INFO".to_string(),
+            message: "Build café started".to_string(),
+            context_level: 1,
+        };
+        let valid_two = LogEntry {
+            timestamp: "2026-07-31T00:00:01Z".to_string(),
+            level: "WARN".to_string(),
+            message: "東京 fallback retained".to_string(),
+            context_level: 2,
+        };
+        std::fs::write(
+            store.dir.join("logs.log.jsonl"),
+            format!(
+                "{}\n{{not json\n{}\n",
+                serde_json::to_string(&valid_one).unwrap(),
+                serde_json::to_string(&valid_two).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let logs = store.read_logs("logs");
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].message, "Build café started");
+        assert_eq!(logs[1].message, "東京 fallback retained");
+    }
+
     /// Verify that truncate_log correctly retains only the most recent entries when the log exceeds max_lines.
     #[test]
     fn log_truncates_to_max_lines() {
@@ -457,6 +543,25 @@ mod tests {
             !tmp.path().join("keys.json").exists(),
             "must not create files outside .query_suggestions directory"
         );
+    }
+
+    #[test]
+    fn stage3_multibyte_names_stay_under_query_suggestions_directory() {
+        let tmp = TempDir::new().unwrap();
+        let store = QsConfigStore::new(tmp.path());
+        let config = make_config("suggestions_東京", "products_é");
+        store.save_config(&config).unwrap();
+
+        let loaded = store.load_config("suggestions_東京").unwrap().unwrap();
+        assert_eq!(loaded.index_name, "suggestions_東京");
+        assert_eq!(loaded.source_indices[0].index_name, "products_é");
+
+        let paths = store.target_artifact_paths("suggestions_東京").unwrap();
+        assert_eq!(paths.root_dir, tmp.path().join(".query_suggestions"));
+        assert!(paths.config_path.starts_with(&paths.root_dir));
+        assert!(paths.status_path.starts_with(&paths.root_dir));
+        assert!(paths.log_path.starts_with(&paths.root_dir));
+        assert!(store.target_artifact_paths("../escape").is_err());
     }
 
     /// Verify that save_status rejects index names with path traversal patterns.

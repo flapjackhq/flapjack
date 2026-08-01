@@ -6,6 +6,7 @@ use crate::handlers::internal_ops::{
     apply_upsert_op, flush_document_batch, ReplicatedDocumentBatch,
 };
 use crate::handlers::AppState;
+use crate::security_audit::{self, Action, Actor, Outcome, Target};
 use axum::{
     extract::{Path, Query, State},
     http::header,
@@ -859,10 +860,12 @@ pub async fn rotate_admin_key(
 ) -> impl IntoResponse {
     match key_store.rotate_admin_key() {
         Ok(new_key) => {
-            tracing::info!(
-                event = "security_audit_admin_action",
-                admin_action = "rotate_admin_key",
-                "security event: admin action"
+            security_audit::emit_admin_action(
+                Actor::admin_api_key(),
+                Action::RotateAdminKey,
+                Target::admin_key(),
+                Outcome::Success,
+                None,
             );
             (
                 StatusCode::OK,

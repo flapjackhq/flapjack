@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-const SPOOL_ROOT: &str = "migration_exports";
+pub(super) const SPOOL_ROOT: &str = "migration_exports";
 const JOBS_DIR: &str = "jobs";
 const MANIFEST_FILE: &str = "manifest.json";
 const MIGRATION_PHASE_FILE: &str = "migration_phase.json";
@@ -150,6 +150,7 @@ impl ArtifactKind {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 enum LifecycleState {
     Running,
+    Interrupted,
     Accepted,
     Failed,
     Deleting,
@@ -566,6 +567,7 @@ pub(crate) struct SpoolProgress {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ExportCheckpoint {
     pub job_uuid: Uuid,
+    pub source_identity_digest: String,
     pub state: String,
     pub progress: SpoolProgress,
     pub resources: ResourceCompletions,
@@ -627,6 +629,7 @@ pub(crate) enum SpoolErrorKind {
     CancelRequested,
     JobTerminal,
     JobNotAccepted,
+    JobNotInterrupted,
     UnsupportedArtifactKind,
     InvalidPhaseTransition,
     PrivacyScrubIntentCollision,
@@ -639,7 +642,7 @@ pub(crate) struct SpoolError {
 }
 
 impl SpoolError {
-    fn new(kind: SpoolErrorKind) -> Self {
+    pub(crate) fn new(kind: SpoolErrorKind) -> Self {
         Self { kind, source: None }
     }
 
@@ -676,6 +679,11 @@ impl From<io::Error> for SpoolError {
 }
 
 type SpoolResult<T> = Result<T, SpoolError>;
+
+fn create_spool_layout(root: &Path) -> SpoolResult<()> {
+    fs::create_dir_all(root.join(JOBS_DIR))?;
+    Ok(())
+}
 
 fn warn_spool_garbage_collection_error(job_uuid: Uuid, error: &SpoolError) {
     tracing::warn!(
@@ -737,6 +745,19 @@ impl SpoolStore {
         Self::open(data_root, limits, None, None)
     }
 
+    pub(crate) fn probe_initial_creation(data_root: &Path) -> SpoolResult<()> {
+        let probe_root = data_root.join(format!(".{SPOOL_ROOT}_probe_{}", Uuid::new_v4()));
+        if let Err(error) = create_spool_layout(&probe_root) {
+            let _ = fs::remove_dir(&probe_root);
+            return Err(error);
+        }
+
+        let probe_jobs = probe_root.join(JOBS_DIR);
+        fs::remove_dir(&probe_jobs)?;
+        fs::remove_dir(&probe_root)?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_tests(
         data_root: &Path,
@@ -754,7 +775,7 @@ impl SpoolStore {
         free_bytes: Option<u64>,
     ) -> SpoolResult<Self> {
         let root = data_root.join(SPOOL_ROOT);
-        fs::create_dir_all(root.join(JOBS_DIR))?;
+        create_spool_layout(&root)?;
         Ok(Self {
             root,
             limits,
@@ -804,6 +825,23 @@ impl SpoolStore {
         authenticated_app_id: Option<&str>,
         publication_semantic: AsyncMigrationPublicationSemantic,
     ) -> SpoolResult<MigrationPhaseRecord> {
+        self.create_async_migration_admission_for_provider_owner(
+            job_uuid,
+            target_index,
+            authenticated_app_id,
+            super::AsyncMigrationSourceProvider::Algolia,
+            publication_semantic,
+        )
+    }
+
+    pub(crate) fn create_async_migration_admission_for_provider_owner(
+        &self,
+        job_uuid: Uuid,
+        target_index: &str,
+        authenticated_app_id: Option<&str>,
+        source_provider: super::AsyncMigrationSourceProvider,
+        publication_semantic: AsyncMigrationPublicationSemantic,
+    ) -> SpoolResult<MigrationPhaseRecord> {
         let _root_lock = self.lock_root()?;
         let job_dir = self.job_dir(job_uuid);
         if job_dir.exists() {
@@ -815,7 +853,7 @@ impl SpoolStore {
             target_index,
             authenticated_app_id,
             publication_semantic,
-            source_provider: super::AsyncMigrationSourceProvider::Algolia,
+            source_provider,
             operation_kind: AsyncMigrationOperationKind::SourceImport,
             topology: None,
         });
@@ -1675,6 +1713,12 @@ impl SpoolStore {
         if manifest.lifecycle == LifecycleState::Deleted {
             if manifest.expires_at <= self.now() {
                 self.write_tombstone(&manifest)?;
+            }
+            return Ok(());
+        }
+        if manifest.lifecycle == LifecycleState::Interrupted {
+            if manifest.expires_at <= self.now() {
+                self.delete_manifest_artifacts(&mut manifest)?;
             }
             return Ok(());
         }

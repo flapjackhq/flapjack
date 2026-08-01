@@ -22,6 +22,24 @@ fn exported_openapi_doc() -> serde_json::Value {
     serde_json::from_str(&exported).expect("exported openapi must be valid json")
 }
 
+fn closed_source_provider_paths<'a>(
+    doc: &'a serde_json::Value,
+    method: &str,
+    suffix: &str,
+) -> BTreeSet<&'a str> {
+    doc.get("paths")
+        .and_then(|paths| paths.as_object())
+        .expect("exported openapi must contain paths")
+        .iter()
+        .filter_map(|(path, operation)| operation.get(method).is_some().then_some(path.as_str()))
+        .filter(|path| {
+            path.strip_prefix("/1/migrations/")
+                .and_then(|tail| tail.strip_suffix(suffix))
+                .is_some_and(|provider| !provider.contains('/'))
+        })
+        .collect()
+}
+
 #[test]
 fn export_writes_apidoc_json_to_target_file() {
     let (_temp_dir, output_path) = temp_output_path("openapi.json");
@@ -73,6 +91,7 @@ fn default_output_path_targets_engine_docs2_openapi_json() {
     );
 }
 
+#[cfg(not(feature = "fault-injection"))]
 #[test]
 fn committed_docs2_openapi_matches_export_output() {
     let committed_path = crate::openapi_export::default_docs2_output_path();
@@ -102,6 +121,7 @@ fn committed_docs2_openapi_matches_export_output() {
     );
 }
 
+#[cfg(not(feature = "fault-injection"))]
 #[test]
 fn committed_demo_openapi_matches_export_output() {
     let committed_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -143,22 +163,92 @@ fn export_output_declares_closed_source_provider_status_paths() {
         "/1/migrations/meilisearch/{job_id}",
         "/1/migrations/typesense/{job_id}",
     ]);
-    let actual_status_paths: BTreeSet<&str> = doc
-        .get("paths")
-        .and_then(|paths| paths.as_object())
-        .expect("exported openapi must contain paths")
-        .iter()
-        .filter_map(|(path, operation)| operation.get("get").is_some().then_some(path.as_str()))
-        .filter(|path| {
-            path.strip_prefix("/1/migrations/")
-                .and_then(|tail| tail.strip_suffix("/{job_id}"))
-                .is_some_and(|provider| !provider.contains('/'))
-        })
-        .collect();
+    let actual_status_paths = closed_source_provider_paths(&doc, "get", "/{job_id}");
 
     assert_eq!(
         actual_status_paths, expected_status_paths,
         "fjcloud derives the closed source_provider union from provider-specific status GET paths"
+    );
+}
+
+#[test]
+fn export_output_declares_closed_source_provider_resume_paths() {
+    let doc = exported_openapi_doc();
+    let expected_resume_paths = BTreeSet::from([
+        "/1/migrations/algolia/{job_id}/resume",
+        "/1/migrations/meilisearch/{job_id}/resume",
+        "/1/migrations/typesense/{job_id}/resume",
+    ]);
+    let actual_resume_paths = closed_source_provider_paths(&doc, "post", "/{job_id}/resume");
+
+    assert_eq!(
+        actual_resume_paths, expected_resume_paths,
+        "fjcloud derives the closed resume source_provider union from provider-specific resume POST paths"
+    );
+    for path in expected_resume_paths {
+        let responses = doc
+            .pointer(&format!(
+                "/paths/{}/post/responses",
+                path.replace('/', "~1")
+            ))
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| panic!("{path} resume POST should document responses"));
+        for status in ["202", "400", "404", "409", "500"] {
+            assert!(
+                responses.contains_key(status),
+                "{path} resume POST should document {status}"
+            );
+        }
+        assert_eq!(
+            responses
+                .get("202")
+                .and_then(|response| response.pointer("/content/application~1json/schema/$ref"))
+                .and_then(serde_json::Value::as_str),
+            Some("#/components/schemas/AsyncMigrationStatusResponse")
+        );
+    }
+}
+
+#[test]
+fn export_output_declares_closed_source_provider_preview_paths() {
+    let doc = exported_openapi_doc();
+    let expected_preview_paths = BTreeSet::from([
+        "/1/migrations/algolia/preview",
+        "/1/migrations/meilisearch/preview",
+        "/1/migrations/typesense/preview",
+    ]);
+    let actual_preview_paths = closed_source_provider_paths(&doc, "post", "/preview");
+
+    assert_eq!(
+        actual_preview_paths, expected_preview_paths,
+        "fjcloud derives the closed preview source_provider union from provider-specific preview POST paths"
+    );
+}
+
+#[test]
+fn export_output_declares_meilisearch_submit_payload_schema() {
+    let doc = exported_openapi_doc();
+
+    assert!(
+        doc.pointer("/components/schemas/MigrateFromMeilisearchRequest")
+            .is_some(),
+        "Meilisearch submit payload must be registered as a reusable ApiDoc component"
+    );
+    assert_eq!(
+        schema_ref(
+            &doc,
+            "/paths/~11~1migrations~1meilisearch/post/requestBody/content/application~1json/schema"
+        ),
+        Some("#/components/schemas/MigrateFromMeilisearchRequest"),
+        "Meilisearch submit route must reference its provider-specific request body"
+    );
+    assert_eq!(
+        schema_ref(
+            &doc,
+            "/paths/~11~1migrations~1meilisearch~1preview/post/requestBody/content/application~1json/schema"
+        ),
+        Some("#/components/schemas/MigrateFromMeilisearchRequest"),
+        "Meilisearch preview route must reference its provider-specific request body"
     );
 }
 #[test]

@@ -6,13 +6,145 @@ mod support;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::thread;
 use std::time::{Duration, Instant};
-use support::{http_request_with_read_timeout, HttpResponse, RunningServer, TempDir};
+use support::{
+    http_request_with_headers, http_request_with_read_timeout, HttpResponse, RunningServer, TempDir,
+};
 
 const TEST_WRITE_QUEUE_CHANNEL_CAPACITY: usize = 2;
 const SERVED_WRITER_CONTENTION_RETRY_WINDOW: Duration = Duration::from_secs(5);
+const RESUME_MIGRATION_OWNER_APP_ID: &str = "test-owner";
+const RESUME_SOURCE_APP_ID: &str = "LOCALMIGRATIONTEST";
+const RESUME_SOURCE_INDEX: &str = "source_products";
+const RESUME_TARGET_INDEX: &str = "migration_resume_restart_target";
+const INITIAL_RESUME_SOURCE_API_KEY: &str = "initial-source-key";
+const FRESH_RESUME_SOURCE_API_KEY: &str = "fresh-resume-key";
+const NO_AUTH_TEST_API_KEY: &str = "unused-no-auth-api-key";
+const ALGOLIA_TEST_BASE_URL_ENV: &str = "FLAPJACK_TEST_ALGOLIA_BASE_URL";
+const RESUME_STATUS_TIMEOUT: Duration = Duration::from_secs(30);
+
+const RESUME_EXPECTED_DOCUMENTS: [(&str, &str, &str); 6] = [
+    ("resume-1", "Resume Fixture One", "fixtures"),
+    ("resume-2", "Resume Fixture Two", "fixtures"),
+    ("resume-3", "Resume Fixture Three", "fixtures"),
+    ("resume-4", "Resume Fixture Four", "fixtures"),
+    ("resume-5", "Resume Fixture Five", "fixtures"),
+    ("resume-6", "Resume Fixture Six", "fixtures"),
+];
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ResumeSourceSnapshot {
+    traversal_starts: usize,
+    resumed_page_requests: usize,
+    blocked_second_page_started: bool,
+    fresh_resume_key_seen: bool,
+}
+
+#[derive(Debug, Default)]
+struct ResumeSourceState {
+    traversal_starts: usize,
+    resumed_page_requests: usize,
+    blocked_second_page_started: bool,
+    fresh_resume_key_seen: bool,
+}
+
+struct ResumeSourceFixture {
+    bind_addr: String,
+    shutdown: Arc<AtomicBool>,
+    state: Arc<Mutex<ResumeSourceState>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl ResumeSourceFixture {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local resume source fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("resume source fixture listener should be nonblocking");
+        let bind_addr = listener
+            .local_addr()
+            .expect("resume source fixture bind address")
+            .to_string();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(Mutex::new(ResumeSourceState::default()));
+        let shutdown_for_thread = Arc::clone(&shutdown);
+        let state_for_thread = Arc::clone(&state);
+        let thread = thread::spawn(move || {
+            while !shutdown_for_thread.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let shutdown = Arc::clone(&shutdown_for_thread);
+                        let state = Arc::clone(&state_for_thread);
+                        thread::spawn(move || {
+                            handle_resume_source_connection(stream, &shutdown, &state)
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("resume source fixture accept failed: {error}"),
+                }
+            }
+        });
+        Self {
+            bind_addr,
+            shutdown,
+            state,
+            thread: Some(thread),
+        }
+    }
+
+    fn endpoint(&self) -> String {
+        format!("http://{}", self.bind_addr)
+    }
+
+    fn assert_reachable(&self) {
+        let response = http_request_with_headers(
+            &self.bind_addr,
+            "GET",
+            "/1/indexes",
+            &[
+                ("x-algolia-application-id", RESUME_SOURCE_APP_ID),
+                ("x-algolia-api-key", INITIAL_RESUME_SOURCE_API_KEY),
+            ],
+            None,
+        )
+        .expect("resume source fixture reachability probe should receive a response");
+        assert_eq!(
+            response.status, 200,
+            "resume source fixture must be reachable before migration admission: {}",
+            response.body
+        );
+    }
+
+    fn snapshot(&self) -> ResumeSourceSnapshot {
+        let state = self.state.lock().unwrap();
+        ResumeSourceSnapshot {
+            traversal_starts: state.traversal_starts,
+            resumed_page_requests: state.resumed_page_requests,
+            blocked_second_page_started: state.blocked_second_page_started,
+            fresh_resume_key_seen: state.fresh_resume_key_seen,
+        }
+    }
+}
+
+impl Drop for ResumeSourceFixture {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(&self.bind_addr);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct AdmissionRecordSample {
@@ -199,6 +331,549 @@ fn create_index_via_http(server: &RunningServer, index_name: &str) {
         create_response.status, 200,
         "create-index precondition must succeed before probe: {}",
         create_response.body
+    );
+}
+
+fn handle_resume_source_connection(
+    mut stream: TcpStream,
+    shutdown: &Arc<AtomicBool>,
+    state: &Arc<Mutex<ResumeSourceState>>,
+) {
+    stream
+        .set_nonblocking(false)
+        .expect("accepted resume source connection should use blocking reads");
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .expect("resume source fixture should clone stream"),
+    );
+    let mut request_line = String::new();
+    if reader
+        .read_line(&mut request_line)
+        .expect("resume source fixture should read request line")
+        == 0
+    {
+        return;
+    }
+
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts
+        .next()
+        .expect("resume source fixture request method")
+        .to_string();
+    let request_target = request_parts
+        .next()
+        .expect("resume source fixture request path")
+        .to_string();
+    let (path, _query) = request_target
+        .split_once('?')
+        .map_or((request_target.as_str(), ""), |(path, query)| (path, query));
+
+    let mut headers = std::collections::BTreeMap::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        reader
+            .read_line(&mut line)
+            .expect("resume source fixture should read headers");
+        if line == "\r\n" {
+            break;
+        }
+        let (name, value) = line
+            .trim_end()
+            .split_once(':')
+            .expect("resume source fixture header should contain colon");
+        headers.insert(name.to_ascii_lowercase(), value.trim().to_string());
+    }
+
+    let content_length = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body_bytes = vec![0; content_length];
+    reader
+        .read_exact(&mut body_bytes)
+        .expect("resume source fixture should read body");
+    let body = if body_bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice::<Value>(&body_bytes)
+            .expect("resume source fixture body should be valid JSON")
+    };
+
+    let app_id = headers
+        .get("x-algolia-application-id")
+        .map(String::as_str)
+        .unwrap_or_default();
+    let api_key = headers
+        .get("x-algolia-api-key")
+        .map(String::as_str)
+        .unwrap_or_default();
+    if app_id != RESUME_SOURCE_APP_ID
+        || (api_key != INITIAL_RESUME_SOURCE_API_KEY && api_key != FRESH_RESUME_SOURCE_API_KEY)
+    {
+        write_json_response(
+            &mut stream,
+            403,
+            json!({"message": "unexpected source credentials"}),
+        );
+        return;
+    }
+
+    if api_key == FRESH_RESUME_SOURCE_API_KEY {
+        state.lock().unwrap().fresh_resume_key_seen = true;
+    }
+
+    match (method.as_str(), path) {
+        ("GET", "/1/indexes") => {
+            write_json_response(
+                &mut stream,
+                200,
+                json!({
+                    "items": [{
+                        "name": RESUME_SOURCE_INDEX,
+                        "entries": RESUME_EXPECTED_DOCUMENTS.len(),
+                        "updatedAt": "2026-07-31T00:00:00Z",
+                        "pendingTask": false
+                    }],
+                    "page": 0,
+                    "nbPages": 1
+                }),
+            );
+        }
+        ("GET", "/1/indexes/source_products/settings") => {
+            write_json_response(
+                &mut stream,
+                200,
+                json!({
+                    "searchableAttributes": ["title"],
+                    "attributesForFaceting": ["category"]
+                }),
+            );
+        }
+        ("POST", "/1/indexes/source_products/rules/search")
+        | ("POST", "/1/indexes/source_products/synonyms/search") => {
+            write_json_response(
+                &mut stream,
+                200,
+                json!({
+                    "hits": [],
+                    "page": 0,
+                    "nbPages": 0
+                }),
+            );
+        }
+        ("POST", "/1/indexes/source_products/browse") => {
+            let cursor = body.get("cursor").and_then(Value::as_str);
+            match cursor {
+                None => {
+                    let page = {
+                        let mut state = state.lock().unwrap();
+                        state.traversal_starts += 1;
+                        state.traversal_starts
+                    };
+                    match page {
+                        1 => write_json_response(
+                            &mut stream,
+                            200,
+                            json!({
+                                "hits": resume_source_documents(0, 3),
+                                "cursor": "identity-cursor-3"
+                            }),
+                        ),
+                        2 => {
+                            state.lock().unwrap().blocked_second_page_started = false;
+                            write_json_response(
+                                &mut stream,
+                                200,
+                                json!({
+                                    "hits": resume_source_documents(0, 2),
+                                    "cursor": "export-cursor-2-block"
+                                }),
+                            );
+                        }
+                        3 => write_json_response(
+                            &mut stream,
+                            200,
+                            json!({
+                                "hits": resume_source_documents(0, 3),
+                                "cursor": "identity-cursor-3"
+                            }),
+                        ),
+                        4 => {
+                            state.lock().unwrap().resumed_page_requests = 1;
+                            write_json_response(
+                                &mut stream,
+                                200,
+                                json!({
+                                    "hits": resume_source_documents(0, 3),
+                                    "cursor": "resume-cursor-3"
+                                }),
+                            );
+                        }
+                        other => write_json_response(
+                            &mut stream,
+                            500,
+                            json!({"message": format!("unexpected traversal start {other}")}),
+                        ),
+                    }
+                }
+                Some("identity-cursor-3") => {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        json!({
+                            "hits": resume_source_documents(3, 2),
+                            "cursor": "identity-cursor-5"
+                        }),
+                    );
+                }
+                Some("identity-cursor-5") => {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        json!({
+                            "hits": resume_source_documents(5, 1)
+                        }),
+                    );
+                }
+                Some("export-cursor-2-block") => {
+                    state.lock().unwrap().blocked_second_page_started = true;
+                    while !shutdown.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                Some("resume-cursor-3") => {
+                    state.lock().unwrap().resumed_page_requests += 1;
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        json!({
+                            "hits": resume_source_documents(3, 2),
+                            "cursor": "resume-cursor-5"
+                        }),
+                    );
+                }
+                Some("resume-cursor-5") => {
+                    state.lock().unwrap().resumed_page_requests += 1;
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        json!({
+                            "hits": resume_source_documents(5, 1)
+                        }),
+                    );
+                }
+                Some(other) => {
+                    write_json_response(
+                        &mut stream,
+                        500,
+                        json!({"message": format!("unexpected browse cursor {other}")}),
+                    );
+                }
+            }
+        }
+        _ => {
+            write_json_response(
+                &mut stream,
+                500,
+                json!({"message": "unexpected source request", "method": method, "path": path}),
+            );
+        }
+    }
+}
+
+fn write_json_response(stream: &mut TcpStream, status: u16, body: Value) {
+    let body = body.to_string();
+    let reason = if status < 400 { "OK" } else { "ERR" };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream
+        .write_all(response.as_bytes())
+        .expect("resume source fixture should write response");
+}
+
+fn resume_source_documents(start: usize, count: usize) -> Vec<Value> {
+    RESUME_EXPECTED_DOCUMENTS[start..start + count]
+        .iter()
+        .map(|(object_id, title, category)| {
+            json!({
+                "objectID": object_id,
+                "title": title,
+                "category": category
+            })
+        })
+        .collect()
+}
+
+fn resume_expected_target_ids() -> HashSet<String> {
+    RESUME_EXPECTED_DOCUMENTS
+        .iter()
+        .map(|(object_id, _, _)| object_id.to_string())
+        .collect()
+}
+
+fn migration_auth_headers(api_key: &str) -> [(&'static str, &str); 2] {
+    [
+        ("x-algolia-application-id", RESUME_MIGRATION_OWNER_APP_ID),
+        ("x-algolia-api-key", api_key),
+    ]
+}
+
+fn submit_resume_migration(server: &RunningServer, admin_key: &str) -> serde_json::Value {
+    let response = http_request_with_headers(
+        server.bind_addr(),
+        "POST",
+        "/1/migrations/algolia",
+        &migration_auth_headers(admin_key),
+        Some(
+            &json!({
+                "appId": RESUME_SOURCE_APP_ID,
+                "apiKey": INITIAL_RESUME_SOURCE_API_KEY,
+                "sourceIndex": RESUME_SOURCE_INDEX,
+                "targetIndex": RESUME_TARGET_INDEX
+            })
+            .to_string(),
+        ),
+    )
+    .expect("async migration submit should receive an HTTP response");
+    assert_eq!(
+        response.status, 202,
+        "resume restart submit must be admitted: {}",
+        response.body
+    );
+    parse_json_response(&response, "resume migration submit")
+}
+
+fn get_migration_status(server: &RunningServer, admin_key: &str, job_id: &str) -> Value {
+    let response = http_request_with_headers(
+        server.bind_addr(),
+        "GET",
+        &format!("/1/migrations/algolia/{job_id}"),
+        &migration_auth_headers(admin_key),
+        None,
+    )
+    .expect("migration status should receive an HTTP response");
+    assert_eq!(
+        response.status, 200,
+        "migration status should return HTTP 200: {}",
+        response.body
+    );
+    parse_json_response(&response, "resume migration status")
+}
+
+fn post_resume_migration(server: &RunningServer, admin_key: &str, job_id: &str) -> Value {
+    let response = http_request_with_headers(
+        server.bind_addr(),
+        "POST",
+        &format!("/1/migrations/algolia/{job_id}/resume"),
+        &migration_auth_headers(admin_key),
+        Some(
+            &json!({
+                "appId": RESUME_SOURCE_APP_ID,
+                "apiKey": FRESH_RESUME_SOURCE_API_KEY,
+                "sourceIndex": RESUME_SOURCE_INDEX,
+                "targetIndex": RESUME_TARGET_INDEX
+            })
+            .to_string(),
+        ),
+    )
+    .expect("migration resume should receive an HTTP response");
+    assert_eq!(
+        response.status, 202,
+        "resume route must accept an interrupted migration: {}",
+        response.body
+    );
+    parse_json_response(&response, "resume migration admission")
+}
+
+fn search_with_auth(
+    server: &RunningServer,
+    admin_key: &str,
+    index_name: &str,
+    payload: Value,
+) -> Value {
+    let response = http_request_with_headers(
+        server.bind_addr(),
+        "POST",
+        &format!("/1/indexes/{index_name}/query"),
+        &migration_auth_headers(admin_key),
+        Some(&payload.to_string()),
+    )
+    .expect("auth search should receive an HTTP response");
+    assert_eq!(
+        response.status, 200,
+        "auth search should return HTTP 200: {}",
+        response.body
+    );
+    parse_json_response(&response, "resume target search")
+}
+
+fn wait_for_resume_export_pre_crash(
+    server: &RunningServer,
+    admin_key: &str,
+    job_id: &str,
+    fixture: &ResumeSourceFixture,
+) -> Value {
+    let started_at = Instant::now();
+    loop {
+        let status = get_migration_status(server, admin_key, job_id);
+        let source = fixture.snapshot();
+        if status["phase"] == json!("exporting")
+            && status["disposition"] == json!("running")
+            && status["terminalAt"].is_null()
+            && status["exportProgress"] == json!({"completed": 2, "total": 6})
+            && source.traversal_starts >= 2
+            && source.blocked_second_page_started
+        {
+            return status;
+        }
+        assert!(
+            started_at.elapsed() <= RESUME_STATUS_TIMEOUT,
+            "resume pre-crash export should reach 2/6 progress with the second export page blocked; last status={status}, source={source:?}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_interrupted_status_after_restart(
+    server: &RunningServer,
+    admin_key: &str,
+    job_id: &str,
+) -> Value {
+    let started_at = Instant::now();
+    loop {
+        let status = get_migration_status(server, admin_key, job_id);
+        if status["phase"] == json!("exporting")
+            && status["disposition"] == json!("running")
+            && status["terminalAt"].is_null()
+            && status["exportProgress"] == json!({"completed": 2, "total": 6})
+            && status["resumable"] == json!(true)
+            && status["operation"] == json!("resume")
+            && status["resumeHandle"]
+                .as_str()
+                .is_some_and(|handle| !handle.is_empty())
+        {
+            return status;
+        }
+        assert!(
+            started_at.elapsed() <= RESUME_STATUS_TIMEOUT,
+            "restart recovery should expose the interrupted positive arm; last status={status}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_terminal_resume_success(
+    server: &RunningServer,
+    admin_key: &str,
+    job_id: &str,
+) -> Value {
+    let started_at = Instant::now();
+    loop {
+        let status = get_migration_status(server, admin_key, job_id);
+        if status["disposition"] == json!("succeeded") {
+            assert_eq!(status["phase"], json!("activating"));
+            assert!(
+                status["terminalAt"].is_string(),
+                "terminal success must expose terminalAt: {status}"
+            );
+            return status;
+        }
+        assert!(
+            started_at.elapsed() <= RESUME_STATUS_TIMEOUT,
+            "resume after restart should reach terminal success; last status={status}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+#[serial_test::serial(flapjack_server_write_env)]
+fn interrupted_async_migration_resumes_exactly_once_after_process_restart() {
+    let tmp = TempDir::new("fj_test_migration_resume_restart");
+    let source_fixture = ResumeSourceFixture::start();
+    source_fixture.assert_reachable();
+    let source_base_url = source_fixture.endpoint();
+    let env = [(ALGOLIA_TEST_BASE_URL_ENV, source_base_url.as_str())];
+
+    let mut server = RunningServer::spawn_no_auth_auto_port_with_env(tmp.path(), &env);
+    let admin_key = NO_AUTH_TEST_API_KEY;
+
+    let submit = submit_resume_migration(&server, admin_key);
+    let job_id = submit["jobId"]
+        .as_str()
+        .expect("resume migration submit must return a durable jobId")
+        .to_string();
+
+    let pre_crash = wait_for_resume_export_pre_crash(&server, admin_key, &job_id, &source_fixture);
+    assert!(
+        pre_crash.get("resumable").is_none(),
+        "a live export worker must not advertise resumable status before restart classification: {pre_crash}"
+    );
+
+    server.kill_and_restart_no_auth_auto_port_with_env(tmp.path(), &env);
+
+    let recovered = wait_for_interrupted_status_after_restart(&server, admin_key, &job_id);
+    let resume_handle = recovered["resumeHandle"]
+        .as_str()
+        .expect("interrupted status must expose resumeHandle")
+        .to_string();
+
+    let resume_admission = post_resume_migration(&server, admin_key, &job_id);
+    assert_eq!(resume_admission["jobId"], json!(job_id));
+    assert_eq!(resume_admission["disposition"], json!("running"));
+
+    let terminal = wait_for_terminal_resume_success(&server, admin_key, &job_id);
+    assert_eq!(terminal["jobId"], json!(job_id));
+    assert!(
+        terminal.get("resumeHandle").is_none(),
+        "terminal success must omit resumeHandle: {terminal}"
+    );
+
+    let target_search = search_with_auth(
+        &server,
+        admin_key,
+        RESUME_TARGET_INDEX,
+        json!({"query": "", "hitsPerPage": 100}),
+    );
+    assert_eq!(
+        target_search["nbHits"],
+        json!(RESUME_EXPECTED_DOCUMENTS.len()),
+        "resumed target must contain the exact six expected documents: {target_search}"
+    );
+    let actual_ids = target_search["hits"]
+        .as_array()
+        .expect("resumed target search must return hits")
+        .iter()
+        .map(|hit| {
+            hit["objectID"]
+                .as_str()
+                .unwrap_or_else(|| panic!("resumed target hit must include objectID: {hit}"))
+                .to_string()
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(actual_ids, resume_expected_target_ids());
+
+    let source = source_fixture.snapshot();
+    assert_eq!(
+        source.traversal_starts, 4,
+        "the source fixture must observe initial identity/export and resumed identity/export traversals"
+    );
+    assert_eq!(
+        source.resumed_page_requests, 3,
+        "the resumed traversal must serve the three shifted pages"
+    );
+    assert!(
+        source.fresh_resume_key_seen,
+        "resume must use fresh source credentials on the second traversal"
+    );
+    assert!(
+        !resume_handle.is_empty(),
+        "interrupted status must expose a non-empty opaque resume handle"
     );
 }
 

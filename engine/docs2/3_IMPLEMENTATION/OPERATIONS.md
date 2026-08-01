@@ -216,6 +216,33 @@ restart GET /1/migrations/algolia/ef4c16f4-3281-42c8-b5f9-553b9f4a265d -> HTTP 2
 restart body: {"jobId":"ef4c16f4-3281-42c8-b5f9-553b9f4a265d","phase":"activating","disposition":"succeeded","exportProgress":{"completed":4,"total":4},"createdAt":"2026-07-20T23:47:12.499361Z","updatedAt":"2026-07-20T23:47:14.682685Z","terminalAt":"2026-07-20T23:47:14.682685Z"}
 ```
 
+#### Migration preview (pre-admission dry run)
+
+Preview reads and translates a source without admitting a job. The three admin-authenticated preview routes are all `POST`: `/1/migrations/algolia/preview`, `/1/migrations/meilisearch/preview`, and `/1/migrations/typesense/preview`. Send the Flapjack application id in `x-algolia-application-id` and the Flapjack admin key in `x-algolia-api-key`; source credentials go in the JSON body. Do not embed real credentials in scripts or logs. <!-- owner: engine/flapjack-http/src/router.rs:134 --> <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:937 --> <!-- owner: engine/docs2/openapi.json -->
+
+Request-body ownership is per provider: Algolia uses `MigrateFromAlgoliaRequest` (`appId`, `apiKey`, `sourceIndex`, optional `targetIndex`, `overwrite`); Meilisearch uses `MigrateFromMeilisearchRequest` (`endpoint`, `apiKey`, `sourceIndex`, optional `targetIndex`, `overwrite`); Typesense currently reuses the Algolia-shaped `MigrateFromAlgoliaRequest`. The generated wire contract in `engine/docs2/openapi.json` is the source of truth for these shapes. <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:92 --> <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:114 --> <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:134 -->
+
+On HTTP `200` the body is `MigrationPreviewResponse`. Its value contract is exactly:
+
+- `sourceCounts.indexes` and `sourceCounts.records` — non-negative integers.
+- `report.entries[]`, each with `severity`, `code`, `resource`, `jsonPath`, and the nullable `pageIndex`/`itemIndex`.
+- `report.summary.totalEntries`, `report.summary.hardRejections`, `report.summary.warnings`, `report.summary.scopeGaps` — non-negative integers.
+- `report.reportDigest` — optional, nullable string.
+
+Non-2xx responses are not empty reports: HTTP `400` signals an invalid migration request or unsupported source payload, HTTP `502` signals an upstream source-provider request failure, and an unsupported provider fails closed with `400` carrying the exact code `source_provider_unsupported`. A consumer must branch on status and must not treat a non-2xx body as a zero-entry report. <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:68 --> <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:970 -->
+
+Separation-of-concerns boundary: `mod.rs::preview_source_migration` reads the source snapshot, collects replica settings, and translates through `translation_session.rs::translate_spool_report`, then stops. It does not admit a job, construct a durable spool, or enter the publication owners (`import.rs::import_accepted_export_inner` → `BulkBuildService::{prepare_publication,create_staging,activate}`). The byte-identity proof for this boundary — the 51-surface durable-state comparison and the reverted `migration_exports/jobs/preview_mutation_sentinel` red mutation — is owned by [`../4_EVIDENCE/2026_07_31_stage3_migration_preview_safety_receipt.md`](../4_EVIDENCE/2026_07_31_stage3_migration_preview_safety_receipt.md); it is not duplicated here. <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:1203 --> <!-- owner: engine/flapjack-http/src/handlers/migration/translation_session.rs:128 -->
+
+Per-provider disposition (published OpenAPI path presence is not a claim that a provider's preview succeeds):
+
+| Provider | Request schema | Proof method | Disposition |
+| --- | --- | --- | --- |
+| Algolia | `MigrateFromAlgoliaRequest` | Fixture route proof returned the translation owner's exact report with `sourceCounts.indexes=1`, `records=3`. | Fixture-proven. No real-Algolia preview claim. |
+| Meilisearch | `MigrateFromMeilisearchRequest` | Pinned local source lifecycle reached; the production route stays unproven. | Real-source parity **open**. Two residuals: `MeilisearchClient::new` rejects the loopback endpoint (strict HTTPS `*.meilisearch.io`), and `source_reader.rs::normalize_meilisearch_settings` collects then discards its translation warnings. |
+| Typesense | `MigrateFromAlgoliaRequest` (Algolia-shaped) | Real-source KAT passes; the preview route asserts HTTP `400` with `source_provider_unsupported`. | Fails closed as unsupported. No Typesense preview adapter claim. |
+
+Stage 2 used a true zero-write path and introduced no ephemeral-scope fallback residual.
+
 ### Snapshot export/import runtime offload
 
 Snapshot export and import offload their synchronous tar/gzip work onto a blocking worker via `tokio::task::spawn_blocking` in `engine/flapjack-http/src/handlers/snapshot.rs::export_snapshot` and `::import_snapshot`, so `/health` checks and task polling are not starved by those operations. The restore and import scenarios below cover the operator-visible outcomes.

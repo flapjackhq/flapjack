@@ -206,7 +206,7 @@ test("buildResultArtifact produces valid schema with all required fields", () =>
     latenciesMs: latencies,
     wallClockMs: 800,
     indexName: "benchmark_100k",
-    settingsSource: "engine/dashboard/tour/product-seed-data.mjs::seedSettings",
+    settingsSource: "engine/loadtest/product-seed-data.mjs::seedSettings",
   });
 
   // Top-level required fields
@@ -215,7 +215,7 @@ test("buildResultArtifact produces valid schema with all required fields", () =>
   assert.equal(artifact.errorCount, 1);
   assert.equal(artifact.wallClockMs, 800);
   assert.equal(artifact.indexName, "benchmark_100k");
-  assert.equal(artifact.settingsSource, "engine/dashboard/tour/product-seed-data.mjs::seedSettings");
+  assert.equal(artifact.settingsSource, "engine/loadtest/product-seed-data.mjs::seedSettings");
   assert.equal(typeof artifact.timestamp, "string");
   // ISO 8601 format
   assert.ok(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(artifact.timestamp));

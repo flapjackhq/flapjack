@@ -5,7 +5,18 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::Mutex;
 use std::thread;
+
+static ALGOLIA_BASE_URL_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+fn lock_clean_algolia_base_url_env() -> std::sync::MutexGuard<'static, ()> {
+    let guard = ALGOLIA_BASE_URL_ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::env::remove_var(TEST_ALGOLIA_BASE_URL_ENV);
+    guard
+}
 
 #[derive(Debug, Clone)]
 struct ScriptedTransport {
@@ -247,6 +258,7 @@ fn browse_documents_with_limits_for_test(
 
 #[test]
 fn client_policy_validates_app_id_before_host_construction() {
+    let _env_lock = lock_clean_algolia_base_url_env();
     for app_id in ["", "bad/id", "bad.example", "bad:443", "bad app"] {
         assert_eq!(
             request_for_test(app_id, "products", AlgoliaMethod::Get, "settings")
@@ -266,6 +278,7 @@ fn client_policy_validates_app_id_before_host_construction() {
 
 #[test]
 fn client_policy_percent_encodes_index_names() {
+    let _env_lock = lock_clean_algolia_base_url_env();
     let request = request_for_test("APP123", "summer/sale 2026", AlgoliaMethod::Post, "browse")
         .expect("valid request should be planned");
 
@@ -278,6 +291,7 @@ fn client_policy_percent_encodes_index_names() {
 
 #[test]
 fn client_policy_uses_exact_https_host_and_fixed_timeouts() {
+    let _env_lock = lock_clean_algolia_base_url_env();
     let request = request_for_test("APP123", "products", AlgoliaMethod::Get, "settings")
         .expect("valid request should be planned");
 
@@ -291,6 +305,7 @@ fn client_policy_uses_exact_https_host_and_fixed_timeouts() {
 
 #[test]
 fn client_policy_has_no_production_base_url_override() {
+    let _env_lock = lock_clean_algolia_base_url_env();
     let request = request_for_test("APP123", "products", AlgoliaMethod::Get, "settings")
         .expect("valid request should be planned");
 
@@ -298,6 +313,94 @@ fn client_policy_has_no_production_base_url_override() {
         request.url,
         "https://APP123-dsn.algolia.net/1/indexes/products/settings"
     );
+}
+
+#[test]
+fn client_policy_allows_test_base_url_override() {
+    let _env_lock = lock_clean_algolia_base_url_env();
+    std::env::set_var(TEST_ALGOLIA_BASE_URL_ENV, "http://127.0.0.1:18181/");
+
+    let request = request_for_test("APP123", "products", AlgoliaMethod::Get, "settings")
+        .expect("test override should still plan a request");
+
+    assert_eq!(
+        request.url,
+        "http://127.0.0.1:18181/1/indexes/products/settings"
+    );
+    assert!(
+        request.fallback_urls.is_empty(),
+        "test override must disable vendor fallback hosts so the fixture stays local"
+    );
+
+    std::env::remove_var(TEST_ALGOLIA_BASE_URL_ENV);
+}
+
+#[test]
+fn client_policy_limits_test_base_url_override_to_debug_builds() {
+    let _env_lock = lock_clean_algolia_base_url_env();
+    std::env::set_var(TEST_ALGOLIA_BASE_URL_ENV, "http://127.0.0.1:18181/");
+
+    let request = request_for_test("APP123", "products", AlgoliaMethod::Get, "settings")
+        .expect("loopback test override should either apply in debug or be ignored in release");
+
+    if cfg!(debug_assertions) {
+        assert_eq!(
+            request.url,
+            "http://127.0.0.1:18181/1/indexes/products/settings"
+        );
+        assert!(
+            request.fallback_urls.is_empty(),
+            "debug/test builds must keep fixture traffic local"
+        );
+    } else {
+        assert_eq!(
+            request.url,
+            "https://APP123-dsn.algolia.net/1/indexes/products/settings"
+        );
+        assert_eq!(
+            request.fallback_urls,
+            vec![
+                "https://APP123-1.algolianet.com/1/indexes/products/settings",
+                "https://APP123-2.algolianet.com/1/indexes/products/settings",
+                "https://APP123-3.algolianet.com/1/indexes/products/settings",
+            ]
+        );
+    }
+
+    std::env::remove_var(TEST_ALGOLIA_BASE_URL_ENV);
+}
+
+#[test]
+fn client_policy_rejects_remote_test_base_url_before_planning_credentials() {
+    let _env_lock = lock_clean_algolia_base_url_env();
+    std::env::set_var(TEST_ALGOLIA_BASE_URL_ENV, "http://203.0.113.10:18181/");
+
+    let error = request_for_test("APP123", "products", AlgoliaMethod::Get, "settings").expect_err(
+        "remote test override must be rejected before a credentialed request is planned",
+    );
+
+    assert_eq!(error.kind(), AlgoliaErrorKind::Validation);
+    assert_eq!(
+        error.safe_message(),
+        "Algolia test base URL must use a literal loopback address"
+    );
+    std::env::remove_var(TEST_ALGOLIA_BASE_URL_ENV);
+}
+
+#[test]
+fn client_policy_rejects_loopback_hostname_to_prevent_dns_rebinding() {
+    let _env_lock = lock_clean_algolia_base_url_env();
+    std::env::set_var(TEST_ALGOLIA_BASE_URL_ENV, "http://localhost:18181/");
+
+    let error = request_for_test("APP123", "products", AlgoliaMethod::Get, "settings")
+        .expect_err("test override must not re-resolve a hostname after loopback validation");
+
+    assert_eq!(error.kind(), AlgoliaErrorKind::Validation);
+    assert_eq!(
+        error.safe_message(),
+        "Algolia test base URL must use a literal loopback address"
+    );
+    std::env::remove_var(TEST_ALGOLIA_BASE_URL_ENV);
 }
 
 // The replica-settings method reuses the exact index_path / plan_request /

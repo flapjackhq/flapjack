@@ -112,6 +112,7 @@ docs2/3_IMPLEMENTATION/*
 !docs2/3_IMPLEMENTATION/SECURITY_BASELINE.md
 !docs2/3_IMPLEMENTATION/DISASTER_RECOVERY.md
 !docs2/3_IMPLEMENTATION/VECTOR_SEARCH_QUICKSTART.md
+!docs2/3_IMPLEMENTATION/2026_07_26_m0b_typesense_source_contract.md
 !docs2/3_IMPLEMENTATION/decisions/
 docs2/3_IMPLEMENTATION/decisions/*
 !docs2/3_IMPLEMENTATION/decisions/active/
@@ -130,3 +131,7 @@ docs2/0_META/OPEN_SOURCE_REPO_TRANSFER_GUIDE.md
 # Stage 5 live ops-contract harness runtime artifacts (harness-owned, not committed)
 tests/results/ops_contract_live/
 tests/results/ops_contract_live.txt
+
+# S3 SSE served-probe runtime evidence (harness-owned, not committed)
+tests/results/s3_sse_http_probe_*/
+tests/results/s3_sse_evidence/

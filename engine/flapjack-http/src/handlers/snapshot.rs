@@ -1,6 +1,7 @@
 use super::AppState;
 use crate::error_response::json_error;
 use crate::extractors::ValidatedIndexName;
+use crate::security_audit::{emit_admin_action, Action, Actor, AuditIndexName, Outcome, Target};
 use axum::{
     body::Bytes,
     extract::State,
@@ -112,6 +113,17 @@ fn snapshot_retention() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(24)
+}
+
+fn emit_snapshot_action(validated_index_name: &str, action: Action, outcome: Outcome) {
+    let audit_index_name = AuditIndexName::from_validated(validated_index_name);
+    emit_admin_action(
+        Actor::admin_api_key(),
+        action,
+        Target::index_snapshot(&audit_index_name),
+        outcome,
+        None,
+    );
 }
 
 /// Validates that a user-supplied restore key references the correct index and has proper format.
@@ -252,8 +264,14 @@ pub async fn import_snapshot(
     match crate::startup_catchup::restore_snapshot_bytes(&state.manager, &index_name, body.to_vec())
         .await
     {
-        Ok(()) => Json(serde_json::json!({ "status": "imported" })).into_response(),
-        Err((step, error)) => snapshot_install_error("Import failed", step, error),
+        Ok(()) => {
+            emit_snapshot_action(&index_name, Action::ImportSnapshot, Outcome::Success);
+            Json(serde_json::json!({ "status": "imported" })).into_response()
+        }
+        Err((step, error)) => {
+            emit_snapshot_action(&index_name, Action::ImportSnapshot, Outcome::Failure);
+            snapshot_install_error("Import failed", step, error)
+        }
     }
 }
 
@@ -360,20 +378,29 @@ pub async fn restore_from_s3(
 
     let (key, data) = match download_restore_payload(&s3_config, &index_name, key_override).await {
         Ok(payload) => payload,
-        Err(response) => return *response,
+        Err(response) => {
+            emit_snapshot_action(&index_name, Action::RestoreSnapshotFromS3, Outcome::Failure);
+            return *response;
+        }
     };
 
     let data_len = data.len();
     // Quiesce the destination writer and run the synchronous install off the
     // async worker pool via the shared restore path.
     match crate::startup_catchup::restore_snapshot_bytes(&state.manager, &index_name, data).await {
-        Ok(()) => Json(serde_json::json!({
-            "status": "restored",
-            "key": key,
-            "size_bytes": data_len,
-        }))
-        .into_response(),
-        Err((step, error)) => snapshot_install_error("Restore failed", step, error),
+        Ok(()) => {
+            emit_snapshot_action(&index_name, Action::RestoreSnapshotFromS3, Outcome::Success);
+            Json(serde_json::json!({
+                "status": "restored",
+                "key": key,
+                "size_bytes": data_len,
+            }))
+            .into_response()
+        }
+        Err((step, error)) => {
+            emit_snapshot_action(&index_name, Action::RestoreSnapshotFromS3, Outcome::Failure);
+            snapshot_install_error("Restore failed", step, error)
+        }
     }
 }
 

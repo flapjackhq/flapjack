@@ -160,6 +160,7 @@ args_scale_rejects_too_small_corpus
 signal_int_evidence
 signal_term_evidence
 cleanup_failure_evidence
+selftest_failure_evidence_retained
 testing_docs_scale_proof_contract
 debbie_public_sync_surface
 args_importing_accepts_scenario_replicas
@@ -325,6 +326,7 @@ scenario_id_for_label() {
     'INT preserves evidence, stops server, and returns 130') printf '%s\n' 'signal_int_evidence' ;;
     'TERM preserves evidence, stops server, and returns 143') printf '%s\n' 'signal_term_evidence' ;;
     'simulated cleanup failure preserves evidence and exits nonzero') printf '%s\n' 'cleanup_failure_evidence' ;;
+    'self-test retains its work directory on failure') printf '%s\n' 'selftest_failure_evidence_retained' ;;
     'testing docs describe the local migration scale proof') printf '%s\n' 'testing_docs_scale_proof_contract' ;;
     'debbie sync surface publishes migration test, docs, and workflow assets') printf '%s\n' 'debbie_public_sync_surface' ;;
     'scenario replicas is accepted for importing mode') printf '%s\n' 'args_importing_accepts_scenario_replicas' ;;
@@ -382,20 +384,65 @@ skip() {
   printf '  [SKIP] %s\n' "$1"
 }
 
-WORK_DIR="$(mktemp -d)"
+if [ -n "${MIGRATION_IMPORT_CONTRACT_SELFTEST_WORK_DIR:-}" ]; then
+  WORK_DIR="$MIGRATION_IMPORT_CONTRACT_SELFTEST_WORK_DIR"
+  if [ -e "$WORK_DIR" ]; then
+    printf 'refusing pre-existing self-test work directory: %s\n' "$WORK_DIR" >&2
+    exit 1
+  fi
+  mkdir -p -- "$WORK_DIR"
+else
+  WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fj_migration_import_contract_selftest.XXXXXX")"
+fi
+WORK_DIR_OWNER="$WORK_DIR/.migration_import_contract_selftest_owned"
+: >"$WORK_DIR_OWNER"
 OWNED_PIDS=()
 
 cleanup() {
-  local pid
+  local rc="$?" pid
   for pid in "${OWNED_PIDS[@]:-}"; do
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
     fi
   done
-  rm -rf "$WORK_DIR" 2>/dev/null || true
+  if [ "$rc" -ne 0 ] || [ "${TESTS_FAILED:-0}" -ne 0 ]; then
+    printf 'self-test failure evidence retained at %s\n' "$WORK_DIR" >&2
+  elif [ ! -f "$WORK_DIR_OWNER" ]; then
+    printf 'refusing cleanup without self-test ownership marker: %s\n' "$WORK_DIR" >&2
+  else
+    rm -rf -- "$WORK_DIR"
+  fi
 }
 trap cleanup EXIT
+
+force_failure_for_cleanup_probe() {
+  [ "${MIGRATION_IMPORT_CONTRACT_SELFTEST_FORCE_FAILURE:-0}" = 1 ] || return 0
+  mkdir -p "$WORK_DIR/forced_failure_evidence"
+  printf '%s\n' artifact >"$WORK_DIR/forced_failure_evidence/scenario-inventory.diff"
+  fail 'forced failure for cleanup probe' "$WORK_DIR"
+  exit 1
+}
+
+assert_failure_retains_work_dir() {
+  local probe_dir="$WORK_DIR/retention_probe" out rc
+  out="$WORK_DIR/retention_probe.out"
+  rm -rf "$probe_dir"
+  set +e
+  MIGRATION_IMPORT_CONTRACT_SELFTEST_FORCE_FAILURE=1 \
+    MIGRATION_IMPORT_CONTRACT_SELFTEST_WORK_DIR="$probe_dir" \
+    bash "$0" >"$out" 2>&1
+  rc="$?"
+  set -e
+  if [ "$rc" != 0 ] \
+    && [ -f "$probe_dir/forced_failure_evidence/scenario-inventory.diff" ] \
+    && grep -Fq 'self-test failure evidence retained at' "$out"; then
+    pass 'self-test retains its work directory on failure'
+  else
+    fail 'self-test retains its work directory on failure' \
+      "rc=$rc output=$(cat "$out" 2>/dev/null || true)"
+  fi
+}
 
 write_fake_runtime() {
   local runtime="$1"
@@ -3346,6 +3393,7 @@ assert_static_contract() {
 }
 
 main() {
+  force_failure_for_cleanup_probe
   echo 'migration_import_contract oracle meta-test'
   assert_static_contract
   assert_generator_contract
@@ -3503,6 +3551,7 @@ main() {
   assert_signal_scenario 'INT preserves evidence, stops server, and returns 130' self_int 130
   assert_signal_scenario 'TERM preserves evidence, stops server, and returns 143' self_term 143
   assert_cleanup_failure_scenario
+  assert_failure_retains_work_dir
   assert_testing_docs_scale_proof_contract
   assert_debbie_public_sync_surface
 

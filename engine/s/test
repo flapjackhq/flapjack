@@ -468,6 +468,9 @@ if [ "$RUN_INTEG" = "true" ]; then
   next_step "Rust: integration tests (nextest)"
   cd "$ENGINE_DIR"
   ensure_dashboard_dist
+  # Some integration tests spawn target/debug/flapjack directly rather than
+  # through Cargo, so the integration lane owns this runtime prerequisite.
+  cargo build --package flapjack-server --bin flapjack
   cargo nextest run
   success "Integration tests passed"
   echo ""

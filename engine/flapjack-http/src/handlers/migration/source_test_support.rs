@@ -1,10 +1,20 @@
 use super::algolia_client::{AlgoliaClientError, AlgoliaErrorKind, AlgoliaIndexRecord};
+use super::meilisearch_client::{
+    MeilisearchClientError, MeilisearchErrorKind, MeilisearchSourceObservation,
+};
 use super::source_identity_partitions::{
     SourceIdentityConfig, SourceIdentityError, CERTIFIED_MAX_ITEMS, DEFAULT_IDENTITY_BUDGET_BYTES,
     IDENTITY_V2_DOMAIN,
 };
-use super::source_reader::{MigrationSourceReader, PageConsumer, SourceExportSink, SourceFuture};
+use super::source_reader::{
+    MeilisearchExportSource, MeilisearchPageConsumer, MeilisearchSourceFuture,
+    MigrationSourceReader, PageConsumer, SourceExportSink, SourceFuture, TypesenseExportSource,
+    TypesensePageConsumer, TypesenseSourceFuture,
+};
 use super::source_snapshot::{source_item_hash, update_source_item_hash_digest};
+use super::typesense_client::{
+    TypesenseClientError, TypesenseErrorKind, TypesenseSourceObservation,
+};
 use crate::dto::SearchRequest;
 use axum::{extract::State, Json};
 use serde_json::Value;
@@ -21,6 +31,201 @@ pub(super) fn identity_config_for_test(
         CERTIFIED_MAX_ITEMS,
     );
     Ok((spool_root, config))
+}
+
+#[derive(Default)]
+pub(super) struct ScriptedMeilisearchSource {
+    observations: VecDeque<MeilisearchSourceObservation>,
+    settings: VecDeque<Value>,
+    document_passes: VecDeque<Vec<Vec<Value>>>,
+    access_error: Option<MeilisearchClientError>,
+}
+
+impl ScriptedMeilisearchSource {
+    pub(super) fn with_passes(
+        observation: MeilisearchSourceObservation,
+        settings: Value,
+        document_passes: Vec<Vec<Vec<Value>>>,
+    ) -> Self {
+        Self {
+            observations: VecDeque::from(vec![observation.clone(); document_passes.len() + 1]),
+            settings: VecDeque::from(vec![settings; document_passes.len()]),
+            document_passes: VecDeque::from(document_passes),
+            access_error: None,
+        }
+    }
+
+    pub(super) fn with_access_error(mut self, error: MeilisearchClientError) -> Self {
+        self.access_error = Some(error);
+        self
+    }
+
+    pub(super) fn with_observations(
+        mut self,
+        observations: Vec<MeilisearchSourceObservation>,
+    ) -> Self {
+        self.observations = VecDeque::from(observations);
+        self
+    }
+}
+
+impl MeilisearchExportSource for ScriptedMeilisearchSource {
+    fn observe_source(&mut self) -> MeilisearchSourceFuture<'_, MeilisearchSourceObservation> {
+        Box::pin(async move {
+            self.observations
+                .pop_front()
+                .ok_or_else(meilisearch_test_script_error)
+        })
+    }
+
+    fn read_settings(&mut self) -> MeilisearchSourceFuture<'_, Value> {
+        Box::pin(async move {
+            self.settings
+                .pop_front()
+                .ok_or_else(meilisearch_test_script_error)
+        })
+    }
+
+    fn require_read_access(&mut self) -> MeilisearchSourceFuture<'_, ()> {
+        let error = self.access_error.clone();
+        Box::pin(async move { error.map_or(Ok(()), Err) })
+    }
+
+    fn read_document_pages<'a>(
+        &'a mut self,
+        consume_page: &'a mut MeilisearchPageConsumer<'a>,
+    ) -> MeilisearchSourceFuture<'a, MeilisearchSourceObservation> {
+        Box::pin(async move {
+            let pages = self
+                .document_passes
+                .pop_front()
+                .ok_or_else(meilisearch_test_script_error)?;
+            for page in pages {
+                consume_page(page)?;
+            }
+            self.observations
+                .front()
+                .cloned()
+                .ok_or_else(meilisearch_test_script_error)
+        })
+    }
+}
+
+pub(super) fn meilisearch_observation(
+    source_name: &str,
+    primary_key: &str,
+    document_count: u64,
+) -> MeilisearchSourceObservation {
+    MeilisearchSourceObservation {
+        source_name: source_name.to_string(),
+        primary_key: primary_key.to_string(),
+        updated_at: "2026-07-26T19:20:26Z".to_string(),
+        document_count,
+    }
+}
+
+fn meilisearch_test_script_error() -> MeilisearchClientError {
+    MeilisearchClientError::new(
+        MeilisearchErrorKind::Progress,
+        "Meilisearch test source script exhausted",
+    )
+}
+
+#[derive(Default)]
+pub(super) struct ScriptedTypesenseSource {
+    observations: VecDeque<TypesenseSourceObservation>,
+    settings: VecDeque<Value>,
+    document_passes: VecDeque<Vec<Vec<Value>>>,
+    access_error: Option<TypesenseClientError>,
+}
+
+impl ScriptedTypesenseSource {
+    pub(super) fn with_passes(
+        observation: TypesenseSourceObservation,
+        settings: Value,
+        document_passes: Vec<Vec<Vec<Value>>>,
+    ) -> Self {
+        Self {
+            observations: VecDeque::from(vec![observation.clone(); document_passes.len() + 1]),
+            settings: VecDeque::from(vec![settings; document_passes.len()]),
+            document_passes: VecDeque::from(document_passes),
+            access_error: None,
+        }
+    }
+
+    pub(super) fn with_access_error(mut self, error: TypesenseClientError) -> Self {
+        self.access_error = Some(error);
+        self
+    }
+
+    pub(super) fn with_observations(
+        mut self,
+        observations: Vec<TypesenseSourceObservation>,
+    ) -> Self {
+        self.observations = VecDeque::from(observations);
+        self
+    }
+}
+
+impl TypesenseExportSource for ScriptedTypesenseSource {
+    fn observe_source(&mut self) -> TypesenseSourceFuture<'_, TypesenseSourceObservation> {
+        Box::pin(async move {
+            self.observations
+                .pop_front()
+                .ok_or_else(typesense_test_script_error)
+        })
+    }
+
+    fn read_settings(&mut self) -> TypesenseSourceFuture<'_, Value> {
+        Box::pin(async move {
+            self.settings
+                .pop_front()
+                .ok_or_else(typesense_test_script_error)
+        })
+    }
+
+    fn require_read_access(&mut self) -> TypesenseSourceFuture<'_, ()> {
+        let error = self.access_error.clone();
+        Box::pin(async move { error.map_or(Ok(()), Err) })
+    }
+
+    fn read_document_pages<'a>(
+        &'a mut self,
+        consume_page: &'a mut TypesensePageConsumer<'a>,
+    ) -> TypesenseSourceFuture<'a, TypesenseSourceObservation> {
+        Box::pin(async move {
+            let pages = self
+                .document_passes
+                .pop_front()
+                .ok_or_else(typesense_test_script_error)?;
+            for page in pages {
+                consume_page(page)?;
+            }
+            self.observations
+                .front()
+                .cloned()
+                .ok_or_else(typesense_test_script_error)
+        })
+    }
+}
+
+pub(super) fn typesense_observation(
+    source_name: &str,
+    document_count: u64,
+) -> TypesenseSourceObservation {
+    TypesenseSourceObservation {
+        source_name: source_name.to_string(),
+        updated_at: "1785020400".to_string(),
+        document_count,
+        schema_hash: "typesense-test-schema-hash".to_string(),
+    }
+}
+
+fn typesense_test_script_error() -> TypesenseClientError {
+    TypesenseClientError::new(
+        TypesenseErrorKind::Progress,
+        "Typesense test source script exhausted",
+    )
 }
 
 pub(super) struct ScriptedSourceReader {
@@ -219,8 +424,11 @@ impl MigrationSourceReader for ScriptedSourceReader {
 pub(super) struct RecordingSink {
     pub(super) settings: Vec<Value>,
     pub(super) document_pages: Vec<Vec<String>>,
+    pub(super) raw_document_pages: Vec<Vec<Value>>,
     pub(super) rule_pages: Vec<Vec<String>>,
+    pub(super) raw_rule_pages: Vec<Vec<Value>>,
     pub(super) synonym_pages: Vec<Vec<String>>,
+    pub(super) raw_synonym_pages: Vec<Vec<Value>>,
 }
 
 impl SourceExportSink for RecordingSink {
@@ -231,16 +439,19 @@ impl SourceExportSink for RecordingSink {
 
     fn commit_document_page(&mut self, page: &[Value]) -> Result<(), AlgoliaClientError> {
         self.document_pages.push(page_object_ids(page));
+        self.raw_document_pages.push(page.to_vec());
         Ok(())
     }
 
     fn commit_rule_page(&mut self, page: &[Value]) -> Result<(), AlgoliaClientError> {
         self.rule_pages.push(page_object_ids(page));
+        self.raw_rule_pages.push(page.to_vec());
         Ok(())
     }
 
     fn commit_synonym_page(&mut self, page: &[Value]) -> Result<(), AlgoliaClientError> {
         self.synonym_pages.push(page_object_ids(page));
+        self.raw_synonym_pages.push(page.to_vec());
         Ok(())
     }
 }

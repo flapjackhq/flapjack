@@ -1,10 +1,10 @@
-use super::algolia_client::{AlgoliaClientError, AlgoliaErrorKind};
+use super::algolia_client::{should_retry, AlgoliaClientError, AlgoliaErrorKind};
 use super::source_reader::{
     collect_quiescent_source_snapshot, collect_replica_settings, read_source_snapshot,
     source_drift_error, MigrationSourceReader, SourceExportSink, SourceIdentity,
 };
 use super::source_snapshot::{source_item_hash, SourceSnapshot};
-use super::spool::{ResourceDenominators, SpoolError, SpoolStore};
+use super::spool::{ExportCheckpoint, ResourceDenominators, SpoolError, SpoolStore};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::env;
@@ -71,6 +71,7 @@ pub(super) enum ExportError {
     Source(AlgoliaClientError),
     Spool(SpoolError),
     Cancelled,
+    Interrupted,
 }
 
 impl From<AlgoliaClientError> for ExportError {
@@ -93,7 +94,7 @@ pub(super) async fn export_algolia_source<R: MigrationSourceReader>(
     reader: &mut R,
 ) -> Result<AcceptedExport, ExportError> {
     store.create_migration_phase(job_uuid)?;
-    run_export(store, reader, ExportRun::Fresh(job_uuid)).await
+    run_export(store, reader, job_uuid).await
 }
 
 /// Export for the synchronous public import path. Replica settings are now
@@ -105,7 +106,7 @@ pub(super) async fn export_algolia_source_for_import<R: MigrationSourceReader>(
     job_uuid: Uuid,
     reader: &mut R,
 ) -> Result<AcceptedExport, ExportError> {
-    run_export(store, reader, ExportRun::Fresh(job_uuid)).await
+    run_export(store, reader, job_uuid).await
 }
 
 /// Resume an in-flight export through its opaque checkpoint handle, refusing any
@@ -118,13 +119,27 @@ pub(super) async fn resume_algolia_source<R: MigrationSourceReader>(
     reader: &mut R,
     checkpoint_handle: &str,
 ) -> Result<AcceptedExport, ExportError> {
-    run_export(store, reader, ExportRun::Resume(checkpoint_handle)).await
+    let checkpoint = claim_validated_algolia_resume(store, reader, checkpoint_handle).await?;
+    resume_claimed_algolia_source(store, reader, checkpoint).await
 }
 
-#[derive(Clone, Copy)]
-enum ExportRun<'a> {
-    Fresh(Uuid),
-    Resume(&'a str),
+pub(super) async fn claim_validated_algolia_resume<R: MigrationSourceReader>(
+    store: &SpoolStore,
+    reader: &mut R,
+    checkpoint_handle: &str,
+) -> Result<ExportCheckpoint, ExportError> {
+    let source_identity = collect_quiescent_source_snapshot(reader).await?;
+    store
+        .claim_interrupted_export(checkpoint_handle, source_identity.digest())
+        .map_err(Into::into)
+}
+
+pub(super) async fn resume_claimed_algolia_source<R: MigrationSourceReader>(
+    store: &SpoolStore,
+    reader: &mut R,
+    checkpoint: ExportCheckpoint,
+) -> Result<AcceptedExport, ExportError> {
+    run_claimed_resume_after_admission(store, reader, checkpoint).await
 }
 
 /// Drive an export to completion and settle a fresh run's durable migration phase
@@ -134,14 +149,10 @@ enum ExportRun<'a> {
 async fn run_export<R: MigrationSourceReader>(
     store: &SpoolStore,
     reader: &mut R,
-    run: ExportRun<'_>,
+    job_uuid: Uuid,
 ) -> Result<AcceptedExport, ExportError> {
-    let fresh_job_uuid = match run {
-        ExportRun::Fresh(job_uuid) => Some(job_uuid),
-        ExportRun::Resume(_) => None,
-    };
-    let outcome = run_export_after_admission(store, reader, run).await;
-    settle_fresh_export(store, fresh_job_uuid, outcome)
+    let outcome = run_export_after_admission(store, reader, job_uuid).await;
+    settle_fresh_export(store, Some(job_uuid), outcome)
 }
 
 /// The admitted export body. Every failure returns through `?`; the caller settles
@@ -150,34 +161,25 @@ async fn run_export<R: MigrationSourceReader>(
 async fn run_export_after_admission<R: MigrationSourceReader>(
     store: &SpoolStore,
     reader: &mut R,
-    run: ExportRun<'_>,
+    fresh_job_uuid: Uuid,
 ) -> Result<AcceptedExport, ExportError> {
-    if let ExportRun::Fresh(job_uuid) = run {
-        store.transition_migration_phase(job_uuid, super::spool::MigrationPhase::Exporting)?;
-        ensure_export_not_cancelled(store, job_uuid)?;
-    }
+    store.transition_migration_phase(fresh_job_uuid, super::spool::MigrationPhase::Exporting)?;
+    ensure_export_not_cancelled(store, fresh_job_uuid)?;
 
     // Pass one: a quiescent snapshot fixes the source identity we will require
     // again after export. Its per-resource counts seed the job denominators.
     let pre_identity = collect_quiescent_source_snapshot(reader).await?;
-    if let ExportRun::Fresh(job_uuid) = run {
-        ensure_export_not_cancelled(store, job_uuid)?;
-    }
+    ensure_export_not_cancelled(store, fresh_job_uuid)?;
 
     // Bind the job before any commit. A resume refuses a changed source identity
     // here, before a single new artifact or sidecar entry is written.
-    let job_uuid = match run {
-        ExportRun::Resume(handle) => store.checkpoint(handle, pre_identity.digest())?.job_uuid,
-        ExportRun::Fresh(job_uuid) => {
-            store
-                .create_export(
-                    job_uuid,
-                    pre_identity.digest(),
-                    denominators(pre_identity.snapshot()),
-                )?
-                .job_uuid
-        }
-    };
+    let job_uuid = store
+        .create_export(
+            fresh_job_uuid,
+            pre_identity.digest(),
+            denominators(pre_identity.snapshot()),
+        )?
+        .job_uuid;
     let (public_handle, checkpoint_handle) = store.handles(job_uuid)?;
     ensure_export_not_cancelled(store, job_uuid)?;
 
@@ -194,13 +196,101 @@ async fn run_export_after_admission<R: MigrationSourceReader>(
             replica_settings,
         }),
         Err(error) => {
-            // Fence the export manifest so no apparently complete partial export
-            // survives. This is best-effort: the migration phase is settled by the
-            // caller even if this fencing itself fails.
+            if let Some(source_error) = retryable_source_error(&error) {
+                if !store.source_error_can_interrupt_export(job_uuid)? {
+                    let _ = store.fail_export(job_uuid);
+                    return Err(error);
+                }
+                store.recover()?;
+                store.interrupt_export(job_uuid, pre_identity.digest())?;
+                tracing::info!(
+                    %job_uuid,
+                    error_kind = ?source_error.kind(),
+                    "Algolia migration export interrupted after retryable source error"
+                );
+                return Err(ExportError::Interrupted);
+            }
+            // Terminal failures still fence the export manifest so no apparently
+            // complete partial export survives. This remains best-effort: the
+            // migration phase is settled by the caller even if fencing itself fails.
             let _ = store.fail_export(job_uuid);
             Err(error)
         }
     }
+}
+
+async fn run_claimed_resume_after_admission<R: MigrationSourceReader>(
+    store: &SpoolStore,
+    reader: &mut R,
+    checkpoint: ExportCheckpoint,
+) -> Result<AcceptedExport, ExportError> {
+    let (public_handle, checkpoint_handle) = store.handles(checkpoint.job_uuid)?;
+    ensure_export_not_cancelled(store, checkpoint.job_uuid)?;
+
+    match stream_resume_and_accept(store, reader, &checkpoint).await {
+        Ok((documents, rules, synonyms, replica_settings)) => Ok(AcceptedExport {
+            job_uuid: checkpoint.job_uuid,
+            public_handle,
+            checkpoint_handle,
+            source_index_name: reader.source_name().to_string(),
+            source_identity_digest: checkpoint.source_identity_digest,
+            documents,
+            rules,
+            synonyms,
+            replica_settings,
+        }),
+        Err(error) => {
+            if let Some(source_error) = retryable_source_error(&error) {
+                if !store.source_error_can_interrupt_export(checkpoint.job_uuid)? {
+                    let _ = store.fail_export(checkpoint.job_uuid);
+                    return Err(error);
+                }
+                store.recover()?;
+                store.interrupt_export(checkpoint.job_uuid, &checkpoint.source_identity_digest)?;
+                tracing::info!(
+                    job_uuid = %checkpoint.job_uuid,
+                    error_kind = ?source_error.kind(),
+                    "Algolia migration export interrupted after retryable source error"
+                );
+                return Err(ExportError::Interrupted);
+            }
+            let _ = store.fail_export(checkpoint.job_uuid);
+            Err(error)
+        }
+    }
+}
+
+async fn stream_resume_and_accept<R: MigrationSourceReader>(
+    store: &SpoolStore,
+    reader: &mut R,
+    checkpoint: &ExportCheckpoint,
+) -> Result<(u64, u64, u64, BTreeMap<String, Value>), ExportError> {
+    let job_uuid = checkpoint.job_uuid;
+    reader.wait_for_quiescent_source().await?;
+    ensure_export_not_cancelled(store, job_uuid)?;
+    let mut sink = SpoolExportSink::open(store, job_uuid, reader.source_name())?;
+    let exported = read_source_snapshot(reader, &mut sink)
+        .await
+        .map_err(export_error_from_source)?;
+    ensure_export_not_cancelled(store, job_uuid)?;
+    let primary_settings = sink
+        .committed_settings
+        .take()
+        .ok_or_else(|| ExportError::Source(missing_committed_settings()))?;
+    let documents = exported.documents.count as u64;
+    let rules = exported.rules.count as u64;
+    let synonyms = exported.synonyms.count as u64;
+    store.complete_documents(job_uuid, documents, &exported.documents.hash)?;
+    ensure_export_not_cancelled(store, job_uuid)?;
+    store.complete_rules(job_uuid, rules, &exported.rules.hash)?;
+    ensure_export_not_cancelled(store, job_uuid)?;
+    store.complete_synonyms(job_uuid, synonyms, &exported.synonyms.hash)?;
+    let replica_settings = collect_replica_settings(reader, &primary_settings)
+        .await
+        .map_err(ExportError::Source)?;
+    ensure_export_not_cancelled(store, job_uuid)?;
+    store.accept_export(job_uuid)?;
+    Ok((documents, rules, synonyms, replica_settings))
 }
 
 /// Settle a fresh run's durable migration phase after a failure. A settlement
@@ -219,6 +309,7 @@ fn settle_fresh_export(
     };
     let settlement = match error {
         ExportError::Cancelled => settle_cancelled_fresh_migration(store, job_uuid),
+        ExportError::Interrupted => Ok(()),
         _ => fail_fresh_migration(store, job_uuid),
     };
     match settlement {
@@ -317,6 +408,15 @@ fn export_error_from_source(error: AlgoliaClientError) -> ExportError {
 fn is_export_cancel_error(error: &AlgoliaClientError) -> bool {
     error.kind() == AlgoliaErrorKind::Progress
         && error.safe_message() == EXPORT_CANCEL_REQUESTED_MESSAGE
+}
+
+fn retryable_source_error(error: &ExportError) -> Option<&AlgoliaClientError> {
+    match error {
+        ExportError::Source(source_error) if should_retry(source_error.kind()) => {
+            Some(source_error)
+        }
+        _ => None,
+    }
 }
 
 fn denominators(snapshot: &SourceSnapshot) -> ResourceDenominators {

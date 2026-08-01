@@ -34,7 +34,7 @@ seed_read_documents() {
   (
     cd "$SCRIPT_DIR"
     node -e '
-import("../dashboard/tour/product-seed-data.mjs").then(({ baseProducts }) => {
+import("./product-seed-data.mjs").then(({ baseProducts }) => {
 
 function round(value) {
   return Math.round(value * 10000) / 10000;

@@ -2964,6 +2964,48 @@
         ]
       }
     },
+    "/1/migrations/algolia/preview": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Preview source migration translation without admitting or publishing a job.",
+        "operationId": "preview_algolia_migration",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MigrateFromAlgoliaRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Advisory source migration translation report",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MigrationPreviewResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid migration request or unsupported source provider"
+          },
+          "502": {
+            "description": "Upstream source provider request failed"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
     "/1/migrations/algolia/{job_id}": {
       "get": {
         "tags": [
@@ -3104,6 +3146,66 @@
         ]
       }
     },
+    "/1/migrations/algolia/{job_id}/resume": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Resume an interrupted asynchronous Algolia source migration.",
+        "operationId": "resume_algolia_migration",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Migration job UUID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MigrateFromAlgoliaRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Async source migration resume admitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsyncMigrationStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid migration job UUID, request body, or unsupported source provider"
+          },
+          "404": {
+            "description": "No durable migration phase record is currently retained for the UUID"
+          },
+          "409": {
+            "description": "migration_resume_claim_conflict or migration_resume_not_available"
+          },
+          "500": {
+            "description": "Migration resume claim could not be persisted"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
     "/1/migrations/bulk-replace": {
       "post": {
         "tags": [
@@ -3178,7 +3280,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/MigrateFromAlgoliaRequest"
+                "$ref": "#/components/schemas/MigrateFromMeilisearchRequest"
               }
             }
           },
@@ -3206,6 +3308,48 @@
           },
           "503": {
             "description": "migration_ha_unsupported or migration_capacity_exhausted"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/1/migrations/meilisearch/preview": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Preview source migration translation without admitting or publishing a job.",
+        "operationId": "preview_meilisearch_migration",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MigrateFromMeilisearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Advisory source migration translation report",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MigrationPreviewResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid migration request or unsupported source provider"
+          },
+          "502": {
+            "description": "Upstream source provider request failed"
           }
         },
         "security": [
@@ -3355,6 +3499,66 @@
         ]
       }
     },
+    "/1/migrations/meilisearch/{job_id}/resume": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Resume an interrupted asynchronous Algolia source migration.",
+        "operationId": "resume_meilisearch_migration",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Migration job UUID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MigrateFromMeilisearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Async source migration resume admitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsyncMigrationStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid migration job UUID, request body, or unsupported source provider"
+          },
+          "404": {
+            "description": "No durable migration phase record is currently retained for the UUID"
+          },
+          "409": {
+            "description": "migration_resume_claim_conflict or migration_resume_not_available"
+          },
+          "500": {
+            "description": "Migration resume claim could not be persisted"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
     "/1/migrations/privacy-scrub": {
       "post": {
         "tags": [
@@ -3410,7 +3614,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/MigrateFromAlgoliaRequest"
+                "$ref": "#/components/schemas/MigrateFromTypesenseRequest"
               }
             }
           },
@@ -3438,6 +3642,48 @@
           },
           "503": {
             "description": "migration_ha_unsupported or migration_capacity_exhausted"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/1/migrations/typesense/preview": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Preview source migration translation without admitting or publishing a job.",
+        "operationId": "preview_typesense_migration",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MigrateFromAlgoliaRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Advisory source migration translation report",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MigrationPreviewResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid migration request or unsupported source provider"
+          },
+          "502": {
+            "description": "Upstream source provider request failed"
           }
         },
         "security": [
@@ -3578,6 +3824,66 @@
           },
           "500": {
             "description": "Migration cancel request could not be persisted"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/1/migrations/typesense/{job_id}/resume": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Resume an interrupted asynchronous Algolia source migration.",
+        "operationId": "resume_typesense_migration",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Migration job UUID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MigrateFromTypesenseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Async source migration resume admitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsyncMigrationStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid migration job UUID, request body, or unsupported source provider"
+          },
+          "404": {
+            "description": "No durable migration phase record is currently retained for the UUID"
+          },
+          "409": {
+            "description": "migration_resume_claim_conflict or migration_resume_not_available"
+          },
+          "500": {
+            "description": "Migration resume claim could not be persisted"
           }
         },
         "security": [
@@ -7388,8 +7694,26 @@
               }
             ]
           },
+          "operation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "phase": {
             "$ref": "#/components/schemas/AsyncMigrationPhase"
+          },
+          "resumable": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "resumeHandle": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "rulesImported": {
             "oneOf": [
@@ -9543,6 +9867,68 @@
           }
         }
       },
+      "MigrateFromMeilisearchRequest": {
+        "type": "object",
+        "description": "Request payload for migrating an index from Meilisearch Cloud to Flapjack.",
+        "required": [
+          "endpoint",
+          "apiKey",
+          "sourceIndex"
+        ],
+        "properties": {
+          "apiKey": {
+            "type": "string"
+          },
+          "endpoint": {
+            "type": "string"
+          },
+          "overwrite": {
+            "type": "boolean",
+            "description": "Replace the target index only on node-local migration endpoints. HA\nimports still refuse overwrite requests."
+          },
+          "sourceIndex": {
+            "type": "string"
+          },
+          "targetIndex": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "MigrateFromTypesenseRequest": {
+        "type": "object",
+        "description": "Request payload for migrating a Typesense Cloud collection to Flapjack.",
+        "required": [
+          "node",
+          "apiKey",
+          "sourceIndex"
+        ],
+        "properties": {
+          "apiKey": {
+            "type": "string"
+          },
+          "node": {
+            "type": "string"
+          },
+          "overwrite": {
+            "type": "boolean",
+            "description": "Replace the target index only on node-local migration endpoints. HA\nimports still refuse overwrite requests."
+          },
+          "sourceIndex": {
+            "type": "string"
+          },
+          "targetIndex": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
       "MigrateWarning": {
         "type": "object",
         "required": [
@@ -9577,6 +9963,126 @@
           },
           "resource": {
             "type": "string"
+          }
+        }
+      },
+      "MigrationPreviewReport": {
+        "type": "object",
+        "required": [
+          "entries",
+          "summary"
+        ],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MigrationPreviewReportEntry"
+            }
+          },
+          "reportDigest": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "summary": {
+            "$ref": "#/components/schemas/MigrationPreviewReportSummary"
+          }
+        }
+      },
+      "MigrationPreviewReportEntry": {
+        "type": "object",
+        "required": [
+          "severity",
+          "code",
+          "resource",
+          "jsonPath"
+        ],
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ReportCode"
+          },
+          "itemIndex": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "jsonPath": {
+            "type": "string"
+          },
+          "pageIndex": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "resource": {
+            "$ref": "#/components/schemas/ReportResource"
+          },
+          "severity": {
+            "$ref": "#/components/schemas/ReportSeverity"
+          }
+        }
+      },
+      "MigrationPreviewReportSummary": {
+        "type": "object",
+        "required": [
+          "totalEntries",
+          "hardRejections",
+          "warnings",
+          "scopeGaps"
+        ],
+        "properties": {
+          "hardRejections": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "scopeGaps": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "totalEntries": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "warnings": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "MigrationPreviewResponse": {
+        "type": "object",
+        "required": [
+          "report",
+          "sourceCounts"
+        ],
+        "properties": {
+          "report": {
+            "$ref": "#/components/schemas/MigrationPreviewReport"
+          },
+          "sourceCounts": {
+            "$ref": "#/components/schemas/MigrationPreviewSourceCounts"
+          }
+        }
+      },
+      "MigrationPreviewSourceCounts": {
+        "type": "object",
+        "required": [
+          "indexes",
+          "records"
+        ],
+        "properties": {
+          "indexes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "records": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       },
@@ -10210,6 +10716,57 @@
             "minimum": 0
           }
         }
+      },
+      "ReportCode": {
+        "type": "string",
+        "description": "Stable machine-readable classification for migration translation outcomes.",
+        "enum": [
+          "ProductNotMigrated",
+          "PersistedNoBehaviorSetting",
+          "ReadOnlySourceField",
+          "ReplicaTopologyNotMigrated",
+          "UnsupportedSourceField",
+          "UnsupportedRuleSchema",
+          "UnsupportedSynonymSchema",
+          "InvalidObjectId",
+          "DuplicateObjectId",
+          "MalformedSettingsPayload",
+          "MalformedDocumentPayload",
+          "MalformedRulePayload",
+          "MalformedSynonymPayload",
+          "ReplicaUnknownRankingToken",
+          "ReplicaExhaustiveSortApproximated",
+          "ReplicaPrimaryRelevancyStrictnessDropped",
+          "ReplicaRelevancyStrictnessSemanticMismatch",
+          "ReplicaMatchingCriticalFieldDiverges",
+          "MeilisearchDocumentOrderNotContractual",
+          "MeilisearchSearchPaginationNotExportBound",
+          "MeilisearchSettingNotMigrated",
+          "MeilisearchSettingValueNormalized",
+          "TypesenseSettingNotMigrated"
+        ]
+      },
+      "ReportResource": {
+        "type": "string",
+        "enum": [
+          "Analytics",
+          "ApiKeys",
+          "Document",
+          "Events",
+          "Experiments",
+          "Recommend",
+          "Rule",
+          "Settings",
+          "Synonym"
+        ]
+      },
+      "ReportSeverity": {
+        "type": "string",
+        "enum": [
+          "ScopeGap",
+          "Warning",
+          "HardRejection"
+        ]
       },
       "RestoreKeyResponse": {
         "type": "object",

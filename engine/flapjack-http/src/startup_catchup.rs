@@ -394,10 +394,13 @@ fn stage_snapshot_bytes(
     let repair = manager
         .repair_publication_target(tenant_id)
         .map_err(|error| (snapshot_repair_step(&error), error.to_string()))?;
-    if repair.disposition == PublicationTargetDisposition::Unavailable {
+    if !matches!(
+        repair.disposition,
+        PublicationTargetDisposition::Loadable | PublicationTargetDisposition::Vacant
+    ) {
         return Err((
             SnapshotInstallStep::RecoverInterrupted,
-            format!("publication repair did not prove tenant '{tenant_id}' loadable"),
+            format!("publication repair did not prove tenant '{tenant_id}' safe for staging"),
         ));
     }
 
@@ -840,7 +843,7 @@ async fn apply_and_log_ops(
 mod tests {
     use super::{
         install_snapshot_bytes, parse_strict_bootstrap_override, prepare_snapshot_restore,
-        retention_gap_detected,
+        restore_snapshot_bytes, retention_gap_detected,
     };
     use crate::handlers::AppState;
     use crate::test_helpers::{assert_quiescence_before_publication, quiesced_snapshot_bytes};
@@ -1390,6 +1393,77 @@ mod tests {
         assert!(
             tenant_path.join(new_marker_name).exists(),
             "restored tenant should contain snapshot content"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_bytes_creates_absent_tenant_from_valid_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let manager = Arc::new(flapjack::IndexManager::new(tmp.path()));
+        let tenant_id = "restore_target";
+        let tenant_path = manager.base_path.join(tenant_id);
+        manager.create_tenant(tenant_id).unwrap();
+        manager.delete_tenant(&tenant_id.to_string()).await.unwrap();
+        assert!(
+            !tenant_path.exists(),
+            "fixture tenant must be absent after an explicit delete"
+        );
+        assert_eq!(
+            manager
+                .repair_publication_target(tenant_id)
+                .unwrap()
+                .disposition,
+            flapjack::index::manager::publication::PublicationTargetDisposition::Vacant,
+            "deletion must leave durable evidence that the target is safely vacant"
+        );
+
+        let snapshot_src = TempDir::new().unwrap();
+        let restored_marker_name = "restored.txt";
+        std::fs::write(snapshot_src.path().join(restored_marker_name), "restored").unwrap();
+        let oplog = flapjack::index::oplog::OpLog::open(
+            &snapshot_src.path().join("oplog"),
+            tenant_id,
+            "peer-node",
+        )
+        .unwrap();
+        oplog
+            .append(
+                "upsert",
+                serde_json::json!({"objectID": "doc-1", "body": {"_id": "doc-1", "title": "Restored"}}),
+            )
+            .unwrap();
+        let snapshot_bytes = export_to_bytes(snapshot_src.path()).unwrap();
+
+        restore_snapshot_bytes(&manager, tenant_id, snapshot_bytes.clone())
+            .await
+            .expect("a valid snapshot must recreate an explicitly deleted tenant");
+        assert_eq!(
+            std::fs::read_to_string(tenant_path.join(restored_marker_name)).unwrap(),
+            "restored",
+            "restored tenant must contain the snapshot generation"
+        );
+
+        manager.delete_tenant(&tenant_id.to_string()).await.unwrap();
+        assert!(
+            !tenant_path.exists(),
+            "fixture tenant must be absent after deleting the restored generation"
+        );
+        assert_eq!(
+            manager
+                .repair_publication_target(tenant_id)
+                .unwrap()
+                .disposition,
+            flapjack::index::manager::publication::PublicationTargetDisposition::Vacant,
+            "deletion must retire the restored generation's committed journal"
+        );
+
+        restore_snapshot_bytes(&manager, tenant_id, snapshot_bytes)
+            .await
+            .expect("the same valid snapshot must survive a second delete-restore cycle");
+        assert_eq!(
+            std::fs::read_to_string(tenant_path.join(restored_marker_name)).unwrap(),
+            "restored",
+            "second restore must publish the same snapshot generation"
         );
     }
 

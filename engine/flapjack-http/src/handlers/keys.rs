@@ -12,6 +12,7 @@ use utoipa::ToSchema;
 
 use crate::auth::{epoch_millis_to_rfc3339, ApiKey, KeyStore};
 use crate::error_response::json_error;
+use crate::security_audit::{emit_admin_action, Action, Actor, Outcome, Target};
 
 /// Deserialize an incoming API key creation request with Algolia-compatible camelCase field names.
 ///
@@ -124,6 +125,13 @@ pub async fn create_key(
     notify_key_lifecycle(&description, "created");
 
     let created_at = epoch_millis_to_rfc3339(created.created_at);
+    emit_admin_action(
+        Actor::admin_api_key(),
+        Action::CreateKey,
+        Target::api_key_fingerprint(&plaintext_value),
+        Outcome::Success,
+        None,
+    );
 
     let response = CreateKeyResponse {
         key: plaintext_value,
@@ -205,12 +213,30 @@ pub async fn update_key(
     let updated = body.into_api_key();
 
     match key_store.update_key(&key_value, updated) {
-        Some(_) => Json(UpdateKeyResponse {
-            key: key_value,
-            updated_at: current_timestamp(),
-        })
-        .into_response(),
-        None => json_error(StatusCode::NOT_FOUND, "Key not found"),
+        Some(_) => {
+            emit_admin_action(
+                Actor::admin_api_key(),
+                Action::UpdateKey,
+                Target::api_key_fingerprint(&key_value),
+                Outcome::Success,
+                None,
+            );
+            Json(UpdateKeyResponse {
+                key: key_value,
+                updated_at: current_timestamp(),
+            })
+            .into_response()
+        }
+        None => {
+            emit_admin_action(
+                Actor::admin_api_key(),
+                Action::UpdateKey,
+                Target::api_key_fingerprint(&key_value),
+                Outcome::Failure,
+                Some("key_not_found"),
+            );
+            json_error(StatusCode::NOT_FOUND, "Key not found")
+        }
     }
 }
 
@@ -235,6 +261,13 @@ pub async fn delete_key(
     Path(key_value): Path<String>,
 ) -> impl IntoResponse {
     if key_store.is_admin(&key_value) {
+        emit_admin_action(
+            Actor::admin_api_key(),
+            Action::DeleteKey,
+            Target::api_key_fingerprint(&key_value),
+            Outcome::Failure,
+            Some("cannot_delete_admin_key"),
+        );
         return json_error(StatusCode::FORBIDDEN, "Cannot delete admin key");
     }
 
@@ -245,6 +278,13 @@ pub async fn delete_key(
         .unwrap_or_default();
 
     if key_store.delete_key(&key_value) {
+        emit_admin_action(
+            Actor::admin_api_key(),
+            Action::DeleteKey,
+            Target::api_key_fingerprint(&key_value),
+            Outcome::Success,
+            None,
+        );
         notify_key_lifecycle(&description, "deleted");
 
         Json(DeleteKeyResponse {
@@ -252,6 +292,13 @@ pub async fn delete_key(
         })
         .into_response()
     } else {
+        emit_admin_action(
+            Actor::admin_api_key(),
+            Action::DeleteKey,
+            Target::api_key_fingerprint(&key_value),
+            Outcome::Failure,
+            Some("key_not_found"),
+        );
         json_error(StatusCode::NOT_FOUND, "Key not found")
     }
 }
@@ -277,12 +324,30 @@ pub async fn restore_key(
     Path(key_value): Path<String>,
 ) -> impl IntoResponse {
     match key_store.restore_key(&key_value) {
-        Some(_) => Json(RestoreKeyResponse {
-            key: key_value,
-            created_at: current_timestamp(),
-        })
-        .into_response(),
-        None => json_error(StatusCode::NOT_FOUND, "Key not found"),
+        Some(_) => {
+            emit_admin_action(
+                Actor::admin_api_key(),
+                Action::RestoreKey,
+                Target::api_key_fingerprint(&key_value),
+                Outcome::Success,
+                None,
+            );
+            Json(RestoreKeyResponse {
+                key: key_value,
+                created_at: current_timestamp(),
+            })
+            .into_response()
+        }
+        None => {
+            emit_admin_action(
+                Actor::admin_api_key(),
+                Action::RestoreKey,
+                Target::api_key_fingerprint(&key_value),
+                Outcome::Failure,
+                Some("key_not_found"),
+            );
+            json_error(StatusCode::NOT_FOUND, "Key not found")
+        }
     }
 }
 #[derive(Debug, Deserialize, ToSchema)]
@@ -442,6 +507,13 @@ pub async fn generate_secured_key(
     let params_str = body.restrictions.to_query_params();
     // Use the hmac_key for secured key generation
     let secured_key = crate::auth::generate_secured_api_key(&body.parent_api_key, &params_str);
+    emit_admin_action(
+        Actor::admin_api_key(),
+        Action::GenerateSecuredKey,
+        Target::api_key_fingerprint(&body.parent_api_key),
+        Outcome::Success,
+        None,
+    );
 
     Json(GenerateSecuredKeyResponse {
         secured_api_key: secured_key,

@@ -30,6 +30,72 @@ fn writer_config(dir: &std::path::Path) -> AnalyticsConfig {
     }
 }
 
+/// Write a pre-minimization search fixture whose `user_ip` values remain exact.
+///
+/// This deliberately bypasses `writer::search_events_to_batch` only for the
+/// final Parquet write. It is the sole test path permitted to create legacy
+/// full-IP analytics files: all canonical columns come from the production
+/// schema and `SearchEvent` conversion, then only `user_ip` is replaced.
+pub(super) fn write_legacy_search_parquet(
+    config: &AnalyticsConfig,
+    index: &str,
+    date: &str,
+    user_ips: &[&str],
+) -> std::path::PathBuf {
+    use arrow::array::StringArray;
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+
+    let timestamp_ms = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    let events: Vec<SearchEvent> = user_ips
+        .iter()
+        .enumerate()
+        .map(|(row, user_ip)| SearchEvent {
+            timestamp_ms,
+            query: format!("legacy-{row}"),
+            query_id: None,
+            index_name: index.to_string(),
+            nb_hits: 1,
+            processing_time_ms: 1,
+            user_token: None,
+            user_ip: Some((*user_ip).to_string()),
+            filters: None,
+            facets: None,
+            analytics_tags: None,
+            page: 0,
+            hits_per_page: 20,
+            has_results: true,
+            country: None,
+            region: None,
+            experiment_id: None,
+            variant_id: None,
+            assignment_method: None,
+        })
+        .collect();
+
+    let schema = crate::analytics::schema::search_event_schema();
+    let canonical_batch = writer::search_events_to_batch(&events, &schema).unwrap();
+    let user_ip_index = schema.index_of("user_ip").unwrap();
+    let mut columns = canonical_batch.columns().to_vec();
+    columns[user_ip_index] = Arc::new(StringArray::from(user_ips.to_vec()));
+    let legacy_batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+
+    let partition_dir = config.searches_dir(index).join(format!("date={date}"));
+    std::fs::create_dir_all(&partition_dir).unwrap();
+    let parquet_path = partition_dir.join("searches_legacy_fixture.parquet");
+    let file = std::fs::File::create(&parquet_path).unwrap();
+    let mut parquet_writer = ArrowWriter::try_new(file, schema, None).unwrap();
+    parquet_writer.write(&legacy_batch).unwrap();
+    parquet_writer.close().unwrap();
+    parquet_path
+}
+
 fn cleanup_config(dir: &std::path::Path) -> AnalyticsConfig {
     AnalyticsConfig {
         enabled: true,
@@ -479,6 +545,60 @@ async fn users_count_deduplicates() {
 }
 
 #[tokio::test]
+async fn users_count_reads_legacy_and_minimized_ip_partitions_together() {
+    let tmp = TempDir::new().unwrap();
+    let config = writer_config(tmp.path());
+    let legacy_date = "2025-06-15";
+    let current_date = "2025-06-16";
+    let current_timestamp_ms = chrono::NaiveDate::parse_from_str(current_date, "%Y-%m-%d")
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+
+    write_legacy_search_parquet(
+        &config,
+        "products",
+        legacy_date,
+        &["203.0.113.47", "198.51.100.23"],
+    );
+
+    let engine = AnalyticsQueryEngine::new(config.clone());
+    let legacy_only = engine
+        .users_count("products", legacy_date, legacy_date)
+        .await
+        .unwrap();
+    assert_eq!(legacy_only["count"], 2);
+    assert_eq!(
+        legacy_only["dates"],
+        serde_json::json!([{"date": legacy_date, "count": 2}])
+    );
+
+    let current_events = ["192.0.2.8", "203.0.114.99"].map(|user_ip| {
+        let mut event = make_search_ev("current", "products", 1);
+        event.timestamp_ms = current_timestamp_ms;
+        event.user_token = None;
+        event.user_ip = Some(user_ip.to_string());
+        event
+    });
+    writer::flush_search_events(&current_events, &config.searches_dir("products")).unwrap();
+
+    let combined = engine
+        .users_count("products", legacy_date, current_date)
+        .await
+        .unwrap();
+    assert_eq!(combined["count"], 4);
+    assert_eq!(
+        combined["dates"],
+        serde_json::json!([
+            {"date": legacy_date, "count": 2},
+            {"date": current_date, "count": 2}
+        ])
+    );
+}
+
+#[tokio::test]
 async fn query_empty_index_returns_empty() {
     let tmp = TempDir::new().unwrap();
     let config = writer_config(tmp.path());
@@ -644,6 +764,186 @@ fn writer_roundtrip_with_experiment_fields() {
         .downcast_ref::<arrow::array::StringArray>()
         .unwrap();
     assert_eq!(method_col.value(0), "user_token");
+}
+
+#[test]
+fn analytics_persists_truncated_client_ip_only() {
+    use crate::analytics::schema::search_event_schema;
+    use arrow::array::{Array, StringArray};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
+    use std::path::Path;
+
+    let read_search_fields = |dir: &Path| -> Vec<(String, String, String)> {
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let partition_dir = dir.join(format!("date={}", today));
+        let parquet_file = std::fs::read_dir(&partition_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                e.path()
+                    .extension()
+                    .map(|x| x == "parquet")
+                    .unwrap_or(false)
+            })
+            .unwrap();
+        let file = File::open(parquet_file.path()).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let batches: Vec<_> = reader.collect::<Result<_, _>>().unwrap();
+        assert_eq!(batches.len(), 1);
+
+        let batch = &batches[0];
+        let user_ip_idx = batch.schema().index_of("user_ip").unwrap();
+        let country_idx = batch.schema().index_of("country").unwrap();
+        let region_idx = batch.schema().index_of("region").unwrap();
+        let user_ip_col = batch
+            .column(user_ip_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let country_col = batch
+            .column(country_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let region_col = batch
+            .column(region_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(batch.num_rows(), 2);
+        (0..batch.num_rows())
+            .map(|row| {
+                assert!(!user_ip_col.is_null(row));
+                assert!(!country_col.is_null(row));
+                assert!(!region_col.is_null(row));
+                (
+                    user_ip_col.value(row).to_string(),
+                    country_col.value(row).to_string(),
+                    region_col.value(row).to_string(),
+                )
+            })
+            .collect()
+    };
+
+    let decode_batch_fields =
+        |batch: &arrow::record_batch::RecordBatch| -> Vec<(String, String, String)> {
+            let user_ip_idx = batch.schema().index_of("user_ip").unwrap();
+            let country_idx = batch.schema().index_of("country").unwrap();
+            let region_idx = batch.schema().index_of("region").unwrap();
+            let user_ip_col = batch
+                .column(user_ip_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let country_col = batch
+                .column(country_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let region_col = batch
+                .column(region_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+
+            assert_eq!(batch.num_rows(), 2);
+            (0..batch.num_rows())
+                .map(|row| {
+                    assert!(!user_ip_col.is_null(row));
+                    assert!(!country_col.is_null(row));
+                    assert!(!region_col.is_null(row));
+                    (
+                        user_ip_col.value(row).to_string(),
+                        country_col.value(row).to_string(),
+                        region_col.value(row).to_string(),
+                    )
+                })
+                .collect()
+        };
+
+    let expected = vec![
+        (
+            "203.0.113.0".to_string(),
+            "US".to_string(),
+            "CA".to_string(),
+        ),
+        (
+            "2001:db8:1234::".to_string(),
+            "DE".to_string(),
+            "BE".to_string(),
+        ),
+    ];
+
+    let ipv4_event = SearchEvent {
+        timestamp_ms: 1000,
+        query: "laptop".to_string(),
+        query_id: Some("b".repeat(32)),
+        index_name: "products".to_string(),
+        nb_hits: 42,
+        processing_time_ms: 5,
+        user_token: None,
+        user_ip: Some("203.0.113.47".to_string()),
+        filters: None,
+        facets: None,
+        analytics_tags: None,
+        page: 0,
+        hits_per_page: 20,
+        has_results: true,
+        country: Some("US".to_string()),
+        region: Some("CA".to_string()),
+        experiment_id: None,
+        variant_id: None,
+        assignment_method: None,
+    };
+    let ipv6_event = SearchEvent {
+        timestamp_ms: 2000,
+        query: "router".to_string(),
+        query_id: Some("c".repeat(32)),
+        index_name: "products".to_string(),
+        nb_hits: 7,
+        processing_time_ms: 6,
+        user_token: None,
+        user_ip: Some("2001:db8:1234:5678::1".to_string()),
+        filters: None,
+        facets: None,
+        analytics_tags: None,
+        page: 0,
+        hits_per_page: 20,
+        has_results: true,
+        country: Some("DE".to_string()),
+        region: Some("BE".to_string()),
+        experiment_id: None,
+        variant_id: None,
+        assignment_method: None,
+    };
+    let events = vec![ipv4_event, ipv6_event];
+
+    let writer_tmp = TempDir::new().unwrap();
+    let writer_dir = writer_tmp.path().join("searches");
+    writer::flush_search_events(&events, &writer_dir).unwrap();
+    let direct_writer_values = read_search_fields(&writer_dir);
+
+    let collector_tmp = TempDir::new().unwrap();
+    let collector_config = collector_config(collector_tmp.path(), 100);
+    let collector = AnalyticsCollector::new(collector_config.clone());
+    for event in events.clone() {
+        collector.record_search(event);
+    }
+    collector.flush_searches();
+    let collector_values = read_search_fields(&collector_config.searches_dir("products"));
+
+    let schema = search_event_schema();
+    let batch = writer::search_events_to_batch(&events, &schema).unwrap();
+    let chokepoint_values = decode_batch_fields(&batch);
+
+    assert_eq!(direct_writer_values, expected);
+    assert_eq!(collector_values, expected);
+    assert_eq!(chokepoint_values, expected);
 }
 
 /// Verify that null experiment metadata columns are preserved as Parquet nulls through a write-read roundtrip.

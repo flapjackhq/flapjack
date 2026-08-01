@@ -3,6 +3,7 @@ use crate::dto::SearchRequest;
 use crate::handlers::migration::spool::{
     AsyncMigrationPublicationSemantic, MigrationImportOutcome, MigrationImportWarning,
 };
+use crate::handlers::migration::AsyncMigrationSourceProvider;
 use flapjack::index::manager::publication::{
     PreStagedPublication, PublicationFaultPoint, PublicationPhase, PublicationScanAction,
     PublicationTarget, PublicationTargetDisposition,
@@ -145,6 +146,192 @@ fn assert_terminal_phase(
     assert_eq!(phase.disposition, disposition);
     assert!(phase.terminal_at.is_some());
     phase
+}
+
+#[tokio::test]
+async fn source_import_recovery_marks_running_export_interrupted_before_serve() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let spool = spool_for_state(&state);
+    let job_uuid = uuid::Uuid::new_v4();
+    let source_identity_digest = hex::encode(Sha256::digest(b"restart-source"));
+    spool
+        .create_async_migration_admission_for_provider_owner(
+            job_uuid,
+            TARGET_INDEX,
+            None,
+            AsyncMigrationSourceProvider::Algolia,
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Exporting)
+        .unwrap();
+    let view = spool
+        .create_export(
+            job_uuid,
+            &source_identity_digest,
+            ResourceDenominators {
+                settings: 1,
+                documents: 2,
+                rules: 0,
+                synonyms: 0,
+                config: 0,
+            },
+        )
+        .unwrap();
+    spool
+        .commit_document_page_with_ids(
+            job_uuid,
+            br#"[{"objectID":"restart-doc-1"}]"#,
+            &["restart-doc-1"],
+        )
+        .unwrap();
+
+    let reports = repair_publications(&state);
+    recover_jobs(&state, &reports).await;
+
+    let reopened = spool_for_state(&state);
+    let phase = reopened.read_migration_phase(job_uuid).unwrap();
+    assert_eq!(phase.disposition, MigrationDisposition::Running);
+    assert!(phase.terminal_at.is_none());
+    assert_eq!(
+        reopened
+            .checkpoint(&view.checkpoint_handle, &source_identity_digest)
+            .unwrap()
+            .state,
+        "Interrupted",
+        "pre-publication source-import recovery must preserve the existing frontier as resumable"
+    );
+    assert_eq!(
+        reopened.completed_document_ids(job_uuid).unwrap(),
+        vec!["restart-doc-1".to_string()],
+        "recovery must not recreate or clear completed-ID sidecars"
+    );
+}
+
+#[tokio::test]
+async fn source_import_recovery_preserves_already_interrupted_export() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let spool = spool_for_state(&state);
+    let job_uuid = uuid::Uuid::new_v4();
+    let source_identity_digest = hex::encode(Sha256::digest(b"already-interrupted-source"));
+    spool
+        .create_async_migration_admission_for_provider_owner(
+            job_uuid,
+            TARGET_INDEX,
+            None,
+            AsyncMigrationSourceProvider::Algolia,
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Exporting)
+        .unwrap();
+    let view = spool
+        .create_export(
+            job_uuid,
+            &source_identity_digest,
+            ResourceDenominators {
+                settings: 1,
+                documents: 2,
+                rules: 0,
+                synonyms: 0,
+                config: 0,
+            },
+        )
+        .unwrap();
+    spool
+        .commit_document_page_with_ids(
+            job_uuid,
+            br#"[{"objectID":"interrupted-doc-1"}]"#,
+            &["interrupted-doc-1"],
+        )
+        .unwrap();
+    spool
+        .interrupt_export(job_uuid, &source_identity_digest)
+        .unwrap();
+    let before_manifest = spool.manifest_json(job_uuid).unwrap();
+
+    let reports = repair_publications(&state);
+    recover_jobs(&state, &reports).await;
+
+    let reopened = spool_for_state(&state);
+    assert_eq!(
+        reopened.manifest_json(job_uuid).unwrap(),
+        before_manifest,
+        "already-interrupted source imports must be idempotent across recovery"
+    );
+    assert_eq!(
+        reopened
+            .checkpoint(&view.checkpoint_handle, &source_identity_digest)
+            .unwrap()
+            .state,
+        "Interrupted"
+    );
+}
+
+#[tokio::test]
+async fn meilisearch_source_import_recovery_fails_closed_without_resume_state() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let spool = spool_for_state(&state);
+    let job_uuid = uuid::Uuid::new_v4();
+    let source_identity_digest = hex::encode(Sha256::digest(b"meili-restart-source"));
+    spool
+        .create_async_migration_admission_for_provider_owner(
+            job_uuid,
+            TARGET_INDEX,
+            None,
+            AsyncMigrationSourceProvider::Meilisearch,
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Exporting)
+        .unwrap();
+    let view = spool
+        .create_export(
+            job_uuid,
+            &source_identity_digest,
+            ResourceDenominators {
+                settings: 1,
+                documents: 2,
+                rules: 0,
+                synonyms: 0,
+                config: 0,
+            },
+        )
+        .unwrap();
+    spool
+        .commit_document_page_with_ids(
+            job_uuid,
+            br#"[{"objectID":"meili-doc-1"}]"#,
+            &["meili-doc-1"],
+        )
+        .unwrap();
+
+    let reports = repair_publications(&state);
+    recover_jobs(&state, &reports).await;
+
+    let reopened = spool_for_state(&state);
+    let phase = reopened.read_migration_phase(job_uuid).unwrap();
+    assert_eq!(phase.disposition, MigrationDisposition::Failed);
+    assert!(phase.terminal_at.is_some());
+    assert_eq!(
+        reopened.resumable_export_handle(job_uuid).unwrap(),
+        None,
+        "non-Algolia source imports must not gain a resume handle during restart recovery"
+    );
+    assert_eq!(
+        reopened
+            .checkpoint(&view.checkpoint_handle, &source_identity_digest)
+            .unwrap()
+            .state,
+        "Running",
+        "restart classification must not project Meilisearch source imports as Interrupted"
+    );
 }
 
 #[tokio::test]

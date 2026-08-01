@@ -35,14 +35,14 @@ CASE_NAMES=(
 CASE_TESTS=(
   matrix_denominator_is_explicit_stage3_oracle
   exact_document_and_settings_rows_persist_payload_values
-  transformed_settings_distinct_and_numeric_attributes_to_index_persist
+  transformed_settings_distinct_and_deprecated_aliases_persist
   warned_allow_compression_setting_persists_and_reports_warning
-  hard_rejected_settings_emit_canonical_codes_and_paths
+  rejects_topology_settings_and_scope_gaps_without_payload_fields
   closed_unknown_fields_reject_settings_rules_and_synonyms
   supported_synonym_payloads_resolve_to_schema_rows
   every_rule_schema_matcher_has_an_owner_path_case
   invalid_object_id_report_preserves_resource_coordinates
-  duplicate_object_id_report_is_scoped_per_resource
+  rejects_invalid_and_resource_duplicate_ids_with_page_coordinates
   malformed_payload_reports_cover_settings_document_rule_and_synonym_paths
   typed_failures_are_aggregated_without_duplicate_invalid_id_entries
   scope_gap_entries_have_deterministic_order
@@ -156,10 +156,10 @@ derive_denominator() {
 mutate_case() {
   case "$1" in
     denominator_row_removed)
-      replace_once "$TRANSLATION_RS" '    exact_settings("attributesForFaceting"),' ''
+      replace_once "$TRANSLATION_RS" '    persisted_no_behavior_setting("attributesForFaceting"),' ''
       ;;
     exact_settings_row_rejected)
-      replace_once "$TRANSLATION_RS" '    exact_settings("attributesForFaceting"),' '    rejected_topology_settings("attributesForFaceting"),'
+      replace_once "$TRANSLATION_RS" '    persisted_no_behavior_setting("attributesForFaceting"),' '    exact_settings("attributesForFaceting"),'
       ;;
     transformed_row_weakened)
       replace_once "$TRANSLATION_RS" '    transformed_settings("numericAttributesToIndex"),' '    exact_settings("numericAttributesToIndex"),'
@@ -168,7 +168,7 @@ mutate_case() {
       replace_once "$TRANSLATION_RS" '            warning_code: Some(WarningCode::PersistedNoBehaviorSetting),' '            warning_code: None,'
       ;;
     topology_rejection_weakened)
-      replace_once "$TRANSLATION_RS" '    rejected_topology_settings("replicas"),' '    exact_settings("replicas"),'
+      replace_once "$TRANSLATION_RS" '    transformed_settings("replicas"),' ''
       ;;
     closed_object_fields_loosened)
       replace_once "$TRANSLATION_RS" '                .all(|key| self.allowed.contains(&key.as_str()))' '                .all(|_key| true)'

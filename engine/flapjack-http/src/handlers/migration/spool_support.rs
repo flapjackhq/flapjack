@@ -1,7 +1,8 @@
 use super::*;
+use crate::handlers::migration::AsyncMigrationSourceProvider;
 
 pub(super) fn public_view(manifest: &SpoolManifest) -> PublicExportView {
-    let progress = export_progress(manifest);
+    let progress = artifact_progress(manifest);
     let completed = progress.completed;
     let total = progress.total;
     let ratio = if total == 0 {
@@ -22,10 +23,17 @@ pub(super) fn public_view(manifest: &SpoolManifest) -> PublicExportView {
     }
 }
 
-pub(super) fn export_progress(manifest: &SpoolManifest) -> MigrationExportProgress {
+fn artifact_progress(manifest: &SpoolManifest) -> MigrationExportProgress {
     MigrationExportProgress {
         completed: manifest.counters.total(),
         total: manifest.denominators.total(),
+    }
+}
+
+pub(super) fn export_progress(manifest: &SpoolManifest) -> MigrationExportProgress {
+    MigrationExportProgress {
+        completed: manifest.counters.documents,
+        total: manifest.denominators.documents,
     }
 }
 
@@ -296,7 +304,7 @@ impl SpoolStore {
             LifecycleState::Deleting | LifecycleState::Deleted => {
                 Err(SpoolError::new(SpoolErrorKind::JobDeleting))
             }
-            LifecycleState::Accepted | LifecycleState::Failed => {
+            LifecycleState::Interrupted | LifecycleState::Accepted | LifecycleState::Failed => {
                 Err(SpoolError::new(SpoolErrorKind::JobTerminal))
             }
         }
@@ -429,7 +437,7 @@ impl SpoolStore {
         if let Some(manifest) = self.read_manifest_if_exists(record.job_uuid)? {
             if matches!(
                 manifest.lifecycle,
-                LifecycleState::Running | LifecycleState::Accepted
+                LifecycleState::Running | LifecycleState::Interrupted | LifecycleState::Accepted
             ) {
                 record.export_progress = Some(export_progress(&manifest));
             }
@@ -437,10 +445,13 @@ impl SpoolStore {
         Ok(())
     }
 
-    fn refresh_migration_export_progress(&self, manifest: &SpoolManifest) -> SpoolResult<()> {
+    pub(super) fn refresh_migration_export_progress(
+        &self,
+        manifest: &SpoolManifest,
+    ) -> SpoolResult<()> {
         if !matches!(
             manifest.lifecycle,
-            LifecycleState::Running | LifecycleState::Accepted
+            LifecycleState::Running | LifecycleState::Interrupted | LifecycleState::Accepted
         ) || !self.migration_phase_path(manifest.job_uuid).exists()
         {
             return Ok(());
@@ -487,6 +498,14 @@ impl SpoolStore {
 }
 
 impl AcceptedSpoolReader {
+    pub(crate) fn source_provider(&self) -> SpoolResult<AsyncMigrationSourceProvider> {
+        Ok(self
+            .store
+            .read_async_migration_metadata_if_exists(self.job_uuid)?
+            .map(|metadata| metadata.source_provider)
+            .unwrap_or_default())
+    }
+
     pub(crate) fn settings(&self) -> SpoolResult<serde_json::Value> {
         let value = self
             .store

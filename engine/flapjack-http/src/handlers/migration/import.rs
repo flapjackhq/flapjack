@@ -4,10 +4,13 @@ use super::bulk_build::{
     AfterDocumentBatchWriteHook, BeforeDocumentBatchWriteHook, BulkBuildTestEvent,
     BulkBuildTestHooks,
 };
-use super::export::{export_algolia_source_for_import, AcceptedExport, ExportError};
+use super::export::{
+    export_algolia_source_for_import, resume_claimed_algolia_source, AcceptedExport, ExportError,
+};
 use super::source_reader::MigrationSourceReader;
 use super::spool::{
-    MigrationImportOutcome, MigrationImportWarning, MigrationPhase, SpoolLimits, SpoolStore,
+    ExportCheckpoint, MigrationImportOutcome, MigrationImportWarning, MigrationPhase, SpoolLimits,
+    SpoolStore,
 };
 use super::translation::{
     translate_accepted_spool_payload, translate_accepted_spool_settings, warning_message,
@@ -414,14 +417,85 @@ where
         target_index.as_str(),
         hooks.bulk_build_hooks(),
     );
-    let cancellation = bulk_build.cancellation();
-    let export = settle_import_result(
+    let export_result = export_algolia_source_for_import(spool, job_uuid, reader).await;
+    let export = match export_result {
+        Ok(export) => export,
+        Err(ExportError::Interrupted) => {
+            return Err(export_interrupted_error());
+        }
+        Err(error) => settle_import_result(spool, job_uuid, Err(export_error(error)))?,
+    };
+    import_accepted_export_inner(
+        state_manager,
         spool,
         job_uuid,
-        export_algolia_source_for_import(spool, job_uuid, reader)
-            .await
-            .map_err(export_error),
-    )?;
+        &target_index,
+        publication_mode,
+        export,
+        bulk_build,
+        #[cfg(test)]
+        hooks,
+    )
+    .await
+}
+
+pub(super) async fn import_from_claimed_resume<R>(
+    state_manager: &Arc<IndexManager>,
+    job_uuid: Uuid,
+    target_index: String,
+    publication_mode: MigrationPublicationMode,
+    reader: &mut R,
+    checkpoint: ExportCheckpoint,
+) -> Result<Json<MigrateFromAlgoliaResponse>, MigrateError>
+where
+    R: MigrationSourceReader,
+{
+    let spool = spool_for_manager(state_manager)?;
+    #[cfg(not(test))]
+    let bulk_build = BulkBuildService::new(state_manager, &spool, job_uuid, target_index.as_str());
+    #[cfg(test)]
+    let bulk_build = BulkBuildService::new(
+        state_manager,
+        &spool,
+        job_uuid,
+        target_index.as_str(),
+        ImportTestHooks::default().bulk_build_hooks(),
+    );
+    let export_result = resume_claimed_algolia_source(&spool, reader, checkpoint).await;
+    let export = match export_result {
+        Ok(export) => export,
+        Err(ExportError::Interrupted) => {
+            return Err(export_interrupted_error());
+        }
+        Err(error) => settle_import_result(&spool, job_uuid, Err(export_error(error)))?,
+    };
+    import_accepted_export_inner(
+        state_manager,
+        &spool,
+        job_uuid,
+        &target_index,
+        publication_mode,
+        export,
+        bulk_build,
+        #[cfg(test)]
+        ImportTestHooks::default(),
+    )
+    .await
+}
+
+// Test-only hooks add an eighth parameter under `--all-targets`; production has seven.
+#[allow(clippy::too_many_arguments)]
+async fn import_accepted_export_inner(
+    state_manager: &Arc<IndexManager>,
+    spool: &SpoolStore,
+    job_uuid: Uuid,
+    target_index: &str,
+    publication_mode: MigrationPublicationMode,
+    export: AcceptedExport,
+    bulk_build: BulkBuildService<'_>,
+    #[cfg(test)] hooks: ImportTestHooks,
+) -> Result<Json<MigrateFromAlgoliaResponse>, MigrateError> {
+    let cancellation = bulk_build.cancellation();
     #[cfg(test)]
     hooks.run_after_accepted_export(spool, export.job_uuid);
     settle_import_result(spool, job_uuid, cancellation.check())?;
@@ -438,7 +512,7 @@ where
         spool,
         &publication,
         &export,
-        &target_index,
+        target_index,
         #[cfg(test)]
         hooks.clone(),
     )
@@ -501,16 +575,12 @@ where
     // The primary is committed, so the claims are now the sidecar homes rather
     // than releasable reservations. Disarm before any further fallible step.
     reservation.disarm();
-    settle_import_result(
-        spool,
-        job_uuid,
-        refresh_target(state_manager, &target_index),
-    )?;
+    settle_import_result(spool, job_uuid, refresh_target(state_manager, target_index))?;
     let activated_counts = settle_import_result(spool, job_uuid, bulk_build.activated_counts())?;
 
     let sidecar_warnings = materialize_replica_sidecars(
         state_manager,
-        &target_index,
+        target_index,
         &staged.replica_settings,
         #[cfg(test)]
         &hooks,
@@ -1096,12 +1166,20 @@ fn fail_migration(spool: &SpoolStore, job_uuid: Uuid, error: MigrateError) -> Mi
     }
 }
 
-fn export_error(error: ExportError) -> MigrateError {
+pub(super) fn export_error(error: ExportError) -> MigrateError {
     match error {
         ExportError::Source(error) => algolia_error(error),
         ExportError::Spool(error) => spool_error(error),
         ExportError::Cancelled => migration_cancelled_error(),
+        ExportError::Interrupted => export_interrupted_error(),
     }
+}
+
+fn export_interrupted_error() -> MigrateError {
+    json_error_parts(
+        axum::http::StatusCode::CONFLICT,
+        "Migration export was interrupted and can be resumed",
+    )
 }
 
 fn translation_error(error: TranslationStreamError<SendError<Vec<Document>>>) -> MigrateError {

@@ -1,13 +1,41 @@
 use super::super::*;
+use crate::auth::route_acl::RouteAcl;
 
 // ── required_acl_for_route ──
 
 fn assert_required_acl(method: Method, path: &str, acl: &'static str) {
-    assert_eq!(required_acl_for_route(&method, path), Some(acl));
+    assert_eq!(
+        required_acl_for_route(&method, path),
+        RouteAcl::Required(acl)
+    );
 }
 
 fn assert_public_route(method: Method, path: &str) {
-    assert_eq!(required_acl_for_route(&method, path), None);
+    assert_eq!(required_acl_for_route(&method, path), RouteAcl::Public);
+}
+
+fn assert_unmapped_route(method: Method, path: &str) {
+    assert_eq!(required_acl_for_route(&method, path), RouteAcl::Unmapped);
+}
+
+#[test]
+fn mapped_route_returns_exact_required_acl() {
+    assert_required_acl(Method::GET, "/1/indexes", "listIndexes");
+}
+
+#[test]
+fn unknown_protected_path_is_unmapped() {
+    assert_unmapped_route(Method::GET, "/1/definitely-not-a-real-route");
+}
+
+#[test]
+fn head_indexes_collection_requires_list_indexes_acl() {
+    assert_required_acl(Method::HEAD, "/1/indexes", "listIndexes");
+}
+
+#[test]
+fn unregistered_put_index_method_is_unmapped() {
+    assert_unmapped_route(Method::PUT, "/1/indexes/products");
 }
 
 #[test]
@@ -31,10 +59,7 @@ fn acl_security_sources_requires_admin() {
 
 #[test]
 fn acl_analytics_endpoint() {
-    assert_eq!(
-        required_acl_for_route(&Method::GET, "/2/searches"),
-        Some("analytics")
-    );
+    assert_required_acl(Method::GET, "/2/searches", "analytics");
 }
 
 #[test]
@@ -54,8 +79,11 @@ fn acl_analytics_maintenance_routes_require_admin() {
 fn acl_abtests_reads_require_analytics_and_writes_require_edit_settings() {
     for method_and_path in [
         (Method::GET, "/2/abtests"),
+        (Method::HEAD, "/2/abtests"),
         (Method::GET, "/2/abtests/123"),
+        (Method::HEAD, "/2/abtests/123"),
         (Method::GET, "/2/abtests/123/results"),
+        (Method::HEAD, "/2/abtests/123/results"),
         (Method::POST, "/2/abtests/estimate"),
     ] {
         assert_required_acl(method_and_path.0, method_and_path.1, "analytics");
@@ -75,151 +103,107 @@ fn acl_abtests_reads_require_analytics_and_writes_require_edit_settings() {
 
 #[test]
 fn acl_events_search() {
-    assert_eq!(
-        required_acl_for_route(&Method::POST, "/1/events"),
-        Some("search")
-    );
+    assert_required_acl(Method::POST, "/1/events", "search");
 }
 
 #[test]
 fn acl_usertoken_delete_requires_delete_object() {
-    assert_eq!(
-        required_acl_for_route(&Method::DELETE, "/1/usertokens/user_123"),
-        Some("deleteObject")
-    );
+    assert_required_acl(Method::DELETE, "/1/usertokens/user_123", "deleteObject");
 }
 
 #[test]
 fn acl_list_indexes() {
-    assert_eq!(
-        required_acl_for_route(&Method::GET, "/1/indexes"),
-        Some("listIndexes")
-    );
+    assert_required_acl(Method::GET, "/1/indexes", "listIndexes");
 }
 
 #[test]
 fn acl_get_single_index_route_requires_search() {
-    assert_eq!(
-        required_acl_for_route(&Method::GET, "/1/indexes/products"),
-        Some("search")
-    );
+    assert_required_acl(Method::GET, "/1/indexes/products", "search");
+}
+
+#[test]
+fn acl_head_single_index_route_requires_search() {
+    assert_required_acl(Method::HEAD, "/1/indexes/products", "search");
 }
 
 #[test]
 fn acl_search_query() {
-    assert_eq!(
-        required_acl_for_route(&Method::POST, "/1/indexes/products/query"),
-        Some("search")
-    );
+    assert_required_acl(Method::POST, "/1/indexes/products/query", "search");
 }
 
 #[test]
 fn acl_chat_requires_inference() {
-    assert_eq!(
-        required_acl_for_route(&Method::POST, "/1/indexes/products/chat"),
-        Some("inference")
-    );
+    assert_required_acl(Method::POST, "/1/indexes/products/chat", "inference");
 }
 
 #[test]
 fn acl_browse() {
-    assert_eq!(
-        required_acl_for_route(&Method::POST, "/1/indexes/products/browse"),
-        Some("browse")
-    );
+    assert_required_acl(Method::POST, "/1/indexes/products/browse", "browse");
 }
 
 #[test]
 fn acl_batch_add_object() {
-    assert_eq!(
-        required_acl_for_route(&Method::POST, "/1/indexes/products/batch"),
-        Some("addObject")
-    );
+    assert_required_acl(Method::POST, "/1/indexes/products/batch", "addObject");
 }
 
 #[test]
 fn acl_settings_get() {
-    assert_eq!(
-        required_acl_for_route(&Method::GET, "/1/indexes/products/settings"),
-        Some("settings")
-    );
+    assert_required_acl(Method::GET, "/1/indexes/products/settings", "settings");
 }
 
 #[test]
 fn acl_settings_put() {
-    assert_eq!(
-        required_acl_for_route(&Method::PUT, "/1/indexes/products/settings"),
-        Some("editSettings")
-    );
+    assert_required_acl(Method::PUT, "/1/indexes/products/settings", "editSettings");
 }
 
 #[test]
 fn acl_delete_index() {
-    assert_eq!(
-        required_acl_for_route(&Method::DELETE, "/1/indexes/products"),
-        Some("deleteIndex")
-    );
+    assert_required_acl(Method::DELETE, "/1/indexes/products", "deleteIndex");
 }
 
 #[test]
 fn acl_clear_delete_object() {
-    assert_eq!(
-        required_acl_for_route(&Method::POST, "/1/indexes/products/clear"),
-        Some("deleteObject")
-    );
+    assert_required_acl(Method::POST, "/1/indexes/products/clear", "deleteObject");
 }
 
 #[test]
 fn acl_tasks() {
-    assert_eq!(
-        required_acl_for_route(&Method::GET, "/1/tasks/123"),
-        Some("search")
-    );
+    assert_required_acl(Method::GET, "/1/tasks/123", "search");
 }
 
 #[test]
 fn acl_task_singular_route() {
-    assert_eq!(
-        required_acl_for_route(&Method::GET, "/1/task/123"),
-        Some("search")
-    );
+    assert_required_acl(Method::GET, "/1/task/123", "search");
 }
 
 #[test]
 fn acl_index_task_route_requires_search() {
-    assert_eq!(
-        required_acl_for_route(&Method::GET, "/1/indexes/products/task/123"),
-        Some("search")
-    );
+    assert_required_acl(Method::GET, "/1/indexes/products/task/123", "search");
 }
 
 #[test]
 fn acl_tasks_collection_route_requires_search() {
-    assert_eq!(
-        required_acl_for_route(&Method::GET, "/1/tasks"),
-        Some("search")
-    );
+    assert_required_acl(Method::GET, "/1/tasks", "search");
 }
 
 #[test]
 fn acl_dictionaries_batch_edit_settings() {
-    assert_eq!(
-        required_acl_for_route(&Method::POST, "/1/dictionaries/stopwords/batch"),
-        Some("editSettings")
+    assert_required_acl(
+        Method::POST,
+        "/1/dictionaries/stopwords/batch",
+        "editSettings",
     );
 }
 
 #[test]
 fn acl_dictionaries_search_settings() {
-    assert_eq!(
-        required_acl_for_route(&Method::POST, "/1/dictionaries/stopwords/search"),
-        Some("settings")
-    );
+    assert_required_acl(Method::POST, "/1/dictionaries/stopwords/search", "settings");
 }
 
 #[test]
 fn acl_dictionaries_settings_and_languages() {
     assert_required_acl(Method::GET, "/1/dictionaries/*/settings", "settings");
+    assert_required_acl(Method::HEAD, "/1/dictionaries/*/settings", "settings");
     assert_required_acl(Method::PUT, "/1/dictionaries/*/settings", "editSettings");
     assert_required_acl(Method::GET, "/1/dictionaries/*/languages", "settings");
 }
@@ -228,66 +212,42 @@ fn acl_dictionaries_settings_and_languages() {
 
 #[test]
 fn acl_internal_replicate_requires_admin() {
-    assert_eq!(
-        required_acl_for_route(&Method::POST, "/internal/replicate"),
-        Some("admin")
-    );
+    assert_required_acl(Method::POST, "/internal/replicate", "admin");
 }
 
 #[test]
 fn acl_internal_ops_requires_admin() {
-    assert_eq!(
-        required_acl_for_route(&Method::GET, "/internal/ops"),
-        Some("admin")
-    );
+    assert_required_acl(Method::GET, "/internal/ops", "admin");
 }
 
 #[test]
 fn acl_internal_cluster_remove_peer_requires_admin() {
-    assert_eq!(
-        required_acl_for_route(&Method::DELETE, "/internal/cluster/peers/node-b"),
-        Some("admin")
-    );
+    assert_required_acl(Method::DELETE, "/internal/cluster/peers/node-b", "admin");
 }
 
 #[test]
 fn acl_internal_pause_requires_admin() {
-    assert_eq!(
-        required_acl_for_route(&Method::POST, "/internal/pause/myindex"),
-        Some("admin")
-    );
+    assert_required_acl(Method::POST, "/internal/pause/myindex", "admin");
 }
 
 #[test]
 fn acl_internal_storage_requires_admin() {
-    assert_eq!(
-        required_acl_for_route(&Method::GET, "/internal/storage"),
-        Some("admin")
-    );
+    assert_required_acl(Method::GET, "/internal/storage", "admin");
 }
 
 #[test]
 fn acl_internal_snapshot_capability_requires_admin() {
-    assert_eq!(
-        required_acl_for_route(&Method::GET, "/internal/snapshots/capability"),
-        Some("admin")
-    );
+    assert_required_acl(Method::GET, "/internal/snapshots/capability", "admin");
 }
 
 #[test]
 fn acl_internal_cluster_add_peer_requires_admin() {
-    assert_eq!(
-        required_acl_for_route(&Method::POST, "/internal/cluster/peers"),
-        Some("admin")
-    );
+    assert_required_acl(Method::POST, "/internal/cluster/peers", "admin");
 }
 
 #[test]
 fn acl_metrics_requires_admin() {
-    assert_eq!(
-        required_acl_for_route(&Method::GET, "/metrics"),
-        Some("admin")
-    );
+    assert_required_acl(Method::GET, "/metrics", "admin");
 }
 
 #[test]
@@ -313,12 +273,10 @@ fn acl_async_migration_routes_require_admin_with_segment_safe_prefix() {
         assert_required_acl(Method::GET, &job_path, "admin");
         assert_required_acl(Method::POST, &format!("{job_path}/cancel"), "admin");
         assert_required_acl(Method::POST, &format!("{job_path}/acknowledge"), "admin");
+        assert_required_acl(Method::POST, &format!("{job_path}/resume"), "admin");
     }
-    assert_eq!(
-        required_acl_for_route(&Method::POST, "/1/migrations/bulk-replace"),
-        Some("admin")
-    );
-    assert_public_route(Method::POST, "/1/migrations-evil/algolia");
+    assert_required_acl(Method::POST, "/1/migrations/bulk-replace", "admin");
+    assert_unmapped_route(Method::POST, "/1/migrations-evil/algolia");
 }
 
 #[test]
@@ -328,7 +286,7 @@ fn privacy_scrub_auth_private_command_requires_private_migration_acl() {
         "/1/migrations/privacy-scrub",
         "privateMigration",
     );
-    assert_public_route(Method::POST, "/1/migrations-privacy-scrub");
+    assert_unmapped_route(Method::POST, "/1/migrations-privacy-scrub");
 }
 
 #[test]
@@ -362,7 +320,7 @@ fn public_path_helper_includes_root_acme_route() {
 
 #[test]
 fn readiness_health_route_is_public_while_metrics_remains_admin_only() {
-    assert_public_route(Method::GET, "/health/ready");
+    assert_unmapped_route(Method::GET, "/health/ready");
     assert!(is_public_path("/health/ready", false));
     assert_required_acl(Method::GET, "/metrics", "admin");
     assert!(!is_public_path("/metrics", false));
@@ -454,17 +412,19 @@ fn acl_personalization_profile_requires_personalization() {
 
 #[test]
 fn acl_recommendations_requires_recommendation() {
-    assert_eq!(
-        required_acl_for_route(&Method::POST, "/1/indexes/my_index/recommendations"),
-        Some("recommendation")
+    assert_required_acl(
+        Method::POST,
+        "/1/indexes/my_index/recommendations",
+        "recommendation",
     );
 }
 
 #[test]
 fn acl_partial_update_post_requires_add_object() {
-    assert_eq!(
-        required_acl_for_route(&Method::POST, "/1/indexes/products/abc123/partial"),
-        Some("addObject")
+    assert_required_acl(
+        Method::POST,
+        "/1/indexes/products/abc123/partial",
+        "addObject",
     );
 }
 
@@ -484,10 +444,7 @@ fn acl_snapshot_routes_require_admin() {
 
 #[test]
 fn acl_compact_requires_admin() {
-    assert_eq!(
-        required_acl_for_route(&Method::POST, "/1/indexes/products/compact"),
-        Some("admin")
-    );
+    assert_required_acl(Method::POST, "/1/indexes/products/compact", "admin");
 }
 
 /// Verify that recommend-rules sub-routes map batch to `editSettings`, search to `settings`, GET to `settings`, and DELETE to `editSettings`.
@@ -517,10 +474,7 @@ fn acl_recommend_rules_routes_require_settings_acls() {
 
 #[test]
 fn acl_logs_requires_logs() {
-    assert_eq!(
-        required_acl_for_route(&Method::GET, "/1/logs/my_index"),
-        Some("logs")
-    );
+    assert_required_acl(Method::GET, "/1/logs/my_index", "logs");
 }
 
 #[test]

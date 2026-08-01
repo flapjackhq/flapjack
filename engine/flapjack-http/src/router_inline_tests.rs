@@ -1,60 +1,28 @@
 use super::*;
+#[cfg(feature = "fault-injection")]
+use crate::middleware::REQUEST_ID_HEADER_NAME;
 use crate::startup::CorsMode;
 use crate::test_helpers::{
     body_json, send_empty_request, send_json_request, with_env_var, EnvVarRestoreGuard,
-    TestStateBuilder, ENV_MUTEX,
+    SharedLogBuffer, TestStateBuilder, ENV_MUTEX,
 };
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode};
+#[cfg(feature = "fault-injection")]
+use axum::http::header;
+use axum::http::{header::HeaderMap, Method, Request, StatusCode};
 use axum::routing::post;
 use flapjack::analytics::{AnalyticsCollector, AnalyticsConfig};
 #[cfg(unix)]
 use std::ffi::OsStr;
-use std::io;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(feature = "fault-injection")]
+use std::time::Duration;
 use tempfile::TempDir;
 use tower::ServiceExt;
-use tracing_subscriber::fmt::MakeWriter;
-
-#[derive(Clone, Default)]
-struct SharedLogBuffer {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl SharedLogBuffer {
-    fn contents(&self) -> String {
-        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap()
-    }
-}
-
-struct SharedLogWriter {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl io::Write for SharedLogWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for SharedLogBuffer {
-    type Writer = SharedLogWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        SharedLogWriter {
-            buffer: Arc::clone(&self.buffer),
-        }
-    }
-}
 
 fn build_test_router_for_data_dir(
     tmp: &TempDir,
@@ -113,6 +81,312 @@ async fn body_text(resp: axum::http::Response<axum::body::Body>) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
+#[cfg(feature = "fault-injection")]
+fn fault_http_request(path: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(path)
+        .header("x-algolia-application-id", "resource-bounds-test")
+        .header("x-algolia-api-key", "admin-key")
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[cfg(feature = "fault-injection")]
+async fn fault_request(app: Router, path: &str) -> axum::http::Response<Body> {
+    app.oneshot(fault_http_request(path)).await.unwrap()
+}
+
+#[cfg(feature = "fault-injection")]
+async fn wait_for_fault_sleep_marker(logs: &SharedLogBuffer) {
+    for _ in 0..40 {
+        if logs.contents().contains(FAULT_SLEEP_LOG_MARKER) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("fault sleep log marker was not emitted before health request");
+}
+
+#[cfg(feature = "fault-injection")]
+fn fault_test_router() -> (TempDir, Router, Arc<KeyStore>) {
+    fault_test_router_with_resource_bounds(ResourceBounds {
+        request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
+        max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+    })
+}
+
+#[cfg(feature = "fault-injection")]
+fn fault_test_router_with_resource_bounds(
+    resource_bounds: ResourceBounds,
+) -> (TempDir, Router, Arc<KeyStore>) {
+    let tmp = TempDir::new().unwrap();
+    let key_dir = tmp.path().join("keys");
+    std::fs::create_dir_all(&key_dir).unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(&key_dir, "admin-key"));
+    let state = TestStateBuilder::new(&tmp).with_analytics().build_shared();
+    let analytics_config = AnalyticsConfig {
+        enabled: false,
+        data_dir: tmp.path().join("analytics"),
+        flush_interval_secs: 60,
+        flush_size: 1000,
+        retention_days: 30,
+    };
+    let app = build_router_with_resource_bounds(
+        state,
+        Some(Arc::clone(&key_store)),
+        AnalyticsCollector::new(analytics_config),
+        Arc::new(TrustedProxyMatcher::from_optional_csv(None).unwrap()),
+        tmp.path(),
+        RouterConfig {
+            cors_mode: CorsMode::LoopbackOnly,
+            disable_dashboard: false,
+        },
+        resource_bounds,
+    );
+    (tmp, app, key_store)
+}
+
+#[cfg(feature = "fault-injection")]
+fn assert_json_content_type(response: &axum::http::Response<Body>) {
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.contains("application/json"),
+        "expected JSON content-type, got: {content_type:?}"
+    );
+}
+
+const EXPECTED_SECURITY_HEADERS: &[(&str, &str)] = &[
+    (
+        "content-security-policy",
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+    ),
+    ("x-content-type-options", "nosniff"),
+    ("referrer-policy", "no-referrer"),
+    (
+        "permissions-policy",
+        "camera=(), microphone=(), geolocation=()",
+    ),
+];
+
+const CUSTOM_CONTENT_SECURITY_POLICY: &str =
+    "default-src 'none'; frame-ancestors 'none'; base-uri 'none'";
+
+const EXPECTED_SWAGGER_SCRIPT_TAGS: &[&str] = &[
+    r#"<script src="./swagger-ui-bundle.js" charset="UTF-8">"#,
+    r#"<script src="./swagger-ui-standalone-preset.js" charset="UTF-8">"#,
+    r#"<script src="./swagger-initializer.js" charset="UTF-8">"#,
+];
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers.get(name).map(|value| {
+        value
+            .to_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|_| "<non-utf8>".to_owned())
+    })
+}
+
+fn assert_security_headers(surface: &str, headers: &HeaderMap) {
+    let mut mismatches = Vec::new();
+
+    for (name, expected) in EXPECTED_SECURITY_HEADERS {
+        match header_value(headers, name) {
+            None => mismatches.push(format!("{name} missing; expected={expected:?}")),
+            Some(actual) if actual.is_empty() => {
+                mismatches.push(format!("{name} empty; expected={expected:?}"))
+            }
+            Some(actual) if actual != *expected => mismatches.push(format!(
+                "{name} wrong; expected={expected:?} actual={actual:?}"
+            )),
+            Some(_) => {}
+        }
+    }
+
+    let csp = header_value(headers, "content-security-policy");
+    let x_frame_options = header_value(headers, "x-frame-options");
+    if !csp
+        .as_deref()
+        .is_some_and(|value| value.contains("frame-ancestors 'none'"))
+        && !x_frame_options
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("deny"))
+    {
+        mismatches.push(format!(
+            "frame protection missing; expected=\"content-security-policy with frame-ancestors 'none' or x-frame-options DENY\" actual_csp={:?} actual_x_frame_options={:?}",
+            csp, x_frame_options
+        ));
+    }
+
+    if let Some(actual) = header_value(headers, "strict-transport-security") {
+        mismatches.push(format!(
+            "strict-transport-security present; expected absent until HTTPS listener support exists actual={actual:?}"
+        ));
+    }
+
+    assert!(
+        mismatches.is_empty(),
+        "{surface} security header mismatches:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+fn script_opening_tags(html: &str) -> Vec<String> {
+    let mut tags = Vec::new();
+    let mut remaining = html;
+
+    while let Some(start) = remaining.find("<script") {
+        remaining = &remaining[start..];
+        if let Some(end) = remaining.find('>') {
+            tags.push(remaining[..=end].to_owned());
+            remaining = &remaining[end + 1..];
+        } else {
+            break;
+        }
+    }
+
+    tags
+}
+
+fn script_tag_has_src(tag: &str) -> bool {
+    tag.to_ascii_lowercase().contains(" src=")
+}
+
+async fn get_response(app: Router, path: &str) -> axum::http::Response<Body> {
+    app.oneshot(
+        Request::builder()
+            .method(Method::GET)
+            .uri(path)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+#[allow(clippy::await_holding_lock)]
+async fn assert_surface_security_headers(surface: &str, path: &str) {
+    let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+    let (_tmp, app, _restore) = build_test_router_with_csp_env(None);
+    let response = get_response(app, path).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{surface} must return 200 before security headers are evaluated"
+    );
+
+    assert_security_headers(surface, response.headers());
+}
+
+fn build_test_router_with_csp_env(
+    raw_policy: Option<&str>,
+) -> (TempDir, Router, EnvVarRestoreGuard) {
+    let restore = match raw_policy {
+        Some(policy) => EnvVarRestoreGuard::set("FLAPJACK_CONTENT_SECURITY_POLICY", policy),
+        None => EnvVarRestoreGuard::remove("FLAPJACK_CONTENT_SECURITY_POLICY"),
+    };
+    let tmp = TempDir::new().unwrap();
+    let app = build_test_router(&tmp, None);
+    (tmp, app, restore)
+}
+
+#[allow(clippy::await_holding_lock)]
+async fn assert_csp_from_env(raw_policy: Option<&str>, expected_policy: &str) {
+    let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+    let (_tmp, app, _restore) = build_test_router_with_csp_env(raw_policy);
+    let response = get_response(app, "/health").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header_value(response.headers(), "content-security-policy").as_deref(),
+        Some(expected_policy)
+    );
+    assert_security_headers("GET /health with CSP env", response.headers());
+}
+
+#[tokio::test]
+async fn health_surface_has_expected_security_headers() {
+    assert_surface_security_headers("GET /health", "/health").await;
+}
+
+#[tokio::test]
+async fn dashboard_surface_has_expected_security_headers() {
+    assert_surface_security_headers("GET /dashboard/", "/dashboard/").await;
+}
+
+#[tokio::test]
+async fn swagger_surface_has_expected_security_headers() {
+    assert_surface_security_headers("GET /swagger-ui/", "/swagger-ui/").await;
+}
+
+#[tokio::test]
+async fn unset_csp_env_uses_strict_default_security_header_policy() {
+    assert_csp_from_env(None, EXPECTED_SECURITY_HEADERS[0].1).await;
+}
+
+#[tokio::test]
+async fn empty_csp_env_uses_strict_default_security_header_policy() {
+    assert_csp_from_env(Some(""), EXPECTED_SECURITY_HEADERS[0].1).await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn valid_csp_env_overrides_default_security_header_policy() {
+    let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+    let (_tmp, app, _restore) =
+        build_test_router_with_csp_env(Some(CUSTOM_CONTENT_SECURITY_POLICY));
+    let response = get_response(app, "/health").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header_value(response.headers(), "content-security-policy").as_deref(),
+        Some(CUSTOM_CONTENT_SECURITY_POLICY)
+    );
+    assert!(
+        header_value(response.headers(), "strict-transport-security").is_none(),
+        "HSTS must remain absent until the server has an HTTPS listener"
+    );
+}
+
+#[tokio::test]
+async fn invalid_csp_env_fails_closed_to_strict_default_security_header_policy() {
+    assert_csp_from_env(
+        Some("default-src 'self'\nscript-src 'none'"),
+        EXPECTED_SECURITY_HEADERS[0].1,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn swagger_ui_script_shape_is_recorded_for_csp_policy() {
+    let tmp = TempDir::new().unwrap();
+    let app = build_test_router(&tmp, None);
+    let response = get_response(app, "/swagger-ui/").await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = body_text(response).await;
+    println!("SWAGGER_UI_HTML_START\n{body}\nSWAGGER_UI_HTML_END");
+
+    let script_tags = script_opening_tags(&body);
+    for tag in &script_tags {
+        println!("SWAGGER_SCRIPT_TAG={tag}");
+    }
+
+    let inline_script_present = script_tags.iter().any(|tag| !script_tag_has_src(tag));
+    println!("SWAGGER_INLINE_SCRIPT_PRESENT={inline_script_present}");
+
+    assert_eq!(
+        script_tags, EXPECTED_SWAGGER_SCRIPT_TAGS,
+        "Swagger script opening tags changed"
+    );
+    assert!(
+        !inline_script_present,
+        "Swagger UI should continue to serve same-origin external scripts so the strict script-src 'self' contract remains sufficient"
+    );
+}
+
 #[test]
 fn max_body_mb_from_value_defaults_to_100_when_unset() {
     assert_eq!(max_body_mb_from_value(None), 100);
@@ -129,6 +403,166 @@ fn max_body_mb_from_value_defaults_to_100_for_invalid_values() {
     assert_eq!(max_body_mb_from_value(Some("abc")), 100);
     assert_eq!(max_body_mb_from_value(Some("")), 100);
     assert_eq!(max_body_mb_from_value(Some("-1")), 100);
+}
+
+#[test]
+fn request_timeout_secs_from_value_uses_default_when_unset_or_invalid() {
+    assert_eq!(
+        request_timeout_secs_from_value(None),
+        DEFAULT_REQUEST_TIMEOUT_SECS
+    );
+    assert_eq!(
+        request_timeout_secs_from_value(Some("")),
+        DEFAULT_REQUEST_TIMEOUT_SECS
+    );
+    assert_eq!(
+        request_timeout_secs_from_value(Some("abc")),
+        DEFAULT_REQUEST_TIMEOUT_SECS
+    );
+    assert_eq!(
+        request_timeout_secs_from_value(Some("0")),
+        DEFAULT_REQUEST_TIMEOUT_SECS
+    );
+}
+
+#[test]
+fn request_timeout_secs_from_value_parses_positive_integer() {
+    assert_eq!(request_timeout_secs_from_value(Some("7")), 7);
+}
+
+#[test]
+fn max_concurrent_requests_from_value_uses_default_when_unset_or_invalid() {
+    assert_eq!(
+        max_concurrent_requests_from_value(None),
+        DEFAULT_MAX_CONCURRENT_REQUESTS
+    );
+    assert_eq!(
+        max_concurrent_requests_from_value(Some("")),
+        DEFAULT_MAX_CONCURRENT_REQUESTS
+    );
+    assert_eq!(
+        max_concurrent_requests_from_value(Some("abc")),
+        DEFAULT_MAX_CONCURRENT_REQUESTS
+    );
+    assert_eq!(
+        max_concurrent_requests_from_value(Some("0")),
+        DEFAULT_MAX_CONCURRENT_REQUESTS
+    );
+}
+
+#[test]
+fn max_concurrent_requests_from_value_parses_positive_integer() {
+    assert_eq!(max_concurrent_requests_from_value(Some("17")), 17);
+}
+
+#[cfg(feature = "fault-injection")]
+#[serial_test::serial(resource_bounds_env)]
+#[tokio::test]
+async fn fault_sleep_times_out_with_canonical_json_error() {
+    let (_tmp, app, _key_store) = fault_test_router_with_resource_bounds(ResourceBounds {
+        request_timeout: Duration::from_secs(1),
+        max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+    });
+
+    let response = fault_request(app, "/internal/fault/sleep").await;
+
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert_json_content_type(&response);
+    assert_eq!(
+        body_text(response).await,
+        r#"{"message":"Request timed out","status":408}"#
+    );
+}
+
+#[cfg(feature = "fault-injection")]
+#[serial_test::serial(resource_bounds_env)]
+#[tokio::test]
+async fn fault_panic_returns_canonical_json_error_with_request_id() {
+    let (_tmp, app, _key_store) = fault_test_router();
+
+    let response = fault_request(app, "/internal/fault/panic").await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        response.headers().get(REQUEST_ID_HEADER_NAME).is_some(),
+        "panic response should include x-request-id"
+    );
+    assert_json_content_type(&response);
+    assert_eq!(
+        body_text(response).await,
+        r#"{"message":"Internal server error","status":500}"#
+    );
+}
+
+#[cfg(feature = "fault-injection")]
+#[serial_test::serial(resource_bounds_env)]
+#[tokio::test]
+async fn global_concurrency_limit_queues_health_while_fault_sleep_owns_slot() {
+    let (_tmp, app, _key_store) = fault_test_router_with_resource_bounds(ResourceBounds {
+        request_timeout: Duration::from_secs(5),
+        max_concurrent_requests: 1,
+    });
+    let logs = SharedLogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .without_time()
+        .with_writer(logs.clone())
+        .finish();
+    let _log_guard = tracing::subscriber::set_default(subscriber);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    let client = reqwest::Client::new();
+
+    let sleep_client = client.clone();
+    let sleep_url = format!("{base_url}/internal/fault/sleep");
+    let mut sleep_task = tokio::spawn(async move {
+        sleep_client
+            .get(sleep_url)
+            .header("x-algolia-application-id", "resource-bounds-test")
+            .header("x-algolia-api-key", "admin-key")
+            .send()
+            .await
+            .unwrap()
+    });
+    wait_for_fault_sleep_marker(&logs).await;
+
+    let health_url = format!("{base_url}/health");
+    let mut health_task = tokio::spawn(async move { client.get(health_url).send().await.unwrap() });
+    tokio::select! {
+        _ = &mut health_task => panic!("health completed while the sleep request held the only global slot"),
+        _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+    }
+
+    let sleep_response = tokio::select! {
+        health_response = &mut health_task => {
+            let response = health_response.unwrap();
+            panic!(
+                "health completed before sleep released the only global slot with status {}",
+                response.status()
+            );
+        }
+        sleep_response = &mut sleep_task => sleep_response.unwrap(),
+    };
+    assert_eq!(sleep_response.status(), reqwest::StatusCode::OK);
+
+    let health_response = health_task.await.unwrap();
+    assert_eq!(health_response.status(), reqwest::StatusCode::OK);
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]

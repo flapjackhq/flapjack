@@ -264,10 +264,12 @@ impl super::IndexManager {
             return Err(FlapjackError::TenantNotFound(tenant_id.to_string()));
         }
 
-        // Quiesce is the canonical guarantee that no persistent writer or merge
-        // thread is still writing into the tree before we remove it. A failed
-        // drain must abort deletion because no safe removal guarantee exists.
-        let _quiesce = self.quiesce_tenant(tenant_id).await?;
+        // Advance the durable epoch while quiescing so repair can distinguish an
+        // intentional deletion from ambiguous lock-only residue. A failed drain
+        // must abort deletion because no safe removal guarantee exists.
+        let target = PublicationTarget::new(tenant_id.as_str())?;
+        let _quiesce = self.quiesce_replacement_tenant(tenant_id, &target).await?;
+        self.clear_tenant_runtime_state(tenant_id);
         self.admission_stores.remove(tenant_id);
 
         #[cfg(debug_assertions)]
@@ -276,8 +278,8 @@ impl super::IndexManager {
             "manager_delete_publication",
         );
 
-        // `quiesce_tenant` above is now the guarantee that the persistent writer
-        // and its merge threads have already finished. This retry loop remains
+        // The replacement quiesce above guarantees that the persistent writer
+        // and its merge threads have finished. This retry loop remains
         // only as defense in depth against transient filesystem errors (a slow
         // antivirus scan, a lingering external handle) and no longer relies on
         // merge threads still draining after the writer was dropped.
@@ -302,6 +304,7 @@ impl super::IndexManager {
         if let Some(e) = last_err {
             return Err(e.into());
         }
+        publication::retire_committed_publication_journals(&self.base_path, &target)?;
         crate::index::write_queue::backpressure::remove_tenant_state(&self.base_path, tenant_id);
         Ok(())
     }
@@ -1393,5 +1396,36 @@ fn pre_staged_activation_error(error: PreStagedActivationError) -> FlapjackError
             "pre-staged replacement activation failed at {:?}",
             error.stage()
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn delete_tenant_succeeds_while_preserving_corrupt_publication_evidence() {
+        let temp = TempDir::new().unwrap();
+        let manager = super::IndexManager::new(temp.path());
+        let tenant_id = "products".to_string();
+        manager.create_tenant(&tenant_id).unwrap();
+
+        let target = PublicationTarget::new(tenant_id.as_str()).unwrap();
+        let transaction = PublicationTransactionId::new("txn_corrupt").unwrap();
+        let paths = PublicationPaths::new(temp.path(), &target, &transaction);
+        std::fs::create_dir_all(paths.journal.parent().unwrap()).unwrap();
+        std::fs::write(&paths.journal, b"not-json").unwrap();
+
+        manager.delete_tenant(&tenant_id).await.unwrap();
+
+        assert!(
+            !temp.path().join(&tenant_id).exists(),
+            "tenant deletion must still remove the live tenant tree"
+        );
+        assert!(
+            paths.journal.exists(),
+            "corrupt publication evidence must remain available for later repair"
+        );
     }
 }

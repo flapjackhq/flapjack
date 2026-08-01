@@ -1,4 +1,5 @@
 use super::*;
+use crate::handlers::migration::AsyncMigrationSourceProvider;
 
 impl SpoolStore {
     pub(crate) fn seal_bulk_replace_export(
@@ -118,6 +119,139 @@ impl SpoolStore {
         Err(SpoolError::new(SpoolErrorKind::CheckpointHandleNotFound))
     }
 
+    pub(crate) fn interrupt_export(
+        &self,
+        job_uuid: Uuid,
+        expected_source_identity_digest: &str,
+    ) -> SpoolResult<()> {
+        validate_source_identity_digest(expected_source_identity_digest)?;
+        let _root_lock = self.lock_root()?;
+        let _job_lock = self.lock_job(job_uuid)?;
+        let mut manifest = self.read_manifest(job_uuid)?;
+        if manifest.source_identity_digest != expected_source_identity_digest {
+            return Err(SpoolError::new(SpoolErrorKind::SourceIdentityMismatch));
+        }
+        if manifest.lifecycle == LifecycleState::Interrupted {
+            return Ok(());
+        }
+        self.ensure_writable(&manifest)?;
+        self.ensure_export_can_be_interrupted(job_uuid)?;
+        manifest.lifecycle = LifecycleState::Interrupted;
+        self.commit_manifest(&manifest)?;
+        self.refresh_migration_export_progress(&manifest)
+    }
+
+    pub(crate) fn claim_interrupted_export(
+        &self,
+        checkpoint_handle: &str,
+        expected_source_identity_digest: &str,
+    ) -> SpoolResult<ExportCheckpoint> {
+        validate_source_identity_digest(expected_source_identity_digest)?;
+        self.claim_interrupted_export_inner(checkpoint_handle, |manifest| {
+            if manifest.source_identity_digest == expected_source_identity_digest {
+                Ok(())
+            } else {
+                Err(SpoolError::new(SpoolErrorKind::SourceIdentityMismatch))
+            }
+        })
+    }
+
+    fn claim_interrupted_export_inner(
+        &self,
+        checkpoint_handle: &str,
+        validate_identity: impl Fn(&SpoolManifest) -> SpoolResult<()>,
+    ) -> SpoolResult<ExportCheckpoint> {
+        let _root_lock = self.lock_root()?;
+        for job_uuid in self.job_uuids()? {
+            let _job_lock = self.lock_job(job_uuid)?;
+            let Some(mut manifest) = self.read_manifest_if_exists(job_uuid)? else {
+                continue;
+            };
+            if manifest.checkpoint_handle != checkpoint_handle {
+                continue;
+            }
+            validate_identity(&manifest)?;
+            if manifest.lifecycle != LifecycleState::Interrupted {
+                return Err(SpoolError::new(SpoolErrorKind::JobNotInterrupted));
+            }
+            self.ensure_export_can_be_interrupted(job_uuid)?;
+            // ADR 0012 Fence A: a resume claim is exactly one durable manifest flip.
+            manifest.lifecycle = LifecycleState::Running;
+            self.commit_manifest(&manifest)?;
+            self.refresh_migration_export_progress(&manifest)?;
+            return Ok(checkpoint_view(&manifest));
+        }
+        Err(SpoolError::new(SpoolErrorKind::CheckpointHandleNotFound))
+    }
+
+    pub(crate) fn recover_export_interruption(&self, job_uuid: Uuid) -> SpoolResult<bool> {
+        let _root_lock = self.lock_root()?;
+        let _job_lock = self.lock_job(job_uuid)?;
+        let Some(mut manifest) = self.read_manifest_if_exists(job_uuid)? else {
+            return Ok(false);
+        };
+        if manifest.lifecycle == LifecycleState::Interrupted {
+            return Ok(true);
+        }
+        if manifest.lifecycle != LifecycleState::Running {
+            return Ok(false);
+        }
+        self.ensure_export_can_be_interrupted(job_uuid)?;
+        manifest.lifecycle = LifecycleState::Interrupted;
+        self.commit_manifest(&manifest)?;
+        self.refresh_migration_export_progress(&manifest)?;
+        Ok(true)
+    }
+
+    pub(crate) fn resumable_export_handle(&self, job_uuid: Uuid) -> SpoolResult<Option<String>> {
+        let _root_lock = self.lock_root()?;
+        if !self.job_dir(job_uuid).exists() {
+            return Ok(None);
+        }
+        let _job_lock = self.lock_job(job_uuid)?;
+        let Some(manifest) = self.read_manifest_if_exists(job_uuid)? else {
+            return Ok(None);
+        };
+        if manifest.lifecycle != LifecycleState::Interrupted {
+            return Ok(None);
+        }
+        let record = self.read_migration_phase(job_uuid)?;
+        if record.phase != MigrationPhase::Exporting
+            || record.disposition != MigrationDisposition::Running
+            || record.terminal_at.is_some()
+            || record.cancel_requested
+        {
+            return Ok(None);
+        }
+        let Some(metadata) = self.read_async_migration_metadata_if_exists(job_uuid)? else {
+            return Ok(None);
+        };
+        if !algolia_source_import_can_interrupt(&metadata) {
+            return Ok(None);
+        }
+        Ok(Some(manifest.checkpoint_handle))
+    }
+
+    pub(crate) fn export_lifecycle_is_running(&self, job_uuid: Uuid) -> SpoolResult<bool> {
+        let _root_lock = self.lock_root()?;
+        if !self.job_dir(job_uuid).exists() {
+            return Ok(false);
+        }
+        let _job_lock = self.lock_job(job_uuid)?;
+        let Some(manifest) = self.read_manifest_if_exists(job_uuid)? else {
+            return Ok(false);
+        };
+        Ok(manifest.lifecycle == LifecycleState::Running)
+    }
+
+    pub(crate) fn source_error_can_interrupt_export(&self, job_uuid: Uuid) -> SpoolResult<bool> {
+        match self.ensure_export_can_be_interrupted(job_uuid) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == SpoolErrorKind::JobTerminal => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn accept_export(&self, job_uuid: Uuid) -> SpoolResult<()> {
         let _root_lock = self.lock_root()?;
         let _job_lock = self.lock_job(job_uuid)?;
@@ -177,6 +311,32 @@ impl SpoolStore {
     }
 }
 
+impl SpoolStore {
+    fn ensure_export_can_be_interrupted(&self, job_uuid: Uuid) -> SpoolResult<()> {
+        let record = self.read_migration_phase(job_uuid)?;
+        if record.phase != MigrationPhase::Exporting
+            || record.disposition != MigrationDisposition::Running
+            || record.terminal_at.is_some()
+            || record.cancel_requested
+        {
+            return Err(SpoolError::new(SpoolErrorKind::JobTerminal));
+        }
+        let Some(metadata) = self.read_async_migration_metadata_if_exists(job_uuid)? else {
+            return Err(SpoolError::new(SpoolErrorKind::JobTerminal));
+        };
+        if !algolia_source_import_can_interrupt(&metadata) {
+            return Err(SpoolError::new(SpoolErrorKind::JobTerminal));
+        }
+        Ok(())
+    }
+}
+
+fn algolia_source_import_can_interrupt(metadata: &AsyncMigrationMetadata) -> bool {
+    metadata.source_provider == AsyncMigrationSourceProvider::Algolia
+        && metadata.operation_kind == AsyncMigrationOperationKind::SourceImport
+        && metadata.publication_transaction_id.is_none()
+}
+
 fn completion_matches(
     actual: &ResourceCompletion,
     expected: &ResourceCompletion,
@@ -219,6 +379,7 @@ fn checkpoint_view(manifest: &SpoolManifest) -> ExportCheckpoint {
     let public = public_view(manifest);
     ExportCheckpoint {
         job_uuid: manifest.job_uuid,
+        source_identity_digest: manifest.source_identity_digest.clone(),
         state: public.state,
         progress: public.progress,
         resources: manifest.resource_completions.clone(),

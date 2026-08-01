@@ -70,6 +70,7 @@ impl PublicationRepairStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicationTargetDisposition {
     Loadable,
+    Vacant,
     Unavailable,
 }
 
@@ -171,6 +172,11 @@ pub fn scan_and_repair_publication_target(
                     && live_target_tree_is_proven(base, &target)?
                 {
                     return Ok(clean_target_report(target, transactions));
+                }
+                if clean_target_paths_are_proven(base, &target)?
+                    && observed_epoch.durable_epoch().is_some()
+                {
+                    return Ok(vacant_target_report(target, transactions));
                 }
                 return Ok(unresolved_target_report(
                     target.clone(),
@@ -290,6 +296,23 @@ fn clean_target_report(
         phase: None,
         evidence: None,
         disposition: PublicationTargetDisposition::Loadable,
+        live_target_mutated: false,
+    }
+}
+
+fn vacant_target_report(
+    target: PublicationTarget,
+    transactions: Vec<PublicationTransactionId>,
+) -> PublicationRepairReport {
+    PublicationRepairReport {
+        target,
+        transactions,
+        status: PublicationRepairStatus::Clean,
+        action: PublicationScanAction::Clean,
+        transaction_id: None,
+        phase: None,
+        evidence: None,
+        disposition: PublicationTargetDisposition::Vacant,
         live_target_mutated: false,
     }
 }

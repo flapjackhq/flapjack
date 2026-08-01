@@ -69,3 +69,66 @@ wait_for_peer_mesh_ready() {
 
   return 1
 }
+
+compose_container_id() {
+  local service="$1"
+  local container_id
+  container_id="$(compose ps -q "$service")"
+  if [ -z "$container_id" ]; then
+    echo "could not resolve container for service $service" >&2
+    return 1
+  fi
+  printf '%s\n' "$container_id"
+}
+
+compose_project_name() {
+  local service="${1:-node-a}"
+  local container_id
+  container_id="$(compose_container_id "$service")" || return 1
+  docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$container_id"
+}
+
+compose_project_network_id() {
+  local service="${1:-node-a}"
+  local network="${2:-fj-net}"
+  local container_id project network_ids
+  container_id="$(compose_container_id "$service")" || return 1
+  project="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$container_id")"
+  if [ -z "$project" ]; then
+    echo "container $container_id has no compose project label" >&2
+    return 1
+  fi
+  network_ids="$(docker network ls -q \
+    --filter "label=com.docker.compose.project=$project" \
+    --filter "label=com.docker.compose.network=$network")"
+  if [ "$(printf '%s\n' "$network_ids" | sed '/^$/d' | wc -l | tr -d ' ')" != "1" ]; then
+    echo "expected one compose network for project $project/$network, got: $network_ids" >&2
+    return 1
+  fi
+  printf '%s\n' "$network_ids"
+}
+
+compose_service_on_project_network() {
+  local service="$1"
+  local network_id="$2"
+  local container_id
+  container_id="$(compose_container_id "$service")" || return 1
+  docker network inspect -f '{{ range $id, $_ := .Containers }}{{ println $id }}{{ end }}' "$network_id" \
+    | grep -Fx "$container_id" >/dev/null
+}
+
+disconnect_service_from_project_network() {
+  local service="$1"
+  local network_id="$2"
+  local container_id
+  container_id="$(compose_container_id "$service")" || return 1
+  docker network disconnect "$network_id" "$container_id"
+}
+
+reconnect_service_to_project_network() {
+  local service="$1"
+  local network_id="$2"
+  local container_id
+  container_id="$(compose_container_id "$service")" || return 1
+  docker network connect --alias "$service" "$network_id" "$container_id"
+}

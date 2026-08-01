@@ -3,15 +3,21 @@
 use super::algolia_client::{
     AlgoliaClient, AlgoliaClientError, AlgoliaErrorKind, AlgoliaIndexRecord, BrowseError,
 };
+use super::meilisearch_client::MeilisearchClient;
+use super::meilisearch_client::{MeilisearchClientError, MeilisearchErrorKind};
 #[cfg(not(test))]
 use super::source_identity_partitions::SourceIdentityConfig;
 use super::source_identity_partitions::SourceIdentityVersion;
 use super::source_snapshot::{canonical_json_bytes, SourceSnapshot, SourceSnapshotBuilder};
 #[cfg(test)]
 use super::source_test_support::identity_config_for_test;
+use super::translation::{translate_settings_for_provider, SettingsSourceProvider};
+use super::typesense_client::{
+    TypesenseClient, TypesenseClientError, TypesenseErrorKind, TypesenseSourceObservation,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -24,6 +30,46 @@ pub(super) type SourceFuture<'a, T> =
 
 pub(super) type PageConsumer<'a> =
     dyn FnMut(Vec<Value>) -> Result<(), AlgoliaClientError> + Send + 'a;
+
+pub(super) type MeilisearchSourceFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, MeilisearchClientError>> + Send + 'a>>;
+
+pub(super) type MeilisearchPageConsumer<'a> =
+    dyn FnMut(Vec<Value>) -> Result<(), MeilisearchClientError> + Send + 'a;
+
+pub(super) use super::meilisearch_client::MeilisearchSourceObservation;
+
+pub(super) type TypesenseSourceFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, TypesenseClientError>> + Send + 'a>>;
+
+pub(super) type TypesensePageConsumer<'a> =
+    dyn FnMut(Vec<Value>) -> Result<(), TypesenseClientError> + Send + 'a;
+
+/// Raw Meilisearch export operations consumed by the provider adapter.
+///
+/// The protocol client owns HTTP and vendor schemas; this contract leaves
+/// document identity normalization and shared snapshot integration to the
+/// source reader.
+pub(super) trait MeilisearchExportSource {
+    fn observe_source(&mut self) -> MeilisearchSourceFuture<'_, MeilisearchSourceObservation>;
+    fn read_settings(&mut self) -> MeilisearchSourceFuture<'_, Value>;
+    fn require_read_access(&mut self) -> MeilisearchSourceFuture<'_, ()>;
+    fn read_document_pages<'a>(
+        &'a mut self,
+        consume_page: &'a mut MeilisearchPageConsumer<'a>,
+    ) -> MeilisearchSourceFuture<'a, MeilisearchSourceObservation>;
+}
+
+/// Raw Typesense export operations consumed by the provider adapter.
+pub(super) trait TypesenseExportSource {
+    fn observe_source(&mut self) -> TypesenseSourceFuture<'_, TypesenseSourceObservation>;
+    fn read_settings(&mut self) -> TypesenseSourceFuture<'_, Value>;
+    fn require_read_access(&mut self) -> TypesenseSourceFuture<'_, ()>;
+    fn read_document_pages<'a>(
+        &'a mut self,
+        consume_page: &'a mut TypesensePageConsumer<'a>,
+    ) -> TypesenseSourceFuture<'a, TypesenseSourceObservation>;
+}
 
 pub(super) trait MigrationSourceReader {
     fn app_id(&self) -> &str;
@@ -45,6 +91,56 @@ pub(super) trait MigrationSourceReader {
         &'a mut self,
         consume_page: &'a mut PageConsumer<'a>,
     ) -> SourceFuture<'a, ()>;
+}
+
+impl<R> MigrationSourceReader for Box<R>
+where
+    R: MigrationSourceReader + ?Sized,
+{
+    fn app_id(&self) -> &str {
+        (**self).app_id()
+    }
+
+    fn source_name(&self) -> &str {
+        (**self).source_name()
+    }
+
+    fn wait_for_quiescent_source(&mut self) -> SourceFuture<'_, AlgoliaIndexRecord> {
+        (**self).wait_for_quiescent_source()
+    }
+
+    fn read_settings(&mut self) -> SourceFuture<'_, Value> {
+        (**self).read_settings()
+    }
+
+    fn read_index_settings<'a>(&'a mut self, index_name: &'a str) -> SourceFuture<'a, Value> {
+        (**self).read_index_settings(index_name)
+    }
+
+    fn require_unretrievable_access<'a>(&'a mut self, settings: &'a Value) -> SourceFuture<'a, ()> {
+        (**self).require_unretrievable_access(settings)
+    }
+
+    fn read_documents<'a>(
+        &'a mut self,
+        consume_page: &'a mut PageConsumer<'a>,
+    ) -> SourceFuture<'a, ()> {
+        (**self).read_documents(consume_page)
+    }
+
+    fn read_rules<'a>(
+        &'a mut self,
+        consume_page: &'a mut PageConsumer<'a>,
+    ) -> SourceFuture<'a, ()> {
+        (**self).read_rules(consume_page)
+    }
+
+    fn read_synonyms<'a>(
+        &'a mut self,
+        consume_page: &'a mut PageConsumer<'a>,
+    ) -> SourceFuture<'a, ()> {
+        (**self).read_synonyms(consume_page)
+    }
 }
 
 pub(super) trait SourceExportSink {
@@ -135,6 +231,365 @@ impl AlgoliaSourceReader {
             source_name: source_name.to_string(),
             client,
         })
+    }
+}
+
+pub(super) struct MeilisearchSourceReader<S> {
+    source_name: String,
+    source: S,
+    observation: Option<MeilisearchSourceObservation>,
+    settings: Option<Value>,
+}
+
+pub(super) struct TypesenseSourceReader<S> {
+    source_name: String,
+    source: S,
+    observation: Option<TypesenseSourceObservation>,
+}
+
+impl<S> MeilisearchSourceReader<S>
+where
+    S: MeilisearchExportSource,
+{
+    pub(super) fn from_source(source_name: &str, source: S) -> Self {
+        Self {
+            source_name: source_name.to_string(),
+            source,
+            observation: None,
+            settings: None,
+        }
+    }
+}
+
+impl MeilisearchSourceReader<MeilisearchClient> {
+    pub(super) fn new(
+        endpoint: &str,
+        api_key: &str,
+        source_name: &str,
+    ) -> Result<Self, AlgoliaClientError> {
+        let source = MeilisearchClient::new(endpoint, api_key, source_name)
+            .map_err(map_meilisearch_error)?;
+        Ok(Self::from_source(source_name, source))
+    }
+}
+
+impl<S> TypesenseSourceReader<S>
+where
+    S: TypesenseExportSource,
+{
+    pub(super) fn from_source(source_name: &str, source: S) -> Self {
+        Self {
+            source_name: source_name.to_string(),
+            source,
+            observation: None,
+        }
+    }
+}
+
+impl TypesenseSourceReader<TypesenseClient> {
+    pub(super) fn new(
+        endpoint: &str,
+        api_key: &str,
+        source_name: &str,
+    ) -> Result<Self, AlgoliaClientError> {
+        let source =
+            TypesenseClient::new(endpoint, api_key, source_name).map_err(map_typesense_error)?;
+        Ok(Self::from_source(source_name, source))
+    }
+}
+
+impl MeilisearchExportSource for MeilisearchClient {
+    fn observe_source(&mut self) -> MeilisearchSourceFuture<'_, MeilisearchSourceObservation> {
+        Box::pin(async move { self.observe_source().await })
+    }
+
+    fn read_settings(&mut self) -> MeilisearchSourceFuture<'_, Value> {
+        Box::pin(async move { self.read_source_settings().await })
+    }
+
+    fn require_read_access(&mut self) -> MeilisearchSourceFuture<'_, ()> {
+        Box::pin(async move { self.require_read_access().await })
+    }
+
+    fn read_document_pages<'a>(
+        &'a mut self,
+        consume_page: &'a mut MeilisearchPageConsumer<'a>,
+    ) -> MeilisearchSourceFuture<'a, MeilisearchSourceObservation> {
+        Box::pin(async move {
+            let capture = self.capture_source(consume_page).await?;
+            Ok(capture.observation())
+        })
+    }
+}
+
+impl TypesenseExportSource for TypesenseClient {
+    fn observe_source(&mut self) -> TypesenseSourceFuture<'_, TypesenseSourceObservation> {
+        Box::pin(async move { self.observe_source().await })
+    }
+
+    fn read_settings(&mut self) -> TypesenseSourceFuture<'_, Value> {
+        Box::pin(async move { self.read_source_settings().await })
+    }
+
+    fn require_read_access(&mut self) -> TypesenseSourceFuture<'_, ()> {
+        Box::pin(async move { self.require_read_access().await })
+    }
+
+    fn read_document_pages<'a>(
+        &'a mut self,
+        consume_page: &'a mut TypesensePageConsumer<'a>,
+    ) -> TypesenseSourceFuture<'a, TypesenseSourceObservation> {
+        Box::pin(async move {
+            let capture = self.capture_source(consume_page).await?;
+            Ok(capture.observation())
+        })
+    }
+}
+
+impl<S> fmt::Debug for MeilisearchSourceReader<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MeilisearchSourceReader")
+            .field("source_name", &"<scrubbed>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S> fmt::Debug for TypesenseSourceReader<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TypesenseSourceReader")
+            .field("source_name", &"<scrubbed>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S> MigrationSourceReader for MeilisearchSourceReader<S>
+where
+    S: MeilisearchExportSource + Send,
+{
+    fn app_id(&self) -> &str {
+        "meilisearch"
+    }
+
+    fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    fn wait_for_quiescent_source(&mut self) -> SourceFuture<'_, AlgoliaIndexRecord> {
+        Box::pin(async move {
+            let observation = self
+                .source
+                .observe_source()
+                .await
+                .map_err(map_meilisearch_error)?;
+            validate_meilisearch_observation(&self.source_name, &observation)?;
+            let record = meilisearch_index_record(&observation);
+            self.observation = Some(observation);
+            Ok(record)
+        })
+    }
+
+    fn read_settings(&mut self) -> SourceFuture<'_, Value> {
+        Box::pin(async move {
+            let raw_settings = self
+                .source
+                .read_settings()
+                .await
+                .map_err(map_meilisearch_error)?;
+            let normalized_settings = normalize_meilisearch_settings(&raw_settings)?;
+            self.settings = Some(raw_settings);
+            Ok(normalized_settings)
+        })
+    }
+
+    fn read_index_settings<'a>(&'a mut self, _index_name: &'a str) -> SourceFuture<'a, Value> {
+        Box::pin(async {
+            Err(AlgoliaClientError::new(
+                AlgoliaErrorKind::Validation,
+                "Meilisearch replica settings are not part of the source contract",
+            ))
+        })
+    }
+
+    fn require_unretrievable_access<'a>(
+        &'a mut self,
+        _settings: &'a Value,
+    ) -> SourceFuture<'a, ()> {
+        Box::pin(async move {
+            self.source
+                .require_read_access()
+                .await
+                .map_err(map_meilisearch_error)
+        })
+    }
+
+    fn read_documents<'a>(
+        &'a mut self,
+        consume_page: &'a mut PageConsumer<'a>,
+    ) -> SourceFuture<'a, ()> {
+        Box::pin(async move {
+            let expected = self
+                .observation
+                .clone()
+                .ok_or_else(meilisearch_progress_error)?;
+            let primary_key = expected.primary_key.clone();
+            let mut consumer_error = None;
+            let observed = self
+                .source
+                .read_document_pages(&mut |page| {
+                    let normalized = normalize_meilisearch_document_page(&page, &primary_key)
+                        .map_err(|error| {
+                            consumer_error = Some(error);
+                            meilisearch_consumer_error()
+                        })?;
+                    consume_page(normalized).map_err(|error| {
+                        consumer_error = Some(error);
+                        meilisearch_consumer_error()
+                    })
+                })
+                .await;
+            if let Some(error) = consumer_error {
+                return Err(error);
+            }
+            let observed = observed.map_err(map_meilisearch_error)?;
+            if observed != expected {
+                return Err(source_drift_error());
+            }
+            Ok(())
+        })
+    }
+
+    fn read_rules<'a>(
+        &'a mut self,
+        _consume_page: &'a mut PageConsumer<'a>,
+    ) -> SourceFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn read_synonyms<'a>(
+        &'a mut self,
+        consume_page: &'a mut PageConsumer<'a>,
+    ) -> SourceFuture<'a, ()> {
+        Box::pin(async move {
+            let settings = self
+                .settings
+                .as_ref()
+                .ok_or_else(meilisearch_progress_error)?;
+            let synonyms = normalize_meilisearch_synonyms(settings)?;
+            if !synonyms.is_empty() {
+                consume_page(synonyms)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl<S> MigrationSourceReader for TypesenseSourceReader<S>
+where
+    S: TypesenseExportSource + Send,
+{
+    fn app_id(&self) -> &str {
+        "typesense"
+    }
+
+    fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    fn wait_for_quiescent_source(&mut self) -> SourceFuture<'_, AlgoliaIndexRecord> {
+        Box::pin(async move {
+            let observation = self
+                .source
+                .observe_source()
+                .await
+                .map_err(map_typesense_error)?;
+            validate_typesense_observation(&self.source_name, &observation)?;
+            let record = typesense_index_record(&observation);
+            self.observation = Some(observation);
+            Ok(record)
+        })
+    }
+
+    fn read_settings(&mut self) -> SourceFuture<'_, Value> {
+        Box::pin(async move {
+            let settings = self
+                .source
+                .read_settings()
+                .await
+                .map_err(map_typesense_error)?;
+            Ok(settings)
+        })
+    }
+
+    fn read_index_settings<'a>(&'a mut self, _index_name: &'a str) -> SourceFuture<'a, Value> {
+        Box::pin(async {
+            Err(AlgoliaClientError::new(
+                AlgoliaErrorKind::Validation,
+                "Typesense replica settings are not part of the source contract",
+            ))
+        })
+    }
+
+    fn require_unretrievable_access<'a>(
+        &'a mut self,
+        _settings: &'a Value,
+    ) -> SourceFuture<'a, ()> {
+        Box::pin(async move {
+            self.source
+                .require_read_access()
+                .await
+                .map_err(map_typesense_error)
+        })
+    }
+
+    fn read_documents<'a>(
+        &'a mut self,
+        consume_page: &'a mut PageConsumer<'a>,
+    ) -> SourceFuture<'a, ()> {
+        Box::pin(async move {
+            let expected = self
+                .observation
+                .clone()
+                .ok_or_else(typesense_progress_error)?;
+            let mut consumer_error = None;
+            let observed = self
+                .source
+                .read_document_pages(&mut |page| {
+                    let normalized = normalize_typesense_document_page(&page, "$.documents")
+                        .map_err(|_| {
+                            consumer_error = Some(typesense_document_identity_error());
+                            typesense_consumer_error()
+                        })?;
+                    consume_page(normalized).map_err(|error| {
+                        consumer_error = Some(error);
+                        typesense_consumer_error()
+                    })
+                })
+                .await;
+            if let Some(error) = consumer_error {
+                return Err(error);
+            }
+            let observed = observed.map_err(map_typesense_error)?;
+            if observed != expected {
+                return Err(source_drift_error());
+            }
+            Ok(())
+        })
+    }
+
+    fn read_rules<'a>(
+        &'a mut self,
+        _consume_page: &'a mut PageConsumer<'a>,
+    ) -> SourceFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn read_synonyms<'a>(
+        &'a mut self,
+        _consume_page: &'a mut PageConsumer<'a>,
+    ) -> SourceFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -394,16 +849,228 @@ fn source_identity_version_name(version: SourceIdentityVersion) -> &'static str 
 }
 
 pub(super) fn source_drift_error() -> AlgoliaClientError {
-    AlgoliaClientError::new(
-        AlgoliaErrorKind::Progress,
-        "Algolia source changed during export",
-    )
+    AlgoliaClientError::new(AlgoliaErrorKind::Progress, "Source changed during export")
 }
 
 fn flatten_browse_error(error: BrowseError<AlgoliaClientError>) -> AlgoliaClientError {
     match error {
         BrowseError::Client(error) | BrowseError::Consumer(error) => error,
     }
+}
+
+fn validate_meilisearch_observation(
+    source_name: &str,
+    observation: &MeilisearchSourceObservation,
+) -> Result<(), AlgoliaClientError> {
+    if observation.source_name != source_name || observation.primary_key.is_empty() {
+        return Err(meilisearch_schema_error());
+    }
+    Ok(())
+}
+
+fn meilisearch_index_record(observation: &MeilisearchSourceObservation) -> AlgoliaIndexRecord {
+    AlgoliaIndexRecord {
+        name: observation.source_name.clone(),
+        entries: observation.document_count,
+        updated_at: observation.updated_at.clone(),
+        pending_task: false,
+    }
+}
+
+fn validate_typesense_observation(
+    source_name: &str,
+    observation: &TypesenseSourceObservation,
+) -> Result<(), AlgoliaClientError> {
+    if observation.source_name != source_name || observation.schema_hash.is_empty() {
+        return Err(typesense_schema_error());
+    }
+    Ok(())
+}
+
+fn typesense_index_record(observation: &TypesenseSourceObservation) -> AlgoliaIndexRecord {
+    AlgoliaIndexRecord {
+        name: observation.source_name.clone(),
+        entries: observation.document_count,
+        updated_at: format!("{}:{}", observation.updated_at, observation.schema_hash),
+        pending_task: false,
+    }
+}
+
+fn normalize_meilisearch_document_page(
+    page: &[Value],
+    primary_key: &str,
+) -> Result<Vec<Value>, AlgoliaClientError> {
+    page.iter()
+        .map(|document| {
+            let object = document
+                .as_object()
+                .ok_or_else(meilisearch_document_identity_error)?;
+            let stable_id = object
+                .get(primary_key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(meilisearch_document_identity_error)?;
+            let mut normalized = object.clone();
+            normalized.insert("objectID".to_string(), Value::String(stable_id.to_string()));
+            Ok(Value::Object(normalized))
+        })
+        .collect()
+}
+
+pub(super) fn normalize_typesense_document_page(
+    page: &[Value],
+    json_path_prefix: &str,
+) -> Result<Vec<Value>, String> {
+    let mut seen = BTreeSet::new();
+    page.iter()
+        .enumerate()
+        .map(|(document_index, document)| {
+            let object = document
+                .as_object()
+                .ok_or_else(|| "Typesense document must be an object".to_string())?;
+            let json_path = format!("{json_path_prefix}[{document_index}].id");
+            let stable_id = match object.get("id") {
+                Some(Value::String(id)) => id,
+                Some(_) => return Err(format!("{json_path}: Typesense id must be a string")),
+                None => return Err(format!("{json_path}: missing Typesense id")),
+            };
+            if !seen.insert(stable_id.clone()) {
+                return Err(format!("{json_path}: duplicate Typesense id {stable_id}"));
+            }
+            let mut normalized = object.clone();
+            normalized.insert("objectID".to_string(), Value::String(stable_id.to_string()));
+            Ok(Value::Object(normalized))
+        })
+        .collect()
+}
+
+fn normalize_meilisearch_synonyms(settings: &Value) -> Result<Vec<Value>, AlgoliaClientError> {
+    let Some(raw_synonyms) = settings.get("synonyms") else {
+        return Ok(Vec::new());
+    };
+    let synonyms = raw_synonyms
+        .as_object()
+        .ok_or_else(meilisearch_schema_error)?;
+    synonyms
+        .iter()
+        .map(|(input, raw_equivalents)| {
+            let equivalents = raw_equivalents
+                .as_array()
+                .ok_or_else(meilisearch_schema_error)?;
+            let mut terms = Vec::with_capacity(equivalents.len() + 1);
+            terms.push(Value::String(input.clone()));
+            for equivalent in equivalents {
+                let equivalent = equivalent
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(meilisearch_schema_error)?;
+                terms.push(Value::String(equivalent.to_string()));
+            }
+            Ok(json!({
+                "objectID": format!("meilisearch:{input}"),
+                "type": "synonym",
+                "synonyms": terms,
+            }))
+        })
+        .collect()
+}
+
+fn normalize_meilisearch_settings(settings: &Value) -> Result<Value, AlgoliaClientError> {
+    let mut failures = Vec::new();
+    let mut warnings = Vec::new();
+    let normalized = translate_settings_for_provider(
+        settings,
+        SettingsSourceProvider::Meilisearch,
+        &mut failures,
+        &mut warnings,
+    )
+    .ok_or_else(meilisearch_schema_error)?;
+    if !failures.is_empty() {
+        return Err(meilisearch_schema_error());
+    }
+    serde_json::to_value(normalized).map_err(|_| meilisearch_schema_error())
+}
+
+fn map_meilisearch_error(error: MeilisearchClientError) -> AlgoliaClientError {
+    let kind = match error.kind() {
+        MeilisearchErrorKind::Validation => AlgoliaErrorKind::Validation,
+        MeilisearchErrorKind::Transport => AlgoliaErrorKind::Transport,
+        MeilisearchErrorKind::Timeout => AlgoliaErrorKind::Timeout,
+        MeilisearchErrorKind::Redirect => AlgoliaErrorKind::Redirect,
+        MeilisearchErrorKind::Upstream => AlgoliaErrorKind::Upstream,
+        MeilisearchErrorKind::Decode => AlgoliaErrorKind::Decode,
+        MeilisearchErrorKind::Schema => AlgoliaErrorKind::Schema,
+        MeilisearchErrorKind::Progress => AlgoliaErrorKind::Progress,
+        MeilisearchErrorKind::Limit => AlgoliaErrorKind::Limit,
+    };
+    AlgoliaClientError::new(kind, error.safe_message())
+}
+
+pub(super) fn map_typesense_error(error: TypesenseClientError) -> AlgoliaClientError {
+    let kind = match error.kind() {
+        TypesenseErrorKind::Validation => AlgoliaErrorKind::Validation,
+        TypesenseErrorKind::Transport => AlgoliaErrorKind::Transport,
+        TypesenseErrorKind::Timeout => AlgoliaErrorKind::Timeout,
+        TypesenseErrorKind::Redirect => AlgoliaErrorKind::Redirect,
+        TypesenseErrorKind::Upstream => AlgoliaErrorKind::Upstream,
+        TypesenseErrorKind::Schema => AlgoliaErrorKind::Schema,
+        TypesenseErrorKind::Progress => AlgoliaErrorKind::Progress,
+        TypesenseErrorKind::Limit => AlgoliaErrorKind::Limit,
+    };
+    AlgoliaClientError::new(kind, error.safe_message())
+}
+
+fn meilisearch_document_identity_error() -> AlgoliaClientError {
+    AlgoliaClientError::new(
+        AlgoliaErrorKind::Schema,
+        "Meilisearch document primary key is invalid",
+    )
+}
+
+fn meilisearch_schema_error() -> AlgoliaClientError {
+    AlgoliaClientError::new(
+        AlgoliaErrorKind::Schema,
+        "Meilisearch source response schema is invalid",
+    )
+}
+
+fn typesense_document_identity_error() -> AlgoliaClientError {
+    AlgoliaClientError::new(AlgoliaErrorKind::Schema, "Typesense document id is invalid")
+}
+
+fn typesense_schema_error() -> AlgoliaClientError {
+    AlgoliaClientError::new(
+        AlgoliaErrorKind::Schema,
+        "Typesense source response schema is invalid",
+    )
+}
+
+fn typesense_progress_error() -> AlgoliaClientError {
+    AlgoliaClientError::new(
+        AlgoliaErrorKind::Progress,
+        "Typesense source reader state is invalid",
+    )
+}
+
+fn meilisearch_progress_error() -> AlgoliaClientError {
+    AlgoliaClientError::new(
+        AlgoliaErrorKind::Progress,
+        "Meilisearch source reader state is invalid",
+    )
+}
+
+fn meilisearch_consumer_error() -> MeilisearchClientError {
+    MeilisearchClientError::new(
+        MeilisearchErrorKind::Progress,
+        "Meilisearch source consumer rejected a page",
+    )
+}
+
+fn typesense_consumer_error() -> TypesenseClientError {
+    TypesenseClientError::new(
+        TypesenseErrorKind::Progress,
+        "Typesense source consumer rejected a page",
+    )
 }
 
 struct NoopSink;

@@ -709,17 +709,40 @@ fn cleanup_superseded_committed_journals(
     let Some(target_root) = current_namespace.parent() else {
         return Ok(());
     };
+    cleanup_committed_publication_journals(target_root, target, Some(current_namespace), io)
+}
+
+pub(crate) fn retire_committed_publication_journals(
+    base: &Path,
+    target: &PublicationTarget,
+) -> Result<()> {
+    let target_root = base.join(super::PUBLICATION_DIR).join(target.as_str());
+    reject_symlinked_managed_path_components(base, &target_root, "publication journal cleanup")?;
+    if !target_root.exists() {
+        return Ok(());
+    }
+    cleanup_committed_publication_journals(&target_root, target, None, &PublicationIo::production())
+}
+
+fn cleanup_committed_publication_journals(
+    target_root: &Path,
+    target: &PublicationTarget,
+    preserved_namespace: Option<&Path>,
+    io: &PublicationIo<'_>,
+) -> Result<()> {
     for entry in fs::read_dir(target_root)? {
         let entry = entry?;
         let path = entry.path();
-        if path == current_namespace || !entry.file_type()?.is_dir() {
+        if preserved_namespace == Some(path.as_path()) || !entry.file_type()?.is_dir() {
             continue;
         }
         let journal_path = path.join("journal.json");
         let Ok(raw) = fs::read_to_string(&journal_path) else {
             continue;
         };
-        let journal = PublicationJournal::from_recovery_json(&raw)?;
+        let Ok(journal) = PublicationJournal::from_recovery_json(&raw) else {
+            continue;
+        };
         // Identity mismatches are repair evidence, not superseded state this
         // activation owns. Delete only a journal bound to this exact namespace.
         if journal.target == *target

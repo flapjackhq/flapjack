@@ -93,9 +93,14 @@ impl EmbedderConfig {
                 }
             }
             EmbedderSource::UserProvided => {
-                if self.dimensions.is_none() {
+                let Some(dimensions) = self.dimensions else {
                     return Err(VectorError::EmbeddingError(
                         "userProvided embedder requires `dimensions`".into(),
+                    ));
+                };
+                if dimensions == 0 {
+                    return Err(VectorError::EmbeddingError(
+                        "userProvided embedder requires `dimensions` greater than 0".into(),
                     ));
                 }
             }

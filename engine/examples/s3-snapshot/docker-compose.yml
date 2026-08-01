@@ -15,9 +15,11 @@ services:
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_KMS_SECRET_KEY: "sseprobe:MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="
+    # This example uses fixed local credentials; never expose its host ports.
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 2s
@@ -52,6 +54,7 @@ services:
       FLAPJACK_DATA_DIR: /data
       FLAPJACK_BIND_ADDR: "0.0.0.0:7700"
       FLAPJACK_NO_AUTH: "1"
+      FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND: "1"
       FLAPJACK_S3_BUCKET: flapjack-snapshots
       FLAPJACK_S3_REGION: us-east-1
       FLAPJACK_S3_ENDPOINT: "http://minio:9000"
@@ -60,8 +63,9 @@ services:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       RUST_LOG: info
+    # Authentication is intentionally disabled for the local example only.
     ports:
-      - "7700:7700"
+      - "127.0.0.1:7700:7700"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:7700/health"]
       interval: 2s

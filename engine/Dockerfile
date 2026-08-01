@@ -49,11 +49,19 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Pin the runtime identity so base-image upgrades cannot shift persisted-volume ownership.
+RUN groupadd --gid 10001 flapjack \
+    && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /data \
+        --shell /usr/sbin/nologin flapjack
+
 COPY --from=builder /app/target/release/flapjack /usr/local/bin/flapjack
 COPY engine/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-RUN mkdir -p /data
+RUN mkdir -p /data \
+    && chown flapjack:flapjack /data
+
+USER flapjack:flapjack
 
 EXPOSE 7700
 

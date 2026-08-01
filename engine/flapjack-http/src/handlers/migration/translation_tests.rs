@@ -1,11 +1,12 @@
 use super::super::spool::{
-    AcceptedSpoolReader, PublicExportView, ResourceDenominators, SpoolError, SpoolLimits,
+    AcceptedSpoolReader, AsyncMigrationPublicationSemantic, ResourceDenominators, SpoolLimits,
     SpoolStore,
 };
 use super::translation_bundle::{translate_replica_settings, translate_replica_topology};
 use super::*;
 use crate::handlers::migration::source_identity_partitions::SourceIdentityValidation;
 use crate::handlers::migration::source_test_support::duplicate_ids_in_different_identity_partitions;
+use crate::handlers::migration::AsyncMigrationSourceProvider;
 use flapjack::index::replica::ReplicaEntry;
 use flapjack::index::settings::DistinctValue;
 use flapjack::types::{Document, FieldValue};
@@ -33,17 +34,7 @@ struct AcceptedSpoolFixture {
     reader: AcceptedSpoolReader,
 }
 
-fn create_export_for_test(
-    store: &SpoolStore,
-    job_uuid: uuid::Uuid,
-    source_identity_digest: &str,
-    denominators: ResourceDenominators,
-) -> Result<PublicExportView, SpoolError> {
-    store.create_migration_phase(job_uuid)?;
-    store.create_export(job_uuid, source_identity_digest, denominators)
-}
-
-fn spool_payload(
+pub(in crate::handlers::migration) fn spool_payload(
     settings: serde_json::Value,
     document_pages: Vec<Vec<serde_json::Value>>,
     rule_pages: Vec<Vec<serde_json::Value>>,
@@ -52,11 +43,24 @@ fn spool_payload(
     SpoolTranslationInput {
         source_index_name: "products".to_string(),
         target_index_name: "shop".to_string(),
+        source_provider: AsyncMigrationSourceProvider::Algolia,
         settings,
         document_pages,
         rule_pages,
         synonym_pages,
         replica_settings: BTreeMap::new(),
+    }
+}
+
+fn typesense_spool_payload(settings: serde_json::Value) -> SpoolTranslationInput {
+    SpoolTranslationInput {
+        source_provider: AsyncMigrationSourceProvider::Typesense,
+        ..spool_payload(
+            settings,
+            vec![vec![json!({"objectID": "prod_001", "id": "prod_001"})]],
+            vec![],
+            vec![],
+        )
     }
 }
 
@@ -66,15 +70,45 @@ fn accepted_spool_fixture(
     rule_pages: Vec<Vec<serde_json::Value>>,
     synonym_pages: Vec<Vec<serde_json::Value>>,
 ) -> AcceptedSpoolFixture {
+    accepted_spool_fixture_for_provider(
+        AsyncMigrationSourceProvider::Algolia,
+        settings,
+        document_pages,
+        rule_pages,
+        synonym_pages,
+    )
+}
+
+fn accepted_spool_fixture_for_provider(
+    source_provider: AsyncMigrationSourceProvider,
+    settings: serde_json::Value,
+    document_pages: Vec<Vec<serde_json::Value>>,
+    rule_pages: Vec<Vec<serde_json::Value>>,
+    synonym_pages: Vec<Vec<serde_json::Value>>,
+) -> AcceptedSpoolFixture {
     let tmp = TempDir::new().unwrap();
     let store = SpoolStore::new(tmp.path(), SpoolLimits::default()).unwrap();
-    let view = create_export_for_test(
-        &store,
-        uuid::Uuid::new_v4(),
-        TEST_SOURCE_DIGEST,
-        denominators_for_pages(&document_pages, &rule_pages, &synonym_pages),
-    )
-    .unwrap();
+    let job_uuid = uuid::Uuid::new_v4();
+    if source_provider == AsyncMigrationSourceProvider::Algolia {
+        store.create_migration_phase(job_uuid).unwrap();
+    } else {
+        store
+            .create_async_migration_admission_for_provider_owner(
+                job_uuid,
+                "shop",
+                None,
+                source_provider,
+                AsyncMigrationPublicationSemantic::default(),
+            )
+            .unwrap();
+    }
+    let view = store
+        .create_export(
+            job_uuid,
+            TEST_SOURCE_DIGEST,
+            denominators_for_pages(&document_pages, &rule_pages, &synonym_pages),
+        )
+        .unwrap();
 
     let settings_bytes = serde_json::to_vec(&settings).unwrap();
     store
@@ -1718,6 +1752,104 @@ fn assert_complete_spool_report(translated: &TranslatedSpoolPayload) {
 }
 
 #[test]
+fn typesense_spool_translation_reports_provider_warnings_for_raw_settings() {
+    let translated = translated(typesense_spool_payload(json!({
+        "default_sorting_field": "price",
+        "enable_nested_fields": true,
+        "fields": [
+            {"name": "id", "type": "string"},
+            {"name": "embedding", "type": "float[]", "num_dim": 384},
+            {"name": "category_id", "type": "string", "reference": "categories.id"}
+        ],
+        "token_separators": ["-"],
+        "symbols_to_index": ["#"],
+        "synonym_sets": ["catalog_synonyms"],
+        "curation_sets": ["catalog_curations"]
+    })));
+
+    assert_eq!(translated.report.summary.hard_rejections, 0);
+    assert_eq!(
+        entries_for_code(&translated.report, ReportCode::TypesenseSettingNotMigrated)
+            .iter()
+            .map(|entry| entry.json_path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "$.curation_sets",
+            "$.default_sorting_field",
+            "$.enable_nested_fields",
+            "$.fields",
+            "$.symbols_to_index",
+            "$.synonym_sets",
+            "$.token_separators",
+        ]
+    );
+}
+
+#[test]
+fn typesense_spool_translation_preserves_collection_metadata_as_provider_warning() {
+    let translated = translated(typesense_spool_payload(json!({
+        "metadata": {
+            "owner": "search-team",
+            "flags": {"localized": true}
+        }
+    })));
+
+    assert_eq!(translated.report.summary.hard_rejections, 0);
+    assert_eq!(
+        entries_for_code(&translated.report, ReportCode::TypesenseSettingNotMigrated)
+            .iter()
+            .map(|entry| entry.json_path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["$.metadata"]
+    );
+}
+
+#[test]
+fn accepted_typesense_spool_translation_uses_persisted_source_provider() {
+    let fixture = accepted_spool_fixture_for_provider(
+        AsyncMigrationSourceProvider::Typesense,
+        json!({
+            "default_sorting_field": "price",
+            "synonym_sets": ["catalog_synonyms"],
+            "curation_sets": ["catalog_curations"]
+        }),
+        vec![vec![json!({"objectID": "prod_001", "id": "prod_001"})]],
+        vec![],
+        vec![],
+    );
+    let mut instrumentation = TranslationSessionInstrumentation::default();
+
+    let translated = match translate_accepted_spool_payload(
+        fixture.reader,
+        "products".to_string(),
+        "shop".to_string(),
+        BTreeMap::new(),
+        &mut instrumentation,
+        || Ok(false),
+        |_batch| Ok::<(), std::convert::Infallible>(()),
+    )
+    .expect("accepted Typesense spool artifacts should read")
+    {
+        TranslationOutcome::Translated(translated) => *translated,
+        TranslationOutcome::Rejected(report) => {
+            panic!("expected accepted Typesense spool to translate, got report {report:#?}")
+        }
+    };
+
+    assert_eq!(
+        entries_for_code(&translated.report, ReportCode::TypesenseSettingNotMigrated)
+            .iter()
+            .map(|entry| entry.json_path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "$.curation_sets",
+            "$.default_sorting_field",
+            "$.synonym_sets"
+        ]
+    );
+}
+
+#[test]
 fn translates_accepted_spool_in_bounded_document_batches() {
     let fixture = accepted_spool_fixture(
         json!({"searchableAttributes": ["title"], "attributesForFaceting": ["page_marker"]}),
@@ -1810,7 +1942,7 @@ fn translates_accepted_spool_in_bounded_document_batches() {
     );
     assert_eq!(
         translated.report.report_digest.as_deref(),
-        Some("0d6865142f81127352eeacc2b34f56741ec13147fa8da9c5dd681ad8f9ca2d68")
+        Some("155f86f68e259b608efa8f50dfc62ec4fe9d99af8b61d57efb529ca5aa42dca4")
     );
 }
 
@@ -1920,6 +2052,7 @@ fn in_memory_translation_observes_carried_replica_settings_count() {
     let input = SpoolTranslationInput {
         source_index_name: "products".to_string(),
         target_index_name: "shop".to_string(),
+        source_provider: AsyncMigrationSourceProvider::Algolia,
         settings: minimal_valid_settings(),
         document_pages: vec![],
         rule_pages: vec![],
@@ -1939,11 +2072,19 @@ fn in_memory_translation_observes_carried_replica_settings_count() {
 
 #[test]
 fn exact_document_and_settings_rows_persist_payload_values() {
-    for field in ["attributesForFaceting", "searchableAttributes"] {
-        let row = resolve_source_field(ResourceKind::Settings, field);
-        assert_eq!(row.disposition, Disposition::Exact);
-        assert_eq!(row.target_owner, TargetOwner::SettingsPayloadMerge);
-    }
+    let faceting_row = resolve_source_field(ResourceKind::Settings, "attributesForFaceting");
+    assert_eq!(faceting_row.disposition, Disposition::Warned);
+    assert_eq!(
+        faceting_row.warning_code,
+        Some(WarningCode::PersistedNoBehaviorSetting)
+    );
+    assert_eq!(faceting_row.target_owner, TargetOwner::SettingsPayloadMerge);
+    let searchable_row = resolve_source_field(ResourceKind::Settings, "searchableAttributes");
+    assert_eq!(searchable_row.disposition, Disposition::Exact);
+    assert_eq!(
+        searchable_row.target_owner,
+        TargetOwner::SettingsPayloadMerge
+    );
     let document_attribute = resolve_source_field(ResourceKind::Document, "title");
     assert_eq!(document_attribute.disposition, Disposition::Exact);
     assert_eq!(document_attribute.target_owner, TargetOwner::DocumentJson);
@@ -2262,6 +2403,14 @@ fn source_reader_vendor_default_settings_are_accepted() {
                 ReportResource::Settings,
                 None,
                 None,
+                "$.attributesForFaceting".to_string()
+            ),
+            (
+                ReportSeverity::Warning,
+                ReportCode::PersistedNoBehaviorSetting,
+                ReportResource::Settings,
+                None,
+                None,
                 "$.attributesToHighlight".to_string()
             ),
             (
@@ -2323,7 +2472,7 @@ fn source_reader_vendor_default_settings_are_accepted() {
         ]
     );
     assert_eq!(translated.report.summary.hard_rejections, 0);
-    assert_eq!(translated.report.summary.warnings, 8);
+    assert_eq!(translated.report.summary.warnings, 9);
 }
 
 #[test]

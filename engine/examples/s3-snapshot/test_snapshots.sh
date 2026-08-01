@@ -43,6 +43,18 @@ ensure_no_local_flapjack_conflict() {
     fi
 }
 
+ensure_localhost_only_ports() {
+    if ! docker compose config --format json | python3 -c '
+import json, sys
+config = json.load(sys.stdin)
+ports = config["services"]["minio"]["ports"] + config["services"]["flapjack"]["ports"]
+if len(ports) != 3 or any(port.get("host_ip") != "127.0.0.1" for port in ports):
+    raise SystemExit("the unauthenticated example must publish exactly three localhost-only ports")
+'; then
+        fail "Compose example ports must bind only to 127.0.0.1"
+    fi
+}
+
 wait_for_hits() {
     local query="$1"
     local expected_hits="$2"
@@ -73,6 +85,7 @@ echo "API: $API"
 echo ""
 
 ensure_no_local_flapjack_conflict
+ensure_localhost_only_ports
 
 # ── Wait for health ──────────────────────────────────────────────────────────
 echo "--- Waiting for Flapjack health ---"
@@ -162,9 +175,9 @@ AFTER=$(curl -sf "$API/1/indexes/$IDX/snapshots" "${HDR[@]}" \
 
 # ── Test 6: Auto-restore on empty data dir ───────────────────────────────────
 echo "--- Test 6: Auto-restore on empty data dir ---"
-# Wipe data while container is running, then force-stop it so shutdown hooks
-# cannot repopulate /data before the next startup check.
-docker compose exec flapjack sh -c "rm -rf /data/*"
+# Wipe visible and hidden data while the container is running, then force-stop
+# it so shutdown hooks cannot repopulate /data before the next startup check.
+docker compose exec flapjack sh -c "rm -rf /data/* /data/.[!.]* /data/..?*"
 docker compose kill -s KILL flapjack > /dev/null
 RESTART_LOG_SINCE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 docker compose up -d flapjack > /dev/null

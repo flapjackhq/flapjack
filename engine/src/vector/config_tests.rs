@@ -53,6 +53,63 @@ fn test_user_provided_requires_dimensions() {
     assert!(config.validate().is_err());
 }
 
+#[test]
+fn stage3_user_provided_rejects_zero_dimensions() {
+    let config = EmbedderConfig {
+        source: EmbedderSource::UserProvided,
+        dimensions: Some(0),
+        ..Default::default()
+    };
+    let err = config
+        .validate_required_fields()
+        .expect_err("userProvided dimensions=0 must fail configuration admission");
+    assert!(
+        format!("{err}").contains("dimensions"),
+        "error should name the invalid field: {err}"
+    );
+}
+
+#[test]
+fn stage3_user_provided_dimensions_reject_negative_and_overflowing_json() {
+    let negative =
+        serde_json::from_str::<EmbedderConfig>(r#"{"source":"userProvided","dimensions":-1}"#);
+    assert!(
+        negative.is_err(),
+        "negative dimensions must fail usize deserialization"
+    );
+
+    let overflowing = serde_json::from_str::<EmbedderConfig>(
+        r#"{"source":"userProvided","dimensions":18446744073709551616}"#,
+    );
+    assert!(
+        overflowing.is_err(),
+        "overflowing dimensions must fail usize deserialization"
+    );
+}
+
+#[test]
+fn stage3_index_settings_validate_embedders_accepts_usize_max_without_allocating() {
+    use crate::index::settings::IndexSettings;
+    use std::collections::HashMap;
+
+    let mut embedders = HashMap::new();
+    embedders.insert(
+        "huge_dimensions".to_string(),
+        serde_json::json!({
+            "source": "userProvided",
+            "dimensions": usize::MAX
+        }),
+    );
+    let settings = IndexSettings {
+        embedders: Some(embedders),
+        ..Default::default()
+    };
+
+    settings
+        .validate_embedders()
+        .expect("configuration admission must not allocate a vector or panic for usize::MAX");
+}
+
 /// Verify that correctly configured embedders pass validation for each source type.
 #[test]
 fn test_valid_configs_pass_validation() {

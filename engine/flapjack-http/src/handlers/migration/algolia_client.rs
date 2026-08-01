@@ -19,6 +19,7 @@ const MAX_BROWSE_PAGES: usize = 1_000_000;
 const MAX_BROWSE_ITEMS: usize = 10_000_000;
 const DEFAULT_QUIESCENCE_MAX_POLLS: usize = 1_200;
 const DEFAULT_QUIESCENCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const TEST_ALGOLIA_BASE_URL_ENV: &str = "FLAPJACK_TEST_ALGOLIA_BASE_URL";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TraversalLimits {
@@ -73,10 +74,12 @@ pub(super) enum AlgoliaErrorKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct AlgoliaClientError {
+pub(super) struct SourceClientError {
     kind: AlgoliaErrorKind,
     message: &'static str,
 }
+
+pub(super) type AlgoliaClientError = SourceClientError;
 
 #[derive(Debug)]
 pub(super) enum BrowseError<E> {
@@ -100,7 +103,7 @@ impl<E> From<AlgoliaClientError> for BrowseError<E> {
     }
 }
 
-impl AlgoliaClientError {
+impl SourceClientError {
     pub(super) fn new(kind: AlgoliaErrorKind, message: &'static str) -> Self {
         Self { kind, message }
     }
@@ -434,6 +437,31 @@ fn validate_app_id(app_id: &str) -> Result<(), AlgoliaClientError> {
     Ok(())
 }
 
+fn test_algolia_base_url_override() -> Result<Option<String>, AlgoliaClientError> {
+    if !cfg!(debug_assertions) {
+        return Ok(None);
+    }
+    let Some(base_url) = std::env::var(TEST_ALGOLIA_BASE_URL_ENV)
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let is_literal_loopback = flapjack::security::vet_outbound_url_target(&base_url, true)
+        .ok()
+        .flatten()
+        .and_then(|target| target.host.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|ip| ip.is_loopback());
+    if !is_literal_loopback {
+        return Err(AlgoliaClientError::new(
+            AlgoliaErrorKind::Validation,
+            "Algolia test base URL must use a literal loopback address",
+        ));
+    }
+    Ok(Some(base_url))
+}
+
 fn algolia_host(app_id: &str, host: AlgoliaHost) -> Result<String, AlgoliaClientError> {
     validate_app_id(app_id)?;
     Ok(match host {
@@ -544,6 +572,28 @@ fn plan_request_with_host_and_response_limit(
     body: Option<Value>,
     max_response_bytes: usize,
 ) -> Result<PlannedRequest, AlgoliaClientError> {
+    validate_app_id(app_id)?;
+    if let Some(base_url) = test_algolia_base_url_override()? {
+        return Ok(PlannedRequest {
+            method,
+            url: format!("{base_url}{path}"),
+            fallback_urls: Vec::new(),
+            headers: vec![
+                ("x-algolia-application-id", app_id.to_string()),
+                ("x-algolia-api-key", api_key.to_string()),
+                ("content-type", "application/json".to_string()),
+            ],
+            body,
+            policy: RequestPolicy {
+                connect_timeout: ALGOLIA_CONNECT_TIMEOUT,
+                request_timeout: ALGOLIA_REQUEST_TIMEOUT,
+                redirects_disabled: true,
+                proxy_disabled: true,
+            },
+            max_response_bytes,
+        });
+    }
+
     let host = algolia_host(app_id, host)?;
     let fallback_urls = algolia_fallback_hosts(app_id)?
         .into_iter()
@@ -626,7 +676,7 @@ async fn execute_json_once<T: AlgoliaTransport>(
     }
 }
 
-fn should_retry(kind: AlgoliaErrorKind) -> bool {
+pub(super) fn should_retry(kind: AlgoliaErrorKind) -> bool {
     matches!(
         kind,
         AlgoliaErrorKind::Timeout

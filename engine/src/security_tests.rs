@@ -6,7 +6,7 @@ use super::test_helpers::AllowLocalUrlsGuard;
 use serial_test::serial;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[test]
 #[serial(flapjack_outbound_url_policy)]
@@ -294,5 +294,230 @@ fn vet_outbound_url_target_prefers_literal_ip_classification_over_test_resolver(
     assert!(
         error.contains("169.254.169.254") && error.contains("link-local/metadata destination"),
         "literal IP classification must win over test resolver override: {error}"
+    );
+}
+
+#[test]
+#[serial(flapjack_outbound_url_policy)]
+fn strict_vendor_target_accepts_only_exact_https_443_host_and_pins_addresses() {
+    let resolution_calls = Arc::new(Mutex::new(0usize));
+    let observed_calls = Arc::clone(&resolution_calls);
+    let _resolver = install_test_outbound_host_resolver(Arc::new(move |host, port| {
+        assert_eq!(host, "api.vendor.example");
+        assert_eq!(port, Some(443));
+        *observed_calls.lock().unwrap() += 1;
+        Some(vec!["8.8.8.8".parse().unwrap(), "1.1.1.1".parse().unwrap()])
+    }));
+
+    let target =
+        super::vet_strict_vendor_url_target("https://api.vendor.example", &["api.vendor.example"])
+            .expect("exact vendor endpoint should pass");
+
+    assert_eq!(target.host, "api.vendor.example");
+    assert_eq!(target.port, Some(443));
+    assert_eq!(
+        target.socket_addrs(),
+        vec![
+            "8.8.8.8:443".parse().unwrap(),
+            "1.1.1.1:443".parse().unwrap()
+        ]
+    );
+    assert_eq!(*resolution_calls.lock().unwrap(), 1);
+}
+
+#[test]
+#[serial(flapjack_outbound_url_policy)]
+fn strict_vendor_target_rejects_url_authority_confusion() {
+    let _resolver = install_test_outbound_host_resolver(Arc::new(|_, _| {
+        Some(vec!["8.8.8.8".parse().unwrap()])
+    }));
+
+    for raw_url in [
+        "http://api.vendor.example",
+        "https://api.vendor.example:8443",
+        "https://user@api.vendor.example",
+        "https://secret:password@api.vendor.example",
+        "https://api.vendor.example.evil.test",
+        "https://evil-api.vendor.example",
+        "https://8.8.8.8",
+        "https://api.vendor.example/tenant",
+    ] {
+        let error =
+            super::vet_strict_vendor_url_target(raw_url, &["api.vendor.example"]).unwrap_err();
+        assert_eq!(
+            error, "Vendor endpoint is not allowed",
+            "rejection must stay static and sanitized for {raw_url}"
+        );
+        assert!(!error.contains(raw_url));
+    }
+}
+
+#[test]
+#[serial(flapjack_outbound_url_policy)]
+fn strict_vendor_target_rejects_unresolved_private_metadata_and_mixed_dns() {
+    let answers = Arc::new(Mutex::new(HashMap::from([
+        ("unresolved.vendor.example", None),
+        (
+            "private.vendor.example",
+            Some(vec!["10.0.0.7".parse::<IpAddr>().unwrap()]),
+        ),
+        (
+            "metadata.vendor.example",
+            Some(vec!["169.254.169.254".parse::<IpAddr>().unwrap()]),
+        ),
+        (
+            "mixed.vendor.example",
+            Some(vec![
+                "8.8.8.8".parse::<IpAddr>().unwrap(),
+                "127.0.0.1".parse::<IpAddr>().unwrap(),
+            ]),
+        ),
+    ])));
+    let _resolver = install_test_outbound_host_resolver(Arc::new(move |host, _| {
+        answers.lock().unwrap().get(host).cloned().flatten()
+    }));
+
+    for host in [
+        "unresolved.vendor.example",
+        "private.vendor.example",
+        "metadata.vendor.example",
+        "mixed.vendor.example",
+    ] {
+        let raw_url = format!("https://{host}");
+        let error = super::vet_strict_vendor_url_target(&raw_url, &[host]).unwrap_err();
+        assert_eq!(error, "Vendor endpoint DNS validation failed");
+        assert!(!error.contains(host));
+    }
+}
+
+/// Pins the Meilisearch Cloud `.meilisearch.io` allowlist at the host-match
+/// predicate that is the single source of truth for strict vendor host vetting.
+///
+/// The documented Cloud credential grammar is `*.meilisearch.io` (see
+/// `engine/docs2/4_EVIDENCE/2026_07_26_jul26_am_12_meilisearch_source_contract.md`,
+/// "Cloud Endpoint Hostname Grammar"). This guard would fail if the match were
+/// loosened to the vendor telemetry classifier's raw `host.ends_with("meilisearch.io")`,
+/// because `evilmeilisearch.io` would then be admitted as a sibling-suffix
+/// authority confusion.
+#[test]
+fn strict_vendor_host_matches_pins_meilisearch_cloud_label_boundary() {
+    const CLOUD_SUFFIX: &str = ".meilisearch.io";
+
+    for accepted_host in [
+        "meilisearch.io",
+        "your-instance.meilisearch.io",
+        "tenant.region.meilisearch.io",
+        "MEILISEARCH.IO",
+        "Your-Instance.Meilisearch.IO",
+    ] {
+        assert!(
+            super::strict_vendor_host_matches(accepted_host, CLOUD_SUFFIX),
+            "documented Meilisearch Cloud host must match: {accepted_host}"
+        );
+    }
+
+    for rejected_host in [
+        "evilmeilisearch.io",
+        "notmeilisearch.io",
+        "meilisearch.io.evil.test",
+        "meilisearch.com",
+        "meilisearch.dev",
+        "meilisearch-io.example",
+        "meilisearch.io.",
+    ] {
+        assert!(
+            !super::strict_vendor_host_matches(rejected_host, CLOUD_SUFFIX),
+            "sibling-suffix host must not pass the label boundary: {rejected_host}"
+        );
+    }
+}
+
+#[test]
+#[serial(flapjack_outbound_url_policy)]
+fn typesense_endpoint_policy_rejects_private_hosts() {
+    let _resolver = install_test_outbound_host_resolver(Arc::new(|host, _| {
+        Some(match host {
+            "loopback.typesense.net" => vec!["127.0.0.1".parse().unwrap()],
+            "rfc1918.typesense.net" => vec!["10.0.0.7".parse().unwrap()],
+            "ula.typesense.net" => vec!["fd00::42".parse().unwrap()],
+            "metadata.typesense.net" => vec!["169.254.169.254".parse().unwrap()],
+            "linklocal.typesense.net" => vec!["fe80::1".parse().unwrap()],
+            "mapped.typesense.net" => vec!["::ffff:169.254.169.254".parse().unwrap()],
+            _ => vec!["8.8.8.8".parse().unwrap()],
+        })
+    }));
+
+    for raw_url in [
+        "https://loopback.typesense.net",
+        "https://rfc1918.typesense.net",
+        "https://ula.typesense.net",
+        "https://metadata.typesense.net",
+        "https://linklocal.typesense.net",
+        "https://mapped.typesense.net",
+    ] {
+        let error = super::vet_typesense_cloud_url_target(raw_url)
+            .expect_err("private, metadata, and link-local hosts must reject");
+        assert_eq!(
+            error, "Vendor endpoint DNS validation failed",
+            "Typesense endpoint rejection reason drifted for {raw_url}"
+        );
+    }
+}
+
+#[test]
+fn strict_vendor_host_matches_pins_typesense_cloud_label_boundary() {
+    const CLOUD_SUFFIX: &str = ".typesense.net";
+
+    for accepted_host in [
+        "typesense.net",
+        "your-instance.typesense.net",
+        "tenant.region.typesense.net",
+        "TYPESENSE.NET",
+        "Your-Instance.Typesense.NET",
+    ] {
+        assert!(
+            super::strict_vendor_host_matches(accepted_host, CLOUD_SUFFIX),
+            "documented Typesense Cloud host must match: {accepted_host}"
+        );
+    }
+
+    for rejected_host in [
+        "eviltypesense.net",
+        "nottypesense.net",
+        "typesense.net.evil.test",
+        "typesense.com",
+        "tenant.typesense.com",
+        "typesense-net.example",
+        "typesense.net.",
+    ] {
+        assert!(
+            !super::strict_vendor_host_matches(rejected_host, CLOUD_SUFFIX),
+            "sibling-suffix host must not pass the label boundary: {rejected_host}"
+        );
+    }
+}
+
+#[test]
+#[serial(flapjack_outbound_url_policy)]
+fn typesense_endpoint_policy_accepts_public_cloud_hosts_and_pins_addresses() {
+    let _resolver = install_test_outbound_host_resolver(Arc::new(|host, port| {
+        assert_eq!(port, Some(443));
+        assert!(
+            host == "typesense.net" || host.ends_with(".typesense.net"),
+            "unexpected Typesense host admitted to resolver: {host}"
+        );
+        Some(vec!["8.8.8.8".parse().unwrap(), "1.1.1.1".parse().unwrap()])
+    }));
+
+    let target = super::vet_typesense_cloud_url_target("https://tenant.region.typesense.net")
+        .expect("documented Typesense Cloud endpoint should pass");
+
+    assert_eq!(target.host, "tenant.region.typesense.net");
+    assert_eq!(
+        target.socket_addrs(),
+        vec![
+            "8.8.8.8:443".parse().unwrap(),
+            "1.1.1.1:443".parse().unwrap()
+        ]
     );
 }

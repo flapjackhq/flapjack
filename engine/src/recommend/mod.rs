@@ -209,4 +209,60 @@ mod tests {
         assert_eq!(config.trending_window_days, 7);
         assert_eq!(config.max_recommendations_default, 30);
     }
+
+    #[test]
+    fn stage3_recommend_config_from_env_handles_negative_and_overflowing_numerics() {
+        let _env_guard = env_lock().lock().unwrap();
+        let _window_reset = EnvVarReset::set(TRENDING_WINDOW_DAYS_ENV_VAR, "-1");
+        let _max_results_reset =
+            EnvVarReset::set(MAX_RECOMMENDATIONS_DEFAULT_ENV_VAR, "18446744073709551616");
+
+        let config = RecommendConfig::from_env();
+
+        assert_eq!(
+            config.trending_window_days, 7,
+            "negative u64 env input must fall back to the default window"
+        );
+        assert_eq!(
+            config.max_recommendations_default, 30,
+            "overflowing u32 env input must fall back to the default max"
+        );
+    }
+
+    #[test]
+    fn stage3_recommend_config_from_env_clamps_max_results() {
+        let _env_guard = env_lock().lock().unwrap();
+        let _window_reset = EnvVarReset::remove(TRENDING_WINDOW_DAYS_ENV_VAR);
+        let _max_results_reset = EnvVarReset::set(MAX_RECOMMENDATIONS_DEFAULT_ENV_VAR, "999");
+
+        let config = RecommendConfig::from_env();
+
+        assert_eq!(config.trending_window_days, 7);
+        assert_eq!(config.max_recommendations_default, 30);
+    }
+
+    #[cfg(feature = "analytics")]
+    #[test]
+    fn stage3_parse_object_ids_preserves_multibyte_ids_and_rejects_malformed_rows() {
+        let encoded = serde_json::json!({
+            "object_ids": "[\"prod-é\",\"東京-2\"]"
+        });
+        assert_eq!(
+            super::parse_object_ids(&encoded),
+            vec!["prod-é".to_string(), "東京-2".to_string()]
+        );
+
+        let array = serde_json::json!({
+            "object_ids": ["用户-1", 42, "emoji-😀"]
+        });
+        assert_eq!(
+            super::parse_object_ids(&array),
+            vec!["用户-1".to_string(), "emoji-😀".to_string()]
+        );
+
+        let malformed = serde_json::json!({
+            "object_ids": "[\"unterminated\""
+        });
+        assert!(super::parse_object_ids(&malformed).is_empty());
+    }
 }

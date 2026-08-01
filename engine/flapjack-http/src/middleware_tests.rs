@@ -374,6 +374,44 @@ async fn wraps_plain_text_errors_into_algolia_json_shape() {
     );
 }
 
+#[tokio::test]
+async fn wraps_empty_request_timeout_into_canonical_json_shape() {
+    let app = Router::new()
+        .route("/timeout", get(|| async { StatusCode::REQUEST_TIMEOUT }))
+        .layer(axum::middleware::from_fn(ensure_json_errors));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/timeout")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+    let ct = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.contains("application/json"),
+        "expected JSON content-type, got: {ct}"
+    );
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({ "message": REQUEST_TIMEOUT_MESSAGE, "status": 408 })
+    );
+}
+
 /// Verify that responses already formatted as JSON errors pass through the middleware unchanged.
 #[tokio::test]
 async fn keeps_existing_json_error_response_unchanged() {

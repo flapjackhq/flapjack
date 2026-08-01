@@ -4,7 +4,7 @@ import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { baseProducts } from "../dashboard/tour/product-seed-data.mjs";
+import { baseProducts } from "./product-seed-data.mjs";
 import { listBatchFiles } from "./import_benchmark.mjs";
 
 const DEFAULT_COUNT = 100000;

@@ -290,6 +290,9 @@ Operational bounds:
 | `FLAPJACK_PORT` | Integer port | unset | CLI-only bind helper; used when `FLAPJACK_BIND_ADDR` is not set. |
 | `FLAPJACK_INSTALL` | Filesystem path | `$HOME/.flapjack` | Install root used by `flapjack uninstall`. |
 | `FLAPJACK_ENV` | `development` or `production` | `development` | Server environment mode; production enforces stricter auth requirements. |
+| `FLAPJACK_CONTENT_SECURITY_POLICY` | HTTP `Content-Security-Policy` header value | `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'` | Overrides the global response CSP for API, dashboard, and Swagger surfaces. Unset, empty, or invalid HTTP header values fail closed to the strict default. |
+| `FLAPJACK_REQUEST_TIMEOUT_SECS` | Positive integer seconds | `300` | Bounds admitted request execution. Unset, empty, invalid, or non-positive values fall back to `300`. The clock starts only after global concurrency admission, so queue wait is not bounded. |
+| `FLAPJACK_MAX_CONCURRENT_REQUESTS` | Positive integer request count | `1024` | Sets one global admitted-request cap shared across routes. Unset, empty, invalid, or non-positive values fall back to `1024`; excess requests queue in `poll_ready` rather than being shed. |
 | `FLAPJACK_GEOIP_DB` | Filesystem path | `${FLAPJACK_DATA_DIR}/GeoLite2-City.mmdb` | Path to GeoIP database file for IP geolocation. |
 | `FLAPJACK_SSL_EMAIL` | Email address | unset | Contact email for ACME/Let's Encrypt SSL automation. |
 | `FLAPJACK_PUBLIC_IP` | IPv4/IPv6 address | unset | Public IP used for IP-based ACME certificate issuance. |
