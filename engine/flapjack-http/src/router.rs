@@ -5,26 +5,27 @@ use std::time::Duration;
 
 use axum::{
     extract::{DefaultBodyLimit, Extension},
-    http::{header, HeaderName, HeaderValue, Request},
+    http::{header, HeaderName, HeaderValue, Method, Request, StatusCode},
     middleware,
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Router,
 };
 use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
-use tower_http::timeout::TimeoutLayer;
 
 use crate::auth::{
-    authenticate_and_authorize, request_application_id, AuthenticatedAppId, KeyStore, RateLimiter,
+    authenticate_and_authorize, request_application_id,
+    session::{DashboardSessionStore, SessionStoreError},
+    AuthenticatedAppId, KeyStore, RateLimiter, ReplicationPeerCredential,
 };
 use crate::handlers;
 use crate::handlers::analytics;
 use crate::handlers::insights::GdprDeleteState;
 use crate::handlers::migration::{
     acknowledge_algolia_migration_http, cancel_algolia_migration_http, cancel_bulk_replace_http,
-    get_algolia_migration_status_http, get_bulk_replace_status_http,
+    get_algolia_migration_status_http, get_bulk_replace_status_http, list_source_indexes_http,
     preview_algolia_migration_http, resume_algolia_migration_http, submit_algolia_migration_http,
     submit_bulk_replace_http, submit_privacy_scrub_http, AsyncMigrationSourceProvider,
 };
@@ -53,6 +54,7 @@ use utoipa_swagger_ui::SwaggerUi;
 pub struct RouterConfig {
     pub cors_mode: CorsMode,
     pub disable_dashboard: bool,
+    pub replication_api_key: Option<String>,
 }
 
 pub(crate) const DEFAULT_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
@@ -62,6 +64,8 @@ const PERMISSIONS_POLICY: HeaderName = HeaderName::from_static("permissions-poli
 const PERMISSIONS_POLICY_VALUE: &str = "camera=(), microphone=(), geolocation=()";
 const REQUEST_TIMEOUT_SECS_ENV: &str = "FLAPJACK_REQUEST_TIMEOUT_SECS";
 const MAX_CONCURRENT_REQUESTS_ENV: &str = "FLAPJACK_MAX_CONCURRENT_REQUESTS";
+const BULK_REPLACE_UPLOAD_PATH: &str = "/1/migrations/bulk-replace";
+const BULK_REPLACE_TIMEOUT_MULTIPLIER: u32 = 6;
 pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 pub(crate) const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 1024;
 #[cfg(feature = "fault-injection")]
@@ -134,9 +138,14 @@ fn build_router_with_resource_bounds(
     config: RouterConfig,
     resource_bounds: ResourceBounds,
 ) -> Router {
-    let auth_enabled = key_store.is_some();
+    let authentication = key_store.clone().map(|key_store| {
+        AuthenticationOwners::open(key_store, data_dir)
+            .unwrap_or_else(|error| panic!("failed to open dashboard session store: {error}"))
+    });
+    let auth_enabled = authentication.is_some();
     let app = Router::new()
         .merge(build_health_routes(state.clone()))
+        .merge(build_dashboard_session_routes(auth_enabled))
         .merge(build_key_routes(key_store.clone()))
         .merge(build_protected_routes(
             state.clone(),
@@ -166,9 +175,41 @@ fn build_router_with_resource_bounds(
         app,
         state,
         trusted_proxy_matcher,
-        key_store,
+        authentication,
         &config,
         resource_bounds,
+    )
+}
+
+/// The credential owners the auth layer needs, held together so the layer can never be
+/// applied with one of them missing — a half-configured pair would silently drop
+/// authentication for every route rather than fail loudly.
+struct AuthenticationOwners {
+    key_store: Arc<KeyStore>,
+    session_store: Arc<DashboardSessionStore>,
+}
+
+impl AuthenticationOwners {
+    /// Dashboard sessions persist under the data directory alongside the rest of the
+    /// single-binary state, so a restart does not log the operator out. An unopenable
+    /// store fails startup rather than degrading to sessions that vanish on restart.
+    fn open(key_store: Arc<KeyStore>, data_dir: &Path) -> Result<Self, SessionStoreError> {
+        let session_store = DashboardSessionStore::open(data_dir, &key_store.admin_key_value())?;
+        Ok(Self {
+            key_store,
+            session_store: Arc::new(session_store),
+        })
+    }
+}
+
+fn build_dashboard_session_routes(auth_enabled: bool) -> Router {
+    if !auth_enabled {
+        return Router::new();
+    }
+    Router::new().route(
+        "/1/dashboard/session",
+        post(handlers::dashboard_session::exchange_dashboard_session)
+            .delete(handlers::dashboard_session::logout_dashboard_session),
     )
 }
 
@@ -244,6 +285,13 @@ fn register_source_migration_routes(mut router: Router<Arc<AppState>>) -> Router
             .route(
                 &format!("{job_path}/resume"),
                 post(resume_algolia_migration_http).layer(Extension(source_provider)),
+            )
+            // The literal `list-indexes` segment sits beside the `:job_id` param
+            // route; the router prefers the static segment, so job status keeps
+            // resolving. `/1/migrations/` already carries the admin ACL.
+            .route(
+                &format!("{provider_path}/list-indexes"),
+                post(list_source_indexes_http).layer(Extension(source_provider)),
             );
     }
     router
@@ -830,7 +878,7 @@ fn apply_middleware(
     app: Router,
     state: Arc<AppState>,
     trusted_proxy_matcher: Arc<TrustedProxyMatcher>,
-    key_store: Option<Arc<KeyStore>>,
+    authentication: Option<AuthenticationOwners>,
     config: &RouterConfig,
     resource_bounds: ResourceBounds,
 ) -> Router {
@@ -862,19 +910,29 @@ fn apply_middleware(
     // Auth layer — only applied when authentication is enabled (KeyStore present).
     // In open mode (--no-auth), the layer is omitted entirely so requests never
     // enter authenticate_and_authorize and never depend on RateLimiter/TrustedProxyMatcher.
-    let app = if let Some(ks) = key_store {
+    let app = if let Some(AuthenticationOwners {
+        key_store: ks,
+        session_store,
+    }) = authentication
+    {
         let rate_limiter = RateLimiter::new();
         let trusted_proxies = trusted_proxy_matcher.clone();
         let disable_dashboard = config.disable_dashboard;
+        let replication_peer_credential =
+            ReplicationPeerCredential::from_optional_secret(config.replication_api_key.clone());
         let auth_layer = middleware::from_fn(
             move |mut request: axum::extract::Request, next: middleware::Next| {
                 let ks = ks.clone();
                 let rl = rate_limiter.clone();
                 let tp = trusted_proxies.clone();
+                let peer_credential = replication_peer_credential.clone();
+                let session_store = session_store.clone();
                 async move {
                     request.extensions_mut().insert(ks);
                     request.extensions_mut().insert(tp);
                     request.extensions_mut().insert(rl);
+                    request.extensions_mut().insert(peer_credential);
+                    request.extensions_mut().insert(session_store);
                     authenticate_and_authorize(request, next, disable_dashboard).await
                 }
             },
@@ -889,13 +947,15 @@ fn apply_middleware(
         .layer(DefaultBodyLimit::max(max_body_mb * 1024 * 1024))
         .layer(middleware::from_fn(normalize_content_type))
         // GlobalConcurrencyLimitLayer queues in poll_ready with one shared
-        // semaphore across cloned routes. TimeoutLayer delegates poll_ready and
-        // starts its clock in call, so it bounds admitted request execution, not
-        // queue wait. This stage intentionally does not shed load.
+        // semaphore across cloned routes. The request timeout starts inside the
+        // call below, so it bounds admitted request execution, not queue wait.
+        // This stage intentionally does not shed load.
         .layer(GlobalConcurrencyLimitLayer::new(
             resource_bounds.max_concurrent_requests,
         ))
-        .layer(TimeoutLayer::new(resource_bounds.request_timeout))
+        .layer(middleware::from_fn(move |request, next| {
+            enforce_request_timeout(request, next, resource_bounds.request_timeout)
+        }))
         .layer(middleware::from_fn(ensure_json_errors))
         .layer(build_cors_layer(&config.cors_mode))
         .layer(middleware::from_fn(allow_private_network))
@@ -907,6 +967,28 @@ fn apply_middleware(
         .layer(middleware::from_fn(move |request, next| {
             insert_security_headers(request, next, security_header_policy.clone())
         }))
+}
+
+async fn enforce_request_timeout(
+    request: Request<axum::body::Body>,
+    next: middleware::Next,
+    timeout: Duration,
+) -> Response {
+    // A measured 1M-record bulk-replace import takes 1,243 seconds and must keep
+    // its upload body attached until durable spool EOF. Six times the configured
+    // request timeout gives the default upload 1,800 seconds while retaining a
+    // finite deadline against authenticated slow-upload resource exhaustion.
+    let timeout =
+        if request.method() == Method::POST && request.uri().path() == BULK_REPLACE_UPLOAD_PATH {
+            timeout.saturating_mul(BULK_REPLACE_TIMEOUT_MULTIPLIER)
+        } else {
+            timeout
+        };
+
+    match tokio::time::timeout(timeout, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
+    }
 }
 
 #[cfg(test)]

@@ -18,22 +18,20 @@ interface ConnectionDialogProps {
 }
 
 export function ConnectionDialog({ open, onOpenChange }: ConnectionDialogProps) {
-  const { apiKey, appId, setApiKey, setAppId, clearAuth } = useAuth();
-  const [keyInput, setKeyInput] = useState(apiKey || '');
+  const { appId, login, logout, setAppId } = useAuth();
+  const [keyInput, setKeyInput] = useState('');
   const [appIdInput, setAppIdInput] = useState(appId || 'flapjack');
 
-  const handleSave = useCallback(() => {
+  const handleSave = useCallback(async () => {
+    await logout();
+    const nextAppId = appIdInput.trim() || 'flapjack';
+    setAppId(nextAppId);
     if (keyInput.trim()) {
-      setApiKey(keyInput.trim());
-    } else {
-      clearAuth();
-    }
-    if (appIdInput.trim()) {
-      setAppId(appIdInput.trim());
+      await login(keyInput.trim());
     }
     onOpenChange(false);
     window.location.reload();
-  }, [keyInput, appIdInput, setApiKey, setAppId, clearAuth, onOpenChange]);
+  }, [keyInput, appIdInput, login, logout, setAppId, onOpenChange]);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>

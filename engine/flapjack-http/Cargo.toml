@@ -1,6 +1,6 @@
 [package]
 name = "flapjack-http"
-version = "1.0.10"
+version = "1.0.11"
 edition = "2021"
 
 [features]
@@ -21,11 +21,16 @@ flapjack-replication = { path = "../flapjack-replication" }
 flapjack-ssl = { path = "../flapjack-ssl" }
 
 axum = "0.7"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio"] }
 dashmap = "6.0"
 tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }
 tokio-stream = "0.1"
+tokio-rustls = "0.26"
 tower = { version = "0.4", features = ["util", "limit"] }
 tower-http = { version = "0.5", features = ["trace", "cors", "timeout", "catch-panic"] }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pki-types = { version = "=1.14.1", features = ["std"] }
 rust-embed = "8"
 mime_guess = "2"
 serde = { version = "1.0", features = ["derive"] }
@@ -66,11 +71,13 @@ aws-config = "1"
 aws-sdk-sesv2 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a"] }
 
 [dev-dependencies]
-flapjack = { path = "..", default-features = false, features = ["test-support"] }
+flapjack = { path = "..", default-features = false, features = ["test-support", "fault-injection"] }
 tempfile = "3"
+tokio = { version = "1.35", features = ["test-util"] }
 wiremock = "0.6"
 tokio-test = "0.4"
 # Serializes hydration-path integration tests that share the
 # FLAPJACK_AI_ALLOW_LOCAL_URLS env var so they don't race on the SSRF
 # opt-in. Used in handlers/search/tests/auto_embed_integration_tests.rs.
 serial_test = "3.0"
+rcgen = "0.13"

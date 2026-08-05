@@ -306,6 +306,13 @@ fn save_settings(state: &Arc<AppState>, index_name: &str, settings: &IndexSettin
     state.manager.invalidate_settings_cache(index_name);
 }
 
+fn text_searchable_settings() -> IndexSettings {
+    IndexSettings {
+        searchable_attributes: Some(vec!["name".to_string()]),
+        ..Default::default()
+    }
+}
+
 #[cfg(feature = "vector-search")]
 fn user_provided_embedder_settings(dimensions: usize) -> IndexSettings {
     let mut embedders = HashMap::new();
@@ -320,6 +327,13 @@ fn user_provided_embedder_settings(dimensions: usize) -> IndexSettings {
         embedders: Some(embedders),
         ..Default::default()
     }
+}
+
+#[cfg(feature = "vector-search")]
+fn embedder_and_text_searchable_settings(dimensions: usize) -> IndexSettings {
+    let mut settings = text_searchable_settings();
+    settings.embedders = user_provided_embedder_settings(dimensions).embedders;
+    settings
 }
 
 /// Build a `Document` with a name field and an optional 3-dimensional vector embedding under the `default` embedder key.
@@ -343,6 +357,80 @@ fn make_vector_doc(id: &str, name: &str, vector: Option<[f32; 3]>) -> Document {
         id: id.to_string(),
         fields,
     }
+}
+
+/// Build a text-only document from the named fields used by recommendation fixtures.
+fn make_text_doc(id: &str, fields: &[(&str, &str)]) -> Document {
+    Document {
+        id: id.to_string(),
+        fields: fields
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), FieldValue::Text((*value).to_string())))
+            .collect(),
+    }
+}
+
+const LOOKING_SIMILAR_TEXT_CORPUS: &[(&str, &str)] = &[
+    (
+        "seed",
+        "Wireless Bluetooth Headphones with active noise cancelling",
+    ),
+    (
+        "near",
+        "Wireless Bluetooth Headphones with active noise cancelling travel",
+    ),
+    ("mid", "Wireless Bluetooth Headphones"),
+    ("zero_overlap", "Ceramic coffee grinder"),
+];
+
+fn shared_vocabulary_text_docs() -> Vec<Document> {
+    LOOKING_SIMILAR_TEXT_CORPUS
+        .iter()
+        .map(|(id, name)| make_text_doc(id, &[("name", name)]))
+        .collect()
+}
+
+#[cfg(feature = "vector-search")]
+fn zero_overlap_nearest_vector_docs() -> Vec<Document> {
+    LOOKING_SIMILAR_TEXT_CORPUS
+        .iter()
+        .map(|(id, name)| {
+            let vector = match *id {
+                "seed" => Some([1.0, 0.0, 0.0]),
+                "zero_overlap" => Some([0.99, 0.01, 0.0]),
+                "near" => Some([0.0, 1.0, 0.0]),
+                "mid" => Some([0.0, 0.0, 1.0]),
+                _ => None,
+            };
+            make_vector_doc(id, name, vector)
+        })
+        .collect()
+}
+
+async fn text_looking_similar_app(tmp: &TempDir) -> Router {
+    let state = crate::test_helpers::TestStateBuilder::new(tmp).build_shared();
+    insert_recommend_docs(&state, "products", shared_vocabulary_text_docs()).await;
+    save_settings(&state, "products", &text_searchable_settings());
+    recommend_router(state)
+}
+
+fn assert_term_fallback_hits(body: &serde_json::Value, expected_object_ids: Vec<&str>) {
+    let hits = body["results"][0]["hits"].as_array().expect("hits array");
+    let object_ids = hits
+        .iter()
+        .map(|hit| hit["objectID"].as_str().expect("objectID"))
+        .collect::<Vec<_>>();
+    assert!(!object_ids.contains(&"seed"));
+    assert!(!object_ids.contains(&"zero_overlap"));
+    assert_eq!(object_ids, expected_object_ids);
+
+    let scores = hits
+        .iter()
+        .map(|hit| hit["_score"].as_u64().expect("numeric _score"))
+        .collect::<Vec<_>>();
+    assert_eq!(scores.first().copied(), Some(100));
+    assert!(scores.windows(2).all(|pair| pair[0] >= pair[1]));
+    assert!(scores.iter().all(|score| *score <= 100));
 }
 
 /// Build a conversion `InsightEvent` with the given index, user token, object ID, event name, and timestamp.
@@ -1926,25 +2014,33 @@ async fn recommend_looking_similar_applies_threshold_and_max_recommendations() {
     assert!(hits[0]["_score"].as_u64().unwrap() >= 80);
 }
 
-/// Verify that looking-similar returns empty hits when the seed document has no vector embedding.
+/// Catch a configured vector index suppressing term fallback when the seed has no embedding.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
-async fn recommend_looking_similar_seed_without_vector_returns_empty_hits() {
+async fn recommend_looking_similar_seed_without_vector_falls_back_to_term_similarity() {
     let tmp = TempDir::new().unwrap();
     let state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
     let app = recommend_router(state.clone());
     state.manager.create_tenant("products").unwrap();
-    save_settings(&state, "products", &user_provided_embedder_settings(3));
+    let settings = embedder_and_text_searchable_settings(3);
+    save_settings(&state, "products", &settings);
 
     state
         .manager
         .add_documents_sync(
             "products",
-            vec![
-                make_vector_doc("seed", "Seed", None),
-                make_vector_doc("near", "Near", Some([0.99, 0.01, 0.0])),
-                make_vector_doc("far", "Far", Some([0.0, 1.0, 0.0])),
-            ],
+            LOOKING_SIMILAR_TEXT_CORPUS
+                .iter()
+                .map(|(id, name)| {
+                    let vector = match *id {
+                        "seed" => None,
+                        "near" => Some([0.99, 0.01, 0.0]),
+                        "mid" => Some([0.7, 0.3, 0.0]),
+                        _ => Some([0.0, 1.0, 0.0]),
+                    };
+                    make_vector_doc(id, name, vector)
+                })
+                .collect(),
         )
         .await
         .unwrap();
@@ -1963,26 +2059,14 @@ async fn recommend_looking_similar_seed_without_vector_returns_empty_hits() {
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["results"][0]["hits"], serde_json::json!([]));
+    assert_term_fallback_hits(&body, vec!["near", "mid"]);
 }
 
-/// Verify that looking-similar returns empty hits when the index has no embedder configuration.
-#[cfg(feature = "vector-search")]
+/// Catch a text-only index returning empty hits merely because no vectors are configured.
 #[tokio::test]
-async fn recommend_looking_similar_index_without_vectors_returns_empty_hits() {
+async fn recommend_looking_similar_index_without_vectors_falls_back_to_term_similarity() {
     let tmp = TempDir::new().unwrap();
-    let state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
-    let app = recommend_router(state.clone());
-
-    insert_recommend_docs(
-        &state,
-        "products",
-        vec![
-            make_vector_doc("seed", "Seed", None),
-            make_vector_doc("other", "Other", None),
-        ],
-    )
-    .await;
+    let app = text_looking_similar_app(&tmp).await;
 
     let (status, body) = post_recommend(
         &app,
@@ -1998,7 +2082,157 @@ async fn recommend_looking_similar_index_without_vectors_returns_empty_hits() {
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["results"][0]["hits"], serde_json::json!([]));
+    assert_term_fallback_hits(&body, vec!["near", "mid"]);
+}
+
+/// Catch default-feature binaries silently returning no capped looking-similar recommendations.
+#[tokio::test]
+async fn recommend_looking_similar_returns_hits_without_vector_search_feature() {
+    let tmp = TempDir::new().unwrap();
+    let app = text_looking_similar_app(&tmp).await;
+
+    let (status, body) = post_recommend(
+        &app,
+        serde_json::json!({
+            "requests": [{
+                "indexName": "products",
+                "model": "looking-similar",
+                "objectID": "seed",
+                "threshold": 0,
+                "maxRecommendations": 1
+            }]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_term_fallback_hits(&body, vec!["near"]);
+}
+
+/// Catch a strict vector threshold falling through to term fallback instead of
+/// returning the surviving vector hit.
+#[cfg(feature = "vector-search")]
+#[tokio::test]
+async fn recommend_looking_similar_strict_threshold_does_not_fall_back() {
+    let tmp = TempDir::new().unwrap();
+    let state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
+    let app = recommend_router(state.clone());
+    state.manager.create_tenant("products").unwrap();
+    save_settings(&state, "products", &user_provided_embedder_settings(3));
+
+    state
+        .manager
+        .add_documents_sync("products", zero_overlap_nearest_vector_docs())
+        .await
+        .unwrap();
+
+    let (status, body) = post_recommend(
+        &app,
+        serde_json::json!({
+            "requests": [{
+                "indexName": "products",
+                "model": "looking-similar",
+                "objectID": "seed",
+                "threshold": 100
+            }]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let hits = body["results"][0]["hits"].as_array().expect("hits array");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["objectID"].as_str(), Some("zero_overlap"));
+    assert_eq!(hits[0]["_score"].as_u64(), Some(100));
+
+    let object_ids = hits
+        .iter()
+        .map(|hit| hit["objectID"].as_str().expect("objectID"))
+        .collect::<Vec<_>>();
+    assert!(!object_ids.contains(&"near"));
+    assert!(!object_ids.contains(&"mid"));
+}
+
+/// Catch an empty vector candidate set falling through to term fallback; the
+/// same text corpus returns ["near", "mid"] through the term fallback.
+#[cfg(feature = "vector-search")]
+#[tokio::test]
+async fn recommend_looking_similar_seed_only_vector_index_does_not_fall_back() {
+    let tmp = TempDir::new().unwrap();
+    let state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
+    let app = recommend_router(state.clone());
+    state.manager.create_tenant("products").unwrap();
+    let settings = embedder_and_text_searchable_settings(3);
+    save_settings(&state, "products", &settings);
+
+    state
+        .manager
+        .add_documents_sync(
+            "products",
+            LOOKING_SIMILAR_TEXT_CORPUS
+                .iter()
+                .map(|(id, name)| {
+                    let vector = (*id == "seed").then_some([1.0, 0.0, 0.0]);
+                    make_vector_doc(id, name, vector)
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+
+    let (status, body) = post_recommend(
+        &app,
+        serde_json::json!({
+            "requests": [{
+                "indexName": "products",
+                "model": "looking-similar",
+                "objectID": "seed",
+                "threshold": 0
+            }]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let hits = body["results"][0]["hits"].as_array().expect("hits array");
+    assert_eq!(hits, &Vec::<serde_json::Value>::new());
+}
+
+/// Catch `compute_looking_similar` probing vectors before `get_or_load`; unlike
+/// manager/tests.rs:5875, this proves the recommend endpoint uses the loaded
+/// vector index instead of term fallback for a cold tenant.
+#[cfg(feature = "vector-search")]
+#[tokio::test]
+async fn recommend_looking_similar_cold_tenant_uses_vector_path() {
+    let tmp = TempDir::new().unwrap();
+    let warm_state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
+    warm_state.manager.create_tenant("products").unwrap();
+    save_settings(&warm_state, "products", &user_provided_embedder_settings(3));
+    warm_state
+        .manager
+        .add_documents_sync("products", zero_overlap_nearest_vector_docs())
+        .await
+        .unwrap();
+
+    let cold_state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
+    let app = recommend_router(cold_state);
+
+    let (status, body) = post_recommend(
+        &app,
+        serde_json::json!({
+            "requests": [{
+                "indexName": "products",
+                "model": "looking-similar",
+                "objectID": "seed",
+                "threshold": 0
+            }]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let hits = body["results"][0]["hits"].as_array().expect("hits array");
+    assert_eq!(hits[0]["objectID"].as_str(), Some("zero_overlap"));
 }
 
 // ── C6.4: Recommend rules application ───────────────────────────────

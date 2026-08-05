@@ -1,0 +1,73 @@
+unknown option -ext
+usage: x509 [-C] [-addreject arg] [-addtrust arg] [-alias] [-CA file]
+    [-CAcreateserial] [-CAform der | pem] [-CAkey file]
+    [-CAkeyform der | pem] [-CAserial file] [-certopt option]
+    [-checkend arg] [-clrext] [-clrreject] [-clrtrust] [-dates]
+    [-days arg] [-email] [-enddate] [-extensions section]
+    [-extfile file] [-fingerprint] [-hash] [-in file]
+    [-inform der | net | pem] [-issuer] [-issuer_hash]
+    [-issuer_hash_old] [-keyform der | pem] [-md5 | -sha1]
+    [-modulus] [-nameopt option] [-next_serial] [-noout]
+    [-ocsp_uri] [-ocspid] [-out file]
+    [-outform der | net | pem] [-passin arg] [-pubkey]
+    [-purpose] [-req] [-serial] [-set_serial n] [-setalias arg]
+    [-signkey file] [-sigopt nm:v] [-startdate] [-subject]
+    [-subject_hash] [-subject_hash_old] [-text] [-trustout]
+    [-x509toreq]
+
+ -C                 Convert the certificate into C code
+ -addreject arg     Reject certificate for a given purpose
+ -addtrust arg      Trust certificate for a given purpose
+ -alias             Output certificate alias
+ -CA file           CA certificate in PEM format unless -CAform is specified
+ -CAcreateserial    Create serial number file if it does not exist
+ -CAform fmt        CA format - default PEM
+ -CAkey file        CA key in PEM format unless -CAkeyform is specified
+                    if omitted, the key is assumed to be in the CA file
+ -CAkeyform fmt     CA key format - default PEM
+ -CAserial file     Serial file
+ -certopt option    Various certificate text options
+ -checkend arg      Check whether the cert expires in the next arg seconds
+                    exit 1 if so, 0 if not
+ -clrext            Clear all extensions
+ -clrreject         Clear all rejected purposes
+ -clrtrust          Clear all trusted purposes
+ -dates             Both Before and After dates
+ -days arg          How long till expiry of a signed certificate - def 30 days
+ -email             Print email address(es)
+ -enddate           Print notAfter field
+ -extensions section
+                    Section from config file with X509V3 extensions to add
+ -extfile file      Configuration file with X509V3 extensions to add
+ -fingerprint       Print the certificate fingerprint
+ -hash              Synonym for -subject_hash
+ -in file           Input file - default stdin
+ -inform fmt        Input format - default PEM (one of DER, NET or PEM)
+ -issuer            Print issuer name
+ -issuer_hash       Print issuer hash value
+ -issuer_hash_old   Print old-style (MD5) issuer hash value
+ -keyform fmt       Private key format - default PEM
+ -modulus           Print the RSA key modulus
+ -nameopt option    Various certificate name options
+ -next_serial       Print the next serial number
+ -noout             No certificate output
+ -ocsp_uri          Print OCSP Responder URL(s)
+ -ocspid            Print OCSP hash values for the subject name and public key
+ -out file          Output file - default stdout
+ -outform fmt       Output format - default PEM (one of DER, NET or PEM)
+ -passin src        Private key password source
+ -pubkey            Output the public key
+ -purpose           Print out certificate purposes
+ -req               Input is a certificate request, sign and output
+ -serial            Print serial number value
+ -set_serial n      Serial number to use
+ -setalias arg      Set certificate alias
+ -signkey file      Self sign cert with arg
+ -sigopt nm:v       Various signature algorithm options
+ -startdate         Print notBefore field
+ -subject           Print subject name
+ -subject_hash      Print subject hash value
+ -subject_hash_old  Print old-style (MD5) subject hash value
+ -text              Print the certificate in text form
+ -trustout          Output a trusted certificate
+ -x509toreq         Output a certification request object

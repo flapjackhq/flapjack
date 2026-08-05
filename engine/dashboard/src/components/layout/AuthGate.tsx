@@ -19,27 +19,22 @@ type ValidationState = 'idle' | 'validating' | 'valid' | 'invalid';
  * @param children - Application content to render once authenticated
  */
 export function AuthGate({ children }: { children: React.ReactNode }) {
-  const { apiKey, clearAuth } = useAuth();
+  const { setSessionAuthenticated } = useAuth();
   const [needsAuth, setNeedsAuth] = useState<boolean | null>(null);
 
-  // On mount, validate the stored key (or check if auth is required).
-  // This catches stale keys from previous sessions when the server key changed.
+  // On mount, validate the HttpOnly session (or check if auth is required).
   useEffect(() => {
     const headers: Record<string, string> = {
       'x-algolia-application-id': 'flapjack',
       'Content-Type': 'application/json',
     };
-    if (apiKey) {
-      headers['x-algolia-api-key'] = apiKey;
-    }
-
     fetch('/1/indexes', { headers })
       .then((res) => {
         if (res.ok) {
+          setSessionAuthenticated(true);
           setNeedsAuth(false);
         } else if (res.status === 403) {
-          // Key is invalid or missing — clear stale key and show auth screen
-          if (apiKey) clearAuth();
+          setSessionAuthenticated(false);
           setNeedsAuth(true);
         }
       })
@@ -47,7 +42,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
         // Server unreachable — show auth gate since we can't tell
         setNeedsAuth(true);
       });
-  }, [apiKey, clearAuth]);
+  }, [setSessionAuthenticated]);
 
   // Still checking
   if (needsAuth === null) {
@@ -59,7 +54,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
   }
 
   if (needsAuth) {
-    return <AuthScreen />;
+    return <AuthScreen onAuthenticated={() => setNeedsAuth(false)} />;
   }
 
   return <>{children}</>;
@@ -70,8 +65,8 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
  * 
  * Submits the key to the server's indexes endpoint for validation. On success, persists the key via the auth store after a brief visual confirmation delay. Displays contextual help for locating or resetting the key.
  */
-function AuthScreen() {
-  const { setApiKey } = useAuth();
+function AuthScreen({ onAuthenticated }: { onAuthenticated: () => void }) {
+  const { login } = useAuth();
   const [keyInput, setKeyInput] = useState('');
   const [validation, setValidation] = useState<ValidationState>('idle');
   const [errorMessage, setErrorMessage] = useState('');
@@ -86,22 +81,9 @@ function AuthScreen() {
       setErrorMessage('');
 
       try {
-        // Validate the key by calling the keys endpoint (admin-only)
-        const res = await fetch('/1/indexes', {
-          headers: {
-            'x-algolia-application-id': 'flapjack',
-            'x-algolia-api-key': key,
-            'Content-Type': 'application/json',
-          },
-        });
-
-        if (res.ok) {
+        if (await login(key)) {
           setValidation('valid');
-          // Small delay so user sees the success state, then save key
-          // (zustand update will re-render AuthGate and show the dashboard)
-          setTimeout(() => {
-            setApiKey(key);
-          }, 400);
+          setTimeout(onAuthenticated, 400);
         } else {
           setValidation('invalid');
           setErrorMessage('Invalid API key. Check your terminal for the correct key.');
@@ -111,7 +93,7 @@ function AuthScreen() {
         setErrorMessage('Could not connect to server.');
       }
     },
-    [keyInput, setApiKey]
+    [keyInput, login, onAuthenticated]
   );
 
   return (

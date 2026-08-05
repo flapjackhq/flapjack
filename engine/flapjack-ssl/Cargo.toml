@@ -1,6 +1,6 @@
 [package]
 name = "flapjack-ssl"
-version = "1.0.10"
+version = "1.0.11"
 edition = "2021"
 
 [dependencies]
@@ -11,6 +11,9 @@ tracing = "0.1"
 once_cell = "1.19"
 dashmap = "6.0"
 instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
+# Direct dependency so this crate can install the rustls provider instant-acme
+# needs; see acme::install_default_crypto_provider.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rcgen = "0.13"
 x509-parser = "0.16"
 thiserror = "1.0"

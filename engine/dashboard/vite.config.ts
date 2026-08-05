@@ -71,6 +71,10 @@ export default defineConfig(({ command }) => ({
       '/internal': BACKEND_TARGET,
       '/api-docs': BACKEND_TARGET,
       '/swagger-ui': BACKEND_TARGET,
+      '/__flapjack_metrics': {
+        target: BACKEND_TARGET,
+        rewrite: () => '/metrics',
+      },
     },
   },
 }));

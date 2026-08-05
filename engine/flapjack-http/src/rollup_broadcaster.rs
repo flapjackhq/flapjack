@@ -332,7 +332,8 @@ mod tests {
                 addr: "http://127.0.0.1:19999".to_string(), // nothing listening
             }],
         };
-        let cluster = AnalyticsClusterClient::new(&node_cfg).expect("cluster client should build");
+        let cluster =
+            AnalyticsClusterClient::new(&node_cfg, None).expect("cluster client should build");
 
         // Should return without error even though peer is unreachable,
         // because with no indexes there's nothing to push.
@@ -363,7 +364,8 @@ mod tests {
                 addr: "http://127.0.0.1:19999".to_string(),
             }],
         };
-        let cluster = AnalyticsClusterClient::new(&node_cfg).expect("cluster client should build");
+        let cluster =
+            AnalyticsClusterClient::new(&node_cfg, None).expect("cluster client should build");
 
         broadcast_rollups_for_indexes(&engine, &cluster, "local", &[]).await;
     }

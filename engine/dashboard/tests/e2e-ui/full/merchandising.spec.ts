@@ -142,6 +142,18 @@ async function findRuleByDescriptionPrefix(
   return null;
 }
 
+async function requireRuleByDescriptionPrefix(
+  request: APIRequestContext,
+  indexName: string,
+  descriptionPrefix: string,
+): Promise<MerchRuleSnapshot> {
+  const persistedRule = await findRuleByDescriptionPrefix(request, indexName, descriptionPrefix);
+  if (!persistedRule) {
+    throw new Error(`Expected a persisted rule with description prefix "${descriptionPrefix}".`);
+  }
+  return persistedRule;
+}
+
 test.describe('Merchandising Studio', () => {
   test('deterministic lifecycle preview supports pin/hide/move and reset restores baseline order', async ({ page, request }) => {
     const lifecycleFixture = await createIsolatedMerchandisingLifecycleScenario(request, 'preview-lifecycle');
@@ -214,15 +226,11 @@ test.describe('Merchandising Studio', () => {
       await expect(savedRuleCard).toContainText('1 pinned');
       await expect(savedRuleCard).toContainText('1 hidden');
 
-      let persistedRule: MerchRuleSnapshot | null = null;
       await expect.poll(async () => {
-        persistedRule = await findRuleByDescriptionPrefix(request, lifecycleFixture.indexName, descriptionPrefix);
-        return persistedRule?.objectID ?? '';
+        return (await findRuleByDescriptionPrefix(request, lifecycleFixture.indexName, descriptionPrefix))?.objectID ?? '';
       }, { timeout: 15_000 }).not.toBe('');
 
-      if (!persistedRule) {
-        throw new Error(`Expected a persisted rule with description prefix "${descriptionPrefix}".`);
-      }
+      const persistedRule = await requireRuleByDescriptionPrefix(request, lifecycleFixture.indexName, descriptionPrefix);
 
       expect(persistedRule.description).toContain(descriptionPrefix);
       expect(persistedRule.conditionPattern).toBe(lifecycleFixture.searchQuery);

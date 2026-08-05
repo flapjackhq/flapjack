@@ -374,7 +374,10 @@ start_server() {
   elif [ "$label" = "ha" ]; then
     (
       export FLAPJACK_NODE_ID="mig5-live-proof"
-      export FLAPJACK_PEERS="migration-peer=http://10.0.0.2:7700"
+      export FLAPJACK_PEERS="migration-peer=https://10.0.0.2:7700"
+      # Peers with no peer credential: startup now requires
+      # FLAPJACK_REPLICATION_API_KEY unless this override is set.
+      export FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS=1
       export FLAPJACK_STARTUP_CATCHUP_STRICT=0
       export FLAPJACK_STARTUP_CATCHUP_TIMEOUT_SECS=2
       export FLAPJACK_ADMIN_KEY="$ADMIN_KEY"

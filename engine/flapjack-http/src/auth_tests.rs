@@ -44,9 +44,15 @@ mod batch_acl_tests;
 mod key_store_tests;
 #[path = "auth_tests/middleware_tests.rs"]
 mod middleware_tests;
+#[path = "auth_tests/peer_boundary_route_contract.rs"]
+pub(crate) mod peer_boundary_route_contract;
 #[path = "auth_tests/restrict_sources_tests.rs"]
 mod restrict_sources_tests;
 #[path = "auth_tests/route_acl_tests.rs"]
 mod route_acl_tests;
 #[path = "auth_tests/secured_key_tests.rs"]
 mod secured_key_tests;
+#[path = "auth_tests/session_store_tests.rs"]
+mod session_store_tests;
+#[path = "auth_tests/session_transport_tests.rs"]
+mod session_transport_tests;

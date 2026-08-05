@@ -16,6 +16,7 @@ export default defineConfig({
       'playwright-webserver.test.ts',
       'vite.config.test.ts',
       'playwright.config.test.ts',
+      'scripts/**/*.test.mjs',
       'tests/global-setup.test.ts',
       'tests/fixtures/**/*.test.ts',
     ],

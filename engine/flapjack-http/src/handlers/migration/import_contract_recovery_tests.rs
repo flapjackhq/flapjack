@@ -335,6 +335,110 @@ async fn meilisearch_source_import_recovery_fails_closed_without_resume_state() 
 }
 
 #[tokio::test]
+async fn legacy_source_import_recovery_settles_running_export_failed() {
+    assert_legacy_source_import_recovery_settles_failed(LegacyExportLifecycle::Running).await;
+}
+
+#[tokio::test]
+async fn legacy_source_import_recovery_settles_interrupted_export_failed() {
+    assert_legacy_source_import_recovery_settles_failed(LegacyExportLifecycle::Interrupted).await;
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LegacyExportLifecycle {
+    Running,
+    Interrupted,
+}
+
+/// A spool written before `spool_format_version` existed can neither be resumed nor
+/// read as accepted, so restart recovery must settle it terminally instead of
+/// advertising a resume that every later claim rejects.
+async fn assert_legacy_source_import_recovery_settles_failed(lifecycle: LegacyExportLifecycle) {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let spool = spool_for_state(&state);
+    let job_uuid = uuid::Uuid::new_v4();
+    let source_identity_digest = hex::encode(Sha256::digest(b"legacy-restart-source"));
+    spool
+        .create_async_migration_admission_for_provider_owner(
+            job_uuid,
+            TARGET_INDEX,
+            None,
+            AsyncMigrationSourceProvider::Algolia,
+            AsyncMigrationPublicationSemantic::CreateOnly,
+        )
+        .unwrap();
+    spool
+        .transition_migration_phase(job_uuid, MigrationPhase::Exporting)
+        .unwrap();
+    let view = spool
+        .create_export(
+            job_uuid,
+            &source_identity_digest,
+            ResourceDenominators {
+                settings: 1,
+                documents: 2,
+                rules: 0,
+                synonyms: 0,
+                config: 0,
+            },
+        )
+        .unwrap();
+    spool
+        .commit_document_page_with_ids(
+            job_uuid,
+            br#"[{"objectID":"legacy-doc-1"}]"#,
+            &["legacy-doc-1"],
+        )
+        .unwrap();
+    if matches!(lifecycle, LegacyExportLifecycle::Interrupted) {
+        spool
+            .interrupt_export(job_uuid, &source_identity_digest)
+            .unwrap();
+    }
+    spool
+        .downgrade_manifest_to_legacy_format_for_test(job_uuid)
+        .unwrap();
+    let legacy_manifest = spool.manifest_json(job_uuid).unwrap();
+
+    let reports = repair_publications(&state);
+    recover_jobs(&state, &reports).await;
+
+    let reopened = spool_for_state(&state);
+    assert_terminal_phase(&reopened, job_uuid, MigrationDisposition::Failed);
+    assert_eq!(
+        reopened.manifest_json(job_uuid).unwrap(),
+        legacy_manifest,
+        "{lifecycle:?}: settling an unsupported-format export must not rewrite its manifest"
+    );
+    // Recovery settles the migration phase without rewriting the manifest, so the
+    // manifest lifecycle still decides which of the two closed refusals applies.
+    match lifecycle {
+        LegacyExportLifecycle::Running => assert_eq!(
+            reopened.resumable_export_handle(job_uuid).unwrap(),
+            None,
+            "a settled legacy export left Running must expose no resume handle"
+        ),
+        LegacyExportLifecycle::Interrupted => assert_eq!(
+            reopened
+                .resumable_export_handle(job_uuid)
+                .expect_err("an Interrupted legacy manifest must fail the format gate")
+                .kind(),
+            SpoolErrorKind::UnsupportedSpoolFormat,
+            "a settled legacy export left Interrupted must refuse on the format gate"
+        ),
+    }
+    assert_eq!(
+        reopened
+            .claim_interrupted_export(&view.checkpoint_handle, &source_identity_digest)
+            .expect_err("a legacy export must never be claimable after recovery")
+            .kind(),
+        SpoolErrorKind::UnsupportedSpoolFormat,
+        "{lifecycle:?}: the resume claim must keep failing closed on the format gate"
+    );
+}
+
+#[tokio::test]
 async fn privacy_scrub_recovery_replays_ack_after_response_loss_and_restart() {
     let hooks = Arc::new(PrivacyScrubTestHooks::default().with_boundaries([
         PrivacyScrubBoundary::ResponseLoss,
@@ -976,6 +1080,8 @@ async fn seed_async_replacement_target(
         .add_documents_durable(target_index, async_replacement_documents(documents))
         .await
         .unwrap();
+    // Durable ack precedes merge quiescence: drain so callers snapshot a settled tree.
+    state.manager.drain_all_write_queues().await.unwrap();
     state.manager.unload(&target_index.to_string()).unwrap();
 }
 
@@ -1061,9 +1167,14 @@ async fn interrupt_bulk_replace_at(
         crate::handlers::migration::import::import_from_admitted_source_with_test_hooks(
             &import_manager,
             job_uuid,
-            BULK_REPLACE_TARGET.to_string(),
-            crate::handlers::migration::MigrationPublicationMode::ReplaceExisting {
-                staging_baseline,
+            crate::handlers::migration::import::SourceImportRequest {
+                expected_provider:
+                    crate::handlers::migration::AsyncMigrationSourceProvider::Algolia,
+                target_index: BULK_REPLACE_TARGET.to_string(),
+                publication_mode:
+                    crate::handlers::migration::MigrationPublicationMode::ReplaceExisting {
+                        staging_baseline,
+                    },
             },
             &mut reader,
             hooks,
@@ -1137,6 +1248,8 @@ async fn seed_bulk_replace_generation(state: &SharedAppState, documents: &[BulkR
         .add_documents_durable(BULK_REPLACE_TARGET, bulk_replace_documents(documents))
         .await
         .unwrap();
+    // Durable ack precedes merge quiescence: drain so callers snapshot a settled tree.
+    state.manager.drain_all_write_queues().await.unwrap();
     state
         .manager
         .unload(&BULK_REPLACE_TARGET.to_string())
@@ -1561,6 +1674,7 @@ async fn populate_staging_index_with_documents(
         .add_documents_durable(staging_tenant, documents)
         .await
         .unwrap();
+    manager.drain_all_write_queues().await.unwrap();
     manager.unload(&staging_tenant.to_string()).unwrap();
     manager
         .scrub_transient_runtime_artifacts(staging_tenant)

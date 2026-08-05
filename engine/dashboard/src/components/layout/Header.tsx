@@ -24,7 +24,7 @@ interface HeaderProps {
  */
 export function Header({ onMenuToggle }: HeaderProps) {
   const { theme, toggleTheme } = useTheme();
-  const { apiKey } = useAuth();
+  const { isAuthenticated } = useAuth();
   const health = useHealth();
   const { isIndexing, totalPending, activeTasks } = useIndexingStatus();
   const devMode = useDevMode();
@@ -53,41 +53,51 @@ export function Header({ onMenuToggle }: HeaderProps) {
   const isChecking = health.isLoading;
 
   return (
-    <header className="h-16 border-b border-border bg-background shadow-sm px-4 md:px-6 flex items-center justify-between">
-      <div className="flex items-center gap-3 md:gap-4">
+    <header
+      className="flex h-16 min-w-0 items-center justify-between gap-2 border-b border-border bg-background px-2 shadow-sm sm:px-4 md:px-6"
+      data-testid="app-shell-header"
+    >
+      {/* The identity/status side yields space first; the task controls on the
+          right remain reachable at the 390px acceptance boundary. */}
+      <div className="flex min-w-0 flex-1 items-center gap-2 md:gap-4" data-testid="app-shell-header-primary">
         <Button
           variant="ghost"
           size="icon"
-          className="md:hidden"
+          className="shrink-0 md:hidden"
           onClick={onMenuToggle}
           aria-label="Toggle navigation"
         >
           <Menu className="h-5 w-5" />
         </Button>
-        <Link to="/" className="text-xl font-bold hover:opacity-80 transition-opacity"><span className="text-2xl">🥞</span> Flapjack</Link>
-        <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-orange-500 text-white uppercase tracking-wider leading-none">Beta</span>
-        <span className="text-sm text-muted-foreground hidden sm:inline">{serverHost}</span>
+        <Link to="/" className="shrink-0 text-xl font-bold transition-opacity hover:opacity-80">
+          <span className="text-2xl">🥞</span>
+          <span className="hidden sm:inline"> Flapjack</span>
+        </Link>
+        <span className="hidden rounded bg-orange-500 px-1.5 py-0.5 text-[10px] font-bold uppercase leading-none tracking-wider text-white sm:inline-flex">Beta</span>
+        <span className="hidden text-sm text-muted-foreground md:inline">{serverHost}</span>
         {isChecking ? (
-          <span className="text-xs px-2 py-0.5 rounded-full bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400">
+          <span className="shrink-0 rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-600 dark:bg-gray-800 dark:text-gray-400" data-testid="app-shell-connection-status">
             Connecting...
           </span>
-        ) : isHealthy && apiKey ? (
-          <span className="text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300">
+        ) : isHealthy && isAuthenticated ? (
+          <span className="shrink-0 rounded-full bg-green-100 px-2 py-0.5 text-xs text-green-700 dark:bg-green-900 dark:text-green-300" data-testid="app-shell-connection-status">
             Connected
           </span>
-        ) : !apiKey ? (
-          <span className="text-xs px-2 py-0.5 rounded-full bg-yellow-100 text-yellow-700 dark:bg-yellow-900 dark:text-yellow-300">
-            No API Key
+        ) : !isAuthenticated ? (
+          <span className="shrink-0 rounded-full bg-yellow-100 px-2 py-0.5 text-xs text-yellow-700 dark:bg-yellow-900 dark:text-yellow-300" data-testid="app-shell-connection-status">
+            Not Authenticated
           </span>
         ) : (
-          <span className="text-xs px-2 py-0.5 rounded-full bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300">
+          <span className="shrink-0 rounded-full bg-red-100 px-2 py-0.5 text-xs text-red-700 dark:bg-red-900 dark:text-red-300" data-testid="app-shell-connection-status">
             Disconnected
           </span>
         )}
       </div>
-      <div className="flex items-center gap-2">
+      {/* Queue state and connection settings are the narrow-width task path.
+          Lower-priority desktop affordances opt in again at md. */}
+      <div className="flex shrink-0 items-center gap-1 md:gap-2" data-testid="app-shell-header-actions">
         {/* Queue / task status button */}
-        <div className="relative" ref={queueRef}>
+        <div className="relative shrink-0" ref={queueRef}>
           <Button
             variant="ghost"
             size="icon"
@@ -148,7 +158,7 @@ export function Header({ onMenuToggle }: HeaderProps) {
           )}
         </div>
 
-        <a href="/swagger-ui" target="_blank" rel="noopener noreferrer">
+        <a className="hidden md:block" href="/swagger-ui" target="_blank" rel="noopener noreferrer">
           <Button variant="ghost" size="sm">
             API Docs
           </Button>
@@ -159,7 +169,7 @@ export function Header({ onMenuToggle }: HeaderProps) {
           onClick={devMode.toggle}
           aria-label="Toggle dev mode"
           title={devMode.enabled ? 'Disable dev mode' : 'Enable dev mode'}
-          className={devMode.enabled ? 'text-orange-500' : ''}
+          className={`hidden md:inline-flex ${devMode.enabled ? 'text-orange-500' : ''}`}
         >
           <Bug className="h-5 w-5" />
         </Button>
@@ -169,14 +179,17 @@ export function Header({ onMenuToggle }: HeaderProps) {
           onClick={toggleTheme}
           aria-label="Toggle theme"
           title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
+          className="hidden md:inline-flex"
         >
           {theme === 'light' ? <Moon className="h-5 w-5" /> : <Sun className="h-5 w-5" />}
         </Button>
         <Button
           variant="ghost"
           size="icon"
+          aria-label="Connection Settings"
           title="Connection Settings"
           onClick={() => setShowSettings(true)}
+          className="shrink-0"
         >
           <Settings className="h-5 w-5" />
         </Button>

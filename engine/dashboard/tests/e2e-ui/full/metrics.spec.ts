@@ -98,9 +98,9 @@ test.describe('Metrics Page', () => {
     const storageCard = page.getByTestId('metrics-total-storage');
     await expect(storageCard).toBeVisible();
     await expect(storageCard.getByText('Total Storage')).toBeVisible();
-    const storageValue = await storageCard.getByTestId('stat-value').textContent();
-    expect(storageValue?.trim()).toMatch(/^\d+(\.\d+)?\s*(B|KB|MB|GB)$/i);
-    expect(storageValue).not.toBe('0 Bytes');
+    const storageValue = storageCard.getByTestId('stat-value');
+    await expect(storageValue).toHaveText(/^\d+(\.\d+)?\s*(B|KB|MB|GB)$/i);
+    await expect(storageValue).not.toHaveText('0 Bytes');
 
     // Loaded Tenants card
     const tenantsCard = page.getByTestId('metrics-tenants');
@@ -144,9 +144,8 @@ test.describe('Metrics Page', () => {
     // Storage cell — should not be "0 Bytes"
     const storageCell = page.getByTestId(`metrics-cell-${TEST_INDEX}-storage`);
     await expect(storageCell).toBeVisible();
-    const storageText = await storageCell.textContent();
-    expect(storageText?.trim()).toMatch(/^\d+(\.\d+)?\s*(B|KB|MB|GB)$/i);
-    expect(storageText).not.toBe('0 Bytes');
+    await expect(storageCell).toHaveText(/^\d+(\.\d+)?\s*(B|KB|MB|GB)$/i);
+    await expect(storageCell).not.toHaveText('0 Bytes');
   });
 
   test('Per-Index tab shows search count > 0 for seeded index', async ({ page }) => {

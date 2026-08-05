@@ -246,8 +246,11 @@ impl MigrationJobRunner {
 
         self.spawn_import(
             job_uuid,
-            admitted.target_index,
-            admitted.publication_mode,
+            import::SourceImportRequest {
+                expected_provider: source_provider,
+                target_index: admitted.target_index,
+                publication_mode: admitted.publication_mode,
+            },
             reader,
             permit,
         );
@@ -279,17 +282,27 @@ impl MigrationJobRunner {
         let target_index = metadata.target_index.clone();
         let publication_mode = self.resume_publication_mode(&metadata)?;
         let mut reader = source_factory(&payload).map_err(algolia_error)?;
-        let checkpoint =
-            super::export::claim_validated_algolia_resume(&spool, &mut reader, &checkpoint_handle)
-                .await
-                .map_err(import::export_error)?;
+        // Algolia is the only enabled resume path, so the resume request context
+        // admits that provider explicitly rather than inferring it from the reader.
+        let expected_provider = AsyncMigrationSourceProvider::Algolia;
+        let checkpoint = super::export::claim_validated_algolia_resume(
+            &spool,
+            &mut reader,
+            &checkpoint_handle,
+            expected_provider,
+        )
+        .await
+        .map_err(import::export_error)?;
         let phase_record = spool
             .read_migration_phase(job_uuid)
             .map_err(resume_spool_error)?;
         self.spawn_resume_import(
             job_uuid,
-            target_index,
-            publication_mode,
+            import::SourceImportRequest {
+                expected_provider,
+                target_index,
+                publication_mode,
+            },
             reader,
             checkpoint,
             permit,
@@ -373,8 +386,11 @@ impl MigrationJobRunner {
 
         self.spawn_import_with_hooks(
             job_uuid,
-            admitted.target_index,
-            admitted.publication_mode,
+            import::SourceImportRequest {
+                expected_provider: AsyncMigrationSourceProvider::Algolia,
+                target_index: admitted.target_index,
+                publication_mode: admitted.publication_mode,
+            },
             reader,
             permit,
             hooks,
@@ -386,8 +402,7 @@ impl MigrationJobRunner {
     fn spawn_import<R>(
         &self,
         job_uuid: Uuid,
-        target_index: String,
-        publication_mode: MigrationPublicationMode,
+        request: import::SourceImportRequest,
         mut reader: R,
         permit: OwnedSemaphorePermit,
     ) where
@@ -399,14 +414,8 @@ impl MigrationJobRunner {
         let active_token = Uuid::new_v4();
         let (published, published_rx) = oneshot::channel();
         let import_task = tokio::spawn(async move {
-            import::import_from_admitted_source(
-                &import_manager,
-                job_uuid,
-                target_index,
-                publication_mode,
-                &mut reader,
-            )
-            .await
+            import::import_from_admitted_source(&import_manager, job_uuid, request, &mut reader)
+                .await
         });
         let monitor = tokio::spawn(async move {
             let result = import_task.await;
@@ -445,8 +454,7 @@ impl MigrationJobRunner {
     fn spawn_resume_import<R>(
         &self,
         job_uuid: Uuid,
-        target_index: String,
-        publication_mode: MigrationPublicationMode,
+        request: import::SourceImportRequest,
         mut reader: R,
         checkpoint: super::spool::ExportCheckpoint,
         permit: OwnedSemaphorePermit,
@@ -463,8 +471,7 @@ impl MigrationJobRunner {
             import::import_from_claimed_resume(
                 &import_manager,
                 job_uuid,
-                target_index,
-                publication_mode,
+                request,
                 &mut reader,
                 checkpoint,
             )
@@ -508,8 +515,7 @@ impl MigrationJobRunner {
     fn spawn_import_with_hooks<R>(
         &self,
         job_uuid: Uuid,
-        target_index: String,
-        publication_mode: MigrationPublicationMode,
+        request: import::SourceImportRequest,
         mut reader: R,
         permit: OwnedSemaphorePermit,
         hooks: import::ImportTestHooks,
@@ -525,8 +531,7 @@ impl MigrationJobRunner {
             import::import_from_admitted_source_with_test_hooks(
                 &import_manager,
                 job_uuid,
-                target_index,
-                publication_mode,
+                request,
                 &mut reader,
                 hooks,
             )
@@ -633,6 +638,19 @@ impl MigrationJobRunner {
                 .await;
         }
         if prepublication_export_can_be_interrupted(&phase, metadata) {
+            // Both resume advertisement and the resume claim reject an
+            // unsupported spool format, so preserving such an export as
+            // resumable would leave the migration non-terminal and unresumable
+            // forever. Settle it before any lifecycle work.
+            if !spool
+                .export_spool_format_is_supported(job_uuid)
+                .map_err(recovery_spool_error)?
+            {
+                spool
+                    .fail_migration(job_uuid)
+                    .map_err(recovery_spool_error)?;
+                return Ok(());
+            }
             spool.recover().map_err(recovery_spool_error)?;
             if spool
                 .recover_export_interruption(job_uuid)
@@ -1025,13 +1043,11 @@ fn recovery_spool_error(error: SpoolError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handlers::migration::algolia_client::{
-        AlgoliaClientError, AlgoliaErrorKind, AlgoliaIndexRecord,
-    };
+    use crate::handlers::migration::algolia_client::{AlgoliaClientError, AlgoliaErrorKind};
     use crate::handlers::migration::source_reader::{
-        MigrationSourceReader, PageConsumer, SourceFuture,
+        MigrationSourceReader, SourceConfigurationConsumer, SourceDocumentPageConsumer,
+        SourceFuture, SourceObservation,
     };
-    use serde_json::Value;
     use tempfile::TempDir;
 
     struct UnusedReader;
@@ -1087,50 +1103,28 @@ mod tests {
     }
 
     impl MigrationSourceReader for UnusedReader {
-        fn app_id(&self) -> &str {
-            "unused"
+        fn source_provider(&self) -> AsyncMigrationSourceProvider {
+            AsyncMigrationSourceProvider::Algolia
         }
 
         fn source_name(&self) -> &str {
             "unused"
         }
 
-        fn wait_for_quiescent_source(&mut self) -> SourceFuture<'_, AlgoliaIndexRecord> {
+        fn observe_quiescent_source(&mut self) -> SourceFuture<'_, SourceObservation> {
             unreachable!("source reader construction fails before async import starts")
         }
 
-        fn read_settings(&mut self) -> SourceFuture<'_, Value> {
-            unreachable!("source reader construction fails before async import starts")
-        }
-
-        fn read_index_settings<'a>(&'a mut self, _index_name: &'a str) -> SourceFuture<'a, Value> {
-            unreachable!("source reader construction fails before async import starts")
-        }
-
-        fn require_unretrievable_access<'a>(
+        fn read_configuration<'a>(
             &'a mut self,
-            _settings: &'a Value,
+            _consume: &'a mut SourceConfigurationConsumer<'a>,
         ) -> SourceFuture<'a, ()> {
             unreachable!("source reader construction fails before async import starts")
         }
 
-        fn read_documents<'a>(
+        fn read_document_records<'a>(
             &'a mut self,
-            _consume_page: &'a mut PageConsumer<'a>,
-        ) -> SourceFuture<'a, ()> {
-            unreachable!("source reader construction fails before async import starts")
-        }
-
-        fn read_rules<'a>(
-            &'a mut self,
-            _consume_page: &'a mut PageConsumer<'a>,
-        ) -> SourceFuture<'a, ()> {
-            unreachable!("source reader construction fails before async import starts")
-        }
-
-        fn read_synonyms<'a>(
-            &'a mut self,
-            _consume_page: &'a mut PageConsumer<'a>,
+            _consume_page: &'a mut SourceDocumentPageConsumer<'a>,
         ) -> SourceFuture<'a, ()> {
             unreachable!("source reader construction fails before async import starts")
         }

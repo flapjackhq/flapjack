@@ -213,6 +213,186 @@ if ! liveness_sampler_output="$(
   fail "liveness_sampler_lifecycle_uses_caller_owned_pid: $liveness_sampler_output"
 fi
 
+start_health_owner_http_fixture() {
+  local fixture_port_path="$1"
+  local fixture_pid_variable_name="$2"
+  local fixture_process_pid
+
+  node -e '
+const fs = require("node:fs");
+const http = require("node:http");
+const portPath = process.argv[1];
+const server = http.createServer((request, response) => {
+  if (request.url !== "/health") {
+    response.writeHead(404);
+    response.end();
+    return;
+  }
+  response.writeHead(200);
+  response.end("ok");
+});
+server.listen(0, "127.0.0.1", () => {
+  fs.writeFileSync(portPath, String(server.address().port));
+});
+' "$fixture_port_path" &
+  fixture_process_pid=$!
+  printf -v "$fixture_pid_variable_name" '%s' "$fixture_process_pid"
+
+  for _ in $(seq 1 100); do
+    [[ -s "$fixture_port_path" ]] && return 0
+    kill -0 "$fixture_process_pid" 2>/dev/null || break
+    sleep 0.02
+  done
+  fail "health ownership fixture did not publish its port"
+}
+
+assert_partial_health_owner_arguments_fail() {
+  local fixture_base_url="$1"
+  local launched_server_pid="$2"
+  local server_log_path="$3"
+  local fixture_bind_addr="$4"
+  local partial_owner_case
+  local partial_server_log_path
+  local partial_bind_addr
+  local output
+
+  for partial_owner_case in log_only bind_only; do
+    partial_server_log_path=""
+    partial_bind_addr=""
+    if [[ "$partial_owner_case" == "log_only" ]]; then
+      partial_server_log_path="$server_log_path"
+    else
+      partial_bind_addr="$fixture_bind_addr"
+    fi
+    if output="$(
+      wait_for_loadtest_health \
+        "$fixture_base_url" \
+        "$launched_server_pid" \
+        2 \
+        0.01 \
+        "$partial_server_log_path" \
+        "$partial_bind_addr" 2>&1
+    )"; then
+      fail "health ownership arguments must be supplied together: $partial_owner_case"
+    fi
+    [[ "$output" == *"needs server log path and bind address"* ]] || {
+      fail "partial ownership arguments must name the paired contract: $partial_owner_case: $output"
+    }
+  done
+}
+
+assert_health_owner_contract() {
+  local fixture_base_url="$1"
+  local launched_server_pid="$2"
+  local server_log_path="$3"
+  local fixture_bind_addr="$4"
+  local output
+
+  wait_for_loadtest_health \
+    "$fixture_base_url" \
+    "$launched_server_pid" \
+    2 \
+    0.01 || fail "generic callers without ownership arguments must still accept HTTP 200"
+
+  printf 'Local: http://%s0\n' "$fixture_bind_addr" >"$server_log_path"
+  if output="$(
+    wait_for_loadtest_health \
+      "$fixture_base_url" \
+      "$launched_server_pid" \
+      2 \
+      0.01 \
+      "$server_log_path" \
+      "$fixture_bind_addr" 2>&1
+  )"; then
+    fail "health readiness must reject a foreign listener's HTTP 200"
+  fi
+  [[ "$output" == *"did not confirm ownership"* ]] || {
+    fail "foreign-listener failure must say did not confirm ownership: $output"
+  }
+
+  printf 'Local: http://%s\n' "$fixture_bind_addr" >"$server_log_path"
+  wait_for_loadtest_health \
+    "$fixture_base_url" \
+    "$launched_server_pid" \
+    2 \
+    0.01 \
+    "$server_log_path" \
+    "$fixture_bind_addr" || fail "matching owned-log banner must accept the HTTP 200"
+
+  assert_partial_health_owner_arguments_fail \
+    "$fixture_base_url" "$launched_server_pid" "$server_log_path" "$fixture_bind_addr"
+
+  echo "PASS: foreign HTTP 200 rejected with did not confirm ownership"
+  echo "PASS: matching Local: http://${fixture_bind_addr} banner accepted"
+}
+
+assert_ipv6_loopback_base_url_contract() {
+  local bind_addr
+
+  bind_addr="$(derive_bind_addr_from_base_url 'http://[::1]:7700')" || {
+    fail "IPv6 loopback base URL must be accepted"
+  }
+  [[ "$bind_addr" == "[::1]:7700" ]] || {
+    fail "IPv6 loopback base URL must preserve a bindable bracketed address, got ${bind_addr}"
+  }
+}
+
+loadtest_health_requires_launched_server_log_owner() (
+  local fixture_dir
+  local fixture_port_path
+  local server_log_path
+  local fixture_pid
+  local launched_server_pid
+  local fixture_port
+  local fixture_bind_addr
+  local fixture_base_url
+  local fixture_status_code
+
+  fixture_dir="$(mktemp -d)"
+  fixture_port_path="$fixture_dir/port"
+  server_log_path="$fixture_dir/server.log"
+
+  start_health_owner_http_fixture "$fixture_port_path" fixture_pid
+  sleep 30 &
+  launched_server_pid=$!
+
+  trap "
+    kill '$fixture_pid' '$launched_server_pid' 2>/dev/null || true
+    wait '$fixture_pid' '$launched_server_pid' 2>/dev/null || true
+    rm -rf '$fixture_dir'
+  " EXIT
+
+  fixture_port="$(cat "$fixture_port_path")"
+  fixture_bind_addr="127.0.0.1:${fixture_port}"
+  fixture_base_url="http://${fixture_bind_addr}"
+  fixture_status_code="$(
+    curl -sS -o /dev/null -w '%{http_code}' --max-time 1 "${fixture_base_url}/health"
+  )" || fail "health ownership fixture was not reachable"
+  [[ "$fixture_status_code" == "200" ]] || {
+    fail "health ownership fixture expected HTTP 200, got $fixture_status_code"
+  }
+  kill -0 "$launched_server_pid" 2>/dev/null || fail "launched-server decoy PID must be live"
+
+  assert_health_owner_contract \
+    "$fixture_base_url" "$launched_server_pid" "$server_log_path" "$fixture_bind_addr"
+)
+
+echo "RUN: loadtest_health_requires_launched_server_log_owner"
+if ! owner_output="$(
+  loadtest_health_requires_launched_server_log_owner 2>&1
+)"; then
+  fail "loadtest_health_requires_launched_server_log_owner: $owner_output"
+fi
+printf '%s\n' "$owner_output"
+
+echo "RUN: assert_ipv6_loopback_base_url_contract"
+assert_ipv6_loopback_base_url_contract
+
+grep -Fq 'wait_for_loadtest_health "$BASE_URL" "$SERVER_PID" 300 0.1 "$server_log_path" "$bind_addr"' \
+  "$LOADTEST_DIR/scale_ladder.sh" || {
+  fail "scale_ladder.sh must pass server log path and bind address to the health owner guard"
+}
+
 fixed_count() {
   printf '0\n'
 }

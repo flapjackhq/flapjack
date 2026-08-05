@@ -1,50 +1,34 @@
-/**
- */
 import { useQuery } from '@tanstack/react-query';
 import { parsePrometheusText, type PrometheusMetric } from '@/lib/prometheusParser';
 import { useAuth } from '@/hooks/useAuth';
 
 const DEFAULT_METRICS_APP_ID = 'flapjack';
 const METRICS_QUERY_KEY = 'prometheus-metrics';
+const METRICS_URL = import.meta.env.DEV ? '/__flapjack_metrics' : '/metrics';
 
 function getEffectiveMetricsAppId(appId: string | null | undefined) {
-  return appId || DEFAULT_METRICS_APP_ID;
-}
-
-function getApiKeyFingerprint(apiKey: string | null | undefined) {
-  if (!apiKey) {
-    return 'anonymous';
-  }
-
-  // Fingerprint the credential so React Query invalidates on key rotation
-  // without storing the raw secret in cache metadata.
-  let hash = 2166136261;
-  for (let index = 0; index < apiKey.length; index += 1) {
-    hash ^= apiKey.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-
-  return `authenticated:${apiKey.length}:${(hash >>> 0).toString(16)}`;
+  const normalizedAppId = appId?.trim();
+  return normalizedAppId || DEFAULT_METRICS_APP_ID;
 }
 
 export function usePrometheusMetrics() {
   const appId = useAuth((state) => state.appId);
-  const apiKey = useAuth((state) => state.apiKey);
+  const isAuthenticated = useAuth((state) => state.isAuthenticated);
   const effectiveAppId = getEffectiveMetricsAppId(appId);
-  const credentialScope = getApiKeyFingerprint(apiKey);
+  const credentialScope = isAuthenticated ? 'session:authenticated' : 'session:anonymous';
 
   return useQuery<PrometheusMetric[]>({
     queryKey: [METRICS_QUERY_KEY, effectiveAppId, credentialScope],
     queryFn: async () => {
-      // Fetch directly from the backend — /metrics can't go through the Vite proxy
-      // because the dashboard page route is also /metrics (SPA path conflict).
+      // The dev-only alias avoids the SPA's /metrics route while keeping the request
+      // same-origin, so the HttpOnly dashboard session cookie reaches the backend.
       const headers: Record<string, string> = {
         'x-algolia-application-id': effectiveAppId,
       };
-      if (apiKey) {
-        headers['x-algolia-api-key'] = apiKey;
-      }
-      const res = await fetch(`${__BACKEND_URL__}/metrics`, { headers });
+      const res = await fetch(METRICS_URL, {
+        credentials: 'include',
+        headers,
+      });
       if (!res.ok) throw new Error(`Metrics fetch failed: ${res.status}`);
       const text = await res.text();
       return parsePrometheusText(text);

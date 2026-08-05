@@ -2,7 +2,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Page } from '@playwright/test';
 import { test, expect } from '../fixtures/auth.fixture';
-import { buildDashboardRouteAudit } from './route_audit_manifest';
 import {
   MOVIES_INDEX,
   resolveLaneCBundleDir,
@@ -100,10 +99,10 @@ async function collectRouteObservations(page: Page, routePath: string): Promise<
   if (routePath === '/events') {
     const statusFilter = page.getByLabel('Status');
     await expect(statusFilter).toBeVisible();
-    const statusOptions = await statusFilter.evaluate((selectElement) => (
-      Array.from((selectElement as HTMLSelectElement).options).map((option) => ({
-        label: option.text,
-        value: option.value,
+    const statusOptions = await statusFilter.getByRole('option').evaluateAll((options) => (
+      options.map((option) => ({
+        label: option.textContent?.trim() ?? '',
+        value: option.getAttribute('value') ?? '',
       }))
     ));
 
@@ -149,23 +148,23 @@ test.describe('Lane C round 2 focused audit', () => {
   });
 
   test('records focused route evidence for the round 2 ranked audit', async ({ page }) => {
-    const auditRoutes = buildDashboardRouteAudit(MOVIES_INDEX);
     const evidence: RouteAuditEvidence[] = [];
 
     for (const routePath of AUDITED_PATHS) {
-      const route = auditRoutes.find((candidate) => candidate.path === routePath);
-      expect(route, `route manifest must own ${routePath}`).toBeDefined();
-
       const browserIssues: BrowserIssueEvidence[] = [];
       attachBrowserIssueCapture(page, browserIssues);
 
       await page.goto(routePath);
-      await route?.waitForReady(page);
+
+      // Observations carry this spec's per-route readiness assertions, so they must resolve
+      // before headings are read: `allTextContents()` does not auto-wait, and reading it on a
+      // still-rendering route would record empty heading evidence instead of failing.
+      const observations = await collectRouteObservations(page, routePath);
 
       evidence.push({
         browserIssues,
         headings: await collectRouteHeadings(page, routePath),
-        observations: await collectRouteObservations(page, routePath),
+        observations,
         path: routePath,
       });
 

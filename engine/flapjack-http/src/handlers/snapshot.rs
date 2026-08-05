@@ -286,7 +286,8 @@ pub async fn import_snapshot(
     responses(
         (status = 200, description = "Snapshot uploaded to S3", body = serde_json::Value),
         (status = 503, description = "S3 not configured"),
-        (status = 404, description = "Index not found")
+        (status = 404, description = "Index not found"),
+        (status = 500, description = "Snapshot upload or retention failed")
     ),
     security(
         ("api_key" = [])
@@ -328,12 +329,15 @@ pub async fn snapshot_to_s3(
 
     match flapjack::index::s3::upload_snapshot(&s3_config, &index_name, &bytes).await {
         Ok(key) => {
-            let _ = flapjack::index::s3::enforce_retention(
+            if let Err(error) = flapjack::index::s3::enforce_retention(
                 &s3_config,
                 &index_name,
                 snapshot_retention(),
             )
-            .await;
+            .await
+            {
+                return internal_error("S3 retention failed", error);
+            }
 
             Json(serde_json::json!({
                 "status": "uploaded",
@@ -804,6 +808,132 @@ mod tests {
         write_result
             .expect("tenant write admission must reopen while the completed snapshot bytes upload");
         assert_document_title(&state, tenant_id, "during_upload", "during upload");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn snapshot_to_s3_returns_500_when_retention_delete_fails() {
+        let s3 = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&s3)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <Name>snapshot-bucket</Name>
+  <Prefix>snapshots/products/</Prefix>
+  <KeyCount>2</KeyCount>
+  <MaxKeys>1000</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>snapshots/products/20260731T010000Z.tar.gz</Key>
+    <LastModified>2026-07-31T01:00:00.000Z</LastModified>
+    <Size>10</Size>
+  </Contents>
+  <Contents>
+    <Key>snapshots/products/20260731T020000Z.tar.gz</Key>
+    <LastModified>2026-07-31T02:00:00.000Z</LastModified>
+    <Size>10</Size>
+  </Contents>
+</ListBucketResult>"#,
+            ))
+            .mount(&s3)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&s3)
+            .await;
+
+        let (status, body, requests) = {
+            let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+            let _bucket = EnvVarRestoreGuard::set("FLAPJACK_S3_BUCKET", "snapshot-bucket");
+            let _region = EnvVarRestoreGuard::set("FLAPJACK_S3_REGION", "us-east-1");
+            let _endpoint = EnvVarRestoreGuard::set("FLAPJACK_S3_ENDPOINT", &s3.uri());
+            let _retention = EnvVarRestoreGuard::set("FLAPJACK_SNAPSHOT_RETENTION", "1");
+            let _access_key = EnvVarRestoreGuard::set("AWS_ACCESS_KEY_ID", "test-access-key");
+            let _secret_key = EnvVarRestoreGuard::set("AWS_SECRET_ACCESS_KEY", "test-secret-key");
+
+            let tmp = TempDir::new().unwrap();
+            let state = TestStateBuilder::new(&tmp).build_shared();
+            state.manager.create_tenant("products").unwrap();
+            state
+                .manager
+                .add_documents_sync("products", vec![test_document("before", "before snapshot")])
+                .await
+                .unwrap();
+            let app = Router::new()
+                .route("/1/indexes/:indexName/snapshot", post(snapshot_to_s3))
+                .with_state(state);
+
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/1/indexes/products/snapshot")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = body_json(response).await;
+            let requests = s3
+                .received_requests()
+                .await
+                .expect("recorded requests should be available");
+            (status, body, requests)
+        };
+        let put_count = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "PUT")
+            .count();
+        let list_requests = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "GET")
+            .collect::<Vec<_>>();
+        let delete_requests = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "DELETE")
+            .collect::<Vec<_>>();
+        assert_eq!(put_count, 1, "handler should upload exactly one snapshot");
+        assert!(
+            list_requests.iter().any(|request| request
+                .url
+                .query_pairs()
+                .any(|(name, value)| name == "prefix" && value == "snapshots/products/")),
+            "handler should list the products retention prefix, got {:?}",
+            list_requests
+                .iter()
+                .map(|request| request.url.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            delete_requests.len(),
+            1,
+            "handler should attempt exactly one rejected retention delete, got {:?}",
+            delete_requests
+                .iter()
+                .map(|request| request.url.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            delete_requests[0]
+                .url
+                .path()
+                .ends_with("snapshots/products/20260731T010000Z.tar.gz"),
+            "the rejected DELETE should target the oldest products snapshot key, got {}",
+            delete_requests[0].url.path()
+        );
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "message": "Internal server error",
+                "status": 500
+            })
+        );
     }
 
     #[tokio::test]

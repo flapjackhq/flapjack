@@ -156,6 +156,7 @@ fn malformed_payload_code_for_snapshot_resource(resource: SourceSnapshotResource
         SourceSnapshotResource::Document => ReportCode::MalformedDocumentPayload,
         SourceSnapshotResource::Rule => ReportCode::MalformedRulePayload,
         SourceSnapshotResource::Synonym => ReportCode::MalformedSynonymPayload,
+        SourceSnapshotResource::ReplicaSettings => ReportCode::MalformedSettingsPayload,
     }
 }
 
@@ -172,6 +173,7 @@ fn report_resource_for_snapshot_resource(resource: SourceSnapshotResource) -> Re
         SourceSnapshotResource::Document => ReportResource::Document,
         SourceSnapshotResource::Rule => ReportResource::Rule,
         SourceSnapshotResource::Synonym => ReportResource::Synonym,
+        SourceSnapshotResource::ReplicaSettings => ReportResource::Settings,
     }
 }
 

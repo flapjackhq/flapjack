@@ -25,9 +25,12 @@ pub mod security_sources;
 pub mod server;
 pub mod server_init;
 pub mod snapshot_byte_ops;
+pub(crate) mod ssl_background;
+pub(crate) mod ssl_startup;
 pub mod startup;
 pub mod startup_catchup;
 pub(crate) mod tenant_dirs;
+pub mod tls_serve;
 
 pub mod background_tasks;
 pub(crate) mod usage_capture;

@@ -381,7 +381,6 @@ fn enabled_core_features() -> Vec<&'static str> {
         (cfg!(feature = "analytics"), "analytics"),
         (cfg!(feature = "axum-support"), "axum-support"),
         (cfg!(feature = "decompound"), "decompound"),
-        (cfg!(feature = "default"), "default"),
         (cfg!(feature = "memory-stats"), "memory-stats"),
         (cfg!(feature = "openapi"), "openapi"),
         (cfg!(feature = "s3-snapshots"), "s3-snapshots"),
@@ -512,6 +511,50 @@ mod tests {
             assert_eq!(info.capabilities.vector_search_local, vector_search_local);
             assert!(!info.capabilities.vector_search_local || info.capabilities.vector_search);
         }
+    }
+
+    #[test]
+    fn enabled_core_features_excludes_umbrella_and_reports_concrete_features() {
+        let mut expected = vec![
+            "analytics",
+            "axum-support",
+            "decompound",
+            "openapi",
+            "s3-snapshots",
+        ];
+        if cfg!(feature = "memory-stats") {
+            expected.push("memory-stats");
+        }
+        if cfg!(feature = "vector-search") {
+            expected.push("vector-search");
+        }
+        if cfg!(feature = "vector-search-local") {
+            expected.push("vector-search-local");
+        }
+        expected.sort_unstable();
+
+        let features = enabled_core_features();
+        assert!(
+            !features.contains(&"default"),
+            "the Cargo umbrella default feature must not be reported as a runtime capability"
+        );
+        assert_eq!(
+            features, expected,
+            "the build must report every enabled concrete capability"
+        );
+    }
+
+    #[test]
+    fn build_info_from_inputs_normalizes_explicit_feature_capabilities() {
+        let info = build_info_from_inputs(
+            "1.2.3",
+            raw_inputs(),
+            ["vector-search-local", "axum-support", "axum-support"],
+        );
+
+        assert_eq!(info.features, vec!["axum-support", "vector-search-local"]);
+        assert!(info.capabilities.vector_search);
+        assert!(info.capabilities.vector_search_local);
     }
 
     #[test]

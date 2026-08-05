@@ -1,0 +1,662 @@
+{
+  "schema": 1,
+  "derived_from": "engine/docs2/4_EVIDENCE/2026_07_30_jul30_12am_3_dashboard_join_audit_receipt.md",
+  "derived_at": "2026-08-03",
+  "note": "Machine-readable owner of the JOIN-1 backend-capability -> Playwright-proof-key mapping. The source receipt is dated, frozen evidence and must not be edited to track live state; this file is the live owner. Regenerate only if the backend capability set itself is re-audited, and record the new source here.",
+  "proof_keys": {
+    "P1": {
+      "spec": "full/search.spec.ts",
+      "title": "searching for \"laptop\" returns laptop products"
+    },
+    "P2": {
+      "spec": "full/search.spec.ts",
+      "title": "typo tolerance returns results for misspelled queries"
+    },
+    "P3": {
+      "spec": "full/search.spec.ts",
+      "title": "filtering by Audio category shows only audio products"
+    },
+    "P4": {
+      "spec": "full/synonyms.spec.ts",
+      "title": "create and delete a multi-way synonym"
+    },
+    "P5": {
+      "spec": "full/rules.spec.ts",
+      "title": "form mode create/read/delete is deterministic and restores seeded baseline"
+    },
+    "P6": {
+      "spec": "full/settings.spec.ts",
+      "title": "save settings persists changes after reload"
+    },
+    "P7": {
+      "spec": "full/settings.spec.ts",
+      "title": "search tab query type persists after save and reload"
+    },
+    "P8": {
+      "spec": "full/settings.spec.ts",
+      "title": "language and text tab query languages persist after save and reload"
+    },
+    "P9": {
+      "spec": "full/settings.spec.ts",
+      "title": "ranking tab distinct settings persist after save and reload"
+    },
+    "P10": {
+      "spec": "full/search.spec.ts",
+      "title": "create document via JSON tab and verify searchable"
+    },
+    "P11": {
+      "spec": "full/search.spec.ts",
+      "title": "delete document via confirm dialog and verify removed"
+    },
+    "P13": {
+      "spec": "full/analytics.spec.ts",
+      "title": "Overview tab loads with KPI cards showing data"
+    },
+    "P14": {
+      "spec": "full/event-debugger.spec.ts",
+      "title": "seeded events appear in the event table"
+    },
+    "P15": {
+      "spec": "full/experiments.spec.ts",
+      "title": "create dialog submit creates an experiment through the UI flow"
+    },
+    "P16": {
+      "spec": "full/metrics.spec.ts",
+      "title": "Overview tab shows aggregate request cards with numeric values"
+    },
+    "P17": {
+      "spec": "full/personalization.spec.ts",
+      "title": "uses starter strategy defaults, persists event and facet edits, and unlocks profile lookup after save"
+    },
+    "P18": {
+      "spec": "full/recommendations.spec.ts",
+      "title": "all five recommendation models: model switching enforces inputs and renders result-or-empty states"
+    },
+    "P19": {
+      "spec": "full/chat.spec.ts",
+      "title": "sends query, displays answer with sources, and supports multi-turn"
+    },
+    "P20": {
+      "spec": "full/vector-settings.spec.ts",
+      "title": "set search mode to Neural Search and verify persistence"
+    },
+    "P21": {
+      "spec": "full/api-keys.spec.ts",
+      "title": "create then delete an API key"
+    },
+    "P22": {
+      "spec": "full/security-sources.spec.ts",
+      "title": "create-delete lifecycle preserves badge and row counts"
+    },
+    "P23": {
+      "spec": "full/dictionaries.spec.ts",
+      "title": "switches between Stopwords, Plurals, and Compounds tabs"
+    },
+    "P24": {
+      "spec": "full/system.spec.ts",
+      "title": "Health tab shows server status as ok"
+    },
+    "P25": {
+      "spec": "full/system.spec.ts",
+      "title": "Replication tab shows replication enabled/disabled status"
+    },
+    "P26": {
+      "spec": "full/system.spec.ts",
+      "title": "Snapshots tab shows S3 Backups section"
+    },
+    "P27": {
+      "spec": "full/system.spec.ts",
+      "title": "Health tab shows tenants loaded card"
+    },
+    "P28": {
+      "spec": "full/system.spec.ts",
+      "title": "Health tab shows memory card with heap usage and progress bar"
+    },
+    "P29": {
+      "spec": "full/migrate-algolia.spec.ts",
+      "title": "migrate Algolia index via UI: fill form \u2192 migrate \u2192 verify success \u2192 browse"
+    }
+  },
+  "rows": [
+    {
+      "capability": "Full-text search (BM25 scoring)",
+      "features_ref": "FEATURES.md:124 Search",
+      "surface": "dashboard route",
+      "proof_key": "P1"
+    },
+    {
+      "capability": "Typo tolerance",
+      "features_ref": "FEATURES.md:125 Search",
+      "surface": "dashboard route",
+      "proof_key": "P2"
+    },
+    {
+      "capability": "Prefix search",
+      "features_ref": "FEATURES.md:126 Search",
+      "surface": "dashboard route",
+      "proof_key": "P7"
+    },
+    {
+      "capability": "Exact phrase / word search",
+      "features_ref": "FEATURES.md:127 Search",
+      "surface": "dashboard route",
+      "proof_key": "P1"
+    },
+    {
+      "capability": "Faceted search",
+      "features_ref": "FEATURES.md:128 Search",
+      "surface": "dashboard route",
+      "proof_key": "P3"
+    },
+    {
+      "capability": "Numeric + string filters",
+      "features_ref": "FEATURES.md:129 Search",
+      "surface": "dashboard route",
+      "proof_key": "P3"
+    },
+    {
+      "capability": "Geo search",
+      "features_ref": "FEATURES.md:130 Search",
+      "surface": "dashboard route",
+      "proof_key": null
+    },
+    {
+      "capability": "Synonyms",
+      "features_ref": "FEATURES.md:131 Search",
+      "surface": "dashboard route",
+      "proof_key": "P4"
+    },
+    {
+      "capability": "Query rules",
+      "features_ref": "FEATURES.md:132 Search",
+      "surface": "dashboard route",
+      "proof_key": "P5"
+    },
+    {
+      "capability": "Distinct (deduplication)",
+      "features_ref": "FEATURES.md:133 Search",
+      "surface": "dashboard route",
+      "proof_key": "P9"
+    },
+    {
+      "capability": "Multi-index search",
+      "features_ref": "FEATURES.md:134 Search",
+      "surface": "API only",
+      "proof_key": null
+    },
+    {
+      "capability": "Highlight / snippet",
+      "features_ref": "FEATURES.md:135 Search",
+      "surface": "dashboard route",
+      "proof_key": "P6"
+    },
+    {
+      "capability": "Smart sorting",
+      "features_ref": "FEATURES.md:136 Search",
+      "surface": "dashboard route",
+      "proof_key": "P1"
+    },
+    {
+      "capability": "Custom ranking",
+      "features_ref": "FEATURES.md:137 Search",
+      "surface": "dashboard route",
+      "proof_key": "P9"
+    },
+    {
+      "capability": "Optional filters (soft boost)",
+      "features_ref": "FEATURES.md:138 Search",
+      "surface": "API only",
+      "proof_key": null
+    },
+    {
+      "capability": "Sum of filters scoring",
+      "features_ref": "FEATURES.md:139 Search",
+      "surface": "API only",
+      "proof_key": null
+    },
+    {
+      "capability": "Decompounding",
+      "features_ref": "FEATURES.md:140 Search",
+      "surface": "config only",
+      "proof_key": null
+    },
+    {
+      "capability": "CJK tokenization",
+      "features_ref": "FEATURES.md:141 Search",
+      "surface": "dashboard route",
+      "proof_key": "P8"
+    },
+    {
+      "capability": "Language-specific stemming",
+      "features_ref": "FEATURES.md:142 Search",
+      "surface": "dashboard route",
+      "proof_key": "P8"
+    },
+    {
+      "capability": "Dead-node auto-heal",
+      "features_ref": "FEATURES.md:148 High Availability",
+      "surface": "config only",
+      "proof_key": null
+    },
+    {
+      "capability": "Schemaless JSON upload",
+      "features_ref": "FEATURES.md:154 Indexing & Records",
+      "surface": "dashboard route",
+      "proof_key": "P10"
+    },
+    {
+      "capability": "`flapjack ingest` beta",
+      "features_ref": "FEATURES.md:155 Indexing & Records",
+      "surface": "CLI only",
+      "proof_key": null
+    },
+    {
+      "capability": "Atomic bulk-replace job API",
+      "features_ref": "FEATURES.md:156 Indexing & Records",
+      "surface": "API only",
+      "proof_key": null
+    },
+    {
+      "capability": "Single record CRUD",
+      "features_ref": "FEATURES.md:157 Indexing & Records",
+      "surface": "dashboard route",
+      "proof_key": "P10"
+    },
+    {
+      "capability": "Batch operations",
+      "features_ref": "FEATURES.md:158 Indexing & Records",
+      "surface": "dashboard route",
+      "proof_key": "P10"
+    },
+    {
+      "capability": "Browse (full index scan)",
+      "features_ref": "FEATURES.md:159 Indexing & Records",
+      "surface": "dashboard route",
+      "proof_key": "P1"
+    },
+    {
+      "capability": "deleteByQuery",
+      "features_ref": "FEATURES.md:160 Indexing & Records",
+      "surface": "API only",
+      "proof_key": null
+    },
+    {
+      "capability": "partialUpdateObjects",
+      "features_ref": "FEATURES.md:161 Indexing & Records",
+      "surface": "API only",
+      "proof_key": null
+    },
+    {
+      "capability": "Index copy / move / clear",
+      "features_ref": "FEATURES.md:162 Indexing & Records",
+      "surface": "API only",
+      "proof_key": null
+    },
+    {
+      "capability": "Replicas",
+      "features_ref": "FEATURES.md:163 Indexing & Records",
+      "surface": "API only",
+      "proof_key": null
+    },
+    {
+      "capability": "Task status API",
+      "features_ref": "FEATURES.md:164 Indexing & Records",
+      "surface": "API only",
+      "proof_key": null
+    },
+    {
+      "capability": "searchableAttributes",
+      "features_ref": "FEATURES.md:180 Index Settings",
+      "surface": "dashboard route",
+      "proof_key": "P6"
+    },
+    {
+      "capability": "attributesForFaceting",
+      "features_ref": "FEATURES.md:181 Index Settings",
+      "surface": "dashboard route",
+      "proof_key": "P6"
+    },
+    {
+      "capability": "ranking (built-in criteria)",
+      "features_ref": "FEATURES.md:182 Index Settings",
+      "surface": "dashboard route",
+      "proof_key": "P9"
+    },
+    {
+      "capability": "customRanking",
+      "features_ref": "FEATURES.md:183 Index Settings",
+      "surface": "dashboard route",
+      "proof_key": "P9"
+    },
+    {
+      "capability": "attributesToRetrieve",
+      "features_ref": "FEATURES.md:184 Index Settings",
+      "surface": "dashboard route",
+      "proof_key": "P6"
+    },
+    {
+      "capability": "attributesToHighlight / Snippet",
+      "features_ref": "FEATURES.md:185 Index Settings",
+      "surface": "dashboard route",
+      "proof_key": "P6"
+    },
+    {
+      "capability": "queryType / removeWordsIfNoResults",
+      "features_ref": "FEATURES.md:186 Index Settings",
+      "surface": "dashboard route",
+      "proof_key": "P7"
+    },
+    {
+      "capability": "typoTolerance settings",
+      "features_ref": "FEATURES.md:187 Index Settings",
+      "surface": "API only",
+      "proof_key": null
+    },
+    {
+      "capability": "minWordSizeFor1/2Typos",
+      "features_ref": "FEATURES.md:188 Index Settings",
+      "surface": "dashboard route",
+      "proof_key": "P6"
+    },
+    {
+      "capability": "ignorePlurals / removeStopWords",
+      "features_ref": "FEATURES.md:189 Index Settings",
+      "surface": "dashboard route",
+      "proof_key": "P8"
+    },
+    {
+      "capability": "Pagination settings (hitsPerPage, paginationLimitedTo)",
+      "features_ref": "FEATURES.md:190 Index Settings",
+      "surface": "dashboard route",
+      "proof_key": "P6"
+    },
+    {
+      "capability": "numericAttributesForFiltering",
+      "features_ref": "FEATURES.md:191 Index Settings",
+      "surface": "API only",
+      "proof_key": null
+    },
+    {
+      "capability": "unretrievableAttributes",
+      "features_ref": "FEATURES.md:192 Index Settings",
+      "surface": "dashboard route",
+      "proof_key": "P6"
+    },
+    {
+      "capability": "disableTypoToleranceOnAttributes",
+      "features_ref": "FEATURES.md:193 Index Settings",
+      "surface": "API only",
+      "proof_key": null
+    },
+    {
+      "capability": "All remaining Algolia settings",
+      "features_ref": "FEATURES.md:194 Index Settings",
+      "surface": "API only",
+      "proof_key": null
+    },
+    {
+      "capability": "Search query logs",
+      "features_ref": "FEATURES.md:200 Analytics & Insights",
+      "surface": "dashboard route",
+      "proof_key": null
+    },
+    {
+      "capability": "Analytics API (top queries, no-results, no-clicks)",
+      "features_ref": "FEATURES.md:201 Analytics & Insights",
+      "surface": "dashboard route",
+      "proof_key": "P13"
+    },
+    {
+      "capability": "Events / Insights API",
+      "features_ref": "FEATURES.md:202 Analytics & Insights",
+      "surface": "dashboard route",
+      "proof_key": "P14"
+    },
+    {
+      "capability": "Event Debugger",
+      "features_ref": "FEATURES.md:203 Analytics & Insights",
+      "surface": "dashboard route",
+      "proof_key": "P14"
+    },
+    {
+      "capability": "A/B Testing (experiments)",
+      "features_ref": "FEATURES.md:204 Analytics & Insights",
+      "surface": "dashboard route",
+      "proof_key": "P15"
+    },
+    {
+      "capability": "Usage metering",
+      "features_ref": "FEATURES.md:205 Analytics & Insights",
+      "surface": "dashboard route",
+      "proof_key": "P16"
+    },
+    {
+      "capability": "Analytics retention cleanup",
+      "features_ref": "FEATURES.md:206 Analytics & Insights",
+      "surface": "config only",
+      "proof_key": null
+    },
+    {
+      "capability": "Durable analytics rollup storage",
+      "features_ref": "FEATURES.md:207 Analytics & Insights",
+      "surface": "dashboard route",
+      "proof_key": "P13"
+    },
+    {
+      "capability": "Personalization API",
+      "features_ref": "FEATURES.md:213 Personalization & AI",
+      "surface": "dashboard route",
+      "proof_key": "P17"
+    },
+    {
+      "capability": "Personalization in search",
+      "features_ref": "FEATURES.md:214 Personalization & AI",
+      "surface": "dashboard route",
+      "proof_key": "P17"
+    },
+    {
+      "capability": "Recommendations API",
+      "features_ref": "FEATURES.md:215 Personalization & AI",
+      "surface": "dashboard route",
+      "proof_key": "P18"
+    },
+    {
+      "capability": "AI Search / RAG endpoint",
+      "features_ref": "FEATURES.md:216 Personalization & AI",
+      "surface": "dashboard route",
+      "proof_key": "P19"
+    },
+    {
+      "capability": "Re-ranking (enableReRanking)",
+      "features_ref": "FEATURES.md:217 Personalization & AI",
+      "surface": "API only",
+      "proof_key": null
+    },
+    {
+      "capability": "Vector search",
+      "features_ref": "FEATURES.md:218 Personalization & AI",
+      "surface": "dashboard route",
+      "proof_key": "P20"
+    },
+    {
+      "capability": "API Keys",
+      "features_ref": "FEATURES.md:224 API Keys & Security",
+      "surface": "dashboard route",
+      "proof_key": "P21"
+    },
+    {
+      "capability": "ACL (Access Control Lists)",
+      "features_ref": "FEATURES.md:225 API Keys & Security",
+      "surface": "dashboard route",
+      "proof_key": "P21"
+    },
+    {
+      "capability": "Key restrictions",
+      "features_ref": "FEATURES.md:226 API Keys & Security",
+      "surface": "dashboard route",
+      "proof_key": "P21"
+    },
+    {
+      "capability": "Rate limiting per key",
+      "features_ref": "FEATURES.md:227 API Keys & Security",
+      "surface": "dashboard route",
+      "proof_key": null
+    },
+    {
+      "capability": "Security Sources / Vault",
+      "features_ref": "FEATURES.md:228 API Keys & Security",
+      "surface": "dashboard route",
+      "proof_key": "P22"
+    },
+    {
+      "capability": "Secured API keys (signed)",
+      "features_ref": "FEATURES.md:229 API Keys & Security",
+      "surface": "API only",
+      "proof_key": null
+    },
+    {
+      "capability": "Stop words dictionary",
+      "features_ref": "FEATURES.md:235 Dictionaries",
+      "surface": "dashboard route",
+      "proof_key": "P23"
+    },
+    {
+      "capability": "Plurals dictionary",
+      "features_ref": "FEATURES.md:236 Dictionaries",
+      "surface": "dashboard route",
+      "proof_key": "P23"
+    },
+    {
+      "capability": "Compounds dictionary",
+      "features_ref": "FEATURES.md:237 Dictionaries",
+      "surface": "dashboard route",
+      "proof_key": "P23"
+    },
+    {
+      "capability": "Custom entries",
+      "features_ref": "FEATURES.md:238 Dictionaries",
+      "surface": "dashboard route",
+      "proof_key": "P23"
+    },
+    {
+      "capability": "Multi-tenant isolation",
+      "features_ref": "FEATURES.md:244 Infrastructure",
+      "surface": "dashboard route",
+      "proof_key": "P27"
+    },
+    {
+      "capability": "Oplog replication + startup catch-up",
+      "features_ref": "FEATURES.md:245 Infrastructure",
+      "surface": "dashboard route",
+      "proof_key": "P25"
+    },
+    {
+      "capability": "S3 snapshots",
+      "features_ref": "FEATURES.md:246 Infrastructure",
+      "surface": "dashboard route",
+      "proof_key": "P26"
+    },
+    {
+      "capability": "Published operations APIs",
+      "features_ref": "FEATURES.md:247 Infrastructure",
+      "surface": "dashboard route",
+      "proof_key": "P24"
+    },
+    {
+      "capability": "SSL / TLS",
+      "features_ref": "FEATURES.md:248 Infrastructure",
+      "surface": "dashboard route",
+      "proof_key": null
+    },
+    {
+      "capability": "OpenAPI spec",
+      "features_ref": "FEATURES.md:249 Infrastructure",
+      "surface": "API only",
+      "proof_key": null
+    },
+    {
+      "capability": "Memory safety",
+      "features_ref": "FEATURES.md:250 Infrastructure",
+      "surface": "dashboard route",
+      "proof_key": "P28"
+    },
+    {
+      "capability": "Health endpoint",
+      "features_ref": "FEATURES.md:251 Infrastructure",
+      "surface": "dashboard route",
+      "proof_key": "P24"
+    },
+    {
+      "capability": "Readiness probe (`/health/ready`)",
+      "features_ref": "FEATURES.md:252 Infrastructure",
+      "surface": "dashboard route",
+      "proof_key": "P24"
+    },
+    {
+      "capability": "Request latency histograms",
+      "features_ref": "FEATURES.md:253 Infrastructure",
+      "surface": "dashboard route",
+      "proof_key": "P16"
+    },
+    {
+      "capability": "Error response parity",
+      "features_ref": "FEATURES.md:254 Infrastructure",
+      "surface": "API only",
+      "proof_key": null
+    },
+    {
+      "capability": "Request ID propagation (Stage 1)",
+      "features_ref": "FEATURES.md:263 Operational / Observability",
+      "surface": "API only",
+      "proof_key": null
+    },
+    {
+      "capability": "JSON structured logging (Stage 2)",
+      "features_ref": "FEATURES.md:264 Operational / Observability",
+      "surface": "config only",
+      "proof_key": null
+    },
+    {
+      "capability": "Configurable CORS origins (Stage 4)",
+      "features_ref": "FEATURES.md:265 Operational / Observability",
+      "surface": "config only",
+      "proof_key": null
+    },
+    {
+      "capability": "Graceful shutdown timeout (Stage 5)",
+      "features_ref": "FEATURES.md:266 Operational / Observability",
+      "surface": "config only",
+      "proof_key": null
+    },
+    {
+      "capability": "Startup dependency summary (Stage 6)",
+      "features_ref": "FEATURES.md:267 Operational / Observability",
+      "surface": "config only",
+      "proof_key": null
+    },
+    {
+      "capability": "Source export: Algolia \u2192 durable on-disk spool (checkpointed, resumable)",
+      "features_ref": "FEATURES.md:295 Algolia migration",
+      "surface": "dashboard route",
+      "proof_key": "P29"
+    },
+    {
+      "capability": "Translation: spool \u2192 Flapjack documents/settings/synonyms/rules",
+      "features_ref": "FEATURES.md:296 Algolia migration",
+      "surface": "dashboard route",
+      "proof_key": "P29"
+    },
+    {
+      "capability": "Import: translated content \u2192 target index via staged publication",
+      "features_ref": "FEATURES.md:297 Algolia migration",
+      "surface": "dashboard route",
+      "proof_key": "P29"
+    },
+    {
+      "capability": "Staged publication primitive (crash-safe, node-local)",
+      "features_ref": "FEATURES.md:298 Algolia migration",
+      "surface": "API only",
+      "proof_key": null
+    }
+  ]
+}

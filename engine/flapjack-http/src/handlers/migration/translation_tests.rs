@@ -1,6 +1,7 @@
+use super::super::source_reader::SourceConfigurationRecord;
 use super::super::spool::{
-    AcceptedSpoolReader, AsyncMigrationPublicationSemantic, ResourceDenominators, SpoolLimits,
-    SpoolStore,
+    AcceptedSpoolReader, AsyncMigrationPublicationSemantic, ResourceDenominators, SpoolError,
+    SpoolErrorKind, SpoolLimits, SpoolStore,
 };
 use super::translation_bundle::{translate_replica_settings, translate_replica_topology};
 use super::*;
@@ -40,6 +41,14 @@ pub(in crate::handlers::migration) fn spool_payload(
     rule_pages: Vec<Vec<serde_json::Value>>,
     synonym_pages: Vec<Vec<serde_json::Value>>,
 ) -> SpoolTranslationInput {
+    let rule_stable_id_pages = rule_pages
+        .iter()
+        .map(|page| page_stable_ids(page))
+        .collect();
+    let synonym_stable_id_pages = synonym_pages
+        .iter()
+        .map(|page| page_stable_ids(page))
+        .collect();
     SpoolTranslationInput {
         source_index_name: "products".to_string(),
         target_index_name: "shop".to_string(),
@@ -47,7 +56,9 @@ pub(in crate::handlers::migration) fn spool_payload(
         settings,
         document_pages,
         rule_pages,
+        rule_stable_id_pages,
         synonym_pages,
+        synonym_stable_id_pages,
         replica_settings: BTreeMap::new(),
     }
 }
@@ -62,6 +73,21 @@ fn typesense_spool_payload(settings: serde_json::Value) -> SpoolTranslationInput
             vec![],
         )
     }
+}
+
+/// TODO: Document accepted_spool_fixture.
+/// Everything one accepted-spool fixture commits before acceptance. A spec
+/// struct rather than positional arguments so replica-owned settings — which
+/// must be committed before `accept_export` fences the job — can be supplied
+/// without growing every fixture call site.
+struct AcceptedSpoolSpec {
+    source_provider: AsyncMigrationSourceProvider,
+    settings: serde_json::Value,
+    document_pages: Vec<Vec<serde_json::Value>>,
+    rule_pages: Vec<Vec<serde_json::Value>>,
+    synonym_pages: Vec<Vec<serde_json::Value>>,
+    synonym_stable_id_pages: Option<Vec<Vec<String>>>,
+    replica_settings: BTreeMap<String, serde_json::Value>,
 }
 
 fn accepted_spool_fixture(
@@ -86,6 +112,44 @@ fn accepted_spool_fixture_for_provider(
     rule_pages: Vec<Vec<serde_json::Value>>,
     synonym_pages: Vec<Vec<serde_json::Value>>,
 ) -> AcceptedSpoolFixture {
+    accepted_spool_fixture_from_spec(AcceptedSpoolSpec {
+        source_provider,
+        settings,
+        document_pages,
+        rule_pages,
+        synonym_pages,
+        synonym_stable_id_pages: None,
+        replica_settings: BTreeMap::new(),
+    })
+}
+
+/// An accepted spool whose durable derived-configuration artifacts carry the
+/// given replica-owned settings, mirroring what `SpoolExportSink` writes.
+fn accepted_spool_fixture_with_replica_settings(
+    settings: serde_json::Value,
+    replica_settings: BTreeMap<String, serde_json::Value>,
+) -> AcceptedSpoolFixture {
+    accepted_spool_fixture_from_spec(AcceptedSpoolSpec {
+        source_provider: AsyncMigrationSourceProvider::Algolia,
+        settings,
+        document_pages: Vec::new(),
+        rule_pages: Vec::new(),
+        synonym_pages: Vec::new(),
+        synonym_stable_id_pages: None,
+        replica_settings,
+    })
+}
+
+fn accepted_spool_fixture_from_spec(spec: AcceptedSpoolSpec) -> AcceptedSpoolFixture {
+    let AcceptedSpoolSpec {
+        source_provider,
+        settings,
+        document_pages,
+        rule_pages,
+        synonym_pages,
+        synonym_stable_id_pages,
+        replica_settings,
+    } = spec;
     let tmp = TempDir::new().unwrap();
     let store = SpoolStore::new(tmp.path(), SpoolLimits::default()).unwrap();
     let job_uuid = uuid::Uuid::new_v4();
@@ -132,8 +196,11 @@ fn accepted_spool_fixture_for_provider(
             .commit_rule_page_with_ids(view.job_uuid, &serde_json::to_vec(page).unwrap(), &id_refs)
             .unwrap();
     }
-    for page in &synonym_pages {
-        let ids = object_ids(page);
+    for (page_index, page) in synonym_pages.iter().enumerate() {
+        let ids = synonym_stable_id_pages
+            .as_ref()
+            .map(|pages| pages[page_index].clone())
+            .unwrap_or_else(|| object_ids(page));
         let id_refs = ids.iter().map(String::as_str).collect::<Vec<_>>();
         store
             .commit_synonym_page_with_ids(
@@ -161,6 +228,11 @@ fn accepted_spool_fixture_for_provider(
             TEST_SOURCE_DIGEST,
         )
         .unwrap();
+    for (source_name, settings) in &replica_settings {
+        store
+            .commit_derived_source_settings(view.job_uuid, source_name, settings)
+            .unwrap();
+    }
     store.accept_export(view.job_uuid).unwrap();
 
     AcceptedSpoolFixture {
@@ -1768,6 +1840,9 @@ fn typesense_spool_translation_reports_provider_warnings_for_raw_settings() {
     })));
 
     assert_eq!(translated.report.summary.hard_rejections, 0);
+    // `enable_nested_fields` is a translation control (not warned) and the blanket
+    // `$.fields` warning is replaced by per-field attribution: the vector field at
+    // index 1 and the reference field at index 2. Report order is path-sorted.
     assert_eq!(
         entries_for_code(&translated.report, ReportCode::TypesenseSettingNotMigrated)
             .iter()
@@ -1776,8 +1851,8 @@ fn typesense_spool_translation_reports_provider_warnings_for_raw_settings() {
         vec![
             "$.curation_sets",
             "$.default_sorting_field",
-            "$.enable_nested_fields",
-            "$.fields",
+            "$.fields[1]",
+            "$.fields[2]",
             "$.symbols_to_index",
             "$.synonym_sets",
             "$.token_separators",
@@ -1823,7 +1898,6 @@ fn accepted_typesense_spool_translation_uses_persisted_source_provider() {
         fixture.reader,
         "products".to_string(),
         "shop".to_string(),
-        BTreeMap::new(),
         &mut instrumentation,
         || Ok(false),
         |_batch| Ok::<(), std::convert::Infallible>(()),
@@ -1868,7 +1942,6 @@ fn translates_accepted_spool_in_bounded_document_batches() {
         fixture.reader,
         "products".to_string(),
         "shop".to_string(),
-        BTreeMap::new(),
         &mut instrumentation,
         || Ok(false),
         |batch| {
@@ -1947,6 +2020,273 @@ fn translates_accepted_spool_in_bounded_document_batches() {
 }
 
 #[test]
+fn accepted_meilisearch_spool_preserves_and_translates_native_synonym_payload() {
+    let stable_id = "meilisearch:synonym:url";
+    let native_payload = json!({
+        "url": ["https://search.example/synonym", "address"]
+    });
+    let source_record =
+        SourceConfigurationRecord::new(stable_id.to_string(), native_payload.clone()).unwrap();
+    let fixture = accepted_spool_fixture_from_spec(AcceptedSpoolSpec {
+        source_provider: AsyncMigrationSourceProvider::Meilisearch,
+        settings: json!({}),
+        document_pages: Vec::new(),
+        rule_pages: Vec::new(),
+        synonym_pages: vec![vec![source_record.identity_payload()]],
+        synonym_stable_id_pages: Some(vec![vec![source_record.stable_id().to_string()]]),
+        replica_settings: BTreeMap::new(),
+    });
+
+    let captured_pages = fixture
+        .reader
+        .synonym_pages()
+        .collect::<Result<Vec<_>, SpoolError>>()
+        .unwrap();
+    assert_eq!(captured_pages[0].items, vec![native_payload]);
+    assert_eq!(captured_pages[0].stable_ids, vec![stable_id]);
+
+    let mut instrumentation = TranslationSessionInstrumentation::default();
+    let translated = match translate_accepted_spool_payload(
+        fixture.reader,
+        "products".to_string(),
+        "shop".to_string(),
+        &mut instrumentation,
+        || Ok(false),
+        |_batch| Ok::<(), std::convert::Infallible>(()),
+    )
+    .expect("accepted Meilisearch spool artifacts should read")
+    {
+        TranslationOutcome::Translated(translated) => *translated,
+        TranslationOutcome::Rejected(report) => {
+            panic!("native Meilisearch synonym must translate, got {report:#?}")
+        }
+    };
+
+    assert_eq!(translated.report.summary.hard_rejections, 0);
+    assert_eq!(translated.bundle.synonyms.len(), 1);
+    assert_eq!(translated.bundle.synonyms[0].object_id(), stable_id);
+    assert_eq!(
+        serde_json::to_value(&translated.bundle.synonyms[0]).unwrap(),
+        json!({
+            "type": "synonym",
+            "objectID": stable_id,
+            "synonyms": ["url", "https://search.example/synonym", "address"]
+        })
+    );
+}
+
+#[test]
+fn accepted_meilisearch_spool_rejects_empty_string_synonym_alternative() {
+    // An empty-string alternative is not a valid Meilisearch synonym. The source
+    // reader no longer re-validates equivalents, so the translator is the single
+    // owner of this rule and it must reject the payload on a spool replay rather
+    // than emit an empty synonym word.
+    let stable_id = "meilisearch:synonym:saw";
+    let native_payload = json!({ "saw": ["cutter", ""] });
+    let source_record =
+        SourceConfigurationRecord::new(stable_id.to_string(), native_payload.clone()).unwrap();
+    let fixture = accepted_spool_fixture_from_spec(AcceptedSpoolSpec {
+        source_provider: AsyncMigrationSourceProvider::Meilisearch,
+        settings: json!({}),
+        document_pages: Vec::new(),
+        rule_pages: Vec::new(),
+        synonym_pages: vec![vec![source_record.identity_payload()]],
+        synonym_stable_id_pages: Some(vec![vec![source_record.stable_id().to_string()]]),
+        replica_settings: BTreeMap::new(),
+    });
+
+    let mut instrumentation = TranslationSessionInstrumentation::default();
+    let report = match translate_accepted_spool_payload(
+        fixture.reader,
+        "products".to_string(),
+        "shop".to_string(),
+        &mut instrumentation,
+        || Ok(false),
+        |_batch| Ok::<(), std::convert::Infallible>(()),
+    )
+    .expect("accepted Meilisearch spool artifacts should read")
+    {
+        TranslationOutcome::Rejected(report) => report,
+        TranslationOutcome::Translated(_) => {
+            panic!("empty-string synonym alternative must be rejected")
+        }
+    };
+
+    assert_eq!(report.summary.hard_rejections, 1);
+    let entry = entry_for_code(&report, ReportCode::MalformedSynonymPayload);
+    assert_eq!(entry.resource, ReportResource::Synonym);
+    assert_eq!(entry.json_path, "$.saw[1]");
+}
+
+fn assert_meilisearch_synonym_sidecar_is_manifest_corrupt(
+    synonym_pages: Vec<Vec<Value>>,
+    synonym_stable_id_pages: Vec<Vec<String>>,
+) {
+    let input = SpoolTranslationInput {
+        source_index_name: "products".to_string(),
+        target_index_name: "shop".to_string(),
+        source_provider: AsyncMigrationSourceProvider::Meilisearch,
+        settings: json!({}),
+        document_pages: vec![],
+        rule_pages: vec![],
+        rule_stable_id_pages: vec![],
+        synonym_pages,
+        synonym_stable_id_pages,
+        replica_settings: BTreeMap::new(),
+    };
+    let mut instrumentation = TranslationSessionInstrumentation::default();
+
+    let error = translate_spool_input(input, &mut instrumentation, |_batch| {
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .expect_err("misaligned native synonym sidecar must fail before translation");
+
+    match error {
+        TranslationStreamError::Spool(error) => {
+            assert_eq!(error.kind(), SpoolErrorKind::ManifestCorrupt)
+        }
+        other => panic!("expected manifest corruption, got {other:?}"),
+    }
+}
+
+#[test]
+fn missing_synonym_stable_id_sidecar_is_manifest_corrupt() {
+    let native_synonym = |input: &str| json!({ input: ["alternative"] });
+
+    assert_meilisearch_synonym_sidecar_is_manifest_corrupt(
+        vec![vec![native_synonym("saw")]],
+        vec![],
+    );
+}
+
+#[test]
+fn misaligned_synonym_stable_id_page_count_is_manifest_corrupt() {
+    let native_synonym = |input: &str| json!({ input: ["alternative"] });
+
+    assert_meilisearch_synonym_sidecar_is_manifest_corrupt(
+        vec![vec![native_synonym("saw")], vec![native_synonym("wrench")]],
+        vec![vec!["meilisearch:synonym:saw".to_string()]],
+    );
+}
+
+#[test]
+fn misaligned_synonym_stable_id_item_count_is_manifest_corrupt() {
+    let native_synonym = |input: &str| json!({ input: ["alternative"] });
+
+    assert_meilisearch_synonym_sidecar_is_manifest_corrupt(
+        vec![vec![native_synonym("saw"), native_synonym("wrench")]],
+        vec![vec!["meilisearch:synonym:saw".to_string()]],
+    );
+}
+
+#[test]
+fn orphan_synonym_stable_id_sidecar_without_value_pages_is_manifest_corrupt() {
+    // An explicit sidecar with no value pages to align against is orphan identity
+    // state: translating it as an empty synonym set would silently discard the
+    // stable IDs the neutral seam captured.
+    assert_meilisearch_synonym_sidecar_is_manifest_corrupt(
+        vec![],
+        vec![vec!["meilisearch:synonym:saw".to_string()]],
+    );
+}
+
+#[test]
+fn accepted_meilisearch_spool_translates_synonym_with_no_alternatives() {
+    // Meilisearch accepts an input mapped to an empty alternatives list, and the
+    // translated Algolia synonym is then the input word alone. Capture and replay
+    // must keep that provider behavior instead of rejecting the payload.
+    let stable_id = "meilisearch:synonym:saw";
+    let native_payload = json!({ "saw": [] });
+    let source_record =
+        SourceConfigurationRecord::new(stable_id.to_string(), native_payload.clone()).unwrap();
+    let fixture = accepted_spool_fixture_from_spec(AcceptedSpoolSpec {
+        source_provider: AsyncMigrationSourceProvider::Meilisearch,
+        settings: json!({}),
+        document_pages: Vec::new(),
+        rule_pages: Vec::new(),
+        synonym_pages: vec![vec![source_record.identity_payload()]],
+        synonym_stable_id_pages: Some(vec![vec![source_record.stable_id().to_string()]]),
+        replica_settings: BTreeMap::new(),
+    });
+
+    let mut instrumentation = TranslationSessionInstrumentation::default();
+    let translated = match translate_accepted_spool_payload(
+        fixture.reader,
+        "products".to_string(),
+        "shop".to_string(),
+        &mut instrumentation,
+        || Ok(false),
+        |_batch| Ok::<(), std::convert::Infallible>(()),
+    )
+    .expect("accepted Meilisearch spool artifacts should read")
+    {
+        TranslationOutcome::Translated(translated) => *translated,
+        TranslationOutcome::Rejected(report) => {
+            panic!("synonym with no alternatives must translate, got {report:#?}")
+        }
+    };
+
+    assert_eq!(translated.report.summary.hard_rejections, 0);
+    assert_eq!(translated.bundle.synonyms.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&translated.bundle.synonyms[0]).unwrap(),
+        json!({
+            "type": "synonym",
+            "objectID": stable_id,
+            "synonyms": ["saw"]
+        })
+    );
+}
+
+#[test]
+fn accepted_typesense_spool_preserves_provider_native_settings_payload() {
+    let native_settings = json!({
+        "default_sorting_field": "price",
+        "enable_nested_fields": true,
+        "metadata": {
+            "url": "https://typesense.example/schema",
+            "apiKey": "source-owned-field-name",
+            "nested": {
+                "endpoint": "https://typesense.example/nested"
+            }
+        }
+    });
+    let fixture = accepted_spool_fixture_for_provider(
+        AsyncMigrationSourceProvider::Typesense,
+        native_settings.clone(),
+        vec![vec![json!({"objectID": "prod_001", "id": "prod_001"})]],
+        vec![],
+        vec![],
+    );
+
+    assert_eq!(
+        fixture.reader.settings().unwrap(),
+        native_settings,
+        "accepted spool must retain the exact provider-native settings payload"
+    );
+
+    let mut instrumentation = TranslationSessionInstrumentation::default();
+    let translated = match translate_accepted_spool_payload(
+        fixture.reader,
+        "products".to_string(),
+        "shop".to_string(),
+        &mut instrumentation,
+        || Ok(false),
+        |_batch| Ok::<(), std::convert::Infallible>(()),
+    )
+    .expect("accepted Typesense spool artifacts should read")
+    {
+        TranslationOutcome::Translated(translated) => *translated,
+        TranslationOutcome::Rejected(report) => {
+            panic!("native Typesense settings must not hard-reject, got {report:#?}")
+        }
+    };
+
+    assert_eq!(translated.report.summary.hard_rejections, 0);
+    assert_eq!(translated.bundle.settings.pagination_limited_to, 1000);
+}
+
+#[test]
 fn accepted_spool_translation_preserves_malformed_typed_payload_paths() {
     let fixture = accepted_spool_fixture(
         minimal_valid_settings(),
@@ -1968,7 +2308,6 @@ fn accepted_spool_translation_preserves_malformed_typed_payload_paths() {
         fixture.reader,
         "products".to_string(),
         "shop".to_string(),
-        BTreeMap::new(),
         &mut instrumentation,
         || Ok(false),
         |batch| {
@@ -2028,14 +2367,16 @@ fn replica_settings_map() -> BTreeMap<String, serde_json::Value> {
 /// entry point and is observed there — counted, never applied to settings.
 #[test]
 fn accepted_spool_translation_observes_carried_replica_settings_count() {
-    let fixture = accepted_spool_fixture(minimal_valid_settings(), vec![], vec![], vec![]);
+    let fixture = accepted_spool_fixture_with_replica_settings(
+        minimal_valid_settings(),
+        replica_settings_map(),
+    );
     let mut instrumentation = TranslationSessionInstrumentation::default();
 
     let outcome = translate_accepted_spool_payload(
         fixture.reader,
         "products".to_string(),
         "shop".to_string(),
-        replica_settings_map(),
         &mut instrumentation,
         || Ok(false),
         |_batch| Ok::<(), std::convert::Infallible>(()),
@@ -2056,7 +2397,9 @@ fn in_memory_translation_observes_carried_replica_settings_count() {
         settings: minimal_valid_settings(),
         document_pages: vec![],
         rule_pages: vec![],
+        rule_stable_id_pages: vec![],
         synonym_pages: vec![],
+        synonym_stable_id_pages: vec![],
         replica_settings: replica_settings_map(),
     };
     let mut instrumentation = TranslationSessionInstrumentation::default();

@@ -1,21 +1,45 @@
 use super::*;
 #[cfg(test)]
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// The idle-progress deadline is measured on the same monotonic clock that
+// `tokio::time::sleep` (below) drives the poll loop with, so a paused test clock
+// controls the deadline and the sleeps together instead of racing wall time.
+use tokio::time::Instant;
 
-/// Default deadline for durable HTTP writes, in milliseconds.
-///
-/// Overridable at runtime via `FLAPJACK_WRITE_DURABLE_TIMEOUT_MS`. Bounds how long
-/// a durable write handler will wait for the write-queue consumer to commit before
-/// returning a retriable `WriteAckTimeout` (503). The default is generous so normal
-/// commits never trip it; the bound exists only to keep an HTTP request from hanging
-/// forever if the consumer task dies mid-restart (PL-13 silent-drop failure mode).
+/// Default durable HTTP-write deadline, overridable through
+/// `FLAPJACK_WRITE_DURABLE_TIMEOUT_MS`. It bounds dead-consumer waits without
+/// affecting ordinary commits (PL-13 silent-drop failure mode).
 const DEFAULT_WRITE_DURABLE_TIMEOUT_MS: u64 = 30_000;
+const WRITE_DURABLE_FAIL_CLOSED_GRACE_MS: u64 = 1_000;
 
 #[derive(Clone, Copy)]
 enum WriteAdmissionMode {
     Live,
     Durable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DurableWriteProgress {
+    status: TaskStatus,
+    received_documents: usize,
+    indexed_documents: usize,
+}
+
+impl DurableWriteProgress {
+    fn from_task(task: &TaskInfo) -> Self {
+        Self {
+            status: task.status.clone(),
+            received_documents: task.received_documents,
+            indexed_documents: task.indexed_documents,
+        }
+    }
+
+    fn advanced_beyond(&self, previous: &Self) -> bool {
+        self.status != previous.status
+            || self.received_documents > previous.received_documents
+            || self.indexed_documents > previous.indexed_documents
+    }
 }
 
 #[cfg(test)]
@@ -205,23 +229,24 @@ impl super::IndexManager {
                 let vector_ctx = VectorWriteContext::new(Arc::clone(&self.vector_indices));
                 #[cfg(not(feature = "vector-search"))]
                 let vector_ctx = VectorWriteContext::new();
-                let (queue, handle, cancellation) = create_write_queue(WriteQueueContext {
-                    tenant_id: tenant_id.to_string(),
-                    index: Arc::clone(index),
-                    tasks: Arc::clone(&self.tasks),
-                    base_path: self.base_path.clone(),
-                    oplog: Some(Arc::clone(&oplog)),
-                    admission_store: Arc::clone(&admission_store),
-                    facet_cache: Arc::clone(&self.facet_cache),
-                    vector_ctx,
-                    queue_metrics_id: 0,
-                    writer_buffer_size: self.write_queue_writer_buffer_size(),
-                    #[cfg(test)]
-                    test_overrides: Default::default(),
-                })?;
+                let (queue, handle, cancellation, worker_completion) =
+                    create_write_queue(WriteQueueContext {
+                        tenant_id: tenant_id.to_string(),
+                        index: Arc::clone(index),
+                        tasks: Arc::clone(&self.tasks),
+                        base_path: self.base_path.clone(),
+                        oplog: Some(Arc::clone(&oplog)),
+                        admission_store: Arc::clone(&admission_store),
+                        facet_cache: Arc::clone(&self.facet_cache),
+                        vector_ctx,
+                        queue_metrics_id: 0,
+                        writer_buffer_size: self.write_queue_writer_buffer_size(),
+                        #[cfg(test)]
+                        test_overrides: Default::default(),
+                    })?;
                 self.write_task_handles.insert(
                     tenant_id.to_string(),
-                    WriteTaskHandle::new_with_cancellation(handle, cancellation),
+                    WriteTaskHandle::new_with_cancellation(handle, cancellation, worker_completion),
                 );
                 Ok(queue)
             })?;
@@ -508,27 +533,28 @@ impl super::IndexManager {
         Duration::from_millis(ms)
     }
 
-    /// Poll a task's status until it reaches a terminal state, sleeping 10ms between
-    /// checks. This is the single source of truth for the "wait until durable" loop
-    /// shared by the unbounded `*_sync` helpers and the bounded `*_durable` paths.
-    ///
-    /// `timeout` selects the waiting policy:
-    /// - `None` — poll indefinitely (internal callers and tests rely on this).
-    /// - `Some(d)` — return [`FlapjackError::WriteAckTimeout`] if the task has not
-    ///   reached a terminal state by `now + d`, so an HTTP write handler cannot hang
-    ///   forever when the write-queue consumer dies before committing (PL-13).
-    ///
-    /// A terminal `Succeeded` resolves to `Ok(())`; a terminal `Failed` propagates the
-    /// underlying message as [`FlapjackError::Tantivy`], which maps to a 5xx response.
+    /// Single terminal-status loop for unbounded sync calls and bounded durable
+    /// calls. A deadline invokes the fail-closed timeout policy; terminal failures
+    /// preserve their underlying 5xx error.
     async fn await_task_terminal(&self, task_id: &str, timeout: Option<Duration>) -> Result<()> {
-        let deadline = timeout.map(|d| Instant::now() + d);
+        let mut idle_deadline = timeout.map(|d| Instant::now() + d);
+        let mut last_progress = None;
         loop {
             let status = self.get_task(task_id)?;
+            let current_progress = DurableWriteProgress::from_task(&status);
+            if last_progress
+                .as_ref()
+                .is_some_and(|previous| current_progress.advanced_beyond(previous))
+            {
+                idle_deadline = timeout.map(|d| Instant::now() + d);
+            }
+            last_progress = Some(current_progress);
+
             match &status.status {
                 TaskStatus::Enqueued | TaskStatus::Processing => {
-                    if let Some(deadline) = deadline {
+                    if let Some(deadline) = idle_deadline {
                         if Instant::now() >= deadline {
-                            return Err(FlapjackError::WriteAckTimeout);
+                            return self.resolve_durable_write_timeout(&status).await;
                         }
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -564,18 +590,100 @@ impl super::IndexManager {
         }
     }
 
-    /// Wait until a queued write task is durably committed to Tantivy, bounded by
-    /// `FLAPJACK_WRITE_DURABLE_TIMEOUT_MS` (default 30s).
+    /// Resolve a timed-out write without returning a failure that recovery can contradict.
     ///
-    /// This is the bounded counterpart to the unbounded `*_sync` poll. HTTP write
-    /// handlers call it after enqueuing so they can report durability while still
-    /// holding the enqueued [`TaskInfo`] — letting a failure response carry the
-    /// `taskID` per the Algolia write contract. Returns
-    /// [`FlapjackError::WriteAckTimeout`] (503) if the consumer does not ack within
-    /// the deadline, or the underlying commit error (5xx) if the commit failed.
+    /// A stopped, non-terminal task is an uncommitted task whose original
+    /// compensation failed. Retrying the canonical compensation seam makes a 503
+    /// safe when cleanup now succeeds. If cleanup still fails, durable admission
+    /// remains the source of truth and the write is acknowledged for replay.
+    async fn resolve_durable_write_timeout(&self, task: &TaskInfo) -> Result<()> {
+        let Some(tenant_id) = Self::tenant_id_from_task_key(&task.id) else {
+            return Err(FlapjackError::WriteAckTimeout);
+        };
+        if let Some(handle) = self
+            .write_task_handles
+            .get(tenant_id)
+            .map(|entry| entry.clone())
+        {
+            if tokio::time::timeout(
+                Duration::from_millis(WRITE_DURABLE_FAIL_CLOSED_GRACE_MS),
+                handle.drain(tenant_id.to_string()),
+            )
+            .await
+            .is_err()
+            {
+                return Err(FlapjackError::WriteAckTimeout);
+            }
+        } else if self
+            .write_queues
+            .get(tenant_id)
+            .is_some_and(|queue| !queue.is_closed())
+        {
+            return Err(FlapjackError::WriteAckTimeout);
+        }
+
+        match self.get_task(&task.id).map(|current| current.status) {
+            Ok(TaskStatus::Succeeded) => return Ok(()),
+            Ok(TaskStatus::Failed(message)) => {
+                return Err(Self::error_from_terminal_task_failure(&message))
+            }
+            Ok(TaskStatus::Enqueued | TaskStatus::Processing) => {}
+            Err(error) => return Err(error),
+        }
+
+        let cleanup_result = self.compensate_stopped_uncommitted_task(tenant_id, &task.id);
+        match cleanup_result {
+            Ok(()) => Err(FlapjackError::WriteAckTimeout),
+            Err(error) => {
+                tracing::error!(
+                    tenant_id,
+                    task_id = %task.id,
+                    %error,
+                    "late write compensation failed; acknowledging durable admission for replay"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn compensate_stopped_uncommitted_task(&self, tenant_id: &str, task_id: &str) -> Result<()> {
+        let admission_store = self.get_or_create_admission_store(tenant_id)?;
+        let oplog = self.get_or_create_oplog_result(tenant_id)?;
+        crate::index::write_queue::compensate_uncommitted_tasks(
+            crate::index::write_queue::DurableReplayState {
+                tenant_id,
+                admission_store: admission_store.as_ref(),
+                oplog: Some(oplog.as_ref()),
+            },
+            0,
+            &[task_id.to_string()],
+        )
+    }
+
+    /// Bounded durable wait used by HTTP handlers. They retain the enqueued task
+    /// while waiting, so failures preserve their `taskID`.
+    ///
+    /// `FLAPJACK_WRITE_DURABLE_TIMEOUT_MS` owns the deadline. A stopped task returns
+    /// 503 only after its replay routes are removed; persistent cleanup failure is
+    /// acknowledged for recovery. Active writes retain the retryable timeout.
     pub async fn wait_for_write_durable(&self, task_id: &str) -> Result<()> {
         self.await_task_terminal(task_id, Some(Self::durable_write_timeout()))
             .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_write_durable_with_timeout_for_test(
+        &self,
+        task_id: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        self.await_task_terminal(task_id, Some(timeout)).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_task_for_test(&self, task: TaskInfo) {
+        self.tasks.insert(task.id.clone(), task.clone());
+        self.tasks.insert(task.numeric_id.to_string(), task);
     }
 
     /// Persist the write-admission record and enqueue the documents without
@@ -611,9 +719,9 @@ impl super::IndexManager {
     /// 200 response means the write is on disk — closing the PL-13 silent-drop where
     /// an enqueued-but-uncommitted write was ACKed before the consumer committed it.
     /// Returns [`FlapjackError::QueueFull`] (429) on backpressure,
-    /// [`FlapjackError::WriteAckTimeout`] (503) if the consumer does not ack in time,
-    /// or the underlying commit error (5xx). Replication uses its origin-aware
-    /// terminal-wait helpers so a peer is acknowledged only after finalization.
+    /// [`FlapjackError::WriteAckTimeout`] (503) while the consumer is active or after
+    /// safe compensation, or the underlying commit error (5xx). Replication uses its
+    /// origin-aware terminal-wait helpers so a peer is acknowledged only after finalization.
     pub async fn add_documents_durable(
         &self,
         tenant_id: &str,

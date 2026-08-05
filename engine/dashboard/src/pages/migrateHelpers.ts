@@ -25,17 +25,11 @@ interface BuildMigrationRequestBodyInput {
 }
 
 export function buildDashboardAuthHeaders(): Record<string, string> {
-  const { apiKey, appId } = useAuth.getState();
-  const headers: Record<string, string> = {
+  const { appId } = useAuth.getState();
+  return {
     'Content-Type': 'application/json',
     'x-algolia-application-id': appId || 'flapjack',
   };
-
-  if (apiKey) {
-    headers['x-algolia-api-key'] = apiKey;
-  }
-
-  return headers;
 }
 
 export async function postSensitiveMigrationRequest<TResponse>(

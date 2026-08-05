@@ -1,0 +1,20 @@
+{
+  "verdict": "GO",
+  "reasons": [],
+  "profile": "standard",
+  "startingCount": 0,
+  "targetCount": 1000000,
+  "trancheCount": 1000000,
+  "diskFreeBytes": 718124933120,
+  "memoryCapacityBytes": 137438953472,
+  "sourceBytesPerRecord": 2048,
+  "indexBytesPerRecord": 32768,
+  "rssBytesPerRecord": 8192,
+  "diskReserveBytes": 53687091200,
+  "memoryReserveBytes": 17179869184,
+  "sourceBytes": 2048000000,
+  "steadyIndexBytes": 32768000000,
+  "mergeAllowanceBytes": 65536000000,
+  "requiredDiskBytes": 154039091200,
+  "requiredMemoryBytes": 25371869184
+}

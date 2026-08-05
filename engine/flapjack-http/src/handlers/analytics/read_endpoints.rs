@@ -2,7 +2,7 @@
 use axum::{
     extract::{Query, RawQuery, State},
     http::HeaderMap,
-    Json,
+    Extension, Json,
 };
 use std::sync::Arc;
 
@@ -10,8 +10,10 @@ use flapjack::analytics::{AnalyticsQueryEngine, AnalyticsQueryParams};
 use flapjack::error::FlapjackError;
 
 use super::{
-    clamp_limit, maybe_fan_out, validate_analytics_index, AnalyticsParams, OverviewParams,
+    analytics_request_has_index_restrictions, clamp_limit, enforce_analytics_index_access,
+    maybe_fan_out, validate_analytics_index, AnalyticsParams, OverviewParams,
 };
+use crate::auth::{ApiKey, SecuredKeyRestrictions};
 use crate::handlers::analytics_dto::*;
 
 /// GET /2/searches - Top searches ranked by frequency
@@ -25,10 +27,17 @@ use crate::handlers::analytics_dto::*;
 pub async fn get_top_searches(
     headers: HeaderMap,
     State(engine): State<Arc<AnalyticsQueryEngine>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     RawQuery(raw_query): RawQuery,
     Query(params): Query<AnalyticsParams>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
     validate_analytics_index(&params.index)?;
+    enforce_analytics_index_access(api_key, secured_restrictions, &params.index)?;
     let limit = clamp_limit(params.limit.unwrap_or(10));
     let click_analytics = params.click_analytics.unwrap_or(false);
     let result = engine
@@ -68,10 +77,17 @@ pub async fn get_top_searches(
 pub async fn get_search_count(
     headers: HeaderMap,
     State(engine): State<Arc<AnalyticsQueryEngine>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     RawQuery(raw_query): RawQuery,
     Query(params): Query<AnalyticsParams>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
     validate_analytics_index(&params.index)?;
+    enforce_analytics_index_access(api_key, secured_restrictions, &params.index)?;
     let result = engine
         .search_count(&params.index, &params.start_date, &params.end_date)
         .await
@@ -99,10 +115,17 @@ pub async fn get_search_count(
 pub async fn get_no_results(
     headers: HeaderMap,
     State(engine): State<Arc<AnalyticsQueryEngine>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     RawQuery(raw_query): RawQuery,
     Query(params): Query<AnalyticsParams>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
     validate_analytics_index(&params.index)?;
+    enforce_analytics_index_access(api_key, secured_restrictions, &params.index)?;
     let limit = clamp_limit(params.limit.unwrap_or(1000));
     let result = engine
         .no_results_searches(&params.index, &params.start_date, &params.end_date, limit)
@@ -131,10 +154,17 @@ pub async fn get_no_results(
 pub async fn get_no_result_rate(
     headers: HeaderMap,
     State(engine): State<Arc<AnalyticsQueryEngine>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     RawQuery(raw_query): RawQuery,
     Query(params): Query<AnalyticsParams>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
     validate_analytics_index(&params.index)?;
+    enforce_analytics_index_access(api_key, secured_restrictions, &params.index)?;
     let result = engine
         .no_results_rate(&params.index, &params.start_date, &params.end_date)
         .await
@@ -162,10 +192,17 @@ pub async fn get_no_result_rate(
 pub async fn get_no_clicks(
     headers: HeaderMap,
     State(engine): State<Arc<AnalyticsQueryEngine>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     RawQuery(raw_query): RawQuery,
     Query(params): Query<AnalyticsParams>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
     validate_analytics_index(&params.index)?;
+    enforce_analytics_index_access(api_key, secured_restrictions, &params.index)?;
     let limit = clamp_limit(params.limit.unwrap_or(1000));
     let result = engine
         .no_click_searches(&params.index, &params.start_date, &params.end_date, limit)
@@ -194,10 +231,17 @@ pub async fn get_no_clicks(
 pub async fn get_no_click_rate(
     headers: HeaderMap,
     State(engine): State<Arc<AnalyticsQueryEngine>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     RawQuery(raw_query): RawQuery,
     Query(params): Query<AnalyticsParams>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
     validate_analytics_index(&params.index)?;
+    enforce_analytics_index_access(api_key, secured_restrictions, &params.index)?;
     let result = engine
         .no_click_rate(&params.index, &params.start_date, &params.end_date)
         .await
@@ -225,10 +269,17 @@ pub async fn get_no_click_rate(
 pub async fn get_click_through_rate(
     headers: HeaderMap,
     State(engine): State<Arc<AnalyticsQueryEngine>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     RawQuery(raw_query): RawQuery,
     Query(params): Query<AnalyticsParams>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
     validate_analytics_index(&params.index)?;
+    enforce_analytics_index_access(api_key, secured_restrictions, &params.index)?;
     let result = engine
         .click_through_rate(&params.index, &params.start_date, &params.end_date)
         .await
@@ -256,10 +307,17 @@ pub async fn get_click_through_rate(
 pub async fn get_average_click_position(
     headers: HeaderMap,
     State(engine): State<Arc<AnalyticsQueryEngine>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     RawQuery(raw_query): RawQuery,
     Query(params): Query<AnalyticsParams>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
     validate_analytics_index(&params.index)?;
+    enforce_analytics_index_access(api_key, secured_restrictions, &params.index)?;
     let result = engine
         .average_click_position(&params.index, &params.start_date, &params.end_date)
         .await
@@ -287,10 +345,17 @@ pub async fn get_average_click_position(
 pub async fn get_click_positions(
     headers: HeaderMap,
     State(engine): State<Arc<AnalyticsQueryEngine>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     RawQuery(raw_query): RawQuery,
     Query(params): Query<AnalyticsParams>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
     validate_analytics_index(&params.index)?;
+    enforce_analytics_index_access(api_key, secured_restrictions, &params.index)?;
     let result = engine
         .click_positions(&params.index, &params.start_date, &params.end_date)
         .await
@@ -318,10 +383,17 @@ pub async fn get_click_positions(
 pub async fn get_add_to_cart_rate(
     headers: HeaderMap,
     State(engine): State<Arc<AnalyticsQueryEngine>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     RawQuery(raw_query): RawQuery,
     Query(params): Query<AnalyticsParams>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
     validate_analytics_index(&params.index)?;
+    enforce_analytics_index_access(api_key, secured_restrictions, &params.index)?;
     let result = engine
         .conversion_rate_for_subtype(
             &params.index,
@@ -354,10 +426,17 @@ pub async fn get_add_to_cart_rate(
 pub async fn get_purchase_rate(
     headers: HeaderMap,
     State(engine): State<Arc<AnalyticsQueryEngine>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     RawQuery(raw_query): RawQuery,
     Query(params): Query<AnalyticsParams>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
     validate_analytics_index(&params.index)?;
+    enforce_analytics_index_access(api_key, secured_restrictions, &params.index)?;
     let result = engine
         .conversion_rate_for_subtype(
             &params.index,
@@ -390,10 +469,17 @@ pub async fn get_purchase_rate(
 pub async fn get_conversion_rate(
     headers: HeaderMap,
     State(engine): State<Arc<AnalyticsQueryEngine>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     RawQuery(raw_query): RawQuery,
     Query(params): Query<AnalyticsParams>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
     validate_analytics_index(&params.index)?;
+    enforce_analytics_index_access(api_key, secured_restrictions, &params.index)?;
     let result = engine
         .conversion_rate(&params.index, &params.start_date, &params.end_date)
         .await
@@ -421,10 +507,17 @@ pub async fn get_conversion_rate(
 pub async fn get_top_hits(
     headers: HeaderMap,
     State(engine): State<Arc<AnalyticsQueryEngine>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     RawQuery(raw_query): RawQuery,
     Query(params): Query<AnalyticsParams>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
     validate_analytics_index(&params.index)?;
+    enforce_analytics_index_access(api_key, secured_restrictions, &params.index)?;
     let limit = clamp_limit(params.limit.unwrap_or(1000));
     let result = engine
         .top_hits(&params.index, &params.start_date, &params.end_date, limit)
@@ -453,10 +546,17 @@ pub async fn get_top_hits(
 pub async fn get_top_filters(
     headers: HeaderMap,
     State(engine): State<Arc<AnalyticsQueryEngine>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     RawQuery(raw_query): RawQuery,
     Query(params): Query<AnalyticsParams>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
     validate_analytics_index(&params.index)?;
+    enforce_analytics_index_access(api_key, secured_restrictions, &params.index)?;
     let limit = clamp_limit(params.limit.unwrap_or(1000));
     let result = engine
         .top_filters(&params.index, &params.start_date, &params.end_date, limit)
@@ -482,11 +582,18 @@ pub async fn get_top_filters(
 pub async fn get_filter_values(
     headers: HeaderMap,
     State(engine): State<Arc<AnalyticsQueryEngine>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     axum::extract::Path(attribute): axum::extract::Path<String>,
     RawQuery(raw_query): RawQuery,
     Query(params): Query<AnalyticsParams>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
     validate_analytics_index(&params.index)?;
+    enforce_analytics_index_access(api_key, secured_restrictions, &params.index)?;
     let limit = clamp_limit(params.limit.unwrap_or(1000));
     let result = engine
         .filter_values(
@@ -523,10 +630,17 @@ pub async fn get_filter_values(
 pub async fn get_filters_no_results(
     headers: HeaderMap,
     State(engine): State<Arc<AnalyticsQueryEngine>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     RawQuery(raw_query): RawQuery,
     Query(params): Query<AnalyticsParams>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
     validate_analytics_index(&params.index)?;
+    enforce_analytics_index_access(api_key, secured_restrictions, &params.index)?;
     let limit = clamp_limit(params.limit.unwrap_or(1000));
     let result = engine
         .filters_no_results(&params.index, &params.start_date, &params.end_date, limit)
@@ -555,10 +669,17 @@ pub async fn get_filters_no_results(
 pub async fn get_users_count(
     headers: HeaderMap,
     State(engine): State<Arc<AnalyticsQueryEngine>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     RawQuery(raw_query): RawQuery,
     Query(params): Query<AnalyticsParams>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
     validate_analytics_index(&params.index)?;
+    enforce_analytics_index_access(api_key, secured_restrictions, &params.index)?;
     let result = engine
         .users_count_hll(&params.index, &params.start_date, &params.end_date)
         .await
@@ -601,13 +722,31 @@ pub async fn get_users_count(
 pub async fn get_overview(
     headers: HeaderMap,
     State(engine): State<Arc<AnalyticsQueryEngine>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     RawQuery(raw_query): RawQuery,
     Query(params): Query<OverviewParams>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
-    let result = engine
-        .overview(&params.start_date, &params.end_date)
-        .await
-        .map_err(|e| FlapjackError::InvalidQuery(format!("Analytics error: {}", e)))?;
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
+    let result = match params.index.as_deref() {
+        Some(index) => {
+            validate_analytics_index(index)?;
+            enforce_analytics_index_access(api_key, secured_restrictions, index)?;
+            engine
+                .overview_for_index(index, &params.start_date, &params.end_date)
+                .await
+        }
+        None => {
+            if analytics_request_has_index_restrictions(api_key, secured_restrictions) {
+                return Err(crate::auth::invalid_api_credentials_flapjack_error());
+            }
+            engine.overview(&params.start_date, &params.end_date).await
+        }
+    }
+    .map_err(|e| FlapjackError::InvalidQuery(format!("Analytics error: {}", e)))?;
     let result = maybe_fan_out(
         &headers,
         "overview",

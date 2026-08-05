@@ -10,7 +10,7 @@
  * 4. Flushing analytics to storage
  */
 
-import type { APIRequestContext } from '@playwright/test';
+import type { APIRequestContext, APIResponse } from '@playwright/test';
 import { API_BASE as API, API_HEADERS as HEADERS } from './local-instance';
 
 export interface AnalyticsSeedConfig {
@@ -41,6 +41,15 @@ export const DEFAULT_ANALYTICS_CONFIG: AnalyticsSeedConfig = {
   countryDistribution: { US: 0.45, GB: 0.2, DE: 0.15, CA: 0.1, FR: 0.1 },
 };
 
+export interface AnalyticsSeedPayload {
+  index: string;
+  days: number;
+  searchCount: number;
+  noResultRate: number;
+  deviceDistribution: AnalyticsSeedConfig['deviceDistribution'];
+  countryDistribution: AnalyticsSeedConfig['countryDistribution'];
+}
+
 const PRODUCTS = [
   { objectID: 'p01', name: 'MacBook Pro 16"', category: 'Laptops', brand: 'Apple', price: 3499 },
   { objectID: 'p02', name: 'ThinkPad X1 Carbon', category: 'Laptops', brand: 'Lenovo', price: 1849 },
@@ -54,23 +63,27 @@ const PRODUCTS = [
   { objectID: 'p10', name: 'Logitech MX Master 3S', category: 'Accessories', brand: 'Logitech', price: 99 },
 ];
 
-const SEARCH_TERMS = [
-  { query: 'laptop', hasResults: true, weight: 50 },
-  { query: 'macbook', hasResults: true, weight: 40 },
-  { query: 'tablet', hasResults: true, weight: 35 },
-  { query: 'headphones', hasResults: true, weight: 30 },
-  { query: 'dell', hasResults: true, weight: 25 },
-  { query: 'apple', hasResults: true, weight: 45 },
-  { query: 'samsung', hasResults: true, weight: 20 },
-  { query: 'monitor', hasResults: true, weight: 15 },
-  { query: 'keyboard', hasResults: true, weight: 12 },
-  { query: 'mouse', hasResults: true, weight: 10 },
-  // No-result queries
-  { query: 'unicorn widget', hasResults: false, weight: 5 },
-  { query: 'nonexistent product', hasResults: false, weight: 3 },
-  { query: 'xyzzy123', hasResults: false, weight: 2 },
-  { query: 'discontinued item', hasResults: false, weight: 4 },
-];
+export function buildAnalyticsSeedPayload(
+  config: AnalyticsSeedConfig,
+): AnalyticsSeedPayload {
+  return {
+    index: config.indexName,
+    days: config.days ?? DEFAULT_ANALYTICS_CONFIG.days ?? 7,
+    searchCount: config.searchCount,
+    noResultRate: config.noResultRate,
+    deviceDistribution: config.deviceDistribution,
+    countryDistribution: config.countryDistribution,
+  };
+}
+
+async function requireSuccessfulResponse(
+  response: APIResponse,
+  operation: string,
+): Promise<void> {
+  if (!response.ok()) {
+    throw new Error(`${operation} failed with status ${response.status()}`);
+  }
+}
 
 /**
  * Seeds analytics data for testing.
@@ -81,29 +94,37 @@ export async function seedAnalytics(
   request: APIRequestContext,
   config: AnalyticsSeedConfig = DEFAULT_ANALYTICS_CONFIG,
 ): Promise<void> {
-  const { indexName, documentCount, days = 7 } = config;
+  const { indexName, documentCount } = config;
+  const seedPayload = buildAnalyticsSeedPayload(config);
+
+  await clearAnalytics(request, indexName);
 
   // 1. Create index and add documents (needed for searches to work)
   const documents = PRODUCTS.slice(0, Math.min(documentCount, PRODUCTS.length));
-  await request.post(`${API}/1/indexes/${indexName}/batch`, {
+  const batchResponse = await request.post(`${API}/1/indexes/${indexName}/batch`, {
     headers: HEADERS,
     data: {
       requests: documents.map((doc) => ({ action: 'addObject', body: doc })),
     },
   });
+  await requireSuccessfulResponse(batchResponse, `Seeding documents for ${indexName}`);
 
   // Wait for indexing to complete
   await new Promise((resolve) => setTimeout(resolve, 2000));
 
   // 2. Seed analytics using backend's built-in generator
   // This creates realistic analytics with geography, devices, searches, clicks
-  await request.post(`${API}/2/analytics/seed`, {
+  const seedResponse = await request.post(`${API}/2/analytics/seed`, {
     headers: HEADERS,
-    data: {
-      index: indexName,
-      days,
-    },
+    data: seedPayload,
   });
+  await requireSuccessfulResponse(seedResponse, `Seeding analytics for ${indexName}`);
+  const seedResult = await seedResponse.json() as { totalSearches?: unknown };
+  if (seedResult.totalSearches !== seedPayload.searchCount) {
+    throw new Error(
+      `Analytics seed returned ${String(seedResult.totalSearches)} searches; expected ${seedPayload.searchCount}`,
+    );
+  }
 
   // Wait for analytics data to be available
   // Seed creates data for the requested historical window (NOT including today).
@@ -113,31 +134,28 @@ export async function seedAnalytics(
   // Use yesterday as end date since seed doesn't create data for today.
   // Include an extra day of buffer so timezone boundaries do not hide seeded rows.
   const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  const verificationWindowDays = Math.max(days + 1, 8);
+  const verificationWindowDays = Math.max(seedPayload.days + 1, 8);
   const verificationStartDate = new Date(
     Date.now() - verificationWindowDays * 24 * 60 * 60 * 1000,
   );
 
-  try {
-    const response = await request.get(`${API}/2/overview`, {
-      headers: HEADERS,
-      params: {
-        index: indexName,
-        startDate: verificationStartDate.toISOString().split('T')[0],
-        endDate: yesterday.toISOString().split('T')[0],
-      },
-    });
-
-    if (!response.ok()) {
-      console.warn(`Analytics seed verification failed: ${response.status()}`);
-    } else {
-      const data = await response.json();
-      if (!data.totalSearches || data.totalSearches === 0) {
-        console.warn('Analytics seed created no data');
-      }
-    }
-  } catch (error) {
-    console.warn('Analytics seed verification warning:', error);
+  const verificationResponse = await request.get(`${API}/2/overview`, {
+    headers: HEADERS,
+    params: {
+      index: indexName,
+      startDate: verificationStartDate.toISOString().split('T')[0],
+      endDate: yesterday.toISOString().split('T')[0],
+    },
+  });
+  await requireSuccessfulResponse(
+    verificationResponse,
+    `Verifying analytics seed for ${indexName}`,
+  );
+  const verificationResult = await verificationResponse.json() as { totalSearches?: unknown };
+  if (verificationResult.totalSearches !== seedPayload.searchCount) {
+    throw new Error(
+      `Analytics verification for ${indexName} found ${String(verificationResult.totalSearches)} searches; expected ${seedPayload.searchCount}`,
+    );
   }
 }
 
@@ -148,10 +166,11 @@ export async function clearAnalytics(
   request: APIRequestContext,
   indexName: string,
 ): Promise<void> {
-  await request.delete(`${API}/2/analytics/clear`, {
-    params: { index: indexName },
+  const response = await request.delete(`${API}/2/analytics/clear`, {
+    data: { index: indexName },
     headers: HEADERS,
   });
+  await requireSuccessfulResponse(response, `Clearing analytics for ${indexName}`);
 }
 
 /**
@@ -164,78 +183,4 @@ export async function deleteIndex(
   await request.delete(`${API}/1/indexes/${indexName}`, {
     headers: HEADERS,
   });
-}
-
-/**
- * Generates a list of searches based on config.
- */
-function generateSearches(
-  count: number,
-  config: AnalyticsSeedConfig,
-): Array<{
-  query: string;
-  userToken: string;
-  ip: string;
-  userAgent: string;
-  tags: string[];
-}> {
-  const searches: ReturnType<typeof generateSearches> = [];
-  
-  // Calculate how many searches per term
-  const totalWeight = SEARCH_TERMS.reduce((sum, term) => sum + term.weight, 0);
-  
-  for (const term of SEARCH_TERMS) {
-    const termCount = Math.round((term.weight / totalWeight) * count);
-    
-    for (let i = 0; i < termCount; i++) {
-      // Randomly assign device
-      const deviceRand = Math.random();
-      let device = 'desktop';
-      if (deviceRand < config.deviceDistribution.mobile + config.deviceDistribution.tablet) {
-        device = deviceRand < config.deviceDistribution.mobile ? 'mobile' : 'tablet';
-      }
-      
-      // Randomly assign country
-      const countryRand = Math.random();
-      let country = 'US';
-      let sum = 0;
-      for (const [code, prob] of Object.entries(config.countryDistribution)) {
-        sum += prob;
-        if (countryRand < sum) {
-          country = code;
-          break;
-        }
-      }
-      
-      searches.push({
-        query: term.query,
-        userToken: `user-${Math.floor(Math.random() * 50) + 1}`, // 50 unique users
-        ip: getIPForCountry(country),
-        userAgent: getUserAgentForDevice(device),
-        tags: [`platform:${device}`, `country:${country}`],
-      });
-    }
-  }
-  
-  return searches;
-}
-
-function getIPForCountry(country: string): string {
-  const ips: Record<string, string> = {
-    US: '8.8.8.8',
-    GB: '81.2.69.142',
-    DE: '46.114.0.0',
-    CA: '24.200.0.0',
-    FR: '2.0.0.0',
-  };
-  return ips[country] || '8.8.8.8';
-}
-
-function getUserAgentForDevice(device: string): string {
-  const agents: Record<string, string> = {
-    desktop: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-    mobile: 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
-    tablet: 'Mozilla/5.0 (iPad; CPU OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
-  };
-  return agents[device] || agents.desktop;
 }

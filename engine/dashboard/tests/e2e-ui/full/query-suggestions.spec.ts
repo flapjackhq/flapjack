@@ -171,6 +171,8 @@ test.describe('Query Suggestions Page', () => {
 
     // ASSERT: config appears in the list body
     await waitForConfigVisibleAfterNavigation(page, configName);
+    await expect(page.getByTestId('qs-configs-list').getByTestId('qs-config-name').filter({ hasText: configName }))
+      .toBeVisible();
 
     // CLEANUP
     await deleteConfigViaUi(page, configName);
@@ -200,6 +202,8 @@ test.describe('Query Suggestions Page', () => {
 
     try {
       await waitForConfigVisibleAfterNavigation(page, configName, 8000);
+      await expect(page.getByTestId('qs-configs-list').getByTestId('qs-config-name').filter({ hasText: configName }))
+        .toBeVisible();
     } finally {
       await page.unroute('**/1/configs');
       await deleteConfigViaUiIfPresent(page, configName);
@@ -286,7 +290,7 @@ test.describe('Query Suggestions Page', () => {
     await dialog.getByRole('button', { name: /cancel/i }).click();
     await expect(dialog).not.toBeVisible({ timeout: 5000 });
 
-    await expect(page.getByText(uniqueName)).not.toBeVisible();
+    await expect(page.getByText(uniqueName)).toBeHidden();
   });
 
   // ── Create and verify card ───────────────────────────────────────────────────
@@ -391,7 +395,7 @@ test.describe('Query Suggestions Page', () => {
 
     await deleteConfigViaUi(page, configName);
 
-    await expect(page.getByTestId('qs-config-name').filter({ hasText: configName })).not.toBeVisible();
+    await expect(page.getByTestId('qs-config-name').filter({ hasText: configName })).toBeHidden();
   });
 
   // ── Sidebar navigation ───────────────────────────────────────────────────────

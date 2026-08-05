@@ -324,9 +324,10 @@ function TopSearchesTableRow({
       </td>
       <td className="py-2.5 pr-4" data-testid="search-volume">
         <div className="flex items-center justify-end gap-2">
-          <div className="w-24 h-2 bg-muted rounded-full overflow-hidden">
+          <div className="w-24 h-2 bg-muted rounded-full overflow-hidden" data-testid="search-volume-track">
             <div
               className="h-full bg-primary/60 rounded-full transition-all"
+              data-testid="search-volume-fill"
               style={{ width: `${percentage}%` }}
             />
           </div>

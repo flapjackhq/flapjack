@@ -8,7 +8,7 @@
  * These tests are READ-ONLY — they never create, modify, or delete data.
  * They fail-fast if the benchmark index is not populated with >= 90k documents.
  *
- * STANDARDS COMPLIANCE (BROWSER_TESTING_STANDARDS_2.md):
+ * STANDARDS COMPLIANCE (~/.matt/scrai/globals/standards/browser_testing.md):
  * - Zero CSS class selectors — uses data-testid, getByRole, getByText
  * - Zero XPath selectors
  * - Zero page.evaluate() calls
@@ -107,12 +107,9 @@ test.describe('Large-Index Performance (benchmark_100k)', () => {
       resultsPanel.getByTestId('document-card').first(),
     ).toBeVisible({ timeout: DATA_RENDER_TIMEOUT });
 
-    // Facets panel renders if facets are configured (facets-panel testid)
+    // Benchmark fixture settings include facets, so the panel is part of the page contract.
     const facetsPanel = page.getByTestId('facets-panel');
-    const hasFacets = (await facetsPanel.count()) > 0;
-    if (hasFacets) {
-      await expect(facetsPanel).toBeVisible({ timeout: DATA_RENDER_TIMEOUT });
-    }
+    await expect(facetsPanel).toBeVisible({ timeout: DATA_RENDER_TIMEOUT });
   });
 
   test('settings page loads all tabs', async ({ page }) => {

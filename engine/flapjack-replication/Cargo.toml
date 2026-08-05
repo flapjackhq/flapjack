@@ -1,6 +1,6 @@
 [package]
 name = "flapjack-replication"
-version = "1.0.10"
+version = "1.0.11"
 edition = "2021"
 
 [dependencies]
@@ -17,3 +17,4 @@ tracing = "0.1"
 [dev-dependencies]
 tempfile = "3.0"
 tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
+tracing-subscriber = "0.3"

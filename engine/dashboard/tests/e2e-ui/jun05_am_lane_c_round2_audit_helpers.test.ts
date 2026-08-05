@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, test } from 'vitest';
 import {
   collectStableOverviewHeadings,
   selectEventStatusFinding,
@@ -6,7 +6,7 @@ import {
 } from './jun05_am_lane_c_round2_audit_helpers';
 
 describe('round 2 route audit helpers', () => {
-  it('derives the document action finding from observed delete button labels', () => {
+  test('derives the document action finding from observed delete button labels', () => {
     expect(
       selectDocumentActionFinding([
         { ariaLabel: null, text: 'JSON', title: 'Toggle JSON view' },
@@ -15,7 +15,7 @@ describe('round 2 route audit helpers', () => {
     ).toBe('Delete action exposes a document-specific accessible name: delete document movie_050.');
   });
 
-  it('keeps the generic delete finding when no document-specific label is observed', () => {
+  test('keeps the generic delete finding when no document-specific label is observed', () => {
     expect(
       selectDocumentActionFinding([
         { ariaLabel: null, text: '', title: 'Delete document' },
@@ -23,7 +23,7 @@ describe('round 2 route audit helpers', () => {
     ).toBe('Delete action is exposed as a generic icon-title action rather than a document-specific action name.');
   });
 
-  it('describes the Event Debugger status filter with the current Failed label', () => {
+  test('describes the Event Debugger status filter with the current Failed label', () => {
     expect(
       selectEventStatusFinding([
         { label: 'All', value: '' },
@@ -33,7 +33,7 @@ describe('round 2 route audit helpers', () => {
     ).toBe('Status filter uses the visible label Failed while preserving the underlying error status value.');
   });
 
-  it('keeps only baseline index headings in overview evidence', () => {
+  test('keeps only baseline index headings in overview evidence', () => {
     expect(
       collectStableOverviewHeadings([
         'Overview',

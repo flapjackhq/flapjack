@@ -7,7 +7,7 @@ use flapjack::index::manager::publication::{
 use fs2::{available_space, FileExt};
 use serde::{de, Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, Write};
@@ -18,6 +18,7 @@ use uuid::Uuid;
 pub(super) const SPOOL_ROOT: &str = "migration_exports";
 const JOBS_DIR: &str = "jobs";
 const MANIFEST_FILE: &str = "manifest.json";
+const SPOOL_FORMAT_VERSION: u32 = 1;
 const MIGRATION_PHASE_FILE: &str = "migration_phase.json";
 const ASYNC_MIGRATION_METADATA_FILE: &str = "async_migration.json";
 const PRIVACY_SCRUB_INTENT_FILE: &str = "privacy_scrub_intent.json";
@@ -71,8 +72,11 @@ pub(crate) struct ResourceDenominators {
 }
 
 impl ResourceDenominators {
+    /// Derived-source configuration is captured alongside an export but is not
+    /// part of the source's own resource completion, so `config` stays out of
+    /// the progress denominator the public status reports.
     fn total(self) -> u64 {
-        self.settings + self.documents + self.rules + self.synonyms + self.config
+        self.settings + self.documents + self.rules + self.synonyms
     }
 }
 
@@ -86,8 +90,11 @@ struct ResourceCounters {
 }
 
 impl ResourceCounters {
+    /// Mirrors [`ResourceDenominators::total`]: derived-source configuration is
+    /// excluded so committing it can never push reported progress past its
+    /// denominator.
     fn total(self) -> u64 {
-        self.settings + self.documents + self.rules + self.synonyms + self.config
+        self.settings + self.documents + self.rules + self.synonyms
     }
 
     fn from_visible_artifacts<'a>(artifacts: impl Iterator<Item = &'a ArtifactManifest>) -> Self {
@@ -108,6 +115,16 @@ impl ResourceCounters {
         }
     }
 }
+
+/// Field names of the derived-configuration record persisted under
+/// [`ArtifactKind::Config`]. Shared by the writer and the accepted reader so the
+/// record shape has exactly one owner.
+const DERIVED_SOURCE_NAME_FIELD: &str = "sourceName";
+const DERIVED_SOURCE_SETTINGS_FIELD: &str = "settings";
+/// The derived-settings record is always a single `{sourceName, settings}`
+/// object, so its manifest `item_count` is exactly this. The writer stamps it
+/// and the accepted reader fails closed on any drift from it.
+const DERIVED_SOURCE_SETTINGS_ITEM_COUNT: u64 = 1;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum ArtifactKind {
@@ -527,6 +544,8 @@ impl ResourceCompletions {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SpoolManifest {
     job_uuid: Uuid,
+    #[serde(default)]
+    spool_format_version: u32,
     public_handle: String,
     checkpoint_handle: String,
     created_at: DateTime<Utc>,
@@ -587,20 +606,26 @@ pub(crate) struct AcceptedSpoolReader {
     documents: Vec<ArtifactManifest>,
     rules: Vec<ArtifactManifest>,
     synonyms: Vec<ArtifactManifest>,
+    derived_configuration: Vec<ArtifactManifest>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AcceptedSpoolPage {
     pub(crate) page_index: usize,
     pub(crate) manifest_count: u64,
+    pub(crate) stable_ids: Vec<String>,
     pub(crate) items: Vec<serde_json::Value>,
 }
 
 pub(crate) struct AcceptedSpoolPageIter<'a> {
     store: &'a SpoolStore,
     job_uuid: Uuid,
+    resource: ObjectResource,
     artifacts: &'a [ArtifactManifest],
     position: usize,
+    stable_id_offset: usize,
+    stable_ids: Option<Vec<String>>,
+    finished: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -631,6 +656,7 @@ pub(crate) enum SpoolErrorKind {
     JobNotAccepted,
     JobNotInterrupted,
     UnsupportedArtifactKind,
+    UnsupportedSpoolFormat,
     InvalidPhaseTransition,
     PrivacyScrubIntentCollision,
 }
@@ -1380,6 +1406,7 @@ impl SpoolStore {
         let now = self.now();
         let manifest = SpoolManifest {
             job_uuid,
+            spool_format_version: SPOOL_FORMAT_VERSION,
             public_handle: new_handle(),
             checkpoint_handle: new_handle(),
             created_at: now,
@@ -1477,6 +1504,29 @@ impl SpoolStore {
         item_count: u64,
     ) -> SpoolResult<()> {
         self.commit_artifact(job_uuid, ArtifactKind::SynonymsPage, bytes, item_count)
+    }
+
+    /// Persist one derived source's settings as a durable configuration
+    /// artifact. This function and [`AcceptedSpoolReader::replica_settings`] are
+    /// the only owners of the on-disk derived-configuration record shape.
+    pub(crate) fn commit_derived_source_settings(
+        &self,
+        job_uuid: Uuid,
+        source_name: &str,
+        settings: &serde_json::Value,
+    ) -> SpoolResult<()> {
+        let record = serde_json::json!({
+            DERIVED_SOURCE_NAME_FIELD: source_name,
+            DERIVED_SOURCE_SETTINGS_FIELD: settings,
+        });
+        let bytes = serde_json::to_vec(&record)
+            .map_err(|_| SpoolError::new(SpoolErrorKind::ManifestCorrupt))?;
+        self.commit_artifact(
+            job_uuid,
+            ArtifactKind::Config,
+            &bytes,
+            DERIVED_SOURCE_SETTINGS_ITEM_COUNT,
+        )
     }
 
     pub(crate) fn commit_config_file(
@@ -1780,6 +1830,24 @@ impl SpoolStore {
     #[cfg(test)]
     pub(crate) fn manifest_json(&self, job_uuid: Uuid) -> SpoolResult<String> {
         fs::read_to_string(self.manifest_path(job_uuid)).map_err(SpoolError::from)
+    }
+
+    /// Rewrites the durable manifest as one written before `spool_format_version`
+    /// existed, so upgrade paths can be proved against a real legacy artifact.
+    #[cfg(test)]
+    pub(crate) fn downgrade_manifest_to_legacy_format_for_test(
+        &self,
+        job_uuid: Uuid,
+    ) -> SpoolResult<()> {
+        let path = self.manifest_path(job_uuid);
+        let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)
+            .map_err(|_| SpoolError::new(SpoolErrorKind::ManifestCorrupt))?;
+        manifest
+            .as_object_mut()
+            .ok_or_else(|| SpoolError::new(SpoolErrorKind::ManifestCorrupt))?
+            .remove("spool_format_version");
+        fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap())?;
+        Ok(())
     }
 
     #[cfg(test)]

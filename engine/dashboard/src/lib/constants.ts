@@ -28,3 +28,14 @@ export const EXPERIMENT_STATUS_BADGE_CLASSES: Record<string, string> = {
 export function formatExperimentStatusBadgeClass(status: string): string {
   return EXPERIMENT_STATUS_BADGE_CLASSES[status] || DEFAULT_EXPERIMENT_STATUS_BADGE_CLASS
 }
+
+/**
+ * Test ids forwarded onto Recharts primitives.
+ *
+ * Recharts spreads unrecognised props onto the rendered `<svg>` surface and the
+ * mark `<path>` elements, so tagging a chart with these ids lets browser specs
+ * assert that Recharts actually drew marks — the same strength as the raw
+ * `svg` / `svg path` locators they replace — without a raw CSS locator.
+ */
+export const CHART_CANVAS_TEST_ID = 'chart-canvas'
+export const CHART_MARK_TEST_ID = 'chart-mark'

@@ -1,13 +1,13 @@
 use super::algolia_client::AlgoliaIndexRecord;
+use super::source_reader::{
+    SourceConfigurationArtifact, SourceConfigurationRecord, SourceExportSink,
+};
 use super::source_test_support::ScriptedSourceReader;
 use super::translation::tests::spool_payload;
 use super::translation::{translate_spool_payload, TranslationOutcome, TranslationReportEntry};
-use super::{
-    AsyncMigrationSourceProvider, TestMigrationSourceReaderFactory,
-    SOURCE_PROVIDER_UNSUPPORTED_MESSAGE,
-};
+use super::{AsyncMigrationSourceProvider, PreviewSourceExport, TestMigrationSourceReaderFactory};
 use crate::auth::KeyStore;
-use crate::test_helpers::{body_json, build_test_router};
+use crate::test_helpers::{body_json, build_test_router, with_env_var};
 use axum::body::Body;
 use axum::extract::Extension;
 use axum::http::{Request, StatusCode};
@@ -27,9 +27,13 @@ const SERVED_SOURCE_RECORD_COUNT: usize = 3;
 const MEILISEARCH_LIVE_ENDPOINT_ENV: &str = "FJ_MEILISEARCH_PREVIEW_ENDPOINT";
 const MEILISEARCH_LIVE_API_KEY_ENV: &str = "FJ_MEILISEARCH_PREVIEW_API_KEY";
 const MEILISEARCH_LIVE_EXPECTED_RECORDS_ENV: &str = "FJ_MEILISEARCH_PREVIEW_EXPECTED_RECORDS";
+const MEILISEARCH_LOOPBACK_OPT_IN_ENV: &str = "FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK";
 // 51 = two 21-entry IndexManager index trees + three publication-namespace
 // entries + two KeyStore files + four migration-export entries.
 const DURABLE_STATE_SPECIMEN_COUNT: usize = 51;
+
+mod meilisearch;
+mod typesense;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DurableStateSpecimen {
@@ -114,6 +118,16 @@ async fn post_preview(app: &axum::Router) -> axum::response::Response {
     .await
 }
 
+fn live_preview_receipt(status: StatusCode, body: &Value, report_codes: Vec<String>) -> Value {
+    json!({
+        "previewProof": "PASS",
+        "previewStatus": status.as_u16(),
+        "previewBody": body,
+        "sourceCounts": body["sourceCounts"],
+        "reportCodes": report_codes,
+    })
+}
+
 fn snapshot_durable_state(root: &Path) -> BTreeMap<String, DurableStateSpecimen> {
     fn visit(root: &Path, current: &Path, snapshot: &mut BTreeMap<String, DurableStateSpecimen>) {
         let mut entries = fs::read_dir(current)
@@ -189,16 +203,80 @@ async fn seed_destination_index(root: &Path, index_name: &str, object_id: &str) 
     drop(manager);
 }
 
-async fn post_provider_preview(
+async fn seed_durable_state_specimens(root: &Path) -> BTreeMap<String, DurableStateSpecimen> {
+    seed_destination_index(root, "shop", "target-before-preview").await;
+    seed_destination_index(root, "bystander", "bystander-before-preview").await;
+    fs::create_dir_all(root.join("migration_exports/jobs")).unwrap();
+    fs::write(
+        root.join("migration_exports/jobs/existing_job.json"),
+        b"existing job sentinel",
+    )
+    .unwrap();
+    fs::write(
+        root.join("migration_exports/owner_metadata.json"),
+        b"migration export root metadata sentinel",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".publication/existing_transaction")).unwrap();
+    fs::write(
+        root.join(".publication/existing_transaction/manifest.json"),
+        b"publication sentinel",
+    )
+    .unwrap();
+
+    let before = snapshot_durable_state(root);
+    assert_eq!(
+        before.len(),
+        DURABLE_STATE_SPECIMEN_COUNT,
+        "durable specimen inventory drifted"
+    );
+    for required in [
+        "migration_exports/jobs",
+        "migration_exports/jobs/existing_job.json",
+        "migration_exports/owner_metadata.json",
+        ".publication",
+        ".publication/existing_transaction/manifest.json",
+        "shop",
+        "bystander",
+    ] {
+        assert!(
+            before.contains_key(required),
+            "required nonzero durable-state surface missing from specimen: {required}"
+        );
+    }
+    println!("durable_state_specimens={}", before.len());
+    before
+}
+
+async fn assert_preview_preserves_durable_state(
+    root: &Path,
+    before: BTreeMap<String, DurableStateSpecimen>,
+    response: axum::response::Response,
+) {
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert!(
+        body.get("jobId").is_none(),
+        "preview must return an advisory report, not an admitted migration receipt"
+    );
+    let after = snapshot_durable_state(root);
+    assert_eq!(after.len(), before.len(), "durable specimen count changed");
+    assert_eq!(
+        after, before,
+        "preview crossed a durable job, spool, staging, publication, target, or bystander owner"
+    );
+}
+
+async fn post_migration_route(
     app: &axum::Router,
-    provider: &str,
+    path: String,
     body: Value,
 ) -> axum::response::Response {
     app.clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/1/migrations/{provider}/preview"))
+                .uri(path)
                 .header("content-type", "application/json")
                 .header("x-algolia-api-key", "admin-key")
                 .header("x-algolia-application-id", "preview-contract-app")
@@ -207,6 +285,22 @@ async fn post_provider_preview(
         )
         .await
         .unwrap()
+}
+
+async fn post_provider_preview(
+    app: &axum::Router,
+    provider: &str,
+    body: Value,
+) -> axum::response::Response {
+    post_migration_route(app, format!("/1/migrations/{provider}/preview"), body).await
+}
+
+async fn post_provider_submit(
+    app: &axum::Router,
+    provider: &str,
+    body: Value,
+) -> axum::response::Response {
+    post_migration_route(app, format!("/1/migrations/{provider}"), body).await
 }
 
 #[tokio::test]
@@ -253,74 +347,101 @@ async fn preview_http_report_matches_translation_owner_and_exact_source_counts()
     );
 }
 
+#[test]
+fn meilisearch_preview_translation_preserves_native_synonym_stable_id() {
+    let stable_id = "meilisearch:synonym:url";
+    let native_payload = json!({
+        "url": ["https://search.example/synonym", "address"]
+    });
+    let artifact =
+        SourceConfigurationArtifact::synonym_records(vec![SourceConfigurationRecord::new(
+            stable_id.to_string(),
+            native_payload.clone(),
+        )
+        .unwrap()]);
+    let mut export = PreviewSourceExport::default();
+    export
+        .commit_configuration(&SourceConfigurationArtifact::settings(&json!({})))
+        .unwrap();
+    export.commit_configuration(&artifact).unwrap();
+    assert_eq!(
+        export.synonym_pages,
+        vec![vec![native_payload]],
+        "preview capture must preserve provider-native synonym vocabulary byte-for-value"
+    );
+
+    let outcome = translate_spool_payload(export.into_translation_input(
+        "products".to_string(),
+        "shop".to_string(),
+        AsyncMigrationSourceProvider::Meilisearch,
+    ));
+    let translated = match outcome {
+        TranslationOutcome::Translated(translated) => translated,
+        TranslationOutcome::Rejected(report) => {
+            panic!("native Meilisearch synonym must translate, got {report:#?}")
+        }
+    };
+
+    assert_eq!(translated.report.summary.hard_rejections, 0);
+    assert_eq!(translated.bundle.synonyms.len(), 1);
+    assert_eq!(translated.bundle.synonyms[0].object_id(), stable_id);
+    assert_eq!(
+        serde_json::to_value(&translated.bundle.synonyms[0]).unwrap(),
+        json!({
+            "type": "synonym",
+            "objectID": stable_id,
+            "synonyms": ["url", "https://search.example/synonym", "address"]
+        })
+    );
+}
+
+#[test]
+fn meilisearch_preview_preserves_provider_native_settings_payload() {
+    let native_settings = json!({
+        "searchableAttributes": ["title"],
+        "displayedAttributes": ["url", "apiKey", "title"],
+        "stopWords": ["https://search.example/settings", "apiKey"]
+    });
+    let mut export = PreviewSourceExport::default();
+    export
+        .commit_configuration(&SourceConfigurationArtifact::settings(&native_settings))
+        .unwrap();
+    assert_eq!(
+        export.settings, native_settings,
+        "preview capture must not redact source-owned provider settings"
+    );
+
+    let outcome = translate_spool_payload(export.into_translation_input(
+        "products".to_string(),
+        "shop".to_string(),
+        AsyncMigrationSourceProvider::Meilisearch,
+    ));
+    let translated = match outcome {
+        TranslationOutcome::Translated(translated) => translated,
+        TranslationOutcome::Rejected(report) => {
+            panic!("native Meilisearch settings must not hard-reject, got {report:#?}")
+        }
+    };
+
+    assert_eq!(translated.report.summary.hard_rejections, 0);
+    assert_eq!(
+        translated.bundle.settings.searchable_attributes,
+        Some(vec!["title".to_string()])
+    );
+}
+
 #[tokio::test]
 async fn preview_does_not_write_durable_state_byte_identity() {
     let tmp = TempDir::new().unwrap();
-    seed_destination_index(tmp.path(), "shop", "target-before-preview").await;
-    seed_destination_index(tmp.path(), "bystander", "bystander-before-preview").await;
-
     let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
     let source_factory = TestMigrationSourceReaderFactory::new(|source_provider| {
         assert_eq!(source_provider, AsyncMigrationSourceProvider::Algolia);
         Ok(Box::new(preview_source_reader()))
     });
     let app = build_test_router(&tmp, Some(key_store)).layer(Extension(source_factory));
-
-    fs::create_dir_all(tmp.path().join("migration_exports/jobs")).unwrap();
-    fs::write(
-        tmp.path().join("migration_exports/jobs/existing_job.json"),
-        b"existing job sentinel",
-    )
-    .unwrap();
-    fs::write(
-        tmp.path().join("migration_exports/owner_metadata.json"),
-        b"migration export root metadata sentinel",
-    )
-    .unwrap();
-    fs::create_dir_all(tmp.path().join(".publication/existing_transaction")).unwrap();
-    fs::write(
-        tmp.path()
-            .join(".publication/existing_transaction/manifest.json"),
-        b"publication sentinel",
-    )
-    .unwrap();
-
-    let before = snapshot_durable_state(tmp.path());
-    assert_eq!(
-        before.len(),
-        DURABLE_STATE_SPECIMEN_COUNT,
-        "durable specimen inventory drifted"
-    );
-    for required in [
-        "migration_exports/jobs",
-        "migration_exports/jobs/existing_job.json",
-        "migration_exports/owner_metadata.json",
-        ".publication",
-        ".publication/existing_transaction/manifest.json",
-        "shop",
-        "bystander",
-    ] {
-        assert!(
-            before.contains_key(required),
-            "required nonzero durable-state surface missing from specimen: {required}"
-        );
-    }
-    println!("durable_state_specimens={}", before.len());
-
+    let before = seed_durable_state_specimens(tmp.path()).await;
     let response = post_preview(&app).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_json(response).await;
-
-    assert!(
-        body.get("jobId").is_none(),
-        "preview must return an advisory report, not an admitted migration receipt"
-    );
-    let after = snapshot_durable_state(tmp.path());
-    assert_eq!(after.len(), before.len(), "durable specimen count changed");
-    assert_eq!(
-        after, before,
-        "preview crossed a durable job, spool, staging, publication, target, or bystander owner"
-    );
+    assert_preview_preserves_durable_state(tmp.path(), before, response).await;
 }
 
 #[tokio::test]
@@ -360,31 +481,9 @@ async fn preview_leaves_absent_target_and_unopened_publication_namespace_absent(
 }
 
 #[tokio::test]
-async fn typesense_preview_returns_exact_unsupported_provider_error() {
-    let tmp = TempDir::new().unwrap();
-    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
-    let app = build_test_router(&tmp, Some(key_store));
-
-    let response = post_provider_preview(
-        &app,
-        "typesense",
-        json!({
-            "appId": "typesense-fixture",
-            "apiKey": "source-key",
-            "sourceIndex": "products",
-            "targetIndex": "shop"
-        }),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = body_json(response).await;
-    assert_eq!(body["code"], "source_provider_unsupported");
-    assert_eq!(body["message"], SOURCE_PROVIDER_UNSUPPORTED_MESSAGE);
-}
-
-#[tokio::test]
 #[ignore = "invoked by tests/meilisearch_source_contract_kat.sh --preview-live"]
 async fn meilisearch_live_preview_reports_exact_seeded_counts_and_codes() {
+    let _env = with_env_var(MEILISEARCH_LOOPBACK_OPT_IN_ENV, "1");
     let endpoint = env::var(MEILISEARCH_LIVE_ENDPOINT_ENV)
         .expect("Meilisearch preview endpoint must be supplied by the live KAT owner");
     let source_api_key = env::var(MEILISEARCH_LIVE_API_KEY_ENV)
@@ -416,9 +515,11 @@ async fn meilisearch_live_preview_reports_exact_seeded_counts_and_codes() {
         json!({"indexes": 1, "records": expected_record_count})
     );
 
-    let report_codes = body["report"]["entries"]
+    let entries = body["report"]["entries"]
         .as_array()
         .expect("preview report entries must be an array")
+        .clone();
+    let report_codes = entries
         .iter()
         .map(|entry| {
             entry["code"]
@@ -427,31 +528,66 @@ async fn meilisearch_live_preview_reports_exact_seeded_counts_and_codes() {
                 .to_string()
         })
         .collect::<Vec<_>>();
+    // The report is sorted by (severity, resource, jsonPath, code), so the settings
+    // warnings interleave by path rather than by code. The seeded fixture PATCHes
+    // `typoTolerance.disableOnWords: ["SKU"]`, which the live server stores
+    // lowercased, so the GET response carries no value-normalization warning.
+    let report_contract = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry["code"]
+                    .as_str()
+                    .expect("preview report code must be a string"),
+                entry["jsonPath"]
+                    .as_str()
+                    .expect("preview report jsonPath must be a string"),
+            )
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        report_codes,
+        report_contract,
         vec![
-            "ProductNotMigrated",
-            "ProductNotMigrated",
-            "ProductNotMigrated",
-            "ProductNotMigrated",
-            "ProductNotMigrated",
-            "MeilisearchDocumentOrderNotContractual",
-            "MeilisearchSearchPaginationNotExportBound",
-            "MeilisearchSettingNotMigrated",
-            "MeilisearchSettingNotMigrated",
-            "MeilisearchSettingNotMigrated",
-            "MeilisearchSettingNotMigrated",
-            "MeilisearchSettingNotMigrated",
-            "MeilisearchSettingValueNormalized",
+            ("ProductNotMigrated", "$"),
+            ("ProductNotMigrated", "$"),
+            ("ProductNotMigrated", "$"),
+            ("ProductNotMigrated", "$"),
+            ("ProductNotMigrated", "$"),
+            ("MeilisearchSettingNotMigrated", "$.dictionary"),
+            ("MeilisearchDocumentOrderNotContractual", "$.documents"),
+            ("MeilisearchSettingNotMigrated", "$.facetSearch"),
+            ("MeilisearchSettingNotMigrated", "$.nonSeparatorTokens"),
+            ("MeilisearchSearchPaginationNotExportBound", "$.pagination"),
+            ("MeilisearchSettingNotMigrated", "$.prefixSearch"),
+            ("MeilisearchSettingNotMigrated", "$.proximityPrecision"),
+            ("MeilisearchSettingNotMigrated", "$.rankingRules[5]"),
+            ("MeilisearchSettingNotMigrated", "$.sortableAttributes"),
+            ("MeilisearchSettingNotMigrated", "$.stopWords"),
         ],
-        "live preview codes must remain owned by the existing Meilisearch translation matrix"
+        "live preview codes must remain owned by the existing Meilisearch translation matrix and live settings warning contract"
     );
-    println!(
-        "{}",
+    println!("{}", live_preview_receipt(status, &body, report_codes));
+}
+
+#[test]
+fn live_preview_receipt_includes_status_body_counts_and_codes() {
+    let body = json!({
+        "sourceCounts": {"indexes": 1, "records": 3},
+        "report": {"entries": []}
+    });
+
+    assert_eq!(
+        live_preview_receipt(
+            StatusCode::OK,
+            &body,
+            vec!["ProductNotMigrated".to_string()]
+        ),
         json!({
             "previewProof": "PASS",
-            "sourceCounts": body["sourceCounts"],
-            "reportCodes": report_codes,
+            "previewStatus": 200,
+            "previewBody": body,
+            "sourceCounts": {"indexes": 1, "records": 3},
+            "reportCodes": ["ProductNotMigrated"],
         })
     );
 }

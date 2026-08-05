@@ -1,6 +1,8 @@
 mod key_store;
 mod middleware;
 mod route_acl;
+pub(crate) mod session;
+pub(crate) mod session_cookie;
 
 pub use key_store::*;
 pub use middleware::authenticate_and_authorize;
@@ -14,6 +16,7 @@ use axum::http::Method;
 use axum::{extract::Request, http::StatusCode, response::Response};
 use dashmap::DashMap;
 use flapjack::error::FlapjackError;
+use flapjack_replication::peer::REPLICATION_PEER_APPLICATION_ID;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -159,6 +162,30 @@ impl KeyApiResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedAppId(pub String);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReplicationPeerCredential {
+    secret: Option<String>,
+}
+
+impl ReplicationPeerCredential {
+    pub(crate) fn from_optional_secret(secret: Option<String>) -> Self {
+        let secret = secret.and_then(|secret| {
+            let normalized = secret.trim();
+            (!normalized.is_empty()).then(|| normalized.to_string())
+        });
+        Self { secret }
+    }
+
+    pub(crate) fn matches_secret(&self, candidate: &str) -> bool {
+        use subtle::ConstantTimeEq;
+
+        let Some(secret) = self.secret.as_deref() else {
+            return false;
+        };
+        secret.len() == candidate.len() && secret.as_bytes().ct_eq(candidate.as_bytes()).into()
+    }
+}
 
 pub fn request_application_id(request: &Request) -> Option<String> {
     request

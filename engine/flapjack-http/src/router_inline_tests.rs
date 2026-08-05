@@ -10,7 +10,7 @@ use axum::body::Body;
 #[cfg(feature = "fault-injection")]
 use axum::http::header;
 use axum::http::{header::HeaderMap, Method, Request, StatusCode};
-use axum::routing::post;
+use axum::routing::{get, post};
 use flapjack::analytics::{AnalyticsCollector, AnalyticsConfig};
 #[cfg(unix)]
 use std::ffi::OsStr;
@@ -19,9 +19,10 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::path::Path;
 use std::sync::Arc;
-#[cfg(feature = "fault-injection")]
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tower::ServiceExt;
 
 fn build_test_router_for_data_dir(
@@ -57,6 +58,7 @@ fn build_test_router_with_state_for_data_dir(
         RouterConfig {
             cors_mode: CorsMode::LoopbackOnly,
             disable_dashboard: false,
+            replication_api_key: None,
         },
     );
 
@@ -110,14 +112,13 @@ async fn wait_for_fault_sleep_marker(logs: &SharedLogBuffer) {
 
 #[cfg(feature = "fault-injection")]
 fn fault_test_router() -> (TempDir, Router, Arc<KeyStore>) {
-    fault_test_router_with_resource_bounds(ResourceBounds {
+    test_router_with_resource_bounds(ResourceBounds {
         request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
         max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
     })
 }
 
-#[cfg(feature = "fault-injection")]
-fn fault_test_router_with_resource_bounds(
+fn test_router_with_resource_bounds(
     resource_bounds: ResourceBounds,
 ) -> (TempDir, Router, Arc<KeyStore>) {
     let tmp = TempDir::new().unwrap();
@@ -141,6 +142,7 @@ fn fault_test_router_with_resource_bounds(
         RouterConfig {
             cors_mode: CorsMode::LoopbackOnly,
             disable_dashboard: false,
+            replication_api_key: None,
         },
         resource_bounds,
     );
@@ -430,6 +432,129 @@ fn request_timeout_secs_from_value_parses_positive_integer() {
     assert_eq!(request_timeout_secs_from_value(Some("7")), 7);
 }
 
+#[tokio::test(start_paused = true)]
+async fn bulk_replace_upload_outlives_global_request_timeout_until_body_eof() {
+    let (_tmp, app, _key_store) = test_router_with_resource_bounds(ResourceBounds {
+        request_timeout: Duration::from_millis(500),
+        max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+    });
+    let (tx, rx) = mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(1);
+    tx.send(Ok(axum::body::Bytes::from_static(
+        b"{\"objectID\":\"slow-one\"}\n",
+    )))
+    .await
+    .unwrap();
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/1/migrations/bulk-replace?indexName=slow_upload")
+        .header("content-type", "application/x-ndjson")
+        .header("x-algolia-api-key", "admin-key")
+        .header("x-algolia-application-id", "timeout-contract-app")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap();
+    let submission = tokio::spawn(app.oneshot(request));
+
+    let body_poll_permit = tokio::time::timeout(Duration::from_secs(10), tx.reserve())
+        .await
+        .expect("bulk replacement should start consuming the request body")
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(
+        !submission.is_finished(),
+        "the generic request timeout must not abort a bounded bulk-replace upload"
+    );
+    drop(body_poll_permit);
+    drop(tx);
+
+    let response = tokio::time::timeout(Duration::from_secs(10), submission)
+        .await
+        .expect("bulk replacement should admit after request-body EOF")
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test(start_paused = true)]
+async fn bulk_replace_upload_is_still_bounded_against_slow_clients() {
+    let (_tmp, app, _key_store) = test_router_with_resource_bounds(ResourceBounds {
+        request_timeout: Duration::from_millis(20),
+        max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+    });
+    let (tx, rx) = mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(1);
+    tx.send(Ok(axum::body::Bytes::from_static(
+        b"{\"objectID\":\"slow-one\"}\n",
+    )))
+    .await
+    .unwrap();
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/1/migrations/bulk-replace?indexName=bounded_slow_upload")
+        .header("content-type", "application/x-ndjson")
+        .header("x-algolia-api-key", "admin-key")
+        .header("x-algolia-application-id", "timeout-contract-app")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap();
+    let submission = tokio::spawn(app.oneshot(request));
+
+    let body_poll_permit = tokio::time::timeout(Duration::from_secs(10), tx.reserve())
+        .await
+        .expect("bulk replacement should start consuming the request body")
+        .unwrap();
+    drop(body_poll_permit);
+    tokio::time::advance(Duration::from_millis(121)).await;
+
+    let response = tokio::time::timeout(Duration::from_secs(1), submission)
+        .await
+        .expect("a stalled bulk-replace upload must have a finite deadline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+}
+
+#[tokio::test]
+async fn global_request_timeout_still_bounds_other_routes() {
+    let app = Router::new()
+        .route(
+            "/slow",
+            post(|| async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                StatusCode::OK
+            }),
+        )
+        .route(
+            BULK_REPLACE_UPLOAD_PATH,
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                StatusCode::OK
+            }),
+        )
+        .layer(middleware::from_fn(|request, next| {
+            enforce_request_timeout(request, next, Duration::from_millis(10))
+        }));
+
+    for (method, path) in [
+        (Method::POST, "/slow"),
+        (Method::GET, BULK_REPLACE_UPLOAD_PATH),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method.clone())
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::REQUEST_TIMEOUT,
+            "{method} {path} must remain subject to the global request timeout"
+        );
+    }
+}
+
 #[test]
 fn max_concurrent_requests_from_value_uses_default_when_unset_or_invalid() {
     assert_eq!(
@@ -459,7 +584,7 @@ fn max_concurrent_requests_from_value_parses_positive_integer() {
 #[serial_test::serial(resource_bounds_env)]
 #[tokio::test]
 async fn fault_sleep_times_out_with_canonical_json_error() {
-    let (_tmp, app, _key_store) = fault_test_router_with_resource_bounds(ResourceBounds {
+    let (_tmp, app, _key_store) = test_router_with_resource_bounds(ResourceBounds {
         request_timeout: Duration::from_secs(1),
         max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
     });
@@ -498,7 +623,7 @@ async fn fault_panic_returns_canonical_json_error_with_request_id() {
 #[serial_test::serial(resource_bounds_env)]
 #[tokio::test]
 async fn global_concurrency_limit_queues_health_while_fault_sleep_owns_slot() {
-    let (_tmp, app, _key_store) = fault_test_router_with_resource_bounds(ResourceBounds {
+    let (_tmp, app, _key_store) = test_router_with_resource_bounds(ResourceBounds {
         request_timeout: Duration::from_secs(5),
         max_concurrent_requests: 1,
     });
@@ -567,13 +692,16 @@ async fn global_concurrency_limit_queues_health_while_fault_sleep_owns_slot() {
 
 #[tokio::test]
 async fn body_limit_from_env_rejects_payload_over_limit() {
-    let (_tmp, app, _restore) = {
-        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
-        let restore = EnvVarRestoreGuard::set("FLAPJACK_MAX_BODY_MB", "1");
-        let tmp = TempDir::new().unwrap();
-        let app = build_test_router(&tmp, None);
-        (tmp, app, restore)
-    };
+    // `with_env_var` holds ENV_MUTEX for the guard's whole lifetime and
+    // restores under that lock. Setting the variable with an unlocked
+    // `EnvVarRestoreGuard` instead leaves the restore racing every sibling that
+    // reads `FLAPJACK_MAX_BODY_MB` while building its own router.
+    let _env_guard = with_env_var("FLAPJACK_MAX_BODY_MB", "1");
+    let tmp = TempDir::new().unwrap();
+    let app = build_test_router(&tmp, None);
+    // The router captured its limit at build time, so release the lock before
+    // awaiting rather than holding ENV_MUTEX across `.await`.
+    drop(_env_guard);
     let oversized_payload = serde_json::json!({
         "uid": "body-limit-over",
         "padding": "a".repeat(1_048_577)
@@ -585,13 +713,11 @@ async fn body_limit_from_env_rejects_payload_over_limit() {
 
 #[tokio::test]
 async fn body_limit_from_env_allows_payload_under_limit() {
-    let (_tmp, app, _restore) = {
-        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
-        let restore = EnvVarRestoreGuard::set("FLAPJACK_MAX_BODY_MB", "1");
-        let tmp = TempDir::new().unwrap();
-        let app = build_test_router(&tmp, None);
-        (tmp, app, restore)
-    };
+    // Same locking contract as `body_limit_from_env_rejects_payload_over_limit`.
+    let _env_guard = with_env_var("FLAPJACK_MAX_BODY_MB", "1");
+    let tmp = TempDir::new().unwrap();
+    let app = build_test_router(&tmp, None);
+    drop(_env_guard);
     let small_payload = serde_json::json!({ "uid": "body-limit-under" });
 
     let response = send_json_request(&app, Method::POST, "/1/indexes", small_payload).await;

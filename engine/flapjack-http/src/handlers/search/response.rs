@@ -354,6 +354,7 @@ pub(super) fn format_search_response(
     let TransformOutputs {
         geo_distances,
         automatic_radius,
+        ..
     } = transform_outputs;
 
     let original_query_words = extract_query_words(&req.query);

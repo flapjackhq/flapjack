@@ -37,6 +37,9 @@ fn collect_relative_files(
     }
     for entry in std::fs::read_dir(current)? {
         let path = entry?.path();
+        if crate::index::utils::is_temporary_entry(&path) {
+            continue;
+        }
         let metadata = std::fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
             return Err(invalid_publication(format!(
@@ -63,4 +66,35 @@ fn collect_relative_files(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn inventory_ignores_atomic_write_temporary_files() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("tenant");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("index_meta.json"), b"published").unwrap();
+        std::fs::write(
+            root.join(".tmp.index_meta.json.123.456.0.tmp"),
+            b"in flight",
+        )
+        .unwrap();
+        std::fs::write(root.join(".index_meta.json.tmp"), b"legacy metadata temp").unwrap();
+        std::fs::write(
+            root.join(".committed_seq.42.99.tmp"),
+            b"legacy watermark temp",
+        )
+        .unwrap();
+
+        assert_eq!(
+            TantivyManagedInventory::from_existing_trees([root.as_path()]).unwrap(),
+            TantivyManagedInventory::new([PathBuf::from("index_meta.json")]).unwrap(),
+            "publication inventory must exclude current and legacy atomic-write temporary files"
+        );
+    }
 }

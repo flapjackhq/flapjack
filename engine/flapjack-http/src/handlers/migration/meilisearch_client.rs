@@ -3,6 +3,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
+#[cfg(debug_assertions)]
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;
@@ -14,6 +16,8 @@ pub(super) const MAX_DOCUMENT_PAGES: usize = 10_000;
 pub(super) const MAX_DOCUMENT_ITEMS: usize = 1_000_000;
 pub(super) const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MEILISEARCH_CLOUD_HOST_SUFFIX: &str = ".meilisearch.io";
+#[cfg(debug_assertions)]
+const MEILISEARCH_PREVIEW_LOOPBACK_ENV: &str = "FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct TraversalLimits {
@@ -38,6 +42,10 @@ pub(super) enum MeilisearchErrorKind {
     Timeout,
     Redirect,
     Upstream,
+    /// The upstream refused the credential's authorization for the requested
+    /// action (Meilisearch `invalid_api_key`), which callers surface as a
+    /// labelled 403 rather than a generic upstream failure.
+    Forbidden,
     Decode,
     Schema,
     Progress,
@@ -78,7 +86,10 @@ pub(super) struct MeilisearchClient {
     client: reqwest::Client,
     endpoint_origin: String,
     api_key: String,
-    source_index: String,
+    /// `None` for credential-scoped source discovery, which enumerates indexes
+    /// instead of reading one. Source-bound operations require it explicitly so
+    /// a discovery client can never silently read an empty index name.
+    source_index: Option<String>,
 }
 
 impl MeilisearchClient {
@@ -87,30 +98,111 @@ impl MeilisearchClient {
         api_key: &str,
         source_index: &str,
     ) -> Result<Self, MeilisearchClientError> {
-        if api_key.is_empty() || source_index.is_empty() {
-            return Err(MeilisearchClientError::new(
-                MeilisearchErrorKind::Validation,
-                "Meilisearch credentials and source index are required",
-            ));
-        }
+        require_source_credentials_and_index(api_key, source_index)?;
+        Self::from_vetted_cloud_endpoint(endpoint, api_key, Some(source_index))
+    }
+
+    /// Build a credential-scoped client for source discovery, which needs API
+    /// credentials but no source index.
+    pub(super) fn new_discovery(
+        endpoint: &str,
+        api_key: &str,
+    ) -> Result<Self, MeilisearchClientError> {
+        require_source_credentials(api_key)?;
+        Self::from_vetted_cloud_endpoint(endpoint, api_key, None)
+    }
+
+    fn from_vetted_cloud_endpoint(
+        endpoint: &str,
+        api_key: &str,
+        source_index: Option<&str>,
+    ) -> Result<Self, MeilisearchClientError> {
         let target = flapjack::security::vet_strict_vendor_url_target(
             endpoint,
             &[MEILISEARCH_CLOUD_HOST_SUFFIX],
         )
-        .map_err(|_| {
-            MeilisearchClientError::new(
-                MeilisearchErrorKind::Validation,
-                "Meilisearch Cloud endpoint is not allowed",
-            )
-        })?;
-        Self::from_vetted_target(&target.host, target.socket_addrs(), api_key, source_index)
+        .map_err(|_| meilisearch_endpoint_not_allowed())?;
+        let endpoint_origin = format!("https://{}", target.host);
+        Self::from_vetted_target(
+            &target.host,
+            endpoint_origin,
+            target.socket_addrs(),
+            api_key,
+            source_index,
+        )
+    }
+
+    #[cfg(debug_assertions)]
+    pub(super) fn new_preview_loopback(
+        endpoint: &str,
+        api_key: &str,
+        source_index: &str,
+    ) -> Result<Self, MeilisearchClientError> {
+        require_source_credentials_and_index(api_key, source_index)?;
+        Self::from_admitted_loopback_endpoint(endpoint, api_key, Some(source_index))
+    }
+
+    /// Debug-only discovery counterpart to [`Self::new_preview_loopback`].
+    #[cfg(debug_assertions)]
+    pub(super) fn new_discovery_preview_loopback(
+        endpoint: &str,
+        api_key: &str,
+    ) -> Result<Self, MeilisearchClientError> {
+        require_source_credentials(api_key)?;
+        Self::from_admitted_loopback_endpoint(endpoint, api_key, None)
+    }
+
+    #[cfg(debug_assertions)]
+    fn from_admitted_loopback_endpoint(
+        endpoint: &str,
+        api_key: &str,
+        source_index: Option<&str>,
+    ) -> Result<Self, MeilisearchClientError> {
+        // This feature exists only for the live contract fixture. Fail before
+        // parsing or vetting attacker-controlled endpoints so the disabled
+        // default cannot trigger DNS resolution as a side effect.
+        if !preview_loopback_enabled() {
+            return Err(meilisearch_preview_loopback_disabled());
+        }
+        let parsed =
+            reqwest::Url::parse(endpoint).map_err(|_| meilisearch_endpoint_not_allowed())?;
+        let parsed_host = parsed
+            .host_str()
+            .ok_or_else(meilisearch_endpoint_not_allowed)?;
+        if parsed_host.eq_ignore_ascii_case("localhost")
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.path() != "/"
+        {
+            return Err(meilisearch_endpoint_not_allowed());
+        }
+        let ip = parsed_host
+            .parse::<IpAddr>()
+            .map_err(|_| meilisearch_endpoint_not_allowed())?;
+        if !ip.is_loopback() {
+            return Err(meilisearch_endpoint_not_allowed());
+        }
+        let target = flapjack::security::vet_outbound_url_target(endpoint, true)
+            .map_err(|_| meilisearch_endpoint_not_allowed())?
+            .ok_or_else(meilisearch_endpoint_not_allowed)?;
+        let endpoint_origin = parsed.origin().ascii_serialization();
+        Self::from_vetted_target(
+            &target.host,
+            endpoint_origin,
+            target.socket_addrs(),
+            api_key,
+            source_index,
+        )
     }
 
     fn from_vetted_target(
         endpoint_host: &str,
+        endpoint_origin: String,
         endpoint_addresses: Vec<SocketAddr>,
         api_key: &str,
-        source_index: &str,
+        source_index: Option<&str>,
     ) -> Result<Self, MeilisearchClientError> {
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
@@ -127,9 +219,9 @@ impl MeilisearchClient {
             })?;
         Ok(Self {
             client,
-            endpoint_origin: format!("https://{endpoint_host}"),
+            endpoint_origin,
             api_key: api_key.to_string(),
-            source_index: source_index.to_string(),
+            source_index: source_index.map(str::to_string),
         })
     }
 
@@ -140,7 +232,40 @@ impl MeilisearchClient {
         api_key: &str,
         source_index: &str,
     ) -> Result<Self, MeilisearchClientError> {
-        Self::from_vetted_target(endpoint_host, endpoint_addresses, api_key, source_index)
+        Self::from_vetted_target(
+            endpoint_host,
+            format!("https://{endpoint_host}"),
+            endpoint_addresses,
+            api_key,
+            Some(source_index),
+        )
+    }
+
+    /// Discovery counterpart to [`Self::for_test`]: the same vetted-target
+    /// builder with no source index bound.
+    #[cfg(test)]
+    pub(super) fn for_discovery_test(
+        endpoint_host: &str,
+        endpoint_origin: String,
+        endpoint_addresses: Vec<SocketAddr>,
+        api_key: &str,
+    ) -> Result<Self, MeilisearchClientError> {
+        Self::from_vetted_target(
+            endpoint_host,
+            endpoint_origin,
+            endpoint_addresses,
+            api_key,
+            None,
+        )
+    }
+
+    fn require_source_index(&self) -> Result<&str, MeilisearchClientError> {
+        self.source_index.as_deref().ok_or_else(|| {
+            MeilisearchClientError::new(
+                MeilisearchErrorKind::Validation,
+                "Meilisearch source index is required",
+            )
+        })
     }
 
     pub(super) fn build_http_request(
@@ -176,26 +301,120 @@ impl MeilisearchClient {
     where
         F: FnMut(Vec<Value>) -> Result<(), MeilisearchClientError>,
     {
+        let source_index = self.require_source_index()?.to_string();
         let mut transport = ReqwestTransport { owner: self };
-        capture_source_with_transport(&mut transport, &self.source_index, consume_page).await
+        capture_source_with_transport(&mut transport, &source_index, consume_page).await
     }
 
     pub(super) async fn observe_source(
         &self,
     ) -> Result<MeilisearchSourceObservation, MeilisearchClientError> {
+        let source_index = self.require_source_index()?.to_string();
         let mut transport = ReqwestTransport { owner: self };
-        observe_source_with_transport(&mut transport, &self.source_index).await
+        observe_source_with_transport(&mut transport, &source_index).await
     }
 
     pub(super) async fn read_source_settings(&self) -> Result<Value, MeilisearchClientError> {
+        let source_index = self.require_source_index()?.to_string();
         let mut transport = ReqwestTransport { owner: self };
-        read_settings_with_transport(&mut transport, &self.source_index).await
+        read_settings_with_transport(&mut transport, &source_index).await
     }
 
     pub(super) async fn require_read_access(&self) -> Result<(), MeilisearchClientError> {
+        let source_index = self.require_source_index()?.to_string();
         let mut transport = ReqwestTransport { owner: self };
-        require_read_access_with_transport(&mut transport, &self.source_index).await
+        require_read_access_with_transport(&mut transport, &source_index).await
     }
+
+    /// Enumerate every index the supplied credentials can list.
+    ///
+    /// Discovery is credential-scoped, so it neither requires nor consumes a
+    /// source index.
+    pub(super) async fn list_indexes(
+        &self,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    ) -> Result<MeilisearchIndexListing, MeilisearchClientError> {
+        let mut transport = ReqwestTransport { owner: self };
+        list_indexes_with_transport(&mut transport, offset, limit).await
+    }
+
+    pub(super) async fn read_index_document_count(
+        &self,
+        index_uid: &str,
+    ) -> Result<u64, MeilisearchClientError> {
+        validate_source_index(index_uid)?;
+        let mut transport = ReqwestTransport { owner: self };
+        let stats = read_index_stats(
+            &mut transport,
+            &format!("/indexes/{}/stats", encoded_index_uid(index_uid)),
+        )
+        .await?;
+        Ok(stats.number_of_documents as u64)
+    }
+}
+
+fn meilisearch_endpoint_not_allowed() -> MeilisearchClientError {
+    MeilisearchClientError::new(
+        MeilisearchErrorKind::Validation,
+        "Meilisearch Cloud endpoint is not allowed",
+    )
+}
+
+#[cfg(debug_assertions)]
+fn meilisearch_preview_loopback_disabled() -> MeilisearchClientError {
+    MeilisearchClientError::new(
+        MeilisearchErrorKind::Validation,
+        "Meilisearch preview loopback endpoint is disabled",
+    )
+}
+
+#[cfg(debug_assertions)]
+fn preview_loopback_enabled() -> bool {
+    matches!(
+        std::env::var(MEILISEARCH_PREVIEW_LOOPBACK_ENV).as_deref(),
+        Ok("1")
+    )
+}
+
+/// Credential-only admission for operations that are not bound to one index.
+fn require_source_credentials(api_key: &str) -> Result<(), MeilisearchClientError> {
+    if api_key.is_empty() {
+        return Err(MeilisearchClientError::new(
+            MeilisearchErrorKind::Validation,
+            "Meilisearch credentials are required",
+        ));
+    }
+    Ok(())
+}
+
+fn require_source_credentials_and_index(
+    api_key: &str,
+    source_index: &str,
+) -> Result<(), MeilisearchClientError> {
+    if api_key.is_empty() || source_index.is_empty() {
+        return Err(MeilisearchClientError::new(
+            MeilisearchErrorKind::Validation,
+            "Meilisearch credentials and source index are required",
+        ));
+    }
+    validate_source_index(source_index)?;
+    Ok(())
+}
+
+pub(super) fn validate_source_index(source_index: &str) -> Result<(), MeilisearchClientError> {
+    if source_index == "."
+        || source_index == ".."
+        || source_index.contains('/')
+        || source_index.contains('\\')
+        || source_index.contains('\0')
+    {
+        return Err(MeilisearchClientError::new(
+            MeilisearchErrorKind::Validation,
+            "Meilisearch source index is invalid",
+        ));
+    }
+    Ok(())
 }
 
 impl fmt::Debug for MeilisearchClient {
@@ -221,9 +440,20 @@ pub(super) struct DocumentPage {
 #[serde(rename_all = "camelCase")]
 pub(super) struct IndexMetadata {
     pub(super) uid: String,
-    primary_key: Option<String>,
-    created_at: String,
-    updated_at: String,
+    pub(super) primary_key: Option<String>,
+    pub(super) created_at: String,
+    pub(super) updated_at: String,
+}
+
+/// One page of `GET /indexes`, preserving Meilisearch's own pagination triple
+/// so callers report the upstream window rather than inferring it from the
+/// returned slice length.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(super) struct MeilisearchIndexListing {
+    pub(super) results: Vec<IndexMetadata>,
+    pub(super) total: u64,
+    pub(super) offset: u64,
+    pub(super) limit: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -470,6 +700,53 @@ fn validate_page_progress(
     Ok(())
 }
 
+/// Index discovery is `GET /indexes` with `offset`/`limit` pagination. Only the
+/// parameters the caller supplied are sent, so an unpaginated request inherits
+/// the upstream's own default window.
+fn index_listing_path(offset: Option<u64>, limit: Option<u64>) -> String {
+    let mut query = Vec::new();
+    if let Some(offset) = offset {
+        query.push(format!("offset={offset}"));
+    }
+    if let Some(limit) = limit {
+        query.push(format!("limit={limit}"));
+    }
+    if query.is_empty() {
+        "/indexes".to_string()
+    } else {
+        format!("/indexes?{}", query.join("&"))
+    }
+}
+
+pub(super) async fn list_indexes_with_transport<T: MeilisearchTransport>(
+    transport: &mut T,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> Result<MeilisearchIndexListing, MeilisearchClientError> {
+    decode_json_value(
+        read_json_with_status_policy(
+            transport,
+            &index_listing_path(offset, limit),
+            validate_discovery_response_status,
+        )
+        .await?,
+    )
+}
+
+/// Discovery adds one rule to the shared status policy: a source key without the
+/// `indexes.get` ACL fails upstream with 403 `invalid_api_key`, and that refusal
+/// must stay distinguishable from a generic upstream failure so callers can
+/// report which permission is missing.
+fn validate_discovery_response_status(status: u16) -> Result<(), MeilisearchClientError> {
+    if status == 403 {
+        return Err(MeilisearchClientError::new(
+            MeilisearchErrorKind::Forbidden,
+            "Meilisearch source credentials lack the indexes.get action",
+        ));
+    }
+    validate_response_status(status)
+}
+
 fn validate_response_status(status: u16) -> Result<(), MeilisearchClientError> {
     match status {
         200..=299 => Ok(()),
@@ -693,6 +970,14 @@ async fn read_json<T: MeilisearchTransport>(
     transport: &mut T,
     path: &str,
 ) -> Result<Value, MeilisearchClientError> {
+    read_json_with_status_policy(transport, path, validate_response_status).await
+}
+
+async fn read_json_with_status_policy<T: MeilisearchTransport>(
+    transport: &mut T,
+    path: &str,
+    validate_status: fn(u16) -> Result<(), MeilisearchClientError>,
+) -> Result<Value, MeilisearchClientError> {
     let response = transport
         .send(MeilisearchRequest {
             method: MeilisearchMethod::Get,
@@ -700,7 +985,7 @@ async fn read_json<T: MeilisearchTransport>(
             body: None,
         })
         .await?;
-    validate_response_status(response.status)?;
+    validate_status(response.status)?;
     if response.body.len() > MAX_RESPONSE_BYTES {
         return Err(MeilisearchClientError::new(
             MeilisearchErrorKind::Limit,

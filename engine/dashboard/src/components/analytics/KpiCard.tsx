@@ -2,6 +2,7 @@ import { useMemo } from 'react';
 import { Area, AreaChart, ResponsiveContainer } from 'recharts';
 import { ArrowDownRight, ArrowUpRight, type LucideIcon, Minus } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { CHART_CANVAS_TEST_ID, CHART_MARK_TEST_ID } from '@/lib/constants';
 import { Skeleton } from '@/components/ui/skeleton';
 
 interface DeltaBadgeProps {
@@ -52,7 +53,7 @@ function KpiSparkline({
   return (
     <div className="h-8 w-full" data-testid="sparkline">
       <ResponsiveContainer width="100%" height="100%" minWidth={1}>
-        <AreaChart data={data}>
+        <AreaChart data={data} data-testid={CHART_CANVAS_TEST_ID}>
           <defs>
             <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stopColor="hsl(var(--primary))" stopOpacity={0.3} />
@@ -60,6 +61,7 @@ function KpiSparkline({
             </linearGradient>
           </defs>
           <Area
+            data-testid={CHART_MARK_TEST_ID}
             type="monotone"
             dataKey={dataKey}
             stroke="hsl(var(--primary))"

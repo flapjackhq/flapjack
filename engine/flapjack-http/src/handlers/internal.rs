@@ -764,6 +764,11 @@ pub async fn add_cluster_peer(
             "addr must be a safe HTTP or HTTPS peer URL",
         );
     };
+    if let Err(message) =
+        crate::analytics_cluster::validate_authenticated_query_peer_transport(&node_id, &addr)
+    {
+        return crate::error_response::json_error(StatusCode::BAD_REQUEST, message);
+    }
     let Some(replication_manager) = state.replication_manager.as_ref() else {
         return crate::error_response::json_error(
             StatusCode::BAD_REQUEST,

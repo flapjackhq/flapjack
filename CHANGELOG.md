@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.11] - 2026-08-05
+
 ### Security
 
 - **Fixed a panic in the API key parser on malformed input.** A secured API key whose
@@ -29,14 +31,112 @@ and this project follows [Semantic Versioning](https://semver.org/).
   base-image upgrades cannot silently shift ownership of persisted volumes. The container
   now exits non-zero with an actionable message when a pre-existing `/data` volume is not
   writable, instead of starting and failing later.
-- CI now gates the bundled dashboard on a high-and-above production `npm audit`, with a
-  deliberately vulnerable fixture proving the gate can fail.
+- **The bundled dashboard no longer ships the known Axios production vulnerability.** Its
+  Axios dependency floor is now `^1.18.0`.
 - The embedded dashboard, API, Swagger UI, and generated error responses now receive a
   strict default security-header set, including CSP frame protection; HSTS remains tied to
   the separate TLS-listener work.
 - Request handling now has configurable execution timeout, queued global concurrency, and
   panic-to-JSON containment boundaries, so timeout and panic paths preserve the canonical
   JSON error shape.
+- Security audit events now cover admin authentication and sensitive mutations across API
+  keys, index deletion, settings changes, snapshot import and restore, S3 restore, and
+  admin-key rotation. Events use bounded actor/action/target/outcome fields and route
+  templates so credentials, headers, query strings, and raw payloads are not logged.
+- S3 snapshot uploads now request server-side encryption by default with `AES256`, can opt
+  into `aws:kms` through `FLAPJACK_S3_SSE`, and verify the returned encryption header
+  instead of trusting the request.
+- Portable snapshot bytes now support optional AES-256-GCM-SIV encryption through
+  `FLAPJACK_SNAPSHOT_KEY_FILE`, with encrypted imports requiring the matching key before
+  restore.
+- **The binary can terminate TLS and hot-rotate ACME material without restarting.** Static
+  PEM startup still fails closed when material is unreadable, malformed, incomplete, or
+  mismatched. ACME issuance now persists the private key, publishes each fullchain/key pair
+  as one owner-private fsynced generation, and updates subsequent rustls handshakes in the
+  running listener without rebinding or changing the process. Malformed renewal material
+  keeps the last valid certificate live. Plaintext HTTP-01 challenges remain reachable on
+  the TLS listener while other plaintext API requests remain rejected. Reverse-proxy TLS
+  remains supported.
+- **Replication peers now authenticate with their own credential instead of the admin key.**
+  Internal routes resolve to one peer-allowed-or-admin-only decision per method and path,
+  so a configured peer credential can serve replication while being refused on
+  `POST /internal/cluster/peers`, `DELETE /internal/cluster/peers/{node_id}`, and
+  `POST /internal/rotate-admin-key`. The credential is read only from the request header and
+  compared in constant time. Admin-key and unauthenticated behavior are unchanged, so a
+  rolling upgrade needs no coordinated cutover. ~~Two limits remain: the peer credential is
+  optional, so replication configured without one keeps the previous posture, and peer
+  transport is still cleartext HTTP.~~ **Both limits are closed — see the next entry.**
+- **A replication peer must now have a credential, and that credential is not sent in the
+  clear by accident.** Two behavior changes, both fail-closed. (1) A node configured with
+  replication peers but no `FLAPJACK_REPLICATION_API_KEY` now **refuses to start** instead of
+  silently falling back to the previous posture. (2) A peer origin using cleartext `http://`
+  is **refused** whenever a credential would travel over it — across static config, persisted
+  config, bootstrap peers, and the runtime `POST /internal/cluster/peers` endpoint — with an
+  actionable error naming the peer and the fix. Set
+  `FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1` to keep a cleartext peer deliberately (for
+  example a trusted private LAN); the refusal message names this escape hatch. Background
+  analytics rollup fan-out, which was previously an unauthenticated peer client, now
+  authenticates with the same credential. **This is a breaking configuration change for
+  anyone running replication without a peer credential or over `http://`** — the rolling
+  upgrade path is documented in `engine/docs2/3_IMPLEMENTATION/OPERATIONS.md`.
+- **The S3 snapshot list path now fails loudly.** `list_snapshots` checks the ListObjectsV2
+  HTTP status before parsing the response body, so a rejected list returns the status
+  (`S3 list: HTTP 403`) instead of a misleading XML parse error. Upload and delete already
+  did this; all three now have focused rejected-response regressions.
+- **The dashboard no longer stores its admin key in browser-readable storage.** Login
+  exchanges the key once for a server-owned `HttpOnly; SameSite=Strict` session cookie;
+  logout revokes the session server-side, authenticated reloads survive, and legacy
+  persisted key material is dropped during store migration. The durable session store
+  persists only keyed fingerprints and per-session salted HMAC-SHA256 verifiers in a
+  `0600` file — never the session token or admin key. Header-key authentication for SDKs
+  and direct API clients is unchanged.
+
+### Reliability
+
+- **Durable admission stays fail-closed under disk exhaustion.** When the write path's disk fills,
+  admission rejects the write with HTTP `500` and no rejected write replays into the index after a
+  restart. Re-proved by three sequential real-filesystem fill-disk specimens at exact fetched
+  `origin/main` SHA `3b11f8216f1d7dccc74262e1b63b3e1603152202`, each accepted with `outcome=PASS`,
+  `acknowledged_count=28`, `recovered_count=28`, `rejection_status=500`, and a `source_sha` equal
+  to that SHA. Receipt:
+  `engine/docs2/4_EVIDENCE/2026_08_03_aug03_11am_11_dur1_respecimen_and_close_receipt.md`.
+
+### Fixed (durability and correctness)
+
+- **`looking-similar` recommendations no longer return an empty result solely because
+  vector search is unavailable.** Published targets now use vector similarity when an
+  embedder is configured and a content/term-similarity fallback otherwise, with no model
+  download or new runtime dependency. Legitimate empty vector answers keep their original
+  strategy instead of being silently replaced.
+- **The dashboard is usable across all 23 authenticated routes at a 390px viewport.** The
+  shared shell, header, and API logger now contain their content without document-level
+  horizontal overflow; the route audit reports 23 tested and 23 usable, with a negative
+  control proving the overflow oracle fails on the former layout.
+- **Runtime HA membership can be managed from the Cluster screen.** Operators can add a
+  peer and remove one behind a node-scoped confirmation dialog. Served browser tests verify
+  both mutations through the runtime cluster-status API and restore the fixture to zero
+  peers after cleanup.
+- **A write rejected to the client can no longer become visible after restart, including
+  when the oplog append itself fails partway.** Previously the durable-acknowledgement
+  guarantee was proven only for failures around the append; it is now proven for a failure
+  *inside* `append_operations_with_task_id`, after a partial task-tagged row has been flushed
+  and synced but before the sequence counter advances — the exact shape an `EIO`/`ENOSPC`
+  takes. The contract admits exactly two honest outcomes: the client sees failure and nothing
+  replays, or the client sees a durable acknowledgement and the documents are there. Rollback
+  stays owned by the existing write-queue compensation path; no second rollback owner exists.
+- **Analytics overview no longer aggregates across every index when one index is
+  requested.** `GET /2/overview?index=<name>` returned figures blended across all indexes;
+  it now aggregates only the requested index.
+- **Bulk-replace uploads now have a route-specific, finite execution deadline.** The global
+  request timeout could terminate a measured 1-million-record upload before durable spool
+  EOF; the route now receives six times the configured timeout (1,800 seconds by default),
+  while focused regressions prove slow clients remain bounded and other routes retain the
+  global deadline.
+- **Scale-ladder readiness no longer accepts an unrelated listener's HTTP 200.** Its health
+  wait now requires the launched server's log to confirm the expected bind address before
+  proceeding.
+- **`flapjack migrate` auto-port startup failures now reap their child process.** Failed
+  startup no longer leaves a listener behind to poison subsequent real-server CLI tests.
 
 ### Added
 
@@ -48,6 +148,15 @@ and this project follows [Semantic Versioning](https://semver.org/).
   exactly-once across a full process restart. Meilisearch and Typesense resume are not
   supported.
 
+- Provider-neutral source index discovery: `POST /1/migrations/{provider}/list-indexes` is
+  mounted and published in the OpenAPI document for all three public providers (`algolia`,
+  `meilisearch`, `typesense`), returning one shared response shape. Previously only the
+  Algolia-shaped discovery path existed; the legacy Algolia route is preserved.
+- Meilisearch and Typesense migrations now have served landed-data coverage through real,
+  digest-pinned source containers and an authenticated Flapjack server, including exact
+  source-ID-to-`objectID` projections and searchable field values. Meilisearch 1.50's default
+  `attributeRank` rule now maps to Algolia's single `attribute` criterion, while its default
+  `wordPosition` rule is omitted with a warning and unknown or custom rule shapes fail closed.
 - Runtime HA membership management: `POST /internal/cluster/peers` adds a peer and
   `DELETE /internal/cluster/peers/{node_id}` removes one, both admin-gated, so cluster
   membership changes no longer require a restart.
@@ -70,11 +179,16 @@ and this project follows [Semantic Versioning](https://semver.org/).
   and cooperative cancellation at `/1/migrations/bulk-replace/{jobID}`. It is node-local
   only; admission returns `503 migration_ha_unsupported` when replication peers are
   configured.
-- `flapjack migrate` operator CLI for one-time Algolia migration: submit, poll durable
-  status, and cancel from the command line. Source and destination credentials are accepted
-  only through `--*-env`, `--*-file`, or `--*-stdin` — never as argv — so keys stay out of
-  help text, shell history, and process listings. Distinct non-zero exit codes classify
-  configuration, transport, and terminal-job failures.
+- `flapjack migrate` operator CLI for one-time migration from Algolia, Meilisearch, or
+  Typesense: submit, poll durable status, cancel, and acknowledge from the command line.
+  `--source-provider <algolia|meilisearch|typesense>` selects the route and defaults to
+  `algolia`; Algolia takes `--app-id`, while Meilisearch and Typesense take
+  `--source-endpoint`, sent as `endpoint` and `node` respectively. Source and destination
+  credentials are accepted only through `--*-env`, `--*-file`, or `--*-stdin` — never as
+  argv — so keys stay out of help text, shell history, and process listings; the original
+  `--algolia-key-{env,file,stdin}` spellings remain as aliases of the provider-neutral
+  `--source-key-*` flags. Distinct non-zero exit codes classify configuration, transport,
+  and terminal-job failures.
 - Cooperative cancellation for asynchronous migration jobs, with owner-identity enforcement
   and a `409` for cancel requests that arrive too late to take effect.
 - Algolia replica topology is carried through migration: replicas named by the source
@@ -84,9 +198,11 @@ and this project follows [Semantic Versioning](https://semver.org/).
   restarts.
 - The migration API now declares one closed `source_provider` union (`algolia`,
   `meilisearch`, `typesense`) with provider-parameterised routes at
-  `/1/migrations/{provider}` and matching OpenAPI paths. Providers without a shipped adapter
-  fail closed with a stable `source_provider_unsupported` error instead of being silently
-  absent. Meilisearch and Typesense adapters are not shipped yet.
+  `/1/migrations/{provider}` and matching OpenAPI paths. Meilisearch and Typesense HTTP
+  migration adapters now submit through the shared durable async lifecycle. Preview is
+  supported for Algolia, Meilisearch, and Typesense; Typesense preview preserves its
+  provider-specific settings translation report. Non-Algolia resume continues to fail
+  closed with stable `source_provider_unsupported` errors.
 
 ### Changed
 
@@ -124,6 +240,8 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Async replacement now survives cancel/failure boundaries and idempotent owner
   ACK replay without leaving the replaced target in an indeterminate
   publication state.
+- S3 snapshot deletion and retention failures now propagate their HTTP status instead of
+  being ignored; `snapshot_to_s3` returns a sanitized `500` when retention cleanup fails.
 
 ## [1.0.10] - 2026-06-09
 

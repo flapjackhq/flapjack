@@ -25,6 +25,25 @@ jobs:
           else
             echo "is-public-repo=false" >> $GITHUB_OUTPUT
           fi
+  # Shape contracts for the release path. These are pure shell + python3 (no
+  # cargo, no network), so they cost seconds. They ran nowhere until 2026-08-04,
+  # which meant release.yml could drift out of contract silently — the release
+  # is the one pipeline where a defect is discovered only after it is public.
+  release-contracts:
+    name: Release contracts
+    needs: check-repo
+    if: needs.check-repo.outputs.is-public-repo == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Release workflow structure contract
+        run: bash engine/tests/test_release_workflow_structure.sh
+
+      - name: GHCR publish preflight contract
+        run: bash engine/tests/test_ghcr_publish_preflight.sh
+
   # ============================================================================
   # RUST ENGINE TESTS
   # ============================================================================
@@ -332,7 +351,11 @@ jobs:
           chmod +x /tmp/flapjack/flapjack
           mkdir -p /tmp/flapjack-data
           SERVER_LOG=/tmp/flapjack-data/server.log
-          FLAPJACK_ADMIN_KEY=fj_devtestadminkey000000 /tmp/flapjack/flapjack --data-dir /tmp/flapjack-data >"$SERVER_LOG" 2>&1 &
+          FLAPJACK_ADMIN_KEY=fj_devtestadminkey000000 \
+          FLAPJACK_NODE_ID=dashboard-e2e \
+          FLAPJACK_ADVERTISE_ADDR=https://dashboard-e2e.invalid:7700 \
+          FLAPJACK_REPLICATION_API_KEY=fj_devtestadminkey000000 \
+            /tmp/flapjack/flapjack --data-dir /tmp/flapjack-data >"$SERVER_LOG" 2>&1 &
           SERVER_PID=$!
           bash engine/tests/common/wait_for_flapjack.sh --pid "$SERVER_PID" --host localhost --port 7700 --log-path "$SERVER_LOG"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4

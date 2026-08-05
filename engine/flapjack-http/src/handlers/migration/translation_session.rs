@@ -4,12 +4,13 @@ use super::translation_bundle::{
     TranslationBundle, TypedTranslationFailure,
 };
 use super::translation_report::{
-    contains_hard_rejection, finalize_report, non_portable_product_entries,
+    contains_hard_rejection, finalize_report, hard_entry, non_portable_product_entries,
     source_snapshot_violation_entry, ReportCode, ReportResource, TranslationReport,
     TranslationReportEntry,
 };
 use super::translation_schema::{validate_rule_page, validate_synonym_page};
 use super::{push_typed_failure, validate_settings_payload};
+use crate::handlers::migration::meilisearch_synonyms::parse_meilisearch_synonym_payload;
 use crate::handlers::migration::source_identity_partitions::{
     SourceIdentityConfig, SourceIdentityError, SourceIdentityValidation,
 };
@@ -18,7 +19,9 @@ use crate::handlers::migration::source_snapshot::{
 };
 #[cfg(test)]
 use crate::handlers::migration::source_test_support::identity_config_for_test;
-use crate::handlers::migration::spool::{AcceptedSpoolPage, AcceptedSpoolReader, SpoolError};
+use crate::handlers::migration::spool::{
+    AcceptedSpoolPage, AcceptedSpoolReader, SpoolError, SpoolErrorKind,
+};
 use crate::handlers::migration::AsyncMigrationSourceProvider;
 use flapjack::index::settings::IndexSettings;
 use flapjack::types::Document;
@@ -53,7 +56,9 @@ pub(in crate::handlers::migration) struct SpoolTranslationInput {
     pub(in crate::handlers::migration) settings: Value,
     pub(in crate::handlers::migration) document_pages: Vec<Vec<Value>>,
     pub(in crate::handlers::migration) rule_pages: Vec<Vec<Value>>,
+    pub(in crate::handlers::migration) rule_stable_id_pages: Vec<Vec<String>>,
     pub(in crate::handlers::migration) synonym_pages: Vec<Vec<Value>>,
+    pub(in crate::handlers::migration) synonym_stable_id_pages: Vec<Vec<String>>,
     /// Replica-owned source settings carried to the translation entry point.
     /// Observation-only in Stage 1: counted, never applied to settings.
     pub(in crate::handlers::migration) replica_settings: BTreeMap<String, Value>,
@@ -153,13 +158,15 @@ pub(in crate::handlers::migration) fn translate_accepted_spool_payload<E>(
     reader: AcceptedSpoolReader,
     source_index_name: String,
     target_index_name: String,
-    replica_settings: BTreeMap<String, Value>,
     instrumentation: &mut TranslationSessionInstrumentation,
     should_cancel: impl FnMut() -> Result<bool, SpoolError>,
     emit_documents: impl FnMut(Vec<Document>) -> Result<(), E>,
 ) -> TranslationStreamResult<TranslationOutcome, E> {
-    let source_provider = accepted_settings_source_provider(reader.source_provider()?);
+    let source_provider = reader.source_provider()?;
     let settings = reader.settings()?;
+    // Replica-owned settings are durable spool artifacts, so the accepted reader
+    // is their single source here — nothing is carried in from the caller.
+    let replica_settings = reader.replica_settings()?;
     translate_pages(
         TranslationSettingsInput {
             source_index_name,
@@ -183,10 +190,7 @@ pub(in crate::handlers::migration) fn translate_accepted_spool_payload<E>(
 pub(in crate::handlers::migration) fn translate_accepted_spool_settings(
     reader: &AcceptedSpoolReader,
 ) -> Result<SettingsTranslationOutcome, SpoolError> {
-    let initial = translate_initial_settings(
-        reader.settings()?,
-        accepted_settings_source_provider(reader.source_provider()?),
-    );
+    let initial = translate_initial_settings(reader.settings()?, reader.source_provider()?);
     if contains_hard_rejection(&initial.entries) {
         return Ok(SettingsTranslationOutcome::Rejected(finalize_report(
             initial.entries,
@@ -204,6 +208,12 @@ pub(in crate::handlers::migration) fn translate_spool_input<E>(
     instrumentation: &mut TranslationSessionInstrumentation,
     emit_documents: impl FnMut(Vec<Document>) -> Result<(), E>,
 ) -> TranslationStreamResult<TranslationOutcome, E> {
+    let configuration_stable_id_pages = |stable_id_pages| match input.source_provider {
+        AsyncMigrationSourceProvider::Algolia => None,
+        AsyncMigrationSourceProvider::Meilisearch | AsyncMigrationSourceProvider::Typesense => {
+            Some(stable_id_pages)
+        }
+    };
     translate_pages(
         TranslationSettingsInput {
             source_index_name: input.source_index_name,
@@ -213,9 +223,15 @@ pub(in crate::handlers::migration) fn translate_spool_input<E>(
             replica_settings: input.replica_settings,
         },
         TranslationPageStreams {
-            documents: pages_from_values(input.document_pages),
-            rules: pages_from_values(input.rule_pages),
-            synonyms: pages_from_values(input.synonym_pages),
+            documents: pages_from_values(input.document_pages, None),
+            rules: pages_from_values(
+                input.rule_pages,
+                configuration_stable_id_pages(input.rule_stable_id_pages),
+            ),
+            synonyms: pages_from_values(
+                input.synonym_pages,
+                configuration_stable_id_pages(input.synonym_stable_id_pages),
+            ),
         },
         true,
         instrumentation,
@@ -302,16 +318,55 @@ where
     session.finish()
 }
 
+/// An explicit stable-ID sidecar carries identity that provider-native payloads
+/// cannot recover, so it must stay exactly one-to-one with the value pages at
+/// both the page and the item level. A mismatch — including a sidecar with no
+/// value pages to align against — is corrupt manifest state, never a reason to
+/// fall back to deriving IDs from payloads.
+fn explicit_sidecar_is_aligned(pages: &[Vec<Value>], stable_id_pages: &[Vec<String>]) -> bool {
+    stable_id_pages.len() == pages.len()
+        && stable_id_pages
+            .iter()
+            .zip(pages)
+            .all(|(stable_ids, items)| stable_ids.len() == items.len())
+}
+
 fn pages_from_values(
     pages: Vec<Vec<Value>>,
+    stable_id_pages: Option<Vec<Vec<String>>>,
 ) -> impl Iterator<Item = SpoolResult<AcceptedSpoolPage>> {
-    pages.into_iter().enumerate().map(|(page_index, items)| {
-        Ok(AcceptedSpoolPage {
-            page_index,
-            manifest_count: items.len() as u64,
-            items,
-        })
-    })
+    let alignment_error = stable_id_pages
+        .as_ref()
+        .is_some_and(|explicit| !explicit_sidecar_is_aligned(&pages, explicit))
+        .then(|| SpoolError::new(SpoolErrorKind::ManifestCorrupt));
+    // A misaligned sidecar fails the whole resource, so no page is translated
+    // from identity state that could not be verified.
+    let pages = if alignment_error.is_some() {
+        Vec::new()
+    } else {
+        pages
+    };
+    let mut stable_id_pages = stable_id_pages.map(Vec::into_iter);
+    alignment_error
+        .map(Err)
+        .into_iter()
+        .chain(
+            pages
+                .into_iter()
+                .enumerate()
+                .map(move |(page_index, items)| {
+                    let stable_ids = stable_id_pages
+                        .as_mut()
+                        .and_then(Iterator::next)
+                        .unwrap_or_else(|| page_stable_ids(&items));
+                    Ok(AcceptedSpoolPage {
+                        page_index,
+                        manifest_count: items.len() as u64,
+                        stable_ids,
+                        items,
+                    })
+                }),
+        )
 }
 
 struct TranslationSession<'a, F, E>
@@ -319,6 +374,7 @@ where
     F: FnMut(Vec<Document>) -> Result<(), E>,
 {
     entries: Vec<TranslationReportEntry>,
+    source_provider: AsyncMigrationSourceProvider,
     snapshot_builder: Option<SourceSnapshotBuilder>,
     settings: Option<flapjack::index::settings::IndexSettings>,
     replica_settings: Vec<ReplicaSettingsTranslation>,
@@ -388,6 +444,7 @@ where
 
         Ok(Self {
             entries,
+            source_provider,
             snapshot_builder: Some(snapshot_builder),
             settings: translated_settings,
             replica_settings: translated_replica_settings,
@@ -455,7 +512,7 @@ where
                 .snapshot_builder
                 .as_mut()
                 .expect("snapshot builder exists until finish")
-                .record_rules_page(page.page_index, &page.items)
+                .record_rules_page_with_stable_ids(page.page_index, &page.items, &page.stable_ids)
             {
                 self.entries
                     .push(source_snapshot_violation_entry(violation));
@@ -485,15 +542,20 @@ where
                 .snapshot_builder
                 .as_mut()
                 .expect("snapshot builder exists until finish")
-                .record_synonyms_page(page.page_index, &page.items)
+                .record_synonyms_page_with_stable_ids(
+                    page.page_index,
+                    &page.items,
+                    &page.stable_ids,
+                )
             {
                 self.entries
                     .push(source_snapshot_violation_entry(violation));
             }
-            validate_synonym_page(page.page_index, &page.items, &mut self.entries);
+            let synonym_items = self.translate_synonym_page(&page);
+            validate_synonym_page(page.page_index, &synonym_items, &mut self.entries);
             self.translate_serde_page(
                 page.page_index,
-                &page.items,
+                &synonym_items,
                 ReportCode::MalformedSynonymPayload,
                 ReportResource::Synonym,
                 |session, value| session.synonyms.push(value),
@@ -501,6 +563,17 @@ where
             self.instrumentation.leave_artifact_page();
         }
         Ok(())
+    }
+
+    fn translate_synonym_page(&mut self, page: &AcceptedSpoolPage) -> Vec<Value> {
+        match self.source_provider {
+            AsyncMigrationSourceProvider::Meilisearch => {
+                translate_meilisearch_synonym_page(page, &mut self.entries)
+            }
+            AsyncMigrationSourceProvider::Algolia | AsyncMigrationSourceProvider::Typesense => {
+                page.items.clone()
+            }
+        }
     }
 
     fn translate_serde_page<T: DeserializeOwned>(
@@ -605,15 +678,75 @@ fn settings_source_provider(
     }
 }
 
-fn accepted_settings_source_provider(
-    source_provider: AsyncMigrationSourceProvider,
-) -> AsyncMigrationSourceProvider {
-    match source_provider {
-        AsyncMigrationSourceProvider::Typesense => AsyncMigrationSourceProvider::Typesense,
-        AsyncMigrationSourceProvider::Algolia | AsyncMigrationSourceProvider::Meilisearch => {
-            AsyncMigrationSourceProvider::Algolia
+pub(in crate::handlers::migration) fn page_stable_ids(items: &[Value]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|item| {
+            item.get("objectID")
+                .or_else(|| item.get("stableId"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn translate_meilisearch_synonym_page(
+    page: &AcceptedSpoolPage,
+    entries: &mut Vec<TranslationReportEntry>,
+) -> Vec<Value> {
+    page.items
+        .iter()
+        .enumerate()
+        .filter_map(|(item_index, item)| {
+            translate_meilisearch_synonym(
+                item,
+                page.stable_ids.get(item_index),
+                page.page_index,
+                item_index,
+                entries,
+            )
+        })
+        .collect()
+}
+
+fn translate_meilisearch_synonym(
+    item: &Value,
+    stable_id: Option<&String>,
+    page_index: usize,
+    item_index: usize,
+    entries: &mut Vec<TranslationReportEntry>,
+) -> Option<Value> {
+    let Some(stable_id) = stable_id else {
+        entries.push(hard_entry(
+            ReportCode::MalformedSynonymPayload,
+            ReportResource::Synonym,
+            Some(page_index),
+            Some(item_index),
+            "$",
+        ));
+        return None;
+    };
+    let synonym = match parse_meilisearch_synonym_payload(item) {
+        Ok(synonym) => synonym,
+        Err(error) => {
+            entries.push(hard_entry(
+                ReportCode::MalformedSynonymPayload,
+                ReportResource::Synonym,
+                Some(page_index),
+                Some(item_index),
+                error.json_path(),
+            ));
+            return None;
         }
-    }
+    };
+    let mut words = Vec::with_capacity(synonym.alternatives.len() + 1);
+    words.push(Value::String(synonym.input));
+    words.extend(synonym.alternatives.into_iter().map(Value::String));
+    Some(serde_json::json!({
+        "objectID": stable_id,
+        "type": "synonym",
+        "synonyms": words,
+    }))
 }
 
 impl TranslationSessionInstrumentation {

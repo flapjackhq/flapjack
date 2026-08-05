@@ -1,4 +1,5 @@
 import { test, expect } from '../../fixtures/auth.fixture';
+import { CHART_CANVAS_TEST_ID, CHART_MARK_TEST_ID, getTableBodyRows } from '../helpers';
 import { seedAnalytics, deleteIndex, DEFAULT_ANALYTICS_CONFIG } from '../../fixtures/analytics-seed';
 
 /**
@@ -8,28 +9,32 @@ import { seedAnalytics, deleteIndex, DEFAULT_ANALYTICS_CONFIG } from '../../fixt
  * These tests go beyond visibility checks — they verify actual data values,
  * mathematical consistency, and correct rollup behavior in the rendered UI.
  *
- * STANDARDS COMPLIANCE (BROWSER_TESTING_STANDARDS_2.md):
- * - Zero CSS class selectors — uses data-testid for value extraction
+ * STANDARDS COMPLIANCE (~/.matt/scrai/globals/standards/browser_testing.md):
+ * - Zero raw locators — uses data-testid and role locators for value extraction
  * - Zero conditional skipping — all assertions are hard
  * - ESLint enforced via tests/e2e-ui/eslint.config.mjs
  */
 
 const INDEX = 'e2e-analytics-deep';
 
-const EXPECTED = {
-  totalSearches: DEFAULT_ANALYTICS_CONFIG.searchCount,
-  uniqueUsers: 50,
-  noResultRate: DEFAULT_ANALYTICS_CONFIG.noResultRate,
-  desktopPct: DEFAULT_ANALYTICS_CONFIG.deviceDistribution.desktop,
-  mobilePct: DEFAULT_ANALYTICS_CONFIG.deviceDistribution.mobile,
-};
+/** Seeded window: two dashboard periods, so the KPI delta badges have a previous period. */
+const SEED_DAYS = 14;
+/** The analytics page opens on its default 7-day range (`defaultRange` in useAnalytics.ts). */
+const DASHBOARD_RANGE_DAYS = 7;
+/**
+ * The seed endpoint spreads `searchCount` evenly across the seeded days and writes nothing
+ * for today, so the default range sees only its own share of the seeded total — not all of it.
+ */
+const EXPECTED_RANGE_SEARCHES = Math.floor(
+  (DEFAULT_ANALYTICS_CONFIG.searchCount / SEED_DAYS) * DASHBOARD_RANGE_DAYS,
+);
 
 test.describe('Analytics Deep Data Verification (real browser)', () => {
   test.beforeAll(async ({ request }) => {
     // Seed both the current and previous 7-day windows so KPI delta badges render.
     await seedAnalytics(request, {
       ...DEFAULT_ANALYTICS_CONFIG,
-      days: 14,
+      days: SEED_DAYS,
       indexName: INDEX,
     });
   });
@@ -43,12 +48,15 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
       await page.goto(`/index/${INDEX}/analytics`);
       await expect(page.getByTestId('kpi-cards')).toBeVisible({ timeout: 10000 });
 
-      // Total Searches KPI should show seeded count (uses data-testid, not CSS class)
+      // Total Searches KPI should show the seeded count for the default range.
       const totalSearches = page.getByTestId('kpi-total-searches');
       await expect(totalSearches).toBeVisible();
       const searchText = await totalSearches.getByTestId('kpi-value').textContent();
       const searchNum = parseInt(searchText!.replace(/,/g, ''), 10);
-      expect(searchNum).toBeGreaterThanOrEqual(EXPECTED.totalSearches * 0.9);
+      expect(searchNum).toBeGreaterThanOrEqual(Math.floor(EXPECTED_RANGE_SEARCHES * 0.9));
+      // The default range is a strict subset of the seeded days, so a value above the whole
+      // seeded total means the server stopped honoring the requested searchCount.
+      expect(searchNum).toBeLessThanOrEqual(DEFAULT_ANALYTICS_CONFIG.searchCount);
 
       // Unique Users KPI
       const uniqueUsers = page.getByTestId('kpi-unique-users');
@@ -69,20 +77,20 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
       await page.goto(`/index/${INDEX}/analytics`);
       const chart = page.getByTestId('search-volume-chart');
       await expect(chart).toBeVisible({ timeout: 10000 });
-      await expect(chart.locator('svg')).toBeVisible();
-      await expect(chart.locator('svg path').first()).toBeVisible();
+      await expect(chart.getByTestId(CHART_CANVAS_TEST_ID)).toBeVisible();
+      await expect(chart.getByTestId(CHART_MARK_TEST_ID).first()).toBeVisible();
     });
 
     test('top 10 searches table shows ranked queries in descending order', async ({ page }) => {
       await page.goto(`/index/${INDEX}/analytics`);
       const table = page.getByTestId('top-searches-overview');
       await expect(table).toBeVisible({ timeout: 10000 });
-      const rows = table.locator('tbody tr');
+      const rows = getTableBodyRows(table);
       await rows.first().waitFor({ timeout: 10000 });
       const count = await rows.count();
       expect(count).toBeGreaterThanOrEqual(5);
       expect(count).toBeLessThanOrEqual(10);
-      await expect(rows.first().locator('td').first()).toHaveText('1');
+      await expect(rows.first().getByRole('cell').first()).toHaveText('1');
     });
 
     test('KPI cards show delta comparison badges when previous period has data', async ({ page }) => {
@@ -106,7 +114,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
       await page.goto(`/index/${INDEX}/analytics`);
       await page.getByTestId('tab-searches').click();
       await expect(page.getByTestId('top-searches-table')).toBeVisible({ timeout: 10000 });
-      const rows = page.getByTestId('top-searches-table').locator('tbody tr');
+      const rows = getTableBodyRows(page.getByTestId('top-searches-table'));
       await rows.first().waitFor({ timeout: 10000 });
       const rowCount = await rows.count();
       expect(rowCount).toBeGreaterThan(10);
@@ -122,16 +130,17 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
       await page.goto(`/index/${INDEX}/analytics`);
       await page.getByTestId('tab-searches').click();
       await expect(page.getByTestId('top-searches-table')).toBeVisible({ timeout: 10000 });
-      await page.getByTestId('top-searches-table').locator('tbody tr').first().waitFor({ timeout: 10000 });
-      const beforeCount = await page.getByTestId('top-searches-table').locator('tbody tr').count();
+      const searchRows = getTableBodyRows(page.getByTestId('top-searches-table'));
+      await searchRows.first().waitFor({ timeout: 10000 });
+      const beforeCount = await searchRows.count();
       expect(beforeCount).toBeGreaterThan(1);
 
       // Read the first row's query text and filter by a partial match to narrow results
-      const firstQuery = await page.getByTestId('top-searches-table').locator('tbody tr').first().locator('td').nth(1).textContent();
+      const firstQuery = await searchRows.first().getByRole('cell').nth(1).textContent();
       const filterStr = firstQuery?.trim().slice(0, 3) ?? 'sam';
       await page.getByTestId('searches-filter-input').fill(filterStr);
       await expect(async () => {
-        const afterCount = await page.getByTestId('top-searches-table').locator('tbody tr').count();
+        const afterCount = await searchRows.count();
         expect(afterCount).toBeLessThan(beforeCount);
       }).toPass({ timeout: 10000 });
     });
@@ -157,7 +166,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
       await page.getByTestId('tab-no-results').click();
       const table = page.getByTestId('no-results-table');
       await expect(table).toBeVisible({ timeout: 10000 });
-      const rows = table.locator('tbody tr');
+      const rows = getTableBodyRows(table);
       await rows.first().waitFor({ timeout: 10000 });
       expect(await rows.count()).toBeGreaterThan(0);
     });
@@ -193,7 +202,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
 
       // Use data-testid instead of CSS class selector for chart container
       const chart = page.getByTestId('device-chart');
-      await expect(chart.locator('svg')).toBeVisible();
+      await expect(chart.getByTestId(CHART_CANVAS_TEST_ID)).toBeVisible();
     });
   });
 
@@ -202,7 +211,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
       await page.goto(`/index/${INDEX}/analytics`);
       await page.getByTestId('tab-geography').click();
       await expect(page.getByText('Searches by Country')).toBeVisible({ timeout: 10000 });
-      const firstRow = page.locator('table tbody tr').first();
+      const firstRow = getTableBodyRows(page.getByRole('table').first()).first();
       await firstRow.waitFor({ timeout: 10000 });
       await expect(firstRow).toContainText('United States');
     });
@@ -211,9 +220,10 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
       await page.goto(`/index/${INDEX}/analytics`);
       await page.getByTestId('tab-geography').click();
       await expect(page.getByText('Searches by Country')).toBeVisible({ timeout: 10000 });
-      await page.locator('table tbody tr').first().waitFor({ timeout: 10000 });
+      const countryRows = getTableBodyRows(page.getByRole('table').first());
+      await countryRows.first().waitFor({ timeout: 10000 });
 
-      const pctCells = page.locator('table tbody tr').getByTestId('country-share');
+      const pctCells = countryRows.getByTestId('country-share');
       const cellCount = await pctCells.count();
       let totalPct = 0;
       for (let i = 0; i < cellCount; i++) {
@@ -228,26 +238,26 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
       await page.goto(`/index/${INDEX}/analytics`);
       await page.getByTestId('tab-geography').click();
       await expect(page.getByText('Searches by Country')).toBeVisible({ timeout: 10000 });
-      await page.locator('table tbody tr').first().click();
+      await getTableBodyRows(page.getByRole('table').first()).first().click();
 
       await expect(page.getByText('All Countries')).toBeVisible({ timeout: 5000 });
       await expect(page.getByText('Top Searches from United States')).toBeVisible();
-      const searchRows = page.locator('table').first().locator('tbody tr');
+      const searchRows = getTableBodyRows(page.getByRole('table').first());
       await searchRows.first().waitFor({ timeout: 10000 });
       expect(await searchRows.count()).toBeGreaterThan(0);
 
       await expect(page.getByText('States', { exact: true })).toBeVisible();
-      const stateRows = page.locator('table').nth(1).locator('tbody tr');
+      const stateRows = getTableBodyRows(page.getByRole('table').nth(1));
       await stateRows.first().waitFor({ timeout: 10000 });
       expect(await stateRows.count()).toBeGreaterThanOrEqual(10);
-      await expect(stateRows.first().locator('td').nth(1)).not.toHaveText(/^$/);
+      await expect(stateRows.first().getByRole('cell').nth(1)).not.toHaveText(/^$/);
     });
 
     test('back button returns from drill-down to country list', async ({ page }) => {
       await page.goto(`/index/${INDEX}/analytics`);
       await page.getByTestId('tab-geography').click();
       await expect(page.getByText('Searches by Country')).toBeVisible({ timeout: 10000 });
-      await page.locator('table tbody tr').first().click();
+      await getTableBodyRows(page.getByRole('table').first()).first().click();
       await expect(page.getByText('All Countries')).toBeVisible({ timeout: 5000 });
       await page.getByText('All Countries').click();
       await expect(page.getByText('Searches by Country')).toBeVisible();
@@ -280,10 +290,10 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
       // Total Searches receives sparkData from dates array — sparkline MUST render
       const sparkline = page.getByTestId('kpi-total-searches').getByTestId('sparkline');
       await expect(sparkline).toBeVisible({ timeout: 10_000 });
-      await expect(sparkline.locator('svg')).toBeVisible();
+      await expect(sparkline.getByTestId(CHART_CANVAS_TEST_ID)).toBeVisible();
 
-      // SVG should contain rendered paths (Recharts AreaChart produces fill + stroke paths)
-      await expect(sparkline.locator('svg path').first()).toBeVisible();
+      // The surface must contain rendered marks (Recharts AreaChart produces fill + stroke paths)
+      await expect(sparkline.getByTestId(CHART_MARK_TEST_ID).first()).toBeVisible();
     });
 
     test('No-Result Rate KPI renders sparkline with SVG path', async ({ page }) => {
@@ -292,7 +302,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
 
       const sparkline = page.getByTestId('kpi-no-result-rate').getByTestId('sparkline');
       await expect(sparkline).toBeVisible({ timeout: 10_000 });
-      await expect(sparkline.locator('svg path').first()).toBeVisible();
+      await expect(sparkline.getByTestId(CHART_MARK_TEST_ID).first()).toBeVisible();
     });
   });
 
@@ -301,7 +311,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
       await page.goto(`/index/${INDEX}/analytics`);
       await page.getByTestId('tab-searches').click();
       await expect(page.getByTestId('top-searches-table')).toBeVisible({ timeout: 10000 });
-      const rows = page.getByTestId('top-searches-table').locator('tbody tr');
+      const rows = getTableBodyRows(page.getByTestId('top-searches-table'));
       await rows.first().waitFor({ timeout: 10000 });
 
       // Verify first 3 rows have meaningful query text
@@ -316,7 +326,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
       await page.getByTestId('tab-searches').click();
       const table = page.getByTestId('top-searches-table');
       await expect(table).toBeVisible({ timeout: 10000 });
-      const rows = table.locator('tbody tr');
+      const rows = getTableBodyRows(table);
       await rows.first().waitFor({ timeout: 10000 });
 
       // Every count cell should be a valid number (possibly with commas)
@@ -334,15 +344,26 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
       await page.getByTestId('tab-searches').click();
       const table = page.getByTestId('top-searches-table');
       await expect(table).toBeVisible({ timeout: 10000 });
-      const rows = table.locator('tbody tr');
+      const rows = getTableBodyRows(table);
       await rows.first().waitFor({ timeout: 10000 });
 
-      // The volume cell contains a progress bar (outer bg + inner fill bar)
+      // The volume cell contains a progress bar: a fixed-width track holding a
+      // fill bar whose width is proportional to the row's share of the top count.
       const firstVolumeCell = rows.first().getByTestId('search-volume');
       await expect(firstVolumeCell).toBeVisible();
-      // The outer container div holds the inner fill bar — verify both render
-      const outerBar = firstVolumeCell.locator('div > div').first();
-      await expect(outerBar).toBeVisible();
+
+      const track = firstVolumeCell.getByTestId('search-volume-track');
+      const fill = firstVolumeCell.getByTestId('search-volume-fill');
+      await expect(track).toBeVisible();
+      await expect(fill).toBeVisible();
+
+      // The top row is the largest count, so its fill must span the whole track.
+      const trackBox = await track.boundingBox();
+      const fillBox = await fill.boundingBox();
+      expect(trackBox!.width).toBeGreaterThan(0);
+      expect(fillBox!.width).toBeGreaterThan(0);
+      // Tolerance absorbs sub-pixel rounding only — a half-width fill still fails.
+      expect(fillBox!.width).toBeCloseTo(trackBox!.width, -1);
     });
   });
 
@@ -351,7 +372,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
       await page.goto(`/index/${INDEX}/analytics`);
       await page.getByTestId('tab-geography').click();
       await expect(page.getByText('Searches by Country')).toBeVisible({ timeout: 10000 });
-      const firstRow = page.locator('table tbody tr').first();
+      const firstRow = getTableBodyRows(page.getByRole('table').first()).first();
       await firstRow.waitFor({ timeout: 10000 });
 
       // First country row (US) should show "United States" and "(US)"
@@ -373,15 +394,15 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
       await page.goto(`/index/${INDEX}/analytics`);
       await page.getByTestId('tab-geography').click();
       await expect(page.getByText('Searches by Country')).toBeVisible({ timeout: 10000 });
-      await page.locator('table tbody tr').first().click();
+      await getTableBodyRows(page.getByRole('table').first()).first().click();
 
       // Top Searches from United States header
       await expect(page.getByText('Top Searches from United States')).toBeVisible({ timeout: 10_000 });
 
       // Search table should show actual queries with counts
-      const searchRows = page.locator('table').first().locator('tbody tr');
+      const searchRows = getTableBodyRows(page.getByRole('table').first());
       await searchRows.first().waitFor({ timeout: 10000 });
-      const queryText = await searchRows.first().locator('td').nth(1).textContent();
+      const queryText = await searchRows.first().getByRole('cell').nth(1).textContent();
       expect(queryText?.trim().length).toBeGreaterThan(0);
     });
 
@@ -389,16 +410,16 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
       await page.goto(`/index/${INDEX}/analytics`);
       await page.getByTestId('tab-geography').click();
       await expect(page.getByText('Searches by Country')).toBeVisible({ timeout: 10000 });
-      await page.locator('table tbody tr').first().click();
+      await getTableBodyRows(page.getByRole('table').first()).first().click();
       await expect(page.getByText('All Countries')).toBeVisible({ timeout: 5000 });
 
       // States section header
       await expect(page.getByText('States', { exact: true })).toBeVisible();
 
       // State rows should have names and numeric counts
-      const stateRows = page.locator('table').nth(1).locator('tbody tr');
+      const stateRows = getTableBodyRows(page.getByRole('table').nth(1));
       await stateRows.first().waitFor({ timeout: 10000 });
-      await expect(stateRows.first().locator('td').nth(1)).not.toHaveText(/^$/);
+      await expect(stateRows.first().getByRole('cell').nth(1)).not.toHaveText(/^$/);
     });
   });
 

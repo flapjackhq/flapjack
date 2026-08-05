@@ -219,7 +219,7 @@ pub(super) fn collect_tokens_for_path_value(
 ///
 /// # Returns
 /// Vector of (path_index, token_vector) tuples for each searchable path containing tokens.
-pub(super) fn collect_doc_tokens_by_path(
+pub(crate) fn collect_doc_tokens_by_path(
     document: &Document,
     searchable_paths: &[String],
     keep_diacritics_on_characters: &str,

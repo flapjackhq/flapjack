@@ -50,12 +50,10 @@ impl IndexMetadata {
     /// Save metadata to the index directory (atomic write via temp file + rename).
     pub fn save(&self, index_dir: &Path) -> Result<()> {
         let path = index_dir.join(METADATA_FILE);
-        let tmp = index_dir.join(".index_meta.json.tmp");
         let data = serde_json::to_string_pretty(self).map_err(|e| {
             crate::error::FlapjackError::InvalidQuery(format!("Serialize error: {}", e))
         })?;
-        std::fs::write(&tmp, &data)?;
-        std::fs::rename(&tmp, &path)?;
+        crate::index::utils::atomic_write(&path, data.as_bytes())?;
         Ok(())
     }
 

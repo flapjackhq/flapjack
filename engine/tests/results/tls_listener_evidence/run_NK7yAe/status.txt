@@ -1,0 +1,2 @@
+outcome=FAIL
+message=served certificate subject did not match localhost

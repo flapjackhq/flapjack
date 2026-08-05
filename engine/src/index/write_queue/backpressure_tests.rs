@@ -208,17 +208,21 @@ fn stage_1_p99_uses_nearest_rank() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_count_stays_live_while_backpressure_pause_and_commit_overlap() {
     const COMMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(1_500);
+    const DURABLE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
     let tmp = tempfile::TempDir::new().unwrap();
     let tenant_id = "stage1_pause_commit_count_live";
     let manager = crate::index::manager::IndexManager::new(tmp.path());
     manager.create_tenant(tenant_id).unwrap();
-    manager
-        .add_documents_durable(
+    let seed_task = manager
+        .add_documents(
             tenant_id,
             vec![text_document("seed_doc", "title", "stage1 seed")],
         )
+        .unwrap();
+    manager
+        .wait_for_write_durable_with_timeout_for_test(&seed_task.id, DURABLE_WAIT_TIMEOUT)
         .await
         .unwrap();
     assert_eq!(manager.tenant_doc_count(tenant_id), Some(1));
@@ -261,7 +265,7 @@ async fn read_count_stays_live_while_backpressure_pause_and_commit_overlap() {
     });
 
     manager
-        .wait_for_write_durable(&delayed_task.id)
+        .wait_for_write_durable_with_timeout_for_test(&delayed_task.id, DURABLE_WAIT_TIMEOUT)
         .await
         .unwrap();
     let overlap_elapsed = overlap_started.elapsed();
@@ -723,9 +727,14 @@ async fn paused_bulk_admission_propagates_resample_artifact_write_failures() {
     );
 
     let artifact_path = backpressure::pause_artifact_path(tmp.path(), tenant_id);
-    let mut permissions = std::fs::metadata(&artifact_path).unwrap().permissions();
-    permissions.set_readonly(true);
-    std::fs::set_permissions(&artifact_path, permissions).unwrap();
+    let artifact_parent = artifact_path.parent().unwrap().to_path_buf();
+    let _hook = backpressure::set_pause_artifact_publication_hook_for_test(
+        &artifact_path,
+        std::sync::Arc::new(|temp_path| {
+            assert!(crate::index::utils::is_temporary_entry(temp_path));
+            std::fs::remove_file(temp_path).unwrap();
+        }),
+    );
 
     assert_stage_6_io_error(
         manager
@@ -742,6 +751,12 @@ async fn paused_bulk_admission_propagates_resample_artifact_write_failures() {
     assert!(
         manager.tenant_tasks_snapshot_for_test(tenant_id).is_empty(),
         "failed resample writes must not allocate task records"
+    );
+    assert!(
+        std::fs::read_dir(&artifact_parent)
+            .unwrap()
+            .all(|entry| !crate::index::utils::is_temporary_entry(&entry.unwrap().path())),
+        "failed artifact publication must remove its temporary replacement"
     );
 }
 

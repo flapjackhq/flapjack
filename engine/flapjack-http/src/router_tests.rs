@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, fs, path::Path, sync::Arc};
 
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
@@ -12,15 +12,21 @@ use flapjack_replication::{
     config::{NodeConfig, PeerConfig},
     manager::ReplicationManager,
 };
-use std::collections::HashMap;
 use tempfile::TempDir;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tower::ServiceExt;
+use tracing_subscriber::prelude::*;
+use wiremock::{
+    matchers::{header as header_matcher, method as method_matcher, path as path_matcher},
+    Mock, MockServer, ResponseTemplate,
+};
 
 use crate::auth::{ApiKey, KeyStore};
 use crate::handlers::dashboard::{dashboard_test_asset_bytes, dashboard_test_index_bytes};
 use crate::handlers::migration::{
     spool::{SpoolLimits, SpoolStore},
-    AsyncMigrationSourceProvider,
+    with_test_algolia_base_url_override, AsyncMigrationSourceProvider,
 };
 use crate::middleware::REQUEST_ID_HEADER_NAME;
 use crate::openapi::{DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS, DOCUMENTED_MEMBERSHIP_SCHEMA_NAMES};
@@ -30,7 +36,7 @@ use crate::openapi_test_helpers::{
 };
 use crate::test_helpers::{
     body_json, build_test_router, send_empty_request, send_json_request, EnvVarRestoreGuard,
-    TestStateBuilder, ENV_MUTEX,
+    SharedLogBuffer, TestStateBuilder, ENV_MUTEX,
 };
 
 fn build_auth_test_app() -> (TempDir, axum::Router) {
@@ -76,6 +82,7 @@ fn build_test_router_with_dashboard_policy(
         crate::router::RouterConfig {
             cors_mode: crate::startup::CorsMode::LoopbackOnly,
             disable_dashboard,
+            replication_api_key: None,
         },
     )
 }
@@ -171,6 +178,7 @@ fn build_no_auth_router_for_state(
         crate::router::RouterConfig {
             cors_mode: crate::startup::CorsMode::LoopbackOnly,
             disable_dashboard: false,
+            replication_api_key: None,
         },
     )
 }
@@ -200,6 +208,7 @@ fn build_auth_router_for_state(
         crate::router::RouterConfig {
             cors_mode: crate::startup::CorsMode::LoopbackOnly,
             disable_dashboard: false,
+            replication_api_key: None,
         },
     )
 }
@@ -726,18 +735,6 @@ async fn migration_preview_route_preserves_admin_contract() {
 
     for source_provider in AsyncMigrationSourceProvider::PUBLIC {
         let provider = source_provider.as_str().unwrap();
-        // Only supported source providers reach body validation. The async submit
-        // lifecycle rejects recognized-but-unsupported providers (typesense) with
-        // `source_provider_unsupported` before parsing the request body, so their
-        // preview lane never reaches the "Invalid migration request body" contract.
-        // That closed refusal is asserted separately by
-        // `migration_preview_refuses_typesense_and_unknown_source_providers`.
-        if !matches!(
-            source_provider,
-            AsyncMigrationSourceProvider::Algolia | AsyncMigrationSourceProvider::Meilisearch
-        ) {
-            continue;
-        }
         let routed_admin_request = post_json(
             &app,
             &format!("/1/migrations/{provider}/preview"),
@@ -762,7 +759,7 @@ async fn migration_preview_route_preserves_admin_contract() {
 }
 
 #[tokio::test]
-async fn migration_preview_refuses_typesense_and_unknown_source_providers() {
+async fn migration_preview_refuses_unknown_source_providers() {
     let tmp = TempDir::new().unwrap();
     let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
     let app = build_test_router(&tmp, Some(key_store));
@@ -785,23 +782,1354 @@ async fn migration_preview_refuses_typesense_and_unknown_source_providers() {
         StatusCode::NOT_FOUND,
         "unknown provider segments must remain outside the closed migration router"
     );
+}
 
-    let typesense = post_json(
+// ── Neutral source-discovery contract ─────────────────────────────────────
+//
+// These tests drive the served `/1/migrations/{provider}/list-indexes` routes
+// through string paths and bodies, keeping the HTTP contract independent of the
+// provider-client implementation. The MIG-12 provider-neutral source seam is
+// `engine/flapjack-http/src/handlers/migration/source_reader.rs`; its seam types
+// are `MigrationSourceReader` (trait), `SourceExportRecord`, `SourceExportError`,
+// `SourceExportSink`, and `AcceptedSourceExport`.
+
+/// A syntactically valid provider-specific discovery body (credentials + host).
+fn source_discovery_request_body(provider: AsyncMigrationSourceProvider) -> serde_json::Value {
+    match provider {
+        AsyncMigrationSourceProvider::Algolia => {
+            serde_json::json!({ "appId": "APPID", "apiKey": "source-key" })
+        }
+        AsyncMigrationSourceProvider::Meilisearch => {
+            serde_json::json!({ "endpoint": "http://127.0.0.1:1", "apiKey": "source-key" })
+        }
+        AsyncMigrationSourceProvider::Typesense => {
+            serde_json::json!({ "node": "http://127.0.0.1:1", "apiKey": "source-key" })
+        }
+    }
+}
+
+/// Build a discovery body with a variable host field name (`endpoint`/`node`).
+fn discovery_host_body(host_field: &str, host: &str, api_key: &str) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        host_field.to_string(),
+        serde_json::Value::String(host.to_string()),
+    );
+    map.insert(
+        "apiKey".to_string(),
+        serde_json::Value::String(api_key.to_string()),
+    );
+    serde_json::Value::Object(map)
+}
+
+/// Start a test-owned JSON upstream and pin the complete request contract.
+async fn start_discovery_upstream(
+    request_path: &str,
+    query: &[(&str, &str)],
+    required_headers: &[(&str, &str)],
+    status: u16,
+    response: serde_json::Value,
+) -> MockServer {
+    let server = MockServer::start().await;
+    assert!(
+        server.address().ip().is_loopback() && server.address().port() != 0,
+        "discovery test upstream must bind an ephemeral loopback port before the request"
+    );
+
+    let mut mock = Mock::given(method_matcher("GET")).and(path_matcher(request_path));
+    for (name, value) in required_headers {
+        mock = mock.and(header_matcher(*name, *value));
+    }
+    let mut expected_query = query
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect::<Vec<_>>();
+    expected_query.sort();
+    // Match the complete query multiset. Presence-only matchers would accept
+    // forbidden Typesense search pagination (`page`/`per_page`) as extras.
+    mock = mock.and(move |request: &wiremock::Request| {
+        let mut actual_query = request
+            .url
+            .query_pairs()
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        actual_query.sort();
+        actual_query == expected_query
+    });
+    mock.respond_with(ResponseTemplate::new(status).set_body_json(response))
+        .expect(1)
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn mount_meilisearch_stats_upstream(
+    server: &MockServer,
+    authorization: &str,
+    counts: &[(&str, u64)],
+) {
+    for (index_uid, document_count) in counts {
+        Mock::given(method_matcher("GET"))
+            .and(path_matcher(format!("/indexes/{index_uid}/stats")))
+            .and(header_matcher("authorization", authorization))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "numberOfDocuments": document_count,
+                "fieldDistribution": {},
+                "isIndexing": false
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+}
+
+fn read_file_tree(root: &Path) -> Vec<u8> {
+    let mut paths = vec![root.to_path_buf()];
+    let mut bytes = Vec::new();
+    while let Some(path) = paths.pop() {
+        let metadata = fs::metadata(&path)
+            .unwrap_or_else(|error| panic!("required leak-sweep path {}: {error}", path.display()));
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&path).unwrap_or_else(|error| {
+                panic!("read leak-sweep directory {}: {error}", path.display())
+            }) {
+                paths.push(entry.expect("read leak-sweep directory entry").path());
+            }
+        } else if metadata.is_file() {
+            bytes.extend(fs::read(&path).unwrap_or_else(|error| {
+                panic!("read leak-sweep file {}: {error}", path.display())
+            }));
+        }
+    }
+    bytes
+}
+
+fn assert_secret_absent(surface: &str, bytes: &[u8], secret: &str) {
+    assert!(
+        !String::from_utf8_lossy(bytes).contains(secret),
+        "{surface} leaked the source credential sentinel"
+    );
+}
+
+fn discovery_credential_sentinel() -> String {
+    ["sk-sentinel-", "DO-NOT-LEAK-", "9f3c"].concat()
+}
+
+fn typesense_collection_summaries(summaries: &[(&str, u64, u64, &str)]) -> serde_json::Value {
+    serde_json::Value::Array(
+        summaries
+            .iter()
+            .map(
+                |(name, document_count, created_at, default_sorting_field)| {
+                    serde_json::json!({
+                        "name": name,
+                        "num_documents": document_count,
+                        "created_at": created_at,
+                        "default_sorting_field": default_sorting_field
+                    })
+                },
+            )
+            .collect(),
+    )
+}
+
+struct ExpectedNeutralDiscoveryMetadata<'a> {
+    name: &'a str,
+    primary_key: Option<&'a str>,
+    entries: Option<u64>,
+    document_count: Option<u64>,
+    created_at: Option<serde_json::Value>,
+    updated_at: Option<&'a str>,
+    default_sorting_field: Option<&'a str>,
+}
+
+impl<'a> ExpectedNeutralDiscoveryMetadata<'a> {
+    fn empty(name: &'a str) -> Self {
+        Self {
+            name,
+            primary_key: None,
+            entries: None,
+            document_count: None,
+            created_at: None,
+            updated_at: None,
+            default_sorting_field: None,
+        }
+    }
+
+    fn algolia(name: &'a str, entries: u64, updated_at: &'a str) -> Self {
+        Self {
+            entries: Some(entries),
+            updated_at: Some(updated_at),
+            ..Self::empty(name)
+        }
+    }
+
+    fn meilisearch(
+        name: &'a str,
+        primary_key: Option<&'a str>,
+        document_count: u64,
+        created_at: &'a str,
+        updated_at: &'a str,
+    ) -> Self {
+        Self {
+            primary_key,
+            document_count: Some(document_count),
+            created_at: Some(serde_json::json!(created_at)),
+            updated_at: Some(updated_at),
+            ..Self::empty(name)
+        }
+    }
+
+    fn typesense(
+        name: &'a str,
+        document_count: u64,
+        created_at: u64,
+        default_sorting_field: &'a str,
+    ) -> Self {
+        Self {
+            document_count: Some(document_count),
+            created_at: Some(serde_json::json!(created_at)),
+            default_sorting_field: Some(default_sorting_field),
+            ..Self::empty(name)
+        }
+    }
+}
+
+fn assert_neutral_discovery_metadata(
+    document: &serde_json::Value,
+    expected: &[ExpectedNeutralDiscoveryMetadata<'_>],
+) {
+    let indexes = document
+        .get("indexes")
+        .and_then(serde_json::Value::as_array)
+        .expect("neutral discovery response must contain an indexes array");
+    assert_eq!(indexes.len(), expected.len());
+    let indexes_by_name: HashMap<_, _> = indexes
+        .iter()
+        .map(|index| {
+            let name = index
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .expect("each neutral discovery entry must contain a name");
+            (name, index)
+        })
+        .collect();
+    assert_eq!(
+        indexes_by_name.len(),
+        expected.len(),
+        "index names must be unique"
+    );
+
+    for expected_entry in expected {
+        let name = expected_entry.name;
+        let index = indexes_by_name
+            .get(name)
+            .unwrap_or_else(|| panic!("missing neutral discovery entry {name}"));
+        let expected_primary_key = expected_entry
+            .primary_key
+            .map(|value| serde_json::Value::String(value.to_string()))
+            .unwrap_or(serde_json::Value::Null);
+        let expected_entries = expected_entry
+            .entries
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null);
+        let expected_document_count = expected_entry
+            .document_count
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null);
+        let expected_created_at = expected_entry
+            .created_at
+            .clone()
+            .unwrap_or(serde_json::Value::Null);
+        let expected_updated_at = expected_entry
+            .updated_at
+            .map(|value| serde_json::Value::String(value.to_string()))
+            .unwrap_or(serde_json::Value::Null);
+        let expected_default_sorting_field = expected_entry
+            .default_sorting_field
+            .map(|value| serde_json::Value::String(value.to_string()))
+            .unwrap_or(serde_json::Value::Null);
+        assert_eq!(
+            index.get("primaryKey"),
+            Some(&expected_primary_key),
+            "{name} primaryKey"
+        );
+        assert_eq!(
+            index.get("entries"),
+            Some(&expected_entries),
+            "{name} entries"
+        );
+        assert_eq!(
+            index.get("documentCount"),
+            Some(&expected_document_count),
+            "{name} documentCount"
+        );
+        assert_eq!(
+            index.get("createdAt"),
+            Some(&expected_created_at),
+            "{name} createdAt"
+        );
+        assert_eq!(
+            index.get("updatedAt"),
+            Some(&expected_updated_at),
+            "{name} updatedAt"
+        );
+        assert_eq!(
+            index.get("defaultSortingField"),
+            Some(&expected_default_sorting_field),
+            "{name} defaultSortingField"
+        );
+    }
+}
+
+#[tokio::test]
+async fn source_discovery_route_is_mounted_for_every_public_provider() {
+    // `/1/migrations/{provider}/list-indexes` must remain a mounted POST route for
+    // every public provider rather than falling through to the job-status route.
+    let (_tmp, app) = build_auth_test_app();
+
+    for source_provider in AsyncMigrationSourceProvider::PUBLIC {
+        let provider = source_provider.as_str().unwrap();
+        let path = format!("/1/migrations/{provider}/list-indexes");
+        let body = source_discovery_request_body(source_provider);
+        let response = post_json(&app, &path, Some("admin-key"), body).await;
+        let status = response.status();
+        assert_ne!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{provider} list-indexes must be a mounted route, not a routing 404"
+        );
+        assert_ne!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{provider} list-indexes must accept POST, not fall through to the job-status GET route"
+        );
+    }
+}
+
+#[tokio::test]
+async fn source_discovery_route_preserves_job_status_param_route() {
+    // Coexistence guard: the literal `list-indexes` segment must not shadow the
+    // `:job_id` param route. A UUID job id still reaches the job-status handler.
+    // This remains a regression guard alongside the literal discovery route.
+    let (_tmp, app) = build_auth_test_app();
+    for source_provider in AsyncMigrationSourceProvider::PUBLIC {
+        let provider = source_provider.as_str().unwrap();
+        let job_path = format!("/1/migrations/{provider}/01890f8e-8b28-78e8-b542-8cfdcb2d4f24");
+        assert_migration_job_not_found_response(
+            get_request(&app, &job_path, Some("admin-key")).await,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn published_migration_paths_are_all_mounted() {
+    // Served-route vs published-OpenAPI invariant: every `/1/migrations/` path the
+    // served OpenAPI advertises with a `post` operation must resolve on the router.
+    // A routing miss is an empty-bodied 404 from the axum fallback; a mounted
+    // handler reporting "job not found" returns 404 WITH a JSON body — only the
+    // former means an advertised path is unserved. This prevents OpenAPI and
+    // router registration from drifting apart.
+    let (_tmp, app) = build_auth_test_app();
+    let response = send_empty_request(&app, Method::GET, "/api-docs/openapi.json").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let document = body_json(response).await;
+    let paths = document
+        .get("paths")
+        .and_then(serde_json::Value::as_object)
+        .expect("served OpenAPI must expose paths");
+
+    let mut checked = 0usize;
+    for (path, operations) in paths {
+        if !path.starts_with("/1/migrations/") {
+            continue;
+        }
+        let Some(ops) = operations.as_object() else {
+            continue;
+        };
+        if !ops.contains_key("post") {
+            continue;
+        }
+        // Migration paths embed concrete provider segments; only `{job_id}` is
+        // templated. Substitute a concrete UUID so the request reaches the router.
+        let concrete = path.replace("{job_id}", "01890f8e-8b28-78e8-b542-8cfdcb2d4f24");
+        let response = post_json(&app, &concrete, Some("admin-key"), serde_json::json!({})).await;
+        let status = response.status();
+        let body = body_bytes(response).await;
+        assert_ne!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "published migration POST path {path} (requested as {concrete}) fell through to a route that does not accept POST"
+        );
+        assert!(
+            !(status == StatusCode::NOT_FOUND && body.is_empty()),
+            "published migration path {path} (requested as {concrete}) is not mounted on the router"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 1,
+        "expected at least one published /1/migrations POST path to check"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+async fn algolia_list_indexes_compat_contract_is_preserved() {
+    // Algolia wire-compat guard for the legacy `/1/algolia-list-indexes` handler.
+    // The neutral discovery route must not disturb it, so this exercises the
+    // legacy path end to end against a deterministic test-owned upstream rather
+    // than serializing `ListAlgoliaIndexesResponse` in the test — a constructed
+    // value proves the struct's serde attributes and nothing about what the
+    // served route actually returns.
+    //
+    // (1) The route still reaches the legacy handler — proven by its own 400
+    // validation message rather than a routing 404/405 or a neutral-route capture.
+    let (_tmp, app) = build_auth_test_app();
+    let routed = post_json(
         &app,
-        "/1/migrations/typesense/preview",
+        "/1/algolia-list-indexes",
         Some("admin-key"),
-        payload,
+        serde_json::json!({ "appId": "", "apiKey": "" }),
     )
     .await;
-    assert_eq!(typesense.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(routed.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        body_json(typesense).await,
+        body_json(routed).await,
         serde_json::json!({
-            "message": "Source provider is not supported",
-            "status": 400,
-            "code": "source_provider_unsupported"
+            "message": "appId and apiKey are required",
+            "status": 400
         })
     );
+
+    // (2) A successful served request returns exactly `{ indexes: [{ name,
+    // entries, updatedAt }] }` carrying the upstream's live values, in upstream
+    // order. The upstream is pinned to `GET /1/indexes?page=0&hitsPerPage=100`
+    // with the credential headers, so a changed request contract fails the mock
+    // rather than silently passing. Upstream-only fields (`pendingTask`, and any
+    // field the vendor adds) must not reach the client, which whole-body
+    // equality — not field-presence checks — is what catches.
+    let upstream = start_discovery_upstream(
+        "/1/indexes",
+        &[("page", "0"), ("hitsPerPage", "100")],
+        &[
+            ("x-algolia-application-id", "COMPATAPP1"),
+            ("x-algolia-api-key", "compat-source-key"),
+        ],
+        200,
+        serde_json::json!({
+            "items": [
+                {
+                    "name": "compat_products",
+                    "entries": 42,
+                    "updatedAt": "2026-07-26T00:00:00Z",
+                    "createdAt": "2026-07-01T00:00:00Z",
+                    "pendingTask": false
+                },
+                {
+                    "name": "compat_categories",
+                    "entries": 7,
+                    "updatedAt": "2026-07-25T12:34:56Z",
+                    "createdAt": "2026-07-02T00:00:00Z",
+                    "pendingTask": false
+                }
+            ],
+            "page": 0,
+            "nbPages": 1
+        }),
+    )
+    .await;
+
+    let upstream_uri = upstream.uri();
+    let listed =
+        with_test_algolia_base_url_override(Some("COMPATAPP1"), Some(&upstream_uri), async {
+            post_json(
+                &app,
+                "/1/algolia-list-indexes",
+                Some("admin-key"),
+                serde_json::json!({ "appId": "COMPATAPP1", "apiKey": "compat-source-key" }),
+            )
+            .await
+        })
+        .await;
+    assert_eq!(
+        listed.status(),
+        StatusCode::OK,
+        "the legacy Algolia discovery route must complete against the test upstream"
+    );
+    assert_eq!(
+        body_json(listed).await,
+        serde_json::json!({
+            "indexes": [
+                { "name": "compat_products", "entries": 42, "updatedAt": "2026-07-26T00:00:00Z" },
+                { "name": "compat_categories", "entries": 7, "updatedAt": "2026-07-25T12:34:56Z" }
+            ]
+        })
+    );
+    upstream.verify().await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn list_source_indexes_returns_meilisearch_known_answer() {
+    // This reaches a test-owned Meilisearch upstream through the explicit
+    // loopback opt-in. M0A known answer
+    // (docs2/4_EVIDENCE/2026_07_26_jul26_am_12_meilisearch_source_contract.md,
+    // "Index discovery" row): `GET /indexes?limit=10` returns uid set
+    // {ambiguous_pk, configured_pk, inferred_pk} with total=3, offset=0, limit=10.
+    // The neutral response preserves the upstream pagination triple, so this
+    // checks the values rather than treating array length as a pagination proxy.
+    let upstream = start_discovery_upstream(
+        "/indexes",
+        &[("limit", "10")],
+        &[("authorization", "Bearer m0a-source-key")],
+        200,
+        serde_json::json!({
+            "results": [
+                {
+                    "uid": "ambiguous_pk",
+                    "primaryKey": null,
+                    "createdAt": "2026-07-26T00:00:00Z",
+                    "updatedAt": "2026-07-26T00:00:00Z"
+                },
+                {
+                    "uid": "configured_pk",
+                    "primaryKey": "sku",
+                    "createdAt": "2026-07-26T00:00:01Z",
+                    "updatedAt": "2026-07-26T00:00:01Z"
+                },
+                {
+                    "uid": "inferred_pk",
+                    "primaryKey": "book_id",
+                    "createdAt": "2026-07-26T00:00:02Z",
+                    "updatedAt": "2026-07-26T00:00:02Z"
+                }
+            ],
+            "total": 3,
+            "offset": 0,
+            "limit": 10
+        }),
+    )
+    .await;
+    mount_meilisearch_stats_upstream(
+        &upstream,
+        "Bearer m0a-source-key",
+        &[
+            ("ambiguous_pk", 0),
+            ("configured_pk", 3),
+            ("inferred_pk", 2),
+        ],
+    )
+    .await;
+    let _env_lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _loopback = EnvVarRestoreGuard::set("FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK", "1");
+    let (_tmp, app) = build_auth_test_app();
+    let response = post_json(
+        &app,
+        "/1/migrations/meilisearch/list-indexes?limit=10",
+        Some("admin-key"),
+        serde_json::json!({ "endpoint": upstream.uri(), "apiKey": "m0a-source-key" }),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "meilisearch discovery must return 200 once the route is mounted"
+    );
+    let document = body_json(response).await;
+    let mut names: Vec<String> = document
+        .get("indexes")
+        .and_then(serde_json::Value::as_array)
+        .expect("discovery response must carry an `indexes` array")
+        .iter()
+        .map(|entry| {
+            entry
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .expect("each discovery entry must carry a `name`")
+                .to_string()
+        })
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "ambiguous_pk".to_string(),
+            "configured_pk".to_string(),
+            "inferred_pk".to_string()
+        ]
+    );
+    assert_eq!(names.len(), 3);
+    assert_neutral_discovery_metadata(
+        &document,
+        &[
+            ExpectedNeutralDiscoveryMetadata::meilisearch(
+                "ambiguous_pk",
+                None,
+                0,
+                "2026-07-26T00:00:00Z",
+                "2026-07-26T00:00:00Z",
+            ),
+            ExpectedNeutralDiscoveryMetadata::meilisearch(
+                "configured_pk",
+                Some("sku"),
+                3,
+                "2026-07-26T00:00:01Z",
+                "2026-07-26T00:00:01Z",
+            ),
+            ExpectedNeutralDiscoveryMetadata::meilisearch(
+                "inferred_pk",
+                Some("book_id"),
+                2,
+                "2026-07-26T00:00:02Z",
+                "2026-07-26T00:00:02Z",
+            ),
+        ],
+    );
+    assert_eq!(
+        document.get("total").and_then(serde_json::Value::as_u64),
+        Some(3)
+    );
+    assert_eq!(
+        document.get("offset").and_then(serde_json::Value::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        document.get("limit").and_then(serde_json::Value::as_u64),
+        Some(10)
+    );
+    upstream.verify().await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn list_source_indexes_maps_meilisearch_invalid_api_key() {
+    // M0A "Least-privilege actions" row: an upstream key missing
+    // `indexes.get` yields HTTP 403 `invalid_api_key` (type `auth`). The discovery
+    // endpoint must surface that as a labelled 403 refusal, not a 200 or an opaque
+    // 5xx.
+    let upstream = start_discovery_upstream(
+        "/indexes",
+        &[("limit", "10")],
+        &[("authorization", "Bearer missing-indexes-get")],
+        403,
+        serde_json::json!({
+            "message": "The provided API key is invalid.",
+            "code": "invalid_api_key",
+            "type": "auth",
+            "link": "https://docs.meilisearch.com/errors#invalid_api_key"
+        }),
+    )
+    .await;
+    let _env_lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _loopback = EnvVarRestoreGuard::set("FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK", "1");
+    let (_tmp, app) = build_auth_test_app();
+    let response = post_json(
+        &app,
+        "/1/migrations/meilisearch/list-indexes?limit=10",
+        Some("admin-key"),
+        serde_json::json!({ "endpoint": upstream.uri(), "apiKey": "missing-indexes-get" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = body_json(response).await;
+    assert_eq!(
+        body.get("code").and_then(serde_json::Value::as_str),
+        Some("invalid_api_key")
+    );
+    upstream.verify().await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn list_source_indexes_returns_typesense_known_answer() {
+    // This reaches a test-owned Typesense upstream through the explicit loopback
+    // opt-in. The collection name set comes from
+    // tests/fixtures/2026_07_26_m0b_typesense_migration/expected_bundle.json:
+    // {fj_ts_migration_products, fj_ts_migration_categories}. Creation order in
+    // tests/typesense_migration_contract.sh (lines 196-197): categories are created
+    // BEFORE products, so Typesense `GET /collections` returns newest-first:
+    // ["fj_ts_migration_products", "fj_ts_migration_categories"]. Hand-calculated
+    // pagination slices over that ordered list:
+    //   limit=1            -> ["fj_ts_migration_products"]
+    //   offset=1&limit=1   -> ["fj_ts_migration_categories"]
+    //   offset=1           -> ["fj_ts_migration_categories"]
+    //   offset=2&limit=1   -> HTTP 400 {"message":"Invalid offset param."}
+    // Counts and sorting fields come from the canonical M0B bundle. `created_at`
+    // uses the source-contract probe's recorded stable marker; response position,
+    // not a fabricated timestamp, owns the newest-first ordering assertion.
+    let expected = [
+        ("fj_ts_migration_products", 3, 1_785_020_400, "price"),
+        ("fj_ts_migration_categories", 2, 1_785_020_400, "priority"),
+    ];
+    let full_upstream = start_discovery_upstream(
+        "/collections",
+        &[("exclude_fields", "fields")],
+        &[("x-typesense-api-key", "m0b-source-key")],
+        200,
+        typesense_collection_summaries(&expected),
+    )
+    .await;
+    let limit_upstream = start_discovery_upstream(
+        "/collections",
+        &[("exclude_fields", "fields"), ("limit", "1")],
+        &[("x-typesense-api-key", "m0b-source-key")],
+        200,
+        typesense_collection_summaries(&expected[..1]),
+    )
+    .await;
+    let page_upstream = start_discovery_upstream(
+        "/collections",
+        &[
+            ("exclude_fields", "fields"),
+            ("offset", "1"),
+            ("limit", "1"),
+        ],
+        &[("x-typesense-api-key", "m0b-source-key")],
+        200,
+        typesense_collection_summaries(&expected[1..]),
+    )
+    .await;
+    let offset_without_limit_upstream = start_discovery_upstream(
+        "/collections",
+        &[("exclude_fields", "fields"), ("offset", "1")],
+        &[("x-typesense-api-key", "m0b-source-key")],
+        200,
+        typesense_collection_summaries(&expected[1..]),
+    )
+    .await;
+    let exhausted_upstream = start_discovery_upstream(
+        "/collections",
+        &[
+            ("exclude_fields", "fields"),
+            ("offset", "2"),
+            ("limit", "1"),
+        ],
+        &[("x-typesense-api-key", "m0b-source-key")],
+        400,
+        serde_json::json!({ "message": "Invalid offset param." }),
+    )
+    .await;
+
+    let _env_lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _loopback = EnvVarRestoreGuard::set("FJ_ENABLE_TYPESENSE_PREVIEW_LOOPBACK", "1");
+    let (_tmp, app) = build_auth_test_app();
+
+    let full = post_json(
+        &app,
+        "/1/migrations/typesense/list-indexes",
+        Some("admin-key"),
+        serde_json::json!({ "node": full_upstream.uri(), "apiKey": "m0b-source-key" }),
+    )
+    .await;
+    assert_eq!(full.status(), StatusCode::OK);
+    let full_document = body_json(full).await;
+    assert_eq!(
+        discovery_index_names(full_document.clone()),
+        vec![
+            "fj_ts_migration_products".to_string(),
+            "fj_ts_migration_categories".to_string()
+        ],
+        "typesense discovery must preserve newest-first collection order"
+    );
+    assert_neutral_discovery_metadata(
+        &full_document,
+        &[
+            ExpectedNeutralDiscoveryMetadata::typesense(
+                "fj_ts_migration_products",
+                3,
+                1_785_020_400,
+                "price",
+            ),
+            ExpectedNeutralDiscoveryMetadata::typesense(
+                "fj_ts_migration_categories",
+                2,
+                1_785_020_400,
+                "priority",
+            ),
+        ],
+    );
+
+    let limit1 = post_json(
+        &app,
+        "/1/migrations/typesense/list-indexes?limit=1",
+        Some("admin-key"),
+        serde_json::json!({ "node": limit_upstream.uri(), "apiKey": "m0b-source-key" }),
+    )
+    .await;
+    assert_eq!(limit1.status(), StatusCode::OK);
+    let limit1_document = body_json(limit1).await;
+    assert_eq!(
+        discovery_index_names(limit1_document.clone()),
+        vec!["fj_ts_migration_products".to_string()]
+    );
+    assert_neutral_discovery_metadata(
+        &limit1_document,
+        &[ExpectedNeutralDiscoveryMetadata::typesense(
+            "fj_ts_migration_products",
+            3,
+            1_785_020_400,
+            "price",
+        )],
+    );
+
+    let page2 = post_json(
+        &app,
+        "/1/migrations/typesense/list-indexes?offset=1&limit=1",
+        Some("admin-key"),
+        serde_json::json!({ "node": page_upstream.uri(), "apiKey": "m0b-source-key" }),
+    )
+    .await;
+    assert_eq!(page2.status(), StatusCode::OK);
+    let page2_document = body_json(page2).await;
+    assert_eq!(
+        discovery_index_names(page2_document.clone()),
+        vec!["fj_ts_migration_categories".to_string()]
+    );
+    assert_neutral_discovery_metadata(
+        &page2_document,
+        &[ExpectedNeutralDiscoveryMetadata::typesense(
+            "fj_ts_migration_categories",
+            2,
+            1_785_020_400,
+            "priority",
+        )],
+    );
+
+    let offset_without_limit = post_json(
+        &app,
+        "/1/migrations/typesense/list-indexes?offset=1",
+        Some("admin-key"),
+        serde_json::json!({
+            "node": offset_without_limit_upstream.uri(),
+            "apiKey": "m0b-source-key"
+        }),
+    )
+    .await;
+    assert_eq!(offset_without_limit.status(), StatusCode::OK);
+    let offset_without_limit_document = body_json(offset_without_limit).await;
+    assert_eq!(
+        discovery_index_names(offset_without_limit_document.clone()),
+        vec!["fj_ts_migration_categories".to_string()]
+    );
+    assert_neutral_discovery_metadata(
+        &offset_without_limit_document,
+        &[ExpectedNeutralDiscoveryMetadata::typesense(
+            "fj_ts_migration_categories",
+            2,
+            1_785_020_400,
+            "priority",
+        )],
+    );
+
+    let exhausted = post_json(
+        &app,
+        "/1/migrations/typesense/list-indexes?offset=2&limit=1",
+        Some("admin-key"),
+        serde_json::json!({
+            "node": exhausted_upstream.uri(),
+            "apiKey": "m0b-source-key"
+        }),
+    )
+    .await;
+    assert_eq!(exhausted.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        body_json(exhausted).await,
+        serde_json::json!({
+            "message": "Typesense request failed",
+            "status": 502
+        })
+    );
+    full_upstream.verify().await;
+    limit_upstream.verify().await;
+    page_upstream.verify().await;
+    offset_without_limit_upstream.verify().await;
+    exhausted_upstream.verify().await;
+}
+
+/// Extract the ordered `name` values from a neutral discovery response.
+fn discovery_index_names(document: serde_json::Value) -> Vec<String> {
+    document
+        .get("indexes")
+        .and_then(serde_json::Value::as_array)
+        .expect("discovery response must carry an `indexes` array")
+        .iter()
+        .map(|entry| {
+            entry
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .expect("each discovery entry must carry a `name`")
+                .to_string()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn list_source_indexes_refuses_non_vendor_host() {
+    // The vetting matrix is owned by `engine/src/security_tests.rs` and is not
+    // re-derived here. This only asserts that a non-vendor host is refused with a
+    // labelled 400 vendor-policy error rather than reaching an upstream.
+    let (_tmp, app) = build_auth_test_app();
+    for (provider, host_field, expected_message) in [
+        (
+            "meilisearch",
+            "endpoint",
+            "Meilisearch Cloud endpoint is not allowed",
+        ),
+        (
+            "typesense",
+            "node",
+            "Typesense Cloud endpoint is not allowed",
+        ),
+    ] {
+        let path = format!("/1/migrations/{provider}/list-indexes");
+        let body = discovery_host_body(host_field, "https://evil.example.com", "source-key");
+        let response = post_json(&app, &path, Some("admin-key"), body).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{provider} must refuse a non-vendor host before any outbound call"
+        );
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({
+                "message": expected_message,
+                "status": 400
+            }),
+            "{provider} must return its canonical safe vendor-policy refusal"
+        );
+    }
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn list_source_indexes_gates_loopback_behind_opt_in() {
+    // With the opt-in env unset a loopback host is refused; with it set to exactly
+    // "1" a literal loopback IP is accepted while hostname `localhost` stays
+    // refused.
+    //
+    // The expected upstream query is per-provider: an unpaginated Meilisearch
+    // discovery request carries no query at all, while every Typesense
+    // discovery request carries `exclude_fields=fields` (the same contract
+    // `list_source_indexes_returns_typesense_known_answer` pins). Sharing one
+    // empty expectation across both providers would demand two mutually
+    // exclusive Typesense request contracts.
+    for (
+        provider,
+        host_field,
+        env_var,
+        upstream_path,
+        upstream_query,
+        header_name,
+        response_body,
+    ) in [
+        (
+            "meilisearch",
+            "endpoint",
+            "FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK",
+            "/indexes",
+            &[][..],
+            "authorization",
+            serde_json::json!({ "results": [], "total": 0, "offset": 0, "limit": 20 }),
+        ),
+        (
+            "typesense",
+            "node",
+            "FJ_ENABLE_TYPESENSE_PREVIEW_LOOPBACK",
+            "/collections",
+            &[("exclude_fields", "fields")][..],
+            "x-typesense-api-key",
+            serde_json::json!([]),
+        ),
+    ] {
+        let header_value = if provider == "meilisearch" {
+            "Bearer loopback-source-key"
+        } else {
+            "loopback-source-key"
+        };
+        let upstream = start_discovery_upstream(
+            upstream_path,
+            upstream_query,
+            &[(header_name, header_value)],
+            200,
+            response_body,
+        )
+        .await;
+        let localhost_uri = upstream.uri().replacen("127.0.0.1", "localhost", 1);
+        let _env_lock = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = format!("/1/migrations/{provider}/list-indexes");
+
+        {
+            let _unset = EnvVarRestoreGuard::remove(env_var);
+            let (_tmp, app) = build_auth_test_app();
+            let refused = post_json(
+                &app,
+                &path,
+                Some("admin-key"),
+                discovery_host_body(host_field, &upstream.uri(), "loopback-source-key"),
+            )
+            .await;
+            assert_eq!(
+                refused.status(),
+                StatusCode::BAD_REQUEST,
+                "{provider} loopback host must be refused when {env_var} is unset"
+            );
+        }
+
+        {
+            let _set = EnvVarRestoreGuard::set(env_var, "1");
+            let (_tmp, app) = build_auth_test_app();
+            let accepted = post_json(
+                &app,
+                &path,
+                Some("admin-key"),
+                discovery_host_body(host_field, &upstream.uri(), "loopback-source-key"),
+            )
+            .await;
+            assert_eq!(
+                accepted.status(),
+                StatusCode::OK,
+                "{provider} literal loopback IP must complete discovery when {env_var}=1"
+            );
+
+            let localhost_refused = post_json(
+                &app,
+                &path,
+                Some("admin-key"),
+                discovery_host_body(host_field, &localhost_uri, "loopback-source-key"),
+            )
+            .await;
+            assert_eq!(
+                localhost_refused.status(),
+                StatusCode::BAD_REQUEST,
+                "{provider} hostname localhost must stay refused even under {env_var}=1"
+            );
+        }
+        upstream.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn list_source_indexes_refuses_payload_mismatch() {
+    // Body-mismatch: an Algolia-shaped `appId` sent to the hosted-source routes,
+    // and hosted-source host fields sent to the Algolia or
+    // opposite hosted route, must produce a labelled
+    // `source_provider_payload_mismatch` refusal rather than serde coercion or
+    // silent misrouting. Run those failure paths under the same log and
+    // temporary-state sweep as the successful leak guard so parser/admission-only
+    // credential leaks are observable.
+    let sentinel = discovery_credential_sentinel();
+    let logs = SharedLogBuffer::default();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(logs.clone()),
+    );
+    let _log_guard = tracing::subscriber::set_default(subscriber);
+    let (tmp, app) = build_auth_test_app();
+
+    let mismatch_cases = [
+        (
+            AsyncMigrationSourceProvider::Algolia,
+            "/1/migrations/algolia/list-indexes",
+            serde_json::json!({ "endpoint": "https://x.example.com", "apiKey": sentinel.as_str() }),
+        ),
+        (
+            AsyncMigrationSourceProvider::Meilisearch,
+            "/1/migrations/meilisearch/list-indexes",
+            serde_json::json!({ "appId": "APPID", "apiKey": sentinel.as_str() }),
+        ),
+        (
+            AsyncMigrationSourceProvider::Typesense,
+            "/1/migrations/typesense/list-indexes",
+            serde_json::json!({ "appId": "APPID", "apiKey": sentinel.as_str() }),
+        ),
+    ];
+    let covered_providers: Vec<_> = mismatch_cases.iter().map(|case| case.0).collect();
+    assert_eq!(
+        covered_providers,
+        AsyncMigrationSourceProvider::PUBLIC.to_vec(),
+        "failure-path leak sweep must cover every public source provider"
+    );
+
+    for (provider, path, body) in mismatch_cases {
+        let response = post_json(&app, path, Some("admin-key"), body).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{} payload mismatch must be refused before provider dispatch",
+            provider.as_str().unwrap()
+        );
+        let response_bytes = body_bytes(response).await;
+        assert_secret_absent("payload-mismatch error body", &response_bytes, &sentinel);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response_bytes).expect("mismatch body must be JSON");
+        assert_eq!(
+            body.get("code").and_then(serde_json::Value::as_str),
+            Some("source_provider_payload_mismatch")
+        );
+    }
+
+    for (provider, path, body, expected_message) in [
+        (
+            AsyncMigrationSourceProvider::Meilisearch,
+            "/1/migrations/meilisearch/list-indexes",
+            discovery_host_body("endpoint", "https://evil.example.com", sentinel.as_str()),
+            "Meilisearch Cloud endpoint is not allowed",
+        ),
+        (
+            AsyncMigrationSourceProvider::Typesense,
+            "/1/migrations/typesense/list-indexes",
+            discovery_host_body("node", "https://evil.example.com", sentinel.as_str()),
+            "Typesense Cloud endpoint is not allowed",
+        ),
+    ] {
+        let response = post_json(&app, path, Some("admin-key"), body).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{} non-vendor host must be refused at admission",
+            provider.as_str().unwrap()
+        );
+        let response_bytes = body_bytes(response).await;
+        assert_secret_absent("vendor-policy error body", &response_bytes, &sentinel);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response_bytes).expect("vendor-policy body must be JSON");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "message": expected_message,
+                "status": 400
+            })
+        );
+    }
+
+    assert_secret_absent(
+        "captured failure-path logs",
+        logs.contents().as_bytes(),
+        &sentinel,
+    );
+    assert_secret_absent(
+        "temporary failure-path spool and data files",
+        &read_file_tree(tmp.path()),
+        &sentinel,
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+async fn list_source_indexes_never_leaks_credentials() {
+    // Exercise a successful upstream request for every public provider, then
+    // sweep all externally observable and durable sinks. This is
+    // deliberately separate from the mismatch test so an early parser refusal
+    // cannot make the runtime leak guard vacuous.
+    let sentinel = discovery_credential_sentinel();
+    let meilisearch_authorization = format!("Bearer {sentinel}");
+
+    let algolia = start_discovery_upstream(
+        "/1/indexes",
+        &[("page", "0"), ("hitsPerPage", "100")],
+        &[
+            ("x-algolia-application-id", "APP123"),
+            ("x-algolia-api-key", sentinel.as_str()),
+        ],
+        200,
+        serde_json::json!({
+            "items": [{
+                "name": "algolia_products",
+                "entries": 2,
+                "updatedAt": "2026-07-26T00:00:00Z",
+                "pendingTask": false
+            }],
+            "page": 0,
+            "nbPages": 1
+        }),
+    )
+    .await;
+    let meilisearch = start_discovery_upstream(
+        "/indexes",
+        &[("limit", "1")],
+        &[("authorization", meilisearch_authorization.as_str())],
+        200,
+        serde_json::json!({
+            "results": [{
+                "uid": "meili_products",
+                "primaryKey": "id",
+                "createdAt": "2026-07-26T00:00:00Z",
+                "updatedAt": "2026-07-26T00:00:00Z"
+            }],
+            "total": 1,
+            "offset": 0,
+            "limit": 1
+        }),
+    )
+    .await;
+    mount_meilisearch_stats_upstream(
+        &meilisearch,
+        meilisearch_authorization.as_str(),
+        &[("meili_products", 1)],
+    )
+    .await;
+    let typesense = start_discovery_upstream(
+        "/collections",
+        &[("exclude_fields", "fields"), ("limit", "1")],
+        &[("x-typesense-api-key", sentinel.as_str())],
+        200,
+        typesense_collection_summaries(&[("typesense_products", 1, 1_785_020_400, "price")]),
+    )
+    .await;
+
+    let logs = SharedLogBuffer::default();
+    let (tmp, app) = build_auth_test_app();
+
+    let requests = [
+        (
+            AsyncMigrationSourceProvider::Algolia,
+            "/1/migrations/algolia/list-indexes",
+            serde_json::json!({ "appId": "APP123", "apiKey": sentinel.as_str() }),
+            vec![ExpectedNeutralDiscoveryMetadata::algolia(
+                "algolia_products",
+                2,
+                "2026-07-26T00:00:00Z",
+            )],
+        ),
+        (
+            AsyncMigrationSourceProvider::Meilisearch,
+            "/1/migrations/meilisearch/list-indexes?limit=1",
+            serde_json::json!({ "endpoint": meilisearch.uri(), "apiKey": sentinel.as_str() }),
+            vec![ExpectedNeutralDiscoveryMetadata::meilisearch(
+                "meili_products",
+                Some("id"),
+                1,
+                "2026-07-26T00:00:00Z",
+                "2026-07-26T00:00:00Z",
+            )],
+        ),
+        (
+            AsyncMigrationSourceProvider::Typesense,
+            "/1/migrations/typesense/list-indexes?limit=1",
+            serde_json::json!({ "node": typesense.uri(), "apiKey": sentinel.as_str() }),
+            vec![ExpectedNeutralDiscoveryMetadata::typesense(
+                "typesense_products",
+                1,
+                1_785_020_400,
+                "price",
+            )],
+        ),
+    ];
+    let covered_providers: Vec<_> = requests.iter().map(|request| request.0).collect();
+    assert_eq!(
+        covered_providers,
+        AsyncMigrationSourceProvider::PUBLIC.to_vec(),
+        "leak sweep must cover every public source provider"
+    );
+
+    let algolia_uri = algolia.uri();
+    let responses =
+        with_test_algolia_base_url_override(Some("APP123"), Some(&algolia_uri), async {
+            let _env_lock = ENV_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _meili_loopback =
+                EnvVarRestoreGuard::set("FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK", "1");
+            let _typesense_loopback =
+                EnvVarRestoreGuard::set("FJ_ENABLE_TYPESENSE_PREVIEW_LOOPBACK", "1");
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .without_time()
+                    .with_ansi(false)
+                    .with_writer(logs.clone()),
+            );
+            let _log_guard = tracing::subscriber::set_default(subscriber);
+
+            let mut responses = Vec::with_capacity(requests.len());
+            for (provider, path, request_body, expected_metadata) in requests {
+                let response = post_json(&app, path, Some("admin-key"), request_body).await;
+                responses.push((provider, response, expected_metadata));
+            }
+            responses
+        })
+        .await;
+
+    // All process-global environment overrides are restored and their locks are
+    // released before response or mock assertions can panic.
+    for (provider, response, expected_metadata) in responses {
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{} valid discovery request must complete",
+            provider.as_str().unwrap()
+        );
+        let response_bytes = body_bytes(response).await;
+        assert_secret_absent("valid discovery response body", &response_bytes, &sentinel);
+        let response_json: serde_json::Value =
+            serde_json::from_slice(&response_bytes).expect("discovery response must be JSON");
+        let expected_names = expected_metadata
+            .iter()
+            .map(|expected| expected.name.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(discovery_index_names(response_json.clone()), expected_names);
+        assert_neutral_discovery_metadata(&response_json, &expected_metadata);
+    }
+
+    algolia.verify().await;
+    meilisearch.verify().await;
+    typesense.verify().await;
+    assert_secret_absent(
+        "captured request logs",
+        logs.contents().as_bytes(),
+        &sentinel,
+    );
+    assert_secret_absent(
+        "temporary migration spool and data files",
+        &read_file_tree(tmp.path()),
+        &sentinel,
+    );
+
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (surface, path) in [
+        ("migration fixtures", crate_dir.join("../tests/fixtures")),
+        (
+            "synced Stage 1 work-note contract",
+            crate_dir.join("src/router_tests.rs"),
+        ),
+        ("canonical OpenAPI", crate_dir.join("../docs2/openapi.json")),
+        (
+            "demo OpenAPI",
+            crate_dir.join("../demo-dualclient/public/openapi.json"),
+        ),
+    ] {
+        assert_secret_absent(surface, &read_file_tree(&path), &sentinel);
+    }
+
+    // The dev chat is useful additional coverage when present, but Debbie mirrors
+    // intentionally do not publish `chats/`. The synced test source above carries
+    // the Stage 1 work-note contract in every supported test locality.
+    let dev_work_notes =
+        crate_dir.join("../../chats/icg/aug02_5am_4_neutral_source_discovery_contract.md");
+    if dev_work_notes.is_file() {
+        assert_secret_absent(
+            "development Stage 1 work notes",
+            &read_file_tree(&dev_work_notes),
+            &sentinel,
+        );
+    }
+
+    let served_openapi =
+        body_bytes(send_empty_request(&app, Method::GET, "/api-docs/openapi.json").await).await;
+    assert_secret_absent("served OpenAPI", &served_openapi, &sentinel);
 }
 
 #[tokio::test]
@@ -918,6 +2246,92 @@ async fn bulk_replace_receipt_states_single_node_topology() {
     let terminal = poll_bulk_replace_terminal(&app, job_id).await;
     assert_eq!(terminal["topology"], "single_node_only");
     assert_eq!(terminal["targetIndex"], "bulk_replace_receipt_target");
+    assert_eq!(terminal["disposition"], "succeeded");
+    assert_eq!(
+        terminal["objectsImported"],
+        serde_json::json!({"imported": 2})
+    );
+}
+
+#[tokio::test]
+async fn bulk_replace_status_count_matches_three_submitted_documents() {
+    let tmp = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let app = build_test_router(&tmp, Some(key_store));
+
+    let response = post_ndjson(
+        &app,
+        "/1/migrations/bulk-replace?indexName=bulk_replace_three_document_count",
+        Some("admin-key"),
+        concat!(
+            "{\"objectID\":\"ordinary\",\"title\":\"Ordinary\"}\n",
+            "{\"objectID\":\"zzsentinel_3_0\",\"donorType\":\"sentinel\"}\n",
+            "{\"objectID\":\"zzsentinel_3_1\",\"donorType\":\"sentinel\"}\n",
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let receipt = body_json(response).await;
+    let terminal = poll_bulk_replace_terminal(&app, receipt["jobID"].as_str().unwrap()).await;
+    // 1 ordinary document + 2 sentinel documents = 3 submitted documents.
+    assert_eq!(terminal["disposition"], "succeeded");
+    assert_eq!(
+        terminal["exportProgress"],
+        serde_json::json!({"completed": 3, "total": 3})
+    );
+    assert_eq!(
+        terminal["objectsImported"],
+        serde_json::json!({"imported": 3})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bulk_replace_streaming_submission_waits_for_body_before_202() {
+    let tmp = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let app = build_test_router(&tmp, Some(key_store));
+    let (tx, rx) = mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(2);
+    tx.send(Ok(axum::body::Bytes::from_static(
+        b"{\"objectID\":\"streaming-one\",\"title\":\"First\"}\n",
+    )))
+    .await
+    .unwrap();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/1/migrations/bulk-replace?indexName=streaming_bulk_replace")
+        .header("content-type", "application/x-ndjson")
+        .header("x-algolia-api-key", "admin-key")
+        .header("x-algolia-application-id", "route-contract-app")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap();
+    let submission = tokio::spawn(app.clone().oneshot(request));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !submission.is_finished(),
+        "202 must not close the transport while the request body is still uploading"
+    );
+
+    tx.send(Ok(axum::body::Bytes::from_static(
+        b"{\"objectID\":\"streaming-two\",\"title\":\"Second\"}\n",
+    )))
+    .await
+    .unwrap();
+    drop(tx);
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(10), submission)
+        .await
+        .expect("bulk replace must return its durable receipt after spooling the request body")
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let receipt = body_json(response).await;
+    assert_eq!(receipt["phase"], "submitted");
+    assert_eq!(receipt["disposition"], "running");
+    let job_id = receipt["jobID"].as_str().unwrap().to_string();
+
+    let terminal = poll_bulk_replace_terminal(&app, &job_id).await;
     assert_eq!(terminal["disposition"], "succeeded");
     assert_eq!(
         terminal["objectsImported"],

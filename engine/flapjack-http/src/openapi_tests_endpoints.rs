@@ -162,8 +162,9 @@ fn assert_migration_operation_uses_api_key(doc: &serde_json::Value, path: &str, 
 
 fn expected_async_migration_request_schema(provider: &str) -> &'static str {
     match provider {
-        "algolia" | "typesense" => "#/components/schemas/MigrateFromAlgoliaRequest",
+        "algolia" => "#/components/schemas/MigrateFromAlgoliaRequest",
         "meilisearch" => "#/components/schemas/MigrateFromMeilisearchRequest",
+        "typesense" => "#/components/schemas/MigrateFromTypesenseRequest",
         provider => {
             panic!("{provider} must declare its provider-specific migration request schema")
         }
@@ -710,6 +711,38 @@ fn analytics_endpoints_use_shared_response_schemas() {
             pointer
         );
     }
+}
+
+#[test]
+fn analytics_clear_request_excludes_seed_only_controls() {
+    let doc = openapi_json();
+
+    assert_eq!(
+        doc.pointer(
+            "/paths/~12~1analytics~1clear/delete/requestBody/content/application~1json/schema/$ref"
+        )
+        .and_then(|value| value.as_str()),
+        Some("#/components/schemas/ClearRequest"),
+        "DELETE /2/analytics/clear must use the index-only ClearRequest body"
+    );
+
+    // Clear only targets an index; the seed-only volume/distribution controls must not
+    // appear on its published contract even though the handler would silently ignore them.
+    assert_exact_property_set(&doc, "/components/schemas/ClearRequest", &["index"]);
+
+    // Seed keeps ownership of the volume/distribution controls it actually consumes.
+    assert_exact_property_set(
+        &doc,
+        "/components/schemas/SeedRequest",
+        &[
+            "index",
+            "days",
+            "searchCount",
+            "noResultRate",
+            "deviceDistribution",
+            "countryDistribution",
+        ],
+    );
 }
 
 #[test]

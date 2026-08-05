@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::mpsc;
@@ -13,11 +14,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const AUTO_PORT_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const AUTO_PORT_HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
-const FLAPJACK_AMBIENT_ENV_VARS: [&str; 17] = [
+const FLAPJACK_AMBIENT_ENV_VARS: [&str; 19] = [
     "FLAPJACK_ADMIN_KEY",
     "FLAPJACK_NO_AUTH",
     "FLAPJACK_ENV",
     "FLAPJACK_BIND_ADDR",
+    "FLAPJACK_SSL_CERT_PATH",
+    "FLAPJACK_SSL_KEY_PATH",
     "FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND",
     "FLAPJACK_PORT",
     "FLAPJACK_DATA_DIR",
@@ -45,6 +48,12 @@ pub(crate) fn flapjack_cmd_executable() -> PathBuf {
 
 pub(crate) fn server_spawn_executable() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_flapjack"))
+}
+
+pub(crate) fn flapjack_process_command() -> std::process::Command {
+    let mut command = std::process::Command::new(server_spawn_executable());
+    strip_flapjack_ambient_env_from_process_command(&mut command);
+    command
 }
 
 fn with_each_flapjack_ambient_env_var(mut apply: impl FnMut(&str)) {
@@ -165,6 +174,53 @@ mod tests {
     }
 }
 
+pub(crate) fn assert_startup_timeout_reaps_child_before_running_server_exists() {
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("sleep 30")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("sleep child should spawn");
+
+    let startup_result = panic::catch_unwind(AssertUnwindSafe(|| {
+        wait_for_auto_port_ready_or_reap_child(
+            &mut child,
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+        );
+    }));
+
+    assert!(
+        startup_result.is_err(),
+        "startup wait should panic when no banner arrives"
+    );
+    let exited = wait_for_child_exit(&mut child, Duration::from_secs(1));
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(
+        exited,
+        "startup failure must reap the child before RunningServer owns it"
+    );
+}
+
+fn wait_for_child_exit(child: &mut std::process::Child, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() <= timeout {
+        if child
+            .try_wait()
+            .expect("child status should be observable")
+            .is_some()
+        {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
 pub(crate) struct TempDir(std::path::PathBuf);
 
 impl TempDir {
@@ -266,8 +322,11 @@ impl RunningServer {
         let mut child =
             spawn_flapjack_auto_port_process(data_dir, no_auth, Stdio::piped(), Stdio::piped());
 
-        let bind_addr = wait_for_startup_bind_addr(&mut child, AUTO_PORT_STARTUP_TIMEOUT);
-        wait_for_health(&bind_addr, AUTO_PORT_HEALTH_TIMEOUT);
+        let bind_addr = wait_for_auto_port_ready_or_reap_child(
+            &mut child,
+            AUTO_PORT_STARTUP_TIMEOUT,
+            AUTO_PORT_HEALTH_TIMEOUT,
+        );
 
         (child, bind_addr)
     }
@@ -284,8 +343,11 @@ impl RunningServer {
             Stdio::piped(),
             Stdio::piped(),
         );
-        let bind_addr = wait_for_startup_bind_addr(&mut child, AUTO_PORT_STARTUP_TIMEOUT);
-        wait_for_health(&bind_addr, AUTO_PORT_HEALTH_TIMEOUT);
+        let bind_addr = wait_for_auto_port_ready_or_reap_child(
+            &mut child,
+            AUTO_PORT_STARTUP_TIMEOUT,
+            AUTO_PORT_HEALTH_TIMEOUT,
+        );
         (child, bind_addr)
     }
 
@@ -379,8 +441,7 @@ impl RunningServer {
     }
 
     fn kill_child(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        kill_and_wait_child(&mut self.child);
     }
 }
 
@@ -402,10 +463,12 @@ pub(crate) fn run_auth_auto_port_startup_once(data_dir: &str, extra_env: &[(&str
         Stdio::piped(),
         Stdio::piped(),
     );
-    let bind_addr = wait_for_startup_bind_addr(&mut child, AUTO_PORT_STARTUP_TIMEOUT);
-    wait_for_health(&bind_addr, AUTO_PORT_HEALTH_TIMEOUT);
-    let _ = child.kill();
-    let _ = child.wait();
+    let _ = wait_for_auto_port_ready_or_reap_child(
+        &mut child,
+        AUTO_PORT_STARTUP_TIMEOUT,
+        AUTO_PORT_HEALTH_TIMEOUT,
+    );
+    kill_and_wait_child(&mut child);
 }
 
 pub(crate) struct HttpResponse {
@@ -516,11 +579,10 @@ fn spawn_flapjack_process_with_env(
     stdout: Stdio,
     stderr: Stdio,
 ) -> Child {
-    let mut command = std::process::Command::new(server_spawn_executable());
+    let mut command = flapjack_process_command();
     if no_auth {
         command.arg("--no-auth");
     }
-    strip_flapjack_ambient_env_from_process_command(&mut command);
     if let Some(bind_addr) = bind_addr {
         command.arg("--bind-addr").arg(bind_addr);
     } else {
@@ -542,6 +604,33 @@ fn allocate_ephemeral_bind_addr() -> String {
         .local_addr()
         .expect("reserved local test port must expose an address");
     format!("127.0.0.1:{}", bind_addr.port())
+}
+
+fn wait_for_auto_port_ready_or_reap_child(
+    child: &mut Child,
+    startup_timeout: Duration,
+    health_timeout: Duration,
+) -> String {
+    let startup_result = panic::catch_unwind(AssertUnwindSafe(|| {
+        let bind_addr = wait_for_startup_bind_addr(child, startup_timeout);
+        wait_for_health(&bind_addr, health_timeout);
+        bind_addr
+    }));
+
+    match startup_result {
+        Ok(bind_addr) => bind_addr,
+        Err(payload) => {
+            // Auto-port startup can panic before RunningServer owns the process;
+            // reaping here keeps failed probes from leaking a server.
+            kill_and_wait_child(child);
+            panic::resume_unwind(payload);
+        }
+    }
+}
+
+fn kill_and_wait_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn wait_for_startup_bind_addr(child: &mut Child, timeout: Duration) -> String {

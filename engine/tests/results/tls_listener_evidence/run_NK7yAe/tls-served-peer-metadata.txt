@@ -1,0 +1,4 @@
+subject=CN=localhost
+sha256 Fingerprint=B5:84:71:9B:83:F8:F9:DA:82:B0:BF:EF:E1:6B:94:10:AE:E6:1C:11:71:02:B3:76:01:FE:72:D2:29:59:93:02
+X509v3 Subject Alternative Name:
+    DNS:localhost, IP Address:127.0.0.1

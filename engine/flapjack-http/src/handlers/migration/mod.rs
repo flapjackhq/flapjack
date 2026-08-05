@@ -1,6 +1,6 @@
 use axum::{
     body::Bytes,
-    extract::{Extension, Path as AxumPath, State},
+    extract::{Extension, Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
@@ -19,6 +19,9 @@ use uuid::Uuid;
 
 #[allow(dead_code)]
 mod algolia_client;
+#[cfg(test)]
+pub(crate) use algolia_client::{with_test_algolia_base_url_override, TEST_ALGOLIA_BASE_URL_ENV};
+mod algolia_source_reader;
 mod bulk_build;
 pub mod bulk_replace;
 mod export;
@@ -26,6 +29,8 @@ mod import;
 mod job_runner;
 #[allow(dead_code)]
 mod meilisearch_client;
+mod meilisearch_source_reader;
+mod meilisearch_synonyms;
 #[cfg(test)]
 mod preview_tests;
 mod source_identity_partitions;
@@ -40,12 +45,15 @@ mod typesense_client;
 mod typesense_client_tests;
 #[cfg(test)]
 mod typesense_contract_tests;
+#[cfg(test)]
+mod typesense_field_validation_tests;
+mod typesense_source_reader;
 
 use super::AppState;
 use crate::auth::AuthenticatedAppId;
 use crate::error_response::{json_error_parts, json_error_parts_with_code};
 use crate::handlers::index_resource_store::{delete_resource_item, load_existing_store};
-use algolia_client::{AlgoliaClient, AlgoliaClientError, AlgoliaErrorKind};
+use algolia_client::{AlgoliaClient, AlgoliaClientError, AlgoliaErrorKind, AlgoliaIndexRecord};
 pub use bulk_replace::{
     cancel_bulk_replace_http, get_bulk_replace_status_http, submit_bulk_replace_http,
     BulkReplaceReceipt,
@@ -72,6 +80,8 @@ const MIGRATION_CANCEL_TOO_LATE_MESSAGE: &str =
 const SOURCE_PROVIDER_UNSUPPORTED_CODE: &str = "source_provider_unsupported";
 const SOURCE_PROVIDER_UNSUPPORTED_MESSAGE: &str = "Source provider is not supported";
 const SOURCE_PROVIDER_PAYLOAD_MISMATCH_CODE: &str = "source_provider_payload_mismatch";
+/// Upstream Meilisearch error code for a key that lacks the requested action.
+const MEILISEARCH_INVALID_API_KEY_CODE: &str = "invalid_api_key";
 const PRIVACY_SCRUB_UNKNOWN_TARGET_CODE: &str = "privacy_scrub_unknown_target";
 const PRIVACY_SCRUB_STALE_GENERATION_CODE: &str = "privacy_scrub_stale_generation";
 const PRIVACY_SCRUB_MISMATCHED_INTENT_CODE: &str = "privacy_scrub_mismatched_intent";
@@ -265,7 +275,7 @@ impl AsyncMigrationSourceProvider {
     }
 
     fn supports_preview(&self) -> bool {
-        matches!(self, Self::Algolia | Self::Meilisearch)
+        matches!(self, Self::Algolia | Self::Meilisearch | Self::Typesense)
     }
 
     fn is_algolia(&self) -> bool {
@@ -535,18 +545,8 @@ pub struct ListAlgoliaIndexesResponse {
 pub async fn list_algolia_indexes(
     Json(payload): Json<ListAlgoliaIndexesRequest>,
 ) -> Result<Json<ListAlgoliaIndexesResponse>, (StatusCode, Json<serde_json::Value>)> {
-    if payload.app_id.is_empty() || payload.api_key.is_empty() {
-        return Err(json_error_parts(
-            StatusCode::BAD_REQUEST,
-            "appId and apiKey are required",
-        ));
-    }
-
-    let client = AlgoliaClient::new(&payload.app_id, &payload.api_key).map_err(algolia_error)?;
-    let indexes = client
-        .list_indexes()
-        .await
-        .map_err(algolia_error)?
+    let indexes = fetch_algolia_index_records(&payload.app_id, &payload.api_key)
+        .await?
         .into_iter()
         .map(|index| AlgoliaIndexInfo {
             name: index.name,
@@ -556,6 +556,128 @@ pub async fn list_algolia_indexes(
         .collect();
 
     Ok(Json(ListAlgoliaIndexesResponse { indexes }))
+}
+
+/// Read the Algolia application's index listing for both the legacy
+/// Algolia-shaped route and the provider-neutral discovery route, so credential
+/// admission and upstream error mapping have a single owner.
+async fn fetch_algolia_index_records(
+    app_id: &str,
+    api_key: &str,
+) -> Result<Vec<AlgoliaIndexRecord>, MigrateError> {
+    if app_id.is_empty() || api_key.is_empty() {
+        return Err(json_error_parts(
+            StatusCode::BAD_REQUEST,
+            "appId and apiKey are required",
+        ));
+    }
+    let client = AlgoliaClient::new(app_id, api_key).map_err(algolia_error)?;
+    client.list_indexes().await.map_err(algolia_error)
+}
+
+// ── Provider-neutral source discovery ───────────────────────────────────
+
+/// Discovery request body for a Meilisearch source. The Algolia arm reuses
+/// [`ListAlgoliaIndexesRequest`] rather than owning a second `{appId, apiKey}`
+/// schema.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListMeilisearchIndexesRequest {
+    pub endpoint: String,
+
+    #[serde(rename = "apiKey")]
+    pub api_key: String,
+}
+
+/// Discovery request body for a Typesense source.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListTypesenseIndexesRequest {
+    pub node: String,
+
+    #[serde(rename = "apiKey")]
+    pub api_key: String,
+}
+
+/// Caller-supplied discovery window, forwarded to the source provider verbatim.
+/// Omitted bounds are not sent, so the upstream's own default window applies.
+#[derive(Debug, Clone, Copy, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct SourceIndexPageQuery {
+    pub offset: Option<u64>,
+    pub limit: Option<u64>,
+}
+
+/// A provider-native source creation timestamp.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum SourceIndexCreatedAt {
+    Rfc3339(String),
+    UnixSeconds(u64),
+}
+
+/// One source index in the provider-neutral discovery response.
+///
+/// Every metadata field is always serialized — `null` where the provider does
+/// not publish it — so clients see one stable shape across providers instead of
+/// a per-provider key set.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceIndexSummary {
+    pub name: String,
+    #[schema(required)]
+    pub primary_key: Option<String>,
+    #[schema(required)]
+    pub entries: Option<u64>,
+    #[schema(required)]
+    pub document_count: Option<u64>,
+    /// Providers publish creation time in incompatible units (RFC 3339 for
+    /// Meilisearch, epoch seconds for Typesense), so the upstream value is
+    /// preserved rather than coerced into one of them.
+    #[schema(required)]
+    pub created_at: Option<SourceIndexCreatedAt>,
+    #[schema(required)]
+    pub updated_at: Option<String>,
+    #[schema(required)]
+    pub default_sorting_field: Option<String>,
+}
+
+impl SourceIndexSummary {
+    fn named(name: String) -> Self {
+        Self {
+            name,
+            primary_key: None,
+            entries: None,
+            document_count: None,
+            created_at: None,
+            updated_at: None,
+            default_sorting_field: None,
+        }
+    }
+}
+
+/// Provider-neutral source discovery response. Pagination fields are present
+/// only for providers that report their own window.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ListSourceIndexesResponse {
+    pub indexes: Vec<SourceIndexSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+}
+
+impl ListSourceIndexesResponse {
+    fn unpaginated(indexes: Vec<SourceIndexSummary>) -> Self {
+        Self {
+            indexes,
+            total: None,
+            offset: None,
+            limit: None,
+        }
+    }
 }
 
 type MigrateError = (StatusCode, Json<serde_json::Value>);
@@ -652,6 +774,12 @@ trait MigrationPreviewPayload {
     fn validate_preview(&self) -> Result<(), MigrateError>;
     fn source_index(&self) -> &str;
     fn target_index(&self) -> &str;
+
+    fn preview_settings_override(
+        &self,
+    ) -> Option<source_reader::SourceFuture<'_, serde_json::Value>> {
+        None
+    }
 }
 
 impl MigrationPreviewPayload for MigrateFromAlgoliaRequest {
@@ -680,6 +808,37 @@ impl MigrationPreviewPayload for MigrateFromMeilisearchRequest {
     fn target_index(&self) -> &str {
         meilisearch_target_index(self)
     }
+
+    fn preview_settings_override(
+        &self,
+    ) -> Option<source_reader::SourceFuture<'_, serde_json::Value>> {
+        Some(Box::pin(async move {
+            let client =
+                preview_meilisearch_client(self).map_err(source_reader::SourceExportError::from)?;
+            client
+                .read_source_settings()
+                .await
+                .map_err(map_preview_meilisearch_error)
+                .map_err(Into::into)
+        }))
+    }
+}
+
+impl MigrationPreviewPayload for MigrateFromTypesenseRequest {
+    fn validate_preview(&self) -> Result<(), MigrateError> {
+        validate_typesense_migration_request(self)
+    }
+
+    fn source_index(&self) -> &str {
+        &self.source_index
+    }
+
+    fn target_index(&self) -> &str {
+        typesense_target_index(self)
+    }
+
+    // TypesenseSourceReader already captures settings_from_collection for the
+    // source collection, so the default preview settings path is authoritative.
 }
 
 impl AsyncMigrationSubmitPayload for MigrateFromAlgoliaRequest {
@@ -755,7 +914,9 @@ macro_rules! define_source_migration_openapi_lifecycle {
         status: $status_fn:ident => $status_path:literal,
         cancel: $cancel_fn:ident => $cancel_path:literal,
         acknowledge: $acknowledge_fn:ident => $acknowledge_path:literal,
-        resume: $resume_fn:ident => $resume_path:literal
+        resume: $resume_fn:ident => $resume_path:literal,
+        list_indexes_request: $list_indexes_request_ty:ty,
+        list_indexes: $list_indexes_fn:ident => $list_indexes_path:literal
     ) => {
         /// Preview source migration translation without admitting or publishing a job.
         #[utoipa::path(
@@ -939,6 +1100,39 @@ macro_rules! define_source_migration_openapi_lifecycle {
             )
             .await
         }
+
+        /// List the source indexes reachable with the supplied source credentials.
+        ///
+        /// Documentation only: this generated function is never mounted.
+        /// `register_source_migration_routes` serves every provider's
+        /// `list-indexes` route through `list_source_indexes_http`, and this
+        /// wrapper delegates to that same handler so the published operation
+        /// cannot drift from the served one.
+        #[utoipa::path(
+            post,
+            path = $list_indexes_path,
+            tag = "migration",
+            request_body = $list_indexes_request_ty,
+            params(SourceIndexPageQuery),
+            responses(
+                (status = 200, description = "Source indexes reachable with the supplied credentials", body = ListSourceIndexesResponse),
+                (status = 400, description = "Invalid discovery request, source_provider_payload_mismatch, or refused source endpoint"),
+                (status = 403, description = "invalid_api_key: source credentials lack index-listing access"),
+                (status = 502, description = "Upstream source provider request failed")
+            ),
+            security(("api_key" = []))
+        )]
+        pub async fn $list_indexes_fn(
+            page: Query<SourceIndexPageQuery>,
+            body: Bytes,
+        ) -> Result<Json<ListSourceIndexesResponse>, MigrateError> {
+            list_source_indexes_http(
+                Some(Extension(AsyncMigrationSourceProvider::$provider)),
+                page,
+                body,
+            )
+            .await
+        }
     };
 }
 
@@ -953,12 +1147,14 @@ define_source_migration_openapi_lifecycle!(
     status: get_algolia_migration_status => "/1/migrations/algolia/{job_id}",
     cancel: cancel_algolia_migration => "/1/migrations/algolia/{job_id}/cancel",
     acknowledge: acknowledge_algolia_migration => "/1/migrations/algolia/{job_id}/acknowledge",
-    resume: resume_algolia_migration => "/1/migrations/algolia/{job_id}/resume"
+    resume: resume_algolia_migration => "/1/migrations/algolia/{job_id}/resume",
+    list_indexes_request: ListAlgoliaIndexesRequest,
+    list_indexes: list_algolia_source_indexes_doc => "/1/migrations/algolia/list-indexes"
 );
 define_source_migration_openapi_lifecycle!(
     Meilisearch,
     preview_request: MigrateFromMeilisearchRequest,
-    preview_source_reader: meilisearch_source_reader,
+    preview_source_reader: preview_meilisearch_source_reader,
     request: MigrateFromMeilisearchRequest,
     source_reader: meilisearch_source_reader,
     preview: preview_meilisearch_migration => "/1/migrations/meilisearch/preview",
@@ -966,12 +1162,14 @@ define_source_migration_openapi_lifecycle!(
     status: get_meilisearch_migration_status => "/1/migrations/meilisearch/{job_id}",
     cancel: cancel_meilisearch_migration => "/1/migrations/meilisearch/{job_id}/cancel",
     acknowledge: acknowledge_meilisearch_migration => "/1/migrations/meilisearch/{job_id}/acknowledge",
-    resume: resume_meilisearch_migration => "/1/migrations/meilisearch/{job_id}/resume"
+    resume: resume_meilisearch_migration => "/1/migrations/meilisearch/{job_id}/resume",
+    list_indexes_request: ListMeilisearchIndexesRequest,
+    list_indexes: list_meilisearch_source_indexes_doc => "/1/migrations/meilisearch/list-indexes"
 );
 define_source_migration_openapi_lifecycle!(
     Typesense,
-    preview_request: MigrateFromAlgoliaRequest,
-    preview_source_reader: algolia_source_reader,
+    preview_request: MigrateFromTypesenseRequest,
+    preview_source_reader: preview_typesense_source_reader,
     request: MigrateFromTypesenseRequest,
     source_reader: typesense_source_reader,
     preview: preview_typesense_migration => "/1/migrations/typesense/preview",
@@ -979,8 +1177,184 @@ define_source_migration_openapi_lifecycle!(
     status: get_typesense_migration_status => "/1/migrations/typesense/{job_id}",
     cancel: cancel_typesense_migration => "/1/migrations/typesense/{job_id}/cancel",
     acknowledge: acknowledge_typesense_migration => "/1/migrations/typesense/{job_id}/acknowledge",
-    resume: resume_typesense_migration => "/1/migrations/typesense/{job_id}/resume"
+    resume: resume_typesense_migration => "/1/migrations/typesense/{job_id}/resume",
+    list_indexes_request: ListTypesenseIndexesRequest,
+    list_indexes: list_typesense_source_indexes_doc => "/1/migrations/typesense/list-indexes"
 );
+
+/// Serve `POST /1/migrations/{provider}/list-indexes` for every public provider.
+///
+/// The provider is already known from the mounted route, so each arm parses
+/// exactly one request type instead of guessing from an untagged union. Source
+/// credentials are used only to build the outbound client — they are never
+/// logged nor persisted.
+pub(crate) async fn list_source_indexes_http(
+    source_provider: Option<Extension<AsyncMigrationSourceProvider>>,
+    Query(page): Query<SourceIndexPageQuery>,
+    body: Bytes,
+) -> Result<Json<ListSourceIndexesResponse>, MigrateError> {
+    let source_provider = source_provider
+        .map(|Extension(provider)| provider)
+        .unwrap_or_default();
+    let response = match source_provider {
+        AsyncMigrationSourceProvider::Algolia => {
+            let payload: ListAlgoliaIndexesRequest =
+                parse_source_discovery_payload(source_provider, &body)?;
+            list_algolia_source_indexes(&payload).await?
+        }
+        AsyncMigrationSourceProvider::Meilisearch => {
+            let payload: ListMeilisearchIndexesRequest =
+                parse_source_discovery_payload(source_provider, &body)?;
+            list_meilisearch_source_indexes(&payload, page).await?
+        }
+        AsyncMigrationSourceProvider::Typesense => {
+            let payload: ListTypesenseIndexesRequest =
+                parse_source_discovery_payload(source_provider, &body)?;
+            list_typesense_source_indexes(&payload, page).await?
+        }
+    };
+    Ok(Json(response))
+}
+
+/// The body field that identifies which provider a discovery payload was
+/// written for.
+fn source_discovery_discriminator(source_provider: AsyncMigrationSourceProvider) -> &'static str {
+    match source_provider {
+        AsyncMigrationSourceProvider::Algolia => "appId",
+        AsyncMigrationSourceProvider::Meilisearch => "endpoint",
+        AsyncMigrationSourceProvider::Typesense => "node",
+    }
+}
+
+/// Parse a discovery body for the route's provider, refusing another provider's
+/// discriminator first so a mislabelled payload is reported as a mismatch rather
+/// than coerced into this provider's shape or rejected as generic bad JSON.
+fn parse_source_discovery_payload<P>(
+    source_provider: AsyncMigrationSourceProvider,
+    body: &[u8],
+) -> Result<P, MigrateError>
+where
+    P: for<'de> Deserialize<'de>,
+{
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| json_error_parts(StatusCode::BAD_REQUEST, "Invalid migration request body"))?;
+    for other_provider in AsyncMigrationSourceProvider::PUBLIC {
+        if other_provider == source_provider {
+            continue;
+        }
+        if value
+            .get(source_discovery_discriminator(other_provider))
+            .is_some()
+        {
+            return Err(source_provider_payload_mismatch(
+                "Source discovery payload does not match source_provider",
+            ));
+        }
+    }
+    serde_json::from_value(value)
+        .map_err(|_| json_error_parts(StatusCode::BAD_REQUEST, "Invalid migration request body"))
+}
+
+async fn list_algolia_source_indexes(
+    payload: &ListAlgoliaIndexesRequest,
+) -> Result<ListSourceIndexesResponse, MigrateError> {
+    // Algolia's application-level listing has no caller-controlled window, so
+    // the neutral response reports no pagination for this provider.
+    let indexes = fetch_algolia_index_records(&payload.app_id, &payload.api_key)
+        .await?
+        .into_iter()
+        .map(|index| SourceIndexSummary {
+            entries: Some(index.entries),
+            updated_at: Some(index.updated_at),
+            ..SourceIndexSummary::named(index.name)
+        })
+        .collect();
+    Ok(ListSourceIndexesResponse::unpaginated(indexes))
+}
+
+async fn list_meilisearch_source_indexes(
+    payload: &ListMeilisearchIndexesRequest,
+    page: SourceIndexPageQuery,
+) -> Result<ListSourceIndexesResponse, MigrateError> {
+    let client = meilisearch_discovery_client(&payload.endpoint, &payload.api_key)?;
+    let listing = client
+        .list_indexes(page.offset, page.limit)
+        .await
+        .map_err(meilisearch_error)?;
+    let mut indexes = Vec::with_capacity(listing.results.len());
+    for index in listing.results {
+        let document_count = client
+            .read_index_document_count(&index.uid)
+            .await
+            .map_err(meilisearch_error)?;
+        indexes.push(SourceIndexSummary {
+            primary_key: index.primary_key,
+            document_count: Some(document_count),
+            created_at: Some(SourceIndexCreatedAt::Rfc3339(index.created_at)),
+            updated_at: Some(index.updated_at),
+            ..SourceIndexSummary::named(index.uid)
+        });
+    }
+    Ok(ListSourceIndexesResponse {
+        indexes,
+        total: Some(listing.total),
+        offset: Some(listing.offset),
+        limit: Some(listing.limit),
+    })
+}
+
+async fn list_typesense_source_indexes(
+    payload: &ListTypesenseIndexesRequest,
+    page: SourceIndexPageQuery,
+) -> Result<ListSourceIndexesResponse, MigrateError> {
+    let client = typesense_discovery_client(&payload.node, &payload.api_key)?;
+    // Typesense returns collections newest-first and reports no pagination
+    // envelope, so the upstream order is the response order.
+    let indexes = client
+        .list_collections(page.offset, page.limit)
+        .await
+        .map_err(typesense_error)?
+        .into_iter()
+        .map(|collection| SourceIndexSummary {
+            document_count: Some(collection.num_documents),
+            created_at: Some(SourceIndexCreatedAt::UnixSeconds(collection.created_at)),
+            default_sorting_field: collection.default_sorting_field,
+            ..SourceIndexSummary::named(collection.name)
+        })
+        .collect();
+    Ok(ListSourceIndexesResponse::unpaginated(indexes))
+}
+
+/// Admit a Meilisearch discovery endpoint through the production vendor policy,
+/// falling back to the debug-only loopback seam for the live contract fixture.
+/// The production refusal is what the caller sees when neither path admits the
+/// endpoint, so an unrecognised host never leaks the loopback opt-in's existence.
+fn meilisearch_discovery_client(
+    endpoint: &str,
+    api_key: &str,
+) -> Result<meilisearch_client::MeilisearchClient, MigrateError> {
+    let admitted = meilisearch_client::MeilisearchClient::new_discovery(endpoint, api_key);
+    #[cfg(debug_assertions)]
+    let admitted = admitted.or_else(|vendor_refusal| {
+        meilisearch_client::MeilisearchClient::new_discovery_preview_loopback(endpoint, api_key)
+            .map_err(|_| vendor_refusal)
+    });
+    admitted.map_err(meilisearch_error)
+}
+
+/// Typesense counterpart to [`meilisearch_discovery_client`].
+fn typesense_discovery_client(
+    node: &str,
+    api_key: &str,
+) -> Result<typesense_client::TypesenseClient, MigrateError> {
+    let admitted = typesense_client::TypesenseClient::new_discovery(node, api_key);
+    #[cfg(debug_assertions)]
+    let admitted = admitted.or_else(|vendor_refusal| {
+        typesense_client::TypesenseClient::new_discovery_preview_loopback(node, api_key)
+            .map_err(|_| vendor_refusal)
+    });
+    admitted.map_err(typesense_error)
+}
 
 pub(crate) async fn preview_algolia_migration_http(
     source_provider: Option<Extension<AsyncMigrationSourceProvider>>,
@@ -997,7 +1371,7 @@ pub(crate) async fn preview_algolia_migration_http(
             let payload = parse_submit_payload(&body)?;
             #[cfg(test)]
             if let Some(Extension(factory)) = test_source_factory.as_ref() {
-                return preview_source_migration(source_provider, payload, |_| {
+                return preview_source_migration_with_test_reader(source_provider, payload, |_| {
                     factory.build(source_provider)
                 })
                 .await;
@@ -1008,14 +1382,26 @@ pub(crate) async fn preview_algolia_migration_http(
             let payload = parse_submit_payload(&body)?;
             #[cfg(test)]
             if let Some(Extension(factory)) = test_source_factory.as_ref() {
-                return preview_source_migration(source_provider, payload, |_| {
+                return preview_source_migration_with_test_reader(source_provider, payload, |_| {
                     factory.build(source_provider)
                 })
                 .await;
             }
-            preview_source_migration(source_provider, payload, meilisearch_source_reader).await
+            preview_source_migration(source_provider, payload, preview_meilisearch_source_reader)
+                .await
         }
-        AsyncMigrationSourceProvider::Typesense => Err(source_provider_unsupported()),
+        AsyncMigrationSourceProvider::Typesense => {
+            let payload = parse_typesense_submit_payload(&body)?;
+            #[cfg(test)]
+            if let Some(Extension(factory)) = test_source_factory.as_ref() {
+                return preview_source_migration_with_test_reader(source_provider, payload, |_| {
+                    factory.build(source_provider)
+                })
+                .await;
+            }
+            preview_source_migration(source_provider, payload, preview_typesense_source_reader)
+                .await
+        }
     }
 }
 
@@ -1211,14 +1597,13 @@ struct PreviewSourceExport {
     settings: serde_json::Value,
     document_pages: Vec<Vec<serde_json::Value>>,
     rule_pages: Vec<Vec<serde_json::Value>>,
+    rule_stable_id_pages: Vec<Vec<String>>,
     synonym_pages: Vec<Vec<serde_json::Value>>,
+    synonym_stable_id_pages: Vec<Vec<String>>,
+    replica_settings: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl PreviewSourceExport {
-    fn settings(&self) -> &serde_json::Value {
-        &self.settings
-    }
-
     fn record_count(&self) -> usize {
         self.document_pages.iter().map(Vec::len).sum()
     }
@@ -1228,7 +1613,6 @@ impl PreviewSourceExport {
         source_index_name: String,
         target_index_name: String,
         source_provider: AsyncMigrationSourceProvider,
-        replica_settings: std::collections::BTreeMap<String, serde_json::Value>,
     ) -> translation::SpoolTranslationInput {
         translation::SpoolTranslationInput {
             source_index_name,
@@ -1237,38 +1621,63 @@ impl PreviewSourceExport {
             settings: self.settings,
             document_pages: self.document_pages,
             rule_pages: self.rule_pages,
+            rule_stable_id_pages: self.rule_stable_id_pages,
             synonym_pages: self.synonym_pages,
-            replica_settings,
+            synonym_stable_id_pages: self.synonym_stable_id_pages,
+            replica_settings: self.replica_settings,
         }
     }
 }
 
 impl source_reader::SourceExportSink for PreviewSourceExport {
-    fn commit_settings(&mut self, settings: &serde_json::Value) -> Result<(), AlgoliaClientError> {
-        self.settings = settings.clone();
+    fn commit_configuration(
+        &mut self,
+        artifact: &source_reader::SourceConfigurationArtifact,
+    ) -> Result<(), source_reader::SourceExportError> {
+        use source_reader::SourceConfigurationArtifact as Artifact;
+        match artifact {
+            Artifact::Settings { payload } => self.settings = payload.clone(),
+            Artifact::Rules { records } => {
+                let (page, stable_ids) = preview_configuration_page(records);
+                self.rule_pages.push(page);
+                self.rule_stable_id_pages.push(stable_ids);
+            }
+            Artifact::Synonyms { records } => {
+                let (page, stable_ids) = preview_configuration_page(records);
+                self.synonym_pages.push(page);
+                self.synonym_stable_id_pages.push(stable_ids);
+            }
+            Artifact::ReplicaSettings {
+                source_name,
+                payload,
+            } => {
+                self.replica_settings
+                    .insert(source_name.clone(), payload.clone());
+            }
+        }
         Ok(())
     }
 
     fn commit_document_page(
         &mut self,
-        page: &[serde_json::Value],
-    ) -> Result<(), AlgoliaClientError> {
-        self.document_pages.push(page.to_vec());
+        page: &[source_reader::SourceExportRecord],
+    ) -> Result<(), source_reader::SourceExportError> {
+        self.document_pages.push(
+            page.iter()
+                .map(|record| record.identity_payload())
+                .collect(),
+        );
         Ok(())
     }
+}
 
-    fn commit_rule_page(&mut self, page: &[serde_json::Value]) -> Result<(), AlgoliaClientError> {
-        self.rule_pages.push(page.to_vec());
-        Ok(())
-    }
-
-    fn commit_synonym_page(
-        &mut self,
-        page: &[serde_json::Value],
-    ) -> Result<(), AlgoliaClientError> {
-        self.synonym_pages.push(page.to_vec());
-        Ok(())
-    }
+fn preview_configuration_page(
+    records: &[source_reader::SourceConfigurationRecord],
+) -> (Vec<serde_json::Value>, Vec<String>) {
+    records
+        .iter()
+        .map(|record| (record.identity_payload(), record.stable_id().to_string()))
+        .unzip()
 }
 
 async fn preview_source_migration<P, F, R>(
@@ -1281,30 +1690,58 @@ where
     F: FnOnce(&P) -> Result<R, AlgoliaClientError>,
     R: source_reader::MigrationSourceReader + Send,
 {
+    preview_source_migration_inner(source_provider, payload, source_factory, true).await
+}
+
+#[cfg(test)]
+async fn preview_source_migration_with_test_reader<P, F, R>(
+    source_provider: AsyncMigrationSourceProvider,
+    payload: P,
+    source_factory: F,
+) -> Result<Json<MigrationPreviewResponse>, MigrateError>
+where
+    P: MigrationPreviewPayload,
+    F: FnOnce(&P) -> Result<R, AlgoliaClientError>,
+    R: source_reader::MigrationSourceReader + Send,
+{
+    preview_source_migration_inner(source_provider, payload, source_factory, false).await
+}
+
+async fn preview_source_migration_inner<P, F, R>(
+    source_provider: AsyncMigrationSourceProvider,
+    payload: P,
+    source_factory: F,
+    fetch_preview_settings: bool,
+) -> Result<Json<MigrationPreviewResponse>, MigrateError>
+where
+    P: MigrationPreviewPayload,
+    F: FnOnce(&P) -> Result<R, AlgoliaClientError>,
+    R: source_reader::MigrationSourceReader + Send,
+{
     ensure_source_provider_preview_supported(source_provider)?;
     payload.validate_preview()?;
     let source_index_name = payload.source_index().to_string();
     let target_index_name = payload.target_index().to_string();
     let mut reader = source_factory(&payload).map_err(algolia_error)?;
+    source_reader::admit_source_provider(source_provider, reader.source_provider())
+        .map_err(source_export_error)?;
 
     reader
-        .wait_for_quiescent_source()
+        .observe_quiescent_source()
         .await
-        .map_err(algolia_error)?;
+        .map_err(source_export_error)?;
     let mut export = PreviewSourceExport::default();
     source_reader::read_source_snapshot(&mut reader, &mut export)
         .await
-        .map_err(algolia_error)?;
-    let replica_settings = source_reader::collect_replica_settings(&mut reader, export.settings())
-        .await
-        .map_err(algolia_error)?;
+        .map_err(source_export_error)?;
+    if fetch_preview_settings {
+        if let Some(settings) = payload.preview_settings_override() {
+            export.settings = settings.await.map_err(source_export_error)?;
+        }
+    }
     let records = export.record_count();
-    let input = export.into_translation_input(
-        source_index_name,
-        target_index_name,
-        source_provider,
-        replica_settings,
-    );
+    let input =
+        export.into_translation_input(source_index_name, target_index_name, source_provider);
     let report = translation::translate_spool_report(input).map_err(|error| {
         json_error_parts(StatusCode::INTERNAL_SERVER_ERROR, error.safe_message())
     })?;
@@ -1640,8 +2077,11 @@ where
     let mut reader = source_factory(&payload).map_err(algolia_error)?;
     import::import_from_source_with_test_hooks(
         &state.manager,
-        admitted.target_index,
-        admitted.publication_mode,
+        import::SourceImportRequest {
+            expected_provider: AsyncMigrationSourceProvider::Algolia,
+            target_index: admitted.target_index,
+            publication_mode: admitted.publication_mode,
+        },
         &mut reader,
         hooks,
     )
@@ -1661,8 +2101,11 @@ where
     let mut reader = source_factory(&payload).map_err(algolia_error)?;
     import::import_from_source(
         &state.manager,
-        admitted.target_index,
-        admitted.publication_mode,
+        import::SourceImportRequest {
+            expected_provider: AsyncMigrationSourceProvider::Algolia,
+            target_index: admitted.target_index,
+            publication_mode: admitted.publication_mode,
+        },
         &mut reader,
     )
     .await
@@ -1681,23 +2124,12 @@ fn admit_migration_payload(
     payload: &MigrateFromAlgoliaRequest,
 ) -> Result<AdmittedMigration, MigrateError> {
     validate_migration_request(payload)?;
-    let target_index = migration_target_index(payload).to_string();
-    if replication_manager.is_some_and(|manager| manager.peer_count() > 0) {
-        return Err(migration_ha_unsupported());
-    }
-    if payload.overwrite {
-        let staging_baseline = manager
-            .capture_replacement_staging_baseline(&target_index)
-            .map_err(|error| json_error_parts(StatusCode::BAD_REQUEST, error.to_string()))?;
-        return Ok(AdmittedMigration {
-            target_index,
-            publication_mode: MigrationPublicationMode::ReplaceExisting { staging_baseline },
-        });
-    }
-    Ok(AdmittedMigration {
-        target_index,
-        publication_mode: MigrationPublicationMode::CreateOnly,
-    })
+    admit_source_migration_target(
+        manager,
+        replication_manager,
+        migration_target_index(payload),
+        payload.overwrite,
+    )
 }
 
 fn admit_meilisearch_migration_payload(
@@ -1706,23 +2138,12 @@ fn admit_meilisearch_migration_payload(
     payload: &MigrateFromMeilisearchRequest,
 ) -> Result<AdmittedMigration, MigrateError> {
     validate_meilisearch_migration_request(payload)?;
-    let target_index = meilisearch_target_index(payload).to_string();
-    if replication_manager.is_some_and(|manager| manager.peer_count() > 0) {
-        return Err(migration_ha_unsupported());
-    }
-    if payload.overwrite {
-        let staging_baseline = manager
-            .capture_replacement_staging_baseline(&target_index)
-            .map_err(|error| json_error_parts(StatusCode::BAD_REQUEST, error.to_string()))?;
-        return Ok(AdmittedMigration {
-            target_index,
-            publication_mode: MigrationPublicationMode::ReplaceExisting { staging_baseline },
-        });
-    }
-    Ok(AdmittedMigration {
-        target_index,
-        publication_mode: MigrationPublicationMode::CreateOnly,
-    })
+    admit_source_migration_target(
+        manager,
+        replication_manager,
+        meilisearch_target_index(payload),
+        payload.overwrite,
+    )
 }
 
 fn admit_typesense_migration_payload(
@@ -1731,21 +2152,34 @@ fn admit_typesense_migration_payload(
     payload: &MigrateFromTypesenseRequest,
 ) -> Result<AdmittedMigration, MigrateError> {
     validate_typesense_migration_request(payload)?;
-    let target_index = typesense_target_index(payload).to_string();
+    admit_source_migration_target(
+        manager,
+        replication_manager,
+        typesense_target_index(payload),
+        payload.overwrite,
+    )
+}
+
+fn admit_source_migration_target(
+    manager: &Arc<flapjack::IndexManager>,
+    replication_manager: Option<&Arc<flapjack_replication::manager::ReplicationManager>>,
+    target_index: &str,
+    overwrite: bool,
+) -> Result<AdmittedMigration, MigrateError> {
     if replication_manager.is_some_and(|manager| manager.peer_count() > 0) {
         return Err(migration_ha_unsupported());
     }
-    if payload.overwrite {
+    if overwrite {
         let staging_baseline = manager
-            .capture_replacement_staging_baseline(&target_index)
+            .capture_replacement_staging_baseline(target_index)
             .map_err(|error| json_error_parts(StatusCode::BAD_REQUEST, error.to_string()))?;
         return Ok(AdmittedMigration {
-            target_index,
+            target_index: target_index.to_string(),
             publication_mode: MigrationPublicationMode::ReplaceExisting { staging_baseline },
         });
     }
     Ok(AdmittedMigration {
-        target_index,
+        target_index: target_index.to_string(),
         publication_mode: MigrationPublicationMode::CreateOnly,
     })
 }
@@ -1760,30 +2194,232 @@ fn algolia_source_reader(
     )
 }
 
+/// Admit a Meilisearch submit endpoint through the production vendor policy,
+/// falling back to the debug-only loopback seam for the live contract fixture —
+/// the same production-first shape as [`meilisearch_discovery_client`]. Both
+/// served and generated submit handlers call this helper, while preview keeps
+/// its separately asserted refusal semantics. `FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK`
+/// now gates submit as well as preview and discovery. Production admission
+/// stays the first branch in every build, and the production refusal is what
+/// the caller sees when neither path admits the endpoint, so an unrecognised
+/// host never leaks the loopback opt-in's existence.
 fn meilisearch_source_reader(
     payload: &MigrateFromMeilisearchRequest,
 ) -> Result<
     source_reader::MeilisearchSourceReader<meilisearch_client::MeilisearchClient>,
     AlgoliaClientError,
 > {
-    source_reader::MeilisearchSourceReader::new(
+    let admitted = source_reader::MeilisearchSourceReader::new(
         &payload.endpoint,
         &payload.api_key,
         &payload.source_index,
-    )
+    );
+    #[cfg(debug_assertions)]
+    let admitted = admitted.or_else(|vendor_refusal| {
+        meilisearch_loopback_source_reader(payload).map_err(|_| vendor_refusal)
+    });
+    admitted
 }
 
+/// Single owner of the debug-only Meilisearch loopback source reader. Preview
+/// uses it directly; submit reaches it only after production vendor admission
+/// refuses. In debug builds [`preview_meilisearch_client`] is the loopback
+/// constructor, and the opt-in plus literal-loopback checks live inside it, so
+/// it refuses before parsing an attacker-controlled endpoint.
+#[cfg(debug_assertions)]
+fn meilisearch_loopback_source_reader(
+    payload: &MigrateFromMeilisearchRequest,
+) -> Result<
+    source_reader::MeilisearchSourceReader<meilisearch_client::MeilisearchClient>,
+    AlgoliaClientError,
+> {
+    let source = preview_meilisearch_client(payload)?;
+    Ok(source_reader::MeilisearchSourceReader::from_source(
+        &payload.source_index,
+        source,
+    ))
+}
+
+/// Client for the preview settings override and the loopback source reader.
+/// Debug builds bind the loopback constructor; release builds bind production
+/// vendor admission.
+fn preview_meilisearch_client(
+    payload: &MigrateFromMeilisearchRequest,
+) -> Result<meilisearch_client::MeilisearchClient, AlgoliaClientError> {
+    #[cfg(debug_assertions)]
+    let client = meilisearch_client::MeilisearchClient::new_preview_loopback(
+        &payload.endpoint,
+        &payload.api_key,
+        &payload.source_index,
+    );
+    #[cfg(not(debug_assertions))]
+    let client = meilisearch_client::MeilisearchClient::new(
+        &payload.endpoint,
+        &payload.api_key,
+        &payload.source_index,
+    );
+    client.map_err(map_preview_meilisearch_error)
+}
+
+/// Preview keeps its own loopback-only debug shape: it reports the seam's own
+/// "loopback endpoint is disabled" refusal rather than the vendor refusal, which
+/// `preview_tests::meilisearch_preview_requires_explicit_loopback_opt_in`
+/// asserts. Submit must not adopt this shape — it would refuse a real
+/// Meilisearch Cloud endpoint in debug builds.
+#[cfg(debug_assertions)]
+fn preview_meilisearch_source_reader(
+    payload: &MigrateFromMeilisearchRequest,
+) -> Result<
+    source_reader::MeilisearchSourceReader<meilisearch_client::MeilisearchClient>,
+    AlgoliaClientError,
+> {
+    meilisearch_loopback_source_reader(payload)
+}
+
+#[cfg(not(debug_assertions))]
+fn preview_meilisearch_source_reader(
+    payload: &MigrateFromMeilisearchRequest,
+) -> Result<
+    source_reader::MeilisearchSourceReader<meilisearch_client::MeilisearchClient>,
+    AlgoliaClientError,
+> {
+    meilisearch_source_reader(payload)
+}
+
+fn map_preview_meilisearch_error(
+    error: meilisearch_client::MeilisearchClientError,
+) -> AlgoliaClientError {
+    let kind = if error.kind() == meilisearch_client::MeilisearchErrorKind::Validation {
+        AlgoliaErrorKind::Validation
+    } else {
+        AlgoliaErrorKind::Upstream
+    };
+    AlgoliaClientError::new(kind, error.safe_message())
+}
+
+/// Admit a Typesense submit endpoint through the production vendor policy,
+/// falling back to the debug-only loopback seam for the live contract fixture —
+/// the same shape as [`typesense_discovery_client`] and [`meilisearch_source_reader`],
+/// with both served and generated submit handlers calling this helper. Preview
+/// keeps its separately asserted refusal semantics.
+/// `FJ_ENABLE_TYPESENSE_PREVIEW_LOOPBACK` now gates submit as well as preview
+/// and discovery. Production admission stays the first branch in every build,
+/// and the production refusal is what the caller sees when neither path admits
+/// the endpoint, so an unrecognised host never leaks the loopback opt-in's
+/// existence.
 fn typesense_source_reader(
     payload: &MigrateFromTypesenseRequest,
 ) -> Result<
     source_reader::TypesenseSourceReader<typesense_client::TypesenseClient>,
     AlgoliaClientError,
 > {
-    source_reader::TypesenseSourceReader::new(
+    let admitted = source_reader::TypesenseSourceReader::new(
+        &payload.node,
+        &payload.api_key,
+        &payload.source_index,
+    );
+    #[cfg(debug_assertions)]
+    let admitted = admitted.or_else(|vendor_refusal| {
+        typesense_loopback_source_reader(payload).map_err(|_| vendor_refusal)
+    });
+    admitted
+}
+
+/// Single owner of the debug-only Typesense loopback source reader. Submit
+/// reaches it only after production vendor admission refuses. The opt-in plus
+/// literal-loopback checks live inside `TypesenseClient::new_preview_loopback`,
+/// so it refuses before parsing an attacker-controlled endpoint.
+#[cfg(debug_assertions)]
+fn typesense_loopback_source_reader(
+    payload: &MigrateFromTypesenseRequest,
+) -> Result<
+    source_reader::TypesenseSourceReader<typesense_client::TypesenseClient>,
+    AlgoliaClientError,
+> {
+    let source = typesense_client::TypesenseClient::new_preview_loopback(
         &payload.node,
         &payload.api_key,
         &payload.source_index,
     )
+    .map_err(typesense_source_reader::map_typesense_client_error)?;
+    Ok(source_reader::TypesenseSourceReader::from_source(
+        &payload.source_index,
+        source,
+    ))
+}
+
+#[cfg(debug_assertions)]
+fn preview_typesense_source_reader(
+    payload: &MigrateFromTypesenseRequest,
+) -> Result<
+    source_reader::TypesenseSourceReader<typesense_client::TypesenseClient>,
+    AlgoliaClientError,
+> {
+    let source = preview_typesense_client(payload)?;
+    Ok(source_reader::TypesenseSourceReader::from_source(
+        &payload.source_index,
+        source,
+    ))
+}
+
+#[cfg(not(debug_assertions))]
+fn preview_typesense_source_reader(
+    payload: &MigrateFromTypesenseRequest,
+) -> Result<
+    source_reader::TypesenseSourceReader<typesense_client::TypesenseClient>,
+    AlgoliaClientError,
+> {
+    typesense_source_reader(payload)
+}
+
+/// Preserve production Typesense Cloud admission in debug builds, then fall
+/// back to the explicit loopback fixture seam when vendor admission refuses the
+/// endpoint. Release preview delegates directly to `typesense_source_reader`.
+#[cfg(debug_assertions)]
+fn preview_typesense_client(
+    payload: &MigrateFromTypesenseRequest,
+) -> Result<typesense_client::TypesenseClient, AlgoliaClientError> {
+    let client = match typesense_client::TypesenseClient::new(
+        &payload.node,
+        &payload.api_key,
+        &payload.source_index,
+    ) {
+        Ok(client) => Ok(client),
+        Err(error) if error.is_endpoint_not_allowed() => {
+            if !typesense_preview_loopback_candidate(&payload.node) {
+                Err(error)
+            } else {
+                typesense_client::TypesenseClient::new_preview_loopback(
+                    &payload.node,
+                    &payload.api_key,
+                    &payload.source_index,
+                )
+            }
+        }
+        Err(error) => Err(error),
+    };
+    client.map_err(typesense_source_reader::map_typesense_client_error)
+}
+
+#[cfg(debug_assertions)]
+fn typesense_preview_loopback_candidate(node: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(node) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+    {
+        return false;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn parse_typesense_submit_payload(
@@ -1829,6 +2465,8 @@ fn validate_meilisearch_migration_request(
             "endpoint, apiKey, and sourceIndex are required",
         ));
     }
+    meilisearch_client::validate_source_index(&payload.source_index)
+        .map_err(|error| json_error_parts(StatusCode::BAD_REQUEST, error.safe_message()))?;
 
     let target_index = payload
         .target_index
@@ -1894,9 +2532,42 @@ fn migration_capacity_exhausted() -> MigrateError {
     )
 }
 
+/// Map a neutral source-export failure onto the existing migration status
+/// rules, so provider-neutral capture keeps a single status owner.
+fn source_export_error(
+    error: source_reader::SourceExportError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    algolia_error(error.into_inner())
+}
+
 fn algolia_error(error: AlgoliaClientError) -> (StatusCode, Json<serde_json::Value>) {
     let status = match error.kind() {
         AlgoliaErrorKind::Validation => StatusCode::BAD_REQUEST,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    json_error_parts(status, error.safe_message())
+}
+
+fn meilisearch_error(error: meilisearch_client::MeilisearchClientError) -> MigrateError {
+    match error.kind() {
+        meilisearch_client::MeilisearchErrorKind::Validation => {
+            json_error_parts(StatusCode::BAD_REQUEST, error.safe_message())
+        }
+        // A source key missing the `indexes.get` ACL fails upstream with 403
+        // `invalid_api_key`; relay that code so the caller can fix the ACL
+        // instead of reading a generic upstream failure.
+        meilisearch_client::MeilisearchErrorKind::Forbidden => json_error_parts_with_code(
+            StatusCode::FORBIDDEN,
+            MEILISEARCH_INVALID_API_KEY_CODE,
+            error.safe_message(),
+        ),
+        _ => json_error_parts(StatusCode::BAD_GATEWAY, error.safe_message()),
+    }
+}
+
+fn typesense_error(error: typesense_client::TypesenseClientError) -> MigrateError {
+    let status = match error.kind() {
+        typesense_client::TypesenseErrorKind::Validation => StatusCode::BAD_REQUEST,
         _ => StatusCode::BAD_GATEWAY,
     };
     json_error_parts(status, error.safe_message())
@@ -1981,6 +2652,7 @@ fn spool_error(error: SpoolError) -> MigrateError {
         | SpoolErrorKind::JobNotAccepted
         | SpoolErrorKind::JobNotInterrupted
         | SpoolErrorKind::UnsupportedArtifactKind
+        | SpoolErrorKind::UnsupportedSpoolFormat
         | SpoolErrorKind::InvalidPhaseTransition
         | SpoolErrorKind::PrivacyScrubIntentCollision => StatusCode::BAD_REQUEST,
         SpoolErrorKind::JobDeleting => StatusCode::CONFLICT,
@@ -2570,6 +3242,26 @@ mod tests {
             .expect_err("invalid targetIndex should fail before export starts");
 
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn meilisearch_migration_request_validation_rejects_traversal_shaped_source_index() {
+        let request = MigrateFromMeilisearchRequest {
+            endpoint: "https://meilisearch.io".to_string(),
+            api_key: "source-key".to_string(),
+            source_index: "../escape".to_string(),
+            target_index: Some("products".to_string()),
+            overwrite: false,
+        };
+
+        let error = validate_meilisearch_migration_request(&request)
+            .expect_err("traversal-shaped sourceIndex should fail before source admission");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1 .0,
+            json!({"message": "Meilisearch source index is invalid", "status": 400})
+        );
     }
 }
 

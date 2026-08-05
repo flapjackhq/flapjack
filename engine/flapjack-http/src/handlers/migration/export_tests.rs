@@ -10,6 +10,7 @@ use crate::handlers::migration::spool::{
     AsyncMigrationPublicationSemantic, PublicExportView, ResourceDenominators, SpoolError,
     SpoolErrorKind, SpoolLimits, SpoolStore,
 };
+use crate::handlers::migration::AsyncMigrationSourceProvider;
 use crate::test_helpers::{EnvVarRestoreGuard, TestStateBuilder, ENV_MUTEX};
 use serde_json::{json, Value};
 use std::fs;
@@ -99,6 +100,28 @@ async fn seed_digest() -> (String, ResourceDenominators) {
     seed_digest_for(record(), documents()).await
 }
 
+async fn seed_digest_with_replica_settings() -> (String, ResourceDenominators) {
+    let mut reader = ScriptedSourceReader::new(APP_ID, SOURCE);
+    reader.push_quiescent(record());
+    reader.push_pass(settings_with_replicas(), documents(), rules(), synonyms());
+    reader.push_index_settings("products_price_asc", Ok(replica_price_settings()));
+    reader.push_index_settings("products_relevance", Ok(replica_relevance_settings()));
+    let identity = collect_quiescent_source_snapshot(&mut reader)
+        .await
+        .expect("stable source with replicas should snapshot");
+    let snapshot = identity.snapshot();
+    (
+        identity.digest().to_string(),
+        ResourceDenominators {
+            settings: 1,
+            documents: snapshot.documents.count as u64,
+            rules: snapshot.rules.count as u64,
+            synonyms: snapshot.synonyms.count as u64,
+            config: 0,
+        },
+    )
+}
+
 fn create_export_for_test(
     store: &SpoolStore,
     job_uuid: Uuid,
@@ -179,9 +202,14 @@ async fn export_destination_isolation_and_sanitization_writes_only_spool_job() {
     let store = store_at(&base_path);
     let mut reader = full_reader();
 
-    let accepted = export_algolia_source(&store, Uuid::new_v4(), &mut reader)
-        .await
-        .expect("stable source should export");
+    let accepted = export_algolia_source(
+        &store,
+        Uuid::new_v4(),
+        &mut reader,
+        AsyncMigrationSourceProvider::Algolia,
+    )
+    .await
+    .expect("stable source should export");
 
     assert_eq!(accepted.documents, 3);
     assert_eq!(accepted.rules, 1);
@@ -226,9 +254,14 @@ async fn export_destination_isolation_and_sanitization_scrubs_public_material() 
     let store = store_at(tmp.path());
     let mut reader = full_reader();
 
-    let accepted = export_algolia_source(&store, Uuid::new_v4(), &mut reader)
-        .await
-        .expect("stable source should export");
+    let accepted = export_algolia_source(
+        &store,
+        Uuid::new_v4(),
+        &mut reader,
+        AsyncMigrationSourceProvider::Algolia,
+    )
+    .await
+    .expect("stable source should export");
     let (digest, _) = seed_digest().await;
 
     let public = store.public_view(&accepted.public_handle).unwrap();
@@ -282,47 +315,72 @@ fn replica_relevance_settings() -> Value {
     })
 }
 
-/// The accepted export carries each replica's complete source settings while the
-/// primary's differ, and the raw map never leaks through diagnostics.
+fn changed_replica_price_settings() -> Value {
+    json!({
+        "ranking": ["desc(price)"],
+        "customRanking": ["desc(margin)"],
+        "relevancyStrictness": 80,
+        "searchableAttributes": ["title"],
+        "note": REPLICA_CANARY,
+        "primary": SOURCE
+    })
+}
+
+/// Each replica's complete source settings land in the durable spool while the
+/// primary's differ, and no replica material reaches the acceptance receipt or
+/// its diagnostics.
 #[tokio::test]
-async fn export_carries_replica_settings_and_keeps_them_out_of_debug() {
+async fn export_persists_replica_settings_durably_and_keeps_them_off_the_receipt() {
     let tmp = TempDir::new().unwrap();
     let store = store_at(tmp.path());
     let mut reader = ScriptedSourceReader::new(APP_ID, SOURCE);
     reader.push_quiescent(record());
     reader.push_pass(settings_with_replicas(), documents(), rules(), synonyms());
+    reader.push_index_settings("products_price_asc", Ok(replica_price_settings()));
+    reader.push_index_settings("products_relevance", Ok(replica_relevance_settings()));
     reader.push_pass(settings_with_replicas(), documents(), rules(), synonyms());
     reader.push_quiescent(record());
-    // Collected once after the export pass, in replicas-list order.
+    // Collected once per identity pass, in replicas-list order.
     reader.push_index_settings("products_price_asc", Ok(replica_price_settings()));
     reader.push_index_settings("products_relevance", Ok(replica_relevance_settings()));
 
-    let accepted = export_algolia_source(&store, Uuid::new_v4(), &mut reader)
-        .await
-        .expect("stable source with replicas should export");
+    let accepted = export_algolia_source(
+        &store,
+        Uuid::new_v4(),
+        &mut reader,
+        AsyncMigrationSourceProvider::Algolia,
+    )
+    .await
+    .expect("stable source with replicas should export");
 
+    // The durable spool is the single owner of the captured replica settings.
+    let durable = store
+        .accepted_artifacts(accepted.job_uuid)
+        .unwrap()
+        .replica_settings()
+        .unwrap();
     assert_eq!(
-        accepted.replica_settings.keys().collect::<Vec<_>>(),
+        durable.keys().collect::<Vec<_>>(),
         vec!["products_price_asc", "products_relevance"]
     );
     // The complete per-replica payload is preserved, including searchableAttributes.
-    assert_eq!(
-        accepted.replica_settings["products_price_asc"],
-        replica_price_settings()
-    );
+    assert_eq!(durable["products_price_asc"], replica_price_settings());
     // Primary ranking (["typo"]) and replica ranking (["desc(price)"]) differ and
     // both are retained faithfully.
     assert_eq!(
-        accepted.replica_settings["products_price_asc"]["ranking"],
+        durable["products_price_asc"]["ranking"],
         json!(["desc(price)"])
     );
-    assert_ne!(
-        accepted.replica_settings["products_price_asc"]["ranking"],
-        json!(["typo"])
-    );
+    assert_ne!(durable["products_price_asc"]["ranking"], json!(["typo"]));
 
-    // No replica index name or settings value may reach a diagnostic line; only
-    // the safe count is rendered.
+    // Derived configuration is captured outside the source's own resource
+    // completions, so the public progress the job reports is unchanged by it.
+    let public = store.public_view(&accepted.public_handle).unwrap();
+    assert_eq!(public.progress.completed, public.progress.total);
+    assert_eq!(public.progress.total, 6);
+
+    // No replica index name or settings value may reach the acceptance receipt
+    // or a diagnostic line.
     let rendered = format!("{accepted:?}");
     for secret in [
         REPLICA_CANARY,
@@ -335,7 +393,6 @@ async fn export_carries_replica_settings_and_keeps_them_out_of_debug() {
             "AcceptedExport Debug must not leak replica material `{secret}`"
         );
     }
-    assert!(rendered.contains("replica_settings_count"));
 }
 
 /// Replica settings are collected inside the accepted-state window: the fetch
@@ -351,6 +408,8 @@ async fn export_collects_replica_settings_before_final_drift_proof() {
     let mut reader = ScriptedSourceReader::new(APP_ID, SOURCE);
     reader.push_quiescent(record());
     reader.push_pass(settings_with_replicas(), documents(), rules(), synonyms());
+    reader.push_index_settings("products_price_asc", Ok(replica_price_settings()));
+    reader.push_index_settings("products_relevance", Ok(replica_relevance_settings()));
     reader.push_pass(settings_with_replicas(), documents(), rules(), synonyms());
     reader.push_index_settings("products_price_asc", Ok(replica_price_settings()));
     reader.push_index_settings("products_relevance", Ok(replica_relevance_settings()));
@@ -360,9 +419,14 @@ async fn export_collects_replica_settings_before_final_drift_proof() {
     drifted.updated_at = "2026-07-15T02:00:00Z".to_string();
     reader.push_quiescent(drifted);
 
-    let error = export_algolia_source(&store, Uuid::new_v4(), &mut reader)
-        .await
-        .expect_err("drift after replica collection must fence the job");
+    let error = export_algolia_source(
+        &store,
+        Uuid::new_v4(),
+        &mut reader,
+        AsyncMigrationSourceProvider::Algolia,
+    )
+    .await
+    .expect_err("drift after replica collection must fence the job");
     assert!(matches!(error, ExportError::Source(_)));
 
     // The replica reads were consumed before the drift proof aborted, proving the
@@ -373,6 +437,53 @@ async fn export_collects_replica_settings_before_final_drift_proof() {
     );
 
     // The fenced job is durably failed, never left apparently complete.
+    let uuids = store.job_uuids().unwrap();
+    assert_eq!(uuids.len(), 1);
+    let (public_handle, _) = store.handles(uuids[0]).unwrap();
+    assert_eq!(store.public_view(&public_handle).unwrap().state, "Failed");
+}
+
+/// Replica-owned settings are part of the accepted source snapshot. A source
+/// whose primary metadata and resources stay stable but whose replica settings
+/// change during capture must be refused instead of publishing mixed payloads.
+#[tokio::test]
+async fn export_refuses_replica_settings_drift_with_unchanged_primary_snapshot() {
+    let tmp = TempDir::new().unwrap();
+    let store = store_at(tmp.path());
+    let mut reader = ScriptedSourceReader::new(APP_ID, SOURCE);
+    reader.push_quiescent(record());
+    reader.push_pass(settings_with_replicas(), documents(), rules(), synonyms());
+    reader.push_index_settings("products_price_asc", Ok(replica_price_settings()));
+    reader.push_index_settings("products_relevance", Ok(replica_relevance_settings()));
+    reader.push_pass(settings_with_replicas(), documents(), rules(), synonyms());
+    reader.push_index_settings("products_price_asc", Ok(changed_replica_price_settings()));
+    reader.push_index_settings("products_relevance", Ok(replica_relevance_settings()));
+    reader.push_quiescent(record());
+
+    let error = export_algolia_source(
+        &store,
+        Uuid::new_v4(),
+        &mut reader,
+        AsyncMigrationSourceProvider::Algolia,
+    )
+    .await
+    .expect_err("replica settings drift must reject the export");
+
+    match error {
+        ExportError::Source(inner) => {
+            assert_eq!(
+                inner.kind(),
+                crate::handlers::migration::algolia_client::AlgoliaErrorKind::Progress
+            );
+            assert_eq!(inner.safe_message(), "Source changed during export");
+        }
+        other => panic!("replica settings drift must surface as source drift: {other:?}"),
+    }
+    assert!(
+        reader.index_settings_reads.is_empty(),
+        "both pre-snapshot and export replica settings reads must be part of the drift proof"
+    );
+
     let uuids = store.job_uuids().unwrap();
     assert_eq!(uuids.len(), 1);
     let (public_handle, _) = store.handles(uuids[0]).unwrap();
@@ -465,9 +576,14 @@ async fn export_resume_skips_completed_ids_through_checkpoint_handle() {
     reopened.recover().unwrap();
     reopened.interrupt_export(view.job_uuid, &digest).unwrap();
     let mut reader = full_reader();
-    let accepted = resume_algolia_source(&reopened, &mut reader, &view.checkpoint_handle)
-        .await
-        .expect("resume should complete the export");
+    let accepted = resume_algolia_source(
+        &reopened,
+        &mut reader,
+        &view.checkpoint_handle,
+        AsyncMigrationSourceProvider::Algolia,
+    )
+    .await
+    .expect("resume should complete the export");
 
     assert_eq!(accepted.job_uuid, view.job_uuid);
     assert_eq!(accepted.documents, 3);
@@ -487,6 +603,67 @@ async fn export_resume_skips_completed_ids_through_checkpoint_handle() {
         .checkpoint(&view.checkpoint_handle, &digest)
         .unwrap();
     assert_eq!(checkpoint.state, "Accepted");
+}
+
+#[tokio::test]
+async fn export_resume_reuses_existing_replica_settings_without_duplicate_config() {
+    let tmp = TempDir::new().unwrap();
+    let store = store_at(tmp.path());
+    let (digest, denominators) = seed_digest_with_replica_settings().await;
+    let view = create_export_for_test(&store, Uuid::new_v4(), &digest, denominators).unwrap();
+    store
+        .commit_derived_source_settings(
+            view.job_uuid,
+            "products_price_asc",
+            &replica_price_settings(),
+        )
+        .unwrap();
+    store
+        .commit_derived_source_settings(
+            view.job_uuid,
+            "products_relevance",
+            &replica_relevance_settings(),
+        )
+        .unwrap();
+    store.interrupt_export(view.job_uuid, &digest).unwrap();
+
+    let mut reader = ScriptedSourceReader::new(APP_ID, SOURCE);
+    reader.push_quiescent(record());
+    reader.push_pass(settings_with_replicas(), documents(), rules(), synonyms());
+    reader.push_index_settings("products_price_asc", Ok(replica_price_settings()));
+    reader.push_index_settings("products_relevance", Ok(replica_relevance_settings()));
+    reader.push_pass(settings_with_replicas(), documents(), rules(), synonyms());
+    reader.push_index_settings("products_price_asc", Ok(replica_price_settings()));
+    reader.push_index_settings("products_relevance", Ok(replica_relevance_settings()));
+    reader.push_quiescent(record());
+
+    let accepted = resume_algolia_source(
+        &store,
+        &mut reader,
+        &view.checkpoint_handle,
+        AsyncMigrationSourceProvider::Algolia,
+    )
+    .await
+    .expect("unchanged replica settings should resume without duplicating config");
+
+    assert_eq!(accepted.job_uuid, view.job_uuid);
+    let config_artifacts = store
+        .visible_artifacts(view.job_uuid)
+        .unwrap()
+        .into_iter()
+        .filter(|name| name.starts_with("config-"))
+        .count();
+    assert_eq!(
+        config_artifacts, 2,
+        "resume must not append a second config artifact for the same replica source"
+    );
+    let durable = store
+        .accepted_artifacts(view.job_uuid)
+        .unwrap()
+        .replica_settings()
+        .unwrap();
+    assert_eq!(durable["products_price_asc"], replica_price_settings());
+    assert_eq!(durable["products_relevance"], replica_relevance_settings());
 }
 
 #[tokio::test]
@@ -526,9 +703,14 @@ async fn export_resume_accepts_reordered_inserted_source_and_refuses_mutation() 
     reader.push_quiescent(record_with_entries(4));
     store.interrupt_export(view.job_uuid, &digest).unwrap();
 
-    let accepted = resume_algolia_source(&store, &mut reader, &view.checkpoint_handle)
-        .await
-        .expect("resume should accept unchanged source identity with shifted pages");
+    let accepted = resume_algolia_source(
+        &store,
+        &mut reader,
+        &view.checkpoint_handle,
+        AsyncMigrationSourceProvider::Algolia,
+    )
+    .await
+    .expect("resume should accept unchanged source identity with shifted pages");
 
     assert_eq!(accepted.documents, 4);
     assert_eq!(accepted.job_uuid, view.job_uuid);
@@ -592,6 +774,7 @@ async fn export_resume_accepts_reordered_inserted_source_and_refuses_mutation() 
         &store,
         &mut mutated_reader,
         &mutation_view.checkpoint_handle,
+        AsyncMigrationSourceProvider::Algolia,
     )
     .await
     .expect_err("changed source identity must refuse resume before streaming");
@@ -637,9 +820,14 @@ async fn export_resume_refuses_mutated_source_without_new_artifacts() {
     ]];
     reader.push_pass(settings(), mutated, rules(), synonyms());
 
-    let error = resume_algolia_source(&store, &mut reader, &view.checkpoint_handle)
-        .await
-        .expect_err("a changed source identity must be refused");
+    let error = resume_algolia_source(
+        &store,
+        &mut reader,
+        &view.checkpoint_handle,
+        AsyncMigrationSourceProvider::Algolia,
+    )
+    .await
+    .expect_err("a changed source identity must be refused");
     assert!(matches!(
         error,
         ExportError::Spool(ref inner) if inner.kind() == SpoolErrorKind::SourceIdentityMismatch
@@ -670,9 +858,14 @@ async fn export_drift_during_streaming_fences_the_job() {
     drifted.updated_at = "2026-07-15T01:00:00Z".to_string();
     reader.push_quiescent(drifted);
 
-    let error = export_algolia_source(&store, Uuid::new_v4(), &mut reader)
-        .await
-        .expect_err("final metadata drift must be rejected");
+    let error = export_algolia_source(
+        &store,
+        Uuid::new_v4(),
+        &mut reader,
+        AsyncMigrationSourceProvider::Algolia,
+    )
+    .await
+    .expect_err("final metadata drift must be rejected");
     assert!(matches!(error, ExportError::Source(_)));
 
     // The fenced job is durably failed, never left apparently complete.
@@ -680,4 +873,93 @@ async fn export_drift_during_streaming_fences_the_job() {
     assert_eq!(uuids.len(), 1);
     let (public_handle, _) = store.handles(uuids[0]).unwrap();
     assert_eq!(store.public_view(&public_handle).unwrap().state, "Failed");
+}
+
+/// A fresh durable export refuses a reader whose provider is not the one the
+/// request context admitted, and refuses it before observing the source or
+/// binding a spool job.
+#[tokio::test]
+async fn fresh_export_refuses_a_reader_from_an_unexpected_provider() {
+    use crate::handlers::migration::algolia_client::AlgoliaErrorKind;
+    use crate::handlers::migration::spool::MigrationDisposition;
+
+    let tmp = TempDir::new().unwrap();
+    let store = store_at(tmp.path());
+    let mut reader = full_reader().reporting_provider(AsyncMigrationSourceProvider::Meilisearch);
+    let job_uuid = Uuid::new_v4();
+
+    let error = export_algolia_source(
+        &store,
+        job_uuid,
+        &mut reader,
+        AsyncMigrationSourceProvider::Algolia,
+    )
+    .await
+    .expect_err("a Meilisearch reader must not export under an Algolia admission");
+
+    match error {
+        ExportError::Source(inner) => {
+            assert_eq!(inner.kind(), AlgoliaErrorKind::Validation);
+            assert_eq!(
+                inner.safe_message(),
+                "Source export provider identity mismatch"
+            );
+        }
+        other => panic!("provider mismatch must surface as a source failure: {other:?}"),
+    }
+
+    // The source was never observed and no export was ever bound: the reader's
+    // scripted quiescence and traversal passes are all still pending.
+    assert_eq!(reader.quiescent_records.len(), 2);
+    assert_eq!(reader.settings_reads.len(), 2);
+    assert!(store.handles(job_uuid).is_err());
+    // The fresh run's durable phase is still settled, never left Running.
+    assert_eq!(
+        store.read_migration_phase(job_uuid).unwrap().disposition,
+        MigrationDisposition::Failed
+    );
+}
+
+/// Resume applies the same admission before claiming the checkpoint, so a
+/// mismatched provider can never take ownership of an interrupted job.
+#[tokio::test]
+async fn resume_refuses_a_reader_from_an_unexpected_provider_before_claiming() {
+    use crate::handlers::migration::algolia_client::AlgoliaErrorKind;
+
+    let tmp = TempDir::new().unwrap();
+    let store = store_at(tmp.path());
+    let (digest, denominators) = seed_digest().await;
+    let view = create_export_for_test(&store, uuid::Uuid::new_v4(), &digest, denominators).unwrap();
+    store.interrupt_export(view.job_uuid, &digest).unwrap();
+
+    let mut reader = full_reader().reporting_provider(AsyncMigrationSourceProvider::Typesense);
+    let error = resume_algolia_source(
+        &store,
+        &mut reader,
+        &view.checkpoint_handle,
+        AsyncMigrationSourceProvider::Algolia,
+    )
+    .await
+    .expect_err("a Typesense reader must not resume an Algolia-admitted job");
+
+    match error {
+        ExportError::Source(inner) => {
+            assert_eq!(inner.kind(), AlgoliaErrorKind::Validation);
+            assert_eq!(
+                inner.safe_message(),
+                "Source export provider identity mismatch"
+            );
+        }
+        other => panic!("provider mismatch must surface as a source failure: {other:?}"),
+    }
+
+    assert_eq!(reader.quiescent_records.len(), 2);
+    // The interrupted job was never claimed, so it stays resumable.
+    assert_eq!(
+        store
+            .checkpoint(&view.checkpoint_handle, &digest)
+            .unwrap()
+            .state,
+        "Interrupted"
+    );
 }

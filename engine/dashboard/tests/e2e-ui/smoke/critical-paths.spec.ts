@@ -16,11 +16,27 @@
  * - Catch: navigation bugs, layout issues, integration failures
  * - No hardcoded sleeps — use Playwright auto-waiting
  */
+import type { Locator, Page } from '@playwright/test';
 import { test, expect } from '../../fixtures/auth.fixture';
 import { deleteIndex } from '../../fixtures/api-helpers';
 import { TEST_INDEX } from '../helpers';
 
 const TEMP_INDEX = 'e2e-temp';
+
+async function goToOverviewPageContainingDeleteButton(
+  page: Page,
+  deleteButton: Locator,
+): Promise<void> {
+  while (await deleteButton.count() === 0) {
+    const nextBtn = page.getByRole('button', { name: /next/i });
+    if (await nextBtn.isEnabled()) {
+      await nextBtn.click();
+      await expect(nextBtn).toBeVisible({ timeout: 1000 });
+    } else {
+      break; // no more pages
+    }
+  }
+}
 
 // Keep this smoke case top-level so grep selectors avoid parent describe noise.
 // Playwright grep evaluates a composite title string (project + file + describe + test),
@@ -186,7 +202,7 @@ test.describe('Smoke Tests', () => {
       await expect(dialog.getByRole('heading', { name: 'Create Index' })).toBeVisible();
 
       // Fill in "e2e-temp" as the index name
-      await dialog.locator('#index-uid').fill(TEMP_INDEX);
+      await dialog.getByLabel('Index Name', { exact: true }).fill(TEMP_INDEX);
 
       // Submit the form — click the "Create Index" button
       await dialog.getByRole('button', { name: /create index/i }).click();
@@ -199,15 +215,7 @@ test.describe('Smoke Tests', () => {
 
       // The index list is paginated (10 per page). Navigate to the page containing the new index.
       const deleteBtn = page.getByTitle(`Delete index "${TEMP_INDEX}"`);
-      while (await deleteBtn.count() === 0) {
-        const nextBtn = page.getByRole('button', { name: /next/i });
-        if (await nextBtn.isEnabled()) {
-          await nextBtn.click();
-          await expect(nextBtn).toBeVisible({ timeout: 1000 });
-        } else {
-          break; // no more pages
-        }
-      }
+      await goToOverviewPageContainingDeleteButton(page, deleteBtn);
       await deleteBtn.click();
 
       // Confirm the deletion dialog

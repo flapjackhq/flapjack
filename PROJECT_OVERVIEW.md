@@ -1,6 +1,6 @@
 # Flapjack - Project Overview
 
-**Last updated:** 2026-07-31
+**Last updated:** 2026-08-04
 
 ## Mission
 
@@ -11,53 +11,81 @@ working while running as a single static binary with data stored on disk.
 
 ## Highest Priority
 
-Public paid beta is shipped. The current strategic order is:
+**Adoption status, stated once so no other document has to guess: Flapjack has no
+users and no customers.** Releases exist (`v1.0.10`, 2026-06-09) and the source is
+public, but nobody is running it in production, Flapjack Cloud is not live, and
+no revenue exists. Corrected 2026-08-02: an earlier commercial-adoption claim
+was false and had been propagating into risk arguments that assumed real
+workloads. Two consequences bind every planning
+decision below. **(1) Breaking changes are cheap** — there is no installed base
+to migrate, so prefer the correct design over the compatible one wherever they
+conflict, except on the Algolia-compatible wire surface, which is the product.
+**(2) Nothing is urgent because it is "in production" — the urgency is that we
+cannot yet honestly ask anyone to adopt it.** The bar is not "no known incidents";
+it is "we can prove the claims we make."
 
-1. **DUR-1 - rejected writes replay into the index after restart.** A batch
-   rejected to the client with HTTP `500` under disk exhaustion becomes visible
-   after restart, reproduced 5/5. This is the only known correctness defect on
-   `main`, and durability is the property the whole product rests on, so it
-   outranks everything below it. Owners and the smallest unblocking change are
-   in [`ROADMAP.md`](ROADMAP.md) row `DUR-1`.
-2. **Security Wave 1 remainder - SEC-G3 and SEC-G8.** Response headers / CSP,
-   the dashboard admin key in `localStorage`, and request timeout / concurrency
-   limit / panic containment. The rest of Wave 1 shipped on 2026-07-31; these
-   two were gated on `router.rs` and are now unblocked.
-3. **RF-4 - runbooks iteration.** Keep operational routing in
+The current strategic order is:
+
+1. **Security follow-through — the `SEC-W4` hygiene residuals.** The serving-path
+   security story has stopped being a capability question: HTTPS serves from
+   operator-supplied PEM files or from ACME-issued material that rotates on a
+   running listener without a restart, replication peers carry a mandatory
+   credential over non-cleartext transport, and the console holds no key material
+   in browser storage. What is left is hygiene, and it is small: a disposition for
+   the production moderate advisories sitting below the audit gate's
+   high-and-above threshold, and the plaintext tarball snapshot helpers
+   (`SEC-G5`), which have been carried unscheduled across four consecutive batches
+   and should get a lane or an explicit acceptance rather than a fifth roll
+   forward. Owner and exit: [`ROADMAP.md`](ROADMAP.md) row `SEC-W4`, which routes
+   the control-level gap detail.
+
+2. **RF-4 — runbooks iteration.** Keep operational routing in
    [`engine/docs2/3_IMPLEMENTATION/OPERATIONS.md`](engine/docs2/3_IMPLEMENTATION/OPERATIONS.md)
-   and continue folding incident learnings into the runbooks.
-4. **PL-10 - write-path saturation under sustained load.** The v1.0.4 batch-size
-   tuning knob and v1.0.5 `TUNABLE_VERIFIED` harness gate are shipped, but the
-   single-writer Tantivy ceiling remains the architectural constraint for v1.1.
-   The repaired July 26 reference contract now proves 1,000,000 compact and
-   1,000,000 standard records through every frozen text-search gate. Do not
-   profile the superseded July 25 liveness/latency failures as current product
-   defects; further scale work needs a new falsifiable question beyond the
-   verified floor. Current open work lives in [`ROADMAP.md`](ROADMAP.md), and
-   measured curves live only in
+   and keep folding incident learnings into the runbooks.
+
+3. **PL-10 — write-path saturation under sustained load.** The single-writer
+   Tantivy ceiling remains the architectural constraint for v1.1. The repaired
+   reference contract proves 1,000,000 compact records through the frozen
+   text-search gates; the 1,000,000 standard-record run reached a measured
+   facet-query p95 ceiling, not a published scale record. Further scale work
+   needs a *new falsifiable question* beyond the verified floor rather than
+   another run. Do not profile the superseded July 25 failures as current
+   defects. Owner and exit: [`ROADMAP.md`](ROADMAP.md) row `PL-10`; measured
+   curves live only in
    [`engine/loadtest/BENCHMARKS.md`](engine/loadtest/BENCHMARKS.md).
-5. **Post-ship HA/test-signal hygiene.** HA snapshot flake remediation is
-   verified, and the remaining signal-protection work is tracked in
+
+4. **Post-ship HA/test-signal hygiene.** HA snapshot flake remediation is
+   verified; remaining signal-protection work is tracked in
    [`ROADMAP.md`](ROADMAP.md).
-6. **Backend↔frontend joined proof (JOIN-1).** The 2026-07-30 matrix found 0 of
-   90 backend capability rows with a current passing joined proof. The
-   credential residual that blocked re-proof is resolved; the runner and
-   reporter residuals are not. The dashboard is frozen pending Svelte
-   replacement, so this is about honest proof and reporting, not new screens.
-7. **Migration deferred-scope follow-through.** Create-only import, fenced
-   existing-target overwrite, and interrupted-job resume are all shipped on the
-   synchronous and authenticated async Algolia paths as of 2026-07-31.
-   HA-converging import remains refused under [`ROADMAP.md`](ROADMAP.md) row
-   `MIG-7`. Pre-launch source migration is expanding to Meilisearch and
-   Typesense through one provider-neutral lifecycle; M0 contract/security work
-   must land before product adapters.
-8. **ADR-0005 OQ4 - cross-node failover idempotency dedup.** Node-local
-   restart-durable idempotency is shipped; cross-node dedup remains a v1.1
-   planned item.
+
+5. **Backend↔frontend joined proof (JOIN-1).** 90 backend capability rows, and
+   for three consecutive lanes zero of them had a current passing joined proof.
+   Two corrections landed 2026-08-03 and both must be inherited: **the joinable
+   denominator is 59, not 90** (27 rows are API-, config-, or CLI-only and four
+   more have no candidate spec, so `0 / 90` was unreachable by construction), and
+   **the number is now a command** rather than a hand audit — a Playwright `json`
+   reporter, a row→key manifest, and `engine/dashboard/scripts/join_proof_report.mjs`
+   make it a side effect of any full-suite run. **Policy reversal, 2026-08-02: the
+   React dashboard is no longer frozen and is not scheduled for replacement.** It
+   is the product's console and is maintained and extended like any other surface;
+   every "deferred to the Svelte console" disposition recorded before that date is
+   void. So this priority is both *proof* and *repair*.
+
+6. **Migration deferred-scope follow-through.** Create-only import, fenced
+   existing-target overwrite, and interrupted-job resume all ship on the
+   synchronous and authenticated async Algolia paths. HA-converging import stays
+   refused under [`ROADMAP.md`](ROADMAP.md) row `MIG-7`. Pre-launch source
+   migration is expanding to Meilisearch and Typesense through one
+   provider-neutral lifecycle; discovery ships for all three providers, and
+   resume remains Algolia-only.
+
+7. **ADR-0005 OQ4 — cross-node failover idempotency dedup.** Node-local
+   restart-durable idempotency ships; cross-node dedup remains a v1.1 planned
+   item.
 
 Release history and shipped-feature lineage stay in [`CHANGELOG.md`](CHANGELOG.md)
 and [`engine/docs2/FEATURES.md`](engine/docs2/FEATURES.md). `PROJECT_OVERVIEW.md`
-does not duplicate that status ledger.
+owns mission and priority order; it does not duplicate that status ledger.
 
 ## Scope
 

@@ -10,6 +10,9 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+#[path = "meilisearch_contract_tests/ranking_rules.rs"]
+mod ranking_rules;
+
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../tests/fixtures/2026_07_26_m0a_meilisearch_source_contract")
@@ -373,6 +376,254 @@ fn meilisearch_settings_map_only_proved_fields_with_applicable_warnings() {
     );
 }
 
+// Live specimen captured directly from the pinned image
+// `getmeili/meilisearch@sha256:9694a59d...` (pkgVersion 1.50.0) by GETting
+// `/indexes/configured_pk/settings` after applying the M0A fixture PATCH. The
+// GET response, unlike the PATCH body in the fixture file, always carries the
+// search-runtime defaults `facetSearch`, `prefixSearch`, and `searchCutoffMs`
+// and lowercases `typoTolerance.disableOnWords`. Preview translation receives
+// exactly this payload, so this is the known answer the live KAT proves.
+#[test]
+fn meilisearch_live_default_settings_specimen_accepts_prefix_search_and_cutoff() {
+    let live_specimen = json!({
+        "displayedAttributes": ["sku", "title", "category", "price", "color", "rank"],
+        "searchableAttributes": ["title", "category"],
+        "filterableAttributes": ["category", "color", "price"],
+        "sortableAttributes": ["price", "rank"],
+        "rankingRules": ["words", "typo", "proximity", "attributeRank", "sort", "wordPosition", "exactness"],
+        "stopWords": ["the"],
+        "nonSeparatorTokens": ["_"],
+        "separatorTokens": ["-"],
+        "dictionary": ["flapjack"],
+        "synonyms": {"saw": ["cutter"], "wrench": ["spanner"]},
+        "distinctAttribute": "sku",
+        "proximityPrecision": "byWord",
+        "typoTolerance": {
+            "enabled": true,
+            "minWordSizeForTypos": {"oneTypo": 5, "twoTypos": 9},
+            "disableOnWords": ["sku"],
+            "disableOnAttributes": ["sku"],
+            "disableOnNumbers": false
+        },
+        "faceting": {"maxValuesPerFacet": 25, "sortFacetValuesBy": {"*": "alpha"}},
+        "pagination": {"maxTotalHits": 50},
+        "embedders": {},
+        "searchCutoffMs": Value::Null,
+        "localizedAttributes": Value::Null,
+        "facetSearch": true,
+        "prefixSearch": "indexingTime"
+    });
+
+    let mut failures = Vec::new();
+    let mut warnings = Vec::new();
+    let translated = translate_settings_for_provider(
+        &live_specimen,
+        SettingsSourceProvider::Meilisearch,
+        &mut failures,
+        &mut warnings,
+    )
+    .expect("the live Meilisearch default settings specimen must translate");
+
+    assert!(failures.is_empty());
+    // The proven fields still map exactly as before; admitting the new defaults
+    // must not perturb the migrated output.
+    assert_eq!(translated.pagination_limited_to, 50);
+    assert_eq!(
+        translated.disable_typo_tolerance_on_words,
+        Some(vec!["sku".to_string()])
+    );
+
+    // Exact warning contract for the live GET response: `searchCutoffMs` is null
+    // (no semantic value, so no warning) and `disableOnWords` is already
+    // lowercase (no normalization warning), while `prefixSearch`/`facetSearch`
+    // and the lossy default `wordPosition` fold are surfaced as unmigrated.
+    // This is the settings portion the live KAT asserts inside the full preview
+    // code vector.
+    let warning_contract = warnings
+        .iter()
+        .map(|warning| (warning.code, warning.json_path.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        warning_contract,
+        vec![
+            (
+                ReportCode::MeilisearchDocumentOrderNotContractual,
+                "$.documents"
+            ),
+            (
+                ReportCode::MeilisearchSearchPaginationNotExportBound,
+                "$.pagination"
+            ),
+            (
+                ReportCode::MeilisearchSettingNotMigrated,
+                "$.rankingRules[5]"
+            ),
+            (ReportCode::MeilisearchSettingNotMigrated, "$.dictionary"),
+            (ReportCode::MeilisearchSettingNotMigrated, "$.facetSearch"),
+            (
+                ReportCode::MeilisearchSettingNotMigrated,
+                "$.nonSeparatorTokens"
+            ),
+            (ReportCode::MeilisearchSettingNotMigrated, "$.prefixSearch"),
+            (
+                ReportCode::MeilisearchSettingNotMigrated,
+                "$.proximityPrecision"
+            ),
+            (
+                ReportCode::MeilisearchSettingNotMigrated,
+                "$.sortableAttributes"
+            ),
+            (ReportCode::MeilisearchSettingNotMigrated, "$.stopWords"),
+        ]
+    );
+}
+
+// The pinned probe container (Meilisearch 1.50.0) returns a full default
+// settings object for a fresh index, with explicit `null` for unset scalars and
+// the 1.50 split ranking rules. This is the exact `/settings` GET body the live
+// probe migrates; it must translate with zero hard rejections or the migration
+// lands no data. Byte-copied from the probe's staged settings artifact so it
+// stays a real specimen, not a hand-approximated one.
+#[test]
+fn meilisearch_1_50_live_default_settings_translate_without_hard_rejection() {
+    let live_defaults = json!({
+        "dictionary": [],
+        "displayedAttributes": ["*"],
+        "distinctAttribute": Value::Null,
+        "embedders": {},
+        "facetSearch": true,
+        "faceting": {"maxValuesPerFacet": 100, "sortFacetValuesBy": {"*": "alpha"}},
+        "filterableAttributes": [],
+        "localizedAttributes": Value::Null,
+        "nonSeparatorTokens": [],
+        "pagination": {"maxTotalHits": 1000},
+        "prefixSearch": "indexingTime",
+        "proximityPrecision": "byWord",
+        "rankingRules": [
+            "words", "typo", "proximity", "attributeRank", "sort", "wordPosition", "exactness"
+        ],
+        "searchCutoffMs": Value::Null,
+        "searchableAttributes": ["*"],
+        "separatorTokens": [],
+        "sortableAttributes": [],
+        "stopWords": [],
+        "typoTolerance": {
+            "disableOnAttributes": [],
+            "disableOnNumbers": false,
+            "disableOnWords": [],
+            "enabled": true,
+            "minWordSizeForTypos": {"oneTypo": 5, "twoTypos": 9}
+        }
+    });
+
+    let mut failures = Vec::new();
+    let mut warnings = Vec::new();
+    let translated = translate_settings_for_provider(
+        &live_defaults,
+        SettingsSourceProvider::Meilisearch,
+        &mut failures,
+        &mut warnings,
+    )
+    .expect("live Meilisearch 1.50 default settings must translate without a hard rejection");
+
+    assert!(
+        failures.is_empty(),
+        "unexpected hard rejections: {failures:?}"
+    );
+    assert_eq!(
+        translated.ranking,
+        Some(vec![
+            "words".to_string(),
+            "typo".to_string(),
+            "proximity".to_string(),
+            "attribute".to_string(),
+            "custom".to_string(),
+            "exact".to_string(),
+        ]),
+    );
+    // A null `distinctAttribute` means "no distinct attribute", so it must not
+    // surface as `attributeForDistinct` in the translated payload.
+    assert_eq!(translated.attribute_for_distinct, None);
+    assert_eq!(translated.pagination_limited_to, 1000);
+}
+
+// Meilisearch >=1.50 (the pinned probe container is 1.50.0) splits the pre-1.50
+// `attribute` ranking rule into `attributeRank` (which attribute matched) and
+// `wordPosition` (position of matched words within the attribute). Flapjack can
+// preserve `attributeRank` under its `attribute` criterion but has no separate
+// `wordPosition` criterion, so the known vendor default remains admissible only
+// with an explicit lossy warning at the folded source rule.
+#[test]
+fn meilisearch_1_50_default_ranking_rules_fold_attribute_split_to_algolia_attribute() {
+    let mut failures = Vec::new();
+    let mut warnings = Vec::new();
+    let translated = translate_settings_for_provider(
+        &json!({
+            "rankingRules": [
+                "words", "typo", "proximity", "attributeRank", "sort", "wordPosition", "exactness"
+            ]
+        }),
+        SettingsSourceProvider::Meilisearch,
+        &mut failures,
+        &mut warnings,
+    )
+    .expect("Meilisearch 1.50 default ranking rules must translate");
+
+    assert!(failures.is_empty(), "unexpected failures: {failures:?}");
+    assert_eq!(
+        translated.ranking,
+        Some(vec![
+            "words".to_string(),
+            "typo".to_string(),
+            "proximity".to_string(),
+            "attribute".to_string(),
+            "custom".to_string(),
+            "exact".to_string(),
+        ]),
+    );
+    assert!(
+        warnings.iter().any(|warning| {
+            warning.code == ReportCode::MeilisearchSettingNotMigrated
+                && warning.json_path == "$.rankingRules[5]"
+        }),
+        "default wordPosition fold must be explicit: {warnings:?}"
+    );
+}
+
+// Admitting `prefixSearch`/`searchCutoffMs` must not weaken fail-closed
+// rejection: a value outside the vendor enum/type is still a MalformedSettings
+// failure at the offending path, not a silently accepted unknown field.
+#[test]
+fn meilisearch_prefix_search_and_cutoff_reject_out_of_contract_values() {
+    for (payload, expected_path) in [
+        (json!({"prefixSearch": "onDemand"}), "$.prefixSearch"),
+        (json!({"prefixSearch": true}), "$.prefixSearch"),
+        (json!({"searchCutoffMs": "150"}), "$.searchCutoffMs"),
+        (json!({"searchCutoffMs": -5}), "$.searchCutoffMs"),
+    ] {
+        let mut failures = Vec::new();
+        let mut warnings = Vec::new();
+        assert!(
+            translate_settings_for_provider(
+                &payload,
+                SettingsSourceProvider::Meilisearch,
+                &mut failures,
+                &mut warnings,
+            )
+            .is_none(),
+            "out-of-contract {expected_path} must fail closed"
+        );
+        assert_eq!(failures.len(), 1);
+        let failure = format!("{:?}", failures[0]);
+        assert!(failure.contains("MalformedSettingsPayload"));
+        assert!(
+            failure.contains(expected_path),
+            "failure {failure} must name {expected_path}"
+        );
+        assert!(warnings.is_empty());
+    }
+}
+
 #[test]
 fn meilisearch_unmapped_and_malformed_settings_are_explicit() {
     let mut failures = Vec::new();
@@ -469,9 +720,13 @@ async fn valid_meilisearch_fixture_admission_reaches_provider_neutral_snapshot_c
     let mut reader = MeilisearchSourceReader::from_source("configured_pk", source);
     let mut sink = RecordingSink::default();
 
-    let accepted = accept_source_export(&mut reader, &mut sink)
-        .await
-        .expect("the production adapter must satisfy the shared snapshot contract");
+    let accepted = accept_source_export(
+        AsyncMigrationSourceProvider::Meilisearch,
+        &mut reader,
+        &mut sink,
+    )
+    .await
+    .expect("the production adapter must satisfy the shared snapshot contract");
 
     assert_eq!(accepted.identity().document_metadata_count(), 3);
     assert_eq!(accepted.identity().snapshot().documents.count, 3);
@@ -484,24 +739,30 @@ async fn valid_meilisearch_fixture_admission_reaches_provider_neutral_snapshot_c
             vec!["SKU-003".to_string()]
         ]
     );
-    assert_eq!(sink.raw_document_pages[0][0]["sku"], "SKU-001");
-    assert_eq!(sink.raw_document_pages[0][0]["objectID"], "SKU-001");
+    // The neutral capture keeps the source payload verbatim and carries the
+    // normalized identity beside it as the stable ID.
+    assert_eq!(sink.raw_document_pages[0][0]["stableId"], "SKU-001");
+    assert_eq!(sink.raw_document_pages[0][0]["payload"]["sku"], "SKU-001");
+    assert_eq!(
+        sink.raw_document_pages[0][0]["payload"]["objectID"],
+        Value::Null
+    );
     assert_eq!(
         sink.synonym_pages,
         vec![vec![
-            "meilisearch:saw".to_string(),
-            "meilisearch:wrench".to_string()
+            "meilisearch:synonym:saw".to_string(),
+            "meilisearch:synonym:wrench".to_string()
         ]]
     );
     assert_eq!(
-        sink.raw_synonym_pages[0][0]["synonyms"],
-        json!(["saw", "cutter"])
+        sink.raw_synonym_pages[0][0],
+        json!({"stableId": "meilisearch:synonym:saw", "payload": {"saw": ["cutter"]}})
     );
     assert_eq!(
-        sink.raw_synonym_pages[0][1]["synonyms"],
-        json!(["wrench", "spanner"])
+        sink.raw_synonym_pages[0][1],
+        json!({"stableId": "meilisearch:synonym:wrench", "payload": {"wrench": ["spanner"]}})
     );
-    assert!(sink.raw_rule_pages.is_empty());
+    assert!(sink.raw_rule_pages.concat().is_empty());
 
     assert_serialized_omits_source_canaries(&serde_json::to_value(&sink.settings).unwrap());
     let debug = format!("{reader:?}\n{:?}", accepted.identity());

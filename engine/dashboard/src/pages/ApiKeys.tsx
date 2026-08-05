@@ -192,7 +192,7 @@ export function ApiKeys() {
                         Key Value
                       </div>
                       <div className="flex items-center gap-2">
-                        <code className="text-sm bg-muted px-2 py-1 rounded font-mono">
+                        <code className="text-sm bg-muted px-2 py-1 rounded font-mono" data-testid="api-key-value">
                           {key.value}
                         </code>
                         <Button
@@ -268,7 +268,7 @@ export function ApiKeys() {
                   <div className="text-sm font-medium mb-2">Permissions</div>
                   <div className="flex flex-wrap gap-2" data-testid="key-permissions">
                     {key.acl.map((permission) => (
-                      <Badge key={permission} variant="secondary">
+                      <Badge key={permission} variant="secondary" data-testid="key-permission">
                         {permission}
                       </Badge>
                     ))}

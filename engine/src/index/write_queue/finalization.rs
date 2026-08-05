@@ -31,10 +31,18 @@ pub(crate) struct FinalizationFaultGuard {
     tenant_id: String,
 }
 
+#[cfg(test)]
+impl FinalizationFaultGuard {
+    pub(crate) fn was_triggered(&self) -> bool {
+        !FINALIZATION_FAULTS.contains_key(&self.tenant_id)
+    }
+}
+
 #[cfg(any(test, feature = "fault-injection"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FinalizationFaultPoint {
     BeforeTantivyCommit,
+    DuringOplogAppendAfterPartialDurableWrite,
     AfterOplogAppendBeforeTantivyCommit,
     AfterTantivyCommitBeforeVersionReceipts,
     AfterFirstVersionReceiptStatement,
@@ -76,7 +84,7 @@ pub(crate) fn commit_is_in_progress_for_test(tenant_id: &str) -> bool {
 }
 
 #[cfg(any(test, feature = "fault-injection"))]
-pub(super) fn inject_finalization_fault(
+pub(crate) fn inject_finalization_fault(
     tenant_id: &str,
     fault_point: FinalizationFaultPoint,
 ) -> crate::error::Result<()> {
@@ -87,10 +95,18 @@ pub(super) fn inject_finalization_fault(
         return Ok(());
     }
     FINALIZATION_FAULTS.remove(tenant_id);
-    if fault_point == FinalizationFaultPoint::BeforeTantivyCommit {
-        return Err(crate::error::FlapjackError::Tantivy(
-            "injected write-queue commit failure".to_string(),
-        ));
+    match fault_point {
+        FinalizationFaultPoint::BeforeTantivyCommit => {
+            return Err(crate::error::FlapjackError::Tantivy(
+                "injected write-queue commit failure".to_string(),
+            ));
+        }
+        FinalizationFaultPoint::DuringOplogAppendAfterPartialDurableWrite => {
+            return Err(crate::error::FlapjackError::Io(
+                "injected oplog append I/O failure after partial durable write".to_string(),
+            ));
+        }
+        _ => {}
     }
     Err(crate::error::FlapjackError::Tantivy(format!(
         "injected write-queue finalization failure at {fault_point:?}"
@@ -195,9 +211,19 @@ pub(super) fn commit_writer_with_panic_guard(
 /// Publish all post-Tantivy state for a committed write batch.
 ///
 /// Per-object versions are committed in one SQLite transaction before the
-/// oplog watermark advances. Any error leaves admission records and task
-/// acknowledgements untouched so the tenant writer exits and recovery can
-/// replay the durable oplog receipts.
+/// oplog watermark advances.
+///
+/// This is the committed-post-Tantivy path, so an error here cannot retract the
+/// batch — its documents are already durable in the index. The caller
+/// ([`super::publish_committed_batch`]) therefore marks the batch's tasks
+/// terminal `Failed` and exits the tenant writer, while leaving the durable
+/// admission records in place. Only the pre-commit path compensates, via
+/// [`super::compensation::compensate_failed_commit_batch`].
+///
+/// Recovery is then idempotent re-application, not a blanket replay of oplog
+/// receipts: [`super::admission::reconcile_records`] re-drives a surviving
+/// admission record only when neither the advanced `committed_seq` nor the
+/// version store already reports its task as published.
 pub(super) fn finalize_committed_batch(
     context: &WriteFinalizationContext<'_>,
     prepared_ops: &[PreparedWriteOperation],

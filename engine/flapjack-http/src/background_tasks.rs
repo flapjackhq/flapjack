@@ -1,6 +1,7 @@
 use crate::handlers::migration::spool::{SpoolError, SpoolLimits, SpoolStore};
 use crate::handlers::AppState;
 use crate::server_init::InfrastructureState;
+use crate::ssl_background::{ssl_background_plan, ConfiguredSsl};
 use crate::tenant_dirs::{has_visible_tenant_dirs, visible_tenant_dir_names};
 use std::fmt;
 use std::future::Future;
@@ -279,7 +280,16 @@ async fn enforce_backup_retention(s3_config: &flapjack::index::s3::S3Config, ten
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(24);
-    let _ = flapjack::index::s3::enforce_retention(s3_config, tenant, retention).await;
+    match flapjack::index::s3::enforce_retention(s3_config, tenant, retention).await {
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(
+                tenant = tenant,
+                "[BACKUP] retention delete failed: {}",
+                error
+            );
+        }
+    }
 }
 
 /// Spawn all server background tasks, including analytics, replication, and maintenance loops.
@@ -371,11 +381,47 @@ fn run_migration_spool_gc_pass(store: &SpoolStore) -> Result<(), SpoolError> {
 }
 
 fn spawn_ssl_renewal(infrastructure: &InfrastructureState) {
-    if let Some(ssl_manager) = infrastructure.ssl_manager.as_ref() {
+    let plan = ssl_background_plan(
+        infrastructure
+            .managed_ssl
+            .as_ref()
+            .map(|configured| ConfiguredSsl {
+                manager: configured.manager.as_ref(),
+                material_dir: configured.material_dir.as_path(),
+            }),
+        infrastructure.tls_resolver.as_ref(),
+    );
+
+    if let Some(ssl_manager) = plan.renewal_manager {
         let ssl_manager = Arc::clone(ssl_manager);
         tokio::spawn(async move { ssl_manager.start_renewal_loop().await });
         tracing::info!("[SSL] Auto-renewal enabled (checks every 24h)");
     }
+
+    let Some(observer) = plan.material_observer else {
+        return;
+    };
+    let resolver = Arc::clone(observer.resolver);
+    let material_dir = observer.material_dir.to_path_buf();
+    let expiry_manager = observer.expiry_manager.map(Arc::clone);
+    tokio::spawn(async move {
+        crate::tls_serve::run_tls_material_observer(
+            resolver,
+            material_dir,
+            move || {
+                let expiry_manager = expiry_manager.clone();
+                async move {
+                    match expiry_manager {
+                        Some(ssl_manager) => ssl_manager.get_status().await.cert_expires_in_days,
+                        None => None,
+                    }
+                }
+            },
+            |_| {},
+        )
+        .await
+    });
+    tracing::info!("[TLS] Certificate material observer enabled");
 }
 
 /// Spawns background tasks for analytics rollup and retention cleanup.

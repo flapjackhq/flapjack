@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+#
+# Prove that the configured GHCR credential can PUSH to the release image
+# repository, before release.yml does anything irreversible.
+#
+# Why this exists: release.yml creates the git tag and the GitHub Release in the
+# `release` job, and only then reaches `docker_prepare` -> `docker_build_*`,
+# which are the first jobs to use `secrets.GHCR_TOKEN`. A credential that has
+# expired or lost `write:packages` is therefore discovered *after* the release
+# is public, leaving a half-release: binaries published, container images
+# missing, tag already cut. Running this as its own job gated only on version
+# validation moves that discovery to ~30 seconds in, while the run is still free
+# to fail with no public trace.
+#
+# Why not just `docker login`: a login succeeds for a read-only credential. The
+# publish jobs need push. This performs the Docker Registry v2 auth handshake
+# and then opens a blob upload session, which the registry grants only to a
+# credential that is actually authorized to write to this repository.
+#
+# Nothing is published. Opening an upload session allocates a server-side
+# session id; no blob data is ever sent (no PATCH, no PUT), so no layer, tag, or
+# manifest is created. GHCR answers DELETE on an upload session with 405, so the
+# session is left to expire on its own — it is unreferenced and invisible in the
+# package.
+#
+# What this does NOT cover: it proves credential capability only. A green
+# preflight says nothing about whether the image builds, whether the runner has
+# disk, or whether the registry is rate-limiting later in the run. Do not read
+# it as "the Docker jobs will succeed".
+#
+# Usage:
+#   package/ghcr_publish_preflight <image-repository>
+#
+# Environment:
+#   GHCR_USERNAME  required  registry user (GitHub actor)
+#   GHCR_TOKEN     required  credential under test
+#   GHCR_REGISTRY  optional  registry base URL, default https://ghcr.io
+#                            (tests point this at a local fake registry)
+#
+# Exit codes are distinct so callers and tests can assert *why* it failed:
+#   0  credential proved push capability
+#   1  usage error
+#   2  a required credential is missing or empty
+#   3  the registry would not mint a scoped bearer token
+#   4  the registry refused the push-capability probe
+
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  package/ghcr_publish_preflight <image-repository>
+
+Proves GHCR_TOKEN can push to <image-repository> (e.g. flapjackhq/flapjack)
+without publishing anything.
+EOF
+}
+
+# Exits with a specific code so the caller can distinguish a missing credential
+# from a live credential that lacks push.
+fail_with() {
+  local code="$1"
+  shift
+  printf 'ghcr_publish_preflight: %s\n' "$*" >&2
+  exit "$code"
+}
+
+if [ "$#" -ne 1 ] || [ -z "${1:-}" ]; then
+  usage
+  fail_with 1 "expected exactly one image repository argument"
+fi
+
+IMAGE_REPOSITORY="$1"
+GHCR_REGISTRY="${GHCR_REGISTRY:-https://ghcr.io}"
+GHCR_REGISTRY="${GHCR_REGISTRY%/}"
+
+[ -n "${GHCR_USERNAME:-}" ] || fail_with 2 "GHCR_USERNAME is empty — refusing to report healthy on an absent credential"
+[ -n "${GHCR_TOKEN:-}" ] || fail_with 2 "GHCR_TOKEN is empty — refusing to report healthy on an absent credential"
+
+# The registry's `service` parameter is its own hostname.
+REGISTRY_SERVICE="${GHCR_REGISTRY#*://}"
+REGISTRY_SERVICE="${REGISTRY_SERVICE%%/*}"
+REGISTRY_SERVICE="${REGISTRY_SERVICE%%:*}"
+
+TOKEN_URL="${GHCR_REGISTRY}/token?service=${REGISTRY_SERVICE}&scope=repository:${IMAGE_REPOSITORY}:pull,push"
+UPLOAD_URL="${GHCR_REGISTRY}/v2/${IMAGE_REPOSITORY}/blobs/uploads/"
+
+# Body and status are fetched together; a transport failure (DNS, refused
+# connection, timeout) is an indeterminate result and must fail, never pass.
+#
+# curl's own stderr is deliberately NOT suppressed: `-S` exists to print the
+# real cause (DNS vs TLS vs refused), and discarding it would leave a failed
+# release run saying only "could not reach". Nothing secret is on that channel —
+# the credential travels in `-u`, and curl does not echo request headers or
+# credentials without `-v`.
+#
+# No `--retry`: a transient blip here fails the run BEFORE anything is
+# published, so re-dispatching is free. Retry logic would buy nothing and would
+# slow the unreachable-registry contract case.
+if ! token_response="$(curl -sS --max-time 30 -w $'\n%{http_code}' \
+  -u "${GHCR_USERNAME}:${GHCR_TOKEN}" "$TOKEN_URL")"; then
+  fail_with 3 "could not reach the registry token endpoint at ${GHCR_REGISTRY}"
+fi
+
+token_status="${token_response##*$'\n'}"
+token_body="${token_response%$'\n'*}"
+
+if [ "$token_status" != "200" ]; then
+  fail_with 3 "registry token endpoint returned HTTP ${token_status} for ${IMAGE_REPOSITORY}"
+fi
+
+# GHCR answers 200 with no `token` field for a credential it will not scope, so
+# the status alone is not proof — the field has to be present and non-empty.
+bearer_token="$(printf '%s' "$token_body" | python3 -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except (ValueError, TypeError):
+    payload = {}
+token = payload.get("token") or ""
+sys.stdout.write(token if isinstance(token, str) else "")
+')"
+
+if [ -z "$bearer_token" ]; then
+  fail_with 3 "registry issued no bearer token for ${IMAGE_REPOSITORY} — the credential is expired, revoked, or unscoped"
+fi
+
+# NEVER print $bearer_token. GHCR's token endpoint returns the supplied
+# credential base64-encoded rather than a signed JWT, so the bearer is
+# credential-equivalent and trivially reversible. GitHub's log masking only
+# knows the literal secret, so it would NOT redact this encoded form. Do not add
+# `set -x`, `echo`, or `-v` to this script.
+if ! upload_status="$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' \
+  -X POST -H "Authorization: Bearer ${bearer_token}" "$UPLOAD_URL")"; then
+  fail_with 4 "could not reach the blob upload endpoint at ${GHCR_REGISTRY}"
+fi
+
+# 202 Accepted is the registry granting an upload session, which it does only
+# for a credential authorized to write this repository.
+if [ "$upload_status" != "202" ]; then
+  fail_with 4 "registry refused a push session for ${IMAGE_REPOSITORY} (HTTP ${upload_status}) — the credential cannot publish images"
+fi
+
+printf 'ghcr_publish_preflight: %s can be pushed to with the configured credential\n' "$IMAGE_REPOSITORY"

@@ -13,6 +13,8 @@ use support::{flapjack_cmd, http_request_with_headers, RunningServer, TempDir};
 
 const FLAPJACK_API_KEY: &str = "fj_stage2_admin_secret";
 const ALGOLIA_API_KEY: &str = "algolia_stage2_source_secret";
+const SOURCE_API_KEY: &str = "provider_stage1_source_secret";
+const ALGOLIA_TEST_BASE_URL_ENV: &str = "FLAPJACK_TEST_ALGOLIA_BASE_URL";
 const JOB_ID: &str = "01890f8e-8b28-78e8-b542-8cfdcb2d4f24";
 const EXIT_CONFIG: i32 = 2;
 const EXIT_HTTP_REJECTION: i32 = 3;
@@ -21,6 +23,44 @@ const EXIT_FAILED_JOB: i32 = 5;
 const EXIT_CANCELLED_JOB: i32 = 6;
 const EXIT_CANCEL_TOO_LATE: i32 = 7;
 const EXIT_ACK_TOO_EARLY: i32 = 8;
+
+struct UnresponsiveAlgoliaFixture {
+    _listener: TcpListener,
+    endpoint: String,
+}
+
+impl UnresponsiveAlgoliaFixture {
+    fn start() -> Self {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind unresponsive Algolia source fixture");
+        let endpoint = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("unresponsive Algolia fixture address")
+        );
+        Self {
+            _listener: listener,
+            endpoint,
+        }
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+}
+
+fn spawn_auth_server_with_algolia_fixture(data_dir: &str, fixture_endpoint: &str) -> RunningServer {
+    RunningServer::spawn_auth_auto_port_with_env(
+        data_dir,
+        &[(ALGOLIA_TEST_BASE_URL_ENV, fixture_endpoint)],
+    )
+}
+
+#[test]
+fn startup_timeout_reaps_child_before_running_server_exists() {
+    support::assert_startup_timeout_reaps_child_before_running_server_exists();
+}
 
 #[test]
 fn migrate_subcommand_never_starts_server_or_binds_listener() {
@@ -116,9 +156,210 @@ fn migrate_submits_expected_body_and_reports_terminal_success() {
 }
 
 #[test]
+fn default_provider_submits_the_unchanged_algolia_payload() {
+    let server = FakeMigrationServer::start(vec![StubResponse::json(
+        202,
+        migration_status("submitted", "succeeded"),
+    )]);
+
+    migrate_cmd(server.endpoint()).assert().success();
+
+    let request = server.take_requests(1).remove(0);
+    assert_provider_submit_request(
+        &request,
+        "/1/migrations/algolia",
+        json!({
+            "appId": "UNREACHABLESTAGE2",
+            "apiKey": ALGOLIA_API_KEY,
+            "sourceIndex": "products",
+            "overwrite": false
+        }),
+    );
+}
+
+#[test]
+fn algolia_key_flag_aliases_still_submit_the_algolia_payload() {
+    let key_file_dir = TempDir::new("migrate_algolia_key_alias_file");
+    let key_file = key_file_dir.root().join("source_key");
+    std::fs::write(&key_file, ALGOLIA_API_KEY).expect("write source key fixture");
+
+    for alias in [
+        "--algolia-key-env",
+        "--algolia-key-file",
+        "--algolia-key-stdin",
+    ] {
+        let server = FakeMigrationServer::start(vec![StubResponse::json(
+            202,
+            migration_status("submitted", "succeeded"),
+        )]);
+        let mut command = flapjack_cmd();
+        command.arg("migrate");
+        add_flapjack_auth_args(&mut command, server.endpoint(), FLAPJACK_API_KEY);
+        command
+            .arg("--app-id")
+            .arg("UNREACHABLESTAGE2")
+            .arg("--source-index")
+            .arg("products")
+            .arg(alias);
+
+        match alias {
+            "--algolia-key-env" => {
+                command
+                    .arg("FJ_MIGRATE_TEST_ALGOLIA_KEY")
+                    .env("FJ_MIGRATE_TEST_ALGOLIA_KEY", ALGOLIA_API_KEY);
+            }
+            "--algolia-key-file" => {
+                command.arg(&key_file);
+            }
+            "--algolia-key-stdin" => {
+                command.write_stdin(ALGOLIA_API_KEY);
+            }
+            _ => unreachable!("closed alias table"),
+        }
+
+        command.assert().success();
+        let request = server.take_requests(1).remove(0);
+        assert_provider_submit_request(
+            &request,
+            "/1/migrations/algolia",
+            json!({
+                "appId": "UNREACHABLESTAGE2",
+                "apiKey": ALGOLIA_API_KEY,
+                "sourceIndex": "products",
+                "overwrite": false
+            }),
+        );
+    }
+}
+
+#[test]
+fn migrate_submits_meilisearch_payload_to_meilisearch_route() {
+    let server = FakeMigrationServer::start(vec![StubResponse::json(
+        202,
+        migration_status("submitted", "succeeded"),
+    )]);
+
+    migrate_cmd_for_provider(
+        server.endpoint(),
+        "meilisearch",
+        "https://tenant.meilisearch.io",
+        SOURCE_API_KEY,
+    )
+    .assert()
+    .success();
+
+    let request = server.take_requests(1).remove(0);
+    assert_provider_submit_request(
+        &request,
+        "/1/migrations/meilisearch",
+        json!({
+            "endpoint": "https://tenant.meilisearch.io",
+            "apiKey": SOURCE_API_KEY,
+            "sourceIndex": "products",
+            "overwrite": false
+        }),
+    );
+}
+
+#[test]
+fn migrate_submits_typesense_payload_to_typesense_route() {
+    let server = FakeMigrationServer::start(vec![StubResponse::json(
+        202,
+        migration_status("submitted", "succeeded"),
+    )]);
+
+    migrate_cmd_for_provider(
+        server.endpoint(),
+        "typesense",
+        "https://tenant.typesense.net",
+        SOURCE_API_KEY,
+    )
+    .assert()
+    .success();
+
+    let request = server.take_requests(1).remove(0);
+    assert_provider_submit_request(
+        &request,
+        "/1/migrations/typesense",
+        json!({
+            "node": "https://tenant.typesense.net",
+            "apiKey": SOURCE_API_KEY,
+            "sourceIndex": "products",
+            "overwrite": false
+        }),
+    );
+}
+
+#[test]
+fn migrate_polls_status_on_the_selected_provider_route() {
+    let server = FakeMigrationServer::start(vec![
+        StubResponse::json(202, migration_status("submitted", "running")),
+        StubResponse::json(200, migration_status("activating", "succeeded")),
+    ]);
+
+    migrate_cmd_for_provider(
+        server.endpoint(),
+        "meilisearch",
+        "https://tenant.meilisearch.io",
+        SOURCE_API_KEY,
+    )
+    .assert()
+    .success();
+
+    let requests = server.take_requests(2);
+    assert_eq!(requests[1].method, "GET");
+    assert_eq!(
+        requests[1].path,
+        format!("/1/migrations/meilisearch/{JOB_ID}")
+    );
+    assert_migration_request_headers(&requests[1]);
+}
+
+#[test]
+fn cancel_and_ack_use_the_selected_provider_route() {
+    let cancel_server = FakeMigrationServer::start(vec![StubResponse::json(
+        200,
+        migration_status("cancel_requested", "running"),
+    )]);
+    migrate_action_cmd_for_provider(
+        cancel_server.endpoint(),
+        "cancel",
+        JOB_ID,
+        FLAPJACK_API_KEY,
+        "typesense",
+    )
+    .assert()
+    .success();
+
+    let ack_server = FakeMigrationServer::start(vec![StubResponse::text(204, String::new())]);
+    migrate_action_cmd_for_provider(
+        ack_server.endpoint(),
+        "ack",
+        JOB_ID,
+        FLAPJACK_API_KEY,
+        "typesense",
+    )
+    .assert()
+    .success();
+
+    assert_action_requests(
+        cancel_server.take_requests(1),
+        &format!("/1/migrations/typesense/{JOB_ID}/cancel"),
+    );
+    assert_action_requests(
+        ack_server.take_requests(1),
+        &format!("/1/migrations/typesense/{JOB_ID}/acknowledge"),
+    );
+}
+
+#[test]
 fn migrate_exits_nonzero_and_names_the_server_error_on_failed_job() {
     let data = TempDir::new("migrate_failed_real_server");
-    let server = RunningServer::spawn_auth_auto_port(data.path());
+    let source_fixture = FakeMigrationServer::start(vec![StubResponse::text(
+        500,
+        "source fixture failure".to_string(),
+    )]);
+    let server = spawn_auth_server_with_algolia_fixture(data.path(), &source_fixture.endpoint());
     let admin_key = std::fs::read_to_string(data.root().join(".admin_key"))
         .expect("auth server should persist its admin key");
 
@@ -143,6 +384,80 @@ fn migrate_exits_nonzero_and_names_the_server_error_on_failed_job() {
     assert!(!combined.contains("objectsImported"));
     assert!(!combined.contains("synonymsImported"));
     assert!(!combined.contains("rulesImported"));
+}
+
+#[test]
+fn real_server_rejects_non_vendor_meilisearch_endpoint() {
+    let data = TempDir::new("migrate_meilisearch_rejection_real_server");
+    let server = RunningServer::spawn_auth_auto_port(data.path());
+    let admin_key = std::fs::read_to_string(data.root().join(".admin_key"))
+        .expect("auth server should persist its admin key");
+
+    let mut command = flapjack_cmd();
+    command.arg("migrate");
+    add_flapjack_auth_args(
+        &mut command,
+        format!("http://{}", server.bind_addr()),
+        admin_key.trim(),
+    );
+    let output = command
+        .arg("--source-provider")
+        .arg("meilisearch")
+        .arg("--source-endpoint")
+        .arg("https://offline.invalid")
+        .arg("--source-key-env")
+        .arg("FJ_MIGRATE_TEST_SOURCE_KEY")
+        .arg("--source-index")
+        .arg("products")
+        .arg("--json")
+        .env("FJ_MIGRATE_TEST_SOURCE_KEY", SOURCE_API_KEY)
+        .assert()
+        .code(EXIT_HTTP_REJECTION)
+        .get_output()
+        .clone();
+
+    assert_json_http_rejection(
+        &output,
+        "migration submission returned HTTP 400: {\"message\":\"Meilisearch Cloud endpoint is not allowed\",\"status\":400}",
+    );
+    assert_secrets_absent(&output, &[admin_key.trim(), SOURCE_API_KEY]);
+}
+
+#[test]
+fn real_server_rejects_non_vendor_typesense_endpoint() {
+    let data = TempDir::new("migrate_typesense_rejection_real_server");
+    let server = RunningServer::spawn_auth_auto_port(data.path());
+    let admin_key = std::fs::read_to_string(data.root().join(".admin_key"))
+        .expect("auth server should persist its admin key");
+
+    let mut command = flapjack_cmd();
+    command.arg("migrate");
+    add_flapjack_auth_args(
+        &mut command,
+        format!("http://{}", server.bind_addr()),
+        admin_key.trim(),
+    );
+    let output = command
+        .arg("--source-provider")
+        .arg("typesense")
+        .arg("--source-endpoint")
+        .arg("https://offline.invalid")
+        .arg("--source-key-env")
+        .arg("FJ_MIGRATE_TEST_SOURCE_KEY")
+        .arg("--source-index")
+        .arg("products")
+        .arg("--json")
+        .env("FJ_MIGRATE_TEST_SOURCE_KEY", SOURCE_API_KEY)
+        .assert()
+        .code(EXIT_HTTP_REJECTION)
+        .get_output()
+        .clone();
+
+    assert_json_http_rejection(
+        &output,
+        "migration submission returned HTTP 400: {\"message\":\"Typesense Cloud endpoint is not allowed\",\"status\":400}",
+    );
+    assert_secrets_absent(&output, &[admin_key.trim(), SOURCE_API_KEY]);
 }
 
 #[test]
@@ -443,9 +758,113 @@ fn migrate_rejects_remote_http_endpoint_before_sending_secrets() {
 }
 
 #[test]
+fn provider_connection_flags_are_mutually_exclusive() {
+    let cases = [
+        ConfigRefusalCase {
+            provider: None,
+            app_id: None,
+            source_endpoint: None,
+            expected_message: "--app-id is required for submission",
+        },
+        ConfigRefusalCase {
+            provider: None,
+            app_id: Some("UNREACHABLESTAGE1"),
+            source_endpoint: Some("https://tenant.meilisearch.io"),
+            expected_message: "--source-endpoint is not valid with --source-provider algolia",
+        },
+        ConfigRefusalCase {
+            provider: Some("meilisearch"),
+            app_id: Some("UNREACHABLESTAGE1"),
+            source_endpoint: Some("https://tenant.meilisearch.io"),
+            expected_message: "--app-id is not valid with --source-provider meilisearch",
+        },
+        ConfigRefusalCase {
+            provider: Some("typesense"),
+            app_id: Some("UNREACHABLESTAGE1"),
+            source_endpoint: Some("https://tenant.typesense.net"),
+            expected_message: "--app-id is not valid with --source-provider typesense",
+        },
+        ConfigRefusalCase {
+            provider: Some("meilisearch"),
+            app_id: None,
+            source_endpoint: None,
+            expected_message: "--source-endpoint is required for a meilisearch submission",
+        },
+        ConfigRefusalCase {
+            provider: Some("typesense"),
+            app_id: None,
+            source_endpoint: None,
+            expected_message: "--source-endpoint is required for a typesense submission",
+        },
+    ];
+
+    for case in cases {
+        let output = migrate_config_refusal_cmd(case)
+            .assert()
+            .code(EXIT_CONFIG)
+            .get_output()
+            .clone();
+        let report: Value =
+            serde_json::from_slice(&output.stdout).expect("JSON local configuration failure");
+        assert_eq!(report["errorType"], json!("config"), "{case:?}");
+        assert_eq!(report["exitCode"], json!(EXIT_CONFIG), "{case:?}");
+        assert_eq!(report["message"], json!(case.expected_message), "{case:?}");
+    }
+}
+
+#[test]
+fn source_endpoint_validation_is_syntactic_only() {
+    let cases = [
+        (
+            "://missing-scheme",
+            "invalid --source-endpoint",
+            "malformed URL should name the source endpoint flag",
+        ),
+        (
+            "ftp://example.com",
+            "--source-endpoint must be an absolute http or https URL",
+            "non-http scheme should be refused locally",
+        ),
+        (
+            "https://",
+            "invalid --source-endpoint",
+            "missing host should be refused locally",
+        ),
+    ];
+
+    for (source_endpoint, expected_message, label) in cases {
+        let output = migrate_cmd_for_provider(
+            "http://127.0.0.1:1".to_string(),
+            "meilisearch",
+            source_endpoint,
+            SOURCE_API_KEY,
+        )
+        .arg("--json")
+        .assert()
+        .code(EXIT_CONFIG)
+        .get_output()
+        .clone();
+        let report: Value =
+            serde_json::from_slice(&output.stdout).expect("JSON local configuration failure");
+        assert_eq!(report["errorType"], json!("config"), "{label}");
+        assert_eq!(report["exitCode"], json!(EXIT_CONFIG), "{label}");
+        assert!(
+            report["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(expected_message)),
+            "{label}: {report}"
+        );
+    }
+}
+
+#[test]
 fn actions_reject_every_submit_only_flag() {
     let submit_only_arguments: &[(&str, &[&str])] = &[
         ("--app-id", &["UNREACHABLESTAGE3"]),
+        ("--source-endpoint", &["https://tenant.meilisearch.io"]),
+        ("--source-key-env", &["FJ_MIGRATE_TEST_ALGOLIA_KEY"]),
+        ("--source-key-file", &["unused_algolia_key_file"]),
+        ("--source-key-stdin", &[]),
         ("--algolia-key-env", &["FJ_MIGRATE_TEST_ALGOLIA_KEY"]),
         ("--algolia-key-file", &["unused_algolia_key_file"]),
         ("--algolia-key-stdin", &[]),
@@ -491,7 +910,8 @@ fn actions_reject_every_submit_only_flag() {
 #[test]
 fn cancel_of_a_real_owned_job_succeeds_without_stub_transport() {
     let data = TempDir::new("migrate_cancel_real_server");
-    let server = RunningServer::spawn_auth_auto_port(data.path());
+    let source_fixture = UnresponsiveAlgoliaFixture::start();
+    let server = spawn_auth_server_with_algolia_fixture(data.path(), source_fixture.endpoint());
     let admin_key = std::fs::read_to_string(data.root().join(".admin_key"))
         .expect("auth server should persist its admin key");
     let request_body = json!({
@@ -549,6 +969,120 @@ fn cancel_of_a_real_owned_job_succeeds_without_stub_transport() {
 }
 
 #[test]
+fn real_server_wrong_provider_cancel_is_not_found_before_mutation() {
+    let data = TempDir::new("migrate_wrong_provider_cancel_real_server");
+    let source_fixture = UnresponsiveAlgoliaFixture::start();
+    let server = spawn_auth_server_with_algolia_fixture(data.path(), source_fixture.endpoint());
+    let admin_key = std::fs::read_to_string(data.root().join(".admin_key"))
+        .expect("auth server should persist its admin key");
+    let request_body = json!({
+        "appId": "UNREACHABLESTAGE3",
+        "apiKey": "algolia_stage3_test_key",
+        "sourceIndex": "products",
+        "overwrite": false
+    })
+    .to_string();
+    let headers = [
+        ("x-algolia-application-id", "test-owner"),
+        ("x-algolia-api-key", admin_key.trim()),
+    ];
+    let admission = http_request_with_headers(
+        server.bind_addr(),
+        "POST",
+        "/1/migrations/algolia",
+        &headers,
+        Some(&request_body),
+    )
+    .expect("direct migration admission should return an HTTP response");
+    assert_eq!(
+        admission.status, 202,
+        "direct migration admission failed: {}",
+        admission.body
+    );
+    let admission_body: Value =
+        serde_json::from_str(&admission.body).expect("migration admission JSON");
+    let job_id = admission_body["jobId"]
+        .as_str()
+        .expect("migration admission must return jobId");
+
+    let output = migrate_action_cmd_for_provider(
+        format!("http://{}", server.bind_addr()),
+        "cancel",
+        job_id,
+        admin_key.trim(),
+        "typesense",
+    )
+    .arg("--json")
+    .assert()
+    .code(EXIT_HTTP_REJECTION)
+    .get_output()
+    .clone();
+
+    assert_json_http_rejection(
+        &output,
+        "migration cancellation returned HTTP 404: code=migration_job_not_found status=404 message=Migration job not found",
+    );
+    assert_secrets_absent(&output, &[admin_key.trim()]);
+}
+
+#[test]
+fn real_server_wrong_provider_ack_is_not_found_before_mutation() {
+    let data = TempDir::new("migrate_wrong_provider_ack_real_server");
+    let source_fixture = UnresponsiveAlgoliaFixture::start();
+    let server = spawn_auth_server_with_algolia_fixture(data.path(), source_fixture.endpoint());
+    let admin_key = std::fs::read_to_string(data.root().join(".admin_key"))
+        .expect("auth server should persist its admin key");
+    let request_body = json!({
+        "appId": "UNREACHABLESTAGE3",
+        "apiKey": "algolia_stage3_test_key",
+        "sourceIndex": "products",
+        "overwrite": false
+    })
+    .to_string();
+    let headers = [
+        ("x-algolia-application-id", "test-owner"),
+        ("x-algolia-api-key", admin_key.trim()),
+    ];
+    let admission = http_request_with_headers(
+        server.bind_addr(),
+        "POST",
+        "/1/migrations/algolia",
+        &headers,
+        Some(&request_body),
+    )
+    .expect("direct migration admission should return an HTTP response");
+    assert_eq!(
+        admission.status, 202,
+        "direct migration admission failed: {}",
+        admission.body
+    );
+    let admission_body: Value =
+        serde_json::from_str(&admission.body).expect("migration admission JSON");
+    let job_id = admission_body["jobId"]
+        .as_str()
+        .expect("migration admission must return jobId");
+
+    let output = migrate_action_cmd_for_provider(
+        format!("http://{}", server.bind_addr()),
+        "ack",
+        job_id,
+        admin_key.trim(),
+        "typesense",
+    )
+    .arg("--json")
+    .assert()
+    .code(EXIT_HTTP_REJECTION)
+    .get_output()
+    .clone();
+
+    assert_json_http_rejection(
+        &output,
+        "migration acknowledgement returned HTTP 404: code=migration_job_not_found status=404 message=Migration job not found",
+    );
+    assert_secrets_absent(&output, &[admin_key.trim()]);
+}
+
+#[test]
 fn migrate_never_accepts_a_secret_as_an_argv_value() {
     let help = flapjack_cmd()
         .arg("migrate")
@@ -563,6 +1097,9 @@ fn migrate_never_accepts_a_secret_as_an_argv_value() {
         "--api-key-env",
         "--api-key-file",
         "--api-key-stdin",
+        "--source-key-env",
+        "--source-key-file",
+        "--source-key-stdin",
         "--algolia-key-env",
         "--algolia-key-file",
         "--algolia-key-stdin",
@@ -575,9 +1112,13 @@ fn migrate_never_accepts_a_secret_as_an_argv_value() {
     assert!(!help
         .lines()
         .any(|line| line.trim_start().starts_with("--algolia-key ")));
+    assert!(!help
+        .lines()
+        .any(|line| line.trim_start().starts_with("--source-key ")));
 
     for (flag, secret) in [
         ("--api-key", FLAPJACK_API_KEY),
+        ("--source-key", SOURCE_API_KEY),
         ("--algolia-key", ALGOLIA_API_KEY),
     ] {
         flapjack_cmd()
@@ -596,6 +1137,16 @@ fn migrate_never_accepts_a_secret_as_an_argv_value() {
         .write_stdin("one-secret-stream")
         .assert()
         .code(2);
+    flapjack_cmd()
+        .args(
+            "migrate --endpoint http://127.0.0.1:1 --source-provider meilisearch \
+             --source-endpoint https://tenant.meilisearch.io --source-index products \
+             --api-key-stdin --source-key-stdin"
+                .split_whitespace(),
+        )
+        .write_stdin("one-secret-stream")
+        .assert()
+        .code(2);
 
     let server = FakeMigrationServer::start(vec![StubResponse::text(
         403,
@@ -609,6 +1160,25 @@ fn migrate_never_accepts_a_secret_as_an_argv_value() {
     let combined = combined_output(&output);
     assert!(!combined.contains(FLAPJACK_API_KEY));
     assert!(!combined.contains(ALGOLIA_API_KEY));
+    assert!(combined.contains("[REDACTED]"));
+
+    let server = FakeMigrationServer::start(vec![StubResponse::text(
+        403,
+        format!("credentials {FLAPJACK_API_KEY} and {SOURCE_API_KEY} rejected"),
+    )]);
+    let output = migrate_cmd_for_provider(
+        server.endpoint(),
+        "meilisearch",
+        "https://tenant.meilisearch.io",
+        SOURCE_API_KEY,
+    )
+    .assert()
+    .code(EXIT_HTTP_REJECTION)
+    .get_output()
+    .clone();
+    let combined = combined_output(&output);
+    assert!(!combined.contains(FLAPJACK_API_KEY));
+    assert!(!combined.contains(SOURCE_API_KEY));
     assert!(combined.contains("[REDACTED]"));
 }
 
@@ -635,6 +1205,28 @@ fn migrate_cmd_with_key(
     command
 }
 
+fn migrate_cmd_for_provider(
+    endpoint: String,
+    provider: &str,
+    source_endpoint: &str,
+    source_api_key: &str,
+) -> assert_cmd::Command {
+    let mut command = flapjack_cmd();
+    command.arg("migrate");
+    add_flapjack_auth_args(&mut command, endpoint, FLAPJACK_API_KEY);
+    command
+        .arg("--source-provider")
+        .arg(provider)
+        .arg("--source-endpoint")
+        .arg(source_endpoint)
+        .arg("--source-key-env")
+        .arg("FJ_MIGRATE_TEST_SOURCE_KEY")
+        .arg("--source-index")
+        .arg("products")
+        .env("FJ_MIGRATE_TEST_SOURCE_KEY", source_api_key);
+    command
+}
+
 fn migrate_action_cmd_with_key(
     endpoint: String,
     action: &str,
@@ -648,6 +1240,53 @@ fn migrate_action_cmd_with_key(
         .arg("--job-id")
         .arg(job_id);
     add_flapjack_auth_args(&mut command, endpoint, flapjack_api_key);
+    command
+}
+
+fn migrate_action_cmd_for_provider(
+    endpoint: String,
+    action: &str,
+    job_id: &str,
+    flapjack_api_key: &str,
+    provider: &str,
+) -> assert_cmd::Command {
+    let mut command = migrate_action_cmd_with_key(endpoint, action, job_id, flapjack_api_key);
+    command.arg("--source-provider").arg(provider);
+    command
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConfigRefusalCase {
+    provider: Option<&'static str>,
+    app_id: Option<&'static str>,
+    source_endpoint: Option<&'static str>,
+    expected_message: &'static str,
+}
+
+fn migrate_config_refusal_cmd(case: ConfigRefusalCase) -> assert_cmd::Command {
+    let mut command = flapjack_cmd();
+    command.arg("migrate");
+    add_flapjack_auth_args(
+        &mut command,
+        "http://127.0.0.1:1".to_string(),
+        FLAPJACK_API_KEY,
+    );
+    command
+        .arg("--source-key-env")
+        .arg("FJ_MIGRATE_TEST_SOURCE_KEY")
+        .arg("--source-index")
+        .arg("products")
+        .arg("--json")
+        .env("FJ_MIGRATE_TEST_SOURCE_KEY", SOURCE_API_KEY);
+    if let Some(provider) = case.provider {
+        command.arg("--source-provider").arg(provider);
+    }
+    if let Some(app_id) = case.app_id {
+        command.arg("--app-id").arg(app_id);
+    }
+    if let Some(source_endpoint) = case.source_endpoint {
+        command.arg("--source-endpoint").arg(source_endpoint);
+    }
     command
 }
 
@@ -785,6 +1424,38 @@ fn assert_action_requests(requests: Vec<RecordedRequest>, expected_path: &str) {
         assert_migration_request_headers(&request);
         assert_eq!(request.body, Value::Null);
     }
+}
+
+fn assert_json_http_rejection(output: &std::process::Output, expected_message: &str) {
+    let report: Value = serde_json::from_slice(&output.stdout).expect("JSON rejection report");
+    assert_eq!(report["errorType"], json!("http_rejection"));
+    assert_eq!(report["exitCode"], json!(EXIT_HTTP_REJECTION));
+    assert_eq!(report["message"], json!(expected_message));
+}
+
+fn assert_secrets_absent(output: &std::process::Output, secrets: &[&str]) {
+    let combined = combined_output(output);
+    for secret in secrets {
+        assert!(
+            !combined.contains(secret),
+            "output exposed secret: {combined}"
+        );
+    }
+}
+
+fn assert_provider_submit_request(
+    request: &RecordedRequest,
+    expected_path: &str,
+    expected_body: Value,
+) {
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.path, expected_path);
+    assert_eq!(request.body, expected_body);
+    assert_migration_request_headers(request);
+    assert_eq!(
+        request.header("content-type").as_deref(),
+        Some("application/json")
+    );
 }
 
 fn assert_migration_request_headers(request: &RecordedRequest) {

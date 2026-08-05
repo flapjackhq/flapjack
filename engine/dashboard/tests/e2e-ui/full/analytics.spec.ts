@@ -17,7 +17,7 @@
  * - BETA badge: displayed
  * - Clear Analytics: confirmation dialog flow
  *
- * STANDARDS COMPLIANCE (BROWSER_TESTING_STANDARDS_2.md):
+ * STANDARDS COMPLIANCE (~/.matt/scrai/globals/standards/browser_testing.md):
  * - Zero page.evaluate() — all assertions via Playwright locators
  * - Zero CSS class selectors — uses data-testid, getByRole, getByText
  * - Zero conditional skipping — all assertions are hard (no if/catch guards)
@@ -26,6 +26,7 @@
  */
 import { test, expect } from '../../fixtures/auth.fixture';
 import { seedAnalytics, deleteIndex, DEFAULT_ANALYTICS_CONFIG } from '../../fixtures/analytics-seed';
+import { CHART_CANVAS_TEST_ID, getTableBodyRows } from '../helpers';
 
 const INDEX = 'e2e-products';
 const ANALYTICS_URL = `/index/${INDEX}/analytics`;
@@ -65,7 +66,7 @@ test.describe('Analytics', () => {
     await expect(chart.getByText('Search Volume')).toBeVisible();
 
     // With seeded data, the chart MUST render an SVG — empty state is a failure
-    await expect(chart.locator('svg')).toBeVisible({ timeout: 10_000 });
+    await expect(chart.getByTestId(CHART_CANVAS_TEST_ID)).toBeVisible({ timeout: 10_000 });
   });
 
   test('Top searches table shows data on Overview tab', async ({ page }) => {
@@ -74,7 +75,7 @@ test.describe('Analytics', () => {
     await expect(topSearches.getByText('Top 10 Searches')).toBeVisible();
 
     // With seeded data, table rows should appear
-    await expect(topSearches.locator('table tbody tr').first()).toBeVisible({ timeout: 10_000 });
+    await expect(getTableBodyRows(topSearches).first()).toBeVisible({ timeout: 10_000 });
   });
 
   test('No-Result Rate Over Time chart renders SVG (not empty state)', async ({ page }) => {
@@ -84,7 +85,7 @@ test.describe('Analytics', () => {
 
     // With seeded data, the chart MUST render SVG. "No data available" is a FAILURE.
     // Previously this used an OR condition that accepted empty state — that's a false positive.
-    await expect(nrrChart.locator('svg')).toBeVisible({ timeout: 10_000 });
+    await expect(nrrChart.getByTestId(CHART_CANVAS_TEST_ID)).toBeVisible({ timeout: 10_000 });
   });
 
   // ---------- No Results Tab ----------
@@ -125,7 +126,7 @@ test.describe('Analytics', () => {
     await expect(page.getByText('Searches by Country')).toBeVisible();
 
     // Table should have at least one country row
-    const rows = page.locator('table tbody tr');
+    const rows = getTableBodyRows(page);
     await expect(rows.first()).toBeVisible();
   });
 
@@ -134,10 +135,10 @@ test.describe('Analytics', () => {
     await expect(page.getByText('Searches by Country')).toBeVisible({ timeout: 10_000 });
 
     // Wait for table rows to load
-    await page.locator('table tbody tr').first().waitFor({ timeout: 10_000 });
+    await getTableBodyRows(page).first().waitFor({ timeout: 10_000 });
 
     // Click the first country row (should be US with seeded data)
-    await page.locator('table tbody tr').first().click();
+    await getTableBodyRows(page).first().click();
 
     // Drill-down view should show "All Countries" back button
     await expect(page.getByText('All Countries')).toBeVisible({ timeout: 5_000 });
@@ -196,16 +197,16 @@ test.describe('Analytics', () => {
     await searchesTab.click();
 
     // Wait for table rows to load
-    await expect(page.locator('table tbody tr').first()).toBeVisible({ timeout: 10_000 });
-    const rowCount = await page.locator('table tbody tr').count();
+    await expect(getTableBodyRows(page).first()).toBeVisible({ timeout: 10_000 });
+    const rowCount = await getTableBodyRows(page).count();
     expect(rowCount).toBeGreaterThan(0);
   });
 
   test('Searches tab filter input narrows results', async ({ page }) => {
     await page.getByTestId('tab-searches').click();
-    await expect(page.locator('table tbody tr').first()).toBeVisible({ timeout: 10_000 });
+    await expect(getTableBodyRows(page).first()).toBeVisible({ timeout: 10_000 });
 
-    const beforeCount = await page.locator('table tbody tr').count();
+    const beforeCount = await getTableBodyRows(page).count();
 
     // Type a specific query in the filter — use a seeded search term
     const filterInput = page.getByTestId('searches-filter-input');
@@ -214,7 +215,7 @@ test.describe('Analytics', () => {
 
     // Wait for client-side filter to take effect — rows should decrease
     await expect(async () => {
-      const afterCount = await page.locator('table tbody tr').count();
+      const afterCount = await getTableBodyRows(page).count();
       expect(afterCount).toBeLessThan(beforeCount);
     }).toPass({ timeout: 10_000 });
   });
@@ -229,7 +230,7 @@ test.describe('Analytics', () => {
     await expect(filtersTable.getByText('Top Filter Attributes')).toBeVisible();
 
     // Valid dual-state: filter data rows vs "No filter usage" empty state
-    const hasData = filtersTable.locator('table tbody tr').first();
+    const hasData = getTableBodyRows(filtersTable).first();
     const emptyState = filtersTable.getByText(/No filter usage/i);
     await expect(hasData.or(emptyState)).toBeVisible({ timeout: 10_000 });
   });
@@ -240,7 +241,7 @@ test.describe('Analytics', () => {
     await expect(filtersTable).toBeVisible({ timeout: 10_000 });
 
     // With seeded data, filter rows MUST exist. Hard assertion — no conditional skip.
-    const firstRow = filtersTable.locator('table tbody tr').first();
+    const firstRow = getTableBodyRows(filtersTable).first();
     await expect(firstRow).toBeVisible({ timeout: 10_000 });
 
     // Click the first filter row to expand it
@@ -248,19 +249,19 @@ test.describe('Analytics', () => {
 
     // After expansion, nested value rows should appear
     await expect(async () => {
-      const allRows = await filtersTable.locator('table tbody tr').count();
+      const allRows = await getTableBodyRows(filtersTable).count();
       expect(allRows).toBeGreaterThan(1);
     }).toPass({ timeout: 10_000 });
 
     // Click again to collapse
-    await filtersTable.locator('table tbody tr').first().click();
+    await getTableBodyRows(filtersTable).first().click();
   });
 
   // ---------- Searches Tab (Advanced) ----------
 
   test('Searches tab shows country filter dropdown with seeded geo data', async ({ page }) => {
     await page.getByTestId('tab-searches').click();
-    await expect(page.locator('table tbody tr').first()).toBeVisible({ timeout: 10_000 });
+    await expect(getTableBodyRows(page).first()).toBeVisible({ timeout: 10_000 });
 
     // With seeded geo data, country filter MUST be visible. Hard assertion — no if guard.
     const countryFilter = page.getByTestId('searches-country-filter');
@@ -277,7 +278,7 @@ test.describe('Analytics', () => {
 
   test('Searches tab shows device filter dropdown with seeded device data', async ({ page }) => {
     await page.getByTestId('tab-searches').click();
-    await expect(page.locator('table tbody tr').first()).toBeVisible({ timeout: 10_000 });
+    await expect(getTableBodyRows(page).first()).toBeVisible({ timeout: 10_000 });
 
     // With seeded device data, device filter MUST be visible. Hard assertion — no if guard.
     const deviceFilter = page.getByTestId('searches-device-filter');
@@ -293,14 +294,14 @@ test.describe('Analytics', () => {
   test('Searches tab column headers are clickable for sorting', async ({ page }) => {
     await page.getByTestId('tab-searches').click();
     const topSearchesTable = page.getByTestId('top-searches-table');
-    await expect(topSearchesTable.locator('table tbody tr').first()).toBeVisible({ timeout: 10_000 });
+    await expect(getTableBodyRows(topSearchesTable).first()).toBeVisible({ timeout: 10_000 });
 
     // Count column header should show sort indicator (default sorted desc by count)
-    const countHeader = topSearchesTable.locator('th').filter({ hasText: 'Count' });
+    const countHeader = topSearchesTable.getByRole('columnheader').filter({ hasText: 'Count' });
     await expect(countHeader).toBeVisible();
 
     // Click the "Query" column to sort by query
-    const queryHeader = topSearchesTable.locator('th').filter({ hasText: 'Query' });
+    const queryHeader = topSearchesTable.getByRole('columnheader').filter({ hasText: 'Query' });
     await expect(queryHeader).toBeVisible();
     await queryHeader.click();
 
@@ -373,7 +374,7 @@ test.describe('Analytics', () => {
     await expect(filtersTable).toBeVisible({ timeout: 10_000 });
 
     // Verify the filters table has rows (the seeded analytics data includes filter usage)
-    await expect(filtersTable.locator('table tbody tr').first()).toBeVisible({ timeout: 10_000 });
+    await expect(getTableBodyRows(filtersTable).first()).toBeVisible({ timeout: 10_000 });
 
     // Shared seed data has top filters but no no-result filters.
     const noResultFilters = page.getByTestId('filters-no-results');
@@ -447,11 +448,11 @@ test.describe('Analytics', () => {
     // Total Searches and No-Result Rate KPIs have sparkData — SVG must render
     const totalSearchesSparkline = page.getByTestId('kpi-total-searches').getByTestId('sparkline');
     await expect(totalSearchesSparkline).toBeVisible({ timeout: 10_000 });
-    await expect(totalSearchesSparkline.locator('svg')).toBeVisible();
+    await expect(totalSearchesSparkline.getByTestId(CHART_CANVAS_TEST_ID)).toBeVisible();
 
     const nrrSparkline = page.getByTestId('kpi-no-result-rate').getByTestId('sparkline');
     await expect(nrrSparkline).toBeVisible();
-    await expect(nrrSparkline.locator('svg')).toBeVisible();
+    await expect(nrrSparkline.getByTestId(CHART_CANVAS_TEST_ID)).toBeVisible();
   });
 
   // ---------- Top Searches Content Verification ----------
@@ -460,11 +461,11 @@ test.describe('Analytics', () => {
     const table = page.getByTestId('top-searches-overview');
     await expect(table).toBeVisible({ timeout: 10_000 });
 
-    const rows = table.locator('tbody tr');
+    const rows = getTableBodyRows(table);
     await rows.first().waitFor({ timeout: 10_000 });
 
     // First row rank should be "1"
-    await expect(rows.first().locator('td').first()).toHaveText('1');
+    await expect(rows.first().getByRole('cell').first()).toHaveText('1');
 
     // Query cell should have non-empty text
     const queryText = await rows.first().getByTestId('search-query').textContent();
@@ -535,7 +536,7 @@ test.describe('Analytics', () => {
     await expect(chart.getByText('Conversion Rate Over Time')).toBeVisible();
 
     // Shared seed data renders conversion history; empty state is not expected.
-    await expect(chart.locator('svg')).toBeVisible({ timeout: 10_000 });
+    await expect(chart.getByTestId(CHART_CANVAS_TEST_ID)).toBeVisible({ timeout: 10_000 });
   });
 
   test('Conversions tab shows add-to-cart and purchase charts with empty revenue breakdown state', async ({ page }) => {
@@ -544,12 +545,12 @@ test.describe('Analytics', () => {
     const atcChart = page.getByTestId('atc-rate-chart');
     await expect(atcChart).toBeVisible({ timeout: 10_000 });
     await expect(atcChart.getByText('Add-to-Cart Rate Over Time')).toBeVisible();
-    await expect(atcChart.locator('svg')).toBeVisible({ timeout: 10_000 });
+    await expect(atcChart.getByTestId(CHART_CANVAS_TEST_ID)).toBeVisible({ timeout: 10_000 });
 
     const purchaseChart = page.getByTestId('purchase-rate-chart');
     await expect(purchaseChart).toBeVisible({ timeout: 10_000 });
     await expect(purchaseChart.getByText('Purchase Rate Over Time')).toBeVisible();
-    await expect(purchaseChart.locator('svg')).toBeVisible({ timeout: 10_000 });
+    await expect(purchaseChart.getByTestId(CHART_CANVAS_TEST_ID)).toBeVisible({ timeout: 10_000 });
 
     await expect(page.getByTestId('revenue-breakdown')).toHaveCount(0);
   });
@@ -603,12 +604,20 @@ test.describe('Analytics', () => {
       await dialog.getByRole('button', { name: 'Clear', exact: true }).click();
 
       await expect(page.getByText('Analytics cleared')).toBeVisible({ timeout: 10_000 });
-      await expect(page.getByTestId('error-state')).toContainText('Unable to load analytics data. Try again.');
-      await expect(page.getByTestId('kpi-total-searches')).toHaveCount(0);
-      await expect(page.getByTestId('kpi-unique-users')).toHaveCount(0);
-      await expect(page.getByTestId('kpi-no-result-rate')).toHaveCount(0);
-      await expect(page.getByTestId('search-volume-chart')).toHaveCount(0);
-      await expect(page.getByTestId('top-searches-overview')).toHaveCount(0);
+      // A cleared index now returns empty analytics (count 0, empty series) with a
+      // successful status rather than erroring the reads (engine commit 8d37d357a
+      // switched analytics status/reads from `dir.exists()` to a parquet-presence
+      // check). The Overview tab therefore renders its normal reset state with zeroed
+      // KPIs and empty-series charts — not the error state the pre-repair bug produced.
+      await expect(page.getByTestId('error-state')).toHaveCount(0);
+      await expect(page.getByTestId('kpi-total-searches')).toBeVisible();
+      await expect(page.getByTestId('kpi-total-searches').getByTestId('kpi-value')).toHaveText('0');
+      await expect(page.getByTestId('kpi-unique-users')).toBeVisible();
+      await expect(page.getByTestId('kpi-unique-users').getByTestId('kpi-value')).toHaveText('0');
+      await expect(page.getByTestId('kpi-no-result-rate')).toBeVisible();
+      await expect(page.getByTestId('search-volume-chart')).toBeVisible();
+      await expect(page.getByTestId('search-volume-chart')).toContainText('No search data yet');
+      await expect(page.getByTestId('top-searches-overview')).toBeVisible();
     } finally {
       await deleteIndex(request, isolatedIndex).catch(() => {});
     }

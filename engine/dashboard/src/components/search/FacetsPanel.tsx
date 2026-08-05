@@ -31,6 +31,8 @@ const FacetValue = memo(function FacetValue({
 }: FacetValueProps) {
   return (
     <button
+      role="checkbox"
+      aria-checked={isSelected}
       onClick={onToggle}
       className="w-full flex items-center justify-between p-2 rounded-md hover:bg-accent text-sm group"
     >
@@ -43,7 +45,7 @@ const FacetValue = memo(function FacetValue({
           }`}
         >
           {isSelected && (
-            <svg className="h-3 w-3 text-primary-foreground" viewBox="0 0 12 12">
+            <svg className="h-3 w-3 text-primary-foreground" viewBox="0 0 12 12" aria-hidden="true">
               <polyline
                 points="2,6 5,9 10,3"
                 fill="none"

@@ -21,7 +21,7 @@ test.describe('Connection Health', () => {
     await expect(page.getByText('Connected').first()).toBeVisible({ timeout: 10_000 });
 
     // No disconnected banner should be visible
-    await expect(page.getByTestId('disconnected-banner')).not.toBeVisible();
+    await expect(page.getByTestId('disconnected-banner')).toBeHidden();
   });
 
   test('BETA badge is always visible in header', async ({ page }) => {

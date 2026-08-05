@@ -11,13 +11,14 @@ use std::time::Duration;
 /// Default: trip after 3 consecutive failures, probe again after 30 seconds
 const DEFAULT_FAILURE_THRESHOLD: u32 = 3;
 const DEFAULT_RECOVERY_TIMEOUT_SECS: u64 = 30;
+pub const REPLICATION_PEER_APPLICATION_ID: &str = "flapjack-replication";
 
 /// HTTP client wrapper for communicating with a single peer node
 pub struct PeerClient {
     peer_id: String,
     base_url: String,
     http_client: reqwest::Client,
-    admin_key: Option<String>,
+    peer_credential: Option<String>,
     last_success: Arc<AtomicU64>, // Unix timestamp in seconds
     circuit_breaker: CircuitBreaker,
 }
@@ -31,17 +32,18 @@ pub enum PeerHealthCheck {
 
 impl PeerClient {
     /// Build a peer client with a 5-second HTTP timeout and a fresh circuit breaker.
-    pub fn new(peer_id: String, base_url: String, admin_key: Option<String>) -> Self {
+    pub fn new(peer_id: String, base_url: String, peer_credential: Option<String>) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect("peer HTTP client with static settings must build");
 
         Self {
             peer_id,
             base_url,
             http_client,
-            admin_key,
+            peer_credential,
             last_success: Arc::new(AtomicU64::new(0)),
             circuit_breaker: CircuitBreaker::new(
                 DEFAULT_FAILURE_THRESHOLD,
@@ -50,16 +52,39 @@ impl PeerClient {
         }
     }
 
-    /// Attach auth headers to a request builder when an admin key is configured.
+    /// Attach auth headers to a request builder when a peer credential is configured.
     /// Uses the existing `x-algolia-api-key` / `x-algolia-application-id` headers
     /// that the auth middleware already understands — no new header introduced.
     fn with_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.admin_key {
+        match &self.peer_credential {
             Some(key) => builder
                 .header("x-algolia-api-key", key)
-                .header("x-algolia-application-id", "flapjack-replication"),
+                .header("x-algolia-application-id", REPLICATION_PEER_APPLICATION_ID),
             None => builder,
         }
+    }
+
+    fn internal_url(&self, path: &str) -> Result<reqwest::Url, String> {
+        let base_url = self.base_url.trim_end_matches('/');
+        reqwest::Url::parse(&format!("{base_url}{path}"))
+            .map_err(|error| format!("Invalid peer URL for {}: {}", self.peer_id, error))
+    }
+
+    fn ops_url(&self, query: &GetOpsQuery) -> Result<reqwest::Url, String> {
+        let mut url = self.internal_url("/internal/ops")?;
+        url.query_pairs_mut()
+            .append_pair("tenant_id", &query.tenant_id)
+            .append_pair("since_seq", &query.since_seq.to_string());
+        Ok(url)
+    }
+
+    fn snapshot_url(&self, tenant_id: &str) -> Result<reqwest::Url, String> {
+        let mut url = self.internal_url("/internal/snapshot/")?;
+        url.path_segments_mut()
+            .map_err(|_| format!("Invalid peer URL for {}: {}", self.peer_id, self.base_url))?
+            .pop_if_empty()
+            .push(tenant_id);
+        Ok(url)
     }
 
     pub fn peer_id(&self) -> &str {
@@ -132,13 +157,10 @@ impl PeerClient {
 
     /// Fetch operations from this peer for catch-up
     pub async fn get_ops(&self, query: GetOpsQuery) -> Result<GetOpsResponse, String> {
-        let url = format!(
-            "{}/internal/ops?tenant_id={}&since_seq={}",
-            self.base_url, query.tenant_id, query.since_seq
-        );
+        let url = self.ops_url(&query)?;
 
         let response = self
-            .with_auth(self.http_client.get(&url))
+            .with_auth(self.http_client.get(url))
             .send()
             .await
             .map_err(|e| {
@@ -173,10 +195,10 @@ impl PeerClient {
 
     /// Download a full tenant snapshot from this peer.
     pub async fn get_snapshot(&self, tenant_id: &str) -> Result<Vec<u8>, String> {
-        let url = format!("{}/internal/snapshot/{}", self.base_url, tenant_id);
+        let url = self.snapshot_url(tenant_id)?;
 
         let response = self
-            .with_auth(self.http_client.get(&url))
+            .with_auth(self.http_client.get(url))
             .send()
             .await
             .map_err(|e| {
@@ -333,11 +355,11 @@ mod tests {
 
         assert_eq!(peer.peer_id(), "test-peer");
         assert_eq!(peer.last_success_timestamp(), 0);
-        assert!(peer.admin_key.is_none());
+        assert!(peer.peer_credential.is_none());
     }
 
     #[test]
-    fn test_peer_client_creation_with_admin_key() {
+    fn test_peer_client_creation_with_peer_credential() {
         let peer = PeerClient::new(
             "test-peer".to_string(),
             "http://localhost:7700".to_string(),
@@ -345,7 +367,7 @@ mod tests {
         );
 
         assert_eq!(peer.peer_id(), "test-peer");
-        assert_eq!(peer.admin_key.as_deref(), Some("my-secret-key"));
+        assert_eq!(peer.peer_credential.as_deref(), Some("my-secret-key"));
     }
 
     #[test]
@@ -379,6 +401,31 @@ mod tests {
             let _ = socket.read(&mut request).await;
             socket.write_all(response.as_bytes()).await.unwrap();
             let _ = socket.shutdown().await;
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    async fn spawn_capture_peer(response: &str) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response = response.to_string();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0u8; 2048];
+                let read = socket.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+            String::from_utf8(request).unwrap()
         });
         (format!("http://{}", addr), handle)
     }
@@ -448,6 +495,55 @@ mod tests {
             PeerHealthCheck::Indeterminate {
                 reason: "Health check for node-b returned 500 Internal Server Error".to_string()
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn get_ops_percent_encodes_tenant_id_in_query() {
+        let body = serde_json::json!({
+            "tenant_id": "tenant-red&role=admin",
+            "ops": [],
+            "current_seq": 7
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (base_url, handle) = spawn_capture_peer(&response).await;
+        let peer = PeerClient::new("node-b".to_string(), base_url, None);
+
+        let result = peer
+            .get_ops(GetOpsQuery {
+                tenant_id: "tenant-red&role=admin".to_string(),
+                since_seq: 7,
+            })
+            .await
+            .unwrap();
+        let request = handle.await.unwrap();
+
+        assert_eq!(result.current_seq, 7);
+        assert!(
+            request.starts_with(
+                "GET /internal/ops?tenant_id=tenant-red%26role%3Dadmin&since_seq=7 HTTP/1.1\r\n"
+            ),
+            "unexpected request line: {request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_snapshot_percent_encodes_tenant_id_path_segment() {
+        let response = "HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\ntest";
+        let (base_url, handle) = spawn_capture_peer(response).await;
+        let peer = PeerClient::new("node-b".to_string(), base_url, None);
+
+        let snapshot = peer.get_snapshot("../tenant-red?role=admin").await.unwrap();
+        let request = handle.await.unwrap();
+
+        assert_eq!(snapshot, b"test");
+        assert!(
+            request.starts_with("GET /internal/snapshot/..%2Ftenant-red%3Frole=admin HTTP/1.1\r\n"),
+            "unexpected request line: {request}"
         );
     }
 }

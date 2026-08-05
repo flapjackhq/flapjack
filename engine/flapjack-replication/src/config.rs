@@ -3,9 +3,91 @@ use std::net::IpAddr;
 use std::path::Path;
 
 const NODE_CONFIG_FILE: &str = "node.json";
+const REPLICATION_API_KEY_ENV: &str = "FLAPJACK_REPLICATION_API_KEY";
+/// Escape hatch that re-permits cleartext peer origins while a peer credential
+/// is configured. See [`NodeConfig::retain_transport_safe_peers`].
+const ALLOW_CLEARTEXT_REPLICATION_PEERS_ENV: &str = "FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS";
 
 #[cfg(test)]
 static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+struct EnvVarRestoreGuard {
+    name: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl EnvVarRestoreGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(name);
+        std::env::set_var(name, value);
+        Self { name, previous }
+    }
+
+    fn remove(name: &'static str) -> Self {
+        let previous = std::env::var_os(name);
+        std::env::remove_var(name);
+        Self { name, previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvVarRestoreGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl TestWriter {
+    fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+    }
+
+    fn output(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+#[cfg(test)]
+impl std::io::Write for TestWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[cfg(test)]
+fn capture_config_logs<T>(action: impl FnOnce() -> T) -> (T, String) {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let writer = TestWriter::new();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_writer(writer.clone()));
+    let result = tracing::subscriber::with_default(subscriber, action);
+    (result, writer.output())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
@@ -25,15 +107,64 @@ pub struct PeerConfig {
 }
 
 impl NodeConfig {
-    /// Load node configuration from {data_dir}/node.json or return standalone default
+    /// Load node configuration for non-server callers, filtering and logging
+    /// peer transports that violate the credential policy.
     pub fn load_or_default(data_dir: &Path) -> Self {
-        let node_json = data_dir.join(NODE_CONFIG_FILE);
-        if let Some(config) = Self::load_from_file(&node_json) {
-            return config;
+        let (config, loaded_from_file, transport_errors) =
+            Self::load_with_transport_validation(data_dir);
+        for error in transport_errors {
+            tracing::error!("{error}");
         }
+        Self::log_loaded_source(&config, loaded_from_file);
+        config
+    }
 
+    /// Load node configuration for server startup, failing rather than silently
+    /// downgrading to standalone mode when transport policy rejects topology.
+    pub fn load_for_server_startup(data_dir: &Path) -> Result<Self, String> {
+        let (config, loaded_from_file, transport_errors) =
+            Self::load_with_transport_validation(data_dir);
+        if !transport_errors.is_empty() {
+            return Err(transport_errors.join("; "));
+        }
+        Self::log_loaded_source(&config, loaded_from_file);
+        Ok(config)
+    }
+
+    fn load_with_transport_validation(data_dir: &Path) -> (Self, bool, Vec<String>) {
+        let node_json = data_dir.join(NODE_CONFIG_FILE);
+        let from_file = Self::load_from_file(&node_json);
+        let loaded_from_file = from_file.is_some();
+        let mut config = from_file.unwrap_or_else(Self::from_env);
+
+        // Peer transport policy is applied once here, over every outbound peer
+        // origin, so `node.json`, `FLAPJACK_PEERS`, and `FLAPJACK_BOOTSTRAP_PEER`
+        // obey exactly one rule.
+        let (peers, mut transport_errors) = Self::retain_transport_safe_peers(config.peers);
+        let (bootstrap_peer, bootstrap_error) =
+            Self::retain_transport_safe_bootstrap_peer(config.bootstrap_peer);
+        config.peers = peers;
+        config.bootstrap_peer = bootstrap_peer;
+        transport_errors.extend(bootstrap_error);
+        (config, loaded_from_file, transport_errors)
+    }
+
+    fn log_loaded_source(config: &Self, loaded_from_file: bool) {
+        if loaded_from_file {
+            tracing::info!(
+                "Loaded node config: node_id={}, peers={}",
+                config.node_id,
+                config.peers.len()
+            );
+        } else {
+            Self::log_default_source(config);
+        }
+    }
+
+    /// Build a standalone node configuration from the peer topology environment.
+    fn from_env() -> Self {
         let peers = Self::parse_env_peers();
-        let config = Self {
+        Self {
             node_id: Self::default_node_id(),
             bind_addr: Self::default_bind_addr(),
             advertise_addr: Self::parse_optional_peer_origin_env("FLAPJACK_ADVERTISE_ADDR"),
@@ -43,9 +174,106 @@ impl NodeConfig {
                 None
             },
             peers,
+        }
+    }
+
+    /// Separate accepted peer origins from transport-policy errors while this
+    /// node has a peer credential to send.
+    ///
+    /// Replication requests and background analytics rollup pushes carry
+    /// `FLAPJACK_REPLICATION_API_KEY`, so an `http://` peer origin puts that
+    /// secret on the wire in plaintext and the peer is refused by default.
+    /// Analytics queries instead forward any caller-supplied key and are
+    /// checked by the HTTP layer at its topology boundaries, including when
+    /// server authentication is disabled.
+    /// `FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1` re-permits it and warns
+    /// loudly every time; it is default-off and intended only for temporary
+    /// rolling upgrades or a private, operator-controlled transport.
+    ///
+    fn retain_transport_safe_peers(peers: Vec<PeerConfig>) -> (Vec<PeerConfig>, Vec<String>) {
+        let mut accepted = Vec::with_capacity(peers.len());
+        let mut errors = Vec::new();
+        for peer in peers {
+            match Self::validate_peer_transport(&peer.node_id, &peer.addr) {
+                Ok(()) => accepted.push(peer),
+                Err(message) => errors.push(message),
+            }
+        }
+        (accepted, errors)
+    }
+
+    fn retain_transport_safe_bootstrap_peer(
+        bootstrap_peer: Option<String>,
+    ) -> (Option<String>, Option<String>) {
+        let Some(bootstrap_peer) = bootstrap_peer else {
+            return (None, None);
         };
-        Self::log_default_source(&config);
-        config
+        match Self::validate_peer_transport("bootstrap", &bootstrap_peer) {
+            Ok(()) => (Some(bootstrap_peer), None),
+            Err(message) => (None, Some(message)),
+        }
+    }
+
+    /// True when a real (non-blank) peer credential is configured, matching the
+    /// trim-and-reject-empty normalization server startup applies.
+    fn has_replication_credential() -> bool {
+        std::env::var(REPLICATION_API_KEY_ENV).is_ok_and(|key| !key.trim().is_empty())
+    }
+
+    fn is_cleartext_peer_addr(addr: &str) -> bool {
+        reqwest::Url::parse(addr).is_ok_and(|url| url.scheme() == "http")
+    }
+
+    /// Enforce the cleartext transport policy for one normalized peer address.
+    ///
+    /// This is shared by startup topology loading and runtime peer mutation so
+    /// both paths obey the same transport rule and escape hatch.
+    pub fn validate_peer_transport(node_id: &str, addr: &str) -> Result<(), String> {
+        if !Self::has_replication_credential() {
+            return Ok(());
+        }
+
+        Self::validate_credentialed_peer_transport(
+            node_id,
+            addr,
+            &format!("{REPLICATION_API_KEY_ENV} is set"),
+        )
+    }
+
+    /// Enforce the peer transport policy when a caller knows it will attach a
+    /// credential other than `FLAPJACK_REPLICATION_API_KEY`.
+    pub fn validate_credentialed_peer_transport(
+        node_id: &str,
+        addr: &str,
+        credential_context: &str,
+    ) -> Result<(), String> {
+        if !Self::is_cleartext_peer_addr(addr) {
+            return Ok(());
+        }
+
+        if matches!(
+            std::env::var(ALLOW_CLEARTEXT_REPLICATION_PEERS_ENV).as_deref(),
+            Ok("1")
+        ) {
+            tracing::warn!(
+                "WARNING: replication peer {} at {} uses cleartext http:// while {}, and is \
+                 permitted only because \
+                 {ALLOW_CLEARTEXT_REPLICATION_PEERS_ENV}=1; the peer credential is sent in \
+                 plaintext. Move the peer to https:// and unset \
+                 {ALLOW_CLEARTEXT_REPLICATION_PEERS_ENV}.",
+                node_id,
+                addr,
+                credential_context
+            );
+            return Ok(());
+        }
+
+        Err(format!(
+            "Refusing replication peer {node_id} at {addr}: {credential_context} and the peer \
+             origin is cleartext http://, which would send the peer credential in \
+             plaintext. Move the peer to https://, or set \
+             {ALLOW_CLEARTEXT_REPLICATION_PEERS_ENV}=1 to keep the cleartext peer."
+        ))
     }
 
     /// Persist runtime membership through the canonical `{data_dir}/node.json` owner.
@@ -90,11 +318,6 @@ impl NodeConfig {
                     })
                     .filter(|peer| !peer.node_id.is_empty())
                     .collect();
-                tracing::info!(
-                    "Loaded node config: node_id={}, peers={}",
-                    config.node_id,
-                    config.peers.len()
-                );
                 Some(config)
             }
             Err(error) => {
@@ -607,6 +830,76 @@ mod tests {
         assert_eq!(config.peers[0].addr, "http://10.0.0.1:7700");
         assert_eq!(config.peers[1].node_id, "ok");
         assert_eq!(config.peers[1].addr, "https://peer-a.example.com:7700");
+    }
+
+    #[test]
+    fn cleartext_peer_with_configured_credential_is_refused_by_default() {
+        let (config, output) = {
+            let _guard = ENV_MUTEX.lock().unwrap();
+            let temp_dir = tempfile::tempdir().unwrap();
+            let _peer_key =
+                EnvVarRestoreGuard::set("FLAPJACK_REPLICATION_API_KEY", "stage-2-peer-secret");
+            let _allow_cleartext =
+                EnvVarRestoreGuard::remove("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS");
+            let _bootstrap_peer = EnvVarRestoreGuard::remove("FLAPJACK_BOOTSTRAP_PEER");
+            let _advertise_addr = EnvVarRestoreGuard::remove("FLAPJACK_ADVERTISE_ADDR");
+            let _peers = EnvVarRestoreGuard::set(
+                "FLAPJACK_PEERS",
+                "cleartext=http://peer-clear.example.com:7700",
+            );
+
+            capture_config_logs(|| NodeConfig::load_or_default(temp_dir.path()))
+        };
+
+        assert!(
+            config.peers.is_empty(),
+            "credentialed cleartext peer must be refused by default, got: {:?}",
+            config.peers
+        );
+        assert!(
+            output.contains("http://peer-clear.example.com:7700") || output.contains("cleartext"),
+            "refusal must name the offending peer, got: {output:?}"
+        );
+        assert!(
+            output.contains("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1"),
+            "refusal must name the cleartext escape variable, got: {output:?}"
+        );
+    }
+
+    #[test]
+    fn cleartext_peer_escape_repermits_and_warns() {
+        let (config, output) = {
+            let _guard = ENV_MUTEX.lock().unwrap();
+            let temp_dir = tempfile::tempdir().unwrap();
+            let _peer_key =
+                EnvVarRestoreGuard::set("FLAPJACK_REPLICATION_API_KEY", "stage-2-peer-secret");
+            let _allow_cleartext =
+                EnvVarRestoreGuard::set("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS", "1");
+            let _bootstrap_peer = EnvVarRestoreGuard::remove("FLAPJACK_BOOTSTRAP_PEER");
+            let _advertise_addr = EnvVarRestoreGuard::remove("FLAPJACK_ADVERTISE_ADDR");
+            let _peers = EnvVarRestoreGuard::set(
+                "FLAPJACK_PEERS",
+                "cleartext=http://peer-clear.example.com:7700",
+            );
+
+            capture_config_logs(|| NodeConfig::load_or_default(temp_dir.path()))
+        };
+
+        assert_eq!(config.peers.len(), 1);
+        assert_eq!(config.peers[0].node_id, "cleartext");
+        assert_eq!(config.peers[0].addr, "http://peer-clear.example.com:7700");
+        assert!(
+            output.contains("WARNING") || output.contains("warning"),
+            "cleartext escape use must emit a loud warning, got: {output:?}"
+        );
+        assert!(
+            output.contains("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1"),
+            "warning must name the cleartext escape variable, got: {output:?}"
+        );
+        assert!(
+            output.contains("http://peer-clear.example.com:7700") || output.contains("cleartext"),
+            "warning must name the cleartext peer, got: {output:?}"
+        );
     }
 
     #[test]

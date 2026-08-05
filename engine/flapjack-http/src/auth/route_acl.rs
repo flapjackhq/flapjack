@@ -4,6 +4,7 @@ use axum::http::Method;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteAcl {
     Required(&'static str),
+    PeerOrAdmin,
     Public,
     Unmapped,
 }
@@ -38,7 +39,7 @@ pub fn required_acl_for_route(method: &Method, path: &str) -> RouteAcl {
     }
 
     if let Some(acl) = fixed_path_acl(method, path) {
-        return RouteAcl::Required(acl);
+        return acl;
     }
 
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -57,57 +58,92 @@ pub fn required_acl_for_route(method: &Method, path: &str) -> RouteAcl {
 
 /// Resolves ACL for non-index routes: keys, usage, analytics, personalization, logs,
 /// configs, metrics, internal endpoints, A/B tests, events, and user-token deletion.
-fn fixed_path_acl(method: &Method, path: &str) -> Option<&'static str> {
+fn fixed_path_acl(method: &Method, path: &str) -> Option<RouteAcl> {
+    if path == "/1/dashboard/session" {
+        return match *method {
+            Method::POST => Some(RouteAcl::Public),
+            Method::DELETE => Some(RouteAcl::Required("admin")),
+            _ => None,
+        };
+    }
     if *method == Method::POST && path == "/1/migrations/privacy-scrub" {
-        return Some(PRIVATE_MIGRATION_ACL);
+        return Some(RouteAcl::Required(PRIVATE_MIGRATION_ACL));
     }
     if path == "/1/migrate-from-algolia" || path == "/1/algolia-list-indexes" {
-        return Some("admin");
+        return Some(RouteAcl::Required("admin"));
     }
     if path.starts_with("/1/migrations/") {
-        return Some("admin");
+        return Some(RouteAcl::Required("admin"));
     }
     if path.starts_with("/1/keys") || path.starts_with("/1/security/sources") {
-        return Some("admin");
+        return Some(RouteAcl::Required("admin"));
     }
     if path.starts_with("/1/usage") {
-        return Some("usage");
+        return Some(RouteAcl::Required("usage"));
     }
     if path.starts_with("/1/strategies/personalization") || path.starts_with("/1/profiles/") {
-        return Some("personalization");
+        return Some(RouteAcl::Required("personalization"));
     }
     if path.starts_with("/1/logs") {
-        return Some("logs");
+        return Some(RouteAcl::Required("logs"));
     }
     if path.starts_with("/1/configs") {
-        return read_or_write_acl(method, "settings", "editSettings");
+        return read_or_write_acl(method, "settings", "editSettings").map(RouteAcl::Required);
     }
-    if path == "/metrics" || path.starts_with("/internal/") {
-        return Some("admin");
+    if path == "/metrics" {
+        return Some(RouteAcl::Required("admin"));
+    }
+    if is_peer_or_admin_internal_route(method, path) {
+        return Some(RouteAcl::PeerOrAdmin);
+    }
+    if path.starts_with("/internal/") {
+        return Some(RouteAcl::Required("admin"));
     }
     if matches!(
         path,
         "/2/analytics/seed" | "/2/analytics/clear" | "/2/analytics/cleanup" | "/2/analytics/flush"
     ) {
-        return Some("admin");
+        return Some(RouteAcl::Required("admin"));
     }
     if path.starts_with("/2/abtests") {
-        return Some(if path == "/2/abtests/estimate" || is_read_method(method) {
-            "analytics"
-        } else {
-            "editSettings"
-        });
+        return Some(RouteAcl::Required(
+            if path == "/2/abtests/estimate" || is_read_method(method) {
+                "analytics"
+            } else {
+                "editSettings"
+            },
+        ));
     }
     if path.starts_with("/2/") {
-        return Some("analytics");
+        return Some(RouteAcl::Required("analytics"));
     }
     if path == "/1/events" || path == "/1/events/debug" {
-        return Some("search");
+        return Some(RouteAcl::Required("search"));
     }
     if *method == Method::DELETE && path.starts_with("/1/usertokens/") {
-        return Some("deleteObject");
+        return Some(RouteAcl::Required("deleteObject"));
     }
     None
+}
+
+fn is_peer_or_admin_internal_route(method: &Method, path: &str) -> bool {
+    if *method == Method::GET {
+        return matches!(
+            path,
+            "/internal/status"
+                | "/internal/cluster/status"
+                | "/internal/snapshots/capability"
+                | "/internal/ops"
+                | "/internal/tenants"
+        ) || is_internal_snapshot_tenant_path(path);
+    }
+
+    *method == Method::POST && matches!(path, "/internal/replicate" | "/internal/analytics-rollup")
+}
+
+fn is_internal_snapshot_tenant_path(path: &str) -> bool {
+    path.strip_prefix("/internal/snapshot/")
+        .is_some_and(|tenant_id| !tenant_id.is_empty() && !tenant_id.contains('/'))
 }
 
 /// Resolves ACL for `/1/indexes/...` routes based on path depth and HTTP method.
@@ -190,3 +226,10 @@ fn dictionaries_acl(method: &Method, parts: &[&str]) -> Option<&'static str> {
 fn tasks_acl(parts: &[&str]) -> bool {
     parts.len() >= 2 && parts[0] == "1" && (parts[1] == "tasks" || parts[1] == "task")
 }
+
+// Stage 1 boundary contract: the closed `/internal/*` denominator and its
+// peer-allowed / admin-only decisions. Kept in this module so the contract
+// lives with its only mapper.
+#[cfg(test)]
+#[path = "../auth_tests/peer_boundary_route_acl_tests.rs"]
+mod peer_boundary_route_acl_tests;

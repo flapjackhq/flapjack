@@ -47,7 +47,7 @@ export function DictionaryEntriesPanel({
   return (
     <div className="space-y-2" data-testid={getListTestId(dictName)}>
       {entries.map((entry) => (
-        <Card key={entry.objectID} className="p-3">
+        <Card key={entry.objectID} data-testid="dictionary-entry" className="p-3">
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
               <p className="truncate text-sm font-medium">{buildEntryDescription(entry)}</p>

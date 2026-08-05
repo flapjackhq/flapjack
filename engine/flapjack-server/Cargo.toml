@@ -1,6 +1,6 @@
 [package]
 name = "flapjack-server"
-version = "1.0.10"
+version = "1.0.11"
 edition = "2021"
 
 [[bin]]
@@ -32,3 +32,5 @@ predicates = "3.0"
 axum = "0.7"
 serial_test = "3.0"
 sha2 = "0.10"
+rcgen = "0.13"
+libc = "0.2"

@@ -2660,8 +2660,9 @@ checksum = "0ce7134b9999ecaf8bcd65542e436736ef32ddca1b3e06094cb6ec5755203b80"
 
 [[package]]
 name = "flapjack"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
+ "aes-gcm-siv",
  "arrow",
  "assert_cmd",
  "axum",
@@ -2688,6 +2689,7 @@ dependencies = [
  "parquet",
  "predicates",
  "prometheus",
+ "quick-xml",
  "rand 0.8.6",
  "regex",
  "reqwest",
@@ -2718,7 +2720,7 @@ dependencies = [
 
 [[package]]
 name = "flapjack-http"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "aes-gcm-siv",
  "aws-config",
@@ -2735,6 +2737,8 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "hostname",
+ "hyper",
+ "hyper-util",
  "ipnet",
  "lru",
  "maxminddb",
@@ -2746,9 +2750,12 @@ dependencies = [
  "opentelemetry_sdk",
  "prometheus",
  "rand 0.8.6",
+ "rcgen 0.13.2",
  "reqwest",
  "rusqlite",
  "rust-embed",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -2758,6 +2765,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-test",
  "tower 0.4.13",
@@ -2775,7 +2783,7 @@ dependencies = [
 
 [[package]]
 name = "flapjack-replication"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "dashmap",
  "flapjack",
@@ -2787,18 +2795,21 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "flapjack-server"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "assert_cmd",
  "axum",
  "clap",
  "flapjack",
  "flapjack-http",
+ "libc",
  "predicates",
+ "rcgen 0.13.2",
  "reqwest",
  "serde",
  "serde_json",
@@ -2811,13 +2822,14 @@ dependencies = [
 
 [[package]]
 name = "flapjack-ssl"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "chrono",
  "dashmap",
  "instant-acme",
  "once_cell",
  "rcgen 0.13.2",
+ "rustls",
  "serde",
  "serial_test",
  "thiserror 1.0.69",

@@ -25,13 +25,10 @@ const api = axios.create({
 api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
   // Read directly from zustand store to stay in sync with AuthGate.
   // Previously read from a separate localStorage key which could desync.
-  const { apiKey, appId } = useAuth.getState();
+  const { appId } = useAuth.getState();
 
-  // Always send app-id; send api-key if configured
+  // The same-origin HttpOnly session cookie carries dashboard authentication.
   config.headers['x-algolia-application-id'] = appId || 'flapjack';
-  if (apiKey) {
-    config.headers['x-algolia-api-key'] = apiKey;
-  }
 
   // Add to logger — capture the actual entry ID returned by addEntry
   const logger = useApiLogger.getState();

@@ -3120,7 +3120,11 @@ async fn add_peer_request(app: Router, node_id: &str, addr: &str) -> Response {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // Process-global env guard must span the request.
 async fn add_cluster_peer_retries_are_idempotent_but_address_changes_conflict() {
+    let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+    let _allow_cleartext =
+        EnvVarRestoreGuard::set("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS", "1");
     let tmp = TempDir::new().unwrap();
     let (_repl_data_dir, repl_mgr) = test_replication_manager_with_two_peers();
     let state = TestStateBuilder::new(&tmp)
@@ -3137,6 +3141,125 @@ async fn add_cluster_peer_retries_are_idempotent_but_address_changes_conflict() 
     let conflict = add_peer_request(app, "test-node-b", "http://different-node-b:7700").await;
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
     assert_eq!(repl_mgr.peer_count(), 2);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // Process-global env guard must span the request.
+async fn add_cluster_peer_rejects_cleartext_transport_when_peer_key_is_configured() {
+    let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+    let _peer_key = EnvVarRestoreGuard::set("FLAPJACK_REPLICATION_API_KEY", "stage-2-peer-secret");
+    let _allow_cleartext = EnvVarRestoreGuard::remove("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS");
+
+    let tmp = TempDir::new().unwrap();
+    let repl_mgr = flapjack_replication::manager::ReplicationManager::new(
+        flapjack_replication::config::NodeConfig {
+            node_id: "test-node-a".to_string(),
+            bind_addr: "127.0.0.1:7700".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
+            peers: Vec::new(),
+        },
+        Some("stage-2-peer-secret".to_string()),
+        tmp.path().to_path_buf(),
+    );
+    let state = TestStateBuilder::new(&tmp)
+        .with_replication_manager(repl_mgr.clone())
+        .build_shared();
+
+    let response = add_peer_request(
+        add_peer_test_router(state),
+        "test-node-b",
+        "http://test-node-b:7700",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = crate::test_helpers::body_json(response).await;
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1")),
+        "runtime cleartext rejection must name the override, got {body:?}"
+    );
+    assert_eq!(repl_mgr.peer_count(), 0);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // Process-global env guard must span the request.
+async fn add_cluster_peer_rejects_cleartext_transport_without_peer_key() {
+    let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+    let _peer_key = EnvVarRestoreGuard::remove("FLAPJACK_REPLICATION_API_KEY");
+    let _allow_cleartext = EnvVarRestoreGuard::remove("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS");
+
+    let tmp = TempDir::new().unwrap();
+    let repl_mgr = flapjack_replication::manager::ReplicationManager::new(
+        flapjack_replication::config::NodeConfig {
+            node_id: "test-node-a".to_string(),
+            bind_addr: "127.0.0.1:7700".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
+            peers: Vec::new(),
+        },
+        None,
+        tmp.path().to_path_buf(),
+    );
+    let state = TestStateBuilder::new(&tmp)
+        .with_replication_manager(repl_mgr.clone())
+        .build_shared();
+
+    let response = add_peer_request(
+        add_peer_test_router(state),
+        "test-node-b",
+        "http://test-node-b:7700",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = crate::test_helpers::body_json(response).await;
+    assert!(
+        body["message"].as_str().is_some_and(|message| {
+            message.contains("analytics")
+                && message.contains("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1")
+        }),
+        "runtime refusal must protect caller credentials forwarded by analytics, got {body:?}"
+    );
+    assert_eq!(repl_mgr.peer_count(), 0);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // Process-global env guard must span the request.
+async fn add_cluster_peer_cleartext_escape_repermits_runtime_membership() {
+    let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+    let _peer_key = EnvVarRestoreGuard::set("FLAPJACK_REPLICATION_API_KEY", "stage-2-peer-secret");
+    let _allow_cleartext =
+        EnvVarRestoreGuard::set("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS", "1");
+
+    let tmp = TempDir::new().unwrap();
+    let repl_mgr = flapjack_replication::manager::ReplicationManager::new(
+        flapjack_replication::config::NodeConfig {
+            node_id: "test-node-a".to_string(),
+            bind_addr: "127.0.0.1:7700".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
+            peers: Vec::new(),
+        },
+        Some("stage-2-peer-secret".to_string()),
+        tmp.path().to_path_buf(),
+    );
+    let state = TestStateBuilder::new(&tmp)
+        .with_replication_manager(repl_mgr.clone())
+        .build_shared();
+
+    let response = add_peer_request(
+        add_peer_test_router(state),
+        "test-node-b",
+        "http://test-node-b:7700",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = crate::test_helpers::body_json(response).await;
+    assert_eq!(body["node_id"], "test-node-b");
+    assert_eq!(body["addr"], "http://test-node-b:7700");
+    assert_eq!(body["peers_total"], 1);
+    assert_eq!(repl_mgr.peer_count(), 1);
 }
 
 #[tokio::test]
@@ -3161,7 +3284,7 @@ async fn add_cluster_peer_persistence_failure_returns_non_leaking_500() {
     let response = add_peer_request(
         add_peer_test_router(state),
         "test-node-b",
-        "http://test-node-b:7700",
+        "https://test-node-b:7700",
     )
     .await;
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);

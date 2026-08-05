@@ -11,6 +11,9 @@ use flapjack::error::FlapjackError;
 use flapjack::index::manager::validate_index_name;
 
 use super::AppState;
+use crate::auth::{
+    invalid_api_credentials_flapjack_error, key_allows_index, ApiKey, SecuredKeyRestrictions,
+};
 
 mod read_endpoints;
 pub use read_endpoints::*;
@@ -33,6 +36,29 @@ pub(crate) fn clamp_limit(limit: usize) -> usize {
 /// error-type conversion; inlining the `.map_err` everywhere would be less DRY.
 pub(crate) fn validate_analytics_index(index: &str) -> Result<(), FlapjackError> {
     validate_index_name(index).map_err(|e| FlapjackError::InvalidQuery(e.to_string()))
+}
+
+pub(crate) fn enforce_analytics_index_access(
+    api_key: Option<&ApiKey>,
+    secured_restrictions: Option<&SecuredKeyRestrictions>,
+    index: &str,
+) -> Result<(), FlapjackError> {
+    if let Some(api_key) = api_key {
+        if !key_allows_index(api_key, secured_restrictions, index) {
+            return Err(invalid_api_credentials_flapjack_error());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn analytics_request_has_index_restrictions(
+    api_key: Option<&ApiKey>,
+    secured_restrictions: Option<&SecuredKeyRestrictions>,
+) -> bool {
+    api_key.is_some_and(|key| !key.indexes.is_empty())
+        || secured_restrictions
+            .and_then(|restrictions| restrictions.restrict_indices.as_ref())
+            .is_some_and(|indices| !indices.is_empty())
 }
 
 /// Validate that `end_date` is not before `start_date`. Returns 400 for inverted ranges.
@@ -79,6 +105,8 @@ pub struct AnalyticsParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OverviewParams {
+    #[serde(default)]
+    pub index: Option<String>,
     #[serde(default = "default_start_date")]
     pub start_date: String,
     #[serde(default = "default_end_date")]
@@ -184,16 +212,30 @@ pub async fn seed_analytics(
         .index
         .ok_or_else(|| FlapjackError::InvalidQuery("Missing 'index' field".to_string()))?;
     validate_analytics_index(&index)?;
-    let days = body.days.unwrap_or(30).min(90);
+    let options = flapjack::analytics::seed::AnalyticsSeedOptions {
+        days: body.days.unwrap_or(30).min(90),
+        search_count: body.search_count,
+        no_result_rate: body.no_result_rate,
+        device_distribution: body.device_distribution,
+        country_distribution: body.country_distribution,
+    };
+    flapjack::analytics::seed::validate_seed_options(&options)
+        .map_err(|error| FlapjackError::InvalidQuery(format!("Seed error: {error}")))?;
 
-    let config = engine.config();
-    let result = flapjack::analytics::seed::seed_analytics(config, &index, days)
-        .map_err(|e| FlapjackError::InvalidQuery(format!("Seed error: {}", e)))?;
+    let config = engine.config().clone();
+    let seed_index = index.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        flapjack::analytics::seed::seed_analytics_with_options(&config, &seed_index, &options)
+    })
+    .await
+    .map_err(|error| FlapjackError::Io(format!("Seed task error: {error}")))?
+    .map_err(|error| FlapjackError::Io(format!("Seed error: {error}")))?;
 
     Ok(Json(serde_json::json!({
         "status": "ok",
         "index": index,
         "days": result.days,
+        "seededDates": result.seeded_dates,
         "totalSearches": result.total_searches,
         "totalClicks": result.total_clicks,
         "totalConversions": result.total_conversions,
@@ -224,40 +266,27 @@ pub async fn flush_analytics() -> Result<Json<serde_json::Value>, FlapjackError>
     delete,
     path = "/2/analytics/clear",
     tag = "analytics-operations",
-    request_body = SeedRequest,
+    request_body = ClearRequest,
     responses((status = 200, description = "Analytics clear status", body = AnalyticsClearResponse)),
     security(("api_key" = []))
 )]
 pub async fn clear_analytics(
     State(engine): State<Arc<AnalyticsQueryEngine>>,
-    Json(body): Json<SeedRequest>,
+    Json(body): Json<ClearRequest>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
     let index = body
         .index
         .ok_or_else(|| FlapjackError::InvalidQuery("Missing 'index' field".to_string()))?;
     validate_analytics_index(&index)?;
 
-    let config = engine.config();
-    let searches_dir = config.searches_dir(&index);
-    let events_dir = config.events_dir(&index);
-
-    let mut removed = 0u64;
-    for dir in [&searches_dir, &events_dir] {
-        if dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        let _ = std::fs::remove_dir_all(&path);
-                        removed += 1;
-                    } else if path.is_file() {
-                        let _ = std::fs::remove_file(&path);
-                        removed += 1;
-                    }
-                }
-            }
-        }
-    }
+    let config = engine.config().clone();
+    let clear_index = index.clone();
+    let removed = tokio::task::spawn_blocking(move || {
+        flapjack::analytics::seed::clear_analytics(&config, &clear_index)
+    })
+    .await
+    .map_err(|error| FlapjackError::Io(format!("Clear task error: {error}")))?
+    .map_err(|error| FlapjackError::Io(format!("Clear error: {error}")))?;
 
     Ok(Json(serde_json::json!({
         "status": "ok",

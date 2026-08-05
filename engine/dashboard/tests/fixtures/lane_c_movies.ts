@@ -473,7 +473,7 @@ function findLatestLaneCBundleDir(baselineRoot: string = LANE_C_BASELINE_ROOT): 
     .filter((name) => fs.statSync(path.join(baselineRoot, name)).isDirectory())
     .sort();
 
-  const latestBundleName = bundleNames.at(-1);
+  const latestBundleName = bundleNames[bundleNames.length - 1];
   if (!latestBundleName) {
     return null;
   }

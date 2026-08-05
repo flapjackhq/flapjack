@@ -22,7 +22,7 @@ const CONSUMED_FIELDS = [
   FULL_PREFERENCES.subtitleAttribute,
   FULL_PREFERENCES.imageAttribute,
   ...FULL_PREFERENCES.tagAttributes,
-].filter((fieldName): fieldName is string => Boolean(fieldName));
+].filter(Boolean);
 
 function firstDocumentCard(page: Page): Locator {
   return page.getByTestId('results-panel').getByTestId('document-card').first();
@@ -120,7 +120,7 @@ async function saveFullPreferences(page: Page): Promise<void> {
   }
 
   await dialog.getByRole('button', { name: 'Save' }).click();
-  await expect(dialog).not.toBeVisible();
+  await expect(dialog).toBeHidden();
 }
 
 async function verifyFullPreferenceCard(
@@ -184,6 +184,7 @@ test.describe('Display Preferences', () => {
 
   test('loads seeded Browse content before modal interactions', async ({ page }) => {
     await verifyDefaultBrowseCard(page, expectedFirstProduct);
+    await expect(firstDocumentCard(page)).toContainText(expectedFirstProduct.objectID);
   });
 
   test('opens the modal with title/subtitle/image/tag controls and index field options', async ({ page }) => {
@@ -204,7 +205,7 @@ test.describe('Display Preferences', () => {
       FULL_PREFERENCES.subtitleAttribute,
       FULL_PREFERENCES.imageAttribute,
       ...FULL_PREFERENCES.tagAttributes,
-    ].filter((fieldName): fieldName is string => Boolean(fieldName));
+    ].filter(Boolean);
 
     const titleSelect = dialog.getByLabel('Title field', { exact: true });
     for (const fieldName of expectedFieldOptions) {
@@ -221,6 +222,7 @@ test.describe('Display Preferences', () => {
 
     await saveFullPreferences(page);
     await verifyFullPreferenceCard(page, expectedFirstProduct);
+    await expect(firstDocumentCard(page).getByTestId('document-card-title')).toHaveText(expectedFirstProduct.name);
   });
 
   test('clears preferences and reverts cards to default field-value rendering', async ({ page }) => {
@@ -232,7 +234,7 @@ test.describe('Display Preferences', () => {
     const dialog = await openDisplayPreferencesModal(page);
     await dialog.getByRole('button', { name: 'Clear' }).click();
     await dialog.getByRole('button', { name: 'Cancel' }).click();
-    await expect(dialog).not.toBeVisible();
+    await expect(dialog).toBeHidden();
 
     await verifyDefaultBrowseCard(page, expectedFirstProduct);
 

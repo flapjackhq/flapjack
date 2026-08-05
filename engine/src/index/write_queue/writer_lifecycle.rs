@@ -8,21 +8,203 @@
 
 use super::{
     acquire_writer_for_queue, configure_merge_policy, WriteQueueCancellation, WriteQueueContext,
+    WriteQueueWorkerCompletion,
 };
+use crate::error::{FlapjackError, Result};
+use crate::types::TenantId;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 #[cfg(any(debug_assertions, test))]
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
 
 static NEXT_QUEUE_METRICS_ID: AtomicU64 = AtomicU64::new(1);
 static LIVE_QUEUE_METRICS: Lazy<DashMap<String, BTreeSet<u64>>> = Lazy::new(DashMap::new);
+const DROP_WRITE_QUEUE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(any(debug_assertions, test))]
 static WRITER_LIFECYCLE_TEST_LOG: Lazy<Mutex<WriterLifecycleTestLog>> =
     Lazy::new(|| Mutex::new(WriterLifecycleTestLog::default()));
+#[cfg(test)]
+static WRITER_CLOSE_HOOK: Lazy<Mutex<Option<WriterCloseHook>>> = Lazy::new(|| Mutex::new(None));
+
+#[derive(Clone)]
+pub(crate) struct WriteTaskHandle {
+    inner: Arc<WriteTaskHandleInner>,
+}
+
+struct WriteTaskHandleInner {
+    state: std::sync::Mutex<WriteTaskHandleState>,
+    completion: tokio::sync::Notify,
+    cancellation: Option<WriteQueueCancellation>,
+    worker_completion: Option<WriteQueueWorkerCompletion>,
+}
+
+enum WriteTaskHandleState {
+    Running(JoinHandle<Result<()>>),
+    Draining,
+    Finished(Result<()>),
+}
+
+impl WriteTaskHandle {
+    #[cfg(test)]
+    pub(crate) fn new(handle: JoinHandle<Result<()>>) -> Self {
+        Self {
+            inner: Arc::new(WriteTaskHandleInner {
+                state: std::sync::Mutex::new(WriteTaskHandleState::Running(handle)),
+                completion: tokio::sync::Notify::new(),
+                cancellation: None,
+                worker_completion: None,
+            }),
+        }
+    }
+
+    pub(crate) fn new_with_cancellation(
+        handle: JoinHandle<Result<()>>,
+        cancellation: WriteQueueCancellation,
+        worker_completion: WriteQueueWorkerCompletion,
+    ) -> Self {
+        Self {
+            inner: Arc::new(WriteTaskHandleInner {
+                state: std::sync::Mutex::new(WriteTaskHandleState::Running(handle)),
+                completion: tokio::sync::Notify::new(),
+                cancellation: Some(cancellation),
+                worker_completion: Some(worker_completion),
+            }),
+        }
+    }
+
+    pub(crate) fn abort(&self) {
+        if let Some(cancellation) = &self.inner.cancellation {
+            // Dedicated write workers stop at the next write-loop event
+            // boundary after committing any work already inside commit_batch.
+            cancellation.cancel();
+        }
+        if let WriteTaskHandleState::Running(handle) = &*self.inner.state.lock().unwrap() {
+            if self.inner.cancellation.is_none() {
+                handle.abort();
+            }
+        }
+    }
+
+    pub(crate) fn wait_for_shutdown_after_cancellation(&self, tenant_id: TenantId) {
+        let Some(worker_completion) = self.inner.worker_completion.clone() else {
+            return;
+        };
+
+        match worker_completion.wait_timeout(DROP_WRITE_QUEUE_DRAIN_TIMEOUT) {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                tracing::error!(
+                    tenant_id = %tenant_id,
+                    %error,
+                    "write queue drain failed during IndexManager drop"
+                );
+            }
+            None => {
+                tracing::error!(
+                    tenant_id = %tenant_id,
+                    "write queue drain did not report completion during IndexManager drop"
+                );
+            }
+        }
+    }
+
+    pub(crate) async fn drain(&self, tenant_id: TenantId) -> Result<()> {
+        self.start_drain_monitor(tenant_id);
+        loop {
+            let notified = self.inner.completion.notified();
+            if let WriteTaskHandleState::Finished(result) = &*self.inner.state.lock().unwrap() {
+                return result.clone();
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn same_handle(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn start_drain_monitor(&self, tenant_id: TenantId) {
+        let handle = {
+            let mut state_guard = self.inner.state.lock().unwrap();
+            match std::mem::replace(&mut *state_guard, WriteTaskHandleState::Draining) {
+                WriteTaskHandleState::Running(handle) => Some(handle),
+                previous @ (WriteTaskHandleState::Draining | WriteTaskHandleState::Finished(_)) => {
+                    *state_guard = previous;
+                    None
+                }
+            }
+        };
+
+        if let Some(handle) = handle {
+            let inner = Arc::clone(&self.inner);
+            tokio::spawn(async move {
+                let result = match handle.await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(write_queue_drain_error(&tenant_id, error)),
+                    Err(error) => Err(write_queue_drain_error(&tenant_id, error)),
+                };
+                *inner.state.lock().unwrap() = WriteTaskHandleState::Finished(result);
+                inner.completion.notify_waiters();
+            });
+        }
+    }
+}
+
+fn write_queue_drain_error(tenant_id: &str, error: impl std::fmt::Display) -> FlapjackError {
+    FlapjackError::Tantivy(format!(
+        "destination write queue drain failed for {tenant_id}: {error}"
+    ))
+}
+
+#[cfg(test)]
+type WriterCloseHook = Arc<dyn Fn(&str) + Send + Sync + 'static>;
+
+#[cfg(test)]
+pub(crate) struct WriterCloseHookGuard {
+    previous: Option<WriterCloseHook>,
+}
+
+#[cfg(test)]
+impl Drop for WriterCloseHookGuard {
+    fn drop(&mut self) {
+        *WRITER_CLOSE_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.previous.take();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_writer_close_hook_for_test(
+    hook: impl Fn(&str) + Send + Sync + 'static,
+) -> WriterCloseHookGuard {
+    let mut slot = WRITER_CLOSE_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    WriterCloseHookGuard {
+        previous: slot.replace(Arc::new(hook)),
+    }
+}
+
+#[cfg(test)]
+fn run_writer_close_hook_for_test(tenant_id: &str) {
+    let hook = WRITER_CLOSE_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(tenant_id);
+    }
+}
+
+#[cfg(not(test))]
+fn run_writer_close_hook_for_test(_tenant_id: &str) {}
+
 #[cfg(any(debug_assertions, test))]
 const WRITER_LIFECYCLE_TEST_EVENT_LIMIT: usize = 4096;
 #[cfg(any(debug_assertions, test))]
@@ -454,6 +636,7 @@ fn close_writer_after_merge_quiescence(
     reason: &str,
 ) -> crate::error::Result<()> {
     if let Some(writer) = writer.take() {
+        run_writer_close_hook_for_test(&ctx.tenant_id);
         let merge_wait_started_at = Instant::now();
         let close_result = writer.wait_merging_threads();
         let merge_wait = merge_wait_started_at.elapsed();

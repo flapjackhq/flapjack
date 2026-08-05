@@ -15,7 +15,7 @@ use super::hybrid::{
     apply_hybrid_fusion, resolve_hybrid_search_inputs, HybridFusionContext, HybridSearchInputs,
 };
 use super::personalization::{resolve_personalization_context, PersonalizationContext};
-use super::pipeline::{measure_pipeline_elapsed, PreparedSearchParams};
+use super::pipeline::{measure_search_phase, PreparedSearchParams};
 use super::response::{format_search_response, ResponseAssemblyContext};
 use super::single_interleaving::{execute_core_search, CoreSearchContext};
 use super::single_support::{
@@ -23,7 +23,7 @@ use super::single_support::{
     resolve_distinct_count, resolve_optional_filter_groups, resolve_search_sort,
     resolve_search_window, resolve_typo_tolerance,
 };
-use super::transforms::apply_reranking_and_transforms;
+use super::transforms::{apply_reranking_and_transforms, TransformContext};
 
 /// Top-level single-index search orchestrator: validates the request, resolves
 /// experiment/personalization/hybrid context, executes search on a blocking thread,
@@ -206,7 +206,7 @@ fn search_single_sync(
     })?;
 
     let ((fallback_message, transform_outputs), search_elapsed) =
-        measure_pipeline_elapsed(start, || {
+        measure_search_phase(start, |search_phase_witness| {
             let fallback_message = apply_hybrid_fusion(
                 &HybridFusionContext {
                     state: &state,
@@ -224,13 +224,16 @@ fn search_single_sync(
             );
 
             let transform_outputs = apply_reranking_and_transforms(
-                &state,
-                &req,
-                &params,
                 &mut result,
-                &effective_index,
-                personalization_ctx.as_ref(),
-                is_interleaving,
+                TransformContext {
+                    state: &state,
+                    req: &req,
+                    params: &params,
+                    effective_index: &effective_index,
+                    personalization_ctx: personalization_ctx.as_ref(),
+                    is_interleaving,
+                    search_phase_witness,
+                },
             );
 
             (fallback_message, transform_outputs)

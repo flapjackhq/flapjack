@@ -1,4 +1,4 @@
-use super::algolia_client::{AlgoliaClientError, AlgoliaErrorKind, AlgoliaIndexRecord};
+use super::algolia_client::{AlgoliaClientError, AlgoliaIndexRecord};
 use super::meilisearch_client::{
     MeilisearchClientError, MeilisearchErrorKind, MeilisearchSourceObservation,
 };
@@ -7,14 +7,18 @@ use super::source_identity_partitions::{
     IDENTITY_V2_DOMAIN,
 };
 use super::source_reader::{
+    algolia_document_records, source_configuration_stable_ids, AlgoliaReplicaSource,
     MeilisearchExportSource, MeilisearchPageConsumer, MeilisearchSourceFuture,
-    MigrationSourceReader, PageConsumer, SourceExportSink, SourceFuture, TypesenseExportSource,
+    MigrationSourceReader, SourceConfigurationArtifact, SourceConfigurationConsumer,
+    SourceDocumentPageConsumer, SourceExportError, SourceExportErrorKind, SourceExportRecord,
+    SourceExportSink, SourceFuture, SourceObservation, TypesenseExportSource,
     TypesensePageConsumer, TypesenseSourceFuture,
 };
 use super::source_snapshot::{source_item_hash, update_source_item_hash_digest};
 use super::typesense_client::{
     TypesenseClientError, TypesenseErrorKind, TypesenseSourceObservation,
 };
+use super::AsyncMigrationSourceProvider;
 use crate::dto::SearchRequest;
 use axum::{extract::State, Json};
 use serde_json::Value;
@@ -231,6 +235,9 @@ fn typesense_test_script_error() -> TypesenseClientError {
 pub(super) struct ScriptedSourceReader {
     pub(super) app_id: String,
     pub(super) source_name: String,
+    /// The provider this scripted reader reports at the neutral seam. Defaults
+    /// to Algolia; overridden to prove provider admission refuses a mismatch.
+    source_provider: AsyncMigrationSourceProvider,
     pub(super) quiescent_records: VecDeque<AlgoliaIndexRecord>,
     pub(super) settings_reads: VecDeque<Value>,
     pub(super) index_settings_reads: VecDeque<(String, Result<Value, AlgoliaClientError>)>,
@@ -239,6 +246,9 @@ pub(super) struct ScriptedSourceReader {
     pub(super) rule_reads: VecDeque<Vec<Vec<Value>>>,
     pub(super) synonym_reads: VecDeque<Vec<Vec<Value>>>,
     pub(super) acl_checks: usize,
+    /// The primary settings captured during this pass, mirroring the Algolia
+    /// adapter so derived replica reads resolve from one already-read value.
+    captured_primary_settings: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -252,6 +262,7 @@ impl ScriptedSourceReader {
         Self {
             app_id: app_id.to_string(),
             source_name: source_name.to_string(),
+            source_provider: AsyncMigrationSourceProvider::Algolia,
             quiescent_records: VecDeque::new(),
             settings_reads: VecDeque::new(),
             index_settings_reads: VecDeque::new(),
@@ -260,7 +271,16 @@ impl ScriptedSourceReader {
             rule_reads: VecDeque::new(),
             synonym_reads: VecDeque::new(),
             acl_checks: 0,
+            captured_primary_settings: None,
         }
+    }
+
+    /// Report a different provider at the neutral seam while keeping the
+    /// Algolia-shaped script, so provider admission can be exercised without a
+    /// second scripted reader.
+    pub(super) fn reporting_provider(mut self, provider: AsyncMigrationSourceProvider) -> Self {
+        self.source_provider = provider;
+        self
     }
 
     /// Queue one full traversal pass: a settings read plus document, rule, and
@@ -311,118 +331,154 @@ impl ScriptedSourceReader {
             .push_back((expected_index_name.to_string(), result));
     }
 
-    fn pop_value(queue: &mut VecDeque<Value>) -> SourceFuture<'_, Value> {
-        Box::pin(async move {
-            queue.pop_front().ok_or_else(|| {
-                AlgoliaClientError::new(AlgoliaErrorKind::Progress, "test source script exhausted")
-            })
-        })
+    /// Queue successful derived-settings reads in collector order for both
+    /// passes of the source-stability capture.
+    pub(super) fn push_index_settings_for_capture_passes<I, N>(&mut self, settings: I)
+    where
+        I: IntoIterator<Item = (N, Value)>,
+        N: Into<String>,
+    {
+        let settings = settings
+            .into_iter()
+            .map(|(name, value)| (name.into(), value))
+            .collect::<Vec<_>>();
+        for _ in 0..2 {
+            for (name, value) in &settings {
+                self.push_index_settings(name, Ok(value.clone()));
+            }
+        }
     }
 
+    fn pop_value(queue: &mut VecDeque<Value>) -> Result<Value, SourceExportError> {
+        queue.pop_front().ok_or_else(script_exhausted_error)
+    }
+
+    /// Replay one queued traversal pass of object pages, honoring the failure
+    /// the pass was queued with.
     fn stream_pages<'a>(
         queue: &'a mut VecDeque<Vec<Vec<Value>>>,
-        consume_page: &'a mut PageConsumer<'a>,
-    ) -> SourceFuture<'a, ()> {
-        Self::stream_pages_with_failure(queue, None, consume_page)
-    }
-
-    fn stream_pages_with_failure<'a>(
-        queue: &'a mut VecDeque<Vec<Vec<Value>>>,
         failure: Option<PageFailure>,
-        consume_page: &'a mut PageConsumer<'a>,
-    ) -> SourceFuture<'a, ()> {
-        Box::pin(async move {
-            let pages = queue.pop_front().ok_or_else(|| {
-                AlgoliaClientError::new(AlgoliaErrorKind::Progress, "test source script exhausted")
-            })?;
-            for (page_index, page) in pages.into_iter().enumerate() {
-                consume_page(page)?;
-                if let Some(failure) = &failure {
-                    if page_index + 1 == failure.completed_pages_before_failure {
-                        return Err(failure.error.clone());
-                    }
+        mut consume_page: impl FnMut(Vec<Value>) -> Result<(), SourceExportError> + 'a,
+    ) -> Result<(), SourceExportError> {
+        let pages = queue.pop_front().ok_or_else(script_exhausted_error)?;
+        for (page_index, page) in pages.into_iter().enumerate() {
+            consume_page(page)?;
+            if let Some(failure) = &failure {
+                if page_index + 1 == failure.completed_pages_before_failure {
+                    return Err(failure.error.clone().into());
                 }
             }
-            Ok(())
+        }
+        Ok(())
+    }
+}
+
+fn script_exhausted_error() -> SourceExportError {
+    SourceExportError::new(
+        SourceExportErrorKind::Progress,
+        "test source script exhausted",
+    )
+}
+
+impl AlgoliaReplicaSource for ScriptedSourceReader {
+    fn read_index_settings<'a>(&'a mut self, index_name: &'a str) -> SourceFuture<'a, Value> {
+        Box::pin(async move {
+            let (expected, result) = self.index_settings_reads.pop_front().ok_or_else(|| {
+                SourceExportError::new(
+                    SourceExportErrorKind::Progress,
+                    "test source index settings script exhausted",
+                )
+            })?;
+            if expected != index_name {
+                return Err(SourceExportError::new(
+                    SourceExportErrorKind::Progress,
+                    "test source index settings requested out of order",
+                ));
+            }
+            result.map_err(Into::into)
         })
     }
 }
 
 impl MigrationSourceReader for ScriptedSourceReader {
-    fn app_id(&self) -> &str {
-        &self.app_id
+    fn source_provider(&self) -> AsyncMigrationSourceProvider {
+        self.source_provider
+    }
+
+    fn source_namespace(&self) -> Option<&str> {
+        Some(&self.app_id)
     }
 
     fn source_name(&self) -> &str {
         &self.source_name
     }
 
-    fn wait_for_quiescent_source(&mut self) -> SourceFuture<'_, AlgoliaIndexRecord> {
+    fn observe_quiescent_source(&mut self) -> SourceFuture<'_, SourceObservation> {
         Box::pin(async move {
-            self.quiescent_records.pop_front().ok_or_else(|| {
-                AlgoliaClientError::new(AlgoliaErrorKind::Progress, "test source script exhausted")
+            let record = self
+                .quiescent_records
+                .pop_front()
+                .ok_or_else(script_exhausted_error)?;
+            Ok(SourceObservation {
+                source_name: record.name,
+                accepted_revision: record.updated_at.clone(),
+                identity_revision: record.updated_at,
+                document_count: record.entries,
+                quiescent: !record.pending_task,
             })
         })
     }
 
-    fn read_settings(&mut self) -> SourceFuture<'_, Value> {
-        Self::pop_value(&mut self.settings_reads)
-    }
-
-    fn read_index_settings<'a>(&'a mut self, index_name: &'a str) -> SourceFuture<'a, Value> {
-        Box::pin(async move {
-            let (expected, result) = self.index_settings_reads.pop_front().ok_or_else(|| {
-                AlgoliaClientError::new(
-                    AlgoliaErrorKind::Progress,
-                    "test source index settings script exhausted",
-                )
-            })?;
-            if expected != index_name {
-                return Err(AlgoliaClientError::new(
-                    AlgoliaErrorKind::Progress,
-                    "test source index settings requested out of order",
-                ));
-            }
-            result
-        })
-    }
-
-    fn require_unretrievable_access<'a>(
+    fn read_configuration<'a>(
         &'a mut self,
-        _settings: &'a Value,
+        consume: &'a mut SourceConfigurationConsumer<'a>,
     ) -> SourceFuture<'a, ()> {
         Box::pin(async move {
+            let settings = Self::pop_value(&mut self.settings_reads)?;
             self.acl_checks += 1;
-            Ok(())
+            let artifact = SourceConfigurationArtifact::settings(&settings);
+            if let SourceConfigurationArtifact::Settings { payload } = &artifact {
+                self.captured_primary_settings = Some(payload.clone());
+            }
+            consume(artifact)?;
+            Self::stream_pages(&mut self.rule_reads, None, |page| {
+                consume(SourceConfigurationArtifact::rules(&page)?)
+            })?;
+            Self::stream_pages(&mut self.synonym_reads, None, |page| {
+                consume(SourceConfigurationArtifact::synonyms(&page)?)
+            })
         })
     }
 
-    fn read_documents<'a>(
+    fn read_derived_configuration<'a>(
         &'a mut self,
-        consume_page: &'a mut PageConsumer<'a>,
+        consume: &'a mut SourceConfigurationConsumer<'a>,
     ) -> SourceFuture<'a, ()> {
-        let failure = self.document_failures.pop_front().unwrap_or(None);
-        Self::stream_pages_with_failure(&mut self.document_reads, failure, consume_page)
+        Box::pin(async move {
+            let Some(primary_settings) = self.captured_primary_settings.clone() else {
+                return Ok(());
+            };
+            super::source_reader::collect_replica_settings(self, &primary_settings, consume).await
+        })
     }
 
-    fn read_rules<'a>(
+    fn read_document_records<'a>(
         &'a mut self,
-        consume_page: &'a mut PageConsumer<'a>,
+        consume_page: &'a mut SourceDocumentPageConsumer<'a>,
     ) -> SourceFuture<'a, ()> {
-        Self::stream_pages(&mut self.rule_reads, consume_page)
-    }
-
-    fn read_synonyms<'a>(
-        &'a mut self,
-        consume_page: &'a mut PageConsumer<'a>,
-    ) -> SourceFuture<'a, ()> {
-        Self::stream_pages(&mut self.synonym_reads, consume_page)
+        Box::pin(async move {
+            let failure = self.document_failures.pop_front().unwrap_or(None);
+            Self::stream_pages(&mut self.document_reads, failure, |page| {
+                consume_page(algolia_document_records(&page)?)
+            })
+        })
     }
 }
 
 #[derive(Default)]
 pub(super) struct RecordingSink {
     pub(super) settings: Vec<Value>,
+    pub(super) replica_settings: std::collections::BTreeMap<String, Value>,
     pub(super) document_pages: Vec<Vec<String>>,
     pub(super) raw_document_pages: Vec<Vec<Value>>,
     pub(super) rule_pages: Vec<Vec<String>>,
@@ -432,39 +488,61 @@ pub(super) struct RecordingSink {
 }
 
 impl SourceExportSink for RecordingSink {
-    fn commit_settings(&mut self, settings: &Value) -> Result<(), AlgoliaClientError> {
-        self.settings.push(settings.clone());
+    fn commit_configuration(
+        &mut self,
+        artifact: &SourceConfigurationArtifact,
+    ) -> Result<(), SourceExportError> {
+        match artifact {
+            SourceConfigurationArtifact::Settings { payload } => {
+                self.settings.push(payload.clone())
+            }
+            SourceConfigurationArtifact::Rules { records } => {
+                self.rule_pages
+                    .push(source_configuration_stable_ids(records));
+                self.raw_rule_pages.push(
+                    records
+                        .iter()
+                        .map(|record| record.to_capture_value())
+                        .collect(),
+                );
+            }
+            SourceConfigurationArtifact::Synonyms { records } => {
+                self.synonym_pages
+                    .push(source_configuration_stable_ids(records));
+                self.raw_synonym_pages.push(
+                    records
+                        .iter()
+                        .map(|record| record.to_capture_value())
+                        .collect(),
+                );
+            }
+            SourceConfigurationArtifact::ReplicaSettings {
+                source_name,
+                payload,
+            } => {
+                self.replica_settings
+                    .insert(source_name.clone(), payload.clone());
+            }
+        }
         Ok(())
     }
 
-    fn commit_document_page(&mut self, page: &[Value]) -> Result<(), AlgoliaClientError> {
-        self.document_pages.push(page_object_ids(page));
-        self.raw_document_pages.push(page.to_vec());
+    fn commit_document_page(
+        &mut self,
+        page: &[SourceExportRecord],
+    ) -> Result<(), SourceExportError> {
+        self.document_pages.push(
+            page.iter()
+                .map(|record| record.stable_id().to_string())
+                .collect(),
+        );
+        self.raw_document_pages.push(
+            page.iter()
+                .map(SourceExportRecord::to_capture_value)
+                .collect(),
+        );
         Ok(())
     }
-
-    fn commit_rule_page(&mut self, page: &[Value]) -> Result<(), AlgoliaClientError> {
-        self.rule_pages.push(page_object_ids(page));
-        self.raw_rule_pages.push(page.to_vec());
-        Ok(())
-    }
-
-    fn commit_synonym_page(&mut self, page: &[Value]) -> Result<(), AlgoliaClientError> {
-        self.synonym_pages.push(page_object_ids(page));
-        self.raw_synonym_pages.push(page.to_vec());
-        Ok(())
-    }
-}
-
-pub(super) fn page_object_ids(page: &[Value]) -> Vec<String> {
-    page.iter()
-        .map(|item| {
-            item.get("objectID")
-                .and_then(Value::as_str)
-                .expect("test fixtures should contain string objectID")
-                .to_string()
-        })
-        .collect()
 }
 
 pub(super) fn expected_document_v2_digest(items: Vec<Value>, partition_count: u32) -> String {

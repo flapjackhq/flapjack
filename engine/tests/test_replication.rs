@@ -32,6 +32,7 @@ use tempfile::TempDir;
 
 const REPLICATION_CONVERGENCE_ATTEMPTS: usize = 1000;
 const REPLICATION_CONVERGENCE_POLL: tokio::time::Duration = tokio::time::Duration::from_millis(10);
+const ALLOW_CLEARTEXT_REPLICATION_PEERS_ENV: &str = "FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS";
 
 async fn apply_replicated_op_and_wait(
     manager: &IndexManager,
@@ -1345,7 +1346,41 @@ async fn assert_missing_replication_manager_rejected(peer_url: &str) {
 }
 
 #[tokio::test]
+#[serial_test::serial(runtime_peer_transport_env)]
+async fn authenticated_http_add_peer_rejects_cleartext_caller_credentials_by_default() {
+    let _cleartext_override =
+        common::EnvVarRestoreGuard::remove(ALLOW_CLEARTEXT_REPLICATION_PEERS_ENV);
+    let admin_key = "runtime-membership-transport-policy-admin-key";
+    let harness = common::state::spawn_authenticated_runtime_add_peer_pair(admin_key).await;
+    let admin_client = authenticated_client(harness.admin_key.as_deref().unwrap());
+
+    let response = post_add_peer(
+        &admin_client,
+        &harness.node_a_addr,
+        serde_json::json!({
+            "node_id": "node-b",
+            "addr": format!("{}/", harness.node_b_peer_url),
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let response_body: serde_json::Value = response.json().await.unwrap();
+    let expected_message = format!(
+        "Refusing replication peer node-b at {}: authenticated analytics query fan-out forwards \
+         caller API keys and the peer origin is cleartext http://, which would send the peer \
+         credential in plaintext. Move the peer to https://, or set \
+         FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1 to keep the cleartext peer.",
+        harness.node_b_peer_url
+    );
+    assert_eq!(response_body["message"], expected_message);
+    assert_eq!(harness.node_a_replication_manager.peer_count(), 0);
+}
+
+#[tokio::test]
+#[serial_test::serial(runtime_peer_transport_env)]
 async fn authenticated_http_add_peer_validates_authorizes_and_replicates_without_restart() {
+    let _cleartext_override =
+        common::EnvVarRestoreGuard::set(ALLOW_CLEARTEXT_REPLICATION_PEERS_ENV, "1");
     let admin_key = "runtime-membership-admin-key";
     let harness = common::state::spawn_authenticated_runtime_add_peer_pair(admin_key).await;
     let admin_client = authenticated_client(harness.admin_key.as_deref().unwrap());
@@ -1506,7 +1541,10 @@ async fn assert_remove_peer_forbidden_preserves_membership(
 }
 
 #[tokio::test]
+#[serial_test::serial(runtime_peer_transport_env)]
 async fn authenticated_http_remove_peer_stops_future_replication_without_restart() {
+    let _cleartext_override =
+        common::EnvVarRestoreGuard::set(ALLOW_CLEARTEXT_REPLICATION_PEERS_ENV, "1");
     let admin_key = "runtime-membership-remove-admin-key";
     let harness = common::state::spawn_authenticated_runtime_add_peer_triplet(admin_key).await;
     let admin_client = authenticated_client(harness.admin_key.as_deref().unwrap());
@@ -3456,7 +3494,7 @@ async fn test_run_rollup_broadcast_sends_to_peer() {
             addr: format!("http://{}", addr_b),
         }],
     };
-    let cluster = flapjack_http::analytics_cluster::AnalyticsClusterClient::new(&node_cfg)
+    let cluster = flapjack_http::analytics_cluster::AnalyticsClusterClient::new(&node_cfg, None)
         .expect("Should build cluster client with one peer");
 
     // Run one broadcast cycle (synchronous, no spawn needed for unit testing)
@@ -3534,7 +3572,7 @@ async fn test_rollup_broadcaster_integration_periodic() {
             addr: format!("http://{}", addr_b),
         }],
     };
-    let cluster = flapjack_http::analytics_cluster::AnalyticsClusterClient::new(&node_cfg)
+    let cluster = flapjack_http::analytics_cluster::AnalyticsClusterClient::new(&node_cfg, None)
         .expect("Should build cluster client");
 
     // Spawn broadcaster with a 1-second interval

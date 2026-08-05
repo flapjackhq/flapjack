@@ -15,6 +15,8 @@ node_modules/
 /data
 /tmp
 /venv
+# Stray probe fallback artifacts: $REJECTION_PATH.tmp.$$ written to CWD when unset
+/.tmp.*
 
 # Data directories
 /datasets/
@@ -148,6 +150,10 @@ validation_summary.md
 
 # HA runtime evidence is preserved locally by the harness, not committed.
 engine/examples/ha-cluster/results/
+
+# Remote measurement evidence fetched by run_remote.sh --evidence-local; local
+# run output, never committed.
+engine/dashboard/.evidence/
 
 # scrai incremental scan caches — derived from source code; nothing outside scrai reads them
 .scrai/state.json

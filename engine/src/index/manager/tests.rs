@@ -7,7 +7,10 @@ use crate::index::write_queue::admission::{
 };
 use crate::index::write_queue::{FinalizationFaultPoint, ReplicatedWriteOrigin, WriteOp};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{mpsc, Arc};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    mpsc, Arc,
+};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -515,6 +518,94 @@ fn fill_write_queue_without_admission(manager: &IndexManager, tenant_id: &str) {
             std::future::pending().await
         })),
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manager_drop_cancels_all_write_workers_before_waiting_for_lock_release() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_ids = [
+        "drop_waits_for_writer_lock_release_a".to_string(),
+        "drop_waits_for_writer_lock_release_b".to_string(),
+    ];
+    let manager = IndexManager::new(temp_dir.path());
+
+    for tenant_id in &tenant_ids {
+        manager.create_tenant(tenant_id).unwrap();
+        manager
+            .add_documents_sync(
+                tenant_id,
+                vec![write_queue_test_document("seed", "seed document")],
+            )
+            .await
+            .unwrap();
+    }
+
+    let (first_close_started_tx, first_close_started_rx) = mpsc::channel();
+    let (second_close_started_tx, second_close_started_rx) = mpsc::channel();
+    let (release_close_tx, release_close_rx) = mpsc::channel();
+    let release_close_rx = std::sync::Mutex::new(Some(release_close_rx));
+    let close_count = AtomicUsize::new(0);
+    let _hook = crate::index::write_queue::set_writer_close_hook_for_test({
+        let tenant_ids = tenant_ids.clone();
+        move |closing_tenant| {
+            if tenant_ids
+                .iter()
+                .any(|tenant_id| tenant_id == closing_tenant)
+            {
+                match close_count.fetch_add(1, AtomicOrdering::SeqCst) {
+                    0 => {
+                        first_close_started_tx
+                            .send(closing_tenant.to_string())
+                            .unwrap();
+                        let receiver = release_close_rx.lock().unwrap().take().unwrap();
+                        let _ = receiver.recv();
+                    }
+                    1 => second_close_started_tx
+                        .send(closing_tenant.to_string())
+                        .unwrap(),
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    let (drop_done_tx, drop_done_rx) = mpsc::channel();
+    let drop_thread = std::thread::spawn(move || {
+        drop(manager);
+        drop_done_tx.send(()).unwrap();
+    });
+
+    let first_closing_tenant = first_close_started_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("drop must cancel the worker and reach the writer-close checkpoint");
+    let second_closing_tenant = second_close_started_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("drop must cancel every worker before waiting for the first worker to close");
+    assert_ne!(first_closing_tenant, second_closing_tenant);
+    assert!(
+        drop_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "IndexManager::drop must wait until the cancelled worker releases its writer lock"
+    );
+
+    release_close_tx.send(()).unwrap();
+    drop_done_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("drop must complete after the worker releases its writer lock");
+    drop_thread.join().unwrap();
+
+    let restarted = IndexManager::new(temp_dir.path());
+    for tenant_id in &tenant_ids {
+        restarted.create_tenant(tenant_id).unwrap();
+        restarted
+            .add_documents_sync(
+                tenant_id,
+                vec![write_queue_test_document("after", "after restart")],
+            )
+            .await
+            .expect("restart write must acquire the released Tantivy writer lock");
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2897,6 +2988,41 @@ async fn post_admission_write_queue_abort_returns_write_ack_timeout_and_keeps_ta
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn active_slow_write_does_not_return_success_before_finalization() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "active_slow_durable_timeout";
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+    let _commit_delay =
+        crate::index::write_queue::delay_commits_for_test(tenant_id, Duration::from_millis(1_250));
+
+    let task = manager
+        .admit_documents_durable(
+            tenant_id,
+            vec![write_queue_test_document(
+                "active_slow_document",
+                "must not be acknowledged before commit",
+            )],
+        )
+        .unwrap();
+    let result = manager
+        .wait_for_write_durable_with_timeout_for_test(&task.id, Duration::from_millis(25))
+        .await;
+
+    assert!(
+        matches!(result, Err(FlapjackError::WriteAckTimeout)),
+        "an active unfinalized write must remain retryable, got {result:?}"
+    );
+    assert!(
+        matches!(
+            manager.get_task(&task.id).unwrap().status,
+            TaskStatus::Enqueued | TaskStatus::Processing
+        ),
+        "the timeout response must precede finalization in this regression"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(flapjack_write_durable_timeout_env)]
 async fn post_admission_write_queue_writer_slot_contention_returns_too_many_concurrent_writes() {
     let _durable_timeout_guard = DurableWriteTimeoutEnvGuard::set("750");
@@ -3021,6 +3147,12 @@ struct FinalizationBoundarySpec {
     name: &'static str,
     fault_point: FinalizationFaultPoint,
     expected_count_after_recovery: u64,
+    // Admission records still on disk when the caller observes terminal failure,
+    // before restart reconciliation. B1 fails pre-Tantivy-commit and compensation
+    // already dropped its record (0); every post-commit boundary keeps its record
+    // until recovery (1). Owned here so the storage proof and the refusal proof
+    // read one value instead of each restating the fault-point comparison.
+    expected_admission_records_before_restart: usize,
 }
 
 fn finalization_boundary_specs() -> [FinalizationBoundarySpec; 6] {
@@ -3028,32 +3160,42 @@ fn finalization_boundary_specs() -> [FinalizationBoundarySpec; 6] {
         FinalizationBoundarySpec {
             name: "b1_after_oplog_append_before_tantivy_commit",
             fault_point: FinalizationFaultPoint::AfterOplogAppendBeforeTantivyCommit,
-            expected_count_after_recovery: 3,
+            // DUR-1: the batch failed before its Tantivy commit, so compensation
+            // retracts its oplog + admission state and only the baseline survives.
+            expected_count_after_recovery: 1,
+            expected_admission_records_before_restart: 0,
         },
         FinalizationBoundarySpec {
             name: "b2_after_tantivy_commit_before_version_receipts",
             fault_point: FinalizationFaultPoint::AfterTantivyCommitBeforeVersionReceipts,
             expected_count_after_recovery: 3,
+            expected_admission_records_before_restart: 1,
         },
         FinalizationBoundarySpec {
             name: "b3_inside_version_receipt_transaction",
             fault_point: FinalizationFaultPoint::AfterFirstVersionReceiptStatement,
             expected_count_after_recovery: 3,
+            expected_admission_records_before_restart: 1,
         },
         FinalizationBoundarySpec {
             name: "b4_after_version_transaction_before_committed_seq",
             fault_point: FinalizationFaultPoint::AfterVersionTransactionBeforeCommittedSeq,
             expected_count_after_recovery: 3,
+            expected_admission_records_before_restart: 1,
         },
         FinalizationBoundarySpec {
             name: "b5_after_committed_seq_before_oplog_truncation",
             fault_point: FinalizationFaultPoint::AfterCommittedSeqBeforeOplogTruncation,
             expected_count_after_recovery: 3,
+            expected_admission_records_before_restart: 1,
         },
         FinalizationBoundarySpec {
             name: "b6_after_oplog_truncation_before_admission_ack",
             fault_point: FinalizationFaultPoint::AfterOplogTruncationBeforeAdmissionAck,
             expected_count_after_recovery: 3,
+            // B6 truncated the oplog but never acked admission, so the admission
+            // record is still on disk until restart reconciliation.
+            expected_admission_records_before_restart: 1,
         },
     ]
 }
@@ -3134,12 +3276,40 @@ fn assert_failed_boundary_storage(
     spec: FinalizationBoundarySpec,
     run: &FailedBoundaryRun,
 ) {
-    assert!(!matches!(
-        run.manager.get_task(&run.task.id).unwrap().status,
-        TaskStatus::Succeeded
-    ));
+    let canonical_task = run.manager.get_task(&run.task.id).unwrap();
+    assert_eq!(
+        canonical_task.id, run.task.id,
+        "canonical task lookup must resolve to the failed boundary task"
+    );
+    let numeric_task = run
+        .manager
+        .get_task(&run.task.numeric_id.to_string())
+        .unwrap();
+    assert_eq!(
+        numeric_task.id, run.task.id,
+        "numeric task alias must resolve to the failed boundary task"
+    );
+    assert_eq!(
+        numeric_task.numeric_id, run.task.numeric_id,
+        "numeric task alias must preserve the failed boundary numeric id"
+    );
+    let failed_status = canonical_task.status;
+    let numeric_status = numeric_task.status;
+    assert!(
+        matches!(&failed_status, TaskStatus::Failed(_)),
+        "{} task canonical lookup must reach terminal Failed before restart; got {failed_status:?}",
+        spec.name
+    );
+    assert!(
+        matches!(&numeric_status, TaskStatus::Failed(_)),
+        "{} task numeric alias must reach terminal Failed before restart; got {numeric_status:?}",
+        spec.name
+    );
     assert_searcher_count(&run.manager, tenant_id, 1);
-    assert_eq!(tenant_admission_record_count(temp_dir.path(), tenant_id), 1);
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        spec.expected_admission_records_before_restart
+    );
 
     if spec.fault_point == FinalizationFaultPoint::AfterFirstVersionReceiptStatement {
         let store =
@@ -3171,23 +3341,29 @@ async fn assert_failed_boundary_refuses_writes(
         .drain(tenant_id.to_string())
         .await;
     assert!(drained_worker_result.is_err());
-    if matches!(
-        spec.fault_point,
-        FinalizationFaultPoint::AfterTantivyCommitBeforeVersionReceipts
-            | FinalizationFaultPoint::AfterFirstVersionReceiptStatement
-            | FinalizationFaultPoint::AfterVersionTransactionBeforeCommittedSeq
-            | FinalizationFaultPoint::AfterCommittedSeqBeforeOplogTruncation
-    ) {
-        let refused_write = manager.add_documents(
-            tenant_id,
-            vec![write_queue_test_document(
-                "must_wait_for_recovery",
-                "must not finalize on a failed worker",
-            )],
-        );
-        assert!(matches!(refused_write, Err(FlapjackError::QueueFull)));
-        assert_eq!(tenant_admission_record_count(temp_dir.path(), tenant_id), 1);
-    }
+    // Every finalization boundary leaves the tenant writer dead, so a follow-up
+    // write must be refused outright rather than silently admitted onto a worker
+    // that can never finalize it. The only boundary-specific value is how many
+    // admission records survive the refusal, owned by the spec and cross-checked
+    // before restart in assert_failed_boundary_storage.
+    let refused_write = manager.add_documents(
+        tenant_id,
+        vec![write_queue_test_document(
+            "must_wait_for_recovery",
+            "must not finalize on a failed worker",
+        )],
+    );
+    assert!(
+        matches!(refused_write, Err(FlapjackError::QueueFull)),
+        "{} must refuse post-failure writes with QueueFull; got {refused_write:?}",
+        spec.name
+    );
+    assert_eq!(
+        tenant_admission_record_count(temp_dir.path(), tenant_id),
+        spec.expected_admission_records_before_restart,
+        "{} must not durably admit a write refused after terminal failure beyond its surviving admission records",
+        spec.name
+    );
     assert_searcher_count(manager, tenant_id, 1);
 }
 
@@ -3200,18 +3376,57 @@ async fn assert_boundary_recovered(
     let restarted = IndexManager::new_with_node_id(temp_dir.path(), "local-node");
     restarted.get_or_load(tenant_id).unwrap();
     assert_searcher_count(&restarted, tenant_id, spec.expected_count_after_recovery);
-    assert_version_tuple(
-        &restarted,
-        tenant_id,
-        "boundary-a",
-        &crate::index::version_store::VersionRecord::new(10_000, "node-a", false, 2),
-    );
-    assert_version_tuple(
-        &restarted,
-        tenant_id,
-        "boundary-b",
-        &crate::index::version_store::VersionRecord::new(20_000, "node-b", false, 3),
-    );
+    if spec.fault_point == FinalizationFaultPoint::AfterOplogAppendBeforeTantivyCommit {
+        // B1 committed nothing; compensation retracted both durable receipts, so
+        // the baseline remains searchable and neither rejected document or
+        // boundary version is resurrected on recovery.
+        let baseline = restarted
+            .get_document(tenant_id, "baseline")
+            .unwrap()
+            .expect("B1 recovery must preserve the baseline document");
+        assert_eq!(baseline.id, "baseline");
+        assert!(
+            restarted
+                .get_document(tenant_id, "boundary-a")
+                .unwrap()
+                .is_none(),
+            "B1 must not make boundary-a searchable after compensation"
+        );
+        assert!(
+            restarted
+                .get_document(tenant_id, "boundary-b")
+                .unwrap()
+                .is_none(),
+            "B1 must not make boundary-b searchable after compensation"
+        );
+        assert_eq!(
+            restarted
+                .get_object_version(tenant_id, "boundary-a")
+                .unwrap(),
+            None,
+            "B1 must not resurrect boundary-a after compensation"
+        );
+        assert_eq!(
+            restarted
+                .get_object_version(tenant_id, "boundary-b")
+                .unwrap(),
+            None,
+            "B1 must not resurrect boundary-b after compensation"
+        );
+    } else {
+        assert_version_tuple(
+            &restarted,
+            tenant_id,
+            "boundary-a",
+            &crate::index::version_store::VersionRecord::new(10_000, "node-a", false, 2),
+        );
+        assert_version_tuple(
+            &restarted,
+            tenant_id,
+            "boundary-b",
+            &crate::index::version_store::VersionRecord::new(20_000, "node-b", false, 3),
+        );
+    }
     assert_eq!(tenant_admission_record_count(temp_dir.path(), tenant_id), 0);
     if spec.fault_point == FinalizationFaultPoint::AfterCommittedSeqBeforeOplogTruncation {
         restarted
@@ -3233,6 +3448,7 @@ async fn assert_boundary_recovered(
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(write_queue_commit_failure_hook)]
+#[serial_test::serial(flapjack_write_durable_timeout_env)]
 async fn finalization_crash_boundaries_recover_without_early_success() {
     let _retention_guard = TestEnvVarGuard::set("FLAPJACK_OPLOG_RETENTION", "0");
     let covered_boundaries = finalization_boundary_specs();
@@ -3252,6 +3468,7 @@ async fn finalization_crash_boundaries_recover_without_early_success() {
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(write_queue_commit_failure_hook)]
+#[serial_test::serial(flapjack_write_durable_timeout_env)]
 async fn primary_b6_retry_preserves_committed_conflict_tuple() {
     let _retention_guard = TestEnvVarGuard::set("FLAPJACK_OPLOG_RETENTION", "0");
     let temp_dir = TempDir::new().unwrap();

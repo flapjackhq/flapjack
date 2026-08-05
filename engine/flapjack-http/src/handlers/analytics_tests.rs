@@ -1,4 +1,5 @@
 use super::*;
+use crate::auth::{ApiKey, SecuredKeyRestrictions, INVALID_API_CREDENTIALS_MESSAGE};
 use crate::test_helpers::body_json;
 use axum::{
     body::Body,
@@ -21,6 +22,331 @@ fn test_analytics_config(tmp: &TempDir) -> AnalyticsConfig {
         flush_size: 10_000,
         retention_days: 90,
     }
+}
+
+fn analytics_only_key_restricted_to(indexes: Vec<String>) -> ApiKey {
+    ApiKey {
+        hash: "analytics-test-hash".to_string(),
+        salt: "analytics-test-salt".to_string(),
+        hmac_key: None,
+        created_at: 0,
+        acl: vec!["analytics".to_string()],
+        description: "analytics test key".to_string(),
+        indexes,
+        max_hits_per_query: 0,
+        max_queries_per_ip_per_hour: 0,
+        query_parameters: String::new(),
+        referers: Vec::new(),
+        restrict_sources: None,
+        validity: 0,
+    }
+}
+
+#[tokio::test]
+async fn analytics_seed_endpoint_applies_configured_volume_and_distributions() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_analytics_config(&tmp);
+    let app = Router::new()
+        .route("/2/analytics/seed", axum::routing::post(seed_analytics))
+        .route("/2/searches/count", get(get_search_count))
+        .route("/2/searches/noResultRate", get(get_no_result_rate))
+        .route("/2/devices", get(get_device_breakdown))
+        .route("/2/geo", get(get_geo_breakdown))
+        .with_state(Arc::new(AnalyticsQueryEngine::new(config)));
+
+    let seed_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/2/analytics/seed")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "index": "configured-seed",
+                        "days": 1,
+                        "searchCount": 20,
+                        "noResultRate": 0.25,
+                        "deviceDistribution": {
+                            "desktop": 0.0,
+                            "mobile": 1.0,
+                            "tablet": 0.0
+                        },
+                        "countryDistribution": { "DE": 1.0 }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(seed_response.status(), StatusCode::OK);
+    let seed_body = body_json(seed_response).await;
+    assert_eq!(seed_body["totalSearches"], 20);
+    let seeded_dates = seed_body["seededDates"].as_array().unwrap();
+    assert_eq!(seeded_dates.len(), 1);
+    let seeded_date = seeded_dates[0].as_str().unwrap();
+    let query = format!("index=configured-seed&startDate={seeded_date}&endDate={seeded_date}");
+
+    let count = get_json(&app, &format!("/2/searches/count?{query}")).await;
+    assert_eq!(count["count"], 20);
+
+    let no_results = get_json(&app, &format!("/2/searches/noResultRate?{query}")).await;
+    assert_eq!(no_results["count"], 20);
+    assert_eq!(no_results["noResults"], 5);
+    assert_eq!(no_results["rate"], 0.25);
+
+    let devices = get_json(&app, &format!("/2/devices?{query}")).await;
+    assert_eq!(
+        devices["platforms"],
+        serde_json::json!([{ "platform": "mobile", "count": 20 }])
+    );
+
+    let geography = get_json(&app, &format!("/2/geo?{query}")).await;
+    assert_eq!(geography["total"], 20);
+    assert_eq!(
+        geography["countries"],
+        serde_json::json!([{ "country": "DE", "count": 20 }])
+    );
+}
+
+#[tokio::test]
+async fn overview_endpoint_filters_to_requested_index() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_analytics_config(&tmp);
+    let app = Router::new()
+        .route("/2/analytics/seed", axum::routing::post(seed_analytics))
+        .route("/2/overview", get(get_overview))
+        .with_state(Arc::new(AnalyticsQueryEngine::new(config)));
+
+    seed_index(&app, "overview-primary", 20).await;
+    seed_index(&app, "overview-other", 35).await;
+
+    let overview = get_json(&app, "/2/overview?index=overview-primary").await;
+
+    assert_eq!(overview["totalSearches"], 20);
+    assert_eq!(
+        overview["indices"],
+        serde_json::json!([{ "index": "overview-primary", "noResults": 1, "searches": 20 }])
+    );
+}
+
+#[tokio::test]
+async fn analytics_index_routes_reject_api_keys_restricted_to_other_indexes() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_analytics_config(&tmp);
+    let app = Router::new()
+        .route("/2/analytics/seed", axum::routing::post(seed_analytics))
+        .route("/2/searches/count", get(get_search_count))
+        .with_state(Arc::new(AnalyticsQueryEngine::new(config)));
+
+    seed_index(&app, "allowed-analytics-index", 5).await;
+    seed_index(&app, "blocked-analytics-index", 9).await;
+
+    let mut request = Request::builder()
+        .method(Method::GET)
+        .uri("/2/searches/count?index=blocked-analytics-index")
+        .body(Body::empty())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(analytics_only_key_restricted_to(vec![
+            "allowed-analytics-index".to_string(),
+        ]));
+
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = body_json(response).await;
+    assert_eq!(body["message"], INVALID_API_CREDENTIALS_MESSAGE);
+}
+
+#[tokio::test]
+async fn analytics_index_routes_reject_secured_key_restrict_indices_mismatches() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_analytics_config(&tmp);
+    let app = Router::new()
+        .route("/2/analytics/seed", axum::routing::post(seed_analytics))
+        .route("/2/searches/count", get(get_search_count))
+        .with_state(Arc::new(AnalyticsQueryEngine::new(config)));
+
+    seed_index(&app, "secured-allowed-index", 4).await;
+    seed_index(&app, "secured-blocked-index", 6).await;
+
+    let mut request = Request::builder()
+        .method(Method::GET)
+        .uri("/2/searches/count?index=secured-blocked-index")
+        .body(Body::empty())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(analytics_only_key_restricted_to(Vec::new()));
+    request.extensions_mut().insert(SecuredKeyRestrictions {
+        restrict_indices: Some(vec!["secured-allowed-index".to_string()]),
+        ..SecuredKeyRestrictions::default()
+    });
+
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = body_json(response).await;
+    assert_eq!(body["message"], INVALID_API_CREDENTIALS_MESSAGE);
+}
+
+#[tokio::test]
+async fn overview_route_blocks_server_wide_access_for_restricted_keys() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_analytics_config(&tmp);
+    let app = Router::new()
+        .route("/2/analytics/seed", axum::routing::post(seed_analytics))
+        .route("/2/overview", get(get_overview))
+        .with_state(Arc::new(AnalyticsQueryEngine::new(config)));
+
+    seed_index(&app, "overview-allowed-index", 7).await;
+    seed_index(&app, "overview-blocked-index", 11).await;
+
+    let mut request = Request::builder()
+        .method(Method::GET)
+        .uri("/2/overview")
+        .body(Body::empty())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(analytics_only_key_restricted_to(vec![
+            "overview-allowed-index".to_string(),
+        ]));
+
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = body_json(response).await;
+    assert_eq!(body["message"], INVALID_API_CREDENTIALS_MESSAGE);
+}
+
+#[tokio::test]
+async fn analytics_clear_filesystem_failures_return_server_error() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = test_analytics_config(&tmp);
+    config.data_dir = tmp.path().join("analytics-file");
+    std::fs::write(&config.data_dir, b"not a directory").unwrap();
+
+    let app = Router::new()
+        .route("/2/analytics/clear", axum::routing::delete(clear_analytics))
+        .with_state(Arc::new(AnalyticsQueryEngine::new(config)));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/2/analytics/clear")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "index": "clear-failure" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = body_json(response).await;
+    assert_eq!(body["status"], 500);
+}
+
+#[tokio::test]
+async fn analytics_seed_distinguishes_invalid_options_from_filesystem_failures() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = test_analytics_config(&tmp);
+    config.data_dir = tmp.path().join("analytics-file");
+    std::fs::write(&config.data_dir, b"not a directory").unwrap();
+
+    let app = Router::new()
+        .route("/2/analytics/seed", axum::routing::post(seed_analytics))
+        .with_state(Arc::new(AnalyticsQueryEngine::new(config)));
+
+    let invalid_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/2/analytics/seed")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "index": "seed-failure",
+                        "days": 1,
+                        "searchCount": 0
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
+    let invalid_body = body_json(invalid_response).await;
+    assert_eq!(invalid_body["status"], 400);
+
+    let filesystem_response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/2/analytics/seed")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "index": "seed-failure",
+                        "days": 1,
+                        "searchCount": 1
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        filesystem_response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let filesystem_body = body_json(filesystem_response).await;
+    assert_eq!(filesystem_body["status"], 500);
+}
+
+async fn seed_index(app: &Router, index: &str, search_count: u32) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/2/analytics/seed")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "index": index,
+                        "days": 1,
+                        "searchCount": search_count
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+async fn get_json(app: &Router, uri: &str) -> serde_json::Value {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
+    body_json(response).await
 }
 
 fn make_search(query: &str, index: &str, query_id: &str) -> SearchEvent {

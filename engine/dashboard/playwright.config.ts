@@ -50,7 +50,19 @@ export default defineConfig({
   // A human who wants the report opened sets Playwright's own PLAYWRIGHT_HTML_OPEN,
   // which still takes precedence over this value; `npm run test:report` is unaffected
   // because the report is still written to disk either way.
-  reporter: [['html', { open: 'never' }]],
+  // The JSON reporter is what makes JOIN-1 computable. Without a machine-readable
+  // result artifact the 90-row backend capability matrix can only be joined against
+  // a run by hand, which is why that row read 0 / 90 for three consecutive lanes
+  // while the suite itself was near-green. `scripts/join_proof_report.mjs` consumes
+  // this exact path; do not remove it without moving that consumer to another
+  // artifact. playwright.config.test.ts fails if either the reporter or the path goes.
+  reporter: [
+    ['html', { open: 'never' }],
+    ['json', { outputFile: 'test-results/results.json' }],
+    ['./scripts/redact_playwright_evidence.mjs', {
+      inputFile: 'test-results/results.json',
+    }],
+  ],
 
   use: {
     baseURL: instance.dashboardBaseUrl,
@@ -92,8 +104,12 @@ export default defineConfig({
 
   webServer: {
     command: 'node scripts/playwright-webserver.mjs',
+    // Declare only the webserver contract scripts/playwright-webserver.mjs reads.
+    // Playwright merges process.env into the spawned process itself, so the child
+    // still inherits the ambient environment — but this block is also what the JSON
+    // reporter writes into test-results/results.json, the durable JOIN-1 proof
+    // artifact. Spreading process.env here dumped every ambient credential into it.
     env: {
-      ...process.env,
       PLAYWRIGHT_WEBSERVER_HOST: instance.host,
       PLAYWRIGHT_WEBSERVER_PORT: String(instance.dashboardPort),
       PLAYWRIGHT_WEBSERVER_URL: instance.dashboardBaseUrl,

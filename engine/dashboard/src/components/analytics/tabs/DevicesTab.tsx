@@ -17,6 +17,7 @@ import {
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import type { TabProps } from '@/lib/analytics-types';
 import { formatDateShort } from '@/lib/analytics-utils';
+import { CHART_CANVAS_TEST_ID, CHART_MARK_TEST_ID } from '@/lib/constants';
 import { useDeviceBreakdown } from '@/hooks/useAnalytics';
 import { EmptyState, TableSkeleton } from '@/components/analytics/AnalyticsShared';
 
@@ -143,7 +144,7 @@ function DeviceTrendChart({
       <CardContent>
         <div className="h-64" data-testid="device-chart">
           <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={chartData}>
+            <AreaChart data={chartData} data-testid={CHART_CANVAS_TEST_ID}>
               <CartesianGrid strokeDasharray="3 3" className="stroke-border" />
               <XAxis dataKey="date" className="text-xs" tick={{ fontSize: 11 }} />
               <YAxis className="text-xs" tick={{ fontSize: 11 }} />
@@ -155,9 +156,9 @@ function DeviceTrendChart({
                   fontSize: '12px',
                 }}
               />
-              <Area type="monotone" dataKey="desktop" stackId="1" stroke={PLATFORM_META.desktop.color} fill={PLATFORM_META.desktop.color} fillOpacity={0.6} />
-              <Area type="monotone" dataKey="mobile" stackId="1" stroke={PLATFORM_META.mobile.color} fill={PLATFORM_META.mobile.color} fillOpacity={0.6} />
-              <Area type="monotone" dataKey="tablet" stackId="1" stroke={PLATFORM_META.tablet.color} fill={PLATFORM_META.tablet.color} fillOpacity={0.6} />
+              <Area data-testid={CHART_MARK_TEST_ID} type="monotone" dataKey="desktop" stackId="1" stroke={PLATFORM_META.desktop.color} fill={PLATFORM_META.desktop.color} fillOpacity={0.6} />
+              <Area data-testid={CHART_MARK_TEST_ID} type="monotone" dataKey="mobile" stackId="1" stroke={PLATFORM_META.mobile.color} fill={PLATFORM_META.mobile.color} fillOpacity={0.6} />
+              <Area data-testid={CHART_MARK_TEST_ID} type="monotone" dataKey="tablet" stackId="1" stroke={PLATFORM_META.tablet.color} fill={PLATFORM_META.tablet.color} fillOpacity={0.6} />
             </AreaChart>
           </ResponsiveContainer>
         </div>

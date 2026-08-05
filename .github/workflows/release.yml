@@ -14,6 +14,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Single owner of the published image coordinates. Both the credential
+  # preflight and docker_prepare read these, so the preflight can never prove
+  # push against a repository the publish jobs do not actually target.
+  RELEASE_REGISTRY: ghcr.io
+  RELEASE_IMAGE_REPOSITORY: flapjackhq/flapjack
 
 jobs:
   validate_release_version:
@@ -57,6 +62,26 @@ jobs:
             echo "ERROR: CHANGELOG.md is missing the ${VERSION} release heading" >&2
             exit 1
           fi
+
+  # Proves the GHCR credential can push BEFORE `release` cuts the public tag.
+  # Gated only on version validation so it runs beside the build matrix and adds
+  # no wall-clock; `release` waits on it, which is what keeps an expired
+  # GHCR_TOKEN from producing a half-release (binaries published, images
+  # missing, tag irreversible — the v1.0.9 shape).
+  ghcr_publish_preflight:
+    name: Verify GHCR publish credential
+    needs: validate_release_version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prove the release credential can push to the release image repository
+        working-directory: engine
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: package/ghcr_publish_preflight "$RELEASE_IMAGE_REPOSITORY"
 
   build:
     needs: validate_release_version
@@ -161,7 +186,10 @@ jobs:
           compression-level: 0
 
   release:
-    needs: build
+    # Both gates are irreversibility gates: build proves the artifacts exist,
+    # ghcr_publish_preflight proves the images will be publishable. Creating the
+    # tag before either is what leaves a partial release on the public mirror.
+    needs: [build, ghcr_publish_preflight]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -254,7 +282,9 @@ jobs:
         env:
           VERSION: ${{ github.event.inputs.version }}
         run: |
-          image="ghcr.io/flapjackhq/flapjack"
+          # Composed from the workflow-level coordinates so the preflight and the
+          # publish jobs cannot drift onto different repositories.
+          image="${RELEASE_REGISTRY}/${RELEASE_IMAGE_REPOSITORY}"
           version_tag="${image}:${VERSION}"
           latest_tag="${image}:latest"
           amd64_candidate_tag="${image}:${VERSION}-linux-amd64"

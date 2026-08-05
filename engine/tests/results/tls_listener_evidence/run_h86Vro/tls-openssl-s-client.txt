@@ -1,0 +1,56 @@
+Connecting to 127.0.0.1
+depth=0 CN=localhost
+verify error:num=18:self-signed certificate
+verify return:1
+depth=0 CN=localhost
+verify return:1
+CONNECTED(00000003)
+---
+Certificate chain
+ 0 s:CN=localhost
+   i:CN=localhost
+   a:PKEY: RSA, 2048 (bit); sigalg: sha256WithRSAEncryption
+   v:NotBefore: Aug  2 02:44:35 2026 GMT; NotAfter: Aug  3 02:44:35 2026 GMT
+-----BEGIN CERTIFICATE-----
+MIIDJTCCAg2gAwIBAgIUToTf0uqwTKVf6Nq4HVW3aNw7DdswDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDgwMjAyNDQzNVoXDTI2MDgw
+MzAyNDQzNVowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEAyVEna1bFt+QlsgAaj9iTLqD2S9lJ1BiMuW2oHTYR70XG
++oMI7U2dZuZjY7zl++URLfKTqxUFO2kpNw1Rt/Je0N5k9hs77M7k0YyhV/loULRb
+VvTK5DBZKouUYTUgNBTDVr/RJYQU3WZxRhw0dPfKaUnpIOsYJSaZ6/TwCiMY1kUh
+Hc0asfP7JpS+bdeOfU8x4AtD/hIJ2bgXCcizkk6khBXB1IIveLAUeb6HXKU3vIoj
+LVDLFVz4Fjf1tdua1JiZDtECXa2Ry4bN/ARUFDlA35bHZUxFG+if0XN6tkV3Sqn5
+++0QHj7MJJ8bSsPmgoMcF9f1WgH0oyaYu/QQO5qBlwIDAQABo28wbTAdBgNVHQ4E
+FgQUz8BE3jcK6rAMDbvwdTKhm0R/uWswHwYDVR0jBBgwFoAUz8BE3jcK6rAMDbvw
+dTKhm0R/uWswDwYDVR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhvc3SH
+BH8AAAEwDQYJKoZIhvcNAQELBQADggEBAFAcKJ+yPWEFadM4r9vuHqG1VGt7Xzf4
+gHsCNn6Ts+56o7pAiu6X24HxfgCCB+iFX3UJOn6h/XlQXKY6zIMspu2P/ux2KZ8Q
+RNgi5+6vxTTqXgSDgT1Ih1qEX5n0QU/PEXj6PHYtoyjY0Ffnq1ILCSoRtXcYvn1O
+n5L5jFa3Dw815mXcoeZ9RvBw7uKMGZBup/MsrN4NSvfMzYol44Mh6WDxVtDfu+Uz
+INLBUgpzvBSf7JwhC6eCGXNrQSr9r/cIWRxQIMNW2zzsyM5IgWXhMj72s3OilUT+
+xm99SDmIXVTJ/SGrZ9PtmENCn0LiHf6Jka48bnR2WvYFiNJg2OzyxK4=
+-----END CERTIFICATE-----
+---
+Server certificate
+subject=CN=localhost
+issuer=CN=localhost
+---
+No client certificate CA names sent
+Peer signing digest: SHA512
+Peer signature type: rsa_pss_rsae_sha512
+Peer Temp Key: X25519, 253 bits
+---
+SSL handshake has read 1303 bytes and written 1620 bytes
+Verification error: self-signed certificate
+---
+New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+Protocol: TLSv1.3
+Server public key is 2048 bit
+This TLS version forbids renegotiation.
+Compression: NONE
+Expansion: NONE
+No ALPN negotiated
+Early data was not sent
+Verify return code: 18 (self-signed certificate)
+---
+DONE

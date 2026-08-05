@@ -10,6 +10,7 @@ pub mod config;
 pub mod hll;
 pub mod manifest;
 pub mod merge;
+mod mutation;
 pub mod query;
 pub mod retention;
 pub mod schema;

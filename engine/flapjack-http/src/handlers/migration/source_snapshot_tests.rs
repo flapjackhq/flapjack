@@ -141,6 +141,13 @@ fn source_snapshot_canonical_hashes_counts_and_membership_independent_of_item_or
         first.synonyms.hash,
         "21565b89eacd4b569d043e4377a801cda328d1faf9756ebe223f06551ae59fe8"
     );
+    assert_eq!(first.replica_settings.count, 0);
+    assert_eq!(first.replica_settings.version, SourceIdentityVersion::V1);
+    assert!(first.replica_settings.ids.is_empty());
+    assert_eq!(
+        first.replica_settings.hash,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
 }
 
 #[test]

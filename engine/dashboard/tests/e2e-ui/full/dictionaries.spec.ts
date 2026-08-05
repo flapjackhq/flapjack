@@ -60,7 +60,7 @@ test.describe('Dictionaries', () => {
 
   test('stopword create-delete lifecycle preserves badge and row counts', async ({ page }) => {
     const stopwordsList = page.getByTestId(getListTestId('stopwords'));
-    const stopwordRows = stopwordsList.locator(':scope > *');
+    const stopwordRows = stopwordsList.getByTestId('dictionary-entry');
 
     // Capture baseline: panel badge shows "0 entries", empty state visible
     await expect(page.getByText('0 entries')).toBeVisible({ timeout: 10_000 });

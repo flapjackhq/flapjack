@@ -69,7 +69,7 @@ test.describe('Rule Editor Form — Mocked Data Loading', () => {
     await expect(page.getByText('complex-mock-rule').first()).toBeVisible({ timeout: 10_000 });
 
     // Click edit on the rule card
-    const ruleCard = page.getByTestId('rules-list').locator('div', { hasText: 'complex-mock-rule' }).first();
+    const ruleCard = page.getByTestId('rule-card').filter({ hasText: 'complex-mock-rule' }).first();
     await ruleCard.getByRole('button', { name: /edit/i }).click();
 
     // Dialog should open in form mode
@@ -111,7 +111,7 @@ test.describe('Rule Editor Form — Mocked Data Loading', () => {
     await expect(page.getByText('conditionless-mock-rule').first()).toBeVisible({ timeout: 15_000 });
 
     // Click edit
-    const ruleCard = page.getByTestId('rules-list').locator('div', { hasText: 'conditionless-mock-rule' }).first();
+    const ruleCard = page.getByTestId('rule-card').filter({ hasText: 'conditionless-mock-rule' }).first();
     await ruleCard.getByRole('button', { name: /edit/i }).click();
 
     const dialog = page.getByRole('dialog');

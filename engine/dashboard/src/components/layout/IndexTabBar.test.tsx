@@ -133,6 +133,9 @@ describe('IndexTabBar', () => {
     expect(scrollContainer).toHaveClass('overflow-x-auto')
 
     const tabList = screen.getByTestId('index-tab-bar-list')
-    expect(tabList).toHaveClass('whitespace-nowrap')
+    expect(tabList).toHaveClass('min-w-max', 'whitespace-nowrap')
+
+    const appShellSection = screen.getByTestId('index-tab-bar')
+    expect(appShellSection).not.toHaveClass('overflow-x-auto', 'min-w-max')
   })
 })

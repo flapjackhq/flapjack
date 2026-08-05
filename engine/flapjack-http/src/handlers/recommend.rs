@@ -208,7 +208,7 @@ pub async fn recommend(
                 .await?
             }
             "looking-similar" => {
-                dispatch_looking_similar(&state, &target_index, req, threshold, max_recs)?
+                dispatch_looking_similar(&state, &target_index, req, threshold, max_recs).await?
             }
             _ => unreachable!("validated above"),
         };
@@ -388,34 +388,44 @@ async fn dispatch_cooccurrence(
         .collect())
 }
 
-/// Compute looking-similar recommendations using vector similarity between the seed document and all other documents in the index.
+/// Dispatch looking-similar recommendations through the async HTTP boundary.
+///
+/// The compute work is offloaded to a blocking task. The response contains JSON
+/// hits ranked by descending similarity, excludes the seed, and uses term
+/// similarity only when vector similarity is unavailable.
 ///
 /// # Arguments
 ///
 /// * `state` - Shared application state containing the index manager.
 /// * `index_name` - Target index (resolved to primary if replica).
 /// * `req` - The originating recommend request; `object_id` must be set.
-/// * `threshold` - Minimum similarity score (0–100) for inclusion.
+/// * `threshold` - Minimum similarity score (0-100) for inclusion.
 /// * `max_recs` - Maximum number of hits to return.
 ///
 /// # Returns
 ///
-/// JSON hits sorted by descending vector similarity, excluding the seed. Returns an empty vec if the seed has no vector or the index has no embedder configured.
-fn dispatch_looking_similar(
+/// JSON hits ranked by descending similarity.
+async fn dispatch_looking_similar(
     state: &Arc<AppState>,
     index_name: &str,
     req: &RecommendRequest,
     threshold: u32,
     max_recs: u32,
 ) -> Result<Vec<serde_json::Value>, FlapjackError> {
-    let seed_id = req.object_id.as_deref().unwrap_or_default();
-    let hits = looking_similar::compute_looking_similar(
-        &state.manager,
-        index_name,
-        seed_id,
-        threshold,
-        max_recs,
-    )
+    let state = Arc::clone(state);
+    let index_name = index_name.to_string();
+    let seed_id = req.object_id.clone().unwrap_or_default();
+    let hits = tokio::task::spawn_blocking(move || {
+        looking_similar::compute_looking_similar(
+            &state.manager,
+            &index_name,
+            &seed_id,
+            threshold,
+            max_recs,
+        )
+    })
+    .await
+    .map_err(|error| FlapjackError::InvalidQuery(format!("spawn_blocking join error: {error}")))?
     .map_err(FlapjackError::InvalidQuery)?;
 
     Ok(hits

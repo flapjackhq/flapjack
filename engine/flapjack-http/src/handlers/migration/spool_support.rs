@@ -129,6 +129,14 @@ pub(super) fn validate_source_identity_digest(digest: &str) -> SpoolResult<()> {
     Err(SpoolError::new(SpoolErrorKind::InvalidSourceIdentityDigest))
 }
 
+pub(super) fn ensure_supported_spool_format(manifest: &SpoolManifest) -> SpoolResult<()> {
+    if manifest.spool_format_version == SPOOL_FORMAT_VERSION {
+        Ok(())
+    } else {
+        Err(SpoolError::new(SpoolErrorKind::UnsupportedSpoolFormat))
+    }
+}
+
 pub(super) fn new_handle() -> String {
     hex_digest(Uuid::new_v4().as_bytes())
 }
@@ -146,11 +154,13 @@ impl SpoolStore {
         if manifest.lifecycle != LifecycleState::Accepted {
             return Err(SpoolError::new(SpoolErrorKind::JobNotAccepted));
         }
+        ensure_supported_spool_format(manifest)?;
 
         let mut settings = None;
         let mut documents = Vec::new();
         let mut rules = Vec::new();
         let mut synonyms = Vec::new();
+        let mut derived_configuration = Vec::new();
         for artifact in visible_artifacts(manifest) {
             validate_relative(&artifact.final_path)?;
             match artifact.kind {
@@ -158,9 +168,7 @@ impl SpoolStore {
                 ArtifactKind::DocumentPage => documents.push(artifact.clone()),
                 ArtifactKind::RulesPage => rules.push(artifact.clone()),
                 ArtifactKind::SynonymsPage => synonyms.push(artifact.clone()),
-                ArtifactKind::Config => {
-                    return Err(SpoolError::new(SpoolErrorKind::UnsupportedArtifactKind));
-                }
+                ArtifactKind::Config => derived_configuration.push(artifact.clone()),
             }
         }
 
@@ -172,7 +180,27 @@ impl SpoolStore {
             documents,
             rules,
             synonyms,
+            derived_configuration,
         })
+    }
+
+    pub(crate) fn completed_derived_source_names(
+        &self,
+        job_uuid: Uuid,
+    ) -> SpoolResult<Vec<String>> {
+        let _root_lock = self.lock_root()?;
+        let _job_lock = self.lock_job(job_uuid)?;
+        let manifest = self.read_manifest(job_uuid)?;
+        let mut source_names = HashSet::new();
+        for artifact in
+            visible_artifacts(&manifest).filter(|artifact| artifact.kind == ArtifactKind::Config)
+        {
+            let (source_name, _) = self.read_derived_source_settings_record(job_uuid, artifact)?;
+            if !source_names.insert(source_name) {
+                return Err(SpoolError::new(SpoolErrorKind::ManifestCorrupt));
+            }
+        }
+        Ok(source_names.into_iter().collect())
     }
 
     pub(super) fn validate_artifact_limits(
@@ -516,24 +544,49 @@ impl AcceptedSpoolReader {
         Ok(value)
     }
 
+    /// The replica-owned source settings captured alongside this export, keyed
+    /// by derived source name. Parsing lives here because
+    /// [`SpoolStore::commit_derived_source_settings`] is the only writer of the
+    /// record shape; a record that does not match it fails closed.
+    pub(crate) fn replica_settings(&self) -> SpoolResult<BTreeMap<String, serde_json::Value>> {
+        let mut replica_settings = BTreeMap::new();
+        for artifact in &self.derived_configuration {
+            let (source_name, settings) = self
+                .store
+                .read_derived_source_settings_record(self.job_uuid, artifact)?;
+            if replica_settings.insert(source_name, settings).is_some() {
+                return Err(SpoolError::new(SpoolErrorKind::ManifestCorrupt));
+            }
+        }
+        Ok(replica_settings)
+    }
+
     pub(crate) fn document_pages(&self) -> AcceptedSpoolPageIter<'_> {
-        self.page_iter(&self.documents)
+        self.page_iter(ObjectResource::Documents, &self.documents)
     }
 
     pub(crate) fn rule_pages(&self) -> AcceptedSpoolPageIter<'_> {
-        self.page_iter(&self.rules)
+        self.page_iter(ObjectResource::Rules, &self.rules)
     }
 
     pub(crate) fn synonym_pages(&self) -> AcceptedSpoolPageIter<'_> {
-        self.page_iter(&self.synonyms)
+        self.page_iter(ObjectResource::Synonyms, &self.synonyms)
     }
 
-    fn page_iter<'a>(&'a self, artifacts: &'a [ArtifactManifest]) -> AcceptedSpoolPageIter<'a> {
+    fn page_iter<'a>(
+        &'a self,
+        resource: ObjectResource,
+        artifacts: &'a [ArtifactManifest],
+    ) -> AcceptedSpoolPageIter<'a> {
         AcceptedSpoolPageIter {
             store: &self.store,
             job_uuid: self.job_uuid,
+            resource,
             artifacts,
             position: 0,
+            stable_id_offset: 0,
+            stable_ids: None,
+            finished: false,
         }
     }
 }
@@ -542,15 +595,47 @@ impl Iterator for AcceptedSpoolPageIter<'_> {
     type Item = SpoolResult<AcceptedSpoolPage>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let artifact = self.artifacts.get(self.position)?;
+        if self.finished {
+            return None;
+        }
+        if self.stable_ids.is_none() {
+            match self
+                .store
+                .completed_ids_for_resource(self.job_uuid, self.resource)
+            {
+                Ok(stable_ids) => self.stable_ids = Some(stable_ids),
+                Err(error) => {
+                    self.finished = true;
+                    return Some(Err(error));
+                }
+            }
+        }
+        let stable_ids = self
+            .stable_ids
+            .as_ref()
+            .expect("stable IDs are loaded before reading accepted artifact pages");
+        let Some(artifact) = self.artifacts.get(self.position) else {
+            self.finished = true;
+            return (self.stable_id_offset != stable_ids.len())
+                .then(|| Err(SpoolError::new(SpoolErrorKind::ManifestCorrupt)));
+        };
         let page_index = self.position;
         self.position += 1;
+        let item_count = artifact.item_count as usize;
+        let end = self.stable_id_offset.saturating_add(item_count);
+        let Some(page_ids) = stable_ids.get(self.stable_id_offset..end) else {
+            self.finished = true;
+            return Some(Err(SpoolError::new(SpoolErrorKind::ManifestCorrupt)));
+        };
+        let page_ids = page_ids.to_vec();
+        self.stable_id_offset = end;
         Some(
             self.store
                 .read_artifact_items(self.job_uuid, artifact)
                 .map(|items| AcceptedSpoolPage {
                     page_index,
                     manifest_count: artifact.item_count,
+                    stable_ids: page_ids,
                     items,
                 }),
         )
@@ -558,6 +643,18 @@ impl Iterator for AcceptedSpoolPageIter<'_> {
 }
 
 impl SpoolStore {
+    fn completed_ids_for_resource(
+        &self,
+        job_uuid: Uuid,
+        resource: ObjectResource,
+    ) -> SpoolResult<Vec<String>> {
+        match resource {
+            ObjectResource::Documents => self.completed_document_ids(job_uuid),
+            ObjectResource::Rules => self.completed_rule_ids(job_uuid),
+            ObjectResource::Synonyms => self.completed_synonym_ids(job_uuid),
+        }
+    }
+
     fn read_artifact_items(
         &self,
         job_uuid: Uuid,
@@ -593,5 +690,24 @@ impl SpoolStore {
             return Err(SpoolError::new(SpoolErrorKind::ResourceVerificationFailed));
         }
         serde_json::from_slice(&bytes).map_err(|_| SpoolError::new(SpoolErrorKind::ManifestCorrupt))
+    }
+
+    fn read_derived_source_settings_record(
+        &self,
+        job_uuid: Uuid,
+        artifact: &ArtifactManifest,
+    ) -> SpoolResult<(String, serde_json::Value)> {
+        if artifact.item_count != DERIVED_SOURCE_SETTINGS_ITEM_COUNT {
+            return Err(SpoolError::new(SpoolErrorKind::ManifestCorrupt));
+        }
+        let record = self.read_artifact_value(job_uuid, artifact)?;
+        let source_name = record
+            .get(DERIVED_SOURCE_NAME_FIELD)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| SpoolError::new(SpoolErrorKind::UnsupportedArtifactKind))?;
+        let settings = record
+            .get(DERIVED_SOURCE_SETTINGS_FIELD)
+            .ok_or_else(|| SpoolError::new(SpoolErrorKind::UnsupportedArtifactKind))?;
+        Ok((source_name.to_string(), settings.clone()))
     }
 }

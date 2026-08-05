@@ -56,21 +56,21 @@ async function submitSearchAndWaitForResponse(
 }
 
 function requestMatchesIndexQuery(
-  request: Request,
+  observedRequest: Request,
   indexName: string,
   query: string,
 ): boolean {
-  if (request.method() !== 'POST') {
+  if (observedRequest.method() !== 'POST') {
     return false;
   }
 
   const searchPath = `/indexes/${indexName}/search`;
   const queryPath = `/indexes/${indexName}/query`;
-  if (!request.url().includes(searchPath) && !request.url().includes(queryPath)) {
+  if (!observedRequest.url().includes(searchPath) && !observedRequest.url().includes(queryPath)) {
     return false;
   }
 
-  const requestBody = request.postData();
+  const requestBody = observedRequest.postData();
   if (!requestBody) {
     return false;
   }
@@ -109,6 +109,22 @@ async function expectRecoveredTopResultToMatchBackend(
     topResultObjectId,
     `Recovered top result should match backend top hit for "${query}"`,
   ).toBe(expectedTopObjectId);
+}
+
+async function waitForMatchingSearchRequest(
+  page: Page,
+  indexName: string,
+  query: string,
+): Promise<boolean> {
+  try {
+    await page.waitForRequest(
+      (observedRequest) => requestMatchesIndexQuery(observedRequest, indexName, query),
+      { timeout: 1_500 },
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 test.describe('Search & Browse Edge Cases', () => {
@@ -171,12 +187,10 @@ test.describe('Search & Browse Edge Cases', () => {
     // Monitor for any matching request — if typing alone triggers search,
     // waitForRequest resolves instead of timing out.
     const searchInput = page.getByPlaceholder(/search documents/i);
-    const typingTriggeredSearch = page.waitForRequest(
-      (request) => requestMatchesIndexQuery(request, TEST_INDEX, recoveryQuery),
-      { timeout: 1_500 },
-    ).then(
-      () => true, // request matched — typing triggered a search (unexpected)
-      () => false, // timeout — no search fired (expected)
+    const typingTriggeredSearch = waitForMatchingSearchRequest(
+      page,
+      TEST_INDEX,
+      recoveryQuery,
     );
 
     await searchInput.fill(recoveryQuery);

@@ -12,6 +12,16 @@ const BACKPRESSURE_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 static BACKPRESSURE_STATE: Lazy<dashmap::DashMap<String, TenantBackpressureState>> =
     Lazy::new(dashmap::DashMap::new);
 
+#[cfg(test)]
+type PauseArtifactPublicationHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+#[cfg(test)]
+static PAUSE_ARTIFACT_PUBLICATION_HOOK: Lazy<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, (u64, PauseArtifactPublicationHook)>>,
+> = Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
+static PAUSE_ARTIFACT_PUBLICATION_HOOK_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Clone)]
 struct TenantBackpressureState {
     observations: VecDeque<ObservationSample>,
@@ -474,8 +484,15 @@ fn persist_decision_artifact(
         observations,
     };
     let payload = serde_json::to_vec_pretty(&artifact)?;
-    std::fs::write(path, payload)?;
+    write_decision_artifact(&path, &payload)?;
     Ok(())
+}
+
+fn write_decision_artifact(path: &Path, payload: &[u8]) -> std::io::Result<()> {
+    crate::index::utils::atomic_write_with_before_rename(path, payload, |_temp_path| {
+        #[cfg(test)]
+        run_pause_artifact_publication_hook(path, _temp_path);
+    })
 }
 
 fn tenant_key(base_path: &Path, tenant_id: &str) -> String {
@@ -611,6 +628,55 @@ pub(crate) fn record_observation_result_for_test(
 #[cfg(test)]
 pub(crate) fn tenant_is_paused_for_test(base_path: &Path, tenant_id: &str) -> bool {
     tenant_is_paused(base_path, tenant_id)
+}
+
+#[cfg(test)]
+pub(crate) struct PauseArtifactPublicationHookGuard {
+    artifact_path: PathBuf,
+    hook_id: u64,
+}
+
+#[cfg(test)]
+impl Drop for PauseArtifactPublicationHookGuard {
+    fn drop(&mut self) {
+        let mut hooks = PAUSE_ARTIFACT_PUBLICATION_HOOK.lock().unwrap();
+        if hooks
+            .get(&self.artifact_path)
+            .is_some_and(|(hook_id, _)| *hook_id == self.hook_id)
+        {
+            hooks.remove(&self.artifact_path);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_pause_artifact_publication_hook_for_test(
+    artifact_path: &Path,
+    hook: PauseArtifactPublicationHook,
+) -> PauseArtifactPublicationHookGuard {
+    let hook_id =
+        PAUSE_ARTIFACT_PUBLICATION_HOOK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let artifact_path = artifact_path.to_path_buf();
+    PAUSE_ARTIFACT_PUBLICATION_HOOK
+        .lock()
+        .unwrap()
+        .insert(artifact_path.clone(), (hook_id, hook));
+    PauseArtifactPublicationHookGuard {
+        artifact_path,
+        hook_id,
+    }
+}
+
+#[cfg(test)]
+fn run_pause_artifact_publication_hook(artifact_path: &Path, temp_path: &Path) {
+    let hook = PAUSE_ARTIFACT_PUBLICATION_HOOK
+        .lock()
+        .unwrap()
+        .get(artifact_path)
+        .map(|(_, hook)| std::sync::Arc::clone(hook));
+    if let Some(hook) = hook {
+        hook(temp_path);
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]

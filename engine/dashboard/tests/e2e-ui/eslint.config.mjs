@@ -1,18 +1,21 @@
 /**
- * ESLint config for E2E-UI spec files.
+ * ESLint config for the browser test files under tests/e2e-ui/.
  *
- * Enforces BROWSER_TESTING_STANDARDS_2.md rules:
+ * Enforces the mandated browser testing standard at
+ * `~/.matt/scrai/globals/standards/browser_testing.md`:
  * - No page.evaluate / page.$eval / page.$$eval / page.$()
- * - No CSS class / XPath / attribute selectors in spec files
+ * - No raw CSS / XPath / attribute / tag locators outside the allow-list below
  * - No { force: true } on actions
  * - No page.pause() (debugging leftover)
  * - No API calls (request.*), waitForTimeout, dispatchEvent in spec files
+ * - Everything else `playwright/flat/recommended` carries: no conditional
+ *   expects, no skipped tests, web-first assertions, awaited assertions
  *
  * Fixture and setup files are exempt. Shared UI helpers are linted alongside spec files.
  *
- * Note: Tag-based locators (table, tr, td, th, svg, etc.) are allowed for
- * row-scoping per BROWSER_TESTING_STANDARDS_2.md. Only CSS class selectors,
- * XPath, and attribute selectors are banned.
+ * `playwright/no-raw-locators` is the single owner of the locator bans, so this
+ * config carries no duplicate custom locator regexes. Its `allowed` list is the
+ * standard's verbatim row-scoping tag list — do not widen it.
  */
 import playwright from 'eslint-plugin-playwright';
 import tseslint from 'typescript-eslint';
@@ -20,6 +23,7 @@ import tseslint from 'typescript-eslint';
 export default tseslint.config(
   {
     // Lint browser specs, focused helper tests, and shared UI helpers used by those specs.
+    ...playwright.configs['flat/recommended'],
     files: ['**/*.spec.ts', '**/*.test.ts', '**/helpers.ts', '**/*_helpers.ts'],
     languageOptions: {
       parser: tseslint.parser,
@@ -28,48 +32,40 @@ export default tseslint.config(
         sourceType: 'module',
       },
     },
-    plugins: {
-      playwright,
-    },
     rules: {
+      ...playwright.configs['flat/recommended'].rules,
+
       // --- Layer 1: Playwright ESLint rules ---
 
       // Ban page.evaluate(), page.$eval(), page.$$eval()
       'playwright/no-eval': 'error',
 
+      // Ban raw CSS class / XPath / attribute / tag locators.
+      'playwright/no-raw-locators': ['error', {
+        allowed: ['aside', 'tr', 'main', 'option'],
+      }],
+
+      // Prefer Playwright's semantic locator helpers over equivalent locator() queries
+      'playwright/prefer-native-locators': 'error',
+
       // Ban deprecated page.$() / page.$$() handle API
       'playwright/no-element-handle': 'error',
-
-      // Ban { force: true } which bypasses actionability checks
-      'playwright/no-force-option': 'error',
 
       // Ban page.pause() (debugging leftover)
       'playwright/no-page-pause': 'error',
 
-      // Prefer Playwright's semantic locator helpers over equivalent locator([attr=...]) queries
-      'playwright/prefer-native-locators': 'error',
+      // Ban { force: true } which bypasses actionability checks
+      'playwright/no-force-option': 'error',
 
-      // --- Layer 1: Custom banned patterns ---
+      // --- Layer 1: Custom banned patterns not owned by no-raw-locators ---
       'no-restricted-syntax': ['error',
         {
-          selector: "CallExpression[callee.object.name='request'][callee.property.name='get']",
-          message: 'API calls (request.get) are banned in spec files. Move to fixtures.ts.',
+          selector: "MemberExpression[object.name='request']",
+          message: 'API calls (request.*) are banned in spec files. Move to fixtures.ts.',
         },
         {
-          selector: "CallExpression[callee.object.name='request'][callee.property.name='post']",
-          message: 'API calls (request.post) are banned in spec files. Move to fixtures.ts.',
-        },
-        {
-          selector: "CallExpression[callee.object.name='request'][callee.property.name='delete']",
-          message: 'API calls (request.delete) are banned in spec files. Move to fixtures.ts.',
-        },
-        {
-          selector: "CallExpression[callee.object.name='request'][callee.property.name='put']",
-          message: 'API calls (request.put) are banned in spec files. Move to fixtures.ts.',
-        },
-        {
-          selector: "CallExpression[callee.object.name='request'][callee.property.name='patch']",
-          message: 'API calls (request.patch) are banned in spec files. Move to fixtures.ts.',
+          selector: "MemberExpression[property.name='evaluate']",
+          message: 'page.evaluate() is banned in spec files.',
         },
         {
           selector: "CallExpression[callee.property.name='waitForTimeout']",
@@ -82,25 +78,6 @@ export default tseslint.config(
         {
           selector: "CallExpression[callee.property.name='setExtraHTTPHeaders']",
           message: 'setExtraHTTPHeaders is banned in spec files. Move to fixtures.ts.',
-        },
-        // Ban CSS class selectors: .locator('.someClass') or .locator('.some-class')
-        {
-          selector: "CallExpression[callee.property.name='locator'] > Literal[value=/^\\./]",
-          message: 'CSS class selectors (.className) are banned in spec files. Use data-testid or getByRole/getByText instead.',
-        },
-        // Ban XPath selectors: .locator('//...')
-        {
-          selector: "CallExpression[callee.property.name='locator'] > Literal[value=/^\\/\\//]",
-          message: 'XPath selectors are banned in spec files. Use data-testid or getByRole/getByText instead.',
-        },
-        {
-          selector: "CallExpression[callee.property.name='locator'] > Literal[value=/^xpath=/]",
-          message: 'XPath selectors are banned in spec files. Use data-testid or getByRole/getByText instead.',
-        },
-        // Ban attribute selectors: .locator('[attr=value]') or .locator('input[name=...]')
-        {
-          selector: "CallExpression[callee.property.name='locator'] > Literal[value=/\\[.*=/]",
-          message: 'Attribute selectors are banned in spec files. Use data-testid or getByRole/getByText instead.',
         },
       ],
     },

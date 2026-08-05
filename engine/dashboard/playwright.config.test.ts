@@ -113,6 +113,42 @@ describe('playwright.config startup contracts', () => {
     expect(config.fullyParallel).toBe(true)
   })
 
+  it('passes only the webserver contract variables so proof artifacts hold no ambient secrets', async () => {
+    // Playwright merges process.env into the spawned webserver itself
+    // (playwright/lib/plugins/webServerPlugin.js), so the child still sees the full
+    // environment without this config declaring it. What the config declares is also
+    // what the JSON reporter serialises into test-results/results.json — the durable
+    // JOIN-1 proof artifact — so spreading `...process.env` here wrote every ambient
+    // credential (ALGOLIA_ADMIN_KEY, MAILSLURP_API_KEY, ...) into evidence files in
+    // plaintext. Declare exactly the contract scripts/playwright-webserver.mjs reads.
+    const config = await loadPlaywrightConfig('')
+
+    expect(Object.keys(config.webServer?.env ?? {}).sort()).toEqual([
+      'PLAYWRIGHT_WEBSERVER_HOST',
+      'PLAYWRIGHT_WEBSERVER_PORT',
+      'PLAYWRIGHT_WEBSERVER_REUSE',
+      'PLAYWRIGHT_WEBSERVER_URL',
+    ])
+    // PATH is present in every real process environment, so its absence proves the
+    // ambient spread is gone rather than merely that these four keys are present.
+    expect(config.webServer?.env).not.toHaveProperty('PATH')
+  })
+
+  it('redacts the JSON report after Playwright writes it', async () => {
+    const config = await loadPlaywrightConfig('')
+    const reporters = config.reporter as Array<[string, Record<string, unknown>?]>
+    const jsonReporterIndex = reporters.findIndex(([name]) => name === 'json')
+    const redactingReporterIndex = reporters.findIndex(
+      ([name]) => name === './scripts/redact_playwright_evidence.mjs',
+    )
+
+    expect(jsonReporterIndex).toBeGreaterThanOrEqual(0)
+    expect(redactingReporterIndex).toBeGreaterThan(jsonReporterIndex)
+    expect(reporters[redactingReporterIndex]?.[1]).toEqual({
+      inputFile: 'test-results/results.json',
+    })
+  })
+
   it('tightens retries/workers and disables webServer reuse in CI', async () => {
     const config = await loadPlaywrightConfig('1')
 
@@ -150,6 +186,22 @@ describe('playwright.config startup contracts', () => {
 
     expect(htmlReporter).toBeDefined()
     expect(htmlReporter?.[1]?.open).toBe('never')
+  })
+
+  it('emits machine-readable JSON results so the JOIN-1 report can be computed', async () => {
+    // The HTML report is for humans and cannot be joined against the 90-row backend
+    // capability matrix. Without a JSON artifact, answering "which of the 27 named
+    // proof specs passed at this SHA?" costs a manual read of a 1,639-line receipt
+    // against an HTML report — which is why JOIN-1 read 0 / 90 for three consecutive
+    // lanes while the suite itself was near-green. scripts/join_proof_report.mjs
+    // consumes exactly this path, so dropping the reporter or renaming the file
+    // silently returns that row to being uncomputable. Assert both.
+    const config = await loadPlaywrightConfig('')
+    const reporters = config.reporter as Array<[string, Record<string, unknown>?]>
+    const jsonReporter = reporters.find(([name]) => name === 'json')
+
+    expect(jsonReporter).toBeDefined()
+    expect(jsonReporter?.[1]?.outputFile).toBe('test-results/results.json')
   })
 
   it('runs Lane C evidence-only specs only when the bundle directory is explicit', async () => {

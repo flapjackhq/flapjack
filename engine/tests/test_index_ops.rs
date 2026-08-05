@@ -463,6 +463,10 @@ mod snapshot {
         assert_eq!(search_before.total, 1, "Should find laptop before export");
 
         let index_path = src_dir.path().join("products");
+        let _quiesce = src_mgr
+            .quiesce_tenant(&"products".to_string())
+            .await
+            .expect("snapshot fixture must quiesce the source writer before export");
         let tarball = export_to_bytes(&index_path).unwrap();
         assert!(tarball.len() > 100, "Tarball should have content");
 

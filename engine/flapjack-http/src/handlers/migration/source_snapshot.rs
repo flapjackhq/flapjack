@@ -14,6 +14,7 @@ pub(super) struct SourceSnapshot {
     pub(super) documents: SourceResourceSnapshot,
     pub(super) rules: SourceResourceSnapshot,
     pub(super) synonyms: SourceResourceSnapshot,
+    pub(super) replica_settings: SourceResourceSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +49,7 @@ pub(super) struct SourceSnapshotBuilder {
     documents: SourceIdentityPartitions,
     rules: SourceResourceAccumulator,
     synonyms: SourceResourceAccumulator,
+    replica_settings: SourceResourceAccumulator,
 }
 
 impl SourceSnapshotBuilder {
@@ -57,6 +59,7 @@ impl SourceSnapshotBuilder {
             documents: SourceIdentityPartitions::new(identity_config)?,
             rules: SourceResourceAccumulator::default(),
             synonyms: SourceResourceAccumulator::default(),
+            replica_settings: SourceResourceAccumulator::default(),
         })
     }
 
@@ -99,6 +102,20 @@ impl SourceSnapshotBuilder {
             .record_items(SourceSnapshotResource::Rule, page_index, page)
     }
 
+    pub(super) fn record_rules_page_with_stable_ids(
+        &mut self,
+        page_index: usize,
+        page: &[Value],
+        stable_ids: &[String],
+    ) -> Result<(), SourceSnapshotSchemaViolation> {
+        self.rules.record_items_with_stable_ids(
+            SourceSnapshotResource::Rule,
+            page_index,
+            page,
+            stable_ids,
+        )
+    }
+
     pub(super) fn record_synonyms_page(
         &mut self,
         page_index: usize,
@@ -106,6 +123,30 @@ impl SourceSnapshotBuilder {
     ) -> Result<(), SourceSnapshotSchemaViolation> {
         self.synonyms
             .record_items(SourceSnapshotResource::Synonym, page_index, page)
+    }
+
+    pub(super) fn record_synonyms_page_with_stable_ids(
+        &mut self,
+        page_index: usize,
+        page: &[Value],
+        stable_ids: &[String],
+    ) -> Result<(), SourceSnapshotSchemaViolation> {
+        self.synonyms.record_items_with_stable_ids(
+            SourceSnapshotResource::Synonym,
+            page_index,
+            page,
+            stable_ids,
+        )
+    }
+
+    pub(super) fn record_replica_settings(
+        &mut self,
+        source_name: &str,
+        settings: &Value,
+    ) -> Result<(), SourceSnapshotSchemaViolation> {
+        let record = json_replica_settings_identity(source_name, settings);
+        self.replica_settings
+            .record_items(SourceSnapshotResource::ReplicaSettings, 0, &[record])
     }
 
     pub(super) fn finish(self) -> Result<SourceSnapshot, SourceIdentityError> {
@@ -123,6 +164,7 @@ impl SourceSnapshotBuilder {
             },
             rules: self.rules.finish(),
             synonyms: self.synonyms.finish(),
+            replica_settings: self.replica_settings.finish(),
         })
     }
 }
@@ -132,6 +174,7 @@ pub(super) enum SourceSnapshotResource {
     Document,
     Rule,
     Synonym,
+    ReplicaSettings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +234,24 @@ struct SourceResourceAccumulator {
     item_hashes: Vec<(String, String)>,
 }
 
+#[derive(Clone, Copy)]
+struct SourceItemPosition {
+    resource: SourceSnapshotResource,
+    page_index: usize,
+    item_index: usize,
+}
+
+impl SourceItemPosition {
+    fn violation(self, kind: SourceSnapshotSchemaViolationKind) -> SourceSnapshotSchemaViolation {
+        SourceSnapshotSchemaViolation {
+            resource: self.resource,
+            kind,
+            page_index: self.page_index,
+            item_index: self.item_index,
+        }
+    }
+}
+
 impl SourceResourceAccumulator {
     fn record_items(
         &mut self,
@@ -199,26 +260,66 @@ impl SourceResourceAccumulator {
         items: &[Value],
     ) -> Result<(), SourceSnapshotSchemaViolation> {
         for (item_index, item) in items.iter().enumerate() {
-            let id = object_stable_id(item).map_err(|kind| SourceSnapshotSchemaViolation {
+            let position = SourceItemPosition {
                 resource,
-                kind,
                 page_index,
                 item_index,
-            })?;
-            if self
-                .ids
-                .insert(id.clone(), (page_index, item_index))
-                .is_some()
-            {
-                return Err(SourceSnapshotSchemaViolation {
-                    resource,
-                    kind: SourceSnapshotSchemaViolationKind::DuplicateObjectId,
-                    page_index,
-                    item_index,
-                });
-            }
-            self.item_hashes.push((id, source_item_hash(item)));
+            };
+            let id = object_stable_id(item).map_err(|kind| position.violation(kind))?;
+            self.record_item(position, id, item)?;
         }
+        Ok(())
+    }
+
+    fn record_items_with_stable_ids(
+        &mut self,
+        resource: SourceSnapshotResource,
+        page_index: usize,
+        items: &[Value],
+        stable_ids: &[String],
+    ) -> Result<(), SourceSnapshotSchemaViolation> {
+        for (item_index, item) in items.iter().enumerate() {
+            let position = SourceItemPosition {
+                resource,
+                page_index,
+                item_index,
+            };
+            if !item.is_object() {
+                return Err(position.violation(SourceSnapshotSchemaViolationKind::MalformedPayload));
+            }
+            let Some(id) = stable_ids.get(item_index).filter(|id| !id.is_empty()) else {
+                return Err(position.violation(SourceSnapshotSchemaViolationKind::InvalidObjectId));
+            };
+            self.record_item(position, id.clone(), item)?;
+        }
+        if stable_ids.len() != items.len() {
+            return Err(SourceSnapshotSchemaViolation {
+                resource,
+                kind: SourceSnapshotSchemaViolationKind::InvalidObjectId,
+                page_index,
+                item_index: items.len(),
+            });
+        }
+        Ok(())
+    }
+
+    fn record_item(
+        &mut self,
+        position: SourceItemPosition,
+        stable_id: String,
+        item: &Value,
+    ) -> Result<(), SourceSnapshotSchemaViolation> {
+        if self
+            .ids
+            .insert(
+                stable_id.clone(),
+                (position.page_index, position.item_index),
+            )
+            .is_some()
+        {
+            return Err(position.violation(SourceSnapshotSchemaViolationKind::DuplicateObjectId));
+        }
+        self.item_hashes.push((stable_id, source_item_hash(item)));
         Ok(())
     }
 
@@ -252,6 +353,13 @@ fn object_resource_snapshot(
         .record_items(resource, 0, items)
         .map_err(AlgoliaClientError::from)?;
     Ok(accumulator.finish())
+}
+
+fn json_replica_settings_identity(source_name: &str, settings: &Value) -> Value {
+    serde_json::json!({
+        "objectID": source_name,
+        "settings": settings,
+    })
 }
 
 pub(super) fn object_stable_id(item: &Value) -> Result<String, SourceSnapshotSchemaViolationKind> {

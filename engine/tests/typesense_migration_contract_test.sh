@@ -18,7 +18,7 @@ WORK_DIR_OWNER="$WORK_DIR/.typesense_migration_contract_selftest_owned"
 TESTS_RUN=0
 TESTS_PASSED=0
 TESTS_FAILED=0
-EXPECTED_CASES=$'rejects_wrong_record_value_and_count\nrejects_dropped_id\nrejects_changed_schema_and_default_sort\nrejects_missing_synonym_and_curation\nrejects_wrong_alias_target\nrejects_truncated_export\nrejects_source_mutation_during_capture\nrejects_credential_leakage\nrejects_cleanup_residue'
+EXPECTED_CASES=$'rejects_wrong_record_value_and_count\nrejects_dropped_id\nrejects_changed_schema_and_default_sort\nrejects_missing_synonym_and_curation\nrejects_wrong_alias_target\nrejects_wrong_discovery_name_set\nrejects_wrong_discovery_order\nrejects_wrong_discovery_slice\nrejects_truncated_export\nrejects_source_mutation_during_capture\nrejects_credential_leakage\nrejects_cleanup_residue'
 
 cleanup() {
   local rc="$?"
@@ -124,6 +124,10 @@ assert_static_contract() {
   grep -Fq 'UNRELATED_SYNONYM_SET' "$ORACLE" && grep -Fq 'global_resource_visibility' "$ORACLE" \
     && pass 'runner proves unrelated global set visibility outside collection regex' \
     || fail 'runner proves unrelated global set visibility outside collection regex'
+  grep -Fq 'assert_collection_listing_discovery_contract' "$ORACLE" \
+    && grep -Fq "'/collections?offset=1&limit=1'" "$ORACLE" \
+    && pass 'runner exercises discovery through the existing Typesense process' \
+    || fail 'runner exercises discovery through the existing Typesense process'
 }
 
 assert_expected_case_denominator() {
@@ -238,10 +242,25 @@ assert_rejection() {
       assert_truncated_export_evidence "$evidence/export_fj_ts_migration_categories.jsonl"
     elif [ "$case_name" = rejects_cleanup_residue ]; then
       assert_cleanup_residue_evidence "$evidence/cleanup_residue_marker.txt"
+    elif [[ "$case_name" == rejects_wrong_discovery_* ]]; then
+      assert_discovery_failure_evidence "$evidence"
     fi
   else
     fail "$case_name" "rc=$rc expected=$expected_text output=$(cat "$out" 2>/dev/null || true)"
   fi
+}
+
+assert_discovery_failure_evidence() {
+  local evidence="$1" file
+  for file in discovery_collections.json discovery_limit_one.json \
+    discovery_offset_one_limit_one.json discovery_offset_one.json \
+    discovery_offset_two.json; do
+    if [ ! -s "$evidence/$file" ] || ! jq -e . "$evidence/$file" >/dev/null 2>&1; then
+      fail 'discovery mutation preserves JSON failure evidence' "missing or invalid: $evidence/$file"
+      return
+    fi
+  done
+  pass 'discovery mutation preserves JSON failure evidence'
 }
 
 assert_truncated_export_evidence() {
@@ -321,6 +340,9 @@ main() {
   assert_rejection rejects_changed_schema_and_default_sort changed_schema_and_default_sort 'schema/default sort mismatch rejected'
   assert_rejection rejects_missing_synonym_and_curation missing_synonym_and_curation 'synonym/curation mismatch rejected'
   assert_rejection rejects_wrong_alias_target wrong_alias_target 'alias target mismatch rejected'
+  assert_rejection rejects_wrong_discovery_name_set wrong_discovery_name_set 'discovery name set mismatch rejected'
+  assert_rejection rejects_wrong_discovery_order wrong_discovery_order 'discovery newest-first order mismatch rejected'
+  assert_rejection rejects_wrong_discovery_slice wrong_discovery_slice 'discovery offset/limit slice mismatch rejected'
   assert_rejection rejects_truncated_export truncated_export 'export for fj_ts_migration_categories did not end with a JSON object'
   assert_rejection rejects_source_mutation_during_capture source_mutation_during_capture 'source mutation rejected: explicit write-freeze attestation was violated'
   assert_rejection rejects_credential_leakage credential_leakage 'credential leakage rejected'

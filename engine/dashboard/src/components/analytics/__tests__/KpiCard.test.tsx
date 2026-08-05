@@ -1,7 +1,8 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { Search } from 'lucide-react';
 import { KpiCard, DeltaBadge } from '@/components/analytics/KpiCard';
+import { CHART_CANVAS_TEST_ID, CHART_MARK_TEST_ID } from '@/lib/constants';
 
 const { responsiveContainerProps } = vi.hoisted(() => ({
   responsiveContainerProps: [] as Array<Record<string, unknown>>,
@@ -24,13 +25,15 @@ vi.mock('recharts', () => ({
     responsiveContainerProps.push(props);
     return <div>{children}</div>;
   },
-  AreaChart: ({ children }: { children: any }) => (
-    <svg data-testid="area-chart" viewBox="0 0 100 100">
+  // Forward the component's own props so tests assert the production chart
+  // test ids rather than ids invented by this mock.
+  AreaChart: ({ children, ...props }: { children: any } & Record<string, unknown>) => (
+    <svg viewBox="0 0 100 100" {...props}>
       {children}
     </svg>
   ),
-  Area: ({ fill, dataKey }: { fill?: string; dataKey?: string }) => (
-    <path data-testid="spark-area" data-fill={fill} data-key={dataKey} />
+  Area: ({ fill, dataKey, ...props }: { fill?: string; dataKey?: string } & Record<string, unknown>) => (
+    <path data-fill={fill} data-key={dataKey} {...props} />
   ),
 }));
 
@@ -113,8 +116,26 @@ describe('KpiCard', () => {
 
     expect(screen.getByTestId('sparkline')).toBeInTheDocument();
     expect(container.querySelector('#spark-total-searches')).toBeInTheDocument();
-    expect(screen.getByTestId('spark-area')).toHaveAttribute('data-fill', 'url(#spark-total-searches)');
-    expect(screen.getByTestId('spark-area')).toHaveAttribute('data-key', 'count');
+    expect(screen.getByTestId(CHART_MARK_TEST_ID)).toHaveAttribute('data-fill', 'url(#spark-total-searches)');
+    expect(screen.getByTestId(CHART_MARK_TEST_ID)).toHaveAttribute('data-key', 'count');
+  });
+
+  it('tags the sparkline surface and its area mark with the shared chart test ids', () => {
+    render(
+      <KpiCard
+        title="Total Searches"
+        value={1234}
+        loading={false}
+        icon={Search}
+        sparkData={[{ count: 10 }, { count: 20 }]}
+        sparkKey="count"
+        format="number"
+      />
+    );
+
+    const sparkline = screen.getByTestId('sparkline');
+    expect(within(sparkline).getByTestId(CHART_CANVAS_TEST_ID)).toBeInTheDocument();
+    expect(within(sparkline).getByTestId(CHART_MARK_TEST_ID)).toHaveAttribute('data-key', 'count');
   });
 
   it('gives sparkline charts a positive minimum width before ResizeObserver has measured layout', () => {

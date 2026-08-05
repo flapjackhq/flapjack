@@ -1,10 +1,22 @@
-use crate::error::Result;
+use crate::error::{FlapjackError, Result};
+use aes_gcm_siv::aead::{Aead, KeyInit, Payload};
+use aes_gcm_siv::{Aes256GcmSiv, Nonce};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use rand::RngCore;
 use std::fs::File;
+use std::io::Read;
 use std::path::{Component, Path};
 use tar::{Archive, Builder};
+
+const SNAPSHOT_KEY_FILE_ENV: &str = "FLAPJACK_SNAPSHOT_KEY_FILE";
+
+// These constants define an on-disk/on-wire format and are not free to change.
+const SNAPSHOT_ENCRYPTION_MAGIC: &[u8; 8] = b"FJSNAPE1";
+const SNAPSHOT_ENCRYPTION_VERSION: u8 = 1;
+const SNAPSHOT_ENCRYPTION_NONCE_LEN: usize = 12;
+const SNAPSHOT_ENCRYPTION_HEADER_LEN: usize = 21;
 
 fn reject_invalid_snapshot_entry_path(entry_path: &Path) -> Result<()> {
     if entry_path.is_absolute() {
@@ -92,7 +104,7 @@ pub fn import_from_tarball(tarball_path: &Path, dest_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn export_to_bytes(index_path: &Path) -> Result<Vec<u8>> {
+fn build_plaintext_snapshot_bytes(index_path: &Path) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
     {
         let encoder = GzEncoder::new(&mut buffer, Compression::fast());
@@ -109,12 +121,174 @@ pub fn export_to_bytes(index_path: &Path) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
+fn snapshot_key_file_error(message: impl Into<String>) -> FlapjackError {
+    FlapjackError::Config(format!(
+        "{SNAPSHOT_KEY_FILE_ENV} key file: {}",
+        message.into()
+    ))
+}
+
+fn parse_snapshot_key(file_bytes: &[u8]) -> Result<[u8; 32]> {
+    let key_bytes = match file_bytes.len() {
+        32 | 64 => file_bytes,
+        33 | 65 if file_bytes.ends_with(b"\n") => &file_bytes[..file_bytes.len() - 1],
+        _ => {
+            return Err(snapshot_key_file_error(
+                "expected exactly 64 hex characters or 32 raw bytes, with at most one trailing newline",
+            ));
+        }
+    };
+
+    let mut key = [0u8; 32];
+    match key_bytes.len() {
+        32 => key.copy_from_slice(key_bytes),
+        64 => {
+            let decoded = hex::decode(key_bytes).map_err(|_| {
+                snapshot_key_file_error(
+                    "expected exactly 64 hex characters or 32 raw bytes, with at most one trailing newline",
+                )
+            })?;
+            key.copy_from_slice(&decoded);
+        }
+        _ => unreachable!("snapshot key length was validated above"),
+    }
+    Ok(key)
+}
+
+fn resolve_snapshot_key_file() -> Result<Option<[u8; 32]>> {
+    let Some(key_path) = std::env::var_os(SNAPSHOT_KEY_FILE_ENV) else {
+        return Ok(None);
+    };
+    let key_path = Path::new(&key_path);
+    let key_file = File::open(key_path).map_err(|error| {
+        snapshot_key_file_error(format!("could not open {}: {error}", key_path.display()))
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = key_file
+            .metadata()
+            .map_err(|error| snapshot_key_file_error(format!("could not inspect mode: {error}")))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                path = %key_path.display(),
+                mode = format_args!("{:#o}", mode & 0o777),
+                "snapshot encryption key file is accessible by group or other users"
+            );
+        }
+    }
+
+    let mut file_bytes = Vec::with_capacity(66);
+    key_file
+        .take(66)
+        .read_to_end(&mut file_bytes)
+        .map_err(|error| snapshot_key_file_error(format!("could not be read: {error}")))?;
+    parse_snapshot_key(&file_bytes).map(Some)
+}
+
+fn encrypt_snapshot_bytes(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
+    let cipher = Aes256GcmSiv::new_from_slice(key)
+        .map_err(|error| FlapjackError::Config(format!("invalid snapshot key: {error}")))?;
+    let mut nonce_bytes = [0u8; SNAPSHOT_ENCRYPTION_NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+
+    let mut envelope = Vec::with_capacity(SNAPSHOT_ENCRYPTION_HEADER_LEN);
+    envelope.extend_from_slice(SNAPSHOT_ENCRYPTION_MAGIC);
+    envelope.push(SNAPSHOT_ENCRYPTION_VERSION);
+    envelope.extend_from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: plaintext,
+                aad: &envelope,
+            },
+        )
+        .map_err(|error| {
+            FlapjackError::Config(format!("snapshot AEAD encryption failed: {error}"))
+        })?;
+    envelope.extend_from_slice(&ciphertext);
+    Ok(envelope)
+}
+
+fn decrypt_snapshot_bytes(envelope: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
+    if envelope.len() < SNAPSHOT_ENCRYPTION_HEADER_LEN {
+        return Err(FlapjackError::Config(
+            "encrypted snapshot envelope is truncated".to_string(),
+        ));
+    }
+    let version = envelope[SNAPSHOT_ENCRYPTION_MAGIC.len()];
+    if version != SNAPSHOT_ENCRYPTION_VERSION {
+        return Err(FlapjackError::Config(format!(
+            "unsupported snapshot encryption version {version}"
+        )));
+    }
+
+    let cipher = Aes256GcmSiv::new_from_slice(key)
+        .map_err(|error| FlapjackError::Config(format!("invalid snapshot key: {error}")))?;
+    let nonce_start = SNAPSHOT_ENCRYPTION_MAGIC.len() + 1;
+    let nonce_end = nonce_start + SNAPSHOT_ENCRYPTION_NONCE_LEN;
+    cipher
+        .decrypt(
+            Nonce::from_slice(&envelope[nonce_start..nonce_end]),
+            Payload {
+                msg: &envelope[SNAPSHOT_ENCRYPTION_HEADER_LEN..],
+                aad: &envelope[..SNAPSHOT_ENCRYPTION_HEADER_LEN],
+            },
+        )
+        .map_err(|error| {
+            FlapjackError::Config(format!(
+                "snapshot AEAD authentication/decryption failed: {error}"
+            ))
+        })
+}
+
+pub fn export_to_bytes(index_path: &Path) -> Result<Vec<u8>> {
+    // Keep this production-call signature stable while configuration stays file-backed.
+    let key = resolve_snapshot_key_file()?;
+    export_to_bytes_with_key(index_path, key.as_ref())
+}
+
+pub fn export_to_bytes_with_key(index_path: &Path, key: Option<&[u8; 32]>) -> Result<Vec<u8>> {
+    let plaintext = build_plaintext_snapshot_bytes(index_path)?;
+    match key {
+        None => Ok(plaintext),
+        Some(key) => encrypt_snapshot_bytes(&plaintext, key),
+    }
+}
+
 pub fn import_from_bytes(data: &[u8], dest_dir: &Path) -> Result<()> {
+    // Keep this production-call signature stable while configuration stays file-backed.
+    let key = resolve_snapshot_key_file()?;
+    import_from_bytes_with_key(data, dest_dir, key.as_ref())
+}
+
+pub fn import_from_bytes_with_key(
+    data: &[u8],
+    dest_dir: &Path,
+    key: Option<&[u8; 32]>,
+) -> Result<()> {
+    let decrypted;
+    let plaintext = if data.starts_with(SNAPSHOT_ENCRYPTION_MAGIC) {
+        let key = key.ok_or_else(|| {
+            snapshot_key_file_error("is required to import an encrypted snapshot")
+        })?;
+        // Decrypt first because validate_snapshot_bytes is the SD-008 traversal guard
+        // and must inspect attacker-controlled plaintext before archive extraction.
+        decrypted = decrypt_snapshot_bytes(data, key)?;
+        decrypted.as_slice()
+    } else {
+        data
+    };
+
     std::fs::create_dir_all(dest_dir)?;
+    validate_snapshot_bytes(plaintext)?;
 
-    validate_snapshot_bytes(data)?;
-
-    let decoder = GzDecoder::new(data);
+    let decoder = GzDecoder::new(plaintext);
     let mut archive = Archive::new(decoder);
     archive.unpack(dest_dir)?;
 
@@ -203,5 +377,23 @@ mod tests {
             validate_snapshot_bytes(&bytes).is_err(),
             "a truncated generated archive must fail before publication"
         );
+    }
+
+    #[test]
+    fn snapshot_key_parser_accepts_raw_key_with_trailing_newline() {
+        let expected = [0xa5; 32];
+        let mut file_bytes = expected.to_vec();
+        file_bytes.push(b'\n');
+
+        assert_eq!(parse_snapshot_key(&file_bytes).unwrap(), expected);
+    }
+
+    #[test]
+    fn snapshot_key_parser_rejects_unrecognized_shape_with_accepted_forms() {
+        let error = parse_snapshot_key(b"too-short\n").unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("64 hex characters"), "{message}");
+        assert!(message.contains("32 raw bytes"), "{message}");
     }
 }

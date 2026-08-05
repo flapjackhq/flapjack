@@ -659,7 +659,7 @@ fn smoke_ssl_config() {
     std::env::set_var("FLAPJACK_PUBLIC_IP", "192.0.2.1");
     let config = flapjack::SslConfig::from_env().expect("ssl: valid env should parse");
     assert_eq!(config.email, "test@example.com");
-    assert_eq!(config.public_ip.to_string(), "192.0.2.1");
+    assert_eq!(config.public_ip.as_deref(), Some("192.0.2.1"));
 
     // Cleanup
     std::env::remove_var("FLAPJACK_SSL_EMAIL");

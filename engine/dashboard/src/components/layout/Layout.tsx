@@ -13,18 +13,22 @@ export function Layout() {
   const isDisconnected = health.isError || (health.data?.status !== 'ok' && !health.isLoading);
 
   return (
-    <div className="flex h-screen flex-col">
+    <div className="flex h-screen w-full min-w-0 flex-col" data-testid="app-shell">
       <Header onMenuToggle={() => setSidebarOpen((o) => !o)} />
       {isDisconnected && (
-        <div className="bg-red-600 text-white px-4 py-2 flex items-center justify-center gap-2 text-sm font-medium" data-testid="disconnected-banner">
+        // The backend host can be one unbroken token, so the banner must own
+        // wrapping instead of giving the document an intrinsic minimum width.
+        <div className="flex min-w-0 flex-wrap items-center justify-center gap-2 bg-red-600 px-4 py-2 text-center text-sm font-medium text-white" data-testid="disconnected-banner">
           <AlertTriangle className="h-4 w-4 shrink-0" />
-          <span>Server disconnected — check that Flapjack is running on {import.meta.env.DEV ? new URL(__BACKEND_URL__).host : window.location.host}</span>
+          <span className="min-w-0 break-words">Server disconnected — check that Flapjack is running on {import.meta.env.DEV ? new URL(__BACKEND_URL__).host : window.location.host}</span>
         </div>
       )}
       <DevModePanel />
-      <div className="flex flex-1 overflow-hidden">
+      {/* Flex children default to min-width:auto; these boundaries let the
+          existing main scroller contain wide route content locally. */}
+      <div className="flex min-w-0 flex-1 overflow-hidden">
         <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
-        <main className="flex-1 overflow-auto p-6 bg-muted/30">
+        <main className="min-w-0 flex-1 overflow-auto bg-muted/30 p-6" data-testid="app-shell-main">
           <Outlet />
         </main>
       </div>

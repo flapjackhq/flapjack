@@ -4,6 +4,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use flapjack_http::serve;
+use flapjack_http::startup::TlsPaths;
+use std::path::PathBuf;
 
 mod credentials;
 mod ingest;
@@ -26,6 +28,10 @@ struct Cli {
     bind_addr: Option<String>,
     #[arg(long, env = "FLAPJACK_PORT")]
     port: Option<u16>,
+    #[arg(long, env = "FLAPJACK_SSL_CERT_PATH")]
+    ssl_cert_path: Option<PathBuf>,
+    #[arg(long, env = "FLAPJACK_SSL_KEY_PATH")]
+    ssl_key_path: Option<PathBuf>,
 
     /// Local-dev instance name. Derives isolated defaults for data-dir and bind address.
     #[arg(long)]
@@ -191,6 +197,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
             std::env::set_var("FLAPJACK_DATA_DIR", &runtime.data_dir);
             std::env::set_var("FLAPJACK_BIND_ADDR", &runtime.bind_addr);
+            if let Some(tls_paths) = &runtime.tls_paths {
+                std::env::set_var("FLAPJACK_SSL_CERT_PATH", &tls_paths.cert_path);
+                std::env::set_var("FLAPJACK_SSL_KEY_PATH", &tls_paths.key_path);
+            }
             if cli.no_auth {
                 std::env::set_var("FLAPJACK_NO_AUTH", "1");
             }
@@ -257,15 +267,22 @@ fn run_reset_admin_key(data_dir: &str) -> Result<(), Box<dyn std::error::Error>>
 struct RuntimeConfig {
     data_dir: String,
     bind_addr: String,
+    tls_paths: Option<TlsPaths>,
 }
 
 fn resolve_runtime_config(cli: &Cli, matches: &ArgMatches) -> Result<RuntimeConfig, String> {
     let data_dir = resolve_data_dir(cli, matches)?;
     let bind_addr = resolve_bind_addr(cli, matches)?;
+    let tls_paths = resolve_tls_config(cli)?;
     Ok(RuntimeConfig {
         data_dir,
         bind_addr,
+        tls_paths,
     })
+}
+
+fn resolve_tls_config(cli: &Cli) -> Result<Option<TlsPaths>, String> {
+    TlsPaths::from_optional_paths(cli.ssl_cert_path.clone(), cli.ssl_key_path.clone())
 }
 
 fn resolve_data_dir(cli: &Cli, matches: &ArgMatches) -> Result<String, String> {
@@ -371,7 +388,6 @@ fn derive_instance_port(instance: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -382,6 +398,54 @@ mod tests {
             .expect("args should parse");
         let cli = Cli::from_arg_matches(&matches).expect("matches should parse into Cli");
         (cli, matches)
+    }
+
+    #[test]
+    fn resolve_tls_config_rejects_cert_without_key() {
+        let (cli, _matches) = parse_cli(&["flapjack", "--ssl-cert-path", "cert.pem"]);
+
+        assert_eq!(
+            resolve_tls_config(&cli).unwrap_err(),
+            "--ssl-cert-path cannot be used without --ssl-key-path"
+        );
+    }
+
+    #[test]
+    fn resolve_tls_config_rejects_key_without_cert() {
+        let (cli, _matches) = parse_cli(&["flapjack", "--ssl-key-path", "key.pem"]);
+
+        assert_eq!(
+            resolve_tls_config(&cli).unwrap_err(),
+            "--ssl-key-path cannot be used without --ssl-cert-path"
+        );
+    }
+
+    #[test]
+    fn resolve_tls_config_returns_paths_when_both_are_set() {
+        let (cli, _matches) = parse_cli(&[
+            "flapjack",
+            "--ssl-cert-path",
+            "cert.pem",
+            "--ssl-key-path",
+            "key.pem",
+        ]);
+
+        let paths = resolve_tls_config(&cli)
+            .expect("tls config should resolve")
+            .expect("tls paths should be present");
+
+        assert_eq!(paths.cert_path, PathBuf::from("cert.pem"));
+        assert_eq!(paths.key_path, PathBuf::from("key.pem"));
+    }
+
+    #[test]
+    fn resolve_tls_config_returns_none_when_neither_is_set() {
+        let (cli, _matches) = parse_cli(&["flapjack"]);
+
+        assert_eq!(
+            resolve_tls_config(&cli).expect("tls config should resolve"),
+            None
+        );
     }
 
     #[test]

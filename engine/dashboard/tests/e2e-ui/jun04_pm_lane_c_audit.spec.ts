@@ -3,9 +3,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { test, expect } from '../fixtures/auth.fixture';
 import {
+  AUDITED_DASHBOARD_ROUTE_PATTERNS,
   assertDashboardRouteCoverage,
   buildDashboardRouteAudit,
   EXCLUDED_DASHBOARD_ROUTES,
+  getDashboardRouteByAppPath,
 } from './route_audit_manifest';
 import {
   MOVIES,
@@ -17,6 +19,11 @@ import {
   validateMovieCorpus,
 } from '../fixtures/lane_c_movies';
 import { buildMovieSeedRequest } from '../fixtures/lane_c_movies_mock_backend';
+import {
+  seedRouteAuditExperiment,
+  type SeededRouteAuditExperiment,
+} from '../fixtures/experiment-seed';
+import { deleteExperiment } from '../fixtures/api-helpers';
 
 const MOCK_BUNDLE_BASELINE_NAME = 'jun98_am_lane_c_baseline';
 const MOCK_BUNDLE_TIMESTAMP = '20260605T000000Z';
@@ -190,10 +197,17 @@ test.describe('Lane C bundle dir safety', () => {
 });
 
 test.describe('Lane C Stage 1 route audit baseline', () => {
-  test.describe.configure({ mode: 'serial' });
+  let routeAuditExperiment: SeededRouteAuditExperiment;
 
   test.beforeAll(async ({ request }) => {
     await seedMoviesIndex(request);
+    routeAuditExperiment = await seedRouteAuditExperiment(request);
+  });
+
+  test.afterAll(async ({ request }) => {
+    if (routeAuditExperiment) {
+      await deleteExperiment(request, routeAuditExperiment.id);
+    }
   });
 
   test('movie corpus is exactly 50 unique stable documents', () => {
@@ -202,7 +216,7 @@ test.describe('Lane C Stage 1 route audit baseline', () => {
   });
 
   test('route manifest exactly covers App user-facing routes', () => {
-    const routes = buildDashboardRouteAudit(MOVIES_INDEX);
+    const routes = buildDashboardRouteAudit(MOVIES_INDEX, routeAuditExperiment);
 
     assertDashboardRouteCoverage(routes);
     expect(EXCLUDED_DASHBOARD_ROUTES).toEqual([
@@ -211,18 +225,17 @@ test.describe('Lane C Stage 1 route audit baseline', () => {
         reason: 'fallback_shell',
         detail: 'App wildcard is a fallback-only not-found shell, not an authenticated dashboard surface.',
       },
-      {
-        appPath: '/experiments/:experimentId',
-        reason: 'requires_runtime_experiment_fixture',
-        detail: 'Detail coverage depends on runtime-created experiment IDs until a deterministic fixture is promoted.',
-      },
     ]);
   });
 
-  for (const route of buildDashboardRouteAudit(MOVIES_INDEX)) {
-    test(`${route.path} reaches a stable ready state`, async ({ page }) => {
+  for (const appPath of AUDITED_DASHBOARD_ROUTE_PATTERNS) {
+    test(`${appPath} reaches a stable ready state`, async ({ page }) => {
+      const routes = buildDashboardRouteAudit(MOVIES_INDEX, routeAuditExperiment);
+      const route = getDashboardRouteByAppPath(routes, appPath);
+
       await page.goto(route.path);
       await route.waitForReady(page);
+      await expect(page.getByRole('main')).toBeVisible();
     });
   }
 });

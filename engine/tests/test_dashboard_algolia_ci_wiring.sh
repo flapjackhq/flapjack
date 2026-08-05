@@ -260,6 +260,17 @@ function workflowSteps() {
   ].flatMap((workflow) => stepBlocks(workflow.path).map((step) => ({ ...step, workflow: workflow.workflow })));
 }
 
+function workflowJobBlock(workflowPath, jobName) {
+  const lines = fs.readFileSync(workflowPath, 'utf8').split('\n');
+  const jobStart = lines.findIndex((line) => line === `  ${jobName}:`);
+  if (jobStart === -1) {
+    return '';
+  }
+  const nextJobOffset = lines.slice(jobStart + 1).findIndex((line) => /^  [a-zA-Z0-9_-]+:$/.test(line));
+  const jobEnd = nextJobOffset === -1 ? lines.length : jobStart + 1 + nextJobOffset;
+  return lines.slice(jobStart, jobEnd).join('\n');
+}
+
 function stepSelectsMigrationSpec(step, ownerProjects, specPath) {
   const scriptNames = npmScriptsFromCommand(runCommandFromStep(step));
   if (scriptNames.length === 0) {
@@ -282,6 +293,7 @@ const integrationStepNames = workflowSteps().filter((step) => (
   && npmScriptFromCommand(runCommandFromStep(step))
 ));
 const migrationSelectingSteps = workflowSteps().filter((step) => stepSelectsMigrationSpec(step, migrationOwners, migrationSpec));
+const dashboardFullE2eJob = workflowJobBlock(ciWorkflowPath, 'dashboard-full-e2e');
 
 check(
   hasExactlyOneSpecOwner(projects, migrationSpec),
@@ -311,6 +323,12 @@ check(
 check(
   migrationSelectingSteps.length > 0 && migrationSelectingSteps.every(stepHasAlgoliaEnv),
   'every workflow step selecting migrate-algolia.spec.ts carries ALGOLIA_APP_ID and ALGOLIA_ADMIN_KEY',
+);
+check(
+  dashboardFullE2eJob.includes('FLAPJACK_NODE_ID=dashboard-e2e')
+    && dashboardFullE2eJob.includes('FLAPJACK_ADVERTISE_ADDR=https://dashboard-e2e.invalid:7700')
+    && dashboardFullE2eJob.includes('FLAPJACK_REPLICATION_API_KEY=fj_devtestadminkey000000'),
+  'dashboard-full-e2e starts a deterministic replication-enabled backend for cluster peer specs',
 );
 check(
   !hasExactlyOneSpecOwner([

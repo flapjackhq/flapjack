@@ -41,6 +41,13 @@ struct EnvironmentVariableGuard {
 
 impl EnvironmentVariableGuard {
     fn remove(name: &'static str) -> Self {
+        // Serialize this mutation through the crate's single canonical env owner so it
+        // cannot run concurrently with any other `environ` mutator (e.g. the Algolia
+        // base-URL guard) and corrupt a parallel `getenv`. The lock is released once the
+        // mutation completes, so sibling guards created in the same test do not deadlock.
+        let _env_lock = crate::test_helpers::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_value = std::env::var_os(name);
         std::env::remove_var(name);
         Self {
@@ -52,6 +59,9 @@ impl EnvironmentVariableGuard {
 
 impl Drop for EnvironmentVariableGuard {
     fn drop(&mut self) {
+        let _env_lock = crate::test_helpers::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match &self.original_value {
             Some(value) => std::env::set_var(self.name, value),
             None => std::env::remove_var(self.name),

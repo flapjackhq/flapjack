@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Search } from 'lucide-react';
 import {
@@ -8,6 +8,7 @@ import {
   formatAnalyticsErrorMessage,
   TableSkeleton,
 } from '@/components/analytics/AnalyticsShared';
+import { CHART_CANVAS_TEST_ID, CHART_MARK_TEST_ID } from '@/lib/constants';
 
 const { responsiveContainerProps } = vi.hoisted(() => ({
   responsiveContainerProps: [] as Array<Record<string, unknown>>,
@@ -19,12 +20,16 @@ vi.mock('recharts', () => ({
     responsiveContainerProps.push(props);
     return <div>{children}</div>;
   },
-  AreaChart: ({ children }: { children: any }) => (
-    <svg data-testid="area-chart" viewBox="0 0 100 100">
+  // Forward the component's own props so tests assert the production chart
+  // test ids rather than ids invented by this mock.
+  AreaChart: ({ children, ...props }: { children: any } & Record<string, unknown>) => (
+    <svg viewBox="0 0 100 100" {...props}>
       {children}
     </svg>
   ),
-  Area: () => null,
+  Area: ({ dataKey, ...props }: { dataKey?: string } & Record<string, unknown>) => (
+    <path data-key={dataKey} {...props} />
+  ),
   CartesianGrid: () => null,
   Tooltip: () => null,
   XAxis: () => null,
@@ -152,7 +157,7 @@ describe('AreaTrendCard', () => {
     );
 
     expect(screen.getByTestId('empty-state-content')).toBeInTheDocument();
-    expect(screen.queryByTestId('area-chart')).not.toBeInTheDocument();
+    expect(screen.queryByTestId(CHART_CANVAS_TEST_ID)).not.toBeInTheDocument();
   });
 
   it('renders chart when data is present', () => {
@@ -176,7 +181,9 @@ describe('AreaTrendCard', () => {
       />
     );
 
-    expect(screen.getByTestId('area-chart')).toBeInTheDocument();
+    const card = screen.getByTestId('trend-data');
+    expect(within(card).getByTestId(CHART_CANVAS_TEST_ID)).toBeInTheDocument();
+    expect(within(card).getByTestId(CHART_MARK_TEST_ID)).toHaveAttribute('data-key', 'value');
     expect(screen.queryByTestId('empty-state-content')).not.toBeInTheDocument();
   });
 

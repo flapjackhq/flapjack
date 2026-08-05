@@ -1,0 +1,94 @@
+SEC-G9 replication peer-credential RED baseline
+captured against a running primary at http://127.0.0.1:57462
+binary: engine/target/debug/flapjack
+node id: secg9-baseline-primary (replication intent via FLAPJACK_ADVERTISE_ADDR)
+credential under test: the admin key, exactly as PeerClient sends it today
+
+== Setup: one tenant with a real oplog ==
+GET /internal/ops serves a per-tenant oplog, so an empty node would 404 for a
+reason unrelated to authorization. Seed one document first.
+
+--- seed a tenant so an oplog exists
+    request : POST /1/indexes/secg9_baseline
+    headers : x-algolia-application-id: flapjack-replication, x-algolia-api-key: <the admin key replicas are configured with today>
+    status  : 201 (expected 201)
+    body    : {"taskID":1785650959345,"objectID":"4bd07ebc4b2430e2bc57eed1088a77b7","createdAt":"2026-08-02T06:09:19.558999+00:00"}
+    result  : PASS
+
+== Direction 1: the replica credential works for replication ==
+
+--- replica pulls the oplog exactly as PeerClient does
+    request : GET /internal/ops?tenant_id=secg9_baseline&since_seq=0
+    headers : x-algolia-application-id: flapjack-replication, x-algolia-api-key: <the admin key replicas are configured with today>
+    status  : 200 (expected 200)
+    body    : {"tenant_id":"secg9_baseline","ops":[{"seq":1,"timestamp_ms":1785650959450,"node_id":"secg9-baseline-primary","tenant_id":"secg9_baseline","op_type":"upsert","payload":{"objectID":"4bd07ebc4b2430e2bc57eed1088a77b7","body":{"_id":"4bd07ebc4b2430e2bc57eed1088a77b7","title":"baseline"},"_flapjack_task_id":"task_secg9_baseline_0e061dab-fae7-49d2-8edb-efaa9c2fdbc8"}}],"current_seq":1,"oldest_retained_seq":1,"node_current_seqs":{"secg9-baseline-primary":1}}
+    result  : PASS
+
+--- oplog response carries the replication payload shape
+    result  : PASS (found "ops")
+
+--- oplog response is scoped to the seeded tenant
+    result  : PASS (found secg9_baseline)
+
+== Direction 2: the SAME credential re-shapes cluster membership ==
+This is the over-privilege. Nothing about replication needs this authority.
+
+--- replica credential adds a bogus cluster peer
+    request : POST /internal/cluster/peers
+    headers : x-algolia-application-id: flapjack-replication, x-algolia-api-key: <the admin key replicas are configured with today>
+    status  : 200 (expected 200)
+    body    : {"node_id":"secg9-bogus-peer","addr":"http://198.51.100.20:7700","peers_total":1}
+    result  : PASS
+
+--- add-peer receipt names the bogus peer
+    result  : PASS (found secg9-bogus-peer)
+
+--- membership now contains the bogus peer
+    request : GET /internal/cluster/status
+    headers : x-algolia-application-id: flapjack-replication, x-algolia-api-key: <the admin key replicas are configured with today>
+    status  : 200 (expected 200)
+    body    : {"node_id":"secg9-baseline-primary","replication_enabled":true,"peers_total":1,"peers_healthy":0,"peers":[{"peer_id":"secg9-bogus-peer","addr":"http://198.51.100.20:7700","status":"never_contacted","last_success_secs_ago":null}],"autoheal_enabled":false,"autoheal_peers":[]}
+    result  : PASS
+
+--- cluster status shows the injected peer
+    result  : PASS (found secg9-bogus-peer)
+
+== Reversal: leave the scratch primary clean ==
+
+--- remove the bogus cluster peer
+    request : DELETE /internal/cluster/peers/secg9-bogus-peer
+    headers : x-algolia-application-id: flapjack-replication, x-algolia-api-key: <the admin key replicas are configured with today>
+    status  : 200 (expected 200)
+    body    : {"node_id":"secg9-bogus-peer","peers_total":0}
+    result  : PASS
+
+--- membership after removal
+    request : GET /internal/cluster/status
+    headers : x-algolia-application-id: flapjack-replication, x-algolia-api-key: <the admin key replicas are configured with today>
+    status  : 200 (expected 200)
+    body    : {"node_id":"secg9-baseline-primary","replication_enabled":true,"peers_total":0,"peers_healthy":0,"peers":[],"autoheal_enabled":false,"autoheal_peers":[]}
+    result  : PASS
+
+--- bogus peer is gone from runtime membership
+    result  : PASS
+
+== Controls: the boundary that already holds today ==
+
+--- an unrelated random key is refused on the replication route
+    request : GET /internal/ops?tenant_id=secg9_baseline&since_seq=0
+    headers : x-algolia-application-id: flapjack-replication, x-algolia-api-key: <an unrelated random key>
+    status  : 403 (expected 403)
+    body    : {"message":"Invalid Application-ID or API key","status":403}
+    result  : PASS
+
+--- a query-string-only credential is refused on the replication route
+    request : GET /internal/ops?tenant_id=secg9_baseline&since_seq=0&x-algolia-api-key=secg9-baseline-admin-key
+    headers : x-algolia-application-id: flapjack-replication, (no x-algolia-api-key header)
+    status  : 403 (expected 403)
+    body    : {"message":"Invalid Application-ID or API key","status":403}
+    result  : PASS
+
+== Summary ==
+checks run: 13, failed: 0
+RESULT: PASS — over-privilege demonstrated and reversed
+Refusals in this transcript are 403; this crate has no 401 auth path.

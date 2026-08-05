@@ -130,16 +130,16 @@ test.describe('Rules', () => {
       const createDialog = page.getByRole('dialog');
       await expect(createDialog).toBeVisible({ timeout: 10_000 });
 
-      await createDialog.locator('#rule-object-id').fill(ruleObjectID);
-      await createDialog.locator('#rule-description').fill(ruleDescription);
-      await createDialog.locator('#rule-condition-pattern-0').fill(conditionPattern);
-      await createDialog.locator('#rule-condition-anchoring-0').selectOption('is');
+      await createDialog.getByLabel('Object ID', { exact: true }).fill(ruleObjectID);
+      await createDialog.getByLabel('Description', { exact: true }).fill(ruleDescription);
+      await createDialog.getByLabel('Pattern 1', { exact: true }).fill(conditionPattern);
+      await createDialog.getByLabel('Anchoring 1', { exact: true }).selectOption('is');
 
       const addPromotedItemButton = createDialog.getByRole('button', { name: /add promoted item/i });
       await addPromotedItemButton.scrollIntoViewIfNeeded();
       await addPromotedItemButton.click();
-      await createDialog.locator('#promote-oid-0').fill(promotedObjectID);
-      await createDialog.locator('#promote-pos-0').fill('0');
+      await createDialog.getByLabel('Promote Object ID 1', { exact: true }).fill(promotedObjectID);
+      await createDialog.getByLabel('Promote Position 1', { exact: true }).fill('0');
 
       await createDialog.getByRole('button', { name: /^create$/i }).click();
       await expect(createDialog).not.toBeVisible({ timeout: 10_000 });
@@ -157,10 +157,10 @@ test.describe('Rules', () => {
       const editDialog = page.getByRole('dialog');
       await expect(editDialog).toBeVisible({ timeout: 10_000 });
 
-      await expect(editDialog.locator('#rule-object-id')).toHaveValue(ruleObjectID);
-      await expect(editDialog.locator('#rule-description')).toHaveValue(ruleDescription);
-      await expect(editDialog.locator('#rule-condition-pattern-0')).toHaveValue(conditionPattern);
-      await expect(editDialog.locator('#promote-oid-0')).toHaveValue(promotedObjectID);
+      await expect(editDialog.getByLabel('Object ID', { exact: true })).toHaveValue(ruleObjectID);
+      await expect(editDialog.getByLabel('Description', { exact: true })).toHaveValue(ruleDescription);
+      await expect(editDialog.getByLabel('Pattern 1', { exact: true })).toHaveValue(conditionPattern);
+      await expect(editDialog.getByLabel('Promote Object ID 1', { exact: true })).toHaveValue(promotedObjectID);
 
       await editDialog.getByRole('button', { name: /cancel/i }).click();
       await expect(editDialog).not.toBeVisible({ timeout: 10_000 });
@@ -238,11 +238,11 @@ test.describe('Rules', () => {
       const editDialog = page.getByRole('dialog');
       await expect(editDialog).toBeVisible({ timeout: 10_000 });
 
-      await editDialog.locator('#rule-description').fill(updatedDescription);
-      await editDialog.locator('#promote-oid-0').fill(updatedPromotedObjectID);
+      await editDialog.getByLabel('Description', { exact: true }).fill(updatedDescription);
+      await editDialog.getByLabel('Promote Object ID 1', { exact: true }).fill(updatedPromotedObjectID);
 
-      await editDialog.locator('#validity-from-0').fill(validityFromLocal);
-      await editDialog.locator('#validity-until-0').fill(validityUntilLocal);
+      await editDialog.getByLabel('Valid From 1', { exact: true }).fill(validityFromLocal);
+      await editDialog.getByLabel('Valid Until 1', { exact: true }).fill(validityUntilLocal);
 
       await editDialog.getByRole('tab', { name: 'JSON' }).click();
       await expect(editDialog.getByText(updatedDescription, { exact: false })).toBeVisible({ timeout: 10_000 });
@@ -261,10 +261,10 @@ test.describe('Rules', () => {
       await updatedRuleCard.getByRole('button', { name: /edit/i }).click();
       const reopenedDialog = page.getByRole('dialog');
       await expect(reopenedDialog).toBeVisible({ timeout: 10_000 });
-      await expect(reopenedDialog.locator('#rule-description')).toHaveValue(updatedDescription);
-      await expect(reopenedDialog.locator('#promote-oid-0')).toHaveValue(updatedPromotedObjectID);
-      await expect(reopenedDialog.locator('#validity-from-0')).toHaveValue(validityFromLocal);
-      await expect(reopenedDialog.locator('#validity-until-0')).toHaveValue(validityUntilLocal);
+      await expect(reopenedDialog.getByLabel('Description', { exact: true })).toHaveValue(updatedDescription);
+      await expect(reopenedDialog.getByLabel('Promote Object ID 1', { exact: true })).toHaveValue(updatedPromotedObjectID);
+      await expect(reopenedDialog.getByLabel('Valid From 1', { exact: true })).toHaveValue(validityFromLocal);
+      await expect(reopenedDialog.getByLabel('Valid Until 1', { exact: true })).toHaveValue(validityUntilLocal);
       await reopenedDialog.getByRole('button', { name: /cancel/i }).click();
 
       await expect

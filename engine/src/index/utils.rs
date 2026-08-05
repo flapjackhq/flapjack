@@ -1,8 +1,95 @@
-//! Filesystem helpers for recursive directory copying with temporary-file filtering.
+//! Filesystem helpers for durable atomic writes and recursive directory copying.
 use crate::error::Result;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Recursively copy a directory tree from `src` to `dst`, skipping entries whose names start with `.tmp`.
+static ATOMIC_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn is_temporary_entry(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.starts_with(".tmp") || is_legacy_atomic_write_temp_name(name)
+}
+
+/// Names written by the pre-[`atomic_write`] call sites, which used `.tmp` as a
+/// *suffix* instead of the prefix this module now emits. A binary that crashed
+/// before the upgrade can still leave one of these on disk, so tree walks must
+/// keep excluding them. Only formats that were actually written are listed:
+/// the pause artifact never had a temp file (it was a plain in-place
+/// `fs::write`), so it has no legacy name.
+fn is_legacy_atomic_write_temp_name(name: &str) -> bool {
+    name == ".index_meta.json.tmp"
+        || name
+            .strip_prefix(".committed_seq.")
+            .is_some_and(|suffix| suffix.ends_with(".tmp"))
+}
+
+pub(crate) fn atomic_write(path: &Path, payload: &[u8]) -> std::io::Result<()> {
+    atomic_write_with_before_rename(path, payload, |_| {})
+}
+
+pub(crate) fn atomic_write_with_before_rename(
+    path: &Path,
+    payload: &[u8],
+    before_rename: impl FnOnce(&Path),
+) -> std::io::Result<()> {
+    atomic_write_with(path, |file| file.write_all(payload), before_rename)
+}
+
+fn atomic_write_with(
+    path: &Path,
+    write_payload: impl FnOnce(&mut File) -> std::io::Result<()>,
+    before_rename: impl FnOnce(&Path),
+) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("atomic-write target has no parent: {}", path.display()),
+        )
+    })?;
+    let temp_path = atomic_write_temp_path(path);
+    let write_result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        write_payload(&mut file)?;
+        file.sync_all()?;
+        drop(file);
+        before_rename(&temp_path);
+        std::fs::rename(&temp_path, path)?;
+        File::open(parent)?.sync_all()
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+fn atomic_write_temp_path(path: &Path) -> std::path::PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let nonce = ATOMIC_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    path.with_file_name(format!(
+        ".tmp.{file_name}.{}.{}.{}.tmp",
+        std::process::id(),
+        timestamp,
+        nonce
+    ))
+}
+
+/// Recursively copy a directory tree from `src` to `dst`, skipping in-flight
+/// atomic-write temporaries as classified by [`is_temporary_entry`].
 ///
 /// Creates `dst` and any intermediate parent directories if they do not exist.
 /// Files that vanish between directory listing and copy are silently skipped.
@@ -23,9 +110,8 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     for entry in entries {
         let path = entry.path();
         let file_name = entry.file_name();
-        let file_name_str = file_name.to_string_lossy();
 
-        if file_name_str.starts_with(".tmp") {
+        if is_temporary_entry(&path) {
             continue;
         }
 
@@ -86,10 +172,63 @@ mod tests {
         fs::create_dir(&src).unwrap();
         fs::write(src.join("keep.txt"), b"ok").unwrap();
         fs::write(src.join(".tmp_lock"), b"skip").unwrap();
+        fs::write(src.join(".index_meta.json.tmp"), b"skip legacy").unwrap();
 
         copy_dir_recursive(&src, &dst).unwrap();
         assert!(dst.join("keep.txt").exists());
         assert!(!dst.join(".tmp_lock").exists());
+        assert!(!dst.join(".index_meta.json.tmp").exists());
+    }
+
+    #[test]
+    fn recognizes_legacy_atomic_write_temp_files() {
+        for name in [".index_meta.json.tmp", ".committed_seq.42.99.tmp"] {
+            assert!(
+                is_temporary_entry(Path::new(name)),
+                "{name} should stay excluded during atomic-write compatibility windows"
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_write_replaces_contents_without_publishing_its_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(&path, b"old").unwrap();
+        let mut observed_temp_path = None;
+
+        atomic_write_with_before_rename(&path, b"new", |temp_path| {
+            assert_eq!(fs::read(temp_path).unwrap(), b"new");
+            assert!(is_temporary_entry(temp_path));
+            observed_temp_path = Some(temp_path.to_path_buf());
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert!(!observed_temp_path.unwrap().exists());
+    }
+
+    #[test]
+    fn atomic_write_cleans_up_after_payload_write_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let error = atomic_write_with(
+            &path,
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "injected payload write failure",
+                ))
+            },
+            |_| {},
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+        assert!(fs::read_dir(dir.path())
+            .unwrap()
+            .all(|entry| !is_temporary_entry(&entry.unwrap().path())));
     }
 
     #[test]

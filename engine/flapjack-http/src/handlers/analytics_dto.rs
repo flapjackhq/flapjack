@@ -265,6 +265,8 @@ pub struct AnalyticsSeedResponse {
     pub status: String,
     pub index: String,
     pub days: u32,
+    #[serde(rename = "seededDates")]
+    pub seeded_dates: Vec<String>,
     #[serde(rename = "totalSearches")]
     pub total_searches: u64,
     #[serde(rename = "totalClicks")]
@@ -305,7 +307,21 @@ pub struct AnalyticsCleanupResponse {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct SeedRequest {
     pub index: Option<String>,
     pub days: Option<u32>,
+    pub search_count: Option<u32>,
+    pub no_result_rate: Option<f64>,
+    pub device_distribution: Option<std::collections::BTreeMap<String, f64>>,
+    pub country_distribution: Option<std::collections::BTreeMap<String, f64>>,
+}
+
+/// Request body for `DELETE /2/analytics/clear`. Clear only targets an index; it must
+/// not inherit the seed-only volume/distribution controls from `SeedRequest`, or the
+/// published contract would advertise controls the clear handler silently ignores.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearRequest {
+    pub index: Option<String>,
 }

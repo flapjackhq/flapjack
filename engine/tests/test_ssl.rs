@@ -1,7 +1,8 @@
-use flapjack_ssl::SslConfig;
+use flapjack_ssl::{SslConfig, SslManager};
 use serial_test::serial;
 use std::env;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
 #[serial]
@@ -20,23 +21,22 @@ fn test_ssl_config_requires_email() {
 
 #[test]
 #[serial]
-fn test_ssl_config_requires_public_ip() {
-    // Set email but not IP
+fn test_ssl_config_requires_acme_identifier() {
     env::set_var("FLAPJACK_SSL_EMAIL", "test@example.com");
     env::remove_var("FLAPJACK_PUBLIC_IP");
+    env::remove_var("FLAPJACK_SSL_DOMAIN");
 
-    // Should fail without explicit IP. Auto-detection is not yet implemented
-    // (detect_public_ip() always returns error, see config.rs TODO)
     let result = SslConfig::from_env();
     assert!(
         result.is_err(),
-        "Config should fail when FLAPJACK_PUBLIC_IP is not set and auto-detection is unimplemented"
+        "Config should fail when neither supported ACME identifier is set"
     );
 
     let err = result.unwrap_err();
     assert!(
-        err.to_string().contains("public IP") || err.to_string().contains("auto-detect"),
-        "Error should mention public IP or auto-detection, got: {}",
+        err.to_string().contains("FLAPJACK_PUBLIC_IP")
+            && err.to_string().contains("FLAPJACK_SSL_DOMAIN"),
+        "Error should name both supported ACME identifier variables, got: {}",
         err
     );
 
@@ -52,7 +52,7 @@ fn test_ssl_config_valid() {
     let config = SslConfig::from_env().expect("Config should parse");
 
     assert_eq!(config.email, "test@example.com");
-    assert_eq!(config.public_ip.to_string(), "192.0.2.1");
+    assert_eq!(config.public_ip.as_deref(), Some("192.0.2.1"));
     assert_eq!(config.check_interval_secs, 86400); // 24 hours
     assert_eq!(config.renew_days_threshold, 3);
     assert!(config.acme_directory.contains("letsencrypt.org"));
@@ -178,9 +178,36 @@ fn test_acme_challenge_concurrent_storage() {
 
 #[tokio::test]
 async fn test_ssl_manager_initialization() {
-    // Skip test if crypto provider not available
-    // This is an integration test that requires network access and crypto libraries
-    // Run with: cargo test --test test_ssl test_ssl_manager_initialization -- --ignored
-    // For now, just test config parsing in unit tests
-    println!("Skipping SSL manager initialization test - requires crypto provider and network");
+    let unique_suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after the unix epoch")
+        .as_nanos();
+    let fixture = tempfile::tempdir().expect("tempdir must be creatable");
+    let missing_root = fixture.path().join(format!(
+        "missing-root-{unique_suffix}-{}.pem",
+        std::process::id()
+    ));
+    let config = SslConfig {
+        public_ip: Some("192.0.2.1".to_string()),
+        acme_identifier: "192.0.2.1".to_string(),
+        email: "test@example.com".to_string(),
+        acme_directory: "https://acme.example.test/directory".to_string(),
+        material_dir: fixture.path().join("material"),
+        root_ca_pem: Some(missing_root.clone()),
+        check_interval_secs: 86_400,
+        renew_days_threshold: 3,
+    };
+
+    let error = match SslManager::new(config).await {
+        Ok(_) => panic!("missing root CA override must fail manager initialization"),
+        Err(error) => error,
+    };
+    let error_text = error.to_string();
+
+    assert!(
+        error_text.contains(missing_root.to_string_lossy().as_ref())
+            || error_text.contains("root")
+            || error_text.contains("No such file"),
+        "manager initialization must surface the root-CA failure context, got: {error_text}"
+    );
 }

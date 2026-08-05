@@ -10,12 +10,22 @@ use crate::handlers::AppState;
 use super::geo::{apply_rule_geo_overrides, best_geoloc_for_filter, extract_all_geolocs};
 use super::highlight::collect_facet_values;
 use super::personalization::{apply_personalization_boost_in_tiers, PersonalizationContext};
-use super::pipeline::{PreparedSearchParams, TransformOutputs};
+use super::pipeline::{PreparedSearchParams, SearchPhaseWitness, TransformOutputs};
 use super::reranking::{
     document_matches_filter, rerank_by_ctr, rerank_documents_by_optional_filters,
 };
 
 type GeoDistanceMap = HashMap<String, (f64, f64, f64)>;
+
+pub(super) struct TransformContext<'a> {
+    pub(super) state: &'a Arc<AppState>,
+    pub(super) req: &'a SearchRequest,
+    pub(super) params: &'a PreparedSearchParams,
+    pub(super) effective_index: &'a str,
+    pub(super) personalization_ctx: Option<&'a PersonalizationContext>,
+    pub(super) is_interleaving: bool,
+    pub(super) search_phase_witness: SearchPhaseWitness,
+}
 
 /// Apply all post-search transforms: CTR re-ranking, optional filter re-ranking,
 /// geo filtering/sorting/pagination, faceting-after-distinct, and personalization.
@@ -23,14 +33,19 @@ type GeoDistanceMap = HashMap<String, (f64, f64, f64)>;
 /// Returns `TransformOutputs` containing geo distances and automatic radius needed
 /// by the response formatter.
 pub(super) fn apply_reranking_and_transforms(
-    state: &Arc<AppState>,
-    req: &SearchRequest,
-    params: &PreparedSearchParams,
     result: &mut SearchResult,
-    effective_index: &str,
-    personalization_ctx: Option<&PersonalizationContext>,
-    is_interleaving: bool,
+    context: TransformContext<'_>,
 ) -> TransformOutputs {
+    let TransformContext {
+        state,
+        req,
+        params,
+        effective_index,
+        personalization_ctx,
+        is_interleaving,
+        search_phase_witness,
+    } = context;
+
     apply_ctr_reranking(state, req, params, result, effective_index, is_interleaving);
 
     if let Some(groups) = params.optional_filter_groups.as_ref() {
@@ -70,10 +85,7 @@ pub(super) fn apply_reranking_and_transforms(
         }
     }
 
-    TransformOutputs {
-        geo_distances,
-        automatic_radius,
-    }
+    TransformOutputs::new(geo_distances, automatic_radius, search_phase_witness)
 }
 
 /// Applies click-through-rate re-ranking when `enableReRanking` is active, fetching

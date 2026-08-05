@@ -2,9 +2,16 @@ import AxeBuilder from '@axe-core/playwright';
 import type { Page } from '@playwright/test';
 import { expect, test } from '../../fixtures/auth.fixture';
 import { TEST_INDEX } from '../../fixtures/test-data';
+import { deleteExperiment } from '../../fixtures/api-helpers';
 import {
+  seedRouteAuditExperiment,
+  type SeededRouteAuditExperiment,
+} from '../../fixtures/experiment-seed';
+import {
+  AUDITED_DASHBOARD_ROUTE_PATTERNS,
   buildDashboardRouteAudit,
   EXCLUDED_DASHBOARD_ROUTES,
+  getDashboardRouteByAppPath,
   type DashboardRoute,
 } from '../route_audit_manifest';
 
@@ -70,8 +77,6 @@ const ROUTE_SUPPRESSIONS: Readonly<Record<string, readonly AxeSuppression[]>> = 
   ],
 };
 
-const AUDITED_ROUTES = buildDashboardRouteAudit(TEST_INDEX);
-
 function formatViolationSummary(
   route: DashboardRoute,
   violations: readonly { id: string; help: string; nodes: readonly unknown[] }[],
@@ -118,24 +123,35 @@ async function scanRoute(page: Page, route: DashboardRoute): Promise<void> {
 }
 
 test.describe('Accessibility audit', () => {
-  test('documents intentional route exclusions inline', async () => {
-    await expect(EXCLUDED_DASHBOARD_ROUTES).toEqual([
+  let routeAuditExperiment: SeededRouteAuditExperiment;
+
+  test.beforeAll(async ({ request }) => {
+    routeAuditExperiment = await seedRouteAuditExperiment(request);
+  });
+
+  test.afterAll(async ({ request }) => {
+    if (routeAuditExperiment) {
+      await deleteExperiment(request, routeAuditExperiment.id);
+    }
+  });
+
+  test('documents intentional route exclusions inline', () => {
+    expect(EXCLUDED_DASHBOARD_ROUTES).toEqual([
       {
         appPath: '*',
         reason: 'fallback_shell',
         detail: 'App wildcard is a fallback-only not-found shell, not an authenticated dashboard surface.',
       },
-      {
-        appPath: '/experiments/:experimentId',
-        reason: 'requires_runtime_experiment_fixture',
-        detail: 'Detail coverage depends on runtime-created experiment IDs until a deterministic fixture is promoted.',
-      },
     ]);
   });
 
-  for (const route of AUDITED_ROUTES) {
-    test(`${route.path} (${route.coverage}) has no automatically detectable accessibility violations`, async ({ page }) => {
+  for (const appPath of AUDITED_DASHBOARD_ROUTE_PATTERNS) {
+    test(`${appPath} has no automatically detectable accessibility violations`, async ({ page }) => {
+      const routes = buildDashboardRouteAudit(TEST_INDEX, routeAuditExperiment);
+      const route = getDashboardRouteByAppPath(routes, appPath);
+
       await scanRoute(page, route);
+      await expect(page.getByRole('main')).toBeVisible();
     });
   }
 });

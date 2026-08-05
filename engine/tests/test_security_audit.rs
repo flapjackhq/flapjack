@@ -353,7 +353,7 @@ fn a10_peer_address_intake_filters_only_localhost_and_metadata_destinations() {
         "replication manager must keep the operator-configured private peer"
     );
     assert!(
-        AnalyticsClusterClient::new(&config).is_some(),
+        AnalyticsClusterClient::new(&config, None).is_some(),
         "analytics fan-out client should still be constructed for private-cluster peers"
     );
 }
@@ -1292,6 +1292,24 @@ fn a04_production_bootstrap_rejects_missing_blank_or_short_admin_key() {
         ),
         Err(StartupAuthValidationError::NoAuthInProduction)
     );
+    for variant in ["Production", " production ", "PRODUCTION"] {
+        assert_eq!(
+            validate_startup_auth_policy(variant, false, None, "127.0.0.1:7700", false),
+            Err(StartupAuthValidationError::MissingAdminKeyInProduction),
+            "variant {variant:?} must not bypass production bootstrap policy"
+        );
+        assert_eq!(
+            validate_startup_auth_policy(
+                variant,
+                true,
+                Some("1234567890abcdef"),
+                "0.0.0.0:7700",
+                true
+            ),
+            Err(StartupAuthValidationError::NoAuthInProduction),
+            "variant {variant:?} must keep no-auth forbidden in production"
+        );
+    }
     assert_eq!(
         validate_startup_auth_policy(
             "production",

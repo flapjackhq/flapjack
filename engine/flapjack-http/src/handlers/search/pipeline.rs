@@ -36,6 +36,26 @@ pub(super) struct PreparedSearchParams {
 pub(super) struct TransformOutputs {
     pub geo_distances: HashMap<String, (f64, f64, f64)>,
     pub automatic_radius: Option<u64>,
+    _search_phase_witness: SearchPhaseWitness,
+}
+
+impl TransformOutputs {
+    pub(super) fn new(
+        geo_distances: HashMap<String, (f64, f64, f64)>,
+        automatic_radius: Option<u64>,
+        search_phase_witness: SearchPhaseWitness,
+    ) -> Self {
+        Self {
+            geo_distances,
+            automatic_radius,
+            _search_phase_witness: search_phase_witness,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct SearchPhaseWitness {
+    _private: (),
 }
 
 pub(super) fn hybrid_fetch_window(hits_per_page: usize, page: usize) -> usize {
@@ -51,4 +71,11 @@ where
 {
     let output = phase();
     (output, start.elapsed())
+}
+
+pub(super) fn measure_search_phase<T, F>(start: Instant, phase: F) -> (T, Duration)
+where
+    F: FnOnce(SearchPhaseWitness) -> T,
+{
+    measure_pipeline_elapsed(start, || phase(SearchPhaseWitness { _private: () }))
 }

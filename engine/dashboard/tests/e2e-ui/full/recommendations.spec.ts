@@ -1,5 +1,5 @@
 import { test, expect, TEST_INDEX } from '../helpers'
-import type { APIRequestContext } from '@playwright/test'
+import type { APIRequestContext, Locator, Page } from '@playwright/test'
 import {
   addDocuments,
   flushAnalytics,
@@ -138,6 +138,81 @@ async function expectRecommendationHits(
   }).toPass({ timeout: 30_000 })
 }
 
+async function expectPreviousModelMarkerCleared(
+  results: Locator,
+  previousModelMarker: string | null,
+) {
+  if (previousModelMarker) {
+    await expect(results).not.toContainText(previousModelMarker)
+  }
+}
+
+async function verifyAndFillModelInputs(
+  page: Page,
+  model: typeof RECOMMENDATION_MODEL_METADATA[number],
+  seeded: SeededRecommendationData,
+) {
+  const submitButton = page.getByTestId('get-recommendations-btn')
+  const objectInput = page.getByTestId('recommendations-object-input')
+  const facetInput = page.getByTestId('recommendations-facet-input')
+
+  if (model.requiresObjectID) {
+    await expect(objectInput).toBeVisible()
+    await objectInput.fill('')
+    await expect(submitButton).toBeDisabled()
+    await objectInput.fill(model.id === 'looking-similar' ? seeded.relatedObjectID : seeded.anchorObjectID)
+  } else {
+    await expect(objectInput).toHaveCount(0)
+  }
+
+  if (model.requiresFacetName) {
+    await expect(facetInput).toBeVisible()
+    await facetInput.fill('')
+    await expect(submitButton).toBeDisabled()
+    await facetInput.fill('brand')
+  } else {
+    await expect(facetInput).toHaveCount(0)
+  }
+}
+
+async function expectRecommendationResultForModel(
+  results: Locator,
+  model: typeof RECOMMENDATION_MODEL_METADATA[number],
+) {
+  await expect(async () => {
+    const resultText = await results.textContent() ?? ''
+    expect(resultText).not.toContain('Submit a preview request to view recommendations.')
+    if (resultText.includes('No recommendations found.')) {
+      return
+    }
+
+    expect(resultText).toContain('processingTimeMS:')
+    if (model.id === 'trending-facets') {
+      expect(resultText).toContain('brand')
+    }
+  }).toPass({ timeout: 10_000 })
+}
+
+async function getRecommendationResultMarker(
+  results: Locator,
+  seeded: SeededRecommendationData,
+): Promise<string | null> {
+  const resultText = await results.textContent() ?? ''
+  if (resultText.includes('No recommendations found.')) {
+    return null
+  }
+  if (resultText.includes(seeded.dominantBrand)) {
+    return seeded.dominantBrand
+  }
+  if (resultText.includes(seeded.relatedObjectID)) {
+    return seeded.relatedObjectID
+  }
+  if (resultText.includes(seeded.secondaryObjectID)) {
+    return seeded.secondaryObjectID
+  }
+  return seeded.anchorObjectID
+}
+
 async function seedRecommendationsData(request: APIRequestContext): Promise<SeededRecommendationData> {
   const seeded = buildSeededRecommendationData()
 
@@ -213,68 +288,13 @@ test.describe('Recommendations page', () => {
       await expect(modelSelect).toHaveValue(model.id)
       await expect(results).toContainText('Submit a preview request to view recommendations.')
       await expect(page.getByRole('alert')).toHaveCount(0)
-
-      if (previousModelMarker) {
-        await expect(results).not.toContainText(previousModelMarker)
-      }
-
-      const objectInput = page.getByTestId('recommendations-object-input')
-      const facetInput = page.getByTestId('recommendations-facet-input')
-
-      if (model.requiresObjectID) {
-        await expect(objectInput).toBeVisible()
-        await objectInput.fill('')
-        await expect(submitButton).toBeDisabled()
-      } else {
-        await expect(objectInput).toHaveCount(0)
-      }
-
-      if (model.requiresFacetName) {
-        await expect(facetInput).toBeVisible()
-        await facetInput.fill('')
-        await expect(submitButton).toBeDisabled()
-      } else {
-        await expect(facetInput).toHaveCount(0)
-      }
-
-      if (model.requiresObjectID) {
-        const objectID = model.id === 'looking-similar'
-          ? seeded.relatedObjectID
-          : seeded.anchorObjectID
-        await objectInput.fill(objectID)
-      }
-      if (model.requiresFacetName) {
-        await facetInput.fill('brand')
-      }
+      await expectPreviousModelMarkerCleared(results, previousModelMarker)
+      await verifyAndFillModelInputs(page, model, seeded)
 
       await expect(submitButton).toBeEnabled()
       await submitButton.click()
-
-      await expect(async () => {
-        const resultText = await results.textContent() ?? ''
-        expect(resultText).not.toContain('Submit a preview request to view recommendations.')
-        if (resultText.includes('No recommendations found.')) {
-          return
-        }
-
-        expect(resultText).toContain('processingTimeMS:')
-        if (model.id === 'trending-facets') {
-          expect(resultText).toContain('brand')
-        }
-      }).toPass({ timeout: 10_000 })
-
-      const resultText = await results.textContent() ?? ''
-      if (resultText.includes('No recommendations found.')) {
-        previousModelMarker = null
-      } else if (resultText.includes(seeded.dominantBrand)) {
-        previousModelMarker = seeded.dominantBrand
-      } else if (resultText.includes(seeded.relatedObjectID)) {
-        previousModelMarker = seeded.relatedObjectID
-      } else if (resultText.includes(seeded.secondaryObjectID)) {
-        previousModelMarker = seeded.secondaryObjectID
-      } else {
-        previousModelMarker = seeded.anchorObjectID
-      }
+      await expectRecommendationResultForModel(results, model)
+      previousModelMarker = await getRecommendationResultMarker(results, seeded)
     }
   })
 

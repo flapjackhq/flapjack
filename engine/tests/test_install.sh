@@ -41,6 +41,10 @@ section() {
   printf "\n\033[1m%s\033[0m\n" "$1"
 }
 
+installer_target_triples() {
+  sed -n 's/.*target="\([A-Za-z0-9._-]*\)".*/\1/p' "$1" | LC_ALL=C sort -u
+}
+
 # ── Unit Tests ───────────────────────────────────────────────────────────────
 
 section "Install Script Syntax & Structure"
@@ -508,6 +512,62 @@ if echo "$api_resp" | grep -q 'flapjack-.*\.tar\.gz'; then
   pass "Release has .tar.gz assets"
 else
   fail "No .tar.gz assets found in latest release"
+fi
+
+# Test: the published release is COMPLETE for every target install.sh can resolve.
+#
+# Why this is separate from the test above: that one passes if a single tarball
+# exists anywhere in the release. A release that published only linux-x86_64 —
+# or that lost an asset to a partial upload — would satisfy it while leaving
+# every macOS and Windows user with a 404 from the documented quickstart. The
+# install path is `curl -fsSL https://install.flapjack.foo | sh`, which resolves
+# /releases/latest and then downloads `flapjack-<triple>.<ext>` plus its
+# `.sha256`, so an incomplete release is a customer-visible outage, not a
+# packaging detail.
+#
+# Deliberately NOT asserted here: that the tag matches the version in
+# engine/Cargo.toml. This file runs in mirror CI (.github/workflows/
+# test-installer.yml, nightly.yml), and a tree-vs-published equality check is red
+# by construction for the whole window between the version bump and the
+# release.yml publish — i.e. it would block the very release it is meant to
+# protect. That assertion belongs in the release lane's post-publish
+# verification, where "the tag I just cut is what customers now resolve" is the
+# correct and non-blocking question.
+#
+# Targets are read from install.sh rather than restated, so adding another
+# supported platform automatically makes its release assets mandatory here.
+missing_assets=""
+checked_targets=0
+installer_targets=$(installer_target_triples "$INSTALL_SCRIPT")
+for _triple in $installer_targets; do
+  checked_targets=$((checked_targets + 1))
+  for _name in "flapjack-${_triple}.tar.gz" "flapjack-${_triple}.tar.gz.sha256"; do
+    echo "$api_resp" | grep -q "\"name\": *\"${_name}\"" || missing_assets="${missing_assets} ${_name}"
+  done
+done
+
+if [ "$checked_targets" -eq 0 ]; then
+  # Fail closed: zero targets means either install.sh stopped naming triples or
+  # the API response never arrived. Passing here would be a vacuous green.
+  fail "Release asset completeness could not be evaluated" \
+    "No installer targets were resolved from $INSTALL_SCRIPT; refusing to report healthy"
+elif [ -n "$missing_assets" ]; then
+  fail "Latest release is missing published assets for ${checked_targets} installer target(s)" \
+    "Missing:${missing_assets}"
+else
+  pass "Latest release publishes every asset install.sh can request (${checked_targets} targets, binary + sha256)"
+fi
+
+# Test: the release a customer resolves is actually installable — not a draft,
+# not a prerelease. `/releases/latest` already excludes drafts, so a draft here
+# means the API shape changed; prerelease is excluded by GitHub too, but both are
+# asserted because the installer treats whatever it gets as shippable.
+if echo "$api_resp" | grep -q '"draft": *true'; then
+  fail "Latest release is a draft; the documented quickstart would resolve an unpublished release"
+elif echo "$api_resp" | grep -q '"prerelease": *true'; then
+  fail "Latest release is a prerelease; the documented quickstart would resolve a prerelease to new users"
+else
+  pass "Latest release is published and not a prerelease"
 fi
 
 # ── Integration Tests (requires network + GITHUB_TOKEN for private repos) ───

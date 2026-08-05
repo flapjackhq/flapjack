@@ -45,6 +45,9 @@ fn collect_tree_records(
     for entry in fs::read_dir(current)? {
         let entry = entry?;
         let path = entry.path();
+        if crate::index::utils::is_temporary_entry(&path) {
+            continue;
+        }
         let relative = normalize_digest_relative_path(root, &path)?;
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {

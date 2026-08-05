@@ -222,3 +222,19 @@ async fn pre_serve_barrier_recovers_async_migrations_before_catchup_future() {
     .await
     .unwrap();
 }
+
+#[test]
+fn ssl_renewal_starts_only_after_http_listener_is_bound() {
+    let source = include_str!("server.rs");
+    let listener_bind = source
+        .find("let listener = tokio::net::TcpListener::bind")
+        .expect("server startup must bind a TCP listener");
+    let background_start = source
+        .find("spawn_background_tasks(&state, &infrastructure);")
+        .expect("server startup must launch the SSL renewal worker");
+
+    assert!(
+        listener_bind < background_start,
+        "HTTP-01 must be reachable before immediate SSL renewal starts"
+    );
+}

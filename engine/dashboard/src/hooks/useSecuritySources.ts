@@ -2,32 +2,10 @@
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import api from '@/lib/api';
+import { extractApiErrorMessage } from '@/lib/apiErrorMessage';
 import { useToast } from '@/hooks/use-toast';
 import { securitySourcesKeys } from '@/lib/queryKeys';
 import type { SecuritySourceEntry, SecuritySourceMutationResponse } from '@/lib/types';
-
-type ApiError = {
-  response?: {
-    data?: unknown;
-  };
-  message?: string;
-};
-
-function errorDescription(error: ApiError): string {
-  const responseData = error.response?.data;
-  if (typeof responseData === 'string' && responseData.length > 0) {
-    return responseData;
-  }
-
-  if (responseData && typeof responseData === 'object') {
-    const message = (responseData as { message?: unknown }).message;
-    if (typeof message === 'string' && message.length > 0) {
-      return message;
-    }
-  }
-
-  return error.message || 'Request failed';
-}
 
 export function useSecuritySources() {
   return useQuery({
@@ -55,10 +33,10 @@ export function useAppendSecuritySource() {
       queryClient.invalidateQueries({ queryKey: securitySourcesKeys.all });
       toast({ title: 'Security source added' });
     },
-    onError: (error: ApiError) => {
+    onError: (error: unknown) => {
       toast({
         title: 'Failed to add security source',
-        description: errorDescription(error),
+        description: extractApiErrorMessage(error, 'Request failed'),
         variant: 'destructive',
       });
     },
@@ -80,10 +58,10 @@ export function useDeleteSecuritySource() {
       queryClient.invalidateQueries({ queryKey: securitySourcesKeys.all });
       toast({ title: 'Security source deleted' });
     },
-    onError: (error: ApiError) => {
+    onError: (error: unknown) => {
       toast({
         title: 'Failed to delete security source',
-        description: errorDescription(error),
+        description: extractApiErrorMessage(error, 'Request failed'),
         variant: 'destructive',
       });
     },

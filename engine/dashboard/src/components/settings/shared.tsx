@@ -101,6 +101,7 @@ export const FieldChips = memo(function FieldChips({
             key={field.name}
             type="button"
             onClick={() => onToggle(field.name)}
+            aria-pressed={isSelected}
             data-testid={`attr-chip-${field.name}`}
             className={cn(
               'inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium transition-colors',
@@ -110,7 +111,7 @@ export const FieldChips = memo(function FieldChips({
             )}
           >
             {field.name}
-            {isSelected && <X className="h-3 w-3 ml-1" />}
+            {isSelected && <X className="h-3 w-3 ml-1" aria-hidden="true" />}
           </button>
         );
       })}

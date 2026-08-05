@@ -26,9 +26,12 @@ import {
   createIndex,
   deleteIndex,
   addDocuments,
-  isVectorSearchEnabled,
+  skipWhenVectorSearchDisabled,
 } from '../../fixtures/api-helpers';
-import { setChatReadySettings } from '../../fixtures/chat-api-helpers';
+import {
+  setChatReadySettings,
+  setChatSearchMode,
+} from '../../fixtures/chat-api-helpers';
 
 test.describe('Navigation & Layout', () => {
 
@@ -229,24 +232,15 @@ test.describe('Navigation & Layout', () => {
     // Click the theme toggle button
     const themeBtn = page.getByRole('button', { name: /toggle theme/i });
     await expect(themeBtn).toBeVisible();
+    await expect(themeBtn).toHaveAttribute('title', 'Switch to dark mode');
 
-    // Get initial theme state
-    const documentRoot = page.getByRole('document');
-    const htmlBefore = await documentRoot.getAttribute('class');
-
-    // Click to toggle — wait for the class to actually change (Playwright retries automatically)
+    // Click to toggle — wait for the button state to actually change (Playwright retries automatically)
     await themeBtn.click();
-    await expect(documentRoot).not.toHaveAttribute('class', htmlBefore ?? '');
-
-    // Theme class should change
-    const htmlAfter = await documentRoot.getAttribute('class');
-    expect(htmlBefore).not.toBe(htmlAfter);
+    await expect(themeBtn).toHaveAttribute('title', 'Switch to light mode');
 
     // Toggle back — wait for class to return to original
     await themeBtn.click();
-    await expect(documentRoot).toHaveAttribute('class', htmlBefore ?? '');
-    const htmlRestored = await documentRoot.getAttribute('class');
-    expect(htmlRestored).toBe(htmlBefore);
+    await expect(themeBtn).toHaveAttribute('title', 'Switch to dark mode');
   });
 
   test('indexing queue button opens empty queue panel', async ({ page }) => {
@@ -309,9 +303,17 @@ test.describe('Navigation & Layout', () => {
   // Index Tab Bar — Chat tab (requires NeuralSearch mode)
   // =========================================================================
 
-  test('chat tab visible and navigable when NeuralSearch mode is enabled', async ({ page, request }) => {
+  test('chat tab visible and navigable when NeuralSearch mode is enabled', async ({
+    page,
+    request,
+  }, testInfo) => {
     const chatIndex = `e2e-nav-chat-${Date.now()}`;
-    const vectorSearchEnabled = await isVectorSearchEnabled(request);
+
+    await skipWhenVectorSearchDisabled(
+      request,
+      testInfo,
+      'Chat tab navigation requires a vector-search-enabled build',
+    );
 
     try {
       await deleteIndex(request, chatIndex);
@@ -323,17 +325,48 @@ test.describe('Navigation & Layout', () => {
 
       await gotoIndexPage(page, chatIndex);
 
-      if (!vectorSearchEnabled) {
-        await expect(page.getByTestId('index-tab-chat')).not.toBeVisible();
-        return;
-      }
-
-      // Chat tab should be visible with NeuralSearch mode
+      // Chat tab should be visible with NeuralSearch mode, then navigate.
       await expect(page.getByTestId('index-tab-chat')).toBeVisible({ timeout: 10_000 });
-
       await page.getByTestId('index-tab-chat').click();
       await expect(page).toHaveURL(new RegExp(`/index/${chatIndex}/chat`));
       await expect(page.getByTestId('chat-input')).toBeVisible({ timeout: 10_000 });
+      await expect(page.getByRole('main')).toBeVisible();
+    } finally {
+      await deleteIndex(request, chatIndex);
+    }
+  });
+
+  test('chat tab hidden when vector search is compiled out', async ({ page, request }) => {
+    const chatIndex = `e2e-nav-chat-compiled-out-${Date.now()}`;
+
+    try {
+      await deleteIndex(request, chatIndex);
+      await createIndex(request, chatIndex);
+      await addDocuments(request, chatIndex, [
+        { objectID: 'chat-nav-disabled-1', name: 'Disabled Chat Product', category: 'Test' },
+      ]);
+      await setChatSearchMode(request, chatIndex, 'neuralSearch');
+
+      await page.route('**/health', async (route) => {
+        const response = await route.fetch();
+        const health = await response.json();
+        await route.fulfill({
+          response,
+          json: {
+            ...health,
+            capabilities: {
+              ...health.capabilities,
+              vectorSearch: false,
+              vectorSearchLocal: false,
+            },
+          },
+        });
+      });
+
+      await gotoIndexPage(page, chatIndex);
+
+      await expect(page.getByTestId('index-tab-chat')).toBeHidden();
+      await expect(page.getByRole('main')).toBeVisible();
     } finally {
       await deleteIndex(request, chatIndex);
     }

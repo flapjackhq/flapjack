@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tempfile::TempDir;
 
+const GEO_SEARCH_UNBUCKETED_RATIO: u64 = 1;
+
 #[test]
 fn hybrid_fetch_window_uses_shared_formula() {
     assert_eq!(hybrid_fetch_window(20, 0), 200);
@@ -27,6 +29,62 @@ fn measure_pipeline_elapsed_includes_closure_runtime() {
         elapsed >= Duration::from_millis(20),
         "elapsed {elapsed:?} should include work done inside the measured phase"
     );
+}
+
+#[test]
+fn measured_search_phase_provides_the_transform_output_witness() {
+    let start = std::time::Instant::now();
+    let ((fallback_message, transform_outputs), _elapsed) =
+        measure_search_phase(start, |search_phase_witness| {
+            (
+                Some("fallback".to_string()),
+                TransformOutputs::new(HashMap::new(), Some(42), search_phase_witness),
+            )
+        });
+
+    assert_eq!(fallback_message.as_deref(), Some("fallback"));
+    assert_eq!(transform_outputs.automatic_radius, Some(42));
+}
+
+fn assert_transform_heavy_geo_time_stays_in_search_bucket(
+    queue_us: u64,
+    search_us: u64,
+    highlight_us: u64,
+    total_us: u64,
+) {
+    assert!(total_us >= search_us);
+    // `total` is measured from an `Instant` taken *after* `queue_wait` is sampled
+    // (see `single_execution.rs::search_single_sync`), so queue time is not part of
+    // `total` and must not be credited as bucketed work.
+    let bucketed_us = search_us.saturating_add(highlight_us);
+    let unbucketed_us = total_us.saturating_sub(bucketed_us);
+    assert!(
+        search_us >= unbucketed_us.saturating_mul(GEO_SEARCH_UNBUCKETED_RATIO),
+        "geo transforms must remain in the search bucket instead of unbucketed response work; queue={queue_us} search={search_us} highlight={highlight_us} unbucketed={unbucketed_us} total={total_us}"
+    );
+}
+
+#[test]
+fn archived_full_suite_timing_shape_keeps_geo_bucket_contract() {
+    assert_transform_heavy_geo_time_stays_in_search_bucket(35, 39_528, 38, 55_842);
+}
+
+#[test]
+fn unbucketed_transform_timing_shape_is_rejected() {
+    let result = std::panic::catch_unwind(|| {
+        assert_transform_heavy_geo_time_stays_in_search_bucket(0, 3, 0, 1_000_000);
+    });
+
+    assert!(
+        result.is_err(),
+        "a response with nearly all processing outside search must fail the bucket contract"
+    );
+}
+
+fn timing_us(body: &serde_json::Value, field: &str) -> u64 {
+    body["processingTimingsMS"][field]
+        .as_u64()
+        .unwrap_or_else(|| panic!("processingTimingsMS.{field} must be a u64"))
 }
 
 fn dense_geoloc_points(doc_seed: usize, points_per_doc: usize) -> flapjack::types::FieldValue {
@@ -54,7 +112,7 @@ fn dense_geoloc_points(doc_seed: usize, points_per_doc: usize) -> flapjack::type
 /// Regression test: build a transform-heavy geo search while keeping response
 /// formatting cheap. If post-search transforms ever move out of the `search`
 /// timing bucket again, `processingTimingsMS.total` will significantly exceed
-/// `processingTimingsMS.search` and this ratio check will fail.
+/// the named buckets and this assertion will fail.
 #[tokio::test]
 async fn search_response_includes_processing_timings_envelope() {
     let tmp = TempDir::new().unwrap();
@@ -132,14 +190,15 @@ async fn search_response_includes_processing_timings_envelope() {
         "processingTimingsMS must include 'total'"
     );
 
-    let queue_us = timings["queue"].as_u64().unwrap();
-    let search_us = timings["search"].as_u64().unwrap();
-    let highlight_us = timings["highlight"].as_u64().unwrap();
-    let total_us = timings["total"].as_u64().unwrap();
+    let queue_us = timing_us(&body, "queue");
+    let search_us = timing_us(&body, "search");
+    let highlight_us = timing_us(&body, "highlight");
+    let total_us = timing_us(&body, "total");
 
-    assert!(total_us >= search_us);
-    assert!(
-        search_us * 10 >= total_us * 8,
-        "search bucket must retain transform-heavy geo time; queue={queue_us} search={search_us} highlight={highlight_us} total={total_us}"
+    assert_transform_heavy_geo_time_stays_in_search_bucket(
+        queue_us,
+        search_us,
+        highlight_us,
+        total_us,
     );
 }

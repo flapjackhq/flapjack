@@ -1438,6 +1438,18 @@ fn mutate_manifest(
     store.commit_manifest(&manifest).unwrap();
 }
 
+fn mutate_manifest_json(store: &SpoolStore, job_uuid: uuid::Uuid, mutate: impl FnOnce(&mut Value)) {
+    let manifest_path = store.manifest_path(job_uuid);
+    let mut manifest_json: Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    mutate(&mut manifest_json);
+    std::fs::write(
+        manifest_path,
+        serde_json::to_vec_pretty(&manifest_json).unwrap(),
+    )
+    .unwrap();
+}
+
 fn artifact_final_path(store: &SpoolStore, job_uuid: uuid::Uuid, kind: ArtifactKind) -> String {
     store
         .read_manifest(job_uuid)
@@ -1607,15 +1619,19 @@ fn manifest_scrubs_source_data_and_public_progress_is_derived() {
     }
 
     let decoded: Value = serde_json::from_str(&manifest).unwrap();
+    assert_eq!(decoded["spool_format_version"], SPOOL_FORMAT_VERSION);
     assert!(decoded.get("progress").is_none());
     assert_ne!(view.public_handle, view.checkpoint_handle);
     assert_ne!(view.public_handle, view.job_uuid.to_string());
     assert_ne!(view.checkpoint_handle, view.job_uuid.to_string());
 
+    // The fixture declares `config: 1`, and derived-source configuration is
+    // deliberately outside export progress: 1 settings + 3 documents + 2 rules +
+    // 1 synonym = 7, with the config denominator excluded.
     let status = store.public_view(&view.public_handle).unwrap();
     assert_eq!(status.progress.completed, 3);
-    assert_eq!(status.progress.total, 8);
-    assert!((status.progress.ratio - 0.375).abs() < f64::EPSILON);
+    assert_eq!(status.progress.total, 7);
+    assert!((status.progress.ratio - 3.0 / 7.0).abs() < f64::EPSILON);
 }
 
 #[test]
@@ -2302,7 +2318,9 @@ fn typed_artifact_methods_account_exact_limits_and_leave_no_partial_state() {
     assert_eq!(store.visible_artifacts(view.job_uuid).unwrap().len(), 1);
     let status = store.public_view(&view.public_handle).unwrap();
     assert_eq!(status.progress.completed, 1);
-    assert_eq!(status.progress.total, 8);
+    // 1 settings + 3 documents + 2 rules + 1 synonym; the fixture's `config: 1`
+    // denominator stays out of export progress.
+    assert_eq!(status.progress.total, 7);
 }
 
 #[test]
@@ -2795,26 +2813,226 @@ fn accepted_reader_decodes_only_accepted_jobs_and_typed_artifacts() {
 }
 
 #[test]
-fn accepted_reader_refuses_config_artifacts_before_exposing_paths() {
+fn accepted_reader_rejects_legacy_manifest_without_spool_format_version() {
     let (_tmp, store, job_uuid) = accepted_store_with_artifacts();
+    mutate_manifest_json(&store, job_uuid, |manifest| {
+        manifest
+            .as_object_mut()
+            .expect("manifest must be an object")
+            .remove("spool_format_version");
+    });
+
+    assert_eq!(
+        store.accepted_artifacts(job_uuid).unwrap_err().kind(),
+        SpoolErrorKind::UnsupportedSpoolFormat
+    );
+}
+
+#[test]
+fn accepted_reader_rejects_unknown_spool_format_version() {
+    let (_tmp, store, job_uuid) = accepted_store_with_artifacts();
+    mutate_manifest_json(&store, job_uuid, |manifest| {
+        manifest["spool_format_version"] = json!(SPOOL_FORMAT_VERSION + 1);
+    });
+
+    assert_eq!(
+        store.accepted_artifacts(job_uuid).unwrap_err().kind(),
+        SpoolErrorKind::UnsupportedSpoolFormat
+    );
+}
+
+#[test]
+fn accepted_reader_loads_ordered_stable_ids_once_and_aligns_every_page() {
+    let tmp = TempDir::new().unwrap();
+    let store = fixed_store(&tmp);
+    let expected_pages = fixed_width_document_pages(3, 2);
+    let view = create_export_for_test(
+        &store,
+        uuid::Uuid::new_v4(),
+        &source_digest(),
+        ResourceDenominators {
+            settings: 1,
+            documents: 6,
+            rules: 0,
+            synonyms: 0,
+            config: 0,
+        },
+    )
+    .unwrap();
+    store
+        .commit_settings_once(view.job_uuid, b"{}", &source_digest())
+        .unwrap();
+    for page in &expected_pages {
+        let ids = page.iter().map(String::as_str).collect::<Vec<_>>();
+        store
+            .commit_document_page_with_ids(view.job_uuid, &object_payload(page), &ids)
+            .unwrap();
+    }
+    store
+        .complete_documents(view.job_uuid, 6, &source_digest())
+        .unwrap();
+    store
+        .complete_rules(view.job_uuid, 0, &source_digest())
+        .unwrap();
+    store
+        .complete_synonyms(view.job_uuid, 0, &source_digest())
+        .unwrap();
+    store.accept_export(view.job_uuid).unwrap();
+
+    reset_completed_id_sidecar_reads_for_tests();
+    let reader = store.accepted_artifacts(view.job_uuid).unwrap();
+    let pages = reader
+        .document_pages()
+        .collect::<SpoolResult<Vec<_>>>()
+        .unwrap();
+
+    assert_eq!(
+        pages
+            .iter()
+            .map(|page| page.stable_ids.clone())
+            .collect::<Vec<_>>(),
+        expected_pages
+    );
+    assert_eq!(
+        completed_id_sidecar_reads_for_tests(),
+        vec![ObjectResource::Documents],
+        "a resource iterator must verify and parse its complete stable-ID sidecar once"
+    );
+}
+
+#[test]
+fn accepted_reader_rejects_stable_ids_trailing_after_the_last_page() {
+    let (_tmp, store, job_uuid) = accepted_store_with_artifacts();
+    let final_path = artifact_final_path(&store, job_uuid, ArtifactKind::DocumentPage);
+    let bytes = br#"[{"objectID":"doc-1"}]"#;
+    std::fs::write(store.job_dir(job_uuid).join(&final_path), bytes).unwrap();
     mutate_manifest(&store, job_uuid, |manifest| {
+        let artifact = manifest
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.final_path == final_path)
+            .unwrap();
+        artifact.compressed_bytes = bytes.len() as u64;
+        artifact.decompressed_bytes = bytes.len() as u64;
+        artifact.item_count = 1;
+        artifact.digest = hex_digest(bytes);
+    });
+
+    let reader = store.accepted_artifacts(job_uuid).unwrap();
+    let mut pages = reader.document_pages();
+    assert_eq!(pages.next().unwrap().unwrap().stable_ids, vec!["doc-1"]);
+    assert_eq!(
+        pages.next().unwrap().unwrap_err().kind(),
+        SpoolErrorKind::ManifestCorrupt,
+        "an accepted iterator must reject sidecar IDs that do not align to any artifact item"
+    );
+}
+
+/// Derived-configuration artifacts are exposed as replica-owned settings, and a
+/// config record that does not match the writer's shape fails closed rather than
+/// silently reading as an empty replica set.
+#[test]
+fn accepted_reader_exposes_derived_configuration_and_refuses_foreign_records() {
+    let (_tmp, store, job_uuid) = accepted_store_with_artifacts();
+    let reader = store.accepted_artifacts(job_uuid).unwrap();
+    assert!(
+        reader.replica_settings().unwrap().is_empty(),
+        "a job with no derived configuration has no replica settings"
+    );
+
+    let record = br#"{"sourceName":"products_price_asc","settings":{"ranking":["desc(price)"]}}"#;
+    push_visible_config_artifact(&store, job_uuid, "config-test.bin", record);
+    let replica_settings = store
+        .accepted_artifacts(job_uuid)
+        .unwrap()
+        .replica_settings()
+        .unwrap();
+    assert_eq!(
+        replica_settings["products_price_asc"],
+        serde_json::json!({"ranking": ["desc(price)"]})
+    );
+
+    push_visible_config_artifact(&store, job_uuid, "config-foreign.bin", b"{}");
+    assert_eq!(
+        store
+            .accepted_artifacts(job_uuid)
+            .unwrap()
+            .replica_settings()
+            .unwrap_err()
+            .kind(),
+        SpoolErrorKind::UnsupportedArtifactKind
+    );
+}
+
+#[test]
+fn accepted_reader_refuses_duplicate_derived_configuration_source_names() {
+    let (_tmp, store, job_uuid) = accepted_store_with_artifacts();
+    let first = br#"{"sourceName":"products_price_asc","settings":{"ranking":["desc(price)"]}}"#;
+    let second = br#"{"sourceName":"products_price_asc","settings":{"ranking":["desc(margin)"]}}"#;
+    push_visible_config_artifact(&store, job_uuid, "config-first.bin", first);
+    push_visible_config_artifact(&store, job_uuid, "config-second.bin", second);
+
+    assert_eq!(
+        store
+            .accepted_artifacts(job_uuid)
+            .unwrap()
+            .replica_settings()
+            .unwrap_err()
+            .kind(),
+        SpoolErrorKind::ManifestCorrupt
+    );
+}
+
+#[test]
+fn accepted_reader_refuses_config_artifact_with_non_singleton_item_count() {
+    // The derived-settings writer always commits one {sourceName, settings}
+    // object with item_count == 1. A manifest whose count drifts from that
+    // singleton shape is corruption and must fail closed even though the
+    // record body still parses.
+    let (_tmp, store, job_uuid) = accepted_store_with_artifacts();
+    let record = br#"{"sourceName":"products_price_asc","settings":{"ranking":["desc(price)"]}}"#;
+    push_visible_config_artifact_with_item_count(&store, job_uuid, "config-drift.bin", record, 2);
+
+    assert_eq!(
+        store
+            .accepted_artifacts(job_uuid)
+            .unwrap()
+            .replica_settings()
+            .unwrap_err()
+            .kind(),
+        SpoolErrorKind::ManifestCorrupt
+    );
+}
+
+fn push_visible_config_artifact(
+    store: &SpoolStore,
+    job_uuid: Uuid,
+    final_path: &str,
+    bytes: &[u8],
+) {
+    push_visible_config_artifact_with_item_count(store, job_uuid, final_path, bytes, 1);
+}
+
+fn push_visible_config_artifact_with_item_count(
+    store: &SpoolStore,
+    job_uuid: Uuid,
+    final_path: &str,
+    bytes: &[u8],
+    item_count: u64,
+) {
+    mutate_manifest(store, job_uuid, |manifest| {
         manifest.artifacts.push(ArtifactManifest {
             kind: ArtifactKind::Config,
             state: ArtifactState::Visible,
-            temp_path: ".fj-spool-tmp-config-test.tmp".to_string(),
-            final_path: "config-test.bin".to_string(),
-            compressed_bytes: 2,
-            decompressed_bytes: 2,
-            item_count: 1,
-            digest: hex_digest(b"{}"),
+            temp_path: format!(".fj-spool-tmp-{final_path}.tmp"),
+            final_path: final_path.to_string(),
+            compressed_bytes: bytes.len() as u64,
+            decompressed_bytes: bytes.len() as u64,
+            item_count,
+            digest: hex_digest(bytes),
         });
     });
-    std::fs::write(store.job_dir(job_uuid).join("config-test.bin"), b"{}").unwrap();
-
-    assert_eq!(
-        reader_error_kind(&store, job_uuid),
-        SpoolErrorKind::UnsupportedArtifactKind
-    );
+    std::fs::write(store.job_dir(job_uuid).join(final_path), bytes).unwrap();
 }
 
 #[test]

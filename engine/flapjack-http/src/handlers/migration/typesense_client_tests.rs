@@ -5,8 +5,10 @@ use super::typesense_client::{
     require_read_access_with_transport, TraversalLimits, TypesenseClient, TypesenseClientError,
     TypesenseErrorKind, TypesenseMethod, TypesenseRequest, TypesenseResponse, TypesenseTransport,
     CONNECT_TIMEOUT, DOCUMENT_PAGE_LIMIT, MAX_DOCUMENT_ITEMS, MAX_DOCUMENT_PAGES,
-    MAX_RESPONSE_BYTES, REQUEST_TIMEOUT,
+    MAX_RESPONSE_BYTES, REQUEST_TIMEOUT, TYPESENSE_PREVIEW_LOOPBACK_ENV,
 };
+use super::typesense_source_reader::map_typesense_client_error;
+use super::AlgoliaErrorKind;
 use flapjack::security::test_helpers::install_test_outbound_host_resolver;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -14,6 +16,7 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +34,28 @@ fn assert_error_is_sanitized(error: &TypesenseClientError) {
             !serialized.contains(canary),
             "serialized error leaked credential canary"
         );
+    }
+}
+
+#[test]
+fn typesense_client_errors_use_the_canonical_source_boundary_mapping() {
+    for (source_kind, expected_kind) in [
+        (TypesenseErrorKind::Validation, AlgoliaErrorKind::Validation),
+        (TypesenseErrorKind::Transport, AlgoliaErrorKind::Transport),
+        (TypesenseErrorKind::Timeout, AlgoliaErrorKind::Timeout),
+        (TypesenseErrorKind::Redirect, AlgoliaErrorKind::Redirect),
+        (TypesenseErrorKind::Upstream, AlgoliaErrorKind::Upstream),
+        (TypesenseErrorKind::Schema, AlgoliaErrorKind::Schema),
+        (TypesenseErrorKind::Progress, AlgoliaErrorKind::Progress),
+        (TypesenseErrorKind::Limit, AlgoliaErrorKind::Limit),
+    ] {
+        let mapped = map_typesense_client_error(TypesenseClientError::new(
+            source_kind,
+            "Typesense mapping canary",
+        ));
+
+        assert_eq!(mapped.kind(), expected_kind);
+        assert_eq!(mapped.safe_message(), "Typesense mapping canary");
     }
 }
 
@@ -731,3 +756,221 @@ fn capture_responses() -> Vec<TypesenseResponse> {
 
 #[path = "typesense_client_capture_metadata_tests.rs"]
 mod capture_metadata_tests;
+
+// ── Source-discovery seam (Stage 2) ─────────────────────────────────────
+//
+// The broader vendor-host and DNS admission matrix is owned by
+// `engine/src/security_tests.rs`; these only pin the discovery-specific
+// behavior that the shared matrix cannot see.
+
+const KAT_LOOPBACK_ENDPOINT: &str = "http://127.0.0.1:17748";
+
+#[test]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+fn discovery_constructor_rejects_non_vendor_host_before_resolution() {
+    let resolution_attempts = Arc::new(AtomicUsize::new(0));
+    let observed_attempts = Arc::clone(&resolution_attempts);
+    let _resolver = install_test_outbound_host_resolver(Arc::new(move |_, _| {
+        observed_attempts.fetch_add(1, Ordering::SeqCst);
+        Some(vec!["8.8.8.8".parse::<IpAddr>().unwrap()])
+    }));
+
+    for endpoint in [
+        "https://evil.example.com",
+        "https://typesense.net.evil.example",
+        KAT_LOOPBACK_ENDPOINT,
+    ] {
+        let error = TypesenseClient::new_discovery(endpoint, API_KEY_CANARY).unwrap_err();
+
+        assert_eq!(error.kind(), TypesenseErrorKind::Validation);
+        assert_eq!(
+            error.safe_message(),
+            "Typesense Cloud endpoint is not allowed"
+        );
+        assert_error_is_sanitized(&error);
+    }
+
+    assert_eq!(
+        resolution_attempts.load(Ordering::SeqCst),
+        0,
+        "discovery admission must refuse a non-vendor host before any resolution"
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+fn discovery_loopback_constructor_requires_explicit_opt_in_before_resolution() {
+    let _env = crate::test_helpers::with_env_var(TYPESENSE_PREVIEW_LOOPBACK_ENV, "");
+    let _resolver = install_test_outbound_host_resolver(Arc::new(|host, _| {
+        panic!("disabled discovery loopback unexpectedly resolved {host}")
+    }));
+
+    let error =
+        TypesenseClient::new_discovery_preview_loopback(KAT_LOOPBACK_ENDPOINT, API_KEY_CANARY)
+            .unwrap_err();
+
+    assert_eq!(error.kind(), TypesenseErrorKind::Validation);
+    assert_eq!(
+        error.safe_message(),
+        "Typesense preview loopback endpoint is disabled"
+    );
+    assert_error_is_sanitized(&error);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+fn discovery_loopback_constructor_admits_only_literal_loopback_addresses() {
+    let _env = crate::test_helpers::with_env_var(TYPESENSE_PREVIEW_LOOPBACK_ENV, "1");
+    let _resolver = install_test_outbound_host_resolver(Arc::new(|host, _| {
+        panic!("loopback-only discovery unexpectedly resolved {host}")
+    }));
+
+    for refused in [
+        "http://localhost:17748",
+        "https://tenant.typesense.net",
+        "http://127.0.0.1:17748/collections",
+    ] {
+        let error =
+            TypesenseClient::new_discovery_preview_loopback(refused, API_KEY_CANARY).unwrap_err();
+        assert_eq!(error.kind(), TypesenseErrorKind::Validation);
+        assert_eq!(
+            error.safe_message(),
+            "Typesense Cloud endpoint is not allowed"
+        );
+    }
+
+    let client =
+        TypesenseClient::new_discovery_preview_loopback(KAT_LOOPBACK_ENDPOINT, API_KEY_CANARY)
+            .expect("a literal loopback IP must be admitted under the opt-in");
+    let request = client
+        .build_http_request(TypesenseRequest {
+            method: TypesenseMethod::Get,
+            path: "/collections?exclude_fields=fields".to_string(),
+            body: None,
+        })
+        .unwrap();
+    assert_eq!(
+        request.url().as_str(),
+        "http://127.0.0.1:17748/collections?exclude_fields=fields"
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+fn typesense_preview_loopback_constructor_rejects_empty_source_collection_before_endpoint_parsing()
+{
+    let _env = crate::test_helpers::with_env_var(TYPESENSE_PREVIEW_LOOPBACK_ENV, "1");
+    let _resolver = install_test_outbound_host_resolver(Arc::new(|host, _| {
+        panic!("empty-collection preview admission unexpectedly resolved {host}")
+    }));
+
+    let error = TypesenseClient::new_preview_loopback("not a URL", API_KEY_CANARY, "")
+        .expect_err("preview must require a nonempty source collection before parsing the node");
+
+    assert_eq!(error.kind(), TypesenseErrorKind::Validation);
+    assert_eq!(
+        error.safe_message(),
+        "Typesense credentials and source collection are required"
+    );
+    assert_error_is_sanitized(&error);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+fn typesense_preview_loopback_constructor_retains_requested_source_collection_without_io() {
+    let _env = crate::test_helpers::with_env_var(TYPESENSE_PREVIEW_LOOPBACK_ENV, "1");
+    let _resolver = install_test_outbound_host_resolver(Arc::new(|host, _| {
+        panic!("literal-loopback preview admission unexpectedly resolved {host}")
+    }));
+
+    let client =
+        TypesenseClient::new_preview_loopback(KAT_LOOPBACK_ENDPOINT, API_KEY_CANARY, SOURCE_CANARY)
+            .expect("opted-in literal loopback must be admitted for one source collection");
+
+    assert_eq!(client.source_collection_for_test(), Some(SOURCE_CANARY));
+}
+
+#[test]
+fn discovery_constructor_requires_credentials_without_requiring_a_collection() {
+    let error = TypesenseClient::new_discovery("https://typesense.net", "").unwrap_err();
+    assert_eq!(error.kind(), TypesenseErrorKind::Validation);
+    assert_eq!(error.safe_message(), "Typesense credentials are required");
+
+    // The export constructor keeps rejecting an empty source collection, so the
+    // split cannot silently admit a collection-less export client.
+    let export_error =
+        TypesenseClient::new("https://typesense.net", API_KEY_CANARY, "").unwrap_err();
+    assert_eq!(export_error.kind(), TypesenseErrorKind::Validation);
+    assert_eq!(
+        export_error.safe_message(),
+        "Typesense credentials and source collection are required"
+    );
+}
+
+#[tokio::test]
+async fn discovery_client_bypasses_proxy_pins_address_and_refuses_redirect() {
+    // Discovery must inherit every `from_vetted_target` transport rule:
+    // `resolve_to_addrs(...)` (reach the pinned address), `.no_proxy()` (never an
+    // ambient proxy), and `.redirect(Policy::none())` (refuse, never follow).
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("discovery upstream precondition must bind");
+    let redirect_target = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("redirect-target precondition must bind");
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("proxy-listener precondition must bind");
+    let upstream_address = upstream.local_addr().unwrap();
+    let redirect_location = format!(
+        "http://{}/collections",
+        redirect_target.local_addr().unwrap()
+    );
+    let proxy_address = proxy.local_addr().unwrap();
+    // The discovery origin is plain HTTP so the upstream can answer with a real
+    // status line, which makes `HTTP_PROXY` the proxy variable under test.
+    let _ambient_proxy =
+        crate::test_helpers::with_env_var("HTTP_PROXY", &format!("http://{proxy_address}"));
+
+    let responder = crate::test_helpers::serve_single_redirect(upstream, redirect_location);
+    let client = TypesenseClient::for_discovery_test(
+        "pinned-target.example",
+        "http://pinned-target.example".to_string(),
+        vec![upstream_address],
+        API_KEY_CANARY,
+    )
+    .unwrap();
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.list_collections(None, Some(10)),
+    )
+    .await
+    .expect("discovery request did not complete against the pinned address")
+    .expect_err("a 302 must be refused rather than followed");
+
+    assert_eq!(error.kind(), TypesenseErrorKind::Redirect);
+    assert_eq!(error.safe_message(), "Typesense redirect was refused");
+    assert_eq!(
+        responder.await.expect("redirect responder panicked"),
+        "GET /collections?exclude_fields=fields&limit=10 HTTP/1.1",
+        "discovery must reach the pinned address with the enumeration request line"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), redirect_target.accept())
+            .await
+            .is_err(),
+        "discovery followed the redirect instead of refusing it"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), proxy.accept())
+            .await
+            .is_err(),
+        "ambient proxy unexpectedly received the discovery request"
+    );
+    assert_error_is_sanitized(&error);
+}

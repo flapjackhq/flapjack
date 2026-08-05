@@ -611,8 +611,11 @@ start_server() {
       FLAPJACK_DATA_DIR="$DATA_DIR" \
       "$BIN_PATH" --auto-port >"$SERVER_LOG" 2>&1 &
   elif [ "$EXPECT_MODE" = "unavailable" ]; then
+    # Peers with no peer credential: startup requires
+    # FLAPJACK_REPLICATION_API_KEY unless this override is set.
     FLAPJACK_NODE_ID="migration-import-contract" \
-      FLAPJACK_PEERS="migration-peer=http://10.0.0.2:7700" \
+      FLAPJACK_PEERS="migration-peer=https://10.0.0.2:7700" \
+      FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS=1 \
       FLAPJACK_STARTUP_CATCHUP_STRICT=0 \
       FLAPJACK_STARTUP_CATCHUP_TIMEOUT_SECS=2 \
       FLAPJACK_ADMIN_KEY="$ADMIN_KEY" \

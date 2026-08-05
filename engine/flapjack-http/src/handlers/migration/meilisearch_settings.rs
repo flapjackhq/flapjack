@@ -3,11 +3,13 @@ use super::translation_report::{
 };
 use serde_json::{Map, Value};
 
-const UNMIGRATED_SETTINGS: [&str; 6] = [
+const UNMIGRATED_SETTINGS: [&str; 8] = [
     "dictionary",
     "facetSearch",
     "nonSeparatorTokens",
+    "prefixSearch",
     "proximityPrecision",
+    "searchCutoffMs",
     "sortableAttributes",
     "stopWords",
 ];
@@ -28,6 +30,16 @@ pub(super) fn normalize_meilisearch_settings(
     let source = raw.as_object().ok_or_else(|| settings_error("$"))?;
     reject_unknown_fields(source)?;
 
+    let mut warnings = vec![
+        warning(
+            ReportCode::MeilisearchDocumentOrderNotContractual,
+            "$.documents",
+        ),
+        warning(
+            ReportCode::MeilisearchSearchPaginationNotExportBound,
+            "$.pagination",
+        ),
+    ];
     let mut normalized = Map::new();
     copy_string_array(
         source,
@@ -47,7 +59,7 @@ pub(super) fn normalize_meilisearch_settings(
         "filterableAttributes",
         "attributesForFaceting",
     )?;
-    copy_ranking_rules(source, &mut normalized)?;
+    copy_ranking_rules(source, &mut normalized, &mut warnings)?;
     copy_pagination(source, &mut normalized)?;
     copy_faceting(source, &mut normalized)?;
     copy_typo_tolerance(source, &mut normalized)?;
@@ -61,16 +73,6 @@ pub(super) fn normalize_meilisearch_settings(
     validate_no_embedder(source)?;
     validate_known_noop_fields(source)?;
 
-    let mut warnings = vec![
-        warning(
-            ReportCode::MeilisearchDocumentOrderNotContractual,
-            "$.documents",
-        ),
-        warning(
-            ReportCode::MeilisearchSearchPaginationNotExportBound,
-            "$.pagination",
-        ),
-    ];
     warnings.extend(
         UNMIGRATED_SETTINGS
             .into_iter()
@@ -91,7 +93,7 @@ pub(super) fn normalize_meilisearch_settings(
 }
 
 fn reject_unknown_fields(source: &Map<String, Value>) -> Result<(), MeilisearchSettingsError> {
-    const KNOWN_FIELDS: [&str; 18] = [
+    const KNOWN_FIELDS: [&str; 20] = [
         "dictionary",
         "displayedAttributes",
         "distinctAttribute",
@@ -102,8 +104,10 @@ fn reject_unknown_fields(source: &Map<String, Value>) -> Result<(), MeilisearchS
         "localizedAttributes",
         "nonSeparatorTokens",
         "pagination",
+        "prefixSearch",
         "proximityPrecision",
         "rankingRules",
+        "searchCutoffMs",
         "searchableAttributes",
         "separatorTokens",
         "sortableAttributes",
@@ -136,29 +140,88 @@ fn copy_string_array(
     Ok(())
 }
 
+const MEILISEARCH_1_50_DEFAULT_RANKING_RULES: [&str; 7] = [
+    "words",
+    "typo",
+    "proximity",
+    "attributeRank",
+    "sort",
+    "wordPosition",
+    "exactness",
+];
+
 fn copy_ranking_rules(
     source: &Map<String, Value>,
     target: &mut Map<String, Value>,
+    warnings: &mut Vec<TranslationReportEntry>,
 ) -> Result<(), MeilisearchSettingsError> {
     let Some(value) = source.get("rankingRules") else {
         return Ok(());
     };
     let rules = string_array(value, "$.rankingRules")?;
-    let mapped = rules
-        .iter()
-        .enumerate()
-        .map(|(index, rule)| {
-            let rule = rule.as_str().expect("string_array returns strings");
-            let target_rule = match rule {
-                "words" | "typo" | "proximity" | "attribute" => rule,
-                "sort" => "custom",
-                "exactness" => "exact",
-                _ => return Err(settings_error(&format!("$.rankingRules[{index}]"))),
-            };
-            Ok(Value::String(target_rule.to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    validate_word_position_rule(&rules, warnings)?;
+    validate_single_attribute_criterion(&rules)?;
+    let mut mapped = Vec::with_capacity(rules.len());
+    for (index, rule) in rules.iter().enumerate() {
+        let rule = rule.as_str().expect("string_array returns strings");
+        let target_rule = match rule {
+            "words" | "typo" | "proximity" => rule,
+            "attribute" | "attributeRank" => "attribute",
+            "wordPosition" => continue,
+            "sort" => "custom",
+            "exactness" => "exact",
+            _ => return Err(settings_error(&format!("$.rankingRules[{index}]"))),
+        };
+        mapped.push(Value::String(target_rule.to_string()));
+    }
     target.insert("ranking".to_string(), Value::Array(mapped));
+    Ok(())
+}
+
+/// Meilisearch names one Algolia `attribute` criterion two ways: pre-1.50
+/// `attribute` and 1.50+ `attributeRank`. Both map to the same target rule, so a
+/// source list carrying both would emit `attribute` twice and Algolia rejects a
+/// duplicated ranking criterion. Fail closed at the second occurrence rather
+/// than silently dropping one source rule — which of the two the operator meant
+/// is not recoverable here. `wordPosition` is deliberately not part of this
+/// check: it is the vendor default's own second family member and is owned by
+/// [`validate_word_position_rule`].
+fn validate_single_attribute_criterion(rules: &[Value]) -> Result<(), MeilisearchSettingsError> {
+    let mut attribute_criterion_seen = false;
+    for (index, rule) in rules.iter().enumerate() {
+        if !matches!(rule.as_str(), Some("attribute" | "attributeRank")) {
+            continue;
+        }
+        if attribute_criterion_seen {
+            return Err(settings_error(&format!("$.rankingRules[{index}]")));
+        }
+        attribute_criterion_seen = true;
+    }
+    Ok(())
+}
+
+fn validate_word_position_rule(
+    rules: &[Value],
+    warnings: &mut Vec<TranslationReportEntry>,
+) -> Result<(), MeilisearchSettingsError> {
+    let Some(index) = rules
+        .iter()
+        .position(|rule| rule.as_str() == Some("wordPosition"))
+    else {
+        return Ok(());
+    };
+    let is_known_vendor_default = rules
+        .iter()
+        .map(|rule| rule.as_str().expect("string_array returns strings"))
+        .eq(MEILISEARCH_1_50_DEFAULT_RANKING_RULES);
+    if !is_known_vendor_default {
+        return Err(settings_error(&format!("$.rankingRules[{index}]")));
+    }
+
+    warnings.push(warning(
+        ReportCode::MeilisearchSettingNotMigrated,
+        &format!("$.rankingRules[{index}]"),
+    ));
     Ok(())
 }
 
@@ -296,6 +359,12 @@ fn copy_optional_string(
     let Some(value) = source.get(source_field) else {
         return Ok(());
     };
+    // Meilisearch >=1.50 reports unset optional scalars as an explicit `null`
+    // rather than omitting them — a fresh index returns `distinctAttribute: null`.
+    // Treat null as absent (no distinct attribute) instead of malformed.
+    if value.is_null() {
+        return Ok(());
+    }
     let value = value
         .as_str()
         .filter(|value| !value.is_empty())
@@ -372,6 +441,22 @@ fn validate_known_noop_fields(source: &Map<String, Value>) -> Result<(), Meilise
         value
             .as_bool()
             .ok_or_else(|| settings_error("$.facetSearch"))?;
+    }
+    // Live Meilisearch (>=1.12) always returns these search-runtime settings in
+    // the GET response. They have no proven Flapjack export equivalent, so they
+    // are surfaced as unmigrated warnings, but the payload still fails closed on
+    // any value outside the vendor's own enum/type so unknown-field rejection is
+    // not weakened by admitting them.
+    if let Some(value) = source.get("prefixSearch") {
+        match value.as_str() {
+            Some("indexingTime") | Some("disabled") => {}
+            _ => return Err(settings_error("$.prefixSearch")),
+        }
+    }
+    if let Some(value) = source.get("searchCutoffMs") {
+        if !value.is_null() && value.as_u64().is_none() {
+            return Err(settings_error("$.searchCutoffMs"));
+        }
     }
     if let Some(value) = source.get("synonyms") {
         value

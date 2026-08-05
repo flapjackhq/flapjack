@@ -19,7 +19,9 @@ use crate::handlers::migration::algolia_client::{
     AlgoliaClientError, AlgoliaErrorKind, AlgoliaIndexRecord,
 };
 use crate::handlers::migration::source_reader::{
-    MigrationSourceReader, PageConsumer, SourceFuture,
+    algolia_document_records, MigrationSourceReader, SourceConfigurationArtifact,
+    SourceConfigurationConsumer, SourceDocumentPageConsumer, SourceExportError,
+    SourceExportErrorKind, SourceFuture, SourceObservation,
 };
 use crate::handlers::migration::source_test_support::{
     sorted_exact_hits_by_object_id, ScriptedSourceReader,
@@ -29,6 +31,7 @@ use crate::handlers::migration::spool::{
     MigrationCancelRequest, MigrationDisposition, MigrationExportProgress, MigrationPhase,
     MigrationPhaseRecord, ResourceDenominators, SpoolErrorKind, SpoolLimits, SpoolStore,
 };
+use crate::handlers::migration::AsyncMigrationSourceProvider;
 use crate::handlers::rules::get_rule;
 use crate::handlers::synonyms::get_synonym;
 use crate::test_helpers::{body_json, EnvVarRestoreGuard, TestStateBuilder, ENV_MUTEX};
@@ -301,6 +304,7 @@ fn privacy_scrub_test_router(
         crate::router::RouterConfig {
             cors_mode: crate::startup::CorsMode::LoopbackOnly,
             disable_dashboard: false,
+            replication_api_key: None,
         },
     )
 }
@@ -1029,8 +1033,7 @@ fn hermetic_source_reader_with_settings_and_pages(
     reader.push_pass(settings.clone(), document_pages.clone(), vec![], vec![]);
     reader.push_pass(settings.clone(), document_pages, vec![], vec![]);
     reader.push_quiescent(source_record);
-    // Export fetches each replica's settings before acceptance, so queue one read
-    // in primary-list order for every replica carried into translation.
+    let mut replica_settings = Vec::new();
     if let Some(replicas) = settings.get("replicas").and_then(|value| value.as_array()) {
         let mut queued_names = HashSet::new();
         for entry in replicas {
@@ -1040,11 +1043,12 @@ fn hermetic_source_reader_with_settings_and_pages(
                 };
                 let name = parsed.name();
                 if queued_names.insert(name.to_string()) {
-                    reader.push_index_settings(name, Ok(json!({"primary": SOURCE_INDEX})));
+                    replica_settings.push((name.to_string(), json!({"primary": SOURCE_INDEX})));
                 }
             }
         }
     }
+    reader.push_index_settings_for_capture_passes(replica_settings);
     reader
 }
 
@@ -1239,69 +1243,68 @@ impl ResumedResumeSourceReader {
 }
 
 impl MigrationSourceReader for ResumedResumeSourceReader {
-    fn app_id(&self) -> &str {
-        SOURCE_APP_ID
+    fn source_provider(&self) -> AsyncMigrationSourceProvider {
+        AsyncMigrationSourceProvider::Algolia
+    }
+
+    fn source_namespace(&self) -> Option<&str> {
+        Some(SOURCE_APP_ID)
     }
 
     fn source_name(&self) -> &str {
         SOURCE_INDEX
     }
 
-    fn wait_for_quiescent_source(&mut self) -> SourceFuture<'_, AlgoliaIndexRecord> {
+    fn observe_quiescent_source(&mut self) -> SourceFuture<'_, SourceObservation> {
         Box::pin(async move {
             self.quiescence_checks += 1;
             if self.quiescence_checks == 2 {
+                // Enrol on the release gate before announcing arrival: the test releases
+                // with `notify_waiters()`, which stores no permit, so a waiter that only
+                // registers after the announcement loses the wakeup and the traversal
+                // never resumes. Same ordering as `BlockingSourceReader` below.
+                let released = self.release.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
                 self.started.notify_one();
-                self.release.notified().await;
+                released.await;
             }
-            self.source_records.pop_front().ok_or_else(|| {
-                AlgoliaClientError::new(
-                    AlgoliaErrorKind::Progress,
+            let record = self.source_records.pop_front().ok_or_else(|| {
+                SourceExportError::new(
+                    SourceExportErrorKind::Progress,
                     "resume source quiescent record already consumed",
                 )
-            })
+            })?;
+            Ok(algolia_test_observation(&record))
         })
     }
 
-    fn read_settings(&mut self) -> SourceFuture<'_, serde_json::Value> {
+    fn read_configuration<'a>(
+        &'a mut self,
+        consume: &'a mut SourceConfigurationConsumer<'a>,
+    ) -> SourceFuture<'a, ()> {
         Box::pin(async move {
-            self.settings_passes.pop_front().ok_or_else(|| {
-                AlgoliaClientError::new(
-                    AlgoliaErrorKind::Progress,
+            let settings = self.settings_passes.pop_front().ok_or_else(|| {
+                SourceExportError::new(
+                    SourceExportErrorKind::Progress,
                     "resume source settings already consumed",
                 )
-            })
+            })?;
+            consume(SourceConfigurationArtifact::settings(&settings))?;
+            consume(SourceConfigurationArtifact::rules(&[])?)?;
+            consume(SourceConfigurationArtifact::synonyms(&[])?)
         })
     }
 
-    fn read_index_settings<'a>(
+    fn read_document_records<'a>(
         &'a mut self,
-        _index_name: &'a str,
-    ) -> SourceFuture<'a, serde_json::Value> {
-        Box::pin(async {
-            Err(AlgoliaClientError::new(
-                AlgoliaErrorKind::Progress,
-                "resume source fixture should not read replica settings",
-            ))
-        })
-    }
-
-    fn require_unretrievable_access<'a>(
-        &'a mut self,
-        _settings: &'a serde_json::Value,
-    ) -> SourceFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn read_documents<'a>(
-        &'a mut self,
-        consume_page: &'a mut PageConsumer<'a>,
+        consume_page: &'a mut SourceDocumentPageConsumer<'a>,
     ) -> SourceFuture<'a, ()> {
         Box::pin(async move {
             self.document_traversals += 1;
             let pages = self.document_passes.pop_front().ok_or_else(|| {
-                AlgoliaClientError::new(
-                    AlgoliaErrorKind::Progress,
+                SourceExportError::new(
+                    SourceExportErrorKind::Progress,
                     "resume source document pages already consumed",
                 )
             })?;
@@ -1311,24 +1314,22 @@ impl MigrationSourceReader for ResumedResumeSourceReader {
                         .second_traversal_pages_served
                         .fetch_add(1, Ordering::SeqCst);
                 }
-                consume_page(page)?;
+                consume_page(algolia_document_records(&page)?)?;
             }
             Ok(())
         })
     }
+}
 
-    fn read_rules<'a>(
-        &'a mut self,
-        _consume_page: &'a mut PageConsumer<'a>,
-    ) -> SourceFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn read_synonyms<'a>(
-        &'a mut self,
-        _consume_page: &'a mut PageConsumer<'a>,
-    ) -> SourceFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
+/// Project a scripted Algolia index record onto the neutral observation the
+/// shared contract consumes.
+fn algolia_test_observation(record: &AlgoliaIndexRecord) -> SourceObservation {
+    SourceObservation {
+        source_name: record.name.clone(),
+        accepted_revision: record.updated_at.clone(),
+        identity_revision: record.updated_at.clone(),
+        document_count: record.entries,
+        quiescent: !record.pending_task,
     }
 }
 
@@ -4681,15 +4682,19 @@ impl BlockingSourceReader {
 }
 
 impl MigrationSourceReader for BlockingSourceReader {
-    fn app_id(&self) -> &str {
-        self.inner.app_id()
+    fn source_provider(&self) -> AsyncMigrationSourceProvider {
+        self.inner.source_provider()
+    }
+
+    fn source_namespace(&self) -> Option<&str> {
+        self.inner.source_namespace()
     }
 
     fn source_name(&self) -> &str {
         self.inner.source_name()
     }
 
-    fn wait_for_quiescent_source(&mut self) -> SourceFuture<'_, AlgoliaIndexRecord> {
+    fn observe_quiescent_source(&mut self) -> SourceFuture<'_, SourceObservation> {
         Box::pin(async move {
             if !self.blocked_once {
                 self.blocked_once = true;
@@ -4699,47 +4704,29 @@ impl MigrationSourceReader for BlockingSourceReader {
                 self.reached_source.notify_one();
                 released.await;
             }
-            self.inner.wait_for_quiescent_source().await
+            self.inner.observe_quiescent_source().await
         })
     }
 
-    fn read_settings(&mut self) -> SourceFuture<'_, serde_json::Value> {
-        self.inner.read_settings()
-    }
-
-    fn read_index_settings<'a>(
+    fn read_configuration<'a>(
         &'a mut self,
-        index_name: &'a str,
-    ) -> SourceFuture<'a, serde_json::Value> {
-        self.inner.read_index_settings(index_name)
-    }
-
-    fn require_unretrievable_access<'a>(
-        &'a mut self,
-        settings: &'a serde_json::Value,
+        consume: &'a mut SourceConfigurationConsumer<'a>,
     ) -> SourceFuture<'a, ()> {
-        self.inner.require_unretrievable_access(settings)
+        self.inner.read_configuration(consume)
     }
 
-    fn read_documents<'a>(
+    fn read_derived_configuration<'a>(
         &'a mut self,
-        consume_page: &'a mut PageConsumer<'a>,
+        consume: &'a mut SourceConfigurationConsumer<'a>,
     ) -> SourceFuture<'a, ()> {
-        self.inner.read_documents(consume_page)
+        self.inner.read_derived_configuration(consume)
     }
 
-    fn read_rules<'a>(
+    fn read_document_records<'a>(
         &'a mut self,
-        consume_page: &'a mut PageConsumer<'a>,
+        consume_page: &'a mut SourceDocumentPageConsumer<'a>,
     ) -> SourceFuture<'a, ()> {
-        self.inner.read_rules(consume_page)
-    }
-
-    fn read_synonyms<'a>(
-        &'a mut self,
-        consume_page: &'a mut PageConsumer<'a>,
-    ) -> SourceFuture<'a, ()> {
-        self.inner.read_synonyms(consume_page)
+        self.inner.read_document_records(consume_page)
     }
 }
 
@@ -4754,56 +4741,35 @@ impl SourceErrorReader {
 }
 
 impl MigrationSourceReader for SourceErrorReader {
-    fn app_id(&self) -> &str {
-        SOURCE_APP_ID
+    fn source_provider(&self) -> AsyncMigrationSourceProvider {
+        AsyncMigrationSourceProvider::Algolia
+    }
+
+    fn source_namespace(&self) -> Option<&str> {
+        Some(SOURCE_APP_ID)
     }
 
     fn source_name(&self) -> &str {
         SOURCE_INDEX
     }
 
-    fn wait_for_quiescent_source(&mut self) -> SourceFuture<'_, AlgoliaIndexRecord> {
+    fn observe_quiescent_source(&mut self) -> SourceFuture<'_, SourceObservation> {
         let error = self.error.take().unwrap_or_else(|| {
             AlgoliaClientError::new(AlgoliaErrorKind::Progress, "unexpected second source wait")
         });
-        Box::pin(async move { Err(error) })
+        Box::pin(async move { Err(error.into()) })
     }
 
-    fn read_settings(&mut self) -> SourceFuture<'_, serde_json::Value> {
-        unreachable_source_step()
-    }
-
-    fn read_index_settings<'a>(
+    fn read_configuration<'a>(
         &'a mut self,
-        _index_name: &'a str,
-    ) -> SourceFuture<'a, serde_json::Value> {
-        unreachable_source_step()
-    }
-
-    fn require_unretrievable_access<'a>(
-        &'a mut self,
-        _settings: &'a serde_json::Value,
+        _consume: &'a mut SourceConfigurationConsumer<'a>,
     ) -> SourceFuture<'a, ()> {
         unreachable_source_step()
     }
 
-    fn read_documents<'a>(
+    fn read_document_records<'a>(
         &'a mut self,
-        _consume_page: &'a mut PageConsumer<'a>,
-    ) -> SourceFuture<'a, ()> {
-        unreachable_source_step()
-    }
-
-    fn read_rules<'a>(
-        &'a mut self,
-        _consume_page: &'a mut PageConsumer<'a>,
-    ) -> SourceFuture<'a, ()> {
-        unreachable_source_step()
-    }
-
-    fn read_synonyms<'a>(
-        &'a mut self,
-        _consume_page: &'a mut PageConsumer<'a>,
+        _consume_page: &'a mut SourceDocumentPageConsumer<'a>,
     ) -> SourceFuture<'a, ()> {
         unreachable_source_step()
     }
@@ -4818,53 +4784,32 @@ impl PanickingSourceReader {
 }
 
 impl MigrationSourceReader for PanickingSourceReader {
-    fn app_id(&self) -> &str {
-        SOURCE_APP_ID
+    fn source_provider(&self) -> AsyncMigrationSourceProvider {
+        AsyncMigrationSourceProvider::Algolia
+    }
+
+    fn source_namespace(&self) -> Option<&str> {
+        Some(SOURCE_APP_ID)
     }
 
     fn source_name(&self) -> &str {
         SOURCE_INDEX
     }
 
-    fn wait_for_quiescent_source(&mut self) -> SourceFuture<'_, AlgoliaIndexRecord> {
+    fn observe_quiescent_source(&mut self) -> SourceFuture<'_, SourceObservation> {
         Box::pin(async { panic!("deterministic async source panic") })
     }
 
-    fn read_settings(&mut self) -> SourceFuture<'_, serde_json::Value> {
-        unreachable_source_step()
-    }
-
-    fn read_index_settings<'a>(
+    fn read_configuration<'a>(
         &'a mut self,
-        _index_name: &'a str,
-    ) -> SourceFuture<'a, serde_json::Value> {
-        unreachable_source_step()
-    }
-
-    fn require_unretrievable_access<'a>(
-        &'a mut self,
-        _settings: &'a serde_json::Value,
+        _consume: &'a mut SourceConfigurationConsumer<'a>,
     ) -> SourceFuture<'a, ()> {
         unreachable_source_step()
     }
 
-    fn read_documents<'a>(
+    fn read_document_records<'a>(
         &'a mut self,
-        _consume_page: &'a mut PageConsumer<'a>,
-    ) -> SourceFuture<'a, ()> {
-        unreachable_source_step()
-    }
-
-    fn read_rules<'a>(
-        &'a mut self,
-        _consume_page: &'a mut PageConsumer<'a>,
-    ) -> SourceFuture<'a, ()> {
-        unreachable_source_step()
-    }
-
-    fn read_synonyms<'a>(
-        &'a mut self,
-        _consume_page: &'a mut PageConsumer<'a>,
+        _consume_page: &'a mut SourceDocumentPageConsumer<'a>,
     ) -> SourceFuture<'a, ()> {
         unreachable_source_step()
     }
@@ -4875,8 +4820,8 @@ where
     T: Send + 'static,
 {
     Box::pin(async {
-        Err(AlgoliaClientError::new(
-            AlgoliaErrorKind::Progress,
+        Err(SourceExportError::new(
+            SourceExportErrorKind::Progress,
             "unreachable source reader step",
         ))
     })

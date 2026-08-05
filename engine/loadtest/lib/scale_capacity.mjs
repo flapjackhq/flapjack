@@ -5,7 +5,8 @@ import path from "node:path";
 
 const POSITIVE_INTEGER_FIELDS = Object.freeze([
   "targetCount",
-  "diskFreeBytes",
+  "dataDiskFreeBytes",
+  "datasetDiskFreeBytes",
   "memoryCapacityBytes",
   "sourceBytesPerRecord",
   "indexBytesPerRecord",
@@ -18,13 +19,16 @@ function isPositiveSafeInteger(value) {
   return Number.isSafeInteger(value) && value > 0;
 }
 
-export function evaluateScaleCapacity(input) {
+function invalidInputFields(input) {
   const invalidFields = [];
   if (input?.profile !== "compact" && input?.profile !== "standard") {
     invalidFields.push("profile");
   }
   if (!Number.isSafeInteger(input?.startingCount) || input.startingCount < 0) {
     invalidFields.push("startingCount");
+  }
+  if (typeof input?.diskFilesystemsShared !== "boolean") {
+    invalidFields.push("diskFilesystemsShared");
   }
   for (const fieldName of POSITIVE_INTEGER_FIELDS) {
     if (!isPositiveSafeInteger(input?.[fieldName])) {
@@ -38,49 +42,69 @@ export function evaluateScaleCapacity(input) {
   ) {
     invalidFields.push("targetCount");
   }
+  return [...new Set(invalidFields)];
+}
 
-  if (invalidFields.length > 0) {
-    return {
-      verdict: "INVALID",
-      reasons: [...new Set(invalidFields)],
-    };
-  }
-
+function calculateCapacityRequirements(input) {
   const trancheCount = input.targetCount - input.startingCount;
   const sourceBytes = trancheCount * input.sourceBytesPerRecord;
   const steadyIndexBytes = input.targetCount * input.indexBytesPerRecord;
   const mergeAllowanceBytes = steadyIndexBytes * 2;
-  const requiredDiskBytes =
-    sourceBytes +
-    steadyIndexBytes +
-    mergeAllowanceBytes +
-    input.diskReserveBytes;
+  const sharedRequiredDiskBytes =
+    sourceBytes + steadyIndexBytes + mergeAllowanceBytes + input.diskReserveBytes;
+  const requiredDataDiskBytes = input.diskFilesystemsShared
+    ? sharedRequiredDiskBytes
+    : steadyIndexBytes + mergeAllowanceBytes + input.diskReserveBytes;
+  const requiredDatasetDiskBytes = input.diskFilesystemsShared
+    ? sharedRequiredDiskBytes
+    : sourceBytes + input.diskReserveBytes;
+  const requiredDiskBytes = input.diskFilesystemsShared
+    ? sharedRequiredDiskBytes
+    : requiredDataDiskBytes + requiredDatasetDiskBytes;
   const requiredMemoryBytes =
     input.targetCount * input.rssBytesPerRecord +
     input.memoryReserveBytes;
+  return {
+    trancheCount,
+    sourceBytes,
+    steadyIndexBytes,
+    mergeAllowanceBytes,
+    requiredDataDiskBytes,
+    requiredDatasetDiskBytes,
+    requiredDiskBytes,
+    requiredMemoryBytes,
+  };
+}
 
-  if (
-    ![
-      sourceBytes,
-      steadyIndexBytes,
-      mergeAllowanceBytes,
-      requiredDiskBytes,
-      requiredMemoryBytes,
-    ].every(Number.isSafeInteger)
-  ) {
-    return {
-      verdict: "INVALID",
-      reasons: ["arithmeticOverflow"],
-    };
+function capacityVerdict(input, requirements) {
+  const diskReasons = [];
+  if (requirements.requiredDataDiskBytes > input.dataDiskFreeBytes) {
+    diskReasons.push("data");
   }
-
+  if (requirements.requiredDatasetDiskBytes > input.datasetDiskFreeBytes) {
+    diskReasons.push("dataset");
+  }
   const reasons = [];
-  if (requiredDiskBytes > input.diskFreeBytes) {
+  if (diskReasons.length > 0) {
     reasons.push("disk");
   }
-  if (requiredMemoryBytes > input.memoryCapacityBytes) {
+  if (requirements.requiredMemoryBytes > input.memoryCapacityBytes) {
     reasons.push("memory");
   }
+  return { diskReasons, reasons };
+}
+
+export function evaluateScaleCapacity(input) {
+  const invalidFields = invalidInputFields(input);
+  if (invalidFields.length > 0) {
+    return { verdict: "INVALID", reasons: invalidFields };
+  }
+
+  const requirements = calculateCapacityRequirements(input);
+  if (!Object.values(requirements).every(Number.isSafeInteger)) {
+    return { verdict: "INVALID", reasons: ["arithmeticOverflow"] };
+  }
+  const { diskReasons, reasons } = capacityVerdict(input, requirements);
 
   return {
     verdict: reasons.length === 0 ? "GO" : "NO_GO",
@@ -88,19 +112,24 @@ export function evaluateScaleCapacity(input) {
     profile: input.profile,
     startingCount: input.startingCount,
     targetCount: input.targetCount,
-    trancheCount,
-    diskFreeBytes: input.diskFreeBytes,
+    trancheCount: requirements.trancheCount,
+    dataDiskFreeBytes: input.dataDiskFreeBytes,
+    datasetDiskFreeBytes: input.datasetDiskFreeBytes,
+    diskFilesystemsShared: input.diskFilesystemsShared,
     memoryCapacityBytes: input.memoryCapacityBytes,
     sourceBytesPerRecord: input.sourceBytesPerRecord,
     indexBytesPerRecord: input.indexBytesPerRecord,
     rssBytesPerRecord: input.rssBytesPerRecord,
     diskReserveBytes: input.diskReserveBytes,
     memoryReserveBytes: input.memoryReserveBytes,
-    sourceBytes,
-    steadyIndexBytes,
-    mergeAllowanceBytes,
-    requiredDiskBytes,
-    requiredMemoryBytes,
+    sourceBytes: requirements.sourceBytes,
+    steadyIndexBytes: requirements.steadyIndexBytes,
+    mergeAllowanceBytes: requirements.mergeAllowanceBytes,
+    requiredDataDiskBytes: requirements.requiredDataDiskBytes,
+    requiredDatasetDiskBytes: requirements.requiredDatasetDiskBytes,
+    requiredDiskBytes: requirements.requiredDiskBytes,
+    requiredMemoryBytes: requirements.requiredMemoryBytes,
+    diskReasons,
   };
 }
 

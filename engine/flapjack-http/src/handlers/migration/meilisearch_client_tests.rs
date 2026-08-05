@@ -11,16 +11,24 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 const RAW_ENDPOINT_CANARY: &str = "https://tenant-secret.meilisearch.example";
 const API_KEY_CANARY: &str = "meili-secret-api-key";
+const KAT_LOOPBACK_ENDPOINT: &str = "http://127.0.0.1:17747";
+#[cfg(debug_assertions)]
+const PREVIEW_LOOPBACK_ENV: &str = "FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK";
 
 fn assert_error_is_sanitized(error: &MeilisearchClientError) {
+    assert_error_excludes(error, &[RAW_ENDPOINT_CANARY, API_KEY_CANARY]);
+}
+
+fn assert_error_excludes(error: &MeilisearchClientError, canaries: &[&str]) {
     let debug = format!("{error:?}");
     let serialized = serde_json::to_string(error).unwrap();
-    for canary in [RAW_ENDPOINT_CANARY, API_KEY_CANARY] {
+    for canary in canaries {
         assert!(!debug.contains(canary), "Debug leaked credential canary");
         assert!(!error.safe_message().contains(canary));
         assert!(
@@ -66,7 +74,6 @@ fn production_constructor_rejects_sibling_suffix_authority_confusion() {
         "https://meilisearch.io.evil.test",
         "https://meilisearch.com",
         "https://tenant.meilisearch.com",
-        "https://127.0.0.1",
         "http://localhost:7700",
     ] {
         let error = MeilisearchClient::new(endpoint, API_KEY_CANARY, "products").unwrap_err();
@@ -77,6 +84,94 @@ fn production_constructor_rejects_sibling_suffix_authority_confusion() {
         );
         assert_error_is_sanitized(&error);
     }
+}
+
+#[test]
+fn production_constructor_rejects_the_kat_literal_loopback_endpoint() {
+    let error =
+        MeilisearchClient::new(KAT_LOOPBACK_ENDPOINT, API_KEY_CANARY, "products").unwrap_err();
+
+    assert_eq!(error.kind(), MeilisearchErrorKind::Validation);
+    assert_eq!(
+        error.safe_message(),
+        "Meilisearch Cloud endpoint is not allowed"
+    );
+    assert_error_excludes(&error, &[KAT_LOOPBACK_ENDPOINT, API_KEY_CANARY]);
+}
+
+#[test]
+fn constructor_rejects_traversal_shaped_source_index_before_building_requests() {
+    for source_index in ["../products", "products/archive", "..", "products\\archive"] {
+        let error = MeilisearchClient::new("https://meilisearch.io", API_KEY_CANARY, source_index)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), MeilisearchErrorKind::Validation);
+        assert_eq!(error.safe_message(), "Meilisearch source index is invalid");
+        assert_error_excludes(&error, &[API_KEY_CANARY, source_index]);
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+fn preview_loopback_constructor_requires_explicit_opt_in_before_resolution() {
+    let _env = crate::test_helpers::with_env_var(PREVIEW_LOOPBACK_ENV, "");
+    let _resolver = install_test_outbound_host_resolver(Arc::new(|host, _| {
+        panic!("disabled loopback preview unexpectedly resolved {host}")
+    }));
+    let disabled_endpoint = "https://disabled-preview.example";
+    let error =
+        MeilisearchClient::new_preview_loopback(disabled_endpoint, API_KEY_CANARY, "products")
+            .unwrap_err();
+
+    assert_eq!(error.kind(), MeilisearchErrorKind::Validation);
+    assert_eq!(
+        error.safe_message(),
+        "Meilisearch preview loopback endpoint is disabled"
+    );
+    assert_error_excludes(&error, &[disabled_endpoint, API_KEY_CANARY]);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+fn preview_loopback_constructor_rejects_hostnames_before_resolution() {
+    let _env = crate::test_helpers::with_env_var(PREVIEW_LOOPBACK_ENV, "1");
+    let _resolver = install_test_outbound_host_resolver(Arc::new(|host, _| {
+        panic!("loopback-only preview unexpectedly resolved {host}")
+    }));
+    let hostname_endpoint = "https://preview-rebind.meilisearch.io";
+    let error =
+        MeilisearchClient::new_preview_loopback(hostname_endpoint, API_KEY_CANARY, "products")
+            .unwrap_err();
+
+    assert_eq!(error.kind(), MeilisearchErrorKind::Validation);
+    assert_eq!(
+        error.safe_message(),
+        "Meilisearch Cloud endpoint is not allowed"
+    );
+    assert_error_excludes(&error, &[hostname_endpoint, API_KEY_CANARY]);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn preview_loopback_constructor_preserves_the_vetted_endpoint_origin() {
+    let _env = crate::test_helpers::with_env_var(PREVIEW_LOOPBACK_ENV, "1");
+    let client =
+        MeilisearchClient::new_preview_loopback(KAT_LOOPBACK_ENDPOINT, API_KEY_CANARY, "products")
+            .unwrap();
+    let request = client
+        .build_http_request(MeilisearchRequest {
+            method: MeilisearchMethod::Get,
+            path: "/indexes/products/settings".to_string(),
+            body: None,
+        })
+        .unwrap();
+
+    assert_eq!(
+        request.url().as_str(),
+        "http://127.0.0.1:17747/indexes/products/settings"
+    );
 }
 
 #[test]
@@ -540,4 +635,138 @@ async fn source_capture_rejects_missing_primary_key_nonterminal_tasks_and_source
         );
         assert_error_is_sanitized(&error);
     }
+}
+
+// ── Source-discovery seam (Stage 2) ─────────────────────────────────────
+//
+// The broader vendor-host and DNS admission matrix is owned by
+// `engine/src/security_tests.rs`; these only pin the discovery-specific
+// behavior that the shared matrix cannot see.
+
+#[test]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+fn discovery_constructor_rejects_non_vendor_host_before_resolution() {
+    let resolution_attempts = Arc::new(AtomicUsize::new(0));
+    let observed_attempts = Arc::clone(&resolution_attempts);
+    let _resolver = install_test_outbound_host_resolver(Arc::new(move |_, _| {
+        observed_attempts.fetch_add(1, Ordering::SeqCst);
+        Some(vec!["8.8.8.8".parse::<IpAddr>().unwrap()])
+    }));
+
+    for endpoint in [
+        "https://evil.example.com",
+        "https://meilisearch.io.evil.example",
+        KAT_LOOPBACK_ENDPOINT,
+    ] {
+        let error = MeilisearchClient::new_discovery(endpoint, API_KEY_CANARY).unwrap_err();
+
+        assert_eq!(error.kind(), MeilisearchErrorKind::Validation);
+        assert_eq!(
+            error.safe_message(),
+            "Meilisearch Cloud endpoint is not allowed"
+        );
+        assert_error_excludes(&error, &[endpoint, API_KEY_CANARY]);
+    }
+
+    assert_eq!(
+        resolution_attempts.load(Ordering::SeqCst),
+        0,
+        "discovery admission must refuse a non-vendor host before any resolution"
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+fn discovery_loopback_constructor_requires_explicit_opt_in_before_resolution() {
+    let _env = crate::test_helpers::with_env_var(PREVIEW_LOOPBACK_ENV, "");
+    let _resolver = install_test_outbound_host_resolver(Arc::new(|host, _| {
+        panic!("disabled discovery loopback unexpectedly resolved {host}")
+    }));
+
+    let error =
+        MeilisearchClient::new_discovery_preview_loopback(KAT_LOOPBACK_ENDPOINT, API_KEY_CANARY)
+            .unwrap_err();
+
+    assert_eq!(error.kind(), MeilisearchErrorKind::Validation);
+    assert_eq!(
+        error.safe_message(),
+        "Meilisearch preview loopback endpoint is disabled"
+    );
+    assert_error_excludes(&error, &[KAT_LOOPBACK_ENDPOINT, API_KEY_CANARY]);
+}
+
+#[test]
+fn discovery_constructor_requires_credentials_without_requiring_a_source_index() {
+    let error = MeilisearchClient::new_discovery("https://meilisearch.io", "").unwrap_err();
+    assert_eq!(error.kind(), MeilisearchErrorKind::Validation);
+    assert_eq!(error.safe_message(), "Meilisearch credentials are required");
+
+    // The export constructors keep rejecting an empty source index, so the split
+    // cannot silently admit an index-less export client.
+    let export_error =
+        MeilisearchClient::new("https://meilisearch.io", API_KEY_CANARY, "").unwrap_err();
+    assert_eq!(export_error.kind(), MeilisearchErrorKind::Validation);
+    assert_eq!(
+        export_error.safe_message(),
+        "Meilisearch credentials and source index are required"
+    );
+}
+
+#[tokio::test]
+async fn discovery_client_bypasses_proxy_pins_address_and_refuses_redirect() {
+    // Discovery must inherit every `from_vetted_target` transport rule:
+    // `resolve_to_addrs(...)` (reach the pinned address), `.no_proxy()` (never an
+    // ambient proxy), and `.redirect(Policy::none())` (refuse, never follow).
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("discovery upstream precondition must bind");
+    let redirect_target = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("redirect-target precondition must bind");
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("proxy-listener precondition must bind");
+    let upstream_address = upstream.local_addr().unwrap();
+    let redirect_location = format!("http://{}/indexes", redirect_target.local_addr().unwrap());
+    let proxy_address = proxy.local_addr().unwrap();
+    // The discovery origin is plain HTTP so the upstream can answer with a real
+    // status line, which makes `HTTP_PROXY` the proxy variable under test.
+    let _ambient_proxy =
+        crate::test_helpers::with_env_var("HTTP_PROXY", &format!("http://{proxy_address}"));
+
+    let responder = crate::test_helpers::serve_single_redirect(upstream, redirect_location);
+    let client = MeilisearchClient::for_discovery_test(
+        "pinned-target.example",
+        "http://pinned-target.example".to_string(),
+        vec![upstream_address],
+        API_KEY_CANARY,
+    )
+    .unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(5), client.list_indexes(None, Some(10)))
+        .await
+        .expect("discovery request did not complete against the pinned address")
+        .expect_err("a 302 must be refused rather than followed");
+
+    assert_eq!(error.kind(), MeilisearchErrorKind::Redirect);
+    assert_eq!(error.safe_message(), "Meilisearch redirect was refused");
+    assert_eq!(
+        responder.await.expect("redirect responder panicked"),
+        "GET /indexes?limit=10 HTTP/1.1",
+        "discovery must reach the pinned address with the enumeration request line"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), redirect_target.accept())
+            .await
+            .is_err(),
+        "discovery followed the redirect instead of refusing it"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), proxy.accept())
+            .await
+            .is_err(),
+        "ambient proxy unexpectedly received the discovery request"
+    );
+    assert_error_is_sanitized(&error);
 }

@@ -5,110 +5,11 @@
 
 use super::config::AnalyticsConfig;
 use super::schema::{InsightEvent, SearchEvent};
+use std::collections::BTreeMap;
 
-/// Default search queries for when we don't know the index content.
-const DEFAULT_QUERIES: &[(&str, u32, bool)] = &[
-    // (query, approx_hits, has_results)
-    ("", 500, true), // Browse / empty query
-    ("shoes", 42, true),
-    ("blue dress", 18, true),
-    ("laptop", 35, true),
-    ("wireless headphones", 12, true),
-    ("running shoes", 28, true),
-    ("iphone case", 15, true),
-    ("organic coffee", 8, true),
-    ("winter jacket", 22, true),
-    ("smart watch", 19, true),
-    ("bluetooth speaker", 14, true),
-    ("yoga mat", 7, true),
-    ("backpack", 25, true),
-    ("sunglasses", 31, true),
-    ("water bottle", 11, true),
-    ("desk lamp", 9, true),
-    ("keyboard", 16, true),
-    ("monitor", 20, true),
-    ("camera", 13, true),
-    ("headset", 17, true),
-    ("tablet", 23, true),
-    ("charger", 10, true),
-    ("mouse pad", 6, true),
-    ("office chair", 4, true),
-    ("standing desk", 3, true),
-    ("batman", 5, true),
-    // Queries that return no results
-    ("free download", 0, false),
-    ("asdfghjkl", 0, false),
-    ("buy cheap online free", 0, false),
-    ("lorem ipsum", 0, false),
-    ("test123", 0, false),
-    ("xxxxxxx", 0, false),
-];
-
-/// Movies-themed queries for movie demo databases.
-const MOVIE_QUERIES: &[(&str, u32, bool)] = &[
-    ("", 1000, true),
-    ("batman", 15, true),
-    ("comedy", 180, true),
-    ("sci fi", 120, true),
-    ("tom hanks", 22, true),
-    ("action", 250, true),
-    ("romance", 95, true),
-    ("thriller", 110, true),
-    ("horror", 80, true),
-    ("marvel", 28, true),
-    ("animation", 65, true),
-    ("documentary", 45, true),
-    ("star wars", 12, true),
-    ("james bond", 18, true),
-    ("christopher nolan", 10, true),
-    ("drama", 300, true),
-    ("adventure", 140, true),
-    ("crime", 75, true),
-    ("musical", 30, true),
-    ("western", 20, true),
-    ("tarantino", 8, true),
-    ("spielberg", 14, true),
-    ("pixar", 16, true),
-    ("oscar", 35, true),
-    ("2024", 40, true),
-    ("new release", 0, false),
-    ("stream free", 0, false),
-    ("torrent", 0, false),
-    ("subtitles", 0, false),
-];
-
-/// Product-themed queries for e-commerce demo databases.
-const PRODUCT_QUERIES: &[(&str, u32, bool)] = &[
-    ("", 800, true),
-    ("samsung", 45, true),
-    ("apple", 38, true),
-    ("laptop", 62, true),
-    ("phone", 55, true),
-    ("headphones", 30, true),
-    ("tv", 42, true),
-    ("camera", 25, true),
-    ("wireless", 48, true),
-    ("bluetooth", 35, true),
-    ("gaming", 28, true),
-    ("keyboard", 20, true),
-    ("monitor", 32, true),
-    ("speaker", 18, true),
-    ("tablet", 22, true),
-    ("earbuds", 15, true),
-    ("charger", 12, true),
-    ("mouse", 17, true),
-    ("printer", 10, true),
-    ("router", 8, true),
-    ("usb", 14, true),
-    ("hdmi", 6, true),
-    ("webcam", 9, true),
-    ("microphone", 11, true),
-    ("ssd", 7, true),
-    ("free shipping", 0, false),
-    ("coupon code", 0, false),
-    ("refurbished xyz123", 0, false),
-    ("wholesale bulk", 0, false),
-];
+#[path = "seed_queries.rs"]
+mod seed_queries;
+use seed_queries::{DEFAULT_QUERIES, MOVIE_QUERIES, PRODUCT_QUERIES};
 
 /// Realistic country distribution with IP ranges and optional region (state).
 /// Format: (country, ip_prefix, weight, region)
@@ -192,7 +93,7 @@ impl Rng {
 
     /// Returns a value in [0.0, 1.0).
     fn next_f64(&mut self) -> f64 {
-        (self.next_u32() as f64) / (u32::MAX as f64)
+        (self.next_u32() as f64) / ((u32::MAX as f64) + 1.0)
     }
 
     /// Returns a value in [lo, hi].
@@ -261,9 +162,420 @@ fn generate_object_ids(rng: &mut Rng, count: usize) -> Vec<String> {
 /// Result of seeding analytics data.
 pub struct SeedResult {
     pub days: u32,
+    pub seeded_dates: Vec<String>,
     pub total_searches: usize,
     pub total_clicks: usize,
     pub total_conversions: usize,
+}
+
+/// Optional controls for deterministic analytics fixtures.
+#[derive(Debug, Clone)]
+pub struct AnalyticsSeedOptions {
+    pub days: u32,
+    pub search_count: Option<u32>,
+    pub no_result_rate: Option<f64>,
+    pub device_distribution: Option<BTreeMap<String, f64>>,
+    pub country_distribution: Option<BTreeMap<String, f64>>,
+}
+
+impl AnalyticsSeedOptions {
+    pub fn for_days(days: u32) -> Self {
+        Self {
+            days,
+            search_count: None,
+            no_result_rate: None,
+            device_distribution: None,
+            country_distribution: None,
+        }
+    }
+}
+
+struct WeightedIndices {
+    indices: Vec<usize>,
+    weights: Vec<f64>,
+}
+
+impl WeightedIndices {
+    fn new(indices: Vec<usize>, base_weights: &[f64]) -> Self {
+        let sum: f64 = indices.iter().map(|index| base_weights[*index]).sum();
+        let weights = indices
+            .iter()
+            .map(|index| base_weights[*index] / sum)
+            .collect();
+        Self { indices, weights }
+    }
+
+    fn pick(&self, rng: &mut Rng) -> usize {
+        self.indices[rng.weighted_pick(&self.weights)]
+    }
+}
+
+struct QueryPools {
+    all: WeightedIndices,
+    with_results: WeightedIndices,
+    without_results: WeightedIndices,
+}
+
+impl QueryPools {
+    fn new(queries: &[(&str, u32, bool)]) -> Self {
+        let base_weights: Vec<f64> = queries
+            .iter()
+            .enumerate()
+            .map(|(index, _)| 1.0 / ((index as f64) + 1.0).powf(0.8))
+            .collect();
+        let matching = |has_results| {
+            queries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, query)| (query.2 == has_results).then_some(index))
+                .collect()
+        };
+        Self {
+            all: WeightedIndices::new((0..queries.len()).collect(), &base_weights),
+            with_results: WeightedIndices::new(matching(true), &base_weights),
+            without_results: WeightedIndices::new(matching(false), &base_weights),
+        }
+    }
+
+    fn pick(&self, rng: &mut Rng, must_have_results: Option<bool>) -> usize {
+        match must_have_results {
+            Some(true) => self.with_results.pick(rng),
+            Some(false) => self.without_results.pick(rng),
+            None => self.all.pick(rng),
+        }
+    }
+}
+
+struct DeviceChoice {
+    tag: String,
+    weight: f64,
+}
+
+struct GeoChoice {
+    country: String,
+    ip_prefix: String,
+    region: Option<String>,
+    weight: f64,
+}
+
+struct SeedRuntime<'a> {
+    index_name: &'a str,
+    queries: &'static [(&'static str, u32, bool)],
+    query_pools: QueryPools,
+    users: Vec<String>,
+    object_ids: Vec<String>,
+    devices: Vec<DeviceChoice>,
+    device_weights: Vec<f64>,
+    geography: Vec<GeoChoice>,
+    geo_weights: Vec<f64>,
+    total_searches: u32,
+    target_no_results: Option<u32>,
+}
+
+struct DayEvents {
+    searches: Vec<SearchEvent>,
+    insights: Vec<InsightEvent>,
+}
+
+/// Validate caller-controlled seed options before any filesystem mutation.
+pub fn validate_seed_options(options: &AnalyticsSeedOptions) -> Result<(), String> {
+    if options.days == 0 || options.days > 90 {
+        return Err("days must be between 1 and 90".to_string());
+    }
+    if matches!(options.search_count, Some(0 | 100_001..)) {
+        return Err("searchCount must be between 1 and 100000".to_string());
+    }
+    if let Some(rate) = options.no_result_rate {
+        if !rate.is_finite() || !(0.0..=1.0).contains(&rate) {
+            return Err("noResultRate must be between 0 and 1".to_string());
+        }
+    }
+    if let Some(distribution) = &options.device_distribution {
+        validate_distribution("deviceDistribution", distribution)?;
+        if distribution
+            .keys()
+            .any(|device| !matches!(device.as_str(), "desktop" | "mobile" | "tablet"))
+        {
+            return Err("deviceDistribution supports desktop, mobile, and tablet".to_string());
+        }
+    }
+    if let Some(distribution) = &options.country_distribution {
+        validate_distribution("countryDistribution", distribution)?;
+        if distribution.keys().any(|country| {
+            country.len() != 2 || !country.bytes().all(|byte| byte.is_ascii_uppercase())
+        }) {
+            return Err("countryDistribution keys must be ISO alpha-2 uppercase codes".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_distribution(name: &str, distribution: &BTreeMap<String, f64>) -> Result<(), String> {
+    if distribution.is_empty() {
+        return Err(format!("{name} must not be empty"));
+    }
+    if distribution
+        .values()
+        .any(|weight| !weight.is_finite() || *weight < 0.0)
+    {
+        return Err(format!("{name} weights must be finite and non-negative"));
+    }
+    let total: f64 = distribution.values().sum();
+    if (total - 1.0).abs() > 0.000_001 {
+        return Err(format!("{name} weights must sum to 1"));
+    }
+    Ok(())
+}
+
+fn resolve_devices(distribution: Option<&BTreeMap<String, f64>>) -> Vec<DeviceChoice> {
+    match distribution {
+        Some(configured) => configured
+            .iter()
+            .map(|(device, weight)| DeviceChoice {
+                tag: format!("platform:{device}"),
+                weight: *weight,
+            })
+            .collect(),
+        None => DEVICE_TAGS
+            .iter()
+            .map(|(tag, weight)| DeviceChoice {
+                tag: (*tag).to_string(),
+                weight: *weight,
+            })
+            .collect(),
+    }
+}
+
+fn resolve_geography(distribution: Option<&BTreeMap<String, f64>>) -> Vec<GeoChoice> {
+    match distribution {
+        Some(configured) => configured
+            .iter()
+            .flat_map(|(country, weight)| expand_country_regions(country, *weight))
+            .collect(),
+        None => GEO_DISTRIBUTION
+            .iter()
+            .map(|(country, prefix, weight, region)| GeoChoice {
+                country: (*country).to_string(),
+                ip_prefix: (*prefix).to_string(),
+                region: region.map(str::to_string),
+                weight: *weight,
+            })
+            .collect(),
+    }
+}
+
+/// Spread one configured country weight across every `GEO_DISTRIBUTION` row for that country.
+///
+/// `GEO_DISTRIBUTION` holds one row per (country, region), so a country such as `US` owns 13
+/// region rows. Collapsing a configured country to a single row would emit one region for the
+/// whole country and erase the region breakdown that `/2/geo/{country}/regions` reports.
+fn expand_country_regions(country: &str, weight: f64) -> Vec<GeoChoice> {
+    let references: Vec<_> = GEO_DISTRIBUTION
+        .iter()
+        .filter(|entry| entry.0 == country)
+        .collect();
+    let reference_weight_total: f64 = references.iter().map(|entry| entry.2).sum();
+    if references.is_empty() || reference_weight_total <= 0.0 {
+        return vec![GeoChoice {
+            country: country.to_string(),
+            ip_prefix: "203.0.113.".to_string(),
+            region: None,
+            weight,
+        }];
+    }
+    references
+        .iter()
+        .map(|(_, prefix, reference_weight, region)| GeoChoice {
+            country: country.to_string(),
+            ip_prefix: (*prefix).to_string(),
+            region: region.map(str::to_string),
+            weight: weight * reference_weight / reference_weight_total,
+        })
+        .collect()
+}
+
+fn daily_search_counts(
+    options: &AnalyticsSeedOptions,
+    now: chrono::DateTime<chrono::Utc>,
+    rng: &mut Rng,
+) -> Vec<u32> {
+    if let Some(total) = options.search_count {
+        let per_day = total / options.days;
+        let remainder = total % options.days;
+        return (0..options.days)
+            .map(|day| per_day + u32::from(day < remainder))
+            .collect();
+    }
+
+    (1..=options.days)
+        .rev()
+        .map(|day_offset| {
+            let date = now - chrono::Duration::days(day_offset as i64);
+            let weekend_factor = if date.format("%u").to_string().parse::<u32>().unwrap_or(1) >= 6 {
+                0.6
+            } else {
+                1.0
+            };
+            (800.0 * weekend_factor * (0.8 + rng.next_f64() * 0.4)) as u32
+        })
+        .collect()
+}
+
+fn must_have_results(runtime: &SeedRuntime<'_>, ordinal: u32) -> Option<bool> {
+    runtime.target_no_results.map(|target| {
+        let total = u64::from(runtime.total_searches);
+        let target = u64::from(target);
+        let current = u64::from(ordinal);
+        let is_no_result = ((current + 1) * target / total) > (current * target / total);
+        !is_no_result
+    })
+}
+
+fn generate_search_event(
+    runtime: &SeedRuntime<'_>,
+    rng: &mut Rng,
+    timestamp_ms: i64,
+    ordinal: u32,
+) -> SearchEvent {
+    let query_index = runtime
+        .query_pools
+        .pick(rng, must_have_results(runtime, ordinal));
+    let (query_text, approx_hits, has_results) = runtime.queries[query_index];
+    let nb_hits = if has_results {
+        (approx_hits as f64 * (0.7 + rng.next_f64() * 0.6)).max(1.0) as u32
+    } else {
+        0
+    };
+    let user_idx = rng.range(0, runtime.users.len() as u32 - 1) as usize;
+    let device = &runtime.devices[rng.weighted_pick(&runtime.device_weights)];
+    let geography = &runtime.geography[rng.weighted_pick(&runtime.geo_weights)];
+    let filter = generate_filter(rng, has_results);
+
+    SearchEvent {
+        timestamp_ms,
+        query: query_text.to_string(),
+        query_id: Some(generate_query_id(rng)),
+        index_name: runtime.index_name.to_string(),
+        nb_hits,
+        processing_time_ms: rng.range(2, 45),
+        user_token: Some(runtime.users[user_idx].clone()),
+        user_ip: Some(format!("{}{}", geography.ip_prefix, rng.range(1, 254))),
+        filters: filter,
+        facets: None,
+        analytics_tags: Some(format!("{},source:organic", device.tag)),
+        page: 0,
+        hits_per_page: 20,
+        has_results,
+        country: Some(geography.country.clone()),
+        region: geography.region.clone(),
+        experiment_id: None,
+        variant_id: None,
+        assignment_method: None,
+    }
+}
+
+fn generate_filter(rng: &mut Rng, has_results: bool) -> Option<String> {
+    if !has_results || rng.next_f64() >= 0.30 {
+        return None;
+    }
+    let weights: Vec<f64> = FILTER_PATTERNS
+        .iter()
+        .map(|(_, _, weight)| *weight)
+        .collect();
+    let (attribute, value, _) = FILTER_PATTERNS[rng.weighted_pick(&weights)];
+    Some(format!("{attribute}:{value}"))
+}
+
+fn generate_insights(
+    runtime: &SeedRuntime<'_>,
+    rng: &mut Rng,
+    search: &SearchEvent,
+) -> Vec<InsightEvent> {
+    if !search.has_results || rng.next_f64() >= 0.35 {
+        return Vec::new();
+    }
+    let object_index = rng.range(0, runtime.object_ids.len() as u32 - 1) as usize;
+    let object_id = runtime.object_ids[object_index].clone();
+    let query_id = search.query_id.clone();
+    let user_token = search.user_token.clone().unwrap_or_default();
+    let mut events = vec![InsightEvent {
+        event_type: "click".to_string(),
+        event_subtype: None,
+        event_name: "Result Clicked".to_string(),
+        index: runtime.index_name.to_string(),
+        user_token: user_token.clone(),
+        authenticated_user_token: None,
+        query_id: query_id.clone(),
+        object_ids: vec![object_id.clone()],
+        object_ids_alt: vec![],
+        positions: Some(vec![generate_click_position(rng)]),
+        timestamp: Some(search.timestamp_ms + rng.range(500, 5000) as i64),
+        value: None,
+        currency: None,
+        interleaving_team: None,
+    }];
+    if rng.next_f64() < 0.15 {
+        events.push(InsightEvent {
+            event_type: "conversion".to_string(),
+            event_subtype: None,
+            event_name: "Product Purchased".to_string(),
+            index: runtime.index_name.to_string(),
+            user_token,
+            authenticated_user_token: None,
+            query_id,
+            object_ids: vec![object_id],
+            object_ids_alt: vec![],
+            positions: None,
+            timestamp: Some(search.timestamp_ms + rng.range(10_000, 120_000) as i64),
+            value: Some((rng.range(500, 15000) as f64) / 100.0),
+            currency: Some("USD".to_string()),
+            interleaving_team: None,
+        });
+    }
+    events
+}
+
+fn generate_day(
+    runtime: &SeedRuntime<'_>,
+    rng: &mut Rng,
+    day_start_ms: i64,
+    search_count: u32,
+    ordinal_start: u32,
+) -> DayEvents {
+    let mut searches = Vec::with_capacity(search_count as usize);
+    let mut insights = Vec::new();
+    for day_ordinal in 0..search_count {
+        let timestamp_ms = day_start_ms + generate_time_of_day_ms(rng);
+        let search = generate_search_event(runtime, rng, timestamp_ms, ordinal_start + day_ordinal);
+        insights.extend(generate_insights(runtime, rng, &search));
+        searches.push(search);
+    }
+    DayEvents { searches, insights }
+}
+
+fn write_day(
+    config: &AnalyticsConfig,
+    index_name: &str,
+    date: chrono::DateTime<chrono::Utc>,
+    events: &DayEvents,
+) -> Result<(), String> {
+    let date_str = date.format("%Y-%m-%d");
+    let search_partition = config
+        .searches_dir(index_name)
+        .join(format!("date={date_str}"));
+    std::fs::create_dir_all(&search_partition)
+        .map_err(|error| format!("Failed to create search partition dir: {error}"))?;
+    write_search_events_to_partition(&events.searches, &search_partition)?;
+
+    if !events.insights.is_empty() {
+        let insight_partition = config
+            .events_dir(index_name)
+            .join(format!("date={date_str}"));
+        std::fs::create_dir_all(&insight_partition)
+            .map_err(|error| format!("Failed to create events partition dir: {error}"))?;
+        write_insight_events_to_partition(&events.insights, &insight_partition)?;
+    }
+    Ok(())
 }
 
 /// Seed analytics data for the given index.
@@ -275,6 +587,26 @@ pub fn seed_analytics(
     index_name: &str,
     days: u32,
 ) -> Result<SeedResult, String> {
+    seed_analytics_with_options(config, index_name, &AnalyticsSeedOptions::for_days(days))
+}
+
+/// Seed analytics using deterministic volume and distribution controls when supplied.
+pub fn seed_analytics_with_options(
+    config: &AnalyticsConfig,
+    index_name: &str,
+    options: &AnalyticsSeedOptions,
+) -> Result<SeedResult, String> {
+    validate_seed_options(options)?;
+    super::mutation::with_index_mutation(config, index_name, || {
+        seed_analytics_exclusively(config, index_name, options)
+    })
+}
+
+fn seed_analytics_exclusively(
+    config: &AnalyticsConfig,
+    index_name: &str,
+    options: &AnalyticsSeedOptions,
+) -> Result<SeedResult, String> {
     let queries = queries_for_index(index_name);
     let mut rng = Rng::new(
         index_name
@@ -282,29 +614,38 @@ pub fn seed_analytics(
             .fold(42u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32)),
     );
 
-    let users = generate_users(&mut rng, 350);
-    let object_ids = generate_object_ids(&mut rng, 200);
-
-    // Build query weight distribution (power-law: top queries get more traffic)
-    let query_weights: Vec<f64> = queries
-        .iter()
-        .enumerate()
-        .map(|(i, _)| 1.0 / ((i as f64) + 1.0).powf(0.8))
-        .collect();
-    let weight_sum: f64 = query_weights.iter().sum();
-    let query_weights: Vec<f64> = query_weights.iter().map(|w| w / weight_sum).collect();
-
-    let geo_weights: Vec<f64> = GEO_DISTRIBUTION.iter().map(|(_, _, w, _)| *w).collect();
-    let device_weights: Vec<f64> = DEVICE_TAGS.iter().map(|d| d.1).collect();
-
     let now = chrono::Utc::now();
-    let mut total_searches = 0usize;
-    let mut total_clicks = 0usize;
-    let mut total_conversions = 0usize;
+    let daily_counts = daily_search_counts(options, now, &mut rng);
+    let total_searches: u32 = daily_counts.iter().sum();
+    let target_no_results = options
+        .no_result_rate
+        .map(|rate| (f64::from(total_searches) * rate).round() as u32);
+    let devices = resolve_devices(options.device_distribution.as_ref());
+    let device_weights = devices.iter().map(|choice| choice.weight).collect();
+    let geography = resolve_geography(options.country_distribution.as_ref());
+    let geo_weights = geography.iter().map(|choice| choice.weight).collect();
+    let runtime = SeedRuntime {
+        index_name,
+        queries,
+        query_pools: QueryPools::new(queries),
+        users: generate_users(&mut rng, 350),
+        object_ids: generate_object_ids(&mut rng, 200),
+        devices,
+        device_weights,
+        geography,
+        geo_weights,
+        total_searches,
+        target_no_results,
+    };
+    let mut ordinal = 0;
+    let mut seeded_dates = Vec::with_capacity(options.days as usize);
+    let mut total_clicks = 0;
+    let mut total_conversions = 0;
 
-    for day_offset in (1..=days).rev() {
+    for (day_index, search_count) in daily_counts.into_iter().enumerate() {
+        let day_offset = options.days - day_index as u32;
         let date = now - chrono::Duration::days(day_offset as i64);
-        let date_str = date.format("%Y-%m-%d").to_string();
+        seeded_dates.push(date.format("%Y-%m-%d").to_string());
         let day_start_ms = date
             .date_naive()
             .and_hms_opt(0, 0, 0)
@@ -312,148 +653,33 @@ pub fn seed_analytics(
             .and_utc()
             .timestamp_millis();
 
-        // Vary daily volume: weekends are ~60% of weekday traffic
-        let weekday = date.format("%u").to_string().parse::<u32>().unwrap_or(1);
-        let weekend_factor = if weekday >= 6 { 0.6 } else { 1.0 };
-
-        // Add some daily noise
-        let noise = 0.8 + rng.next_f64() * 0.4; // 0.8 to 1.2
-        let base_daily_searches = (800.0 * weekend_factor * noise) as u32;
-
-        let mut day_searches: Vec<SearchEvent> = Vec::new();
-        let mut day_events: Vec<InsightEvent> = Vec::new();
-
-        for _ in 0..base_daily_searches {
-            let qi = rng.weighted_pick(&query_weights);
-            let (query_text, approx_hits, has_results) = queries[qi];
-
-            // Vary hit count slightly
-            let nb_hits = if has_results {
-                let h = approx_hits as f64 * (0.7 + rng.next_f64() * 0.6);
-                h.max(1.0) as u32
-            } else {
-                0
-            };
-
-            let user_idx = rng.range(0, users.len() as u32 - 1) as usize;
-            let geo_idx = rng.weighted_pick(&geo_weights);
-            let device_idx = rng.weighted_pick(&device_weights);
-
-            // Spread events across the day with realistic time-of-day distribution
-            let hour_offset_ms = generate_time_of_day_ms(&mut rng);
-            let ts = day_start_ms + hour_offset_ms;
-
-            let query_id = generate_query_id(&mut rng);
-            let device_tag = DEVICE_TAGS[device_idx].0;
-            let (country_code, ip_prefix, _, region) = GEO_DISTRIBUTION[geo_idx];
-            let user_ip = format!("{}{}", ip_prefix, rng.range(1, 254));
-
-            // ~30% of searches include filters
-            let filter_str = if has_results && rng.next_f64() < 0.30 {
-                let filter_weights: Vec<f64> = FILTER_PATTERNS.iter().map(|(_, _, w)| *w).collect();
-                let fi = rng.weighted_pick(&filter_weights);
-                let (attr, val, _) = FILTER_PATTERNS[fi];
-                Some(format!("{}:{}", attr, val))
-            } else {
-                None
-            };
-
-            day_searches.push(SearchEvent {
-                timestamp_ms: ts,
-                query: query_text.to_string(),
-                query_id: Some(query_id.clone()),
-                index_name: index_name.to_string(),
-                nb_hits,
-                processing_time_ms: rng.range(2, 45),
-                user_token: Some(users[user_idx].clone()),
-                user_ip: Some(user_ip),
-                filters: filter_str,
-                facets: None,
-                analytics_tags: Some(format!("{},source:organic", device_tag)),
-                page: 0,
-                hits_per_page: 20,
-                has_results,
-                country: Some(country_code.to_string()),
-                region: region.map(|r| r.to_string()),
-                experiment_id: None,
-                variant_id: None,
-                assignment_method: None,
-            });
-
-            // Generate click events (~35% CTR for searches with results)
-            if has_results && rng.next_f64() < 0.35 {
-                // Click position: heavily weighted toward position 1
-                let position = generate_click_position(&mut rng);
-                let obj_idx = rng.range(0, object_ids.len() as u32 - 1) as usize;
-
-                day_events.push(InsightEvent {
-                    event_type: "click".to_string(),
-                    event_subtype: None,
-                    event_name: "Result Clicked".to_string(),
-                    index: index_name.to_string(),
-                    user_token: users[user_idx].clone(),
-                    authenticated_user_token: None,
-                    query_id: Some(query_id.clone()),
-                    object_ids: vec![object_ids[obj_idx].clone()],
-                    object_ids_alt: vec![],
-                    positions: Some(vec![position]),
-                    timestamp: Some(ts + rng.range(500, 5000) as i64), // Click 0.5-5s after search
-                    value: None,
-                    currency: None,
-                    interleaving_team: None,
-                });
-                total_clicks += 1;
-
-                // ~15% of clicks lead to conversion
-                if rng.next_f64() < 0.15 {
-                    day_events.push(InsightEvent {
-                        event_type: "conversion".to_string(),
-                        event_subtype: None,
-                        event_name: "Product Purchased".to_string(),
-                        index: index_name.to_string(),
-                        user_token: users[user_idx].clone(),
-                        authenticated_user_token: None,
-                        query_id: Some(query_id),
-                        object_ids: vec![object_ids[obj_idx].clone()],
-                        object_ids_alt: vec![],
-                        positions: None,
-                        timestamp: Some(ts + rng.range(10_000, 120_000) as i64),
-                        value: Some((rng.range(500, 15000) as f64) / 100.0),
-                        currency: Some("USD".to_string()),
-                        interleaving_team: None,
-                    });
-                    total_conversions += 1;
-                }
-            }
-        }
-
-        total_searches += day_searches.len();
-
-        // Write search events for this day
-        let search_dir = config.searches_dir(index_name);
-        let partition_dir = search_dir.join(format!("date={}", date_str));
-        std::fs::create_dir_all(&partition_dir)
-            .map_err(|e| format!("Failed to create search partition dir: {}", e))?;
-
-        write_search_events_to_partition(&day_searches, &partition_dir)?;
-
-        // Write insight events for this day
-        if !day_events.is_empty() {
-            let events_dir = config.events_dir(index_name);
-            let events_partition = events_dir.join(format!("date={}", date_str));
-            std::fs::create_dir_all(&events_partition)
-                .map_err(|e| format!("Failed to create events partition dir: {}", e))?;
-
-            write_insight_events_to_partition(&day_events, &events_partition)?;
-        }
+        let day_events = generate_day(&runtime, &mut rng, day_start_ms, search_count, ordinal);
+        total_clicks += day_events
+            .insights
+            .iter()
+            .filter(|event| event.event_type == "click")
+            .count();
+        total_conversions += day_events
+            .insights
+            .iter()
+            .filter(|event| event.event_type == "conversion")
+            .count();
+        write_day(config, index_name, date, &day_events)?;
+        ordinal += search_count;
     }
 
     Ok(SeedResult {
-        days,
-        total_searches,
+        days: options.days,
+        seeded_dates,
+        total_searches: total_searches as usize,
         total_clicks,
         total_conversions,
     })
+}
+
+/// Clear search and insight analytics for one index without racing a seed.
+pub fn clear_analytics(config: &AnalyticsConfig, index_name: &str) -> Result<u64, String> {
+    super::mutation::clear_index(config, index_name)
 }
 
 /// Generate a realistic time-of-day offset in milliseconds.
@@ -492,200 +718,7 @@ fn write_search_events_to_partition(
     let schema = super::schema::search_event_schema();
     let batch = super::writer::search_events_to_batch(events, &schema)?;
     let path = partition_dir.join("seed_searches.parquet");
-    super::writer::write_parquet_file(&path, batch)
-}
-
-#[cfg(test)]
-#[allow(clippy::items_after_test_module)]
-mod tests {
-    use super::*;
-
-    // --- Rng tests ---
-
-    #[test]
-    fn rng_zero_seed_becomes_one() {
-        let rng = Rng::new(0);
-        assert_eq!(rng.state, 1);
-    }
-
-    #[test]
-    fn rng_nonzero_seed_kept() {
-        let rng = Rng::new(42);
-        assert_eq!(rng.state, 42);
-    }
-
-    #[test]
-    fn rng_deterministic() {
-        let mut a = Rng::new(42);
-        let mut b = Rng::new(42);
-        for _ in 0..100 {
-            assert_eq!(a.next_u32(), b.next_u32());
-        }
-    }
-
-    #[test]
-    fn rng_next_f64_in_range() {
-        let mut rng = Rng::new(123);
-        for _ in 0..1000 {
-            let v = rng.next_f64();
-            assert!((0.0..1.0).contains(&v), "next_f64 out of range: {}", v);
-        }
-    }
-
-    #[test]
-    fn rng_range_within_bounds() {
-        let mut rng = Rng::new(99);
-        for _ in 0..500 {
-            let v = rng.range(5, 10);
-            assert!((5..=10).contains(&v), "range out of bounds: {}", v);
-        }
-    }
-
-    #[test]
-    fn rng_range_lo_equals_hi() {
-        let mut rng = Rng::new(1);
-        assert_eq!(rng.range(7, 7), 7);
-    }
-
-    #[test]
-    fn rng_range_lo_greater_than_hi() {
-        let mut rng = Rng::new(1);
-        assert_eq!(rng.range(10, 5), 10);
-    }
-
-    #[test]
-    fn rng_weighted_pick_single_weight() {
-        let mut rng = Rng::new(42);
-        // Only one weight — always picks index 0
-        for _ in 0..10 {
-            assert_eq!(rng.weighted_pick(&[1.0]), 0);
-        }
-    }
-
-    #[test]
-    fn rng_weighted_pick_extreme_weights() {
-        let mut rng = Rng::new(42);
-        // First weight is 0, second is 1 — index 0 can never be picked
-        // because r is in [0,1) and the condition `r < 0.0` is always false.
-        let mut counts = [0u32; 2];
-        for _ in 0..100 {
-            counts[rng.weighted_pick(&[0.0, 1.0])] += 1;
-        }
-        assert_eq!(counts[0], 0, "weight-0 index should never be picked");
-        assert_eq!(counts[1], 100, "weight-1 index should always be picked");
-    }
-
-    // --- generate_query_id ---
-
-    #[test]
-    fn generate_query_id_length_and_hex() {
-        let mut rng = Rng::new(42);
-        let id = generate_query_id(&mut rng);
-        assert_eq!(id.len(), 32);
-        assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "not hex: {}", id);
-    }
-
-    // --- queries_for_index ---
-
-    #[test]
-    fn queries_for_index_movie() {
-        let q = queries_for_index("my_movies");
-        assert_eq!(q.len(), MOVIE_QUERIES.len());
-        assert_eq!(q[1].0, "batman");
-    }
-
-    #[test]
-    fn queries_for_index_product() {
-        let q = queries_for_index("bestbuy_products");
-        assert_eq!(q.len(), PRODUCT_QUERIES.len());
-        assert_eq!(q[1].0, "samsung");
-    }
-
-    #[test]
-    fn queries_for_index_default() {
-        let q = queries_for_index("random_index");
-        assert_eq!(q.len(), DEFAULT_QUERIES.len());
-        assert_eq!(q[1].0, "shoes");
-    }
-
-    #[test]
-    fn queries_for_index_case_insensitive() {
-        let m = queries_for_index("MOVIES");
-        assert_eq!(m.len(), MOVIE_QUERIES.len());
-        let s = queries_for_index("MyShop");
-        assert_eq!(s.len(), PRODUCT_QUERIES.len());
-    }
-
-    // --- generate_users / generate_object_ids ---
-
-    #[test]
-    fn generate_users_format() {
-        let mut rng = Rng::new(42);
-        let users = generate_users(&mut rng, 5);
-        assert_eq!(users.len(), 5);
-        for u in &users {
-            assert!(u.starts_with("user-"), "bad format: {}", u);
-            assert_eq!(u.len(), 13); // "user-" + 8 hex chars
-        }
-    }
-
-    #[test]
-    fn generate_object_ids_format() {
-        let mut rng = Rng::new(42);
-        let oids = generate_object_ids(&mut rng, 3);
-        assert_eq!(oids.len(), 3);
-        for o in &oids {
-            assert!(o.starts_with("obj-"), "bad format: {}", o);
-            assert_eq!(o.len(), 10); // "obj-" + 6 hex chars
-        }
-    }
-
-    // --- generate_click_position ---
-
-    #[test]
-    fn generate_click_position_in_range() {
-        let mut rng = Rng::new(42);
-        for _ in 0..500 {
-            let pos = generate_click_position(&mut rng);
-            assert!((1..=12).contains(&pos), "position out of range: {}", pos);
-        }
-    }
-
-    // --- generate_time_of_day_ms ---
-
-    #[test]
-    fn generate_time_of_day_ms_in_range() {
-        let mut rng = Rng::new(42);
-        let day_ms = 24 * 60 * 60 * 1000;
-        for _ in 0..500 {
-            let t = generate_time_of_day_ms(&mut rng);
-            assert!(t >= 0 && t < day_ms, "time out of range: {}", t);
-        }
-    }
-
-    // --- constant arrays ---
-
-    #[test]
-    fn geo_distribution_weights_sum_roughly_one() {
-        let sum: f64 = GEO_DISTRIBUTION.iter().map(|(_, _, w, _)| w).sum();
-        assert!((sum - 1.0).abs() < 0.05, "geo weights sum = {}", sum);
-    }
-
-    #[test]
-    fn device_tags_weights_sum_one() {
-        let sum: f64 = DEVICE_TAGS.iter().map(|d| d.1).sum();
-        assert!((sum - 1.0).abs() < 0.01, "device weights sum = {}", sum);
-    }
-
-    #[test]
-    fn all_query_sets_have_no_result_entries() {
-        for queries in [DEFAULT_QUERIES, MOVIE_QUERIES, PRODUCT_QUERIES] {
-            assert!(
-                queries.iter().any(|(_, _, has_results)| !has_results),
-                "query set should have some no-result entries"
-            );
-        }
-    }
+    super::writer::write_parquet_file_atomic(&path, batch)
 }
 
 /// Write insight events to a specific date partition.
@@ -696,5 +729,9 @@ fn write_insight_events_to_partition(
     let schema = super::schema::insight_event_schema();
     let batch = super::writer::insight_events_to_batch(events, &schema)?;
     let path = partition_dir.join("seed_events.parquet");
-    super::writer::write_parquet_file(&path, batch)
+    super::writer::write_parquet_file_atomic(&path, batch)
 }
+
+#[cfg(test)]
+#[path = "seed_tests.rs"]
+mod tests;

@@ -19,9 +19,29 @@
  * - Clicking index navigates to search page
  * - Export All triggers download
  */
+import type { Download, Page, Response } from '@playwright/test';
 import { test, expect } from '../../fixtures/auth.fixture';
-import { TEST_INDEX, waitForOverviewIndexRow } from '../helpers';
+import { CHART_CANVAS_TEST_ID, TEST_INDEX, waitForOverviewIndexRow } from '../helpers';
 import { deleteIndex } from '../../fixtures/api-helpers';
+
+async function waitForOptionalExportDownload(page: Page): Promise<Download | null> {
+  try {
+    return await page.waitForEvent('download', { timeout: 15_000 });
+  } catch {
+    return null;
+  }
+}
+
+async function waitForOptionalExportResponse(page: Page): Promise<Response | null> {
+  try {
+    return await page.waitForResponse(
+      resp => resp.url().includes('/snapshot') || resp.url().includes('/export'),
+      { timeout: 15_000 },
+    );
+  } catch {
+    return null;
+  }
+}
 
 test.describe('Overview Page', () => {
 
@@ -84,7 +104,7 @@ test.describe('Overview Page', () => {
     await expect(dialog).toBeVisible();
     await expect(dialog.getByRole('heading', { name: 'Create Index' })).toBeVisible();
 
-    await dialog.locator('#index-uid').fill(tempIndex);
+    await dialog.getByLabel('Index Name', { exact: true }).fill(tempIndex);
     await dialog.getByRole('button', { name: /create index/i }).click();
 
     await expect(dialog).not.toBeVisible({ timeout: 10000 });
@@ -110,7 +130,7 @@ test.describe('Overview Page', () => {
     const statusCard = page.getByTestId('stat-card-status');
     await expect(statusCard).toBeVisible();
     await expect(statusCard.getByText('Healthy')).toBeVisible({ timeout: 10000 });
-    await expect(statusCard.getByText('Disconnected')).not.toBeVisible();
+    await expect(statusCard.getByText('Disconnected')).toBeHidden();
   });
 
   test('clicking e2e-products navigates to its search page', async ({ page }) => {
@@ -127,7 +147,7 @@ test.describe('Overview Page', () => {
     await expect(dialog.getByText('Empty index')).toBeVisible();
     await expect(dialog.getByText(/Movies/)).toBeVisible();
     await expect(dialog.getByText(/Products/)).toBeVisible();
-    await expect(dialog.locator('#index-uid')).toBeVisible();
+    await expect(dialog.getByLabel('Index Name', { exact: true })).toBeVisible();
 
     await dialog.getByRole('button', { name: /cancel/i }).click();
     await expect(dialog).not.toBeVisible({ timeout: 5000 });
@@ -139,7 +159,7 @@ test.describe('Overview Page', () => {
     await expect(dialog).toBeVisible();
 
     await dialog.getByText(/Movies/).click();
-    const nameInput = dialog.locator('#index-uid');
+    const nameInput = dialog.getByLabel('Index Name', { exact: true });
     await expect(nameInput).toHaveValue('movies');
 
     await dialog.getByRole('button', { name: /cancel/i }).click();
@@ -190,7 +210,7 @@ test.describe('Overview Page', () => {
     // Chart only renders after API responds; under full-suite load this can take >10 s.
     const chart = analyticsCard.getByTestId('overview-analytics-chart');
     await expect(chart).toBeVisible({ timeout: 30_000 });
-    await expect(chart.locator('svg')).toBeVisible();
+    await expect(chart.getByTestId(CHART_CANVAS_TEST_ID)).toBeVisible();
   });
 
   test('View Details link in analytics section navigates to analytics page', async ({ page }) => {
@@ -218,27 +238,15 @@ test.describe('Overview Page', () => {
     const exportBtn = page.getByTestId('overview-export-all-btn');
     await expect(exportBtn).toBeVisible();
 
-    const downloadPromise = page.waitForEvent('download', { timeout: 15_000 }).catch(() => null);
-    const responsePromise = page.waitForResponse(
-      resp => resp.url().includes('/snapshot') || resp.url().includes('/export'),
-      { timeout: 15_000 }
-    ).catch(() => null);
+    const [download, response] = await Promise.all([
+      waitForOptionalExportDownload(page),
+      waitForOptionalExportResponse(page),
+      exportBtn.click().then(() => null),
+    ]);
 
-    await exportBtn.click();
-
-    const download = await downloadPromise;
-    const response = await responsePromise;
-    if (download) {
-      expect(download.suggestedFilename()).toMatch(/\S/);
-      return;
-    }
-
-    if (response) {
-      expect(response.status()).toBeGreaterThanOrEqual(200);
-      expect(response.status()).toBeLessThan(300);
-      return;
-    }
-
-    throw new Error('Expected export to trigger either a file download or an export response');
+    expect(download ?? response).not.toBeNull();
+    expect(download?.suggestedFilename() ?? 'export response observed').toMatch(/\S/);
+    expect(response?.status() ?? 200).toBeGreaterThanOrEqual(200);
+    expect(response?.status() ?? 200).toBeLessThan(300);
   });
 });

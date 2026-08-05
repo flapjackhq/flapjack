@@ -1,5 +1,6 @@
 import type { Page } from '@playwright/test';
 import { expect } from '@playwright/test';
+import type { SeededRouteAuditExperiment } from '../fixtures/experiment-seed';
 import { waitForSearchResultsOrEmptyState } from './helpers';
 
 export type DashboardRoute = {
@@ -12,7 +13,7 @@ export type DashboardRoute = {
 
 export type ExcludedDashboardRoute = {
   appPath: string;
-  reason: 'fallback_shell' | 'requires_runtime_experiment_fixture';
+  reason: 'fallback_shell';
   detail: string;
 };
 
@@ -49,14 +50,16 @@ export const EXCLUDED_DASHBOARD_ROUTES: readonly ExcludedDashboardRoute[] = [
     reason: 'fallback_shell',
     detail: 'App wildcard is a fallback-only not-found shell, not an authenticated dashboard surface.',
   },
-  {
-    appPath: '/experiments/:experimentId',
-    reason: 'requires_runtime_experiment_fixture',
-    detail: 'Detail coverage depends on runtime-created experiment IDs until a deterministic fixture is promoted.',
-  },
 ] as const;
 
-export function buildDashboardRouteAudit(indexName: string): readonly DashboardRoute[] {
+export const AUDITED_DASHBOARD_ROUTE_PATTERNS = APP_USER_FACING_ROUTE_PATTERNS.filter(
+  (appPath) => !EXCLUDED_DASHBOARD_ROUTES.some((excludedRoute) => excludedRoute.appPath === appPath),
+);
+
+export function buildDashboardRouteAudit(
+  indexName: string,
+  experiment: SeededRouteAuditExperiment,
+): readonly DashboardRoute[] {
   const indexBasePath = `/index/${indexName}`;
 
   return [
@@ -138,6 +141,7 @@ export function buildDashboardRouteAudit(indexName: string): readonly DashboardR
         await expect(
           page.getByTestId('cluster-standalone-state')
             .or(page.getByTestId('cluster-peer-table'))
+            .or(page.getByTestId('cluster-ha-empty-state'))
             .or(page.getByTestId('cluster-error-state')),
         ).toBeVisible({ timeout: 15_000 });
       },
@@ -169,6 +173,17 @@ export function buildDashboardRouteAudit(indexName: string): readonly DashboardR
       coverage: 'global route',
       waitForReady: async (page) => {
         await expect(page.getByTestId('experiments-heading')).toBeVisible({ timeout: 15_000 });
+      },
+    },
+    {
+      id: 'experiment-detail',
+      appPath: '/experiments/:experimentId',
+      path: `/experiments/${encodeURIComponent(experiment.id)}`,
+      coverage: 'seeded child route',
+      waitForReady: async (page) => {
+        await expect(page.getByTestId('experiment-detail-name')).toHaveText(experiment.name, {
+          timeout: 15_000,
+        });
       },
     },
     {
@@ -297,4 +312,17 @@ export function assertDashboardRouteCoverage(routes: readonly DashboardRoute[]):
 
   expect(coveredAppPaths).toEqual(expectedAppPaths);
   expect([...auditedAppPaths].filter((path) => excludedAppPaths.has(path))).toEqual([]);
+}
+
+export function getDashboardRouteByAppPath(
+  routes: readonly DashboardRoute[],
+  appPath: string,
+): DashboardRoute {
+  const route = routes.find((candidate) => candidate.appPath === appPath);
+
+  if (!route) {
+    throw new Error(`Dashboard route manifest is missing ${appPath}`);
+  }
+
+  return route;
 }

@@ -185,7 +185,7 @@ remove_completed_dataset() {
 
 disk_free_bytes() {
   local directory="$1"
-  local available_bytes="${SCALE_DISK_FREE_BYTES_OVERRIDE:-}"
+  local available_bytes="${2:-}"
 
   if [[ -z "$available_bytes" ]]; then
     available_bytes="$(df -Pk "$directory" | awk 'NR == 2 { printf "%.0f", $4 * 1024 }')"
@@ -195,6 +195,62 @@ disk_free_bytes() {
     return 1
   }
   printf '%s\n' "$available_bytes"
+}
+
+disk_filesystem_id() {
+  local directory="$1"
+  local filesystem_id
+
+  # The free-space pool is keyed by the filesystem's device id, not by `df`
+  # column 1 alone: distinct mounts routinely share source labels like `tmpfs`
+  # or `overlay` while reporting different available bytes.
+  # GNU stat accepts BSD's `-f` flag but assigns `%d` a different meaning
+  # (free inodes), so try GNU's device-id format first. BSD stat rejects `-c`
+  # and falls through to its own device-id format.
+  if filesystem_id="$(stat -c '%d' "$directory" 2>/dev/null)"; then
+    :
+  elif filesystem_id="$(stat -f '%d' "$directory" 2>/dev/null)"; then
+    :
+  else
+    echo "FAIL: filesystem identity is unavailable for ${directory}" >&2
+    return 1
+  fi
+  [[ "$filesystem_id" =~ ^[0-9]+$ ]] || {
+    echo "FAIL: filesystem identity is missing or non-numeric for ${directory}: ${filesystem_id}" >&2
+    return 1
+  }
+  printf '%s\n' "$filesystem_id"
+}
+
+capacity_disk_evidence_json() {
+  local dataset_directory="${TMPDIR:-/tmp}"
+  local data_filesystem_id dataset_filesystem_id
+  local data_free_bytes dataset_free_bytes
+  local disk_filesystems_shared=false
+  local disk_free_override="${SCALE_DISK_FREE_BYTES_OVERRIDE:-}"
+
+  data_filesystem_id="$(disk_filesystem_id "$SERVER_DATA_DIR")" || return 1
+  dataset_filesystem_id="$(disk_filesystem_id "$dataset_directory")" || return 1
+  data_free_bytes="$(disk_free_bytes "$SERVER_DATA_DIR" "$disk_free_override")" || return 1
+  if [[ "$data_filesystem_id" == "$dataset_filesystem_id" ]]; then
+    disk_filesystems_shared=true
+    dataset_free_bytes="$data_free_bytes"
+  else
+    dataset_free_bytes="$(disk_free_bytes "$dataset_directory" "$disk_free_override")" || return 1
+  fi
+
+  # On 2026-08-04 the ladder measured only SERVER_DATA_DIR while generating its
+  # entire tranche under TMPDIR. Preserve both free-space readings so a small
+  # root volume cannot pass preflight merely because the index lives on NVMe.
+  jq -cn \
+    --argjson data_disk_free_bytes "$data_free_bytes" \
+    --argjson dataset_disk_free_bytes "$dataset_free_bytes" \
+    --argjson disk_filesystems_shared "$disk_filesystems_shared" \
+    '{
+      dataDiskFreeBytes: $data_disk_free_bytes,
+      datasetDiskFreeBytes: $dataset_disk_free_bytes,
+      diskFilesystemsShared: $disk_filesystems_shared
+    }'
 }
 
 memory_capacity_bytes() {
@@ -243,7 +299,7 @@ run_capacity_preflight() {
   local rss_bytes_per_record
   local disk_reserve_bytes="${SCALE_DISK_RESERVE_BYTES:-53687091200}"
   local memory_reserve_bytes="${SCALE_MEMORY_RESERVE_BYTES:-17179869184}"
-  local free_disk
+  local disk_evidence
   local memory_capacity
   local input_json
   local helper_exit_code=0
@@ -253,14 +309,14 @@ run_capacity_preflight() {
   index_bytes_per_record="$(capacity_index_bytes_per_record)"
   rss_bytes_per_record="$(capacity_rss_bytes_per_record)"
 
-  free_disk="$(disk_free_bytes "$SERVER_DATA_DIR")" || return 1
+  disk_evidence="$(capacity_disk_evidence_json)" || return 1
   memory_capacity="$(memory_capacity_bytes)" || return 1
   input_json="$(
     jq -cn \
       --arg profile "$PROFILE" \
       --argjson starting_count "$starting_count" \
       --argjson target_count "$target_count" \
-      --argjson disk_free_bytes "$free_disk" \
+      --argjson disk_evidence "$disk_evidence" \
       --argjson memory_capacity_bytes "$memory_capacity" \
       --argjson source_bytes_per_record "$source_bytes_per_record" \
       --argjson index_bytes_per_record "$index_bytes_per_record" \
@@ -271,7 +327,9 @@ run_capacity_preflight() {
         profile: $profile,
         startingCount: $starting_count,
         targetCount: $target_count,
-        diskFreeBytes: $disk_free_bytes,
+        dataDiskFreeBytes: $disk_evidence.dataDiskFreeBytes,
+        datasetDiskFreeBytes: $disk_evidence.datasetDiskFreeBytes,
+        diskFilesystemsShared: $disk_evidence.diskFilesystemsShared,
         memoryCapacityBytes: $memory_capacity_bytes,
         sourceBytesPerRecord: $source_bytes_per_record,
         indexBytesPerRecord: $index_bytes_per_record,
@@ -651,7 +709,9 @@ cleanup() {
       done
     fi
     if [[ -n "$RESULTS_DIR" ]]; then
-      if ! {
+      if ! mkdir -p "$RESULTS_DIR"; then
+        echo "ERROR: failed to create results directory for failure evidence in ${RESULTS_DIR}" >&2
+      elif ! {
         echo "outcome=FAIL"
         echo "failure_outcome=${FAILURE_OUTCOME}"
         echo "script_exit_code=${script_exit_code}"
@@ -832,7 +892,7 @@ if [[ -n "$STOP_AFTER_RUNG" ]]; then
   }
 fi
 
-require_loadtest_commands curl jq node ps du awk timeout
+require_loadtest_commands curl jq node ps du df stat awk timeout
 mkdir -p "$SERVER_DATA_DIR"
 SERVER_DATA_DIR="$(cd "$SERVER_DATA_DIR" && pwd)"
 if [[ -z "$RESULTS_DIR" ]]; then
@@ -896,7 +956,7 @@ SERVER_PID="$(
   start_loadtest_server "$SERVER_BINARY" "no-auth" "$bind_addr" "$SERVER_DATA_DIR" \
     "$server_log_path"
 )"
-wait_for_loadtest_health "$BASE_URL" "$SERVER_PID"
+wait_for_loadtest_health "$BASE_URL" "$SERVER_PID" 300 0.1 "$server_log_path" "$bind_addr"
 
 if [[ "$RESUME" -eq 1 ]]; then
   initial_count="$(index_doc_count "$BASE_URL" "$index_name")"

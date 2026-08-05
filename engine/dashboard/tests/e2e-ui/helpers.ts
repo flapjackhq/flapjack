@@ -16,6 +16,23 @@ export { TEST_INDEX } from '../fixtures/test-data';
 // Re-export auth fixture so test files only need one import
 export { test, expect } from '../fixtures/auth.fixture';
 
+// Chart primitives carry these ids in the dashboard source, so specs can assert
+// that Recharts drew a real surface and real marks without a raw `svg` locator.
+// `src/lib/constants.ts` stays the single owner of the values.
+export { CHART_CANVAS_TEST_ID, CHART_MARK_TEST_ID } from '../../src/lib/constants';
+
+/**
+ * Body rows inside `container` — the rows holding data cells, with header rows
+ * excluded. `container` may be the page, a table, or any wrapper around one.
+ *
+ * Role-based, so table specs never need a raw `tbody tr` locator and never depend
+ * on whether a table renders a `<thead>`.
+ */
+export function getTableBodyRows(container: Page | Locator): Locator {
+  const page = 'page' in container ? container.page() : container;
+  return container.getByRole('row').filter({ has: page.getByRole('cell') });
+}
+
 type SettingsTabAssertion = {
   tabLabel: string;
   panelAssertion: (panel: Locator) => Locator;

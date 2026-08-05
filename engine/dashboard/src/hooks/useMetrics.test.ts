@@ -14,8 +14,8 @@ vi.mock('@/lib/prometheusParser', () => ({
 const { authStateRef, useAuthMock } = vi.hoisted(() => {
   const authStateRef = {
     current: {
-      apiKey: null as string | null,
       appId: 'flapjack',
+      isAuthenticated: false,
     },
   };
   const useAuthMock = Object.assign(
@@ -57,234 +57,139 @@ describe('usePrometheusMetrics', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.stubGlobal('__BACKEND_URL__', 'http://backend.test');
-    authStateRef.current = { apiKey: null, appId: 'flapjack' };
+    authStateRef.current = { appId: 'flapjack', isAuthenticated: false };
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
-  it('sends auth headers from the auth store when fetching metrics', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      text: vi.fn().mockResolvedValue('metrics-body'),
-    });
-    vi.stubGlobal('fetch', fetchMock);
-    parsePrometheusTextMock.mockReturnValue([
-      {
-        name: 'flapjack_documents_count',
-        labels: { index: 'products' },
-        value: 12,
-      },
-    ]);
-    authStateRef.current = {
-      apiKey: 'admin-key',
-      appId: 'tenant-app',
-    };
-
-    const { wrapper } = createWrapper();
-    const { result } = renderHook(() => usePrometheusMetrics(), {
-      wrapper,
-    });
-
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-
-    expect(fetchMock).toHaveBeenCalledWith('http://backend.test/metrics', {
-      headers: {
-        'x-algolia-application-id': 'tenant-app',
-        'x-algolia-api-key': 'admin-key',
-      },
-    });
-    expect(parsePrometheusTextMock).toHaveBeenCalledWith('metrics-body');
-  });
-
-  it('falls back to the default app id and omits the api key when auth is empty', async () => {
+  it('uses the same-origin metrics proxy so authenticated requests carry the session cookie', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       text: vi.fn().mockResolvedValue('metrics-body'),
     });
     vi.stubGlobal('fetch', fetchMock);
     parsePrometheusTextMock.mockReturnValue([]);
-    authStateRef.current = { apiKey: null, appId: '' };
+    authStateRef.current = { appId: 'tenant-app', isAuthenticated: true };
 
     const { wrapper } = createWrapper();
-    const { result } = renderHook(() => usePrometheusMetrics(), {
-      wrapper,
-    });
+    const { result } = renderHook(() => usePrometheusMetrics(), { wrapper });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(fetchMock).toHaveBeenCalledWith('/__flapjack_metrics', {
+      credentials: 'include',
+      headers: {
+        'x-algolia-application-id': 'tenant-app',
+      },
+    });
+  });
 
-    expect(fetchMock).toHaveBeenCalledWith('http://backend.test/metrics', {
+  it('falls back to the default app id without adding secret headers', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      text: vi.fn().mockResolvedValue('metrics-body'),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    parsePrometheusTextMock.mockReturnValue([]);
+    authStateRef.current = { appId: '', isAuthenticated: false };
+
+    const { wrapper } = createWrapper();
+    const { result } = renderHook(() => usePrometheusMetrics(), { wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(fetchMock).toHaveBeenCalledWith('/__flapjack_metrics', {
+      credentials: 'include',
       headers: {
         'x-algolia-application-id': 'flapjack',
       },
     });
   });
 
-  it('refetches metrics when the auth scope changes', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        text: vi.fn().mockResolvedValue('metrics-body-1'),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        text: vi.fn().mockResolvedValue('metrics-body-2'),
-      });
-    vi.stubGlobal('fetch', fetchMock);
-    parsePrometheusTextMock.mockReturnValue([]);
-
-    const { wrapper } = createWrapper();
-    const { result, rerender } = renderHook(() => usePrometheusMetrics(), {
-      wrapper,
-    });
-
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-
-    authStateRef.current = {
-      apiKey: 'rotated-admin-key',
-      appId: 'tenant-app',
-    };
-    rerender();
-
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    expect(fetchMock).toHaveBeenNthCalledWith(2, 'http://backend.test/metrics', {
-      headers: {
-        'x-algolia-application-id': 'tenant-app',
-        'x-algolia-api-key': 'rotated-admin-key',
-      },
-    });
-  });
-
-  it('refetches metrics when the api key rotates within the same app', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        text: vi.fn().mockResolvedValue('metrics-body-1'),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        text: vi.fn().mockResolvedValue('metrics-body-2'),
-      });
-    vi.stubGlobal('fetch', fetchMock);
-    parsePrometheusTextMock.mockReturnValue([]);
-    authStateRef.current = {
-      apiKey: 'admin-key-1',
-      appId: 'tenant-app',
-    };
-
-    const { wrapper } = createWrapper();
-    const { result, rerender } = renderHook(() => usePrometheusMetrics(), {
-      wrapper,
-    });
-
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-
-    authStateRef.current = {
-      apiKey: 'admin-key-2',
-      appId: 'tenant-app',
-    };
-    rerender();
-
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    expect(fetchMock).toHaveBeenNthCalledWith(2, 'http://backend.test/metrics', {
-      headers: {
-        'x-algolia-application-id': 'tenant-app',
-        'x-algolia-api-key': 'admin-key-2',
-      },
-    });
-  });
-
-  it('does not refetch metrics when auth identity values are unchanged', async () => {
+  it('treats whitespace-only app ids as blank and falls back to flapjack', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       text: vi.fn().mockResolvedValue('metrics-body'),
     });
     vi.stubGlobal('fetch', fetchMock);
     parsePrometheusTextMock.mockReturnValue([]);
-    authStateRef.current = {
-      apiKey: 'stable-admin-key',
-      appId: 'tenant-app',
-    };
+    authStateRef.current = { appId: '   ', isAuthenticated: true };
 
     const { wrapper } = createWrapper();
-    const { result, rerender } = renderHook(() => usePrometheusMetrics(), {
-      wrapper,
-    });
+    const { result } = renderHook(() => usePrometheusMetrics(), { wrapper });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-
-    authStateRef.current = {
-      apiKey: 'stable-admin-key',
-      appId: 'tenant-app',
-    };
-    rerender();
-
-    await waitFor(() => expect(result.current.fetchStatus).toBe('idle'));
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith('/__flapjack_metrics', {
+      credentials: 'include',
+      headers: {
+        'x-algolia-application-id': 'flapjack',
+      },
+    });
   });
 
-  it('stores a non-secret credential fingerprint in the query cache key', async () => {
+  it('refetches metrics when session authentication changes', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       text: vi.fn().mockResolvedValue('metrics-body'),
     });
     vi.stubGlobal('fetch', fetchMock);
     parsePrometheusTextMock.mockReturnValue([]);
-    authStateRef.current = {
-      apiKey: 'super-secret-admin-key',
-      appId: 'tenant-app',
-    };
+
+    const { wrapper } = createWrapper();
+    const { result, rerender } = renderHook(() => usePrometheusMetrics(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    authStateRef.current = { appId: 'flapjack', isAuthenticated: true };
+    rerender();
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+  });
+
+  it('stores the exact non-secret session scope in the query cache key', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      text: vi.fn().mockResolvedValue('metrics-body'),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    parsePrometheusTextMock.mockReturnValue([]);
+    authStateRef.current = { appId: 'tenant-app', isAuthenticated: true };
 
     const { client, wrapper } = createWrapper();
-    const { result } = renderHook(() => usePrometheusMetrics(), {
-      wrapper,
-    });
-
+    const { result } = renderHook(() => usePrometheusMetrics(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     const metricsQuery = client
       .getQueryCache()
       .getAll()
       .find((query) => query.queryKey[0] === 'prometheus-metrics');
-
-    expect(metricsQuery).toBeDefined();
-    expect(String(metricsQuery?.queryKey[2])).toMatch(/^authenticated:/);
-    expect(String(metricsQuery?.queryKey[2])).not.toContain('super-secret-admin-key');
+    expect(metricsQuery?.queryKey).toEqual([
+      'prometheus-metrics',
+      'tenant-app',
+      'session:authenticated',
+    ]);
   });
 
-  it('uses the selector auth snapshot for headers instead of imperative store reads', async () => {
+  it('uses the selector auth snapshot instead of imperative store reads', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       text: vi.fn().mockResolvedValue('metrics-body'),
     });
     vi.stubGlobal('fetch', fetchMock);
     parsePrometheusTextMock.mockReturnValue([]);
-    authStateRef.current = {
-      apiKey: 'selector-admin-key',
-      appId: 'selector-app',
-    };
+    authStateRef.current = { appId: 'selector-app', isAuthenticated: true };
     useAuthMock.getState.mockReturnValue({
-      apiKey: 'imperative-admin-key',
       appId: 'imperative-app',
+      isAuthenticated: false,
     });
 
     const { wrapper } = createWrapper();
-    const { result } = renderHook(() => usePrometheusMetrics(), {
-      wrapper,
-    });
-
+    const { result } = renderHook(() => usePrometheusMetrics(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    expect(fetchMock).toHaveBeenCalledWith('http://backend.test/metrics', {
+    expect(fetchMock).toHaveBeenCalledWith('/__flapjack_metrics', {
+      credentials: 'include',
       headers: {
         'x-algolia-application-id': 'selector-app',
-        'x-algolia-api-key': 'selector-admin-key',
       },
     });
     expect(useAuthMock.getState).not.toHaveBeenCalled();

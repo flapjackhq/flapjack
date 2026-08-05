@@ -16,11 +16,30 @@
  * - Clear All synonyms (cancel to preserve data)
  * - Synonym card structure
  */
+import type { Page } from '@playwright/test';
 import { test, expect } from '../../fixtures/auth.fixture';
 import { TEST_INDEX } from '../helpers';
 import { createSynonym, deleteSynonym } from '../../fixtures/api-helpers';
 
 const SYNONYMS_URL = `/index/${TEST_INDEX}/synonyms`;
+
+async function clickClearAllAndCancel(page: Page): Promise<void> {
+  const clearAllBtn = page.getByRole('button', { name: /clear all/i });
+  await expect(clearAllBtn).toBeVisible({ timeout: 5_000 });
+
+  // Dismiss to avoid actually clearing seeded synonyms
+  page.on('dialog', (dialog) => dialog.dismiss());
+
+  await clearAllBtn.click();
+
+  // Handle custom dialog if present
+  const dialog = page.getByRole('dialog');
+  if (await dialog.isVisible({ timeout: 2_000 }).catch(() => false)) {
+    const cancelBtn = dialog.getByRole('button', { name: /cancel/i });
+    await cancelBtn.click();
+    await expect(dialog).not.toBeVisible({ timeout: 5_000 });
+  }
+}
 
 test.describe('Synonyms', () => {
   test.beforeEach(async ({ page }) => {
@@ -87,7 +106,7 @@ test.describe('Synonyms', () => {
     await expect(page.getByText(/test = testing = qa/).first()).toBeVisible({ timeout: 10_000 });
 
     // Cleanup: delete the synonym via ConfirmDialog
-    const synonymCard = page.getByTestId('synonyms-list').locator('div', { hasText: 'test = testing = qa' }).first();
+    const synonymCard = page.getByTestId('synonym-card').filter({ hasText: 'test = testing = qa' }).first();
     await synonymCard.getByRole('button', { name: /Delete/i }).click();
 
     const confirmDialog = page.getByRole('dialog');
@@ -96,7 +115,7 @@ test.describe('Synonyms', () => {
     await expect(confirmDialog).not.toBeVisible({ timeout: 5_000 });
 
     await expect(
-      page.getByTestId('synonyms-list').locator('div', { hasText: 'test = testing = qa' })
+      page.getByTestId('synonym-card').filter({ hasText: 'test = testing = qa' })
     ).toHaveCount(0, { timeout: 10_000 });
   });
 
@@ -191,24 +210,9 @@ test.describe('Synonyms', () => {
   // ---------- Clear All Synonyms ----------
 
   test('Clear All button shows confirmation and can be cancelled', async ({ page }) => {
-    const clearAllBtn = page.getByRole('button', { name: /clear all/i });
+    await clickClearAllAndCancel(page);
 
-    if (await clearAllBtn.isVisible({ timeout: 5_000 }).catch(() => false)) {
-      // Dismiss to avoid actually clearing seeded synonyms
-      page.on('dialog', (d) => d.dismiss());
-
-      await clearAllBtn.click();
-
-      // Handle custom dialog if present
-      const dialog = page.getByRole('dialog');
-      if (await dialog.isVisible({ timeout: 2_000 }).catch(() => false)) {
-        const cancelBtn = dialog.getByRole('button', { name: /cancel/i });
-        await cancelBtn.click();
-        await expect(dialog).not.toBeVisible({ timeout: 5_000 });
-      }
-
-      // Seeded synonyms should still be visible
-      await expect(page.getByText(/laptop/).first()).toBeVisible();
-    }
+    // Seeded synonyms should still be visible
+    await expect(page.getByText(/laptop/).first()).toBeVisible();
   });
 });

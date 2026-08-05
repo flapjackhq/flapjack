@@ -868,7 +868,12 @@ pub(crate) fn write_parquet_file(path: &Path, batch: RecordBatch) -> Result<(), 
     Ok(())
 }
 
-fn write_parquet_file_atomic(path: &Path, batch: RecordBatch) -> Result<(), String> {
+/// Persist a complete parquet file before atomically publishing it at `path`.
+///
+/// The temporary extension is intentionally not `.parquet`, so concurrent
+/// analytics readers only discover the previous complete file or its complete
+/// replacement.
+pub(crate) fn write_parquet_file_atomic(path: &Path, batch: RecordBatch) -> Result<(), String> {
     reject_symlink_if_exists(path, "parquet destination")?;
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -1,0 +1,10 @@
+HTTP/1.1 200 OK
+content-type: application/json
+vary: origin, access-control-request-method, access-control-request-headers
+x-request-id: e7d9f68b-3f99-41a6-aeae-eb25f1313d60
+content-security-policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'
+x-content-type-options: nosniff
+referrer-policy: no-referrer
+permissions-policy: camera=(), microphone=(), geolocation=()
+content-length: 24
+date: Sun, 02 Aug 2026 02:48:45 GMT

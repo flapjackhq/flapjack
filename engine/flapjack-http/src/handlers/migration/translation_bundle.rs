@@ -19,6 +19,7 @@ use super::push_unique_entry;
 use super::translation_report::{
     hard_entry, warning_entry, ReportCode, ReportResource, TranslationReportEntry,
 };
+use super::typesense_settings::normalize_typesense_settings;
 
 pub(super) const MATCHING_CRITICAL_REPLICA_FIELDS: [&str; 14] = [
     "attributesForFaceting",
@@ -35,19 +36,6 @@ pub(super) const MATCHING_CRITICAL_REPLICA_FIELDS: [&str; 14] = [
     "optionalWords",
     "searchableAttributes",
     "separatorsToIndex",
-];
-type TypesenseSettingValidator = fn(&Value) -> bool;
-const TYPESENSE_REPORTABLE_SETTING_FIELDS: [(&str, TypesenseSettingValidator); 10] = [
-    ("default_sorting_field", typesense_string_or_null),
-    ("enable_nested_fields", typesense_bool_or_null),
-    ("fields", typesense_object_array_or_null),
-    ("token_separators", typesense_string_array_or_null),
-    ("symbols_to_index", typesense_string_array_or_null),
-    ("synonym_sets", typesense_string_array_or_null),
-    ("curation_sets", typesense_string_array_or_null),
-    ("metadata", typesense_object_or_null),
-    ("facet_by", typesense_string_array_or_null),
-    ("query_by", typesense_string_or_null),
 ];
 const NUMERIC_ATTRIBUTES_FOR_FILTERING_FIELD: &str = "numericAttributesForFiltering";
 const NUMERIC_ATTRIBUTES_TO_INDEX_ALIAS: &str = "numericAttributesToIndex";
@@ -69,11 +57,11 @@ pub(in crate::handlers::migration) struct TranslationBundle {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::handlers::migration) struct TypedTranslationFailure {
-    pub(super) code: ReportCode,
-    pub(super) resource: ReportResource,
-    pub(super) page_index: Option<usize>,
-    pub(super) item_index: Option<usize>,
-    pub(super) json_path: String,
+    pub(in crate::handlers::migration) code: ReportCode,
+    pub(in crate::handlers::migration) resource: ReportResource,
+    pub(in crate::handlers::migration) page_index: Option<usize>,
+    pub(in crate::handlers::migration) item_index: Option<usize>,
+    pub(in crate::handlers::migration) json_path: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -668,7 +656,27 @@ pub(in crate::handlers::migration) fn translate_settings_for_provider(
     let settings_value = match provider {
         SettingsSourceProvider::Algolia => settings_value,
         SettingsSourceProvider::Typesense => {
-            return translate_typesense_settings(settings_value, failures, report_entries);
+            let normalized_typesense = match normalize_typesense_settings(settings_value) {
+                Ok(normalized) => normalized,
+                Err(error) => {
+                    failures.push(failure(
+                        ReportCode::MalformedSettingsPayload,
+                        ReportResource::Settings,
+                        None,
+                        None,
+                        error.json_path,
+                    ));
+                    return None;
+                }
+            };
+            for warning in normalized_typesense.warnings {
+                push_unique_entry(report_entries, warning);
+            }
+            let mut settings = translate_settings(&normalized_typesense.value, failures)?;
+            // Typesense has no ranking concept; leaving Flapjack's default ranking
+            // would invent one the source never expressed.
+            settings.ranking = None;
+            return Some(settings);
         }
         SettingsSourceProvider::Meilisearch => {
             normalized = match normalize_meilisearch_settings(settings_value) {
@@ -691,100 +699,6 @@ pub(in crate::handlers::migration) fn translate_settings_for_provider(
         }
     };
     translate_settings(settings_value, failures)
-}
-
-fn translate_typesense_settings(
-    settings_value: &Value,
-    failures: &mut Vec<TypedTranslationFailure>,
-    report_entries: &mut Vec<TranslationReportEntry>,
-) -> Option<IndexSettings> {
-    let Some(settings) = settings_value.as_object() else {
-        failures.push(failure(
-            ReportCode::MalformedSettingsPayload,
-            ReportResource::Settings,
-            None,
-            None,
-            "$".to_string(),
-        ));
-        return None;
-    };
-
-    for (field, value) in settings {
-        if value.is_null() {
-            continue;
-        }
-        let Some(expected) = typesense_setting_validator(field) else {
-            failures.push(failure(
-                ReportCode::MalformedSettingsPayload,
-                ReportResource::Settings,
-                None,
-                None,
-                format!("$.{field}"),
-            ));
-            return None;
-        };
-        if !expected(value) {
-            failures.push(failure(
-                ReportCode::MalformedSettingsPayload,
-                ReportResource::Settings,
-                None,
-                None,
-                format!("$.{field}"),
-            ));
-            return None;
-        }
-    }
-    for (field, _) in TYPESENSE_REPORTABLE_SETTING_FIELDS {
-        if settings.get(field).is_some_and(|value| !value.is_null()) {
-            push_unique_entry(
-                report_entries,
-                warning_entry(
-                    ReportCode::TypesenseSettingNotMigrated,
-                    ReportResource::Settings,
-                    None,
-                    None,
-                    &format!("$.{field}"),
-                ),
-            );
-        }
-    }
-
-    Some(IndexSettings {
-        ranking: None,
-        ..Default::default()
-    })
-}
-
-fn typesense_setting_validator(field: &str) -> Option<TypesenseSettingValidator> {
-    TYPESENSE_REPORTABLE_SETTING_FIELDS
-        .iter()
-        .find_map(|(known_field, validator)| (*known_field == field).then_some(*validator))
-}
-
-fn typesense_string_or_null(value: &Value) -> bool {
-    value.is_null() || value.as_str().is_some()
-}
-
-fn typesense_bool_or_null(value: &Value) -> bool {
-    value.is_null() || value.as_bool().is_some()
-}
-
-fn typesense_object_or_null(value: &Value) -> bool {
-    value.is_null() || value.as_object().is_some()
-}
-
-fn typesense_object_array_or_null(value: &Value) -> bool {
-    value.is_null()
-        || value
-            .as_array()
-            .is_some_and(|items| items.iter().all(Value::is_object))
-}
-
-fn typesense_string_array_or_null(value: &Value) -> bool {
-    value.is_null()
-        || value
-            .as_array()
-            .is_some_and(|items| items.iter().all(|item| item.as_str().is_some()))
 }
 
 fn fold_deprecated_settings_aliases(settings_value: &Value) -> Value {

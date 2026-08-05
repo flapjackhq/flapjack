@@ -55,13 +55,15 @@ impl super::AnalyticsQueryEngine {
         let end_ms = date_to_end_ms(end_date)?;
 
         // Get tracked search count + daily
-        let search_ctx = self.create_session_with_searches(index_name).await?;
+        let ctx = self
+            .create_session_with_searches_and_events(index_name)
+            .await?;
         let search_sql = format!(
             "SELECT COUNT(*) as count FROM searches \
              WHERE timestamp_ms >= {} AND timestamp_ms <= {} AND query_id IS NOT NULL",
             start_ms, end_ms
         );
-        let df = search_ctx
+        let df = ctx
             .sql(&search_sql)
             .await
             .map_err(|e| format!("SQL error: {}", e))?;
@@ -83,7 +85,7 @@ impl super::AnalyticsQueryEngine {
              GROUP BY day_ms ORDER BY day_ms",
             start_ms, end_ms
         );
-        let df = search_ctx
+        let df = ctx
             .sql(&daily_search_sql)
             .await
             .map_err(|e| format!("SQL error: {}", e))?;
@@ -98,13 +100,12 @@ impl super::AnalyticsQueryEngine {
             .unwrap_or_default();
 
         // Get conversion count + daily
-        let events_ctx = self.create_session_with_events(index_name).await?;
         let conv_sql = format!(
             "SELECT COUNT(*) as count FROM events \
              WHERE timestamp_ms >= {} AND timestamp_ms <= {} AND event_type = 'conversion'{}",
             start_ms, end_ms, subtype_filter
         );
-        let conversion_count = match events_ctx.sql(&conv_sql).await {
+        let conversion_count = match ctx.sql(&conv_sql).await {
             Ok(df) => {
                 let batches = df
                     .collect()
@@ -127,24 +128,24 @@ impl super::AnalyticsQueryEngine {
              GROUP BY day_ms ORDER BY day_ms",
             start_ms, end_ms, subtype_filter
         );
-        let daily_convs: std::collections::HashMap<i64, i64> =
-            match events_ctx.sql(&daily_conv_sql).await {
-                Ok(df) => {
-                    let batches = df
-                        .collect()
-                        .await
-                        .map_err(|e| format!("Exec error: {}", e))?;
-                    batches_to_json(&batches)?
-                        .iter()
-                        .filter_map(|r| {
-                            let ms = r.get("day_ms")?.as_i64()?;
-                            let c = r.get("count")?.as_i64()?;
-                            Some((ms, c))
-                        })
-                        .collect()
-                }
-                Err(_) => std::collections::HashMap::new(),
-            };
+        let daily_convs: std::collections::HashMap<i64, i64> = match ctx.sql(&daily_conv_sql).await
+        {
+            Ok(df) => {
+                let batches = df
+                    .collect()
+                    .await
+                    .map_err(|e| format!("Exec error: {}", e))?;
+                batches_to_json(&batches)?
+                    .iter()
+                    .filter_map(|r| {
+                        let ms = r.get("day_ms")?.as_i64()?;
+                        let c = r.get("count")?.as_i64()?;
+                        Some((ms, c))
+                    })
+                    .collect()
+            }
+            Err(_) => std::collections::HashMap::new(),
+        };
 
         let dates: Vec<serde_json::Value> = daily_searches
             .iter()

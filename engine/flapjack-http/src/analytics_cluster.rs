@@ -7,6 +7,7 @@
 use flapjack::analytics::merge;
 use flapjack::analytics::types::{ClusterMetadata, NodeDetail, NodeStatus, PeerResult};
 use flapjack_replication::config::{NodeConfig, PeerConfig};
+use flapjack_replication::peer::REPLICATION_PEER_APPLICATION_ID;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,26 +17,58 @@ pub struct AnalyticsClusterClient {
     node_id: String,
     peers: Vec<PeerConfig>,
     http_client: reqwest::Client,
+    /// Credential this node presents on peer-initiated fan-out (rollup pushes).
+    /// Resolved once at startup; analytics code never reads the environment.
+    /// `None` keeps rollup pushes unauthenticated for `FLAPJACK_NO_AUTH` and
+    /// explicitly-unauthenticated clusters.
+    peer_credential: Option<String>,
 }
 
 impl AnalyticsClusterClient {
-    /// Create a new cluster client from node config.
+    /// Create a new cluster client from node config and the peer credential
+    /// resolved by server startup.
     /// Returns None if no peers are configured (standalone mode).
-    pub fn new(node_config: &NodeConfig) -> Option<Arc<Self>> {
+    pub fn new(node_config: &NodeConfig, peer_credential: Option<String>) -> Option<Arc<Self>> {
         if node_config.peers.is_empty() {
             return None;
         }
 
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
+            // Peer origins are validated before this client is built. Following
+            // redirects would let a peer forward custom API-key headers beyond
+            // that validated origin, including onto cleartext transport.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect("analytics HTTP client with static settings must build");
 
         Some(Arc::new(Self {
             node_id: node_config.node_id.clone(),
             peers: node_config.peers.clone(),
             http_client,
+            peer_credential,
         }))
+    }
+
+    /// Attach peer identity headers to an outbound fan-out request.
+    ///
+    /// Both fan-outs send the same header shape but draw from different
+    /// credential sources: `query_peers` forwards the inbound request's
+    /// credentials, while `push_rollup_to_peers` is a background broadcaster
+    /// with no inbound request and uses the configured peer credential.
+    fn with_peer_identity(
+        request: reqwest::RequestBuilder,
+        api_key: Option<&str>,
+        application_id: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        let request = match api_key {
+            Some(key) => request.header("X-Algolia-API-Key", key),
+            None => request,
+        };
+        match application_id {
+            Some(id) => request.header("X-Algolia-Application-Id", id),
+            None => request,
+        }
     }
 
     /// Query all peers in parallel for an analytics endpoint.
@@ -89,13 +122,11 @@ impl AnalyticsClusterClient {
 
             handles.push(tokio::spawn(async move {
                 let start = Instant::now();
-                let mut req = client.get(&url).header("X-Flapjack-Local-Only", "true");
-                if let Some(key) = &api_key {
-                    req = req.header("X-Algolia-API-Key", key);
-                }
-                if let Some(id) = &app_id {
-                    req = req.header("X-Algolia-Application-Id", id);
-                }
+                let req = Self::with_peer_identity(
+                    client.get(&url).header("X-Flapjack-Local-Only", "true"),
+                    api_key.as_deref(),
+                    app_id.as_deref(),
+                );
                 let result = req.send().await;
 
                 let latency_ms = start.elapsed().as_millis() as u64;
@@ -177,9 +208,17 @@ impl AnalyticsClusterClient {
             let client = self.http_client.clone();
             let payload = rollup_json.clone();
             let peer_id = peer.node_id.clone();
+            let peer_credential = self.peer_credential.clone();
 
             handles.push(tokio::spawn(async move {
-                match client.post(&url).json(&payload).send().await {
+                let request = Self::with_peer_identity(
+                    client.post(&url).json(&payload),
+                    peer_credential.as_deref(),
+                    peer_credential
+                        .as_deref()
+                        .map(|_| REPLICATION_PEER_APPLICATION_ID),
+                );
+                match request.send().await {
                     Ok(resp) if resp.status().is_success() => {
                         tracing::debug!(
                             "[ROLLUP-PUSH] OK peer={} status={}",
@@ -290,6 +329,24 @@ impl AnalyticsClusterClient {
     }
 }
 
+/// Protect caller API keys forwarded by authenticated analytics fan-out.
+///
+/// Replication transport validation normally keys off the configured peer
+/// credential. Analytics queries are different: they preserve the caller's
+/// API key so the remote node applies the same authorization. Every topology
+/// mutation boundary must therefore apply this additional transport premise
+/// even when the explicit unauthenticated-replication escape is active.
+pub(crate) fn validate_authenticated_query_peer_transport(
+    node_id: &str,
+    addr: &str,
+) -> Result<(), String> {
+    NodeConfig::validate_credentialed_peer_transport(
+        node_id,
+        addr,
+        "authenticated analytics query fan-out forwards caller API keys",
+    )
+}
+
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -310,6 +367,79 @@ pub fn get_global_cluster() -> Option<Arc<AnalyticsClusterClient>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn spawn_recording_peer() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test peer must bind before the request is awaited");
+        let addr = listener
+            .local_addr()
+            .expect("bound test peer must expose its address");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("test peer should accept");
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let read = socket
+                    .read(&mut buf)
+                    .await
+                    .expect("test peer should read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&request).to_string());
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
+                .await
+                .expect("test peer should write response");
+            let _ = socket.shutdown().await;
+        });
+
+        (format!("http://{addr}"), rx)
+    }
+
+    fn cluster_for_peer(
+        peer_addr: String,
+        peer_credential: Option<String>,
+    ) -> Arc<AnalyticsClusterClient> {
+        AnalyticsClusterClient::new(
+            &NodeConfig {
+                node_id: "node-a".to_string(),
+                bind_addr: "127.0.0.1:0".to_string(),
+                advertise_addr: None,
+                bootstrap_peer: None,
+                peers: vec![PeerConfig {
+                    node_id: "node-b".to_string(),
+                    addr: peer_addr,
+                }],
+            },
+            peer_credential,
+        )
+        .expect("cluster client should build with a peer")
+    }
+
+    async fn received_request(request_rx: tokio::sync::oneshot::Receiver<String>) -> String {
+        tokio::time::timeout(Duration::from_secs(2), request_rx)
+            .await
+            .expect("peer should receive the request")
+            .expect("peer request channel should stay open")
+    }
+
+    fn header_value<'a>(request: &'a str, header_name: &str) -> Option<&'a str> {
+        request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case(header_name).then(|| value.trim())
+        })
+    }
 
     #[test]
     fn new_returns_none_for_no_peers() {
@@ -320,7 +450,7 @@ mod tests {
             bootstrap_peer: None,
             peers: vec![],
         };
-        assert!(AnalyticsClusterClient::new(&config).is_none());
+        assert!(AnalyticsClusterClient::new(&config, None).is_none());
     }
 
     #[test]
@@ -335,11 +465,135 @@ mod tests {
                 addr: "http://node-b:7700".to_string(),
             }],
         };
-        let client = AnalyticsClusterClient::new(&config);
+        let client = AnalyticsClusterClient::new(&config, None);
         assert!(client.is_some());
         let client = client.unwrap();
         assert_eq!(client.node_id, "node-a");
         assert_eq!(client.peers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn push_rollup_to_peers_uses_query_peer_auth_header_contract() {
+        const PEER_KEY: &str = "stage-2-rollup-peer-secret";
+
+        let (query_peer_addr, query_request_rx) = spawn_recording_peer().await;
+        let query_cluster = cluster_for_peer(query_peer_addr, None);
+        let mut query_headers = axum::http::HeaderMap::new();
+        query_headers.insert(
+            "X-Algolia-API-Key",
+            PEER_KEY
+                .parse()
+                .expect("test peer key must be a header value"),
+        );
+        query_headers.insert(
+            "X-Algolia-Application-Id",
+            REPLICATION_PEER_APPLICATION_ID
+                .parse()
+                .expect("peer application id must be a header value"),
+        );
+
+        let query_results = query_cluster
+            .query_peers("/internal/test-analytics", "", &query_headers)
+            .await;
+        assert_eq!(query_results.len(), 1, "query peer must respond");
+        assert!(
+            query_results[0].data.is_ok(),
+            "query peer response must be valid before comparing headers: {:?}",
+            query_results[0].data
+        );
+        let query_request = received_request(query_request_rx).await;
+        assert_eq!(
+            header_value(&query_request, "X-Algolia-API-Key"),
+            Some(PEER_KEY)
+        );
+        assert_eq!(
+            header_value(&query_request, "X-Algolia-Application-Id"),
+            Some(REPLICATION_PEER_APPLICATION_ID)
+        );
+
+        let (rollup_peer_addr, rollup_request_rx) = spawn_recording_peer().await;
+        let rollup_cluster = cluster_for_peer(rollup_peer_addr, Some(PEER_KEY.to_string()));
+        let rollup = AnalyticsRollup {
+            node_id: "node-a".to_string(),
+            index: "products".to_string(),
+            generated_at_secs: 1_722_600_000,
+            results: HashMap::new(),
+        };
+
+        rollup_cluster.push_rollup_to_peers(&rollup).await;
+        let rollup_request = received_request(rollup_request_rx).await;
+        assert!(
+            rollup_request.starts_with("POST /internal/analytics-rollup HTTP/1.1"),
+            "rollup fan-out must POST to the internal rollup endpoint, got: {rollup_request:?}"
+        );
+        assert_eq!(
+            header_value(&rollup_request, "X-Algolia-API-Key"),
+            header_value(&query_request, "X-Algolia-API-Key"),
+            "rollup fan-out must send the same replication credential as query fan-out"
+        );
+        assert_eq!(
+            header_value(&rollup_request, "X-Algolia-Application-Id"),
+            header_value(&query_request, "X-Algolia-Application-Id"),
+            "rollup fan-out must identify itself with the same peer application id as query fan-out"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_rollup_does_not_follow_peer_redirect() {
+        let target = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("redirect target must bind before the request is sent");
+        let target_addr = target.local_addr().unwrap();
+        let redirector = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("redirecting peer must bind before the request is sent");
+        let redirector_addr = redirector.local_addr().unwrap();
+
+        let redirect_task = tokio::spawn(async move {
+            let (mut socket, _) = redirector.accept().await.unwrap();
+            let _ = read_request_headers(&mut socket).await;
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://{target_addr}/stolen\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let cluster = cluster_for_peer(
+            format!("http://{redirector_addr}"),
+            Some("redirect-sensitive-peer-key".to_string()),
+        );
+        cluster
+            .push_rollup_to_peers(&AnalyticsRollup {
+                node_id: "node-a".to_string(),
+                index: "products".to_string(),
+                generated_at_secs: 1_722_600_000,
+                results: HashMap::new(),
+            })
+            .await;
+        redirect_task.await.unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), target.accept())
+                .await
+                .is_err(),
+            "authenticated analytics requests must stop at redirects instead of forwarding the peer key to a new origin"
+        );
+    }
+
+    async fn read_request_headers(socket: &mut tokio::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let read = socket.read(&mut buf).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&request).to_string()
     }
 
     #[test]

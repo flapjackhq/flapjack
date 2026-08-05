@@ -147,16 +147,56 @@ async fn route_acl_denies_unmapped_route_by_default() {
         StatusCode::FORBIDDEN,
         "registered protected routes with no ACL mapping must not fall through to the downstream handler"
     );
+    assert!(
+        !downstream_ran.load(Ordering::SeqCst),
+        "unmapped protected routes must be denied before the downstream handler runs"
+    );
+}
+
+#[tokio::test]
+async fn unmapped_route_refusal_carries_the_json_error_envelope() {
+    let (_temp_dir, key_store, plaintext_key) =
+        create_non_admin_test_key("Unmapped-route envelope test key");
+
+    let app = Router::new()
+        .route(
+            "/1/definitely-not-a-real-route",
+            get(|| async { StatusCode::OK }),
+        )
+        .layer(axum::middleware::from_fn(|request, next| async move {
+            authenticate_and_authorize(request, next, false).await
+        }))
+        .layer(Extension(key_store));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/1/definitely-not-a-real-route")
+                .header("x-algolia-application-id", "app-id")
+                .header("x-algolia-api-key", &plaintext_key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.contains("application/json"),
+        "unmapped-route refusals must use the shared JSON error envelope"
+    );
     assert_eq!(
         body_json(response).await,
         serde_json::json!({
             "message": "Method not allowed with this API key",
             "status": 403
         })
-    );
-    assert!(
-        !downstream_ran.load(Ordering::SeqCst),
-        "unmapped protected routes must be denied before the downstream handler runs"
     );
 }
 
@@ -475,9 +515,10 @@ async fn privacy_scrub_auth_rejects_normal_admin_and_incomplete_app_material() {
         .unwrap();
     assert_eq!(
         query_private_credential.status(),
-        StatusCode::OK,
-        "privateMigration query-string auth must not be blocked as an admin-ACL route"
+        StatusCode::FORBIDDEN,
+        "privateMigration credentials must not be accepted from URL query strings on privileged migration routes"
     );
+    assert_invalid_api_credentials_response(query_private_credential).await;
 }
 #[tokio::test]
 async fn auth_middleware_secured_key_restrict_sources_rejection_does_not_consume_rate_limit() {

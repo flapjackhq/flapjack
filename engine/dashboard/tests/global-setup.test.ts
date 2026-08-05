@@ -19,17 +19,25 @@ describe('resolvePlaywrightSecretEnvPath', () => {
     expect(resolvePlaywrightSecretEnvPath({ FJ_NO_SECRET_FILE: '1' }, '/repo/engine/dashboard/tests')).toBeUndefined();
   });
 
-  it('uses the explicit FJ_SECRET_FILE path when provided', () => {
+  it('reports an explicit FJ_SECRET_FILE path as explicitly chosen', () => {
     expect(resolvePlaywrightSecretEnvPath(
       { FJ_SECRET_FILE: '/tmp/custom.env' },
       '/repo/engine/dashboard/tests',
-    )).toBe('/tmp/custom.env');
+    )).toEqual({ path: '/tmp/custom.env', explicit: true });
   });
 
-  it('falls back to engine/.secret/.env.secret relative to the tests directory', () => {
-    expect(resolvePlaywrightSecretEnvPath({}, '/repo/engine/dashboard/tests')).toBe(
-      join('/repo/engine/dashboard/tests', '..', '..', '.secret', '.env.secret'),
-    );
+  it('reports the engine/.secret/.env.secret fallback as not explicitly chosen', () => {
+    expect(resolvePlaywrightSecretEnvPath({}, '/repo/engine/dashboard/tests')).toEqual({
+      path: join('/repo/engine/dashboard/tests', '..', '..', '.secret', '.env.secret'),
+      explicit: false,
+    });
+  });
+
+  it('treats an empty FJ_SECRET_FILE as no explicit choice', () => {
+    expect(resolvePlaywrightSecretEnvPath({ FJ_SECRET_FILE: '' }, '/repo/engine/dashboard/tests')).toEqual({
+      path: join('/repo/engine/dashboard/tests', '..', '..', '.secret', '.env.secret'),
+      explicit: false,
+    });
   });
 });
 
@@ -45,10 +53,29 @@ describe('loadPlaywrightSecretEnv', () => {
     expect(dotenvConfig).not.toHaveBeenCalled();
   });
 
-  it('loads the explicit secret file path through dotenv', () => {
+  it('lets the explicit secret file replace stale ambient credential values', () => {
     loadPlaywrightSecretEnv({ FJ_SECRET_FILE: '/tmp/custom.env' }, '/repo/engine/dashboard/tests');
 
-    expect(dotenvConfig).toHaveBeenCalledWith({ path: '/tmp/custom.env' });
+    expect(dotenvConfig).toHaveBeenCalledWith({
+      path: '/tmp/custom.env',
+      override: true,
+    });
+  });
+
+  it('preserves ambient credential values when loading the fallback secret file', () => {
+    loadPlaywrightSecretEnv({}, '/repo/engine/dashboard/tests');
+
+    expect(dotenvConfig).toHaveBeenCalledWith({
+      path: join('/repo/engine/dashboard/tests', '..', '..', '.secret', '.env.secret'),
+    });
+  });
+
+  it('loads the fallback file without override when FJ_SECRET_FILE is set but empty', () => {
+    loadPlaywrightSecretEnv({ FJ_SECRET_FILE: '' }, '/repo/engine/dashboard/tests');
+
+    expect(dotenvConfig).toHaveBeenCalledWith({
+      path: join('/repo/engine/dashboard/tests', '..', '..', '.secret', '.env.secret'),
+    });
   });
 
   it('keeps global setup as the Playwright secret-loading entry point', () => {
@@ -56,6 +83,6 @@ describe('loadPlaywrightSecretEnv', () => {
 
     globalSetup();
 
-    expect(dotenvConfig).toHaveBeenCalledWith({ path: '/tmp/global.env' });
+    expect(dotenvConfig).toHaveBeenCalledWith({ path: '/tmp/global.env', override: true });
   });
 });

@@ -132,6 +132,7 @@ fn make_router(tmp: &TempDir) -> (axum::Router, Arc<AppState>) {
         RouterConfig {
             cors_mode: CorsMode::LoopbackOnly,
             disable_dashboard: true,
+            replication_api_key: None,
         },
     );
     (router, state)

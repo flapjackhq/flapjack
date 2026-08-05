@@ -556,6 +556,73 @@ fn interrupted_export_is_reclaimed_at_original_absolute_expiry() {
     );
 }
 
+#[test]
+fn legacy_interrupted_export_is_not_advertised_as_resumable() {
+    let tmp = TempDir::new().unwrap();
+    let store = export_resume_store(&tmp);
+    let (view, _) = create_legacy_interrupted_export(&store);
+    let legacy_manifest = std::fs::read(store.manifest_path(view.job_uuid)).unwrap();
+
+    let error = store
+        .resumable_export_handle(view.job_uuid)
+        .expect_err("a legacy interrupted export must not expose a resume handle");
+
+    assert_eq!(error.kind(), SpoolErrorKind::UnsupportedSpoolFormat);
+    assert_eq!(
+        std::fs::read(store.manifest_path(view.job_uuid)).unwrap(),
+        legacy_manifest,
+        "checking resume availability must not mutate a legacy manifest"
+    );
+}
+
+#[test]
+fn legacy_interrupted_export_claim_is_rejected_without_lifecycle_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let store = export_resume_store(&tmp);
+    let (view, source_identity_digest) = create_legacy_interrupted_export(&store);
+    let legacy_manifest = std::fs::read(store.manifest_path(view.job_uuid)).unwrap();
+
+    let error = store
+        .claim_interrupted_export(&view.checkpoint_handle, &source_identity_digest)
+        .expect_err("a legacy interrupted export must fail before its lifecycle is claimed");
+
+    assert_eq!(error.kind(), SpoolErrorKind::UnsupportedSpoolFormat);
+    assert_eq!(
+        std::fs::read(store.manifest_path(view.job_uuid)).unwrap(),
+        legacy_manifest,
+        "a rejected legacy claim must leave the Interrupted manifest byte-identical"
+    );
+}
+
+fn create_legacy_interrupted_export(store: &SpoolStore) -> (PublicExportView, String) {
+    let source_identity_digest = hex_digest(b"legacy-interrupted-source");
+    let view = create_export_for_test(
+        store,
+        uuid::Uuid::new_v4(),
+        &source_identity_digest,
+        export_resume_denominators(),
+    )
+    .unwrap();
+    store
+        .interrupt_export(view.job_uuid, &source_identity_digest)
+        .unwrap();
+
+    let manifest_path = store.manifest_path(view.job_uuid);
+    let mut legacy_manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    legacy_manifest
+        .as_object_mut()
+        .unwrap()
+        .remove("spool_format_version");
+    std::fs::write(
+        manifest_path,
+        serde_json::to_vec_pretty(&legacy_manifest).unwrap(),
+    )
+    .unwrap();
+
+    (view, source_identity_digest)
+}
+
 fn commit_one(store: &SpoolStore, job_uuid: Uuid, resource: ObjectResource, id: &str) {
     let payload = format!(r#"[{{"objectID":"{id}"}}]"#);
     match resource {

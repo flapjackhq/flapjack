@@ -1,6 +1,10 @@
 use crate::error::Result;
 use s3::bucket::Bucket;
+use s3::command::Command;
 use s3::creds::Credentials;
+use s3::request::tokio_backend::ReqwestRequest;
+use s3::request::Request as S3Request;
+use s3::serde_types::ListBucketResult;
 use s3::Region;
 
 const SSE_ENV: &str = "FLAPJACK_S3_SSE";
@@ -187,25 +191,64 @@ pub async fn download_latest_snapshot(
 pub async fn list_snapshots(config: &S3Config, index_name: &str) -> Result<Vec<String>> {
     let bucket = config.bucket_internal()?;
     let prefix = format!("snapshots/{}/", index_name);
-    let results = bucket
-        .list(prefix, None)
-        .await
-        .map_err(|e| crate::error::FlapjackError::S3(format!("S3 list: {}", e)))?;
+    let mut continuation_token = None;
+    let mut results = Vec::new();
+    loop {
+        let page = list_snapshot_page(&bucket, prefix.clone(), continuation_token).await?;
+        continuation_token = page.next_continuation_token.clone();
+        results.push(page);
+        if continuation_token.is_none() {
+            break;
+        }
+    }
+
     let mut keys: Vec<String> = results
         .into_iter()
-        .flat_map(|r| r.contents)
+        .flat_map(|page| page.contents)
         .map(|obj| obj.key)
         .collect();
     keys.sort();
     Ok(keys)
 }
 
+async fn list_snapshot_page(
+    bucket: &Bucket,
+    prefix: String,
+    continuation_token: Option<String>,
+) -> Result<ListBucketResult> {
+    let command = Command::ListObjectsV2 {
+        prefix,
+        delimiter: None,
+        continuation_token,
+        start_after: None,
+        max_keys: None,
+    };
+    let request = ReqwestRequest::new(bucket, "/", command)
+        .await
+        .map_err(|error| s3_error("S3 list", error))?;
+    let response = request
+        .response_data(false)
+        .await
+        .map_err(|error| s3_error("S3 list", error))?;
+    let status = response.status_code();
+    if !(200..300).contains(&status) {
+        // Rejected S3 list responses commonly use error XML that does not parse as ListBucketResult.
+        return Err(s3_error("S3 list", format!("HTTP {status}")));
+    }
+
+    quick_xml::de::from_reader(response.as_slice()).map_err(|error| s3_error("S3 list", error))
+}
+
 pub async fn delete_snapshot(config: &S3Config, key: &str) -> Result<()> {
     let bucket = config.bucket_internal()?;
-    bucket
+    let response = bucket
         .delete_object(key)
         .await
-        .map_err(|e| crate::error::FlapjackError::S3(format!("S3 delete: {}", e)))?;
+        .map_err(|error| s3_error("S3 delete", error))?;
+    let status = response.status_code();
+    if !(200..300).contains(&status) {
+        return Err(s3_error("S3 delete", format!("HTTP {status}")));
+    }
     Ok(())
 }
 
@@ -226,7 +269,10 @@ pub async fn enforce_retention(config: &S3Config, index_name: &str, keep: usize)
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+    use wiremock::{
+        matchers::{method, query_param, query_param_is_missing},
+        Mock, MockServer, ResponseTemplate,
+    };
 
     const SSE_HEADER: &str = "x-amz-server-side-encryption";
     const SSE_KMS_KEY_ID_HEADER: &str = "x-amz-server-side-encryption-aws-kms-key-id";
@@ -542,6 +588,186 @@ mod tests {
             put_requests.len(),
             1,
             "rejected upload should still issue exactly one PUT"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn delete_snapshot_fails_loudly_when_bucket_rejects_delete() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let _access_key = EnvVarRestoreGuard::set("AWS_ACCESS_KEY_ID", "test");
+        let _secret_key = EnvVarRestoreGuard::set("AWS_SECRET_ACCESS_KEY", "test");
+
+        let result = delete_snapshot(
+            &test_config(Some(&server.uri())),
+            "snapshots/products/old.tar.gz",
+        )
+        .await;
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("recorded requests should be available");
+        assert_eq!(
+            requests.len(),
+            1,
+            "delete_snapshot should issue exactly one S3 request and no extra traffic, got {:?}",
+            requests
+                .iter()
+                .map(|request| request.method.as_str().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            requests[0].method.as_str(),
+            "DELETE",
+            "the single S3 request should be a DELETE"
+        );
+
+        let error = result.expect_err("rejected delete should return an S3 error");
+        assert!(
+            matches!(error, crate::error::FlapjackError::S3(_)),
+            "rejected delete should return FlapjackError::S3, got {error:?}"
+        );
+        let error = error.to_string();
+        assert!(
+            error.contains("S3 delete"),
+            "delete error should identify S3 delete context, got {error:?}"
+        );
+        assert!(
+            error_identifies_http_status(&error, 403),
+            "delete error should identify HTTP status 403, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn list_snapshots_fails_loudly_when_bucket_rejects_list() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(query_param("list-type", "2"))
+            .and(query_param("prefix", "snapshots/products/"))
+            .and(query_param_is_missing("continuation-token"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                "<Error><Code>AccessDenied</Code><Message>Access denied</Message></Error>",
+            ))
+            .mount(&server)
+            .await;
+
+        let _access_key = EnvVarRestoreGuard::set("AWS_ACCESS_KEY_ID", "test");
+        let _secret_key = EnvVarRestoreGuard::set("AWS_SECRET_ACCESS_KEY", "test");
+
+        let result = list_snapshots(&test_config(Some(&server.uri())), "products").await;
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("recorded requests should be available");
+        assert_eq!(
+            requests.len(),
+            1,
+            "list_snapshots should issue exactly one S3 request and no extra traffic, got {:?}",
+            requests
+                .iter()
+                .map(|request| request.method.as_str().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            requests[0].method.as_str(),
+            "GET",
+            "the single S3 request should be a GET"
+        );
+        assert_eq!(
+            requests[0].url.path(),
+            "/test-bucket/",
+            "list_snapshots should issue a bucket-root ListObjectsV2 request"
+        );
+
+        let error = result.expect_err("rejected list should return an S3 error");
+        assert!(
+            matches!(error, crate::error::FlapjackError::S3(_)),
+            "rejected list should return FlapjackError::S3, got {error:?}"
+        );
+        let error = error.to_string();
+        assert!(
+            error.contains("S3 list"),
+            "list error should identify S3 list context, got {error:?}"
+        );
+        assert!(
+            error_identifies_http_status(&error, 403),
+            "list error should identify HTTP status 403, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn list_snapshots_collects_all_pages_and_sorts_keys() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(query_param("list-type", "2"))
+            .and(query_param("prefix", "snapshots/products/"))
+            .and(query_param_is_missing("continuation-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<ListBucketResult>
+                    <Name>test-bucket</Name>
+                    <Prefix>snapshots/products/</Prefix>
+                    <IsTruncated>true</IsTruncated>
+                    <NextContinuationToken>page-2</NextContinuationToken>
+                    <Contents>
+                        <Key>snapshots/products/20240102T000000Z.tar.gz</Key>
+                        <LastModified>2024-01-02T00:00:00.000Z</LastModified>
+                        <Size>42</Size>
+                    </Contents>
+                </ListBucketResult>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(query_param("list-type", "2"))
+            .and(query_param("prefix", "snapshots/products/"))
+            .and(query_param("continuation-token", "page-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<ListBucketResult>
+                    <Name>test-bucket</Name>
+                    <Prefix>snapshots/products/</Prefix>
+                    <IsTruncated>false</IsTruncated>
+                    <Contents>
+                        <Key>snapshots/products/20240101T000000Z.tar.gz</Key>
+                        <LastModified>2024-01-01T00:00:00.000Z</LastModified>
+                        <Size>42</Size>
+                    </Contents>
+                </ListBucketResult>"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let _access_key = EnvVarRestoreGuard::set("AWS_ACCESS_KEY_ID", "test");
+        let _secret_key = EnvVarRestoreGuard::set("AWS_SECRET_ACCESS_KEY", "test");
+
+        let keys = list_snapshots(&test_config(Some(&server.uri())), "products")
+            .await
+            .expect("paginated list should succeed");
+
+        assert_eq!(
+            keys,
+            vec![
+                "snapshots/products/20240101T000000Z.tar.gz",
+                "snapshots/products/20240102T000000Z.tar.gz",
+            ],
+            "list_snapshots should collect every page and return sorted snapshot keys"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("recorded requests should be available");
+        assert_eq!(
+            requests.len(),
+            2,
+            "paginated list should issue one GET per page"
         );
     }
 }

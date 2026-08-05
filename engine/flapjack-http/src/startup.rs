@@ -3,7 +3,7 @@ use fs2::FileExt;
 use std::fs::OpenOptions;
 use std::io::IsTerminal;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Layer;
 
@@ -11,6 +11,7 @@ use crate::admin_key_persistence::{
     ensure_admin_key_permissions, persist_admin_key_file, PermissionFailureMode,
 };
 use crate::auth::{generate_admin_key, generate_hex_key, KeyStore};
+use flapjack_replication::config::NodeConfig;
 use std::sync::Arc;
 
 /// Controls log output format: human-readable text (default) or structured JSON.
@@ -27,6 +28,11 @@ pub enum CorsMode {
 }
 
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
+/// Escape hatch that permits replication topology without a peer credential.
+/// Temporary rolling-upgrade compatibility only; see
+/// [`validate_replication_peer_credential`].
+const ALLOW_UNAUTHENTICATED_REPLICATION_PEERS_ENV: &str =
+    "FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS";
 const MIN_PRODUCTION_ADMIN_KEY_LENGTH: usize = 16;
 pub const NO_AUTH_PUBLIC_BIND_WARNING: &str = "WARNING: FLAPJACK_NO_AUTH is enabled on a non-loopback or hostname bind address because FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND=1; this exposes unauthenticated Flapjack APIs publicly.";
 
@@ -96,6 +102,7 @@ pub fn validate_startup_auth_policy(
     resolved_bind_addr: &str,
     allow_no_auth_public_bind: bool,
 ) -> Result<StartupAuthValidationOutcome, StartupAuthValidationError> {
+    let env_mode = normalized_env_mode(env_mode);
     if no_auth && env_mode == "production" {
         return Err(StartupAuthValidationError::NoAuthInProduction);
     }
@@ -111,6 +118,14 @@ pub fn validate_startup_auth_policy(
             resolved_bind_addr,
             allow_no_auth_public_bind,
         ),
+    }
+}
+
+fn normalized_env_mode(env_mode: &str) -> &str {
+    if env_mode.trim().eq_ignore_ascii_case("production") {
+        "production"
+    } else {
+        "development"
     }
 }
 
@@ -335,16 +350,53 @@ pub(crate) struct ServerConfig {
     pub disable_dashboard: bool,
     pub allow_no_auth_public_bind: bool,
     pub admin_key_env: Option<String>,
+    pub replication_api_key_env: Option<String>,
     pub data_dir: String,
     pub bind_addr: String,
+    pub tls_paths: Option<TlsPaths>,
+    /// Replication topology, parsed exactly once during config load.
+    /// `server.rs` reuses this value so `node.json` / `FLAPJACK_PEERS` are
+    /// never read (or warned about) twice per process.
+    pub node_config: NodeConfig,
     pub _data_dir_lock: DataDirProcessLock,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsPaths {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
+
+impl TlsPaths {
+    pub fn from_optional_paths<CertPath, KeyPath>(
+        cert_path: Option<CertPath>,
+        key_path: Option<KeyPath>,
+    ) -> Result<Option<Self>, String>
+    where
+        CertPath: Into<PathBuf>,
+        KeyPath: Into<PathBuf>,
+    {
+        match (cert_path, key_path) {
+            (Some(cert_path), Some(key_path)) => Ok(Some(Self {
+                cert_path: cert_path.into(),
+                key_path: key_path.into(),
+            })),
+            (Some(_), None) => {
+                Err("--ssl-cert-path cannot be used without --ssl-key-path".to_string())
+            }
+            (None, Some(_)) => {
+                Err("--ssl-key-path cannot be used without --ssl-cert-path".to_string())
+            }
+            (None, None) => Ok(None),
+        }
+    }
+}
+
 /// Loads startup configuration from environment variables for mode/auth, optional
-/// dashboard lockdown, public no-auth bind override, admin key, data directory,
-/// and bind address, then
+/// dashboard lockdown, public no-auth bind override, admin key, replication peer
+/// API key, data directory, bind address, and optional TLS paths, then
 /// initializes logging and acquires the per-process data directory lock.
-pub(crate) fn load_server_config() -> ServerConfig {
+pub(crate) fn load_server_config() -> Result<ServerConfig, String> {
     let env_mode = std::env::var("FLAPJACK_ENV").unwrap_or_else(|_| "development".into());
     let no_auth = std::env::var("FLAPJACK_NO_AUTH")
         .ok()
@@ -361,28 +413,133 @@ pub(crate) fn load_server_config() -> ServerConfig {
 
     let raw_admin_key_env = std::env::var("FLAPJACK_ADMIN_KEY").ok();
     let admin_key_env = raw_admin_key_env.as_deref().and_then(normalize_admin_key);
+    let raw_replication_api_key_env = std::env::var("FLAPJACK_REPLICATION_API_KEY").ok();
+    let replication_api_key_env =
+        normalize_replication_api_key(raw_replication_api_key_env.as_deref())?;
 
     let data_dir = std::env::var("FLAPJACK_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
-    let data_dir_lock = match acquire_data_dir_process_lock(Path::new(&data_dir)) {
-        Ok(lock) => lock,
-        Err(message) => {
-            eprintln!("ERROR: {}", message);
-            std::process::exit(1);
+    let data_dir_lock = acquire_data_dir_process_lock(Path::new(&data_dir))?;
+
+    let node_config = NodeConfig::load_for_server_startup(Path::new(&data_dir))?;
+    validate_replication_peer_credential(
+        &node_config,
+        replication_api_key_env.as_deref(),
+        Path::new(&data_dir),
+    )?;
+    // Analytics fan-out forwards any caller-supplied API key even in no-auth
+    // mode. Keep every peer behind the credentialed transport policy when the
+    // replication peer key is absent and therefore did not already trigger it.
+    if replication_api_key_env.is_none() {
+        for peer in &node_config.peers {
+            crate::analytics_cluster::validate_authenticated_query_peer_transport(
+                &peer.node_id,
+                &peer.addr,
+            )?;
         }
-    };
+        if let Some(bootstrap_peer) = node_config.bootstrap_peer.as_deref() {
+            if no_auth {
+                crate::analytics_cluster::validate_authenticated_query_peer_transport(
+                    "bootstrap",
+                    bootstrap_peer,
+                )?;
+            } else {
+                NodeConfig::validate_credentialed_peer_transport(
+                    "bootstrap",
+                    bootstrap_peer,
+                    "bootstrap join uses the admin API key",
+                )?;
+            }
+        }
+    }
 
     let bind_addr =
         std::env::var("FLAPJACK_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:7700".to_string());
+    let tls_paths = TlsPaths::from_optional_paths(
+        std::env::var_os("FLAPJACK_SSL_CERT_PATH"),
+        std::env::var_os("FLAPJACK_SSL_KEY_PATH"),
+    )?;
 
-    ServerConfig {
+    Ok(ServerConfig {
         env_mode,
         no_auth,
         disable_dashboard,
         allow_no_auth_public_bind,
         admin_key_env,
+        replication_api_key_env,
         data_dir,
         bind_addr,
+        tls_paths,
+        node_config,
         _data_dir_lock: data_dir_lock,
+    })
+}
+
+/// Refuse to start with replication topology but no outbound peer identity.
+///
+/// Replication fan-out and analytics rollup pushes carry
+/// `FLAPJACK_REPLICATION_API_KEY`. Without it the node emits unauthenticated
+/// peer traffic, so configured topology and a missing peer credential is a
+/// startup error rather than a silent downgrade. Authenticated analytics query
+/// fan-out separately carries the caller's API key and remains transport-safe.
+///
+/// `ALLOW_UNAUTHENTICATED_REPLICATION_PEERS_ENV=1` re-permits startup for
+/// temporary rolling-upgrade compatibility and warns loudly every time. There
+/// is deliberately no implicit `FLAPJACK_NO_AUTH=1` exemption: one rule with
+/// one named escape beats two ways to be unauthenticated.
+fn validate_replication_peer_credential(
+    node_config: &NodeConfig,
+    replication_api_key_env: Option<&str>,
+    data_dir: &Path,
+) -> Result<(), String> {
+    if !node_config.has_replication_intent() || replication_api_key_env.is_some() {
+        return Ok(());
+    }
+
+    let intent = describe_replication_intent(node_config, data_dir);
+    if std::env::var(ALLOW_UNAUTHENTICATED_REPLICATION_PEERS_ENV).as_deref() != Ok("1") {
+        return Err(format!(
+            "replication is configured ({intent}) but FLAPJACK_REPLICATION_API_KEY is unset; \
+             set FLAPJACK_REPLICATION_API_KEY so this node presents a peer identity on outbound \
+             replication and analytics rollup traffic, or set \
+             {ALLOW_UNAUTHENTICATED_REPLICATION_PEERS_ENV}=1 to start unauthenticated"
+        ));
+    }
+
+    tracing::warn!(
+        "WARNING: replication is configured ({intent}) with no FLAPJACK_REPLICATION_API_KEY \
+         because {ALLOW_UNAUTHENTICATED_REPLICATION_PEERS_ENV}=1; this node sends unauthenticated \
+         replication and analytics rollup traffic to its peers. Authenticated analytics queries \
+         still forward caller API keys and therefore require HTTPS peer origins unless the \
+         cleartext override is set. The unauthenticated override is for temporary rolling-upgrade \
+         compatibility only — set FLAPJACK_REPLICATION_API_KEY and unset \
+         {ALLOW_UNAUTHENTICATED_REPLICATION_PEERS_ENV}."
+    );
+    Ok(())
+}
+
+/// Name the configuration that requested replication so startup errors and
+/// warnings point the operator at the input they must fix. Peer source mirrors
+/// `NodeConfig::load_or_default` precedence: `node.json` wins when present.
+fn describe_replication_intent(node_config: &NodeConfig, data_dir: &Path) -> String {
+    if !node_config.peers.is_empty() {
+        let source = if data_dir.join("node.json").exists() {
+            "node.json"
+        } else {
+            "FLAPJACK_PEERS"
+        };
+        let peer_ids: Vec<&str> = node_config
+            .peers
+            .iter()
+            .map(|peer| peer.node_id.as_str())
+            .collect();
+        return format!("peers from {source}: {}", peer_ids.join(", "));
+    }
+    if let Some(bootstrap_peer) = &node_config.bootstrap_peer {
+        return format!("FLAPJACK_BOOTSTRAP_PEER={bootstrap_peer}");
+    }
+    match &node_config.advertise_addr {
+        Some(advertise_addr) => format!("FLAPJACK_ADVERTISE_ADDR={advertise_addr}"),
+        None => "replication intent".to_string(),
     }
 }
 
@@ -441,6 +598,17 @@ fn resolve_admin_key(
 fn normalize_admin_key(raw_key: &str) -> Option<String> {
     let trimmed = raw_key.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn normalize_replication_api_key(raw_key: Option<&str>) -> Result<Option<String>, String> {
+    let Some(key) = raw_key.and_then(normalize_admin_key) else {
+        return Ok(None);
+    };
+    HeaderValue::from_str(&key).map_err(|_| {
+        "FLAPJACK_REPLICATION_API_KEY contains characters that are invalid in an HTTP header"
+            .to_string()
+    })?;
+    Ok(Some(key))
 }
 
 fn warn_on_failed_admin_key_persist(admin_key_file: &Path, key: &str) {
@@ -738,9 +906,25 @@ fn print_auth_disabled_banner() {
     );
 }
 
+pub(crate) struct StartupBannerUrls {
+    pub(crate) base: String,
+    pub(crate) dashboard: String,
+    pub(crate) swagger: String,
+}
+
+pub(crate) fn startup_banner_urls(bind_addr: &str, scheme: &str) -> StartupBannerUrls {
+    let base = format!("{scheme}://{bind_addr}");
+    StartupBannerUrls {
+        dashboard: format!("{base}/dashboard"),
+        swagger: format!("{base}/swagger-ui"),
+        base,
+    }
+}
+
 /// Prints the server startup banner with bind address, auth status, and timing.
 pub(crate) fn print_startup_banner(
     bind_addr: &str,
+    scheme: &str,
     auth: AuthStatus,
     startup_ms: u128,
     data_dir: &str,
@@ -748,7 +932,7 @@ pub(crate) fn print_startup_banner(
     use colored::Colorize;
     use std::io::Write;
 
-    let url = format!("http://{}", bind_addr);
+    let urls = startup_banner_urls(bind_addr, scheme);
     let version = format!("v{}", env!("CARGO_PKG_VERSION"));
     let timing = format!("ready in {}ms", startup_ms);
 
@@ -763,19 +947,17 @@ pub(crate) fn print_startup_banner(
     println!(
         "  {}  Local:      {}",
         "\u{2192}".green(),
-        url.as_str().cyan()
+        urls.base.as_str().cyan()
     );
-    let dash = format!("{}/dashboard", url);
     println!(
         "  {}  Dashboard:  {}",
         "\u{2192}".green(),
-        dash.as_str().cyan()
+        urls.dashboard.as_str().cyan()
     );
-    let docs = format!("{}/swagger-ui", url);
     println!(
         "  {}  API Docs:   {}",
         "\u{2192}".green(),
-        docs.as_str().cyan()
+        urls.swagger.as_str().cyan()
     );
     println!(
         "  {}  {}",
@@ -784,7 +966,7 @@ pub(crate) fn print_startup_banner(
     );
 
     match auth {
-        AuthStatus::NewKey(ref key) => print_new_key_banner(key, &url, data_dir),
+        AuthStatus::NewKey(ref key) => print_new_key_banner(key, &urls.base, data_dir),
         AuthStatus::KeyInFile => print_existing_key_banner(data_dir),
         AuthStatus::Disabled => print_auth_disabled_banner(),
     }

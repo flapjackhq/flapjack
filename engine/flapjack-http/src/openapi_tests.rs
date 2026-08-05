@@ -980,6 +980,56 @@ fn stage7_typed_responses_use_component_schemas() {
 }
 
 #[test]
+fn neutral_source_discovery_metadata_schema_matches_the_wire_contract() {
+    let doc = openapi_json();
+    let summary = doc
+        .pointer("/components/schemas/SourceIndexSummary")
+        .expect("neutral discovery summary schema must be published");
+    let required = summary
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .expect("every stable metadata key must be required")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        required,
+        [
+            "createdAt",
+            "defaultSortingField",
+            "documentCount",
+            "entries",
+            "name",
+            "primaryKey",
+            "updatedAt",
+        ]
+        .into_iter()
+        .collect(),
+        "nullable provider metadata is always serialized and must not be documented as omittable"
+    );
+    assert_eq!(
+        schema_ref(summary, "/properties/createdAt"),
+        Some("#/components/schemas/SourceIndexCreatedAt")
+    );
+    assert_eq!(
+        schema_composition_refs(&doc, "/components/schemas/SourceIndexCreatedAt"),
+        Vec::<&str>::new(),
+        "scalar timestamp variants must be expressed inline, not as missing component references"
+    );
+    let created_at_schema = doc
+        .pointer("/components/schemas/SourceIndexCreatedAt/oneOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("createdAt must publish its string-or-integer scalar union");
+    assert_eq!(
+        created_at_schema
+            .iter()
+            .filter_map(|variant| variant.get("type").and_then(serde_json::Value::as_str))
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["integer", "string"].into_iter().collect()
+    );
+}
+
+#[test]
 fn migration_tag_is_registered_once() {
     let doc = openapi_json();
     let migration_tags = doc

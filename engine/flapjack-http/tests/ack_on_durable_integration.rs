@@ -163,7 +163,7 @@ fn tenant_string_task_ids_for_test(manager: &Arc<IndexManager>, tenant: &str) ->
         .collect()
 }
 
-fn accepted_primary_delete_task_id_for_test(
+fn accepted_new_tenant_task_id_for_test(
     manager: &Arc<IndexManager>,
     tenant: &str,
     baseline_task_ids: &HashSet<String>,
@@ -175,7 +175,7 @@ fn accepted_primary_delete_task_id_for_test(
         .find(|task| !baseline_task_ids.contains(&task.id))
         .map(|task| task.numeric_id)
         .unwrap_or_else(|| {
-            panic!("{context}: delete should create one new primary task id for error reporting")
+            panic!("{context}: request should create one new tenant task id for error reporting")
         })
 }
 
@@ -250,10 +250,17 @@ impl Drop for DurableTimeoutEnvOverrideGuard {
     }
 }
 
+fn recover_poisoned_lock<T>(
+    result: std::sync::LockResult<std::sync::MutexGuard<'_, T>>,
+) -> std::sync::MutexGuard<'_, T> {
+    result.unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn set_durable_timeout_env_for_test(timeout_ms: u64) -> DurableTimeoutEnvOverrideGuard {
-    let lock = DURABLE_TIMEOUT_ENV_LOCK
-        .lock()
-        .expect("durable-timeout env lock should not be poisoned");
+    // A failed assertion must not reduce the rest of this integration target to
+    // setup-only PoisonError failures. The original panic remains reported by the
+    // test harness, while later tests still exercise their contracts.
+    let lock = recover_poisoned_lock(DURABLE_TIMEOUT_ENV_LOCK.lock());
     let previous = std::env::var("FLAPJACK_WRITE_DURABLE_TIMEOUT_MS").ok();
     // SAFETY: Writes are serialized by the process-wide lock above, and the Drop
     // impl restores prior state before releasing that lock.
@@ -272,6 +279,15 @@ fn set_default_durable_timeout_env_for_test() -> DurableTimeoutEnvOverrideGuard 
     // same lock as timeout-injection tests so they never inherit a sibling's
     // intentionally tiny `FLAPJACK_WRITE_DURABLE_TIMEOUT_MS`.
     set_durable_timeout_env_for_test(DEFAULT_WRITE_DURABLE_TIMEOUT_MS_FOR_TEST)
+}
+
+#[test]
+fn test_environment_lock_recovery_preserves_later_test_coverage() {
+    let lock = std::sync::Mutex::new(());
+    let guard = lock.lock().expect("fresh local lock should acquire");
+    let poisoned = std::sync::PoisonError::new(guard);
+    let recovered = recover_poisoned_lock(Err(poisoned));
+    drop(recovered);
 }
 
 #[test]
@@ -299,34 +315,6 @@ fn test_durable_timeout_env_override_requires_isolation() {
         observed, "222",
         "second override should be visible after the first guard releases the lock"
     );
-}
-
-#[cfg(unix)]
-fn set_tenant_permissions_read_only(base: &std::path::Path, tenant: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    let tenant_path = base.join(tenant);
-    // Keep durable admission writable so this seam fails after the task is
-    // accepted, when Tantivy commits into the read-only tenant directory.
-    std::fs::create_dir_all(tenant_path.join("write_admission"))
-        .expect("write admission dir should exist before forcing commit failure");
-    let mut perms = std::fs::metadata(&tenant_path)
-        .expect("tenant dir metadata should exist")
-        .permissions();
-    perms.set_mode(0o555);
-    std::fs::set_permissions(&tenant_path, perms)
-        .expect("tenant dir should become read-only to force commit failure");
-}
-
-#[cfg(unix)]
-fn set_tenant_permissions_writable(base: &std::path::Path, tenant: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    let tenant_path = base.join(tenant);
-    let mut perms = std::fs::metadata(&tenant_path)
-        .expect("tenant dir metadata should exist")
-        .permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&tenant_path, perms)
-        .expect("tenant dir permissions should be restorable");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -437,27 +425,42 @@ async fn test_commit_failure_returns_5xx() {
         "warm-up write should commit before inducing commit failure, got {warmup_status:?}"
     );
 
-    #[cfg(unix)]
-    set_tenant_permissions_read_only(tmp.path(), tenant);
+    let baseline_task_ids = tenant_string_task_ids_for_test(&state.manager, tenant);
+    let _commit_failure = state.manager.fail_next_commit_for_test(tenant);
 
     let write_resp = post_single_doc(&state, tenant, "commit-should-fail").await;
     let write_status = write_resp.status();
     let write_payload = response_json(write_resp).await;
-    let write_task = extract_numeric_task_id(&write_payload, "commit-failure write");
-    let queued_status =
-        wait_for_task_terminal(&state.manager, write_task, Duration::from_secs(5)).await;
+    let accepted_write_task_id = accepted_new_tenant_task_id_for_test(
+        &state.manager,
+        tenant,
+        &baseline_task_ids,
+        "commit-failure write",
+    );
+    let queued_status = wait_for_task_terminal(
+        &state.manager,
+        accepted_write_task_id,
+        Duration::from_secs(5),
+    )
+    .await;
     assert!(
         matches!(queued_status, TaskStatus::Failed(_)),
-        "filesystem seam must produce an actual failed queued task before asserting HTTP contract, got {queued_status:?}"
+        "injected commit failure must produce an actual failed queued task before asserting HTTP contract, got {queued_status:?}"
     );
 
-    #[cfg(unix)]
-    set_tenant_permissions_writable(tmp.path(), tenant);
-
-    assert!(
-        write_status.is_server_error(),
-        "commit failure must surface as 5xx; got {} (false ACK indicates defect)",
-        write_status
+    assert_eq!(
+        write_status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "injected commit failure must surface as exact 500, never a false ACK"
+    );
+    assert_eq!(
+        write_payload,
+        json!({
+            "taskID": accepted_write_task_id,
+            "message": "Internal server error",
+            "status": 500,
+        }),
+        "commit-failure response must preserve the accepted task and sanitized error envelope"
     );
 }
 
@@ -511,7 +514,7 @@ async fn test_delete_object_restart_returns_bounded_503() {
     })
     .await
     .expect("delete task should reach enqueued/processing before induced restart");
-    let accepted_delete_task_id = accepted_primary_delete_task_id_for_test(
+    let accepted_delete_task_id = accepted_new_tenant_task_id_for_test(
         &manager,
         tenant,
         &baseline_task_ids,
@@ -588,22 +591,19 @@ async fn test_delete_object_replica_durable_failure_preserves_task_id() {
     )
     .await;
 
-    #[cfg(unix)]
-    set_tenant_permissions_read_only(tmp.path(), replica);
+    let _replica_commit_failure = manager.fail_next_commit_for_test(replica);
 
     let primary_baseline_task_ids = tenant_string_task_ids_for_test(&manager, tenant);
     let response = delete_single_doc(&state, tenant, "seed-doc")
         .await
         .expect("accepted primary delete must surface mapped durable failure response when replica commit fails");
 
-    #[cfg(unix)]
-    set_tenant_permissions_writable(tmp.path(), replica);
-
-    assert!(
-        response.status().is_server_error(),
-        "replica durable failure must surface as server error"
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "injected replica commit failure must surface as exact 500"
     );
-    let accepted_primary_delete_task_id = accepted_primary_delete_task_id_for_test(
+    let accepted_primary_delete_task_id = accepted_new_tenant_task_id_for_test(
         &manager,
         tenant,
         &primary_baseline_task_ids,
@@ -611,9 +611,13 @@ async fn test_delete_object_replica_durable_failure_preserves_task_id() {
     );
     let response_json = response_json(response).await;
     assert_eq!(
-        response_json["taskID"].as_i64(),
-        Some(accepted_primary_delete_task_id),
-        "accepted delete must preserve the exact primary taskID when replica durable leg fails after primary accept"
+        response_json,
+        json!({
+            "taskID": accepted_primary_delete_task_id,
+            "message": "Internal server error",
+            "status": 500,
+        }),
+        "replica failure must preserve the accepted primary taskID and sanitized error envelope"
     );
 }
 
@@ -677,7 +681,7 @@ async fn test_delete_object_replica_queue_full_preserves_task_id_and_retry_after
         Some("1"),
         "accepted delete with replica QueueFull must preserve Retry-After: 1"
     );
-    let accepted_primary_delete_task_id = accepted_primary_delete_task_id_for_test(
+    let accepted_primary_delete_task_id = accepted_new_tenant_task_id_for_test(
         &manager,
         tenant,
         &primary_baseline_task_ids,

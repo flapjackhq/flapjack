@@ -1,6 +1,6 @@
 use axum::{
-    extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
+    extract::{FromRequestParts, Request},
+    http::{header::CONTENT_TYPE, Extensions, HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -14,6 +14,38 @@ use crate::error_response::json_error;
 pub const DEFAULT_TRUSTED_PROXY_CIDRS: &str = "127.0.0.0/8,::1/128";
 pub const REQUEST_ID_HEADER_NAME: &str = "x-request-id";
 pub const REQUEST_TIMEOUT_MESSAGE: &str = "Request timed out";
+
+/// Marks requests accepted by Flapjack's native TLS listener.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeTlsTransport;
+
+/// Extracted result of the canonical transport-security decision.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TransportSecurity(bool);
+
+impl TransportSecurity {
+    pub(crate) fn is_secure(self) -> bool {
+        self.0
+    }
+}
+
+#[axum::async_trait]
+impl<S> FromRequestParts<S> for TransportSecurity
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(request_is_transport_secure(
+            &parts.headers,
+            &parts.extensions,
+        )))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct RequestId(pub String);
@@ -81,6 +113,31 @@ impl TrustedProxyMatcher {
     pub fn is_empty(&self) -> bool {
         self.networks.is_empty()
     }
+}
+
+/// Whether the request arrived over native TLS or a trusted proxy reported HTTPS.
+///
+/// The single transport-security decision in the process: cookie issuance and every
+/// test read it here rather than re-deriving TLS or proxy state on their own.
+pub(crate) fn request_is_transport_secure(headers: &HeaderMap, extensions: &Extensions) -> bool {
+    if extensions.get::<NativeTlsTransport>().is_some() {
+        return true;
+    }
+
+    let Some(peer) = extensions.get::<axum::extract::ConnectInfo<SocketAddr>>() else {
+        return false;
+    };
+    let Some(trusted_proxies) = extensions.get::<Arc<TrustedProxyMatcher>>() else {
+        return false;
+    };
+
+    // An untrusted peer's forwarding header is attacker-controlled, so the claim is
+    // only honoured once the peer itself is inside the trusted-proxy set.
+    trusted_proxies.is_trusted(peer.0.ip())
+        && headers
+            .get("x-forwarded-proto")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("https"))
 }
 
 fn parse_x_forwarded_for(headers: &HeaderMap) -> Vec<IpAddr> {

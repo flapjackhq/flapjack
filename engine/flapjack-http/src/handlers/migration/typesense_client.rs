@@ -4,6 +4,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
+#[cfg(debug_assertions)]
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;
@@ -14,6 +16,8 @@ pub(super) const DOCUMENT_PAGE_LIMIT: usize = 100;
 pub(super) const MAX_DOCUMENT_PAGES: usize = 10_000;
 pub(super) const MAX_DOCUMENT_ITEMS: usize = 1_000_000;
 pub(super) const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(debug_assertions)]
+pub(super) const TYPESENSE_PREVIEW_LOOPBACK_ENV: &str = "FJ_ENABLE_TYPESENSE_PREVIEW_LOOPBACK";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct TraversalLimits {
@@ -63,6 +67,11 @@ impl TypesenseClientError {
     pub(super) fn safe_message(&self) -> &'static str {
         self.message
     }
+
+    #[cfg(debug_assertions)]
+    pub(super) fn is_endpoint_not_allowed(&self) -> bool {
+        *self == typesense_endpoint_not_allowed()
+    }
 }
 
 impl fmt::Debug for TypesenseClientError {
@@ -79,7 +88,10 @@ pub(super) struct TypesenseClient {
     client: reqwest::Client,
     endpoint_origin: String,
     api_key: String,
-    source_collection: String,
+    /// `None` for credential-scoped source discovery, which enumerates
+    /// collections instead of reading one. Source-bound operations require it
+    /// explicitly so a discovery client can never silently read an empty name.
+    source_collection: Option<String>,
 }
 
 impl TypesenseClient {
@@ -88,21 +100,98 @@ impl TypesenseClient {
         api_key: &str,
         source_collection: &str,
     ) -> Result<Self, TypesenseClientError> {
-        if api_key.is_empty() || source_collection.is_empty() {
-            return Err(TypesenseClientError::new(
-                TypesenseErrorKind::Validation,
-                "Typesense credentials and source collection are required",
-            ));
-        }
-        let target =
-            flapjack::security::vet_typesense_cloud_url_target(endpoint).map_err(|_| {
-                TypesenseClientError::new(
-                    TypesenseErrorKind::Validation,
-                    "Typesense Cloud endpoint is not allowed",
-                )
-            })?;
+        require_source_credentials_and_collection(api_key, source_collection)?;
+        Self::from_vetted_cloud_endpoint(endpoint, api_key, Some(source_collection))
+    }
+
+    /// Build a credential-scoped client for source discovery, which needs API
+    /// credentials but no source collection.
+    pub(super) fn new_discovery(
+        endpoint: &str,
+        api_key: &str,
+    ) -> Result<Self, TypesenseClientError> {
+        require_source_credentials(api_key)?;
+        Self::from_vetted_cloud_endpoint(endpoint, api_key, None)
+    }
+
+    fn from_vetted_cloud_endpoint(
+        endpoint: &str,
+        api_key: &str,
+        source_collection: Option<&str>,
+    ) -> Result<Self, TypesenseClientError> {
+        let target = flapjack::security::vet_typesense_cloud_url_target(endpoint)
+            .map_err(|_| typesense_endpoint_not_allowed())?;
         Self::from_vetted_target(
             &target.host,
+            format!("https://{}", target.host),
+            target.socket_addrs(),
+            api_key,
+            source_collection,
+        )
+    }
+
+    /// Debug-only loopback discovery admission for the live Typesense contract
+    /// fixture, mirroring `MeilisearchClient::new_preview_loopback`: refuse
+    /// before parsing an attacker-controlled endpoint when the opt-in is absent,
+    /// then admit only a literal loopback IP with no credentials, query,
+    /// fragment, or path.
+    #[cfg(debug_assertions)]
+    pub(super) fn new_discovery_preview_loopback(
+        endpoint: &str,
+        api_key: &str,
+    ) -> Result<Self, TypesenseClientError> {
+        Self::from_admitted_loopback_endpoint(endpoint, api_key, None)
+    }
+
+    #[cfg(debug_assertions)]
+    pub(super) fn new_preview_loopback(
+        endpoint: &str,
+        api_key: &str,
+        source_collection: &str,
+    ) -> Result<Self, TypesenseClientError> {
+        Self::from_admitted_loopback_endpoint(endpoint, api_key, Some(source_collection))
+    }
+
+    #[cfg(debug_assertions)]
+    fn from_admitted_loopback_endpoint(
+        endpoint: &str,
+        api_key: &str,
+        source_collection: Option<&str>,
+    ) -> Result<Self, TypesenseClientError> {
+        match source_collection {
+            Some(collection) => require_source_credentials_and_collection(api_key, collection)?,
+            None => require_source_credentials(api_key)?,
+        }
+        // Fail before parsing or vetting attacker-controlled endpoints so the
+        // disabled default cannot trigger DNS resolution as a side effect.
+        if !preview_loopback_enabled() {
+            return Err(typesense_preview_loopback_disabled());
+        }
+        let parsed = reqwest::Url::parse(endpoint).map_err(|_| typesense_endpoint_not_allowed())?;
+        let parsed_host = parsed
+            .host_str()
+            .ok_or_else(typesense_endpoint_not_allowed)?;
+        if parsed_host.eq_ignore_ascii_case("localhost")
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.path() != "/"
+        {
+            return Err(typesense_endpoint_not_allowed());
+        }
+        let ip = parsed_host
+            .parse::<IpAddr>()
+            .map_err(|_| typesense_endpoint_not_allowed())?;
+        if !ip.is_loopback() {
+            return Err(typesense_endpoint_not_allowed());
+        }
+        let target = flapjack::security::vet_outbound_url_target(endpoint, true)
+            .map_err(|_| typesense_endpoint_not_allowed())?
+            .ok_or_else(typesense_endpoint_not_allowed)?;
+        Self::from_vetted_target(
+            &target.host,
+            parsed.origin().ascii_serialization(),
             target.socket_addrs(),
             api_key,
             source_collection,
@@ -111,9 +200,10 @@ impl TypesenseClient {
 
     fn from_vetted_target(
         endpoint_host: &str,
+        endpoint_origin: String,
         endpoint_addresses: Vec<SocketAddr>,
         api_key: &str,
-        source_collection: &str,
+        source_collection: Option<&str>,
     ) -> Result<Self, TypesenseClientError> {
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
@@ -130,9 +220,9 @@ impl TypesenseClient {
             })?;
         Ok(Self {
             client,
-            endpoint_origin: format!("https://{endpoint_host}"),
+            endpoint_origin,
             api_key: api_key.to_string(),
-            source_collection: source_collection.to_string(),
+            source_collection: source_collection.map(str::to_string),
         })
     }
 
@@ -145,10 +235,43 @@ impl TypesenseClient {
     ) -> Result<Self, TypesenseClientError> {
         Self::from_vetted_target(
             endpoint_host,
+            format!("https://{endpoint_host}"),
             endpoint_addresses,
             api_key,
-            source_collection,
+            Some(source_collection),
         )
+    }
+
+    /// Discovery counterpart to [`Self::for_test`]: the same vetted-target
+    /// builder with no source collection bound.
+    #[cfg(test)]
+    pub(super) fn for_discovery_test(
+        endpoint_host: &str,
+        endpoint_origin: String,
+        endpoint_addresses: Vec<SocketAddr>,
+        api_key: &str,
+    ) -> Result<Self, TypesenseClientError> {
+        Self::from_vetted_target(
+            endpoint_host,
+            endpoint_origin,
+            endpoint_addresses,
+            api_key,
+            None,
+        )
+    }
+
+    fn require_source_collection(&self) -> Result<&str, TypesenseClientError> {
+        self.source_collection.as_deref().ok_or_else(|| {
+            TypesenseClientError::new(
+                TypesenseErrorKind::Validation,
+                "Typesense source collection is required",
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn source_collection_for_test(&self) -> Option<&str> {
+        self.source_collection.as_deref()
     }
 
     pub(super) fn build_http_request(
@@ -191,28 +314,92 @@ impl TypesenseClient {
     where
         F: FnMut(Vec<Value>) -> Result<(), TypesenseClientError>,
     {
+        let source_collection = self.require_source_collection()?.to_string();
         let mut transport = ReqwestTransport { owner: self };
-        capture_source_with_transport(&mut transport, &self.source_collection, consume_page).await
+        capture_source_with_transport(&mut transport, &source_collection, consume_page).await
     }
 
     #[allow(dead_code)]
     pub(super) async fn observe_source(
         &self,
     ) -> Result<TypesenseSourceObservation, TypesenseClientError> {
+        let source_collection = self.require_source_collection()?.to_string();
         let mut transport = ReqwestTransport { owner: self };
-        observe_source_with_transport(&mut transport, &self.source_collection).await
+        observe_source_with_transport(&mut transport, &source_collection).await
     }
 
     pub(super) async fn read_source_settings(&self) -> Result<Value, TypesenseClientError> {
+        let source_collection = self.require_source_collection()?.to_string();
         let mut transport = ReqwestTransport { owner: self };
-        read_settings_with_transport(&mut transport, &self.source_collection).await
+        read_settings_with_transport(&mut transport, &source_collection).await
     }
 
     #[allow(dead_code)]
     pub(super) async fn require_read_access(&self) -> Result<(), TypesenseClientError> {
+        let source_collection = self.require_source_collection()?.to_string();
         let mut transport = ReqwestTransport { owner: self };
-        require_read_access_with_transport(&mut transport, &self.source_collection).await
+        require_read_access_with_transport(&mut transport, &source_collection).await
     }
+
+    /// Enumerate every collection the supplied credentials can list.
+    ///
+    /// Discovery is credential-scoped, so it neither requires nor consumes a
+    /// source collection.
+    pub(super) async fn list_collections(
+        &self,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    ) -> Result<Vec<TypesenseCollectionSummary>, TypesenseClientError> {
+        let mut transport = ReqwestTransport { owner: self };
+        list_collections_with_transport(&mut transport, offset, limit).await
+    }
+}
+
+fn typesense_endpoint_not_allowed() -> TypesenseClientError {
+    TypesenseClientError::new(
+        TypesenseErrorKind::Validation,
+        "Typesense Cloud endpoint is not allowed",
+    )
+}
+
+#[cfg(debug_assertions)]
+fn typesense_preview_loopback_disabled() -> TypesenseClientError {
+    TypesenseClientError::new(
+        TypesenseErrorKind::Validation,
+        "Typesense preview loopback endpoint is disabled",
+    )
+}
+
+#[cfg(debug_assertions)]
+fn preview_loopback_enabled() -> bool {
+    matches!(
+        std::env::var(TYPESENSE_PREVIEW_LOOPBACK_ENV).as_deref(),
+        Ok("1")
+    )
+}
+
+/// Credential-only admission for operations that are not bound to one collection.
+fn require_source_credentials(api_key: &str) -> Result<(), TypesenseClientError> {
+    if api_key.is_empty() {
+        return Err(TypesenseClientError::new(
+            TypesenseErrorKind::Validation,
+            "Typesense credentials are required",
+        ));
+    }
+    Ok(())
+}
+
+fn require_source_credentials_and_collection(
+    api_key: &str,
+    source_collection: &str,
+) -> Result<(), TypesenseClientError> {
+    if api_key.is_empty() || source_collection.is_empty() {
+        return Err(TypesenseClientError::new(
+            TypesenseErrorKind::Validation,
+            "Typesense credentials and source collection are required",
+        ));
+    }
+    Ok(())
 }
 
 impl fmt::Debug for TypesenseClient {
@@ -253,6 +440,18 @@ pub(super) struct TypesenseCollection {
     curation_sets: Option<Vec<String>>,
     #[serde(flatten)]
     extra_settings: BTreeMap<String, Value>,
+}
+
+/// One collection as returned by `GET /collections` with the field schema
+/// excluded. Discovery only needs the summary surface, so this deliberately does
+/// not reuse [`TypesenseCollection`], whose required `fields` never arrives.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(super) struct TypesenseCollectionSummary {
+    pub(super) name: String,
+    pub(super) num_documents: u64,
+    pub(super) created_at: u64,
+    #[serde(default)]
+    pub(super) default_sorting_field: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -531,6 +730,31 @@ fn validate_response_status(status: u16) -> Result<(), TypesenseClientError> {
     }
 }
 
+/// Collection discovery is `GET /collections` paginated by `offset`/`limit`.
+/// This is NOT the `page`/`per_page` document-export contract used by
+/// `fetch_document_pages_with_expected_count`; the two must not be conflated.
+/// `exclude_fields=fields` keeps the summary response bounded.
+fn collection_listing_path(offset: Option<u64>, limit: Option<u64>) -> String {
+    let mut query = vec!["exclude_fields=fields".to_string()];
+    if let Some(offset) = offset {
+        query.push(format!("offset={offset}"));
+    }
+    if let Some(limit) = limit {
+        query.push(format!("limit={limit}"));
+    }
+    format!("/collections?{}", query.join("&"))
+}
+
+pub(super) async fn list_collections_with_transport<T: TypesenseTransport>(
+    transport: &mut T,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> Result<Vec<TypesenseCollectionSummary>, TypesenseClientError> {
+    // Typesense returns collections newest-first; the decoded order is the
+    // contract, so this preserves the upstream sequence verbatim.
+    decode_json_value(read_json(transport, &collection_listing_path(offset, limit)).await?)
+}
+
 #[allow(dead_code)]
 pub(super) async fn observe_source_with_transport<T: TypesenseTransport>(
     transport: &mut T,
@@ -736,4 +960,91 @@ fn source_changed_error() -> TypesenseClientError {
         TypesenseErrorKind::Progress,
         "Typesense source changed during export",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct SingleResponseTransport {
+        expected_path: &'static str,
+        response: Option<TypesenseResponse>,
+    }
+
+    impl SingleResponseTransport {
+        fn with_json(expected_path: &'static str, status: u16, body: Value) -> Self {
+            Self {
+                expected_path,
+                response: Some(TypesenseResponse {
+                    status,
+                    body: serde_json::to_vec(&body).expect("test body must serialize"),
+                }),
+            }
+        }
+    }
+
+    impl TypesenseTransport for SingleResponseTransport {
+        fn send<'a>(
+            &'a mut self,
+            request: TypesenseRequest,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<TypesenseResponse, TypesenseClientError>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                assert_eq!(request.method, TypesenseMethod::Get);
+                assert_eq!(request.path, self.expected_path);
+                assert_eq!(request.body, None);
+                self.response.take().ok_or_else(|| {
+                    TypesenseClientError::new(
+                        TypesenseErrorKind::Transport,
+                        "unexpected duplicate Typesense test request",
+                    )
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn list_collections_accepts_offset_without_limit_known_answer() {
+        let mut transport = SingleResponseTransport::with_json(
+            "/collections?exclude_fields=fields&offset=1",
+            200,
+            json!([{
+                "name": "fj_ts_migration_categories",
+                "num_documents": 2,
+                "created_at": 1_785_020_400u64,
+                "default_sorting_field": "priority"
+            }]),
+        );
+
+        let collections = list_collections_with_transport(&mut transport, Some(1), None)
+            .await
+            .expect("offset without limit is a Typesense 30.2 success window");
+
+        assert_eq!(
+            collections,
+            vec![TypesenseCollectionSummary {
+                name: "fj_ts_migration_categories".to_string(),
+                num_documents: 2,
+                created_at: 1_785_020_400,
+                default_sorting_field: Some("priority".to_string()),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_collections_surfaces_exhausted_offset_rejection() {
+        let mut transport = SingleResponseTransport::with_json(
+            "/collections?exclude_fields=fields&offset=2&limit=1",
+            400,
+            json!({ "message": "Invalid offset param." }),
+        );
+
+        let error = list_collections_with_transport(&mut transport, Some(2), Some(1))
+            .await
+            .expect_err("offset equal to collection count is rejected by Typesense 30.2");
+
+        assert_eq!(error.kind(), TypesenseErrorKind::Upstream);
+        assert_eq!(error.safe_message(), "Typesense request failed");
+    }
 }

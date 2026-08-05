@@ -1,12 +1,15 @@
 use super::algolia_client::{should_retry, AlgoliaClientError, AlgoliaErrorKind};
 use super::source_reader::{
-    collect_quiescent_source_snapshot, collect_replica_settings, read_source_snapshot,
-    source_drift_error, MigrationSourceReader, SourceExportSink, SourceIdentity,
+    admit_source_provider, collect_quiescent_source_snapshot, read_source_snapshot,
+    source_drift_error, source_identity_from_reader, MigrationSourceReader,
+    SourceConfigurationArtifact, SourceConfigurationRecord, SourceExportError,
+    SourceExportErrorKind, SourceExportRecord, SourceExportSink, SourceIdentity,
 };
 use super::source_snapshot::{source_item_hash, SourceSnapshot};
 use super::spool::{ExportCheckpoint, ResourceDenominators, SpoolError, SpoolStore};
+use super::AsyncMigrationSourceProvider;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::env;
 use std::fmt;
 use std::fs;
@@ -26,11 +29,9 @@ const EXPORT_CANCEL_REQUESTED_MESSAGE: &str = "Migration export cancellation was
 /// opaque resume handles — never App ID, source name, API key, object IDs, or
 /// raw records.
 ///
-/// `replica_settings` is the one exception to the counts-only shape: it is the
-/// transient map of replica-owned source settings that migration translation
-/// will later consume. It is deliberately excluded from the derived `Debug` (see
-/// the custom impl below) so replica index names and settings values cannot leak
-/// through diagnostics.
+/// Configuration payloads deliberately stay out of this receipt: replica-owned
+/// settings are durable spool artifacts, read back through `AcceptedSpoolReader`
+/// by the translation owner rather than carried in memory alongside the counts.
 #[derive(Clone, PartialEq)]
 pub(super) struct AcceptedExport {
     pub(super) job_uuid: Uuid,
@@ -41,13 +42,10 @@ pub(super) struct AcceptedExport {
     pub(super) documents: u64,
     pub(super) rules: u64,
     pub(super) synonyms: u64,
-    pub(super) replica_settings: BTreeMap<String, Value>,
 }
 
 impl fmt::Debug for AcceptedExport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Only the replica *count* is safe to render; the index names and their
-        // settings values are source material and must never reach a log line.
         formatter
             .debug_struct("AcceptedExport")
             .field("job_uuid", &self.job_uuid)
@@ -58,7 +56,6 @@ impl fmt::Debug for AcceptedExport {
             .field("documents", &self.documents)
             .field("rules", &self.rules)
             .field("synonyms", &self.synonyms)
-            .field("replica_settings_count", &self.replica_settings.len())
             .finish_non_exhaustive()
     }
 }
@@ -80,6 +77,12 @@ impl From<AlgoliaClientError> for ExportError {
     }
 }
 
+impl From<SourceExportError> for ExportError {
+    fn from(error: SourceExportError) -> Self {
+        Self::Source(error.into_inner())
+    }
+}
+
 impl From<SpoolError> for ExportError {
     fn from(error: SpoolError) -> Self {
         Self::Spool(error)
@@ -88,25 +91,27 @@ impl From<SpoolError> for ExportError {
 
 /// Export the selected Algolia source into a fresh durable spool job.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(super) async fn export_algolia_source<R: MigrationSourceReader>(
+pub(super) async fn export_algolia_source<R: MigrationSourceReader + Send>(
     store: &SpoolStore,
     job_uuid: Uuid,
     reader: &mut R,
+    expected_provider: AsyncMigrationSourceProvider,
 ) -> Result<AcceptedExport, ExportError> {
     store.create_migration_phase(job_uuid)?;
-    run_export(store, reader, job_uuid).await
+    run_export(store, reader, job_uuid, expected_provider).await
 }
 
 /// Export for the synchronous public import path. Replica settings are now
 /// translated rather than hard-rejected, so a missing or unavailable replica
 /// settings response is a real source failure and must surface as the typed,
 /// credential-scrubbed Algolia error rather than an empty carried map.
-pub(super) async fn export_algolia_source_for_import<R: MigrationSourceReader>(
+pub(super) async fn export_algolia_source_for_import<R: MigrationSourceReader + Send>(
     store: &SpoolStore,
     job_uuid: Uuid,
     reader: &mut R,
+    expected_provider: AsyncMigrationSourceProvider,
 ) -> Result<AcceptedExport, ExportError> {
-    run_export(store, reader, job_uuid).await
+    run_export(store, reader, job_uuid, expected_provider).await
 }
 
 /// Resume an in-flight export through its opaque checkpoint handle, refusing any
@@ -114,51 +119,72 @@ pub(super) async fn export_algolia_source_for_import<R: MigrationSourceReader>(
 /// route drives resume yet, so this seam is exercised only by the crash/drift
 /// regression tests.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(super) async fn resume_algolia_source<R: MigrationSourceReader>(
+pub(super) async fn resume_algolia_source<R: MigrationSourceReader + Send>(
     store: &SpoolStore,
     reader: &mut R,
     checkpoint_handle: &str,
+    expected_provider: AsyncMigrationSourceProvider,
 ) -> Result<AcceptedExport, ExportError> {
-    let checkpoint = claim_validated_algolia_resume(store, reader, checkpoint_handle).await?;
-    resume_claimed_algolia_source(store, reader, checkpoint).await
+    let checkpoint =
+        claim_validated_algolia_resume(store, reader, checkpoint_handle, expected_provider).await?;
+    resume_claimed_algolia_source(store, reader, checkpoint, expected_provider).await
 }
 
-pub(super) async fn claim_validated_algolia_resume<R: MigrationSourceReader>(
+pub(super) async fn claim_validated_algolia_resume<R: MigrationSourceReader + Send>(
     store: &SpoolStore,
     reader: &mut R,
     checkpoint_handle: &str,
+    expected_provider: AsyncMigrationSourceProvider,
 ) -> Result<ExportCheckpoint, ExportError> {
+    admit_export_provider(reader, expected_provider)?;
     let source_identity = collect_quiescent_source_snapshot(reader).await?;
     store
         .claim_interrupted_export(checkpoint_handle, source_identity.digest())
         .map_err(Into::into)
 }
 
-pub(super) async fn resume_claimed_algolia_source<R: MigrationSourceReader>(
+pub(super) async fn resume_claimed_algolia_source<R: MigrationSourceReader + Send>(
     store: &SpoolStore,
     reader: &mut R,
     checkpoint: ExportCheckpoint,
+    expected_provider: AsyncMigrationSourceProvider,
 ) -> Result<AcceptedExport, ExportError> {
+    admit_export_provider(reader, expected_provider)?;
     run_claimed_resume_after_admission(store, reader, checkpoint).await
+}
+
+/// The durable path's single provider-admission call. It delegates to the shared
+/// `source_reader::admit_source_provider` comparison so preview and export judge
+/// provider identity by exactly one rule, and it runs before any source
+/// observation or spool commit on every durable entry point.
+fn admit_export_provider<R: MigrationSourceReader + ?Sized>(
+    reader: &R,
+    expected_provider: AsyncMigrationSourceProvider,
+) -> Result<(), ExportError> {
+    admit_source_provider(expected_provider, reader.source_provider()).map_err(ExportError::from)
 }
 
 /// Drive an export to completion and settle a fresh run's durable migration phase
 /// on any failure, no matter which post-admission step produced it. Settlement is
 /// centralized here — rather than duplicated across the body's `?` branches — so
 /// no error path can surface while leaving `migration_phase.json` stuck `Running`.
-async fn run_export<R: MigrationSourceReader>(
+async fn run_export<R: MigrationSourceReader + Send>(
     store: &SpoolStore,
     reader: &mut R,
     job_uuid: Uuid,
+    expected_provider: AsyncMigrationSourceProvider,
 ) -> Result<AcceptedExport, ExportError> {
-    let outcome = run_export_after_admission(store, reader, job_uuid).await;
+    let outcome = match admit_export_provider(reader, expected_provider) {
+        Ok(()) => run_export_after_admission(store, reader, job_uuid).await,
+        Err(error) => Err(error),
+    };
     settle_fresh_export(store, Some(job_uuid), outcome)
 }
 
 /// The admitted export body. Every failure returns through `?`; the caller settles
 /// a fresh run's phase, so this stays a single linear path with no scattered
 /// per-branch phase writes.
-async fn run_export_after_admission<R: MigrationSourceReader>(
+async fn run_export_after_admission<R: MigrationSourceReader + Send>(
     store: &SpoolStore,
     reader: &mut R,
     fresh_job_uuid: Uuid,
@@ -184,16 +210,15 @@ async fn run_export_after_admission<R: MigrationSourceReader>(
     ensure_export_not_cancelled(store, job_uuid)?;
 
     match stream_and_accept(store, reader, job_uuid, &pre_identity).await {
-        Ok((documents, rules, synonyms, replica_settings)) => Ok(AcceptedExport {
+        Ok(counts) => Ok(AcceptedExport {
             job_uuid,
             public_handle,
             checkpoint_handle,
             source_index_name: reader.source_name().to_string(),
             source_identity_digest: pre_identity.digest().to_string(),
-            documents,
-            rules,
-            synonyms,
-            replica_settings,
+            documents: counts.documents,
+            rules: counts.rules,
+            synonyms: counts.synonyms,
         }),
         Err(error) => {
             if let Some(source_error) = retryable_source_error(&error) {
@@ -219,7 +244,7 @@ async fn run_export_after_admission<R: MigrationSourceReader>(
     }
 }
 
-async fn run_claimed_resume_after_admission<R: MigrationSourceReader>(
+async fn run_claimed_resume_after_admission<R: MigrationSourceReader + Send>(
     store: &SpoolStore,
     reader: &mut R,
     checkpoint: ExportCheckpoint,
@@ -228,16 +253,15 @@ async fn run_claimed_resume_after_admission<R: MigrationSourceReader>(
     ensure_export_not_cancelled(store, checkpoint.job_uuid)?;
 
     match stream_resume_and_accept(store, reader, &checkpoint).await {
-        Ok((documents, rules, synonyms, replica_settings)) => Ok(AcceptedExport {
+        Ok(counts) => Ok(AcceptedExport {
             job_uuid: checkpoint.job_uuid,
             public_handle,
             checkpoint_handle,
             source_index_name: reader.source_name().to_string(),
             source_identity_digest: checkpoint.source_identity_digest,
-            documents,
-            rules,
-            synonyms,
-            replica_settings,
+            documents: counts.documents,
+            rules: counts.rules,
+            synonyms: counts.synonyms,
         }),
         Err(error) => {
             if let Some(source_error) = retryable_source_error(&error) {
@@ -260,23 +284,18 @@ async fn run_claimed_resume_after_admission<R: MigrationSourceReader>(
     }
 }
 
-async fn stream_resume_and_accept<R: MigrationSourceReader>(
+async fn stream_resume_and_accept<R: MigrationSourceReader + Send>(
     store: &SpoolStore,
     reader: &mut R,
     checkpoint: &ExportCheckpoint,
-) -> Result<(u64, u64, u64, BTreeMap<String, Value>), ExportError> {
+) -> Result<ExportedResourceCounts, ExportError> {
     let job_uuid = checkpoint.job_uuid;
-    reader.wait_for_quiescent_source().await?;
     ensure_export_not_cancelled(store, job_uuid)?;
     let mut sink = SpoolExportSink::open(store, job_uuid, reader.source_name())?;
     let exported = read_source_snapshot(reader, &mut sink)
         .await
         .map_err(export_error_from_source)?;
     ensure_export_not_cancelled(store, job_uuid)?;
-    let primary_settings = sink
-        .committed_settings
-        .take()
-        .ok_or_else(|| ExportError::Source(missing_committed_settings()))?;
     let documents = exported.documents.count as u64;
     let rules = exported.rules.count as u64;
     let synonyms = exported.synonyms.count as u64;
@@ -285,12 +304,19 @@ async fn stream_resume_and_accept<R: MigrationSourceReader>(
     store.complete_rules(job_uuid, rules, &exported.rules.hash)?;
     ensure_export_not_cancelled(store, job_uuid)?;
     store.complete_synonyms(job_uuid, synonyms, &exported.synonyms.hash)?;
-    let replica_settings = collect_replica_settings(reader, &primary_settings)
-        .await
-        .map_err(ExportError::Source)?;
+    ensure_export_not_cancelled(store, job_uuid)?;
+    let final_observation = reader.observe_quiescent_source().await?;
+    let exported_identity = source_identity_from_reader(reader, &final_observation, exported)?;
+    if exported_identity.digest() != checkpoint.source_identity_digest {
+        return Err(ExportError::Source(source_drift_error().into_inner()));
+    }
     ensure_export_not_cancelled(store, job_uuid)?;
     store.accept_export(job_uuid)?;
-    Ok((documents, rules, synonyms, replica_settings))
+    Ok(ExportedResourceCounts {
+        documents,
+        rules,
+        synonyms,
+    })
 }
 
 /// Settle a fresh run's durable migration phase after a failure. A settlement
@@ -328,23 +354,19 @@ fn settle_cancelled_fresh_migration(store: &SpoolStore, job_uuid: Uuid) -> Resul
     Ok(())
 }
 
-async fn stream_and_accept<R: MigrationSourceReader>(
+/// Capture one full export pass into the spool, then prove the source did not
+/// change while it was being read.
+async fn stream_and_accept<R: MigrationSourceReader + Send>(
     store: &SpoolStore,
     reader: &mut R,
     job_uuid: Uuid,
     pre_identity: &SourceIdentity,
-) -> Result<(u64, u64, u64, BTreeMap<String, Value>), ExportError> {
+) -> Result<ExportedResourceCounts, ExportError> {
     let mut sink = SpoolExportSink::open(store, job_uuid, reader.source_name())?;
     let exported = read_source_snapshot(reader, &mut sink)
         .await
         .map_err(export_error_from_source)?;
     ensure_export_not_cancelled(store, job_uuid)?;
-    // Reuse the exact primary settings value committed during this pass; never
-    // issue a second primary-settings request just to read the replicas list.
-    let primary_settings = sink
-        .committed_settings
-        .take()
-        .ok_or_else(|| ExportError::Source(missing_committed_settings()))?;
 
     let documents = exported.documents.count as u64;
     let rules = exported.rules.count as u64;
@@ -359,35 +381,33 @@ async fn stream_and_accept<R: MigrationSourceReader>(
     ensure_export_not_cancelled(store, job_uuid)?;
     store.complete_synonyms(job_uuid, synonyms, &exported.synonyms.hash)?;
 
-    // Collect each replica's complete source settings inside the accepted-state
-    // window — before the final quiescence/drift proof — so the carried map is
-    // bracketed by the same proof as the primary snapshot and cannot be paired
-    // with a later source state. Any fetch failure is fail-closed and keeps its
-    // typed, credential-scrubbed Algolia shape.
-    let replica_settings = collect_replica_settings(reader, &primary_settings)
-        .await
-        .map_err(ExportError::Source)?;
-
     // Pass two: require quiescence again and prove the exported identity equals
     // the pre-snapshot identity. Any difference is source drift. This proof now
-    // runs after the replica fetch, so a source change during replica collection
-    // is caught here rather than silently accepted.
+    // runs after the derived-configuration reads, so a source change during that
+    // collection is caught here rather than silently accepted.
     ensure_export_not_cancelled(store, job_uuid)?;
-    let final_metadata = reader.wait_for_quiescent_source().await?;
+    let final_observation = reader.observe_quiescent_source().await?;
     ensure_export_not_cancelled(store, job_uuid)?;
-    let exported_identity = SourceIdentity::new(
-        reader.app_id(),
-        reader.source_name(),
-        &final_metadata,
-        exported,
-    )?;
+    let exported_identity = source_identity_from_reader(reader, &final_observation, exported)?;
     if *pre_identity != exported_identity {
-        return Err(ExportError::Source(source_drift_error()));
+        return Err(ExportError::Source(source_drift_error().into_inner()));
     }
 
     ensure_export_not_cancelled(store, job_uuid)?;
     store.accept_export(job_uuid)?;
-    Ok((documents, rules, synonyms, replica_settings))
+    Ok(ExportedResourceCounts {
+        documents,
+        rules,
+        synonyms,
+    })
+}
+
+/// The per-resource item counts one capture pass committed, named so the two
+/// capture entry points return a self-describing value instead of a tuple.
+struct ExportedResourceCounts {
+    documents: u64,
+    rules: u64,
+    synonyms: u64,
 }
 
 fn ensure_export_not_cancelled(store: &SpoolStore, job_uuid: Uuid) -> Result<(), ExportError> {
@@ -397,7 +417,8 @@ fn ensure_export_not_cancelled(store: &SpoolStore, job_uuid: Uuid) -> Result<(),
     Ok(())
 }
 
-fn export_error_from_source(error: AlgoliaClientError) -> ExportError {
+fn export_error_from_source(error: SourceExportError) -> ExportError {
+    let error = error.into_inner();
     if is_export_cancel_error(&error) {
         ExportError::Cancelled
     } else {
@@ -429,8 +450,9 @@ fn denominators(snapshot: &SourceSnapshot) -> ResourceDenominators {
     }
 }
 
-/// Streams raw source pages into the spool store, skipping object IDs a prior
-/// run already committed so a resumed traversal writes only the missing items.
+/// Streams captured source artifacts into the spool store, skipping object IDs
+/// a prior run already committed so a resumed traversal writes only the missing
+/// items.
 struct SpoolExportSink<'a> {
     store: &'a SpoolStore,
     job_uuid: Uuid,
@@ -438,10 +460,8 @@ struct SpoolExportSink<'a> {
     completed_documents: HashSet<String>,
     completed_rules: HashSet<String>,
     completed_synonyms: HashSet<String>,
+    completed_replica_settings: HashSet<String>,
     live_drift_barrier_reached: bool,
-    /// The primary settings value seen during this export pass, captured so the
-    /// replica collector can reuse it without a second primary-settings request.
-    committed_settings: Option<Value>,
 }
 
 impl<'a> SpoolExportSink<'a> {
@@ -452,61 +472,134 @@ impl<'a> SpoolExportSink<'a> {
             completed_documents: id_set(store.completed_document_ids(job_uuid)?),
             completed_rules: id_set(store.completed_rule_ids(job_uuid)?),
             completed_synonyms: id_set(store.completed_synonym_ids(job_uuid)?),
+            completed_replica_settings: id_set(store.completed_derived_source_names(job_uuid)?),
             store,
             live_drift_barrier_reached: false,
-            committed_settings: None,
         })
     }
 
-    fn persist_page(
+    /// Persist one derived source's settings as a durable configuration
+    /// artifact, so translation reads it back from the spool rather than from a
+    /// map carried through the acceptance receipt.
+    fn commit_derived_settings(
+        &mut self,
+        source_name: &str,
+        settings: &Value,
+    ) -> Result<(), SourceExportError> {
+        if self.completed_replica_settings.contains(source_name) {
+            return Ok(());
+        }
+        self.store
+            .commit_derived_source_settings(self.job_uuid, source_name, settings)
+            .map_err(spool_stream_error)?;
+        self.completed_replica_settings
+            .insert(source_name.to_string());
+        Ok(())
+    }
+
+    fn commit_settings(&mut self, settings: &Value) -> Result<(), SourceExportError> {
+        self.ensure_not_cancelled()?;
+        let bytes = serde_json::to_vec(settings).map_err(|_| serialize_error())?;
+        let hash = source_item_hash(settings);
+        self.store
+            .commit_settings_once(self.job_uuid, &bytes, &hash)
+            .map_err(spool_stream_error)
+    }
+
+    /// Persist the fresh items of an object page, keyed by the stable IDs the
+    /// neutral capture already validated.
+    fn persist_document_page(
         &self,
-        page: &[Value],
+        page: &[SourceExportRecord],
         completed: &HashSet<String>,
         commit: impl Fn(&[u8], &[&str]) -> Result<(), SpoolError>,
-    ) -> Result<(), AlgoliaClientError> {
-        let fresh: Vec<&Value> = page
+    ) -> Result<(), SourceExportError> {
+        let fresh: Vec<&SourceExportRecord> = page
             .iter()
-            .filter(|item| match object_id(item) {
-                Some(id) => !completed.contains(id),
-                None => true,
-            })
+            .filter(|record| !completed.contains(record.stable_id()))
             .collect();
         if fresh.is_empty() {
             return Ok(());
         }
         let ids = fresh
             .iter()
-            .map(|item| {
-                object_id(item)
-                    .map(str::to_string)
-                    .ok_or_else(missing_object_id)
-            })
-            .collect::<Result<Vec<String>, _>>()?;
+            .map(|record| record.stable_id().to_string())
+            .collect::<Vec<_>>();
         let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-        let bytes = serde_json::to_vec(&fresh).map_err(|_| serialize_error())?;
+        let payloads = fresh
+            .iter()
+            .map(|record| record.identity_payload())
+            .collect::<Vec<_>>();
+        let bytes = serde_json::to_vec(&payloads).map_err(|_| serialize_error())?;
+        commit(&bytes, &id_refs).map_err(spool_stream_error)
+    }
+
+    fn persist_configuration_page(
+        &self,
+        page: &[SourceConfigurationRecord],
+        completed: &HashSet<String>,
+        commit: impl Fn(&[u8], &[&str]) -> Result<(), SpoolError>,
+    ) -> Result<(), SourceExportError> {
+        let fresh: Vec<&SourceConfigurationRecord> = page
+            .iter()
+            .filter(|record| !completed.contains(record.stable_id()))
+            .collect();
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        let ids = fresh
+            .iter()
+            .map(|record| record.stable_id().to_string())
+            .collect::<Vec<_>>();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let payloads = fresh
+            .iter()
+            .map(|record| record.identity_payload())
+            .collect::<Vec<_>>();
+        let bytes = serde_json::to_vec(&payloads).map_err(|_| serialize_error())?;
         commit(&bytes, &id_refs).map_err(spool_stream_error)
     }
 }
 
 impl SourceExportSink for SpoolExportSink<'_> {
-    fn commit_settings(&mut self, settings: &Value) -> Result<(), AlgoliaClientError> {
+    fn commit_configuration(
+        &mut self,
+        artifact: &SourceConfigurationArtifact,
+    ) -> Result<(), SourceExportError> {
         self.ensure_not_cancelled()?;
-        let bytes = serde_json::to_vec(settings).map_err(|_| serialize_error())?;
-        let hash = source_item_hash(settings);
-        self.store
-            .commit_settings_once(self.job_uuid, &bytes, &hash)
-            .map_err(spool_stream_error)?;
-        // Capture the exact committed value so replica collection reuses it.
-        self.committed_settings = Some(settings.clone());
-        Ok(())
+        let (store, job) = (self.store, self.job_uuid);
+        match artifact {
+            SourceConfigurationArtifact::Settings { payload } => self.commit_settings(payload),
+            SourceConfigurationArtifact::Rules { records } => {
+                self.persist_configuration_page(records, &self.completed_rules, |bytes, ids| {
+                    store.commit_rule_page_with_ids(job, bytes, ids)
+                })
+            }
+            SourceConfigurationArtifact::Synonyms { records } => {
+                self.persist_configuration_page(records, &self.completed_synonyms, |bytes, ids| {
+                    store.commit_synonym_page_with_ids(job, bytes, ids)
+                })
+            }
+            // Replica-owned settings belong to indexes derived from this source
+            // rather than to the exported source itself, so they commit as
+            // derived-configuration artifacts outside the job's own resource
+            // completions instead of riding along on the acceptance receipt.
+            SourceConfigurationArtifact::ReplicaSettings {
+                source_name,
+                payload,
+            } => self.commit_derived_settings(source_name, payload),
+        }
     }
 
-    fn commit_document_page(&mut self, page: &[Value]) -> Result<(), AlgoliaClientError> {
+    fn commit_document_page(
+        &mut self,
+        page: &[SourceExportRecord],
+    ) -> Result<(), SourceExportError> {
         self.ensure_not_cancelled()?;
         let (store, job) = (self.store, self.job_uuid);
         let should_wait = !self.live_drift_barrier_reached
             && page_has_fresh_items(page, &self.completed_documents);
-        self.persist_page(page, &self.completed_documents, |bytes, ids| {
+        self.persist_document_page(page, &self.completed_documents, |bytes, ids| {
             store.commit_document_page_with_ids(job, bytes, ids)
         })?;
         if should_wait {
@@ -515,26 +608,10 @@ impl SourceExportSink for SpoolExportSink<'_> {
         }
         Ok(())
     }
-
-    fn commit_rule_page(&mut self, page: &[Value]) -> Result<(), AlgoliaClientError> {
-        self.ensure_not_cancelled()?;
-        let (store, job) = (self.store, self.job_uuid);
-        self.persist_page(page, &self.completed_rules, |bytes, ids| {
-            store.commit_rule_page_with_ids(job, bytes, ids)
-        })
-    }
-
-    fn commit_synonym_page(&mut self, page: &[Value]) -> Result<(), AlgoliaClientError> {
-        self.ensure_not_cancelled()?;
-        let (store, job) = (self.store, self.job_uuid);
-        self.persist_page(page, &self.completed_synonyms, |bytes, ids| {
-            store.commit_synonym_page_with_ids(job, bytes, ids)
-        })
-    }
 }
 
 impl SpoolExportSink<'_> {
-    fn ensure_not_cancelled(&self) -> Result<(), AlgoliaClientError> {
+    fn ensure_not_cancelled(&self) -> Result<(), SourceExportError> {
         match self.store.cancel_requested(self.job_uuid) {
             Ok(false) => Ok(()),
             Ok(true) => Err(export_cancel_requested_error()),
@@ -547,24 +624,12 @@ fn id_set(ids: Vec<String>) -> HashSet<String> {
     ids.into_iter().collect()
 }
 
-fn object_id(item: &Value) -> Option<&str> {
-    item.as_object()
-        .and_then(|object| object.get("objectID"))
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
+fn page_has_fresh_items(page: &[SourceExportRecord], completed: &HashSet<String>) -> bool {
+    page.iter()
+        .any(|item| !completed.contains(item.stable_id()))
 }
 
-fn page_has_fresh_items(page: &[Value], completed: &HashSet<String>) -> bool {
-    page.iter().any(|item| match object_id(item) {
-        Some(id) => !completed.contains(id),
-        None => true,
-    })
-}
-
-fn wait_for_live_drift_barrier(
-    source_name: &str,
-    job_uuid: Uuid,
-) -> Result<(), AlgoliaClientError> {
+fn wait_for_live_drift_barrier(source_name: &str, job_uuid: Uuid) -> Result<(), SourceExportError> {
     let Ok(target_source) = env::var(LIVE_DRIFT_SOURCE_ENV) else {
         return Ok(());
     };
@@ -598,47 +663,32 @@ fn wait_for_live_drift_barrier(
     Err(live_drift_barrier_error())
 }
 
-fn live_drift_barrier_error() -> AlgoliaClientError {
-    use super::algolia_client::AlgoliaErrorKind;
-    AlgoliaClientError::new(
-        AlgoliaErrorKind::Progress,
+fn live_drift_barrier_error() -> SourceExportError {
+    SourceExportError::new(
+        SourceExportErrorKind::Progress,
         "Migration export live drift barrier was not released",
     )
 }
 
-fn missing_committed_settings() -> AlgoliaClientError {
-    use super::algolia_client::AlgoliaErrorKind;
-    AlgoliaClientError::new(
-        AlgoliaErrorKind::Progress,
-        "Migration export did not capture primary settings before replica collection",
+fn serialize_error() -> SourceExportError {
+    SourceExportError::new(
+        SourceExportErrorKind::Schema,
+        "Source item could not be serialized for export",
     )
 }
 
-fn missing_object_id() -> AlgoliaClientError {
-    use super::algolia_client::AlgoliaErrorKind;
-    AlgoliaClientError::new(
-        AlgoliaErrorKind::Schema,
-        "Algolia source item was missing a string objectID",
-    )
-}
-
-fn serialize_error() -> AlgoliaClientError {
-    use super::algolia_client::AlgoliaErrorKind;
-    AlgoliaClientError::new(
-        AlgoliaErrorKind::Schema,
-        "Algolia source item could not be serialized for export",
-    )
-}
-
-fn spool_stream_error(_error: SpoolError) -> AlgoliaClientError {
-    AlgoliaClientError::new(
-        AlgoliaErrorKind::Progress,
+fn spool_stream_error(_error: SpoolError) -> SourceExportError {
+    SourceExportError::new(
+        SourceExportErrorKind::Progress,
         "Migration export could not persist source data",
     )
 }
 
-fn export_cancel_requested_error() -> AlgoliaClientError {
-    AlgoliaClientError::new(AlgoliaErrorKind::Progress, EXPORT_CANCEL_REQUESTED_MESSAGE)
+fn export_cancel_requested_error() -> SourceExportError {
+    SourceExportError::new(
+        SourceExportErrorKind::Progress,
+        EXPORT_CANCEL_REQUESTED_MESSAGE,
+    )
 }
 
 #[cfg(test)]

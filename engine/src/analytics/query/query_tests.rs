@@ -1,6 +1,7 @@
 use super::*;
 use crate::analytics::collector::AnalyticsCollector;
 use crate::analytics::schema::{InsightEvent, SearchEvent};
+use crate::analytics::seed::clear_analytics;
 use crate::analytics::writer::{flush_rollup_window, search_events_to_batch, write_parquet_file};
 use std::collections::BTreeSet;
 use tempfile::TempDir;
@@ -186,6 +187,42 @@ fn find_parquet_files_nested() {
     std::fs::write(dir.path().join("top.parquet"), b"fake").unwrap();
     let files = find_parquet_files(dir.path()).unwrap();
     assert_eq!(files.len(), 2);
+}
+
+#[test]
+fn parquet_presence_check_stops_after_first_matching_partition() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Every partition holds a parquet, so whichever entry the iterator yields
+    // first is a match. Descending into it consumes one root entry plus one leaf
+    // entry, so a lazy walk must find the match well within a small entry budget.
+    for partition in 0..100 {
+        let path = dir.path().join(format!("{partition:02}_partition"));
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("data.parquet"), b"fake").unwrap();
+    }
+
+    // A budget of 4 entries is far below the 100 root partitions. This passes
+    // only if the walk short-circuits after the first match; an implementation
+    // that enumerates every sibling before inspecting the first would exhaust
+    // the budget and return an error.
+    assert!(contains_parquet_file_with_entry_budget(dir.path(), 4).unwrap());
+}
+
+#[test]
+fn parquet_presence_check_errors_when_it_enumerates_past_the_first_match() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // A budget of 1 cannot cover the root entry plus the leaf parquet needed for
+    // even a single descent, so any real walk trips the guard. This proves the
+    // budget is load-bearing and the passing case above is not vacuous.
+    for partition in 0..8 {
+        let path = dir.path().join(format!("{partition:02}_partition"));
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("data.parquet"), b"fake").unwrap();
+    }
+
+    assert!(contains_parquet_file_with_entry_budget(dir.path(), 1).is_err());
 }
 
 // ── arrow_value_at ──
@@ -481,6 +518,17 @@ fn seed_known_answer_dataset(temp_dir: &TempDir) -> AnalyticsConfig {
     write_parquet_file(&parquet_path, batch).unwrap();
 
     config
+}
+
+#[tokio::test]
+async fn status_reports_no_data_after_clear_preserves_empty_roots() {
+    let temp_dir = TempDir::new().unwrap();
+    let config = seed_known_answer_dataset(&temp_dir);
+    let engine = AnalyticsQueryEngine::new(config.clone());
+
+    assert_eq!(engine.status("products").await.unwrap()["hasData"], true);
+    assert_eq!(clear_analytics(&config, "products").unwrap(), 1);
+    assert_eq!(engine.status("products").await.unwrap()["hasData"], false);
 }
 
 fn seed_hourly_spread_dataset(temp_dir: &TempDir) -> AnalyticsConfig {

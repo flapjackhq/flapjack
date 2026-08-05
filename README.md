@@ -192,7 +192,7 @@ InstantSearch.js widgets work as-is — `SearchBox`, `Hits`, `RefinementList`, `
 | Hybrid search | Keyword + vector with Reciprocal Rank Fusion (RRF; same platform caveat as vector search) |
 | A/B testing | Mode A (query overrides), Mode B (index rerouting), interleaving, statistics |
 | Personalization | Event scoring, user profile building, query-time `personalizationImpact` |
-| Recommendations | Related products, bought-together, trending, looking-similar |
+| Recommendations | Related products, bought-together, trending; looking-similar works on every published target, using vector similarity when an embedder is configured and content/term similarity otherwise |
 | AI search / RAG | Chat-style query with LLM reranking (BYO provider) |
 | Analytics | Search events, click tracking, query suggestions, HA fan-out |
 | Federated search | Weighted multi-index queries with RRF merge |

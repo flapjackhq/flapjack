@@ -87,13 +87,6 @@ function getSettingsPanel(page: Page, tabLabel: string) {
   return page.getByRole('tabpanel', { name: tabLabel });
 }
 
-async function getSelectedOptionValues(select: Locator) {
-  return select.evaluate((el) => {
-    const htmlSelect = el as HTMLSelectElement;
-    return Array.from(htmlSelect.selectedOptions, (option) => option.value);
-  });
-}
-
 async function saveSettings(page: Page) {
   const saveBtn = page.getByRole('button', { name: /save/i });
   await expect(saveBtn).toBeVisible({ timeout: 5_000 });
@@ -110,6 +103,47 @@ async function reloadSettings(page: Page, tabLabel: string) {
   await page.reload();
   await expect(page.getByRole('heading', { name: /settings/i })).toBeVisible({ timeout: 10_000 });
   await selectTab(page, tabLabel);
+}
+
+function chooseAlternateQueryType(currentQueryType: string): typeof EXPLICIT_QUERY_TYPE_OPTIONS[number] {
+  const targetQueryType = EXPLICIT_QUERY_TYPE_OPTIONS.find((option) => option !== currentQueryType);
+  if (!targetQueryType) {
+    throw new Error(`No alternate queryType found for current value: ${currentQueryType}`);
+  }
+  return targetQueryType;
+}
+
+function readStringArraySetting(
+  settings: Record<string, unknown>,
+  key: string,
+): string[] {
+  const value = settings[key];
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is string => typeof item === 'string');
+}
+
+function chooseTargetLanguages(originalSettings: Record<string, unknown>): string[] {
+  const originalLanguages = readStringArraySetting(originalSettings, 'queryLanguages');
+  return originalLanguages.join(',') === 'de,es' ? ['en', 'fr'] : ['de', 'es'];
+}
+
+function chooseDistinctAttribute(originalSettings: Record<string, unknown>): string {
+  const originalAttribute = typeof originalSettings.attributeForDistinct === 'string'
+    ? originalSettings.attributeForDistinct
+    : '';
+  return originalAttribute === 'category' ? 'brand' : 'category';
+}
+
+async function ensureSwitchChecked(switchControl: Locator) {
+  if ((await switchControl.getAttribute('aria-checked')) !== 'true') {
+    await switchControl.click();
+  }
+}
+
+function appendFacetAttribute(originalFacets: string, facetAttribute: string): string {
+  return originalFacets ? `${originalFacets}, ${facetAttribute}` : facetAttribute;
 }
 
 test.describe('Settings Page', () => {
@@ -242,11 +276,11 @@ test.describe('Settings Page', () => {
     const toggleChip = getSettingsPanel(page, 'Search').getByTestId(`attr-chip-${SEARCH_TOGGLE_CHIP}`);
     await expect(toggleChip).toBeVisible({ timeout: 10_000 });
 
-    await expect(page.getByRole('button', { name: /reset/i })).not.toBeVisible();
-    await expect(page.getByRole('button', { name: /save/i })).not.toBeVisible();
+    await expect(page.getByRole('button', { name: /reset/i })).toBeHidden();
+    await expect(page.getByRole('button', { name: /save/i })).toBeHidden();
 
     await toggleChip.click();
-    await expect(toggleChip.locator('svg')).toHaveCount(0);
+    await expect(toggleChip).toHaveAttribute('aria-pressed', 'false');
 
     const resetBtn = page.getByRole('button', { name: /reset/i });
     const saveBtn = page.getByRole('button', { name: /save/i });
@@ -256,8 +290,8 @@ test.describe('Settings Page', () => {
     await resetBtn.click();
 
     await expect(resetBtn).not.toBeVisible({ timeout: 5_000 });
-    await expect(saveBtn).not.toBeVisible();
-    await expect(toggleChip.locator('svg')).toHaveCount(1);
+    await expect(saveBtn).toBeHidden();
+    await expect(toggleChip).toHaveAttribute('aria-pressed', 'true');
   });
 
   test('save settings persists changes after reload', async ({ page, request }) => {
@@ -275,7 +309,7 @@ test.describe('Settings Page', () => {
 
       const reloadedToggleChip = getSettingsPanel(page, 'Search').getByTestId(`attr-chip-${SEARCH_TOGGLE_CHIP}`);
       await expect(reloadedToggleChip).toBeVisible({ timeout: 10_000 });
-      await expect(reloadedToggleChip.locator('svg')).toHaveCount(0);
+      await expect(reloadedToggleChip).toHaveAttribute('aria-pressed', 'false');
     } finally {
       await updateSettings(request, settingsTestIndex, originalSettings);
     }
@@ -287,11 +321,7 @@ test.describe('Settings Page', () => {
     const originalSettings = await getSettings(request, settingsTestIndex);
     const queryTypeSelect = getSettingsPanel(page, 'Search').getByRole('combobox');
     const currentQueryType = await queryTypeSelect.inputValue();
-    const targetQueryType = EXPLICIT_QUERY_TYPE_OPTIONS.find((option) => option !== currentQueryType);
-
-    if (!targetQueryType) {
-      throw new Error(`No alternate queryType found for current value: ${currentQueryType}`);
-    }
+    const targetQueryType = chooseAlternateQueryType(currentQueryType);
 
     try {
       await queryTypeSelect.selectOption(targetQueryType);
@@ -309,23 +339,19 @@ test.describe('Settings Page', () => {
     await selectTab(page, 'Language & Text');
 
     const originalSettings = await getSettings(request, settingsTestIndex);
-    const originalLanguages = Array.isArray(originalSettings.queryLanguages)
-      ? originalSettings.queryLanguages.filter((value): value is string => typeof value === 'string')
-      : [];
-    const targetLanguages = originalLanguages.join(',') === 'de,es' ? ['en', 'fr'] : ['de', 'es'];
+    const targetLanguages = chooseTargetLanguages(originalSettings);
 
     try {
       const queryLanguagesSelect = getSettingsPanel(page, 'Language & Text').getByTestId('query-languages-select');
       await queryLanguagesSelect.selectOption(targetLanguages);
-      await expect.poll(async () => getSelectedOptionValues(queryLanguagesSelect)).toEqual(targetLanguages);
+      await expect(queryLanguagesSelect).toHaveValues(targetLanguages);
 
       await saveSettings(page);
       await reloadSettings(page, 'Language & Text');
 
-      const reloadedLanguages = await getSelectedOptionValues(
-        getSettingsPanel(page, 'Language & Text').getByTestId('query-languages-select')
-      );
-      expect(reloadedLanguages).toEqual(targetLanguages);
+      await expect(
+        getSettingsPanel(page, 'Language & Text').getByTestId('query-languages-select'),
+      ).toHaveValues(targetLanguages);
     } finally {
       await updateSettings(request, settingsTestIndex, originalSettings);
     }
@@ -335,18 +361,13 @@ test.describe('Settings Page', () => {
     await selectTab(page, 'Ranking');
 
     const originalSettings = await getSettings(request, settingsTestIndex);
-    const originalAttribute = typeof originalSettings.attributeForDistinct === 'string'
-      ? originalSettings.attributeForDistinct
-      : '';
-    const targetAttribute = originalAttribute === 'category' ? 'brand' : 'category';
+    const targetAttribute = chooseDistinctAttribute(originalSettings);
 
     try {
       const rankingPanel = getSettingsPanel(page, 'Ranking');
       const distinctSwitch = rankingPanel.getByTestId('distinct-enabled-switch');
       await expect(distinctSwitch).toBeVisible();
-      if ((await distinctSwitch.getAttribute('aria-checked')) !== 'true') {
-        await distinctSwitch.click();
-      }
+      await ensureSwitchChecked(distinctSwitch);
 
       const attributeInput = rankingPanel.getByPlaceholder('sku');
       await expect(attributeInput).toBeVisible({ timeout: 5_000 });
@@ -367,11 +388,11 @@ test.describe('Settings Page', () => {
     const searchPanel = getSettingsPanel(page, 'Search');
     const toggleChip = searchPanel.getByTestId(`attr-chip-${SEARCH_TOGGLE_CHIP}`);
     await expect(toggleChip).toBeVisible({ timeout: 10_000 });
-    await expect(toggleChip.locator('svg')).toHaveCount(1);
+    await expect(toggleChip).toHaveAttribute('aria-pressed', 'true');
 
     // Make a draft change on the Search tab
     await toggleChip.click();
-    await expect(toggleChip.locator('svg')).toHaveCount(0);
+    await expect(toggleChip).toHaveAttribute('aria-pressed', 'false');
     await expect(page.getByRole('button', { name: /reset/i })).toBeVisible({ timeout: 5_000 });
 
     // Open JSON view — exercises the currentSettings = { ...settings, ...formData } merge
@@ -387,11 +408,12 @@ test.describe('Settings Page', () => {
     // Reset while still in JSON view — dirty controls should disappear
     await page.getByRole('button', { name: /reset/i }).click();
     await expect(page.getByRole('button', { name: /reset/i })).not.toBeVisible({ timeout: 5_000 });
-    await expect(page.getByRole('button', { name: /save/i })).not.toBeVisible();
+    await expect(page.getByRole('button', { name: /save/i })).toBeHidden();
 
     // Reopen form view — saved value should be restored (formData cleared by Reset)
     await jsonToggle.click();
-    await expect(getSettingsPanel(page, 'Search').getByTestId(`attr-chip-${SEARCH_TOGGLE_CHIP}`).locator('svg')).toHaveCount(1);
+    await expect(getSettingsPanel(page, 'Search').getByTestId(`attr-chip-${SEARCH_TOGGLE_CHIP}`))
+      .toHaveAttribute('aria-pressed', 'true');
   });
 
   test('facets and filters persistence with reindex warning lifecycle', async ({ page, request }) => {
@@ -405,7 +427,7 @@ test.describe('Settings Page', () => {
     try {
       // Append a new facet attribute
       const originalFacets = await facetTextarea.inputValue();
-      const updatedFacets = originalFacets ? `${originalFacets}, tags` : 'tags';
+      const updatedFacets = appendFacetAttribute(originalFacets, 'tags');
       await facetTextarea.fill(updatedFacets);
 
       // "Reindex needed" warning should appear when facets differ from saved
@@ -456,7 +478,7 @@ test.describe('Settings Page', () => {
       // Reset — should restore the persisted value (internal_notes only)
       await page.getByRole('button', { name: /reset/i }).click();
       await expect(page.getByRole('button', { name: /reset/i })).not.toBeVisible({ timeout: 5_000 });
-      await expect(page.getByRole('button', { name: /save/i })).not.toBeVisible();
+      await expect(page.getByRole('button', { name: /save/i })).toBeHidden();
       await expect(reloadedTextarea).toHaveValue('internal_notes');
     } finally {
       await updateSettings(request, settingsTestIndex, originalSettings);

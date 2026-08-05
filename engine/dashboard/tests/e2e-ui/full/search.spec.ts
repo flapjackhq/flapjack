@@ -51,6 +51,48 @@ function extractObjectIds(hits: unknown[] | undefined): string[] {
     .filter((value): value is string => Boolean(value));
 }
 
+async function buildQueryExpectations(
+  request: APIRequestContext,
+  candidateQueries: string[],
+): Promise<Array<{ query: string; expectedObjectIds: string[] }>> {
+  const queryExpectations: Array<{ query: string; expectedObjectIds: string[] }> = [];
+  for (const query of candidateQueries) {
+    const expectedObjectIds = extractObjectIds((await searchIndex(request, TEST_INDEX, query)).hits);
+    if (expectedObjectIds.length > 0) {
+      queryExpectations.push({ query, expectedObjectIds });
+    }
+    if (queryExpectations.length >= 4) {
+      break;
+    }
+  }
+  return queryExpectations;
+}
+
+async function findSynonymPairWithOverlap(
+  request: APIRequestContext,
+  synonymPairs: ReadonlyArray<{ alias: string; canonical: string }>,
+): Promise<{
+  alias: string;
+  canonical: string;
+  overlappingIds: string[];
+} | null> {
+  for (const pair of synonymPairs) {
+    const aliasIds = extractObjectIds((await searchIndex(request, TEST_INDEX, pair.alias)).hits);
+    const canonicalIds = extractObjectIds((await searchIndex(request, TEST_INDEX, pair.canonical)).hits);
+    const overlappingIds = aliasIds.filter((id) => canonicalIds.includes(id));
+
+    if (overlappingIds.length > 0) {
+      return {
+        alias: pair.alias,
+        canonical: pair.canonical,
+        overlappingIds,
+      };
+    }
+  }
+
+  return null;
+}
+
 async function submitSearchQueryAndWaitForTopCard(
   page: Page,
   query: string,
@@ -86,7 +128,9 @@ async function waitForFacetHeadingAndValue(
   await expect(
     facetsPanel.getByRole('heading', { name: new RegExp(`^${headingName}$`, 'i') }),
   ).toBeVisible({ timeout: 15_000 });
-  const facetButton = facetsPanel.locator('button', { hasText: expectedFacetValue }).first();
+  const facetButton = facetsPanel
+    .getByRole('checkbox', { name: new RegExp(expectedFacetValue) })
+    .first();
   await expect(facetButton).toBeVisible({ timeout: 15_000 });
   return facetButton;
 }
@@ -100,7 +144,7 @@ async function submitSearchAndWaitForFacets(
 
   const facetsPanel = page.getByTestId('facets-panel');
   await expect(facetsPanel).toBeVisible({ timeout: 10_000 });
-  await expect(facetsPanel.locator('button').first()).toBeVisible({ timeout: 15_000 });
+  await expect(facetsPanel.getByRole('checkbox').first()).toBeVisible({ timeout: 15_000 });
   return facetsPanel;
 }
 
@@ -122,14 +166,14 @@ async function primeJsonTextareaFromFormBuilder(
   await dialog.getByPlaceholder('Field name').last().fill('name');
   await dialog.getByPlaceholder('Value').last().fill(seedValue);
   await expect
-    .poll(async () => (await dialog.locator('textarea').inputValue()).trim(), {
+    .poll(async () => (await dialog.getByLabel('Documents JSON').inputValue()).trim(), {
       timeout: 5_000,
     })
     .not.toBe('');
 }
 
-function waitForAddDocumentUpdateResponse(page: Page, indexName = TEST_INDEX): Promise<void> {
-  return page.waitForResponse(
+async function waitForAddDocumentUpdateResponse(page: Page, indexName = TEST_INDEX): Promise<void> {
+  await page.waitForResponse(
     (response) => {
       if (response.request().method() !== 'POST') {
         return false;
@@ -140,7 +184,7 @@ function waitForAddDocumentUpdateResponse(page: Page, indexName = TEST_INDEX): P
       return [200, 202].includes(response.status());
     },
     { timeout: 15_000 },
-  ).then(() => undefined);
+  );
 }
 
 async function addDocumentViaJsonDialog(
@@ -154,7 +198,7 @@ async function addDocumentViaJsonDialog(
     dialog,
     typeof document.name === 'string' ? document.name : String(document.objectID ?? 'temporary document'),
   );
-  await dialog.locator('textarea').fill(JSON.stringify(document, null, 2));
+  await dialog.getByLabel('Documents JSON').fill(JSON.stringify(document, null, 2));
   await dialog.getByRole('button', { name: /^Add Document$/ }).click();
   await updateResponse;
   await expect(dialog).not.toBeVisible({ timeout: 10_000 });
@@ -228,7 +272,7 @@ test.describe('Search & Browse', () => {
     const resultsPanel = page.getByTestId('results-panel');
     await expect(resultsPanel).toBeVisible({ timeout: 10000 });
     await expect(resultsPanel.getByTestId('document-card').first()).toBeVisible({ timeout: 10_000 });
-    await expect(audioBtn.locator('svg')).toBeVisible({ timeout: 10_000 });
+    await expect(audioBtn).toBeChecked();
   });
 
   // ---------------------------------------------------------------------------
@@ -266,10 +310,10 @@ test.describe('Search & Browse', () => {
     const facetsPanel = page.getByTestId('facets-panel');
     await expect(facetsPanel).toBeVisible({ timeout: 10000 });
 
-    // Apply the first available facet filter, then clear it.
-    const firstFacetButton = facetsPanel.getByRole('button').first();
-    await expect(firstFacetButton).toBeVisible({ timeout: 15_000 });
-    await firstFacetButton.click();
+    // Apply a known facet filter, then clear it.
+    const appleFacetCheckbox = await waitForFacetHeadingAndValue(facetsPanel, 'brand', 'Apple');
+    await appleFacetCheckbox.click();
+    await expect(appleFacetCheckbox).toHaveAttribute('aria-checked', 'true');
 
     const resultsPanel = page.getByTestId('results-panel');
     const filteredCards = resultsPanel.getByTestId('document-card');
@@ -375,7 +419,7 @@ test.describe('Search & Browse', () => {
       // Pagination controls currently render icon-only buttons in the indicator container.
       // Click the enabled navigation button and assert page transition after real network activity.
       const paginationContainer = resultsPanel.getByTestId('pagination-controls');
-      const nextButton = paginationContainer.locator('button:not([disabled])').first();
+      const nextButton = paginationContainer.getByRole('button', { name: 'Next page' });
       await expect(nextButton).toBeVisible({ timeout: 5_000 });
       await expect(nextButton).toBeEnabled();
       const currentPageTopId = await readVisibleObjectId(resultsPanel.getByTestId('document-card').first());
@@ -536,16 +580,7 @@ test.describe('Search & Browse', () => {
   // ---------------------------------------------------------------------------
   test('different searches return distinct result sets', async ({ page, request }) => {
     const candidateQueries = ['laptop', 'keyboard', 'tablet', 'apple', 'samsung', 'headphones'];
-    const queryExpectations: Array<{ query: string; expectedObjectIds: string[] }> = [];
-    for (const query of candidateQueries) {
-      const expectedObjectIds = extractObjectIds((await searchIndex(request, TEST_INDEX, query)).hits);
-      if (expectedObjectIds.length > 0) {
-        queryExpectations.push({ query, expectedObjectIds });
-      }
-      if (queryExpectations.length >= 4) {
-        break;
-      }
-    }
+    const queryExpectations = await buildQueryExpectations(request, candidateQueries);
     expect(queryExpectations.length).toBeGreaterThanOrEqual(2);
 
     const seenTopIds = new Set<string>();
@@ -571,28 +606,7 @@ test.describe('Search & Browse', () => {
       { alias: 'notebook', canonical: 'laptop' },
     ] as const;
 
-    let selectedPair:
-      | {
-          alias: string;
-          canonical: string;
-          overlappingIds: string[];
-        }
-      | null = null;
-
-    for (const pair of synonymPairs) {
-      const aliasIds = extractObjectIds((await searchIndex(request, TEST_INDEX, pair.alias)).hits);
-      const canonicalIds = extractObjectIds((await searchIndex(request, TEST_INDEX, pair.canonical)).hits);
-      const overlappingIds = aliasIds.filter((id) => canonicalIds.includes(id));
-
-      if (overlappingIds.length > 0) {
-        selectedPair = {
-          alias: pair.alias,
-          canonical: pair.canonical,
-          overlappingIds,
-        };
-        break;
-      }
-    }
+    const selectedPair = await findSynonymPairWithOverlap(request, synonymPairs);
 
     expect(selectedPair).not.toBeNull();
     const pair = selectedPair as {
@@ -625,8 +639,13 @@ test.describe('Search & Browse', () => {
   // ---------------------------------------------------------------------------
   // Synonym: search "earbuds" returns headphone results
   // ---------------------------------------------------------------------------
-  test('synonym "earbuds" returns headphone results', async ({ page }) => {
-    await submitSearchQueryAndWaitForTopCard(page, 'earbuds');
+  test('synonym "earbuds" returns headphone results', async ({ page, request }) => {
+    const expectedHeadphoneObjectIds = extractObjectIds((await searchIndex(request, TEST_INDEX, 'headphones')).hits);
+    expect(expectedHeadphoneObjectIds.length).toBeGreaterThan(0);
+
+    const firstCard = await submitSearchQueryAndWaitForTopCard(page, 'earbuds');
+    const topObjectId = await readVisibleObjectId(firstCard);
+    expect(expectedHeadphoneObjectIds).toContain(topObjectId);
   });
 
   // ---------------------------------------------------------------------------
@@ -636,7 +655,7 @@ test.describe('Search & Browse', () => {
     const facetsPanel = await submitSearchAndWaitForFacets(page, 'laptop');
     await waitForFacetHeadingAndValue(facetsPanel, 'category', 'Laptops');
 
-    const categoryButtons = facetsPanel.locator('button');
+    const categoryButtons = facetsPanel.getByRole('checkbox');
     await expect(categoryButtons.first()).toBeVisible({ timeout: 10_000 });
     const count = await categoryButtons.count();
     expect(count).toBeGreaterThanOrEqual(1);
@@ -649,7 +668,7 @@ test.describe('Search & Browse', () => {
     const facetsPanel = await submitSearchAndWaitForFacets(page, 'laptop');
     await waitForFacetHeadingAndValue(facetsPanel, 'brand', 'Apple');
 
-    const brandButtons = facetsPanel.locator('button');
+    const brandButtons = facetsPanel.getByRole('checkbox');
     await expect(brandButtons.first()).toBeVisible({ timeout: 10_000 });
   });
 
@@ -661,7 +680,7 @@ test.describe('Search & Browse', () => {
 
     // Facet buttons should show numeric count badges (e.g., "Tablets 2" or "Apple 3")
     // Check that at least one facet button contains a number
-    const firstFacetBtn = facetsPanel.locator('button').first();
+    const firstFacetBtn = facetsPanel.getByRole('checkbox').first();
     const btnText = await firstFacetBtn.textContent();
     expect(btnText).toMatch(/\d+/);
   });

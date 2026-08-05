@@ -12,6 +12,8 @@ const FNV64_PRIME: u64 = 0x100000001b3;
 thread_local! {
     static COMPLETED_ID_CHECKPOINT_WRITES: RefCell<Vec<CompletedIdCheckpointWrite>> =
         const { RefCell::new(Vec::new()) };
+    static COMPLETED_ID_SIDECAR_READS: RefCell<Vec<ObjectResource>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -38,6 +40,21 @@ pub(super) fn completed_id_checkpoint_writes_for_tests() -> Vec<CompletedIdCheck
 #[cfg(test)]
 fn record_completed_id_checkpoint_write(write: CompletedIdCheckpointWrite) {
     COMPLETED_ID_CHECKPOINT_WRITES.with(|writes| writes.borrow_mut().push(write));
+}
+
+#[cfg(test)]
+pub(super) fn reset_completed_id_sidecar_reads_for_tests() {
+    COMPLETED_ID_SIDECAR_READS.with(|reads| reads.borrow_mut().clear());
+}
+
+#[cfg(test)]
+pub(super) fn completed_id_sidecar_reads_for_tests() -> Vec<ObjectResource> {
+    COMPLETED_ID_SIDECAR_READS.with(|reads| reads.borrow().clone())
+}
+
+#[cfg(test)]
+fn record_completed_id_sidecar_read(resource: ObjectResource) {
+    COMPLETED_ID_SIDECAR_READS.with(|reads| reads.borrow_mut().push(resource));
 }
 
 impl SpoolStore {
@@ -314,6 +331,8 @@ impl SpoolStore {
         sidecar: &SidecarManifest,
         resource: ObjectResource,
     ) -> SpoolResult<CompletedSidecarSnapshot> {
+        #[cfg(test)]
+        record_completed_id_sidecar_read(resource);
         let path = self.resource_sidecar_path(job_uuid, resource);
         if !path.exists() {
             return if sidecar.length == 0 && sidecar.count == 0 {

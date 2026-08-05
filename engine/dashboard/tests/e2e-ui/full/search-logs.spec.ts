@@ -18,6 +18,7 @@
  * - Export button visible
  * - Request count badge accuracy
  */
+import type { Page } from '@playwright/test';
 import { test, expect, TEST_INDEX, API_BASE, gotoOverviewPage } from '../helpers';
 
 test.describe('Search Logs', () => {
@@ -25,12 +26,25 @@ test.describe('Search Logs', () => {
    * Helper: visit /overview first to generate real API calls (indexes, health),
    * wait for the page to fully load, then navigate to /logs.
    */
-  async function generateLogsAndNavigate(page: import('@playwright/test').Page) {
+  async function generateLogsAndNavigate(page: Page) {
     await gotoOverviewPage(page);
     await expect(page.getByText(TEST_INDEX).first()).toBeVisible({ timeout: 15000 });
 
     await page.goto('/logs');
     await expect(page.getByRole('heading', { name: /api log/i })).toBeVisible();
+  }
+
+  async function confirmClearLogsIfPrompted(page: Page): Promise<void> {
+    const dialog = page.getByRole('dialog');
+    if (await dialog.isVisible({ timeout: 1000 }).catch(() => false)) {
+      await dialog.getByRole('button', { name: /clear|confirm/i }).click();
+    }
+  }
+
+  async function expandPostLogEntry(page: Page): Promise<void> {
+    const postEntry = page.getByRole('button', { name: /\bPOST\b/ }).first();
+    await expect(postEntry).toBeVisible({ timeout: 5_000 });
+    await postEntry.click();
   }
 
   test('logs appear after visiting other pages that trigger API calls', async ({ page }) => {
@@ -84,13 +98,10 @@ test.describe('Search Logs', () => {
     await page.getByRole('main').getByRole('button', { name: /clear/i }).click();
 
     // If a confirmation dialog appears, confirm it
-    const dialog = page.getByRole('dialog');
-    if (await dialog.isVisible({ timeout: 1000 }).catch(() => false)) {
-      await dialog.getByRole('button', { name: /clear|confirm/i }).click();
-    }
+    await confirmClearLogsIfPrompted(page);
 
     await expect(page.getByText(/no api logs/i)).toBeVisible({ timeout: 10000 });
-    await expect(page.getByTestId('logs-list')).not.toBeVisible();
+    await expect(page.getByTestId('logs-list')).toBeHidden();
   });
 
   // ---------- Filter ----------
@@ -118,7 +129,7 @@ test.describe('Search Logs', () => {
     // Phase 2: apply an impossible filter — empty state should appear
     await filterInput.fill('zzz_no_match_zzz');
     await expect(page.getByRole('heading', { name: /no api logs/i })).toBeVisible({ timeout: 5_000 });
-    await expect(logsList).not.toBeVisible();
+    await expect(logsList).toBeHidden();
 
     // Phase 3: clear the filter — the original entries should reappear
     await filterInput.fill('');
@@ -190,16 +201,13 @@ test.describe('Search Logs', () => {
     await expect(page.getByTestId('logs-list')).toBeVisible({ timeout: 10000 });
 
     // Find and expand a POST entry (search query) which should have a request body
-    const postEntry = page.getByRole('button', { name: /\bPOST\b/ }).first();
-    if (await postEntry.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await postEntry.click();
+    await expandPostLogEntry(page);
 
-      // Expanded detail should show curl command
-      await expect(page.getByText('Curl Command')).toBeVisible({ timeout: 10_000 });
+    // Expanded detail should show curl command
+    await expect(page.getByText('Curl Command')).toBeVisible({ timeout: 10_000 });
 
-      // Should show request body section heading
-      await expect(page.getByRole('heading', { name: 'Request Body' })).toBeVisible({ timeout: 10_000 });
-    }
+    // Should show request body section heading
+    await expect(page.getByRole('heading', { name: 'Request Body' })).toBeVisible({ timeout: 10_000 });
   });
 
   // ---------- Export ----------

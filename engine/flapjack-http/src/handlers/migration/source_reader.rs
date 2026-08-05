@@ -1,185 +1,452 @@
+//! Provider-neutral source-migration contract.
+//!
+//! Vendor clients, errors, observations, and raw schemas stay inside adapters.
 #![allow(dead_code)]
 
-use super::algolia_client::{
-    AlgoliaClient, AlgoliaClientError, AlgoliaErrorKind, AlgoliaIndexRecord, BrowseError,
+use super::algolia_client::{AlgoliaClientError, AlgoliaErrorKind};
+#[cfg(test)]
+pub(super) use super::algolia_source_reader::collect_replica_settings;
+pub(super) use super::algolia_source_reader::AlgoliaSourceReader;
+pub(super) use super::meilisearch_source_reader::MeilisearchSourceReader;
+#[cfg(test)]
+pub(super) use super::meilisearch_source_reader::{
+    MeilisearchExportSource, MeilisearchPageConsumer, MeilisearchSourceFuture,
 };
-use super::meilisearch_client::MeilisearchClient;
-use super::meilisearch_client::{MeilisearchClientError, MeilisearchErrorKind};
 #[cfg(not(test))]
 use super::source_identity_partitions::SourceIdentityConfig;
-use super::source_identity_partitions::SourceIdentityVersion;
+use super::source_identity_partitions::{SourceIdentityError, SourceIdentityVersion};
 use super::source_snapshot::{canonical_json_bytes, SourceSnapshot, SourceSnapshotBuilder};
 #[cfg(test)]
 use super::source_test_support::identity_config_for_test;
-use super::translation::{translate_settings_for_provider, SettingsSourceProvider};
-use super::typesense_client::{
-    TypesenseClient, TypesenseClientError, TypesenseErrorKind, TypesenseSourceObservation,
+use super::translation::ReportCode;
+pub(super) use super::typesense_source_reader::TypesenseSourceReader;
+#[cfg(test)]
+pub(super) use super::typesense_source_reader::{
+    TypesenseExportSource, TypesensePageConsumer, TypesenseSourceFuture,
 };
+use super::AsyncMigrationSourceProvider;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
-// The futures stay `Send` so the export orchestration composes into an axum
-// handler; the raw-page callbacks are likewise `Send` because they carry the
-// snapshot builder and store-backed sink across await points.
 pub(super) type SourceFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, AlgoliaClientError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<T, SourceExportError>> + Send + 'a>>;
 
-pub(super) type PageConsumer<'a> =
-    dyn FnMut(Vec<Value>) -> Result<(), AlgoliaClientError> + Send + 'a;
+pub(super) type SourceDocumentPageConsumer<'a> =
+    dyn FnMut(Vec<SourceExportRecord>) -> Result<(), SourceExportError> + Send + 'a;
 
-pub(super) type MeilisearchSourceFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, MeilisearchClientError>> + Send + 'a>>;
+pub(super) type SourceConfigurationConsumer<'a> =
+    dyn FnMut(SourceConfigurationArtifact) -> Result<(), SourceExportError> + Send + 'a;
 
-pub(super) type MeilisearchPageConsumer<'a> =
-    dyn FnMut(Vec<Value>) -> Result<(), MeilisearchClientError> + Send + 'a;
-
-pub(super) use super::meilisearch_client::MeilisearchSourceObservation;
-
-pub(super) type TypesenseSourceFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, TypesenseClientError>> + Send + 'a>>;
-
-pub(super) type TypesensePageConsumer<'a> =
-    dyn FnMut(Vec<Value>) -> Result<(), TypesenseClientError> + Send + 'a;
-
-/// Raw Meilisearch export operations consumed by the provider adapter.
-///
-/// The protocol client owns HTTP and vendor schemas; this contract leaves
-/// document identity normalization and shared snapshot integration to the
-/// source reader.
-pub(super) trait MeilisearchExportSource {
-    fn observe_source(&mut self) -> MeilisearchSourceFuture<'_, MeilisearchSourceObservation>;
-    fn read_settings(&mut self) -> MeilisearchSourceFuture<'_, Value>;
-    fn require_read_access(&mut self) -> MeilisearchSourceFuture<'_, ()>;
-    fn read_document_pages<'a>(
-        &'a mut self,
-        consume_page: &'a mut MeilisearchPageConsumer<'a>,
-    ) -> MeilisearchSourceFuture<'a, MeilisearchSourceObservation>;
-}
-
-/// Raw Typesense export operations consumed by the provider adapter.
-pub(super) trait TypesenseExportSource {
-    fn observe_source(&mut self) -> TypesenseSourceFuture<'_, TypesenseSourceObservation>;
-    fn read_settings(&mut self) -> TypesenseSourceFuture<'_, Value>;
-    fn require_read_access(&mut self) -> TypesenseSourceFuture<'_, ()>;
-    fn read_document_pages<'a>(
-        &'a mut self,
-        consume_page: &'a mut TypesensePageConsumer<'a>,
-    ) -> TypesenseSourceFuture<'a, TypesenseSourceObservation>;
-}
-
-pub(super) trait MigrationSourceReader {
-    fn app_id(&self) -> &str;
-    fn source_name(&self) -> &str;
-    fn wait_for_quiescent_source(&mut self) -> SourceFuture<'_, AlgoliaIndexRecord>;
-    fn read_settings(&mut self) -> SourceFuture<'_, Value>;
-    /// Fetch the complete settings JSON for an arbitrary index name. This is the
-    /// single low-level replica read the shared collector composes; it performs
-    /// no parsing or list traversal of its own.
+/// Replica-owned settings reads. Only Algolia's source model has replica indexes.
+pub(super) trait AlgoliaReplicaSource {
     fn read_index_settings<'a>(&'a mut self, index_name: &'a str) -> SourceFuture<'a, Value>;
-    fn require_unretrievable_access<'a>(&'a mut self, settings: &'a Value) -> SourceFuture<'a, ()>;
-    fn read_documents<'a>(
+}
+
+/// Neutral failure at the source-migration seam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SourceExportError {
+    kind: SourceExportErrorKind,
+    message: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SourceExportErrorKind {
+    Validation,
+    Transport,
+    Timeout,
+    Redirect,
+    RateLimit,
+    Server,
+    Upstream,
+    Decode,
+    Schema,
+    Progress,
+    Limit,
+}
+
+impl SourceExportError {
+    pub(super) fn new(kind: SourceExportErrorKind, message: &'static str) -> Self {
+        Self { kind, message }
+    }
+
+    pub(super) fn kind(&self) -> SourceExportErrorKind {
+        self.kind
+    }
+
+    pub(super) fn safe_message(&self) -> &str {
+        self.message
+    }
+
+    pub(super) fn into_inner(self) -> AlgoliaClientError {
+        AlgoliaClientError::new(self.kind.into_algolia_kind(), self.message)
+    }
+}
+
+impl SourceExportErrorKind {
+    fn from_algolia_kind(kind: AlgoliaErrorKind) -> Self {
+        match kind {
+            AlgoliaErrorKind::Validation => Self::Validation,
+            AlgoliaErrorKind::Transport => Self::Transport,
+            AlgoliaErrorKind::Timeout => Self::Timeout,
+            AlgoliaErrorKind::Redirect => Self::Redirect,
+            AlgoliaErrorKind::RateLimit => Self::RateLimit,
+            AlgoliaErrorKind::Server => Self::Server,
+            AlgoliaErrorKind::Upstream => Self::Upstream,
+            AlgoliaErrorKind::Decode => Self::Decode,
+            AlgoliaErrorKind::Schema => Self::Schema,
+            AlgoliaErrorKind::Progress => Self::Progress,
+            AlgoliaErrorKind::Limit => Self::Limit,
+        }
+    }
+
+    fn into_algolia_kind(self) -> AlgoliaErrorKind {
+        match self {
+            Self::Validation => AlgoliaErrorKind::Validation,
+            Self::Transport => AlgoliaErrorKind::Transport,
+            Self::Timeout => AlgoliaErrorKind::Timeout,
+            Self::Redirect => AlgoliaErrorKind::Redirect,
+            Self::RateLimit => AlgoliaErrorKind::RateLimit,
+            Self::Server => AlgoliaErrorKind::Server,
+            Self::Upstream => AlgoliaErrorKind::Upstream,
+            Self::Decode => AlgoliaErrorKind::Decode,
+            Self::Schema => AlgoliaErrorKind::Schema,
+            Self::Progress => AlgoliaErrorKind::Progress,
+            Self::Limit => AlgoliaErrorKind::Limit,
+        }
+    }
+}
+
+impl From<AlgoliaClientError> for SourceExportError {
+    fn from(error: AlgoliaClientError) -> Self {
+        Self {
+            kind: SourceExportErrorKind::from_algolia_kind(error.kind()),
+            message: error.safe_message(),
+        }
+    }
+}
+
+impl From<SourceIdentityError> for SourceExportError {
+    fn from(error: SourceIdentityError) -> Self {
+        AlgoliaClientError::from(error).into()
+    }
+}
+
+/// A source document paired with the stable ID the export is keyed by.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct StableSourceDocument {
+    stable_id: String,
+    payload: Value,
+}
+
+impl StableSourceDocument {
+    fn new(stable_id: String, payload: Value) -> Result<Self, SourceExportError> {
+        if stable_id.is_empty() {
+            return Err(missing_stable_id());
+        }
+        Ok(Self { stable_id, payload })
+    }
+
+    /// Documents cross the seam as Algolia-shaped records, so their identity
+    /// view pins `objectID` to the validated stable ID. Non-document
+    /// configuration keeps its provider-native payload and carries the stable
+    /// ID out of band; see [`SourceConfigurationRecord::identity_payload`].
+    fn identity_payload(&self) -> Value {
+        let mut payload = self.payload.clone();
+        if let Value::Object(object) = &mut payload {
+            object.insert(
+                "objectID".to_string(),
+                Value::String(self.stable_id.clone()),
+            );
+        }
+        payload
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct SourceExportRecord {
+    document: StableSourceDocument,
+}
+
+impl SourceExportRecord {
+    pub(super) fn from_document(
+        stable_id: String,
+        payload: Value,
+    ) -> Result<Self, SourceExportError> {
+        Ok(Self {
+            document: StableSourceDocument::new(stable_id, payload)?,
+        })
+    }
+
+    pub(super) fn stable_id(&self) -> &str {
+        &self.document.stable_id
+    }
+
+    pub(super) fn payload(&self) -> &Value {
+        &self.document.payload
+    }
+
+    /// The payload as the downstream translation and identity owners see it:
+    /// the source fields with `objectID` pinned to the validated stable ID.
+    pub(super) fn identity_payload(&self) -> Value {
+        self.document.identity_payload()
+    }
+
+    pub(super) fn to_capture_value(&self) -> Value {
+        json!({
+            "stableId": self.stable_id(),
+            "payload": self.payload(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct SourceConfigurationRecord {
+    stable_id: String,
+    payload: Value,
+}
+
+impl SourceConfigurationRecord {
+    pub(super) fn new(stable_id: String, payload: Value) -> Result<Self, SourceExportError> {
+        if stable_id.is_empty() {
+            return Err(missing_stable_id());
+        }
+        Ok(Self { stable_id, payload })
+    }
+
+    fn from_object_id(payload: &Value) -> Result<Self, SourceExportError> {
+        let stable_id =
+            object_id_from_payload(payload, "objectID").ok_or_else(missing_stable_id)?;
+        Self::new(stable_id.to_string(), payload.clone())
+    }
+
+    pub(super) fn stable_id(&self) -> &str {
+        &self.stable_id
+    }
+
+    pub(super) fn payload(&self) -> &Value {
+        &self.payload
+    }
+
+    /// Configuration keeps its untouched provider-native payload; the stable ID
+    /// travels alongside it (via `record_*_page_with_stable_ids`) rather than
+    /// being folded into the payload as `objectID`. This keeps provider-native
+    /// shapes — e.g. a Meilisearch synonym `{"saw": ["cutter"]}` — intact for
+    /// their downstream translators, which reject any extra keys.
+    pub(super) fn identity_payload(&self) -> Value {
+        self.payload.clone()
+    }
+
+    pub(super) fn to_capture_value(&self) -> Value {
+        json!({
+            "stableId": self.stable_id(),
+            "payload": self.payload(),
+        })
+    }
+}
+
+/// The closed set of non-document source configuration an adapter may emit.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum SourceConfigurationArtifact {
+    Settings {
+        payload: Value,
+    },
+    Rules {
+        records: Vec<SourceConfigurationRecord>,
+    },
+    Synonyms {
+        records: Vec<SourceConfigurationRecord>,
+    },
+    ReplicaSettings {
+        source_name: String,
+        payload: Value,
+    },
+}
+
+impl SourceConfigurationArtifact {
+    pub(super) fn settings(payload: &Value) -> Self {
+        Self::Settings {
+            payload: payload.clone(),
+        }
+    }
+
+    pub(super) fn rules(records: &[Value]) -> Result<Self, SourceExportError> {
+        let records = records
+            .iter()
+            .map(SourceConfigurationRecord::from_object_id)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::Rules { records })
+    }
+
+    pub(super) fn synonyms(records: &[Value]) -> Result<Self, SourceExportError> {
+        let records = records
+            .iter()
+            .map(SourceConfigurationRecord::from_object_id)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::Synonyms { records })
+    }
+
+    pub(super) fn synonym_records(records: Vec<SourceConfigurationRecord>) -> Self {
+        Self::Synonyms { records }
+    }
+
+    pub(super) fn replica_settings(source_name: &str, payload: &Value) -> Self {
+        // Replica settings come from the same vendor index-settings read as the
+        // primary settings, so they are the same raw source artifact and are kept
+        // verbatim. Any secret material lives in the connection layer, which
+        // redacts at its own diagnostic boundary; source-owned fields (even ones
+        // named `apiKey`/`url`) are the user's data and must reach translation.
+        Self::ReplicaSettings {
+            source_name: source_name.to_string(),
+            payload: payload.clone(),
+        }
+    }
+}
+
+/// Provider-neutral view of a quiescent source at one point in time.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct SourceObservation {
+    pub(super) source_name: String,
+    pub(super) accepted_revision: String,
+    pub(super) identity_revision: String,
+    pub(super) document_count: u64,
+    pub(super) quiescent: bool,
+}
+
+impl fmt::Debug for SourceObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SourceObservation")
+            .field("source_name", &"<scrubbed>")
+            .field("accepted_revision", &self.accepted_revision)
+            .field("document_count", &self.document_count)
+            .field("quiescent", &self.quiescent)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The shared source-migration contract every provider adapter implements.
+pub(super) trait MigrationSourceReader {
+    fn source_provider(&self) -> AsyncMigrationSourceProvider;
+
+    /// A non-secret grouping name for the source, where the provider has one.
+    fn source_namespace(&self) -> Option<&str> {
+        None
+    }
+
+    fn source_name(&self) -> &str;
+
+    fn observe_quiescent_source(&mut self) -> SourceFuture<'_, SourceObservation>;
+
+    /// Emit the source's own configuration as tagged artifacts.
+    fn read_configuration<'a>(
         &'a mut self,
-        consume_page: &'a mut PageConsumer<'a>,
+        consume: &'a mut SourceConfigurationConsumer<'a>,
     ) -> SourceFuture<'a, ()>;
-    fn read_rules<'a>(&'a mut self, consume_page: &'a mut PageConsumer<'a>)
-        -> SourceFuture<'a, ()>;
-    fn read_synonyms<'a>(
+
+    /// Emit configuration owned by sources derived from this one.
+    fn read_derived_configuration<'a>(
         &'a mut self,
-        consume_page: &'a mut PageConsumer<'a>,
+        consume: &'a mut SourceConfigurationConsumer<'a>,
+    ) -> SourceFuture<'a, ()> {
+        let _ = consume;
+        Box::pin(async { Ok(()) })
+    }
+
+    fn read_document_records<'a>(
+        &'a mut self,
+        consume_page: &'a mut SourceDocumentPageConsumer<'a>,
     ) -> SourceFuture<'a, ()>;
 }
 
 impl<R> MigrationSourceReader for Box<R>
 where
-    R: MigrationSourceReader + ?Sized,
+    R: MigrationSourceReader + Send + ?Sized,
 {
-    fn app_id(&self) -> &str {
-        (**self).app_id()
+    fn source_provider(&self) -> AsyncMigrationSourceProvider {
+        (**self).source_provider()
+    }
+
+    fn source_namespace(&self) -> Option<&str> {
+        (**self).source_namespace()
     }
 
     fn source_name(&self) -> &str {
         (**self).source_name()
     }
 
-    fn wait_for_quiescent_source(&mut self) -> SourceFuture<'_, AlgoliaIndexRecord> {
-        (**self).wait_for_quiescent_source()
+    fn observe_quiescent_source(&mut self) -> SourceFuture<'_, SourceObservation> {
+        (**self).observe_quiescent_source()
     }
 
-    fn read_settings(&mut self) -> SourceFuture<'_, Value> {
-        (**self).read_settings()
-    }
-
-    fn read_index_settings<'a>(&'a mut self, index_name: &'a str) -> SourceFuture<'a, Value> {
-        (**self).read_index_settings(index_name)
-    }
-
-    fn require_unretrievable_access<'a>(&'a mut self, settings: &'a Value) -> SourceFuture<'a, ()> {
-        (**self).require_unretrievable_access(settings)
-    }
-
-    fn read_documents<'a>(
+    fn read_configuration<'a>(
         &'a mut self,
-        consume_page: &'a mut PageConsumer<'a>,
+        consume: &'a mut SourceConfigurationConsumer<'a>,
     ) -> SourceFuture<'a, ()> {
-        (**self).read_documents(consume_page)
+        (**self).read_configuration(consume)
     }
 
-    fn read_rules<'a>(
+    fn read_derived_configuration<'a>(
         &'a mut self,
-        consume_page: &'a mut PageConsumer<'a>,
+        consume: &'a mut SourceConfigurationConsumer<'a>,
     ) -> SourceFuture<'a, ()> {
-        (**self).read_rules(consume_page)
+        (**self).read_derived_configuration(consume)
     }
 
-    fn read_synonyms<'a>(
+    fn read_document_records<'a>(
         &'a mut self,
-        consume_page: &'a mut PageConsumer<'a>,
+        consume_page: &'a mut SourceDocumentPageConsumer<'a>,
     ) -> SourceFuture<'a, ()> {
-        (**self).read_synonyms(consume_page)
+        (**self).read_document_records(consume_page)
     }
 }
 
+/// The capture side of the seam: typed documents and tagged configuration.
 pub(super) trait SourceExportSink {
-    fn commit_settings(&mut self, settings: &Value) -> Result<(), AlgoliaClientError>;
-    fn commit_document_page(&mut self, page: &[Value]) -> Result<(), AlgoliaClientError>;
-    fn commit_rule_page(&mut self, page: &[Value]) -> Result<(), AlgoliaClientError>;
-    fn commit_synonym_page(&mut self, page: &[Value]) -> Result<(), AlgoliaClientError>;
+    fn commit_configuration(
+        &mut self,
+        artifact: &SourceConfigurationArtifact,
+    ) -> Result<(), SourceExportError>;
+
+    fn commit_document_page(
+        &mut self,
+        page: &[SourceExportRecord],
+    ) -> Result<(), SourceExportError>;
 }
 
+/// The single owner of who the accepted source was and what state it was in.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct SourceIdentity {
+    provider: AsyncMigrationSourceProvider,
+    namespace: Option<String>,
+    source_name: String,
     digest: String,
-    updated_at: String,
+    accepted_revision: String,
     document_metadata_count: u64,
     snapshot: SourceSnapshot,
 }
 
 impl SourceIdentity {
-    pub(super) fn new(
-        app_id: &str,
-        source_name: &str,
-        metadata: &AlgoliaIndexRecord,
-        snapshot: SourceSnapshot,
-    ) -> Result<Self, AlgoliaClientError> {
-        validate_metadata(source_name, metadata, &snapshot)?;
-        Ok(Self {
-            digest: source_identity_digest(app_id, source_name, metadata, &snapshot),
-            updated_at: metadata.updated_at.clone(),
-            document_metadata_count: metadata.entries,
-            snapshot,
-        })
-    }
-
     pub(super) fn digest(&self) -> &str {
         &self.digest
     }
 
-    pub(super) fn updated_at(&self) -> &str {
-        &self.updated_at
+    pub(super) fn provider(&self) -> AsyncMigrationSourceProvider {
+        self.provider
+    }
+
+    pub(super) fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
+    }
+
+    pub(super) fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    pub(super) fn accepted_revision(&self) -> &str {
+        &self.accepted_revision
     }
 
     pub(super) fn document_metadata_count(&self) -> u64 {
@@ -195,550 +462,106 @@ impl fmt::Debug for SourceIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SourceIdentity")
+            .field("provider", &self.provider)
+            .field("namespace", &self.namespace.as_ref().map(|_| "<scrubbed>"))
+            .field("source_name", &"<scrubbed>")
             .field("digest", &self.digest)
-            .field("updated_at", &self.updated_at)
+            .field("accepted_revision", &self.accepted_revision)
             .field("document_metadata_count", &self.document_metadata_count)
             .finish_non_exhaustive()
     }
 }
 
+/// Acceptance receipt with identity evidence and provider-attributed warnings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AcceptedSourceExport {
     identity: SourceIdentity,
+    warnings: Vec<ReportCode>,
 }
 
 impl AcceptedSourceExport {
     pub(super) fn identity(&self) -> &SourceIdentity {
         &self.identity
     }
-}
 
-pub(super) struct AlgoliaSourceReader {
-    app_id: String,
-    source_name: String,
-    client: AlgoliaClient,
-}
+    pub(super) fn provider(&self) -> AsyncMigrationSourceProvider {
+        self.identity.provider()
+    }
 
-impl AlgoliaSourceReader {
-    pub(super) fn new(
-        app_id: &str,
-        api_key: &str,
-        source_name: &str,
-    ) -> Result<Self, AlgoliaClientError> {
-        let client = AlgoliaClient::for_source(app_id, api_key, source_name)?;
-        Ok(Self {
-            app_id: app_id.to_string(),
-            source_name: source_name.to_string(),
-            client,
-        })
+    pub(super) fn source_namespace(&self) -> Option<&str> {
+        self.identity.namespace()
+    }
+
+    pub(super) fn source_name(&self) -> &str {
+        self.identity.source_name()
+    }
+
+    pub(super) fn warning_codes(&self) -> &[ReportCode] {
+        &self.warnings
     }
 }
 
-pub(super) struct MeilisearchSourceReader<S> {
-    source_name: String,
-    source: S,
-    observation: Option<MeilisearchSourceObservation>,
-    settings: Option<Value>,
-}
-
-pub(super) struct TypesenseSourceReader<S> {
-    source_name: String,
-    source: S,
-    observation: Option<TypesenseSourceObservation>,
-}
-
-impl<S> MeilisearchSourceReader<S>
-where
-    S: MeilisearchExportSource,
-{
-    pub(super) fn from_source(source_name: &str, source: S) -> Self {
-        Self {
-            source_name: source_name.to_string(),
-            source,
-            observation: None,
-            settings: None,
-        }
-    }
-}
-
-impl MeilisearchSourceReader<MeilisearchClient> {
-    pub(super) fn new(
-        endpoint: &str,
-        api_key: &str,
-        source_name: &str,
-    ) -> Result<Self, AlgoliaClientError> {
-        let source = MeilisearchClient::new(endpoint, api_key, source_name)
-            .map_err(map_meilisearch_error)?;
-        Ok(Self::from_source(source_name, source))
-    }
-}
-
-impl<S> TypesenseSourceReader<S>
-where
-    S: TypesenseExportSource,
-{
-    pub(super) fn from_source(source_name: &str, source: S) -> Self {
-        Self {
-            source_name: source_name.to_string(),
-            source,
-            observation: None,
-        }
-    }
-}
-
-impl TypesenseSourceReader<TypesenseClient> {
-    pub(super) fn new(
-        endpoint: &str,
-        api_key: &str,
-        source_name: &str,
-    ) -> Result<Self, AlgoliaClientError> {
-        let source =
-            TypesenseClient::new(endpoint, api_key, source_name).map_err(map_typesense_error)?;
-        Ok(Self::from_source(source_name, source))
-    }
-}
-
-impl MeilisearchExportSource for MeilisearchClient {
-    fn observe_source(&mut self) -> MeilisearchSourceFuture<'_, MeilisearchSourceObservation> {
-        Box::pin(async move { self.observe_source().await })
-    }
-
-    fn read_settings(&mut self) -> MeilisearchSourceFuture<'_, Value> {
-        Box::pin(async move { self.read_source_settings().await })
-    }
-
-    fn require_read_access(&mut self) -> MeilisearchSourceFuture<'_, ()> {
-        Box::pin(async move { self.require_read_access().await })
-    }
-
-    fn read_document_pages<'a>(
-        &'a mut self,
-        consume_page: &'a mut MeilisearchPageConsumer<'a>,
-    ) -> MeilisearchSourceFuture<'a, MeilisearchSourceObservation> {
-        Box::pin(async move {
-            let capture = self.capture_source(consume_page).await?;
-            Ok(capture.observation())
-        })
-    }
-}
-
-impl TypesenseExportSource for TypesenseClient {
-    fn observe_source(&mut self) -> TypesenseSourceFuture<'_, TypesenseSourceObservation> {
-        Box::pin(async move { self.observe_source().await })
-    }
-
-    fn read_settings(&mut self) -> TypesenseSourceFuture<'_, Value> {
-        Box::pin(async move { self.read_source_settings().await })
-    }
-
-    fn require_read_access(&mut self) -> TypesenseSourceFuture<'_, ()> {
-        Box::pin(async move { self.require_read_access().await })
-    }
-
-    fn read_document_pages<'a>(
-        &'a mut self,
-        consume_page: &'a mut TypesensePageConsumer<'a>,
-    ) -> TypesenseSourceFuture<'a, TypesenseSourceObservation> {
-        Box::pin(async move {
-            let capture = self.capture_source(consume_page).await?;
-            Ok(capture.observation())
-        })
-    }
-}
-
-impl<S> fmt::Debug for MeilisearchSourceReader<S> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("MeilisearchSourceReader")
-            .field("source_name", &"<scrubbed>")
-            .finish_non_exhaustive()
-    }
-}
-
-impl<S> fmt::Debug for TypesenseSourceReader<S> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TypesenseSourceReader")
-            .field("source_name", &"<scrubbed>")
-            .finish_non_exhaustive()
-    }
-}
-
-impl<S> MigrationSourceReader for MeilisearchSourceReader<S>
-where
-    S: MeilisearchExportSource + Send,
-{
-    fn app_id(&self) -> &str {
-        "meilisearch"
-    }
-
-    fn source_name(&self) -> &str {
-        &self.source_name
-    }
-
-    fn wait_for_quiescent_source(&mut self) -> SourceFuture<'_, AlgoliaIndexRecord> {
-        Box::pin(async move {
-            let observation = self
-                .source
-                .observe_source()
-                .await
-                .map_err(map_meilisearch_error)?;
-            validate_meilisearch_observation(&self.source_name, &observation)?;
-            let record = meilisearch_index_record(&observation);
-            self.observation = Some(observation);
-            Ok(record)
-        })
-    }
-
-    fn read_settings(&mut self) -> SourceFuture<'_, Value> {
-        Box::pin(async move {
-            let raw_settings = self
-                .source
-                .read_settings()
-                .await
-                .map_err(map_meilisearch_error)?;
-            let normalized_settings = normalize_meilisearch_settings(&raw_settings)?;
-            self.settings = Some(raw_settings);
-            Ok(normalized_settings)
-        })
-    }
-
-    fn read_index_settings<'a>(&'a mut self, _index_name: &'a str) -> SourceFuture<'a, Value> {
-        Box::pin(async {
-            Err(AlgoliaClientError::new(
-                AlgoliaErrorKind::Validation,
-                "Meilisearch replica settings are not part of the source contract",
-            ))
-        })
-    }
-
-    fn require_unretrievable_access<'a>(
-        &'a mut self,
-        _settings: &'a Value,
-    ) -> SourceFuture<'a, ()> {
-        Box::pin(async move {
-            self.source
-                .require_read_access()
-                .await
-                .map_err(map_meilisearch_error)
-        })
-    }
-
-    fn read_documents<'a>(
-        &'a mut self,
-        consume_page: &'a mut PageConsumer<'a>,
-    ) -> SourceFuture<'a, ()> {
-        Box::pin(async move {
-            let expected = self
-                .observation
-                .clone()
-                .ok_or_else(meilisearch_progress_error)?;
-            let primary_key = expected.primary_key.clone();
-            let mut consumer_error = None;
-            let observed = self
-                .source
-                .read_document_pages(&mut |page| {
-                    let normalized = normalize_meilisearch_document_page(&page, &primary_key)
-                        .map_err(|error| {
-                            consumer_error = Some(error);
-                            meilisearch_consumer_error()
-                        })?;
-                    consume_page(normalized).map_err(|error| {
-                        consumer_error = Some(error);
-                        meilisearch_consumer_error()
-                    })
-                })
-                .await;
-            if let Some(error) = consumer_error {
-                return Err(error);
-            }
-            let observed = observed.map_err(map_meilisearch_error)?;
-            if observed != expected {
-                return Err(source_drift_error());
-            }
-            Ok(())
-        })
-    }
-
-    fn read_rules<'a>(
-        &'a mut self,
-        _consume_page: &'a mut PageConsumer<'a>,
-    ) -> SourceFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn read_synonyms<'a>(
-        &'a mut self,
-        consume_page: &'a mut PageConsumer<'a>,
-    ) -> SourceFuture<'a, ()> {
-        Box::pin(async move {
-            let settings = self
-                .settings
-                .as_ref()
-                .ok_or_else(meilisearch_progress_error)?;
-            let synonyms = normalize_meilisearch_synonyms(settings)?;
-            if !synonyms.is_empty() {
-                consume_page(synonyms)?;
-            }
-            Ok(())
-        })
-    }
-}
-
-impl<S> MigrationSourceReader for TypesenseSourceReader<S>
-where
-    S: TypesenseExportSource + Send,
-{
-    fn app_id(&self) -> &str {
-        "typesense"
-    }
-
-    fn source_name(&self) -> &str {
-        &self.source_name
-    }
-
-    fn wait_for_quiescent_source(&mut self) -> SourceFuture<'_, AlgoliaIndexRecord> {
-        Box::pin(async move {
-            let observation = self
-                .source
-                .observe_source()
-                .await
-                .map_err(map_typesense_error)?;
-            validate_typesense_observation(&self.source_name, &observation)?;
-            let record = typesense_index_record(&observation);
-            self.observation = Some(observation);
-            Ok(record)
-        })
-    }
-
-    fn read_settings(&mut self) -> SourceFuture<'_, Value> {
-        Box::pin(async move {
-            let settings = self
-                .source
-                .read_settings()
-                .await
-                .map_err(map_typesense_error)?;
-            Ok(settings)
-        })
-    }
-
-    fn read_index_settings<'a>(&'a mut self, _index_name: &'a str) -> SourceFuture<'a, Value> {
-        Box::pin(async {
-            Err(AlgoliaClientError::new(
-                AlgoliaErrorKind::Validation,
-                "Typesense replica settings are not part of the source contract",
-            ))
-        })
-    }
-
-    fn require_unretrievable_access<'a>(
-        &'a mut self,
-        _settings: &'a Value,
-    ) -> SourceFuture<'a, ()> {
-        Box::pin(async move {
-            self.source
-                .require_read_access()
-                .await
-                .map_err(map_typesense_error)
-        })
-    }
-
-    fn read_documents<'a>(
-        &'a mut self,
-        consume_page: &'a mut PageConsumer<'a>,
-    ) -> SourceFuture<'a, ()> {
-        Box::pin(async move {
-            let expected = self
-                .observation
-                .clone()
-                .ok_or_else(typesense_progress_error)?;
-            let mut consumer_error = None;
-            let observed = self
-                .source
-                .read_document_pages(&mut |page| {
-                    let normalized = normalize_typesense_document_page(&page, "$.documents")
-                        .map_err(|_| {
-                            consumer_error = Some(typesense_document_identity_error());
-                            typesense_consumer_error()
-                        })?;
-                    consume_page(normalized).map_err(|error| {
-                        consumer_error = Some(error);
-                        typesense_consumer_error()
-                    })
-                })
-                .await;
-            if let Some(error) = consumer_error {
-                return Err(error);
-            }
-            let observed = observed.map_err(map_typesense_error)?;
-            if observed != expected {
-                return Err(source_drift_error());
-            }
-            Ok(())
-        })
-    }
-
-    fn read_rules<'a>(
-        &'a mut self,
-        _consume_page: &'a mut PageConsumer<'a>,
-    ) -> SourceFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn read_synonyms<'a>(
-        &'a mut self,
-        _consume_page: &'a mut PageConsumer<'a>,
-    ) -> SourceFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
-    }
-}
-
-impl fmt::Debug for AlgoliaSourceReader {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AlgoliaSourceReader")
-            .field("app_id", &"<scrubbed>")
-            .field("source_name", &"<scrubbed>")
-            .finish_non_exhaustive()
-    }
-}
-
-impl MigrationSourceReader for AlgoliaSourceReader {
-    fn app_id(&self) -> &str {
-        &self.app_id
-    }
-
-    fn source_name(&self) -> &str {
-        &self.source_name
-    }
-
-    fn wait_for_quiescent_source(&mut self) -> SourceFuture<'_, AlgoliaIndexRecord> {
-        Box::pin(async move { self.client.wait_for_quiescent_source().await })
-    }
-
-    fn read_settings(&mut self) -> SourceFuture<'_, Value> {
-        Box::pin(async move { self.client.settings().await })
-    }
-
-    fn read_index_settings<'a>(&'a mut self, index_name: &'a str) -> SourceFuture<'a, Value> {
-        Box::pin(async move { self.client.index_settings(index_name).await })
-    }
-
-    fn require_unretrievable_access<'a>(&'a mut self, settings: &'a Value) -> SourceFuture<'a, ()> {
-        Box::pin(async move { self.client.require_unretrievable_access(settings).await })
-    }
-
-    fn read_documents<'a>(
-        &'a mut self,
-        mut consume_page: &'a mut PageConsumer<'a>,
-    ) -> SourceFuture<'a, ()> {
-        Box::pin(async move {
-            self.client
-                .browse_documents(&mut consume_page)
-                .await
-                .map_err(flatten_browse_error)
-        })
-    }
-
-    fn read_rules<'a>(
-        &'a mut self,
-        mut consume_page: &'a mut PageConsumer<'a>,
-    ) -> SourceFuture<'a, ()> {
-        Box::pin(async move {
-            self.client
-                .paginated_hits("rules/search", &mut consume_page)
-                .await
-                .map_err(flatten_browse_error)
-        })
-    }
-
-    fn read_synonyms<'a>(
-        &'a mut self,
-        mut consume_page: &'a mut PageConsumer<'a>,
-    ) -> SourceFuture<'a, ()> {
-        Box::pin(async move {
-            self.client
-                .paginated_hits("synonyms/search", &mut consume_page)
-                .await
-                .map_err(flatten_browse_error)
-        })
-    }
-}
+// --- Shared capture ----------------------------------------------------------
 
 pub(super) async fn collect_quiescent_source_snapshot<R>(
     reader: &mut R,
-) -> Result<SourceIdentity, AlgoliaClientError>
+) -> Result<SourceIdentity, SourceExportError>
 where
-    R: MigrationSourceReader,
+    R: MigrationSourceReader + Send,
 {
-    let metadata = reader.wait_for_quiescent_source().await?;
+    let observation = reader.observe_quiescent_source().await?;
     let snapshot = read_source_snapshot(reader, &mut NoopSink).await?;
-    SourceIdentity::new(reader.app_id(), reader.source_name(), &metadata, snapshot)
+    source_identity_from_reader(reader, &observation, snapshot)
 }
 
-/// Collect the complete source settings for every replica named in the primary
-/// settings' `replicas` list. Each string entry is parsed through the single
-/// canonical replica parser and its settings fetched exactly once; the returned
-/// map is keyed by replica index name and holds the full response JSON.
-///
-/// Absent `replicas` performs zero index-specific reads. Malformed primary
-/// `replicas` *shapes* (non-array, non-string entries) are left to the existing
-/// translation validation owner, so non-string entries are skipped here rather
-/// than rejected. A string entry that fails the canonical parser is a fail-closed
-/// validation error with a single static, scrubbed message.
-pub(super) async fn collect_replica_settings<R>(
-    reader: &mut R,
-    primary_settings: &Value,
-) -> Result<BTreeMap<String, Value>, AlgoliaClientError>
+/// Build the canonical identity for a reader's observed source state.
+pub(super) fn source_identity_from_reader<R>(
+    reader: &R,
+    observation: &SourceObservation,
+    snapshot: SourceSnapshot,
+) -> Result<SourceIdentity, SourceExportError>
 where
-    R: MigrationSourceReader,
+    R: MigrationSourceReader + ?Sized,
 {
-    let mut collected = BTreeMap::new();
-    let Some(entries) = primary_settings.get("replicas").and_then(Value::as_array) else {
-        return Ok(collected);
-    };
-
-    for entry in entries {
-        let Some(raw) = entry.as_str() else {
-            continue;
-        };
-        let parsed = flapjack::index::replica::parse_replica_entry(raw)
-            .map_err(|_| replica_entry_validation_error())?;
-        let name = parsed.name().to_string();
-        if collected.contains_key(&name) {
-            continue;
-        }
-        let settings = reader.read_index_settings(&name).await?;
-        collected.insert(name, settings);
+    let source_name = reader.source_name();
+    if observation.source_name != source_name || !observation.quiescent {
+        return Err(source_drift_error());
     }
-
-    Ok(collected)
+    if observation.document_count != snapshot.documents.count as u64 {
+        return Err(SourceExportError::new(
+            SourceExportErrorKind::Progress,
+            "Source metadata did not match exported documents",
+        ));
+    }
+    let provider = reader.source_provider();
+    let namespace = reader.source_namespace();
+    Ok(SourceIdentity {
+        digest: source_identity_digest(provider, namespace, source_name, observation, &snapshot),
+        provider,
+        namespace: namespace.map(str::to_string),
+        source_name: source_name.to_string(),
+        accepted_revision: observation.accepted_revision.clone(),
+        document_metadata_count: observation.document_count,
+        snapshot,
+    })
 }
 
-fn replica_entry_validation_error() -> AlgoliaClientError {
-    AlgoliaClientError::new(
-        AlgoliaErrorKind::Validation,
-        "Algolia replica entry could not be parsed for migration",
-    )
-}
-
+/// Admit a source export with provider identity and two-pass stability proof.
 pub(super) async fn accept_source_export<R, S>(
+    expected_provider: AsyncMigrationSourceProvider,
     reader: &mut R,
     sink: &mut S,
-) -> Result<AcceptedSourceExport, AlgoliaClientError>
+) -> Result<AcceptedSourceExport, SourceExportError>
 where
-    R: MigrationSourceReader,
+    R: MigrationSourceReader + Send,
     S: SourceExportSink + Send,
 {
+    admit_source_provider(expected_provider, reader.source_provider())?;
     let pre_identity = collect_quiescent_source_snapshot(reader).await?;
     let exported_snapshot = read_source_snapshot(reader, sink).await?;
-    let final_metadata = reader.wait_for_quiescent_source().await?;
-    let exported_identity = SourceIdentity::new(
-        reader.app_id(),
-        reader.source_name(),
-        &final_metadata,
-        exported_snapshot,
-    )?;
+    let final_observation = reader.observe_quiescent_source().await?;
+    let exported_identity =
+        source_identity_from_reader(reader, &final_observation, exported_snapshot)?;
 
     // Algolia browse cursors expire and browse order is not stable. Persisted
     // resume state must use exact membership and hashes, never cursors or
@@ -749,15 +572,31 @@ where
 
     Ok(AcceptedSourceExport {
         identity: pre_identity,
+        warnings: source_export_warnings(reader.source_provider()),
     })
 }
 
+/// The single provider-admission comparison.
+pub(super) fn admit_source_provider(
+    expected_provider: AsyncMigrationSourceProvider,
+    actual_provider: AsyncMigrationSourceProvider,
+) -> Result<(), SourceExportError> {
+    if expected_provider == actual_provider {
+        return Ok(());
+    }
+    Err(SourceExportError::new(
+        SourceExportErrorKind::Validation,
+        "Source export provider identity mismatch",
+    ))
+}
+
+/// Stream one full capture pass while accumulating the canonical source snapshot.
 pub(super) async fn read_source_snapshot<R, S>(
     reader: &mut R,
     sink: &mut S,
-) -> Result<SourceSnapshot, AlgoliaClientError>
+) -> Result<SourceSnapshot, SourceExportError>
 where
-    R: MigrationSourceReader,
+    R: MigrationSourceReader + Send,
     S: SourceExportSink + Send,
 {
     #[cfg(not(test))]
@@ -765,72 +604,125 @@ where
     #[cfg(test)]
     let (_identity_spool_root, identity_config) = identity_config_for_test()?;
     let mut builder = SourceSnapshotBuilder::new(identity_config)?;
-    let settings = reader.read_settings().await?;
-    reader.require_unretrievable_access(&settings).await?;
-    builder.record_settings(&settings);
-    sink.commit_settings(&settings)?;
 
     {
-        let mut consume_page = |page: Vec<Value>| {
-            builder.record_documents(&page)?;
+        let mut consume = |artifact: SourceConfigurationArtifact| {
+            record_configuration_identity(&mut builder, &artifact)?;
+            sink.commit_configuration(&artifact)
+        };
+        reader.read_configuration(&mut consume).await?;
+    }
+    {
+        let mut consume_page = |page: Vec<SourceExportRecord>| {
+            let identity_page = source_record_identity_page(&page);
+            builder.record_documents(&identity_page)?;
             sink.commit_document_page(&page)
         };
-        reader.read_documents(&mut consume_page).await?;
+        reader.read_document_records(&mut consume_page).await?;
     }
     {
-        let mut consume_page = |page: Vec<Value>| {
-            builder.record_rules(&page)?;
-            sink.commit_rule_page(&page)
+        let mut consume = |artifact: SourceConfigurationArtifact| {
+            record_configuration_identity(&mut builder, &artifact)?;
+            sink.commit_configuration(&artifact)
         };
-        reader.read_rules(&mut consume_page).await?;
-    }
-    {
-        let mut consume_page = |page: Vec<Value>| {
-            builder.record_synonyms(&page)?;
-            sink.commit_synonym_page(&page)
-        };
-        reader.read_synonyms(&mut consume_page).await?;
+        reader.read_derived_configuration(&mut consume).await?;
     }
 
-    builder.finish().map_err(AlgoliaClientError::from)
+    builder.finish().map_err(Into::into)
 }
 
-fn validate_metadata(
-    source_name: &str,
-    metadata: &AlgoliaIndexRecord,
-    snapshot: &SourceSnapshot,
-) -> Result<(), AlgoliaClientError> {
-    if metadata.name != source_name || metadata.pending_task {
-        return Err(source_drift_error());
+/// Fold a tagged configuration artifact into the canonical source identity.
+fn record_configuration_identity(
+    builder: &mut SourceSnapshotBuilder,
+    artifact: &SourceConfigurationArtifact,
+) -> Result<(), SourceExportError> {
+    match artifact {
+        SourceConfigurationArtifact::Settings { payload } => {
+            builder.record_settings(payload);
+            Ok(())
+        }
+        // Configuration records carry their stable ID out of band so the
+        // snapshot keys them without folding `objectID` into the provider-native
+        // payload. This is the same seam the staging translator records against
+        // (`TranslationSession::consume_*_pages`), keeping capture and staging
+        // identities byte-for-byte consistent.
+        SourceConfigurationArtifact::Rules { records } => builder
+            .record_rules_page_with_stable_ids(
+                0,
+                &source_configuration_identity_page(records),
+                &source_configuration_stable_ids(records),
+            )
+            .map_err(AlgoliaClientError::from)
+            .map_err(Into::into),
+        SourceConfigurationArtifact::Synonyms { records } => builder
+            .record_synonyms_page_with_stable_ids(
+                0,
+                &source_configuration_identity_page(records),
+                &source_configuration_stable_ids(records),
+            )
+            .map_err(AlgoliaClientError::from)
+            .map_err(Into::into),
+        SourceConfigurationArtifact::ReplicaSettings {
+            source_name,
+            payload,
+        } => builder
+            .record_replica_settings(source_name, payload)
+            .map_err(AlgoliaClientError::from)
+            .map_err(Into::into),
     }
-    if metadata.entries != snapshot.documents.count as u64 {
-        return Err(AlgoliaClientError::new(
-            AlgoliaErrorKind::Progress,
-            "Algolia source metadata did not match exported documents",
-        ));
-    }
-    Ok(())
 }
 
 fn source_identity_digest(
-    app_id: &str,
+    provider: AsyncMigrationSourceProvider,
+    namespace: Option<&str>,
     source_name: &str,
-    metadata: &AlgoliaIndexRecord,
+    observation: &SourceObservation,
     snapshot: &SourceSnapshot,
 ) -> String {
     let identity = json!({
-        "appID": app_id,
-        "sourceIndex": source_name,
-        "updatedAt": metadata.updated_at,
-        "documentMetadataCount": metadata.entries,
+        "provider": provider.as_str(),
+        "namespace": namespace,
+        "sourceName": source_name,
+        "updatedAt": observation.identity_revision,
+        "documentMetadataCount": observation.document_count,
         "resources": {
             "settings": resource_identity(&snapshot.settings),
             "documents": resource_identity(&snapshot.documents),
             "rules": resource_identity(&snapshot.rules),
             "synonyms": resource_identity(&snapshot.synonyms),
+            "replicaSettings": resource_identity(&snapshot.replica_settings),
         }
     });
     hex::encode(Sha256::digest(canonical_json_bytes(&identity)))
+}
+
+fn source_export_warnings(provider: AsyncMigrationSourceProvider) -> Vec<ReportCode> {
+    match provider {
+        AsyncMigrationSourceProvider::Algolia => Vec::new(),
+        AsyncMigrationSourceProvider::Meilisearch => vec![
+            ReportCode::MeilisearchDocumentOrderNotContractual,
+            ReportCode::MeilisearchSearchPaginationNotExportBound,
+        ],
+        AsyncMigrationSourceProvider::Typesense => vec![ReportCode::TypesenseSettingNotMigrated],
+    }
+}
+
+fn source_record_identity_page(page: &[SourceExportRecord]) -> Vec<Value> {
+    page.iter()
+        .map(SourceExportRecord::identity_payload)
+        .collect()
+}
+
+fn source_configuration_identity_page(page: &[SourceConfigurationRecord]) -> Vec<Value> {
+    page.iter()
+        .map(SourceConfigurationRecord::identity_payload)
+        .collect()
+}
+
+pub(super) fn source_configuration_stable_ids(page: &[SourceConfigurationRecord]) -> Vec<String> {
+    page.iter()
+        .map(|record| record.stable_id().to_string())
+        .collect()
 }
 
 fn resource_identity(resource: &super::source_snapshot::SourceResourceSnapshot) -> Value {
@@ -848,247 +740,150 @@ fn source_identity_version_name(version: SourceIdentityVersion) -> &'static str 
     }
 }
 
-pub(super) fn source_drift_error() -> AlgoliaClientError {
-    AlgoliaClientError::new(AlgoliaErrorKind::Progress, "Source changed during export")
+pub(super) fn source_drift_error() -> SourceExportError {
+    SourceExportError::new(
+        SourceExportErrorKind::Progress,
+        "Source changed during export",
+    )
 }
 
-fn flatten_browse_error(error: BrowseError<AlgoliaClientError>) -> AlgoliaClientError {
-    match error {
-        BrowseError::Client(error) | BrowseError::Consumer(error) => error,
+// --- Adapter-to-neutral normalization ---------------------------------------
+
+/// Hand one vendor page to the neutral consumer and stash neutral failures.
+pub(super) fn capture_neutral_page(
+    capture_error: &mut Option<SourceExportError>,
+    records: Result<Vec<SourceExportRecord>, SourceExportError>,
+    consume_page: &mut SourceDocumentPageConsumer<'_>,
+) -> Result<(), PageCaptureAborted> {
+    match records.and_then(consume_page) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            *capture_error = Some(error);
+            Err(PageCaptureAborted)
+        }
     }
 }
 
-fn validate_meilisearch_observation(
-    source_name: &str,
-    observation: &MeilisearchSourceObservation,
-) -> Result<(), AlgoliaClientError> {
-    if observation.source_name != source_name || observation.primary_key.is_empty() {
-        return Err(meilisearch_schema_error());
+/// Marker returned when [`capture_neutral_page`] stashed the real cause.
+pub(super) struct PageCaptureAborted;
+
+/// Prefer the stashed neutral cause over the vendor traversal placeholder.
+pub(super) fn finish_neutral_page_capture(
+    capture_error: Option<SourceExportError>,
+    outcome: Result<(), AlgoliaClientError>,
+) -> Result<(), SourceExportError> {
+    if let Some(error) = capture_error {
+        return Err(error);
     }
-    Ok(())
+    outcome.map_err(Into::into)
 }
 
-fn meilisearch_index_record(observation: &MeilisearchSourceObservation) -> AlgoliaIndexRecord {
-    AlgoliaIndexRecord {
-        name: observation.source_name.clone(),
-        entries: observation.document_count,
-        updated_at: observation.updated_at.clone(),
-        pending_task: false,
-    }
-}
-
-fn validate_typesense_observation(
-    source_name: &str,
-    observation: &TypesenseSourceObservation,
-) -> Result<(), AlgoliaClientError> {
-    if observation.source_name != source_name || observation.schema_hash.is_empty() {
-        return Err(typesense_schema_error());
-    }
-    Ok(())
-}
-
-fn typesense_index_record(observation: &TypesenseSourceObservation) -> AlgoliaIndexRecord {
-    AlgoliaIndexRecord {
-        name: observation.source_name.clone(),
-        entries: observation.document_count,
-        updated_at: format!("{}:{}", observation.updated_at, observation.schema_hash),
-        pending_task: false,
-    }
-}
-
-fn normalize_meilisearch_document_page(
+pub(super) fn algolia_document_records(
     page: &[Value],
-    primary_key: &str,
-) -> Result<Vec<Value>, AlgoliaClientError> {
+) -> Result<Vec<SourceExportRecord>, SourceExportError> {
     page.iter()
         .map(|document| {
-            let object = document
-                .as_object()
-                .ok_or_else(meilisearch_document_identity_error)?;
-            let stable_id = object
-                .get(primary_key)
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(meilisearch_document_identity_error)?;
-            let mut normalized = object.clone();
-            normalized.insert("objectID".to_string(), Value::String(stable_id.to_string()));
-            Ok(Value::Object(normalized))
+            let stable_id =
+                object_id_from_payload(document, "objectID").ok_or_else(missing_stable_id)?;
+            SourceExportRecord::from_document(stable_id.to_string(), document.clone())
         })
         .collect()
 }
 
-pub(super) fn normalize_typesense_document_page(
-    page: &[Value],
-    json_path_prefix: &str,
-) -> Result<Vec<Value>, String> {
-    let mut seen = BTreeSet::new();
-    page.iter()
-        .enumerate()
-        .map(|(document_index, document)| {
-            let object = document
-                .as_object()
-                .ok_or_else(|| "Typesense document must be an object".to_string())?;
-            let json_path = format!("{json_path_prefix}[{document_index}].id");
-            let stable_id = match object.get("id") {
-                Some(Value::String(id)) => id,
-                Some(_) => return Err(format!("{json_path}: Typesense id must be a string")),
-                None => return Err(format!("{json_path}: missing Typesense id")),
-            };
-            if !seen.insert(stable_id.clone()) {
-                return Err(format!("{json_path}: duplicate Typesense id {stable_id}"));
-            }
-            let mut normalized = object.clone();
-            normalized.insert("objectID".to_string(), Value::String(stable_id.to_string()));
-            Ok(Value::Object(normalized))
-        })
-        .collect()
-}
-
-fn normalize_meilisearch_synonyms(settings: &Value) -> Result<Vec<Value>, AlgoliaClientError> {
-    let Some(raw_synonyms) = settings.get("synonyms") else {
-        return Ok(Vec::new());
-    };
-    let synonyms = raw_synonyms
+pub(super) fn object_id_from_payload<'a>(payload: &'a Value, field: &str) -> Option<&'a str> {
+    payload
         .as_object()
-        .ok_or_else(meilisearch_schema_error)?;
-    synonyms
-        .iter()
-        .map(|(input, raw_equivalents)| {
-            let equivalents = raw_equivalents
-                .as_array()
-                .ok_or_else(meilisearch_schema_error)?;
-            let mut terms = Vec::with_capacity(equivalents.len() + 1);
-            terms.push(Value::String(input.clone()));
-            for equivalent in equivalents {
-                let equivalent = equivalent
-                    .as_str()
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(meilisearch_schema_error)?;
-                terms.push(Value::String(equivalent.to_string()));
-            }
-            Ok(json!({
-                "objectID": format!("meilisearch:{input}"),
-                "type": "synonym",
-                "synonyms": terms,
-            }))
-        })
-        .collect()
+        .and_then(|object| object.get(field))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
 }
 
-fn normalize_meilisearch_settings(settings: &Value) -> Result<Value, AlgoliaClientError> {
-    let mut failures = Vec::new();
-    let mut warnings = Vec::new();
-    let normalized = translate_settings_for_provider(
-        settings,
-        SettingsSourceProvider::Meilisearch,
-        &mut failures,
-        &mut warnings,
+// --- Error construction ------------------------------------------------------
+
+pub(super) fn replica_entry_validation_error() -> SourceExportError {
+    SourceExportError::new(
+        SourceExportErrorKind::Validation,
+        "Algolia replica entry could not be parsed for migration",
     )
-    .ok_or_else(meilisearch_schema_error)?;
-    if !failures.is_empty() {
-        return Err(meilisearch_schema_error());
-    }
-    serde_json::to_value(normalized).map_err(|_| meilisearch_schema_error())
 }
 
-fn map_meilisearch_error(error: MeilisearchClientError) -> AlgoliaClientError {
-    let kind = match error.kind() {
-        MeilisearchErrorKind::Validation => AlgoliaErrorKind::Validation,
-        MeilisearchErrorKind::Transport => AlgoliaErrorKind::Transport,
-        MeilisearchErrorKind::Timeout => AlgoliaErrorKind::Timeout,
-        MeilisearchErrorKind::Redirect => AlgoliaErrorKind::Redirect,
-        MeilisearchErrorKind::Upstream => AlgoliaErrorKind::Upstream,
-        MeilisearchErrorKind::Decode => AlgoliaErrorKind::Decode,
-        MeilisearchErrorKind::Schema => AlgoliaErrorKind::Schema,
-        MeilisearchErrorKind::Progress => AlgoliaErrorKind::Progress,
-        MeilisearchErrorKind::Limit => AlgoliaErrorKind::Limit,
-    };
-    AlgoliaClientError::new(kind, error.safe_message())
+pub(super) fn missing_captured_primary_settings() -> SourceExportError {
+    SourceExportError::new(
+        SourceExportErrorKind::Progress,
+        "Source export did not capture primary settings before derived configuration",
+    )
 }
 
-pub(super) fn map_typesense_error(error: TypesenseClientError) -> AlgoliaClientError {
-    let kind = match error.kind() {
-        TypesenseErrorKind::Validation => AlgoliaErrorKind::Validation,
-        TypesenseErrorKind::Transport => AlgoliaErrorKind::Transport,
-        TypesenseErrorKind::Timeout => AlgoliaErrorKind::Timeout,
-        TypesenseErrorKind::Redirect => AlgoliaErrorKind::Redirect,
-        TypesenseErrorKind::Upstream => AlgoliaErrorKind::Upstream,
-        TypesenseErrorKind::Schema => AlgoliaErrorKind::Schema,
-        TypesenseErrorKind::Progress => AlgoliaErrorKind::Progress,
-        TypesenseErrorKind::Limit => AlgoliaErrorKind::Limit,
-    };
-    AlgoliaClientError::new(kind, error.safe_message())
+fn missing_stable_id() -> SourceExportError {
+    SourceExportError::new(
+        SourceExportErrorKind::Schema,
+        "Source document stable ID is invalid",
+    )
 }
 
-fn meilisearch_document_identity_error() -> AlgoliaClientError {
-    AlgoliaClientError::new(
-        AlgoliaErrorKind::Schema,
+pub(super) fn meilisearch_document_identity_error() -> SourceExportError {
+    SourceExportError::new(
+        SourceExportErrorKind::Schema,
         "Meilisearch document primary key is invalid",
     )
 }
 
-fn meilisearch_schema_error() -> AlgoliaClientError {
-    AlgoliaClientError::new(
-        AlgoliaErrorKind::Schema,
+pub(super) fn meilisearch_schema_error() -> SourceExportError {
+    SourceExportError::new(
+        SourceExportErrorKind::Schema,
         "Meilisearch source response schema is invalid",
     )
 }
 
-fn typesense_document_identity_error() -> AlgoliaClientError {
-    AlgoliaClientError::new(AlgoliaErrorKind::Schema, "Typesense document id is invalid")
-}
-
-fn typesense_schema_error() -> AlgoliaClientError {
-    AlgoliaClientError::new(
-        AlgoliaErrorKind::Schema,
-        "Typesense source response schema is invalid",
-    )
-}
-
-fn typesense_progress_error() -> AlgoliaClientError {
-    AlgoliaClientError::new(
-        AlgoliaErrorKind::Progress,
-        "Typesense source reader state is invalid",
-    )
-}
-
-fn meilisearch_progress_error() -> AlgoliaClientError {
-    AlgoliaClientError::new(
-        AlgoliaErrorKind::Progress,
+pub(super) fn meilisearch_progress_error() -> SourceExportError {
+    SourceExportError::new(
+        SourceExportErrorKind::Progress,
         "Meilisearch source reader state is invalid",
     )
 }
 
-fn meilisearch_consumer_error() -> MeilisearchClientError {
-    MeilisearchClientError::new(
-        MeilisearchErrorKind::Progress,
-        "Meilisearch source consumer rejected a page",
+pub(super) fn typesense_document_identity_error() -> SourceExportError {
+    SourceExportError::new(
+        SourceExportErrorKind::Schema,
+        "Typesense document id is invalid",
     )
 }
 
-fn typesense_consumer_error() -> TypesenseClientError {
-    TypesenseClientError::new(
-        TypesenseErrorKind::Progress,
-        "Typesense source consumer rejected a page",
+pub(super) fn typesense_schema_error() -> SourceExportError {
+    SourceExportError::new(
+        SourceExportErrorKind::Schema,
+        "Typesense source response schema is invalid",
+    )
+}
+
+pub(super) fn typesense_progress_error() -> SourceExportError {
+    SourceExportError::new(
+        SourceExportErrorKind::Progress,
+        "Typesense source reader state is invalid",
+    )
+}
+
+pub(super) fn algolia_consumer_error() -> AlgoliaClientError {
+    AlgoliaClientError::new(
+        AlgoliaErrorKind::Progress,
+        "Algolia source consumer rejected a page",
     )
 }
 
 struct NoopSink;
 
 impl SourceExportSink for NoopSink {
-    fn commit_settings(&mut self, _settings: &Value) -> Result<(), AlgoliaClientError> {
+    fn commit_configuration(
+        &mut self,
+        _artifact: &SourceConfigurationArtifact,
+    ) -> Result<(), SourceExportError> {
         Ok(())
     }
 
-    fn commit_document_page(&mut self, _page: &[Value]) -> Result<(), AlgoliaClientError> {
-        Ok(())
-    }
-
-    fn commit_rule_page(&mut self, _page: &[Value]) -> Result<(), AlgoliaClientError> {
-        Ok(())
-    }
-
-    fn commit_synonym_page(&mut self, _page: &[Value]) -> Result<(), AlgoliaClientError> {
+    fn commit_document_page(
+        &mut self,
+        _page: &[SourceExportRecord],
+    ) -> Result<(), SourceExportError> {
         Ok(())
     }
 }

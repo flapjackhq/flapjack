@@ -6,7 +6,9 @@ use crate::handlers::AppState;
 use crate::middleware::{TrustedProxyMatcher, DEFAULT_TRUSTED_PROXY_CIDRS};
 use crate::notifications::{init_global_notifier, NotificationService};
 use crate::pause_registry;
+use crate::ssl_startup::{initialize_ssl_material, ConfiguredSslMaterial};
 use crate::startup::ServerConfig;
+use crate::tls_serve::ReloadableTlsResolver;
 use crate::usage_persistence::UsagePersistence;
 use flapjack::analytics::{AnalyticsCollector, AnalyticsConfig, AnalyticsQueryEngine};
 use flapjack::dictionaries::manager::DictionaryManager;
@@ -15,6 +17,7 @@ use flapjack::recommend::RecommendConfig;
 use flapjack::IndexManager;
 use flapjack_replication::config::{NodeConfig, PeerConfig};
 use flapjack_replication::manager::ReplicationManager;
+use flapjack_replication::peer::REPLICATION_PEER_APPLICATION_ID;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -31,7 +34,8 @@ pub(crate) struct InfrastructureState {
     pub bind_addr: String,
     pub trusted_proxy_matcher: Arc<TrustedProxyMatcher>,
     pub replication_manager: Option<Arc<ReplicationManager>>,
-    pub ssl_manager: Option<Arc<flapjack::SslManager>>,
+    pub managed_ssl: Option<ConfiguredSslMaterial>,
+    pub tls_resolver: Option<Arc<ReloadableTlsResolver>>,
     pub analytics_config: AnalyticsConfig,
     pub analytics_collector: Arc<AnalyticsCollector>,
     pub analytics_engine: Arc<AnalyticsQueryEngine>,
@@ -65,7 +69,12 @@ impl StartupSummary {
             s3_snapshots_enabled: infra.s3_config.is_some(),
             s3_snapshot_interval_secs: infra.s3_snapshot_interval_secs,
             replication_peer_count: infra.node_config.peers.len(),
-            ssl_enabled: infra.ssl_manager.is_some(),
+            // Reports auto-renewal, which needs the ACME manager itself; a node
+            // that only observes already-published material is not "SSL enabled".
+            ssl_enabled: infra
+                .managed_ssl
+                .as_ref()
+                .is_some_and(|configured| configured.manager.is_some()),
             analytics_enabled: infra.analytics_config.enabled,
             geoip_enabled: infra.geoip_reader.is_some(),
             vector_search_compiled: cfg!(feature = "vector-search"),
@@ -104,14 +113,16 @@ pub(crate) async fn initialize_infrastructure(
     let bind_addr = node_config.bind_addr.clone();
 
     let trusted_proxy_matcher = initialize_trusted_proxies()?;
-    let replication_manager = initialize_replication(&node_config, admin_key.clone(), data_dir);
+    // Replication and analytics rollup fan-out share the one credential resolved
+    // by server startup.
+    let peer_credential = server_config.replication_api_key_env.clone();
+    let replication_manager =
+        initialize_replication(&node_config, peer_credential.clone(), data_dir);
     if node_config.bootstrap_peer.is_some() {
         let replication_manager = replication_manager
             .as_ref()
             .expect("bootstrap intent must initialize replication manager");
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()?;
+        let client = build_bootstrap_http_client()?;
         bootstrap_join_with_client(
             &client,
             &mut node_config,
@@ -121,8 +132,8 @@ pub(crate) async fn initialize_infrastructure(
         .await
         .map_err(std::io::Error::other)?;
     }
-    initialize_analytics_cluster(&node_config);
-    let ssl_manager = initialize_ssl_manager().await;
+    initialize_analytics_cluster(&node_config, peer_credential);
+    let managed_ssl = initialize_ssl_material().await;
     let (s3_config, s3_snapshot_interval_secs) = initialize_s3(data_dir, &manager).await;
 
     let (analytics_config, analytics_collector, analytics_engine) =
@@ -141,7 +152,8 @@ pub(crate) async fn initialize_infrastructure(
         bind_addr,
         trusted_proxy_matcher,
         replication_manager,
-        ssl_manager,
+        managed_ssl,
+        tls_resolver: None,
         analytics_config,
         analytics_collector,
         analytics_engine,
@@ -155,6 +167,15 @@ pub(crate) async fn initialize_infrastructure(
         #[cfg(feature = "otel")]
         otel_guard: None,
     })
+}
+
+fn build_bootstrap_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        // Bootstrap requests carry the admin key. Never let an authenticated
+        // request escape the validated bootstrap origin through a redirect.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
 }
 
 /// Logs the resolved bind address, node identity, and data directory at startup.
@@ -210,8 +231,10 @@ fn initialize_trusted_proxies() -> Result<Arc<TrustedProxyMatcher>, Box<dyn std:
     Ok(matcher)
 }
 
-fn initialize_analytics_cluster(node_config: &NodeConfig) {
-    if let Some(cluster_client) = analytics_cluster::AnalyticsClusterClient::new(node_config) {
+fn initialize_analytics_cluster(node_config: &NodeConfig, peer_credential: Option<String>) {
+    if let Some(cluster_client) =
+        analytics_cluster::AnalyticsClusterClient::new(node_config, peer_credential)
+    {
         analytics_cluster::set_global_cluster(cluster_client);
         tracing::info!(
             "[HA-analytics] Cluster analytics enabled: fan-out to {} peers",
@@ -222,12 +245,13 @@ fn initialize_analytics_cluster(node_config: &NodeConfig) {
 
 fn initialize_replication(
     node_config: &NodeConfig,
-    admin_key: Option<String>,
+    peer_credential: Option<String>,
     data_dir: &Path,
 ) -> Option<Arc<ReplicationManager>> {
     if node_config.has_replication_intent() {
         tracing::info!("Replication enabled: {} peers", node_config.peers.len());
-        let repl = ReplicationManager::new(node_config.clone(), admin_key, data_dir.to_path_buf());
+        let repl =
+            ReplicationManager::new(node_config.clone(), peer_credential, data_dir.to_path_buf());
         flapjack_replication::set_global_manager(Arc::clone(&repl));
         Some(repl)
     } else {
@@ -261,7 +285,7 @@ fn with_bootstrap_auth(
     match admin_key {
         Some(key) => request
             .header("x-algolia-api-key", key)
-            .header("x-algolia-application-id", "flapjack-replication"),
+            .header("x-algolia-application-id", REPLICATION_PEER_APPLICATION_ID),
         None => request,
     }
 }
@@ -377,6 +401,11 @@ fn insert_bootstrap_member(
     if member_node_id == local_node_id {
         return Ok(());
     }
+    crate::analytics_cluster::validate_authenticated_query_peer_transport(
+        member_node_id,
+        member_addr,
+    )
+    .map_err(|message| format!("bootstrap status rejected peer: {message}"))?;
     if let Some(existing_addr) = members.get(member_node_id) {
         if existing_addr != member_addr {
             return Err(format!(
@@ -387,32 +416,6 @@ fn insert_bootstrap_member(
     }
     members.insert(member_node_id.to_string(), member_addr.to_string());
     Ok(())
-}
-
-/// Initializes the SSL/TLS manager from environment configuration.
-async fn initialize_ssl_manager() -> Option<Arc<flapjack::SslManager>> {
-    match flapjack::SslConfig::from_env() {
-        Ok(ssl_config) => {
-            tracing::info!(
-                "[SSL] SSL management enabled for IP: {}",
-                ssl_config.public_ip
-            );
-            match flapjack::SslManager::new(ssl_config).await {
-                Ok(mgr) => {
-                    flapjack_ssl::set_global_manager(Arc::clone(&mgr));
-                    Some(mgr)
-                }
-                Err(e) => {
-                    tracing::error!("[SSL] Failed to initialize SSL manager: {}", e);
-                    None
-                }
-            }
-        }
-        Err(e) => {
-            tracing::info!("[SSL] SSL management disabled: {}", e);
-            None
-        }
-    }
 }
 
 /// Initializes S3 snapshot configuration and restores any existing remote snapshots.
@@ -532,7 +535,10 @@ pub(crate) fn initialize_state(
         manager: Arc::clone(&infrastructure.manager),
         key_store: key_store.clone(),
         replication_manager: infrastructure.replication_manager.clone(),
-        ssl_manager: infrastructure.ssl_manager.clone(),
+        ssl_manager: infrastructure
+            .managed_ssl
+            .as_ref()
+            .and_then(|configured| configured.manager.clone()),
         analytics_engine: Some(Arc::clone(&infrastructure.analytics_engine)),
         recommend_config: RecommendConfig::from_env(),
         experiment_store: Some(Arc::new(ExperimentStore::new(Path::new(data_dir))?)),
@@ -698,4 +704,4 @@ mod tests {
 
 #[cfg(test)]
 #[path = "server_bootstrap_tests.rs"]
-mod bootstrap_tests;
+mod server_bootstrap_tests;

@@ -8,6 +8,22 @@ ORACLE="$SCRIPT_DIR/migration_import_contract.sh"
 NIGHTLY_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/nightly.yml"
 SCALE_EVIDENCE_HEAD="bbfd59bf64dae52626ee584e39bb7bff0b580494"
 
+# Meta-suite runtime ceiling (MIG-17R) — derived from host-local measurements taken on
+# Sunday, August 2, 2026, with `uptime` captured immediately before each of two sequential
+# full-suite runs on this host:
+#   run 1: elapsed 1205s @ 1-min load 84.54  (heavy host contention)  <- slowest observed
+#   run 2: elapsed  683s @ 1-min load 13.27  (light host load)
+# The 1.76x spread tracks the load spread, confirming both are single clean runs, not
+# overlapping suites. Ceiling = 2 x slowest observed = 2 x 1205 = 2410s, rounded down to
+# 2400s. Headroom = 2400 - 1205 = 1195s (~99% over the slowest run, ~3.5x over the
+# light-load run), absorbing further contention beyond the observed load of 84.54 while
+# staying below the 3600s `timeout` wrapper so this guard, not the timeout, is the binding
+# failure. A breach means either a real suite regression (fix the suite) or the host was
+# even more loaded than August 2, 2026 (re-derive from fresh measurements). The value is
+# env-overridable so a red-phase check can force failure with a below-observed ceiling.
+: "${MIGRATION_IMPORT_CONTRACT_META_SUITE_RUNTIME_CEILING_SECONDS:=2400}"
+readonly MIGRATION_IMPORT_CONTRACT_META_SUITE_RUNTIME_CEILING_SECONDS
+
 export MIGRATION_IMPORT_CONTRACT_SCALE_SAMPLER_INTERVAL_SECONDS="${MIGRATION_IMPORT_CONTRACT_SCALE_SAMPLER_INTERVAL_SECONDS:-0.001}"
 export MIGRATION_IMPORT_CONTRACT_READY_POLL_INTERVAL_SECONDS="${MIGRATION_IMPORT_CONTRACT_READY_POLL_INTERVAL_SECONDS:-0.01}"
 
@@ -593,19 +609,52 @@ def wait_for_sampled_sidecar_size(data_dir, corpus_size, trial_number, expected_
     )
 
 
-def wait_for_sampled_manifest_snapshot(data_dir, corpus_size, trial_number):
-    sampled_manifest = (
+def manifest_snapshot_matches(sampled_manifest, expected_manifest):
+    try:
+        manifest = json.loads(sampled_manifest.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+    completed = manifest.get("completed_objects", {})
+    expected_completed = expected_manifest["completed_objects"]
+    return (
+        completed.get("generation") == expected_completed["generation"]
+        and completed.get("count") == expected_completed["count"]
+        and completed.get("length") == expected_completed["length"]
+        and manifest.get("snapshot_token") == expected_manifest["snapshot_token"]
+    )
+
+
+def wait_for_sampled_manifest_snapshot(sampled_manifest, expected_manifest):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if manifest_snapshot_matches(sampled_manifest, expected_manifest):
+            return
+        time.sleep(0.01)
+    raise ScaleFixtureError(
+        f"timed out waiting for matching sampled manifest snapshot at {sampled_manifest}"
+    )
+
+def sampled_manifest_snapshot_path(data_dir, corpus_size, trial_number):
+    return (
         data_dir.parent / "logs" / "scale-trials" / str(corpus_size)
         / f"trial-{trial_number}" / "sampler.json.candidates" / "manifest.0.json"
     )
-    deadline = time.monotonic() + 5
-    while not sampled_manifest.exists() and time.monotonic() < deadline:
+
+def seed_stale_sampled_manifest_snapshot(sampled_manifest, manifest):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if sampled_manifest.parent.is_dir():
+            break
         time.sleep(0.01)
-    if sampled_manifest.exists():
-        return
-    raise ScaleFixtureError(
-        f"timed out waiting for sampled manifest snapshot for scale trial {trial_number} at n={corpus_size}"
-    )
+    if not sampled_manifest.parent.is_dir():
+        raise ScaleFixtureError(
+            f"timed out waiting for sampled manifest directory at {sampled_manifest.parent}"
+        )
+    stale_manifest = json.loads(json.dumps(manifest))
+    stale_manifest["snapshot_token"] = "stale-sampled-manifest"
+    sampled_manifest.write_text(json.dumps(stale_manifest, separators=(",", ":")), encoding="utf-8")
+    old_timestamp = time.time() - 10
+    os.utime(sampled_manifest, (old_timestamp, old_timestamp))
 
 def write_fake_job(target, corpus_size):
     data_dir_file = state / "data_dir"
@@ -657,7 +706,8 @@ def write_fake_job(target, corpus_size):
             "generation": expected_page_count,
             "count": corpus_size,
             "length": sidecar_sizes[-1],
-        }
+        },
+        "snapshot_token": f"{target_component}:{corpus_size}:{trial_number}",
     }
     if scenario == "scale_manifest_generation_drift":
         manifest["completed_objects"]["generation"] = page_count + 99
@@ -666,9 +716,12 @@ def write_fake_job(target, corpus_size):
     if scenario == "scale_manifest_length_drift":
         manifest["completed_objects"]["length"] = 1
     manifest_path = job_dir / "manifest.json"
+    if scenario == "scale_manifest_deleted_snapshot":
+        sampled_manifest = sampled_manifest_snapshot_path(data_dir, corpus_size, trial_number)
+        seed_stale_sampled_manifest_snapshot(sampled_manifest, manifest)
     manifest_path.write_text(json.dumps(manifest, separators=(",", ":")), encoding="utf-8")
     if scenario == "scale_manifest_deleted_snapshot":
-        wait_for_sampled_manifest_snapshot(data_dir, corpus_size, trial_number)
+        wait_for_sampled_manifest_snapshot(sampled_manifest, manifest)
         manifest_path.write_text(json.dumps({
             "lifecycle": "Deleted",
             "completed_objects": {"generation": 0, "count": 0, "length": 0},
@@ -1677,15 +1730,19 @@ evidence_scale_sampled_archives_resolve() {
 }
 
 evidence_scale_deleted_archives_preserve_authentic_state() {
-  local evidence="$1" archive
-  while IFS= read -r archive; do
+  local evidence="$1" archive target condition trial expected_token
+  while IFS=$'\t' read -r archive target condition trial; do
+    expected_token="${target}:${condition}:${trial}"
     jq -e '.lifecycle == "Deleted"' "$evidence/$archive/manifest.json" >/dev/null || return 1
     jq -e '
       .completed_objects.generation > 0
       and .completed_objects.count > 0
       and .completed_objects.length > 0
     ' "$evidence/$archive/manifest.sampled.json" >/dev/null || return 1
-  done < <(jq -r '.scale.conditions_observed[].trials[].job_archive' "$evidence/receipt.json")
+    jq -e --arg expected_token "$expected_token" \
+      '.snapshot_token == $expected_token' \
+      "$evidence/$archive/manifest.sampled.json" >/dev/null || return 1
+  done < <(jq -r '.scale.conditions_observed[].trials[] | [.job_archive, .target_index, .condition_n, .trial] | @tsv' "$evidence/receipt.json")
 }
 
 # The hot path is sample_scale_trial's poll loop, which re-runs every 10ms; the
@@ -1763,6 +1820,32 @@ assert_terminal_scenario_inventory() {
   if [ -s "$diff_out" ]; then
     sed 's/^/    /' "$diff_out"
   fi
+  return 1
+}
+
+is_positive_integer() {
+  case "$1" in
+    ""|*[!0-9]*|0) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+assert_meta_suite_runtime_ceiling() {
+  local elapsed_seconds="$1" ceiling_seconds
+  ceiling_seconds="$MIGRATION_IMPORT_CONTRACT_META_SUITE_RUNTIME_CEILING_SECONDS"
+  if ! is_positive_integer "$elapsed_seconds" || ! is_positive_integer "$ceiling_seconds"; then
+    printf '  [FAIL] meta-suite runtime ceiling\n'
+    printf '    elapsed=%s ceiling=%s must both be positive integer seconds\n' \
+      "$elapsed_seconds" "$ceiling_seconds"
+    return 1
+  fi
+  if [ "$elapsed_seconds" -le "$ceiling_seconds" ]; then
+    printf 'Meta-suite runtime ceiling: elapsed=%ss ceiling=%ss\n' \
+      "$elapsed_seconds" "$ceiling_seconds"
+    return 0
+  fi
+  printf '  [FAIL] meta-suite runtime ceiling\n'
+  printf '    elapsed=%ss exceeded ceiling=%ss\n' "$elapsed_seconds" "$ceiling_seconds"
   return 1
 }
 
@@ -2333,7 +2416,7 @@ assert_success_scenario() {
     && [ -n "$data_dir" ] \
     && [ ! -e "$data_dir" ] \
     && { [ "$mode" != "unavailable" ] || [ "$(cat "$runtime/state/node_id" 2>/dev/null)" = "migration-import-contract" ]; } \
-    && { [ "$mode" != "unavailable" ] || [ "$(cat "$runtime/state/peers" 2>/dev/null)" = "migration-peer=http://10.0.0.2:7700" ]; } \
+    && { [ "$mode" != "unavailable" ] || [ "$(cat "$runtime/state/peers" 2>/dev/null)" = "migration-peer=https://10.0.0.2:7700" ]; } \
     && [ -z "$(extract_evidence_path "$out")" ]; then
     pass "$label"
   else
@@ -3393,6 +3476,7 @@ assert_static_contract() {
 }
 
 main() {
+  local suite_started_seconds="$SECONDS" suite_elapsed_seconds
   force_failure_for_cleanup_probe
   echo 'migration_import_contract oracle meta-test'
   assert_static_contract
@@ -3556,6 +3640,8 @@ main() {
   assert_debbie_public_sync_surface
 
   assert_terminal_scenario_inventory || return 1
+  suite_elapsed_seconds=$((SECONDS - suite_started_seconds))
+  assert_meta_suite_runtime_ceiling "$suite_elapsed_seconds" || return 1
 
   printf '\nResults: %d/%d passed (%d skipped)\n' "$TESTS_PASSED" "$TESTS_RUN" "$TESTS_SKIPPED"
   if [ "$TESTS_FAILED" -gt 0 ]; then

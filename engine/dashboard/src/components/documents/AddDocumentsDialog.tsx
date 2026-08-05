@@ -362,6 +362,7 @@ export function AddDocumentsDialog({
                 </Button>
               </div>
               <textarea
+                aria-label="Documents JSON"
                 className="w-full h-44 p-3 text-sm font-mono rounded-md border border-input bg-background resize-y focus:outline-none focus:ring-2 focus:ring-ring"
                 placeholder={'[\n  { "objectID": "1", "title": "My document", "body": "..." }\n]'}
                 value={jsonText}

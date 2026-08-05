@@ -180,7 +180,7 @@ export function Synonyms() {
       ) : (
         <div className="space-y-2" data-testid="synonyms-list">
           {data.hits.map((synonym) => (
-            <Card key={synonym.objectID} className="p-4 hover:bg-accent/50 transition-colors">
+            <Card key={synonym.objectID} data-testid="synonym-card" className="p-4 hover:bg-accent/50 transition-colors">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-3 min-w-0">
                   <Badge variant="outline" className="shrink-0 text-xs">

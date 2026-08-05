@@ -22,6 +22,7 @@ pub mod analytics_dto;
 pub mod browse;
 pub mod chat;
 pub mod dashboard;
+pub mod dashboard_session;
 pub mod dictionaries;
 pub mod dto_algolia;
 pub mod experiments;
@@ -105,7 +106,9 @@ pub use keys::{
 pub use metrics::metrics_handler;
 pub use migration::{
     acknowledge_algolia_migration, cancel_algolia_migration, get_algolia_migration_status,
-    list_algolia_indexes, migrate_from_algolia, submit_algolia_migration, submit_privacy_scrub,
+    list_algolia_indexes, list_algolia_source_indexes_doc, list_meilisearch_source_indexes_doc,
+    list_typesense_source_indexes_doc, migrate_from_algolia, submit_algolia_migration,
+    submit_privacy_scrub,
 };
 pub use objects::{
     add_documents, add_record_auto_id, delete_by_query, delete_object, get_object, get_objects,

@@ -7,7 +7,7 @@
  * request.get/post/delete directly (which is banned by ESLint).
  * Fixture files are exempt from the ESLint spec-file rules.
  */
-import { expect, type APIRequestContext } from '@playwright/test';
+import { expect, type APIRequestContext, type TestInfo } from '@playwright/test';
 import { API_BASE, API_HEADERS } from './local-instance';
 import { buildApiPath, buildIndexPath, getSettings, searchIndex } from './index-api-helpers';
 import type { ApiKey, ApiKeyCreateResponse } from '../../src/lib/types';
@@ -69,7 +69,18 @@ export async function isVectorSearchEnabled(
   request: APIRequestContext,
 ): Promise<boolean> {
   const health = await getHealth(request);
-  return health.capabilities?.vectorSearch !== false;
+  return health.capabilities?.vectorSearch === true;
+}
+
+/** Mark vector-enabled browser coverage as not applicable on compiled-out builds. */
+export async function skipWhenVectorSearchDisabled(
+  request: APIRequestContext,
+  testInfo: TestInfo,
+  reason: string,
+): Promise<void> {
+  if (!(await isVectorSearchEnabled(request))) {
+    testInfo.skip(true, reason);
+  }
 }
 
 function buildExperimentPath(experimentId: string, ...segments: string[]): string {
@@ -742,8 +753,14 @@ type UpdateExperimentPayload = DashboardCreateExperimentPayload & {
 
 const DEFAULT_EXPERIMENT_WAIT_TIMEOUT_MS = 15_000;
 const DEFAULT_EXPERIMENT_WAIT_INTERVAL_MS = 250;
+const DEFAULT_EXPERIMENT_LIST_PAGE_SIZE = 10;
 
 type RawExperimentRecord = Record<string, unknown>;
+interface ExperimentListPage {
+  experiments: ExperimentRecord[];
+  count: number;
+  total: number;
+}
 
 function asUnknownRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -827,6 +844,37 @@ function normalizeExperimentRecord(
   };
 }
 
+function readNonNegativeInteger(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function normalizeExperimentListPage(body: unknown): ExperimentListPage {
+  const record = asUnknownRecord(body);
+  const experiments = Array.isArray(record.abtests)
+    ? record.abtests.map((entry) => normalizeExperimentRecord(asExperimentRecord(entry)))
+    : [];
+
+  return {
+    experiments,
+    count: readNonNegativeInteger(record.count) ?? experiments.length,
+    total: readNonNegativeInteger(record.total) ?? experiments.length,
+  };
+}
+
+async function fetchExperimentListPage(
+  request: APIRequestContext,
+  pagination?: { offset: number; limit: number },
+): Promise<ExperimentListPage> {
+  const res = await request.get(`${API_BASE}/2/abtests`, {
+    headers: API_HEADERS,
+    ...(pagination ? { params: pagination } : {}),
+  });
+  if (!res.ok()) {
+    throw new Error(`listExperiments failed (${res.status()}): ${await res.text()}`);
+  }
+  return normalizeExperimentListPage(await res.json());
+}
+
 async function postExperimentLifecycleAction(
   request: APIRequestContext,
   experimentId: string,
@@ -860,15 +908,23 @@ async function deleteExperimentsMatching(
 export async function listExperiments(
   request: APIRequestContext,
 ): Promise<ExperimentRecord[]> {
-  const res = await request.get(`${API_BASE}/2/abtests`, { headers: API_HEADERS });
-  if (!res.ok()) {
-    throw new Error(`listExperiments failed (${res.status()}): ${await res.text()}`);
+  const firstPage = await fetchExperimentListPage(request);
+  const experiments = [...firstPage.experiments];
+  const pageSize = firstPage.count > 0
+    ? firstPage.count
+    : DEFAULT_EXPERIMENT_LIST_PAGE_SIZE;
+
+  let offset = firstPage.count;
+  while (offset < firstPage.total) {
+    const page = await fetchExperimentListPage(request, { offset, limit: pageSize });
+    experiments.push(...page.experiments);
+    if (page.count === 0) {
+      break;
+    }
+    offset += page.count;
   }
-  const body = await res.json() as { abtests?: unknown };
-  if (!Array.isArray(body.abtests)) {
-    return [];
-  }
-  return body.abtests.map((entry) => normalizeExperimentRecord(asExperimentRecord(entry)));
+
+  return experiments;
 }
 
 /** Find an experiment by name. Throws if not found. */
@@ -1097,6 +1153,7 @@ export interface InsightEvent {
   positions?: number[];
   queryID?: string;
   eventSubtype?: string;
+  interleavingTeam?: 'control' | 'variant';
 }
 
 /** Send insight events via POST /1/events. Throws on failure. */

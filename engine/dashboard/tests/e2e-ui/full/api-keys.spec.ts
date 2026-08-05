@@ -145,8 +145,9 @@ test.describe('API Keys Page', () => {
     const keyCard = page.getByTestId('key-card').filter({ hasText: description });
     await expect(keyCard).toBeVisible({ timeout: 10_000 });
     const permissions = keyCard.getByTestId('key-permissions');
-    await expect(permissions.locator('div')).toHaveCount(expectedPermissions.length, { timeout: 10_000 });
-    const renderedPermissions = (await permissions.locator('div').allInnerTexts())
+    const permissionBadges = permissions.getByTestId('key-permission');
+    await expect(permissionBadges).toHaveCount(expectedPermissions.length, { timeout: 10_000 });
+    const renderedPermissions = (await permissionBadges.allInnerTexts())
       .map((permission) => permission.trim())
       .sort();
     expect(renderedPermissions).toEqual([...expectedPermissions].sort());
@@ -175,7 +176,7 @@ test.describe('API Keys Page', () => {
 
     const keyCard = page.getByTestId('key-card').filter({ hasText: prefixedDescription('Copy Feedback Key') });
     await expect(keyCard).toBeVisible({ timeout: 10_000 });
-    const keyValue = (await keyCard.locator('code').first().innerText()).trim();
+    const keyValue = (await keyCard.getByTestId('api-key-value').innerText()).trim();
 
     await expect(keyCard.getByRole('button', { name: 'Copy', exact: true })).toBeVisible({ timeout: 10_000 });
     await keyCard.getByRole('button', { name: 'Copy', exact: true }).click();

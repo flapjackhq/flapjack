@@ -1,0 +1,469 @@
+================================================================================
+SEC-W2 / in-binary TLS listener — Stage 1 RED baseline and design record
+Captured: 2026-08-01
+Branch: batman/jul31_5pm_2_in_binary_tls_listener
+HEAD at capture: 8456bfe1f ("baseline: pre-session scrai/tooling sync")
+Purpose: durable Stage 1 evidence. Stage 2 builds from this file, not from
+         re-discovery. All paths below are repo-relative.
+================================================================================
+
+--------------------------------------------------------------------------------
+SECTION 1 — MEILISEARCH TLS FLAG CONTRACT: VERIFIED
+--------------------------------------------------------------------------------
+
+STATUS: VERIFIED. The inherited claim in `ROADMAP.md:164` / `ROADMAP.md:211`
+("ship `--ssl-cert-path` / `--ssl-key-path` matching Meilisearch flag names",
+carried as an explicitly UNVERIFIED claim) is now confirmed correct against
+upstream. No near-miss spelling correction is needed.
+
+No Meilisearch binary is installed on this host, so `meilisearch --help` could
+not be used:
+
+    $ which meilisearch
+    meilisearch not found
+    $ ls /usr/local/bin/meilisearch /opt/homebrew/bin/meilisearch
+    ls: /opt/homebrew/bin/meilisearch: No such file or directory
+    ls: /usr/local/bin/meilisearch: No such file or directory
+
+Verified instead against THREE independent authoritative sources, two of which
+are upstream source artifacts rather than prose documentation.
+
+SOURCE A — Meilisearch published configuration reference (the exact URL named in
+the Stage 1 checklist):
+    https://www.meilisearch.com/docs/resources/self_hosting/configuration/reference
+  Reported verbatim:
+    --ssl-cert-path        env MEILI_SSL_CERT_PATH   "Value must be a path to
+                                                      PEM-formatted certificates"
+    --ssl-key-path         env MEILI_SSL_KEY_PATH    "RSA private key or PKCS8-
+                                                      encoded private key, both
+                                                      in PEM format"
+    --ssl-auth-path        env MEILI_SSL_AUTH_PATH
+    --ssl-ocsp-path        env MEILI_SSL_OCSP_PATH
+    --ssl-require-auth     env MEILI_SSL_REQUIRE_AUTH
+    --ssl-resumption       env MEILI_SSL_RESUMPTION
+    --ssl-tickets          env MEILI_SSL_TICKETS
+
+SOURCE B — upstream clap definitions (primary source of truth for the CLI):
+    https://raw.githubusercontent.com/meilisearch/meilisearch/main/crates/meilisearch/src/option.rs
+  Verbatim:
+    #[clap(long, env = MEILI_SSL_CERT_PATH, value_parser)]
+    pub ssl_cert_path: Option<PathBuf>,
+
+    #[clap(long, env = MEILI_SSL_KEY_PATH, value_parser)]
+    pub ssl_key_path: Option<PathBuf>,
+
+  clap's `long` derive kebab-cases the field name, so `ssl_cert_path` ->
+  `--ssl-cert-path` and `ssl_key_path` -> `--ssl-key-path`. This is the
+  mechanism that makes Source A's spelling authoritative rather than editorial.
+
+SOURCE C — upstream shipped config file:
+    https://raw.githubusercontent.com/meilisearch/meilisearch/main/config.toml
+  Verbatim:
+    # Sets the server's SSL certificates.
+    # ssl_cert_path = "./path/to/certfile"
+    # Sets the server's SSL key files.
+    # ssl_key_path = "./path/to/private-key"
+
+CONCLUSION FOR STAGE 2 — use these exact spellings in
+`engine/flapjack-server/src/main.rs`:
+
+    --ssl-cert-path   (PEM certificate chain; first cert certifies the key,
+                       last cert is a root CA)
+    --ssl-key-path    (RSA or PKCS8 private key, PEM)
+
+ENV VAR NAMING — DELIBERATE DIVERGENCE. Do NOT copy `MEILI_SSL_CERT_PATH` /
+`MEILI_SSL_KEY_PATH`. Every other flag in `struct Cli`
+(`engine/flapjack-server/src/main.rs:24-41`) uses the `FLAPJACK_` prefix
+(`FLAPJACK_DATA_DIR`, `FLAPJACK_BIND_ADDR`, `FLAPJACK_PORT`). Stage 2 should use
+`FLAPJACK_SSL_CERT_PATH` / `FLAPJACK_SSL_KEY_PATH`. The compatibility promise in
+`ROADMAP.md` is about the CLI flag names an operator types; adopting a foreign
+env prefix would break this repo's single env-naming convention and collide
+conceptually with the existing `FLAPJACK_SSL_EMAIL` / `FLAPJACK_ACME_DIRECTORY`
+owned by `engine/flapjack-ssl/src/config.rs`.
+
+OUT OF SCOPE (recorded so a later lane does not re-verify): `--ssl-auth-path`,
+`--ssl-ocsp-path`, `--ssl-require-auth`, `--ssl-resumption`, `--ssl-tickets`
+exist upstream but are not in this lane's `ROADMAP.md` row.
+
+--------------------------------------------------------------------------------
+SECTION 2 — RED BASELINE: NO SERVER-SIDE TLS EXISTS AT HEAD
+--------------------------------------------------------------------------------
+
+2.1 — Baseline build green BEFORE any probe, so probe failure is attributable to
+      missing TLS and not to a stale or broken binary.
+
+    $ cd engine && cargo build -p flapjack-server 2>&1 | tail -30
+    ...
+       Compiling flapjack-http v1.0.10 (engine/flapjack-http)
+       Compiling flapjack-replication v1.0.10 (engine/flapjack-replication)
+       Compiling flapjack-server v1.0.10 (engine/flapjack-server)
+        Finished `dev` profile [unoptimized + debuginfo] target(s) in 3m 43s
+    exit 0; produced engine/target/debug/flapjack
+
+2.2 — Source-level proof that no TLS acceptor exists (checklist-mandated grep):
+
+    $ cd engine && grep -rn "rustls\|TlsAcceptor" flapjack-http/src/ flapjack-server/src/
+    exit=1
+    (zero matching lines — empty result is the evidence)
+
+    Note: `rustls` DOES appear in the dependency tree (Cargo.lock has
+    rustls 0.23.40, tokio-rustls 0.26.4, hyper-rustls 0.27.9), pulled in as a
+    CLIENT-side TLS stack by reqwest/rust-s3/instant-acme. Nothing in the server
+    crates references it. See Section 3.4.
+
+2.3 — Behavioral RED probe. Launch command (isolated temp data dir, ephemeral
+      port, auth off so the probe needs no key):
+
+    $ TMPD=$(mktemp -d)
+    $ engine/target/debug/flapjack --data-dir "$TMPD/data" --auto-port --no-auth \
+        > "$TMPD/server.log" 2>&1 &
+
+    Resolved port for this run: 51845 (from the startup banner line
+    `->  Local:      http://127.0.0.1:51845`).
+
+    Liveness control — the server IS up and answering on that exact port:
+
+    $ curl -sS -o /dev/null -w 'HTTP %{http_code} scheme=%{scheme}\n' \
+        http://127.0.0.1:51845/health
+    HTTP 200 scheme=HTTP
+
+    This control matters: without it, a failed handshake could just mean
+    "nothing listening". It proves the same socket serves plaintext HTTP and
+    refuses TLS.
+
+2.4 — PROBE 1 (checklist / operator-directive form):
+
+    $ openssl s_client -connect 127.0.0.1:51845 </dev/null
+    8717349120:error:1404B42E:SSL routines:ST_CONNECT:tlsv1 alert protocol version:.../tls13_lib.c:151:
+    CONNECTED(00000003)
+    ---
+    no peer certificate available
+    ---
+    No client certificate CA names sent
+    ---
+    SSL handshake has read 5 bytes and written 294 bytes
+    ---
+    New, (NONE), Cipher is (NONE)
+    Secure Renegotiation IS NOT supported
+    Compression: NONE
+    Expansion: NONE
+    No ALPN negotiated
+    SSL-Session:
+        Protocol  : TLSv1.3
+        Cipher    : 0000
+        Session-ID:
+        Master-Key:
+    ---
+    probe1_exit=1
+
+    Reading: TCP connect succeeds (`CONNECTED`), then the handshake dies.
+    "no peer certificate available", `Cipher is (NONE)`, and a nonzero exit are
+    the RED assertions. The 5 bytes read back are the plain-HTTP server's
+    response bytes being misread as a TLS record header, which is exactly the
+    "plaintext listener, no terminator" signature.
+
+2.5 — PROBE 2 (SNI variant):
+
+    $ openssl s_client -connect 127.0.0.1:51845 -servername localhost </dev/null
+    8717349120:error:1404B42E:SSL routines:ST_CONNECT:tlsv1 alert protocol version:.../tls13_lib.c:151:
+    CONNECTED(00000003)
+    ---
+    no peer certificate available
+    ---
+    SSL handshake has read 5 bytes and written 312 bytes
+    ---
+    New, (NONE), Cipher is (NONE)
+    No ALPN negotiated
+    ---
+    probe2_exit=1
+
+    WHY THE SNI VARIANT MATTERS HERE: identical failure, and that identity is
+    the point. It proves the current failure is "no TLS terminator at all", not
+    "a terminator that rejected this server name". Stage 2 ships a single
+    static cert/key pair with no SNI-based cert selection, so once TLS lands,
+    Probe 1 and Probe 2 must BOTH succeed and must both present the same
+    certificate. A future Stage-2/3 result where Probe 2 succeeds and Probe 1
+    fails would mean an SNI-required config was introduced — a regression
+    against the loopback/IP-address use case this lane targets, since
+    `openssl s_client -connect 127.0.0.1:<port>` sends no SNI at all.
+
+2.6 — Client tool identity (LibreSSL, not OpenSSL — macOS system default):
+
+    $ openssl version
+    LibreSSL 3.3.6
+
+    Stage 3's probe script must not assume GNU/OpenSSL-only flags or error
+    strings. LibreSSL 3.3.6's failure text here is `tlsv1 alert protocol
+    version`; OpenSSL 3.x typically emits `wrong version number` for the same
+    condition. Assert on handshake failure + absence of a peer certificate +
+    nonzero exit, NOT on the vendor-specific error string.
+
+2.7 — Graceful-shutdown behavior that must survive Stage 2 (captured from the
+      same run's server log at SIGTERM):
+
+    INFO flapjack_http::startup: [shutdown] Received SIGTERM
+    INFO flapjack_http::server: [shutdown] Server stopped accepting connections, cleaning up... timeout_env_var="FLAPJACK_SHUTDOWN_TIMEOUT_SECS" timeout_secs=30
+    INFO flapjack_http::server: [shutdown] Analytics buffers flushed
+    INFO flapjack::analytics::collector: [analytics] Flush loop shutting down
+    INFO flapjack_http::server: [shutdown] All write queues drained before deadline timeout_env_var="FLAPJACK_SHUTDOWN_TIMEOUT_SECS" timeout_secs=30
+
+    These five lines are the plaintext GREEN reference for the drain path.
+    Stage 2's TLS path must emit the same sequence, in particular
+    "All write queues drained before deadline". Its failure twin —
+    "Write queue drain timed out; forcing exit may drop queued writes
+    (data-loss risk)" — is the data-loss condition named in the Stage 2
+    preserve block.
+
+--------------------------------------------------------------------------------
+SECTION 3 — OWNER MAP (traced at HEAD)
+--------------------------------------------------------------------------------
+
+3.1 — CLI / config owners Stage 2 must EXTEND (not duplicate):
+
+  `engine/flapjack-server/src/main.rs`
+    - `struct Cli` (line 20). Every option is `#[arg(long, env = "FLAPJACK_...")]`.
+      This is where `--ssl-cert-path` / `--ssl-key-path` belong.
+    - `resolve_runtime_config()` (line 265) -> `resolve_data_dir()` (274),
+      `resolve_bind_addr()` (285). Precedence is resolved HERE, then handed to
+      the http crate via env. `resolve_bind_addr` already models the exact
+      pattern Stage 2 needs for conflict rejection: `--auto-port` + `--bind-addr`
+      returns `Err("--auto-port cannot be used with --bind-addr")` (line 290).
+      The both-or-neither TLS check should follow that shape and be a sibling
+      `resolve_tls_config()` returning `Result<_, String>` — a pure function,
+      unit-testable without binding a socket.
+
+  `engine/flapjack-http/src/startup.rs`
+    - `ServerConfig` + `load_server_config()` (line 350). This is the SINGLE
+      env-to-struct reader for the http crate (`FLAPJACK_ENV`,
+      `FLAPJACK_NO_AUTH`, `FLAPJACK_DATA_DIR`, `FLAPJACK_BIND_ADDR`, ...). TLS
+      paths must land on `ServerConfig` here. Do NOT add a second `std::env::var`
+      call inside `server.rs`.
+    - `print_startup_banner()` (line 748) — ADJACENT SINGLE-SOURCE OWNER, and
+      the easiest thing to silently break. Line 757 hardcodes
+      `let url = format!("http://{}", bind_addr);` and lines 774/780 derive the
+      dashboard and swagger-ui URLs from that same `url`. Ship TLS without
+      touching this and the banner advertises three `http://` links against an
+      HTTPS-only socket. Stage 2 must thread a scheme through this one function
+      so all three lines flip together; it must not add a second banner path.
+      Upstream Meilisearch has this exact bug filed
+      (meilisearch/meilisearch#2660, "Address in the launch resume is always
+      http even if https is used") — do not inherit it.
+    - `shutdown_signal()` — the shutdown future the plaintext path awaits.
+
+3.2 — Listener owner (`engine/flapjack-http/src/server.rs`, `serve()`):
+
+    let listener = tokio::net::TcpListener::bind(&infrastructure.bind_addr).await?;
+    let auth_status = resolve_auth_status(&server_config, key_is_new, admin_key);
+    print_startup_banner(&listener.local_addr()?.to_string(), auth_status, ...);
+
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
+
+    let _ = run_graceful_shutdown(&mut infrastructure, &state, shutdown_timeout_secs).await;
+    Ok(())
+
+  That is the entire block to swap. Three properties are load-bearing:
+    (a) `listener.local_addr()` must still be read BEFORE serving, because
+        `--auto-port` binds :0 and the banner (and every test that scrapes the
+        banner for the port, including the RED probe above) depends on it.
+    (b) `into_make_service_with_connect_info::<SocketAddr>()` is what makes
+        `ConnectInfo<SocketAddr>` extractable.
+    (c) `run_graceful_shutdown(...)` runs AFTER the serve future returns. It is
+        a separate statement, not chained — so the TLS arm must return control
+        to this same point rather than owning its own exit.
+
+3.3 — SSL owner is ACME state, NOT socket termination. Confirmed:
+
+  `engine/flapjack-http/src/server_init.rs`
+    - `InfrastructureState.ssl_manager: Option<Arc<flapjack::SslManager>>` (36)
+    - `initialize_ssl_manager()` (396): builds an `SslManager` from
+      `SslConfig::from_env()`, registers it globally, returns `None` when
+      `FLAPJACK_SSL_EMAIL` is unset. Never touches a socket.
+  `engine/flapjack-ssl/src/manager.rs`
+    - `struct SslManager` (11) holds `config`, `acme_client`, `last_check`,
+      `last_renewal`, `renewal_status`. There is NO in-memory certificate and NO
+      key field. Public API is `new`, `start_renewal_loop`, `get_acme_client`,
+      `get_status`.
+  `engine/flapjack-http/src/handlers/internal.rs`
+    - `acme_challenge()` (972) serves `/.well-known/acme-challenge/:token` over
+      PLAIN HTTP via `get_challenge_response`. ADJACENT OWNER TO PRESERVE:
+      HTTP-01 validation is defined to happen over port 80 plaintext. Stage 2
+      must not make this route unreachable, and Stage 4 must not move it behind
+      TLS.
+
+  FINDING RELEVANT TO STAGE 4 (recorded now so Stage 4 does not re-derive it):
+  the existing ACME path CANNOT feed an in-binary terminator without a change.
+    - `manager.rs:126` — `let (cert_pem, _key_pem) = acme_client.request_certificate(...)`.
+      The private key is DISCARDED. `AcmeClient::request_certificate`
+      (`engine/flapjack-ssl/src/acme.rs:55`) returns `(certificate_pem,
+      private_key_pem)`, but only the cert survives.
+    - `manager.rs:153` `write_certificate_files()` writes only `fullchain.pem`
+      to the hardcoded absolute path `/etc/letsencrypt/live/<ip>/`.
+    - `manager.rs:172` `reload_nginx()` shells out to `systemctl reload nginx`.
+  In other words the current ACME implementation assumes an EXTERNAL nginx
+  terminator holding a key it never sees. Stage 4's "can SslManager feed the
+  selected terminator without expanding this lane?" question therefore starts
+  from a NO on the current code: it needs key retention plus a non-root-owned
+  storage location plus a reload hook that is not `systemctl`. Stage 4 should
+  weigh that against filing the gap spec.
+
+3.4 — Dependency reachability (checked before recommending anything new):
+
+  Already in `engine/Cargo.lock`, so no new tree:
+    rustls 0.23.40, rustls-pki-types 1.14.1, tokio-rustls 0.26.4,
+    hyper 1.9.0, hyper-util 0.1.20, ring 0.17.14, rcgen 0.13.2 (+0.14.8)
+  NOT present:
+    rustls-pemfile (0 entries), axum-server (0 entries)
+  Direct declarations today: no workspace crate declares tokio-rustls; rustls
+  arrives only transitively through reqwest `rustls-tls`, rust-s3
+  `tokio-rustls-tls`, and flapjack-ssl's instant-acme `hyper-rustls`/`ring`.
+
+  So a tokio-rustls-based seam adds ONE genuinely new crate (`rustls-pemfile`,
+  a tiny PEM parser) and promotes already-compiled crates to direct deps. An
+  `axum-server` seam would add a new crate plus its own server stack.
+
+--------------------------------------------------------------------------------
+SECTION 4 — STAGE 2 SEAM DECISION
+--------------------------------------------------------------------------------
+
+4.0 — THE HARD CONSTRAINT (this is what decides the stage):
+
+  axum 0.7.9's `serve` is hard-bound to a concrete `tokio::net::TcpListener`.
+  Verified in the vendored crate source, `axum-0.7.9/src/serve.rs:92`:
+
+      pub fn serve<M, S>(tcp_listener: TcpListener, make_service: M) -> Serve<M, S>
+
+  and `axum-0.7.9/src/serve.rs:532`:
+
+      pub struct IncomingStream<'a> {
+          tcp_stream: &'a TokioIo<TcpStream>,
+          remote_addr: SocketAddr,
+      }
+
+  There is no `Listener` trait in axum 0.7 (that arrived in axum 0.8). A
+  `tokio_rustls::server::TlsStream` therefore CANNOT be handed to
+  `axum::serve`. "Just wrap the listener and keep calling axum::serve" is not
+  available. Any plan that assumes it will fail at Stage 2 compile time.
+
+4.1 — THE ENABLING FACT (this is what makes the chosen seam cheap):
+
+  `axum-0.7.9/src/extract/connect_info.rs:97`:
+
+      impl Connected<SocketAddr> for SocketAddr {
+          fn connect_info(remote_addr: SocketAddr) -> Self { remote_addr }
+      }
+
+  and line 103:
+
+      impl<S, C, T> Service<T> for IntoMakeServiceWithConnectInfo<S, C>
+      where S: Clone, C: Connected<T>
+
+  Consequence: the value returned by
+  `app.into_make_service_with_connect_info::<SocketAddr>()` is a `Service` over
+  BOTH `IncomingStream<'_>` (what `axum::serve` feeds it) AND a bare
+  `SocketAddr`. A hand-rolled TLS accept loop can call
+  `make_service.call(peer_addr)` and get back the identical
+  `AddExtension<Router, ConnectInfo<SocketAddr>>` that the plaintext path
+  produces. Connect-info is preserved by construction, using the same
+  expression, not by a parallel re-implementation.
+
+4.2 — DECISION: extract one small TLS-serve seam inside `flapjack-http`
+      (e.g. `engine/flapjack-http/src/tls_serve.rs`), and have `serve()` choose
+      between the existing `axum::serve(...)` arm and the new arm at the single
+      existing call site.
+
+  Shape:
+    - `serve()` keeps binding ONE `tokio::net::TcpListener` and keeps calling
+      `print_startup_banner(&listener.local_addr()?...)` before serving, so
+      `--auto-port` and banner behavior are untouched. Only the scheme argument
+      to the banner changes.
+    - `let make_service = app.into_make_service_with_connect_info::<SocketAddr>();`
+      is hoisted so BOTH arms consume the same expression (4.1).
+    - Plaintext arm: unchanged `axum::serve(listener, make_service)
+      .with_graceful_shutdown(shutdown_signal()).await?`.
+    - TLS arm: `tokio_rustls::TlsAcceptor` over the same listener; per
+      connection `make_service.call(peer_addr)` -> `TowerToHyperService` ->
+      `hyper_util::server::conn::auto::Builder::serve_connection_with_upgrades`;
+      accept loop selects against `shutdown_signal()` and drains in-flight
+      connections with `hyper_util::server::graceful::GracefulShutdown`.
+    - `run_graceful_shutdown(...)` stays OUTSIDE the match, exactly where it is
+      today. Both arms fall through to it, so the drain cannot be skipped by
+      construction rather than by remembering to call it.
+  New deps: `tokio-rustls` + `rustls` + `rustls-pemfile` (+ `hyper-util`
+  features `server-auto`, `server-graceful`, `service`) on
+  `engine/flapjack-http/Cargo.toml`. Only rustls-pemfile is new to the lock
+  (3.4). Stage 2 must install a process-level rustls crypto provider explicitly
+  (`rustls::crypto::ring::default_provider().install_default()`); rustls 0.23
+  panics at `ServerConfig` build time if none is set, and `ring` is already the
+  provider in tree via instant-acme.
+
+  WHY THIS IS CLEANER THAN A PARALLEL SERVER PATH: the risk this lane is
+  actually exposed to is DUPLICATE OWNERSHIP of two things the Stage 2 preserve
+  block names — connect-info and the write-queue drain. A parallel
+  `serve_tls()` entry point would fork the whole startup sequence (config load,
+  auth validation, key store, infrastructure init, pre-serve barrier,
+  background tasks, banner) and give the drain a second caller that can rot
+  independently. Confining the fork to the ~15 lines between "listener bound"
+  and "serve future returned" means startup, banner, and shutdown each keep
+  exactly one owner. The TLS arm is a listener detail, not a second server.
+
+4.3 — ALTERNATIVE CONSIDERED AND REJECTED: `axum-server` crate with its
+      `tls-rustls` feature.
+  Rejected on ownership, not on capability. `axum-server` drives graceful
+  shutdown through its own `Handle` type (`handle.graceful_shutdown(Some(dur))`)
+  rather than through a shutdown future. Adopting it means either the existing
+  `shutdown_signal()` in `engine/flapjack-http/src/startup.rs` stops being the
+  single shutdown owner, or a bridging task is added whose only job is to
+  translate one shutdown mechanism into another — a second owner for the exact
+  invariant the Stage 2 preserve block says must not be lost. It also brings a
+  whole crate that is not in the lock today (3.4) to do what a bounded amount of
+  already-compiled hyper-util code does, and its `Accept` abstraction would have
+  to be re-checked for connect-info behavior anyway.
+
+4.4 — ALTERNATIVE CONSIDERED AND REJECTED: upgrade axum 0.7 -> 0.8 to use the
+      new `Listener` trait, which would let `axum::serve` take a TLS listener
+      directly.
+  This is the technically tidiest end state and it is far outside this lane. It
+  is a breaking upgrade across `flapjack` (feature `axum-support`),
+  `flapjack-http` (every handler, extractor, and the utoipa/utoipa-swagger-ui
+  integration), and `flapjack-server`. This lane's `ROADMAP.md` row is an
+  optional listener flag, and its own text says "the flag is an option, not a
+  new blessed path". Trading that for a workspace-wide framework migration
+  inverts the cost. Recorded here so a later reviewer sees it was weighed, not
+  missed.
+
+--------------------------------------------------------------------------------
+SECTION 5 — OPEN QUESTIONS CARRIED TO LATER STAGES
+--------------------------------------------------------------------------------
+
+Q1 (Stage 2) — Bad-input failure mode. The `ROADMAP.md` row and the stage text
+   require failing loudly rather than falling back to plaintext. Unresolved
+   detail: cert/key files are read at bind time, so an unreadable or malformed
+   PEM must abort startup with a nonzero exit BEFORE `print_startup_banner`
+   prints a URL. Decide whether that error exits from `resolve_tls_config()` in
+   `main.rs` (pure, testable, but cannot catch a file deleted between parse and
+   bind) or from `serve()`. Recommendation: validate-and-load in `main.rs`,
+   surface I/O errors there, and treat a later bind-time failure as a hard
+   `Err` out of `serve()`.
+
+Q2 (Stage 2/3) — Does the dashboard/swagger-ui asset path or any CORS default
+   assume `http://`? `cors_origins_from_env()` defaults to loopback-only mode.
+   Not traced this stage; flagged because an HTTPS origin is a different origin
+   than the same host over HTTP.
+
+Q3 (Stage 3) — Cert generation for the probe. `rcgen` 0.13 is already a
+   `flapjack-ssl` dependency and could generate the self-signed pair in-process,
+   avoiding a hard dependency on the host's `openssl req`. Not decided here.
+
+Q4 (Stage 4) — Whether to fix or gap-spec the ACME path, given the discarded
+   private key, the hardcoded `/etc/letsencrypt/live` path, and the
+   `systemctl reload nginx` call documented in 3.3. Evidence is captured; the
+   disposition is Stage 4's to make.
+
+================================================================================
+END OF STAGE 1 RECORD
+================================================================================

@@ -360,6 +360,49 @@ partition healing, or quorum recovery.
 **Recovery:** Re-run the probe against a stable emitter set with re-anchored windows; if deviation persists, recalibrate the bound from a fresh sample using the formula above (`ceil(max(max_observed * 2, 50))`, owner `docs/reference/research/pl12_stage1_baseline.md`) before changing circuit-breaker defaults.
 **Test (where applicable):** `bash engine/loadtest/tests/ha_peer_failed_amplification_acceptance.sh`
 
+### Scenario: Roll peer-identity enforcement through an HA cluster
+
+**Symptom:** During a binary rollout, a node with replication intent and no
+`FLAPJACK_REPLICATION_API_KEY` fails startup unless
+`FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS=1` is set. Any node refuses
+an `http://` peer unless
+`FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1` is set, including when the
+dedicated peer credential or server authentication is absent.
+**Diagnosis:** Replication fan-out and analytics rollup fan-out now require an
+outbound peer identity for configured replication, and credentialed cleartext
+peer origins are default-off. A rejected startup peer fails configuration
+loading instead of being dropped and allowing the node to serve with reduced
+topology. Analytics queries forward caller-supplied API keys to peers even when
+server authentication is disabled, so the unauthenticated-replication escape
+does not make those requests safe for cleartext transport.
+`FLAPJACK_BOOTSTRAP_PEER` and runtime
+`POST /internal/cluster/peers` share the same cleartext transport policy.
+Bootstrap join remains admin-only and sends the admin API key, so the
+unauthenticated-replication escape does not by itself permit an `http://`
+bootstrap origin; that requires the separate cleartext escape. Peer
+credentials do not authorize add/remove membership or
+`POST /internal/rotate-admin-key`.
+**Recovery:**
+
+1. Generate one shared `FLAPJACK_REPLICATION_API_KEY` and set it on all nodes
+   before or during the binary rollout. Keep `FLAPJACK_ADMIN_KEY` configured on
+   every node.
+2. Prefer `https://` peer origins for `FLAPJACK_PEERS`,
+   `FLAPJACK_BOOTSTRAP_PEER`, persisted `node.json`, and runtime membership
+   changes.
+3. If zero-downtime compatibility requires it, set
+   `FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS=1` only on nodes that must
+   start before the shared peer key is present, and set
+   `FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1` only for temporary
+   `http://` peers on operator-controlled transport. This separate override is
+   required for analytics query fan-out and an admin-authenticated `http://`
+   bootstrap join even when the dedicated peer key or server authentication is
+   absent.
+4. Remove both escape variables after `/internal/cluster/status` shows the
+   cluster has converged with the shared peer key and safe peer origins.
+
+**Test (where applicable):** `cd engine && timeout 1200 cargo test -p flapjack-replication --lib -- cleartext_`; `cd engine && timeout 1200 cargo test -p flapjack-http --lib -- startup_unauthenticated_peer_escape_still_requires_tls_for_authenticated_analytics`; `cd engine && timeout 1200 cargo test -p flapjack-http --lib -- add_cluster_peer_rejects_cleartext_transport_without_peer_key`; `cd engine && bash tests/replication_peer_auth_http_probe.sh`
+
 ### Scenario: Add or remove an HA node
 
 **Symptom:** Operators need to change HA membership while preserving catch-up
@@ -460,7 +503,7 @@ and ADR `0005`.
 | Delete durability | PL-14 is done: delete handlers route through the durable delete path instead of unbounded `delete_documents_sync` calls. Behavioral ownership remains with `delete_documents_durable` in `engine/src/index/manager/write.rs`, delete callers in `objects/batch.rs`, `objects/mod.rs`, and `replicas.rs`, plus the non-terminal task eviction guard in `engine/src/index/manager/mod.rs`. |
 | 429 / 503 | Transient errors include `Retry-After: 1`; clients SHOULD retry with the same key. |
 
-### Known limitations (paid-beta posture)
+### Known limitations (current self-hosted posture)
 
 - **Same key, different body**: the cache key is the header value only. Sending the
   same `X-Flapjack-Idempotency-Key` with a different body within the TTL window

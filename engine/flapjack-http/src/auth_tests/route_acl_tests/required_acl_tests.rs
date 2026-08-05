@@ -18,6 +18,10 @@ fn assert_unmapped_route(method: Method, path: &str) {
     assert_eq!(required_acl_for_route(&method, path), RouteAcl::Unmapped);
 }
 
+fn assert_peer_or_admin_route(method: Method, path: &str) {
+    assert_eq!(required_acl_for_route(&method, path), RouteAcl::PeerOrAdmin);
+}
+
 #[test]
 fn mapped_route_returns_exact_required_acl() {
     assert_required_acl(Method::GET, "/1/indexes", "listIndexes");
@@ -211,13 +215,13 @@ fn acl_dictionaries_settings_and_languages() {
 // ── /internal/* ACL ──
 
 #[test]
-fn acl_internal_replicate_requires_admin() {
-    assert_required_acl(Method::POST, "/internal/replicate", "admin");
+fn acl_internal_replicate_requires_peer_or_admin() {
+    assert_peer_or_admin_route(Method::POST, "/internal/replicate");
 }
 
 #[test]
-fn acl_internal_ops_requires_admin() {
-    assert_required_acl(Method::GET, "/internal/ops", "admin");
+fn acl_internal_ops_requires_peer_or_admin() {
+    assert_peer_or_admin_route(Method::GET, "/internal/ops");
 }
 
 #[test]
@@ -236,8 +240,8 @@ fn acl_internal_storage_requires_admin() {
 }
 
 #[test]
-fn acl_internal_snapshot_capability_requires_admin() {
-    assert_required_acl(Method::GET, "/internal/snapshots/capability", "admin");
+fn acl_internal_snapshot_capability_requires_peer_or_admin() {
+    assert_peer_or_admin_route(Method::GET, "/internal/snapshots/capability");
 }
 
 #[test]
@@ -270,6 +274,14 @@ fn acl_async_migration_routes_require_admin_with_segment_safe_prefix() {
         let job_path = format!("{provider_path}/01890f8e-8b28-78e8-b542-8cfdcb2d4f24");
 
         assert_required_acl(Method::POST, &provider_path, "admin");
+        // The neutral source-discovery route inherits the `/1/migrations/` prefix
+        // owner in `auth/route_acl.rs` (left untouched); this asserts that inherited
+        // admin requirement rather than adding a new ACL rule.
+        assert_required_acl(
+            Method::POST,
+            &format!("{provider_path}/list-indexes"),
+            "admin",
+        );
         assert_required_acl(Method::GET, &job_path, "admin");
         assert_required_acl(Method::POST, &format!("{job_path}/cancel"), "admin");
         assert_required_acl(Method::POST, &format!("{job_path}/acknowledge"), "admin");

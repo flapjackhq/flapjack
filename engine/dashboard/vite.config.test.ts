@@ -48,7 +48,17 @@ describe('vite.config lifecycle contracts', () => {
       '/internal': mockInstance.backendBaseUrl,
       '/api-docs': mockInstance.backendBaseUrl,
       '/swagger-ui': mockInstance.backendBaseUrl,
+      '/__flapjack_metrics': {
+        target: mockInstance.backendBaseUrl,
+        rewrite: expect.any(Function),
+      },
     });
+
+    const metricsProxy = config.server?.proxy?.['/__flapjack_metrics'];
+    expect(typeof metricsProxy).toBe('object');
+    if (typeof metricsProxy === 'object') {
+      expect(metricsProxy.rewrite?.('/__flapjack_metrics')).toBe('/metrics');
+    }
   });
 
   it('keeps Playwright artifact directories out of Vite watch graph', async () => {

@@ -1,6 +1,11 @@
 import { test, expect } from '../fixtures/auth.fixture';
 import type { APIRequestContext } from '@playwright/test';
-import { seedAnalytics, deleteIndex, DEFAULT_ANALYTICS_CONFIG } from '../fixtures/analytics-seed';
+import {
+  clearAnalytics,
+  seedAnalytics,
+  deleteIndex,
+  DEFAULT_ANALYTICS_CONFIG,
+} from '../fixtures/analytics-seed';
 import { API_BASE as API, API_HEADERS as H } from '../fixtures/local-instance';
 
 /**
@@ -46,8 +51,12 @@ function getDateRange() {
 }
 
 test.describe('Analytics Data API Verification (no browser)', () => {
+  test.describe.configure({ mode: 'serial' });
+  let cleanupRequired = false;
+
   test.beforeAll(async ({ request }) => {
     await skipIfNoServer({ request });
+    cleanupRequired = true;
     await seedAnalytics(request, {
       ...DEFAULT_ANALYTICS_CONFIG,
       indexName: INDEX,
@@ -55,7 +64,12 @@ test.describe('Analytics Data API Verification (no browser)', () => {
   });
 
   test.afterAll(async ({ request }) => {
-    try { await deleteIndex(request, INDEX); } catch { /* ignore */ }
+    if (!cleanupRequired) return;
+    try {
+      await clearAnalytics(request, INDEX);
+    } finally {
+      await deleteIndex(request, INDEX);
+    }
   });
 
   test.beforeEach(skipIfNoServer);

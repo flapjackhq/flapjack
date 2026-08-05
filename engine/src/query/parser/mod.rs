@@ -3,7 +3,7 @@ use crate::text_normalization::normalize_for_search;
 use crate::types::Query;
 
 /// Determine if a character is within CJK (Chinese, Japanese, Korean) or related Unicode ranges, including Han ideographs, Hiragana, Katakana, Hangul, and combining marks.
-fn is_cjk(c: char) -> bool {
+pub(crate) fn is_cjk(c: char) -> bool {
     matches!(c,
         '\u{4E00}'..='\u{9FFF}' |
         '\u{3400}'..='\u{4DBF}' |

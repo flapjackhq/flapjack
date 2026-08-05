@@ -146,30 +146,7 @@ pub fn read_committed_seq(tenant_path: &Path) -> u64 {
 pub fn write_committed_seq(tenant_path: &Path, seq: u64) -> std::io::Result<()> {
     let path = committed_seq_path(tenant_path);
     fs::create_dir_all(tenant_path)?;
-    let tmp_path = tenant_path.join(format!(
-        ".{COMMITTED_SEQ_FILE}.{seq}.{}.tmp",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-
-    let write_result = (|| -> std::io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)?;
-        file.write_all(seq.to_string().as_bytes())?;
-        file.sync_all()?;
-        fs::rename(&tmp_path, &path)?;
-        File::open(tenant_path)?.sync_all()?;
-        Ok(())
-    })();
-
-    if write_result.is_err() {
-        let _ = fs::remove_file(&tmp_path);
-    }
-    write_result
+    crate::index::utils::atomic_write(&path, seq.to_string().as_bytes())
 }
 
 impl OpLog {
@@ -408,6 +385,22 @@ impl OpLog {
             seg.writer.write_all(line.as_bytes())?;
             seg.writer.write_all(b"\n")?;
             seg.size += line.len() as u64 + 1;
+
+            #[cfg(any(test, feature = "fault-injection"))]
+            if let Err(injected_error) = crate::index::write_queue::inject_finalization_fault(
+                &self.tenant_id,
+                crate::index::write_queue::FinalizationFaultPoint::DuringOplogAppendAfterPartialDurableWrite,
+            ) {
+                // This point models EIO/ENOSPC after a task-tagged row reaches
+                // durable storage but before current_seq learns about it.
+                // Returning only after flush + sync preserves that exact replay
+                // hazard without slowing ordinary fault-injection builds.
+                seg.writer.flush()?;
+                if task_id.is_some() {
+                    seg.writer.get_ref().sync_all()?;
+                }
+                return Err(injected_error);
+            }
             receipts.push(OpLogReceipt {
                 seq: last_seq,
                 object_id,
@@ -445,6 +438,88 @@ impl OpLog {
                     .map(str::to_string)
             })
             .collect())
+    }
+
+    /// Physically retract every durable entry with `seq >= from_seq`, removing
+    /// the suffix from the segment files so a subsequent restart never replays
+    /// it. This is the retraction primitive that closes DUR-1: when a batch's
+    /// Tantivy commit fails, the oplog rows appended for that batch must be
+    /// erased, not merely left un-acknowledged, or recovery would resurrect
+    /// writes the client was told failed.
+    ///
+    /// Retraction keys on the sequence floor rather than on returned receipts,
+    /// so a partially written batch whose receipts never reached the caller is
+    /// also erased. Returns the number of entries removed and fails closed on
+    /// any I/O error, leaving the caller to treat the batch as non-terminal.
+    pub fn retract_from(&self, from_seq: u64) -> crate::error::Result<u64> {
+        let mut segment = self.segment.lock().unwrap();
+        segment.writer.flush().map_err(|error| {
+            oplog_io_error(
+                "flush active oplog segment before retraction",
+                &segment.path,
+                error,
+            )
+        })?;
+
+        let outcome = retract_suffix_segments(&self.dir, from_seq)?;
+        if outcome.changed {
+            self.reopen_active_segment_after_retraction(&mut segment)?;
+        }
+        Ok(outcome.removed)
+    }
+
+    /// Retract only task-tagged entries for a failed write-queue batch, leaving
+    /// unrelated synchronous metadata rows in the same sequence suffix intact.
+    pub fn retract_tasks_from<'a, I>(&self, from_seq: u64, task_ids: I) -> crate::error::Result<u64>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let task_ids: BTreeSet<String> = task_ids.into_iter().map(str::to_string).collect();
+        if task_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut segment = self.segment.lock().unwrap();
+        segment.writer.flush().map_err(|error| {
+            oplog_io_error(
+                "flush active oplog segment before task retraction",
+                &segment.path,
+                error,
+            )
+        })?;
+
+        let outcome = retract_task_segments(&self.dir, from_seq, &task_ids)?;
+        if outcome.changed {
+            self.reopen_active_segment_after_retraction(&mut segment)?;
+        }
+        Ok(outcome.removed)
+    }
+
+    fn reopen_active_segment_after_retraction(
+        &self,
+        segment: &mut ActiveSegment,
+    ) -> crate::error::Result<()> {
+        let (max_seq, max_segment_id) = Self::scan_existing(&self.dir)?;
+        let active_segment_id = max_segment_id.max(1);
+        let active_segment_path = self
+            .dir
+            .join(format!("segment_{active_segment_id:04}.jsonl"));
+        let active_segment_size = active_segment_path
+            .metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&active_segment_path)?;
+        *segment = ActiveSegment {
+            writer: BufWriter::new(file),
+            path: active_segment_path,
+            size: active_segment_size,
+            id: active_segment_id,
+        };
+        self.current_seq.store(max_seq, Ordering::SeqCst);
+        Ok(())
     }
 
     fn rotate_segment_locked(&self, seg: &mut ActiveSegment) -> crate::error::Result<()> {
@@ -555,6 +630,10 @@ fn payload_object_id(payload: &serde_json::Value) -> Option<&str> {
         .filter(|object_id| !object_id.is_empty())
 }
 
+#[path = "oplog_retraction.rs"]
+mod oplog_retraction;
+use oplog_retraction::*;
+
 fn sorted_segment_entries(dir: &Path) -> std::io::Result<Vec<std::fs::DirEntry>> {
     let mut entries: Vec<_> = fs::read_dir(dir)?
         .filter_map(|entry| entry.ok())
@@ -572,224 +651,7 @@ fn sorted_segment_entries(dir: &Path) -> std::io::Result<Vec<std::fs::DirEntry>>
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    /// Verify that appending entries increments the sequence counter and that `read_since` correctly filters by sequence number.
-    #[test]
-    fn test_append_and_read() {
-        let tmp = TempDir::new().unwrap();
-        let oplog = OpLog::open(tmp.path(), "t1", "node1").unwrap();
-
-        assert_eq!(oplog.current_seq(), 0);
-        let s1 = oplog
-            .append("upsert", serde_json::json!({"objectID": "1"}))
-            .unwrap();
-        assert_eq!(s1, 1);
-        let s2 = oplog
-            .append("delete", serde_json::json!({"objectID": "2"}))
-            .unwrap();
-        assert_eq!(s2, 2);
-
-        let all = oplog.read_since(0).unwrap();
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].seq, 1);
-        assert_eq!(all[1].seq, 2);
-
-        let since1 = oplog.read_since(1).unwrap();
-        assert_eq!(since1.len(), 1);
-        assert_eq!(since1[0].seq, 2);
-    }
-
-    /// Verify that `append_batch` assigns contiguous sequence numbers and all entries are retrievable.
-    #[test]
-    fn test_batch_append() {
-        let tmp = TempDir::new().unwrap();
-        let oplog = OpLog::open(tmp.path(), "t1", "node1").unwrap();
-
-        let ops: Vec<(String, serde_json::Value)> = vec![
-            ("upsert".into(), serde_json::json!({"objectID": "a"})),
-            ("upsert".into(), serde_json::json!({"objectID": "b"})),
-            ("delete".into(), serde_json::json!({"objectID": "c"})),
-        ];
-        let last = oplog.append_batch(&ops).unwrap();
-        assert_eq!(last, 3);
-        assert_eq!(oplog.current_seq(), 3);
-
-        let all = oplog.read_since(0).unwrap();
-        assert_eq!(all.len(), 3);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn write_committed_seq_replaces_existing_path_instead_of_following_it() {
-        use std::os::unix::fs::symlink;
-
-        let tmp = TempDir::new().unwrap();
-        let tenant_path = tmp.path().join("tenant");
-        std::fs::create_dir_all(&tenant_path).unwrap();
-        let committed_path = tenant_path.join("committed_seq");
-        symlink("/dev/null", &committed_path).unwrap();
-
-        write_committed_seq(&tenant_path, 42).unwrap();
-
-        let metadata = std::fs::symlink_metadata(&committed_path).unwrap();
-        assert!(
-            !metadata.file_type().is_symlink() && metadata.file_type().is_file(),
-            "committed_seq must be atomically installed as a regular durable sidecar"
-        );
-        assert_eq!(read_committed_seq(&tenant_path), 42);
-    }
-
-    /// Verify that reopening an oplog on the same directory resumes from the previously written sequence number without gaps or duplicates.
-    #[test]
-    fn test_reopen_continues_seq() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().to_path_buf();
-
-        {
-            let oplog = OpLog::open(&dir, "t1", "node1").unwrap();
-            oplog.append("upsert", serde_json::json!({"x": 1})).unwrap();
-            oplog.append("upsert", serde_json::json!({"x": 2})).unwrap();
-        }
-
-        let oplog2 = OpLog::open(&dir, "t1", "node1").unwrap();
-        assert_eq!(oplog2.current_seq(), 2);
-        let s3 = oplog2
-            .append("delete", serde_json::json!({"x": 3}))
-            .unwrap();
-        assert_eq!(s3, 3);
-
-        let all = oplog2.read_since(0).unwrap();
-        assert_eq!(all.len(), 3);
-    }
-
-    /// Verify that `truncate_before` removes only segments whose entries are entirely below the threshold, leaving newer entries intact.
-    #[test]
-    fn test_truncate() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().to_path_buf();
-
-        {
-            let oplog = OpLog::open(&dir, "t1", "node1").unwrap();
-            for i in 0..5 {
-                oplog.append("upsert", serde_json::json!({"i": i})).unwrap();
-            }
-            oplog
-                .rotate_segment_locked(&mut oplog.segment.lock().unwrap())
-                .unwrap();
-            for i in 5..10 {
-                oplog.append("upsert", serde_json::json!({"i": i})).unwrap();
-            }
-        }
-
-        let oplog = OpLog::open(&dir, "t1", "node1").unwrap();
-        let removed = oplog.truncate_before(6).unwrap();
-        assert_eq!(removed, 1);
-
-        let remaining = oplog.read_since(0).unwrap();
-        assert_eq!(remaining.len(), 5);
-        assert_eq!(remaining[0].seq, 6);
-    }
-
-    #[test]
-    fn test_oldest_seq_none_when_no_entries() {
-        let tmp = TempDir::new().unwrap();
-        let oplog = OpLog::open(tmp.path(), "t1", "node1").unwrap();
-
-        assert_eq!(oplog.oldest_seq(), None);
-    }
-    #[test]
-    fn test_oldest_seq_after_truncate_before() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().to_path_buf();
-
-        {
-            let oplog = OpLog::open(&dir, "t1", "node1").unwrap();
-            for i in 0..5 {
-                oplog.append("upsert", serde_json::json!({"i": i})).unwrap();
-            }
-            oplog
-                .rotate_segment_locked(&mut oplog.segment.lock().unwrap())
-                .unwrap();
-            for i in 5..10 {
-                oplog.append("upsert", serde_json::json!({"i": i})).unwrap();
-            }
-        }
-
-        let oplog = OpLog::open(&dir, "t1", "node1").unwrap();
-        assert_eq!(oplog.oldest_seq(), Some(1));
-
-        let removed = oplog.truncate_before(6).unwrap();
-        assert_eq!(removed, 1);
-        assert_eq!(oplog.oldest_seq(), Some(6));
-    }
-
-    #[test]
-    fn test_read_write_committed_seq_roundtrip() {
-        let tmp = TempDir::new().unwrap();
-        let tenant_path = tmp.path().join("tenant");
-        std::fs::create_dir_all(&tenant_path).unwrap();
-
-        assert_eq!(read_committed_seq(&tenant_path), 0);
-        write_committed_seq(&tenant_path, 42).unwrap();
-        assert_eq!(read_committed_seq(&tenant_path), 42);
-    }
-
-    #[test]
-    fn test_oldest_seq_active_segment_only() {
-        let tmp = TempDir::new().unwrap();
-        let oplog = OpLog::open(tmp.path(), "t1", "node1").unwrap();
-
-        oplog.append("upsert", serde_json::json!({"a": 1})).unwrap();
-        oplog.append("upsert", serde_json::json!({"a": 2})).unwrap();
-        oplog.append("upsert", serde_json::json!({"a": 3})).unwrap();
-
-        // Without any segment rotation, oldest_seq should still read
-        // the first entry from the flushed active segment.
-        assert_eq!(oplog.oldest_seq(), Some(1));
-    }
-
-    #[test]
-    fn test_read_committed_seq_malformed_returns_zero() {
-        let tmp = TempDir::new().unwrap();
-        let tenant_path = tmp.path().join("tenant");
-        std::fs::create_dir_all(&tenant_path).unwrap();
-
-        // Write non-numeric content to the sidecar file.
-        std::fs::write(tenant_path.join("committed_seq"), "not-a-number").unwrap();
-        assert_eq!(read_committed_seq(&tenant_path), 0);
-
-        // Write empty content.
-        std::fs::write(tenant_path.join("committed_seq"), "").unwrap();
-        assert_eq!(read_committed_seq(&tenant_path), 0);
-    }
-
-    #[test]
-    fn test_read_committed_seq_missing_file_returns_zero() {
-        let tmp = TempDir::new().unwrap();
-        // Tenant path exists as a directory but has no committed_seq file.
-        let tenant_path = tmp.path().join("tenant_no_file");
-        std::fs::create_dir_all(&tenant_path).unwrap();
-        assert_eq!(read_committed_seq(&tenant_path), 0);
-
-        // Tenant path does not exist at all.
-        let missing_path = tmp.path().join("nonexistent_tenant");
-        assert_eq!(read_committed_seq(&missing_path), 0);
-    }
-
-    #[test]
-    fn test_write_committed_seq_overwrites_previous() {
-        let tmp = TempDir::new().unwrap();
-        let tenant_path = tmp.path().join("tenant");
-        std::fs::create_dir_all(&tenant_path).unwrap();
-
-        write_committed_seq(&tenant_path, 42).unwrap();
-        assert_eq!(read_committed_seq(&tenant_path), 42);
-
-        write_committed_seq(&tenant_path, 100).unwrap();
-        assert_eq!(read_committed_seq(&tenant_path), 100);
-    }
+    include!("oplog_tests.rs");
 }
 
 #[cfg(test)]

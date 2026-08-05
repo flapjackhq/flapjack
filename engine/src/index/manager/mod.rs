@@ -9,7 +9,7 @@ use crate::index::utils::copy_dir_recursive;
 use crate::index::write_queue::{
     admission::{WriteAdmissionRecord, WriteAdmissionStore, WriteAdmissionTicket},
     create_write_queue, ReplicatedWriteOrigin, VectorWriteContext, WriteAction, WriteOp,
-    WriteQueue, WriteQueueCancellation, WriteQueueContext,
+    WriteQueue, WriteQueueContext, WriteTaskHandle,
 };
 use crate::index::BulkBuildWriterConfig;
 use crate::index::Index;
@@ -30,7 +30,6 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use tokio::task::JoinHandle;
 
 const MAX_TASKS_PER_TENANT: usize = 1000;
 /// Maximum index name length in bytes.
@@ -39,109 +38,6 @@ const MAX_INDEX_NAME_BYTES: usize = 256;
 use super::OptionalFilterSpecs;
 use super::SearchOptions;
 use crate::index::settings::strip_unordered_prefix;
-
-#[derive(Clone)]
-pub(crate) struct WriteTaskHandle {
-    inner: Arc<WriteTaskHandleInner>,
-}
-
-struct WriteTaskHandleInner {
-    state: std::sync::Mutex<WriteTaskHandleState>,
-    completion: tokio::sync::Notify,
-    cancellation: Option<WriteQueueCancellation>,
-}
-
-enum WriteTaskHandleState {
-    Running(JoinHandle<Result<()>>),
-    Draining,
-    Finished(Result<()>),
-}
-
-impl WriteTaskHandle {
-    #[cfg(test)]
-    pub(crate) fn new(handle: JoinHandle<Result<()>>) -> Self {
-        Self {
-            inner: Arc::new(WriteTaskHandleInner {
-                state: std::sync::Mutex::new(WriteTaskHandleState::Running(handle)),
-                completion: tokio::sync::Notify::new(),
-                cancellation: None,
-            }),
-        }
-    }
-
-    pub(crate) fn new_with_cancellation(
-        handle: JoinHandle<Result<()>>,
-        cancellation: WriteQueueCancellation,
-    ) -> Self {
-        Self {
-            inner: Arc::new(WriteTaskHandleInner {
-                state: std::sync::Mutex::new(WriteTaskHandleState::Running(handle)),
-                completion: tokio::sync::Notify::new(),
-                cancellation: Some(cancellation),
-            }),
-        }
-    }
-
-    pub(crate) fn abort(&self) {
-        if let Some(cancellation) = &self.inner.cancellation {
-            // Dedicated write workers stop at the next write-loop event
-            // boundary after committing any work already inside commit_batch.
-            cancellation.cancel();
-        }
-        if let WriteTaskHandleState::Running(handle) = &*self.inner.state.lock().unwrap() {
-            if self.inner.cancellation.is_none() {
-                handle.abort();
-            }
-        }
-    }
-
-    pub(crate) async fn drain(&self, tenant_id: TenantId) -> Result<()> {
-        self.start_drain_monitor(tenant_id);
-        loop {
-            let notified = self.inner.completion.notified();
-            if let WriteTaskHandleState::Finished(result) = &*self.inner.state.lock().unwrap() {
-                return result.clone();
-            }
-            notified.await;
-        }
-    }
-
-    pub(crate) fn same_handle(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner)
-    }
-
-    fn start_drain_monitor(&self, tenant_id: TenantId) {
-        let handle = {
-            let mut state_guard = self.inner.state.lock().unwrap();
-            match std::mem::replace(&mut *state_guard, WriteTaskHandleState::Draining) {
-                WriteTaskHandleState::Running(handle) => Some(handle),
-                previous @ (WriteTaskHandleState::Draining | WriteTaskHandleState::Finished(_)) => {
-                    *state_guard = previous;
-                    None
-                }
-            }
-        };
-
-        if let Some(handle) = handle {
-            let inner = Arc::clone(&self.inner);
-            tokio::spawn(async move {
-                let result = match handle.await {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(error)) => Err(write_queue_drain_error(&tenant_id, error)),
-                    Err(error) => Err(write_queue_drain_error(&tenant_id, error)),
-                };
-                *inner.state.lock().unwrap() = WriteTaskHandleState::Finished(result);
-                inner.completion.notify_waiters();
-            });
-        }
-    }
-}
-
-fn write_queue_drain_error(tenant_id: &str, error: impl std::fmt::Display) -> FlapjackError {
-    FlapjackError::Tantivy(format!(
-        "destination write queue drain failed for {tenant_id}: {error}"
-    ))
-}
 
 fn is_synchronous_metadata_oplog_op(op_type: &str) -> bool {
     matches!(
@@ -258,7 +154,7 @@ mod ranking;
 mod recovery;
 mod search;
 mod search_phases;
-mod tokenization;
+pub(crate) mod tokenization;
 #[cfg(feature = "vector-search")]
 mod vector;
 mod write;
@@ -787,8 +683,19 @@ impl Drop for IndexManager {
     /// which drains writes cleanly. This abort-on-drop is a safety net for tests
     /// and unexpected drops.
     fn drop(&mut self) {
-        for entry in self.write_task_handles.iter() {
-            entry.value().abort();
+        let handles: Vec<_> = self
+            .write_task_handles
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        for (tenant_id, _) in &handles {
+            drop(self.write_queues.remove(tenant_id));
+        }
+        for (_, handle) in &handles {
+            handle.abort();
+        }
+        for (tenant_id, handle) in handles {
+            handle.wait_for_shutdown_after_cancellation(tenant_id);
         }
     }
 }

@@ -28,14 +28,16 @@ derive_bind_addr_from_base_url() {
 const input = process.argv[1];
 try {
   const url = new URL(input);
+  const normalizedHost = url.hostname.replace(/^\[(.*)\]$/, "$1");
   const loopbackHosts = new Set(["127.0.0.1", "localhost", "::1"]);
-  if (!loopbackHosts.has(url.hostname)) {
+  if (!loopbackHosts.has(normalizedHost)) {
     console.error(`refusing to start a no-auth loadtest server on non-loopback host: ${url.hostname}`);
     process.exit(42);
   }
   const fallbackPort = url.protocol === "https:" ? "443" : "80";
   const port = url.port || fallbackPort;
-  process.stdout.write(`${url.hostname}:${port}`);
+  const bindHost = normalizedHost.includes(":") ? `[${normalizedHost}]` : normalizedHost;
+  process.stdout.write(`${bindHost}:${port}`);
 } catch (error) {
   console.error(error.message);
   process.exit(1);
@@ -121,9 +123,18 @@ wait_for_loadtest_health() {
   local server_pid="$2"
   local max_attempts="${3:-300}"
   local sleep_seconds="${4:-0.1}"
+  local server_log_path="${5:-}"
+  local expected_bind_addr="${6:-}"
   local health_url="${base_url}/health"
   local attempt
   local health_status_code
+
+  if [[ -n "$server_log_path" || -n "$expected_bind_addr" ]]; then
+    [[ -n "$server_log_path" && -n "$expected_bind_addr" ]] || {
+      echo "FAIL: wait_for_loadtest_health owner check needs server log path and bind address"
+      exit 1
+    }
+  fi
 
   for ((attempt = 1; attempt <= max_attempts; attempt += 1)); do
     if [[ -n "$server_pid" ]] && ! kill -0 "$server_pid" 2>/dev/null; then
@@ -136,12 +147,23 @@ wait_for_loadtest_health() {
       curl -sS -o /dev/null -w '%{http_code}' --max-time 1 "$health_url" 2>/dev/null || true
     )"
     if [[ "$health_status_code" == "200" ]]; then
-      return 0
+      if [[ -z "$server_log_path" ]]; then
+        return 0
+      fi
+      if awk -v expected_url="http://${expected_bind_addr}" \
+        '$0 ~ /Local:/ && $NF == expected_url { found = 1 } END { exit found ? 0 : 1 }' \
+        "$server_log_path" 2>/dev/null; then
+        return 0
+      fi
     fi
 
     sleep "$sleep_seconds"
   done
 
+  if [[ -n "$server_log_path" ]]; then
+    echo "FAIL: timed out waiting for $health_url; $server_log_path did not confirm ownership of http://${expected_bind_addr}"
+    exit 1
+  fi
   echo "FAIL: timed out waiting for $health_url"
   exit 1
 }
@@ -676,9 +698,13 @@ wait_for_loadtest_task_published() {
 load_dashboard_seed_settings() {
   local loadtest_root="${1:-$LOADTEST_HELPER_DIR/..}"
 
+  # The import is relative to $loadtest_root (engine/loadtest), which the cd above establishes.
+  # product-seed-data.mjs moved here from the deleted engine/dashboard/tour/ in b04cfcc46; the
+  # old '../dashboard/tour/' spelling survived that move and made every scale-ladder run die with
+  # ERR_MODULE_NOT_FOUND before importing a single document.
   LOADTEST_SETTINGS_JSON="$(
     cd "$loadtest_root" || exit
-    node -e 'import("../dashboard/tour/product-seed-data.mjs").then(({ seedSettings }) => { process.stdout.write(JSON.stringify(seedSettings)); }).catch((error) => { console.error(error); process.exit(1); });'
+    node -e 'import("./product-seed-data.mjs").then(({ seedSettings }) => { process.stdout.write(JSON.stringify(seedSettings)); }).catch((error) => { console.error(error); process.exit(1); });'
   )"
 }
 

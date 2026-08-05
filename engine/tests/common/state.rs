@@ -369,6 +369,7 @@ fn build_test_app_for_data_dir(data_dir: &Path, admin_key: Option<&str>) -> Rout
         flapjack_http::router::RouterConfig {
             cors_mode: CorsMode::LoopbackOnly,
             disable_dashboard: false,
+            replication_api_key: None,
         },
     )
 }
@@ -870,6 +871,7 @@ fn build_authenticated_replication_router(
         flapjack_http::router::RouterConfig {
             cors_mode: CorsMode::LoopbackOnly,
             disable_dashboard: false,
+            replication_api_key: None,
         },
     )
 }

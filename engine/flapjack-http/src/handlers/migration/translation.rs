@@ -10,8 +10,13 @@ mod translation_report;
 mod translation_schema;
 #[path = "translation_session.rs"]
 mod translation_session;
+#[path = "typesense_field_validation.rs"]
+mod typesense_field_validation;
+#[path = "typesense_settings.rs"]
+mod typesense_settings;
 
 use self::translation_bundle::TypedTranslationFailure;
+#[cfg_attr(not(test), allow(unused_imports))]
 pub(super) use self::translation_bundle::{
     translate_settings_for_provider, ReplicaSettingsTranslation, SettingsSourceProvider,
 };
@@ -21,7 +26,7 @@ pub(super) use self::translation_report::{
     TranslationReportEntry, TranslationReportSummary,
 };
 #[cfg(test)]
-pub(super) use self::translation_session::translate_spool_input;
+pub(super) use self::translation_session::{page_stable_ids, translate_spool_input};
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(super) use self::translation_session::{
     translate_accepted_spool_payload, translate_accepted_spool_settings, translate_spool_payload,

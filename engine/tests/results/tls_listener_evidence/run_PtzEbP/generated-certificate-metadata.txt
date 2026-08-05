@@ -1,0 +1,5 @@
+subject=CN=localhost
+issuer=CN=localhost
+sha256 Fingerprint=0B:F0:D5:26:DA:97:5F:F0:68:AE:57:0D:52:F1:FE:D5:8D:61:BF:25:E0:63:A1:0E:F4:80:DC:99:FC:FD:89:2A
+X509v3 Subject Alternative Name:
+    DNS:localhost, IP Address:127.0.0.1

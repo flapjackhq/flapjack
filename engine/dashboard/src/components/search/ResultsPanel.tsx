@@ -175,10 +175,11 @@ export const ResultsPanel = memo(function ResultsPanel({
               <Button
                 variant="outline"
                 size="sm"
+                aria-label="Previous page"
                 onClick={() => handlePageChange(currentPage - 1)}
                 disabled={!hasPrevPage}
               >
-                <ChevronLeft className="h-4 w-4" />
+                <ChevronLeft className="h-4 w-4" aria-hidden="true" />
               </Button>
               <span className="text-sm text-muted-foreground">
                 Page {currentPage + 1} of {totalPages}
@@ -186,10 +187,11 @@ export const ResultsPanel = memo(function ResultsPanel({
               <Button
                 variant="outline"
                 size="sm"
+                aria-label="Next page"
                 onClick={() => handlePageChange(currentPage + 1)}
                 disabled={!hasNextPage}
               >
-                <ChevronRight className="h-4 w-4" />
+                <ChevronRight className="h-4 w-4" aria-hidden="true" />
               </Button>
             </div>
           )}

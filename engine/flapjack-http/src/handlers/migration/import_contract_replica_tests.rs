@@ -22,7 +22,7 @@ fn hermetic_fixture_uses_canonical_parser_for_malformed_replica_entries() {
 }
 
 #[test]
-fn hermetic_fixture_queues_duplicate_replica_names_once_in_collector_order() {
+fn hermetic_fixture_queues_each_replica_for_both_capture_passes_in_collector_order() {
     let reader = hermetic_source_reader_with_settings_and_pages(
         json!({
             "searchableAttributes": ["title"],
@@ -41,7 +41,15 @@ fn hermetic_fixture_queues_duplicate_replica_names_once_in_collector_order() {
         .iter()
         .map(|(name, _)| name.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(queued_names, ["replica_price_asc", "replica_relevance"]);
+    assert_eq!(
+        queued_names,
+        [
+            "replica_price_asc",
+            "replica_relevance",
+            "replica_price_asc",
+            "replica_relevance"
+        ]
+    );
 }
 
 /// A source replica whose settings are fetched successfully migrates as a
@@ -79,10 +87,10 @@ async fn migrate_replica_topology_activates_virtual_replica_with_warnings() {
                 vec![],
                 vec![],
             );
-            reader.push_index_settings(
+            reader.push_index_settings_for_capture_passes([(
                 "replica_idx",
-                Ok(json!({"ranking": ["desc(price)"], "relevancyStrictness": 80})),
-            );
+                json!({"ranking": ["desc(price)"], "relevancyStrictness": 80}),
+            )]);
             reader.push_quiescent(source_record);
             Ok(reader)
         },
@@ -225,14 +233,14 @@ async fn migrate_replica_materializes_virtual_sidecar_with_translated_rankings()
                 vec![],
                 vec![],
             );
-            reader.push_index_settings(
+            reader.push_index_settings_for_capture_passes([(
                 "replica_price_asc",
-                Ok(json!({
+                json!({
                     "ranking": ["desc(price)", "typo", "geo"],
                     "customRanking": ["asc(popularity)"],
                     "relevancyStrictness": 50
-                })),
-            );
+                }),
+            )]);
             reader.push_quiescent(source_record);
             Ok(reader)
         },
@@ -331,8 +339,10 @@ async fn migrate_replica_collision_with_existing_directory_returns_409() {
                 vec![],
                 vec![],
             );
-            reader
-                .push_index_settings("replica_price_asc", Ok(json!({"ranking": ["desc(price)"]})));
+            reader.push_index_settings_for_capture_passes([(
+                "replica_price_asc",
+                json!({"ranking": ["desc(price)"]}),
+            )]);
             reader.push_quiescent(source_record);
             Ok(reader)
         },
@@ -378,10 +388,10 @@ async fn migrate_standard_replica_materializes_as_virtual_sidecar() {
                 vec![],
                 vec![],
             );
-            reader.push_index_settings(
+            reader.push_index_settings_for_capture_passes([(
                 "replica_date_desc",
-                Ok(json!({"ranking": ["desc(date)"], "customRanking": ["desc(views)"]})),
-            );
+                json!({"ranking": ["desc(date)"], "customRanking": ["desc(views)"]}),
+            )]);
             reader.push_quiescent(source_record);
             Ok(reader)
         },
@@ -528,10 +538,10 @@ fn replica_source_reader(replica_entry: &str, derived_name: &str) -> ScriptedSou
         vec![],
         vec![],
     );
-    reader.push_index_settings(
+    reader.push_index_settings_for_capture_passes([(
         derived_name,
-        Ok(json!({"ranking": ["desc(price)"], "customRanking": ["asc(popularity)"]})),
-    );
+        json!({"ranking": ["desc(price)"], "customRanking": ["asc(popularity)"]}),
+    )]);
     reader.push_quiescent(source_record);
     reader
 }
@@ -750,8 +760,10 @@ fn two_replica_source_reader() -> ScriptedSourceReader {
         vec![],
         vec![],
     );
-    reader.push_index_settings("replica_ok", Ok(json!({"ranking": ["desc(price)"]})));
-    reader.push_index_settings("replica_blocked", Ok(json!({"ranking": ["desc(date)"]})));
+    reader.push_index_settings_for_capture_passes([
+        ("replica_ok", json!({"ranking": ["desc(price)"]})),
+        ("replica_blocked", json!({"ranking": ["desc(date)"]})),
+    ]);
     reader.push_quiescent(source_record);
     reader
 }

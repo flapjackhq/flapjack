@@ -12,6 +12,7 @@ import { AlertCircle, type LucideIcon } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import { formatDateLong, formatDateShort } from '@/lib/analytics-utils';
+import { CHART_CANVAS_TEST_ID, CHART_MARK_TEST_ID } from '@/lib/constants';
 
 const ANALYTICS_ERROR_MESSAGE = 'Unable to load analytics data. Try again.';
 
@@ -63,7 +64,7 @@ export function AreaTrendCard({
           <Skeleton className="w-full" style={{ height: chartHeight }} />
         ) : data?.length ? (
           <ResponsiveContainer width="100%" height={chartHeight} minWidth={1}>
-            <AreaChart data={data}>
+            <AreaChart data={data} data-testid={CHART_CANVAS_TEST_ID}>
               <defs>
                 <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
                   <stop offset="0%" stopColor={gradientColor} stopOpacity={0.2} />
@@ -94,6 +95,7 @@ export function AreaTrendCard({
                 formatter={(value: any) => [tooltipValueFormatter(Number(value)), seriesLabel]}
               />
               <Area
+                data-testid={CHART_MARK_TEST_ID}
                 type="monotone"
                 dataKey={dataKey}
                 stroke={strokeColor}

@@ -35,6 +35,6 @@ test.describe('Index tab bar smoke', () => {
     await gotoIndexPage(page, TEST_INDEX);
 
     // The seeded TEST_INDEX is not in NeuralSearch mode, so Chat tab should not be visible
-    await expect(page.getByTestId('index-tab-chat')).not.toBeVisible();
+    await expect(page.getByTestId('index-tab-chat')).toBeHidden();
   });
 });

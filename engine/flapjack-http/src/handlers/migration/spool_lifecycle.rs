@@ -170,6 +170,7 @@ impl SpoolStore {
             if manifest.checkpoint_handle != checkpoint_handle {
                 continue;
             }
+            ensure_supported_spool_format(&manifest)?;
             validate_identity(&manifest)?;
             if manifest.lifecycle != LifecycleState::Interrupted {
                 return Err(SpoolError::new(SpoolErrorKind::JobNotInterrupted));
@@ -215,6 +216,7 @@ impl SpoolStore {
         if manifest.lifecycle != LifecycleState::Interrupted {
             return Ok(None);
         }
+        ensure_supported_spool_format(&manifest)?;
         let record = self.read_migration_phase(job_uuid)?;
         if record.phase != MigrationPhase::Exporting
             || record.disposition != MigrationDisposition::Running
@@ -230,6 +232,21 @@ impl SpoolStore {
             return Ok(None);
         }
         Ok(Some(manifest.checkpoint_handle))
+    }
+
+    /// Answers the format gate without mutating anything, so restart recovery can
+    /// decide an incompatible export's fate before touching its lifecycle. A job
+    /// with no durable manifest has nothing to be incompatible with.
+    pub(crate) fn export_spool_format_is_supported(&self, job_uuid: Uuid) -> SpoolResult<bool> {
+        let _root_lock = self.lock_root()?;
+        if !self.job_dir(job_uuid).exists() {
+            return Ok(true);
+        }
+        let _job_lock = self.lock_job(job_uuid)?;
+        let Some(manifest) = self.read_manifest_if_exists(job_uuid)? else {
+            return Ok(true);
+        };
+        Ok(ensure_supported_spool_format(&manifest).is_ok())
     }
 
     pub(crate) fn export_lifecycle_is_running(&self, job_uuid: Uuid) -> SpoolResult<bool> {
@@ -395,6 +412,10 @@ pub(super) fn ensure_resource_incomplete(
         ArtifactKind::DocumentPage => manifest.resource_completions.documents.complete,
         ArtifactKind::RulesPage => manifest.resource_completions.rules.complete,
         ArtifactKind::SynonymsPage => manifest.resource_completions.synonyms.complete,
+        // Derived-source configuration has no resource completion of its own —
+        // it is captured inside the accepted-state window and bracketed by the
+        // export's drift proof. Writability past acceptance is already fenced by
+        // `ensure_writable`, so there is no completion flag to consult here.
         ArtifactKind::Config => false,
     };
     if complete {

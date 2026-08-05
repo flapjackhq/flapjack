@@ -101,12 +101,15 @@ preserve_cleanup_residue_evidence() {
 }
 
 cleanup() {
-  local rc="$?"
+  local rc="$?" artifact
   if [ "$rc" -ne 0 ] || [ ! -f "$PASS_MARKER" ]; then
     mkdir -p "$EVIDENCE_DIR"
     docker logs "$CONTAINER_NAME" >"$EVIDENCE_DIR/container.log" 2>&1 || true
     docker image inspect "$IMAGE_REF" >"$EVIDENCE_DIR/image_inspect.json" 2>&1 || true
-    cp "$ROOT_DIR"/*.json "$ROOT_DIR"/*.jsonl "$ROOT_DIR"/*.txt "$EVIDENCE_DIR"/ 2>/dev/null || true
+    for artifact in "$ROOT_DIR"/*.json "$ROOT_DIR"/*.jsonl "$ROOT_DIR"/*.txt; do
+      [ -f "$artifact" ] || continue
+      cp "$artifact" "$EVIDENCE_DIR"/
+    done
     preserve_cleanup_residue_evidence
     docker ps -a --filter "name=^/${CONTAINER_NAME}$" --format '{{.Names}}' >"$EVIDENCE_DIR/container_residue.txt" 2>/dev/null || true
     sanitize_preserved_evidence
@@ -257,8 +260,61 @@ JSON
   remember_secret EXPORT "$EXPORT_KEY"
   code="$(http_json GET /collections "$EXPORT_KEY" "" "$out")"
   [ "$code" = 401 ] || fail "narrower key unexpectedly listed collections"
+  code="$(http_json GET '/collections?limit=1' "$SCOPED_KEY" "" "$out")"
+  [ "$code" = 200 ] || fail "least-privilege discovery listing failed with $code"
+  code="$(http_json GET '/collections?limit=1' "$EXPORT_KEY" "" "$out")"
+  [ "$code" = 401 ] || fail "narrower key unexpectedly listed a discovery slice"
   code="$(http_json GET /keys "$SCOPED_KEY" "" "$out")"
   [ "$code" = 401 ] || fail "capture key unexpectedly read /keys"
+}
+
+mutate_collection_listing_for_test() {
+  local family="$1" listing="$2"
+  case "${FJ_TYPESENSE_CONTRACT_MUTATION:-}" in
+    wrong_discovery_name_set)
+      [ "$family" = full ] || return 0
+      jq '.[0].name = "fj_ts_migration_wrong"' "$listing" >"$listing.mutated"
+      mv "$listing.mutated" "$listing"
+      ;;
+    wrong_discovery_order)
+      [ "$family" = full ] || return 0
+      jq 'reverse' "$listing" >"$listing.mutated"
+      mv "$listing.mutated" "$listing"
+      ;;
+    wrong_discovery_slice)
+      [ "$family" = offset_without_limit ] || return 0
+      jq '[]' "$listing" >"$listing.mutated"
+      mv "$listing.mutated" "$listing"
+      ;;
+  esac
+}
+
+assert_collection_listing_discovery_contract() {
+  local full="$ROOT_DIR/discovery_collections.json"
+  local first="$ROOT_DIR/discovery_limit_one.json"
+  local second="$ROOT_DIR/discovery_offset_one_limit_one.json"
+  local offset_without_limit="$ROOT_DIR/discovery_offset_one.json"
+  local exhausted="$ROOT_DIR/discovery_offset_two.json"
+
+  expect_http 200 GET /collections "$SCOPED_KEY" "" "$full"
+  expect_http 200 GET '/collections?limit=1' "$SCOPED_KEY" "" "$first"
+  expect_http 200 GET '/collections?offset=1&limit=1' "$SCOPED_KEY" "" "$second"
+  expect_http 200 GET '/collections?offset=1' "$SCOPED_KEY" "" "$offset_without_limit"
+  expect_http 400 GET '/collections?offset=2&limit=1' "$SCOPED_KEY" "" "$exhausted"
+  mutate_collection_listing_for_test full "$full"
+  mutate_collection_listing_for_test offset_without_limit "$offset_without_limit"
+
+  jq -e --arg products "$PRODUCTS" --arg categories "$CATEGORIES" \
+    'map(.name) | sort == ([$products, $categories] | sort)' "$full" >/dev/null \
+    || fail "discovery name set mismatch rejected"
+  jq -e --arg products "$PRODUCTS" --arg categories "$CATEGORIES" \
+    'map(.name) == [$products, $categories]' "$full" >/dev/null \
+    || fail "discovery newest-first order mismatch rejected"
+  jq -e --arg products "$PRODUCTS" 'map(.name) == [$products]' "$first" >/dev/null \
+    && jq -e --arg categories "$CATEGORIES" 'map(.name) == [$categories]' "$second" >/dev/null \
+    && jq -e --arg categories "$CATEGORIES" 'map(.name) == [$categories]' "$offset_without_limit" >/dev/null \
+    && jq -e '. == {"message":"Invalid offset param."}' "$exhausted" >/dev/null \
+    || fail "discovery offset/limit slice mismatch rejected"
 }
 
 product_count() {
@@ -409,6 +465,8 @@ apply_test_mutation() {
       jq '(.source.synonym_sets[0].items)=[] | (.source.curation_sets[0].items)=[]' "$ROOT_DIR/actual_bundle.json" >"$ROOT_DIR/mutated.json" ;;
     wrong_alias_target)
       jq '(.source.aliases[] | select(.name=="fj_ts_migration_catalog") | .collection_name)="fj_ts_migration_categories"' "$ROOT_DIR/actual_bundle.json" >"$ROOT_DIR/mutated.json" ;;
+    wrong_discovery_name_set|wrong_discovery_order|wrong_discovery_slice)
+      fail "discovery mutation did not run during collection listing" ;;
     truncated_export)
       : ;;
     source_mutation_during_capture)
@@ -478,6 +536,7 @@ main() {
   seed_alias
   create_capture_key
   permission_controls
+  assert_collection_listing_discovery_contract
   capture_bundle
   apply_test_mutation
   assert_no_secret_leakage

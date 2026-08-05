@@ -189,9 +189,9 @@ test.describe('System Page', () => {
     const totalStorageCard = page.getByTestId('indexes-total-storage');
     await expect(totalStorageCard).toBeVisible();
     await expect(totalStorageCard.getByText('Total Storage')).toBeVisible();
-    const storageText = await totalStorageCard.getByTestId('stat-value').textContent();
-    expect(storageText?.trim()).toMatch(/^\d+(\.\d+)?\s*(B|KB|MB|GB)$/i);
-    expect(storageText).not.toBe('0 Bytes');
+    const storageText = totalStorageCard.getByTestId('stat-value');
+    await expect(storageText).toHaveText(/^\d+(\.\d+)?\s*(B|KB|MB|GB)$/i);
+    await expect(storageText).not.toHaveText('0 Bytes');
   });
 
   test('Indexes tab shows health status column for each index', async ({ page }) => {

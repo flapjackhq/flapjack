@@ -65,7 +65,7 @@ export function buildMovieSeedRequest(
 
       throw new Error(`Unexpected mock request URL: ${url}`);
     },
-  } as APIRequestContext;
+  } as unknown as APIRequestContext;
 
   return {
     addedDocuments: () => addedDocuments,

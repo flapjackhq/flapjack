@@ -1,9 +1,9 @@
 use super::{
     acquire_data_dir_process_lock, build_log_layer_with_writer, build_tracing_subscriber,
     cors_origins_from_value, initialize_key_store, load_server_config, log_format_from_value,
-    normalize_admin_key, read_admin_key, shutdown_timeout_secs_from_value,
+    normalize_admin_key, read_admin_key, shutdown_timeout_secs_from_value, startup_banner_urls,
     validate_startup_auth_policy, CorsMode, LogFormat, ServerConfig, StartupAuthValidationError,
-    StartupAuthValidationOutcome, NO_AUTH_PUBLIC_BIND_WARNING,
+    StartupAuthValidationOutcome, TlsPaths, NO_AUTH_PUBLIC_BIND_WARNING,
 };
 use crate::test_helpers::{EnvVarRestoreGuard, ENV_MUTEX};
 use axum::http::HeaderValue;
@@ -267,6 +267,13 @@ fn validate_startup_auth_policy_rejects_missing_blank_and_short_production_admin
         ),
         Err(StartupAuthValidationError::AdminKeyTooShortInProduction)
     );
+    for variant in ["Production", " production ", "PRODUCTION"] {
+        assert_eq!(
+            validate_startup_auth_policy(variant, false, None, "127.0.0.1:7700", false),
+            Err(StartupAuthValidationError::MissingAdminKeyInProduction),
+            "variant {variant:?} must keep production admin-key enforcement"
+        );
+    }
 }
 
 #[test]
@@ -543,8 +550,17 @@ fn initialize_key_store_persists_env_admin_key_with_restrictive_permissions() {
         disable_dashboard: false,
         allow_no_auth_public_bind: false,
         admin_key_env: Some("  env-admin-key  ".to_string()),
+        replication_api_key_env: None,
         data_dir: temp_dir.path().display().to_string(),
         bind_addr: "127.0.0.1:7700".to_string(),
+        tls_paths: None,
+        node_config: NodeConfig {
+            node_id: "node-a".to_string(),
+            bind_addr: "127.0.0.1:7700".to_string(),
+            advertise_addr: None,
+            peers: Vec::new(),
+            bootstrap_peer: None,
+        },
         _data_dir_lock: acquire_data_dir_process_lock(temp_dir.path()).unwrap(),
     };
 
@@ -629,13 +645,15 @@ fn startup_banner_shows_capabilities() {
 fn flapjack_disable_dashboard_env_parses_true_and_defaults_false() {
     let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
     let _disable_dashboard = EnvVarRestoreGuard::remove("FLAPJACK_DISABLE_DASHBOARD");
+    let _cert_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_CERT_PATH");
+    let _key_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_KEY_PATH");
 
     {
         let temp_dir = TempDir::new().unwrap();
         let _data_dir =
             EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
 
-        let server_config = load_server_config();
+        let server_config = load_server_config().expect("server config should load");
 
         assert!(!server_config.disable_dashboard);
     }
@@ -646,7 +664,7 @@ fn flapjack_disable_dashboard_env_parses_true_and_defaults_false() {
             EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
         let _disable_dashboard_set = EnvVarRestoreGuard::set("FLAPJACK_DISABLE_DASHBOARD", "1");
 
-        let server_config = load_server_config();
+        let server_config = load_server_config().expect("server config should load");
 
         assert!(server_config.disable_dashboard);
     }
@@ -656,13 +674,15 @@ fn flapjack_disable_dashboard_env_parses_true_and_defaults_false() {
 fn flapjack_allow_no_auth_public_bind_env_parses_one_and_defaults_false() {
     let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
     let _allow_public_bind = EnvVarRestoreGuard::remove("FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND");
+    let _cert_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_CERT_PATH");
+    let _key_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_KEY_PATH");
 
     {
         let temp_dir = TempDir::new().unwrap();
         let _data_dir =
             EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
 
-        let server_config = load_server_config();
+        let server_config = load_server_config().expect("server config should load");
 
         assert!(!server_config.allow_no_auth_public_bind);
     }
@@ -674,7 +694,7 @@ fn flapjack_allow_no_auth_public_bind_env_parses_one_and_defaults_false() {
         let _allow_public_bind_set =
             EnvVarRestoreGuard::set("FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND", "true");
 
-        let server_config = load_server_config();
+        let server_config = load_server_config().expect("server config should load");
 
         assert!(!server_config.allow_no_auth_public_bind);
     }
@@ -686,10 +706,589 @@ fn flapjack_allow_no_auth_public_bind_env_parses_one_and_defaults_false() {
         let _allow_public_bind_set =
             EnvVarRestoreGuard::set("FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND", "1");
 
-        let server_config = load_server_config();
+        let server_config = load_server_config().expect("server config should load");
 
         assert!(server_config.allow_no_auth_public_bind);
     }
+}
+
+#[test]
+fn replication_peer_api_key_env_is_normalized_without_persistence() {
+    let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+    let _admin_key = EnvVarRestoreGuard::remove("FLAPJACK_ADMIN_KEY");
+    let _peers = EnvVarRestoreGuard::remove("FLAPJACK_PEERS");
+    let _bootstrap_peer = EnvVarRestoreGuard::remove("FLAPJACK_BOOTSTRAP_PEER");
+    let _advertise_addr = EnvVarRestoreGuard::remove("FLAPJACK_ADVERTISE_ADDR");
+    let _allow_unauthenticated =
+        EnvVarRestoreGuard::remove("FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS");
+    let _cert_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_CERT_PATH");
+    let _key_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_KEY_PATH");
+
+    {
+        let temp_dir = TempDir::new().unwrap();
+        let _data_dir =
+            EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+        let _peer_key = EnvVarRestoreGuard::remove("FLAPJACK_REPLICATION_API_KEY");
+
+        let server_config = load_server_config().expect("server config should load");
+
+        assert_eq!(server_config.replication_api_key_env, None);
+    }
+
+    {
+        let temp_dir = TempDir::new().unwrap();
+        let _data_dir =
+            EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+        let _peer_key = EnvVarRestoreGuard::set("FLAPJACK_REPLICATION_API_KEY", "  \n\t  ");
+
+        let server_config = load_server_config().expect("server config should load");
+
+        assert_eq!(server_config.replication_api_key_env, None);
+    }
+
+    {
+        let temp_dir = TempDir::new().unwrap();
+        let _data_dir =
+            EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+        let _peer_key =
+            EnvVarRestoreGuard::set("FLAPJACK_REPLICATION_API_KEY", "  stage-2-peer-secret  ");
+
+        let server_config = load_server_config().expect("server config should load");
+
+        assert_eq!(
+            server_config.replication_api_key_env,
+            Some("stage-2-peer-secret".to_string())
+        );
+        assert!(
+            !temp_dir.path().join(".admin_key").exists(),
+            "loading the peer credential must not persist it as an admin key"
+        );
+    }
+}
+
+#[test]
+fn replication_peer_api_key_rejects_invalid_header_characters() {
+    let result = {
+        let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+        let _peer_key = EnvVarRestoreGuard::set(
+            "FLAPJACK_REPLICATION_API_KEY",
+            "peer-secret\nforged-header: value",
+        );
+
+        load_server_config()
+    };
+
+    match result {
+        Err(error) => assert_eq!(
+            error,
+            "FLAPJACK_REPLICATION_API_KEY contains characters that are invalid in an HTTP header"
+        ),
+        Ok(_) => panic!("startup must reject a peer key that cannot be sent"),
+    }
+}
+
+#[test]
+fn startup_accepts_replication_peers_with_peer_api_key() {
+    let result = {
+        let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+        let temp_dir = TempDir::new().unwrap();
+        let _data_dir =
+            EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+        let _admin_key = EnvVarRestoreGuard::remove("FLAPJACK_ADMIN_KEY");
+        let _peer_key =
+            EnvVarRestoreGuard::set("FLAPJACK_REPLICATION_API_KEY", "  stage-2-peer-secret  ");
+        let _allow_unauthenticated =
+            EnvVarRestoreGuard::remove("FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS");
+        let _peers =
+            EnvVarRestoreGuard::set("FLAPJACK_PEERS", "node-b=https://node-b.example.com:7700");
+        let _bootstrap_peer = EnvVarRestoreGuard::remove("FLAPJACK_BOOTSTRAP_PEER");
+        let _advertise_addr = EnvVarRestoreGuard::remove("FLAPJACK_ADVERTISE_ADDR");
+        let _cert_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_CERT_PATH");
+        let _key_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_KEY_PATH");
+
+        load_server_config().map(|server_config| server_config.replication_api_key_env)
+    };
+
+    assert_eq!(
+        result.expect("HTTPS replication peers with a peer credential should permit startup"),
+        Some("stage-2-peer-secret".to_string()),
+        "startup must preserve the normalized peer credential for authenticated replication"
+    );
+}
+
+#[test]
+fn startup_rejects_cleartext_static_peer_instead_of_serving_standalone() {
+    let result = {
+        let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+        let temp_dir = TempDir::new().unwrap();
+        let _data_dir =
+            EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+        let _peer_key =
+            EnvVarRestoreGuard::set("FLAPJACK_REPLICATION_API_KEY", "stage-2-peer-secret");
+        let _allow_cleartext =
+            EnvVarRestoreGuard::remove("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS");
+        let _peers =
+            EnvVarRestoreGuard::set("FLAPJACK_PEERS", "node-b=http://node-b.example.com:7700");
+        let _bootstrap_peer = EnvVarRestoreGuard::remove("FLAPJACK_BOOTSTRAP_PEER");
+        let _advertise_addr = EnvVarRestoreGuard::remove("FLAPJACK_ADVERTISE_ADDR");
+
+        load_server_config().map(|_| ())
+    };
+
+    let error = result.expect_err("rejected static topology must fail startup");
+    assert!(
+        error.contains("node-b") && error.contains("http://node-b.example.com:7700"),
+        "startup error must identify the rejected static peer: {error}"
+    );
+    assert!(
+        error.contains("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1"),
+        "startup error must name the cleartext override: {error}"
+    );
+}
+
+#[test]
+fn startup_rejects_cleartext_bootstrap_peer_instead_of_becoming_a_seed() {
+    let result = {
+        let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+        let temp_dir = TempDir::new().unwrap();
+        let _data_dir =
+            EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+        let _peer_key =
+            EnvVarRestoreGuard::set("FLAPJACK_REPLICATION_API_KEY", "stage-2-peer-secret");
+        let _allow_cleartext =
+            EnvVarRestoreGuard::remove("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS");
+        let _peers = EnvVarRestoreGuard::remove("FLAPJACK_PEERS");
+        let _bootstrap_peer = EnvVarRestoreGuard::set(
+            "FLAPJACK_BOOTSTRAP_PEER",
+            "http://bootstrap.example.com:7700",
+        );
+        let _advertise_addr =
+            EnvVarRestoreGuard::set("FLAPJACK_ADVERTISE_ADDR", "https://seed.example.com:7700");
+
+        load_server_config().map(|_| ())
+    };
+
+    let error = result.expect_err("rejected bootstrap topology must fail startup");
+    assert!(
+        error.contains("bootstrap") && error.contains("http://bootstrap.example.com:7700"),
+        "startup error must identify the rejected bootstrap peer: {error}"
+    );
+    assert!(
+        error.contains("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1"),
+        "startup error must name the cleartext override: {error}"
+    );
+}
+
+#[test]
+fn startup_refuses_replication_peers_without_peer_api_key() {
+    let result = {
+        let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+        let temp_dir = TempDir::new().unwrap();
+        let _data_dir =
+            EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+        let _admin_key = EnvVarRestoreGuard::remove("FLAPJACK_ADMIN_KEY");
+        let _peer_key = EnvVarRestoreGuard::remove("FLAPJACK_REPLICATION_API_KEY");
+        let _allow_unauthenticated =
+            EnvVarRestoreGuard::remove("FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS");
+        let _peers =
+            EnvVarRestoreGuard::set("FLAPJACK_PEERS", "node-b=https://node-b.example.com:7700");
+        let _bootstrap_peer = EnvVarRestoreGuard::remove("FLAPJACK_BOOTSTRAP_PEER");
+        let _advertise_addr = EnvVarRestoreGuard::remove("FLAPJACK_ADVERTISE_ADDR");
+        let _cert_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_CERT_PATH");
+        let _key_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_KEY_PATH");
+
+        load_server_config().map(|_| ())
+    };
+
+    match result {
+        Ok(()) => {
+            panic!(
+                "replication peers from FLAPJACK_PEERS must require FLAPJACK_REPLICATION_API_KEY"
+            )
+        }
+        Err(error) => {
+            assert!(
+                error.contains("FLAPJACK_REPLICATION_API_KEY"),
+                "error must name the missing peer credential setting, got: {error}"
+            );
+            assert!(
+                error.contains("FLAPJACK_PEERS") || error.contains("node-b"),
+                "error must identify the replication intent that triggered validation, got: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn startup_refuses_node_json_replication_peers_without_peer_api_key() {
+    let result = {
+        let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+        let temp_dir = TempDir::new().unwrap();
+        let node_json = serde_json::json!({
+            "node_id": "node-a",
+            "bind_addr": "127.0.0.1:0",
+            "peers": [{
+                "node_id": "node-b",
+                "addr": "https://node-b.example.com:7700"
+            }]
+        });
+        std::fs::write(temp_dir.path().join("node.json"), node_json.to_string())
+            .expect("test node.json must be writable");
+        let _data_dir =
+            EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+        let _admin_key = EnvVarRestoreGuard::remove("FLAPJACK_ADMIN_KEY");
+        let _peer_key = EnvVarRestoreGuard::remove("FLAPJACK_REPLICATION_API_KEY");
+        let _allow_unauthenticated =
+            EnvVarRestoreGuard::remove("FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS");
+        let _peers = EnvVarRestoreGuard::remove("FLAPJACK_PEERS");
+        let _bootstrap_peer = EnvVarRestoreGuard::remove("FLAPJACK_BOOTSTRAP_PEER");
+        let _advertise_addr = EnvVarRestoreGuard::remove("FLAPJACK_ADVERTISE_ADDR");
+        let _cert_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_CERT_PATH");
+        let _key_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_KEY_PATH");
+
+        load_server_config().map(|_| ())
+    };
+
+    match result {
+        Ok(()) => {
+            panic!("replication peers from node.json must require FLAPJACK_REPLICATION_API_KEY")
+        }
+        Err(error) => {
+            assert!(
+                error.contains("FLAPJACK_REPLICATION_API_KEY"),
+                "error must name the missing peer credential setting, got: {error}"
+            );
+            assert!(
+                error.contains("node.json") || error.contains("node-b"),
+                "error must identify the persisted replication intent, got: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn startup_unauthenticated_peer_escape_repermits_and_warns() {
+    let result = {
+        let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+        let temp_dir = TempDir::new().unwrap();
+        let _data_dir =
+            EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+        let _admin_key = EnvVarRestoreGuard::remove("FLAPJACK_ADMIN_KEY");
+        let _peer_key = EnvVarRestoreGuard::remove("FLAPJACK_REPLICATION_API_KEY");
+        let _allow_unauthenticated =
+            EnvVarRestoreGuard::set("FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS", "1");
+        let _peers =
+            EnvVarRestoreGuard::set("FLAPJACK_PEERS", "node-b=https://node-b.example.com:7700");
+        let _bootstrap_peer = EnvVarRestoreGuard::remove("FLAPJACK_BOOTSTRAP_PEER");
+        let _advertise_addr = EnvVarRestoreGuard::remove("FLAPJACK_ADVERTISE_ADDR");
+        let _cert_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_CERT_PATH");
+        let _key_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_KEY_PATH");
+        let writer = TestWriter::new();
+        let subscriber =
+            tracing_subscriber::registry().with(build_log_layer_with_writer(writer.clone(), false));
+
+        tracing::subscriber::with_default(subscriber, load_server_config)
+            .map(|server_config| (server_config.replication_api_key_env, writer.output()))
+    };
+
+    let (replication_api_key_env, output) =
+        result.expect("explicit unauthenticated peer override should permit startup");
+    assert_eq!(replication_api_key_env, None);
+    assert!(
+        output.contains("WARNING") || output.contains("warning"),
+        "override use must emit a loud warning, got: {output:?}"
+    );
+    assert!(
+        output.contains("FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS=1"),
+        "warning must name the unauthenticated peer override, got: {output:?}"
+    );
+    assert!(
+        output.contains("FLAPJACK_REPLICATION_API_KEY"),
+        "warning must name the missing peer credential setting, got: {output:?}"
+    );
+}
+
+#[test]
+fn startup_unauthenticated_peer_escape_still_requires_tls_for_authenticated_analytics() {
+    let result = {
+        let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+        let temp_dir = TempDir::new().unwrap();
+        let _data_dir =
+            EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+        let _no_auth = EnvVarRestoreGuard::remove("FLAPJACK_NO_AUTH");
+        let _admin_key = EnvVarRestoreGuard::set("FLAPJACK_ADMIN_KEY", "analytics-admin-secret");
+        let _peer_key = EnvVarRestoreGuard::remove("FLAPJACK_REPLICATION_API_KEY");
+        let _allow_unauthenticated =
+            EnvVarRestoreGuard::set("FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS", "1");
+        let _allow_cleartext =
+            EnvVarRestoreGuard::remove("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS");
+        let _peers =
+            EnvVarRestoreGuard::set("FLAPJACK_PEERS", "node-b=http://node-b.example.com:7700");
+        let _bootstrap_peer = EnvVarRestoreGuard::remove("FLAPJACK_BOOTSTRAP_PEER");
+        let _advertise_addr = EnvVarRestoreGuard::remove("FLAPJACK_ADVERTISE_ADDR");
+        let _cert_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_CERT_PATH");
+        let _key_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_KEY_PATH");
+
+        load_server_config().map(|_| ())
+    };
+
+    let error = result.expect_err(
+        "authenticated analytics must not forward caller credentials to a cleartext peer",
+    );
+    assert!(
+        error.contains("analytics") && error.contains("caller API keys"),
+        "refusal must identify the credential-bearing analytics path, got: {error}"
+    );
+    assert!(
+        error.contains("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1"),
+        "refusal must name the explicit cleartext override, got: {error}"
+    );
+}
+
+#[test]
+fn no_auth_cluster_still_rejects_cleartext_analytics_peers() {
+    let result = {
+        let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+        let temp_dir = TempDir::new().unwrap();
+        let _data_dir =
+            EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+        let _no_auth = EnvVarRestoreGuard::set("FLAPJACK_NO_AUTH", "1");
+        let _admin_key = EnvVarRestoreGuard::remove("FLAPJACK_ADMIN_KEY");
+        let _peer_key = EnvVarRestoreGuard::remove("FLAPJACK_REPLICATION_API_KEY");
+        let _allow_unauthenticated =
+            EnvVarRestoreGuard::set("FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS", "1");
+        let _allow_cleartext =
+            EnvVarRestoreGuard::remove("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS");
+        let _peers =
+            EnvVarRestoreGuard::set("FLAPJACK_PEERS", "node-b=http://node-b.example.com:7700");
+        let _bootstrap_peer = EnvVarRestoreGuard::remove("FLAPJACK_BOOTSTRAP_PEER");
+        let _advertise_addr = EnvVarRestoreGuard::remove("FLAPJACK_ADVERTISE_ADDR");
+        let _cert_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_CERT_PATH");
+        let _key_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_KEY_PATH");
+
+        load_server_config().map(|_| ())
+    };
+
+    let error = result.expect_err("no-auth routes may still receive and forward caller API keys");
+    assert!(
+        error.contains("analytics") && error.contains("caller API keys"),
+        "refusal must identify the credential-bearing analytics path, got: {error}"
+    );
+    assert!(
+        error.contains("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1"),
+        "refusal must name the explicit cleartext override, got: {error}"
+    );
+}
+
+#[test]
+fn startup_unauthenticated_peer_escape_does_not_expose_admin_key_to_cleartext_bootstrap() {
+    let result = {
+        let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+        let temp_dir = TempDir::new().unwrap();
+        let _data_dir =
+            EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+        let _admin_key = EnvVarRestoreGuard::set("FLAPJACK_ADMIN_KEY", "bootstrap-admin-secret");
+        let _peer_key = EnvVarRestoreGuard::remove("FLAPJACK_REPLICATION_API_KEY");
+        let _allow_unauthenticated =
+            EnvVarRestoreGuard::set("FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS", "1");
+        let _allow_cleartext =
+            EnvVarRestoreGuard::remove("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS");
+        let _peers = EnvVarRestoreGuard::remove("FLAPJACK_PEERS");
+        let _bootstrap_peer = EnvVarRestoreGuard::set(
+            "FLAPJACK_BOOTSTRAP_PEER",
+            "http://bootstrap.example.com:7700",
+        );
+        let _advertise_addr =
+            EnvVarRestoreGuard::set("FLAPJACK_ADVERTISE_ADDR", "https://joiner.example.com:7700");
+        let _cert_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_CERT_PATH");
+        let _key_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_KEY_PATH");
+
+        load_server_config().map(|_| ())
+    };
+
+    let error = result.expect_err(
+        "the unauthenticated replication escape must not send the admin key to HTTP bootstrap",
+    );
+    assert!(
+        error.contains("admin API key"),
+        "refusal must identify the credential at risk, got: {error}"
+    );
+    assert!(
+        error.contains("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1"),
+        "refusal must name the separate cleartext transport override, got: {error}"
+    );
+}
+
+#[test]
+fn startup_cleartext_escape_explicitly_repermits_admin_authenticated_bootstrap() {
+    let result = {
+        let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+        let temp_dir = TempDir::new().unwrap();
+        let _data_dir =
+            EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+        let _admin_key = EnvVarRestoreGuard::set("FLAPJACK_ADMIN_KEY", "bootstrap-admin-secret");
+        let _peer_key = EnvVarRestoreGuard::remove("FLAPJACK_REPLICATION_API_KEY");
+        let _allow_unauthenticated =
+            EnvVarRestoreGuard::set("FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS", "1");
+        let _allow_cleartext =
+            EnvVarRestoreGuard::set("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS", "1");
+        let _peers = EnvVarRestoreGuard::remove("FLAPJACK_PEERS");
+        let _bootstrap_peer = EnvVarRestoreGuard::set(
+            "FLAPJACK_BOOTSTRAP_PEER",
+            "http://bootstrap.example.com:7700",
+        );
+        let _advertise_addr =
+            EnvVarRestoreGuard::set("FLAPJACK_ADVERTISE_ADDR", "https://joiner.example.com:7700");
+        let _cert_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_CERT_PATH");
+        let _key_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_KEY_PATH");
+        let writer = TestWriter::new();
+        let subscriber =
+            tracing_subscriber::registry().with(build_log_layer_with_writer(writer.clone(), false));
+
+        tracing::subscriber::with_default(subscriber, load_server_config)
+            .map(|config| (config.node_config.bootstrap_peer, writer.output()))
+    };
+
+    let (bootstrap_peer, output) =
+        result.expect("both explicit escapes should permit cleartext bootstrap");
+    assert_eq!(
+        bootstrap_peer.as_deref(),
+        Some("http://bootstrap.example.com:7700")
+    );
+    assert!(
+        output.contains("admin API key")
+            && output.contains("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1"),
+        "warning must name the credential and transport escape, got: {output:?}"
+    );
+}
+
+#[test]
+fn startup_node_json_unauthenticated_peer_escape_repermits_and_warns() {
+    let result = {
+        let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+        let temp_dir = TempDir::new().unwrap();
+        let node_json = serde_json::json!({
+            "node_id": "node-a",
+            "bind_addr": "127.0.0.1:0",
+            "peers": [{
+                "node_id": "node-b",
+                "addr": "https://node-b.example.com:7700"
+            }]
+        });
+        std::fs::write(temp_dir.path().join("node.json"), node_json.to_string())
+            .expect("test node.json must be writable");
+        let _data_dir =
+            EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+        let _admin_key = EnvVarRestoreGuard::remove("FLAPJACK_ADMIN_KEY");
+        let _peer_key = EnvVarRestoreGuard::remove("FLAPJACK_REPLICATION_API_KEY");
+        let _allow_unauthenticated =
+            EnvVarRestoreGuard::set("FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS", "1");
+        let _peers = EnvVarRestoreGuard::remove("FLAPJACK_PEERS");
+        let _bootstrap_peer = EnvVarRestoreGuard::remove("FLAPJACK_BOOTSTRAP_PEER");
+        let _advertise_addr = EnvVarRestoreGuard::remove("FLAPJACK_ADVERTISE_ADDR");
+        let _cert_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_CERT_PATH");
+        let _key_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_KEY_PATH");
+        let writer = TestWriter::new();
+        let subscriber =
+            tracing_subscriber::registry().with(build_log_layer_with_writer(writer.clone(), false));
+
+        tracing::subscriber::with_default(subscriber, load_server_config)
+            .map(|server_config| (server_config.replication_api_key_env, writer.output()))
+    };
+
+    let (replication_api_key_env, output) =
+        result.expect("explicit unauthenticated peer override should permit node.json topology");
+    assert_eq!(replication_api_key_env, None);
+    assert!(
+        output.contains("WARNING") || output.contains("warning"),
+        "node.json override use must emit a loud warning, got: {output:?}"
+    );
+    assert!(
+        output.contains("FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS=1"),
+        "warning must name the unauthenticated peer override, got: {output:?}"
+    );
+    assert!(
+        output.contains("FLAPJACK_REPLICATION_API_KEY"),
+        "warning must name the missing peer credential setting, got: {output:?}"
+    );
+    assert!(
+        output.contains("node.json") || output.contains("node-b"),
+        "warning must identify the persisted replication intent, got: {output:?}"
+    );
+}
+
+#[test]
+fn tls_paths_constructor_rejects_partial_pairs() {
+    assert_eq!(
+        TlsPaths::from_optional_paths(Some("cert.pem"), None::<&str>).unwrap_err(),
+        "--ssl-cert-path cannot be used without --ssl-key-path"
+    );
+    assert_eq!(
+        TlsPaths::from_optional_paths(None::<&str>, Some("key.pem")).unwrap_err(),
+        "--ssl-key-path cannot be used without --ssl-cert-path"
+    );
+}
+
+#[test]
+fn tls_paths_constructor_returns_paths_or_none() {
+    let paths = TlsPaths::from_optional_paths(Some("cert.pem"), Some("key.pem"))
+        .expect("tls paths should resolve")
+        .expect("tls paths should be present");
+
+    assert_eq!(paths.cert_path, std::path::PathBuf::from("cert.pem"));
+    assert_eq!(paths.key_path, std::path::PathBuf::from("key.pem"));
+    assert_eq!(
+        TlsPaths::from_optional_paths(None::<&str>, None::<&str>)
+            .expect("missing tls paths should resolve"),
+        None
+    );
+}
+
+#[test]
+fn tls_paths_env_loading_uses_shared_pairing_rule() {
+    let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+    let temp_dir = TempDir::new().unwrap();
+    let _data_dir = EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+    let _cert_path = EnvVarRestoreGuard::set("FLAPJACK_SSL_CERT_PATH", "cert.pem");
+    let _key_path = EnvVarRestoreGuard::set("FLAPJACK_SSL_KEY_PATH", "key.pem");
+
+    let server_config = load_server_config().expect("server config should load");
+
+    let paths = server_config
+        .tls_paths
+        .expect("tls paths should load from environment");
+    assert_eq!(paths.cert_path, std::path::PathBuf::from("cert.pem"));
+    assert_eq!(paths.key_path, std::path::PathBuf::from("key.pem"));
+}
+
+#[test]
+fn tls_paths_env_loading_rejects_partial_pairs() {
+    let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+    let temp_dir = TempDir::new().unwrap();
+    let _data_dir = EnvVarRestoreGuard::set("FLAPJACK_DATA_DIR", temp_dir.path().to_str().unwrap());
+    let _cert_path = EnvVarRestoreGuard::set("FLAPJACK_SSL_CERT_PATH", "cert.pem");
+    let _key_path = EnvVarRestoreGuard::remove("FLAPJACK_SSL_KEY_PATH");
+
+    match load_server_config() {
+        Ok(_) => panic!("partial tls env config should fail"),
+        Err(error) => assert_eq!(
+            error,
+            "--ssl-cert-path cannot be used without --ssl-key-path"
+        ),
+    }
+}
+
+#[test]
+fn startup_banner_urls_use_one_scheme_seam() {
+    let http_urls = startup_banner_urls("127.0.0.1:7700", "http");
+    assert_eq!(http_urls.base, "http://127.0.0.1:7700");
+    assert_eq!(http_urls.dashboard, "http://127.0.0.1:7700/dashboard");
+    assert_eq!(http_urls.swagger, "http://127.0.0.1:7700/swagger-ui");
+
+    let https_urls = startup_banner_urls("127.0.0.1:7700", "https");
+    assert_eq!(https_urls.base, "https://127.0.0.1:7700");
+    assert_eq!(https_urls.dashboard, "https://127.0.0.1:7700/dashboard");
+    assert_eq!(https_urls.swagger, "https://127.0.0.1:7700/swagger-ui");
 }
 
 // --- Tracing subscriber builder tests ---
@@ -767,8 +1366,8 @@ fn load_server_config_doc_lists_only_fields_loaded_here() {
     let source = include_str!("startup.rs");
     let expected_doc =
         "/// Loads startup configuration from environment variables for mode/auth, optional\n\
-/// dashboard lockdown, public no-auth bind override, admin key, data directory,\n\
-/// and bind address, then\n\
+/// dashboard lockdown, public no-auth bind override, admin key, replication peer\n\
+/// API key, data directory, bind address, and optional TLS paths, then\n\
 /// initializes logging and acquires the per-process data directory lock.";
     let stale_doc =
             "/// Loads server configuration from environment variables: data directory, bind address,\n\

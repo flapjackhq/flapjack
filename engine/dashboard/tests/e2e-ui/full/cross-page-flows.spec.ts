@@ -14,7 +14,7 @@
  * - Settings → modify attribute → save → Search → verify → revert
  */
 import { test, expect } from '../../fixtures/auth.fixture';
-import { API_BASE, API_HEADERS, TEST_INDEX, getSidebar, waitForOverviewIndexRow, waitForSearchResultsOrEmptyState } from '../helpers';
+import { TEST_INDEX, getSidebar, waitForOverviewIndexRow, waitForSearchResultsOrEmptyState } from '../helpers';
 import { deleteIndex, addDocuments, searchIndex, getSettings, updateSettings } from '../../fixtures/api-helpers';
 import { createIsolatedMerchandisingScenario } from '../scenario-helpers';
 
@@ -50,7 +50,7 @@ test.describe('Cross-Page Flows', () => {
     await page.getByRole('button', { name: /create.*index/i }).click();
     const createDialog = page.getByRole('dialog');
     await expect(createDialog).toBeVisible();
-    await createDialog.locator('#index-uid').fill(tempIndex);
+    await createDialog.getByLabel('Index Name', { exact: true }).fill(tempIndex);
     await createDialog.getByRole('button', { name: /create index/i }).click();
     await expect(createDialog).not.toBeVisible({ timeout: 10_000 });
 
@@ -177,7 +177,7 @@ test.describe('Cross-Page Flows', () => {
       const tagsChip = page.getByTestId('attr-chip-tags').first();
       await expect(tagsChip).toBeVisible({ timeout: 10_000 });
       await tagsChip.click();
-      await expect(tagsChip.locator('svg')).toHaveCount(0);
+      await expect(tagsChip).toHaveAttribute('aria-pressed', 'false');
 
       const saveButton = page.getByRole('button', { name: /save/i });
       await expect(saveButton).toBeVisible({ timeout: 5_000 });
@@ -199,7 +199,7 @@ test.describe('Cross-Page Flows', () => {
       await expect(page.getByRole('heading', { name: /settings/i })).toBeVisible({ timeout: 10_000 });
       const reloadedTagsChip = page.getByTestId('attr-chip-tags').first();
       await expect(reloadedTagsChip).toBeVisible({ timeout: 10_000 });
-      await expect(reloadedTagsChip.locator('svg')).toHaveCount(0);
+      await expect(reloadedTagsChip).toHaveAttribute('aria-pressed', 'false');
     } finally {
       // Restore original settings to avoid test pollution
       await updateSettings(request, TEST_INDEX, originalSettings);

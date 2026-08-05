@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -12,6 +13,7 @@ use crate::startup::{
     shutdown_signal, shutdown_timeout_secs_from_env, validate_startup_auth_policy, AuthStatus,
     CorsMode, StartupAuthValidationOutcome, NO_AUTH_PUBLIC_BIND_WARNING,
 };
+use crate::tls_serve;
 use flapjack_replication::config::NodeConfig;
 
 #[cfg(test)]
@@ -24,19 +26,28 @@ mod startup_repair_tests;
 pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let startup_start = std::time::Instant::now();
 
-    let server_config = load_server_config();
-
+    // Tracing is installed before config load so startup validation warnings
+    // (unauthenticated replication peers, cleartext peers) reach the log.
     #[cfg(feature = "otel")]
     let otel_guard = init_tracing();
     #[cfg(not(feature = "otel"))]
     init_tracing();
+
+    let server_config = load_server_config().map_err(std::io::Error::other)?;
+    let loaded_tls = server_config
+        .tls_paths
+        .as_ref()
+        .map(tls_serve::load_tls_config)
+        .transpose()
+        .map_err(std::io::Error::other)?;
 
     log_memory_configuration();
 
     let cors_mode = cors_origins_from_env();
     let shutdown_timeout_secs = shutdown_timeout_secs_from_env();
     let data_dir = Path::new(&server_config.data_dir);
-    let node_config = NodeConfig::load_or_default(data_dir);
+    // Topology was already parsed and validated by `load_server_config`.
+    let node_config = server_config.node_config.clone();
     match validate_startup_auth_policy(
         &server_config.env_mode,
         server_config.no_auth,
@@ -51,9 +62,12 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => exit_for_startup_auth_validation_error(error),
     }
     let (key_store, admin_key, key_is_new) = initialize_key_store(&server_config, data_dir);
-
     let mut infrastructure =
-        initialize_infrastructure(&server_config, data_dir, admin_key.clone(), node_config).await?;
+        initialize_server_infrastructure(&server_config, data_dir, admin_key.clone(), node_config)
+            .await?;
+    if let Some(loaded_tls) = loaded_tls.as_ref() {
+        infrastructure.tls_resolver = Some(Arc::clone(&loaded_tls.resolver));
+    }
 
     #[cfg(feature = "otel")]
     {
@@ -84,8 +98,6 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(std::io::Error::other)?;
 
-    spawn_background_tasks(&state, &infrastructure);
-
     let app = build_router(
         Arc::clone(&state),
         key_store,
@@ -95,27 +107,49 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         RouterConfig {
             cors_mode,
             disable_dashboard: server_config.disable_dashboard,
+            replication_api_key: server_config.replication_api_key_env.clone(),
         },
     );
 
     let listener = tokio::net::TcpListener::bind(&infrastructure.bind_addr).await?;
+    // SSL renewal may immediately request a certificate. Bind first so Pebble or a
+    // production CA can queue its HTTP-01 request until Axum begins accepting it.
+    spawn_background_tasks(&state, &infrastructure);
     let auth_status = resolve_auth_status(&server_config, key_is_new, admin_key);
+    let use_tls = loaded_tls.is_some();
     print_startup_banner(
         &listener.local_addr()?.to_string(),
+        if use_tls { "https" } else { "http" },
         auth_status,
         startup_start.elapsed().as_millis(),
         &server_config.data_dir,
     );
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+    match loaded_tls {
+        Some(loaded_tls) => {
+            tls_serve::serve_tls(listener, make_service, loaded_tls.config, shutdown_signal())
+                .await
+                .map_err(std::io::Error::other)?;
+        }
+        None => {
+            axum::serve(listener, make_service)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+        }
+    }
 
     let _ = run_graceful_shutdown(&mut infrastructure, &state, shutdown_timeout_secs).await;
     Ok(())
+}
+
+pub(crate) async fn initialize_server_infrastructure(
+    server_config: &crate::startup::ServerConfig,
+    data_dir: &Path,
+    admin_key: Option<String>,
+    node_config: NodeConfig,
+) -> Result<crate::server_init::InfrastructureState, Box<dyn std::error::Error>> {
+    initialize_infrastructure(server_config, data_dir, admin_key, node_config).await
 }
 
 pub(crate) async fn run_pre_serve_barrier(

@@ -1975,6 +1975,9 @@
           "404": {
             "description": "Index not found"
           },
+          "500": {
+            "description": "Snapshot upload or retention failed"
+          },
           "503": {
             "description": "S3 not configured"
           }
@@ -2964,6 +2967,74 @@
         ]
       }
     },
+    "/1/migrations/algolia/list-indexes": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "List the source indexes reachable with the supplied source credentials.",
+        "description": "Documentation only: this generated function is never mounted.\n`register_source_migration_routes` serves every provider's\n`list-indexes` route through `list_source_indexes_http`, and this\nwrapper delegates to that same handler so the published operation\ncannot drift from the served one.",
+        "operationId": "list_algolia_source_indexes_doc",
+        "parameters": [
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ListAlgoliaIndexesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Source indexes reachable with the supplied credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSourceIndexesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid discovery request, source_provider_payload_mismatch, or refused source endpoint"
+          },
+          "403": {
+            "description": "invalid_api_key: source credentials lack index-listing access"
+          },
+          "502": {
+            "description": "Upstream source provider request failed"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
     "/1/migrations/algolia/preview": {
       "post": {
         "tags": [
@@ -3317,6 +3388,74 @@
         ]
       }
     },
+    "/1/migrations/meilisearch/list-indexes": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "List the source indexes reachable with the supplied source credentials.",
+        "description": "Documentation only: this generated function is never mounted.\n`register_source_migration_routes` serves every provider's\n`list-indexes` route through `list_source_indexes_http`, and this\nwrapper delegates to that same handler so the published operation\ncannot drift from the served one.",
+        "operationId": "list_meilisearch_source_indexes_doc",
+        "parameters": [
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ListMeilisearchIndexesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Source indexes reachable with the supplied credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSourceIndexesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid discovery request, source_provider_payload_mismatch, or refused source endpoint"
+          },
+          "403": {
+            "description": "invalid_api_key: source credentials lack index-listing access"
+          },
+          "502": {
+            "description": "Upstream source provider request failed"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
     "/1/migrations/meilisearch/preview": {
       "post": {
         "tags": [
@@ -3651,6 +3790,74 @@
         ]
       }
     },
+    "/1/migrations/typesense/list-indexes": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "List the source indexes reachable with the supplied source credentials.",
+        "description": "Documentation only: this generated function is never mounted.\n`register_source_migration_routes` serves every provider's\n`list-indexes` route through `list_source_indexes_http`, and this\nwrapper delegates to that same handler so the published operation\ncannot drift from the served one.",
+        "operationId": "list_typesense_source_indexes_doc",
+        "parameters": [
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ListTypesenseIndexesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Source indexes reachable with the supplied credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSourceIndexesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid discovery request, source_provider_payload_mismatch, or refused source endpoint"
+          },
+          "403": {
+            "description": "invalid_api_key: source credentials lack index-listing access"
+          },
+          "502": {
+            "description": "Upstream source provider request failed"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
     "/1/migrations/typesense/preview": {
       "post": {
         "tags": [
@@ -3662,7 +3869,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/MigrateFromAlgoliaRequest"
+                "$ref": "#/components/schemas/MigrateFromTypesenseRequest"
               }
             }
           },
@@ -4885,7 +5092,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/SeedRequest"
+                "$ref": "#/components/schemas/ClearRequest"
               }
             }
           },
@@ -7380,6 +7587,7 @@
           "status",
           "index",
           "days",
+          "seededDates",
           "totalSearches",
           "totalClicks",
           "totalConversions"
@@ -7392,6 +7600,12 @@
           },
           "index": {
             "type": "string"
+          },
+          "seededDates": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           },
           "status": {
             "type": "string"
@@ -8123,6 +8337,18 @@
             "items": {
               "type": "object"
             }
+          }
+        }
+      },
+      "ClearRequest": {
+        "type": "object",
+        "description": "Request body for `DELETE /2/analytics/clear`. Clear only targets an index; it must\nnot inherit the seed-only volume/distribution controls from `SeedRequest`, or the\npublished contract would advertise controls the clear handler silently ignores.",
+        "properties": {
+          "index": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -9761,6 +9987,79 @@
             }
           }
         }
+      },
+      "ListMeilisearchIndexesRequest": {
+        "type": "object",
+        "description": "Discovery request body for a Meilisearch source. The Algolia arm reuses\n[`ListAlgoliaIndexesRequest`] rather than owning a second `{appId, apiKey}`\nschema.",
+        "required": [
+          "endpoint",
+          "apiKey"
+        ],
+        "properties": {
+          "apiKey": {
+            "type": "string"
+          },
+          "endpoint": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ListSourceIndexesResponse": {
+        "type": "object",
+        "description": "Provider-neutral source discovery response. Pagination fields are present\nonly for providers that report their own window.",
+        "required": [
+          "indexes"
+        ],
+        "properties": {
+          "indexes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceIndexSummary"
+            }
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "offset": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "total": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "ListTypesenseIndexesRequest": {
+        "type": "object",
+        "description": "Discovery request body for a Typesense source.",
+        "required": [
+          "node",
+          "apiKey"
+        ],
+        "properties": {
+          "apiKey": {
+            "type": "string"
+          },
+          "node": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
       },
       "LogEntry": {
         "type": "object",
@@ -11822,6 +12121,19 @@
       "SeedRequest": {
         "type": "object",
         "properties": {
+          "countryDistribution": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "number",
+              "format": "double"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
           "days": {
             "type": [
               "integer",
@@ -11830,11 +12142,39 @@
             "format": "int32",
             "minimum": 0
           },
+          "deviceDistribution": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "number",
+              "format": "double"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
           "index": {
             "type": [
               "string",
               "null"
             ]
+          },
+          "noResultRate": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "searchCount": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
           }
         }
       },
@@ -12347,6 +12687,82 @@
           "not_configured",
           "configured_unverified"
         ]
+      },
+      "SourceIndexCreatedAt": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        ],
+        "description": "A provider-native source creation timestamp."
+      },
+      "SourceIndexSummary": {
+        "type": "object",
+        "description": "One source index in the provider-neutral discovery response.\n\nEvery metadata field is always serialized — `null` where the provider does\nnot publish it — so clients see one stable shape across providers instead of\na per-provider key set.",
+        "required": [
+          "name",
+          "primaryKey",
+          "entries",
+          "documentCount",
+          "createdAt",
+          "updatedAt",
+          "defaultSortingField"
+        ],
+        "properties": {
+          "createdAt": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SourceIndexCreatedAt",
+                "description": "Providers publish creation time in incompatible units (RFC 3339 for\nMeilisearch, epoch seconds for Typesense), so the upstream value is\npreserved rather than coerced into one of them."
+              }
+            ]
+          },
+          "defaultSortingField": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "documentCount": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "entries": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "primaryKey": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updatedAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
       },
       "SourceMutationTimestampResponse": {
         "type": "object",

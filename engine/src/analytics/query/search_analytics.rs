@@ -36,7 +36,16 @@ impl super::AnalyticsQueryEngine {
             }
         }
 
-        let ctx = self.create_session_with_searches(params.index_name).await?;
+        // Click enrichment reads `events` after this query returns, so the
+        // events table is registered up front: acquiring a second same-index
+        // read later would deadlock against a seed or clear that queued while
+        // this snapshot was still live.
+        let ctx = if click_analytics {
+            self.create_session_with_searches_and_events(params.index_name)
+                .await?
+        } else {
+            self.create_session_with_searches(params.index_name).await?
+        };
         let mut where_clause = format!(
             "timestamp_ms >= {} AND timestamp_ms <= {}",
             start_ms, end_ms
@@ -73,9 +82,13 @@ impl super::AnalyticsQueryEngine {
         let rows = batches_to_json(&batches)?;
 
         if click_analytics {
-            // Enrich with CTR data from events
+            run_analytics_read_stage_hook(
+                AnalyticsReadStage::AfterInitialSearchCollection,
+                params.index_name,
+            );
+            // Enrich with CTR data from events, reusing this snapshot's session
             let enriched = self
-                .enrich_with_click_data(params.index_name, start_ms, end_ms, rows)
+                .enrich_with_click_data(&ctx, start_ms, end_ms, rows)
                 .await?;
             Ok(serde_json::json!({"searches": enriched}))
         } else {
@@ -316,7 +329,9 @@ impl super::AnalyticsQueryEngine {
         let end_ms = date_to_end_ms(end_date)?;
 
         // Get all tracked searches grouped by query
-        let search_ctx = self.create_session_with_searches(index_name).await?;
+        let ctx = self
+            .create_session_with_searches_and_events(index_name)
+            .await?;
         let sql = format!(
             "SELECT query as search, COUNT(*) as count, \
              CAST(AVG(nb_hits) AS INTEGER) as \"nbHits\" \
@@ -326,7 +341,7 @@ impl super::AnalyticsQueryEngine {
              ORDER BY count DESC",
             start_ms, end_ms
         );
-        let df = search_ctx
+        let df = ctx
             .sql(&sql)
             .await
             .map_err(|e| format!("SQL error: {}", e))?;
@@ -338,7 +353,6 @@ impl super::AnalyticsQueryEngine {
 
         // Get queries that DID get clicks (via queryID correlation)
         // First get queryIDs that have click events
-        let events_ctx = self.create_session_with_events(index_name).await?;
         let click_qids_sql = format!(
             "SELECT DISTINCT query_id FROM events \
              WHERE timestamp_ms >= {} AND timestamp_ms <= {} \
@@ -346,7 +360,7 @@ impl super::AnalyticsQueryEngine {
             start_ms, end_ms
         );
         let clicked_queries: std::collections::HashSet<String> =
-            match events_ctx.sql(&click_qids_sql).await {
+            match ctx.sql(&click_qids_sql).await {
                 Ok(df) => {
                     let batches = df
                         .collect()
@@ -361,7 +375,6 @@ impl super::AnalyticsQueryEngine {
             };
 
         // Now get the actual query text for those queryIDs from searches
-        let search_ctx2 = self.create_session_with_searches(index_name).await?;
         let clicked_query_texts: std::collections::HashSet<String> = if clicked_queries.is_empty() {
             std::collections::HashSet::new()
         } else {
@@ -377,7 +390,7 @@ impl super::AnalyticsQueryEngine {
                 end_ms,
                 qid_list.join(",")
             );
-            match search_ctx2.sql(&qid_sql).await {
+            match ctx.sql(&qid_sql).await {
                 Ok(df) => {
                     let batches = df
                         .collect()
@@ -415,13 +428,15 @@ impl super::AnalyticsQueryEngine {
         let start_ms = date_to_start_ms(start_date)?;
         let end_ms = date_to_end_ms(end_date)?;
 
-        let search_ctx = self.create_session_with_searches(index_name).await?;
+        let ctx = self
+            .create_session_with_searches_and_events(index_name)
+            .await?;
         let sql = format!(
             "SELECT COUNT(*) as count FROM searches \
              WHERE timestamp_ms >= {} AND timestamp_ms <= {} AND query_id IS NOT NULL",
             start_ms, end_ms
         );
-        let df = search_ctx
+        let df = ctx
             .sql(&sql)
             .await
             .map_err(|e| format!("SQL error: {}", e))?;
@@ -444,7 +459,7 @@ impl super::AnalyticsQueryEngine {
              GROUP BY day_ms ORDER BY day_ms",
             start_ms, end_ms
         );
-        let df = search_ctx
+        let df = ctx
             .sql(&daily_search_sql)
             .await
             .map_err(|e| format!("SQL error: {}", e))?;
@@ -454,14 +469,13 @@ impl super::AnalyticsQueryEngine {
             .map_err(|e| format!("Exec error: {}", e))?;
         let daily_searches = batches_to_json(&batches)?;
 
-        let events_ctx = self.create_session_with_events(index_name).await?;
         let click_sql = format!(
             "SELECT COUNT(DISTINCT query_id) as count FROM events \
              WHERE timestamp_ms >= {} AND timestamp_ms <= {} \
                AND event_type = 'click' AND query_id IS NOT NULL",
             start_ms, end_ms
         );
-        let clicked = match events_ctx.sql(&click_sql).await {
+        let clicked = match ctx.sql(&click_sql).await {
             Ok(df) => {
                 let batches = df
                     .collect()
@@ -487,7 +501,7 @@ impl super::AnalyticsQueryEngine {
             start_ms, end_ms
         );
         let daily_clicked: std::collections::HashMap<i64, i64> =
-            match events_ctx.sql(&daily_click_sql).await {
+            match ctx.sql(&daily_click_sql).await {
                 Ok(df) => {
                     let batches = df
                         .collect()

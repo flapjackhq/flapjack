@@ -33,13 +33,15 @@ impl super::AnalyticsQueryEngine {
         let end_ms = date_to_end_ms(end_date)?;
 
         // Get tracked search count (searches with queryID)
-        let search_ctx = self.create_session_with_searches(index_name).await?;
+        let ctx = self
+            .create_session_with_searches_and_events(index_name)
+            .await?;
         let search_sql = format!(
             "SELECT COUNT(*) as count FROM searches \
              WHERE timestamp_ms >= {} AND timestamp_ms <= {} AND query_id IS NOT NULL",
             start_ms, end_ms
         );
-        let df = search_ctx
+        let df = ctx
             .sql(&search_sql)
             .await
             .map_err(|e| format!("SQL error: {}", e))?;
@@ -62,7 +64,7 @@ impl super::AnalyticsQueryEngine {
              GROUP BY day_ms ORDER BY day_ms",
             start_ms, end_ms
         );
-        let df = search_ctx
+        let df = ctx
             .sql(&daily_search_sql)
             .await
             .map_err(|e| format!("SQL error: {}", e))?;
@@ -73,13 +75,12 @@ impl super::AnalyticsQueryEngine {
         let daily_searches = batches_to_json(&batches)?;
 
         // Get click count + daily clicks
-        let events_ctx = self.create_session_with_events(index_name).await?;
         let click_sql = format!(
             "SELECT COUNT(*) as count FROM events \
              WHERE timestamp_ms >= {} AND timestamp_ms <= {} AND event_type = 'click'",
             start_ms, end_ms
         );
-        let click_count = match events_ctx.sql(&click_sql).await {
+        let click_count = match ctx.sql(&click_sql).await {
             Ok(df) => {
                 let batches = df
                     .collect()
@@ -103,7 +104,7 @@ impl super::AnalyticsQueryEngine {
             start_ms, end_ms
         );
         let daily_clicks: std::collections::HashMap<i64, i64> =
-            match events_ctx.sql(&daily_click_sql).await {
+            match ctx.sql(&daily_click_sql).await {
                 Ok(df) => {
                     let batches = df
                         .collect()

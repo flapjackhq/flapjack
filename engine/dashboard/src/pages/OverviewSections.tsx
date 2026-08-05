@@ -22,6 +22,7 @@ import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { InfoTooltip } from '@/components/ui/info-tooltip';
 import { formatBytes, formatDate } from '@/lib/utils';
+import { CHART_CANVAS_TEST_ID, CHART_MARK_TEST_ID } from '@/lib/constants';
 
 interface AnalyticsOverviewData {
   totalSearches?: number;
@@ -232,7 +233,7 @@ export function OverviewAnalyticsSection({
             {overview?.dates && overview.dates.length > 0 && (
               <div className="h-32" data-testid="overview-analytics-chart">
                 <ResponsiveContainer width="100%" height="100%" minWidth={1}>
-                  <AreaChart data={overview.dates}>
+                  <AreaChart data={overview.dates} data-testid={CHART_CANVAS_TEST_ID}>
                     <defs>
                       <linearGradient id="overviewGradient" x1="0" y1="0" x2="0" y2="1">
                         <stop offset="0%" stopColor="hsl(var(--primary))" stopOpacity={0.2} />
@@ -259,7 +260,7 @@ export function OverviewAnalyticsSection({
                       }}
                       formatter={(value: number | undefined) => [Number(value ?? 0).toLocaleString(), 'Searches']}
                     />
-                    <Area type="monotone" dataKey="count" stroke="hsl(var(--primary))" strokeWidth={2} fill="url(#overviewGradient)" />
+                    <Area data-testid={CHART_MARK_TEST_ID} type="monotone" dataKey="count" stroke="hsl(var(--primary))" strokeWidth={2} fill="url(#overviewGradient)" />
                   </AreaChart>
                 </ResponsiveContainer>
               </div>

@@ -11,11 +11,14 @@ use crate::error_response::json_error;
 use crate::security_audit::{self, Actor, AuditPath, Target};
 
 use super::route_acl::RouteAcl;
+use super::session::DashboardSessionStore;
+use super::session_cookie::presented_session_token;
 use super::{
     api_key_restrict_sources_match, invalid_api_credentials_error, key_allows_index,
     referer_matches, request_application_id, required_acl_for_route, restrict_sources_match,
     validate_secured_key, ApiKey, AuthenticatedAppId, KeyStore, RateLimiter,
-    SecuredKeyRestrictions,
+    ReplicationPeerCredential, SecuredKeyRestrictions, PRIVATE_MIGRATION_ACL,
+    REPLICATION_PEER_APPLICATION_ID,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +27,9 @@ pub(crate) enum RouteExposure {
     Disabled,
     Protected,
 }
+
+pub(crate) const DASHBOARD_SESSION_EXCHANGES_PER_IP_PER_HOUR: u64 = 10;
+const DASHBOARD_SESSION_EXCHANGE_RATE_LIMIT_BUCKET: &str = "dashboard-session-exchange";
 
 pub(crate) fn route_exposure(path: &str, disable_dashboard: bool) -> RouteExposure {
     if is_always_public_path(path) {
@@ -79,7 +85,11 @@ pub(crate) fn extract_index_name(path: &str) -> Option<String> {
 
 /// Extract API key from request headers or query string.
 ///
-/// First checks the `x-algolia-api-key` header. If not found and the route requires admin ACL, returns `None` to prevent credential leakage via logs, shell history, proxy access logs, or referrer-like surfaces. Otherwise attempts to extract the key from the `x-algolia-api-key` query string parameter.
+/// First checks the `x-algolia-api-key` header. If not found and the route is a
+/// privileged operational route (`admin` or `privateMigration` ACL), returns `None`
+/// to prevent credential leakage via logs, shell history, proxy access logs, or
+/// referrer-like surfaces. Otherwise attempts to extract the key from the
+/// `x-algolia-api-key` query string parameter.
 ///
 /// # Arguments
 ///
@@ -88,15 +98,14 @@ pub(crate) fn extract_index_name(path: &str) -> Option<String> {
 /// # Returns
 ///
 /// `Some(key)` if an API key is found, `None` otherwise.
-fn extract_api_key(request: &Request) -> Option<String> {
+fn extract_api_key_for_route(request: &Request, route_acl: RouteAcl) -> Option<String> {
     if let Some(val) = request.headers().get("x-algolia-api-key") {
         return val.to_str().ok().map(|s| s.to_string());
     }
 
-    // Admin-ACL routes reject URL-borne credentials so sensitive keys do not
+    // Privileged operational routes reject URL-borne credentials so sensitive
     // leak via logs, shell history, proxy access logs, or referrer-like surfaces.
-    if required_acl_for_route(request.method(), request.uri().path()) == RouteAcl::Required("admin")
-    {
+    if requires_header_credentials(route_acl) {
         return None;
     }
 
@@ -108,6 +117,23 @@ fn extract_api_key(request: &Request) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+fn extract_api_key(request: &Request) -> Option<String> {
+    extract_api_key_for_route(
+        request,
+        required_acl_for_route(request.method(), request.uri().path()),
+    )
+}
+
+fn requires_header_credentials(route_acl: RouteAcl) -> bool {
+    matches!(
+        route_acl,
+        RouteAcl::Required("admin")
+            | RouteAcl::Required(PRIVATE_MIGRATION_ACL)
+            | RouteAcl::PeerOrAdmin
+    )
 }
 
 fn lookup_authenticated_key(
@@ -150,6 +176,7 @@ fn ensure_key_is_not_expired(api_key: &ApiKey) -> Option<Response> {
 
 /// Checks if the API key's ACL grants access to the requested route, returning 403 if not.
 /// Admin routes require an admin key or a self-read of the key's own `/1/keys/{value}` path.
+#[cfg(test)]
 fn ensure_route_acl_allows_request(
     key_store: &KeyStore,
     api_key: &ApiKey,
@@ -157,13 +184,35 @@ fn ensure_route_acl_allows_request(
     method: &Method,
     path: &str,
 ) -> Option<Response> {
-    let has_access = match required_acl_for_route(method, path) {
+    ensure_route_acl_allows_request_for_acl(
+        key_store,
+        api_key,
+        api_key_value,
+        required_acl_for_route(method, path),
+        method,
+        path,
+    )
+}
+
+fn ensure_route_acl_allows_request_for_acl(
+    key_store: &KeyStore,
+    api_key: &ApiKey,
+    api_key_value: &str,
+    route_acl: RouteAcl,
+    method: &Method,
+    path: &str,
+) -> Option<Response> {
+    let has_access = match route_acl {
         RouteAcl::Public => return None,
+        // route_acl_denies_unmapped_route_by_default and
+        // unmapped_route_refusal_carries_the_json_error_envelope require
+        // fall-through to json_error(FORBIDDEN, "Method not allowed with this API key").
         RouteAcl::Unmapped => false,
         RouteAcl::Required("admin") => {
             key_store.is_admin(api_key_value)
                 || is_own_key_read_request(method, path, api_key_value)
         }
+        RouteAcl::PeerOrAdmin => key_store.is_admin(api_key_value),
         RouteAcl::Required(required_acl) => api_key.acl.iter().any(|acl| acl == required_acl),
     };
 
@@ -175,6 +224,22 @@ fn ensure_route_acl_allows_request(
             "Method not allowed with this API key",
         ))
     }
+}
+
+fn is_configured_replication_peer_request(
+    request: &Request,
+    route_acl: RouteAcl,
+    application_id: &str,
+    api_key_value: &str,
+) -> bool {
+    if route_acl != RouteAcl::PeerOrAdmin || application_id != REPLICATION_PEER_APPLICATION_ID {
+        return false;
+    }
+
+    request
+        .extensions()
+        .get::<ReplicationPeerCredential>()
+        .is_some_and(|credential| credential.matches_secret(api_key_value))
 }
 
 /// Validates the request Referer header against the API key's allowed referer patterns.
@@ -255,6 +320,28 @@ fn ensure_rate_limit_allows_request(
     None
 }
 
+fn ensure_dashboard_session_exchange_rate_limit(request: &Request) -> Option<Response> {
+    let Some(rate_limiter) = request.extensions().get::<RateLimiter>() else {
+        return Some(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal server error",
+        ));
+    };
+    let client_ip = crate::middleware::extract_rate_limit_ip(request);
+    if rate_limiter.check_and_increment(
+        DASHBOARD_SESSION_EXCHANGE_RATE_LIMIT_BUCKET,
+        client_ip,
+        DASHBOARD_SESSION_EXCHANGES_PER_IP_PER_HOUR,
+    ) {
+        None
+    } else {
+        Some(json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many dashboard session exchange attempts per IP per hour",
+        ))
+    }
+}
+
 /// Checks that the API key (and any secured-key index restrictions) permits access
 /// to the index named in the URL path. Returns 403 if the index is not allowed.
 fn ensure_index_access_is_allowed(
@@ -284,11 +371,21 @@ pub async fn authenticate_and_authorize(
     }
 
     let path = request.uri().path().to_string();
+    let route_acl = required_acl_for_route(request.method(), &path);
 
     match route_exposure(&path, disable_dashboard) {
         RouteExposure::Public => return Ok(next.run(request).await),
         RouteExposure::Disabled => return Err(StatusCode::NOT_FOUND.into_response()),
         RouteExposure::Protected => {}
+    }
+
+    if route_acl == RouteAcl::Public {
+        if request.method() == Method::POST && path == "/1/dashboard/session" {
+            if let Some(response) = ensure_dashboard_session_exchange_rate_limit(&request) {
+                return Err(response);
+            }
+        }
+        return Ok(next.run(request).await);
     }
 
     let Some(key_store) = request.extensions().get::<std::sync::Arc<KeyStore>>() else {
@@ -301,13 +398,23 @@ pub async fn authenticate_and_authorize(
 
     let application_id_opt = request_application_id(&request);
 
-    let api_key_value = match extract_api_key(&request) {
-        Some(key_value) => key_value,
-        None => {
-            log_auth_failure(&path, "missing", "api_key_missing");
-            return Err(invalid_api_credentials_error());
-        }
-    };
+    let (api_key_value, authenticated_by_session) =
+        match extract_api_key_for_route(&request, route_acl) {
+            Some(key_value) => (key_value, false),
+            None => {
+                let session_is_valid = request
+                    .extensions()
+                    .get::<std::sync::Arc<DashboardSessionStore>>()
+                    .zip(presented_session_token(&request))
+                    .is_some_and(|(store, token)| store.validate_session(&token));
+                if session_is_valid {
+                    (key_store.admin_key_value(), true)
+                } else {
+                    log_auth_failure(&path, "missing", "api_key_missing");
+                    return Err(invalid_api_credentials_error());
+                }
+            }
+        };
 
     let application_id = match application_id_opt {
         Some(id) => id,
@@ -323,8 +430,32 @@ pub async fn authenticate_and_authorize(
         }
     };
 
-    let (api_key, secured_restrictions) = match lookup_authenticated_key(&key_store, &api_key_value)
+    if authenticated_by_session && application_id == REPLICATION_PEER_APPLICATION_ID {
+        log_auth_failure(&path, "session", "peer_application_id_forbidden");
+        return Err(invalid_api_credentials_error());
+    }
+
+    // Existing KeyStore identities take precedence over the separately
+    // configured peer secret. Otherwise reusing a restricted API key as the
+    // peer secret would silently promote every holder of that key to the peer
+    // tier and bypass its ACL, expiry, source, and index restrictions.
+    let authenticated_key = lookup_authenticated_key(&key_store, &api_key_value);
+    if authenticated_key.is_none()
+        && is_configured_replication_peer_request(
+            &request,
+            route_acl,
+            &application_id,
+            &api_key_value,
+        )
     {
+        let mut request = request;
+        request
+            .extensions_mut()
+            .insert(AuthenticatedAppId(application_id));
+        return Ok(next.run(request).await);
+    }
+
+    let (api_key, secured_restrictions) = match authenticated_key {
         Some(authenticated) => authenticated,
         None => {
             log_auth_failure(
@@ -338,10 +469,11 @@ pub async fn authenticate_and_authorize(
     if let Some(response) = ensure_key_is_not_expired(&api_key) {
         return Err(response);
     }
-    if let Some(response) = ensure_route_acl_allows_request(
+    if let Some(response) = ensure_route_acl_allows_request_for_acl(
         &key_store,
         &api_key,
         &api_key_value,
+        route_acl,
         request.method(),
         &path,
     ) {
@@ -367,7 +499,10 @@ pub async fn authenticate_and_authorize(
     }
 
     let successful_admin_target = (key_store.is_admin(&api_key_value)
-        && required_acl_for_route(request.method(), &path) == RouteAcl::Required("admin"))
+        && matches!(
+            route_acl,
+            RouteAcl::Required("admin") | RouteAcl::PeerOrAdmin
+        ))
     .then(|| Target::route_pattern(AuditPath::for_auth_route(&path)));
     if let Some(target) = successful_admin_target {
         security_audit::emit_auth_success(Actor::admin_api_key(), target);
@@ -385,3 +520,9 @@ pub async fn authenticate_and_authorize(
 
     Ok(next.run(request).await)
 }
+
+// Stage 1 boundary contract: peer-vs-admin enforcement through the real
+// middleware, using the existing KeyStore and request-extension seams.
+#[cfg(test)]
+#[path = "../auth_tests/peer_boundary_middleware_tests.rs"]
+mod peer_boundary_middleware_tests;

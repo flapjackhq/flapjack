@@ -21,9 +21,12 @@ services:
       FLAPJACK_NO_AUTH: "1"
       FLAPJACK_NODE_ID: node-a
       FLAPJACK_PEERS: "node-b=http://node-b:7700"
+      # No peer credential in this local fixture; startup requires FLAPJACK_REPLICATION_API_KEY whenever peers are configured.
+      FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS: "1"
+      FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS: "1"
       RUST_LOG: info
     ports:
-      - "7700:7700"
+      - "127.0.0.1:7700:7700"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:7700/health"]
       interval: 2s
@@ -42,9 +45,12 @@ services:
       FLAPJACK_NO_AUTH: "1"
       FLAPJACK_NODE_ID: node-b
       FLAPJACK_PEERS: "node-a=http://node-a:7700"
+      # No peer credential in this local fixture; startup requires FLAPJACK_REPLICATION_API_KEY whenever peers are configured.
+      FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS: "1"
+      FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS: "1"
       RUST_LOG: info
     ports:
-      - "7701:7700"
+      - "127.0.0.1:7701:7700"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:7700/health"]
       interval: 2s

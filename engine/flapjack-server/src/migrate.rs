@@ -2,8 +2,9 @@
 //! Operator usage is owned by `engine/docs2/3_IMPLEMENTATION/OPS_CONFIGURATION.md`.
 
 use crate::credentials::{validate_required_http_header_value, SecretSource};
-use clap::{Args, Subcommand};
-use serde::{Deserialize, Serialize};
+use clap::{Args, Subcommand, ValueEnum};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use std::io::Read;
 use std::net::IpAddr;
@@ -34,6 +35,10 @@ pub(crate) struct MigrateArgs {
     #[command(flatten)]
     connection: MigrateConnectionArgs,
 
+    /// Source migration provider
+    #[arg(long, value_enum, default_value_t = SourceProvider::Algolia, global = true)]
+    source_provider: SourceProvider,
+
     #[command(subcommand)]
     action: Option<MigrateAction>,
 
@@ -41,17 +46,21 @@ pub(crate) struct MigrateArgs {
     #[arg(long)]
     app_id: Option<String>,
 
-    /// Environment variable containing the source Algolia API key
+    /// Source Meilisearch endpoint or Typesense node URL
     #[arg(long)]
-    algolia_key_env: Option<String>,
+    source_endpoint: Option<String>,
 
-    /// File containing the source Algolia API key
-    #[arg(long)]
-    algolia_key_file: Option<PathBuf>,
+    /// Environment variable containing the source provider API key
+    #[arg(long, visible_alias = "algolia-key-env")]
+    source_key_env: Option<String>,
 
-    /// Read the source Algolia API key from stdin
-    #[arg(long)]
-    algolia_key_stdin: bool,
+    /// File containing the source provider API key
+    #[arg(long, visible_alias = "algolia-key-file")]
+    source_key_file: Option<PathBuf>,
+
+    /// Read the source provider API key from stdin
+    #[arg(long, visible_alias = "algolia-key-stdin")]
+    source_key_stdin: bool,
 
     /// Source Algolia index
     #[arg(long)]
@@ -99,6 +108,29 @@ struct MigrateConnectionArgs {
     /// Emit the server-returned status as JSON
     #[arg(long, global = true)]
     json: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum SourceProvider {
+    Algolia,
+    Meilisearch,
+    Typesense,
+}
+
+impl SourceProvider {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Algolia => "algolia",
+            Self::Meilisearch => "meilisearch",
+            Self::Typesense => "typesense",
+        }
+    }
+}
+
+impl std::fmt::Display for SourceProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -171,12 +203,35 @@ struct MigrationFailure {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MigrationRequest<'a> {
-    app_id: &'a str,
+    #[serde(flatten)]
+    source_connection: SourceConnection<'a>,
     api_key: &'a str,
     source_index: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     target_index: Option<&'a str>,
     overwrite: bool,
+}
+
+#[derive(Clone, Copy)]
+enum SourceConnection<'a> {
+    Algolia(&'a str),
+    Meilisearch(&'a str),
+    Typesense(&'a str),
+}
+
+impl Serialize for SourceConnection<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        match self {
+            Self::Algolia(app_id) => map.serialize_entry("appId", app_id)?,
+            Self::Meilisearch(endpoint) => map.serialize_entry("endpoint", endpoint)?,
+            Self::Typesense(node) => map.serialize_entry("node", node)?,
+        }
+        map.end()
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -231,6 +286,13 @@ struct ValidatedConnection {
     timeout: Duration,
 }
 
+struct ValidatedSubmit<'a> {
+    poll_interval: Duration,
+    connection: ValidatedConnection,
+    source_connection: SourceConnection<'a>,
+    source_index: &'a str,
+}
+
 #[derive(Deserialize)]
 struct ServerErrorBody {
     code: String,
@@ -259,6 +321,8 @@ struct MigrationClient<'a> {
     endpoint: reqwest::Url,
     application_id: &'a str,
     api_key: &'a str,
+    /// Provider-selected first path segment under `1/migrations/` (e.g. `algolia`).
+    route_segment: &'a str,
     client: reqwest::blocking::Client,
 }
 
@@ -290,21 +354,27 @@ fn execute(args: &MigrateArgs) -> Result<MigrationSuccess, MigrationFailure> {
 }
 
 fn run_migration(args: &MigrateArgs) -> Result<MigrationSuccess, MigrationFailure> {
-    let (poll_interval, connection, app_id, source_index) = validate_args(args)?;
-    let ValidatedConnection { endpoint, timeout } = connection;
+    let validated = validate_args(args)?;
+    let ValidatedConnection { endpoint, timeout } = validated.connection;
     let flapjack_source = flapjack_secret_source(&args.connection);
     let api_key = flapjack_source.read("API key").map_err(config_failure)?;
-    let algolia_source = algolia_secret_source(args);
-    let algolia_key = algolia_source
-        .read("Algolia API key")
+    let source_api_key_source = source_api_key_secret_source(args);
+    let source_api_key = source_api_key_source
+        .read("source API key")
         .map_err(|message| failure_with_secrets(FailureKind::Config, message, &[&api_key]))?;
-    let secrets = [api_key.as_str(), algolia_key.as_str()];
-    let client = MigrationClient::new(&args.connection, endpoint, timeout, &api_key)
-        .map_err(|message| failure_with_secrets(FailureKind::Config, message, &secrets))?;
+    let secrets = [api_key.as_str(), source_api_key.as_str()];
+    let client = MigrationClient::new(
+        &args.connection,
+        endpoint,
+        timeout,
+        &api_key,
+        args.source_provider.label(),
+    )
+    .map_err(|message| failure_with_secrets(FailureKind::Config, message, &secrets))?;
     let request = MigrationRequest {
-        app_id,
-        api_key: &algolia_key,
-        source_index,
+        source_connection: validated.source_connection,
+        api_key: &source_api_key,
+        source_index: validated.source_index,
         target_index: args.target_index.as_deref(),
         overwrite: args.overwrite,
     };
@@ -315,8 +385,14 @@ fn run_migration(args: &MigrateArgs) -> Result<MigrationSuccess, MigrationFailur
         return terminal_result(admitted, &secrets)
             .map(|status| MigrationSuccess::status(status, &secrets));
     }
-    poll_until_terminal(&client, admitted, poll_interval, timeout, &secrets)
-        .map(|status| MigrationSuccess::status(status, &secrets))
+    poll_until_terminal(
+        &client,
+        admitted,
+        validated.poll_interval,
+        timeout,
+        &secrets,
+    )
+    .map(|status| MigrationSuccess::status(status, &secrets))
 }
 
 fn run_job_action(
@@ -336,8 +412,14 @@ fn run_job_action(
         .read("API key")
         .map_err(config_failure)?;
     let secrets = [api_key.as_str()];
-    let client = MigrationClient::new(&args.connection, endpoint, timeout, &api_key)
-        .map_err(|message| failure_with_secrets(FailureKind::Config, message, &secrets))?;
+    let client = MigrationClient::new(
+        &args.connection,
+        endpoint,
+        timeout,
+        &api_key,
+        args.source_provider.label(),
+    )
+    .map_err(|message| failure_with_secrets(FailureKind::Config, message, &secrets))?;
     match action {
         MigrateAction::Cancel(_) => client
             .cancel(job_id)
@@ -350,29 +432,25 @@ fn run_job_action(
     }
 }
 
-fn validate_args(
-    args: &MigrateArgs,
-) -> Result<(Duration, ValidatedConnection, &str, &str), MigrationFailure> {
+fn validate_args(args: &MigrateArgs) -> Result<ValidatedSubmit<'_>, MigrationFailure> {
     let connection = validate_flapjack_args(args)?;
-    let app_id = args
-        .app_id
-        .as_deref()
-        .ok_or_else(|| config_failure("--app-id is required for submission".to_string()))?;
+    let source_connection = validate_source_connection(args)?;
     let source_index = args
         .source_index
         .as_deref()
         .ok_or_else(|| config_failure("--source-index is required for submission".to_string()))?;
-    let algolia_source = algolia_secret_source(args);
-    algolia_source
-        .validate_exactly_one("--algolia-key-env, --algolia-key-file, or --algolia-key-stdin")
+    let source_api_key_source = source_api_key_secret_source(args);
+    source_api_key_source
+        .validate_exactly_one(
+            "--source-key-env (alias --algolia-key-env), --source-key-file (alias --algolia-key-file), or --source-key-stdin (alias --algolia-key-stdin)",
+        )
         .map_err(config_failure)?;
-    if args.connection.api_key_stdin && args.algolia_key_stdin {
+    if args.connection.api_key_stdin && args.source_key_stdin {
         return Err(config_failure(
-            "--api-key-stdin cannot be combined with --algolia-key-stdin; both consume stdin"
+            "--api-key-stdin cannot be combined with --source-key-stdin (alias --algolia-key-stdin); both consume stdin"
                 .to_string(),
         ));
     }
-    validate_required_http_header_value("--app-id", app_id).map_err(config_failure)?;
     validate_required_http_header_value("--source-index", source_index).map_err(config_failure)?;
     if let Some(target_index) = args.target_index.as_deref() {
         validate_required_http_header_value("--target-index", target_index)
@@ -385,16 +463,31 @@ fn validate_args(
             .unwrap_or(DEFAULT_POLL_INTERVAL),
         MAX_POLL_INTERVAL,
     )?;
-    Ok((poll_interval, connection, app_id, source_index))
+    Ok(ValidatedSubmit {
+        poll_interval,
+        connection,
+        source_connection,
+        source_index,
+    })
 }
 
 impl MigrateArgs {
     fn explicit_submit_only_flag(&self) -> Option<&'static str> {
         [
             (self.app_id.is_some(), "--app-id"),
-            (self.algolia_key_env.is_some(), "--algolia-key-env"),
-            (self.algolia_key_file.is_some(), "--algolia-key-file"),
-            (self.algolia_key_stdin, "--algolia-key-stdin"),
+            (self.source_endpoint.is_some(), "--source-endpoint"),
+            (
+                self.source_key_env.is_some(),
+                "--source-key-env (alias --algolia-key-env)",
+            ),
+            (
+                self.source_key_file.is_some(),
+                "--source-key-file (alias --algolia-key-file)",
+            ),
+            (
+                self.source_key_stdin,
+                "--source-key-stdin (alias --algolia-key-stdin)",
+            ),
             (self.source_index.is_some(), "--source-index"),
             (self.target_index.is_some(), "--target-index"),
             (self.overwrite, "--overwrite"),
@@ -417,6 +510,57 @@ fn validate_flapjack_args(args: &MigrateArgs) -> Result<ValidatedConnection, Mig
     Ok(ValidatedConnection { endpoint, timeout })
 }
 
+fn validate_source_connection(
+    args: &MigrateArgs,
+) -> Result<SourceConnection<'_>, MigrationFailure> {
+    match args.source_provider {
+        SourceProvider::Algolia => validate_algolia_connection(args),
+        SourceProvider::Meilisearch | SourceProvider::Typesense => {
+            validate_endpoint_source_connection(args)
+        }
+    }
+}
+
+fn validate_algolia_connection(
+    args: &MigrateArgs,
+) -> Result<SourceConnection<'_>, MigrationFailure> {
+    if args.source_endpoint.is_some() {
+        return Err(config_failure(
+            "--source-endpoint is not valid with --source-provider algolia".to_string(),
+        ));
+    }
+    let app_id = args
+        .app_id
+        .as_deref()
+        .ok_or_else(|| config_failure("--app-id is required for submission".to_string()))?;
+    validate_required_http_header_value("--app-id", app_id).map_err(config_failure)?;
+    Ok(SourceConnection::Algolia(app_id))
+}
+
+fn validate_endpoint_source_connection(
+    args: &MigrateArgs,
+) -> Result<SourceConnection<'_>, MigrationFailure> {
+    let provider = args.source_provider;
+    if args.app_id.is_some() {
+        return Err(config_failure(format!(
+            "--app-id is not valid with --source-provider {provider}"
+        )));
+    }
+    let source_endpoint = args.source_endpoint.as_deref().ok_or_else(|| {
+        config_failure(format!(
+            "--source-endpoint is required for a {provider} submission"
+        ))
+    })?;
+    validate_source_endpoint(source_endpoint).map_err(config_failure)?;
+    match provider {
+        SourceProvider::Meilisearch => Ok(SourceConnection::Meilisearch(source_endpoint)),
+        SourceProvider::Typesense => Ok(SourceConnection::Typesense(source_endpoint)),
+        SourceProvider::Algolia => {
+            unreachable!("algolia source connection is validated separately")
+        }
+    }
+}
+
 fn validate_endpoint(endpoint: Option<&str>) -> Result<reqwest::Url, String> {
     let endpoint = endpoint.ok_or_else(|| "--endpoint is required".to_string())?;
     let endpoint =
@@ -430,6 +574,17 @@ fn validate_endpoint(endpoint: Option<&str>) -> Result<reqwest::Url, String> {
         );
     }
     Ok(endpoint)
+}
+
+fn validate_source_endpoint(source_endpoint: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(source_endpoint)
+        .map_err(|error| format!("invalid --source-endpoint: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("--source-endpoint must be an absolute http or https URL".to_string());
+    }
+    // Unlike --endpoint, the CLI never sends credentials to this URL; it only forwards the
+    // string to Flapjack, where the vendor allowlist has a single server-owned implementation.
+    Ok(())
 }
 
 fn endpoint_targets_loopback(endpoint: &reqwest::Url) -> bool {
@@ -450,11 +605,11 @@ fn flapjack_secret_source(args: &MigrateConnectionArgs) -> SecretSource<'_> {
     )
 }
 
-fn algolia_secret_source(args: &MigrateArgs) -> SecretSource<'_> {
+fn source_api_key_secret_source(args: &MigrateArgs) -> SecretSource<'_> {
     SecretSource::new(
-        args.algolia_key_env.as_deref(),
-        args.algolia_key_file.as_deref(),
-        args.algolia_key_stdin,
+        args.source_key_env.as_deref(),
+        args.source_key_file.as_deref(),
+        args.source_key_stdin,
     )
 }
 
@@ -573,6 +728,7 @@ impl<'a> MigrationClient<'a> {
         endpoint: reqwest::Url,
         timeout: Duration,
         api_key: &'a str,
+        route_segment: &'a str,
     ) -> Result<Self, String> {
         let request_timeout = timeout.min(Duration::from_secs(30));
         let client = reqwest::blocking::Client::builder()
@@ -585,6 +741,7 @@ impl<'a> MigrationClient<'a> {
             endpoint,
             application_id: &args.application_id,
             api_key,
+            route_segment,
             client,
         })
     }
@@ -593,7 +750,7 @@ impl<'a> MigrationClient<'a> {
         &self,
         request: &MigrationRequest<'_>,
     ) -> Result<MigrationStatus, MigrationClientFailure> {
-        let url = self.url("1/migrations/algolia")?;
+        let url = self.url(&format!("1/migrations/{}", self.route_segment))?;
         let response = self
             .authenticated(self.client.post(url))
             .json(request)
@@ -608,7 +765,7 @@ impl<'a> MigrationClient<'a> {
                 "migration server returned an invalid jobId: {reason}"
             ))
         })?;
-        let url = self.url(&format!("1/migrations/algolia/{job_id}"))?;
+        let url = self.url(&format!("1/migrations/{}/{job_id}", self.route_segment))?;
         let response = self
             .authenticated(self.client.get(url))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -638,7 +795,10 @@ impl<'a> MigrationClient<'a> {
                 "migration action received invalid job ID: {reason}"
             ))
         })?;
-        let url = self.url(&format!("1/migrations/algolia/{job_id}/{action}"))?;
+        let url = self.url(&format!(
+            "1/migrations/{}/{job_id}/{action}",
+            self.route_segment
+        ))?;
         self.authenticated(self.client.post(url))
             .send()
             .map_err(|error| transport_failure(operation, error))

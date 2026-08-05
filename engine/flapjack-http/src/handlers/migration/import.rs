@@ -18,8 +18,9 @@ use super::translation::{
     TranslationSessionInstrumentation, TranslationStreamError,
 };
 use super::{
-    algolia_error, migration_cancelled_error, spool_error, MigrateCount, MigrateError,
-    MigrateFromAlgoliaResponse, MigrateWarning, MigrationPublicationMode,
+    algolia_error, migration_cancelled_error, spool_error, AsyncMigrationSourceProvider,
+    MigrateCount, MigrateError, MigrateFromAlgoliaResponse, MigrateWarning,
+    MigrationPublicationMode,
 };
 use crate::error_response::json_error_parts;
 use crate::handlers::index_resource_store::save_resource_batch;
@@ -34,8 +35,6 @@ use flapjack::index::rules::RuleStore;
 use flapjack::index::synonyms::SynonymStore;
 use flapjack::types::Document;
 use flapjack::IndexManager;
-use serde_json::Value;
-use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::HashSet;
 #[cfg(test)]
@@ -286,14 +285,24 @@ impl ImportTestHooks {
     }
 }
 
+/// The request context one import runs under: the provider the caller admitted,
+/// the index the import lands in, and how it publishes. Bundled so the import
+/// entry points carry one context value rather than three positional arguments
+/// that must stay in the same order at every call site.
+#[derive(Clone)]
+pub(super) struct SourceImportRequest {
+    pub(super) expected_provider: AsyncMigrationSourceProvider,
+    pub(super) target_index: String,
+    pub(super) publication_mode: MigrationPublicationMode,
+}
+
 pub(super) async fn import_from_source<R>(
     state_manager: &Arc<IndexManager>,
-    target_index: String,
-    publication_mode: MigrationPublicationMode,
+    request: SourceImportRequest,
     reader: &mut R,
 ) -> Result<Json<MigrateFromAlgoliaResponse>, MigrateError>
 where
-    R: MigrationSourceReader,
+    R: MigrationSourceReader + Send,
 {
     let spool = spool_for_manager(state_manager)?;
     let job_uuid = Uuid::new_v4();
@@ -304,8 +313,7 @@ where
         state_manager,
         &spool,
         job_uuid,
-        target_index,
-        publication_mode,
+        request,
         reader,
         #[cfg(test)]
         ImportTestHooks::default(),
@@ -316,48 +324,36 @@ where
 #[cfg(test)]
 pub(super) async fn import_from_source_with_test_hooks<R>(
     state_manager: &Arc<IndexManager>,
-    target_index: String,
-    publication_mode: MigrationPublicationMode,
+    request: SourceImportRequest,
     reader: &mut R,
     hooks: ImportTestHooks,
 ) -> Result<Json<MigrateFromAlgoliaResponse>, MigrateError>
 where
-    R: MigrationSourceReader,
+    R: MigrationSourceReader + Send,
 {
     let spool = spool_for_manager(state_manager)?;
     let job_uuid = Uuid::new_v4();
     spool
         .create_migration_phase(job_uuid)
         .map_err(spool_error)?;
-    import_from_admitted_source_inner(
-        state_manager,
-        &spool,
-        job_uuid,
-        target_index,
-        publication_mode,
-        reader,
-        hooks,
-    )
-    .await
+    import_from_admitted_source_inner(state_manager, &spool, job_uuid, request, reader, hooks).await
 }
 
 #[allow(dead_code)]
 pub(super) async fn import_from_admitted_source<R>(
     state_manager: &Arc<IndexManager>,
     job_uuid: Uuid,
-    target_index: String,
-    publication_mode: MigrationPublicationMode,
+    request: SourceImportRequest,
     reader: &mut R,
 ) -> Result<Json<MigrateFromAlgoliaResponse>, MigrateError>
 where
-    R: MigrationSourceReader,
+    R: MigrationSourceReader + Send,
 {
     import_from_admitted_source_inner(
         state_manager,
         &spool_for_manager(state_manager)?,
         job_uuid,
-        target_index,
-        publication_mode,
+        request,
         reader,
         #[cfg(test)]
         ImportTestHooks::default(),
@@ -369,20 +365,18 @@ where
 pub(super) async fn import_from_admitted_source_with_test_hooks<R>(
     state_manager: &Arc<IndexManager>,
     job_uuid: Uuid,
-    target_index: String,
-    publication_mode: MigrationPublicationMode,
+    request: SourceImportRequest,
     reader: &mut R,
     hooks: ImportTestHooks,
 ) -> Result<Json<MigrateFromAlgoliaResponse>, MigrateError>
 where
-    R: MigrationSourceReader,
+    R: MigrationSourceReader + Send,
 {
     import_from_admitted_source_inner(
         state_manager,
         &spool_for_manager(state_manager)?,
         job_uuid,
-        target_index,
-        publication_mode,
+        request,
         reader,
         hooks,
     )
@@ -399,25 +393,30 @@ async fn import_from_admitted_source_inner<R>(
     state_manager: &Arc<IndexManager>,
     spool: &SpoolStore,
     job_uuid: Uuid,
-    target_index: String,
-    publication_mode: MigrationPublicationMode,
+    request: SourceImportRequest,
     reader: &mut R,
     #[cfg(test)] hooks: ImportTestHooks,
 ) -> Result<Json<MigrateFromAlgoliaResponse>, MigrateError>
 where
-    R: MigrationSourceReader,
+    R: MigrationSourceReader + Send,
 {
     #[cfg(not(test))]
-    let bulk_build = BulkBuildService::new(state_manager, spool, job_uuid, target_index.as_str());
+    let bulk_build = BulkBuildService::new(
+        state_manager,
+        spool,
+        job_uuid,
+        request.target_index.as_str(),
+    );
     #[cfg(test)]
     let bulk_build = BulkBuildService::new(
         state_manager,
         spool,
         job_uuid,
-        target_index.as_str(),
+        request.target_index.as_str(),
         hooks.bulk_build_hooks(),
     );
-    let export_result = export_algolia_source_for_import(spool, job_uuid, reader).await;
+    let export_result =
+        export_algolia_source_for_import(spool, job_uuid, reader, request.expected_provider).await;
     let export = match export_result {
         Ok(export) => export,
         Err(ExportError::Interrupted) => {
@@ -429,8 +428,7 @@ where
         state_manager,
         spool,
         job_uuid,
-        &target_index,
-        publication_mode,
+        &request,
         export,
         bulk_build,
         #[cfg(test)]
@@ -442,26 +440,31 @@ where
 pub(super) async fn import_from_claimed_resume<R>(
     state_manager: &Arc<IndexManager>,
     job_uuid: Uuid,
-    target_index: String,
-    publication_mode: MigrationPublicationMode,
+    request: SourceImportRequest,
     reader: &mut R,
     checkpoint: ExportCheckpoint,
 ) -> Result<Json<MigrateFromAlgoliaResponse>, MigrateError>
 where
-    R: MigrationSourceReader,
+    R: MigrationSourceReader + Send,
 {
     let spool = spool_for_manager(state_manager)?;
     #[cfg(not(test))]
-    let bulk_build = BulkBuildService::new(state_manager, &spool, job_uuid, target_index.as_str());
+    let bulk_build = BulkBuildService::new(
+        state_manager,
+        &spool,
+        job_uuid,
+        request.target_index.as_str(),
+    );
     #[cfg(test)]
     let bulk_build = BulkBuildService::new(
         state_manager,
         &spool,
         job_uuid,
-        target_index.as_str(),
+        request.target_index.as_str(),
         ImportTestHooks::default().bulk_build_hooks(),
     );
-    let export_result = resume_claimed_algolia_source(&spool, reader, checkpoint).await;
+    let export_result =
+        resume_claimed_algolia_source(&spool, reader, checkpoint, request.expected_provider).await;
     let export = match export_result {
         Ok(export) => export,
         Err(ExportError::Interrupted) => {
@@ -473,8 +476,7 @@ where
         state_manager,
         &spool,
         job_uuid,
-        &target_index,
-        publication_mode,
+        &request,
         export,
         bulk_build,
         #[cfg(test)]
@@ -483,22 +485,28 @@ where
     .await
 }
 
-// Test-only hooks add an eighth parameter under `--all-targets`; production has seven.
+// Test-only hooks add a seventh parameter under `--all-targets`; production has six.
 #[allow(clippy::too_many_arguments)]
 async fn import_accepted_export_inner(
     state_manager: &Arc<IndexManager>,
     spool: &SpoolStore,
     job_uuid: Uuid,
-    target_index: &str,
-    publication_mode: MigrationPublicationMode,
+    request: &SourceImportRequest,
     export: AcceptedExport,
     bulk_build: BulkBuildService<'_>,
     #[cfg(test)] hooks: ImportTestHooks,
 ) -> Result<Json<MigrateFromAlgoliaResponse>, MigrateError> {
+    let target_index = request.target_index.as_str();
+    let publication_mode = request.publication_mode;
     let cancellation = bulk_build.cancellation();
     #[cfg(test)]
     hooks.run_after_accepted_export(spool, export.job_uuid);
     settle_import_result(spool, job_uuid, cancellation.check())?;
+    settle_import_result(
+        spool,
+        job_uuid,
+        transition_import_phase(spool, job_uuid, MigrationPhase::Preparing),
+    )?;
     let publication = settle_import_result(spool, job_uuid, bulk_build.prepare_publication())?;
 
     let ((), publication) = abort_publication_on_error(
@@ -648,7 +656,6 @@ async fn stage_import_export(
             source_index_name: &export.source_index_name,
             target_index,
             job_uuid: export.job_uuid,
-            replica_settings: export.replica_settings.clone(),
         },
         #[cfg(test)]
         hooks,
@@ -671,7 +678,6 @@ pub(super) async fn stage_accepted_bulk_replace(
             source_index_name: target_index,
             target_index,
             job_uuid,
-            replica_settings: BTreeMap::new(),
         },
         #[cfg(test)]
         ImportTestHooks::default(),
@@ -722,7 +728,6 @@ async fn stage_export(
         accepted,
         input.source_index_name.to_string(),
         input.target_index.to_string(),
-        input.replica_settings,
         &mut instrumentation,
         || cancellation.cancel_requested(),
         |batch| document_sender.send(batch),
@@ -760,7 +765,6 @@ struct StageExportInput<'a> {
     source_index_name: &'a str,
     target_index: &'a str,
     job_uuid: Uuid,
-    replica_settings: BTreeMap<String, Value>,
 }
 
 fn rejected_translation(report: impl serde::Serialize) -> MigrateError {

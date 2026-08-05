@@ -637,6 +637,26 @@ fn canonical_tree_digest_changes_for_path_type_and_content() {
     assert_ne!(content_changed, type_changed);
 }
 
+#[test]
+fn canonical_tree_digest_ignores_atomic_write_temporary_files() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("tree");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("index_meta.json"), b"published").unwrap();
+    let inventory = TantivyManagedInventory::new([]).unwrap();
+    let published_digest = canonical_tenant_tree_digest(&root, &inventory).unwrap();
+
+    std::fs::write(root.join(".tmp.index_meta.json.123.tmp"), b"in flight").unwrap();
+    std::fs::write(root.join(".index_meta.json.tmp"), b"legacy metadata temp").unwrap();
+    std::fs::write(root.join(".committed_seq.42.99.tmp"), b"legacy watermark temp").unwrap();
+
+    assert_eq!(
+        canonical_tenant_tree_digest(&root, &inventory).unwrap(),
+        published_digest,
+        "publication digests must exclude both current and legacy atomic-write replacement files"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn canonical_tree_digest_rejects_symlinks() {

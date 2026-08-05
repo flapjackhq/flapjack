@@ -1417,6 +1417,9 @@ fn sync_tree(path: &Path, io: &PublicationIo<'_>) -> Result<()> {
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let child = entry.path();
+        if crate::index::utils::is_temporary_entry(&child) {
+            continue;
+        }
         let metadata = fs::symlink_metadata(&child)?;
         if metadata.is_dir() {
             sync_tree(&child, io)?;
@@ -1572,4 +1575,47 @@ fn strip_resolved_root(root_path: &Path, path: &Path) -> Result<PathBuf> {
     })?;
     validate_relative_path("resolved publication artifact path", relative)?;
     Ok(relative.to_path_buf())
+}
+
+#[cfg(test)]
+mod sync_tree_tests {
+    use super::*;
+    use crate::index::manager::publication::fault::{PublicationFaultScript, PublicationOperation};
+    use tempfile::TempDir;
+
+    #[test]
+    fn sync_tree_ignores_atomic_write_temporary_files() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("tenant");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("index_meta.json"), b"published").unwrap();
+        fs::write(
+            root.join(".tmp.index_meta.json.123.456.0.tmp"),
+            b"in flight",
+        )
+        .unwrap();
+        fs::write(root.join(".index_meta.json.tmp"), b"legacy metadata temp").unwrap();
+        fs::write(
+            root.join(".committed_seq.42.99.tmp"),
+            b"legacy watermark temp",
+        )
+        .unwrap();
+        let operations = PublicationFaultScript::recording();
+
+        sync_tree(&root, &PublicationIo::with_faults(&operations)).unwrap();
+
+        let synced_files = operations
+            .operations()
+            .into_iter()
+            .filter_map(|operation| match operation {
+                PublicationOperation::SyncFile(path) => Some(path),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            synced_files,
+            vec![root.join("index_meta.json")],
+            "publication sync must exclude current and legacy atomic-write temporary files"
+        );
+    }
 }

@@ -11,6 +11,10 @@ End-to-end tests for the Flapjack dashboard using [Playwright](https://playwrigh
 
 When we say "e2e-ui tests" we mean **non-mocked, simulated-human, real-browser tests**. Not API tests. Not unit tests. Real browser.
 
+## Browser-Test Naming Resolution
+
+This repo keeps `tests/e2e-ui/{smoke,full}` as the established equivalent of the browser-unmocked layout in `~/.matt/scrai/globals/standards/browser_testing.md`. Mocked specs remain identified by the `*-mocked.spec.ts` filename suffix. The strict browser-testing lint and authoring rules apply to browser specs regardless of directory naming.
+
 ## Directory Structure
 
 ```
@@ -61,7 +65,7 @@ tests/
 - **Repo-local config file** at `flapjack.local.conf` (copy from `flapjack.local.conf.example`)
 - **Flapjack server** running on `http://$FJ_HOST:$FJ_BACKEND_PORT` from that file
 - **Vite dev server** on `http://$FJ_HOST:$FJ_DASHBOARD_PORT` from that file (started automatically by Playwright unless already running)
-- **Algolia credentials** (required for the real-Algolia migration coverage and some API tests) — set both `ALGOLIA_APP_ID` and `ALGOLIA_ADMIN_KEY` in `../../.secret/.env.secret`, or point Playwright at another file with `FJ_SECRET_FILE=/path/to/.env.secret`; missing required credentials fail closed in every environment
+- **Algolia credentials** (required for the real-Algolia migration coverage and some API tests) — set both `ALGOLIA_APP_ID` and `ALGOLIA_ADMIN_KEY` in `../../.secret/.env.secret`, or point Playwright at another file with `FJ_SECRET_FILE=/path/to/.env.secret`; missing required credentials fail closed in every environment. These two paths differ in precedence: an explicit `FJ_SECRET_FILE` overrides ambient `ALGOLIA_*` values, while the implicit `../../.secret/.env.secret` fallback yields to them — so a shell with stale `ALGOLIA_*` exports must set `FJ_SECRET_FILE` or unset those exports
 
 ## Running Tests
 
@@ -89,6 +93,17 @@ npm run test:debug
 # View the last HTML report
 npm run test:report
 ```
+
+The JSON reporter output is redacted automatically after Playwright writes it. If you retain a
+redirected Playwright transcript as evidence, sanitize it before copying or citing it:
+
+```bash
+node scripts/redact_playwright_evidence.mjs retained-playwright.log
+```
+
+The command rewrites the named file atomically with mode `0600`. Pass
+`--secret-file /absolute/path/to/.env.secret` when the transcript may contain detached secret
+values that are not attached to a recognizable credential field or request header.
 
 ## No Sleeps Policy
 
@@ -214,7 +229,7 @@ await page.pause();
 The dashboard needs a running Flapjack server at the repo-local configured backend URL (`flapjack.local.conf`).
 
 ### Credentialed tests fail in CI
-Set `ALGOLIA_APP_ID` and `ALGOLIA_ADMIN_KEY` in `.secret/.env.secret` at the project root, or set `FJ_SECRET_FILE` to another env file. Use `FJ_NO_SECRET_FILE=1` only when you intentionally want to prove the missing-credentials failure path.
+Set `ALGOLIA_APP_ID` and `ALGOLIA_ADMIN_KEY` in `.secret/.env.secret` at the project root, or set `FJ_SECRET_FILE` to another env file. Use `FJ_NO_SECRET_FILE=1` only when you intentionally want to prove the missing-credentials failure path. An explicit `FJ_SECRET_FILE` replaces ambient `ALGOLIA_*` values; the implicit `.secret/.env.secret` fallback does not, so stale ambient exports otherwise win and surface as `ApiError: Invalid Application-ID or API key`.
 
 ### Tests timeout
 Increase timeout in `playwright.config.ts` or per-test with `test.describe.configure({ timeout: 120_000 })`.

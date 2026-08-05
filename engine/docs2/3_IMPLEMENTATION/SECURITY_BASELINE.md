@@ -27,6 +27,28 @@ Proof surfaces:
 - `cargo test -p flapjack-server --test env_mode_test`
 - `engine/flapjack-http/src/startup.rs`
 
+### TLS transport
+
+- Flapjack can serve optional in-binary TLS when operators provide both
+  `--ssl-cert-path` / `FLAPJACK_SSL_CERT_PATH` and `--ssl-key-path` /
+  `FLAPJACK_SSL_KEY_PATH`.
+- with both TLS paths unset, the server binds plaintext HTTP by default.
+- TLS certificate and key material are loaded once at startup; file replacement
+  requires a restart.
+- startup fails before serving if either side is missing, unreadable, malformed,
+  or does not form a usable certificate/key pair.
+- reverse proxy or load-balancer TLS remains the preferred production topology.
+- the ACME manager configured by `FLAPJACK_SSL_EMAIL`, `FLAPJACK_PUBLIC_IP`, and
+  `FLAPJACK_ACME_DIRECTORY` is not wired to rotate the in-binary listener.
+
+Proof surfaces:
+
+- `engine/flapjack-http/src/server.rs::serve`
+- `engine/flapjack-http/src/tls_serve.rs::load_tls_config`
+- `engine/flapjack-server/src/main.rs`
+- `engine/tests/tls_listener_http_probe.sh`
+- `engine/flapjack-server/tests/tls_startup_test.rs`
+
 ### Admin-only operational surfaces
 
 - `/metrics` requires admin-key auth.
@@ -313,6 +335,9 @@ The public docs should normalize the following production posture:
 - provide a strong admin key
 - do not use `--no-auth` or `FLAPJACK_NO_AUTH=1` outside local loopback-only dev
 - keep `/internal/*` and `/metrics` behind both auth and network controls
+- prefer reverse-proxy or load-balancer TLS in production; use the in-binary
+  `--ssl-cert-path` / `--ssl-key-path` listener only when static certificate
+  files and restart-based rotation are acceptable
 - keep secrets in an env file or secret store, not in tracked config
 
 Current public docs are aligned with that baseline:
@@ -326,7 +351,9 @@ Current public docs are aligned with that baseline:
 These are not launch blockers for the OSS repo, but they are the recommended
 production baseline:
 
-- terminate TLS at a trusted proxy or load balancer
+- terminate TLS at a trusted proxy or load balancer when practical; the optional
+  in-binary listener is a static certificate/key-file mode, not an ACME rotation
+  lifecycle
 - restrict `/internal/*` and `/metrics` with firewall/VPC rules even though they are auth-gated
 - use dedicated service accounts and least-privilege filesystem ownership
 - back up the data dir before upgrades and before risky maintenance

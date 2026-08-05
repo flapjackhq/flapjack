@@ -53,10 +53,13 @@ bash scale_ladder.sh \
   --profile compact \
   --rungs 1000000,2000000,4000000,8000000,16000000,32000000,64000000 \
   --batch-size 10000 \
+  --base-url http://127.0.0.1:<isolated-port> \
   --data-dir /srv/flapjack-scale/compact_ladder_data \
   --results-dir /durable/compact_ladder \
   --server-binary ../target/release/flapjack
 ```
+
+A fixed port 7700 is unsafe on a busy multi-lane host; assign each ladder run an isolated port.
 
 For the dated competitor-headroom campaign, pass its frozen 1.5x calibration values:
 

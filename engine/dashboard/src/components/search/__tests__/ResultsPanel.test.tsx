@@ -171,3 +171,51 @@ describe('ResultsPanel summary contract', () => {
     expect(deleteMutate).toHaveBeenCalledWith('doc-1', expect.any(Object));
   });
 });
+
+describe('ResultsPanel pagination contract', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    mockUseDeleteDocument.mockReturnValue({
+      mutate: vi.fn(),
+      isPending: false,
+    });
+
+    mockUseDisplayPreferences.mockReturnValue({
+      preferences: savedPreferences,
+    });
+
+    mockUseSearch.mockReturnValue({
+      data: {
+        hits: [{ objectID: 'doc-1', name: 'Laptop Pro' }],
+        nbHits: 60,
+        nbPages: 3,
+        processingTimeMS: 4,
+        queryID: 'qid-page',
+      },
+      isLoading: false,
+      error: null,
+    });
+  });
+
+  it('gives the icon-only page buttons accessible names and the correct disabled state', () => {
+    render(<ResultsPanel {...defaultProps} />);
+
+    const previous = screen.getByRole('button', { name: 'Previous page' });
+    const next = screen.getByRole('button', { name: 'Next page' });
+
+    expect(previous).toBeDisabled();
+    expect(next).toBeEnabled();
+    expect(screen.getByTestId('pagination-controls')).toHaveTextContent('Page 1 of 3');
+  });
+
+  it('advances to the next page when the named next button is clicked', async () => {
+    const user = userEvent.setup();
+    const onParamsChange = vi.fn();
+
+    render(<ResultsPanel {...defaultProps} onParamsChange={onParamsChange} />);
+    await user.click(screen.getByRole('button', { name: 'Next page' }));
+
+    expect(onParamsChange).toHaveBeenCalledWith({ page: 1 });
+  });
+});

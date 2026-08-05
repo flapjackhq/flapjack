@@ -4,18 +4,45 @@ use serde_json::json;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::sync::Mutex;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
-static ALGOLIA_BASE_URL_ENV_MUTEX: Mutex<()> = Mutex::new(());
+#[derive(Debug)]
+struct CountingStaticResolver {
+    calls: Mutex<Vec<String>>,
+    address: SocketAddr,
+}
 
-fn lock_clean_algolia_base_url_env() -> std::sync::MutexGuard<'static, ()> {
-    let guard = ALGOLIA_BASE_URL_ENV_MUTEX
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    std::env::remove_var(TEST_ALGOLIA_BASE_URL_ENV);
-    guard
+impl CountingStaticResolver {
+    fn new(address: SocketAddr) -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            address,
+        }
+    }
+
+    fn observed_hosts(&self) -> Vec<String> {
+        self.calls
+            .lock()
+            .expect("resolver call list mutex poisoned")
+            .clone()
+    }
+}
+
+impl reqwest::dns::Resolve for CountingStaticResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        self.calls
+            .lock()
+            .expect("resolver call list mutex poisoned")
+            .push(name.as_str().to_string());
+        let selected = self.address;
+        Box::pin(async move {
+            let addrs: reqwest::dns::Addrs = Box::new(std::iter::once(selected));
+            Ok(addrs)
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +98,8 @@ fn request_urls(transport: &ScriptedTransport) -> Vec<&str> {
         .collect()
 }
 
+/// Plan a request without touching the base-URL guard. Callers must already
+/// hold either a vendor-host or override guard.
 fn request_for_test(
     app_id: &str,
     index_name: &str,
@@ -87,11 +116,31 @@ fn scripted_json_for_test(
     method: AlgoliaMethod,
     suffix: &str,
 ) -> Result<Value, AlgoliaClientError> {
-    let request = request_for_test(app_id, index_name, method, suffix)?;
-    tokio_test::block_on(execute_json_with_retry(transport, request))
+    let base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
+    execute_scripted_request_with_guard_for_test(
+        &base_url_env,
+        transport,
+        request_for_test(app_id, index_name, method, suffix),
+    )
+}
+
+fn execute_scripted_request_with_guard_for_test(
+    _base_url_env: &AlgoliaBaseUrlEnvGuard,
+    transport: &mut ScriptedTransport,
+    request: Result<PlannedRequest, AlgoliaClientError>,
+) -> Result<Value, AlgoliaClientError> {
+    tokio_test::block_on(execute_json_with_retry(transport, request?))
 }
 
 fn list_indexes_for_test(
+    transport: &mut ScriptedTransport,
+) -> Result<Vec<AlgoliaIndexRecord>, AlgoliaClientError> {
+    let base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
+    list_indexes_with_guard_for_test(&base_url_env, transport)
+}
+
+fn list_indexes_with_guard_for_test(
+    _base_url_env: &AlgoliaBaseUrlEnvGuard,
     transport: &mut ScriptedTransport,
 ) -> Result<Vec<AlgoliaIndexRecord>, AlgoliaClientError> {
     tokio_test::block_on(list_indexes_with_transport(transport, "APP123", "key"))
@@ -101,12 +150,14 @@ fn list_indexes_with_limits_for_test(
     transport: &mut ScriptedTransport,
     limits: TraversalLimits,
 ) -> Result<Vec<AlgoliaIndexRecord>, AlgoliaClientError> {
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
     tokio_test::block_on(list_indexes_with_transport_and_limits(
         transport, "APP123", "key", limits,
     ))
 }
 
-fn key_allows_unretrievable_for_test(
+fn key_allows_unretrievable_with_guard_for_test(
+    _base_url_env: &AlgoliaBaseUrlEnvGuard,
     transport: &mut ScriptedTransport,
 ) -> Result<bool, AlgoliaClientError> {
     tokio_test::block_on(key_allows_unretrievable_with_transport(
@@ -114,10 +165,714 @@ fn key_allows_unretrievable_for_test(
     ))
 }
 
+fn expected_algolia_validation_hosts(app_id: &str) -> Vec<(String, Option<u16>)> {
+    // `vet_outbound_url_target` passes `Url::host_str()` to the resolver, and
+    // URL parsing canonicalizes DNS names to lowercase before that callback.
+    let app_id = app_id.to_ascii_lowercase();
+    let mut hosts = vec![(format!("{app_id}-dsn.algolia.net"), Some(443))];
+    hosts.extend(
+        (1..=3).map(|host_index| (format!("{app_id}-{host_index}.algolianet.com"), Some(443))),
+    );
+    hosts.push((format!("{app_id}.algolia.net"), Some(443)));
+    hosts
+}
+
+// Recorded (host, port) pairs the validation resolver was asked to resolve.
+// Aliased to keep `clippy::type_complexity` quiet under CI's `-D warnings`.
+type ValidationResolverCalls = Arc<Mutex<Vec<(String, Option<u16>)>>>;
+
+fn install_recording_validation_resolver(
+    calls: ValidationResolverCalls,
+    resolved_ip: IpAddr,
+) -> flapjack::security::test_helpers::OutboundHostResolverGuard {
+    install_scoped_validation_resolver(calls, Some(vec![resolved_ip]))
+}
+
+fn install_unresolved_validation_resolver(
+    calls: ValidationResolverCalls,
+) -> flapjack::security::test_helpers::OutboundHostResolverGuard {
+    install_scoped_validation_resolver(calls, None)
+}
+
+fn install_scoped_validation_resolver(
+    calls: ValidationResolverCalls,
+    app123_result: Option<Vec<IpAddr>>,
+) -> flapjack::security::test_helpers::OutboundHostResolverGuard {
+    install_test_algolia_validation_resolver("APP123", app123_result, move |host, port| {
+        calls
+            .lock()
+            .expect("validation resolver call list mutex poisoned")
+            .push((host.to_string(), port));
+    })
+}
+
+fn validation_calls(calls: &ValidationResolverCalls) -> Vec<(String, Option<u16>)> {
+    calls
+        .lock()
+        .expect("validation resolver call list mutex poisoned")
+        .clone()
+}
+
+#[test]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+fn scoped_validation_resolver_preserves_system_dns_for_unrelated_hosts() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let _resolver = install_recording_validation_resolver(calls, REBINDING_VETTED_IP);
+
+    let error = flapjack::security::vet_outbound_url_target("https://localhost./", false)
+        .expect_err("the scoped resolver must not replace an unrelated loopback DNS answer");
+
+    assert!(
+        error.contains("private or local destination"),
+        "system DNS should preserve the loopback policy refusal: {error}"
+    );
+}
+
+type AlgoliaPinObservations = Arc<Mutex<Vec<(String, Vec<SocketAddr>)>>>;
+
+fn observed_algolia_pins(observations: &AlgoliaPinObservations) -> Vec<(String, Vec<SocketAddr>)> {
+    observations
+        .lock()
+        .expect("Algolia pin observation mutex poisoned")
+        .clone()
+}
+
+/// The address the recording validation resolver returns for every Algolia
+/// vendor host, i.e. the address a correctly pinned client must dial.
+///
+/// `192.0.0.8` is the RFC 7600 "dummy address" out of the IETF-protocol-
+/// assignments block. Three properties are load-bearing and a later edit must
+/// keep all three:
+/// 1. `flapjack::security::outbound_ip_block_reason` allows it — it is not
+///    loopback, private, link-local, broadcast, or unspecified — so the
+///    generic `vet_outbound_url_target` path accepts it exactly like a real
+///    vendor address.
+/// 2. `flapjack::security::is_public_vendor_ip` also allows it, so the strict
+///    `vet_strict_vendor_url_target` path (the shape `typesense_client.rs`
+///    uses, and a legitimate choice for the pinning fix) accepts it too. The
+///    RFC 5737 TEST-NET literals do NOT satisfy this: `Ipv4Addr::is_documentation()`
+///    covers `192.0.2.0/24`, `198.51.100.0/24`, and `203.0.113.0/24`, so a
+///    TEST-NET answer would make the strict vet fail DNS validation and force
+///    a refusal that this proof reads as an over-broad rejection.
+/// 3. It is not a real host and is not globally routable, so a pinned connect
+///    from a unit test never reaches a third party.
+const REBINDING_VETTED_IP: IpAddr = TEST_VETTED_ALGOLIA_IP;
+
+/// Algolia vendor hosts are always reached over https on the default port, and
+/// `VettedOutboundUrlTarget::socket_addrs()` therefore stamps 443 onto every
+/// pinned address. `hyper-util`'s `set_port` keeps a resolver-supplied port
+/// verbatim when the URL carries no explicit port, so the pinned port is what
+/// actually goes on the wire — a pin built from anything but the vetted target
+/// would dial a different socket.
+const ALGOLIA_VENDOR_PORT: u16 = 443;
+
+/// Single owner for the loopback port the test base-URL override fixture listens
+/// on. Both the override URL string and the expected pinned `SocketAddr` derive
+/// from this constant so a port change cannot silently desync the two halves of
+/// the pin-map contract.
+const TEST_FIXTURE_LOOPBACK_PORT: u16 = 18181;
+
+/// Recompute, from the same `flapjack::security` owner the constructor must
+/// use, the exact `(host, Vec<SocketAddr>)` map a correctly pinned client has
+/// to install. Runs under whatever validation resolver the caller installed, so
+/// it is the vetted-address source of truth for this process, not a literal.
+///
+/// Call this AFTER snapshotting `validation_calls`: it deliberately drives the
+/// same recording resolver and would otherwise pollute the observed host list.
+fn vetted_algolia_pin_map(app_id: &str) -> Vec<(String, Vec<SocketAddr>)> {
+    expected_algolia_validation_hosts(app_id)
+        .into_iter()
+        .map(|(host, _port)| {
+            let target =
+                flapjack::security::vet_outbound_url_target(&format!("https://{host}/"), false)
+                    .unwrap_or_else(|error| {
+                        panic!("vetting `{host}` under the test resolver must succeed: {error}")
+                    })
+                    .unwrap_or_else(|| panic!("`{host}` must resolve under the test resolver"));
+            (host, target.socket_addrs())
+        })
+        .collect()
+}
+
+/// Reasons the owner source does not bind its `resolve_to_addrs` pins to the
+/// vetted `socket_addrs()` output. Empty means the binding contract holds.
+///
+/// This scanner is retained only as a known-answer fixture for common unsafe
+/// source shapes. Production pin equality is owned by the runtime observer on
+/// `pin_resolved_algolia_host`; source inference is not its oracle.
+///
+/// The scanner rejects the substitution shapes a real Stage 2 could plausibly
+/// reach: a literal address, a misleadingly named vector, a post-validation
+/// re-resolution, an opaque helper whose return value cannot be traced to
+/// `socket_addrs()`, and mutated vetted vectors. Direct mutation
+/// (`let mut pinned = target.socket_addrs(); pinned.push(loopback);`) is caught
+/// by the `mut`-binding rule in `pin_binding_failure`; interior mutation
+/// (`Mutex::new(target.socket_addrs()); lock().unwrap().push(loopback)`) is
+/// caught by the interior-mutability provenance rule.
+///
+/// One residual is inherent to source-text inference: a
+/// same-file helper that *receives* `target.socket_addrs()` as an argument and
+/// mutates it internally (`resolve_to_addrs(&t.host, &launder(t.socket_addrs()))`)
+/// still shows the `socket_addrs()` text in the pin chain with no visible local
+/// mutation. The canonical builder observer covers that whole class by recording
+/// the actual values passed to reqwest.
+fn pin_derivation_failures(client_source: &str) -> Vec<String> {
+    const PIN_CALL: &str = "resolve_to_addrs(";
+    let mut failures = Vec::new();
+
+    if !client_source.contains(PIN_CALL) {
+        failures.push(
+            "algolia_client.rs never calls `resolve_to_addrs`; the vetted addresses are not \
+             pinned, so reqwest resolves every Algolia host again at connect time"
+                .to_string(),
+        );
+    }
+    if !client_source.contains("flapjack::security::vet_") {
+        failures.push(
+            "algolia_client.rs never vets an outbound target through `flapjack::security::vet_*`; \
+             pinned addresses must come from a vetted target, not from a private lookup"
+                .to_string(),
+        );
+    }
+    if client_source.contains("to_socket_addrs") {
+        failures.push(
+            "algolia_client.rs performs its own `to_socket_addrs` lookup; a second resolution \
+             after validation is the rebinding window the pin exists to close"
+                .to_string(),
+        );
+    }
+
+    let mut rest = client_source;
+    while let Some(offset) = rest.find(PIN_CALL) {
+        let arguments_start = offset + PIN_CALL.len();
+        let arguments = balanced_call_arguments(&rest[arguments_start..]);
+        if let Some(message) = pin_binding_failure(client_source, arguments) {
+            failures.push(format!(
+                "`resolve_to_addrs({arguments})` {message}; pass the same vetted target's `host` \
+                 and `socket_addrs()` (directly, or through `let` bindings derived from it) so \
+                 every pinned socket address is the one validation already approved"
+            ));
+        }
+        rest = &rest[arguments_start..];
+    }
+
+    failures
+}
+
+/// Text between a call's opening paren and its matching close paren.
+fn balanced_call_arguments(after_open_paren: &str) -> &str {
+    let mut depth = 1_usize;
+    for (index, character) in after_open_paren.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &after_open_paren[..index];
+                }
+            }
+            _ => {}
+        }
+    }
+    after_open_paren
+}
+
+fn source_identifiers(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|character: char| !character.is_alphanumeric() && character != '_')
+        .filter(|token| !token.is_empty())
+}
+
+fn pin_binding_failure(client_source: &str, arguments: &str) -> Option<String> {
+    let Some((host_expression, addresses_expression)) = split_top_level_comma(arguments) else {
+        return Some("does not pass both a host argument and an address argument".to_string());
+    };
+    let bindings = let_bindings(client_source);
+    let vetted_targets = vetted_target_identifiers(&bindings);
+    let host_targets = expression_target_hosts(host_expression, &bindings, 0);
+    let address_targets = expression_target_socket_addrs(addresses_expression, &bindings, 0);
+    let matching_vetted_targets: Vec<&String> = host_targets
+        .iter()
+        .filter(|target| address_targets.contains(target) && vetted_targets.contains(target))
+        .collect();
+
+    if matching_vetted_targets.is_empty() {
+        return Some(format!(
+            "does not bind its host argument {host_expression:?} and address argument \
+             {addresses_expression:?} to the same vetted target"
+        ));
+    }
+
+    // The address argument traces back to `<vetted>.socket_addrs()`, but that is
+    // only trustworthy if the vector reqwest actually pins was never mutated
+    // after that call. `let mut pinned = target.socket_addrs(); pinned.push(loopback);`
+    // still traces to `target`, yet pins a loopback address the vetted set never
+    // contained. Any `mut` binding in the address provenance re-opens that hole,
+    // so reject it — the vetted `typesense_client.rs` shape never needs one.
+    let mutable = mutable_binding_identifiers(client_source);
+    let address_references = expression_referenced_identifiers(addresses_expression, &bindings, 0);
+    if let Some(mutated) = address_references
+        .into_iter()
+        .find(|identifier| mutable.contains(identifier))
+    {
+        return Some(format!(
+            "pins address vector `{mutated}`, which is declared `mut`; a mutable pin can \
+             diverge from the vetted `socket_addrs()` output before connect, so its addresses \
+             are not provably the ones validation approved"
+        ));
+    }
+
+    let interior_mutable = interior_mutable_binding_identifiers(client_source);
+    let address_references = expression_referenced_identifiers(addresses_expression, &bindings, 0);
+    if let Some(mutated) = address_references
+        .into_iter()
+        .find(|identifier| interior_mutable.contains(identifier))
+    {
+        return Some(format!(
+            "pins address vector through interior-mutable binding `{mutated}`; a lock guard can \
+             diverge from the vetted `socket_addrs()` output before connect, so its addresses \
+             are not provably the ones validation approved"
+        ));
+    }
+
+    None
+}
+
+fn split_top_level_comma(arguments: &str) -> Option<(&str, &str)> {
+    let mut depth = 0_usize;
+    for (index, character) in arguments.char_indices() {
+        match character {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                return Some((arguments[..index].trim(), arguments[index + 1..].trim()));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn let_bindings(client_source: &str) -> Vec<(String, String)> {
+    let mut bindings = Vec::new();
+    let mut rest = client_source;
+    while let Some(offset) = rest.find("let ") {
+        let statement = &rest[offset..];
+        let statement = &statement[..statement.find(';').unwrap_or(statement.len())];
+        if let Some(equals) = statement.find('=') {
+            let (bound, initializer) = statement.split_at(equals);
+            if let Some(identifier) = binding_identifier(bound) {
+                bindings.push((identifier.to_string(), initializer[1..].trim().to_string()));
+            }
+        }
+        rest = &rest[offset + "let ".len()..];
+    }
+    bindings
+}
+
+fn binding_identifier(bound: &str) -> Option<&str> {
+    source_identifiers(bound).find(|token| *token != "let" && *token != "mut")
+}
+
+fn vetted_target_identifiers(bindings: &[(String, String)]) -> Vec<String> {
+    bindings
+        .iter()
+        .filter(|(_, initializer)| initializer.contains("flapjack::security::vet_"))
+        .map(|(identifier, _)| identifier.clone())
+        .collect()
+}
+
+/// Identifiers introduced with `let mut`. A pinned address vector that appears
+/// in this set (directly, or transitively through its binding chain) cannot be
+/// proven equal to the vetted `socket_addrs()` output, because Rust requires
+/// `mut` to `push`, reassign, or hand out `&mut` — so the only way to smuggle a
+/// loopback address into a vetted vector after the fact is through a `mut`
+/// binding. Rejecting every mutable variable in the address chain closes the
+/// mutation false-accept without needing to enumerate mutation methods.
+///
+/// Token-level (not substring) matching, so a variable named `mutex` is not
+/// mistaken for a `mut` binding and a `mutation_helper()` initializer on the
+/// right-hand side is never inspected (only the `let`-pattern before `=` is).
+fn mutable_binding_identifiers(client_source: &str) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    let mut rest = client_source;
+    while let Some(offset) = rest.find("let ") {
+        let statement = &rest[offset..];
+        let statement = &statement[..statement.find(';').unwrap_or(statement.len())];
+        if let Some(equals) = statement.find('=') {
+            let bound = &statement[..equals];
+            if source_identifiers(bound).any(|token| token == "mut") {
+                if let Some(identifier) = binding_identifier(bound) {
+                    identifiers.push(identifier.to_string());
+                }
+            }
+        }
+        rest = &rest[offset + "let ".len()..];
+    }
+    dedupe_targets(identifiers)
+}
+
+/// Identifiers bound to interior-mutable containers derived from
+/// `socket_addrs()`. These are mutable even when the binding is not `let mut`:
+/// `Mutex<Vec<_>>` can be changed through a lock guard and `RefCell<Vec<_>>`
+/// can be changed through `borrow_mut()`, then handed to `resolve_to_addrs`
+/// via a borrowed view. The scanner must not certify the original initializer
+/// as the vector reqwest actually receives.
+fn interior_mutable_binding_identifiers(client_source: &str) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    for (identifier, initializer) in let_bindings(client_source) {
+        let initializer_uses_interior_mutability = initializer.contains("Mutex::new(")
+            || initializer.contains("RwLock::new(")
+            || initializer.contains("RefCell::new(");
+        let initializer_derives_from_socket_addrs = initializer.contains(".socket_addrs()");
+        if initializer_uses_interior_mutability && initializer_derives_from_socket_addrs {
+            identifiers.push(identifier);
+        }
+    }
+    dedupe_targets(identifiers)
+}
+
+/// Every identifier the expression depends on, transitively through `let`
+/// bindings. Feeding the address argument through this and intersecting with
+/// `mutable_binding_identifiers` catches a mutable pinned vector no matter where
+/// in its provenance the `mut` binding sits — a direct `&mut_vec`, a block
+/// initializer that mutates a local, or a `mut` intermediate the address is
+/// derived from.
+fn expression_referenced_identifiers(
+    expression: &str,
+    bindings: &[(String, String)],
+    depth: usize,
+) -> Vec<String> {
+    if depth > 8 {
+        return Vec::new();
+    }
+    let mut identifiers: Vec<String> = source_identifiers(expression)
+        .map(|token| token.to_string())
+        .collect();
+    for identifier in source_identifiers(expression) {
+        if let Some((_, initializer)) = bindings
+            .iter()
+            .rev()
+            .find(|(bound_identifier, _)| bound_identifier == identifier)
+        {
+            identifiers.extend(expression_referenced_identifiers(
+                initializer,
+                bindings,
+                depth + 1,
+            ));
+            for mutable_owner in interior_mutable_guard_owners(initializer, bindings) {
+                identifiers.push(mutable_owner.clone());
+                identifiers.extend(expression_referenced_identifiers(
+                    &mutable_owner,
+                    bindings,
+                    depth + 1,
+                ));
+            }
+        }
+    }
+    dedupe_targets(identifiers)
+}
+
+fn interior_mutable_guard_owners(expression: &str, bindings: &[(String, String)]) -> Vec<String> {
+    source_identifiers(expression)
+        .filter(|identifier| {
+            expression.contains(&format!("{identifier}.lock()"))
+                || expression.contains(&format!("{identifier}.read()"))
+                || expression.contains(&format!("{identifier}.write()"))
+                || expression.contains(&format!("{identifier}.borrow()"))
+                || expression.contains(&format!("{identifier}.borrow_mut()"))
+        })
+        .filter(|identifier| {
+            bindings
+                .iter()
+                .any(|(bound_identifier, _)| bound_identifier == identifier)
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn expression_target_hosts(
+    expression: &str,
+    bindings: &[(String, String)],
+    depth: usize,
+) -> Vec<String> {
+    if depth > 8 {
+        return Vec::new();
+    }
+    let mut targets = direct_member_receivers(expression, ".host");
+    for identifier in source_identifiers(expression) {
+        if let Some((_, initializer)) = bindings
+            .iter()
+            .rev()
+            .find(|(bound_identifier, _)| bound_identifier == identifier)
+        {
+            targets.extend(expression_target_hosts(initializer, bindings, depth + 1));
+        }
+    }
+    dedupe_targets(targets)
+}
+
+fn expression_target_socket_addrs(
+    expression: &str,
+    bindings: &[(String, String)],
+    depth: usize,
+) -> Vec<String> {
+    if depth > 8 {
+        return Vec::new();
+    }
+    let mut targets = direct_member_receivers(expression, ".socket_addrs()");
+    for identifier in source_identifiers(expression) {
+        if let Some((_, initializer)) = bindings
+            .iter()
+            .rev()
+            .find(|(bound_identifier, _)| bound_identifier == identifier)
+        {
+            targets.extend(expression_target_socket_addrs(
+                initializer,
+                bindings,
+                depth + 1,
+            ));
+        }
+    }
+    dedupe_targets(targets)
+}
+
+fn direct_member_receivers(expression: &str, member: &str) -> Vec<String> {
+    let mut receivers = Vec::new();
+    let mut rest = expression;
+    while let Some(member_offset) = rest.find(member) {
+        let before_member = &rest[..member_offset];
+        if let Some(receiver) = before_member
+            .split(|character: char| !character.is_alphanumeric() && character != '_')
+            .rfind(|token| !token.is_empty())
+        {
+            receivers.push(receiver.to_string());
+        }
+        rest = &rest[member_offset + member.len()..];
+    }
+    dedupe_targets(receivers)
+}
+
+fn dedupe_targets(targets: Vec<String>) -> Vec<String> {
+    let mut deduped = Vec::new();
+    for target in targets {
+        if !deduped.contains(&target) {
+            deduped.push(target);
+        }
+    }
+    deduped
+}
+
+fn spawn_loopback_sink(max_hits: usize) -> (SocketAddr, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback sink should bind");
+    listener
+        .set_nonblocking(true)
+        .expect("loopback sink should become nonblocking");
+    let blocked_address = listener.local_addr().expect("loopback sink address");
+    let sink_hits = Arc::new(AtomicUsize::new(0));
+    let server_hits = Arc::clone(&sink_hits);
+    let server = thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_millis(900);
+        while std::time::Instant::now() < deadline && server_hits.load(Ordering::SeqCst) < max_hits
+        {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    server_hits.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+                    let mut buffer = [0_u8; 1024];
+                    let _ = stream.read(&mut buffer);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: application/json\r\n\r\n{{}}"
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("loopback sink accept failed: {error}"),
+            }
+        }
+    });
+    (blocked_address, sink_hits, server)
+}
+
+struct RebindingPinningEvidence {
+    result: Result<(), AlgoliaClientError>,
+    sink_hits: usize,
+    validation_hosts: Vec<(String, Option<u16>)>,
+    expected_validation_hosts: Vec<(String, Option<u16>)>,
+    connect_hosts: Vec<String>,
+    observed_pins: Vec<(String, Vec<SocketAddr>)>,
+    vetted_pins: Vec<(String, Vec<SocketAddr>)>,
+    rebind_sink: SocketAddr,
+}
+
+fn assert_rebinding_pinning_contract(evidence: RebindingPinningEvidence) {
+    let RebindingPinningEvidence {
+        result,
+        sink_hits,
+        validation_hosts,
+        expected_validation_hosts,
+        connect_hosts,
+        observed_pins,
+        vetted_pins,
+        rebind_sink,
+    } = evidence;
+    let mut failures = Vec::new();
+
+    // Address side of the pin contract. `vetted_pins` is recomputed from
+    // `flapjack::security` under the same validation resolver the constructor
+    // saw. The production helper observer records the values actually handed to
+    // reqwest, so equality here covers arbitrary mutation or laundering shapes
+    // without relying on an enumerable source-text scanner.
+    if observed_pins != vetted_pins {
+        failures.push(format!(
+            "reqwest received Algolia pins {observed_pins:?}; expected the exact vetted pin map {vetted_pins:?}"
+        ));
+    }
+    let expected_pin_hosts: Vec<String> = expected_validation_hosts
+        .iter()
+        .map(|(host, _port)| host.clone())
+        .collect();
+    let pinned_hosts: Vec<String> = observed_pins.iter().map(|(host, _)| host.clone()).collect();
+    let mut sorted_pinned_hosts = pinned_hosts.clone();
+    sorted_pinned_hosts.sort();
+    let mut sorted_expected_pin_hosts = expected_pin_hosts.clone();
+    sorted_expected_pin_hosts.sort();
+    if sorted_pinned_hosts != sorted_expected_pin_hosts {
+        failures.push(format!(
+            "vetted pin map covers {sorted_pinned_hosts:?}; every Algolia host the shared client \
+             can put on the wire must carry a pin: {sorted_expected_pin_hosts:?}"
+        ));
+    }
+    for (host, addresses) in &vetted_pins {
+        if addresses.is_empty() {
+            failures.push(format!(
+                "vetted pin map has no address for `{host}`; an empty pin leaves the host \
+                 unpinned and reqwest resolves it again at connect time"
+            ));
+        }
+        for address in addresses {
+            if address.ip() != REBINDING_VETTED_IP || address.port() != ALGOLIA_VENDOR_PORT {
+                failures.push(format!(
+                    "`{host}` vets to {address}; expected the validated \
+                     {REBINDING_VETTED_IP}:{ALGOLIA_VENDOR_PORT}, so the pin under test is not \
+                     the address validation approved"
+                ));
+            }
+            if address.ip().is_loopback() || *address == rebind_sink {
+                failures.push(format!(
+                    "`{host}` vets to local address {address}; the rebound answer must never \
+                     reach the vetted set"
+                ));
+            }
+        }
+    }
+    let mut validation_hosts = validation_hosts;
+    validation_hosts.sort();
+    let mut expected_validation_hosts = expected_validation_hosts;
+    expected_validation_hosts.sort();
+
+    // The request's ordinary outcome (success / timeout / transport error against the
+    // vetted public address) is deliberately outside this contract — a correctly pinned
+    // client never observes the rebound loopback answer, so it cannot reclassify it as a
+    // policy refusal. But an over-broad Stage 2 constructor that vets every host and then
+    // refuses *every* request would otherwise satisfy the three checks below vacuously.
+    // Guard that: the vetted-safe destination must NOT come back as a policy refusal.
+    if let Err(error) = &result {
+        if error.kind() == AlgoliaErrorKind::Validation
+            && error.safe_message() == "Algolia outbound destination was refused by policy"
+        {
+            failures.push(
+                "vetted-safe Algolia host was refused by policy; pinning must let the safe \
+                 validated address through, not reject every request"
+                    .to_string(),
+            );
+        }
+    }
+    if validation_hosts != expected_validation_hosts {
+        failures.push(format!(
+            "validation resolver saw {validation_hosts:?}; expected the constructor to vet the complete Algolia host set {expected_validation_hosts:?} before any request"
+        ));
+    }
+    if sink_hits != 0 {
+        failures.push(format!(
+            "loopback sink accepted {sink_hits} connection(s); pinned connects must never follow rebound DNS to a local address"
+        ));
+    }
+    if !connect_hosts.is_empty() {
+        failures.push(format!(
+            "reqwest resolver was consulted at connect time for {connect_hosts:?}; pinned Algolia connects must reuse the vetted addresses"
+        ));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Algolia rebinding proof failed:\n{}",
+        failures.join("\n")
+    );
+}
+
+fn assert_blocked_validation_policy_refusal(
+    result: Result<(), AlgoliaClientError>,
+    sink_hits: usize,
+    validation_hosts: Vec<(String, Option<u16>)>,
+    connect_hosts: Vec<String>,
+) {
+    let mut failures = Vec::new();
+    match result {
+        Ok(()) => failures.push(
+            "blocked validation DNS unexpectedly completed instead of returning a policy error"
+                .to_string(),
+        ),
+        Err(error) => {
+            if error.kind() != AlgoliaErrorKind::Validation {
+                failures.push(format!(
+                    "blocked validation DNS returned {:?}; expected Validation",
+                    error.kind()
+                ));
+            }
+            if error.safe_message() != "Algolia outbound destination was refused by policy" {
+                failures.push(format!(
+                    "blocked validation DNS returned safe message {:?}; expected {:?}",
+                    error.safe_message(),
+                    "Algolia outbound destination was refused by policy"
+                ));
+            }
+        }
+    }
+    let expected_validation_hosts = expected_algolia_validation_hosts("APP123");
+    if validation_hosts.is_empty()
+        || validation_hosts
+            .iter()
+            .any(|host| !expected_validation_hosts.contains(host))
+    {
+        failures.push(format!(
+            "validation resolver saw {validation_hosts:?}; expected one or more Algolia vendor hosts from {expected_validation_hosts:?} before policy refusal"
+        ));
+    }
+    if sink_hits != 0 {
+        failures.push(format!(
+            "loopback sink accepted {sink_hits} connection(s); blocked validation DNS must be refused before connect"
+        ));
+    }
+    if !connect_hosts.is_empty() {
+        failures.push(format!(
+            "reqwest resolver was consulted at connect time for {connect_hosts:?}; blocked validation DNS must be refused first"
+        ));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Algolia blocked-validation proof failed:\n{}",
+        failures.join("\n")
+    );
+}
+
 fn require_unretrievable_access_for_test(
     transport: &mut ScriptedTransport,
     settings: &Value,
 ) -> Result<(), AlgoliaClientError> {
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
     tokio_test::block_on(require_unretrievable_access_with_transport(
         transport, "APP123", "key", settings,
     ))
@@ -126,6 +881,7 @@ fn require_unretrievable_access_for_test(
 fn wait_for_quiescent_source_for_test(
     transport: &mut ScriptedTransport,
 ) -> Result<AlgoliaIndexRecord, AlgoliaClientError> {
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
     tokio_test::block_on(wait_for_quiescent_source_with_transport(
         transport,
         "APP123",
@@ -168,6 +924,7 @@ fn paginated_raw_hits_for_test(
     transport: &mut ScriptedTransport,
     endpoint: &str,
 ) -> Result<Vec<Value>, AlgoliaClientError> {
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
     let mut delivered = Vec::new();
     let result = tokio_test::block_on(paginated_hits_with_transport(
         transport,
@@ -192,6 +949,7 @@ fn paginated_raw_hits_with_limits_for_test(
     endpoint: &str,
     limits: TraversalLimits,
 ) -> Result<Vec<Value>, AlgoliaClientError> {
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
     let mut delivered = Vec::new();
     let result = tokio_test::block_on(paginated_hits_with_transport_and_limits(
         transport,
@@ -215,6 +973,7 @@ fn paginated_raw_hits_with_limits_for_test(
 fn browse_documents_for_test(
     transport: &mut ScriptedTransport,
 ) -> Result<Vec<Value>, AlgoliaClientError> {
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
     let mut delivered = Vec::new();
     let result = tokio_test::block_on(browse_documents_with_transport(
         transport,
@@ -237,6 +996,7 @@ fn browse_documents_with_limits_for_test(
     transport: &mut ScriptedTransport,
     limits: TraversalLimits,
 ) -> Result<Vec<Value>, AlgoliaClientError> {
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
     let mut delivered = Vec::new();
     let result = tokio_test::block_on(browse_documents_with_transport_and_limits(
         transport,
@@ -258,7 +1018,7 @@ fn browse_documents_with_limits_for_test(
 
 #[test]
 fn client_policy_validates_app_id_before_host_construction() {
-    let _env_lock = lock_clean_algolia_base_url_env();
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
     for app_id in ["", "bad/id", "bad.example", "bad:443", "bad app"] {
         assert_eq!(
             request_for_test(app_id, "products", AlgoliaMethod::Get, "settings")
@@ -278,7 +1038,7 @@ fn client_policy_validates_app_id_before_host_construction() {
 
 #[test]
 fn client_policy_percent_encodes_index_names() {
-    let _env_lock = lock_clean_algolia_base_url_env();
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
     let request = request_for_test("APP123", "summer/sale 2026", AlgoliaMethod::Post, "browse")
         .expect("valid request should be planned");
 
@@ -291,7 +1051,7 @@ fn client_policy_percent_encodes_index_names() {
 
 #[test]
 fn client_policy_uses_exact_https_host_and_fixed_timeouts() {
-    let _env_lock = lock_clean_algolia_base_url_env();
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
     let request = request_for_test("APP123", "products", AlgoliaMethod::Get, "settings")
         .expect("valid request should be planned");
 
@@ -305,7 +1065,7 @@ fn client_policy_uses_exact_https_host_and_fixed_timeouts() {
 
 #[test]
 fn client_policy_has_no_production_base_url_override() {
-    let _env_lock = lock_clean_algolia_base_url_env();
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
     let request = request_for_test("APP123", "products", AlgoliaMethod::Get, "settings")
         .expect("valid request should be planned");
 
@@ -317,8 +1077,7 @@ fn client_policy_has_no_production_base_url_override() {
 
 #[test]
 fn client_policy_allows_test_base_url_override() {
-    let _env_lock = lock_clean_algolia_base_url_env();
-    std::env::set_var(TEST_ALGOLIA_BASE_URL_ENV, "http://127.0.0.1:18181/");
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::overridden_to("http://127.0.0.1:18181/");
 
     let request = request_for_test("APP123", "products", AlgoliaMethod::Get, "settings")
         .expect("test override should still plan a request");
@@ -331,14 +1090,11 @@ fn client_policy_allows_test_base_url_override() {
         request.fallback_urls.is_empty(),
         "test override must disable vendor fallback hosts so the fixture stays local"
     );
-
-    std::env::remove_var(TEST_ALGOLIA_BASE_URL_ENV);
 }
 
 #[test]
 fn client_policy_limits_test_base_url_override_to_debug_builds() {
-    let _env_lock = lock_clean_algolia_base_url_env();
-    std::env::set_var(TEST_ALGOLIA_BASE_URL_ENV, "http://127.0.0.1:18181/");
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::overridden_to("http://127.0.0.1:18181/");
 
     let request = request_for_test("APP123", "products", AlgoliaMethod::Get, "settings")
         .expect("loopback test override should either apply in debug or be ignored in release");
@@ -366,14 +1122,11 @@ fn client_policy_limits_test_base_url_override_to_debug_builds() {
             ]
         );
     }
-
-    std::env::remove_var(TEST_ALGOLIA_BASE_URL_ENV);
 }
 
 #[test]
 fn client_policy_rejects_remote_test_base_url_before_planning_credentials() {
-    let _env_lock = lock_clean_algolia_base_url_env();
-    std::env::set_var(TEST_ALGOLIA_BASE_URL_ENV, "http://203.0.113.10:18181/");
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::overridden_to("http://203.0.113.10:18181/");
 
     let error = request_for_test("APP123", "products", AlgoliaMethod::Get, "settings").expect_err(
         "remote test override must be rejected before a credentialed request is planned",
@@ -384,13 +1137,11 @@ fn client_policy_rejects_remote_test_base_url_before_planning_credentials() {
         error.safe_message(),
         "Algolia test base URL must use a literal loopback address"
     );
-    std::env::remove_var(TEST_ALGOLIA_BASE_URL_ENV);
 }
 
 #[test]
 fn client_policy_rejects_loopback_hostname_to_prevent_dns_rebinding() {
-    let _env_lock = lock_clean_algolia_base_url_env();
-    std::env::set_var(TEST_ALGOLIA_BASE_URL_ENV, "http://localhost:18181/");
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::overridden_to("http://localhost:18181/");
 
     let error = request_for_test("APP123", "products", AlgoliaMethod::Get, "settings")
         .expect_err("test override must not re-resolve a hostname after loopback validation");
@@ -400,7 +1151,401 @@ fn client_policy_rejects_loopback_hostname_to_prevent_dns_rebinding() {
         error.safe_message(),
         "Algolia test base URL must use a literal loopback address"
     );
-    std::env::remove_var(TEST_ALGOLIA_BASE_URL_ENV);
+}
+
+#[test]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+fn client_policy_refuses_rebound_data_host_before_loopback_connect() {
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
+    let (blocked_address, sink_hits, server) = spawn_loopback_sink(4);
+    let validation_resolver_calls = Arc::new(Mutex::new(Vec::new()));
+    let _validation_resolver = install_recording_validation_resolver(
+        Arc::clone(&validation_resolver_calls),
+        // Allowed by both outbound policies and not a real host — see
+        // `REBINDING_VETTED_IP` for why all three of those properties matter.
+        REBINDING_VETTED_IP,
+    );
+    let resolver = Arc::new(CountingStaticResolver::new(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        blocked_address.port(),
+    )));
+    let _connect_resolver = install_test_dns_resolver(resolver.clone());
+    let pin_observations = Arc::new(Mutex::new(Vec::new()));
+    let _pin_observer = install_test_algolia_pin_observer(Arc::clone(&pin_observations));
+
+    // The post-pin request may time out, return a transport error, or receive an
+    // upstream response from the vetted public address. Its ordinary outcome is
+    // intentionally outside this security contract: the rebound loopback answer
+    // must be bypassed rather than detected and reclassified after the fact. We
+    // still hand it to the contract so an over-broad refusal is caught.
+    let ordinary_result: Result<(), AlgoliaClientError> = tokio_test::block_on(async {
+        let client = AlgoliaClient::for_source("APP123", "key", "products")?;
+        client.settings().await.map(|_| ())
+    });
+
+    server.join().expect("loopback sink thread should finish");
+    // Snapshot the observed hosts BEFORE recomputing the vetted pin map: that
+    // recomputation drives the same recording resolver.
+    let observed_validation_hosts = validation_calls(&validation_resolver_calls);
+    let observed_pins = observed_algolia_pins(&pin_observations);
+    assert_rebinding_pinning_contract(RebindingPinningEvidence {
+        result: ordinary_result,
+        sink_hits: sink_hits.load(Ordering::SeqCst),
+        validation_hosts: observed_validation_hosts,
+        expected_validation_hosts: expected_algolia_validation_hosts("APP123"),
+        connect_hosts: resolver.observed_hosts(),
+        observed_pins,
+        vetted_pins: vetted_algolia_pin_map("APP123"),
+        rebind_sink: blocked_address,
+    });
+}
+
+#[test]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+fn client_policy_refuses_rebound_control_host_before_loopback_connect() {
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
+    let (blocked_address, sink_hits, server) = spawn_loopback_sink(4);
+    let validation_resolver_calls = Arc::new(Mutex::new(Vec::new()));
+    let _validation_resolver = install_recording_validation_resolver(
+        Arc::clone(&validation_resolver_calls),
+        // Allowed by policy but not a real host; see the data-host proof above.
+        REBINDING_VETTED_IP,
+    );
+    let resolver = Arc::new(CountingStaticResolver::new(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        blocked_address.port(),
+    )));
+    let _connect_resolver = install_test_dns_resolver(resolver.clone());
+    let pin_observations = Arc::new(Mutex::new(Vec::new()));
+    let _pin_observer = install_test_algolia_pin_observer(Arc::clone(&pin_observations));
+
+    // See the data-host proof above: success versus an ordinary public-network
+    // failure is irrelevant here as long as reqwest cannot observe the rebound.
+    let ordinary_result: Result<(), AlgoliaClientError> = tokio_test::block_on(async {
+        let client = AlgoliaClient::new("APP123", "key")?;
+        client.list_indexes().await.map(|_| ())
+    });
+
+    server.join().expect("loopback sink thread should finish");
+    // See the data-host proof: snapshot before recomputing the vetted pin map.
+    let observed_validation_hosts = validation_calls(&validation_resolver_calls);
+    let observed_pins = observed_algolia_pins(&pin_observations);
+    assert_rebinding_pinning_contract(RebindingPinningEvidence {
+        result: ordinary_result,
+        sink_hits: sink_hits.load(Ordering::SeqCst),
+        validation_hosts: observed_validation_hosts,
+        expected_validation_hosts: expected_algolia_validation_hosts("APP123"),
+        connect_hosts: resolver.observed_hosts(),
+        observed_pins,
+        vetted_pins: vetted_algolia_pin_map("APP123"),
+        rebind_sink: blocked_address,
+    });
+}
+
+/// Deterministic equality proof for the exact values handed to reqwest.
+#[test]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+fn client_policy_pins_only_addresses_returned_by_outbound_validation() {
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
+    let validation_resolver_calls = Arc::new(Mutex::new(Vec::new()));
+    let _validation_resolver = install_recording_validation_resolver(
+        Arc::clone(&validation_resolver_calls),
+        REBINDING_VETTED_IP,
+    );
+    let pin_observations = Arc::new(Mutex::new(Vec::new()));
+    let _pin_observer = install_test_algolia_pin_observer(Arc::clone(&pin_observations));
+
+    AlgoliaClient::new("APP123", "key").expect("vetted Algolia hosts should build a client");
+
+    assert_eq!(
+        validation_calls(&validation_resolver_calls),
+        expected_algolia_validation_hosts("APP123"),
+        "the shared client must vet every host it can put on the wire"
+    );
+    assert_eq!(
+        observed_algolia_pins(&pin_observations),
+        vetted_algolia_pin_map("APP123"),
+        "reqwest must receive the exact host/address values returned by outbound validation"
+    );
+}
+
+#[test]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+fn client_policy_pins_the_loopback_fixture_destination_when_the_base_url_override_is_active() {
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::overridden_to(&format!(
+        "http://127.0.0.1:{TEST_FIXTURE_LOOPBACK_PORT}/"
+    ));
+    let validation_resolver_calls = Arc::new(Mutex::new(Vec::new()));
+    let _validation_resolver =
+        install_unresolved_validation_resolver(Arc::clone(&validation_resolver_calls));
+    let pin_observations = Arc::new(Mutex::new(Vec::new()));
+    let _pin_observer = install_test_algolia_pin_observer(Arc::clone(&pin_observations));
+
+    AlgoliaClient::new("APP123", "key")
+        .expect("an active loopback fixture override should build an Algolia client");
+
+    // An active loopback override must short-circuit vendor vetting entirely: no
+    // `APP123-*` synthetic host may be handed to `vet_outbound_url_target`. The
+    // scoped resolver only records the five APP123 vendor hosts, so an empty call
+    // list is the achievable-correct value — the override's own `127.0.0.1` vet
+    // falls through to system resolution unrecorded. This fails a Stage 2 fix that
+    // keeps vetting the unresolvable vendor hosts and merely appends the loopback
+    // pin.
+    assert_eq!(
+        validation_calls(&validation_resolver_calls),
+        Vec::<(String, Option<u16>)>::new(),
+        "an active loopback override must not vet any synthetic Algolia vendor host"
+    );
+    // Defense-in-depth pin. `hyper-util`'s `HttpConnector` short-circuits
+    // IP-literal hosts through `dns::SocketAddrs::try_parse` before consulting the
+    // `resolve_to_addrs` map, and `test_algolia_base_url_override` rejects any
+    // non-literal-loopback base URL, so this pin never changes the socket hyper
+    // dials for the fixture — it documents the exact destination and guarantees no
+    // vendor host is pinned in its place.
+    assert_eq!(
+        observed_algolia_pins(&pin_observations),
+        vec![(
+            "127.0.0.1".to_string(),
+            vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                TEST_FIXTURE_LOOPBACK_PORT
+            )]
+        )],
+        "reqwest must pin only the active loopback fixture destination"
+    );
+}
+
+#[test]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+fn algolia_pin_observer_restores_previous_scope_on_drop() {
+    let outer_observations = Arc::new(Mutex::new(Vec::new()));
+    let _outer_observer = install_test_algolia_pin_observer(Arc::clone(&outer_observations));
+    let inner_observations = Arc::new(Mutex::new(Vec::new()));
+
+    {
+        let _inner_observer = install_test_algolia_pin_observer(Arc::clone(&inner_observations));
+        let _builder = pin_resolved_algolia_host(
+            reqwest::Client::builder(),
+            "inner.algolia.test".to_string(),
+            vec![SocketAddr::new(REBINDING_VETTED_IP, ALGOLIA_VENDOR_PORT)],
+        );
+    }
+    let _builder = pin_resolved_algolia_host(
+        reqwest::Client::builder(),
+        "outer.algolia.test".to_string(),
+        vec![SocketAddr::new(REBINDING_VETTED_IP, ALGOLIA_VENDOR_PORT)],
+    );
+
+    assert_eq!(
+        observed_algolia_pins(&inner_observations),
+        vec![(
+            "inner.algolia.test".to_string(),
+            vec![SocketAddr::new(REBINDING_VETTED_IP, ALGOLIA_VENDOR_PORT)]
+        )]
+    );
+    assert_eq!(
+        observed_algolia_pins(&outer_observations),
+        vec![(
+            "outer.algolia.test".to_string(),
+            vec![SocketAddr::new(REBINDING_VETTED_IP, ALGOLIA_VENDOR_PORT)]
+        )]
+    );
+}
+
+/// The retained pin-derivation scanner must itself go red for its unsafe fixtures
+/// and accept the vetted shape `typesense_client.rs::from_vetted_target` uses.
+#[test]
+fn pin_derivation_scanner_accepts_vetted_addresses_and_rejects_substitutes() {
+    let inline_vetted = r#"
+        let target = flapjack::security::vet_outbound_url_target(url, false)?;
+        builder = builder.resolve_to_addrs(&target.host, &target.socket_addrs());
+    "#;
+    assert_eq!(
+        pin_derivation_failures(inline_vetted),
+        Vec::<String>::new(),
+        "an inline `target.socket_addrs()` pin is the vetted shape and must pass"
+    );
+
+    let bound_vetted = r#"
+        let target = flapjack::security::vet_strict_vendor_url_target(url, HOSTS)?;
+        let pinned_addresses = target.socket_addrs();
+        builder = builder.resolve_to_addrs(&target.host, &pinned_addresses);
+    "#;
+    assert_eq!(
+        pin_derivation_failures(bound_vetted),
+        Vec::<String>::new(),
+        "a `let`-bound `socket_addrs()` pin is the same vetted shape and must pass"
+    );
+
+    let mutated_vetted = r#"
+        let target = flapjack::security::vet_outbound_url_target(url, false)?;
+        let mut pinned_addresses = target.socket_addrs();
+        pinned_addresses.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443));
+        builder = builder.resolve_to_addrs(&target.host, &pinned_addresses);
+    "#;
+    assert_eq!(
+        pin_derivation_failures(mutated_vetted).len(),
+        1,
+        "mutating vetted addresses with a literal loopback pin must be reported"
+    );
+
+    // The mutation guard keys on the `mut` binding, not on `.push` specifically,
+    // so a wholesale reassignment of the vetted vector is caught the same way.
+    // Keep this so a later "only detect push" simplification cannot re-open the
+    // hole through a different mutation.
+    let reassigned_vetted = r#"
+        let target = flapjack::security::vet_outbound_url_target(url, false)?;
+        let mut pinned_addresses = target.socket_addrs();
+        pinned_addresses = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443)];
+        builder = builder.resolve_to_addrs(&target.host, &pinned_addresses);
+    "#;
+    assert_eq!(
+        pin_derivation_failures(reassigned_vetted).len(),
+        1,
+        "reassigning the vetted address vector through a `mut` binding must be reported"
+    );
+
+    let interior_mutated_vetted = r#"
+        let target = flapjack::security::vet_outbound_url_target(url, false)?;
+        let pinned_addresses = std::sync::Mutex::new(target.socket_addrs());
+        pinned_addresses
+            .lock()
+            .unwrap()
+            .push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443));
+        let locked_addresses = pinned_addresses.lock().unwrap();
+        builder = builder.resolve_to_addrs(&target.host, &locked_addresses);
+    "#;
+    assert_eq!(
+        pin_derivation_failures(interior_mutated_vetted).len(),
+        1,
+        "mutating vetted addresses through an immutable Mutex binding must be reported"
+    );
+    assert!(
+        pin_derivation_failures(interior_mutated_vetted)[0].contains("interior-mutable"),
+        "{:?}",
+        pin_derivation_failures(interior_mutated_vetted)
+    );
+
+    let refcell_mutated_vetted = r#"
+        let target = flapjack::security::vet_outbound_url_target(url, false)?;
+        let pinned_addresses = std::cell::RefCell::new(target.socket_addrs());
+        pinned_addresses
+            .borrow_mut()
+            .push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443));
+        let borrowed_addresses = pinned_addresses.borrow();
+        builder = builder.resolve_to_addrs(&target.host, &borrowed_addresses);
+    "#;
+    assert_eq!(
+        pin_derivation_failures(refcell_mutated_vetted).len(),
+        1,
+        "mutating vetted addresses through an immutable RefCell binding must be reported"
+    );
+    assert!(
+        pin_derivation_failures(refcell_mutated_vetted)[0].contains("interior-mutable"),
+        "{:?}",
+        pin_derivation_failures(refcell_mutated_vetted)
+    );
+
+    let literal_address = r#"
+        let target = flapjack::security::vet_outbound_url_target(url, false)?;
+        let pinned_addresses = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443)];
+        builder = builder.resolve_to_addrs(&target.host, &pinned_addresses);
+    "#;
+    assert_eq!(
+        pin_derivation_failures(literal_address).len(),
+        1,
+        "pinning a literal address instead of the vetted one must be reported"
+    );
+
+    let misleading_name = r#"
+        let target = flapjack::security::vet_outbound_url_target(url, false)?;
+        let unvetted_socket_addrs =
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443)];
+        builder = builder.resolve_to_addrs(&target.host, &unvetted_socket_addrs);
+    "#;
+    assert_eq!(
+        pin_derivation_failures(misleading_name).len(),
+        1,
+        "a misleading variable name containing `socket_addrs` must not certify a literal pin"
+    );
+
+    let second_lookup = r#"
+        let target = flapjack::security::vet_outbound_url_target(url, false)?;
+        let pinned_addresses: Vec<SocketAddr> = (host, 443).to_socket_addrs()?.collect();
+        builder = builder.resolve_to_addrs(&target.host, &pinned_addresses);
+    "#;
+    assert_eq!(
+        pin_derivation_failures(second_lookup).len(),
+        2,
+        "a post-validation re-resolution must be reported as both a second lookup and an \
+         unvetted pin"
+    );
+
+    assert_eq!(
+        pin_derivation_failures("let client = reqwest::Client::builder().build();").len(),
+        2,
+        "a client with no pin and no vet must be reported for both"
+    );
+}
+
+#[test]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+fn client_policy_rejects_blocked_vendor_resolution_before_connect() {
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
+    let (blocked_address, sink_hits, server) = spawn_loopback_sink(1);
+    let validation_resolver_calls = Arc::new(Mutex::new(Vec::new()));
+    let _validation_resolver = install_recording_validation_resolver(
+        Arc::clone(&validation_resolver_calls),
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+    );
+    let resolver = Arc::new(CountingStaticResolver::new(blocked_address));
+    let _connect_resolver = install_test_dns_resolver(resolver.clone());
+
+    let result: Result<(), AlgoliaClientError> = tokio_test::block_on(async {
+        let client = AlgoliaClient::for_source("APP123", "key", "products")?;
+        client.settings().await.map(|_| ())
+    });
+
+    server.join().expect("loopback sink thread should finish");
+    assert_blocked_validation_policy_refusal(
+        result,
+        sink_hits.load(Ordering::SeqCst),
+        validation_calls(&validation_resolver_calls),
+        resolver.observed_hosts(),
+    );
+}
+
+#[test]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+fn client_policy_rejects_unresolved_vendor_host_before_connect() {
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
+    let validation_resolver_calls = Arc::new(Mutex::new(Vec::new()));
+    let _validation_resolver =
+        install_unresolved_validation_resolver(Arc::clone(&validation_resolver_calls));
+    let resolver = Arc::new(CountingStaticResolver::new(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        ALGOLIA_VENDOR_PORT,
+    )));
+    let _connect_resolver = install_test_dns_resolver(resolver.clone());
+    let pin_observations = Arc::new(Mutex::new(Vec::new()));
+    let _pin_observer = install_test_algolia_pin_observer(Arc::clone(&pin_observations));
+
+    let error = match AlgoliaClient::new("APP123", "key") {
+        Ok(_) => panic!("unresolved Algolia vendor host must fail closed"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), AlgoliaErrorKind::Validation);
+    assert_eq!(
+        error.safe_message(),
+        "Algolia outbound destination was refused by policy"
+    );
+    assert_eq!(
+        validation_calls(&validation_resolver_calls),
+        vec![expected_algolia_validation_hosts("APP123")[0].clone()]
+    );
+    assert!(resolver.observed_hosts().is_empty());
+    assert!(observed_algolia_pins(&pin_observations).is_empty());
 }
 
 // The replica-settings method reuses the exact index_path / plan_request /
@@ -409,6 +1554,7 @@ fn client_policy_rejects_loopback_hostname_to_prevent_dns_rebinding() {
 // returned verbatim, and any non-2xx stays in the typed, scrubbed error owner.
 #[test]
 fn index_settings_encodes_arbitrary_name_returns_full_json_and_scrubs_errors() {
+    let base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
     let replica_name = "réplica price/asc 2026";
 
     let request = request_for_test("APP123", replica_name, AlgoliaMethod::Get, "settings")
@@ -426,23 +1572,19 @@ fn index_settings_encodes_arbitrary_name_returns_full_json_and_scrubs_errors() {
         "primary": "products"
     });
     let mut ok_transport = ScriptedTransport::new(vec![ok(full_settings.clone())]);
-    let returned = scripted_json_for_test(
+    let returned = execute_scripted_request_with_guard_for_test(
+        &base_url_env,
         &mut ok_transport,
-        "APP123",
-        replica_name,
-        AlgoliaMethod::Get,
-        "settings",
+        request_for_test("APP123", replica_name, AlgoliaMethod::Get, "settings"),
     )
     .expect("2xx settings response should decode to the full JSON");
     assert_eq!(returned, full_settings);
 
     let mut missing_transport = ScriptedTransport::new(vec![status(404)]);
-    let error = scripted_json_for_test(
+    let error = execute_scripted_request_with_guard_for_test(
+        &base_url_env,
         &mut missing_transport,
-        "APP123",
-        replica_name,
-        AlgoliaMethod::Get,
-        "settings",
+        request_for_test("APP123", replica_name, AlgoliaMethod::Get, "settings"),
     )
     .expect_err("a 404 missing replica must be a typed error");
     assert_eq!(error.kind(), AlgoliaErrorKind::Upstream);
@@ -482,6 +1624,7 @@ fn retry_policy_retries_transient_failures_and_stops_on_success() {
 
 #[test]
 fn retry_policy_uses_algolia_fallback_hosts_after_transient_data_failure() {
+    let base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
     let mut transport = ScriptedTransport::new(vec![
         Err(AlgoliaClientError::new(
             AlgoliaErrorKind::Timeout,
@@ -490,12 +1633,10 @@ fn retry_policy_uses_algolia_fallback_hosts_after_transient_data_failure() {
         ok(json!({"done": true})),
     ]);
 
-    let response = scripted_json_for_test(
+    let response = execute_scripted_request_with_guard_for_test(
+        &base_url_env,
         &mut transport,
-        "APP123",
-        "products",
-        AlgoliaMethod::Get,
-        "settings",
+        request_for_test("APP123", "products", AlgoliaMethod::Get, "settings"),
     )
     .expect("first fallback host should succeed");
 
@@ -511,6 +1652,7 @@ fn retry_policy_uses_algolia_fallback_hosts_after_transient_data_failure() {
 
 #[test]
 fn retry_policy_uses_algolia_fallback_hosts_after_transient_control_failure() {
+    let base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
     let mut transport = ScriptedTransport::new(vec![
         Err(AlgoliaClientError::new(
             AlgoliaErrorKind::Transport,
@@ -528,7 +1670,8 @@ fn retry_policy_uses_algolia_fallback_hosts_after_transient_control_failure() {
         )),
     ]);
 
-    let indexes = list_indexes_for_test(&mut transport).expect("control fallback should succeed");
+    let indexes = list_indexes_with_guard_for_test(&base_url_env, &mut transport)
+        .expect("control fallback should succeed");
 
     assert_eq!(indexes.len(), 1);
     assert_eq!(
@@ -584,6 +1727,7 @@ fn retry_policy_stops_immediately_for_non_retryable_failures() {
 
 #[test]
 fn retry_policy_returns_stable_variant_after_retry_budget() {
+    let base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
     for (responses, expected_kind) in [
         (
             vec![
@@ -638,12 +1782,10 @@ fn retry_policy_returns_stable_variant_after_retry_budget() {
     ] {
         let mut transport = ScriptedTransport::new(responses);
 
-        let result = scripted_json_for_test(
+        let result = execute_scripted_request_with_guard_for_test(
+            &base_url_env,
             &mut transport,
-            "APP123",
-            "products",
-            AlgoliaMethod::Get,
-            "settings",
+            request_for_test("APP123", "products", AlgoliaMethod::Get, "settings"),
         );
 
         assert_eq!(
@@ -664,6 +1806,7 @@ fn retry_policy_returns_stable_variant_after_retry_budget() {
 
 #[test]
 fn list_indexes_pagination_starts_at_page_zero_and_follows_nb_pages_changes() {
+    let base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
     let mut transport = ScriptedTransport::new(vec![
         ok(json!({
             "items": [{"name": "products", "entries": 2, "updatedAt": "2026-01-01T00:00:00Z", "pendingTask": false}],
@@ -679,7 +1822,8 @@ fn list_indexes_pagination_starts_at_page_zero_and_follows_nb_pages_changes() {
         })),
     ]);
 
-    let indexes = list_indexes_for_test(&mut transport).expect("pagination should complete");
+    let indexes = list_indexes_with_guard_for_test(&base_url_env, &mut transport)
+        .expect("pagination should complete");
 
     assert_eq!(indexes.len(), 3);
     assert_eq!(indexes[0].name, "products");
@@ -824,6 +1968,7 @@ fn list_indexes_pagination_accepts_public_rows_without_pending_task() {
 
 #[test]
 fn source_export_acl_and_quiescence_reads_key_acl_through_strict_planner() {
+    let base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
     for (acl, expected) in [
         (json!(["search", "seeUnretrievableAttributes"]), true),
         (json!(["admin"]), true),
@@ -832,7 +1977,8 @@ fn source_export_acl_and_quiescence_reads_key_acl_through_strict_planner() {
         let mut transport = ScriptedTransport::new(vec![ok(json!({ "acl": acl }))]);
 
         assert_eq!(
-            key_allows_unretrievable_for_test(&mut transport).expect("ACL lookup should parse"),
+            key_allows_unretrievable_with_guard_for_test(&base_url_env, &mut transport)
+                .expect("ACL lookup should parse"),
             expected
         );
         assert_eq!(transport.requests.len(), 1);
@@ -857,13 +2003,16 @@ fn source_export_acl_and_quiescence_rejects_unretrievable_without_capability() {
     assert!(!error.safe_message().contains("source-secret"));
 
     let mut secret_key_transport = ScriptedTransport::new(vec![ok(json!({ "acl": ["search"] }))]);
-    let secret_key_error = tokio_test::block_on(require_unretrievable_access_with_transport(
-        &mut secret_key_transport,
-        "APP123",
-        "source-secret",
-        &settings,
-    ))
-    .expect_err("scrubbed errors must not echo the API key");
+    let secret_key_error = {
+        let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
+        tokio_test::block_on(require_unretrievable_access_with_transport(
+            &mut secret_key_transport,
+            "APP123",
+            "source-secret",
+            &settings,
+        ))
+        .expect_err("scrubbed errors must not echo the API key")
+    };
     assert!(!secret_key_error.safe_message().contains("source-secret"));
 
     let mut allowed = ScriptedTransport::new(vec![ok(json!({
@@ -1212,6 +2361,7 @@ fn strict_source_progress_streams_browse_page_before_following_request_failure()
         )),
     ]);
     let mut delivered_page_sizes = Vec::new();
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
 
     let result = tokio_test::block_on(browse_documents_with_transport(
         &mut transport,
@@ -1320,6 +2470,7 @@ fn source_export_raw_traversal_preserves_json_and_uses_strict_browse_bodies() {
         ok(json!({"hits": []})),
     ]);
     let mut delivered = Vec::new();
+    let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
 
     tokio_test::block_on(browse_documents_with_transport(
         &mut transport,
@@ -1702,5 +2853,137 @@ fn source_export_raw_traversal_uses_independent_resource_limits() {
             .expect("exact document item cap should pass")
             .len(),
         2
+    );
+}
+
+#[test]
+fn algolia_base_url_environment_has_one_synchronized_test_owner() {
+    let client_source = include_str!("algolia_client.rs");
+
+    assert!(
+        client_source.contains("mod test_algolia_base_url_env"),
+        "the production observer and test mutator must share one synchronization owner"
+    );
+    assert!(
+        client_source.contains("test_algolia_base_url_env::read_override()"),
+        "the test-build environment observer must enter the shared synchronization owner"
+    );
+    let migration_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers/migration");
+    for path in migration_rust_sources(&migration_dir) {
+        if path.ends_with("algolia_client.rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !source.contains(TEST_ALGOLIA_BASE_URL_ENV),
+            "migration tests must use the shared RAII owner, found direct access in {}",
+            path.display()
+        );
+    }
+}
+
+/// Fail-capable SSOT guard for the process-global env-mutation race: every
+/// migration source that mutates `environ` must enter the crate's single
+/// canonical `test_helpers::ENV_MUTEX`, and no migration source may define its
+/// own competing `static ENV_MUTEX`. A second, uncoordinated mutex (or a bare
+/// `set_var`/`remove_var` outside the owner) lets two mutators reallocate
+/// `environ` while a parallel `getenv` walks it — the exact undefined behavior
+/// behind the multithreaded `migration` flake. This guard goes red the moment
+/// any migration mutator stops routing through the canonical owner.
+#[test]
+fn all_migration_env_mutation_shares_one_canonical_synchronization_owner() {
+    const CANONICAL_ENV_OWNER: &str = "test_helpers::ENV_MUTEX";
+    let migration_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers/migration");
+
+    for path in migration_rust_sources(&migration_dir) {
+        // This guard file necessarily contains the sentinel strings it scans for
+        // (as string literals and assertion text), so the policy-defining file
+        // exempts itself to avoid matching its own source.
+        if path.ends_with("algolia_client_tests.rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).unwrap();
+
+        assert!(
+            !source.contains("static ENV_MUTEX:"),
+            "migration source {} defines a competing `static ENV_MUTEX`; the canonical \
+             owner is `test_helpers::ENV_MUTEX` and must be the only one",
+            path.display()
+        );
+
+        // The re-entrancy flag belongs to the mutex, not to any one guard type.
+        // A migration source that keeps its own copy only maintains it on the
+        // paths it controls, so every OTHER acquisition of `ENV_MUTEX` leaves
+        // the flag false — and the reader that trusts it then re-locks a
+        // non-reentrant mutex on a thread that already holds it and deadlocks
+        // the whole test binary at 0% CPU. That was `TEST-HANG-1` (2026-08-03).
+        // Restoring a local `CURRENT_THREAD_HOLDS_ENV_MUTEX` turns this red.
+        assert!(
+            !source.contains("CURRENT_THREAD_HOLDS_ENV_MUTEX"),
+            "migration source {} keeps a private env-lock holder flag; the canonical \
+             owner is `test_helpers::current_thread_holds_env_lock`, which every \
+             `ENV_MUTEX` acquisition maintains. A partially-maintained flag deadlocks.",
+            path.display()
+        );
+
+        let mutates_process_env =
+            source.contains("std::env::set_var(") || source.contains("std::env::remove_var(");
+        if mutates_process_env {
+            assert!(
+                source.contains(CANONICAL_ENV_OWNER),
+                "migration source {} mutates process-global env without entering the \
+                 canonical `{CANONICAL_ENV_OWNER}` synchronization owner",
+                path.display()
+            );
+        }
+    }
+}
+
+fn migration_rust_sources(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut sources = Vec::new();
+    for entry in std::fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            sources.extend(migration_rust_sources(&path));
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            sources.push(path);
+        }
+    }
+    sources
+}
+
+#[test]
+fn algolia_base_url_environment_guard_restores_the_exact_prior_value() {
+    let prior_value = test_algolia_base_url_env::current_value_for_test();
+    {
+        let _base_url_env =
+            AlgoliaBaseUrlEnvGuard::overridden_to("http://127.0.0.1:18181/prior-value-test");
+        assert_eq!(
+            test_algolia_base_url_override().expect("loopback override should be valid"),
+            Some("http://127.0.0.1:18181/prior-value-test".to_string())
+        );
+    }
+    assert_eq!(
+        test_algolia_base_url_env::current_value_for_test(),
+        prior_value,
+        "dropping the synchronized override must restore presence and bytes exactly"
+    );
+}
+
+#[tokio::test]
+async fn algolia_base_url_route_override_is_task_scoped() {
+    let expected_url = "http://127.0.0.1:18181/task-scoped-test";
+    let observed = with_test_algolia_base_url_override(None, Some(expected_url), async {
+        test_algolia_base_url_override().expect("task-scoped loopback override should be valid")
+    })
+    .await;
+
+    assert_eq!(observed, Some(expected_url.to_string()));
+    assert_ne!(
+        test_algolia_base_url_override().expect("unscoped override read should remain valid"),
+        Some(expected_url.to_string()),
+        "the route override must not leak beyond its scoped request future"
     );
 }

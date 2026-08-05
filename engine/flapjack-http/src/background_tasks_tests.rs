@@ -1,14 +1,16 @@
     use super::{
-        autoheal_enabled_from_env, completed_utc_day, extract_s3_snapshot_tenant_id,
-        migration_spool_gc_interval_secs, parse_autoheal_enabled, rollup_window_bounds_ms,
-        run_migration_spool_gc_loop, run_usage_rollover, HOUR_MS, AUTOHEAL_ENABLED_ENV,
-        MIGRATION_SPOOL_GC_INTERVAL_ENV,
+        autoheal_enabled_from_env, completed_utc_day, enforce_backup_retention,
+        extract_s3_snapshot_tenant_id, migration_spool_gc_interval_secs, parse_autoheal_enabled,
+        rollup_window_bounds_ms, run_migration_spool_gc_loop, run_usage_rollover, HOUR_MS,
+        AUTOHEAL_ENABLED_ENV, MIGRATION_SPOOL_GC_INTERVAL_ENV,
     };
     use crate::handlers::migration::spool::{
         AsyncMigrationPublicationSemantic, MigrationDisposition, ResourceDenominators, SpoolLimits,
         SpoolStore,
     };
-    use crate::test_helpers::{restore_env_var, with_env_var, TestStateBuilder, ENV_MUTEX};
+    use crate::test_helpers::{
+        restore_env_var, with_env_var, SharedLogBuffer, TestStateBuilder, ENV_MUTEX,
+    };
     use crate::usage_persistence::UsagePersistence;
     use chrono::TimeZone;
     use std::path::PathBuf;
@@ -16,6 +18,8 @@
     use std::sync::Arc;
     use tokio::sync::Notify;
     use tokio::time::{timeout, Duration};
+    use tracing_subscriber::prelude::*;
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn completed_utc_day_returns_prior_day_at_and_after_midnight() {
@@ -56,6 +60,131 @@
                 "{prefix} must not become a local restore path component"
             );
         }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn enforce_backup_retention_logs_delete_failure_with_tenant() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <Name>snapshot-bucket</Name>
+  <Prefix>snapshots/products/</Prefix>
+  <KeyCount>2</KeyCount>
+  <MaxKeys>1000</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>snapshots/products/20260731T010000Z.tar.gz</Key>
+    <LastModified>2026-07-31T01:00:00.000Z</LastModified>
+    <Size>10</Size>
+  </Contents>
+  <Contents>
+    <Key>snapshots/products/20260731T020000Z.tar.gz</Key>
+    <LastModified>2026-07-31T02:00:00.000Z</LastModified>
+    <Size>10</Size>
+  </Contents>
+</ListBucketResult>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let logs = {
+            let _lock = ENV_MUTEX.lock().expect("env mutex poisoned");
+            let previous_retention = std::env::var_os("FLAPJACK_SNAPSHOT_RETENTION");
+            let previous_access_key = std::env::var_os("AWS_ACCESS_KEY_ID");
+            let previous_secret_key = std::env::var_os("AWS_SECRET_ACCESS_KEY");
+            std::env::set_var("FLAPJACK_SNAPSHOT_RETENTION", "1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+
+            let logs = SharedLogBuffer::default();
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .without_time()
+                    .with_ansi(false)
+                    .with_writer(logs.clone()),
+            );
+            let s3_config = flapjack::index::s3::S3Config {
+                bucket_name: "snapshot-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: Some(server.uri()),
+            };
+
+            let _log_guard = tracing::subscriber::set_default(subscriber);
+            enforce_backup_retention(&s3_config, "products").await;
+
+            restore_env_var("FLAPJACK_SNAPSHOT_RETENTION", previous_retention);
+            restore_env_var("AWS_ACCESS_KEY_ID", previous_access_key);
+            restore_env_var("AWS_SECRET_ACCESS_KEY", previous_secret_key);
+            logs.contents()
+        };
+        let requests = server
+            .received_requests()
+            .await
+            .expect("recorded requests should be available");
+        let list_requests: Vec<_> = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "GET")
+            .collect();
+        assert_eq!(
+            list_requests.len(),
+            1,
+            "retention pass should issue exactly one LIST, got {:?}",
+            list_requests
+                .iter()
+                .map(|request| request.url.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            list_requests[0]
+                .url
+                .query_pairs()
+                .any(|(name, value)| name == "prefix" && value == "snapshots/products/"),
+            "retention pass should LIST the products snapshot prefix, got {}",
+            list_requests[0].url
+        );
+        let delete_requests: Vec<_> = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "DELETE")
+            .collect();
+        assert_eq!(
+            delete_requests.len(),
+            1,
+            "retention pass should reach exactly one rejected DELETE, got {:?}",
+            delete_requests
+                .iter()
+                .map(|request| request.url.as_str())
+                .collect::<Vec<_>>()
+        );
+        let delete_path = delete_requests[0].url.path();
+        assert!(
+            delete_path.ends_with("snapshots/products/20260731T010000Z.tar.gz"),
+            "the rejected DELETE should target the oldest products snapshot, got {delete_path}"
+        );
+
+        assert!(
+            logs.contains("ERROR"),
+            "retention delete failure should emit an ERROR log, got {logs:?}"
+        );
+        assert!(
+            logs.contains("tenant=products") || logs.contains("tenant=\"products\""),
+            "retention delete failure log should include the tenant field, got {logs:?}"
+        );
+        assert!(
+            logs.contains("S3 delete"),
+            "retention delete failure log should include delete context, got {logs:?}"
+        );
+        assert!(
+            logs.split(|character: char| !character.is_ascii_digit())
+                .any(|token| token == "403"),
+            "retention delete failure log should include HTTP status 403, got {logs:?}"
+        );
     }
 
     #[test]

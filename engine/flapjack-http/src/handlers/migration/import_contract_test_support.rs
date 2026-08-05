@@ -8,7 +8,10 @@ use crate::handlers::rules::get_rule;
 use crate::handlers::search::search_single;
 use crate::handlers::settings::{get_settings, persist_index_settings};
 use crate::handlers::synonyms::get_synonym;
-use crate::test_helpers::body_json;
+use crate::test_helpers::{
+    assert_retained_channel_closed_delta, body_json, retained_channel_closed_count,
+    TestStateBuilder,
+};
 use axum::{
     extract::{Path as AxumPath, Query, State},
     http::StatusCode,
@@ -76,6 +79,7 @@ pub(super) async fn seed_preexisting_target_resources(
     .unwrap();
     save_resource_batch::<RuleStore, _>(&state.manager, target_index, [preexisting_rule()], true)
         .unwrap();
+    state.manager.drain_all_write_queues().await.unwrap();
 }
 
 pub(super) async fn assert_preexisting_target_resources(
@@ -343,4 +347,20 @@ fn only_spool_job(spool: &SpoolStore) -> uuid::Uuid {
     let jobs = spool.job_uuids().unwrap();
     assert_eq!(jobs.len(), 1, "expected one migration spool job");
     jobs[0]
+}
+
+#[tokio::test]
+async fn preexisting_target_fixture_returns_after_merge_quiescence() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let tenant = "preexisting_fixture_quiescence";
+    let closes_before = retained_channel_closed_count(tenant);
+
+    seed_preexisting_target_resources(&state, tenant).await;
+
+    assert_retained_channel_closed_delta(
+        tenant,
+        closes_before,
+        "the shared pre-existing target fixture must close its writer after merge quiescence before callers snapshot the directory",
+    );
 }

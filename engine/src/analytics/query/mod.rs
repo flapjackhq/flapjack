@@ -2,7 +2,8 @@ use base64::Engine;
 use datafusion::datasource::listing::ListingOptions;
 use datafusion::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::config::AnalyticsConfig;
@@ -13,6 +14,10 @@ mod conversion_analytics;
 mod filters_analytics;
 mod search_analytics;
 mod user_analytics;
+
+#[cfg(test)]
+#[path = "query_concurrency_tests.rs"]
+mod concurrency_tests;
 
 #[cfg(test)]
 #[path = "query_tests.rs"]
@@ -63,6 +68,95 @@ pub struct AnalyticsQueryEngine {
     config: AnalyticsConfig,
 }
 
+/// A registered raw analytics session and the stable per-index filesystem
+/// snapshot it reads. Keeping ownership together prevents callers from dropping
+/// the snapshot between parquet discovery and DataFusion execution.
+struct AnalyticsSession {
+    context: SessionContext,
+    _snapshot: super::mutation::IndexReadGuard,
+}
+
+/// Windows inside a multi-step analytics read where a same-index seed or clear
+/// may queue. Each variant names a handoff that must stay inside one snapshot:
+/// a mutation arriving there must neither deadlock the read nor split it across
+/// two different filesystem states. Only tests observe these stages; production
+/// builds compile the hook body away.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnalyticsReadStage {
+    /// After a searches-only session holds its snapshot and has registered the
+    /// raw table, before the endpoint begins executing its query.
+    AfterSearchesRegistration,
+    /// Between `searches` registration and `events` registration.
+    BeforeEventsRegistration,
+    /// After an endpoint collected its initial `searches` rows and before it
+    /// runs any follow-up query, such as click enrichment.
+    AfterInitialSearchCollection,
+}
+
+/// Stage hooks keyed by index name so concurrently running tests, which share
+/// this process, never observe or cancel each other's hook.
+#[cfg(test)]
+type AnalyticsReadStageHook = Arc<dyn Fn(AnalyticsReadStage) + Send + Sync>;
+
+#[cfg(test)]
+type AnalyticsReadStageHookRegistry = std::sync::Mutex<HashMap<String, AnalyticsReadStageHook>>;
+
+#[cfg(test)]
+static ANALYTICS_READ_STAGE_HOOKS: once_cell::sync::Lazy<AnalyticsReadStageHookRegistry> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+struct AnalyticsReadStageHookGuard {
+    index_name: String,
+}
+
+#[cfg(test)]
+impl Drop for AnalyticsReadStageHookGuard {
+    fn drop(&mut self) {
+        ANALYTICS_READ_STAGE_HOOKS
+            .lock()
+            .unwrap()
+            .remove(&self.index_name);
+    }
+}
+
+#[cfg(test)]
+fn set_analytics_read_stage_hook(
+    index_name: &str,
+    hook: AnalyticsReadStageHook,
+) -> AnalyticsReadStageHookGuard {
+    ANALYTICS_READ_STAGE_HOOKS
+        .lock()
+        .unwrap()
+        .insert(index_name.to_string(), hook);
+    AnalyticsReadStageHookGuard {
+        index_name: index_name.to_string(),
+    }
+}
+
+#[cfg(test)]
+fn run_analytics_read_stage_hook(stage: AnalyticsReadStage, index_name: &str) {
+    let hook = ANALYTICS_READ_STAGE_HOOKS
+        .lock()
+        .unwrap()
+        .get(index_name)
+        .cloned();
+    if let Some(hook) = hook {
+        hook(stage);
+    }
+}
+
+#[cfg(not(test))]
+fn run_analytics_read_stage_hook(_stage: AnalyticsReadStage, _index_name: &str) {}
+
+impl Deref for AnalyticsSession {
+    type Target = SessionContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.context
+    }
+}
+
 impl AnalyticsQueryEngine {
     pub fn new(config: AnalyticsConfig) -> Self {
         Self { config }
@@ -79,6 +173,7 @@ impl AnalyticsQueryEngine {
         index_name: &str,
         sql: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
+        let _snapshot = super::mutation::begin_index_read(&self.config, index_name).await?;
         let dir = self.config.searches_dir(index_name);
         self.query_parquet_dir(&dir, "searches", sql).await
     }
@@ -89,6 +184,7 @@ impl AnalyticsQueryEngine {
         index_name: &str,
         sql: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
+        let _snapshot = super::mutation::begin_index_read(&self.config, index_name).await?;
         let dir = self.config.events_dir(index_name);
         self.query_parquet_dir(&dir, "events", sql).await
     }
@@ -188,12 +284,13 @@ impl AnalyticsQueryEngine {
 
     /// Analytics status (last updated timestamp).
     pub async fn status(&self, index_name: &str) -> Result<serde_json::Value, String> {
+        let _snapshot = super::mutation::begin_index_read(&self.config, index_name).await?;
         let dir = self.config.searches_dir(index_name);
-        let exists = dir.exists();
+        let has_data = contains_parquet_file(&dir)?;
 
         Ok(serde_json::json!({
             "enabled": self.config.enabled,
-            "hasData": exists,
+            "hasData": has_data,
             "retentionDays": self.config.retention_days,
         }))
     }
@@ -207,9 +304,29 @@ impl AnalyticsQueryEngine {
     ) -> Result<serde_json::Value, String> {
         let start_ms = date_to_start_ms(start_date)?;
         let end_ms = date_to_end_ms(end_date)?;
-
-        // Discover all index directories
         let indices = self.list_analytics_indices()?;
+        self.overview_for_indices(&indices, start_ms, end_ms).await
+    }
+
+    /// Overview analytics for one index.
+    pub async fn overview_for_index(
+        &self,
+        index_name: &str,
+        start_date: &str,
+        end_date: &str,
+    ) -> Result<serde_json::Value, String> {
+        let start_ms = date_to_start_ms(start_date)?;
+        let end_ms = date_to_end_ms(end_date)?;
+        let indices = vec![index_name.to_string()];
+        self.overview_for_indices(&indices, start_ms, end_ms).await
+    }
+
+    async fn overview_for_indices(
+        &self,
+        indices: &[String],
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<serde_json::Value, String> {
         if indices.is_empty() {
             return Ok(serde_json::json!({
                 "totalSearches": 0,
@@ -226,7 +343,7 @@ impl AnalyticsQueryEngine {
         let mut daily_searches: BTreeMap<i64, i64> = BTreeMap::new();
         let mut per_index: Vec<serde_json::Value> = Vec::new();
 
-        for index_name in &indices {
+        for index_name in indices {
             let metrics = self
                 .collect_overview_metrics_for_index(index_name, start_ms, end_ms)
                 .await?;
@@ -252,7 +369,6 @@ impl AnalyticsQueryEngine {
             .map(|(&ms, &count)| serde_json::json!({"date": ms_to_date_string(ms), "count": count}))
             .collect();
 
-        // Sort per_index by searches descending
         per_index.sort_by(|a, b| {
             let sa = a.get("searches").and_then(|v| v.as_i64()).unwrap_or(0);
             let sb = b.get("searches").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -297,20 +413,20 @@ impl AnalyticsQueryEngine {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<IndexOverviewMetrics, String> {
-        let search_ctx = self.create_session_with_searches(index_name).await?;
+        let ctx = self
+            .create_session_with_searches_and_events(index_name)
+            .await?;
         let totals_rows = self
-            .query_rows_or_empty(&search_ctx, &overview_totals_sql(start_ms, end_ms))
+            .query_rows_or_empty(&ctx, &overview_totals_sql(start_ms, end_ms))
             .await?;
         let daily_rows = self
-            .query_rows_or_empty(&search_ctx, &overview_daily_sql(start_ms, end_ms))
+            .query_rows_or_empty(&ctx, &overview_daily_sql(start_ms, end_ms))
             .await?;
         let user_rows = self
-            .query_rows_or_empty(&search_ctx, &overview_users_sql(start_ms, end_ms))
+            .query_rows_or_empty(&ctx, &overview_users_sql(start_ms, end_ms))
             .await?;
-
-        let events_ctx = self.create_session_with_events(index_name).await?;
         let click_rows = self
-            .query_rows_or_empty(&events_ctx, &overview_clicks_sql(start_ms, end_ms))
+            .query_rows_or_empty(&ctx, &overview_clicks_sql(start_ms, end_ms))
             .await?;
 
         Ok(IndexOverviewMetrics {
@@ -360,10 +476,52 @@ impl AnalyticsQueryEngine {
     async fn create_session_with_searches(
         &self,
         index_name: &str,
-    ) -> Result<SessionContext, String> {
-        let dir = self.config.searches_dir(index_name);
+    ) -> Result<AnalyticsSession, String> {
+        let snapshot = super::mutation::begin_index_read(&self.config, index_name).await?;
         let ctx = SessionContext::new();
-        if !dir.exists() {
+        self.register_searches_table(&ctx, index_name).await?;
+        run_analytics_read_stage_hook(AnalyticsReadStage::AfterSearchesRegistration, index_name);
+        Ok(AnalyticsSession {
+            context: ctx,
+            _snapshot: snapshot,
+        })
+    }
+
+    /// Create a DataFusion `SessionContext` with the `events` table registered from Parquet files for the given index. If the events directory does not exist, registers an empty in-memory table so queries return zero rows instead of failing.
+    async fn create_session_with_events(
+        &self,
+        index_name: &str,
+    ) -> Result<AnalyticsSession, String> {
+        let snapshot = super::mutation::begin_index_read(&self.config, index_name).await?;
+        let ctx = SessionContext::new();
+        self.register_events_table(&ctx, index_name).await?;
+        Ok(AnalyticsSession {
+            context: ctx,
+            _snapshot: snapshot,
+        })
+    }
+
+    async fn create_session_with_searches_and_events(
+        &self,
+        index_name: &str,
+    ) -> Result<AnalyticsSession, String> {
+        let snapshot = super::mutation::begin_index_read(&self.config, index_name).await?;
+        let ctx = SessionContext::new();
+        self.register_searches_table(&ctx, index_name).await?;
+        self.register_events_table(&ctx, index_name).await?;
+        Ok(AnalyticsSession {
+            context: ctx,
+            _snapshot: snapshot,
+        })
+    }
+
+    async fn register_searches_table(
+        &self,
+        ctx: &SessionContext,
+        index_name: &str,
+    ) -> Result<(), String> {
+        let dir = self.config.searches_dir(index_name);
+        if !contains_parquet_file(&dir)? {
             // Register an empty table so SQL queries return 0 rows instead of erroring
             let batch =
                 arrow::record_batch::RecordBatch::new_empty(super::schema::search_event_schema());
@@ -374,7 +532,7 @@ impl AnalyticsQueryEngine {
             .map_err(|e| format!("Failed to create empty searches table: {}", e))?;
             ctx.register_table("searches", Arc::new(mem_table))
                 .map_err(|e| format!("Failed to register empty searches: {}", e))?;
-            return Ok(ctx);
+            return Ok(());
         }
         let opts = ListingOptions::new(Arc::new(
             datafusion::datasource::file_format::parquet::ParquetFormat::default(),
@@ -385,14 +543,17 @@ impl AnalyticsQueryEngine {
         ctx.register_listing_table("searches", &table_path, opts, None, None)
             .await
             .map_err(|e| format!("Failed to register searches: {}", e))?;
-        Ok(ctx)
+        Ok(())
     }
 
-    /// Create a DataFusion `SessionContext` with the `events` table registered from Parquet files for the given index. If the events directory does not exist, registers an empty in-memory table so queries return zero rows instead of failing.
-    async fn create_session_with_events(&self, index_name: &str) -> Result<SessionContext, String> {
+    async fn register_events_table(
+        &self,
+        ctx: &SessionContext,
+        index_name: &str,
+    ) -> Result<(), String> {
+        run_analytics_read_stage_hook(AnalyticsReadStage::BeforeEventsRegistration, index_name);
         let dir = self.config.events_dir(index_name);
-        let ctx = SessionContext::new();
-        if !dir.exists() {
+        if !contains_parquet_file(&dir)? {
             let batch =
                 arrow::record_batch::RecordBatch::new_empty(super::schema::insight_event_schema());
             let mem_table = datafusion::datasource::MemTable::try_new(
@@ -402,7 +563,7 @@ impl AnalyticsQueryEngine {
             .map_err(|e| format!("Failed to create empty events table: {}", e))?;
             ctx.register_table("events", Arc::new(mem_table))
                 .map_err(|e| format!("Failed to register empty events: {}", e))?;
-            return Ok(ctx);
+            return Ok(());
         }
         let opts = ListingOptions::new(Arc::new(
             datafusion::datasource::file_format::parquet::ParquetFormat::default(),
@@ -413,48 +574,47 @@ impl AnalyticsQueryEngine {
         ctx.register_listing_table("events", &table_path, opts, None, None)
             .await
             .map_err(|e| format!("Failed to register events: {}", e))?;
-        Ok(ctx)
+        Ok(())
     }
 
     /// Augment search result rows with click analytics fields (`clickThroughRate`, `conversionRate`, `clickCount`, `trackedSearchCount`, `conversionCount`, `averageClickPosition`) by cross-referencing the events table through query ID correlation.
+    ///
+    /// Runs inside the caller's already-admitted searches+events session: taking
+    /// a second same-index read here would deadlock against any seed or clear
+    /// that queued while the caller's snapshot was still live.
     async fn enrich_with_click_data(
         &self,
-        index_name: &str,
+        ctx: &SessionContext,
         start_ms: i64,
         end_ms: i64,
         rows: Vec<serde_json::Value>,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let search_ctx = self.create_session_with_searches(index_name).await?;
         let tracked_sql = tracked_counts_sql(start_ms, end_ms);
-        let Some(tracked_rows) = self
-            .query_rows_or_skip_sql(&search_ctx, &tracked_sql)
-            .await?
-        else {
+        let Some(tracked_rows) = self.query_rows_or_skip_sql(ctx, &tracked_sql).await? else {
             return Ok(rows);
         };
         let tracked_by_query = map_query_counts(&tracked_rows, "query", "tracked_count");
 
         let qid_sql = query_id_map_sql(start_ms, end_ms);
-        let Some(qid_rows) = self.query_rows_or_skip_sql(&search_ctx, &qid_sql).await? else {
+        let Some(qid_rows) = self.query_rows_or_skip_sql(ctx, &qid_sql).await? else {
             return Ok(rows);
         };
         let qid_to_query = map_query_ids_to_queries(&qid_rows);
 
-        let events_ctx = self.create_session_with_events(index_name).await?;
         let clicks_rows = self
-            .query_rows_or_empty(&events_ctx, &click_counts_sql(start_ms, end_ms))
+            .query_rows_or_empty(ctx, &click_counts_sql(start_ms, end_ms))
             .await?;
         let clicks_by_query =
             aggregate_counts_by_query_id(&clicks_rows, &qid_to_query, "click_count");
 
         let conversion_rows = self
-            .query_rows_or_empty(&events_ctx, &conversion_counts_sql(start_ms, end_ms))
+            .query_rows_or_empty(ctx, &conversion_counts_sql(start_ms, end_ms))
             .await?;
         let conversions_by_query =
             aggregate_counts_by_query_id(&conversion_rows, &qid_to_query, "conv_count");
 
         let position_rows = self
-            .query_rows_or_empty(&events_ctx, &click_positions_sql(start_ms, end_ms))
+            .query_rows_or_empty(ctx, &click_positions_sql(start_ms, end_ms))
             .await?;
         let (position_sums, position_counts) =
             aggregate_click_positions_by_query(&position_rows, &qid_to_query);
@@ -764,12 +924,12 @@ fn enrich_rows_with_click_metrics(
 }
 
 /// Recursively walk a directory and return paths to all `.parquet` files found. Returns an empty `Vec` if the directory does not exist. Follows Hive-style partitioned layouts where parquet files may be nested in date-keyed subdirectories.
-fn find_parquet_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+fn find_parquet_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::new();
     if !dir.exists() {
         return Ok(files);
     }
-    fn walk(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
+    fn walk(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
         let entries = std::fs::read_dir(dir).map_err(|e| format!("read_dir error: {}", e))?;
         for entry in entries {
             let entry = entry.map_err(|e| format!("entry error: {}", e))?;
@@ -784,6 +944,57 @@ fn find_parquet_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, 
     }
     walk(dir, &mut files)?;
     Ok(files)
+}
+
+fn contains_parquet_file(dir: &Path) -> Result<bool, String> {
+    contains_parquet_file_inner(dir, &mut None)
+}
+
+#[cfg(test)]
+fn contains_parquet_file_with_entry_budget(dir: &Path, max_entries: usize) -> Result<bool, String> {
+    contains_parquet_file_inner(dir, &mut Some(max_entries))
+}
+
+/// Return `true` as soon as any `.parquet` file is found anywhere under `dir`.
+///
+/// Directory entries are pulled lazily from the `read_dir` iterator and each is
+/// inspected before the next is read, so a match short-circuits without
+/// enumerating (or allocating) the remaining sibling partitions. This keeps the
+/// common analytics presence check cheap on large Hive-partitioned trees.
+///
+/// `remaining_entry_budget`, when set, bounds how many directory entries may be
+/// consumed before giving up. Tests use it to prove the walk stops after the
+/// first match instead of eagerly enumerating every partition.
+fn contains_parquet_file_inner(
+    dir: &Path,
+    remaining_entry_budget: &mut Option<usize>,
+) -> Result<bool, String> {
+    if !dir.exists() {
+        return Ok(false);
+    }
+
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("read_dir error: {}", e))?;
+    for entry in entries {
+        if let Some(remaining) = remaining_entry_budget.as_mut() {
+            if *remaining == 0 {
+                return Err("parquet presence check enumerated too many entries".to_string());
+            }
+            *remaining -= 1;
+        }
+        let entry = entry.map_err(|e| format!("entry error: {}", e))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("file_type error for {}: {}", path.display(), e))?;
+        if file_type.is_dir() {
+            if contains_parquet_file_inner(&path, remaining_entry_budget)? {
+                return Ok(true);
+            }
+        } else if path.extension().map(|e| e == "parquet").unwrap_or(false) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn rounded_rate_or_null(numerator: i64, denominator: i64) -> serde_json::Value {

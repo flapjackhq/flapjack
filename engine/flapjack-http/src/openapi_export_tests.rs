@@ -251,6 +251,20 @@ fn export_output_declares_meilisearch_submit_payload_schema() {
         "Meilisearch preview route must reference its provider-specific request body"
     );
 }
+
+#[test]
+fn export_output_declares_typesense_preview_payload_schema() {
+    let doc = exported_openapi_doc();
+
+    assert_eq!(
+        schema_ref(
+            &doc,
+            "/paths/~11~1migrations~1typesense~1preview/post/requestBody/content/application~1json/schema"
+        ),
+        Some("#/components/schemas/MigrateFromTypesenseRequest"),
+        "Typesense preview route must reference its provider-specific request body"
+    );
+}
 #[test]
 fn export_output_includes_federated_batch_contract_components() {
     let doc = exported_openapi_doc();

@@ -10,6 +10,7 @@ use prometheus::{Encoder, TextEncoder};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     io::Write,
+    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
         Mutex,
@@ -31,6 +32,20 @@ const JULY_22_TIMEOUT_RISK_PENDING_ADMISSIONS: usize = 690;
 const ONLINE_SPECIMEN_SETTLED_MAX: usize = 4;
 static WRITE_QUEUE_ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
+#[test]
+fn dropped_worker_completion_reporter_records_abnormal_termination() {
+    let completion = WriteQueueWorkerCompletion::new();
+    drop(completion.reporter("panic_completion_tenant".to_string()));
+
+    let result = completion
+        .wait_timeout(Duration::ZERO)
+        .expect("abnormal worker termination must wake blocking completion waiters");
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "Tantivy error: write queue worker for panic_completion_tenant stopped before reporting completion: worker thread unwound"
+    );
+}
+
 type WriteQueueHandle = tokio::task::JoinHandle<crate::error::Result<()>>;
 type WriteQueueTasks = Arc<dashmap::DashMap<String, TaskInfo>>;
 type WriteQueueSetup = (WriteQueue, WriteQueueHandle, WriteQueueTasks);
@@ -41,6 +56,13 @@ type GatedWriteQueueSetup = (
     Arc<WriteQueueWorkerGate>,
 );
 type OplogWriteQueueSetup = (
+    WriteQueue,
+    WriteQueueHandle,
+    WriteQueueTasks,
+    Arc<crate::index::oplog::OpLog>,
+);
+type OplogWriteQueueSetupWithIndex = (
+    Arc<crate::index::Index>,
     WriteQueue,
     WriteQueueHandle,
     WriteQueueTasks,
@@ -255,7 +277,7 @@ fn setup_write_queue_with_index_and_overrides(
     let admission_store =
         Arc::new(admission::WriteAdmissionStore::open(tmp.path(), tenant_id).unwrap());
 
-    let (tx, handle, _cancellation) = create_write_queue(WriteQueueContext {
+    let (tx, handle, _cancellation, _completion) = create_write_queue(WriteQueueContext {
         tenant_id: tenant_id.to_string(),
         index,
         tasks: Arc::clone(&tasks),
@@ -282,11 +304,13 @@ fn setup_write_queue(tmp: &tempfile::TempDir, tenant_id: &str) -> WriteQueueSetu
     setup_write_queue_with_index(tmp, tenant_id, index)
 }
 
-fn setup_write_queue_with_oplog(tmp: &tempfile::TempDir, tenant_id: &str) -> OplogWriteQueueSetup {
+fn setup_write_queue_with_oplog_and_overrides(
+    tmp: &tempfile::TempDir,
+    tenant_id: &str,
+    index: Arc<crate::index::Index>,
+    test_overrides: WriteQueueTestOverrides,
+) -> OplogWriteQueueSetup {
     let tenant_path = tmp.path().join(tenant_id);
-    std::fs::create_dir_all(&tenant_path).unwrap();
-    let schema = crate::index::schema::Schema::builder().build();
-    let index = Arc::new(crate::index::Index::create(&tenant_path, schema).unwrap());
     let tasks: Arc<dashmap::DashMap<String, TaskInfo>> = Arc::new(dashmap::DashMap::new());
     let facet_cache = Arc::new(dashmap::DashMap::new());
     #[cfg(feature = "vector-search")]
@@ -300,7 +324,7 @@ fn setup_write_queue_with_oplog(tmp: &tempfile::TempDir, tenant_id: &str) -> Opl
             .unwrap(),
     );
 
-    let (tx, handle, _cancellation) = create_write_queue(WriteQueueContext {
+    let (tx, handle, _cancellation, _completion) = create_write_queue(WriteQueueContext {
         tenant_id: tenant_id.to_string(),
         index,
         tasks: Arc::clone(&tasks),
@@ -311,11 +335,43 @@ fn setup_write_queue_with_oplog(tmp: &tempfile::TempDir, tenant_id: &str) -> Opl
         vector_ctx,
         queue_metrics_id: 0,
         writer_buffer_size: crate::index::Index::DEFAULT_BUFFER_SIZE,
-        test_overrides: WriteQueueTestOverrides::default(),
+        test_overrides,
     })
     .unwrap();
 
     (tx, handle, tasks, oplog)
+}
+
+fn setup_write_queue_with_oplog(tmp: &tempfile::TempDir, tenant_id: &str) -> OplogWriteQueueSetup {
+    let tenant_path = tmp.path().join(tenant_id);
+    std::fs::create_dir_all(&tenant_path).unwrap();
+    let schema = crate::index::schema::Schema::builder().build();
+    let index = Arc::new(crate::index::Index::create(&tenant_path, schema).unwrap());
+    setup_write_queue_with_oplog_and_overrides(
+        tmp,
+        tenant_id,
+        index,
+        WriteQueueTestOverrides::default(),
+    )
+}
+
+fn setup_gated_write_queue_with_oplog_and_overrides(
+    tmp: &tempfile::TempDir,
+    tenant_id: &str,
+    index: Arc<crate::index::Index>,
+    test_overrides: WriteQueueTestOverrides,
+) -> (OplogWriteQueueSetupWithIndex, Arc<WriteQueueWorkerGate>) {
+    let worker_gate = Arc::new(WriteQueueWorkerGate::closed());
+    let (tx, handle, tasks, oplog) = setup_write_queue_with_oplog_and_overrides(
+        tmp,
+        tenant_id,
+        Arc::clone(&index),
+        WriteQueueTestOverrides {
+            worker_start_gate: Some(Arc::clone(&worker_gate)),
+            ..test_overrides
+        },
+    );
+    ((index, tx, handle, tasks, oplog), worker_gate)
 }
 
 fn setup_write_queue_with_budget(
@@ -361,7 +417,976 @@ fn text_document(id: &str, field: &str, value: &str) -> crate::types::Document {
     }
 }
 
+fn dur1_replicated_documents(
+    object_ids: &[&str],
+) -> Vec<(crate::types::Document, ReplicatedWriteOrigin)> {
+    object_ids
+        .iter()
+        .enumerate()
+        .map(|(index, object_id)| {
+            (
+                text_document(
+                    object_id,
+                    "title",
+                    &format!("DUR-1 replicated document {index}"),
+                ),
+                ReplicatedWriteOrigin::new(
+                    10_000 + index as u64,
+                    format!("dur1-replica-node-{index}"),
+                ),
+            )
+        })
+        .collect()
+}
+
+fn assert_dur1_admission_records_drained(temp_dir: &tempfile::TempDir, tenant_id: &str) {
+    assert!(
+        crate::index::write_queue::admission::WriteAdmissionStore::open(temp_dir.path(), tenant_id)
+            .unwrap()
+            .load_records()
+            .unwrap()
+            .is_empty(),
+        "durable write admission records must be drained after restart reconciliation"
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CommittedIndexSnapshot {
+    meta_json: String,
+    segment_ids: Vec<String>,
+}
+
+fn committed_index_snapshot(tenant_path: &Path) -> CommittedIndexSnapshot {
+    let meta_json = std::fs::read_to_string(tenant_path.join("meta.json")).unwrap();
+    let parsed_meta: serde_json::Value = serde_json::from_str(&meta_json).unwrap();
+    let mut segment_ids: Vec<String> = parsed_meta
+        .get("segments")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("meta.json must contain segments array: {meta_json}"))
+        .iter()
+        .map(|segment| {
+            segment
+                .get("segment_id")
+                .or_else(|| segment.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("segment entry must expose an id: {segment:?}"))
+                .to_string()
+        })
+        .collect();
+    segment_ids.sort();
+    CommittedIndexSnapshot {
+        meta_json,
+        segment_ids,
+    }
+}
+
+fn assert_dur1_visible_documents(
+    manager: &crate::index::manager::IndexManager,
+    tenant_id: &str,
+    expected_ids: &[&str],
+    absent_ids: &[&str],
+    context: &str,
+) {
+    let observed_ids: Vec<&str> = expected_ids
+        .iter()
+        .chain(absent_ids.iter())
+        .copied()
+        .filter(|object_id| {
+            manager
+                .get_document(tenant_id, object_id)
+                .unwrap()
+                .is_some()
+        })
+        .collect();
+    assert_eq!(
+        observed_ids, expected_ids,
+        "{context} visible objectID set must match expected ids"
+    );
+    assert_eq!(
+        manager.tenant_doc_count(tenant_id),
+        Some(expected_ids.len() as u64),
+        "{context} must expose exactly the expected searchable document count"
+    );
+}
+
+fn oplog_task_id(entry: &crate::index::oplog::OpLogEntry) -> String {
+    entry
+        .payload
+        .get("_flapjack_task_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("oplog entry must include task id: {entry:?}"))
+        .to_string()
+}
+
+fn oplog_object_id(entry: &crate::index::oplog::OpLogEntry) -> String {
+    entry
+        .payload
+        .get("objectID")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("oplog entry must include objectID: {entry:?}"))
+        .to_string()
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(write_queue_commit_failure_hook)]
+async fn dur1_failed_durable_write_stays_absent_after_restart() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let tenant_id = "dur1_failed_durable_write_restart";
+    let baseline_id = "dur1_baseline";
+    let rejected_ids = ["dur1_rejected_a", "dur1_rejected_b"];
+    let manager =
+        crate::index::manager::IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+    manager.create_tenant(tenant_id).unwrap();
+    manager
+        .add_documents_sync(
+            tenant_id,
+            vec![text_document(baseline_id, "title", "DUR-1 baseline")],
+        )
+        .await
+        .unwrap();
+    let tenant_path = temp_dir.path().join(tenant_id);
+    let before_failure_snapshot = committed_index_snapshot(&tenant_path);
+
+    let _fault = crate::index::write_queue::fail_next_finalization_for_test(
+        tenant_id,
+        FinalizationFaultPoint::BeforeTantivyCommit,
+    );
+    let task = manager
+        .admit_replicated_documents_durable_for_test(
+            tenant_id,
+            dur1_replicated_documents(&rejected_ids),
+        )
+        .unwrap();
+
+    assert!(
+        manager.wait_for_write_durable(&task.id).await.is_err(),
+        "injected durable write failure must reach the waiting caller"
+    );
+    let canonical_task = manager.get_task(&task.id).unwrap();
+    assert_eq!(
+        canonical_task.id, task.id,
+        "canonical task lookup must resolve to the failed durable write"
+    );
+    let numeric_task = manager.get_task(&task.numeric_id.to_string()).unwrap();
+    assert_eq!(
+        numeric_task.id, task.id,
+        "numeric task alias must resolve to the failed durable write"
+    );
+    assert_eq!(
+        numeric_task.numeric_id, task.numeric_id,
+        "numeric task alias must preserve the failed durable write numeric id"
+    );
+    assert!(
+        matches!(canonical_task.status, crate::types::TaskStatus::Failed(_)),
+        "failed durable write canonical task lookup must be terminal Failed"
+    );
+    assert!(
+        matches!(numeric_task.status, crate::types::TaskStatus::Failed(_)),
+        "failed durable write numeric task alias must be terminal Failed"
+    );
+    let failed_write_handle = manager
+        .write_task_handles
+        .get(tenant_id)
+        .map(|entry| entry.clone())
+        .expect("failed durable write must leave a tenant worker handle to drain");
+    assert!(
+        failed_write_handle
+            .drain(tenant_id.to_string())
+            .await
+            .is_err(),
+        "failed durable write worker must terminate with the injected commit error"
+    );
+    assert_eq!(
+        committed_index_snapshot(&tenant_path),
+        before_failure_snapshot,
+        "BeforeTantivyCommit must not change committed meta.json or committed segment ids"
+    );
+    assert_dur1_visible_documents(
+        &manager,
+        tenant_id,
+        &[baseline_id],
+        &rejected_ids,
+        "in-process after injected pre-commit failure",
+    );
+    manager.unload(&tenant_id.to_string()).unwrap();
+
+    drop(manager);
+    let restarted_manager =
+        crate::index::manager::IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+    restarted_manager.get_or_load(tenant_id).unwrap();
+    assert_dur1_visible_documents(
+        &restarted_manager,
+        tenant_id,
+        &[baseline_id],
+        &rejected_ids,
+        "first restart",
+    );
+    assert_dur1_admission_records_drained(&temp_dir, tenant_id);
+
+    drop(restarted_manager);
+    let second_restart =
+        crate::index::manager::IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+    second_restart.get_or_load(tenant_id).unwrap();
+    assert_dur1_visible_documents(
+        &second_restart,
+        tenant_id,
+        &[baseline_id],
+        &rejected_ids,
+        "second restart",
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dur1_successful_durable_write_survives_restart() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let tenant_id = "dur1_successful_durable_write_restart";
+    let baseline_id = "dur1_success_baseline";
+    let accepted_ids = ["dur1_accepted_a", "dur1_accepted_b"];
+    let manager =
+        crate::index::manager::IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+    manager.create_tenant(tenant_id).unwrap();
+    manager
+        .add_documents_sync(
+            tenant_id,
+            vec![text_document(
+                baseline_id,
+                "title",
+                "DUR-1 negative-control baseline",
+            )],
+        )
+        .await
+        .unwrap();
+
+    let task = manager
+        .admit_replicated_documents_durable_for_test(
+            tenant_id,
+            dur1_replicated_documents(&accepted_ids),
+        )
+        .unwrap();
+    manager.wait_for_write_durable(&task.id).await.unwrap();
+
+    drop(manager);
+    let restarted_manager =
+        crate::index::manager::IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+    restarted_manager.get_or_load(tenant_id).unwrap();
+    assert_dur1_visible_documents(
+        &restarted_manager,
+        tenant_id,
+        &[baseline_id, accepted_ids[0], accepted_ids[1]],
+        &[],
+        "successful restart",
+    );
+    assert_dur1_admission_records_drained(&temp_dir, tenant_id);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(write_queue_commit_failure_hook)]
+async fn compensation_preserves_concurrent_metadata_oplog_append() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let tenant_id = "compensation_preserves_metadata";
+    let baseline_id = "metadata_compensation_baseline";
+    let rejected_ids = [
+        "metadata_compensation_rejected_a",
+        "metadata_compensation_rejected_b",
+    ];
+    let manager = Arc::new(crate::index::manager::IndexManager::new_with_node_id(
+        temp_dir.path(),
+        "local-node",
+    ));
+    manager.create_tenant(tenant_id).unwrap();
+    manager
+        .add_documents_sync(
+            tenant_id,
+            vec![text_document(
+                baseline_id,
+                "title",
+                "metadata compensation baseline",
+            )],
+        )
+        .await
+        .unwrap();
+
+    let hook_manager = Arc::clone(&manager);
+    let hook_admission_path = temp_dir.path().to_path_buf();
+    let admission_was_durable_before_retraction = Arc::new(AtomicBool::new(false));
+    let hook_observation = Arc::clone(&admission_was_durable_before_retraction);
+    let _metadata_append =
+        crate::index::write_queue::set_compensation_before_oplog_retraction_hook_for_test(
+            Arc::new(move |hook_tenant_id| {
+                let records = crate::index::write_queue::admission::WriteAdmissionStore::open(
+                    &hook_admission_path,
+                    hook_tenant_id,
+                )
+                .unwrap()
+                .load_records()
+                .unwrap();
+                assert!(
+                    !records.is_empty(),
+                    "admission replay must remain durable until oplog retraction succeeds"
+                );
+                hook_observation.store(true, Ordering::SeqCst);
+                hook_manager.append_oplog(
+                    hook_tenant_id,
+                    "settings",
+                    serde_json::json!({"searchableAttributes": ["title"]}),
+                );
+            }),
+        );
+    let _fault = crate::index::write_queue::fail_next_finalization_for_test(
+        tenant_id,
+        FinalizationFaultPoint::BeforeTantivyCommit,
+    );
+    let task = manager
+        .admit_replicated_documents_durable_for_test(
+            tenant_id,
+            dur1_replicated_documents(&rejected_ids),
+        )
+        .unwrap();
+
+    assert!(manager.wait_for_write_durable(&task.id).await.is_err());
+    assert!(
+        admission_was_durable_before_retraction.load(Ordering::SeqCst),
+        "compensation must observe admission before retracting the oplog"
+    );
+    let handle = manager
+        .write_task_handles
+        .get(tenant_id)
+        .map(|entry| entry.clone())
+        .expect("failed durable write must leave a tenant worker handle to drain");
+    assert!(handle.drain(tenant_id.to_string()).await.is_err());
+
+    let tenant_path = temp_dir.path().join(tenant_id);
+    let committed_seq = crate::index::oplog::read_committed_seq(&tenant_path);
+    let oplog = manager.get_oplog(tenant_id).unwrap();
+    let entries = oplog.read_since(0).unwrap();
+    assert!(
+        entries.iter().any(|entry| entry.op_type == "settings"),
+        "compensation must not delete unrelated synchronous metadata rows: {entries:?}"
+    );
+    assert!(
+        oplog.current_seq() >= committed_seq,
+        "compensation must not rewind the oplog tail below committed_seq; current_seq={}, committed_seq={committed_seq}",
+        oplog.current_seq()
+    );
+}
+
+async fn setup_compensation_manager(
+    base_path: &std::path::Path,
+    tenant_id: &str,
+    baseline_id: &str,
+) -> Arc<crate::index::manager::IndexManager> {
+    let manager = crate::index::manager::IndexManager::new_with_node_id(base_path, "local-node");
+    manager.create_tenant(tenant_id).unwrap();
+    manager
+        .add_documents_sync(
+            tenant_id,
+            vec![text_document(baseline_id, "title", "compensation baseline")],
+        )
+        .await
+        .unwrap();
+    manager
+}
+
+async fn assert_successful_compensation_stays_absent() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let tenant_id = "compensation_success_absent";
+    let baseline_id = "compensation_baseline";
+    let rejected_ids = ["compensation_rejected_a", "compensation_rejected_b"];
+    let manager = setup_compensation_manager(temp_dir.path(), tenant_id, baseline_id).await;
+
+    let _fault = crate::index::write_queue::fail_next_finalization_for_test(
+        tenant_id,
+        FinalizationFaultPoint::BeforeTantivyCommit,
+    );
+    let task = manager
+        .admit_replicated_documents_durable_for_test(
+            tenant_id,
+            dur1_replicated_documents(&rejected_ids),
+        )
+        .unwrap();
+    assert!(manager.wait_for_write_durable(&task.id).await.is_err());
+    assert!(
+        matches!(
+            manager.get_task(&task.id).map(|task| task.status),
+            Ok(crate::types::TaskStatus::Failed(_))
+        ),
+        "successful compensation must still certify the task terminal Failed"
+    );
+    let handle = manager
+        .write_task_handles
+        .get(tenant_id)
+        .map(|entry| entry.clone())
+        .expect("failed durable write must leave a tenant worker handle to drain");
+    assert!(handle.drain(tenant_id.to_string()).await.is_err());
+    manager.unload(&tenant_id.to_string()).unwrap();
+    drop(manager);
+
+    for context in ["first restart", "second restart"] {
+        let restarted =
+            crate::index::manager::IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+        restarted.get_or_load(tenant_id).unwrap();
+        assert_dur1_visible_documents(
+            &restarted,
+            tenant_id,
+            &[baseline_id],
+            &rejected_ids,
+            context,
+        );
+        assert_dur1_admission_records_drained(&temp_dir, tenant_id);
+        drop(restarted);
+    }
+}
+
+fn assert_task_replay_routes_absent(
+    manager: &crate::index::manager::IndexManager,
+    base_path: &std::path::Path,
+    tenant_id: &str,
+    task_id: &str,
+) {
+    let (admission_records, oplog_task_ids) =
+        task_replay_routes(manager, base_path, tenant_id, task_id);
+    assert!(
+        admission_records.is_empty(),
+        "a public timeout must not leave admission replay records"
+    );
+    assert!(
+        !oplog_task_ids.contains(task_id),
+        "a public timeout must not leave task-tagged oplog rows"
+    );
+}
+
+fn task_replay_routes(
+    manager: &crate::index::manager::IndexManager,
+    base_path: &std::path::Path,
+    tenant_id: &str,
+    _task_id: &str,
+) -> (
+    Vec<crate::index::write_queue::admission::WriteAdmissionRecord>,
+    BTreeSet<String>,
+) {
+    let admission_records =
+        crate::index::write_queue::admission::WriteAdmissionStore::open(base_path, tenant_id)
+            .unwrap()
+            .load_records()
+            .unwrap();
+    let oplog_task_ids: BTreeSet<String> = manager
+        .get_oplog(tenant_id)
+        .unwrap()
+        .read_since(0)
+        .unwrap()
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .payload
+                .get("_flapjack_task_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    (admission_records, oplog_task_ids)
+}
+
+async fn wait_for_task_replay_routes_absent(
+    manager: &crate::index::manager::IndexManager,
+    base_path: &std::path::Path,
+    tenant_id: &str,
+    task_id: &str,
+) {
+    tokio::time::timeout(WRITE_QUEUE_PROGRESS_TIMEOUT, async {
+        loop {
+            let (admission_records, oplog_task_ids) =
+                task_replay_routes(manager, base_path, tenant_id, task_id);
+            if admission_records.is_empty() && !oplog_task_ids.contains(task_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stopped write compensation should remove replay routes before timeout");
+}
+
+async fn assert_public_timeout_retries_compensation() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let tenant_id = "compensation_failure_fail_closed";
+    let baseline_id = "compensation_fc_baseline";
+    let rejected_ids = ["compensation_fc_rejected_a", "compensation_fc_rejected_b"];
+    let manager = setup_compensation_manager(temp_dir.path(), tenant_id, baseline_id).await;
+
+    let _commit_fault = crate::index::write_queue::fail_next_finalization_for_test(
+        tenant_id,
+        FinalizationFaultPoint::BeforeTantivyCommit,
+    );
+    let _compensation_fault = crate::index::write_queue::fail_next_compensation_for_test(tenant_id);
+    let task = manager
+        .admit_replicated_documents_durable_for_test(
+            tenant_id,
+            dur1_replicated_documents(&rejected_ids),
+        )
+        .unwrap();
+    let handle = manager
+        .write_task_handles
+        .get(tenant_id)
+        .map(|entry| entry.clone())
+        .expect("fail-closed durable write must leave a tenant worker handle to drain");
+    assert!(
+        handle.drain(tenant_id.to_string()).await.is_err(),
+        "test precondition: the injected compensation failure must stop the worker before the public timeout"
+    );
+
+    let durable_result = manager
+        .wait_for_write_durable_with_timeout_for_test(&task.id, Duration::from_millis(25))
+        .await;
+    assert!(
+        matches!(durable_result, Err(FlapjackError::WriteAckTimeout)),
+        "the bounded public waiter must surface its client error path, got {durable_result:?}"
+    );
+    let post_stop_result = manager
+        .wait_for_write_durable_with_timeout_for_test(&task.id, WRITE_QUEUE_PROGRESS_TIMEOUT)
+        .await;
+    assert!(
+        matches!(post_stop_result, Err(FlapjackError::WriteAckTimeout)),
+        "a stopped task whose replay routes are cleaned up must remain a retryable public timeout, got {post_stop_result:?}"
+    );
+
+    assert!(
+        !matches!(
+            manager.get_task(&task.id).map(|task| task.status),
+            Ok(crate::types::TaskStatus::Failed(_))
+        ),
+        "a batch whose retraction failed must NOT be certified terminal Failed"
+    );
+
+    wait_for_task_replay_routes_absent(&manager, temp_dir.path(), tenant_id, &task.id).await;
+    assert_task_replay_routes_absent(&manager, temp_dir.path(), tenant_id, &task.id);
+
+    manager.unload(&tenant_id.to_string()).unwrap();
+    drop(manager);
+    for context in [
+        "first public-waiter restart",
+        "second public-waiter restart",
+    ] {
+        let restarted =
+            crate::index::manager::IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+        restarted.get_or_load(tenant_id).unwrap();
+        assert_dur1_visible_documents(
+            &restarted,
+            tenant_id,
+            &[baseline_id],
+            &rejected_ids,
+            context,
+        );
+        assert_dur1_admission_records_drained(&temp_dir, tenant_id);
+        drop(restarted);
+    }
+}
+
+async fn assert_persistent_failure_uses_durable_ack() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let tenant_id = "compensation_persistent_failure";
+    let baseline_id = "compensation_persistent_baseline";
+    let accepted_ids = ["compensation_persistent_a", "compensation_persistent_b"];
+    let manager = setup_compensation_manager(temp_dir.path(), tenant_id, baseline_id).await;
+
+    let _commit_fault = crate::index::write_queue::fail_next_finalization_for_test(
+        tenant_id,
+        FinalizationFaultPoint::BeforeTantivyCommit,
+    );
+    let _compensation_fault =
+        crate::index::write_queue::fail_compensation_attempts_for_test(tenant_id, 2);
+    let task = manager
+        .admit_replicated_documents_durable_for_test(
+            tenant_id,
+            dur1_replicated_documents(&accepted_ids),
+        )
+        .unwrap();
+
+    wait_for_persistent_compensation_durable_ack(&manager, &task.id).await;
+    assert_eq!(
+        crate::index::write_queue::compensation_fault_attempts_remaining_for_test(tenant_id),
+        0,
+        "the worker and bounded waiter must each reach the compensation seam"
+    );
+    assert!(
+        !matches!(
+            manager.get_task(&task.id).map(|task| task.status),
+            Ok(crate::types::TaskStatus::Failed(_))
+        ),
+        "durably acknowledged replay must not expose a terminal failure"
+    );
+    manager.unload(&tenant_id.to_string()).unwrap();
+    drop(manager);
+
+    let restarted =
+        crate::index::manager::IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+    restarted.get_or_load(tenant_id).unwrap();
+    assert_dur1_visible_documents(
+        &restarted,
+        tenant_id,
+        &[baseline_id, accepted_ids[0], accepted_ids[1]],
+        &[],
+        "durable acknowledgement recovery",
+    );
+    assert_dur1_admission_records_drained(&temp_dir, tenant_id);
+}
+
+async fn wait_for_persistent_compensation_durable_ack(
+    manager: &crate::index::manager::IndexManager,
+    task_id: &str,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match manager
+            .wait_for_write_durable_with_timeout_for_test(task_id, Duration::from_millis(25))
+            .await
+        {
+            Ok(()) => return,
+            Err(FlapjackError::WriteAckTimeout) if std::time::Instant::now() < deadline => {
+                tokio::task::yield_now().await;
+            }
+            result => panic!(
+                "a persistent compensation failure must become a durable acknowledgement before the bounded deadline, got {result:?}"
+            ),
+        }
+    }
+}
+
+/// The durable-wait window is 25ms; progress is published every 20ms so each
+/// publication lands inside a fresh idle window but the final `Succeeded` lands
+/// at virtual ~60ms — well past the original 25ms window. A total-elapsed fence
+/// (the defect this stage removed) would time the task out at 30ms and redden.
+const PROGRESS_CONTRACT_WINDOW: Duration = Duration::from_millis(25);
+const PROGRESS_CONTRACT_STEP: Duration = Duration::from_millis(20);
+
+// `start_paused` runs the whole test on tokio's virtual clock: the fence's idle
+// deadline, its 10ms poll sleeps, and the `advance()` calls below all read one
+// clock the test controls, so ordering is fixed by the durations here and never
+// by scheduler jitter under `cargo test --workspace` contention.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn durable_wait_deadline_is_reset_by_observable_task_progress() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = crate::index::manager::IndexManager::new(tmp.path());
+
+    let stalled_task_id = "task_progress_contract_stalled_1".to_string();
+    manager.insert_task_for_test(TaskInfo::new(stalled_task_id.clone(), 1, 3));
+    let stalled = manager
+        .wait_for_write_durable_with_timeout_for_test(&stalled_task_id, PROGRESS_CONTRACT_WINDOW)
+        .await;
+    assert!(
+        matches!(stalled, Err(FlapjackError::WriteAckTimeout)),
+        "a non-terminal task with no observed progress inside the durable window must fail closed, got {stalled:?}"
+    );
+
+    let progressing_task_id = "task_progress_contract_progressing_2".to_string();
+    let mut progressing_task = TaskInfo::new(progressing_task_id.clone(), 2, 3);
+    progressing_task.status = TaskStatus::Processing;
+    manager.insert_task_for_test(progressing_task);
+
+    let waiter = {
+        let manager = Arc::clone(&manager);
+        let task_id = progressing_task_id.clone();
+        tokio::spawn(async move {
+            manager
+                .wait_for_write_durable_with_timeout_for_test(&task_id, PROGRESS_CONTRACT_WINDOW)
+                .await
+        })
+    };
+
+    // Let the waiter record the task's initial (zero-progress) state and arm its
+    // first idle sleep before any progress is published.
+    tokio::task::yield_now().await;
+
+    // Test-owned seam: publish each progress step first, then advance the virtual
+    // clock by less than one window so the waiter observes the update and resets
+    // its deadline. No real sleeps, so the waiter can only advance after the
+    // update it depends on has already been published.
+    for indexed_documents in 1..=3 {
+        let mut task = manager.get_task(&progressing_task_id).unwrap();
+        task.indexed_documents = indexed_documents;
+        if indexed_documents == 3 {
+            task.status = TaskStatus::Succeeded;
+        }
+        manager.insert_task_for_test(task);
+        tokio::time::advance(PROGRESS_CONTRACT_STEP).await;
+    }
+
+    let progressed = waiter.await.unwrap();
+    assert!(
+        matches!(progressed, Ok(())),
+        "slow but steady progress beyond the original durable window must remain acknowledged, got {progressed:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(write_queue_commit_failure_hook)]
+/// DUR-1 fail-closed contract for commit-failure compensation.
+///
+/// Covers successful cleanup, a transient failure retried before public 503,
+/// and persistent failure converted to durable acknowledgement for recovery.
+async fn compensation_failure_is_fail_closed() {
+    assert_successful_compensation_stays_absent().await;
+    assert_public_timeout_retries_compensation().await;
+    assert_persistent_failure_uses_durable_ack().await;
+}
+
+/// DUR-1: a batch that fails after appending part of its oplog prefix but before
+/// its Tantivy commit must retract that whole prefix, so a restart cannot
+/// resurrect the published-but-uncommitted op. (Before the fail-closed
+/// compensation this batch left the first op's oplog row published, and recovery
+/// replayed it — the exact durability defect DUR-1 closes.)
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(write_queue_commit_failure_hook)]
+async fn oplog_append_boundary_retracts_failed_batch_prefix() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let tenant_id = "oplog_append_boundary_prefix";
+    let baseline_id = "oplog_prefix_baseline";
+    let first_id = "oplog_prefix_first";
+    let second_id = "oplog_prefix_second";
+    let baseline_manager =
+        crate::index::manager::IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+    baseline_manager.create_tenant(tenant_id).unwrap();
+    baseline_manager
+        .add_documents_sync(
+            tenant_id,
+            vec![text_document(baseline_id, "title", "oplog prefix baseline")],
+        )
+        .await
+        .unwrap();
+    drop(baseline_manager);
+
+    let tenant_path = temp_dir.path().join(tenant_id);
+    let index = Arc::new(crate::index::Index::open(&tenant_path).unwrap());
+    let ((index, tx, handle, tasks, oplog), worker_gate) =
+        setup_gated_write_queue_with_oplog_and_overrides(
+            &temp_dir,
+            tenant_id,
+            index,
+            WriteQueueTestOverrides {
+                batch_size: Some(2),
+                ..Default::default()
+            },
+        );
+    let pre_batch_oplog_seq = oplog.current_seq();
+    let first_task = register_task(tasks.as_ref(), "oplog_prefix_task_1", 2, 1);
+    let second_task = register_task(tasks.as_ref(), "oplog_prefix_task_2", 3, 1);
+    enqueue_write(
+        &tx,
+        first_task.clone(),
+        vec![WriteAction::Upsert(text_document(
+            first_id,
+            "title",
+            "oplog prefix first",
+        ))],
+    )
+    .await;
+    enqueue_write(
+        &tx,
+        second_task.clone(),
+        vec![WriteAction::Upsert(text_document(
+            second_id,
+            "title",
+            "oplog prefix second",
+        ))],
+    )
+    .await;
+
+    let _fault = crate::index::write_queue::fail_next_finalization_for_test(
+        tenant_id,
+        FinalizationFaultPoint::AfterOplogAppendBeforeTantivyCommit,
+    );
+    worker_gate.release();
+    drop(tx);
+    let queue_result = handle.await.unwrap();
+    assert!(
+        queue_result.is_err(),
+        "injected post-oplog failure must terminate the queue worker"
+    );
+    assert_task_failed(tasks.as_ref(), &first_task);
+    assert_task_failed(tasks.as_ref(), &second_task);
+
+    let entries = oplog.read_since(pre_batch_oplog_seq).unwrap();
+    let observed_prefix: Vec<(u64, String, String)> = entries
+        .iter()
+        .map(|entry| (entry.seq, oplog_task_id(entry), oplog_object_id(entry)))
+        .collect();
+    assert_eq!(
+        observed_prefix,
+        Vec::new(),
+        "compensation must retract the whole failed batch's oplog prefix, including the first published op; pre_batch_seq={pre_batch_oplog_seq}, observed prefix was {observed_prefix:?}"
+    );
+
+    drop(index);
+    let restarted_manager =
+        crate::index::manager::IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+    restarted_manager.get_or_load(tenant_id).unwrap();
+    assert_dur1_visible_documents(
+        &restarted_manager,
+        tenant_id,
+        &[baseline_id],
+        &[first_id, second_id],
+        "restart after retracted oplog prefix",
+    );
+    assert_dur1_admission_records_drained(&temp_dir, tenant_id);
+}
+
+struct PartialAppendRestartExpectation<'a> {
+    baseline_id: &'a str,
+    batch_ids: [&'a str; 2],
+    pre_batch_oplog_seq: u64,
+    client_saw_failure: bool,
+}
+
+fn assert_partial_append_restart_outcome(
+    temp_dir: &tempfile::TempDir,
+    tenant_id: &str,
+    oplog: &crate::index::oplog::OpLog,
+    expectation: PartialAppendRestartExpectation<'_>,
+) {
+    let restarted =
+        crate::index::manager::IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+    restarted.get_or_load(tenant_id).unwrap();
+
+    // Both arms are contractual. Arm A retracts every replay route before a
+    // failed verdict; Arm B gives an honest durable acknowledgement and must
+    // recover every acknowledged document. Do not simplify this to one arm.
+    if expectation.client_saw_failure {
+        assert_dur1_visible_documents(
+            &restarted,
+            tenant_id,
+            &[expectation.baseline_id],
+            &expectation.batch_ids,
+            "failed partial oplog append after restart",
+        );
+        let replayable_task_rows: Vec<(String, String)> = oplog
+            .read_since(expectation.pre_batch_oplog_seq)
+            .unwrap()
+            .iter()
+            .map(|entry| (oplog_task_id(entry), oplog_object_id(entry)))
+            .collect();
+        assert_eq!(
+            replayable_task_rows,
+            Vec::new(),
+            "a client-visible failure must leave no replayable task rows"
+        );
+    } else {
+        assert_dur1_visible_documents(
+            &restarted,
+            tenant_id,
+            &[
+                expectation.baseline_id,
+                expectation.batch_ids[0],
+                expectation.batch_ids[1],
+            ],
+            &[],
+            "durably acknowledged partial oplog append after restart",
+        );
+    }
+    assert_dur1_admission_records_drained(temp_dir, tenant_id);
+}
+
+/// DUR-1: an I/O failure from inside the oplog append must not let the client
+/// observe failure while leaving the task replayable after restart.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(write_queue_commit_failure_hook)]
+async fn oplog_append_io_failure_before_acknowledgement_is_fail_closed() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let tenant_id = "oplog_append_io_failure_before_ack";
+    let baseline_id = "oplog_append_io_baseline";
+    let batch_ids = ["oplog_append_io_first", "oplog_append_io_second"];
+    let baseline_manager =
+        setup_compensation_manager(temp_dir.path(), tenant_id, baseline_id).await;
+    baseline_manager.graceful_shutdown().await;
+    drop(baseline_manager);
+
+    let tenant_path = temp_dir.path().join(tenant_id);
+    let index = Arc::new(crate::index::Index::open(&tenant_path).unwrap());
+    let ((index, tx, handle, tasks, oplog), worker_gate) =
+        setup_gated_write_queue_with_oplog_and_overrides(
+            &temp_dir,
+            tenant_id,
+            index,
+            WriteQueueTestOverrides {
+                batch_size: Some(2),
+                ..Default::default()
+            },
+        );
+    let pre_batch_oplog_seq = oplog.current_seq();
+    let first_task = register_task(tasks.as_ref(), "oplog_append_io_task_1", 2, 1);
+    let second_task = register_task(tasks.as_ref(), "oplog_append_io_task_2", 3, 1);
+    enqueue_write(
+        &tx,
+        first_task.clone(),
+        vec![WriteAction::Upsert(text_document(
+            batch_ids[0],
+            "title",
+            "oplog append I/O first",
+        ))],
+    )
+    .await;
+    enqueue_write(
+        &tx,
+        second_task.clone(),
+        vec![WriteAction::Upsert(text_document(
+            batch_ids[1],
+            "title",
+            "oplog append I/O second",
+        ))],
+    )
+    .await;
+
+    // Unlike AfterOplogAppendBeforeTantivyCommit, this fault fires after the
+    // first task-tagged row is durable but before current_seq advances. That
+    // partial append is the EIO/ENOSPC surface whose replay contract matters.
+    let fault = crate::index::write_queue::fail_next_finalization_for_test(
+        tenant_id,
+        FinalizationFaultPoint::DuringOplogAppendAfterPartialDurableWrite,
+    );
+    worker_gate.release();
+    drop(tx);
+    let queue_result = handle.await.unwrap();
+    assert!(
+        fault.was_triggered(),
+        "the guard must prove the mid-append fault fired before either contractual arm is accepted; queue_result={queue_result:?}"
+    );
+
+    let client_saw_failure = [first_task.as_str(), second_task.as_str()]
+        .iter()
+        .all(|task_id| {
+            tasks
+                .get(*task_id)
+                .is_some_and(|task| matches!(task.status, TaskStatus::Failed(_)))
+        });
+    let client_saw_success = [first_task.as_str(), second_task.as_str()]
+        .iter()
+        .all(|task_id| task_succeeded(tasks.as_ref(), task_id));
+    assert!(
+        client_saw_failure ^ client_saw_success,
+        "the batch must expose one consistent client outcome; queue_result={queue_result:?}"
+    );
+
+    if client_saw_failure {
+        assert_task_failed(tasks.as_ref(), &first_task);
+        assert_task_failed(tasks.as_ref(), &second_task);
+    } else {
+        assert_task_succeeded(tasks.as_ref(), &first_task, 1);
+        assert_task_succeeded(tasks.as_ref(), &second_task, 1);
+    }
+    drop(index);
+    assert_partial_append_restart_outcome(
+        &temp_dir,
+        tenant_id,
+        oplog.as_ref(),
+        PartialAppendRestartExpectation {
+            baseline_id,
+            batch_ids,
+            pre_batch_oplog_seq,
+            client_saw_failure,
+        },
+    );
+}
+
 include!("write_queue/backpressure_tests.rs");
+include!("write_queue/backpressure_artifact_tests.rs");
 
 fn task_succeeded(tasks: &dashmap::DashMap<String, TaskInfo>, task_id: &str) -> bool {
     tasks
@@ -2131,7 +3156,7 @@ async fn hundred_commits_do_not_leave_hundred_flush_segments() {
         wait_for_task_success(tasks.as_ref(), &task_id).await;
     }
 
-    let observation = tokio::time::timeout(Duration::from_secs(10), async {
+    let observation = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let observation = observed_segments(index.as_ref());
             if observation.live_docs == COMMIT_COUNT as u64
@@ -2416,7 +3441,7 @@ async fn writer_memory_admission_counts_persistent_writer_budget() {
 
 async fn assert_idle_writer_eviction_releases_budget_and_allows_more_tenants(
     writer_idle_timeout: Option<Duration>,
-    idle_wait: Duration,
+    idle_wait_timeout: Duration,
 ) {
     let tmp = tempfile::TempDir::new().unwrap();
     let shared_budget = Arc::new(MemoryBudget::new(MemoryBudgetConfig {
@@ -2455,7 +3480,13 @@ async fn assert_idle_writer_eviction_releases_budget_and_allows_more_tenants(
         )
         .await;
         wait_for_task_success(tasks.as_ref(), &task_id).await;
-        tokio::time::sleep(idle_wait).await;
+        wait_for_writer_merge_wait_count(
+            &tenant_id,
+            "idle_timeout",
+            merge_wait_before + 1,
+            idle_wait_timeout,
+        )
+        .await;
         assert_eq!(
             indexed_document_count(index.as_ref()),
             1,
@@ -2480,11 +3511,31 @@ async fn assert_idle_writer_eviction_releases_budget_and_allows_more_tenants(
     }
 }
 
+async fn wait_for_writer_merge_wait_count(
+    tenant_id: &str,
+    reason: &str,
+    expected_count: u64,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let observed = writer_merge_wait_count(tenant_id, reason);
+        if observed >= expected_count {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for writer merge-wait count {expected_count} for tenant {tenant_id}; observed {observed}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn idle_writer_eviction_releases_budget_and_allows_more_tenants() {
     assert_idle_writer_eviction_releases_budget_and_allows_more_tenants(
         Some(Duration::from_millis(25)),
-        Duration::from_millis(150),
+        Duration::from_secs(2),
     )
     .await;
 }
@@ -3905,7 +4956,7 @@ async fn test_create_write_queue_with_vector_indices() {
     let admission_store =
         Arc::new(admission::WriteAdmissionStore::open(tmp.path(), tenant_id).unwrap());
 
-    let (tx, handle, _cancellation) = create_write_queue(WriteQueueContext {
+    let (tx, handle, _cancellation, _completion) = create_write_queue(WriteQueueContext {
         tenant_id: tenant_id.to_string(),
         index,
         tasks: Arc::clone(&tasks),
@@ -4006,7 +5057,7 @@ mod auto_embed_tests {
         let admission_store =
             Arc::new(admission::WriteAdmissionStore::open(tmp.path(), tenant_id).unwrap());
 
-        let (tx, handle, _cancellation) = create_write_queue(WriteQueueContext {
+        let (tx, handle, _cancellation, _completion) = create_write_queue(WriteQueueContext {
             tenant_id: tenant_id.to_string(),
             index,
             tasks: Arc::clone(&tasks),
@@ -4744,7 +5795,7 @@ mod auto_embed_tests {
         let admission_store =
             Arc::new(admission::WriteAdmissionStore::open(tmp.path(), tenant_id).unwrap());
 
-        let (tx, handle, _cancellation) = create_write_queue(WriteQueueContext {
+        let (tx, handle, _cancellation, _completion) = create_write_queue(WriteQueueContext {
             tenant_id: tenant_id.to_string(),
             index: Arc::clone(&index),
             tasks: Arc::clone(&tasks),

@@ -195,6 +195,9 @@ pub const DOCUMENTED_INTERNAL_PATHS: [&str; 5] = [
         crate::handlers::migration::bulk_replace::submit_bulk_replace_http,
         crate::handlers::migration::submit_privacy_scrub,
         crate::handlers::migration::list_algolia_indexes,
+        crate::handlers::migration::list_algolia_source_indexes_doc,
+        crate::handlers::migration::list_meilisearch_source_indexes_doc,
+        crate::handlers::migration::list_typesense_source_indexes_doc,
         // Stage 7: Usage
         crate::handlers::usage::usage_global,
         crate::handlers::usage::usage_per_index,
@@ -319,6 +322,7 @@ pub const DOCUMENTED_INTERNAL_PATHS: [&str; 5] = [
             flapjack::experiments::config::ExperimentConclusion,
             // Stage 7: Analytics
             crate::handlers::analytics::SeedRequest,
+            crate::handlers::analytics::ClearRequest,
             crate::handlers::analytics::AnalyticsDateCount,
             crate::handlers::analytics::AnalyticsTopSearchEntry,
             crate::handlers::analytics::AnalyticsTopSearchesResponse,
@@ -392,6 +396,11 @@ pub const DOCUMENTED_INTERNAL_PATHS: [&str; 5] = [
             crate::handlers::migration::ListAlgoliaIndexesRequest,
             crate::handlers::migration::AlgoliaIndexInfo,
             crate::handlers::migration::ListAlgoliaIndexesResponse,
+            crate::handlers::migration::ListMeilisearchIndexesRequest,
+            crate::handlers::migration::ListTypesenseIndexesRequest,
+            crate::handlers::migration::SourceIndexCreatedAt,
+            crate::handlers::migration::SourceIndexSummary,
+            crate::handlers::migration::ListSourceIndexesResponse,
             crate::handlers::migration::PrivacyScrubRequest,
             crate::handlers::migration::PrivacyScrubAck,
             // Stage 7: Chat

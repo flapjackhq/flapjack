@@ -316,6 +316,7 @@
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(flapjack_write_durable_timeout_env)]
     async fn durable_acks_survive_replace_index_contents_mutation_fence() {
         let (_temp_dir, manager, staging_baseline) = mutation_fence_fixture().await;
         let counters = MutationCounters::default();

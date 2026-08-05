@@ -116,7 +116,7 @@ pub struct ReplicationManager {
     bind_addr: String,
     advertise_addr: Option<String>,
     data_dir: PathBuf,
-    admin_key: Option<String>,
+    peer_credential: Option<String>,
     peers: RwLock<Vec<Arc<PeerClient>>>,
     /// Tracks delivery status for each configured peer and tenant
     /// Outer map: tenant_id -> inner map
@@ -146,7 +146,11 @@ impl ReplicationManager {
     /// # Returns
     ///
     /// An Arc-wrapped ReplicationManager ready for use in multi-threaded contexts.
-    pub fn new(node_config: NodeConfig, admin_key: Option<String>, data_dir: PathBuf) -> Arc<Self> {
+    pub fn new(
+        node_config: NodeConfig,
+        peer_credential: Option<String>,
+        data_dir: PathBuf,
+    ) -> Arc<Self> {
         let peers: Vec<Arc<PeerClient>> = node_config
             .peers
             .iter()
@@ -154,7 +158,7 @@ impl ReplicationManager {
                 Arc::new(PeerClient::new(
                     peer_config.node_id.clone(),
                     peer_config.addr.clone(),
-                    admin_key.clone(),
+                    peer_credential.clone(),
                 ))
             })
             .collect();
@@ -166,7 +170,7 @@ impl ReplicationManager {
             bind_addr: node_config.bind_addr,
             advertise_addr: node_config.advertise_addr,
             data_dir,
-            admin_key,
+            peer_credential,
             peers: RwLock::new(peers),
             peer_cursors: Arc::new(DashMap::new()),
             health_probe_handle: Mutex::new(None),
@@ -394,7 +398,7 @@ impl ReplicationManager {
         let peer = Arc::new(PeerClient::new(
             node_id.clone(),
             addr.clone(),
-            self.admin_key.clone(),
+            self.peer_credential.clone(),
         ));
         peers.push(peer);
         Ok(AddPeerReceipt {
@@ -448,7 +452,7 @@ impl ReplicationManager {
                 Arc::new(PeerClient::new(
                     peer.node_id.clone(),
                     peer.addr.clone(),
-                    self.admin_key.clone(),
+                    self.peer_credential.clone(),
                 ))
             })
             .collect();
@@ -1246,7 +1250,7 @@ impl ReplicationManager {
             Arc::new(PeerClient::new(
                 peer_config.node_id.clone(),
                 peer_config.addr.clone(),
-                self.admin_key.clone(),
+                self.peer_credential.clone(),
             ))
         });
         let health = peer.health_check().await;
@@ -1537,9 +1541,13 @@ mod tests {
         }
     }
 
-    fn new_test_manager(config: NodeConfig, admin_key: Option<String>) -> TestReplicationManager {
+    fn new_test_manager(
+        config: NodeConfig,
+        peer_credential: Option<String>,
+    ) -> TestReplicationManager {
         let data_dir = tempfile::tempdir().unwrap();
-        let manager = ReplicationManager::new(config, admin_key, data_dir.path().to_path_buf());
+        let manager =
+            ReplicationManager::new(config, peer_credential, data_dir.path().to_path_buf());
         TestReplicationManager {
             _data_dir: data_dir,
             manager,
@@ -1549,9 +1557,9 @@ mod tests {
     fn new_test_manager_in(
         data_dir: &Path,
         config: NodeConfig,
-        admin_key: Option<String>,
+        peer_credential: Option<String>,
     ) -> Arc<ReplicationManager> {
-        ReplicationManager::new(config, admin_key, data_dir.to_path_buf())
+        ReplicationManager::new(config, peer_credential, data_dir.to_path_buf())
     }
 
     fn write_node_config_fixture(data_dir: &Path, peers: Vec<PeerConfig>) {
@@ -3359,7 +3367,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutable_peer_runtime_added_peer_uses_retained_admin_key() {
+    async fn mutable_peer_runtime_added_peer_uses_retained_peer_credential() {
         let (peer_url, peer_handle) = spawn_replicate_peer(33, 1).await;
         let manager = new_test_manager(
             NodeConfig {
@@ -3386,7 +3394,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert!(
             requests[0].contains("x-algolia-api-key: replication-secret"),
-            "runtime-created peer should authenticate replication requests with the retained admin key; request was:\n{}",
+            "runtime-created peer should authenticate replication requests with the retained peer credential; request was:\n{}",
             requests[0]
         );
         wait_for_acked_seq(&manager, "tenant-red", "node-b", 33).await;

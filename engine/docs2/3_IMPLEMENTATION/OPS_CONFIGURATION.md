@@ -114,9 +114,9 @@ Operational bounds:
 
 ## `flapjack migrate`
 
-`flapjack migrate` copies an Algolia index into an existing Flapjack server. It
-is a pure authenticated HTTP client: it submits
-`POST /1/migrations/algolia`, polls the returned durable job to a terminal
+`flapjack migrate` copies an Algolia, Meilisearch, or Typesense index into an
+existing Flapjack server. It is a pure authenticated HTTP client: it submits
+`POST /1/migrations/{provider}`, polls the returned durable job to a terminal
 state, and never starts a server or binds a listener.
 
 Set the two credential environment variables in the calling environment, then
@@ -127,8 +127,9 @@ flapjack migrate \
   --endpoint http://127.0.0.1:7700 \
   --application-id acme-store \
   --api-key-env FLAPJACK_ADMIN_KEY \
-  --app-id ALGOLIAAPP123 \
-  --algolia-key-env ALGOLIA_ADMIN_KEY \
+  --source-provider meilisearch \
+  --source-endpoint https://tenant.meilisearch.io \
+  --source-key-env SOURCE_PROVIDER_ADMIN_KEY \
   --source-index products \
   --target-index products_v2 \
   --overwrite \
@@ -140,8 +141,8 @@ flapjack migrate \
 The bare `flapjack migrate` invocation is both submit and monitor: after
 admission it polls until the job succeeds, fails, is cancelled, or reaches the
 client timeout. There is no `status` subcommand. For out-of-band monitoring,
-send an authenticated `GET /1/migrations/algolia/{job_id}` request to the same
-Flapjack server.
+send an authenticated `GET /1/migrations/{provider}/{job_id}` request to the
+same Flapjack server, using the provider selected when the job was submitted.
 
 Cancellation is cooperative. A successful cancel request prints the
 server-returned status:
@@ -151,6 +152,7 @@ flapjack migrate \
   --endpoint http://127.0.0.1:7700 \
   --application-id acme-store \
   --api-key-env FLAPJACK_ADMIN_KEY \
+  --source-provider meilisearch \
   cancel --job-id 01890f8e-8b28-78e8-b542-8cfdcb2d4f24
 ```
 
@@ -161,6 +163,7 @@ flapjack migrate \
   --endpoint http://127.0.0.1:7700 \
   --application-id acme-store \
   --api-key-env FLAPJACK_ADMIN_KEY \
+  --source-provider meilisearch \
   ack --job-id 01890f8e-8b28-78e8-b542-8cfdcb2d4f24
 ```
 
@@ -172,19 +175,21 @@ and ack through exactly one of `--api-key-env`, `--api-key-file`, or
 command-line arguments can be visible to other users of the host.
 
 For any non-loopback Flapjack endpoint, use `https://`. The CLI rejects
-cleartext remote `http://` endpoints so the Flapjack owner key and Algolia
-source key are not sent without TLS. Plain HTTP is accepted only for
+cleartext remote `http://` endpoints so the Flapjack owner key and source
+provider key are not sent without TLS. Plain HTTP is accepted only for
 `localhost` and loopback IPs such as `127.0.0.1` during local development.
 
-Submission also requires the Algolia source key through exactly one of
-`--algolia-key-env`, `--algolia-key-file`, or `--algolia-key-stdin`. These
-Algolia-key flags are submit-only. The CLI rejects all submit-only flags on
-`cancel` and `ack`, and rejects a submit that combines `--api-key-stdin` with
-`--algolia-key-stdin` because both would consume the same stream.
+Submission also requires the source-provider key through exactly one of
+`--source-key-env`, `--source-key-file`, or `--source-key-stdin`. The shipped
+`--algolia-key-env`, `--algolia-key-file`, and `--algolia-key-stdin` names are
+aliases for those canonical flags. Source-key flags are submit-only. The CLI
+rejects all submit-only flags on `cancel` and `ack`, and rejects a submit that
+combines `--api-key-stdin` with `--source-key-stdin` (including its Algolia
+alias) because both would consume the same stream.
 
-The Algolia Admin API key is the simple supported choice; keep it confidential.
-For a least-privilege source key, match the permissions to the requests the
-importer actually issues:
+For Algolia specifically, the Admin API key is the simple supported choice;
+keep it confidential. For a least-privilege Algolia source key, match the
+permissions to the requests the importer actually issues:
 
 | Importer request | When issued | Required Algolia ACL |
 |---|---|---|
@@ -209,7 +214,7 @@ The similarly named ID flags belong to different systems:
 | Flag | Identity | Where it is sent | Validation/default |
 |---|---|---|---|
 | `--application-id` | Flapjack tenant and job owner namespace | `x-algolia-application-id` request header | Defaults to `flapjack` |
-| `--app-id` | Source Algolia application | `appId` submission body field | Required; ASCII letters and digits only |
+| `--app-id` | Source Algolia application | `appId` submission body field | Algolia submissions only; required and restricted to ASCII letters and digits |
 
 Job ownership combines the Flapjack application ID with a SHA-256 digest of the
 submitting Flapjack key. Use the same `--application-id` and the same Flapjack
@@ -265,6 +270,12 @@ start; the CLI exposes no resume flag.
 
 Operational bounds:
 
+- `--source-provider <algolia|meilisearch|typesense>` selects the route and
+  payload shape and defaults to `algolia`. An Algolia submission requires
+  `--app-id` and rejects `--source-endpoint`; a Meilisearch submission requires
+  `--source-endpoint` and sends it as `endpoint`; a Typesense submission
+  requires `--source-endpoint` and sends it as `node`. Meilisearch and
+  Typesense reject `--app-id`.
 - `--endpoint` is required and must be an absolute HTTP or HTTPS URL. Remote
   endpoints must use HTTPS; plain HTTP is accepted only for `localhost` and
   loopback IPs. `--poll-interval` accepts a positive whole duration with an
@@ -294,9 +305,25 @@ Operational bounds:
 | `FLAPJACK_REQUEST_TIMEOUT_SECS` | Positive integer seconds | `300` | Bounds admitted request execution. Unset, empty, invalid, or non-positive values fall back to `300`. The clock starts only after global concurrency admission, so queue wait is not bounded. |
 | `FLAPJACK_MAX_CONCURRENT_REQUESTS` | Positive integer request count | `1024` | Sets one global admitted-request cap shared across routes. Unset, empty, invalid, or non-positive values fall back to `1024`; excess requests queue in `poll_ready` rather than being shed. |
 | `FLAPJACK_GEOIP_DB` | Filesystem path | `${FLAPJACK_DATA_DIR}/GeoLite2-City.mmdb` | Path to GeoIP database file for IP geolocation. |
+| `--ssl-cert-path` / `FLAPJACK_SSL_CERT_PATH` | Filesystem path to PEM certificate chain | unset | Optional in-binary TLS certificate chain. Must be configured together with `--ssl-key-path` / `FLAPJACK_SSL_KEY_PATH`; when both are unset the server binds plaintext HTTP. The file is loaded once at startup, so replacing it requires a server restart. Unreadable, empty, malformed, or key-mismatched material fails startup before serving. |
+| `--ssl-key-path` / `FLAPJACK_SSL_KEY_PATH` | Filesystem path to PEM private key | unset | Optional in-binary TLS private key matching the configured certificate chain. Must be configured together with `--ssl-cert-path` / `FLAPJACK_SSL_CERT_PATH`; when both are set the startup banner reports `https`. The key file may contain one supported PEM private key and is loaded only at startup. |
 | `FLAPJACK_SSL_EMAIL` | Email address | unset | Contact email for ACME/Let's Encrypt SSL automation. |
 | `FLAPJACK_PUBLIC_IP` | IPv4/IPv6 address | unset | Public IP used for IP-based ACME certificate issuance. |
+| `FLAPJACK_SSL_DOMAIN` | DNS name | unset | Domain used for DNS-based ACME issuance when `FLAPJACK_PUBLIC_IP` is unset. Values are trimmed and validated during configuration loading. |
 | `FLAPJACK_ACME_DIRECTORY` | HTTPS URL | `https://acme-v02.api.letsencrypt.org/directory` | ACME directory endpoint. |
+| `FLAPJACK_ACME_MATERIAL_DIR` | Filesystem path | `${FLAPJACK_DATA_DIR}/ssl/acme` | Directory where ACME automation publishes the currently visible `fullchain.pem` and owner-private `privkey.pem` pair. The service also requires write access to its parent directory, where owner-scoped atomic generations are staged and retained; configure both paths on the same filesystem. Platforms without Unix-style atomic symlink replacement support first publication but reject replacement of existing material before mutation. |
+| `FLAPJACK_ACME_ROOT_CA_PEM` | Filesystem path to PEM CA certificate | unset | Optional ACME trust-anchor override, read during SSL manager initialization. Missing or unreadable PEM fails initialization before account creation. |
+
+Production recommendation: keep terminating TLS at a reverse proxy or load
+balancer unless you have a specific reason to run the optional static-file
+in-binary listener. ACME automation configured by `FLAPJACK_SSL_EMAIL`,
+`FLAPJACK_PUBLIC_IP` or `FLAPJACK_SSL_DOMAIN`, and `FLAPJACK_ACME_DIRECTORY`
+publishes `fullchain.pem` plus owner-private `privkey.pem` under
+`FLAPJACK_ACME_MATERIAL_DIR`. The static in-binary TLS listener loads material
+once at startup, so replacing the ACME-published pair still requires a server
+restart until served rotation is wired separately. Any ACME-backed in-binary
+design must keep HTTP-01 reachable over plaintext port 80 while the HTTPS
+listener serves TLS.
 
 ## Auth
 
@@ -328,6 +355,7 @@ Operational bounds:
 | `FLAPJACK_SNAPSHOT_INTERVAL` | Integer seconds | `0` | Scheduled S3 snapshot interval; `0` disables. |
 | `FLAPJACK_SNAPSHOT_RETENTION` | Integer count | `24` | Number of snapshots retained per index/tenant. |
 | `FLAPJACK_OPLOG_RETENTION` | Integer operation count | `1000` | Retention window for committed oplog entries. |
+| `FLAPJACK_SNAPSHOT_KEY_FILE` | Filesystem path to a file containing exactly 64 hex characters or 32 raw bytes, with at most one trailing newline | unset (plaintext snapshot bytes) | Enables optional AES-256-GCM-SIV encryption of portable snapshot bytes (envelope `FJSNAPE1`). **Every node that produces, consumes, replicates, or auto-restores snapshot bytes — including S3 auto-restore — must use the same key file**, or an encrypted producer feeding an unkeyed consumer fails with an error naming this env var. On Unix, any group/other permission bit (`mode & 0o077 != 0`) emits a warning; Flapjack does not `chmod` the file, because read-only secret mounts are valid. |
 
 ## Replication
 
@@ -337,6 +365,9 @@ Operational bounds:
 | `FLAPJACK_ADVERTISE_ADDR` | HTTP(S) origin | unset | Address this node publishes to peers. A fresh seed node with an advertised address starts replication even when its peer list is empty. |
 | `FLAPJACK_PEERS` | Comma-separated `id=addr` pairs | empty | Static full membership for mesh replication. Use this when the complete peer set is known at startup; it takes precedence over bootstrap join. |
 | `FLAPJACK_BOOTSTRAP_PEER` | HTTP(S) origin | unset | Single running member used by a fresh node to join an HA cluster when no static peer list is configured. |
+| `FLAPJACK_REPLICATION_API_KEY` | Non-empty string | unset | Outbound peer credential for configured replication. Trimmed whitespace-only values are treated as unset; the value is never auto-generated, is not stored in `KeyStore`, and is never returned by `/1/keys`. Startup validation is owned by `engine/flapjack-http/src/startup.rs::validate_replication_peer_credential`; transport validation is owned by `engine/flapjack-replication/src/config.rs::NodeConfig::validate_peer_transport`. See [Replication peer credential](#replication-peer-credential). |
+| `FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS` | `1` only | unset / off | Temporary rolling-upgrade escape hatch. When unset or set to anything except `1`, any configured replication intent without `FLAPJACK_REPLICATION_API_KEY` fails startup. Owned by `engine/flapjack-http/src/startup.rs::validate_replication_peer_credential`. |
+| `FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS` | `1` only | unset / off | Temporary cleartext transport escape hatch. When unset or set to anything except `1`, `http://` peer origins are refused whenever an outbound credential could be attached. Server startup fails instead of dropping a rejected static, persisted, or bootstrap peer and serving with reduced topology. This includes caller-supplied API keys forwarded by analytics queries even when server authentication is disabled, plus the admin credential used for bootstrap membership. Owned by `engine/flapjack-replication/src/config.rs::NodeConfig::{load_for_server_startup,validate_peer_transport,validate_credentialed_peer_transport}` and `engine/flapjack-http/src/analytics_cluster.rs::validate_authenticated_query_peer_transport`, including static peers, persisted `node.json`, bootstrap peers, and runtime `POST /internal/cluster/peers`. |
 | `FLAPJACK_STARTUP_CATCHUP_TIMEOUT_SECS` | Integer seconds | `30` | Startup catch-up timeout before serving. |
 | `FLAPJACK_SYNC_INTERVAL_SECS` | Integer seconds | `60` | Periodic replication catch-up interval. |
 | `FLAPJACK_AUTOHEAL_ENABLED` | `true` or `false` | `false` | Enables quorum-preserving auto-heal eviction from the replication health-probe loop after three consecutive unreachable observations. Values are trimmed and matched ASCII-case-insensitively; invalid values warn and behave as `false`. See [Dead-node auto-heal](./OPERATIONS.md#scenario-dead-node-auto-heal). |
@@ -358,6 +389,95 @@ admin-only `/internal/cluster/peers` mutation, fetches cluster status, persists
 the learned membership to `node.json`, and fails startup rather than serving as
 a silent single-node fallback when auth, registration, status, or
 advertised-origin resolution fails.
+
+### Replication peer credential
+
+Configured replication now requires an outbound peer identity by default. The
+configured topology sources are `node.json`, `FLAPJACK_PEERS`,
+`FLAPJACK_BOOTSTRAP_PEER`, `FLAPJACK_ADVERTISE_ADDR`, and runtime
+`POST /internal/cluster/peers`; they must not be treated as unchanged when
+`FLAPJACK_REPLICATION_API_KEY` is absent. Startup refuses static, persisted,
+bootstrap, and advertised-address replication intent unless the peer key is set
+or `FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS=1` is present for a
+temporary rolling upgrade.
+
+The startup refusal text is:
+
+```text
+replication is configured (<intent>) but FLAPJACK_REPLICATION_API_KEY is unset; set FLAPJACK_REPLICATION_API_KEY so this node presents a peer identity on outbound replication and analytics rollup traffic, or set FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS=1 to start unauthenticated
+```
+
+When the peer credential is set, startup trims it and rejects values that
+cannot be encoded as an HTTP header. Outbound replication and analytics rollup
+fan-out use the accepted value with
+`x-algolia-application-id: flapjack-replication`.
+`engine/flapjack-http/src/analytics_cluster.rs::AnalyticsClusterClient::query_peers`
+forwards inbound credentials, while
+`engine/flapjack-http/src/analytics_cluster.rs::AnalyticsClusterClient::push_rollup_to_peers`
+uses the configured outbound peer credential for background rollup pushes.
+
+Credentialed `http://` peer origins are refused by default because the
+credential would be sent in plaintext. A rejected startup peer fails
+configuration loading; it is never silently removed in a way that lets the
+node serve standalone or as an empty seed. Analytics query fan-out forwards any
+caller-supplied API key even when server authentication is disabled, so every
+`http://` peer origin is refused if the dedicated peer credential is disabled.
+Bootstrap join also uses the admin API key for its admin-only membership mutation, so an
+`http://` bootstrap origin is refused when auth is enabled, even if
+`FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS=1` disables the dedicated
+peer credential. Re-permitting either path requires the separate, explicit
+`FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1` override. This policy is shared by static
+`FLAPJACK_PEERS`, persisted `node.json` peers, `FLAPJACK_BOOTSTRAP_PEER`, and
+runtime `POST /internal/cluster/peers`.
+
+The cleartext refusal text is:
+
+```text
+Refusing replication peer <node_id> at <addr>: FLAPJACK_REPLICATION_API_KEY is set and the peer origin is cleartext http://, which would send the peer credential in plaintext. Move the peer to https://, or set FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1 to keep the cleartext peer.
+```
+
+`https://` peer origins were already supported before this lane:
+`engine/flapjack-replication/src/config.rs::NodeConfig::normalize_peer_addr`
+accepts HTTP(S) origins, config tests construct
+`https://peer-a.example.com:7700`, and the replication crate builds `reqwest`
+with `rustls-tls`. This lane changes default refusal of credentialed
+cleartext, not TLS feature availability.
+
+The peer-allowed internal route set is owned by
+`engine/flapjack-http/src/auth/route_acl.rs::required_acl_for_route`: `GET
+/internal/status`, `GET /internal/cluster/status`, `GET
+/internal/snapshots/capability`, `GET /internal/ops`, `GET /internal/tenants`,
+`GET /internal/snapshot/:tenant_id`, `POST /internal/replicate`, and `POST
+/internal/analytics-rollup`. Everything else under `/internal/` is admin-only,
+including `POST /internal/cluster/peers`, `DELETE
+/internal/cluster/peers/:node_id`, `POST /internal/rotate-admin-key`, and any
+unmapped `/internal/*`.
+
+The admin key remains accepted on peer-allowed routes unconditionally, as owned
+by `engine/flapjack-http/src/auth/middleware.rs`. URL-query credentials are
+refused for both internal tiers.
+
+Rollout order:
+
+1. Generate a peer secret, set `FLAPJACK_REPLICATION_API_KEY` to the same value
+   on every node before or during the binary rollout, and keep
+   `FLAPJACK_ADMIN_KEY` configured.
+2. Prefer `https://` peer origins. Use
+   `FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS=1` or
+   `FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1` only as temporary, logged
+   compatibility overrides, then remove them after every node converges.
+3. Verify with `engine/tests/replication_peer_auth_http_probe.sh`.
+4. After every node is confirmed on the peer secret, remove both temporary
+   overrides. Outbound replication never substitutes `FLAPJACK_ADMIN_KEY` for
+   a missing peer key; the unauthenticated override therefore sends no identity
+   until `FLAPJACK_REPLICATION_API_KEY` is configured.
+
+Scope boundaries: the public `/1/keys` ACL vocabulary is unchanged and
+Algolia-compatible, with no `"replication"` ACL. Bootstrap join via
+`FLAPJACK_BOOTSTRAP_PEER` remains admin-only, runtime add/remove membership and
+admin-key rotation remain admin-only, and the peer credential cannot join a
+cluster or authorize `POST /internal/cluster/peers`, `DELETE
+/internal/cluster/peers/:node_id`, or `POST /internal/rotate-admin-key`.
 
 Runtime membership is restart-durable through the existing `node.json` owner.
 `ReplicationManager::{add_peer,remove_peer,replace_peers}` persist membership

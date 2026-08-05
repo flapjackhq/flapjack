@@ -9,6 +9,7 @@ pub(crate) mod admission;
 #[cfg(test)]
 mod admission_tests;
 pub(crate) mod backpressure;
+mod compensation;
 mod finalization;
 pub(crate) mod segment_observation;
 mod vectors;
@@ -16,11 +17,21 @@ mod writer_lifecycle;
 
 #[cfg(any(debug_assertions, test))]
 pub use backpressure::force_backpressure_pause_for_test;
+pub(crate) use compensation::{compensate_uncommitted_tasks, DurableReplayState};
+#[cfg(test)]
+pub(crate) use compensation::{
+    compensation_fault_attempts_remaining_for_test, fail_compensation_attempts_for_test,
+    fail_next_compensation_for_test, set_compensation_before_oplog_retraction_hook_for_test,
+};
 pub(crate) use finalization::PERSISTED_VECTORS_DIR;
 #[cfg(any(test, feature = "fault-injection"))]
 pub(crate) use finalization::{
-    fail_next_commit_for_test, fail_next_finalization_for_test, FinalizationFaultPoint,
+    fail_next_commit_for_test, fail_next_finalization_for_test, inject_finalization_fault,
+    FinalizationFaultPoint,
 };
+#[cfg(test)]
+pub(crate) use writer_lifecycle::set_writer_close_hook_for_test;
+pub(crate) use writer_lifecycle::WriteTaskHandle;
 #[cfg(any(debug_assertions, test))]
 pub use writer_lifecycle::{
     clear_writer_lifecycle_test_events, record_writer_lifecycle_publication_checkpoint,
@@ -38,7 +49,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout_at;
@@ -799,6 +810,101 @@ impl WriteQueueCancellation {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct WriteQueueWorkerCompletion {
+    inner: Arc<WriteQueueWorkerCompletionInner>,
+}
+
+struct WriteQueueWorkerCompletionInner {
+    result: Mutex<Option<crate::error::Result<()>>>,
+    ready: Condvar,
+}
+
+struct WriteQueueWorkerCompletionReporter {
+    completion: WriteQueueWorkerCompletion,
+    tenant_id: String,
+    reported: bool,
+}
+
+impl WriteQueueWorkerCompletion {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(WriteQueueWorkerCompletionInner {
+                result: Mutex::new(None),
+                ready: Condvar::new(),
+            }),
+        }
+    }
+
+    fn complete(&self, result: crate::error::Result<()>) {
+        *self
+            .inner
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
+        self.inner.ready.notify_all();
+    }
+
+    fn reporter(&self, tenant_id: String) -> WriteQueueWorkerCompletionReporter {
+        WriteQueueWorkerCompletionReporter {
+            completion: self.clone(),
+            tenant_id,
+            reported: false,
+        }
+    }
+
+    pub(crate) fn wait_timeout(&self, timeout: Duration) -> Option<crate::error::Result<()>> {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self
+            .inner
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if let Some(result) = guard.clone() {
+                return Some(result);
+            }
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            let (next_guard, wait) = self
+                .inner
+                .ready
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard = next_guard;
+            if wait.timed_out() && guard.is_none() {
+                return None;
+            }
+        }
+    }
+}
+
+impl WriteQueueWorkerCompletionReporter {
+    fn report(mut self, result: crate::error::Result<()>) {
+        self.completion.complete(result);
+        self.reported = true;
+    }
+}
+
+impl Drop for WriteQueueWorkerCompletionReporter {
+    fn drop(&mut self) {
+        if !self.reported {
+            self.completion.complete(write_queue_worker_stopped_result(
+                &self.tenant_id,
+                "worker thread unwound",
+            ));
+        }
+    }
+}
+
+fn write_queue_worker_stopped_result(
+    tenant_id: &str,
+    detail: impl std::fmt::Display,
+) -> crate::error::Result<()> {
+    Err(crate::error::FlapjackError::Tantivy(format!(
+        "write queue worker for {tenant_id} stopped before reporting completion: {detail}"
+    )))
+}
+
 type PreparedWriteDocument = (String, serde_json::Value, tantivy::TantivyDocument);
 
 struct PreparedWriteOperation {
@@ -815,6 +921,13 @@ struct PreparedWriteOperation {
     doc_vectors: Vec<Option<std::collections::HashMap<String, Vec<f32>>>>,
     #[cfg(feature = "vector-search")]
     vectors_modified: bool,
+}
+
+struct PreparedWriteBatch {
+    operations: Vec<PreparedWriteOperation>,
+    added_count: usize,
+    deleted_count: usize,
+    rejected_count: usize,
 }
 
 impl PreparedWriteOperation {
@@ -913,15 +1026,16 @@ struct WriteFinalizationContext<'a> {
 ///
 /// # Returns
 ///
-/// A `(WriteQueue, JoinHandle, WriteQueueCancellation)` tuple: the channel sender
-/// for submitting `WriteOp`s, the worker completion handle, and the cancellation
-/// signal stored by the canonical `WriteTaskHandle`.
+/// A `(WriteQueue, JoinHandle, WriteQueueCancellation, WriteQueueWorkerCompletion)` tuple: the
+/// channel sender for submitting `WriteOp`s, the async worker completion handle, the cancellation
+/// signal, and a blocking worker completion signal.
 pub(crate) fn create_write_queue(
     mut ctx: WriteQueueContext,
 ) -> crate::error::Result<(
     WriteQueue,
     tokio::task::JoinHandle<crate::error::Result<()>>,
     WriteQueueCancellation,
+    WriteQueueWorkerCompletion,
 )> {
     let (tx, rx) = mpsc::channel(write_queue_channel_capacity());
     let (cancellation, cancellation_rx) = write_queue_cancellation_channel();
@@ -953,7 +1067,7 @@ pub(crate) fn create_write_queue(
     }
     run_replay_startup(&ctx, replay_records, &cancellation)?;
 
-    let handle = spawn_dedicated_write_worker(
+    let (handle, completion) = spawn_dedicated_write_worker(
         ctx,
         rx,
         cancellation.clone(),
@@ -961,7 +1075,7 @@ pub(crate) fn create_write_queue(
         tenant_metrics,
     )?;
 
-    Ok((tx, handle, cancellation))
+    Ok((tx, handle, cancellation, completion))
 }
 
 fn write_queue_cancellation_channel() -> (WriteQueueCancellation, watch::Receiver<bool>) {
@@ -975,12 +1089,19 @@ fn spawn_dedicated_write_worker(
     cancellation: WriteQueueCancellation,
     cancellation_rx: watch::Receiver<bool>,
     tenant_metrics: writer_lifecycle::WriteQueueTenantMetrics,
-) -> crate::error::Result<tokio::task::JoinHandle<crate::error::Result<()>>> {
+) -> crate::error::Result<(
+    tokio::task::JoinHandle<crate::error::Result<()>>,
+    WriteQueueWorkerCompletion,
+)> {
     let tenant_id = ctx.tenant_id.clone();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let completion = WriteQueueWorkerCompletion::new();
+    let thread_completion = completion.clone();
+    let completion_tenant_id = tenant_id.clone();
     std::thread::Builder::new()
         .name(format!("flapjack-write-{tenant_id}"))
         .spawn(move || {
+            let completion_reporter = thread_completion.reporter(completion_tenant_id);
             let result = run_dedicated_write_worker_runtime(
                 ctx,
                 rx,
@@ -988,6 +1109,7 @@ fn spawn_dedicated_write_worker(
                 cancellation_rx,
                 tenant_metrics,
             );
+            completion_reporter.report(result.clone());
             let _ = result_tx.send(result);
         })
         .map_err(|error| {
@@ -996,13 +1118,13 @@ fn spawn_dedicated_write_worker(
             ))
         })?;
 
-    Ok(tokio::spawn(async move {
-        result_rx.await.map_err(|error| {
-            crate::error::FlapjackError::Tantivy(format!(
-                "write queue worker for {tenant_id} stopped before reporting completion: {error}"
-            ))
-        })?
-    }))
+    let handle = tokio::spawn(async move {
+        match result_rx.await {
+            Ok(result) => result,
+            Err(error) => write_queue_worker_stopped_result(&tenant_id, error),
+        }
+    });
+    Ok((handle, completion))
 }
 
 fn run_dedicated_write_worker_runtime(
@@ -1653,6 +1775,30 @@ fn process_doc_vectors(
 /// # Errors
 ///
 /// Returns an error if the Tantivy commit fails or panics. Embedding failures are logged but do not block the Tantivy commit.
+/// Certify a batch as failed only after retracting its durable side effects.
+///
+/// Runs [`compensation::compensate_failed_commit_batch`] first. On success the
+/// tasks are marked terminal `Failed` and `error` is returned. On compensation
+/// failure the tasks are left non-terminal and the compensation error is
+/// returned instead, so the worker exits and recovery replays the still-durable
+/// state rather than the client seeing a `Failed` verdict a restart could
+/// contradict. Only pre-commit failures use this path; a post-commit failure
+/// leaves durable Tantivy state that must survive, so it marks failed directly.
+fn fail_batch_with_compensation(
+    context: &WriteFinalizationContext<'_>,
+    pre_batch_oplog_seq: Option<u64>,
+    batch_task_ids: &[String],
+    error: crate::error::FlapjackError,
+) -> crate::error::FlapjackError {
+    if let Err(compensation_error) =
+        compensation::compensate_failed_commit_batch(context, pre_batch_oplog_seq, batch_task_ids)
+    {
+        return compensation_error;
+    }
+    finalization::mark_tasks_failed(context.tasks, batch_task_ids, &error);
+    error
+}
+
 #[allow(unused_mut, unused_variables)]
 async fn commit_batch(
     ctx: &WriteQueueContext,
@@ -1691,34 +1837,23 @@ async fn commit_batch(
         embedder_configs: &embedder_configs,
     };
 
-    let mut prepared_ops = Vec::with_capacity(ops.len());
-    let mut added_count = 0usize;
-    let mut deleted_count = 0usize;
-    let mut rejected_count = 0usize;
+    // The oplog sequence floor bounds this batch's task-tagged rows. Synchronous
+    // metadata may interleave above the same floor, so compensation selects by
+    // task id and preserves unrelated rows (see fail_batch_with_compensation).
+    let pre_batch_oplog_seq = finalization_context.oplog.map(|oplog| oplog.current_seq());
 
-    for op in ops.drain(..) {
-        // PL-10 saturation fix: stage every queued op into the same Tantivy
-        // writer and commit once per queue flush. The previous loop committed
-        // once per op, which turned a queue batch into many tiny disk commits.
-        let prepared =
-            match stage_write_op_for_commit(&finalization_context, settings.as_ref(), writer, op)
-                .await
-            {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    finalization::mark_tasks_failed(
-                        finalization_context.tasks,
-                        &batch_task_ids,
-                        &error,
-                    );
-                    return Err(error);
-                }
-            };
-        added_count += prepared.valid_docs.len();
-        deleted_count += prepared.deleted_ids.len();
-        rejected_count += prepared.rejected.len();
-        prepared_ops.push(prepared);
-    }
+    let prepared_batch =
+        match stage_batch_for_commit(&finalization_context, settings.as_ref(), writer, ops).await {
+            Ok(prepared_batch) => prepared_batch,
+            Err(error) => {
+                return Err(fail_batch_with_compensation(
+                    &finalization_context,
+                    pre_batch_oplog_seq,
+                    &batch_task_ids,
+                    error,
+                ));
+            }
+        };
 
     #[cfg(any(debug_assertions, test))]
     if let Some(delay) = write_queue_test_commit_delay(ctx.tenant_id.as_str()) {
@@ -1731,49 +1866,94 @@ async fn commit_batch(
     let build_secs = match finalization::commit_writer_with_panic_guard(
         writer,
         ctx.tenant_id.as_str(),
-        added_count,
-        deleted_count,
-        rejected_count,
+        prepared_batch.added_count,
+        prepared_batch.deleted_count,
+        prepared_batch.rejected_count,
     ) {
         Ok(build_secs) => build_secs,
         Err(error) => {
-            finalization::mark_tasks_failed(finalization_context.tasks, &batch_task_ids, &error);
-            return Err(error);
+            // The Tantivy commit failed after the batch appended to the oplog.
+            // Retract the orphaned oplog/admission state so recovery cannot
+            // resurrect writes the client is about to be told failed (DUR-1).
+            return Err(fail_batch_with_compensation(
+                &finalization_context,
+                pre_batch_oplog_seq,
+                &batch_task_ids,
+                error,
+            ));
         }
     };
+    publish_committed_batch(
+        &finalization_context,
+        &prepared_batch.operations,
+        build_secs,
+        &batch_task_ids,
+    )?;
+
+    observe_write_queue_phase(PHASE_COMMIT_BATCH, phase_start);
+    Ok(())
+}
+
+async fn stage_batch_for_commit(
+    context: &WriteFinalizationContext<'_>,
+    settings: Option<&crate::index::settings::IndexSettings>,
+    writer: &mut crate::index::ManagedIndexWriter,
+    ops: &mut Vec<WriteOp>,
+) -> crate::error::Result<PreparedWriteBatch> {
+    let mut operations = Vec::with_capacity(ops.len());
+    let mut added_count = 0;
+    let mut deleted_count = 0;
+    let mut rejected_count = 0;
+
+    for op in ops.drain(..) {
+        // Stage every queued operation into one writer so a queue flush pays
+        // Tantivy's fixed commit cost only once.
+        let prepared = stage_write_op_for_commit(context, settings, writer, op).await?;
+        added_count += prepared.valid_docs.len();
+        deleted_count += prepared.deleted_ids.len();
+        rejected_count += prepared.rejected.len();
+        operations.push(prepared);
+    }
+
+    Ok(PreparedWriteBatch {
+        operations,
+        added_count,
+        deleted_count,
+        rejected_count,
+    })
+}
+
+fn publish_committed_batch(
+    context: &WriteFinalizationContext<'_>,
+    prepared_ops: &[PreparedWriteOperation],
+    build_secs: u64,
+    batch_task_ids: &[String],
+) -> crate::error::Result<()> {
     #[cfg(any(test, feature = "fault-injection"))]
     if let Err(error) = finalization::inject_finalization_fault(
-        ctx.tenant_id.as_str(),
+        context.tenant_id,
         finalization::FinalizationFaultPoint::AfterTantivyCommitBeforeVersionReceipts,
     ) {
-        finalization::mark_tasks_failed(finalization_context.tasks, &batch_task_ids, &error);
+        finalization::mark_tasks_failed(context.tasks, batch_task_ids, &error);
         return Err(error);
     }
-    if let Err(error) =
-        finalization::finalize_committed_batch(&finalization_context, &prepared_ops, build_secs)
-    {
-        finalization::mark_tasks_failed(finalization_context.tasks, &batch_task_ids, &error);
+    if let Err(error) = finalization::finalize_committed_batch(context, prepared_ops, build_secs) {
+        finalization::mark_tasks_failed(context.tasks, batch_task_ids, &error);
         return Err(error);
     }
-    if let Err(error) = finalization_context.admission_store.remove_tasks(
+    if let Err(error) = context.admission_store.remove_tasks(
         prepared_ops
             .iter()
             .map(|prepared| prepared.task_id.as_str()),
     ) {
-        finalization::mark_tasks_failed(finalization_context.tasks, &batch_task_ids, &error);
+        finalization::mark_tasks_failed(context.tasks, batch_task_ids, &error);
         return Err(error);
     }
-    finalization::forget_finalized_tasks(
-        finalization_context.base_path,
-        finalization_context.tenant_id,
-        &prepared_ops,
-    );
-    for prepared in &prepared_ops {
-        record_delete_term_observation(finalization_context.tasks, prepared);
-        finalization::mark_task_succeeded(finalization_context.tasks, prepared);
+    finalization::forget_finalized_tasks(context.base_path, context.tenant_id, prepared_ops);
+    for prepared in prepared_ops {
+        record_delete_term_observation(context.tasks, prepared);
+        finalization::mark_task_succeeded(context.tasks, prepared);
     }
-
-    observe_write_queue_phase(PHASE_COMMIT_BATCH, phase_start);
     Ok(())
 }
 

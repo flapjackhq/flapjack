@@ -12,6 +12,9 @@ BASE_URL=""; MASTER_KEY=""
 TASK_POLL_LIMIT=120
 SECRET_VALUES=()
 RESTRICTED_KEY=""
+LIVE_HEALTH_STATUS=""
+LIVE_HEALTH_BODY='null'
+PREVIEW_PROBE_RECEIPT='null'
 EXPECTED_WARNING_IDENTIFIERS='["meili_primary_key_ambiguous_candidates","meili_document_order_not_contractual","meili_search_pagination_bound_not_document_export_bound","meili_setting_value_normalized","meili_trailing_slash_redirect_unknown"]'
 EXPECTED_RESTRICTED_KEY_ACTION_PROBES='[{"action":"indexes.get","method":"GET","path":"/indexes?limit=10"},{"action":"documents.get","method":"POST","path":"/indexes/configured_pk/documents/fetch","body":{"offset":0,"limit":1}},{"action":"settings.get","method":"GET","path":"/indexes/configured_pk/settings"},{"action":"tasks.get","method":"GET","path":"/tasks?limit=1"},{"action":"version","method":"GET","path":"/version"},{"action":"stats.get","method":"GET","path":"/stats"},{"action":"search","method":"POST","path":"/indexes/configured_pk/search","body":{"q":"rake"}},{"action":"dumps.create","method":"POST","path":"/dumps","body":{}},{"action":"snapshots.create","method":"POST","path":"/snapshots","body":{}}]'
 
@@ -665,6 +668,8 @@ wait_for_live_health() {
       record_trace "health_${attempt}" GET /health
       if [[ "$status" == 200 ]] \
         && jq -e '.status == "available"' <<<"$payload" >/dev/null; then
+        LIVE_HEALTH_STATUS="$status"
+        LIVE_HEALTH_BODY="$payload"
         return 0
       fi
     fi
@@ -752,7 +757,19 @@ validate_stub_cleanup() {
 }
 
 emit_receipt() {
-  local sorted_ids="$1"
+  local sorted_ids="$1" live_health
+  live_health='null'
+  if [[ "$MODE" != stub ]]; then
+    live_health="$(jq -cn \
+      --arg endpoint "$BASE_URL" \
+      --arg status "$LIVE_HEALTH_STATUS" \
+      --argjson body "$LIVE_HEALTH_BODY" \
+      '{
+        endpoint: $endpoint,
+        status: ($status | tonumber),
+        body: $body
+      }')"
+  fi
   jq -cn \
     --argjson ids "$sorted_ids" \
     --argjson poll_limit "$TASK_POLL_LIMIT" \
@@ -760,6 +777,9 @@ emit_receipt() {
     --arg temp_dir "$(jq -r '.cleanup.tempDir' "$EXPECTED")" \
     --arg export_method "$(jq -r '.pagination.documentExportMethod' "$EXPECTED")" \
     --arg export_path "$(jq -r '.pagination.documentExportPath' "$EXPECTED")" \
+    --arg mode "$MODE" \
+    --argjson live_health "$live_health" \
+    --argjson preview_probe "$PREVIEW_PROBE_RECEIPT" \
     '{
       result:"PASS",
       sortedStableIds:$ids,
@@ -767,7 +787,9 @@ emit_receipt() {
       documentExport:{method:$export_method,path:$export_path},
       taskPolling:{bounded:true,limit:$poll_limit},
       cleanup:{containerName:$container,tempDir:$temp_dir}
-    }'
+    }
+    + (if $live_health == null then {} else {liveHealth:$live_health} end)
+    + (if $mode == "preview_live" then {previewProbe:$preview_probe} else {} end)'
 }
 
 run_preview_probe() {
@@ -779,7 +801,8 @@ run_preview_probe() {
     || die "preview record count fixture must be positive"
 
   if output="$(
-    FJ_MEILISEARCH_PREVIEW_ENDPOINT="$BASE_URL" \
+    cd "$ENGINE_DIR" && FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK=1 \
+      FJ_MEILISEARCH_PREVIEW_ENDPOINT="$BASE_URL" \
       FJ_MEILISEARCH_PREVIEW_API_KEY="$MASTER_KEY" \
       FJ_MEILISEARCH_PREVIEW_EXPECTED_RECORDS="$expected_records" \
       timeout 600 cargo test -p flapjack-http -- \
@@ -799,6 +822,9 @@ run_preview_probe() {
     || die "preview probe did not execute exactly one passing test"
   grep -Fq '"previewProof":"PASS"' <<<"$output" \
     || die "preview probe PASS receipt is missing"
+  PREVIEW_PROBE_RECEIPT="$(grep -F '"previewProof":"PASS"' <<<"$output" | tail -n 1)"
+  jq -e . <<<"$PREVIEW_PROBE_RECEIPT" >/dev/null \
+    || die "preview probe PASS receipt is not valid JSON"
 }
 
 main() {

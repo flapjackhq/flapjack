@@ -27,6 +27,10 @@ import {
   waitForExperimentByName,
 } from '../../fixtures/api-helpers';
 import { PRODUCTS } from '../../fixtures/test-data';
+import {
+  seedRouteAuditExperiment,
+  type SeededRouteAuditExperiment,
+} from '../../fixtures/experiment-seed';
 
 const EXPERIMENT_INDEX = 'e2e-products';
 const EXPERIMENT_QUERY = 'apple';
@@ -302,7 +306,19 @@ function makeExperimentPayload(name: string) {
   };
 }
 
+async function cleanupConcludedExperiment(
+  request: Parameters<typeof getExperimentResults>[0],
+  experimentId: string,
+): Promise<void> {
+  const latestResults = await getExperimentResults(request, experimentId);
+  if (latestResults.status !== 'concluded') {
+    await stopExperiment(request, experimentId);
+  }
+  await deleteExperiment(request, experimentId);
+}
+
 test.describe.configure({ mode: 'serial' });
+
 test.beforeEach(async ({ request }) => {
   // Limit cleanup to this suite's own fixtures so browser-unmocked runs do not
   // delete unrelated experiments from the shared backend instance.
@@ -454,25 +470,31 @@ test.describe('Experiment Detail Page', () => {
     }
   });
 
-  test('detail page shows experiment name, status, index, and metric', async ({ page, request }) => {
-    const experiment = await createExperiment(
-      request,
-      makeExperimentPayload(`e2e-exp-detail-info-${Date.now()}`),
-    );
-    await startExperiment(request, experiment.id);
+  test.describe('seeded draft detail', () => {
+    let experiment: SeededRouteAuditExperiment;
 
-    try {
+    test.beforeAll(async ({ request }) => {
+      experiment = await seedRouteAuditExperiment(request);
+    });
+
+    test.afterAll(async ({ request }) => {
+      if (experiment) {
+        await deleteExperiment(request, experiment.id);
+      }
+    });
+
+    test('detail page shows experiment name, status, index, and metric', async ({ page }) => {
       await page.goto(`/experiments/${experiment.id}`);
 
       await expect(page.getByTestId('experiment-detail-name')).toHaveText(experiment.name, {
         timeout: 10_000,
       });
-      await expect(page.getByTestId('experiment-detail-status')).toContainText('running');
-      await expect(page.getByTestId('experiment-detail-index')).toHaveText(EXPERIMENT_INDEX);
-      await expect(page.getByTestId('experiment-detail-primary-metric')).toHaveText('CTR');
-    } finally {
-      await deleteExperiment(request, experiment.id);
-    }
+      await expect(page.getByTestId('experiment-detail-status')).toContainText(experiment.status);
+      await expect(page.getByTestId('experiment-detail-index')).toHaveText(experiment.indexName);
+      await expect(page.getByTestId('experiment-detail-primary-metric')).toHaveText(
+        experiment.primaryMetricLabel,
+      );
+    });
   });
 
   test('detail page shows progress bar for running experiment collecting data', async ({ page, request }) => {
@@ -695,11 +717,7 @@ test.describe('Experiment Detail Page', () => {
       await expect(page.getByTestId('conclusion-card')).toContainText(conclusionReason);
       await expect(page.getByTestId('declare-winner-button')).toHaveCount(0);
     } finally {
-      const latestResults = await getExperimentResults(request, experiment.id);
-      if (latestResults.status !== 'concluded') {
-        await stopExperiment(request, experiment.id);
-      }
-      await deleteExperiment(request, experiment.id);
+      await cleanupConcludedExperiment(request, experiment.id);
     }
   });
 });
