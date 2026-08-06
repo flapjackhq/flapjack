@@ -157,11 +157,11 @@ async fn process_export(
 
     let src = manager.base_path.join(&tenant_id);
     let dest = dest_path.clone();
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     let checkpoint_tenant_id = tenant_id.clone();
 
     let copy_result = tokio::task::spawn_blocking(move || {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "test-support"))]
         crate::index::write_queue::record_writer_lifecycle_publication_checkpoint(
             &checkpoint_tenant_id,
             "manager_export_publication",

@@ -17,3 +17,34 @@ ignore = [
     { id = "RUSTSEC-2026-0194", reason = "quadratic-runtime DoS in quick-xml; fix (>=0.41) unreachable behind rust-s3 0.37.2 (latest); S3-response parsing only" },
     { id = "RUSTSEC-2026-0195", reason = "NsReader memory-exhaustion DoS in quick-xml; fix (>=0.41) unreachable behind rust-s3 0.37.2 (latest); S3-response parsing only" },
 ]
+
+[licenses]
+# Gate dependency licenses so a GPL/AGPL crate cannot enter the tree unnoticed.
+# The engine ships under Elastic-2.0; a copyleft dependency that reaches beyond
+# file scope would conflict with that and with the ability to offer commercial
+# terms. Every entry below was observed in the resolved tree via
+# `cargo deny list`; add a license here only after confirming it is permissive
+# or file-scoped, never to silence a failure.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "Elastic-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    # File-scoped copyleft. Compatible with shipping under Elastic-2.0 as long
+    # as we link these crates unmodified: attohttpc, colored, htmlescape.
+    # Modifying an MPL file obliges us to publish that file. Do not vendor and
+    # patch them without recording it here.
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "zlib-acknowledgement",
+]

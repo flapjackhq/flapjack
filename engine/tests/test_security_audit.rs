@@ -1615,6 +1615,19 @@ fn a06_workspace_passes_cargo_audit_and_cargo_deny() {
         String::from_utf8_lossy(&deny_output.stdout),
         String::from_utf8_lossy(&deny_output.stderr)
     );
+
+    // The engine ships under Elastic-2.0, so a copyleft dependency reaching
+    // beyond file scope would conflict with the license and with offering
+    // commercial terms. Goes red when a dependency arrives under a license
+    // absent from the `[licenses] allow` list in engine/deny.toml, or when a
+    // workspace crate ships with no `license` field at all.
+    let license_output = a06_run_cargo_command(&engine_dir, &["deny", "check", "licenses"]);
+    assert!(
+        license_output.status.success(),
+        "workspace must pass `cargo deny check licenses`; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&license_output.stdout),
+        String::from_utf8_lossy(&license_output.stderr)
+    );
 }
 
 #[derive(Clone, Default)]

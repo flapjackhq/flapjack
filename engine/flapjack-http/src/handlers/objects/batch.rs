@@ -563,7 +563,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use tracing::instrument::WithSubscriber;
     use tracing::{Event, Subscriber};
     use tracing_subscriber::layer::{Context, SubscriberExt};
     use tracing_subscriber::{registry::LookupSpan, Layer};
@@ -630,6 +629,32 @@ mod tests {
     fn document(id: &str) -> Document {
         Document::from_json(&serde_json::json!({ "_id": id })).expect("valid test document")
     }
+
+    fn three_adds_request() -> AddDocumentsRequest {
+        AddDocumentsRequest::Batch {
+            requests: vec![
+                BatchOperation {
+                    action: "addObject".to_string(),
+                    index_name: None,
+                    body: Some(legacy_doc("one")),
+                    create_if_not_exists: None,
+                },
+                BatchOperation {
+                    action: "addObject".to_string(),
+                    index_name: None,
+                    body: Some(legacy_doc("two")),
+                    create_if_not_exists: None,
+                },
+                BatchOperation {
+                    action: "addObject".to_string(),
+                    index_name: None,
+                    body: Some(legacy_doc("three")),
+                    create_if_not_exists: None,
+                },
+            ],
+        }
+    }
+
     #[test]
     fn batch_operations_from_legacy_request_wraps_docs_as_add_object_actions() {
         let operations = batch_operations_from_request(AddDocumentsRequest::Legacy {
@@ -672,32 +697,14 @@ mod tests {
         let state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
         let captured = CapturedBatchEvents::default();
         let subscriber = tracing_subscriber::registry().with(captured.clone());
-        let request = AddDocumentsRequest::Batch {
-            requests: vec![
-                BatchOperation {
-                    action: "addObject".to_string(),
-                    index_name: None,
-                    body: Some(legacy_doc("one")),
-                    create_if_not_exists: None,
-                },
-                BatchOperation {
-                    action: "addObject".to_string(),
-                    index_name: None,
-                    body: Some(legacy_doc("two")),
-                    create_if_not_exists: None,
-                },
-                BatchOperation {
-                    action: "addObject".to_string(),
-                    index_name: None,
-                    body: Some(legacy_doc("three")),
-                    create_if_not_exists: None,
-                },
-            ],
-        };
+        let request = three_adds_request();
 
-        let result = add_documents_batch_impl(State(state), "log_contract".to_string(), request)
-            .with_subscriber(subscriber)
-            .await;
+        let result = {
+            let _default = tracing::subscriber::set_default(subscriber);
+            tracing::callsite::rebuild_interest_cache();
+            add_documents_batch_impl(State(state), "log_contract".to_string(), request).await
+        };
+        tracing::callsite::rebuild_interest_cache();
         assert!(result.is_ok(), "batch fixture must commit successfully");
 
         let events = captured.events();

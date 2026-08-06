@@ -810,7 +810,12 @@ async fn create_move_fixture(manager: &IndexManager, tenant: &str, marker: &str)
     let version = crate::index::version_store::VersionRecord::new(41, marker, false, 41);
     let version_store = crate::index::version_store::VersionStore::open(&path).unwrap();
     assert!(version_store.upsert("move-object", &version).unwrap());
-    manager.unload(&tenant.to_string()).unwrap();
+    drop(
+        manager
+            .quiesce_tenant(&tenant.to_string())
+            .await
+            .expect("quiescing the move fixture writer must succeed"),
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

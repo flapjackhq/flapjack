@@ -4,6 +4,7 @@ use super::source_test_support::{
 };
 use super::translation::{
     translate_settings_for_provider, warning_message, ReportCode, SettingsSourceProvider,
+    TranslationReportEntry,
 };
 use super::*;
 use serde_json::{json, Value};
@@ -47,6 +48,26 @@ fn string_array(value: &Value) -> Vec<String> {
                 .to_string()
         })
         .collect()
+}
+
+fn assert_provider_advisories(warnings: &[TranslationReportEntry]) {
+    assert_eq!(
+        warnings
+            .iter()
+            .map(|warning| (warning.code, warning.json_path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                ReportCode::MeilisearchDocumentOrderNotContractual,
+                "$.documents",
+            ),
+            (
+                ReportCode::MeilisearchSearchPaginationNotExportBound,
+                "$.pagination",
+            ),
+        ],
+        "provider-wide advisories must survive an unrelated setting rejection"
+    );
 }
 
 fn stable_ids(documents: &Value, primary_key: &str) -> Result<Vec<String>, String> {
@@ -620,8 +641,67 @@ fn meilisearch_prefix_search_and_cutoff_reject_out_of_contract_values() {
             failure.contains(expected_path),
             "failure {failure} must name {expected_path}"
         );
-        assert!(warnings.is_empty());
+        assert_provider_advisories(&warnings);
     }
+}
+
+#[test]
+fn meilisearch_hard_rejection_preserves_provider_advisory_warnings() {
+    let mut failures = Vec::new();
+    let mut warnings = Vec::new();
+
+    assert!(
+        translate_settings_for_provider(
+            &json!({"typoTolerance": {"disableOnNumbers": true}}),
+            SettingsSourceProvider::Meilisearch,
+            &mut failures,
+            &mut warnings,
+        )
+        .is_none(),
+        "disableOnNumbers=true must remain a hard rejection"
+    );
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].json_path, "$.typoTolerance.disableOnNumbers");
+    assert_provider_advisories(&warnings);
+}
+
+#[test]
+fn meilisearch_hard_rejection_preserves_known_unmigrated_setting_warnings() {
+    let mut failures = Vec::new();
+    let mut warnings = Vec::new();
+
+    assert!(
+        translate_settings_for_provider(
+            &json!({
+                "dictionary": ["flapjack"],
+                "embedders": {"default": {"source": "userProvided"}}
+            }),
+            SettingsSourceProvider::Meilisearch,
+            &mut failures,
+            &mut warnings,
+        )
+        .is_none(),
+        "an unrelated hard rejection must not discard already-known warnings"
+    );
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].json_path, "$.embedders");
+    assert_eq!(
+        warnings
+            .iter()
+            .map(|warning| (warning.code, warning.json_path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                ReportCode::MeilisearchDocumentOrderNotContractual,
+                "$.documents",
+            ),
+            (
+                ReportCode::MeilisearchSearchPaginationNotExportBound,
+                "$.pagination",
+            ),
+            (ReportCode::MeilisearchSettingNotMigrated, "$.dictionary"),
+        ]
+    );
 }
 
 #[test]
@@ -672,7 +752,49 @@ fn meilisearch_unmapped_and_malformed_settings_are_explicit() {
         let failure = format!("{:?}", failures[0]);
         assert!(failure.contains("MalformedSettingsPayload"));
         assert!(failure.contains(expected_path));
-        assert!(warnings.is_empty());
+        assert_provider_advisories(&warnings);
+    }
+}
+
+#[test]
+fn meilisearch_warning_only_settings_reject_malformed_values() {
+    for (payload, expected_path) in [
+        (json!({"dictionary": true}), "$.dictionary"),
+        (
+            json!({"nonSeparatorTokens": ["_",""]}),
+            "$.nonSeparatorTokens",
+        ),
+        (json!({"proximityPrecision": 5}), "$.proximityPrecision"),
+        (
+            json!({"proximityPrecision": "unsupported"}),
+            "$.proximityPrecision",
+        ),
+        (
+            json!({"sortableAttributes": {"price": "asc"}}),
+            "$.sortableAttributes",
+        ),
+        (json!({"stopWords": [true]}), "$.stopWords"),
+    ] {
+        let mut failures = Vec::new();
+        let mut warnings = Vec::new();
+        assert!(
+            translate_settings_for_provider(
+                &payload,
+                SettingsSourceProvider::Meilisearch,
+                &mut failures,
+                &mut warnings,
+            )
+            .is_none(),
+            "malformed warning-only field {expected_path} must fail closed"
+        );
+        assert_eq!(failures.len(), 1);
+        let failure = format!("{:?}", failures[0]);
+        assert!(failure.contains("MalformedSettingsPayload"));
+        assert!(
+            failure.contains(expected_path),
+            "failure {failure} must name {expected_path}"
+        );
+        assert_provider_advisories(&warnings);
     }
 }
 

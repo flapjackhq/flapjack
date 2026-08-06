@@ -8,8 +8,8 @@ Usage:
   package/release_artifact_manifest <target-triple> <binary-path> <output-dir>
 
 Creates the release archive, checksum sidecar, and build manifest for an already-built
-flapjack binary. The manifest build object is copied from the binary's own
-`build-info --json` output.
+flapjack binary. The manifest build object is copied from the binary's embedded
+build identity record, with native binaries cross-checked against `build-info --json`.
 EOF
 }
 
@@ -28,8 +28,11 @@ BINARY_PATH="$2"
 OUTPUT_DIR="$3"
 
 [ -n "$TARGET_TRIPLE" ] || die "target triple must not be empty"
+if ! [[ "$TARGET_TRIPLE" =~ ^[A-Za-z0-9_][A-Za-z0-9_.]*(-[A-Za-z0-9_][A-Za-z0-9_.]*)+$ ]]; then
+  die "target triple must be a hyphen-separated Rust target name using only ASCII letters, numbers, '_', and '.': $TARGET_TRIPLE"
+fi
 [ -f "$BINARY_PATH" ] || die "binary path does not exist: $BINARY_PATH"
-[ -x "$BINARY_PATH" ] || die "binary path is not executable: $BINARY_PATH"
+[ -r "$BINARY_PATH" ] || die "binary path is not readable: $BINARY_PATH"
 
 case "$TARGET_TRIPLE" in
   *-pc-windows-*|*-windows-*)
@@ -43,6 +46,10 @@ case "$TARGET_TRIPLE" in
 esac
 
 mkdir -p "$OUTPUT_DIR"
+ARCHIVE_PATH="$OUTPUT_DIR/$ARCHIVE_NAME"
+CHECKSUM_PATH="$ARCHIVE_PATH.sha256"
+MANIFEST_PATH="$OUTPUT_DIR/flapjack-${TARGET_TRIPLE}.manifest.json"
+rm -f "$ARCHIVE_PATH" "$CHECKSUM_PATH" "$MANIFEST_PATH"
 
 TMP_DIR="$(mktemp -d)"
 cleanup() {
@@ -55,13 +62,186 @@ BUILD_JSON="$TMP_DIR/build.json"
 mkdir -p "$STAGING_DIR"
 
 cp "$BINARY_PATH" "$STAGING_DIR/$PACKAGED_BINARY_NAME"
-"$STAGING_DIR/$PACKAGED_BINARY_NAME" build-info --json >"$BUILD_JSON"
 
-ARCHIVE_PATH="$OUTPUT_DIR/$ARCHIVE_NAME"
-CHECKSUM_PATH="$ARCHIVE_PATH.sha256"
-MANIFEST_PATH="$OUTPUT_DIR/flapjack-${TARGET_TRIPLE}.manifest.json"
+host_triple() {
+  rustc -vV | awk '/^host: / { print $2 }'
+}
 
-rm -f "$ARCHIVE_PATH" "$CHECKSUM_PATH" "$MANIFEST_PATH"
+is_host_executable_target() {
+  local host host_arch target_arch
+  host="$(host_triple)"
+  [ "$TARGET_TRIPLE" = "$host" ] && return 0
+
+  host_arch="${host%%-*}"
+  target_arch="${TARGET_TRIPLE%%-*}"
+  [ "$target_arch" = "$host_arch" ] || return 1
+
+  # Linux artifacts with the host architecture remain executable across the
+  # GNU/musl libc boundary because release musl artifacts are statically linked.
+  case "$host" in
+    *-linux-*) ;;
+    *) return 1 ;;
+  esac
+  case "$TARGET_TRIPLE" in
+    *-linux-musl*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+extract_embedded_build_json() {
+  local binary_path="$1"
+  local output_path="$2"
+  python3 - "$binary_path" "$output_path" <<'PY'
+import pathlib
+import sys
+
+binary_path = pathlib.Path(sys.argv[1])
+output_path = pathlib.Path(sys.argv[2])
+contents = binary_path.read_bytes()
+start_marker = b"FLAPJACK_BUILD_INFO_JSON_BEGIN\n"
+end_marker = b"\nFLAPJACK_BUILD_INFO_JSON_END\n"
+
+starts = []
+ends = []
+cursor = 0
+while True:
+    index = contents.find(start_marker, cursor)
+    if index < 0:
+        break
+    starts.append(index)
+    cursor = index + len(start_marker)
+
+cursor = 0
+while True:
+    index = contents.find(end_marker, cursor)
+    if index < 0:
+        break
+    ends.append(index)
+    cursor = index + len(end_marker)
+
+if len(starts) != 1:
+    raise SystemExit(
+        f"embedded build-info JSON begin marker must appear exactly once, found {len(starts)}"
+    )
+if len(ends) != 1:
+    raise SystemExit(
+        f"embedded build-info JSON end marker must appear exactly once, found {len(ends)}"
+    )
+
+json_start = starts[0] + len(start_marker)
+json_end = ends[0]
+if json_end < json_start:
+    raise SystemExit("embedded build-info JSON end marker precedes begin marker")
+
+output_path.write_bytes(contents[json_start:json_end] + b"\n")
+PY
+}
+
+validate_embedded_build_json() {
+  local build_json_path="$1"
+  python3 - "$build_json_path" <<'PY'
+import json
+import pathlib
+import sys
+
+EXPECTED_BUILD_KEYS = {
+    "schemaVersion", "version", "revision", "revisionKnown", "dirty",
+    "dirtyKnown", "workspaceDigest", "profile", "target", "features",
+    "capabilities",
+}
+EXPECTED_CAPABILITY_KEYS = {"vectorSearch", "vectorSearchLocal"}
+
+
+def reject_duplicate_keys(pairs):
+    value = {}
+    for key, member in pairs:
+        if key in value:
+            raise ValueError(f"embedded build-info JSON contains duplicate key: {key}")
+        value[key] = member
+    return value
+
+
+def is_lower_hex(value, length):
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def validate_build_info(build):
+    if not isinstance(build, dict) or set(build) != EXPECTED_BUILD_KEYS:
+        actual_keys = sorted(build) if isinstance(build, dict) else []
+        raise SystemExit(f"embedded build-info JSON keys mismatch: {actual_keys}")
+    if type(build["schemaVersion"]) is not int or build["schemaVersion"] != 1:
+        raise SystemExit("embedded build-info schemaVersion must be integer 1")
+    for field in ("version", "profile", "target"):
+        if not isinstance(build[field], str) or not build[field]:
+            raise SystemExit(f"embedded build-info {field} must be a non-empty string")
+    if type(build["revisionKnown"]) is not bool:
+        raise SystemExit("embedded build-info revisionKnown must be a boolean")
+    expected_revision_known = is_lower_hex(build["revision"], 40)
+    if build["revision"] is not None and not expected_revision_known:
+        raise SystemExit("embedded build-info revision must be null or 40 lowercase hex characters")
+    if build["revisionKnown"] != expected_revision_known:
+        raise SystemExit("embedded build-info revisionKnown does not match revision")
+    if type(build["dirtyKnown"]) is not bool:
+        raise SystemExit("embedded build-info dirtyKnown must be a boolean")
+    if build["dirty"] is not None and type(build["dirty"]) is not bool:
+        raise SystemExit("embedded build-info dirty must be null or a boolean")
+    if build["dirtyKnown"] != (type(build["dirty"]) is bool):
+        raise SystemExit("embedded build-info dirtyKnown does not match dirty")
+    if not is_lower_hex(build["workspaceDigest"], 64):
+        raise SystemExit("embedded build-info workspaceDigest must be 64 lowercase hex characters")
+    features = build["features"]
+    if not isinstance(features, list) or not all(isinstance(feature, str) for feature in features):
+        raise SystemExit("embedded build-info features must be an array of strings")
+    if features != sorted(set(features)):
+        raise SystemExit("embedded build-info features must be sorted and unique")
+    capabilities = build["capabilities"]
+    if not isinstance(capabilities, dict) or set(capabilities) != EXPECTED_CAPABILITY_KEYS:
+        raise SystemExit("embedded build-info capabilities keys mismatch")
+    if not all(type(capabilities[key]) is bool for key in EXPECTED_CAPABILITY_KEYS):
+        raise SystemExit("embedded build-info capabilities must be booleans")
+    vector_search_local = "vector-search-local" in features
+    vector_search = vector_search_local or "vector-search" in features
+    if capabilities != {"vectorSearch": vector_search, "vectorSearchLocal": vector_search_local}:
+        raise SystemExit("embedded build-info capabilities do not match features")
+
+
+record = pathlib.Path(sys.argv[1]).read_bytes()
+try:
+    build = json.loads(record.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+except UnicodeDecodeError as error:
+    raise SystemExit(f"embedded build-info JSON is not UTF-8: {error}") from error
+except (json.JSONDecodeError, ValueError) as error:
+    raise SystemExit(f"embedded build-info JSON is malformed: {error}") from error
+
+validate_build_info(build)
+PY
+}
+
+write_build_json() {
+  local binary_path="$1"
+  local output_path="$2"
+  local embedded_json="$TMP_DIR/embedded_build.json"
+  local executed_json="$TMP_DIR/executed_build.json"
+
+  extract_embedded_build_json "$binary_path" "$embedded_json"
+  validate_embedded_build_json "$embedded_json"
+  if is_host_executable_target; then
+    [ -x "$binary_path" ] || die "native binary path is not executable: $binary_path"
+    "$binary_path" build-info --json >"$executed_json"
+    if ! cmp -s "$embedded_json" "$executed_json"; then
+      die "executed build-info JSON does not match embedded build-info JSON"
+    fi
+  fi
+  cp "$embedded_json" "$output_path"
+}
+
+# The QEMU action in .github/workflows/release.yml belongs to Docker image
+# fallback; REL-11 release packaging must not host-execute foreign artifacts.
+write_build_json "$STAGING_DIR/$PACKAGED_BINARY_NAME" "$BUILD_JSON"
 
 case "$ARCHIVE_NAME" in
   *.zip)

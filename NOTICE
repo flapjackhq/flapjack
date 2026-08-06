@@ -1,0 +1,41 @@
+Flapjack
+Copyright (c) 2026 Stuart Robinson
+
+This repository is not licensed uniformly. The split is deliberate: the
+non-compete restriction lands on the server and never on code you embed in
+your own application.
+
+  Elastic License 2.0 -- see LICENSE
+    Everything in this repository except the paths listed below. This is the
+    Flapjack engine, HTTP server, replication, SSL, dashboard, and the
+    packaging around them.
+
+  MIT License -- see the LICENSE file in each directory
+    sdks/csharp/  sdks/dart/    sdks/go/      sdks/java/    sdks/javascript/
+    sdks/kotlin/  sdks/php/     sdks/python/  sdks/ruby/    sdks/scala/
+    sdks/swift/
+
+    These client libraries derive from Algolia's MIT-licensed API clients and
+    retain Algolia's copyright notice alongside Flapjack's. Do not replace or
+    remove those notices; the MIT license they arrive under requires them.
+
+  GPL-2.0-or-later -- see sdks/wordpress/composer.json
+    sdks/wordpress/ follows the WordPress plugin ecosystem convention.
+
+  MIT License -- declared in each package manifest
+    integrations/django/, integrations/laravel-scout/, integrations/rails/
+    These are not published to the public mirror yet. Their copyright
+    provenance has not been audited, so they carry no LICENSE file of their
+    own; audit before publishing.
+
+In plain terms: the client libraries carry no restriction at all, so an
+application that talks to Flapjack is never encumbered by the engine's
+license. The single thing the Elastic License 2.0 prohibits is providing
+Flapjack itself to third parties as a hosted or managed service. Running
+Flapjack for your own business, including inside a commercial product, is
+permitted. See the "License" section of README.md for the plain-English
+version and LICENSE for the controlling terms.
+
+Releases up to and including v1.0.10 (2026-06-09) were published under the MIT
+License and remain available under those terms. The Elastic License 2.0
+applies from the next release forward.

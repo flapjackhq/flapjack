@@ -1326,15 +1326,17 @@ async fn list_typesense_source_indexes(
 }
 
 /// Admit a Meilisearch discovery endpoint through the production vendor policy,
-/// falling back to the debug-only loopback seam for the live contract fixture.
-/// The production refusal is what the caller sees when neither path admits the
-/// endpoint, so an unrecognised host never leaks the loopback opt-in's existence.
+/// falling back to the loopback seam for the live contract fixture. The seam is
+/// reachable in the shipped profile only behind the existing
+/// `FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK=1` opt-in, matching the preview
+/// admission owner [`preview_meilisearch_client`]. The production refusal is
+/// what the caller sees when neither path admits the endpoint, so an
+/// unrecognised host never leaks the loopback opt-in's existence.
 fn meilisearch_discovery_client(
     endpoint: &str,
     api_key: &str,
 ) -> Result<meilisearch_client::MeilisearchClient, MigrateError> {
     let admitted = meilisearch_client::MeilisearchClient::new_discovery(endpoint, api_key);
-    #[cfg(debug_assertions)]
     let admitted = admitted.or_else(|vendor_refusal| {
         meilisearch_client::MeilisearchClient::new_discovery_preview_loopback(endpoint, api_key)
             .map_err(|_| vendor_refusal)
@@ -2221,13 +2223,63 @@ fn meilisearch_source_reader(
     admitted
 }
 
-/// Single owner of the debug-only Meilisearch loopback source reader. Preview
-/// uses it directly; submit reaches it only after production vendor admission
-/// refuses. In debug builds [`preview_meilisearch_client`] is the loopback
-/// constructor, and the opt-in plus literal-loopback checks live inside it, so
-/// it refuses before parsing an attacker-controlled endpoint.
+/// Single owner of the debug-only Meilisearch loopback source reader for
+/// submit, which reaches it only after production vendor admission refuses. The
+/// opt-in plus literal-loopback checks live inside
+/// `MeilisearchClient::new_preview_loopback`, so it refuses before parsing an
+/// attacker-controlled endpoint.
 #[cfg(debug_assertions)]
 fn meilisearch_loopback_source_reader(
+    payload: &MigrateFromMeilisearchRequest,
+) -> Result<
+    source_reader::MeilisearchSourceReader<meilisearch_client::MeilisearchClient>,
+    AlgoliaClientError,
+> {
+    let source = meilisearch_client::MeilisearchClient::new_preview_loopback(
+        &payload.endpoint,
+        &payload.api_key,
+        &payload.source_index,
+    )
+    .map_err(map_preview_meilisearch_error)?;
+    Ok(source_reader::MeilisearchSourceReader::from_source(
+        &payload.source_index,
+        source,
+    ))
+}
+
+/// Single owner of Meilisearch preview admission, shared by the preview
+/// settings override and the preview source reader. Production Meilisearch
+/// Cloud admission is the first branch in every profile; only the sanitized
+/// "endpoint is not allowed" refusal hands the same `payload.endpoint` to the
+/// literal-loopback fixture seam, which is reachable in the shipped profile
+/// only behind the existing `FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK=1` opt-in.
+/// Loopback classification lives inside the client constructor, so this seam
+/// never re-parses an endpoint. Preview reports the seam's own "loopback
+/// endpoint is disabled" refusal, which
+/// `preview_tests::meilisearch::meilisearch_preview_requires_explicit_loopback_opt_in`
+/// asserts. Submit must not adopt this shape — its refusal is the vendor one,
+/// so an unrecognised host never learns the opt-in exists.
+fn preview_meilisearch_client(
+    payload: &MigrateFromMeilisearchRequest,
+) -> Result<meilisearch_client::MeilisearchClient, AlgoliaClientError> {
+    let client = match meilisearch_client::MeilisearchClient::new(
+        &payload.endpoint,
+        &payload.api_key,
+        &payload.source_index,
+    ) {
+        Err(vendor_refusal) if vendor_refusal.is_endpoint_not_allowed() => {
+            meilisearch_client::MeilisearchClient::new_preview_loopback(
+                &payload.endpoint,
+                &payload.api_key,
+                &payload.source_index,
+            )
+        }
+        admitted => admitted,
+    };
+    client.map_err(map_preview_meilisearch_error)
+}
+
+fn preview_meilisearch_source_reader(
     payload: &MigrateFromMeilisearchRequest,
 ) -> Result<
     source_reader::MeilisearchSourceReader<meilisearch_client::MeilisearchClient>,
@@ -2238,52 +2290,6 @@ fn meilisearch_loopback_source_reader(
         &payload.source_index,
         source,
     ))
-}
-
-/// Client for the preview settings override and the loopback source reader.
-/// Debug builds bind the loopback constructor; release builds bind production
-/// vendor admission.
-fn preview_meilisearch_client(
-    payload: &MigrateFromMeilisearchRequest,
-) -> Result<meilisearch_client::MeilisearchClient, AlgoliaClientError> {
-    #[cfg(debug_assertions)]
-    let client = meilisearch_client::MeilisearchClient::new_preview_loopback(
-        &payload.endpoint,
-        &payload.api_key,
-        &payload.source_index,
-    );
-    #[cfg(not(debug_assertions))]
-    let client = meilisearch_client::MeilisearchClient::new(
-        &payload.endpoint,
-        &payload.api_key,
-        &payload.source_index,
-    );
-    client.map_err(map_preview_meilisearch_error)
-}
-
-/// Preview keeps its own loopback-only debug shape: it reports the seam's own
-/// "loopback endpoint is disabled" refusal rather than the vendor refusal, which
-/// `preview_tests::meilisearch_preview_requires_explicit_loopback_opt_in`
-/// asserts. Submit must not adopt this shape — it would refuse a real
-/// Meilisearch Cloud endpoint in debug builds.
-#[cfg(debug_assertions)]
-fn preview_meilisearch_source_reader(
-    payload: &MigrateFromMeilisearchRequest,
-) -> Result<
-    source_reader::MeilisearchSourceReader<meilisearch_client::MeilisearchClient>,
-    AlgoliaClientError,
-> {
-    meilisearch_loopback_source_reader(payload)
-}
-
-#[cfg(not(debug_assertions))]
-fn preview_meilisearch_source_reader(
-    payload: &MigrateFromMeilisearchRequest,
-) -> Result<
-    source_reader::MeilisearchSourceReader<meilisearch_client::MeilisearchClient>,
-    AlgoliaClientError,
-> {
-    meilisearch_source_reader(payload)
 }
 
 fn map_preview_meilisearch_error(

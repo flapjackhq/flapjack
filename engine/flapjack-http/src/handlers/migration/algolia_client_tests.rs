@@ -297,25 +297,18 @@ fn vetted_algolia_pin_map(app_id: &str) -> Vec<(String, Vec<SocketAddr>)> {
 /// Reasons the owner source does not bind its `resolve_to_addrs` pins to the
 /// vetted `socket_addrs()` output. Empty means the binding contract holds.
 ///
-/// This scanner is retained only as a known-answer fixture for common unsafe
-/// source shapes. Production pin equality is owned by the runtime observer on
-/// `pin_resolved_algolia_host`; source inference is not its oracle.
+/// This scanner is retained as a known-answer fixture for unsafe source shapes.
+/// Production pin equality is also owned by the runtime observer on
+/// `pin_resolved_algolia_host`.
 ///
 /// The scanner rejects the substitution shapes a real Stage 2 could plausibly
 /// reach: a literal address, a misleadingly named vector, a post-validation
-/// re-resolution, an opaque helper whose return value cannot be traced to
-/// `socket_addrs()`, and mutated vetted vectors. Direct mutation
+/// re-resolution, an opaque helper around `socket_addrs()`, and mutated vetted
+/// vectors. Direct mutation
 /// (`let mut pinned = target.socket_addrs(); pinned.push(loopback);`) is caught
 /// by the `mut`-binding rule in `pin_binding_failure`; interior mutation
-/// (`Mutex::new(target.socket_addrs()); lock().unwrap().push(loopback)`) is
-/// caught by the interior-mutability provenance rule.
-///
-/// One residual is inherent to source-text inference: a
-/// same-file helper that *receives* `target.socket_addrs()` as an argument and
-/// mutates it internally (`resolve_to_addrs(&t.host, &launder(t.socket_addrs()))`)
-/// still shows the `socket_addrs()` text in the pin chain with no visible local
-/// mutation. The canonical builder observer covers that whole class by recording
-/// the actual values passed to reqwest.
+/// is rejected because wrapping or extracting the vetted vector is not a
+/// transparent derivation shape.
 fn pin_derivation_failures(client_source: &str) -> Vec<String> {
     const PIN_CALL: &str = "resolve_to_addrs(";
     let mut failures = Vec::new();
@@ -398,7 +391,8 @@ fn pin_binding_failure(client_source: &str, arguments: &str) -> Option<String> {
     if matching_vetted_targets.is_empty() {
         return Some(format!(
             "does not bind its host argument {host_expression:?} and address argument \
-             {addresses_expression:?} to the same vetted target"
+             {addresses_expression:?} to the same vetted target through transparent field \
+             access; opaque helpers and interior-mutable extraction are not accepted"
         ));
     }
 
@@ -416,19 +410,6 @@ fn pin_binding_failure(client_source: &str, arguments: &str) -> Option<String> {
     {
         return Some(format!(
             "pins address vector `{mutated}`, which is declared `mut`; a mutable pin can \
-             diverge from the vetted `socket_addrs()` output before connect, so its addresses \
-             are not provably the ones validation approved"
-        ));
-    }
-
-    let interior_mutable = interior_mutable_binding_identifiers(client_source);
-    let address_references = expression_referenced_identifiers(addresses_expression, &bindings, 0);
-    if let Some(mutated) = address_references
-        .into_iter()
-        .find(|identifier| interior_mutable.contains(identifier))
-    {
-        return Some(format!(
-            "pins address vector through interior-mutable binding `{mutated}`; a lock guard can \
              diverge from the vetted `socket_addrs()` output before connect, so its addresses \
              are not provably the ones validation approved"
         ));
@@ -511,26 +492,6 @@ fn mutable_binding_identifiers(client_source: &str) -> Vec<String> {
     dedupe_targets(identifiers)
 }
 
-/// Identifiers bound to interior-mutable containers derived from
-/// `socket_addrs()`. These are mutable even when the binding is not `let mut`:
-/// `Mutex<Vec<_>>` can be changed through a lock guard and `RefCell<Vec<_>>`
-/// can be changed through `borrow_mut()`, then handed to `resolve_to_addrs`
-/// via a borrowed view. The scanner must not certify the original initializer
-/// as the vector reqwest actually receives.
-fn interior_mutable_binding_identifiers(client_source: &str) -> Vec<String> {
-    let mut identifiers = Vec::new();
-    for (identifier, initializer) in let_bindings(client_source) {
-        let initializer_uses_interior_mutability = initializer.contains("Mutex::new(")
-            || initializer.contains("RwLock::new(")
-            || initializer.contains("RefCell::new(");
-        let initializer_derives_from_socket_addrs = initializer.contains(".socket_addrs()");
-        if initializer_uses_interior_mutability && initializer_derives_from_socket_addrs {
-            identifiers.push(identifier);
-        }
-    }
-    dedupe_targets(identifiers)
-}
-
 /// Every identifier the expression depends on, transitively through `let`
 /// bindings. Feeding the address argument through this and intersecting with
 /// `mutable_binding_identifiers` catches a mutable pinned vector no matter where
@@ -559,35 +520,9 @@ fn expression_referenced_identifiers(
                 bindings,
                 depth + 1,
             ));
-            for mutable_owner in interior_mutable_guard_owners(initializer, bindings) {
-                identifiers.push(mutable_owner.clone());
-                identifiers.extend(expression_referenced_identifiers(
-                    &mutable_owner,
-                    bindings,
-                    depth + 1,
-                ));
-            }
         }
     }
     dedupe_targets(identifiers)
-}
-
-fn interior_mutable_guard_owners(expression: &str, bindings: &[(String, String)]) -> Vec<String> {
-    source_identifiers(expression)
-        .filter(|identifier| {
-            expression.contains(&format!("{identifier}.lock()"))
-                || expression.contains(&format!("{identifier}.read()"))
-                || expression.contains(&format!("{identifier}.write()"))
-                || expression.contains(&format!("{identifier}.borrow()"))
-                || expression.contains(&format!("{identifier}.borrow_mut()"))
-        })
-        .filter(|identifier| {
-            bindings
-                .iter()
-                .any(|(bound_identifier, _)| bound_identifier == identifier)
-        })
-        .map(str::to_string)
-        .collect()
 }
 
 fn expression_target_hosts(
@@ -595,20 +530,7 @@ fn expression_target_hosts(
     bindings: &[(String, String)],
     depth: usize,
 ) -> Vec<String> {
-    if depth > 8 {
-        return Vec::new();
-    }
-    let mut targets = direct_member_receivers(expression, ".host");
-    for identifier in source_identifiers(expression) {
-        if let Some((_, initializer)) = bindings
-            .iter()
-            .rev()
-            .find(|(bound_identifier, _)| bound_identifier == identifier)
-        {
-            targets.extend(expression_target_hosts(initializer, bindings, depth + 1));
-        }
-    }
-    dedupe_targets(targets)
+    expression_target_member(expression, bindings, depth, ".host")
 }
 
 fn expression_target_socket_addrs(
@@ -616,40 +538,61 @@ fn expression_target_socket_addrs(
     bindings: &[(String, String)],
     depth: usize,
 ) -> Vec<String> {
+    expression_target_member(expression, bindings, depth, ".socket_addrs()")
+}
+
+/// Trace only transparent member access, optionally through immutable `let`
+/// aliases. Any call or field chain around the value is an opaque transform and
+/// therefore cannot prove that reqwest receives the value vetting produced.
+fn expression_target_member(
+    expression: &str,
+    bindings: &[(String, String)],
+    depth: usize,
+    member: &str,
+) -> Vec<String> {
     if depth > 8 {
         return Vec::new();
     }
-    let mut targets = direct_member_receivers(expression, ".socket_addrs()");
-    for identifier in source_identifiers(expression) {
-        if let Some((_, initializer)) = bindings
-            .iter()
-            .rev()
-            .find(|(bound_identifier, _)| bound_identifier == identifier)
-        {
-            targets.extend(expression_target_socket_addrs(
-                initializer,
-                bindings,
-                depth + 1,
-            ));
-        }
+    if let Some(receiver) = exact_member_receiver(expression, member) {
+        return vec![receiver.to_string()];
     }
-    dedupe_targets(targets)
+    let Some(identifier) = transparent_identifier(expression) else {
+        return Vec::new();
+    };
+    let Some((_, initializer)) = bindings
+        .iter()
+        .rev()
+        .find(|(bound_identifier, _)| bound_identifier == identifier)
+    else {
+        return Vec::new();
+    };
+    expression_target_member(initializer, bindings, depth + 1, member)
 }
 
-fn direct_member_receivers(expression: &str, member: &str) -> Vec<String> {
-    let mut receivers = Vec::new();
-    let mut rest = expression;
-    while let Some(member_offset) = rest.find(member) {
-        let before_member = &rest[..member_offset];
-        if let Some(receiver) = before_member
-            .split(|character: char| !character.is_alphanumeric() && character != '_')
-            .rfind(|token| !token.is_empty())
-        {
-            receivers.push(receiver.to_string());
-        }
-        rest = &rest[member_offset + member.len()..];
+fn exact_member_receiver<'a>(expression: &'a str, member: &str) -> Option<&'a str> {
+    let receiver = transparent_expression(expression).strip_suffix(member)?;
+    (!receiver.is_empty()
+        && receiver
+            .chars()
+            .all(|character| character.is_alphanumeric() || character == '_'))
+    .then_some(receiver)
+}
+
+fn transparent_identifier(expression: &str) -> Option<&str> {
+    let expression = transparent_expression(expression);
+    (!expression.is_empty()
+        && expression
+            .chars()
+            .all(|character| character.is_alphanumeric() || character == '_'))
+    .then_some(expression)
+}
+
+fn transparent_expression(mut expression: &str) -> &str {
+    expression = expression.trim();
+    while let Some(unborrowed) = expression.strip_prefix('&') {
+        expression = unborrowed.trim_start();
     }
-    dedupe_targets(receivers)
+    expression.trim()
 }
 
 fn dedupe_targets(targets: Vec<String>) -> Vec<String> {
@@ -1099,7 +1042,7 @@ fn client_policy_limits_test_base_url_override_to_debug_builds() {
     let request = request_for_test("APP123", "products", AlgoliaMethod::Get, "settings")
         .expect("loopback test override should either apply in debug or be ignored in release");
 
-    if cfg!(debug_assertions) {
+    if cfg!(any(debug_assertions, test)) {
         assert_eq!(
             request.url,
             "http://127.0.0.1:18181/1/indexes/products/settings"
@@ -1426,6 +1369,27 @@ fn pin_derivation_scanner_accepts_vetted_addresses_and_rejects_substitutes() {
         pin_derivation_failures(interior_mutated_vetted)
     );
 
+    let rwlock_mutated_vetted = r#"
+        let target = flapjack::security::vet_outbound_url_target(url, false)?;
+        let pinned_addresses = std::sync::RwLock::new(target.socket_addrs());
+        pinned_addresses
+            .write()
+            .unwrap()
+            .push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443));
+        let locked_addresses = pinned_addresses.read().unwrap();
+        builder = builder.resolve_to_addrs(&target.host, &locked_addresses);
+    "#;
+    assert_eq!(
+        pin_derivation_failures(rwlock_mutated_vetted).len(),
+        1,
+        "mutating vetted addresses through an immutable RwLock binding must be reported"
+    );
+    assert!(
+        pin_derivation_failures(rwlock_mutated_vetted)[0].contains("interior-mutable"),
+        "{:?}",
+        pin_derivation_failures(rwlock_mutated_vetted)
+    );
+
     let refcell_mutated_vetted = r#"
         let target = flapjack::security::vet_outbound_url_target(url, false)?;
         let pinned_addresses = std::cell::RefCell::new(target.socket_addrs());
@@ -1485,6 +1449,21 @@ fn pin_derivation_scanner_accepts_vetted_addresses_and_rejects_substitutes() {
         pin_derivation_failures("let client = reqwest::Client::builder().build();").len(),
         2,
         "a client with no pin and no vet must be reported for both"
+    );
+
+    let laundered_vetted = r#"
+        fn launder(mut addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
+            addresses.clear();
+            addresses.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443));
+            addresses
+        }
+        let target = flapjack::security::vet_outbound_url_target(url, false)?;
+        builder = builder.resolve_to_addrs(&target.host, &launder(target.socket_addrs()));
+    "#;
+    assert_eq!(
+        pin_derivation_failures(laundered_vetted).len(),
+        1,
+        "a helper can mutate or substitute the vector between vetting and pinning"
     );
 }
 

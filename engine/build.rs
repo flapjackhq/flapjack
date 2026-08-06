@@ -2,7 +2,8 @@
 mod build_info;
 
 use build_info::{
-    collect_vcs_inputs, discover_vcs, vcs_invalidation_paths, workspace_digest,
+    build_info_from_inputs, canonical_build_info_json, collect_vcs_inputs, discover_vcs,
+    enabled_core_features_from_env, vcs_invalidation_paths, workspace_digest, RawBuildInputs,
     WORKSPACE_DIGEST_FILES, WORKSPACE_DIGEST_RUST_DIRS,
 };
 use std::env;
@@ -15,6 +16,7 @@ const DIRTY_INPUT_ENV: &str = "FLAPJACK_INTERNAL_BUILD_DIRTY";
 const DIGEST_INPUT_ENV: &str = "FLAPJACK_INTERNAL_WORKSPACE_DIGEST";
 const PROFILE_INPUT_ENV: &str = "FLAPJACK_INTERNAL_BUILD_PROFILE";
 const TARGET_INPUT_ENV: &str = "FLAPJACK_INTERNAL_BUILD_TARGET";
+const BUILD_INFO_JSON_ENV: &str = "FLAPJACK_INTERNAL_BUILD_INFO_JSON";
 
 fn main() {
     let workspace_root = env::var("CARGO_MANIFEST_DIR")
@@ -47,6 +49,21 @@ fn main() {
     emit_raw_input(DIGEST_INPUT_ENV, &digest);
     emit_raw_input(PROFILE_INPUT_ENV, &profile);
     emit_raw_input(TARGET_INPUT_ENV, &target);
+    emit_raw_input(
+        BUILD_INFO_JSON_ENV,
+        &canonical_build_info_json(&build_info_from_inputs(
+            &required_build_input("CARGO_PKG_VERSION"),
+            RawBuildInputs {
+                revision: vcs.revision,
+                dirty: vcs.dirty,
+                workspace_digest: digest,
+                profile,
+                target,
+            },
+            enabled_core_features_from_env(|env_name| env::var_os(env_name).is_some()),
+        ))
+        .unwrap_or_else(|error| panic!("failed to serialize build-info JSON: {error}")),
+    );
 }
 
 fn emit_invalidation_policy(workspace_root: &Path) {

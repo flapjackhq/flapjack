@@ -18,7 +18,7 @@ use once_cell::sync::Lazy;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-#[cfg(any(debug_assertions, test))]
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 static NEXT_QUEUE_METRICS_ID: AtomicU64 = AtomicU64::new(1);
 static LIVE_QUEUE_METRICS: Lazy<DashMap<String, BTreeSet<u64>>> = Lazy::new(DashMap::new);
 const DROP_WRITE_QUEUE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(any(debug_assertions, test))]
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
 static WRITER_LIFECYCLE_TEST_LOG: Lazy<Mutex<WriterLifecycleTestLog>> =
     Lazy::new(|| Mutex::new(WriterLifecycleTestLog::default()));
 #[cfg(test)]
@@ -205,12 +205,12 @@ fn run_writer_close_hook_for_test(tenant_id: &str) {
 #[cfg(not(test))]
 fn run_writer_close_hook_for_test(_tenant_id: &str) {}
 
-#[cfg(any(debug_assertions, test))]
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
 const WRITER_LIFECYCLE_TEST_EVENT_LIMIT: usize = 4096;
-#[cfg(any(debug_assertions, test))]
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
 const WRITER_LIFECYCLE_TEST_TENANT_LIMIT: usize = 4096;
 
-#[cfg(any(debug_assertions, test))]
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WriterLifecycleTestEvent {
     pub tenant_id: String,
@@ -219,7 +219,7 @@ pub struct WriterLifecycleTestEvent {
     pub sequence: u64,
 }
 
-#[cfg(any(debug_assertions, test))]
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
 #[derive(Default)]
 struct WriterLifecycleTestLog {
     events_by_tenant: BTreeMap<String, Vec<WriterLifecycleTestEvent>>,
@@ -227,7 +227,7 @@ struct WriterLifecycleTestLog {
     tenant_order: VecDeque<String>,
 }
 
-#[cfg(any(debug_assertions, test))]
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
 impl WriterLifecycleTestLog {
     fn clear(&mut self) {
         self.events_by_tenant.clear();
@@ -661,7 +661,7 @@ fn close_writer_after_merge_quiescence(
     Ok(())
 }
 
-#[cfg(any(debug_assertions, test))]
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
 fn record_writer_lifecycle_test_event(tenant_id: &str, reason: &str, phase: &'static str) {
     WRITER_LIFECYCLE_TEST_LOG
         .lock()
@@ -669,15 +669,15 @@ fn record_writer_lifecycle_test_event(tenant_id: &str, reason: &str, phase: &'st
         .push(tenant_id, reason, phase);
 }
 
-#[cfg(not(any(debug_assertions, test)))]
+#[cfg(not(any(debug_assertions, test, feature = "test-support")))]
 fn record_writer_lifecycle_test_event(_tenant_id: &str, _reason: &str, _phase: &'static str) {}
 
-#[cfg(any(debug_assertions, test))]
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
 pub fn record_writer_lifecycle_publication_checkpoint(tenant_id: &str, phase: &'static str) {
     record_writer_lifecycle_test_event(tenant_id, "publication", phase);
 }
 
-#[cfg(any(debug_assertions, test))]
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
 pub fn clear_writer_lifecycle_test_events() {
     WRITER_LIFECYCLE_TEST_LOG
         .lock()
@@ -685,7 +685,7 @@ pub fn clear_writer_lifecycle_test_events() {
         .clear();
 }
 
-#[cfg(any(debug_assertions, test))]
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
 pub fn writer_lifecycle_test_events(tenant_id: &str) -> Vec<WriterLifecycleTestEvent> {
     WRITER_LIFECYCLE_TEST_LOG
         .lock()

@@ -124,6 +124,10 @@ describe('playwright.config startup contracts', () => {
     const config = await loadPlaywrightConfig('')
 
     expect(Object.keys(config.webServer?.env ?? {}).sort()).toEqual([
+      'PLAYWRIGHT_BACKEND_DATA_DIR',
+      'PLAYWRIGHT_BACKEND_HOST',
+      'PLAYWRIGHT_BACKEND_PORT',
+      'PLAYWRIGHT_BACKEND_URL',
       'PLAYWRIGHT_WEBSERVER_HOST',
       'PLAYWRIGHT_WEBSERVER_PORT',
       'PLAYWRIGHT_WEBSERVER_REUSE',
@@ -132,6 +136,24 @@ describe('playwright.config startup contracts', () => {
     // PATH is present in every real process environment, so its absence proves the
     // ambient spread is gone rather than merely that these four keys are present.
     expect(config.webServer?.env).not.toHaveProperty('PATH')
+  })
+
+  it('declares the backend launch target so the webserver owns the vector-enabled backend', async () => {
+    // Before this contract, `webServer` started only Vite and every e2e run silently
+    // depended on an operator having pre-started a backend by hand. A text-only
+    // backend then made the four vector specs skip through skipWhenVectorSearchDisabled
+    // and the suite still reported green. The backend target has to travel with the
+    // Playwright startup contract for those specs to be able to run at all.
+    const config = await loadPlaywrightConfig('')
+
+    expect(config.webServer?.env).toMatchObject({
+      PLAYWRIGHT_BACKEND_HOST: mockInstance.host,
+      PLAYWRIGHT_BACKEND_PORT: String(mockInstance.backendPort),
+      PLAYWRIGHT_BACKEND_URL: mockInstance.backendBaseUrl,
+      // Pinned to the same directory tests/fixtures/local-instance.ts resolves, so
+      // filesystem-backed fixtures read the data dir the backend actually writes.
+      PLAYWRIGHT_BACKEND_DATA_DIR: mockInstance.backendDataDir,
+    })
   })
 
   it('redacts the JSON report after Playwright writes it', async () => {

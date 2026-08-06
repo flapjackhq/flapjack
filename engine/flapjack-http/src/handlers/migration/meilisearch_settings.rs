@@ -3,17 +3,6 @@ use super::translation_report::{
 };
 use serde_json::{Map, Value};
 
-const UNMIGRATED_SETTINGS: [&str; 8] = [
-    "dictionary",
-    "facetSearch",
-    "nonSeparatorTokens",
-    "prefixSearch",
-    "proximityPrecision",
-    "searchCutoffMs",
-    "sortableAttributes",
-    "stopWords",
-];
-
 pub(super) struct NormalizedMeilisearchSettings {
     pub(super) value: Value,
     pub(super) warnings: Vec<TranslationReportEntry>,
@@ -22,13 +11,13 @@ pub(super) struct NormalizedMeilisearchSettings {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MeilisearchSettingsError {
     pub(super) json_path: String,
+    pub(super) warnings: Vec<TranslationReportEntry>,
 }
 
 pub(super) fn normalize_meilisearch_settings(
     raw: &Value,
 ) -> Result<NormalizedMeilisearchSettings, MeilisearchSettingsError> {
     let source = raw.as_object().ok_or_else(|| settings_error("$"))?;
-    reject_unknown_fields(source)?;
 
     let mut warnings = vec![
         warning(
@@ -40,56 +29,53 @@ pub(super) fn normalize_meilisearch_settings(
             "$.pagination",
         ),
     ];
-    let mut normalized = Map::new();
-    copy_string_array(
-        source,
-        &mut normalized,
-        "displayedAttributes",
-        "attributesToRetrieve",
-    )?;
-    copy_string_array(
-        source,
-        &mut normalized,
-        "searchableAttributes",
-        "searchableAttributes",
-    )?;
-    copy_string_array(
-        source,
-        &mut normalized,
-        "filterableAttributes",
-        "attributesForFaceting",
-    )?;
-    copy_ranking_rules(source, &mut normalized, &mut warnings)?;
-    copy_pagination(source, &mut normalized)?;
-    copy_faceting(source, &mut normalized)?;
-    copy_typo_tolerance(source, &mut normalized)?;
-    copy_optional_string(
-        source,
-        &mut normalized,
-        "distinctAttribute",
-        "attributeForDistinct",
-    )?;
-    copy_separator_tokens(source, &mut normalized)?;
-    validate_no_embedder(source)?;
-    validate_known_noop_fields(source)?;
+    let normalized: Result<Value, MeilisearchSettingsError> = (|| {
+        reject_unknown_fields(source)?;
+        let mut normalized = Map::new();
+        copy_string_array(
+            source,
+            &mut normalized,
+            "displayedAttributes",
+            "attributesToRetrieve",
+        )?;
+        copy_string_array(
+            source,
+            &mut normalized,
+            "searchableAttributes",
+            "searchableAttributes",
+        )?;
+        copy_string_array(
+            source,
+            &mut normalized,
+            "filterableAttributes",
+            "attributesForFaceting",
+        )?;
+        copy_ranking_rules(source, &mut normalized, &mut warnings)?;
+        copy_pagination(source, &mut normalized)?;
+        copy_faceting(source, &mut normalized)?;
+        copy_typo_tolerance(source, &mut normalized)?;
+        copy_optional_string(
+            source,
+            &mut normalized,
+            "distinctAttribute",
+            "attributeForDistinct",
+        )?;
+        copy_separator_tokens(source, &mut normalized)?;
+        append_unmigrated_setting_warnings(source, &mut warnings)?;
+        validate_no_embedder(source)?;
+        validate_known_noop_fields(source)?;
+        append_normalization_warnings(source, &mut warnings)?;
+        Ok(Value::Object(normalized))
+    })();
+    let value = match normalized {
+        Ok(value) => value,
+        Err(mut error) => {
+            error.warnings = warnings;
+            return Err(error);
+        }
+    };
 
-    warnings.extend(
-        UNMIGRATED_SETTINGS
-            .into_iter()
-            .filter(|field| source.get(*field).is_some_and(has_semantic_value))
-            .map(|field| {
-                warning(
-                    ReportCode::MeilisearchSettingNotMigrated,
-                    &format!("$.{field}"),
-                )
-            }),
-    );
-    append_normalization_warnings(source, &mut warnings)?;
-
-    Ok(NormalizedMeilisearchSettings {
-        value: Value::Object(normalized),
-        warnings,
-    })
+    Ok(NormalizedMeilisearchSettings { value, warnings })
 }
 
 fn reject_unknown_fields(source: &Map<String, Value>) -> Result<(), MeilisearchSettingsError> {
@@ -437,33 +423,122 @@ fn validate_known_noop_fields(source: &Map<String, Value>) -> Result<(), Meilise
     {
         return Err(settings_error("$.localizedAttributes"));
     }
-    if let Some(value) = source.get("facetSearch") {
-        value
-            .as_bool()
-            .ok_or_else(|| settings_error("$.facetSearch"))?;
-    }
-    // Live Meilisearch (>=1.12) always returns these search-runtime settings in
-    // the GET response. They have no proven Flapjack export equivalent, so they
-    // are surfaced as unmigrated warnings, but the payload still fails closed on
-    // any value outside the vendor's own enum/type so unknown-field rejection is
-    // not weakened by admitting them.
-    if let Some(value) = source.get("prefixSearch") {
-        match value.as_str() {
-            Some("indexingTime") | Some("disabled") => {}
-            _ => return Err(settings_error("$.prefixSearch")),
-        }
-    }
-    if let Some(value) = source.get("searchCutoffMs") {
-        if !value.is_null() && value.as_u64().is_none() {
-            return Err(settings_error("$.searchCutoffMs"));
-        }
-    }
     if let Some(value) = source.get("synonyms") {
         value
             .as_object()
             .ok_or_else(|| settings_error("$.synonyms"))?;
     }
     Ok(())
+}
+
+fn append_unmigrated_setting_warnings(
+    source: &Map<String, Value>,
+    warnings: &mut Vec<TranslationReportEntry>,
+) -> Result<(), MeilisearchSettingsError> {
+    append_warning_string_array(source, warnings, "dictionary")?;
+    append_warning_bool(source, warnings, "facetSearch")?;
+    append_warning_string_array(source, warnings, "nonSeparatorTokens")?;
+    append_warning_prefix_search(source, warnings)?;
+    append_warning_proximity_precision(source, warnings)?;
+    append_warning_nullable_u64(source, warnings, "searchCutoffMs")?;
+    append_warning_string_array(source, warnings, "sortableAttributes")?;
+    append_warning_string_array(source, warnings, "stopWords")?;
+    Ok(())
+}
+
+fn append_warning_bool(
+    source: &Map<String, Value>,
+    warnings: &mut Vec<TranslationReportEntry>,
+    field: &str,
+) -> Result<(), MeilisearchSettingsError> {
+    let Some(value) = source.get(field) else {
+        return Ok(());
+    };
+    value
+        .as_bool()
+        .ok_or_else(|| settings_error(&format!("$.{field}")))?;
+    warnings.push(warning(
+        ReportCode::MeilisearchSettingNotMigrated,
+        &format!("$.{field}"),
+    ));
+    Ok(())
+}
+
+fn append_warning_string_array(
+    source: &Map<String, Value>,
+    warnings: &mut Vec<TranslationReportEntry>,
+    field: &str,
+) -> Result<(), MeilisearchSettingsError> {
+    let Some(value) = source.get(field) else {
+        return Ok(());
+    };
+    let values = string_array(value, &format!("$.{field}"))?;
+    if !values.is_empty() {
+        warnings.push(warning(
+            ReportCode::MeilisearchSettingNotMigrated,
+            &format!("$.{field}"),
+        ));
+    }
+    Ok(())
+}
+
+fn append_warning_proximity_precision(
+    source: &Map<String, Value>,
+    warnings: &mut Vec<TranslationReportEntry>,
+) -> Result<(), MeilisearchSettingsError> {
+    let Some(value) = source.get("proximityPrecision") else {
+        return Ok(());
+    };
+    match value.as_str() {
+        Some("byWord") | Some("byAttribute") => {
+            warnings.push(warning(
+                ReportCode::MeilisearchSettingNotMigrated,
+                "$.proximityPrecision",
+            ));
+            Ok(())
+        }
+        _ => Err(settings_error("$.proximityPrecision")),
+    }
+}
+
+fn append_warning_nullable_u64(
+    source: &Map<String, Value>,
+    warnings: &mut Vec<TranslationReportEntry>,
+    field: &str,
+) -> Result<(), MeilisearchSettingsError> {
+    let Some(value) = source.get(field) else {
+        return Ok(());
+    };
+    if value.is_null() {
+        return Ok(());
+    }
+    value
+        .as_u64()
+        .ok_or_else(|| settings_error(&format!("$.{field}")))?;
+    warnings.push(warning(
+        ReportCode::MeilisearchSettingNotMigrated,
+        &format!("$.{field}"),
+    ));
+    Ok(())
+}
+
+fn append_warning_prefix_search(
+    source: &Map<String, Value>,
+    warnings: &mut Vec<TranslationReportEntry>,
+) -> Result<(), MeilisearchSettingsError> {
+    let Some(value) = source.get("prefixSearch") else {
+        return Ok(());
+    };
+    match value.as_str() {
+        Some("indexingTime") | Some("disabled") => {
+            warnings.push(warning(
+                ReportCode::MeilisearchSettingNotMigrated,
+                "$.prefixSearch",
+            ));
+            Ok(())
+        }
+        _ => Err(settings_error("$.prefixSearch")),
+    }
 }
 
 fn append_normalization_warnings(
@@ -531,15 +606,6 @@ fn positive_u32(value: &Value, path: &str) -> Result<Value, MeilisearchSettingsE
     Ok(Value::from(value))
 }
 
-fn has_semantic_value(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Array(values) => !values.is_empty(),
-        Value::Object(values) => !values.is_empty(),
-        _ => true,
-    }
-}
-
 fn warning(code: ReportCode, path: &str) -> TranslationReportEntry {
     warning_entry(code, ReportResource::Settings, None, None, path)
 }
@@ -547,5 +613,6 @@ fn warning(code: ReportCode, path: &str) -> TranslationReportEntry {
 fn settings_error(path: &str) -> MeilisearchSettingsError {
     MeilisearchSettingsError {
         json_path: path.to_string(),
+        warnings: Vec::new(),
     }
 }

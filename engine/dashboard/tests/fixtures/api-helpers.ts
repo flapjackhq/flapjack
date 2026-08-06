@@ -9,7 +9,13 @@
  */
 import { expect, type APIRequestContext, type TestInfo } from '@playwright/test';
 import { API_BASE, API_HEADERS } from './local-instance';
-import { buildApiPath, buildIndexPath, getSettings, searchIndex } from './index-api-helpers';
+import {
+  buildApiPath,
+  buildIndexPath,
+  getSettings,
+  searchIndex,
+  type SearchIndexOptions,
+} from './index-api-helpers';
 import type { ApiKey, ApiKeyCreateResponse } from '../../src/lib/types';
 import {
   asExperimentRecord,
@@ -525,6 +531,39 @@ export async function addDocumentsWithVectors(
   if (!res.ok()) {
     throw new Error(`addDocumentsWithVectors failed (${res.status()}): ${await res.text()}`);
   }
+}
+
+function readSearchObjectIds(hits: unknown[] | undefined): string[] {
+  if (!Array.isArray(hits)) {
+    return [];
+  }
+
+  return hits
+    .map((hit) => {
+      if (!hit || typeof hit !== 'object') {
+        return '';
+      }
+      const objectID = (hit as Record<string, unknown>).objectID;
+      return typeof objectID === 'string' ? objectID : '';
+    })
+    .filter((objectID): objectID is string => objectID.length > 0);
+}
+
+/** Wait until a search returns the expected objectIDs. */
+export async function waitForSearchableObjectIds(
+  request: APIRequestContext,
+  indexName: string,
+  query: string,
+  expectedObjectIds: string[],
+  options: SearchIndexOptions = {},
+  timeoutMs = 15_000,
+): Promise<void> {
+  await expect(async () => {
+    const response = await searchIndex(request, indexName, query, options);
+    expect(readSearchObjectIds(response.hits)).toEqual(
+      expect.arrayContaining(expectedObjectIds),
+    );
+  }).toPass({ timeout: timeoutMs });
 }
 
 /** Clear all embedders by setting embedders to empty map. */

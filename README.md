@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/flapjackhq/flapjack/actions/workflows/ci.yml/badge.svg)](https://github.com/flapjackhq/flapjack/actions/workflows/ci.yml)
 [![Release](https://github.com/flapjackhq/flapjack/actions/workflows/release.yml/badge.svg)](https://github.com/flapjackhq/flapjack/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: Elastic 2.0](https://img.shields.io/badge/License-Elastic_2.0-blue.svg)](LICENSE)
 
 Drop-in replacement for [Algolia](https://algolia.com) — works with [InstantSearch.js](https://github.com/algolia/instantsearch) and the [algoliasearch](https://github.com/algolia/algoliasearch-client-javascript) client. Typo-tolerant full-text search with faceting, geo search, and custom ranking. Single static binary, runs anywhere, data stays on disk.
 
@@ -229,7 +229,7 @@ All standard InstantSearch.js v5 widgets connect directly to Flapjack's `/1/` en
 
 **Q: What is the licensing and support model?**
 
-Flapjack is MIT-licensed and free to self-host with no feature gates. For managed hosting, [Flapjack Cloud](https://cloud.flapjack.foo) handles provisioning, backups, and updates. Community support is available through the [GitHub repository](https://github.com/flapjackhq/flapjack).
+The engine is source-available under the [Elastic License 2.0](LICENSE) and free to self-host with no feature gates. Run it for your own business, including inside a commercial product, at any scale, for free. The one thing you may not do is provide Flapjack itself to third parties as a hosted or managed search service. The client SDKs under [sdks/](sdks/) are MIT, so nothing the license restricts reaches your application code. For managed hosting, [Flapjack Cloud](https://cloud.flapjack.foo) handles provisioning, backups, and updates. Community support is available through the [GitHub repository](https://github.com/flapjackhq/flapjack).
 
 **Q: How do HMAC-scoped API keys work?**
 
@@ -246,7 +246,7 @@ Flapjack supports the same HMAC-signed secured API keys that Algolia uses for fr
 |  | Flapjack | Algolia | Meilisearch | Typesense | Elasticsearch | OpenSearch |
 |--|----------|---------|-------------|-----------|---------------|-----------|
 | Self-hosted | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ |
-| License | MIT | Proprietary | MIT + BUSL-1.1 | GPL-3 | ELv2 / SSPL / AGPL | Apache 2.0 |
+| License | Elastic 2.0 | Proprietary | MIT + BUSL-1.1 | GPL-3 | ELv2 / SSPL / AGPL | Apache 2.0 |
 | Algolia-compatible API | ✅ | — | ❌ | ❌ | ❌ | ❌ |
 | InstantSearch.js | Native | Native | Adapter | Adapter | Community | Community |
 | Built-in Algolia migration | ✅ | — | ❌ | ❌ | ❌ | ❌ |
@@ -435,4 +435,19 @@ Flapjack includes a built-in dashboard UI served at `http://localhost:7700/dashb
 
 ## License
 
- [MIT](LICENSE)
+The engine is [Elastic License 2.0](LICENSE). The client SDKs and framework
+integrations are MIT. [NOTICE](NOTICE) maps every path to its license.
+
+**You can, for free and forever:** run Flapjack for your own business at any
+scale; use it behind a commercial product or paid app; self-host it for
+internal search; modify it; redistribute it and your changes; use it in
+education and research.
+
+**You cannot:** provide Flapjack to third parties as a hosted or managed
+service that gives them access to a substantial set of its features. That is
+the one restriction, and it exists so that [Flapjack
+Cloud](https://cloud.flapjack.foo) can fund the engine's development.
+
+If you are unsure whether your case is permitted, it almost certainly is —
+open a [discussion](https://github.com/flapjackhq/flapjack/discussions) and
+ask. Releases through v1.0.10 remain available under the MIT License.

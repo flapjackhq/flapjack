@@ -21,7 +21,7 @@ fn meilisearch_loopback_body(endpoint: &str, api_key: &str) -> Value {
 async fn meilisearch_preview_requires_explicit_loopback_opt_in() {
     const API_KEY_CANARY: &str = "preview-route-api-key-canary";
 
-    let _env = with_env_var(MEILISEARCH_LOOPBACK_OPT_IN_ENV, "");
+    let _env = with_env_var(MEILISEARCH_PREVIEW_LOOPBACK_ENV, "");
     let tmp = TempDir::new().unwrap();
     let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
     let app = build_test_router(&tmp, Some(key_store));
@@ -56,7 +56,7 @@ async fn meilisearch_preview_requires_explicit_loopback_opt_in() {
 #[test]
 #[cfg(debug_assertions)]
 fn meilisearch_submit_admits_opted_in_loopback_source_reader() {
-    let _env = with_env_var(MEILISEARCH_LOOPBACK_OPT_IN_ENV, "1");
+    let _env = with_env_var(MEILISEARCH_PREVIEW_LOOPBACK_ENV, "1");
     let payload: MigrateFromMeilisearchRequest = serde_json::from_value(meilisearch_loopback_body(
         MEILISEARCH_LOOPBACK_ENDPOINT,
         "submit-route-api-key-canary",
@@ -77,7 +77,7 @@ fn meilisearch_submit_admits_opted_in_loopback_source_reader() {
 fn meilisearch_submit_accepts_vetted_cloud_endpoint_without_loopback_opt_in() {
     const CLOUD_HOST: &str = "submit-debug-contract.meilisearch.io";
 
-    let _env = with_env_var(MEILISEARCH_LOOPBACK_OPT_IN_ENV, "");
+    let _env = with_env_var(MEILISEARCH_PREVIEW_LOOPBACK_ENV, "");
     let _resolver = install_test_outbound_host_resolver(Arc::new(|host, port| {
         assert_eq!(host, CLOUD_HOST);
         assert_eq!(port, Some(443));
@@ -102,7 +102,7 @@ fn meilisearch_submit_accepts_vetted_cloud_endpoint_without_loopback_opt_in() {
 async fn meilisearch_submit_requires_explicit_loopback_opt_in() {
     const API_KEY_CANARY: &str = "submit-route-api-key-canary";
 
-    let _env = with_env_var(MEILISEARCH_LOOPBACK_OPT_IN_ENV, "");
+    let _env = with_env_var(MEILISEARCH_PREVIEW_LOOPBACK_ENV, "");
     let tmp = TempDir::new().unwrap();
     let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
     let app = build_test_router(&tmp, Some(key_store));
@@ -142,7 +142,7 @@ async fn meilisearch_submit_opt_in_does_not_admit_non_loopback_hosts() {
     const API_KEY_CANARY: &str = "submit-route-non-loopback-api-key-canary";
     const NON_LOOPBACK_ENDPOINT: &str = "https://evil.example.com";
 
-    let _env = with_env_var(MEILISEARCH_LOOPBACK_OPT_IN_ENV, "1");
+    let _env = with_env_var(MEILISEARCH_PREVIEW_LOOPBACK_ENV, "1");
     let tmp = TempDir::new().unwrap();
     let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
     let app = build_test_router(&tmp, Some(key_store));
@@ -177,7 +177,7 @@ async fn meilisearch_preview_rejects_non_loopback_literals_and_authority_confusi
     const API_KEY_CANARY: &str = "preview-route-api-key-canary";
     const REBIND_HOST: &str = "preview-rebind.meilisearch.io";
 
-    let _env = with_env_var(MEILISEARCH_LOOPBACK_OPT_IN_ENV, "1");
+    let _env = with_env_var(MEILISEARCH_PREVIEW_LOOPBACK_ENV, "1");
     let _resolver = install_test_outbound_host_resolver(Arc::new(|host, port| {
         assert_eq!(host, REBIND_HOST, "unexpected host reached the resolver");
         assert_eq!(port, Some(443));

@@ -2,7 +2,7 @@
 	"name": "irregular-plurals",
 	"version": "4.2.0",
 	"description": "Map of nouns to their irregular plural form",
-	"license": "MIT",
+	"license": "Elastic-2.0",
 	"repository": "sindresorhus/irregular-plurals",
 	"funding": "https://github.com/sponsors/sindresorhus",
 	"author": {

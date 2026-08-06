@@ -743,7 +743,7 @@ struct VettedTestAlgoliaBaseUrlOverride {
 
 fn vetted_test_algolia_base_url_override(
 ) -> Result<Option<VettedTestAlgoliaBaseUrlOverride>, AlgoliaClientError> {
-    if !cfg!(debug_assertions) {
+    if !cfg!(any(debug_assertions, test)) {
         return Ok(None);
     }
     #[cfg(test)]

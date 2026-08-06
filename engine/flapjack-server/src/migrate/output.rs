@@ -1,4 +1,4 @@
-use super::{MigrationCount, MigrationFailure, MigrationStatus};
+use super::{MigrationCount, MigrationFailure, MigrationPreviewResponse, MigrationStatus};
 use serde_json::{json, Value};
 
 pub(super) fn finish_failure(
@@ -108,6 +108,48 @@ pub(super) fn print_acknowledgement(
         );
     } else {
         println!("job_id={job_id} acknowledged=true");
+    }
+    Ok(())
+}
+
+pub(super) fn print_preview(
+    preview: &MigrationPreviewResponse,
+    response_json: &Value,
+    json_output: bool,
+    secrets: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if json_output {
+        let mut redacted = response_json.clone();
+        redact_json_value(&mut redacted, secrets);
+        println!("{}", serde_json::to_string(&redacted)?);
+        return Ok(());
+    }
+
+    let summary = &preview.report.summary;
+    let mut fields = vec![
+        format!("total_entries={}", summary.total_entries),
+        format!("hard_rejections={}", summary.hard_rejections),
+        format!("warnings={}", summary.warnings),
+        format!("scope_gaps={}", summary.scope_gaps),
+        format!("source_indexes={}", preview.source_counts.indexes),
+        format!("source_records={}", preview.source_counts.records),
+    ];
+    if let Some(report_digest) = preview.report.report_digest.as_deref() {
+        fields.push(format!(
+            "report_digest={}",
+            redact_secrets(report_digest, secrets)
+        ));
+    }
+    println!("{}", fields.join(" "));
+
+    for entry in &preview.report.entries {
+        println!(
+            "severity={} code={} resource={} jsonPath={}",
+            redact_secrets(&entry.severity, secrets),
+            redact_secrets(&entry.code, secrets),
+            redact_secrets(&entry.resource, secrets),
+            redact_secrets(&entry.json_path, secrets),
+        );
     }
     Ok(())
 }

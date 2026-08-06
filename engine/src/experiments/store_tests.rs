@@ -61,6 +61,67 @@ fn create_duplicate_id_fails() {
 }
 
 #[test]
+fn experiment_atomic_write_removes_temp_after_failed_rename() {
+    let tmp = TempDir::new().unwrap();
+    let store = ExperimentStore::new(tmp.path()).unwrap();
+    let experiments_dir = tmp.path().join(".experiments");
+    let target_path = experiments_dir.join("e1.json");
+    std::fs::create_dir(&target_path).unwrap();
+
+    let error = store
+        .create(make_experiment("e1", "products"))
+        .expect_err("renaming a completed experiment over a directory must fail");
+
+    assert!(matches!(error, ExperimentError::Io(_)));
+    assert!(
+        target_path.is_dir(),
+        "rename must leave the target directory intact"
+    );
+    assert!(
+        !target_path.is_file(),
+        "failed rename must not publish a file"
+    );
+    assert!(
+        !experiments_dir.join("e1.json.tmp").exists(),
+        "failed rename must remove the completed experiment temp file"
+    );
+}
+
+#[test]
+fn id_map_persist_removes_temp_after_failed_rename() {
+    let tmp = TempDir::new().unwrap();
+    let store = ExperimentStore::new(tmp.path()).unwrap();
+    let experiments_dir = tmp.path().join(".experiments");
+    let id_map_path = experiments_dir.join("_id_map.json");
+    assert!(
+        id_map_path.is_file(),
+        "store construction must seed the ID map"
+    );
+    std::fs::remove_file(&id_map_path).unwrap();
+    std::fs::create_dir(&id_map_path).unwrap();
+
+    let error = store
+        .create(make_experiment("e1", "products"))
+        .expect_err("renaming a completed ID map over a directory must fail");
+
+    assert!(matches!(error, ExperimentError::Io(_)));
+    assert!(
+        id_map_path.is_dir(),
+        "rename must leave the target directory intact"
+    );
+    let persisted: Experiment = serde_json::from_slice(
+        &std::fs::read(experiments_dir.join("e1.json"))
+            .expect("experiment JSON is published before ID-map persistence"),
+    )
+    .unwrap();
+    assert_eq!(persisted.id, "e1");
+    assert!(
+        !experiments_dir.join("_id_map.json.tmp").exists(),
+        "failed rename must remove the completed ID-map temp file"
+    );
+}
+
+#[test]
 fn get_nonexistent_returns_not_found() {
     let tmp = TempDir::new().unwrap();
     let store = ExperimentStore::new(tmp.path()).unwrap();

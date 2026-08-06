@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 mod output;
 
-use output::{finish_failure, print_acknowledgement, print_status};
+use output::{finish_failure, print_acknowledgement, print_preview, print_status};
 
 const DEFAULT_POLL_INTERVAL: &str = "250ms";
 const DEFAULT_TIMEOUT: &str = "1h";
@@ -29,6 +29,7 @@ const EXIT_FAILED_JOB: i32 = 5;
 const EXIT_CANCELLED_JOB: i32 = 6;
 const EXIT_CANCEL_TOO_LATE: i32 = 7;
 const EXIT_ACK_TOO_EARLY: i32 = 8;
+const EXIT_PREVIEW_HARD_REJECTIONS: i32 = 9;
 
 #[derive(Args, Debug)]
 pub(crate) struct MigrateArgs {
@@ -43,27 +44,27 @@ pub(crate) struct MigrateArgs {
     action: Option<MigrateAction>,
 
     /// Source Algolia application id
-    #[arg(long)]
+    #[arg(long, global = true)]
     app_id: Option<String>,
 
     /// Source Meilisearch endpoint or Typesense node URL
-    #[arg(long)]
+    #[arg(long, global = true)]
     source_endpoint: Option<String>,
 
     /// Environment variable containing the source provider API key
-    #[arg(long, visible_alias = "algolia-key-env")]
+    #[arg(long, visible_alias = "algolia-key-env", global = true)]
     source_key_env: Option<String>,
 
     /// File containing the source provider API key
-    #[arg(long, visible_alias = "algolia-key-file")]
+    #[arg(long, visible_alias = "algolia-key-file", global = true)]
     source_key_file: Option<PathBuf>,
 
     /// Read the source provider API key from stdin
-    #[arg(long, visible_alias = "algolia-key-stdin")]
+    #[arg(long, visible_alias = "algolia-key-stdin", global = true)]
     source_key_stdin: bool,
 
     /// Source Algolia index
-    #[arg(long)]
+    #[arg(long, global = true)]
     source_index: Option<String>,
 
     /// Destination Flapjack index; defaults to the source index
@@ -78,7 +79,7 @@ pub(crate) struct MigrateArgs {
     #[arg(long)]
     poll_interval: Option<String>,
 
-    /// Maximum time to poll, with ms, s, m, or h suffix
+    /// Maximum time for migration polling or a preview request, with ms, s, m, or h suffix
     #[arg(long, default_value = DEFAULT_TIMEOUT, global = true)]
     timeout: String,
 }
@@ -135,18 +136,12 @@ impl std::fmt::Display for SourceProvider {
 
 #[derive(Subcommand, Debug)]
 enum MigrateAction {
+    /// Report migration compatibility without importing data
+    Preview,
     /// Request cooperative cancellation of an owned migration job
     Cancel(MigrationJobArgs),
     /// Acknowledge an owned terminal migration job
     Ack(MigrationJobArgs),
-}
-
-impl MigrateAction {
-    fn job_id(&self) -> &str {
-        match self {
-            Self::Cancel(job) | Self::Ack(job) => &job.job_id,
-        }
-    }
 }
 
 #[derive(Args, Debug)]
@@ -154,6 +149,12 @@ struct MigrationJobArgs {
     /// Durable migration job UUID
     #[arg(long)]
     job_id: String,
+}
+
+#[derive(Clone, Copy)]
+enum JobActionKind {
+    Cancel,
+    Ack,
 }
 
 #[derive(Clone, Copy)]
@@ -210,6 +211,50 @@ struct MigrationRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     target_index: Option<&'a str>,
     overwrite: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MigrationPreviewResponse {
+    report: MigrationPreviewReport,
+    source_counts: MigrationPreviewSourceCounts,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MigrationPreviewReport {
+    entries: Vec<MigrationPreviewReportEntry>,
+    summary: MigrationPreviewReportSummary,
+    report_digest: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MigrationPreviewReportSummary {
+    total_entries: usize,
+    hard_rejections: usize,
+    warnings: usize,
+    scope_gaps: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MigrationPreviewReportEntry {
+    severity: String,
+    code: String,
+    resource: String,
+    json_path: String,
+}
+
+#[derive(Deserialize)]
+struct MigrationPreviewSourceCounts {
+    indexes: usize,
+    records: usize,
+}
+
+struct MigrationPreviewPayload {
+    response: MigrationPreviewResponse,
+    json: Value,
 }
 
 #[derive(Clone, Copy)]
@@ -293,6 +338,17 @@ struct ValidatedSubmit<'a> {
     source_index: &'a str,
 }
 
+struct MigrationSecrets {
+    flapjack_api_key: String,
+    source_api_key: String,
+}
+
+impl MigrationSecrets {
+    fn redaction_secrets(&self) -> [&str; 2] {
+        [&self.flapjack_api_key, &self.source_api_key]
+    }
+}
+
 #[derive(Deserialize)]
 struct ServerErrorBody {
     code: String,
@@ -303,6 +359,10 @@ struct ServerErrorBody {
 enum MigrationSuccess {
     Status {
         status: Box<MigrationStatus>,
+        secrets: Vec<String>,
+    },
+    Preview {
+        preview: Box<MigrationPreviewPayload>,
         secrets: Vec<String>,
     },
     Acknowledged(String),
@@ -339,6 +399,19 @@ pub(crate) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
             print_status(&status, args.connection.json, &secrets)?;
             Ok(())
         }
+        Ok(MigrationSuccess::Preview { preview, secrets }) => {
+            print_preview(
+                &preview.response,
+                &preview.json,
+                args.connection.json,
+                &secrets,
+            )?;
+            // Hard rejections are a CI-gating preview failure even though HTTP succeeded.
+            if preview.response.report.summary.hard_rejections > 0 {
+                std::process::exit(EXIT_PREVIEW_HARD_REJECTIONS);
+            }
+            Ok(())
+        }
         Ok(MigrationSuccess::Acknowledged(job_id)) => {
             print_acknowledgement(&job_id, args.connection.json)
         }
@@ -349,31 +422,25 @@ pub(crate) fn run(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> 
 fn execute(args: &MigrateArgs) -> Result<MigrationSuccess, MigrationFailure> {
     match args.action.as_ref() {
         None => run_migration(args),
-        Some(action) => run_job_action(args, action),
+        Some(MigrateAction::Preview) => run_preview(args),
+        Some(MigrateAction::Cancel(job)) => {
+            run_job_action(args, &job.job_id, JobActionKind::Cancel)
+        }
+        Some(MigrateAction::Ack(job)) => run_job_action(args, &job.job_id, JobActionKind::Ack),
     }
 }
 
 fn run_migration(args: &MigrateArgs) -> Result<MigrationSuccess, MigrationFailure> {
     let validated = validate_args(args)?;
     let ValidatedConnection { endpoint, timeout } = validated.connection;
-    let flapjack_source = flapjack_secret_source(&args.connection);
-    let api_key = flapjack_source.read("API key").map_err(config_failure)?;
-    let source_api_key_source = source_api_key_secret_source(args);
-    let source_api_key = source_api_key_source
-        .read("source API key")
-        .map_err(|message| failure_with_secrets(FailureKind::Config, message, &[&api_key]))?;
-    let secrets = [api_key.as_str(), source_api_key.as_str()];
-    let client = MigrationClient::new(
-        &args.connection,
-        endpoint,
-        timeout,
-        &api_key,
-        args.source_provider.label(),
-    )
-    .map_err(|message| failure_with_secrets(FailureKind::Config, message, &secrets))?;
+    let credentials = read_migration_secrets(args)?;
+    let secrets = credentials.redaction_secrets();
+    let client =
+        short_request_migration_client(args, endpoint, timeout, &credentials.flapjack_api_key)
+            .map_err(|message| failure_with_secrets(FailureKind::Config, message, &secrets))?;
     let request = MigrationRequest {
         source_connection: validated.source_connection,
-        api_key: &source_api_key,
+        api_key: &credentials.source_api_key,
         source_index: validated.source_index,
         target_index: args.target_index.as_deref(),
         overwrite: args.overwrite,
@@ -395,16 +462,53 @@ fn run_migration(args: &MigrateArgs) -> Result<MigrationSuccess, MigrationFailur
     .map(|status| MigrationSuccess::status(status, &secrets))
 }
 
+fn run_preview(args: &MigrateArgs) -> Result<MigrationSuccess, MigrationFailure> {
+    if let Some(flag) = args.explicit_submit_only_flag() {
+        return Err(submit_only_flag_failure(flag));
+    }
+    let validated = validate_args(args)?;
+    let ValidatedConnection { endpoint, timeout } = validated.connection;
+    let credentials = read_migration_secrets(args)?;
+    let secrets = credentials.redaction_secrets();
+    let client = MigrationClient::new(
+        &args.connection,
+        endpoint,
+        timeout,
+        &credentials.flapjack_api_key,
+        args.source_provider.label(),
+    )
+    .map_err(|message| failure_with_secrets(FailureKind::Config, message, &secrets))?;
+    let request = MigrationRequest {
+        source_connection: validated.source_connection,
+        api_key: &credentials.source_api_key,
+        source_index: validated.source_index,
+        target_index: None,
+        overwrite: false,
+    };
+    let preview = client
+        .preview(&request)
+        .map_err(|error| failure_with_secrets(error.kind, error.message, &secrets))?;
+    Ok(MigrationSuccess::Preview {
+        preview: Box::new(preview),
+        secrets: secrets.iter().map(|secret| (*secret).to_string()).collect(),
+    })
+}
+
 fn run_job_action(
     args: &MigrateArgs,
-    action: &MigrateAction,
+    job_id: &str,
+    action: JobActionKind,
 ) -> Result<MigrationSuccess, MigrationFailure> {
-    if let Some(flag) = args.explicit_submit_only_flag() {
+    // Preview accepts the source connection flags but rejects the submit-only
+    // ones, so the retry these two rejections name must differ.
+    if let Some(flag) = args.explicit_source_flag() {
         return Err(config_failure(format!(
-            "{flag} is only valid when submitting a migration"
+            "{flag} is only valid when submitting a migration or previewing one"
         )));
     }
-    let job_id = action.job_id();
+    if let Some(flag) = args.explicit_submit_only_flag() {
+        return Err(submit_only_flag_failure(flag));
+    }
     validate_job_id(job_id)
         .map_err(|reason| config_failure(format!("invalid --job-id: {reason}")))?;
     let ValidatedConnection { endpoint, timeout } = validate_flapjack_args(args)?;
@@ -412,20 +516,14 @@ fn run_job_action(
         .read("API key")
         .map_err(config_failure)?;
     let secrets = [api_key.as_str()];
-    let client = MigrationClient::new(
-        &args.connection,
-        endpoint,
-        timeout,
-        &api_key,
-        args.source_provider.label(),
-    )
-    .map_err(|message| failure_with_secrets(FailureKind::Config, message, &secrets))?;
+    let client = short_request_migration_client(args, endpoint, timeout, &api_key)
+        .map_err(|message| failure_with_secrets(FailureKind::Config, message, &secrets))?;
     match action {
-        MigrateAction::Cancel(_) => client
+        JobActionKind::Cancel => client
             .cancel(job_id)
             .map(|status| MigrationSuccess::status(status, &secrets))
             .map_err(|error| failure_with_secrets(error.kind, error.message, &secrets)),
-        MigrateAction::Ack(_) => client
+        JobActionKind::Ack => client
             .acknowledge(job_id)
             .map(|()| MigrationSuccess::Acknowledged(job_id.to_string()))
             .map_err(|error| failure_with_secrets(error.kind, error.message, &secrets)),
@@ -438,7 +536,7 @@ fn validate_args(args: &MigrateArgs) -> Result<ValidatedSubmit<'_>, MigrationFai
     let source_index = args
         .source_index
         .as_deref()
-        .ok_or_else(|| config_failure("--source-index is required for submission".to_string()))?;
+        .ok_or_else(|| config_failure("--source-index is required".to_string()))?;
     let source_api_key_source = source_api_key_secret_source(args);
     source_api_key_source
         .validate_exactly_one(
@@ -471,8 +569,44 @@ fn validate_args(args: &MigrateArgs) -> Result<ValidatedSubmit<'_>, MigrationFai
     })
 }
 
+fn read_migration_secrets(args: &MigrateArgs) -> Result<MigrationSecrets, MigrationFailure> {
+    let flapjack_api_key = flapjack_secret_source(&args.connection)
+        .read("API key")
+        .map_err(config_failure)?;
+    let source_api_key = source_api_key_secret_source(args)
+        .read("source API key")
+        .map_err(|message| {
+            failure_with_secrets(FailureKind::Config, message, &[flapjack_api_key.as_str()])
+        })?;
+    Ok(MigrationSecrets {
+        flapjack_api_key,
+        source_api_key,
+    })
+}
+
+/// Sole owner of the rejection wording for flags only a submission accepts, so
+/// preview and the job actions cannot drift into contradicting each other.
+fn submit_only_flag_failure(flag: &str) -> MigrationFailure {
+    config_failure(format!("{flag} is only valid when submitting a migration"))
+}
+
+fn short_request_migration_client<'a>(
+    args: &'a MigrateArgs,
+    endpoint: reqwest::Url,
+    timeout: Duration,
+    api_key: &'a str,
+) -> Result<MigrationClient<'a>, String> {
+    MigrationClient::new(
+        &args.connection,
+        endpoint,
+        timeout.min(Duration::from_secs(30)),
+        api_key,
+        args.source_provider.label(),
+    )
+}
+
 impl MigrateArgs {
-    fn explicit_submit_only_flag(&self) -> Option<&'static str> {
+    fn explicit_source_flag(&self) -> Option<&'static str> {
         [
             (self.app_id.is_some(), "--app-id"),
             (self.source_endpoint.is_some(), "--source-endpoint"),
@@ -489,6 +623,13 @@ impl MigrateArgs {
                 "--source-key-stdin (alias --algolia-key-stdin)",
             ),
             (self.source_index.is_some(), "--source-index"),
+        ]
+        .into_iter()
+        .find_map(|(is_present, flag)| is_present.then_some(flag))
+    }
+
+    fn explicit_submit_only_flag(&self) -> Option<&'static str> {
+        [
             (self.target_index.is_some(), "--target-index"),
             (self.overwrite, "--overwrite"),
             (self.poll_interval.is_some(), "--poll-interval"),
@@ -532,7 +673,7 @@ fn validate_algolia_connection(
     let app_id = args
         .app_id
         .as_deref()
-        .ok_or_else(|| config_failure("--app-id is required for submission".to_string()))?;
+        .ok_or_else(|| config_failure("--app-id is required".to_string()))?;
     validate_required_http_header_value("--app-id", app_id).map_err(config_failure)?;
     Ok(SourceConnection::Algolia(app_id))
 }
@@ -548,7 +689,7 @@ fn validate_endpoint_source_connection(
     }
     let source_endpoint = args.source_endpoint.as_deref().ok_or_else(|| {
         config_failure(format!(
-            "--source-endpoint is required for a {provider} submission"
+            "--source-endpoint is required for --source-provider {provider}"
         ))
     })?;
     validate_source_endpoint(source_endpoint).map_err(config_failure)?;
@@ -726,11 +867,10 @@ impl<'a> MigrationClient<'a> {
     fn new(
         args: &'a MigrateConnectionArgs,
         endpoint: reqwest::Url,
-        timeout: Duration,
+        request_timeout: Duration,
         api_key: &'a str,
         route_segment: &'a str,
     ) -> Result<Self, String> {
-        let request_timeout = timeout.min(Duration::from_secs(30));
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(request_timeout.min(Duration::from_secs(5)))
             .timeout(request_timeout)
@@ -757,6 +897,19 @@ impl<'a> MigrationClient<'a> {
             .send()
             .map_err(|error| transport_failure("migration submission", error))?;
         parse_response(response, 202, "migration submission")
+    }
+
+    fn preview(
+        &self,
+        request: &MigrationRequest<'_>,
+    ) -> Result<MigrationPreviewPayload, MigrationClientFailure> {
+        let url = self.url(&format!("1/migrations/{}/preview", self.route_segment))?;
+        let response = self
+            .authenticated(self.client.post(url))
+            .json(request)
+            .send()
+            .map_err(|error| transport_failure("migration preview", error))?;
+        parse_preview_response(response)
     }
 
     fn status(&self, job_id: &str) -> Result<MigrationStatus, MigrationClientFailure> {
@@ -873,6 +1026,58 @@ fn parse_response(
         http_rejection(format!("{operation} returned an invalid jobId: {reason}"))
     })?;
     Ok(parsed)
+}
+
+fn parse_preview_response(
+    response: reqwest::blocking::Response,
+) -> Result<MigrationPreviewPayload, MigrationClientFailure> {
+    const OPERATION: &str = "migration preview";
+    let (status, body) = read_response(response, OPERATION)?;
+    require_status(status, &body, 200, OPERATION)?;
+    let json: Value = serde_json::from_slice(&body).map_err(|error| {
+        http_rejection(format!(
+            "{OPERATION} returned an incompatible response: {error}"
+        ))
+    })?;
+    let response: MigrationPreviewResponse =
+        serde_json::from_value(json.clone()).map_err(|error| {
+            http_rejection(format!(
+                "{OPERATION} returned an incompatible response: {error}"
+            ))
+        })?;
+    validate_preview_report(&response.report)?;
+    Ok(MigrationPreviewPayload { response, json })
+}
+
+fn validate_preview_report(report: &MigrationPreviewReport) -> Result<(), MigrationClientFailure> {
+    let mut hard_rejections = 0;
+    let mut warnings = 0;
+    let mut scope_gaps = 0;
+    for entry in &report.entries {
+        match entry.severity.as_str() {
+            "HardRejection" => hard_rejections += 1,
+            "Warning" => warnings += 1,
+            "ScopeGap" => scope_gaps += 1,
+            _ => {
+                return Err(http_rejection(
+                    "migration preview returned an incompatible response: unknown report severity"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    let summary = &report.summary;
+    if summary.total_entries != report.entries.len()
+        || summary.hard_rejections != hard_rejections
+        || summary.warnings != warnings
+        || summary.scope_gaps != scope_gaps
+    {
+        return Err(http_rejection(
+            "migration preview returned an incompatible response: report summary does not match entries"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_empty_response(

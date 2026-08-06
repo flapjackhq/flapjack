@@ -3,7 +3,7 @@ use super::meilisearch_client::{
     fetch_document_pages_with_transport, require_read_access_with_transport, MeilisearchClient,
     MeilisearchClientError, MeilisearchErrorKind, MeilisearchMethod, MeilisearchRequest,
     MeilisearchResponse, MeilisearchTransport, TraversalLimits, CONNECT_TIMEOUT,
-    MAX_RESPONSE_BYTES, REQUEST_TIMEOUT,
+    MAX_RESPONSE_BYTES, MEILISEARCH_PREVIEW_LOOPBACK_ENV, REQUEST_TIMEOUT,
 };
 use flapjack::security::test_helpers::install_test_outbound_host_resolver;
 use serde_json::json;
@@ -18,8 +18,6 @@ use std::time::Duration;
 const RAW_ENDPOINT_CANARY: &str = "https://tenant-secret.meilisearch.example";
 const API_KEY_CANARY: &str = "meili-secret-api-key";
 const KAT_LOOPBACK_ENDPOINT: &str = "http://127.0.0.1:17747";
-#[cfg(debug_assertions)]
-const PREVIEW_LOOPBACK_ENV: &str = "FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK";
 
 fn assert_error_is_sanitized(error: &MeilisearchClientError) {
     assert_error_excludes(error, &[RAW_ENDPOINT_CANARY, API_KEY_CANARY]);
@@ -112,10 +110,9 @@ fn constructor_rejects_traversal_shaped_source_index_before_building_requests() 
 }
 
 #[test]
-#[cfg(debug_assertions)]
 #[serial_test::serial(flapjack_outbound_url_policy)]
 fn preview_loopback_constructor_requires_explicit_opt_in_before_resolution() {
-    let _env = crate::test_helpers::with_env_var(PREVIEW_LOOPBACK_ENV, "");
+    let _env = crate::test_helpers::with_env_var(MEILISEARCH_PREVIEW_LOOPBACK_ENV, "");
     let _resolver = install_test_outbound_host_resolver(Arc::new(|host, _| {
         panic!("disabled loopback preview unexpectedly resolved {host}")
     }));
@@ -133,10 +130,9 @@ fn preview_loopback_constructor_requires_explicit_opt_in_before_resolution() {
 }
 
 #[test]
-#[cfg(debug_assertions)]
 #[serial_test::serial(flapjack_outbound_url_policy)]
 fn preview_loopback_constructor_rejects_hostnames_before_resolution() {
-    let _env = crate::test_helpers::with_env_var(PREVIEW_LOOPBACK_ENV, "1");
+    let _env = crate::test_helpers::with_env_var(MEILISEARCH_PREVIEW_LOOPBACK_ENV, "1");
     let _resolver = install_test_outbound_host_resolver(Arc::new(|host, _| {
         panic!("loopback-only preview unexpectedly resolved {host}")
     }));
@@ -153,10 +149,12 @@ fn preview_loopback_constructor_rejects_hostnames_before_resolution() {
     assert_error_excludes(&error, &[hostname_endpoint, API_KEY_CANARY]);
 }
 
-#[test]
-#[cfg(debug_assertions)]
-fn preview_loopback_constructor_preserves_the_vetted_endpoint_origin() {
-    let _env = crate::test_helpers::with_env_var(PREVIEW_LOOPBACK_ENV, "1");
+/// Build the opted-in loopback client and assert it addresses the KAT fixture's
+/// own origin. Both profile-scoped tests below assert exactly this: the debug
+/// one guards the seam developers use, and the release one is the shipped-binary
+/// reachability proof.
+fn assert_preview_loopback_builds_the_kat_settings_url() {
+    let _env = crate::test_helpers::with_env_var(MEILISEARCH_PREVIEW_LOOPBACK_ENV, "1");
     let client =
         MeilisearchClient::new_preview_loopback(KAT_LOOPBACK_ENDPOINT, API_KEY_CANARY, "products")
             .unwrap();
@@ -172,6 +170,21 @@ fn preview_loopback_constructor_preserves_the_vetted_endpoint_origin() {
         request.url().as_str(),
         "http://127.0.0.1:17747/indexes/products/settings"
     );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn preview_loopback_constructor_preserves_the_vetted_endpoint_origin() {
+    assert_preview_loopback_builds_the_kat_settings_url();
+}
+
+/// The shipped profile must reach the same loopback seam. Before the seam left
+/// `#[cfg(debug_assertions)]` this failed to compile in release, which is the
+/// load-bearing proof that the preview override never reached a release binary.
+#[test]
+#[cfg(not(debug_assertions))]
+fn preview_loopback_constructor_is_reachable_in_release_with_explicit_opt_in() {
+    assert_preview_loopback_builds_the_kat_settings_url();
 }
 
 #[test]
@@ -676,10 +689,9 @@ fn discovery_constructor_rejects_non_vendor_host_before_resolution() {
 }
 
 #[test]
-#[cfg(debug_assertions)]
 #[serial_test::serial(flapjack_outbound_url_policy)]
 fn discovery_loopback_constructor_requires_explicit_opt_in_before_resolution() {
-    let _env = crate::test_helpers::with_env_var(PREVIEW_LOOPBACK_ENV, "");
+    let _env = crate::test_helpers::with_env_var(MEILISEARCH_PREVIEW_LOOPBACK_ENV, "");
     let _resolver = install_test_outbound_host_resolver(Arc::new(|host, _| {
         panic!("disabled discovery loopback unexpectedly resolved {host}")
     }));

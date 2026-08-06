@@ -1,3 +1,7 @@
+/// Only the debug-gated loopback tests below name the opt-in, so the import
+/// carries the same gate as the seam it points at.
+#[cfg(debug_assertions)]
+use super::typesense_client::TYPESENSE_PREVIEW_LOOPBACK_ENV;
 use super::typesense_client::{
     capture_source_with_transport, decode_document_page, encoded_collection_name,
     fetch_document_pages_with_expected_count_for_test, fetch_document_pages_with_transport,
@@ -5,7 +9,7 @@ use super::typesense_client::{
     require_read_access_with_transport, TraversalLimits, TypesenseClient, TypesenseClientError,
     TypesenseErrorKind, TypesenseMethod, TypesenseRequest, TypesenseResponse, TypesenseTransport,
     CONNECT_TIMEOUT, DOCUMENT_PAGE_LIMIT, MAX_DOCUMENT_ITEMS, MAX_DOCUMENT_PAGES,
-    MAX_RESPONSE_BYTES, REQUEST_TIMEOUT, TYPESENSE_PREVIEW_LOOPBACK_ENV,
+    MAX_RESPONSE_BYTES, REQUEST_TIMEOUT,
 };
 use super::typesense_source_reader::map_typesense_client_error;
 use super::AlgoliaErrorKind;

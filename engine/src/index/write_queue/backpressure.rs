@@ -44,7 +44,7 @@ struct PauseState {
     reason: String,
     peak_live_segment_count: Option<usize>,
     admission_rejected: bool,
-    #[cfg(any(debug_assertions, test))]
+    #[cfg(any(debug_assertions, test, feature = "test-support"))]
     clear_after_rejection: bool,
 }
 
@@ -160,18 +160,18 @@ pub(crate) fn ensure_bulk_admission_allowed(
     let reason = pause.reason.clone();
     if !pause.admission_rejected {
         pause.admission_rejected = true;
-        #[cfg(any(debug_assertions, test))]
+        #[cfg(any(debug_assertions, test, feature = "test-support"))]
         if pause.clear_after_rejection {
             state.pause = None;
         }
         drop(state);
         return Err(backpressure_error(tenant_id, &reason));
     }
-    #[cfg(any(debug_assertions, test))]
+    #[cfg(any(debug_assertions, test, feature = "test-support"))]
     let clear_after_rejection = pause.clear_after_rejection;
-    #[cfg(any(debug_assertions, test))]
+    #[cfg(any(debug_assertions, test, feature = "test-support"))]
     let should_resample = !clear_after_rejection;
-    #[cfg(not(any(debug_assertions, test)))]
+    #[cfg(not(any(debug_assertions, test, feature = "test-support")))]
     let should_resample = true;
     drop(state);
     if should_resample {
@@ -184,7 +184,7 @@ pub(crate) fn ensure_bulk_admission_allowed(
             return Ok(());
         }
     }
-    #[cfg(any(debug_assertions, test))]
+    #[cfg(any(debug_assertions, test, feature = "test-support"))]
     if clear_after_rejection {
         if let Some(mut state) = BACKPRESSURE_STATE.get_mut(&key) {
             if state
@@ -291,7 +291,7 @@ fn update_state(
                 .pause
                 .as_ref()
                 .is_some_and(|pause| pause.admission_rejected),
-            #[cfg(any(debug_assertions, test))]
+            #[cfg(any(debug_assertions, test, feature = "test-support"))]
             clear_after_rejection: false,
         });
         return Some((
@@ -358,7 +358,7 @@ fn update_state(
                 reason: reason.clone(),
                 peak_live_segment_count: observed_segment_peak(&state.observations),
                 admission_rejected: false,
-                #[cfg(any(debug_assertions, test))]
+                #[cfg(any(debug_assertions, test, feature = "test-support"))]
                 clear_after_rejection: false,
             });
             return Some((
@@ -588,7 +588,7 @@ pub(crate) fn hold_non_improving_pause_for_test(
             "test-support observations did not establish write backpressure".to_string(),
         ));
     };
-    #[cfg(any(debug_assertions, test))]
+    #[cfg(any(debug_assertions, test, feature = "test-support"))]
     {
         pause.clear_after_rejection = false;
     }
@@ -596,7 +596,7 @@ pub(crate) fn hold_non_improving_pause_for_test(
     Ok(pause_guard)
 }
 
-#[cfg(any(debug_assertions, test))]
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
 pub fn force_backpressure_pause_for_test(
     base_path: &Path,
     tenant_id: &str,

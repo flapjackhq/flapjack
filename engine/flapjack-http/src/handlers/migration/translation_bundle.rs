@@ -682,6 +682,9 @@ pub(in crate::handlers::migration) fn translate_settings_for_provider(
             normalized = match normalize_meilisearch_settings(settings_value) {
                 Ok(normalized) => normalized,
                 Err(error) => {
+                    for warning in error.warnings {
+                        push_unique_entry(report_entries, warning);
+                    }
                     failures.push(failure(
                         ReportCode::MalformedSettingsPayload,
                         ReportResource::Settings,

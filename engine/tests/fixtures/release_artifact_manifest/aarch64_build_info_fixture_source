@@ -1,0 +1,92 @@
+// Deterministic source for a Linux aarch64 fixture used by
+// build_identity_package_contract.sh. It deliberately avoids libc so the
+// resulting ELF is static and can be regenerated with the command in
+// fixture_producer.
+
+#define BUILD_INFO_JSON                                                       \
+    "{\"schemaVersion\":1,\"version\":\"1.0.11-fixture\","                 \
+    "\"revision\":\"0123456789abcdef0123456789abcdef01234567\","           \
+    "\"revisionKnown\":true,\"dirty\":false,\"dirtyKnown\":true,"         \
+    "\"workspaceDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"," \
+    "\"profile\":\"release\",\"target\":\"aarch64-unknown-linux-musl\"," \
+    "\"features\":[\"fixture-feature\",\"vector-search\"],"               \
+    "\"capabilities\":{\"vectorSearch\":true,\"vectorSearchLocal\":false}}"
+
+static const char BUILD_INFO[] = BUILD_INFO_JSON "\n";
+
+// The test-only non-executing reader extracts this delimited copy. Keeping the
+// metadata in the ELF makes it possible to prove the packaging expectations can
+// pass without relying on the fixture's executable code path.
+__attribute__((used)) static const char BUILD_INFO_METADATA[] =
+    "FLAPJACK_BUILD_INFO_JSON_BEGIN\n" BUILD_INFO_JSON
+    "\nFLAPJACK_BUILD_INFO_JSON_END\n";
+
+static const char SENTINEL_ENV[] = "FLAPJACK_EXECUTION_SENTINEL=";
+static const char SENTINEL_CONTENT[] = "executed\n";
+
+static long linux_syscall3(long number, long arg0, long arg1, long arg2) {
+  register long x0 __asm__("x0") = arg0;
+  register long x1 __asm__("x1") = arg1;
+  register long x2 __asm__("x2") = arg2;
+  register long x8 __asm__("x8") = number;
+  __asm__ volatile("svc 0"
+                   : "+r"(x0)
+                   : "r"(x1), "r"(x2), "r"(x8)
+                   : "memory");
+  return x0;
+}
+
+static long linux_syscall4(long number, long arg0, long arg1, long arg2,
+                           long arg3) {
+  register long x0 __asm__("x0") = arg0;
+  register long x1 __asm__("x1") = arg1;
+  register long x2 __asm__("x2") = arg2;
+  register long x3 __asm__("x3") = arg3;
+  register long x8 __asm__("x8") = number;
+  __asm__ volatile("svc 0"
+                   : "+r"(x0)
+                   : "r"(x1), "r"(x2), "r"(x3), "r"(x8)
+                   : "memory");
+  return x0;
+}
+
+static const char *sentinel_path(char **environment) {
+  for (char **entry = environment; *entry; ++entry) {
+    const char *candidate = *entry;
+    unsigned long index = 0;
+    while (SENTINEL_ENV[index] && candidate[index] == SENTINEL_ENV[index]) {
+      ++index;
+    }
+    if (!SENTINEL_ENV[index]) {
+      return candidate + index;
+    }
+  }
+  return 0;
+}
+
+__attribute__((noreturn, used)) void fixture_main(long *initial_stack) {
+  long argc = initial_stack[0];
+  char **argv = (char **)&initial_stack[1];
+  char **environment = argv + argc + 1;
+  const char *path = sentinel_path(environment);
+
+  // Linux aarch64 syscall numbers: openat=56, close=57, write=64, exit=93.
+  if (path && *path) {
+    long fd = linux_syscall4(56, -100, (long)path, 577, 384);
+    if (fd < 0) {
+      linux_syscall3(93, 125, 0, 0);
+    }
+    linux_syscall3(64, fd, (long)SENTINEL_CONTENT,
+                   sizeof(SENTINEL_CONTENT) - 1);
+    linux_syscall3(57, fd, 0, 0);
+  }
+  linux_syscall3(64, 1, (long)BUILD_INFO, sizeof(BUILD_INFO) - 1);
+  linux_syscall3(93, 0, 0, 0);
+  __builtin_unreachable();
+}
+
+__asm__(".global _start\n"
+        ".type _start,%function\n"
+        "_start:\n"
+        "mov x0, sp\n"
+        "bl fixture_main\n");

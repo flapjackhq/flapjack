@@ -45,7 +45,7 @@ fn meilisearch_custom_split_ranking_rules_fail_closed_when_order_is_ambiguous() 
             failure.contains(expected_path),
             "failure {failure} must name {expected_path}"
         );
-        assert!(warnings.is_empty());
+        assert_provider_advisories(&warnings);
     }
 }
 
@@ -90,7 +90,7 @@ fn meilisearch_attribute_alias_pair_fails_closed_as_duplicate_criterion() {
             failure.contains(expected_path),
             "failure {failure} must name {expected_path}"
         );
-        assert!(warnings.is_empty());
+        assert_provider_advisories(&warnings);
     }
 }
 

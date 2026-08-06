@@ -1,4 +1,5 @@
 use crate::error::{FlapjackError, Result};
+use crate::index::utils::copy_dir_recursive;
 use aes_gcm_siv::aead::{Aead, KeyInit, Payload};
 use aes_gcm_siv::{Aes256GcmSiv, Nonce};
 use flate2::read::GzDecoder;
@@ -73,43 +74,19 @@ fn validate_snapshot_bytes(data: &[u8]) -> Result<()> {
     validate_archive_entries(&mut archive)
 }
 
-pub fn export_to_tarball(index_path: &Path, dest_file: &Path) -> Result<u64> {
-    let file = File::create(dest_file)?;
-    let encoder = GzEncoder::new(file, Compression::fast());
-    let mut archive = Builder::new(encoder);
-
-    archive.append_dir_all(".", index_path)?;
-
-    let encoder = archive.into_inner()?;
-    encoder.finish()?;
-
-    let size = std::fs::metadata(dest_file)?.len();
-    Ok(size)
-}
-
-pub fn import_from_tarball(tarball_path: &Path, dest_dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dest_dir)?;
-
-    let validation_file = File::open(tarball_path)?;
-    let validation_decoder = GzDecoder::new(validation_file);
-    let mut validation_archive = Archive::new(validation_decoder);
-    validate_archive_entries(&mut validation_archive)?;
-
-    let file = File::open(tarball_path)?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = Archive::new(decoder);
-
-    archive.unpack(dest_dir)?;
-
-    Ok(())
+fn stage_snapshot_tree(index_path: &Path) -> Result<tempfile::TempDir> {
+    let staged = tempfile::tempdir()?;
+    copy_dir_recursive(index_path, staged.path())?;
+    Ok(staged)
 }
 
 fn build_plaintext_snapshot_bytes(index_path: &Path) -> Result<Vec<u8>> {
+    let staged = stage_snapshot_tree(index_path)?;
     let mut buffer = Vec::new();
     {
         let encoder = GzEncoder::new(&mut buffer, Compression::fast());
         let mut archive = Builder::new(encoder);
-        archive.append_dir_all(".", index_path)?;
+        archive.append_dir_all(".", staged.path())?;
         let encoder = archive.into_inner()?;
         encoder.finish()?;
     }
@@ -302,30 +279,91 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    /// Verify that exporting a directory tree to a gzipped tarball and re-importing it preserves both flat files and nested subdirectory contents.
+    const LEGACY_WRITER_TEMP_NAMES: [&str; 8] = [
+        ".stopwords.tmp",
+        ".plurals.tmp",
+        ".compounds.tmp",
+        ".settings.tmp",
+        "manifest.json.tmp",
+        "rollup_1hour_123.parquet.456.tmp",
+        "_id_map.json.tmp",
+        "experiment-id.json.tmp",
+    ];
+
+    fn restored_entry_names(root: &Path) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn assert_snapshot_tree_excludes_writer_temps(restored: &Path, artifact: &str) {
+        let entries = restored_entry_names(restored);
+        println!("{artifact} restored tree: {entries:?}");
+        assert_eq!(
+            fs::read(restored.join("control.txt")).unwrap(),
+            b"durable control contents"
+        );
+
+        let leaked: Vec<_> = LEGACY_WRITER_TEMP_NAMES
+            .iter()
+            .copied()
+            .filter(|name| restored.join(name).exists())
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "{artifact} restored writer temporaries: {leaked:?}; restored tree: {entries:?}"
+        );
+    }
+
     #[test]
-    fn test_tarball_roundtrip() {
-        let src = TempDir::new().unwrap();
-        let dest = TempDir::new().unwrap();
+    fn snapshot_exports_exclude_writer_temp_files() {
+        let source = TempDir::new().unwrap();
+        fs::write(
+            source.path().join("control.txt"),
+            b"durable control contents",
+        )
+        .unwrap();
+        for name in LEGACY_WRITER_TEMP_NAMES {
+            fs::write(source.path().join(name), b"in-flight writer contents").unwrap();
+        }
 
-        fs::write(src.path().join("test.txt"), "hello world").unwrap();
-        fs::create_dir(src.path().join("subdir")).unwrap();
-        fs::write(src.path().join("subdir/nested.txt"), "nested content").unwrap();
+        let bytes = export_to_bytes(source.path()).unwrap();
+        let bytes_restored = TempDir::new().unwrap();
+        import_from_bytes(&bytes, bytes_restored.path()).unwrap();
+        assert_snapshot_tree_excludes_writer_temps(bytes_restored.path(), "bytes artifact");
+    }
 
-        let tarball = dest.path().join("export.tar.gz");
-        export_to_tarball(src.path(), &tarball).unwrap();
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_exports_reject_source_symlinks() {
+        use std::os::unix::fs::symlink;
 
-        let restored = TempDir::new().unwrap();
-        import_from_tarball(&tarball, restored.path()).unwrap();
+        let fixture = TempDir::new().unwrap();
+        let source = fixture.path().join("source");
+        let external_dir = fixture.path().join("external");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&external_dir).unwrap();
+        fs::write(
+            external_dir.join("secret.txt"),
+            b"external directory contents",
+        )
+        .unwrap();
+        let external_file = fixture.path().join("external.txt");
+        fs::write(&external_file, b"external file contents").unwrap();
 
-        assert_eq!(
-            fs::read_to_string(restored.path().join("test.txt")).unwrap(),
-            "hello world"
-        );
-        assert_eq!(
-            fs::read_to_string(restored.path().join("subdir/nested.txt")).unwrap(),
-            "nested content"
-        );
+        for (kind, target) in [("file", external_file), ("directory", external_dir)] {
+            let source = source.join(kind);
+            fs::create_dir(&source).unwrap();
+            symlink(target, source.join("linked_entry")).unwrap();
+
+            assert!(
+                export_to_bytes(&source).is_err(),
+                "bytes export accepted a source {kind} symlink"
+            );
+        }
     }
 
     #[test]

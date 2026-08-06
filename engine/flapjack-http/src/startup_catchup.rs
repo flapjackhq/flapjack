@@ -435,7 +435,7 @@ fn activate_snapshot_publication(
     // synchronous install runs, so the drain is no longer masqueraded by an
     // `unload` here — the `snapshot_restore_publication` checkpoint is reached
     // only after that manager-owned merge-quiescent drain.
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, test))]
     flapjack::index::write_queue::record_writer_lifecycle_publication_checkpoint(
         tenant_id,
         "snapshot_restore_publication",

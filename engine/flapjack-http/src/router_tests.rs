@@ -915,6 +915,7 @@ fn discovery_credential_sentinel() -> String {
     ["sk-sentinel-", "DO-NOT-LEAK-", "9f3c"].concat()
 }
 
+#[cfg(debug_assertions)]
 fn typesense_collection_summaries(summaries: &[(&str, u64, u64, &str)]) -> serde_json::Value {
     serde_json::Value::Array(
         summaries
@@ -956,6 +957,7 @@ impl<'a> ExpectedNeutralDiscoveryMetadata<'a> {
         }
     }
 
+    #[cfg(debug_assertions)]
     fn algolia(name: &'a str, entries: u64, updated_at: &'a str) -> Self {
         Self {
             entries: Some(entries),
@@ -980,6 +982,7 @@ impl<'a> ExpectedNeutralDiscoveryMetadata<'a> {
         }
     }
 
+    #[cfg(debug_assertions)]
     fn typesense(
         name: &'a str,
         document_count: u64,
@@ -1447,6 +1450,7 @@ async fn list_source_indexes_maps_meilisearch_invalid_api_key() {
 }
 
 #[allow(clippy::await_holding_lock)]
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn list_source_indexes_returns_typesense_known_answer() {
     // This reaches a test-owned Typesense upstream through the explicit loopback
@@ -1656,6 +1660,7 @@ async fn list_source_indexes_returns_typesense_known_answer() {
 }
 
 /// Extract the ordered `name` values from a neutral discovery response.
+#[cfg(debug_assertions)]
 fn discovery_index_names(document: serde_json::Value) -> Vec<String> {
     document
         .get("indexes")
@@ -1710,6 +1715,7 @@ async fn list_source_indexes_refuses_non_vendor_host() {
 }
 
 #[allow(clippy::await_holding_lock)]
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn list_source_indexes_gates_loopback_behind_opt_in() {
     // With the opt-in env unset a loopback host is refused; with it set to exactly
@@ -1928,6 +1934,7 @@ async fn list_source_indexes_refuses_payload_mismatch() {
 }
 
 #[allow(clippy::await_holding_lock)]
+#[cfg(debug_assertions)]
 #[tokio::test]
 #[serial_test::serial(flapjack_outbound_url_policy)]
 async fn list_source_indexes_never_leaks_credentials() {

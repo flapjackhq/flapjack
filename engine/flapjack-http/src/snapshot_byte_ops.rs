@@ -25,12 +25,12 @@ pub(crate) fn export_snapshot_bytes(
     index_path: &Path,
     tenant_id: &str,
 ) -> Result<Vec<u8>, FlapjackError> {
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, test))]
     flapjack::index::write_queue::record_writer_lifecycle_publication_checkpoint(
         tenant_id,
         "snapshot_export_read",
     );
-    #[cfg(not(debug_assertions))]
+    #[cfg(not(any(debug_assertions, test)))]
     let _ = tenant_id;
     export_with_retry(|| export_to_bytes(index_path))
 }

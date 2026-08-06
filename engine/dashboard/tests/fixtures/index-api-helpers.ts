@@ -79,6 +79,7 @@ export interface SearchIndexOptions {
   hitsPerPage?: number;
   page?: number;
   filters?: string;
+  mode?: 'keywordSearch' | 'neuralSearch';
 }
 
 export type SearchIndexResponse = {
@@ -106,6 +107,7 @@ export async function searchIndex(
   if (typeof options?.hitsPerPage === 'number') body.hitsPerPage = options.hitsPerPage;
   if (typeof options?.page === 'number') body.page = options.page;
   if (typeof options?.filters === 'string') body.filters = options.filters;
+  if (typeof options?.mode === 'string') body.mode = options.mode;
 
   const res = await request.post(
     buildIndexPath(indexName, 'query'),

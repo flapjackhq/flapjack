@@ -15,7 +15,7 @@ pub(crate) mod segment_observation;
 mod vectors;
 mod writer_lifecycle;
 
-#[cfg(any(debug_assertions, test))]
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
 pub use backpressure::force_backpressure_pause_for_test;
 pub(crate) use compensation::{compensate_uncommitted_tasks, DurableReplayState};
 #[cfg(test)]
@@ -32,7 +32,7 @@ pub(crate) use finalization::{
 #[cfg(test)]
 pub(crate) use writer_lifecycle::set_writer_close_hook_for_test;
 pub(crate) use writer_lifecycle::WriteTaskHandle;
-#[cfg(any(debug_assertions, test))]
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
 pub use writer_lifecycle::{
     clear_writer_lifecycle_test_events, record_writer_lifecycle_publication_checkpoint,
     writer_lifecycle_test_events, WriterLifecycleTestEvent,
@@ -72,7 +72,7 @@ const WRITE_QUEUE_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_WRITE_QUEUE_CHANNEL_CAPACITY: usize = 512;
 const WRITE_QUEUE_CHANNEL_CAPACITY_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_CHANNEL_CAPACITY";
 const WRITE_QUEUE_START_DELAY_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_START_DELAY_MS";
-#[cfg(any(debug_assertions, test))]
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
 const WRITE_QUEUE_TEST_COMMIT_DELAY_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_TEST_COMMIT_DELAY_MS";
 #[cfg(test)]
 static WRITE_QUEUE_TEST_COMMIT_DELAY_BY_TENANT: Lazy<dashmap::DashMap<String, Duration>> =
@@ -593,12 +593,15 @@ fn tenant_scoped_test_commit_delay(tenant_id: &str) -> Option<Duration> {
         .map(|delay| *delay)
 }
 
-#[cfg(all(debug_assertions, not(test)))]
+/// The tenant-scoped delay map is owned by this crate's own unit tests. Every
+/// other build that compiles `write_queue_test_commit_delay` — debug, or a
+/// dependent's test build enabling `test-support` — gets the no-op arm.
+#[cfg(all(not(test), any(debug_assertions, feature = "test-support")))]
 fn tenant_scoped_test_commit_delay(_tenant_id: &str) -> Option<Duration> {
     None
 }
 
-#[cfg(any(debug_assertions, test))]
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
 fn write_queue_test_commit_delay(tenant_id: &str) -> Option<Duration> {
     if let Some(delay) = tenant_scoped_test_commit_delay(tenant_id) {
         return Some(delay);
@@ -1855,7 +1858,7 @@ async fn commit_batch(
             }
         };
 
-    #[cfg(any(debug_assertions, test))]
+    #[cfg(any(debug_assertions, test, feature = "test-support"))]
     if let Some(delay) = write_queue_test_commit_delay(ctx.tenant_id.as_str()) {
         // A yielding sleep would hide the shared-runtime blocking reproduced only by
         // single_worker_runtime_serves_count_during_injected_two_second_commit in

@@ -11,6 +11,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 pub const BUILD_INFO_SCHEMA_VERSION: u8 = 1;
+pub(crate) const EMBEDDED_BUILD_INFO_JSON_CAPACITY: usize = 16 * 1024;
+pub const BUILD_INFO_JSON_BEGIN_MARKER: &[u8] = b"FLAPJACK_BUILD_INFO_JSON_BEGIN\n";
+pub const BUILD_INFO_JSON_END_MARKER: &[u8] = b"\nFLAPJACK_BUILD_INFO_JSON_END\n";
 
 pub(crate) const WORKSPACE_DIGEST_FILES: &[&str] = &[
     "Cargo.lock",
@@ -29,6 +32,17 @@ pub(crate) const WORKSPACE_DIGEST_RUST_DIRS: &[&str] = &[
     "flapjack-replication/src",
     "flapjack-server/src",
     "flapjack-ssl/src",
+];
+
+pub(crate) const CORE_FEATURES: &[(&str, &str)] = &[
+    ("CARGO_FEATURE_ANALYTICS", "analytics"),
+    ("CARGO_FEATURE_AXUM_SUPPORT", "axum-support"),
+    ("CARGO_FEATURE_DECOMPOUND", "decompound"),
+    ("CARGO_FEATURE_MEMORY_STATS", "memory-stats"),
+    ("CARGO_FEATURE_OPENAPI", "openapi"),
+    ("CARGO_FEATURE_S3_SNAPSHOTS", "s3-snapshots"),
+    ("CARGO_FEATURE_VECTOR_SEARCH", "vector-search"),
+    ("CARGO_FEATURE_VECTOR_SEARCH_LOCAL", "vector-search-local"),
 ];
 
 const WORKSPACE_DIGEST_EXCLUDED_PATH_PREFIXES: &[&str] = &[
@@ -86,28 +100,79 @@ pub(crate) struct VcsState {
     pub dirty: Option<bool>,
 }
 
+/// The canonical build identity, embedded verbatim in every artifact that links this
+/// crate so release packaging can read provenance out of the artifact's own bytes
+/// instead of executing a foreign-target binary.
+///
+/// This crate is the only place the record may be materialized. `engine/build.rs` emits
+/// `FLAPJACK_INTERNAL_BUILD_INFO_JSON` through `cargo:rustc-env`, and Cargo scopes that
+/// variable to the crate whose build script emitted it — so an `option_env!` read from
+/// any other crate silently yields `None` and embeds an empty record.
+#[used]
+static EMBEDDED_BUILD_INFO_JSON: [u8; EMBEDDED_BUILD_INFO_JSON_CAPACITY] =
+    embedded_build_info_json_bytes(option_env!("FLAPJACK_INTERNAL_BUILD_INFO_JSON"));
+
+/// Offset and length of the JSON payload inside [`EMBEDDED_BUILD_INFO_JSON`]. Both are
+/// `const` so the delimiters are consumed at compile time and never reach `.rodata` as a
+/// second copy of the marker bytes.
+const EMBEDDED_BUILD_INFO_JSON_OFFSET: usize = BUILD_INFO_JSON_BEGIN_MARKER.len();
+const EMBEDDED_BUILD_INFO_JSON_LEN: usize = match option_env!("FLAPJACK_INTERNAL_BUILD_INFO_JSON") {
+    Some(json) => json.len(),
+    None => 0,
+};
+
 /// Returns the canonical build identity for this compiled core crate.
 pub fn build_info() -> &'static BuildInfo {
     static BUILD_INFO: OnceLock<BuildInfo> = OnceLock::new();
     BUILD_INFO.get_or_init(|| {
-        build_info_from_inputs(
-            env!("CARGO_PKG_VERSION"),
-            RawBuildInputs {
-                revision: non_empty(option_env!("FLAPJACK_INTERNAL_BUILD_REVISION")),
-                dirty: parse_dirty(option_env!("FLAPJACK_INTERNAL_BUILD_DIRTY")),
-                workspace_digest: option_env!("FLAPJACK_INTERNAL_WORKSPACE_DIGEST")
-                    .unwrap_or_default()
-                    .to_owned(),
-                profile: option_env!("FLAPJACK_INTERNAL_BUILD_PROFILE")
-                    .unwrap_or_default()
-                    .to_owned(),
-                target: option_env!("FLAPJACK_INTERNAL_BUILD_TARGET")
-                    .unwrap_or_default()
-                    .to_owned(),
-            },
-            enabled_core_features(),
-        )
+        parse_build_info_json(embedded_build_info_json())
+            .unwrap_or_else(|error| panic!("compiled build-info record is invalid: {error}"))
     })
+}
+
+/// Reads this artifact's own embedded record, by compile-time-known layout.
+///
+/// The read is what keeps the record in the linked artifact. `#[used]` only binds the
+/// compiler: it leaves the static unreferenced, so a linker that garbage-collects
+/// unreferenced sections discards it outright — which is how the musl release binaries
+/// reached packaging with zero markers. Loading the bytes here makes the record
+/// load-bearing for observable behavior, so the relocation from live code survives any
+/// linker, and `black_box` stops the optimizer from folding the constant away and
+/// dropping the static with it.
+///
+/// Slicing at known offsets rather than searching for the delimiters is deliberate: a
+/// runtime marker search would pull the marker literals into `.rodata` as a second copy,
+/// and packaging fails closed on a duplicate marker. Scanning belongs to
+/// [`embedded_build_info_json_from_bytes`], whose callers inspect a foreign artifact
+/// whose layout they cannot know.
+fn embedded_build_info_json() -> &'static str {
+    let record = std::hint::black_box(&EMBEDDED_BUILD_INFO_JSON);
+    let payload = &record[EMBEDDED_BUILD_INFO_JSON_OFFSET
+        ..EMBEDDED_BUILD_INFO_JSON_OFFSET + EMBEDDED_BUILD_INFO_JSON_LEN];
+    std::str::from_utf8(payload).expect("embedded build-info JSON must be UTF-8")
+}
+
+pub fn canonical_build_info_json(info: &BuildInfo) -> serde_json::Result<String> {
+    serde_json::to_string(info)
+}
+
+pub fn embedded_build_info_json_from_bytes(bytes: &[u8]) -> Result<String, String> {
+    parse_embedded_build_info(bytes).map(|(_, json)| json.to_owned())
+}
+
+fn parse_embedded_build_info(bytes: &[u8]) -> Result<(BuildInfo, &str), String> {
+    let (json_start, json_end) = embedded_build_info_json_range(bytes)?;
+    let json_bytes = &bytes[json_start..json_end];
+    let json = std::str::from_utf8(json_bytes)
+        .map_err(|error| format!("embedded build-info JSON is not UTF-8: {error}"))?;
+    let info =
+        parse_build_info_json(json).map_err(|error| error.replacen("compiled", "embedded", 1))?;
+    Ok((info, json))
+}
+
+fn parse_build_info_json(json: &str) -> Result<BuildInfo, String> {
+    serde_json::from_str::<BuildInfo>(json)
+        .map_err(|error| format!("compiled build-info JSON is malformed: {error}"))
 }
 
 pub(crate) fn build_info_from_inputs<I, S>(
@@ -341,6 +406,82 @@ where
         .collect()
 }
 
+pub(crate) fn enabled_core_features_from_env<F>(mut env_present: F) -> Vec<&'static str>
+where
+    F: FnMut(&str) -> bool,
+{
+    CORE_FEATURES
+        .iter()
+        .filter_map(|(env_name, feature_name)| env_present(env_name).then_some(*feature_name))
+        .collect()
+}
+
+pub(crate) const fn embedded_build_info_json_bytes(
+    json: Option<&str>,
+) -> [u8; EMBEDDED_BUILD_INFO_JSON_CAPACITY] {
+    let json = match json {
+        Some(value) => value.as_bytes(),
+        None => b"",
+    };
+    let required_len =
+        BUILD_INFO_JSON_BEGIN_MARKER.len() + json.len() + BUILD_INFO_JSON_END_MARKER.len();
+    if required_len > EMBEDDED_BUILD_INFO_JSON_CAPACITY {
+        panic!("embedded build-info JSON exceeds static capacity");
+    }
+
+    let mut bytes = [0_u8; EMBEDDED_BUILD_INFO_JSON_CAPACITY];
+    let mut offset = 0;
+    offset = copy_const_bytes(&mut bytes, offset, BUILD_INFO_JSON_BEGIN_MARKER);
+    offset = copy_const_bytes(&mut bytes, offset, json);
+    let _ = copy_const_bytes(&mut bytes, offset, BUILD_INFO_JSON_END_MARKER);
+    bytes
+}
+
+const fn copy_const_bytes(
+    target: &mut [u8; EMBEDDED_BUILD_INFO_JSON_CAPACITY],
+    offset: usize,
+    source: &[u8],
+) -> usize {
+    let mut index = 0;
+    while index < source.len() {
+        target[offset + index] = source[index];
+        index += 1;
+    }
+    offset + source.len()
+}
+
+fn embedded_build_info_json_range(bytes: &[u8]) -> Result<(usize, usize), String> {
+    let starts = find_all_bytes(bytes, BUILD_INFO_JSON_BEGIN_MARKER);
+    if starts.len() != 1 {
+        return Err(format!(
+            "embedded build-info JSON begin marker must appear exactly once, found {}",
+            starts.len()
+        ));
+    }
+    let ends = find_all_bytes(bytes, BUILD_INFO_JSON_END_MARKER);
+    if ends.len() != 1 {
+        return Err(format!(
+            "embedded build-info JSON end marker must appear exactly once, found {}",
+            ends.len()
+        ));
+    }
+
+    let json_start = starts[0] + BUILD_INFO_JSON_BEGIN_MARKER.len();
+    let json_end = ends[0];
+    if json_end < json_start {
+        return Err("embedded build-info JSON end marker precedes begin marker".to_owned());
+    }
+    Ok((json_start, json_end))
+}
+
+fn find_all_bytes(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+    haystack
+        .windows(needle.len())
+        .enumerate()
+        .filter_map(|(index, candidate)| (candidate == needle).then_some(index))
+        .collect()
+}
+
 fn validate_revision_override(revision: &str) -> Result<String, String> {
     (revision.len() == 40
         && revision
@@ -363,458 +504,20 @@ fn normalize_revision(revision: &str) -> Option<String> {
     .then(|| revision.to_ascii_lowercase())
 }
 
-fn non_empty(value: Option<&str>) -> Option<String> {
-    value.filter(|value| !value.is_empty()).map(str::to_owned)
-}
-
-fn parse_dirty(value: Option<&str>) -> Option<bool> {
-    match value {
-        Some("true") => Some(true),
-        Some("false") => Some(false),
-        _ => None,
-    }
-}
-
 fn enabled_core_features() -> Vec<&'static str> {
-    let mut features = Vec::new();
-    for (enabled, name) in [
-        (cfg!(feature = "analytics"), "analytics"),
-        (cfg!(feature = "axum-support"), "axum-support"),
-        (cfg!(feature = "decompound"), "decompound"),
-        (cfg!(feature = "memory-stats"), "memory-stats"),
-        (cfg!(feature = "openapi"), "openapi"),
-        (cfg!(feature = "s3-snapshots"), "s3-snapshots"),
-        (cfg!(feature = "vector-search"), "vector-search"),
-        (cfg!(feature = "vector-search-local"), "vector-search-local"),
-    ] {
-        if enabled {
-            features.push(name);
-        }
-    }
-    features
+    enabled_core_features_from_env(|env_name| match env_name {
+        "CARGO_FEATURE_ANALYTICS" => cfg!(feature = "analytics"),
+        "CARGO_FEATURE_AXUM_SUPPORT" => cfg!(feature = "axum-support"),
+        "CARGO_FEATURE_DECOMPOUND" => cfg!(feature = "decompound"),
+        "CARGO_FEATURE_MEMORY_STATS" => cfg!(feature = "memory-stats"),
+        "CARGO_FEATURE_OPENAPI" => cfg!(feature = "openapi"),
+        "CARGO_FEATURE_S3_SNAPSHOTS" => cfg!(feature = "s3-snapshots"),
+        "CARGO_FEATURE_VECTOR_SEARCH" => cfg!(feature = "vector-search"),
+        "CARGO_FEATURE_VECTOR_SEARCH_LOCAL" => cfg!(feature = "vector-search-local"),
+        _ => false,
+    })
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-    use std::fs;
-    use std::path::Path;
-    use tempfile::TempDir;
-
-    const REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
-
-    fn raw_inputs() -> RawBuildInputs {
-        RawBuildInputs {
-            revision: Some(REVISION.to_owned()),
-            dirty: Some(false),
-            workspace_digest: "b6b44f584f1f23eae6fbc857b48bb749518e3f61576e346d6afc568f3d51d89e"
-                .to_owned(),
-            profile: "release".to_owned(),
-            target: "x86_64-unknown-linux-gnu".to_owned(),
-        }
-    }
-
-    #[test]
-    fn build_info_serializes_exact_public_contract() {
-        let info = build_info_from_inputs(
-            "1.2.3",
-            raw_inputs(),
-            [
-                "vector-search-local",
-                "analytics",
-                "vector-search",
-                "analytics",
-            ],
-        );
-
-        let value = serde_json::to_value(info).unwrap();
-        assert_eq!(
-            value,
-            json!({
-                "schemaVersion": 1,
-                "version": "1.2.3",
-                "revision": REVISION,
-                "revisionKnown": true,
-                "dirty": false,
-                "dirtyKnown": true,
-                "workspaceDigest": "b6b44f584f1f23eae6fbc857b48bb749518e3f61576e346d6afc568f3d51d89e",
-                "profile": "release",
-                "target": "x86_64-unknown-linux-gnu",
-                "features": ["analytics", "vector-search", "vector-search-local"],
-                "capabilities": {
-                    "vectorSearch": true,
-                    "vectorSearchLocal": true
-                }
-            })
-        );
-
-        let serialized = serde_json::to_string(&value).unwrap();
-        for forbidden in [
-            "migration",
-            "Migration",
-            "timestamp",
-            "Timestamp",
-            "/Users/",
-            "/home/",
-            r"C:\\",
-        ] {
-            assert!(!serialized.contains(forbidden), "found {forbidden}");
-        }
-    }
-
-    #[test]
-    fn unknown_vcs_values_serialize_as_honest_null_pairs() {
-        let mut inputs = raw_inputs();
-        inputs.revision = None;
-        inputs.dirty = None;
-
-        let value = serde_json::to_value(build_info_from_inputs(
-            "1.2.3",
-            inputs,
-            std::iter::empty::<&str>(),
-        ))
-        .unwrap();
-        assert_eq!(value["revision"], serde_json::Value::Null);
-        assert_eq!(value["revisionKnown"], false);
-        assert_eq!(value["dirty"], serde_json::Value::Null);
-        assert_eq!(value["dirtyKnown"], false);
-        assert_eq!(
-            value["capabilities"],
-            json!({"vectorSearch": false, "vectorSearchLocal": false})
-        );
-    }
-
-    #[test]
-    fn capability_projection_covers_vector_feature_combinations() {
-        let cases = [
-            (
-                vec![
-                    "analytics",
-                    "axum-support",
-                    "decompound",
-                    "default",
-                    "openapi",
-                    "s3-snapshots",
-                ],
-                false,
-                false,
-            ),
-            (vec!["vector-search"], true, false),
-            (vec!["vector-search-local"], true, true),
-            (vec!["vector-search", "vector-search-local"], true, true),
-        ];
-
-        for (features, vector_search, vector_search_local) in cases {
-            let info = build_info_from_inputs("1.2.3", raw_inputs(), features);
-            assert_eq!(info.capabilities.vector_search, vector_search);
-            assert_eq!(info.capabilities.vector_search_local, vector_search_local);
-            assert!(!info.capabilities.vector_search_local || info.capabilities.vector_search);
-        }
-    }
-
-    #[test]
-    fn enabled_core_features_excludes_umbrella_and_reports_concrete_features() {
-        let mut expected = vec![
-            "analytics",
-            "axum-support",
-            "decompound",
-            "openapi",
-            "s3-snapshots",
-        ];
-        if cfg!(feature = "memory-stats") {
-            expected.push("memory-stats");
-        }
-        if cfg!(feature = "vector-search") {
-            expected.push("vector-search");
-        }
-        if cfg!(feature = "vector-search-local") {
-            expected.push("vector-search-local");
-        }
-        expected.sort_unstable();
-
-        let features = enabled_core_features();
-        assert!(
-            !features.contains(&"default"),
-            "the Cargo umbrella default feature must not be reported as a runtime capability"
-        );
-        assert_eq!(
-            features, expected,
-            "the build must report every enabled concrete capability"
-        );
-    }
-
-    #[test]
-    fn build_info_from_inputs_normalizes_explicit_feature_capabilities() {
-        let info = build_info_from_inputs(
-            "1.2.3",
-            raw_inputs(),
-            ["vector-search-local", "axum-support", "axum-support"],
-        );
-
-        assert_eq!(info.features, vec!["axum-support", "vector-search-local"]);
-        assert!(info.capabilities.vector_search);
-        assert!(info.capabilities.vector_search_local);
-    }
-
-    #[test]
-    fn vcs_discovery_preserves_independent_known_states() {
-        struct Case {
-            name: &'static str,
-            revision_result: Result<&'static str, &'static str>,
-            dirty_result: Result<&'static str, &'static str>,
-            expected_revision: Option<&'static str>,
-            expected_dirty: Option<bool>,
-        }
-
-        let cases = [
-            Case {
-                name: "clean checkout",
-                revision_result: Ok(REVISION),
-                dirty_result: Ok(""),
-                expected_revision: Some(REVISION),
-                expected_dirty: Some(false),
-            },
-            Case {
-                name: "dirty checkout",
-                revision_result: Ok(REVISION),
-                dirty_result: Ok(" M src/lib.rs\n"),
-                expected_revision: Some(REVISION),
-                expected_dirty: Some(true),
-            },
-            Case {
-                name: "git unavailable",
-                revision_result: Err("git unavailable"),
-                dirty_result: Err("git unavailable"),
-                expected_revision: None,
-                expected_dirty: None,
-            },
-            Case {
-                name: "dirty known while revision unavailable",
-                revision_result: Err("not a checkout"),
-                dirty_result: Ok(""),
-                expected_revision: None,
-                expected_dirty: Some(false),
-            },
-            Case {
-                name: "revision known while dirty unavailable",
-                revision_result: Ok(REVISION),
-                dirty_result: Err("status unavailable"),
-                expected_revision: Some(REVISION),
-                expected_dirty: None,
-            },
-        ];
-
-        for case in cases {
-            let vcs = discover_vcs(|arguments| match arguments {
-                ["rev-parse", "HEAD"] => case
-                    .revision_result
-                    .map(str::to_owned)
-                    .map_err(str::to_owned),
-                ["status", "--porcelain"] => {
-                    case.dirty_result.map(str::to_owned).map_err(str::to_owned)
-                }
-                _ => unreachable!("unexpected Git arguments: {arguments:?}"),
-            });
-            assert_eq!(
-                vcs,
-                VcsState {
-                    revision: case.expected_revision.map(str::to_owned),
-                    dirty: case.expected_dirty,
-                },
-                "{}",
-                case.name
-            );
-        }
-    }
-
-    #[test]
-    fn revision_override_is_validated_and_does_not_invent_dirty_state() {
-        let uppercase_revision = REVISION.to_uppercase();
-        let inputs = collect_vcs_inputs(Some(&uppercase_revision), || {
-            panic!("valid override must not require VCS")
-        })
-        .unwrap();
-        assert_eq!(inputs.revision.as_deref(), Some(REVISION));
-        assert_eq!(inputs.dirty, None);
-
-        let revision_with_leading_space = format!(" {REVISION}");
-        for malformed in [
-            "",
-            "abc123",
-            "g123456789abcdef0123456789abcdef01234567",
-            &revision_with_leading_space,
-        ] {
-            let error = collect_vcs_inputs(Some(malformed), VcsState::default).unwrap_err();
-            assert!(error.contains("FLAPJACK_BUILD_REVISION"), "{error}");
-            assert!(error.contains("40 hexadecimal"), "{error}");
-        }
-    }
-
-    #[test]
-    fn vcs_invalidation_tracks_head_and_active_branch_ref() {
-        let paths = vcs_invalidation_paths(|arguments| match arguments {
-            ["rev-parse", "--git-path", "HEAD"] => Ok(".git/worktrees/stage/HEAD\n".to_owned()),
-            ["symbolic-ref", "-q", "HEAD"] => Ok("refs/heads/main\n".to_owned()),
-            ["rev-parse", "--git-path", "refs/heads/main"] => {
-                Ok(".git/refs/heads/main\n".to_owned())
-            }
-            _ => unreachable!("unexpected Git arguments: {arguments:?}"),
-        });
-
-        assert_eq!(
-            paths,
-            vec![
-                PathBuf::from(".git/refs/heads/main"),
-                PathBuf::from(".git/worktrees/stage/HEAD"),
-            ]
-        );
-    }
-
-    #[test]
-    fn workspace_digest_is_order_independent_and_known() {
-        let first = TempDir::new().unwrap();
-        let second = TempDir::new().unwrap();
-        write_fixture(first.path(), false);
-        write_fixture(second.path(), true);
-
-        let first_digest = workspace_digest(first.path()).unwrap();
-        let second_digest = workspace_digest(second.path()).unwrap();
-        assert_eq!(first_digest, second_digest);
-        assert_eq!(
-            first_digest, "e4952c4d3e1bcc82810dd9a5df3f18601f6ffa5dccd08444bd535e75c74b8294",
-            "digest contract must have a fixed known answer"
-        );
-        assert_eq!(first_digest.len(), 64);
-        assert!(first_digest
-            .chars()
-            .all(|character| character.is_ascii_hexdigit()));
-        assert_eq!(first_digest, first_digest.to_lowercase());
-    }
-
-    #[test]
-    fn workspace_digest_changes_for_included_bytes_and_relative_paths() {
-        let fixture = TempDir::new().unwrap();
-        write_fixture(fixture.path(), false);
-        let original = workspace_digest(fixture.path()).unwrap();
-
-        fs::write(fixture.path().join("src/lib.rs"), b"pub fn changed() {}\n").unwrap();
-        let bytes_changed = workspace_digest(fixture.path()).unwrap();
-        assert_ne!(original, bytes_changed);
-
-        fs::rename(
-            fixture.path().join("src/lib.rs"),
-            fixture.path().join("src/renamed.rs"),
-        )
-        .unwrap();
-        let path_changed = workspace_digest(fixture.path()).unwrap();
-        assert_ne!(bytes_changed, path_changed);
-    }
-
-    #[test]
-    fn workspace_digest_includes_nested_rust_sources_with_generated_output_names() {
-        let fixture = TempDir::new().unwrap();
-        write_fixture(fixture.path(), false);
-        let original = workspace_digest(fixture.path()).unwrap();
-
-        write_file(
-            fixture.path(),
-            "src/dist/mod.rs",
-            b"pub fn real_dist_module() {}\n",
-        );
-        let dist_module_digest = workspace_digest(fixture.path()).unwrap();
-        assert_ne!(original, dist_module_digest);
-
-        write_file(
-            fixture.path(),
-            "src/target/mod.rs",
-            b"pub fn real_target_module() {}\n",
-        );
-        let target_module_digest = workspace_digest(fixture.path()).unwrap();
-        assert_ne!(dist_module_digest, target_module_digest);
-
-        let included_paths = workspace_digest_paths(fixture.path()).unwrap();
-        assert!(included_paths
-            .iter()
-            .any(|path| path == Path::new("src/dist/mod.rs")));
-        assert!(included_paths
-            .iter()
-            .any(|path| path == Path::new("src/target/mod.rs")));
-    }
-
-    #[test]
-    fn workspace_digest_ignores_generated_local_metadata_and_absolute_root() {
-        let fixture_root = TempDir::new().unwrap();
-        let first = fixture_root.path().join("ordinary/workspace");
-        let second = fixture_root.path().join("target/workspace");
-        write_fixture(&first, false);
-        write_fixture(&second, false);
-        let expected = workspace_digest(&first).unwrap();
-
-        for relative_path in [
-            ".git/index",
-            "target/debug/flapjack",
-            "node_modules/package/index.js",
-            "dashboard/dist/index.html",
-            ".cache/value",
-            "src/__pycache__/generated.rs",
-            ".DS_Store",
-        ] {
-            write_file(&first, relative_path, b"local mutation");
-        }
-        let included_paths = workspace_digest_paths(&first).unwrap();
-        let actual = workspace_digest(&first).unwrap();
-
-        assert_eq!(actual, expected);
-        assert_eq!(actual, workspace_digest(&second).unwrap());
-        assert!(included_paths.iter().all(|path| !path.is_absolute()));
-        assert!(included_paths.iter().all(|path| !path
-            .to_string_lossy()
-            .contains(first.to_string_lossy().as_ref())));
-    }
-
-    fn write_fixture(root: &Path, reverse_order: bool) {
-        let mut files = vec![
-            ("Cargo.toml", b"[workspace]\n".as_slice()),
-            ("Cargo.lock", b"version = 4\n".as_slice()),
-            ("build.rs", b"fn main() {}\n".as_slice()),
-            ("src/lib.rs", b"pub fn core() {}\n".as_slice()),
-            (
-                "flapjack-http/Cargo.toml",
-                b"[package]\nname = \"flapjack-http\"\n".as_slice(),
-            ),
-            ("flapjack-http/build.rs", b"fn main() {}\n".as_slice()),
-            ("flapjack-http/src/lib.rs", b"pub fn http() {}\n".as_slice()),
-            (
-                "flapjack-server/Cargo.toml",
-                b"[package]\nname = \"flapjack-server\"\n".as_slice(),
-            ),
-            ("flapjack-server/src/main.rs", b"fn main() {}\n".as_slice()),
-            (
-                "flapjack-replication/Cargo.toml",
-                b"[package]\nname = \"flapjack-replication\"\n".as_slice(),
-            ),
-            (
-                "flapjack-replication/src/lib.rs",
-                b"pub fn replication() {}\n".as_slice(),
-            ),
-            (
-                "flapjack-ssl/Cargo.toml",
-                b"[package]\nname = \"flapjack-ssl\"\n".as_slice(),
-            ),
-            ("flapjack-ssl/src/lib.rs", b"pub fn ssl() {}\n".as_slice()),
-        ];
-        if reverse_order {
-            files.reverse();
-        }
-        for (path, contents) in files {
-            write_file(root, path, contents);
-        }
-    }
-
-    fn write_file(root: &Path, relative_path: &str, contents: &[u8]) {
-        let path = root.join(relative_path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, contents).unwrap();
-    }
-}
+#[path = "build_info/tests.rs"]
+mod tests;

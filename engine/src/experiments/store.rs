@@ -147,18 +147,23 @@ impl ExperimentStore {
         id
     }
 
+    fn persist_json<T: serde::Serialize>(
+        &self,
+        file_name: &str,
+        value: &T,
+    ) -> Result<(), ExperimentError> {
+        let data = serde_json::to_string_pretty(value)?;
+        crate::index::utils::atomic_write(&self.dir.join(file_name), data.as_bytes())?;
+        Ok(())
+    }
+
     fn persist_id_map(&self) -> Result<(), ExperimentError> {
         let map: std::collections::HashMap<String, i64> = self
             .id_to_numeric
             .iter()
             .map(|entry| (entry.key().clone(), *entry.value()))
             .collect();
-        let tmp_path = self.dir.join("_id_map.json.tmp");
-        let final_path = self.dir.join("_id_map.json");
-        let data = serde_json::to_string_pretty(&map)?;
-        std::fs::write(&tmp_path, data)?;
-        std::fs::rename(&tmp_path, &final_path)?;
-        Ok(())
+        self.persist_json("_id_map.json", &map)
     }
 
     /// Get the numeric (Algolia-compatible) integer ID for a UUID experiment.
@@ -190,13 +195,12 @@ impl ExperimentStore {
         i64::try_from(millis).ok()
     }
 
-    fn atomic_write(&self, experiment: &Experiment) -> Result<(), ExperimentError> {
-        let tmp_path = self.dir.join(format!("{}.json.tmp", experiment.id));
-        let final_path = self.dir.join(format!("{}.json", experiment.id));
-        let data = serde_json::to_string_pretty(experiment)?;
-        std::fs::write(&tmp_path, data)?;
-        std::fs::rename(&tmp_path, &final_path)?;
-        Ok(())
+    /// Serialize an experiment and durably publish it as `<id>.json` through the
+    /// canonical atomic-write owner. This helper owns only path/data assembly;
+    /// temp naming, `sync_all`, atomic rename, cleanup, and parent fsync belong
+    /// to `crate::index::utils::atomic_write`.
+    fn persist_experiment(&self, experiment: &Experiment) -> Result<(), ExperimentError> {
+        self.persist_json(&format!("{}.json", experiment.id), experiment)
     }
 
     pub fn create(&self, experiment: Experiment) -> Result<Experiment, ExperimentError> {
@@ -205,7 +209,7 @@ impl ExperimentStore {
             return Err(ExperimentError::AlreadyExists(experiment.id));
         }
         self.register_active_if_running(&experiment)?;
-        self.atomic_write(&experiment)?;
+        self.persist_experiment(&experiment)?;
         self.assign_numeric_id(&experiment.id);
         self.persist_id_map()?;
         self.experiments
@@ -257,7 +261,7 @@ impl ExperimentStore {
             )));
         }
         experiment.validate()?;
-        self.atomic_write(&experiment)?;
+        self.persist_experiment(&experiment)?;
         self.experiments
             .insert(experiment.id.clone(), experiment.clone());
         Ok(experiment)
@@ -288,7 +292,7 @@ impl ExperimentStore {
         }
         experiment.status = ExperimentStatus::Running;
         experiment.started_at = Some(now_ms());
-        self.atomic_write(&experiment)?;
+        self.persist_experiment(&experiment)?;
         self.experiments.insert(id.to_string(), experiment.clone());
         self.active_by_index
             .insert(experiment.index_name.clone(), experiment.id.clone());
@@ -316,7 +320,7 @@ impl ExperimentStore {
         let running_snapshot = experiment.clone();
         experiment.status = ExperimentStatus::Stopped;
         experiment.stopped_at = Some(now_ms());
-        self.atomic_write(&experiment)?;
+        self.persist_experiment(&experiment)?;
         self.experiments.insert(id.to_string(), experiment.clone());
         self.unregister_active_if_running(&running_snapshot);
         Ok(experiment)
@@ -362,7 +366,7 @@ impl ExperimentStore {
             experiment.stopped_at = Some(now_ms());
         }
         experiment.conclusion = Some(conclusion);
-        self.atomic_write(&experiment)?;
+        self.persist_experiment(&experiment)?;
         self.experiments.insert(id.to_string(), experiment.clone());
         Ok(experiment)
     }

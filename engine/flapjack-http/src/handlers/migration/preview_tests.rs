@@ -1,4 +1,5 @@
 use super::algolia_client::AlgoliaIndexRecord;
+use super::meilisearch_client::MEILISEARCH_PREVIEW_LOOPBACK_ENV;
 use super::source_reader::{
     SourceConfigurationArtifact, SourceConfigurationRecord, SourceExportSink,
 };
@@ -27,7 +28,6 @@ const SERVED_SOURCE_RECORD_COUNT: usize = 3;
 const MEILISEARCH_LIVE_ENDPOINT_ENV: &str = "FJ_MEILISEARCH_PREVIEW_ENDPOINT";
 const MEILISEARCH_LIVE_API_KEY_ENV: &str = "FJ_MEILISEARCH_PREVIEW_API_KEY";
 const MEILISEARCH_LIVE_EXPECTED_RECORDS_ENV: &str = "FJ_MEILISEARCH_PREVIEW_EXPECTED_RECORDS";
-const MEILISEARCH_LOOPBACK_OPT_IN_ENV: &str = "FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK";
 // 51 = two 21-entry IndexManager index trees + three publication-namespace
 // entries + two KeyStore files + four migration-export entries.
 const DURABLE_STATE_SPECIMEN_COUNT: usize = 51;
@@ -295,6 +295,26 @@ async fn post_provider_preview(
     post_migration_route(app, format!("/1/migrations/{provider}/preview"), body).await
 }
 
+fn algolia_preview_app(tmp: &TempDir) -> axum::Router {
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let source_factory = TestMigrationSourceReaderFactory::new(|source_provider| {
+        assert_eq!(source_provider, AsyncMigrationSourceProvider::Algolia);
+        Ok(Box::new(preview_source_reader()))
+    });
+    build_test_router(tmp, Some(key_store)).layer(Extension(source_factory))
+}
+
+fn sorted_object_keys(value: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .unwrap_or_else(|| panic!("expected a JSON object, got {value}"))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
 async fn post_provider_submit(
     app: &axum::Router,
     provider: &str,
@@ -319,12 +339,7 @@ async fn preview_http_report_matches_translation_owner_and_exact_source_counts()
     );
 
     let tmp = TempDir::new().unwrap();
-    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
-    let source_factory = TestMigrationSourceReaderFactory::new(|source_provider| {
-        assert_eq!(source_provider, AsyncMigrationSourceProvider::Algolia);
-        Ok(Box::new(preview_source_reader()))
-    });
-    let app = build_test_router(&tmp, Some(key_store)).layer(Extension(source_factory));
+    let app = algolia_preview_app(&tmp);
 
     let response = post_preview(&app).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -430,15 +445,75 @@ fn meilisearch_preview_preserves_provider_native_settings_payload() {
     );
 }
 
+/// `flapjack-server/src/migrate.rs` declares its own deserialize-only
+/// `MigrationPreviewResponse` because this owner is serialize-only with private
+/// fields, so the two shapes have no compiler-enforced link. This test is that
+/// link: renaming or dropping a key here fails now, instead of leaving
+/// `flapjack migrate preview` to fail at runtime against a real server with
+/// "migration preview returned an incompatible response". Exact key sets are
+/// pinned only where the CLI model declares every key; entries carry
+/// server-only keys, so they are pinned per CLI-consumed key.
+#[tokio::test]
+async fn preview_response_pins_the_json_keys_the_migrate_cli_deserializes() {
+    let tmp = TempDir::new().unwrap();
+    let app = algolia_preview_app(&tmp);
+
+    let response = post_preview(&app).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+
+    assert_eq!(sorted_object_keys(&body), ["report", "sourceCounts"]);
+    assert_eq!(
+        sorted_object_keys(&body["report"]),
+        ["entries", "reportDigest", "summary"]
+    );
+    assert_eq!(
+        sorted_object_keys(&body["sourceCounts"]),
+        ["indexes", "records"]
+    );
+    for count in ["indexes", "records"] {
+        assert!(
+            body["sourceCounts"][count].is_u64(),
+            "the CLI model deserializes sourceCounts.{count} as usize"
+        );
+    }
+
+    let summary = &body["report"]["summary"];
+    assert_eq!(
+        sorted_object_keys(summary),
+        ["hardRejections", "scopeGaps", "totalEntries", "warnings"]
+    );
+    for count in ["hardRejections", "scopeGaps", "totalEntries", "warnings"] {
+        assert!(
+            summary[count].is_u64(),
+            "the CLI model deserializes summary.{count} as usize, and gates its exit code on \
+             hardRejections"
+        );
+    }
+    assert!(
+        body["report"]["reportDigest"].is_string() || body["report"]["reportDigest"].is_null(),
+        "the CLI model deserializes reportDigest as Option<String>"
+    );
+
+    let entry = body["report"]["entries"]
+        .get(0)
+        .expect("the preview fixture must report at least one entry");
+    // Entries carry keys the CLI's model does not declare (`pageIndex`,
+    // `itemIndex`), and serde ignores them, so pin presence and type of the
+    // four keys the CLI actually deserializes instead of the whole key set.
+    for rendered in ["code", "jsonPath", "resource", "severity"] {
+        assert!(
+            entry.get(rendered).is_some_and(Value::is_string),
+            "the CLI deserializes and renders entry.{rendered} as a String, got {:?}",
+            entry.get(rendered)
+        );
+    }
+}
+
 #[tokio::test]
 async fn preview_does_not_write_durable_state_byte_identity() {
     let tmp = TempDir::new().unwrap();
-    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
-    let source_factory = TestMigrationSourceReaderFactory::new(|source_provider| {
-        assert_eq!(source_provider, AsyncMigrationSourceProvider::Algolia);
-        Ok(Box::new(preview_source_reader()))
-    });
-    let app = build_test_router(&tmp, Some(key_store)).layer(Extension(source_factory));
+    let app = algolia_preview_app(&tmp);
     let before = seed_durable_state_specimens(tmp.path()).await;
     let response = post_preview(&app).await;
     assert_preview_preserves_durable_state(tmp.path(), before, response).await;
@@ -447,12 +522,7 @@ async fn preview_does_not_write_durable_state_byte_identity() {
 #[tokio::test]
 async fn preview_leaves_absent_target_and_unopened_publication_namespace_absent() {
     let tmp = TempDir::new().unwrap();
-    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
-    let source_factory = TestMigrationSourceReaderFactory::new(|source_provider| {
-        assert_eq!(source_provider, AsyncMigrationSourceProvider::Algolia);
-        Ok(Box::new(preview_source_reader()))
-    });
-    let app = build_test_router(&tmp, Some(key_store)).layer(Extension(source_factory));
+    let app = algolia_preview_app(&tmp);
     let target_index = tmp.path().join("shop");
     let publication_namespace = tmp.path().join(".publication");
 
@@ -483,7 +553,7 @@ async fn preview_leaves_absent_target_and_unopened_publication_namespace_absent(
 #[tokio::test]
 #[ignore = "invoked by tests/meilisearch_source_contract_kat.sh --preview-live"]
 async fn meilisearch_live_preview_reports_exact_seeded_counts_and_codes() {
-    let _env = with_env_var(MEILISEARCH_LOOPBACK_OPT_IN_ENV, "1");
+    let _env = with_env_var(MEILISEARCH_PREVIEW_LOOPBACK_ENV, "1");
     let endpoint = env::var(MEILISEARCH_LIVE_ENDPOINT_ENV)
         .expect("Meilisearch preview endpoint must be supplied by the live KAT owner");
     let source_api_key = env::var(MEILISEARCH_LIVE_API_KEY_ENV)

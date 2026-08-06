@@ -3,7 +3,6 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
-#[cfg(debug_assertions)]
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -16,8 +15,10 @@ pub(super) const MAX_DOCUMENT_PAGES: usize = 10_000;
 pub(super) const MAX_DOCUMENT_ITEMS: usize = 1_000_000;
 pub(super) const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MEILISEARCH_CLOUD_HOST_SUFFIX: &str = ".meilisearch.io";
-#[cfg(debug_assertions)]
-const MEILISEARCH_PREVIEW_LOOPBACK_ENV: &str = "FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK";
+/// Opt-in that makes the literal-loopback fixture seam reachable. It is read in
+/// every profile, so the shipped binary can serve the live contract fixture,
+/// and the seam stays closed unless an operator sets it to `1`.
+pub(super) const MEILISEARCH_PREVIEW_LOOPBACK_ENV: &str = "FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct TraversalLimits {
@@ -69,6 +70,13 @@ impl MeilisearchClientError {
 
     pub(super) fn safe_message(&self) -> &'static str {
         self.message
+    }
+
+    /// True for the single sanitized endpoint refusal every admission path
+    /// returns, so callers can chain a fallback admission attempt without
+    /// re-stating the refusal text or re-deriving the validation details.
+    pub(super) fn is_endpoint_not_allowed(&self) -> bool {
+        *self == meilisearch_endpoint_not_allowed()
     }
 }
 
@@ -132,7 +140,10 @@ impl MeilisearchClient {
         )
     }
 
-    #[cfg(debug_assertions)]
+    /// Admit the literal-loopback fixture endpoint the live contract harness
+    /// serves. This compiles in every profile, so the shipped binary can reach
+    /// the seam, but only behind the explicit
+    /// `FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK=1` opt-in enforced below.
     pub(super) fn new_preview_loopback(
         endpoint: &str,
         api_key: &str,
@@ -142,8 +153,8 @@ impl MeilisearchClient {
         Self::from_admitted_loopback_endpoint(endpoint, api_key, Some(source_index))
     }
 
-    /// Debug-only discovery counterpart to [`Self::new_preview_loopback`].
-    #[cfg(debug_assertions)]
+    /// Discovery counterpart to [`Self::new_preview_loopback`], under the same
+    /// opt-in.
     pub(super) fn new_discovery_preview_loopback(
         endpoint: &str,
         api_key: &str,
@@ -152,15 +163,15 @@ impl MeilisearchClient {
         Self::from_admitted_loopback_endpoint(endpoint, api_key, None)
     }
 
-    #[cfg(debug_assertions)]
     fn from_admitted_loopback_endpoint(
         endpoint: &str,
         api_key: &str,
         source_index: Option<&str>,
     ) -> Result<Self, MeilisearchClientError> {
-        // This feature exists only for the live contract fixture. Fail before
-        // parsing or vetting attacker-controlled endpoints so the disabled
-        // default cannot trigger DNS resolution as a side effect.
+        // This seam exists only for the live contract fixture, and it is
+        // production-reachable only when the operator sets the opt-in. Fail
+        // before parsing or vetting attacker-controlled endpoints so the
+        // disabled default cannot trigger DNS resolution as a side effect.
         if !preview_loopback_enabled() {
             return Err(meilisearch_preview_loopback_disabled());
         }
@@ -361,7 +372,6 @@ fn meilisearch_endpoint_not_allowed() -> MeilisearchClientError {
     )
 }
 
-#[cfg(debug_assertions)]
 fn meilisearch_preview_loopback_disabled() -> MeilisearchClientError {
     MeilisearchClientError::new(
         MeilisearchErrorKind::Validation,
@@ -369,7 +379,6 @@ fn meilisearch_preview_loopback_disabled() -> MeilisearchClientError {
     )
 }
 
-#[cfg(debug_assertions)]
 fn preview_loopback_enabled() -> bool {
     matches!(
         std::env::var(MEILISEARCH_PREVIEW_LOOPBACK_ENV).as_deref(),

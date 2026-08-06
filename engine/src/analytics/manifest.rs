@@ -80,10 +80,7 @@ impl RollupManifest {
             fs::create_dir_all(parent)?;
         }
 
-        let tmp_path = path.with_extension("json.tmp");
-        fs::write(&tmp_path, json)?;
-        fs::rename(&tmp_path, path)?;
-        Ok(())
+        crate::index::utils::atomic_write(path, json.as_bytes())
     }
 
     pub fn has_complete_coverage(&self, date: &str, tier: &str) -> bool {
@@ -424,6 +421,27 @@ mod tests {
         assert!(path.exists());
         let tmp = path.with_extension("json.tmp");
         assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn manifest_save_removes_temp_after_failed_rename() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("manifest.json");
+        fs::create_dir(&path).unwrap();
+
+        RollupManifest::new("products")
+            .save(&path)
+            .expect_err("renaming a completed manifest over a directory must fail");
+
+        assert!(
+            path.is_dir(),
+            "rename must leave the target directory intact"
+        );
+        assert!(!path.is_file(), "failed rename must not publish a file");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "failed rename must remove the completed manifest temp file"
+        );
     }
 
     // ── JSON format ─────────────────────────────────────────────────────

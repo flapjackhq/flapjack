@@ -10,22 +10,67 @@
  * - Embedder deletion via confirm dialog
  * - Settings persistence after save + reload
  */
-import type { Page, Response } from '@playwright/test';
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import type { APIRequestContext, Page, Response } from '@playwright/test';
 import { test, expect } from '../../fixtures/auth.fixture';
 import { waitForSearchResultsOrEmptyState } from '../helpers';
 import {
+  P20_TEXT_ONLY_CONTROL_TEST_TITLE,
+  installTextOnlyNegativeControlCapability,
+  isP20TextOnlyNegativeControl,
+  waitForTextOnlyNegativeControlReadiness,
+} from '../../fixtures/p20_negative_control';
+import {
+  addDocumentsWithVectors,
   configureEmbedder,
   createIndex,
   deleteIndex,
   getSettings,
   readEmbeddersFromSettings,
+  searchIndex,
   skipWhenVectorSearchDisabled,
   updateSettings,
   waitForEmbedder,
   waitForEmbedderRemoval,
+  waitForSearchableObjectIds,
 } from '../../fixtures/api-helpers';
 
 const VECTOR_ENABLED_MESSAGE = 'Vector-settings e2e flows require a vector-search-enabled build';
+const VECTOR_PROOF_QUERY = 'ergonomic posture';
+const VECTOR_PROOF_TARGET_ID = 'semantic-chair';
+const VECTOR_PROOF_TARGET_NAME = 'Lumbar Support Chair';
+const VECTOR_PROOF_KEYWORD_DECOY_ID = 'keyword-decoy';
+const VECTOR_PROOF_KEYWORD_DECOY_NAME = 'Ergonomic Posture Keyword Decoy';
+const VECTOR_PROOF_STANDING_DESK_ID = 'standing-desk';
+const VECTOR_PROOF_STANDING_DESK_NAME = 'Standing Desk Converter';
+const VECTOR_PROOF_SUPPORTING_IDS = [
+  VECTOR_PROOF_KEYWORD_DECOY_ID,
+  VECTOR_PROOF_STANDING_DESK_ID,
+];
+const VECTOR_PROOF_TARGET_DOCUMENTS = [
+  {
+    objectID: VECTOR_PROOF_TARGET_ID,
+    name: VECTOR_PROOF_TARGET_NAME,
+    description: 'Adjustable seating with lower-back support for long focus sessions.',
+    _vectors: { default: [0.99, 0.05, 0] },
+  },
+];
+const VECTOR_PROOF_SUPPORTING_DOCUMENTS = [
+  {
+    objectID: VECTOR_PROOF_KEYWORD_DECOY_ID,
+    name: VECTOR_PROOF_KEYWORD_DECOY_NAME,
+    description: 'Keyword-heavy document intentionally far from the semantic query vector.',
+    _vectors: { default: [0, 0, 1] },
+  },
+  {
+    objectID: VECTOR_PROOF_STANDING_DESK_ID,
+    name: VECTOR_PROOF_STANDING_DESK_NAME,
+    description: 'Workspace riser for alternating between sitting and standing.',
+    _vectors: { default: [0, 1, 0] },
+  },
+];
+const P20_TEXT_ONLY_NEGATIVE_CONTROL = isP20TextOnlyNegativeControl();
 
 async function openVectorTab(page: Page) {
   await page.getByRole('tab', { name: 'Vector / AI' }).click();
@@ -51,6 +96,98 @@ async function saveVectorSettings(page: Page, indexName: string): Promise<void> 
   );
   await saveButton.click();
   await saveResponsePromise;
+}
+
+function vectorForText(text: string): number[] {
+  return text.toLowerCase().includes(VECTOR_PROOF_QUERY) ? [1, 0, 0] : [0, 0, 1];
+}
+
+async function readRequestBody(request: NodeJS.ReadableStream): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+function parseEmbedderInput(body: string): string {
+  try {
+    const parsed = JSON.parse(body) as { input?: unknown };
+    return typeof parsed.input === 'string' ? parsed.input : '';
+  } catch {
+    return '';
+  }
+}
+
+async function startDeterministicEmbedder(): Promise<{ server: Server; url: string }> {
+  const server = createServer(async (request, response) => {
+    const input = parseEmbedderInput(await readRequestBody(request));
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ embedding: vectorForText(input) }));
+  });
+
+  await new Promise<void>((resolve) => {
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address() as AddressInfo;
+  return { server, url: `http://127.0.0.1:${address.port}/embed` };
+}
+
+async function stopDeterministicEmbedder(server: Server): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
+}
+
+function extractObjectIds(hits: unknown[] | undefined): string[] {
+  if (!Array.isArray(hits)) {
+    return [];
+  }
+
+  return hits
+    .map((hit) => {
+      if (!hit || typeof hit !== 'object') {
+        return '';
+      }
+      const objectID = (hit as Record<string, unknown>).objectID;
+      return typeof objectID === 'string' ? objectID : '';
+    })
+    .filter((value): value is string => value.length > 0);
+}
+
+async function expectKeywordOnlyMissesVectorTarget(
+  request: APIRequestContext,
+  indexName: string,
+): Promise<void> {
+  await expect(async () => {
+    const response = await searchIndex(request, indexName, VECTOR_PROOF_QUERY, {
+      hitsPerPage: 10,
+      mode: 'keywordSearch',
+    });
+    expect(extractObjectIds(response.hits)).not.toContain(VECTOR_PROOF_TARGET_ID);
+  }).toPass({ timeout: 15_000 });
+}
+
+async function waitForP20TargetReadiness(
+  request: APIRequestContext,
+  indexName: string,
+): Promise<void> {
+  if (P20_TEXT_ONLY_NEGATIVE_CONTROL) {
+    await waitForTextOnlyNegativeControlReadiness({
+      request,
+      indexName,
+      targetObjectId: VECTOR_PROOF_TARGET_ID,
+    });
+    return;
+  }
+
+  await waitForSearchableObjectIds(
+    request,
+    indexName,
+    VECTOR_PROOF_QUERY,
+    [VECTOR_PROOF_TARGET_ID],
+    { hitsPerPage: 10, mode: 'neuralSearch' },
+  );
 }
 
 test.describe('Vector Search Settings', () => {
@@ -88,17 +225,11 @@ test.describe('Vector Search Settings', () => {
     page,
   }) => {
     await page.route('**/health', async (route) => {
-      const response = await route.fetch();
-      const health = await response.json();
       await route.fulfill({
-        response,
+        status: 200,
         json: {
-          ...health,
-          capabilities: {
-            ...health.capabilities,
-            vectorSearch: false,
-            vectorSearchLocal: false,
-          },
+          status: 'ok',
+          capabilities: { vectorSearch: false, vectorSearchLocal: false },
         },
       });
     });
@@ -118,7 +249,16 @@ test.describe('Vector Search Settings', () => {
 
   test.describe('vector-enabled settings flows', () => {
     test.beforeEach(async ({ request, page }, testInfo) => {
-      await skipWhenVectorSearchDisabled(request, testInfo, VECTOR_ENABLED_MESSAGE);
+      // The text-only negative control stubs the browser capability answer for its own single
+      // test only; every other test keeps the real capability gate and skips when disabled.
+      if (
+        P20_TEXT_ONLY_NEGATIVE_CONTROL &&
+        testInfo.title === P20_TEXT_ONLY_CONTROL_TEST_TITLE
+      ) {
+        await installTextOnlyNegativeControlCapability(page);
+      } else {
+        await skipWhenVectorSearchDisabled(request, testInfo, VECTOR_ENABLED_MESSAGE);
+      }
 
       // Save original settings for cleanup
       originalSettings = await getSettings(request, vectorTestIndex);
@@ -178,7 +318,8 @@ test.describe('Vector Search Settings', () => {
 
     // ---- Set search mode (10.21 vector-settings-2) ----
 
-    test('set search mode to Neural Search and verify persistence', async ({ page }) => {
+    test('set search mode to Neural Search and verify persistence', async ({ page, request }) => {
+      test.setTimeout(60_000);
       await expect(page.getByTestId('search-mode-select')).toBeVisible({
         timeout: 10_000,
       });
@@ -198,6 +339,59 @@ test.describe('Vector Search Settings', () => {
         'neuralSearch',
         { timeout: 10_000 },
       );
+
+      const embedder = await startDeterministicEmbedder();
+      try {
+        await configureEmbedder(request, vectorTestIndex, 'default', {
+          source: 'rest',
+          url: embedder.url,
+          dimensions: 3,
+          request: { input: '{{text}}' },
+          response: { embedding: '{{embedding}}' },
+        });
+        await waitForEmbedder(request, vectorTestIndex, 'default');
+        await addDocumentsWithVectors(
+          request,
+          vectorTestIndex,
+          VECTOR_PROOF_SUPPORTING_DOCUMENTS,
+        );
+        await waitForSearchableObjectIds(
+          request,
+          vectorTestIndex,
+          '',
+          VECTOR_PROOF_SUPPORTING_IDS,
+          { hitsPerPage: 10, mode: 'keywordSearch' },
+        );
+        await addDocumentsWithVectors(
+          request,
+          vectorTestIndex,
+          VECTOR_PROOF_TARGET_DOCUMENTS,
+        );
+        await waitForP20TargetReadiness(request, vectorTestIndex);
+        await expectKeywordOnlyMissesVectorTarget(request, vectorTestIndex);
+
+        await page.goto(`/index/${vectorTestIndex}`);
+        await expect(page.getByTestId('hybrid-controls')).toBeVisible({
+          timeout: 15_000,
+        });
+        await page.getByTestId('semantic-ratio-slider').fill('1');
+        await expect(page.getByTestId('semantic-ratio-label')).toHaveText(
+          'Semantic only',
+        );
+
+        const searchInput = page.getByPlaceholder(/search documents/i);
+        await searchInput.fill(VECTOR_PROOF_QUERY);
+        await searchInput.press('Enter');
+
+        const semanticResult = page
+          .getByTestId('results-panel')
+          .getByTestId('document-card')
+          .filter({ hasText: VECTOR_PROOF_TARGET_ID });
+        await expect(semanticResult).toBeVisible({ timeout: 15_000 });
+        await expect(semanticResult).toContainText(VECTOR_PROOF_TARGET_NAME);
+      } finally {
+        await stopDeterministicEmbedder(embedder.server);
+      }
     });
 
     // ---- Add embedder (10.21 vector-settings-3) ----

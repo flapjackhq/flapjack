@@ -18,7 +18,7 @@ pub mod snapshot;
 pub mod storage_size;
 pub mod synonyms;
 pub mod task_queue;
-mod utils;
+pub(crate) mod utils;
 pub mod version_store;
 pub mod write_queue;
 pub mod writer;

@@ -848,19 +848,31 @@ pub(crate) fn write_parquet_file(path: &Path, batch: RecordBatch) -> Result<(), 
     }
     reject_symlink_if_exists(path, "parquet file path")?;
 
+    let file =
+        fs::File::create(path).map_err(|e| format!("Failed to create parquet file: {}", e))?;
+    let schema = batch.schema();
+    write_parquet_batches(file, schema, &[batch])
+}
+
+/// Stream record batches into an open parquet target with the ZSTD compression
+/// and 100 000-row group size shared by every parquet writer in this module.
+fn write_parquet_batches<W: std::io::Write + Send>(
+    target: W,
+    schema: Arc<arrow::datatypes::Schema>,
+    batches: &[RecordBatch],
+) -> Result<(), String> {
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
         .set_max_row_group_size(100_000)
         .build();
 
-    let file =
-        fs::File::create(path).map_err(|e| format!("Failed to create parquet file: {}", e))?;
-    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))
+    let mut writer = ArrowWriter::try_new(target, schema, Some(props))
         .map_err(|e| format!("Failed to create arrow writer: {}", e))?;
-
-    writer
-        .write(&batch)
-        .map_err(|e| format!("Failed to write batch: {}", e))?;
+    for batch in batches {
+        writer
+            .write(batch)
+            .map_err(|e| format!("Failed to write batch: {}", e))?;
+    }
     writer
         .close()
         .map_err(|e| format!("Failed to close writer: {}", e))?;
@@ -868,49 +880,43 @@ pub(crate) fn write_parquet_file(path: &Path, batch: RecordBatch) -> Result<(), 
     Ok(())
 }
 
-/// Persist a complete parquet file before atomically publishing it at `path`.
+/// Bridge the parquet writers to the canonical streaming atomic-write owner.
 ///
-/// The temporary extension is intentionally not `.parquet`, so concurrent
-/// analytics readers only discover the previous complete file or its complete
-/// replacement.
+/// `crate::index::utils::atomic_write_stream` owns temp naming (intentionally
+/// not `.parquet`, so concurrent readers only discover a complete file),
+/// payload `sync_all`, atomic rename, failed-write cleanup, and parent-directory
+/// fsync. This bridge only adapts the owner's `io::Error` surface to the parquet
+/// writers' `String` errors while preserving destination context. It owns no
+/// temp, rename, or cleanup logic of its own.
+fn write_parquet_atomically(
+    path: &Path,
+    destination_context: &str,
+    write_payload: impl FnOnce(&mut fs::File) -> Result<(), String>,
+) -> Result<(), String> {
+    let result = crate::index::utils::atomic_write_stream(
+        path,
+        |file| write_payload(file).map_err(std::io::Error::other),
+        |_| reject_symlink_if_exists(path, "parquet destination").map_err(std::io::Error::other),
+    );
+    result.map_err(|error| format!("{destination_context}: {error}"))
+}
+
+/// Persist a complete parquet file before atomically publishing it at `path`.
 pub(crate) fn write_parquet_file_atomic(path: &Path, batch: RecordBatch) -> Result<(), String> {
-    reject_symlink_if_exists(path, "parquet destination")?;
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp_path = path.with_extension(format!("parquet.{}.tmp", now_ns));
-    write_parquet_file(&tmp_path, batch)?;
-    fs::File::open(&tmp_path)
-        .and_then(|file| file.sync_all())
-        .map_err(|e| {
-            format!(
-                "Failed to sync temp parquet file {} before rename: {}",
-                tmp_path.display(),
-                e
-            )
-        })?;
-    reject_symlink_if_exists(path, "parquet destination")?;
-    fs::rename(&tmp_path, path).map_err(|e| {
-        format!(
-            "Failed to atomically replace parquet file {} with {}: {}",
-            path.display(),
-            tmp_path.display(),
-            e
-        )
-    })?;
     if let Some(parent) = path.parent() {
-        fs::File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|e| {
-                format!(
-                    "Failed to sync parquet directory {} after rename: {}",
-                    parent.display(),
-                    e
-                )
-            })?;
+        reject_symlink_if_exists(parent, "parquet parent dir")?;
     }
-    Ok(())
+    reject_symlink_if_exists(path, "parquet destination")?;
+    let schema = batch.schema();
+    let batches = [batch];
+    write_parquet_atomically(
+        path,
+        &format!(
+            "Failed to atomically replace parquet file {}",
+            path.display()
+        ),
+        |file| write_parquet_batches(&mut *file, schema, &batches),
+    )
 }
 
 /// GeoIP enrichment has already run at this persistence boundary, so `/24` for
@@ -1295,58 +1301,11 @@ fn rewrite_parquet_file(
     schema: Arc<arrow::datatypes::Schema>,
     batches: &[RecordBatch],
 ) -> Result<(), String> {
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp_path = path.with_extension(format!("parquet.{}.tmp", now_ns));
-
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(Default::default()))
-        .set_max_row_group_size(100_000)
-        .build();
-
-    let tmp_file = fs::File::create(&tmp_path).map_err(|e| {
-        format!(
-            "Failed to create temp parquet file {}: {}",
-            tmp_path.display(),
-            e
-        )
-    })?;
-    let mut writer = ArrowWriter::try_new(tmp_file, schema, Some(props)).map_err(|e| {
-        format!(
-            "Failed to create parquet writer {}: {}",
-            tmp_path.display(),
-            e
-        )
-    })?;
-    for batch in batches {
-        writer.write(batch).map_err(|e| {
-            format!(
-                "Failed to write temp parquet batch {}: {}",
-                tmp_path.display(),
-                e
-            )
-        })?;
-    }
-    writer.close().map_err(|e| {
-        format!(
-            "Failed to close temp parquet writer {}: {}",
-            tmp_path.display(),
-            e
-        )
-    })?;
-
-    fs::rename(&tmp_path, path).map_err(|e| {
-        format!(
-            "Failed to replace parquet file {} with {}: {}",
-            path.display(),
-            tmp_path.display(),
-            e
-        )
-    })?;
-
-    Ok(())
+    write_parquet_atomically(
+        path,
+        &format!("Failed to replace parquet file {}", path.display()),
+        |file| write_parquet_batches(&mut *file, schema, batches),
+    )
 }
 
 #[cfg(test)]
@@ -1525,6 +1484,175 @@ mod tests {
             make("xyzzy", 0, false, 5_000, "user-a"),
             make("zzznothing", 0, false, 6_000, "user-d"),
         ]
+    }
+
+    /// Classifies leaked temporaries through the canonical owner so these guards
+    /// stay live if `atomic_write` ever changes its temp naming.
+    fn leaked_temp_files(dir: &Path) -> Vec<PathBuf> {
+        let mut paths: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| crate::index::utils::is_temporary_entry(path))
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn write_parquet_atomically_payload_error_names_destination() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("rollup.parquet");
+        let destination_context = format!("Failed to replace parquet file {}", path.display());
+
+        let error = write_parquet_atomically(&path, &destination_context, |_| {
+            Err("injected parquet payload failure".to_string())
+        })
+        .expect_err("payload failures must remain attributable to their destination");
+
+        assert!(
+            error.contains(path.to_string_lossy().as_ref()),
+            "payload error must identify destination {}: {error}",
+            path.display()
+        );
+        assert!(
+            error.contains("injected parquet payload failure"),
+            "payload error must preserve its cause: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_parquet_atomically_rechecks_destination_after_payload_write() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("search_events.parquet");
+        let outside = tmp.path().join("outside.parquet");
+        fs::write(&outside, b"outside").unwrap();
+        let destination_context = format!(
+            "Failed to atomically replace parquet file {}",
+            path.display()
+        );
+
+        let error = write_parquet_atomically(&path, &destination_context, |file| {
+            std::io::Write::write_all(file, b"complete parquet payload")
+                .map_err(|write_error| write_error.to_string())?;
+            symlink(&outside, &path).map_err(|symlink_error| symlink_error.to_string())?;
+            Ok(())
+        })
+        .expect_err("a symlink introduced after payload writing must block publication");
+
+        assert!(
+            error.contains("refusing symlinked parquet destination"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the destination symlink must not be replaced"
+        );
+        assert!(
+            leaked_temp_files(tmp.path()).is_empty(),
+            "failed publication must clean up its temporary parquet file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_parquet_file_atomic_rejects_symlinked_parent_dir() {
+        let tmp = TempDir::new().unwrap();
+        let partition_dir = tmp.path().join("date=2026-08-05");
+        let outside_dir = tmp.path().join("outside");
+        fs::create_dir(&outside_dir).unwrap();
+        symlink(&outside_dir, &partition_dir).unwrap();
+        let path = partition_dir.join("search_events.parquet");
+        let schema = search_event_schema();
+        let batch =
+            search_events_to_batch(&fixture_events(base_ts_2025_06_15_noon()), &schema).unwrap();
+
+        let error = write_parquet_file_atomic(&path, batch)
+            .expect_err("atomic parquet publish must reject symlinked parent directories");
+
+        assert!(
+            error.contains("refusing symlinked parquet parent dir"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            fs::read_dir(&outside_dir).unwrap().next().is_none(),
+            "atomic parquet publish must not write through a symlinked parent"
+        );
+        assert!(
+            leaked_temp_files(tmp.path()).is_empty(),
+            "failed publication must clean up its temporary parquet file"
+        );
+    }
+
+    #[test]
+    fn write_parquet_file_atomic_removes_temp_after_failed_rename() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("search_events.parquet");
+        fs::create_dir(&path).unwrap();
+        let schema = search_event_schema();
+        let batch =
+            search_events_to_batch(&fixture_events(base_ts_2025_06_15_noon()), &schema).unwrap();
+
+        let error = write_parquet_file_atomic(&path, batch)
+            .expect_err("renaming a completed parquet file over a directory must fail");
+
+        assert!(
+            error.contains("Failed to atomically replace parquet file"),
+            "test must reach the rename failure, got: {error}"
+        );
+        assert!(
+            path.is_dir(),
+            "rename must leave the target directory intact"
+        );
+        let leaked = leaked_temp_files(tmp.path());
+        assert!(
+            leaked.is_empty(),
+            "failed rename must remove completed parquet temp files, found: {leaked:?}"
+        );
+    }
+
+    #[test]
+    fn rewrite_parquet_file_removes_temp_after_failed_rename() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("rollup.parquet");
+        fs::create_dir(&path).unwrap();
+        let schema = search_rollup_schema();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![0])),
+                Arc::new(Int64Array::from(vec![60_000])),
+                Arc::new(StringArray::from(vec!["laptop"])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![10])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![0])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(BinaryArray::from(vec![None::<&[u8]>])),
+            ],
+        )
+        .unwrap();
+
+        let error = rewrite_parquet_file(&path, schema, &[batch])
+            .expect_err("renaming a completed parquet rewrite over a directory must fail");
+
+        assert!(
+            error.contains("Failed to replace parquet file"),
+            "test must reach the rename failure, got: {error}"
+        );
+        assert!(
+            path.is_dir(),
+            "rename must leave the target directory intact"
+        );
+        let leaked = leaked_temp_files(tmp.path());
+        assert!(
+            leaked.is_empty(),
+            "failed rename must remove completed parquet temp files, found: {leaked:?}"
+        );
     }
 
     fn seed_raw_events(config: &AnalyticsConfig, events: &[SearchEvent], date: &str) {

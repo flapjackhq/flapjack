@@ -1,0 +1,16 @@
+# Single source of truth for non-`CARGO_`/`CROSS_` build-identity passthrough in
+# `cross`. `cross` runs the release build inside a container, and only the
+# variables listed here (plus the `CARGO_`/`CROSS_` prefixes cross forwards by
+# default) reach `engine/build.rs` inside that container. Without this file the
+# workflow-exported `FLAPJACK_BUILD_REVISION` is dropped at the container
+# boundary and the compiled binary reports an unknown revision.
+#
+# Only the external `FLAPJACK_BUILD_REVISION` is passed through: `build.rs`
+# reads it via `revision_override()` and emits the internal
+# `FLAPJACK_INTERNAL_BUILD_REVISION` itself, so that internal name is never
+# consumed from the container environment and must not be listed here.
+#
+# Drift guard: engine/tests/test_release_workflow_structure.sh
+# ("Release build identity packaging" section).
+[build.env]
+passthrough = ["FLAPJACK_BUILD_REVISION"]

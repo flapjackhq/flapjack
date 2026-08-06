@@ -15,7 +15,7 @@ use crate::error_response::json_error_parts;
 use crate::handlers::AppState;
 use axum::body::Body;
 use axum::extract::{Extension, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header::CONTENT_LENGTH, HeaderMap, StatusCode};
 use axum::Json;
 use flapjack::validate_index_name;
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,8 @@ use uuid::Uuid;
 pub(crate) const BULK_REPLACE_MAX_BYTES_ENV: &str = "FLAPJACK_BULK_REPLACE_MAX_BYTES";
 const BULK_REPLACE_PAGE_DOCUMENTS: usize = 500;
 const BULK_REPLACE_PAGE_BYTES: usize = 1024 * 1024;
+const BULK_REPLACE_TOO_LARGE_MESSAGE: &str =
+    "Bulk replacement payload exceeds the configured limit";
 const HA_UNSUPPORTED_MESSAGE: &str =
     "Migration is only supported when no replication peers are configured";
 
@@ -90,6 +92,20 @@ pub async fn submit_bulk_replace_http(
             StatusCode::SERVICE_UNAVAILABLE,
             "migration_ha_unsupported",
             HA_UNSUPPORTED_MESSAGE,
+        ));
+    }
+
+    // Refusing an oversized declaration here avoids wasted spool I/O. The streaming admission
+    // remains the authoritative runtime cap for missing, malformed, or dishonest declarations.
+    if headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|declared_bytes| declared_bytes > state.bulk_replace_max_bytes)
+    {
+        return Err(json_error_parts(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            BULK_REPLACE_TOO_LARGE_MESSAGE,
         ));
     }
 
@@ -296,7 +312,7 @@ impl<'a> NdjsonSpoolStream<'a> {
         if self.received_bytes > self.max_bytes {
             return Err(json_error_parts(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                "Bulk replacement payload exceeds the configured limit",
+                BULK_REPLACE_TOO_LARGE_MESSAGE,
             ));
         }
         self.pending.extend_from_slice(chunk);
@@ -467,4 +483,91 @@ pub(super) async fn run_bulk_replace(
 
 fn internal_error() -> MigrateError {
     json_error_parts(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::TestStateBuilder;
+    use axum::{
+        body::Bytes,
+        http::{header, Request},
+        routing::post,
+        Router,
+    };
+    use std::{
+        convert::Infallible,
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll},
+    };
+    use tempfile::TempDir;
+    use tokio::sync::Notify;
+    use tokio_stream::Stream;
+    use tower::ServiceExt;
+
+    struct FirstPollPendingStream {
+        polls: Arc<AtomicUsize>,
+        first_poll: Arc<Notify>,
+    }
+
+    impl Stream for FirstPollPendingStream {
+        type Item = Result<Bytes, Infallible>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            this.polls.fetch_add(1, Ordering::SeqCst);
+            this.first_poll.notify_one();
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_declared_content_length_is_rejected_before_body_poll() {
+        const MAX_BYTES: u64 = 32;
+
+        let tmp = TempDir::new().unwrap();
+        let state = TestStateBuilder::new(&tmp)
+            .with_bulk_replace_max_bytes(MAX_BYTES)
+            .build_shared();
+        let app = Router::new()
+            .route("/1/migrations/bulk-replace", post(submit_bulk_replace_http))
+            .with_state(state);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let first_poll = Arc::new(Notify::new());
+        let body = Body::from_stream(FirstPollPendingStream {
+            polls: Arc::clone(&polls),
+            first_poll: Arc::clone(&first_poll),
+        });
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/1/migrations/bulk-replace?indexName=declared_over_cap")
+            .header(header::CONTENT_LENGTH, MAX_BYTES + 1)
+            .body(body)
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(AuthenticatedAppId("bulk-owner-app".to_string()));
+
+        let mut response = Box::pin(app.oneshot(request));
+        tokio::select! {
+            biased;
+            response = &mut response => {
+                let response = response.unwrap();
+                assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+                assert_eq!(
+                    polls.load(Ordering::SeqCst),
+                    0,
+                    "an oversized declared upload must be refused before polling its body",
+                );
+            }
+            _ = first_poll.notified() => {
+                assert_eq!(
+                    polls.load(Ordering::SeqCst),
+                    0,
+                    "an oversized declared upload must be refused before polling its body",
+                );
+            }
+        }
+    }
 }

@@ -210,7 +210,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_build_info_json() -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", serde_json::to_string(flapjack::build_info())?);
+    println!(
+        "{}",
+        flapjack::build_info::canonical_build_info_json(flapjack::build_info())?
+    );
     Ok(())
 }
 

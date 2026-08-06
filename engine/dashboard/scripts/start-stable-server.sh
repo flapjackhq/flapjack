@@ -4,10 +4,10 @@
 # Uses port 7700 by default (override with FLAPJACK_BIND_ADDR).
 #
 # Usage: ./scripts/start-stable-server.sh
-# Rebuild (default build now includes vector search + local embedding):
-#   cargo build -p flapjack-server --release && mkdir -p bin && cp ../target/release/flapjack bin/flapjack-stable
-# Lean text-only build (optional):
-#   cargo build -p flapjack-server --release --no-default-features && mkdir -p bin && cp ../target/release/flapjack bin/flapjack-stable
+# Rebuild: npm run update-server
+#   package.json owns the build flags — including --features vector-search-local,
+#   which is what makes GET /health report vectorSearch/vectorSearchLocal true and
+#   keeps the dashboard's vector e2e specs from skipping themselves.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
@@ -17,8 +17,7 @@ DEFAULT_DASHBOARD_ADMIN_KEY="fj_devtestadminkey000000"
 
 if [ ! -f "$BIN" ]; then
   echo "Stable binary not found at $BIN"
-  echo "Build it with: cargo build -p flapjack-server --release && mkdir -p bin && cp ../target/release/flapjack bin/flapjack-stable"
-  echo "Optional lean text-only build: cargo build -p flapjack-server --release --no-default-features && mkdir -p bin && cp ../target/release/flapjack bin/flapjack-stable"
+  echo "Build it with: npm run update-server"
   exit 1
 fi
 

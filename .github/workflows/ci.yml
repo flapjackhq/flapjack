@@ -44,6 +44,12 @@ jobs:
       - name: GHCR publish preflight contract
         run: bash engine/tests/test_ghcr_publish_preflight.sh
 
+      # The only automated proof of the cross passthrough KAT's oracle and of its
+      # DEFERRED-ENV classification boundary. It drives the KAT against mock
+      # cross/timeout/docker binaries, so it needs no container and costs seconds.
+      - name: Cross passthrough KAT supervision contract
+        run: bash engine/tests/build_identity_cross_kat_supervision_test.sh
+
   # ============================================================================
   # RUST ENGINE TESTS
   # ============================================================================

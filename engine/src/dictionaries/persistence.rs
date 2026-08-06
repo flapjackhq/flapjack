@@ -33,16 +33,6 @@ impl DictionaryStore {
         self.dir.join(format!("{}.json", name))
     }
 
-    // ── Atomic write helper ───────────────────────────────────────────
-
-    fn atomic_write(&self, name: &str, data: &[u8]) -> Result<(), DictionaryError> {
-        let target = self.file_path(name);
-        let tmp = self.dir.join(format!(".{}.tmp", name));
-        std::fs::write(&tmp, data)?;
-        std::fs::rename(&tmp, &target)?;
-        Ok(())
-    }
-
     fn read_file(&self, name: &str) -> Result<Option<Vec<u8>>, DictionaryError> {
         let path = self.file_path(name);
         match std::fs::read(&path) {
@@ -50,6 +40,16 @@ impl DictionaryStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    fn save_json<T: serde::Serialize + ?Sized>(
+        &self,
+        name: &str,
+        value: &T,
+    ) -> Result<(), DictionaryError> {
+        let data = serde_json::to_vec_pretty(value)?;
+        crate::index::utils::atomic_write(&self.file_path(name), &data)?;
+        Ok(())
     }
 
     // ── Stopwords ─────────────────────────────────────────────────────
@@ -62,8 +62,7 @@ impl DictionaryStore {
     }
 
     pub fn save_stopwords(&self, entries: &[StopwordEntry]) -> Result<(), DictionaryError> {
-        let data = serde_json::to_vec_pretty(entries)?;
-        self.atomic_write("stopwords", &data)
+        self.save_json("stopwords", entries)
     }
 
     // ── Plurals ───────────────────────────────────────────────────────
@@ -76,8 +75,7 @@ impl DictionaryStore {
     }
 
     pub fn save_plurals(&self, entries: &[PluralEntry]) -> Result<(), DictionaryError> {
-        let data = serde_json::to_vec_pretty(entries)?;
-        self.atomic_write("plurals", &data)
+        self.save_json("plurals", entries)
     }
 
     // ── Compounds ─────────────────────────────────────────────────────
@@ -90,8 +88,7 @@ impl DictionaryStore {
     }
 
     pub fn save_compounds(&self, entries: &[CompoundEntry]) -> Result<(), DictionaryError> {
-        let data = serde_json::to_vec_pretty(entries)?;
-        self.atomic_write("compounds", &data)
+        self.save_json("compounds", entries)
     }
 
     // ── Settings ──────────────────────────────────────────────────────
@@ -104,8 +101,7 @@ impl DictionaryStore {
     }
 
     pub fn save_settings(&self, settings: &DictionarySettings) -> Result<(), DictionaryError> {
-        let data = serde_json::to_vec_pretty(settings)?;
-        self.atomic_write("settings", &data)
+        self.save_json("settings", settings)
     }
 
     // ── Convenience: count entries per language ────────────────────────
@@ -285,6 +281,31 @@ mod tests {
         assert!(
             !tmp_path.exists(),
             "temp file should be cleaned up after atomic write"
+        );
+    }
+
+    #[test]
+    fn dictionary_atomic_write_removes_temp_after_failed_rename() {
+        let (_tmp, store) = make_store();
+        let target_path = store.file_path("stopwords");
+        std::fs::create_dir(&target_path).unwrap();
+
+        let error = store
+            .save_stopwords(&[])
+            .expect_err("renaming a completed temp file over a directory must fail");
+
+        assert!(matches!(error, DictionaryError::IoError(_)));
+        assert!(
+            target_path.is_dir(),
+            "rename must leave the target directory intact"
+        );
+        assert!(
+            !target_path.is_file(),
+            "failed rename must not publish a file"
+        );
+        assert!(
+            !store.dir.join(".stopwords.tmp").exists(),
+            "failed rename must remove the completed dictionary temp file"
         );
     }
 

@@ -1,5 +1,5 @@
 //! Filesystem helpers for durable atomic writes and recursive directory copying.
-use crate::error::Result;
+use crate::error::{FlapjackError, Result};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -25,6 +25,12 @@ fn is_legacy_atomic_write_temp_name(name: &str) -> bool {
         || name
             .strip_prefix(".committed_seq.")
             .is_some_and(|suffix| suffix.ends_with(".tmp"))
+        || matches!(
+            name,
+            ".stopwords.tmp" | ".plurals.tmp" | ".compounds.tmp" | ".settings.tmp"
+        )
+        || name.ends_with(".json.tmp")
+        || (name.contains(".parquet.") && name.ends_with(".tmp"))
 }
 
 pub(crate) fn atomic_write(path: &Path, payload: &[u8]) -> std::io::Result<()> {
@@ -36,13 +42,33 @@ pub(crate) fn atomic_write_with_before_rename(
     payload: &[u8],
     before_rename: impl FnOnce(&Path),
 ) -> std::io::Result<()> {
-    atomic_write_with(path, |file| file.write_all(payload), before_rename)
+    atomic_write_with(
+        path,
+        |file| file.write_all(payload),
+        |temp_path| {
+            before_rename(temp_path);
+            Ok(())
+        },
+    )
+}
+
+/// Streaming variant of [`atomic_write`] for payloads too large to buffer, such
+/// as parquet files. The caller writes directly into the temp file `utils`
+/// supplies; `utils` still owns canonical temp naming, `sync_all`, atomic
+/// rename, parent-directory fsync, and failed-write cleanup. The fallible hook
+/// runs after the payload sync and immediately before the rename.
+pub(crate) fn atomic_write_stream(
+    path: &Path,
+    write_payload: impl FnOnce(&mut File) -> std::io::Result<()>,
+    before_rename: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    atomic_write_with(path, write_payload, before_rename)
 }
 
 fn atomic_write_with(
     path: &Path,
     write_payload: impl FnOnce(&mut File) -> std::io::Result<()>,
-    before_rename: impl FnOnce(&Path),
+    before_rename: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
@@ -59,7 +85,7 @@ fn atomic_write_with(
         write_payload(&mut file)?;
         file.sync_all()?;
         drop(file);
-        before_rename(&temp_path);
+        before_rename(&temp_path)?;
         std::fs::rename(&temp_path, path)?;
         File::open(parent)?.sync_all()
     })();
@@ -101,7 +127,8 @@ fn atomic_write_temp_path(path: &Path) -> std::path::PathBuf {
 ///
 /// # Errors
 ///
-/// Returns an error if `src` cannot be read, a file copy fails, or directory creation fails.
+/// Returns an error if `src` cannot be read, a source entry is a symbolic link,
+/// a file copy fails, or directory creation fails.
 pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
 
@@ -110,21 +137,29 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     for entry in entries {
         let path = entry.path();
         let file_name = entry.file_name();
+        let file_type = entry.file_type()?;
 
         if is_temporary_entry(&path) {
             continue;
         }
 
+        if file_type.is_symlink() {
+            return Err(FlapjackError::InvalidDocument(format!(
+                "refusing to copy symbolic link: {}",
+                path.display()
+            )));
+        }
+
         let dest_path = dst.join(file_name);
 
-        if path.is_dir() {
+        if file_type.is_dir() {
             copy_dir_recursive(&path, &dest_path)?;
-        } else {
-            if !path.exists() {
-                continue;
-            }
-            std::fs::copy(&path, &dest_path)?;
+            continue;
         }
+        if !path.exists() {
+            continue;
+        }
+        std::fs::copy(&path, &dest_path)?;
     }
 
     Ok(())
@@ -191,6 +226,44 @@ mod tests {
     }
 
     #[test]
+    fn residual_writer_temp_names_are_excluded_from_snapshot_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        fs::create_dir(&src).unwrap();
+        let temp_names = [
+            ".stopwords.tmp",
+            ".plurals.tmp",
+            ".compounds.tmp",
+            ".settings.tmp",
+            "manifest.json.tmp",
+            "rollup_1hour_123.parquet.456.tmp",
+            "experiment-id.json.tmp",
+            "_id_map.json.tmp",
+        ];
+        for name in temp_names {
+            fs::write(src.join(name), b"in-flight").unwrap();
+        }
+
+        copy_dir_recursive(&src, &dst).unwrap();
+        let unclassified: Vec<_> = temp_names
+            .iter()
+            .copied()
+            .filter(|name| !is_temporary_entry(Path::new(name)))
+            .collect();
+        let copied: Vec<_> = temp_names
+            .iter()
+            .copied()
+            .filter(|name| dst.join(name).exists())
+            .collect();
+
+        assert!(
+            unclassified.is_empty() && copied.is_empty(),
+            "residual temp names must be classified and omitted; unclassified={unclassified:?}, copied={copied:?}"
+        );
+    }
+
+    #[test]
     fn atomic_write_replaces_contents_without_publishing_its_temp_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
@@ -221,11 +294,26 @@ mod tests {
                     "injected payload write failure",
                 ))
             },
-            |_| {},
+            |_| Ok(()),
         )
         .unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+        assert!(fs::read_dir(dir.path())
+            .unwrap()
+            .all(|entry| !is_temporary_entry(&entry.unwrap().path())));
+    }
+
+    #[test]
+    fn atomic_write_cleans_up_after_rename_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        atomic_write_with_before_rename(&path, b"new", |_| {
+            fs::create_dir(&path).unwrap();
+        })
+        .unwrap_err();
+
         assert!(fs::read_dir(dir.path())
             .unwrap()
             .all(|entry| !is_temporary_entry(&entry.unwrap().path())));

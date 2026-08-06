@@ -23,6 +23,7 @@ const EXIT_FAILED_JOB: i32 = 5;
 const EXIT_CANCELLED_JOB: i32 = 6;
 const EXIT_CANCEL_TOO_LATE: i32 = 7;
 const EXIT_ACK_TOO_EARLY: i32 = 8;
+const EXIT_PREVIEW_HARD_REJECTIONS: i32 = 9;
 
 struct UnresponsiveAlgoliaFixture {
     _listener: TcpListener,
@@ -259,6 +260,311 @@ fn migrate_submits_meilisearch_payload_to_meilisearch_route() {
             "overwrite": false
         }),
     );
+}
+
+#[test]
+fn migrate_preview_human_output_reports_entries_summary_and_exit_code() {
+    let server =
+        FakeMigrationServer::start(vec![StubResponse::json(200, migration_preview_response(0))]);
+
+    let output = migrate_preview_cmd(
+        server.endpoint(),
+        "meilisearch",
+        "https://tenant.meilisearch.io",
+        SOURCE_API_KEY,
+    )
+    .assert()
+    .code(0)
+    .get_output()
+    .clone();
+
+    let stdout = String::from_utf8(output.stdout.clone()).expect("UTF-8 human preview report");
+    let expected_lines = [
+        "total_entries=2 hard_rejections=0 warnings=1 scope_gaps=1 source_indexes=1 source_records=37 report_digest=preview-contract-digest",
+        "severity=Warning code=MeilisearchSettingNotMigrated resource=Settings jsonPath=$.stopWords",
+        "severity=ScopeGap code=ProductNotMigrated resource=Analytics jsonPath=$",
+    ];
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), expected_lines);
+    assert_secrets_absent(&output, &[FLAPJACK_API_KEY, SOURCE_API_KEY]);
+
+    let request = server.take_requests(1).remove(0);
+    assert_provider_submit_request(
+        &request,
+        "/1/migrations/meilisearch/preview",
+        json!({
+            "endpoint": "https://tenant.meilisearch.io",
+            "apiKey": SOURCE_API_KEY,
+            "sourceIndex": "products",
+            "overwrite": false
+        }),
+    );
+}
+
+#[test]
+fn migrate_preview_json_reports_contract_fields_and_exit_code() {
+    let server =
+        FakeMigrationServer::start(vec![StubResponse::json(200, migration_preview_response(2))]);
+
+    let output = migrate_preview_cmd(
+        server.endpoint(),
+        "meilisearch",
+        "https://tenant.meilisearch.io",
+        SOURCE_API_KEY,
+    )
+    .arg("--json")
+    .assert()
+    .code(EXIT_PREVIEW_HARD_REJECTIONS)
+    .get_output()
+    .clone();
+
+    let report: Value = serde_json::from_slice(&output.stdout).expect("JSON preview report");
+    assert_eq!(report, migration_preview_response(2));
+    assert_eq!(report["report"]["summary"]["hardRejections"], json!(2));
+    assert_eq!(report["report"]["summary"]["warnings"], json!(1));
+    assert_eq!(report["report"]["summary"]["scopeGaps"], json!(1));
+    assert_eq!(
+        report["report"]["reportDigest"],
+        json!("preview-contract-digest")
+    );
+    assert_secrets_absent(&output, &[FLAPJACK_API_KEY, SOURCE_API_KEY]);
+
+    let request = server.take_requests(1).remove(0);
+    assert_provider_submit_request(
+        &request,
+        "/1/migrations/meilisearch/preview",
+        json!({
+            "endpoint": "https://tenant.meilisearch.io",
+            "apiKey": SOURCE_API_KEY,
+            "sourceIndex": "products",
+            "overwrite": false
+        }),
+    );
+}
+
+#[test]
+fn migrate_preview_uses_operator_timeout_for_the_synchronous_request() {
+    let server =
+        FakeMigrationServer::start(vec![StubResponse::json(200, migration_preview_response(0))
+            .delayed_by(Duration::from_secs(31))]);
+
+    let output = migrate_preview_cmd(
+        server.endpoint(),
+        "meilisearch",
+        "https://tenant.meilisearch.io",
+        SOURCE_API_KEY,
+    )
+    // The margin over the retired 30s submit cap is wide so a scheduling
+    // overshoot on a loaded host cannot flip this success assertion.
+    .args(["--timeout", "10m"])
+    .assert()
+    .code(0)
+    .get_output()
+    .clone();
+
+    assert_secrets_absent(&output, &[FLAPJACK_API_KEY, SOURCE_API_KEY]);
+    let request = server.take_requests(1).remove(0);
+    assert_provider_submit_request(
+        &request,
+        "/1/migrations/meilisearch/preview",
+        json!({
+            "endpoint": "https://tenant.meilisearch.io",
+            "apiKey": SOURCE_API_KEY,
+            "sourceIndex": "products",
+            "overwrite": false
+        }),
+    );
+}
+
+#[test]
+fn migrate_preview_gives_up_when_the_operator_timeout_is_shorter_than_the_response() {
+    let server =
+        FakeMigrationServer::start(vec![StubResponse::json(200, migration_preview_response(0))
+            .delayed_by(Duration::from_secs(30))]);
+
+    let output = migrate_preview_cmd(
+        server.endpoint(),
+        "meilisearch",
+        "https://tenant.meilisearch.io",
+        SOURCE_API_KEY,
+    )
+    .args(["--timeout", "1s"])
+    .assert()
+    .code(EXIT_TIMEOUT)
+    .get_output()
+    .clone();
+
+    assert_secrets_absent(&output, &[FLAPJACK_API_KEY, SOURCE_API_KEY]);
+}
+
+#[test]
+fn migrate_preview_rejects_submit_only_flags_before_contacting_server() {
+    for (flag, values) in [
+        ("--overwrite", Vec::new()),
+        ("--target-index", vec!["products_copy"]),
+        ("--poll-interval", vec!["1s"]),
+    ] {
+        let mut command = flapjack_cmd();
+        command.arg("migrate");
+        add_flapjack_auth_args(
+            &mut command,
+            "http://127.0.0.1:1".to_string(),
+            FLAPJACK_API_KEY,
+        );
+        command
+            .arg(flag)
+            .args(values)
+            .arg("preview")
+            .arg("--source-provider")
+            .arg("meilisearch")
+            .arg("--source-endpoint")
+            .arg("https://tenant.meilisearch.io")
+            .arg("--source-key-env")
+            .arg("FJ_MIGRATE_TEST_SOURCE_KEY")
+            .arg("--source-index")
+            .arg("products")
+            .env("FJ_MIGRATE_TEST_SOURCE_KEY", SOURCE_API_KEY);
+
+        let output = command.assert().code(EXIT_CONFIG).get_output().clone();
+
+        let combined = combined_output(&output);
+        assert!(
+            combined.contains(&format!("{flag} is only valid when submitting a migration")),
+            "{flag}: {combined}"
+        );
+    }
+}
+
+#[test]
+fn migrate_preview_missing_source_index_names_the_required_flag() {
+    let output = flapjack_cmd()
+        .arg("migrate")
+        .arg("preview")
+        .arg("--endpoint")
+        .arg("http://127.0.0.1:1")
+        .arg("--source-provider")
+        .arg("meilisearch")
+        .arg("--source-endpoint")
+        .arg("https://tenant.meilisearch.io")
+        .arg("--source-key-env")
+        .arg("FJ_MIGRATE_TEST_SOURCE_KEY")
+        .arg("--application-id")
+        .arg("test-owner")
+        .arg("--api-key-env")
+        .arg("FJ_MIGRATE_TEST_API_KEY")
+        .arg("--json")
+        .env("FJ_MIGRATE_TEST_SOURCE_KEY", SOURCE_API_KEY)
+        .env("FJ_MIGRATE_TEST_API_KEY", FLAPJACK_API_KEY)
+        .assert()
+        .code(EXIT_CONFIG)
+        .get_output()
+        .clone();
+
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("JSON local configuration failure");
+    assert_eq!(report["message"], json!("--source-index is required"));
+}
+
+#[test]
+fn migrate_preview_redacts_non_success_and_incompatible_response_failures() {
+    for response in [
+        StubResponse::text(
+            403,
+            format!("credentials {FLAPJACK_API_KEY} and {SOURCE_API_KEY} rejected"),
+        ),
+        StubResponse::text(
+            200,
+            format!("not JSON: {FLAPJACK_API_KEY} {SOURCE_API_KEY}"),
+        ),
+        StubResponse::json(
+            200,
+            json!({"report": {"summary": {"hardRejections": 0}}, "sourceCounts": {}}),
+        ),
+    ] {
+        let server = FakeMigrationServer::start(vec![response]);
+
+        let output = migrate_preview_cmd(
+            server.endpoint(),
+            "meilisearch",
+            "https://tenant.meilisearch.io",
+            SOURCE_API_KEY,
+        )
+        .arg("--json")
+        .assert()
+        .code(EXIT_HTTP_REJECTION)
+        .get_output()
+        .clone();
+
+        assert_preview_http_rejection_is_redacted(&output);
+        let request = server.take_requests(1).remove(0);
+        assert_eq!(request.path, "/1/migrations/meilisearch/preview");
+    }
+}
+
+#[test]
+fn migrate_preview_rejects_internally_inconsistent_reports() {
+    let mut mismatched_summary = migration_preview_response(0);
+    mismatched_summary["report"]["summary"]["warnings"] = json!(0);
+    let mut unknown_severity = migration_preview_response(0);
+    unknown_severity["report"]["entries"][0]["severity"] = json!("Advisory");
+
+    for response in [mismatched_summary, unknown_severity] {
+        let server = FakeMigrationServer::start(vec![StubResponse::json(200, response)]);
+        let output = migrate_preview_cmd(
+            server.endpoint(),
+            "meilisearch",
+            "https://tenant.meilisearch.io",
+            SOURCE_API_KEY,
+        )
+        .arg("--json")
+        .assert()
+        .code(EXIT_HTTP_REJECTION)
+        .get_output()
+        .clone();
+
+        assert_preview_http_rejection_is_redacted(&output);
+        let request = server.take_requests(1).remove(0);
+        assert_eq!(request.path, "/1/migrations/meilisearch/preview");
+    }
+}
+
+#[test]
+fn migrate_preview_routes_algolia_and_typesense_to_the_selected_provider() {
+    for (provider, endpoint, expected_path, expected_body) in [
+        (
+            "algolia",
+            "",
+            "/1/migrations/algolia/preview",
+            json!({
+                "appId": "UNREACHABLESTAGE2",
+                "apiKey": SOURCE_API_KEY,
+                "sourceIndex": "products",
+                "overwrite": false
+            }),
+        ),
+        (
+            "typesense",
+            "https://tenant.typesense.net",
+            "/1/migrations/typesense/preview",
+            json!({
+                "node": "https://tenant.typesense.net",
+                "apiKey": SOURCE_API_KEY,
+                "sourceIndex": "products",
+                "overwrite": false
+            }),
+        ),
+    ] {
+        let server = FakeMigrationServer::start(vec![StubResponse::json(
+            200,
+            migration_preview_response(0),
+        )]);
+
+        migrate_preview_cmd(server.endpoint(), provider, endpoint, SOURCE_API_KEY)
+            .assert()
+            .success();
+
+        let request = server.take_requests(1).remove(0);
+        assert_provider_submit_request(&request, expected_path, expected_body);
+    }
 }
 
 #[test]
@@ -764,7 +1070,7 @@ fn provider_connection_flags_are_mutually_exclusive() {
             provider: None,
             app_id: None,
             source_endpoint: None,
-            expected_message: "--app-id is required for submission",
+            expected_message: "--app-id is required",
         },
         ConfigRefusalCase {
             provider: None,
@@ -788,13 +1094,13 @@ fn provider_connection_flags_are_mutually_exclusive() {
             provider: Some("meilisearch"),
             app_id: None,
             source_endpoint: None,
-            expected_message: "--source-endpoint is required for a meilisearch submission",
+            expected_message: "--source-endpoint is required for --source-provider meilisearch",
         },
         ConfigRefusalCase {
             provider: Some("typesense"),
             app_id: None,
             source_endpoint: None,
-            expected_message: "--source-endpoint is required for a typesense submission",
+            expected_message: "--source-endpoint is required for --source-provider typesense",
         },
     ];
 
@@ -876,25 +1182,7 @@ fn actions_reject_every_submit_only_flag() {
 
     for action in ["cancel", "ack"] {
         for (flag, values) in submit_only_arguments {
-            let mut command = flapjack_cmd();
-            command
-                .arg("migrate")
-                .arg("--endpoint")
-                .arg("http://127.0.0.1:1")
-                .arg("--api-key-env")
-                .arg("FJ_MIGRATE_TEST_API_KEY")
-                .arg(flag)
-                .args(*values)
-                .arg(action)
-                .arg("--job-id")
-                .arg(JOB_ID)
-                .arg("--json")
-                .env("FJ_MIGRATE_TEST_API_KEY", FLAPJACK_API_KEY)
-                .env("FJ_MIGRATE_TEST_ALGOLIA_KEY", ALGOLIA_API_KEY);
-
-            let output = command.assert().code(EXIT_CONFIG).get_output().clone();
-            let report: Value =
-                serde_json::from_slice(&output.stdout).expect("JSON local configuration failure");
+            let report = action_rejection_report(action, flag, values);
             assert_eq!(report["errorType"], json!("config"), "{action} {flag}");
             assert_eq!(report["exitCode"], json!(EXIT_CONFIG), "{action} {flag}");
             assert!(
@@ -905,6 +1193,54 @@ fn actions_reject_every_submit_only_flag() {
             );
         }
     }
+}
+
+#[test]
+fn actions_offer_preview_only_for_the_flags_preview_accepts() {
+    for action in ["cancel", "ack"] {
+        let source_flag_report =
+            action_rejection_report(action, "--app-id", &["UNREACHABLESTAGE3"]);
+        assert_eq!(
+            source_flag_report["message"],
+            json!("--app-id is only valid when submitting a migration or previewing one"),
+            "{action} must offer preview as a retry for source connection flags"
+        );
+
+        for (flag, values) in [
+            ("--target-index", &["products_copy"][..]),
+            ("--overwrite", &[][..]),
+            ("--poll-interval", &["1s"][..]),
+        ] {
+            let report = action_rejection_report(action, flag, values);
+            assert_eq!(
+                report["message"],
+                json!(format!("{flag} is only valid when submitting a migration")),
+                "{action} must not offer preview as a retry for a submit-only flag that \
+                 run_preview itself rejects"
+            );
+        }
+    }
+}
+
+fn action_rejection_report(action: &str, flag: &str, values: &[&str]) -> Value {
+    let mut command = flapjack_cmd();
+    command
+        .arg("migrate")
+        .arg("--endpoint")
+        .arg("http://127.0.0.1:1")
+        .arg("--api-key-env")
+        .arg("FJ_MIGRATE_TEST_API_KEY")
+        .arg(flag)
+        .args(values)
+        .arg(action)
+        .arg("--job-id")
+        .arg(JOB_ID)
+        .arg("--json")
+        .env("FJ_MIGRATE_TEST_API_KEY", FLAPJACK_API_KEY)
+        .env("FJ_MIGRATE_TEST_ALGOLIA_KEY", ALGOLIA_API_KEY);
+
+    let output = command.assert().code(EXIT_CONFIG).get_output().clone();
+    serde_json::from_slice(&output.stdout).expect("JSON local configuration failure")
 }
 
 #[test]
@@ -1227,6 +1563,38 @@ fn migrate_cmd_for_provider(
     command
 }
 
+fn migrate_preview_cmd(
+    endpoint: String,
+    provider: &str,
+    source_endpoint: &str,
+    source_api_key: &str,
+) -> assert_cmd::Command {
+    let mut command = flapjack_cmd();
+    command
+        .arg("migrate")
+        .arg("preview")
+        .arg("--endpoint")
+        .arg(endpoint)
+        .arg("--source-provider")
+        .arg(provider)
+        .arg("--source-key-env")
+        .arg("FJ_MIGRATE_TEST_SOURCE_KEY")
+        .arg("--source-index")
+        .arg("products")
+        .arg("--application-id")
+        .arg("test-owner")
+        .arg("--api-key-env")
+        .arg("FJ_MIGRATE_TEST_API_KEY")
+        .env("FJ_MIGRATE_TEST_SOURCE_KEY", source_api_key)
+        .env("FJ_MIGRATE_TEST_API_KEY", FLAPJACK_API_KEY);
+    if provider == "algolia" {
+        command.arg("--app-id").arg("UNREACHABLESTAGE2");
+    } else {
+        command.arg("--source-endpoint").arg(source_endpoint);
+    }
+    command
+}
+
 fn migrate_action_cmd_with_key(
     endpoint: String,
     action: &str,
@@ -1417,6 +1785,19 @@ fn assert_named_refusal_is_redacted(output: &std::process::Output, expected_code
     assert!(!combined.contains(ALGOLIA_API_KEY));
 }
 
+fn assert_preview_http_rejection_is_redacted(output: &std::process::Output) {
+    let report: Value = serde_json::from_slice(&output.stdout).expect("JSON rejection report");
+    assert_eq!(report["errorType"], json!("http_rejection"));
+    assert_eq!(report["exitCode"], json!(EXIT_HTTP_REJECTION));
+    assert!(
+        report["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("migration preview")),
+        "preview rejection omitted operation name: {report}"
+    );
+    assert_secrets_absent(output, &[FLAPJACK_API_KEY, SOURCE_API_KEY]);
+}
+
 fn assert_action_requests(requests: Vec<RecordedRequest>, expected_path: &str) {
     for request in requests {
         assert_eq!(request.method, "POST");
@@ -1471,6 +1852,53 @@ fn assert_migration_request_headers(request: &RecordedRequest) {
 
 fn migration_status(phase: &str, disposition: &str) -> Value {
     json!({"jobId": JOB_ID, "phase": phase, "disposition": disposition})
+}
+
+fn migration_preview_response(hard_rejections: usize) -> Value {
+    let mut entries = vec![
+        json!({
+            "severity": "Warning",
+            "code": "MeilisearchSettingNotMigrated",
+            "resource": "Settings",
+            "pageIndex": null,
+            "itemIndex": null,
+            "jsonPath": "$.stopWords"
+        }),
+        json!({
+            "severity": "ScopeGap",
+            "code": "ProductNotMigrated",
+            "resource": "Analytics",
+            "pageIndex": null,
+            "itemIndex": null,
+            "jsonPath": "$"
+        }),
+    ];
+    entries.extend((0..hard_rejections).map(|item_index| {
+        json!({
+            "severity": "HardRejection",
+            "code": "MalformedSourcePayload",
+            "resource": "Settings",
+            "pageIndex": null,
+            "itemIndex": item_index,
+            "jsonPath": "$.rankingRules"
+        })
+    }));
+    json!({
+        "report": {
+            "entries": entries,
+            "summary": {
+                "totalEntries": 2 + hard_rejections,
+                "hardRejections": hard_rejections,
+                "warnings": 1,
+                "scopeGaps": 1
+            },
+            "reportDigest": "preview-contract-digest"
+        },
+        "sourceCounts": {
+            "indexes": 1,
+            "records": 37
+        }
+    })
 }
 
 fn combined_output(output: &std::process::Output) -> String {

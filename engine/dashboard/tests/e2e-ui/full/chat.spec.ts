@@ -55,6 +55,34 @@ async function submitChatQuery(page: Page, query: ChatRequest['query']) {
   await page.getByTestId('chat-send-button').click();
 }
 
+function getChatDocument(objectID: string) {
+  const document = CHAT_DOCUMENTS.find((candidate) => candidate.objectID === objectID);
+  if (!document) {
+    throw new Error(`Missing CHAT_DOCUMENTS fixture for ${objectID}`);
+  }
+  return document;
+}
+
+async function expectAssistantMessageWithSource(
+  thread: ReturnType<Page['getByTestId']>,
+  messageIndex: number,
+  query: ChatRequest['query'],
+  objectID: string,
+) {
+  const document = getChatDocument(objectID);
+  const assistantMessage = thread.getByTestId('chat-message-assistant').nth(messageIndex);
+  await expect(assistantMessage).toContainText(`Based on your search for "${query}"`, {
+    timeout: 15_000,
+  });
+  await expect(assistantMessage).toContainText(document.content);
+
+  const sourceItem = assistantMessage.getByTestId('chat-source-item').filter({
+    hasText: document.objectID,
+  });
+  await expect(sourceItem).toBeVisible();
+  await expect(sourceItem).toContainText(document.content);
+}
+
 test.describe('Chat / RAG', () => {
   test.describe.configure({ mode: 'serial' });
 
@@ -71,17 +99,11 @@ test.describe('Chat / RAG', () => {
     await setChatSearchMode(request, CHAT_INDEX, 'neuralSearch');
 
     await page.route('**/health', async (route) => {
-      const response = await route.fetch();
-      const health = await response.json();
       await route.fulfill({
-        response,
+        status: 200,
         json: {
-          ...health,
-          capabilities: {
-            ...health.capabilities,
-            vectorSearch: false,
-            vectorSearchLocal: false,
-          },
+          status: 'ok',
+          capabilities: { vectorSearch: false, vectorSearchLocal: false },
         },
       });
     });
@@ -161,11 +183,7 @@ test.describe('Chat / RAG', () => {
         thread.getByText(new RegExp(`^${FIRST_QUERY}$`)),
       ).toBeVisible({ timeout: 15_000 });
 
-      // Assert: assistant answer from stub ("Based on your search for ...")
-      await expect(thread.getByText('Based on your search for')).toBeVisible({ timeout: 15_000 });
-
-      // Assert: at least one source citation visible
-      await expect(page.getByTestId('chat-sources').first()).toBeVisible();
+      await expectAssistantMessageWithSource(thread, 0, FIRST_QUERY, 'chat-doc-1');
 
       // Act: send second message in same conversation (multi-turn)
       await submitChatQuery(page, SECOND_QUERY);
@@ -176,9 +194,10 @@ test.describe('Chat / RAG', () => {
         thread.getByText(new RegExp(`^${SECOND_QUERY}$`)),
       ).toBeVisible({ timeout: 15_000 });
 
-      // Assert: two assistant answers now present
-      const answers = thread.getByText('Based on your search for');
-      await expect(answers).toHaveCount(2, { timeout: 15_000 });
+      await expect(thread.getByTestId('chat-message-assistant')).toHaveCount(2, {
+        timeout: 15_000,
+      });
+      await expectAssistantMessageWithSource(thread, 1, SECOND_QUERY, 'chat-doc-2');
     });
 
     test('shows no-results message on an empty index', async ({ page, request }) => {

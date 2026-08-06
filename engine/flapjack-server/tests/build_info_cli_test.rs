@@ -75,6 +75,29 @@ fn build_info_json_outputs_canonical_build_info() {
 }
 
 #[test]
+fn compiled_executable_embeds_same_canonical_build_info_json() {
+    let output = flapjack_cmd()
+        .arg("build-info")
+        .arg("--json")
+        .assert()
+        .success()
+        .stderr("")
+        .get_output()
+        .clone();
+    let cli_stdout = String::from_utf8(output.stdout).unwrap();
+    let executable_bytes = std::fs::read(flapjack_cmd_executable())
+        .expect("assert_cmd-selected flapjack executable should be readable");
+    let embedded =
+        flapjack::build_info::embedded_build_info_json_from_bytes(&executable_bytes).unwrap();
+
+    assert_eq!(embedded, cli_stdout.trim());
+    assert_eq!(
+        embedded,
+        flapjack::build_info::canonical_build_info_json(flapjack::build_info()).unwrap()
+    );
+}
+
+#[test]
 fn package_version_output_still_uses_package_version() {
     flapjack_cmd()
         .arg("--version")

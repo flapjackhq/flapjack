@@ -23,10 +23,15 @@ function formatSourceLabel(source: Record<string, unknown>): string {
 
   const content = source.content;
   if (typeof content === 'string' && content.trim().length > 0) {
-    return content;
+    return content.trim();
   }
 
   return 'Source details unavailable';
+}
+
+function formatSourceContent(source: Record<string, unknown>): string {
+  const content = source.content;
+  return typeof content === 'string' ? content.trim() : '';
 }
 
 function getMessageKey(message: ChatMessage, index: number): string {
@@ -181,6 +186,7 @@ export function Chat() {
               messages.map((message, messageIndex) => (
                 <div
                   className="rounded-md border p-3"
+                  data-testid={`chat-message-${message.role}`}
                   key={getMessageKey(message, messageIndex)}
                 >
                   <p className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">
@@ -191,11 +197,23 @@ export function Chat() {
                     <div className="mt-3 space-y-1" data-testid="chat-sources">
                       <p className="text-xs font-medium text-muted-foreground">Sources</p>
                       <ul className="list-inside list-disc text-xs text-muted-foreground">
-                        {message.sources.map((source, sourceIndex) => (
-                          <li key={`source-${messageIndex}-${sourceIndex}`}>
-                            {formatSourceLabel(source)}
-                          </li>
-                        ))}
+                        {message.sources.map((source, sourceIndex) => {
+                          const sourceLabel = formatSourceLabel(source);
+                          const sourceContent = formatSourceContent(source);
+                          const shouldRenderSourceContent =
+                            sourceContent.length > 0 && sourceContent !== sourceLabel;
+                          return (
+                            <li
+                              data-testid="chat-source-item"
+                              key={`source-${messageIndex}-${sourceIndex}`}
+                            >
+                              <span>{sourceLabel}</span>
+                              {shouldRenderSourceContent ? (
+                                <span>: {sourceContent}</span>
+                              ) : null}
+                            </li>
+                          );
+                        })}
                       </ul>
                     </div>
                   ) : null}

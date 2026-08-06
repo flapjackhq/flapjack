@@ -1,9 +1,19 @@
+/// The Typesense loopback seam and its preview admission owner are still
+/// `#[cfg(debug_assertions)]`, so every test that names them carries the same
+/// gate. `typesense_preview_release_source_reader_delegates_to_submit_owner`
+/// is the release-profile counterpart.
+#[cfg(debug_assertions)]
+use super::super::preview_typesense_client;
 use super::super::source_reader::TypesenseSourceReader;
 use super::super::source_test_support::{typesense_observation, ScriptedTypesenseSource};
+#[cfg(debug_assertions)]
 use super::super::typesense_client::TYPESENSE_PREVIEW_LOOPBACK_ENV;
-use super::super::{preview_typesense_client, MigrateFromTypesenseRequest};
+#[cfg(debug_assertions)]
+use super::super::MigrateFromTypesenseRequest;
 use super::*;
+#[cfg(debug_assertions)]
 use flapjack::security::test_helpers::install_test_outbound_host_resolver;
+#[cfg(debug_assertions)]
 use std::net::IpAddr;
 
 const TYPESENSE_PREVIEW_ENDPOINT: &str = "http://127.0.0.1:17748";
@@ -199,6 +209,7 @@ async fn typesense_preview_does_not_write_durable_state_byte_identity() {
 }
 
 #[tokio::test]
+#[cfg(debug_assertions)]
 async fn typesense_preview_requires_explicit_loopback_opt_in() {
     const API_KEY_CANARY: &str = "preview-route-api-key-canary";
 
@@ -272,6 +283,7 @@ fn typesense_submit_accepts_vetted_cloud_endpoint_without_loopback_opt_in() {
 /// Without the opt-in, submit stays refused and reports the production vendor
 /// refusal, never the loopback seam's own message.
 #[tokio::test]
+#[cfg(debug_assertions)]
 async fn typesense_submit_requires_explicit_loopback_opt_in() {
     const API_KEY_CANARY: &str = "submit-route-api-key-canary";
 
@@ -307,6 +319,7 @@ async fn typesense_submit_requires_explicit_loopback_opt_in() {
 /// The opt-in widens submit admission to literal loopback only. With the
 /// switch on, a non-vendor host is still refused by production admission.
 #[tokio::test]
+#[cfg(debug_assertions)]
 async fn typesense_submit_opt_in_does_not_admit_non_loopback_hosts() {
     const API_KEY_CANARY: &str = "submit-route-non-loopback-api-key-canary";
     const NON_LOOPBACK_NODE: &str = "https://evil.example.com";
@@ -346,6 +359,7 @@ async fn typesense_submit_opt_in_does_not_admit_non_loopback_hosts() {
 }
 
 #[tokio::test]
+#[cfg(debug_assertions)]
 async fn typesense_preview_non_loopback_refusal_hides_loopback_opt_in() {
     const API_KEY_CANARY: &str = "preview-route-non-loopback-api-key-canary";
     const NON_LOOPBACK_NODE: &str = "https://evil.example.com";
@@ -389,6 +403,7 @@ async fn typesense_preview_non_loopback_refusal_hides_loopback_opt_in() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 #[serial_test::serial(flapjack_outbound_url_policy)]
 fn typesense_preview_accepts_cloud_endpoint_without_loopback_opt_in() {
     let _env = with_env_var(TYPESENSE_PREVIEW_LOOPBACK_ENV, "");

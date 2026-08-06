@@ -9,6 +9,10 @@ TRACE_FILE=""; TEMP_DIR=""; CONTAINER_NAME=""
 CONTAINER_CLEANUP_ARMED=0; LIVE_CLEANED=0
 FAILURE_EVIDENCE_DIR="/tmp/flapjack_stage2_meilisearch_source_contract_failure_$$"
 BASE_URL=""; MASTER_KEY=""
+SERVER_PID=""; SERVER_DATA_DIR=""; SERVER_LOG=""
+PREVIEW_HUMAN_OUTPUT_FILE=""; PREVIEW_JSON_OUTPUT_FILE=""
+PREVIEW_HUMAN_EXIT=""; PREVIEW_JSON_EXIT=""
+FLAPJACK_URL=""; FLAPJACK_ADMIN_KEY_VALUE=""
 TASK_POLL_LIMIT=120
 SECRET_VALUES=()
 RESTRICTED_KEY=""
@@ -581,6 +585,18 @@ cleanup_live() {
   [[ "$LIVE_CLEANED" -eq 0 ]] || return 0
   LIVE_CLEANED=1
   local cleanup_failed=0 container_state
+  if [[ -n "$SERVER_PID" ]]; then
+    if kill -0 "$SERVER_PID" >/dev/null 2>&1; then
+      kill "$SERVER_PID" >/dev/null 2>&1 || true
+      wait "$SERVER_PID" >/dev/null 2>&1 || true
+    fi
+  fi
+  if [[ -n "$SERVER_DATA_DIR" && -n "$TEMP_DIR" \
+    && "$(dirname "$SERVER_DATA_DIR")" == "$TEMP_DIR" \
+    && "$(basename "$SERVER_DATA_DIR")" == flapjack_server ]]; then
+    rm -rf -- "$SERVER_DATA_DIR" || cleanup_failed=1
+  fi
+  [[ -z "$SERVER_DATA_DIR" || ! -e "$SERVER_DATA_DIR" ]] || cleanup_failed=1
   if [[ "$CONTAINER_CLEANUP_ARMED" -eq 1 ]]; then
     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
@@ -606,6 +622,19 @@ stage_sanitized_failure_evidence() {
   if [[ -f "$TEMP_DIR/last_response_label.txt" ]]; then
     cp "$TEMP_DIR/last_response_label.txt" \
       "$FAILURE_EVIDENCE_DIR/last_response_label.txt"
+  fi
+  if [[ -f "$PREVIEW_HUMAN_OUTPUT_FILE" ]]; then
+    cp "$PREVIEW_HUMAN_OUTPUT_FILE" "$FAILURE_EVIDENCE_DIR/preview_human_output.txt"
+  fi
+  if [[ -f "$PREVIEW_JSON_OUTPUT_FILE" ]]; then
+    cp "$PREVIEW_JSON_OUTPUT_FILE" "$FAILURE_EVIDENCE_DIR/preview_json_output.json"
+  fi
+  if [[ -f "$SERVER_LOG" ]]; then
+    cp "$SERVER_LOG" "$FAILURE_EVIDENCE_DIR/flapjack_server.log"
+  fi
+  if [[ "$PREVIEW_PROBE_RECEIPT" != null ]]; then
+    jq -c . <<<"$PREVIEW_PROBE_RECEIPT" \
+      >"$FAILURE_EVIDENCE_DIR/preview_probe_receipt.json"
   fi
 }
 
@@ -748,6 +777,13 @@ validate_contract() {
   printf '%s\n' "$sorted_ids"
 }
 
+seed_preview_hard_rejection_source() {
+  [[ "$MODE" == preview_live ]] || return 0
+  live_task_request preview_hard_rejection_settings PATCH \
+    /indexes/configured_pk/settings \
+    '{"typoTolerance":{"disableOnNumbers":true}}' succeeded
+}
+
 validate_stub_cleanup() {
   local cleanup_state expected
   cleanup_state="$(jq -c . "$STUB_RESPONSE_DIR/cleanup_state.json")" \
@@ -794,37 +830,148 @@ emit_receipt() {
 
 run_preview_probe() {
   [[ "$MODE" == preview_live ]] || return 0
-  local expected_records output status
+  local expected_records binary flapjack_key_env source_key_env health_file
+  local status payload attempt human_output json_output severity_denominator
   expected_records="$(jq -er '.documents.countAfter' "$EXPECTED")" \
     || die "preview record count fixture is missing"
   [[ "$expected_records" =~ ^[1-9][0-9]*$ ]] \
     || die "preview record count fixture must be positive"
 
-  if output="$(
-    cd "$ENGINE_DIR" && FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK=1 \
-      FJ_MEILISEARCH_PREVIEW_ENDPOINT="$BASE_URL" \
-      FJ_MEILISEARCH_PREVIEW_API_KEY="$MASTER_KEY" \
-      FJ_MEILISEARCH_PREVIEW_EXPECTED_RECORDS="$expected_records" \
-      timeout 600 cargo test -p flapjack-http -- \
-        handlers::migration::preview_tests::meilisearch_live_preview_reports_exact_seeded_counts_and_codes \
-        --ignored --exact --nocapture 2>&1
-  )"; then
-    printf '%s\n' "$output"
-  else
-    status=$?
-    printf '%s\n' "$output" >&2
-    [[ "$status" -ne 124 ]] \
-      || die "preview probe timed out after 600 seconds"
-    die "preview probe test failed (exit=$status)"
+  if ! (cd "$ENGINE_DIR" && timeout 1800 cargo build --release -p flapjack-server \
+    >/tmp/s4_build_release.log 2>&1); then
+    die "release flapjack-server build failed; see /tmp/s4_build_release.log"
   fi
+  binary="$ENGINE_DIR/target/release/flapjack"
+  [[ -x "$binary" ]] || die "release flapjack binary missing after build"
 
-  grep -Eq 'test result: ok\. 1 passed;' <<<"$output" \
-    || die "preview probe did not execute exactly one passing test"
-  grep -Fq '"previewProof":"PASS"' <<<"$output" \
-    || die "preview probe PASS receipt is missing"
-  PREVIEW_PROBE_RECEIPT="$(grep -F '"previewProof":"PASS"' <<<"$output" | tail -n 1)"
+  SERVER_DATA_DIR="$TEMP_DIR/flapjack_server"
+  SERVER_LOG="$TEMP_DIR/flapjack_server.log"
+  PREVIEW_HUMAN_OUTPUT_FILE="$TEMP_DIR/preview_human_output.txt"
+  PREVIEW_JSON_OUTPUT_FILE="$TEMP_DIR/preview_json_output.json"
+  mkdir -m 700 "$SERVER_DATA_DIR"
+  FLAPJACK_ADMIN_KEY_VALUE="stage4-flapjack-$(openssl rand -hex 24)"
+  SECRET_VALUES+=("$FLAPJACK_ADMIN_KEY_VALUE")
+  FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK=1 \
+    FLAPJACK_ADMIN_KEY="$FLAPJACK_ADMIN_KEY_VALUE" \
+    "$binary" --data-dir "$SERVER_DATA_DIR" --auto-port \
+    >"$SERVER_LOG" 2>&1 &
+  SERVER_PID=$!
+
+  for ((attempt = 0; attempt < 120; attempt++)); do
+    FLAPJACK_URL="$(sed -E 's/\x1B\\[[0-9;]*[A-Za-z]//g' "$SERVER_LOG" \
+      | grep -Eo 'http://127\.0\.0\.1:[0-9]+' | head -n 1 || true)"
+    if [[ -n "$FLAPJACK_URL" ]]; then
+      break
+    fi
+    kill -0 "$SERVER_PID" >/dev/null 2>&1 \
+      || die "flapjack-server exited before printing startup URL"
+    sleep 0.25
+  done
+  [[ -n "$FLAPJACK_URL" ]] || die "flapjack-server startup URL was not observed"
+
+  health_file="$TEMP_DIR/flapjack_health.json"
+  for ((attempt = 0; attempt < 120; attempt++)); do
+    if status="$(curl -sS -o "$health_file" -w '%{http_code}' \
+      "$FLAPJACK_URL/health" 2>>"$SERVER_LOG")"; then
+      payload="$(jq -c . "$health_file" 2>/dev/null || true)"
+      if [[ "$status" == 200 ]] \
+        && jq -e '.status == "ok"' <<<"$payload" >/dev/null 2>&1; then
+        break
+      fi
+    fi
+    sleep 0.25
+  done
+  [[ "${status:-}" == 200 ]] && jq -e '.status == "ok"' "$health_file" >/dev/null \
+    || die "flapjack-server /health did not return status ok"
+
+  flapjack_key_env=FJ_STAGE4_FLAPJACK_ADMIN_KEY
+  source_key_env=FJ_STAGE4_MEILI_MASTER_KEY
+  export "$flapjack_key_env=$FLAPJACK_ADMIN_KEY_VALUE"
+  export "$source_key_env=$MASTER_KEY"
+
+  set +e
+  "$binary" migrate preview \
+    --endpoint "$FLAPJACK_URL" \
+    --api-key-env "$flapjack_key_env" \
+    --source-provider meilisearch \
+    --source-endpoint "$BASE_URL" \
+    --source-index "$(jq -r '.indexes.configured.uid' "$EXPECTED")" \
+    --source-key-env "$source_key_env" \
+    >"$PREVIEW_HUMAN_OUTPUT_FILE" 2>&1
+  PREVIEW_HUMAN_EXIT=$?
+  "$binary" migrate preview \
+    --endpoint "$FLAPJACK_URL" \
+    --api-key-env "$flapjack_key_env" \
+    --source-provider meilisearch \
+    --source-endpoint "$BASE_URL" \
+    --source-index "$(jq -r '.indexes.configured.uid' "$EXPECTED")" \
+    --source-key-env "$source_key_env" \
+    --json \
+    >"$PREVIEW_JSON_OUTPUT_FILE" 2>&1
+  PREVIEW_JSON_EXIT=$?
+  set -e
+
+  [[ "$PREVIEW_HUMAN_EXIT" -eq 9 ]] \
+    || die "human CLI preview exit mismatch: $PREVIEW_HUMAN_EXIT"
+  [[ "$PREVIEW_JSON_EXIT" -eq 9 ]] \
+    || die "JSON CLI preview exit mismatch: $PREVIEW_JSON_EXIT"
+  human_output="$(cat "$PREVIEW_HUMAN_OUTPUT_FILE")"
+  json_output="$(cat "$PREVIEW_JSON_OUTPUT_FILE")"
+  redact_and_reject_credentials "$human_output"
+  redact_and_reject_credentials "$json_output"
+  redact_and_reject_credentials "$(cat "$SERVER_LOG")"
+
+  jq -e --argjson expected_records "$expected_records" '
+    .sourceCounts.indexes == 1 and
+    .sourceCounts.records == $expected_records and
+    ([.report.entries[] | select(.severity == "HardRejection")] | length) > 0 and
+    ([.report.entries[] | select(.severity == "Warning")] | length) > 0 and
+    .report.summary.totalEntries == (.report.entries | length) and
+    .report.summary.hardRejections == ([.report.entries[] | select(.severity == "HardRejection")] | length) and
+    .report.summary.warnings == ([.report.entries[] | select(.severity == "Warning")] | length) and
+    .report.summary.scopeGaps == ([.report.entries[] | select(.severity == "ScopeGap")] | length)
+  ' "$PREVIEW_JSON_OUTPUT_FILE" >/dev/null || die "JSON CLI preview report mismatch"
+  grep -Fq "source_indexes=1" "$PREVIEW_HUMAN_OUTPUT_FILE" \
+    || die "human CLI preview omitted source index count"
+  grep -Fq "source_records=${expected_records}" "$PREVIEW_HUMAN_OUTPUT_FILE" \
+    || die "human CLI preview omitted source record count"
+  grep -Fq "severity=HardRejection" "$PREVIEW_HUMAN_OUTPUT_FILE" \
+    || die "human CLI preview omitted hard rejection entry"
+  grep -Fq "severity=Warning" "$PREVIEW_HUMAN_OUTPUT_FILE" \
+    || die "human CLI preview omitted warning entry"
+
+  severity_denominator="$(jq -cn \
+    --argjson exercised "$(jq -c '[.report.entries[].severity] | unique | length' \
+      "$PREVIEW_JSON_OUTPUT_FILE")" \
+    --argjson total 3 \
+    '{exercised:$exercised,total:$total}')"
+  PREVIEW_PROBE_RECEIPT="$(jq -cn \
+    --arg preview_proof PASS \
+    --arg build_profile release \
+    --arg flapjack_url "$FLAPJACK_URL" \
+    --arg source_url "$BASE_URL" \
+    --arg human_exit "$PREVIEW_HUMAN_EXIT" \
+    --arg json_exit "$PREVIEW_JSON_EXIT" \
+    --argjson expected_records "$expected_records" \
+    --argjson json_output "$(jq -c . "$PREVIEW_JSON_OUTPUT_FILE")" \
+    --arg human_output "$human_output" \
+    --argjson severity_denominator "$severity_denominator" \
+    '{
+      previewProof:$preview_proof,
+      buildProfile:$build_profile,
+      flapjackUrl:$flapjack_url,
+      sourceUrl:$source_url,
+      humanExitCode:($human_exit | tonumber),
+      jsonExitCode:($json_exit | tonumber),
+      expected:{sourceCounts:{indexes:1,records:$expected_records}},
+      actual:$json_output,
+      humanOutput:$human_output,
+      severityDenominator:$severity_denominator
+    }')"
   jq -e . <<<"$PREVIEW_PROBE_RECEIPT" >/dev/null \
-    || die "preview probe PASS receipt is not valid JSON"
+    || die "served CLI preview PASS receipt is not valid JSON"
+  printf '%s\n' "$human_output"
+  printf '%s\n' "$json_output"
 }
 
 main() {
@@ -841,6 +988,7 @@ main() {
 
   local sorted_ids
   sorted_ids="$(validate_contract)" || return $?
+  seed_preview_hard_rejection_source
   run_preview_probe
   if [[ "$MODE" != stub ]]; then
     stage_sanitized_failure_evidence

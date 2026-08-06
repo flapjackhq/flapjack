@@ -6,6 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ORACLE="$SCRIPT_DIR/migration_import_contract.sh"
 NIGHTLY_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/nightly.yml"
+NIGHTLY_IMPORT_LOG_SPECIMEN="$SCRIPT_DIR/../docs2/4_EVIDENCE/2026_08_05_stage2_nightly_migration_import_selector_specimen.log"
 SCALE_EVIDENCE_HEAD="bbfd59bf64dae52626ee584e39bb7bff0b580494"
 
 # Meta-suite runtime ceiling (MIG-17R) — derived from host-local measurements taken on
@@ -54,6 +55,14 @@ nightly_import_receipt_count_gate
 nightly_import_exact_cleanup
 nightly_import_evidence_upload
 nightly_import_seeded_object_count_two
+nightly_import_selector_not_mode_prefix
+nightly_import_specimen_matches_live_receipt
+nightly_import_selector_accepts_permuted_keys
+nightly_import_selector_rejects_missing_check
+nightly_import_selector_rejects_wrong_count
+nightly_import_legacy_mode_anchor_misses_specimen
+nightly_import_selector_extraction_rejects_missing
+nightly_import_shape_filter_rejects_drift
 nightly_scale_job_count
 nightly_scale_dispatch_gate
 nightly_scale_two_point_command
@@ -179,6 +188,7 @@ cleanup_failure_evidence
 selftest_failure_evidence_retained
 testing_docs_scale_proof_contract
 debbie_public_sync_surface
+public_selector_artifacts_sanitized
 args_importing_accepts_scenario_replicas
 args_unavailable_refuses_scenario
 args_unknown_scenario_fails
@@ -220,6 +230,14 @@ scenario_id_for_label() {
     'nightly cleanup deletes exactly created source index') printf '%s\n' 'nightly_import_exact_cleanup' ;;
     'nightly uploads preserved oracle evidence') printf '%s\n' 'nightly_import_evidence_upload' ;;
     'nightly scheduled import pins SEEDED_OBJECT_COUNT=2') printf '%s\n' 'nightly_import_seeded_object_count_two' ;;
+    'nightly importing selector does not depend on leading mode key') printf '%s\n' 'nightly_import_selector_not_mode_prefix' ;;
+    'nightly importing specimen matches live oracle receipt shape') printf '%s\n' 'nightly_import_specimen_matches_live_receipt' ;;
+    'nightly importing selector accepts permuted receipt keys') printf '%s\n' 'nightly_import_selector_accepts_permuted_keys' ;;
+    'nightly importing selector rejects receipts missing migration_import check') printf '%s\n' 'nightly_import_selector_rejects_missing_check' ;;
+    'nightly importing selector rejects wrong imported detail') printf '%s\n' 'nightly_import_selector_rejects_wrong_count' ;;
+    'legacy nightly importing mode anchor misses captured passing receipt') printf '%s\n' 'nightly_import_legacy_mode_anchor_misses_specimen' ;;
+    'nightly importing selector extraction rejects a missing selector') printf '%s\n' 'nightly_import_selector_extraction_rejects_missing' ;;
+    'nightly importing receipt shape filter rejects drifted counts') printf '%s\n' 'nightly_import_shape_filter_rejects_drift' ;;
     'nightly has exactly one migration scale contract job') printf '%s\n' 'nightly_scale_job_count' ;;
     'nightly scale contract is public-mirror and dispatch-input gated') printf '%s\n' 'nightly_scale_dispatch_gate' ;;
     'nightly scale contract invokes the two-point scale oracle') printf '%s\n' 'nightly_scale_two_point_command' ;;
@@ -345,6 +363,7 @@ scenario_id_for_label() {
     'self-test retains its work directory on failure') printf '%s\n' 'selftest_failure_evidence_retained' ;;
     'testing docs describe the local migration scale proof') printf '%s\n' 'testing_docs_scale_proof_contract' ;;
     'debbie sync surface publishes migration test, docs, and workflow assets') printf '%s\n' 'debbie_public_sync_surface' ;;
+    'public selector specimen and receipt are scrubbed') printf '%s\n' 'public_selector_artifacts_sanitized' ;;
     'scenario replicas is accepted for importing mode') printf '%s\n' 'args_importing_accepts_scenario_replicas' ;;
     'unavailable refuses scenario') printf '%s\n' 'args_unavailable_refuses_scenario' ;;
     'unknown scenario fails') printf '%s\n' 'args_unknown_scenario_fails' ;;
@@ -591,15 +610,22 @@ class ScaleFixtureError(RuntimeError):
 
 
 def wait_for_sampled_sidecar_size(data_dir, corpus_size, trial_number, expected_size):
-    observed_size = (
+    sampler_output = (
         data_dir.parent / "logs" / "scale-trials" / str(corpus_size)
-        / f"trial-{trial_number}" / "sampler.json.candidates" / "observed_size"
+        / f"trial-{trial_number}" / "sampler.json"
     )
+    observed_size = sampler_output.parent / "sampler.json.candidates" / "observed_size"
+    sampled_sizes = sampler_output.parent / "sampler.json.sizes"
     deadline = time.monotonic() + 2
     expected_text = str(expected_size)
     while time.monotonic() < deadline:
         try:
-            if observed_size.read_text(encoding="utf-8").strip() == expected_text:
+            recorded_sizes = sampled_sizes.read_text(encoding="utf-8").splitlines()
+            if (
+                observed_size.read_text(encoding="utf-8").strip() == expected_text
+                and recorded_sizes
+                and recorded_sizes[-1] == expected_text
+            ):
                 return
         except FileNotFoundError:
             pass
@@ -640,6 +666,23 @@ def sampled_manifest_snapshot_path(data_dir, corpus_size, trial_number):
         / f"trial-{trial_number}" / "sampler.json.candidates" / "manifest.0.json"
     )
 
+def delete_sampled_manifest_once_for_race_probe(sampled_manifest):
+    marker = state / "scale_manifest_deleted_snapshot_race_probe"
+    if scenario != "scale_manifest_deleted_snapshot" or marker.exists():
+        return
+    marker.write_text("done", encoding="utf-8")
+    sampled_manifest.unlink(missing_ok=True)
+
+def write_stale_sampled_manifest_snapshot(sampled_manifest, stale_manifest):
+    sampled_manifest.write_text(json.dumps(stale_manifest, separators=(",", ":")), encoding="utf-8")
+    delete_sampled_manifest_once_for_race_probe(sampled_manifest)
+    old_timestamp = time.time() - 10
+    try:
+        os.utime(sampled_manifest, (old_timestamp, old_timestamp))
+    except FileNotFoundError:
+        return False
+    return True
+
 def seed_stale_sampled_manifest_snapshot(sampled_manifest, manifest):
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
@@ -652,9 +695,13 @@ def seed_stale_sampled_manifest_snapshot(sampled_manifest, manifest):
         )
     stale_manifest = json.loads(json.dumps(manifest))
     stale_manifest["snapshot_token"] = "stale-sampled-manifest"
-    sampled_manifest.write_text(json.dumps(stale_manifest, separators=(",", ":")), encoding="utf-8")
-    old_timestamp = time.time() - 10
-    os.utime(sampled_manifest, (old_timestamp, old_timestamp))
+    while time.monotonic() < deadline:
+        if write_stale_sampled_manifest_snapshot(sampled_manifest, stale_manifest):
+            return
+        time.sleep(0.01)
+    raise ScaleFixtureError(
+        f"timed out writing stale sampled manifest snapshot at {sampled_manifest}"
+    )
 
 def write_fake_job(target, corpus_size):
     data_dir_file = state / "data_dir"
@@ -1632,6 +1679,12 @@ secret_file_for() {
   printf '%s\n' "$runtime/secret.env"
 }
 
+artifact_has_no_secret_markers() {
+  local artifact="$1"
+  [ -f "$artifact" ] || return 1
+  ! grep -Eq 'APPID_CANARY|ADMIN_SECRET_CANARY|ALGOLIA_APP_ID=|ALGOLIA_ADMIN_KEY=|X-Algolia-(Application-Id|API-Key)' "$artifact"
+}
+
 verification_manifest_for() {
   local runtime="$1"
   mkdir -p "$runtime"
@@ -2208,6 +2261,221 @@ text_contains() {
   grep -Fq "$needle" <<<"$text"
 }
 
+remove_nightly_import_selector_from_workflow() {
+  local source="$1" target="$2"
+  awk '
+    $0 == "          select_migration_import_receipt() {" { skip = 1; next }
+    skip && $0 == "          }" { skip = 0; next }
+    !skip { print }
+  ' "$source" >"$target"
+}
+
+extract_nightly_import_selector_function() {
+  local workflow="$1" output="$2"
+  awk '
+    $0 == "          select_migration_import_receipt() {" { in_fn = 1 }
+    in_fn {
+      line = $0
+      sub(/^          /, "", line)
+      print line
+      if ($0 == "          }") { exit }
+    }
+  ' "$workflow" >"$output"
+  grep -Fq 'select_migration_import_receipt() {' "$output"
+}
+
+nightly_import_specimen_receipt() {
+  jq -Rcer '
+    fromjson?
+    | select(type == "object")
+    | select(.mode == "importing")
+    | select(.status == "pass")
+  ' "$NIGHTLY_IMPORT_LOG_SPECIMEN" | tail -n 1
+}
+
+# The specimen is the single fixture source for this selector proof, so the replay pins
+# SEEDED_OBJECT_COUNT to the count the specimen itself reports instead of restating a
+# literal that could silently disagree with it.
+nightly_import_specimen_object_count() {
+  nightly_import_specimen_receipt \
+    | jq -er '.checks[] | select(.name == "migration_import") | .detail | ltrimstr("objects.imported=")'
+}
+
+# Reduces a receipt to its key order plus per-leaf value types, so a comparison can prove two
+# receipts share a shape without depending on host-specific or run-specific values.
+NIGHTLY_IMPORT_RECEIPT_SHAPE_FILTER='
+  def skeleton:
+    if type == "object" then with_entries(.value |= skeleton)
+    elif type == "array" then (if length == 0 then [] else [.[0] | skeleton] end)
+    else type
+    end;
+  {shape: skeleton, check_names: [.checks[].name]}
+'
+
+nightly_import_receipt_shape() {
+  jq -c "$NIGHTLY_IMPORT_RECEIPT_SHAPE_FILTER"
+}
+
+write_nightly_import_selector_log() {
+  local target="$1" filter="$2" receipt
+  receipt="$(nightly_import_specimen_receipt)" || return 1
+  {
+    printf 'scheduled importing oracle log specimen replay\n'
+    printf '%s\n' "$receipt" | jq -c "$filter"
+  } >"$target"
+}
+
+run_nightly_import_selector_fixture() {
+  local log_file="$1" output="$2" selector_function selector_script seeded_object_count
+  selector_function="$WORK_DIR/nightly-import-selector-function.sh"
+  selector_script="$WORK_DIR/nightly-import-selector-replay.sh"
+  extract_nightly_import_selector_function "$NIGHTLY_WORKFLOW" "$selector_function" || return 1
+  seeded_object_count="$(nightly_import_specimen_object_count)" || return 1
+  {
+    # The scheduled-import step runs under the Actions default `bash -e`; replay under the
+    # stricter `-o pipefail` too so the selector cannot pass only by relying on the looser one.
+    printf '%s\n' 'set -euo pipefail'
+    printf 'ORACLE_LOG=%q\n' "$log_file"
+    printf 'SEEDED_OBJECT_COUNT=%q\n' "$seeded_object_count"
+    cat "$selector_function"
+    printf '%s\n' 'select_migration_import_receipt'
+  } >"$selector_script"
+  bash "$selector_script" >"$output" 2>"$output.stderr"
+}
+
+assert_nightly_import_specimen_matches_live_receipt_shape() {
+  local label='nightly importing specimen matches live oracle receipt shape'
+  local runtime out rc secret live_shape specimen_shape
+  if [ ! -f "$NIGHTLY_IMPORT_LOG_SPECIMEN" ]; then
+    fail "$label" "missing specimen $NIGHTLY_IMPORT_LOG_SPECIMEN"
+    return
+  fi
+  runtime="$WORK_DIR/nightly_import_specimen_shape"
+  out="$runtime.out"
+  secret="$(secret_file_for "$runtime")"
+  rc="$(run_oracle_with_stub importing_ok "$out" "$runtime" \
+    --expect-mode importing --secret-file "$secret" \
+    --source-index source_products --target-index target_products)"
+  if [ "$rc" != 0 ]; then
+    fail "$label" "stub oracle rc=$rc output=$(cat "$out" 2>/dev/null || true)"
+    return
+  fi
+  live_shape="$(jq -Rcer "fromjson? | select(type == \"object\") | $NIGHTLY_IMPORT_RECEIPT_SHAPE_FILTER" "$out" | tail -n 1)" || {
+    fail "$label" "live oracle emitted no receipt object: $(cat "$out" 2>/dev/null || true)"
+    return
+  }
+  specimen_shape="$(nightly_import_specimen_receipt | nightly_import_receipt_shape)" || {
+    fail "$label" "failed to derive receipt from $NIGHTLY_IMPORT_LOG_SPECIMEN"
+    return
+  }
+  if [ "$specimen_shape" = "$live_shape" ]; then
+    pass "$label"
+  else
+    fail "$label" "specimen=$specimen_shape live=$live_shape"
+  fi
+}
+
+assert_legacy_nightly_import_mode_anchor_misses_specimen() {
+  local label='legacy nightly importing mode anchor misses captured passing receipt' receipt
+  receipt="$(nightly_import_specimen_receipt)" || {
+    fail "$label" "failed to derive receipt from $NIGHTLY_IMPORT_LOG_SPECIMEN"
+    return
+  }
+  if printf '%s\n' "$receipt" | grep -Eq '^\{"mode":'; then
+    fail "$label" 'captured passing receipt unexpectedly matched the legacy selector'
+  else
+    pass "$label"
+  fi
+}
+
+assert_nightly_import_selector_extraction_rejects_missing_selector() {
+  local label='nightly importing selector extraction rejects a missing selector'
+  local mutated_workflow extracted_selector
+  mutated_workflow="$WORK_DIR/nightly-import-without-selector.yml"
+  extracted_selector="$WORK_DIR/nightly-import-missing-selector.sh"
+  remove_nightly_import_selector_from_workflow "$NIGHTLY_WORKFLOW" "$mutated_workflow"
+  if extract_nightly_import_selector_function "$mutated_workflow" "$extracted_selector"; then
+    fail "$label" 'selector extraction accepted a workflow with the function removed'
+  else
+    pass "$label"
+  fi
+}
+
+assert_nightly_import_shape_filter_rejects_drifted_counts() {
+  local label='nightly importing receipt shape filter rejects drifted counts'
+  local receipt expected_shape drifted_shape
+  receipt="$(nightly_import_specimen_receipt)" || {
+    fail "$label" "failed to derive receipt from $NIGHTLY_IMPORT_LOG_SPECIMEN"
+    return
+  }
+  expected_shape="$(printf '%s\n' "$receipt" | nightly_import_receipt_shape)" || {
+    fail "$label" 'failed to derive the captured receipt shape'
+    return
+  }
+  drifted_shape="$(printf '%s\n' "$receipt" \
+    | jq -c '.counts = {source:.counts.source_count, target:.counts.target_count}' \
+    | nightly_import_receipt_shape)" || {
+    fail "$label" 'failed to derive the drifted receipt shape'
+    return
+  }
+  if [ "$drifted_shape" != "$expected_shape" ]; then
+    pass "$label"
+  else
+    fail "$label" 'receipt shape filter accepted drifted count keys'
+  fi
+}
+
+assert_nightly_import_selector_accepts_permuted_receipt() {
+  local label='nightly importing selector accepts permuted receipt keys' log_file output expected_count
+  log_file="$WORK_DIR/nightly-import-permuted-receipt.log"
+  output="$WORK_DIR/nightly-import-permuted-receipt.out"
+  if [ ! -f "$NIGHTLY_IMPORT_LOG_SPECIMEN" ]; then
+    fail "$label" "missing specimen $NIGHTLY_IMPORT_LOG_SPECIMEN"
+    return
+  fi
+  # Reversing entries permutes whatever key set the emitter owns today, so this control cannot
+  # drift out of date the way a restated key list would.
+  write_nightly_import_selector_log "$log_file" 'to_entries | reverse | from_entries' || {
+    fail "$label" "failed to derive receipt from $NIGHTLY_IMPORT_LOG_SPECIMEN"
+    return
+  }
+  expected_count="$(nightly_import_specimen_object_count)" || {
+    fail "$label" "failed to derive imported count from $NIGHTLY_IMPORT_LOG_SPECIMEN"
+    return
+  }
+  if grep -Eq '^\{"mode":' "$log_file"; then
+    fail "$label" 'permuted control still matched the old leading {"mode": selector'
+    return
+  fi
+  if run_nightly_import_selector_fixture "$log_file" "$output" \
+    && jq -e --arg detail "objects.imported=$expected_count" \
+      '.mode == "importing" and any(.checks[]; .name == "migration_import" and .status == "pass" and .detail == $detail)' \
+      "$output" >/dev/null; then
+    pass "$label"
+  else
+    fail "$label" "output=$(cat "$output" 2>/dev/null || true) stderr=$(cat "$output.stderr" 2>/dev/null || true)"
+  fi
+}
+
+assert_nightly_import_selector_rejects_mutation() {
+  local label="$1" filter="$2" log_file output
+  log_file="$WORK_DIR/${label//[^A-Za-z0-9_]/_}.log"
+  output="$WORK_DIR/${label//[^A-Za-z0-9_]/_}.out"
+  write_nightly_import_selector_log "$log_file" "$filter" || {
+    fail "$label" "failed to derive receipt from $NIGHTLY_IMPORT_LOG_SPECIMEN"
+    return
+  }
+  if run_nightly_import_selector_fixture "$log_file" "$output"; then
+    fail "$label" "selector accepted $(cat "$output" 2>/dev/null || true)"
+  # A missing or unextractable selector also exits nonzero, so require the rejection to carry
+  # the selector's own diagnostic — otherwise deleting the selector would read as a pass.
+  elif grep -Fq 'did not emit a passing receipt' "$output.stderr" 2>/dev/null; then
+    pass "$label"
+  else
+    fail "$label" "rejection did not come from the workflow selector: stderr=$(cat "$output.stderr" 2>/dev/null || true)"
+  fi
+}
+
 remove_scale_secret_env_from_workflow() {
   local source="$1" target="$2"
   awk '
@@ -2245,7 +2513,7 @@ assert_scale_workflow_mutation_rejected() {
   before_results="$TEST_RESULTS"
   original_workflow="$NIGHTLY_WORKFLOW"
   NIGHTLY_WORKFLOW="$mutated_workflow"
-  assert_nightly_importing_contract >/dev/null
+  assert_nightly_scale_contract >/dev/null
   local rejected="false"
   [ "$TESTS_FAILED" -gt "$before_failed" ] && rejected="true"
   TESTS_RUN="$before_run"
@@ -2263,7 +2531,7 @@ assert_scale_workflow_mutation_rejected() {
 }
 
 assert_nightly_importing_contract() {
-  local job_count oracle_step_count scale_job_body scale_secret_write_count
+  local job_count oracle_step_count
   if [ ! -f "$NIGHTLY_WORKFLOW" ]; then
     fail 'nightly workflow exists for scheduled importing oracle' "$NIGHTLY_WORKFLOW"
     return
@@ -2271,7 +2539,6 @@ assert_nightly_importing_contract() {
 
   job_count="$(grep -Ec '^  migration-import-contract:' "$NIGHTLY_WORKFLOW")"
   oracle_step_count="$(grep -Ec 'bash engine/tests/migration_import_contract\.sh --expect-mode importing' "$NIGHTLY_WORKFLOW")"
-  scale_job_body="$(workflow_job_body "$NIGHTLY_WORKFLOW" migration-scale-contract)"
 
   [ "$job_count" = "1" ] \
     && pass 'nightly has exactly one migration import contract job' \
@@ -2316,7 +2583,30 @@ assert_nightly_importing_contract() {
   grep -Fq '/tmp/flapjack_migration_import_contract_evidence_*' "$NIGHTLY_WORKFLOW" \
     && pass 'nightly uploads preserved oracle evidence' \
     || fail 'nightly uploads preserved oracle evidence'
+  ! grep -Fq "grep -E '^\\{\"mode\":'" "$NIGHTLY_WORKFLOW" \
+    && pass 'nightly importing selector does not depend on leading mode key' \
+    || fail 'nightly importing selector does not depend on leading mode key'
+  assert_legacy_nightly_import_mode_anchor_misses_specimen
+  assert_nightly_import_selector_extraction_rejects_missing_selector
+  assert_nightly_import_specimen_matches_live_receipt_shape
+  assert_nightly_import_shape_filter_rejects_drifted_counts
+  assert_nightly_import_selector_accepts_permuted_receipt
+  assert_nightly_import_selector_rejects_mutation \
+    'nightly importing selector rejects receipts missing migration_import check' \
+    '.checks = [.checks[] | select(.name != "migration_import")]'
+  assert_nightly_import_selector_rejects_mutation \
+    'nightly importing selector rejects wrong imported detail' \
+    '(.checks[] | select(.name == "migration_import") | .detail)
+       |= ("objects.imported=" + ((ltrimstr("objects.imported=") | tonumber) + 1 | tostring))'
+}
 
+assert_nightly_scale_contract() {
+  local job_count scale_job_body scale_secret_write_count
+  if [ ! -f "$NIGHTLY_WORKFLOW" ]; then
+    fail 'nightly workflow exists for migration scale contract' "$NIGHTLY_WORKFLOW"
+    return
+  fi
+  scale_job_body="$(workflow_job_body "$NIGHTLY_WORKFLOW" migration-scale-contract)"
   job_count="$(grep -Ec '^  migration-scale-contract:' "$NIGHTLY_WORKFLOW" || true)"
   [ "$job_count" = "1" ] \
     && pass 'nightly has exactly one migration scale contract job' \
@@ -2390,10 +2680,23 @@ assert_debbie_public_sync_surface() {
   if [ -f "$debbie" ] \
     && grep -Fxq 'path = "engine/tests/"' "$debbie" \
     && grep -Fxq 'path = "engine/docs2/1_STRATEGY/"' "$debbie" \
-    && grep -Fxq 'path = ".github/"' "$debbie"; then
+    && grep -Fxq 'path = ".github/"' "$debbie" \
+    && grep -Fxq '    "engine/docs2/4_EVIDENCE/2026_08_05_stage2_nightly_migration_import_selector_specimen.log",' "$debbie" \
+    && grep -Fxq '    "engine/docs2/4_EVIDENCE/2026_08_05_aug05_am_2_nightly_migration_oracle_repair_receipt.md",' "$debbie"; then
     pass 'debbie sync surface publishes migration test, docs, and workflow assets'
   else
     fail 'debbie sync surface publishes migration test, docs, and workflow assets'
+  fi
+}
+
+assert_public_selector_artifacts_are_sanitized() {
+  local label='public selector specimen and receipt are scrubbed'
+  local receipt_doc="$SCRIPT_DIR/../docs2/4_EVIDENCE/2026_08_05_aug05_am_2_nightly_migration_oracle_repair_receipt.md"
+  if artifact_has_no_secret_markers "$NIGHTLY_IMPORT_LOG_SPECIMEN" \
+    && artifact_has_no_secret_markers "$receipt_doc"; then
+    pass "$label"
+  else
+    fail "$label" "specimen=$NIGHTLY_IMPORT_LOG_SPECIMEN receipt=$receipt_doc"
   fi
 }
 
@@ -3467,6 +3770,7 @@ assert_static_contract() {
     && pass 'scale sampler hot path avoids manifest validation and size subprocesses' \
     || fail 'scale sampler hot path avoids manifest validation and size subprocesses'
   assert_nightly_importing_contract
+  assert_nightly_scale_contract
   assert_scale_workflow_mutation_rejected \
     'nightly scale contract rejects missing scoped credential environment' \
     remove_scale_secret_env_from_workflow
@@ -3638,6 +3942,7 @@ main() {
   assert_failure_retains_work_dir
   assert_testing_docs_scale_proof_contract
   assert_debbie_public_sync_surface
+  assert_public_selector_artifacts_are_sanitized
 
   assert_terminal_scenario_inventory || return 1
   suite_elapsed_seconds=$((SECONDS - suite_started_seconds))

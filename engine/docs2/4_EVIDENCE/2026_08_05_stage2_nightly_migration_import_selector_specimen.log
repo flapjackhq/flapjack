@@ -1,0 +1,8 @@
+# Captured scheduled-import oracle stdout, taken offline with no Algolia credentials by running
+# engine/tests/migration_import_contract.sh --expect-mode importing under the meta-suite stub
+# harness (MIGRATION_IMPORT_CONTRACT_SCENARIO=importing_ok). Host-specific strings were replaced
+# with public-runner placeholders; every key, nesting level, and value type below is verbatim.
+# The 'nightly importing specimen matches live oracle receipt shape' scenario in
+# engine/tests/migration_import_contract_test.sh re-derives a live receipt and fails if this
+# specimen stops describing what the oracle actually emits.
+{"status":"pass","mode":"importing","scenario":"","source_index":"fj_migration_import_source","target_index":"fj_migration_import_target","head":"b0434329688702b13ed0f6a36d47255c05cccedd","host":{"name":"public-ci-runner","uname":"Linux public-ci-runner 6.8.0 #1 SMP x86_64 GNU/Linux"},"runtime":{"shell":"/usr/bin/bash","bash_version":"5.2.21(1)-release","working_directory":"/home/runner/work/flapjack/flapjack/engine"},"binary":{"path":"/home/runner/work/flapjack/flapjack/engine/target/release/flapjack","build_info":{"schemaVersion":1,"version":"test","revision":"stubbed-revision","revisionKnown":true,"dirty":false,"dirtyKnown":true}},"owned_resources":{"targets":["fj_migration_import_target"]},"scale":null,"counts":{"source_count":7,"target_count":7},"replica_sequences":null,"elapsed_seconds":2,"checks":[{"name":"local_server","status":"pass","detail":"started"},{"name":"migration_import","status":"pass","detail":"objects.imported=7"},{"name":"target_entries","status":"pass","detail":"entries=7"},{"name":"contract_complete","status":"pass","detail":"importing"}]}

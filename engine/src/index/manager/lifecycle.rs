@@ -272,7 +272,7 @@ impl super::IndexManager {
         self.clear_tenant_runtime_state(tenant_id);
         self.admission_stores.remove(tenant_id);
 
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "test-support"))]
         crate::index::write_queue::record_writer_lifecycle_publication_checkpoint(
             tenant_id,
             "manager_delete_publication",
@@ -381,7 +381,7 @@ impl super::IndexManager {
             }
         };
 
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "test-support"))]
         crate::index::write_queue::record_writer_lifecycle_publication_checkpoint(
             tenant_id,
             "manager_import_publication",
@@ -509,7 +509,7 @@ impl super::IndexManager {
             PublicationWatermark::new(watermark),
         )?;
 
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "test-support"))]
         crate::index::write_queue::record_writer_lifecycle_publication_checkpoint(
             destination,
             "manager_replace_publication",
@@ -1226,7 +1226,7 @@ impl super::IndexManager {
         self.invalidate_facet_cache(tenant_id);
         let drain_result = self.drain_until_no_live_writer(tenant_id).await;
         self.clear_tenant_runtime_state(tenant_id);
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "test-support"))]
         crate::index::write_queue::record_writer_lifecycle_publication_checkpoint(
             tenant_id,
             "manager_quiesce_admission_fenced",
@@ -1247,7 +1247,7 @@ impl super::IndexManager {
     ) -> Result<TenantQuiesce> {
         self.invalidate_facet_cache(tenant_id);
         self.drain_until_no_live_writer(tenant_id).await?;
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "test-support"))]
         crate::index::write_queue::record_writer_lifecycle_publication_checkpoint(
             tenant_id,
             "manager_quiesce_admission_fenced",

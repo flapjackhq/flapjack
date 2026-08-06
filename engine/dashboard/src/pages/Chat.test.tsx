@@ -188,4 +188,27 @@ describe('Chat', () => {
     expect(sources).not.toHaveTextContent('secret-token');
     expect(sources).not.toHaveTextContent('should-not-render');
   });
+
+  it('renders a content-only source once through the no-objectID label fallback', () => {
+    mockSettings('neuralSearch', false, {
+      default: { source: 'userProvided', dimensions: 384 },
+    });
+    const sourceContent = 'Wireless headphones with noise cancellation';
+    mockChatState({
+      messages: [
+        {
+          role: 'assistant',
+          content: 'Answer with content-only source',
+          sources: [{ content: sourceContent }],
+        },
+      ],
+    });
+
+    renderChat();
+
+    const sourceItem = screen.getByTestId('chat-source-item');
+    expect(sourceItem).toHaveTextContent(sourceContent);
+    expect(sourceItem.textContent?.match(new RegExp(sourceContent, 'g'))).toHaveLength(1);
+    expect(sourceItem).not.toHaveTextContent(`${sourceContent}: ${sourceContent}`);
+  });
 });

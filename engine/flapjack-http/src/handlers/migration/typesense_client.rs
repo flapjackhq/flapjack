@@ -269,7 +269,9 @@ impl TypesenseClient {
         })
     }
 
-    #[cfg(test)]
+    /// Only the debug-gated loopback admission tests read this back, so it
+    /// carries the same gate and leaves no dead accessor in release builds.
+    #[cfg(all(test, debug_assertions))]
     pub(super) fn source_collection_for_test(&self) -> Option<&str> {
         self.source_collection.as_deref()
     }

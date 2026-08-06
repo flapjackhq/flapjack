@@ -8,6 +8,8 @@ RELEASE_WORKFLOW="$REPO_DIR/.github/workflows/release.yml"
 DOCKER_WORKFLOW="$REPO_DIR/.github/workflows/docker.yml"
 CI_WORKFLOW="$REPO_DIR/.github/workflows/ci.yml"
 RELEASE_MANIFEST_HELPER="$REPO_DIR/engine/package/release_artifact_manifest"
+CROSS_TOML="$REPO_DIR/engine/Cross.toml"
+ROOT_CROSS_TOML="$REPO_DIR/Cross.toml"
 
 TESTS_RUN=0
 TESTS_PASSED=0
@@ -61,6 +63,60 @@ assert_file_executable() {
   fi
 }
 
+assert_file_absent() {
+  local file_path="$1"
+  local description="$2"
+  if [ ! -e "$file_path" ]; then
+    pass "$description"
+  else
+    fail "$description"
+  fi
+}
+
+# cross reads Cross.toml relative to the crate it builds, so the release build's
+# container-passthrough owner must be engine/Cross.toml and must deliver exactly
+# the external FLAPJACK_BUILD_REVISION the workflow exports. The build.rs-emitted
+# FLAPJACK_INTERNAL_BUILD_REVISION is produced inside the build script, never
+# consumed from the container environment, so passing it through would be a
+# false owner. A guard that only checks the release.yml env spelling is
+# false-green because the value never crosses the container boundary without
+# this passthrough.
+cross_passthrough_contains() {
+  local variable_name="$1"
+  python3 - "$CROSS_TOML" "$variable_name" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    config = tomllib.load(handle)
+passthrough = config.get("build", {}).get("env", {}).get("passthrough", [])
+sys.exit(0 if sys.argv[2] in passthrough else 1)
+PY
+}
+
+assert_cross_build_revision_passthrough() {
+  if [ ! -f "$CROSS_TOML" ]; then
+    fail "engine/Cross.toml owns the cross container build-identity passthrough"
+    return
+  fi
+  pass "engine/Cross.toml owns the cross container build-identity passthrough"
+
+  assert_file_absent "$ROOT_CROSS_TOML" \
+    "Cross.toml is not misplaced at the repo root where the release build never reads it"
+
+  if cross_passthrough_contains "FLAPJACK_BUILD_REVISION"; then
+    pass "engine/Cross.toml [build.env] passthrough delivers FLAPJACK_BUILD_REVISION into the container build"
+  else
+    fail "engine/Cross.toml [build.env] passthrough delivers FLAPJACK_BUILD_REVISION into the container build"
+  fi
+
+  if cross_passthrough_contains "FLAPJACK_INTERNAL_BUILD_REVISION"; then
+    fail "engine/Cross.toml passthrough must not carry the build.rs-emitted internal revision name"
+  else
+    pass "engine/Cross.toml passthrough must not carry the build.rs-emitted internal revision name"
+  fi
+}
+
 # Slices one job out of the workflow so an assertion cannot be satisfied by a
 # match somewhere else in the file. `secrets.GHCR_TOKEN`, for example, appears
 # in every Docker job, so a whole-file grep would pass even if the preflight
@@ -93,6 +149,40 @@ assert_job_contains() {
 # Both patterns match the repository identity by SHAPE rather than by name,
 # because debbie rewrites that identity per mirror. This is run against the real
 # workflow and against an identity-rewritten copy of it; see the call sites.
+# The credential the preflight proves must be the credential the publish jobs
+# actually use, and naming either one literally is what lets them drift: point
+# the registry logins at a different secret and a literal assertion still
+# passes, leaving the preflight proving a credential the release never uses — a
+# green guard over an unproven credential.
+#
+# This is not hypothetical. Granting the release repository Actions access to
+# the GHCR package lets the publish jobs move from the PAT to the built-in
+# GITHUB_TOKEN, and that migration touches the login steps, not the preflight.
+# Comparing the two names rather than asserting either lets that migration pass
+# cleanly while still catching a half-done one.
+assert_preflight_proves_the_publish_credential() {
+  local publish_secrets preflight_secrets
+  publish_secrets="$(grep -oE '^[[:space:]]*password: \$\{\{ secrets\.[A-Z_]+ \}\}' "$RELEASE_WORKFLOW" \
+    | grep -oE 'secrets\.[A-Z_]+' | sort -u)"
+  preflight_secrets="$(job_block "ghcr_publish_preflight" | grep -oE 'secrets\.[A-Z_]+' | sort -u)"
+
+  if [ -z "$publish_secrets" ]; then
+    fail "preflight proves the credential the registry logins use (no registry login credential found)"
+    return
+  fi
+  # More than one distinct name means the publish jobs disagree with each other,
+  # so no single preflight can prove all of them.
+  if [ "$(printf '%s\n' "$publish_secrets" | wc -l | tr -d ' ')" != "1" ]; then
+    fail "preflight proves the credential the registry logins use (logins disagree: $(printf '%s ' $publish_secrets))"
+    return
+  fi
+  if [ "$publish_secrets" = "$preflight_secrets" ]; then
+    pass "preflight proves the credential the registry logins use ($publish_secrets)"
+  else
+    fail "preflight proves the credential the registry logins use (logins=$publish_secrets preflight=${preflight_secrets:-none})"
+  fi
+}
+
 assert_image_identity_ssot() {
   local workflow_path="$1"
   local context="$2"
@@ -117,6 +207,11 @@ if [ "$#" -ne 2 ] || [ "$1" != "build-info" ] || [ "$2" != "--json" ]; then
   exit 64
 fi
 printf '%s\n' '{"schemaVersion":1,"version":"1.2.3","revision":"0123456789abcdef0123456789abcdef01234567","revisionKnown":true,"dirty":false,"dirtyKnown":true,"workspaceDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"release","target":"x86_64-unknown-linux-gnu","features":["vector-search"],"capabilities":{"vectorSearch":true,"vectorSearchLocal":false}}'
+: <<'FLAPJACK_BUILD_INFO_EMBED'
+FLAPJACK_BUILD_INFO_JSON_BEGIN
+{"schemaVersion":1,"version":"1.2.3","revision":"0123456789abcdef0123456789abcdef01234567","revisionKnown":true,"dirty":false,"dirtyKnown":true,"workspaceDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"release","target":"x86_64-unknown-linux-gnu","features":["vector-search"],"capabilities":{"vectorSearch":true,"vectorSearchLocal":false}}
+FLAPJACK_BUILD_INFO_JSON_END
+FLAPJACK_BUILD_INFO_EMBED
 EOF
   chmod +x "$bin_path"
 
@@ -219,7 +314,7 @@ section "GHCR publish credential preflight"
 # credential proof ahead of the first irreversible act.
 assert_contains "$RELEASE_WORKFLOW" '^\s*ghcr_publish_preflight:' "release.yml defines a GHCR publish-credential preflight"
 assert_job_contains "ghcr_publish_preflight" '^\s*needs:\s*validate_release_version\s*$' "preflight is gated only on version validation, so it runs beside the build matrix"
-assert_job_contains "ghcr_publish_preflight" 'secrets\.GHCR_TOKEN' "preflight exercises the same secret the Docker publish jobs consume"
+assert_preflight_proves_the_publish_credential
 assert_job_contains "ghcr_publish_preflight" 'package/ghcr_publish_preflight' "preflight calls the shared helper instead of inlining probe logic in YAML"
 assert_job_contains "ghcr_publish_preflight" 'RELEASE_IMAGE_REPOSITORY' "preflight probes the same image repository the Docker jobs publish to"
 assert_job_contains "ghcr_publish_preflight" '^\s*timeout-minutes:' "preflight is time-bounded so a hung registry cannot stall the release"
@@ -231,6 +326,7 @@ assert_file_executable "$REPO_DIR/engine/package/ghcr_publish_preflight" "ghcr_p
 section "Release build identity packaging"
 assert_contains "$RELEASE_WORKFLOW" "github\\.sha.*\\^\\[0-9a-f\\]\\{40\\}\\$|\\^\\[0-9a-f\\]\\{40\\}\\$.*github\\.sha" "release.yml verifies github.sha is exactly 40 lowercase hex characters"
 assert_contains "$RELEASE_WORKFLOW" "FLAPJACK_BUILD_REVISION: \\$\\{\\{ github\\.sha \\}\\}" "release.yml exports github.sha as FLAPJACK_BUILD_REVISION for release builds"
+assert_cross_build_revision_passthrough
 assert_contains "$RELEASE_WORKFLOW" "package/release_artifact_manifest \\$\\{\\{ matrix\\.target \\}\\} target/\\$\\{\\{ matrix\\.target \\}\\}/release/flapjack " "unix packaging calls the shared release_artifact_manifest helper"
 assert_contains "$RELEASE_WORKFLOW" "package/release_artifact_manifest \\$\\{\\{ matrix\\.target \\}\\} target/\\$\\{\\{ matrix\\.target \\}\\}/release/flapjack\\.exe " "windows packaging calls the shared release_artifact_manifest helper"
 assert_contains "$RELEASE_WORKFLOW" "flapjack-\\*\\.manifest\\.json" "release.yml uploads and publishes manifest JSON assets"
@@ -273,6 +369,7 @@ section "Release contracts actually run"
 # quietly disabled.
 assert_contains "$CI_WORKFLOW" '^\s*run: bash engine/tests/test_release_workflow_structure\.sh\s*$' "ci.yml runs the release workflow structure contract"
 assert_contains "$CI_WORKFLOW" '^\s*run: bash engine/tests/test_ghcr_publish_preflight\.sh\s*$' "ci.yml runs the GHCR publish preflight contract"
+assert_contains "$CI_WORKFLOW" '^\s*run: bash engine/tests/build_identity_cross_kat_supervision_test\.sh\s*$' "ci.yml runs the cross passthrough KAT supervision contract"
 
 printf '\n\033[1mResults: %d/%d passed\033[0m\n' "$TESTS_PASSED" "$TESTS_RUN"
 if [ "$TESTS_FAILED" -gt 0 ]; then

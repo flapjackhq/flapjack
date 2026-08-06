@@ -322,11 +322,29 @@ jobs:
             exit 1
           fi
 
+          select_migration_import_receipt() {
+            local receipt
+            # No `-e`: an empty selection must reach the diagnostic below rather than aborting
+            # the step through jq's exit status, which `set -e -o pipefail` would do silently.
+            receipt="$(
+              jq -Rc --arg expected "objects.imported=${SEEDED_OBJECT_COUNT}" '
+                fromjson?
+                | select(type == "object")
+                | select(.status == "pass")
+                | select(.mode == "importing")
+                | select((.checks // []) | type == "array")
+                | select(any(.checks[]; .name == "migration_import" and .status == "pass" and .detail == $expected))
+              ' "$ORACLE_LOG" | tail -n 1
+            )"
+            if [ -z "$receipt" ]; then
+              printf 'ERROR: migration import oracle did not emit a passing receipt for objects.imported=%s\n' "$SEEDED_OBJECT_COUNT" >&2
+              return 1
+            fi
+            printf '%s\n' "$receipt"
+          }
+
           FLAPJACK_BIN="$PWD/engine/target/release/flapjack" bash engine/tests/migration_import_contract.sh --expect-mode importing --secret-file "$SECRET_FILE" --source-index "$SOURCE_INDEX" --target-index "$TARGET_INDEX" 2>&1 | tee "$ORACLE_LOG"
-          receipt="$(grep -E '^\{"mode":' "$ORACLE_LOG" | tail -1)"
-          jq -e --arg expected "objects.imported=${SEEDED_OBJECT_COUNT}" \
-            '.checks[] | select(.name == "migration_import" and .detail == $expected)' \
-            <<<"$receipt" >/dev/null
+          select_migration_import_receipt >/dev/null
       - name: Upload migration import oracle evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

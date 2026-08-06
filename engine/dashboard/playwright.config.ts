@@ -116,6 +116,17 @@ export default defineConfig({
       // Always spawn a fresh dashboard process for this run. Reuse mode depends on
       // a cross-process lease file and can block indefinitely if a stale lease is left behind.
       PLAYWRIGHT_WEBSERVER_REUSE: '0',
+      // The backend is part of the startup contract, not an operator prerequisite.
+      // When it was left to a human, a text-only build made skipWhenVectorSearchDisabled
+      // skip every chat / hybrid-search / vector-settings / navigation vector spec while
+      // the run still reported green. scripts/playwright-webserver.mjs now starts it and
+      // refuses to hand over to the browser unless /health reports vectorSearch: true.
+      PLAYWRIGHT_BACKEND_HOST: instance.host,
+      PLAYWRIGHT_BACKEND_PORT: String(instance.backendPort),
+      PLAYWRIGHT_BACKEND_URL: instance.backendBaseUrl,
+      // Pinned to the directory tests/fixtures/local-instance.ts resolves, so
+      // filesystem-backed fixtures read what the backend actually writes.
+      PLAYWRIGHT_BACKEND_DATA_DIR: instance.backendDataDir,
     },
     url: instance.dashboardBaseUrl,
     // Always start this workspace's Vite server so Playwright never reuses a foreign repo
