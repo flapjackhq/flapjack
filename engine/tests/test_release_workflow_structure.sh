@@ -8,6 +8,7 @@ RELEASE_WORKFLOW="${RELEASE_WORKFLOW_UNDER_TEST:-$REPO_DIR/.github/workflows/rel
 DOCKER_WORKFLOW="$REPO_DIR/.github/workflows/docker.yml"
 CI_WORKFLOW="$REPO_DIR/.github/workflows/ci.yml"
 RELEASE_MANIFEST_HELPER="$REPO_DIR/engine/package/release_artifact_manifest"
+HTTP_MANIFEST="$REPO_DIR/engine/flapjack-http/Cargo.toml"
 CROSS_TOML="$REPO_DIR/engine/Cross.toml"
 ROOT_CROSS_TOML="$REPO_DIR/Cross.toml"
 
@@ -419,6 +420,7 @@ assert_job_contains "release_ci_status_preflight" '"\$\{\{ github\.repository \}
 assert_job_needs "release" "release_ci_status_preflight" "the public tag and GitHub Release wait for terminal push CI status"
 
 section "Release build identity packaging"
+assert_contains "$HTTP_MANIFEST" 'utoipa-swagger-ui = \{ version = "8\.0", features = \["axum", "vendored"\] \}' "release builds vendor Swagger UI instead of downloading it during compilation"
 assert_contains "$RELEASE_WORKFLOW" "github\\.sha.*\\^\\[0-9a-f\\]\\{40\\}\\$|\\^\\[0-9a-f\\]\\{40\\}\\$.*github\\.sha" "release.yml verifies github.sha is exactly 40 lowercase hex characters"
 assert_contains "$RELEASE_WORKFLOW" "FLAPJACK_BUILD_REVISION: \\$\\{\\{ github\\.sha \\}\\}" "release.yml exports github.sha as FLAPJACK_BUILD_REVISION for release builds"
 assert_cross_build_revision_passthrough
