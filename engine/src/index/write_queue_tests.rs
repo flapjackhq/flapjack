@@ -3244,23 +3244,14 @@ async fn hundred_commits_do_not_leave_hundred_flush_segments() {
         wait_for_task_success(tasks.as_ref(), &task_id).await;
     }
 
-    let observation = tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            let observation = observed_segments(index.as_ref());
-            if observation.live_docs == COMMIT_COUNT as u64
-                && observation.live_segment_count < COMMIT_COUNT / 2
-                && observation.orphan_file_set_ids.is_empty()
-            {
-                return observation;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("worker-owned merge owner should converge 100 commits before shutdown");
-
     drop(tx);
-    handle.await.unwrap().unwrap();
+    tokio::time::timeout(WRITE_QUEUE_PROGRESS_TIMEOUT, handle)
+        .await
+        .expect("worker should finish channel-closed merge quiescence before timeout")
+        .expect("write queue worker task should join successfully")
+        .expect("write queue worker should shut down successfully");
+
+    let observation = observed_segments(index.as_ref());
 
     assert_eq!(
         observation.live_docs, COMMIT_COUNT as u64,
