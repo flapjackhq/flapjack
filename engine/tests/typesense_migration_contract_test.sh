@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 ORACLE="tests/typesense_migration_contract.sh"
 FIXTURE_DIR="tests/fixtures/2026_07_26_m0b_typesense_migration"
+SOURCE_RANGE_EVIDENCE="docs2/4_EVIDENCE/aug10_8pm_6_source_metadata_integration/source_range.md"
 if [ -n "${FJ_TYPESENSE_SELFTEST_WORK_DIR:-}" ]; then
   WORK_DIR="$FJ_TYPESENSE_SELFTEST_WORK_DIR"
   if [ -e "$WORK_DIR" ]; then
@@ -14,6 +16,7 @@ else
   WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fj_typesense_migration_contract_selftest.XXXXXX")"
 fi
 WORK_DIR_OWNER="$WORK_DIR/.typesense_migration_contract_selftest_owned"
+WRITE_FREEZE_ASSERTIONS="$WORK_DIR/write_freeze_served_contract_assertions.txt"
 : >"$WORK_DIR_OWNER"
 TESTS_RUN=0
 TESTS_PASSED=0
@@ -67,6 +70,33 @@ false_schema_sentinels_are_exact() {
   ' "$bundle" >/dev/null
 }
 
+exported_products_match_typesense_30_2_shape() {
+  local products="$1" bundle="$2"
+  jq -s --slurpfile bundle "$bundle" -e '
+    def expected_export_shape($omitted_fields):
+      map(with_entries(select(
+        .value != null
+        and ((.key as $key | $omitted_fields | index($key)) | not)
+      )))
+      | sort_by(.id);
+    . as $imports
+    | ($bundle[0].source.collections
+       | map(select(.name == "fj_ts_migration_products"))) as $products
+    | ([$products[0].fields[] | select(.store == false) | .name] | sort) as $omitted_fields
+    | ($imports | length) == 137
+      and ([ $imports[] | select(has("nullable_note")) ] | length) == 137
+      and ([ $imports[] | select(.nullable_note == null) ] | length) == 136
+      and ([ $imports[] | select(.nullable_note != null) | {id, nullable_note} ]
+           == [{id:"prod_002", nullable_note:"backorder"}])
+      and ([ $imports[] | select(has("secret_note")) | {id, secret_note} ]
+           == [{id:"prod_001", secret_note:"stored sentinel remains exported"}])
+      and ($products | length) == 1
+      and ($omitted_fields == ["secret_note"])
+      and (($products[0].documents | sort_by(.id))
+           == ($imports | expected_export_shape($omitted_fields)))
+  ' "$products" >/dev/null
+}
+
 assert_missing_false_schema_sentinels_are_rejected() {
   local mutated_bundle="$WORK_DIR/expected_bundle_without_false_schema_sentinels.json"
   jq '
@@ -79,6 +109,24 @@ assert_missing_false_schema_sentinels_are_rejected() {
     pass 'false schema assertion rejects missing sentinels'
   else
     fail 'false schema assertion rejects missing sentinels'
+  fi
+}
+
+assert_import_only_document_fields_are_rejected() {
+  local imported_documents="$WORK_DIR/imported_product_documents.json"
+  local mutated_bundle="$WORK_DIR/expected_bundle_with_import_only_fields.json"
+  jq -s '.' "$FIXTURE_DIR/seed_products.jsonl" >"$imported_documents"
+  jq --slurpfile imported "$imported_documents" '
+    (.source.collections[]
+      | select(.name == "fj_ts_migration_products")
+      | .documents) = $imported[0]
+  ' "$FIXTURE_DIR/expected_bundle.json" >"$mutated_bundle"
+
+  if ! exported_products_match_typesense_30_2_shape \
+    "$FIXTURE_DIR/seed_products.jsonl" "$mutated_bundle"; then
+    pass 'export-shape assertion rejects raw import-only document fields'
+  else
+    fail 'export-shape assertion rejects raw import-only document fields'
   fi
 }
 
@@ -112,6 +160,10 @@ assert_static_contract() {
   false_schema_sentinels_are_exact "$FIXTURE_DIR/expected_bundle.json" \
     && pass 'expected bundle preserves explicit false schema flags' \
     || fail 'expected bundle preserves explicit false schema flags'
+  exported_products_match_typesense_30_2_shape \
+    "$FIXTURE_DIR/seed_products.jsonl" "$FIXTURE_DIR/expected_bundle.json" \
+    && pass 'expected bundle matches Typesense 30.2 exported document shape' \
+    || fail 'expected bundle matches Typesense 30.2 exported document shape'
   grep -Fq 'bool_default("index"; true)' "$ORACLE" \
     && grep -Fq 'bool_default("store"; true)' "$ORACLE" \
     && ! grep -Fq 'index:(.index // true)' "$ORACLE" \
@@ -130,12 +182,105 @@ assert_static_contract() {
     || fail 'runner exercises discovery through the existing Typesense process'
 }
 
+assert_export_stream_live_contract_wiring() {
+  local products="$FIXTURE_DIR/seed_products.jsonl"
+  if jq -s -e '
+      length == 137
+      and (map(.id) | length == (unique | length))
+      and (map(.title) | length == (unique | length))
+      and all(.[]; (.id | type) == "string" and (.id | length) > 0)
+    ' "$products" >/dev/null \
+    && grep -Fq 'EXPECTED_PRODUCT_IDS="$ROOT_DIR/expected_product_ids.txt"' "$ORACLE" \
+    && grep -Fq 'jq -r '\''.id'\'' "$FIXTURE_DIR/seed_products.jsonl" | LC_ALL=C sort >"$EXPECTED_PRODUCT_IDS"' "$ORACLE" \
+    && grep -Fq 'TYPESENSE_EXPECTED_IDS_FILE="$EXPECTED_PRODUCT_IDS"' "$ORACLE" \
+    && grep -Fq 'handlers::migration::typesense_client_tests::typesense_export_stream_live_contract' "$ORACLE" \
+    && grep -Fq 'TYPESENSE_EXPORT_STREAM_CONTRACT documents=137 exact_ids=PASS export_requests=1 query_pagination=absent no_terminal_newline=PASS discovery_export_requests=0' "$ORACLE" \
+    && grep -Fq 'cmp "$EXPECTED_PRODUCT_IDS" "$CAPTURED_PRODUCT_IDS"' "$ORACLE" \
+    && grep -Fq 'export_requests=1' "$ORACLE" \
+    && grep -Fq 'query_pagination=absent' "$ORACLE" \
+    && grep -Fq 'discovery_export_requests=0' "$ORACLE" \
+    && grep -Fq 'LIVE_EXPORT_RED_COMMAND FJ_TYPESENSE_RUN_PRODUCTION_EXPORT_RED=1 bash engine/tests/typesense_migration_contract.sh' "$SOURCE_RANGE_EVIDENCE" \
+    && grep -Fq 'last_byte' "$ORACLE" \
+    && grep -Fq '[ "$last_byte" = 125 ]' "$ORACLE"; then
+    pass 'runner wires the 137-document production export-stream live contract'
+  else
+    fail 'runner wires the 137-document production export-stream live contract' \
+      'missing 137 exact-ID fixture, production live test, one-request recorder, pagination rejection, discovery guard, supplied-input command, or no-terminal-newline assertion'
+  fi
+}
+
+assert_live_export_arm_skip_is_announced() {
+  local live_gate first_return_line skip_line
+  live_gate="$WORK_DIR/run_production_export_stream_contract.sh"
+  awk '
+    /^run_production_export_stream_contract\(\) \{/ {capture=1}
+    capture {print}
+    capture && /^}/ {exit}
+  ' "$ORACLE" >"$live_gate"
+  first_return_line="$(grep -nF 'return 0' "$live_gate" | head -n 1 | cut -d: -f1)"
+  skip_line="$(grep -nF 'SKIP: production export-stream live contract explicitly disabled with FJ_TYPESENSE_RUN_PRODUCTION_EXPORT_RED=0' "$live_gate" | head -n 1 | cut -d: -f1)"
+  # Meta-tests opt out of the deliberately red Stage 1 live arm. A silent
+  # `return 0` would make that explicit skip invisible in an otherwise green
+  # run, so the gate must announce the skip and name its disabling input.
+  if grep -Fq 'FJ_TYPESENSE_RUN_PRODUCTION_EXPORT_RED' "$live_gate" \
+    && [ -n "$skip_line" ] \
+    && [ -n "$first_return_line" ] \
+    && [ "$skip_line" -lt "$first_return_line" ] \
+    && ! grep -Fq '[ "${FJ_TYPESENSE_RUN_PRODUCTION_EXPORT_RED:-0}" = 1 ] || return 0' "$ORACLE"; then
+    pass 'skipped live export arm announces itself instead of returning silently'
+  else
+    fail 'skipped live export arm announces itself instead of returning silently' \
+      'the explicit opt-out returns without reporting the skip or its disabling input'
+  fi
+}
+
+assert_live_export_arm_runs_by_default() {
+  local live_gate="$WORK_DIR/run_production_export_stream_contract_default.sh"
+  local marker="$WORK_DIR/default_live_arm_entered" out="$WORK_DIR/default_live_arm.out" rc
+  awk '
+    /^run_production_export_stream_contract\(\) \{/ {capture=1}
+    capture {print}
+    capture && /^}/ {exit}
+  ' "$ORACLE" >"$live_gate"
+
+  set +e
+  (
+    unset FJ_TYPESENSE_RUN_PRODUCTION_EXPORT_RED
+    ROOT_DIR="$WORK_DIR/default_live_probe"
+    PORT=1
+    SCOPED_KEY=probe
+    PRODUCTS=fj_ts_migration_products
+    EXPECTED_PRODUCT_IDS="$WORK_DIR/default_expected_ids.txt"
+    mkdir -p "$ROOT_DIR"
+    timeout() {
+      : >"$marker"
+      return 1
+    }
+    fail() {
+      exit 97
+    }
+    source "$live_gate"
+    run_production_export_stream_contract
+  ) >"$out" 2>&1
+  rc="$?"
+  set -e
+
+  if [ "$rc" = 97 ] \
+    && [ -f "$marker" ] \
+    && ! grep -Fq 'SKIP: production export-stream live contract' "$out"; then
+    pass 'production export-stream live contract runs by default'
+  else
+    fail 'production export-stream live contract runs by default' \
+      "rc=$rc entered=$([ -f "$marker" ] && printf yes || printf no) output=$(cat "$out" 2>/dev/null || true)"
+  fi
+}
+
 assert_expected_case_denominator() {
   local expected observed missing extra
   expected="$WORK_DIR/expected_cases.txt"
   observed="$WORK_DIR/observed_cases.txt"
   printf '%s\n' "$EXPECTED_CASES" | sort >"$expected"
-  grep -E '^[[:space:]]*assert_rejection ' "$0" | awk '{print $2}' | sort >"$observed"
+  grep -E '^[[:space:]]*assert_rejection ' "$SCRIPT_PATH" | awk '{print $2}' | sort >"$observed"
   missing="$(comm -23 "$expected" "$observed" || true)"
   extra="$(comm -13 "$expected" "$observed" || true)"
   if [ -z "$missing" ] && [ -z "$extra" ]; then
@@ -152,7 +297,7 @@ assert_failure_retains_work_dir() {
   set +e
   FJ_TYPESENSE_SELFTEST_FORCE_FAILURE=1 \
     FJ_TYPESENSE_SELFTEST_WORK_DIR="$probe_dir" \
-    bash "$0" >"$out" 2>&1
+    bash "$SCRIPT_PATH" >"$out" 2>&1
   rc="$?"
   set -e
   if [ "$rc" != 0 ] && [ -f "$probe_dir/forced_failure_evidence/container.log" ]; then
@@ -170,7 +315,7 @@ assert_preexisting_work_dir_is_rejected() {
   set +e
   FJ_TYPESENSE_SELFTEST_FORCE_FAILURE=1 \
     FJ_TYPESENSE_SELFTEST_WORK_DIR="$probe_dir" \
-    bash "$0" >"$out" 2>&1
+    bash "$SCRIPT_PATH" >"$out" 2>&1
   rc="$?"
   set -e
   if [ "$rc" != 0 ] \
@@ -185,7 +330,8 @@ assert_preexisting_work_dir_is_rejected() {
 assert_unsafe_run_id_is_rejected() {
   local out="$WORK_DIR/unsafe_run_id.out" rc
   set +e
-  FJ_TYPESENSE_RUN_ID='../unsafe/path' bash "$ORACLE" >"$out" 2>&1
+  FJ_TYPESENSE_RUN_PRODUCTION_EXPORT_RED=0 \
+    FJ_TYPESENSE_RUN_ID='../unsafe/path' bash "$ORACLE" >"$out" 2>&1
   rc="$?"
   set -e
   if [ "$rc" != 0 ] && grep -Fq 'run id must contain only' "$out"; then
@@ -201,6 +347,7 @@ assert_preexisting_evidence_dir_is_rejected() {
   printf '%s\n' preserve >"$evidence/sentinel"
   set +e
   FJ_TYPESENSE_WRITE_FREEZE_ATTESTED=1 \
+    FJ_TYPESENSE_RUN_PRODUCTION_EXPORT_RED=0 \
     FJ_TYPESENSE_RUN_ID="preexisting_evidence_$$" \
     FJ_TYPESENSE_EVIDENCE_DIR="$evidence" \
     bash "$ORACLE" >"$out" 2>&1
@@ -219,6 +366,8 @@ run_oracle() {
   local mutation="$1" out="$2" evidence="$3"
   set +e
   FJ_TYPESENSE_WRITE_FREEZE_ATTESTED=1 \
+    FJ_TYPESENSE_RUN_PRODUCTION_EXPORT_RED=0 \
+    FJ_TYPESENSE_RUN_SERVED_WRITE_FREEZE_CONTRACT=0 \
     FJ_TYPESENSE_CONTRACT_MUTATION="$mutation" \
     FJ_TYPESENSE_RUN_ID="selftest_${mutation}_$$" \
     FJ_TYPESENSE_EVIDENCE_DIR="$evidence" \
@@ -238,10 +387,12 @@ assert_rejection() {
     assert_no_secret_artifacts "$case_name" "$out" "$evidence"
     if [ "$case_name" = rejects_source_mutation_during_capture ]; then
       assert_mutation_observation "$evidence/mutation_observation.txt"
+      assert_source_fixture_teardown "$case_name" "$mutation" "$out" "$evidence"
     elif [ "$case_name" = rejects_truncated_export ]; then
       assert_truncated_export_evidence "$evidence/export_fj_ts_migration_categories.jsonl"
     elif [ "$case_name" = rejects_cleanup_residue ]; then
       assert_cleanup_residue_evidence "$evidence/cleanup_residue_marker.txt"
+      assert_source_fixture_teardown "$case_name" "$mutation" "$out" "$evidence"
     elif [[ "$case_name" == rejects_wrong_discovery_* ]]; then
       assert_discovery_failure_evidence "$evidence"
     fi
@@ -282,6 +433,47 @@ assert_cleanup_residue_evidence() {
   fi
 }
 
+# This KAT's Docker container is the seeded Typesense source fixture, not a
+# migrated Flapjack target. The oracle names it from the run id run_oracle
+# supplies, so the exact name is derivable here without reaching into the
+# oracle's private temp root. Three halves, each load-bearing:
+#   - container_residue.txt must name the exact container, proving the source
+#     fixture was live when the guard fired. Without it the case could go green
+#     on a run that died before it captured the source.
+#   - a successful Docker inventory must show that source fixture removed. A
+#     failed inventory is indeterminate and must fail closed, never masquerade
+#     as an empty survivor list.
+#   - the transcript must carry no PASS verdict, so a rejected capture cannot
+#     also report success.
+# Goes red if the oracle stops force-removing the container on the failure path,
+# stops snapshotting the source fixture before teardown, Docker inspection
+# fails, or the oracle ever prints the PASS verdict alongside a rejection. This
+# assertion deliberately makes no migrated-target or erased-job claim: those
+# require provider-aware lifecycle owners outside this source-contract KAT.
+assert_source_fixture_teardown() {
+  local case_name="$1" mutation="$2" out="$3" evidence="$4"
+  local container="fj_typesense_migration_contract_selftest_${mutation}_$$"
+  local live_at_guard survivors docker_status
+  live_at_guard="$(cat "$evidence/container_residue.txt" 2>/dev/null || true)"
+  set +e
+  survivors="$(docker ps -a --filter "name=^/${container}$" --format '{{.Names}}' 2>"$evidence/docker_inventory.err")"
+  docker_status="$?"
+  set -e
+  if [ "$docker_status" -ne 0 ]; then
+    fail "$case_name source fixture teardown is observable" \
+      "docker ps exited $docker_status: $(cat "$evidence/docker_inventory.err" 2>/dev/null || true)"
+    return
+  fi
+  if [ "$live_at_guard" = "$container" ] \
+    && [ -z "$survivors" ] \
+    && ! grep -Fq 'PASS: Typesense migration source contract KAT verified' "$out"; then
+    pass "$case_name removes the source fixture and declares no pass"
+  else
+    fail "$case_name removes the source fixture and declares no pass" \
+      "live_at_guard=$live_at_guard survivors=$survivors"
+  fi
+}
+
 assert_positive_control() {
   local out="$WORK_DIR/positive.out" evidence="$WORK_DIR/positive_evidence" rc
   rc="$(run_oracle "" "$out" "$evidence")"
@@ -314,12 +506,109 @@ assert_no_secret_artifacts() {
 assert_mutation_observation() {
   local observation="$1"
   if grep -Fq 'mutation_http_code=200' "$observation" 2>/dev/null \
-    && grep -Fq 'count_before=3' "$observation" \
-    && grep -Fq 'count_after=3' "$observation"; then
+    && grep -Fq 'count_before=137' "$observation" \
+    && grep -Fq 'count_after=137' "$observation"; then
     pass 'source mutation case records real same-count public update'
   else
     fail 'source mutation case records real same-count public update' "$(cat "$observation" 2>/dev/null || true)"
   fi
+}
+
+write_freeze_served_contract_assertion_manifest() {
+  cat <<'EOF'
+supported_http_status::[ "$code" = 400 ] || fail "$endpoint $attestation attestation returned $code"
+supported_refusal_message::.message | contains("external write freeze/attestation")
+supported_zero_source_io::[ "$(source_request_count)" = "$before" ] || fail "$endpoint $attestation reached Typesense"
+preview_document_count::.sourceCounts == {indexes:1,records:137}
+submit_document_count::.objectsImported.imported == 137
+true_source_reachability::[ "$after" -gt "$before" ] || fail "$endpoint true attestation did not reach Typesense"
+resume_http_status::[ "$code" = 400 ] && jq -e
+resume_error_code::.code == "source_provider_unsupported"
+resume_zero_source_io::[ "$(source_request_count)" = "$before" ] || fail "Typesense resume $attestation reached the source"
+served_denominator::[ "$MISSING_REFUSED $FALSE_REFUSED $ZERO_SOURCE_REQUESTS $TRUE_PASSED $RESUME_UNSUPPORTED" = '2 2 4 2 3' ]
+EOF
+}
+
+write_freeze_served_contract_shape_is_complete() {
+  local candidate="$1"
+  python3 - "$candidate" "$WRITE_FREEZE_ASSERTIONS" <<'PY'
+import pathlib
+import sys
+
+driver = pathlib.Path(sys.argv[1]).read_text()
+assertions = tuple(
+    line.split("::", 1)[1]
+    for line in pathlib.Path(sys.argv[2]).read_text().splitlines()
+)
+required = (
+    "readonly WRITE_FREEZE_SUPPORTED_ENDPOINTS='preview submit'",
+    "readonly WRITE_FREEZE_ATTESTATION_ARMS='missing false true'",
+    "readonly WRITE_FREEZE_RESUME_ARMS='missing false true'",
+    'for endpoint in $WRITE_FREEZE_SUPPORTED_ENDPOINTS; do',
+    'for attestation in $WRITE_FREEZE_ATTESTATION_ARMS; do',
+    'probe_supported_write_freeze_arm "$endpoint" "$attestation"',
+    'for attestation in $WRITE_FREEZE_RESUME_ARMS; do',
+    'probe_resume_write_freeze_arm "$attestation"',
+    'TYPESENSE_WRITE_FREEZE_CONTRACT endpoints=preview,submit missing_refused=2 false_refused=2 zero_source_requests=4 true_passed=2 resume_unsupported=3 resume_source_requests=0 documents=137',
+ ) + assertions
+raise SystemExit(0 if all(needle in driver for needle in required) else 1)
+PY
+}
+
+write_freeze_served_contract_without_assertion() {
+  local source="$1" assertion="$2" destination="$3"
+  python3 - "$source" "$assertion" "$destination" <<'PY'
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1])
+assertion = sys.argv[2]
+destination = pathlib.Path(sys.argv[3])
+driver = source.read_text()
+if driver.count(assertion) != 1:
+    raise SystemExit(f"expected exactly one served-contract assertion: {assertion}")
+destination.write_text(driver.replace(assertion, "", 1))
+PY
+}
+
+assert_write_freeze_served_contract_assertion_mutation() {
+  local case_name="$1" assertion="$2"
+  local mutated="$WORK_DIR/write_freeze_${case_name}.sh"
+  write_freeze_served_contract_without_assertion "$ORACLE" "$assertion" "$mutated"
+  if write_freeze_served_contract_shape_is_complete "$mutated"; then
+    fail "write-freeze served-contract mutation removes $case_name assertion"
+    return 1
+  fi
+  pass "write-freeze served-contract mutation removes $case_name assertion"
+}
+
+assert_write_freeze_served_contract_meta() {
+  local missing_endpoint="$WORK_DIR/write_freeze_missing_endpoint.sh"
+  local missing_resume_arm="$WORK_DIR/write_freeze_missing_resume_arm.sh"
+  local mutation case_name assertion
+
+  write_freeze_served_contract_assertion_manifest >"$WRITE_FREEZE_ASSERTIONS"
+
+  if ! write_freeze_served_contract_shape_is_complete "$ORACLE"; then
+    printf 'TYPESENSE_WRITE_FREEZE_META=RED missing_supported_endpoint_or_resume_refusal_arm\n' >&2
+    exit 1
+  fi
+
+  sed "s/readonly WRITE_FREEZE_SUPPORTED_ENDPOINTS='preview submit'/readonly WRITE_FREEZE_SUPPORTED_ENDPOINTS='preview'/" \
+    "$ORACLE" >"$missing_endpoint"
+  sed "s/readonly WRITE_FREEZE_RESUME_ARMS='missing false true'/readonly WRITE_FREEZE_RESUME_ARMS='missing true'/" \
+    "$ORACLE" >"$missing_resume_arm"
+  if write_freeze_served_contract_shape_is_complete "$missing_endpoint" \
+    || write_freeze_served_contract_shape_is_complete "$missing_resume_arm"; then
+    fail 'write-freeze served-contract mutation removes a supported or resume arm'
+  else
+    pass 'write-freeze served-contract mutation removes a supported or resume arm'
+  fi
+  while IFS= read -r mutation; do
+    case_name="${mutation%%::*}"
+    assertion="${mutation#*::}"
+    assert_write_freeze_served_contract_assertion_mutation "$case_name" "$assertion"
+  done <"$WRITE_FREEZE_ASSERTIONS"
 }
 
 main() {
@@ -327,8 +616,13 @@ main() {
   mkdir -p "$WORK_DIR"
   force_failure_for_cleanup_probe
   echo 'typesense_migration_contract meta-test'
+  assert_write_freeze_served_contract_meta
   assert_static_contract
+  assert_export_stream_live_contract_wiring
+  assert_live_export_arm_skip_is_announced
+  assert_live_export_arm_runs_by_default
   assert_missing_false_schema_sentinels_are_rejected
+  assert_import_only_document_fields_are_rejected
   assert_expected_case_denominator
   assert_failure_retains_work_dir
   assert_preexisting_work_dir_is_rejected

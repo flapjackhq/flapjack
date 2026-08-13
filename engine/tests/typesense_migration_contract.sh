@@ -5,6 +5,8 @@ IMAGE_REF="typesense/typesense:30.2"
 IMAGE_DIGEST="sha256:610f2d34b1f93d00762869da2c67736775e5798d19a2c8b91b014b8a0cc1e110"
 FIXTURE_DIR="tests/fixtures/2026_07_26_m0b_typesense_migration"
 EXPECTED_BUNDLE="$FIXTURE_DIR/expected_bundle.json"
+EXPECTED_PRODUCT_IDS=""
+CAPTURED_PRODUCT_IDS=""
 PRODUCTS="fj_ts_migration_products"
 CATEGORIES="fj_ts_migration_categories"
 ALIAS_NAME="fj_ts_migration_catalog"
@@ -40,6 +42,14 @@ RESIDUE_MARKER="$ROOT_DIR/residue/fj_typesense_migration_contract_residue_marker
 PORT=""
 SCOPED_KEY=""
 EXPORT_KEY=""
+FLAPJACK_PID=""
+PROXY_PID=""
+FLAPJACK_URL=""
+FLAPJACK_ADMIN_KEY_VALUE=""
+PROXY_PORT=""
+readonly WRITE_FREEZE_SUPPORTED_ENDPOINTS='preview submit'
+readonly WRITE_FREEZE_ATTESTATION_ARMS='missing false true'
+readonly WRITE_FREEZE_RESUME_ARMS='missing false true'
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
@@ -100,13 +110,25 @@ preserve_cleanup_residue_evidence() {
   cp "$RESIDUE_MARKER" "$EVIDENCE_DIR/cleanup_residue_marker.txt"
 }
 
+stop_local_processes() {
+  local pid
+  for pid in "$FLAPJACK_PID" "$PROXY_PID"; do
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || continue
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+  FLAPJACK_PID=""
+  PROXY_PID=""
+}
+
 cleanup() {
   local rc="$?" artifact
+  stop_local_processes
   if [ "$rc" -ne 0 ] || [ ! -f "$PASS_MARKER" ]; then
     mkdir -p "$EVIDENCE_DIR"
     docker logs "$CONTAINER_NAME" >"$EVIDENCE_DIR/container.log" 2>&1 || true
     docker image inspect "$IMAGE_REF" >"$EVIDENCE_DIR/image_inspect.json" 2>&1 || true
-    for artifact in "$ROOT_DIR"/*.json "$ROOT_DIR"/*.jsonl "$ROOT_DIR"/*.txt; do
+    for artifact in "$ROOT_DIR"/*.json "$ROOT_DIR"/*.jsonl "$ROOT_DIR"/*.txt "$ROOT_DIR"/*.log; do
       [ -f "$artifact" ] || continue
       cp "$artifact" "$EVIDENCE_DIR"/
     done
@@ -136,6 +158,9 @@ require_tools() {
   command -v docker >/dev/null || fail "docker is required"
   command -v curl >/dev/null || fail "curl is required"
   command -v jq >/dev/null || fail "jq is required"
+  command -v openssl >/dev/null || fail "openssl is required"
+  command -v python3 >/dev/null || fail "python3 is required"
+  command -v timeout >/dev/null || fail "timeout is required"
 }
 
 http_json() {
@@ -199,7 +224,44 @@ JSON
   expect_http 201 POST /collections "$BOOTSTRAP_KEY" "$ROOT_DIR/categories_schema.json" "$ROOT_DIR/create_categories.json"
   expect_http 201 POST /collections "$BOOTSTRAP_KEY" "$ROOT_DIR/products_schema.json" "$ROOT_DIR/create_products.json"
   import_documents "$CATEGORIES" "$FIXTURE_DIR/seed_categories.jsonl" 2
-  import_documents "$PRODUCTS" "$FIXTURE_DIR/seed_products.jsonl" 3
+  import_documents "$PRODUCTS" "$FIXTURE_DIR/seed_products.jsonl" 137
+}
+
+derive_expected_product_ids() {
+  EXPECTED_PRODUCT_IDS="$ROOT_DIR/expected_product_ids.txt"
+  CAPTURED_PRODUCT_IDS="$ROOT_DIR/captured_product_ids.txt"
+  jq -r '.id' "$FIXTURE_DIR/seed_products.jsonl" | LC_ALL=C sort >"$EXPECTED_PRODUCT_IDS"
+  [ "$(wc -l <"$EXPECTED_PRODUCT_IDS" | tr -d ' ')" = 137 ] \
+    || fail "expected product ID artifact did not contain 137 IDs"
+  [ "$(LC_ALL=C sort -u "$EXPECTED_PRODUCT_IDS" | wc -l | tr -d ' ')" = 137 ] \
+    || fail "expected product ID artifact contained duplicate IDs"
+}
+
+run_production_export_stream_contract() {
+  # The live contract runs by default. Meta-tests that exercise unrelated
+  # harness mutations opt out explicitly and must retain an observable skip.
+  if [ "${FJ_TYPESENSE_RUN_PRODUCTION_EXPORT_RED:-1}" != 1 ]; then
+    printf 'SKIP: production export-stream live contract explicitly disabled with FJ_TYPESENSE_RUN_PRODUCTION_EXPORT_RED=0\n'
+    return 0
+  fi
+  local live_log="$ROOT_DIR/typesense_export_stream_live_contract.log"
+  set +e
+  FJ_ENABLE_TYPESENSE_PREVIEW_LOOPBACK=1 \
+    TYPESENSE_ENDPOINT="http://127.0.0.1:${PORT}" \
+    TYPESENSE_API_KEY="$SCOPED_KEY" \
+    TYPESENSE_COLLECTION="$PRODUCTS" \
+    TYPESENSE_EXPECTED_IDS_FILE="$EXPECTED_PRODUCT_IDS" \
+    timeout 600 cargo test -p flapjack-http --lib -- \
+      handlers::migration::typesense_client_tests::typesense_export_stream_live_contract \
+      --ignored --exact --nocapture >"$live_log" 2>&1
+  local rc="$?"
+  set -e
+  cat "$live_log"
+  [ "$rc" -ne 124 ] || fail "production export-stream live test timed out"
+  [ "$rc" -eq 0 ] || fail "production export-stream live test rejected the current traversal"
+  cmp "$EXPECTED_PRODUCT_IDS" "$CAPTURED_PRODUCT_IDS"
+  grep -Fqx 'TYPESENSE_EXPORT_STREAM_CONTRACT documents=137 exact_ids=PASS export_requests=1 query_pagination=absent no_terminal_newline=PASS discovery_export_requests=0' "$live_log" \
+    || fail "production export-stream live test omitted its exact contract receipt"
 }
 
 import_documents() {
@@ -522,6 +584,182 @@ validate_bundle() {
   fi
 }
 
+start_counting_proxy() {
+  cat >"$ROOT_DIR/counting_proxy.py" <<'PY'
+import http.client
+import os
+import pathlib
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+upstream_port = int(os.environ["UPSTREAM_PORT"])
+count_file = pathlib.Path(os.environ["COUNT_FILE"])
+count_lock = threading.Lock()
+class Handler(BaseHTTPRequestHandler):
+    def relay(self):
+        length = int(self.headers.get("content-length", "0"))
+        body = self.rfile.read(length) if length else None
+        headers = {key: value for key, value in self.headers.items()
+                   if key.lower() not in {"host", "connection", "content-length"}}
+        with count_lock:
+            with count_file.open("a", encoding="utf-8") as requests:
+                requests.write(f"{self.command} {self.path}\n")
+        connection = http.client.HTTPConnection("127.0.0.1", upstream_port, timeout=120)
+        connection.request(self.command, self.path, body=body, headers=headers)
+        response = connection.getresponse()
+        payload = response.read()
+        self.send_response(response.status)
+        for key, value in response.getheaders():
+            if key.lower() not in {"connection", "content-length", "transfer-encoding"}:
+                self.send_header(key, value)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+        connection.close()
+    do_GET = relay
+    do_POST = relay
+    do_PUT = relay
+    do_PATCH = relay
+    def log_message(self, *_args):
+        pass
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+pathlib.Path(os.environ["PORT_FILE"]).write_text(str(server.server_port), encoding="utf-8")
+server.serve_forever()
+PY
+  : >"$ROOT_DIR/typesense_proxy_requests.txt"
+  UPSTREAM_PORT="$PORT" COUNT_FILE="$ROOT_DIR/typesense_proxy_requests.txt" \
+    PORT_FILE="$ROOT_DIR/proxy_port.txt" python3 "$ROOT_DIR/counting_proxy.py" \
+    >"$ROOT_DIR/proxy.log" 2>&1 &
+  PROXY_PID=$!
+  for _ in $(seq 1 40); do
+    [ -s "$ROOT_DIR/proxy_port.txt" ] && break
+    kill -0 "$PROXY_PID" 2>/dev/null || fail "Typesense counting proxy exited during startup"
+    sleep 0.1
+  done
+  PROXY_PORT="$(cat "$ROOT_DIR/proxy_port.txt" 2>/dev/null || true)"
+  [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] || fail "Typesense counting proxy did not publish a port"
+}
+
+start_flapjack_server() {
+  cargo build -p flapjack-server >"$ROOT_DIR/flapjack_build.log" 2>&1
+  local binary="$(pwd)/target/debug/flapjack"
+  [ -x "$binary" ] || fail "flapjack-server build did not produce $binary"
+  FLAPJACK_ADMIN_KEY_VALUE="fj-typesense-contract-$(openssl rand -hex 24)"
+  remember_secret FLAPJACK_ADMIN "$FLAPJACK_ADMIN_KEY_VALUE"
+  FJ_ENABLE_TYPESENSE_PREVIEW_LOOPBACK=1 \
+    FLAPJACK_ADMIN_KEY="$FLAPJACK_ADMIN_KEY_VALUE" \
+    FLAPJACK_DATA_DIR="$ROOT_DIR/flapjack_data" \
+    "$binary" --auto-port >"$ROOT_DIR/flapjack_server.log" 2>&1 &
+  FLAPJACK_PID=$!
+  tests/common/wait_for_flapjack.sh --pid "$FLAPJACK_PID" --host 127.0.0.1 --port auto \
+    --log-path "$ROOT_DIR/flapjack_server.log" --retries 80 --interval-seconds 0.25
+  local server_port
+  server_port="$(sed -n -E 's/.*Local:.*http:\/\/(\[::\]|0\.0\.0\.0|127\.0\.0\.1):([0-9]+).*/\2/p' "$ROOT_DIR/flapjack_server.log" | head -1)"
+  [ -n "$server_port" ] || fail "flapjack-server became ready without an auto-port"
+  FLAPJACK_URL="http://127.0.0.1:${server_port}"
+}
+
+served_request() {
+  local method="$1" path="$2" body="$3" out="$4"
+  curl -sS --connect-timeout 2 --max-time 120 -o "$out" -w '%{http_code}' -X "$method" \
+    -H 'x-algolia-application-id: flapjack' -H "x-algolia-api-key: $FLAPJACK_ADMIN_KEY_VALUE" \
+    -H 'content-type: application/json' --data-binary @"$body" "$FLAPJACK_URL$path"
+}
+
+source_request_count() {
+  wc -l <"$ROOT_DIR/typesense_proxy_requests.txt" | tr -d ' '
+}
+
+write_freeze_body() {
+  local attestation="$1" target="$2" out="$3"
+  jq -n --arg node "http://127.0.0.1:$PROXY_PORT" --arg key "$SCOPED_KEY" \
+    --arg source "$PRODUCTS" --arg target "$target" --arg attestation "$attestation" '
+      {node:$node,apiKey:$key,sourceIndex:$source,targetIndex:$target,overwrite:false}
+      + (if $attestation == "missing" then {} else {sourceWriteFrozen:($attestation == "true")} end)
+    ' >"$out"
+}
+
+wait_for_submit_capture() {
+  local job_id="$1" out="$2" disposition=""
+  for _ in $(seq 1 240); do
+    disposition="$(curl -sS --connect-timeout 2 --max-time 10 \
+      -H 'x-algolia-application-id: flapjack' -H "x-algolia-api-key: $FLAPJACK_ADMIN_KEY_VALUE" \
+      "$FLAPJACK_URL/1/migrations/typesense/$job_id" | tee "$out" | jq -r '.disposition // empty')"
+    [ "$disposition" = succeeded ] && break
+    [ "$disposition" != failed ] && [ "$disposition" != cancelled ] \
+      || fail "attested Typesense submit ended with $disposition"
+    sleep 0.25
+  done
+  [ "$disposition" = succeeded ] || fail "attested Typesense submit did not complete"
+  jq -e '.objectsImported.imported == 137' "$out" >/dev/null \
+    || fail "attested Typesense submit did not import 137 documents"
+}
+
+probe_supported_write_freeze_arm() {
+  local endpoint="$1" attestation="$2" body out code before after target path
+  target="fj_ts_write_freeze_${endpoint}_target"
+  body="$ROOT_DIR/${endpoint}_${attestation}_request.json"
+  out="$ROOT_DIR/${endpoint}_${attestation}_response.json"
+  write_freeze_body "$attestation" "$target" "$body"
+  before="$(source_request_count)"
+  [ "$endpoint" = preview ] && path=/1/migrations/typesense/preview || path=/1/migrations/typesense
+  code="$(served_request POST "$path" "$body" "$out")"
+  if [ "$attestation" != true ]; then
+    [ "$code" = 400 ] || fail "$endpoint $attestation attestation returned $code"
+    jq -e '.message | contains("external write freeze/attestation")' "$out" >/dev/null \
+      || fail "$endpoint $attestation attestation returned the wrong refusal"
+    [ "$(source_request_count)" = "$before" ] || fail "$endpoint $attestation reached Typesense"
+    [ "$attestation" = missing ] && MISSING_REFUSED=$((MISSING_REFUSED + 1)) \
+      || FALSE_REFUSED=$((FALSE_REFUSED + 1))
+    ZERO_SOURCE_REQUESTS=$((ZERO_SOURCE_REQUESTS + 1))
+    return
+  fi
+  [ "$code" = 200 ] || [ "$code" = 202 ] || fail "$endpoint true attestation returned $code"
+  if [ "$endpoint" = preview ]; then
+    jq -e '.sourceCounts == {indexes:1,records:137}' "$out" >/dev/null \
+      || fail "attested Typesense preview did not observe 137 documents"
+  else
+    wait_for_submit_capture "$(jq -r '.jobId' "$out")" "$ROOT_DIR/submit_true_status.json"
+  fi
+  after="$(source_request_count)"
+  [ "$after" -gt "$before" ] || fail "$endpoint true attestation did not reach Typesense"
+  TRUE_PASSED=$((TRUE_PASSED + 1))
+}
+
+probe_resume_write_freeze_arm() {
+  local attestation="$1" body out before code
+  body="$ROOT_DIR/resume_${attestation}_request.json"
+  out="$ROOT_DIR/resume_${attestation}_response.json"
+  write_freeze_body "$attestation" fj_ts_write_freeze_resume_target "$body"
+  before="$(source_request_count)"
+  code="$(served_request POST '/1/migrations/typesense/01890f8e-8b28-78e8-b542-8cfdcb2d4f24/resume' "$body" "$out")"
+  [ "$code" = 400 ] && jq -e '.code == "source_provider_unsupported"' "$out" >/dev/null \
+    || fail "Typesense resume $attestation did not return source_provider_unsupported"
+  [ "$(source_request_count)" = "$before" ] || fail "Typesense resume $attestation reached the source"
+  RESUME_UNSUPPORTED=$((RESUME_UNSUPPORTED + 1))
+}
+
+assert_served_write_freeze_contract() {
+  if [ "${FJ_TYPESENSE_RUN_SERVED_WRITE_FREEZE_CONTRACT:-1}" != 1 ]; then
+    printf 'SKIP: served write-freeze contract explicitly disabled for harness self-tests\n'
+    return
+  fi
+  MISSING_REFUSED=0 FALSE_REFUSED=0 ZERO_SOURCE_REQUESTS=0 TRUE_PASSED=0 RESUME_UNSUPPORTED=0
+  start_counting_proxy
+  start_flapjack_server
+  for endpoint in $WRITE_FREEZE_SUPPORTED_ENDPOINTS; do
+    for attestation in $WRITE_FREEZE_ATTESTATION_ARMS; do
+      probe_supported_write_freeze_arm "$endpoint" "$attestation"
+    done
+  done
+  for attestation in $WRITE_FREEZE_RESUME_ARMS; do
+    probe_resume_write_freeze_arm "$attestation"
+  done
+  [ "$MISSING_REFUSED $FALSE_REFUSED $ZERO_SOURCE_REQUESTS $TRUE_PASSED $RESUME_UNSUPPORTED" = '2 2 4 2 3' ] \
+    || fail "served write-freeze denominator mismatch"
+  stop_local_processes
+  printf 'TYPESENSE_WRITE_FREEZE_CONTRACT endpoints=preview,submit missing_refused=2 false_refused=2 zero_source_requests=4 true_passed=2 resume_unsupported=3 resume_source_requests=0 documents=137\n'
+}
+
 main() {
   cd "$(repo_root)/engine"
   require_tools
@@ -529,6 +767,7 @@ main() {
     || fail "write-freeze attestation required before capture"
   [ -f "$EXPECTED_BUNDLE" ] || fail "missing expected bundle: $EXPECTED_BUNDLE"
   mkdir -p "$ROOT_DIR"
+  derive_expected_product_ids
   remember_secret BOOTSTRAP "$BOOTSTRAP_KEY"
   start_typesense
   seed_linked_sets
@@ -536,7 +775,9 @@ main() {
   seed_alias
   create_capture_key
   permission_controls
+  assert_served_write_freeze_contract
   assert_collection_listing_discovery_contract
+  run_production_export_stream_contract
   capture_bundle
   apply_test_mutation
   assert_no_secret_leakage

@@ -14,7 +14,6 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-const WRITE_DURABLE_TIMEOUT_ENV_VAR: &str = "FLAPJACK_WRITE_DURABLE_TIMEOUT_MS";
 const WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_ENV_VAR: &str =
     "FLAPJACK_WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_MS";
 
@@ -43,18 +42,6 @@ impl Drop for TestEnvVarGuard {
     }
 }
 
-struct DurableWriteTimeoutEnvGuard {
-    _inner: TestEnvVarGuard,
-}
-
-impl DurableWriteTimeoutEnvGuard {
-    fn set(value: &str) -> Self {
-        Self {
-            _inner: TestEnvVarGuard::set(WRITE_DURABLE_TIMEOUT_ENV_VAR, value),
-        }
-    }
-}
-
 struct WriteQueueWriterAcquireTimeoutEnvGuard {
     _inner: TestEnvVarGuard,
 }
@@ -65,6 +52,26 @@ impl WriteQueueWriterAcquireTimeoutEnvGuard {
             _inner: TestEnvVarGuard::set(WRITE_QUEUE_WRITER_ACQUIRE_TIMEOUT_ENV_VAR, value),
         }
     }
+}
+
+/// The durable-write timeout env var is read per call by production code, so a
+/// test that sets it shortens the deadline for every test running concurrently
+/// in this binary. A serial_test key cannot fence that: siblings outside the
+/// group — such as `write_path_exit_gate_on_local_standard_specimen` — never join it and
+/// simply read the poisoned value, then fail closed with `WriteAckTimeout` about
+/// a second into a write that had thirty. Narrow test timing belongs on
+/// `wait_for_write_durable_with_timeout_for_test`, which takes the deadline as an
+/// argument and touches no process state.
+#[test]
+fn manager_tests_never_mutate_the_process_wide_durable_write_timeout() {
+    // Assembled at compile time so this guard does not match its own source.
+    let process_wide_timeout_env_var = concat!("FLAPJACK_WRITE_DURABLE_", "TIMEOUT_MS");
+
+    assert!(
+        !include_str!("tests.rs").contains(process_wide_timeout_env_var),
+        "{process_wide_timeout_env_var} is process-global; use \
+         wait_for_write_durable_with_timeout_for_test for narrow test deadlines"
+    );
 }
 
 struct TraversalEscapeDirGuard {
@@ -2948,7 +2955,7 @@ async fn write_queue_committed_unpruned_admission_reconciles_without_reapplying(
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(flapjack_write_durable_timeout_env)]
 async fn post_admission_write_queue_abort_returns_write_ack_timeout_and_keeps_task() {
-    let _timeout_guard = DurableWriteTimeoutEnvGuard::set("25");
+    const ABORTED_CONSUMER_DEADLINE: Duration = Duration::from_millis(25);
     let temp_dir = TempDir::new().unwrap();
     let tenant_id = "write_queue_durable_timeout";
     let manager = IndexManager::new(temp_dir.path());
@@ -2972,7 +2979,9 @@ async fn post_admission_write_queue_abort_returns_write_ack_timeout_and_keeps_ta
         "tenant write_queue consumer must be aborted after admission"
     );
 
-    let result = manager.wait_for_write_durable(&task.id).await;
+    let result = manager
+        .wait_for_write_durable_with_timeout_for_test(&task.id, ABORTED_CONSUMER_DEADLINE)
+        .await;
     assert!(
         matches!(result, Err(FlapjackError::WriteAckTimeout)),
         "stalled post-admission write_queue consumer must surface WriteAckTimeout, got {result:?}"
@@ -3030,7 +3039,9 @@ async fn active_slow_write_does_not_return_success_before_finalization() {
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(flapjack_write_durable_timeout_env)]
 async fn post_admission_write_queue_writer_slot_contention_returns_too_many_concurrent_writes() {
-    let _durable_timeout_guard = DurableWriteTimeoutEnvGuard::set("750");
+    // Outlasts the 25ms writer-acquire window below, so the wait ends on the
+    // contention failure the assertion names rather than on its own deadline.
+    const WRITER_CONTENTION_DEADLINE: Duration = Duration::from_millis(750);
     let _writer_timeout_guard = WriteQueueWriterAcquireTimeoutEnvGuard::set("25");
     let temp_dir = TempDir::new().unwrap();
     let tenant_id = "write_queue_writer_slot_contention";
@@ -3069,7 +3080,9 @@ async fn post_admission_write_queue_writer_slot_contention_returns_too_many_conc
         "task must be admitted before writer-slot contention is observed"
     );
 
-    let result = manager.wait_for_write_durable(&task.id).await;
+    let result = manager
+        .wait_for_write_durable_with_timeout_for_test(&task.id, WRITER_CONTENTION_DEADLINE)
+        .await;
     assert!(
         matches!(
             result,

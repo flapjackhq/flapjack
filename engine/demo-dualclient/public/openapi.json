@@ -10126,7 +10126,8 @@
               "null"
             ]
           }
-        }
+        },
+        "additionalProperties": false
       },
       "MigrateFromAlgoliaResponse": {
         "type": "object",
@@ -10218,6 +10219,9 @@
           },
           "sourceIndex": {
             "type": "string"
+          },
+          "sourceWriteFrozen": {
+            "type": "boolean"
           },
           "targetIndex": {
             "type": [

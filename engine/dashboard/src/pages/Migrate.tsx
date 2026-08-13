@@ -1,158 +1,390 @@
 import { useState } from 'react';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQueryClient, type QueryClient } from '@tanstack/react-query';
+import api from '@/lib/api';
 import {
   MigrationCredentialsCard,
-  AlgoliaIndexPickerCard,
   MigrationErrorCard,
   MigrationHeader,
   MigrationIndexNamesCard,
   MigrationInfoCard,
+  MigrationPreviewCard,
+  MigrationProgressCard,
   MigrationSubmitButton,
   MigrationSuccessCard,
+  SourceIndexPickerCard,
 } from './MigrateSections';
 import {
-  type AlgoliaIndexInfo,
+  MIGRATION_PROVIDER_DESCRIPTORS,
+  type AsyncMigrationStatusResponse,
+  type ListSourceIndexesResponse,
+  type MigrationPreviewResponse,
+  type MigrationProviderDescriptor,
+  type MigrationProviderId,
   type MigrationResult,
+  buildAsyncMigrationViewState,
+  buildDiscoveryRequestBody,
   buildMigrationRequestBody,
   getIndexListErrorMessage,
   getMigrationErrorMessage,
+  getTerminalMigrationErrorMessage,
   postSensitiveMigrationRequest,
   resolveEffectiveTargetIndex,
 } from './migrateHelpers';
 
+const POLL_INTERVAL_MS = 750;
+
+interface MigrationFormValues {
+  selectedProviderId: MigrationProviderId;
+  firstCredentialValue: string;
+  apiKey: string;
+  sourceIndex: string;
+  targetIndex: string;
+  overwrite: boolean;
+  sourceWriteFrozen: boolean;
+  showKey: boolean;
+}
+
+const INITIAL_FORM_VALUES: MigrationFormValues = {
+  selectedProviderId: 'algolia',
+  firstCredentialValue: '',
+  apiKey: '',
+  sourceIndex: '',
+  targetIndex: '',
+  overwrite: false,
+  sourceWriteFrozen: false,
+  showKey: false,
+};
+
 export function Migrate() {
-  const queryClient = useQueryClient();
-
-  const [appId, setAppId] = useState('');
-  const [apiKey, setApiKey] = useState('');
-  const [sourceIndex, setSourceIndex] = useState('');
-  const [targetIndex, setTargetIndex] = useState('');
-  const [overwrite, setOverwrite] = useState(false);
-  const [showKey, setShowKey] = useState(false);
-
-  // Algolia index listing
-  const [algoliaIndexes, setAlgoliaIndexes] = useState<AlgoliaIndexInfo[] | null>(null);
-  const [indexListError, setIndexListError] = useState<string | null>(null);
-  const trimmedAppId = appId.trim();
-  const trimmedApiKey = apiKey.trim();
-  const trimmedSourceIndex = sourceIndex.trim();
-  const trimmedTargetIndex = targetIndex.trim();
-  const effectiveTarget = resolveEffectiveTargetIndex(trimmedSourceIndex, trimmedTargetIndex);
-
-  const resetIndexListingState = () => {
-    setAlgoliaIndexes(null);
-    setIndexListError(null);
-  };
-
-  const fetchIndexes = useMutation({
-    mutationFn: async () => {
-      const data = await postSensitiveMigrationRequest<{ indexes: AlgoliaIndexInfo[] }>(
-        '/1/algolia-list-indexes',
-        { appId: trimmedAppId, apiKey: trimmedApiKey },
-      );
-      return data.indexes;
-    },
-    onSuccess: (indexes) => {
-      setAlgoliaIndexes(indexes);
-      setIndexListError(null);
-      // Auto-select if there's only one index
-      if (indexes.length === 1) {
-        setSourceIndex(indexes[0].name);
-      }
-    },
-    onError: (error) => {
-      setAlgoliaIndexes(null);
-      setIndexListError(getIndexListErrorMessage(error));
-    },
-  });
-
-  const migration = useMutation({
-    mutationFn: async () => {
-      return postSensitiveMigrationRequest<MigrationResult>(
-        '/1/migrate-from-algolia',
-        buildMigrationRequestBody({
-          appId: trimmedAppId,
-          apiKey: trimmedApiKey,
-          sourceIndex: trimmedSourceIndex,
-          targetIndex: trimmedTargetIndex,
-          overwrite,
-        }),
-      );
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['indexes'] });
-    },
-  });
-
-  const hasCredentials = Boolean(trimmedAppId && trimmedApiKey);
-  const canFetchIndexes = hasCredentials && !fetchIndexes.isPending;
-  const canSubmit =
-    Boolean(trimmedAppId && trimmedApiKey && trimmedSourceIndex) && !migration.isPending;
+  const controller = useMigrationController();
+  const { form, discovery, preview, migration, actions } = controller;
 
   return (
     <div className="space-y-6 max-w-2xl">
-      <MigrationHeader effectiveTarget={effectiveTarget} />
-
+      <MigrationHeader provider={form.provider} effectiveTarget={form.effectiveTarget} />
       <MigrationCredentialsCard
-        appId={appId}
-        apiKey={apiKey}
-        showKey={showKey}
-        migrationPending={migration.isPending}
-        hasCredentials={hasCredentials}
-        canFetchIndexes={canFetchIndexes}
-        fetchIndexesPending={fetchIndexes.isPending}
-        algoliaIndexesLoaded={Boolean(algoliaIndexes)}
-        onAppIdChange={(value) => {
-          setAppId(value);
-          resetIndexListingState();
+        providers={MIGRATION_PROVIDER_DESCRIPTORS}
+        provider={form.provider}
+        values={{
+          firstCredentialValue: form.values.firstCredentialValue,
+          apiKey: form.values.apiKey,
+          showKey: form.values.showKey,
         }}
-        onApiKeyChange={(value) => {
-          setApiKey(value);
-          resetIndexListingState();
+        status={{
+          controlsLocked: controller.controlsLocked,
+          hasCredentials: controller.hasCredentials,
+          canFetchSources: controller.canFetchSources,
+          fetchSourcesPending: discovery.mutation.isPending,
         }}
-        onToggleShowKey={() => setShowKey(!showKey)}
-        onFetchIndexes={() => fetchIndexes.mutate()}
+        actions={actions.credentials}
       />
-
-      <AlgoliaIndexPickerCard
-        algoliaIndexes={algoliaIndexes}
-        sourceIndex={sourceIndex}
-        migrationPending={migration.isPending}
-        indexListError={indexListError}
-        onSelectSourceIndex={setSourceIndex}
+      <SourceIndexPickerCard
+        provider={form.provider}
+        state={{
+          discoveryResponse: discovery.response,
+          sourceIndex: form.values.sourceIndex,
+          controlsLocked: controller.controlsLocked,
+          indexListError: discovery.error,
+        }}
+        onSelectSourceIndex={actions.selectSourceIndex}
       />
-
       <MigrationIndexNamesCard
-        algoliaIndexesLoaded={Boolean(algoliaIndexes)}
-        sourceIndex={sourceIndex}
-        targetIndex={targetIndex}
-        trimmedSourceIndex={trimmedSourceIndex}
-        overwrite={overwrite}
-        migrationPending={migration.isPending}
-        onSourceIndexChange={setSourceIndex}
-        onTargetIndexChange={setTargetIndex}
-        onOverwriteChange={setOverwrite}
+        provider={form.provider}
+        values={{
+          sourcesLoaded: Boolean(discovery.response),
+          sourceIndex: form.values.sourceIndex,
+          targetIndex: form.values.targetIndex,
+          trimmedSourceIndex: form.trimmedSourceIndex,
+          overwrite: form.values.overwrite,
+          sourceWriteFrozen: form.values.sourceWriteFrozen,
+        }}
+        controlsLocked={controller.controlsLocked}
+        actions={actions.indexNames}
       />
-
       <MigrationSubmitButton
-        canSubmit={canSubmit}
-        migrationPending={migration.isPending}
-        effectiveTarget={effectiveTarget}
-        onSubmit={() => migration.mutate()}
+        provider={form.provider}
+        state={{
+          canSubmit: controller.canSubmit,
+          canPreview: controller.canPreview,
+          hasPreview: Boolean(preview.mutation.data),
+          previewFailed: preview.mutation.isError,
+          previewHasBlockers: controller.previewHasBlockers,
+          previewPending: preview.mutation.isPending,
+          migrationPending: migration.mutation.isPending,
+          effectiveTarget: form.effectiveTarget,
+        }}
+        onEditSource={() => document.getElementById('source-index')?.focus()}
+        onPreview={() => actions.preview()}
+        onSubmit={() => migration.mutation.mutate()}
       />
-
-      {migration.isSuccess && migration.data && (
+      <MigrationPreviewCard
+        preview={preview.mutation.data ?? null}
+        previewPending={preview.mutation.isPending}
+        errorMessage={
+          preview.mutation.isError
+            ? getMigrationErrorMessage(
+              preview.mutation.error,
+              form.provider,
+              [form.trimmedFirstCredential, form.trimmedApiKey],
+            )
+            : null
+        }
+      />
+      {migration.currentStatus && <MigrationProgressCard status={migration.currentStatus} />}
+      {migration.mutation.isSuccess && migration.mutation.data && (
         <MigrationSuccessCard
-          migrationData={migration.data}
-          effectiveTarget={effectiveTarget}
+          migrationData={migration.mutation.data}
+          effectiveTarget={migration.mutation.data.status.targetIndex ?? form.effectiveTarget}
         />
       )}
-
-      {migration.isError && (
-        <MigrationErrorCard errorMessage={getMigrationErrorMessage(migration.error)} />
+      {migration.mutation.isError && (
+        <MigrationErrorCard
+          errorMessage={getMigrationErrorMessage(
+            migration.mutation.error,
+            form.provider,
+            [form.trimmedFirstCredential, form.trimmedApiKey],
+          )}
+        />
       )}
-
-      <MigrationInfoCard />
+      <MigrationInfoCard provider={form.provider} />
     </div>
   );
+}
+
+function useMigrationController() {
+  const queryClient = useQueryClient();
+  const form = useMigrationForm();
+  const discovery = useSourceDiscovery(form);
+  const preview = useMigrationPreview(form);
+  const migration = useMigrationSubmission(form, queryClient);
+
+  const resetMigrationOutput = () => {
+    preview.reset();
+    migration.reset();
+  };
+  const resetAllOutput = () => {
+    discovery.reset();
+    resetMigrationOutput();
+  };
+  const changeIndexValue = (changes: Partial<MigrationFormValues>) => {
+    form.update(changes);
+    resetMigrationOutput();
+  };
+  const hasCredentials = Boolean(form.trimmedFirstCredential && form.trimmedApiKey);
+  const previewHardRejections = preview.mutation.data?.report.summary.hardRejections;
+  const previewHasBlockers = (previewHardRejections ?? 0) > 0;
+  const requestPending = preview.mutation.isPending || migration.mutation.isPending;
+  const controlsLocked = discovery.mutation.isPending || requestPending;
+  const hasRequiredWriteFreeze = form.provider.id !== 'typesense'
+    || form.values.sourceWriteFrozen;
+
+  return {
+    form,
+    discovery,
+    preview,
+    migration,
+    hasCredentials,
+    controlsLocked,
+    canFetchSources: hasCredentials && !discovery.mutation.isPending,
+    canPreview: Boolean(hasCredentials && form.trimmedSourceIndex && hasRequiredWriteFreeze)
+      && !requestPending,
+    previewHasBlockers,
+    canSubmit: Boolean(
+      preview.mutation.data && previewHardRejections === 0 && hasRequiredWriteFreeze,
+    ) && !requestPending,
+    actions: {
+      credentials: {
+        selectProvider: (selectedProviderId: MigrationProviderId) => {
+          form.update({
+            selectedProviderId,
+            firstCredentialValue: '',
+            apiKey: '',
+            sourceIndex: '',
+            sourceWriteFrozen: false,
+          });
+          resetAllOutput();
+        },
+        changeFirstCredential: (firstCredentialValue: string) => {
+          form.update({ firstCredentialValue, sourceWriteFrozen: false });
+          resetAllOutput();
+        },
+        changeApiKey: (apiKey: string) => {
+          form.update({ apiKey, sourceWriteFrozen: false });
+          resetAllOutput();
+        },
+        toggleApiKeyVisibility: () => form.update({ showKey: !form.values.showKey }),
+        fetchSources: () => discovery.mutation.mutate(),
+      },
+      selectSourceIndex: (sourceIndex: string) => changeIndexValue({
+        sourceIndex,
+        sourceWriteFrozen: false,
+      }),
+      indexNames: {
+        changeSourceIndex: (sourceIndex: string) => changeIndexValue({
+          sourceIndex,
+          sourceWriteFrozen: false,
+        }),
+        changeTargetIndex: (targetIndex: string) => changeIndexValue({ targetIndex }),
+        changeOverwrite: (overwrite: boolean) => changeIndexValue({ overwrite }),
+        changeSourceWriteFrozen: (sourceWriteFrozen: boolean) => changeIndexValue({
+          sourceWriteFrozen,
+        }),
+      },
+      preview: () => {
+        migration.reset();
+        preview.mutation.mutate();
+      },
+    },
+  };
+}
+
+function useMigrationForm() {
+  const [values, setValues] = useState<MigrationFormValues>(INITIAL_FORM_VALUES);
+  const provider = MIGRATION_PROVIDER_DESCRIPTORS.find(
+    (candidate) => candidate.id === values.selectedProviderId,
+  ) ?? MIGRATION_PROVIDER_DESCRIPTORS[0];
+  const trimmedFirstCredential = values.firstCredentialValue.trim();
+  const trimmedApiKey = values.apiKey.trim();
+  const trimmedSourceIndex = values.sourceIndex.trim();
+  const trimmedTargetIndex = values.targetIndex.trim();
+
+  return {
+    values,
+    provider,
+    trimmedFirstCredential,
+    trimmedApiKey,
+    trimmedSourceIndex,
+    trimmedTargetIndex,
+    effectiveTarget: resolveEffectiveTargetIndex(trimmedSourceIndex, trimmedTargetIndex),
+    update: (changes: Partial<MigrationFormValues>) => {
+      setValues((current) => ({ ...current, ...changes }));
+    },
+  };
+}
+
+function useSourceDiscovery(form: ReturnType<typeof useMigrationForm>) {
+  const [response, setResponse] = useState<ListSourceIndexesResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const mutation = useMutation({
+    mutationFn: async () => {
+      const response = await postSensitiveMigrationRequest<ListSourceIndexesResponse>(
+        `/1/migrations/${form.provider.routeSegment}/list-indexes`,
+        buildDiscoveryRequestBody(form.provider, form.trimmedFirstCredential, form.trimmedApiKey),
+      );
+      return response;
+    },
+    onSuccess: (nextResponse) => {
+      setResponse(nextResponse);
+      setError(null);
+      if (nextResponse.indexes.length === 1) {
+        form.update({ sourceIndex: nextResponse.indexes[0].name, sourceWriteFrozen: false });
+      }
+    },
+    onError: (requestError) => {
+      setResponse(null);
+      setError(getIndexListErrorMessage(
+        requestError,
+        form.provider,
+        [form.trimmedFirstCredential, form.trimmedApiKey],
+      ));
+    },
+  });
+
+  return {
+    response,
+    error,
+    mutation,
+    reset: () => {
+      setResponse(null);
+      setError(null);
+      mutation.reset();
+    },
+  };
+}
+
+function useMigrationSubmission(
+  form: ReturnType<typeof useMigrationForm>,
+  queryClient: QueryClient,
+) {
+  const [currentStatus, setCurrentStatus] = useState<AsyncMigrationStatusResponse | null>(null);
+  const mutation = useMutation({
+    mutationFn: async (): Promise<MigrationResult> => {
+      const admission = await postSensitiveMigrationRequest<AsyncMigrationStatusResponse>(
+        `/1/migrations/${form.provider.routeSegment}`,
+        buildCurrentMigrationRequestBody(form),
+      );
+      return pollMigrationToTerminal(form.provider, admission, setCurrentStatus);
+    },
+    onMutate: () => setCurrentStatus(null),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['indexes'] }),
+  });
+
+  return {
+    currentStatus,
+    mutation,
+    reset: () => {
+      setCurrentStatus(null);
+      mutation.reset();
+    },
+  };
+}
+
+function useMigrationPreview(form: ReturnType<typeof useMigrationForm>) {
+  const mutation = useMutation({
+    mutationFn: async (): Promise<MigrationPreviewResponse> => postSensitiveMigrationRequest(
+      `/1/migrations/${form.provider.routeSegment}/preview`,
+      buildCurrentMigrationRequestBody(form),
+    ),
+  });
+
+  return {
+    mutation,
+    reset: () => mutation.reset(),
+  };
+}
+
+function buildCurrentMigrationRequestBody(
+  form: ReturnType<typeof useMigrationForm>,
+): Record<string, unknown> {
+  // Preview shares the submit payload; only the route suffix and response handling differ.
+  return buildMigrationRequestBody({
+    provider: form.provider,
+    firstCredentialValue: form.trimmedFirstCredential,
+    apiKey: form.trimmedApiKey,
+    sourceIndex: form.trimmedSourceIndex,
+    targetIndex: form.trimmedTargetIndex,
+    overwrite: form.values.overwrite,
+    sourceWriteFrozen: form.values.sourceWriteFrozen,
+  });
+}
+
+async function pollMigrationToTerminal(
+  provider: MigrationProviderDescriptor,
+  admission: AsyncMigrationStatusResponse,
+  setCurrentStatus: (status: AsyncMigrationStatusResponse) => void,
+): Promise<MigrationResult> {
+  let status = admission;
+  setCurrentStatus(status);
+
+  for (;;) {
+    const viewState = buildAsyncMigrationViewState(status);
+    if (viewState.kind === 'success') {
+      return { status: viewState.status, counts: viewState.counts };
+    }
+    if (viewState.kind === 'error') {
+      throw new Error(getTerminalMigrationErrorMessage(viewState.status, provider));
+    }
+    await delay(POLL_INTERVAL_MS);
+    const response = await api.get<AsyncMigrationStatusResponse>(
+      `/1/migrations/${provider.routeSegment}/${status.jobId}`,
+    );
+    status = response.data;
+    setCurrentStatus(status);
+  }
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, milliseconds);
+  });
 }

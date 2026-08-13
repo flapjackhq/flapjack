@@ -549,6 +549,7 @@ fn migrate_preview_routes_algolia_and_typesense_to_the_selected_provider() {
                 "node": "https://tenant.typesense.net",
                 "apiKey": SOURCE_API_KEY,
                 "sourceIndex": "products",
+                "sourceWriteFrozen": true,
                 "overwrite": false
             }),
         ),
@@ -591,9 +592,126 @@ fn migrate_submits_typesense_payload_to_typesense_route() {
             "node": "https://tenant.typesense.net",
             "apiKey": SOURCE_API_KEY,
             "sourceIndex": "products",
+            "sourceWriteFrozen": true,
             "overwrite": false
         }),
     );
+}
+
+#[test]
+fn source_write_frozen_typesense_submit_and_preview_emit_attestation() {
+    for (action, expected_path) in [
+        ("submit", "/1/migrations/typesense"),
+        ("preview", "/1/migrations/typesense/preview"),
+    ] {
+        let response = match action {
+            "submit" => StubResponse::json(202, migration_status("submitted", "succeeded")),
+            "preview" => StubResponse::json(200, migration_preview_response(0)),
+            _ => unreachable!("closed action table"),
+        };
+        let server = FakeMigrationServer::start(vec![response]);
+
+        match action {
+            "submit" => {
+                migrate_cmd_for_provider(
+                    server.endpoint(),
+                    "typesense",
+                    "https://tenant.typesense.net",
+                    SOURCE_API_KEY,
+                )
+                .assert()
+                .success();
+            }
+            "preview" => {
+                migrate_preview_cmd(
+                    server.endpoint(),
+                    "typesense",
+                    "https://tenant.typesense.net",
+                    SOURCE_API_KEY,
+                )
+                .assert()
+                .success();
+            }
+            _ => unreachable!("closed action table"),
+        }
+
+        let request = server.take_requests(1).remove(0);
+        assert_provider_submit_request(
+            &request,
+            expected_path,
+            json!({
+                "node": "https://tenant.typesense.net",
+                "apiKey": SOURCE_API_KEY,
+                "sourceIndex": "products",
+                "sourceWriteFrozen": true,
+                "overwrite": false
+            }),
+        );
+    }
+}
+
+#[test]
+fn source_write_frozen_missing_flag_fails_typesense_locally_before_http() {
+    let output = migrate_cmd_for_provider_without_write_freeze(
+        "http://127.0.0.1:1".to_string(),
+        "typesense",
+        "https://tenant.typesense.net",
+        SOURCE_API_KEY,
+    )
+    .arg("--json")
+    .assert()
+    .code(EXIT_CONFIG)
+    .get_output()
+    .clone();
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("JSON local configuration failure");
+    assert_eq!(report["errorType"], json!("config"));
+    assert_eq!(report["exitCode"], json!(EXIT_CONFIG));
+    assert_eq!(
+        report["message"],
+        json!("--source-write-frozen is required for --source-provider typesense")
+    );
+}
+
+#[test]
+fn source_write_frozen_is_typesense_only_and_documented_in_help() {
+    let help = flapjack_cmd()
+        .arg("migrate")
+        .arg("--help")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help = String::from_utf8(help).expect("help is UTF-8");
+    assert!(help.contains("--source-write-frozen"), "{help}");
+
+    for (provider, expected_message) in [
+        (
+            "algolia",
+            "--source-write-frozen is not valid with --source-provider algolia",
+        ),
+        (
+            "meilisearch",
+            "--source-write-frozen is not valid with --source-provider meilisearch",
+        ),
+    ] {
+        let mut command = if provider == "algolia" {
+            migrate_cmd("http://127.0.0.1:1".to_string())
+        } else {
+            migrate_cmd_for_provider_without_write_freeze(
+                "http://127.0.0.1:1".to_string(),
+                provider,
+                "https://tenant.meilisearch.io",
+                SOURCE_API_KEY,
+            )
+        };
+        command.arg("--source-write-frozen").arg("--json");
+        let output = command.assert().code(EXIT_CONFIG).get_output().clone();
+        let report: Value =
+            serde_json::from_slice(&output.stdout).expect("JSON local configuration failure");
+        assert_eq!(report["message"], json!(expected_message), "{provider}");
+    }
 }
 
 #[test]
@@ -752,6 +870,7 @@ fn real_server_rejects_non_vendor_typesense_endpoint() {
         .arg("FJ_MIGRATE_TEST_SOURCE_KEY")
         .arg("--source-index")
         .arg("products")
+        .arg("--source-write-frozen")
         .arg("--json")
         .env("FJ_MIGRATE_TEST_SOURCE_KEY", SOURCE_API_KEY)
         .assert()
@@ -1547,6 +1666,24 @@ fn migrate_cmd_for_provider(
     source_endpoint: &str,
     source_api_key: &str,
 ) -> assert_cmd::Command {
+    let mut command = migrate_cmd_for_provider_without_write_freeze(
+        endpoint,
+        provider,
+        source_endpoint,
+        source_api_key,
+    );
+    if provider == "typesense" {
+        command.arg("--source-write-frozen");
+    }
+    command
+}
+
+fn migrate_cmd_for_provider_without_write_freeze(
+    endpoint: String,
+    provider: &str,
+    source_endpoint: &str,
+    source_api_key: &str,
+) -> assert_cmd::Command {
     let mut command = flapjack_cmd();
     command.arg("migrate");
     add_flapjack_auth_args(&mut command, endpoint, FLAPJACK_API_KEY);
@@ -1591,6 +1728,9 @@ fn migrate_preview_cmd(
         command.arg("--app-id").arg("UNREACHABLESTAGE2");
     } else {
         command.arg("--source-endpoint").arg(source_endpoint);
+    }
+    if provider == "typesense" {
+        command.arg("--source-write-frozen");
     }
     command
 }

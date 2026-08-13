@@ -3,9 +3,8 @@
  *
  * NON-MOCKED SIMULATED-HUMAN REAL-BROWSER TESTS.
  * Tests the Migrate from Algolia page against a real Flapjack backend.
- * Since we cannot test actual Algolia migration without real credentials,
- * tests focus on form UI, validation, toggle behavior, error states,
- * and info section content.
+ * Credential-free cases cover form UI, validation, toggles, and error states;
+ * the dry-run case reuses the canonical real Algolia fixture.
  *
  * Pre-requisites:
  *   - Flapjack server running on the repo-local configured backend port
@@ -23,15 +22,42 @@
  * - Clearing fields re-disables migrate button
  * - Info section shows all three info items
  * - Custom target index overrides source name in button text
+ * - Receipt-backed dry-run report and target non-mutation
  */
+import type { Page } from '@playwright/test';
 import { test, expect } from '../../fixtures/auth.fixture';
+import {
+  cleanupMigrationIndexes,
+  seedAlgoliaIndex,
+} from '../../fixtures/algolia.fixture';
+import {
+  expectMigrationPreviewReport,
+  expectMigrationWriteUnavailable,
+  type MigrationPreviewOracle,
+} from '../../fixtures/migration-preview.fixture';
+import { assertIndexNotCreated } from '../../fixtures/source-provider.fixture';
+
+const ALGOLIA_PREVIEW_ORACLE: MigrationPreviewOracle = {
+  summary: {
+    totalEntries: 14,
+    hardRejections: 0,
+    warnings: 9,
+    scopeGaps: 5,
+  },
+  entry: {
+    severity: 'Warning',
+    code: 'PersistedNoBehaviorSetting',
+    resource: 'Settings',
+    jsonPath: '$.hitsPerPage',
+  },
+};
 
 test.describe('Migrate Page', () => {
-  function sourceIndexInput(page: import('@playwright/test').Page) {
+  function sourceIndexInput(page: Page) {
     return page.getByLabel('Source Index (Algolia)');
   }
 
-  function targetIndexInput(page: import('@playwright/test').Page) {
+  function targetIndexInput(page: Page) {
     return page.getByLabel(/Target Index \(Flapjack\)/);
   }
 
@@ -60,21 +86,20 @@ test.describe('Migrate Page', () => {
     await expect(page.getByText('Large indexes:')).toBeVisible();
   });
 
-  test('migrate button is disabled when credentials are empty', async ({ page }) => {
-    const migrateBtn = page.getByRole('button', { name: /migrate/i });
-    await expect(migrateBtn).toBeVisible();
-    await expect(migrateBtn).toBeDisabled();
+  test('preview button is disabled when credentials are empty', async ({ page }) => {
+    const previewButton = page.getByRole('button', { name: /preview migration/i });
+    await expect(previewButton).toBeVisible();
+    await expect(previewButton).toBeDisabled();
   });
 
-  test('filling credentials and source index enables migrate button', async ({ page }) => {
+  test('filling credentials and source index enables preview button', async ({ page }) => {
     await page.getByLabel('Application ID').fill('test-app-id');
     await page.getByLabel('Admin API Key').fill('test-api-key');
     await sourceIndexInput(page).fill('test-index');
 
-    const migrateBtn = page.getByRole('button', { name: /migrate/i });
-    await expect(migrateBtn).toBeEnabled();
-    // Button text should include the effective target index name
-    await expect(migrateBtn).toContainText('test-index');
+    const previewButton = page.getByRole('button', { name: /preview migration/i });
+    await expect(previewButton).toBeEnabled();
+    await expectMigrationWriteUnavailable(page, 'Algolia', 'test-index');
   });
 
   test('API key field toggles visibility with eye button', async ({ page }) => {
@@ -117,48 +142,46 @@ test.describe('Migrate Page', () => {
     await expect(targetInput).toHaveAttribute('placeholder', 'my-products');
   });
 
-  test('custom target index overrides source name in button text', async ({ page }) => {
+  test('custom target index keeps write unavailable before preview', async ({ page }) => {
     await page.getByLabel('Application ID').fill('test-app-id');
     await page.getByLabel('Admin API Key').fill('test-api-key');
     await sourceIndexInput(page).fill('source-idx');
     await targetIndexInput(page).fill('custom-target');
 
-    const migrateBtn = page.getByRole('button', { name: /migrate/i });
-    await expect(migrateBtn).toBeEnabled();
-    // Button should show the custom target name, not the source name
-    await expect(migrateBtn).toContainText('custom-target');
+    await expect(page.getByRole('button', { name: /preview migration/i })).toBeEnabled();
+    await expectMigrationWriteUnavailable(page, 'Algolia', 'custom-target');
   });
 
-  test('clearing source index re-disables migrate button', async ({ page }) => {
+  test('clearing source index re-disables preview button', async ({ page }) => {
     // Fill all fields to enable the button
     await page.getByLabel('Application ID').fill('test-app-id');
     await page.getByLabel('Admin API Key').fill('test-api-key');
     await sourceIndexInput(page).fill('test-index');
 
-    const migrateBtn = page.getByRole('button', { name: /migrate/i });
-    await expect(migrateBtn).toBeEnabled();
+    const previewButton = page.getByRole('button', { name: /preview migration/i });
+    await expect(previewButton).toBeEnabled();
 
     // Clear the source index
     await sourceIndexInput(page).clear();
 
     // Button should become disabled again
-    await expect(migrateBtn).toBeDisabled();
+    await expect(previewButton).toBeDisabled();
   });
 
-  test('clearing app ID re-disables migrate button', async ({ page }) => {
+  test('clearing app ID re-disables preview button', async ({ page }) => {
     await page.getByLabel('Application ID').fill('test-app-id');
     await page.getByLabel('Admin API Key').fill('test-api-key');
     await sourceIndexInput(page).fill('test-index');
 
-    const migrateBtn = page.getByRole('button', { name: /migrate/i });
-    await expect(migrateBtn).toBeEnabled();
+    const previewButton = page.getByRole('button', { name: /preview migration/i });
+    await expect(previewButton).toBeEnabled();
 
     // Clear the app ID
     await page.getByLabel('Application ID').clear();
-    await expect(migrateBtn).toBeDisabled();
+    await expect(previewButton).toBeDisabled();
   });
 
-  test('submitting with invalid credentials shows error', async ({ page }) => {
+  test('previewing with invalid credentials shows error', async ({ page }) => {
     const sourceIndex = `nonexistent-index-${Date.now()}`;
     const fakeApiKey = 'fake-api-key';
     const rawUpstreamUrl = `https://fake-app-id-dsn.algolia.net/1/indexes/${sourceIndex}/settings`;
@@ -168,8 +191,7 @@ test.describe('Migrate Page', () => {
     await page.getByLabel('Admin API Key').fill(fakeApiKey);
     await sourceIndexInput(page).fill(sourceIndex);
 
-    // Click migrate
-    await page.getByRole('button', { name: /migrate/i }).click();
+    await page.getByRole('button', { name: /preview migration/i }).click();
 
     // Should show a sanitized error card after the request fails.
     const errorCard = page.getByTestId('migration-error-card');
@@ -178,14 +200,14 @@ test.describe('Migrate Page', () => {
     await expect(errorCard).not.toContainText(rawUpstreamUrl);
   });
 
-  test('migration attempts do not expose Algolia API keys in API Logs', async ({ page }) => {
+  test('preview attempts do not expose Algolia API keys in API Logs', async ({ page }) => {
     const uniqueApiKey = `fake-api-key-${Date.now()}`;
 
     await page.getByLabel('Application ID').fill('fake-app-id');
     await page.getByLabel('Admin API Key').fill(uniqueApiKey);
     await sourceIndexInput(page).fill('nonexistent-index');
 
-    await page.getByRole('button', { name: /migrate/i }).click();
+    await page.getByRole('button', { name: /preview migration/i }).click();
     await expect(page.getByText(/migration failed/i)).toBeVisible({ timeout: 15_000 });
 
     // Generate a normal logged request so the logs page proves the logger still works.
@@ -214,5 +236,33 @@ test.describe('Migrate Page', () => {
 
   test('API key field shows security note', async ({ page }) => {
     await expect(page.getByText('Needs read access. Not stored anywhere.')).toBeVisible();
+  });
+
+  test('dry-run preview shows Algolia warning and scope-gap report', async ({ page, request }, testInfo) => {
+    test.setTimeout(120_000);
+    const algolia = await seedAlgoliaIndex();
+
+    try {
+      await page.getByLabel('Application ID').fill(algolia.appId);
+      await page.getByLabel('Admin API Key').fill(algolia.adminKey);
+      await sourceIndexInput(page).fill(algolia.indexName);
+      await targetIndexInput(page).fill(algolia.targetIndexName);
+
+      const previewButton = page.getByRole('button', { name: /preview migration/i });
+      await expect(previewButton).toBeVisible();
+      await expect(previewButton).toBeEnabled();
+      await expectMigrationWriteUnavailable(page, 'Algolia', algolia.targetIndexName);
+      await previewButton.click();
+
+      await expectMigrationPreviewReport(page, ALGOLIA_PREVIEW_ORACLE);
+      await assertIndexNotCreated(request, algolia.targetIndexName);
+      await expect(page.getByRole('button', { name: /^submit migration$/i })).toBeEnabled();
+    } finally {
+      const cleanupReceipt = await cleanupMigrationIndexes(algolia);
+      await testInfo.attach('algolia-preview-cleanup-receipt', {
+        body: JSON.stringify(cleanupReceipt, null, 2),
+        contentType: 'application/json',
+      });
+    }
   });
 });

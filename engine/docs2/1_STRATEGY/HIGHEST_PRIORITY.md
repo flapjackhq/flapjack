@@ -1,6 +1,6 @@
 # Highest Priority: Open-Source Launch Readiness
 
-**Updated: 2026-08-04 (v1.0.10 released 2026-06-09; release inventory remains in `CHANGELOG.md` and shipped capability status in `engine/docs2/FEATURES.md`; adoption status and strategy route to `PROJECT_OVERVIEW.md`, active status routes to `ROADMAP.md`, and historical launch + post-launch content stays under Archive)**
+**Updated: 2026-08-10.** The current release is v1.0.11; release inventory remains in `CHANGELOG.md`, shipped capability status in `engine/docs2/FEATURES.md`, adoption strategy in `PROJECT_OVERVIEW.md`, and active status in `ROADMAP.md`. Everything below `Archive — historical snapshot` is non-actionable history.
 
 ## Mission
 
@@ -22,7 +22,7 @@ For active priorities and current execution status, use the repo-root owners:
 
 This strategy file remains the enduring owner for mission and principles; status detail is intentionally routed to the repo-root docs above.
 
-## Archive
+## Archive — historical snapshot (through 2026-04-15)
 ### Launch Status
 
 Full checklist with per-item evidence lives in [`engine/docs2/FEATURES.md`](../FEATURES.md) (the canonical status ledger). This document tracks the final launch gate and the few remaining sign-off tasks.

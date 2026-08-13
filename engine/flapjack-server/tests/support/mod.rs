@@ -9,11 +9,25 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::mpsc;
+#[cfg(test)]
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const AUTO_PORT_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const AUTO_PORT_HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// Wall-clock ceiling for one HTTP request, transient-read retries included, when
+/// the caller owns no deadline of its own. Callers that do own one
+/// (`wait_for_health`, `wait_for_task_published_at`) pass it down instead, so a
+/// single request can neither outlive that deadline nor delay its next check.
+const DEFAULT_HTTP_REQUEST_BUDGET: Duration = Duration::from_secs(4);
+/// Sockets reject a zero read timeout, so a nearly spent budget still gets the
+/// smallest usable attempt window.
+const MIN_HTTP_READ_TIMEOUT: Duration = Duration::from_millis(10);
 const FLAPJACK_AMBIENT_ENV_VARS: [&str; 19] = [
     "FLAPJACK_ADMIN_KEY",
     "FLAPJACK_NO_AUTH",
@@ -77,10 +91,18 @@ fn strip_flapjack_ambient_env_from_process_command(command: &mut std::process::C
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_task_poll_response, is_transient_task_poll_transport_error,
-        with_each_flapjack_ambient_env_var, TaskPollOutcome, FLAPJACK_AMBIENT_ENV_VARS,
+        classify_task_poll_response, http_request_before_deadline,
+        http_request_with_headers_and_budget, is_transient_http_transport_error,
+        read_http_response, with_each_flapjack_ambient_env_var, HttpRequestBudget,
+        HttpResponseReader, TaskPollOutcome, DEFAULT_HTTP_READ_TIMEOUT,
+        DEFAULT_HTTP_REQUEST_BUDGET, FLAPJACK_AMBIENT_ENV_VARS, MIN_HTTP_READ_TIMEOUT,
     };
     use serde_json::json;
+    use std::io::{Error, ErrorKind, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{atomic::Ordering, mpsc, Arc};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn with_each_flapjack_ambient_env_var_visits_each_env_var_once_in_order() {
@@ -162,15 +184,267 @@ mod tests {
 
     #[test]
     fn transient_task_poll_transport_errors_are_retryable() {
-        assert!(is_transient_task_poll_transport_error(
+        assert!(is_transient_http_transport_error(
             "failed reading response from 127.0.0.1:44051: Resource temporarily unavailable (os error 11)"
         ));
-        assert!(is_transient_task_poll_transport_error(
+        assert!(is_transient_http_transport_error(
             "failed to connect to 127.0.0.1:44051: Connection refused (os error 61)"
         ));
-        assert!(!is_transient_task_poll_transport_error(
+        assert!(!is_transient_http_transport_error(
             "invalid HTTP response from 127.0.0.1: garbage"
         ));
+    }
+
+    #[test]
+    fn read_http_response_retries_a_transient_read_on_the_same_connection() {
+        let mut reader = TransientThenResponse::new(
+            ErrorKind::TimedOut,
+            b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        );
+
+        let response = read_http_response(
+            &mut reader,
+            "fixture",
+            HttpRequestBudget::lasting(DEFAULT_HTTP_REQUEST_BUDGET),
+        )
+        .expect("a transient read timeout must retry on the original connection");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "ok");
+        assert_eq!(
+            reader.transient_errors_seen(),
+            1,
+            "fixture must prove the retry path was actually exercised"
+        );
+    }
+
+    #[test]
+    fn read_http_response_stops_retrying_once_the_budget_cannot_absorb_an_attempt() {
+        let mut reader = TransientThenResponse::new(
+            ErrorKind::TimedOut,
+            b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        );
+
+        let error = read_http_response(
+            &mut reader,
+            "fixture",
+            HttpRequestBudget::single_attempt(Duration::from_millis(50)),
+        )
+        .expect_err("a spent retry budget must surface the transient read error");
+
+        assert!(
+            error.contains("failed reading response from fixture"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            reader.transient_errors_seen(),
+            1,
+            "a spent retry budget must not start another read attempt"
+        );
+    }
+
+    #[test]
+    fn default_http_request_budget_allows_a_full_transient_read_retry() {
+        let connection_and_write_overhead = Duration::from_millis(50);
+        let first_attempt_started =
+            Instant::now() - DEFAULT_HTTP_READ_TIMEOUT - connection_and_write_overhead;
+        let budget =
+            HttpRequestBudget::lasting_from(first_attempt_started, DEFAULT_HTTP_REQUEST_BUDGET);
+
+        assert_eq!(budget.attempt_timeout(), DEFAULT_HTTP_READ_TIMEOUT);
+        let retry_timeout = budget.retry_attempt_timeout().expect(
+            "the default budget must start a retry after one full read timeout plus request overhead"
+        );
+        assert!(
+            retry_timeout < DEFAULT_HTTP_READ_TIMEOUT,
+            "the retry timeout must shrink to fit the remaining request budget"
+        );
+        assert!(
+            retry_timeout > MIN_HTTP_READ_TIMEOUT,
+            "the remaining default budget must provide a meaningful retry window"
+        );
+    }
+
+    #[test]
+    fn caller_deadline_budget_neither_outlives_nor_delays_the_deadline_check() {
+        let built_at = Instant::now();
+        let near_deadline = built_at + Duration::from_millis(300);
+        let near = HttpRequestBudget::until(near_deadline);
+        assert!(
+            built_at + near.attempt_timeout() <= near_deadline,
+            "a read attempt must fit inside the caller's remaining time"
+        );
+        assert!(
+            near.deadline.expect("bounded budget must have a deadline") <= near_deadline,
+            "retries must stop by the deadline the caller owns"
+        );
+
+        let far = HttpRequestBudget::until(built_at + Duration::from_secs(30));
+        assert!(
+            far.deadline.expect("bounded budget must have a deadline")
+                <= Instant::now() + DEFAULT_HTTP_REQUEST_BUDGET,
+            "a far deadline must still return control for the caller's own timeout check"
+        );
+    }
+
+    #[test]
+    fn explicit_read_timeout_budget_never_retries() {
+        let budget = HttpRequestBudget::single_attempt(Duration::from_secs(10));
+
+        assert_eq!(budget.attempt_timeout(), Duration::from_secs(10));
+        assert!(budget.retry_attempt_timeout().is_none());
+    }
+
+    #[test]
+    fn default_http_request_preserves_connection_across_transient_read_timeout() {
+        const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(100);
+        // Long enough that the client observes several read timeouts even when it
+        // is descheduled, so the retry path is exercised rather than raced past.
+        const RESPONSE_DELAY: Duration = Duration::from_millis(400);
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("transient-read fixture must bind a loopback port");
+        let bind_addr = listener
+            .local_addr()
+            .expect("transient-read fixture must report its address")
+            .to_string();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("transient-read fixture must accept one request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("transient-read fixture must bound request-header reads");
+            let request = read_complete_request_headers(&mut stream);
+            assert!(
+                request.starts_with("GET /delayed HTTP/1.0"),
+                "fixture must receive the expected request before delaying its response: {request}"
+            );
+
+            thread::sleep(RESPONSE_DELAY);
+            stream
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .expect("transient-read fixture must answer the retried read");
+        });
+
+        let transient_read_retries = Arc::new(super::AtomicUsize::new(0));
+        let budget =
+            HttpRequestBudget::new(Instant::now() + Duration::from_secs(2), ATTEMPT_TIMEOUT)
+                .with_transient_read_observer(Arc::clone(&transient_read_retries));
+        let response =
+            http_request_with_headers_and_budget(&bind_addr, "GET", "/delayed", &[], None, budget)
+                .expect("a transient read timeout must retry on the original connection");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "ok");
+        assert!(
+            transient_read_retries.load(Ordering::SeqCst) > 0,
+            "the loopback fixture must observe a transient read before accepting the response"
+        );
+        server.join().expect("transient-read fixture must finish");
+    }
+
+    #[test]
+    fn http_request_before_deadline_returns_before_the_caller_deadline() {
+        const DEADLINE_SLACK: Duration = Duration::from_millis(200);
+
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("silent fixture must bind a loopback port");
+        let bind_addr = listener
+            .local_addr()
+            .expect("silent fixture must report its address")
+            .to_string();
+
+        // Hold the connection open, unanswered, for the whole request so only the
+        // caller's deadline can end it.
+        let (release_fixture, fixture_released) = mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let (held_stream, _) = listener
+                .accept()
+                .expect("silent fixture must accept one request");
+            fixture_released.recv().ok();
+            drop(held_stream);
+        });
+
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let error = http_request_before_deadline(&bind_addr, "GET", "/never", None, deadline)
+            .expect_err("a silent server must surface a read timeout");
+
+        assert!(
+            error.contains("failed reading response"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            Instant::now() <= deadline + DEADLINE_SLACK,
+            "a request must not retry past the deadline its caller owns"
+        );
+        drop(release_fixture);
+        server.join().expect("silent fixture must finish");
+    }
+
+    fn read_complete_request_headers(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        // Read in small chunks so valid TCP segmentation cannot make the
+        // request-line assertion depend on a single read returning everything.
+        let mut chunk = [0_u8; 8];
+        loop {
+            let bytes_read = stream
+                .read(&mut chunk)
+                .expect("fixture must receive request headers");
+            assert!(
+                bytes_read > 0,
+                "client must not close before sending complete request headers"
+            );
+            request.extend_from_slice(&chunk[..bytes_read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return String::from_utf8(request).expect("request headers must be UTF-8");
+            }
+        }
+    }
+
+    struct TransientThenResponse {
+        transient_error: ErrorKind,
+        response: &'static [u8],
+        offset: usize,
+        transient_errors_seen: usize,
+    }
+
+    impl TransientThenResponse {
+        fn new(transient_error: ErrorKind, response: &'static [u8]) -> Self {
+            Self {
+                transient_error,
+                response,
+                offset: 0,
+                transient_errors_seen: 0,
+            }
+        }
+
+        fn transient_errors_seen(&self) -> usize {
+            self.transient_errors_seen
+        }
+    }
+
+    impl Read for TransientThenResponse {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.transient_errors_seen == 0 {
+                self.transient_errors_seen += 1;
+                return Err(Error::from(self.transient_error));
+            }
+            if self.offset == self.response.len() {
+                return Ok(0);
+            }
+            let bytes_to_copy = buffer.len().min(self.response.len() - self.offset);
+            buffer[..bytes_to_copy]
+                .copy_from_slice(&self.response[self.offset..self.offset + bytes_to_copy]);
+            self.offset += bytes_to_copy;
+            Ok(bytes_to_copy)
+        }
+    }
+
+    impl HttpResponseReader for TransientThenResponse {
+        fn set_response_read_timeout(&self, _timeout: Duration) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }
 
@@ -471,6 +745,7 @@ pub(crate) fn run_auth_auto_port_startup_once(data_dir: &str, extra_env: &[(&str
     kill_and_wait_child(&mut child);
 }
 
+#[derive(Debug)]
 pub(crate) struct HttpResponse {
     pub(crate) status: u16,
     pub(crate) headers: HashMap<String, String>,
@@ -517,6 +792,7 @@ pub(crate) fn wait_for_task_published_at(
 ) -> Value {
     let path = format!("/1/indexes/{index_name}/task/{task_id}");
     let started_at = Instant::now();
+    let deadline = started_at + timeout;
     let mut last_body = Value::Null;
 
     loop {
@@ -527,11 +803,11 @@ pub(crate) fn wait_for_task_published_at(
             last_body
         );
 
-        let response = match http_request(bind_addr, "GET", &path, None) {
+        let response = match http_request_before_deadline(bind_addr, "GET", &path, None, deadline) {
             Ok(response) => response,
             // Crash/restart tests can briefly observe socket-level EAGAIN/timeout/refused
             // while the task-polling loop is still within its overall retry window.
-            Err(error) if is_transient_task_poll_transport_error(&error) => {
+            Err(error) if is_transient_http_transport_error(&error) => {
                 last_body = serde_json::json!({ "transientTransportError": error });
                 thread::sleep(Duration::from_millis(25));
                 continue;
@@ -722,6 +998,7 @@ fn extract_bind_addr_from_banner_line(line: &str) -> Option<String> {
 
 fn wait_for_health(bind_addr: &str, timeout: Duration) {
     let start = Instant::now();
+    let deadline = start + timeout;
     loop {
         if start.elapsed() > timeout {
             panic!(
@@ -730,7 +1007,9 @@ fn wait_for_health(bind_addr: &str, timeout: Duration) {
             );
         }
 
-        if let Ok(response) = http_request(bind_addr, "GET", "/health", None) {
+        if let Ok(response) =
+            http_request_before_deadline(bind_addr, "GET", "/health", None, deadline)
+        {
             if response.status == 200 && response.body.contains("\"status\":\"ok\"") {
                 return;
             }
@@ -842,7 +1121,7 @@ fn classify_task_poll_response(task_id: i64, body: &Value) -> TaskPollOutcome {
     TaskPollOutcome::Pending
 }
 
-fn is_transient_task_poll_transport_error(error: &str) -> bool {
+fn is_transient_http_transport_error(error: &str) -> bool {
     error.contains("Resource temporarily unavailable")
         || error.contains("timed out")
         || error.contains("Connection refused")
@@ -854,6 +1133,99 @@ struct JsonResponse {
     body: Value,
 }
 
+/// Time budget for one HTTP request: the maximum duration of one socket read and
+/// the wall-clock deadline shared by all attempts. Each attempt receives only
+/// the time still remaining, so connection and write overhead cannot consume the
+/// retry or make the request outlive a deadline owned by its caller.
+#[derive(Clone, Debug)]
+struct HttpRequestBudget {
+    deadline: Option<Instant>,
+    attempt_timeout: Duration,
+    #[cfg(test)]
+    transient_read_observer: Option<Arc<AtomicUsize>>,
+}
+
+impl HttpRequestBudget {
+    fn new(deadline: Instant, attempt_timeout: Duration) -> Self {
+        Self {
+            deadline: Some(deadline),
+            attempt_timeout: attempt_timeout.max(MIN_HTTP_READ_TIMEOUT),
+            #[cfg(test)]
+            transient_read_observer: None,
+        }
+    }
+
+    /// Budget that may retry transient reads for `total`, using the default
+    /// per-attempt read timeout.
+    fn lasting(total: Duration) -> Self {
+        Self::lasting_from(Instant::now(), total)
+    }
+
+    /// Budget for a caller that owns an overall `deadline`: never outlives that
+    /// deadline, and never withholds control past the default request budget.
+    fn until(deadline: Instant) -> Self {
+        let now = Instant::now();
+        let remaining = deadline
+            .saturating_duration_since(now)
+            .min(DEFAULT_HTTP_REQUEST_BUDGET);
+        Self::lasting_from(now, remaining)
+    }
+
+    fn lasting_from(start: Instant, total: Duration) -> Self {
+        Self::new(start + total, total.min(DEFAULT_HTTP_READ_TIMEOUT))
+    }
+
+    /// One attempt with an explicit socket read timeout and no retries, for
+    /// callers whose assertion is about that timeout itself.
+    fn single_attempt(read_timeout: Duration) -> Self {
+        Self {
+            deadline: None,
+            attempt_timeout: read_timeout.max(MIN_HTTP_READ_TIMEOUT),
+            #[cfg(test)]
+            transient_read_observer: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_transient_read_observer(mut self, observer: Arc<AtomicUsize>) -> Self {
+        self.transient_read_observer = Some(observer);
+        self
+    }
+
+    fn attempt_timeout(&self) -> Duration {
+        self.attempt_timeout
+    }
+
+    fn initial_attempt_timeout(&self) -> Option<Duration> {
+        match self.deadline {
+            Some(_) => self.remaining_attempt_timeout(),
+            None => Some(self.attempt_timeout),
+        }
+    }
+
+    fn retry_attempt_timeout(&self) -> Option<Duration> {
+        self.deadline.and_then(|_| self.remaining_attempt_timeout())
+    }
+
+    fn remaining_attempt_timeout(&self) -> Option<Duration> {
+        let remaining = self
+            .deadline
+            .expect("remaining timeout requires a request deadline")
+            .saturating_duration_since(Instant::now());
+        (remaining >= MIN_HTTP_READ_TIMEOUT).then(|| remaining.min(self.attempt_timeout))
+    }
+
+    #[cfg(test)]
+    fn record_transient_read_retry(&self) {
+        if let Some(observer) = &self.transient_read_observer {
+            observer.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn record_transient_read_retry(&self) {}
+}
+
 pub(crate) fn http_request_with_headers(
     bind_addr: &str,
     method: &str,
@@ -861,13 +1233,32 @@ pub(crate) fn http_request_with_headers(
     headers: &[(&str, &str)],
     body: Option<&str>,
 ) -> Result<HttpResponse, String> {
-    http_request_with_headers_and_read_timeout(
+    http_request_with_headers_and_budget(
         bind_addr,
         method,
         path,
         headers,
         body,
-        Duration::from_secs(2),
+        HttpRequestBudget::lasting(DEFAULT_HTTP_REQUEST_BUDGET),
+    )
+}
+
+/// Issue a request on behalf of a loop that owns `deadline`, so transient-read
+/// retries can never push past the timeout that loop is enforcing.
+fn http_request_before_deadline(
+    bind_addr: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    deadline: Instant,
+) -> Result<HttpResponse, String> {
+    http_request_with_headers_and_budget(
+        bind_addr,
+        method,
+        path,
+        &[],
+        body,
+        HttpRequestBudget::until(deadline),
     )
 }
 
@@ -879,20 +1270,65 @@ fn http_request_with_headers_and_read_timeout(
     body: Option<&str>,
     read_timeout: Duration,
 ) -> Result<HttpResponse, String> {
-    let body = body.unwrap_or("");
+    http_request_with_headers_and_budget(
+        bind_addr,
+        method,
+        path,
+        headers,
+        Some(body.unwrap_or("")),
+        HttpRequestBudget::single_attempt(read_timeout),
+    )
+}
+
+fn http_request_with_headers_and_budget(
+    bind_addr: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+    budget: HttpRequestBudget,
+) -> Result<HttpResponse, String> {
     let mut stream = open_http_request_with_read_timeout(
         bind_addr,
         method,
         path,
         headers,
-        Some(body),
-        read_timeout,
+        body,
+        budget.attempt_timeout(),
     )?;
+    read_http_response(&mut stream, bind_addr, budget)
+}
 
+fn read_http_response(
+    stream: &mut impl HttpResponseReader,
+    bind_addr: &str,
+    budget: HttpRequestBudget,
+) -> Result<HttpResponse, String> {
     let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .map_err(|e| format!("failed reading response from {}: {}", bind_addr, e))?;
+    let mut next_attempt_timeout = budget.initial_attempt_timeout();
+    let mut last_read_error = None;
+    loop {
+        let Some(attempt_timeout) = next_attempt_timeout else {
+            return Err(last_read_error.unwrap_or_else(|| {
+                format!("failed reading response from {bind_addr}: request budget exhausted")
+            }));
+        };
+        stream
+            .set_response_read_timeout(attempt_timeout)
+            .map_err(|error| format!("failed setting read timeout: {error}"))?;
+        match stream.read_to_end(&mut raw) {
+            Ok(_) => break,
+            Err(error) => {
+                let message = format!("failed reading response from {bind_addr}: {error}");
+                if !is_transient_http_transport_error(&message) {
+                    return Err(message);
+                }
+                budget.record_transient_read_retry();
+                last_read_error = Some(message);
+                next_attempt_timeout = budget.retry_attempt_timeout();
+            }
+        }
+    }
 
     let text = String::from_utf8_lossy(&raw);
     let (head, payload) = text
@@ -922,6 +1358,16 @@ fn http_request_with_headers_and_read_timeout(
         headers,
         body: payload.to_string(),
     })
+}
+
+trait HttpResponseReader: Read {
+    fn set_response_read_timeout(&self, timeout: Duration) -> std::io::Result<()>;
+}
+
+impl HttpResponseReader for TcpStream {
+    fn set_response_read_timeout(&self, timeout: Duration) -> std::io::Result<()> {
+        self.set_read_timeout(Some(timeout))
+    }
 }
 
 fn write_http_request(

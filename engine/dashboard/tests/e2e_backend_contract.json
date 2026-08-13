@@ -1,0 +1,118 @@
+{
+  "$comment": [
+    "Single owner for: which backend capabilities the dashboard e2e specs require, and",
+    "which environment starts a backend that has them.",
+    "",
+    "WHY THIS FILE EXISTS (anchored 2026-08-06).",
+    "A dashboard e2e spec declares its backend precondition in its own fixture, and the",
+    "CI job that runs it declares the backend environment in its own `run:` block. Nothing",
+    "connected the two, so they drifted, twice, in a single nightly run:",
+    "",
+    "  - nightly.yml 'Dashboard all tests' starts a plain standalone backend and then runs",
+    "    `npm run test:pages`, which is `playwright test --project=e2e-ui` with NO path",
+    "    filter and therefore includes tests/e2e-ui/full/. cluster_peers.spec.ts threw",
+    "    'Cluster peer specs require a replication-enabled HA backend' in run 31072375322.",
+    "  - ci.yml 'Dashboard full e2e tests' starts a replication-enabled backend but omits",
+    "    FLAPJACK_AI_ALLOW_LOCAL_URLS, so vector-settings.spec.ts failed three times in",
+    "    prod CI run 31096601354 with 'rest embedder URL private or local destination",
+    "    `127.0.0.1` is not allowed'.",
+    "",
+    "Both specs were correct and both passed their authoring lane's own proof, because",
+    "that lane started a backend that satisfied them. The defect is that the workflow's",
+    "backend and the spec's precondition had no shared owner.",
+    "",
+    "WHY THE ENVIRONMENT MUST BE ON THE BACKEND STARTUP STEP, NOT THE TEST STEP.",
+    "This is the trap that makes the bug non-obvious. scripts/playwright-webserver.mjs",
+    "starts a correctly-configured backend via spawnBackendServer — but startPlaywrightServers",
+    "passes allowReuse: true for the backend, so when a workflow has already started one on",
+    "the target port, Playwright REUSES it and spawnBackendServer never runs. Environment",
+    "declared on the Playwright step therefore cannot reach the process under test. Only the",
+    "step that launches the binary can satisfy these requirements.",
+    "",
+    "HOW TO ADD A REQUIREMENT.",
+    "Add an entry below naming the env, the specs that need it, and the exact symptom when",
+    "it is missing. engine/tests/test_dashboard_e2e_backend_contract.py then fails every",
+    "workflow job whose spec selection includes one of those specs without that env, and",
+    "fails spawnBackendServer if it does not provide the union of all of them.",
+    "",
+    "BASE vs PER-SPEC, AND WHY GETTING THIS WRONG IS INVISIBLE (anchored 2026-08-07).",
+    "Set \"base\": true when assertBackendReadiness itself enforces the requirement, i.e.",
+    "the harness refuses the backend at webServer startup before any spec runs. Leave it",
+    "unset when only named specs need it at request time. The distinction is load-bearing",
+    "because a per-spec requirement is checked only against a job's spec SELECTION, so a",
+    "job that selects none of the named specs passes this gate and then dies at startup",
+    "anyway. That is exactly what happened: ci.yml's dashboard-pages and",
+    "dashboard-integration jobs carried neither replication nor ai_local_outbound, this",
+    "gate exited 0, and staging run 31213083385 failed both jobs with 'refused the",
+    "dashboard local-URL embedder probe' before a single spec executed. The rule to keep:",
+    "a static contract that guarantees a runtime assertion must be at least as strict as",
+    "that assertion, and assertBackendReadiness is the assertion here."
+  ],
+  "requirements": [
+    {
+      "id": "replication",
+      "base": true,
+      "enforced_by": "assertReplicationEnabled",
+      "why_base": "assertBackendReadiness calls assertReplicationEnabled unconditionally for every backend it accepts or spawns, so this is required regardless of which specs a job selects. It is NOT only cluster_peers.spec.ts's requirement, even though that spec is the reason the values were chosen.",
+      "why": "Runtime HA membership (ROADMAP HA-MEMBERSHIP-UI) is a real product surface. Its specs drive add/remove peer mutations through /internal/cluster/*, which the server only registers when replication is configured. No peers are configured — a single node with a replication identity is enough for the membership UI to be exercised, and ci.yml's dashboard-full-e2e job has run 400+ specs in exactly this configuration since 2026-08-03.",
+      "symptom_if_missing": "Cluster peer specs require a replication-enabled HA backend, but the target reports standalone mode",
+      "required_by": ["tests/e2e-ui/full/cluster_peers.spec.ts"],
+      "env": {
+        "FLAPJACK_NODE_ID": "dashboard-e2e",
+        "FLAPJACK_ADVERTISE_ADDR": "https://dashboard-e2e.invalid:7700",
+        "FLAPJACK_REPLICATION_API_KEY": "fj_devtestadminkey000000"
+      }
+    },
+    {
+      "id": "ai_local_outbound",
+      "base": true,
+      "enforced_by": "probeLocalOutboundOptIn",
+      "why_base": "assertBackendReadiness calls probeLocalOutboundOptIn for every backend it accepts or spawns (skipped only under the P20_TEXT_ONLY_NEGATIVE_CONTROL negative control), so this is required regardless of which specs a job selects. Modelling it as vector-settings.spec.ts's private requirement is what let ci.yml's dashboard-pages and dashboard-integration jobs ship without it: the guard passed and the harness refused anyway.",
+      "why": "vector-settings.spec.ts stands up a deterministic embedder on 127.0.0.1 and registers it as a `rest` source. engine/src/security.rs::allow_local_outbound_urls reads FLAPJACK_AI_ALLOW_LOCAL_URLS and outbound_ip_block_reason refuses a private or loopback destination when it is absent. That refusal is a deliberate fail-closed SSRF control with a documented operator opt-in for exactly this local-AI case; the fix is to set the opt-in in the harness, NEVER to weaken security.rs.",
+      "symptom_if_missing": "rest embedder URL private or local destination `127.0.0.1` is not allowed",
+      "required_by": ["tests/e2e-ui/full/vector-settings.spec.ts"],
+      "env": {
+        "FLAPJACK_AI_ALLOW_LOCAL_URLS": "1"
+      }
+    },
+    {
+      "id": "migration_preview_loopback",
+      "why": "The Meilisearch and Typesense provider migration happy-path specs use digest-pinned loopback source fixtures. Once the release fallback is available, those submit paths require the preview loopback opt-ins at backend process start; setting them on the Playwright step is too late when a backend is already listening and reused.",
+      "symptom_if_missing": "Meilisearch Cloud endpoint is not allowed / Typesense Cloud endpoint is not allowed",
+      "required_by": [
+        "tests/e2e-ui/full/migrate-meilisearch.spec.ts",
+        "tests/e2e-ui/full/migrate-typesense.spec.ts"
+      ],
+      "env": {
+        "FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK": "1",
+        "FJ_ENABLE_TYPESENSE_PREVIEW_LOOPBACK": "1"
+      }
+    },
+    {
+      "id": "meilisearch_loopback_refusal",
+      "why": "The Meilisearch refusal spec proves the console adds operator guidance when the backend rejects a loopback source. That proof is only meaningful when FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK is absent from the backend process start environment. Run it through `npm run test:e2e-ui:migrate-meilisearch-refusal`, which selects only the refusal project and narrows PLAYWRIGHT_BACKEND_CONTRACT_IDS to the non-preview base requirements.",
+      "symptom_if_missing": "The refusal case cannot receive `Meilisearch Cloud endpoint is not allowed` if the backend was started with FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK=1",
+      "required_by": [],
+      "env_absent": ["FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK"]
+    }
+  ],
+  "npm_script_spec_scopes": {
+    "$comment": [
+      "Resolved from engine/dashboard/package.json at gate time rather than restated here.",
+      "This map only records which scripts are dashboard Playwright entry points; the gate",
+      "reads the actual script body to learn which paths it selects, so a script that gains",
+      "or loses a path filter cannot silently escape the contract."
+    ],
+    "playwright_entry_points": [
+      "test",
+      "test:pages",
+      "test:e2e-ui",
+      "test:e2e-ui:smoke",
+      "test:e2e-ui:full",
+      "test:e2e-ui:migrate-meilisearch-refusal",
+      "test:smoke",
+      "test:integration",
+      "test:e2e-api"
+    ]
+  }
+}

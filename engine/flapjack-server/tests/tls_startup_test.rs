@@ -43,6 +43,10 @@ fn spawn_tls_process(
 ) -> Child {
     let mut command = flapjack_process_command();
     command
+        // The SIGTERM contract below observes the INFO-level drain receipt.
+        // Pin the child filter so a host-level `RUST_LOG=warn` cannot hide the
+        // behavior the test is responsible for proving.
+        .env("RUST_LOG", "info")
         .arg("--no-auth")
         .arg("--data-dir")
         .arg(data_dir)

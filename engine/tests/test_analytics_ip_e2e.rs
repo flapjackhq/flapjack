@@ -1,6 +1,7 @@
 use arrow::array::{Array, StringArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::{json, Value};
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -83,14 +84,73 @@ fn collect_search_parquet_files(root: &Path, output: &mut Vec<PathBuf>) {
     }
 }
 
+/// Resolve the built `flapjack` binary through Cargo's target-directory contract.
+///
+/// This used to be `CARGO_MANIFEST_DIR/target/debug/flapjack`, which is wrong whenever the target
+/// directory is not `<manifest>/target` — and the union doctrine every recent lane follows puts it
+/// somewhere else on purpose, because a quarantined target directory is what makes a union run
+/// authoritative. Under that configuration the lookup failed and the test reddened before
+/// exercising any analytics behaviour at all, so nothing about IP minimization was being measured.
+/// See `ROADMAP.md` row `TEST-HARNESS-1`.
+///
+/// An explicit `CARGO_TARGET_DIR` is authoritative. Relative values use the workspace invocation
+/// directory, which is this crate's manifest directory in the documented test commands. When the
+/// variable is unset or empty, use Cargo's ordinary worktree-local `target` directory.
+fn flapjack_binary_path(cargo_target_dir: Option<&OsStr>, manifest_dir: &Path) -> PathBuf {
+    let configured_target = cargo_target_dir
+        .filter(|value| !value.is_empty())
+        .map(Path::new);
+    let target_dir = match configured_target {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => manifest_dir.join(path),
+        None => manifest_dir.join("target"),
+    };
+    target_dir.join("debug/flapjack")
+}
+
+#[test]
+fn flapjack_binary_honors_cargo_target_dir_before_worktree_fallback() {
+    let manifest_dir = Path::new("/worktree/engine");
+
+    // The external quarantine wins even though the worktree fallback differs.
+    assert_eq!(
+        flapjack_binary_path(
+            Some(Path::new("/quarantine/target").as_os_str()),
+            manifest_dir,
+        ),
+        PathBuf::from("/quarantine/target/debug/flapjack"),
+    );
+    // Cargo resolves a relative CARGO_TARGET_DIR from the workspace invocation directory.
+    assert_eq!(
+        flapjack_binary_path(Some(Path::new("quarantine").as_os_str()), manifest_dir),
+        PathBuf::from("/worktree/engine/quarantine/debug/flapjack"),
+    );
+    // Unset and empty values both use the ordinary worktree target.
+    assert_eq!(
+        flapjack_binary_path(None, manifest_dir),
+        PathBuf::from("/worktree/engine/target/debug/flapjack"),
+    );
+    assert_eq!(
+        flapjack_binary_path(Some(Path::new("").as_os_str()), manifest_dir),
+        PathBuf::from("/worktree/engine/target/debug/flapjack"),
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn served_search_persists_only_minimized_client_ip() {
     let executable = std::env::var_os("FLAPJACK_BIN")
         .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/flapjack"));
+        .unwrap_or_else(|| {
+            let cargo_target_dir = std::env::var_os("CARGO_TARGET_DIR");
+            flapjack_binary_path(
+                cargo_target_dir.as_deref(),
+                Path::new(env!("CARGO_MANIFEST_DIR")),
+            )
+        });
     assert!(
         executable.is_file(),
-        "flapjack executable must exist at {}; build flapjack-server first",
+        "flapjack executable must exist at {}; build flapjack-server first \
+         (resolved from CARGO_TARGET_DIR before the worktree target fallback)",
         executable.display()
     );
 

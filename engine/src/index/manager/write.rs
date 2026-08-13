@@ -12,6 +12,7 @@ use tokio::time::Instant;
 /// affecting ordinary commits (PL-13 silent-drop failure mode).
 const DEFAULT_WRITE_DURABLE_TIMEOUT_MS: u64 = 30_000;
 const WRITE_DURABLE_FAIL_CLOSED_GRACE_MS: u64 = 1_000;
+const WRITE_DURABLE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy)]
 enum WriteAdmissionMode {
@@ -117,6 +118,17 @@ impl super::IndexManager {
         LoadWriteQueueCheckpointHookGuard {
             previous: slot.replace(Arc::new(hook)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_write_admission_after_stage_hook_for_test(
+        &self,
+        tenant_id: &str,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.get_or_create_admission_store(tenant_id)?
+            .set_after_stage_hook(hook);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -557,7 +569,7 @@ impl super::IndexManager {
                             return self.resolve_durable_write_timeout(&status).await;
                         }
                     }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    tokio::time::sleep_until(Instant::now() + WRITE_DURABLE_POLL_INTERVAL).await;
                 }
                 TaskStatus::Succeeded => {
                     // Sweep terminal overflow as soon as a write reaches completion so
@@ -678,6 +690,35 @@ impl super::IndexManager {
         timeout: Duration,
     ) -> Result<()> {
         self.await_task_terminal(task_id, Some(timeout)).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn add_documents_durable_with_timeout_for_test(
+        &self,
+        tenant_id: &str,
+        docs: Vec<Document>,
+        timeout: Duration,
+    ) -> Result<TaskInfo> {
+        let task = self.admit_documents_durable(tenant_id, docs)?;
+        self.wait_for_write_durable_with_timeout_for_test(&task.id, timeout)
+            .await?;
+        Ok(task)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn add_documents_insert_durable_with_timeout_for_test(
+        &self,
+        tenant_id: &str,
+        docs: Vec<Document>,
+        timeout: Duration,
+    ) -> Result<TaskInfo> {
+        let index = self.get_or_load(tenant_id)?;
+        let actions = docs.into_iter().map(WriteAction::Add).collect();
+        let task =
+            self.admit_write_actions(tenant_id, &index, actions, WriteAdmissionMode::Durable)?;
+        self.wait_for_write_durable_with_timeout_for_test(&task.id, timeout)
+            .await?;
+        Ok(task)
     }
 
     #[cfg(test)]

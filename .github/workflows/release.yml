@@ -6,11 +6,13 @@ on:
       version:
         description: "Release version (e.g. 0.1.0)"
         required: true
+      acknowledged_ci_failure_run_id:
+        description: "Exact failed push-CI run ID being acknowledged"
+        required: false
+        default: ""
 
 permissions:
-  contents: write
-  packages: write
-  id-token: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -82,6 +84,24 @@ jobs:
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
         run: package/ghcr_publish_preflight "$RELEASE_IMAGE_REPOSITORY"
+
+  release_ci_status_preflight:
+    name: Verify release target CI status
+    needs: validate_release_version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require terminal push CI success or an exact failed-run acknowledgement
+        working-directory: engine
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACKNOWLEDGED_CI_FAILURE_RUN_ID: ${{ github.event.inputs.acknowledged_ci_failure_run_id }}
+        run: package/release_ci_status_preflight "${{ github.repository }}" "${{ github.sha }}" "ci.yml" "$ACKNOWLEDGED_CI_FAILURE_RUN_ID"
 
   build:
     needs: validate_release_version
@@ -186,11 +206,15 @@ jobs:
           compression-level: 0
 
   release:
-    # Both gates are irreversibility gates: build proves the artifacts exist,
-    # ghcr_publish_preflight proves the images will be publishable. Creating the
-    # tag before either is what leaves a partial release on the public mirror.
-    needs: [build, ghcr_publish_preflight]
+    # All three are irreversibility gates: build proves the artifacts exist,
+    # ghcr_publish_preflight proves the images will be publishable, and
+    # release_ci_status_preflight proves the target's push CI is terminal green
+    # (or its exact failed run is acknowledged). Creating the tag before these
+    # proofs is what leaves a partial release on the public mirror.
+    needs: [build, ghcr_publish_preflight, release_ci_status_preflight]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -303,6 +327,10 @@ jobs:
     needs: docker_prepare
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -335,6 +363,10 @@ jobs:
     needs: docker_prepare
     runs-on: ${{ vars.ARM64_NATIVE_RUNNER }}
     timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -371,6 +403,10 @@ jobs:
     # the native lane: set repo var ARM64_NATIVE_RUNNER (e.g. ubuntu-24.04-arm,
     # free on public repos) to skip this QEMU path entirely.
     timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -408,6 +444,9 @@ jobs:
       - docker_build_arm64_qemu
     if: ${{ always() && needs.docker_build_amd64.result == 'success' && (needs.docker_build_arm64_native.result == 'success' || needs.docker_build_arm64_qemu.result == 'success') }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: docker/setup-buildx-action@v3
 
@@ -448,6 +487,9 @@ jobs:
     # promoting an unverified manifest.)
     if: ${{ always() && needs.docker_manifest_verify.result == 'success' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: docker/setup-buildx-action@v3
 

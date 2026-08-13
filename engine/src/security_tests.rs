@@ -8,6 +8,21 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
+const RESOLVER_GUARD_TEST_HOST: &str = "resolver-guard.flapjack.invalid";
+
+fn install_resolver_returning(ip: IpAddr) -> super::test_helpers::OutboundHostResolverGuard {
+    install_test_outbound_host_resolver(Arc::new(move |_, _| Some(vec![ip])))
+}
+
+fn resolve_guard_test_host() -> Option<(IpAddr, &'static str)> {
+    first_blocked_outbound_host_ip(RESOLVER_GUARD_TEST_HOST, Some(443), false)
+}
+
+fn resolve_with_scoped_override(ip: IpAddr) -> Option<(IpAddr, &'static str)> {
+    let _guard = install_resolver_returning(ip);
+    resolve_guard_test_host()
+}
+
 #[test]
 #[serial(flapjack_outbound_url_policy)]
 fn unset_defaults_to_false() {
@@ -168,6 +183,69 @@ fn outbound_host_resolution_policy_edge_cases() {
         None,
         "resolution failure must stay non-blocking for offline/live-DNS-independent validation"
     );
+}
+
+#[test]
+#[serial(flapjack_outbound_url_policy)]
+fn outbound_host_resolver_guard_restores_nearest_live_predecessor() {
+    let root_ip = "10.0.0.1".parse::<IpAddr>().unwrap();
+    let public_ip = "8.8.8.8".parse::<IpAddr>().unwrap();
+    let loopback_ip = "127.0.0.1".parse::<IpAddr>().unwrap();
+    let private_reason = "private or local destination";
+
+    let root_guard = install_resolver_returning(root_ip);
+    let observed_root = resolve_guard_test_host();
+    let older_guard = install_resolver_returning(public_ip);
+    let observed_older = resolve_guard_test_host();
+    let newer_guard = install_resolver_returning(loopback_ip);
+
+    drop(older_guard);
+    let observed_after_older_drop = resolve_guard_test_host();
+    drop(newer_guard);
+    let observed_after_newer_drop = resolve_guard_test_host();
+    drop(root_guard);
+    let observed_after_root_drop = resolve_guard_test_host();
+
+    assert_eq!(observed_root, Some((root_ip, private_reason)));
+    assert_eq!(observed_older, None);
+    assert_eq!(
+        observed_after_older_drop,
+        Some((loopback_ip, private_reason))
+    );
+    assert_eq!(observed_after_newer_drop, Some((root_ip, private_reason)));
+    assert_eq!(observed_after_root_drop, None);
+}
+
+#[test]
+#[serial(flapjack_outbound_url_policy)]
+fn outbound_host_resolver_guard_cleans_up_on_scope_exit_and_panic() {
+    let root_ip = "10.0.0.1".parse::<IpAddr>().unwrap();
+    let loopback_ip = "127.0.0.1".parse::<IpAddr>().unwrap();
+    let private_reason = "private or local destination";
+    let root_guard = install_resolver_returning(root_ip);
+
+    let observed_in_returning_scope = resolve_with_scoped_override(loopback_ip);
+    let observed_after_scope = resolve_guard_test_host();
+    let panic_result = std::panic::catch_unwind(|| {
+        let _panicking_guard = install_resolver_returning(loopback_ip);
+        assert_eq!(
+            resolve_guard_test_host(),
+            Some((loopback_ip, private_reason))
+        );
+        panic!("exercise resolver guard panic cleanup");
+    });
+    let observed_after_panic = resolve_guard_test_host();
+    drop(root_guard);
+    let observed_after_root_drop = resolve_guard_test_host();
+
+    assert_eq!(
+        observed_in_returning_scope,
+        Some((loopback_ip, private_reason))
+    );
+    assert_eq!(observed_after_scope, Some((root_ip, private_reason)));
+    assert!(panic_result.is_err(), "the cleanup fixture must unwind");
+    assert_eq!(observed_after_panic, Some((root_ip, private_reason)));
+    assert_eq!(observed_after_root_drop, None);
 }
 
 #[test]

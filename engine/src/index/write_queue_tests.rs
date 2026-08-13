@@ -131,6 +131,16 @@ fn with_write_queue_channel_capacity_env<T>(
     test_body()
 }
 
+async fn add_documents_and_wait_for_test(
+    manager: &crate::index::manager::IndexManager,
+    tenant_id: &str,
+    docs: Vec<Document>,
+) -> crate::error::Result<TaskInfo> {
+    manager
+        .add_documents_durable_with_timeout_for_test(tenant_id, docs, WRITE_QUEUE_PROGRESS_TIMEOUT)
+        .await
+}
+
 /// Applies a temporary batch-size env value while the caller holds WRITE_QUEUE_ENV_LOCK.
 fn with_write_queue_batch_size_env_locked<T>(
     env_value: Option<&str>,
@@ -1094,7 +1104,7 @@ async fn durable_wait_deadline_is_reset_by_observable_task_progress() {
 
     // Let the waiter record the task's initial (zero-progress) state and arm its
     // first idle sleep before any progress is published.
-    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(1)).await;
 
     // Test-owned seam: publish each progress step first, then advance the virtual
     // clock by less than one window so the waiter observes the update and resets
@@ -1114,6 +1124,40 @@ async fn durable_wait_deadline_is_reset_by_observable_task_progress() {
     assert!(
         matches!(progressed, Ok(())),
         "slow but steady progress beyond the original durable window must remain acknowledged, got {progressed:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_wait_keeps_configured_wall_clock_bound_when_runtime_is_descheduled() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    const IDLE_BUDGET: Duration = Duration::from_millis(25);
+    const RUNTIME_STALL: Duration = Duration::from_millis(75);
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = crate::index::manager::IndexManager::new(tmp.path());
+    let task_id = "runtime_starvation_contract".to_string();
+    let mut task = TaskInfo::new(task_id.clone(), 1, 1);
+    task.status = TaskStatus::Processing;
+    manager.insert_task_for_test(task);
+
+    let mut waiter =
+        Box::pin(manager.wait_for_write_durable_with_timeout_for_test(&task_id, IDLE_BUDGET));
+    let initial_poll = std::future::poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx))).await;
+    assert!(
+        matches!(initial_poll, Poll::Pending),
+        "a processing task must arm the durable-wait poll timer"
+    );
+
+    // Model the union run's runtime starvation: neither the waiter nor its poll
+    // timer can run during this interval, so it cannot observe task idleness.
+    std::thread::sleep(RUNTIME_STALL);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let post_stall_poll = std::future::poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx))).await;
+    assert!(
+        matches!(post_stall_poll, Poll::Ready(Err(FlapjackError::WriteAckTimeout))),
+        "a stalled runtime must not stretch the configured durable timeout, got {post_stall_poll:?}"
     );
 }
 
@@ -2605,11 +2649,24 @@ async fn write_path_exit_gate_on_local_standard_specimen() {
     manager.invalidate_settings_cache(tenant_id);
     install_stage_5_geo_rule(&manager, tenant_id);
 
-    for document in stage_5_corpus(DOCUMENT_COUNT) {
-        manager
+    // A bare durable-ack failure here cannot be told apart from a slow host, so
+    // record which write stalled and for how long against the rest of the run.
+    let mut write_durations = Vec::with_capacity(DOCUMENT_COUNT);
+    for (write_index, document) in stage_5_corpus(DOCUMENT_COUNT).into_iter().enumerate() {
+        let started_at = std::time::Instant::now();
+        let outcome = manager
             .add_documents_durable(tenant_id, vec![document])
-            .await
-            .expect("every acknowledged Stage 7 write must commit durably");
+            .await;
+        write_durations.push(started_at.elapsed());
+        if let Err(error) = outcome {
+            panic!(
+                "every acknowledged Stage 7 write must commit durably; \
+                 write {write_index} of {DOCUMENT_COUNT} failed with {error:?} after {:?}, \
+                 slowest preceding write {:?}",
+                write_durations[write_index],
+                write_durations[..write_index].iter().max()
+            );
+        }
     }
     assert!(
         crate::index::write_queue::admission::WriteAdmissionStore::open(tmp.path(), tenant_id)
@@ -2680,6 +2737,38 @@ async fn write_path_exit_gate_on_local_standard_specimen() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn explicit_timeout_write_queue_helper_uses_durable_admission_store() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let tenant_id = "write_queue_helper_durable_store";
+    let manager = crate::index::manager::IndexManager::new(tmp.path());
+    manager.create_tenant(tenant_id).unwrap();
+    let durable_append_seen = Arc::new(AtomicBool::new(false));
+    manager
+        .set_write_admission_after_stage_hook_for_test(tenant_id, {
+            let durable_append_seen = Arc::clone(&durable_append_seen);
+            move || durable_append_seen.store(true, Ordering::Release)
+        })
+        .unwrap();
+
+    add_documents_and_wait_for_test(
+        &manager,
+        tenant_id,
+        vec![text_document(
+            "durable_append_doc",
+            "name",
+            "durable admission must be used",
+        )],
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        durable_append_seen.load(Ordering::Acquire),
+        "explicit-timeout write-queue helper must route through durable admission append"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn count_latency_stays_under_gate_during_writes() {
     const BULK_DOCUMENT_COUNT: usize = 4_000;
     const COUNT_LATENCY_GATE: Duration = Duration::from_millis(250);
@@ -2687,13 +2776,13 @@ async fn count_latency_stays_under_gate_during_writes() {
     let tenant_id = "stage7_count_latency";
     let manager = crate::index::manager::IndexManager::new(tmp.path());
     manager.create_tenant(tenant_id).unwrap();
-    manager
-        .add_documents_durable(
-            tenant_id,
-            vec![text_document("count_seed", "name", "count latency seed")],
-        )
-        .await
-        .unwrap();
+    add_documents_and_wait_for_test(
+        &manager,
+        tenant_id,
+        vec![text_document("count_seed", "name", "count latency seed")],
+    )
+    .await
+    .unwrap();
     assert_eq!(manager.tenant_doc_count(tenant_id), Some(1));
 
     let samples = Arc::new(Mutex::new(Vec::<(u64, Duration)>::new()));
@@ -2725,8 +2814,7 @@ async fn count_latency_stays_under_gate_during_writes() {
             )
         })
         .collect();
-    manager
-        .add_documents_durable(tenant_id, documents)
+    add_documents_and_wait_for_test(&manager, tenant_id, documents)
         .await
         .expect("bulk write must commit");
     let expected_final_count = BULK_DOCUMENT_COUNT as u64 + 1;
@@ -3229,21 +3317,6 @@ async fn merge_owner_survives_consecutive_commits() {
         wait_for_task_success(tasks.as_ref(), &task_id).await;
     }
 
-    let converged = tokio::time::timeout(WRITE_QUEUE_PROGRESS_TIMEOUT, async {
-        loop {
-            let observation = observed_segments(index.as_ref());
-            if observation.live_docs == 2
-                && observation.live_segment_count == 1
-                && observation.orphan_file_set_ids.is_empty()
-            {
-                return observation;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("worker-owned merge owner should converge consecutive commits before shutdown");
-
     assert_eq!(
         write_queue_counter_value(WRITE_QUEUE_WRITER_OPENS_METRIC_NAME, &tenant_id),
         1,
@@ -3253,13 +3326,35 @@ async fn merge_owner_survives_consecutive_commits() {
         write_queue_counter_value(WRITE_QUEUE_COMMITS_METRIC_NAME, &tenant_id) >= 2,
         "tenant worker should record at least two successful commits"
     );
+
+    drop(tx);
+    tokio::time::timeout(WRITE_QUEUE_PROGRESS_TIMEOUT, handle)
+        .await
+        .expect("worker should finish channel-closed merge quiescence before timeout")
+        .expect("write queue worker task should join successfully")
+        .expect("write queue worker should shut down successfully");
+
+    let lifecycle_events = writer_lifecycle::writer_lifecycle_test_events(&tenant_id);
+    assert!(
+        lifecycle_events
+            .iter()
+            .any(|event| event.reason == "channel_closed" && event.phase == "merge_quiesced"),
+        "worker shutdown should retain channel-closed merge quiescence before segment census; got {lifecycle_events:?}"
+    );
+
+    let converged = observed_segments(index.as_ref());
+    assert_eq!(
+        converged.live_docs, 2,
+        "converged index should retain both committed docs; got {converged:?}"
+    );
+    assert_eq!(
+        converged.live_segment_count, 1,
+        "converged index should have exactly one live segment after worker-owned merge quiescence; got {converged:?}"
+    );
     assert!(
         converged.orphan_file_set_ids.is_empty(),
         "converged index should not leave orphan file sets; got {converged:?}"
     );
-
-    drop(tx);
-    handle.await.unwrap().unwrap();
 }
 
 #[test]

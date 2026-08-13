@@ -117,8 +117,11 @@ fn fixed_path_acl(method: &Method, path: &str) -> Option<RouteAcl> {
     if path.starts_with("/2/") {
         return Some(RouteAcl::Required("analytics"));
     }
-    if path == "/1/events" || path == "/1/events/debug" {
+    if path == "/1/events" {
         return Some(RouteAcl::Required("search"));
+    }
+    if path == "/1/events/debug" {
+        return Some(RouteAcl::Required("analytics"));
     }
     if *method == Method::DELETE && path.starts_with("/1/usertokens/") {
         return Some(RouteAcl::Required("deleteObject"));

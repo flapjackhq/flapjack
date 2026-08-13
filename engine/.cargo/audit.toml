@@ -16,8 +16,12 @@
 # REMOVE when a rust-s3 release depends on quick-xml >=0.41:
 # check https://crates.io/crates/rust-s3 then `cargo update rust-s3`.
 # Tracked in ROADMAP.md (RUSTSEC quick-xml row).
+# RUSTSEC-2026-0253 is separately bounded to Tantivy's sole
+# LruCache<usize, Block>: the advisory requires a key with a panicking Drop,
+# which usize cannot provide. Remove it when Tantivy permits lru >=0.18.2.
 [advisories]
 ignore = [
     "RUSTSEC-2026-0194", # quick-xml: quadratic runtime on duplicate attribute names
     "RUSTSEC-2026-0195", # quick-xml: NsReader unbounded namespace allocation
+    "RUSTSEC-2026-0253", # 2026-08-12: Tantivy's usize-keyed cache cannot trigger lru's panicking-Drop precondition
 ]

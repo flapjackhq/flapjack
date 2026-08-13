@@ -522,6 +522,74 @@ assert_mutation_rejected() {
   if grep -Eq 'command not found|No such file or directory|syntax error|invalid JSON text passed' "$output"; then
     die "ORACLE_INCIDENTAL_FAILURE: $scenario failed outside its intended assertion"
   fi
+  assert_rejection_stopped_at_its_guard "$scenario" "$responses" "$output"
+}
+
+# Exit status plus expected text only proves the oracle failed with the right
+# words. These trace assertions prove *where* it stopped: a guard that fires
+# after the source was already re-read, mutated, or receipted is a guard that
+# fired too late to protect anything.
+assert_rejection_stopped_at_its_guard() {
+  local scenario="$1" responses="$2" output="$3"
+  case "$scenario" in
+    dropped_stable_id | duplicate_stable_id)
+      assert_stable_id_failure_stops_before_downstream_source_reads "$scenario" "$responses"
+      ;;
+    source_mutation_during_capture)
+      assert_source_mutation_blocks_controlled_mutation "$responses"
+      ;;
+    cleanup_residue)
+      assert_cleanup_residue_blocks_receipt "$responses" "$output"
+      ;;
+  esac
+}
+
+assert_trace_contains_label() {
+  local trace="$1" label="$2"
+  jq -s -e --arg label "$label" 'any(.[]; .label == $label)' "$trace" >/dev/null \
+    || die "ORACLE_NOT_LOAD_BEARING: trace never reached $label"
+}
+
+assert_trace_omits_label() {
+  local trace="$1" label="$2"
+  jq -s -e --arg label "$label" 'all(.[]; .label != $label)' "$trace" >/dev/null \
+    || die "ORACLE_NOT_LOAD_BEARING: trace continued into $label"
+}
+
+assert_stable_id_failure_stops_before_downstream_source_reads() {
+  local scenario="$1" responses="$2" trace="$responses/request_trace.jsonl"
+  assert_trace_contains_label "$trace" configured_page_0
+  assert_trace_contains_label "$trace" configured_page_1
+  assert_trace_omits_label "$trace" inferred_page_0
+  assert_trace_omits_label "$trace" settings
+  assert_trace_omits_label "$trace" configured_index_before
+  assert_trace_omits_label "$trace" mutation_task_poll_0
+  assert_trace_omits_label "$trace" configured_after_page_0
+  printf 'ASSERT %s stopped before downstream source reads\n' "$scenario"
+}
+
+assert_source_mutation_blocks_controlled_mutation() {
+  local responses="$1" trace="$responses/request_trace.jsonl"
+  assert_trace_contains_label "$trace" configured_index_before
+  assert_trace_contains_label "$trace" stats_before
+  assert_trace_contains_label "$trace" tasks_before
+  assert_trace_contains_label "$trace" configured_index_capture_after
+  assert_trace_contains_label "$trace" stats_capture_after
+  assert_trace_contains_label "$trace" tasks_capture_after
+  assert_trace_omits_label "$trace" mutation_task_poll_0
+  assert_trace_omits_label "$trace" configured_after_page_0
+  assert_trace_omits_label "$trace" stats_after
+  printf 'ASSERT source mutation blocked controlled mutation\n'
+}
+
+assert_cleanup_residue_blocks_receipt() {
+  local responses="$1" output="$2"
+  jq -e 'any(.[]; . == true)' "$responses/cleanup_state.json" >/dev/null \
+    || die "ORACLE_NOT_LOAD_BEARING: cleanup_residue did not seed residue"
+  if tail -1 "$output" | jq -e '.result == "PASS"' >/dev/null 2>&1; then
+    die "ORACLE_NOT_LOAD_BEARING: cleanup residue still emitted a PASS receipt"
+  fi
+  printf 'ASSERT cleanup residue blocked PASS receipt\n'
 }
 
 write_preflight_tool_shim() {
@@ -760,17 +828,21 @@ exit 7'
 }
 
 assert_preview_probe_contract() {
-  local scenario="$1" case_dir tool_dir output harness expected_records shim_mode status
+  local scenario="$1" case_dir tool_dir output harness expected_records shim_mode status fake_engine
   case_dir="$TMP_DIR/$scenario"
   tool_dir="$case_dir/tools"
   output="$case_dir/output"
   harness="$case_dir/preview_probe_harness"
+  fake_engine="$case_dir/fake_engine"
   expected_records="$(jq -er '.documents.countAfter' "$FIXTURE_DIR/expected_bundle.json")"
-  mkdir -p "$tool_dir"
+  mkdir -p "$tool_dir" "$fake_engine/target/release"
 
   # Expansions belong to the generated timeout shim, not this process.
   # shellcheck disable=SC2016
   write_preflight_tool_shim "$tool_dir" timeout '
+if [[ "${1:-} ${2:-} ${3:-}" == "1800 cargo build" ]]; then
+  exit 0
+fi
 [[ "${1:-}" == "600" && "${2:-}" == "cargo" ]] || exit 8
 case "${PREVIEW_SHIM_MODE:?}" in
   success)
@@ -792,15 +864,72 @@ case "${PREVIEW_SHIM_MODE:?}" in
   *) exit 10 ;;
 esac'
 
+  # shellcheck disable=SC2016
+  write_preflight_tool_shim "$tool_dir" curl '
+out=""
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    -o)
+      out="${2:?}"
+      shift 2
+      ;;
+    -w)
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+[[ -n "$out" ]] || exit 11
+printf "%s\n" "{\"status\":\"ok\"}" >"$out"
+printf "%s" "200"'
+
+  # shellcheck disable=SC2016
+  write_preflight_tool_shim "$fake_engine/target/release" flapjack '
+if [[ "${1:-}" == "--data-dir" ]]; then
+  printf "%s\n" "listening on http://127.0.0.1:18765"
+  while :; do sleep 1; done
+fi
+[[ "${1:-} ${2:-}" == "migrate preview" ]] || exit 12
+[[ "${PREVIEW_SHIM_MODE:?}" != timed_out ]] || exit 124
+records="${PREVIEW_EXPECTED_RECORDS:?}"
+[[ "${PREVIEW_SHIM_MODE:?}" != zero_match ]] || records=0
+if [[ " $* " == *" --json "* ]]; then
+  printf "%s\n" \
+    "{\"sourceCounts\":{\"indexes\":1,\"records\":${records}},\"report\":{\"entries\":[{\"severity\":\"HardRejection\"},{\"severity\":\"Warning\"}],\"summary\":{\"totalEntries\":2,\"hardRejections\":1,\"warnings\":1,\"scopeGaps\":0}}}"
+else
+  printf "%s\n" \
+    "source_indexes=1" \
+    "source_records=${records}" \
+    "severity=HardRejection" \
+    "severity=Warning"
+fi
+exit 9'
+
   cat >"$harness" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 source "${PREVIEW_RUNNER:?}"
 MODE=preview_live
 EXPECTED="${PREVIEW_EXPECTED_FIXTURE:?}"
+TEMP_DIR="${PREVIEW_TEMP_DIR:?}"
+ENGINE_DIR="${PREVIEW_FAKE_ENGINE_DIR:?}"
+mkdir -p "$TEMP_DIR"
 BASE_URL="http://127.0.0.1:7700"
 MASTER_KEY="preview-contract-key"
+cleanup_preview_harness() {
+  local status=$?
+  trap - EXIT
+  if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
+    kill "$SERVER_PID" >/dev/null 2>&1 || true
+    wait "$SERVER_PID" >/dev/null 2>&1 || true
+  fi
+  exit "$status"
+}
+trap cleanup_preview_harness EXIT
 run_preview_probe
+printf "%s\n" "$PREVIEW_PROBE_RECEIPT"
 EOF
   chmod +x "$harness"
 
@@ -816,7 +945,10 @@ EOF
     PREVIEW_RUNNER="$RUNNER" \
     PREVIEW_EXPECTED_FIXTURE="$FIXTURE_DIR/expected_bundle.json" \
     PREVIEW_EXPECTED_RECORDS="$expected_records" \
+    PREVIEW_TEMP_DIR="$case_dir/preview_tmp" \
+    PREVIEW_FAKE_ENGINE_DIR="$fake_engine" \
     PREVIEW_SHIM_MODE="$shim_mode" \
+    FJ_MEILISEARCH_PREVIEW_EXPECTED_RECORDS="$expected_records" \
     bash "$harness" >"$output" 2>&1
   status=$?
   set -e
@@ -831,13 +963,13 @@ EOF
     preview_zero_match)
       [[ "$status" -ne 0 ]] \
         || die "ORACLE_NOT_LOAD_BEARING: zero-match preview probe remained green"
-      grep -Fq 'preview probe did not execute exactly one passing test' "$output" \
+      grep -Fq 'JSON CLI preview report mismatch' "$output" \
         || die "ORACLE_WRONG_FAILURE: zero-match guard did not own the failure"
       ;;
     preview_timeout)
       [[ "$status" -ne 0 ]] \
         || die "ORACLE_NOT_LOAD_BEARING: timed-out preview probe remained green"
-      grep -Fq 'preview probe timed out after 600 seconds' "$output" \
+      grep -Fq 'human CLI preview exit mismatch: 124' "$output" \
         || die "ORACLE_WRONG_FAILURE: timeout guard did not own the failure"
       ;;
   esac

@@ -32,6 +32,11 @@ interface ResolveAdminKeyOptions {
 
 export interface LocalInstanceConfig {
   host: string;
+  /**
+   * Backend target host the dashboard/Playwright layer connects to. Distinct from
+   * `host`, which stays the dashboard/Vite bind host that builds `dashboardBaseUrl`.
+   */
+  backendHost: string;
   backendPort: number;
   dashboardPort: number;
   adminKey: string;
@@ -167,6 +172,14 @@ function parseHttpOrigin(raw: string | undefined): string | null {
   }
 }
 
+/** Wraps a bare IPv6 host in brackets so it is safe to embed in a URL authority. */
+function bracketIpv6Host(host: string): string {
+  if (host.includes(':') && !host.startsWith('[') && !host.endsWith(']')) {
+    return `[${host}]`;
+  }
+  return host;
+}
+
 /** Builds an `http://host:port` origin string, with optional browser-safe bind-address substitution. */
 function formatHttpOrigin(
   host: string,
@@ -184,11 +197,7 @@ function formatHttpOrigin(
     }
   }
 
-  if (urlHost.includes(':') && !urlHost.startsWith('[') && !urlHost.endsWith(']')) {
-    urlHost = `[${urlHost}]`;
-  }
-
-  return `http://${urlHost}:${port}`;
+  return `http://${bracketIpv6Host(urlHost)}:${port}`;
 }
 
 function pickConfiguredValue(...values: Array<string | undefined>): string | undefined {
@@ -511,22 +520,63 @@ export function findLoopbackProcessAdminKey(
   return undefined;
 }
 
-export function getLocalInstanceConfig(): LocalInstanceConfig {
-  const { fileValues, loadedFromFile } = readLocalConfigValues();
-  const host = pickConfiguredValue(fileValues.FJ_HOST, process.env.FJ_HOST) || DEFAULTS.host;
+/**
+ * TODO: Document getLocalInstanceConfig.
+ */
+interface BackendEndpoint {
+  backendBaseUrl: string;
+  backendHost: string;
+  backendPort: number;
+}
+
+/**
+ * Resolves the effective backend endpoint exactly once so its URL, host, and port
+ * cannot disagree. A valid `FLAPJACK_BACKEND_URL` (file-first, env-second) owns all
+ * three halves; otherwise the endpoint falls back to the dashboard-bind `host` plus
+ * the configured `FJ_BACKEND_PORT`.
+ */
+function resolveBackendEndpoint(
+  fileValues: Record<string, string>,
+  host: string,
+): BackendEndpoint {
+  const selectedUrl = [
+    fileValues.FLAPJACK_BACKEND_URL,
+    process.env.FLAPJACK_BACKEND_URL,
+  ].find((value) => parseHttpOrigin(value) !== null);
+  const backendBaseUrl = parseHttpOrigin(selectedUrl);
+  if (backendBaseUrl !== null) {
+    // `selectedUrl` is guaranteed parseable here — parseHttpOrigin returned non-null.
+    const parsed = new URL(selectedUrl as string);
+    return {
+      backendBaseUrl,
+      backendHost: bracketIpv6Host(parsed.hostname),
+      backendPort: parsed.port
+        ? Number(parsed.port)
+        : (parsed.protocol === 'https:' ? 443 : 80),
+    };
+  }
   const backendPort = resolveConfiguredPort(
     DEFAULTS.backendPort,
     fileValues.FJ_BACKEND_PORT,
     process.env.FJ_BACKEND_PORT,
   );
+  return {
+    backendBaseUrl: formatHttpOrigin(host, backendPort),
+    backendHost: host,
+    backendPort,
+  };
+}
+
+export function getLocalInstanceConfig(): LocalInstanceConfig {
+  const { fileValues, loadedFromFile } = readLocalConfigValues();
+  const host = pickConfiguredValue(fileValues.FJ_HOST, process.env.FJ_HOST) || DEFAULTS.host;
   const dashboardPort = resolveConfiguredPort(
     DEFAULTS.dashboardPort,
     fileValues.FJ_DASHBOARD_PORT,
     process.env.FJ_DASHBOARD_PORT,
     process.env.FLAPJACK_DASHBOARD_PORT,
   );
-  const backendBaseUrl =
-    parseHttpOrigin(process.env.FLAPJACK_BACKEND_URL) || formatHttpOrigin(host, backendPort);
+  const { backendBaseUrl, backendHost, backendPort } = resolveBackendEndpoint(fileValues, host);
   // Only reuse the runtime server admin key for loopback backends. Remote
   // dashboard targets must opt in with FJ_TEST_ADMIN_KEY so a local secret
   // is never sent to an arbitrary non-local URL by default.
@@ -544,6 +594,7 @@ export function getLocalInstanceConfig(): LocalInstanceConfig {
 
   return {
     host,
+    backendHost,
     backendPort,
     dashboardPort,
     adminKey,

@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+#
+# Refuse an irreversible release unless ordinary push CI for the exact target
+# SHA is terminal success, or the resolved failed run is explicitly and safely
+# acknowledged.
+#
+# Usage:
+#   package/release_ci_status_preflight \
+#     <repository> <target-sha> <ci-workflow-file> <acknowledged-run-id>
+#
+# Pass an empty string for <acknowledged-run-id> in the ordinary success case.
+# The helper only reads GitHub Actions state. It never dispatches a workflow,
+# changes a run, publishes an artifact, or prints authentication material.
+#
+# Exit codes are distinct so release.yml can distinguish bad wiring, an
+# indeterminate API read, and a known CI verdict that refuses release:
+#   0  release CI requirement satisfied
+#   1  usage error
+#   2  could not determine CI status from GitHub
+#   3  CI status is known and does not authorize release
+
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  package/release_ci_status_preflight <repository> <target-sha> <ci-workflow-file> <acknowledged-run-id>
+
+Requires the exact target SHA's ordinary push CI run to be terminal success.
+Pass an empty string for <acknowledged-run-id> unless acknowledging the exact
+resolved push run after a verified terminal failure.
+EOF
+}
+
+fail_with() {
+  local code="$1"
+  shift
+  printf 'release_ci_status_preflight: %s\n' "$*" >&2
+  exit "$code"
+}
+
+parse_run_fields() {
+  local response="$1"
+  local response_shape="$2"
+
+  printf '%s' "$response" | python3 -c '
+import json
+import sys
+
+response_shape = sys.argv[1]
+try:
+    response = json.load(sys.stdin)
+except (TypeError, ValueError):
+    raise SystemExit(1)
+
+if response_shape == "list":
+    if not isinstance(response, list):
+        raise SystemExit(1)
+    if not response:
+        print("MISSING")
+        raise SystemExit(0)
+    run = response[0]
+elif response_shape == "object":
+    run = response
+else:
+    raise SystemExit(1)
+
+required = ("databaseId", "headSha", "event", "status", "conclusion")
+if not isinstance(run, dict) or any(key not in run for key in required):
+    raise SystemExit(1)
+
+values = [run[key] if run[key] is not None else "" for key in required]
+if not isinstance(values[0], int) or any(not isinstance(value, str) for value in values[1:]):
+    raise SystemExit(1)
+print("\t".join(str(value) for value in values))
+' "$response_shape"
+}
+
+if [ "$#" -ne 4 ]; then
+  usage
+  fail_with 1 "expected exactly four arguments"
+fi
+
+repository="$1"
+target_sha="$2"
+workflow_file="$3"
+acknowledged_run_id="$4"
+
+[ -n "$repository" ] || fail_with 1 "repository is empty"
+[ -n "$target_sha" ] || fail_with 1 "target SHA is empty"
+[ -n "$workflow_file" ] || fail_with 1 "CI workflow file is empty"
+[[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] || fail_with 1 "target SHA must be exactly 40 lowercase hexadecimal characters"
+[ -z "$acknowledged_run_id" ] || [[ "$acknowledged_run_id" =~ ^[0-9]+$ ]] || \
+  fail_with 1 "acknowledged run id must be decimal digits"
+
+# `--event push` is load-bearing: workflow_dispatch and other events can run the
+# same workflow at the same SHA, but they are not the ordinary integration run
+# whose terminal result authorizes a release.
+if ! runs_json="$(gh run list \
+  --repo "$repository" \
+  --workflow "$workflow_file" \
+  --commit "$target_sha" \
+  --event push \
+  --limit 1 \
+  --json databaseId,headSha,event,status,conclusion)"; then
+  fail_with 2 "could not determine CI status: GitHub could not list push runs for ${workflow_file} at ${target_sha} in ${repository}"
+fi
+
+if ! run_fields="$(parse_run_fields "$runs_json" "list")"; then
+  fail_with 2 "could not determine CI status: GitHub returned an invalid push-run response for ${target_sha}"
+fi
+
+if [ "$run_fields" = "MISSING" ]; then
+  fail_with 3 "CI status is not success: no push CI run found for ${workflow_file} at ${target_sha} in ${repository}"
+fi
+
+IFS=$'\t' read -r resolved_run_id resolved_head_sha resolved_event resolved_status resolved_conclusion <<<"$run_fields"
+resolved_run_state="resolved run ${resolved_run_id} has status ${resolved_status:-unknown} and conclusion ${resolved_conclusion:-none}"
+
+if [ "$resolved_head_sha" != "$target_sha" ] || [ "$resolved_event" != "push" ]; then
+  fail_with 2 "could not determine CI status: ${resolved_run_state} but did not match the requested SHA and push event"
+fi
+
+if [ "$resolved_status" = "completed" ] && [ "$resolved_conclusion" = "success" ]; then
+  printf 'release_ci_status_preflight: push CI run %s is terminal success for %s\n' "$resolved_run_id" "$target_sha"
+  exit 0
+fi
+
+# Acknowledgement is evaluated only after the resolved run has failed the
+# ordinary success requirement. It is deliberately narrow:
+#
+# 1. `gh run view --repo` proves the acknowledged id is a live run in this same
+#    repository; the returned id must also equal the requested id.
+# 2. Its head SHA must equal the release target SHA.
+# 3. Its live conclusion must be exactly `failure` (and therefore terminal).
+# 4. Its id must be the exact push-event run resolved above. Matching head SHA
+#    alone is not sufficient because different workflows can share a SHA.
+if [ -n "$acknowledged_run_id" ]; then
+  if ! acknowledged_run_json="$(gh run view "$acknowledged_run_id" \
+    --repo "$repository" \
+    --json databaseId,headSha,event,status,conclusion)"; then
+    fail_with 2 "could not determine CI status: ${resolved_run_state}; acknowledged run ${acknowledged_run_id} could not be verified in ${repository}"
+  fi
+
+  if ! acknowledged_fields="$(parse_run_fields "$acknowledged_run_json" "object")"; then
+    fail_with 2 "could not determine CI status: ${resolved_run_state}; GitHub returned an invalid response for acknowledged run ${acknowledged_run_id}"
+  fi
+
+  IFS=$'\t' read -r live_acknowledged_id acknowledged_head_sha acknowledged_event acknowledged_status acknowledged_conclusion <<<"$acknowledged_fields"
+
+  [ "$live_acknowledged_id" = "$acknowledged_run_id" ] || \
+    fail_with 3 "CI status is not success: ${resolved_run_state}; acknowledged run id ${acknowledged_run_id} resolved as ${live_acknowledged_id}"
+  [ "$acknowledged_head_sha" = "$target_sha" ] || \
+    fail_with 3 "CI status is not success: ${resolved_run_state}; acknowledged run ${acknowledged_run_id} has head SHA ${acknowledged_head_sha}, not ${target_sha}"
+  [ "$acknowledged_status" = "completed" ] && [ "$acknowledged_conclusion" = "failure" ] || \
+    fail_with 3 "CI status is not success: ${resolved_run_state}; acknowledged run ${acknowledged_run_id} has status ${acknowledged_status:-unknown} and conclusion ${acknowledged_conclusion:-none}, not terminal failure"
+  [ "$live_acknowledged_id" = "$resolved_run_id" ] && [ "$acknowledged_event" = "push" ] || \
+    fail_with 3 "CI status is not success: ${resolved_run_state}; acknowledged run ${acknowledged_run_id} is not resolved push CI run ${resolved_run_id}"
+
+  if ! failing_jobs="$(gh api --paginate \
+    "repos/${repository}/actions/runs/${acknowledged_run_id}/jobs?per_page=100" \
+    --jq '.jobs[] | select(.conclusion == "failure") | .name')"; then
+    fail_with 2 "could not determine CI status: ${resolved_run_state}; failing jobs for acknowledged run ${acknowledged_run_id} could not be read"
+  fi
+  [ -n "$failing_jobs" ] || \
+    fail_with 2 "could not determine CI status: ${resolved_run_state}; acknowledged run ${acknowledged_run_id} reported failure but no failing job names"
+
+  printf 'release_ci_status_preflight: acknowledged terminal failure in resolved push run %s; failing jobs:\n' "$resolved_run_id"
+  while IFS= read -r failing_job; do
+    printf '  - %s\n' "$failing_job"
+  done <<<"$failing_jobs"
+  exit 0
+fi
+
+# Refusal remains the default for every unhandled or unexpected state.
+fail_with 3 "CI status is not success: ${resolved_run_state}"

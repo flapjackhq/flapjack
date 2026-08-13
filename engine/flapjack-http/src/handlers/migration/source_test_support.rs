@@ -140,7 +140,7 @@ pub(super) struct ScriptedTypesenseSource {
     observations: VecDeque<TypesenseSourceObservation>,
     settings: VecDeque<Value>,
     document_passes: VecDeque<Vec<Vec<Value>>>,
-    access_error: Option<TypesenseClientError>,
+    document_access_error: Option<TypesenseClientError>,
 }
 
 impl ScriptedTypesenseSource {
@@ -153,12 +153,12 @@ impl ScriptedTypesenseSource {
             observations: VecDeque::from(vec![observation.clone(); document_passes.len() + 1]),
             settings: VecDeque::from(vec![settings; document_passes.len()]),
             document_passes: VecDeque::from(document_passes),
-            access_error: None,
+            document_access_error: None,
         }
     }
 
-    pub(super) fn with_access_error(mut self, error: TypesenseClientError) -> Self {
-        self.access_error = Some(error);
+    pub(super) fn with_document_access_error(mut self, error: TypesenseClientError) -> Self {
+        self.document_access_error = Some(error);
         self
     }
 
@@ -188,16 +188,14 @@ impl TypesenseExportSource for ScriptedTypesenseSource {
         })
     }
 
-    fn require_read_access(&mut self) -> TypesenseSourceFuture<'_, ()> {
-        let error = self.access_error.clone();
-        Box::pin(async move { error.map_or(Ok(()), Err) })
-    }
-
     fn read_document_pages<'a>(
         &'a mut self,
         consume_page: &'a mut TypesensePageConsumer<'a>,
     ) -> TypesenseSourceFuture<'a, TypesenseSourceObservation> {
         Box::pin(async move {
+            if let Some(error) = self.document_access_error.clone() {
+                return Err(error);
+            }
             let pages = self
                 .document_passes
                 .pop_front()

@@ -22,19 +22,12 @@ SOURCE_READER="$ENGINE_DIR/flapjack-http/src/handlers/migration/source_reader.rs
 ROUTER_SOURCE="$ENGINE_DIR/flapjack-http/src/router.rs"
 TYPESENSE_FIXTURE="$ENGINE_DIR/tests/fixtures/2026_07_26_m0b_typesense_migration/expected_bundle.json"
 
+# shellcheck source=lib/source_provider_fixtures.sh
+source "$SCRIPT_DIR/lib/source_provider_fixtures.sh"
+
 readonly PROBE_ADMIN_KEY="source-migration-provider-parity-admin-key"
 readonly PROBE_APPLICATION_ID="source-migration-provider-parity-app"
 readonly UNKNOWN_JOB_ID="01890f8e-8b28-78e8-b542-8cfdcb2d4f24"
-readonly MEILI_IMAGE="getmeili/meilisearch@sha256:9694a59df43ee3f54b3fda9c5de381a3ee9852678e3e31cadf37d6bddea7fc1b"
-readonly TYPESENSE_IMAGE_REF="typesense/typesense:30.2"
-readonly TYPESENSE_IMAGE_DIGEST="sha256:610f2d34b1f93d00762869da2c67736775e5798d19a2c8b91b014b8a0cc1e110"
-readonly TYPESENSE_IMAGE="${TYPESENSE_IMAGE_REF}@${TYPESENSE_IMAGE_DIGEST}"
-readonly MEILI_KEY="source-migration-provider-parity-meili-key"
-readonly TYPESENSE_KEY="source-migration-provider-parity-typesense-key"
-readonly TYPESENSE_PRODUCTS="fj_ts_migration_products"
-readonly TYPESENSE_CATEGORIES="fj_ts_migration_categories"
-readonly TYPESENSE_SYNONYM_SET="fj_ts_migration_synonyms"
-readonly TYPESENSE_CURATION_SET="fj_ts_migration_curations"
 
 BIN=""
 TMP=""
@@ -49,6 +42,8 @@ TYPESENSE_PORT=""
 BASE=""
 CHECKS_FAILED=0
 CLEANUP_FAILED=0
+CLEANUP_FAILURE_OVERRIDES_EXIT="${CLEANUP_FAILURE_OVERRIDES_EXIT:-0}"
+EXTRA_OWNED_PIDS=()
 
 die_indeterminate() {
   printf 'SOURCE_MIGRATION_HTTP_PROBE=INDETERMINATE reason=%s\n' "$1" >&2
@@ -124,50 +119,52 @@ terminate_owned_pid() {
   return 0
 }
 
-container_exists() {
-  local name="$1"
-  docker ps -a --filter "name=^/${name}$" --format '{{.Names}}' 2>/dev/null | grep -Fxq "$name"
-}
-
-remove_owned_container() {
-  local label="$1" name="$2"
-  [ -n "$name" ] || return 0
-  if container_exists "$name"; then
-    if ! docker rm -f "$name" >/dev/null 2>&1; then
-      mark_cleanup_failure "${label}_container_rm_failed name=${name}"
-      return 0
-    fi
+cleanup_source_provider_container() {
+  local provider="$1" container="$2" fixture_dir="$3"
+  [ -n "$container" ] || return 0
+  if ! source_provider_owned_container_exists "$provider" "$container"; then
+    return 0
   fi
-  if container_exists "$name"; then
-    mark_cleanup_failure "${label}_container_residue name=${name}"
+  if [ "$provider" = typesense ] && [ -n "$fixture_dir" ]; then
+    repair_typesense_data_permissions "$container" "$fixture_dir" || return 0
+    ensure_stopped_typesense_data_host_removable "$container" "$fixture_dir" || return 0
   fi
-  return 0
+  remove_owned_container "$provider" "$container" || return 0
 }
 
 cleanup() {
   local script_exit_code=$?
+  local owned_pid_entry owned_pid_label owned_pid
   if { [ "$CHECKS_FAILED" -gt 0 ] || [ "$script_exit_code" -ne 0 ]; } && [ -n "$TMP" ]; then
     [ -z "$MEILI_CONTAINER" ] || docker logs "$MEILI_CONTAINER" >"$TMP/meilisearch.log" 2>&1 || true
     [ -z "$TYPESENSE_CONTAINER" ] || docker logs "$TYPESENSE_CONTAINER" >"$TMP/typesense.log" 2>&1 || true
   fi
   terminate_owned_pid flapjack_server "$SERVER_PID"
   terminate_owned_pid algolia_stub "$ALGOLIA_STUB_PID"
-  remove_owned_container meilisearch "$MEILI_CONTAINER"
-  remove_owned_container typesense "$TYPESENSE_CONTAINER"
+  for owned_pid_entry in ${EXTRA_OWNED_PIDS[@]+"${EXTRA_OWNED_PIDS[@]}"}; do
+    owned_pid_label="${owned_pid_entry%%:*}"
+    owned_pid="${owned_pid_entry#*:}"
+    terminate_owned_pid "$owned_pid_label" "$owned_pid"
+  done
+  cleanup_source_provider_container meilisearch "$MEILI_CONTAINER" "$TMP"
+  cleanup_source_provider_container typesense "$TYPESENSE_CONTAINER" "$TMP"
   if [ -n "$TMP" ] && [ -d "$TMP" ]; then
     if [ "$CHECKS_FAILED" -gt 0 ] || [ "$script_exit_code" -ne 0 ] || [ "$CLEANUP_FAILED" -ne 0 ]; then
       printf 'INFO: preserved source migration provider parity evidence at %s\n' "$TMP" >&2
     else
-      rm -rf "$TMP"
+      if ! rm -rf "$TMP"; then
+        mark_cleanup_failure "source_migration_fixture_dir_rm_failed dir=${TMP}"
+      fi
+      if [ -d "$TMP" ]; then
+        mark_cleanup_failure "source_migration_fixture_dir_residue dir=${TMP}"
+      fi
     fi
   fi
-  if [ "$CLEANUP_FAILED" -ne 0 ] && [ "$script_exit_code" -eq 0 ]; then
+  if [ "$CLEANUP_FAILED" -ne 0 ] && { [ "$script_exit_code" -eq 0 ] || [ "$CLEANUP_FAILURE_OVERRIDES_EXIT" -eq 1 ]; }; then
     exit 2
   fi
   exit "$script_exit_code"
 }
-trap cleanup EXIT
-
 require_tools() {
   local tool missing=0
   for tool in awk cargo curl docker grep jq mktemp perl ps python3 sed tail; do
@@ -181,21 +178,6 @@ require_tools() {
   [ -f "$SOURCE_READER" ] || die_indeterminate 'source_reader_missing'
   [ -f "$ROUTER_SOURCE" ] || die_indeterminate 'router_source_missing'
   [ -f "$TYPESENSE_FIXTURE" ] || die_indeterminate 'typesense_fixture_missing'
-}
-
-wait_for_json() {
-  local url="$1" predicate="$2" header_name="${3:-}" header_value="${4:-}" out="$5"
-  local attempt
-  for attempt in $(seq 1 120); do
-    if [ -n "$header_name" ]; then
-      curl -sS --connect-timeout 1 --max-time 2 -H "$header_name: $header_value" "$url" >"$out" 2>/dev/null || true
-    else
-      curl -sS --connect-timeout 1 --max-time 2 "$url" >"$out" 2>/dev/null || true
-    fi
-    jq -e "$predicate" "$out" >/dev/null 2>&1 && return 0
-    sleep 0.25
-  done
-  die_indeterminate "upstream_readiness_failed url=${url}"
 }
 
 start_algolia_stub() {
@@ -235,137 +217,19 @@ PY
   ALGOLIA_STUB_BASE="http://127.0.0.1:${port}"
 }
 
-poll_meili_task() {
-  local task_uid="$1" attempt
-  local out="$TMP/meili_task_${task_uid}.json"
-  for attempt in $(seq 1 120); do
-    curl -sS --connect-timeout 1 --max-time 2 -H "Authorization: Bearer $MEILI_KEY" \
-      "http://127.0.0.1:${MEILI_PORT}/tasks/${task_uid}" >"$out" 2>/dev/null || true
-    jq -e '.status == "succeeded"' "$out" >/dev/null 2>&1 && return 0
-    jq -e '.status == "failed" or .status == "canceled"' "$out" >/dev/null 2>&1 \
-      && die_indeterminate 'meilisearch_seed_task_failed'
-    sleep 0.25
-  done
-  die_indeterminate 'meilisearch_seed_task_timeout'
-}
-
-submit_meilisearch_seed_task() {
-  local label="$1" path="$2" body="$3"
-  local response="$TMP/meili_${label}.json" status curl_exit task_uid
-  set +e
-  status="$(curl -sS --connect-timeout 1 --max-time 10 \
-    -o "$response" -w '%{http_code}' -X POST \
-    -H "Authorization: Bearer $MEILI_KEY" -H 'Content-Type: application/json' \
-    --data "$body" "http://127.0.0.1:${MEILI_PORT}${path}")"
-  curl_exit=$?
-  set -e
-  [ "$curl_exit" -eq 0 ] \
-    || die_indeterminate "meilisearch_${label}_transport_${curl_exit}"
-  [ "$status" = 202 ] || die_indeterminate "meilisearch_${label}_status_${status}"
-  task_uid="$(jq -er '.taskUid | select(type == "number")' "$response" 2>/dev/null || true)"
-  [ -n "$task_uid" ] || die_indeterminate "meilisearch_${label}_task_uid_missing"
-  poll_meili_task "$task_uid"
-}
-
-start_meilisearch() {
-  docker run -d --name "$MEILI_CONTAINER" --publish 127.0.0.1::7700 \
-    -e "MEILI_MASTER_KEY=$MEILI_KEY" -e MEILI_ENV=development "$MEILI_IMAGE" >"$TMP/meili_container_id.txt"
-  MEILI_PORT="$(docker port "$MEILI_CONTAINER" 7700/tcp | awk -F: '/127.0.0.1/ {print $NF; exit}')"
-  [ -n "$MEILI_PORT" ] || die_indeterminate 'meilisearch_port_missing'
-  wait_for_json "http://127.0.0.1:${MEILI_PORT}/health" '.status == "available"' '' '' "$TMP/meili_health.json"
-  submit_meilisearch_seed_task create_index /indexes \
-    '{"uid":"configured_pk","primaryKey":"sku"}'
-  submit_meilisearch_seed_task seed_documents /indexes/configured_pk/documents \
-    '[{"sku":"MEILI-001","title":"Espresso Tamper","price":24.5,"stock":7},{"sku":"MEILI-002","title":"Pour Over Kettle","price":39.75,"stock":3}]'
-  curl -sS -H "Authorization: Bearer $MEILI_KEY" \
-    "http://127.0.0.1:${MEILI_PORT}/indexes" >"$TMP/meili_expected_listing.json"
-}
-
-verify_typesense_image_digest() {
-  if ! docker image inspect "$TYPESENSE_IMAGE" >"$TMP/typesense_image_inspect.json" 2>/dev/null; then
-    docker pull "$TYPESENSE_IMAGE" >"$TMP/typesense_image_pull.txt"
-    docker image inspect "$TYPESENSE_IMAGE" >"$TMP/typesense_image_inspect.json"
-  fi
-  jq -e --arg digest "$TYPESENSE_IMAGE_DIGEST" '
-    .[0].RepoDigests // []
-    | any(endswith("@" + $digest))
-  ' "$TMP/typesense_image_inspect.json" >/dev/null \
-    || die_indeterminate 'typesense_image_digest_mismatch'
-}
-
-typesense_json() {
-  local method="$1" path="$2" body="${3:-}" out="$4" status
-  local args=(-sS -o "$out" -w '%{http_code}' -X "$method" -H "X-TYPESENSE-API-KEY: $TYPESENSE_KEY" -H 'Content-Type: application/json')
-  [ -z "$body" ] || args+=(--data "$body")
-  status="$(curl "${args[@]}" "http://127.0.0.1:${TYPESENSE_PORT}${path}")"
-  [ "$status" = 200 ] || [ "$status" = 201 ] || die_indeterminate "typesense_seed_status_${status}"
-}
-
-seed_typesense_linked_sets_from_fixture() {
-  jq -e --arg name "$TYPESENSE_SYNONYM_SET" '
-    .source.synonym_sets[] | select(.name == $name) | {items}
-  ' "$TYPESENSE_FIXTURE" >"$TMP/typesense_synonym_set.json"
-  typesense_json PUT "/synonym_sets/${TYPESENSE_SYNONYM_SET}" \
-    "$(cat "$TMP/typesense_synonym_set.json")" "$TMP/typesense_create_synonym_set.json"
-
-  jq -e --arg name "$TYPESENSE_CURATION_SET" '
-    .source.curation_sets[] | select(.name == $name) | {items}
-  ' "$TYPESENSE_FIXTURE" >"$TMP/typesense_curation_set.json"
-  typesense_json PUT "/curation_sets/${TYPESENSE_CURATION_SET}" \
-    "$(cat "$TMP/typesense_curation_set.json")" "$TMP/typesense_create_curation_set.json"
-}
-
-seed_typesense_collection_from_fixture() {
-  local collection="$1" index=0 document
-  jq -e --arg name "$collection" '
-    .source.collections[] | select(.name == $name) | del(.documents)
-  ' "$TYPESENSE_FIXTURE" >"$TMP/typesense_schema_${collection}.json"
-  typesense_json POST /collections \
-    "$(cat "$TMP/typesense_schema_${collection}.json")" "$TMP/typesense_create_${collection}.json"
-
-  case "$collection" in
-    "$TYPESENSE_CATEGORIES")
-      jq -cn '{id:"cat_1",name:"Coffee",priority:1,active:true,labels:["coffee"]}' \
-        >"$TMP/typesense_documents_${collection}.jsonl"
-      ;;
-    "$TYPESENSE_PRODUCTS")
-      jq -cn '{id:"prod_1",title:"Espresso",sku:"ESP-001",price:12.5,inventory:8,available:true,tags:["coffee"],category_id:"cat_1"}' \
-        >"$TMP/typesense_documents_${collection}.jsonl"
-      jq -cn '{id:"prod_2",title:"Latte",sku:"LAT-002",price:9.5,inventory:5,available:true,tags:["coffee","milk"],category_id:"cat_1"}' \
-        >>"$TMP/typesense_documents_${collection}.jsonl"
-      ;;
-    *)
-      die_indeterminate "typesense_unknown_fixture_collection_${collection}"
-      ;;
-  esac
-  while IFS= read -r document; do
-    index=$((index + 1))
-    typesense_json POST "/collections/${collection}/documents" "$document" \
-      "$TMP/typesense_seed_${collection}_${index}.json"
-  done <"$TMP/typesense_documents_${collection}.jsonl"
-}
-
-start_typesense() {
-  mkdir -p "$TMP/typesense_data"
-  verify_typesense_image_digest
-  docker run -d --name "$TYPESENSE_CONTAINER" --publish 127.0.0.1::8108 \
-    --volume "$TMP/typesense_data:/data" \
-    "$TYPESENSE_IMAGE" --data-dir=/data --api-key="$TYPESENSE_KEY" >"$TMP/typesense_container_id.txt"
-  TYPESENSE_PORT="$(docker port "$TYPESENSE_CONTAINER" 8108/tcp | awk -F: '/127.0.0.1/ {print $NF; exit}')"
-  [ -n "$TYPESENSE_PORT" ] || die_indeterminate 'typesense_port_missing'
-  wait_for_json "http://127.0.0.1:${TYPESENSE_PORT}/health" '.ok == true' '' '' "$TMP/typesense_health.json"
-  seed_typesense_linked_sets_from_fixture
-  seed_typesense_collection_from_fixture "$TYPESENSE_CATEGORIES"
-  sleep 1
-  seed_typesense_collection_from_fixture "$TYPESENSE_PRODUCTS"
-  curl -sS -H "X-TYPESENSE-API-KEY: $TYPESENSE_KEY" \
-    "http://127.0.0.1:${TYPESENSE_PORT}/collections?exclude_fields=fields" >"$TMP/typesense_expected_listing.json"
-}
-
 start_discovery_upstreams() {
   start_algolia_stub
   start_meilisearch
   start_typesense
+}
+
+configure_source_provider_owner_token() {
+  local token_suffix
+  [ -n "$TMP" ] || die_indeterminate 'source_provider_owner_token_tmp_missing'
+  token_suffix="${TMP##*.}"
+  [ "$token_suffix" != "$TMP" ] || token_suffix="${TMP##*/}"
+  SOURCE_PROVIDER_OWNER_TOKEN="source_migration_provider_parity_$$_${token_suffix}"
+  export SOURCE_PROVIDER_OWNER_TOKEN
 }
 
 target_dir() {
@@ -475,7 +339,8 @@ served_discovery_request() {
     --data "$body" "${BASE}${path}")"
   curl_exit=$?
   set -e
-  [ "$curl_exit" -eq 0 ] || fail_red "served_discovery_transport label=${label} expected=0 actual=${curl_exit}"
+  [ "$curl_exit" -eq 0 ] || die_indeterminate \
+    "served_discovery_transport label=${label} expected=0 actual=${curl_exit}"
   [ "$status" = "$expected_status" ] || fail_red \
     "served_discovery_status label=${label} expected=${expected_status} actual=${status} body=$(jq -c . "$body_file" 2>/dev/null || true)"
 }
@@ -564,6 +429,63 @@ served_search() {
   served_request "$label" POST "/1/indexes/${index_name}/query" "$body" 200
 }
 
+assert_meilisearch_discovery_body() {
+  local body_file="$1" failure="$2"
+  jq -n -e --slurpfile actual "$body_file" \
+    --slurpfile source "$TMP/meili_expected_listing.json" '
+      $source[0].results[0] as $expected |
+      $actual[0].indexes == [{
+        name:$expected.uid, primaryKey:$expected.primaryKey, entries:null,
+        documentCount:2, createdAt:$expected.createdAt,
+        updatedAt:$expected.updatedAt, defaultSortingField:null
+      }] and $actual[0].total == 1 and $actual[0].offset == 0 and $actual[0].limit == 10
+    ' >/dev/null || fail_red "$failure body=$(jq -c . "$body_file" 2>/dev/null || true)"
+}
+
+assert_typesense_discovery_body() {
+  local body_file="$1" failure="$2"
+  jq -n -e --slurpfile actual "$body_file" \
+    --slurpfile source "$TMP/typesense_expected_listing.json" '
+      def expected_summary:
+        {name,primaryKey:null,entries:null,documentCount:.num_documents,
+         createdAt:.created_at,updatedAt:null,
+         defaultSortingField:(.default_sorting_field // null)};
+      ($source[0] | map(expected_summary)) as $expected |
+      ($expected | map(.name)) == ["fj_ts_migration_products","fj_ts_migration_categories"] and
+      $actual[0] == {indexes:$expected}
+    ' >/dev/null || fail_red "$failure body=$(jq -c . "$body_file" 2>/dev/null || true)"
+}
+
+assert_meilisearch_landed_documents() {
+  local body_file="$1" failure="$2"
+  jq -e '
+    .nbHits == 2 and (.hits | length) == 2 and
+    ([.hits[] | {objectID,sku,title,price,stock}] | sort_by(.objectID)) == [
+      {objectID:"MEILI-001",sku:"MEILI-001",title:"Espresso Tamper",price:24.5,stock:7},
+      {objectID:"MEILI-002",sku:"MEILI-002",title:"Pour Over Kettle",price:39.75,stock:3}
+    ]
+  ' "$body_file" >/dev/null || fail_red "$failure body=$(jq -c . "$body_file" 2>/dev/null || true)"
+}
+
+assert_typesense_categories_landed_documents() {
+  local body_file="$1" failure="$2"
+  jq -e '.nbHits == 1 and (.hits | length) == 1 and
+    (.hits[0] | {objectID,id,name,priority,active,labels}) ==
+      {objectID:"cat_1",id:"cat_1",name:"Coffee",priority:1,active:true,labels:["coffee"]}' \
+    "$body_file" >/dev/null || fail_red "$failure body=$(jq -c . "$body_file" 2>/dev/null || true)"
+}
+
+assert_typesense_products_landed_documents() {
+  local body_file="$1" failure="$2"
+  jq -e '
+    .nbHits == 2 and (.hits | length) == 2 and
+    ([.hits[] | {objectID,id,title,sku,price,inventory,available,tags,category_id}] | sort_by(.objectID)) == [
+      {objectID:"prod_1",id:"prod_1",title:"Espresso",sku:"ESP-001",price:12.5,inventory:8,available:true,tags:["coffee"],category_id:"cat_1"},
+      {objectID:"prod_2",id:"prod_2",title:"Latte",sku:"LAT-002",price:9.5,inventory:5,available:true,tags:["coffee","milk"],category_id:"cat_1"}
+    ]
+  ' "$body_file" >/dev/null || fail_red "$failure body=$(jq -c . "$body_file" 2>/dev/null || true)"
+}
+
 # Prove migrated provider documents are searchable in Flapjack with the exact
 # values the source served. Every expected value below is a contract check, not
 # a sample: MEILI-001 / MEILI-002 are the `sku` values of the seeded
@@ -580,19 +502,13 @@ probe_served_migrated_data() {
   run_served_migration meilisearch meilisearch_configured_pk \
     "{\"endpoint\":\"http://127.0.0.1:${MEILI_PORT}\",\"apiKey\":\"${MEILI_KEY}\",\"sourceIndex\":\"configured_pk\"}"
   run_served_migration typesense typesense_categories \
-    "{\"node\":\"http://127.0.0.1:${TYPESENSE_PORT}\",\"apiKey\":\"${TYPESENSE_KEY}\",\"sourceIndex\":\"${TYPESENSE_CATEGORIES}\"}"
+    "{\"node\":\"http://127.0.0.1:${TYPESENSE_PORT}\",\"apiKey\":\"${TYPESENSE_KEY}\",\"sourceIndex\":\"${TYPESENSE_CATEGORIES}\",\"sourceWriteFrozen\":true}"
   run_served_migration typesense typesense_products \
-    "{\"node\":\"http://127.0.0.1:${TYPESENSE_PORT}\",\"apiKey\":\"${TYPESENSE_KEY}\",\"sourceIndex\":\"${TYPESENSE_PRODUCTS}\"}"
+    "{\"node\":\"http://127.0.0.1:${TYPESENSE_PORT}\",\"apiKey\":\"${TYPESENSE_KEY}\",\"sourceIndex\":\"${TYPESENSE_PRODUCTS}\",\"sourceWriteFrozen\":true}"
 
   served_search meilisearch_all configured_pk ''
-  jq -e '
-    .nbHits == 2 and (.hits | length) == 2 and
-    ([.hits[] | {objectID,sku,title,price,stock}] | sort_by(.objectID)) == [
-      {objectID:"MEILI-001",sku:"MEILI-001",title:"Espresso Tamper",price:24.5,stock:7},
-      {objectID:"MEILI-002",sku:"MEILI-002",title:"Pour Over Kettle",price:39.75,stock:3}
-    ]
-  ' "$TMP/meilisearch_all.json" >/dev/null || fail_red \
-    "meilisearch_all_documents_mismatch body=$(jq -c . "$TMP/meilisearch_all.json" 2>/dev/null || true)"
+  assert_meilisearch_landed_documents "$TMP/meilisearch_all.json" \
+    'meilisearch_all_documents_mismatch'
   served_search meilisearch_espresso configured_pk 'Espresso Tamper'
   jq -e '.nbHits == 1 and (.hits | length) == 1 and
     (.hits[0] | {objectID,sku,title,price,stock}) ==
@@ -607,11 +523,8 @@ probe_served_migrated_data() {
     "meilisearch_kettle_mismatch body=$(jq -c . "$TMP/meilisearch_kettle.json" 2>/dev/null || true)"
 
   served_search typesense_categories_all "$TYPESENSE_CATEGORIES" ''
-  jq -e '.nbHits == 1 and (.hits | length) == 1 and
-    (.hits[0] | {objectID,id,name,priority,active,labels}) ==
-      {objectID:"cat_1",id:"cat_1",name:"Coffee",priority:1,active:true,labels:["coffee"]}' \
-    "$TMP/typesense_categories_all.json" >/dev/null || fail_red \
-    "typesense_category_all_documents_mismatch body=$(jq -c . "$TMP/typesense_categories_all.json" 2>/dev/null || true)"
+  assert_typesense_categories_landed_documents "$TMP/typesense_categories_all.json" \
+    'typesense_category_all_documents_mismatch'
   served_search typesense_category_coffee "$TYPESENSE_CATEGORIES" Coffee
   jq -e '.nbHits == 1 and (.hits | length) == 1 and
     (.hits[0] | {objectID,id,name,priority,active,labels}) ==
@@ -620,14 +533,8 @@ probe_served_migrated_data() {
     "typesense_category_coffee_mismatch body=$(jq -c . "$TMP/typesense_category_coffee.json" 2>/dev/null || true)"
 
   served_search typesense_products_all "$TYPESENSE_PRODUCTS" ''
-  jq -e '
-    .nbHits == 2 and (.hits | length) == 2 and
-    ([.hits[] | {objectID,id,title,sku,price,inventory,available,tags,category_id}] | sort_by(.objectID)) == [
-      {objectID:"prod_1",id:"prod_1",title:"Espresso",sku:"ESP-001",price:12.5,inventory:8,available:true,tags:["coffee"],category_id:"cat_1"},
-      {objectID:"prod_2",id:"prod_2",title:"Latte",sku:"LAT-002",price:9.5,inventory:5,available:true,tags:["coffee","milk"],category_id:"cat_1"}
-    ]
-  ' "$TMP/typesense_products_all.json" >/dev/null || fail_red \
-    "typesense_product_all_documents_mismatch body=$(jq -c . "$TMP/typesense_products_all.json" 2>/dev/null || true)"
+  assert_typesense_products_landed_documents "$TMP/typesense_products_all.json" \
+    'typesense_product_all_documents_mismatch'
   served_search typesense_product_espresso "$TYPESENSE_PRODUCTS" Espresso
   jq -e '.nbHits == 1 and (.hits | length) == 1 and
     (.hits[0] | {objectID,id,title,sku,price,inventory,available,tags,category_id}) ==
@@ -683,29 +590,14 @@ probe_served_discovery() {
   served_discovery_request meilisearch_discovery \
     '/1/migrations/meilisearch/list-indexes?offset=0&limit=10' \
     "{\"endpoint\":\"http://127.0.0.1:${MEILI_PORT}\",\"apiKey\":\"${MEILI_KEY}\"}" 200
-  jq -n -e --slurpfile actual "$TMP/meilisearch_discovery.json" \
-    --slurpfile source "$TMP/meili_expected_listing.json" '
-      $source[0].results[0] as $expected |
-      $actual[0].indexes == [{
-        name:$expected.uid, primaryKey:$expected.primaryKey, entries:null,
-        documentCount:null, createdAt:$expected.createdAt,
-        updatedAt:$expected.updatedAt, defaultSortingField:null
-      }] and $actual[0].total == 1 and $actual[0].offset == 0 and $actual[0].limit == 10
-    ' >/dev/null || fail_red 'meilisearch_discovery_body_mismatch'
+  assert_meilisearch_discovery_body "$TMP/meilisearch_discovery.json" \
+    'meilisearch_discovery_body_mismatch'
 
   served_discovery_request typesense_discovery \
     '/1/migrations/typesense/list-indexes?offset=0&limit=2' \
     "{\"node\":\"http://127.0.0.1:${TYPESENSE_PORT}\",\"apiKey\":\"${TYPESENSE_KEY}\"}" 200
-  jq -n -e --slurpfile actual "$TMP/typesense_discovery.json" \
-    --slurpfile source "$TMP/typesense_expected_listing.json" '
-      def expected_summary:
-        {name,primaryKey:null,entries:null,documentCount:.num_documents,
-         createdAt:.created_at,updatedAt:null,
-         defaultSortingField:(.default_sorting_field // null)};
-      ($source[0] | map(expected_summary)) as $expected |
-      ($expected | map(.name)) == ["fj_ts_migration_products","fj_ts_migration_categories"] and
-      $actual[0] == {indexes:$expected}
-    ' >/dev/null || fail_red 'typesense_discovery_body_mismatch'
+  assert_typesense_discovery_body "$TMP/typesense_discovery.json" \
+    'typesense_discovery_body_mismatch'
 
   served_discovery_request meilisearch_localhost_refused \
     '/1/migrations/meilisearch/list-indexes' \
@@ -735,7 +627,7 @@ probe_served_discovery() {
 
 probe_served_typesense_preview() {
   served_preview_request typesense_preview '/1/migrations/typesense/preview' \
-    "{\"node\":\"http://127.0.0.1:${TYPESENSE_PORT}\",\"apiKey\":\"${TYPESENSE_KEY}\",\"sourceIndex\":\"${TYPESENSE_PRODUCTS}\",\"targetIndex\":\"shop\"}" 200
+    "{\"node\":\"http://127.0.0.1:${TYPESENSE_PORT}\",\"apiKey\":\"${TYPESENSE_KEY}\",\"sourceIndex\":\"${TYPESENSE_PRODUCTS}\",\"targetIndex\":\"shop\",\"sourceWriteFrozen\":true}" 200
   jq -e '
     keys == ["report","sourceCounts"] and
     .sourceCounts == {"indexes":1,"records":2} and
@@ -766,7 +658,7 @@ probe_served_typesense_preview() {
   [ -z "$leaks" ] || fail_red 'served_typesense_preview_credential_leak'
   printf 'PASS: served Typesense preview response contains no source or admin credentials\n' \
     >>"$TMP/credential_leak_scan.txt"
-  printf 'PREVIEW request={"node":"http://127.0.0.1:%s","apiKey":"[REDACTED_TYPESENSE_KEY]","sourceIndex":"%s","targetIndex":"shop"}\n' \
+  printf 'PREVIEW request={"node":"http://127.0.0.1:%s","apiKey":"[REDACTED_TYPESENSE_KEY]","sourceIndex":"%s","targetIndex":"shop","sourceWriteFrozen":true}\n' \
     "$TYPESENSE_PORT" "$TYPESENSE_PRODUCTS"
   printf 'PREVIEW status=%s\n' "$(cat "$TMP/typesense_preview_status.txt")"
   printf 'PREVIEW sourceCounts=%s\n' "$(jq -c .sourceCounts "$TMP/typesense_preview.json")"
@@ -1336,9 +1228,347 @@ probe_neutral_shared_seam() {
   fi
 }
 
+write_parity_cleanup_fake_bins() {
+  local fake_bin="$1"
+  mkdir -p "$fake_bin"
+  cat >"$fake_bin/docker" <<'FAKE_DOCKER'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${PARITY_CLEANUP_TEST_DOCKER_LOG:?}"
+state_dir="${PARITY_CLEANUP_TEST_DOCKER_STATE:?}"
+
+case "${1:-}" in
+  ps)
+    ps_count_file="$state_dir/ps_count"
+    ps_count=0
+    [ -f "$ps_count_file" ] && ps_count="$(cat "$ps_count_file")"
+    ps_count=$((ps_count + 1))
+    printf '%s\n' "$ps_count" >"$ps_count_file"
+    if [ -n "${PARITY_CLEANUP_TEST_FAIL_PS_CALL:-}" ] && [ "$ps_count" -eq "${PARITY_CLEANUP_TEST_FAIL_PS_CALL}" ]; then
+      printf 'fake docker: ps failed on call %s\n' "$ps_count" >&2
+      exit 1
+    fi
+    name_filter=""
+    include_stopped=0
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -a) include_stopped=1; shift ;;
+        --filter) name_filter="${2:-}"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    name="${name_filter#name=^/}"
+    name="${name%$}"
+    if [ -n "$name" ] && [ -f "$state_dir/$name.provider" ] \
+      && { [ "$include_stopped" -eq 1 ] || [ ! -f "$state_dir/$name.stopped" ]; }; then
+      printf '%s\n' "$name"
+    fi
+    ;;
+  inspect)
+    format="${3:-}"
+    name="${4:-}"
+    case "$format" in
+      *flapjack.source_provider_fixture.token*) cat "$state_dir/$name.token" 2>/dev/null || true ;;
+      *flapjack.source_provider_fixture.provider*) cat "$state_dir/$name.provider" 2>/dev/null || true ;;
+      *flapjack.source_provider_fixture*) [ -f "$state_dir/$name.provider" ] && printf '1\n' ;;
+    esac
+    ;;
+  logs)
+    exit 0
+    ;;
+  exec)
+    name="${2:-}"
+    shift 2
+    printf 'docker exec %s %s\n' "$name" "$*" >>"${PARITY_CLEANUP_TEST_ORDER_LOG:?}"
+    [ "${PARITY_CLEANUP_TEST_FAIL_EXEC_FOR:-}" != "$name" ] || exit 1
+    ;;
+  rm)
+    [ "${2:-}" = "-f" ] || exit 97
+    name="${3:-}"
+    printf 'docker rm -f %s\n' "$name" >>"${PARITY_CLEANUP_TEST_ORDER_LOG:?}"
+    rm -f -- "$state_dir/$name.provider" "$state_dir/$name.token" "$state_dir/$name.stopped"
+    ;;
+  *)
+    exit 97
+    ;;
+esac
+FAKE_DOCKER
+  chmod +x "$fake_bin/docker"
+
+  cat >"$fake_bin/rm" <<'FAKE_RM'
+#!/usr/bin/env bash
+set -euo pipefail
+for arg in "$@"; do
+  if [ -n "${PARITY_CLEANUP_TEST_RM_FAIL_DIR:-}" ] && [ "$arg" = "$PARITY_CLEANUP_TEST_RM_FAIL_DIR" ]; then
+    exit 19
+  fi
+done
+exec /bin/rm "$@"
+FAKE_RM
+  chmod +x "$fake_bin/rm"
+}
+
+register_parity_cleanup_fake_container() {
+  local state_dir="$1" name="$2" provider="$3" token="$4"
+  printf '%s\n' "$provider" >"$state_dir/$name.provider"
+  printf '%s\n' "$token" >"$state_dir/$name.token"
+}
+
+run_parity_cleanup_contract_child() {
+  local scenario="${SOURCE_MIGRATION_PROVIDER_PARITY_CLEANUP_CHILD:?}"
+  TMP="${PARITY_CLEANUP_TEST_FIXTURE_DIR:?}"
+  MEILI_CONTAINER=""
+  SERVER_PID=""
+  ALGOLIA_STUB_PID=""
+  EXTRA_OWNED_PIDS=()
+  SOURCE_PROVIDER_OWNER_TOKEN="${PARITY_CLEANUP_TEST_EXPECTED_TOKEN:-parity_cleanup_token}"
+  export SOURCE_PROVIDER_OWNER_TOKEN
+  case "$scenario" in
+    unowned_typesense|repair_failure|running_state_ps_failure)
+      TYPESENSE_CONTAINER="${PARITY_CLEANUP_TEST_TYPESENSE_CONTAINER:?}"
+      mkdir -p "$TMP/$TYPESENSE_HOST_DATA_SUBDIR"
+      touch "$TMP/$TYPESENSE_HOST_DATA_SUBDIR/marker"
+      ;;
+    rm_failure)
+      TYPESENSE_CONTAINER=""
+      mkdir -p "$TMP"
+      ;;
+    *)
+      die_indeterminate "unknown_cleanup_contract_child scenario=${scenario}"
+      ;;
+  esac
+  trap cleanup EXIT
+  exit 0
+}
+
+assert_parity_cleanup_file_contains() {
+  local file="$1" expected="$2"
+  grep -F "$expected" "$file" >/dev/null || {
+    printf 'expected %s to contain %s, saw:\n' "$file" "$expected" >&2
+    cat "$file" >&2
+    exit 1
+  }
+}
+
+assert_parity_cleanup_file_excludes() {
+  local file="$1" rejected="$2"
+  ! grep -F "$rejected" "$file" >/dev/null || {
+    printf 'did not expect %s in %s, saw:\n' "$rejected" "$file" >&2
+    cat "$file" >&2
+    exit 1
+  }
+}
+
+run_parity_cleanup_contract_case() {
+  local root="$1" scenario="$2" container token output status fixture_dir state_dir
+  container="fj_source_migration_provider_parity_typesense_99101"
+  token="parity_cleanup_expected_token"
+  fixture_dir="$root/${scenario}_fixture"
+  state_dir="$root/docker_state"
+  mkdir -p "$fixture_dir" "$state_dir"
+  : >"$root/docker.log"
+  : >"$root/order.log"
+  rm -f -- "$state_dir/ps_count"
+  register_parity_cleanup_fake_container "$state_dir" "$container" typesense "$token"
+  case "$scenario" in
+    unowned_typesense)
+      printf 'foreign_token\n' >"$state_dir/$container.token"
+      ;;
+    repair_failure)
+      ;;
+    running_state_ps_failure)
+      ;;
+    rm_failure)
+      rm -f -- "$state_dir/$container.provider" "$state_dir/$container.token"
+      ;;
+  esac
+
+  set +e
+  output="$(env \
+    PATH="$root/bin:$PATH" \
+    PARITY_CLEANUP_TEST_DOCKER_LOG="$root/docker.log" \
+    PARITY_CLEANUP_TEST_DOCKER_STATE="$state_dir" \
+    PARITY_CLEANUP_TEST_EXPECTED_TOKEN="$token" \
+    PARITY_CLEANUP_TEST_FIXTURE_DIR="$fixture_dir" \
+    PARITY_CLEANUP_TEST_ORDER_LOG="$root/order.log" \
+    PARITY_CLEANUP_TEST_TYPESENSE_CONTAINER="$container" \
+    PARITY_CLEANUP_TEST_FAIL_EXEC_FOR="$([ "$scenario" = repair_failure ] && printf '%s' "$container")" \
+    PARITY_CLEANUP_TEST_FAIL_PS_CALL="$([ "$scenario" = running_state_ps_failure ] && printf '2')" \
+    PARITY_CLEANUP_TEST_RM_FAIL_DIR="$([ "$scenario" = rm_failure ] && printf '%s' "$fixture_dir")" \
+    SOURCE_MIGRATION_PROVIDER_PARITY_CLEANUP_CHILD="$scenario" \
+    bash "$0" 2>&1)"
+  status=$?
+  set -e
+  printf '%s\n' "$output" >"$root/${scenario}.out"
+  [ "$status" -eq 2 ] || {
+    printf 'expected cleanup contract %s to exit 2, got %s\noutput=%s\n' "$scenario" "$status" "$output" >&2
+    exit 1
+  }
+}
+
+assert_parity_unowned_cleanup_contract() {
+  local root="$1" container="fj_source_migration_provider_parity_typesense_99101"
+  run_parity_cleanup_contract_case "$root" unowned_typesense
+  assert_parity_cleanup_file_contains "$root/unowned_typesense.out" \
+    "SOURCE_MIGRATION_HTTP_PROBE=INDETERMINATE cleanup=typesense_container_unowned_label name=$container"
+  assert_parity_cleanup_file_excludes "$root/order.log" "docker exec $container"
+  assert_parity_cleanup_file_excludes "$root/order.log" "docker rm -f $container"
+  [ -f "$root/docker_state/$container.provider" ] || exit 1
+  [ -f "$root/unowned_typesense_fixture/$TYPESENSE_HOST_DATA_SUBDIR/marker" ] || exit 1
+}
+
+assert_parity_repair_failure_contract() {
+  local root="$1" container="fj_source_migration_provider_parity_typesense_99101"
+  run_parity_cleanup_contract_case "$root" repair_failure
+  assert_parity_cleanup_file_contains "$root/repair_failure.out" \
+    "SOURCE_MIGRATION_HTTP_PROBE=INDETERMINATE cleanup=typesense_data_permission_repair_failed name=$container"
+  assert_parity_cleanup_file_contains "$root/order.log" "docker exec $container"
+  assert_parity_cleanup_file_excludes "$root/order.log" "docker rm -f $container"
+  [ -f "$root/docker_state/$container.provider" ] || exit 1
+  [ -f "$root/repair_failure_fixture/$TYPESENSE_HOST_DATA_SUBDIR/marker" ] || exit 1
+}
+
+assert_parity_running_state_ps_failure_contract() {
+  local root="$1" container="fj_source_migration_provider_parity_typesense_99101"
+  run_parity_cleanup_contract_case "$root" running_state_ps_failure
+  assert_parity_cleanup_file_contains "$root/running_state_ps_failure.out" \
+    "SOURCE_MIGRATION_HTTP_PROBE=INDETERMINATE cleanup=docker_ps_failed name=$container"
+  assert_parity_cleanup_file_excludes "$root/order.log" "docker exec $container"
+  assert_parity_cleanup_file_excludes "$root/order.log" "docker rm -f $container"
+  [ -f "$root/docker_state/$container.provider" ] || exit 1
+  [ -f "$root/running_state_ps_failure_fixture/$TYPESENSE_HOST_DATA_SUBDIR/marker" ] || exit 1
+}
+
+assert_parity_rm_failure_contract() {
+  local root="$1"
+  run_parity_cleanup_contract_case "$root" rm_failure
+  assert_parity_cleanup_file_contains "$root/rm_failure.out" \
+    "SOURCE_MIGRATION_HTTP_PROBE=INDETERMINATE cleanup=source_migration_fixture_dir_rm_failed dir=$root/rm_failure_fixture"
+  assert_parity_cleanup_file_contains "$root/rm_failure.out" \
+    "SOURCE_MIGRATION_HTTP_PROBE=INDETERMINATE cleanup=source_migration_fixture_dir_residue dir=$root/rm_failure_fixture"
+  [ -d "$root/rm_failure_fixture" ] || exit 1
+}
+
+assert_typesense_host_removable_argument_contract() {
+  local root="$1" direct_fixture_path
+  direct_fixture_path="$root/direct_argument_fixture"
+  mkdir -p "$direct_fixture_path/$TYPESENSE_HOST_DATA_SUBDIR"
+  typesense_data_host_removable "$direct_fixture_path" || {
+    printf 'expected Typesense host-removability helper to honor its direct argument\n' >&2
+    exit 1
+  }
+}
+
+run_parity_cleanup_contract_tests() {
+  local root
+  root="$(mktemp -d "${TMPDIR:-/tmp}/fj_source_migration_provider_parity_cleanup_test.XXXXXX")"
+  write_parity_cleanup_fake_bins "$root/bin"
+  assert_typesense_host_removable_argument_contract "$root"
+  assert_parity_unowned_cleanup_contract "$root"
+  assert_parity_repair_failure_contract "$root"
+  assert_parity_running_state_ps_failure_contract "$root"
+  assert_parity_rm_failure_contract "$root"
+  rm -rf -- "$root"
+  printf 'SOURCE_MIGRATION_PROVIDER_PARITY_CLEANUP_TEST=PASS cases=direct_argument,unowned_typesense,repair_failure,running_state_ps_failure,rm_failure\n'
+}
+
+run_parity_startup_token_contract_child() {
+  require_tools() { :; }
+  build_or_resolve_binary() { :; }
+  start_discovery_upstreams() {
+    env | grep -Fqx "SOURCE_PROVIDER_OWNER_TOKEN=${SOURCE_PROVIDER_OWNER_TOKEN:-}" \
+      || fail_red 'source_provider_owner_token_not_exported_before_upstreams'
+    [ -n "${SOURCE_PROVIDER_OWNER_TOKEN:-}" ] \
+      || fail_red 'source_provider_owner_token_empty_before_upstreams'
+    source_provider_docker_labels meilisearch
+    printf '%s\n' "${SOURCE_PROVIDER_DOCKER_LABEL_ARGS[@]}" \
+      >"${PARITY_STARTUP_TOKEN_TEST_ROOT:?}/meilisearch_labels.txt"
+    source_provider_docker_labels typesense
+    printf '%s\n' "${SOURCE_PROVIDER_DOCKER_LABEL_ARGS[@]}" \
+      >"${PARITY_STARTUP_TOKEN_TEST_ROOT:?}/typesense_labels.txt"
+  }
+  start_server() { :; }
+  probe_served_lifecycle() { :; }
+  probe_served_discovery() { :; }
+  probe_served_typesense_preview() { :; }
+  probe_served_migrated_data() { :; }
+  probe_route_tag_mutations() { :; }
+  probe_live_router_binding_mutations() { :; }
+  probe_neutral_shared_seam() { :; }
+  main
+}
+
+assert_parity_startup_exports_owner_token_contract() {
+  local root output status token
+  root="$(mktemp -d "${TMPDIR:-/tmp}/fj_source_migration_provider_parity_startup_token_test.XXXXXX")"
+  set +e
+  output="$(PARITY_STARTUP_TOKEN_TEST_ROOT="$root" \
+    SOURCE_MIGRATION_PROVIDER_PARITY_STARTUP_TOKEN_CHILD=1 \
+    bash "$0" 2>&1)"
+  status=$?
+  set -e
+  printf '%s\n' "$output" >"$root/startup_token.out"
+  [ "$status" -eq 0 ] || {
+    printf 'expected startup token contract to pass, got %s\noutput=%s\n' "$status" "$output" >&2
+    exit 1
+  }
+  token="$(sed -n 's/^flapjack\.source_provider_fixture\.token=//p' "$root/typesense_labels.txt" | tail -1)"
+  [ -n "$token" ] || {
+    printf 'expected Typesense docker labels to include a source provider owner token, saw:\n' >&2
+    cat "$root/typesense_labels.txt" >&2
+    exit 1
+  }
+  grep -Fx "flapjack.source_provider_fixture.token=$token" "$root/meilisearch_labels.txt" >/dev/null || {
+    printf 'expected Meilisearch docker labels to use the same owner token as Typesense\n' >&2
+    cat "$root/meilisearch_labels.txt" "$root/typesense_labels.txt" >&2
+    exit 1
+  }
+  rm -rf -- "$root"
+}
+
+assert_source_provider_owner_token_required_contract() {
+  local status output
+  set +e
+  output="$(
+    env -u SOURCE_PROVIDER_OWNER_TOKEN \
+      bash -c '
+        set -euo pipefail
+        script_dir="$1"
+        # shellcheck source=lib/source_provider_fixtures.sh
+        source "$script_dir/lib/source_provider_fixtures.sh"
+        set +e
+        source_provider_docker_labels typesense 2>&1
+        rc=$?
+        set -e
+        printf "\nstatus=%s\n" "$rc"
+      ' bash "$SCRIPT_DIR"
+  )"
+  status=$?
+  set -e
+  [ "$status" -eq 0 ] || {
+    printf 'expected owner-token requirement probe wrapper to exit 0, got %s\noutput=%s\n' "$status" "$output" >&2
+    exit 1
+  }
+  printf '%s\n' "$output" | grep -F 'ERROR: SOURCE_PROVIDER_OWNER_TOKEN must be set before starting typesense fixtures' >/dev/null || {
+    printf 'expected missing owner token error, saw:\n%s\n' "$output" >&2
+    exit 1
+  }
+  printf '%s\n' "$output" | grep -F 'status=1' >/dev/null || {
+    printf 'expected source_provider_docker_labels to fail without SOURCE_PROVIDER_OWNER_TOKEN, saw:\n%s\n' "$output" >&2
+    exit 1
+  }
+}
+
+run_parity_startup_contract_tests() {
+  assert_source_provider_owner_token_required_contract
+  assert_parity_startup_exports_owner_token_contract
+  printf 'SOURCE_MIGRATION_PROVIDER_PARITY_STARTUP_TEST=PASS cases=owner_token_required,owner_token_exported_before_upstreams\n'
+}
+
 main() {
   require_tools
   TMP="$(mktemp -d "${TMPDIR:-/tmp}/fj_source_migration_provider_parity.XXXXXX")"
+  configure_source_provider_owner_token
   build_or_resolve_binary
   start_discovery_upstreams
   start_server
@@ -1352,4 +1582,17 @@ main() {
   printf 'SOURCE_MIGRATION_HTTP_PROBE=PASS providers=3 lifecycle=submit,status,cancel,ack,preview discovery=list-indexes landed_data=meilisearch,typesense\n'
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  if [ -n "${SOURCE_MIGRATION_PROVIDER_PARITY_CLEANUP_CHILD:-}" ]; then
+    run_parity_cleanup_contract_child
+  elif [ -n "${SOURCE_MIGRATION_PROVIDER_PARITY_STARTUP_TOKEN_CHILD:-}" ]; then
+    run_parity_startup_token_contract_child
+  elif [ "${SOURCE_MIGRATION_PROVIDER_PARITY_CLEANUP_TEST:-}" = "1" ]; then
+    run_parity_cleanup_contract_tests
+  elif [ "${SOURCE_MIGRATION_PROVIDER_PARITY_STARTUP_TEST:-}" = "1" ]; then
+    run_parity_startup_contract_tests
+  else
+    trap cleanup EXIT
+    main "$@"
+  fi
+fi

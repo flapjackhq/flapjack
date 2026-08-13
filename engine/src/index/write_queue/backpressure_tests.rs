@@ -34,6 +34,32 @@ fn assert_stage_6_io_error(result: crate::error::Result<TaskInfo>) {
     }
 }
 
+const STAGE_6_DURABLE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn add_stage_6_documents_and_wait_for_test(
+    manager: &crate::index::manager::IndexManager,
+    tenant_id: &str,
+    docs: Vec<Document>,
+) -> crate::error::Result<TaskInfo> {
+    manager
+        .add_documents_durable_with_timeout_for_test(tenant_id, docs, STAGE_6_DURABLE_WAIT_TIMEOUT)
+        .await
+}
+
+async fn add_stage_6_documents_insert_and_wait_for_test(
+    manager: &crate::index::manager::IndexManager,
+    tenant_id: &str,
+    docs: Vec<Document>,
+) -> crate::error::Result<TaskInfo> {
+    manager
+        .add_documents_insert_durable_with_timeout_for_test(
+            tenant_id,
+            docs,
+            STAGE_6_DURABLE_WAIT_TIMEOUT,
+        )
+        .await
+}
+
 fn assert_stage_6_pause_artifact(tmp: &tempfile::TempDir, tenant_id: &str, decision: &str) {
     let artifact_path = backpressure::pause_artifact_path(tmp.path(), tenant_id);
     let artifact = std::fs::read_to_string(&artifact_path)
@@ -327,17 +353,17 @@ async fn forced_backpressure_pause_blocks_first_durable_insert_then_recovers() {
         "paused durable insert must not append durable admission records"
     );
 
-    manager
-        .add_documents_insert_durable(
-            tenant_id,
-            vec![text_document(
-                "retry_insert",
-                "title",
-                "forced pause retry accepted",
-            )],
-        )
-        .await
-        .unwrap();
+    add_stage_6_documents_insert_and_wait_for_test(
+        &manager,
+        tenant_id,
+        vec![text_document(
+            "retry_insert",
+            "title",
+            "forced pause retry accepted",
+        )],
+    )
+    .await
+    .unwrap();
     assert_eq!(manager.tenant_doc_count(tenant_id), Some(1));
     assert!(
         manager.get_document(tenant_id, "retry_insert").unwrap().is_some(),
@@ -413,14 +439,70 @@ async fn backpressure_does_not_fire_while_state_is_improving() {
         "decreasing live-segment counts are improving even while index bytes grow"
     );
 
-    manager
-        .add_documents_durable(
-            tenant_id,
-            vec![text_document("accepted_doc", "title", "stage6 accepted")],
-        )
-        .await
-        .unwrap();
+    add_stage_6_documents_and_wait_for_test(
+        &manager,
+        tenant_id,
+        vec![text_document("accepted_doc", "title", "stage6 accepted")],
+    )
+    .await
+    .unwrap();
     assert_eq!(manager.tenant_doc_count(tenant_id), Some(1));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn explicit_timeout_add_helper_uses_durable_admission_store() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let tenant_id = "stage6_add_helper_durable_store";
+    let manager = crate::index::manager::IndexManager::new(tmp.path());
+    manager.create_tenant(tenant_id).unwrap();
+    std::fs::write(
+        tmp.path()
+            .join(tenant_id)
+            .join(admission::WRITE_ADMISSION_DIR),
+        b"blocks durable admission directory",
+    )
+    .unwrap();
+
+    assert_stage_6_io_error(
+        add_stage_6_documents_and_wait_for_test(
+            &manager,
+            tenant_id,
+            vec![text_document(
+                "blocked_durable_add",
+                "title",
+                "durable admission must be used",
+            )],
+        )
+        .await,
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn explicit_timeout_insert_helper_uses_durable_admission_store() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let tenant_id = "stage6_insert_helper_durable_store";
+    let manager = crate::index::manager::IndexManager::new(tmp.path());
+    manager.create_tenant(tenant_id).unwrap();
+    std::fs::write(
+        tmp.path()
+            .join(tenant_id)
+            .join(admission::WRITE_ADMISSION_DIR),
+        b"blocks durable admission directory",
+    )
+    .unwrap();
+
+    assert_stage_6_io_error(
+        add_stage_6_documents_insert_and_wait_for_test(
+            &manager,
+            tenant_id,
+            vec![text_document(
+                "blocked_durable_insert",
+                "title",
+                "durable admission must be used",
+            )],
+        )
+        .await,
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -429,13 +511,13 @@ async fn reads_stay_live_while_bulk_admission_is_paused() {
     let tenant_id = "stage6_reads_live_when_paused";
     let manager = crate::index::manager::IndexManager::new(tmp.path());
     manager.create_tenant(tenant_id).unwrap();
-    manager
-        .add_documents_durable(
-            tenant_id,
-            vec![text_document("live_doc", "title", "stage6 searchable")],
-        )
-        .await
-        .unwrap();
+    add_stage_6_documents_and_wait_for_test(
+        &manager,
+        tenant_id,
+        vec![text_document("live_doc", "title", "stage6 searchable")],
+    )
+    .await
+    .unwrap();
     let tenant_id = tenant_id.to_string();
     let quiesce = manager.quiesce_tenant(&tenant_id).await.unwrap();
     drop(quiesce);
@@ -678,17 +760,17 @@ async fn paused_bulk_admission_resamples_loaded_index_and_recovers() {
             )
             .await,
     );
-    manager
-        .add_documents_insert_durable(
-            tenant_id,
-            vec![text_document(
-                "accepted_doc",
-                "title",
-                "accepted after admission resample",
-            )],
-        )
-        .await
-        .unwrap();
+    add_stage_6_documents_insert_and_wait_for_test(
+        &manager,
+        tenant_id,
+        vec![text_document(
+            "accepted_doc",
+            "title",
+            "accepted after admission resample",
+        )],
+    )
+    .await
+    .unwrap();
     assert_eq!(manager.tenant_doc_count(tenant_id), Some(1));
     assert_stage_6_pause_artifact(&tmp, tenant_id, "admit");
 }

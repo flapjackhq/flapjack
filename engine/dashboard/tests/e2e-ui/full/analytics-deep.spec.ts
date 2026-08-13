@@ -15,7 +15,11 @@ import { seedAnalytics, deleteIndex, DEFAULT_ANALYTICS_CONFIG } from '../../fixt
  * - ESLint enforced via tests/e2e-ui/eslint.config.mjs
  */
 
-const INDEX = 'e2e-analytics-deep';
+// `fullyParallel` runs this file's hooks once per worker, so each worker owns its seed and
+// cleanup. The worker suffix must come from Playwright itself; no harness variable sets it.
+function analyticsIndexName() {
+  return `e2e-analytics-deep-${test.info().parallelIndex}`;
+}
 
 /** Seeded window: two dashboard periods, so the KPI delta badges have a previous period. */
 const SEED_DAYS = 14;
@@ -31,21 +35,22 @@ const EXPECTED_RANGE_SEARCHES = Math.floor(
 
 test.describe('Analytics Deep Data Verification (real browser)', () => {
   test.beforeAll(async ({ request }) => {
+    const indexName = analyticsIndexName();
     // Seed both the current and previous 7-day windows so KPI delta badges render.
     await seedAnalytics(request, {
       ...DEFAULT_ANALYTICS_CONFIG,
       days: SEED_DAYS,
-      indexName: INDEX,
+      indexName,
     });
   });
 
   test.afterAll(async ({ request }) => {
-    try { await deleteIndex(request, INDEX); } catch { /* ignore */ }
+    try { await deleteIndex(request, analyticsIndexName()); } catch { /* ignore */ }
   });
 
   test.describe('Overview Tab — KPI Cards', () => {
     test('KPI cards show non-zero numeric values from seeded data', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await expect(page.getByTestId('kpi-cards')).toBeVisible({ timeout: 10000 });
 
       // Total Searches KPI should show the seeded count for the default range.
@@ -74,7 +79,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
     });
 
     test('search volume chart renders SVG with data path', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       const chart = page.getByTestId('search-volume-chart');
       await expect(chart).toBeVisible({ timeout: 10000 });
       await expect(chart.getByTestId(CHART_CANVAS_TEST_ID)).toBeVisible();
@@ -82,7 +87,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
     });
 
     test('top 10 searches table shows ranked queries in descending order', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       const table = page.getByTestId('top-searches-overview');
       await expect(table).toBeVisible({ timeout: 10000 });
       const rows = getTableBodyRows(table);
@@ -94,7 +99,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
     });
 
     test('KPI cards show delta comparison badges when previous period has data', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await expect(page.getByTestId('kpi-cards')).toBeVisible({ timeout: 10000 });
 
       // The seeded dataset renders comparison values for all three KPI cards.
@@ -111,7 +116,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
 
   test.describe('Searches Tab — Data Table', () => {
     test('displays sortable table with query counts in descending order', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await page.getByTestId('tab-searches').click();
       await expect(page.getByTestId('top-searches-table')).toBeVisible({ timeout: 10000 });
       const rows = getTableBodyRows(page.getByTestId('top-searches-table'));
@@ -127,7 +132,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
     });
 
     test('text filter narrows results client-side', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await page.getByTestId('tab-searches').click();
       await expect(page.getByTestId('top-searches-table')).toBeVisible({ timeout: 10000 });
       const searchRows = getTableBodyRows(page.getByTestId('top-searches-table'));
@@ -148,7 +153,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
 
   test.describe('No Results Tab', () => {
     test('shows rate banner with valid percentage between 0-100', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await page.getByTestId('tab-no-results').click();
       const banner = page.getByTestId('no-result-rate-banner');
       await expect(banner).toBeVisible({ timeout: 10000 });
@@ -162,7 +167,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
     });
 
     test('shows table of zero-result queries with seeded data', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await page.getByTestId('tab-no-results').click();
       const table = page.getByTestId('no-results-table');
       await expect(table).toBeVisible({ timeout: 10000 });
@@ -174,7 +179,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
 
   test.describe('Devices Tab', () => {
     test('shows platform cards with desktop > mobile counts', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await page.getByTestId('tab-devices').click();
       await expect(page.getByTestId('device-desktop')).toBeVisible({ timeout: 10000 });
       await expect(page.getByTestId('device-mobile')).toBeVisible();
@@ -196,7 +201,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
     });
 
     test('shows device chart with SVG rendering', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await page.getByTestId('tab-devices').click();
       await expect(page.getByTestId('device-desktop')).toBeVisible({ timeout: 10000 });
 
@@ -208,7 +213,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
 
   test.describe('Geography Tab', () => {
     test('shows country table with US as top country', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await page.getByTestId('tab-geography').click();
       await expect(page.getByText('Searches by Country')).toBeVisible({ timeout: 10000 });
       const firstRow = getTableBodyRows(page.getByRole('table').first()).first();
@@ -217,7 +222,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
     });
 
     test('country percentages sum to approximately 100%', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await page.getByTestId('tab-geography').click();
       await expect(page.getByText('Searches by Country')).toBeVisible({ timeout: 10000 });
       const countryRows = getTableBodyRows(page.getByRole('table').first());
@@ -235,7 +240,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
     });
 
     test('clicking country shows drill-down with searches and regions', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await page.getByTestId('tab-geography').click();
       await expect(page.getByText('Searches by Country')).toBeVisible({ timeout: 10000 });
       await getTableBodyRows(page.getByRole('table').first()).first().click();
@@ -254,7 +259,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
     });
 
     test('back button returns from drill-down to country list', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await page.getByTestId('tab-geography').click();
       await expect(page.getByText('Searches by Country')).toBeVisible({ timeout: 10000 });
       await getTableBodyRows(page.getByRole('table').first()).first().click();
@@ -266,7 +271,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
 
   test.describe('Date Range Switching', () => {
     test('switching to 30d updates KPI values', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await expect(page.getByTestId('kpi-cards')).toBeVisible({ timeout: 10000 });
 
       // Use data-testid instead of CSS class selector
@@ -284,7 +289,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
 
   test.describe('Sparkline Rendering', () => {
     test('Total Searches KPI renders sparkline with SVG path', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await expect(page.getByTestId('kpi-cards')).toBeVisible({ timeout: 10000 });
 
       // Total Searches receives sparkData from dates array — sparkline MUST render
@@ -297,7 +302,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
     });
 
     test('No-Result Rate KPI renders sparkline with SVG path', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await expect(page.getByTestId('kpi-cards')).toBeVisible({ timeout: 10000 });
 
       const sparkline = page.getByTestId('kpi-no-result-rate').getByTestId('sparkline');
@@ -308,7 +313,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
 
   test.describe('Content Verification — Searches Tab', () => {
     test('search query cells contain non-empty text strings', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await page.getByTestId('tab-searches').click();
       await expect(page.getByTestId('top-searches-table')).toBeVisible({ timeout: 10000 });
       const rows = getTableBodyRows(page.getByTestId('top-searches-table'));
@@ -322,7 +327,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
     });
 
     test('search count cells contain comma-formatted numbers', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await page.getByTestId('tab-searches').click();
       const table = page.getByTestId('top-searches-table');
       await expect(table).toBeVisible({ timeout: 10000 });
@@ -340,7 +345,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
     });
 
     test('volume bars have non-zero width for rows with counts', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await page.getByTestId('tab-searches').click();
       const table = page.getByTestId('top-searches-table');
       await expect(table).toBeVisible({ timeout: 10000 });
@@ -369,7 +374,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
 
   test.describe('Content Verification — Geography Tab', () => {
     test('country rows show flag emoji, country name, and code', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await page.getByTestId('tab-geography').click();
       await expect(page.getByText('Searches by Country')).toBeVisible({ timeout: 10000 });
       const firstRow = getTableBodyRows(page.getByRole('table').first()).first();
@@ -391,7 +396,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
     });
 
     test('drill-down shows country-specific search queries', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await page.getByTestId('tab-geography').click();
       await expect(page.getByText('Searches by Country')).toBeVisible({ timeout: 10000 });
       await getTableBodyRows(page.getByRole('table').first()).first().click();
@@ -407,7 +412,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
     });
 
     test('States table in US drill-down shows state names with counts', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await page.getByTestId('tab-geography').click();
       await expect(page.getByText('Searches by Country')).toBeVisible({ timeout: 10000 });
       await getTableBodyRows(page.getByRole('table').first()).first().click();
@@ -425,7 +430,7 @@ test.describe('Analytics Deep Data Verification (real browser)', () => {
 
   test.describe('Content Verification — Devices Tab', () => {
     test('device counts add up across platform cards', async ({ page }) => {
-      await page.goto(`/index/${INDEX}/analytics`);
+      await page.goto(`/index/${analyticsIndexName()}/analytics`);
       await page.getByTestId('tab-devices').click();
       await expect(page.getByTestId('device-desktop')).toBeVisible({ timeout: 10000 });
       await expect(page.getByTestId('device-mobile')).toBeVisible();

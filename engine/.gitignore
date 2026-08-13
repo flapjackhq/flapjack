@@ -69,6 +69,7 @@ logs
 !loadtest/results/*-acme-pebble-kat-evidence/red_baseline_crypto_provider_panic.log
 # Captured oracle output read by the nightly-import selector contract test.
 !docs2/4_EVIDENCE/2026_08_05_stage2_nightly_migration_import_selector_specimen.log
+!docs2/4_EVIDENCE/aug08_9pm_3_nextest_liveness/*.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

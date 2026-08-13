@@ -3,6 +3,22 @@ import { getLocalInstanceConfig } from './local-instance-config';
 
 const instance = getLocalInstanceConfig();
 
+// Hand the resolved backend admin key to scripts/playwright-webserver.mjs, whose readiness
+// probes must authenticate as the reused backend expects. getLocalInstanceConfig() is the
+// single owner of that resolution (flapjack.local.conf plus reused-loopback process
+// discovery), but the webserver runs under plain node and cannot import this TypeScript
+// resolver — so the value has to cross as an environment variable. It travels ambiently
+// rather than in webServer.env below because Playwright serialises that block verbatim into
+// test-results/results.json; the credential must never land in the durable proof artifact.
+// Playwright still merges this process's environment into the spawned webserver, so the
+// child reads it. redact_playwright_evidence.mjs is the defense-in-depth backstop.
+process.env.PLAYWRIGHT_BACKEND_ADMIN_KEY = instance.adminKey;
+// spawnDashboardServer() runs `npm run dev` with the wrapper's inherited environment.
+// Vite reads FJ_DASHBOARD_PORT rather than PLAYWRIGHT_WEBSERVER_PORT, so export the
+// resolved port ambiently here to keep the spawned dashboard bind target aligned with
+// the wrapper's readiness URL without expanding the JSON-reported webServer contract.
+process.env.FJ_DASHBOARD_PORT = String(instance.dashboardPort);
+
 function parseWorkersOverride(rawValue: string | undefined): number | undefined {
   if (!rawValue) {
     return undefined;
@@ -22,9 +38,17 @@ const evidenceOnlyLaneCSpecs = [
   'jun04_pm_lane_c_audit.spec.ts',
   'jun05_am_lane_c_round2_audit.spec.ts',
 ];
+const splitBackendLifecycleSpecs = [
+  'migrate-meilisearch-refusal.spec.ts',
+];
 const e2eUiTestIgnore = process.env.LANE_C_BUNDLE_DIR
-  ? ['*.setup.ts', '*.test.ts']
-  : ['*.setup.ts', '*.test.ts', ...evidenceOnlyLaneCSpecs];
+  ? ['*.setup.ts', '*.test.ts', ...splitBackendLifecycleSpecs]
+  : [
+    '*.setup.ts',
+    '*.test.ts',
+    ...splitBackendLifecycleSpecs,
+    ...evidenceOnlyLaneCSpecs,
+  ];
 
 /**
  * Playwright configuration for Flapjack dashboard.
@@ -93,6 +117,13 @@ export default defineConfig({
       dependencies: ['seed'],
       use: { ...devices['Desktop Chrome'] },
     },
+    {
+      name: 'e2e-ui-meilisearch-refusal',
+      testDir: './tests/e2e-ui',
+      testMatch: 'migrate-meilisearch-refusal.spec.ts',
+      dependencies: ['seed'],
+      use: { ...devices['Desktop Chrome'] },
+    },
     // --- E2E-API: API-level tests against real server (no browser rendering) ---
     // For real-browser simulated-human tests, see the e2e-ui project above.
     {
@@ -121,7 +152,7 @@ export default defineConfig({
       // skip every chat / hybrid-search / vector-settings / navigation vector spec while
       // the run still reported green. scripts/playwright-webserver.mjs now starts it and
       // refuses to hand over to the browser unless /health reports vectorSearch: true.
-      PLAYWRIGHT_BACKEND_HOST: instance.host,
+      PLAYWRIGHT_BACKEND_HOST: instance.backendHost,
       PLAYWRIGHT_BACKEND_PORT: String(instance.backendPort),
       PLAYWRIGHT_BACKEND_URL: instance.backendBaseUrl,
       // Pinned to the directory tests/fixtures/local-instance.ts resolves, so

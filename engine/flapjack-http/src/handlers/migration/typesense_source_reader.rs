@@ -8,7 +8,7 @@ use super::source_reader::{
 use super::typesense_client::{
     TypesenseClient, TypesenseClientError, TypesenseErrorKind, TypesenseSourceObservation,
 };
-use super::AsyncMigrationSourceProvider;
+use super::{AsyncMigrationSourceProvider, TYPESENSE_WRITE_FREEZE_REQUIRED_MESSAGE};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -25,7 +25,6 @@ pub(super) type TypesensePageConsumer<'a> =
 pub(super) trait TypesenseExportSource {
     fn observe_source(&mut self) -> TypesenseSourceFuture<'_, TypesenseSourceObservation>;
     fn read_settings(&mut self) -> TypesenseSourceFuture<'_, Value>;
-    fn require_read_access(&mut self) -> TypesenseSourceFuture<'_, ()>;
     fn read_document_pages<'a>(
         &'a mut self,
         consume_page: &'a mut TypesensePageConsumer<'a>,
@@ -39,10 +38,6 @@ impl TypesenseExportSource for TypesenseClient {
 
     fn read_settings(&mut self) -> TypesenseSourceFuture<'_, Value> {
         Box::pin(async move { self.read_source_settings().await })
-    }
-
-    fn require_read_access(&mut self) -> TypesenseSourceFuture<'_, ()> {
-        Box::pin(async move { TypesenseClient::require_read_access(self).await })
     }
 
     fn read_document_pages<'a>(
@@ -60,17 +55,19 @@ pub(super) struct TypesenseSourceReader<S> {
     source_name: String,
     source: S,
     observation: Option<TypesenseSourceObservation>,
+    source_write_frozen: bool,
 }
 
 impl<S> TypesenseSourceReader<S>
 where
     S: TypesenseExportSource,
 {
-    pub(super) fn from_source(source_name: &str, source: S) -> Self {
+    pub(super) fn from_source(source_name: &str, source: S, source_write_frozen: bool) -> Self {
         Self {
             source_name: source_name.to_string(),
             source,
             observation: None,
+            source_write_frozen,
         }
     }
 }
@@ -80,10 +77,11 @@ impl TypesenseSourceReader<TypesenseClient> {
         endpoint: &str,
         api_key: &str,
         source_name: &str,
+        source_write_frozen: bool,
     ) -> Result<Self, AlgoliaClientError> {
         let source = TypesenseClient::new(endpoint, api_key, source_name)
             .map_err(map_typesense_client_error)?;
-        Ok(Self::from_source(source_name, source))
+        Ok(Self::from_source(source_name, source, source_write_frozen))
     }
 }
 
@@ -110,6 +108,12 @@ where
 
     fn observe_quiescent_source(&mut self) -> SourceFuture<'_, SourceObservation> {
         Box::pin(async move {
+            if !self.source_write_frozen {
+                return Err(SourceExportError::new(
+                    SourceExportErrorKind::Validation,
+                    TYPESENSE_WRITE_FREEZE_REQUIRED_MESSAGE,
+                ));
+            }
             let observation = self
                 .source
                 .observe_source()
@@ -144,10 +148,6 @@ where
             let settings = self
                 .source
                 .read_settings()
-                .await
-                .map_err(map_typesense_error)?;
-            self.source
-                .require_read_access()
                 .await
                 .map_err(map_typesense_error)?;
             consume(SourceConfigurationArtifact::settings(&settings))?;
@@ -188,7 +188,7 @@ where
     }
 }
 
-fn typesense_document_records(
+pub(super) fn typesense_document_records(
     page: &[Value],
     json_path_prefix: &str,
 ) -> Result<Vec<SourceExportRecord>, SourceExportError> {
@@ -251,4 +251,78 @@ pub(super) fn map_typesense_error(error: TypesenseClientError) -> SourceExportEr
 
 pub(super) fn map_typesense_client_error(error: TypesenseClientError) -> AlgoliaClientError {
     map_typesense_error(error).into_inner()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handlers::migration::source_reader::{MigrationSourceReader, SourceExportErrorKind};
+    use serde_json::json;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct CountingTypesenseSource {
+        observation: TypesenseSourceObservation,
+        observe_calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingTypesenseSource {
+        fn new(observe_calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                observation: TypesenseSourceObservation {
+                    source_name: "products".to_string(),
+                    updated_at: "1785020400".to_string(),
+                    document_count: 0,
+                    schema_hash: "schema-hash".to_string(),
+                },
+                observe_calls,
+            }
+        }
+    }
+
+    impl TypesenseExportSource for CountingTypesenseSource {
+        fn observe_source(&mut self) -> TypesenseSourceFuture<'_, TypesenseSourceObservation> {
+            self.observe_calls.fetch_add(1, Ordering::SeqCst);
+            let observation = self.observation.clone();
+            Box::pin(async move { Ok(observation) })
+        }
+
+        fn read_settings(&mut self) -> TypesenseSourceFuture<'_, Value> {
+            Box::pin(async { Ok(json!({})) })
+        }
+
+        fn read_document_pages<'a>(
+            &'a mut self,
+            _consume_page: &'a mut TypesensePageConsumer<'a>,
+        ) -> TypesenseSourceFuture<'a, TypesenseSourceObservation> {
+            let observation = self.observation.clone();
+            Box::pin(async move { Ok(observation) })
+        }
+    }
+
+    #[tokio::test]
+    async fn typesense_write_freeze_reader_requires_explicit_attestation() {
+        let observe_calls = Arc::new(AtomicUsize::new(0));
+        let source = CountingTypesenseSource::new(Arc::clone(&observe_calls));
+        let mut reader = TypesenseSourceReader::from_source("products", source, false);
+
+        let outcome = reader.observe_quiescent_source().await;
+        if outcome.is_ok() || observe_calls.load(Ordering::SeqCst) != 0 {
+            println!("WRITE_FREEZE_RED_READER=unattested_reader_claimed_quiescent");
+            panic!("unattested Typesense reader observed source quiescence");
+        }
+        let error = outcome.expect_err("unattested reader must fail closed");
+        assert_eq!(error.kind(), SourceExportErrorKind::Validation);
+
+        let source = CountingTypesenseSource::new(Arc::clone(&observe_calls));
+        let mut reader = TypesenseSourceReader::from_source("products", source, true);
+        let observed = reader
+            .observe_quiescent_source()
+            .await
+            .expect("attested reader should observe the source");
+        assert_eq!(observed.source_name, "products");
+        assert_eq!(observe_calls.load(Ordering::SeqCst), 1);
+    }
 }

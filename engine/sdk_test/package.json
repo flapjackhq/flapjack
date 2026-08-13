@@ -10,8 +10,11 @@
     "test:compat": "node full_compat_tests.js",
     "test:instantsearch": "node instantsearch_contract_tests.js",
     "test:widgets": "node instantsearch_contract_tests.js",
+    "test:real_clients": "node browser_tests_unmocked/run_real_client_conformance.mjs",
+    "lint:real_clients": "eslint --config browser_tests_unmocked/eslint.config.mjs --max-warnings 0 'browser_tests_unmocked/**/*.spec.mjs' 'browser_tests_unmocked/app/**/*.js'",
+    "test:real_clients:wiring": "node tests/real_client_conformance_wiring_test.mjs",
     "test:runner-shell": "bash tests/dashboard_runner_bootstrap_node_modules_test.sh && bash tests/dashboard_runner_lockfile_change_reinstalls_node_modules_test.sh && bash tests/dashboard_runner_reuse_node_modules_validation_test.sh && bash tests/sdk_runner_bootstrap_node_modules_test.sh && bash tests/sdk_runner_cache_hit_reuses_node_modules_test.sh && bash tests/sdk_runner_reuse_guard_test.sh && bash tests/sdk_runner_reuse_node_modules_validation_test.sh && bash tests/sdk_runner_deduplicates_core_js_when_e2e_enabled_test.sh",
-    "test:all": "node test.js && node contract_tests.js && node full_compat_tests.js && node instantsearch_contract_tests.js",
+    "test:all": "node test.js && node contract_tests.js && node full_compat_tests.js && node instantsearch_contract_tests.js && npm run test:real_clients",
     "test:full": "npm run test:all",
     "test:migration": "node test_algolia_migration.js",
     "test:migration:verbose": "node test_algolia_migration.js --verbose",
@@ -20,5 +23,19 @@
   "dependencies": {
     "algoliasearch": "^5.0.0",
     "dotenv": "^17.2.3"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "eslint": "^10.0.0",
+    "eslint-plugin-playwright": "^2.11.0",
+    "instantsearch.js": "^4.111.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-instantsearch": "^7.44.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.67.0",
+    "vite": "^6.4.3",
+    "vue": "^3.5.41",
+    "vue-instantsearch": "^4.29.2"
   }
 }

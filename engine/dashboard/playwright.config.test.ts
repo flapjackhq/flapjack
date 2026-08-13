@@ -7,11 +7,13 @@ type PlaywrightProject = {
   teardown?: string
   testMatch?: string | string[]
   testIgnore?: string[]
+  grep?: RegExp
 }
 
-const { mockInstance } = vi.hoisted(() => ({
-  mockInstance: {
+const { defaultMockInstance, mockInstance } = vi.hoisted(() => {
+  const defaultMockInstance = {
     host: '127.0.0.1',
+    backendHost: '127.0.0.1',
     backendPort: 7711,
     dashboardPort: 5511,
     adminKey: 'test-admin-key',
@@ -20,8 +22,13 @@ const { mockInstance } = vi.hoisted(() => ({
     dashboardBaseUrl: 'http://127.0.0.1:5511',
     configPath: '/tmp/flapjack.local.conf',
     loadedFromFile: true,
-  },
-}))
+  }
+
+  return {
+    defaultMockInstance,
+    mockInstance: { ...defaultMockInstance },
+  }
+})
 
 async function loadPlaywrightConfig(
   ciValue?: string,
@@ -64,9 +71,14 @@ function findProject(configProjects: unknown, name: string): PlaywrightProject |
 }
 
 afterEach(() => {
+  Object.assign(mockInstance, defaultMockInstance)
   vi.unstubAllEnvs()
   vi.resetModules()
   vi.doUnmock('./local-instance-config')
+  // The config forwards the resolved admin key via a real process.env assignment
+  // (not vi.stubEnv), so unstubAllEnvs cannot reclaim it — clear it by hand.
+  delete process.env.PLAYWRIGHT_BACKEND_ADMIN_KEY
+  delete process.env.FJ_DASHBOARD_PORT
 })
 
 describe('playwright.config startup contracts', () => {
@@ -101,6 +113,7 @@ describe('playwright.config startup contracts', () => {
     expect(uiProject?.testIgnore).toEqual([
       '*.setup.ts',
       '*.test.ts',
+      'migrate-meilisearch-refusal.spec.ts',
       'jun04_pm_lane_c_audit.spec.ts',
       'jun05_am_lane_c_round2_audit.spec.ts',
     ])
@@ -138,6 +151,38 @@ describe('playwright.config startup contracts', () => {
     expect(config.webServer?.env).not.toHaveProperty('PATH')
   })
 
+  it('forwards the resolved admin key to the webserver off-artifact, never in webServer.env', async () => {
+    // getLocalInstanceConfig resolves the backend admin key from flapjack.local.conf and
+    // from a reused loopback backend's process line; scripts/playwright-webserver.mjs runs
+    // under plain node and cannot import that TypeScript resolver, so the config must hand
+    // the resolved key across. It travels as an ambient process.env assignment because
+    // Playwright serialises webServer.env verbatim into test-results/results.json — putting
+    // the credential there would leak it into the durable proof artifact. Playwright still
+    // merges the ambient environment into the spawned webserver, so the child reads it.
+    delete process.env.PLAYWRIGHT_BACKEND_ADMIN_KEY
+    const config = await loadPlaywrightConfig('')
+
+    expect(process.env.PLAYWRIGHT_BACKEND_ADMIN_KEY).toBe(mockInstance.adminKey)
+    expect(config.webServer?.env).not.toHaveProperty('PLAYWRIGHT_BACKEND_ADMIN_KEY')
+    expect(JSON.stringify(config.webServer?.env)).not.toContain(mockInstance.adminKey)
+  })
+
+  it('forwards the resolved dashboard port ambiently so the wrapper child binds the probed port', async () => {
+    delete process.env.FJ_DASHBOARD_PORT
+    mockInstance.dashboardPort = 15177
+    mockInstance.dashboardBaseUrl = 'http://127.0.0.1:15177'
+
+    const config = await loadPlaywrightConfig('')
+
+    expect(process.env.FJ_DASHBOARD_PORT).toBe('15177')
+    expect(config.webServer?.env).not.toHaveProperty('FJ_DASHBOARD_PORT')
+    expect(config.webServer?.env).toMatchObject({
+      PLAYWRIGHT_WEBSERVER_PORT: '15177',
+      PLAYWRIGHT_WEBSERVER_URL: 'http://127.0.0.1:15177',
+    })
+    expect(config.webServer?.url).toBe('http://127.0.0.1:15177')
+  })
+
   it('declares the backend launch target so the webserver owns the vector-enabled backend', async () => {
     // Before this contract, `webServer` started only Vite and every e2e run silently
     // depended on an operator having pre-started a backend by hand. A text-only
@@ -147,12 +192,31 @@ describe('playwright.config startup contracts', () => {
     const config = await loadPlaywrightConfig('')
 
     expect(config.webServer?.env).toMatchObject({
-      PLAYWRIGHT_BACKEND_HOST: mockInstance.host,
+      PLAYWRIGHT_BACKEND_HOST: mockInstance.backendHost,
       PLAYWRIGHT_BACKEND_PORT: String(mockInstance.backendPort),
       PLAYWRIGHT_BACKEND_URL: mockInstance.backendBaseUrl,
       // Pinned to the same directory tests/fixtures/local-instance.ts resolves, so
       // filesystem-backed fixtures read the data dir the backend actually writes.
       PLAYWRIGHT_BACKEND_DATA_DIR: mockInstance.backendDataDir,
+    })
+  })
+
+  it('keeps the dashboard bind host separate from a non-loopback backend target host', async () => {
+    mockInstance.host = '127.0.0.1'
+    mockInstance.backendHost = '192.168.1.50'
+    mockInstance.backendPort = 17707
+    mockInstance.dashboardPort = 5511
+    mockInstance.backendBaseUrl = 'http://192.168.1.50:17707'
+    mockInstance.dashboardBaseUrl = 'http://127.0.0.1:5511'
+
+    const config = await loadPlaywrightConfig('')
+
+    expect(config.webServer?.env).toMatchObject({
+      PLAYWRIGHT_WEBSERVER_HOST: '127.0.0.1',
+      PLAYWRIGHT_WEBSERVER_URL: 'http://127.0.0.1:5511',
+      PLAYWRIGHT_BACKEND_HOST: '192.168.1.50',
+      PLAYWRIGHT_BACKEND_PORT: '17707',
+      PLAYWRIGHT_BACKEND_URL: 'http://192.168.1.50:17707',
     })
   })
 
@@ -236,6 +300,31 @@ describe('playwright.config startup contracts', () => {
     const laneCConfig = await loadPlaywrightConfig('', undefined, 'docs/live-state/jun05_am_lane_c_baseline/20260605T045543Z')
     const laneCUiProject = findProject(laneCConfig.projects, 'e2e-ui')
 
-    expect(laneCUiProject?.testIgnore).toEqual(['*.setup.ts', '*.test.ts'])
+    expect(laneCUiProject?.testIgnore).toEqual([
+      '*.setup.ts',
+      '*.test.ts',
+      'migrate-meilisearch-refusal.spec.ts',
+    ])
+  })
+
+  it('runs provider migration specs once in the normal UI project', async () => {
+    const config = await loadPlaywrightConfig('')
+    const uiProject = findProject(config.projects, 'e2e-ui')
+
+    expect(uiProject?.testIgnore).not.toContain('full/migrate-meilisearch.spec.ts')
+    expect(uiProject?.testIgnore).not.toContain('full/migrate-typesense.spec.ts')
+  })
+
+  it('splits the Meilisearch loopback refusal case into its own backend lifecycle project', async () => {
+    const config = await loadPlaywrightConfig('')
+    const uiProject = findProject(config.projects, 'e2e-ui')
+    const refusalProject = findProject(config.projects, 'e2e-ui-meilisearch-refusal')
+
+    expect(uiProject?.testIgnore).toContain('migrate-meilisearch-refusal.spec.ts')
+    expect(refusalProject).toMatchObject({
+      testDir: './tests/e2e-ui',
+      testMatch: 'migrate-meilisearch-refusal.spec.ts',
+      dependencies: ['seed'],
+    })
   })
 })

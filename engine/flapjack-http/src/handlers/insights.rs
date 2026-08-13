@@ -1,13 +1,16 @@
 //! Algolia Insights API-compatible event ingestion, debug event inspection, and GDPR user token deletion handlers.
 use axum::{
     extract::{Path, Query, State},
-    Json,
+    Extension, Json,
 };
 use std::sync::Arc;
 
 use flapjack::analytics::schema::{validate_user_token, InsightEvent};
 use flapjack::analytics::{AnalyticsCollector, DebugEvent};
 use flapjack::error::FlapjackError;
+
+use super::analytics::enforce_analytics_index_access;
+use crate::auth::{key_allows_index, ApiKey, SecuredKeyRestrictions};
 
 const DEBUG_EVENTS_DEFAULT_LIMIT: usize = 100;
 const DEBUG_EVENTS_MAX_LIMIT: usize = 1000;
@@ -20,12 +23,26 @@ const DEBUG_EVENTS_TIME_RANGE_ERROR: &str = "from must be less than or equal to 
 #[utoipa::path(post, path = "/1/events", tag = "insights", security(("api_key" = [])))]
 pub async fn post_events(
     State(collector): State<Arc<AnalyticsCollector>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     Json(body): Json<InsightsRequest>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
     if body.events.len() > 1000 {
         return Err(FlapjackError::InvalidQuery(
             "Maximum 1000 events per request".to_string(),
         ));
+    }
+
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
+
+    // Authorize every target before recording anything. A mixed-index request is
+    // one atomic authorization decision; otherwise an allowed prefix could be
+    // persisted before a later forbidden event rejects the batch.
+    for event in &body.events {
+        enforce_analytics_index_access(api_key, secured_restrictions, &event.index)?;
     }
 
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -75,6 +92,8 @@ pub async fn post_events(
 #[utoipa::path(get, path = "/1/events/debug", tag = "insights", security(("api_key" = [])))]
 pub async fn get_debug_events(
     State(collector): State<Arc<AnalyticsCollector>>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     Query(params): Query<DebugEventsQuery>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
     if let Some(status) = params.status.as_deref() {
@@ -95,14 +114,30 @@ pub async fn get_debug_events(
             ));
         }
     }
-    let events = collector.get_debug_events(
-        limit,
+
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
+    if let Some(index) = params.index.as_deref() {
+        enforce_analytics_index_access(api_key, secured_restrictions, index)?;
+    }
+
+    // Fetch all matching ring-buffer entries so the caller's limit is applied
+    // after tenant filtering. Limiting first would let recent forbidden events
+    // starve older allowed events from an otherwise valid response.
+    let mut events = collector.get_debug_events(
+        usize::MAX,
         params.index.as_deref(),
         params.event_type.as_deref(),
         params.status.as_deref(),
         from_timestamp_ms,
         until_timestamp_ms,
     );
+    if let Some(api_key) = api_key {
+        events.retain(|event| key_allows_index(api_key, secured_restrictions, &event.index));
+    }
+    events.truncate(limit);
 
     Ok(Json(serde_json::json!({
         "events": events,

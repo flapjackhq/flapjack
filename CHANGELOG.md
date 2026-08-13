@@ -7,7 +7,59 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [1.0.11] - 2026-08-05
+## [1.0.12] - 2026-08-12
+
+### Added
+
+- **Typesense migration now requires an explicit source write-freeze attestation.** Preview and
+  submit reject missing or false `sourceWriteFrozen` before any source request. The CLI and
+  dashboard carry the same contract, the dashboard checkbox is default-unchecked, and successful
+  preview/submit behavior is proven against a real pinned Typesense 30.2 source. Resume remains
+  unsupported for Typesense.
+- **The dashboard `Migrate` screen now reaches all three source providers.** Discovery,
+  submit, and status polling drive the real `/1/migrations/{algolia,meilisearch,typesense}`
+  routes from one provider descriptor, replacing the Algolia-only compat aliases. A source
+  on a loopback or private address renders the outbound-SSRF refusal and names the
+  `FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK` / `FJ_ENABLE_TYPESENSE_PREVIEW_LOOPBACK` opt-in
+  instead of a generic error.
+- **The console offers a translation-report dry-run before any migration writes anything.**
+  A `Preview` step renders the report — total entries, hard rejections, warnings and scope
+  gaps, plus every individual entry — and **submit stays disabled while any hard rejection
+  is present**. Preview and submit share one request builder, and editing any field that
+  changes the request clears the stale report rather than leaving it on screen. This works
+  for all three source providers. Neither Meilisearch's nor Typesense's own console offers
+  a migration dry-run.
+
+### Fixed
+
+- **Official browser search clients now authenticate with the same public contract as direct
+  requests.** The server accepts the Algolia Application ID from
+  `x-algolia-application-id` or the requester's `x-algolia-agent` query parameter while keeping
+  the search API key scoped and public. Recurring real-client tests exercise vanilla
+  `algoliasearch`, React InstantSearch, and Vue InstantSearch against a live Flapjack server and
+  require each client to return its own exact seeded record.
+
+- **Typesense export reads the endpoint's real single-stream contract.** The source client no
+  longer fabricates `page` / `per_page` windows for `/documents/export`; it consumes one bounded
+  JSONL stream, including a final record without a trailing newline, while preserving the existing
+  response-byte and item ceilings. A pinned live contract proves 137 exact IDs are captured once
+  from one query-free export request.
+- **Release binaries now honour the self-hosted-source loopback opt-ins they document.**
+  The Meilisearch and Typesense loopback admission seams were `#[cfg(debug_assertions)]`-gated,
+  so `FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK=1` / `FJ_ENABLE_TYPESENSE_PREVIEW_LOOPBACK=1`
+  had no effect in a released binary — the console correctly told a self-hosting user to set
+  a variable the shipped build ignored. Both providers now use the same production-first,
+  explicit-loopback-fallback admission path in debug and release. **The fail-closed default
+  is unchanged and is proven by absence of traffic:** with the opt-in absent, or set to any
+  value other than `1`, the server makes zero requests to the source and performs zero DNS
+  resolutions.
+- Unknown fields in an Algolia migration request body are now rejected instead of silently
+  ignored, and migration jobs poll to a terminal state rather than stopping at the first
+  non-terminal status.
+- Loadtest readiness helpers no longer accept a `200` from a listener they did not launch:
+  every live caller now supplies the launched server's log and expected bind address.
+
+## [1.0.11] - 2026-08-06
 
 ### Security
 
@@ -99,7 +151,7 @@ and this project follows [Semantic Versioning](https://semver.org/).
   `origin/main` SHA `3b11f8216f1d7dccc74262e1b63b3e1603152202`, each accepted with `outcome=PASS`,
   `acknowledged_count=28`, `recovered_count=28`, `rejection_status=500`, and a `source_sha` equal
   to that SHA. Receipt:
-  `engine/docs2/4_EVIDENCE/2026_08_03_aug03_11am_11_dur1_respecimen_and_close_receipt.md`.
+  the reviewed private dur1 respecimen and close receipt.
 
 ### Fixed (durability and correctness)
 

@@ -707,7 +707,7 @@ fn source_export_warnings(provider: AsyncMigrationSourceProvider) -> Vec<ReportC
     }
 }
 
-fn source_record_identity_page(page: &[SourceExportRecord]) -> Vec<Value> {
+pub(super) fn source_record_identity_page(page: &[SourceExportRecord]) -> Vec<Value> {
     page.iter()
         .map(SourceExportRecord::identity_payload)
         .collect()

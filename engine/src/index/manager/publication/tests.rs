@@ -2522,6 +2522,13 @@ fn every_activation_filesystem_fault_restores_the_old_publication() {
             *op == PublicationOperation::Checkpoint(PublicationCheckpoint::CommitDurable)
         })
         .unwrap();
+    let prepare_durable_index = operations
+        .iter()
+        .position(|op| {
+            *op == PublicationOperation::Checkpoint(PublicationCheckpoint::AfterPrepareJournal)
+        })
+        .expect("fault script must observe the prepare-durable boundary");
+    assert!(prepare_durable_index < commit_index);
 
     for operation_index in 0..commit_index {
         let fixture = ActivationFixture::new();
@@ -2559,6 +2566,11 @@ fn every_activation_filesystem_fault_restores_the_old_publication() {
             b"old-sidecar",
             "operation {operation_index}: {:?}",
             faults.operations()
+        );
+        assert_precommit_fault_reached_clean_disposition(
+            &fixture,
+            operation_index,
+            operation_index >= prepare_durable_index,
         );
     }
 
@@ -2627,6 +2639,14 @@ fn every_precommit_create_fault_resolves_without_publication_residue() {
                 == PublicationOperation::Checkpoint(PublicationCheckpoint::CommitDurable)
         })
         .unwrap();
+    let prepare_durable_index = operations
+        .iter()
+        .position(|operation| {
+            *operation
+                == PublicationOperation::Checkpoint(PublicationCheckpoint::AfterPrepareJournal)
+        })
+        .expect("fault script must observe the prepare-durable boundary");
+    assert!(prepare_durable_index < commit_index);
 
     for operation_index in 0..commit_index {
         let fixture = ActivationFixture::new();
@@ -2650,6 +2670,54 @@ fn every_precommit_create_fault_resolves_without_publication_residue() {
         assert!(!fixture.paths.backup.exists(), "operation {operation_index}");
         assert!(!fixture.journal_temp_path().exists(), "operation {operation_index}");
         assert!(!fixture.sidecar_backup_dir().exists(), "operation {operation_index}");
+        assert_precommit_fault_reached_clean_disposition(
+            &fixture,
+            operation_index,
+            operation_index >= prepare_durable_index,
+        );
+    }
+}
+
+/// Disposition half of invariant 6: a pre-commit publication fault must leave
+/// the journal in a clean terminal disposition. A fault before the
+/// `AfterPrepareJournal` checkpoint may leave no journal because prepare was not
+/// yet durable. At or after that boundary, exactly one journal must survive and
+/// its phase must be `RolledBack` or `Quarantined`. A missing durable journal,
+/// one left `Prepared`, a false `Committed`, or two conflicting journals are all
+/// invalid dispositions.
+fn assert_precommit_fault_reached_clean_disposition(
+    fixture: &ActivationFixture,
+    operation_index: usize,
+    prepare_was_durable: bool,
+) {
+    let durable = fixture
+        .paths
+        .journal
+        .exists()
+        .then(|| fixture.read_journal().phase);
+    let quarantine_journal = fixture.paths.quarantine.join("journal.json");
+    let quarantined = quarantine_journal.exists().then(|| {
+        PublicationJournal::from_json(&std::fs::read_to_string(&quarantine_journal).unwrap())
+            .unwrap()
+            .phase
+    });
+    match (durable, quarantined) {
+        (Some(phase), None) | (None, Some(phase)) => assert!(
+            matches!(
+                phase,
+                PublicationPhase::RolledBack | PublicationPhase::Quarantined
+            ),
+            "operation {operation_index}: surviving publication journal must be RolledBack or \
+             Quarantined, found {phase:?}"
+        ),
+        (None, None) if !prepare_was_durable => {}
+        (None, None) => panic!(
+            "operation {operation_index}: fault after prepare durability lost the publication journal"
+        ),
+        (Some(durable_phase), Some(quarantined_phase)) => panic!(
+            "operation {operation_index}: pre-commit fault left two conflicting journals \
+             (durable={durable_phase:?}, quarantined={quarantined_phase:?})"
+        ),
     }
 }
 

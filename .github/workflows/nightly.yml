@@ -130,7 +130,23 @@ jobs:
           chmod +x engine/target/debug/flapjack
           mkdir -p /tmp/flapjack-data
           SERVER_LOG=/tmp/flapjack-data/server.log
-          FLAPJACK_ADMIN_KEY=fj_devtestadminkey000000 engine/target/debug/flapjack --data-dir /tmp/flapjack-data >"$SERVER_LOG" 2>&1 &
+          # This job runs `npm run test:pages`, which is `playwright test --project=e2e-ui`
+          # with NO path filter — so it runs tests/e2e-ui/full/ as well as the smoke specs.
+          # The backend capability environment below is owned by
+          # engine/dashboard/tests/e2e_backend_contract.json and enforced by
+          # engine/tests/test_dashboard_e2e_backend_contract.py. It must be set HERE and
+          # not on the Playwright step: Playwright reuses a backend that is already
+          # listening, so spawnBackendServer never runs and env declared on the test step
+          # cannot reach the process under test. Missing it is what made
+          # cluster_peers.spec.ts fail in run 31072375322.
+          FLAPJACK_ADMIN_KEY=fj_devtestadminkey000000 \
+          FLAPJACK_NODE_ID=dashboard-e2e \
+          FLAPJACK_ADVERTISE_ADDR=https://dashboard-e2e.invalid:7700 \
+          FLAPJACK_REPLICATION_API_KEY=fj_devtestadminkey000000 \
+          FLAPJACK_AI_ALLOW_LOCAL_URLS=1 \
+          FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK=1 \
+          FJ_ENABLE_TYPESENSE_PREVIEW_LOOPBACK=1 \
+            engine/target/debug/flapjack --data-dir /tmp/flapjack-data >"$SERVER_LOG" 2>&1 &
           SERVER_PID=$!
           bash engine/tests/common/wait_for_flapjack.sh --pid "$SERVER_PID" --host localhost --port 7700 --log-path "$SERVER_LOG"
           curl --retry 60 --retry-delay 1 --retry-connrefused --fail --silent --show-error http://localhost:7700/health/ready
@@ -157,6 +173,7 @@ jobs:
         env:
           ALGOLIA_APP_ID: ${{ secrets.ALGOLIA_APP_ID }}
           ALGOLIA_ADMIN_KEY: ${{ secrets.ALGOLIA_ADMIN_KEY }}
+          PLAYWRIGHT_HTML_OUTPUT_DIR: playwright-report-pages
       - name: Run integration tests
         working-directory: engine/dashboard
         run: npm run test:integration
@@ -168,7 +185,9 @@ jobs:
         if: always()
         with:
           name: dashboard-all-tests-report
-          path: engine/dashboard/playwright-report/
+          path: |
+            engine/dashboard/playwright-report-pages/
+            engine/dashboard/playwright-report/
           retention-days: 14
 
   # ============================================================================
@@ -216,6 +235,11 @@ jobs:
       - name: Build release server
         working-directory: engine
         run: cargo build --release --locked --package flapjack-server --features vector-search
+      - name: Run release Meilisearch loopback constructor proof
+        working-directory: engine
+        run: cargo test --release -p flapjack-http --lib -- preview_loopback_constructor_is_reachable_in_release_with_explicit_opt_in
+      - name: Run migration release loopback contract
+        run: bash engine/tests/migration_release_loopback_contract.sh
       - name: Run scheduled migration import oracle
         env:
           ALGOLIA_APP_ID: ${{ secrets.ALGOLIA_APP_ID }}
@@ -232,30 +256,41 @@ jobs:
             fi
           }
 
+          require_single_line_secret() {
+            local name="$1"
+            local value="$2"
+            case "$value" in
+              *$'\n'*|*$'\r'*)
+                printf 'ERROR: required secret contains a newline and cannot be used safely: %s\n' "$name" >&2
+                return 1
+                ;;
+            esac
+          }
+
           algolia_request() {
             local method="$1"
             local path="$2"
             local body="${3:-}"
             local out="$4"
             local body_file=""
+            local url="https://${ALGOLIA_APP_ID}.algolia.net${path}"
+            local curl_args=(
+              --silent
+              --show-error
+              --fail
+              --request "$method"
+              --url "$url"
+              --header "x-algolia-application-id: $ALGOLIA_APP_ID"
+              --header "x-algolia-api-key: $ALGOLIA_ADMIN_KEY"
+              --header "content-type: application/json"
+            )
             if [ -n "$body" ]; then
               body_file="$(mktemp "$RUNNER_TEMP/algolia-body.XXXXXX")"
               chmod 600 "$body_file"
               printf '%s' "$body" >"$body_file"
+              curl_args+=(--data-binary "@$body_file")
             fi
-            {
-              printf 'silent\n'
-              printf 'show-error\n'
-              printf 'fail\n'
-              printf 'request = "%s"\n' "$method"
-              printf 'url = "https://%s.algolia.net%s"\n' "$ALGOLIA_APP_ID" "$path"
-              printf 'header = "x-algolia-application-id: %s"\n' "$ALGOLIA_APP_ID"
-              printf 'header = "x-algolia-api-key: %s"\n' "$ALGOLIA_ADMIN_KEY"
-              printf 'header = "content-type: application/json"\n'
-              if [ -n "$body_file" ]; then
-                printf 'data-binary = "@%s"\n' "$body_file"
-              fi
-            } | curl --config - >"$out"
+            curl "${curl_args[@]}" >"$out"
             [ -z "$body_file" ] || rm -f "$body_file"
           }
 
@@ -288,6 +323,8 @@ jobs:
 
           require_secret ALGOLIA_APP_ID "$ALGOLIA_APP_ID"
           require_secret ALGOLIA_ADMIN_KEY "$ALGOLIA_ADMIN_KEY"
+          require_single_line_secret ALGOLIA_APP_ID "$ALGOLIA_APP_ID"
+          require_single_line_secret ALGOLIA_ADMIN_KEY "$ALGOLIA_ADMIN_KEY"
           SECRET_FILE="$RUNNER_TEMP/migration_import_contract.env"
           ORACLE_LOG="$RUNNER_TEMP/migration-import-contract.log"
           : >"$ORACLE_LOG"
@@ -384,8 +421,21 @@ jobs:
             fi
           }
 
+          require_single_line_secret() {
+            local name="$1"
+            local value="$2"
+            case "$value" in
+              *$'\n'*|*$'\r'*)
+                printf 'ERROR: required secret contains a newline and cannot be used safely: %s\n' "$name" >&2
+                return 1
+                ;;
+            esac
+          }
+
           require_secret ALGOLIA_APP_ID "$ALGOLIA_APP_ID"
           require_secret ALGOLIA_ADMIN_KEY "$ALGOLIA_ADMIN_KEY"
+          require_single_line_secret ALGOLIA_APP_ID "$ALGOLIA_APP_ID"
+          require_single_line_secret ALGOLIA_ADMIN_KEY "$ALGOLIA_ADMIN_KEY"
 
           SECRET_FILE="$RUNNER_TEMP/migration_scale_contract.env"
           ORACLE_LOG="$RUNNER_TEMP/migration-scale-contract.log"

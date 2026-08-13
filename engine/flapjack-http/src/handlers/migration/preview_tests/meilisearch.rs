@@ -54,7 +54,6 @@ async fn meilisearch_preview_requires_explicit_loopback_opt_in() {
 /// contract fixture serves. Asserted at the reader constructor rather than the
 /// route so the test never spawns a background import against a dead port.
 #[test]
-#[cfg(debug_assertions)]
 fn meilisearch_submit_admits_opted_in_loopback_source_reader() {
     let _env = with_env_var(MEILISEARCH_PREVIEW_LOOPBACK_ENV, "1");
     let payload: MigrateFromMeilisearchRequest = serde_json::from_value(meilisearch_loopback_body(
@@ -68,11 +67,10 @@ fn meilisearch_submit_admits_opted_in_loopback_source_reader() {
     );
 }
 
-/// Production admission must remain the first branch in debug builds. This
+/// Production admission must remain the first branch in every profile. This
 /// constructor-only check resolves a vetted vendor host without issuing a
 /// request and proves the absent loopback opt-in cannot shadow Cloud submit.
 #[test]
-#[cfg(debug_assertions)]
 #[serial_test::serial(flapjack_outbound_url_policy)]
 fn meilisearch_submit_accepts_vetted_cloud_endpoint_without_loopback_opt_in() {
     const CLOUD_HOST: &str = "submit-debug-contract.meilisearch.io";
@@ -92,7 +90,7 @@ fn meilisearch_submit_accepts_vetted_cloud_endpoint_without_loopback_opt_in() {
     };
 
     super::super::meilisearch_source_reader(&payload)
-        .expect("debug submit must retain vetted Meilisearch Cloud admission");
+        .expect("submit must retain vetted Meilisearch Cloud admission in every profile");
 }
 
 /// Without the opt-in, submit stays refused, and it reports the production

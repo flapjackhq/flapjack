@@ -11,6 +11,37 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+#[test]
+fn application_id_accepts_official_browser_query_transport() {
+    let query_only = Request::builder()
+        .uri("/1/indexes/*/queries?x-algolia-application-id=browser-app")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        request_application_id(&query_only).as_deref(),
+        Some("browser-app")
+    );
+
+    let header_wins = Request::builder()
+        .uri("/1/indexes/*/queries?x-algolia-application-id=query-app")
+        .header("x-algolia-application-id", "header-app")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        request_application_id(&header_wins).as_deref(),
+        Some("header-app")
+    );
+
+    let encoded = Request::builder()
+        .uri("/1/indexes/*/queries?x-algolia-application-id=browser%20app")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        request_application_id(&encoded).as_deref(),
+        Some("browser app")
+    );
+}
+
 fn test_search_api_key(description: &str) -> ApiKey {
     ApiKey {
         hash: String::new(),

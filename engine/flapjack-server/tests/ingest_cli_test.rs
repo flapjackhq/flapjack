@@ -3,11 +3,13 @@
 mod support;
 
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use support::{flapjack_cmd, RunningServer, TempDir};
@@ -673,6 +675,91 @@ fn non_json_failure_redacts_api_key_from_stderr() {
     assert!(stderr.contains("[REDACTED]"));
 }
 
+/// The fake sink must keep answering after its scripted responses run out.
+///
+/// It used to serve exactly `responses.len()` connections and then return, dropping its
+/// `TcpListener` and closing the port. The ingest CLI retries a failed batch up to
+/// `RETRY_ATTEMPT_LIMIT` times, so any scenario producing a retry hit a dead port on the next
+/// attempt and reported `failed to connect to sink: Connection refused` — a fact about the harness,
+/// not about the product under test, and one that also changed the process exit code. Real HTTP
+/// endpoints keep listening; so does this one now, replaying its last scripted response for
+/// anything beyond the script. See `ROADMAP.md` row `TEST-SINK-1`.
+#[test]
+fn fake_sink_answers_connections_beyond_its_scripted_responses() {
+    let sink = FakeBatchSink::start(vec![SinkResponse::status(403)]);
+
+    let scripted = post_to_sink(&sink, r#"{"requests":[]}"#);
+    assert!(
+        scripted.starts_with("HTTP/1.1 403"),
+        "scripted response should be the 403 the script names: {scripted}"
+    );
+
+    // Beyond the script. Before the repair this connect was refused outright.
+    let unscripted = post_to_sink(&sink, r#"{"requests":[]}"#);
+    assert!(
+        unscripted.starts_with("HTTP/1.1 403"),
+        "unscripted response should replay the last scripted status: {unscripted}"
+    );
+
+    // Both requests are still recorded, so a test asserting "the CLI must not send another batch"
+    // keeps failing loudly when it does — the replay hides the connection, never the request.
+    assert_eq!(sink.drain_bodies().len(), 2);
+}
+
+#[test]
+fn fake_sink_ignores_unrelated_metrics_probes_without_consuming_its_script() {
+    let sink = FakeBatchSink::start(vec![SinkResponse::status(403)]);
+
+    let metrics_response = get_from_sink(&sink, "/metrics");
+    assert!(
+        metrics_response.starts_with("HTTP/1.1 404"),
+        "an unrelated metrics probe must be rejected, got: {metrics_response}"
+    );
+
+    let ingest_response = post_to_sink(&sink, r#"{"requests":[]}"#);
+    assert!(
+        ingest_response.starts_with("HTTP/1.1 403"),
+        "the metrics probe must not consume the scripted ingest response, got: {ingest_response}"
+    );
+    assert_eq!(
+        sink.next_request().path,
+        "/1/indexes/products/batch",
+        "only ingest-protocol requests belong in the sink's request channel"
+    );
+    assert!(
+        sink.try_next_request(Duration::from_millis(50)).is_none(),
+        "the unrelated metrics probe must not be recorded as ingest traffic"
+    );
+}
+
+/// When retries are exhausted the CLI must report what the sink actually said.
+///
+/// `503` is retryable, so the CLI makes all three attempts against a script holding one response.
+/// Attempts two and three land beyond the script — previously a closed port, which made the final
+/// user-visible message `failed to connect to sink: Connection refused` even though the sink had
+/// answered perfectly well. That message named the harness's own bookkeeping as the failure.
+#[test]
+fn exhausted_retries_report_the_sink_status_not_a_harness_connect_failure() {
+    let sink = FakeBatchSink::start(vec![SinkResponse::status(503)]);
+    let source = write_source("retry_exhausted_message", r#"[{"objectID":"p1"}]"#);
+
+    let output = ingest_cmd_without_report(sink.endpoint(), source.source_path())
+        .assert()
+        .code(5) // EXIT_RETRY_EXHAUSTED
+        .get_output()
+        .clone();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("retryable HTTP 503"),
+        "stderr must name the sink's own response: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Connection refused"),
+        "a sink that is still listening must never produce a connect failure: {stderr}"
+    );
+}
+
 #[test]
 fn api_key_with_http_delimiters_is_rejected_before_connecting() {
     let sink = FakeBatchSink::start(vec![SinkResponse::ok(); 1]);
@@ -992,6 +1079,56 @@ fn batch_operation_count(body: &Value) -> usize {
     body["requests"].as_array().unwrap().len()
 }
 
+/// Minimal raw HTTP POST straight at the fake sink, with no CLI in the middle.
+///
+/// Used by the harness-contract tests so they assert what the sink does, not what the CLI does with
+/// it — mixing the two is how a harness defect ends up diagnosed as a product defect.
+fn post_to_sink(sink: &FakeBatchSink, body: &str) -> String {
+    let mut stream = TcpStream::connect(sink.bind_addr.as_str())
+        .unwrap_or_else(|error| panic!("connect to fake sink at {}: {error}", sink.bind_addr));
+    // Bounded on purpose. A raw socket read with no timeout turns any sink hiccup into an
+    // indefinite hang, which is the failure mode this whole repair exists to remove — a hang
+    // reports nothing and costs a full CI timeout, while a bounded read fails with a message.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set sink read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .expect("set sink write timeout");
+    let request = format!(
+        "POST /1/indexes/products/batch HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        sink.bind_addr,
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).expect("write to sink");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read sink response");
+    response
+}
+
+fn get_from_sink(sink: &FakeBatchSink, path: &str) -> String {
+    let mut stream = TcpStream::connect(sink.bind_addr.as_str())
+        .unwrap_or_else(|error| panic!("connect to fake sink at {}: {error}", sink.bind_addr));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set sink read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .expect("set sink write timeout");
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        sink.bind_addr
+    );
+    stream.write_all(request.as_bytes()).expect("write to sink");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read sink response");
+    response
+}
+
 #[derive(Clone)]
 enum SinkResponse {
     Ok,
@@ -1050,6 +1187,14 @@ impl RecordedRequest {
 struct FakeBatchSink {
     bind_addr: String,
     requests: Receiver<RecordedRequest>,
+    /// Set by `Drop` so the accept loop stops and releases its listener. Without it the loop below
+    /// would hold one file descriptor and one parked thread per sink for the life of the test
+    /// binary, and this file starts 26 of them.
+    shutdown: Arc<AtomicBool>,
+    /// Faults the sink thread hit while serving. `Drop` fails the test on them, so a sink that dies
+    /// mid-test reports *why* instead of silently becoming "connection refused" somewhere else.
+    /// This is the whole lesson of `TEST-SINK-1`: the harness used to swallow its own death.
+    faults: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeBatchSink {
@@ -1057,10 +1202,18 @@ impl FakeBatchSink {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake sink");
         let bind_addr = listener.local_addr().unwrap().to_string();
         let (tx, rx) = mpsc::channel();
-        thread::spawn(move || serve_fake_sink(listener, responses, tx));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let faults = Arc::new(Mutex::new(Vec::new()));
+        thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            let faults = Arc::clone(&faults);
+            move || serve_fake_sink(listener, responses, tx, shutdown, faults)
+        });
         Self {
             bind_addr,
             requests: rx,
+            shutdown,
+            faults,
         }
     }
 
@@ -1068,20 +1221,69 @@ impl FakeBatchSink {
         format!("http://{}", self.bind_addr)
     }
 
+    /// Wait for a request the test EXPECTS to arrive.
+    ///
+    /// The bound is generous on purpose, and the asymmetry with `try_next_request` below is the
+    /// whole point. This call is waiting on a spawned `flapjack` process — a ~300 MB binary that
+    /// must load, parse its source file, and open a connection — while the rest of this file runs
+    /// in parallel and other suites contend for the same host. Five seconds measured as too tight:
+    /// on an otherwise-idle run the whole file finishes in ~6 s, but under load
+    /// `blocked_sink_bounds_parser_readahead_and_queue_high_watermark` reported
+    /// `expected fake sink request: Timeout` in 4 of 5 consecutive full-file runs, on unmodified
+    /// `main` as well as with the `TEST-SINK-1` repair. Nothing about parser readahead is being
+    /// measured when it fails that way.
+    ///
+    /// This is not "raise the timeout instead of diagnosing". The diagnosis is that the bound was
+    /// measuring process-start latency on a contended host rather than the behaviour under test;
+    /// widening a bound that only ever gates *how long we wait for something we require* cannot
+    /// hide a defect, because the assertion still has to hold when it arrives.
     fn next_request(&self) -> RecordedRequest {
         self.requests
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(30))
             .expect("expected fake sink request")
     }
 
+    /// Wait for a request the test may be proving does NOT arrive.
+    ///
+    /// The caller supplies the bound and callers keep it SHORT deliberately — several tests assert
+    /// `try_next_request(..).is_none()` to prove the CLI sent no further batch. Widening those
+    /// would weaken a real assertion, which is exactly why `next_request` above was widened alone.
     fn try_next_request(&self, timeout: Duration) -> Option<RecordedRequest> {
         self.requests.recv_timeout(timeout).ok()
     }
 
+    /// Collect every request already recorded, stopping once the sink goes quiet.
+    ///
+    /// The overall deadline is load-bearing and was added with the `TEST-SINK-1` repair. Before it,
+    /// this loop terminated for an accidental reason: the sink stopped answering once its script ran
+    /// out, so no further request could ever arrive. Now that the sink keeps serving — which is the
+    /// point of the repair — a client that connects in a loop would keep this `while let` fed
+    /// forever, and the test would HANG rather than fail. It did exactly that once during
+    /// development, and a hang is strictly worse than a failure: it burns a full CI timeout and
+    /// reports nothing. So the drain fails loudly instead, naming what it saw.
     fn drain_bodies(&self) -> Vec<Value> {
+        const DRAIN_DEADLINE: Duration = Duration::from_secs(20);
+        let started = std::time::Instant::now();
         let mut bodies = Vec::new();
+        let mut paths = Vec::new();
         while let Some(request) = self.try_next_request(Duration::from_millis(250)) {
+            paths.push(request.path.clone());
             bodies.push(request.body);
+            assert!(
+                started.elapsed() < DRAIN_DEADLINE,
+                "fake sink was still receiving requests after {DRAIN_DEADLINE:?} \
+                 ({} drained); the client under test is looping, not finishing. \
+                 Distinct paths seen: {:?}",
+                bodies.len(),
+                {
+                    // Naming the paths makes the next occurrence self-diagnosing: one path means
+                    // this test's own CLI is looping, several means a client found the wrong sink.
+                    let mut distinct = paths.clone();
+                    distinct.sort();
+                    distinct.dedup();
+                    distinct
+                }
+            );
         }
         bodies
     }
@@ -1091,37 +1293,158 @@ impl FakeBatchSink {
     }
 }
 
+impl Drop for FakeBatchSink {
+    fn drop(&mut self) {
+        // Stop the accept loop first, then poke the port so a thread parked in `accept()` wakes and
+        // observes the flag. Ordering matters: the store must be visible before the wake-up
+        // connection, or the loop serves the poke as if it were a real request.
+        self.shutdown.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.bind_addr.as_str());
+
+        // A sink that faulted mid-test is the defect this harness exists to surface, so it fails
+        // its own test by name. Skipped while already unwinding: a second panic there aborts the
+        // process and destroys the original failure message.
+        if std::thread::panicking() {
+            return;
+        }
+        let faults = self
+            .faults
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            faults.is_empty(),
+            "fake sink faulted: {}",
+            faults.join("; ")
+        );
+    }
+}
+
+fn record_fault(faults: &Mutex<Vec<String>>, message: String) {
+    faults
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(message);
+}
+
+/// Serve connections until the owning `FakeBatchSink` is dropped.
+///
+/// This loop used to run exactly `responses.len()` times and then return, which dropped `listener`
+/// and closed the port. The ingest CLI retries a batch up to `RETRY_ATTEMPT_LIMIT` times, so any
+/// scenario that produced a retry met a dead port on the next attempt; `send_once` then reported
+/// `failed to connect to sink: Connection refused`, every attempt counted as non-ambiguous, and the
+/// process exited `5` (`EXIT_RETRY_EXHAUSTED`) instead of whatever the sink had actually said. The
+/// harness's own bookkeeping became the product's reported failure. `ROADMAP.md` row `TEST-SINK-1`.
+///
+/// Real HTTP endpoints do not stop listening after N requests, so neither does this one: beyond the
+/// script it replays the last scripted response, which is also what a real server would do — a 403
+/// stays a 403 however many times you ask.
 fn serve_fake_sink(
     listener: TcpListener,
     responses: Vec<SinkResponse>,
     tx: Sender<RecordedRequest>,
+    shutdown: Arc<AtomicBool>,
+    faults: Arc<Mutex<Vec<String>>>,
 ) {
-    for response in responses {
-        let Ok((stream, _)) = listener.accept() else {
-            return;
+    // Replay is bounded. "Keep listening" is the repair, but *unbounded* replay reintroduces a
+    // worse failure than the one it fixes: a client that connects in a loop keeps the sink fed
+    // forever and the test HANGS instead of failing. That happened during development — one run saw
+    // 101 requests arrive on a sink scripted for 2. A cap converts that into a named fault, and the
+    // number is far above any legitimate scenario: the CLI's own ceiling is
+    // `script length x RETRY_ATTEMPT_LIMIT`, and no test here scripts more than a handful.
+    const MAX_SERVED_CONNECTIONS: usize = 256;
+    let mut served = 0usize;
+    let mut scripted: VecDeque<_> = responses.into();
+    let mut last: Option<SinkResponse> = None;
+    loop {
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) => {
+                // Previously swallowed by `let Ok(..) else { return }`, which closed the port and
+                // left the cause invisible. Record it so `Drop` names it.
+                record_fault(&faults, format!("accept failed: {error}"));
+                return;
+            }
         };
-        handle_fake_sink_connection(stream, response, &tx);
+        if shutdown.load(Ordering::SeqCst) {
+            return; // the wake-up connection from `Drop`
+        }
+        let response = scripted
+            .front()
+            .cloned()
+            // `last` is only `None` for an empty script, which no test writes; answering 200 keeps
+            // the port honest rather than silently closing it.
+            .or_else(|| last.clone())
+            .unwrap_or(SinkResponse::Ok);
+        match handle_fake_sink_connection(stream, response, &tx) {
+            Ok(false) => continue,
+            Ok(true) => {
+                served += 1;
+                if let Some(consumed) = scripted.pop_front() {
+                    last = Some(consumed);
+                }
+                if served > MAX_SERVED_CONNECTIONS {
+                    record_fault(
+                        &faults,
+                        format!(
+                            "sink served more than {MAX_SERVED_CONNECTIONS} ingest connections; \
+                             an ingest client is looping rather than finishing"
+                        ),
+                    );
+                    return;
+                }
+            }
+            Err(error) => record_fault(&faults, error),
+        }
     }
 }
 
+/// Serve one connection.
+///
+/// `Err` means the **sink** could not do its job — a malformed request line, a header with no
+/// colon, a body that is not the JSON it claims to be — and `Drop` fails the test with it. A client
+/// that hangs up mid-request is deliberately NOT an error: several tests kill the CLI on purpose,
+/// and the wake-up connection from `Drop` sends nothing at all. Every `unwrap()` here used to panic
+/// a detached thread instead, which killed the listener and turned the real cause into
+/// `Connection refused` at whatever unrelated place next tried to connect.
 fn handle_fake_sink_connection(
     mut stream: TcpStream,
     response: SinkResponse,
     tx: &Sender<RecordedRequest>,
-) {
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
+) -> Result<bool, String> {
+    let cloned = stream
+        .try_clone()
+        .map_err(|error| format!("clone sink stream: {error}"))?;
+    let mut reader = BufReader::new(cloned);
     let mut request_line = String::new();
-    reader.read_line(&mut request_line).unwrap();
-    let path = request_line.split_whitespace().nth(1).unwrap().to_string();
+    match reader.read_line(&mut request_line) {
+        Ok(0) | Err(_) => return Ok(false), // client hung up before sending anything
+        Ok(_) => {}
+    }
+    let Some(path) = request_line.split_whitespace().nth(1).map(str::to_string) else {
+        return Err(format!("malformed request line: {request_line:?}"));
+    };
+    // Parallel tests use ephemeral ports. A client that reserved a port and released it before
+    // spawning its server can briefly race this already-bound sink and send a readiness probe here
+    // instead. Such traffic is neither an ingest request nor evidence that the ingest CLI loops:
+    // reject it without consuming a scripted response or recording it in the ingest channel.
+    if !path.starts_with("/1/") {
+        write_response(&mut stream, 404, "NOT FOUND", "{}");
+        return Ok(false);
+    }
     let mut headers = BTreeMap::new();
     let mut line = String::new();
     loop {
         line.clear();
-        reader.read_line(&mut line).unwrap();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => return Ok(false), // client hung up mid-headers
+            Ok(_) => {}
+        }
         if line == "\r\n" {
             break;
         }
-        let (name, value) = line.trim_end().split_once(':').unwrap();
+        let Some((name, value)) = line.trim_end().split_once(':') else {
+            return Err(format!("malformed header line: {line:?}"));
+        };
         headers.insert(name.to_ascii_lowercase(), value.trim().to_string());
     }
 
@@ -1130,30 +1453,43 @@ fn handle_fake_sink_connection(
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
     let mut body_bytes = vec![0; content_length];
-    reader.read_exact(&mut body_bytes).unwrap();
+    if reader.read_exact(&mut body_bytes).is_err() {
+        return Ok(false); // client hung up mid-body
+    }
     let body = if headers
         .get("content-type")
         .is_some_and(|value| value.starts_with("application/x-ndjson"))
     {
-        Value::Array(
-            body_bytes
-                .split(|byte| *byte == b'\n')
-                .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
-                .map(|line| serde_json::from_slice(line).unwrap())
-                .collect(),
-        )
+        let mut entries = Vec::new();
+        for line in body_bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        {
+            entries.push(
+                serde_json::from_slice(line)
+                    .map_err(|error| format!("ndjson line is not JSON: {error}"))?,
+            );
+        }
+        Value::Array(entries)
     } else if body_bytes.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice(&body_bytes).unwrap()
+        serde_json::from_slice(&body_bytes)
+            .map_err(|error| format!("request body is not JSON: {error}"))?
     };
-    tx.send(RecordedRequest {
-        path,
-        headers,
-        raw_body: body_bytes,
-        body,
-    })
-    .unwrap();
+    // A closed receiver just means the test finished and dropped its `FakeBatchSink`; that is not a
+    // sink fault, and reporting it as one would race `Drop`'s own fault check.
+    if tx
+        .send(RecordedRequest {
+            path,
+            headers,
+            raw_body: body_bytes,
+            body,
+        })
+        .is_err()
+    {
+        return Ok(true);
+    }
 
     match response {
         SinkResponse::Ok => write_response(&mut stream, 200, "OK", "{}"),
@@ -1170,9 +1506,11 @@ fn handle_fake_sink_connection(
             let head = format!(
                 "HTTP/1.1 307 Redirect\r\nLocation: http://127.0.0.1/next?key={secret}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             );
-            stream.write_all(head.as_bytes()).unwrap();
+            // Write failures here mean the client is already gone — benign, never a sink fault.
+            let _ = stream.write_all(head.as_bytes());
         }
     }
+    Ok(true)
 }
 
 fn write_response(stream: &mut TcpStream, status: u16, reason: &str, body: &str) {
@@ -1180,7 +1518,8 @@ fn write_response(stream: &mut TcpStream, status: u16, reason: &str, body: &str)
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    stream.write_all(response.as_bytes()).unwrap();
+    // The client may have hung up (several tests kill the CLI mid-batch); that is not a fault.
+    let _ = stream.write_all(response.as_bytes());
 }
 
 fn write_retry_after_response(
@@ -1194,5 +1533,6 @@ fn write_retry_after_response(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nRetry-After: {retry_after}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    stream.write_all(response.as_bytes()).unwrap();
+    // Same as `write_response`: a hung-up client is not a sink fault.
+    let _ = stream.write_all(response.as_bytes());
 }

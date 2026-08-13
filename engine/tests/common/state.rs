@@ -333,11 +333,40 @@ pub fn build_test_app_for_local_requests(admin_key: Option<&str>) -> (Router, Te
     (app, temp_dir)
 }
 
+/// Build a local-request router while returning the exact analytics runtime wired into it.
+///
+/// Tests that verify both HTTP-visible debug events and persisted analytics must flush this
+/// collector and query this paired engine; the process-global collector is a different owner.
+pub fn build_test_app_for_local_requests_with_analytics(
+    admin_key: Option<&str>,
+) -> (
+    Router,
+    TempDir,
+    Arc<flapjack::analytics::AnalyticsCollector>,
+    Arc<flapjack::analytics::AnalyticsQueryEngine>,
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let (app, analytics_collector, analytics_engine) =
+        build_test_app_for_data_dir_with_analytics(temp_dir.path(), admin_key);
+    (app, temp_dir, analytics_collector, analytics_engine)
+}
+
 pub fn build_test_app_for_existing_data_dir(data_dir: &Path, admin_key: Option<&str>) -> Router {
     build_test_app_for_data_dir(data_dir, admin_key)
 }
 
 fn build_test_app_for_data_dir(data_dir: &Path, admin_key: Option<&str>) -> Router {
+    build_test_app_for_data_dir_with_analytics(data_dir, admin_key).0
+}
+
+fn build_test_app_for_data_dir_with_analytics(
+    data_dir: &Path,
+    admin_key: Option<&str>,
+) -> (
+    Router,
+    Arc<flapjack::analytics::AnalyticsCollector>,
+    Arc<flapjack::analytics::AnalyticsQueryEngine>,
+) {
     let (analytics_collector, analytics_engine) =
         build_analytics_runtime(analytics_config(data_dir, 10_000));
 
@@ -360,10 +389,10 @@ fn build_test_app_for_data_dir(data_dir: &Path, admin_key: Option<&str>) -> Rout
         None,
     );
 
-    flapjack_http::router::build_router(
+    let app = flapjack_http::router::build_router(
         state,
         key_store,
-        analytics_collector,
+        Arc::clone(&analytics_collector),
         default_trusted_proxy_matcher(),
         data_dir,
         flapjack_http::router::RouterConfig {
@@ -371,7 +400,9 @@ fn build_test_app_for_data_dir(data_dir: &Path, admin_key: Option<&str>) -> Rout
             disable_dashboard: false,
             replication_api_key: None,
         },
-    )
+    );
+
+    (app, analytics_collector, analytics_engine)
 }
 
 pub async fn spawn_server_with_key(admin_key: Option<&str>) -> (String, TempDir) {

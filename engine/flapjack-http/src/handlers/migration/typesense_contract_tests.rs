@@ -6,35 +6,11 @@ use flapjack::index::settings::IndexSettings;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../tests/fixtures/2026_07_26_m0b_typesense_migration/expected_bundle.json")
-}
+use crate::router_tests::typesense_fixture_test_support::{expected_bundle, products_documents};
 
 fn m0b_public_contract_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../docs2/3_IMPLEMENTATION/2026_07_26_m0b_typesense_source_contract.md")
-}
-
-fn expected_bundle() -> Value {
-    let path = fixture_path();
-    serde_json::from_slice(
-        &std::fs::read(&path)
-            .unwrap_or_else(|error| panic!("fixture {} must be readable: {error}", path.display())),
-    )
-    .unwrap_or_else(|error| panic!("fixture {} must be JSON: {error}", path.display()))
-}
-
-fn products_documents(bundle: &Value) -> Vec<Value> {
-    bundle["source"]["collections"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|collection| collection["name"] == "fj_ts_migration_products")
-        .unwrap()["documents"]
-        .as_array()
-        .unwrap()
-        .clone()
 }
 
 fn serialized_settings(settings: &IndexSettings) -> Value {
@@ -89,7 +65,7 @@ async fn capture_typesense_contract_documents(
         json!({}),
         vec![documents.clone(), documents],
     );
-    let mut reader = TypesenseSourceReader::from_source("fj_ts_migration_products", source);
+    let mut reader = TypesenseSourceReader::from_source("fj_ts_migration_products", source, true);
     let mut sink = RecordingSink::default();
 
     accept_source_export(
@@ -104,13 +80,16 @@ async fn capture_typesense_contract_documents(
 
 #[tokio::test]
 async fn typesense_stable_id_mapping_uses_the_production_document_record_path() {
-    let bundle = expected_bundle();
-    let documents = products_documents(&bundle);
-    let expected_ids = vec![
-        "prod_001".to_string(),
-        "prod_002".to_string(),
-        "prod_003".to_string(),
-    ];
+    let documents = products_documents().to_vec();
+    let expected_ids = documents
+        .iter()
+        .map(|document| {
+            document["id"]
+                .as_str()
+                .expect("fixture product ids must be strings")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
 
     let mut missing_with_synthesized_object_id = documents.clone();
     missing_with_synthesized_object_id[0]
@@ -185,10 +164,8 @@ async fn typesense_stable_id_mapping_uses_the_production_document_record_path() 
 fn typesense_settings_m0b_known_answer_translates_schema_flags() {
     let bundle = expected_bundle();
 
-    let (categories, _) = typesense_settings_and_warnings(&collection_settings(
-        &bundle,
-        "fj_ts_migration_categories",
-    ));
+    let (categories, _) =
+        typesense_settings_and_warnings(&collection_settings(bundle, "fj_ts_migration_categories"));
     let expected_categories = IndexSettings {
         attributes_for_faceting: vec!["active".to_string(), "labels".to_string()],
         searchable_attributes: Some(vec![
@@ -207,7 +184,7 @@ fn typesense_settings_m0b_known_answer_translates_schema_flags() {
     assert!(categories.custom_ranking.is_none());
 
     let (products, _) =
-        typesense_settings_and_warnings(&collection_settings(&bundle, "fj_ts_migration_products"));
+        typesense_settings_and_warnings(&collection_settings(bundle, "fj_ts_migration_products"));
     let expected_products = IndexSettings {
         attributes_for_faceting: vec![
             "price".to_string(),
@@ -282,10 +259,8 @@ fn typesense_settings_preserves_explicit_empty_searchable_attributes() {
 fn typesense_settings_m0b_warning_set_is_exact() {
     let bundle = expected_bundle();
 
-    let (_, categories_warnings) = typesense_settings_and_warnings(&collection_settings(
-        &bundle,
-        "fj_ts_migration_categories",
-    ));
+    let (_, categories_warnings) =
+        typesense_settings_and_warnings(&collection_settings(bundle, "fj_ts_migration_categories"));
     assert_eq!(
         categories_warnings,
         vec![(
@@ -295,7 +270,7 @@ fn typesense_settings_m0b_warning_set_is_exact() {
     );
 
     let (_, products_warnings) =
-        typesense_settings_and_warnings(&collection_settings(&bundle, "fj_ts_migration_products"));
+        typesense_settings_and_warnings(&collection_settings(bundle, "fj_ts_migration_products"));
     assert_eq!(
         products_warnings,
         vec![

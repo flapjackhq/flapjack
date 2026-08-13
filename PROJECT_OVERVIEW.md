@@ -1,99 +1,47 @@
 # Flapjack - Project Overview
 
-**Last updated:** 2026-08-05
+**Last updated:** 2026-08-12
 
 ## Mission
 
-Flapjack is a drop-in replacement for Algolia: a typo-tolerant full-text search
-engine with faceting, geo search, custom ranking, vector search, and click
-analytics. It keeps the Algolia-compatible client and InstantSearch.js surface
-working while running as a single static binary with data stored on disk.
+Flapjack is a drop-in replacement for Algolia: a typo-tolerant full-text search engine with faceting, geo search, custom ranking, vector search, and click analytics.
+It keeps the Algolia-compatible client and InstantSearch.js surface working while running as a single static binary with data stored on disk.
 
 ## Highest Priority
 
-**Adoption status, stated once so no other document has to guess: Flapjack has no
-users and no customers.** Releases exist (`v1.0.10`, 2026-06-09) and the source is
-public, but nobody is running it in production, Flapjack Cloud is not live, and
-no revenue exists. Corrected 2026-08-02: an earlier commercial-adoption claim
-was false and had been propagating into risk arguments that assumed real
-workloads. Two consequences bind every planning
-decision below. **(1) Breaking changes are cheap** — there is no installed base
-to migrate, so prefer the correct design over the compatible one wherever they
-conflict, except on the Algolia-compatible wire surface, which is the product.
-**(2) Nothing is urgent because it is "in production" — the urgency is that we
-cannot yet honestly ask anyone to adopt it.** The bar is not "no known incidents";
-it is "we can prove the claims we make."
+**Adoption status, stated once so no other document has to guess: Flapjack has no users and no customers.** `v1.0.11` published 2026-08-06 and the source is public,
+but nobody runs it in production, Flapjack Cloud is not live, and no revenue exists. Corrected 2026-08-02: an earlier commercial-adoption claim was false and had
+been propagating into risk arguments that assumed real workloads. **(1) Breaking changes are cheap** — no installed base to migrate, so prefer the correct design
+over the compatible one wherever they conflict, except on the Algolia-compatible wire surface, which is the product. **(2) Nothing is urgent because it is "in
+production" — the urgency is that we cannot yet honestly ask anyone to adopt it.** The bar is not "no known incidents"; it is "we can prove the claims we make."
 
-The current strategic order is:
+**Current priority order, row state, and executable exits live only in [`ROADMAP.md`](ROADMAP.md), especially `## Up Next`.** This overview owns the enduring reason for that order: local correctness comes before outward publication, adoption claims require fail-capable evidence, and build-heavy proofs must not overlap when host contention would invalidate them. Keeping the numbered work list out of this file prevents two priority owners from drifting apart.
 
-1. **`REL-11` — the release path, which now gates every other item in this list.**
-   The 2026-08-05 v1.0.11 cut was attempted and stopped on two packaging defects,
-   so users still resolve `v1.0.10` from 2026-06-09. It gates both channels, not
-   just OSS: Flapjack Cloud bakes its engine AMI from the same published release
-   archive and manifest, so **no engine capability described below has actually
-   reached a user by either route.** Ranked first because it is the only row whose
-   closure changes that. Owner and exit: [`ROADMAP.md`](ROADMAP.md) row `REL-11`.
+Release history and shipped-feature lineage stay in [`CHANGELOG.md`](CHANGELOG.md) and
+[`engine/docs2/FEATURES.md`](engine/docs2/FEATURES.md). `PROJECT_OVERVIEW.md` owns
+mission, scope, adoption truth, and product-surface policy; it does not duplicate the open-work ledger.
 
-2. **`NIGHT-1` — twenty consecutive red nights on the public mirror.** Every
-   `nightly.yml` run from 2026-07-17 to 2026-08-05 failed in `Migration import
-   contract`, and the current cause makes it report red while the product passes.
-   Ranked second because it means the only recurring real-Algolia end-to-end guard
-   produced no signal across the whole period the migration feature set — the one
-   being sold — was rebuilt. Owner and exit: [`ROADMAP.md`](ROADMAP.md) row `NIGHT-1`.
+## Product surfaces
 
-3. **Security follow-through — the `SEC-W4` hygiene residuals.** The serving-path
-   security story has stopped being a capability question: HTTPS serves from
-   operator-supplied PEM files or from ACME-issued material that rotates on a
-   running listener without a restart, replication peers carry a mandatory
-   credential over non-cleartext transport, and the console holds no key material
-   in browser storage. What is left is hygiene, and it is small: a disposition for
-   the production moderate advisories sitting below the audit gate's
-   high-and-above threshold, and the plaintext tarball snapshot helpers
-   (`SEC-G5`), which have now been carried unscheduled across five consecutive
-   batches and are scheduled a wave slot or an explicit written acceptance rather
-   than a sixth roll forward. Owner and exit: [`ROADMAP.md`](ROADMAP.md) row `SEC-W4`, which routes
-   the control-level gap detail.
+`engine/dashboard/` (React) is **the shipping UI, and it is frozen against new screens as of 2026-08-08.** This section is the single owner of that policy:
+`.scrai/overview.md` — which assembles into `CLAUDE.md` and `AGENTS.md` — deliberately states no scheduling policy and points every agent here, so this is
+the only place the answer exists. **Corrected 2026-08-08: this section previously read "not frozen and not scheduled for replacement," which was false in both
+halves and contradicted this file's own product-surface policy two sections above it.** That is `DOC-SSOT-1`'s defect recurring one day after it closed — not as a stale
+restatement this time, but as an owner that disagreed with itself, which is the harder version to notice.
 
-4. **RF-4 — runbooks iteration.** Keep operational routing in
-   [`engine/docs2/3_IMPLEMENTATION/OPERATIONS.md`](engine/docs2/3_IMPLEMENTATION/OPERATIONS.md)
-   and keep folding incident learnings into the runbooks.
+The policy, sourced from the decision rather than restated from memory: [ADR 0006](engine/docs2/3_IMPLEMENTATION/decisions/active/0006_console_source_home.md)
+has been **Accepted since 2026-07-18** — one Svelte console replaces both this dashboard and the managed cloud console, and this tree is deleted at the
+program's **parity-gated** cutover (the program's phases live in the private `fjcloud_dev` console-unification program plan, not here). Two consequences
+that are easy to get backwards:
 
-5. **PL-10 — write-path saturation under sustained load.** The single-writer
-   Tantivy ceiling remains the architectural constraint for v1.1. Two standing
-   warnings: further scale work needs a *new falsifiable question* beyond the
-   verified floor rather than another run, and the superseded July 25 failures
-   must not be profiled as current defects. Owner and exit:
-   [`ROADMAP.md`](ROADMAP.md) row `PL-10`; measured curves live only in
-   [`engine/loadtest/BENCHMARKS.md`](engine/loadtest/BENCHMARKS.md).
+- **Deletion is gated on parity, not scheduled on a date.** ADR 0006 states `engine/dashboard` remains the shipping UI until that cutover and that nothing in
+  this repo changed at decision time. Do not read the freeze as "already replaced," and do not stop fixing it.
+- **The freeze forbids ADDING a route, not editing one.** Enforced by `engine/dashboard/src/App.routeFreeze.test.tsx`, which pins the 24 route paths in
+  `App.tsx`. Removing a route is allowed because that is migration progress; bugfix, CI, and security work inside existing screens stays legitimate until
+  cutover, because a freeze that blocks repairs gets routed around within a week. A feature added inside an existing screen is not caught — a stated bound.
 
-6. **Post-ship HA/test-signal hygiene.** HA snapshot flake remediation is
-   verified; remaining signal-protection work is tracked in
-   [`ROADMAP.md`](ROADMAP.md).
-
-7. **Backend↔frontend joined proof (JOIN-1).** Two corrections from 2026-08-03
-   must be inherited by anyone reading this: **the joinable denominator is 59, not
-   90**, and **the number is now a command**, not a hand audit — so do not
-   re-derive it. **Policy reversal, 2026-08-02: the React dashboard is no longer
-   frozen and is not scheduled for replacement.** It is the product's console and
-   is maintained like any other surface; every "deferred to the Svelte console"
-   disposition recorded before that date is void. Owner and exit:
-   [`ROADMAP.md`](ROADMAP.md) row `JOIN-1`.
-
-8. **Migration deferred-scope follow-through.** Create-only import, fenced
-   existing-target overwrite, and interrupted-job resume all ship on the
-   synchronous and authenticated async Algolia paths. HA-converging import stays
-   refused under [`ROADMAP.md`](ROADMAP.md) row `MIG-7`. Pre-launch source
-   migration is expanding to Meilisearch and Typesense through one
-   provider-neutral lifecycle; discovery ships for all three providers, and
-   resume remains Algolia-only.
-
-9. **ADR-0005 OQ4 — cross-node failover idempotency dedup.** Node-local
-   restart-durable idempotency ships; cross-node dedup remains a v1.1 planned
-   item.
-
-Release history and shipped-feature lineage stay in [`CHANGELOG.md`](CHANGELOG.md)
-and [`engine/docs2/FEATURES.md`](engine/docs2/FEATURES.md). `PROJECT_OVERVIEW.md`
-owns mission and priority order; it does not duplicate that status ledger.
+The enforcement exists because the decision alone did not hold: in the two weeks after 2026-07-25 this tree took 164 commits and +17,157 / −10,814 lines into a
+codebase already decided for deletion. Shipped dashboard capability is described in [`engine/docs2/FEATURES.md`](engine/docs2/FEATURES.md), not here.
 
 ## Scope
 
@@ -104,11 +52,10 @@ owns mission and priority order; it does not duplicate that status ledger.
 - Keep search latency low and memory usage bounded under realistic workloads.
 - Extend analytics, vector search, HA, and operational tooling without increasing
   operator complexity.
-- Keep public documentation routed through canonical owners:
-  `PROJECT_OVERVIEW.md` for mission and priority order, [`ROADMAP.md`](ROADMAP.md)
-  for open work, [`engine/docs2/FEATURES.md`](engine/docs2/FEATURES.md) for
-  shipped capability status, and [`CHANGELOG.md`](CHANGELOG.md) for release
-  history.
+- Keep public documentation routed through canonical owners: `PROJECT_OVERVIEW.md` for
+  mission and priority order, [`ROADMAP.md`](ROADMAP.md) for open work,
+  [`engine/docs2/FEATURES.md`](engine/docs2/FEATURES.md) for shipped capability status,
+  and [`CHANGELOG.md`](CHANGELOG.md) for release history.
 
 ## Non-Goals
 

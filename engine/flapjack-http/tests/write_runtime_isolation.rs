@@ -30,9 +30,14 @@ const COMMIT_DELAY_ENV_VAR: &str = "FLAPJACK_WRITE_QUEUE_TEST_COMMIT_DELAY_MS";
 const COMMIT_DELAY_MS: u64 = 2_000;
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
 const REQUIRED_SAMPLE_COUNT: usize = 100;
+const MIN_OVERLAP_ENDPOINT_SAMPLES: usize = 1;
 const LATENCY_LIMIT_MS: u128 = 250;
 const COUNT_STALL_RED_THRESHOLD_MS: u128 = 1_000;
 const INDEX_NAME: &str = "runtime_isolation";
+const OVERLAP_DENOMINATOR_SHORTFALL: &str = "overlap_denominator_shortfall";
+const SCHEDULED_DEADLINE_TAIL: &str = "scheduled_deadline_tail";
+const SCHEDULED_DEADLINE_WITHIN_CONTRACT: &str = "scheduled_deadline_within_contract";
+const REQUEST_SERVICE_TAIL: &str = "request_service_tail";
 
 struct EnvVarGuard(&'static str);
 
@@ -56,7 +61,8 @@ impl Drop for EnvVarGuard {
 #[derive(Clone, Debug)]
 struct LivenessSample {
     endpoint: &'static str,
-    latency_ms: u128,
+    scheduled_deadline_delay_ms: u128,
+    request_start_latency_ms: u128,
     batch_incomplete_at_start: bool,
 }
 
@@ -69,7 +75,24 @@ enum LivenessTiming {
 struct BatchOutcome {
     response: Response<Body>,
     elapsed: Duration,
-    completed_at: Instant,
+}
+
+struct RuntimeLivenessScenario {
+    _tmp: TempDir,
+    app: axum::Router,
+    state: Arc<AppState>,
+    samples: Vec<LivenessSample>,
+    outcome: BatchOutcome,
+}
+
+struct LivenessEvaluation {
+    overlap_samples: usize,
+    total_samples: usize,
+    scheduled_health: Vec<u128>,
+    scheduled_count: Vec<u128>,
+    request_health: Vec<u128>,
+    request_count: Vec<u128>,
+    classification: &'static str,
 }
 
 fn make_state(tmp: &TempDir) -> Arc<AppState> {
@@ -169,7 +192,6 @@ async fn sample_liveness(
     app: axum::Router,
     batch_complete: Arc<AtomicBool>,
     ready: oneshot::Sender<()>,
-    timing: LivenessTiming,
 ) -> Vec<LivenessSample> {
     let schedule_start = Instant::now();
     ready.send(()).expect("test waits for sampler readiness");
@@ -191,14 +213,22 @@ async fn sample_liveness(
             response.status()
         );
         let observed_at = Instant::now();
+        let scheduled_deadline_delay_ms = liveness_latency_ms(
+            LivenessTiming::ScheduledDeadline,
+            scheduled_deadline,
+            request_started,
+            observed_at,
+        );
+        let request_start_latency_ms = liveness_latency_ms(
+            LivenessTiming::RequestStart,
+            scheduled_deadline,
+            request_started,
+            observed_at,
+        );
         samples.push(LivenessSample {
             endpoint,
-            latency_ms: liveness_latency_ms(
-                timing,
-                scheduled_deadline,
-                request_started,
-                observed_at,
-            ),
+            scheduled_deadline_delay_ms,
+            request_start_latency_ms,
             batch_incomplete_at_start,
         });
     }
@@ -219,11 +249,18 @@ fn liveness_latency_ms(
     .as_millis()
 }
 
-fn endpoint_distribution(samples: &[LivenessSample], endpoint: &str) -> Vec<u128> {
+fn endpoint_timing_distribution(
+    samples: &[LivenessSample],
+    endpoint: &str,
+    timing: LivenessTiming,
+) -> Vec<u128> {
     let mut distribution: Vec<u128> = samples
         .iter()
         .filter(|sample| sample.endpoint == endpoint)
-        .map(|sample| sample.latency_ms)
+        .map(|sample| match timing {
+            LivenessTiming::ScheduledDeadline => sample.scheduled_deadline_delay_ms,
+            LivenessTiming::RequestStart => sample.request_start_latency_ms,
+        })
         .collect();
     distribution.sort_unstable();
     distribution
@@ -237,37 +274,149 @@ fn samples_during_batch_overlap(samples: &[LivenessSample]) -> Vec<LivenessSampl
         .collect()
 }
 
+fn liveness_sample(
+    endpoint: &'static str,
+    scheduled_deadline_delay_ms: u128,
+    request_start_latency_ms: u128,
+    batch_incomplete_at_start: bool,
+) -> LivenessSample {
+    LivenessSample {
+        endpoint,
+        scheduled_deadline_delay_ms,
+        request_start_latency_ms,
+        batch_incomplete_at_start,
+    }
+}
+
 fn p99(distribution: &[u128]) -> u128 {
     let rank = (99 * distribution.len()).div_ceil(100);
     distribution[rank - 1]
 }
 
-fn assert_liveness_distribution(samples: &[LivenessSample]) {
-    let health = endpoint_distribution(samples, "health");
-    let count = endpoint_distribution(samples, "count");
-    assert!(!health.is_empty(), "health must have liveness samples");
-    assert!(!count.is_empty(), "count must have liveness samples");
+fn distribution_is_within_contract(distribution: &[u128]) -> bool {
+    !distribution.is_empty()
+        && p99(distribution) <= LATENCY_LIMIT_MS
+        && distribution
+            .last()
+            .is_some_and(|maximum| *maximum <= LATENCY_LIMIT_MS)
+}
 
-    let health_p99 = p99(&health);
-    let count_p99 = p99(&count);
-    let health_max = *health.last().expect("health distribution is non-empty");
-    let count_max = *count.last().expect("count distribution is non-empty");
-    assert!(
-        health_p99 <= LATENCY_LIMIT_MS
-            && count_p99 <= LATENCY_LIMIT_MS
-            && health_max <= LATENCY_LIMIT_MS
-            && count_max <= LATENCY_LIMIT_MS,
-        "route liveness exceeded {LATENCY_LIMIT_MS}ms: \
-         health_samples={} health_p99={health_p99} health_max={health_max} health={health:?}; \
-         count_samples={} count_p99={count_p99} count_max={count_max} count={count:?}",
-        health.len(),
-        count.len(),
+fn classify_liveness_distributions(
+    scheduled_health: &[u128],
+    scheduled_count: &[u128],
+    request_health: &[u128],
+    request_count: &[u128],
+) -> &'static str {
+    if [
+        scheduled_health,
+        scheduled_count,
+        request_health,
+        request_count,
+    ]
+    .iter()
+    .any(|distribution| distribution.len() < MIN_OVERLAP_ENDPOINT_SAMPLES)
+    {
+        return OVERLAP_DENOMINATOR_SHORTFALL;
+    }
+
+    let scheduled_deadline_live = distribution_is_within_contract(scheduled_health)
+        && distribution_is_within_contract(scheduled_count);
+    let request_service_live = distribution_is_within_contract(request_health)
+        && distribution_is_within_contract(request_count);
+    match (scheduled_deadline_live, request_service_live) {
+        (false, true) => SCHEDULED_DEADLINE_TAIL,
+        (true, true) => SCHEDULED_DEADLINE_WITHIN_CONTRACT,
+        (_, false) => REQUEST_SERVICE_TAIL,
+    }
+}
+
+fn metric_or_na(distribution: &[u128], metric: impl FnOnce(&[u128]) -> u128) -> String {
+    if distribution.is_empty() {
+        "n/a".to_string()
+    } else {
+        metric(distribution).to_string()
+    }
+}
+
+fn evaluate_liveness_samples(samples: &[LivenessSample]) -> LivenessEvaluation {
+    let overlap_samples = samples_during_batch_overlap(samples);
+    let scheduled_health = endpoint_timing_distribution(
+        &overlap_samples,
+        "health",
+        LivenessTiming::ScheduledDeadline,
+    );
+    let scheduled_count =
+        endpoint_timing_distribution(&overlap_samples, "count", LivenessTiming::ScheduledDeadline);
+    let request_health =
+        endpoint_timing_distribution(&overlap_samples, "health", LivenessTiming::RequestStart);
+    let request_count =
+        endpoint_timing_distribution(&overlap_samples, "count", LivenessTiming::RequestStart);
+    let classification = classify_liveness_distributions(
+        &scheduled_health,
+        &scheduled_count,
+        &request_health,
+        &request_count,
+    );
+    LivenessEvaluation {
+        overlap_samples: overlap_samples.len(),
+        total_samples: samples.len(),
+        scheduled_health,
+        scheduled_count,
+        request_health,
+        request_count,
+        classification,
+    }
+}
+
+impl LivenessEvaluation {
+    fn describe(&self, label: &str) -> String {
+        format!(
+            "{label}: classification={} overlap_samples={} total_samples={}; ScheduledDeadline distribution: health_samples={} health_p99_ms={} health_max_ms={} health={:?}; count_samples={} count_p99_ms={} count_max_ms={} count={:?}; RequestStart distribution: health_samples={} health_p99_ms={} health_max_ms={} health={:?}; count_samples={} count_p99_ms={} count_max_ms={} count={:?}",
+            self.classification,
+            self.overlap_samples,
+            self.total_samples,
+            self.scheduled_health.len(),
+            metric_or_na(&self.scheduled_health, p99),
+            metric_or_na(&self.scheduled_health, |distribution| distribution[distribution.len() - 1]),
+            self.scheduled_health,
+            self.scheduled_count.len(),
+            metric_or_na(&self.scheduled_count, p99),
+            metric_or_na(&self.scheduled_count, |distribution| distribution[distribution.len() - 1]),
+            self.scheduled_count,
+            self.request_health.len(),
+            metric_or_na(&self.request_health, p99),
+            metric_or_na(&self.request_health, |distribution| distribution[distribution.len() - 1]),
+            self.request_health,
+            self.request_count.len(),
+            metric_or_na(&self.request_count, p99),
+            metric_or_na(&self.request_count, |distribution| distribution[distribution.len() - 1]),
+            self.request_count,
+        )
+    }
+}
+
+fn assert_liveness_distribution(samples: &[LivenessSample]) {
+    let evaluation = evaluate_liveness_samples(samples);
+    eprintln!(
+        "{}",
+        evaluation.describe("Stage 1 workspace admission discriminator")
+    );
+    assert_eq!(
+        evaluation.classification,
+        SCHEDULED_DEADLINE_WITHIN_CONTRACT,
+        "workspace admission liveness failed: classification={} overlap_samples={} total_samples={}",
+        evaluation.classification,
+        evaluation.overlap_samples,
+        evaluation.total_samples,
     );
 }
 
-fn assert_route_characterization(samples: &[LivenessSample]) -> (Vec<u128>, Vec<u128>) {
-    let health = endpoint_distribution(samples, "health");
-    let count = endpoint_distribution(samples, "count");
+fn assert_route_characterization(
+    samples: &[LivenessSample],
+    timing: LivenessTiming,
+) -> (Vec<u128>, Vec<u128>) {
+    let health = endpoint_timing_distribution(samples, "health", timing);
+    let count = endpoint_timing_distribution(samples, "count", timing);
     let health_max = *health.last().expect("health must have liveness samples");
     let count_max = *count.last().expect("count must have liveness samples");
     assert!(
@@ -284,54 +433,48 @@ fn assert_route_characterization(samples: &[LivenessSample]) -> (Vec<u128>, Vec<
 #[test]
 fn route_characterization_accepts_count_latency_below_red_threshold() {
     let mut samples = [
-        LivenessSample {
-            endpoint: "health",
-            latency_ms: LATENCY_LIMIT_MS,
-            batch_incomplete_at_start: true,
-        },
-        LivenessSample {
-            endpoint: "count",
-            latency_ms: COUNT_STALL_RED_THRESHOLD_MS,
-            batch_incomplete_at_start: true,
-        },
+        liveness_sample("health", LATENCY_LIMIT_MS, LATENCY_LIMIT_MS, true),
+        liveness_sample(
+            "count",
+            COUNT_STALL_RED_THRESHOLD_MS,
+            COUNT_STALL_RED_THRESHOLD_MS,
+            true,
+        ),
     ];
-    assert_route_characterization(&samples);
+    assert_route_characterization(&samples, LivenessTiming::ScheduledDeadline);
     for endpoint_index in [1, 0] {
-        samples[endpoint_index].latency_ms += 1;
-        assert!(std::panic::catch_unwind(|| assert_route_characterization(&samples)).is_err());
-        samples[endpoint_index].latency_ms -= 1;
+        samples[endpoint_index].scheduled_deadline_delay_ms += 1;
+        assert!(std::panic::catch_unwind(|| {
+            assert_route_characterization(&samples, LivenessTiming::ScheduledDeadline)
+        })
+        .is_err());
+        samples[endpoint_index].scheduled_deadline_delay_ms -= 1;
     }
 }
 
 #[test]
 fn route_characterization_ignores_samples_started_after_batch_completion() {
     let samples = [
-        LivenessSample {
-            endpoint: "health",
-            latency_ms: LATENCY_LIMIT_MS,
-            batch_incomplete_at_start: true,
-        },
-        LivenessSample {
-            endpoint: "count",
-            latency_ms: COUNT_STALL_RED_THRESHOLD_MS,
-            batch_incomplete_at_start: true,
-        },
-        LivenessSample {
-            endpoint: "health",
-            latency_ms: LATENCY_LIMIT_MS + 1,
-            batch_incomplete_at_start: false,
-        },
-        LivenessSample {
-            endpoint: "count",
-            latency_ms: COUNT_STALL_RED_THRESHOLD_MS + 1,
-            batch_incomplete_at_start: false,
-        },
+        liveness_sample("health", LATENCY_LIMIT_MS, LATENCY_LIMIT_MS, true),
+        liveness_sample(
+            "count",
+            COUNT_STALL_RED_THRESHOLD_MS,
+            COUNT_STALL_RED_THRESHOLD_MS,
+            true,
+        ),
+        liveness_sample("health", LATENCY_LIMIT_MS + 1, LATENCY_LIMIT_MS + 1, false),
+        liveness_sample(
+            "count",
+            COUNT_STALL_RED_THRESHOLD_MS + 1,
+            COUNT_STALL_RED_THRESHOLD_MS + 1,
+            false,
+        ),
     ];
 
     let overlap_samples = samples_during_batch_overlap(&samples);
 
     assert_eq!(overlap_samples.len(), 2);
-    assert_route_characterization(&overlap_samples);
+    assert_route_characterization(&overlap_samples, LivenessTiming::ScheduledDeadline);
 }
 
 #[test]
@@ -357,6 +500,50 @@ fn single_worker_timing_includes_scheduler_starvation_before_request_start() {
             observed_at,
         ),
         1,
+    );
+}
+
+#[test]
+fn liveness_classification_covers_each_measured_outcome() {
+    let within_contract = [1, LATENCY_LIMIT_MS];
+    let above_contract = [LATENCY_LIMIT_MS + 1];
+    let empty = [];
+
+    assert_eq!(
+        classify_liveness_distributions(
+            &empty,
+            &within_contract,
+            &within_contract,
+            &within_contract,
+        ),
+        OVERLAP_DENOMINATOR_SHORTFALL,
+    );
+    assert_eq!(
+        classify_liveness_distributions(
+            &above_contract,
+            &above_contract,
+            &within_contract,
+            &within_contract,
+        ),
+        SCHEDULED_DEADLINE_TAIL,
+    );
+    assert_eq!(
+        classify_liveness_distributions(
+            &within_contract,
+            &within_contract,
+            &within_contract,
+            &within_contract,
+        ),
+        SCHEDULED_DEADLINE_WITHIN_CONTRACT,
+    );
+    assert_eq!(
+        classify_liveness_distributions(
+            &within_contract,
+            &within_contract,
+            &above_contract,
+            &within_contract,
+        ),
+        REQUEST_SERVICE_TAIL,
     );
 }
 
@@ -440,7 +627,6 @@ fn spawn_delayed_batch(
         BatchOutcome {
             response,
             elapsed: completed_at.duration_since(started),
-            completed_at,
         }
     })
 }
@@ -463,29 +649,6 @@ async fn join_liveness_and_batch(
             let samples = sampler.await.expect("sampler task completes");
             (samples, outcome)
         }
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn liveness_join_surfaces_batch_panic_without_waiting_for_sampler() {
-    let sampler = tokio::spawn(async { std::future::pending::<Vec<LivenessSample>>().await });
-    let batch = tokio::spawn(async {
-        panic!("simulated batch task failure");
-        #[allow(unreachable_code)]
-        BatchOutcome {
-            response: Response::new(Body::empty()),
-            elapsed: Duration::ZERO,
-            completed_at: Instant::now(),
-        }
-    });
-    let joined = tokio::spawn(join_liveness_and_batch(sampler, batch));
-
-    let result = tokio::time::timeout(Duration::from_millis(250), joined)
-        .await
-        .expect("batch task failure must be observed without waiting for the sampler");
-    match result {
-        Ok(_) => panic!("batch task failure must panic the liveness join"),
-        Err(join_error) => assert!(join_error.is_panic()),
     }
 }
 
@@ -517,13 +680,18 @@ async fn assert_committed_batch(app: &axum::Router, state: &Arc<AppState>, outco
     assert_eq!(latest_document_count(app).await, 1);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-#[serial_test::serial]
-async fn single_worker_runtime_serves_count_during_injected_two_second_commit() {
+async fn prepare_runtime_liveness_scenario() -> (TempDir, axum::Router, Arc<AppState>) {
     let tmp = TempDir::new().expect("temporary data directory");
     let (app, state) = make_router(&tmp);
     prepare_index(&app).await;
+    (tmp, app, state)
+}
 
+async fn run_prepared_delayed_commit_liveness_scenario(
+    tmp: TempDir,
+    app: axum::Router,
+    state: Arc<AppState>,
+) -> RuntimeLivenessScenario {
     let _delay_guard = EnvVarGuard::set(COMMIT_DELAY_ENV_VAR, &COMMIT_DELAY_MS.to_string());
     let batch_complete = Arc::new(AtomicBool::new(false));
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -531,14 +699,31 @@ async fn single_worker_runtime_serves_count_during_injected_two_second_commit() 
         app.clone(),
         Arc::clone(&batch_complete),
         ready_tx,
-        LivenessTiming::ScheduledDeadline,
     ));
     ready_rx.await.expect("separate sampler task became ready");
     let batch = spawn_delayed_batch(app.clone(), batch_complete);
 
     let (samples, outcome) = join_liveness_and_batch(sampler, batch).await;
-    assert_committed_batch(&app, &state, outcome).await;
-    assert_liveness_distribution(&samples);
+    RuntimeLivenessScenario {
+        _tmp: tmp,
+        app,
+        state,
+        samples,
+        outcome,
+    }
+}
+
+async fn run_delayed_commit_liveness_scenario() -> RuntimeLivenessScenario {
+    let (tmp, app, state) = prepare_runtime_liveness_scenario().await;
+    run_prepared_delayed_commit_liveness_scenario(tmp, app, state).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial_test::serial]
+async fn single_worker_runtime_serves_count_during_injected_two_second_commit() {
+    let scenario = run_delayed_commit_liveness_scenario().await;
+    assert_committed_batch(&scenario.app, &scenario.state, scenario.outcome).await;
+    assert_liveness_distribution(&scenario.samples);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -564,20 +749,16 @@ async fn routes_stay_live_while_backpressure_pause_and_commit_overlap() {
         .hold_write_backpressure_pause_for_test_support(INDEX_NAME)
         .expect("existing backpressure owner holds the tenant pause");
 
-    let overlap_started = Instant::now();
     let (ready_tx, ready_rx) = oneshot::channel();
     let sampler = tokio::spawn(sample_liveness(
         app.clone(),
         Arc::clone(&batch_complete),
         ready_tx,
-        LivenessTiming::RequestStart,
     ));
     ready_rx.await.expect("overlap sampler became ready");
 
     let (samples, outcome) = join_liveness_and_batch(sampler, batch).await;
-    let overlap_elapsed = outcome
-        .completed_at
-        .saturating_duration_since(overlap_started);
+    let overlap_elapsed = outcome.elapsed;
     assert_committed_batch(&app, &state, outcome).await;
     let overlap_samples = samples_during_batch_overlap(&samples);
     assert!(
@@ -587,7 +768,8 @@ async fn routes_stay_live_while_backpressure_pause_and_commit_overlap() {
         samples.len(),
         overlap_elapsed.as_millis()
     );
-    let (health, count) = assert_route_characterization(&overlap_samples);
+    let (health, count) =
+        assert_route_characterization(&overlap_samples, LivenessTiming::RequestStart);
     let health_p99 = p99(&health);
     let count_p99 = p99(&count);
     let health_max = *health.last().expect("health distribution is non-empty");

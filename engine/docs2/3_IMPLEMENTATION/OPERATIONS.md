@@ -220,7 +220,7 @@ restart body: {"jobId":"ef4c16f4-3281-42c8-b5f9-553b9f4a265d","phase":"activatin
 
 Preview reads and translates a source without admitting a job. The three admin-authenticated preview routes are all `POST`: `/1/migrations/algolia/preview`, `/1/migrations/meilisearch/preview`, and `/1/migrations/typesense/preview`. Send the Flapjack application id in `x-algolia-application-id` and the Flapjack admin key in `x-algolia-api-key`; source credentials go in the JSON body. Do not embed real credentials in scripts or logs. <!-- owner: engine/flapjack-http/src/router.rs:134 --> <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:937 --> <!-- owner: engine/docs2/openapi.json -->
 
-Request-body ownership is per provider: Algolia uses `MigrateFromAlgoliaRequest` (`appId`, `apiKey`, `sourceIndex`, optional `targetIndex`, `overwrite`); Meilisearch uses `MigrateFromMeilisearchRequest` (`endpoint`, `apiKey`, `sourceIndex`, optional `targetIndex`, `overwrite`); Typesense currently reuses the Algolia-shaped `MigrateFromAlgoliaRequest`. The generated wire contract in `engine/docs2/openapi.json` is the source of truth for these shapes. <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:92 --> <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:114 --> <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:134 -->
+Request-body ownership is per provider: Algolia uses `MigrateFromAlgoliaRequest` (`appId`, `apiKey`, `sourceIndex`, optional `targetIndex`, `overwrite`); Meilisearch uses `MigrateFromMeilisearchRequest` (`endpoint`, `apiKey`, `sourceIndex`, optional `targetIndex`, `overwrite`); Typesense uses `MigrateFromTypesenseRequest` (`node`, `apiKey`, `sourceIndex`, required literal `sourceWriteFrozen: true`, optional `targetIndex`, `overwrite`). The generated wire contract in `engine/docs2/openapi.json` is the source of truth for these shapes. <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:92 --> <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:114 --> <!-- owner: engine/flapjack-http/src/handlers/migration/mod.rs:134 -->
 
 On HTTP `200` the body is `MigrationPreviewResponse`. Its value contract is exactly:
 
@@ -239,7 +239,7 @@ Per-provider disposition (published OpenAPI path presence is not a claim that a 
 | --- | --- | --- | --- |
 | Algolia | `MigrateFromAlgoliaRequest` | Fixture route proof returned the translation owner's exact report with `sourceCounts.indexes=1`, `records=3`. | Fixture-proven. No real-Algolia preview claim. |
 | Meilisearch | `MigrateFromMeilisearchRequest` | Pinned local source lifecycle reached; the production route stays unproven. | Real-source parity **open**. Two residuals: `MeilisearchClient::new` rejects the loopback endpoint (strict HTTPS `*.meilisearch.io`), and `source_reader.rs::normalize_meilisearch_settings` collects then discards its translation warnings. |
-| Typesense | `MigrateFromAlgoliaRequest` (Algolia-shaped) | Real-source KAT passes; the preview route asserts HTTP `400` with `source_provider_unsupported`. | Fails closed as unsupported. No Typesense preview adapter claim. |
+| Typesense | `MigrateFromTypesenseRequest` with `sourceWriteFrozen: true` | Real-source KAT passes when the caller attests that source writes are frozen; missing or false attestation fails before source I/O. | Fails closed without explicit write-freeze attestation. |
 
 Stage 2 used a true zero-write path and introduced no ephemeral-scope fallback residual.
 

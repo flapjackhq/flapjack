@@ -1,4 +1,20 @@
 use super::*;
+use serial_test::serial;
+
+// `EmbedderConfig::validate()` reads TWO pieces of process-global state: the
+// `FLAPJACK_AI_ALLOW_LOCAL_URLS` opt-in (via `crate::security::allow_local_outbound_urls`)
+// and the outbound host resolver that `crate::security::test_helpers::
+// install_test_outbound_host_resolver` replaces. `security_tests.rs` mutates both, and
+// guards itself with `#[serial(flapjack_outbound_url_policy)]`.
+//
+// Serializing only the MUTATORS is half a guard. Until 2026-08-06 the readers below were
+// not in that group, so `cargo test -p flapjack --lib --features vector-search --
+// security:: vector::config` failed roughly one run in three: a security case would have
+// the opt-in temporarily set, or its stub resolver installed, while an `a10_*` case was
+// asserting that a loopback URL is REJECTED — and under the opt-in it is accepted, so
+// `expect_err` panicked. Green alone, red in combination, which is why it survived every
+// focused run. Any test whose expectation depends on outbound-URL policy belongs in this
+// group; a test that only exercises required-field validation does not.
 
 // ── Config validation tests (3.5) ──
 
@@ -112,6 +128,7 @@ fn stage3_index_settings_validate_embedders_accepts_usize_max_without_allocating
 
 /// Verify that correctly configured embedders pass validation for each source type.
 #[test]
+#[serial(flapjack_outbound_url_policy)]
 fn test_valid_configs_pass_validation() {
     let openai = EmbedderConfig {
         source: EmbedderSource::OpenAi,
@@ -137,7 +154,10 @@ fn test_valid_configs_pass_validation() {
     assert!(user_provided.validate().is_ok());
 }
 
+/// Rejection here depends on the outbound-URL policy, so this test joins the
+/// `flapjack_outbound_url_policy` serial group — see the module header.
 #[test]
+#[serial(flapjack_outbound_url_policy)]
 fn a10_openai_config_rejects_non_http_or_malformed_url() {
     for payload in [
         "file:///etc/passwd",
@@ -165,7 +185,10 @@ fn a10_openai_config_rejects_non_http_or_malformed_url() {
     }
 }
 
+/// Rejection here depends on the outbound-URL policy, so this test joins the
+/// `flapjack_outbound_url_policy` serial group — see the module header.
 #[test]
+#[serial(flapjack_outbound_url_policy)]
 fn a10_rest_config_rejects_non_http_or_malformed_url() {
     for payload in [
         "file:///etc/passwd",

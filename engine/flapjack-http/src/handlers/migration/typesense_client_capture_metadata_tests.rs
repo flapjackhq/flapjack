@@ -32,7 +32,7 @@ async fn source_capture_reads_proved_endpoints_and_requires_stable_collection_me
             (TypesenseMethod::Get, "/collections/catalog"),
             (
                 TypesenseMethod::Get,
-                "/collections/catalog/documents/export?page=1&per_page=100"
+                "/collections/catalog/documents/export"
             ),
             (TypesenseMethod::Get, "/collections/catalog"),
         ]

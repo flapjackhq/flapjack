@@ -89,6 +89,11 @@ export interface ClusterPeerOracle {
   confirmCleartextPeerRefusal: (response: Response) => Promise<void>;
 }
 
+/** An Arrange-phase harness failure, distinct from a product behavior failure. */
+export class SetupInfrastructureError extends Error {
+  override readonly name = 'SetupInfrastructureError';
+}
+
 type ClusterPeerFixtures = {
   seededCluster: SeededClusterPeerState;
   clusterPeerOracle: ClusterPeerOracle;
@@ -104,6 +109,37 @@ export async function getClusterStatus(request: APIRequestContext): Promise<Clus
   return body;
 }
 
+function assertHaClusterStatusShape(status: ClusterStatus): asserts status is HaClusterStatus {
+  if (
+    typeof status.peers_total !== 'number'
+    || typeof status.peers_healthy !== 'number'
+    || !Array.isArray(status.peers)
+  ) {
+    throw new SetupInfrastructureError(
+      'Cluster peer specs require /internal/cluster/status to include peers_total, '
+      + 'peers_healthy, and peers[] when replication_enabled=true.',
+    );
+  }
+
+  for (const [index, peer] of status.peers.entries()) {
+    if (
+      !peer
+      || typeof peer.peer_id !== 'string'
+      || typeof peer.addr !== 'string'
+      || typeof peer.status !== 'string'
+      || (
+        peer.last_success_secs_ago !== null
+        && typeof peer.last_success_secs_ago !== 'number'
+      )
+    ) {
+      throw new SetupInfrastructureError(
+        `Cluster peer specs require /internal/cluster/status peers[${index}] to carry `
+        + 'peer_id, addr, status, and nullable last_success_secs_ago.',
+      );
+    }
+  }
+}
+
 /**
  * Fail setup with an explicit message when the target backend is not a
  * replication-enabled HA harness. A `replication manager is not configured`
@@ -114,12 +150,13 @@ export async function getClusterStatus(request: APIRequestContext): Promise<Clus
 export async function requireHaHarness(request: APIRequestContext): Promise<HaClusterStatus> {
   const status = await getClusterStatus(request);
   if (!status.replication_enabled) {
-    throw new Error(
+    throw new SetupInfrastructureError(
       'Cluster peer specs require a replication-enabled HA backend, but the target reports '
       + `standalone mode (node_id=${status.node_id}). Start the backend with replication `
       + 'configured before running tests/e2e-ui/full/cluster_peers.spec.ts.',
     );
   }
+  assertHaClusterStatusShape(status);
   return status;
 }
 

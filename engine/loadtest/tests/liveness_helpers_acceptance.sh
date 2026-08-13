@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC1091,SC2034,SC2329
+# shellcheck disable=SC1091,SC2016,SC2034,SC2329
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOADTEST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ENGINE_DIR="$(cd "$LOADTEST_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$ENGINE_DIR/.." && pwd)"
 
 # shellcheck source=../lib/loadtest_shell_helpers.sh
 source "$LOADTEST_DIR/lib/loadtest_shell_helpers.sh"
@@ -286,38 +288,52 @@ assert_health_owner_contract() {
   local launched_server_pid="$2"
   local server_log_path="$3"
   local fixture_bind_addr="$4"
-  local output
+  local caller_label="$5"
+  shift 5
 
-  wait_for_loadtest_health \
-    "$fixture_base_url" \
-    "$launched_server_pid" \
-    2 \
-    0.01 || fail "generic callers without ownership arguments must still accept HTTP 200"
+  local matching_owner_output
+  local output
+  local resolved_owner_args=()
+  local owner_arg
+
+  for owner_arg in "$@"; do
+    case "$owner_arg" in
+      __fixture_server_log_path__)
+        resolved_owner_args+=("$server_log_path")
+        ;;
+      __fixture_bind_addr__)
+        resolved_owner_args+=("$fixture_bind_addr")
+        ;;
+      *)
+        resolved_owner_args+=("$owner_arg")
+        ;;
+    esac
+  done
 
   printf 'Local: http://%s0\n' "$fixture_bind_addr" >"$server_log_path"
   if output="$(
     wait_for_loadtest_health \
       "$fixture_base_url" \
       "$launched_server_pid" \
-      2 \
-      0.01 \
-      "$server_log_path" \
-      "$fixture_bind_addr" 2>&1
+      "${resolved_owner_args[@]}" 2>&1
   )"; then
-    fail "health readiness must reject a foreign listener's HTTP 200"
+    fail "${caller_label}: health readiness must reject a foreign listener's HTTP 200"
   fi
   [[ "$output" == *"did not confirm ownership"* ]] || {
-    fail "foreign-listener failure must say did not confirm ownership: $output"
+    fail "${caller_label}: foreign-listener failure must say did not confirm ownership: $output"
   }
 
   printf 'Local: http://%s\n' "$fixture_bind_addr" >"$server_log_path"
-  wait_for_loadtest_health \
-    "$fixture_base_url" \
-    "$launched_server_pid" \
-    2 \
-    0.01 \
-    "$server_log_path" \
-    "$fixture_bind_addr" || fail "matching owned-log banner must accept the HTTP 200"
+  if matching_owner_output="$(
+    wait_for_loadtest_health \
+      "$fixture_base_url" \
+      "$launched_server_pid" \
+      "${resolved_owner_args[@]}" 2>&1
+  )"; then
+    :
+  else
+    fail "${caller_label}: matching owned-log banner must accept the HTTP 200: $matching_owner_output"
+  fi
 
   assert_partial_health_owner_arguments_fail \
     "$fixture_base_url" "$launched_server_pid" "$server_log_path" "$fixture_bind_addr"
@@ -337,7 +353,9 @@ assert_ipv6_loopback_base_url_contract() {
   }
 }
 
-loadtest_health_requires_launched_server_log_owner() (
+with_health_owner_fixture() (
+  local assertion_function="$1"
+  shift
   local fixture_dir
   local fixture_port_path
   local server_log_path
@@ -356,13 +374,20 @@ loadtest_health_requires_launched_server_log_owner() (
   sleep 30 &
   launched_server_pid=$!
 
-  trap "
-    kill '$fixture_pid' '$launched_server_pid' 2>/dev/null || true
-    wait '$fixture_pid' '$launched_server_pid' 2>/dev/null || true
-    rm -rf '$fixture_dir'
-  " EXIT
+  cleanup_health_owner_fixture() {
+    kill "$fixture_pid" "$launched_server_pid" 2>/dev/null || true
+    wait "$fixture_pid" "$launched_server_pid" 2>/dev/null || true
+    rm -rf "$fixture_dir"
+  }
+  trap cleanup_health_owner_fixture EXIT
 
   fixture_port="$(cat "$fixture_port_path")"
+  [[ "$fixture_port" =~ ^[0-9]+$ ]] || {
+    fail "health ownership fixture published a non-numeric port: $fixture_port"
+  }
+  [[ "$fixture_port" != "7700" ]] || {
+    fail "health ownership fixture must use a private port, never the shared loadtest port 7700"
+  }
   fixture_bind_addr="127.0.0.1:${fixture_port}"
   fixture_base_url="http://${fixture_bind_addr}"
   fixture_status_code="$(
@@ -372,10 +397,27 @@ loadtest_health_requires_launched_server_log_owner() (
     fail "health ownership fixture expected HTTP 200, got $fixture_status_code"
   }
   kill -0 "$launched_server_pid" 2>/dev/null || fail "launched-server decoy PID must be live"
+  [[ "$launched_server_pid" != "$fixture_pid" ]] || {
+    fail "launched-server decoy PID must not be the foreign listener's own PID"
+  }
 
-  assert_health_owner_contract \
-    "$fixture_base_url" "$launched_server_pid" "$server_log_path" "$fixture_bind_addr"
+  "$assertion_function" \
+    "$fixture_base_url" \
+    "$launched_server_pid" \
+    "$server_log_path" \
+    "$fixture_bind_addr" \
+    "$@"
 )
+
+loadtest_health_requires_launched_server_log_owner() {
+  with_health_owner_fixture \
+    assert_health_owner_contract \
+    "generic readiness owner contract" \
+    2 \
+    0.01 \
+    __fixture_server_log_path__ \
+    __fixture_bind_addr__
+}
 
 echo "RUN: loadtest_health_requires_launched_server_log_owner"
 if ! owner_output="$(
@@ -392,6 +434,178 @@ grep -Fq 'wait_for_loadtest_health "$BASE_URL" "$SERVER_PID" 300 0.1 "$server_lo
   "$LOADTEST_DIR/scale_ladder.sh" || {
   fail "scale_ladder.sh must pass server log path and bind address to the health owner guard"
 }
+
+# ---------------------------------------------------------------------------
+# PL-15 measured denominator — SINGLE OWNER. Do not restate these counts in any
+# other scenario, script, or doc; reference this block instead.
+#
+# Sweep: every occurrence of the identifier `wait_for_loadtest_health` in shell
+# sources across the repository (excluding generated/vendor directories and this
+# test file, which is the observer rather than a caller). Reproduce with:
+#   grep -rn --include='*.sh' --exclude-dir=target --exclude-dir=node_modules \
+#     --exclude-dir=.git -I -F 'wait_for_loadtest_health' .
+#
+#   classification            | count | sites (path:line at the time of writing)
+#   -------------------------|-------|------------------------------------------
+#   helper definition        |   1   | engine/loadtest/lib/loadtest_shell_helpers.sh:121
+#   helper failure message   |   1   | engine/loadtest/lib/loadtest_shell_helpers.sh:134
+#   test stub (not a caller) |   2   | engine/_dev/s/manual-tests/disk_exhaustion_durability_selftest.sh:191,604
+#   live caller, both args   |   4   | engine/loadtest/scale_ladder.sh:959
+#                            |       | engine/loadtest/tests/scale_ladder_smoke_acceptance.sh:208
+#                            |       | engine/loadtest/tests/pl10_saturation_acceptance.sh:273
+#                            |       | engine/_dev/s/manual-tests/20260730_disk_exhaustion_durability.sh:179
+#   live caller, neither arg |   0   | (none)
+#   live caller, exactly one |   0   | (none — the one-arg refusal at
+#                            |       |  loadtest_shell_helpers.sh:132-137 is owned by
+#                            |       |  assert_partial_health_owner_arguments_fail above)
+#   -------------------------|-------|------------------------------------------
+#   live callers, total      |   4   |
+#
+# `assert_wait_for_loadtest_health_denominator` below pins that whole set, so a
+# new shell call site anywhere in the repository fails this test instead of silently
+# escaping the ownership contract.
+# ---------------------------------------------------------------------------
+
+assert_wait_for_loadtest_health_denominator() {
+  local both_ownership_argument_caller_count
+  local expected_sites
+  local live_caller_count
+  local neither_ownership_argument_caller_count
+  local observed_sites
+
+  # path:trimmed-source-text for each occurrence, sorted. Line numbers are
+  # deliberately excluded so unrelated edits above a call site do not churn this
+  # guard, while any added, removed, or reshaped call site does.
+  expected_sites="$(
+    cat <<'EXPECTED_SITES'
+engine/_dev/s/manual-tests/20260730_disk_exhaustion_durability.sh:wait_for_loadtest_health "$BASE_URL" "$SERVER_PID" 200 0.1 "$log_path" "$FLAPJACK_BIND_ADDR"
+engine/_dev/s/manual-tests/disk_exhaustion_durability_selftest.sh:wait_for_loadtest_health() { return 0; }
+engine/_dev/s/manual-tests/disk_exhaustion_durability_selftest.sh:wait_for_loadtest_health() { return 0; }
+engine/loadtest/lib/loadtest_shell_helpers.sh:echo "FAIL: wait_for_loadtest_health owner check needs server log path and bind address"
+engine/loadtest/lib/loadtest_shell_helpers.sh:wait_for_loadtest_health() {
+engine/loadtest/scale_ladder.sh:wait_for_loadtest_health "$BASE_URL" "$SERVER_PID" 300 0.1 "$server_log_path" "$bind_addr"
+engine/loadtest/tests/pl10_saturation_acceptance.sh:wait_for_loadtest_health "$FLAPJACK_BASE_URL" "$SERVER_PID" "300" "0.1" "$case_log_path" "$FLAPJACK_BIND_ADDR"
+engine/loadtest/tests/scale_ladder_smoke_acceptance.sh:wait_for_loadtest_health "$base_url" "$mutation_server_pid" 300 0.1 "$mutation_server_log_path" "$mutation_bind_addr"
+EXPECTED_SITES
+  )"
+
+  observed_sites="$(
+    cd "$REPO_ROOT" &&
+      grep -rn --exclude-dir=target --exclude-dir=node_modules --exclude-dir=.git \
+        --include='*.sh' -I -F 'wait_for_loadtest_health' . |
+      sed 's|^\./||' |
+      grep -v '^engine/loadtest/tests/liveness_helpers_acceptance\.sh:' |
+      awk -F: '{ path = $1; sub(/^[^:]*:[0-9]+:[[:space:]]*/, ""); printf "%s:%s\n", path, $0 }' |
+      sort
+  )"
+
+  [[ "$observed_sites" == "$expected_sites" ]] || {
+    fail "$(
+      printf '%s\n%s\n%s\n%s\n' \
+        "wait_for_loadtest_health denominator changed; update the PL-15 table and the per-caller scenarios together" \
+        "--- expected ---" "$expected_sites" \
+        "--- observed ---
+$observed_sites"
+    )"
+  }
+
+  live_caller_count="$(grep -c ':wait_for_loadtest_health "' <<<"$expected_sites")"
+  both_ownership_argument_caller_count="$(
+    grep ':wait_for_loadtest_health "' <<<"$expected_sites" |
+      awk '{
+        has_log = ($0 ~ /server_log_path|mutation_server_log_path|case_log_path|log_path/)
+        has_bind = ($0 ~ /bind_addr|mutation_bind_addr|FLAPJACK_BIND_ADDR/)
+        if (has_log && has_bind) {
+          count += 1
+        }
+      } END { print count + 0 }'
+  )"
+  neither_ownership_argument_caller_count=$((
+    live_caller_count - both_ownership_argument_caller_count
+  ))
+
+  [[ "$both_ownership_argument_caller_count" == "4" ]] || {
+    fail "wait_for_loadtest_health denominator expected 4 both-args callers, got ${both_ownership_argument_caller_count}"
+  }
+  [[ "$neither_ownership_argument_caller_count" == "0" ]] || {
+    fail "wait_for_loadtest_health denominator expected 0 neither-arg callers, got ${neither_ownership_argument_caller_count}"
+  }
+
+  echo "PASS: wait_for_loadtest_health denominator pinned at ${live_caller_count} live callers (${both_ownership_argument_caller_count} both-args, ${neither_ownership_argument_caller_count} neither-arg, 0 one-arg)"
+}
+
+assert_owned_caller_rejects_foreign_health_200() (
+  local caller_label="$1"
+  local caller_relative_path="$2"
+  local caller_call_line="$3"
+  local caller_max_attempts="$4"
+  local caller_sleep_seconds="$5"
+  shift 5
+
+  local caller_path="$ENGINE_DIR/$caller_relative_path"
+  local call_line_occurrences
+  local owner_contract_output
+
+  [[ -f "$caller_path" ]] || {
+    fail "$caller_label: caller file is missing: $caller_relative_path"
+  }
+  # Whole-line (whitespace-trimmed) equality, not a substring match: Stage 2
+  # appends ownership arguments to this same line, and a substring pin would
+  # still match the lengthened line and silently keep reporting green.
+  call_line_occurrences="$(
+    awk -v expected="$caller_call_line" '
+      {
+        line = $0
+        sub(/^[[:space:]]+/, "", line)
+        sub(/[[:space:]]+$/, "", line)
+      }
+      line == expected { matched += 1 }
+      END { print matched + 0 }
+    ' "$caller_path"
+  )"
+  [[ "$call_line_occurrences" == "1" ]] || {
+    fail "$caller_label: expected exactly 1 owned health call line in ${caller_relative_path}, found ${call_line_occurrences}; Stage 2 must wire ownership arguments into this caller"
+  }
+
+  # Reuse the one fixture/bootstrap and behavioral owner. The last two
+  # placeholders are resolved inside the shared fixture so every caller scenario
+  # checks the exact same foreign-listener rejection and matching-banner success.
+  if owner_contract_output="$(
+    with_health_owner_fixture \
+      assert_health_owner_contract \
+      "$caller_label" \
+      "$caller_max_attempts" \
+      "$caller_sleep_seconds" \
+      __fixture_server_log_path__ \
+      __fixture_bind_addr__ 2>&1
+  )"; then
+    printf '%s\n' "$owner_contract_output"
+  else
+    fail "$caller_label: foreign-listener owner contract failed: $owner_contract_output"
+  fi
+
+  echo "PASS: ${caller_label} (${caller_relative_path}) rejects a foreign HTTP 200 and accepts its matching owned log banner"
+)
+
+echo "RUN: assert_wait_for_loadtest_health_denominator"
+assert_wait_for_loadtest_health_denominator
+
+echo "RUN: owned_health_callers_reject_a_foreign_health_200"
+assert_owned_caller_rejects_foreign_health_200 \
+  "scale_ladder_smoke_acceptance" \
+  "loadtest/tests/scale_ladder_smoke_acceptance.sh" \
+  'wait_for_loadtest_health "$base_url" "$mutation_server_pid" 300 0.1 "$mutation_server_log_path" "$mutation_bind_addr"' \
+  300 0.01
+assert_owned_caller_rejects_foreign_health_200 \
+  "pl10_saturation_acceptance" \
+  "loadtest/tests/pl10_saturation_acceptance.sh" \
+  'wait_for_loadtest_health "$FLAPJACK_BASE_URL" "$SERVER_PID" "300" "0.1" "$case_log_path" "$FLAPJACK_BIND_ADDR"' \
+  300 0.01
+assert_owned_caller_rejects_foreign_health_200 \
+  "20260730_disk_exhaustion_durability" \
+  "_dev/s/manual-tests/20260730_disk_exhaustion_durability.sh" \
+  'wait_for_loadtest_health "$BASE_URL" "$SERVER_PID" 200 0.1 "$log_path" "$FLAPJACK_BIND_ADDR"' \
+  200 0.01
 
 fixed_count() {
   printf '0\n'

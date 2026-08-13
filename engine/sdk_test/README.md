@@ -2,7 +2,25 @@
 
 End-to-end tests that validate Flapjack's Algolia API compatibility against real Algolia.
 
-**Prerequisites:** Algolia credentials in `.secret/.env.secret` (`ALGOLIA_APP_ID`, `ALGOLIA_ADMIN_KEY`) and Flapjack running on `localhost:7700`.
+**Prerequisites:** Flapjack running on `FLAPJACK_URL` (default `http://localhost:7700`).
+The Algolia comparison/migration scripts additionally require `ALGOLIA_APP_ID` and
+`ALGOLIA_ADMIN_KEY` in `.secret/.env.secret`.
+
+## Real InstantSearch clients
+
+`browser_tests_unmocked/` renders the official vanilla, React, and Vue InstantSearch
+packages in Chromium against the real Flapjack server through `algoliasearch/lite`. One
+shared fixture gives every interaction a different expected result, proving exact initial
+hits, query refinement, facet refinement, and pagination for every client. The browser
+receives a temporary search-only key restricted to the fixture index; the administrative
+key remains in the setup runner.
+
+```bash
+npm run test:real_clients
+```
+
+`./s/test --sdk` owns normal local execution. Public mirror CI runs the same browser suite
+in the `SDK contract tests` job.
 
 ## Critical Tests
 

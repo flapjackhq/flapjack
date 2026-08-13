@@ -197,7 +197,7 @@ InstantSearch.js widgets work as-is — `SearchBox`, `Hits`, `RefinementList`, `
 | Analytics | Search events, click tracking, query suggestions, HA fan-out |
 | Federated search | Weighted multi-index queries with RRF merge |
 
-Algolia-compatible REST API under `/1/` — works with InstantSearch.js v5 and the algoliasearch client.
+Algolia-compatible REST API under `/1/` — works with InstantSearch.js 4.x and the algoliasearch v5 client.
 
 ---
 
@@ -213,7 +213,7 @@ Algolia-compatible REST API under `/1/` — works with InstantSearch.js v5 and t
 
 **Q: How close is the Algolia API compatibility?**
 
-Flapjack implements all 197 Algolia REST API endpoints under `/1/`. It works with the `algoliasearch` JavaScript client and InstantSearch.js v5 without code changes beyond pointing the host at your Flapjack instance. See the Features table below and the Comparison table for a side-by-side breakdown.
+Flapjack implements all 197 Algolia REST API endpoints under `/1/`. It works with the `algoliasearch` v5 JavaScript client and InstantSearch.js 4.x without code changes beyond pointing the host at your Flapjack instance. See the Features table below and the Comparison table for a side-by-side breakdown.
 
 **Q: Does Flapjack support multi-tenancy?**
 
@@ -225,7 +225,7 @@ Batch writes use durable-ack semantics — HTTP 200 returns only after the Tanti
 
 **Q: Which InstantSearch.js widgets work?**
 
-All standard InstantSearch.js v5 widgets connect directly to Flapjack's `/1/` endpoints without an adapter: `SearchBox`, `Hits`, `RefinementList`, `Pagination`, `GeoSearch`, and others. The Comparison table lists Flapjack as "Native" for InstantSearch.js support.
+The official InstantSearch.js 4.x, React InstantSearch 7.x, and Vue InstantSearch 4.x clients connect directly to Flapjack's `/1/` endpoints. Recurring browser tests cover `SearchBox`, `Hits`, `RefinementList`, and `Pagination`; API contract tests cover the wider widget response surface. See the client matrix in [`engine/docs2/FEATURES.md`](engine/docs2/FEATURES.md).
 
 **Q: What is the licensing and support model?**
 

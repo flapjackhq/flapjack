@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-RELEASE_WORKFLOW="$REPO_DIR/.github/workflows/release.yml"
+RELEASE_WORKFLOW="${RELEASE_WORKFLOW_UNDER_TEST:-$REPO_DIR/.github/workflows/release.yml}"
 DOCKER_WORKFLOW="$REPO_DIR/.github/workflows/docker.yml"
 CI_WORKFLOW="$REPO_DIR/.github/workflows/ci.yml"
 RELEASE_MANIFEST_HELPER="$REPO_DIR/engine/package/release_artifact_manifest"
@@ -73,6 +73,14 @@ assert_file_absent() {
   fi
 }
 
+workflow_permissions_block() {
+  awk '
+    /^permissions:/ { in_block = 1; print; next }
+    in_block && /^[^[:space:]]/ { in_block = 0 }
+    in_block { print }
+  ' "$RELEASE_WORKFLOW"
+}
+
 # cross reads Cross.toml relative to the crate it builds, so the release build's
 # container-passthrough owner must be engine/Cross.toml and must deliver exactly
 # the external FLAPJACK_BUILD_REVISION the workflow exports. The build.rs-emitted
@@ -81,14 +89,42 @@ assert_file_absent() {
 # false owner. A guard that only checks the release.yml env spelling is
 # false-green because the value never crosses the container boundary without
 # this passthrough.
+# Exit codes are three-valued on purpose. The first version of this probe returned
+# only 0/1, so a `ModuleNotFoundError` was indistinguishable from "the passthrough is
+# missing" — and that is not hypothetical: `tomllib` is Python 3.11+, this repo's macOS
+# host runs 3.9, and the probe therefore reported `engine/Cross.toml [build.env]
+# passthrough delivers FLAPJACK_BUILD_REVISION` as FAILED on a tree where Cross.toml was
+# correct and CI was green. A probe that cannot run must say so; reporting a verdict it
+# did not compute sends the next reader to repair a file that has nothing wrong with it.
+#   0 = present   1 = absent   2 = could not be determined
 cross_passthrough_contains() {
   local variable_name="$1"
   python3 - "$CROSS_TOML" "$variable_name" <<'PY'
 import sys
-import tomllib
 
-with open(sys.argv[1], "rb") as handle:
-    config = tomllib.load(handle)
+# tomllib is stdlib from 3.11; tomli is the identical API it was adopted from, and is
+# what makes this probe runnable on older interpreters instead of merely honest about
+# being unable to run.
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        print(
+            f"INDETERMINATE: reading {sys.argv[1]} needs tomllib (Python 3.11+) or tomli; "
+            f"this interpreter is {sys.version.split()[0]} and has neither.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+try:
+    with open(sys.argv[1], "rb") as handle:
+        config = tomllib.load(handle)
+except (OSError, tomllib.TOMLDecodeError) as error:
+    print(f"INDETERMINATE: cannot parse {sys.argv[1]}: {error}", file=sys.stderr)
+    sys.exit(2)
+
 passthrough = config.get("build", {}).get("env", {}).get("passthrough", [])
 sys.exit(0 if sys.argv[2] in passthrough else 1)
 PY
@@ -104,8 +140,15 @@ assert_cross_build_revision_passthrough() {
   assert_file_absent "$ROOT_CROSS_TOML" \
     "Cross.toml is not misplaced at the repo root where the release build never reads it"
 
-  if cross_passthrough_contains "FLAPJACK_BUILD_REVISION"; then
+  local passthrough_status=0
+  cross_passthrough_contains "FLAPJACK_BUILD_REVISION" || passthrough_status=$?
+  if [ "$passthrough_status" -eq 0 ]; then
     pass "engine/Cross.toml [build.env] passthrough delivers FLAPJACK_BUILD_REVISION into the container build"
+  elif [ "$passthrough_status" -eq 2 ]; then
+    # Indeterminate is still a failure — an unverified contract has not been verified —
+    # but it must not be reported as the contract being broken. The stderr line above
+    # names the real cause.
+    fail "engine/Cross.toml [build.env] passthrough COULD NOT BE READ (see INDETERMINATE above); this is a probe failure, not proof the passthrough is missing"
   else
     fail "engine/Cross.toml [build.env] passthrough delivers FLAPJACK_BUILD_REVISION into the container build"
   fi
@@ -135,6 +178,19 @@ assert_job_contains() {
   local pattern="$2"
   local description="$3"
   if job_block "$job_name" | grep -Eq "$pattern"; then
+    pass "$description"
+  else
+    fail "$description"
+  fi
+}
+
+assert_job_needs() {
+  local job_name="$1"
+  local dependency="$2"
+  local description="$3"
+  local needs
+  needs="$(job_block "$job_name" | sed -nE 's/^[[:space:]]*needs:[[:space:]]*\[([^]]*)\][[:space:]]*$/\1/p')"
+  if printf '%s\n' "$needs" | tr ',' '\n' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g' | grep -Fxq "$dependency"; then
     pass "$description"
   else
     fail "$description"
@@ -270,6 +326,26 @@ PY
 }
 
 section "Release workflow sequencing"
+if workflow_permissions_block | grep -Eq '^\s*permissions:\s*$'; then
+  pass "release.yml declares explicit workflow-token permissions"
+else
+  fail "release.yml declares explicit workflow-token permissions"
+fi
+if workflow_permissions_block | grep -Eq '^\s*contents:\s*read\s*$'; then
+  pass "release.yml defaults the workflow token to read-only repository contents"
+else
+  fail "release.yml defaults the workflow token to read-only repository contents"
+fi
+if workflow_permissions_block | grep -Eq '^\s*packages:\s*write\s*$'; then
+  fail "release.yml does not grant package-write scope workflow-wide"
+else
+  pass "release.yml does not grant package-write scope workflow-wide"
+fi
+if workflow_permissions_block | grep -Eq '^\s*id-token:\s*write\s*$'; then
+  fail "release.yml does not grant OIDC workflow-wide"
+else
+  pass "release.yml does not grant OIDC workflow-wide"
+fi
 assert_contains "$RELEASE_WORKFLOW" '^\s*validate_release_version:' "release.yml defines a release-version validation gate"
 assert_contains "$RELEASE_WORKFLOW" '^\s*needs:\s*validate_release_version\s*$' "build job waits for the release-version validation gate"
 assert_contains "$RELEASE_WORKFLOW" '^\s*docker_prepare:' "release.yml defines docker_prepare tag owner"
@@ -320,8 +396,27 @@ assert_job_contains "ghcr_publish_preflight" 'RELEASE_IMAGE_REPOSITORY' "preflig
 assert_job_contains "ghcr_publish_preflight" '^\s*timeout-minutes:' "preflight is time-bounded so a hung registry cannot stall the release"
 # The load-bearing assertion: without this the preflight is decorative, because
 # `release` would still create the public tag while the credential is unproven.
-assert_job_contains "release" '^\s*needs:\s*\[build, ghcr_publish_preflight\]\s*$' "the public tag and GitHub Release wait on proven push capability"
+assert_job_needs "release" "build" "the public tag and GitHub Release wait for release artifacts"
+assert_job_needs "release" "ghcr_publish_preflight" "the public tag and GitHub Release wait on proven push capability"
+assert_job_contains "release" '^\s*permissions:\s*$' "release job declares its elevated token scope locally"
+assert_job_contains "release" '^\s*contents:\s*write\s*$' "release job alone receives repository-write scope for tag and release publication"
 assert_file_executable "$REPO_DIR/engine/package/ghcr_publish_preflight" "ghcr_publish_preflight helper is executable"
+
+section "Release CI status preflight"
+# This gate reads the ordinary push-CI run for github.sha and must be a true
+# prerequisite of `release`; a sibling job would leave tag creation unguarded.
+assert_contains "$RELEASE_WORKFLOW" '^\s*acknowledged_ci_failure_run_id:' "release.yml accepts an exact failed push-CI run acknowledgement"
+assert_contains "$RELEASE_WORKFLOW" '^\s*default:\s*["'\'']{2}\s*$' "CI failure acknowledgement defaults to empty"
+assert_contains "$RELEASE_WORKFLOW" '^\s*release_ci_status_preflight:' "release.yml defines the release CI-status preflight"
+assert_job_contains "release_ci_status_preflight" '^\s*needs:\s*validate_release_version\s*$' "CI-status preflight is gated only on version validation"
+assert_job_contains "release_ci_status_preflight" '^\s*timeout-minutes:' "CI-status preflight is time-bounded"
+assert_job_contains "release_ci_status_preflight" '^\s*actions:\s*read\s*$' "CI-status preflight can read Actions run status"
+assert_job_contains "release_ci_status_preflight" '^\s*contents:\s*read\s*$' "CI-status preflight has least-privilege checkout access"
+assert_job_contains "release_ci_status_preflight" '^\s*GH_TOKEN:\s*\$\{\{ github\.token \}\}\s*$' "CI-status preflight authenticates gh with the workflow token"
+assert_job_contains "release_ci_status_preflight" '^\s*ACKNOWLEDGED_CI_FAILURE_RUN_ID:\s*\$\{\{ github\.event\.inputs\.acknowledged_ci_failure_run_id \}\}\s*$' "CI-status preflight passes acknowledgement through a dedicated environment variable"
+assert_job_contains "release_ci_status_preflight" 'package/release_ci_status_preflight' "CI-status preflight calls the Stage 1 owner instead of duplicating decision logic"
+assert_job_contains "release_ci_status_preflight" '"\$\{\{ github\.repository \}\}" "\$\{\{ github\.sha \}\}" "ci\.yml" "\$ACKNOWLEDGED_CI_FAILURE_RUN_ID"' "CI-status preflight uses workflow-owned repository, SHA, workflow, and acknowledgement context"
+assert_job_needs "release" "release_ci_status_preflight" "the public tag and GitHub Release wait for terminal push CI status"
 
 section "Release build identity packaging"
 assert_contains "$RELEASE_WORKFLOW" "github\\.sha.*\\^\\[0-9a-f\\]\\{40\\}\\$|\\^\\[0-9a-f\\]\\{40\\}\\$.*github\\.sha" "release.yml verifies github.sha is exactly 40 lowercase hex characters"
@@ -338,6 +433,12 @@ assert_file_executable "$RELEASE_MANIFEST_HELPER" "release_artifact_manifest hel
 assert_release_helper_contract
 
 section "Docker build hang protection and retry safety"
+assert_job_contains "docker_build_amd64" '^\s*packages:\s*write\s*$' "amd64 Docker publish job keeps package-write scope local to the publishing lane"
+assert_job_contains "docker_build_amd64" '^\s*id-token:\s*write\s*$' "amd64 Docker publish job keeps OIDC scope local to the publishing lane"
+assert_job_contains "docker_build_arm64_native" '^\s*packages:\s*write\s*$' "arm64 native Docker publish job keeps package-write scope local to the publishing lane"
+assert_job_contains "docker_build_arm64_native" '^\s*id-token:\s*write\s*$' "arm64 native Docker publish job keeps OIDC scope local to the publishing lane"
+assert_job_contains "docker_build_arm64_qemu" '^\s*packages:\s*write\s*$' "arm64 qemu Docker publish job keeps package-write scope local to the publishing lane"
+assert_job_contains "docker_build_arm64_qemu" '^\s*id-token:\s*write\s*$' "arm64 qemu Docker publish job keeps OIDC scope local to the publishing lane"
 # The qemu arm64 fallback once hung the release pipeline indefinitely because it
 # had no runtime cap. Require an explicit, generous-but-bounded timeout on it so
 # a stalled emulated build fails fast instead of stalling the whole release.
@@ -370,6 +471,21 @@ section "Release contracts actually run"
 assert_contains "$CI_WORKFLOW" '^\s*run: bash engine/tests/test_release_workflow_structure\.sh\s*$' "ci.yml runs the release workflow structure contract"
 assert_contains "$CI_WORKFLOW" '^\s*run: bash engine/tests/test_ghcr_publish_preflight\.sh\s*$' "ci.yml runs the GHCR publish preflight contract"
 assert_contains "$CI_WORKFLOW" '^\s*run: bash engine/tests/build_identity_cross_kat_supervision_test\.sh\s*$' "ci.yml runs the cross passthrough KAT supervision contract"
+assert_contains "$CI_WORKFLOW" '^\s*run: bash engine/tests/validate_public_ledger_citations_test\.sh\s*$' "ci.yml runs the public-ledger citation contract tests"
+assert_contains "$CI_WORKFLOW" '^\s*run: bash engine/tests/validate_public_ledger_citations\.sh --mode mirror\s*$' "ci.yml runs the public-ledger citation oracle in mirror mode"
+# The assertions above prove release.yml DECLARES the CI-status preflight job. This one
+# proves the preflight's behavioural contract is executed rather than merely present:
+# engine/tests/test_release_ci_status_preflight.sh shipped with REL-12 and was invoked by
+# no workflow, which is the same inert-contract failure this section was written for.
+#
+# GH_TOKEN is part of the invocation contract, not incidental (tightened 2026-08-07).
+# The contract drives the preflight against live pinned runs in flapjackhq/flapjack, so an
+# unauthenticated `gh` fails 17 of its 41 cases. This assertion previously matched a BARE
+# `run:` line, which is what an unauthenticated copy of the step looks like — so the one
+# invocation shape guaranteed to fail in CI was the only shape this test accepted. Staging
+# run 31213083385 failed exactly that way while this assertion was green. Requiring the
+# token here means the failing shape can no longer satisfy the contract.
+assert_contains "$CI_WORKFLOW" '^\s*run: GH_TOKEN="\$\{\{ github\.token \}\}" bash engine/tests/test_release_ci_status_preflight\.sh\s*$' "ci.yml runs the release CI-status preflight contract with GH_TOKEN"
 
 printf '\n\033[1mResults: %d/%d passed\033[0m\n' "$TESTS_PASSED" "$TESTS_RUN"
 if [ "$TESTS_FAILED" -gt 0 ]; then

@@ -21,6 +21,7 @@ read_secret_env_value() {
     case "$current_line" in
       *=*)
         current_key="${current_line%%=*}"
+        current_key="${current_key#export }"
         if [ "$current_key" = "$key" ]; then
           line="$current_line"
         fi

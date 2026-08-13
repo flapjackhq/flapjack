@@ -280,15 +280,17 @@
         ],
         "documents": [
           {
-            "available": true,
-            "category_id": "cat_coffee",
-            "embedding": [
-              0.125,
-              0.25,
-              0.5
-            ],
             "id": "prod_001",
+            "title": "Café Espresso Grinder",
+            "sku": "CAF-001",
+            "price": 129.95,
             "inventory": 42,
+            "available": true,
+            "tags": [
+              "coffee",
+              "kitchen",
+              "unicode"
+            ],
             "metadata": {
               "color": "brushed steel",
               "dimensions": {
@@ -297,25 +299,24 @@
               },
               "rating": 4.75
             },
-            "price": 129.95,
-            "sku": "CAF-001",
-            "tags": [
-              "coffee",
-              "kitchen",
-              "unicode"
+            "embedding": [
+              0.125,
+              0.25,
+              0.5
             ],
-            "title": "Café Espresso Grinder"
+            "category_id": "cat_coffee"
           },
           {
-            "available": false,
-            "category_id": "cat_kitchen",
-            "embedding": [
-              0.75,
-              0.5,
-              0.25
-            ],
             "id": "prod_002",
+            "title": "Tea Kettle Deluxe",
+            "sku": "TEA-002",
+            "price": 54.5,
             "inventory": 0,
+            "available": false,
+            "tags": [
+              "tea",
+              "kitchen"
+            ],
             "metadata": {
               "color": "cobalt",
               "dimensions": {
@@ -325,24 +326,24 @@
               "rating": 4.1
             },
             "nullable_note": "backorder",
-            "price": 54.5,
-            "sku": "TEA-002",
-            "tags": [
-              "tea",
-              "kitchen"
+            "embedding": [
+              0.75,
+              0.5,
+              0.25
             ],
-            "title": "Tea Kettle Deluxe"
+            "category_id": "cat_kitchen"
           },
           {
-            "available": true,
-            "category_id": "cat_kitchen",
-            "embedding": [
-              0.33,
-              0.66,
-              0.99
-            ],
             "id": "prod_003",
+            "title": "Nested Bento Box",
+            "sku": "BEN-003",
+            "price": 31.25,
             "inventory": 7,
+            "available": true,
+            "tags": [
+              "lunch",
+              "日本語"
+            ],
             "metadata": {
               "color": "vermillion",
               "dimensions": {
@@ -351,13 +352,3496 @@
               },
               "rating": 4.9
             },
-            "price": 31.25,
-            "sku": "BEN-003",
-            "tags": [
-              "lunch",
-              "日本語"
+            "embedding": [
+              0.33,
+              0.66,
+              0.99
             ],
-            "title": "Nested Bento Box"
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_004",
+            "title": "Audit Product 004",
+            "sku": "AUD-004",
+            "price": 10.4,
+            "inventory": 4,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-004",
+              "dimensions": {
+                "height_cm": 4,
+                "width_cm": 5
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_005",
+            "title": "Audit Product 005",
+            "sku": "AUD-005",
+            "price": 10.5,
+            "inventory": 5,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-005",
+              "dimensions": {
+                "height_cm": 5,
+                "width_cm": 6
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_006",
+            "title": "Audit Product 006",
+            "sku": "AUD-006",
+            "price": 10.6,
+            "inventory": 6,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-006",
+              "dimensions": {
+                "height_cm": 6,
+                "width_cm": 7
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_007",
+            "title": "Audit Product 007",
+            "sku": "AUD-007",
+            "price": 10.7,
+            "inventory": 7,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-007",
+              "dimensions": {
+                "height_cm": 7,
+                "width_cm": 8
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_008",
+            "title": "Audit Product 008",
+            "sku": "AUD-008",
+            "price": 10.8,
+            "inventory": 8,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-008",
+              "dimensions": {
+                "height_cm": 8,
+                "width_cm": 9
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_009",
+            "title": "Audit Product 009",
+            "sku": "AUD-009",
+            "price": 10.9,
+            "inventory": 9,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-009",
+              "dimensions": {
+                "height_cm": 9,
+                "width_cm": 10
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_010",
+            "title": "Audit Product 010",
+            "sku": "AUD-010",
+            "price": 11,
+            "inventory": 10,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-010",
+              "dimensions": {
+                "height_cm": 10,
+                "width_cm": 11
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_011",
+            "title": "Audit Product 011",
+            "sku": "AUD-011",
+            "price": 11.1,
+            "inventory": 11,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-011",
+              "dimensions": {
+                "height_cm": 11,
+                "width_cm": 12
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_012",
+            "title": "Audit Product 012",
+            "sku": "AUD-012",
+            "price": 11.2,
+            "inventory": 12,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-012",
+              "dimensions": {
+                "height_cm": 12,
+                "width_cm": 13
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_013",
+            "title": "Audit Product 013",
+            "sku": "AUD-013",
+            "price": 11.3,
+            "inventory": 13,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-013",
+              "dimensions": {
+                "height_cm": 13,
+                "width_cm": 14
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_014",
+            "title": "Audit Product 014",
+            "sku": "AUD-014",
+            "price": 11.4,
+            "inventory": 14,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-014",
+              "dimensions": {
+                "height_cm": 14,
+                "width_cm": 15
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_015",
+            "title": "Audit Product 015",
+            "sku": "AUD-015",
+            "price": 11.5,
+            "inventory": 15,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-015",
+              "dimensions": {
+                "height_cm": 15,
+                "width_cm": 16
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_016",
+            "title": "Audit Product 016",
+            "sku": "AUD-016",
+            "price": 11.6,
+            "inventory": 16,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-016",
+              "dimensions": {
+                "height_cm": 16,
+                "width_cm": 17
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_017",
+            "title": "Audit Product 017",
+            "sku": "AUD-017",
+            "price": 11.7,
+            "inventory": 17,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-017",
+              "dimensions": {
+                "height_cm": 17,
+                "width_cm": 18
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_018",
+            "title": "Audit Product 018",
+            "sku": "AUD-018",
+            "price": 11.8,
+            "inventory": 18,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-018",
+              "dimensions": {
+                "height_cm": 18,
+                "width_cm": 19
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_019",
+            "title": "Audit Product 019",
+            "sku": "AUD-019",
+            "price": 11.9,
+            "inventory": 19,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-019",
+              "dimensions": {
+                "height_cm": 19,
+                "width_cm": 20
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_020",
+            "title": "Audit Product 020",
+            "sku": "AUD-020",
+            "price": 12,
+            "inventory": 20,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-020",
+              "dimensions": {
+                "height_cm": 20,
+                "width_cm": 21
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_021",
+            "title": "Audit Product 021",
+            "sku": "AUD-021",
+            "price": 12.1,
+            "inventory": 21,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-021",
+              "dimensions": {
+                "height_cm": 21,
+                "width_cm": 22
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_022",
+            "title": "Audit Product 022",
+            "sku": "AUD-022",
+            "price": 12.2,
+            "inventory": 22,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-022",
+              "dimensions": {
+                "height_cm": 22,
+                "width_cm": 23
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_023",
+            "title": "Audit Product 023",
+            "sku": "AUD-023",
+            "price": 12.3,
+            "inventory": 23,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-023",
+              "dimensions": {
+                "height_cm": 23,
+                "width_cm": 24
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_024",
+            "title": "Audit Product 024",
+            "sku": "AUD-024",
+            "price": 12.4,
+            "inventory": 24,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-024",
+              "dimensions": {
+                "height_cm": 24,
+                "width_cm": 25
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_025",
+            "title": "Audit Product 025",
+            "sku": "AUD-025",
+            "price": 12.5,
+            "inventory": 25,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-025",
+              "dimensions": {
+                "height_cm": 25,
+                "width_cm": 26
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_026",
+            "title": "Audit Product 026",
+            "sku": "AUD-026",
+            "price": 12.6,
+            "inventory": 26,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-026",
+              "dimensions": {
+                "height_cm": 26,
+                "width_cm": 27
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_027",
+            "title": "Audit Product 027",
+            "sku": "AUD-027",
+            "price": 12.7,
+            "inventory": 27,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-027",
+              "dimensions": {
+                "height_cm": 27,
+                "width_cm": 28
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_028",
+            "title": "Audit Product 028",
+            "sku": "AUD-028",
+            "price": 12.8,
+            "inventory": 28,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-028",
+              "dimensions": {
+                "height_cm": 28,
+                "width_cm": 29
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_029",
+            "title": "Audit Product 029",
+            "sku": "AUD-029",
+            "price": 12.9,
+            "inventory": 29,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-029",
+              "dimensions": {
+                "height_cm": 29,
+                "width_cm": 30
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_030",
+            "title": "Audit Product 030",
+            "sku": "AUD-030",
+            "price": 13,
+            "inventory": 30,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-030",
+              "dimensions": {
+                "height_cm": 30,
+                "width_cm": 31
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_031",
+            "title": "Audit Product 031",
+            "sku": "AUD-031",
+            "price": 13.1,
+            "inventory": 31,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-031",
+              "dimensions": {
+                "height_cm": 31,
+                "width_cm": 32
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_032",
+            "title": "Audit Product 032",
+            "sku": "AUD-032",
+            "price": 13.2,
+            "inventory": 32,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-032",
+              "dimensions": {
+                "height_cm": 32,
+                "width_cm": 33
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_033",
+            "title": "Audit Product 033",
+            "sku": "AUD-033",
+            "price": 13.3,
+            "inventory": 33,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-033",
+              "dimensions": {
+                "height_cm": 33,
+                "width_cm": 34
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_034",
+            "title": "Audit Product 034",
+            "sku": "AUD-034",
+            "price": 13.4,
+            "inventory": 34,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-034",
+              "dimensions": {
+                "height_cm": 34,
+                "width_cm": 35
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_035",
+            "title": "Audit Product 035",
+            "sku": "AUD-035",
+            "price": 13.5,
+            "inventory": 35,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-035",
+              "dimensions": {
+                "height_cm": 35,
+                "width_cm": 36
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_036",
+            "title": "Audit Product 036",
+            "sku": "AUD-036",
+            "price": 13.6,
+            "inventory": 36,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-036",
+              "dimensions": {
+                "height_cm": 36,
+                "width_cm": 37
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_037",
+            "title": "Audit Product 037",
+            "sku": "AUD-037",
+            "price": 13.7,
+            "inventory": 37,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-037",
+              "dimensions": {
+                "height_cm": 37,
+                "width_cm": 38
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_038",
+            "title": "Audit Product 038",
+            "sku": "AUD-038",
+            "price": 13.8,
+            "inventory": 38,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-038",
+              "dimensions": {
+                "height_cm": 38,
+                "width_cm": 39
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_039",
+            "title": "Audit Product 039",
+            "sku": "AUD-039",
+            "price": 13.9,
+            "inventory": 39,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-039",
+              "dimensions": {
+                "height_cm": 39,
+                "width_cm": 40
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_040",
+            "title": "Audit Product 040",
+            "sku": "AUD-040",
+            "price": 14,
+            "inventory": 40,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-040",
+              "dimensions": {
+                "height_cm": 40,
+                "width_cm": 41
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_041",
+            "title": "Audit Product 041",
+            "sku": "AUD-041",
+            "price": 14.1,
+            "inventory": 41,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-041",
+              "dimensions": {
+                "height_cm": 41,
+                "width_cm": 42
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_042",
+            "title": "Audit Product 042",
+            "sku": "AUD-042",
+            "price": 14.2,
+            "inventory": 42,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-042",
+              "dimensions": {
+                "height_cm": 42,
+                "width_cm": 43
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_043",
+            "title": "Audit Product 043",
+            "sku": "AUD-043",
+            "price": 14.3,
+            "inventory": 43,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-043",
+              "dimensions": {
+                "height_cm": 43,
+                "width_cm": 44
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_044",
+            "title": "Audit Product 044",
+            "sku": "AUD-044",
+            "price": 14.4,
+            "inventory": 44,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-044",
+              "dimensions": {
+                "height_cm": 44,
+                "width_cm": 45
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_045",
+            "title": "Audit Product 045",
+            "sku": "AUD-045",
+            "price": 14.5,
+            "inventory": 45,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-045",
+              "dimensions": {
+                "height_cm": 45,
+                "width_cm": 46
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_046",
+            "title": "Audit Product 046",
+            "sku": "AUD-046",
+            "price": 14.6,
+            "inventory": 46,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-046",
+              "dimensions": {
+                "height_cm": 46,
+                "width_cm": 47
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_047",
+            "title": "Audit Product 047",
+            "sku": "AUD-047",
+            "price": 14.7,
+            "inventory": 47,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-047",
+              "dimensions": {
+                "height_cm": 47,
+                "width_cm": 48
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_048",
+            "title": "Audit Product 048",
+            "sku": "AUD-048",
+            "price": 14.8,
+            "inventory": 48,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-048",
+              "dimensions": {
+                "height_cm": 48,
+                "width_cm": 49
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_049",
+            "title": "Audit Product 049",
+            "sku": "AUD-049",
+            "price": 14.9,
+            "inventory": 49,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-049",
+              "dimensions": {
+                "height_cm": 49,
+                "width_cm": 50
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_050",
+            "title": "Audit Product 050",
+            "sku": "AUD-050",
+            "price": 15,
+            "inventory": 50,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-050",
+              "dimensions": {
+                "height_cm": 50,
+                "width_cm": 51
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_051",
+            "title": "Audit Product 051",
+            "sku": "AUD-051",
+            "price": 15.1,
+            "inventory": 51,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-051",
+              "dimensions": {
+                "height_cm": 51,
+                "width_cm": 52
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_052",
+            "title": "Audit Product 052",
+            "sku": "AUD-052",
+            "price": 15.2,
+            "inventory": 52,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-052",
+              "dimensions": {
+                "height_cm": 52,
+                "width_cm": 53
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_053",
+            "title": "Audit Product 053",
+            "sku": "AUD-053",
+            "price": 15.3,
+            "inventory": 53,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-053",
+              "dimensions": {
+                "height_cm": 53,
+                "width_cm": 54
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_054",
+            "title": "Audit Product 054",
+            "sku": "AUD-054",
+            "price": 15.4,
+            "inventory": 54,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-054",
+              "dimensions": {
+                "height_cm": 54,
+                "width_cm": 55
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_055",
+            "title": "Audit Product 055",
+            "sku": "AUD-055",
+            "price": 15.5,
+            "inventory": 55,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-055",
+              "dimensions": {
+                "height_cm": 55,
+                "width_cm": 56
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_056",
+            "title": "Audit Product 056",
+            "sku": "AUD-056",
+            "price": 15.6,
+            "inventory": 56,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-056",
+              "dimensions": {
+                "height_cm": 56,
+                "width_cm": 57
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_057",
+            "title": "Audit Product 057",
+            "sku": "AUD-057",
+            "price": 15.7,
+            "inventory": 57,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-057",
+              "dimensions": {
+                "height_cm": 57,
+                "width_cm": 58
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_058",
+            "title": "Audit Product 058",
+            "sku": "AUD-058",
+            "price": 15.8,
+            "inventory": 58,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-058",
+              "dimensions": {
+                "height_cm": 58,
+                "width_cm": 59
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_059",
+            "title": "Audit Product 059",
+            "sku": "AUD-059",
+            "price": 15.9,
+            "inventory": 59,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-059",
+              "dimensions": {
+                "height_cm": 59,
+                "width_cm": 60
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_060",
+            "title": "Audit Product 060",
+            "sku": "AUD-060",
+            "price": 16,
+            "inventory": 60,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-060",
+              "dimensions": {
+                "height_cm": 60,
+                "width_cm": 61
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_061",
+            "title": "Audit Product 061",
+            "sku": "AUD-061",
+            "price": 16.1,
+            "inventory": 61,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-061",
+              "dimensions": {
+                "height_cm": 61,
+                "width_cm": 62
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_062",
+            "title": "Audit Product 062",
+            "sku": "AUD-062",
+            "price": 16.2,
+            "inventory": 62,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-062",
+              "dimensions": {
+                "height_cm": 62,
+                "width_cm": 63
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_063",
+            "title": "Audit Product 063",
+            "sku": "AUD-063",
+            "price": 16.3,
+            "inventory": 63,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-063",
+              "dimensions": {
+                "height_cm": 63,
+                "width_cm": 64
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_064",
+            "title": "Audit Product 064",
+            "sku": "AUD-064",
+            "price": 16.4,
+            "inventory": 64,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-064",
+              "dimensions": {
+                "height_cm": 64,
+                "width_cm": 65
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_065",
+            "title": "Audit Product 065",
+            "sku": "AUD-065",
+            "price": 16.5,
+            "inventory": 65,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-065",
+              "dimensions": {
+                "height_cm": 65,
+                "width_cm": 66
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_066",
+            "title": "Audit Product 066",
+            "sku": "AUD-066",
+            "price": 16.6,
+            "inventory": 66,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-066",
+              "dimensions": {
+                "height_cm": 66,
+                "width_cm": 67
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_067",
+            "title": "Audit Product 067",
+            "sku": "AUD-067",
+            "price": 16.7,
+            "inventory": 67,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-067",
+              "dimensions": {
+                "height_cm": 67,
+                "width_cm": 68
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_068",
+            "title": "Audit Product 068",
+            "sku": "AUD-068",
+            "price": 16.8,
+            "inventory": 68,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-068",
+              "dimensions": {
+                "height_cm": 68,
+                "width_cm": 69
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_069",
+            "title": "Audit Product 069",
+            "sku": "AUD-069",
+            "price": 16.9,
+            "inventory": 69,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-069",
+              "dimensions": {
+                "height_cm": 69,
+                "width_cm": 70
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_070",
+            "title": "Audit Product 070",
+            "sku": "AUD-070",
+            "price": 17,
+            "inventory": 70,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-070",
+              "dimensions": {
+                "height_cm": 70,
+                "width_cm": 71
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_071",
+            "title": "Audit Product 071",
+            "sku": "AUD-071",
+            "price": 17.1,
+            "inventory": 71,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-071",
+              "dimensions": {
+                "height_cm": 71,
+                "width_cm": 72
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_072",
+            "title": "Audit Product 072",
+            "sku": "AUD-072",
+            "price": 17.2,
+            "inventory": 72,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-072",
+              "dimensions": {
+                "height_cm": 72,
+                "width_cm": 73
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_073",
+            "title": "Audit Product 073",
+            "sku": "AUD-073",
+            "price": 17.3,
+            "inventory": 73,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-073",
+              "dimensions": {
+                "height_cm": 73,
+                "width_cm": 74
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_074",
+            "title": "Audit Product 074",
+            "sku": "AUD-074",
+            "price": 17.4,
+            "inventory": 74,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-074",
+              "dimensions": {
+                "height_cm": 74,
+                "width_cm": 75
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_075",
+            "title": "Audit Product 075",
+            "sku": "AUD-075",
+            "price": 17.5,
+            "inventory": 75,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-075",
+              "dimensions": {
+                "height_cm": 75,
+                "width_cm": 76
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_076",
+            "title": "Audit Product 076",
+            "sku": "AUD-076",
+            "price": 17.6,
+            "inventory": 76,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-076",
+              "dimensions": {
+                "height_cm": 76,
+                "width_cm": 77
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_077",
+            "title": "Audit Product 077",
+            "sku": "AUD-077",
+            "price": 17.7,
+            "inventory": 77,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-077",
+              "dimensions": {
+                "height_cm": 77,
+                "width_cm": 78
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_078",
+            "title": "Audit Product 078",
+            "sku": "AUD-078",
+            "price": 17.8,
+            "inventory": 78,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-078",
+              "dimensions": {
+                "height_cm": 78,
+                "width_cm": 79
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_079",
+            "title": "Audit Product 079",
+            "sku": "AUD-079",
+            "price": 17.9,
+            "inventory": 79,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-079",
+              "dimensions": {
+                "height_cm": 79,
+                "width_cm": 80
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_080",
+            "title": "Audit Product 080",
+            "sku": "AUD-080",
+            "price": 18,
+            "inventory": 80,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-080",
+              "dimensions": {
+                "height_cm": 80,
+                "width_cm": 81
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_081",
+            "title": "Audit Product 081",
+            "sku": "AUD-081",
+            "price": 18.1,
+            "inventory": 81,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-081",
+              "dimensions": {
+                "height_cm": 81,
+                "width_cm": 82
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_082",
+            "title": "Audit Product 082",
+            "sku": "AUD-082",
+            "price": 18.2,
+            "inventory": 82,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-082",
+              "dimensions": {
+                "height_cm": 82,
+                "width_cm": 83
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_083",
+            "title": "Audit Product 083",
+            "sku": "AUD-083",
+            "price": 18.3,
+            "inventory": 83,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-083",
+              "dimensions": {
+                "height_cm": 83,
+                "width_cm": 84
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_084",
+            "title": "Audit Product 084",
+            "sku": "AUD-084",
+            "price": 18.4,
+            "inventory": 84,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-084",
+              "dimensions": {
+                "height_cm": 84,
+                "width_cm": 85
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_085",
+            "title": "Audit Product 085",
+            "sku": "AUD-085",
+            "price": 18.5,
+            "inventory": 85,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-085",
+              "dimensions": {
+                "height_cm": 85,
+                "width_cm": 86
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_086",
+            "title": "Audit Product 086",
+            "sku": "AUD-086",
+            "price": 18.6,
+            "inventory": 86,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-086",
+              "dimensions": {
+                "height_cm": 86,
+                "width_cm": 87
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_087",
+            "title": "Audit Product 087",
+            "sku": "AUD-087",
+            "price": 18.7,
+            "inventory": 87,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-087",
+              "dimensions": {
+                "height_cm": 87,
+                "width_cm": 88
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_088",
+            "title": "Audit Product 088",
+            "sku": "AUD-088",
+            "price": 18.8,
+            "inventory": 88,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-088",
+              "dimensions": {
+                "height_cm": 88,
+                "width_cm": 89
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_089",
+            "title": "Audit Product 089",
+            "sku": "AUD-089",
+            "price": 18.9,
+            "inventory": 89,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-089",
+              "dimensions": {
+                "height_cm": 89,
+                "width_cm": 90
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_090",
+            "title": "Audit Product 090",
+            "sku": "AUD-090",
+            "price": 19,
+            "inventory": 90,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-090",
+              "dimensions": {
+                "height_cm": 90,
+                "width_cm": 91
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_091",
+            "title": "Audit Product 091",
+            "sku": "AUD-091",
+            "price": 19.1,
+            "inventory": 91,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-091",
+              "dimensions": {
+                "height_cm": 91,
+                "width_cm": 92
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_092",
+            "title": "Audit Product 092",
+            "sku": "AUD-092",
+            "price": 19.2,
+            "inventory": 92,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-092",
+              "dimensions": {
+                "height_cm": 92,
+                "width_cm": 93
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_093",
+            "title": "Audit Product 093",
+            "sku": "AUD-093",
+            "price": 19.3,
+            "inventory": 93,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-093",
+              "dimensions": {
+                "height_cm": 93,
+                "width_cm": 94
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_094",
+            "title": "Audit Product 094",
+            "sku": "AUD-094",
+            "price": 19.4,
+            "inventory": 94,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-094",
+              "dimensions": {
+                "height_cm": 94,
+                "width_cm": 95
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_095",
+            "title": "Audit Product 095",
+            "sku": "AUD-095",
+            "price": 19.5,
+            "inventory": 95,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-095",
+              "dimensions": {
+                "height_cm": 95,
+                "width_cm": 96
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_096",
+            "title": "Audit Product 096",
+            "sku": "AUD-096",
+            "price": 19.6,
+            "inventory": 96,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-096",
+              "dimensions": {
+                "height_cm": 96,
+                "width_cm": 97
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_097",
+            "title": "Audit Product 097",
+            "sku": "AUD-097",
+            "price": 19.7,
+            "inventory": 97,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-097",
+              "dimensions": {
+                "height_cm": 97,
+                "width_cm": 98
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_098",
+            "title": "Audit Product 098",
+            "sku": "AUD-098",
+            "price": 19.8,
+            "inventory": 98,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-098",
+              "dimensions": {
+                "height_cm": 98,
+                "width_cm": 99
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_099",
+            "title": "Audit Product 099",
+            "sku": "AUD-099",
+            "price": 19.9,
+            "inventory": 99,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-099",
+              "dimensions": {
+                "height_cm": 99,
+                "width_cm": 100
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_100",
+            "title": "Audit Product 100",
+            "sku": "AUD-100",
+            "price": 20,
+            "inventory": 100,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-100",
+              "dimensions": {
+                "height_cm": 100,
+                "width_cm": 101
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_101",
+            "title": "Audit Product 101",
+            "sku": "AUD-101",
+            "price": 20.1,
+            "inventory": 101,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-101",
+              "dimensions": {
+                "height_cm": 101,
+                "width_cm": 102
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_102",
+            "title": "Audit Product 102",
+            "sku": "AUD-102",
+            "price": 20.2,
+            "inventory": 102,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-102",
+              "dimensions": {
+                "height_cm": 102,
+                "width_cm": 103
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_103",
+            "title": "Audit Product 103",
+            "sku": "AUD-103",
+            "price": 20.3,
+            "inventory": 103,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-103",
+              "dimensions": {
+                "height_cm": 103,
+                "width_cm": 104
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_104",
+            "title": "Audit Product 104",
+            "sku": "AUD-104",
+            "price": 20.4,
+            "inventory": 104,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-104",
+              "dimensions": {
+                "height_cm": 104,
+                "width_cm": 105
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_105",
+            "title": "Audit Product 105",
+            "sku": "AUD-105",
+            "price": 20.5,
+            "inventory": 105,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-105",
+              "dimensions": {
+                "height_cm": 105,
+                "width_cm": 106
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_106",
+            "title": "Audit Product 106",
+            "sku": "AUD-106",
+            "price": 20.6,
+            "inventory": 106,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-106",
+              "dimensions": {
+                "height_cm": 106,
+                "width_cm": 107
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_107",
+            "title": "Audit Product 107",
+            "sku": "AUD-107",
+            "price": 20.7,
+            "inventory": 107,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-107",
+              "dimensions": {
+                "height_cm": 107,
+                "width_cm": 108
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_108",
+            "title": "Audit Product 108",
+            "sku": "AUD-108",
+            "price": 20.8,
+            "inventory": 108,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-108",
+              "dimensions": {
+                "height_cm": 108,
+                "width_cm": 109
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_109",
+            "title": "Audit Product 109",
+            "sku": "AUD-109",
+            "price": 20.9,
+            "inventory": 109,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-109",
+              "dimensions": {
+                "height_cm": 109,
+                "width_cm": 110
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_110",
+            "title": "Audit Product 110",
+            "sku": "AUD-110",
+            "price": 21,
+            "inventory": 110,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-110",
+              "dimensions": {
+                "height_cm": 110,
+                "width_cm": 111
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_111",
+            "title": "Audit Product 111",
+            "sku": "AUD-111",
+            "price": 21.1,
+            "inventory": 111,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-111",
+              "dimensions": {
+                "height_cm": 111,
+                "width_cm": 112
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_112",
+            "title": "Audit Product 112",
+            "sku": "AUD-112",
+            "price": 21.2,
+            "inventory": 112,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-112",
+              "dimensions": {
+                "height_cm": 112,
+                "width_cm": 113
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_113",
+            "title": "Audit Product 113",
+            "sku": "AUD-113",
+            "price": 21.3,
+            "inventory": 113,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-113",
+              "dimensions": {
+                "height_cm": 113,
+                "width_cm": 114
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_114",
+            "title": "Audit Product 114",
+            "sku": "AUD-114",
+            "price": 21.4,
+            "inventory": 114,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-114",
+              "dimensions": {
+                "height_cm": 114,
+                "width_cm": 115
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_115",
+            "title": "Audit Product 115",
+            "sku": "AUD-115",
+            "price": 21.5,
+            "inventory": 115,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-115",
+              "dimensions": {
+                "height_cm": 115,
+                "width_cm": 116
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_116",
+            "title": "Audit Product 116",
+            "sku": "AUD-116",
+            "price": 21.6,
+            "inventory": 116,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-116",
+              "dimensions": {
+                "height_cm": 116,
+                "width_cm": 117
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_117",
+            "title": "Audit Product 117",
+            "sku": "AUD-117",
+            "price": 21.7,
+            "inventory": 117,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-117",
+              "dimensions": {
+                "height_cm": 117,
+                "width_cm": 118
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_118",
+            "title": "Audit Product 118",
+            "sku": "AUD-118",
+            "price": 21.8,
+            "inventory": 118,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-118",
+              "dimensions": {
+                "height_cm": 118,
+                "width_cm": 119
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_119",
+            "title": "Audit Product 119",
+            "sku": "AUD-119",
+            "price": 21.9,
+            "inventory": 119,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-119",
+              "dimensions": {
+                "height_cm": 119,
+                "width_cm": 120
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_120",
+            "title": "Audit Product 120",
+            "sku": "AUD-120",
+            "price": 22,
+            "inventory": 120,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-120",
+              "dimensions": {
+                "height_cm": 120,
+                "width_cm": 121
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_121",
+            "title": "Audit Product 121",
+            "sku": "AUD-121",
+            "price": 22.1,
+            "inventory": 121,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-121",
+              "dimensions": {
+                "height_cm": 121,
+                "width_cm": 122
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_122",
+            "title": "Audit Product 122",
+            "sku": "AUD-122",
+            "price": 22.2,
+            "inventory": 122,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-122",
+              "dimensions": {
+                "height_cm": 122,
+                "width_cm": 123
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_123",
+            "title": "Audit Product 123",
+            "sku": "AUD-123",
+            "price": 22.3,
+            "inventory": 123,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-123",
+              "dimensions": {
+                "height_cm": 123,
+                "width_cm": 124
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_124",
+            "title": "Audit Product 124",
+            "sku": "AUD-124",
+            "price": 22.4,
+            "inventory": 124,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-124",
+              "dimensions": {
+                "height_cm": 124,
+                "width_cm": 125
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_125",
+            "title": "Audit Product 125",
+            "sku": "AUD-125",
+            "price": 22.5,
+            "inventory": 125,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-125",
+              "dimensions": {
+                "height_cm": 125,
+                "width_cm": 126
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_126",
+            "title": "Audit Product 126",
+            "sku": "AUD-126",
+            "price": 22.6,
+            "inventory": 126,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-126",
+              "dimensions": {
+                "height_cm": 126,
+                "width_cm": 127
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_127",
+            "title": "Audit Product 127",
+            "sku": "AUD-127",
+            "price": 22.7,
+            "inventory": 127,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-127",
+              "dimensions": {
+                "height_cm": 127,
+                "width_cm": 128
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_128",
+            "title": "Audit Product 128",
+            "sku": "AUD-128",
+            "price": 22.8,
+            "inventory": 128,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-128",
+              "dimensions": {
+                "height_cm": 128,
+                "width_cm": 129
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_129",
+            "title": "Audit Product 129",
+            "sku": "AUD-129",
+            "price": 22.9,
+            "inventory": 129,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-129",
+              "dimensions": {
+                "height_cm": 129,
+                "width_cm": 130
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_130",
+            "title": "Audit Product 130",
+            "sku": "AUD-130",
+            "price": 23,
+            "inventory": 130,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-130",
+              "dimensions": {
+                "height_cm": 130,
+                "width_cm": 131
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_131",
+            "title": "Audit Product 131",
+            "sku": "AUD-131",
+            "price": 23.1,
+            "inventory": 131,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-131",
+              "dimensions": {
+                "height_cm": 131,
+                "width_cm": 132
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_132",
+            "title": "Audit Product 132",
+            "sku": "AUD-132",
+            "price": 23.2,
+            "inventory": 132,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-132",
+              "dimensions": {
+                "height_cm": 132,
+                "width_cm": 133
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_133",
+            "title": "Audit Product 133",
+            "sku": "AUD-133",
+            "price": 23.3,
+            "inventory": 133,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-133",
+              "dimensions": {
+                "height_cm": 133,
+                "width_cm": 134
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_134",
+            "title": "Audit Product 134",
+            "sku": "AUD-134",
+            "price": 23.4,
+            "inventory": 134,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-134",
+              "dimensions": {
+                "height_cm": 134,
+                "width_cm": 135
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_135",
+            "title": "Audit Product 135",
+            "sku": "AUD-135",
+            "price": 23.5,
+            "inventory": 135,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-135",
+              "dimensions": {
+                "height_cm": 135,
+                "width_cm": 136
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
+          },
+          {
+            "id": "prod_136",
+            "title": "Audit Product 136",
+            "sku": "AUD-136",
+            "price": 23.6,
+            "inventory": 136,
+            "available": true,
+            "tags": [
+              "audit",
+              "even"
+            ],
+            "metadata": {
+              "color": "fixture-136",
+              "dimensions": {
+                "height_cm": 136,
+                "width_cm": 137
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_kitchen"
+          },
+          {
+            "id": "prod_137",
+            "title": "Audit Product 137",
+            "sku": "AUD-137",
+            "price": 23.7,
+            "inventory": 137,
+            "available": false,
+            "tags": [
+              "audit",
+              "odd"
+            ],
+            "metadata": {
+              "color": "fixture-137",
+              "dimensions": {
+                "height_cm": 137,
+                "width_cm": 138
+              },
+              "rating": 4
+            },
+            "embedding": [
+              0.1,
+              0.2,
+              0.3
+            ],
+            "category_id": "cat_coffee"
           }
         ]
       }

@@ -147,6 +147,14 @@ for script_name in test.js contract_tests.js full_compat_tests.js instantsearch_
   fi
 done
 
+real_client_count=$(grep -Fc "args=run test:real_clients" "$NPM_LOG" || true)
+if [ "$real_client_count" != "1" ]; then
+  echo "Expected real-client browser conformance to run exactly once under --sdk --e2e, got $real_client_count"
+  cat "$NPM_LOG"
+  cat "$OUTPUT_FILE"
+  exit 1
+fi
+
 if grep -Fq "SDK: JS test.js" "$OUTPUT_FILE"; then
   echo "Expected SDK-only JS suite block to be skipped when --e2e is enabled"
   cat "$OUTPUT_FILE"

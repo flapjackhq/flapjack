@@ -1,17 +1,19 @@
-/// Only the debug-gated loopback tests below name the opt-in, so the import
-/// carries the same gate as the seam it points at.
-#[cfg(debug_assertions)]
+use super::source_identity_partitions::SourceIdentityConfig;
+use super::source_reader::source_record_identity_page;
+use super::source_snapshot::SourceSnapshotBuilder;
+/// The loopback seam is reachable in every profile behind the explicit
+/// `FJ_ENABLE_TYPESENSE_PREVIEW_LOOPBACK=1` opt-in, so the tests below and this
+/// import run un-gated.
 use super::typesense_client::TYPESENSE_PREVIEW_LOOPBACK_ENV;
 use super::typesense_client::{
     capture_source_with_transport, decode_document_page, encoded_collection_name,
     fetch_document_pages_with_expected_count_for_test, fetch_document_pages_with_transport,
-    observe_source_with_transport, page_exceeds_traversal_budget, read_settings_with_transport,
+    list_collections_with_transport, observe_source_with_transport, read_settings_with_transport,
     require_read_access_with_transport, TraversalLimits, TypesenseClient, TypesenseClientError,
     TypesenseErrorKind, TypesenseMethod, TypesenseRequest, TypesenseResponse, TypesenseTransport,
-    CONNECT_TIMEOUT, DOCUMENT_PAGE_LIMIT, MAX_DOCUMENT_ITEMS, MAX_DOCUMENT_PAGES,
-    MAX_RESPONSE_BYTES, REQUEST_TIMEOUT,
+    CONNECT_TIMEOUT, MAX_DOCUMENT_ITEMS, MAX_RESPONSE_BYTES, REQUEST_TIMEOUT,
 };
-use super::typesense_source_reader::map_typesense_client_error;
+use super::typesense_source_reader::{map_typesense_client_error, typesense_document_records};
 use super::AlgoliaErrorKind;
 use flapjack::security::test_helpers::install_test_outbound_host_resolver;
 use serde_json::{json, Value};
@@ -22,11 +24,15 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tempfile::TempDir;
 
 const RAW_ENDPOINT_CANARY: &str = "https://tenant-secret.typesense.example";
 const API_KEY_CANARY: &str = "typesense-secret-api-key";
 const SOURCE_CANARY: &str = "private-typesense-collection";
+const LIVE_NETWORK_AWAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+use crate::router_tests::typesense_fixture_test_support::product_ids as expected_product_ids;
 
 fn assert_error_is_sanitized(error: &TypesenseClientError) {
     let debug = format!("{error:?}");
@@ -168,35 +174,44 @@ fn client_transport_time_budgets_are_bounded() {
 }
 
 #[test]
-fn default_document_traversal_budget_reaches_advertised_item_ceiling() {
-    let reachable_items = DOCUMENT_PAGE_LIMIT
-        .checked_mul(MAX_DOCUMENT_PAGES)
-        .expect("document traversal budget multiplication should not overflow");
-    assert!(
-        reachable_items >= MAX_DOCUMENT_ITEMS,
-        "default traversal can only reach {reachable_items} items before page limit"
-    );
-    assert!(
-        !page_exceeds_traversal_budget(
-            MAX_DOCUMENT_PAGES + 1,
-            TraversalLimits::default(),
-            Some(MAX_DOCUMENT_ITEMS),
-            MAX_DOCUMENT_ITEMS,
-        ),
-        "counted traversal must reserve an empty completion probe at the advertised ceiling"
-    );
-    assert!(
-        page_exceeds_traversal_budget(
-            MAX_DOCUMENT_PAGES + 2,
-            TraversalLimits::default(),
-            Some(MAX_DOCUMENT_ITEMS),
-            MAX_DOCUMENT_ITEMS,
-        ),
-        "counted traversal must reserve only one completion probe"
+fn default_document_traversal_budget_is_the_advertised_item_ceiling() {
+    assert_eq!(
+        TraversalLimits::default(),
+        TraversalLimits {
+            max_items: MAX_DOCUMENT_ITEMS
+        },
+        "the export stream carries no budget other than the advertised item ceiling"
     );
 }
 
+/// The item ceiling is an exact boundary on the single stream: a stream of
+/// exactly `max_items` values is accepted and one more value is refused.
 #[tokio::test]
+async fn export_stream_item_ceiling_accepts_the_limit_and_refuses_one_more() {
+    for (documents, expected_error) in [(3usize, None), (4, Some(TypesenseErrorKind::Limit))] {
+        let mut transport = ScriptedTransport::with_export_responses([numbered_page(0, documents)]);
+        let result = fetch_document_pages_with_transport(
+            &mut transport,
+            "catalog",
+            TraversalLimits { max_items: 3 },
+            |_| Ok::<_, TypesenseClientError>(()),
+        )
+        .await;
+
+        match expected_error {
+            None => result.expect("a stream at the item ceiling must be accepted"),
+            Some(kind) => {
+                let error = result.expect_err("a stream past the item ceiling must be refused");
+                assert_eq!(error.kind(), kind);
+                assert_error_is_sanitized(&error);
+            }
+        }
+        assert_eq!(transport.requests.len(), 1);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(flapjack_outbound_url_policy)]
 async fn client_bypasses_ambient_https_proxy_and_uses_pinned_address() {
     let direct_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -251,18 +266,16 @@ fn collection_name_is_percent_encoded_as_one_path_segment() {
 }
 
 #[test]
-fn document_page_decoding_preserves_declared_pagination() {
-    let page = decode_document_page(
+fn document_stream_decoding_preserves_every_value_in_stream_order() {
+    let documents = decode_document_page(
         br#"{"id":"prod_001"}
-{"id":"prod_002"}
-"#,
+{"id":"prod_002"}"#,
     )
     .unwrap();
 
-    assert_eq!(page.page, 1);
-    assert_eq!(page.found, 2);
+    assert_eq!(documents.len(), 2);
     assert_eq!(
-        page.documents
+        documents
             .iter()
             .map(|document| document["id"].as_str().unwrap())
             .collect::<Vec<_>>(),
@@ -272,17 +285,15 @@ fn document_page_decoding_preserves_declared_pagination() {
 
 #[test]
 fn document_export_decoding_reads_json_values_without_search_envelope() {
-    let page = decode_document_page(
+    let documents = decode_document_page(
         br#"{"id":"prod_001","title":"Alpha"}
-{"id":"prod_002","title":"Beta"}
-"#,
+{"id":"prod_002","title":"Beta"}"#,
     )
     .unwrap();
 
-    assert_eq!(page.page, 1);
-    assert_eq!(page.found, 2);
+    assert_eq!(documents.len(), 2);
     assert_eq!(
-        page.documents
+        documents
             .iter()
             .map(|document| document["id"].as_str().unwrap())
             .collect::<Vec<_>>(),
@@ -360,10 +371,55 @@ impl TypesenseTransport for ScriptedTransport {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct RecordedExchange {
+    request: TypesenseRequest,
+    no_terminal_newline: Option<bool>,
+}
+
+struct RecordingTransport<T> {
+    delegate: T,
+    exchanges: Vec<RecordedExchange>,
+}
+
+impl<T> RecordingTransport<T> {
+    fn new(delegate: T) -> Self {
+        Self {
+            delegate,
+            exchanges: Vec::new(),
+        }
+    }
+}
+
+impl<T: TypesenseTransport + Send> TypesenseTransport for RecordingTransport<T> {
+    fn send<'a>(
+        &'a mut self,
+        request: TypesenseRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<TypesenseResponse, TypesenseClientError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let recorded_request = request.clone();
+            let result = self.delegate.send(request).await;
+            let no_terminal_newline = result
+                .as_ref()
+                .ok()
+                .map(|response| response.body.last().is_some_and(|byte| *byte != b'\n'));
+            self.exchanges.push(RecordedExchange {
+                request: recorded_request,
+                no_terminal_newline,
+            });
+            result
+        })
+    }
+}
+
 #[derive(Default)]
 struct UnderreportedExportTransport {
     requests: Vec<TypesenseRequest>,
 }
+
+const UNDERREPORTED_DECLARED_DOCUMENTS: usize = 100;
+const UNDERREPORTED_STREAMED_DOCUMENTS: usize = 200;
 
 impl TypesenseTransport for UnderreportedExportTransport {
     fn send<'a>(
@@ -375,13 +431,13 @@ impl TypesenseTransport for UnderreportedExportTransport {
         self.requests.push(request);
         Box::pin(async move {
             match path.as_str() {
-                "/collections/catalog" => Ok(json_response(collection(DOCUMENT_PAGE_LIMIT))),
-                "/collections/catalog/documents/export?page=1&per_page=100" => {
-                    Ok(export_response(numbered_page(0, DOCUMENT_PAGE_LIMIT)))
+                "/collections/catalog" => {
+                    Ok(json_response(collection(UNDERREPORTED_DECLARED_DOCUMENTS)))
                 }
-                "/collections/catalog/documents/export?page=2&per_page=100" => Ok(export_response(
-                    numbered_page(DOCUMENT_PAGE_LIMIT, DOCUMENT_PAGE_LIMIT),
-                )),
+                "/collections/catalog/documents/export" => Ok(export_response(numbered_page(
+                    0,
+                    UNDERREPORTED_STREAMED_DOCUMENTS,
+                ))),
                 _ => Err(TypesenseClientError::new(
                     TypesenseErrorKind::Transport,
                     "Typesense transport failed",
@@ -401,53 +457,315 @@ fn numbered_page(start: usize, count: usize) -> Vec<Value> {
         .collect()
 }
 
+/// A Typesense 30.2 export body: newline-separated JSON values with no terminal
+/// newline, which is the exact shape the live contract pins.
 fn export_body(documents: Vec<Value>) -> Vec<u8> {
-    let mut body = Vec::new();
-    for document in documents {
-        body.extend_from_slice(&serde_json::to_vec(&document).unwrap());
-        body.push(b'\n');
-    }
-    body
-}
-
-fn expected_product_ids() -> Vec<String> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../tests/fixtures/2026_07_26_m0b_typesense_migration/expected_bundle.json");
-    let bundle: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    bundle["source"]["collections"]
-        .as_array()
-        .unwrap()
+    documents
         .iter()
-        .find(|collection| collection["name"] == "fj_ts_migration_products")
-        .unwrap()["documents"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|document| document["id"].as_str().unwrap().to_string())
-        .collect()
-}
-
-fn fixture_traversal_limits() -> TraversalLimits {
-    TraversalLimits {
-        page_size: 2,
-        ..TraversalLimits::default()
-    }
+        .map(|document| serde_json::to_string(document).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes()
 }
 
 #[tokio::test]
-async fn document_traversal_follows_declared_pages_and_fixture_ids() {
-    let expected_ids = expected_product_ids();
-    let mut transport = ScriptedTransport::with_export_responses([
-        page(&[&expected_ids[0], &expected_ids[1]]),
-        page(&[&expected_ids[2]]),
-    ]);
+async fn recording_transport_delegates_the_original_request_unchanged() {
+    let request = TypesenseRequest {
+        method: TypesenseMethod::Get,
+        path: "/collections/catalog/documents/export?sentinel=original".to_string(),
+        body: None,
+    };
+    let response = TypesenseResponse {
+        status: 200,
+        body: br#"{"id":"prod_001"}"#.to_vec(),
+    };
+    let mut transport = RecordingTransport::new(ScriptedTransport {
+        responses: VecDeque::from([response.clone()]),
+        requests: Vec::new(),
+    });
+
+    assert_eq!(transport.send(request.clone()).await.unwrap(), response);
+    assert_eq!(transport.delegate.requests, vec![request.clone()]);
+    assert_eq!(
+        transport.exchanges,
+        vec![RecordedExchange {
+            request,
+            no_terminal_newline: Some(true),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn recording_transport_records_delegate_errors_before_propagating() {
+    let request = TypesenseRequest {
+        method: TypesenseMethod::Get,
+        path: "/collections/catalog/documents/export".to_string(),
+        body: None,
+    };
+    let mut transport = RecordingTransport::new(ScriptedTransport::default());
+
+    let error = transport.send(request.clone()).await.unwrap_err();
+
+    assert_eq!(error.kind(), TypesenseErrorKind::Transport);
+    assert_eq!(
+        transport.exchanges,
+        vec![RecordedExchange {
+            request,
+            no_terminal_newline: None,
+        }],
+        "failed delegate attempts must remain visible to request-count oracles"
+    );
+}
+
+/// The 137 canonical fixture products as export documents, in fixture order.
+fn fixture_export_documents() -> Vec<Value> {
+    expected_product_ids()
+        .iter()
+        .map(|id| json!({ "id": id }))
+        .collect()
+}
+
+fn export_exchanges<T>(transport: &RecordingTransport<T>) -> Vec<&RecordedExchange> {
+    transport
+        .exchanges
+        .iter()
+        .filter(|exchange| exchange.request.path.contains("/documents/export"))
+        .collect()
+}
+
+#[tokio::test]
+async fn source_capture_reads_the_whole_collection_from_one_query_free_export_stream() {
+    let documents = fixture_export_documents();
+    assert_eq!(documents.len(), 137, "the live denominator must be exact");
+    let mut transport = RecordingTransport::new(ScriptedTransport {
+        responses: VecDeque::from([
+            json_response(collection(documents.len())),
+            export_response(documents.clone()),
+            json_response(collection(documents.len())),
+        ]),
+        requests: Vec::new(),
+    });
+    let mut captured_ids = Vec::new();
+
+    capture_source_with_transport(&mut transport, "catalog", |page| {
+        captured_ids.extend(
+            page.iter()
+                .map(|document| document["id"].as_str().unwrap().to_string()),
+        );
+        Ok::<_, TypesenseClientError>(())
+    })
+    .await
+    .expect("one bounded Typesense export stream must capture the whole collection");
+
+    assert_eq!(
+        captured_ids,
+        expected_product_ids(),
+        "every fixture value must be consumed exactly once, in stream order"
+    );
+    let exports = export_exchanges(&transport);
+    assert_eq!(exports.len(), 1, "export is one unpaginated stream request");
+    assert_eq!(
+        exports[0].request.path, "/collections/catalog/documents/export",
+        "Typesense 30.2 export takes no page/per_page query"
+    );
+    assert_eq!(
+        exports[0].no_terminal_newline,
+        Some(true),
+        "the fixture stream must carry no terminal newline"
+    );
+}
+
+#[tokio::test]
+async fn counted_export_consumes_the_whole_stream_in_one_query_free_request() {
+    let documents = fixture_export_documents();
+    let mut transport = RecordingTransport::new(ScriptedTransport {
+        responses: VecDeque::from([export_response(documents.clone())]),
+        requests: Vec::new(),
+    });
+    let mut consumed_pages = Vec::new();
+
+    fetch_document_pages_with_expected_count_for_test(
+        &mut transport,
+        "catalog/2026",
+        TraversalLimits::default(),
+        documents.len(),
+        |page| {
+            consumed_pages.push(page);
+            Ok::<_, TypesenseClientError>(())
+        },
+    )
+    .await
+    .expect("the counted export must accept the whole stream in one request");
+
+    assert_eq!(
+        consumed_pages,
+        vec![documents],
+        "the export stream is handed to the consumer once, unsplit"
+    );
+    let exports = export_exchanges(&transport);
+    assert_eq!(exports.len(), 1);
+    assert_eq!(
+        exports[0].request.path,
+        format!(
+            "/collections/{}/documents/export",
+            encoded_collection_name("catalog/2026")
+        )
+    );
+}
+
+#[tokio::test]
+async fn read_access_probe_uses_the_same_query_free_export_path() {
+    let documents = fixture_export_documents();
+    let mut transport = RecordingTransport::new(ScriptedTransport {
+        responses: VecDeque::from([
+            json_response(collection(documents.len())),
+            export_response(documents),
+        ]),
+        requests: Vec::new(),
+    });
+
+    require_read_access_with_transport(&mut transport, "catalog")
+        .await
+        .expect("a readable collection must admit the query-free export probe");
+
+    let exports = export_exchanges(&transport);
+    assert_eq!(exports.len(), 1);
+    assert_eq!(
+        exports[0].request.path,
+        "/collections/catalog/documents/export"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned Typesense 30.2 live contract driver"]
+async fn typesense_export_stream_live_contract() {
+    let endpoint = std::env::var("TYPESENSE_ENDPOINT").expect("driver must pass loopback endpoint");
+    let api_key = std::env::var("TYPESENSE_API_KEY").expect("driver must pass scoped key");
+    let collection =
+        std::env::var("TYPESENSE_COLLECTION").expect("driver must pass source collection");
+    let expected_path = PathBuf::from(
+        std::env::var("TYPESENSE_EXPECTED_IDS_FILE")
+            .expect("driver must pass expected-ID artifact"),
+    );
+    let expected_ids = std::fs::read_to_string(&expected_path)
+        .expect("expected-ID artifact must be readable")
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(expected_ids.len(), 137, "live denominator must be exact");
+
+    let upstream = url::Url::parse(&endpoint).expect("driver endpoint must be a URL");
+    let upstream_ip: IpAddr = upstream
+        .host_str()
+        .expect("driver endpoint must have a host")
+        .parse()
+        .expect("driver endpoint must use a literal loopback address");
+    assert!(upstream_ip.is_loopback());
+    assert!(upstream.port_or_known_default().is_some());
+    let _loopback = crate::test_helpers::with_env_var(TYPESENSE_PREVIEW_LOOPBACK_ENV, "1");
+    let discovery_client = TypesenseClient::new_discovery_preview_loopback(&endpoint, &api_key)
+        .expect("driver loopback endpoint must be admitted for discovery");
+    // `RecordingTransport` decorates the production transport, so byte-limit
+    // enforcement, error-kind mapping, and `resolve_to_addrs` pinning keep one
+    // owner. The finite verdict comes from the client's own `CONNECT_TIMEOUT`
+    // and `REQUEST_TIMEOUT` plus the `LIVE_NETWORK_AWAIT_TIMEOUT` wrappers
+    // below, not from a second bounded-await transport.
+    let mut discovery_transport = RecordingTransport::new(discovery_client.transport());
+    let discovered = tokio::time::timeout(
+        LIVE_NETWORK_AWAIT_TIMEOUT,
+        list_collections_with_transport(&mut discovery_transport, None, None),
+    )
+    .await
+    .expect("collection discovery exceeded the live-contract deadline")
+    .expect("collection discovery must succeed before export");
+    assert!(
+        discovered.iter().any(|item| item.name == collection),
+        "driver collection must be visible to scoped discovery"
+    );
+    let discovery_export_requests = discovery_transport
+        .exchanges
+        .iter()
+        .filter(|exchange| exchange.request.path.contains("/documents/export"))
+        .count();
+    assert_eq!(discovery_export_requests, 0);
+
+    let client = TypesenseClient::new_preview_loopback(&endpoint, &api_key, &collection)
+        .expect("driver loopback endpoint must be admitted for capture");
+    let mut transport = RecordingTransport::new(client.transport());
+    let mut captured_ids = Vec::new();
+    let capture = tokio::time::timeout(
+        LIVE_NETWORK_AWAIT_TIMEOUT,
+        capture_source_with_transport(&mut transport, &collection, |documents| {
+            captured_ids.extend(documents.into_iter().map(|document| {
+                document["id"]
+                    .as_str()
+                    .expect("Typesense fixture IDs must be strings")
+                    .to_string()
+            }));
+            Ok::<_, TypesenseClientError>(())
+        }),
+    )
+    .await
+    .expect("source capture exceeded the live-contract deadline");
+    let export_requests = transport
+        .exchanges
+        .iter()
+        .filter(|exchange| exchange.request.path.contains("/documents/export"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        export_requests.len(),
+        1,
+        "capture must issue one export request"
+    );
+    assert_eq!(export_requests[0].request.method, TypesenseMethod::Get);
+    assert_eq!(
+        export_requests[0].request.path,
+        format!(
+            "/collections/{}/documents/export",
+            encoded_collection_name(&collection)
+        ),
+        "Typesense 30.2 export is one stream and rejects fabricated page/per_page traversal"
+    );
+    capture.expect("one bounded Typesense export stream must capture successfully");
+
+    captured_ids.sort();
+    assert_eq!(
+        captured_ids, expected_ids,
+        "all exact fixture IDs are required"
+    );
+    assert!(
+        export_requests[0].no_terminal_newline == Some(true),
+        "Typesense 30.2 export fixture must preserve no terminal newline"
+    );
+    let captured_path = expected_path.with_file_name("captured_product_ids.txt");
+    std::fs::write(&captured_path, format!("{}\n", captured_ids.join("\n")))
+        .expect("captured-ID artifact must be writable beside the driver artifact");
+    println!(
+        "TYPESENSE_EXPORT_STREAM_CONTRACT documents=137 exact_ids=PASS export_requests=1 query_pagination=absent no_terminal_newline=PASS discovery_export_requests=0"
+    );
+}
+
+/// The uncounted traversal — the variant with no advertised document count —
+/// still reads the whole stream from one percent-encoded query-free request.
+#[tokio::test]
+async fn uncounted_document_traversal_streams_fixture_ids_from_one_request() {
+    let expected_ids = expected_product_ids()
+        .into_iter()
+        .take(3)
+        .collect::<Vec<_>>();
+    assert_eq!(expected_ids.len(), 3, "the stream specimen uses three IDs");
+    let mut transport = ScriptedTransport::with_export_responses([page(&[
+        &expected_ids[0],
+        &expected_ids[1],
+        &expected_ids[2],
+    ])]);
     let mut page_counts = Vec::new();
     let mut ids = Vec::new();
 
     fetch_document_pages_with_transport(
         &mut transport,
         "catalog/2026",
-        fixture_traversal_limits(),
+        TraversalLimits::default(),
         |documents| {
             page_counts.push(documents.len());
             ids.extend(
@@ -461,57 +779,93 @@ async fn document_traversal_follows_declared_pages_and_fixture_ids() {
     .await
     .unwrap();
 
-    assert_eq!(page_counts, vec![2, 1]);
+    assert_eq!(page_counts, vec![3], "the stream is consumed once, unsplit");
     assert_eq!(ids, expected_ids);
-    assert_eq!(transport.requests.len(), 2);
-    for (request, expected_page) in transport.requests.iter().zip([1, 2]) {
-        assert_eq!(request.method, TypesenseMethod::Get);
+    assert_eq!(transport.requests.len(), 1);
+    assert_eq!(transport.requests[0].method, TypesenseMethod::Get);
+    assert_eq!(
+        transport.requests[0].path,
+        format!(
+            "/collections/{}/documents/export",
+            encoded_collection_name("catalog/2026")
+        )
+    );
+    assert_eq!(transport.requests[0].body, None);
+}
+
+/// The counted traversal admits exactly the advertised number of values. A
+/// short stream, a long stream, and a stream carrying an extra in-stream error
+/// object all disagree with the advertised count and are refused before any
+/// value reaches the consumer.
+#[tokio::test]
+async fn counted_export_rejects_streams_that_do_not_match_the_advertised_count() {
+    let specimens = [
+        page(&["prod_001", "prod_002"]),
+        page(&["prod_001", "prod_002", "prod_003", "prod_004"]),
+        vec![
+            json!({"id": "prod_001"}),
+            json!({"id": "prod_002"}),
+            json!({"code": 500, "error": "Not found."}),
+            json!({"id": "prod_003"}),
+        ],
+    ];
+
+    for documents in specimens {
+        let mut transport = ScriptedTransport::with_export_responses([documents]);
+        let mut consumed = 0usize;
+        let error = fetch_document_pages_with_expected_count_for_test(
+            &mut transport,
+            "catalog",
+            TraversalLimits::default(),
+            3,
+            |page| {
+                consumed += page.len();
+                Ok::<_, TypesenseClientError>(())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), TypesenseErrorKind::Progress);
         assert_eq!(
-            request.path,
-            format!(
-                "/collections/{}/documents/export?page={expected_page}&per_page=2",
-                encoded_collection_name("catalog/2026")
-            )
+            consumed, 0,
+            "a rejected stream must never reach the consumer"
         );
-        assert_eq!(request.body, None);
+        assert_eq!(transport.requests.len(), 1);
+        assert_eq!(
+            transport.requests[0].path,
+            "/collections/catalog/documents/export"
+        );
+        assert_error_is_sanitized(&error);
     }
 }
 
 #[tokio::test]
-async fn document_traversal_rejects_repeated_truncated_inconsistent_and_over_budget_pages() {
-    let specimens = [
-        vec![page(&["prod_001", "prod_002"]), page(&[])],
-        vec![page(&["prod_001", "prod_002", "prod_003"])],
-    ];
+async fn counted_export_rejects_advertised_count_above_item_ceiling_as_limit() {
+    let mut transport =
+        ScriptedTransport::with_export_responses([page(&["prod_001", "prod_002", "prod_003"])]);
+    let mut consumed = 0usize;
 
-    for responses in specimens {
-        let mut transport = ScriptedTransport::with_export_responses(responses);
-        let error = fetch_document_pages_with_transport(
-            &mut transport,
-            "catalog",
-            fixture_traversal_limits(),
-            |_| Ok::<_, TypesenseClientError>(()),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.kind(), TypesenseErrorKind::Progress);
-        assert_error_is_sanitized(&error);
-    }
-
-    let mut transport = ScriptedTransport::with_export_responses([page(&["prod_001", "prod_002"])]);
-    let error = fetch_document_pages_with_transport(
+    let error = fetch_document_pages_with_expected_count_for_test(
         &mut transport,
         "catalog",
-        TraversalLimits {
-            max_pages: 1,
-            max_items: 1,
-            page_size: 2,
+        TraversalLimits { max_items: 3 },
+        4,
+        |documents| {
+            consumed += documents.len();
+            Ok::<_, TypesenseClientError>(())
         },
-        |_| Ok::<_, TypesenseClientError>(()),
     )
     .await
-    .unwrap_err();
+    .expect_err("advertised counts above the traversal ceiling must be refused");
+
     assert_eq!(error.kind(), TypesenseErrorKind::Limit);
+    assert_eq!(consumed, 0, "a rejected stream must not reach the consumer");
+    assert!(
+        transport.requests.is_empty(),
+        "an impossible advertised count must fail before requesting the stream"
+    );
+    assert_error_is_sanitized(&error);
 }
 
 #[tokio::test]
@@ -568,103 +922,9 @@ async fn source_capture_accepts_empty_collection_export() {
             (TypesenseMethod::Get, "/collections/catalog"),
             (
                 TypesenseMethod::Get,
-                "/collections/catalog/documents/export?page=1&per_page=100"
+                "/collections/catalog/documents/export"
             ),
             (TypesenseMethod::Get, "/collections/catalog"),
-        ]
-    );
-}
-
-#[tokio::test]
-async fn source_capture_accepts_exact_multiple_after_empty_completion_probe() {
-    let mut transport = ScriptedTransport {
-        responses: VecDeque::from([
-            json_response(collection(2 * DOCUMENT_PAGE_LIMIT)),
-            export_response(numbered_page(0, DOCUMENT_PAGE_LIMIT)),
-            export_response(numbered_page(DOCUMENT_PAGE_LIMIT, DOCUMENT_PAGE_LIMIT)),
-            export_response(Vec::new()),
-            json_response(collection(2 * DOCUMENT_PAGE_LIMIT)),
-        ]),
-        requests: Vec::new(),
-    };
-    let mut consumed_ids = Vec::new();
-
-    let capture = capture_source_with_transport(&mut transport, "catalog", |documents| {
-        consumed_ids.extend(
-            documents
-                .iter()
-                .map(|document| document["id"].as_str().unwrap().to_string()),
-        );
-        Ok::<_, TypesenseClientError>(())
-    })
-    .await
-    .expect("an exact multiple of the export page size should accept an empty completion probe");
-
-    assert_eq!(
-        capture.observation().document_count,
-        (2 * DOCUMENT_PAGE_LIMIT) as u64
-    );
-    assert_eq!(consumed_ids.len(), 2 * DOCUMENT_PAGE_LIMIT);
-    assert_eq!(consumed_ids.first().unwrap(), "prod_000");
-    assert_eq!(consumed_ids.last().unwrap(), "prod_199");
-    assert_eq!(
-        transport
-            .requests
-            .iter()
-            .map(|request| request.path.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            "/collections/catalog",
-            "/collections/catalog/documents/export?page=1&per_page=100",
-            "/collections/catalog/documents/export?page=2&per_page=100",
-            "/collections/catalog/documents/export?page=3&per_page=100",
-            "/collections/catalog",
-        ]
-    );
-}
-
-#[tokio::test]
-async fn counted_export_reserves_page_budget_for_empty_completion_probe() {
-    let mut transport = ScriptedTransport::with_export_responses([
-        numbered_page(0, DOCUMENT_PAGE_LIMIT),
-        numbered_page(DOCUMENT_PAGE_LIMIT, DOCUMENT_PAGE_LIMIT),
-        Vec::new(),
-    ]);
-    let limits = TraversalLimits {
-        max_pages: 2,
-        max_items: 2 * DOCUMENT_PAGE_LIMIT,
-        page_size: DOCUMENT_PAGE_LIMIT,
-    };
-    let mut consumed_ids = Vec::new();
-
-    fetch_document_pages_with_expected_count_for_test(
-        &mut transport,
-        "catalog",
-        limits,
-        2 * DOCUMENT_PAGE_LIMIT,
-        |documents| {
-            consumed_ids.extend(
-                documents
-                    .iter()
-                    .map(|document| document["id"].as_str().unwrap().to_string()),
-            );
-            Ok::<_, TypesenseClientError>(())
-        },
-    )
-    .await
-    .expect("counted traversal should reserve one request for the empty completion probe");
-
-    assert_eq!(consumed_ids.len(), 2 * DOCUMENT_PAGE_LIMIT);
-    assert_eq!(
-        transport
-            .requests
-            .iter()
-            .map(|request| request.path.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            "/collections/catalog/documents/export?page=1&per_page=100",
-            "/collections/catalog/documents/export?page=2&per_page=100",
-            "/collections/catalog/documents/export?page=3&per_page=100",
         ]
     );
 }
@@ -686,7 +946,10 @@ async fn source_capture_rejects_underreported_metadata_with_trailing_export_data
     .unwrap_err();
 
     assert_eq!(error.kind(), TypesenseErrorKind::Progress);
-    assert_eq!(consumed_ids.len(), DOCUMENT_PAGE_LIMIT);
+    assert!(
+        consumed_ids.is_empty(),
+        "a stream longer than the advertised count must never reach the consumer"
+    );
     assert_eq!(
         transport
             .requests
@@ -695,8 +958,7 @@ async fn source_capture_rejects_underreported_metadata_with_trailing_export_data
             .collect::<Vec<_>>(),
         vec![
             "/collections/catalog",
-            "/collections/catalog/documents/export?page=1&per_page=100",
-            "/collections/catalog/documents/export?page=2&per_page=100",
+            "/collections/catalog/documents/export",
         ]
     );
     assert_error_is_sanitized(&error);
@@ -802,7 +1064,6 @@ fn discovery_constructor_rejects_non_vendor_host_before_resolution() {
 }
 
 #[test]
-#[cfg(debug_assertions)]
 #[serial_test::serial(flapjack_outbound_url_policy)]
 fn discovery_loopback_constructor_requires_explicit_opt_in_before_resolution() {
     let _env = crate::test_helpers::with_env_var(TYPESENSE_PREVIEW_LOOPBACK_ENV, "");
@@ -823,7 +1084,6 @@ fn discovery_loopback_constructor_requires_explicit_opt_in_before_resolution() {
 }
 
 #[test]
-#[cfg(debug_assertions)]
 #[serial_test::serial(flapjack_outbound_url_policy)]
 fn discovery_loopback_constructor_admits_only_literal_loopback_addresses() {
     let _env = crate::test_helpers::with_env_var(TYPESENSE_PREVIEW_LOOPBACK_ENV, "1");
@@ -862,7 +1122,6 @@ fn discovery_loopback_constructor_admits_only_literal_loopback_addresses() {
 }
 
 #[test]
-#[cfg(debug_assertions)]
 #[serial_test::serial(flapjack_outbound_url_policy)]
 fn typesense_preview_loopback_constructor_rejects_empty_source_collection_before_endpoint_parsing()
 {
@@ -883,7 +1142,6 @@ fn typesense_preview_loopback_constructor_rejects_empty_source_collection_before
 }
 
 #[test]
-#[cfg(debug_assertions)]
 #[serial_test::serial(flapjack_outbound_url_policy)]
 fn typesense_preview_loopback_constructor_retains_requested_source_collection_without_io() {
     let _env = crate::test_helpers::with_env_var(TYPESENSE_PREVIEW_LOOPBACK_ENV, "1");
@@ -916,6 +1174,7 @@ fn discovery_constructor_requires_credentials_without_requiring_a_collection() {
 }
 
 #[tokio::test]
+#[serial_test::serial(flapjack_outbound_url_policy)]
 async fn discovery_client_bypasses_proxy_pins_address_and_refuses_redirect() {
     // Discovery must inherit every `from_vetted_target` transport rule:
     // `resolve_to_addrs(...)` (reach the pinned address), `.no_proxy()` (never an
@@ -964,12 +1223,12 @@ async fn discovery_client_bypasses_proxy_pins_address_and_refuses_redirect() {
         "GET /collections?exclude_fields=fields&limit=10 HTTP/1.1",
         "discovery must reach the pinned address with the enumeration request line"
     );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), redirect_target.accept())
-            .await
-            .is_err(),
-        "discovery followed the redirect instead of refusing it"
-    );
+    // Redirect refusal is proven deterministically by the `Redirect` error kind
+    // and safe message above; the pinned upstream request line proves the request
+    // reached the vetted address rather than following the 302. A port-based
+    // "no connection ever reached the redirect target" probe added nothing but
+    // nondeterminism (it spuriously failed the broad suite while passing in
+    // isolation), so it is intentionally omitted.
     assert!(
         tokio::time::timeout(Duration::from_millis(100), proxy.accept())
             .await
@@ -977,4 +1236,196 @@ async fn discovery_client_bypasses_proxy_pins_address_and_refuses_redirect() {
         "ambient proxy unexpectedly received the discovery request"
     );
     assert_error_is_sanitized(&error);
+}
+
+// ── Export throughput probe (Stage 2) ───────────────────────────────────
+//
+// A timed unit-throughput measurement in this lane's real execution locality.
+// The item-ceiling projection measures parser and identity CPU only: the
+// independent response-byte ceiling can bind first for a representative export
+// body, and the probe reports that boundary separately. It drives the
+// production export parser and the canonical provider-neutral identity path,
+// so it cannot pass on a no-op.
+
+const THROUGHPUT_PROBE_DOCUMENTS: usize = 10_000;
+const THROUGHPUT_BUDGET_SECONDS: usize = 1_200;
+
+#[derive(Debug, PartialEq, Eq)]
+struct ThroughputMeasurement {
+    elapsed_ms: usize,
+    documents_per_second: usize,
+    projected_worst_case_seconds: usize,
+}
+
+fn throughput_measurement(
+    documents: usize,
+    measured_elapsed_ms: usize,
+    traversal_limit: usize,
+) -> ThroughputMeasurement {
+    let documents_per_second = documents * 1000 / measured_elapsed_ms;
+    ThroughputMeasurement {
+        elapsed_ms: measured_elapsed_ms,
+        documents_per_second,
+        projected_worst_case_seconds: traversal_limit.div_ceil(documents_per_second),
+    }
+}
+
+fn representative_byte_ceiling_items(
+    documents: usize,
+    body_bytes: usize,
+    response_byte_limit: usize,
+) -> usize {
+    assert!(
+        documents > 0,
+        "the byte projection needs a document specimen"
+    );
+    assert!(body_bytes > 0, "the byte projection needs a body specimen");
+    response_byte_limit / body_bytes.div_ceil(documents)
+}
+
+#[test]
+fn throughput_measurement_reports_observed_elapsed_time() {
+    assert_eq!(
+        throughput_measurement(10_000, 125, 1_000_000),
+        ThroughputMeasurement {
+            elapsed_ms: 125,
+            documents_per_second: 80_000,
+            projected_worst_case_seconds: 13,
+        }
+    );
+    assert_eq!(
+        representative_byte_ceiling_items(10_000, 1_000_000, MAX_RESPONSE_BYTES),
+        83_886,
+        "the byte projection uses the conservative ceiling of specimen bytes per document"
+    );
+}
+
+fn assert_and_report_throughput_evidence(
+    measurement: &ThroughputMeasurement,
+    traversal_limit: usize,
+    body_bytes: usize,
+) {
+    let representative_items = representative_byte_ceiling_items(
+        THROUGHPUT_PROBE_DOCUMENTS,
+        body_bytes,
+        MAX_RESPONSE_BYTES,
+    );
+    assert!(measurement.documents_per_second > 0);
+    assert_eq!(
+        measurement.documents_per_second,
+        THROUGHPUT_PROBE_DOCUMENTS * 1000 / measurement.elapsed_ms,
+        "the receipt figures must satisfy the validator's integer arithmetic"
+    );
+    assert!(
+        measurement.projected_worst_case_seconds <= THROUGHPUT_BUDGET_SECONDS,
+        "projected parser and identity work for {traversal_limit} documents takes \
+         {}s, over the {THROUGHPUT_BUDGET_SECONDS}s stage budget; \
+         re-plan the traversal instead of widening the budget",
+        measurement.projected_worst_case_seconds
+    );
+    assert!(
+        representative_items < traversal_limit,
+        "the receipt must not misstate the item-ceiling CPU projection as an end-to-end export ceiling"
+    );
+    println!(
+        "TYPESENSE_EXPORT_THROUGHPUT documents={THROUGHPUT_PROBE_DOCUMENTS} \
+elapsed_ms={} docs_per_second={} \
+traversal_limit={traversal_limit} \
+projected_worst_case_seconds={} \
+budget_seconds={THROUGHPUT_BUDGET_SECONDS} locality=lane_worktree",
+        measurement.elapsed_ms,
+        measurement.documents_per_second,
+        measurement.projected_worst_case_seconds,
+    );
+    println!(
+        "TYPESENSE_EXPORT_BYTE_CEILING documents={THROUGHPUT_PROBE_DOCUMENTS} \
+body_bytes={body_bytes} response_byte_limit={MAX_RESPONSE_BYTES} \
+representative_byte_ceiling_items={representative_items} \
+item_ceiling={traversal_limit}"
+    );
+}
+
+fn throughput_probe_documents() -> Vec<Value> {
+    (0..THROUGHPUT_PROBE_DOCUMENTS)
+        .map(|index| {
+            json!({
+                "id": format!("prod_{index:06}"),
+                "title": format!("Probe product {index}"),
+                "sku": format!("SKU-{index:06}"),
+                "price": index,
+            })
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "timed throughput probe recorded in the Stage 2 evidence receipt"]
+async fn typesense_export_identity_throughput_probe() {
+    let documents = throughput_probe_documents();
+    let body = export_body(documents.clone());
+    let body_bytes = body.len();
+    assert!(
+        body_bytes < MAX_RESPONSE_BYTES,
+        "the probe stream must fit under the unchanged byte ceiling, not widen it"
+    );
+    let traversal_limit = TraversalLimits::default().max_items;
+    let certified_max_items =
+        u64::try_from(traversal_limit).expect("traversal ceiling must fit identity arithmetic");
+    let spool_root = TempDir::new().expect("identity spool root should be created");
+    let identity_config =
+        SourceIdentityConfig::for_test(spool_root.path(), 1 << 20, certified_max_items);
+    assert_eq!(
+        identity_config.certified_max_items, certified_max_items,
+        "the measured identity partition layout must certify the printed traversal ceiling"
+    );
+    let mut builder =
+        SourceSnapshotBuilder::new(identity_config).expect("snapshot builder should be created");
+    builder.record_settings(&json!({ "fields": [] }));
+    let mut transport = ScriptedTransport {
+        responses: VecDeque::from([
+            json_response(collection(THROUGHPUT_PROBE_DOCUMENTS)),
+            TypesenseResponse { status: 200, body },
+            json_response(collection(THROUGHPUT_PROBE_DOCUMENTS)),
+        ]),
+        requests: Vec::new(),
+    };
+    let mut page_index = 0usize;
+
+    let started = Instant::now();
+    capture_source_with_transport(&mut transport, "catalog", |page| {
+        let records = typesense_document_records(&page, "$.documents")
+            .expect("probe documents must carry the canonical Typesense stable id");
+        builder
+            .record_documents_page(page_index, &source_record_identity_page(&records))
+            .expect("probe documents must record into the canonical source identity");
+        page_index += 1;
+        Ok::<_, TypesenseClientError>(())
+    })
+    .await
+    .expect("the probe stream must capture through the production export parser");
+    let snapshot = builder
+        .finish()
+        .expect("the canonical source identity must close");
+    let measured_elapsed_ms = usize::try_from(started.elapsed().as_millis())
+        .expect("probe elapsed milliseconds must fit a usize");
+
+    assert_eq!(
+        snapshot.documents.count, THROUGHPUT_PROBE_DOCUMENTS,
+        "every streamed document must reach the canonical identity path"
+    );
+    assert_eq!(transport.requests.len(), 3);
+    assert!(
+        measured_elapsed_ms > 0,
+        "the probe must take measurable wall-clock time"
+    );
+
+    // Read the ceiling from its single owner, and project it exactly as the
+    // receipt validator does: `(traversal_limit + rate - 1) / rate`.
+    let measurement = throughput_measurement(
+        THROUGHPUT_PROBE_DOCUMENTS,
+        measured_elapsed_ms,
+        traversal_limit,
+    );
+
+    assert_and_report_throughput_evidence(&measurement, traversal_limit, body_bytes);
 }

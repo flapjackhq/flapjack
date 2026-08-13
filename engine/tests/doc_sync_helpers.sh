@@ -7,11 +7,12 @@ doc_sync_init() {
   DOC_SYNC_FILES_LOG=$(mktemp "${TMPDIR:-/tmp}/flapjack-sync-files.XXXXXX")
   DOC_SYNC_DIRS_LOG=$(mktemp "${TMPDIR:-/tmp}/flapjack-sync-dirs.XXXXXX")
   DOC_SYNC_EXCLUDES_LOG=$(mktemp "${TMPDIR:-/tmp}/flapjack-sync-excludes.XXXXXX")
+  DOC_SYNC_REMAPS_LOG=$(mktemp "${TMPDIR:-/tmp}/flapjack-sync-remaps.XXXXXX")
   DOC_SYNC_PARSED_LOG=$(mktemp "${TMPDIR:-/tmp}/flapjack-sync-parsed.XXXXXX")
 }
 
 doc_sync_cleanup() {
-  rm -f "${DOC_SYNC_FILES_LOG:-}" "${DOC_SYNC_DIRS_LOG:-}" "${DOC_SYNC_EXCLUDES_LOG:-}" "${DOC_SYNC_PARSED_LOG:-}"
+  rm -f "${DOC_SYNC_FILES_LOG:-}" "${DOC_SYNC_DIRS_LOG:-}" "${DOC_SYNC_EXCLUDES_LOG:-}" "${DOC_SYNC_REMAPS_LOG:-}" "${DOC_SYNC_PARSED_LOG:-}"
 }
 
 doc_sync_normalize_repo_path() {
@@ -53,87 +54,78 @@ doc_sync_normalize_repo_path() {
   printf '%s' "$output"
 }
 
+doc_sync_python_with_tomllib() {
+  local -a candidates=()
+  if [ -n "${DOC_SYNC_PYTHON:-}" ]; then
+    candidates+=("$DOC_SYNC_PYTHON")
+  else
+    candidates+=(python3 python3.14 python3.13 python3.12 python3.11)
+  fi
+
+  local -a tried=()
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if ! command -v "$candidate" >/dev/null 2>&1; then
+      tried+=("$candidate: not found")
+      continue
+    fi
+    if "$candidate" -c 'import tomllib' >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    tried+=("$candidate: cannot import tomllib")
+  done
+
+  printf 'ERROR: doc_sync_python_tomllib_unavailable; tried: %s\n' "${tried[*]}" >&2
+  return 1
+}
+
+doc_sync_emit_sync_surface() {
+  local parser_python
+  parser_python="$(doc_sync_python_with_tomllib)" || return 1
+
+  "$parser_python" - "$DOC_SYNC_CONFIG_FILE" <<'PY'
+import sys
+import tomllib
+
+config_path = sys.argv[1]
+with open(config_path, "rb") as handle:
+    raw = tomllib.load(handle)
+
+sync = raw.get("sync", {})
+for path in sync.get("files", []):
+    if path:
+        print(f"FILE\t{path}")
+
+for item in sync.get("dirs", []):
+    path = item.get("path", "")
+    if not path:
+        continue
+    print(f"DIR\t{path}")
+    for pattern in item.get("exclude", []):
+        if pattern:
+            print(f"EXCLUDE\t{path}\t{pattern}")
+
+for item in sync.get("remap", []):
+    src = item.get("from", "")
+    dest = item.get("to", "")
+    if src and dest:
+        print(f"REMAP\t{src}\t{dest}")
+PY
+}
+
 doc_sync_collect_sync_surface() {
   if [ ! -f "$DOC_SYNC_CONFIG_FILE" ]; then
     printf "\033[0;31mMissing .debbie.toml at %s\033[0m\n" "$DOC_SYNC_CONFIG_FILE"
     return 1
   fi
 
-  awk '
-    function emit_file(path) {
-      if (path != "") print "FILE\t" path
-    }
-    function emit_dir(path) {
-      if (path != "") print "DIR\t" path
-    }
-    function emit_exclude(path, pattern) {
-      if (path != "" && pattern != "") print "EXCLUDE\t" path "\t" pattern
-    }
-    {
-      line = $0
-      sub(/[[:space:]]+#.*/, "", line)
-
-      if (line ~ /^[[:space:]]*\[\[sync\.dirs\]\][[:space:]]*$/) {
-        in_dirs = 1
-        in_exclude = 0
-        current_dir = ""
-      }
-
-      if (line ~ /^[[:space:]]*\[/ && line !~ /^[[:space:]]*\[sync\]/ && line !~ /^[[:space:]]*\[\[sync\.dirs\]\][[:space:]]*$/) {
-        in_files = 0
-        in_exclude = 0
-        if (line !~ /^[[:space:]]*\[\[sync\.dirs\]\]/) {
-          in_dirs = 0
-        }
-      }
-
-      if (line ~ /^[[:space:]]*files[[:space:]]*=[[:space:]]*\[/) {
-        in_files = 1
-      }
-
-      if (in_files) {
-        tmp = line
-        while (match(tmp, /"([^"\\]|\\.)*"/)) {
-          quoted = substr(tmp, RSTART + 1, RLENGTH - 2)
-          emit_file(quoted)
-          tmp = substr(tmp, RSTART + RLENGTH)
-        }
-        if (line ~ /\]/) {
-          in_files = 0
-        }
-      }
-
-      if (in_dirs) {
-        if (line ~ /^[[:space:]]*path[[:space:]]*=[[:space:]]*"/) {
-          tmp = line
-          if (match(tmp, /"([^"\\]|\\.)*"/)) {
-            current_dir = substr(tmp, RSTART + 1, RLENGTH - 2)
-            emit_dir(current_dir)
-          }
-        }
-
-        if (line ~ /^[[:space:]]*exclude[[:space:]]*=[[:space:]]*\[/) {
-          in_exclude = 1
-        }
-
-        if (in_exclude) {
-          tmp = line
-          while (match(tmp, /"([^"\\]|\\.)*"/)) {
-            quoted = substr(tmp, RSTART + 1, RLENGTH - 2)
-            emit_exclude(current_dir, quoted)
-            tmp = substr(tmp, RSTART + RLENGTH)
-          }
-          if (line ~ /\]/) {
-            in_exclude = 0
-          }
-        }
-      }
-    }
-  ' "$DOC_SYNC_CONFIG_FILE" > "$DOC_SYNC_PARSED_LOG"
+  doc_sync_emit_sync_surface > "$DOC_SYNC_PARSED_LOG" || return 1
 
   : > "$DOC_SYNC_FILES_LOG"
   : > "$DOC_SYNC_DIRS_LOG"
   : > "$DOC_SYNC_EXCLUDES_LOG"
+  : > "$DOC_SYNC_REMAPS_LOG"
 
   while IFS=$'\t' read -r kind col1 col2; do
     case "$kind" in
@@ -152,46 +144,88 @@ doc_sync_collect_sync_surface() {
           printf '%s\t%s\n' "$(doc_sync_normalize_repo_path "${col1%/}")" "$col2" >> "$DOC_SYNC_EXCLUDES_LOG"
         fi
         ;;
+      REMAP)
+        if [ -n "$col1" ] && [ -n "${col2:-}" ]; then
+          printf '%s\t%s\n' "$(doc_sync_normalize_repo_path "$col1")" "$(doc_sync_normalize_repo_path "$col2")" >> "$DOC_SYNC_REMAPS_LOG"
+        fi
+        ;;
     esac
   done < "$DOC_SYNC_PARSED_LOG"
 
   sort -u -o "$DOC_SYNC_FILES_LOG" "$DOC_SYNC_FILES_LOG"
   sort -u -o "$DOC_SYNC_DIRS_LOG" "$DOC_SYNC_DIRS_LOG"
   sort -u -o "$DOC_SYNC_EXCLUDES_LOG" "$DOC_SYNC_EXCLUDES_LOG"
+  sort -u -o "$DOC_SYNC_REMAPS_LOG" "$DOC_SYNC_REMAPS_LOG"
+}
+
+doc_sync_component_match() {
+  local pattern="$1"
+  local relative_path="$2"
+  local IFS='/'
+  local -a parts
+  read -r -a parts <<< "$relative_path"
+
+  local part
+  for part in "${parts[@]}"; do
+    [[ "$part" == $pattern ]] && return 0
+  done
+  return 1
+}
+
+doc_sync_path_or_parent_match() {
+  local pattern="$1"
+  local relative_path="$2"
+
+  while [ -n "$relative_path" ]; do
+    [[ "$relative_path" == $pattern ]] && return 0
+    case "$relative_path" in
+      */*) relative_path="${relative_path%/*}" ;;
+      *) break ;;
+    esac
+  done
+
+  return 1
 }
 
 doc_sync_matches_exclude_pattern() {
   local relative_path="$1"
   local pattern="$2"
 
+  pattern="${pattern#"${pattern%%[![:space:]]*}"}"
+  pattern="${pattern%"${pattern##*[![:space:]]}"}"
   if [ -z "$pattern" ]; then
     return 1
   fi
 
+  local directory_only=false
+  if [[ "$pattern" == */ ]]; then
+    directory_only=true
+    pattern="${pattern%/}"
+  fi
+
+  local anchored=false
   if [[ "$pattern" == /* ]]; then
-    local anchored="${pattern#/}"
-    if [[ "$anchored" == */ ]]; then
-      [[ "$relative_path" == "$anchored"* ]]
+    anchored=true
+    pattern="${pattern#/}"
+  fi
+
+  [ -n "$pattern" ] || return 1
+
+  if [ "$directory_only" = true ]; then
+    if [[ "$pattern" == *"/"* ]] || [ "$anchored" = true ]; then
+      [[ "$relative_path" == "$pattern" || "$relative_path" == "$pattern"/* ]]
       return
     fi
-    [[ "$relative_path" == "$anchored" || "$relative_path" == "$anchored"/* ]]
+    doc_sync_component_match "$pattern" "$relative_path"
     return
   fi
 
-  if [[ "$pattern" == */ ]]; then
-    local dir_pattern="${pattern%/}"
-    [[ "$relative_path" == "$dir_pattern" || "$relative_path" == "$dir_pattern"/* || "$relative_path" == */"$dir_pattern" || "$relative_path" == */"$dir_pattern"/* ]]
+  if [ "$anchored" = true ] || [[ "$pattern" == *"/"* ]]; then
+    doc_sync_path_or_parent_match "$pattern" "$relative_path"
     return
   fi
 
-  if [[ "$pattern" == *"/"* ]]; then
-    [[ "$relative_path" == $pattern || "$relative_path" == $pattern/* || "$relative_path" == */$pattern || "$relative_path" == */$pattern/* ]]
-    return
-  fi
-
-  local base_name
-  base_name=$(basename -- "$relative_path")
-  [[ "$relative_path" == "$pattern" || "$relative_path" == "$pattern"/* || "$base_name" == $pattern ]]
+  doc_sync_component_match "$pattern" "$relative_path"
 }
 
 doc_sync_path_is_synced() {
@@ -204,9 +238,22 @@ doc_sync_path_is_synced() {
     return 1
   fi
 
+  # Ownership follows Debbie's is_owned order: explicit files, then remap
+  # destinations, then non-excluded dir contents. Debbie has no remap-source
+  # rule, so a remap source is published only when it is independently owned
+  # (also an explicit file or inside a synced dir) — never denied outright.
   if grep -Fxq -- "$normalized_path" "$DOC_SYNC_FILES_LOG"; then
     return 0
   fi
+
+  local remap_source
+  local remap_dest
+  while IFS=$'\t' read -r remap_source remap_dest; do
+    [ -n "${remap_dest:-}" ] || continue
+    if [ "$normalized_path" = "$remap_dest" ]; then
+      return 0
+    fi
+  done < "$DOC_SYNC_REMAPS_LOG"
 
   local dir_path
   while IFS= read -r dir_path; do

@@ -563,7 +563,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use tracing::{Event, Subscriber};
+    use tracing::instrument::WithSubscriber;
+    use tracing::subscriber::Interest;
+    use tracing::{Event, Metadata, Subscriber};
     use tracing_subscriber::layer::{Context, SubscriberExt};
     use tracing_subscriber::{registry::LookupSpan, Layer};
 
@@ -587,6 +589,13 @@ mod tests {
     where
         S: Subscriber + for<'span> LookupSpan<'span>,
     {
+        fn register_callsite(&self, _metadata: &'static Metadata<'static>) -> Interest {
+            // Other tests install thread-local dispatchers in the same process. Re-evaluate
+            // this capture layer for each event so a callsite first seen elsewhere cannot
+            // remain disabled, without rebuilding tracing's process-wide interest cache.
+            Interest::sometimes()
+        }
+
         fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
             let mut captured = CapturedBatchEvent::default();
             event.record(&mut captured);
@@ -699,12 +708,9 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(captured.clone());
         let request = three_adds_request();
 
-        let result = {
-            let _default = tracing::subscriber::set_default(subscriber);
-            tracing::callsite::rebuild_interest_cache();
-            add_documents_batch_impl(State(state), "log_contract".to_string(), request).await
-        };
-        tracing::callsite::rebuild_interest_cache();
+        let result = add_documents_batch_impl(State(state), "log_contract".to_string(), request)
+            .with_subscriber(subscriber)
+            .await;
         assert!(result.is_ok(), "batch fixture must commit successfully");
 
         let events = captured.events();

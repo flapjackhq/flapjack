@@ -7,6 +7,7 @@
 # Usage:
 #   ./s/test                  # default: unit + integ + server
 #   ./s/test --sdk-host-safety # scan shipped sdks/ for vendor host literals
+#   ./s/test --publish-guard   # prove the mirror publish guard refuses unmerged trees
 #   ./s/test --unit           # cargo test --lib (~15s, 1053 tests)
 #   ./s/test --integ          # cargo nextest run (~90s, 327 tests)
 #   ./s/test --server         # cargo test -p flapjack-server (~10s, 12 tests)
@@ -18,6 +19,7 @@
 #   ./s/test --e2e            # build binary + start server + sdk + contract tests
 #   ./s/test --go             # Go SDK unit tests
 #   ./s/test --cold-install   # cold-install README quickstart smoke (opt-in)
+#   ./s/test --migration-release-loopback # shipped-profile migration loopback contract
 #   ./s/test --all            # everything (except --sdk-algolia)
 #   ./s/test --ci             # what CI runs
 #   ./s/test --list           # print what each flag does and exit
@@ -37,6 +39,7 @@ load_local_instance_config "$ROOT_DIR"
 # ── Flag parsing ──────────────────────────────────────────────────────────────
 
 RUN_SDK_HOST_SAFETY=false
+RUN_PUBLISH_GUARD=false
 RUN_UNIT=false
 RUN_INTEG=false
 RUN_SERVER=false
@@ -48,12 +51,14 @@ RUN_DASHBOARD_FULL=false
 RUN_E2E=false
 RUN_GO=false
 RUN_COLD_INSTALL=false
+RUN_MIGRATION_RELEASE_LOOPBACK=false
 RUN_LIST=false
 EXPLICIT=false
 
 for arg in "$@"; do
   case "$arg" in
     --sdk-host-safety) RUN_SDK_HOST_SAFETY=true; EXPLICIT=true ;;
+    --publish-guard)  RUN_PUBLISH_GUARD=true; EXPLICIT=true ;;
     --unit)           RUN_UNIT=true; EXPLICIT=true ;;
     --integ)          RUN_INTEG=true; EXPLICIT=true ;;
     --server)         RUN_SERVER=true; EXPLICIT=true ;;
@@ -65,13 +70,16 @@ for arg in "$@"; do
     --e2e)            RUN_E2E=true; EXPLICIT=true ;;
     --go)             RUN_GO=true; EXPLICIT=true ;;
     --cold-install)   RUN_COLD_INSTALL=true; EXPLICIT=true ;;
+    --migration-release-loopback) RUN_MIGRATION_RELEASE_LOOPBACK=true; EXPLICIT=true ;;
     --all)
       RUN_SDK_HOST_SAFETY=true
+      RUN_PUBLISH_GUARD=true
       RUN_UNIT=true; RUN_INTEG=true; RUN_SERVER=true; RUN_SDK=true
       RUN_DASHBOARD=true; RUN_DASHBOARD_FULL=true; RUN_E2E=true; RUN_GO=true
       EXPLICIT=true ;;
     --ci)
       RUN_SDK_HOST_SAFETY=true
+      RUN_PUBLISH_GUARD=true
       RUN_UNIT=true; RUN_INTEG=true; RUN_SERVER=true
       RUN_DASHBOARD=true
       EXPLICIT=true ;;
@@ -92,6 +100,7 @@ if [ "$RUN_LIST" = "true" ]; then
   divider
   echo "  (no flags)         unit + integ + server (default)               ~2.5 min"
   echo "  --sdk-host-safety  scan shipped sdks/ for vendor host literals   ~1s"
+  echo "  --publish-guard    prove the mirror publish guard refuses unmerged  ~2s"
   echo "  --unit             cargo test --lib (1053 tests)                 ~15s"
   echo "  --integ            cargo nextest run (327 tests)                 ~90s"
   echo "  --server           cargo test -p flapjack-server (12 tests)     ~10s"
@@ -104,8 +113,9 @@ if [ "$RUN_LIST" = "true" ]; then
   echo "  --go               Go SDK unit tests                            ~5s"
   echo "  --cold-install     bash \"\$ENGINE_DIR/tests/readme_quickstart_smoke.sh\""
   echo "                     opt-in; COLD_INSTALL_DRY_RUN=1 probes dispatch without network"
-  echo "  --all              everything (incl. sdk-host-safety gate)       ~20 min"
-  echo "  --ci               sdk-host-safety + unit + integ + server + dashboard  ~5 min"
+  echo "  --migration-release-loopback  shipped-profile migration loopback contract  ~15 min"
+  echo "  --all              everything (incl. sdk-host-safety + publish-guard) ~20 min"
+  echo "  --ci               sdk-host-safety + publish-guard + unit + integ + server + dashboard  ~5 min"
   echo "  --list             print this help"
   echo ""
   echo "  Combine flags: ./s/test --unit --sdk"
@@ -298,6 +308,20 @@ run_sdk_node_test() {
   echo ""
 }
 
+run_sdk_npm_test() {
+  local step_label="$1"
+  local npm_script="$2"
+  local success_message="$3"
+
+  next_step "$step_label"
+  (
+    cd "$ENGINE_DIR/sdk_test"
+    FLAPJACK_URL="$FJ_API_BASE" FLAPJACK_ADMIN_KEY="$FJ_TEST_ADMIN_KEY" npm run "$npm_script"
+  )
+  success "$success_message"
+  echo ""
+}
+
 run_sdk_protocol_smoke_test() {
   local step_label="$1"
   local script_name="$2"
@@ -319,6 +343,7 @@ run_sdk_core_js_suite() {
   run_sdk_node_test "${step_prefix}: JS contract_tests.js" "contract_tests.js" "SDK contract_tests.js passed"
   run_sdk_node_test "${step_prefix}: JS full_compat_tests.js" "full_compat_tests.js" "SDK full_compat_tests.js passed"
   run_sdk_node_test "${step_prefix}: JS instantsearch_contract_tests.js" "instantsearch_contract_tests.js" "SDK instantsearch_contract_tests.js passed"
+  run_sdk_npm_test "${step_prefix}: real InstantSearch clients" "test:real_clients" "Real InstantSearch client conformance passed"
 }
 
 server_is_healthy() {
@@ -358,7 +383,9 @@ start_server() {
     info "Building debug binary..."
     cd "$ENGINE_DIR"
     ensure_dashboard_dist
-    cargo build --package flapjack-server 2>&1 | tail -2
+    # Playwright's shared readiness contract rejects a text-only backend so
+    # vector specs can never become silent skips. Match CI's build-server job.
+    cargo build --package flapjack-server --features vector-search 2>&1 | tail -2
   fi
 
   FJ_TMP_DIR="/tmp/fj-test-data-$$"
@@ -366,6 +393,10 @@ start_server() {
 
   info "Starting flapjack server on :$FJ_BACKEND_PORT..."
   FLAPJACK_ADMIN_KEY="$FJ_TEST_ADMIN_KEY" \
+    FLAPJACK_NODE_ID=dashboard-e2e \
+    FLAPJACK_ADVERTISE_ADDR=https://dashboard-e2e.invalid:7700 \
+    FLAPJACK_REPLICATION_API_KEY="$FJ_TEST_ADMIN_KEY" \
+    FLAPJACK_AI_ALLOW_LOCAL_URLS=1 \
     "$ENGINE_DIR/target/debug/flapjack" --data-dir "$FJ_TMP_DIR" --port "$FJ_BACKEND_PORT" &
   FJ_PID=$!
 
@@ -435,6 +466,47 @@ if [ "$RUN_SDK_HOST_SAFETY" = "true" ]; then
   next_step "SDK: no executable vendor-host literals in shipped sdks/"
   bash "$ENGINE_DIR/tests/no_vendor_host_in_shipped_sdk.sh"
   success "No executable vendor-host literals in shipped SDK mirror"
+  echo ""
+fi
+
+# ── Mirror publish guard ──────────────────────────────────────────────────────
+# Dev-only, and this runner is its only automatic runner: `scripts/` and `.debbie/`
+# are outside the debbie sync scope, so mirror CI cannot run these tests, and dev
+# repos keep GitHub Actions disabled. Behavioural cases against throwaway git repos;
+# ~2s. The test lives under scripts/ rather than engine/tests/ precisely so it is
+# never synced to a mirror where the guard it tests does not exist.
+#
+# THIS FILE IS SYNCED (engine/_dev/s/test -> engine/s/test), so this block runs on the
+# mirrors too, where scripts/ does not exist. `.debbie.toml` is the discriminator:
+# verified absent on flapjackhq/flapjack by reading the mirror, not by reading the
+# sync config. It is also the semantically correct one — the publish guard exists
+# because of `debbie sync`, so it applies exactly to a clone that is a sync source.
+#
+# The dev branch is fail-closed on purpose: in a clone that CAN publish, a missing
+# guard is the defect, not a reason to skip.
+
+if [ "$RUN_PUBLISH_GUARD" = "true" ]; then
+  if [ -f "$ROOT_DIR/.debbie.toml" ]; then
+    next_step "Publish: mirror publish guard refuses an unmerged dev tree"
+    ssot_guard="$ROOT_DIR/scripts/check_migration_ssot_owners.sh"
+    if [ ! -f "$ROOT_DIR/scripts/tests/publish_guard_test.sh" ]; then
+      # `error` prints but does not exit, so without this the run falls through to a bare
+      # 127 from the missing file — a status that reads like a tooling fault rather than
+      # the contract violation it is.
+      error "This clone can publish (.debbie.toml present) but scripts/tests/publish_guard_test.sh is missing"
+      exit 1
+    fi
+    if [ ! -x "$ssot_guard" ]; then
+      error "This clone can publish (.debbie.toml present) but the migration SSOT owner guard is missing or not executable"
+      exit 1
+    fi
+    bash "$ROOT_DIR/scripts/tests/publish_guard_test.sh"
+    MIGRATION_SSOT_ENGINE_DIR="$ENGINE_DIR" bash "$ssot_guard"
+    success "Publish guard contract holds"
+  else
+    next_step "Publish: guard not applicable in a mirror clone (no .debbie.toml)"
+    success "Skipped — a mirror is a sync target, never a sync source"
+  fi
   echo ""
 fi
 
@@ -608,6 +680,15 @@ if [ "$RUN_COLD_INSTALL" = "true" ]; then
     bash "$ENGINE_DIR/tests/readme_quickstart_smoke.sh"
     success "Cold-install README quickstart smoke passed"
   fi
+  echo ""
+fi
+
+# ── Shipped-profile migration loopback contract ─────────────────────────────
+
+if [ "$RUN_MIGRATION_RELEASE_LOOPBACK" = "true" ]; then
+  next_step "Migration: shipped-profile loopback source contract"
+  bash "$ENGINE_DIR/tests/migration_release_loopback_contract.sh"
+  success "Shipped-profile migration loopback source contract passed"
   echo ""
 fi
 

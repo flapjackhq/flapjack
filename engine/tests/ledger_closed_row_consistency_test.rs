@@ -67,19 +67,21 @@ const LANDED_DATA_RECEIPT: &str =
     "engine/docs2/4_EVIDENCE/2026_08_03_aug03_11am_5_competitor_migration_lands_data_receipt.md";
 const LANDED_DATA_MERGE: &str = "2c05776c7b9d8f60bae89c34ad819ece084fa2e4";
 
-const NAMED_OPEN_ROWS: &[&str] = &["SEC-W4", "JOIN-1", "PL-10"];
+const NAMED_OPEN_ROWS: &[&str] = &["JOIN-1", "PL-10"];
 const NAMED_CLOSED_ROWS: &[&str] = &[
     "BUILD-1",
     "DUR-1",
     "DUR-2",
+    "SEC-W4",
     "SEC-G3",
     "SEC-W2A",
     "HA-MEMBERSHIP-UI",
     "MIG-17R",
+    "MIG-22",
 ];
 const NAMED_SHIPPED_ROWS: &[&str] = &["INFRA-1"];
 const NAMED_CROSS_OWNER_FACTS: &[&str] = &["SEC-G9", "PR-13"];
-const NAMED_DENOMINATOR: usize = 13;
+const NAMED_DENOMINATOR: usize = 14;
 
 fn repo_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is `engine/` for tests in this directory.
@@ -140,6 +142,29 @@ fn require_text(findings: &mut Vec<String>, owner: &str, text: &str, required: &
     if !text.contains(required) {
         findings.push(format!(
             "  - {owner} is missing required claim {required:?}"
+        ));
+    }
+}
+
+/// Assert a row carries something of a given *shape* rather than a given literal.
+///
+/// Used where the fact is required but its value is expected to move — a measurement
+/// and the revision it was taken at. `description` is what the reader is told is
+/// missing, because a raw regex in a failure message explains nothing about the
+/// ledger's obligation. An invalid pattern panics rather than silently matching
+/// nothing: a guard that cannot fail is not a guard.
+fn require_pattern(
+    findings: &mut Vec<String>,
+    owner: &str,
+    text: &str,
+    pattern: &str,
+    description: &str,
+) {
+    let compiled = regex::Regex::new(pattern)
+        .unwrap_or_else(|e| panic!("require_pattern got an invalid regex {pattern:?}: {e}"));
+    if !compiled.is_match(text) {
+        findings.push(format!(
+            "  - {owner} is missing {description} (no match for {pattern:?})"
         ));
     }
 }
@@ -300,19 +325,83 @@ fn record_open_work_conflicts(
 
 fn record_measured_owner_conflicts(roadmap: &str, features: &str, findings: &mut Vec<String>) {
     let join_row = table_row(roadmap, "JOIN-1").unwrap_or_default();
-    require_text(findings, "ROADMAP.md row `JOIN-1`", join_row, "57 / 59");
+    // `JOIN-1` is checked for SHAPE, not for one frozen measurement.
+    //
+    // This used to pin the literal strings "57 / 59" and "2 capability-gated skips".
+    // The 2026-08-06 sweeps superseded both twice in one day — first to 56 / 59 with
+    // zero skips, then to 59 / 59 — so the pin was demanding that the row retain a
+    // measurement its own owner had already replaced. That is the retained-revision
+    // defect `ROADMAP.md` row `DOC-LAYOUT-1` removed the revision stack to stop, and a
+    // pin that must be hand-edited after every sweep reds the build for a non-defect.
+    //
+    // A literal pin could not detect drift from reality anyway: it compares the row to
+    // a string in this file, never to `join_proof_report.mjs`, which is the actual
+    // measurement owner. So what remains here are only assertions that (a) do not rot
+    // and (b) are provably able to fail. Both were checked by mutating the row.
+    //
+    // DELIBERATELY ABSENT, and do not re-add it: a check that the row states a
+    // joined-proof figure of the form `N / N`. It reads like the obvious assertion and
+    // it is inert. The row correctly cites superseded figures while explaining what
+    // they were superseded by — it carries `56 / 59` alongside `59 / 59` today — so
+    // deleting the *current* measurement still leaves a historical one matching, and
+    // the check passes over exactly the edit it exists to catch. A short-SHA pattern
+    // fails the same way: the row cites incidental commits like the console merge.
+    // Hence the 40-character form below, which only the measurement revision uses.
+    require_pattern(
+        findings,
+        "ROADMAP.md row `JOIN-1`",
+        join_row,
+        r"[0-9a-f]{40}",
+        "a full 40-character measurement revision for its joined-proof figure",
+    );
     require_text(
         findings,
         "ROADMAP.md row `JOIN-1`",
         join_row,
-        "2 capability-gated skips",
+        "A capability-gated skip is never counted toward the numerator",
+    );
+    // `SDK-1` is load-bearing beyond its own prose, so its removal must be loud.
+    //
+    // `drain_followups.py` expires a follow-up row on age UNLESS a ledger row names its
+    // lane. Twelve `jul16_3pm_1_sdk_outbound_safety` rows are undischarged external
+    // registry remediation waiting on credentials that do not exist on this host, and
+    // before `SDK-1` was written a drain at cutoff `2026-07-17` planned 26 closures with
+    // that lane appearing 16 times in the plan; after it, 10 closures and zero
+    // occurrences, and the same zero at a much later `2026-08-01`. The prose supervisor
+    // note that used to hold the line was retired *because* this row replaced it, so
+    // deleting the row now silently re-arms the sweep with no backstop anywhere.
+    //
+    // The assertion is on the lane NAME, not on `SDK-1`'s wording or its ID, because the
+    // name is the exact token the drain's promotion conjunct matches. Renaming the row
+    // is fine; dropping the lane name is what breaks the protection.
+    //
+    // MIRROR PORTABILITY, and do not "improve" this by reading the follow-up ledger to
+    // make the check conditional: `.debbie.toml` does not sync `chats/` at all, so a test
+    // that joins to a lane file is green in the dev tree and red on the public mirror.
+    // That is `ROADMAP.md` row `DOC-PUBLIC-1`'s class and it has bitten this repo
+    // repeatedly. Every path this test reads is a synced ledger.
+    //
+    // RETIREMENT, so this does not become a pin nobody dares touch: delete this
+    // assertion in the same commit that closes `SDK-1` on its stated exit and drains the
+    // lane's follow-up rows. Until then it is the only thing keeping the handoff alive.
+    require_text(
+        findings,
+        "ROADMAP.md",
+        roadmap,
+        "jul16_3pm_1_sdk_outbound_safety",
     );
     let sec_w4_row = table_row(roadmap, "SEC-W4").unwrap_or_default();
     require_text(
         findings,
         "ROADMAP.md row `SEC-W4`",
         sec_w4_row,
-        "`SEC-G9` residuals closed",
+        "e26f06804bbb7911266b8ed442d7440440a857e1",
+    );
+    require_text(
+        findings,
+        "ROADMAP.md row `SEC-W4`",
+        sec_w4_row,
+        "no residual open item",
     );
     let pr13_row = table_row(features, "PR-13").unwrap_or_default();
     require_text(findings, "FEATURES.md row `PR-13`", pr13_row, "✅ Done");
@@ -377,22 +466,59 @@ fn record_migration_attribution_conflicts(
     );
 }
 
-#[test]
-fn named_reconciliation_rejects_reopened_build_capacity_row() {
+/// `ROADMAP.md` with one named row's closure marker softened back to `**OPEN`.
+///
+/// Mutating the real ledger rather than a fixture is deliberate: a fixture would
+/// keep passing after the live row was reworded, which is the drift this file
+/// exists to catch. The mutation is asserted to have actually landed, because a
+/// row that already lacked `CLOSED_MARKER` would leave the ledger untouched and
+/// the caller's finding would then appear for the wrong reason — a mutation test
+/// that cannot tell those two cases apart is not a guard.
+fn roadmap_with_row_reopened(roadmap: &str, id: &str) -> String {
+    let row =
+        table_row(roadmap, id).unwrap_or_else(|| panic!("ROADMAP.md has no `{id}` row to reopen"));
+    let reopened_row = row.replacen(CLOSED_MARKER, "**OPEN", 1);
+    assert_ne!(
+        row, reopened_row,
+        "`{id}` does not declare {CLOSED_MARKER:?}, so reopening it changed nothing and the \
+         reconciliation finding below would not be attributable to this mutation"
+    );
+    roadmap.replacen(row, &reopened_row, 1)
+}
+
+fn assert_reopening_row_is_rejected(id: &str) {
     let roadmap = read_ledger("ROADMAP.md");
-    let build_row = table_row(&roadmap, "BUILD-1").expect("ROADMAP.md has a BUILD-1 row");
-    let reopened_build_row = build_row.replacen(CLOSED_MARKER, "**OPEN", 1);
-    let reopened_roadmap = roadmap.replacen(build_row, &reopened_build_row, 1);
     let mut findings = Vec::new();
 
-    record_roadmap_state_conflicts(&reopened_roadmap, &mut findings);
+    record_roadmap_state_conflicts(&roadmap_with_row_reopened(&roadmap, id), &mut findings);
 
+    let expected = format!("  - `{id}` must be closed in ROADMAP.md");
     assert!(
-        findings
-            .iter()
-            .any(|finding| finding == "  - `BUILD-1` must be closed in ROADMAP.md"),
-        "reopening BUILD-1 must fail the named batch-row reconciliation"
+        findings.iter().any(|finding| finding == &expected),
+        "reopening {id} must fail the named batch-row reconciliation with {expected:?}, got:\n{}",
+        findings.join("\n")
     );
+}
+
+#[test]
+fn named_reconciliation_rejects_reopened_build_capacity_row() {
+    assert_reopening_row_is_rejected("BUILD-1");
+}
+
+/// `MIG-22` closed on 2026-08-10 by *retiring* a clause rather than satisfying it,
+/// which is the closure shape most likely to be quietly reopened later: the
+/// retirement reads like an admission that something is unfinished, so a future
+/// reader may soften the marker back rather than argue with the reasoning. The
+/// row's own falsifiable exit names this test as one of its three red specimens,
+/// so that promise has to be executable rather than prose.
+#[test]
+fn named_reconciliation_rejects_reopened_migration_loopback_row() {
+    assert_reopening_row_is_rejected("MIG-22");
+}
+
+#[test]
+fn named_reconciliation_rejects_reopened_security_wave_4_row() {
+    assert_reopening_row_is_rejected("SEC-W4");
 }
 
 #[test]

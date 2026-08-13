@@ -1,7 +1,9 @@
 import { algoliasearch } from 'algoliasearch';
+import { randomUUID } from 'node:crypto';
 import { PRODUCTS, SYNONYMS, RULES, SETTINGS } from './test-data';
 import { API_HEADERS } from './local-instance';
 import { buildApiPath, buildIndexPath, joinEncodedPath } from './index-api-helpers';
+import { resolvePlaywrightSecretEnvPath } from '../global-setup';
 
 export interface AlgoliaTestContext {
   appId: string;
@@ -21,6 +23,30 @@ export type AlgoliaCredentialMode = 'run' | 'fail';
 export interface AlgoliaCredentialModeInput {
   hasCredentials: boolean;
 }
+
+/**
+ * Closed set of credential-shape verdicts. `missing` means at least one value is
+ * absent or empty, `blank` means a present value is entirely whitespace, and
+ * `padded` means a present value carries leading or trailing whitespace. Only
+ * `ok` describes a pair worth sending to a vendor.
+ */
+export type AlgoliaCredentialShape = 'ok' | 'missing' | 'blank' | 'padded';
+
+export interface AlgoliaCredentialPair {
+  appId: string | undefined;
+  adminKey: string | undefined;
+}
+
+export interface AlgoliaCredentialSetupErrorInput {
+  shape: AlgoliaCredentialShape;
+  appIdLength: number;
+  adminKeyLength: number;
+  credentialSourcePath: string;
+  readinessStatus?: number;
+  readinessCause?: unknown;
+}
+
+const NO_SECRET_FILE_SOURCE = 'no secret file configured (FJ_NO_SECRET_FILE=1)';
 
 interface DeletionProbeResult {
   deleted: boolean;
@@ -44,6 +70,14 @@ type SaveRuleRequest = Parameters<SearchClient['saveRule']>[0];
 const CLEANUP_POLL_INTERVAL_MS = 500;
 const CLEANUP_TIMEOUT_MS = 20_000;
 
+export function buildAlgoliaMigrationIndexName(
+  timestamp = Date.now(),
+  pid = process.pid,
+  nonce: string = randomUUID(),
+): string {
+  return `fj_e2e_migrate_${timestamp}_${pid}_${nonce}`;
+}
+
 export class MissingAlgoliaCredentialsError extends Error {
   constructor() {
     super('Missing required Algolia credentials: ALGOLIA_APP_ID and ALGOLIA_ADMIN_KEY');
@@ -64,9 +98,132 @@ export function resolveAlgoliaCredentialMode({
 
 /**
  * Returns true if Algolia credentials are available in the environment.
+ *
+ * Truthiness only — it cannot tell a usable pair from a whitespace-padded or
+ * blank one. Use `classifyAlgoliaCredentialShape` for the shape verdict and
+ * `assertAlgoliaCredentialsReady` for the usable-against-the-vendor verdict.
  */
 export function hasAlgoliaCredentials(): boolean {
   return !!(process.env.ALGOLIA_APP_ID && process.env.ALGOLIA_ADMIN_KEY);
+}
+
+/** Severity order used to report the worst verdict across the credential pair. */
+const CREDENTIAL_SHAPE_SEVERITY: Record<AlgoliaCredentialShape, number> = {
+  ok: 0,
+  padded: 1,
+  blank: 2,
+  missing: 3,
+};
+
+function classifyCredentialValue(value: string | undefined): AlgoliaCredentialShape {
+  if (!value) {
+    return 'missing';
+  }
+  if (value.trim().length === 0) {
+    return 'blank';
+  }
+  if (value !== value.trim()) {
+    return 'padded';
+  }
+  return 'ok';
+}
+
+/**
+ * Reports the worst shape verdict across the Algolia credential pair. Pure: it
+ * reads nothing from the environment and makes no network call.
+ */
+export function classifyAlgoliaCredentialShape({
+  appId,
+  adminKey,
+}: AlgoliaCredentialPair): AlgoliaCredentialShape {
+  return [classifyCredentialValue(appId), classifyCredentialValue(adminKey)].reduce(
+    (worst, verdict) => (
+      CREDENTIAL_SHAPE_SEVERITY[verdict] > CREDENTIAL_SHAPE_SEVERITY[worst] ? verdict : worst
+    ),
+    'ok' as AlgoliaCredentialShape,
+  );
+}
+
+/**
+ * Raised when the Algolia credentials this suite was handed are not usable.
+ *
+ * This is a `setup-infra` fault, never a product defect and never a skip: the
+ * migration path under test was never exercised, so neither a pass nor a
+ * product-defect failure would be truthful. The message carries credential
+ * lengths and the file the credentials came from — never a credential value.
+ */
+export class AlgoliaCredentialSetupError extends Error {
+  readonly classification = 'setup-infra';
+  readonly shape: AlgoliaCredentialShape;
+  readonly readinessStatus?: number;
+  readonly cause?: unknown;
+
+  constructor({
+    shape,
+    appIdLength,
+    adminKeyLength,
+    credentialSourcePath,
+    readinessStatus,
+    readinessCause,
+  }: AlgoliaCredentialSetupErrorInput) {
+    const status = readinessStatus === undefined ? '' : `, readinessStatus=${readinessStatus}`;
+    super(
+      `[setup-infra] Algolia credentials are not usable (shape=${shape}, `
+      + `appIdLength=${appIdLength}, adminKeyLength=${adminKeyLength}${status}, `
+      + `credentialSource=${credentialSourcePath})`,
+    );
+    this.name = 'AlgoliaCredentialSetupError';
+    this.shape = shape;
+    this.readinessStatus = readinessStatus;
+    this.cause = readinessCause;
+  }
+}
+
+/** The secret file the credentials were loaded from, for setup-fault triage. */
+function resolveAlgoliaCredentialSourcePath(): string {
+  return resolvePlaywrightSecretEnvPath()?.path ?? NO_SECRET_FILE_SOURCE;
+}
+
+/**
+ * Asserts the ambient Algolia credentials are usable before any test relies on
+ * them: first the pure shape verdict, then a live authentication through the
+ * same backend route the Migrate screen calls (`POST /1/algolia-list-indexes`).
+ *
+ * Failures raise `AlgoliaCredentialSetupError`, never a skip.
+ */
+export async function assertAlgoliaCredentialsReady(): Promise<void> {
+  const appId = process.env.ALGOLIA_APP_ID;
+  const adminKey = process.env.ALGOLIA_ADMIN_KEY;
+  const shape = classifyAlgoliaCredentialShape({ appId, adminKey });
+  const buildSetupError = (readinessStatus?: number, readinessCause?: unknown) => (
+    new AlgoliaCredentialSetupError({
+      shape,
+      appIdLength: appId?.length ?? 0,
+      adminKeyLength: adminKey?.length ?? 0,
+      credentialSourcePath: resolveAlgoliaCredentialSourcePath(),
+      readinessStatus,
+      readinessCause,
+    })
+  );
+
+  if (shape !== 'ok') {
+    throw buildSetupError();
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(buildApiPath('/1/algolia-list-indexes'), {
+      method: 'POST',
+      headers: API_HEADERS,
+      body: JSON.stringify({ appId, apiKey: adminKey }),
+    });
+  } catch (cause) {
+    throw buildSetupError(undefined, cause);
+  }
+
+  if (response.status !== 200) {
+    throw buildSetupError(response.status);
+  }
 }
 
 /**
@@ -74,40 +231,58 @@ export function hasAlgoliaCredentials(): boolean {
  * Polls until all documents are searchable before returning.
  */
 export async function seedAlgoliaIndex(): Promise<AlgoliaTestContext> {
+  // A fixture making a network call is deliberate, not stray I/O — do not remove.
+  // `hasAlgoliaCredentials` gates on truthiness, so a blank, whitespace-padded, or
+  // stale-but-present pair passed the gate and only surfaced downstream as a vendor
+  // 403 that is indistinguishable from an Algolia outage. That ambiguity is what
+  // made P29 a misdiagnosis. Authenticating here, before any data is written,
+  // separates "our credentials are wrong" from "the vendor is down" at the one
+  // point where the answer is still unambiguous. It probes through
+  // POST /1/algolia-list-indexes because that is the route the Migrate screen
+  // itself calls; if that route ever stops distinguishing a credential fault from
+  // a backend fault, replace it with a direct vendor call and say so here.
+  await assertAlgoliaCredentialsReady();
+
   const appId = process.env.ALGOLIA_APP_ID!;
   const adminKey = process.env.ALGOLIA_ADMIN_KEY!;
-  const indexName = `fj_e2e_migrate_${Date.now()}`;
+  const indexName = buildAlgoliaMigrationIndexName();
   const targetIndexName = `${indexName}_target`;
   const invalidTargetIndexName = `${indexName}_invalid_target`;
 
   const client = algoliasearch(appId, adminKey);
 
-  // Apply settings
-  await client.setSettings({ indexName, indexSettings: SETTINGS });
+  try {
+    await client.setSettings({ indexName, indexSettings: SETTINGS });
 
-  // Save synonyms
-  for (const syn of SYNONYMS) {
-    await client.saveSynonym({
-      indexName,
-      objectID: syn.objectID,
-      synonymHit: syn as SaveSynonymRequest['synonymHit'],
-    });
+    for (const syn of SYNONYMS) {
+      await client.saveSynonym({
+        indexName,
+        objectID: syn.objectID,
+        synonymHit: syn as SaveSynonymRequest['synonymHit'],
+      });
+    }
+
+    for (const rule of RULES) {
+      await client.saveRule({
+        indexName,
+        objectID: rule.objectID,
+        rule: rule as SaveRuleRequest['rule'],
+      });
+    }
+
+    await client.saveObjects({ indexName, objects: PRODUCTS });
+    await pollAlgoliaReady(client, indexName, PRODUCTS.length);
+  } catch (seedError) {
+    try {
+      await client.deleteIndex({ indexName });
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [seedError, rollbackError],
+        `Algolia seed failed for "${indexName}" and rollback also failed`,
+      );
+    }
+    throw seedError;
   }
-
-  // Save rules
-  for (const rule of RULES) {
-    await client.saveRule({
-      indexName,
-      objectID: rule.objectID,
-      rule: rule as SaveRuleRequest['rule'],
-    });
-  }
-
-  // Save objects
-  await client.saveObjects({ indexName, objects: PRODUCTS });
-
-  // Poll until all documents are indexed and searchable
-  await pollAlgoliaReady(client, indexName, PRODUCTS.length);
 
   return { appId, adminKey, indexName, targetIndexName, invalidTargetIndexName };
 }

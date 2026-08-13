@@ -400,7 +400,7 @@ async fn typesense_reader_normalizes_document_id_without_rewriting_source_fields
         typesense_settings(),
         vec![pages],
     );
-    let mut reader = TypesenseSourceReader::from_source("products", source);
+    let mut reader = TypesenseSourceReader::from_source("products", source, true);
     reader.observe_quiescent_source().await.unwrap();
     let sink = capture_through_sink(&mut reader).await.unwrap();
 
@@ -430,6 +430,7 @@ async fn typesense_reader_preserves_native_settings_payloads_and_identity_preima
             settings.clone(),
             vec![documents.clone(), documents],
         ),
+        true,
     );
     let mut sink = RecordingSink::default();
 
@@ -461,7 +462,7 @@ async fn typesense_reader_rejects_invalid_ids_with_sanitized_errors() {
             typesense_settings(),
             vec![vec![documents]],
         );
-        let mut reader = TypesenseSourceReader::from_source("products", source);
+        let mut reader = TypesenseSourceReader::from_source("products", source, true);
         let error = collect_quiescent_source_snapshot(&mut reader)
             .await
             .unwrap_err();
@@ -473,33 +474,38 @@ async fn typesense_reader_rejects_invalid_ids_with_sanitized_errors() {
 }
 
 #[tokio::test]
-async fn typesense_reader_rejects_restricted_credentials_before_accepting_snapshot() {
+async fn typesense_reader_proves_document_access_during_the_single_export_capture() {
+    let settings = typesense_settings();
     let source = ScriptedTypesenseSource::with_passes(
         typesense_observation("products", 1),
-        typesense_settings(),
+        settings.clone(),
         vec![vec![vec![json!({"id": "prod_001"})]]],
     )
-    .with_access_error(TypesenseClientError::new(
+    .with_document_access_error(TypesenseClientError::new(
         TypesenseErrorKind::Upstream,
         "Typesense source credentials lack required read access",
     ));
-    let mut reader = TypesenseSourceReader::from_source("products", source);
+    let mut reader = TypesenseSourceReader::from_source("products", source, true);
+    reader
+        .observe_quiescent_source()
+        .await
+        .expect("the collection metadata must be available before capture");
     let mut sink = RecordingSink::default();
 
-    let error = accept_source_export(
-        AsyncMigrationSourceProvider::Typesense,
-        &mut reader,
-        &mut sink,
-    )
-    .await
-    .expect_err("restricted credentials must fail before accepting any artifact");
+    let error = super::source_reader::read_source_snapshot(&mut reader, &mut sink)
+        .await
+        .expect_err("restricted credentials must fail during document export");
 
     assert_eq!(error.kind(), SourceExportErrorKind::Upstream);
     assert_eq!(
         error.safe_message(),
         "Typesense source credentials lack required read access"
     );
-    assert!(sink.settings.is_empty());
+    assert_eq!(
+        sink.settings,
+        vec![settings],
+        "configuration capture must not issue a separate full export access probe"
+    );
     assert!(sink.raw_document_pages.is_empty());
     assert!(!format!("{error:?}").contains("typesense-source-key-canary"));
 }
@@ -511,7 +517,7 @@ async fn typesense_reader_rejects_observation_name_mismatch() {
         typesense_settings(),
         vec![vec![vec![json!({"id": "prod_001"})]]],
     );
-    let mut reader = TypesenseSourceReader::from_source("products", source);
+    let mut reader = TypesenseSourceReader::from_source("products", source, true);
 
     let error = reader
         .observe_quiescent_source()
@@ -536,7 +542,7 @@ async fn typesense_reader_rejects_drift_with_provider_neutral_diagnostic() {
         vec![vec![vec![json!({"id": "prod_001"})]]],
     )
     .with_observations(vec![initial, changed]);
-    let mut reader = TypesenseSourceReader::from_source("products", source);
+    let mut reader = TypesenseSourceReader::from_source("products", source, true);
     let mut sink = RecordingSink::default();
 
     let error = accept_source_export(
@@ -683,6 +689,7 @@ async fn all_source_readers_emit_the_exact_neutral_export_bundle_oracle() {
                 vec![typesense_documents.clone()],
             ],
         ),
+        true,
     );
     let mut typesense_sink = RecordingSink::default();
     let typesense_accepted = accept_source_export(

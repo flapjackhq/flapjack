@@ -139,11 +139,11 @@ structural_self_check() {
 }
 
 derive_denominator() {
-  local output denominator
+  local output denominator status
   output="$(
     cd "$ROOT_DIR"
     cargo test -p flapjack-http handlers::migration::translation::tests::matrix_denominator_is_explicit_stage3_oracle -- --nocapture 2>&1
-  )"
+  )" || { status=$?; printf '%s\n' "$output" >&2; return "$status"; }
   denominator="$(printf '%s\n' "$output" | sed -n 's/.*DENOMINATOR=\([0-9][0-9]*\).*/\1/p' | tail -1)"
   if [[ -z "$denominator" || "$denominator" == "0" ]]; then
     echo "VACUOUS: matrix denominator was zero or missing" >&2

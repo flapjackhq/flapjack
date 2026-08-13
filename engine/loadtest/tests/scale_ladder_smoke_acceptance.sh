@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1091
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -196,12 +197,15 @@ jq -e '.profile == "compact" and .lastCompletedRung == 20000' \
   export FLAPJACK_LOADTEST_BENCHMARK_INDEX="scale_ceiling_compact"
   load_shared_loadtest_config
   initialize_loadtest_auth_headers
+  mutation_bind_addr="127.0.0.1:${port}"
+  mutation_server_log_path="$results_dir/server_count_mismatch.log"
   mutation_server_pid="$(
-    start_loadtest_server "$SERVER_BINARY" "no-auth" "127.0.0.1:${port}" "$data_dir" \
-      "$results_dir/server_count_mismatch.log"
+    start_loadtest_server "$SERVER_BINARY" "no-auth" "$mutation_bind_addr" "$data_dir" \
+      "$mutation_server_log_path"
   )"
   trap 'stop_loadtest_server "$mutation_server_pid"' EXIT
-  wait_for_loadtest_health "$base_url" "$mutation_server_pid"
+  # The log/bind pair proves this launched server owns readiness; a foreign /health once fooled this gate.
+  wait_for_loadtest_health "$base_url" "$mutation_server_pid" 300 0.1 "$mutation_server_log_path" "$mutation_bind_addr"
   encoded_index="$(loadtest_encode_path_component "scale_ceiling_compact")"
   encoded_object="$(loadtest_encode_path_component "bench-010001")"
   delete_response="$(

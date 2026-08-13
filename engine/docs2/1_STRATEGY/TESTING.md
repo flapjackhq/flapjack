@@ -37,7 +37,7 @@ Important:
 | Dashboard unit | 542 passed / 542 total | ~8s | `cd dashboard && npm run test:unit:run` |
 | Dashboard browser smoke | 12 executed (10 specs + seed/cleanup) | ~5s | `cd dashboard && npm run test:e2e-ui:smoke` |
 | Dashboard browser full | 332 executed (330 specs + seed/cleanup) | ~2 min | `cd dashboard && npm run test:e2e-ui:full` |
-| JS SDK (no Algolia) | 32 | ~8s | `./s/test --sdk` (test.js + contract_tests.js) |
+| JS SDK + real clients (no Algolia) | API suites + 3 rendered clients + 6 protocol smokes | ~25s | `./s/test --sdk` |
 | JS SDK Algolia migration | 24 | ~3s | `./s/test --sdk-algolia` (test_algolia_migration.js) |
 | JS SDK Algolia validation | 18 (+1 skip) | ~16s | `./s/test --sdk-algolia` (algolia_validation.js) |
 | Go SDK | ~3 | ~5s | `cd ../sdks/go && go test ./flapjack/...` |
@@ -123,6 +123,7 @@ Dashboard testing is covered by the browser smoke/full suites and the HTTP-only 
 
 ### SDK tests
 - **JS SDK tests** (`sdk_test/`): Uses `algoliasearch` npm package against running server. Run via `./s/test --sdk` (test.js + contract_tests.js) or `./s/test --sdk-algolia` (needs Algolia creds).
+- **Real client browser tests** (`sdk_test/browser_tests_unmocked/`): Chromium renders the official InstantSearch.js, React InstantSearch, and Vue InstantSearch packages against the real server. The three clients share one dataset and exact query/facet/pagination assertions. Run via `./s/test --sdk` or `npm run test:real_clients` with a server already running.
 - **SDK bootstrap decoupling:** `engine/sdk_test` is self-contained with its own `package.json`; bootstrap now runs local `npm ci` in `sdk_test` instead of depending on `dashboard/node_modules`.
 - **Go SDK** (`sdks/go/`): Unit tests, run via `./s/test --go`.
 - **Other SDKs** (PHP, Python, Ruby, Java, C#): CI only, require their runtimes. A legacy aggregate runner covers Go + PHP only.
@@ -333,6 +334,7 @@ JavaScript tests using the official `algoliasearch` npm package against a runnin
 |--------|---------|-------|----------|
 | `test.js` | Basic SDK ops (settings, batch, search, filters, facets) | 8 | No |
 | `contract_tests.js` | Full API contract validation (CRUD, browse, delete-by, multi-index) | 24 | No |
+| `browser_tests_unmocked/real_client_conformance.spec.mjs` | Official vanilla, React, and Vue rendered clients | 3 | No |
 
 ### Requires Algolia creds (`./s/test --sdk-algolia`)
 
@@ -372,7 +374,7 @@ All automated SDK tests require a running server (`./s/test --sdk` handles this 
 | Server binary | `cargo test -p flapjack-server` | 25 | ~10s | Startup modes, key management, multi-instance |
 | Dashboard unit | `npm run test:unit:run` | 542 | ~8s | React components, hooks, config parser |
 | Dashboard browser smoke | `npm run test:e2e-ui:smoke` | 12 executed (10 specs + seed/cleanup) | ~5s | Critical user paths |
-| JS SDK | `./s/test --sdk` | 32 | ~8s | API contract validation |
+| JS SDK + real clients | `./s/test --sdk` | API suites + 3 rendered clients + 6 protocol smokes | ~25s | API contracts and official-client browser behavior |
 | CLI smoke | `./s/test --e2e` | 17 | ~10s | Real binary curl tests |
 | SDK migration | `node test_algolia_migration.js` | 24 | ~3s | Algolia drop-in proof |
 | SDK validation | `node algolia_validation.js` | 18 (+1 skip) | ~16s | Response accuracy vs Algolia |

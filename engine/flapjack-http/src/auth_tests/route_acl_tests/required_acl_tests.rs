@@ -106,8 +106,13 @@ fn acl_abtests_reads_require_analytics_and_writes_require_edit_settings() {
 }
 
 #[test]
-fn acl_events_search() {
+fn event_ingestion_requires_search() {
     assert_required_acl(Method::POST, "/1/events", "search");
+}
+
+#[test]
+fn event_debugger_requires_analytics() {
+    assert_required_acl(Method::GET, "/1/events/debug", "analytics");
 }
 
 #[test]

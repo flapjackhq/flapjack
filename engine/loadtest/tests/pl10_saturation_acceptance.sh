@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1091
 set -euo pipefail
 
 LOADTEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -264,7 +265,8 @@ start_case_server() {
     SERVER_PID="$(start_loadtest_server "$SERVER_BINARY" "no-auth" "$FLAPJACK_BIND_ADDR" "$case_data_dir" "$case_log_path")"
   fi
 
-  wait_for_loadtest_health "$FLAPJACK_BASE_URL" "$SERVER_PID" "300" "0.1"
+  # The log/bind pair proves this launched server owns readiness; a foreign /health once fooled this gate.
+  wait_for_loadtest_health "$FLAPJACK_BASE_URL" "$SERVER_PID" "300" "0.1" "$case_log_path" "$FLAPJACK_BIND_ADDR"
 }
 
 run_case() {

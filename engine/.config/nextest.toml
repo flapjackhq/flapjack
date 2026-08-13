@@ -1,18 +1,19 @@
-# # .config/nextest.toml
-# [[profile.default.overrides]]
-# filter = 'test(/^tests::heavy::/)'
-# threads-required = 2 # This test takes 2 cores
-
-
-
 [profile.default]
 # Exclude lib tests from nextest — they run 1800x faster under `cargo test --lib`
 # because nextest spawns a separate process per test, each paying ~1.5s to load the
 # flapjack binary. 877+ lib tests in <1s vs minutes under nextest.
 # Run lib tests separately: cargo test --lib -p flapjack -p flapjack-http
 default-filter = "not (test(/_slow$/) or test(/_very_slow$/) or kind(lib))"
-# With fewer test binaries (15 HTTP tests instead of 57), default parallelism
-# (num CPUs = 12) works well. No need to throttle.
+# Stage 1 reproduced an 18-way scheduled_deadline_tail while request-start
+# latency stayed within contract. A 12-way arm passed, but a later clean exact
+# gate still measured a 239 ms scheduled-deadline p99 with that admission-width.
+# This is a full scheduler reservation, not a latency-threshold increase. The
+# default profile is shared by mirror CI's fast-tests jobs (ci.yml:175,178), so
+# use nextest's host-portable num-test-threads value to make only this liveness
+# specimen mutually exclusive with unrelated test processes.
+[[profile.default.overrides]]
+filter = 'test(single_worker_runtime_serves_count_during_injected_two_second_commit)'
+threads-required = "num-test-threads"
 
 [profile.slow]
 default-filter = "test(/_slow$/) and not test(/_very_slow$/)"

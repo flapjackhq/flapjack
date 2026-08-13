@@ -75,6 +75,10 @@ pub(crate) struct MigrateArgs {
     #[arg(long)]
     overwrite: bool,
 
+    /// Attest that Typesense source writes are frozen for the migration capture
+    #[arg(long, global = true)]
+    source_write_frozen: bool,
+
     /// Delay between status requests, with ms, s, m, or h suffix
     #[arg(long)]
     poll_interval: Option<String>,
@@ -261,7 +265,10 @@ struct MigrationPreviewPayload {
 enum SourceConnection<'a> {
     Algolia(&'a str),
     Meilisearch(&'a str),
-    Typesense(&'a str),
+    Typesense {
+        node: &'a str,
+        source_write_frozen: bool,
+    },
 }
 
 impl Serialize for SourceConnection<'_> {
@@ -269,11 +276,25 @@ impl Serialize for SourceConnection<'_> {
     where
         S: Serializer,
     {
-        let mut map = serializer.serialize_map(Some(1))?;
+        let mut map = serializer.serialize_map(Some(match self {
+            Self::Typesense {
+                source_write_frozen: true,
+                ..
+            } => 2,
+            _ => 1,
+        }))?;
         match self {
             Self::Algolia(app_id) => map.serialize_entry("appId", app_id)?,
             Self::Meilisearch(endpoint) => map.serialize_entry("endpoint", endpoint)?,
-            Self::Typesense(node) => map.serialize_entry("node", node)?,
+            Self::Typesense {
+                node,
+                source_write_frozen,
+            } => {
+                map.serialize_entry("node", node)?;
+                if *source_write_frozen {
+                    map.serialize_entry("sourceWriteFrozen", source_write_frozen)?;
+                }
+            }
         }
         map.end()
     }
@@ -623,6 +644,7 @@ impl MigrateArgs {
                 "--source-key-stdin (alias --algolia-key-stdin)",
             ),
             (self.source_index.is_some(), "--source-index"),
+            (self.source_write_frozen, "--source-write-frozen"),
         ]
         .into_iter()
         .find_map(|(is_present, flag)| is_present.then_some(flag))
@@ -670,6 +692,11 @@ fn validate_algolia_connection(
             "--source-endpoint is not valid with --source-provider algolia".to_string(),
         ));
     }
+    if args.source_write_frozen {
+        return Err(config_failure(
+            "--source-write-frozen is not valid with --source-provider algolia".to_string(),
+        ));
+    }
     let app_id = args
         .app_id
         .as_deref()
@@ -694,8 +721,26 @@ fn validate_endpoint_source_connection(
     })?;
     validate_source_endpoint(source_endpoint).map_err(config_failure)?;
     match provider {
-        SourceProvider::Meilisearch => Ok(SourceConnection::Meilisearch(source_endpoint)),
-        SourceProvider::Typesense => Ok(SourceConnection::Typesense(source_endpoint)),
+        SourceProvider::Meilisearch => {
+            if args.source_write_frozen {
+                return Err(config_failure(
+                    "--source-write-frozen is not valid with --source-provider meilisearch"
+                        .to_string(),
+                ));
+            }
+            Ok(SourceConnection::Meilisearch(source_endpoint))
+        }
+        SourceProvider::Typesense => {
+            if !args.source_write_frozen {
+                return Err(config_failure(
+                    "--source-write-frozen is required for --source-provider typesense".to_string(),
+                ));
+            }
+            Ok(SourceConnection::Typesense {
+                node: source_endpoint,
+                source_write_frozen: true,
+            })
+        }
         SourceProvider::Algolia => {
             unreachable!("algolia source connection is validated separately")
         }

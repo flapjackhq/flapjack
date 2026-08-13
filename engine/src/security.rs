@@ -289,12 +289,20 @@ pub mod test_helpers {
     type OutboundHostResolver =
         dyn Fn(&str, Option<u16>) -> Option<Vec<std::net::IpAddr>> + Send + Sync;
 
-    fn outbound_host_resolver_slot(
-    ) -> &'static std::sync::Mutex<Option<std::sync::Arc<OutboundHostResolver>>> {
-        static SLOT: std::sync::OnceLock<
-            std::sync::Mutex<Option<std::sync::Arc<OutboundHostResolver>>>,
-        > = std::sync::OnceLock::new();
-        SLOT.get_or_init(|| std::sync::Mutex::new(None))
+    struct OutboundHostResolverEntry {
+        guard_identity: std::sync::Arc<()>,
+        resolver: std::sync::Arc<OutboundHostResolver>,
+    }
+
+    #[derive(Default)]
+    struct OutboundHostResolverState {
+        live_resolvers: Vec<OutboundHostResolverEntry>,
+    }
+
+    fn outbound_host_resolver_slot() -> &'static std::sync::Mutex<OutboundHostResolverState> {
+        static SLOT: std::sync::OnceLock<std::sync::Mutex<OutboundHostResolverState>> =
+            std::sync::OnceLock::new();
+        SLOT.get_or_init(|| std::sync::Mutex::new(OutboundHostResolverState::default()))
     }
 
     pub(crate) fn take_test_outbound_host_resolver() -> Option<std::sync::Arc<OutboundHostResolver>>
@@ -302,7 +310,9 @@ pub mod test_helpers {
         outbound_host_resolver_slot()
             .lock()
             .expect("test outbound host resolver slot mutex poisoned")
-            .clone()
+            .live_resolvers
+            .last()
+            .map(|entry| std::sync::Arc::clone(&entry.resolver))
     }
 
     /// RAII guard for a test-only outbound hostname resolver override.
@@ -311,27 +321,37 @@ pub mod test_helpers {
     /// falls back to OS DNS resolution. Returning `None` from the resolver
     /// preserves fail-open-on-unresolved-host semantics for that lookup.
     pub struct OutboundHostResolverGuard {
-        previous: Option<std::sync::Arc<OutboundHostResolver>>,
+        identity: std::sync::Arc<()>,
     }
 
     impl Drop for OutboundHostResolverGuard {
         fn drop(&mut self) {
-            *outbound_host_resolver_slot()
+            let mut state = outbound_host_resolver_slot()
                 .lock()
-                .expect("test outbound host resolver slot mutex poisoned") = self.previous.take();
+                .expect("test outbound host resolver slot mutex poisoned");
+            let entry_index = state
+                .live_resolvers
+                .iter()
+                .position(|entry| std::sync::Arc::ptr_eq(&entry.guard_identity, &self.identity))
+                .expect("test outbound host resolver guard must remain live until drop");
+            state.live_resolvers.remove(entry_index);
         }
     }
 
     /// Install a test-only outbound hostname resolver override and return an
-    /// RAII guard that restores the previous resolver on drop.
+    /// RAII guard that restores the nearest still-live predecessor on drop.
     pub fn install_test_outbound_host_resolver(
         resolver: std::sync::Arc<OutboundHostResolver>,
     ) -> OutboundHostResolverGuard {
-        let mut slot = outbound_host_resolver_slot()
+        let mut state = outbound_host_resolver_slot()
             .lock()
             .expect("test outbound host resolver slot mutex poisoned");
-        let previous = slot.replace(resolver);
-        OutboundHostResolverGuard { previous }
+        let identity = std::sync::Arc::new(());
+        state.live_resolvers.push(OutboundHostResolverEntry {
+            guard_identity: std::sync::Arc::clone(&identity),
+            resolver,
+        });
+        OutboundHostResolverGuard { identity }
     }
 
     /// RAII guard: override `FLAPJACK_AI_ALLOW_LOCAL_URLS` for the guard's

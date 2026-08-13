@@ -30,7 +30,7 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use tempfile::TempDir;
@@ -878,8 +878,20 @@ fn typesense_submit_payload_with_key(target_index: &str, api_key: &str) -> serde
         "apiKey": api_key,
         "sourceIndex": "source_products",
         "targetIndex": target_index,
-        "overwrite": false
+        "overwrite": false,
+        "sourceWriteFrozen": true
     })
+}
+
+fn typesense_resume_payload(source_write_frozen: Option<bool>) -> serde_json::Value {
+    let mut body = typesense_submit_payload("resume_target");
+    match source_write_frozen {
+        Some(attestation) => body["sourceWriteFrozen"] = json!(attestation),
+        None => {
+            body.as_object_mut().unwrap().remove("sourceWriteFrozen");
+        }
+    }
+    body
 }
 
 async fn job_uuid_from_submit_response(response: Response<Body>) -> Uuid {
@@ -968,14 +980,29 @@ async fn send_resume_request(
     authenticated_app_id: &str,
     api_key: &str,
 ) -> Response<Body> {
+    send_resume_request_with_body(
+        app,
+        job_uuid,
+        authenticated_app_id,
+        api_key,
+        algolia_submit_payload("resume_target"),
+    )
+    .await
+}
+
+async fn send_resume_request_with_body(
+    app: &MigrationLifecycleRoutes,
+    job_uuid: Uuid,
+    authenticated_app_id: &str,
+    api_key: &str,
+    body: serde_json::Value,
+) -> Response<Body> {
     let mut request = Request::builder()
         .method(Method::POST)
         .uri(app.job_uri(job_uuid, "/resume"))
         .header("content-type", "application/json")
         .header("x-algolia-api-key", api_key)
-        .body(Body::from(
-            algolia_submit_payload("resume_target").to_string(),
-        ))
+        .body(Body::from(body.to_string()))
         .unwrap();
     request
         .extensions_mut()
@@ -1744,61 +1771,75 @@ async fn typesense_credentials_never_reach_logs_errors_spool_or_public_json() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn typesense_changed_source_after_export_blocks_publication() {
-    const TARGET_INDEX: &str = "typesense_changed_source_target";
-    let tmp = TempDir::new().unwrap();
-    let state = TestStateBuilder::new(&tmp).build_shared();
-    let logs = SharedLogBuffer::default();
-    let _subscriber_guard = capture_logs(&logs);
-    let app = migration_job_route_for_provider_with_test_source_factory(
-        "typesense",
-        Arc::clone(&state),
-        Some(TestMigrationSourceReaderFactory::new(|provider| {
-            assert_eq!(provider, AsyncMigrationSourceProvider::Typesense);
-            // The durable export admits the request context's provider before
-            // observing the source, so the scripted reader must report the
-            // provider the route admitted for the drift proof to be reached.
-            Ok(Box::new(
-                async_source_reader_with_final_drift().reporting_provider(provider),
-            ))
-        })),
-    );
-    let publication_before = target_publication_residue_snapshot(&state, TARGET_INDEX);
-    let response = send_submit_request(
-        &app,
-        "typesense-owner",
-        "typesense-owner-key",
-        typesense_submit_payload(TARGET_INDEX),
-    )
-    .await;
+async fn local_provider_changed_source_after_export_blocks_publication() {
+    for (provider, provider_name, owner_app, owner_key, target_index, payload) in [
+        (
+            AsyncMigrationSourceProvider::Meilisearch,
+            "meilisearch",
+            "meilisearch-owner",
+            "meilisearch-owner-key",
+            "meilisearch_changed_source_target",
+            meilisearch_submit_payload("meilisearch_changed_source_target"),
+        ),
+        (
+            AsyncMigrationSourceProvider::Typesense,
+            "typesense",
+            "typesense-owner",
+            "typesense-owner-key",
+            "typesense_changed_source_target",
+            typesense_submit_payload("typesense_changed_source_target"),
+        ),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let state = TestStateBuilder::new(&tmp).build_shared();
+        let logs = SharedLogBuffer::default();
+        let _subscriber_guard = capture_logs(&logs);
+        let app = migration_job_route_for_provider_with_test_source_factory(
+            provider_name,
+            Arc::clone(&state),
+            Some(TestMigrationSourceReaderFactory::new(move |observed| {
+                assert_eq!(observed, provider);
+                // The durable export admits the request context's provider before
+                // observing the source, so the scripted reader must report the
+                // provider the route admitted for the drift proof to be reached.
+                Ok(Box::new(
+                    async_source_reader_with_final_drift().reporting_provider(observed),
+                ))
+            })),
+        );
+        let publication_before = target_publication_residue_snapshot(&state, target_index);
+        let response = send_submit_request(&app, owner_app, owner_key, payload).await;
 
-    assert_eq!(
-        response.status(),
-        StatusCode::ACCEPTED,
-        "Typesense drift must be exercised after shared lifecycle admission"
-    );
-    let job_uuid = job_uuid_from_submit_response(response).await;
-    let terminal =
-        wait_for_route_terminal(&app, job_uuid, "typesense-owner", "typesense-owner-key").await;
-    state.migration_runner.drain_active_imports().await;
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "{provider_name} drift must be exercised after shared lifecycle admission"
+        );
+        let job_uuid = job_uuid_from_submit_response(response).await;
+        let terminal = wait_for_route_terminal(&app, job_uuid, owner_app, owner_key).await;
+        state.migration_runner.drain_active_imports().await;
 
-    assert_eq!(terminal["disposition"], "failed");
-    assert_import_outcome_fields_absent(&terminal);
-    assert_target_not_listed(
-        &state,
-        TARGET_INDEX,
-        "source drift must block target publication",
-    )
-    .await;
-    assert_eq!(
-        target_publication_residue_snapshot(&state, TARGET_INDEX),
-        publication_before,
-        "source drift must leave target, publication, and quarantine namespaces absent"
-    );
-    assert!(
-        logs.contents().contains("Source changed during export"),
-        "source drift must retain the shared scrubbed error in captured logs"
-    );
+        assert_eq!(
+            terminal["disposition"], "failed",
+            "{provider_name} source drift must fail the admitted job"
+        );
+        assert_import_outcome_fields_absent(&terminal);
+        assert_target_not_listed(
+            &state,
+            target_index,
+            "source drift must block target publication",
+        )
+        .await;
+        assert_eq!(
+            target_publication_residue_snapshot(&state, target_index),
+            publication_before,
+            "{provider_name} source drift must leave target, publication, and quarantine namespaces absent"
+        );
+        assert!(
+            logs.contents().contains("Source changed during export"),
+            "{provider_name} source drift must retain the shared scrubbed error in captured logs"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1982,6 +2023,59 @@ async fn non_algolia_resume_routes_reject_without_mutating_shared_lifecycle_stat
             phase_before,
             "non-Algolia resume refusal must not fabricate a lifecycle transition"
         );
+    }
+}
+
+#[tokio::test]
+async fn typesense_resume_refuses_every_attestation_arm_before_source_io() {
+    const OWNER_APP: &str = "typesense-resume-attestation-owner";
+    const OWNER_KEY: &str = "typesense-resume-attestation-key";
+
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let spool = import::spool_for_manager(&state.manager).unwrap();
+    let factory_calls = Arc::new(AtomicUsize::new(0));
+    let observed_factory_calls = Arc::clone(&factory_calls);
+    let source_factory = TestMigrationSourceReaderFactory::new(move |_| {
+        observed_factory_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(async_hermetic_typesense_source_reader()))
+    });
+    let app = migration_job_route_for_provider_with_test_source_factory(
+        "typesense",
+        Arc::clone(&state),
+        Some(source_factory),
+    );
+
+    for (attestation, body) in [
+        ("missing", typesense_resume_payload(None)),
+        ("false", typesense_resume_payload(Some(false))),
+        ("true", typesense_resume_payload(Some(true))),
+    ] {
+        let job_uuid = Uuid::new_v4();
+        spool
+            .create_async_migration_admission_for_provider_owner(
+                job_uuid,
+                "typesense_resume_target",
+                Some(OWNER_APP),
+                AsyncMigrationSourceProvider::Typesense,
+                AsyncMigrationPublicationSemantic::CreateOnly,
+            )
+            .unwrap();
+        let phase_before = spool.read_migration_phase(job_uuid).unwrap();
+        let response =
+            send_resume_request_with_body(&app, job_uuid, OWNER_APP, OWNER_KEY, body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{attestation}");
+        assert_eq!(
+            body_json(response).await,
+            json!({
+                "message": SOURCE_PROVIDER_UNSUPPORTED_MESSAGE,
+                "status": 400,
+                "code": SOURCE_PROVIDER_UNSUPPORTED_CODE,
+            }),
+            "Typesense resume must stay provider-unsupported for {attestation} attestation"
+        );
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 0, "{attestation}");
+        assert_eq!(spool.read_migration_phase(job_uuid).unwrap(), phase_before);
     }
 }
 
@@ -2671,34 +2765,70 @@ async fn stale_generation_cannot_mutate_terminal_or_ack_state_for_any_provider()
         wait_for_route_terminal(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
         let terminal_before = spool.read_migration_phase(job_uuid).unwrap();
         let metadata = spool.read_async_migration_metadata(job_uuid).unwrap();
+        let job_row_before = std::fs::read(spool.migration_phase_path(job_uuid)).unwrap();
+        let metadata_row_before =
+            std::fs::read(spool.async_migration_metadata_path(job_uuid)).unwrap();
+        let expected_terminal_body = serde_json::to_value(
+            AsyncMigrationStatusResponse::with_metadata(terminal_before.clone(), &metadata),
+        )
+        .unwrap();
         let transaction_id = metadata
             .publication_transaction_id
+            .clone()
             .expect("terminal import should retain its publication transaction");
-        let target = PublicationTarget::new(target_index).unwrap();
+        let target = PublicationTarget::new(&target_index).unwrap();
         let journal_path =
             PublicationPaths::new(&state.manager.base_path, &target, &transaction_id).journal;
         let mut journal: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
         journal["generation"] = json!(format!("stale-replacement-{source_provider}"));
         std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        let reservation_before = target_publication_residue_snapshot(&state, &target_index);
 
+        let status = send_status_request(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
+        assert_eq!(status.status(), StatusCode::OK);
         assert_eq!(
-            send_status_request(&app, job_uuid, OWNER_APP, OWNER_KEY)
-                .await
-                .status(),
-            StatusCode::OK
+            body_json(status).await,
+            expected_terminal_body,
+            "{source_provider} stale generation status must expose the exact terminal job"
         );
+        let cancel = send_cancel_request(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
+        assert_eq!(cancel.status(), StatusCode::OK);
         assert_eq!(
-            send_cancel_request(&app, job_uuid, OWNER_APP, OWNER_KEY)
-                .await
-                .status(),
-            StatusCode::OK
+            body_json(cancel).await,
+            expected_terminal_body,
+            "{source_provider} late cancel must expose the exact unchanged terminal job"
         );
         let acknowledge = send_acknowledge_request(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
         stale_ack_statuses.push((source_provider, acknowledge.status()));
         assert_eq!(
+            body_json(acknowledge).await,
+            json!({
+                "message": "Migration publication generation evidence is stale or unavailable",
+                "status": 409,
+                "code": "migration_ack_stale_generation"
+            }),
+            "{source_provider} stale generation ACK must expose the stable refusal body"
+        );
+        assert_eq!(
             spool.read_migration_phase(job_uuid).unwrap(),
-            terminal_before
+            terminal_before,
+            "{source_provider} stale lifecycle calls mutated the parsed terminal job row"
+        );
+        assert_eq!(
+            std::fs::read(spool.migration_phase_path(job_uuid)).unwrap(),
+            job_row_before,
+            "{source_provider} stale lifecycle calls rewrote the terminal job row"
+        );
+        assert_eq!(
+            std::fs::read(spool.async_migration_metadata_path(job_uuid)).unwrap(),
+            metadata_row_before,
+            "{source_provider} stale lifecycle calls rewrote the migration metadata row"
+        );
+        assert_eq!(
+            target_publication_residue_snapshot(&state, &target_index),
+            reservation_before,
+            "{source_provider} stale lifecycle calls changed target reservation or publication state"
         );
     }
 
@@ -2888,7 +3018,7 @@ fn async_hermetic_typesense_source_reader() -> TypesenseSourceReader<ScriptedTyp
         settings,
         vec![document_pages.clone(), document_pages],
     );
-    TypesenseSourceReader::from_source("source_products", source)
+    TypesenseSourceReader::from_source("source_products", source, true)
 }
 
 fn read_meilisearch_fixture_json(name: &str) -> serde_json::Value {

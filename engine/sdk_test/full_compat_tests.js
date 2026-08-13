@@ -7,8 +7,11 @@ SDKs:
 - Ruby/Go/Java/Swift: GAP (planned Stage 2 protocol edge-case verification)
 
 InstantSearch libs:
-- InstantSearch.js v5: Covered by instantsearch_contract_tests.js
-- React/Vue/Angular/Android/iOS InstantSearch: GAP (planned Stage 3 verification-by-proxy)
+- InstantSearch.js 4.111, React InstantSearch 7.44, and Vue InstantSearch 4.29:
+  rendered browser coverage lives in browser_tests_unmocked/real_client_conformance.spec.mjs.
+- This file and instantsearch_contract_tests.js cover API contracts only; they are not
+  evidence that a framework client rendered successfully.
+- Angular/Android/iOS InstantSearch: no rendered-client proof in this repository.
 
 Critical widgets:
 - RangeSlider: Covered (instantsearch_contract_tests.js: "RangeSlider contract facets_stats shape")

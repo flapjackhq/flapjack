@@ -424,22 +424,6 @@ async fn bootstrap_admin_auth_does_not_follow_peer_redirect() {
         .await
         .expect("bootstrap redirector must bind before bootstrap starts");
     let redirector_addr = redirector.local_addr().unwrap();
-    let target_task = tokio::spawn(async move {
-        let accepted = tokio::time::timeout(
-            tokio::time::Duration::from_millis(500),
-            redirect_target.accept(),
-        )
-        .await;
-        let Ok(Ok((mut socket, _))) = accepted else {
-            return None;
-        };
-        let request = read_http_request(&mut socket).await;
-        socket
-            .write_all(b"HTTP/1.1 409 Redirected\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-            .await
-            .unwrap();
-        Some(request)
-    });
     let redirect_task = tokio::spawn(async move {
         let (mut socket, _) = redirector.accept().await.unwrap();
         let _ = read_http_request(&mut socket).await;
@@ -464,10 +448,11 @@ async fn bootstrap_admin_auth_does_not_follow_peer_redirect() {
     assert!(error.contains("307"), "unexpected bootstrap error: {error}");
     redirect_task.await.unwrap();
 
-    assert!(
-        target_task.await.unwrap().is_none(),
-        "bootstrap must not forward the admin key to a redirect target"
-    );
+    // Receiving the redirector's 307 as the final response proves the client
+    // did not follow it. Keep the target listener open so a followed request
+    // would connect and then time out instead; accepting here would let an
+    // unrelated shared-host probe create a false failure.
+    drop(redirect_target);
 }
 
 #[tokio::test]

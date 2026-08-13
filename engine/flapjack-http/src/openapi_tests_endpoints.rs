@@ -219,6 +219,34 @@ fn assert_async_migration_lifecycle_is_documented(doc: &serde_json::Value, provi
     assert_async_migration_resume_documents_contract(doc, &resume_path);
 }
 
+#[test]
+fn typesense_migration_schema_documents_write_freeze_attestation_only_on_typesense() {
+    let doc = openapi_json();
+
+    assert_eq!(
+        doc.pointer(
+            "/components/schemas/MigrateFromTypesenseRequest/properties/sourceWriteFrozen/type"
+        )
+        .and_then(serde_json::Value::as_str),
+        Some("boolean")
+    );
+    assert!(doc
+        .pointer("/components/schemas/MigrateFromAlgoliaRequest/properties/sourceWriteFrozen")
+        .is_none());
+    assert!(doc
+        .pointer("/components/schemas/MigrateFromMeilisearchRequest/properties/sourceWriteFrozen")
+        .is_none());
+    for route in [
+        "/paths/~11~1migrations~1typesense/post/requestBody/content/application~1json/schema",
+        "/paths/~11~1migrations~1typesense~1preview/post/requestBody/content/application~1json/schema",
+    ] {
+        assert_eq!(
+            schema_ref(&doc, route),
+            Some("#/components/schemas/MigrateFromTypesenseRequest")
+        );
+    }
+}
+
 fn operation_responses<'a>(
     doc: &'a serde_json::Value,
     path: &str,

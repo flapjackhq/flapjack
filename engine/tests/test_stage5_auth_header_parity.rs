@@ -64,16 +64,18 @@ async fn assert_forbidden_invalid_auth(
 }
 
 #[tokio::test]
-async fn application_id_header_is_required_even_when_query_contains_application_id() {
+async fn application_id_query_transport_authenticates_without_header() {
     let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
 
-    assert_forbidden_invalid_auth(
+    let response = send_request(
         &app,
         Method::GET,
         "/1/indexes?x-algolia-application-id=test",
         &[("x-algolia-api-key", ADMIN_KEY)],
     )
     .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]

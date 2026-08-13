@@ -278,6 +278,7 @@ describe('getLocalInstanceConfig', () => {
     vi.stubEnv('FJ_BACKEND_PORT', '19999');
     vi.stubEnv('FJ_DASHBOARD_PORT', '59999');
     vi.stubEnv('FJ_TEST_ADMIN_KEY', 'env-admin-key');
+    vi.stubEnv('FLAPJACK_BACKEND_URL', 'http://127.0.0.1:19999');
     vi.spyOn(fs, 'existsSync').mockImplementation((target) => (
       String(target).endsWith('flapjack.local.conf')
     ));
@@ -291,6 +292,7 @@ describe('getLocalInstanceConfig', () => {
         'FJ_BACKEND_PORT=18893',
         'FJ_DASHBOARD_PORT=15183',
         'FJ_TEST_ADMIN_KEY=file-admin-key',
+        'FLAPJACK_BACKEND_URL=http://localhost:18893',
       ].join('\n');
     });
 
@@ -300,7 +302,7 @@ describe('getLocalInstanceConfig', () => {
     expect(config.backendPort).toBe(18893);
     expect(config.dashboardPort).toBe(15183);
     expect(config.adminKey).toBe('file-admin-key');
-    expect(config.backendBaseUrl).toBe('http://127.0.0.1:18893');
+    expect(config.backendBaseUrl).toBe('http://localhost:18893');
     expect(config.dashboardBaseUrl).toBe('http://127.0.0.1:15183');
     expect(config.loadedFromFile).toBe(true);
   });
@@ -318,6 +320,156 @@ describe('getLocalInstanceConfig', () => {
     expect(config.dashboardPort).toBe(5177);
     expect(config.backendBaseUrl).toBe('http://127.0.0.1:7700');
     expect(config.dashboardBaseUrl).toBe('http://127.0.0.1:5177');
+  });
+
+  it.each([undefined, 'not-a-valid-url'])(
+    'keeps the local-config backend endpoint coherent when the URL override is %s',
+    (backendUrl) => {
+      vi.stubEnv('FLAPJACK_BACKEND_URL', backendUrl);
+      vi.spyOn(fs, 'existsSync').mockImplementation((target) => (
+        String(target).endsWith('flapjack.local.conf')
+      ));
+      vi.spyOn(fs, 'readFileSync').mockReturnValue([
+        'FJ_HOST=localhost',
+        'FJ_BACKEND_PORT=18893',
+      ].join('\n'));
+
+      const config = getLocalInstanceConfig();
+
+      expect(config).toMatchObject({
+        host: 'localhost',
+        backendHost: 'localhost',
+        backendPort: 18893,
+        backendBaseUrl: 'http://localhost:18893',
+        loadedFromFile: true,
+      });
+    },
+  );
+
+  it('keeps the backend port coherent with a loopback FLAPJACK_BACKEND_URL', () => {
+    vi.stubEnv('FLAPJACK_BACKEND_URL', 'http://127.0.0.1:17707');
+    vi.stubEnv('FJ_BACKEND_PORT', undefined);
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false);
+
+    const config = getLocalInstanceConfig();
+
+    expect(config.loadedFromFile).toBe(false);
+    expect(config.backendBaseUrl).toBe('http://127.0.0.1:17707');
+    expect(config.backendPort).toBe(17707);
+  });
+
+  it('prefers an explicit FLAPJACK_BACKEND_URL port over an env FJ_BACKEND_PORT', () => {
+    // backendBaseUrl already derives unconditionally from FLAPJACK_BACKEND_URL, so
+    // backendPort must follow the same URL port or the port half of the endpoint splits:
+    // readiness probes the URL port while the spawn binds FJ_BACKEND_PORT. When both are
+    // supplied the URL's explicit port is the single source of truth.
+    vi.stubEnv('FLAPJACK_BACKEND_URL', 'http://127.0.0.1:17707');
+    vi.stubEnv('FJ_BACKEND_PORT', '18893');
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false);
+
+    const config = getLocalInstanceConfig();
+
+    expect(config.backendBaseUrl).toBe('http://127.0.0.1:17707');
+    expect(config.backendPort).toBe(17707);
+  });
+
+  it('prefers an explicit FLAPJACK_BACKEND_URL port over a flapjack.local.conf FJ_BACKEND_PORT', () => {
+    // Same precedence as the env variant, but FJ_BACKEND_PORT comes from the per-clone
+    // config file, which normally beats env. A file-declared backend port must still lose
+    // to an explicit URL port so per-clone config-file isolation cannot silently repoint
+    // the readiness probe away from the spawned backend.
+    vi.stubEnv('FLAPJACK_BACKEND_URL', 'http://127.0.0.1:17707');
+    vi.spyOn(fs, 'existsSync').mockImplementation((target) => (
+      String(target).endsWith('flapjack.local.conf')
+    ));
+    vi.spyOn(fs, 'readFileSync').mockImplementation((target) => {
+      if (!String(target).endsWith('flapjack.local.conf')) {
+        throw new Error(`Unexpected read target: ${String(target)}`);
+      }
+
+      return 'FJ_BACKEND_PORT=18893';
+    });
+
+    const config = getLocalInstanceConfig();
+
+    expect(config.loadedFromFile).toBe(true);
+    expect(config.backendBaseUrl).toBe('http://127.0.0.1:17707');
+    expect(config.backendPort).toBe(17707);
+  });
+
+  it.each([
+    { backendUrl: 'http://staging.example.com', expectedPort: 80 },
+    { backendUrl: 'https://staging.example.com', expectedPort: 443 },
+  ])('derives backendPort $expectedPort from portless $backendUrl', ({
+    backendUrl,
+    expectedPort,
+  }) => {
+    // URL.port is empty for both accepted portless protocols. Pin both branches so the
+    // resolver must use the protocol default, never 0 / NaN / a hardcoded HTTPS port.
+    vi.stubEnv('FLAPJACK_BACKEND_URL', backendUrl);
+    vi.stubEnv('FJ_TEST_ADMIN_KEY', 'remote-admin-key');
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false);
+
+    const config = getLocalInstanceConfig();
+
+    expect(config.backendBaseUrl).toBe(backendUrl);
+    expect(config.backendPort).toBe(expectedPort);
+  });
+
+  it('honors a non-loopback FLAPJACK_BACKEND_URL host as the backend target host', () => {
+    // `host` remains the dashboard bind owner used by Vite and dashboardBaseUrl. The
+    // backend target host needs its own resolved field so a remote backend URL cannot
+    // repoint the dashboard bind address or be silently collapsed back to loopback.
+    vi.stubEnv('FLAPJACK_BACKEND_URL', 'http://192.168.1.50:17707');
+    vi.stubEnv('FJ_TEST_ADMIN_KEY', 'remote-admin-key');
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false);
+
+    const config = getLocalInstanceConfig();
+
+    expect(config).toMatchObject({
+      backendBaseUrl: 'http://192.168.1.50:17707',
+      backendHost: '192.168.1.50',
+      host: '127.0.0.1',
+      dashboardBaseUrl: 'http://127.0.0.1:5177',
+    });
+  });
+
+  it('preserves a bracketed IPv6 host for a backend bind derived from an explicit URL', () => {
+    vi.stubEnv('FLAPJACK_BACKEND_URL', 'http://[::1]:17707');
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false);
+
+    const config = getLocalInstanceConfig();
+
+    expect(config).toMatchObject({
+      backendBaseUrl: 'http://[::1]:17707',
+      backendHost: '[::1]',
+      backendPort: 17707,
+    });
+  });
+
+  it('reads a flapjack.local.conf FLAPJACK_BACKEND_URL like every other shared routing key', () => {
+    // Every shared routing key (FJ_HOST, FJ_BACKEND_PORT, FJ_DASHBOARD_PORT,
+    // FJ_TEST_ADMIN_KEY) is read file-first, env-second, and parseLocalConfigFile already
+    // parses FLAPJACK_BACKEND_URL out of a config file. A per-clone file must therefore be
+    // able to declare the backend URL too; otherwise the value is silently dropped for
+    // this one key while every sibling honors the file.
+    vi.stubEnv('FLAPJACK_BACKEND_URL', undefined);
+    vi.spyOn(fs, 'existsSync').mockImplementation((target) => (
+      String(target).endsWith('flapjack.local.conf')
+    ));
+    vi.spyOn(fs, 'readFileSync').mockImplementation((target) => {
+      if (!String(target).endsWith('flapjack.local.conf')) {
+        throw new Error(`Unexpected read target: ${String(target)}`);
+      }
+
+      return 'FLAPJACK_BACKEND_URL=http://127.0.0.1:17707';
+    });
+
+    const config = getLocalInstanceConfig();
+
+    expect(config.loadedFromFile).toBe(true);
+    expect(config.backendBaseUrl).toBe('http://127.0.0.1:17707');
+    expect(config.backendPort).toBe(17707);
   });
 
   it('uses FLAPJACK_BACKEND_URL origin and configured admin key for remote backends', () => {

@@ -1,12 +1,12 @@
 use super::*;
 use serde::de::DeserializeOwned;
 use serde_json::json;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 #[derive(Debug)]
@@ -235,6 +235,72 @@ fn observed_algolia_pins(observations: &AlgoliaPinObservations) -> Vec<(String, 
         .lock()
         .expect("Algolia pin observation mutex poisoned")
         .clone()
+}
+
+fn redacted_algolia_pins(
+    app_id: &str,
+    observations: &AlgoliaPinObservations,
+) -> Vec<(String, Vec<SocketAddr>)> {
+    let app_id_lower = app_id.to_ascii_lowercase();
+    observed_algolia_pins(observations)
+        .into_iter()
+        .map(|(host, addresses)| {
+            let host = host
+                .replace(app_id, "<app-id>")
+                .replace(&app_id_lower, "<app-id>");
+            (host, addresses)
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[ignore]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+async fn live_algolia_client_lists_indexes_with_canonical_credentials() {
+    let app_id = std::env::var("ALGOLIA_APP_ID")
+        .expect("ALGOLIA_APP_ID must be present for the ignored live Algolia probe");
+    let api_key = std::env::var("ALGOLIA_ADMIN_KEY")
+        .expect("ALGOLIA_ADMIN_KEY must be present for the ignored live Algolia probe");
+    eprintln!(
+        "live_algolia_client_probe credential_metadata app_id_len={} admin_key_len={} app_id_trim_eq={} admin_key_trim_eq={}",
+        app_id.len(),
+        api_key.len(),
+        app_id == app_id.trim(),
+        api_key == api_key.trim()
+    );
+
+    let pin_observations = Arc::new(Mutex::new(Vec::new()));
+    let _pin_observer = install_test_algolia_pin_observer(Arc::clone(&pin_observations));
+
+    let result = match AlgoliaClient::new(&app_id, &api_key) {
+        Ok(client) => client.list_indexes().await,
+        Err(error) => Err(error),
+    };
+    eprintln!(
+        "live_algolia_client_probe observed_vetted_pins={:?}",
+        redacted_algolia_pins(&app_id, &pin_observations)
+    );
+
+    match result {
+        Ok(indexes) => {
+            eprintln!(
+                "live_algolia_client_probe result=ok index_count={}",
+                indexes.len()
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "live_algolia_client_probe result=error kind={:?} safe_message={}",
+                error.kind(),
+                error.safe_message()
+            );
+            panic!(
+                "live AlgoliaClient::list_indexes failed: {:?}: {}",
+                error.kind(),
+                error.safe_message()
+            );
+        }
+    }
 }
 
 /// The address the recording validation resolver returns for every Algolia
@@ -606,7 +672,25 @@ fn dedupe_targets(targets: Vec<String>) -> Vec<String> {
 }
 
 fn spawn_loopback_sink(max_hits: usize) -> (SocketAddr, Arc<AtomicUsize>, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback sink should bind");
+    // A cancelled reqwest connect task can finish after its owning test returns.
+    // Never recycle a sink port in this process: otherwise a late connection for
+    // the previous specimen can be accepted by the next specimen's listener and
+    // falsely reported as a pin bypass without a lookup on its resolver.
+    static USED_SINK_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    let listener = loop {
+        let candidate = TcpListener::bind("127.0.0.1:0").expect("loopback sink should bind");
+        let candidate_port = candidate
+            .local_addr()
+            .expect("loopback sink address")
+            .port();
+        let mut used_ports = USED_SINK_PORTS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .expect("loopback sink port registry mutex poisoned");
+        if used_ports.insert(candidate_port) {
+            break candidate;
+        }
+    };
     listener
         .set_nonblocking(true)
         .expect("loopback sink should become nonblocking");
@@ -614,15 +698,27 @@ fn spawn_loopback_sink(max_hits: usize) -> (SocketAddr, Arc<AtomicUsize>, thread
     let sink_hits = Arc::new(AtomicUsize::new(0));
     let server_hits = Arc::clone(&sink_hits);
     let server = thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_millis(900);
+        // Budget ~900ms per specimen so the sink stays alive for the whole loop.
+        // A fixed deadline would let later specimens' connect attempts land after
+        // the listener already exited, leaving sink_hits at 0 whether the policy
+        // blocked the connect or leaked it — a false green under load.
+        let deadline =
+            std::time::Instant::now() + Duration::from_millis(900) * max_hits.max(1) as u32;
         while std::time::Instant::now() < deadline && server_hits.load(Ordering::SeqCst) < max_hits
         {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    server_hits.fetch_add(1, Ordering::SeqCst);
                     let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
                     let mut buffer = [0_u8; 1024];
-                    let _ = stream.read(&mut buffer);
+                    let read = stream.read(&mut buffer).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
+                    // This suite runs on a shared host where unrelated health
+                    // probes can reach ephemeral loopback ports. Count only a
+                    // request carrying this specimen's Algolia credential;
+                    // anonymous TCP connects are not evidence about this client.
+                    if request.contains("x-algolia-api-key: key") {
+                        server_hits.fetch_add(1, Ordering::SeqCst);
+                    }
                     let _ = write!(
                         stream,
                         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: application/json\r\n\r\n{{}}"
@@ -2849,7 +2945,7 @@ fn algolia_base_url_environment_has_one_synchronized_test_owner() {
     );
     let migration_dir =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers/migration");
-    for path in migration_rust_sources(&migration_dir) {
+    for path in rust_sources_recursively(&migration_dir) {
         if path.ends_with("algolia_client.rs") {
             continue;
         }
@@ -2876,7 +2972,7 @@ fn all_migration_env_mutation_shares_one_canonical_synchronization_owner() {
     let migration_dir =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers/migration");
 
-    for path in migration_rust_sources(&migration_dir) {
+    for path in rust_sources_recursively(&migration_dir) {
         // This guard file necessarily contains the sentinel strings it scans for
         // (as string literals and assertion text), so the policy-defining file
         // exempts itself to avoid matching its own source.
@@ -2920,12 +3016,167 @@ fn all_migration_env_mutation_shares_one_canonical_synchronization_owner() {
     }
 }
 
-fn migration_rust_sources(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
+/// Census every direct access to the resolver/pin test-hook family, then prove
+/// the process-global outbound resolver has one lifetime owner. The exact census
+/// keeps a newly added reader, mutator, re-export, or wrapper visible here; the
+/// nested-drop assertion is the fail-capable contract for the audited gap.
+#[test]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+fn resolver_hook_family_has_one_lifetime_isolation_owner() {
+    let engine_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("flapjack-http must live below the engine workspace");
+    assert_eq!(
+        resolver_hook_access_counts(engine_root),
+        expected_resolver_hook_access_counts(),
+        "every hook-family reader and mutator must stay in the audited table owned by security::test_helpers"
+    );
+    assert_outbound_resolver_lifetime_isolation();
+}
+
+fn resolver_hook_names() -> [String; 7] {
+    [
+        ["install", "test", "outbound", "host", "resolver"].join("_"),
+        ["take", "test", "outbound", "host", "resolver"].join("_"),
+        ["install", "test", "dns", "resolver"].join("_"),
+        ["take", "test", "dns", "resolver"].join("_"),
+        ["install", "test", "algolia", "pin", "observer"].join("_"),
+        ["install", "test", "algolia", "validation", "resolver"].join("_"),
+        ["with", "test", "algolia", "base", "url", "override"].join("_"),
+    ]
+}
+
+fn resolver_hook_access_count(source: &str, hook_names: &[String]) -> usize {
+    hook_names
+        .iter()
+        .map(|hook| source.matches(hook).count())
+        .sum()
+}
+
+fn resolver_hook_access_counts(
+    engine_root: &std::path::Path,
+) -> std::collections::BTreeMap<String, usize> {
+    let hook_names = resolver_hook_names();
+    let mut observed = std::collections::BTreeMap::new();
+    for path in rust_sources_recursively(engine_root) {
+        let source = std::fs::read_to_string(&path).unwrap();
+        let access_count = resolver_hook_access_count(&source, &hook_names);
+        if access_count == 0 {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(engine_root)
+            .expect("workspace Rust source must be below engine root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        observed.insert(relative, access_count);
+    }
+    observed
+}
+
+fn expected_resolver_hook_access_counts() -> std::collections::BTreeMap<String, usize> {
+    std::collections::BTreeMap::from([
+        ("flapjack-http/src/ai_provider.rs".to_string(), 3),
+        ("flapjack-http/src/handlers/chat_tests.rs".to_string(), 5),
+        (
+            "flapjack-http/src/handlers/migration/algolia_client.rs".to_string(),
+            8,
+        ),
+        (
+            "flapjack-http/src/handlers/migration/algolia_client_tests.rs".to_string(),
+            18,
+        ),
+        (
+            "flapjack-http/src/handlers/migration/meilisearch_client_tests.rs".to_string(),
+            7,
+        ),
+        ("flapjack-http/src/handlers/migration/mod.rs".to_string(), 1),
+        (
+            "flapjack-http/src/handlers/migration/preview_tests/meilisearch.rs".to_string(),
+            4,
+        ),
+        (
+            "flapjack-http/src/handlers/migration/preview_tests/typesense.rs".to_string(),
+            3,
+        ),
+        (
+            "flapjack-http/src/handlers/migration/source_reader_tests.rs".to_string(),
+            2,
+        ),
+        (
+            "flapjack-http/src/handlers/migration/typesense_client_tests.rs".to_string(),
+            8,
+        ),
+        ("flapjack-http/src/router_tests.rs".to_string(), 3),
+        ("src/security.rs".to_string(), 3),
+        // Core guard coverage adds one installer call while keeping
+        // `security::test_helpers` as the hook family's single owner.
+        ("src/security_tests.rs".to_string(), 12),
+        ("src/vector/config_tests.rs".to_string(), 1),
+        ("src/vector/embedder.rs".to_string(), 3),
+        ("src/vector/embedder_tests.rs".to_string(), 10),
+    ])
+}
+
+#[test]
+fn resolver_hook_census_counts_multiple_accesses_on_one_line() {
+    let hook_names = resolver_hook_names();
+    let two_accesses_on_one_line = format!("{}({}())", hook_names[0], hook_names[1]);
+    assert_eq!(
+        resolver_hook_access_count(&two_accesses_on_one_line, &hook_names),
+        2
+    );
+}
+
+fn assert_outbound_resolver_lifetime_isolation() {
+    use flapjack::security::test_helpers::install_test_outbound_host_resolver;
+
+    let root_guard = install_test_outbound_host_resolver(Arc::new(|_, _| {
+        Some(vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))])
+    }));
+    let older_guard = install_test_outbound_host_resolver(Arc::new(|_, _| {
+        Some(vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))])
+    }));
+    let newer_guard = install_test_outbound_host_resolver(Arc::new(|_, _| {
+        Some(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+    }));
+
+    drop(older_guard);
+    let observed_after_older_drop = flapjack::security::first_blocked_outbound_host_ip(
+        "resolver-isolation.test",
+        Some(443),
+        false,
+    );
+
+    // Restore the process-global slot before the intentional red assertion so
+    // this contract cannot leak its fixture into another test during unwind.
+    drop(newer_guard);
+    drop(root_guard);
+
+    assert_eq!(
+        observed_after_older_drop,
+        Some((
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "private or local destination"
+        )),
+        "dropping an older guard must not replace the newer resolver; the shared hook family needs one lifetime isolation owner"
+    );
+}
+
+fn rust_sources_recursively(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut sources = Vec::new();
     for entry in std::fs::read_dir(directory).unwrap() {
         let path = entry.unwrap().path();
         if path.is_dir() {
-            sources.extend(migration_rust_sources(&path));
+            if path.file_name().is_some_and(|name| {
+                matches!(
+                    name.to_str(),
+                    Some("target" | "node_modules" | ".git" | ".fastembed_cache")
+                )
+            }) {
+                continue;
+            }
+            sources.extend(rust_sources_recursively(&path));
         } else if path.extension().is_some_and(|extension| extension == "rs") {
             sources.push(path);
         }

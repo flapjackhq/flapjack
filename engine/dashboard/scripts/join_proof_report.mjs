@@ -43,39 +43,9 @@
 // being proven.
 
 import { readFileSync, existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { DEFAULTS, die, parseArgs, readJoinManifest } from './join_proof_common.mjs';
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const DASHBOARD_DIR = resolve(HERE, '..');
-
-const DEFAULTS = {
-  results: resolve(DASHBOARD_DIR, 'test-results/results.json'),
-  manifest: resolve(DASHBOARD_DIR, 'tests/e2e-ui/join_proof_manifest.json'),
-};
-
-function parseArgs(argv) {
-  const out = { ...DEFAULTS, json: false };
-  for (let i = 0; i < argv.length; i += 1) {
-    const flag = argv[i];
-    if (flag === '--json') {
-      out.json = true;
-    } else if (flag === '--results' || flag === '--manifest') {
-      const value = argv[i + 1];
-      if (!value) die(`${flag} needs a value`);
-      out[flag.slice(2)] = resolve(process.cwd(), value);
-      i += 1;
-    } else {
-      die(`unknown argument: ${flag}`);
-    }
-  }
-  return out;
-}
-
-function die(message) {
-  process.stderr.write(`join_proof_report: ${message}\n`);
-  process.exit(1);
-}
+const SCRIPT_NAME = 'join_proof_report';
 
 // Playwright's JSON reporter nests suites arbitrarily deep and repeats the file
 // path on every level, so collect leaf specs rather than assuming a shape.
@@ -109,13 +79,18 @@ function specMatches(reportedFile, manifestSpec) {
 }
 
 function main() {
-  const args = parseArgs(process.argv.slice(2));
+  const args = parseArgs(process.argv.slice(2), {
+    defaults: { results: DEFAULTS.results, manifest: DEFAULTS.manifest, json: false },
+    booleanFlags: ['--json'],
+    valueFlags: ['--results', '--manifest'],
+    scriptName: SCRIPT_NAME,
+  });
 
-  if (!existsSync(args.manifest)) die(`manifest not found: ${args.manifest}`);
-  const manifest = JSON.parse(readFileSync(args.manifest, 'utf8'));
+  const manifest = readJoinManifest(args.manifest, SCRIPT_NAME);
 
   if (!existsSync(args.results)) {
     die(
+      SCRIPT_NAME,
       `results not found: ${args.results}\n` +
         '  Run the browser suite first. The `json` reporter in playwright.config.ts writes this file.',
     );
@@ -125,7 +100,9 @@ function main() {
   const specs = [];
   collectSpecs(report, specs);
   for (const suite of report.suites ?? []) collectSpecs(suite, specs);
-  if (specs.length === 0) die('the results file contained no specs; refusing to report a vacuous zero');
+  if (specs.length === 0) {
+    die(SCRIPT_NAME, 'the results file contained no specs; refusing to report a vacuous zero');
+  }
 
   // Resolve every proof key against the run.
   const keyOutcome = {};

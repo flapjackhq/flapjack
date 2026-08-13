@@ -159,3 +159,4 @@ engine/dashboard/.evidence/
 .scrai/state.json
 .scrai/summaries.json
 .scrai/dir_summaries.json
+.scrai/codemap_graph_cache.json

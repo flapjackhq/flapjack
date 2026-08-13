@@ -8,6 +8,10 @@ import {
   type AlgoliaTestContext,
 } from '../../fixtures/algolia.fixture';
 import { searchIndex } from '../../fixtures/api-helpers';
+import {
+  expectMigrationPreviewReport,
+  type MigrationPreviewOracle,
+} from '../../fixtures/migration-preview.fixture';
 import { EXPECTED_COUNTS, PRODUCTS } from '../../fixtures/test-data';
 
 /**
@@ -27,6 +31,21 @@ const credentialMode = resolveAlgoliaCredentialMode({
 if (credentialMode === 'fail') {
   throw new MissingAlgoliaCredentialsError();
 }
+
+const ALGOLIA_PREVIEW_ORACLE: MigrationPreviewOracle = {
+  summary: {
+    totalEntries: 14,
+    hardRejections: 0,
+    warnings: 9,
+    scopeGaps: 5,
+  },
+  entry: {
+    severity: 'Warning',
+    code: 'PersistedNoBehaviorSetting',
+    resource: 'Settings',
+    jsonPath: '$.hitsPerPage',
+  },
+};
 
 test.describe('Algolia Migration (real browser)', () => {
   let ctx: AlgoliaTestContext | undefined;
@@ -74,15 +93,17 @@ test.describe('Algolia Migration (real browser)', () => {
       'unchecked',
     );
 
-    // Verify Migrate button shows index name and is enabled
-    const migrateButton = page.getByRole('button', {
-      name: new RegExp(`Migrate.*"${algoliaCtx.targetIndexName}"`),
-    });
-    await expect(migrateButton).toBeEnabled();
+    const previewButton = page.getByRole('button', { name: /preview migration/i });
+    await expect(previewButton).toBeEnabled();
+    await previewButton.click();
+    await expectMigrationPreviewReport(page, ALGOLIA_PREVIEW_ORACLE);
 
-    // Click Migrate and verify user-visible success state instead of coupling
+    const submitButton = page.getByRole('button', { name: /^submit migration$/i });
+    await expect(submitButton).toBeEnabled();
+
+    // Submit and verify user-visible success state instead of coupling
     // to transport timing for a single response packet.
-    await migrateButton.click();
+    await submitButton.click();
 
     // Wait for success card
     await expect(page.getByText('Migration complete')).toBeVisible({ timeout: 90_000 });
@@ -132,8 +153,7 @@ test.describe('Algolia Migration (real browser)', () => {
     await page.getByLabel('Source Index (Algolia)').fill(algoliaCtx.indexName);
     await page.getByLabel(/Target Index \(Flapjack\)/).fill(algoliaCtx.invalidTargetIndexName);
 
-    const migrateButton = page.getByRole('button', { name: /migrate/i });
-    await migrateButton.click();
+    await page.getByRole('button', { name: /preview migration/i }).click();
 
     const errorCard = page.getByTestId('migration-error-card');
     await expect(errorCard).toContainText('Migration failed', { timeout: 15_000 });

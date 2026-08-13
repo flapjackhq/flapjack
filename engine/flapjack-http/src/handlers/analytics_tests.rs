@@ -24,6 +24,22 @@ fn test_analytics_config(tmp: &TempDir) -> AnalyticsConfig {
     }
 }
 
+fn analytics_seed_request(index: &str, search_count: u32) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri("/2/analytics/seed")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "index": index,
+                "days": 1,
+                "searchCount": search_count
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
 fn analytics_only_key_restricted_to(indexes: Vec<String>) -> ApiKey {
     ApiKey {
         hash: "analytics-test-hash".to_string(),
@@ -253,53 +269,56 @@ async fn analytics_clear_filesystem_failures_return_server_error() {
 #[tokio::test]
 async fn analytics_seed_distinguishes_invalid_options_from_filesystem_failures() {
     let tmp = TempDir::new().unwrap();
-    let mut config = test_analytics_config(&tmp);
-    config.data_dir = tmp.path().join("analytics-file");
-    std::fs::write(&config.data_dir, b"not a directory").unwrap();
-
-    let app = Router::new()
+    let healthy_config = test_analytics_config(&tmp);
+    let healthy_app = Router::new()
         .route("/2/analytics/seed", axum::routing::post(seed_analytics))
-        .with_state(Arc::new(AnalyticsQueryEngine::new(config)));
+        .with_state(Arc::new(AnalyticsQueryEngine::new(healthy_config.clone())));
 
-    let invalid_response = app
+    let healthy_response = healthy_app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/2/analytics/seed")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "index": "seed-failure",
-                        "days": 1,
-                        "searchCount": 0
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
+        .oneshot(analytics_seed_request("healthy-seed", 3))
+        .await
+        .unwrap();
+    assert_eq!(healthy_response.status(), StatusCode::OK);
+    let healthy_body = body_json(healthy_response).await;
+    assert_eq!(healthy_body["status"], "ok");
+    assert_eq!(healthy_body["index"], "healthy-seed");
+    assert_eq!(healthy_body["days"], 1);
+    assert_eq!(healthy_body["totalSearches"], 3);
+    assert_eq!(healthy_body["seededDates"].as_array().unwrap().len(), 1);
+
+    let invalid_response = healthy_app
+        .oneshot(analytics_seed_request("invalid-seed", 0))
         .await
         .unwrap();
     assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
     let invalid_body = body_json(invalid_response).await;
-    assert_eq!(invalid_body["status"], 400);
+    assert_eq!(
+        invalid_body,
+        serde_json::json!({
+            "message": "Seed error: searchCount must be between 1 and 100000",
+            "status": 400
+        })
+    );
 
-    let filesystem_response = app
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/2/analytics/seed")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "index": "seed-failure",
-                        "days": 1,
-                        "searchCount": 1
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
+    let obstructed_index = "partition-setup-failure";
+    std::fs::create_dir_all(
+        healthy_config
+            .target_artifact_paths(obstructed_index)
+            .index_root,
+    )
+    .unwrap();
+    std::fs::write(
+        healthy_config.searches_dir(obstructed_index),
+        b"not a directory",
+    )
+    .unwrap();
+    let obstructed_app = Router::new()
+        .route("/2/analytics/seed", axum::routing::post(seed_analytics))
+        .with_state(Arc::new(AnalyticsQueryEngine::new(healthy_config)));
+
+    let filesystem_response = obstructed_app
+        .oneshot(analytics_seed_request(obstructed_index, 1))
         .await
         .unwrap();
     assert_eq!(
@@ -307,27 +326,19 @@ async fn analytics_seed_distinguishes_invalid_options_from_filesystem_failures()
         StatusCode::INTERNAL_SERVER_ERROR
     );
     let filesystem_body = body_json(filesystem_response).await;
-    assert_eq!(filesystem_body["status"], 500);
+    assert_eq!(
+        filesystem_body,
+        serde_json::json!({
+            "message": "Internal server error",
+            "status": 500
+        })
+    );
 }
 
 async fn seed_index(app: &Router, index: &str, search_count: u32) {
     let response = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/2/analytics/seed")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "index": index,
-                        "days": 1,
-                        "searchCount": search_count
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
+        .oneshot(analytics_seed_request(index, search_count))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);

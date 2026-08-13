@@ -48,6 +48,36 @@ function normalizeRelativePath(rawPath) {
   return rawPath.replace(/^\.\//, '').replace(/\/$/, '');
 }
 
+function yamlScalarValue(rawValue) {
+  const trimmed = rawValue.trim();
+  if (trimmed.length < 2 || trimmed[0] !== trimmed[trimmed.length - 1]) {
+    return trimmed;
+  }
+  if (trimmed[0] === "'") {
+    return trimmed.slice(1, -1).replace(/''/g, "'");
+  }
+  if (trimmed[0] === '"') {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return '';
+    }
+  }
+  return trimmed;
+}
+
+function normalizeReportDirectory(rawDirectory) {
+  if (!rawDirectory) {
+    return '';
+  }
+  const directory = yamlScalarValue(rawDirectory).replace(/\\/g, '/');
+  if (!directory) {
+    return '';
+  }
+  const normalized = path.posix.normalize(directory);
+  return normalized === '.' ? '' : normalized.replace(/\/$/, '');
+}
+
 function parseProjects(configSource) {
   const projects = [];
   const projectPattern = /\{\s*name:\s*['"]([^'"]+)['"][\s\S]*?testDir:\s*['"]([^'"]+)['"][\s\S]*?\}/g;
@@ -181,6 +211,10 @@ function scriptInvocations(scriptName) {
 
 function stepBlocks(workflowPath) {
   const lines = fs.readFileSync(workflowPath, 'utf8').split('\n');
+  return stepBlocksFromLines(lines);
+}
+
+function stepBlocksFromLines(lines) {
   const blocks = [];
   let current = null;
   for (const line of lines) {
@@ -248,9 +282,155 @@ function npmScriptFromCommand(command) {
   return npmScriptsFromCommand(command)[0];
 }
 
+function shellCommandSeparatorWidth(command, index) {
+  if (command[index] === ';' || command[index] === '\n') {
+    return 1;
+  }
+  const twoCharacterOperator = command.slice(index, index + 2);
+  if (['&&', '||', '|&'].includes(twoCharacterOperator)) {
+    return 2;
+  }
+  return command[index] === '&' || command[index] === '|' ? 1 : 0;
+}
+
+function commandSegments(command) {
+  const segments = [];
+  let segmentStart = 0;
+  let quote = null;
+  let escaped = false;
+  const suspendedQuotes = [];
+  let index = 0;
+
+  while (index < command.length) {
+    const character = command[index];
+    if (escaped) {
+      escaped = false;
+    } else if (quote === "'") {
+      if (character === quote) quote = null;
+    } else if (character === '\\') {
+      escaped = true;
+    } else if (command.slice(index, index + 2) === '$(') {
+      suspendedQuotes.push(quote);
+      quote = null;
+      index += 2;
+      continue;
+    } else if (quote !== null) {
+      if (character === quote) quote = null;
+    } else if (character === "'" || character === '"') {
+      quote = character;
+    } else if (suspendedQuotes.length > 0) {
+      if (character === '(') suspendedQuotes.push(null);
+      if (character === ')') quote = suspendedQuotes.pop();
+    } else {
+      const separatorWidth = shellCommandSeparatorWidth(command, index);
+      if (separatorWidth > 0) {
+        const segment = command.slice(segmentStart, index).trim();
+        if (segment !== '') segments.push(segment);
+        index += separatorWidth;
+        segmentStart = index;
+        continue;
+      }
+    }
+    index += 1;
+  }
+
+  const finalSegment = command.slice(segmentStart).trim();
+  if (finalSegment !== '') segments.push(finalSegment);
+  return segments;
+}
+
+function commandSegmentRunsPlaywright(commandSegment) {
+  if (splitPlaywrightCommands(commandSegment).length > 0) {
+    return true;
+  }
+  return npmScriptsFromCommand(commandSegment)
+    .some((scriptName) => scriptInvocations(scriptName).length > 0);
+}
+
+function exportedEnvironmentAssignment(tokens, variableName) {
+  if (tokens[0] !== 'export') {
+    return null;
+  }
+  for (const token of tokens.slice(1)) {
+    const match = token.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match) {
+      break;
+    }
+    if (match[1] === variableName) {
+      return { value: match[2] };
+    }
+  }
+  return null;
+}
+
+function inlinePrefixEnvironmentAssignment(tokens, variableName) {
+  for (const token of tokens) {
+    if (token === 'env') {
+      continue;
+    }
+    if (token === 'npm' || token === 'npx' || token === 'playwright' || token === 'sh') {
+      return null;
+    }
+    const match = token.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match) {
+      return null;
+    }
+    if (match[1] === variableName) {
+      return { value: match[2] };
+    }
+  }
+  return null;
+}
+
+function playwrightEnvironmentAssignments(command, variableName) {
+  // A shell `export VAR=value` (standalone, or chained with `&& runner`) sets VAR
+  // in the step's shell for every later command, so it can silently redirect a
+  // later Playwright run's HTML report just like an inline `VAR=value runner`
+  // prefix. Only report-producing runner segments matter; setup commands such as
+  // `npx playwright install` must not stop the scan before the real test command.
+  const assignments = [];
+  let exportedAssignment = null;
+  for (const commandSegment of commandSegments(command)) {
+    const tokens = tokenizeCommand(commandSegment);
+    if (tokens.length === 0) {
+      continue;
+    }
+
+    if (tokens[0] === 'export') {
+      const assignment = exportedEnvironmentAssignment(tokens, variableName);
+      if (assignment !== null) {
+        exportedAssignment = assignment;
+      }
+      continue;
+    }
+
+    if (!commandSegmentRunsPlaywright(commandSegment)) {
+      continue;
+    }
+
+    assignments.push(inlinePrefixEnvironmentAssignment(tokens, variableName) ?? exportedAssignment);
+  }
+  return assignments;
+}
+
 function stepHasAlgoliaEnv(step) {
   const joined = step.lines.join('\n');
   return joined.includes('ALGOLIA_APP_ID:') && joined.includes('ALGOLIA_ADMIN_KEY:');
+}
+
+function stepEnvironmentValue(step, variableName) {
+  const pattern = new RegExp(`^\\s*${variableName}:\\s*(\\S+)\\s*$`);
+  for (const line of step.lines) {
+    const match = line.match(pattern);
+    if (match) {
+      return match[1];
+    }
+  }
+  return '';
+}
+
+function stepIncludesPath(step, expectedPath) {
+  return step.lines.some((line) => line.trim() === expectedPath);
 }
 
 function workflowSteps() {
@@ -269,6 +449,80 @@ function workflowJobBlock(workflowPath, jobName) {
   const nextJobOffset = lines.slice(jobStart + 1).findIndex((line) => /^  [a-zA-Z0-9_-]+:$/.test(line));
   const jobEnd = nextJobOffset === -1 ? lines.length : jobStart + 1 + nextJobOffset;
   return lines.slice(jobStart, jobEnd).join('\n');
+}
+
+function workflowJobSteps(workflowPath, jobName) {
+  const jobBlock = workflowJobBlock(workflowPath, jobName);
+  return jobBlock ? stepBlocksFromLines(jobBlock.split('\n')) : [];
+}
+
+function scopeEnvironmentValue(scopeBlock, envIndent, variableName) {
+  const lines = scopeBlock.split('\n');
+  const envPattern = new RegExp(`^ {${envIndent}}env:\\s*$`);
+  const envStart = lines.findIndex((line) => envPattern.test(line));
+  if (envStart === -1) {
+    return '';
+  }
+
+  const pattern = new RegExp(`^ {${envIndent + 2}}${variableName}:\\s*(\\S+)\\s*$`);
+  for (const line of lines.slice(envStart + 1)) {
+    if (line.trim() !== '' && leadingSpaces(line) <= envIndent) {
+      break;
+    }
+    const match = line.match(pattern);
+    if (match) {
+      return match[1];
+    }
+  }
+  return '';
+}
+
+function stepPlaywrightInvocations(step) {
+  const command = runCommandFromStep(step);
+  const directInvocations = splitPlaywrightCommands(command);
+  const scriptInvocationsFromCommand = npmScriptsFromCommand(command)
+    .flatMap((scriptName) => scriptInvocations(scriptName));
+  return [...directInvocations, ...scriptInvocationsFromCommand];
+}
+
+function stepRunsPlaywright(step) {
+  return stepPlaywrightInvocations(step).length > 0;
+}
+
+function configuredHtmlReportDirectory(configSource) {
+  const htmlReporter = configSource.match(/\[\s*(['"])html\1\s*,\s*\{([\s\S]*?)\}\s*\]/);
+  if (!htmlReporter) {
+    return '';
+  }
+  const outputFolder = htmlReporter[2].match(/\boutputFolder\s*:\s*(['"])(.*?)\1/);
+  if (outputFolder) {
+    return normalizeReportDirectory(outputFolder[2]);
+  }
+  if (/\boutputFolder\s*:/.test(htmlReporter[2])) {
+    return '';
+  }
+  return 'playwright-report';
+}
+
+function stepHtmlReportDirectories(
+  step,
+  jobReportDirectory,
+  workflowReportDirectory,
+  configReportDirectory,
+) {
+  const command = runCommandFromStep(step);
+  const inheritedReportDirectory = normalizeReportDirectory(
+    stepEnvironmentValue(step, 'PLAYWRIGHT_HTML_OUTPUT_DIR'),
+  )
+    || jobReportDirectory
+    || workflowReportDirectory
+    || configReportDirectory;
+  return playwrightEnvironmentAssignments(command, 'PLAYWRIGHT_HTML_OUTPUT_DIR')
+    .map((commandAssignment) => (
+      commandAssignment === null
+        ? inheritedReportDirectory
+        : normalizeReportDirectory(commandAssignment.value) || configReportDirectory
+    ));
 }
 
 function stepSelectsMigrationSpec(step, ownerProjects, specPath) {
@@ -293,7 +547,42 @@ const integrationStepNames = workflowSteps().filter((step) => (
   && npmScriptFromCommand(runCommandFromStep(step))
 ));
 const migrationSelectingSteps = workflowSteps().filter((step) => stepSelectsMigrationSpec(step, migrationOwners, migrationSpec));
+const dashboardBuildSteps = workflowJobSteps(ciWorkflowPath, 'dashboard-build');
+const auditFixtureStepIndex = dashboardBuildSteps.findIndex((step) => (
+  runCommandFromStep(step) === 'bash scripts/audit_gate_fixture_test.sh'
+  && step.lines.some((line) => line.trim() === 'working-directory: engine/dashboard')
+));
+const liveAuditStepIndex = dashboardBuildSteps.findIndex((step) => (
+  runCommandFromStep(step) === 'bash scripts/audit_gate.sh'
+  && step.lines.some((line) => line.trim() === 'working-directory: engine/dashboard')
+));
 const dashboardFullE2eJob = workflowJobBlock(ciWorkflowPath, 'dashboard-full-e2e');
+const nightlyPageStep = workflowSteps().find((step) => (
+  step.workflow === 'nightly.yml' && step.name === 'Run page tests'
+));
+const nightlyDashboardJob = workflowJobBlock(nightlyWorkflowPath, 'dashboard-all');
+const nightlyDashboardSteps = workflowJobSteps(nightlyWorkflowPath, 'dashboard-all');
+const nightlyJobReportDirectory = normalizeReportDirectory(
+  scopeEnvironmentValue(nightlyDashboardJob, 4, 'PLAYWRIGHT_HTML_OUTPUT_DIR'),
+);
+const nightlyWorkflowReportDirectory = normalizeReportDirectory(
+  scopeEnvironmentValue(
+    fs.readFileSync(nightlyWorkflowPath, 'utf8'),
+    0,
+    'PLAYWRIGHT_HTML_OUTPUT_DIR',
+  ),
+);
+const configReportDirectory = configuredHtmlReportDirectory(playwrightConfig);
+const nightlyPageStepIndex = nightlyDashboardSteps.findIndex((step) => step.name === 'Run page tests');
+const laterNightlyPlaywrightSteps = nightlyPageStepIndex === -1
+  ? []
+  : nightlyDashboardSteps.slice(nightlyPageStepIndex + 1).filter(stepRunsPlaywright);
+const nightlyReportUploadStep = workflowSteps().find((step) => (
+  step.workflow === 'nightly.yml' && step.name === 'Upload test reports'
+));
+const nightlyPageReportDirectory = nightlyPageStep
+  ? normalizeReportDirectory(stepEnvironmentValue(nightlyPageStep, 'PLAYWRIGHT_HTML_OUTPUT_DIR'))
+  : '';
 
 check(
   hasExactlyOneSpecOwner(projects, migrationSpec),
@@ -325,6 +614,38 @@ check(
   'every workflow step selecting migrate-algolia.spec.ts carries ALGOLIA_APP_ID and ALGOLIA_ADMIN_KEY',
 );
 check(
+  auditFixtureStepIndex !== -1
+    && liveAuditStepIndex !== -1
+    && auditFixtureStepIndex < liveAuditStepIndex,
+  'dashboard-build runs the deterministic audit fixture suite before the live production audit',
+);
+check(
+  nightlyPageReportDirectory !== '' && nightlyPageReportDirectory !== 'playwright-report',
+  'nightly page tests write HTML evidence outside the later integration report directory',
+);
+check(
+  nightlyPageStepIndex !== -1
+    && laterNightlyPlaywrightSteps.length > 0
+    && laterNightlyPlaywrightSteps.every((step) => {
+      const reportDirectories = stepHtmlReportDirectories(
+        step,
+        nightlyJobReportDirectory,
+        nightlyWorkflowReportDirectory,
+        configReportDirectory,
+      );
+      return reportDirectories.length > 0 && reportDirectories.every((reportDirectory) => (
+        reportDirectory !== '' && reportDirectory !== nightlyPageReportDirectory
+      ));
+    }),
+  `later nightly Playwright steps do not write HTML evidence into ${nightlyPageReportDirectory || 'the page report directory'}`,
+);
+check(
+  Boolean(nightlyReportUploadStep)
+    && stepIncludesPath(nightlyReportUploadStep, `engine/dashboard/${nightlyPageReportDirectory}/`)
+    && stepIncludesPath(nightlyReportUploadStep, 'engine/dashboard/playwright-report/'),
+  'nightly dashboard artifact uploads both page and integration HTML reports',
+);
+check(
   dashboardFullE2eJob.includes('FLAPJACK_NODE_ID=dashboard-e2e')
     && dashboardFullE2eJob.includes('FLAPJACK_ADVERTISE_ADDR=https://dashboard-e2e.invalid:7700')
     && dashboardFullE2eJob.includes('FLAPJACK_REPLICATION_API_KEY=fj_devtestadminkey000000'),
@@ -348,6 +669,98 @@ check(
     ],
   }, migrationOwners, migrationSpec),
   'contract self-test detects GitHub Actions block-scalar run steps that select migrate-algolia.spec.ts',
+);
+check(
+  stepHtmlReportDirectories({
+    name: 'Synthetic inline report environment step',
+    lines: [
+      '      - name: Synthetic inline report environment step',
+      '        working-directory: engine/dashboard',
+      '        run: PLAYWRIGHT_HTML_OUTPUT_DIR=playwright-report-pages npm run test:integration',
+    ],
+  }, 'job-report', 'workflow-report', 'config-report').join(',') === 'playwright-report-pages',
+  'contract self-test detects inline Playwright HTML report environment assignments',
+);
+check(
+  stepHtmlReportDirectories({
+    name: 'Synthetic exported report environment step',
+    lines: [
+      '      - name: Synthetic exported report environment step',
+      '        working-directory: engine/dashboard',
+      '        run: |',
+      '          export PLAYWRIGHT_HTML_OUTPUT_DIR=playwright-report-pages',
+      '          npm run test:integration',
+    ],
+  }, 'job-report', 'workflow-report', 'config-report').join(',') === 'playwright-report-pages',
+  'contract self-test detects exported Playwright HTML report environment assignments',
+);
+check(
+  stepHtmlReportDirectories({
+    name: 'Synthetic later inline report environment step',
+    lines: [
+      '      - name: Synthetic later inline report environment step',
+      '        working-directory: engine/dashboard',
+      '        run: |',
+      '          npx playwright install --with-deps chromium',
+      '          PLAYWRIGHT_HTML_OUTPUT_DIR=playwright-report-pages npm run test:integration',
+    ],
+  }, 'job-report', 'workflow-report', 'config-report').join(',') === 'playwright-report-pages',
+  'contract self-test keeps scanning until the Playwright test runner segment',
+);
+check(
+  stepHtmlReportDirectories({
+    name: 'Synthetic empty inline report environment step',
+    lines: [
+      '      - name: Synthetic empty inline report environment step',
+      '        working-directory: engine/dashboard',
+      '        run: |',
+      '          export PLAYWRIGHT_HTML_OUTPUT_DIR=playwright-report-pages',
+      '          npx playwright install --with-deps chromium',
+      '          PLAYWRIGHT_HTML_OUTPUT_DIR= npm run test:integration',
+    ],
+  }, 'job-report', 'workflow-report', 'config-report').join(',') === 'config-report',
+  'contract self-test treats empty inline Playwright HTML report assignment as an override',
+);
+check(
+  stepHtmlReportDirectories({
+    name: 'Synthetic multiple Playwright runners step',
+    lines: [
+      '      - name: Synthetic multiple Playwright runners step',
+      '        working-directory: engine/dashboard',
+      '        run: |',
+      '          export PLAYWRIGHT_HTML_OUTPUT_DIR=playwright-report-pages',
+      '          PLAYWRIGHT_HTML_OUTPUT_DIR= npm run test:integration',
+      '          npm run test:integration',
+    ],
+  }, 'job-report', 'workflow-report', 'config-report').join(',')
+    === 'config-report,playwright-report-pages',
+  'contract self-test inspects every Playwright runner in a step',
+);
+check(
+  stepHtmlReportDirectories({
+    name: 'Synthetic same-line Playwright runners step',
+    lines: [
+      '      - name: Synthetic same-line Playwright runners step',
+      '        working-directory: engine/dashboard',
+      '        run: PLAYWRIGHT_HTML_OUTPUT_DIR= npm run test:integration ; PLAYWRIGHT_HTML_OUTPUT_DIR=playwright-report-pages npm run test:integration',
+    ],
+  }, 'job-report', 'workflow-report', 'config-report').join(',')
+    === 'config-report,playwright-report-pages',
+  'contract self-test inspects semicolon-separated Playwright runners',
+);
+check(
+  ['&&', '||', '&', '|', '|&'].every((operator) => (
+    stepHtmlReportDirectories({
+      name: `Synthetic ${operator} Playwright runners step`,
+      lines: [
+        `      - name: Synthetic ${operator} Playwright runners step`,
+        '        working-directory: engine/dashboard',
+        `        run: PLAYWRIGHT_HTML_OUTPUT_DIR= npm run test:integration ${operator} PLAYWRIGHT_HTML_OUTPUT_DIR=playwright-report-pages npm run test:integration`,
+      ],
+    }, 'job-report', 'workflow-report', 'config-report').join(',')
+      === 'config-report,playwright-report-pages'
+  )),
+  'contract self-test inspects shell-separated Playwright runners',
 );
 
 console.log(`note\tworkflow steps selecting migration spec: ${migrationSelectingSteps.map((step) => `${step.workflow}:${step.name}`).join(', ') || 'none'}`);

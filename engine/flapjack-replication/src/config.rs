@@ -581,6 +581,9 @@ mod tests {
     /// Verify that a well-formed `node.json` file is parsed and its node ID, bind address, and peer list are returned verbatim.
     #[test]
     fn test_load_or_default_valid_file() {
+        // node.json here carries a cleartext peer, so a sibling test's credential
+        // env can flip the transport policy mid-load unless we serialize.
+        let _guard = ENV_MUTEX.lock().unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
         let node_json_path = temp_dir.path().join("node.json");
 

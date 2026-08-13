@@ -2258,7 +2258,7 @@ mod tests {
         );
         let manager = new_test_manager_in(
             temp_dir.path(),
-            NodeConfig::load_or_default(temp_dir.path()),
+            autoheal_manager_config(vec![peer_config("node-b"), peer_config("node-c")]),
             None,
         );
         let mut journal = AutohealJournal::with_max_bytes(temp_dir.path(), 16 * 1024).unwrap();

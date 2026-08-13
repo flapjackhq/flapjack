@@ -3,7 +3,9 @@ use super::algolia_client::AlgoliaErrorKind;
 use super::source_identity_partitions::{
     SourceIdentityConfig, SourceIdentityError, SourceIdentityVersion,
 };
-use super::source_snapshot::{canonical_json_bytes, source_item_hash, SourceSnapshot};
+use super::source_snapshot::{
+    canonical_json_bytes, source_item_hash, SourceSnapshot, SourceSnapshotBuilder,
+};
 use super::source_test_support::expected_document_v2_digest;
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -36,8 +38,16 @@ fn rule_one() -> serde_json::Value {
     json!({"objectID": "rule-1", "condition": {"pattern": "sale", "anchoring": "contains"}})
 }
 
+fn rule_two() -> serde_json::Value {
+    json!({"objectID": "rule-2", "consequence": {"filterPromotes": true}})
+}
+
 fn synonym_one() -> serde_json::Value {
     json!({"type": "synonym", "synonyms": ["tee", "shirt"], "objectID": "syn-1"})
+}
+
+fn synonym_two() -> serde_json::Value {
+    json!({"type": "oneWaySynonym", "input": "tv", "synonyms": ["television"], "objectID": "syn-2"})
 }
 
 fn btree_set(items: &[&str]) -> BTreeSet<String> {
@@ -59,6 +69,59 @@ fn snapshot_from_raw(
         SourceIdentityConfig::for_test(spool_root.path(), 4096, 8),
     )
     .expect("valid snapshot should build")
+}
+
+fn snapshot_with_resource_order(reverse: bool) -> SourceSnapshot {
+    let spool_root = TempDir::new().expect("identity spool root should be created");
+    let mut builder =
+        SourceSnapshotBuilder::new(SourceIdentityConfig::for_test(spool_root.path(), 4096, 8))
+            .expect("snapshot builder should be created");
+    builder.record_settings(&settings_fixture());
+    builder
+        .record_documents_page(0, &[document_one(), document_two()])
+        .expect("documents should record");
+
+    if reverse {
+        builder
+            .record_rules_page(0, &[rule_two()])
+            .expect("rule two should record");
+        builder
+            .record_rules_page(1, &[rule_one()])
+            .expect("rule one should record");
+        builder
+            .record_synonyms_page(0, &[synonym_two()])
+            .expect("synonym two should record");
+        builder
+            .record_synonyms_page(1, &[synonym_one()])
+            .expect("synonym one should record");
+        builder
+            .record_replica_settings("replica-b", &json!({"ranking": ["words"]}))
+            .expect("replica b settings should record");
+        builder
+            .record_replica_settings("replica-a", &json!({"ranking": ["typo"]}))
+            .expect("replica a settings should record");
+    } else {
+        builder
+            .record_rules_page(0, &[rule_one()])
+            .expect("rule one should record");
+        builder
+            .record_rules_page(1, &[rule_two()])
+            .expect("rule two should record");
+        builder
+            .record_synonyms_page(0, &[synonym_one()])
+            .expect("synonym one should record");
+        builder
+            .record_synonyms_page(1, &[synonym_two()])
+            .expect("synonym two should record");
+        builder
+            .record_replica_settings("replica-a", &json!({"ranking": ["typo"]}))
+            .expect("replica a settings should record");
+        builder
+            .record_replica_settings("replica-b", &json!({"ranking": ["words"]}))
+            .expect("replica b settings should record");
+    }
+
+    builder.finish().expect("snapshot should finish")
 }
 
 #[test]
@@ -147,6 +210,25 @@ fn source_snapshot_canonical_hashes_counts_and_membership_independent_of_item_or
     assert_eq!(
         first.replica_settings.hash,
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+}
+
+#[test]
+fn source_snapshot_resource_hashes_are_independent_of_rule_synonym_and_replica_order() {
+    let first = snapshot_with_resource_order(false);
+    let reordered = snapshot_with_resource_order(true);
+
+    assert_eq!(first.rules, reordered.rules);
+    assert_eq!(first.synonyms, reordered.synonyms);
+    assert_eq!(first.replica_settings, reordered.replica_settings);
+    assert_eq!(first.rules.count, 2);
+    assert_eq!(first.rules.ids, btree_set(&["rule-1", "rule-2"]));
+    assert_eq!(first.synonyms.count, 2);
+    assert_eq!(first.synonyms.ids, btree_set(&["syn-1", "syn-2"]));
+    assert_eq!(first.replica_settings.count, 2);
+    assert_eq!(
+        first.replica_settings.ids,
+        btree_set(&["replica-a", "replica-b"])
     );
 }
 

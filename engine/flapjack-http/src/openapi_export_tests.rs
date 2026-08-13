@@ -259,10 +259,38 @@ fn export_output_declares_typesense_preview_payload_schema() {
     assert_eq!(
         schema_ref(
             &doc,
+            "/paths/~11~1migrations~1typesense/post/requestBody/content/application~1json/schema"
+        ),
+        Some("#/components/schemas/MigrateFromTypesenseRequest"),
+        "Typesense submit route must reference its provider-specific request body"
+    );
+    assert_eq!(
+        schema_ref(
+            &doc,
             "/paths/~11~1migrations~1typesense~1preview/post/requestBody/content/application~1json/schema"
         ),
         Some("#/components/schemas/MigrateFromTypesenseRequest"),
         "Typesense preview route must reference its provider-specific request body"
+    );
+    assert_eq!(
+        doc.pointer(
+            "/components/schemas/MigrateFromTypesenseRequest/properties/sourceWriteFrozen/type"
+        )
+        .and_then(serde_json::Value::as_str),
+        Some("boolean"),
+        "Typesense request schema must document the write-freeze attestation"
+    );
+    assert!(
+        doc.pointer("/components/schemas/MigrateFromAlgoliaRequest/properties/sourceWriteFrozen")
+            .is_none(),
+        "Algolia request schema must not grow the Typesense attestation field"
+    );
+    assert!(
+        doc.pointer(
+            "/components/schemas/MigrateFromMeilisearchRequest/properties/sourceWriteFrozen"
+        )
+        .is_none(),
+        "Meilisearch request schema must not grow the Typesense attestation field"
     );
 }
 #[test]

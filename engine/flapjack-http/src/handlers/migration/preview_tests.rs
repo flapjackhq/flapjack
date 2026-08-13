@@ -17,8 +17,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -28,6 +30,11 @@ const SERVED_SOURCE_RECORD_COUNT: usize = 3;
 const MEILISEARCH_LIVE_ENDPOINT_ENV: &str = "FJ_MEILISEARCH_PREVIEW_ENDPOINT";
 const MEILISEARCH_LIVE_API_KEY_ENV: &str = "FJ_MEILISEARCH_PREVIEW_API_KEY";
 const MEILISEARCH_LIVE_EXPECTED_RECORDS_ENV: &str = "FJ_MEILISEARCH_PREVIEW_EXPECTED_RECORDS";
+// The client owns its per-request timeout. This shorter outer bound protects
+// the ignored test process and ENV_MUTEX lifecycle if the upstream stalls.
+const MEILISEARCH_LIVE_PREVIEW_REQUEST_DEADLINE: Duration = Duration::from_secs(15);
+const MEILISEARCH_LIVE_PREVIEW_DEADLINE_ERROR: &str =
+    "Meilisearch live preview request exceeded its in-test deadline";
 // 51 = two 21-entry IndexManager index trees + three publication-namespace
 // entries + two KeyStore files + four migration-export entries.
 const DURABLE_STATE_SPECIMEN_COUNT: usize = 51;
@@ -295,6 +302,18 @@ async fn post_provider_preview(
     post_migration_route(app, format!("/1/migrations/{provider}/preview"), body).await
 }
 
+async fn live_preview_request_with_deadline<F, T>(
+    deadline: Duration,
+    request: F,
+) -> Result<T, &'static str>
+where
+    F: Future<Output = T>,
+{
+    tokio::time::timeout(deadline, request)
+        .await
+        .map_err(|_| MEILISEARCH_LIVE_PREVIEW_DEADLINE_ERROR)
+}
+
 fn algolia_preview_app(tmp: &TempDir) -> axum::Router {
     let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
     let source_factory = TestMigrationSourceReaderFactory::new(|source_provider| {
@@ -550,8 +569,31 @@ async fn preview_leaves_absent_target_and_unopened_publication_namespace_absent(
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn live_preview_request_deadline_fires() {
+    let deadline = Duration::from_secs(1);
+    let guarded_request = tokio::spawn(live_preview_request_with_deadline(deadline, async move {
+        tokio::time::sleep(deadline + Duration::from_secs(1)).await;
+        "completed without a deadline"
+    }));
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(deadline).await;
+
+    assert_eq!(
+        guarded_request.await.unwrap(),
+        Err(MEILISEARCH_LIVE_PREVIEW_DEADLINE_ERROR),
+        "{MEILISEARCH_LIVE_PREVIEW_DEADLINE_ERROR}"
+    );
+}
+
 #[tokio::test]
-#[ignore = "invoked by tests/meilisearch_source_contract_kat.sh --preview-live"]
+// `meilisearch_source_contract_kat.sh --preview-live` covers the same preview path
+// through the released server CLI and never invokes this test. The only owner that
+// runs this test directly is `tests/test_preview_process_deadline.sh`, which drives
+// it against a loopback blackhole to prove the deadline below protects the test
+// process lifecycle. Both need a live endpoint supplied by their fixture owner.
+#[ignore = "needs a live source endpoint; run directly by tests/test_preview_process_deadline.sh"]
 async fn meilisearch_live_preview_reports_exact_seeded_counts_and_codes() {
     let _env = with_env_var(MEILISEARCH_PREVIEW_LOOPBACK_ENV, "1");
     let endpoint = env::var(MEILISEARCH_LIVE_ENDPOINT_ENV)
@@ -566,17 +608,21 @@ async fn meilisearch_live_preview_reports_exact_seeded_counts_and_codes() {
     let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
     let app = build_test_router(&tmp, Some(key_store));
 
-    let response = post_provider_preview(
-        &app,
-        "meilisearch",
-        json!({
-            "endpoint": endpoint,
-            "apiKey": source_api_key,
-            "sourceIndex": "configured_pk",
-            "targetIndex": "meilisearch_preview_target"
-        }),
+    let response = live_preview_request_with_deadline(
+        MEILISEARCH_LIVE_PREVIEW_REQUEST_DEADLINE,
+        post_provider_preview(
+            &app,
+            "meilisearch",
+            json!({
+                "endpoint": endpoint,
+                "apiKey": source_api_key,
+                "sourceIndex": "configured_pk",
+                "targetIndex": "meilisearch_preview_target"
+            }),
+        ),
     )
-    .await;
+    .await
+    .unwrap_or_else(|error| panic!("{error}"));
     let status = response.status();
     let body = body_json(response).await;
     assert_eq!(status, StatusCode::OK, "preview error body: {body}");
