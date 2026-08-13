@@ -134,7 +134,7 @@ describe('Settings', () => {
     expect(screen.queryByTestId('monaco-editor')).not.toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: /json/i }))
-    expect(screen.getByTestId('monaco-editor')).toBeInTheDocument()
+    expect(await screen.findByTestId('monaco-editor')).toBeInTheDocument()
     expect(screen.queryByTestId('settings-form')).not.toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: /json/i }))
@@ -163,7 +163,7 @@ describe('Settings', () => {
 
     expect(screen.getByRole('button', { name: /save changes/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /reset/i })).toBeInTheDocument()
-    expect(screen.getByTestId('monaco-editor')).toBeInTheDocument()
+    expect(await screen.findByTestId('monaco-editor')).toBeInTheDocument()
   })
 
   it('save and reset are handled by the page state', async () => {
