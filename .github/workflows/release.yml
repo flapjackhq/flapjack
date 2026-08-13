@@ -352,6 +352,8 @@ jobs:
           push: true
           platforms: linux/amd64
           tags: ${{ needs.docker_prepare.outputs.amd64_candidate_tag }}
+          build-args: |
+            FLAPJACK_BUILD_REVISION=${{ github.sha }}
           provenance: mode=max
           sbom: true
           cache-from: type=gha
@@ -386,6 +388,8 @@ jobs:
           push: true
           platforms: linux/arm64
           tags: ${{ needs.docker_prepare.outputs.arm64_candidate_tag }}
+          build-args: |
+            FLAPJACK_BUILD_REVISION=${{ github.sha }}
           provenance: mode=max
           sbom: true
           cache-from: type=gha
@@ -430,6 +434,8 @@ jobs:
           push: true
           platforms: linux/arm64
           tags: ${{ needs.docker_prepare.outputs.arm64_candidate_tag }}
+          build-args: |
+            FLAPJACK_BUILD_REVISION=${{ github.sha }}
           provenance: mode=max
           sbom: true
           cache-from: type=gha

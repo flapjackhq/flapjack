@@ -1,6 +1,6 @@
 # Flapjack - Project Overview
 
-**Last updated:** 2026-08-12
+**Last updated:** 2026-08-13
 
 ## Mission
 
@@ -9,7 +9,7 @@ It keeps the Algolia-compatible client and InstantSearch.js surface working whil
 
 ## Highest Priority
 
-**Adoption status, stated once so no other document has to guess: Flapjack has no users and no customers.** `v1.0.11` published 2026-08-06 and the source is public,
+**Adoption status, stated once so no other document has to guess: Flapjack has no users and no customers.** `v1.0.12` published 2026-08-13 and the source is public,
 but nobody runs it in production, Flapjack Cloud is not live, and no revenue exists. Corrected 2026-08-02: an earlier commercial-adoption claim was false and had
 been propagating into risk arguments that assumed real workloads. **(1) Breaking changes are cheap** — no installed base to migrate, so prefer the correct design
 over the compatible one wherever they conflict, except on the Algolia-compatible wire surface, which is the product. **(2) Nothing is urgent because it is "in

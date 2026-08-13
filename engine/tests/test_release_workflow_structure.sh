@@ -9,6 +9,7 @@ DOCKER_WORKFLOW="$REPO_DIR/.github/workflows/docker.yml"
 CI_WORKFLOW="$REPO_DIR/.github/workflows/ci.yml"
 RELEASE_MANIFEST_HELPER="$REPO_DIR/engine/package/release_artifact_manifest"
 HTTP_MANIFEST="$REPO_DIR/engine/flapjack-http/Cargo.toml"
+DOCKERFILE="$REPO_DIR/engine/Dockerfile"
 CROSS_TOML="$REPO_DIR/engine/Cross.toml"
 ROOT_CROSS_TOML="$REPO_DIR/Cross.toml"
 
@@ -435,6 +436,10 @@ assert_file_executable "$RELEASE_MANIFEST_HELPER" "release_artifact_manifest hel
 assert_release_helper_contract
 
 section "Docker build hang protection and retry safety"
+assert_contains "$DOCKERFILE" '^ARG FLAPJACK_BUILD_REVISION$' "Dockerfile accepts the canonical build revision as a build argument"
+assert_job_contains "docker_build_amd64" '^\s*FLAPJACK_BUILD_REVISION=\$\{\{ github\.sha \}\}\s*$' "amd64 release image embeds the exact release commit"
+assert_job_contains "docker_build_arm64_native" '^\s*FLAPJACK_BUILD_REVISION=\$\{\{ github\.sha \}\}\s*$' "native arm64 release image embeds the exact release commit"
+assert_job_contains "docker_build_arm64_qemu" '^\s*FLAPJACK_BUILD_REVISION=\$\{\{ github\.sha \}\}\s*$' "qemu arm64 release image embeds the exact release commit"
 assert_job_contains "docker_build_amd64" '^\s*packages:\s*write\s*$' "amd64 Docker publish job keeps package-write scope local to the publishing lane"
 assert_job_contains "docker_build_amd64" '^\s*id-token:\s*write\s*$' "amd64 Docker publish job keeps OIDC scope local to the publishing lane"
 assert_job_contains "docker_build_arm64_native" '^\s*packages:\s*write\s*$' "arm64 native Docker publish job keeps package-write scope local to the publishing lane"

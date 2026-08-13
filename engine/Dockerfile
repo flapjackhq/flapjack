@@ -14,6 +14,8 @@ RUN npm run build
 # ── Stage 2: Build Rust binary ───────────────────────────────────────────────
 FROM rust:1 AS builder
 WORKDIR /app
+ARG FLAPJACK_BUILD_REVISION
+ENV FLAPJACK_BUILD_REVISION=${FLAPJACK_BUILD_REVISION}
 
 # Copy manifests
 COPY engine/Cargo.toml engine/Cargo.lock ./
