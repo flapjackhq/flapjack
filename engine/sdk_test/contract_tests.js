@@ -24,10 +24,12 @@ async function waitForIndexing(indexName, expectedCount, maxWaitMs = 5000) {
   const result = await waitForSearch(
     indexName,
     { query: '', hitsPerPage: 1 },
-    (searchResult) => searchResult.nbHits >= expectedCount,
+    (searchResult) => searchResult.nbHits === expectedCount,
     maxWaitMs
   );
-  return Boolean(result);
+  if (!result) {
+    throw new Error(`Timed out waiting for ${indexName} to contain exactly ${expectedCount} hits`);
+  }
 }
 
 test('POST /1/indexes/{indexName}/batch - addObject', async () => {
@@ -217,7 +219,7 @@ test('POST /1/indexes/{indexName}/query - filters', async () => {
     ]
   });
   
-  await waitForIndexing(TEST_INDEX, 4);
+  await waitForIndexing(TEST_INDEX, 3);
   
   const result = await client.search({
     requests: [{
@@ -701,7 +703,7 @@ test('Search response - InstantSearch-compatible shape (hits, facets, pagination
     ]
   });
 
-  await waitForIndexing(TEST_INDEX, 1);
+  await waitForIndexing(TEST_INDEX, 4);
 
   const result = await client.search({
     requests: [{
@@ -762,9 +764,7 @@ test('DELETE /1/indexes/{indexName} - delete index', async () => {
     throw new Error(`Create index failed (${createResponse.status}): ${await createResponse.text()}`);
   }
   
-  if (!(await waitForIndexing(tempIndex, 1))) {
-    throw new Error('Timed out waiting for temporary index to be searchable');
-  }
+  await waitForIndexing(tempIndex, 1);
   
   const deleteResponse = await fetch(`${FLAPJACK_URL}/1/indexes/${tempIndex}`, {
     method: 'DELETE',
