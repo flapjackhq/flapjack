@@ -220,7 +220,7 @@ pub struct Query {
 /// A composable filter tree for narrowing search results.
 ///
 /// Filters can be combined with [`Filter::And`] and [`Filter::Or`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Filter {
     Equals { field: String, value: FieldValue },
     NotEquals { field: String, value: FieldValue },

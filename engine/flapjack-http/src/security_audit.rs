@@ -99,6 +99,10 @@ fn escape_audit_index_name(name: &str) -> String {
 pub struct Target(String);
 
 impl Target {
+    pub fn api_key_collection() -> Self {
+        Self("api_keys".to_string())
+    }
+
     pub fn api_key_fingerprint(key_value: &str) -> Self {
         let digest = Sha256::digest(key_value.as_bytes());
         Self(format!("api_key:{}", hex::encode(&digest[..8])))

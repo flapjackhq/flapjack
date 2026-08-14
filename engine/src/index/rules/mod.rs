@@ -330,7 +330,7 @@ impl RuleStore {
     pub fn save(&self, path: &Path) -> Result<()> {
         let rules: Vec<&Rule> = self.rules.values().collect();
         let content = serde_json::to_string_pretty(&rules)?;
-        std::fs::write(path, content)?;
+        crate::index::atomic_write_file(path, content.as_bytes())?;
         Ok(())
     }
 

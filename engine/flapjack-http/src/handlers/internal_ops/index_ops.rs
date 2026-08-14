@@ -68,7 +68,7 @@ where
 
     match serde_json::to_vec(payload) {
         Ok(bytes) => {
-            std::fs::write(&destination_path, bytes).map_err(|error| {
+            flapjack::index::atomic_write_file(&destination_path, &bytes).map_err(|error| {
                 format!(
                     "[REPL {}] copy_index seq {} failed to write destination {} for {}: {}",
                     tenant_id, seq, filename, destination, error
@@ -277,23 +277,27 @@ pub(crate) async fn apply_clear_index_op(
     })?;
 
     if let Some(data) = settings {
-        if let Err(error) = std::fs::write(&settings_path, data).map_err(|error| {
-            format!(
-                "[REPL {}] clear_index seq {} failed to restore settings for {}: {}",
-                tenant_id, op_entry.seq, index_name, error
-            )
-        }) {
+        if let Err(error) =
+            flapjack::index::atomic_write_file(&settings_path, &data).map_err(|error| {
+                format!(
+                    "[REPL {}] clear_index seq {} failed to restore settings for {}: {}",
+                    tenant_id, op_entry.seq, index_name, error
+                )
+            })
+        {
             tracing::warn!("{}", error);
         }
     }
 
     if let Some(data) = relevance {
-        if let Err(error) = std::fs::write(&relevance_path, data).map_err(|error| {
-            format!(
-                "[REPL {}] clear_index seq {} failed to restore relevance for {}: {}",
-                tenant_id, op_entry.seq, index_name, error
-            )
-        }) {
+        if let Err(error) =
+            flapjack::index::atomic_write_file(&relevance_path, &data).map_err(|error| {
+                format!(
+                    "[REPL {}] clear_index seq {} failed to restore relevance for {}: {}",
+                    tenant_id, op_entry.seq, index_name, error
+                )
+            })
+        {
             tracing::warn!("{}", error);
         }
     }

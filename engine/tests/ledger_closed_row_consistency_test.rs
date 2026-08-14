@@ -66,6 +66,9 @@ const OPEN_WORK_DISPATCH_SECTION: &str = "## Up Next";
 const LANDED_DATA_RECEIPT: &str =
     "engine/docs2/4_EVIDENCE/2026_08_03_aug03_11am_5_competitor_migration_lands_data_receipt.md";
 const LANDED_DATA_MERGE: &str = "2c05776c7b9d8f60bae89c34ad819ece084fa2e4";
+const DASHBOARD_390_RECEIPT: &str =
+    "engine/docs2/4_EVIDENCE/2026_08_03_aug03_11am_9_dashboard_390px_receipt.md";
+const DASHBOARD_390_PROOF: &str = "tested 23 usable 23\nAUDIT_AFTER_EXIT=0\nALL_USABLE_EXIT=0";
 
 const NAMED_OPEN_ROWS: &[&str] = &["JOIN-1", "PL-10"];
 const NAMED_CLOSED_ROWS: &[&str] = &[
@@ -323,7 +326,11 @@ fn record_open_work_conflicts(
     }
 }
 
-fn record_measured_owner_conflicts(roadmap: &str, features: &str, findings: &mut Vec<String>) {
+fn record_measured_owner_conflicts(
+    roadmap: &str,
+    dashboard_390_receipt: &str,
+    findings: &mut Vec<String>,
+) {
     let join_row = table_row(roadmap, "JOIN-1").unwrap_or_default();
     // `JOIN-1` is checked for SHAPE, not for one frozen measurement.
     //
@@ -403,13 +410,38 @@ fn record_measured_owner_conflicts(roadmap: &str, features: &str, findings: &mut
         sec_w4_row,
         "no residual open item",
     );
-    let pr13_row = table_row(features, "PR-13").unwrap_or_default();
-    require_text(findings, "FEATURES.md row `PR-13`", pr13_row, "✅ Done");
+    // FEATURES.md is intentionally compact and no longer carries the historical
+    // PR-13 row. The immutable lane receipt owns the exact measured denominator.
     require_text(
         findings,
-        "FEATURES.md row `PR-13`",
-        pr13_row,
-        "tested 23 usable 23",
+        DASHBOARD_390_RECEIPT,
+        dashboard_390_receipt,
+        DASHBOARD_390_PROOF,
+    );
+}
+
+#[test]
+fn named_reconciliation_rejects_missing_dashboard_390_measurement() {
+    let roadmap = read_ledger("ROADMAP.md");
+    let receipt = read_ledger(DASHBOARD_390_RECEIPT);
+    let mutated = receipt.replacen(
+        DASHBOARD_390_PROOF,
+        "tested 23 usable 22\nAUDIT_AFTER_EXIT=0\nALL_USABLE_EXIT=1",
+        1,
+    );
+    assert_ne!(
+        receipt, mutated,
+        "the live dashboard receipt lacks the exact measurement this mutation must remove"
+    );
+
+    let mut findings = Vec::new();
+    record_measured_owner_conflicts(&roadmap, &mutated, &mut findings);
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.contains(DASHBOARD_390_RECEIPT)),
+        "mutating the durable PR-13 receipt must fail its named reconciliation, got:\n{}",
+        findings.join("\n")
     );
 }
 
@@ -526,6 +558,7 @@ fn named_batch_rows_are_reconciled_with_merged_evidence() {
     let roadmap = read_ledger("ROADMAP.md");
     let project_overview = read_ledger("PROJECT_OVERVIEW.md");
     let features = read_ledger("engine/docs2/FEATURES.md");
+    let dashboard_390_receipt = read_ledger(DASHBOARD_390_RECEIPT);
     let priority_section = section_body(&project_overview, OPEN_WORK_PRIORITY_SECTION);
     let dispatch_ids = table_row_ids(section_body(&roadmap, OPEN_WORK_DISPATCH_SECTION));
     let mut findings = Vec::new();
@@ -541,7 +574,7 @@ fn named_batch_rows_are_reconciled_with_merged_evidence() {
 
     record_roadmap_state_conflicts(&roadmap, &mut findings);
     record_open_work_conflicts(priority_section, &dispatch_ids, &mut findings);
-    record_measured_owner_conflicts(&roadmap, &features, &mut findings);
+    record_measured_owner_conflicts(&roadmap, &dashboard_390_receipt, &mut findings);
     record_migration_attribution_conflicts(&roadmap, &features, &mut findings);
 
     assert!(

@@ -166,7 +166,7 @@ pub fn spawn_rollup_broadcaster(
     cluster: Arc<AnalyticsClusterClient>,
     node_id: String,
     interval_secs: u64,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         // MissedTickBehavior::Delay: if one cycle is slow, don't burst-catch-up
@@ -178,7 +178,7 @@ pub fn spawn_rollup_broadcaster(
             interval.tick().await;
             run_rollup_broadcast(&engine, &config, &cluster, &node_id).await;
         }
-    });
+    })
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

@@ -314,6 +314,47 @@ mod compact_index {
 mod operation_index {
     use super::*;
 
+    #[test]
+    fn index_names_reject_every_server_owned_top_level_namespace() {
+        // IndexManager and the HTTP server share the same data root. Any index
+        // accepted here can therefore replace a server-owned directory or make
+        // a required state file impossible to create.
+        let reserved = [
+            ".",
+            ".publication",
+            ".publication_quarantine",
+            ".query_suggestions",
+            ".experiments",
+            ".admin_key",
+            ".process.lock",
+            "_usage",
+            "_idempotency",
+            "analytics",
+            "migration_exports",
+            "ssl",
+            "keys.json",
+            "key_material.json",
+            "dashboard_sessions.json",
+            "security_sources.json",
+            "node.json",
+            "autoheal_decisions.jsonl",
+        ];
+
+        for name in reserved {
+            assert!(
+                flapjack::validate_index_name(name).is_err(),
+                "server-owned top-level name {name:?} must not be accepted as an index"
+            );
+        }
+
+        for name in ["products", "products.v2", "analytics_events"] {
+            assert!(
+                flapjack::validate_index_name(name).is_ok(),
+                "ordinary index name {name:?} must remain valid"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn move_basic() {
         let tmp = TempDir::new().unwrap();
@@ -363,6 +404,30 @@ mod operation_index {
     }
 
     #[tokio::test]
+    async fn move_rejects_same_source_and_destination_without_losing_records() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = IndexManager::new(tmp.path());
+        mgr.create_tenant("products").unwrap();
+        mgr.add_documents_sync("products", make_docs(&["keep_me"]))
+            .await
+            .unwrap();
+
+        let result = mgr.move_index("products", "products").await;
+
+        assert!(result.is_err(), "self-move must fail before any mutation");
+        let preserved = mgr.search("products", "Item", None, None, 10).unwrap();
+        assert_eq!(
+            preserved
+                .documents
+                .iter()
+                .map(|hit| hit.document.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep_me"],
+            "a rejected self-move must leave the source generation intact"
+        );
+    }
+
+    #[tokio::test]
     async fn copy_basic() {
         let tmp = TempDir::new().unwrap();
         let mgr = IndexManager::new(tmp.path());
@@ -377,6 +442,99 @@ mod operation_index {
         assert_eq!(src_results.documents.len(), 2);
         let dst_results = mgr.search("dst", "Item", None, None, 10).unwrap();
         assert_eq!(dst_results.documents.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn copy_rejects_same_source_and_destination_without_losing_records() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = IndexManager::new(tmp.path());
+        mgr.create_tenant("products").unwrap();
+        mgr.add_documents_sync("products", make_docs(&["keep_me"]))
+            .await
+            .unwrap();
+
+        let result = mgr.copy_index("products", "products", None).await;
+
+        assert!(result.is_err(), "self-copy must fail before any mutation");
+        let preserved = mgr.search("products", "Item", None, None, 10).unwrap();
+        assert_eq!(
+            preserved
+                .documents
+                .iter()
+                .map(|hit| hit.document.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep_me"],
+            "a rejected self-copy must leave the source generation intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_copy_preserves_destination_records() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = IndexManager::new(tmp.path());
+        mgr.create_tenant("source").unwrap();
+        mgr.add_documents_sync("source", make_docs(&["source_only"]))
+            .await
+            .unwrap();
+        mgr.create_tenant("destination").unwrap();
+        mgr.add_documents_sync("destination", make_docs(&["destination_only"]))
+            .await
+            .unwrap();
+
+        let scope = vec!["settings".to_string()];
+        mgr.copy_index("source", "destination", Some(&scope))
+            .await
+            .unwrap();
+
+        let preserved = mgr.search("destination", "Item", None, None, 10).unwrap();
+        assert_eq!(
+            preserved
+                .documents
+                .iter()
+                .map(|hit| hit.document.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["destination_only"],
+            "Algolia scoped copy replaces selected configuration only"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_full_copy_preserves_existing_destination_generation() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let mgr = IndexManager::new(tmp.path());
+        mgr.create_tenant("source").unwrap();
+        mgr.add_documents_sync("source", make_docs(&["source_only"]))
+            .await
+            .unwrap();
+        mgr.create_tenant("destination").unwrap();
+        mgr.add_documents_sync("destination", make_docs(&["destination_only"]))
+            .await
+            .unwrap();
+        symlink(
+            tmp.path().join("source").join("settings.json"),
+            tmp.path().join("source").join("unsupported_link"),
+        )
+        .unwrap();
+
+        let result = mgr.copy_index("source", "destination", None).await;
+
+        assert!(
+            result.is_err(),
+            "the canonical tree copier must reject symbolic links"
+        );
+        let preserved = mgr.search("destination", "Item", None, None, 10).unwrap();
+        assert_eq!(
+            preserved
+                .documents
+                .iter()
+                .map(|hit| hit.document.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["destination_only"],
+            "staging failure must leave the published destination untouched"
+        );
     }
 
     #[tokio::test]

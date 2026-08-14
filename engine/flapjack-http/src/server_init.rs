@@ -563,6 +563,7 @@ pub(crate) fn initialize_state(
         idempotency_cache: Arc::new(
             crate::idempotency::IdempotencyCache::from_env_with_data_dir(Path::new(data_dir)),
         ),
+        background_task_health: Arc::new(crate::background_tasks::BackgroundTaskHealth::default()),
     }))
 }
 

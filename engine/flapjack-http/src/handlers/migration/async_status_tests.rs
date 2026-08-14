@@ -2636,7 +2636,8 @@ fn assert_shared_migration_lifecycle_owners(sources: &[(String, String)]) {
             "read_migration_phase(",
             &[
                 ("flapjack-http/src/handlers/migration/job_runner.rs", 2),
-                ("flapjack-http/src/handlers/migration/mod.rs", 5),
+                ("flapjack-http/src/handlers/migration/mod.rs", 3),
+                ("flapjack-http/src/handlers/migration/privacy_scrub.rs", 2),
                 ("flapjack-http/src/handlers/migration/spool.rs", 11),
                 ("flapjack-http/src/handlers/migration/spool_lifecycle.rs", 2),
                 ("flapjack-http/src/handlers/migration/spool_support.rs", 1),

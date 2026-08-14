@@ -11,7 +11,7 @@ pub fn persist_admin_key_file(
     key: &str,
     permission_mode: PermissionFailureMode,
 ) -> Result<(), String> {
-    std::fs::write(admin_key_file, key)
+    flapjack::index::atomic_write_private_file(admin_key_file, key.as_bytes())
         .map_err(|error| format!("Failed to write .admin_key: {}", error))?;
 
     ensure_admin_key_permissions(admin_key_file, permission_mode)

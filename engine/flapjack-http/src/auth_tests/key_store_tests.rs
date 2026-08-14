@@ -126,24 +126,23 @@ fn default_search_key_has_bounded_per_ip_rate_limit() {
     );
 }
 #[test]
-fn load_or_create_recreates_default_keys_when_keys_json_is_corrupt() {
+fn load_or_create_refuses_to_overwrite_corrupt_keys_json() {
     let temp_dir = TempDir::new().unwrap();
     let keys_path = temp_dir.path().join("keys.json");
-    std::fs::write(&keys_path, "{ definitely-not-valid-json").unwrap();
+    let corrupt_contents = "{ definitely-not-valid-json";
+    std::fs::write(&keys_path, corrupt_contents).unwrap();
 
-    let store = KeyStore::load_or_create(temp_dir.path(), "test-admin-key");
-    let stored_data: KeyStoreData =
-        serde_json::from_str(&std::fs::read_to_string(&keys_path).unwrap())
-            .expect("load_or_create should rewrite corrupt keys.json with valid key data");
-
-    assert_eq!(
-        stored_data.keys.len(),
-        2,
-        "default key store should contain admin and search keys"
-    );
+    // Security state must fail closed. Replacing malformed credentials with new
+    // defaults would both erase incident evidence and silently change access.
+    let outcome = KeyStore::try_load_or_create(temp_dir.path(), "test-admin-key");
     assert!(
-        store.lookup("test-admin-key").is_some(),
-        "recreated key store should contain a usable admin key"
+        outcome.is_err(),
+        "malformed keys.json must prevent key-store initialization"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&keys_path).unwrap(),
+        corrupt_contents,
+        "failed initialization must preserve the malformed file for recovery and diagnosis"
     );
 }
 #[test]
@@ -153,11 +152,22 @@ fn load_or_create_rotates_admin_hash_when_admin_key_changes() {
     let rotated_admin_key = "rotated-admin-key";
 
     let original_store = KeyStore::load_or_create(temp_dir.path(), original_admin_key);
+    flapjack::index::atomic_write_private_file(
+        &temp_dir.path().join(".admin_key"),
+        original_admin_key.as_bytes(),
+    )
+    .unwrap();
     let original_admin_entry = original_store
         .list_all()
         .into_iter()
         .find(|key| key.description == "Admin API Key")
         .expect("admin key must exist");
+    let original_search_value = original_store
+        .list_all()
+        .into_iter()
+        .find(|key| key.description == "Default Search API Key")
+        .and_then(|key| key.hmac_key)
+        .expect("default search key material must exist before rotation");
 
     let rotated_store = KeyStore::load_or_create(temp_dir.path(), rotated_admin_key);
     let rotated_admin_entry = rotated_store
@@ -178,6 +188,35 @@ fn load_or_create_rotates_admin_hash_when_admin_key_changes() {
         (original_admin_entry.hash, original_admin_entry.salt),
         (rotated_admin_entry.hash, rotated_admin_entry.salt),
         "admin key rotation should replace both hash and salt"
+    );
+    let rotated_search_value = rotated_store
+        .list_all()
+        .into_iter()
+        .find(|key| key.description == "Default Search API Key")
+        .and_then(|key| key.hmac_key)
+        .expect("default search key material must survive startup rotation");
+    assert_eq!(
+        rotated_search_value, original_search_value,
+        "startup rotation must re-encrypt rather than replace secured-key material"
+    );
+}
+
+#[test]
+fn load_or_create_refuses_to_overwrite_corrupt_key_material() {
+    let temp_dir = TempDir::new().unwrap();
+    let admin_key = "admin-for-corrupt-material";
+    drop(KeyStore::load_or_create(temp_dir.path(), admin_key));
+    let material_path = temp_dir.path().join("key_material.json");
+    let corrupt_contents = "{ not-valid-key-material";
+    std::fs::write(&material_path, corrupt_contents).unwrap();
+
+    let outcome = KeyStore::try_load_or_create(temp_dir.path(), admin_key);
+
+    assert!(outcome.is_err());
+    assert_eq!(
+        std::fs::read_to_string(&material_path).unwrap(),
+        corrupt_contents,
+        "malformed encrypted material must remain available for recovery"
     );
 }
 
@@ -226,6 +265,35 @@ fn concurrent_runtime_admin_key_rotations_leave_persisted_key_authorized() {
     assert!(
         store.lookup(&persisted_key).is_some(),
         "persisted .admin_key must authorize via the stored admin hash"
+    );
+}
+
+#[test]
+fn runtime_admin_rotation_failure_preserves_old_memory_and_disk_credentials() {
+    let temp_dir = TempDir::new().unwrap();
+    let original_admin_key = "original-admin-key-for-failed-rotation";
+    let store = KeyStore::load_or_create(temp_dir.path(), original_admin_key);
+    let admin_key_path = temp_dir.path().join(".admin_key");
+    flapjack::index::atomic_write_private_file(&admin_key_path, original_admin_key.as_bytes())
+        .unwrap();
+    let original_keys_json = std::fs::read(temp_dir.path().join("keys.json")).unwrap();
+
+    // Fail the first credential publication before any authoritative state can
+    // change. A directory at the file target makes rename fail deterministically.
+    let material_path = temp_dir.path().join("key_material.json");
+    std::fs::remove_file(&material_path).unwrap();
+    std::fs::create_dir(&material_path).unwrap();
+
+    assert!(store.rotate_admin_key().is_err());
+    assert_eq!(store.admin_key_value(), original_admin_key);
+    assert!(store.lookup(original_admin_key).is_some());
+    assert_eq!(
+        std::fs::read_to_string(&admin_key_path).unwrap(),
+        original_admin_key
+    );
+    assert_eq!(
+        std::fs::read(temp_dir.path().join("keys.json")).unwrap(),
+        original_keys_json
     );
 }
 #[test]

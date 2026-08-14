@@ -450,6 +450,11 @@ mod admin_key_bootstrap {
         let new_key = "new_admin_key_2222222222222222";
 
         let _store1 = KeyStore::load_or_create(temp_dir.path(), old_key);
+        flapjack::index::atomic_write_private_file(
+            &temp_dir.path().join(".admin_key"),
+            old_key.as_bytes(),
+        )
+        .unwrap();
 
         let keys_json_old = fs::read_to_string(temp_dir.path().join("keys.json")).unwrap();
         let data_old: serde_json::Value = serde_json::from_str(&keys_json_old).unwrap();
@@ -637,24 +642,24 @@ mod admin_key_bootstrap {
     }
 
     #[test]
-    fn test_keystore_handles_corrupted_json_gracefully() {
+    fn test_keystore_refuses_to_overwrite_corrupted_json() {
         let temp_dir = TempDir::new().unwrap();
         let keys_json_path = temp_dir.path().join("keys.json");
         let admin_key = "test_admin_key_corruption_test";
+        let corrupted_json = "{ invalid json }";
 
-        fs::write(&keys_json_path, "{ invalid json }").unwrap();
+        fs::write(&keys_json_path, corrupted_json).unwrap();
 
-        let store = KeyStore::load_or_create(temp_dir.path(), admin_key);
+        let outcome = KeyStore::try_load_or_create(temp_dir.path(), admin_key);
 
         assert!(
-            store.lookup(admin_key).is_some(),
-            "Should recover from corrupted JSON"
+            outcome.is_err(),
+            "corrupted credential state must prevent key-store initialization"
         );
-
-        let keys_json = fs::read_to_string(&keys_json_path).unwrap();
-        assert!(
-            serde_json::from_str::<serde_json::Value>(&keys_json).is_ok(),
-            "Should have valid JSON after recovery"
+        assert_eq!(
+            fs::read_to_string(&keys_json_path).unwrap(),
+            corrupted_json,
+            "failed initialization must preserve corrupted credential state byte-for-byte"
         );
     }
 

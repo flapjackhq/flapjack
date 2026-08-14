@@ -232,6 +232,7 @@ struct CompletedPageCheck {
     already_complete: bool,
     sidecar: SidecarManifest,
     digest_state: u64,
+    #[cfg(test)]
     sidecar_read_bytes: usize,
 }
 
@@ -258,6 +259,7 @@ impl SpoolStore {
             .completed_ids
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(test)]
         let mut sidecar_read_bytes = 0;
         if !cache
             .entries
@@ -265,7 +267,10 @@ impl SpoolStore {
             .is_some_and(|entry| entry.matches(&sidecar))
         {
             let snapshot = self.read_completed_sidecar_snapshot(job_uuid, &sidecar, resource)?;
-            sidecar_read_bytes = sidecar.length as usize;
+            #[cfg(test)]
+            {
+                sidecar_read_bytes = sidecar.length as usize;
+            }
             cache.entries.insert(
                 key,
                 CachedCompletedIds {
@@ -286,6 +291,7 @@ impl SpoolStore {
             already_complete: page_is_already_complete(&entry.ids, object_ids)?,
             sidecar,
             digest_state: entry.digest_state,
+            #[cfg(test)]
             sidecar_read_bytes,
         })
     }

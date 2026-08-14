@@ -267,7 +267,7 @@ impl EmbedderFingerprint {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("fingerprint.json");
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(&path, json)
+        crate::index::atomic_write_file(&path, json.as_bytes())
     }
 
     /// Load fingerprint from `{dir}/fingerprint.json`.

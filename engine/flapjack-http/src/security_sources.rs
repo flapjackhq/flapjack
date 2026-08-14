@@ -73,10 +73,8 @@ impl SecuritySourcesStore {
             std::fs::create_dir_all(parent)?;
         }
 
-        let tmp_path = self.file_path.with_extension("json.tmp");
         let data = serde_json::to_vec_pretty(entries)?;
-        std::fs::write(&tmp_path, data)?;
-        std::fs::rename(&tmp_path, &self.file_path)?;
+        flapjack::index::atomic_write_file(&self.file_path, &data)?;
         Ok(())
     }
 

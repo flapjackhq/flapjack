@@ -3,9 +3,10 @@ use crate::handlers::AppState;
 use crate::server_init::InfrastructureState;
 use crate::ssl_background::{ssl_background_plan, ConfiguredSsl};
 use crate::tenant_dirs::{has_visible_tenant_dirs, visible_tenant_dir_names};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -13,6 +14,106 @@ const HOUR_MS: i64 = 3_600_000;
 const MIGRATION_SPOOL_GC_INTERVAL_ENV: &str = "FLAPJACK_MIGRATION_SPOOL_GC_INTERVAL_SECS";
 const DEFAULT_MIGRATION_SPOOL_GC_INTERVAL_SECS: u64 = 300;
 const AUTOHEAL_ENABLED_ENV: &str = "FLAPJACK_AUTOHEAL_ENABLED";
+const ROLLUP_INTERVAL_ENV: &str = "FLAPJACK_ROLLUP_INTERVAL_SECS";
+const SYNC_INTERVAL_ENV: &str = "FLAPJACK_SYNC_INTERVAL_SECS";
+
+/// Server-wide liveness state for loops whose unexpected exit makes the node
+/// operationally incomplete even though request handling can continue.
+#[derive(Default)]
+pub struct BackgroundTaskHealth {
+    tasks: Mutex<BTreeMap<&'static str, bool>>,
+}
+
+impl BackgroundTaskHealth {
+    fn record_running(&self, name: &'static str) {
+        self.tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(name, true);
+    }
+
+    fn record_exit(&self, name: &'static str) {
+        self.tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(name, false);
+    }
+
+    pub(crate) fn failed_tasks(&self) -> Vec<String> {
+        self.tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|(_, running)| !*running)
+            .map(|(name, _)| (*name).to_string())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_exit_for_test(&self, name: &'static str) {
+        self.record_exit(name);
+    }
+}
+
+fn spawn_supervised<F>(health: Arc<BackgroundTaskHealth>, name: &'static str, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    supervise_handle(health, name, tokio::spawn(future));
+}
+
+fn supervise_handle(
+    health: Arc<BackgroundTaskHealth>,
+    name: &'static str,
+    worker: tokio::task::JoinHandle<()>,
+) {
+    health.record_running(name);
+    // The monitor owns the worker handle, so completion and panic cannot be
+    // silently discarded. Runtime shutdown drops both and does not create a
+    // false unhealthy transition while the process is terminating.
+    tokio::spawn(async move {
+        let result = worker.await;
+        health.record_exit(name);
+        match result {
+            Ok(()) => tracing::error!(task = name, "critical background task exited"),
+            Err(error) => {
+                tracing::error!(task = name, error = %error, "critical background task failed")
+            }
+        }
+    });
+}
+
+fn positive_interval_secs(
+    name: &str,
+    configured: Option<&str>,
+    default: u64,
+) -> Result<u64, String> {
+    let Some(raw) = configured else {
+        return Ok(default);
+    };
+    raw.trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| format!("{name} must be a positive integer, got {raw:?}"))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BackgroundTaskIntervals {
+    rollup_secs: u64,
+    sync_secs: u64,
+}
+
+impl BackgroundTaskIntervals {
+    fn from_env() -> Result<Self, String> {
+        let rollup = std::env::var(ROLLUP_INTERVAL_ENV).ok();
+        let sync = std::env::var(SYNC_INTERVAL_ENV).ok();
+        Ok(Self {
+            rollup_secs: positive_interval_secs(ROLLUP_INTERVAL_ENV, rollup.as_deref(), 300)?,
+            sync_secs: positive_interval_secs(SYNC_INTERVAL_ENV, sync.as_deref(), 60)?,
+        })
+    }
+}
 
 /// Restore all tenant indexes from S3 snapshots when the data directory is empty.
 ///
@@ -293,15 +394,24 @@ async fn enforce_backup_retention(s3_config: &flapjack::index::s3::S3Config, ten
 }
 
 /// Spawn all server background tasks, including analytics, replication, and maintenance loops.
-pub(crate) fn spawn_background_tasks(state: &Arc<AppState>, infrastructure: &InfrastructureState) {
-    spawn_ssl_renewal(infrastructure);
-    spawn_analytics_tasks(infrastructure);
-    spawn_s3_backup_task(infrastructure);
-    spawn_replication_tasks(state, infrastructure);
+pub(crate) fn spawn_background_tasks(
+    state: &Arc<AppState>,
+    infrastructure: &InfrastructureState,
+) -> Result<(), String> {
+    // Validate every externally configured duration before spawning anything.
+    // This avoids a partial background subsystem when one Tokio interval would
+    // otherwise panic after the server has begun accepting traffic.
+    let intervals = BackgroundTaskIntervals::from_env()?;
+    let health = Arc::clone(&state.background_task_health);
+    spawn_ssl_renewal(infrastructure, &health);
+    spawn_analytics_tasks(infrastructure, intervals.rollup_secs, &health);
+    spawn_s3_backup_task(infrastructure, &health);
+    spawn_replication_tasks(state, infrastructure, intervals.sync_secs, &health);
     spawn_migration_spool_gc_task(state);
     spawn_usage_rollup_task(state);
     spawn_metrics_refresh_task(state);
     spawn_usage_alert_task(state);
+    Ok(())
 }
 
 fn migration_spool_gc_interval_secs() -> u64 {
@@ -347,13 +457,17 @@ fn spawn_migration_spool_gc_task(state: &Arc<AppState>) {
         }
     };
 
-    tokio::spawn(async move {
-        run_migration_spool_gc_loop(Duration::from_secs(interval_secs), move || {
-            let store = store.clone();
-            async move { run_migration_spool_gc_pass(&store) }
-        })
-        .await;
-    });
+    spawn_supervised(
+        Arc::clone(&state.background_task_health),
+        "migration-spool-gc",
+        async move {
+            run_migration_spool_gc_loop(Duration::from_secs(interval_secs), move || {
+                let store = store.clone();
+                async move { run_migration_spool_gc_pass(&store) }
+            })
+            .await;
+        },
+    );
     tracing::info!("[migration] Spool GC enabled (interval={}s)", interval_secs);
 }
 
@@ -380,7 +494,7 @@ fn run_migration_spool_gc_pass(store: &SpoolStore) -> Result<(), SpoolError> {
     store.collect_garbage()
 }
 
-fn spawn_ssl_renewal(infrastructure: &InfrastructureState) {
+fn spawn_ssl_renewal(infrastructure: &InfrastructureState, health: &Arc<BackgroundTaskHealth>) {
     let plan = ssl_background_plan(
         infrastructure
             .managed_ssl
@@ -394,7 +508,9 @@ fn spawn_ssl_renewal(infrastructure: &InfrastructureState) {
 
     if let Some(ssl_manager) = plan.renewal_manager {
         let ssl_manager = Arc::clone(ssl_manager);
-        tokio::spawn(async move { ssl_manager.start_renewal_loop().await });
+        spawn_supervised(Arc::clone(health), "ssl-renewal", async move {
+            ssl_manager.start_renewal_loop().await
+        });
         tracing::info!("[SSL] Auto-renewal enabled (checks every 24h)");
     }
 
@@ -404,7 +520,7 @@ fn spawn_ssl_renewal(infrastructure: &InfrastructureState) {
     let resolver = Arc::clone(observer.resolver);
     let material_dir = observer.material_dir.to_path_buf();
     let expiry_manager = observer.expiry_manager.map(Arc::clone);
-    tokio::spawn(async move {
+    spawn_supervised(Arc::clone(health), "tls-material-observer", async move {
         crate::tls_serve::run_tls_material_observer(
             resolver,
             material_dir,
@@ -425,18 +541,24 @@ fn spawn_ssl_renewal(infrastructure: &InfrastructureState) {
 }
 
 /// Spawns background tasks for analytics rollup and retention cleanup.
-fn spawn_analytics_tasks(infrastructure: &InfrastructureState) {
+fn spawn_analytics_tasks(
+    infrastructure: &InfrastructureState,
+    rollup_interval_secs: u64,
+    health: &Arc<BackgroundTaskHealth>,
+) {
     if !infrastructure.analytics_config.enabled {
         tracing::info!("[analytics] Analytics disabled");
         return;
     }
 
     let collector = Arc::clone(&infrastructure.analytics_collector);
-    tokio::spawn(async move { collector.run_flush_loop().await });
+    spawn_supervised(Arc::clone(health), "analytics-flush", async move {
+        collector.run_flush_loop().await
+    });
 
     let retention_dir = infrastructure.analytics_config.data_dir.clone();
     let retention_days = infrastructure.analytics_config.retention_days;
-    tokio::spawn(async move {
+    spawn_supervised(Arc::clone(health), "analytics-retention", async move {
         flapjack::analytics::retention::run_retention_loop(retention_dir, retention_days).await;
     });
 
@@ -446,21 +568,18 @@ fn spawn_analytics_tasks(infrastructure: &InfrastructureState) {
         infrastructure.analytics_config.retention_days
     );
 
-    spawn_local_rollup_generation_task(infrastructure);
+    spawn_local_rollup_generation_task(infrastructure, rollup_interval_secs, health);
 
     if let Some(cluster) = crate::analytics_cluster::get_global_cluster() {
-        let rollup_interval_secs = std::env::var("FLAPJACK_ROLLUP_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(300);
         let local_node_id = cluster.node_id().to_string();
-        crate::rollup_broadcaster::spawn_rollup_broadcaster(
+        let handle = crate::rollup_broadcaster::spawn_rollup_broadcaster(
             Arc::clone(&infrastructure.analytics_engine),
             infrastructure.analytics_config.clone(),
             cluster,
             local_node_id,
             rollup_interval_secs,
         );
+        supervise_handle(Arc::clone(health), "rollup-broadcast", handle);
         tracing::info!(
             "[ROLLUP-BROADCAST] Broadcaster started (interval={}s)",
             rollup_interval_secs
@@ -468,14 +587,14 @@ fn spawn_analytics_tasks(infrastructure: &InfrastructureState) {
     }
 }
 
-fn spawn_local_rollup_generation_task(infrastructure: &InfrastructureState) {
-    let rollup_interval_secs = std::env::var("FLAPJACK_ROLLUP_INTERVAL_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(300);
+fn spawn_local_rollup_generation_task(
+    infrastructure: &InfrastructureState,
+    rollup_interval_secs: u64,
+    health: &Arc<BackgroundTaskHealth>,
+) {
     let collector = Arc::clone(&infrastructure.analytics_collector);
     let analytics_config = infrastructure.analytics_config.clone();
-    tokio::spawn(async move {
+    spawn_supervised(Arc::clone(health), "local-rollup-generation", async move {
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(rollup_interval_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -607,7 +726,7 @@ mod snapshot_restore_tests {
 }
 
 /// Spawns a periodic S3 snapshot backup task for all tenants.
-fn spawn_s3_backup_task(infrastructure: &InfrastructureState) {
+fn spawn_s3_backup_task(infrastructure: &InfrastructureState, health: &Arc<BackgroundTaskHealth>) {
     if let Some(s3_config) = infrastructure.s3_config.as_ref() {
         if let Some(interval_secs) = infrastructure.s3_snapshot_interval_secs {
             let data_dir = infrastructure
@@ -617,7 +736,7 @@ fn spawn_s3_backup_task(infrastructure: &InfrastructureState) {
                 .to_string();
             let manager = Arc::clone(&infrastructure.manager);
             let config = s3_config.clone();
-            tokio::spawn(async move {
+            spawn_supervised(Arc::clone(health), "s3-backup", async move {
                 scheduled_s3_backups(data_dir, config, manager, interval_secs).await;
             });
             tracing::info!("Scheduled S3 backups every {}s", interval_secs);
@@ -626,21 +745,37 @@ fn spawn_s3_backup_task(infrastructure: &InfrastructureState) {
 }
 
 /// Spawns replication health probe and periodic peer-sync tasks.
-fn spawn_replication_tasks(state: &Arc<AppState>, infrastructure: &InfrastructureState) {
+fn spawn_replication_tasks(
+    state: &Arc<AppState>,
+    infrastructure: &InfrastructureState,
+    sync_interval_secs: u64,
+    health: &Arc<BackgroundTaskHealth>,
+) {
     if let Some(replication_manager) = infrastructure.replication_manager.as_ref() {
         let autoheal_enabled = autoheal_enabled_from_env();
         replication_manager.start_health_probe(10, autoheal_enabled);
+        let health_probe = Arc::clone(replication_manager);
+        spawn_supervised(
+            Arc::clone(health),
+            "replication-health-watchdog",
+            async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if !health_probe.health_probe_is_running() {
+                        return;
+                    }
+                }
+            },
+        );
         tracing::info!("[autoheal] enabled={}", autoheal_enabled);
         // NOTE: One-shot startup catch-up moved to server.rs as a pre-serve barrier
         // (run_pre_serve_catchup). Only periodic sync remains as a background task.
-        let sync_interval: u64 = std::env::var("FLAPJACK_SYNC_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(60);
-        crate::startup_catchup::spawn_periodic_sync(Arc::clone(state), sync_interval);
+        let handle =
+            crate::startup_catchup::spawn_periodic_sync(Arc::clone(state), sync_interval_secs);
+        supervise_handle(Arc::clone(health), "replication-sync", handle);
         tracing::info!(
             "[REPL-sync] Periodic anti-entropy sync enabled (interval={}s)",
-            sync_interval
+            sync_interval_secs
         );
     }
 }
@@ -678,39 +813,43 @@ fn spawn_usage_rollup_task(state: &Arc<AppState>) {
         let counters = Arc::clone(&state.usage_counters);
         let manager = Arc::clone(&state.manager);
         let storage_gauges = state.metrics_state.clone().map(|m| m.storage_gauges);
-        tokio::spawn(async move {
-            loop {
-                let now = chrono::Utc::now();
-                let tomorrow = (now + chrono::Duration::days(1))
-                    .date_naive()
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap()
-                    .and_utc();
-                let secs_until_midnight = (tomorrow - now).num_seconds().max(1) as u64;
-                tokio::time::sleep(tokio::time::Duration::from_secs(secs_until_midnight)).await;
+        spawn_supervised(
+            Arc::clone(&state.background_task_health),
+            "usage-rollup",
+            async move {
+                loop {
+                    let now = chrono::Utc::now();
+                    let tomorrow = (now + chrono::Duration::days(1))
+                        .date_naive()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_utc();
+                    let secs_until_midnight = (tomorrow - now).num_seconds().max(1) as u64;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(secs_until_midnight)).await;
 
-                // Capture `now` after waking so the completed-day helper selects
-                // the just-completed UTC date rather than the new current day.
-                let rollup_now = chrono::Utc::now();
-                let completed_day = completed_utc_day(rollup_now);
-                match run_usage_rollover(
-                    rollup_now,
-                    &persistence,
-                    &counters,
-                    &manager,
-                    storage_gauges.as_deref(),
-                ) {
-                    Ok(_) => {
-                        tracing::info!("[usage] Daily rollup complete (date={})", completed_day)
+                    // Capture `now` after waking so the completed-day helper selects
+                    // the just-completed UTC date rather than the new current day.
+                    let rollup_now = chrono::Utc::now();
+                    let completed_day = completed_utc_day(rollup_now);
+                    match run_usage_rollover(
+                        rollup_now,
+                        &persistence,
+                        &counters,
+                        &manager,
+                        storage_gauges.as_deref(),
+                    ) {
+                        Ok(_) => {
+                            tracing::info!("[usage] Daily rollup complete (date={})", completed_day)
+                        }
+                        Err(e) => tracing::error!(
+                            "[usage] Daily rollup failed (date={}): {}",
+                            completed_day,
+                            e
+                        ),
                     }
-                    Err(e) => tracing::error!(
-                        "[usage] Daily rollup failed (date={}): {}",
-                        completed_day,
-                        e
-                    ),
                 }
-            }
-        });
+            },
+        );
     }
 }
 
@@ -718,17 +857,21 @@ fn spawn_usage_rollup_task(state: &Arc<AppState>) {
 fn spawn_metrics_refresh_task(state: &Arc<AppState>) {
     let manager = Arc::clone(&state.manager);
     if let Some(ms) = state.metrics_state.clone() {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                let storage = manager.all_tenant_storage();
-                ms.storage_gauges.clear();
-                for (tenant, bytes) in storage {
-                    ms.storage_gauges.insert(tenant, bytes);
+        spawn_supervised(
+            Arc::clone(&state.background_task_health),
+            "metrics-refresh",
+            async move {
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    let storage = manager.all_tenant_storage();
+                    ms.storage_gauges.clear();
+                    for (tenant, bytes) in storage {
+                        ms.storage_gauges.insert(tenant, bytes);
+                    }
                 }
-            }
-        });
+            },
+        );
     }
 }
 
@@ -746,20 +889,24 @@ fn spawn_usage_alert_task(state: &Arc<AppState>) {
         return;
     }
     let counters = Arc::clone(&state.usage_counters);
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            if let Some(notifier) = crate::notifications::global_notifier() {
-                crate::notifications::check_usage_thresholds(
-                    notifier,
-                    &counters,
-                    search_threshold,
-                    write_threshold,
-                );
+    spawn_supervised(
+        Arc::clone(&state.background_task_health),
+        "usage-alerts",
+        async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                if let Some(notifier) = crate::notifications::global_notifier() {
+                    crate::notifications::check_usage_thresholds(
+                        notifier,
+                        &counters,
+                        search_threshold,
+                        write_threshold,
+                    );
+                }
             }
-        }
-    });
+        },
+    );
     tracing::info!(
         "[notifications] Usage threshold alerts enabled (searches={}, writes={})",
         search_threshold,

@@ -201,6 +201,10 @@ pub async fn batch_search(
         .get::<crate::auth::SecuredKeyRestrictions>()
         .cloned();
     let api_key = request.extensions().get::<crate::auth::ApiKey>().cloned();
+    let paid_beta_v1_customer = request
+        .extensions()
+        .get::<crate::api_profile::PaidBetaV1CustomerRequest>()
+        .is_some();
     let dictionary_lookup_tenant = request
         .extensions()
         .get::<crate::auth::AuthenticatedAppId>()
@@ -211,10 +215,14 @@ pub async fn batch_search(
         .map_err(|e| FlapjackError::InvalidQuery(format!("Failed to read body: {}", e)))?;
     let body: serde_json::Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| FlapjackError::InvalidQuery(format!("Invalid JSON: {}", e)))?;
-    let batch: BatchSearchRequest = serde_json::from_value(body).map_err(|e| {
-        tracing::error!("Batch search deserialization failed: {}", e);
-        FlapjackError::InvalidQuery(format!("Invalid batch search: {}", e))
-    })?;
+    let batch: BatchSearchRequest = if paid_beta_v1_customer {
+        crate::api_profile::prepare_paid_beta_v1_batch(body, api_key.as_ref())?
+    } else {
+        serde_json::from_value(body).map_err(|e| {
+            tracing::error!("Batch search deserialization failed: {}", e);
+            FlapjackError::InvalidQuery(format!("Invalid batch search: {}", e))
+        })?
+    };
 
     if batch.requests.len() > crate::dto::MAX_BATCH_SEARCH_QUERIES {
         return Err(FlapjackError::InvalidQuery(format!(

@@ -505,16 +505,29 @@ fn normalize_revision(revision: &str) -> Option<String> {
 }
 
 fn enabled_core_features() -> Vec<&'static str> {
-    enabled_core_features_from_env(|env_name| match env_name {
-        "CARGO_FEATURE_ANALYTICS" => cfg!(feature = "analytics"),
-        "CARGO_FEATURE_AXUM_SUPPORT" => cfg!(feature = "axum-support"),
-        "CARGO_FEATURE_DECOMPOUND" => cfg!(feature = "decompound"),
-        "CARGO_FEATURE_MEMORY_STATS" => cfg!(feature = "memory-stats"),
-        "CARGO_FEATURE_OPENAPI" => cfg!(feature = "openapi"),
-        "CARGO_FEATURE_S3_SNAPSHOTS" => cfg!(feature = "s3-snapshots"),
-        "CARGO_FEATURE_VECTOR_SEARCH" => cfg!(feature = "vector-search"),
-        "CARGO_FEATURE_VECTOR_SEARCH_LOCAL" => cfg!(feature = "vector-search-local"),
-        _ => false,
+    // Keep the compile-time predicates beside their Cargo environment names.
+    // A `matches!` rewrite is incorrect here: it would report names whose
+    // corresponding feature is disabled in a partial-feature build.
+    let compiled_features = [
+        ("CARGO_FEATURE_ANALYTICS", cfg!(feature = "analytics")),
+        ("CARGO_FEATURE_AXUM_SUPPORT", cfg!(feature = "axum-support")),
+        ("CARGO_FEATURE_DECOMPOUND", cfg!(feature = "decompound")),
+        ("CARGO_FEATURE_MEMORY_STATS", cfg!(feature = "memory-stats")),
+        ("CARGO_FEATURE_OPENAPI", cfg!(feature = "openapi")),
+        ("CARGO_FEATURE_S3_SNAPSHOTS", cfg!(feature = "s3-snapshots")),
+        (
+            "CARGO_FEATURE_VECTOR_SEARCH",
+            cfg!(feature = "vector-search"),
+        ),
+        (
+            "CARGO_FEATURE_VECTOR_SEARCH_LOCAL",
+            cfg!(feature = "vector-search-local"),
+        ),
+    ];
+    enabled_core_features_from_env(|env_name| {
+        compiled_features
+            .iter()
+            .any(|(candidate, enabled)| *enabled && *candidate == env_name)
     })
 }
 

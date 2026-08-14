@@ -15,7 +15,7 @@ been propagating into risk arguments that assumed real workloads. **(1) Breaking
 over the compatible one wherever they conflict, except on the Algolia-compatible wire surface, which is the product. **(2) Nothing is urgent because it is "in
 production" — the urgency is that we cannot yet honestly ask anyone to adopt it.** The bar is not "no known incidents"; it is "we can prove the claims we make."
 
-**Current priority order, row state, and executable exits live only in [`ROADMAP.md`](ROADMAP.md), especially `## Up Next`.** This overview owns the enduring reason for that order: local correctness comes before outward publication, adoption claims require fail-capable evidence, and build-heavy proofs must not overlap when host contention would invalidate them. Keeping the numbered work list out of this file prevents two priority owners from drifting apart.
+**Beads is the sole ledger for new open and planned work in the private dev repository.** Start with `bd prime` and `bd ready --json`; dependencies decide what is ready. This overview owns the enduring rationale: local correctness comes before outward publication, adoption claims require fail-capable evidence, and build-heavy proofs must not overlap when host contention would invalidate them. ROADMAP.md is a read-only historical archive and must not be groomed, scheduled, or updated after the 2026-08-13 adoption boundary; the [archived document](ROADMAP.md) remains public context.
 
 Release history and shipped-feature lineage stay in [`CHANGELOG.md`](CHANGELOG.md) and
 [`engine/docs2/FEATURES.md`](engine/docs2/FEATURES.md). `PROJECT_OVERVIEW.md` owns
@@ -53,15 +53,14 @@ codebase already decided for deletion. Shipped dashboard capability is described
 - Extend analytics, vector search, HA, and operational tooling without increasing
   operator complexity.
 - Keep public documentation routed through canonical owners: `PROJECT_OVERVIEW.md` for
-  mission and priority order, [`ROADMAP.md`](ROADMAP.md) for open work,
+  mission, scope, and durable priority rationale, private Beads for open work,
   [`engine/docs2/FEATURES.md`](engine/docs2/FEATURES.md) for shipped capability status,
   and [`CHANGELOG.md`](CHANGELOG.md) for release history.
 
 ## Non-Goals
 
 - Recreating Algolia's hosted control plane or proprietary infrastructure.
-- Moving public roadmap state into private chats, evidence bundles, or ad hoc
-  release notes.
+- Publishing the private open-work ledger as product documentation.
 - Treating beta release history as the active work ledger.
 - Weakening durability, API compatibility, or validation gates to improve raw
   throughput numbers.

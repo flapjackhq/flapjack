@@ -10,6 +10,7 @@ use tracing_subscriber::Layer;
 use crate::admin_key_persistence::{
     ensure_admin_key_permissions, persist_admin_key_file, PermissionFailureMode,
 };
+use crate::api_profile::ApiProfile;
 use crate::auth::{generate_admin_key, generate_hex_key, KeyStore};
 use flapjack_replication::config::NodeConfig;
 use std::sync::Arc;
@@ -347,6 +348,7 @@ pub(crate) fn log_memory_configuration() {
 pub(crate) struct ServerConfig {
     pub env_mode: String,
     pub no_auth: bool,
+    pub api_profile: ApiProfile,
     pub disable_dashboard: bool,
     pub allow_no_auth_public_bind: bool,
     pub admin_key_env: Option<String>,
@@ -402,6 +404,10 @@ pub(crate) fn load_server_config() -> Result<ServerConfig, String> {
         .ok()
         .filter(|value| value == "1")
         .is_some();
+    let api_profile = ApiProfile::from_env().map_err(|error| error.to_string())?;
+    api_profile
+        .validate_auth_enabled(!no_auth)
+        .map_err(|error| error.to_string())?;
     let disable_dashboard = std::env::var("FLAPJACK_DISABLE_DASHBOARD")
         .ok()
         .filter(|value| value == "1")
@@ -462,6 +468,7 @@ pub(crate) fn load_server_config() -> Result<ServerConfig, String> {
     Ok(ServerConfig {
         env_mode,
         no_auth,
+        api_profile,
         disable_dashboard,
         allow_no_auth_public_bind,
         admin_key_env,
@@ -549,20 +556,36 @@ fn describe_replication_intent(node_config: &NodeConfig, data_dir: &Path) -> Str
 /// - `FLAPJACK_ADMIN_KEY`: persisted into `.admin_key` and loaded into memory.
 /// - existing `.admin_key`: reused.
 /// - missing `.admin_key`: auto-generate and save a new key.
+pub(crate) struct InitializedKeyStore {
+    pub key_store: Option<Arc<KeyStore>>,
+    pub admin_key: Option<String>,
+    pub key_is_new: bool,
+}
+
 pub(crate) fn initialize_key_store(
     server_config: &ServerConfig,
     data_dir: &Path,
-) -> (Option<Arc<KeyStore>>, Option<String>, bool) {
+) -> Result<InitializedKeyStore, String> {
     let admin_key_file = data_dir.join(".admin_key");
     let (admin_key, key_is_new) = resolve_admin_key(server_config, &admin_key_file);
 
-    let key_store = admin_key.as_ref().map(|key| {
-        let key_store = Arc::new(KeyStore::load_or_create(data_dir, key));
-        tracing::info!("API key authentication enabled");
-        key_store
-    });
+    let key_store = match admin_key.as_ref() {
+        Some(key) => {
+            let key_store = Arc::new(KeyStore::try_load_or_create(data_dir, key)?);
+            // Publish only after KeyStore has used the previous file value, if
+            // any, to re-encrypt secured-key material during startup rotation.
+            persist_admin_key_file(&admin_key_file, key, PermissionFailureMode::ReturnError)?;
+            tracing::info!("API key authentication enabled");
+            Some(key_store)
+        }
+        None => None,
+    };
 
-    (key_store, admin_key, key_is_new)
+    Ok(InitializedKeyStore {
+        key_store,
+        admin_key,
+        key_is_new,
+    })
 }
 
 fn resolve_admin_key(
@@ -578,7 +601,8 @@ fn resolve_admin_key(
         .as_deref()
         .and_then(normalize_admin_key)
     {
-        warn_on_failed_admin_key_persist(admin_key_file, &key);
+        // KeyStore owns publication after it has used the prior file value to
+        // re-encrypt any existing secured-key material under the new secret.
         return (Some(key), false);
     }
 
@@ -609,12 +633,6 @@ fn normalize_replication_api_key(raw_key: Option<&str>) -> Result<Option<String>
             .to_string()
     })?;
     Ok(Some(key))
-}
-
-fn warn_on_failed_admin_key_persist(admin_key_file: &Path, key: &str) {
-    if let Err(error) = persist_admin_key(admin_key_file, key) {
-        tracing::warn!("Failed to save admin key to .admin_key: {}", error);
-    }
 }
 
 fn load_existing_admin_key(admin_key_file: &Path, data_dir: &str) -> String {

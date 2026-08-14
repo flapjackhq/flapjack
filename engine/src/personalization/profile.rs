@@ -539,7 +539,7 @@ impl PersonalizationProfileStore {
 
         let json = serde_json::to_string_pretty(profile)
             .map_err(|e| format!("failed to serialize profile: {}", e))?;
-        std::fs::write(&path, json)
+        crate::index::atomic_write_file(&path, json.as_bytes())
             .map_err(|e| format!("failed to write profile '{}': {}", path.display(), e))?;
         Ok(())
     }
@@ -746,5 +746,40 @@ mod tests {
         assert_eq!(loaded, profile);
         assert!(store.delete_profile("user-123").unwrap());
         assert!(store.load_profile("user-123").unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_store_replaces_the_live_file_instead_of_truncating_it() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = TempDir::new().unwrap();
+        let store = PersonalizationProfileStore::new(tmp.path());
+        let mut profile = PersonalizationProfile {
+            user_token: "atomic-profile".to_string(),
+            last_event_at: Some("2026-08-13T12:00:00Z".to_string()),
+            scores: BTreeMap::from([(
+                "brand".to_string(),
+                BTreeMap::from([("Nike".to_string(), 10)]),
+            )]),
+        };
+
+        store.save_profile(&profile).unwrap();
+        let path = store.profile_path(&profile.user_token).unwrap();
+        let original_inode = std::fs::metadata(&path).unwrap().ino();
+
+        profile
+            .scores
+            .get_mut("brand")
+            .unwrap()
+            .insert("Adidas".to_string(), 20);
+        store.save_profile(&profile).unwrap();
+
+        assert_eq!(store.load_profile("atomic-profile").unwrap(), Some(profile));
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().ino(),
+            original_inode,
+            "profile updates must publish by rename, not truncate the live file"
+        );
     }
 }

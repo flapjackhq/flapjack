@@ -388,6 +388,7 @@ fn journal_parser_refuses_legacy_v1_schema_without_fence_evidence() {
     assert!(error.contains("predates fence evidence"), "{error}");
 }
 
+/// Invalid journal fields fail closed at the parser boundary.
 #[test]
 fn journal_rejects_invalid_schema_and_evidence() {
     let mut value = prepared_journal().to_json_value();
@@ -395,7 +396,7 @@ fn journal_rejects_invalid_schema_and_evidence() {
     let error = PublicationJournal::from_json(&value.to_string())
         .expect_err("current-directory journal targets must be rejected")
         .to_string();
-    assert!(error.contains("current-directory path component"), "{error}");
+    assert!(error.contains("reserved for server storage"), "{error}");
 
     let mut value = prepared_journal().to_json_value();
     value["schema_version"] = serde_json::json!(99);

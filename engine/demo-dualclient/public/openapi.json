@@ -10586,9 +10586,14 @@
           "schemaVersion",
           "version",
           "profile",
+          "apiProfile",
+          "supportedApiProfiles",
           "capabilities"
         ],
         "properties": {
+          "apiProfile": {
+            "type": "string"
+          },
           "capabilities": {
             "$ref": "#/components/schemas/BuildCapabilities"
           },
@@ -10599,6 +10604,12 @@
             "type": "integer",
             "format": "int32",
             "minimum": 0
+          },
+          "supportedApiProfiles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           },
           "version": {
             "type": "string"

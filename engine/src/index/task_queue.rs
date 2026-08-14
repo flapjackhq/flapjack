@@ -1,5 +1,7 @@
 //! Background task queue that serializes long-running index operations (currently export) via a bounded mpsc channel, tracking each task's lifecycle in a shared `DashMap`.
 use crate::error::Result;
+use crate::index::manager::task_retention::TaskRetention;
+use crate::index::manager::MAX_TASKS_PER_TENANT;
 use crate::types::{TaskInfo, TaskStatus, TenantId};
 use dashmap::DashMap;
 use std::path::PathBuf;
@@ -9,6 +11,7 @@ use tokio::sync::mpsc;
 pub struct TaskQueue {
     sender: mpsc::Sender<TaskCommand>,
     tasks: Arc<DashMap<String, TaskInfo>>,
+    task_retention: Arc<TaskRetention>,
 }
 
 pub enum TaskCommand {
@@ -20,21 +23,36 @@ pub enum TaskCommand {
 }
 
 impl TaskQueue {
-    pub fn new(manager: Weak<crate::IndexManager>, tasks: Arc<DashMap<String, TaskInfo>>) -> Self {
+    pub(crate) fn new(
+        manager: Weak<crate::IndexManager>,
+        tasks: Arc<DashMap<String, TaskInfo>>,
+        task_retention: Arc<TaskRetention>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(100);
 
         tokio::spawn(process_tasks(rx, tasks.clone(), manager));
 
-        TaskQueue { sender: tx, tasks }
+        TaskQueue {
+            sender: tx,
+            tasks,
+            task_retention,
+        }
     }
 
     #[cfg(test)]
     /// Build a deterministically closed queue so admission tests exercise the
     /// real sender failure without racing a background receiver shutdown.
-    pub(crate) fn closed_for_test(tasks: Arc<DashMap<String, TaskInfo>>) -> Self {
+    pub(crate) fn closed_for_test(
+        tasks: Arc<DashMap<String, TaskInfo>>,
+        task_retention: Arc<TaskRetention>,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
-        TaskQueue { sender, tasks }
+        TaskQueue {
+            sender,
+            tasks,
+            task_retention,
+        }
     }
 
     pub fn enqueue_export(
@@ -48,8 +66,8 @@ impl TaskQueue {
             .try_reserve()
             .map_err(|_| crate::FlapjackError::QueueFull)?;
         let task_id = task.id.clone();
-        self.tasks.insert(task_id.clone(), task.clone());
-        self.tasks.insert(task.numeric_id.to_string(), task);
+        self.task_retention
+            .insert(&self.tasks, &tenant_id, task, MAX_TASKS_PER_TENANT);
         permit.send(TaskCommand::Export {
             task_id,
             tenant_id,
@@ -201,7 +219,7 @@ mod tests {
     fn closed_admission_rejects_without_publishing_task_aliases() {
         let temp_dir = TempDir::new().unwrap();
         let tasks = Arc::new(DashMap::new());
-        let queue = TaskQueue::closed_for_test(tasks.clone());
+        let queue = TaskQueue::closed_for_test(tasks.clone(), Arc::new(TaskRetention::new()));
         let task = TaskInfo::new("export_tenant_test".to_string(), 42, 0);
 
         let result = queue.enqueue_export(

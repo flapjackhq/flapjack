@@ -305,7 +305,7 @@ EOF
     && grep -Fq 'SDK: no executable vendor-host literals in shipped sdks/' "$shadow/run.out" \
     && grep -Fq 'TOTAL offending files: 0' "$shadow/run.out" \
     && grep -Fq 'OK: no executable vendor-host literals in shipped sdks/' "$shadow/run.out" \
-    && grep -Fq 'cargo test --lib -p flapjack -p flapjack-http -p flapjack-replication' "$marker"; then
+    && grep -Fq 'cargo test --lib -p flapjack -p flapjack-replication' "$marker"; then
     pass "$label"
   else
     fail "$label" \

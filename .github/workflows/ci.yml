@@ -84,6 +84,15 @@ jobs:
       - name: Dashboard e2e backend contract
         run: python3 engine/tests/test_dashboard_e2e_backend_contract.py
 
+      # This manifest is the fail-closed bridge between test classes and their
+      # minimum execution tiers. A new workflow job or ignored Rust test must be
+      # classified before the public quick signal can turn green.
+      - name: Test-tier ownership contract
+        run: python3 engine/tests/test_ci_test_tiers.py --verify
+
+      - name: Candidate binary handoff contract
+        run: python3 engine/tests/test_extract_candidate_binary.py
+
   # ============================================================================
   # RUST ENGINE TESTS
   # ============================================================================
@@ -137,7 +146,7 @@ jobs:
           -W clippy::cognitive_complexity
 
   rust-tests-fast:
-    name: Rust tests (fast)
+    name: Rust candidate (fast)
     needs: check-repo
     if: needs.check-repo.outputs.is-public-repo == 'true'
     runs-on: ubuntu-latest
@@ -150,38 +159,28 @@ jobs:
       run:
         working-directory: engine
     steps:
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
-          sudo apt-get clean
-          df -h
-        working-directory: .
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: engine
-      - uses: taiki-e/install-action@a93b01ec36baa756f8701f3a0a8daa54a46d6339 # nextest
-      - name: Install cargo audit/deny tools for security audit tests
-        uses: taiki-e/install-action@a93b01ec36baa756f8701f3a0a8daa54a46d6339 # cargo-audit,cargo-deny
-        with:
-          tool: cargo-audit,cargo-deny
-          fallback: none
       - name: Create dashboard dist stub (for RustEmbed)
         run: mkdir -p dashboard/dist && echo '<html></html>' > dashboard/dist/index.html
-      - name: Workspace build gate
-        run: cargo build --tests --workspace
-      - name: Build binaries (needed by integration tests)
-        run: cargo build --package flapjack-server --features vector-search
-      - name: Build vector-search test binaries
+      # Compile outside the behavioral timeout. If the cache is cold, this step
+      # reports cold compilation honestly instead of consuming the test budget.
+      - name: Build candidate core test binary
+        id: candidate-build
         timeout-minutes: 30
-        run: RUSTFLAGS='-C debuginfo=0 -C strip=debuginfo' cargo build --tests -p flapjack -p flapjack-http --features vector-search
-      - name: Fast tests (vector-search)
-        timeout-minutes: 30
-        run: cargo nextest run -p flapjack -p flapjack-http --features vector-search
-      - name: Fast tests (remaining)
-        timeout-minutes: 30
-        run: cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication
+        run: cargo test -p flapjack --lib --no-run --message-format=json > candidate_build.json && python3 tests/extract_candidate_binary.py candidate_build.json "$GITHUB_OUTPUT"
+      - name: Candidate test-tier inventory
+        timeout-minutes: 10
+        run: python3 tests/test_ci_test_tiers.py --verify
+      # The narrower core is intentionally in-process: it passed as a 2,277-test
+      # specimen, while flapjack-http and vector-feature library unions showed
+      # process-global interference. Those surfaces stay in isolated nextest.
+      - name: Candidate core tests
+        timeout-minutes: 6
+        run: timeout --kill-after=60s 300s "${{ steps.candidate-build.outputs.executable }}"
 
   rust-tests-all:
     name: Rust tests (all)
@@ -221,13 +220,15 @@ jobs:
         run: cargo build --package flapjack-server --features vector-search
       - name: Build vector-search test binaries
         timeout-minutes: 30
-        run: RUSTFLAGS='-C debuginfo=0 -C strip=debuginfo' cargo build --tests -p flapjack -p flapjack-http --features vector-search
+        # Keep compilation outside the test timeout, but use the job-level
+        # RUSTFLAGS so nextest reuses these exact artifacts.
+        run: cargo build --tests -p flapjack -p flapjack-http --features vector-search
       - name: All tests (vector-search)
-        timeout-minutes: 30
-        run: cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci
+        timeout-minutes: 20
+        run: cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci --no-fail-fast
       - name: All tests (remaining)
-        timeout-minutes: 30
-        run: cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci
+        timeout-minutes: 10
+        run: cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci --no-fail-fast
 
   # ============================================================================
   # BUILD SERVER (shared by SDK e2e tests)

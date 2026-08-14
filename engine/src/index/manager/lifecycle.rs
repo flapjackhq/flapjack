@@ -176,21 +176,11 @@ impl super::IndexManager {
             return Ok(());
         }
 
-        std::fs::create_dir_all(&path)?;
-        let schema = crate::index::schema::Schema::builder().build();
-        // New index: no settings yet, default to CJK-aware tokenizer
-        let index = Arc::new(Index::create(&path, schema)?);
+        let index = initialize_new_tenant_tree(&path)?;
+        // Publish runtime state only after every required on-disk artifact is
+        // durable. Otherwise a failed create can make a retry return success
+        // from the cache while the tenant tree is still incomplete.
         self.loaded.insert(tenant_id.to_string(), index);
-
-        let settings_path = path.join("settings.json");
-        if !settings_path.exists() {
-            let default_settings = IndexSettings::default();
-            default_settings.save(&settings_path)?;
-        }
-
-        // Persist index creation metadata
-        crate::index::index_metadata::IndexMetadata::load_or_create(&path)?;
-        write_committed_seq(&path, 0)?;
 
         Ok(())
     }
@@ -572,6 +562,11 @@ impl super::IndexManager {
     ) -> Result<TaskInfo> {
         validate_index_name(source)?;
         validate_index_name(destination)?;
+        if source == destination {
+            return Err(FlapjackError::InvalidQuery(
+                "Source and destination index names must differ".into(),
+            ));
+        }
         let src_path = self.base_path.join(source);
         if !src_path.exists() {
             return self.make_noop_task(source);
@@ -1045,9 +1040,11 @@ impl super::IndexManager {
         .map(Arc::new)
     }
 
-    /// Copy an index from source to destination, optionally filtering to specific configuration files.
+    /// Copy an index through the canonical publication transaction.
     ///
-    /// Validates both names and removes any existing destination. Copies the entire directory, or (if scope is specified) only the requested files ("settings", "synonyms", "rules"). If source doesn't exist, creates an empty tenant instead.
+    /// A full copy replaces the destination generation. A scoped copy replaces
+    /// only the named configuration resources and preserves destination records
+    /// and unselected resources, matching Algolia's operation-index contract.
     ///
     /// # Arguments
     ///
@@ -1066,45 +1063,69 @@ impl super::IndexManager {
     ) -> Result<TaskInfo> {
         validate_index_name(source)?;
         validate_index_name(destination)?;
+        if source == destination {
+            return Err(FlapjackError::InvalidQuery(
+                "Source and destination index names must differ".into(),
+            ));
+        }
+
         let src_path = self.base_path.join(source);
-
-        if self.loaded.contains_key(destination) {
-            self.delete_tenant(&destination.to_string()).await?;
-        } else {
-            let dest_path = self.base_path.join(destination);
-            if dest_path.exists() {
-                std::fs::remove_dir_all(&dest_path)?;
-            }
-        }
-
-        if !src_path.exists() {
-            self.create_tenant(destination)?;
-            return self.make_noop_task(destination);
-        }
-
         let dest_path = self.base_path.join(destination);
+        let source_exists = src_path.is_dir();
 
-        match scope {
-            None => {
-                std::fs::create_dir_all(&dest_path)?;
-                copy_dir_recursive(&src_path, &dest_path)?;
-            }
-            Some(scopes) => {
-                self.create_tenant(destination)?;
-                for s in scopes {
-                    let filename = match s.as_str() {
-                        "settings" => "settings.json",
-                        "synonyms" => "synonyms.json",
-                        "rules" => "rules.json",
-                        _ => continue,
-                    };
-                    let src_file = src_path.join(filename);
-                    if src_file.exists() {
-                        std::fs::copy(&src_file, dest_path.join(filename))?;
+        // Acquire both admission fences in name order. This makes reverse copies
+        // (A->B and B->A) converge on the same lock order instead of deadlocking.
+        let mut participants = vec![destination.to_string()];
+        if source_exists {
+            participants.push(source.to_string());
+        }
+        participants.sort();
+        participants.dedup();
+        let mut quiesce_guards = Vec::with_capacity(participants.len());
+        for participant in participants {
+            quiesce_guards.push(self.quiesce_tenant(&participant).await?);
+        }
+
+        let target = PublicationTarget::new(destination)?;
+        let publication = PreStagedPublication::prepare(&self.base_path, target)?;
+        let staging_path = publication.paths().staging.clone();
+
+        let staging_result = (|| -> Result<()> {
+            match scope {
+                None if source_exists => copy_dir_recursive(&src_path, &staging_path)?,
+                None => {
+                    drop(initialize_new_tenant_tree(&staging_path)?);
+                }
+                Some(scopes) => {
+                    if dest_path.is_dir() {
+                        copy_dir_recursive(&dest_path, &staging_path)?;
+                    } else {
+                        drop(initialize_new_tenant_tree(&staging_path)?);
                     }
+                    apply_scoped_index_copy(
+                        source_exists.then_some(src_path.as_path()),
+                        &staging_path,
+                        scopes,
+                    )?;
                 }
             }
+            Ok(())
+        })();
+
+        if let Err(staging_error) = staging_result {
+            return match publication.abort() {
+                Ok(()) => Err(staging_error),
+                Err(cleanup_error) => Err(FlapjackError::Io(format!(
+                    "copy staging failed: {staging_error}; staging cleanup failed: {cleanup_error}"
+                ))),
+            };
         }
+
+        publication
+            .activate()
+            .map_err(pre_staged_activation_error)?;
+        self.clear_tenant_runtime_state(&destination.to_string());
+        drop(quiesce_guards);
 
         self.make_noop_task(destination)
     }
@@ -1299,6 +1320,49 @@ impl super::IndexManager {
             ))
         })?
     }
+}
+
+/// Build every required artifact for a new tenant before callers publish it.
+///
+/// This is shared by ordinary creation and copy publication so neither path can
+/// expose an index that lacks settings, metadata, or its committed watermark.
+fn initialize_new_tenant_tree(path: &Path) -> Result<Arc<Index>> {
+    std::fs::create_dir_all(path)?;
+    let schema = crate::index::schema::Schema::builder().build();
+    let index = Arc::new(Index::create(path, schema)?);
+    IndexSettings::default().save(path.join("settings.json"))?;
+    crate::index::index_metadata::IndexMetadata::load_or_create(path)?;
+    write_committed_seq(path, 0)?;
+    Ok(index)
+}
+
+/// Overlay selected Algolia configuration scopes in an unpublished tenant tree.
+/// A missing source represents an empty/default index, so selected resources are
+/// reset rather than accidentally preserving the destination's old value.
+fn apply_scoped_index_copy(source: Option<&Path>, staging: &Path, scopes: &[String]) -> Result<()> {
+    for scope in scopes {
+        let filename = match scope.as_str() {
+            "settings" => "settings.json",
+            "synonyms" => "synonyms.json",
+            "rules" => "rules.json",
+            _ => continue,
+        };
+        let staged_file = staging.join(filename);
+        let source_file = source.map(|root| root.join(filename));
+
+        if let Some(source_file) = source_file.filter(|path| path.is_file()) {
+            std::fs::copy(source_file, staged_file)?;
+        } else if scope == "settings" {
+            IndexSettings::default().save(staged_file)?;
+        } else {
+            match std::fs::remove_file(staged_file) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn replace_directory(source: &Path, destination: &Path) -> Result<()> {

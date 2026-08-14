@@ -7,6 +7,17 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.13] - 2026-08-14
+
+### Added
+
+- **Paid Beta v1 deployments can opt into an exact customer data-plane profile.**
+  `FLAPJACK_API_PROFILE=paid_beta_v1` keeps authenticated administration and replication
+  behavior intact while limiting direct customer credentials to the literal Algolia batch-search
+  route, a closed request schema, and one exactly scoped physical index. Unknown profiles,
+  authentication-disabled startup, unpublished customer routes, unsupported parameters, and
+  invalid or over-broad credentials fail closed. The default profile remains `full`.
+
 ## [1.0.12] - 2026-08-12
 
 ### Added

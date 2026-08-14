@@ -89,6 +89,7 @@ fn build_test_router_with_dashboard_policy(
             cors_mode: crate::startup::CorsMode::LoopbackOnly,
             disable_dashboard,
             replication_api_key: None,
+            api_profile: crate::api_profile::ApiProfile::Full,
         },
     )
 }
@@ -185,6 +186,7 @@ fn build_no_auth_router_for_state(
             cors_mode: crate::startup::CorsMode::LoopbackOnly,
             disable_dashboard: false,
             replication_api_key: None,
+            api_profile: crate::api_profile::ApiProfile::Full,
         },
     )
 }
@@ -215,6 +217,7 @@ fn build_auth_router_for_state(
             cors_mode: crate::startup::CorsMode::LoopbackOnly,
             disable_dashboard: false,
             replication_api_key: None,
+            api_profile: crate::api_profile::ApiProfile::Full,
         },
     )
 }

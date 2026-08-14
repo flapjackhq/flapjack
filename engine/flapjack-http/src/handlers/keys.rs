@@ -120,7 +120,20 @@ pub async fn create_key(
 
     let key = body.into_api_key();
     let description = key.description.clone();
-    let (created, plaintext_value) = key_store.create_key(key);
+    let (created, plaintext_value) = match key_store.try_create_key(key) {
+        Ok(created) => created,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to persist created API key");
+            emit_admin_action(
+                Actor::admin_api_key(),
+                Action::CreateKey,
+                Target::api_key_collection(),
+                Outcome::Failure,
+                Some("persistence_failed"),
+            );
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error");
+        }
+    };
 
     notify_key_lifecycle(&description, "created");
 
@@ -212,8 +225,8 @@ pub async fn update_key(
 
     let updated = body.into_api_key();
 
-    match key_store.update_key(&key_value, updated) {
-        Some(_) => {
+    match key_store.try_update_key(&key_value, updated) {
+        Ok(Some(_)) => {
             emit_admin_action(
                 Actor::admin_api_key(),
                 Action::UpdateKey,
@@ -227,7 +240,7 @@ pub async fn update_key(
             })
             .into_response()
         }
-        None => {
+        Ok(None) => {
             emit_admin_action(
                 Actor::admin_api_key(),
                 Action::UpdateKey,
@@ -236,6 +249,17 @@ pub async fn update_key(
                 Some("key_not_found"),
             );
             json_error(StatusCode::NOT_FOUND, "Key not found")
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "failed to persist updated API key");
+            emit_admin_action(
+                Actor::admin_api_key(),
+                Action::UpdateKey,
+                Target::api_key_fingerprint(&key_value),
+                Outcome::Failure,
+                Some("persistence_failed"),
+            );
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
         }
     }
 }
@@ -277,29 +301,43 @@ pub async fn delete_key(
         .map(|k| k.description.clone())
         .unwrap_or_default();
 
-    if key_store.delete_key(&key_value) {
-        emit_admin_action(
-            Actor::admin_api_key(),
-            Action::DeleteKey,
-            Target::api_key_fingerprint(&key_value),
-            Outcome::Success,
-            None,
-        );
-        notify_key_lifecycle(&description, "deleted");
+    match key_store.try_delete_key(&key_value) {
+        Ok(true) => {
+            emit_admin_action(
+                Actor::admin_api_key(),
+                Action::DeleteKey,
+                Target::api_key_fingerprint(&key_value),
+                Outcome::Success,
+                None,
+            );
+            notify_key_lifecycle(&description, "deleted");
 
-        Json(DeleteKeyResponse {
-            deleted_at: current_timestamp(),
-        })
-        .into_response()
-    } else {
-        emit_admin_action(
-            Actor::admin_api_key(),
-            Action::DeleteKey,
-            Target::api_key_fingerprint(&key_value),
-            Outcome::Failure,
-            Some("key_not_found"),
-        );
-        json_error(StatusCode::NOT_FOUND, "Key not found")
+            Json(DeleteKeyResponse {
+                deleted_at: current_timestamp(),
+            })
+            .into_response()
+        }
+        Ok(false) => {
+            emit_admin_action(
+                Actor::admin_api_key(),
+                Action::DeleteKey,
+                Target::api_key_fingerprint(&key_value),
+                Outcome::Failure,
+                Some("key_not_found"),
+            );
+            json_error(StatusCode::NOT_FOUND, "Key not found")
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "failed to persist deleted API key");
+            emit_admin_action(
+                Actor::admin_api_key(),
+                Action::DeleteKey,
+                Target::api_key_fingerprint(&key_value),
+                Outcome::Failure,
+                Some("persistence_failed"),
+            );
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+        }
     }
 }
 
@@ -323,8 +361,8 @@ pub async fn restore_key(
     State(key_store): State<Arc<KeyStore>>,
     Path(key_value): Path<String>,
 ) -> impl IntoResponse {
-    match key_store.restore_key(&key_value) {
-        Some(_) => {
+    match key_store.try_restore_key(&key_value) {
+        Ok(Some(_)) => {
             emit_admin_action(
                 Actor::admin_api_key(),
                 Action::RestoreKey,
@@ -338,7 +376,7 @@ pub async fn restore_key(
             })
             .into_response()
         }
-        None => {
+        Ok(None) => {
             emit_admin_action(
                 Actor::admin_api_key(),
                 Action::RestoreKey,
@@ -347,6 +385,17 @@ pub async fn restore_key(
                 Some("key_not_found"),
             );
             json_error(StatusCode::NOT_FOUND, "Key not found")
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "failed to persist restored API key");
+            emit_admin_action(
+                Actor::admin_api_key(),
+                Action::RestoreKey,
+                Target::api_key_fingerprint(&key_value),
+                Outcome::Failure,
+                Some("persistence_failed"),
+            );
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
         }
     }
 }

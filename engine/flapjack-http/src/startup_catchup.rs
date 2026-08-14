@@ -178,7 +178,10 @@ pub async fn run_periodic_catchup(state: Arc<AppState>) {
 /// Spawn a background task that runs catch-up from peers on a timer.
 /// This is the P0 fix for network partition recovery without restart.
 /// Configurable via FLAPJACK_SYNC_INTERVAL_SECS (default 60).
-pub fn spawn_periodic_sync(state: Arc<AppState>, interval_secs: u64) {
+pub fn spawn_periodic_sync(
+    state: Arc<AppState>,
+    interval_secs: u64,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
         // If a sync cycle runs longer than the interval, skip missed ticks
@@ -191,7 +194,7 @@ pub fn spawn_periodic_sync(state: Arc<AppState>, interval_secs: u64) {
             tracing::debug!("[REPL-sync] Periodic sync starting");
             run_periodic_catchup(Arc::clone(&state)).await;
         }
-    });
+    })
 }
 
 /// Core catch-up logic shared by startup and periodic sync.

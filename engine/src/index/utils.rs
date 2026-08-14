@@ -305,6 +305,31 @@ mod tests {
     }
 
     #[test]
+    fn atomic_write_preserves_live_file_when_publication_hook_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(&path, b"known-good").unwrap();
+
+        let error = atomic_write_with(
+            &path,
+            |file| file.write_all(b"replacement"),
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected before-rename failure",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(&path).unwrap(), b"known-good");
+        assert!(fs::read_dir(dir.path())
+            .unwrap()
+            .all(|entry| !is_temporary_entry(&entry.unwrap().path())));
+    }
+
+    #[test]
     fn atomic_write_cleans_up_after_rename_failure() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");

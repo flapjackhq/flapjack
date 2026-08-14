@@ -59,6 +59,7 @@ fn build_test_router_with_state_for_data_dir(
             cors_mode: CorsMode::LoopbackOnly,
             disable_dashboard: false,
             replication_api_key: None,
+            api_profile: crate::api_profile::ApiProfile::Full,
         },
     );
 
@@ -143,6 +144,7 @@ fn test_router_with_resource_bounds(
             cors_mode: CorsMode::LoopbackOnly,
             disable_dashboard: false,
             replication_api_key: None,
+            api_profile: crate::api_profile::ApiProfile::Full,
         },
         resource_bounds,
     );

@@ -26,6 +26,12 @@ fn readiness_service_unavailable() -> HandlerError {
 pub async fn ready(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, HandlerError> {
+    let failed_tasks = state.background_task_health.failed_tasks();
+    if !failed_tasks.is_empty() {
+        tracing::warn!(tasks = ?failed_tasks, "readiness probe found exited background tasks");
+        return Err(readiness_service_unavailable());
+    }
+
     let visible_tenants = visible_tenant_dir_names(&state.manager.base_path).map_err(|error| {
         tracing::warn!(
             "readiness probe failed to inspect tenant dirs at {:?}: {}",
@@ -98,6 +104,29 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, serde_json::json!({ "ready": true }));
+    }
+
+    #[tokio::test]
+    async fn ready_returns_unavailable_after_a_background_task_exits() {
+        let tmp = TempDir::new().unwrap();
+        let state = TestStateBuilder::new(&tmp).build_shared();
+        state
+            .background_task_health
+            .record_exit_for_test("analytics-flush");
+        let app = Router::new()
+            .route("/health/ready", get(ready))
+            .with_state(state);
+
+        let (status, body) = readiness_response_json(app).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "message": "Service unavailable",
+                "status": 503
+            })
+        );
     }
 
     #[tokio::test]

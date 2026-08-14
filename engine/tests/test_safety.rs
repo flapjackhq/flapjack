@@ -681,6 +681,9 @@ mod memory_safety {
                     300,
                 )),
             ),
+            background_task_health: Arc::new(
+                flapjack_http::background_tasks::BackgroundTaskHealth::default(),
+            ),
         });
 
         let health_route =

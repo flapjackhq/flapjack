@@ -2,6 +2,7 @@ use super::{
     bootstrap_join_with_client, build_bootstrap_http_client, merge_bootstrap_membership,
     resolve_advertised_origin,
 };
+use crate::api_profile::ApiProfile;
 use crate::startup::{acquire_data_dir_process_lock, ServerConfig};
 use crate::test_helpers::{EnvVarRestoreGuard, ENV_MUTEX};
 use flapjack::index::oplog::OpLogEntry;
@@ -30,6 +31,7 @@ fn server_config_for_data_dir(
     ServerConfig {
         env_mode: "development".to_string(),
         no_auth: false,
+        api_profile: ApiProfile::Full,
         disable_dashboard: false,
         allow_no_auth_public_bind: false,
         admin_key_env: Some("admin-secret".to_string()),
@@ -513,49 +515,53 @@ async fn bootstrap_join_fails_loudly_for_unreachable_or_self_only_peer() {
     assert!(self_only.contains("no remote members"));
 }
 
-#[tokio::test]
-async fn bootstrap_join_rejects_conflicting_addresses_and_blank_ids() {
-    let conflict = bootstrap_error_from_responses(vec![
-        (200, "{}".to_string()),
-        (
-            200,
-            serde_json::json!({
-                "node_id": "bootstrap-a",
-                "replication_enabled": true,
-                "peers": [{
-                    "peer_id": "bootstrap-a",
-                    "addr": "http://different-bootstrap.example.com:7700",
-                    "status": "healthy",
-                    "last_success_secs_ago": 0
-                }]
-            })
-            .to_string(),
-        ),
-    ])
-    .await;
+#[test]
+fn bootstrap_join_rejects_conflicting_addresses_and_blank_ids() {
+    // Membership validation is pure. Keep these malformed-topology contracts
+    // independent of sockets and process-global cleartext transport policy.
+    let config = bootstrap_node_config("https://bootstrap.example.com:7700".to_string());
+    let conflict_status = serde_json::from_value(serde_json::json!({
+        "node_id": "bootstrap-a",
+        "replication_enabled": true,
+        "peers": [{
+            "peer_id": "bootstrap-a",
+            "addr": "https://different-bootstrap.example.com:7700",
+            "status": "healthy",
+            "last_success_secs_ago": 0
+        }]
+    }))
+    .expect("conflicting membership fixture should deserialize");
+    let conflict = merge_bootstrap_membership(
+        &config,
+        "https://bootstrap.example.com:7700",
+        conflict_status,
+    )
+    .expect_err("one node ID with two addresses must be rejected");
 
-    assert!(conflict.contains("conflicting addresses"));
+    assert!(
+        conflict.contains("conflicting addresses"),
+        "unexpected bootstrap conflict error: {conflict}"
+    );
 
-    let blank_id = bootstrap_error_from_responses(vec![
-        (200, "{}".to_string()),
-        (
-            200,
-            serde_json::json!({
-                "node_id": "bootstrap-a",
-                "replication_enabled": true,
-                "peers": [{
-                    "peer_id": "  ",
-                    "addr": "http://node-c.example.com:7700",
-                    "status": "healthy",
-                    "last_success_secs_ago": 0
-                }]
-            })
-            .to_string(),
-        ),
-    ])
-    .await;
+    let blank_status = serde_json::from_value(serde_json::json!({
+        "node_id": "bootstrap-a",
+        "replication_enabled": true,
+        "peers": [{
+            "peer_id": "  ",
+            "addr": "https://node-c.example.com:7700",
+            "status": "healthy",
+            "last_success_secs_ago": 0
+        }]
+    }))
+    .expect("blank-node membership fixture should deserialize");
+    let blank_id =
+        merge_bootstrap_membership(&config, "https://bootstrap.example.com:7700", blank_status)
+            .expect_err("blank peer node IDs must be rejected");
 
-    assert!(blank_id.contains("blank node_id"));
+    assert!(
+        blank_id.contains("blank node_id"),
+        "unexpected blank-node error: {blank_id}"
+    );
 }
 
 #[test]

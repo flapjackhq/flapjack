@@ -263,7 +263,7 @@ impl VectorIndex {
         };
         let meta_json = serde_json::to_string_pretty(&meta)
             .map_err(|e| VectorError::SerializationError(e.to_string()))?;
-        std::fs::write(dir.join("id_map.json"), meta_json)?;
+        crate::index::atomic_write_file(&dir.join("id_map.json"), meta_json.as_bytes())?;
 
         Ok(())
     }

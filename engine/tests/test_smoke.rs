@@ -384,6 +384,9 @@ async fn smoke_internal_endpoint() {
         idempotency_cache: std::sync::Arc::new(flapjack_http::idempotency::IdempotencyCache::new(
             std::time::Duration::from_secs(300),
         )),
+        background_task_health: std::sync::Arc::new(
+            flapjack_http::background_tasks::BackgroundTaskHealth::default(),
+        ),
     });
 
     let internal = Router::new()
@@ -498,6 +501,9 @@ mod cors {
                 flapjack_http::idempotency::IdempotencyCache::new(std::time::Duration::from_secs(
                     300,
                 )),
+            ),
+            background_task_health: Arc::new(
+                flapjack_http::background_tasks::BackgroundTaskHealth::default(),
             ),
         });
 

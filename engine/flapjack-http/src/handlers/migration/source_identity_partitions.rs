@@ -1,5 +1,4 @@
 //! Bounded source identity partitioning contract.
-#![allow(dead_code)]
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -76,6 +75,7 @@ impl SourceIdentityConfig {
         Ok(config)
     }
 
+    #[cfg(test)]
     pub(super) fn for_test(
         spool_root: &Path,
         budget_bytes: usize,
@@ -87,10 +87,6 @@ impl SourceIdentityConfig {
             certified_max_items,
             spool_root_ownership: SpoolRootOwnership::CallerProvided,
         }
-    }
-
-    pub(super) fn max_resident_bytes(&self) -> usize {
-        self.budget_bytes
     }
 
     pub(super) fn validate(&self) -> Result<(), SourceIdentityError> {
@@ -173,6 +169,7 @@ impl SourceIdentityPartitions {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn partition_count(&self) -> u32 {
         self.partition_count
     }
@@ -352,10 +349,12 @@ pub(super) struct SourceIdentityOutcome {
 }
 
 impl SourceIdentityOutcome {
+    #[cfg(test)]
     pub(super) fn max_resident_bytes_observed(&self) -> usize {
         self.max_resident_bytes_observed
     }
 
+    #[cfg(test)]
     pub(super) fn max_resident_tuples_observed(&self) -> usize {
         self.max_resident_tuples_observed
     }
@@ -506,12 +505,14 @@ impl PartialEq for SourceIdentityError {
 
 impl Eq for SourceIdentityError {}
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SourceIdentityReceipt {
     pub(super) version: SourceIdentityVersion,
     pub(super) digest: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum IdentityComparisonError {
     VersionMismatch {
@@ -521,6 +522,7 @@ pub(super) enum IdentityComparisonError {
     DigestMismatch,
 }
 
+#[cfg(test)]
 pub(super) fn compare_receipt(
     receipt: &SourceIdentityReceipt,
     current: &SourceIdentityOutcome,

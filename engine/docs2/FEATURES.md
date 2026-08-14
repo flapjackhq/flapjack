@@ -1,274 +1,20 @@
-# Flapjack Shipped Product Status
+# Flapjack Shipped Capabilities
 
-Canonical shipped capability and production-readiness snapshot for Flapjack.
-Open and future work is owned only by [`ROADMAP.md`](../../ROADMAP.md).
+This document owns current shipped product capabilities and their limitations.
+It deliberately does not own strategy, live work, release history, or test policy:
 
-**Last updated: 2026-08-13.** Published v1.0.12 includes the combined integration adds a closed, executable bounded-ingress
-contract to the already-shipped Events / Insights API. Tenant authorization remains enforced; the configured
-allowance accepts exactly two requests, the first excess request returns exact HTTP 429, and the rejected
-event appears in neither debug output nor analytics. The synchronized owners are
-`engine/tests/test_tenant_isolation.rs` and `engine/tests/events_rate_limit_http_probe.sh`; the complete
-tenant-isolation target is now 11 passed / 0 failed. **Bounded ingress closed 2026-08-12 as `SEC-EVENTS-2`.**
-The existing shared limiter was sufficient, so no production limiter/code repair was required. This work is published in v1.0.12; release history remains owned by `CHANGELOG.md`.
-`TEST-FLAKE-1` remains open: its signal-based repair and three later specimen passes are real, the historical
-deterministic pre-fix reproducer is absent, and the disposition remains `keep_open`. *The 2026-08-10 entry
-follows for historical context.*
+- [`PROJECT_OVERVIEW.md`](../../PROJECT_OVERVIEW.md) owns mission and strategic priority.
+- The private development repository's Beads ledger (`.beads/`) is the only live-work ledger.
+- [`CHANGELOG.md`](../../CHANGELOG.md) owns release history.
+- [`1_STRATEGY/TESTING.md`](1_STRATEGY/TESTING.md) owns test policy and current test commands.
 
-**Last updated: 2026-08-10 evening.** **No product capability shipped in the 36 hours to this entry, and
-the headline claim in the 2026-08-09 entry below has since been falsified by measurement.** Four things
-are true right now and each was measured, not recalled. **(1) The staging scheduled nightly green did NOT
-recur.** The 2026-08-08 `success` was real, but the two scheduled runs after it — 2026-08-09 and
-2026-08-10 — both concluded `failure`, as did a 2026-08-09 dispatch. The 2026-08-10 failure is one job,
-`Rust all tests`, on one test:
-`ledger_closed_row_consistency_test::no_closed_roadmap_row_is_still_listed_as_open_work`, reporting two
-findings that are both the closed row `TEST-FLAKE-2` still named as open work. **That is a
-documentation-consistency gate, not a product defect, and it is already green on `main`** (4 passed
-locally) — it was repaired on 2026-08-09, four hours *after* the staging mirror was published at its
-pinned source SHA. Staging has therefore been red for two nights on a defect this repository fixed two
-days ago; the repair reaches it through a sync, not through code. **(2) Mirror lag grew on both sides:**
-staging `70`, prod `591` with `0/8` workflow exports — the `539` and `484` figures earlier entries carry
-are superseded. Prod's scheduled nightly streak is now **34** consecutive failures (2026-07-08 through
-2026-08-10), not the 31 the ledger states. **(3) The full-workspace `nextest` liveness red is diagnosed
-and it is NOT a product defect.** Under a matched 18-way/12-way admission experiment at one tree, the
-specimen's `RequestStart` p99 is **0 ms** while its `ScheduledDeadline` p99 is 278–430 ms: once a request
-starts it is served instantly, and the tail is time spent waiting for a Tokio worker on an oversubscribed
-host. The repair is in flight and unmerged. **(4) Two consecutive measurement lanes produced VOID
-results** — see `Testing & Quality Assurance`. **One previously-untracked launch blocker is filed in this
-entry rather than left in a handoff:** `/1/events` and `/1/events/debug` require only the `search` ACL and
-their handlers receive no key extension at all, so a browser-embedded search key can write events tagged
-with any index and read every tenant's buffered events including `user_token`. It is now `PR-17` in
-Tier 1 and `SEC-EVENTS-1` in [`ROADMAP.md`](../../ROADMAP.md). Nobody is exposed today because nobody runs
-Flapjack; it must be closed before anyone can be asked to. **Superseded later the same evening: the repair
-landed at `561cce36b` and `SEC-EVENTS-1` closed 2026-08-10** — see the `PR-17` Tier 1 row and the
-`Insights-route tenant authorization` security row, both now recording the close. The customer-ingress
-abuse-rate contract was still open on 2026-08-10; the later 2026-08-12 local close supersedes that historical
-state. *2026-08-09 entry follows, still accurate for
-its own subject except where the four findings above supersede it.*
-
-**Last updated: 2026-08-09.** Three things shipped since the 2026-08-07 entry below, and none of them
-is a new product capability — all three are distribution or proof surfaces, which is what
-[`PROJECT_OVERVIEW.md`](../../PROJECT_OVERVIEW.md) says the remaining work is. **(1) The Go SDK's
-credential leak is fixed for consumers.** `github.com/flapjackhq/flapjack-search-go/v4` `v4.0.1` is
-published with `v4.0.0` retracted; a clean-room `go get @latest` resolves `v4.0.1`, and a
-request-counting proof observed two Flapjack hosts and **zero** Algolia host attempts. Three GitHub
-Security Advisories are published (`GHSA-jc2w-7wq6-r5w7` Go, `GHSA-jhcc-64c6-pfq2` Python,
-`GHSA-q67x-w5fw-5mw2` Ruby). **The PyPI and RubyGems packages are still unfixed and still leak** —
-read the SDK table's published-artifact rows below, not the per-language smoke-test rows, before
-telling anyone a language is safe. **(2) The in-process workspace union is now a recurring CI reader**
-(`.github/workflows/union.yml`, scheduled 06:00 UTC), so the ~2.5-hour `cargo test --workspace` that
-only ever ran on one contended developer Mac runs on a free runner instead. **(3) The dashboard
-join manifest has a wired validator** (`npm run check:join-manifest`, run by `ci.yml`'s
-`dashboard-build` job). **One gate is red at the time of writing:** the full-workspace
-`cargo nextest run --workspace` fails one load-sensitive specimen,
-`flapjack-http::write_runtime_isolation::single_worker_runtime_serves_count_during_injected_two_second_commit`
-— see **Testing & Quality Assurance** below. Mirror parity is unchanged for prod: staging carries
-this state, prod does not. *2026-08-07 entry follows, still current for its own subject:* **The console now migrates from all three source providers,
-offers a translation-report dry-run before any write, and that whole flow is browser-proven** — locally
-against real containerised sources and, for the first time, remotely on Linux CI. `engine/dashboard/src/pages/migrateHelpers.ts`
-carries a three-entry `MIGRATION_PROVIDER_DESCRIPTORS` array (`algolia`, `meilisearch`, `typesense`) driving
-discovery, submit and polling against the real `/1/migrations/{provider}` routes; `Migrate.tsx`'s
-`useMigrationPreview` and the `migration-preview-trigger` surface in `MigrateSections.tsx` render the
-translation report before any write path opens, share one request builder with submit, reset on any
-form-changing edit, and **gate submit on `hardRejections === 0`**. Measured, not asserted: the targeted
-three-provider browser run exits `0` with **21 passed**, each provider driving discovery → preview → submit →
-terminal success → browse → served search; the full `e2e-ui` suite exits `0` at **411 passed, 5 skipped**
-with every skip attributed and none on a migration path; the 390px route audit passes 3 over 23 routes; and
-the SSRF-refusal path passes 4, naming the opt-in rather than showing a generic error. Falsifiability was
-demonstrated by changing one expected summary count and taking the red. **This is a capability neither
-competitor's console has** — verified externally 2026-08-06: Typesense Cloud's dashboard has no
-collection-import feature at all, and Meilisearch's Algolia-migration guide hands you a record loop to write
-yourself; neither offers a dry-run. `ROADMAP.md` row `MIG-21` closed on this evidence.
-
-**The shipped-profile backend defect underneath it is repaired.** Release binaries previously compiled the
-Meilisearch and Typesense loopback admission seams out, so the opt-ins the console tells self-hosting users
-to set had no effect in a released binary. Both providers now use the same production-first,
-explicit-loopback-fallback admission shape in debug *and* release.
-`engine/tests/migration_release_loopback_contract.sh` builds and runs a `--release` server and passes
-**26/26 arms twice** — 4 positive, 14 enabled-endpoint refusals, and 8 disabled/wrong-value arms that assert
-**zero source requests and zero DNS resolutions**, so the fail-closed default is proven by absence of traffic
-rather than only by an error string. Mutation red was taken through the production admission owner.
-**That contract now runs in a recurring gate, as of 2026-08-07** — `.github/workflows/nightly.yml:242` runs it in
-the scheduled `migration-import-contract` job, alongside a release-profile constructor test, with
-`engine/tests/migration_release_loopback_recurring_gate_test.rs` reding if the invocation is removed. `nightly.yml`
-was chosen over widening the developer flag set because the contract's measured wall-clock is `171.13`s cold and it
-starts Docker containers. This supersedes the standing residual here, which said the contract was an explicit
-`engine/_dev/s/test --migration-release-loopback` selector absent from `--all`, `--ci`, and every workflow.
-**`ROADMAP.md` row `MIG-22` closed 2026-08-10 on both clauses.**
-Clause (1), the recurring gate, is **met**: `.github/workflows/nightly.yml:242` runs
-`engine/tests/migration_release_loopback_contract.sh` in the scheduled `migration-import-contract`
-job, measured at 171.13 s cold, with `engine/tests/migration_release_loopback_recurring_gate_test.rs`
-reding if that invocation is removed. Clause (2) — the console migration's joined proof keys
-`P30`/`P31` — was **retired explicitly on 2026-08-10 rather than met**, because its declared closing
-partner evaporated: it was to close alongside `JOIN-1`, and `JOIN-1` was retargeted 2026-08-08 away
-from producing any numerator, so the aggregate join-report is no longer a valid owner. The capability
-the clause protected is covered by the shipped-profile contract above, re-measured 2026-08-10 at
-**26/26 arms, exit 0, 488 s wall clock**, whose four positive arms drive discovery, submit, terminal
-polling, acknowledgement, and landed search for both providers against a real containerised source on
-a `--release` binary. The browser half of that story closed under `MIG-21` on 2026-08-07 and is not
-re-derived here. **Do not satisfy or revive this by re-running the join proof, and do not read the
-retirement as claiming a new joined-proof numerator** — none is claimed.
-
-**`v1.0.11` published 2026-08-06** — the first release since 2026-06-09 and the first time any engine change
-reaches a user by either the OSS installer or the Flapjack Cloud engine AMI, which bakes from the same
-published archive and manifest. Also landed since the last revision: `flapjack migrate preview` reaching the
-CLI for all three source providers (`MIG-20`) with live Meilisearch preview (`MIG-15`); one canonical durable-writer/atomic-write
-owner with per-writer snapshot exclusion (`DUR-3`); a `Content-Length` pre-check that refuses an over-cap
-bulk-replace upload with `413` before the spool is touched (`MIG-18`); deletion of the plaintext tarball
-snapshot helpers, leaving `FLAPJACK_SNAPSHOT_KEY_FILE` / `FJSNAPE1` as the single snapshot-encryption scheme
-(`SEC-G5`); and the loadtest readiness ownership guard reaching every live caller (`PL-15`). Static PEM
-startup, ACME-backed hot rotation, mandatory replication-peer credentials, and credentialed-cleartext refusal
-remain shipped. The React dashboard remains the shipping UI and must still receive fixes, but new routes are
-frozen while ADR 0006's Svelte console proceeds toward a parity-gated cutover; shipped capability in this
-tree is not evidence that the replacement decision was superseded.
-
-**A full `Nightly Tests` run went green on 2026-08-07 for the first time since 2026-07-07 — and it was a
-manual dispatch, not a scheduled run, which is the only reading this file will support.** Staging run
-`31213162105` at mirror SHA `23c15008b`, the first carrying every landed repair, concluded `success` on
-**all 36 jobs**, with only the capability-gated `Migration scale contract` skipped. Its `event` is
-`workflow_dispatch`; the two most recent `event=schedule` runs both failed, so **the 31-run scheduled
-streak is unbroken and nothing here may be read as "the nightly is green"**. What it does prove is that
-every repair works together on Linux CI. Separately, staging *push* CI at that identical SHA is red on
-three jobs — two dashboard jobs missing a backend env export and one duplicated workflow step — tracked as
-`ROADMAP.md` row `CI-STAGING-1`; that red is a harness defect, not a product defect.
-
-**Prior context, still accurate:**
-The first nightly run on either mirror carrying every landed repair (staging `31176417863` at mirror SHA
-`1db1f8dcb`) returned **410 passed, 1 failed**, with `cluster_peers.spec.ts` and `vector-settings.spec.ts`
-both green. The single remaining failure is a Linux-only fixture-teardown defect: `source_provider_fixture_ctl.sh
-down typesense` cannot `rm -rf` root-owned container files, a boundary macOS never exercises. **The prod
-mirror has not received the repairs at all** — its head predates them and its workflows carry none of the
-four backend-start environment exports the fix adds — so a red prod night is currently evidence about the
-sync, not about the code. See `ROADMAP.md` rows `NIGHT-1` and `SYNC-1`. Nothing in this file should be read
-as carrying current *prod* nightly proof. Open work remains canonical in [`ROADMAP.md`](../../ROADMAP.md).
-
-- 2026-05-31 stage note: `FLAPJACK_WRITE_QUEUE_BATCH_SIZE` is now runtime-configurable with default-preserving behavior (`32` fallback). See [`3_IMPLEMENTATION/OPS_CONFIGURATION.md`](3_IMPLEMENTATION/OPS_CONFIGURATION.md) for full operator semantics.
-
-- **Backend API:** 197/197 complete (as of 2026-03-13). The full parity verification is retained in the dev repo's internal audit history.
-- **Dashboard UI:** `dashboard/src/App.tsx` defines 24 derived user-facing route patterns from 24 raw `path=` attributes and two attribute-less index routes, backed by 22 lazy page components; the wildcard has no lazy component and `Overview` serves two patterns. No scaffolded stubs remain.
-- **E2E Browser Tests:** The `JOIN-1` denominator is manifest-derived rather than recalled: **96 backend rows, 69 dashboard routes, 65 joinable rows, and 34 proof keys, with 0 unresolved mappings**. **Updated 2026-08-08: `JOIN-1` is OPEN and RETARGETED — there is no joined-proof numerator and none is being produced**, because ADR 0006 deletes this tree at cutover. The manifest survives as the console port map and now has a wired validator (`npm run check:join-manifest`, green at `96 checked / 90 resolved / 0 mismatched / 6 shape-exempt`, run by `ci.yml`'s `dashboard-build`). The `59 / 59` numerator and the `61` rows / `30` keys figures this bullet used to carry are superseded — **do not copy `59`, `61`, or `65` forward as a numerator**, do not read the absence of one as a failing score, and a capability-gated skip is never counted toward one. Historical subset-proxy attribution (60 passed / 1 red / 0 skipped / 4 not-run over 65 joinable rows, with `P29`/`P34` not-run and `P35` red *inside the proxy*) is preserved in the 2026-08-07 `aug07_8pm_2` join-proof receipt, a dev-repo evidence artifact not cited by path here because it is outside the public sync surface. The closure predicate is canonical in [`ROADMAP.md`](../../ROADMAP.md) row `JOIN-1`; the spec-file inventory and harness state are owned by the `E2E Browser Tests (Playwright)` section below.
-- **Tour Video Walkthroughs:** Removed 2026-07-30 — the system depended on an external tool at a local path that no longer exists and had been unrunnable since 2026-04-14. Dashboard end-to-end proof is the Playwright e2e-ui suite.
-- **Load & Stress Testing:** k6 suite in `engine/loadtest/` — smoke, search throughput, write throughput, mixed workload, spike, memory-pressure, plus the long-running `mixed-soak` / `write-soak` scenarios and `soak_proof.sh` restart harness. PL-10's post-fix 60-minute Stage 3 mixed-soak gate (run date 2026-05-27) is classified `failure`, while the public write contract remained intact (no write `5xx`, no unexpected write `4xx`). Keep detailed lane status in [`ROADMAP.md`](../../ROADMAP.md), with measured verdict/evidence paths retained in private stage artifacts. Large-dataset benchmarking (100k docs): deterministic generator (`generate_dataset.mjs`), import throughput (`import_benchmark.sh`), search latency by query type (`search_benchmark.sh`), k6 concurrent load (`benchmark_k6.sh`), and dashboard large-index perf test (`large-index-perf.spec.ts`).
-- **Architecture decisions:** `3_IMPLEMENTATION/decisions/active/`
-
-## Public Sync Lineage Ledger (Canonical)
-
-This is the detailed public-sync lineage ledger. Current strategic priority order is owned by [`PROJECT_OVERVIEW.md`](../../PROJECT_OVERVIEW.md), current open-work state is owned by [`ROADMAP.md`](../../ROADMAP.md), and release truth is owned by [`CHANGELOG.md`](../../CHANGELOG.md); v1.0.12, published 2026-08-13 by prod `release.yml` run `31667507360`, is the latest ship in the v1.0 line and supersedes v1.0.11 (2026-08-06). **Flapjack has no users and no customers** — see [`PROJECT_OVERVIEW.md`](../../PROJECT_OVERVIEW.md). Corrected 2026-08-03: this sentence previously overstated the release's commercial adoption.
-
-**Historical mirror snapshot, measured 2026-08-09 by `bash engine/_dev/s/mirror_lag_probe.sh` — never by a
-commit range, and never inferred from `.debbie.toml`.** This table preserves that dated measurement;
-[`ROADMAP.md`](../../ROADMAP.md) owns live mirror state. The two public mirrors were in very different
-states, and conflating them repeatedly produced false product verdicts:
-
-| Mirror | State | Consequence |
-|---|---|---|
-| `gridl-staging/flapjack` | **Published snapshot.** Published 2026-08-08 at pinned dev source `83234fa9c`; `workflow_exports=8/8`; lag reduced from 80 to 18. | Staging push CI and a **scheduled** staging nightly were green end to end, the latter being the first scheduled green anywhere since 2026-07-07. |
-| `flapjackhq/flapjack` (prod) | **Stale in this snapshot.** `dev_sha=1b32cf727`, lag `539`, `workflow_exports=0/8`. Byte-identical `dev_sha` before and after the 2026-08-08 publish attempt — prod was **not** mutated. | Prod CI and prod nightly were re-running a harness that was missing all eight `FLAPJACK_*` backend-start exports. **Their red was a stale-mirror artifact, not a product defect**, and must not be read as one: `ROADMAP.md` rows `NIGHT-1` and `CI-E2E-1` were both blocked on this sync and neither needed code. |
-
-The 2026-08-08 publish took its `no_publish` arm from a four-clause gate that recorded
-`a=true b=false c=false d=false`. **The refusal was the gate working**, and its two evaluable
-failures were a ledger-consistency assertion already repaired on dev at `a3bc39047` plus a charter
-that named a non-existent artifact — neither a product defect. Owner:
-[`ROADMAP.md`](../../ROADMAP.md) row `SYNC-1`. Every `debbie sync` and every publication requires
-explicit operator authorization; local branches, worktrees, validation, and dispatch do not.
-
-May 22 OSS polish wave status facts (lanes A-F) and the v1.0.3 public-beta cut remain canonical historical lineage in the existing rows below; they are preserved as lineage, not as the current release baseline.
-
-| Proof Item | Value |
-|---|---|
-| Canonical dev source for historical v1.0.3 wave | Commit `1111b` (v1.0.3 release cut lane) plus merged PL-14 fix surface `dbd78016` |
-| Staging publication | `ci.yml` green at HEAD for the v1.0.3 wave (see current production lane-state owner in `ROADMAP.md`) |
-| Prod publication | `ci.yml` green at HEAD for the v1.0.3 wave with release artifacts published on 2026-05-30 |
-| Release closeout channels | `github_release`, `binaries`, `ghcr_VERSION`, `ghcr_latest`, `mirror_ci`, `nightlies` |
-| Preserved cleanup lineage in prod history | Historical mar31/apr08/apr15 publication lineage remains preserved below; v1.0.3 is an additive release wave, not a history rewrite |
-| Non-pruned stale-file removals in public clones | No new stale-file removal axis introduced in v1.0.3; prior mar31/apr08/apr15 cleanup lineage remains authoritative |
-| Tracked-file audit outcome | v1.0.3 closure retained public-sync boundaries; no new blocker leaks surfaced in the published release wave |
-| Validator boundary contract | Public status/readiness detail ownership remains split: `FEATURES.md` for canonical snapshot, `PROJECT_OVERVIEW.md` for strategic priority order, and `ROADMAP.md` for live lane-state |
-| Local public validation before push | v1.0.3 release closure validated release assets/channels (`gh release`, GHCR multi-arch, nightly/staging/prod CI green lineage); release history now routes to `CHANGELOG.md` |
-| Known residual (out of scope for this wave) | v1.0.3 intentionally excludes post-tag `[Unreleased]` CLI flag/dispatch fixes that ship in the next release |
-
----
-
-## Griddle Launch Status (as of 2026-03-24)
-
-The original internal launch checklist is retained in the dev repo; the public outcome is summarized below.
-
-| Checklist Item | Status | Notes |
-|---|---|---|
-| GL-1 Replication peer auth | ✅ Done | `PeerClient` sends `x-algolia-api-key` + `x-algolia-application-id`; `/internal/*` remains admin-gated. |
-| GL-2 Replication catch-up on startup | ✅ Done | `startup_catchup.rs` — fetches missed ops from primary on boot before serving. |
-| GL-3 `restrictSources` enforcement | ✅ Done | CIDR/IP allow-list on API keys, fail-closed. Merged. |
-| GL-4 Metering agent integration | ✅ Done | `/internal/storage` and `/metrics` both require admin-key auth. `POST /internal/rotate-admin-key` supports runtime key rotation without restart. |
-| GL-5 Dictionaries multi-tenant fix | ✅ Done | Per-tenant stop words/plurals/compounds wired in backend and shipped in dashboard UI. |
-| GL-6 Dashboard feature completeness | ✅ Done | Dashboard route inventory shipped: 22 user-facing routes backed by 21 lazy-loaded page components, plus the not-found catch-all. Tour video acceptance suite now covers all 24 per-feature specs (01-24) with archived MP4 artifacts. Legacy root walkthrough covers all 21 pages at smoke level. |
-| GL-7 Griddle integration docs | ✅ Done | Canonical integration docs are maintained in `../../README.md` (quickstart + API flow), `3_IMPLEMENTATION/DEPLOYMENT.md` (deployment paths), and `../examples/ha-cluster/README.md` (HA proof). |
-| GL-8 Engine polish | ✅ Done | Stage 2 and Stage 3 follow-ups remain implemented: recommend env-var handling, virtual-replica validation/enforcement, and auth `restrictSources`/ACL hardening with tests. |
-| GL-9 OpenAPI spec completeness | ✅ Done | Stage 4/5 annotation work verified via both `openapi_export_tests` and `openapi::tests` for recommend/personalization/experiments. |
-
-### What "done" requires before CEO sign-off
-
-1. ~~**GL-4** lands~~ — ✅ Done (admin key rotation live, metering endpoints auth-gated)
-2. ~~**Chat/RAG dashboard page** — only remaining UI stub (backend ✅, UI shell still scaffolded)~~ — ✅ Done (`/index/:name/chat` shipped)
-3. ~~**Dashboard full E2E-UI stability** (per `BROWSER_TESTING_STANDARDS_2.md`) — latest standalone full run baseline is 318/320 passing; fix the two failing Overview analytics specs.~~ — ✅ Done (latest clean-head standalone browser full proof passed 320/320 at `10cc160`)
-4. `./s/test --all` green (~20 min full suite) after the dashboard full-suite stability pass. — ✅ Done: exact-HEAD wrapper verification passed on 2026-03-26 at commit `aa7dd7db61d7e274cdf946ac6dd7d7435c4dcdf4`, with all 14 sections green. That result is superseded historical evidence (2026-03-26), not present-tense status; the current dashboard composition result is recorded at the top of this file.
-
-## Open-Source Launch Readiness (as of 2026-04-01)
-
-| Item | Status | Session | Notes |
-|------|--------|---------|-------|
-| Post-merge regression validation | ✅ Done | mar22_1 | Full suite green; coverage verified |
-| End-to-end API smoke test (`integration_smoke.sh`) | ✅ Done | mar22_pm_3 | 513-line test covering 13 API categories |
-| HA + Docker deployment verified | ✅ Done | mar22_3 | Single-node, HA cluster, replication, S3 snapshot all tested |
-| Docs accuracy audit | ✅ Done | mar22_pm_2 | Full mechanical audit, dead links removed |
-| Performance benchmarks published | ✅ Done | mar22_2 | k6 baselines published in [`engine/loadtest/BENCHMARKS.md`](../loadtest/BENCHMARKS.md). |
-| `query-suggestions.spec.ts` full-suite status | ✅ Exact-HEAD wrapper green (superseded) | mar23_pm_1 + mar24_pm_1 + mar25_pm_12 | Exact-HEAD wrapper verification passed at commit `aa7dd7db`, with all 14 wrapper sections green. Superseded historical evidence (2026-03-26), not current status. |
-| CI org names fixed + smoke wired into CI | ✅ Done | mar23_pm_2 | Legacy org tokens → correct org names; `sleep 3` → `wait_for_flapjack.sh`; `integration-smoke` job added |
-| Systemd VPS deployment path | ✅ Done | mar23_pm_3 + mar23_pm_5 + stage_03 + stage_04 | Templates/docs landed in mar23; live VPS end-to-end verification completed on 2026-03-26. The validated contract included Linux ELF install, `EnvironmentFile=/etc/flapjack/env`, `systemctl enable --now`, public `/health` + `/health/ready`, manual restart, and SIGKILL recovery. |
-| README quickstart accuracy | ✅ Done | mar23_pm_3 | `/health/ready` docs fixed; quickstart curl commands updated with task-wait loop |
-| README screenshots (dash_overview, dash_search, dash_migrate_alg) | ✅ Done | mar23_pm_4 + mar24_pm_1 | Automation landed in mar23_pm_4; refreshed tracked PNGs were merged on 2026-03-25 alongside the screenshot-gated test flow. |
-| Repo URL + path hygiene | ✅ Done | mar24_pm_2 | README/show-HN/tour/deployment docs now point to the public repo or `<repo-root>` placeholders where appropriate, and deploy/sync helper scripts now resolve `origin` or repo root instead of hardcoded local paths. |
-| Test stability fixes (Recommendations + analytics-deep) | ✅ Done | mar23_pm_6 | Recommendations.test.tsx network-noise isolation; analytics-deep.spec.ts flexible assertion replacing California hardcode; bundler dedup verification script |
-| Post-merge regression validation (pm_1) | ✅ Done | mar26_pm_1 | Full suite green after am_1+am_2 merge. Green wrapper proof at `aa7dd7db` — superseded historical evidence (2026-03-26), not current suite status. |
-| Debbie sync config hardening | ✅ Done | mar26_pm_2 | Blacklist → whitelist `.debbie.toml`. Prevents leaking 60+ internal files to public repos. |
-| README & Show HN polish | ✅ Done | mar26_pm_3 | Stale claims fixed, Docker quickstart added, engine/README public-ready, FEATURES.md counts corrected. |
-| Staging push + CI gate-closing | ✅ Done | mar27_noon + mar27_pm | Fixed debbie whitelist gaps, post-sync hook pattern, staging CI across 6+ rounds. Gate-closing staging run `23671792399` on commit `745a059` completed `success`. |
-| Algolia compat hardening + deterministic parity | ✅ Done | mar27_night + mar27_master | Mutation parity matrix, runtime/OpenAPI/artifact coupling tests, staged mirror guards, dashboard readiness contracts, SDK/HTTP contract reinforcement. Canonical matrix in `engine/flapjack-http/src/mutation_parity.rs`. |
-| Launch docs truth-sync + proof pack | ✅ Done | mar27_pm | PRIORITIES.md, ROADMAP.md, HIGHEST_PRIORITY.md all reconciled with live launch state. Launch proof pack created. Public surface validated (README smoke 6/6, doc-link validation, live URL checks). |
-| Confidence completeness: Stage 3 soak/failure | ✅ Done | mar28_stage3_6 | 2h mixed/write soak artifacts, restart-during-active-writes proof, nontrivial crash/restart recovery proof. Bounded latency, zero 5xx, exact post-restart count preservation. |
-| Confidence completeness: Stage 4-6 ops/security | ✅ Done | mar28_stage3_6 | Upgrade smoke test, canonical OPERATIONS.md runbooks, SECURITY_BASELINE.md hardening doc, security proof surfaces green. |
-| OSS policy docs + version 1.0.0 | ✅ Done | mar28_pm_1 | SECURITY.md, CHANGELOG.md, CONTRIBUTING.md created and added to debbie sync whitelist. All workspace crates bumped to 1.0.0. Version consistency test added. Dev release script `lib/version.sh` helper created. |
-| OpenTelemetry distributed tracing | ✅ Done | mar28_pm_2 | Feature-gated OTEL OTLP gRPC export (`--features otel`). `otel.rs` module with `try_init_otel_layer()`, wired into subscriber and graceful shutdown. Zero overhead when disabled. |
-| TODO stub cleanup + HA soak hardening | ✅ Done | mar28_pm_3 | Replaced ~601 auto-generated `TODO: Document` stubs with real doc comments across all crates. Added a dev-repo HA soak test harness. Doc-regression tests for server/startup. |
-| Codebase quality cleanup (Round 2) | ✅ Done | mar29 | Fixed 15 error-leaking 500 sites across settings/snapshot/query_suggestions (settings+rules+synonyms+query_suggestions migrated to `HandlerError`; snapshot's local helper sanitized). Removed `cognitive_complexity` suppressions in `startup_catchup.rs`/`server.rs`. Decomposed `execute_search_query` (CC=26 → 8 extracted helpers, orchestrator now ~130 lines). Updated `engine/CLAUDE.md` with HandlerError and suppression guidance. |
-| HA multi-node soak harness + CI integration | ✅ Done | mar29_pm_1 | Delivered a dev-repo HA soak harness, Rust integration coverage (`engine/tests/test_ha_soak_harness.rs`), and topology/soak shell acceptance tests (`engine/loadtest/tests/ha_topology_acceptance.sh`, `engine/loadtest/tests/ha_soak_acceptance.sh`). |
-| File size guardrail enforcement | ✅ Done | mar29_pm_2 | Extracted 13 inline test modules (>500 test lines each) to standalone `*_tests.rs` files. Split 2 production files (`search_helpers.rs`, `promote.rs`). All files now under 800-line guardrail. Pre-commit hook installed via `engine/scripts/install-pre-commit-hook.sh`. |
-| Debbie sync pipeline (wave 2) | ✅ Done | mar30_pm_1 | Full debbie sync pipeline to staging and prod repos. OpenAPI test dedup and helper extraction (`openapi_test_helpers.rs`). Experiment handler refactoring (extracted `require_experiment_store`, `resolve_store_and_experiment_id`, `should_promote_variant_settings` helpers). Soak proof consistency harness improvements. Fixed debbie sync excludes for HA soak harness test and SDK lock files. |
-| Cognitive complexity reduction | ✅ Done | mar30_pm_2 | Decomposed 5 high-complexity hotspots: `merge_settings_payload` (CC=35), `SearchRequest::validate` (CC=29), `compute_exact_vs_prefix_bucket` (CC=26), `build_results_response` (CC=22), `browse_index` (CC=21). Each refactored into domain-grouped private helpers. Added settings characterization tests (`settings_tests.rs`). Moved `SearchCompat` trait methods to default implementations. |
-| Full regression gate + targeted fixes | ✅ Done | mar30_pm_5 | Ran the full post-merge regression gate across Rust, dashboard, browser, SDK, and Go surfaces. The real regression fix was FastEmbed test nondeterminism caused by concurrent ONNX/model cache initialization; affected tests are now serialized. Proof artifacts were captured in `engine/state/`, and the committed OpenAPI export was re-synced after restoring real browse/experiment endpoint summaries in current `main`. |
-| Public doc sync surface hardening | ✅ Done | mar30_pm_6 | The public-doc contract is explicit in `.debbie.toml`; Stage 2 of the v2 doc-system migration replaces the former priorities file with `PROJECT_OVERVIEW.md` plus `ROADMAP.md`, alongside `engine/LIB.md`, `engine/docs2/FEATURES.md`, `engine/loadtest/BENCHMARKS.md`, and the public `engine/docs2/1_STRATEGY/` + `3_IMPLEMENTATION/` trees. Added `engine/tests/doc_sync_helpers.sh`, `engine/tests/validate_sync_surface.sh`, widened `engine/tests/validate_doc_links.sh`, and scrubbed non-public path references from the synced doc graph, including dev-only multi-instance script references in `engine/README.md`. |
-| HA convergence contract + runbook truth sync | ✅ Done | mar31_am_2 | Boundary path executed. Added `engine/docs2/4_EVIDENCE/HA_CONVERGENCE_ANALYSIS.md`, aligned `engine/docs2/3_IMPLEMENTATION/OPERATIONS.md` and `engine/examples/ha-cluster/README.md` with the proven async-replication boundary, and tightened `engine/loadtest/tests/ha_soak_acceptance.sh`. |
-| Debbie sync wave 3 | ✅ Done | mar31_am_1 | Published the latest post-launch hardening to staging commit `6166055` (CI run `23818440499`) and prod commit `b7841a0` (CI run `23819698304`). Carried the HA boundary truth surfaces, public doc sync contract, regression-gate follow-through, and refreshed committed OpenAPI export. |
-| Nightly CI + sync hygiene | ✅ Done | mar31_pm_1 | Restored nightly Rust CI parity by stubbing the dashboard dist asset, added `CHANGELOG.md`/`CONTRIBUTING.md`/`SECURITY.md` to the public sync whitelist, and clarified root README vector/hybrid platform caveats by target. Published in the completed public lineage; see [Public Sync Lineage Ledger (Canonical)](#public-sync-lineage-ledger-canonical). |
-| Operations runbook hardening | ✅ Done | mar31_pm_2 | `engine/docs2/3_IMPLEMENTATION/OPERATIONS.md` now carries proof-backed startup/readiness/replication/admin-key/snapshot failure runbooks, stronger ownership links to deployment/security/config docs, corrected `flapjack --data-dir <path> reset-admin-key` syntax, and tightened proof citations. Published in the completed public lineage; see [Public Sync Lineage Ledger (Canonical)](#public-sync-lineage-ledger-canonical). |
-| Security baseline docs + test coverage | ✅ Done | mar31_pm_3 | `engine/docs2/3_IMPLEMENTATION/SECURITY_BASELINE.md` and `engine/docs2/4_EVIDENCE/SECURITY_BASELINE_AUDIT.md` now capture the shipped HTTP hardening surface (CORS, body limits, trusted proxies, per-key rate limiting) with focused proof references, and non-strict startup catchup now warns-and-continues on write-queue timeout. Published in the completed public lineage; see [Public Sync Lineage Ledger (Canonical)](#public-sync-lineage-ledger-canonical). |
-| Security baseline follow-through | ✅ Done | mar31_pm_4 | Closed the scoped HTTP-hardening proof gaps with invalid-key non-consumption and `FLAPJACK_MAX_BODY_MB` `413` tests, aligned the security docs/audit, refreshed the committed OpenAPI export, and tightened helper-script safety around sync destinations. Published in the completed public lineage; see [Public Sync Lineage Ledger (Canonical)](#public-sync-lineage-ledger-canonical). |
-| Runbook parity + admin-key truth sync | ✅ Done | mar31_pm_5 | Standardized `flapjack --data-dir <path> reset-admin-key` across startup output, dashboard auth help, `engine/docs/AUTH_DESIGN.md`, and `OPERATIONS.md`, including shell-safe quoting for spaced paths. Published in the completed public lineage; see [Public Sync Lineage Ledger (Canonical)](#public-sync-lineage-ledger-canonical). |
-| Experiment handler merge guardrails | ✅ Done | mar31_pm_6 | Routed `/2/abtests/{id}/results` through the shared resolver seam, added direct results-endpoint proof for store-unavailable plus numeric/UUID resolution, and aligned experiment OpenAPI `500` docs with resolver behavior. Published in the completed public lineage; see [Public Sync Lineage Ledger (Canonical)](#public-sync-lineage-ledger-canonical). |
-| Targeted cleanup follow-through | ✅ Done | apr08 | Extracted dashboard experiment normalization/results typing into `engine/dashboard/src/lib/experiment-normalization.ts` and removed a stale server cognitive-complexity suppression. Published in the completed public lineage; see [Public Sync Lineage Ledger (Canonical)](#public-sync-lineage-ledger-canonical). |
-| Analytics retention hardening + rollup foundation | ✅ Retention done / 🔶 rollup foundation only | apr07_pm_2 | Analytics retention cleanup is deterministic and still defaults to 90 days via `FLAPJACK_ANALYTICS_RETENTION_DAYS`; durable rollup design, known-answer query contracts, schema/config helpers, and `RollupManifest` foundation were merged in the Apr 15 foundation. Later durable analytics work shipped the rollup writer, query-planner fallback, and certified-coverage retention gate; the canonical shipped status is owned by the Analytics & Insights durable rollup storage row. |
-| Test hygiene, SDK contract CI, and query safety audit | ✅ Done with deferrals | apr07_pm_3 | Public CI now has an SDK contract gate, dashboard/browser tests were tightened to reduce false positives, stale test-script shims were removed in favor of `engine/s/test`, and confirmed query/request crash paths now return typed/sanitized errors. The run still deferred OpenAPI snapshot follow-up verification and did not execute the separate search-HA ownership plan. |
-| OSS polish wave: lane A repo cutover | ✅ Done (superseded by flapjackhq transfer) | may22_5pm_2 | Original may22 cutover landed at `griddlehq/flapjack`; superseded 2026-05-24 by may24_816am L1 which transferred the engine repo from `griddlehq/flapjack` → `flapjackhq/flapjack` for owner-identity consistency with the SDK family. Old URL auto-redirects. install.flapjack.foo now points at `flapjackhq/flapjack/main/engine/install.sh`. Historical detail retained in private stage evidence. |
-| OSS polish wave: lane B nightly CI | ✅ Done with deferred-op | may22_5pm_3 | `engine/rust-toolchain.toml` pinned to 1.95.0 and added to `.debbie.toml` `[sync].files`. Nightly workflow JS/Go/server-backed SDK jobs realigned with CI owner parity (shared server artifact, JS workspace flow, Go unit/e2e split). Stages 1–3 complete; Stages 4–5 (3 consecutive green nightly runs on `griddlehq/flapjack`) marked `@work:deferred-op` and never dispatched after cutover. |
-| OSS polish wave: lane C README polish | ✅ Done | may22_5pm_4 | 9-stage audit covering root + engine READMEs, CONTRIBUTING audit-and-extend, SECURITY disclosure-path audit, `engine/LIB.md` architecture refresh, CHANGELOG v1.0.0 fidelity, SDK README cleanup, root clutter sweep, and consolidated outbound-link gate. |
-| OSS polish wave: lane D docs + demo | ✅ Done | may22_5pm_5 | docs.flapjack.foo + flapjack-demo + apex `flapjack-website` redeployed via Cloudflare Pages. Stage 1 audit froze the docs owner; Stage 2 corrected launch-link sources in `website/index.html` + `engine/demo-dualclient`; Stage 3–4 deployed docs/demo/apex from selected owners; Stage 5 ran the sitemap-first URL audit with ≥10-URL + zero-non-2xx/3xx gate. |
-| OSS polish wave: lane E SDK release | ✅ Done (publishes landed across canonical owners) | may22_5pm_6 | Stage 1 topology audit correctly stopped this lane from publishing from the dev mirror; canonical owners later shipped: PyPI `flapjack-search==1.0.0` (may23 Lane 7), Go `github.com/flapjackhq/flapjack-search-go/v4@v4.0.0` (may23 Lane 9), npm `flapjack-search@1.0.0` + 6 scoped packages (2026-05-24 via OIDC Trusted Publishing from `flapjackhq/flapjack-search-javascript` `release.yml`; sigstore provenance log entries `1626399336`–`1626400381`). |
-| OSS polish wave: lane F e2e validation | ✅ Done (all 3 gaps closed) | may22_5pm_7 | 8-stage cross-platform validation evidence is retained in private stage artifacts. Final closure: (Stage 1 GHCR arm64) v1.0.1 multi-arch shipped to `ghcr.io/griddlehq/flapjack` in may23 Lane 5 and retagged to `ghcr.io/flapjackhq/flapjack` on 2026-05-24 (`docker manifest inspect ghcr.io/flapjackhq/flapjack:1.0.1` shows linux/amd64+linux/arm64); (Stage 5 faceting) `pass=12 fail=0` broader + `pass=6 fail=0` focused; (Stage 6 SDK registry) Python 1.0.0 (may23 L7), Go v4.0.0 (may23 L9), npm 1.0.0 + 6 scoped packages (2026-05-24 OIDC). |
-| may24_816am batch: flapjackhq transfer + RF planning baselines + npm 1.0.0 | ✅ Done | may24_816am | (L1 `d1e30589`) engine repo transferred `griddlehq/flapjack` → `flapjackhq/flapjack`; (L3 `3bdcdffe`) Wave 2 RF-2 analytics rollup build note retained in private stage evidence; (L4 `1283eb7e`) Wave 3 RF-1 HA design detail retained in private ADR evidence + red ha_contracts test baseline (`engine/tests/ha_contracts/c[1-5]_*.rs`); (wrap-up `a2a9feca`) owner-drift sweep; (post-wrap 2026-05-24) GHCR multi-arch retagged to flapjackhq namespace via `docker buildx imagetools create`, npm published via OIDC Trusted Publishing on `flapjackhq/flapjack-search-javascript` (provenance entries `1626399336`–`1626400381`). Wave 2 + Wave 3 dispatched against this baseline. |
-
----
+Historical launch, rollout, and completed-work narratives remain available in git
+history and evidence receipts; repeating them here made current capability lookup
+ambiguous and allowed stale status prose to compete with its canonical owners.
 
 ## Shipped Feature Status
 
-All shipped capability status lives in the feature tables below (Search, Indexing, Analytics, etc.) through the Production-Readiness tiers. `ROADMAP.md` and `engine/README.md` must link here instead of duplicating feature/readiness inventories.
+All shipped capability status lives in the feature tables below. Other documents should link here instead of duplicating feature inventories.
 
 ## Search
 
@@ -315,7 +61,7 @@ All shipped capability status lives in the feature tables below (Search, Indexin
 | Index copy / move / clear | ✅ | |
 | Replicas | ✅ | Virtual + standard replicas |
 | Task status API | ✅ | Async task tracking |
-| Fail-closed durable acknowledgement | ✅ | A write is never acknowledged before it is recoverable, and a write rejected to the client never becomes visible after restart. The direct oplog-append I/O failure class is proven by `engine/src/index/write_queue_tests.rs::oplog_append_io_failure_before_acknowledgement_is_fail_closed`, which flushes and syncs a partial task-tagged row inside `OpLog::append_operations_with_task_id` *before* `current_seq` advances and then requires one of exactly two honest outcomes: client failure with no replayable state after restart, or an honest durable acknowledgement with the documents present. Compensation stays single-owned by `compensate_failed_commit_batch` → `compensate_uncommitted_tasks` → `OpLog::retract_tasks_from`; no second rollback owner was added (2026-08-02). Receipt: [`4_EVIDENCE/2026_08_02_aug02_11am_2_durable_ack_fail_closed_receipt.md`](4_EVIDENCE/2026_08_02_aug02_11am_2_durable_ack_fail_closed_receipt.md). The separate disk-exhaustion fill instance is tracked in `ROADMAP.md` row `DUR-1`. |
+| Fail-closed durable acknowledgement | ✅ | A write is never acknowledged before it is recoverable, and a write rejected to the client never becomes visible after restart. The direct oplog-append I/O failure class is proven by `engine/src/index/write_queue_tests.rs::oplog_append_io_failure_before_acknowledgement_is_fail_closed`, which flushes and syncs a partial task-tagged row inside `OpLog::append_operations_with_task_id` *before* `current_seq` advances and then requires one of exactly two honest outcomes: client failure with no replayable state after restart, or an honest durable acknowledgement with the documents present. Compensation stays single-owned by `compensate_failed_commit_batch` → `compensate_uncommitted_tasks` → `OpLog::retract_tasks_from`; no second rollback owner was added (2026-08-02). Receipt: [`4_EVIDENCE/2026_08_02_aug02_11am_2_durable_ack_fail_closed_receipt.md`](4_EVIDENCE/2026_08_02_aug02_11am_2_durable_ack_fail_closed_receipt.md). |
 
 ### `flapjack ingest` Beta Bounds
 
@@ -450,7 +196,7 @@ Per-channel state, measured 2026-08-09:
 | RubyGems `flapjack-search` | ❌ **No — do not use** | Same disposition as PyPI. Advisory `GHSA-q67x-w5fw-5mw2` published. Blocked on a missing `~/.gem/credentials` / `GEM_HOST_*`. |
 | Live owner source refs (Go, Python, Ruby) | ✅ Clean | Zero-hit outbound-host scan across Go 349 files / 1 branch, Python 759 / 1, Ruby 1457 / 2, against a starting inventory of 23 hits over 4 branches and 2,568 tree files. |
 
-Owner: [`ROADMAP.md`](../../ROADMAP.md) row `SDK-1`, open on clause `(d)` only. Public receipt:
+The public remediation receipt is:
 [`4_EVIDENCE/2026_08_08_aug08_9pm_2_sdk_receipt.md`](4_EVIDENCE/2026_08_08_aug08_9pm_2_sdk_receipt.md).
 Clause `(d)` needs an operator with registry credentials, not an engineer.
 
@@ -479,7 +225,7 @@ scope limits are recorded in
 
 ## Source migration — PROVIDER-NEUTRAL CORE + ALGOLIA RESUME SHIPPED
 
-**Status as of 2026-08-06: node-local source discovery and preview ship for Algolia, Meilisearch, and Typesense; authenticated async migration supports all three source adapters, while interrupted-job resume remains Algolia-only. The console reaches all three providers and **all three are browser-proven** as of 2026-08-07 — corrected from an earlier "Algolia only" reading, which the `MIG-21` receipt and the 21-passed targeted three-provider run had already falsified. See the `Dashboard Migrate page` row below and [`ROADMAP.md`](../../ROADMAP.md) row `MIG-22`, which **closed 2026-08-10**: its release-profile loopback contract reached a recurring scheduled gate in `nightly.yml` (so the "runs in no recurring gate" reading is superseded) and its joined-proof clause (`P30`/`P31`, formerly owned by `JOIN-1`) was retired explicitly once `JOIN-1` stopped producing a numerator.** Create-only import and `overwrite=true` replacement use the fenced publication owner. Successful async status projects the durable settings/synonym/rule outcome and warnings; non-success states omit that outcome rather than fabricating zeroes. HA-converging import remains refused by design in [`ROADMAP.md`](../../ROADMAP.md) row `MIG-7`. `MIG-4` is a separate publication-repair proof row, not part of this migration capability.
+**Current capability:** node-local discovery, preview, and authenticated async import support Algolia, Meilisearch, and Typesense. Interrupted-job resume remains Algolia-only, and HA import is refused because staged publication is node-local and has no convergence epoch.
 
 **Operator CLI:** `flapjack migrate` uses one provider-neutral internal adapter/capture seam and one shared submit/status/cancel/acknowledge lifecycle across the public Algolia, Meilisearch, and Typesense route families. Resume remains Algolia-only. The served provider-parity probe proves local landed-data fidelity through real digest-pinned Meilisearch and Typesense containers: Meilisearch `configured_pk` lands two searchable documents with exact `sku`-to-`objectID` projections, and Typesense categories/products land one category plus two products with exact `id`-to-`objectID` projections. Receipt: `engine/docs2/4_EVIDENCE/2026_08_03_aug03_11am_5_competitor_migration_lands_data_receipt.md`; landed merge: `2c05776c7b9d8f60bae89c34ad819ece084fa2e4`. See the [`flapjack migrate` operator configuration](3_IMPLEMENTATION/OPS_CONFIGURATION.md#flapjack-migrate) for provider connections, secret sources, output, and exit behavior.
 
@@ -498,9 +244,9 @@ scope limits are recorded in
 | Staged publication primitive (crash-safe, node-local) | ✅ Shipped | `engine/src/index/manager/publication.rs` |
 | Interrupted-job resume (pre-publication export) | ✅ Shipped — Algolia only | `POST /1/migrations/{provider}/{job_id}/resume`; `engine/flapjack-http/src/handlers/migration/{spool_lifecycle,export,job_runner,mod}.rs`; restart proof `engine/flapjack-server/tests/crash_durability_test.rs::interrupted_async_migration_resumes_exactly_once_after_process_restart` |
 | Dashboard `Migrate` page | ✅ All three providers reachable, dry-run before any write, and **all three browser-proven** as of 2026-08-07 (`86b143724`) — 21 passed targeted, 411 passed / 5 skipped full `e2e-ui`, and `migrate-{meilisearch,typesense}.spec.ts` executed on Linux CI in staging nightly `31176417863`. Synchronous create-only mutation; no console job-status or resume surface. **Published in v1.0.12:** the installable dashboard reaches all three providers and exposes the dry-run. | `engine/dashboard/src/pages/{Migrate.tsx,MigrateSections.tsx,migrateHelpers.ts}`; specs `engine/dashboard/tests/e2e-ui/full/migrate-{algolia,meilisearch,typesense}.spec.ts`. Re-measure rather than cite: `cd engine/dashboard && npm run test:e2e-ui`. Screen contract: the private migrate screen contract. |
-| **Backend ↔ frontend joined end-to-end** | **`JOIN-1` is OPEN and was RETARGETED 2026-08-08. There is no joined-proof numerator and one is no longer being pursued — do not read that as a failing score, and do not dispatch a lane to produce one.** Why the target changed rather than the measurement: ADR 0006 (`engine/docs2/3_IMPLEMENTATION/decisions/active/0006_console_source_home.md`, Accepted 2026-07-18 — dev-tree path, deliberately not linked because it is outside the public sync surface; [`PROJECT_OVERVIEW.md`](../../PROJECT_OVERVIEW.md) owns this policy) deletes `engine/dashboard` at the console-unification cutover, so a numerator proving that tree works has a scheduled expiry. Six dedicated lanes in nine days produced six receipts and zero admissible numerators, which is a predicate defect rather than six execution failures. **What survives is the manifest as the console port map:** 96 backend rows, 69 dashboard routes, 65 joinable rows, 34 proof keys, 0 unresolved mappings — the answer to *which screens exist and therefore must be ported*, consumed cross-repo as the OSS-console column of `fjcloud_dev`'s capability matrix. **That map is now validated by a wired gate, new 2026-08-08:** `npm run check:join-manifest` is green at `96 checked / 90 resolved / 0 mismatched / 6 shape-exempt` and runs in `ci.yml`'s `dashboard-build` job; falsifiability was proven by mutation, a single line token changed on one row reding as `stored-line-drift, drift=1, validator_rc=1` with a byte-identical revert restoring green. The row closes when `engine/dashboard` is deleted. The superseded `59 / 59` at `05c546ca5ba3b8dc92b0cb83e6604f09a7c6c433`, the `61`-row figure, and any copied `65` must not be carried forward as results. Full predicate: [`ROADMAP.md`](../../ROADMAP.md) row `JOIN-1`. | Manifest owner `engine/dashboard/tests/e2e-ui/join_proof_manifest.json`; validator `engine/dashboard/scripts/check_join_manifest.mjs` (+ `check_join_manifest.test.mjs`, 25/25 green), wired at `engine/dashboard/package.json` and `.github/workflows/ci.yml:324`; outcome classifier `engine/dashboard/scripts/join_proof_report.mjs`, which still hard-exits `1` with `results not found` when Playwright JSON is absent. Retired-numerator diagnosis is recorded in the 2026-08-07 `aug07_8pm_2` join-proof receipt, a dev-repo evidence artifact deliberately not cited by path here because it is outside the public sync surface (`DOC-PUBLIC-1`). **Known cross-repo gap:** flapjack CI does not detect `fjcloud_dev` failing to re-pin `engine_snapshot.sha256`, so that desync is silent here. |
+| **Backend ↔ frontend joined end-to-end** | No portfolio-wide score is claimed for the retiring React dashboard. Provider-specific browser proofs are listed above, while the validated manifest remains the console port map. | Manifest owner: `engine/dashboard/tests/e2e-ui/join_proof_manifest.json`; validator: `engine/dashboard/scripts/check_join_manifest.mjs`. The console replacement policy is owned by [`PROJECT_OVERVIEW.md`](../../PROJECT_OVERVIEW.md). |
 
-Replica translation detects topology from the source primary, fetches every named replica's own settings, and carries the derived virtual topology plus translated per-replica settings in the create-only migration bundle. Materialization then creates each derived replica as a settings-only virtual sidecar (no physical copy, by design) whose sort order resolves at query time. This contract is live-proven: on 2026-07-19 a real Algolia application with one `virtual(...)` relevance replica and one standard replica migrated end-to-end with a passing machine-verified receipt (jul18_11am batch) covering fixture seeding, import, sort-order proofs on the primary and both replica indexes, sidecar structure, and exact source cleanup. Remaining fidelity limits stay owned by `ROADMAP.md` MIG-11 and surface as documented migration warnings: standard-replica exhaustive sorting is approximated as a virtual replica, and Algolia `relevancyStrictness` semantics differ from Flapjack's deterministic ranking.
+Replica translation detects topology from the source primary, fetches every named replica's own settings, and carries the derived virtual topology plus translated per-replica settings in the create-only migration bundle. Materialization then creates each derived replica as a settings-only virtual sidecar (no physical copy, by design) whose sort order resolves at query time. This contract is live-proven: on 2026-07-19 a real Algolia application with one `virtual(...)` relevance replica and one standard replica migrated end-to-end with a passing machine-verified receipt (jul18_11am batch) covering fixture seeding, import, sort-order proofs on the primary and both replica indexes, sidecar structure, and exact source cleanup. The remaining fidelity limits surface as documented migration warnings: standard-replica exhaustive sorting is approximated as a virtual replica, and Algolia `relevancyStrictness` semantics differ from Flapjack's deterministic ranking.
 
 Migration warnings expose the remaining replica fidelity limits:
 
@@ -509,8 +255,6 @@ Migration warnings expose the remaining replica fidelity limits:
 - Matching-critical fields that diverge from the primary cannot be reproduced independently by a virtual replica.
 - Algolia and Flapjack use different `relevancyStrictness` scales, and `nbSortedHits` may differ for deterministic queries.
 
-**Current boundary:** node-local discovery, preview, and authenticated async import support Algolia, Meilisearch, and Typesense; import can create a fresh target or replace an existing target with `overwrite=true`. An interrupted pre-publication Algolia export can be claimed through the explicit admin-authenticated resume route using fresh request-only credentials. Positive status exposes `resumable`, `operation`, and `resumeHandle`; interruption preserves the original absolute `expires_at`. Meilisearch and Typesense resume are not supported. HA import is refused because staged publication is node-local and no convergence epoch exists; that design remains under `MIG-7`.
-
 ## Dashboard UI
 
 `dashboard/src/App.tsx` defines 24 derived user-facing route patterns from 24 raw `path=` attributes and two attribute-less index routes, backed by 22 lazy page components. No stub pages remain.
@@ -518,317 +262,8 @@ The route inventory spans overview, search/browse, settings, analytics, relevanc
 
 Playwright webserver startup now reclaims stale startup leases before acquiring the shared server slot. The repair shipped at `89df8543d`; `engine/dashboard/scripts/playwright-webserver.mjs::acquireStartupLease` is the behavior owner.
 
-**Caveat — route shipped ≠ backend capability joined.** A shipped route is not a joined-proof pass, and as of 2026-08-08 **no joined-proof numerator exists and none is being produced**: `JOIN-1` was retargeted to manifest accuracy because ADR 0006 deletes this tree at cutover. **Do not re-run `dashboard/scripts/join_proof_report.mjs` to "refresh the numerator" — that is the exact lane shape the retarget forbids** (six of them produced zero admissible results). The manifest map, the wired `npm run check:join-manifest` validator, and the closure predicate are canonical in [`ROADMAP.md`](../../ROADMAP.md) row `JOIN-1` and the joined-proof row in the **Source migration** table above. Where a numerator is ever wanted again, it is for the *Svelte* console, not this tree. Console migration for Meilisearch and Typesense is browser-reachable, and its joined proof is **unmeasured rather than red**: `P30`/`P31` sit in a join-proof report that has not been re-run since the specs went green, and no re-run is planned. Do not restate an unrun key as a failing one. [`ROADMAP.md`](../../ROADMAP.md) row `MIG-22` no longer waits on those two keys — it **closed 2026-08-10** by retiring that clause explicitly, against the shipped-profile loopback contract rather than any joined-proof numerator. Console-absent backend modes include async `overwrite=true`, migration status/cancel/acknowledge/resume, bulk-replace cancellation, and auto-heal lifecycle. **Runtime HA peer add/remove left this list on 2026-08-03:** the Cluster screen now drives the internal add/remove endpoints, with served mutations confirmed through `/internal/cluster/status`. Receipts: the reviewed private join1 sweep receipt and the reviewed private cluster peer screen receipt.
+**Caveat:** a shipped route does not imply portfolio-wide backend-to-frontend proof. The provider-specific proofs above and the validated port manifest are the bounded claims; no aggregate score is claimed for the React dashboard scheduled for replacement.
 
 | Status | Features |
 |---|---|
 | ✅ Built | Overview, Search & Browse (including Hybrid Search mode), Settings (all tabs, including Vector Search settings), Analytics (7 tabs), Synonyms, Rules, Merchandising Studio, API Keys (with `restrictSources`), Search Logs, Query Suggestions, Personalization, Recommendations, Experiments, Event Debugger, Metrics, System, Migrate, Dictionaries, Security Sources, Chat/RAG |
-
-## Testing & Quality Assurance
-
-### Rust suite: two runners, deliberately, and one of them is expected red
-
-This repository runs the Rust workspace **two different ways** and the difference is load-bearing, so
-neither result may be quoted as "the test suite" without saying which one produced it.
-
-| Runner | Command | Wall clock | Expectation | Why it exists |
-|---|---|---|---|---|
-| `nextest` (process-per-test) | `cargo nextest run --workspace` | ~16 min | **Green**, and it is the gate `nightly.yml`'s `Rust all tests` job asserts | Fast, and CI-affordable |
-| In-process union | `cargo test --workspace --no-fail-fast` | ~2.5 h | **Evidence reader; may pass or fail while `TEST-FLAKE-1` remains open. A green union satisfies only the broad-run clause and does not manufacture the missing historical pre-fix reproducer.** | It is the *only* runner structurally capable of seeing one test corrupt another through process-global state. With one process per test there is no shared process to leak through — so a green `nextest` run over ~5,800 process-isolated tests does **not** refute an in-process union red. |
-
-**New 2026-08-08: the union became a recurring reader instead of a hand-run on one developer Mac.**
-`.github/workflows/union.yml` runs it on a schedule (06:00 UTC) on a free runner. It is deliberately
-**not** a job inside `nightly.yml` and deliberately **not** `continue-on-error`: an expected-red job
-inside `nightly.yml` would flip that workflow's conclusion and thereby reset `NIGHT-1`'s
-two-consecutive-green exit and fail `SYNC-1`'s publish gate, holding the release hostage to a flake
-investigation — while `continue-on-error` would make it a gate that cannot fail, which this
-repository has already caught three times as an inert contract. Non-removability is asserted by
-`engine/tests/union_recurring_gate_test.rs`. It reaches CI only once a mirror sync carries it
-(`SYNC-1`).
-
-**Current state, 2026-08-09 — read both runners:**
-
-- **Two complete unions ran at byte-identical `main` `5487e725f`. The first exited `101` with one
-  failure; the second exited `0`, 86 binaries, 6,069 passed, 0 failed.** Same SHA, same tree, same
-  command, so the pair is a controlled repetition rather than a re-measurement. **A green that
-  follows no repair is not proof of repair** — nothing changed between the runs. It closed
-  `TEST-FLAKE-2` on that row's own single-clause exit and met one of `TEST-FLAKE-1`'s two clauses
-  (its exit says *plus*, so that row stays open). Receipt:
-  [`4_EVIDENCE/2026_08_08_second_postmerge_union_recurrence_receipt.md`](4_EVIDENCE/2026_08_08_second_postmerge_union_recurrence_receipt.md).
-- **`nextest --workspace` is RED on one specimen**, reproduced by three complete clean-worktree runs:
-  `flapjack-http::write_runtime_isolation::single_worker_runtime_serves_count_during_injected_two_second_commit`,
-  1,210 run / 1,209 passed / 1 failed / 7 skipped, observing health and count p99 of 402/392, 448/438
-  and 528/537 ms against an asserted 250 ms ceiling. Three same-HEAD **focused** repetitions pass in
-  ~2.3 s each, so this is a load-sensitive full-workspace failure. Repair lane in flight; the
-  standing constraint is that it may not be closed by raising the ceiling, adding Tokio workers,
-  `#[ignore]`, or narrowing the gate to focused-only.
-- **Attribution added 2026-08-10, and it changes what this red means: the product is live; the
-  harness is oversubscribed.** A matched experiment at one clean tree held the selection, binaries,
-  profile, source, injected write delay, thresholds and Tokio worker count fixed and varied only
-  `--test-threads`: 18-way (the capture host's logical CPU count) FAILS, 12-way PASSES. In every
-  failing run the specimen's `RequestStart` p99 is **0 ms** while its `ScheduledDeadline` p99 is
-  278–430 ms. Once the request starts it is served immediately; the tail is entirely time waiting to
-  be scheduled onto a worker while ~13–18 sibling test processes contend for the same CPUs. That
-  rules out the production write-queue seam as the owner. **The repair is still unmerged and its
-  current shape is host-dependent** — a relative `test-threads` cap resolves to 12 on the
-  18-logical-CPU capture host but to **1 thread** on a 4-vCPU mirror runner, where every
-  `cargo nextest run` in `ci.yml` and `nightly.yml` would then run serially under a 45-minute job
-  timeout. Read the cap's resolved value on the target runner before landing it.
-
-### Measurement lanes can be void, and two consecutive ones were
-
-Two lanes on 2026-08-10 attempted the same repo-local compile-share measurement and **both produced
-no admissible ratio**. Recorded here because a void measurement is a real outcome that must not be
-mistaken for an un-run one, and because the second void was not the first void's cause repeating.
-The first lane's test-execution input was invalid (`cargo nextest run -P ci` exited `100` on the
-`ledger_correction_gate_test` overdue-receipt gate — a documentation gate, since cleared) **and** its
-run was voided by after-bracket host load of `42.57` against a ceiling of `24`. The second lane
-cleared cause one, added a held-quiet-window protocol that reported `OPEN` after six consecutive
-samples at or below `20`, and still voided on load: `26.45` mid-build and `36.52` after the cold
-compile. Cold compile itself was sound both times (`302.52 s`, `361.41 s`, both exit `0`). **The
-unexamined assumption both lanes share is that a full-throttle `cargo test --workspace --no-run` can
-finish on an 18-core host without driving the 1-minute load average past 24** — the first lane's own
-figures report `user 2726.27 s` over `real 302.52 s`, roughly nine-way average parallelism from the
-measured command alone. Both receipts are dev-repo reference artifacts dated 2026-08-10, deliberately
-not cited by path here because they sit outside the public sync surface.
-
-### Test-harness defects are tracked as defects, not absorbed as flakes
-
-**`TEST-SINK-1`, repaired 2026-08-08, is the reference example of why a red name must not be trusted
-over a red mechanism.** `non_json_failure_redacts_api_key_from_stderr` failed in a union with
-`failed to connect to sink: Connection refused (os error 61)`. The name reads like a credential leak;
-it was not one, and nothing about redaction was being measured when it reds — the CLI never reached
-the sink. `FakeBatchSink::start` served exactly `responses.len()` connections and then closed its
-port, while `HttpSink::send` retries up to 3 times, so a retry met a dead port. **Renaming the test
-would have been the wrong repair**: the name is accurate about what the test checks; the defect was
-that the test could die before checking anything and still fail under that name.
-
-The repair was **measured against a baseline rather than asserted** — full-file
-`cargo test -p flapjack-server --test ingest_cli_test`, same host: unmodified `main` was clean in
-**1 of 5** runs with 3–4 failures per bad run; after the repair, **8 of 8** clean, 39/39, longest
-8.31 s. Falsifiability proven by mutation: reverting only the replay reds both new tests with the
-union's exact error string. Two further defects were found by the first repair's own guard —
-unbounded replay let a looping client take 101 requests on a sink scripted for 2 and **hang for 15
-minutes instead of failing** (replay is now capped at 256 connections and the drain carries a 20 s
-deadline naming what it saw), and the sink's `unwrap()`s panicked a detached thread, killing the
-listener and re-emitting the cause as `Connection refused` somewhere unrelated (faults are now
-recorded and failed by `Drop`). Owner: `engine/flapjack-server/tests/ingest_cli_test.rs`;
-[`ROADMAP.md`](../../ROADMAP.md) row `TEST-SINK-1`.
-
-### E2E Browser Tests (Playwright)
-
-The current inventory is 57 Playwright spec files, counted 2026-08-06 by `find engine/dashboard/tests -name '*.spec.ts'`: 40 full `e2e-ui` specs, seven top-level `e2e-ui` specs, five smoke specs, four `e2e-api` specs, and one `e2e-binary` spec.
-
-**Two dashboard CI jobs executed their tests for the first time ever on 2026-08-08.** `dashboard-pages` and `dashboard-integration` had died at `webServer` startup on every prior run — they carried neither `FLAPJACK_AI_ALLOW_LOCAL_URLS` nor the replication trio, so no spec in either job had ever run remotely. Both are green in staging push CI run `31245623596`. The underlying defect was in the guard rather than the workflow: the contract checker validated requirements against a job's *spec selection* while `assertBackendReadiness` probes **every** backend it accepts, so the requirements are now data (`"base": true` in the contract file) enforced against every backend-starting job regardless of selection. See `ROADMAP.md` row `CI-STAGING-1`, closed. **Harness capability provisioning is now declared, not implicit (2026-08-06).** `engine/dashboard/tests/e2e_backend_contract.json` is the single owner of which backend capabilities the specs require, and `engine/tests/test_dashboard_e2e_backend_contract.py` — run in `ci.yml`'s `release-contracts` job — holds every job that starts a backend and then runs dashboard specs to that contract, asserts its own invocation so unwiring it reds, and resolves each npm script's actual spec selection per Playwright invocation. A contract naming an absent variable now forces a fresh backend instead of silently reusing an incapable one, because `startPlaywrightServers` previously passed `allowReuse: true` and the environment was only ever set inside `spawnBackendServer`.
-
-**The dashboard composition is not currently green.** At `ddb6fccef82af3e43eedf88778a89f28dd2cbe33`, run 2 of `./s/test --dashboard-full` returned 1 with Vitest 663/663, smoke UNPARSEABLE/DID NOT RUN, and full UNPARSEABLE/DID NOT RUN at preflight load 23.08/52.28/59.43; run 3 returned execution-tool exit 1 after exact-PID interruption with Vitest 663/663, smoke 17/0/0/0/0/17, and full 357/1/0/8/1/367 at preflight load 25.37/35.87/50.05. **Two of the audit's three residuals were closed later the same day; only one remains.** Valid Algolia runtime inputs were missing at audit time and were **resolved 2026-07-30 by the credential repoint**. The Playwright HTML reporter not returning was **fixed at `53391b794` (2026-07-30 11:57), after the audit was measured** — Playwright resolves the reporter's `open` as `PLAYWRIGHT_HTML_OPEN || options.open || 'on-failure'`, so a red run on a TTY served the report and blocked forever; `engine/dashboard/playwright.config.ts` now pins `open: 'never'` and `playwright.config.test.ts` pins that setting with a regression test. The remaining open residual is the inconclusive run-2 Vite/webserver startup failure. **The re-proof has not been run**, so the numbers above stand as the last measured result even though two of their causes are gone. **Do not read the 2026-08-08 CI greens above as that re-proof, and do not read this paragraph as contradicting them — they measure different harnesses.** The CI evidence covers the `ci.yml`/`nightly.yml` jobs on Linux runners (`Dashboard page tests`, `Dashboard integration tests`, `Dashboard all tests` at `411 passed / 5 skipped`); this paragraph is about the local `./s/test --dashboard-full` wrapper composition on this host, whose last measurement is still the audit above. Closing this residual requires running that wrapper, not citing a CI job.
-
-The prior all-green claim at `aa7dd7db61d7e274cdf946ac6dd7d7435c4dcdf4` (2026-03-26, all 14 wrapper sections, exit 0) is retained as superseded historical evidence. It is four months and 77+ lane merges behind current source and must not be read as present-tense status.
-Coverage includes smoke and full-browser flows across index creation, search, faceting, settings, analytics, dictionaries, security sources, API keys, and migration.
-
-Coverage hardened by three MAR18 workstreams (merged 2026-03-18):
-
-| Workstream | Scope | Record |
-|---|---|---|
-| A — CRUD & Data Management | Documents, settings, rules, merchandising, API keys, dictionaries, security sources (7 stages, 19/19 checks) | Internal workstream checklist retained in the dev repo |
-| B — Intelligence & Analytics | Analytics, query suggestions, experiments, personalization, recommendations (5 stages, 18/20 checks) | Internal workstream checklist retained in the dev repo |
-| C — System, Devtools, Edge Cases | System/metrics/migration reconciliation, devtools, navigation dedup, adversarial search, shared constants (6 stages, 16/16 checks) | Internal workstream checklist retained in the dev repo |
-
-Quality standards: zero ESLint violations, zero CSS class selectors, zero sleeps, zero conditional assertions, content verification (not just visibility), deterministic seed data with cleanup.
-
-### Tour Video Walkthroughs (Playtour) — removed 2026-07-30
-
-The `engine/dashboard/tour/` video-walkthrough system has been deleted. It recorded MP4
-walkthroughs of each dashboard feature using an external tool, `playtour`, loaded from a
-fixed local path outside this repository. That path no longer exists, so the system had been
-unrunnable since it was last touched on 2026-04-14 and could not be revived here.
-
-Its one live dependency, the shared product fixture, moved to
-`engine/loadtest/product-seed-data.mjs`, which is where its remaining consumers are.
-
-End-to-end proof of dashboard behaviour now comes solely from the Playwright e2e-ui suite
-above, which runs unattended. **Corrected 2026-08-03: it is not green.** The most recent
-measured composition (rented `i4i.2xlarge`, `us-east-1`, source SHA `3c2f2343`) was
-`347 passed / 1 failed / 20 skipped` for the full UI phase and `62 passed` for `e2e-api`.
-The single failure — `readme-screenshots.spec.ts` search readiness — was fixed after that run
-and proved with a focused `5 passed`, but no second full-suite pass has been claimed.
-
-**Browser-test standard conformance gate (2026-08-02).** `npm run lint:e2e` in
-`engine/dashboard/` enforces `tests/e2e-ui/eslint.config.mjs` at `--max-warnings 0` over every
-`e2e-ui` spec and helper. The measured pre-gate corpus was 234 hits across 49 swept files —
-115 `playwright/no-raw-locators`, 44 `playwright/no-conditional-in-test`, 27
-`playwright/no-useless-not`, 18 `playwright/no-conditional-expect`, seven
-`playwright/expect-expect`, six `no-restricted-syntax` — all repaired with role-based or
-scoped permitted locators rather than by widening the allow-list. Screen specs are the source
-of truth for the target behavior of any screen a lane changes; the template is
-[`docs/screen_specs/_template.md`](../../docs/screen_specs/_template.md) and the current route
-audit is [`docs/screen_specs/_audit.md`](../../docs/screen_specs/_audit.md). Receipt:
-[`4_EVIDENCE/2026_08_02_aug02_11am_5_browser_standard_conformance_receipt.md`](4_EVIDENCE/2026_08_02_aug02_11am_5_browser_standard_conformance_receipt.md).
-
-### Load & Stress Testing (k6)
-
-k6 test suite in `engine/loadtest/` covering concurrent production traffic patterns. See [`engine/loadtest/BENCHMARKS.md`](../loadtest/BENCHMARKS.md).
-
-| Scenario | File | What it measures |
-|---|---|---|
-| Smoke | `scenarios/smoke.js` | Health, basic search/write, gate before heavier runs |
-| Search throughput | `scenarios/search-throughput.js` | Concurrent read performance, p95/p99 latency under ramp |
-| Write throughput | `scenarios/write-throughput.js` | Batch write concurrency, task creation rate, error rates |
-| Mixed workload | `scenarios/mixed-workload.js` | Concurrent reads + writes, tagged metrics per workload |
-| Spike | `scenarios/spike.js` | Traffic burst recovery, error rates during sudden load jump |
-| Memory pressure | `scenarios/memory-pressure.js` | Validates memory_middleware.rs behavior at Normal/Elevated/Critical pressure levels |
-
-### Large-Dataset Benchmarking (100k docs)
-
-Added by mar22_2. Deterministic 100k-doc product dataset generator with import throughput, search latency, and concurrent load benchmarks. See [`engine/loadtest/BENCHMARKS.md`](../loadtest/BENCHMARKS.md) for results.
-
-| Tool | File | What it measures |
-|---|---|---|
-| Dataset generator | `generate_dataset.mjs` | Deterministic 100k product docs from 25 base products, batched JSONL output |
-| Import benchmark | `import_benchmark.sh` / `import_benchmark.mjs` | Batch ingest throughput, per-batch latency (avg/p95/p99), error rate |
-| Search benchmark | `search_benchmark.sh` / `search_benchmark.mjs` | Latency by query type (prefix, typo, multi-word, facet, geo, filter, highlight) |
-| k6 concurrent load | `benchmark_k6.sh` | Full k6 suite against 100k-doc index |
-| Dashboard perf | `tests/e2e-ui/full/large-index-perf.spec.ts` | Page load and search responsiveness with 100k-doc index |
-
-### Regression Guard Scripts
-
-CI-runnable scripts that verify documentation accuracy and API completeness against a live server.
-
-| Script | Purpose |
-|---|---|
-| `engine/tests/readme_api_smoke.sh` | Starts a clean server, executes every API curl example from the root README, asserts correct responses |
-| `engine/tests/validate_doc_links.sh` | Checks all internal markdown links in the current public routing docs (`README.md`, `PROJECT_OVERVIEW.md`, `ROADMAP.md`, `engine/README.md`, `engine/docs/HIGHEST_LEVEL.md`, `engine/docs2/FEATURES.md`, and `engine/docs2/1_STRATEGY/HIGHEST_PRIORITY.md`) resolve to real files |
-| `engine/tests/integration_smoke.sh` | Comprehensive 513-line API integration test: 13 categories (health, index CRUD, doc CRUD, search variants, settings, synonyms, rules, analytics, API keys, dashboard, multi-index, browse, task status). Added by mar22_pm_3. |
-| `engine/tests/upgrade_smoke.sh` | Starts an older binary on a temp data dir, seeds data, then upgrades that same dir to a newer binary and re-verifies health/readiness/search/write/dashboard |
-
----
-
-## Current Production-Readiness State
-
-Production-readiness checklist organized by priority tier. Tier 1 items were launch blockers, Tier 2 items are required for production confidence, Tier 3 items can be iterated on post-launch.
-
-v1.0.12, published 2026-08-13, is the current shipped baseline; nobody is running it (see [`PROJECT_OVERVIEW.md`](../../PROJECT_OVERVIEW.md)). Corrected 2026-08-03: this sentence previously overstated the release's commercial adoption. This section remains the canonical readiness snapshot while strategic priority order is routed to [`PROJECT_OVERVIEW.md`](../../PROJECT_OVERVIEW.md) and ongoing lane-state/post-ship sequencing is routed to [`ROADMAP.md`](../../ROADMAP.md) to avoid duplicate live-status prose in this owner.
-
-**Last updated: 2026-08-13.** The published baseline is `v1.0.12`; the Typesense stream and
-write-freeze capabilities described above are included. Tier 1's tenant-authorization defect
-and its separate event-ingress bounded-abuse acceptance is closed locally as `SEC-EVENTS-2`.
-The full-workspace liveness defect is repaired and re-proved; `TEST-FLAKE-1` remains open only because its
-historical deterministic pre-fix reproducer is absent. Distribution state is deliberately not restated
-here: staging and prod currency, CI observation, and scheduled-nightly exits change independently and are
-owned by `ROADMAP.md` rows `SYNC-1`, `CI-E2E-1`, and `NIGHT-1`.
-
-Historical readiness context remains in Git and in the evidence-linked rows below; it is not retained here
-as a second live distribution ledger. In particular, superseded join numerators and dated mirror-lag counts
-must not be copied forward as current readiness facts.
-
-### Tier 1 — Launch Blockers
-
-These must be complete before any customer-facing deployment or open-source release.
-
-| # | Work Item | Status | Description |
-|---|-----------|--------|-------------|
-| PR-1 | `./s/test --all` green | ✅ Done (2026-03-26) | Exact-HEAD wrapper verification passed at commit `aa7dd7db61d7e274cdf946ac6dd7d7435c4dcdf4`, with all 14 sections green. A second independent wrapper proof also completed green on 2026-03-26. Both are superseded historical evidence, not present-tense status. |
-| PR-2 | Load & stress testing | ✅ Done (2026-03-19) | k6 suite in `engine/loadtest/` — 6 scenarios covering search throughput, write throughput, mixed workload, spike, and memory-pressure validation. Branch: `batman/mar19_2_load_stress_testing`. |
-| PR-3 | Tour video completion (Phases 2–5) | ✅ Done (2026-03-20); refreshed 2026-03-30 | Original closure shipped 22/24 archived MP4 artifacts. The former vector/chat blockers (05/06) were later closed with dedicated specs plus default-build/vector+AI runtime wiring, bringing archived per-feature MP4 coverage to 24/24. Branch: `batman/mar19_3_tour_videos_phases_2_5`. |
-| PR-4 | UI/UX audit, polish & Tour Phase 6 | ✅ Done (2026-03-21) | Two parts that must happen together: (1) **Tour Phase 6** — watch all 22 recorded tour videos and identify every moment of confusion, awkward flow, or unclear labeling; (2) **Fix + re-record** — address identified issues across the shipped dashboard route set, re-record final polished videos, create index video. Scope includes error message quality (are failure states helpful and actionable?), empty states, loading states, workflow coherence, information hierarchy. Known issues: (a) API Keys layout "feels chaotic", (b) System > Index Health "too much info at once", (c) sidebar index list clutter. The tour videos are the no-manual-QA equivalent of a human QA pass — watching them *is* the human-perspective walkthrough. |
-| PR-9 | Security audit | ✅ Done (2026-03-21) | Stage 1 closed targeted evidence gaps: malformed-request rejection without panic plus sanitized invalid-credential bodies (`engine/tests/test_security_audit.rs`), restricted-key cross-index denial using shared `key_allows_index()` (`engine/tests/test_tenant_isolation.rs`, `engine/flapjack-http/src/handlers/search/batch.rs`), and API-key entropy coverage near `generate_hex_key()` (`engine/flapjack-http/src/auth_tests/key_store_tests.rs`, `engine/flapjack-http/src/auth/key_store.rs`). Full OWASP top-10 pass complete (2026-05-25). |
-| PR-17 | Insights-route tenant authorization | ✅ Done (2026-08-10) | **Filed and closed the same day; Tier 1 has no open row again.** The defect was reproduced against a local served binary before repair, not inferred from source: a key with ACL `search` and `indexes=["tenant_allowed"]` posted an event whose body named `tenant_forbidden` and received HTTP `200`, then read that same event back through `/1/events/debug` and received HTTP `200`. Fixed at `561cce36b` on every clause of the exit this row named: `/1/events/debug` raised above `search` to the `analytics` ACL; both handlers take the key/app-id extensions and call the shared analytics index-access enforcement; the debug buffer is tenant-filtered; and the current combined-tree `engine/tests/test_tenant_isolation.rs` target covers same-tenant allowed, cross-tenant denied, restricted-key denied, debug tenant-filtering, search-only-key rejection, and bounded ingress — 11 passed, 0 failed. Ledger row: `SEC-EVENTS-1`, closed. Customer-ingress abuse limits were still open on 2026-08-10; the later 2026-08-12 local `SEC-EVENTS-2` close in [`ROADMAP.md`](../../ROADMAP.md) supersedes that historical state. |
-| PR-14 | First-run experience audit | ✅ Done (2026-03-21) | Follow the root quickstart in `../../README.md` from a blank machine with fresh eyes. Time how long it takes to go from binary download → first index → first working search. Document every friction point, confusing error, or missing step. Fix and update docs until the experience is under 5 minutes with zero head-scratching. This is the single highest-impact thing for open-source adoption — a frustrated developer who can't get started in 5 minutes closes the tab. |
-
-### Tier 2 — Production Confidence
-
-Required before we can honestly ask anyone to run this in production. **Flapjack has no users and no customers today** (see [`PROJECT_OVERVIEW.md`](../../PROJECT_OVERVIEW.md)); this tier is the adoption bar, not an incident-response backlog.
-
-| # | Work Item | Status | Description |
-|---|-----------|--------|-------------|
-| PR-5 | Accessibility (axe-core + WCAG) | ✅ Done (2026-03-21) | `@axe-core/playwright` integrated into Playwright suite (`accessibility.spec.ts`). Automated WCAG violation detection covers all dashboard routes for missing labels, broken ARIA, and contrast issues. Known Radix-tab ID suppressions documented inline. |
-| PR-6 | Deep health check | ✅ Done (2026-03-21) | `/health/ready` ships as an operational readiness probe (`engine/flapjack-http/src/handlers/readiness.rs`) with canonical 503 failure envelope and 200 on healthy/empty-node states. Bug fixed 2026-03-23: `_usage/` excluded from tenant probing in `tenant_dirs.rs`. Future depth additions (S3 accessibility, replication connectivity, index-file readability) tracked separately if needed. |
-| PR-7 | Latency histograms + performance baseline | ✅ Done (2026-03-21) | Stage 3 shipped request-latency histogram instrumentation (`engine/flapjack-http/src/latency_middleware.rs`) and `/metrics` exposition integration (`engine/flapjack-http/src/handlers/metrics.rs`). Stage 4 published the benchmark baseline in [`engine/loadtest/BENCHMARKS.md`](../loadtest/BENCHMARKS.md); `engine/loadtest/run.sh` exits with code 99 only for threshold breaches while completing all scenarios. Benchmark figures remain owned by `BENCHMARKS.md`. |
-| PR-8 | Error recovery + data durability | ✅ Done (2026-03-21) | Delivered targeted integration tests: (a) crash-during-indexing → restart → zero data loss (`crash_durability_test.rs`), (b) restart-during-active-writes → acknowledged writes survive (`restart_during_writes_test.rs`), (c) replication peer catch-up reconnection, (d) S3 backup/restore round-trip, (e) multi-tenant isolation under adversarial load (`test_tenant_isolation.rs`). 2h soak artifacts prove bounded latency and exact post-restart count preservation. |
-| PR-10 | Chaos / resilience testing | 🟡 Partially covered — 1 mode open (2026-08-01) | **Narrowed 2026-08-01:** the originally planned `engine/scripts/chaos_test.sh` + `engine/tests/test_resilience_isolation.rs` were never created and remain the one still-open mode. Of the four named adversarial modes: **kill-server-mid-write is covered** by `crash_durability_test.rs`, `restart_during_writes_test.rs`, and `idempotency_restart_durability_test.rs`. **fill-disk-mid-write now has a bounded Darwin APFS probe and an automated acceptance contract** — `engine/_dev/s/manual-tests/20260730_disk_exhaustion_durability.sh` (bounded 32 MiB attached image, evidence-before-teardown, exact-PID interrupt handling) and `engine/loadtest/tests/disk_exhaustion_acceptance.sh` (sole automated evidence consumer) — but the mode remains **product-gap-routed, not closed**: retained specimens prove no panic and a sanitized HTTP 500 rejection, yet a rejected batch replays into the index on restart (76 acknowledged vs 80 recovered, extras `disk-020-00`..`disk-020-03`, reproduced 5/5), and the post-restart write property is unproven. Closing it requires fixing the write-queue durable-admission / commit-finalization defect in `engine/src/index/write_queue/{admission.rs,finalization.rs,mod.rs}` — tracked as `ROADMAP.md` row `DUR-1` — and then three sequential final-HEAD specimens passing `disk_exhaustion_acceptance.sh`. **partition-replica-from-primary is now covered** by an asserted replica-partition-healing contract: `engine/examples/ha-cluster/test_ha_partition.sh` drives isolate→acknowledged-write→heal→exact-set convergence with acknowledged-union and no-ack oracles. **OOM-kill-and-restart is now covered**: `engine/examples/ha-cluster/test_oom_kill_durability.sh` forces a Docker `State.OOMKilled=true` kill mid-write and asserts acknowledged-write recovery equals the acknowledged oracle with zero rejected-batch replay; `engine/loadtest/scenarios/memory-pressure.js` still only observes memory-pressure middleware and is not the OOM oracle. Both scenarios are held by the standing acceptance contract `engine/loadtest/tests/chaos_residual_modes_acceptance.sh`, whose fail-capability is proven by `engine/loadtest/tests/chaos_residual_modes_acceptance_selftest.sh` driving each scenario's own negative control (`FLAPJACK_OOM_NEGATIVE_EMPTY_RESTART=1`, `FLAPJACK_PARTITION_SKIP_HEAL=1`) red. Evidence receipts: [`4_EVIDENCE/2026_07_30_jul30_12am_5_disk_exhaustion_receipt.md`](4_EVIDENCE/2026_07_30_jul30_12am_5_disk_exhaustion_receipt.md), [`4_EVIDENCE/2026_07_31_jul31_5pm_1_chaos_residual_modes_receipt.md`](4_EVIDENCE/2026_07_31_jul31_5pm_1_chaos_residual_modes_receipt.md). |
-
-### Post-Launch Work
-
-Important for long-term operational maturity. Can iterate after initial release.
-
-| # | Work Item | Status | Description |
-|---|-----------|--------|-------------|
-| PR-11 | Distributed tracing (OpenTelemetry) | ✅ Done (2026-03-28) | OTLP gRPC trace export is shipped behind the `otel` Cargo feature flag. Runtime configuration uses `OTEL_EXPORTER_OTLP_ENDPOINT`, and startup wiring now initializes OTEL when the endpoint is set. |
-| PR-12 | Runbooks & incident response | ✅ Done (2026-05-25) | Closeout verified in `engine/docs2/3_IMPLEMENTATION/OPERATIONS.md` with 19 `### Scenario` runbooks and explicit `**Test (where applicable):**` markers; Stage 2 regression coverage commands reran green at HEAD in this stage: `cargo test -p flapjack-http readiness::tests -- --test-threads=1`, `cargo test -p flapjack-http startup_catchup::tests -- --test-threads=1`, `cargo nextest run --test test_replication -E "test(test_startup_catchup_noop_without_replication) or test(test_two_node_startup_catchup_via_get_ops) or test(test_restart_catches_up_before_serving)"`, and `cargo nextest run -p flapjack-server --test admin_key_test` (evidence intentionally excludes the separately tracked ignored admin-key concurrency regression). |
-| PR-16 | Disaster recovery measured backup/restore contract | ✅ Done (2026-05-25) | File-snapshot DR contract is now documented in [`engine/docs2/3_IMPLEMENTATION/DISASTER_RECOVERY.md`](3_IMPLEMENTATION/DISASTER_RECOVERY.md) from the Stage 1 measured artifact (`engine/target/dr_proof/latest/measurements.txt`): `RPO_MEASURED_MS=10`, `RTO_MEASURED_MS=221`, and exact `DOC_COUNT_AT_SNAPSHOT=DOC_COUNT_AT_RESTORE=550` parity under active-write snapshot capture. |
-| PR-13 | Mobile / responsive dashboard | ✅ Done (2026-08-03) | Shared 390px overflow is closed. The audited denominator is 23 authenticated routes, and all 23 are usable without document-level horizontal overflow. `AUD-SHARED-001` in [`docs/screen_specs/_audit.md`](../../docs/screen_specs/_audit.md) is closed; rendered evidence identified `Layout.tsx`, `Header.tsx`, and `ApiLogger.tsx` as the owners. The route-audit exit reported `tested 23 usable 23`, and its negative control made all 23 routes unusable before restore, proving the oracle can fail. This is 390px usability, not phone-native optimisation; the admin console remains deliberately desktop-first. Receipt: the reviewed private dashboard 390px receipt. |
-| PR-14 | Search HA ownership/freshness design | 🔴 Deferred / design gate required | Active health probing already exists, but automatic search write promotion remains unsafe until index ownership, generation/term, replica freshness, restart recovery, and split-brain behavior have one tested source of truth. Safe forwarding/503 behavior can proceed after that abstraction is specified. |
-| PR-15 | Durable analytics rollup writer/query planner | ✅ Done (2026-05-25) | The Apr 15 design foundation is now fully closed: rollup writer, query-planner fallback, and certified-coverage retention gating are shipped. See the durable analytics row in [Analytics & Insights](#analytics--insights) for canonical code-owner and proof references. |
-
-### Completed Work Archive
-
-| Date | Milestone | Details |
-|------|-----------|---------|
-| 2026-05-27 | may27_1: PL-9 rollup window override shipped (commits `9353fca8` + `05b4ae8b`) | `FLAPJACK_ROLLUP_WINDOW_OVERRIDE_MS` now resolves through `engine/src/analytics/mod.rs`, is consumed by `engine/flapjack-http/src/background_tasks.rs` + `engine/src/analytics/writer.rs`, and is passed through `engine/loadtest/soak_proof.sh` so the soak harness and engine use the same window width. Executable proofs: `engine/loadtest/tests/soak_proof_analytics_acceptance.sh` and `engine/loadtest/tests/analytics_soak_window_override_acceptance.sh`. |
-| 2026-05-26 | may26_pm_3: PL-1 test-hang CI-side cap closeout | Canonical timeout-policy completion recorded from current HEAD acceptance proof: `.github/workflows/ci.yml` and `.github/workflows/nightly.yml` now enforce `timeout-minutes: 10` on the five direct `cargo nextest run` steps, with contract assertions in `engine/tests/ci_test_timeout_cap_acceptance.sh`. |
-| 2026-03-13 | Backend API 197/197 | Full Algolia parity verified; the detailed audit history is retained in the dev repo. |
-| 2026-03-13 | SDK compatibility verified | JS (32 contract + 13 compat), PHP, Python, Ruby, Go, Java, Swift smoke tests, InstantSearch.js (15 contract tests). |
-| 2026-03-14 | Dashboard route inventory shipped | 22 user-facing routes backed by 21 lazy-loaded page components, with zero stubs. |
-| 2026-03-14 | GL-1 through GL-9 | Griddle launch checklist complete. |
-| 2026-03-18 | MAR18 Workstream A | CRUD & data management e2e hardening — 7 stages, 19/19 checks. |
-| 2026-03-18 | MAR18 Workstream B | Intelligence & analytics e2e hardening — 5 stages, 18/20 checks. |
-| 2026-03-18 | MAR18 Workstream C | System, devtools, edge cases e2e hardening — 6 stages, 16/16 checks. |
-| 2026-03-18 | E2E test count: 340/340 | Up from 320. All passing across 36 spec files (baseline before mar19_1). |
-| 2026-03-18 | Tour system bootstrap (Phase 0 + Phase 1 partial) | Infrastructure + 5/24 specs (01-04, 09). |
-| 2026-03-19 | PR-1: `./s/test --all` green | Historical milestone; later superseded by exact-HEAD wrapper reruns, including the final 2026-03-26 green proof at commit `a220e66c`. |
-| 2026-03-19 | PR-2: Load & stress testing | k6 suite built — 6 scenarios, `engine/loadtest/`. |
-| 2026-03-19–20 | PR-3: Tour videos phases 2–5 | 17 new specs (07-24 minus 05/06), 22/24 total with MP4 artifacts. Rust source fixes: index recovery, relevance scoring. IndexTabBar refactor. |
-| 2026-03-20 | mar20_2 observability/security (Stages 1–3) | Stage 1 closed targeted PR-9 security-coverage gaps (malformed-request rejection without panic, sanitized invalid-credential bodies, restricted-key cross-index denial via shared `key_allows_index()`, API-key entropy tests). Stage 2 shipped `/health/ready` with canonical readiness error contract. Stage 3 shipped request-latency histogram instrumentation and `/metrics` exposition wiring. |
-| 2026-03-21 | mar20_2 observability/security (Stage 4 baseline artifact) | Published the loadtest baseline artifact in [`engine/loadtest/BENCHMARKS.md`](../loadtest/BENCHMARKS.md); `engine/loadtest/run.sh` now reports threshold-breach runs with exit code 99 after completing all scenarios. |
-| 2026-03-21 | mar21_1: Vector search first-class (Stages 1–3) | Stage 1: `capabilities` object (`vectorSearch`, `vectorSearchLocal`) in `/health` + startup banner. Stage 2: all 4 dashboard components capability-aware (Chat, SearchModeSection, EmbedderPanel, VectorStatusBadge) with e2e route-interception tests. Stage 3: `VECTOR_SEARCH_QUICKSTART.md` created and linked. Branch: `batman/mar21_1_vector_search_first_class`. |
-| 2026-03-21 | mar21_2: Federated multi-index search (Stages 1–5) | Full Meilisearch-compatible federation: `federation.rs` module (419 lines) with weighted RRF merge, `FederationConfig`/`FederationMeta`/`FederatedResponse` types, wired into batch handler. OpenAPI annotations, JS SDK federation types added. Design doc: `FEDERATED_SEARCH_DESIGN.md`. Integration tests in `test_federated_search.rs`. Branch: `batman/mar21_2_federated_multi_index_search`. |
-| 2026-03-21 | mar21_3: Observability & ops hardening (Stages 1–2, 4–6) | Stage 1: `x-request-id` middleware (forwarded or UUID v4 generated). Stage 2: `FLAPJACK_LOG_FORMAT=json` structured logging. Stage 4: `FLAPJACK_ALLOWED_ORIGINS` configurable CORS. Stage 5: `FLAPJACK_SHUTDOWN_TIMEOUT_SECS` graceful shutdown. Stage 6: startup dependency summary. Stage 7: `OPS_CONFIGURATION.md` env var reference. Stage 3 (OpenTelemetry OTLP export) was completed later on 2026-03-28. Branch: `batman/mar21_3_observability_ops_hardening`. |
-| 2026-03-22 | mar22_1: Regression fix & validation sweep | OpenAPI spec regenerated (federation + observability routes). README API smoke script (`engine/tests/readme_api_smoke.sh`) and doc link validator (`engine/tests/validate_doc_links.sh`) created. Rust test suite and Playwright smoke confirmed green post-merge. Branch: `batman/mar22_1_regression_fix_and_validation_sweep`. |
-| 2026-03-22 | mar22_2: Large-dataset performance benchmarking | Deterministic 100k-doc generator (`generate_dataset.mjs`), import throughput benchmark (`import_benchmark.sh`), search latency benchmark by query type (`search_benchmark.sh`), k6 concurrent load runner (`benchmark_k6.sh`), dashboard large-index perf test (`large-index-perf.spec.ts`). Baseline compilation script (`compile_baseline.sh`). Branch: `batman/mar22_2_large_dataset_performance_benchmarking`. |
-| 2026-03-22 | mar22_3: HA & deployment verification | Docker single-node, 3-node HA cluster, 2-node replication/analytics fan-out, and S3 snapshot/restore all verified end-to-end via Docker. Dockerfile bind-address fix (`ENV FLAPJACK_BIND_ADDR=0.0.0.0:7700`). New S3 snapshot example (`engine/examples/s3-snapshot/`). HA test script tightened with in-network health probes. Deployment and HA docs reconciled to match verified proofs. S3 snapshot audit doc (`3_IMPLEMENTATION/S3_SNAPSHOT_AUDIT.md`). Branch: `batman/mar22_3_ha_and_deployment_verification`. |
-| 2026-03-23 | mar22_pm_1: Full test suite regression gate | Crate-by-crate Rust test validation, fixed taskID alias collisions in index manager (`lifecycle.rs`, `write.rs`, `mod.rs`), fixed 21 dashboard test regressions (unit + e2e), refreshed openapi snapshot fixture, stabilized query-suggestions e2e, and captured wrapper proof artifacts. That run stayed non-green (`a6a12ea1`); launch authority was later superseded by the green proof at commit `a220e66c`. Branch: `batman/mar22_pm_1_full_test_suite_regression_gate`. |
-| 2026-03-23 | mar22_pm_2: Documentation accuracy audit | All 6 stages complete. Mechanical code-vs-docs verification across all public-facing documents: env var completeness (OPS_CONFIGURATION.md canonical), feature comparison table verified, quickstart guides reconciled against live contracts, cross-doc DRY violations fixed, PHASES.md deprecated, terminology normalized. Tightened SSL config assertions (`flapjack-ssl/src/config.rs`). 1 code blocker was logged in an internal audit note (`/health/ready` unit test vs runtime mismatch). All validation scripts pass. Branch: `batman/mar22_pm_2_docs_accuracy_audit`. |
-| 2026-03-23 | mar22_pm_3: Benchmark validation & integration smoke | New comprehensive API integration smoke test (`engine/tests/integration_smoke.sh`, 513 lines) exercising 13 API path categories. Updated benchmark baseline compilation (`compile_baseline.mjs/sh`). Large-dataset baseline: 100k docs imported in 48.4s, search p95 128ms, all 6 k6 scenarios PASS (Apple M4 Max). Results in [`engine/loadtest/BENCHMARKS.md`](../loadtest/BENCHMARKS.md). Branch: `batman/mar22_pm_3_benchmark_and_smoke`. |
-| 2026-03-24 | mar23_pm_4: README screenshot automation | Created automated Playwright e2e test `readme-screenshots.spec.ts` (73 lines) covering Overview, Search, and Migrate screenshot capture with readiness contracts. Branch: `batman/mar23_pm_4_readme_screenshots`. |
-| 2026-03-24 | mar23_pm_5: Systemd VPS deployment docs | Improved `engine/examples/systemd/README.md` with production guidance (env file setup, admin key requirements, `/health/ready` probe verification). This remained docs-only at the time and was later closed by the 2026-03-26 live VPS verification. Branch: `batman/mar23_pm_5_systemd_vps_smoke_test`. |
-| 2026-03-24 | mar23_pm_6: Test stability & launch status reconciliation | Fixed `Recommendations.test.tsx` (network-noise isolation, test helper refactoring), `analytics-deep.spec.ts` (California hardcode → flexible assertion), `sdk_test/package.json` update, bundler dedup verification script. Launch docs reconciled with canonical wrapper proof status. Branch: `batman/mar23_pm_6_test_all_green`. |
-| 2026-03-25 | mar24_pm_1: test hardening at current HEAD | Hardened `query-suggestions.spec.ts` readiness waits, `local-instance-config.ts` parsing/URL handling, Playwright worker override support, socket-churn retries in Rust integration tests, and refreshed the tracked README screenshot PNGs. Targeted validations passed at HEAD; the port-contention issue seen in earlier wrapper runs was resolved in the final green proof at commit `a220e66c`. Branch: `batman/mar24_pm_1_test_suite_green`. |
-| 2026-03-25 | stage_04: exact-HEAD wrapper proof refresh | Ran the canonical wrapper at commit `23ac8a9e76c90cf2c36c447b812acdcbf0e32d4e`; executed sections `[1]-[5]` passed, and the first failing executed section was `[6]` Dashboard Playwright smoke (`127.0.0.1:53142` already in use). |
-| 2026-03-25 | mar24_pm_2: repo hygiene fixes | Landed the safe hygiene subset: public-repo URL updates in README/show-HN/deployment docs, `<repo-root>` placeholders in retained docs, path-agnostic deploy/sync helper scripts, and cleanup of the duplicated `load_local_instance_config` TODO block. Destructive doc/history removals from the worktree branch were intentionally not merged into `main`. Branch: `batman/mar24_pm_2_repo_hygiene_sweep`. |
-| 2026-03-25 | mar25_pm_10: exact-HEAD wrapper proof | Fixed `local-instance-config.ts` quoted-value comment-stripping bug via TDD (new test file `local-instance-config.test.ts`). Produced proof artifacts in the dev repo. Green run at commit `0dc55b39` passed all executed sections [1]-[13]. Subsequent verification run at commit `23ac8a9e` was red due to Playwright port contention (`127.0.0.1:53142` already in use), not a code defect. Updated launch-status docs. Branch: `batman/mar25_pm_10_exact_head_wrapper_proof`. |
-| 2026-03-25 | mar25_pm_11: live linux systemd VPS validation | Attempted VPS validation of systemd deployment path. Fixed the EC2 SSH helper to fall back to `~/.ssh`. Refactored the internal local-instance shell helper to use safe KEY=value parsing instead of shell sourcing — adds helper functions for config loading, hostname extraction, loopback detection, and inline comment stripping. Locally verified systemd artifact consistency (`flapjack.service`/`env.example`/README alignment, `/health` + `/health/ready` route contracts). VPS host reachability timed out at that time; this failed attempt was later superseded by the 2026-03-26 successful live verification. Branch: `batman/mar25_pm_11_live_linux_systemd_vps_validation`. |
-| 2026-03-25 | mar25_pm_13: live VPS systemd validation (second attempt) | Re-attempted VPS validation; SSH still timing out to `44.202.224.48`. Code review posthoc stages cleaned up analytics test doc comments (`analytics_tests.rs`: replaced TODO stubs with meaningful descriptions), refactored `hybrid.rs` (removed `#[allow(dead_code)]` suppressions, simplified `build_fused_document` and `requested_hybrid_params` with idiomatic Rust), and refactored `search_compat.rs` (extracted `search_with_legacy_options` helper, cleaned doc comments). This failed attempt was later superseded by the 2026-03-26 successful live verification. Branch: `batman/mar25_pm_13_live_vps_systemd_validation`. |
-| 2026-03-25 | mar25_pm_14: Rust code quality audit + leaky test fix | Fixed the intermittent nextest leak in integration test local helpers (`engine/tests/common/state.rs` and `engine/tests/common/http.rs`): proper server shutdown and resource cleanup to eliminate leaked child processes/file descriptors. Fixed 2 clippy warnings (feature-gated `dead_code` in `hybrid.rs` — resolved by pm_13's posthoc refactor removing the suppressions entirely). Fixed 6 `cargo fmt` diffs (leading blank lines in `dictionaries.rs`, `metrics.rs`, `notifications.rs`, `rollup_broadcaster.rs`, `router_tests.rs`, `startup_catchup.rs`). Additional cleanup in `language.rs`, `decompound.rs`, `stopwords/mod.rs`, `write_queue/` modules. Nextest now reports 0 leaky, 0 failed. `cargo clippy --workspace` clean. `cargo fmt --check` clean. Branch: `batman/mar25_pm_14_rust_quality_leaky_test`. |
-| 2026-03-28 | mar28: Stage 4-6 confidence-completeness ops/security pass | Added `engine/tests/upgrade_smoke.sh` and proved upgrade handoff from the gate-closing staging commit `745a059` to the current binary on the same data dir. Added canonical operator docs in [`engine/docs2/3_IMPLEMENTATION/OPERATIONS.md`](3_IMPLEMENTATION/OPERATIONS.md) and scoped hardening guidance in [`engine/docs2/3_IMPLEMENTATION/SECURITY_BASELINE.md`](3_IMPLEMENTATION/SECURITY_BASELINE.md). Also tightened the MinIO snapshot harness to match its no-auth compose stack and fail fast when a stray local `flapjack` owns `127.0.0.1:7700`. |
-| 2026-03-28 | mar28: Stage 3 soak/failure proof pack | Added `engine/flapjack-server/tests/restart_during_writes_test.rs`, extended `crash_durability_test.rs` with a nontrivial acknowledged-dataset recovery proof, and completed 2h `mixed-soak` / `write-soak` artifact capture with `engine/loadtest/soak_proof.sh`. The new soak artifacts prove bounded latency, zero `5xx`, restart-safe recovery, and exact post-soak/post-restart count preservation, while also documenting that the current single-node write-overload thresholds still breach under prolonged overload on this host. |
-| 2026-03-26 | mar25_pm_12: Playwright port hardening + wrapper green proof | Fixed port contention between Playwright smoke and full e2e runs within `./s/test --all`. Added a port-release wait step in the canonical test wrapper and `--wait-port-free` mode in `engine/dashboard/scripts/playwright-webserver.mjs`. New vitest coverage for port-wait logic. JSDoc cleanup in `local-instance-config.ts`. Produced an authoritative green exact-HEAD wrapper proof at commit `a220e66c`, with all 14 sections passed. Resolves launch blocker #1 (PR-1). Branch: `batman/mar25_pm_12_playwright_port_wrapper_proof`. |
-| 2026-03-26 | stage_04: VPS systemd proof reconciliation | Published a redacted maintained evidence summary in the dev repo from the live Stage 3 run/review, updated launch status ledgers to remove stale VPS blocker language, and added the explicit Linux binary prerequisite in `engine/examples/systemd/README.md`. |
-| 2026-03-26 | mar26_am_1: HA cluster dashboard | New Cluster page in React dashboard (`engine/dashboard/src/pages/Cluster.tsx`) showing live peer health with status badges (healthy/stale/unhealthy/circuit_open/never_contacted), auto-refreshing every 5s via `useClusterStatus` hook. Standalone mode shows configuration guidance. Added to sidebar nav and router. Full TDD coverage (`Cluster.test.tsx`, `useClusterStatus.test.ts`). Operator spec at `engine/dashboard/tests/specs/cluster.md`. Branch: `batman/mar26_am_1_ha_cluster_dashboard`. |
-| 2026-03-26 | mar26_am_2: VPS systemd end-to-end proof | Full end-to-end systemd deployment validated on Ubuntu EC2 (c7i-flex.2xlarge, us-east-1). Service account, unit file, env file, health probes, restart recovery, crash recovery all confirmed. EC2 helper script secret-path handling was corrected to use the repo-local secret directory. Resolves launch blocker #2. Branch: `batman/mar26_am_2_vps_systemd_proof`. |
-| 2026-03-26 | mar26_pm_1: Post-merge regression validation | Full test suite validated green after merging am_1 (HA dashboard) and am_2 (VPS systemd). Cargo check/clippy/fmt clean, 2839+ Rust lib tests, 25 server tests, 542+ vitest, nextest 0 leaky, Playwright smoke+full, SDK/CLI all passing. Metrics handler refactored (extracted `storage_bytes_gauge_values` helper), search_compat doc comments cleaned, common.sh refactored. Green wrapper proof at `aa7dd7db` (superseded historical evidence; not current suite status). Branch: `batman/mar26_pm_1_post_merge_regression_validation`. |
-| 2026-03-26 | mar26_pm_2: Debbie config hardening | Replaced dangerous blacklist `.debbie.toml` (syncing entire repo root with 14 exclusions) with proper whitelist config using explicit `sync.files` + targeted `[[sync.dirs]]`. Would have leaked 60+ internal files to public repos. Created `.debbie/post-sync.sh` hook for Cargo.toml path dep fixup. Dry-run validated against staging repo. Branch: `batman/mar26_pm_2_debbie_config_hardening`. |
-| 2026-03-26 | mar26_pm_3: README & Show HN launch polish | Fixed 4 stale Show HN claims ("English-only, no vector search, no HA" — all shipped). Root README: feature table verified, architecture tree duplicate fixed, Docker Compose quickstart added (`engine/examples/quickstart/`). engine/README cleaned for public audience. FEATURES.md spec counts corrected to 46. Branch: `batman/mar26_pm_3_readme_launch_polish`. |
-| 2026-03-27 | mar26_pm_4: Dev repo test suite + Docker build | Second independent full test suite proof at HEAD; all 14 sections green. Docker build verified with container health + search smoke test. Added `search_compat` shim unit + integration tests. Branch: `batman/mar26_pm_4_dev_repo_test_suite_and_docker`. |
-| 2026-03-27 | mar26_pm_5: Debbie staging sync config hardening | Fixed legacy identity values to the correct public-target mappings. Added `ROADMAP.md`, `engine/docs2/` strategy docs, `engine/examples/`, `integrations/laravel-scout/`, CI shell scripts to sync whitelist. Sanitized `FEATURES.md` and `TESTING.md` to remove private dashboard path references for public staging. Executed real debbie sync to staging clone. Stage 4 (staging push + CI) deferred. Branch: `batman/mar26_pm_5_debbie_sync_staging_ci`. |
-| 2026-03-27 | mar27_noon: Staging push + CI fix | Fixed `.debbie.toml` whitelist gaps (`validate_doc_links.sh`), fixed post-sync hook to handle `branch =` tantivy deps alongside `path =`, fixed `integration_smoke.sh` executable bit. Pushed to staging repo and drove CI through 6+ rounds of fixes. Key code fixes: dashboard chat e2e specs (embedder readiness), API key create `200` alignment, A/B test create `200` alignment, stale CRUD setup expectations, crash-durability task-poll helper retry robustness, OpenAPI typed-schema corrections. Commits: `d7beff86` through `45374320`. |
-| 2026-03-27 | mar27_pm: Launch gate closure + truth-sync | 5-stage launch completion: (1) Staging CI green via gate-closing run `23671792399` on commit `745a059`; (2) truth-synced PRIORITIES.md, ROADMAP.md, HIGHEST_PRIORITY.md to match live launch state; (3) public launch surface audit — README smoke 6/6, doc-link validation green, all live public URLs returning 200; (4) a launch proof pack was created in the dev repo; (5) Algolia compat sprint checklist drafted. |
-| 2026-03-27 | mar27_night: Algolia compat hardening | Built deterministic parity foundation: canonical high-risk mutation inventory in `engine/flapjack-http/src/mutation_parity.rs`, behavior-level parity checks in `engine/tests/test_mutation_parity.rs`, spec-level parity checks in `flapjack-http::openapi::tests::high_risk_mutation_openapi_contracts_match_shared_matrix`. Caught and fixed additional drift: `POST /1/indexes/{indexName}` corrected to `201`, missing OpenAPI paths for auto-ID save and partial update, stronger `/2/abtests/{id}/conclude` schema. All 5 stages (mutation matrix, artifact coupling, mirror guards, dashboard readiness contracts, SDK/HTTP reinforcement) complete. |
-| 2026-03-28 | mar28: Soak threshold correction + test coverage expansion | Verified staging CI run `23674270883` (33/33 green). Resolved Stage 3 soak threshold breach by introducing `SOAK_WRITE_THRESHOLDS` in `engine/loadtest/lib/throughput.js` — correctly distinguishes sustained-overload acceptance from short-baseline failure. Expanded test coverage: 4 new federation unit tests + 3 handler tests in `batch_federation.rs`, 2 new cluster status backend tests in `internal_tests.rs`, 8 new extended parity lifecycle/error tests in `tests/test_mutation_parity_extended.rs`. All tests green, clippy clean, fmt clean. |
-| 2026-03-28 | mar28_pm_1: Security, versioning, and release polish | Created SECURITY.md (vulnerability disclosure policy), CHANGELOG.md (Keep a Changelog format with full feature inventory), CONTRIBUTING.md (contributor guide). All three added to `.debbie.toml` sync whitelist. Bumped all 5 workspace crates from 0.1.0 to 1.0.0. Added version consistency test (`engine/flapjack-server/tests/version_consistency_test.rs`). Created a shared version helper for dev release scripts. Branch: `batman/mar28_pm_1_security_versioning_release_polish`. |
-| 2026-03-28 | mar28_pm_2: OpenTelemetry distributed tracing (PR-11) | Feature-gated OTEL OTLP gRPC export behind `--features otel` in `flapjack-http`. New `engine/flapjack-http/src/otel.rs` module with `try_init_otel_layer()` — reads `OTEL_EXPORTER_OTLP_ENDPOINT`, builds OTLP exporter when set, returns None when unset (zero overhead). Wired into tracing subscriber composition in `startup.rs` and graceful shutdown in `server.rs` (provider flush). Updated OPS_CONFIGURATION.md, FEATURES.md, ROADMAP.md, PRIORITIES.md. Both `cargo check -p flapjack-http` and `cargo check -p flapjack-http --features otel` pass clean. Branch: `batman/mar28_pm_2_opentelemetry_distributed_tracing`. |
-| 2026-03-29 | mar28_pm_3: TODO stub cleanup + HA soak hardening | Replaced ~601 auto-generated `TODO: Document` stubs with real doc comments across all 4 crates (engine/src: 271, flapjack-http: 322, flapjack-server: 3, flapjack-replication: 5). Added a dev-repo HA soak test harness for 3-node restart-rotation validation. Doc-regression tests for `run_graceful_shutdown` and `load_server_config`. Module-level `//!` summaries added to key files. Branch: `batman/mar28_pm_3_code_hygiene_todo_cleanup_ha_soak`. |
-| 2026-03-29 | mar29: Codebase cleanup round 2 | Fixed 15 error-leaking 500 response sites in `settings.rs` (7), `snapshot.rs` (7), `query_suggestions.rs` (1) — all migrated to `HandlerError` which auto-sanitizes internal errors. Consolidated duplicate `internal_error` helpers in `rules.rs`/`synonyms.rs` via same migration. Removed 3 `cognitive_complexity` suppressions in `startup_catchup.rs` by extracting `execute_timed_catchup()` and `handle_fetch_error()` helpers. Removed `server.rs` serve() suppression. Decomposed `execute_search_query` (CC=26, 348 NLOC) into phase helpers. Added `validate_restore_key_override` to snapshot handler. New integration test for query suggestions. Updated `engine/CLAUDE.md` with HandlerError and suppression guidance. Branch: `batman/mar29_codebase_cleanup_checklist`. |
-| 2026-03-29 | mar29_pm_1: HA multi-node soak harness + CI integration | Completed HA soak confidence infrastructure for the multi-node branch: a dev-repo harness script, Rust structural integration test (`engine/tests/test_ha_soak_harness.rs`), and shell acceptance checks for soak/topology (`engine/loadtest/tests/ha_soak_acceptance.sh`, `engine/loadtest/tests/ha_topology_acceptance.sh`). Multi-node soak execution itself remains Docker-daemon dependent and was explicitly deferred when Docker is unavailable. Branch: `batman/mar29_pm_1_ha_multi_node_soak`. |
-| 2026-03-31 | mar30_pm_5: Full regression gate + targeted fixes | Ran the full post-merge regression gate across Rust, dashboard, browser, SDK, and Go surfaces. The confirmed regression was FastEmbed test nondeterminism from concurrent ONNX/model cache initialization; affected local-embedder tests are now serialized in `engine/src/vector/embedder_tests.rs` and `engine/src/index/write_queue_tests.rs`. Proof artifacts were recorded in `engine/state/`. The follow-through merge on 2026-03-31 also restored real summaries for `browse_index` and the experiment CRUD/conclude handlers and regenerated `engine/docs2/openapi.json`, leaving `openapi_export_tests::committed_docs2_openapi_matches_export_output` green at current `main`. Branch: `batman/mar30_pm_5_full_regression_gate_targeted_fixes`. |
-| 2026-03-31 | mar30_pm_6: Public doc sync surface hardening | Hardened the public documentation contract so canonical routing docs are explicitly synced instead of relying on stale mirror state. `.debbie.toml` now whitelists the canonical public doc graph (`ROADMAP.md`, `PRIORITIES.md`, `engine/LIB.md`, `engine/docs2/FEATURES.md`, `engine/loadtest/BENCHMARKS.md`, `engine/docs2/1_STRATEGY/`, `engine/docs2/3_IMPLEMENTATION/`). Added `engine/tests/doc_sync_helpers.sh`, a dedicated `engine/tests/validate_sync_surface.sh`, widened `engine/tests/validate_doc_links.sh`, and scrubbed non-public path references from the newly public docs, including removing dev-only `_dev/s/` multi-instance helpers from `engine/README.md`. Branch: `batman/mar30_pm_6_public_doc_sync_surface_hardening`. |
-| 2026-03-31 | mar31_am_2: HA convergence contract + runbook truth sync | Added `engine/docs2/4_EVIDENCE/HA_CONVERGENCE_ANALYSIS.md`, aligned `engine/docs2/3_IMPLEMENTATION/OPERATIONS.md` and `engine/examples/ha-cluster/README.md` with the proven async-replication boundary, and tightened `engine/loadtest/tests/ha_soak_acceptance.sh`. Branch: `batman/mar31_am_2_ha_convergence_contract_and_runbook_truth_sync`. |
-| 2026-03-31 | mar31_am_1: Debbie sync wave 3 | Published the then-current post-launch hardening to staging commit `6166055` (CI run `23818440499`) and prod commit `b7841a0` (CI run `23819698304`), carrying the HA boundary truth surfaces, public doc sync contract, regression-gate follow-through, and refreshed committed OpenAPI export. Branch: `batman/mar31_am_1_green_baseline_and_wave3_public_sync`. |
-| 2026-03-31 | mar31_pm_1: Nightly CI + sync hygiene | Restored nightly Rust CI parity by stubbing the dashboard dist asset, added `CHANGELOG.md` / `CONTRIBUTING.md` / `SECURITY.md` to `.debbie.toml`, and tightened root README vector/hybrid caveats so pre-built Linux/Windows binary limits match the real release matrix. This was later published in the completed public lineage (see [Public Sync Lineage Ledger (Canonical)](#public-sync-lineage-ledger-canonical)). Branch: `batman/mar31_pm_1_ci_and_sync_hygiene`. |
-| 2026-03-31 | mar31_pm_2: Operations runbook hardening | Expanded `engine/docs2/3_IMPLEMENTATION/OPERATIONS.md` with proof-backed failure-mode runbooks, ownership cross-links, corrected `reset-admin-key` CLI ordering, and tighter readiness/replication proof citations. This was later published in the completed public lineage (see [Public Sync Lineage Ledger (Canonical)](#public-sync-lineage-ledger-canonical)). Branch: `batman/mar31_pm_2_operations_runbook_hardening`. |
-| 2026-03-31 | mar31_pm_3: Security baseline docs + test coverage | Added the canonical HTTP-hardening ledger in `engine/docs2/3_IMPLEMENTATION/SECURITY_BASELINE.md` and the paired audit matrix in `engine/docs2/4_EVIDENCE/SECURITY_BASELINE_AUDIT.md`, documenting CORS, trusted-proxy, rate-limit, and body-limit behavior with proof references. Added focused security proofs and aligned `startup_catchup.rs` so non-strict bootstrap logs write-queue timeout instead of failing startup. Branch: `batman/mar31_pm_3_security_baseline_docs_and_tests`. |
-| 2026-03-31 | mar31_pm_4: Security baseline follow-through | Closed the remaining scoped HTTP-hardening proof gaps with invalid-key non-consumption and `FLAPJACK_MAX_BODY_MB` `413` tests, extracted `max_body_mb_from_value`, aligned the audit/doc surfaces, refreshed `engine/docs2/openapi.json`, and hardened sync helpers against symlinked destinations. Branch: `batman/mar31_pm_4_security_baseline_followthrough`. |
-| 2026-03-31 | mar31_pm_5: Runbook parity + admin-key truth sync | Standardized the explicit `flapjack --data-dir <path> reset-admin-key` contract across startup output, dashboard auth help, `engine/docs/AUTH_DESIGN.md`, and `engine/docs2/3_IMPLEMENTATION/OPERATIONS.md`, including shell-quoted output for spaced paths. Branch: `batman/mar31_pm_5_runbook_parity_and_admin_key_truth_sync`. |
-| 2026-03-31 | mar31_pm_6: Experiment handler merge guardrails | Routed `/2/abtests/{id}/results` through `resolve_store_and_experiment_id()`, added direct results-endpoint seam proofs for store-unavailable plus numeric/UUID resolution, removed the orphaned old OpenAPI test file, and aligned experiment OpenAPI docs with the resolver-driven `500` path. Branch: `batman/mar31_pm_6_experiment_handler_merge_guardrails`. |
-| 2026-04-08 | apr08: targeted cleanup follow-through | Extracted dashboard experiment payload normalization/results typing into `engine/dashboard/src/lib/experiment-normalization.ts` with focused tests, reducing `useExperiments.ts` to hook concerns, and removed a stale `clippy::cognitive_complexity` suppression from `flapjack-http/src/server.rs` after re-verifying the crate stays clippy-clean. Commits: `44e7fa9c`, `7250f00b`. |
-| 2026-04-15 | apr07_pm_2: analytics retention hardening | Hardened partition-retention behavior with deterministic cutoff tests, preserved the 90-day default, documented the actual env/config surface, added durable rollup design and known-answer query contracts, and merged rollup schema/config/manifest foundation. Later rollup writer/query-planner/retention-gate shipped status is owned by the Analytics & Insights durable rollup storage row. Branch: `batman/apr07_pm_2_analytics_phase5_retention`. |
-| 2026-04-15 | apr07_pm_3: test hygiene and safety audit | Added public CI SDK contract coverage, tightened dashboard/browser false-positive patterns, added targeted plural/analytics collector tests, converted confirmed filter query crash paths to typed errors with safer formatting, sanitized experiment internal errors, removed stale test shims, and aligned canonical runner docs. OpenAPI snapshot follow-up remained deferred in the session handoff. Branch: `batman/apr07_pm_3_test_hygiene_and_safety_audit`. |

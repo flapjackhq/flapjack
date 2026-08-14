@@ -978,9 +978,10 @@ async fn a07_repeated_invalid_credentials_keep_canonical_403_and_do_not_consume_
 // recorded no-op rather than a live exploit test.
 #[allow(clippy::assertions_on_constants)]
 async fn a07_session_fixation_and_jwt_downgrade_are_not_applicable_to_current_auth_surface() {
-    // Flapjack's HTTP auth model at HEAD is API-key only (direct keys + HMAC
-    // secured keys). There is no session cookie state or JWT verifier seam in
-    // the auth owners, so session fixation/JWT downgrade are N/A for this stage.
+    // Flapjack's HTTP auth model at HEAD is API-key only (direct keys,
+    // PBV1 bearer-carried raw keys, and HMAC secured keys). There is no session
+    // cookie state or JWT verifier seam in the auth owners, so session
+    // fixation/JWT downgrade are N/A for this stage.
     const HAS_SESSIONS: bool = false;
     assert!(
         !HAS_SESSIONS,
@@ -997,8 +998,8 @@ async fn a07_session_fixation_and_jwt_downgrade_are_not_applicable_to_current_au
         mod_src.to_ascii_lowercase(),
     ] {
         assert!(
-            !src.contains("bearer ") && !src.contains("jwt"),
-            "auth owner files must not expose a JWT bearer-token verifier surface at HEAD",
+            !src.contains("jwt"),
+            "auth owner files must not expose a JWT verifier surface at HEAD",
         );
         assert!(
             !src.contains("set-cookie") && !src.contains("sessionid"),
@@ -1466,6 +1467,8 @@ async fn a05_public_health_uses_explicit_metadata_denylist() {
             "schemaVersion": flapjack::build_info().schema_version,
             "version": flapjack::build_info().version,
             "profile": flapjack::build_info().profile,
+            "apiProfile": "full",
+            "supportedApiProfiles": ["full", "paid_beta_v1"],
             "capabilities": flapjack::build_info().capabilities,
         })
     );

@@ -230,7 +230,7 @@ fn ssl_renewal_starts_only_after_http_listener_is_bound() {
         .find("let listener = tokio::net::TcpListener::bind")
         .expect("server startup must bind a TCP listener");
     let background_start = source
-        .find("spawn_background_tasks(&state, &infrastructure);")
+        .find("spawn_background_tasks(&state, &infrastructure)")
         .expect("server startup must launch the SSL renewal worker");
 
     assert!(

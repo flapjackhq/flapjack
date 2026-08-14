@@ -469,10 +469,10 @@ async fn clear_single_index_preserving_settings(
 
     // Restore settings and relevance config
     if let Some(data) = settings {
-        std::fs::write(&settings_path, data)?;
+        flapjack::index::atomic_write_file(&settings_path, &data)?;
     }
     if let Some(data) = relevance {
-        std::fs::write(&relevance_path, data)?;
+        flapjack::index::atomic_write_file(&relevance_path, &data)?;
     }
 
     Ok(())
@@ -737,13 +737,14 @@ mod tests {
         assert_eq!(body["nbPages"], 1);
     }
 
+    /// List results use the same namespace validator as create/copy/delete.
     #[tokio::test]
-    async fn list_indices_preserves_valid_nonpublication_tenant_names() {
+    async fn list_indices_excludes_server_owned_data_directories() {
         let tmp = tempfile::tempdir().unwrap();
         let state = TestStateBuilder::new(&tmp).build_shared();
-        state.manager.create_tenant("_shadow").unwrap();
-        state.manager.create_tenant("analytics").unwrap();
         state.manager.create_tenant("products").unwrap();
+        std::fs::create_dir_all(tmp.path().join("_shadow")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("analytics")).unwrap();
         std::fs::create_dir_all(tmp.path().join(".publication")).unwrap();
         std::fs::create_dir_all(tmp.path().join(".publication_quarantine")).unwrap();
 
@@ -769,7 +770,7 @@ mod tests {
             .iter()
             .map(|item| item["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, vec!["_shadow", "analytics", "products"]);
+        assert_eq!(names, vec!["products"]);
         assert_eq!(body["nbPages"], 1);
     }
 }

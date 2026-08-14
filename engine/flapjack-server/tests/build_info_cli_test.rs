@@ -109,11 +109,13 @@ fn package_version_output_still_uses_package_version() {
 #[test]
 fn existing_operational_subcommands_remain_routed() {
     let uninstall_home = TempDir::new("fj_test_uninstall_home");
-    let uninstall_install = TempDir::new("fj_test_uninstall_install");
+    // A missing target exercises CLI routing without asking the safety guard to
+    // recursively remove an assert_cmd build directory or an unowned fixture.
+    let uninstall_install = Path::new(uninstall_home.path()).join("missing-install");
     flapjack_cmd()
         .arg("uninstall")
         .env("HOME", uninstall_home.path())
-        .env("FLAPJACK_INSTALL", uninstall_install.path())
+        .env("FLAPJACK_INSTALL", &uninstall_install)
         .assert()
         .success()
         .stderr(contains("Flapjack has been uninstalled."));
@@ -126,6 +128,28 @@ fn existing_operational_subcommands_remain_routed() {
         .assert()
         .failure()
         .stderr(contains("No keys.json found"));
+}
+
+#[test]
+fn uninstall_rejects_unowned_target_without_deleting_its_contents() {
+    let uninstall_home = TempDir::new("fj_test_uninstall_guard_home");
+    let unowned_target = TempDir::new("fj_test_uninstall_guard_target");
+    let sentinel = Path::new(unowned_target.path()).join("must_survive.txt");
+    std::fs::write(&sentinel, b"operator data").unwrap();
+
+    flapjack_cmd()
+        .arg("uninstall")
+        .env("HOME", uninstall_home.path())
+        .env("FLAPJACK_INSTALL", unowned_target.path())
+        .assert()
+        .failure()
+        .stderr(contains("Refusing to uninstall"));
+
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"operator data",
+        "a rejected recursive-delete target must remain untouched"
+    );
 }
 
 #[test]

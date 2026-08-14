@@ -42,6 +42,93 @@ fn application_id_accepts_official_browser_query_transport() {
     );
 }
 
+#[test]
+fn rate_limiter_fails_closed_at_the_global_bucket_cap() {
+    let limiter = RateLimiter::new();
+    let key_hash = "bounded-rate-key";
+
+    for address_number in 0..65_536_u128 {
+        assert!(limiter.check_and_increment(
+            key_hash,
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(address_number)),
+            1,
+        ));
+    }
+
+    assert!(
+        !limiter.check_and_increment(
+            key_hash,
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(65_536_u128)),
+            1,
+        ),
+        "a new cardinality key must fail closed once the global cap is full"
+    );
+    assert_eq!(
+        limiter.counters.len(),
+        65_536,
+        "the denied key must not allocate a counter"
+    );
+}
+
+#[test]
+fn rate_limiter_reclaims_expired_buckets_before_failing_closed() {
+    let limiter = RateLimiter::with_max_buckets(2);
+    let expired_ip = "2001:db8::1".parse().unwrap();
+    let active_ip = "2001:db8::2".parse().unwrap();
+    let replacement_ip = "2001:db8::3".parse().unwrap();
+
+    assert!(limiter.check_and_increment("key", expired_ip, 2));
+    assert!(limiter.check_and_increment("key", active_ip, 2));
+    limiter
+        .counters
+        .get_mut(&("key".to_string(), expired_ip))
+        .unwrap()
+        .value_mut()
+        .1 = Instant::now() - RATE_LIMIT_WINDOW - Duration::from_secs(1);
+
+    assert!(limiter.check_and_increment("key", replacement_ip, 2));
+    assert_eq!(limiter.counters.len(), 2);
+    assert!(!limiter
+        .counters
+        .contains_key(&("key".to_string(), expired_ip)));
+    assert!(limiter
+        .counters
+        .contains_key(&("key".to_string(), active_ip)));
+    assert!(limiter
+        .counters
+        .contains_key(&("key".to_string(), replacement_ip)));
+}
+
+#[test]
+fn rate_limiter_parallel_admission_respects_the_global_bucket_cap() {
+    const CAPACITY: usize = 32;
+    const CONTENDERS: usize = 64;
+    let limiter = Arc::new(RateLimiter::with_max_buckets(CAPACITY));
+    let start = Arc::new(std::sync::Barrier::new(CONTENDERS));
+    let mut workers = Vec::with_capacity(CONTENDERS);
+
+    for address_number in 0..CONTENDERS {
+        let limiter = Arc::clone(&limiter);
+        let start = Arc::clone(&start);
+        workers.push(std::thread::spawn(move || {
+            start.wait();
+            limiter.check_and_increment(
+                "parallel-key",
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(address_number as u128)),
+                1,
+            )
+        }));
+    }
+
+    let admitted = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .filter(|admitted| *admitted)
+        .count();
+    assert_eq!(admitted, CAPACITY);
+    assert_eq!(limiter.counters.len(), CAPACITY);
+}
+
 fn test_search_api_key(description: &str) -> ApiKey {
     ApiKey {
         hash: String::new(),

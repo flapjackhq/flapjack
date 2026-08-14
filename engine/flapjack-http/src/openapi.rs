@@ -193,7 +193,7 @@ pub const DOCUMENTED_INTERNAL_PATHS: [&str; 5] = [
         crate::handlers::migration::acknowledge_typesense_migration,
         crate::handlers::migration::resume_typesense_migration,
         crate::handlers::migration::bulk_replace::submit_bulk_replace_http,
-        crate::handlers::migration::submit_privacy_scrub,
+        crate::handlers::migration::privacy_scrub::submit_privacy_scrub,
         crate::handlers::migration::list_algolia_indexes,
         crate::handlers::migration::list_algolia_source_indexes_doc,
         crate::handlers::migration::list_meilisearch_source_indexes_doc,

@@ -29,11 +29,36 @@ use dashmap::DashMap;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 
-const MAX_TASKS_PER_TENANT: usize = 1000;
+pub(crate) const MAX_TASKS_PER_TENANT: usize = 1000;
+
+fn current_epoch_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
 /// Maximum index name length in bytes.
 const MAX_INDEX_NAME_BYTES: usize = 256;
+/// Plain top-level paths in the shared data root that belong to server state.
+///
+/// Dot- and underscore-prefixed names are reserved by convention below, so this
+/// list owns only the remaining exact collisions. New server components that
+/// allocate a plain top-level path must add it here before shipping.
+const SERVER_OWNED_DATA_ROOT_NAMES: &[&str] = &[
+    "analytics",
+    "autoheal_decisions.jsonl",
+    "dashboard_sessions.json",
+    "key_material.json",
+    "keys.json",
+    "migration_exports",
+    "node.json",
+    "security_sources.json",
+    "ssl",
+];
 
 use super::OptionalFilterSpecs;
 use super::SearchOptions;
@@ -54,8 +79,8 @@ fn is_synchronous_metadata_oplog_op(op_type: &str) -> bool {
     )
 }
 
-/// Validate that a tenant/index name is safe for use as a filesystem path component.
-/// Rejects path traversal attempts, empty names, and names with unsafe characters.
+/// Validate that a tenant/index name is safe in the server's shared data root.
+/// Rejects path traversal, unsafe characters, and names owned by server storage.
 pub fn validate_index_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(FlapjackError::InvalidQuery(
@@ -83,6 +108,18 @@ pub fn validate_index_name(name: &str) -> Result<()> {
     if publication::is_reserved_publication_namespace(Path::new(name)) {
         return Err(FlapjackError::InvalidQuery(
             "Index name is reserved publication namespace".to_string(),
+        ));
+    }
+    // Internal state consistently uses dot/underscore prefixes. Reserving the
+    // conventions, rather than today's individual names, prevents a future
+    // subsystem from silently colliding with an already accepted index.
+    if name == "."
+        || name.starts_with('.')
+        || name.starts_with('_')
+        || SERVER_OWNED_DATA_ROOT_NAMES.contains(&name)
+    {
+        return Err(FlapjackError::InvalidQuery(
+            "Index name is reserved for server storage".to_string(),
         ));
     }
     Ok(())
@@ -119,6 +156,8 @@ pub struct IndexManager {
     pub(crate) write_task_handles: DashMap<TenantId, WriteTaskHandle>,
     pub(crate) oplogs: DashMap<TenantId, Arc<OpLog>>,
     tasks: Arc<DashMap<String, TaskInfo>>,
+    task_retention: Arc<TaskRetention>,
+    next_task_numeric_id: AtomicI64,
     task_queue: TaskQueue,
     settings_cache: DashMap<TenantId, Arc<IndexSettings>>,
     rules_cache: DashMap<TenantId, Arc<RuleStore>>,
@@ -154,6 +193,7 @@ mod ranking;
 mod recovery;
 mod search;
 mod search_phases;
+pub(crate) mod task_retention;
 pub(crate) mod tokenization;
 #[cfg(feature = "vector-search")]
 mod vector;
@@ -162,6 +202,7 @@ mod write;
 // Re-export sub-module items for use within the manager module
 use query::*;
 use ranking::*;
+use task_retention::TaskRetention;
 use tokenization::*;
 
 impl IndexManager {
@@ -195,6 +236,7 @@ impl IndexManager {
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak| {
             let tasks = Arc::new(DashMap::new());
+            let task_retention = Arc::new(TaskRetention::new());
             IndexManager {
                 base_path: base_path.as_ref().to_path_buf(),
                 node_id: node_id.into(),
@@ -205,7 +247,9 @@ impl IndexManager {
                 write_task_handles: DashMap::new(),
                 oplogs: DashMap::new(),
                 tasks: tasks.clone(),
-                task_queue: TaskQueue::new(weak.clone(), tasks),
+                task_retention: Arc::clone(&task_retention),
+                next_task_numeric_id: AtomicI64::new(current_epoch_millis()),
+                task_queue: TaskQueue::new(weak.clone(), tasks, task_retention),
                 settings_cache: DashMap::new(),
                 rules_cache: DashMap::new(),
                 synonyms_cache: DashMap::new(),
@@ -305,25 +349,18 @@ impl IndexManager {
             .ok_or_else(|| FlapjackError::TaskNotFound(task_id.to_string()))
     }
 
-    /// Reserve a numeric task ID, bumping until no alias key exists.
-    ///
-    /// SDK waitTask() calls use the numeric `taskID` alias. If two writes land in
-    /// the same millisecond, timestamp-derived IDs can collide and make one alias
-    /// unresolvable. This keeps aliases unique even under concurrent writes.
-    fn reserve_numeric_task_id(&self, mut numeric_id: i64) -> i64 {
-        while self.tasks.contains_key(&numeric_id.to_string()) {
-            numeric_id += 1;
-        }
-        numeric_id
-    }
-
-    /// Allocate a unique numeric task ID seeded from current epoch millis.
+    /// Allocate a process-unique numeric task ID seeded from current epoch millis.
+    /// The atomic allocator prevents simultaneous requests from reserving the
+    /// same alias before either one publishes its task record.
     fn next_numeric_task_id(&self) -> i64 {
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        self.reserve_numeric_task_id(seed)
+        loop {
+            let numeric_id = self
+                .next_task_numeric_id
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            if !self.tasks.contains_key(&numeric_id.to_string()) {
+                return numeric_id;
+            }
+        }
     }
 
     /// Count tasks in Enqueued or Processing state for a given tenant.
@@ -359,38 +396,7 @@ impl IndexManager {
     /// Remove the oldest tasks for a tenant when the count exceeds `max_tasks`. Tasks
     /// are sorted by creation time; both the string task ID and numeric ID alias are removed.
     pub fn evict_old_tasks(&self, tenant_id: &str, max_tasks: usize) {
-        let prefix = format!("task_{}_{}", tenant_id, "");
-        let tenant_tasks: Vec<_> = self
-            .tasks
-            .iter()
-            .filter(|entry| entry.key().starts_with(&prefix))
-            .map(|entry| {
-                (
-                    entry.key().clone(),
-                    entry.value().numeric_id,
-                    entry.value().created_at,
-                    entry.value().status.clone(),
-                )
-            })
-            .collect();
-
-        if tenant_tasks.len() >= max_tasks {
-            let target_removals = tenant_tasks.len() - max_tasks + 1;
-            // Keep in-flight tasks visible for wait loops even when over cap.
-            // If terminal tasks are insufficient, we temporarily run above cap
-            // until later sweeps after those tasks reach terminal state.
-            let mut terminal_tasks: Vec<_> = tenant_tasks
-                .into_iter()
-                .filter(|(_, _, _, status)| Self::is_task_terminal(status))
-                .map(|(task_id, numeric_id, created_at, _)| (task_id, numeric_id, created_at))
-                .collect();
-            terminal_tasks.sort_by_key(|(_, _, created_at)| *created_at);
-            for (task_id, numeric_id, _) in terminal_tasks.iter().take(target_removals) {
-                self.tasks.remove(task_id);
-                // Also remove the numeric_id alias key
-                self.tasks.remove(&numeric_id.to_string());
-            }
-        }
+        self.task_retention.trim(&self.tasks, tenant_id, max_tasks);
     }
 
     /// Return a tenant's `Arc<Index>`, loading from disk if not cached. Acquires a
@@ -400,6 +406,15 @@ impl IndexManager {
         validate_index_name(tenant_id)?;
         if let Some(index) = self.loaded.get(tenant_id) {
             return Ok(Arc::clone(&index));
+        }
+
+        // A missing tenant has no recovery state to serialize. Reject it before
+        // allocating a per-name mutex so arbitrary lookup names cannot become
+        // permanent registry entries. A concurrent create may make this one
+        // request observe NotFound; its retry will take the normal locked path.
+        let path = self.base_path.join(tenant_id);
+        if !path.exists() {
+            return Err(FlapjackError::TenantNotFound(tenant_id.to_string()));
         }
 
         // Recovery mutates on-disk state and acquires a writer; only one thread
@@ -416,11 +431,6 @@ impl IndexManager {
 
         if let Some(index) = self.loaded.get(tenant_id) {
             return Ok(Arc::clone(&index));
-        }
-
-        let path = self.base_path.join(tenant_id);
-        if !path.exists() {
-            return Err(FlapjackError::TenantNotFound(tenant_id.to_string()));
         }
 
         let index_languages = Self::read_index_languages(&path);
@@ -566,12 +576,14 @@ impl IndexManager {
     }
 
     pub fn make_noop_task(&self, index_name: &str) -> Result<TaskInfo> {
+        // Synchronous metadata operations still publish ordinary task IDs, so
+        // they must pass through the same retention owner as queued writes.
         let numeric_id = self.next_numeric_task_id();
         let task_id = format!("task_{}_{}", index_name, uuid::Uuid::new_v4());
         let mut task = TaskInfo::new(task_id.clone(), numeric_id, 0);
         task.status = TaskStatus::Succeeded;
-        self.tasks.insert(task_id.clone(), task.clone());
-        self.tasks.insert(numeric_id.to_string(), task.clone());
+        self.task_retention
+            .insert(&self.tasks, index_name, task.clone(), MAX_TASKS_PER_TENANT);
         Ok(task)
     }
 

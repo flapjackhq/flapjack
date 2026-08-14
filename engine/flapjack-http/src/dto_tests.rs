@@ -706,6 +706,56 @@ fn optional_filters_empty_value() {
     assert!(specs.is_empty());
 }
 
+#[test]
+fn http_filter_helpers_match_the_core_owner_for_every_algolia_input_form() {
+    let facet_cases = [
+        serde_json::json!("brand:Nike"),
+        serde_json::json!("-brand:'Air Max'"),
+        serde_json::json!(["brand:Nike", "color:Red"]),
+        serde_json::json!([["brand:Nike", "brand:Adidas"], "color:Red"]),
+        serde_json::json!([42, [false], "brand:Nike"]),
+        serde_json::json!(null),
+    ];
+    for input in facet_cases {
+        assert_eq!(
+            facet_filters_to_ast(&input),
+            flapjack::query::algolia_filters::facet_filters_to_ast(&input),
+            "facet filter drift for {input}"
+        );
+    }
+
+    let numeric_cases = [
+        serde_json::json!("price>=10"),
+        serde_json::json!("price<=10.5"),
+        serde_json::json!(["price>1", "stock!=0"]),
+        serde_json::json!([["price=10", "price<0"], "rating>=-1.5"]),
+        serde_json::json!(["price=invalid", 42]),
+        serde_json::json!(null),
+    ];
+    for input in numeric_cases {
+        assert_eq!(
+            numeric_filters_to_ast(&input),
+            flapjack::query::algolia_filters::numeric_filters_to_ast(&input),
+            "numeric filter drift for {input}"
+        );
+    }
+
+    let tag_cases = [
+        serde_json::json!("featured"),
+        serde_json::json!(["featured", "sale"]),
+        serde_json::json!([["featured", "sale"], "clearance"]),
+        serde_json::json!([false, [42], "featured"]),
+        serde_json::json!(null),
+    ];
+    for input in tag_cases {
+        assert_eq!(
+            tag_filters_to_ast(&input),
+            flapjack::query::algolia_filters::tag_filters_to_ast(&input),
+            "tag filter drift for {input}"
+        );
+    }
+}
+
 // ── deserialize_string_or_vec ──
 
 #[test]

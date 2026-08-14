@@ -76,7 +76,7 @@ impl UsagePersistence {
         self.usage_dir.join(format!("{}.json", date))
     }
 
-    /// Atomically write a snapshot: write to tmp file, then rename.
+    /// Durably publish a complete snapshot through the shared atomic-write owner.
     pub fn save_snapshot(
         &self,
         date: &str,
@@ -99,14 +99,8 @@ impl UsagePersistence {
 
     fn write_snapshot(&self, date: &str, snapshot: &DailyUsageSnapshot) -> io::Result<()> {
         let json = serde_json::to_string_pretty(&snapshot).map_err(io::Error::other)?;
-
         let final_path = self.snapshot_path(date);
-        let tmp_path = self.usage_dir.join(format!("{}.json.tmp", date));
-
-        std::fs::write(&tmp_path, json.as_bytes())?;
-        std::fs::rename(&tmp_path, &final_path)?;
-
-        Ok(())
+        flapjack::index::atomic_write_file(&final_path, json.as_bytes())
     }
 
     /// Load a snapshot for a given date, returning `None` if no file exists.
@@ -578,7 +572,7 @@ mod tests {
         assert_eq!(snapshot.indexes["products"].search_operations, 10);
     }
 
-    /// Verify that `save_snapshot` leaves no `.tmp` file behind after the atomic write-then-rename completes and that the final file is loadable.
+    /// Verify that `save_snapshot` leaves no legacy temp file behind and publishes a loadable snapshot.
     #[test]
     fn usage_rollup_write_is_atomic() {
         let tmp = TempDir::new().unwrap();

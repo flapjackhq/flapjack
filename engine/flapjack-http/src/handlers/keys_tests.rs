@@ -19,11 +19,18 @@ fn keys_router(key_store: Arc<KeyStore>) -> Router {
         .route("/1/keys/:key", get(get_key))
         .route("/1/keys/:key", put(update_key))
         .route("/1/keys/:key", delete(delete_key))
+        .route("/1/keys/:key/restore", post(restore_key))
         .with_state(key_store)
 }
 
 fn make_test_key_store(tmp: &TempDir) -> Arc<KeyStore> {
     Arc::new(KeyStore::load_or_create(tmp.path(), TEST_ADMIN_KEY))
+}
+
+fn block_key_material_writes(tmp: &TempDir) {
+    let material_path = tmp.path().join("key_material.json");
+    std::fs::remove_file(&material_path).unwrap();
+    std::fs::create_dir(&material_path).unwrap();
 }
 
 /// Assert that a JSON value is a valid RFC 3339 timestamp string.
@@ -163,6 +170,153 @@ async fn create_key_response_field_is_key_not_value() {
         created.get("value").is_none(),
         "POST response should NOT have 'value' field"
     );
+}
+
+/// A credential mutation is not successful until its durable state is
+/// published. This fixture turns the material-file target into a directory so
+/// the write fails deterministically on every supported filesystem.
+#[tokio::test]
+async fn create_key_persistence_failure_returns_500_and_keeps_memory_unchanged() {
+    let tmp = TempDir::new().unwrap();
+    let store = make_test_key_store(&tmp);
+    let original_keys = store.list_all();
+    block_key_material_writes(&tmp);
+    let app = keys_router(Arc::clone(&store));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/1/keys")
+                .header("content-type", "application/json")
+                .body(Body::from(create_key_json_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        store.list_all().len(),
+        original_keys.len(),
+        "an unpersisted key must never become active in memory"
+    );
+}
+
+#[tokio::test]
+async fn update_key_persistence_failure_returns_500_and_preserves_old_value() {
+    let tmp = TempDir::new().unwrap();
+    let store = make_test_key_store(&tmp);
+    let (_, plaintext) = store.create_key(ApiKey {
+        description: "before failed update".to_string(),
+        ..CreateKeyRequest {
+            acl: vec!["search".to_string()],
+            description: None,
+            indexes: None,
+            max_hits_per_query: None,
+            max_queries_per_ip_per_hour: None,
+            query_parameters: None,
+            referers: None,
+            restrict_sources: None,
+            validity: None,
+        }
+        .into_api_key()
+    });
+    block_key_material_writes(&tmp);
+    let app = keys_router(Arc::clone(&store));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/1/keys/{plaintext}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"acl": ["search"], "description": "after"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        store.lookup(&plaintext).unwrap().description,
+        "before failed update"
+    );
+}
+
+#[tokio::test]
+async fn delete_key_persistence_failure_returns_500_and_keeps_key_active() {
+    let tmp = TempDir::new().unwrap();
+    let store = make_test_key_store(&tmp);
+    let (_, plaintext) = store.create_key(
+        CreateKeyRequest {
+            acl: vec!["search".to_string()],
+            description: Some("failed delete".to_string()),
+            indexes: None,
+            max_hits_per_query: None,
+            max_queries_per_ip_per_hour: None,
+            query_parameters: None,
+            referers: None,
+            restrict_sources: None,
+            validity: None,
+        }
+        .into_api_key(),
+    );
+    block_key_material_writes(&tmp);
+    let app = keys_router(Arc::clone(&store));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/1/keys/{plaintext}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(store.lookup(&plaintext).is_some());
+}
+
+#[tokio::test]
+async fn restore_key_persistence_failure_returns_500_and_keeps_key_deleted() {
+    let tmp = TempDir::new().unwrap();
+    let store = make_test_key_store(&tmp);
+    let (_, plaintext) = store.create_key(
+        CreateKeyRequest {
+            acl: vec!["search".to_string()],
+            description: Some("failed restore".to_string()),
+            indexes: None,
+            max_hits_per_query: None,
+            max_queries_per_ip_per_hour: None,
+            query_parameters: None,
+            referers: None,
+            restrict_sources: None,
+            validity: None,
+        }
+        .into_api_key(),
+    );
+    assert!(store.delete_key(&plaintext));
+    block_key_material_writes(&tmp);
+    let app = keys_router(Arc::clone(&store));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/1/keys/{plaintext}/restore"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(store.lookup(&plaintext).is_none());
 }
 
 // T1.5: GET key — hash, salt, hmac_key never exposed

@@ -26,7 +26,7 @@ fn facet_requests() -> Vec<FacetRequest> {
         .collect()
 }
 
-fn assert_phase_budget(
+fn assert_phase_reconciliation(
     family: &str,
     report: QueryPhaseReport,
     requires_fetch: bool,
@@ -53,14 +53,6 @@ fn assert_phase_budget(
         report.total_ns,
         "{family}: reconciliation"
     );
-    // Scheduler and clock noise may consume up to 2ms or 5% of total wall time.
-    let residual_tolerance_ns = 2_000_000_u64.max(report.total_ns / 20);
-    assert!(
-        report.unattributed_ns <= residual_tolerance_ns,
-        "{family}: unattributed {}ns exceeds {}ns",
-        report.unattributed_ns,
-        residual_tolerance_ns
-    );
     assert!(report.collect_ns > 0, "{family}: collect phase");
     if requires_fetch {
         assert!(report.fetch_ns > 0, "{family}: fetch phase");
@@ -72,6 +64,44 @@ fn assert_phase_budget(
             "{family}: facet collector participation"
         );
     }
+}
+
+fn assert_phase_budget(
+    family: &str,
+    report: QueryPhaseReport,
+    requires_fetch: bool,
+    requires_facets: bool,
+) {
+    assert_phase_reconciliation(family, report, requires_fetch, requires_facets);
+    // Scheduler and clock noise may consume up to 2ms or 5% of total wall time.
+    let residual_tolerance_ns = 2_000_000_u64.max(report.total_ns / 20);
+    assert!(
+        report.unattributed_ns <= residual_tolerance_ns,
+        "{family}: unattributed {}ns exceeds {}ns",
+        report.unattributed_ns,
+        residual_tolerance_ns
+    );
+}
+
+fn scheduler_delayed_report() -> QueryPhaseReport {
+    QueryPhaseReport {
+        collect_ns: 1_000_000,
+        unattributed_ns: 4_000_000,
+        total_ns: 5_000_000,
+        execution_path: "count_only",
+        ..QueryPhaseReport::default()
+    }
+}
+
+#[test]
+fn phase_reconciliation_accepts_scheduler_delay() {
+    assert_phase_reconciliation("synthetic", scheduler_delayed_report(), false, false);
+}
+
+#[test]
+#[should_panic(expected = "synthetic: unattributed 4000000ns exceeds 2000000ns")]
+fn phase_budget_still_rejects_the_same_unattributed_time() {
+    assert_phase_budget("synthetic", scheduler_delayed_report(), false, false);
 }
 
 fn execute_text_family(
@@ -592,7 +622,11 @@ fn concurrent_executions_emit_independent_phase_reports() {
             report.candidates_collected, TOTAL_DOCS,
             "heavy: candidates_collected"
         );
-        assert_phase_budget("heavy", *report, true, false);
+        // This specimen proves per-execution isolation while two threads share
+        // one executor. Hosted-runner descheduling is real wall time but not
+        // missing phase attribution; the sequential taxonomy tests above keep
+        // the strict residual budget.
+        assert_phase_reconciliation("heavy", *report, true, false);
     }
 
     assert_eq!(count_only_reports.len(), COUNT_ONLY_ITERATIONS);
@@ -611,6 +645,6 @@ fn concurrent_executions_emit_independent_phase_reports() {
             "count_only: candidates_collected"
         );
         assert_eq!(report.facet_cardinality, 0, "count_only: facet_cardinality");
-        assert_phase_budget("count_only", *report, false, false);
+        assert_phase_reconciliation("count_only", *report, false, false);
     }
 }

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 mod credentials;
 mod ingest;
 mod migrate;
+mod uninstall;
 
 /// Top-level CLI definition for the `flapjack` binary.
 ///
@@ -71,96 +72,6 @@ enum Command {
     },
 }
 
-/// Remove the install directory (`FLAPJACK_INSTALL` first, then `$HOME/.flapjack`) and clean shell rc PATH entries.
-fn run_uninstall() -> Result<(), Box<dyn std::error::Error>> {
-    let home = std::env::var("HOME").map_err(|_| "HOME environment variable not set")?;
-    let install_dir =
-        std::env::var("FLAPJACK_INSTALL").unwrap_or_else(|_| format!("{}/.flapjack", home));
-
-    // Remove the install directory
-    if std::path::Path::new(&install_dir).exists() {
-        std::fs::remove_dir_all(&install_dir)?;
-        eprintln!("Removed {}", install_dir);
-    } else {
-        eprintln!("Directory {} does not exist, skipping", install_dir);
-    }
-
-    // Clean PATH entries from shell config files
-    let rc_files = [
-        format!("{}/.bashrc", home),
-        format!("{}/.bash_profile", home),
-        format!("{}/.zshrc", home),
-        format!("{}/.profile", home),
-        format!("{}/.config/fish/config.fish", home),
-    ];
-
-    for rc_path in &rc_files {
-        let path = std::path::Path::new(rc_path);
-        if !path.exists() {
-            continue;
-        }
-
-        let contents = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        if !contents.contains(".flapjack") {
-            continue;
-        }
-
-        if let Some(new_contents) = strip_flapjack_path_entries(&contents) {
-            std::fs::write(path, new_contents)?;
-            eprintln!("Cleaned PATH entry from {}", rc_path);
-        }
-    }
-
-    eprintln!("\nFlapjack has been uninstalled.");
-    Ok(())
-}
-
-/// Remove installer marker blocks and `.flapjack` PATH lines, returning `None` when unchanged.
-fn strip_flapjack_path_entries(contents: &str) -> Option<String> {
-    let mut new_lines: Vec<&str> = Vec::new();
-    let mut lines = contents.lines().peekable();
-    let mut modified = false;
-
-    while let Some(line) = lines.next() {
-        if line.trim() == "# Flapjack" {
-            if matches!(lines.peek(), Some(next_line) if next_line.contains(".flapjack")) {
-                lines.next();
-            }
-            modified = true;
-            continue;
-        }
-
-        if is_flapjack_path_line(line) {
-            modified = true;
-            continue;
-        }
-
-        new_lines.push(line);
-    }
-
-    if !modified {
-        return None;
-    }
-
-    while new_lines.last() == Some(&"") {
-        new_lines.pop();
-    }
-
-    let mut new_contents = new_lines.join("\n");
-    if !new_contents.is_empty() {
-        new_contents.push('\n');
-    }
-    Some(new_contents)
-}
-
-fn is_flapjack_path_line(line: &str) -> bool {
-    (line.contains("export PATH") || line.contains("set -gx PATH")) && line.contains(".flapjack")
-}
-
 /// Parse CLI arguments and dispatch to the appropriate subcommand or start the HTTP server.
 ///
 /// When no subcommand is given, resolves runtime configuration (data directory and bind address)
@@ -180,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match &cli.command {
         Some(Command::Ingest(args)) => ingest::run(args),
         Some(Command::Migrate(args)) => migrate::run(args),
-        Some(Command::Uninstall) => run_uninstall(),
+        Some(Command::Uninstall) => uninstall::run(),
         Some(Command::ResetAdminKey) => {
             let data_dir = resolve_data_dir(&cli, &matches)
                 .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
@@ -391,6 +302,7 @@ fn derive_instance_port(instance: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::uninstall::{run as run_uninstall, strip_path_entries, validate_target};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -579,11 +491,74 @@ mod tests {
         ]
         .join("\n");
 
-        let stripped = strip_flapjack_path_entries(&contents).expect("expected cleanup");
+        let stripped = strip_path_entries(&contents).expect("expected cleanup");
         assert_eq!(
             stripped,
             ["export PATH=\"$HOME/bin:$PATH\"", "echo done", ""].join("\n")
         );
+    }
+
+    #[test]
+    fn uninstall_target_validation_accepts_only_a_dedicated_matching_install() {
+        let fixture = tempfile::tempdir().unwrap();
+        let install_root = fixture.path().join("custom-install");
+        let bin_dir = install_root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let running_binary = std::env::current_exe().unwrap();
+        std::fs::copy(&running_binary, bin_dir.join("flapjack")).unwrap();
+
+        let validated = validate_target(&install_root, fixture.path(), &running_binary)
+            .expect("a dedicated root containing the running artifact should be removable");
+
+        assert_eq!(validated, std::fs::canonicalize(&install_root).unwrap());
+    }
+
+    #[test]
+    fn uninstall_target_validation_rejects_broad_and_unowned_directories() {
+        let fixture = tempfile::tempdir().unwrap();
+        let running_binary = std::env::current_exe().unwrap();
+
+        let home_error =
+            validate_target(fixture.path(), fixture.path(), &running_binary).unwrap_err();
+        assert!(home_error.contains("home directory"), "{home_error}");
+
+        let unowned = fixture.path().join("unowned");
+        std::fs::create_dir_all(unowned.join("bin")).unwrap();
+        let unowned_error = validate_target(&unowned, fixture.path(), &running_binary).unwrap_err();
+        assert!(unowned_error.contains("bin/flapjack"), "{unowned_error}");
+
+        #[cfg(unix)]
+        {
+            let root_error =
+                validate_target(std::path::Path::new("/"), fixture.path(), &running_binary)
+                    .unwrap_err();
+            assert!(root_error.contains("filesystem root"), "{root_error}");
+        }
+    }
+
+    #[test]
+    fn uninstall_target_validation_rejects_repository_and_shared_prefix_shapes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let running_binary = std::env::current_exe().unwrap();
+
+        let repository = fixture.path().join("repository");
+        std::fs::create_dir_all(repository.join("bin")).unwrap();
+        std::fs::create_dir(repository.join(".git")).unwrap();
+        std::fs::copy(&running_binary, repository.join("bin/flapjack")).unwrap();
+        let repository_error =
+            validate_target(&repository, fixture.path(), &running_binary).unwrap_err();
+        assert!(
+            repository_error.contains("repository"),
+            "{repository_error}"
+        );
+
+        let shared_prefix = fixture.path().join("shared-prefix");
+        std::fs::create_dir_all(shared_prefix.join("bin")).unwrap();
+        std::fs::create_dir(shared_prefix.join("share")).unwrap();
+        std::fs::copy(&running_binary, shared_prefix.join("bin/flapjack")).unwrap();
+        let shared_error =
+            validate_target(&shared_prefix, fixture.path(), &running_binary).unwrap_err();
+        assert!(shared_error.contains("dedicated"), "{shared_error}");
     }
 
     #[test]
@@ -657,9 +632,13 @@ mod tests {
         let default_install = test_home.join(".flapjack");
         let custom_install = test_home.join("custom-install");
         std::fs::create_dir_all(&default_install).expect("create default install dir");
-        std::fs::create_dir_all(&custom_install).expect("create custom install dir");
+        std::fs::create_dir_all(custom_install.join("bin")).expect("create custom install dir");
         std::fs::write(default_install.join("keep.txt"), "keep").expect("seed default dir");
-        std::fs::write(custom_install.join("remove.txt"), "remove").expect("seed custom dir");
+        std::fs::copy(
+            std::env::current_exe().expect("resolve current test executable"),
+            custom_install.join("bin/flapjack"),
+        )
+        .expect("seed installed flapjack artifact");
 
         let zshrc_path = test_home.join(".zshrc");
         std::fs::write(

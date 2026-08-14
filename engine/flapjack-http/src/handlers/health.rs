@@ -1,9 +1,13 @@
-use axum::{extract::State, Json};
+use axum::{
+    extract::{Extension, State},
+    Json,
+};
 use serde::Serialize;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
 use super::AppState;
+use crate::api_profile::{ApiProfile, SUPPORTED_API_PROFILES};
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -11,17 +15,30 @@ pub struct PublicBuildInfo {
     schema_version: u8,
     version: String,
     profile: String,
+    api_profile: String,
+    supported_api_profiles: Vec<String>,
     capabilities: flapjack::BuildCapabilities,
 }
 
-impl From<&flapjack::BuildInfo> for PublicBuildInfo {
-    fn from(build: &flapjack::BuildInfo) -> Self {
+impl PublicBuildInfo {
+    fn new(build: &flapjack::BuildInfo, api_profile: ApiProfile) -> Self {
         Self {
             schema_version: build.schema_version,
             version: build.version.clone(),
             profile: build.profile.clone(),
+            api_profile: api_profile.as_str().to_string(),
+            supported_api_profiles: SUPPORTED_API_PROFILES
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             capabilities: build.capabilities.clone(),
         }
+    }
+}
+
+impl From<&flapjack::BuildInfo> for PublicBuildInfo {
+    fn from(build: &flapjack::BuildInfo) -> Self {
+        Self::new(build, ApiProfile::Full)
     }
 }
 
@@ -52,7 +69,10 @@ pub struct HealthResponse {
         (status = 200, description = "Server is healthy", body = HealthResponse)
     )
 )]
-pub async fn health(State(_state): State<Arc<AppState>>) -> Json<HealthResponse> {
+pub async fn health(
+    State(_state): State<Arc<AppState>>,
+    profile: Option<Extension<ApiProfile>>,
+) -> Json<HealthResponse> {
     let build = flapjack::build_info();
     let budget = flapjack::get_global_budget();
     let observer = flapjack::MemoryObserver::global();
@@ -61,7 +81,10 @@ pub async fn health(State(_state): State<Arc<AppState>>) -> Json<HealthResponse>
     Json(HealthResponse {
         status: "ok",
         version: build.version.clone(),
-        build: PublicBuildInfo::from(build),
+        build: PublicBuildInfo::new(
+            build,
+            profile.map(|Extension(value)| value).unwrap_or_default(),
+        ),
         uptime_secs: _state.start_time.elapsed().as_secs(),
         capabilities: build.capabilities.clone(),
         active_writers: budget.active_writers(),
@@ -110,6 +133,11 @@ mod tests {
             serde_json::to_value(&flapjack::build_info().version).unwrap()
         );
         assert!(json["build"]["profile"].is_string());
+        assert_eq!(json["build"]["apiProfile"], "full");
+        assert_eq!(
+            json["build"]["supportedApiProfiles"],
+            serde_json::json!(["full", "paid_beta_v1"])
+        );
         assert_eq!(
             json["build"]["capabilities"],
             serde_json::to_value(&flapjack::build_info().capabilities).unwrap()

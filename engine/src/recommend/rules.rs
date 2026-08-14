@@ -149,7 +149,8 @@ fn save_rules(
     let path = dir.join("rules.json");
     let data = serde_json::to_string_pretty(rules)
         .map_err(|e| format!("Failed to serialize rules: {}", e))?;
-    std::fs::write(&path, data).map_err(|e| format!("Failed to write rules file: {}", e))
+    crate::index::atomic_write_file(&path, data.as_bytes())
+        .map_err(|e| format!("Failed to write rules file: {}", e))
 }
 
 /// Get a single rule by objectID.

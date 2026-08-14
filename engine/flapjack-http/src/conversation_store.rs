@@ -2,8 +2,11 @@
 
 use dashmap::DashMap;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+const DEFAULT_MAX_CONVERSATIONS: usize = 1_000;
+const DEFAULT_MAX_MESSAGE_BYTES: usize = 16 * 1_024;
 
 /// A single message in a conversation.
 #[derive(Debug, Clone)]
@@ -22,11 +25,16 @@ struct ConversationState {
 ///
 /// - `max_messages`: maximum messages retained per conversation (oldest are evicted).
 /// - `ttl`: conversations not accessed within this duration are considered expired and
-///   are pruned on the next `get_or_create` call.
+///   are pruned on the next lookup or append.
 pub struct ConversationStore {
     conversations: DashMap<String, ConversationState>,
     max_messages: usize,
     ttl: Duration,
+    max_conversations: usize,
+    max_message_bytes: usize,
+    // Serializes only new-ID admission and eviction. Existing-history reads
+    // remain concurrent, while parallel appends cannot overshoot the global cap.
+    admission_lock: Mutex<()>,
 }
 
 impl ConversationStore {
@@ -37,6 +45,9 @@ impl ConversationStore {
             conversations: DashMap::new(),
             max_messages,
             ttl,
+            max_conversations: DEFAULT_MAX_CONVERSATIONS,
+            max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
+            admission_lock: Mutex::new(()),
         }
     }
 
@@ -72,6 +83,27 @@ impl ConversationStore {
         user_message: String,
         assistant_message: String,
     ) {
+        let _admission = self
+            .admission_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.evict_expired();
+
+        if !self.conversations.contains_key(conversation_id)
+            && self.conversations.len() >= self.max_conversations
+        {
+            // Evict the least-recently accessed conversation before admitting
+            // the new ID. The appending exchange therefore always survives.
+            let oldest_id = self
+                .conversations
+                .iter()
+                .min_by_key(|entry| entry.value().last_access)
+                .map(|entry| entry.key().clone());
+            if let Some(oldest_id) = oldest_id {
+                self.conversations.remove(&oldest_id);
+            }
+        }
+
         let mut entry = self
             .conversations
             .entry(conversation_id.to_string())
@@ -82,11 +114,11 @@ impl ConversationStore {
         entry.last_access = Instant::now();
         entry.messages.push_back(ConversationMessage {
             role: "user".to_string(),
-            content: user_message,
+            content: truncate_to_byte_cap(user_message, self.max_message_bytes),
         });
         entry.messages.push_back(ConversationMessage {
             role: "assistant".to_string(),
-            content: assistant_message,
+            content: truncate_to_byte_cap(assistant_message, self.max_message_bytes),
         });
         // Evict oldest messages, always in pairs to preserve turn structure.
         while entry.messages.len() > self.max_messages {
@@ -113,6 +145,21 @@ fn pair_aligned_cap(max_messages: usize) -> usize {
     } else {
         max_messages
     }
+}
+
+fn truncate_to_byte_cap(mut content: String, byte_cap: usize) -> String {
+    if content.len() <= byte_cap {
+        return content;
+    }
+
+    // String::truncate requires a character boundary. Walk backward at most
+    // three bytes for valid UTF-8, preserving the exact byte upper bound.
+    let mut boundary = byte_cap;
+    while !content.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    content.truncate(boundary);
+    content
 }
 
 #[cfg(test)]
@@ -193,6 +240,50 @@ mod tests {
             store.conversations.is_empty(),
             "stale entry should be removed"
         );
+    }
+
+    #[test]
+    fn production_store_caps_distinct_conversation_ids() {
+        let store = ConversationStore::default_shared();
+
+        for conversation_number in 0..1_002 {
+            store.append_exchange(
+                &format!("conversation_{conversation_number}"),
+                "question".to_string(),
+                "answer".to_string(),
+            );
+        }
+
+        assert_eq!(
+            store.conversations.len(),
+            1_000,
+            "production cardinality must stay at the hand-counted global cap"
+        );
+        assert!(
+            !store.get_history("conversation_1001").is_empty(),
+            "the exchange being appended must survive capacity eviction"
+        );
+    }
+
+    #[test]
+    fn production_store_caps_each_retained_message_without_breaking_utf8() {
+        let store = ConversationStore::default_shared();
+        let oversized = "é".repeat(10_000);
+
+        store.append_exchange("bounded_content", oversized.clone(), oversized);
+
+        let history = store.get_history("bounded_content");
+        assert_eq!(history.len(), 2);
+        for message in history {
+            assert!(
+                message.content.len() <= 16 * 1_024,
+                "retained message exceeded the 16 KiB byte cap"
+            );
+            assert!(
+                message.content.is_char_boundary(message.content.len()),
+                "truncation must retain valid UTF-8"
+            );
+        }
     }
 
     #[test]

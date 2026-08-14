@@ -1,6 +1,7 @@
 pub mod admin_key_persistence;
 pub mod ai_provider;
 pub mod analytics_cluster;
+pub mod api_profile;
 pub mod auth;
 pub mod conversation_store;
 #[cfg(test)]
@@ -67,6 +68,8 @@ pub(crate) mod openapi_test_helpers;
 mod openapi_tests;
 #[cfg(test)]
 mod operations_consumer_contract_tests;
+#[cfg(test)]
+mod pbv1_profile_tests;
 #[cfg(test)]
 mod router_tests;
 #[cfg(test)]

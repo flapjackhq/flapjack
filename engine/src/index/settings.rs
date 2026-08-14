@@ -586,7 +586,7 @@ impl IndexSettings {
 
     pub fn save<P: AsRef<Path>>(&self, path: P) -> crate::error::Result<()> {
         let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
+        crate::index::atomic_write_file(path.as_ref(), content.as_bytes())?;
         Ok(())
     }
 

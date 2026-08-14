@@ -25,8 +25,8 @@ use chrono::Utc;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::error_response::json_error;
 
@@ -243,9 +243,16 @@ pub fn validate_acls(acls: &[String]) -> Result<(), String> {
 
 /// Per-key, per-IP rate limiter for `maxQueriesPerIPPerHour`.
 /// Key: (key_hash, ip_addr), Value: (request_count, window_start).
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(3600);
+const MAX_RATE_LIMIT_BUCKETS: usize = 65_536;
+
 #[derive(Clone)]
 pub struct RateLimiter {
     counters: Arc<DashMap<(String, IpAddr), (u64, Instant)>>,
+    max_buckets: usize,
+    // Existing buckets stay lock-free through DashMap. Only admission of a new
+    // cardinality key is serialized so parallel requests cannot exceed the cap.
+    admission_lock: Arc<Mutex<()>>,
 }
 
 impl Default for RateLimiter {
@@ -256,29 +263,66 @@ impl Default for RateLimiter {
 
 impl RateLimiter {
     pub fn new() -> Self {
+        Self::with_max_buckets(MAX_RATE_LIMIT_BUCKETS)
+    }
+
+    fn with_max_buckets(max_buckets: usize) -> Self {
         Self {
             counters: Arc::new(DashMap::new()),
+            max_buckets,
+            admission_lock: Arc::new(Mutex::new(())),
         }
     }
 
     /// Check and increment the rate counter. Returns true if the request is allowed.
     pub fn check_and_increment(&self, key_hash: &str, ip: IpAddr, max_per_hour: u64) -> bool {
         let key = (key_hash.to_string(), ip);
-        let mut entry = self.counters.entry(key).or_insert((0, Instant::now()));
-        let (count, window_start) = entry.value_mut();
-
-        // Reset window if more than 1 hour has elapsed
-        if window_start.elapsed() >= std::time::Duration::from_secs(3600) {
-            *count = 0;
-            *window_start = Instant::now();
+        let now = Instant::now();
+        if let Some(mut counter) = self.counters.get_mut(&key) {
+            return increment_rate_counter(counter.value_mut(), now, max_per_hour);
         }
 
-        if *count >= max_per_hour {
+        if max_per_hour == 0 {
             return false;
         }
-        *count += 1;
+
+        let _admission = self
+            .admission_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let admission_now = Instant::now();
+        // Another request may have admitted this exact bucket while this one
+        // waited. It is an existing counter now and must keep normal semantics.
+        if let Some(mut counter) = self.counters.get_mut(&key) {
+            return increment_rate_counter(counter.value_mut(), admission_now, max_per_hour);
+        }
+
+        // Reclaim complete windows before failing closed. Rejecting a novel
+        // bucket at capacity prevents a cardinality spray from consuming
+        // unbounded memory without resetting any active client's allowance.
+        self.counters.retain(|_, (_, window_start)| {
+            admission_now.saturating_duration_since(*window_start) < RATE_LIMIT_WINDOW
+        });
+        if self.counters.len() >= self.max_buckets {
+            return false;
+        }
+
+        self.counters.insert(key, (1, admission_now));
         true
     }
+}
+
+fn increment_rate_counter(counter: &mut (u64, Instant), now: Instant, max_per_hour: u64) -> bool {
+    let (count, window_start) = counter;
+    if now.saturating_duration_since(*window_start) >= RATE_LIMIT_WINDOW {
+        *count = 0;
+        *window_start = now;
+    }
+    if *count >= max_per_hour {
+        return false;
+    }
+    *count += 1;
+    true
 }
 
 /// Check if a referer matches any pattern in the allowlist.

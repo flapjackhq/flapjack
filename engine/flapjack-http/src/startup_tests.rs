@@ -547,6 +547,7 @@ fn initialize_key_store_persists_env_admin_key_with_restrictive_permissions() {
     let server_config = ServerConfig {
         env_mode: "development".to_string(),
         no_auth: false,
+        api_profile: crate::api_profile::ApiProfile::Full,
         disable_dashboard: false,
         allow_no_auth_public_bind: false,
         admin_key_env: Some("  env-admin-key  ".to_string()),
@@ -564,11 +565,11 @@ fn initialize_key_store_persists_env_admin_key_with_restrictive_permissions() {
         _data_dir_lock: acquire_data_dir_process_lock(temp_dir.path()).unwrap(),
     };
 
-    let (_key_store, admin_key, key_is_new) = initialize_key_store(&server_config, temp_dir.path());
+    let initialized = initialize_key_store(&server_config, temp_dir.path()).unwrap();
     let metadata = std::fs::metadata(temp_dir.path().join(".admin_key")).unwrap();
 
-    assert_eq!(admin_key, Some("env-admin-key".to_string()));
-    assert!(!key_is_new);
+    assert_eq!(initialized.admin_key, Some("env-admin-key".to_string()));
+    assert!(!initialized.key_is_new);
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
 }
 

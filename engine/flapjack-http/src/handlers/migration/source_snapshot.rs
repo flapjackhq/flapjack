@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use super::algolia_client::{AlgoliaClientError, AlgoliaErrorKind};
 use super::source_identity_partitions::{
     SourceIdentityConfig, SourceIdentityError, SourceIdentityPartitions, SourceIdentityVersion,
@@ -72,11 +70,13 @@ impl SourceSnapshotBuilder {
             .map_err(AlgoliaClientError::from)
     }
 
+    #[cfg(test)]
     pub(super) fn record_rules(&mut self, page: &[Value]) -> Result<(), AlgoliaClientError> {
         self.record_rules_page(0, page)
             .map_err(AlgoliaClientError::from)
     }
 
+    #[cfg(test)]
     pub(super) fn record_synonyms(&mut self, page: &[Value]) -> Result<(), AlgoliaClientError> {
         self.record_synonyms_page(0, page)
             .map_err(AlgoliaClientError::from)
@@ -93,6 +93,7 @@ impl SourceSnapshotBuilder {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn record_rules_page(
         &mut self,
         page_index: usize,
@@ -116,6 +117,7 @@ impl SourceSnapshotBuilder {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn record_synonyms_page(
         &mut self,
         page_index: usize,
@@ -342,17 +344,6 @@ fn settings_resource_snapshot(settings: &Value) -> SourceResourceSnapshot {
         ids: BTreeSet::from([id]),
         version: SourceIdentityVersion::V1,
     }
-}
-
-fn object_resource_snapshot(
-    resource: SourceSnapshotResource,
-    items: &[Value],
-) -> Result<SourceResourceSnapshot, AlgoliaClientError> {
-    let mut accumulator = SourceResourceAccumulator::default();
-    accumulator
-        .record_items(resource, 0, items)
-        .map_err(AlgoliaClientError::from)?;
-    Ok(accumulator.finish())
 }
 
 fn json_replica_settings_identity(source_name: &str, settings: &Value) -> Value {

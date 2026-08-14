@@ -59,6 +59,9 @@ fn make_state(tmp: &TempDir) -> Arc<AppState> {
         )),
         bulk_replace_max_bytes: 4 * 1024 * 1024 * 1024,
         idempotency_cache: Arc::new(IdempotencyCache::new(Duration::from_secs(300))),
+        background_task_health: Arc::new(
+            flapjack_http::background_tasks::BackgroundTaskHealth::default(),
+        ),
     })
 }
 

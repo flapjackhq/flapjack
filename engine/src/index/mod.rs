@@ -37,6 +37,36 @@ use synonyms::SynonymStore;
 use tantivy::Index as TantivyIndex;
 pub use writer::ManagedIndexWriter;
 
+/// Durably replace an authoritative file without exposing a partial payload.
+///
+/// Keep ordinary configuration and metadata writers on this facade so the
+/// temp-file naming, file sync, atomic rename, parent-directory sync, and
+/// failure cleanup remain owned by one implementation.
+pub fn atomic_write_file(path: &Path, payload: &[u8]) -> std::io::Result<()> {
+    utils::atomic_write(path, payload)
+}
+
+/// Durably replace a private file without exposing a partially written payload.
+///
+/// This is the narrow cross-crate facade for the canonical atomic-write owner in
+/// `index::utils`. On Unix the temporary file receives mode `0600` before it is
+/// renamed into place, so sensitive content is never published with broader
+/// permissions, even briefly.
+pub fn atomic_write_private_file(path: &Path, payload: &[u8]) -> std::io::Result<()> {
+    utils::atomic_write_stream(
+        path,
+        |file| std::io::Write::write_all(file, payload),
+        |temp_path| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(temp_path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            Ok(())
+        },
+    )
+}
+
 /// Cached facet query results per tenant index: `(timestamp, hit_count, facet_values, facet_stats, exhaustive)`.
 pub(crate) type FacetCacheEntry = Arc<(
     std::time::Instant,
@@ -889,6 +919,26 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_file_replaces_the_inode_instead_of_truncating_it() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, b"old-state").unwrap();
+        let original_inode = std::fs::metadata(&path).unwrap().ino();
+
+        atomic_write_file(&path, b"complete-new-state").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete-new-state");
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().ino(),
+            original_inode,
+            "authoritative writes must publish by rename, not truncate the live file"
+        );
+    }
 
     #[test]
     fn bulk_constant_selection_records_its_measurement() {

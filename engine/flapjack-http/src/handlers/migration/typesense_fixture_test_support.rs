@@ -4,8 +4,6 @@
 //! consumers at different points in the private module tree share one fixture
 //! traversal and one cached parse.
 
-#![allow(dead_code)]
-
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::OnceLock;

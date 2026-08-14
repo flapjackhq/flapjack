@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, RwLock};
+use std::sync::RwLock;
 
 use crate::admin_key_persistence::{persist_admin_key_file, PermissionFailureMode};
 
@@ -30,12 +30,6 @@ pub struct KeyStore {
     file_path: PathBuf,
     key_material_path: PathBuf,
     admin_key_value: RwLock<String>,
-    // Serializes `rotate_admin_key` against itself so the `.admin_key` file write and
-    // the subsequent in-memory hash/value update are atomic per-rotation. Concurrent
-    // rotations would otherwise interleave file-write A, file-write B (overwriting A),
-    // then memory-update A — leaving the persisted file inconsistent with in-memory state.
-    // Does NOT block auth readers (`is_admin`, `lookup`, etc.) which use the RwLock.
-    rotation_mutex: Mutex<()>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -54,14 +48,32 @@ struct EncryptedHmacKey {
 }
 
 impl KeyStore {
-    /// Load keys from `keys.json` in `data_dir`, or create default keys if the file is missing or corrupt.
+    /// Load keys from `keys.json` in `data_dir`, or create defaults when no store exists.
     ///
-    /// Automatically re-hashes the admin entry if `admin_key` differs from the stored hash, enabling key rotation via the `FLAPJACK_ADMIN_KEY` env var. Persists the result to disk on return.
+    /// This compatibility wrapper fails closed by panicking when existing
+    /// credential state is malformed or cannot be durably persisted. Server
+    /// startup uses [`Self::try_load_or_create`] to surface the same failure.
     pub fn load_or_create(data_dir: &Path, admin_key: &str) -> Self {
+        Self::try_load_or_create(data_dir, admin_key)
+            .unwrap_or_else(|error| panic!("Failed to initialize API key store: {error}"))
+    }
+
+    /// Fallible key-store initialization used by production startup.
+    ///
+    /// Existing malformed security state is preserved and returned as an error;
+    /// only an absent `keys.json` authorizes creation of default credentials.
+    pub fn try_load_or_create(data_dir: &Path, admin_key: &str) -> Result<Self, String> {
         let file_path = data_dir.join("keys.json");
         let key_material_path = data_dir.join(KEY_MATERIAL_FILE_NAME);
-        let mut data = Self::load_key_store_data_or_default(&file_path, admin_key);
-        hydrate_hmac_keys_from_material_file(&key_material_path, &mut data, admin_key);
+        let admin_key_path = data_dir.join(".admin_key");
+        let previous_admin_key = read_optional_admin_key(&admin_key_path)?;
+        let mut data = Self::load_key_store_data_or_default(&file_path, admin_key)?;
+        hydrate_hmac_keys_from_material_file(
+            &key_material_path,
+            &mut data,
+            admin_key,
+            previous_admin_key.as_deref(),
+        )?;
         Self::rotate_admin_entry_if_needed(&mut data, admin_key);
 
         let store = Self {
@@ -69,24 +81,20 @@ impl KeyStore {
             file_path,
             key_material_path,
             admin_key_value: RwLock::new(admin_key.to_string()),
-            rotation_mutex: Mutex::new(()),
         };
-        store.save();
-        store
+        store.save()?;
+        Ok(store)
     }
 
-    fn load_key_store_data_or_default(file_path: &Path, admin_key: &str) -> KeyStoreData {
+    fn load_key_store_data_or_default(
+        file_path: &Path,
+        admin_key: &str,
+    ) -> Result<KeyStoreData, String> {
         if !file_path.exists() {
-            return Self::create_default_keys(admin_key);
+            return Ok(Self::create_default_keys(admin_key));
         }
 
-        match Self::read_key_store_data(file_path) {
-            Ok(data) => data,
-            Err(error) => {
-                tracing::warn!("{error}, recreating");
-                Self::create_default_keys(admin_key)
-            }
-        }
+        Self::read_key_store_data(file_path)
     }
 
     fn read_key_store_data(file_path: &Path) -> Result<KeyStoreData, String> {
@@ -162,16 +170,19 @@ impl KeyStore {
         }
     }
 
-    /// Persist the current key data to `keys.json` with pretty-printed JSON and set file permissions to `0600` on Unix.
-    fn save(&self) {
+    /// Persist both credential files before any mutation becomes visible in memory.
+    fn save(&self) -> Result<(), String> {
         let admin_key = self.admin_key_value.read().unwrap().clone();
         let data = self.data.read().unwrap();
-        if let Err(error) = persist_key_store_data(&self.file_path, &data) {
-            tracing::warn!("Failed to save keys.json: {}", error);
-        }
-        if let Err(error) = persist_key_material_data(&self.key_material_path, &data, &admin_key) {
-            tracing::warn!("Failed to save {}: {}", KEY_MATERIAL_FILE_NAME, error);
-        }
+        self.persist_candidate(&data, &admin_key)
+    }
+
+    /// Publish encrypted material first and `keys.json` last. The latter is the
+    /// visible commit point: if its write fails, the extra encrypted material is
+    /// unreferenced and the prior key set remains authoritative.
+    fn persist_candidate(&self, data: &KeyStoreData, admin_key: &str) -> Result<(), String> {
+        persist_key_material_data(&self.key_material_path, data, admin_key)?;
+        persist_key_store_data(&self.file_path, data)
     }
 
     pub fn is_admin(&self, key_value: &str) -> bool {
@@ -217,7 +228,13 @@ impl KeyStore {
 
     /// Creates a new key and returns the plaintext value (only time it's visible)
     /// The key is hashed before storage
-    pub fn create_key(&self, mut key: ApiKey) -> (ApiKey, String) {
+    pub fn create_key(&self, key: ApiKey) -> (ApiKey, String) {
+        self.try_create_key(key)
+            .unwrap_or_else(|error| panic!("Failed to persist created API key: {error}"))
+    }
+
+    /// Create and durably persist a key before making it visible to readers.
+    pub fn try_create_key(&self, mut key: ApiKey) -> Result<(ApiKey, String), String> {
         let plaintext_value = format!("fj_search_{}", generate_hex_key());
         let salt = generate_salt();
         let hash = hash_key(&plaintext_value, &salt);
@@ -228,20 +245,37 @@ impl KeyStore {
         // Store hmac_key for secured key support (except for admin-like keys)
         key.hmac_key = Some(plaintext_value.clone());
 
+        // The lock order is admin key then data throughout this type. Holding
+        // both across persistence prevents concurrent mutations from publishing
+        // snapshots derived from stale in-memory state.
+        let admin_key = self.admin_key_value.read().unwrap();
         let mut data = self.data.write().unwrap();
-        data.keys.push(key.clone());
-        drop(data);
-        self.save();
+        let mut candidate = data.clone();
+        candidate.keys.push(key.clone());
+        self.persist_candidate(&candidate, &admin_key)?;
+        *data = candidate;
 
-        (key, plaintext_value)
+        Ok((key, plaintext_value))
     }
 
     /// Update a key's mutable fields (ACL, description, indexes, etc.) while preserving its hash, salt, hmac_key, and creation timestamp.
     ///
     /// Returns the updated key on success, or `None` if no key matches `key_value`.
-    pub fn update_key(&self, key_value: &str, mut updated: ApiKey) -> Option<ApiKey> {
+    pub fn update_key(&self, key_value: &str, updated: ApiKey) -> Option<ApiKey> {
+        self.try_update_key(key_value, updated)
+            .unwrap_or_else(|error| panic!("Failed to persist updated API key: {error}"))
+    }
+
+    /// Update a key only after the candidate state is durably published.
+    pub fn try_update_key(
+        &self,
+        key_value: &str,
+        mut updated: ApiKey,
+    ) -> Result<Option<ApiKey>, String> {
+        let admin_key = self.admin_key_value.read().unwrap();
         let mut data = self.data.write().unwrap();
-        if let Some(existing) = data
+        let mut candidate = data.clone();
+        if let Some(existing) = candidate
             .keys
             .iter_mut()
             .find(|k| verify_key(key_value, &k.hash, &k.salt))
@@ -252,11 +286,11 @@ impl KeyStore {
             updated.hmac_key = existing.hmac_key.clone();
             updated.created_at = existing.created_at;
             *existing = updated.clone();
-            drop(data);
-            self.save();
-            Some(updated)
+            self.persist_candidate(&candidate, &admin_key)?;
+            *data = candidate;
+            Ok(Some(updated))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -264,28 +298,36 @@ impl KeyStore {
     ///
     /// Refuses to delete the admin key. Returns `true` if a key was deleted, `false` if the key was not found or is the admin key.
     pub fn delete_key(&self, key_value: &str) -> bool {
+        self.try_delete_key(key_value)
+            .unwrap_or_else(|error| panic!("Failed to persist deleted API key: {error}"))
+    }
+
+    /// Soft-delete a key only after the candidate state is durably published.
+    pub fn try_delete_key(&self, key_value: &str) -> Result<bool, String> {
+        let admin_key = self.admin_key_value.read().unwrap();
         let mut data = self.data.write().unwrap();
+        let mut candidate = data.clone();
 
         // Check if this is the admin key and prevent deletion
-        if let Some(admin) = admin_key_entry(&data.keys) {
+        if let Some(admin) = admin_key_entry(&candidate.keys) {
             if verify_key(key_value, &admin.hash, &admin.salt) {
-                return false;
+                return Ok(false);
             }
         }
 
         // Find and delete the key
-        if let Some(pos) = data
+        if let Some(pos) = candidate
             .keys
             .iter()
             .position(|k| verify_key(key_value, &k.hash, &k.salt))
         {
-            let removed = data.keys.remove(pos);
-            data.deleted_keys.push(removed);
-            drop(data);
-            self.save();
-            true
+            let removed = candidate.keys.remove(pos);
+            candidate.deleted_keys.push(removed);
+            self.persist_candidate(&candidate, &admin_key)?;
+            *data = candidate;
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
@@ -293,19 +335,27 @@ impl KeyStore {
     ///
     /// Returns the restored `ApiKey` on success, or `None` if no matching deleted key is found.
     pub fn restore_key(&self, key_value: &str) -> Option<ApiKey> {
+        self.try_restore_key(key_value)
+            .unwrap_or_else(|error| panic!("Failed to persist restored API key: {error}"))
+    }
+
+    /// Restore a key only after the candidate state is durably published.
+    pub fn try_restore_key(&self, key_value: &str) -> Result<Option<ApiKey>, String> {
+        let admin_key = self.admin_key_value.read().unwrap();
         let mut data = self.data.write().unwrap();
-        if let Some(pos) = data
+        let mut candidate = data.clone();
+        if let Some(pos) = candidate
             .deleted_keys
             .iter()
             .position(|k| verify_key(key_value, &k.hash, &k.salt))
         {
-            let restored = data.deleted_keys.remove(pos);
-            data.keys.push(restored.clone());
-            drop(data);
-            self.save();
-            Some(restored)
+            let restored = candidate.deleted_keys.remove(pos);
+            candidate.keys.push(restored.clone());
+            self.persist_candidate(&candidate, &admin_key)?;
+            *data = candidate;
+            Ok(Some(restored))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -319,49 +369,59 @@ impl KeyStore {
     /// Disk writes happen before in-memory updates so that an I/O failure leaves the
     /// running process in its original consistent state (no admin lockout).
     pub fn rotate_admin_key(&self) -> Result<String, String> {
-        // Serialize concurrent rotations so .admin_key file write + in-memory update
-        // form one critical section. Recover from poison: the guarded value is `()`
-        // with no invariants, so it is safe to proceed after a prior panic — failing
-        // hard here would permanently block all future rotations.
-        let _rotation_guard = self
-            .rotation_mutex
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
         let new_key = generate_admin_key();
         let new_salt = generate_salt();
         let new_hash = hash_key(&new_key, &new_salt);
 
-        // Persist .admin_key FIRST — if this fails, nothing has changed.
         let data_dir = self
             .file_path
             .parent()
             .ok_or("Cannot determine data directory from keys.json path")?;
-        persist_admin_key_file(
-            &data_dir.join(".admin_key"),
-            &new_key,
-            PermissionFailureMode::WarnAndContinue,
-        )?;
+        let admin_key_path = data_dir.join(".admin_key");
 
-        // Update in-memory state atomically (admin_key first, then data — matches
-        // list_all_as_dto() lock ordering to prevent reader inconsistency).
-        {
-            let mut admin_key = self.admin_key_value.write().unwrap();
-            let mut data = self.data.write().unwrap();
-            let admin_entry =
-                admin_key_entry_mut(&mut data.keys).ok_or("No admin key found in key store")?;
-            admin_entry.hash = new_hash;
-            admin_entry.salt = new_salt;
-            *admin_key = new_key.clone();
+        // Write locks serialize rotation against every credential mutation and
+        // keep readers on the old credentials until all files have committed.
+        let mut admin_key = self.admin_key_value.write().unwrap();
+        let mut data = self.data.write().unwrap();
+        let mut candidate = data.clone();
+        let admin_entry =
+            admin_key_entry_mut(&mut candidate.keys).ok_or("No admin key found in key store")?;
+        admin_entry.hash = new_hash;
+        admin_entry.salt = new_salt;
+
+        if let Err(error) = self.persist_candidate(&candidate, &new_key) {
+            // Material is written before keys.json. If the latter failed, put
+            // the prior encryption back before returning control to the server.
+            return Err(rollback_rotation_error(
+                error,
+                self.persist_candidate(&data, &admin_key),
+            ));
+        }
+        if let Err(error) = persist_admin_key_file(
+            &admin_key_path,
+            &new_key,
+            PermissionFailureMode::ReturnError,
+        ) {
+            return Err(rollback_rotation_error(
+                error,
+                self.persist_candidate(&data, &admin_key),
+            ));
         }
 
-        // Persist keys.json — if this fails (save() only warns), the new .admin_key
-        // and in-memory state are consistent; rotate_admin_entry_if_needed() will
-        // reconcile keys.json on next restart.
-        self.save();
+        *data = candidate;
+        *admin_key = new_key.clone();
 
         tracing::info!("Admin key rotated at runtime");
         Ok(new_key)
+    }
+}
+
+fn rollback_rotation_error(primary: String, rollback: Result<(), String>) -> String {
+    match rollback {
+        Ok(()) => primary,
+        Err(rollback_error) => {
+            format!("{primary}; additionally failed to restore prior key state: {rollback_error}")
+        }
     }
 }
 
@@ -427,7 +487,7 @@ pub fn reset_admin_key(data_dir: &Path) -> Result<String, String> {
     let mut data: KeyStoreData =
         serde_json::from_str(&contents).map_err(|e| format!("Failed to parse keys.json: {}", e))?;
 
-    let key_material = load_key_material_data_or_default(&key_material_path);
+    let key_material = load_key_material_data_or_default(&key_material_path)?;
     if !key_material.encrypted_hmac_by_hash.is_empty() {
         return Err(format!(
             "Cannot reset admin key offline while {} contains encrypted key material; use /internal/rotate-admin-key so existing search keys remain usable",
@@ -455,7 +515,7 @@ pub fn reset_admin_key(data_dir: &Path) -> Result<String, String> {
     }
 
     if !key_material.hmac_by_hash.is_empty() {
-        hydrate_hmac_keys_from_material_data(&key_material, &mut data, &new_key);
+        hydrate_hmac_keys_from_material_data(&key_material, &mut data, &new_key)?;
         persist_key_material_data(&key_material_path, &data, &new_key)?;
     }
     persist_key_store_data(&file_path, &data)?;
@@ -483,6 +543,7 @@ fn is_admin_key_entry(key: &ApiKey) -> bool {
     key.description == ADMIN_KEY_DESCRIPTION
 }
 
+/// Serialize the public credential metadata and publish it atomically.
 fn persist_key_store_data(file_path: &Path, data: &KeyStoreData) -> Result<(), String> {
     // Never persist plaintext parent-key material in keys.json.
     let mut persisted = data.clone();
@@ -497,15 +558,16 @@ fn persist_key_store_data(file_path: &Path, data: &KeyStoreData) -> Result<(), S
         .map_err(|error| format!("Failed to serialize keys.json: {error}"))?;
 
     if let Some(parent) = file_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create key-store directory: {error}"))?;
     }
 
-    std::fs::write(file_path, &json)
+    flapjack::index::atomic_write_private_file(file_path, json.as_bytes())
         .map_err(|error| format!("Failed to write keys.json: {error}"))?;
-    ensure_private_file_permissions(file_path);
     Ok(())
 }
 
+/// Encrypt parent-key material and publish it atomically with private permissions.
 fn persist_key_material_data(
     file_path: &Path,
     data: &KeyStoreData,
@@ -526,38 +588,78 @@ fn persist_key_material_data(
     let json = serde_json::to_string_pretty(&payload)
         .map_err(|error| format!("Failed to serialize {KEY_MATERIAL_FILE_NAME}: {error}"))?;
     if let Some(parent) = file_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create key-store directory: {error}"))?;
     }
 
-    std::fs::write(file_path, &json)
+    flapjack::index::atomic_write_private_file(file_path, json.as_bytes())
         .map_err(|error| format!("Failed to write {KEY_MATERIAL_FILE_NAME}: {error}"))?;
-    ensure_private_file_permissions(file_path);
     Ok(())
 }
 
+/// Hydrate plaintext key material from a valid sidecar without replacing bad evidence.
 fn hydrate_hmac_keys_from_material_file(
     file_path: &Path,
     data: &mut KeyStoreData,
     admin_key: &str,
-) {
-    let payload = load_key_material_data_or_default(file_path);
-    hydrate_hmac_keys_from_material_data(&payload, data, admin_key);
+    previous_admin_key: Option<&str>,
+) -> Result<(), String> {
+    let payload = load_key_material_data_or_default(file_path)?;
+    let original = data.clone();
+    match hydrate_hmac_keys_from_material_data(&payload, data, admin_key) {
+        Ok(()) => Ok(()),
+        Err(primary_error) => {
+            let Some(previous_admin_key) = previous_admin_key.filter(|key| *key != admin_key)
+            else {
+                return Err(primary_error);
+            };
+
+            // Startup admin-key rotation must decrypt existing material with the
+            // previously persisted secret before re-encrypting it under the new
+            // secret. Restore the untouched data first in case the primary pass
+            // hydrated some entries before encountering a bad ciphertext.
+            *data = original;
+            hydrate_hmac_keys_from_material_data(&payload, data, previous_admin_key).map_err(
+                |fallback_error| {
+                    format!("{primary_error}; previous admin key also failed: {fallback_error}")
+                },
+            )
+        }
+    }
 }
 
-fn load_key_material_data_or_default(file_path: &Path) -> KeyMaterialData {
-    std::fs::read_to_string(file_path)
-        .ok()
-        .and_then(|contents| serde_json::from_str::<KeyMaterialData>(&contents).ok())
-        .unwrap_or_default()
+fn read_optional_admin_key(file_path: &Path) -> Result<Option<String>, String> {
+    if !file_path.exists() {
+        return Ok(None);
+    }
+    let value = std::fs::read_to_string(file_path)
+        .map_err(|error| format!("Failed to read .admin_key: {error}"))?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(".admin_key is empty".to_string());
+    }
+    Ok(Some(value.to_string()))
 }
 
+fn load_key_material_data_or_default(file_path: &Path) -> Result<KeyMaterialData, String> {
+    if !file_path.exists() {
+        return Ok(KeyMaterialData::default());
+    }
+
+    let contents = std::fs::read_to_string(file_path)
+        .map_err(|error| format!("Failed to read {KEY_MATERIAL_FILE_NAME}: {error}"))?;
+    serde_json::from_str(&contents)
+        .map_err(|error| format!("Failed to parse {KEY_MATERIAL_FILE_NAME}: {error}"))
+}
+
+/// Attach decrypted HMAC values to their matching keys.
 fn hydrate_hmac_keys_from_material_data(
     payload: &KeyMaterialData,
     data: &mut KeyStoreData,
     admin_key: &str,
-) {
+) -> Result<(), String> {
     if payload.hmac_by_hash.is_empty() && payload.encrypted_hmac_by_hash.is_empty() {
-        return;
+        return Ok(());
     }
 
     for key in data.keys.iter_mut().chain(data.deleted_keys.iter_mut()) {
@@ -568,17 +670,19 @@ fn hydrate_hmac_keys_from_material_data(
             }
 
             if let Some(encrypted_hmac_key) = payload.encrypted_hmac_by_hash.get(&key.hash) {
-                match decrypt_key_material_value(encrypted_hmac_key, admin_key) {
-                    Ok(hmac_key) => key.hmac_key = Some(hmac_key),
-                    Err(error) => tracing::warn!(
-                        "Failed to decrypt key material for hash {}: {}",
-                        key.hash,
-                        error
-                    ),
-                }
+                let hmac_key =
+                    decrypt_key_material_value(encrypted_hmac_key, admin_key).map_err(|error| {
+                        format!(
+                            "Failed to decrypt key material for hash {}: {error}",
+                            key.hash
+                        )
+                    })?;
+                key.hmac_key = Some(hmac_key);
             }
         }
     }
+
+    Ok(())
 }
 
 fn derive_key_material_encryption_key(admin_key: &str) -> [u8; 32] {
@@ -636,17 +740,4 @@ fn decrypt_key_material_value(
         .map_err(|error| format!("Failed to decrypt key material: {error}"))?;
     String::from_utf8(decrypted_bytes)
         .map_err(|error| format!("Decrypted key material is not valid UTF-8: {error}"))
-}
-
-fn ensure_private_file_permissions(file_path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        if let Err(error) =
-            std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(0o600))
-        {
-            tracing::warn!("Failed to set file permissions: {}", error);
-        }
-    }
 }

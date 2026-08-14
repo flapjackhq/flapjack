@@ -305,6 +305,7 @@ fn privacy_scrub_test_router(
             cors_mode: crate::startup::CorsMode::LoopbackOnly,
             disable_dashboard: false,
             replication_api_key: None,
+            api_profile: crate::api_profile::ApiProfile::Full,
         },
     )
 }

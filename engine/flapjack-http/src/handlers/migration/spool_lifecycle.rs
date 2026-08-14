@@ -97,6 +97,7 @@ impl SpoolStore {
         self.complete_object_resource(job_uuid, ObjectResource::Synonyms, count, hash)
     }
 
+    #[cfg(test)]
     pub(crate) fn checkpoint(
         &self,
         checkpoint_handle: &str,

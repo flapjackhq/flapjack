@@ -160,3 +160,6 @@ engine/dashboard/.evidence/
 .scrai/summaries.json
 .scrai/dir_summaries.json
 .scrai/codemap_graph_cache.json
+
+# Beads physical-root workspace gate (local runtime state)
+/.beads.gate.lock*

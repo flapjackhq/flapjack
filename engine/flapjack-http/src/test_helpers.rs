@@ -411,6 +411,9 @@ impl<'tmp> TestStateBuilder<'tmp> {
             idempotency_cache: Arc::new(
                 crate::idempotency::IdempotencyCache::from_env_with_data_dir(self.tmp.path()),
             ),
+            background_task_health: Arc::new(
+                crate::background_tasks::BackgroundTaskHealth::default(),
+            ),
         }
     }
 
@@ -493,6 +496,7 @@ pub(crate) fn build_test_router_for_data_dir(
             cors_mode: crate::startup::CorsMode::LoopbackOnly,
             disable_dashboard: false,
             replication_api_key: None,
+            api_profile: crate::api_profile::ApiProfile::Full,
         },
     )
 }

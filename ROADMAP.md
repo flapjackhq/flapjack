@@ -1,8 +1,12 @@
-# Flapjack - Roadmap
+# Flapjack - Roadmap — READ-ONLY HISTORICAL ARCHIVE
+
+> Frozen on 2026-08-13 when the private dev repository adopted Beads as its
+> sole ledger for new open and planned work. Do not groom, append, close, or
+> schedule from this file. Existing rows preserve historical public context.
 
 **Last updated:** 2026-08-13. Flapjack `v1.0.12` is published from exact prod commit `925af4c2587324b4a6afca6ebe8fc54bfe7f8dfb` after exact-SHA staging and prod push CI both passed all 35 jobs. Release run `31667507360` passed all required jobs and published five platform archives, five checksums, five build manifests, and the verified multi-architecture GHCR image. `debbie status --json` then reported both mirrors current at dev release source `a5714611375f760386d19702fd4a5bce45c60547`. The remaining PBV1 boundary is fjcloud-owned: advance its one engine pin to `1.0.12`, bake the AMI from the published ARM64 musl manifest/archive, and run its candidate-bound browser proof and soak.
 
-This file owns the open-work ledger. Every row names the command, test, or receipt that produced its claim. `Active` and `Planned` own scope and evidence; `Up Next` owns ordering only, so the two cannot desync.
+Before the adoption boundary, this file owned the open-work ledger. Every row names the command, test, or receipt that produced its historical claim. The private Beads ledger now owns all new work and ordering.
 
 **This file supersedes in place; it does not stack revisions.** Through 2026-08-03 it revised by prepending the new state and retaining "prior revision follows verbatim", five deep: **286 of its 548 lines were retained history**, so its tail was stale by default, could contradict its head, and grew every time anyone corrected it. `git log -p` is the correct owner for that history and already has all of it. When a claim changes, rewrite the row and name the commit or receipt that changed it — provenance is a citation, not a retained copy. The stack was removed on 2026-08-03 with every `Active`/`Up Next`/`Planned` row ID verified present before and after. See row `DOC-LAYOUT-1`.
 

@@ -153,7 +153,7 @@ impl QsConfigStore {
         }
         let path = self.config_path(&config.index_name)?;
         let json = serde_json::to_string_pretty(config).map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
+        crate::index::atomic_write_file(&path, json.as_bytes())
     }
 
     pub fn load_config(&self, index_name: &str) -> std::io::Result<Option<QsConfig>> {
@@ -240,7 +240,7 @@ impl QsConfigStore {
         self.ensure_dir()?;
         let path = self.status_path(&status.index_name)?;
         let json = serde_json::to_string(status).map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
+        crate::index::atomic_write_file(&path, json.as_bytes())
     }
 
     /// Write log entries to an index's log file in newline-delimited JSON format.
@@ -279,7 +279,7 @@ impl QsConfigStore {
         }
         let keep = &lines[lines.len() - max_lines..];
         let new_content = keep.join("\n") + "\n";
-        std::fs::write(path, new_content)
+        crate::index::atomic_write_file(&path, new_content.as_bytes())
     }
 
     /// Load all log entries for an index from its log file in order.

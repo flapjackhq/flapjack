@@ -1,4 +1,4 @@
-use flapjack::index::manager::publication::is_reserved_publication_namespace;
+//! Canonical discovery of API-valid tenant directories in the shared data root.
 use flapjack::validate_index_name;
 use std::path::Path;
 
@@ -15,23 +15,10 @@ fn visible_tenant_name_if_visible_directory(
     is_directory: bool,
 ) -> Option<String> {
     let name = utf8_directory_name(name, is_directory)?;
-    if is_reserved_publication_namespace(Path::new(&name)) {
-        return None;
-    }
-    // Skip hidden dirs (`.`-prefix), underscore-prefixed infrastructure dirs
-    // (`_`-prefix convention for internal storage like `_usage`), and the
-    // legacy `analytics` dir (Parquet files, not a search index), and migration
-    // export spool storage.
-    // Probing any of these as a tenant index would break the readiness probe.
-    if name.starts_with('.')
-        || name.starts_with('_')
-        || name == "analytics"
-        || name == "migration_exports"
-    {
-        None
-    } else {
-        Some(name)
-    }
+    // Validation owns both path safety and the internal-storage namespace. All
+    // discovery consumers therefore see exactly the names the API can create.
+    validate_index_name(&name).ok()?;
+    Some(name)
 }
 
 pub(crate) fn valid_index_tenant_dir_name(entry: &std::fs::DirEntry) -> Option<String> {
@@ -196,8 +183,10 @@ mod tests {
         assert_eq!(tenant_dirs, vec!["publication".to_string()]);
     }
 
+    /// Server-owned names must be absent from both visible and complete tenant
+    /// discovery; otherwise backup/replication would disagree with API validity.
     #[test]
-    fn valid_index_tenant_dir_names_preserve_nonpublication_index_names() {
+    fn valid_index_tenant_dir_names_exclude_server_owned_names() {
         let temp_dir = TempDir::new().unwrap();
         fs::create_dir(temp_dir.path().join("_shadow")).unwrap();
         fs::create_dir(temp_dir.path().join("analytics")).unwrap();
@@ -209,13 +198,6 @@ mod tests {
         let mut tenant_dirs = valid_index_tenant_dir_names(temp_dir.path()).unwrap();
         tenant_dirs.sort();
 
-        assert_eq!(
-            tenant_dirs,
-            vec![
-                "_shadow".to_string(),
-                "analytics".to_string(),
-                "products".to_string()
-            ]
-        );
+        assert_eq!(tenant_dirs, vec!["products".to_string()]);
     }
 }

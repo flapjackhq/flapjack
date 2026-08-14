@@ -57,7 +57,8 @@ pub async fn set_personalization_strategy(
     let path = strategy_path(&state);
     let json =
         serde_json::to_string_pretty(&strategy).map_err(|e| FlapjackError::Json(e.to_string()))?;
-    std::fs::write(&path, json).map_err(|e| FlapjackError::Io(e.to_string()))?;
+    flapjack::index::atomic_write_file(&path, json.as_bytes())
+        .map_err(|e| FlapjackError::Io(e.to_string()))?;
 
     let now = chrono::Utc::now().to_rfc3339();
     Ok(Json(SetStrategyResponse { updated_at: now }))

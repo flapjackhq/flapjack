@@ -2,8 +2,6 @@ mod filter_parsing;
 mod request_params;
 mod response_types;
 
-#[cfg(test)]
-pub(crate) use filter_parsing::*;
 pub use response_types::*;
 
 use flapjack::error::FlapjackError;
@@ -11,6 +9,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
 
+#[cfg(test)]
+pub(crate) use flapjack::query::algolia_filters::{
+    facet_filters_to_ast, numeric_filters_to_ast, parse_facet_filter_string,
+    parse_numeric_filter_string, tag_filters_to_ast,
+};
 pub use flapjack::query::algolia_filters::{
     parse_optional_filters, parse_optional_filters_grouped,
 };

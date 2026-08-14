@@ -131,6 +131,9 @@ fn make_state(tmp: &TempDir) -> Arc<AppState> {
         )),
         bulk_replace_max_bytes: 4 * 1024 * 1024 * 1024,
         idempotency_cache: Arc::new(IdempotencyCache::new(Duration::from_secs(300))),
+        background_task_health: Arc::new(
+            flapjack_http::background_tasks::BackgroundTaskHealth::default(),
+        ),
     })
 }
 
@@ -156,6 +159,7 @@ fn make_router(tmp: &TempDir) -> (axum::Router, Arc<AppState>) {
             cors_mode: CorsMode::LoopbackOnly,
             disable_dashboard: true,
             replication_api_key: None,
+            api_profile: flapjack_http::api_profile::ApiProfile::Full,
         },
     );
     (router, state)

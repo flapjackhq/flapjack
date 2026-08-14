@@ -72,37 +72,36 @@ Important:
 
 ```bash
 # From engine/ directory:
-cargo test --lib -p flapjack -p flapjack-http -p flapjack-replication && cargo nextest run && cargo test -p flapjack-server
+cargo test --lib -p flapjack -p flapjack-replication && cargo nextest run -P ci -p flapjack-http --lib && cargo nextest run --no-fail-fast && cargo test -p flapjack-server
 ```
 
-1. **2839 inline unit tests** via `./s/test --unit` (1530 flapjack + 1276 flapjack-http + 33 flapjack-replication, ~49s wall-clock in latest run)
-2. **797 integration tests** via `./s/test --integ` (~42s wall-clock in latest run; 7 skipped in summary output)
+1. **Library tests** via `./s/test --unit`: 2,277 passing flapjack core tests (8 ignored), 137 passing replication tests, and 2,434 passing process-isolated HTTP tests (5 skipped) in the August 14 proof.
+2. **Integration tests** via `./s/test --integ`: 951 selected by the default profile in the August 14 proof, with 7 skipped; `--no-fail-fast` reports the complete failure set.
 3. **25 server binary tests** via `cargo test -p flapjack-server` (~10s wall-clock, 5 unit + 20 integration spawning real binary)
 
-**Total: ~101s wall-clock, ~3661 tests (plus 7 skipped integration cases).**
+Wall-clock time is host-dependent; use the exact command receipts rather than the obsolete historical aggregate estimate.
 
 ### Why the lib/nextest split?
 
-Nextest spawns a separate OS process per test. Each process pays ~1.5s to load the flapjack binary (tantivy + arrow + parquet). For inline unit tests that take microseconds, this is pure waste:
+Nextest spawns a separate OS process per test. Each process pays startup overhead to load the flapjack binary (tantivy + arrow + parquet). The large `flapjack` core therefore stays in-process, while the `flapjack-http` library uses process-per-test isolation because it owns process-global migration state:
 
-| Method | 2839 lib tests | Per-test |
-|--------|----------------|----------|
-| `./s/test --unit` (threads) | **~49s** | 0.017s |
-| `cargo nextest run` (processes) | **much slower for micro-tests due process startup overhead** | varies |
+| Method | Ownership | Isolation |
+|--------|-----------|-----------|
+| `cargo test --lib -p flapjack -p flapjack-replication` | **Fast in-process core** | host-dependent |
+| `cargo nextest run -P ci -p flapjack-http --lib` | **Isolated HTTP library tests** | host-dependent |
 
-The nextest config (`kind(lib)` filter) automatically excludes lib tests. Always run `cargo test --lib` alongside nextest.
+The default nextest integration profile excludes `kind(lib)`, so it does not duplicate either library owner. Always run both library commands alongside integration nextest.
 
 ---
 
 ## Test Organization
 
 ### Inline unit tests (`#[cfg(test)]` in source files)
-2839 tests in the latest baseline run. Test pure functions in isolation. Run via `./s/test --unit`.
-Latest crate split: 1530 in flapjack, 1276 in flapjack-http, 33 in flapjack-replication.
+Run via `./s/test --unit`. The August 14 proof executed 2,277 flapjack core tests and 137 replication tests in-process, then 2,434 flapjack-http tests under process-per-test nextest isolation; 8 core tests were ignored and 5 HTTP tests were skipped under their explicit tier owners.
 Note: `flapjack-server` has no lib target — do not include it in the count.
 
 ### Integration tests (`engine/tests/*.rs`)
-797 tests in the latest baseline run (default profile summary), with 7 skipped. Test HTTP endpoints, auth, replication, cross-crate integration. Run via `./s/test --integ` (which uses nextest under the hood). Filtered by name suffix:
+951 tests were selected in the August 14 default-profile proof, with 7 skipped. Test HTTP endpoints, auth, replication, cross-crate integration. Run via `./s/test --integ` (which uses nextest with `--no-fail-fast`). Filtered by name suffix:
 
 - **No suffix**: Default. Run every time.
 - **`_slow` suffix**: Excluded from default profile. Performance benchmarks, stress tests.
@@ -142,8 +141,9 @@ Runs `test_smoke.rs` — 10 tests covering every workspace crate (library, parse
 
 ### Development (TDD)
 ```bash
-cargo test --lib -p flapjack -p flapjack-http -p flapjack-replication  # ~15s — unit tests
-cargo nextest run                                 # ~2 min — integration tests
+cargo test --lib -p flapjack -p flapjack-replication  # fast in-process core
+cargo nextest run -P ci -p flapjack-http --lib       # process-isolated HTTP library
+cargo nextest run --no-fail-fast                     # process-isolated integration tests
 ```
 
 ### Parallel clone execution (same machine)
@@ -152,12 +152,12 @@ Each clone should run its own backend and dashboard test stack.
 
 ### Pre-commit
 ```bash
-cargo test --lib -p flapjack -p flapjack-http -p flapjack-replication && cargo nextest run && cargo test -p flapjack-server
+cargo test --lib -p flapjack -p flapjack-replication && cargo nextest run -P ci -p flapjack-http --lib && cargo nextest run --no-fail-fast && cargo test -p flapjack-server
 ```
 
 ### CI
 ```bash
-cargo test --lib -p flapjack -p flapjack-http -p flapjack-replication && cargo nextest run && cargo test -p flapjack-server  # every commit
+cargo test --lib -p flapjack -p flapjack-replication && cargo nextest run -P ci -p flapjack-http --lib && cargo nextest run --no-fail-fast && cargo test -p flapjack-server  # every commit
 cargo nextest run -P slow                                            # PR/merge queue
 cargo nextest run -P very_slow                                       # nightly
 cargo test --lib -p flapjack -p flapjack-http && cargo nextest run -P ci && cargo test -p flapjack-server  # release
@@ -365,11 +365,51 @@ All automated SDK tests require a running server (`./s/test --sdk` handles this 
 
 ---
 
+## CI Baselines and Execution Tiers
+
+The workflow YAML remains execution truth. `engine/tests/ci_test_tiers.json` is the machine-readable ownership manifest: `test_ci_test_tiers.py` fails public CI when a workflow job, risk class, or intentional Rust ignore has no explicit minimum tier. This table is the operator-facing summary rather than a second executable definition.
+
+| Surface | Minimum tier | Executable owner |
+|---------|--------------|------------------|
+| Rust core search/index and durability | Candidate | `ci.yml` → `rust-tests-fast`; prebuild then bounded `cargo test -p flapjack --lib` |
+| Authentication, index boundary, API compatibility, startup/wiring | Public fast | `ci.yml` → `integration-smoke` |
+| Rust HTTP, vector, server, TLS, and replication | Public complete | `ci.yml` → `rust-tests-all`, using nextest process isolation |
+| Source quality and test-harness contracts | Public fast | `ci.yml` → `fmt`, `clippy`, and `release-contracts` |
+| Dashboard and SDKs | Public fast | `ci.yml` dashboard and SDK job families; surface details stay in their own READMEs |
+| Installer and migration oracles | Nightly | `nightly.yml` installer and migration jobs |
+| Comprehensive default-feature Rust/dashboard/SDK/integration | Nightly | `nightly.yml` comprehensive job families |
+| Process-global leak detection | Union | `union.yml` → `rust-in-process-union`; never substitute nextest |
+| Packaging, images, and release preflights | Release | manually dispatched `release.yml` and development-image `docker.yml`; never part of candidate feedback |
+| Twenty long-running or live-system ignored Rust evidence harnesses | Manual evidence | exact source/name allowlist in `ci_test_tiers.json` |
+
+### Public-staging baseline (before the candidate split)
+
+These are successful, first-attempt `gridl-staging/flapjack` push-CI specimens. Durations are run/job wall clock from GitHub timestamps; compare jobs within this workflow family only.
+
+| Run | Workflow | Rust fast | Rust all | Integration smoke | Release contracts |
+|-----|----------|-----------|----------|-------------------|-------------------|
+| `31682605708` | 24m27s | 24m17s | 22m18s | 18s | 35s |
+| `31674400217` | 26m02s | 25m55s | 23m43s | 15s | 38s |
+| `31664714337` | 25m41s | 25m34s | 24m07s | 18s | 40s |
+| `31658983027` | 26m14s | 25m59s | 23m34s | 19s | 33s |
+| `31657261952` | 26m12s | 25m58s | 25m38s | 19s | 35s |
+| `31245623596` | 25m51s | 25m40s | 23m10s | 19s | 27s |
+
+Median Rust-fast wall clock was 25m47s. In run `31682605708`, the vector prebuild compiled for 3m11s with step-local `RUSTFLAGS=-C debuginfo=0 -C strip=debuginfo`; nextest then returned to the job profile `-C debuginfo=0`, recompiled for 9m53s, and executed 962 tests in only 62.397s. The complete job showed the same fingerprint mismatch: a 2m53s prebuild, a 9m04s nextest compile, then 5,847 tests in 159.700s. The repaired workflow keeps compilation before the timeout but gives prebuild and nextest one job-level compilation identity.
+
+### Candidate contract and local measurements
+
+The candidate deliberately excludes the two unsafe broad library unions. The vector-feature `flapjack + flapjack-http` library specimen ran 2,434 tests but failed from cross-test vector-save observation interference; the exact test passed alone. The default-feature workspace library specimen ran 2,433 HTTP tests but failed from migration process-state interference; that exact test also passed alone. Both surfaces retain nextest and union owners.
+
+On an uncontended Apple Silicon host with an absent worktree target directory, `cargo test -p flapjack --lib --no-run` took 161.22s. Reusing that artifact, the bounded candidate took 145.64s and passed 2,277 tests with the eight manifest-classified manual-evidence ignores. A focused durability filter completed in 6.89s. Cold compilation and warm behavior are reported separately; the build exports the exact Cargo test executable and the behavioral step runs that artifact directly under a 300-second cap, so Cargo cannot recompile inside the behavior budget and individual test results stream immediately.
+
+---
+
 ## Strategy Overview
 
 | Layer | Command | Tests | Time | Purpose |
 |-------|---------|-------|------|---------|
-| Inline unit | `./s/test --unit` | 2839 | ~50s | Pure function correctness |
+| Rust libraries | `./s/test --unit` | Core + HTTP + replication libraries | Host-dependent | Fast core runs in-process; process-global HTTP tests run under isolated nextest `ci` |
 | Integration | `./s/test --integ` | 797 (7 skipped) | ~42s | HTTP, auth, replication, geo |
 | Server binary | `cargo test -p flapjack-server` | 25 | ~10s | Startup modes, key management, multi-instance |
 | Dashboard unit | `npm run test:unit:run` | 542 | ~8s | React components, hooks, config parser |

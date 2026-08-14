@@ -134,7 +134,7 @@ impl SynonymStore {
     pub fn save<P: AsRef<Path>>(&self, path: P) -> crate::error::Result<()> {
         let synonyms: Vec<&Synonym> = self.synonyms.values().collect();
         let content = serde_json::to_string_pretty(&synonyms)?;
-        std::fs::write(path, content)?;
+        crate::index::atomic_write_file(path.as_ref(), content.as_bytes())?;
         Ok(())
     }
 

@@ -1,15 +1,18 @@
     use super::{
         autoheal_enabled_from_env, completed_utc_day, enforce_backup_retention,
         extract_s3_snapshot_tenant_id, migration_spool_gc_interval_secs, parse_autoheal_enabled,
-        rollup_window_bounds_ms, run_migration_spool_gc_loop, run_usage_rollover, HOUR_MS,
-        AUTOHEAL_ENABLED_ENV, MIGRATION_SPOOL_GC_INTERVAL_ENV,
+        positive_interval_secs, rollup_window_bounds_ms, run_migration_spool_gc_loop,
+        run_usage_rollover, spawn_supervised, BackgroundTaskHealth, BackgroundTaskIntervals,
+        HOUR_MS, AUTOHEAL_ENABLED_ENV, MIGRATION_SPOOL_GC_INTERVAL_ENV, ROLLUP_INTERVAL_ENV,
+        SYNC_INTERVAL_ENV,
     };
     use crate::handlers::migration::spool::{
         AsyncMigrationPublicationSemantic, MigrationDisposition, ResourceDenominators, SpoolLimits,
         SpoolStore,
     };
     use crate::test_helpers::{
-        restore_env_var, with_env_var, SharedLogBuffer, TestStateBuilder, ENV_MUTEX,
+        restore_env_var, with_env_var, EnvVarRestoreGuard, SharedLogBuffer, TestStateBuilder,
+        ENV_MUTEX,
     };
     use crate::usage_persistence::UsagePersistence;
     use chrono::TimeZone;
@@ -20,6 +23,68 @@
     use tokio::time::{timeout, Duration};
     use tracing_subscriber::prelude::*;
     use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn background_interval_parser_rejects_zero_and_invalid_values() {
+        assert_eq!(positive_interval_secs("rollup", None, 300), Ok(300));
+        assert_eq!(positive_interval_secs("rollup", Some("42"), 300), Ok(42));
+        assert_eq!(
+            positive_interval_secs("rollup", Some("0"), 300),
+            Err("rollup must be a positive integer, got \"0\"".to_string())
+        );
+        assert_eq!(
+            positive_interval_secs("sync", Some("not-a-number"), 60),
+            Err("sync must be a positive integer, got \"not-a-number\"".to_string())
+        );
+    }
+
+    #[test]
+    fn background_interval_config_rejects_zero_before_task_admission() {
+        let _env = ENV_MUTEX.lock().expect("env mutex should lock");
+        let _rollup = EnvVarRestoreGuard::set(ROLLUP_INTERVAL_ENV, "0");
+        let _sync = EnvVarRestoreGuard::set(SYNC_INTERVAL_ENV, "60");
+
+        assert_eq!(
+            BackgroundTaskIntervals::from_env().unwrap_err(),
+            "FLAPJACK_ROLLUP_INTERVAL_SECS must be a positive integer, got \"0\""
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_task_exit_changes_liveness_state() {
+        let health = Arc::new(BackgroundTaskHealth::default());
+        spawn_supervised(Arc::clone(&health), "test-loop", async {});
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if health.failed_tasks() == vec!["test-loop".to_string()] {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a completed supervised task must become unhealthy promptly");
+    }
+
+    #[tokio::test]
+    async fn supervised_task_panic_changes_liveness_state() {
+        let health = Arc::new(BackgroundTaskHealth::default());
+        spawn_supervised(Arc::clone(&health), "panicking-loop", async {
+            panic!("representative worker failure")
+        });
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if health.failed_tasks() == vec!["panicking-loop".to_string()] {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a panicking supervised task must become unhealthy promptly");
+    }
 
     #[test]
     fn completed_utc_day_returns_prior_day_at_and_after_midnight() {

@@ -499,9 +499,8 @@ impl super::IndexManager {
                 .append_record(record)?,
         };
         let task = record.task_info();
-        self.tasks.insert(task_id.clone(), task.clone());
-        self.tasks.insert(numeric_id.to_string(), task.clone());
-        self.evict_old_tasks(tenant_id, MAX_TASKS_PER_TENANT);
+        self.task_retention
+            .insert(&self.tasks, tenant_id, task.clone(), MAX_TASKS_PER_TENANT);
 
         permit.send(record.write_op());
         drop(admission_guard);
@@ -575,26 +574,23 @@ impl super::IndexManager {
                     // Sweep terminal overflow as soon as a write reaches completion so
                     // idle tenants do not stay above retention cap until another write.
                     if let Some(tenant_id) = Self::tenant_id_from_task_key(task_id) {
-                        self.evict_old_tasks(tenant_id, MAX_TASKS_PER_TENANT);
-                        // Preserve the just-observed terminal task so the caller's
-                        // returned taskID remains immediately queryable via both
-                        // canonical and numeric alias lookup paths.
-                        if !self.tasks.contains_key(task_id) {
-                            self.tasks.insert(task_id.to_string(), status.clone());
-                            self.tasks
-                                .insert(status.numeric_id.to_string(), status.clone());
-                        }
+                        self.task_retention.insert(
+                            &self.tasks,
+                            tenant_id,
+                            status.clone(),
+                            MAX_TASKS_PER_TENANT,
+                        );
                     }
                     return Ok(());
                 }
                 TaskStatus::Failed(e) => {
                     if let Some(tenant_id) = Self::tenant_id_from_task_key(task_id) {
-                        self.evict_old_tasks(tenant_id, MAX_TASKS_PER_TENANT);
-                        if !self.tasks.contains_key(task_id) {
-                            self.tasks.insert(task_id.to_string(), status.clone());
-                            self.tasks
-                                .insert(status.numeric_id.to_string(), status.clone());
-                        }
+                        self.task_retention.insert(
+                            &self.tasks,
+                            tenant_id,
+                            status.clone(),
+                            MAX_TASKS_PER_TENANT,
+                        );
                     }
                     return Err(Self::error_from_terminal_task_failure(e));
                 }

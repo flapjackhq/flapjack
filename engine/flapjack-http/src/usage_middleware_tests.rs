@@ -340,6 +340,9 @@ fn make_app_state(tmp: &tempfile::TempDir) -> std::sync::Arc<crate::handlers::Ap
         idempotency_cache: std::sync::Arc::new(
             crate::idempotency::IdempotencyCache::from_env_with_data_dir(tmp.path()),
         ),
+        background_task_health: std::sync::Arc::new(
+            crate::background_tasks::BackgroundTaskHealth::default(),
+        ),
     })
 }
 

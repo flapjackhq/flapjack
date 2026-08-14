@@ -4,7 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { EXPECTED_SHAPE_EXEMPT_ROWS, validateJoinManifest } from './check_join_manifest.mjs';
+import {
+  EXPECTED_SHAPE_EXEMPT_ROWS,
+  refreshJoinManifestLineRefs,
+  validateJoinManifest,
+} from './check_join_manifest.mjs';
 
 const validatorScriptPath = join(process.cwd(), 'scripts/check_join_manifest.mjs');
 const tempDirs = [];
@@ -455,6 +459,41 @@ describe('validateJoinManifest', () => {
         actualLine: 7,
       }),
     );
+  });
+
+  it('refreshes line-only drift after FEATURES.md compaction', () => {
+    const fixture = writeFixture({
+      rows: [
+        documentRow('FEATURES.md:9 Search'),
+        ...expectedShapeExemptRows(),
+      ],
+      featuresLines: featuresWithCapability({ line: 7 }),
+    });
+
+    expect(validateJoinManifest(fixture).ok).toBe(false);
+    expect(refreshJoinManifestLineRefs(fixture)).toEqual({ rowsUpdated: 1 });
+    expect(validateJoinManifest(fixture)).toMatchObject({
+      ok: true,
+      summary: { rowsMismatched: 0 },
+    });
+  });
+
+  it('refuses to refresh an ambiguous capability and section match', () => {
+    const fixture = writeFixture({
+      rows: [
+        documentRow('FEATURES.md:9 Search'),
+        ...expectedShapeExemptRows(),
+      ],
+      featuresLines: [
+        ...featuresWithCapability({ line: 7 }),
+        '| Typo tolerance | Done | duplicate |',
+      ],
+    });
+
+    expect(() => refreshJoinManifestLineRefs(fixture)).toThrow(
+      'row 1 Typo tolerance resolves to 2 FEATURES.md rows in section Search',
+    );
+    expect(validateJoinManifest(fixture).ok).toBe(false);
   });
 
   it('fails when no document-shaped refs were checked', () => {

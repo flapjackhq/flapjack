@@ -111,6 +111,28 @@ api_request() {
   curl_request "yes" "$@"
 }
 
+# Exercise the real restricted-key middleware without changing the admin-key
+# helper used by setup and cleanup. The created key remains process-local and
+# is never printed, so failure output cannot disclose a live credential.
+restricted_request() {
+  local method="$1"
+  local path="$2"
+  local body="${3:-}"
+  local -a headers=(
+    '-H' 'content-type: application/json'
+    '-H' "x-algolia-api-key: ${CREATED_API_KEY}"
+    '-H' "x-algolia-application-id: ${APP_ID}"
+  )
+
+  if [ -n "$body" ]; then
+    curl -sS -w '\n%{http_code}' -X "$method" "${BASE}${path}" \
+      "${headers[@]}" --data "$body" 2>&1 || true
+    return
+  fi
+  curl -sS -w '\n%{http_code}' -X "$method" "${BASE}${path}" \
+    "${headers[@]}" 2>&1 || true
+}
+
 request_json() {
   local requester="$1"
   shift
@@ -439,12 +461,48 @@ main() {
 
   section 'API Keys + Analytics Events'
 
+  request_json public_request POST "/1/indexes/${SMOKE_INDEX}/query" '{"query":"laptop"}'
+  if [ "$LAST_HTTP" = '403' ] && json_matches "$LAST_BODY" '.status == 403' ; then
+    pass 'Protected search rejects a request without an API key'
+  else
+    fail 'Protected search rejects a request without an API key' "HTTP ${LAST_HTTP} — ${LAST_BODY}"
+  fi
+
+  local boundary_index='smoke_restricted_boundary'
+  request_json api_request POST '/1/indexes' "{\"uid\":\"${boundary_index}\"}"
+  if [ "$LAST_HTTP" = '200' ] && json_matches "$LAST_BODY" ".uid == \"${boundary_index}\"" ; then
+    pass 'Create cross-index boundary fixture'
+  else
+    fail 'Create cross-index boundary fixture' "HTTP ${LAST_HTTP} — ${LAST_BODY}"
+  fi
+
   request_json api_request POST '/1/keys' '{"acl":["search","browse"],"indexes":["smoke_test"],"description":"Smoke restricted key"}'
   CREATED_API_KEY="$(printf '%s\n' "$LAST_BODY" | jq -r '.key // empty' 2>/dev/null || true)"
   if [ "$LAST_HTTP" = '200' ] && [ -n "$CREATED_API_KEY" ]; then
     pass 'POST /1/keys creates restricted key'
   else
     fail 'POST /1/keys creates restricted key' "HTTP ${LAST_HTTP} — ${LAST_BODY}"
+  fi
+
+  request_json restricted_request POST "/1/indexes/${SMOKE_INDEX}/query" '{"query":"laptop"}'
+  if [ "$LAST_HTTP" = '200' ] && json_matches "$LAST_BODY" '.nbHits >= 1' ; then
+    pass 'Restricted search key can query its allowed index'
+  else
+    fail 'Restricted search key can query its allowed index' "HTTP ${LAST_HTTP} — ${LAST_BODY}"
+  fi
+
+  request_json restricted_request POST "/1/indexes/${boundary_index}/query" '{"query":""}'
+  if [ "$LAST_HTTP" = '403' ] && json_matches "$LAST_BODY" '.status == 403' ; then
+    pass 'Restricted search key cannot cross its index boundary'
+  else
+    fail 'Restricted search key cannot cross its index boundary' "HTTP ${LAST_HTTP} — ${LAST_BODY}"
+  fi
+
+  request_json restricted_request PUT "/1/indexes/${SMOKE_INDEX}/forbidden-write" '{"objectID":"forbidden-write","title":"must not persist"}'
+  if [ "$LAST_HTTP" = '403' ] && json_matches "$LAST_BODY" '.status == 403' ; then
+    pass 'Search-only key cannot mutate its allowed index'
+  else
+    fail 'Search-only key cannot mutate its allowed index' "HTTP ${LAST_HTTP} — ${LAST_BODY}"
   fi
 
   request_json api_request GET '/1/keys'
@@ -459,6 +517,16 @@ main() {
     pass 'DELETE /1/keys/:key returns deletion envelope'
   else
     fail 'DELETE /1/keys/:key returns deletion envelope' "HTTP ${LAST_HTTP} — ${LAST_BODY}"
+  fi
+
+  local boundary_delete_task
+  request_json api_request DELETE "/1/indexes/${boundary_index}"
+  boundary_delete_task="$(extract_task_id "$LAST_BODY")"
+  if [ "$LAST_HTTP" = '200' ] && [ -n "$boundary_delete_task" ]; then
+    pass 'Delete cross-index boundary fixture'
+    wait_for_task "$boundary_delete_task" || true
+  else
+    fail 'Delete cross-index boundary fixture' "HTTP ${LAST_HTTP} — ${LAST_BODY}"
   fi
 
   request_json api_request POST '/1/events' '{"events":[{"eventType":"view","eventName":"Smoke View","index":"smoke_test","userToken":"smoke_user_1","objectIDs":["doc-nyc-1"]}]}'

@@ -172,12 +172,13 @@ impl IndexManager {
                                 tenant_id, error
                             ))
                         })?;
-                    std::fs::write(&settings_path, settings_json).map_err(|error| {
-                        FlapjackError::Tantivy(format!(
-                            "[RECOVERY {}] failed to write restored settings.json: {}",
-                            tenant_id, error
-                        ))
-                    })?;
+                    crate::index::atomic_write_file(&settings_path, settings_json.as_bytes())
+                        .map_err(|error| {
+                            FlapjackError::Tantivy(format!(
+                                "[RECOVERY {}] failed to write restored settings.json: {}",
+                                tenant_id, error
+                            ))
+                        })?;
                     tracing::info!("[RECOVERY {}] restored settings.json from oplog", tenant_id);
                 }
                 op if op.starts_with("save_synonym") || op == "clear_synonyms" => {

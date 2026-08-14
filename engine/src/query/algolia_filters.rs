@@ -2,7 +2,7 @@
 use crate::types::{FieldValue, Filter};
 
 /// Extract field and value from a "field:value" string with optional negation prefix `-`. Returns a Filter::Equals or Filter::Not wrapping it, or None if invalid.
-fn parse_facet_filter_string(s: &str) -> Option<Filter> {
+pub fn parse_facet_filter_string(s: &str) -> Option<Filter> {
     let s = s.trim();
     let (negated, s) = if let Some(rest) = s.strip_prefix('-') {
         (true, rest)
@@ -64,7 +64,7 @@ pub fn facet_filters_to_ast(value: &serde_json::Value) -> Option<Filter> {
 }
 
 /// Extract field and numeric value from a comparison string (e.g., "price>=10"). Supports >=, <=, !=, >, <, = operators with integer or float values.
-fn parse_numeric_filter_string(s: &str) -> Option<Filter> {
+pub fn parse_numeric_filter_string(s: &str) -> Option<Filter> {
     let s = s.trim();
     let ops = [">=", "<=", "!=", ">", "<", "="];
     for op in &ops {

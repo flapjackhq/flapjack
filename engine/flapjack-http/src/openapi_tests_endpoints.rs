@@ -806,12 +806,26 @@ fn health_endpoint_publishes_exact_response_schema() {
     assert_required_fields(
         &doc,
         "/components/schemas/PublicBuildInfo",
-        &["schemaVersion", "version", "profile", "capabilities"],
+        &[
+            "schemaVersion",
+            "version",
+            "profile",
+            "apiProfile",
+            "supportedApiProfiles",
+            "capabilities",
+        ],
     );
     assert_exact_property_set(
         &doc,
         "/components/schemas/PublicBuildInfo",
-        &["schemaVersion", "version", "profile", "capabilities"],
+        &[
+            "schemaVersion",
+            "version",
+            "profile",
+            "apiProfile",
+            "supportedApiProfiles",
+            "capabilities",
+        ],
     );
     for property in [
         "revision",

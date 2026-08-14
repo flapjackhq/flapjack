@@ -1,7 +1,6 @@
 //! Provider-neutral source-migration contract.
 //!
 //! Vendor clients, errors, observations, and raw schemas stay inside adapters.
-#![allow(dead_code)]
 
 use super::algolia_client::{AlgoliaClientError, AlgoliaErrorKind};
 #[cfg(test)]
@@ -18,6 +17,7 @@ use super::source_identity_partitions::{SourceIdentityError, SourceIdentityVersi
 use super::source_snapshot::{canonical_json_bytes, SourceSnapshot, SourceSnapshotBuilder};
 #[cfg(test)]
 use super::source_test_support::identity_config_for_test;
+#[cfg(test)]
 use super::translation::ReportCode;
 pub(super) use super::typesense_source_reader::TypesenseSourceReader;
 #[cfg(test)]
@@ -72,10 +72,12 @@ impl SourceExportError {
         Self { kind, message }
     }
 
+    #[cfg(test)]
     pub(super) fn kind(&self) -> SourceExportErrorKind {
         self.kind
     }
 
+    #[cfg(test)]
     pub(super) fn safe_message(&self) -> &str {
         self.message
     }
@@ -184,6 +186,7 @@ impl SourceExportRecord {
         &self.document.stable_id
     }
 
+    #[cfg(test)]
     pub(super) fn payload(&self) -> &Value {
         &self.document.payload
     }
@@ -194,6 +197,7 @@ impl SourceExportRecord {
         self.document.identity_payload()
     }
 
+    #[cfg(test)]
     pub(super) fn to_capture_value(&self) -> Value {
         json!({
             "stableId": self.stable_id(),
@@ -226,6 +230,7 @@ impl SourceConfigurationRecord {
         &self.stable_id
     }
 
+    #[cfg(test)]
     pub(super) fn payload(&self) -> &Value {
         &self.payload
     }
@@ -239,6 +244,7 @@ impl SourceConfigurationRecord {
         self.payload.clone()
     }
 
+    #[cfg(test)]
     pub(super) fn to_capture_value(&self) -> Value {
         json!({
             "stableId": self.stable_id(),
@@ -433,22 +439,27 @@ impl SourceIdentity {
         &self.digest
     }
 
+    #[cfg(test)]
     pub(super) fn provider(&self) -> AsyncMigrationSourceProvider {
         self.provider
     }
 
+    #[cfg(test)]
     pub(super) fn namespace(&self) -> Option<&str> {
         self.namespace.as_deref()
     }
 
+    #[cfg(test)]
     pub(super) fn source_name(&self) -> &str {
         &self.source_name
     }
 
+    #[cfg(test)]
     pub(super) fn accepted_revision(&self) -> &str {
         &self.accepted_revision
     }
 
+    #[cfg(test)]
     pub(super) fn document_metadata_count(&self) -> u64 {
         self.document_metadata_count
     }
@@ -473,12 +484,14 @@ impl fmt::Debug for SourceIdentity {
 }
 
 /// Acceptance receipt with identity evidence and provider-attributed warnings.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AcceptedSourceExport {
     identity: SourceIdentity,
     warnings: Vec<ReportCode>,
 }
 
+#[cfg(test)]
 impl AcceptedSourceExport {
     pub(super) fn identity(&self) -> &SourceIdentity {
         &self.identity
@@ -547,6 +560,7 @@ where
 }
 
 /// Admit a source export with provider identity and two-pass stability proof.
+#[cfg(test)]
 pub(super) async fn accept_source_export<R, S>(
     expected_provider: AsyncMigrationSourceProvider,
     reader: &mut R,
@@ -696,6 +710,7 @@ fn source_identity_digest(
     hex::encode(Sha256::digest(canonical_json_bytes(&identity)))
 }
 
+#[cfg(test)]
 fn source_export_warnings(provider: AsyncMigrationSourceProvider) -> Vec<ReportCode> {
     match provider {
         AsyncMigrationSourceProvider::Algolia => Vec::new(),

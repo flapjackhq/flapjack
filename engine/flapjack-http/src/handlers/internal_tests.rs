@@ -1544,15 +1544,15 @@ async fn get_ops_does_not_open_publication_roots_as_moved_source_candidates() {
 }
 
 #[tokio::test]
-async fn get_ops_moved_source_fallback_scans_valid_nonpublication_destinations() {
+async fn get_ops_moved_source_fallback_scans_valid_destinations() {
     let tmp = TempDir::new().unwrap();
     let state = TestStateBuilder::new(&tmp).build_shared();
-    state.manager.create_tenant("_shadow").unwrap();
-    let destination_oplog = state.manager.get_or_create_oplog("_shadow").unwrap();
+    state.manager.create_tenant("shadow_replica").unwrap();
+    let destination_oplog = state.manager.get_or_create_oplog("shadow_replica").unwrap();
     destination_oplog
         .append(
             "move_index",
-            serde_json::json!({"source": "missing_source", "destination": "_shadow"}),
+            serde_json::json!({"source": "missing_source", "destination": "shadow_replica"}),
         )
         .unwrap();
     destination_oplog
@@ -1583,7 +1583,7 @@ async fn get_ops_moved_source_fallback_scans_valid_nonpublication_destinations()
     let ops = json["ops"].as_array().unwrap();
     assert_eq!(ops.len(), 1);
     assert_eq!(ops[0]["op_type"], "move_index");
-    assert_eq!(ops[0]["payload"]["destination"], "_shadow");
+    assert_eq!(ops[0]["payload"]["destination"], "shadow_replica");
 }
 
 /// Verify that malformed tenant IDs in GET `/internal/ops` are rejected as

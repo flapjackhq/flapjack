@@ -81,6 +81,8 @@ pub struct AppState {
     /// Per-node TTL cache that dedups writes carrying an `X-Flapjack-Idempotency-Key`
     /// header (ADR 0005 / PL-8 write-loss recovery).
     pub idempotency_cache: Arc<IdempotencyCache>,
+    #[doc(hidden)]
+    pub background_task_health: Arc<crate::background_tasks::BackgroundTaskHealth>,
 }
 
 /// Compute nbPages safely for Algolia-style paginated responses.

@@ -1,0 +1,209 @@
+{
+  "schema_version": 1,
+  "tier_order": [
+    "focused",
+    "candidate",
+    "public_fast",
+    "public_complete",
+    "nightly",
+    "union",
+    "release",
+    "manual_evidence"
+  ],
+  "infrastructure_jobs": [
+    ".github/workflows/ci.yml#check-repo",
+    ".github/workflows/ci.yml#build-server",
+    ".github/workflows/nightly.yml#check-repo",
+    ".github/workflows/nightly.yml#build-server",
+    ".github/workflows/nightly.yml#nightly-summary",
+    ".github/workflows/union.yml#check-repo"
+  ],
+  "classes": [
+    {
+      "id": "source_quality",
+      "minimum_tier": "public_fast",
+      "owner_jobs": [
+        ".github/workflows/ci.yml#fmt",
+        ".github/workflows/ci.yml#clippy"
+      ],
+      "required_fragments": ["cargo fmt --all --check", "cargo clippy"]
+    },
+    {
+      "id": "test_harness_integrity",
+      "minimum_tier": "public_fast",
+      "owner_jobs": [".github/workflows/ci.yml#release-contracts"],
+      "required_fragments": [
+        "python3 engine/tests/test_ci_test_tiers.py --verify",
+        "python3 engine/tests/test_extract_candidate_binary.py"
+      ],
+      "risks": ["test_harness_integrity"]
+    },
+    {
+      "id": "rust_core_candidate",
+      "minimum_tier": "candidate",
+      "owner_jobs": [".github/workflows/ci.yml#rust-tests-fast"],
+      "required_fragments": [
+        "cargo test -p flapjack --lib --no-run --message-format=json > candidate_build.json",
+        "id: candidate-build",
+        "python3 tests/test_ci_test_tiers.py --verify",
+        "timeout --kill-after=60s 300s \"${{ steps.candidate-build.outputs.executable }}\""
+      ],
+      "risks": ["core_search_index", "durability"]
+    },
+    {
+      "id": "rust_process_isolated_complete",
+      "minimum_tier": "public_complete",
+      "owner_jobs": [
+        ".github/workflows/ci.yml#rust-tests-all",
+        ".github/workflows/nightly.yml#rust-all-tests"
+      ],
+      "required_fragments": [
+        "cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci --no-fail-fast",
+        "cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci --no-fail-fast",
+        "cargo nextest run -P ci"
+      ],
+      "risks": ["vector_isolation", "process_global_isolation"]
+    },
+    {
+      "id": "integration_smoke",
+      "minimum_tier": "public_fast",
+      "owner_jobs": [".github/workflows/ci.yml#integration-smoke"],
+      "required_fragments": ["bash engine/tests/integration_smoke.sh"],
+      "source_contracts": [
+        {
+          "path": "engine/tests/integration_smoke.sh",
+          "required_fragments": [
+            "request_json public_request POST \"/1/indexes/${SMOKE_INDEX}/query\"",
+            "request_json restricted_request POST \"/1/indexes/${boundary_index}/query\"",
+            "request_json restricted_request PUT \"/1/indexes/${SMOKE_INDEX}/forbidden-write\""
+          ]
+        }
+      ],
+      "risks": ["auth_tenant", "api_compat", "startup_wiring"]
+    },
+    {
+      "id": "dashboard",
+      "minimum_tier": "public_fast",
+      "owner_jobs": [
+        ".github/workflows/ci.yml#dashboard-unit",
+        ".github/workflows/ci.yml#dashboard-build",
+        ".github/workflows/ci.yml#dashboard-pages",
+        ".github/workflows/ci.yml#dashboard-full-e2e",
+        ".github/workflows/ci.yml#dashboard-integration",
+        ".github/workflows/nightly.yml#dashboard-all"
+      ],
+      "required_fragments": ["npm run test:unit:run", "npm run test:pages"],
+      "risks": ["dashboard"]
+    },
+    {
+      "id": "sdks",
+      "minimum_tier": "public_fast",
+      "owner_jobs": [
+        ".github/workflows/ci.yml#sdk-php",
+        ".github/workflows/ci.yml#sdk-python",
+        ".github/workflows/ci.yml#sdk-javascript",
+        ".github/workflows/ci.yml#sdk-contract",
+        ".github/workflows/ci.yml#sdk-go",
+        ".github/workflows/ci.yml#sdk-go-e2e",
+        ".github/workflows/ci.yml#sdk-ruby",
+        ".github/workflows/ci.yml#sdk-java",
+        ".github/workflows/ci.yml#sdk-csharp",
+        ".github/workflows/nightly.yml#sdk-php-all",
+        ".github/workflows/nightly.yml#sdk-python-all",
+        ".github/workflows/nightly.yml#sdk-javascript-all",
+        ".github/workflows/nightly.yml#sdk-go-all",
+        ".github/workflows/nightly.yml#sdk-go-e2e",
+        ".github/workflows/nightly.yml#sdk-ruby-all",
+        ".github/workflows/nightly.yml#sdk-java-all",
+        ".github/workflows/nightly.yml#sdk-csharp-all"
+      ],
+      "required_fragments": ["npm run test:contract", "poetry run pytest", "go test"],
+      "risks": ["sdks"]
+    },
+    {
+      "id": "external_integrations",
+      "minimum_tier": "public_fast",
+      "owner_jobs": [
+        ".github/workflows/ci.yml#integration-laravel-scout",
+        ".github/workflows/ci.yml#integration-wordpress",
+        ".github/workflows/nightly.yml#integration-wordpress-all"
+      ],
+      "required_fragments": ["composer run test:unit", "composer run test:integration"]
+    },
+    {
+      "id": "installer",
+      "minimum_tier": "nightly",
+      "owner_jobs": [
+        ".github/workflows/nightly.yml#installer-all",
+        ".github/workflows/test-installer.yml#installer"
+      ],
+      "required_fragments": ["engine/tests/test_install.sh"],
+      "risks": ["installer"]
+    },
+    {
+      "id": "migration",
+      "minimum_tier": "nightly",
+      "owner_jobs": [
+        ".github/workflows/nightly.yml#migration-import-contract",
+        ".github/workflows/nightly.yml#migration-scale-contract"
+      ],
+      "required_fragments": ["migration_import_contract.sh"],
+      "risks": ["migration"]
+    },
+    {
+      "id": "in_process_union",
+      "minimum_tier": "union",
+      "owner_jobs": [".github/workflows/union.yml#rust-in-process-union"],
+      "required_fragments": ["cargo test --workspace --no-fail-fast"],
+      "risks": ["union"]
+    },
+    {
+      "id": "release_pipeline",
+      "minimum_tier": "release",
+      "owner_jobs": [
+        ".github/workflows/release.yml#validate_release_version",
+        ".github/workflows/release.yml#ghcr_publish_preflight",
+        ".github/workflows/release.yml#release_ci_status_preflight",
+        ".github/workflows/release.yml#build",
+        ".github/workflows/release.yml#release",
+        ".github/workflows/release.yml#docker_prepare",
+        ".github/workflows/release.yml#docker_build_amd64",
+        ".github/workflows/release.yml#docker_build_arm64_native",
+        ".github/workflows/release.yml#docker_build_arm64_qemu",
+        ".github/workflows/release.yml#docker_manifest_verify",
+        ".github/workflows/release.yml#docker_promote_stable"
+      ],
+      "required_fragments": ["Validate requested release version", "ghcr.io"],
+      "risks": ["release"]
+    },
+    {
+      "id": "manual_dev_image",
+      "minimum_tier": "release",
+      "owner_jobs": [".github/workflows/docker.yml#docker"],
+      "required_fragments": ["docker/build-push-action@v6", "engine/Dockerfile"],
+      "risks": ["release"]
+    }
+  ],
+  "ignored_tests": [
+    {"source": "engine/src/integ_tests/test_perf.rs", "name": "facet_p95_meets_frozen_per_query_gate_on_local_standard_specimen_very_slow", "minimum_tier": "manual_evidence"},
+    {"source": "engine/src/integ_tests/test_perf.rs", "name": "result_cache_disabled_still_meets_scale_gate_very_slow", "minimum_tier": "manual_evidence"},
+    {"source": "engine/src/integ_tests/test_perf.rs", "name": "local_standard_specimen_calibration_curve_very_slow", "minimum_tier": "manual_evidence"},
+    {"source": "engine/src/integ_tests/test_perf.rs", "name": "bounded_executor_frozen_matrix_benchmark_slow", "minimum_tier": "manual_evidence"},
+    {"source": "engine/src/index/write_queue_tests.rs", "name": "writer_idle_timeout_candidate_matrix_selects_default", "minimum_tier": "manual_evidence"},
+    {"source": "engine/src/index/write_queue_tests.rs", "name": "merge_policy_candidate_matrix_selects_first_passing_policy", "minimum_tier": "manual_evidence"},
+    {"source": "engine/src/index/write_queue_tests.rs", "name": "selected_default_idle_writer_eviction_releases_budget_and_allows_more_tenants", "minimum_tier": "manual_evidence"},
+    {"source": "engine/src/index/manager/publication/tests/repair_cli_contract.rs", "name": "publication_repair_cli_generates_owner_authentic_layouts", "minimum_tier": "manual_evidence"},
+    {"source": "engine/flapjack-http/src/handlers/migration/algolia_client_tests.rs", "name": "live_algolia_client_lists_indexes_with_canonical_credentials", "minimum_tier": "manual_evidence"},
+    {"source": "engine/flapjack-http/src/handlers/migration/preview_tests.rs", "name": "meilisearch_live_preview_reports_exact_seeded_counts_and_codes", "minimum_tier": "manual_evidence"},
+    {"source": "engine/flapjack-http/src/handlers/migration/spool_gc_probe_tests.rs", "name": "seed_migration_spool_gc_probe_fixture", "minimum_tier": "manual_evidence"},
+    {"source": "engine/flapjack-http/src/handlers/migration/typesense_client_tests.rs", "name": "typesense_export_identity_throughput_probe", "minimum_tier": "manual_evidence"},
+    {"source": "engine/flapjack-http/src/handlers/migration/typesense_client_tests.rs", "name": "typesense_export_stream_live_contract", "minimum_tier": "manual_evidence"},
+    {"source": "engine/tests/test_browse_scalability.rs", "name": "browse_scalability_stress_very_slow", "minimum_tier": "manual_evidence"},
+    {"source": "engine/tests/test_browse_scalability_slow.rs", "name": "browse_scalability_slow_returns_all_docs_exactly_once", "minimum_tier": "manual_evidence"},
+    {"source": "engine/tests/test_connection_hardening.rs", "name": "test_keepalive_reuse_after_30s_idle", "minimum_tier": "manual_evidence"},
+    {"source": "engine/tests/test_docker_e2e.rs", "name": "test_docker_rollup_broadcaster_node_a_pushes_to_node_b", "minimum_tier": "manual_evidence"},
+    {"source": "engine/tests/test_records_browse_parity.rs", "name": "browse_1m_docs_full_scan_slow", "minimum_tier": "manual_evidence"},
+    {"source": "engine/tests/test_records_browse_parity.rs", "name": "browse_bulk_seed_10k_smoke", "minimum_tier": "manual_evidence"},
+    {"source": "engine/tests/test_stage5_connection_behavior_parity.rs", "name": "connection_reuse_after_30s_idle_slow", "minimum_tier": "manual_evidence"}
+  ]
+}

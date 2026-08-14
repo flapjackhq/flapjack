@@ -102,11 +102,6 @@ impl PublicationTarget {
     pub fn new(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
         super::validate_index_name(&value)?;
-        if value == "." {
-            return Err(invalid_publication(
-                "publication target cannot be the current-directory path component",
-            ));
-        }
         Ok(Self(value))
     }
 

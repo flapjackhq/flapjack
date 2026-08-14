@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 // Stage 2 builds this migration-local persistence owner before later stages wire callers.
 use chrono::{DateTime, Duration, Utc};
 use flapjack::index::manager::publication::{
@@ -10,7 +9,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Seek, Write};
+#[cfg(test)]
+use std::io::Seek;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -592,6 +593,7 @@ pub(crate) struct ExportCheckpoint {
     pub resources: ResourceCompletions,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StagedArtifactForTest {
     pub temp_path: String,
@@ -633,6 +635,7 @@ pub(crate) enum SpoolErrorKind {
     Io,
     ManifestCorrupt,
     JobNotFound,
+    #[cfg(test)]
     PublicHandleNotFound,
     JobDeleting,
     CompressedPageBytesExceeded,
@@ -645,13 +648,13 @@ pub(crate) enum SpoolErrorKind {
     StagedArtifactBytesExceeded,
     InvalidRelativePath,
     InvalidSourceIdentityDigest,
+    #[cfg(test)]
     InvalidCompletedResourceId,
     CheckpointHandleNotFound,
     SourceIdentityMismatch,
     ResourceVerificationFailed,
     ResourceComplete,
     ResourcesIncomplete,
-    CancelRequested,
     JobTerminal,
     JobNotAccepted,
     JobNotInterrupted,
@@ -830,6 +833,7 @@ impl SpoolStore {
         Ok(record)
     }
 
+    #[cfg(test)]
     pub(crate) fn create_async_migration_admission(
         &self,
         job_uuid: Uuid,
@@ -844,6 +848,7 @@ impl SpoolStore {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn create_async_migration_admission_for_owner(
         &self,
         job_uuid: Uuid,
@@ -1158,6 +1163,7 @@ impl SpoolStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn record_async_publication_transaction_if_present(
         &self,
         job_uuid: Uuid,
@@ -1202,6 +1208,7 @@ impl SpoolStore {
         Ok(record)
     }
 
+    #[cfg(test)]
     pub(crate) fn request_migration_cancel(
         &self,
         job_uuid: Uuid,
@@ -1457,6 +1464,7 @@ impl SpoolStore {
         Ok((manifest.public_handle, manifest.checkpoint_handle))
     }
 
+    #[cfg(test)]
     pub(crate) fn public_view(&self, handle: &str) -> SpoolResult<PublicExportView> {
         let _root_lock = self.lock_root()?;
         for job_uuid in self.job_uuids()? {
@@ -1470,6 +1478,7 @@ impl SpoolStore {
         Err(SpoolError::new(SpoolErrorKind::PublicHandleNotFound))
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_settings(
         &self,
         job_uuid: Uuid,
@@ -1479,6 +1488,7 @@ impl SpoolStore {
         self.commit_artifact(job_uuid, ArtifactKind::Settings, bytes, item_count)
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_document_page(
         &self,
         job_uuid: Uuid,
@@ -1488,6 +1498,7 @@ impl SpoolStore {
         self.commit_artifact(job_uuid, ArtifactKind::DocumentPage, bytes, item_count)
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_rules_page(
         &self,
         job_uuid: Uuid,
@@ -1497,6 +1508,7 @@ impl SpoolStore {
         self.commit_artifact(job_uuid, ArtifactKind::RulesPage, bytes, item_count)
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_synonyms_page(
         &self,
         job_uuid: Uuid,
@@ -1529,6 +1541,7 @@ impl SpoolStore {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_config_file(
         &self,
         job_uuid: Uuid,
@@ -1608,6 +1621,7 @@ impl SpoolStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_completed_object_ids(
         &self,
         job_uuid: Uuid,
@@ -1649,6 +1663,7 @@ impl SpoolStore {
         self.commit_manifest(&manifest)
     }
 
+    #[cfg(test)]
     pub(crate) fn is_object_completed(&self, job_uuid: Uuid, object_id: &str) -> SpoolResult<bool> {
         Ok(self
             .completed_object_ids(job_uuid)?
@@ -1656,11 +1671,13 @@ impl SpoolStore {
             .any(|completed| completed == object_id))
     }
 
+    #[cfg(test)]
     pub(crate) fn completed_object_ids(&self, job_uuid: Uuid) -> SpoolResult<Vec<String>> {
         let manifest = self.read_manifest(job_uuid)?;
         self.completed_object_ids_from_manifest(job_uuid, &manifest)
     }
 
+    #[cfg(test)]
     fn completed_object_ids_from_manifest(
         &self,
         job_uuid: Uuid,
@@ -1868,6 +1885,7 @@ impl SpoolStore {
         fs::read_to_string(self.job_dir(job_uuid).join("tombstone.json")).map_err(SpoolError::from)
     }
 
+    #[cfg(test)]
     pub(crate) fn visible_artifacts(&self, job_uuid: Uuid) -> SpoolResult<Vec<String>> {
         let manifest = self.read_manifest(job_uuid)?;
         Ok(visible_artifacts(&manifest)
@@ -1973,6 +1991,7 @@ impl SpoolStore {
     }
 }
 
+#[cfg(test)]
 fn validate_completed_resource_id(value: &str) -> SpoolResult<()> {
     if value.is_empty() || value.chars().any(|ch| matches!(ch, '\n' | '\r' | '\0')) {
         return Err(SpoolError::new(SpoolErrorKind::InvalidCompletedResourceId));

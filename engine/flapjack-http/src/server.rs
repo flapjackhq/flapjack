@@ -61,7 +61,11 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(error) => exit_for_startup_auth_validation_error(error),
     }
-    let (key_store, admin_key, key_is_new) = initialize_key_store(&server_config, data_dir);
+    let initialized_keys =
+        initialize_key_store(&server_config, data_dir).map_err(std::io::Error::other)?;
+    let key_store = initialized_keys.key_store;
+    let admin_key = initialized_keys.admin_key;
+    let key_is_new = initialized_keys.key_is_new;
     let mut infrastructure =
         initialize_server_infrastructure(&server_config, data_dir, admin_key.clone(), node_config)
             .await?;
@@ -108,13 +112,14 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             cors_mode,
             disable_dashboard: server_config.disable_dashboard,
             replication_api_key: server_config.replication_api_key_env.clone(),
+            api_profile: server_config.api_profile,
         },
     );
 
     let listener = tokio::net::TcpListener::bind(&infrastructure.bind_addr).await?;
     // SSL renewal may immediately request a certificate. Bind first so Pebble or a
     // production CA can queue its HTTP-01 request until Axum begins accepting it.
-    spawn_background_tasks(&state, &infrastructure);
+    spawn_background_tasks(&state, &infrastructure).map_err(std::io::Error::other)?;
     let auth_status = resolve_auth_status(&server_config, key_is_new, admin_key);
     let use_tls = loaded_tls.is_some();
     print_startup_banner(

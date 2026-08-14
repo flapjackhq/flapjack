@@ -219,7 +219,7 @@ assert_capped_vector_job_prebuild_binding() {
   local capped_step_name="$4"
   local capped_step_command="$5"
   local prebuild_step_name="Build vector-search test binaries"
-  local prebuild_command="RUSTFLAGS='-C debuginfo=0 -C strip=debuginfo' cargo build --tests -p flapjack -p flapjack-http --features vector-search"
+  local prebuild_command="cargo build --tests -p flapjack -p flapjack-http --features vector-search"
   local signal_job_block_unique="0"
   local signal_canonical_prebuild_present="0"
   local signal_canonical_capped_present="0"
@@ -323,7 +323,7 @@ jobs:
       - name: Fast tests (vector-search)
         run: cargo nextest run -p flapjack -p flapjack-http --features vector-search
       - name: Build vector-search test binaries
-        run: RUSTFLAGS='-C debuginfo=0 -C strip=debuginfo' cargo build --tests -p flapjack -p flapjack-http --features vector-search
+        run: cargo build --tests -p flapjack -p flapjack-http --features vector-search
 YAML
 
   local binding_output
@@ -519,17 +519,15 @@ section "Rust test timeout acceptance contract"
 assert_duplicate_step_name_regression_fixture
 assert_duplicate_step_fixture_guards_wrong_failure_mode
 assert_duplicate_step_fixture_ignores_helper_prose_changes
-assert_step_contract "$CI_WORKFLOW" "ci.yml" "Fast tests (vector-search)" "cargo nextest run -p flapjack -p flapjack-http --features vector-search"
-assert_step_contract "$CI_WORKFLOW" "ci.yml" "Fast tests (remaining)" "cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication"
-assert_step_contract "$CI_WORKFLOW" "ci.yml" "All tests (vector-search)" "cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci" "20"
-assert_step_contract "$CI_WORKFLOW" "ci.yml" "All tests (remaining)" "cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci"
-assert_job_contains_pattern "$CI_WORKFLOW" "ci.yml" "rust-tests-fast" '^[[:space:]]*tool:[[:space:]]*cargo-audit,cargo-deny[[:space:]]*$' "ci.yml 'rust-tests-fast' installs cargo-audit and cargo-deny before running vector-search tests"
+assert_step_contract "$CI_WORKFLOW" "ci.yml" "Build candidate core test binary" 'cargo test -p flapjack --lib --no-run --message-format=json > candidate_build.json && python3 tests/extract_candidate_binary.py candidate_build.json "$GITHUB_OUTPUT"' "30"
+assert_step_contract "$CI_WORKFLOW" "ci.yml" "Candidate test-tier inventory" "python3 tests/test_ci_test_tiers.py --verify" "10"
+assert_step_contract "$CI_WORKFLOW" "ci.yml" "Candidate core tests" 'timeout --kill-after=60s 300s "${{ steps.candidate-build.outputs.executable }}"' "6"
+assert_step_contract "$CI_WORKFLOW" "ci.yml" "All tests (vector-search)" "cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci --no-fail-fast" "20"
+assert_step_contract "$CI_WORKFLOW" "ci.yml" "All tests (remaining)" "cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci --no-fail-fast"
 assert_job_contains_pattern "$CI_WORKFLOW" "ci.yml" "rust-tests-all" '^[[:space:]]*tool:[[:space:]]*cargo-audit,cargo-deny[[:space:]]*$' "ci.yml 'rust-tests-all' installs cargo-audit and cargo-deny before running vector-search tests"
-assert_named_step_order_in_job "$CI_WORKFLOW" "ci.yml" "rust-tests-fast" "Install cargo security tools" "Fast tests (vector-search)"
-assert_named_step_order_in_job "$CI_WORKFLOW" "ci.yml" "rust-tests-all" "Install cargo security tools" "All tests (vector-search)"
-assert_capped_vector_job_prebuild_binding "$CI_WORKFLOW" "ci.yml" "rust-tests-fast" "Fast tests (vector-search)" "cargo nextest run -p flapjack -p flapjack-http --features vector-search"
-assert_capped_vector_job_prebuild_binding "$CI_WORKFLOW" "ci.yml" "rust-tests-all" "All tests (vector-search)" "cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci"
-assert_step_contract "$NIGHTLY_WORKFLOW" "nightly.yml" "Run all tests" "cargo nextest run -P ci"
+assert_named_step_order_in_job "$CI_WORKFLOW" "ci.yml" "rust-tests-all" "Install cargo audit/deny tools for security audit tests" "All tests (vector-search)"
+assert_capped_vector_job_prebuild_binding "$CI_WORKFLOW" "ci.yml" "rust-tests-all" "All tests (vector-search)" "cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci --no-fail-fast"
+assert_step_contract "$NIGHTLY_WORKFLOW" "nightly.yml" "Run all tests" "cargo nextest run -P ci" "45"
 
 printf '\n\033[1mResults: %d/%d passed\033[0m\n' "$TESTS_PASSED" "$TESTS_RUN"
 if [ "$TESTS_FAILED" -gt 0 ]; then

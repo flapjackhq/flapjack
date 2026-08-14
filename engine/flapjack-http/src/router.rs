@@ -15,6 +15,7 @@ use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
+use crate::api_profile::ApiProfile;
 use crate::auth::{
     authenticate_and_authorize, request_application_id,
     session::{DashboardSessionStore, SessionStoreError},
@@ -55,6 +56,7 @@ pub struct RouterConfig {
     pub cors_mode: CorsMode,
     pub disable_dashboard: bool,
     pub replication_api_key: Option<String>,
+    pub api_profile: ApiProfile,
 }
 
 pub(crate) const DEFAULT_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
@@ -138,6 +140,14 @@ fn build_router_with_resource_bounds(
     config: RouterConfig,
     resource_bounds: ResourceBounds,
 ) -> Router {
+    config
+        .api_profile
+        .validate_auth_enabled(key_store.is_some())
+        .unwrap_or_else(|error| panic!("invalid API profile configuration: {error}"));
+    let config = RouterConfig {
+        disable_dashboard: config.disable_dashboard || config.api_profile == ApiProfile::PaidBetaV1,
+        ..config
+    };
     let authentication = key_store.clone().map(|key_store| {
         AuthenticationOwners::open(key_store, data_dir)
             .unwrap_or_else(|error| panic!("failed to open dashboard session store: {error}"))
@@ -942,6 +952,7 @@ fn apply_middleware(
         app
     };
 
+    let api_profile = config.api_profile;
     app_id_layer(app)
         .layer(memory_middleware)
         .layer(DefaultBodyLimit::max(max_body_mb * 1024 * 1024))
@@ -967,6 +978,7 @@ fn apply_middleware(
         .layer(middleware::from_fn(move |request, next| {
             insert_security_headers(request, next, security_header_policy.clone())
         }))
+        .layer(Extension(api_profile))
 }
 
 async fn enforce_request_timeout(

@@ -2270,7 +2270,10 @@ os.execv(
 )
 PY
   runner_pid=$!
-  wait_for_event "health_request|" 5
+  # The runner owns separate five-second startup-banner and health windows, so
+  # the harness must observe the health request across both windows instead of
+  # racing only the second one on a contended host.
+  wait_for_event "health_request|" 12
   server_pid="$(latest_event_pid "server_bound|")"
   kill -INT -- "-$runner_pid"
   python3 - "$runner_pid" "$timeout_marker" <<'PY' &
@@ -2282,7 +2285,11 @@ import time
 
 runner_pid = int(sys.argv[1])
 timeout_marker = pathlib.Path(sys.argv[2])
-time.sleep(2)
+# The runner may consume three one-second fail-closed shutdown phases (TERM,
+# reap, and final process-group verification) before serializing evidence. Keep
+# this watchdog above that owned budget; the all-signal specimen below uses the
+# same five-second ceiling.
+time.sleep(5)
 try:
     os.kill(runner_pid, 0)
 except ProcessLookupError:
@@ -2350,7 +2357,7 @@ os.execv(runner, [
 ])
 PY
     runner_pid=$!
-    wait_for_event "health_request|" 5
+    wait_for_event "health_request|" 12
     server_pid="$(latest_event_pid "server_bound|")"
     kill "-$signal_name" -- "-$runner_pid"
     python3 - "$runner_pid" "$timeout_marker" <<'PY' &

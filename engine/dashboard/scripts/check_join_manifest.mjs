@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { DEFAULTS, die, parseArgs, readJoinManifest } from './join_proof_common.mjs';
 
 const SCRIPT_NAME = 'check_join_manifest';
@@ -101,6 +101,42 @@ export function validateJoinManifest({ manifestPath = DEFAULTS.manifest, feature
   summary.rowsMismatched = mismatchedRows.size + missingShapeExemptRows;
 
   return { ok: problems.length === 0, summary, problems };
+}
+
+export function refreshJoinManifestLineRefs({
+  manifestPath = DEFAULTS.manifest,
+  featuresPath = DEFAULTS.features,
+}) {
+  const manifest = readJoinManifest(manifestPath, SCRIPT_NAME);
+  if (manifest === null || typeof manifest !== 'object' || !Array.isArray(manifest.rows)) {
+    throw new Error('manifest must be an object with a rows array');
+  }
+  const featureIndex = indexFeatures(readFeaturesLines(featuresPath));
+  let rowsUpdated = 0;
+
+  for (const [index, row] of manifest.rows.entries()) {
+    const parsedRef = parseFeaturesRef(row?.features_ref);
+    if (parsedRef.kind === 'shape-exempt') continue;
+    if (parsedRef.kind !== 'document') {
+      throw new Error(`row ${index + 1} has no refreshable FEATURES.md reference`);
+    }
+    const hits = featureIndex.byCapability.get(row.capability) ?? [];
+    const sectionHits = hits.filter((hit) => hit.section === parsedRef.section);
+    if (sectionHits.length !== 1) {
+      throw new Error(
+        `row ${index + 1} ${row.capability} resolves to ${sectionHits.length} `
+        + `FEATURES.md rows in section ${parsedRef.section}`,
+      );
+    }
+    const refreshedRef = `FEATURES.md:${sectionHits[0].line} ${parsedRef.section}`;
+    if (row.features_ref !== refreshedRef) {
+      row.features_ref = refreshedRef;
+      rowsUpdated += 1;
+    }
+  }
+
+  if (rowsUpdated > 0) writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  return { rowsUpdated };
 }
 
 function emptySummary(rows) {
@@ -285,11 +321,27 @@ function formatProblem(problem) {
 
 function main() {
   const args = parseArgs(process.argv.slice(2), {
-    defaults: { manifest: DEFAULTS.manifest, features: DEFAULTS.features, json: false },
-    booleanFlags: ['--json'],
+    defaults: {
+      manifest: DEFAULTS.manifest,
+      features: DEFAULTS.features,
+      json: false,
+      'refresh-lines': false,
+    },
+    booleanFlags: ['--json', '--refresh-lines'],
     valueFlags: ['--manifest', '--features'],
     scriptName: SCRIPT_NAME,
   });
+  if (args['refresh-lines']) {
+    try {
+      const refreshed = refreshJoinManifestLineRefs({
+        manifestPath: args.manifest,
+        featuresPath: args.features,
+      });
+      process.stdout.write(`JOIN manifest line refs refreshed: ${refreshed.rowsUpdated}\n`);
+    } catch (error) {
+      die(SCRIPT_NAME, `cannot refresh line refs: ${error.message}`);
+    }
+  }
   const result = validateJoinManifest({ manifestPath: args.manifest, featuresPath: args.features });
   if (args.json) {
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
