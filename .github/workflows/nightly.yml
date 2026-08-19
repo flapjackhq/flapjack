@@ -19,6 +19,16 @@ on:
         type: boolean
         required: false
         default: false
+      run_pbv2_fjcloud_external_smoke:
+        description: 'Run the exact FJCloud PBV2 Algolia smoke only'
+        type: boolean
+        required: false
+        default: false
+      fjcloud_mirror_sha:
+        description: 'Exact public FJCloud staging-mirror SHA to test'
+        type: string
+        required: false
+        default: ''
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,11 +43,122 @@ jobs:
     steps:
       - id: check
         run: |
-          if [ "${{ github.repository }}" = "flapjackhq/flapjack" ] || [ "${{ github.repository }}" = "gridl-staging/flapjack" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.run_pbv2_fjcloud_external_smoke }}" = "true" ]; then
+            echo "is-public-repo=false" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.repository }}" = "flapjackhq/flapjack" ] || [ "${{ github.repository }}" = "gridl-staging/flapjack" ]; then
             echo "is-public-repo=true" >> "$GITHUB_OUTPUT"
           else
             echo "is-public-repo=false" >> "$GITHUB_OUTPUT"
           fi
+
+  pbv2-fjcloud-external-smoke:
+    name: PBV2 FJCloud external Algolia smoke
+    if: github.event_name == 'workflow_dispatch' && inputs.run_pbv2_fjcloud_external_smoke == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_USER: fjcloud
+          POSTGRES_PASSWORD: password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fjcloud -d postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://fjcloud:password@127.0.0.1:5432/postgres
+      FJCLOUD_EXPECTED_DEV_SHA: b42ddd49c81e31b1e274576d332e996646103c24
+      FLAPJACK_EXPECTED_DEV_SHA: 22432a0836f913362ebb4fc90201a11672b7f5c3
+      ALGOLIA_APP_ID: ${{ secrets.ALGOLIA_APP_ID }}
+      ALGOLIA_ADMIN_KEY: ${{ secrets.ALGOLIA_ADMIN_KEY }}
+    steps:
+      - name: Refuse an omitted or malformed FJCloud SHA
+        run: |
+          [[ "${{ inputs.fjcloud_mirror_sha }}" =~ ^[0-9a-f]{40}$ ]]
+      - name: Check out exact Flapjack source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Check out exact public FJCloud source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: gridl-infra-staging/fjcloud
+          ref: ${{ inputs.fjcloud_mirror_sha }}
+          path: fjcloud
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            engine
+            fjcloud/infra
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+      - name: Verify exact source identities
+        run: |
+          test "$(jq -r .dev_sha .debbie/sync_manifest.json)" = "$FLAPJACK_EXPECTED_DEV_SHA"
+          test "$(jq -r .dev_sha fjcloud/.debbie/sync_manifest.json)" = "$FJCLOUD_EXPECTED_DEV_SHA"
+      - name: Prepare run-scoped Algolia credential file
+        run: |
+          test -n "$ALGOLIA_APP_ID"
+          test -n "$ALGOLIA_ADMIN_KEY"
+          umask 077
+          {
+            printf 'ALGOLIA_APP_ID=%s\n' "$ALGOLIA_APP_ID"
+            printf 'ALGOLIA_ADMIN_KEY=%s\n' "$ALGOLIA_ADMIN_KEY"
+          } > "$RUNNER_TEMP/algolia.env"
+      - name: Remove the exact residue from the interrupted local smoke
+        run: |
+          set -euo pipefail
+          index='fjcloud_import_catalog_probe_20260819232353_73916_source'
+          base="https://${ALGOLIA_APP_ID}.algolia.net/1/indexes/${index}"
+          status="$(curl --silent --show-error --output "$RUNNER_TEMP/residue-get.json" --write-out '%{http_code}' \
+            --header "x-algolia-application-id: $ALGOLIA_APP_ID" \
+            --header "x-algolia-api-key: $ALGOLIA_ADMIN_KEY" "$base")"
+          if [ "$status" = 404 ]; then
+            exit 0
+          fi
+          test "$status" = 200
+          curl --silent --show-error --fail --request DELETE \
+            --header "x-algolia-application-id: $ALGOLIA_APP_ID" \
+            --header "x-algolia-api-key: $ALGOLIA_ADMIN_KEY" \
+            "$base" > "$RUNNER_TEMP/residue-delete.json"
+          task_id="$(jq -er .taskID "$RUNNER_TEMP/residue-delete.json")"
+          for _ in $(seq 1 60); do
+            task_status="$(curl --silent --show-error --fail \
+              --header "x-algolia-application-id: $ALGOLIA_APP_ID" \
+              --header "x-algolia-api-key: $ALGOLIA_ADMIN_KEY" \
+              "$base/task/$task_id" | jq -er .status)"
+            [ "$task_status" = published ] && exit 0
+            sleep 1
+          done
+          exit 1
+      - name: Run exact PBV2 external smoke
+        working-directory: fjcloud
+        env:
+          FJCLOUD_SECRET_FILE: ${{ runner.temp }}/algolia.env
+          FLAPJACK_DEV_DIR: ${{ github.workspace }}/engine
+          FJCLOUD_CUSTOMER_SURFACE_PROFILE: paid_beta_v2
+          PBV2_RELEASE_ACCEPTANCE: '1'
+          FJCLOUD_ALGOLIA_MIGRATION_ENABLED: 'true'
+          SKIP_EMAIL_VERIFICATION: ''
+          API_DEV_ALLOW_SKIP_EMAIL_VERIFICATION: ''
+        run: |
+          bash scripts/bootstrap-env-local.sh
+          bash scripts/algolia_import_catalog_live_probe.sh --phases catalog \
+            | tee "$RUNNER_TEMP/pbv2-external-smoke.log"
+      - name: Upload secret-safe smoke receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pbv2-fjcloud-external-smoke
+          path: ${{ runner.temp }}/pbv2-external-smoke.log
+          if-no-files-found: error
+          retention-days: 14
 
   # ============================================================================
   # RUST ENGINE TESTS (ALL)
