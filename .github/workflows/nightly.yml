@@ -72,7 +72,7 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgres://fjcloud:password@127.0.0.1:5432/postgres
-      FJCLOUD_EXPECTED_DEV_SHA: b42ddd49c81e31b1e274576d332e996646103c24
+      FJCLOUD_EXPECTED_DEV_SHA: afa538f995938d8d838f962975d3fd100cfdd1c4
       FLAPJACK_EXPECTED_DEV_SHA: 22432a0836f913362ebb4fc90201a11672b7f5c3
       ALGOLIA_APP_ID: ${{ secrets.ALGOLIA_APP_ID }}
       ALGOLIA_ADMIN_KEY: ${{ secrets.ALGOLIA_ADMIN_KEY }}
@@ -88,6 +88,8 @@ jobs:
           repository: gridl-infra-staging/fjcloud
           ref: ${{ inputs.fjcloud_mirror_sha }}
           path: fjcloud
+          token: ${{ secrets.GHCR_TOKEN }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
