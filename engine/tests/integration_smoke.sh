@@ -45,6 +45,7 @@ section() {
   printf '\n\033[1m%s\033[0m\n' "$1"
 }
 
+# TODO: Document cleanup.
 cleanup() {
   local script_exit_code=$?
   if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -78,6 +79,7 @@ extract_task_id() {
   printf '%s\n' "$1" | jq -r 'if (.taskID | type == "number") then (.taskID | tostring) else empty end' 2>/dev/null || true
 }
 
+# TODO: Document curl_request.
 curl_request() {
   local include_auth="$1"
   local method="$2"
@@ -148,6 +150,7 @@ json_matches() {
   printf '%s\n' "$body" | jq -e "$jq_filter" >/dev/null 2>&1
 }
 
+# TODO: Document wait_for_task.
 wait_for_task() {
   local task_id="$1"
   local task_status_body=""
@@ -192,6 +195,7 @@ generate_admin_key() {
   printf 'fj_smoke_%s\n' "$random_hex"
 }
 
+# TODO: Document build_or_resolve_binary.
 build_or_resolve_binary() {
   if [ -n "${FLAPJACK_BIN:-}" ]; then
     if [ ! -x "$FLAPJACK_BIN" ]; then
@@ -220,6 +224,7 @@ build_or_resolve_binary() {
   fi
 }
 
+# TODO: Document start_server.
 start_server() {
   local wait_helper
   TMP_DATA="$(mktemp -d)"
@@ -253,6 +258,7 @@ report_summary() {
   return 0
 }
 
+# TODO: Document main.
 main() {
   echo 'Integration API Smoke Test'
   require_tools

@@ -48,6 +48,15 @@ pub(super) fn with_index_mutation<T>(
     operation: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
     let index_root = config.target_artifact_paths(index_name).index_root;
+    with_index_root_mutation(index_root, operation)
+}
+
+/// Serialize a mutation when the already-resolved index root is the canonical
+/// identity available to the caller.
+pub(super) fn with_index_root_mutation<T>(
+    index_root: PathBuf,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
     let state = operation_state(index_root)?;
     let _guard = begin_index_mutation(state)?;
     operation()

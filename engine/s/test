@@ -6,6 +6,7 @@
 #
 # Usage:
 #   ./s/test                  # default: unit + integ + server
+#   ./s/test --rwork-contract  # validate repository Rwork + Dev Container config
 #   ./s/test --sdk-host-safety # scan shipped sdks/ for vendor host literals
 #   ./s/test --publish-guard   # prove the mirror publish guard refuses unmerged trees
 #   ./s/test --unit           # core in-process + HTTP libs process-isolated
@@ -16,6 +17,7 @@
 #   ./s/test --sdk-algolia    # JS SDK tests that need Algolia creds
 #   ./s/test --dashboard      # vitest unit + playwright smoke
 #   ./s/test --dashboard-full # + playwright full e2e
+#   ./s/test --console        # Svelte console unit/check/build + real-engine browser
 #   ./s/test --e2e            # build binary + start server + sdk + contract tests
 #   ./s/test --go             # Go SDK unit tests
 #   ./s/test --cold-install   # cold-install README quickstart smoke (opt-in)
@@ -40,6 +42,7 @@ load_local_instance_config "$ROOT_DIR"
 
 RUN_SDK_HOST_SAFETY=false
 RUN_PUBLISH_GUARD=false
+RUN_RWORK_CONTRACT=false
 RUN_UNIT=false
 RUN_INTEG=false
 RUN_SERVER=false
@@ -48,6 +51,7 @@ RUN_SDK=false
 RUN_SDK_ALGOLIA=false
 RUN_DASHBOARD=false
 RUN_DASHBOARD_FULL=false
+RUN_CONSOLE=false
 RUN_E2E=false
 RUN_GO=false
 RUN_COLD_INSTALL=false
@@ -59,6 +63,7 @@ for arg in "$@"; do
   case "$arg" in
     --sdk-host-safety) RUN_SDK_HOST_SAFETY=true; EXPLICIT=true ;;
     --publish-guard)  RUN_PUBLISH_GUARD=true; EXPLICIT=true ;;
+    --rwork-contract) RUN_RWORK_CONTRACT=true; EXPLICIT=true ;;
     --unit)           RUN_UNIT=true; EXPLICIT=true ;;
     --integ)          RUN_INTEG=true; EXPLICIT=true ;;
     --server)         RUN_SERVER=true; EXPLICIT=true ;;
@@ -67,6 +72,7 @@ for arg in "$@"; do
     --sdk-algolia)    RUN_SDK_ALGOLIA=true; EXPLICIT=true ;;
     --dashboard)      RUN_DASHBOARD=true; EXPLICIT=true ;;
     --dashboard-full) RUN_DASHBOARD_FULL=true; EXPLICIT=true ;;
+    --console)        RUN_CONSOLE=true; EXPLICIT=true ;;
     --e2e)            RUN_E2E=true; EXPLICIT=true ;;
     --go)             RUN_GO=true; EXPLICIT=true ;;
     --cold-install)   RUN_COLD_INSTALL=true; EXPLICIT=true ;;
@@ -74,14 +80,18 @@ for arg in "$@"; do
     --all)
       RUN_SDK_HOST_SAFETY=true
       RUN_PUBLISH_GUARD=true
+      RUN_RWORK_CONTRACT=true
       RUN_UNIT=true; RUN_INTEG=true; RUN_SERVER=true; RUN_SDK=true
       RUN_DASHBOARD=true; RUN_DASHBOARD_FULL=true; RUN_E2E=true; RUN_GO=true
+      RUN_CONSOLE=true
       EXPLICIT=true ;;
     --ci)
       RUN_SDK_HOST_SAFETY=true
       RUN_PUBLISH_GUARD=true
+      RUN_RWORK_CONTRACT=true
       RUN_UNIT=true; RUN_INTEG=true; RUN_SERVER=true
       RUN_DASHBOARD=true
+      RUN_CONSOLE=true
       EXPLICIT=true ;;
     --list)           RUN_LIST=true ;;
     *)
@@ -101,6 +111,7 @@ if [ "$RUN_LIST" = "true" ]; then
   echo "  (no flags)         unit + integ + server (default)               host-dependent"
   echo "  --sdk-host-safety  scan shipped sdks/ for vendor host literals   ~1s"
   echo "  --publish-guard    prove the mirror publish guard refuses unmerged  ~2s"
+  echo "  --rwork-contract   validate repository Rwork + Dev Container config  <1s"
   echo "  --unit             core in-process + HTTP libs isolated          host-dependent"
   echo "  --integ            process-isolated integration tests            host-dependent"
   echo "  --server           cargo test -p flapjack-server (12 tests)     ~10s"
@@ -109,13 +120,14 @@ if [ "$RUN_LIST" = "true" ]; then
   echo "  --sdk-algolia      JS SDK: algolia_migration + validation       ~15s"
   echo "  --dashboard        vitest unit + playwright smoke               ~2.5 min"
   echo "  --dashboard-full   vitest unit + playwright smoke + full e2e    ~15 min"
+  echo "  --console          Svelte unit/check/build + real-engine browser ~3 min"
   echo "  --e2e              build binary + server + sdk + contract tests  ~30s"
   echo "  --go               Go SDK unit tests                            ~5s"
   echo "  --cold-install     bash \"\$ENGINE_DIR/tests/readme_quickstart_smoke.sh\""
   echo "                     opt-in; COLD_INSTALL_DRY_RUN=1 probes dispatch without network"
   echo "  --migration-release-loopback  shipped-profile migration loopback contract  ~15 min"
-  echo "  --all              everything (incl. sdk-host-safety + publish-guard) ~20 min"
-  echo "  --ci               sdk-host-safety + publish-guard + unit + integ + server + dashboard  ~5 min"
+  echo "  --all              everything (incl. console browser)             ~23 min"
+  echo "  --ci               public-fast owners incl. dashboard + console   ~8 min"
   echo "  --list             print this help"
   echo ""
   echo "  Combine flags: ./s/test --unit --sdk"
@@ -294,6 +306,17 @@ ensure_dashboard_node_modules() {
     "@playwright/test"
 }
 
+ensure_console_node_modules() {
+  ensure_node_modules_from_lockfile \
+    "console" \
+    "$ENGINE_DIR/console" \
+    "$ENGINE_DIR/console/package-lock.json" \
+    "vitest" \
+    "@playwright/test" \
+    "@axe-core/playwright" \
+    "eslint"
+}
+
 run_sdk_node_test() {
   local step_label="$1"
   local script_name="$2"
@@ -457,6 +480,28 @@ ensure_server() {
 banner "Flapjack Test Suite"
 timer_start
 
+# ── Rwork repository contract ────────────────────────────────────────────────
+# Rwork configuration is a private-dev concern and is intentionally absent from
+# public mirrors. `.debbie.toml` identifies the source checkout; there a missing
+# config or contract test is a defect, not a skip.
+
+if [ "$RUN_RWORK_CONTRACT" = "true" ]; then
+  if [ -f "$ROOT_DIR/.debbie.toml" ]; then
+    next_step "Rwork: repository profile and Dev Container contract"
+    if [ ! -f "$ROOT_DIR/.rwork.toml" ] || \
+       [ ! -f "$ROOT_DIR/scripts/tests/rwork_repository_contract_test.sh" ]; then
+      error "This dev checkout is missing its Rwork config or repository contract"
+      exit 1
+    fi
+    bash "$ROOT_DIR/scripts/tests/rwork_repository_contract_test.sh"
+    success "Rwork repository contract holds"
+  else
+    next_step "Rwork: contract not applicable in a public mirror"
+    success "Skipped — Rwork source-checkout config is dev-only"
+  fi
+  echo ""
+fi
+
 # ── SDK host safety gate ──────────────────────────────────────────────────────
 # Runs first, before any Rust or dashboard work: a cheap source contract that
 # fails fast when the shipped sdks/ mirror still contains executable vendor-host
@@ -601,6 +646,40 @@ if [ "$RUN_DASHBOARD" = "true" ] || [ "$RUN_DASHBOARD_FULL" = "true" ]; then
     echo ""
   fi
 fi
+
+# -- Console checks --
+if [ "$RUN_CONSOLE" = "true" ]; then
+  ensure_console_node_modules
+
+  next_step "Console: component, type, and build checks"
+  npm --prefix "$ENGINE_DIR/console" run test:unit:run
+  npm --prefix "$ENGINE_DIR/console" run check
+  npm --prefix "$ENGINE_DIR/console" run build
+  npm --prefix "$ENGINE_DIR/console" run lint:browser-tests:unmocked
+  success "Console static and component checks passed"
+  echo ""
+
+  # Browser setup creates and deletes indexes. Never reuse a configured backend,
+  # even a healthy loopback process: this lane owns a fresh data directory and port.
+  if [ "$SERVER_STARTED" = "true" ]; then
+    stop_server
+    SERVER_STARTED=false
+  fi
+  FJ_HOST="127.0.0.1"
+  FJ_BACKEND_PORT="$(node -e 'const net=require("net");const server=net.createServer();server.listen(0,"127.0.0.1",()=>{console.log(server.address().port);server.close();});')"
+  FJ_API_BASE="http://${FJ_HOST}:${FJ_BACKEND_PORT}"
+  FJ_CONSOLE_TEST_INSTANCE_TOKEN="$(node -e 'console.log(require("crypto").randomUUID())')"
+  ensure_server
+
+  next_step "Console: real-engine standalone browser conformance"
+  FJ_CONSOLE_BACKEND_URL="$FJ_API_BASE" \
+    FJ_CONSOLE_ADMIN_KEY="$FJ_TEST_ADMIN_KEY" \
+    FJ_CONSOLE_TEST_INSTANCE_TOKEN="$FJ_CONSOLE_TEST_INSTANCE_TOKEN" \
+    npm --prefix "$ENGINE_DIR/console" run test:browser:unmocked
+  success "Console real-engine browser conformance passed"
+  echo ""
+fi
+# -- End console checks --
 
 # ── E2E: build binary + start server + run sdk + contract tests ──────────────
 

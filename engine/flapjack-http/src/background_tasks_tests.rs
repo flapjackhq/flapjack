@@ -100,6 +100,7 @@
         assert_eq!(completed_utc_day(just_before_midnight), "2026-07-18");
     }
 
+    /// TODO: Document s3_snapshot_tenant_prefix_rejects_path_traversal_components.
     #[test]
     fn s3_snapshot_tenant_prefix_rejects_path_traversal_components() {
         assert_eq!(
@@ -589,6 +590,7 @@
         assert_eq!(manifest["artifacts"].as_array().unwrap().len(), 0);
     }
 
+    /// TODO: Document one_shot_rollover_persists_completed_day_and_resets_counters.
     #[tokio::test]
     async fn one_shot_rollover_persists_completed_day_and_resets_counters() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -657,6 +659,7 @@
         assert_eq!(entry.documents_deleted_total.load(Ordering::Relaxed), 0);
     }
 
+    /// TODO: Document one_shot_rollover_unions_gauges_and_preserves_source.
     #[tokio::test]
     async fn one_shot_rollover_unions_gauges_and_preserves_source() {
         let tmp = tempfile::TempDir::new().unwrap();

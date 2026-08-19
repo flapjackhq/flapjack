@@ -1,3 +1,4 @@
+//! Stub summary for analytics_tests.rs.
 use super::*;
 use crate::auth::{ApiKey, SecuredKeyRestrictions, INVALID_API_CREDENTIALS_MESSAGE};
 use crate::test_helpers::body_json;
@@ -360,6 +361,7 @@ async fn get_json(app: &Router, uri: &str) -> serde_json::Value {
     body_json(response).await
 }
 
+/// TODO: Document make_search.
 fn make_search(query: &str, index: &str, query_id: &str) -> SearchEvent {
     SearchEvent {
         timestamp_ms: chrono::Utc::now().timestamp_millis(),
@@ -384,6 +386,7 @@ fn make_search(query: &str, index: &str, query_id: &str) -> SearchEvent {
     }
 }
 
+/// TODO: Document make_conversion.
 fn make_conversion(query_id: &str, index: &str, subtype: &str) -> InsightEvent {
     InsightEvent {
         event_type: "conversion".to_string(),
@@ -1140,7 +1143,7 @@ async fn top_searches_response_shape_without_click_analytics() {
         ))
         .body(Body::empty())
         .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let body = body_json(resp).await;
@@ -1156,6 +1159,23 @@ async fn top_searches_response_shape_without_click_analytics() {
         entry["nbHits"].as_i64().is_some(),
         "nbHits should be integer"
     );
+    assert!(
+        entry.get("_nbHitsSum").is_none() && entry.get("_nbHitsCount").is_none(),
+        "cluster-only weighted-average components must not leak into the public response"
+    );
+
+    let local_only_req = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "/2/searches?index=products&startDate={today}&endDate={today}"
+        ))
+        .header("X-Flapjack-Local-Only", "true")
+        .body(Body::empty())
+        .unwrap();
+    let local_only_body = body_json(app.oneshot(local_only_req).await.unwrap()).await;
+    let local_only_entry = &local_only_body["searches"][0];
+    assert!(local_only_entry["_nbHitsSum"].as_i64().is_some());
+    assert!(local_only_entry["_nbHitsCount"].as_i64().is_some());
 }
 
 /// Verify the `/2/searches` endpoint includes `trackedSearchCount`, `clickCount`, `clickThroughRate`, `conversionRate`, `conversionCount`, and `averageClickPosition` when `clickAnalytics=true`.
@@ -1419,6 +1439,7 @@ mod stage5_analytics_integration_tests {
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
+    /// TODO: Document countries_endpoint_reflects_enriched_country_field.
     #[tokio::test]
     async fn countries_endpoint_reflects_enriched_country_field() {
         let tmp = TempDir::new().unwrap();
@@ -1444,6 +1465,7 @@ mod stage5_analytics_integration_tests {
         );
         assert_eq!(countries[0]["count"], 1);
     }
+    /// TODO: Document analytics_event_persisted_without_country_when_geoip_unavailable.
     #[tokio::test]
     async fn analytics_event_persisted_without_country_when_geoip_unavailable() {
         let tmp = TempDir::new().unwrap();
@@ -1516,6 +1538,7 @@ mod stage_b_contract_parity_tests {
     }
 
     // ── B.1: countries limit/offset/orderBy ──
+    /// TODO: Document countries_supports_limit_offset_order_by_direction_consistently.
     #[tokio::test]
     async fn countries_supports_limit_offset_order_by_direction_consistently() {
         let tmp = TempDir::new().unwrap();
@@ -1610,6 +1633,7 @@ mod stage_b_contract_parity_tests {
     }
 
     // ── B.2: countries invalid date range → 400 ──
+    /// TODO: Document countries_invalid_date_range_returns_algolia_shaped_400.
     #[tokio::test]
     async fn countries_invalid_date_range_returns_algolia_shaped_400() {
         let tmp = TempDir::new().unwrap();
@@ -1656,6 +1680,7 @@ mod stage_b_contract_parity_tests {
     }
 
     // ── B.3: countries tags filter ──
+    /// TODO: Document countries_tags_filter_applies_when_tags_present.
     #[tokio::test]
     async fn countries_tags_filter_applies_when_tags_present() {
         let tmp = TempDir::new().unwrap();
@@ -1730,6 +1755,7 @@ mod stage_b_contract_parity_tests {
     }
 
     // ── B.4: conversion date bucket format consistency ──
+    /// TODO: Document conversion_endpoints_share_identical_date_bucket_format.
     #[tokio::test]
     async fn conversion_endpoints_share_identical_date_bucket_format() {
         let tmp = TempDir::new().unwrap();
@@ -1806,6 +1832,7 @@ mod stage_b_contract_parity_tests {
     }
 
     // ── B.5: revenue contract strictness ──
+    /// TODO: Document revenue_endpoint_currency_map_and_totals_match_contract.
     #[tokio::test]
     async fn revenue_endpoint_currency_map_and_totals_match_contract() {
         let tmp = TempDir::new().unwrap();
@@ -1896,6 +1923,7 @@ mod stage_b_contract_parity_tests {
     }
 
     // ── B.6: no extra top-level fields ──
+    /// TODO: Document analytics_endpoints_never_emit_extra_top_level_fields.
     #[tokio::test]
     async fn analytics_endpoints_never_emit_extra_top_level_fields() {
         let tmp = TempDir::new().unwrap();
@@ -2010,6 +2038,7 @@ mod stage3_rollup_http_parity_tests {
             .timestamp_millis()
     }
 
+    /// TODO: Document fixture_search_event.
     fn fixture_search_event(
         query: &str,
         nb_hits: u32,
@@ -2040,6 +2069,7 @@ mod stage3_rollup_http_parity_tests {
         }
     }
 
+    /// TODO: Document seed_known_answer_daily_dataset.
     fn seed_known_answer_daily_dataset(config: &AnalyticsConfig) {
         let collector = AnalyticsCollector::new(config.clone());
         let base_ts = fixture_day_start_ms() + 12 * HOUR_MS;
@@ -2072,6 +2102,7 @@ mod stage3_rollup_http_parity_tests {
             .expect("daily rollup flush");
     }
 
+    /// TODO: Document build_test_app.
     fn build_test_app(remove_raw_searches: bool) -> TestAppFixture {
         let tmp = TempDir::new().unwrap();
         let config = test_analytics_config(&tmp);
@@ -2094,6 +2125,7 @@ mod stage3_rollup_http_parity_tests {
         TestAppFixture { _tmp: tmp, app }
     }
 
+    /// TODO: Document request_bytes.
     async fn request_bytes(app: &Router, uri: &str, local_only: bool) -> (StatusCode, Vec<u8>) {
         let mut request = Request::builder().method(Method::GET).uri(uri);
         if local_only {
@@ -2125,6 +2157,7 @@ mod stage3_rollup_http_parity_tests {
         );
     }
 
+    /// TODO: Document rollup_top_searches_and_search_count_payload_parity.
     #[tokio::test]
     async fn rollup_top_searches_and_search_count_payload_parity() {
         let raw_fixture = build_test_app(false);
@@ -2163,6 +2196,7 @@ mod stage3_rollup_http_parity_tests {
         );
     }
 
+    /// TODO: Document rollup_users_count_contract_parity_and_header_modes.
     #[tokio::test]
     async fn rollup_users_count_contract_parity_and_header_modes() {
         let raw_fixture = build_test_app(false);

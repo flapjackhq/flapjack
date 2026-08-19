@@ -111,6 +111,7 @@ require_tools() {
   [ -x "$WAIT_HELPER" ] || die "missing readiness helper: $WAIT_HELPER"
 }
 
+# TODO: Document build_or_resolve_binary.
 build_or_resolve_binary() {
   if [ -n "${FLAPJACK_BIN:-}" ]; then
     [ -x "$FLAPJACK_BIN" ] || die "FLAPJACK_BIN=$FLAPJACK_BIN is not executable"
@@ -133,6 +134,7 @@ build_or_resolve_binary() {
   [ -x "$BIN" ] || die "expected binary at $BIN"
 }
 
+# TODO: Document start_server.
 start_server() {
   TMP_DATA="$(mktemp -d)"
   mkdir -p "$TMP_DATA/http"
@@ -251,6 +253,7 @@ assert_full_result_envelope() {
     "${http_dir}/page_2.json" "(.hits | length) == ${FULL_PAGE_2_LEN}"
 }
 
+# TODO: Document assert_simple_case.
 assert_simple_case() {
   local http_dir="${TMP_DATA}/http/simple"
   assert_full_result_envelope simple
@@ -329,6 +332,7 @@ append_http_evidence_to_transcript() {
   done
 }
 
+# TODO: Document main.
 main() {
   if [ "${1:-}" = '--help' ] || [ "${1:-}" = '-h' ]; then
     usage

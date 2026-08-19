@@ -1,3 +1,4 @@
+//! Stub summary for response.rs.
 use axum::Json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -103,7 +104,16 @@ fn expand_query_words_with_synonyms(
 /// Constructs a `Highlighter` with custom pre/post tags and snippet ellipsis text
 /// from request params or index settings.
 fn build_highlighter(req: &SearchRequest, params: &PreparedSearchParams) -> Highlighter {
-    let base = match (&req.highlight_pre_tag, &req.highlight_post_tag) {
+    let saved_settings = params.loaded_settings.as_deref();
+    let pre_tag = req
+        .highlight_pre_tag
+        .as_ref()
+        .or_else(|| saved_settings.and_then(|settings| settings.highlight_pre_tag.as_ref()));
+    let post_tag = req
+        .highlight_post_tag
+        .as_ref()
+        .or_else(|| saved_settings.and_then(|settings| settings.highlight_post_tag.as_ref()));
+    let base = match (pre_tag, post_tag) {
         (Some(pre), Some(post)) => Highlighter::new(pre.clone(), post.clone()),
         _ => Highlighter::default(),
     };
@@ -573,14 +583,26 @@ fn build_highlight_result(
     restrict_arrays: bool,
     can_see_unretrievable_attributes: bool,
 ) {
-    let skip = matches!(&req.attributes_to_highlight, Some(attrs) if attrs.is_empty());
-    if skip {
+    let attributes_to_highlight = req.attributes_to_highlight.as_ref().or_else(|| {
+        params
+            .loaded_settings
+            .as_ref()
+            .and_then(|settings| settings.attributes_to_highlight.as_ref())
+    });
+    if matches!(attributes_to_highlight, Some(attributes) if attributes.is_empty()) {
         return;
     }
 
     let mut highlight_map = ctx
         .highlighter
         .highlight_document(&scored_doc.document, ctx.query_words);
+    if let Some(attributes) = attributes_to_highlight {
+        highlight_map.retain(|attribute, _| {
+            attributes
+                .iter()
+                .any(|selected| selected == "*" || selected == attribute)
+        });
+    }
 
     let replace_synonyms = req
         .replace_synonyms_in_highlight
@@ -630,7 +652,13 @@ fn build_snippet_result(
     restrict_arrays: bool,
     can_see_unretrievable_attributes: bool,
 ) {
-    let snippet_attrs = match req.attributes_to_snippet.as_ref() {
+    let effective_snippet_attributes = req.attributes_to_snippet.as_ref().or_else(|| {
+        params
+            .loaded_settings
+            .as_ref()
+            .and_then(|settings| settings.attributes_to_snippet.as_ref())
+    });
+    let snippet_attrs = match effective_snippet_attributes {
         Some(attrs) if !attrs.is_empty() => attrs,
         _ => return,
     };
@@ -701,6 +729,7 @@ mod tests {
     use super::build_response_params_string;
     use crate::dto::SearchRequest;
     use serde_json::json;
+    /// TODO: Document response_params_string_includes_encoded_core_fields.
     #[test]
     fn response_params_string_includes_encoded_core_fields() {
         let req = SearchRequest {

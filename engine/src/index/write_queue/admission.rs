@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/write_queue/admission.rs.
 use crate::error::{FlapjackError, Result};
 use crate::index::manager::publication::PublicationEpoch;
 use crate::index::version_store::VersionStore;
@@ -399,6 +400,7 @@ impl WriteAdmissionStore {
         Ok(())
     }
 
+    /// TODO: Document WriteAdmissionStore.load_records.
     pub(crate) fn load_records(&self) -> Result<Vec<WriteAdmissionRecord>> {
         let _guard = self.lock_lifecycle()?;
         self.load_records_unlocked()
@@ -437,6 +439,7 @@ impl WriteAdmissionStore {
         self.remove_tasks([task_id])
     }
 
+    /// TODO: Document WriteAdmissionStore.remove_tasks.
     pub(crate) fn remove_tasks<'a>(
         &self,
         task_ids: impl IntoIterator<Item = &'a str>,
@@ -734,6 +737,7 @@ fn serialize_record_envelope(record: &WriteAdmissionRecord) -> Result<Vec<u8>> {
     })
 }
 
+/// TODO: Document read_record.
 fn read_record(path: &Path) -> Result<WriteAdmissionRecord> {
     let bytes = fs::read(path)?;
     let envelope: WriteAdmissionEnvelope = serde_json::from_slice(&bytes).map_err(|error| {

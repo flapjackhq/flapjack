@@ -1,3 +1,5 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/source_snapshot.rs.
+
 use super::algolia_client::{AlgoliaClientError, AlgoliaErrorKind};
 use super::source_identity_partitions::{
     SourceIdentityConfig, SourceIdentityError, SourceIdentityPartitions, SourceIdentityVersion,
@@ -255,6 +257,7 @@ impl SourceItemPosition {
 }
 
 impl SourceResourceAccumulator {
+    /// TODO: Document SourceResourceAccumulator.record_items.
     fn record_items(
         &mut self,
         resource: SourceSnapshotResource,

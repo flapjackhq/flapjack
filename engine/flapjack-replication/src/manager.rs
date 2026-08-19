@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-replication/src/manager.rs.
 use super::autoheal::{
     AutohealActionRecord, AutohealCycle, AutohealJournal, AutohealJournalEvent, EvictionDecision,
     ProbeOutcome, DEFAULT_AUTOHEAL_SUSTAINED_FAILURE_THRESHOLD,
@@ -537,6 +538,7 @@ impl ReplicationManager {
         true
     }
 
+    /// TODO: Document ReplicationManager.replicate_to_peer_with_retry.
     async fn replicate_to_peer_with_retry(
         peer: &Arc<PeerClient>,
         tenant_id: &str,
@@ -563,6 +565,7 @@ impl ReplicationManager {
         result.map(|resp| resp.acked_seq)
     }
 
+    /// TODO: Document ReplicationManager.replicate_to_single_peer.
     async fn replicate_to_single_peer(
         &self,
         peer: Arc<PeerClient>,
@@ -700,6 +703,7 @@ impl ReplicationManager {
             .await
     }
 
+    /// TODO: Document ReplicationManager.validate_catch_up_response.
     fn validate_catch_up_response(
         peer_id: &str,
         requested_tenant_id: &str,

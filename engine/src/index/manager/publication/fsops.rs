@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/manager/publication/fsops.rs.
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -125,6 +126,7 @@ impl PublicationFs for StdPublicationFs {
     }
 }
 
+/// TODO: Document rename_with_transient_retry_using.
 pub(crate) fn rename_with_transient_retry_using(
     fs: &mut impl PublicationFs,
     from: &Path,
@@ -235,6 +237,7 @@ mod tests {
         }
     }
 
+    /// TODO: Document transient_rename_errors_are_retried_until_success.
     #[test]
     fn transient_rename_errors_are_retried_until_success() {
         let tmp = TempDir::new().unwrap();
@@ -258,6 +261,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document persistent_or_non_transient_rename_errors_are_returned.
     #[test]
     fn persistent_or_non_transient_rename_errors_are_returned() {
         let tmp = TempDir::new().unwrap();
@@ -285,6 +289,7 @@ mod tests {
         assert_eq!(non_transient.calls.len(), 1);
     }
 
+    /// TODO: Document managed_rename_rejects_symlinked_source_or_destination_endpoints.
     #[cfg(unix)]
     #[test]
     fn managed_rename_rejects_symlinked_source_or_destination_endpoints() {
@@ -329,6 +334,7 @@ mod tests {
         assert!(fs.calls.is_empty());
     }
 
+    /// TODO: Document durability_helpers_sync_the_precise_file_and_parent_directories.
     #[test]
     fn durability_helpers_sync_the_precise_file_and_parent_directories() {
         let tmp = TempDir::new().unwrap();

@@ -1,3 +1,4 @@
+//! Stub summary for config_tests.rs.
 use super::*;
 use serial_test::serial;
 

@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/internal_tests.rs.
 use super::*;
 use flapjack::index::oplog::OpLogEntry;
 use flapjack::index::version_store::{VersionRecord, VersionStore};
@@ -68,6 +69,7 @@ fn make_index_op(
     }
 }
 
+/// TODO: Document apply_single_index_op.
 async fn apply_single_index_op(
     manager: &IndexManager,
     seq: u64,
@@ -105,6 +107,7 @@ fn make_replication_batch_payload(
     serde_json::Value::Object(payload)
 }
 
+/// TODO: Document rotate_admin_key_error_response_hides_storage_details.
 #[tokio::test]
 async fn rotate_admin_key_error_response_hides_storage_details() {
     let response = rotate_admin_key_error_response(&"keys.json: permission denied");
@@ -141,6 +144,7 @@ struct BatchWrapperFlowSpec<'a> {
     restored_entry: serde_json::Value,
 }
 
+/// TODO: Document assert_batch_wrapper_flow.
 async fn assert_batch_wrapper_flow<AfterReplace, AfterDelete, AfterRestore>(
     spec: BatchWrapperFlowSpec<'_>,
     assert_after_replace: AfterReplace,
@@ -1486,6 +1490,7 @@ async fn get_ops_missing_tenant_returns_standard_404_json() {
     assert_eq!(json["message"], "Tenant not found");
 }
 
+/// TODO: Document list_tenants_excludes_publication_roots.
 #[tokio::test]
 async fn list_tenants_excludes_publication_roots() {
     let tmp = TempDir::new().unwrap();
@@ -1510,6 +1515,7 @@ async fn list_tenants_excludes_publication_roots() {
     assert_eq!(body["tenants"], serde_json::json!(["products"]));
 }
 
+/// TODO: Document get_ops_does_not_open_publication_roots_as_moved_source_candidates.
 #[tokio::test]
 async fn get_ops_does_not_open_publication_roots_as_moved_source_candidates() {
     let tmp = TempDir::new().unwrap();
@@ -1543,6 +1549,7 @@ async fn get_ops_does_not_open_publication_roots_as_moved_source_candidates() {
     assert_eq!(body["status"], 404);
 }
 
+/// TODO: Document get_ops_moved_source_fallback_scans_valid_destinations.
 #[tokio::test]
 async fn get_ops_moved_source_fallback_scans_valid_destinations() {
     let tmp = TempDir::new().unwrap();
@@ -2544,6 +2551,7 @@ async fn test_full_pause_write_resume_cycle() {
         "step 6: write after resume should NOT return 503"
     );
 }
+/// TODO: Document contains_document_replication_ops_detects_upsert_and_delete.
 #[test]
 fn contains_document_replication_ops_detects_upsert_and_delete() {
     let upsert = make_upsert_op(1, 1000, "node-a", "tenant", "doc1", "alpha");
@@ -3059,6 +3067,7 @@ async fn cluster_status_autoheal_keeps_evicted_candidates_out_of_active_membersh
     assert_eq!(evicted["action"]["outcome"], "success");
 }
 
+/// TODO: Document test_replication_manager_with_two_peers.
 fn test_replication_manager_with_two_peers() -> (
     TempDir,
     std::sync::Arc<flapjack_replication::manager::ReplicationManager>,
@@ -3352,6 +3361,7 @@ async fn cluster_status_body(app: &Router) -> serde_json::Value {
     crate::test_helpers::body_json(resp).await
 }
 
+/// TODO: Document remove_cluster_peer_known_peer_returns_200_and_removes_membership.
 #[tokio::test]
 async fn remove_cluster_peer_known_peer_returns_200_and_removes_membership() {
     let tmp = TempDir::new().unwrap();
@@ -3386,6 +3396,7 @@ async fn remove_cluster_peer_known_peer_returns_200_and_removes_membership() {
     assert_eq!(peers[0]["peer_id"], "test-node-c");
 }
 
+/// TODO: Document remove_cluster_peer_unknown_peer_returns_404_without_mutation.
 #[tokio::test]
 async fn remove_cluster_peer_unknown_peer_returns_404_without_mutation() {
     let tmp = TempDir::new().unwrap();

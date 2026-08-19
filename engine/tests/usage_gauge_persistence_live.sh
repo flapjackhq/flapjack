@@ -57,6 +57,7 @@ stop_server() {
   SERVER_PID=""
 }
 
+# TODO: Document cleanup.
 cleanup() {
   local script_exit_code=$?
   stop_server
@@ -118,6 +119,7 @@ build_server() {
   [ -x "$BIN" ] || die "expected current-checkout binary at $BIN"
 }
 
+# TODO: Document start_server.
 start_server() {
   local server_log="$1"
   FLAPJACK_ADMIN_KEY="$ADMIN_KEY" \
@@ -138,6 +140,7 @@ start_server() {
   BASE="http://127.0.0.1:${PORT}"
 }
 
+# TODO: Document http_json.
 http_json() {
   local out_file="$1" method="$2" path="$3" body="${4:-}"
   local curl_args=(
@@ -197,6 +200,7 @@ write_usage_fixture() {
   fi
 }
 
+# TODO: Document assert_usage_responses.
 assert_usage_responses() {
   local before_ms after_ms
   before_ms="$(jq -nr 'now * 1000 | floor')"
@@ -229,6 +233,7 @@ assert_usage_responses() {
     '.documents_count == []'
 }
 
+# TODO: Document main.
 main() {
   local now_seconds
   require_tools

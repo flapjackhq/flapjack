@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/spool.rs.
 // Stage 2 builds this migration-local persistence owner before later stages wire callers.
 use chrono::{DateTime, Duration, Utc};
 use flapjack::index::manager::publication::{
@@ -542,6 +543,7 @@ impl ResourceCompletions {
     }
 }
 
+/// TODO: Document SpoolManifest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SpoolManifest {
     job_uuid: Uuid,
@@ -630,6 +632,7 @@ pub(crate) struct AcceptedSpoolPageIter<'a> {
     finished: bool,
 }
 
+/// TODO: Document SpoolErrorKind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpoolErrorKind {
     Io,
@@ -797,6 +800,7 @@ impl SpoolStore {
         Self::open(data_root, limits, Some(now), Some(free_bytes))
     }
 
+    /// TODO: Document SpoolStore.open.
     fn open(
         data_root: &Path,
         limits: SpoolLimits,
@@ -818,6 +822,7 @@ impl SpoolStore {
         self.fixed_now.unwrap_or_else(Utc::now)
     }
 
+    /// TODO: Document SpoolStore.create_migration_phase.
     pub(crate) fn create_migration_phase(
         &self,
         job_uuid: Uuid,
@@ -833,6 +838,7 @@ impl SpoolStore {
         Ok(record)
     }
 
+    /// TODO: Document SpoolStore.create_async_migration_admission.
     #[cfg(test)]
     pub(crate) fn create_async_migration_admission(
         &self,
@@ -848,6 +854,7 @@ impl SpoolStore {
         )
     }
 
+    /// TODO: Document SpoolStore.create_async_migration_admission_for_owner.
     #[cfg(test)]
     pub(crate) fn create_async_migration_admission_for_owner(
         &self,
@@ -967,6 +974,7 @@ impl SpoolStore {
         })
     }
 
+    /// TODO: Document SpoolStore.create_async_metadata_only_admission_for_test.
     #[cfg(test)]
     pub(crate) fn create_async_metadata_only_admission_for_test(
         &self,
@@ -1009,6 +1017,7 @@ impl SpoolStore {
         }
     }
 
+    /// TODO: Document SpoolStore.recover_async_admissions.
     pub(crate) fn recover_async_admissions(&self) -> SpoolResult<Vec<Uuid>> {
         let _root_lock = self.lock_root()?;
         let mut cleaned = Vec::new();
@@ -1046,6 +1055,7 @@ impl SpoolStore {
         }
     }
 
+    /// TODO: Document SpoolStore.read_migration_phase.
     pub(crate) fn read_migration_phase(&self, job_uuid: Uuid) -> SpoolResult<MigrationPhaseRecord> {
         let bytes = match fs::read(self.migration_phase_path(job_uuid)) {
             Ok(bytes) => bytes,
@@ -1070,6 +1080,7 @@ impl SpoolStore {
         Ok(record)
     }
 
+    /// TODO: Document SpoolStore.read_async_migration_metadata.
     pub(crate) fn read_async_migration_metadata(
         &self,
         job_uuid: Uuid,
@@ -1188,6 +1199,7 @@ impl SpoolStore {
         self.commit_async_migration_metadata(&metadata)
     }
 
+    /// TODO: Document SpoolStore.transition_migration_phase.
     pub(crate) fn transition_migration_phase(
         &self,
         job_uuid: Uuid,
@@ -1208,6 +1220,7 @@ impl SpoolStore {
         Ok(record)
     }
 
+    /// TODO: Document SpoolStore.request_migration_cancel.
     #[cfg(test)]
     pub(crate) fn request_migration_cancel(
         &self,
@@ -1228,6 +1241,7 @@ impl SpoolStore {
         Ok(record)
     }
 
+    /// TODO: Document SpoolStore.request_async_migration_cancel.
     pub(crate) fn request_async_migration_cancel(
         &self,
         job_uuid: Uuid,
@@ -1253,6 +1267,7 @@ impl SpoolStore {
         Ok(MigrationCancelRequest::Requested(record))
     }
 
+    /// TODO: Document SpoolStore.async_publication_is_too_late_to_cancel.
     fn async_publication_is_too_late_to_cancel(
         &self,
         job_uuid: Uuid,
@@ -1318,6 +1333,7 @@ impl SpoolStore {
         self.settle_migration(job_uuid, MigrationDisposition::Cancelled, None)
     }
 
+    /// TODO: Document SpoolStore.settle_migration.
     fn settle_migration(
         &self,
         job_uuid: Uuid,
@@ -1568,6 +1584,7 @@ impl SpoolStore {
         self.commit_artifact_payload(job_uuid, kind, bytes, bytes.len() as u64, item_count)
     }
 
+    /// TODO: Document SpoolStore.commit_artifact_payload.
     fn commit_artifact_payload(
         &self,
         job_uuid: Uuid,
@@ -1621,6 +1638,7 @@ impl SpoolStore {
         }
     }
 
+    /// TODO: Document SpoolStore.mark_completed_object_ids.
     #[cfg(test)]
     pub(crate) fn mark_completed_object_ids(
         &self,
@@ -1677,6 +1695,7 @@ impl SpoolStore {
         self.completed_object_ids_from_manifest(job_uuid, &manifest)
     }
 
+    /// TODO: Document SpoolStore.completed_object_ids_from_manifest.
     #[cfg(test)]
     fn completed_object_ids_from_manifest(
         &self,
@@ -1686,6 +1705,7 @@ impl SpoolStore {
         self.completed_resource_ids_from_manifest(job_uuid, manifest, ObjectResource::Documents)
     }
 
+    /// TODO: Document SpoolStore.delete_export_artifacts.
     pub(crate) fn delete_export_artifacts(
         &self,
         job_uuid: Uuid,
@@ -1727,6 +1747,7 @@ impl SpoolStore {
         Ok(true)
     }
 
+    /// TODO: Document SpoolStore.delete_manifest_artifacts.
     fn delete_manifest_artifacts(&self, manifest: &mut SpoolManifest) -> SpoolResult<()> {
         manifest.lifecycle = LifecycleState::Deleting;
         manifest.deleted_at = Some(self.now());
@@ -1825,6 +1846,7 @@ impl SpoolStore {
             .ok_or_else(|| SpoolError::new(SpoolErrorKind::ManifestCorrupt))
     }
 
+    /// TODO: Document SpoolStore.recover.
     pub(crate) fn recover(&self) -> SpoolResult<()> {
         let _root_lock = self.lock_root()?;
         for job_uuid in self.job_uuids()? {
@@ -1946,6 +1968,7 @@ impl SpoolStore {
         self.build_accepted_reader(job_uuid, &manifest)
     }
 
+    /// TODO: Document SpoolStore.pre_register_artifact_for_test.
     #[cfg(test)]
     pub(crate) fn pre_register_artifact_for_test(
         &self,

@@ -1,3 +1,4 @@
+//! Stub summary for metrics.rs.
 use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -120,6 +121,7 @@ fn register_live_index_state_gauges(registry: &Registry, state: &AppState) {
     register_oplog_sequence_gauge(registry, state);
 }
 
+/// TODO: Document register_analytics_gauges.
 fn register_analytics_gauges(registry: &Registry) {
     let snapshot = flapjack::analytics::get_global_collector()
         .map(|collector| collector.analytics_metrics_snapshot())
@@ -642,6 +644,7 @@ mod tests {
         }
     }
 
+    /// TODO: Document metrics_reflects_actual_tenant_count.
     #[tokio::test]
     async fn metrics_reflects_actual_tenant_count() {
         let tmp = TempDir::new().unwrap();
@@ -665,6 +668,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document metrics_shows_storage_gauges_after_poller_update.
     #[tokio::test]
     async fn metrics_shows_storage_gauges_after_poller_update() {
         let tmp = TempDir::new().unwrap();
@@ -699,6 +703,7 @@ mod tests {
         assert_eq!(value, 1234.0, "storage bytes should come from MetricsState");
     }
 
+    /// TODO: Document metrics_includes_per_index_usage_counters.
     #[tokio::test]
     async fn metrics_includes_per_index_usage_counters() {
         let tmp = TempDir::new().unwrap();
@@ -766,6 +771,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document metrics_counter_values_match_known_operations.
     #[tokio::test]
     async fn metrics_counter_values_match_known_operations() {
         let tmp = TempDir::new().unwrap();
@@ -822,6 +828,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document metrics_includes_documents_count_gauge.
     #[tokio::test]
     async fn metrics_includes_documents_count_gauge() {
         let tmp = TempDir::new().unwrap();
@@ -869,6 +876,7 @@ mod tests {
         assert_eq!(value, 2.0, "should have 2 docs in the gauge");
     }
 
+    /// TODO: Document metrics_includes_oplog_current_seq_gauge.
     #[tokio::test]
     async fn metrics_includes_oplog_current_seq_gauge() {
         let tmp = TempDir::new().unwrap();
@@ -911,6 +919,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document public_billing_usage_gauges_aggregate_without_index_labels.
     #[test]
     fn public_billing_usage_gauges_aggregate_without_index_labels() {
         let registry = Registry::new();
@@ -943,6 +952,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document public_live_index_gauges_aggregate_without_tenant_labels.
     #[tokio::test]
     async fn public_live_index_gauges_aggregate_without_tenant_labels() {
         let tmp = TempDir::new().unwrap();
@@ -998,6 +1008,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document register_public_billing_usage_metric_families.
     fn register_public_billing_usage_metric_families(
         usage_counters: &dashmap::DashMap<String, crate::usage_middleware::TenantUsageCounters>,
     ) -> Vec<prometheus::Gauge> {

@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+//! Stub summary for engine/flapjack-server/tests/support/mod.rs.
 use assert_cmd::Command;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -144,6 +145,7 @@ mod tests {
         assert_eq!(outcome, TaskPollOutcome::Pending);
     }
 
+    /// TODO: Document classify_task_poll_response_surfaces_terminal_failures.
     #[test]
     fn classify_task_poll_response_surfaces_terminal_failures() {
         let outcome = classify_task_poll_response(
@@ -164,6 +166,7 @@ mod tests {
         }
     }
 
+    /// TODO: Document classify_task_poll_response_rejects_malformed_payloads.
     #[test]
     fn classify_task_poll_response_rejects_malformed_payloads() {
         let outcome = classify_task_poll_response(
@@ -605,6 +608,7 @@ impl RunningServer {
         (child, bind_addr)
     }
 
+    /// TODO: Document RunningServer.start_auto_port_process_with_env.
     fn start_auto_port_process_with_env(
         data_dir: &str,
         no_auth: bool,
@@ -645,6 +649,7 @@ impl RunningServer {
         add_documents_batch_at(self.bind_addr(), index_name, payload)
     }
 
+    /// TODO: Document RunningServer.wait_for_task_published.
     pub(crate) fn wait_for_task_published(
         &self,
         index_name: &str,
@@ -752,6 +757,7 @@ pub(crate) struct HttpResponse {
     pub(crate) body: String,
 }
 
+/// TODO: Document spawn_flapjack_auto_port_process.
 pub(crate) fn spawn_flapjack_auto_port_process(
     data_dir: &str,
     no_auth: bool,
@@ -784,6 +790,7 @@ pub(crate) fn add_documents_batch_at(bind_addr: &str, index_name: &str, payload:
     extract_task_id_from_body(&response.body)
 }
 
+/// TODO: Document wait_for_task_published_at.
 pub(crate) fn wait_for_task_published_at(
     bind_addr: &str,
     index_name: &str,
@@ -837,6 +844,7 @@ pub(crate) fn wait_for_task_published_at(
     }
 }
 
+/// TODO: Document spawn_flapjack_process.
 fn spawn_flapjack_process(
     data_dir: &str,
     no_auth: bool,
@@ -847,6 +855,7 @@ fn spawn_flapjack_process(
     spawn_flapjack_process_with_env(data_dir, no_auth, bind_addr, &[], stdout, stderr)
 }
 
+/// TODO: Document spawn_flapjack_process_with_env.
 fn spawn_flapjack_process_with_env(
     data_dir: &str,
     no_auth: bool,
@@ -909,6 +918,7 @@ fn kill_and_wait_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// TODO: Document wait_for_startup_bind_addr.
 fn wait_for_startup_bind_addr(child: &mut Child, timeout: Duration) -> String {
     let stdout = child
         .stdout
@@ -963,6 +973,7 @@ fn wait_for_startup_bind_addr(child: &mut Child, timeout: Duration) -> String {
     }
 }
 
+/// TODO: Document spawn_pipe_reader.
 fn spawn_pipe_reader<R: Read + Send + 'static>(reader: R, tx: mpsc::Sender<String>) {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
@@ -996,6 +1007,7 @@ fn extract_bind_addr_from_banner_line(line: &str) -> Option<String> {
     }
 }
 
+/// TODO: Document wait_for_health.
 fn wait_for_health(bind_addr: &str, timeout: Duration) {
     let start = Instant::now();
     let deadline = start + timeout;
@@ -1039,6 +1051,7 @@ pub(crate) fn http_request_with_read_timeout(
     http_request_with_headers_and_read_timeout(bind_addr, method, path, headers, body, read_timeout)
 }
 
+/// TODO: Document open_http_request_with_read_timeout.
 pub(crate) fn open_http_request_with_read_timeout(
     bind_addr: &str,
     method: &str,
@@ -1092,6 +1105,7 @@ fn extract_task_id_from_body(body: &Value) -> i64 {
         .unwrap_or_else(|| panic!("batch response must include numeric taskID: {body}"))
 }
 
+/// TODO: Document classify_task_poll_response.
 fn classify_task_poll_response(task_id: i64, body: &Value) -> TaskPollOutcome {
     let status = body["status"].as_str();
     let pending_task = body["pendingTask"].as_bool();
@@ -1226,6 +1240,7 @@ impl HttpRequestBudget {
     fn record_transient_read_retry(&self) {}
 }
 
+/// TODO: Document http_request_with_headers.
 pub(crate) fn http_request_with_headers(
     bind_addr: &str,
     method: &str,
@@ -1262,6 +1277,7 @@ fn http_request_before_deadline(
     )
 }
 
+/// TODO: Document http_request_with_headers_and_read_timeout.
 fn http_request_with_headers_and_read_timeout(
     bind_addr: &str,
     method: &str,
@@ -1370,6 +1386,7 @@ impl HttpResponseReader for TcpStream {
     }
 }
 
+/// TODO: Document write_http_request.
 fn write_http_request(
     stream: &mut TcpStream,
     bind_addr: &str,
@@ -1444,6 +1461,7 @@ pub(crate) fn admin_entry_exists_in_json(json_str: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// TODO: Document strip_ansi.
 fn strip_ansi(text: &str) -> String {
     let mut result = String::new();
     let mut chars = text.chars().peekable();

@@ -7,6 +7,9 @@ interface SearchRequestDetails {
   hasFacets: boolean;
 }
 
+/**
+ * TODO: Document readSearchRequestDetails.
+ */
 function readSearchRequestDetails(requestBody: string): SearchRequestDetails {
   try {
     const parsedBody = JSON.parse(requestBody) as Record<string, unknown>;
@@ -31,6 +34,9 @@ interface ResponseMatchOptions {
   requireFacets?: boolean;
 }
 
+/**
+ * TODO: Document responseMatchesIndexQuery.
+ */
 export function responseMatchesIndexQuery(
   response: Response,
   indexName: string,
@@ -70,6 +76,9 @@ export function responseMatchesIndexQuery(
   return true;
 }
 
+/**
+ * TODO: Document extractObjectIdFromText.
+ */
 export function extractObjectIdFromText(cardText: string): string {
   const normalizedCardText = cardText.replace(/\s+/g, ' ');
   const objectIdLabelMatch = normalizedCardText.match(

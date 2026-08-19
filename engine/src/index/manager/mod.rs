@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/manager/mod.rs.
 use crate::error::{FlapjackError, Result};
 use crate::index::oplog::{write_committed_seq, OpLog};
 use crate::index::relevance::RelevanceConfig;
@@ -486,15 +487,27 @@ impl IndexManager {
         self.loaded.len()
     }
 
-    /// Return the total disk usage in bytes for a single tenant's data directory.
+    /// Return the total disk usage in bytes for a single tenant's index and analytics data.
     ///
-    /// Returns 0 if the tenant directory does not exist.
+    /// Returns 0 if neither tenant directory exists.
     pub fn tenant_storage_bytes(&self, tenant_id: &str) -> u64 {
         if validate_index_name(tenant_id).is_err() {
             return 0;
         }
-        let path = self.base_path.join(tenant_id);
-        crate::index::storage_size::dir_size_bytes(&path).unwrap_or(0)
+        let index_path = self.base_path.join(tenant_id);
+        let analytics_path = self
+            .publication_analytics_config()
+            .target_artifact_paths(tenant_id)
+            .index_root;
+        let index_bytes = crate::index::storage_size::dir_size_bytes(&index_path).unwrap_or(0);
+
+        if crate::index::storage_size::directory_paths_overlap(&index_path, &analytics_path) {
+            return index_bytes;
+        }
+
+        let analytics_bytes =
+            crate::index::storage_size::dir_size_bytes(&analytics_path).unwrap_or(0);
+        index_bytes.saturating_add(analytics_bytes)
     }
 
     /// Remove writer-local control artifacts that must not enter publication manifests.
@@ -599,6 +612,7 @@ impl IndexManager {
         }
     }
 
+    /// TODO: Document IndexManager.get_or_create_oplog_result.
     pub(crate) fn get_or_create_oplog_result(&self, tenant_id: &str) -> Result<Arc<OpLog>> {
         if let Err(error) = validate_index_name(tenant_id) {
             tracing::warn!("[OPLOG {}] invalid tenant id: {}", tenant_id, error);

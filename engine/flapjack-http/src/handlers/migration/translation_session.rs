@@ -1,3 +1,5 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/translation_session.rs.
+
 use super::translation_bundle::{
     translate_and_apply_primary_replicas, translate_document, translate_serde_value,
     translate_settings_for_provider, ReplicaSettingsTranslation, SettingsSourceProvider,
@@ -154,6 +156,7 @@ pub(in crate::handlers::migration) fn translate_spool_report(
     })
 }
 
+/// TODO: Document translate_accepted_spool_payload.
 pub(in crate::handlers::migration) fn translate_accepted_spool_payload<E>(
     reader: AcceptedSpoolReader,
     source_index_name: String,
@@ -203,6 +206,7 @@ pub(in crate::handlers::migration) fn translate_accepted_spool_settings(
     )))
 }
 
+/// TODO: Document translate_spool_input.
 pub(in crate::handlers::migration) fn translate_spool_input<E>(
     input: SpoolTranslationInput,
     instrumentation: &mut TranslationSessionInstrumentation,
@@ -257,6 +261,7 @@ struct TranslationSessionOptions {
     document_batch_size: usize,
 }
 
+/// TODO: Document translate_initial_settings.
 fn translate_initial_settings(
     settings: Value,
     source_provider: AsyncMigrationSourceProvider,
@@ -281,6 +286,7 @@ fn translate_initial_settings(
     }
 }
 
+/// TODO: Document translate_pages.
 fn translate_pages<DocumentPages, RulePages, SynonymPages, E>(
     settings_input: TranslationSettingsInput,
     page_streams: TranslationPageStreams<DocumentPages, RulePages, SynonymPages>,
@@ -369,6 +375,7 @@ fn pages_from_values(
         )
 }
 
+/// TODO: Document TranslationSession.
 struct TranslationSession<'a, F, E>
 where
     F: FnMut(Vec<Document>) -> Result<(), E>,
@@ -393,6 +400,7 @@ impl<'a, F, E> TranslationSession<'a, F, E>
 where
     F: FnMut(Vec<Document>) -> Result<(), E>,
 {
+    /// TODO: Document TranslationSession.new.
     fn new(
         settings_input: TranslationSettingsInput,
         options: TranslationSessionOptions,
@@ -472,6 +480,7 @@ where
         Ok(())
     }
 
+    /// TODO: Document TranslationSession.consume_document_page.
     fn consume_document_page(&mut self, page: AcceptedSpoolPage) -> TranslationStreamResult<(), E> {
         self.instrumentation.enter_document_page();
         if let Err(error) = self
@@ -500,6 +509,7 @@ where
         Ok(())
     }
 
+    /// TODO: Document TranslationSession.consume_rule_pages.
     fn consume_rule_pages(
         &mut self,
         pages: impl IntoIterator<Item = SpoolResult<AcceptedSpoolPage>>,
@@ -530,6 +540,7 @@ where
         Ok(())
     }
 
+    /// TODO: Document TranslationSession.consume_synonym_pages.
     fn consume_synonym_pages(
         &mut self,
         pages: impl IntoIterator<Item = SpoolResult<AcceptedSpoolPage>>,
@@ -576,6 +587,7 @@ where
         }
     }
 
+    /// TODO: Document TranslationSession.translate_serde_page.
     fn translate_serde_page<T: DeserializeOwned>(
         &mut self,
         page_index: usize,
@@ -616,6 +628,7 @@ where
         Ok(())
     }
 
+    /// TODO: Document TranslationSession.finish.
     fn finish(mut self) -> TranslationStreamResult<TranslationOutcome, E> {
         self.flush_documents()?;
         let snapshot_builder = self

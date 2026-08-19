@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/build.rs.
 use std::path::Path;
 
 #[path = "src/dashboard_build.rs"]
@@ -6,6 +7,7 @@ mod dashboard_build;
 const DASHBOARD_DIST_DIR: &str = "../dashboard/dist";
 const DASHBOARD_ASSETS_DIR: &str = "../dashboard/dist/assets";
 
+/// TODO: Document main.
 fn main() {
     // Keep cfg validation explicit so unknown cfgs fail fast.
     println!("cargo:rustc-check-cfg=cfg(flapjack_dashboard_dist)");

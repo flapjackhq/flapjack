@@ -288,6 +288,59 @@ jobs:
           path: ${{ runner.temp }}/integration-smoke.log
           retention-days: 7
 
+  console:
+    name: Svelte console conformance
+    needs: [check-repo, build-server]
+    if: needs.check-repo.outputs.is-public-repo == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Download server binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: flapjack-server
+          path: /tmp/flapjack
+      - name: Start Flapjack server
+        run: |
+          chmod +x /tmp/flapjack/flapjack
+          mkdir -p /tmp/flapjack-console-data
+          SERVER_LOG=/tmp/flapjack-console-data/server.log
+          FLAPJACK_ADMIN_KEY=fj_devtestadminkey000000 \
+            /tmp/flapjack/flapjack --data-dir /tmp/flapjack-console-data >"$SERVER_LOG" 2>&1 &
+          SERVER_PID=$!
+          bash engine/tests/common/wait_for_flapjack.sh --pid "$SERVER_PID" --host localhost --port 7700 --log-path "$SERVER_LOG"
+          echo "FJ_CONSOLE_TEST_INSTANCE_TOKEN=$(openssl rand -hex 24)" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: engine/console/package-lock.json
+      - name: Install console dependencies
+        working-directory: engine/console
+        run: npm ci
+      - name: Install console Playwright browser
+        working-directory: engine/console
+        timeout-minutes: 5
+        run: npx playwright install chromium
+      - name: Run exact console checks
+        working-directory: engine/console
+        run: |
+          npm run test:unit:run
+          npm run check
+          npm run build
+          npm run lint:browser-tests:unmocked
+          npm run test:browser:unmocked
+      - name: Upload console browser failures
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: console-browser-failures
+          path: |
+            engine/console/test-results/
+            engine/console/playwright-report/
+          retention-days: 7
+
   # ============================================================================
   # DASHBOARD TESTS
   # ============================================================================
@@ -380,9 +433,10 @@ jobs:
       - name: Install dependencies
         working-directory: engine/dashboard
         run: npm install
-      - name: Install Playwright browsers
+      - name: Install dashboard page Playwright browser
         working-directory: engine/dashboard
-        run: npx playwright install --with-deps chromium
+        timeout-minutes: 5
+        run: npx playwright install chromium
       - name: Run page tests
         working-directory: engine/dashboard
         run: npm run test:e2e-ui:smoke
@@ -435,9 +489,10 @@ jobs:
       - name: Install dependencies
         working-directory: engine/dashboard
         run: npm install
-      - name: Install Playwright browsers
+      - name: Install dashboard full Playwright browser
         working-directory: engine/dashboard
-        run: npx playwright install --with-deps chromium
+        timeout-minutes: 5
+        run: npx playwright install chromium
       - name: Run full e2e tests
         working-directory: engine/dashboard
         run: npm run test:e2e-ui:full
@@ -493,9 +548,10 @@ jobs:
       - name: Install dependencies
         working-directory: engine/dashboard
         run: npm install
-      - name: Install Playwright browsers
+      - name: Install dashboard integration Playwright browser
         working-directory: engine/dashboard
-        run: npx playwright install --with-deps chromium
+        timeout-minutes: 5
+        run: npx playwright install chromium
       - name: Run integration tests
         working-directory: engine/dashboard
         run: npm run test:integration
@@ -651,12 +707,15 @@ jobs:
         run: npm run test:contract
         env:
           FLAPJACK_URL: http://localhost:7700
+      - name: Install SDK Playwright browser
+        working-directory: engine/sdk_test
+        timeout-minutes: 5
+        run: npx playwright install chromium
       - name: SDK real-client conformance
         working-directory: engine/sdk_test
         run: |
           npm run test:real_clients:wiring
           npm run lint:real_clients
-          npx playwright install --with-deps chromium
           npm run test:real_clients
         env:
           FLAPJACK_URL: http://localhost:7700

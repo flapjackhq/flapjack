@@ -1,3 +1,4 @@
+//! Stub summary for engine/build.rs.
 #[path = "src/build_info.rs"]
 mod build_info;
 
@@ -18,6 +19,7 @@ const PROFILE_INPUT_ENV: &str = "FLAPJACK_INTERNAL_BUILD_PROFILE";
 const TARGET_INPUT_ENV: &str = "FLAPJACK_INTERNAL_BUILD_TARGET";
 const BUILD_INFO_JSON_ENV: &str = "FLAPJACK_INTERNAL_BUILD_INFO_JSON";
 
+/// TODO: Document main.
 fn main() {
     let workspace_root = env::var("CARGO_MANIFEST_DIR")
         .map_err(|error| format!("CARGO_MANIFEST_DIR is unavailable: {error}"))

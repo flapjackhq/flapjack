@@ -27,6 +27,7 @@ async fn test_vector_index_missing_returns_none() {
     assert!(manager.get_vector_index("nonexistent").is_none());
 }
 
+/// TODO: Document test_vector_index_search_through_manager.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 async fn test_vector_index_search_through_manager() {
@@ -49,6 +50,7 @@ async fn test_vector_index_search_through_manager() {
 
 // ── Multi-tenant vector isolation test ──
 
+/// TODO: Document test_vector_tenant_isolation.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 async fn test_vector_tenant_isolation() {
@@ -131,6 +133,7 @@ async fn all_tenant_oplog_seqs_empty_when_no_oplogs() {
 
 // ── Vector index load-on-open tests (8.4) ──
 
+/// TODO: Document test_load_vector_index_on_get_or_load.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 async fn test_load_vector_index_on_get_or_load() {
@@ -184,6 +187,7 @@ async fn test_load_vector_index_on_get_or_load() {
     assert_eq!(results[0].doc_id, "doc1");
 }
 
+/// TODO: Document test_load_no_vectors_dir_ok.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 async fn test_load_no_vectors_dir_ok() {
@@ -207,6 +211,7 @@ async fn test_load_no_vectors_dir_ok() {
     );
 }
 
+/// TODO: Document test_load_corrupted_vector_index_logs_warning.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 async fn test_load_corrupted_vector_index_logs_warning() {
@@ -251,6 +256,7 @@ async fn test_load_corrupted_vector_index_logs_warning() {
     );
 }
 
+/// TODO: Document test_create_tenant_loads_existing_vectors.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 async fn test_create_tenant_loads_existing_vectors() {
@@ -331,6 +337,7 @@ fn setup_tenant_with_oplog_vectors(
     tenant_path
 }
 
+/// TODO: Document test_recover_vectors_from_oplog.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 async fn test_recover_vectors_from_oplog() {
@@ -378,6 +385,7 @@ async fn test_recover_vectors_from_oplog() {
     assert_eq!(results[0].doc_id, "doc1");
 }
 
+/// TODO: Document test_recover_vectors_with_deletes.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 async fn test_recover_vectors_with_deletes() {
@@ -428,6 +436,7 @@ async fn test_recover_vectors_with_deletes() {
     assert_eq!(results[0].doc_id, "doc2");
 }
 
+/// TODO: Document test_recover_no_vectors_in_old_oplog.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 async fn test_recover_no_vectors_in_old_oplog() {
@@ -455,6 +464,7 @@ async fn test_recover_no_vectors_in_old_oplog() {
     );
 }
 
+/// TODO: Document test_recover_vectors_after_clear_op.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 async fn test_recover_vectors_after_clear_op() {
@@ -513,6 +523,7 @@ async fn test_recover_vectors_after_clear_op() {
     assert_eq!(results[0].doc_id, "doc3");
 }
 
+/// TODO: Document test_recover_vectors_saved_to_disk.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 async fn test_recover_vectors_saved_to_disk() {
@@ -548,6 +559,7 @@ async fn test_recover_vectors_saved_to_disk() {
     );
 }
 
+/// TODO: Document test_recover_vectors_upsert_same_doc_twice.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 async fn test_recover_vectors_upsert_same_doc_twice() {
@@ -596,6 +608,7 @@ async fn test_recover_vectors_upsert_same_doc_twice() {
     assert_eq!(results[0].doc_id, "doc1");
 }
 
+/// TODO: Document test_load_vector_index_skips_when_already_loaded.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 async fn test_load_vector_index_skips_when_already_loaded() {
@@ -639,6 +652,7 @@ async fn test_load_vector_index_skips_when_already_loaded() {
     assert_eq!(results[0].doc_id, "mem_doc1");
 }
 
+/// TODO: Document test_full_crash_recovery_vectors_available.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 #[serial_test::serial(flapjack_outbound_url_policy)]
@@ -721,6 +735,7 @@ async fn test_full_crash_recovery_vectors_available() {
 
 // ── Fingerprint integration tests (8.18) ──
 
+/// TODO: Document test_fingerprint_match_loads_vectors.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 async fn test_fingerprint_match_loads_vectors() {
@@ -786,6 +801,7 @@ async fn test_fingerprint_match_loads_vectors() {
     );
 }
 
+/// TODO: Document test_fingerprint_mismatch_skips_vectors.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 async fn test_fingerprint_mismatch_skips_vectors() {
@@ -842,6 +858,7 @@ async fn test_fingerprint_mismatch_skips_vectors() {
     );
 }
 
+/// TODO: Document test_no_fingerprint_file_loads_vectors_anyway.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 async fn test_no_fingerprint_file_loads_vectors_anyway() {
@@ -889,6 +906,7 @@ async fn test_no_fingerprint_file_loads_vectors_anyway() {
     );
 }
 
+/// TODO: Document test_fingerprint_mismatch_template_change_skips.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 async fn test_fingerprint_mismatch_template_change_skips() {
@@ -948,6 +966,7 @@ async fn test_fingerprint_mismatch_template_change_skips() {
 
 // ── Memory accounting tests (8.21) ──
 
+/// TODO: Document test_vector_memory_usage_with_indices.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 async fn test_vector_memory_usage_with_indices() {
@@ -983,6 +1002,7 @@ async fn test_vector_memory_usage_no_indices() {
 
 // ── HTTP integration tests (8.25) ──
 
+/// TODO: Document test_vectors_survive_manager_restart.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 #[serial_test::serial(flapjack_outbound_url_policy)]
@@ -1078,6 +1098,7 @@ async fn test_vectors_survive_manager_restart() {
     }
 }
 
+/// TODO: Document test_vectors_lost_when_embedder_model_changes.
 #[cfg(feature = "vector-search")]
 #[tokio::test]
 #[serial_test::serial(flapjack_outbound_url_policy)]

@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/server_startup_tests.rs.
 use super::*;
 use crate::handlers::migration::spool::{
     AsyncMigrationPublicationSemantic, MigrationDisposition, MigrationPhase, SpoolLimits,
@@ -26,6 +27,7 @@ fn copy_tree(source: &Path, destination: &Path) {
     }
 }
 
+/// TODO: Document write_journal.
 fn write_journal(
     base: &Path,
     target_name: &str,
@@ -76,6 +78,7 @@ fn write_journal(
     paths
 }
 
+/// TODO: Document prepare_committed_cleanup.
 fn prepare_committed_cleanup(base: &Path, manager: &flapjack::IndexManager) -> PublicationPaths {
     manager.create_tenant("products").unwrap();
     manager.create_tenant("products_old_seed").unwrap();
@@ -94,6 +97,7 @@ fn prepare_committed_cleanup(base: &Path, manager: &flapjack::IndexManager) -> P
     )
 }
 
+/// TODO: Document prepare_quarantined_replacement.
 fn prepare_quarantined_replacement(
     base: &Path,
     manager: &flapjack::IndexManager,
@@ -123,6 +127,7 @@ fn prepare_quarantined_replacement(
     )
 }
 
+/// TODO: Document pre_serve_barrier_repairs_without_peers_and_preserves_report_dispositions.
 #[tokio::test]
 async fn pre_serve_barrier_repairs_without_peers_and_preserves_report_dispositions() {
     let temp = TempDir::new().unwrap();
@@ -172,6 +177,7 @@ async fn pre_serve_barrier_repairs_without_peers_and_preserves_report_dispositio
         .unwrap();
 }
 
+/// TODO: Document pre_serve_barrier_completes_publication_repair_before_catchup_future.
 #[tokio::test]
 async fn pre_serve_barrier_completes_publication_repair_before_catchup_future() {
     let temp = TempDir::new().unwrap();
@@ -193,6 +199,7 @@ async fn pre_serve_barrier_completes_publication_repair_before_catchup_future() 
     );
 }
 
+/// TODO: Document pre_serve_barrier_recovers_async_migrations_before_catchup_future.
 #[tokio::test]
 async fn pre_serve_barrier_recovers_async_migrations_before_catchup_future() {
     let temp = TempDir::new().unwrap();

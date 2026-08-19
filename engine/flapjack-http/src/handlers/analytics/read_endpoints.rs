@@ -54,7 +54,7 @@ pub async fn get_top_searches(
         )
         .await
         .map_err(|e| FlapjackError::InvalidQuery(format!("Analytics error: {}", e)))?;
-    let result = maybe_fan_out(
+    let mut result = maybe_fan_out(
         &headers,
         "searches",
         "/2/searches",
@@ -63,6 +63,18 @@ pub async fn get_top_searches(
         limit,
     )
     .await;
+    // Exact numerator/denominator fields travel only between cluster nodes and
+    // through the rollup cache. Public clients retain the established schema.
+    if headers.get("X-Flapjack-Local-Only").is_none() {
+        if let Some(searches) = result.get_mut("searches").and_then(|v| v.as_array_mut()) {
+            for search in searches {
+                if let Some(object) = search.as_object_mut() {
+                    object.remove("_nbHitsSum");
+                    object.remove("_nbHitsCount");
+                }
+            }
+        }
+    }
     Ok(Json(result))
 }
 

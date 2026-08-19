@@ -1,3 +1,4 @@
+//! Stub summary for index_resource_store.rs.
 use flapjack::error::FlapjackError;
 use flapjack::index::replica::parse_replica_entry;
 use flapjack::index::rules::{Rule, RuleStore};
@@ -129,6 +130,7 @@ pub(crate) fn save_resource_item<S: IndexResourceStore>(
     Ok(())
 }
 
+/// TODO: Document save_resource_batch.
 pub(crate) fn save_resource_batch<S, I>(
     manager: &IndexManager,
     index_name: &str,
@@ -157,6 +159,7 @@ where
     Ok(store)
 }
 
+/// TODO: Document delete_resource_item.
 pub(crate) fn delete_resource_item<S: IndexResourceStore>(
     manager: &IndexManager,
     index_name: &str,
@@ -189,6 +192,7 @@ pub(crate) fn clear_resource_store<S: IndexResourceStore>(
     Ok(())
 }
 
+/// TODO: Document forward_store_to_replicas.
 pub(crate) fn forward_store_to_replicas<S: IndexResourceStore>(
     manager: &IndexManager,
     primary_index_name: &str,

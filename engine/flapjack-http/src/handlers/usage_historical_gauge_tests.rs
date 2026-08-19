@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/usage_historical_gauge_tests.rs.
 use super::*;
 use crate::usage_persistence::{CapturedUsageGauges, UsagePersistence};
 use std::collections::HashMap;
@@ -25,6 +26,7 @@ fn midnight_utc_ms(date: &str) -> i64 {
         .timestamp_millis()
 }
 
+/// TODO: Document usage_historical_gauge_points_preserve_options_and_union_indexes.
 #[tokio::test]
 async fn usage_historical_gauge_points_preserve_options_and_union_indexes() {
     let tmp = TempDir::new().unwrap();
@@ -82,6 +84,7 @@ async fn usage_historical_gauge_points_preserve_options_and_union_indexes() {
     assert!(json["documents_count"].as_array().unwrap().is_empty());
 }
 
+/// TODO: Document usage_historical_gauge_range_appends_todays_live_point_once.
 #[tokio::test]
 async fn usage_historical_gauge_range_appends_todays_live_point_once() {
     let tmp = TempDir::new().unwrap();

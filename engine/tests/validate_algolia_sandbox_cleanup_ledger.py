@@ -67,6 +67,7 @@ def require_no_unsubstituted_placeholders(text: str, name: str) -> None:
 
 
 def validate_resources(egress: dict[str, Any], require_populated: bool) -> None:
+    """TODO: Document validate_resources."""
     resources = require_mapping(egress.get("resources"), "stage6_egress.resources")
     missing = [key for key in RESOURCE_KEYS if key not in resources]
     if missing:
@@ -89,6 +90,7 @@ def validate_resources(egress: dict[str, Any], require_populated: bool) -> None:
 
 
 def validate_cleanup_commands(egress: dict[str, Any], require_populated: bool) -> None:
+    """TODO: Document validate_cleanup_commands."""
     commands = egress.get("cleanup_commands")
     if not isinstance(commands, list) or not all(isinstance(item, str) for item in commands):
         raise LedgerValidationError("stage6_egress.cleanup_commands must be a string list")
@@ -172,6 +174,7 @@ def validate_ledger(ledger: dict[str, Any], require_populated: bool = False) -> 
 
 
 def run_mutation_tests(ledger: dict[str, Any]) -> None:
+    """TODO: Document run_mutation_tests."""
     validate_ledger(ledger)
     for key in RESOURCE_KEYS:
         mutated = copy.deepcopy(ledger)
@@ -227,6 +230,7 @@ def expect_failure(ledger: dict[str, Any], scenario: str, require_populated: boo
 
 
 def main() -> int:
+    """TODO: Document main."""
     parser = argparse.ArgumentParser()
     parser.add_argument("ledger", type=Path)
     parser.add_argument("--require-populated", action="store_true")

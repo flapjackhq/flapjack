@@ -161,6 +161,9 @@ export interface UserData {
   [key: string]: unknown;
 }
 
+/**
+ * TODO: Document IndexSettings.
+ */
 export interface IndexSettings {
   searchableAttributes?: string[];
   attributesForFaceting?: string[];

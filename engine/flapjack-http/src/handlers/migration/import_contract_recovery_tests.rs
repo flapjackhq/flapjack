@@ -1,3 +1,5 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/import_contract_recovery_tests.rs.
+
 use super::*;
 use crate::dto::SearchRequest;
 use crate::handlers::migration::spool::{

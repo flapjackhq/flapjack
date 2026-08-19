@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/import.rs.
 use super::bulk_build::{flapjack_error, BulkBuildCounts, BulkBuildService};
 #[cfg(test)]
 use super::bulk_build::{
@@ -296,6 +297,7 @@ pub(super) struct SourceImportRequest {
     pub(super) publication_mode: MigrationPublicationMode,
 }
 
+/// TODO: Document import_from_source.
 pub(super) async fn import_from_source<R>(
     state_manager: &Arc<IndexManager>,
     request: SourceImportRequest,
@@ -321,6 +323,7 @@ where
     .await
 }
 
+/// TODO: Document import_from_source_with_test_hooks.
 #[cfg(test)]
 pub(super) async fn import_from_source_with_test_hooks<R>(
     state_manager: &Arc<IndexManager>,
@@ -339,6 +342,7 @@ where
     import_from_admitted_source_inner(state_manager, &spool, job_uuid, request, reader, hooks).await
 }
 
+/// TODO: Document import_from_admitted_source.
 #[allow(dead_code)]
 pub(super) async fn import_from_admitted_source<R>(
     state_manager: &Arc<IndexManager>,
@@ -361,6 +365,7 @@ where
     .await
 }
 
+/// TODO: Document import_from_admitted_source_with_test_hooks.
 #[cfg(test)]
 pub(super) async fn import_from_admitted_source_with_test_hooks<R>(
     state_manager: &Arc<IndexManager>,
@@ -389,6 +394,7 @@ pub(super) fn spool_for_manager(
     SpoolStore::new(&state_manager.base_path, SpoolLimits::default()).map_err(spool_error)
 }
 
+/// TODO: Document import_from_admitted_source_inner.
 async fn import_from_admitted_source_inner<R>(
     state_manager: &Arc<IndexManager>,
     spool: &SpoolStore,
@@ -640,6 +646,7 @@ fn import_outcome_warning(warning: &MigrateWarning) -> MigrationImportWarning {
     }
 }
 
+/// TODO: Document stage_import_export.
 async fn stage_import_export(
     bulk_build: &BulkBuildService<'_>,
     spool: &SpoolStore,
@@ -686,6 +693,7 @@ pub(super) async fn stage_accepted_bulk_replace(
     Ok(staged.counts)
 }
 
+/// TODO: Document stage_export.
 async fn stage_export(
     bulk_build: &BulkBuildService<'_>,
     spool: &SpoolStore,
@@ -784,6 +792,7 @@ fn persist_translated_settings(
     persist_index_settings(staging_manager, staging_tenant, settings)
 }
 
+/// TODO: Document persist_translated_resources.
 fn persist_translated_resources(
     staging_manager: &IndexManager,
     staging_tenant: &str,
@@ -807,6 +816,7 @@ fn persist_translated_resources(
     Ok(())
 }
 
+/// TODO: Document activated_response.
 fn activated_response(
     staged: StagedImport,
     activated: BulkBuildCounts,
@@ -1063,6 +1073,7 @@ fn wait_for_live_import_barrier(
     )
 }
 
+/// TODO: Document wait_for_live_import_barrier_with_timeout.
 #[cfg(test)]
 pub(super) fn wait_for_live_import_barrier_with_timeout(
     source_name: &str,

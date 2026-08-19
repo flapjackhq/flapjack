@@ -1,3 +1,4 @@
+//! Stub summary for single_support.rs.
 use crate::dto::SearchRequest;
 use flapjack::index::settings::IndexSettings;
 use flapjack::index::DEFAULT_RELEVANCY_STRICTNESS;
@@ -188,6 +189,7 @@ fn hybrid_search_inputs_reports_inactive_without_query_vector() {
 
     assert!(!inputs.is_hybrid_active());
 }
+/// TODO: Document resolve_search_sort_parses_asc_and_desc_suffixes.
 #[test]
 fn resolve_search_sort_parses_asc_and_desc_suffixes() {
     let req = SearchRequest {

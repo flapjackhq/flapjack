@@ -1,3 +1,4 @@
+//! Stub summary for export-openapi.rs.
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
@@ -19,6 +20,7 @@ fn parse_output_path() -> Result<PathBuf, String> {
     parse_output_path_from_args(std::env::args_os().skip(1))
 }
 
+/// TODO: Document main.
 fn main() {
     let output_path = match parse_output_path() {
         Ok(path) => path,

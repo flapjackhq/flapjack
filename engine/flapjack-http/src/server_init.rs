@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/server_init.rs.
 use crate::analytics_cluster;
 use crate::auth::KeyStore;
 use crate::conversation_store::ConversationStore;
@@ -27,6 +28,7 @@ use crate::handlers::metrics::MetricsState;
 use crate::usage_middleware::TenantUsageCounters;
 use dashmap::DashMap;
 
+/// TODO: Document InfrastructureState.
 pub(crate) struct InfrastructureState {
     pub manager: Arc<IndexManager>,
     pub dictionary_manager: Arc<DictionaryManager>,
@@ -97,6 +99,7 @@ pub(crate) fn log_startup_summary(summary: &StartupSummary) {
     );
 }
 
+/// TODO: Document initialize_infrastructure.
 pub(crate) async fn initialize_infrastructure(
     server_config: &ServerConfig,
     data_dir: &Path,
@@ -606,6 +609,7 @@ mod tests {
         }
     }
 
+    /// TODO: Document startup_summary_struct_fields_reflect_values.
     #[test]
     fn startup_summary_struct_fields_reflect_values() {
         let summary = StartupSummary {
@@ -628,6 +632,7 @@ mod tests {
         assert!(summary.vector_search_compiled);
         assert!(!summary.auth_enabled);
     }
+    /// TODO: Document log_startup_summary_emits_single_structured_info_event.
     #[test]
     fn log_startup_summary_emits_single_structured_info_event() {
         let summary = StartupSummary {

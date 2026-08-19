@@ -1,3 +1,4 @@
+//! Stub summary for query_execution.rs.
 use super::super::*;
 use crate::index::FacetCacheKey;
 
@@ -291,6 +292,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// TODO: Document sample_facet_data.
     fn sample_facet_data() -> (
         HashMap<String, Vec<crate::types::FacetCount>>,
         HashMap<String, crate::types::FacetStats>,
@@ -327,6 +329,7 @@ mod tests {
             "facet cache should remain unchanged when no cache key is provided"
         );
     }
+    /// TODO: Document maybe_cache_facets_inserts_expected_payload.
     #[tokio::test]
     async fn maybe_cache_facets_inserts_expected_payload() {
         let temp_dir = TempDir::new().unwrap();
@@ -368,6 +371,7 @@ mod tests {
             5.0
         );
     }
+    /// TODO: Document maybe_cache_facets_evicts_existing_entry_when_at_capacity.
     #[tokio::test]
     async fn maybe_cache_facets_evicts_existing_entry_when_at_capacity() {
         let temp_dir = TempDir::new().unwrap();
@@ -406,6 +410,7 @@ mod tests {
             "most recent insertion should remain in cache after eviction"
         );
     }
+    /// TODO: Document should_generate_split_alternatives_requires_full_condition_set.
     #[test]
     fn should_generate_split_alternatives_requires_full_condition_set() {
         assert!(should_generate_split_alternatives(

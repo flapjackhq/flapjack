@@ -420,6 +420,7 @@
         assert_eq!(all.len(), 3);
     }
 
+    /// TODO: Document write_committed_seq_replaces_existing_path_instead_of_following_it.
     #[cfg(unix)]
     #[test]
     fn write_committed_seq_replaces_existing_path_instead_of_following_it() {
@@ -499,6 +500,7 @@
 
         assert_eq!(oplog.oldest_seq(), None);
     }
+    /// TODO: Document test_oldest_seq_after_truncate_before.
     #[test]
     fn test_oldest_seq_after_truncate_before() {
         let tmp = TempDir::new().unwrap();

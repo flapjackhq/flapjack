@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/manager/publication/scanner.rs.
 use super::epoch::{observe_publication_epoch, publication_epoch_paths_for_target_path};
 use super::fsops::reject_symlinked_managed_path_components;
 use super::repair::repair_publication_outcome_with_epoch;
@@ -265,6 +266,7 @@ fn repair_discovered_target(
     })
 }
 
+/// TODO: Document unresolved_target_report.
 fn unresolved_target_report(
     target: PublicationTarget,
     transactions: Vec<PublicationTransactionId>,
@@ -363,6 +365,7 @@ fn validate_target_scan_roots(base: &Path, paths: &PublicationPaths) -> Result<(
     Ok(())
 }
 
+/// TODO: Document target_transactions.
 fn target_transactions(
     base: &Path,
     target: &PublicationTarget,
@@ -432,6 +435,7 @@ fn epoch_sidecar_path(base: &Path, target: &PublicationTarget, path: &Path) -> b
     path == paths.epoch || path == paths.temp || path == paths.lock
 }
 
+/// TODO: Document resolved_manifest.
 fn resolved_manifest(
     base: &Path,
     analytics: &AnalyticsConfig,

@@ -1,3 +1,4 @@
+//! Stub summary for chat_tests.rs.
 use super::*;
 use axum::{
     body::Body,
@@ -373,6 +374,7 @@ async fn chat_json_response_contains_answer_sources_query_id() {
         "missing 'queryID' field — expected in Stage 3 response"
     );
 }
+/// TODO: Document chat_sources_hide_unretrievable_attributes_without_acl.
 #[tokio::test]
 async fn chat_sources_hide_unretrievable_attributes_without_acl() {
     let _guard = lock_env_guard().await;
@@ -695,6 +697,7 @@ async fn chat_openai_provider_upstream_401_maps_to_502_error() {
     );
 }
 
+/// TODO: Document a10_resolve_provider_config_rejects_unsafe_base_url_from_index_settings.
 #[tokio::test]
 async fn a10_resolve_provider_config_rejects_unsafe_base_url_from_index_settings() {
     let _guard = lock_env_guard().await;
@@ -748,6 +751,7 @@ async fn a10_resolve_provider_config_rejects_unsafe_base_url_from_index_settings
     }
 }
 
+/// TODO: Document a10_resolve_provider_config_rejects_unsafe_base_url_from_env.
 #[tokio::test]
 async fn a10_resolve_provider_config_rejects_unsafe_base_url_from_env() {
     let _guard = lock_env_guard().await;
@@ -981,6 +985,7 @@ async fn security_chat_uses_pinned_vetted_resolution_addresses() {
     );
 }
 
+/// TODO: Document sse_sender_exits_cleanly_when_receiver_dropped.
 #[tokio::test]
 async fn sse_sender_exits_cleanly_when_receiver_dropped() {
     let (tx, rx) = mpsc::channel(2);

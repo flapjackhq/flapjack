@@ -20,8 +20,11 @@ fn sort_by_date(dates: &mut [Value]) {
 /// identifies which field holds the array (e.g., "searches", "hits", "filters").
 /// Each result item must have a key field (e.g., "search", "hit", "attribute") and a "count" field.
 pub fn merge_top_k(results: &[Value], results_key: &str, key_field: &str, limit: usize) -> Value {
-    // Track count and nbHits (both are summable) per key, plus a template for other fields
-    let mut counts: HashMap<String, (i64, i64, Value)> = HashMap::new();
+    // Track the search count plus the nbHits numerator/denominator per key.
+    // nbHits is an average in the public contract, so node averages must never
+    // be added together. Query results carry the exact private components; the
+    // avg*count fallback keeps older peer payloads weighted during upgrades.
+    let mut counts: HashMap<String, (i64, i64, i64, bool, Value)> = HashMap::new();
 
     for result in results {
         if let Some(items) = result.get(results_key).and_then(|v| v.as_array()) {
@@ -32,11 +35,23 @@ pub fn merge_top_k(results: &[Value], results_key: &str, key_field: &str, limit:
                     .unwrap_or("")
                     .to_string();
                 let count = item.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-                let nb_hits = item.get("nbHits").and_then(|v| v.as_i64()).unwrap_or(0);
+                let nb_hits = item.get("nbHits").and_then(|v| v.as_i64());
+                let private_sum = item.get("_nbHitsSum").and_then(|v| v.as_i64());
+                let private_count = item.get("_nbHitsCount").and_then(|v| v.as_i64());
+                let (nb_hits_sum, nb_hits_count) = match (private_sum, private_count) {
+                    (Some(sum), Some(denominator)) => (sum, denominator),
+                    _ => nb_hits
+                        .map(|average| (average.saturating_mul(count), count))
+                        .unwrap_or((0, 0)),
+                };
 
-                let entry = counts.entry(key).or_insert_with(|| (0, 0, item.clone()));
+                let entry = counts
+                    .entry(key)
+                    .or_insert_with(|| (0, 0, 0, false, item.clone()));
                 entry.0 += count;
-                entry.1 += nb_hits;
+                entry.1 += nb_hits_sum;
+                entry.2 += nb_hits_count;
+                entry.3 |= nb_hits.is_some() || private_sum.is_some();
             }
         }
     }
@@ -44,22 +59,39 @@ pub fn merge_top_k(results: &[Value], results_key: &str, key_field: &str, limit:
     // Build merged array, updating count and nbHits in each item
     let mut merged: Vec<Value> = counts
         .into_iter()
-        .map(|(_key, (total_count, total_nb_hits, mut template))| {
-            if let Some(obj) = template.as_object_mut() {
-                obj.insert("count".to_string(), json!(total_count));
-                if total_nb_hits > 0 || obj.contains_key("nbHits") {
-                    obj.insert("nbHits".to_string(), json!(total_nb_hits));
+        .map(
+            |(
+                _key,
+                (total_count, total_nb_hits, total_nb_hits_count, has_nb_hits, mut template),
+            )| {
+                if let Some(obj) = template.as_object_mut() {
+                    obj.insert("count".to_string(), json!(total_count));
+                    if has_nb_hits {
+                        let average = if total_nb_hits_count > 0 {
+                            total_nb_hits / total_nb_hits_count
+                        } else {
+                            0
+                        };
+                        obj.insert("nbHits".to_string(), json!(average));
+                    }
+                    obj.remove("_nbHitsSum");
+                    obj.remove("_nbHitsCount");
                 }
-            }
-            template
-        })
+                template
+            },
+        )
         .collect();
 
-    // Sort by count descending
+    // Sort by count descending, then by the endpoint's logical key ascending.
+    // HashMap iteration order must never become observable in tied rows.
     merged.sort_by(|a, b| {
         let ca = a.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
         let cb = b.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-        cb.cmp(&ca)
+        cb.cmp(&ca).then_with(|| {
+            let ka = a.get(key_field).and_then(|v| v.as_str()).unwrap_or("");
+            let kb = b.get(key_field).and_then(|v| v.as_str()).unwrap_or("");
+            ka.cmp(kb)
+        })
     });
 
     merged.truncate(limit);

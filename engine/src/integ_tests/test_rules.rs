@@ -200,7 +200,7 @@ async fn test_context_based_rule_matches_any_rule_context() {
 }
 
 #[tokio::test]
-async fn test_pin_deduplication() {
+async fn test_zero_based_pin_position_shifts_third_result_to_first_without_duplication() {
     let (manager, temp_dir, index_name) = setup_test().await;
 
     let rule = crate::index::rules::Rule {
@@ -214,7 +214,7 @@ async fn test_pin_deduplication() {
         }],
         consequence: crate::index::rules::Consequence {
             promote: Some(vec![crate::index::rules::Promote::Single {
-                object_id: "1".to_string(),
+                object_id: "3".to_string(),
                 position: 0,
             }]),
             hide: None,
@@ -227,41 +227,238 @@ async fn test_pin_deduplication() {
         validity: None,
     };
 
+    let docs = vec![
+        crate::types::Document::from_json(&json!({"_id": "1", "name": "Gaming Laptop", "rank": 1}))
+            .unwrap(),
+        crate::types::Document::from_json(&json!({"_id": "2", "name": "Office Laptop", "rank": 2}))
+            .unwrap(),
+        crate::types::Document::from_json(&json!({"_id": "3", "name": "Budget Laptop", "rank": 3}))
+            .unwrap(),
+    ];
+    manager.add_documents_sync(&index_name, docs).await.unwrap();
+
+    let sort = crate::types::Sort::ByField {
+        field: "rank".to_string(),
+        order: crate::types::SortOrder::Asc,
+    };
+    let search = || {
+        manager
+            .search_with_options(
+                &index_name,
+                "laptop",
+                &SearchOptions {
+                    sort: Some(&sort),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    };
+    let baseline_ids: Vec<_> = search()
+        .documents
+        .into_iter()
+        .map(|document| document.document.id)
+        .collect();
+    assert_eq!(baseline_ids, vec!["1", "2", "3"]);
+
     let rules_path = temp_dir.path().join(&index_name).join("rules.json");
     let mut store = crate::index::rules::RuleStore::new();
     store.insert(rule);
     store.save(&rules_path).unwrap();
 
-    let docs = vec![
-        crate::types::Document::from_json(
-            &json!({"_id": "1", "name": "Gaming Laptop", "popularity": 500}),
-        )
-        .unwrap(),
-        crate::types::Document::from_json(
-            &json!({"_id": "2", "name": "Office Laptop", "popularity": 300}),
-        )
-        .unwrap(),
-        crate::types::Document::from_json(
-            &json!({"_id": "3", "name": "Budget Laptop", "popularity": 100}),
-        )
-        .unwrap(),
-    ];
-    manager.add_documents_sync(&index_name, docs).await.unwrap();
-
-    let result = manager
-        .search(&index_name, "laptop", None, None, 10)
-        .unwrap();
-    assert_eq!(result.documents[0].document.id, "1");
+    let result = search();
+    let result_ids: Vec<_> = result
+        .documents
+        .iter()
+        .map(|document| document.document.id.as_str())
+        .collect();
+    assert_eq!(result_ids, vec!["3", "1", "2"]);
 
     let id_positions: Vec<_> = result
         .documents
         .iter()
         .enumerate()
-        .filter(|(_, d)| d.document.id == "1")
+        .filter(|(_, d)| d.document.id == "3")
         .map(|(i, _)| i)
         .collect();
     assert_eq!(id_positions.len(), 1, "Pinned item should appear only once");
-    assert_eq!(id_positions[0], 0, "Pinned item should be at position 0");
+    assert_eq!(id_positions[0], 0, "Position 0 must mean the first result");
+}
+
+#[tokio::test]
+async fn test_managed_merchandising_rule_lifecycle_has_exact_search_consequences() -> Result<()> {
+    let (manager, temp_dir, index_name) = setup_test().await;
+    let rules_path = temp_dir.path().join(&index_name).join("rules.json");
+    let settings = crate::index::settings::IndexSettings {
+        attributes_for_faceting: vec!["category".to_string()],
+        ..crate::index::settings::IndexSettings::default()
+    };
+    settings.save(temp_dir.path().join(&index_name).join("settings.json"))?;
+    manager.invalidate_settings_cache(&index_name);
+
+    let docs = vec![
+        Document::from_json(&json!({
+            "_id": "trail-1", "name": "Blue Ridge Trail Jacket",
+            "category": "outerwear", "rank": 1
+        }))?,
+        Document::from_json(&json!({
+            "_id": "trail-2", "name": "Red Ridge Trail Jacket",
+            "category": "outerwear", "rank": 2
+        }))?,
+        Document::from_json(&json!({
+            "_id": "trail-3", "name": "River Trail Shell",
+            "category": "outerwear", "rank": 3
+        }))?,
+        Document::from_json(&json!({
+            "_id": "trail-4", "name": "Alpine Trail Boots",
+            "category": "footwear", "rank": 4
+        }))?,
+    ];
+    manager.add_documents_sync(&index_name, docs).await?;
+
+    let sort = crate::types::Sort::ByField {
+        field: "rank".to_string(),
+        order: crate::types::SortOrder::Asc,
+    };
+    let search_ids = |query: &str, filter_text: &str| -> Result<(Vec<String>, Vec<String>)> {
+        let filter = crate::filter_parser::parse_filter(filter_text).unwrap();
+        let result = manager.search_with_options(
+            &index_name,
+            query,
+            &SearchOptions {
+                filter: Some(&filter),
+                sort: Some(&sort),
+                limit: 10,
+                ..Default::default()
+            },
+        )?;
+        Ok((
+            result
+                .documents
+                .into_iter()
+                .map(|document| document.document.id)
+                .collect(),
+            result.applied_rules,
+        ))
+    };
+    let outerwear_baseline = vec!["trail-1", "trail-2", "trail-3"];
+
+    assert_eq!(
+        search_ids("trail", "category:outerwear")?.0,
+        outerwear_baseline
+    );
+
+    let base_rule = crate::index::rules::Rule {
+        object_id: "managed-trail-rule".to_string(),
+        conditions: vec![crate::index::rules::Condition {
+            pattern: Some("trail".to_string()),
+            anchoring: Some(crate::index::rules::Anchoring::Contains),
+            alternatives: None,
+            context: None,
+            filters: Some("category:outerwear".to_string()),
+        }],
+        consequence: crate::index::rules::Consequence {
+            promote: Some(vec![crate::index::rules::Promote::Single {
+                object_id: "trail-3".to_string(),
+                position: 0,
+            }]),
+            hide: Some(vec![crate::index::rules::Hide {
+                object_id: "trail-2".to_string(),
+            }]),
+            filter_promotes: None,
+            user_data: None,
+            params: None,
+        },
+        description: Some("Managed trail merchandising".to_string()),
+        enabled: Some(false),
+        validity: Some(vec![crate::index::rules::TimeRange {
+            from: 1_704_067_200,
+            until: 4_102_444_799,
+        }]),
+    };
+
+    let mut store = crate::index::rules::RuleStore::new();
+    store.insert(base_rule.clone());
+    store.save(&rules_path)?;
+    manager.invalidate_rules_cache(&index_name);
+    let persisted_draft = crate::index::rules::RuleStore::load(&rules_path)?;
+    assert_eq!(
+        persisted_draft.get("managed-trail-rule").unwrap().enabled,
+        Some(false)
+    );
+    assert_eq!(
+        search_ids("trail", "category:outerwear")?.0,
+        outerwear_baseline,
+        "A persisted draft must not change hits or order"
+    );
+
+    let mut future_rule = base_rule.clone();
+    future_rule.enabled = Some(true);
+    future_rule.validity = Some(vec![crate::index::rules::TimeRange {
+        from: 4_102_444_800,
+        until: 4_133_980_800,
+    }]);
+    store.insert(future_rule);
+    store.save(&rules_path)?;
+    manager.invalidate_rules_cache(&index_name);
+    assert_eq!(
+        search_ids("trail", "category:outerwear")?.0,
+        outerwear_baseline,
+        "A future rule must persist without changing hits or order"
+    );
+
+    let mut expired_rule = base_rule.clone();
+    expired_rule.enabled = Some(true);
+    expired_rule.validity = Some(vec![crate::index::rules::TimeRange {
+        from: 946_684_800,
+        until: 978_307_199,
+    }]);
+    store.insert(expired_rule);
+    store.save(&rules_path)?;
+    manager.invalidate_rules_cache(&index_name);
+    assert_eq!(
+        search_ids("trail", "category:outerwear")?.0,
+        outerwear_baseline,
+        "An expired rule must persist without changing hits or order"
+    );
+
+    let mut published_rule = base_rule;
+    published_rule.enabled = Some(true);
+    store.insert(published_rule);
+    store.save(&rules_path)?;
+    manager.invalidate_rules_cache(&index_name);
+
+    let persisted_published = crate::index::rules::RuleStore::load(&rules_path)?;
+    let readback = persisted_published.get("managed-trail-rule").unwrap();
+    assert_eq!(readback.enabled, Some(true));
+    assert_eq!(readback.validity.as_ref().unwrap()[0].from, 1_704_067_200);
+
+    let (active_ids, active_rules) = search_ids("trail", "category:outerwear")?;
+    assert_eq!(active_ids, vec!["trail-3", "trail-1"]);
+    assert_eq!(active_rules, vec!["managed-trail-rule"]);
+    assert_eq!(
+        search_ids("ridge", "category:outerwear")?.0,
+        vec!["trail-1", "trail-2"],
+        "A nonmatching query must retain its exact hits and order"
+    );
+    assert_eq!(
+        search_ids("trail", "category:footwear")?.0,
+        vec!["trail-4"],
+        "A mismatched filter scope must retain its exact hits and order"
+    );
+
+    store.remove("managed-trail-rule");
+    store.save(&rules_path)?;
+    manager.invalidate_rules_cache(&index_name);
+    let after_delete = crate::index::rules::RuleStore::load(&rules_path)?;
+    assert!(after_delete.get("managed-trail-rule").is_none());
+    let (deleted_ids, deleted_rules) = search_ids("trail", "category:outerwear")?;
+    assert_eq!(deleted_ids, outerwear_baseline);
+    assert!(
+        deleted_rules.is_empty(),
+        "Deleted rules must leave no residue"
+    );
+    Ok(())
 }
 
 #[tokio::test]

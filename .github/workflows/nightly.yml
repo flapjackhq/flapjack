@@ -158,9 +158,10 @@ jobs:
       - name: Install dependencies
         working-directory: engine/dashboard
         run: npm ci
-      - name: Install Playwright browsers
+      - name: Install dashboard nightly Playwright browser
         working-directory: engine/dashboard
-        run: npx playwright install --with-deps chromium
+        timeout-minutes: 5
+        run: npx playwright install chromium
       - name: Type check & build
         working-directory: engine/dashboard
         run: npm run build

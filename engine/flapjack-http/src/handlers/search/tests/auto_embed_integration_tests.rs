@@ -1,3 +1,4 @@
+//! Stub summary for auto_embed_integration_tests.rs.
 use super::*;
 use crate::dto::HybridSearchParams;
 use flapjack::index::settings::IndexSettings;
@@ -24,6 +25,7 @@ fn save_settings(state: &Arc<AppState>, index_name: &str, settings: &IndexSettin
     settings.save(dir.join("settings.json")).unwrap();
 }
 
+/// TODO: Document rest_embedder_settings.
 fn rest_embedder_settings(server_uri: &str) -> IndexSettings {
     let mut embedders = HashMap::new();
     embedders.insert(

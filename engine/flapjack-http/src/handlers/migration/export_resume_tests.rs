@@ -1,7 +1,9 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/export_resume_tests.rs.
 use super::*;
 use chrono::{TimeZone, Utc};
 use tempfile::TempDir;
 
+/// TODO: Document export_resume_store.
 fn export_resume_store(tmp: &TempDir) -> SpoolStore {
     let limits = SpoolLimits {
         max_compressed_page_bytes: 1_024,
@@ -47,6 +49,7 @@ fn create_export_for_test(
     store.create_export(job_uuid, source_identity_digest, denominators)
 }
 
+/// TODO: Document export_resume_atomic_pages_publish_payload_and_exact_membership_together.
 #[test]
 fn export_resume_atomic_pages_publish_payload_and_exact_membership_together() {
     let tmp = TempDir::new().unwrap();
@@ -100,6 +103,7 @@ fn export_resume_atomic_pages_publish_payload_and_exact_membership_together() {
     );
 }
 
+/// TODO: Document export_resume_completed_pages_are_noops_after_reopen_and_page_shift.
 #[test]
 fn export_resume_completed_pages_are_noops_after_reopen_and_page_shift() {
     let tmp = TempDir::new().unwrap();
@@ -155,6 +159,7 @@ fn export_resume_completed_pages_are_noops_after_reopen_and_page_shift() {
     );
 }
 
+/// TODO: Document export_resume_recovery_rolls_back_payload_and_membership_before_manifest_commit.
 #[test]
 fn export_resume_recovery_rolls_back_payload_and_membership_before_manifest_commit() {
     for (resource, kind, committed_id, uncommitted_id) in [
@@ -216,6 +221,7 @@ fn export_resume_recovery_rolls_back_payload_and_membership_before_manifest_comm
     }
 }
 
+/// TODO: Document export_resume_singleton_settings_is_atomic_and_idempotent_after_reopen.
 #[test]
 fn export_resume_singleton_settings_is_atomic_and_idempotent_after_reopen() {
     let tmp = TempDir::new().unwrap();
@@ -262,6 +268,7 @@ fn export_resume_singleton_settings_is_atomic_and_idempotent_after_reopen() {
     );
 }
 
+/// TODO: Document export_resume_checkpoint_requires_exact_source_identity_without_advancing_state.
 #[test]
 fn export_resume_checkpoint_requires_exact_source_identity_without_advancing_state() {
     let tmp = TempDir::new().unwrap();
@@ -284,6 +291,7 @@ fn export_resume_checkpoint_requires_exact_source_identity_without_advancing_sta
     assert_eq!(store.manifest_json(view.job_uuid).unwrap(), before);
 }
 
+/// TODO: Document export_resume_empty_resources_complete_and_terminal_states_fence_writes.
 #[test]
 fn export_resume_empty_resources_complete_and_terminal_states_fence_writes() {
     let tmp = TempDir::new().unwrap();
@@ -349,6 +357,7 @@ fn export_resume_empty_resources_complete_and_terminal_states_fence_writes() {
     );
 }
 
+/// TODO: Document export_resume_resource_completion_rejects_unverified_counts_and_incomplete_acceptance.
 #[test]
 fn export_resume_resource_completion_rejects_unverified_counts_and_incomplete_acceptance() {
     let tmp = TempDir::new().unwrap();
@@ -372,6 +381,7 @@ fn export_resume_resource_completion_rejects_unverified_counts_and_incomplete_ac
     assert_eq!(accept_error.kind(), SpoolErrorKind::ResourcesIncomplete);
 }
 
+/// TODO: Document export_resume_nonempty_resource_completion_persists_verified_counts_and_hashes.
 #[test]
 fn export_resume_nonempty_resource_completion_persists_verified_counts_and_hashes() {
     let tmp = TempDir::new().unwrap();

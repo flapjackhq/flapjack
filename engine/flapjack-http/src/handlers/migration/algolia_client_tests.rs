@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/algolia_client_tests.rs.
 use super::*;
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -942,6 +943,7 @@ fn index_page(items: Value, page: usize, nb_pages: usize) -> Value {
     })
 }
 
+/// TODO: Document paginated_hits_for_test.
 fn paginated_hits_for_test<T: DeserializeOwned>(
     transport: &mut ScriptedTransport,
     endpoint: &str,
@@ -959,6 +961,7 @@ fn paginated_hits_for_test<T: DeserializeOwned>(
         .collect()
 }
 
+/// TODO: Document paginated_raw_hits_for_test.
 fn paginated_raw_hits_for_test(
     transport: &mut ScriptedTransport,
     endpoint: &str,
@@ -983,6 +986,7 @@ fn paginated_raw_hits_for_test(
     }
 }
 
+/// TODO: Document paginated_raw_hits_with_limits_for_test.
 fn paginated_raw_hits_with_limits_for_test(
     transport: &mut ScriptedTransport,
     endpoint: &str,
@@ -1009,6 +1013,7 @@ fn paginated_raw_hits_with_limits_for_test(
     }
 }
 
+/// TODO: Document browse_documents_for_test.
 fn browse_documents_for_test(
     transport: &mut ScriptedTransport,
 ) -> Result<Vec<Value>, AlgoliaClientError> {
@@ -1031,6 +1036,7 @@ fn browse_documents_for_test(
     }
 }
 
+/// TODO: Document browse_documents_with_limits_for_test.
 fn browse_documents_with_limits_for_test(
     transport: &mut ScriptedTransport,
     limits: TraversalLimits,
@@ -1055,6 +1061,7 @@ fn browse_documents_with_limits_for_test(
     }
 }
 
+/// TODO: Document client_policy_validates_app_id_before_host_construction.
 #[test]
 fn client_policy_validates_app_id_before_host_construction() {
     let _base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
@@ -1627,6 +1634,7 @@ fn client_policy_rejects_unresolved_vendor_host_before_connect() {
 // execute_json_with_retry seam. This known-answer test proves the requested path
 // is percent-encoded for an arbitrary index name, the full settings JSON is
 // returned verbatim, and any non-2xx stays in the typed, scrubbed error owner.
+/// TODO: Document index_settings_encodes_arbitrary_name_returns_full_json_and_scrubs_errors.
 #[test]
 fn index_settings_encodes_arbitrary_name_returns_full_json_and_scrubs_errors() {
     let base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
@@ -1673,6 +1681,7 @@ fn index_settings_encodes_arbitrary_name_returns_full_json_and_scrubs_errors() {
     );
 }
 
+/// TODO: Document retry_policy_retries_transient_failures_and_stops_on_success.
 #[test]
 fn retry_policy_retries_transient_failures_and_stops_on_success() {
     let mut transport = ScriptedTransport::new(vec![
@@ -1697,6 +1706,7 @@ fn retry_policy_retries_transient_failures_and_stops_on_success() {
     assert_eq!(transport.requests.len(), 3);
 }
 
+/// TODO: Document retry_policy_uses_algolia_fallback_hosts_after_transient_data_failure.
 #[test]
 fn retry_policy_uses_algolia_fallback_hosts_after_transient_data_failure() {
     let base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
@@ -1725,6 +1735,7 @@ fn retry_policy_uses_algolia_fallback_hosts_after_transient_data_failure() {
     );
 }
 
+/// TODO: Document retry_policy_uses_algolia_fallback_hosts_after_transient_control_failure.
 #[test]
 fn retry_policy_uses_algolia_fallback_hosts_after_transient_control_failure() {
     let base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
@@ -1758,6 +1769,7 @@ fn retry_policy_uses_algolia_fallback_hosts_after_transient_control_failure() {
     );
 }
 
+/// TODO: Document retry_policy_stops_immediately_for_non_retryable_failures.
 #[test]
 fn retry_policy_stops_immediately_for_non_retryable_failures() {
     for kind in [
@@ -1800,6 +1812,7 @@ fn retry_policy_stops_immediately_for_non_retryable_failures() {
     assert_eq!(transport.requests.len(), 1);
 }
 
+/// TODO: Document retry_policy_returns_stable_variant_after_retry_budget.
 #[test]
 fn retry_policy_returns_stable_variant_after_retry_budget() {
     let base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
@@ -1879,6 +1892,7 @@ fn retry_policy_returns_stable_variant_after_retry_budget() {
     }
 }
 
+/// TODO: Document list_indexes_pagination_starts_at_page_zero_and_follows_nb_pages_changes.
 #[test]
 fn list_indexes_pagination_starts_at_page_zero_and_follows_nb_pages_changes() {
     let base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
@@ -1916,6 +1930,7 @@ fn list_indexes_pagination_starts_at_page_zero_and_follows_nb_pages_changes() {
     );
 }
 
+/// TODO: Document list_indexes_pagination_rejects_missing_metadata_and_bad_items.
 #[test]
 fn list_indexes_pagination_rejects_missing_metadata_and_bad_items() {
     for (body, expected_kind) in [
@@ -1943,6 +1958,7 @@ fn list_indexes_pagination_rejects_missing_metadata_and_bad_items() {
     }
 }
 
+/// TODO: Document list_indexes_pagination_rejects_repeated_content.
 #[test]
 fn list_indexes_pagination_rejects_repeated_content() {
     let mut transport = ScriptedTransport::new(vec![
@@ -1966,6 +1982,7 @@ fn list_indexes_pagination_rejects_repeated_content() {
     );
 }
 
+/// TODO: Document list_indexes_pagination_rejects_page_equal_to_shrunk_nb_pages.
 #[test]
 fn list_indexes_pagination_rejects_page_equal_to_shrunk_nb_pages() {
     let mut transport = ScriptedTransport::new(vec![
@@ -2020,6 +2037,7 @@ fn list_indexes_pagination_accepts_empty_zero_nb_pages() {
     assert_eq!(transport.requests.len(), 1);
 }
 
+/// TODO: Document list_indexes_pagination_accepts_public_rows_without_pending_task.
 #[test]
 fn list_indexes_pagination_accepts_public_rows_without_pending_task() {
     let mut transport = ScriptedTransport::new(vec![ok(index_page(
@@ -2041,6 +2059,7 @@ fn list_indexes_pagination_accepts_public_rows_without_pending_task() {
     assert_eq!(indexes[0].updated_at, "2026-01-01T00:00:00Z");
 }
 
+/// TODO: Document source_export_acl_and_quiescence_reads_key_acl_through_strict_planner.
 #[test]
 fn source_export_acl_and_quiescence_reads_key_acl_through_strict_planner() {
     let base_url_env = AlgoliaBaseUrlEnvGuard::vendor_hosts();
@@ -2066,6 +2085,7 @@ fn source_export_acl_and_quiescence_reads_key_acl_through_strict_planner() {
     }
 }
 
+/// TODO: Document source_export_acl_and_quiescence_rejects_unretrievable_without_capability.
 #[test]
 fn source_export_acl_and_quiescence_rejects_unretrievable_without_capability() {
     let settings = json!({ "unretrievableAttributes": ["secret"] });
@@ -2102,6 +2122,7 @@ fn source_export_acl_and_quiescence_rejects_unretrievable_without_capability() {
     assert!(no_hidden_fields.requests.is_empty());
 }
 
+/// TODO: Document source_export_acl_and_quiescence_polls_until_selected_index_is_not_pending.
 #[test]
 fn source_export_acl_and_quiescence_polls_until_selected_index_is_not_pending() {
     let mut transport = ScriptedTransport::new(vec![
@@ -2137,6 +2158,7 @@ fn source_export_acl_and_quiescence_polls_until_selected_index_is_not_pending() 
     assert_eq!(transport.requests.len(), 2);
 }
 
+/// TODO: Document source_export_acl_and_quiescence_rejects_ambiguous_selected_index_metadata.
 #[test]
 fn source_export_acl_and_quiescence_rejects_ambiguous_selected_index_metadata() {
     for body in [
@@ -2180,6 +2202,7 @@ fn source_export_acl_and_quiescence_rejects_ambiguous_selected_index_metadata() 
     }
 }
 
+/// TODO: Document source_export_acl_and_quiescence_requires_selected_pending_task_metadata.
 #[test]
 fn source_export_acl_and_quiescence_requires_selected_pending_task_metadata() {
     for item in [
@@ -2204,6 +2227,7 @@ fn source_export_acl_and_quiescence_requires_selected_pending_task_metadata() {
     }
 }
 
+/// TODO: Document source_export_acl_and_quiescence_deadline_expiry_is_scrubbed.
 #[test]
 fn source_export_acl_and_quiescence_deadline_expiry_is_scrubbed() {
     let mut transport = ScriptedTransport::new(vec![
@@ -2265,6 +2289,7 @@ fn strict_source_progress_rejects_malformed_hits() {
     );
 }
 
+/// TODO: Document strict_source_progress_uses_explicit_nb_pages_not_short_page_heuristic.
 #[test]
 fn strict_source_progress_uses_explicit_nb_pages_not_short_page_heuristic() {
     let mut transport = ScriptedTransport::new(vec![
@@ -2286,6 +2311,7 @@ fn strict_source_progress_uses_explicit_nb_pages_not_short_page_heuristic() {
     assert_eq!(transport.requests.len(), 2);
 }
 
+/// TODO: Document strict_source_progress_rejects_page_equal_to_shrunk_nb_pages.
 #[test]
 fn strict_source_progress_rejects_page_equal_to_shrunk_nb_pages() {
     let mut transport = ScriptedTransport::new(vec![
@@ -2313,6 +2339,7 @@ fn strict_source_progress_rejects_page_equal_to_shrunk_nb_pages() {
     assert_eq!(transport.requests.len(), 2);
 }
 
+/// TODO: Document strict_source_progress_rejects_nonempty_zero_nb_pages.
 #[test]
 fn strict_source_progress_rejects_nonempty_zero_nb_pages() {
     let mut transport = ScriptedTransport::new(vec![ok(json!({
@@ -2347,6 +2374,7 @@ fn strict_source_progress_accepts_empty_zero_nb_pages() {
     assert_eq!(transport.requests.len(), 1);
 }
 
+/// TODO: Document strict_source_progress_rejects_empty_intermediate_search_page.
 #[test]
 fn strict_source_progress_rejects_empty_intermediate_search_page() {
     let mut transport = ScriptedTransport::new(vec![
@@ -2418,6 +2446,7 @@ fn strict_source_progress_rejects_non_string_browse_cursor() {
     );
 }
 
+/// TODO: Document strict_source_progress_streams_browse_page_before_following_request_failure.
 #[test]
 fn strict_source_progress_streams_browse_page_before_following_request_failure() {
     let mut transport = ScriptedTransport::new(vec![
@@ -2460,6 +2489,7 @@ fn strict_source_progress_streams_browse_page_before_following_request_failure()
     assert_eq!(delivered_page_sizes, vec![1]);
 }
 
+/// TODO: Document response_byte_limit_is_enforced_before_json_decoding.
 #[test]
 fn response_byte_limit_is_enforced_before_json_decoding() {
     let mut transport = ScriptedTransport::new(vec![Ok(RawResponse {
@@ -2481,6 +2511,7 @@ fn response_byte_limit_is_enforced_before_json_decoding() {
     );
 }
 
+/// TODO: Document response_byte_limit_rejects_production_content_length_before_buffering.
 #[test]
 fn response_byte_limit_rejects_production_content_length_before_buffering() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
@@ -2531,6 +2562,7 @@ fn response_byte_limit_rejects_production_content_length_before_buffering() {
     );
 }
 
+/// TODO: Document source_export_raw_traversal_preserves_json_and_uses_strict_browse_bodies.
 #[test]
 fn source_export_raw_traversal_preserves_json_and_uses_strict_browse_bodies() {
     let raw = json!({
@@ -2638,6 +2670,7 @@ fn source_export_raw_traversal_strips_search_decorations_without_normalizing_def
         .ends_with("/1/indexes/products/synonyms/search"));
 }
 
+/// TODO: Document source_export_synonyms_search_accepts_algolia_nbhits_only_pagination.
 #[test]
 fn source_export_synonyms_search_accepts_algolia_nbhits_only_pagination() {
     let first_page_hits: Vec<Value> = (0..1000)
@@ -2683,6 +2716,7 @@ fn source_export_synonyms_search_accepts_algolia_nbhits_only_pagination() {
     );
 }
 
+/// TODO: Document source_export_raw_traversal_requires_unique_string_object_ids_for_rules_and_synonyms.
 #[test]
 fn source_export_raw_traversal_requires_unique_string_object_ids_for_rules_and_synonyms() {
     for endpoint in ["rules/search", "synonyms/search"] {
@@ -2705,6 +2739,7 @@ fn source_export_raw_traversal_requires_unique_string_object_ids_for_rules_and_s
     }
 }
 
+/// TODO: Document source_export_raw_traversal_enforces_index_list_item_limits.
 #[test]
 fn source_export_raw_traversal_enforces_index_list_item_limits() {
     let limits = TraversalLimits {
@@ -2772,6 +2807,7 @@ fn source_export_raw_traversal_enforces_index_list_item_limits() {
     );
 }
 
+/// TODO: Document source_export_raw_traversal_enforces_index_list_page_limits.
 #[test]
 fn source_export_raw_traversal_enforces_index_list_page_limits() {
     let limits = TraversalLimits {
@@ -2828,6 +2864,7 @@ fn source_export_raw_traversal_enforces_index_list_page_limits() {
     assert_eq!(over_transport.requests.len(), 2);
 }
 
+/// TODO: Document source_export_raw_traversal_enforces_index_list_response_byte_limits.
 #[test]
 fn source_export_raw_traversal_enforces_index_list_response_byte_limits() {
     let page = index_page(
@@ -2872,6 +2909,7 @@ fn source_export_raw_traversal_enforces_index_list_response_byte_limits() {
     );
 }
 
+/// TODO: Document source_export_raw_traversal_uses_independent_resource_limits.
 #[test]
 fn source_export_raw_traversal_uses_independent_resource_limits() {
     let exact_two_items = vec![ok(json!({

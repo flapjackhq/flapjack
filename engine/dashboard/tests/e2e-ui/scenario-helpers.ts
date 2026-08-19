@@ -1,4 +1,7 @@
 /**
+ * @module Stub summary for scenario-helpers.ts.
+ */
+/**
  */
 import { expect, type APIRequestContext } from '@playwright/test';
 import { addDocuments, createIndex, deleteIndex, searchIndex } from '../fixtures/api-helpers';
@@ -100,6 +103,9 @@ async function waitForIndexedQuery(
   }).toPass({ timeout: SEARCH_WAIT_TIMEOUT_MS });
 }
 
+/**
+ * TODO: Document createIsolatedMerchandisingScenario.
+ */
 export async function createIsolatedMerchandisingScenario(
   request: APIRequestContext,
   scenarioName: string,
@@ -124,6 +130,9 @@ export async function createIsolatedMerchandisingScenario(
   return { indexName, searchQuery };
 }
 
+/**
+ * TODO: Document createIsolatedMerchandisingComparisonScenario.
+ */
 export async function createIsolatedMerchandisingComparisonScenario(
   request: APIRequestContext,
   scenarioName: string,
@@ -170,6 +179,9 @@ export async function createIsolatedMerchandisingComparisonScenario(
   };
 }
 
+/**
+ * TODO: Document createIsolatedMerchandisingLifecycleScenario.
+ */
 export async function createIsolatedMerchandisingLifecycleScenario(
   request: APIRequestContext,
   scenarioName: string,

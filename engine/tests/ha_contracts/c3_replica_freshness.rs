@@ -1,3 +1,4 @@
+//! Stub summary for c3_replica_freshness.rs.
 // Contract C3: Startup/Periodic Freshness Gates
 //
 // Decision 0003 §C3 verdict: already upheld at HEAD.
@@ -7,6 +8,7 @@
 
 use crate::common;
 
+/// TODO: Document c3_replica_freshness_requires_all_peer_coverage_per_tenant_round.
 #[tokio::test]
 async fn c3_replica_freshness_requires_all_peer_coverage_per_tenant_round() {
     let (addr_a, _tmp_a) = common::spawn_server_with_internal("c3-node-a").await;

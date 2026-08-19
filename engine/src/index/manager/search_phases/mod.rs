@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/manager/search_phases/mod.rs.
 use super::*;
 use crate::index::FacetCacheKey;
 
@@ -67,6 +68,7 @@ impl super::IndexManager {
     }
 }
 
+/// TODO: Document preprocess_query.
 pub(super) fn preprocess_query(
     tenant_id: &str,
     settings: &Option<Arc<IndexSettings>>,
@@ -296,6 +298,7 @@ pub(super) fn prepare_search_filters(
     })
 }
 
+/// TODO: Document execute_search_query.
 pub(super) fn execute_search_query(
     manager: &super::IndexManager,
     tenant_id: &str,
@@ -397,6 +400,7 @@ struct RuleEffectsResult {
     rendering_content: Option<serde_json::Value>,
 }
 
+/// TODO: Document lookup_cached_facets.
 fn lookup_cached_facets(
     manager: &super::IndexManager,
     tenant_id: &str,
@@ -544,6 +548,7 @@ fn facet_cache_supports_options(opts: &SearchOptions<'_>) -> bool {
         && !all_query_words_optional
 }
 
+/// TODO: Document sort_with_stage2_ranking.
 fn sort_with_stage2_ranking(
     all_results: &mut Vec<crate::types::ScoredDocument>,
     effective_sort: Option<&Sort>,
@@ -595,6 +600,7 @@ fn sort_with_stage2_ranking(
     );
 }
 
+/// TODO: Document apply_rule_effects.
 fn apply_rule_effects(
     all_results: Vec<crate::types::ScoredDocument>,
     total: usize,
@@ -642,6 +648,7 @@ fn apply_rule_effects(
     })
 }
 
+/// TODO: Document finalize_search_result.
 fn finalize_search_result(
     prepared: &PreparedSearchFilters,
     mut ruled_result: RuleEffectsResult,
@@ -857,6 +864,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// TODO: Document lookup_cached_facets_returns_cached_hit_with_computed_key.
     #[tokio::test]
     async fn lookup_cached_facets_returns_cached_hit_with_computed_key() {
         let temp_dir = TempDir::new().unwrap();
@@ -925,6 +933,7 @@ mod tests {
         assert!(exhaustive);
     }
 
+    /// TODO: Document lookup_cached_facets_separates_geo_rule_constraints.
     #[tokio::test]
     async fn lookup_cached_facets_separates_geo_rule_constraints() {
         let temp_dir = TempDir::new().unwrap();

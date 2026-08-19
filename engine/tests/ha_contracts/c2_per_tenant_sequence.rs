@@ -1,3 +1,4 @@
+//! Stub summary for c2_per_tenant_sequence.rs.
 // Contract C2: Per-Tenant Sequence Continuity
 //
 // Decision 0003 §C2: "Each tenant's oplog maintains a monotonically increasing
@@ -16,6 +17,7 @@ use flapjack::types::Document;
 use flapjack::IndexManager;
 use tempfile::TempDir;
 
+/// TODO: Document sequence_numbers_are_monotonically_increasing.
 #[tokio::test]
 async fn sequence_numbers_are_monotonically_increasing() {
     let temp_dir = TempDir::new().unwrap();
@@ -54,6 +56,7 @@ async fn sequence_numbers_are_monotonically_increasing() {
     }
 }
 
+/// TODO: Document read_since_returns_only_entries_after_boundary.
 #[tokio::test]
 async fn read_since_returns_only_entries_after_boundary() {
     let temp_dir = TempDir::new().unwrap();
@@ -93,6 +96,7 @@ async fn read_since_returns_only_entries_after_boundary() {
     }
 }
 
+/// TODO: Document committed_seq_persists_across_manager_instances.
 #[tokio::test]
 async fn committed_seq_persists_across_manager_instances() {
     let temp_dir = TempDir::new().unwrap();

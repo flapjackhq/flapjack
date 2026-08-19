@@ -1,6 +1,8 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/spool_support.rs.
 use super::*;
 use crate::handlers::migration::AsyncMigrationSourceProvider;
 
+/// TODO: Document public_view.
 pub(super) fn public_view(manifest: &SpoolManifest) -> PublicExportView {
     let progress = artifact_progress(manifest);
     let completed = progress.completed;
@@ -146,6 +148,7 @@ pub(super) fn hex_digest(bytes: &[u8]) -> String {
 }
 
 impl SpoolStore {
+    /// TODO: Document SpoolStore.build_accepted_reader.
     pub(super) fn build_accepted_reader(
         &self,
         job_uuid: Uuid,
@@ -203,6 +206,7 @@ impl SpoolStore {
         Ok(source_names.into_iter().collect())
     }
 
+    /// TODO: Document SpoolStore.validate_artifact_limits.
     pub(super) fn validate_artifact_limits(
         &self,
         manifest: &SpoolManifest,
@@ -241,6 +245,7 @@ impl SpoolStore {
         Ok(())
     }
 
+    /// TODO: Document SpoolStore.write_and_publish_artifact.
     pub(super) fn write_and_publish_artifact(
         &self,
         job_uuid: Uuid,
@@ -258,6 +263,7 @@ impl SpoolStore {
         sync_dir(&job_dir)
     }
 
+    /// TODO: Document SpoolStore.recover_artifacts.
     pub(super) fn recover_artifacts(
         &self,
         job_uuid: Uuid,
@@ -285,6 +291,7 @@ impl SpoolStore {
         Ok(())
     }
 
+    /// TODO: Document SpoolStore.recover_resource_sidecar.
     pub(super) fn recover_resource_sidecar(
         &self,
         job_uuid: Uuid,
@@ -409,6 +416,7 @@ impl SpoolStore {
         write_atomic(&self.job_dir(manifest.job_uuid), MANIFEST_FILE, &bytes)
     }
 
+    /// TODO: Document SpoolStore.commit_migration_phase.
     pub(super) fn commit_migration_phase(&self, record: &MigrationPhaseRecord) -> SpoolResult<()> {
         #[cfg(test)]
         {
@@ -473,6 +481,7 @@ impl SpoolStore {
         Ok(())
     }
 
+    /// TODO: Document SpoolStore.refresh_migration_export_progress.
     pub(super) fn refresh_migration_export_progress(
         &self,
         manifest: &SpoolManifest,
@@ -671,6 +680,7 @@ impl SpoolStore {
         Ok(items)
     }
 
+    /// TODO: Document SpoolStore.read_artifact_value.
     fn read_artifact_value(
         &self,
         job_uuid: Uuid,

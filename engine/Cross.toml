@@ -5,12 +5,12 @@
 # workflow-exported `FLAPJACK_BUILD_REVISION` is dropped at the container
 # boundary and the compiled binary reports an unknown revision.
 #
-# Only the external `FLAPJACK_BUILD_REVISION` is passed through: `build.rs`
-# reads it via `revision_override()` and emits the internal
-# `FLAPJACK_INTERNAL_BUILD_REVISION` itself, so that internal name is never
-# consumed from the container environment and must not be listed here.
+# The external build revision and release asset requirement must cross the
+# container boundary. `build.rs` emits `FLAPJACK_INTERNAL_BUILD_REVISION`
+# itself, so that internal name is never consumed from the container
+# environment and must not be listed here.
 #
 # Drift guard: engine/tests/test_release_workflow_structure.sh
 # ("Release build identity packaging" section).
 [build.env]
-passthrough = ["FLAPJACK_BUILD_REVISION"]
+passthrough = ["FLAPJACK_BUILD_REVISION", "FLAPJACK_REQUIRE_DASHBOARD"]

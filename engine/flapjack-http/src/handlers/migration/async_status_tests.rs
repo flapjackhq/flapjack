@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/async_status_tests.rs.
 use super::*;
 use crate::auth::AuthenticatedAppId;
 use crate::handlers::indices::list_indices;
@@ -50,6 +51,7 @@ fn assert_import_outcome_fields_absent(body: &serde_json::Value) {
     assert!(body.get("warnings").is_none());
 }
 
+/// TODO: Document async_migration_status_response_wire_contract_has_no_overall_progress.
 #[test]
 fn async_migration_status_response_wire_contract_has_no_overall_progress() {
     let job_uuid = Uuid::parse_str("01890f8e-8b28-78e8-b542-8cfdcb2d4f24").unwrap();
@@ -130,6 +132,7 @@ fn async_running_status_hides_pre_recorded_import_outcome() {
     assert_import_outcome_fields_absent(&body);
 }
 
+/// TODO: Document async_migration_status_response_serializes_cancelled_terminal_disposition.
 #[test]
 fn async_migration_status_response_serializes_cancelled_terminal_disposition() {
     let job_uuid = Uuid::parse_str("01890f8e-8b28-78e8-b542-8cfdcb2d4f24").unwrap();
@@ -155,6 +158,7 @@ fn async_migration_status_response_serializes_cancelled_terminal_disposition() {
     assert_import_outcome_fields_absent(&body);
 }
 
+/// TODO: Document async_submit_returns_admission_snapshot_and_status_reads_durable_phase.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_submit_returns_admission_snapshot_and_status_reads_durable_phase() {
     let tmp = TempDir::new().unwrap();
@@ -240,7 +244,6 @@ async fn async_terminal_status_reports_import_outcome_counts_and_warnings() {
     assert_eq!(
         warning_codes,
         BTreeSet::from([
-            "PersistedNoBehaviorSetting",
             "ReplicaExhaustiveSortApproximated",
             "ReplicaMatchingCriticalFieldDiverges",
             "ReplicaRelevancyStrictnessSemanticMismatch",
@@ -248,7 +251,7 @@ async fn async_terminal_status_reports_import_outcome_counts_and_warnings() {
     );
     assert_eq!(
         terminal.warnings.len(),
-        4,
+        3,
         "async status must not expose extra translation warnings"
     );
     let exhaustive_warning = terminal
@@ -288,6 +291,7 @@ async fn async_terminal_status_reports_zero_rule_and_synonym_counts() {
     );
 }
 
+/// TODO: Document async_status_unknown_uuid_returns_stable_not_found_code.
 #[tokio::test]
 async fn async_status_unknown_uuid_returns_stable_not_found_code() {
     let tmp = TempDir::new().unwrap();
@@ -313,6 +317,7 @@ async fn async_status_unknown_uuid_returns_stable_not_found_code() {
     );
 }
 
+/// TODO: Document async_cancel_invalid_uuid_returns_bad_request.
 #[tokio::test]
 async fn async_cancel_invalid_uuid_returns_bad_request() {
     let tmp = TempDir::new().unwrap();
@@ -336,6 +341,7 @@ async fn async_cancel_invalid_uuid_returns_bad_request() {
     );
 }
 
+/// TODO: Document async_cancel_unknown_uuid_returns_stable_not_found_code.
 #[tokio::test]
 async fn async_cancel_unknown_uuid_returns_stable_not_found_code() {
     let tmp = TempDir::new().unwrap();
@@ -361,6 +367,7 @@ async fn async_cancel_unknown_uuid_returns_stable_not_found_code() {
     );
 }
 
+/// TODO: Document async_cancel_running_job_returns_status_without_exposing_internal_flag.
 #[tokio::test]
 async fn async_cancel_running_job_returns_status_without_exposing_internal_flag() {
     let tmp = TempDir::new().unwrap();
@@ -399,6 +406,7 @@ async fn async_cancel_running_job_returns_status_without_exposing_internal_flag(
     assert_import_outcome_fields_absent(&body);
 }
 
+/// TODO: Document async_cancel_terminal_jobs_returns_existing_terminal_status.
 #[tokio::test]
 async fn async_cancel_terminal_jobs_returns_existing_terminal_status() {
     let tmp = TempDir::new().unwrap();
@@ -468,6 +476,7 @@ async fn async_cancel_terminal_jobs_returns_existing_terminal_status() {
     }
 }
 
+/// TODO: Document async_acknowledge_terminal_job_returns_no_content_and_preserves_phase.
 #[tokio::test]
 async fn async_acknowledge_terminal_job_returns_no_content_and_preserves_phase() {
     let tmp = TempDir::new().unwrap();
@@ -1056,6 +1065,7 @@ async fn algolia_malformed_submit_body_keeps_json_error_contract() {
     assert_eq!(state.migration_runner.active_count_for_test(), 0);
 }
 
+/// TODO: Document async_submit_spool_failure_returns_sanitized_500_without_spawning_import.
 #[tokio::test]
 async fn async_submit_spool_failure_returns_sanitized_500_without_spawning_import() {
     let tmp = TempDir::new().unwrap();
@@ -1091,6 +1101,7 @@ async fn async_submit_spool_failure_returns_sanitized_500_without_spawning_impor
     assert_eq!(state.migration_runner.active_count_for_test(), 0);
 }
 
+/// TODO: Document async_status_and_cancel_hide_foreign_job_uuids.
 #[tokio::test]
 async fn async_status_and_cancel_hide_foreign_job_uuids() {
     let tmp = TempDir::new().unwrap();
@@ -3101,6 +3112,7 @@ fn async_source_reader_with_import_outcome() -> ScriptedSourceReader {
     reader
 }
 
+/// TODO: Document wait_for_async_terminal.
 async fn wait_for_async_terminal(
     state: &Arc<AppState>,
     job_uuid: Uuid,

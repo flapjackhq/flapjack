@@ -1,3 +1,4 @@
+//! Stub summary for query_suggestions.rs.
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -54,6 +55,12 @@ fn validate_qs_config(config: &QsConfig) -> Result<(), String> {
     validate_qs_index_name(&config.index_name)?;
     for source in &config.source_indices {
         validate_qs_index_name(&source.index_name)?;
+        if source.index_name == config.index_name {
+            return Err(format!(
+                "source index '{}' must differ from the suggestions destination",
+                source.index_name
+            ));
+        }
     }
     Ok(())
 }
@@ -230,7 +237,15 @@ pub async fn delete_config(
         return invalid_input_response(message);
     }
 
-    match store(&state).delete_config(&index_name) {
+    let s = store(&state);
+    if s.config_exists(&index_name) && s.load_status(&index_name).is_running {
+        return json_error(
+            StatusCode::CONFLICT,
+            "A build is already in progress. Wait for it to finish before deleting.",
+        );
+    }
+
+    match s.delete_config(&index_name) {
         Ok(true) => mutation_success_response("Configuration was deleted with success."),
         Ok(false) => config_not_found_response(&index_name),
         Err(e) => store_error_response(e),
@@ -335,13 +350,18 @@ fn spawn_build(state: Arc<AppState>, config: QsConfig) {
         let engine = match analytics_engine {
             Some(e) => e,
             None => {
+                let message = "Build failed: analytics engine not initialized";
                 tracing::warn!(
                     "[query-suggestions] Build skipped for '{}': analytics engine not initialized",
                     config.index_name
                 );
-                let mut status = store.load_status(&config.index_name);
-                status.is_running = false;
-                store.save_status(&status).ok();
+                if let Err(error) = store.record_failed_build(&config.index_name, message) {
+                    tracing::error!(
+                        "[query-suggestions] Failed to persist terminal failure for '{}': {}",
+                        config.index_name,
+                        error
+                    );
+                }
                 return;
             }
         };
@@ -358,9 +378,15 @@ fn spawn_build(state: Arc<AppState>, config: QsConfig) {
                     config.index_name,
                     e
                 );
-                let mut status = store.load_status(&config.index_name);
-                status.is_running = false;
-                store.save_status(&status).ok();
+                if let Err(error) =
+                    store.record_failed_build(&config.index_name, &format!("Build failed: {e}"))
+                {
+                    tracing::error!(
+                        "[query-suggestions] Failed to persist terminal failure for '{}': {}",
+                        config.index_name,
+                        error
+                    );
+                }
             }
         }
     });

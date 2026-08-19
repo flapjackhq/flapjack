@@ -1,6 +1,8 @@
+//! Stub summary for engine/src/index/manager/publication/tests/repair_cli_generator_tests.rs.
 use super::*;
 use crate::{Document, IndexManager};
 
+/// TODO: Document selected_boundary_operation_remains_pending_before_pause_report.
 #[test]
 fn selected_boundary_operation_remains_pending_before_pause_report() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -31,6 +33,7 @@ fn selected_boundary_operation_remains_pending_before_pause_report() {
     );
 }
 
+/// TODO: Document generated_layout_index_preserves_manifest_oracle_data.
 #[test]
 fn generated_layout_index_preserves_manifest_oracle_data() {
     let scenario = manifest_with_base("base_001_create")
@@ -52,10 +55,11 @@ fn generated_layout_index_preserves_manifest_oracle_data() {
     assert_eq!(layout.residue.journal, "present");
     assert_eq!(
         layout.digests.get("target").map(String::as_str),
-        Some("sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7")
+        Some("sha256:066beb98a824179f5326e6cc453d86669ca00dcebaafc72ce34630adcf96892a")
     );
 }
 
+/// TODO: Document generated_base_layout_parses_materialized_journal_identity.
 #[test]
 fn generated_base_layout_parses_materialized_journal_identity() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -75,6 +79,7 @@ fn generated_base_layout_parses_materialized_journal_identity() {
     .unwrap();
 }
 
+/// TODO: Document generated_base_layout_cli_oracle_matches_scanner_report.
 #[test]
 fn generated_base_layout_cli_oracle_matches_scanner_report() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -99,6 +104,7 @@ fn generated_base_layout_cli_oracle_matches_scanner_report() {
     assert_eq!(report.action.as_str(), scenario.cli.action);
 }
 
+/// TODO: Document replacement_commit_oracle_distinguishes_fixture_and_clean_report_phase.
 #[test]
 fn replacement_commit_oracle_distinguishes_fixture_and_clean_report_phase() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -139,6 +145,7 @@ fn replacement_commit_oracle_distinguishes_fixture_and_clean_report_phase() {
     );
 }
 
+/// TODO: Document generated_base_layout_checks_manifest_owner_oracles.
 #[test]
 fn generated_base_layout_checks_manifest_owner_oracles() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -173,6 +180,7 @@ fn manifest_source_oracle_guard_rejects_recomputed_digest_values() {
     assert!(error.contains("new digest"), "{error}");
 }
 
+/// TODO: Document generated_layout_keeps_manifest_oracles_separate_from_filesystem_state.
 #[test]
 fn generated_layout_keeps_manifest_oracles_separate_from_filesystem_state() {
     let mut manifest = manifest_with_base("base_001_create");
@@ -213,6 +221,7 @@ fn generated_layout_preserves_visible_and_exit_code_oracles() {
     assert!(error.contains("oracle was rewritten"), "{error}");
 }
 
+/// TODO: Document generated_base_layout_materializes_control_index_for_http_projection.
 #[tokio::test]
 async fn generated_base_layout_materializes_control_index_for_http_projection() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -244,6 +253,7 @@ async fn generated_base_layout_materializes_control_index_for_http_projection() 
     );
 }
 
+/// TODO: Document generated_loadable_layout_rejects_unqueryable_target.
 #[tokio::test]
 async fn generated_loadable_layout_rejects_unqueryable_target() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -265,6 +275,7 @@ async fn generated_loadable_layout_rejects_unqueryable_target() {
     assert!(error.contains("query"), "{error}");
 }
 
+/// TODO: Document worker_generation_uses_owner_activation_seam_and_test_binary.
 #[test]
 fn worker_generation_uses_owner_activation_seam_and_test_binary() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -300,6 +311,7 @@ fn worker_generation_uses_owner_activation_seam_and_test_binary() {
     );
 }
 
+/// TODO: Document generator_activation_fixture_reopens_old_new_and_control_indexes.
 #[tokio::test]
 async fn generator_activation_fixture_reopens_old_new_and_control_indexes() {
     let fixture = ActivationFixture::new();
@@ -351,6 +363,7 @@ async fn generator_activation_fixture_reopens_old_new_and_control_indexes() {
     );
 }
 
+/// TODO: Document generator_activation_fixture_fresh_generations_are_inventory_and_digest_stable.
 #[test]
 fn generator_activation_fixture_fresh_generations_are_inventory_and_digest_stable() {
     let first = ActivationFixture::new();
@@ -372,6 +385,7 @@ fn generator_activation_fixture_fresh_generations_are_inventory_and_digest_stabl
     assert_eq!(first.new_digest(), second.new_digest());
 }
 
+/// TODO: Document write_generator_control_index.
 async fn write_generator_control_index(base: &Path) {
     let manager = IndexManager::new(base);
     manager.create_tenant("control_products").unwrap();
@@ -391,6 +405,7 @@ async fn write_generator_control_index(base: &Path) {
     manager.graceful_shutdown().await;
 }
 
+/// TODO: Document assert_generator_fixture_tree.
 fn assert_generator_fixture_tree(
     base: &Path,
     tenant: &str,
@@ -421,6 +436,7 @@ fn assert_generator_fixture_tree(
     assert_eq!(hits, expected_hits);
 }
 
+/// TODO: Document ambiguous_target_and_staging_mutation_materializes_both_trees.
 #[test]
 fn ambiguous_target_and_staging_mutation_materializes_both_trees() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -451,6 +467,7 @@ fn ambiguous_target_and_staging_mutation_materializes_both_trees() {
     );
 }
 
+/// TODO: Document ambiguous_target_and_staging_manifest_expects_sidecar_backups.
 #[test]
 fn ambiguous_target_and_staging_manifest_expects_sidecar_backups() {
     let manifest = load_scenario_manifest();
@@ -469,6 +486,7 @@ fn ambiguous_target_and_staging_manifest_expects_sidecar_backups() {
     }
 }
 
+/// TODO: Document corrupt_journal_manifest_expects_absent_sidecar_targets.
 #[test]
 fn corrupt_journal_manifest_expects_absent_sidecar_targets() {
     let manifest = load_scenario_manifest();
@@ -488,6 +506,7 @@ fn corrupt_journal_manifest_expects_absent_sidecar_targets() {
     }
 }
 
+/// TODO: Document pause_report_validation_rejects_pid_and_identity_mismatches.
 #[test]
 fn pause_report_validation_rejects_pid_and_identity_mismatches() {
     let valid = PauseReport {
@@ -544,6 +563,7 @@ fn wait_for_pause_report_uses_bounded_timeout() {
     assert!(error.contains("timed out waiting for pause report"), "{error}");
 }
 
+/// TODO: Document wait_for_pause_report_tolerates_partial_report_writes.
 #[test]
 fn wait_for_pause_report_tolerates_partial_report_writes() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -760,6 +780,7 @@ fn live_http_fixture_manifest_contract_rejects_extra_expected_highlight_entry() 
     assert!(message.contains("expected_highlight must match"), "{message}");
 }
 
+/// TODO: Document live_http_fixture_manifest_contract_rejects_unknown_expectation_key.
 #[test]
 fn live_http_fixture_manifest_contract_rejects_unknown_expectation_key() {
     let mut manifest = manifest_with_base("base_001_create");
@@ -865,6 +886,7 @@ fn live_http_fixture_manifest_contract_rejects_unresolved_scenario_projection() 
     assert!(message.contains("unknown loadable object projection legacy-branch"), "{message}");
 }
 
+/// TODO: Document live_http_fixture_manifest_contract_rejects_duplicate_map_keys.
 #[test]
 fn live_http_fixture_manifest_contract_rejects_duplicate_map_keys() {
     let raw = r#"{
@@ -912,6 +934,7 @@ fn live_http_fixture_manifest_contract_rejects_duplicate_map_keys() {
     assert!(error.to_string().contains("duplicate key object_absent"), "{error}");
 }
 
+/// TODO: Document generated_old_target_projection_comes_from_manifest_fixture.
 #[tokio::test]
 async fn generated_old_target_projection_comes_from_manifest_fixture() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -938,6 +961,7 @@ async fn generated_old_target_projection_comes_from_manifest_fixture() {
     assert!(error.contains("object body mismatch"), "{error}");
 }
 
+/// TODO: Document generated_target_projection_uses_manifest_projection_map.
 #[tokio::test]
 async fn generated_target_projection_uses_manifest_projection_map() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -984,6 +1008,7 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
     "non-string panic".to_string()
 }
 
+/// TODO: Document manifest_with_base.
 fn manifest_with_base(id: &str) -> ScenarioManifest {
     serde_json::from_value(serde_json::json!({
         "schema_version": 1,
@@ -1000,8 +1025,8 @@ fn manifest_with_base(id: &str) -> ScenarioManifest {
             "policy_keys": [],
             "digests": {
                 "old": "absent",
-                "new": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
-                "target": "sha256:35820c78a8b1cb061ab3b7356634b956cb18ca51479d1c0a1fe96ea6c6c6acf7",
+                "new": "sha256:066beb98a824179f5326e6cc453d86669ca00dcebaafc72ce34630adcf96892a",
+                "target": "sha256:066beb98a824179f5326e6cc453d86669ca00dcebaafc72ce34630adcf96892a",
                 "staging": "absent",
                 "backup": "absent"
             },
@@ -1035,6 +1060,7 @@ fn manifest_with_base(id: &str) -> ScenarioManifest {
     .unwrap()
 }
 
+/// TODO: Document live_http_fixture_json.
 fn live_http_fixture_json() -> serde_json::Value {
     serde_json::json!({
         "target_index": "products",

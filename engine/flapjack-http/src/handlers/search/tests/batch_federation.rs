@@ -1,3 +1,4 @@
+//! Stub summary for batch_federation.rs.
 use super::*;
 use serde::Deserialize;
 
@@ -8,6 +9,7 @@ struct BatchSearchRequestWithFederation {
     strategy: Option<String>,
     federation: Option<crate::federation::FederationConfig>,
 }
+/// TODO: Document batch_request_parses_federation_defaults_and_optional_presence.
 #[test]
 fn batch_request_parses_federation_defaults_and_optional_presence() {
     let with_federation: BatchSearchRequestWithFederation = serde_json::from_value(json!({
@@ -34,6 +36,7 @@ fn batch_request_parses_federation_defaults_and_optional_presence() {
         "federation should be None when omitted"
     );
 }
+/// TODO: Document batch_search_federation_two_indexes_returns_flat_hits_with_metadata.
 #[tokio::test]
 async fn batch_search_federation_two_indexes_returns_flat_hits_with_metadata() {
     let tmp = TempDir::new().unwrap();
@@ -92,6 +95,7 @@ async fn batch_search_federation_two_indexes_returns_flat_hits_with_metadata() {
         );
     }
 }
+/// TODO: Document batch_search_federation_weight_boosting_promotes_boosted_index_hits.
 #[tokio::test]
 async fn batch_search_federation_weight_boosting_promotes_boosted_index_hits() {
     let tmp = TempDir::new().unwrap();
@@ -139,6 +143,7 @@ async fn batch_search_federation_weight_boosting_promotes_boosted_index_hits() {
         "higher federationOptions.weight should promote boosted index results"
     );
 }
+/// TODO: Document batch_search_federation_pagination_uses_offset_limit_and_estimated_total_hits.
 #[tokio::test]
 async fn batch_search_federation_pagination_uses_offset_limit_and_estimated_total_hits() {
     let tmp = TempDir::new().unwrap();
@@ -194,6 +199,7 @@ async fn batch_search_federation_pagination_uses_offset_limit_and_estimated_tota
         "estimatedTotalHits should sum nbHits from each federated query result"
     );
 }
+/// TODO: Document batch_search_federation_ignores_per_query_page_and_hits_per_page.
 #[tokio::test]
 async fn batch_search_federation_ignores_per_query_page_and_hits_per_page() {
     let tmp = TempDir::new().unwrap();
@@ -239,6 +245,7 @@ async fn batch_search_federation_ignores_per_query_page_and_hits_per_page() {
         "federation must rank from each query's top hits, not the request's page window"
     );
 }
+/// TODO: Document batch_search_federation_ignores_per_query_response_fields.
 #[tokio::test]
 async fn batch_search_federation_ignores_per_query_response_fields() {
     let tmp = TempDir::new().unwrap();
@@ -280,6 +287,7 @@ async fn batch_search_federation_ignores_per_query_response_fields() {
         "federation must ignore per-query responseFields that would remove hits"
     );
 }
+/// TODO: Document batch_search_without_federation_keeps_legacy_results_shape.
 #[tokio::test]
 async fn batch_search_without_federation_keeps_legacy_results_shape() {
     let tmp = TempDir::new().unwrap();
@@ -309,6 +317,7 @@ async fn batch_search_without_federation_keeps_legacy_results_shape() {
         "non-federated batch response must remain results[]-based"
     );
 }
+/// TODO: Document batch_search_rejects_federation_with_stop_if_enough_matches_strategy.
 #[tokio::test]
 async fn batch_search_rejects_federation_with_stop_if_enough_matches_strategy() {
     let tmp = TempDir::new().unwrap();
@@ -340,6 +349,7 @@ async fn batch_search_rejects_federation_with_stop_if_enough_matches_strategy() 
         "unexpected error: {body}"
     );
 }
+/// TODO: Document batch_search_rejects_federation_with_type_facet_queries.
 #[tokio::test]
 async fn batch_search_rejects_federation_with_type_facet_queries() {
     let tmp = TempDir::new().unwrap();
@@ -375,6 +385,7 @@ async fn batch_search_rejects_federation_with_type_facet_queries() {
         "unexpected error: {body}"
     );
 }
+/// TODO: Document batch_search_rejects_federation_merge_facets_until_supported.
 #[tokio::test]
 async fn batch_search_rejects_federation_merge_facets_until_supported() {
     let tmp = TempDir::new().unwrap();
@@ -430,6 +441,7 @@ async fn batch_search_rejects_federation_merge_facets_until_supported() {
         "non-federated facet queries must still return facetHits under results[]"
     );
 }
+/// TODO: Document batch_search_federation_still_enforces_per_query_index_permissions.
 #[tokio::test]
 async fn batch_search_federation_still_enforces_per_query_index_permissions() {
     let tmp = TempDir::new().unwrap();

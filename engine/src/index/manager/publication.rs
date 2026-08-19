@@ -1,3 +1,5 @@
+//! Stub summary for engine/src/index/manager/publication.rs.
+
 use crate::error::{FlapjackError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -154,6 +156,7 @@ pub fn is_reserved_publication_namespace(path: &Path) -> bool {
     first_component == PUBLICATION_DIR || first_component == QUARANTINE_DIR
 }
 
+/// TODO: Document first_safe_relative_component.
 fn first_safe_relative_component(path: &Path) -> Option<&std::ffi::OsStr> {
     if path.as_os_str().is_empty() || path.is_absolute() {
         return None;
@@ -881,6 +884,7 @@ pub fn classify_external_relative_path(
     }
 }
 
+/// TODO: Document RawJournal.
 #[derive(Deserialize)]
 struct RawJournal {
     schema_version: u32,
@@ -970,6 +974,7 @@ struct RawTransition {
     recorded_at: Option<String>,
 }
 
+/// TODO: Document validate_raw_transitions.
 fn validate_raw_transitions(
     raw: Vec<RawTransition>,
     phase: PublicationPhase,
@@ -1032,6 +1037,7 @@ fn parse_disposition(value: &str) -> Result<PublicationDisposition> {
     }
 }
 
+/// TODO: Document validate_phase_disposition.
 fn validate_phase_disposition(
     phase: PublicationPhase,
     disposition: Option<PublicationDisposition>,
@@ -1061,6 +1067,7 @@ fn validate_phase_disposition(
     }
 }
 
+/// TODO: Document validate_opaque_component.
 pub(super) fn validate_opaque_component(label: &str, value: &str) -> Result<()> {
     if value.is_empty()
         || value == "."
@@ -1085,6 +1092,7 @@ pub(super) fn validate_opaque_component(label: &str, value: &str) -> Result<()> 
     Ok(())
 }
 
+/// TODO: Document validate_relative_path.
 pub(super) fn validate_relative_path(label: &str, path: &Path) -> Result<()> {
     if path.as_os_str().is_empty() || path.is_absolute() {
         return Err(invalid_publication(format!("{label} must be relative")));
@@ -1117,6 +1125,7 @@ fn path_evidence(
     })
 }
 
+/// TODO: Document relative_path_evidence.
 pub(super) fn relative_path_evidence(
     target: &PublicationTarget,
     transaction: &PublicationTransactionId,

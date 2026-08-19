@@ -3,6 +3,9 @@
 import { useQuery } from '@tanstack/react-query';
 import api from '@/lib/api';
 
+/**
+ * TODO: Document HealthDetail.
+ */
 export interface HealthDetail {
   status: string;
   active_writers: number;
@@ -52,6 +55,9 @@ function normalizeHealthDetail(data: HealthDetailResponse): HealthDetail {
   };
 }
 
+/**
+ * TODO: Document useHealthDetail.
+ */
 export function useHealthDetail() {
   return useQuery<HealthDetail>({
     queryKey: HEALTH_DETAIL_QUERY_KEY,

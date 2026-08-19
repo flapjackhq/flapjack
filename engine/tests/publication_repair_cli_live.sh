@@ -69,6 +69,7 @@ evidence_command() {
     "$CURRENT_CASE_ID" "$cleanup_outcome"
 }
 
+# TODO: Document cleanup.
 cleanup() {
   local original_status=$?
   local final_status="$original_status"
@@ -109,6 +110,7 @@ trap 'handle_signal INT 2' INT
 trap 'handle_signal TERM 15' TERM
 trap 'handle_signal HUP 1' HUP
 
+# TODO: Document parse_args.
 parse_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -145,6 +147,7 @@ parse_args() {
   [ -n "$ARTIFACT_ARG" ] || die "--artifact-dir is required"
 }
 
+# TODO: Document require_tools.
 require_tools() {
   local missing=0
   local tool
@@ -173,6 +176,7 @@ print(pathlib.Path(sys.argv[1]).resolve(strict=True))
 PY
 }
 
+# TODO: Document validate_paths.
 validate_paths() {
   [[ "$BINARY_ARG" = /* ]] || die "binary must be an absolute path"
   [[ "$MANIFEST_ARG" = /* ]] || die "manifest must be an absolute path"
@@ -283,6 +287,7 @@ write_helper() {
   cp "$HELPER_SOURCE" "$HELPER"
 }
 
+# TODO: Document assert_build_info_json.
 assert_build_info_json() {
   local path="$1"
   local revision="$2"
@@ -361,6 +366,7 @@ run_generator() {
     >"$ARTIFACT_DIR/.runner/scenario_ids.txt"
 }
 
+# TODO: Document invoke_cli.
 invoke_cli() {
   local case_root="$1"
   local target="$2"
@@ -404,6 +410,7 @@ server_output_path() {
   printf '%s\n' "$ARTIFACT_DIR/.runner/${ident}.${label}.server"
 }
 
+# TODO: Document wait_for_startup_bind_addr.
 wait_for_startup_bind_addr() {
   local ident="$1"
   local timeout_secs="$2"
@@ -434,6 +441,7 @@ wait_for_startup_bind_addr() {
   done
 }
 
+# TODO: Document wait_for_health.
 wait_for_health() {
   local ident="$1"
   local bind_addr="$2"
@@ -467,6 +475,7 @@ wait_for_health() {
   done
 }
 
+# TODO: Document start_server.
 start_server() {
   local case_root="$1"
   local ident="$2"
@@ -505,6 +514,7 @@ server_process_group_alive() {
   fi
 }
 
+# TODO: Document send_server_signal.
 send_server_signal() {
   local signal="$1"
   local pid="$2"
@@ -569,6 +579,7 @@ clear_server_state() {
   SERVER_STDERR_PATH=""
 }
 
+# TODO: Document stop_server.
 stop_server() {
   local pid="${CHILD_PID:-}"
 
@@ -658,6 +669,7 @@ else:
 PY
 }
 
+# TODO: Document run_case.
 run_case() {
   local ident="$1"
   CURRENT_CASE_ID="$ident"
@@ -724,6 +736,7 @@ run_contract() {
   printf 'PASS: publication repair CLI live contract passed\n'
 }
 
+# TODO: Document main.
 main() {
   FAILURE_PHASE="argument_validation"
   parse_args "$@"

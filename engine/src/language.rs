@@ -1,3 +1,4 @@
+//! Stub summary for language.rs.
 use std::fmt;
 use std::str::FromStr;
 
@@ -168,6 +169,7 @@ impl fmt::Display for LanguageCode {
 impl FromStr for LanguageCode {
     type Err = UnknownLanguageCode;
 
+    /// TODO: Document LanguageCode.from_str.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let lower = s.to_lowercase();
         match lower.as_str() {

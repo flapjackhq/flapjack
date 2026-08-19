@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/translation_schema.rs.
 use super::{hard_entry, ReportCode, ReportResource, TranslationReportEntry};
 use super::{
     resolve_rule_schema, resolve_source_field, resolve_source_schema, Disposition, ResourceKind,
@@ -15,6 +16,7 @@ pub(super) fn validate_rule_page(
     }
 }
 
+/// TODO: Document validate_rule_payload.
 fn validate_rule_payload(
     rule: &Value,
     page_index: usize,
@@ -74,6 +76,7 @@ fn validate_rule_payload(
     }
 }
 
+/// TODO: Document validate_consequence_schema.
 fn validate_consequence_schema(
     consequence: &Value,
     page_index: usize,
@@ -116,6 +119,7 @@ fn validate_consequence_schema(
     }
 }
 
+/// TODO: Document validate_consequence_params_schema.
 fn validate_consequence_params_schema(
     params: &Value,
     page_index: usize,
@@ -181,6 +185,7 @@ fn validate_consequence_params_schema(
     }
 }
 
+/// TODO: Document validate_rule_schema_array.
 fn validate_rule_schema_array(
     values: Option<&Value>,
     path: RuleSchemaPath,
@@ -204,6 +209,7 @@ fn validate_rule_schema_array(
     }
 }
 
+/// TODO: Document validate_rule_schema_value.
 fn validate_rule_schema_value(
     path: RuleSchemaPath,
     value: &Value,
@@ -224,6 +230,7 @@ fn validate_rule_schema_value(
     }
 }
 
+/// TODO: Document validate_synonym_page.
 pub(super) fn validate_synonym_page(
     page_index: usize,
     page: &[Value],

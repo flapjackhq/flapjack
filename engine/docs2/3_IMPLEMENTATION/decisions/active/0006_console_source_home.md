@@ -31,11 +31,13 @@ argued both sides; the operator decided 2026-07-18.
 ## Decision
 
 The shared console source lives in this repo, flapjack_dev (working target `engine/console/`;
-exact layout finalized at the plan's P3 extraction phase). The cloud platform consumes a pinned
-Flapjack revision (a 40-hex SHA lock file in its own web tree, fetched by its own CI/deploy).
-Flapjack's release keeps building its entire product — engine and console — from its own tree;
-no cross-repo fetch ever enters the OSS release path. The console is MIT like the rest of this
-repo. Strategic framing is OSS-primary.
+exact layout finalized at the plan's P3 extraction phase). The selected cloud consumption
+mechanism is an exact Flapjack revision carried by an additive, non-editable vendor snapshot plus a
+lock and staleness check; no public build-time fetch or delete-capable sync enters the cloud build.
+Flapjack's release keeps building its entire product — engine and console — from its own tree, so
+no cross-repo fetch enters the OSS release path. The console follows the repository's root license
+map: currently Elastic License 2.0, while the SDK and integration exceptions remain owned by
+`NOTICE` and their path-specific licenses. Strategic framing is OSS-primary.
 
 ## Rationale
 
@@ -47,10 +49,10 @@ repo. Strategic framing is OSS-primary.
    a derived, regenerable sync artifact whose entire history was scheduled for deletion and
    recreation at decision time. `flapjackhq/flapjack` has external consumers and releases; its
    history stability is a product requirement. An immutable-SHA pin belongs on the stable repo.
-3. **Self-containment and licensing.** `git clone` + build keeps producing the whole MIT product
-   from one repo. The alternative required granting MIT to a subtree of an unlicensed
-   all-rights-reserved repo and made OSS builds depend on it — a flag for any downstream
-   due-diligence scan.
+3. **Self-containment and licensing.** `git clone` + build keeps producing the engine and console
+   from one repository under its root license map. The alternative required a separately licensed
+   subtree in an otherwise unlicensed cloud repository and made OSS builds depend on it — a flag
+   for any downstream due-diligence scan.
 4. **Ownership follows the stake.** After cutover the console is 100% of Flapjack's UI versus a
    minority of the cloud app's routes, and effort allocation is OSS-primary.
 
@@ -72,12 +74,33 @@ The extraction refactor cost is identical under either home (measured 2026-07-18
   in the plan's R4/R5 include the fail-closed embedded-asset gate (a release build must fail, not
   embed a stub, when real dashboard assets are absent) and the SPA fallback fix for client routes
   containing dots (legal in index names) in `engine/flapjack-http/src/handlers/dashboard.rs`.
-- The cloud repo carries the pin and its bump runbook; its rollback is reverting the pin.
+- The cloud repo will carry the lock, additive vendor snapshot, staleness check, and bump runbook;
+  its rollback will revert the lock and snapshot together.
 
 ## References
 
 - Program plan (SSOT for the program): fjcloud_dev `docs/design/console_unification_revised_plan.md`
   (v7, 2026-07-18) — its "Operator decisions — SETTLED" section records the companion answers
-  (MIT license, OSS-primary framing, mirror-state disposition) and its amended R2 mirrors this ADR.
+  (root license map, OSS-primary framing, mirror-state disposition) and its amended R2 mirrors this
+  ADR.
 - The pro/contra decision docs that argued both sides were retired 2026-07-18 and are preserved in
   fjcloud_dev git history.
+
+## R2 re-derivation (2026-08-08)
+
+R2 RE-DERIVATION VERDICT: KEEP FLAPJACK AS THE ONLY EDITABLE CONSOLE SOURCE HOME.
+
+Current evidence re-measured all four rationale headings: 0 were falsified, 4 remain supported,
+and 0 were unmeasured, so the declared threshold of at least two falsifications was not met.
+Dependency-direction wording is narrowed to the OSS build/release path: later Flapjack operational
+tests may read a fjcloud checkout, but no fjcloud source fetch enters the Flapjack product build or
+release. The licensing premise is corrected: commit f8e00a8a5 relicensed the engine and dashboard
+to Elastic License 2.0; the rationale that survives is single-repository self-containment and
+license ownership, not the obsolete claim that the whole product is MIT.
+
+Consumption mechanism remains owned by fjcloud's console-unification R2. At re-derivation time,
+the public pinned fetch was INADMISSIBLE: the prod manifest was 494 commits (148 first-parent
+commits) behind live flapjack origin/main, and the prod workflow contract recognized 0/8 required
+export slots. R2's selected fallback is an additive, non-editable vendor snapshot at pin-bump time
+with a staleness check and no delete semantics. Flapjack remains the only editable source; no fork,
+second editable copy, or debbie cross-project export is authorized.

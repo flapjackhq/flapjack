@@ -443,6 +443,7 @@ cancel_delete_algolia_index() {
   algolia_vendor_wait_task "$index" "$task" "$LOG_DIR/cancel-delete-task-$(cancel_log_label "$index").json"
 }
 
+# TODO: Document cancel_sweep_candidates.
 cancel_sweep_candidates() {
   local listing="$1" now
   now="$(date +%s)"
@@ -473,6 +474,7 @@ cancel_record_swept_indices() {
   mv "$next" "$RECEIPT"
 }
 
+# TODO: Document cancel_preflight_sweep.
 cancel_preflight_sweep() {
   local listing="$1" disposition index swept=() skipped=()
   cancel_vendor_json read GET "/1/indexes" "" "$listing"
@@ -521,6 +523,7 @@ cancel_seed_source_index() {
     || die "cancel seeding task did not publish"
 }
 
+# TODO: Document cancel_assert_source_seeded.
 cancel_assert_source_seeded() {
   local observed out
   out="$LOG_DIR/cancel-source-count.json"
@@ -585,6 +588,7 @@ cleanup_async_scenario() {
   ASYNC_FIXTURE_CLEANED=1
 }
 
+# TODO: Document cleanup_cancel_algolia_indices.
 cleanup_cancel_algolia_indices() {
   local index failed=0 listing="$LOG_DIR/cancel-cleanup-indexes-before.json"
   local final_listing="$LOG_DIR/cancel-cleanup-indexes-after.json"
@@ -629,6 +633,7 @@ cancel_submit_migration() {
   printf '%s\n' "$job_id"
 }
 
+# TODO: Document cancel_wait_for_observed_job.
 cancel_wait_for_observed_job() {
   local barrier_dir="$1" expected_job="$2" label="$3" observed_file observed attempt=0
   observed_file="$barrier_dir/observed"
@@ -672,6 +677,7 @@ cancel_read_status() {
   printf '%s\n' "$out"
 }
 
+# TODO: Document cancel_poll_disposition.
 cancel_poll_disposition() {
   local job_id="$1" label="$2" expected="$3" status_file disposition attempt=0
   while [ "$attempt" -lt "$CANCEL_POLL_ATTEMPTS" ]; do
@@ -700,6 +706,7 @@ cancel_poll_disposition() {
   die "${label} job did not reach ${expected} within ${CANCEL_POLL_ATTEMPTS} polls"
 }
 
+# TODO: Document cancel_seed_preexisting_target.
 cancel_seed_preexisting_target() {
   local target="$1" sentinel_body code count snapshot_dir
   sentinel_body='{"objectID":"sentinel-object","sentinel":"preserve-me","count":1}'
@@ -724,6 +731,7 @@ cancel_seed_preexisting_target() {
   record_check "cancel_precommit_sentinel_seeded" "pass" "target=${target}; entries=1"
 }
 
+# TODO: Document cancel_assert_preexisting_target_unchanged.
 cancel_assert_preexisting_target_unchanged() {
   local target="$1" code count before_canonical after_canonical
   flapjack_request GET "$(encoded_index_path "$target")/sentinel-object" "" "$LOG_DIR/cancel-precommit-sentinel-after.raw" \
@@ -747,6 +755,7 @@ cancel_assert_preexisting_target_unchanged() {
   record_check "cancel_precommit_target_unchanged" "pass" "sentinel, listing, and directory snapshot unchanged"
 }
 
+# TODO: Document cancel_job_dir_is_terminal_cancel_metadata.
 cancel_job_dir_is_terminal_cancel_metadata() {
   local job_dir="$1" job_id="$2"
   [ "$(basename "$job_dir")" = "$job_id" ] || return 1
@@ -769,6 +778,7 @@ cancel_job_dir_is_terminal_cancel_metadata() {
   ' "$job_dir/manifest.json" >/dev/null
 }
 
+# TODO: Document cancel_assert_no_uncommitted_artifacts.
 cancel_assert_no_uncommitted_artifacts() {
   local target="$1" label="$2" allowed_job_id="${3:-}" jobs_dir publication job_dir
   jobs_dir="$DATA_DIR/migration_exports/jobs"
@@ -789,6 +799,7 @@ cancel_assert_no_uncommitted_artifacts() {
   record_check "${label}_artifact_cleanup" "pass" "no spool or publication staging residue"
 }
 
+# TODO: Document cancel_query_target_objects.
 cancel_query_target_objects() {
   local target="$1" label="$2" request cursor="" ids_file page_label ordinal=0 page_count fetched_count duplicate_count
   ids_file="$LOG_DIR/${label}.jsonl"
@@ -826,6 +837,7 @@ cancel_query_target_objects() {
   jq -S -s -c 'sort_by(.objectID)' "$ids_file"
 }
 
+# TODO: Document cancel_assert_postcommit_target_matches_source.
 cancel_assert_postcommit_target_matches_source() {
   local target="$1" observed expected count
   count="$(target_listing_count "$target" "cancel-postcommit-list-after")" \
@@ -852,6 +864,7 @@ cancel_record_arm_receipt() {
   mv "$next" "$RECEIPT"
 }
 
+# TODO: Document assert_cancel_scenario.
 assert_cancel_scenario() {
   local pre_status post_status code
   CANCEL_PRECOMMIT_TARGET="$TARGET_INDEX"
@@ -906,6 +919,7 @@ async_phase_rank() {
   return 1
 }
 
+# TODO: Document delete_replica_source_fixture_target.
 delete_replica_source_fixture_target() {
   local index_name="$1" label="$2" code payload task_id remaining=40 status
   source_algolia_request DELETE "$(source_algolia_index_path "$index_name")" "" "$LOG_DIR/replica-cleanup-${label}.raw" \
@@ -1070,6 +1084,7 @@ assert_async_job() {
   assert_async_target_activated
 }
 
+# TODO: Document cleanup_replica_source_fixture.
 cleanup_replica_source_fixture() {
   [ "$SCENARIO" = "replicas" ] || return 0
   [ "$REPLICA_SOURCE_FIXTURE_CLEANED" -eq 0 ] || return 0
@@ -1088,6 +1103,7 @@ cleanup_replica_source_fixture() {
   return 1
 }
 
+# TODO: Document assert_unavailable.
 assert_unavailable() {
   local body code payload target_count
   body="$(migration_payload)"
@@ -1128,6 +1144,7 @@ capture_target_absence() {
   record_check "$check_name" "pass" "target not listed"
 }
 
+# TODO: Document assert_importing.
 assert_importing() {
   local body code payload imported matches
   body="$(migration_payload)"
@@ -1168,6 +1185,7 @@ assert_importing() {
   fi
 }
 
+# TODO: Document assert_verified_import.
 assert_verified_import() {
   local imported="$1" source_count manifest_source_count synonym_count rule_count
   local request expected_first competitor hidden expected_rule

@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/server_shutdown_tests.rs.
 use super::{
     flush_then_wait_for_manager_shutdown, flush_then_wait_for_migration_and_manager_shutdown,
     full_graceful_shutdown, ShutdownWaitOutcome,
@@ -55,6 +56,7 @@ async fn shutdown_wait_helper_returns_timed_out_when_manager_exceeds_deadline() 
     );
 }
 
+/// TODO: Document shutdown_wait_helper_waits_for_migrations_and_manager_under_one_deadline.
 #[tokio::test]
 async fn shutdown_wait_helper_waits_for_migrations_and_manager_under_one_deadline() {
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -83,6 +85,7 @@ async fn shutdown_wait_helper_waits_for_migrations_and_manager_under_one_deadlin
     assert!(events.contains(&"manager-drained"));
 }
 
+/// TODO: Document shutdown_wait_helper_times_out_once_for_combined_migration_and_manager_work.
 #[tokio::test]
 async fn shutdown_wait_helper_times_out_once_for_combined_migration_and_manager_work() {
     let events = Arc::new(Mutex::new(Vec::new()));

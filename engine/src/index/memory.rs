@@ -147,6 +147,14 @@ impl MemoryBudget {
             .is_empty()
     }
 
+    #[cfg(test)]
+    pub(crate) fn writer_waiter_registration_count(&self) -> u64 {
+        self.writer_waiters
+            .lock()
+            .expect("writer waiter state poisoned")
+            .next_generation
+    }
+
     pub(crate) fn writer_waiter_handoff(&self) -> Option<WriterWaiterHandoff> {
         let state = self
             .writer_waiters

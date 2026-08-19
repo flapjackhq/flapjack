@@ -1,8 +1,8 @@
 /**
  * ESLint config for the browser test files under tests/e2e-ui/.
  *
- * Enforces the mandated browser testing standard at
- * `~/.matt/scrai/globals/standards/browser_testing.md`:
+ * Enforces the repository-owned browser testing standard at
+ * `engine/dashboard/_dev/testing/TESTING.md`:
  * - No page.evaluate / page.$eval / page.$$eval / page.$()
  * - No raw CSS / XPath / attribute / tag locators outside the allow-list below
  * - No { force: true } on actions

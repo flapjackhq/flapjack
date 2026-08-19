@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/vector/embedder.rs.
 use std::sync::OnceLock;
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
@@ -557,6 +558,7 @@ impl OpenAiEmbedder {
     }
 }
 
+/// TODO: Document vet_embedder_outbound_target.
 fn vet_embedder_outbound_target(
     raw_url: &str,
     source: &str,
@@ -580,6 +582,7 @@ fn vet_embedder_outbound_target(
     }
 }
 
+/// TODO: Document is_direct_constructor_localhost_or_private.
 fn is_direct_constructor_localhost_or_private(raw_url: &str) -> bool {
     let parsed = match reqwest::Url::parse(raw_url) {
         Ok(parsed) => parsed,
@@ -605,6 +608,7 @@ fn is_direct_constructor_localhost_or_private(raw_url: &str) -> bool {
     )
 }
 
+/// TODO: Document build_embedder_http_client.
 fn build_embedder_http_client(
     mut client_builder: reqwest::ClientBuilder,
     vetted_target: Option<&crate::security::VettedOutboundUrlTarget>,

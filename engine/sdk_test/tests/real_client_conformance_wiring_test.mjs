@@ -91,8 +91,8 @@ assert.match(
 );
 assert.match(
   workflow,
-  /name: SDK real-client conformance[^]*playwright install --with-deps chromium/,
-  'public CI must provision the browser required by the real-client suite',
+  /name: Install SDK Playwright browser\n[^]*?timeout-minutes: 5\n[^]*?run: npx playwright install chromium\n[^]*?name: SDK real-client conformance/,
+  'public CI must provision the browser in a bounded step before the real-client suite',
 );
 
 console.log('PASS real-client conformance dependency and recurring-gate wiring');

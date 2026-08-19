@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/router.rs.
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -167,7 +168,12 @@ fn build_router_with_resource_bounds(
             Arc::clone(&analytics_collector),
         ))
         .merge(build_experiments_routes(state.clone()))
-        .merge(build_insights_routes(analytics_collector, data_dir))
+        .merge(build_insights_routes(
+            analytics_collector,
+            Arc::clone(&state.idempotency_cache),
+            data_dir,
+            state.notification_service.clone(),
+        ))
         .merge(build_internal_routes(state.clone(), auth_enabled));
 
     let app = if config.disable_dashboard {
@@ -529,6 +535,7 @@ fn build_protected_routes(state: Arc<AppState>, data_dir: &Path, auth_enabled: b
     ))
 }
 
+/// TODO: Document build_internal_routes.
 fn build_internal_routes(state: Arc<AppState>, auth_enabled: bool) -> Router {
     let public_routes = Router::new()
         .route(
@@ -724,15 +731,22 @@ fn build_experiments_routes(state: Arc<AppState>) -> Router {
 }
 
 /// Builds click/conversion event ingestion and GDPR profile-deletion routes.
-fn build_insights_routes(analytics_collector: Arc<AnalyticsCollector>, data_dir: &Path) -> Router {
+fn build_insights_routes(
+    analytics_collector: Arc<AnalyticsCollector>,
+    idempotency_cache: Arc<crate::idempotency::IdempotencyCache>,
+    data_dir: &Path,
+    notification_service: Option<Arc<crate::notifications::NotificationService>>,
+) -> Router {
     let gdpr_delete_state = GdprDeleteState {
         analytics_collector: analytics_collector.clone(),
         profile_store_base_path: data_dir.to_path_buf(),
+        gdpr_notifier: notification_service,
     };
 
     Router::new()
         .route("/1/events", post(handlers::insights::post_events))
         .route("/1/events/debug", get(handlers::insights::get_debug_events))
+        .layer(Extension(idempotency_cache))
         .with_state(analytics_collector)
         .merge(
             Router::new()
@@ -760,6 +774,7 @@ pub(crate) fn build_cors_layer(mode: &CorsMode) -> CorsLayer {
     }
 }
 
+/// TODO: Document is_loopback_origin.
 fn is_loopback_origin(origin: &axum::http::HeaderValue, _: &axum::http::request::Parts) -> bool {
     let Ok(raw_origin) = origin.to_str() else {
         return false;
@@ -867,6 +882,7 @@ fn panic_json_response(_panic: Box<dyn std::any::Any + Send + 'static>) -> Respo
     )
 }
 
+/// TODO: Document app_id_layer.
 pub(crate) fn app_id_layer(app: Router) -> Router {
     app.layer(middleware::from_fn(
         |mut request: axum::extract::Request, next: middleware::Next| async move {
@@ -884,6 +900,7 @@ pub(crate) fn app_id_layer(app: Router) -> Router {
     ))
 }
 
+/// TODO: Document apply_middleware.
 fn apply_middleware(
     app: Router,
     state: Arc<AppState>,

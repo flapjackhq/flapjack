@@ -1,3 +1,4 @@
+//! Stub summary for parity_export.rs.
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
@@ -15,6 +16,7 @@ enum ParityExportError {
 }
 
 impl Display for ParityExportError {
+    /// TODO: Document ParityExportError.fmt.
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Serialize(error) => write!(f, "failed to serialize parity export JSON: {error}"),
@@ -83,6 +85,7 @@ fn write_parity_export_json(output_path: &Path) -> Result<(), ParityExportError>
     Ok(())
 }
 
+/// TODO: Document main.
 fn main() {
     let output_path = match parse_output_path() {
         Ok(path) => path,

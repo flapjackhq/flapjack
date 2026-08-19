@@ -63,6 +63,7 @@ url_encode() {
   python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
 }
 
+# TODO: Document init_run.
 init_run() {
   require_tool curl
   require_tool jq
@@ -123,6 +124,7 @@ algolia_base() {
 http_body() { sed '$d'; }
 http_code() { tail -1; }
 
+# TODO: Document algolia_request.
 algolia_request() {
   local mode="$1" method="$2" path="$3" key="$4" body="${5:-}" base
   base="$(algolia_base "$mode")"
@@ -211,6 +213,7 @@ create_key() {
   printf '%s\n' "$key"
 }
 
+# TODO: Document seed_fixture_files.
 seed_fixture_files() {
   python3 - "$WORK_DIR" <<'PY'
 import json, pathlib, sys
@@ -271,6 +274,7 @@ seed_rules_synonyms() {
   wait_recorded_task "$index" "$out"
 }
 
+# TODO: Document seed_vendor.
 seed_vendor() {
   seed_fixture_files
   local source_index="${RUN_PREFIX}_source"
@@ -320,6 +324,7 @@ fetch_translation_fixtures() {
   record_check "fixtures_fetched" "pass" "wrote SpoolTranslationInput fixture files"
 }
 
+# TODO: Document run_rust_live_suite.
 run_rust_live_suite() {
   local cargo_out="$LOG_DIR/cargo-live-translation.out" status sentinel_count sentinel_value
   set +e
@@ -341,6 +346,7 @@ run_rust_live_suite() {
   record_check "rust_live_translation" "pass" "LIVE_TRANSLATION_PASS=${sentinel_value}"
 }
 
+# TODO: Document cleanup_vendor.
 cleanup_vendor() {
   [ -n "$WORK_DIR" ] || return 0
   local key index response code payload remaining task
@@ -402,6 +408,7 @@ remaining_recorded_indexes() {
   done | LC_ALL=C sort -u
 }
 
+# TODO: Document preserve_run_evidence.
 preserve_run_evidence() {
   [ -n "$WORK_DIR" ] || return 0
   [ -z "$EVIDENCE_DIR" ] || return 0

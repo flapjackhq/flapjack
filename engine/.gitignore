@@ -29,6 +29,7 @@ railway.json
 .claude/settings.local.json
 sdk_test/.cache/
 **/test-results/
+**/playwright-report/
 _dev/benchmarks_2/results.json
 _dev/demo-dualclient/dist/openapi.json
 _dev/demo-dualclient/dist/stats.json
@@ -47,7 +48,8 @@ _dev/demo-dualclient/public/openapi.json
 
 # Lock files for dependencies (keep app lockfiles, ignore others)
 **/package-lock.json
-# Exceptions: keep dashboard and sdk_test package-lock.json files
+# Exceptions: keep console, dashboard, and sdk_test package-lock.json files
+!console/package-lock.json
 !dashboard/package-lock.json
 !sdk_test/package-lock.json
 

@@ -1,3 +1,4 @@
+//! Stub summary for ai_provider.rs.
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::sync::{Arc, Mutex, OnceLock};
@@ -171,6 +172,7 @@ impl OpenAiCompatibleProvider {
     }
 }
 
+/// TODO: Document build_openai_client.
 fn build_openai_client(config: &AiProviderConfig) -> reqwest::Client {
     let mut builder = reqwest::Client::builder();
 

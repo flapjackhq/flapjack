@@ -27,6 +27,7 @@ print_failure_with_log() {
   fi
 }
 
+# TODO: Document main.
 main() {
   local pid="" log_path="" health_url="" host="127.0.0.1" port="" retries="60" interval_seconds="0.5"
 

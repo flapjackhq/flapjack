@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/manager/lifecycle.rs.
 use super::recovery::{RecoveryDocumentContext, RecoverySeqWindow};
 use super::*;
 use crate::index::oplog::{read_committed_seq, write_committed_seq, OpLog, OpLogEntry, OPLOG_DIR};
@@ -551,6 +552,7 @@ impl super::IndexManager {
         .await
     }
 
+    /// TODO: Document IndexManager.move_index_with_publication.
     async fn move_index_with_publication(
         &self,
         source: &str,

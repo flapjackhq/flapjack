@@ -138,6 +138,7 @@ fn source_snapshot_canonical_orders_object_keys_recursively_without_reordering_a
     );
 }
 
+/// TODO: Document source_snapshot_canonical_hashes_counts_and_membership_independent_of_item_order.
 #[test]
 fn source_snapshot_canonical_hashes_counts_and_membership_independent_of_item_order() {
     let first = snapshot_from_raw(
@@ -232,6 +233,7 @@ fn source_snapshot_resource_hashes_are_independent_of_rule_synonym_and_replica_o
     );
 }
 
+/// TODO: Document source_snapshot_canonical_changes_for_value_insertions_and_deletions.
 #[test]
 fn source_snapshot_canonical_changes_for_value_insertions_and_deletions() {
     let baseline = snapshot_from_raw(
@@ -280,6 +282,7 @@ fn source_snapshot_canonical_changes_for_value_insertions_and_deletions() {
     assert_ne!(baseline.documents.count, deleted.documents.count);
 }
 
+/// TODO: Document source_snapshot_canonical_rejects_missing_and_duplicate_object_ids.
 #[test]
 fn source_snapshot_canonical_rejects_missing_and_duplicate_object_ids() {
     for invalid_documents in [

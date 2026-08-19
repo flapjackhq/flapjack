@@ -378,6 +378,7 @@ async fn test_get_strategy_404_when_not_set() {
     let (status, _) = send_get(&app, "/1/strategies/personalization").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+/// TODO: Document test_delete_strategy_then_get_returns_404.
 #[tokio::test]
 async fn test_delete_strategy_then_get_returns_404() {
     let tmp = TempDir::new().unwrap();
@@ -406,6 +407,7 @@ async fn test_delete_strategy_then_get_returns_404() {
     let (get_status, _) = send_get(&app, "/1/strategies/personalization").await;
     assert_eq!(get_status, StatusCode::NOT_FOUND);
 }
+/// TODO: Document test_delete_strategy_is_idempotent_when_not_configured.
 #[tokio::test]
 async fn test_delete_strategy_is_idempotent_when_not_configured() {
     let tmp = TempDir::new().unwrap();
@@ -491,6 +493,88 @@ async fn test_get_profile_computes_from_insight_events() {
         nike <= 20 && adidas <= 20,
         "scores should be normalized to <=20: {body}"
     );
+}
+
+/// Direct profile computation and standalone deletion must enter the same
+/// per-user ordering owner used by their production handlers.
+#[tokio::test]
+async fn direct_profile_get_and_standalone_delete_share_user_ordering() {
+    use axum::extract::{Path, State};
+    use std::future::Future;
+    use std::task::Poll;
+
+    let tmp = TempDir::new().unwrap();
+    let config = test_analytics_config(&tmp);
+    let collector = AnalyticsCollector::new(config.clone());
+    let state = make_state_with_analytics(&tmp, Some(Arc::new(AnalyticsQueryEngine::new(config))));
+    state.manager.create_tenant("products").unwrap();
+    state
+        .manager
+        .add_documents_sync("products", vec![make_product_doc("prod-nike", "Nike")])
+        .await
+        .unwrap();
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    collector.record_insight(make_view_event("target-user", "prod-nike", now_ms));
+    collector.flush_all();
+
+    let app = personalization_router(Arc::clone(&state));
+    let (post_status, _) = send_json(
+        &app,
+        Method::POST,
+        "/1/strategies/personalization",
+        valid_strategy(),
+    )
+    .await;
+    assert_eq!(post_status, StatusCode::OK);
+
+    let store = PersonalizationProfileStore::new(tmp.path());
+    let control = PersonalizationProfile {
+        user_token: "control-user".to_string(),
+        last_event_at: None,
+        scores: BTreeMap::from([(
+            "brand".to_string(),
+            BTreeMap::from([("Adidas".to_string(), 20)]),
+        )]),
+    };
+    store.save_profile(&control).unwrap();
+    let probe = store.user_operation_probe_for_test("target-user").unwrap();
+
+    let blocker = store.begin_user_operation("target-user").await.unwrap();
+    let mut profile_get = Box::pin(get_user_profile(
+        State(Arc::clone(&state)),
+        Path("target-user".to_string()),
+    ));
+    let first_get_poll =
+        std::future::poll_fn(|cx| Poll::Ready(profile_get.as_mut().poll(cx))).await;
+    assert!(matches!(first_get_poll, Poll::Pending));
+    assert_eq!(
+        probe.admission_count(),
+        2,
+        "the direct GET compute path must enter the profile operation owner"
+    );
+    drop(blocker);
+    let profile = profile_get.await.unwrap().0;
+    assert_eq!(profile["userToken"], "target-user");
+
+    let blocker = store.begin_user_operation("target-user").await.unwrap();
+    let mut profile_delete = Box::pin(delete_user_profile(
+        State(Arc::clone(&state)),
+        Path("target-user".to_string()),
+    ));
+    let first_delete_poll =
+        std::future::poll_fn(|cx| Poll::Ready(profile_delete.as_mut().poll(cx))).await;
+    assert!(matches!(first_delete_poll, Poll::Pending));
+    assert_eq!(
+        probe.admission_count(),
+        4,
+        "the standalone DELETE path must enter the profile operation owner"
+    );
+    drop(blocker);
+    let _ = profile_delete.await.unwrap();
+
+    assert!(store.load_profile("target-user").unwrap().is_none());
+    assert_eq!(store.load_profile("control-user").unwrap(), Some(control));
 }
 
 /// Delete a previously cached profile and verify that a subsequent GET returns 404.

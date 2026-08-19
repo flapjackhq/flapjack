@@ -1,3 +1,5 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/export_tests.rs.
+
 use super::{
     export_algolia_source, resume_algolia_source, wait_for_live_drift_barrier, ExportError,
     LIVE_DRIFT_BARRIER_DIR_ENV, LIVE_DRIFT_OBSERVED_FILE, LIVE_DRIFT_RELEASE_FILE,
@@ -136,6 +138,7 @@ fn create_export_for_test(
     store.create_export(job_uuid, source_identity_digest, denominators)
 }
 
+/// TODO: Document seed_digest_for.
 async fn seed_digest_for(
     record: AlgoliaIndexRecord,
     document_pages: Vec<Vec<Value>>,
@@ -163,6 +166,7 @@ fn store_at(path: &std::path::Path) -> SpoolStore {
     SpoolStore::new(path, SpoolLimits::default()).expect("spool store should open")
 }
 
+/// TODO: Document live_drift_barrier_records_job_and_waits_for_release.
 #[test]
 fn live_drift_barrier_records_job_and_waits_for_release() {
     let _env_lock = ENV_MUTEX.lock().expect("env mutex poisoned");
@@ -194,6 +198,7 @@ fn live_drift_barrier_records_job_and_waits_for_release() {
     assert_eq!(fs::read_to_string(observed).unwrap(), job_uuid.to_string());
 }
 
+/// TODO: Document export_destination_isolation_and_sanitization_writes_only_spool_job.
 #[tokio::test]
 async fn export_destination_isolation_and_sanitization_writes_only_spool_job() {
     let tmp = TempDir::new().unwrap();
@@ -248,6 +253,7 @@ async fn export_destination_isolation_and_sanitization_writes_only_spool_job() {
     assert_eq!(checkpoint.job_uuid, accepted.job_uuid);
 }
 
+/// TODO: Document export_destination_isolation_and_sanitization_scrubs_public_material.
 #[tokio::test]
 async fn export_destination_isolation_and_sanitization_scrubs_public_material() {
     let tmp = TempDir::new().unwrap();
@@ -490,6 +496,7 @@ async fn export_refuses_replica_settings_drift_with_unchanged_primary_snapshot()
     assert_eq!(store.public_view(&public_handle).unwrap().state, "Failed");
 }
 
+/// TODO: Document export_failure_settlement_phase_write_error_surfaces_storage_failure.
 #[test]
 fn export_failure_settlement_phase_write_error_surfaces_storage_failure() {
     let tmp = TempDir::new().unwrap();
@@ -514,6 +521,7 @@ fn export_failure_settlement_phase_write_error_surfaces_storage_failure() {
     );
 }
 
+/// TODO: Document fresh_export_failure_always_settles_durable_phase.
 #[test]
 fn fresh_export_failure_always_settles_durable_phase() {
     use crate::handlers::migration::spool::MigrationDisposition;
@@ -556,6 +564,7 @@ fn fresh_export_failure_always_settles_durable_phase() {
     );
 }
 
+/// TODO: Document export_resume_skips_completed_ids_through_checkpoint_handle.
 #[tokio::test]
 async fn export_resume_skips_completed_ids_through_checkpoint_handle() {
     let tmp = TempDir::new().unwrap();
@@ -666,6 +675,7 @@ async fn export_resume_reuses_existing_replica_settings_without_duplicate_config
     assert_eq!(durable["products_relevance"], replica_relevance_settings());
 }
 
+/// TODO: Document export_resume_accepts_reordered_inserted_source_and_refuses_mutation.
 #[tokio::test]
 async fn export_resume_accepts_reordered_inserted_source_and_refuses_mutation() {
     let tmp = TempDir::new().unwrap();
@@ -798,6 +808,7 @@ async fn export_resume_accepts_reordered_inserted_source_and_refuses_mutation() 
     );
 }
 
+/// TODO: Document export_resume_refuses_mutated_source_without_new_artifacts.
 #[tokio::test]
 async fn export_resume_refuses_mutated_source_without_new_artifacts() {
     let tmp = TempDir::new().unwrap();
@@ -843,6 +854,7 @@ async fn export_resume_refuses_mutated_source_without_new_artifacts() {
     assert_eq!(checkpoint.state, "Interrupted");
 }
 
+/// TODO: Document export_drift_during_streaming_fences_the_job.
 #[tokio::test]
 async fn export_drift_during_streaming_fences_the_job() {
     let tmp = TempDir::new().unwrap();

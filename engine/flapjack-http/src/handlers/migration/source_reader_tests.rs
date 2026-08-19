@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/source_reader_tests.rs.
 use super::algolia_client::{
     install_test_algolia_validation_resolver, AlgoliaClientError, AlgoliaErrorKind,
     AlgoliaIndexRecord, TEST_VETTED_ALGOLIA_IP,
@@ -1044,6 +1045,7 @@ async fn neutral_export_preserves_replica_user_data_urls_verbatim() {
     );
 }
 
+/// TODO: Document source_reader_identity_is_order_independent_and_uses_canonical_source_inputs.
 #[tokio::test]
 async fn source_reader_identity_is_order_independent_and_uses_canonical_source_inputs() {
     let mut first = stable_reader();
@@ -1188,6 +1190,7 @@ fn source_reader_algolia_backend_is_constructed_only_through_algolia_client_vali
     assert_eq!(error.kind(), AlgoliaErrorKind::Validation);
 }
 
+/// TODO: Document source_reader_two_pass_accepts_same_membership_with_page_order_changes.
 #[tokio::test]
 async fn source_reader_two_pass_accepts_same_membership_with_page_order_changes() {
     let mut reader = stable_reader();
@@ -1225,6 +1228,7 @@ async fn source_reader_two_pass_accepts_same_membership_with_page_order_changes(
     assert_eq!(sink.synonym_pages, vec![vec!["syn-1"]]);
 }
 
+/// TODO: Document source_reader_two_pass_rejects_drift_with_scrubbed_error.
 #[tokio::test]
 async fn source_reader_two_pass_rejects_drift_with_scrubbed_error() {
     let mut reader = stable_reader();
@@ -1360,6 +1364,7 @@ fn replica_relevance_settings() -> Value {
     })
 }
 
+/// TODO: Document collect_replica_settings_fetches_bare_and_virtual_names_in_order_with_full_json.
 #[tokio::test]
 async fn collect_replica_settings_fetches_bare_and_virtual_names_in_order_with_full_json() {
     let mut reader = ScriptedSourceReader::new("APPID", "products");
@@ -1414,6 +1419,7 @@ async fn collect_replica_settings_fails_closed_on_missing_script() {
     assert_eq!(error.kind(), SourceExportErrorKind::Progress);
 }
 
+/// TODO: Document collect_replica_settings_maps_parser_failure_to_scrubbed_validation.
 #[tokio::test]
 async fn collect_replica_settings_maps_parser_failure_to_scrubbed_validation() {
     let mut reader = ScriptedSourceReader::new("APPID", "products");
@@ -1434,6 +1440,7 @@ async fn collect_replica_settings_maps_parser_failure_to_scrubbed_validation() {
     );
 }
 
+/// TODO: Document collect_replica_settings_propagates_typed_fetch_error.
 #[tokio::test]
 async fn collect_replica_settings_propagates_typed_fetch_error() {
     let mut reader = ScriptedSourceReader::new("APPID", "products");

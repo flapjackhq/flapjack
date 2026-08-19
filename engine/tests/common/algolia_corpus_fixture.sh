@@ -68,6 +68,7 @@ algolia_url() {
   printf 'https://%s.algolia.net%s' "$ALGOLIA_APP_ID" "$path"
 }
 
+# TODO: Document algolia_request.
 algolia_request() {
   local method="$1" path="$2" body="$3" out="$4" body_file="" status
   if [[ "$body" == @* ]]; then
@@ -160,6 +161,7 @@ cleanup_prepare_failure() {
   cleanup_from_ledger "$LEDGER_PATH" || true
 }
 
+# TODO: Document delete_index_and_prove_absent.
 delete_index_and_prove_absent() {
   local index_name="$1" label="$2" out path code remaining=40
   out="$(mktemp)"
@@ -178,6 +180,7 @@ delete_index_and_prove_absent() {
   rm -f "$out"
 }
 
+# TODO: Document prefix_preflight.
 prefix_preflight() {
   local out stale_index
   [ "$OWNED_SOURCE" -eq 1 ] || return 0
@@ -196,6 +199,7 @@ prefix_preflight() {
   ')
 }
 
+# TODO: Document seed_settings_synonyms_rules.
 seed_settings_synonyms_rules() {
   local out="$WORK_DIR/algolia-setup.raw" path manifest settings synonyms rules
   path="$(encoded_index_path "$SOURCE_INDEX")"
@@ -218,6 +222,7 @@ seed_settings_synonyms_rules() {
   wait_for_response_tasks "$SOURCE_INDEX" "$out"
 }
 
+# TODO: Document seed_documents.
 seed_documents() {
   local docs_file batch_dir batch_file request_file out path
   docs_file="$WORK_DIR/algolia-scale-documents.ndjson"
@@ -238,6 +243,7 @@ seed_documents() {
   done
 }
 
+# TODO: Document run_prepare.
 run_prepare() {
   require_absolute_path "--secret-file" "$SECRET_FILE"
   require_absolute_path "--work-dir" "$WORK_DIR"
@@ -293,6 +299,7 @@ run_cleanup() {
   cleanup_from_ledger "$LEDGER_PATH"
 }
 
+# TODO: Document run_source_count.
 run_source_count() {
   local out path count
   require_absolute_path "--secret-file" "$SECRET_FILE"
@@ -332,6 +339,7 @@ cleanup_selftest_failure() {
   [ -z "$SELFTEST_TEMP_DIR" ] || rm -rf "$SELFTEST_TEMP_DIR"
 }
 
+# TODO: Document run_selftest.
 run_selftest() {
   local temp_dir metadata ledger source out
   require_absolute_path "--secret-file" "$SECRET_FILE"
@@ -385,6 +393,7 @@ parse_source_count_args() {
   done
 }
 
+# TODO: Document main.
 main() {
   local mode="${1:-}"
   [ "$#" -gt 0 ] && shift || true

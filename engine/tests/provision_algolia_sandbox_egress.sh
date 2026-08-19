@@ -48,6 +48,7 @@ aws_ignore_not_found() {
   "$@" >/dev/null 2>&1 || true
 }
 
+# TODO: Document recover_created_resource_ids.
 recover_created_resource_ids() {
   if [ -z "$INTERNET_GATEWAY_ID" ] && [ -s "${IGW_CREATE_RESPONSE:-}" ]; then
     INTERNET_GATEWAY_ID="$(jq -r '.InternetGateway.InternetGatewayId // empty' "$IGW_CREATE_RESPONSE")"
@@ -69,6 +70,7 @@ recover_created_resource_ids() {
   fi
 }
 
+# TODO: Document cleanup_egress.
 cleanup_egress() {
   trap - EXIT INT TERM
   set +e
@@ -127,6 +129,7 @@ wait_for_ssm_command() {
   return 1
 }
 
+# TODO: Document prepare_retry_ledger.
 prepare_retry_ledger() {
   [ "$(jq -r '.stage6_egress.status' "$LEDGER")" = cleanup_attempted_after_failure ] || return 0
 

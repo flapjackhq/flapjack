@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/build_info.rs.
 // The collector and digest policy below are imported directly by build.rs; they are
 // intentionally unused by non-test runtime library builds.
 #![cfg_attr(not(test), allow(dead_code))]
@@ -175,6 +176,7 @@ fn parse_build_info_json(json: &str) -> Result<BuildInfo, String> {
         .map_err(|error| format!("compiled build-info JSON is malformed: {error}"))
 }
 
+/// TODO: Document build_info_from_inputs.
 pub(crate) fn build_info_from_inputs<I, S>(
     version: &str,
     raw: RawBuildInputs,
@@ -240,6 +242,7 @@ where
     VcsState { revision, dirty }
 }
 
+/// TODO: Document vcs_invalidation_paths.
 pub(crate) fn vcs_invalidation_paths<F>(mut run_git: F) -> Vec<PathBuf>
 where
     F: FnMut(&[&str]) -> Result<String, String>,
@@ -280,6 +283,7 @@ pub(crate) fn workspace_digest(workspace_root: &Path) -> io::Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// TODO: Document workspace_digest_paths.
 pub(crate) fn workspace_digest_paths(workspace_root: &Path) -> io::Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for relative_path in WORKSPACE_DIGEST_FILES {
@@ -304,6 +308,7 @@ pub(crate) fn workspace_digest_paths(workspace_root: &Path) -> io::Result<Vec<Pa
     Ok(normalized_paths.into_iter().map(|(_, path)| path).collect())
 }
 
+/// TODO: Document collect_rust_sources.
 fn collect_rust_sources(
     workspace_root: &Path,
     directory: &Path,
@@ -333,6 +338,7 @@ fn collect_rust_sources(
     Ok(())
 }
 
+/// TODO: Document normalized_relative_path.
 fn normalized_relative_path(workspace_root: &Path, path: &Path) -> io::Result<PathBuf> {
     let relative = path.strip_prefix(workspace_root).map_err(|_| {
         io::Error::new(

@@ -228,6 +228,7 @@ pub fn extract_task_id(body: &serde_json::Value) -> i64 {
         .unwrap_or_else(|| panic!("missing taskID in response: {body}"))
 }
 
+/// TODO: Document build_authed_request.
 fn build_authed_request(
     method: axum::http::Method,
     uri: &str,

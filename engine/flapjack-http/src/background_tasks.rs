@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/background_tasks.rs.
 use crate::handlers::migration::spool::{SpoolError, SpoolLimits, SpoolStore};
 use crate::handlers::AppState;
 use crate::server_init::InfrastructureState;
@@ -187,6 +188,7 @@ async fn fetch_s3_tenant_prefixes(
     Some(ids)
 }
 
+/// TODO: Document extract_s3_snapshot_tenant_id.
 fn extract_s3_snapshot_tenant_id(prefix: &str) -> Option<String> {
     let tenant = prefix
         .strip_prefix("snapshots/")
@@ -587,6 +589,7 @@ fn spawn_analytics_tasks(
     }
 }
 
+/// TODO: Document spawn_local_rollup_generation_task.
 fn spawn_local_rollup_generation_task(
     infrastructure: &InfrastructureState,
     rollup_interval_secs: u64,
@@ -610,6 +613,7 @@ fn spawn_local_rollup_generation_task(
     );
 }
 
+/// TODO: Document run_local_rollup_generation_pass.
 fn run_local_rollup_generation_pass(
     analytics_config: &flapjack::analytics::AnalyticsConfig,
     collector: &Arc<flapjack::analytics::AnalyticsCollector>,
@@ -658,6 +662,7 @@ fn rollup_window_bounds_ms(now_ms: i64) -> (i64, i64) {
     (window_start_ms, window_end_ms)
 }
 
+/// TODO: Document discover_rollup_indexes.
 fn discover_rollup_indexes(analytics_config: &flapjack::analytics::AnalyticsConfig) -> Vec<String> {
     let mut indexes = Vec::new();
     let Ok(entries) = std::fs::read_dir(&analytics_config.data_dir) else {

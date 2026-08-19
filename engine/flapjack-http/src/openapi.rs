@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/openapi.rs.
 use utoipa::OpenApi;
 
 pub const DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS: [&str; 3] = [
@@ -436,6 +437,7 @@ pub const DOCUMENTED_INTERNAL_PATHS: [&str; 5] = [
 )]
 pub struct ApiDoc;
 
+/// TODO: Document documented_openapi.
 pub fn documented_openapi(auth_enabled: bool) -> utoipa::openapi::OpenApi {
     let mut document = ApiDoc::openapi();
     if auth_enabled {

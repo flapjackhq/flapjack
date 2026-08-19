@@ -1,21 +1,125 @@
 use super::*;
 
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+
+fn test_notifier() -> Arc<crate::notifications::NotificationService> {
+    Arc::new(crate::notifications::NotificationService::disabled())
+}
+
+async fn ingest_view_events(app: &Router, user_tokens: &[&str]) {
+    let events: Vec<_> = user_tokens
+        .iter()
+        .enumerate()
+        .map(|(position, user_token)| {
+            json!({
+                "eventType": "view",
+                "eventName": "Viewed",
+                "index": "products",
+                "userToken": user_token,
+                "objectIDs": [format!("object-{position}")]
+            })
+        })
+        .collect();
+    let response =
+        send_json_request(app, Method::POST, "/1/events", json!({ "events": events })).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+fn seed_outside_analytics(config: &AnalyticsConfig) {
+    let events =
+        ["delete-me", "safe-user"].map(|user_token| flapjack::analytics::schema::InsightEvent {
+            event_type: "view".to_string(),
+            event_subtype: None,
+            event_name: "Viewed".to_string(),
+            index: "products".to_string(),
+            user_token: user_token.to_string(),
+            authenticated_user_token: None,
+            query_id: None,
+            object_ids: vec![format!("object-{user_token}")],
+            object_ids_alt: vec![],
+            positions: None,
+            timestamp: Some(chrono::Utc::now().timestamp_millis()),
+            value: None,
+            currency: None,
+            interleaving_team: None,
+        });
+    flapjack::analytics::writer::flush_insight_events(&events, &config.events_dir("products"))
+        .unwrap();
+}
+
+fn snapshot_regular_files(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    fn visit(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        files: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+    ) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let file_type = entry.file_type().unwrap();
+            assert!(
+                !file_type.is_symlink(),
+                "fixture must be a real directory tree"
+            );
+            if file_type.is_dir() {
+                visit(root, &entry.path(), files);
+            } else if file_type.is_file() {
+                files.push((
+                    entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                    std::fs::read(entry.path()).unwrap(),
+                ));
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    visit(root, root, &mut files);
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    assert!(
+        !files.is_empty(),
+        "outside fixture must contain persisted data"
+    );
+    files
+}
+
+async fn assert_debug_event_exists(app: &Router, user_token: &str) {
+    let response = send_empty_request(app, Method::GET, "/1/events/debug?limit=100").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert!(
+        body["events"]
+            .as_array()
+            .is_some_and(|events| events.iter().any(|event| event["userToken"] == user_token)),
+        "expected buffered debug event for {user_token}: {body}"
+    );
+}
+
+fn assert_sanitized_internal_error(body: &serde_json::Value) {
+    assert_eq!(
+        body,
+        &json!({
+            "message": "Internal server error",
+            "status": 500
+        })
+    );
+    assert!(body.get("deletedAt").is_none());
+}
+
 /// Verify that the GDPR delete endpoint invokes `send_gdpr_confirmation` on the global notification service.
 #[tokio::test]
 async fn delete_usertoken_sends_gdpr_notification() {
-    // Initialize global notifier (OnceLock — only first call wins, which is fine)
-    let service = Arc::new(crate::notifications::NotificationService::disabled());
-    crate::notifications::init_global_notifier(Arc::clone(&service));
-
-    // Get reference to the global service for counter checks
-    let notifier = crate::notifications::global_notifier().expect("notifier should be set");
+    let notifier = test_notifier();
     let before = notifier
         .gdpr_call_count
         .load(std::sync::atomic::Ordering::Relaxed);
 
     let tmp = TempDir::new().unwrap();
     let collector = AnalyticsCollector::new(test_analytics_config(&tmp));
-    let app = app_router(collector);
+    let app = app_router_with_base_and_notifier(
+        collector,
+        tmp.path().to_path_buf(),
+        Some(Arc::clone(&notifier)),
+    );
 
     let response = send_empty_request(&app, Method::DELETE, "/1/usertokens/user_test_gdpr").await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -26,6 +130,323 @@ async fn delete_usertoken_sends_gdpr_notification() {
     assert!(
         after > before,
         "send_gdpr_confirmation should have been called: before={before}, after={after}"
+    );
+}
+
+/// A configured analytics root may not redirect GDPR deletion outside the
+/// configured tree. Refusal must happen before in-memory or external data is
+/// changed, and the endpoint must not claim or notify successful deletion.
+#[cfg(unix)]
+#[tokio::test]
+async fn gdpr_delete_rejects_symlinked_analytics_root_before_any_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let outside_config = AnalyticsConfig {
+        enabled: true,
+        data_dir: tmp.path().join("outside-analytics"),
+        flush_interval_secs: 3600,
+        flush_size: 10_000,
+        retention_days: 90,
+    };
+    seed_outside_analytics(&outside_config);
+    let outside_before = snapshot_regular_files(&outside_config.data_dir);
+
+    let linked_root = tmp.path().join("analytics-link");
+    symlink(&outside_config.data_dir, &linked_root).unwrap();
+    let linked_config = AnalyticsConfig {
+        data_dir: linked_root,
+        ..outside_config.clone()
+    };
+    let linked_collector = AnalyticsCollector::new(linked_config);
+    let notifier = test_notifier();
+    let app = app_router_with_base_and_notifier(
+        Arc::clone(&linked_collector),
+        tmp.path().to_path_buf(),
+        Some(Arc::clone(&notifier)),
+    );
+    ingest_view_events(&app, &["delete-me"]).await;
+
+    let notifications_before = notifier
+        .gdpr_call_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let response = send_empty_request(&app, Method::DELETE, "/1/usertokens/delete-me").await;
+    let status = response.status();
+    let body = body_json(response).await;
+    let notifications_after = notifier
+        .gdpr_call_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let outside_after = snapshot_regular_files(&outside_config.data_dir);
+    assert_eq!(
+        outside_after, outside_before,
+        "symlink target outside the configured tree was mutated"
+    );
+    assert_debug_event_exists(&app, "delete-me").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_sanitized_internal_error(&body);
+    assert_eq!(notifications_after, notifications_before);
+}
+
+/// Per-index events roots receive the same fail-closed treatment as the
+/// configured analytics root. A regular parent directory must not make a
+/// symlinked events leaf safe to traverse.
+#[cfg(unix)]
+#[tokio::test]
+async fn gdpr_delete_rejects_symlinked_index_events_root_before_any_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let outside_config = AnalyticsConfig {
+        enabled: true,
+        data_dir: tmp.path().join("outside-analytics"),
+        flush_interval_secs: 3600,
+        flush_size: 10_000,
+        retention_days: 90,
+    };
+    seed_outside_analytics(&outside_config);
+    let outside_before = snapshot_regular_files(&outside_config.data_dir);
+
+    let config = AnalyticsConfig {
+        enabled: true,
+        data_dir: tmp.path().join("analytics"),
+        flush_interval_secs: 3600,
+        flush_size: 10_000,
+        retention_days: 90,
+    };
+    let events_dir = config.events_dir("products");
+    std::fs::create_dir_all(events_dir.parent().unwrap()).unwrap();
+    symlink(outside_config.events_dir("products"), &events_dir).unwrap();
+
+    let collector = AnalyticsCollector::new(config);
+    let notifier = test_notifier();
+    let app = app_router_with_base_and_notifier(
+        Arc::clone(&collector),
+        tmp.path().to_path_buf(),
+        Some(Arc::clone(&notifier)),
+    );
+    ingest_view_events(&app, &["delete-me"]).await;
+
+    let notifications_before = notifier
+        .gdpr_call_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let response = send_empty_request(&app, Method::DELETE, "/1/usertokens/delete-me").await;
+    let status = response.status();
+    let body = body_json(response).await;
+    let notifications_after = notifier
+        .gdpr_call_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let outside_after = snapshot_regular_files(&outside_config.data_dir);
+    assert_eq!(
+        outside_after, outside_before,
+        "symlink target outside the configured tree was mutated"
+    );
+    assert_debug_event_exists(&app, "delete-me").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_sanitized_internal_error(&body);
+    assert_eq!(notifications_after, notifications_before);
+}
+
+/// A profile deletion failure is a server-side failure, not a successful GDPR
+/// deletion. In particular, no success timestamp or confirmation may escape.
+#[cfg(unix)]
+#[tokio::test]
+async fn gdpr_delete_profile_obstruction_returns_sanitized_error_without_notification() {
+    let tmp = TempDir::new().unwrap();
+    let blocked_profile = tmp
+        .path()
+        .join("personalization/profiles/blocked-user.json");
+    std::fs::create_dir_all(&blocked_profile).unwrap();
+
+    let collector = AnalyticsCollector::new(test_analytics_config(&tmp));
+    let notifier = test_notifier();
+    let app = app_router_with_base_and_notifier(
+        collector,
+        tmp.path().to_path_buf(),
+        Some(Arc::clone(&notifier)),
+    );
+    ingest_view_events(&app, &["blocked-user"]).await;
+    let notifications_before = notifier
+        .gdpr_call_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let response = send_empty_request(&app, Method::DELETE, "/1/usertokens/blocked-user").await;
+    let status = response.status();
+    let body = body_json(response).await;
+    let notifications_after = notifier
+        .gdpr_call_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    assert!(
+        blocked_profile.is_dir(),
+        "obstructing directory was mutated"
+    );
+    assert_debug_event_exists(&app, "blocked-user").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_sanitized_internal_error(&body);
+    assert_eq!(notifications_after, notifications_before);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn gdpr_delete_rejects_symlinked_profiles_parent_before_analytics_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let outside_profiles = tmp.path().join("outside-profiles");
+    std::fs::create_dir_all(&outside_profiles).unwrap();
+    let outside_profile = outside_profiles.join("delete-me.json");
+    let outside_bytes = br#"{"user_token":"delete-me","scores":{}}"#;
+    std::fs::write(&outside_profile, outside_bytes).unwrap();
+
+    let personalization_dir = tmp.path().join("personalization");
+    std::fs::create_dir_all(&personalization_dir).unwrap();
+    symlink(&outside_profiles, personalization_dir.join("profiles")).unwrap();
+
+    let collector = AnalyticsCollector::new(test_analytics_config(&tmp));
+    let notifier = test_notifier();
+    let app = app_router_with_base_and_notifier(
+        collector,
+        tmp.path().to_path_buf(),
+        Some(Arc::clone(&notifier)),
+    );
+    ingest_view_events(&app, &["delete-me"]).await;
+    let notifications_before = notifier
+        .gdpr_call_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let response = send_empty_request(&app, Method::DELETE, "/1/usertokens/delete-me").await;
+    let status = response.status();
+    let body = body_json(response).await;
+
+    assert_eq!(std::fs::read(outside_profile).unwrap(), outside_bytes);
+    assert_debug_event_exists(&app, "delete-me").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_sanitized_internal_error(&body);
+    assert_eq!(
+        notifier
+            .gdpr_call_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        notifications_before
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn gdpr_delete_rejects_symlinked_profile_file_before_analytics_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let outside_profile = tmp.path().join("outside-profile.json");
+    let outside_bytes = br#"{"user_token":"delete-me","scores":{}}"#;
+    std::fs::write(&outside_profile, outside_bytes).unwrap();
+
+    let profiles_dir = tmp.path().join("personalization/profiles");
+    std::fs::create_dir_all(&profiles_dir).unwrap();
+    symlink(&outside_profile, profiles_dir.join("delete-me.json")).unwrap();
+
+    let collector = AnalyticsCollector::new(test_analytics_config(&tmp));
+    let notifier = test_notifier();
+    let app = app_router_with_base_and_notifier(
+        collector,
+        tmp.path().to_path_buf(),
+        Some(Arc::clone(&notifier)),
+    );
+    ingest_view_events(&app, &["delete-me"]).await;
+    let notifications_before = notifier
+        .gdpr_call_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let response = send_empty_request(&app, Method::DELETE, "/1/usertokens/delete-me").await;
+    let status = response.status();
+    let body = body_json(response).await;
+
+    assert_eq!(std::fs::read(outside_profile).unwrap(), outside_bytes);
+    assert_debug_event_exists(&app, "delete-me").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_sanitized_internal_error(&body);
+    assert_eq!(
+        notifier
+            .gdpr_call_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        notifications_before
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn gdpr_delete_nested_symlink_preflight_preserves_all_selected_data() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_analytics_config(&tmp);
+    seed_outside_analytics(&config);
+    let products_before = snapshot_regular_files(&config.events_dir("products"));
+
+    let broken_partition = config.events_dir("broken").join("date=2026-08-16");
+    let outside_dir = tmp.path().join("outside-events");
+    std::fs::create_dir_all(&broken_partition).unwrap();
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    symlink(&outside_dir, broken_partition.join("escape")).unwrap();
+
+    let collector = AnalyticsCollector::new(config.clone());
+    let notifier = test_notifier();
+    let app = app_router_with_base_and_notifier(
+        collector,
+        tmp.path().to_path_buf(),
+        Some(Arc::clone(&notifier)),
+    );
+    ingest_view_events(&app, &["delete-me"]).await;
+
+    let response = send_empty_request(&app, Method::DELETE, "/1/usertokens/delete-me").await;
+    let status = response.status();
+    let body = body_json(response).await;
+
+    assert_eq!(
+        snapshot_regular_files(&config.events_dir("products")),
+        products_before,
+        "a selected real events tree was mutated before nested-symlink refusal"
+    );
+    assert_debug_event_exists(&app, "delete-me").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_sanitized_internal_error(&body);
+    assert_eq!(
+        notifier
+            .gdpr_call_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn gdpr_delete_non_directory_events_root_preserves_all_selected_data() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_analytics_config(&tmp);
+    seed_outside_analytics(&config);
+    let products_before = snapshot_regular_files(&config.events_dir("products"));
+
+    let broken_events = config.events_dir("broken");
+    std::fs::create_dir_all(broken_events.parent().unwrap()).unwrap();
+    std::fs::write(&broken_events, b"not a directory").unwrap();
+
+    let collector = AnalyticsCollector::new(config.clone());
+    let notifier = test_notifier();
+    let app = app_router_with_base_and_notifier(
+        collector,
+        tmp.path().to_path_buf(),
+        Some(Arc::clone(&notifier)),
+    );
+    ingest_view_events(&app, &["delete-me"]).await;
+
+    let response = send_empty_request(&app, Method::DELETE, "/1/usertokens/delete-me").await;
+    let status = response.status();
+    let body = body_json(response).await;
+
+    assert_eq!(std::fs::read(&broken_events).unwrap(), b"not a directory");
+    assert_eq!(
+        snapshot_regular_files(&config.events_dir("products")),
+        products_before,
+        "a selected real events tree was mutated before invalid-leaf refusal"
+    );
+    assert_debug_event_exists(&app, "delete-me").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_sanitized_internal_error(&body);
+    assert_eq!(
+        notifier
+            .gdpr_call_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
     );
 }
 

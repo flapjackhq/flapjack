@@ -1,3 +1,5 @@
+//! Stub summary for engine/src/security_tests.rs.
+
 use super::allow_local_outbound_urls;
 use super::first_blocked_outbound_host_ip;
 use super::outbound_ip_block_reason;
@@ -77,6 +79,7 @@ fn arbitrary_string_is_false() {
     );
 }
 
+/// TODO: Document outbound_ip_policy_classification_matrix.
 #[test]
 fn outbound_ip_policy_classification_matrix() {
     let public_v4: IpAddr = "8.8.8.8".parse().unwrap();
@@ -150,6 +153,7 @@ fn outbound_ip_policy_classification_matrix() {
     );
 }
 
+/// TODO: Document outbound_host_resolution_policy_edge_cases.
 #[test]
 #[serial(flapjack_outbound_url_policy)]
 fn outbound_host_resolution_policy_edge_cases() {
@@ -312,6 +316,7 @@ fn vet_outbound_url_target_returns_none_for_unresolved_host() {
     );
 }
 
+/// TODO: Document vet_outbound_url_target_returns_vetted_target_on_safe_resolution.
 #[test]
 #[serial(flapjack_outbound_url_policy)]
 fn vet_outbound_url_target_returns_vetted_target_on_safe_resolution() {

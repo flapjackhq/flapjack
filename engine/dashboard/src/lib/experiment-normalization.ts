@@ -1,3 +1,6 @@
+/**
+ * @module Stub summary for experiment-normalization.ts.
+ */
 import type { Experiment } from '@/lib/types';
 import { asExperimentRecord } from './experiment-api-contract';
 
@@ -59,6 +62,9 @@ function readEndedAt(record: RawRecord): number | undefined {
   return asTimestamp(record.endedAt) ?? asTimestamp(record.endAt);
 }
 
+/**
+ * TODO: Document normalizePrimaryMetric.
+ */
 function normalizePrimaryMetric(metric: unknown): string {
   const rawMetric = asString(metric);
   switch (rawMetric) {
@@ -86,6 +92,9 @@ function normalizeTrafficSplit(value: unknown): number {
   return Math.min(1, Math.max(0, scaled));
 }
 
+/**
+ * TODO: Document normalizeStatus.
+ */
 function normalizeStatus(record: RawRecord): Experiment['status'] {
   const status = asString(record.status);
   if (

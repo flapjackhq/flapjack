@@ -448,6 +448,7 @@ fn replace_documents_per_segment_labels(
     WRITE_QUEUE_SEGMENT_LABELS_BY_TENANT.insert(tenant_id.to_string(), segment_ids);
 }
 
+/// TODO: Document write_queue_batch_size.
 fn write_queue_batch_size() -> usize {
     match std::env::var(WRITE_QUEUE_BATCH_SIZE_ENV_VAR) {
         Ok(raw_value) => match raw_value.parse::<usize>() {
@@ -475,6 +476,7 @@ fn write_queue_batch_size() -> usize {
     }
 }
 
+/// TODO: Document writer_acquire_timeout.
 fn writer_acquire_timeout() -> Duration {
     match std::env::var(WRITER_ACQUIRE_TIMEOUT_ENV_VAR) {
         Ok(raw_value) => match raw_value.parse::<u64>() {
@@ -502,6 +504,7 @@ fn writer_acquire_timeout() -> Duration {
     }
 }
 
+/// TODO: Document write_queue_channel_capacity.
 fn write_queue_channel_capacity() -> usize {
     match std::env::var(WRITE_QUEUE_CHANNEL_CAPACITY_ENV_VAR) {
         Ok(raw_value) => match raw_value.parse::<usize>() {
@@ -529,6 +532,7 @@ fn write_queue_channel_capacity() -> usize {
     }
 }
 
+/// TODO: Document write_queue_start_delay.
 fn write_queue_start_delay() -> Option<Duration> {
     let raw_value = std::env::var(WRITE_QUEUE_START_DELAY_ENV_VAR).ok()?;
     match raw_value.parse::<u64>() {
@@ -1153,6 +1157,7 @@ fn run_dedicated_write_worker_runtime(
         })
 }
 
+/// TODO: Document run_replay_startup.
 fn run_replay_startup(
     ctx: &WriteQueueContext,
     replay_records: Vec<WriteAdmissionRecord>,

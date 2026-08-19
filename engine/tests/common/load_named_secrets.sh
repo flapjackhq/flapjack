@@ -54,6 +54,7 @@ export_if_unset() {
   export "$var_name=$value"
 }
 
+# TODO: Document load_named_secrets.
 load_named_secrets() {
   local env_file=""
   local key=""

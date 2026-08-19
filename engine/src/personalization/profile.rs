@@ -1,7 +1,13 @@
 //! Personalization profile computation and storage. Scores and normalizes user event affinities across facets to 0-20 range, persisting profiles to JSON.
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Weak};
+
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::types::{Document, FieldValue};
 
@@ -11,6 +17,42 @@ pub const MAX_FACETS: usize = 15;
 const MAX_AFFINITY: f64 = 20.0;
 const NINETY_DAYS_MS: i64 = 90 * 24 * 60 * 60 * 1000;
 const VALID_EVENT_TYPES: &[&str] = &["click", "conversion", "view"];
+
+static PROFILE_USER_OPERATIONS: Lazy<
+    std::sync::Mutex<HashMap<PathBuf, Weak<ProfileUserOperation>>>,
+> = Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+struct ProfileUserOperation {
+    operation_key: PathBuf,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(any(test, feature = "test-support"))]
+    admissions: AtomicUsize,
+}
+
+impl ProfileUserOperation {
+    fn new(operation_key: PathBuf) -> Self {
+        Self {
+            operation_key,
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(any(test, feature = "test-support"))]
+            admissions: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Drop for ProfileUserOperation {
+    fn drop(&mut self) {
+        let Ok(mut operations) = PROFILE_USER_OPERATIONS.lock() else {
+            return;
+        };
+        let is_current_operation = operations
+            .get(&self.operation_key)
+            .is_some_and(|operation| std::ptr::eq(operation.as_ptr(), self));
+        if is_current_operation {
+            operations.remove(&self.operation_key);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -311,11 +353,30 @@ pub async fn compute_and_cache_profile(
     user_token: &str,
     now_ms: i64,
 ) -> Result<PersonalizationProfile, String> {
-    let computed =
-        compute_profile_from_storage(manager, analytics_engine, strategy, user_token, now_ms)
-            .await?;
+    cache_computed_profile(
+        store,
+        user_token,
+        compute_profile_from_storage(manager, analytics_engine, strategy, user_token, now_ms),
+    )
+    .await
+}
+
+async fn cache_computed_profile<F>(
+    store: &PersonalizationProfileStore,
+    user_token: &str,
+    computation: F,
+) -> Result<PersonalizationProfile, String>
+where
+    F: Future<Output = Result<ComputedProfile, String>>,
+{
+    let _operation = store.begin_user_operation(user_token).await?;
+    let computed = computation.await?;
     let profile = computed.to_profile(user_token);
-    store.save_profile(&profile)?;
+    if profile.scores.is_empty() {
+        store.delete_profile(user_token)?;
+    } else {
+        store.save_profile(&profile)?;
+    }
     Ok(profile)
 }
 
@@ -484,6 +545,25 @@ pub struct PersonalizationProfileStore {
     base_path: PathBuf,
 }
 
+/// Per-user profile computation/deletion operation guard.
+pub struct ProfileUserOperationGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    _operation: Arc<ProfileUserOperation>,
+}
+
+/// Test-only observation handle for the per-user operation owner.
+#[cfg(any(test, feature = "test-support"))]
+pub struct ProfileUserOperationProbe {
+    operation: Arc<ProfileUserOperation>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl ProfileUserOperationProbe {
+    pub fn admission_count(&self) -> usize {
+        self.operation.admissions.load(Ordering::SeqCst)
+    }
+}
+
 impl PersonalizationProfileStore {
     pub fn new(base_path: impl AsRef<Path>) -> Self {
         Self {
@@ -493,6 +573,48 @@ impl PersonalizationProfileStore {
 
     pub fn strategy_path(&self) -> PathBuf {
         self.base_path.join(STRATEGY_FILENAME)
+    }
+
+    /// Enter the ordering domain shared by profile computation and deletion.
+    pub async fn begin_user_operation(
+        &self,
+        user_token: &str,
+    ) -> Result<ProfileUserOperationGuard, String> {
+        let operation_key = self.profile_path(user_token)?;
+        let operation = self.user_operation(&operation_key)?;
+        #[cfg(any(test, feature = "test-support"))]
+        operation.admissions.fetch_add(1, Ordering::SeqCst);
+        let guard = operation.lock.clone().lock_owned().await;
+        Ok(ProfileUserOperationGuard {
+            _guard: guard,
+            _operation: operation,
+        })
+    }
+
+    fn user_operation(&self, operation_key: &Path) -> Result<Arc<ProfileUserOperation>, String> {
+        let mut operations = PROFILE_USER_OPERATIONS
+            .lock()
+            .map_err(|error| format!("profile operation registry poisoned: {error}"))?;
+        if let Some(operation) = operations.get(operation_key).and_then(Weak::upgrade) {
+            return Ok(operation);
+        }
+
+        let operation = Arc::new(ProfileUserOperation::new(operation_key.to_path_buf()));
+        operations.insert(operation_key.to_path_buf(), Arc::downgrade(&operation));
+        Ok(operation)
+    }
+
+    /// Observe admission to this user's operation owner in integration tests.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn user_operation_probe_for_test(
+        &self,
+        user_token: &str,
+    ) -> Result<ProfileUserOperationProbe, String> {
+        let operation_key = self.profile_path(user_token)?;
+        Ok(ProfileUserOperationProbe {
+            operation: self.user_operation(&operation_key)?,
+        })
     }
 
     pub fn profile_path(&self, user_token: &str) -> Result<PathBuf, String> {
@@ -545,14 +667,74 @@ impl PersonalizationProfileStore {
     }
 
     pub fn delete_profile(&self, user_token: &str) -> Result<bool, String> {
+        self.preflight_delete_profile(user_token)?;
         let path = self.profile_path(user_token)?;
-        if !path.exists() {
-            return Ok(false);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(format!(
+                    "failed to stat profile '{}': {}",
+                    path.display(),
+                    error
+                ));
+            }
+        };
+        if !metadata.is_file() {
+            return Err(format!("profile path is not a file: '{}'", path.display()));
         }
 
         std::fs::remove_file(&path)
             .map_err(|e| format!("failed to delete profile '{}': {}", path.display(), e))?;
         Ok(true)
+    }
+
+    /// Validate the complete deletion path without following symlinked owners.
+    /// The HTTP deletion flow calls this before changing analytics data.
+    pub fn preflight_delete_profile(&self, user_token: &str) -> Result<(), String> {
+        let profile_path = self.profile_path(user_token)?;
+        let personalization_dir = self.base_path.join("personalization");
+        let profiles_dir = personalization_dir.join("profiles");
+        for (path, role) in [
+            (&self.base_path, "profile data root"),
+            (&personalization_dir, "personalization directory"),
+            (&profiles_dir, "profiles directory"),
+        ] {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(format!("refusing symlinked {role} '{}'", path.display()));
+                }
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => {
+                    return Err(format!("{role} is not a directory: '{}'", path.display()));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "failed to stat {role} '{}': {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+
+        match std::fs::symlink_metadata(&profile_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+                "refusing symlinked profile path '{}'",
+                profile_path.display()
+            )),
+            Ok(metadata) if metadata.is_file() => Ok(()),
+            Ok(_) => Err(format!(
+                "profile path is not a file: '{}'",
+                profile_path.display()
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "failed to stat profile '{}': {}",
+                profile_path.display(),
+                error
+            )),
+        }
     }
 }
 
@@ -746,6 +928,64 @@ mod tests {
         assert_eq!(loaded, profile);
         assert!(store.delete_profile("user-123").unwrap());
         assert!(store.load_profile("user-123").unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_delete_cannot_be_followed_by_stale_profile_publication() {
+        use std::future::Future;
+        use std::task::Poll;
+        use tokio::sync::oneshot;
+
+        let tmp = TempDir::new().unwrap();
+        let store = PersonalizationProfileStore::new(tmp.path());
+        let control = PersonalizationProfile {
+            user_token: "control-user".to_string(),
+            last_event_at: None,
+            scores: BTreeMap::from([(
+                "brand".to_string(),
+                BTreeMap::from([("Adidas".to_string(), 20)]),
+            )]),
+        };
+        store.save_profile(&control).unwrap();
+
+        let (release_compute_tx, release_compute_rx) = oneshot::channel();
+        let mut compute = Box::pin(cache_computed_profile(&store, "target-user", async move {
+            release_compute_rx.await.unwrap();
+            Ok(ComputedProfile {
+                last_event_at_ms: Some(1_750_000_000_000),
+                scores: BTreeMap::from([(
+                    "brand".to_string(),
+                    BTreeMap::from([("Nike".to_string(), 20)]),
+                )]),
+            })
+        }));
+        let first_compute_poll =
+            std::future::poll_fn(|cx| Poll::Ready(compute.as_mut().poll(cx))).await;
+        assert!(
+            matches!(first_compute_poll, Poll::Pending),
+            "the profile computation must pause while holding its user operation"
+        );
+
+        let mut deletion = Box::pin(async {
+            let _operation = store.begin_user_operation("target-user").await.unwrap();
+            store.delete_profile("target-user").unwrap();
+        });
+        let first_delete_poll =
+            std::future::poll_fn(|cx| Poll::Ready(deletion.as_mut().poll(cx))).await;
+        assert!(
+            matches!(first_delete_poll, Poll::Pending),
+            "deletion must wait behind an admitted in-flight profile computation"
+        );
+
+        release_compute_tx.send(()).unwrap();
+        compute.await.unwrap();
+        deletion.await;
+
+        assert!(
+            store.load_profile("target-user").unwrap().is_none(),
+            "an in-flight computation republished the target profile after deletion"
+        );
+        assert_eq!(store.load_profile("control-user").unwrap(), Some(control));
     }
 
     #[cfg(unix)]

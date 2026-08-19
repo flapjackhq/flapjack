@@ -4500,8 +4500,8 @@
         "tags": [
           "insights"
         ],
-        "summary": "DELETE /1/usertokens/{userToken} - GDPR deletion for all insight events tied to a user token",
-        "description": "Multi-store cleanup: purges insight events from analytics collector AND\ndeletes the personalization profile cache for the user token. Ordering is\ndeterministic (analytics first, then profile cache) with best-effort\nsemantics — each store is cleaned independently so a failure in one does\nnot block cleanup of the other.",
+        "summary": "DELETE /1/usertokens/{userToken} - Delete insight events tied to a user token.",
+        "description": "Admin and unrestricted keys retain the full GDPR cleanup across analytics\nand the global personalization profile. Index-restricted keys purge only\nauthorized analytics partitions because the profile has no index scope.",
         "operationId": "delete_usertoken",
         "parameters": [
           {

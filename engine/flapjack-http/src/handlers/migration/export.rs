@@ -1,3 +1,5 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/export.rs.
+
 use super::algolia_client::{should_retry, AlgoliaClientError, AlgoliaErrorKind};
 use super::source_reader::{
     admit_source_provider, collect_quiescent_source_snapshot, read_source_snapshot,
@@ -45,6 +47,7 @@ pub(super) struct AcceptedExport {
 }
 
 impl fmt::Debug for AcceptedExport {
+    /// TODO: Document AcceptedExport.fmt.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AcceptedExport")
@@ -629,6 +632,7 @@ fn page_has_fresh_items(page: &[SourceExportRecord], completed: &HashSet<String>
         .any(|item| !completed.contains(item.stable_id()))
 }
 
+/// TODO: Document wait_for_live_drift_barrier.
 fn wait_for_live_drift_barrier(source_name: &str, job_uuid: Uuid) -> Result<(), SourceExportError> {
     let Ok(target_source) = env::var(LIVE_DRIFT_SOURCE_ENV) else {
         return Ok(());

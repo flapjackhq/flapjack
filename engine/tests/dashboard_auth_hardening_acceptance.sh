@@ -53,6 +53,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# TODO: Document require_tools.
 require_tools() {
   local missing=0 tool
   for tool in cargo curl grep mktemp sed tr; do
@@ -105,6 +106,7 @@ stop_server() {
   LAST_LOG_PATH=""
 }
 
+# TODO: Document start_server.
 start_server() {
   local mode="$1"
   local data_dir="$TMP_ROOT/${mode}_data"
@@ -160,6 +162,7 @@ EOF
   test -s "$data_dir/node.json"
 }
 
+# TODO: Document start_no_auth_server.
 start_no_auth_server() {
   local mode="$1" bind_addr="$2" allow_public_bind="$3" node_json_bind="${4:-}"
   local data_dir="$TMP_ROOT/${mode}_data"
@@ -207,6 +210,7 @@ is_job_running() {
   return 1
 }
 
+# TODO: Document wait_for_exit_nonzero.
 wait_for_exit_nonzero() {
   local description="$1" exit_code="" i
   for i in $(seq 1 80); do
@@ -303,6 +307,7 @@ assert_redirect_location() {
   fi
 }
 
+# TODO: Document run_dashboard_case.
 run_dashboard_case() {
   build_current_checkout_binary
 
@@ -322,6 +327,7 @@ run_dashboard_case() {
   stop_server
 }
 
+# TODO: Document run_no_auth_case.
 run_no_auth_case() {
   build_current_checkout_binary
 
@@ -348,6 +354,7 @@ run_no_auth_case() {
   assert_log_contains 'node.json public bind override logs guard error' "$NO_AUTH_PUBLIC_BIND_ERROR"
 }
 
+# TODO: Document main.
 main() {
   if [ "$#" -ne 1 ]; then
     usage >&2

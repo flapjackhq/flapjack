@@ -1,3 +1,4 @@
+//! Stub summary for c4_restart_recovery.rs.
 // Contract C4: Restart Recovery & Committed Sequence Continuity
 //
 // Decision 0003 §C4 verdict: already upheld at HEAD.
@@ -5,6 +6,7 @@
 
 use crate::common;
 
+/// TODO: Document restart_recovery_catches_up_before_serving.
 #[tokio::test]
 async fn restart_recovery_catches_up_before_serving() {
     let client = reqwest::Client::new();

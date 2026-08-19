@@ -9,7 +9,7 @@ members = [
 
 [package]
 name = "flapjack"
-version = "1.0.13"
+version = "1.0.14"
 edition = "2021"
 build = "build.rs"
 description = "Full-text search engine library with typo tolerance, faceting, and Algolia-compatible conventions"
@@ -73,7 +73,7 @@ hostname = "0.4"
 utoipa = { version = "5.3", features = ["uuid"], optional = true }
 flapjack-ssl = { path = "flapjack-ssl" }
 sysinfo = { version = "0.30", optional = true }
-usearch = { version = "2", optional = true }
+usearch = { version = "2", optional = true, default-features = false }
 fastembed = { version = "5", optional = true, default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]

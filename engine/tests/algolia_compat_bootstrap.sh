@@ -22,6 +22,7 @@ timestamp_algolia_compat() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
 
+# TODO: Document resolve_algolia_compat_binary.
 resolve_algolia_compat_binary() {
   local engine_dir="$1"
   local bin=""
@@ -64,6 +65,7 @@ assert_algolia_compat_port_free() {
   fi
 }
 
+# TODO: Document wait_for_algolia_compat_health.
 wait_for_algolia_compat_health() {
   local base_url="$1"
   local server_log="$2"
@@ -89,6 +91,7 @@ wait_for_algolia_compat_health() {
   fi
 }
 
+# TODO: Document ensure_algolia_compat_sdk_dependencies.
 ensure_algolia_compat_sdk_dependencies() {
   local sdk_dir="$1"
 
@@ -106,6 +109,7 @@ ensure_algolia_compat_sdk_dependencies() {
   fi
 }
 
+# TODO: Document run_algolia_compat_npm_script.
 run_algolia_compat_npm_script() {
   local sdk_dir="$1"
   local npm_script="$2"
@@ -138,6 +142,7 @@ initialize_algolia_compat_harness_state() {
   trap cleanup_algolia_compat_harness EXIT
 }
 
+# TODO: Document prepare_algolia_compat_server_env.
 prepare_algolia_compat_server_env() {
   local default_bind_addr="$1"
   local admin_key_prefix="$2"
@@ -157,6 +162,7 @@ prepare_algolia_compat_server_env() {
   export FLAPJACK_URL="http://${bind_addr}"
 }
 
+# TODO: Document start_algolia_compat_server.
 start_algolia_compat_server() {
   local bin="$1"
   local server_log_name="$2"
@@ -182,6 +188,7 @@ print_algolia_compat_server_details() {
   echo "Server log: $server_log"
 }
 
+# TODO: Document run_algolia_compat_harness.
 run_algolia_compat_harness() {
   local stage_label="$1"
   local default_bind_addr="$2"

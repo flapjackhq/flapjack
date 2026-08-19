@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/translation_report.rs.
 use super::super::source_snapshot::source_item_hash;
 use super::super::source_snapshot::{
     SourceSnapshotResource, SourceSnapshotSchemaViolation, SourceSnapshotSchemaViolationKind,
@@ -78,6 +79,7 @@ pub(in crate::handlers::migration) enum ReportCode {
     TypesenseSettingNotMigrated,
 }
 
+/// TODO: Document non_portable_product_entries.
 pub(super) fn non_portable_product_entries() -> Vec<TranslationReportEntry> {
     [
         ReportResource::Analytics,
@@ -98,6 +100,7 @@ pub(super) fn non_portable_product_entries() -> Vec<TranslationReportEntry> {
     .collect()
 }
 
+/// TODO: Document warning_entry.
 pub(super) fn warning_entry(
     code: ReportCode,
     resource: ReportResource,
@@ -115,6 +118,7 @@ pub(super) fn warning_entry(
     }
 }
 
+/// TODO: Document hard_entry.
 pub(super) fn hard_entry(
     code: ReportCode,
     resource: ReportResource,
@@ -132,6 +136,7 @@ pub(super) fn hard_entry(
     }
 }
 
+/// TODO: Document source_snapshot_violation_entry.
 pub(super) fn source_snapshot_violation_entry(
     violation: SourceSnapshotSchemaViolation,
 ) -> TranslationReportEntry {
@@ -183,6 +188,7 @@ pub(super) fn contains_hard_rejection(entries: &[TranslationReportEntry]) -> boo
         .any(|entry| entry.severity == ReportSeverity::HardRejection)
 }
 
+/// TODO: Document warning_message.
 pub(in crate::handlers::migration) fn warning_message(code: ReportCode) -> Option<&'static str> {
     Some(match code {
         ReportCode::PersistedNoBehaviorSetting => {
@@ -237,6 +243,7 @@ pub(in crate::handlers::migration) fn warning_message(code: ReportCode) -> Optio
     })
 }
 
+/// TODO: Document finalize_report.
 pub(super) fn finalize_report(mut entries: Vec<TranslationReportEntry>) -> TranslationReport {
     entries.sort_by(|left, right| report_entry_sort_key(left).cmp(&report_entry_sort_key(right)));
     let summary = TranslationReportSummary {
@@ -302,6 +309,7 @@ fn resource_rank(resource: ReportResource) -> u8 {
     }
 }
 
+/// TODO: Document report_code_rank.
 fn report_code_rank(code: ReportCode) -> u8 {
     match code {
         ReportCode::ProductNotMigrated => 0,

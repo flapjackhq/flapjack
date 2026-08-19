@@ -152,6 +152,7 @@ impl AcmeClient {
         Ok(order)
     }
 
+    /// TODO: Document AcmeClient.prepare_http01_challenges.
     async fn prepare_http01_challenges(
         &self,
         order: &mut Order,
@@ -196,6 +197,7 @@ impl AcmeClient {
             .map_err(|e| FlapjackError::Acme(format!("Failed to poll order ready: {}", e)))
     }
 
+    /// TODO: Document AcmeClient.finalize_order.
     async fn finalize_order(&self, order: &mut Order) -> Result<(String, String)> {
         tracing::info!("[SSL] Finalizing order...");
         let private_key_pem = order

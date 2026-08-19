@@ -17,6 +17,9 @@ interface UseChatResult {
   sendMessage: (query: string) => Promise<void>;
 }
 
+/**
+ * TODO: Document useChat.
+ */
 export function useChat(indexName: string): UseChatResult {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);

@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/settings/payload_merge.rs.
 use axum::http::StatusCode;
 use std::collections::HashMap;
 
@@ -227,6 +228,7 @@ fn apply_response_and_display_fields(
     }
 }
 
+/// TODO: Document parse_distinct_value_strict.
 pub(in crate::handlers) fn parse_distinct_value_strict(
     raw: Option<serde_json::Value>,
 ) -> Result<Option<DistinctValue>, &'static str> {

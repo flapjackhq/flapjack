@@ -1,4 +1,7 @@
 /**
+ * @module Stub summary for engine/dashboard/local-instance-config.ts.
+ */
+/**
  * Local instance configuration for development and testing.
  * Reads port/host settings from flapjack.local.conf for per-clone isolation.
  */
@@ -325,6 +328,9 @@ function isLoopbackBackendUrl(backendBaseUrl: string): boolean {
   }
 }
 
+/**
+ * TODO: Document parseBindAddress.
+ */
 function parseBindAddress(rawBindAddress: string | undefined): HostAndPort | null {
   if (!rawBindAddress) {
     return null;
@@ -369,6 +375,9 @@ function trackedBindAddressMatchesBackend(
   );
 }
 
+/**
+ * TODO: Document findTrackedBackendDataDir.
+ */
 export function findTrackedBackendDataDir(
   backendBaseUrl: string,
   stateDir: string = MULTI_INSTANCE_STATE_DIR,

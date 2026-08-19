@@ -1,3 +1,4 @@
+//! Stub summary for engine/tests/common/state.rs.
 use axum::{
     middleware,
     routing::{delete, get, post},
@@ -130,6 +131,7 @@ fn apply_standard_test_http_layers(app: Router) -> Router {
     ))
 }
 
+/// TODO: Document apply_test_app_id_layer.
 pub fn apply_test_app_id_layer(app: Router) -> Router {
     app.layer(middleware::from_fn(
         |mut request: axum::extract::Request, next: middleware::Next| async move {
@@ -238,6 +240,7 @@ pub fn make_test_app_state(
     })
 }
 
+/// TODO: Document wait_for_health.
 async fn wait_for_health(addrs: &[&str], attempts: usize) {
     let client = reqwest::Client::new();
     let mut last_unready_addr = "";
@@ -283,6 +286,7 @@ pub(crate) async fn spawn_router(app: Router, temp_dir: &mut TempDir) -> String 
     addr
 }
 
+/// TODO: Document build_query_suggestions_test_routes.
 fn build_query_suggestions_test_routes(state: Arc<flapjack_http::handlers::AppState>) -> Router {
     let public_health_routes =
         flapjack_http::router::build_public_health_routes().with_state(state.clone());
@@ -358,6 +362,7 @@ pub fn build_test_app_for_existing_data_dir(data_dir: &Path, admin_key: Option<&
     build_test_app_for_data_dir(data_dir, admin_key)
 }
 
+/// TODO: Document build_test_app_for_data_dir.
 fn build_test_app_for_data_dir(data_dir: &Path, admin_key: Option<&str>) -> Router {
     build_test_app_for_data_dir_with_analytics(data_dir, admin_key).0
 }
@@ -416,7 +421,9 @@ pub async fn spawn_server_with_key(admin_key: Option<&str>) -> (String, TempDir)
     (addr, temp_dir)
 }
 
-pub async fn spawn_server_with_qs_analytics(source_index_name: &str) -> (String, TempDir) {
+async fn spawn_server_with_qs_analytics_inner(
+    source_index_name: &str,
+) -> (String, TempDir, Arc<flapjack::IndexManager>) {
     let mut temp_dir = TempDir::new().unwrap();
 
     let analytics_config = analytics_config(temp_dir.path(), 100_000);
@@ -437,6 +444,7 @@ pub async fn spawn_server_with_qs_analytics(source_index_name: &str) -> (String,
         None,
     );
 
+    let manager = Arc::clone(&state.manager);
     let analytics_routes = Router::new()
         .route(
             "/2/conversions/addToCartRate",
@@ -475,11 +483,79 @@ pub async fn spawn_server_with_qs_analytics(source_index_name: &str) -> (String,
                 .with_state(flapjack_http::handlers::insights::GdprDeleteState {
                     analytics_collector,
                     profile_store_base_path: temp_dir.path().to_path_buf(),
+                    gdpr_notifier: None,
                 }),
         );
 
     let app = apply_standard_test_http_layers(app);
 
+    let addr = spawn_router(app, &mut temp_dir).await;
+
+    (addr, temp_dir, manager)
+}
+
+/// TODO: Document spawn_server_with_qs_analytics.
+pub async fn spawn_server_with_qs_analytics(source_index_name: &str) -> (String, TempDir) {
+    let (addr, temp_dir, _manager) = spawn_server_with_qs_analytics_inner(source_index_name).await;
+    (addr, temp_dir)
+}
+
+/// Spawn the same real HTTP suggestions stack while exposing its source manager
+/// for focused source-nonmutation setup and assertions.
+pub async fn spawn_server_with_qs_analytics_and_manager(
+    source_index_name: &str,
+) -> (String, TempDir, Arc<flapjack::IndexManager>) {
+    spawn_server_with_qs_analytics_inner(source_index_name).await
+}
+
+/// Spawn a Query Suggestions server with an exact, hand-counted search fixture.
+/// Each tuple is `(query, search_count, nb_hits)` for one source index.
+pub async fn spawn_server_with_exact_qs_searches(
+    source_index_name: &str,
+    searches: &[(&str, u32, u32)],
+) -> (String, TempDir) {
+    let mut temp_dir = TempDir::new().unwrap();
+    let analytics_config = analytics_config(temp_dir.path(), 100_000);
+    let (analytics_collector, analytics_engine) = build_analytics_runtime(analytics_config);
+    let timestamp_ms = chrono::Utc::now().timestamp_millis();
+
+    for (query, count, nb_hits) in searches {
+        for ordinal in 0..*count {
+            analytics_collector.record_search(flapjack::analytics::schema::SearchEvent {
+                timestamp_ms: timestamp_ms + i64::from(ordinal),
+                query: (*query).to_string(),
+                query_id: Some(format!("{source_index_name}-{query}-{ordinal}")),
+                index_name: source_index_name.to_string(),
+                nb_hits: *nb_hits,
+                processing_time_ms: 1,
+                user_token: Some(format!("user-{ordinal}")),
+                user_ip: None,
+                filters: None,
+                facets: None,
+                analytics_tags: None,
+                page: 0,
+                hits_per_page: 20,
+                has_results: *nb_hits > 0,
+                country: None,
+                region: None,
+                experiment_id: None,
+                variant_id: None,
+                assignment_method: None,
+            });
+        }
+    }
+    analytics_collector.flush_searches();
+
+    let state = make_test_app_state(
+        temp_dir.path(),
+        None,
+        None,
+        None,
+        Some(analytics_engine),
+        None,
+        None,
+    );
+    let app = apply_standard_test_http_layers(build_query_suggestions_test_routes(state));
     let addr = spawn_router(app, &mut temp_dir).await;
 
     (addr, temp_dir)
@@ -642,6 +718,7 @@ fn build_node_router(state: Arc<flapjack_http::handlers::AppState>) -> Router {
     )
 }
 
+/// TODO: Document replication_manager_for_peers.
 fn replication_manager_for_peers(
     data_dir: &Path,
     node_id: &str,
@@ -752,6 +829,7 @@ pub async fn spawn_replication_pair(
     (addr_a, addr_b, tmp_a, tmp_b)
 }
 
+/// TODO: Document spawn_authenticated_replication_pair.
 pub async fn spawn_authenticated_replication_pair(
     node_a_id: &str,
     node_b_id: &str,
@@ -882,6 +960,7 @@ fn panic_no_routable_interface(reason: impl std::fmt::Display) -> ! {
     panic!("SKIPPED_NO_ROUTABLE_INTERFACE");
 }
 
+/// TODO: Document build_authenticated_replication_router.
 fn build_authenticated_replication_router(
     data_dir: &Path,
     key_store: Arc<flapjack_http::auth::KeyStore>,
@@ -956,6 +1035,7 @@ fn build_counted_authenticated_router(
     )
 }
 
+/// TODO: Document optional_authenticated_node_c_app.
 fn optional_authenticated_node_c_app(
     peers: &RuntimePeerSet<'_>,
     admin_key: &str,
@@ -982,6 +1062,7 @@ fn optional_authenticated_node_c_app(
     ))
 }
 
+/// TODO: Document build_authenticated_runtime_add_peer_apps.
 fn build_authenticated_runtime_add_peer_apps(
     peers: &RuntimePeerSet<'_>,
     admin_key: &str,
@@ -1018,6 +1099,7 @@ fn build_authenticated_runtime_add_peer_apps(
     }
 }
 
+/// TODO: Document build_no_auth_node_app.
 fn build_no_auth_node_app(
     data_dir: &Path,
     replication_manager: Arc<ReplicationManager>,
@@ -1052,6 +1134,7 @@ fn optional_no_auth_node_c_app(peers: &RuntimePeerSet<'_>) -> Option<Router> {
     ))
 }
 
+/// TODO: Document build_runtime_add_peer_apps.
 fn build_runtime_add_peer_apps(
     peers: &RuntimePeerSet<'_>,
     admin_key: Option<&str>,
@@ -1072,6 +1155,7 @@ fn build_runtime_add_peer_apps(
     }
 }
 
+/// TODO: Document spawn_runtime_add_peer_harness.
 async fn spawn_runtime_add_peer_harness(
     listener_a: TcpListener,
     listener_b: TcpListener,
@@ -1159,6 +1243,7 @@ pub async fn spawn_authenticated_runtime_add_peer_pair(admin_key: &str) -> Runti
     spawn_runtime_add_peer_harness(listener_a, listener_b, None, Some(admin_key)).await
 }
 
+/// TODO: Document spawn_authenticated_runtime_add_peer_triplet.
 pub async fn spawn_authenticated_runtime_add_peer_triplet(
     admin_key: &str,
 ) -> RuntimeAddPeerHarness {
@@ -1181,6 +1266,7 @@ pub async fn spawn_authenticated_runtime_add_peer_triplet(
 
 // ── Restartable node helpers ──────────────────────────────────────────────────
 
+/// TODO: Document serve_with_shutdown.
 fn serve_with_shutdown(listener: TcpListener, app: Router) -> TestNode {
     let addr = listener.local_addr().unwrap().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -1460,6 +1546,7 @@ pub async fn spawn_retained_node_from_node_json(data_dir: &Path) -> Result<TestN
     Ok(node)
 }
 
+/// TODO: Document spawn_stoppable_replication_pair.
 pub async fn spawn_stoppable_replication_pair(
     node_a_id: &str,
     node_b_id: &str,
@@ -1493,6 +1580,7 @@ pub async fn spawn_replication_node_on_existing_dir(
         .expect("replication node should finish pre-serve catch-up before serving")
 }
 
+/// TODO: Document try_spawn_replication_node_on_existing_dir.
 pub async fn try_spawn_replication_node_on_existing_dir(
     data_dir: &Path,
     node_id: &str,
@@ -1533,6 +1621,7 @@ mod tests {
     use axum::http::{Method, StatusCode};
     use tempfile::tempdir;
 
+    /// TODO: Document build_node_router_injects_default_app_id_for_internal_ops_requests.
     #[tokio::test]
     async fn build_node_router_injects_default_app_id_for_internal_ops_requests() {
         let tmp = tempdir().expect("tempdir");

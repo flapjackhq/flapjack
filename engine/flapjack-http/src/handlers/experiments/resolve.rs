@@ -1,3 +1,4 @@
+//! Stub summary for resolve.rs.
 use super::{experiment_error_to_response, AppState};
 use crate::error_response::json_error;
 use axum::{http::StatusCode, response::Response};
@@ -45,6 +46,7 @@ pub(super) fn numeric_id_for_experiment(
     require_numeric_id_mapping(experiment_id, store.get_numeric_id(experiment_id))
 }
 
+/// TODO: Document resolve_experiment_id.
 fn resolve_experiment_id(
     store: &ExperimentStore,
     id_str: &str,

@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/import_contract_tests.rs.
 use super::{
     acknowledge_algolia_migration, authenticated_owner_identity,
     bulk_build::{BulkBuildService, BulkBuildTestEvent},
@@ -879,6 +880,7 @@ fn release_privacy_scrub_boundary(hooks: &PrivacyScrubTestHooks, boundary: Priva
     hooks.control(boundary).release.notify_one();
 }
 
+/// TODO: Document live_import_barriers_are_inert_without_environment.
 #[test]
 fn live_import_barriers_are_inert_without_environment() {
     let _env_lock = ENV_MUTEX.lock().expect("env mutex poisoned");
@@ -904,6 +906,7 @@ fn live_import_barriers_are_inert_without_environment() {
     .expect("post-commit barrier must be inert by default");
 }
 
+/// TODO: Document live_import_barrier_ignores_non_matching_source.
 #[test]
 fn live_import_barrier_ignores_non_matching_source() {
     let _env_lock = ENV_MUTEX.lock().expect("env mutex poisoned");
@@ -927,6 +930,7 @@ fn live_import_barrier_ignores_non_matching_source() {
     );
 }
 
+/// TODO: Document live_import_barrier_records_job_and_waits_for_release.
 #[test]
 fn live_import_barrier_records_job_and_waits_for_release() {
     let _env_lock = ENV_MUTEX.lock().expect("env mutex poisoned");
@@ -966,6 +970,7 @@ fn live_import_barrier_records_job_and_waits_for_release() {
     assert_eq!(fs::read_to_string(observed).unwrap(), job_uuid.to_string());
 }
 
+/// TODO: Document live_import_post_commit_barrier_times_out_bounded.
 #[test]
 fn live_import_post_commit_barrier_times_out_bounded() {
     let _env_lock = ENV_MUTEX.lock().expect("env mutex poisoned");
@@ -1019,6 +1024,7 @@ fn hermetic_source_reader_with_documents(
     )
 }
 
+/// TODO: Document hermetic_source_reader_with_settings_and_pages.
 fn hermetic_source_reader_with_settings_and_pages(
     settings: serde_json::Value,
     document_pages: Vec<Vec<serde_json::Value>>,
@@ -1635,6 +1641,7 @@ fn read_migration_phase_at(base_path: &Path, job_uuid: uuid::Uuid) -> MigrationP
         .expect("migration phase should be directly readable")
 }
 
+/// TODO: Document async_import_submission_returns_uuid_while_source_is_blocked_then_succeeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_import_submission_returns_uuid_while_source_is_blocked_then_succeeds() {
     let tmp = TempDir::new().unwrap();
@@ -1861,6 +1868,7 @@ async fn async_import_create_then_overwrite_replaces_exact_target() {
     );
 }
 
+/// TODO: Document async_import_runner_allows_two_targets_to_reach_source_barrier_together.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_import_runner_allows_two_targets_to_reach_source_barrier_together() {
     let tmp = TempDir::new().unwrap();
@@ -1907,6 +1915,7 @@ async fn async_import_runner_allows_two_targets_to_reach_source_barrier_together
     assert_eq!(state.migration_runner.active_count_for_test(), 0);
 }
 
+/// TODO: Document async_import_cancel_after_export_acceptance_settles_cancelled_and_publishes_no_target.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_import_cancel_after_export_acceptance_settles_cancelled_and_publishes_no_target() {
     let tmp = TempDir::new().unwrap();
@@ -1940,6 +1949,7 @@ async fn async_import_cancel_after_export_acceptance_settles_cancelled_and_publi
     assert_target_absent_from_disk_and_list(&state, TARGET_INDEX).await;
 }
 
+/// TODO: Document async_import_cancel_during_document_staging_drains_writer_and_releases_accounting.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_import_cancel_during_document_staging_drains_writer_and_releases_accounting() {
     let tmp = TempDir::new().unwrap();
@@ -2009,6 +2019,7 @@ async fn async_import_cancel_during_document_staging_drains_writer_and_releases_
     assert_target_absent_from_disk_and_list(&state, "cancel_during_staging_target").await;
 }
 
+/// TODO: Document async_import_cancel_before_activation_aborts_publication_transaction.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_import_cancel_before_activation_aborts_publication_transaction() {
     let tmp = TempDir::new().unwrap();
@@ -2075,6 +2086,7 @@ async fn async_import_cancel_before_activation_aborts_publication_transaction() 
     assert_target_absent_from_disk_and_list(&state, TARGET_INDEX).await;
 }
 
+/// TODO: Document async_import_precommit_cancel_preserves_preexisting_destination.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_import_precommit_cancel_preserves_preexisting_destination() {
     let tmp = TempDir::new().unwrap();
@@ -2161,6 +2173,7 @@ async fn async_import_precommit_cancel_preserves_preexisting_destination() {
     );
 }
 
+/// TODO: Document async_import_cancel_after_activation_is_too_late_and_keeps_committed_target.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_import_cancel_after_activation_is_too_late_and_keeps_committed_target() {
     let tmp = TempDir::new().unwrap();
@@ -2240,6 +2253,7 @@ async fn async_import_cancel_after_activation_is_too_late_and_keeps_committed_ta
     .await;
 }
 
+/// TODO: Document async_import_capacity_refusal_is_retryable_and_writes_no_new_job_artifacts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_import_capacity_refusal_is_retryable_and_writes_no_new_job_artifacts() {
     let tmp = TempDir::new().unwrap();
@@ -2296,6 +2310,7 @@ async fn async_import_capacity_refusal_is_retryable_and_writes_no_new_job_artifa
     wait_for_active_count(&state, 0).await;
 }
 
+/// TODO: Document async_import_overwrite_true_records_replacement_semantic.
 #[tokio::test]
 async fn async_import_overwrite_true_records_replacement_semantic() {
     let tmp = TempDir::new().unwrap();
@@ -2333,6 +2348,7 @@ async fn async_import_overwrite_true_records_replacement_semantic() {
     );
 }
 
+/// TODO: Document async_import_ha_state_is_refused_by_shared_admission_owner.
 #[tokio::test]
 async fn async_import_ha_state_is_refused_by_shared_admission_owner() {
     let tmp = TempDir::new().unwrap();
@@ -2364,6 +2380,7 @@ async fn async_import_ha_state_is_refused_by_shared_admission_owner() {
     assert_no_migration_artifacts(&state);
 }
 
+/// TODO: Document async_admission_recovery_removes_metadata_only_partial_and_preserves_sync_phase.
 #[test]
 fn async_admission_recovery_removes_metadata_only_partial_and_preserves_sync_phase() {
     let tmp = TempDir::new().unwrap();
@@ -2400,6 +2417,7 @@ fn async_admission_recovery_removes_metadata_only_partial_and_preserves_sync_pha
     );
 }
 
+/// TODO: Document async_import_source_error_settles_failed_and_releases_accounting.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_import_source_error_settles_failed_and_releases_accounting() {
     let tmp = TempDir::new().unwrap();
@@ -2424,6 +2442,7 @@ async fn async_import_source_error_settles_failed_and_releases_accounting() {
     assert_target_absent_from_disk_and_list(&state, TARGET_INDEX).await;
 }
 
+/// TODO: Document async_import_panic_settles_failed_and_releases_accounting.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_import_panic_settles_failed_and_releases_accounting() {
     let tmp = TempDir::new().unwrap();
@@ -2443,6 +2462,7 @@ async fn async_import_panic_settles_failed_and_releases_accounting() {
     assert_target_absent_from_disk_and_list(&state, TARGET_INDEX).await;
 }
 
+/// TODO: Document migrate_phase_observed_during_staging_keeps_export_progress_nonterminal.
 #[tokio::test]
 async fn migrate_phase_observed_during_staging_keeps_export_progress_nonterminal() {
     let tmp = TempDir::new().unwrap();
@@ -2496,6 +2516,7 @@ async fn migrate_phase_observed_during_staging_keeps_export_progress_nonterminal
     );
 }
 
+/// TODO: Document migrate_staging_failure_records_terminal_failure.
 #[tokio::test]
 async fn migrate_staging_failure_records_terminal_failure() {
     let tmp = TempDir::new().unwrap();
@@ -2672,6 +2693,7 @@ async fn async_import_bounds_nonclearing_retryable_write_failure() {
     assert_target_absent_from_disk_and_list(&state, TARGET_INDEX).await;
 }
 
+/// TODO: Document migrate_failure_settlement_phase_write_error_surfaces_storage_failure.
 #[tokio::test]
 async fn migrate_failure_settlement_phase_write_error_surfaces_storage_failure() {
     let tmp = TempDir::new().unwrap();
@@ -2724,6 +2746,7 @@ async fn migrate_failure_settlement_phase_write_error_surfaces_storage_failure()
     assert_eq!(phase.terminal_at, None);
 }
 
+/// TODO: Document migrate_pre_activation_phase_is_nonterminal_activating.
 #[tokio::test]
 async fn migrate_pre_activation_phase_is_nonterminal_activating() {
     let tmp = TempDir::new().unwrap();
@@ -2769,6 +2792,7 @@ async fn migrate_pre_activation_phase_is_nonterminal_activating() {
     assert_eq!(observed.terminal_at, None);
 }
 
+/// TODO: Document migrate_success_records_terminal_success_after_artifact_deletion.
 #[tokio::test]
 async fn migrate_success_records_terminal_success_after_artifact_deletion() {
     let tmp = TempDir::new().unwrap();
@@ -2809,6 +2833,7 @@ async fn migrate_success_records_terminal_success_after_artifact_deletion() {
     );
 }
 
+/// TODO: Document migrate_reported_counts_imply_target_contains_documents.
 #[tokio::test]
 async fn migrate_reported_counts_imply_target_contains_documents() {
     let tmp = TempDir::new().unwrap();
@@ -3149,6 +3174,7 @@ async fn duplicate_validation_runs_before_any_activation_fence() {
     );
 }
 
+/// TODO: Document migrate_published_target_serves_facets_from_source_settings.
 #[tokio::test]
 async fn migrate_published_target_serves_facets_from_source_settings() {
     let tmp = TempDir::new().unwrap();
@@ -3181,6 +3207,7 @@ async fn migrate_published_target_serves_facets_from_source_settings() {
     .await;
 }
 
+/// TODO: Document migrate_refuses_ha_cluster_before_import_admission.
 #[tokio::test]
 async fn migrate_refuses_ha_cluster_before_import_admission() {
     let tmp = TempDir::new().unwrap();
@@ -3221,6 +3248,7 @@ async fn migrate_refuses_ha_cluster_before_import_admission() {
     assert_no_migration_artifacts(&state);
 }
 
+/// TODO: Document migrate_overwrite_true_ha_is_refused_before_admission.
 #[tokio::test]
 async fn migrate_overwrite_true_ha_is_refused_before_admission() {
     let tmp = TempDir::new().unwrap();
@@ -3257,6 +3285,7 @@ async fn migrate_overwrite_true_ha_is_refused_before_admission() {
     assert_no_migration_artifacts(&state);
 }
 
+/// TODO: Document migrate_overwrite_true_node_local_sync_is_admitted_after_fence_contract.
 #[tokio::test]
 async fn migrate_overwrite_true_node_local_sync_is_admitted_after_fence_contract() {
     let tmp = TempDir::new().unwrap();
@@ -3390,6 +3419,7 @@ async fn migrate_overwrite_with_acknowledged_pre_activation_write_completes() {
     );
 }
 
+/// TODO: Document migrate_preexisting_searchable_target_survives_canonical_conflict.
 #[tokio::test]
 async fn migrate_preexisting_searchable_target_survives_canonical_conflict() {
     let tmp = TempDir::new().unwrap();
@@ -3421,6 +3451,7 @@ async fn migrate_preexisting_searchable_target_survives_canonical_conflict() {
     assert_preexisting_target_resources(&state, TARGET_INDEX).await;
 }
 
+/// TODO: Document migrate_two_concurrent_imports_admit_exactly_one_create_only_winner.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn migrate_two_concurrent_imports_admit_exactly_one_create_only_winner() {
     let tmp = TempDir::new().unwrap();
@@ -3494,6 +3525,7 @@ async fn migrate_two_concurrent_imports_admit_exactly_one_create_only_winner() {
     );
 }
 
+/// TODO: Document migrate_translation_hard_rejection_aborts_publication_and_keeps_spool_evidence.
 #[tokio::test]
 async fn migrate_translation_hard_rejection_aborts_publication_and_keeps_spool_evidence() {
     let tmp = TempDir::new().unwrap();
@@ -3540,6 +3572,7 @@ async fn migrate_translation_hard_rejection_aborts_publication_and_keeps_spool_e
     assert_no_retained_accepted_spool_document_artifacts(&state);
 }
 
+/// TODO: Document migrate_corrupt_accepted_artifact_aborts_publication_and_keeps_spool_evidence.
 #[tokio::test]
 async fn migrate_corrupt_accepted_artifact_aborts_publication_and_keeps_spool_evidence() {
     let tmp = TempDir::new().unwrap();
@@ -3570,6 +3603,7 @@ async fn migrate_corrupt_accepted_artifact_aborts_publication_and_keeps_spool_ev
     assert_spool_lifecycle_with_artifacts(&state, "Accepted");
 }
 
+/// TODO: Document migrate_staging_document_write_failure_aborts_publication_and_keeps_spool_evidence.
 #[tokio::test]
 async fn migrate_staging_document_write_failure_aborts_publication_and_keeps_spool_evidence() {
     let tmp = TempDir::new().unwrap();
@@ -3598,6 +3632,7 @@ async fn migrate_staging_document_write_failure_aborts_publication_and_keeps_spo
     assert_spool_lifecycle_with_artifacts(&state, "Accepted");
 }
 
+/// TODO: Document migrate_mid_document_export_failure_fails_job_without_activating_target.
 #[tokio::test]
 async fn migrate_mid_document_export_failure_fails_job_without_activating_target() {
     let tmp = TempDir::new().unwrap();
@@ -4213,6 +4248,7 @@ async fn async_migration_resume_reclaimed_or_absent_is_not_available() {
     );
 }
 
+/// TODO: Document migrate_pre_activation_unwind_drops_staging_without_activating_target.
 #[tokio::test]
 async fn migrate_pre_activation_unwind_drops_staging_without_activating_target() {
     let tmp = TempDir::new().unwrap();
@@ -4240,6 +4276,7 @@ async fn migrate_pre_activation_unwind_drops_staging_without_activating_target()
     assert_spool_lifecycle_with_artifacts(&state, "Accepted");
 }
 
+/// TODO: Document migrate_ha_retry_after_success_is_refused_before_reader_or_spool_write.
 #[tokio::test]
 async fn migrate_ha_retry_after_success_is_refused_before_reader_or_spool_write() {
     let tmp = TempDir::new().unwrap();
@@ -4294,6 +4331,7 @@ async fn migrate_ha_retry_after_success_is_refused_before_reader_or_spool_write(
     }
 }
 
+/// TODO: Document migrate_three_page_import_streams_bounded_batches_and_activates_all_documents.
 #[tokio::test]
 async fn migrate_three_page_import_streams_bounded_batches_and_activates_all_documents() {
     let tmp = TempDir::new().unwrap();
@@ -4336,6 +4374,7 @@ async fn migrate_three_page_import_streams_bounded_batches_and_activates_all_doc
     assert_no_retained_accepted_spool_document_artifacts(&state);
 }
 
+/// TODO: Document migrate_validates_request_before_ha_admission_guard.
 #[tokio::test]
 async fn migrate_validates_request_before_ha_admission_guard() {
     let tmp = TempDir::new().unwrap();
@@ -4379,6 +4418,7 @@ async fn migrate_validates_request_before_ha_admission_guard() {
     assert_no_migration_artifacts(&state);
 }
 
+/// TODO: Document migrate_validates_target_index_before_ha_admission_guard.
 #[tokio::test]
 async fn migrate_validates_target_index_before_ha_admission_guard() {
     let tmp = TempDir::new().unwrap();
@@ -4446,6 +4486,7 @@ fn spool_job_count(state: &Arc<crate::handlers::AppState>) -> usize {
         .len()
 }
 
+/// TODO: Document assert_import_reported_equals_target_contents.
 async fn assert_import_reported_equals_target_contents(
     state: &Arc<crate::handlers::AppState>,
     response: Result<Json<MigrateFromAlgoliaResponse>, super::MigrateError>,
@@ -4478,6 +4519,7 @@ async fn assert_import_reported_equals_target_contents(
     }
 }
 
+/// TODO: Document assert_target_facets.
 async fn assert_target_facets(
     state: &Arc<crate::handlers::AppState>,
     target_index: &str,
@@ -4538,6 +4580,7 @@ fn document_page(start: usize, count: usize) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// TODO: Document submit_blocked_async_import.
 async fn submit_blocked_async_import(
     state: &Arc<crate::handlers::AppState>,
     target_index: &str,
@@ -4585,6 +4628,7 @@ async fn wait_for_successful_pause_injection(
     .expect("backpressure pause injection should succeed before migration settlement");
 }
 
+/// TODO: Document wait_for_terminal_phase.
 async fn wait_for_terminal_phase(
     state: &Arc<crate::handlers::AppState>,
     job_uuid: uuid::Uuid,

@@ -38,6 +38,7 @@ extract_readme_curl_block() {
   ' "$README_PATH"
 }
 
+# TODO: Document run_readme_curl.
 run_readme_curl() {
   local path="$1"
   local command_block=""

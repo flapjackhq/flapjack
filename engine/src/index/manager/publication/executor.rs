@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/manager/publication/executor.rs.
 use super::digest::canonical_tenant_tree_digest;
 #[cfg(feature = "test-support")]
 use super::fault::PanicAtCheckpoint;
@@ -173,6 +174,7 @@ impl PreStagedPublication {
         self.activate_with_mode_and_fence(ActivationMode::Replace, Some(fence_evidence))
     }
 
+    /// TODO: Document PreStagedPublication.activate_with_mode.
     fn activate_with_mode(
         self,
         mode: ActivationMode,
@@ -251,6 +253,7 @@ impl PreStagedPublication {
         self.activate_with_mode_fence_and_io(ActivationMode::Replace, Some(fence_evidence), &io)
     }
 
+    /// TODO: Document PreStagedPublication.activate_with_fault_for_test.
     #[cfg(test)]
     pub(crate) fn activate_with_fault_for_test(
         self,
@@ -516,6 +519,7 @@ impl PublicationArtifactManifest {
     }
 }
 
+/// TODO: Document resolved_move_manifest.
 fn resolved_move_manifest(
     base: &Path,
     analytics: &AnalyticsConfig,
@@ -629,6 +633,7 @@ pub(crate) fn activate_publication_with_fence_and_faults_for_test(
     )
 }
 
+/// TODO: Document activate_publication_inner.
 fn activate_publication_inner(
     inputs: PublicationActivationInputs<'_>,
     context: &ActivationContext<'_>,
@@ -757,6 +762,7 @@ fn cleanup_committed_publication_journals(
     io.sync_dir(target_root)
 }
 
+/// TODO: Document prepare_digest_evidence.
 fn prepare_digest_evidence(
     paths: &PublicationPaths,
     manifest: &mut PublicationArtifactManifest,
@@ -815,6 +821,7 @@ fn verify_staged_committed_seq_watermark(
     Ok(())
 }
 
+/// TODO: Document cleanup_unprepared_transaction.
 fn cleanup_unprepared_transaction(
     paths: &PublicationPaths,
     manifest: &PublicationArtifactManifest,
@@ -971,6 +978,7 @@ fn transaction_namespace(paths: &PublicationPaths) -> Result<&Path> {
         .ok_or_else(|| invalid_publication("publication staging path has no transaction namespace"))
 }
 
+/// TODO: Document resolve_failed_activation.
 fn resolve_failed_activation(
     paths: &PublicationPaths,
     manifest: &PublicationArtifactManifest,
@@ -993,6 +1001,7 @@ fn resolve_failed_activation(
     Err(activation_error)
 }
 
+/// TODO: Document promote_staging.
 fn promote_staging(
     paths: &PublicationPaths,
     manifest: &PublicationArtifactManifest,
@@ -1013,6 +1022,7 @@ fn promote_staging(
     Ok(())
 }
 
+/// TODO: Document rollback_activation.
 fn rollback_activation(
     paths: &PublicationPaths,
     manifest: &PublicationArtifactManifest,
@@ -1046,6 +1056,7 @@ pub(super) fn capture_journaled_sidecars(
     Ok(())
 }
 
+/// TODO: Document promote_journaled_sidecars.
 pub(super) fn promote_journaled_sidecars(
     manifest: &PublicationArtifactManifest,
     io: &PublicationIo<'_>,
@@ -1106,6 +1117,7 @@ fn remove_query_suggestions(
     io.remove_if_exists(&artifacts.status_path)
 }
 
+/// TODO: Document restore_journaled_sidecars.
 pub(super) fn restore_journaled_sidecars(
     paths: &PublicationPaths,
     manifest: &PublicationArtifactManifest,
@@ -1157,6 +1169,7 @@ pub(super) enum JournalWritePhase {
     Rollback,
 }
 
+/// TODO: Document persist_journal.
 pub(super) fn persist_journal(
     paths: &PublicationPaths,
     journal: &PublicationJournal,
@@ -1193,6 +1206,7 @@ impl JournalWritePhase {
     }
 }
 
+/// TODO: Document quarantine_journal.
 fn quarantine_journal(
     paths: &PublicationPaths,
     journal: &PublicationJournal,
@@ -1210,6 +1224,7 @@ fn quarantine_journal(
     Ok(())
 }
 
+/// TODO: Document validate_manifest_entries.
 pub(super) fn validate_manifest_entries(
     entries: &[PublicationArtifactManifestEntry],
 ) -> Result<()> {
@@ -1238,6 +1253,7 @@ pub(super) fn validate_manifest_entries(
     Ok(())
 }
 
+/// TODO: Document reject_overlapping_manifest_entry.
 fn reject_overlapping_manifest_entry(
     owners: &BTreeSet<(PublicationArtifactRoot, PathBuf)>,
     root: PublicationArtifactRoot,
@@ -1255,6 +1271,7 @@ fn reject_overlapping_manifest_entry(
     Ok(())
 }
 
+/// TODO: Document validate_manifest_entry.
 fn validate_manifest_entry(entry: &PublicationArtifactManifestEntry) -> Result<()> {
     validate_relative_path(
         "publication artifact original path",
@@ -1346,6 +1363,7 @@ struct ArtifactDigestRecord {
     bytes: Vec<u8>,
 }
 
+/// TODO: Document collect_artifact_digest_records.
 fn collect_artifact_digest_records(
     root: &Path,
     current: &Path,
@@ -1431,6 +1449,7 @@ fn sync_tree(path: &Path, io: &PublicationIo<'_>) -> Result<()> {
     Ok(())
 }
 
+/// TODO: Document copy_path_durably.
 pub(super) fn copy_path_durably(from: &Path, to: &Path, io: &PublicationIo<'_>) -> Result<()> {
     let metadata = fs::symlink_metadata(from)?;
     if metadata.file_type().is_symlink() {
@@ -1513,6 +1532,7 @@ pub(super) fn sidecar_residue_root(paths: &PublicationPaths) -> PathBuf {
         .join("sidecars")
 }
 
+/// TODO: Document query_suggestions_manifest_entries.
 fn query_suggestions_manifest_entries(
     original: QsTargetArtifactPaths,
     promoted: QsTargetArtifactPaths,

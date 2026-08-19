@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/objects_tests.rs.
 use super::*;
 use axum::http::StatusCode;
 
@@ -1274,6 +1275,7 @@ mod content_hash_and_idempotency {
         )
     }
 
+    /// TODO: Document post_auto_id.
     async fn post_auto_id(
         app: &Router,
         index: &str,
@@ -1302,6 +1304,7 @@ mod content_hash_and_idempotency {
         (status, json)
     }
 
+    /// TODO: Document post_batch.
     async fn post_batch(
         app: &Router,
         index: &str,
@@ -1353,6 +1356,7 @@ mod content_hash_and_idempotency {
         (status, headers, raw)
     }
 
+    /// TODO: Document install_idempotency_store_failure_trigger.
     fn install_idempotency_store_failure_trigger(state: &Arc<AppState>) {
         let cache_path = state
             .idempotency_cache
@@ -1371,6 +1375,7 @@ mod content_hash_and_idempotency {
         .expect("install sqlite trigger to force post-commit idempotency store failure");
     }
 
+    /// TODO: Document index_document_count.
     fn index_document_count(state: &Arc<AppState>, index_name: &str) -> usize {
         let index = state
             .manager
@@ -1771,6 +1776,7 @@ mod content_hash_and_idempotency {
         assert_eq!(r1, r2);
     }
 
+    /// TODO: Document test_auto_id_post_commit_idempotency_store_failure_preserves_created_response.
     #[tokio::test]
     async fn test_auto_id_post_commit_idempotency_store_failure_preserves_created_response() {
         let env_guard = crate::test_helpers::with_env_var("FLAPJACK_IDEMPOTENCY_PERSISTENT", "1");
@@ -1794,6 +1800,7 @@ mod content_hash_and_idempotency {
         assert!(body.get("objectID").and_then(|v| v.as_str()).is_some());
     }
 
+    /// TODO: Document test_batch_post_commit_idempotency_store_failure_preserves_success_response.
     #[tokio::test]
     async fn test_batch_post_commit_idempotency_store_failure_preserves_success_response() {
         let env_guard = crate::test_helpers::with_env_var("FLAPJACK_IDEMPOTENCY_PERSISTENT", "1");

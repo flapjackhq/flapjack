@@ -1,3 +1,4 @@
+//! Stub summary for chat.rs.
 use axum::{
     extract::{Extension, Path, State},
     http::{header, HeaderMap, StatusCode},
@@ -339,6 +340,7 @@ fn normalized_non_empty(value: Option<String>) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// TODO: Document validate_ai_base_url.
 fn validate_ai_base_url(
     base_url: &str,
 ) -> Result<Option<flapjack::security::VettedOutboundUrlTarget>, String> {

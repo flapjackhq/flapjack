@@ -1,3 +1,4 @@
+//! Stub summary for settings_tests.rs.
 use super::*;
 use crate::test_helpers::TestStateBuilder;
 use axum::body::Body;
@@ -53,6 +54,7 @@ async fn get_settings_json(app: &Router) -> serde_json::Value {
     serde_json::from_slice(&body).unwrap()
 }
 
+/// TODO: Document post_search_json.
 async fn post_search_json(
     app: &Router,
     index_name: &str,
@@ -81,6 +83,7 @@ async fn post_search_json(
     serde_json::from_slice(&body).unwrap()
 }
 
+/// TODO: Document test_get_settings_corrupt_settings_file_returns_sanitized_500.
 #[tokio::test]
 async fn test_get_settings_corrupt_settings_file_returns_sanitized_500() {
     let tmp = TempDir::new().unwrap();
@@ -127,6 +130,7 @@ async fn test_get_settings_corrupt_settings_file_returns_sanitized_500() {
     );
 }
 
+/// TODO: Document test_set_settings_when_tenant_path_is_file_returns_sanitized_500.
 #[tokio::test]
 async fn test_set_settings_when_tenant_path_is_file_returns_sanitized_500() {
     let tmp = TempDir::new().unwrap();
@@ -404,6 +408,7 @@ async fn test_set_settings_pagination_limited_to_roundtrip() {
     assert_eq!(json["paginationLimitedTo"], serde_json::json!(50));
 }
 
+/// TODO: Document test_set_settings_reindexes_existing_documents_for_facets.
 #[tokio::test]
 async fn test_set_settings_reindexes_existing_documents_for_facets() {
     let tmp = TempDir::new().unwrap();
@@ -613,6 +618,53 @@ async fn test_merge_settings_payload_partial_update_preserves_omitted_fields() {
         serde_json::json!(384)
     );
     assert_eq!(json["paginationLimitedTo"], serde_json::json!(75));
+}
+
+#[tokio::test]
+async fn test_selected_false_zero_empty_array_and_empty_string_values_roundtrip() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let app = settings_router(state);
+
+    let response = post_settings(
+        &app,
+        r#"{
+            "ranking": [],
+            "customRanking": [],
+            "attributesToHighlight": [],
+            "attributesToSnippet": [],
+            "highlightPreTag": "",
+            "highlightPostTag": "",
+            "snippetEllipsisText": "",
+            "hitsPerPage": 0,
+            "paginationLimitedTo": 0,
+            "queryLanguages": [],
+            "removeStopWords": false,
+            "ignorePlurals": false,
+            "distinct": false
+        }"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let settings = get_settings_json(&app).await;
+    for field in [
+        "ranking",
+        "customRanking",
+        "attributesToHighlight",
+        "attributesToSnippet",
+        "queryLanguages",
+    ] {
+        assert_eq!(settings[field], serde_json::json!([]), "{field}");
+    }
+    for field in ["highlightPreTag", "highlightPostTag", "snippetEllipsisText"] {
+        assert_eq!(settings[field], serde_json::json!(""), "{field}");
+    }
+    assert_eq!(settings["hitsPerPage"], serde_json::json!(0));
+    assert_eq!(settings["paginationLimitedTo"], serde_json::json!(0));
+    assert_eq!(settings["removeStopWords"], serde_json::json!(false));
+    assert_eq!(settings["ignorePlurals"], serde_json::json!(false));
+    assert_eq!(settings["distinct"], serde_json::json!(false));
 }
 
 #[tokio::test]
@@ -2192,8 +2244,8 @@ async fn test_a5_forward_to_replicas_propagates_empty_list_clears() {
             .get("queryLanguages")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
-        serde_json::Value::Null,
-        "forwardToReplicas should propagate empty queryLanguages to clear replica"
+        serde_json::json!([]),
+        "forwardToReplicas should preserve an explicit empty queryLanguages clear"
     );
 }
 
@@ -2593,6 +2645,7 @@ async fn test_query_type_persists_to_disk() {
         "queryType should be persisted to disk"
     );
 }
+/// TODO: Document test_ranking_roundtrip_is_supported.
 #[tokio::test]
 async fn test_ranking_roundtrip_is_supported() {
     let tmp = TempDir::new().unwrap();
@@ -2631,6 +2684,7 @@ async fn test_ranking_roundtrip_is_supported() {
         "ranking should persist through GET after update"
     );
 }
+/// TODO: Document test_stage4_structural_settings_roundtrip_is_supported.
 #[tokio::test]
 async fn test_stage4_structural_settings_roundtrip_is_supported() {
     let tmp = TempDir::new().unwrap();
@@ -2693,6 +2747,7 @@ async fn test_stage4_structural_settings_roundtrip_is_supported() {
         serde_json::json!(["sku"])
     );
 }
+/// TODO: Document test_forward_to_replicas_rejects_invalid_boolean_value.
 #[tokio::test]
 async fn test_forward_to_replicas_rejects_invalid_boolean_value() {
     let tmp = TempDir::new().unwrap();
@@ -2709,6 +2764,7 @@ async fn test_forward_to_replicas_rejects_invalid_boolean_value() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// TODO: Document test_synonyms_batch_rejects_invalid_forward_to_replicas_boolean_value.
 #[tokio::test]
 async fn test_synonyms_batch_rejects_invalid_forward_to_replicas_boolean_value() {
     let tmp = TempDir::new().unwrap();
@@ -2725,6 +2781,7 @@ async fn test_synonyms_batch_rejects_invalid_forward_to_replicas_boolean_value()
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// TODO: Document test_synonyms_batch_rejects_invalid_replace_existing_boolean_value.
 #[tokio::test]
 async fn test_synonyms_batch_rejects_invalid_replace_existing_boolean_value() {
     let tmp = TempDir::new().unwrap();
@@ -2741,6 +2798,7 @@ async fn test_synonyms_batch_rejects_invalid_replace_existing_boolean_value() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// TODO: Document test_rules_batch_rejects_invalid_forward_to_replicas_boolean_value.
 #[tokio::test]
 async fn test_rules_batch_rejects_invalid_forward_to_replicas_boolean_value() {
     let tmp = TempDir::new().unwrap();
@@ -2757,6 +2815,7 @@ async fn test_rules_batch_rejects_invalid_forward_to_replicas_boolean_value() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// TODO: Document test_rules_batch_rejects_invalid_clear_existing_boolean_value.
 #[tokio::test]
 async fn test_rules_batch_rejects_invalid_clear_existing_boolean_value() {
     let tmp = TempDir::new().unwrap();

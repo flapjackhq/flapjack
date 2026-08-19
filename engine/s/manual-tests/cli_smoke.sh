@@ -39,6 +39,7 @@ generate_admin_key() {
   printf 'fj_cli_smoke_%s\n' "$random_hex"
 }
 
+# TODO: Document cleanup.
 cleanup() {
   local script_exit_code=$?
   # Delete test index

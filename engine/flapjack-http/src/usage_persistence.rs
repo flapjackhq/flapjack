@@ -1,3 +1,5 @@
+//! Stub summary for engine/flapjack-http/src/usage_persistence.rs.
+
 use crate::usage_middleware::TenantUsageCounters;
 use chrono::NaiveDate;
 use dashmap::DashMap;
@@ -237,6 +239,7 @@ impl UsagePersistence {
         self.counters_and_gauges_to_snapshot(date, counters, &HashMap::new())
     }
 
+    /// TODO: Document UsagePersistence.counters_and_gauges_to_snapshot.
     fn counters_and_gauges_to_snapshot(
         &self,
         date: &str,
@@ -306,6 +309,7 @@ mod tests {
         assert_eq!(snapshot.documents_deleted, 0);
     }
 
+    /// TODO: Document legacy_snapshot_without_gauges_loads_as_absent.
     #[test]
     fn legacy_snapshot_without_gauges_loads_as_absent() {
         let tmp = TempDir::new().unwrap();
@@ -342,6 +346,7 @@ mod tests {
         assert_eq!(legacy.storage_bytes, None);
     }
 
+    /// TODO: Document gauge_aware_save_preserves_optional_values_and_unions_indexes.
     #[test]
     fn gauge_aware_save_preserves_optional_values_and_unions_indexes() {
         let tmp = TempDir::new().unwrap();
@@ -405,6 +410,7 @@ mod tests {
         assert_eq!(empty.storage_bytes, Some(0));
     }
 
+    /// TODO: Document gauge_aware_rollup_resets_only_counters.
     #[test]
     fn gauge_aware_rollup_resets_only_counters() {
         let tmp = TempDir::new().unwrap();

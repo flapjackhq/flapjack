@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/usage_capture.rs.
 use crate::usage_persistence::CapturedUsageGauges;
 use dashmap::DashMap;
 use std::collections::HashMap;
@@ -54,6 +55,7 @@ pub(crate) fn capture_requested_live_gauges(
     )
 }
 
+/// TODO: Document capture_requested_from_sources.
 fn capture_requested_from_sources<CaptureDocuments, CaptureStorage>(
     selection: UsageGaugeSelection,
     capture_documents: CaptureDocuments,
@@ -73,6 +75,7 @@ where
     captured
 }
 
+/// TODO: Document capture_document_counts.
 fn capture_document_counts(
     manager: &flapjack::IndexManager,
     index_filter: Option<&str>,
@@ -99,6 +102,7 @@ fn capture_document_counts(
     }
 }
 
+/// TODO: Document capture_storage_bytes.
 fn capture_storage_bytes(
     storage_gauges: Option<&DashMap<String, u64>>,
     index_filter: Option<&str>,
@@ -133,6 +137,7 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
+    /// TODO: Document storage_only_capture_does_not_access_document_source.
     #[test]
     fn storage_only_capture_does_not_access_document_source() {
         let document_source_accessed = Cell::new(false);
@@ -166,6 +171,7 @@ mod tests {
         assert_eq!(captured.get("empty").unwrap().storage_bytes, Some(0));
     }
 
+    /// TODO: Document documents_only_capture_does_not_access_storage_source.
     #[test]
     fn documents_only_capture_does_not_access_storage_source() {
         let document_source_accessed = Cell::new(false);

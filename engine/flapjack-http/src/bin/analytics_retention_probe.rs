@@ -1,3 +1,4 @@
+//! Stub summary for analytics_retention_probe.rs.
 use flapjack::analytics::manifest::RollupManifest;
 use flapjack::analytics::retention::cleanup_old_partitions;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ fn fail(message: impl AsRef<str>) -> ! {
     std::process::exit(1);
 }
 
+/// TODO: Document ensure_probe_layout.
 fn ensure_probe_layout(analytics_dir: &Path) -> Result<PathBuf, String> {
     let probe_index_dir = analytics_dir.join(PROBE_INDEX_NAME);
     let probe_partition_dir = probe_index_dir.join("searches").join(PROBE_PARTITION);
@@ -32,6 +34,7 @@ fn cleanup_probe_index(analytics_dir: &Path) {
     let _ = std::fs::remove_dir_all(analytics_dir.join(PROBE_INDEX_NAME));
 }
 
+/// TODO: Document main.
 fn main() {
     let analytics_dir = match std::env::args().nth(1) {
         Some(value) => PathBuf::from(value),

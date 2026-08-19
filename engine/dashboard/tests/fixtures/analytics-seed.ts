@@ -13,6 +13,9 @@
 import type { APIRequestContext, APIResponse } from '@playwright/test';
 import { API_BASE as API, API_HEADERS as HEADERS } from './local-instance';
 
+/**
+ * TODO: Document AnalyticsSeedConfig.
+ */
 export interface AnalyticsSeedConfig {
   /** Index name to seed */
   indexName: string;

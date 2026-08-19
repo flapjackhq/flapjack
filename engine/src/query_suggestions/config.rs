@@ -150,6 +150,15 @@ impl QsConfigStore {
         validate_store_index_name(&config.index_name)?;
         for source in &config.source_indices {
             validate_store_index_name(&source.index_name)?;
+            if source.index_name == config.index_name {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "source index '{}' must differ from the suggestions destination",
+                        source.index_name
+                    ),
+                ));
+            }
         }
         let path = self.config_path(&config.index_name)?;
         let json = serde_json::to_string_pretty(config).map_err(std::io::Error::other)?;
@@ -198,13 +207,17 @@ impl QsConfigStore {
     }
 
     pub fn delete_config(&self, index_name: &str) -> std::io::Result<bool> {
-        let path = self.config_path(index_name)?;
-        if path.exists() {
-            std::fs::remove_file(path)?;
-            Ok(true)
-        } else {
-            Ok(false)
+        let paths = self.target_artifact_paths(index_name)?;
+        if !paths.config_path.exists() {
+            return Ok(false);
         }
+        for sidecar in [&paths.status_path, &paths.log_path] {
+            if sidecar.exists() {
+                std::fs::remove_file(sidecar)?;
+            }
+        }
+        std::fs::remove_file(paths.config_path)?;
+        Ok(true)
     }
 
     /// Load the build status for an index, or return a default status if not found.
@@ -241,6 +254,40 @@ impl QsConfigStore {
         let path = self.status_path(&status.index_name)?;
         let json = serde_json::to_string(status).map_err(std::io::Error::other)?;
         crate::index::atomic_write_file(&path, json.as_bytes())
+    }
+
+    /// Persist a terminal failed build using the Algolia-compatible status
+    /// fields: `lastBuiltAt` advances while `lastSuccessfulBuiltAt` does not.
+    /// The paired ERROR log carries the human-readable reason.
+    pub fn record_failed_build(&self, index_name: &str, message: &str) -> std::io::Result<()> {
+        self.record_failed_build_before_terminal(index_name, message, || {})
+    }
+
+    fn record_failed_build_before_terminal<F>(
+        &self,
+        index_name: &str,
+        message: &str,
+        before_terminal_status: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(),
+    {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut status = self.load_status(index_name);
+        self.append_log(
+            index_name,
+            &[LogEntry {
+                timestamp: now.clone(),
+                level: "ERROR".to_string(),
+                message: message.to_string(),
+                context_level: 0,
+            }],
+        )?;
+        self.truncate_log(index_name, 1000)?;
+        before_terminal_status();
+        status.is_running = false;
+        status.last_built_at = Some(now);
+        self.save_status(&status)
     }
 
     /// Write log entries to an index's log file in newline-delimited JSON format.
@@ -408,7 +455,30 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = QsConfigStore::new(tmp.path());
         store.save_config(&make_config("del_me", "x")).unwrap();
+        store
+            .save_status(&BuildStatus {
+                index_name: "del_me".to_string(),
+                is_running: false,
+                last_built_at: Some("2026-08-18T00:00:00Z".to_string()),
+                last_successful_built_at: Some("2026-08-18T00:00:00Z".to_string()),
+            })
+            .unwrap();
+        store
+            .append_log(
+                "del_me",
+                &[LogEntry {
+                    timestamp: "2026-08-18T00:00:00Z".to_string(),
+                    level: "INFO".to_string(),
+                    message: "built".to_string(),
+                    context_level: 1,
+                }],
+            )
+            .unwrap();
         assert!(store.delete_config("del_me").unwrap());
+        let paths = store.target_artifact_paths("del_me").unwrap();
+        assert!(!paths.config_path.exists());
+        assert!(!paths.status_path.exists());
+        assert!(!paths.log_path.exists());
         assert!(!store.delete_config("del_me").unwrap());
     }
 
@@ -448,6 +518,102 @@ mod tests {
         store.save_status(&status).unwrap();
         let loaded = store.load_status("test");
         assert_eq!(loaded.last_built_at.unwrap(), "2026-02-19T12:00:00Z");
+    }
+
+    #[test]
+    fn failed_build_advances_attempt_without_claiming_success() {
+        let tmp = TempDir::new().unwrap();
+        let store = QsConfigStore::new(tmp.path());
+        store
+            .save_config(&make_config("failed", "products"))
+            .unwrap();
+        store
+            .record_failed_build("failed", "analytics engine not initialized")
+            .unwrap();
+
+        let status = store.load_status("failed");
+        assert!(!status.is_running);
+        assert!(status.last_built_at.is_some());
+        assert!(status.last_successful_built_at.is_none());
+        let logs = store.read_logs("failed");
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].level, "ERROR");
+        assert_eq!(logs[0].message, "analytics engine not initialized");
+    }
+
+    #[test]
+    fn failed_build_log_error_keeps_status_running_and_delete_blocked() {
+        let tmp = TempDir::new().unwrap();
+        let store = QsConfigStore::new(tmp.path());
+        store
+            .save_config(&make_config("failed", "products"))
+            .unwrap();
+        store
+            .save_status(&BuildStatus {
+                index_name: "failed".to_string(),
+                is_running: true,
+                last_built_at: None,
+                last_successful_built_at: None,
+            })
+            .unwrap();
+        let log_path = store.log_path("failed").unwrap();
+        std::fs::create_dir_all(&log_path).unwrap();
+
+        assert!(store
+            .record_failed_build("failed", "forced log persistence failure")
+            .is_err());
+        assert!(
+            store.load_status("failed").is_running,
+            "a failed log write must not publish terminal status and admit deletion"
+        );
+        assert!(store.config_exists("failed"));
+    }
+
+    #[test]
+    fn failed_build_delete_race_leaves_zero_control_residue() {
+        let tmp = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(QsConfigStore::new(tmp.path()));
+        store
+            .save_config(&make_config("failed", "products"))
+            .unwrap();
+        store
+            .save_status(&BuildStatus {
+                index_name: "failed".to_string(),
+                is_running: true,
+                last_built_at: None,
+                last_successful_built_at: None,
+            })
+            .unwrap();
+
+        let (log_persisted_tx, log_persisted_rx) = std::sync::mpsc::sync_channel(0);
+        let (publish_terminal_tx, publish_terminal_rx) = std::sync::mpsc::sync_channel(0);
+        let worker_store = std::sync::Arc::clone(&store);
+        let worker = std::thread::spawn(move || {
+            worker_store.record_failed_build_before_terminal(
+                "failed",
+                "deterministic failure",
+                || {
+                    log_persisted_tx.send(()).unwrap();
+                    publish_terminal_rx.recv().unwrap();
+                },
+            )
+        });
+
+        log_persisted_rx.recv().unwrap();
+        assert!(store.load_status("failed").is_running);
+        assert!(
+            store.config_exists("failed") && store.load_status("failed").is_running,
+            "DELETE must remain blocked until all failure-sidecar writes finish"
+        );
+        publish_terminal_tx.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+
+        assert!(!store.load_status("failed").is_running);
+        assert!(store.delete_config("failed").unwrap());
+        let paths = store.target_artifact_paths("failed").unwrap();
+        assert!(!paths.config_path.exists());
+        assert!(!paths.status_path.exists());
+        assert!(!paths.log_path.exists());
     }
 
     /// Verify that log entries can be appended and read back in order with all fields preserved.

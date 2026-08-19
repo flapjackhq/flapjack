@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/analytics/collector.rs.
 use dashmap::DashMap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -7,6 +8,7 @@ use tokio::sync::Notify;
 
 use super::aggregation::QueryAggregator;
 use super::config::AnalyticsConfig;
+use super::mutation;
 use super::schema::{InsightEvent, SearchEvent};
 use super::writer;
 
@@ -50,7 +52,13 @@ pub struct AnalyticsMetricsSnapshot {
 pub struct AnalyticsCollector {
     config: AnalyticsConfig,
     search_buffer: Mutex<Vec<SearchEvent>>,
+    /// Linearizes insight ingestion, flush publication, and user deletion.
+    insight_mutation: Mutex<()>,
     insight_buffer: Mutex<Vec<InsightEvent>>,
+    #[cfg(test)]
+    insight_flush_after_take_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    insight_purge_before_lock_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     debug_buffer: Mutex<VecDeque<DebugEvent>>,
     aggregator: QueryAggregator,
     /// queryID -> (query, index_name, timestamp_ms) for correlating clicks with searches
@@ -75,6 +83,7 @@ pub struct QueryIdEntry {
 }
 
 impl AnalyticsCollector {
+    /// TODO: Document AnalyticsCollector.new.
     pub fn new(config: AnalyticsConfig) -> Arc<Self> {
         let soak_marker_user_token = std::env::var("FLAPJACK_LOADTEST_SOAK_MARKER_USER_TOKEN")
             .ok()
@@ -82,7 +91,12 @@ impl AnalyticsCollector {
         Arc::new(Self {
             config,
             search_buffer: Mutex::new(Vec::with_capacity(1024)),
+            insight_mutation: Mutex::new(()),
             insight_buffer: Mutex::new(Vec::with_capacity(256)),
+            #[cfg(test)]
+            insight_flush_after_take_hook: Mutex::new(None),
+            #[cfg(test)]
+            insight_purge_before_lock_hook: Mutex::new(None),
             debug_buffer: Mutex::new(VecDeque::with_capacity(DEBUG_BUFFER_CAP)),
             aggregator: QueryAggregator::new(30),
             query_id_cache: DashMap::new(),
@@ -156,6 +170,7 @@ impl AnalyticsCollector {
         self.accepted_events_total.fetch_add(1, Ordering::Relaxed);
 
         let should_flush = {
+            let _mutation = self.insight_mutation.lock().unwrap();
             let mut buf = self.insight_buffer.lock().unwrap();
             buf.push(event);
             buf.len() >= self.config.flush_size
@@ -283,12 +298,17 @@ impl AnalyticsCollector {
     /// Flush insight events to Parquet.
     pub fn flush_insights(&self) {
         let flush_started_at = Instant::now();
+        let _mutation = self.insight_mutation.lock().unwrap();
         let events = {
             let mut buf = self.insight_buffer.lock().unwrap();
             std::mem::take(&mut *buf)
         };
         if events.is_empty() {
             return;
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.insight_flush_after_take_hook.lock().unwrap().clone() {
+            hook();
         }
 
         let mut by_index: std::collections::HashMap<String, Vec<InsightEvent>> =
@@ -300,7 +320,9 @@ impl AnalyticsCollector {
         let mut dropped_events = 0_u64;
         for (index_name, index_events) in by_index {
             let dir = self.config.events_dir(&index_name);
-            if let Err(e) = writer::flush_insight_events(&index_events, &dir) {
+            if let Err(e) = mutation::with_index_mutation(&self.config, &index_name, || {
+                writer::flush_insight_events(&index_events, &dir)
+            }) {
                 dropped_events += index_events.len() as u64;
                 tracing::error!(
                     "[analytics] Failed to flush {} insight events for {}: {}",
@@ -332,30 +354,135 @@ impl AnalyticsCollector {
     /// Purge all insight events for a user token from memory and on-disk analytics data.
     /// Returns number of removed events.
     pub fn purge_user_token(&self, user_token: &str) -> Result<u64, String> {
+        self.purge_user_token_matching_index(user_token, None)
+    }
+
+    /// Purge insight events for a user token only where the event's index matches.
+    /// Returns number of removed events.
+    pub fn purge_user_token_where_index(
+        &self,
+        user_token: &str,
+        index_matches: &dyn Fn(&str) -> bool,
+    ) -> Result<u64, String> {
+        self.purge_user_token_matching_index(user_token, Some(index_matches))
+    }
+
+    fn purge_user_token_matching_index(
+        &self,
+        user_token: &str,
+        index_matches: Option<&dyn Fn(&str) -> bool>,
+    ) -> Result<u64, String> {
+        #[cfg(test)]
+        if let Some(hook) = self.insight_purge_before_lock_hook.lock().unwrap().clone() {
+            hook();
+        }
+        let _mutation = self
+            .insight_mutation
+            .lock()
+            .map_err(|error| format!("analytics insight mutation lock poisoned: {error}"))?;
+        let events_dirs = self.events_dirs_for_user_token_purge(index_matches)?;
+
         let removed_from_buffer = {
             let mut buf = self.insight_buffer.lock().unwrap();
             let before = buf.len();
-            buf.retain(|e| e.user_token != user_token);
+            buf.retain(|event| {
+                event.user_token != user_token
+                    || !index_matches.is_none_or(|matches| matches(&event.index))
+            });
+            (before - buf.len()) as u64
+        };
+
+        let removed_from_debug = {
+            let mut buf = self.debug_buffer.lock().unwrap();
+            let before = buf.len();
+            buf.retain(|event| {
+                event.user_token != user_token
+                    || !index_matches.is_none_or(|matches| matches(&event.index))
+            });
             (before - buf.len()) as u64
         };
 
         let mut removed_from_disk = 0_u64;
-        if self.config.data_dir.exists() {
-            let entries = std::fs::read_dir(&self.config.data_dir)
-                .map_err(|e| format!("Failed to read analytics data dir: {}", e))?;
-            for entry in entries {
-                let entry = entry.map_err(|e| format!("Failed to read analytics entry: {}", e))?;
-                let index_dir = entry.path();
-                if !index_dir.is_dir() {
-                    continue;
-                }
-                let events_dir = index_dir.join("events");
-                removed_from_disk +=
-                    writer::purge_insight_events_for_user_token(&events_dir, user_token)?;
+        for (index_root, events_dir) in events_dirs {
+            removed_from_disk += mutation::with_index_root_mutation(index_root, || {
+                writer::purge_insight_events_for_user_token(&events_dir, user_token)
+            })?;
+        }
+
+        Ok(removed_from_buffer + removed_from_debug + removed_from_disk)
+    }
+
+    /// Resolve every selected on-disk events root before deleting from any
+    /// in-memory or persisted store. `symlink_metadata` deliberately does not
+    /// follow the configured root or events leaves outside the analytics tree.
+    fn events_dirs_for_user_token_purge(
+        &self,
+        index_matches: Option<&dyn Fn(&str) -> bool>,
+    ) -> Result<Vec<(std::path::PathBuf, std::path::PathBuf)>, String> {
+        match std::fs::symlink_metadata(&self.config.data_dir) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing to traverse symlinked analytics path {}",
+                    self.config.data_dir.display()
+                ));
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "analytics data root is not a directory: {}",
+                    self.config.data_dir.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(format!(
+                    "Failed to stat analytics data dir {}: {}",
+                    self.config.data_dir.display(),
+                    error
+                ));
             }
         }
 
-        Ok(removed_from_buffer + removed_from_disk)
+        let entries = std::fs::read_dir(&self.config.data_dir)
+            .map_err(|e| format!("Failed to read analytics data dir: {}", e))?;
+        let mut events_dirs = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("Failed to read analytics entry: {}", e))?;
+            let file_type = entry.file_type().map_err(|e| {
+                format!(
+                    "Failed to stat analytics entry {}: {}",
+                    entry.path().display(),
+                    e
+                )
+            })?;
+            if file_type.is_symlink() {
+                return Err(format!(
+                    "refusing to traverse symlinked analytics path {}",
+                    entry.path().display()
+                ));
+            }
+            let index_dir = entry.path();
+            if !file_type.is_dir() {
+                continue;
+            }
+            if index_matches.is_some_and(|matches| {
+                index_dir
+                    .file_name()
+                    .and_then(AnalyticsConfig::value_from_path_component)
+                    .is_none_or(|index| !matches(&index))
+            }) {
+                continue;
+            }
+
+            let events_dir = index_dir.join("events");
+            events_dirs.push((index_dir, events_dir));
+        }
+
+        events_dirs.sort_by(|left, right| left.0.cmp(&right.0));
+        for (_, events_dir) in &events_dirs {
+            writer::preflight_insight_events_purge(events_dir)?;
+        }
+        Ok(events_dirs)
     }
 
     /// Start the background flush loop. Should be spawned as a tokio task.
@@ -385,6 +512,7 @@ impl AnalyticsCollector {
         self.shutdown.notify_one();
     }
 
+    /// TODO: Document AnalyticsCollector.analytics_metrics_snapshot.
     pub fn analytics_metrics_snapshot(&self) -> AnalyticsMetricsSnapshot {
         let flush_samples: Vec<f64> = {
             let samples = self.flush_latency_ms_samples.lock().unwrap();
@@ -493,6 +621,7 @@ mod tests {
         }
     }
 
+    /// TODO: Document test_event.
     fn test_event(
         timestamp_ms: i64,
         index: &str,
@@ -515,6 +644,97 @@ mod tests {
                 vec!["validation failed".to_string()]
             },
         }
+    }
+
+    fn insight_event(user_token: &str) -> InsightEvent {
+        InsightEvent {
+            event_type: "view".to_string(),
+            event_subtype: None,
+            event_name: "Viewed".to_string(),
+            index: "products".to_string(),
+            user_token: user_token.to_string(),
+            authenticated_user_token: None,
+            query_id: None,
+            object_ids: vec![format!("object-{user_token}")],
+            object_ids_alt: vec![],
+            positions: None,
+            timestamp: Some(chrono::Utc::now().timestamp_millis()),
+            value: None,
+            currency: None,
+            interleaving_team: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_purge_waits_for_inflight_flush_and_prevents_resurrection() {
+        use std::sync::{mpsc, Barrier};
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let config = test_config(&temp_dir);
+        let collector = AnalyticsCollector::new(config.clone());
+        collector.record_insight(insight_event("delete-me"));
+        collector.record_insight(insight_event("safe-user"));
+
+        let flush_reached_barrier = Arc::new(Barrier::new(2));
+        let release_flush_barrier = Arc::new(Barrier::new(2));
+        let hook_reached = Arc::clone(&flush_reached_barrier);
+        let hook_release = Arc::clone(&release_flush_barrier);
+        *collector.insight_flush_after_take_hook.lock().unwrap() = Some(Arc::new(move || {
+            hook_reached.wait();
+            hook_release.wait();
+        }));
+
+        let flush_collector = Arc::clone(&collector);
+        let flush_thread = std::thread::spawn(move || flush_collector.flush_insights());
+        flush_reached_barrier.wait();
+
+        let (purge_done_tx, purge_done_rx) = mpsc::channel();
+        let purge_attempted_barrier = Arc::new(Barrier::new(2));
+        let hook_attempted = Arc::clone(&purge_attempted_barrier);
+        *collector.insight_purge_before_lock_hook.lock().unwrap() = Some(Arc::new(move || {
+            hook_attempted.wait();
+        }));
+        let purge_collector = Arc::clone(&collector);
+        let purge_thread = std::thread::spawn(move || {
+            let result = purge_collector.purge_user_token("delete-me");
+            purge_done_tx.send(result).unwrap();
+        });
+        purge_attempted_barrier.wait();
+        assert!(
+            purge_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "purge must wait while the taken insight batch is still publishing"
+        );
+
+        release_flush_barrier.wait();
+        flush_thread.join().unwrap();
+        let removed = purge_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("purge should finish after flush publication")
+            .unwrap();
+        purge_thread.join().unwrap();
+        assert_eq!(removed, 1);
+
+        let rows = crate::analytics::AnalyticsQueryEngine::new(config)
+            .query_events(
+                "products",
+                "SELECT user_token, COUNT(*) AS count FROM events GROUP BY user_token ORDER BY user_token",
+            )
+            .await
+            .unwrap();
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.get("user_token") == Some(&serde_json::json!("delete-me"))),
+            "deleted user resurrected after the in-flight flush: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.get("user_token") == Some(&serde_json::json!("safe-user"))),
+            "non-target control event was lost: {rows:?}"
+        );
     }
 
     #[test]
@@ -548,6 +768,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document get_debug_events_filters_by_status_ok_and_error.
     #[test]
     fn get_debug_events_filters_by_status_ok_and_error() {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -596,6 +817,7 @@ mod tests {
         assert_eq!(names, vec!["three".to_string(), "two".to_string()]);
     }
 
+    /// TODO: Document get_debug_events_returns_reverse_chronological_order.
     #[test]
     fn get_debug_events_returns_reverse_chronological_order() {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -617,6 +839,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document analytics_metrics_snapshot_tracks_accepted_events_and_flush_latency.
     #[test]
     fn analytics_metrics_snapshot_tracks_accepted_events_and_flush_latency() {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -662,6 +885,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document rollup_boundary_metric_only_tracks_nonempty_windows.
     #[test]
     fn rollup_boundary_metric_only_tracks_nonempty_windows() {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -683,6 +907,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document soak_marker_metric_tracks_first_matching_insight_event.
     #[test]
     fn soak_marker_metric_tracks_first_matching_insight_event() {
         let temp_dir = TempDir::new().expect("temp dir");

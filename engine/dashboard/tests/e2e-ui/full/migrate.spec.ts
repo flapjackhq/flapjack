@@ -39,16 +39,16 @@ import { assertIndexNotCreated } from '../../fixtures/source-provider.fixture';
 
 const ALGOLIA_PREVIEW_ORACLE: MigrationPreviewOracle = {
   summary: {
-    totalEntries: 14,
+    totalEntries: 9,
     hardRejections: 0,
-    warnings: 9,
+    warnings: 4,
     scopeGaps: 5,
   },
   entry: {
     severity: 'Warning',
     code: 'PersistedNoBehaviorSetting',
     resource: 'Settings',
-    jsonPath: '$.hitsPerPage',
+    jsonPath: '$.attributesToSnippet',
   },
 };
 

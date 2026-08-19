@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-replication/src/config.rs.
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::Path;
@@ -517,6 +518,7 @@ impl NodeConfig {
             .find(Self::is_unsafe_peer_ip)
     }
 
+    /// TODO: Document NodeConfig.is_unsafe_peer_ip.
     fn is_unsafe_peer_ip(ip: &IpAddr) -> bool {
         match ip {
             IpAddr::V4(v4) => {
@@ -801,6 +803,7 @@ mod tests {
         assert_eq!(reloaded.peers[1].addr, "http://node-c:7700");
     }
 
+    /// TODO: Document a10_env_peer_parser_rejects_unsafe_or_malformed_peer_addresses.
     #[test]
     fn a10_env_peer_parser_rejects_unsafe_or_malformed_peer_addresses() {
         let _guard = ENV_MUTEX.lock().unwrap();
@@ -905,6 +908,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document a10_node_json_filters_unsafe_peer_addresses.
     #[test]
     fn a10_node_json_filters_unsafe_peer_addresses() {
         let _guard = ENV_MUTEX.lock().unwrap();
@@ -951,6 +955,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document normalize_peer_addr_rejects_non_origin_urls.
     #[test]
     fn normalize_peer_addr_rejects_non_origin_urls() {
         for candidate in [

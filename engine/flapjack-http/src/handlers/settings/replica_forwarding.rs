@@ -1,3 +1,4 @@
+//! Stub summary for replica_forwarding.rs.
 use std::sync::Arc;
 
 use super::settings_file_path;
@@ -46,6 +47,7 @@ pub(super) fn forward_settings_to_replicas(
     Ok(())
 }
 
+/// TODO: Document apply_forwarded_primary_fields.
 fn apply_forwarded_primary_fields(
     primary_settings: &IndexSettings,
     replica_settings: &mut IndexSettings,

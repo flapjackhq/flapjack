@@ -1,3 +1,4 @@
+//! Stub summary for query_tests.rs.
 use super::*;
 use crate::analytics::collector::AnalyticsCollector;
 use crate::analytics::schema::{InsightEvent, SearchEvent};
@@ -395,6 +396,7 @@ async fn no_click_searches_escapes_query_ids_from_events_before_in_clause() {
         "clicked query should not be returned as no-click even with quote in query_id"
     );
 }
+/// TODO: Document aggregate_counts_by_query_id_merges_multiple_query_ids_into_same_query.
 #[test]
 fn aggregate_counts_by_query_id_merges_multiple_query_ids_into_same_query() {
     let rows = vec![
@@ -413,6 +415,7 @@ fn aggregate_counts_by_query_id_merges_multiple_query_ids_into_same_query() {
     assert_eq!(aggregated.get("boots"), Some(&5));
     assert_eq!(aggregated.get("hats"), Some(&1));
 }
+/// TODO: Document enrich_rows_with_click_metrics_adds_expected_fields.
 #[test]
 fn enrich_rows_with_click_metrics_adds_expected_fields() {
     let rows = vec![serde_json::json!({"search": "boots"})];
@@ -450,6 +453,7 @@ fn enrich_rows_with_click_metrics_adds_expected_fields() {
 // `search_events_to_batch`, then assert exact numeric results through the
 // public `AnalyticsQueryEngine` API.
 
+/// TODO: Document search_event_with_hits.
 fn search_event_with_hits(
     index: &str,
     query: &str,
@@ -481,6 +485,7 @@ fn search_event_with_hits(
     }
 }
 
+/// TODO: Document seed_known_answer_dataset.
 fn seed_known_answer_dataset(temp_dir: &TempDir) -> AnalyticsConfig {
     let config = test_analytics_config(temp_dir);
     let index = "products";
@@ -531,6 +536,7 @@ async fn status_reports_no_data_after_clear_preserves_empty_roots() {
     assert_eq!(engine.status("products").await.unwrap()["hasData"], false);
 }
 
+/// TODO: Document seed_hourly_spread_dataset.
 fn seed_hourly_spread_dataset(temp_dir: &TempDir) -> AnalyticsConfig {
     let config = test_analytics_config(temp_dir);
     let index = "products";
@@ -568,6 +574,7 @@ fn seed_hourly_spread_dataset(temp_dir: &TempDir) -> AnalyticsConfig {
     config
 }
 
+/// TODO: Document known_answer_top_searches.
 #[tokio::test]
 async fn known_answer_top_searches() {
     let temp_dir = TempDir::new().unwrap();
@@ -591,19 +598,22 @@ async fn known_answer_top_searches() {
     assert_eq!(searches[0]["count"], 3);
     // AVG(10, 50, 60) = 40.0, CAST to INTEGER = 40
     assert_eq!(searches[0]["nbHits"], 40);
+    assert_eq!(searches[0]["_nbHitsSum"], 120);
+    assert_eq!(searches[0]["_nbHitsCount"], 3);
 
     assert_eq!(searches[1]["search"], "phone");
     assert_eq!(searches[1]["count"], 2);
     // AVG(100, 200) = 150.0, CAST to INTEGER = 150
     assert_eq!(searches[1]["nbHits"], 150);
+    assert_eq!(searches[1]["_nbHitsSum"], 300);
+    assert_eq!(searches[1]["_nbHitsCount"], 2);
 
-    // xyzzy and zzznothing both have count=1; order between them is stable by query text
+    // Equal-count rows use query text as the deterministic secondary key.
     let tail: Vec<&str> = searches[2..]
         .iter()
         .map(|s| s["search"].as_str().unwrap())
         .collect();
-    assert!(tail.contains(&"xyzzy"));
-    assert!(tail.contains(&"zzznothing"));
+    assert_eq!(tail, vec!["xyzzy", "zzznothing"]);
 
     for s in &searches[2..] {
         assert_eq!(s["count"], 1);
@@ -611,6 +621,7 @@ async fn known_answer_top_searches() {
     }
 }
 
+/// TODO: Document known_answer_search_count.
 #[tokio::test]
 async fn known_answer_search_count() {
     let temp_dir = TempDir::new().unwrap();
@@ -630,6 +641,7 @@ async fn known_answer_search_count() {
     assert_eq!(dates[0]["count"], 7);
 }
 
+/// TODO: Document known_answer_no_results_searches.
 #[tokio::test]
 async fn known_answer_no_results_searches() {
     let temp_dir = TempDir::new().unwrap();
@@ -648,8 +660,7 @@ async fn known_answer_no_results_searches() {
         .iter()
         .map(|s| s["search"].as_str().unwrap())
         .collect();
-    assert!(queries.contains(&"xyzzy"));
-    assert!(queries.contains(&"zzznothing"));
+    assert_eq!(queries, vec!["xyzzy", "zzznothing"]);
 
     for s in searches {
         assert_eq!(s["count"], 1);
@@ -657,6 +668,7 @@ async fn known_answer_no_results_searches() {
     }
 }
 
+/// TODO: Document known_answer_no_results_rate.
 #[tokio::test]
 async fn known_answer_no_results_rate() {
     let temp_dir = TempDir::new().unwrap();
@@ -779,6 +791,7 @@ fn remove_raw_searches(config: &AnalyticsConfig, index_name: &str) {
     }
 }
 
+/// TODO: Document rollup_matches_raw_top_searches.
 #[tokio::test]
 async fn rollup_matches_raw_top_searches() {
     let temp_dir = TempDir::new().unwrap();
@@ -843,6 +856,7 @@ async fn rollup_matches_raw_top_searches() {
     );
 }
 
+/// TODO: Document rollup_matches_raw_search_count.
 #[tokio::test]
 async fn rollup_matches_raw_search_count() {
     let temp_dir = TempDir::new().unwrap();
@@ -880,6 +894,7 @@ async fn rollup_matches_raw_search_count() {
     );
 }
 
+/// TODO: Document rollup_matches_raw_search_count_hourly_tier_daily_dates.
 #[tokio::test]
 async fn rollup_matches_raw_search_count_hourly_tier_daily_dates() {
     let temp_dir = TempDir::new().unwrap();
@@ -913,6 +928,7 @@ async fn rollup_matches_raw_search_count_hourly_tier_daily_dates() {
     );
 }
 
+/// TODO: Document rollup_matches_raw_users_count_hll.
 #[tokio::test]
 async fn rollup_matches_raw_users_count_hll() {
     let temp_dir = TempDir::new().unwrap();
@@ -940,6 +956,7 @@ async fn rollup_matches_raw_users_count_hll() {
     assert_eq!(rollup, raw, "rollup-served HLL payload must match raw");
 }
 
+/// TODO: Document raw_fallback_uncertified_range_serves_raw.
 #[tokio::test]
 async fn raw_fallback_uncertified_range_serves_raw() {
     let temp_dir = TempDir::new().unwrap();

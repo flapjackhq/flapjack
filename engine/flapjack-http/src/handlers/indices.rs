@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/indices.rs.
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -703,6 +704,7 @@ mod tests {
         assert_eq!(entries, 2, "entries should match document count");
     }
 
+    /// TODO: Document list_indices_excludes_publication_roots_and_paginates_visible_tenants.
     #[tokio::test]
     async fn list_indices_excludes_publication_roots_and_paginates_visible_tenants() {
         let tmp = tempfile::tempdir().unwrap();

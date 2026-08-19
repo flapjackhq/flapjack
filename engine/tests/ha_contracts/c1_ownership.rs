@@ -1,3 +1,4 @@
+//! Stub summary for c1_ownership.rs.
 // Contract C1: Push Replication Ownership
 //
 // Decision 0003 §C1 verdict: already upheld at HEAD.
@@ -6,6 +7,7 @@
 
 use crate::common;
 
+/// TODO: Document c1_ownership_requires_trackable_delivery_failure.
 #[tokio::test]
 async fn c1_ownership_requires_trackable_delivery_failure() {
     let (live_peer_addr, _live_peer_tmp) = common::spawn_server_with_internal("c1-live-peer").await;

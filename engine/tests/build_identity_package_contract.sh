@@ -515,6 +515,7 @@ assert_cross_revision_passthrough() {
   log "cross passthrough KAT: engine/Cross.toml delivered FLAPJACK_BUILD_REVISION=${CROSS_KAT_FAKE_REVISION} to build.rs"
 }
 
+# TODO: Document copy_engine_tree.
 copy_engine_tree() {
   local destination="$1"
   mkdir -p "$destination"
@@ -532,6 +533,7 @@ copy_engine_tree() {
   )
 }
 
+# TODO: Document assert_manifest_contract.
 assert_manifest_contract() {
   local first_manifest="$1"
   local first_output="$2"

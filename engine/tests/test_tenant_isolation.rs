@@ -265,6 +265,430 @@ async fn event_ingress_rate_limit_allows_exact_allowance_then_rejects_without_si
 }
 
 #[tokio::test]
+async fn gdpr_delete_removes_only_target_users_event_debug_records() {
+    const INDEX: &str = "gdpr_event_debug";
+    const TARGET_USER: &str = "gdpr_event_debug_target";
+    const CONTROL_USER: &str = "gdpr_event_debug_control";
+
+    let (app, _tmp, _analytics_collector, _analytics_engine) =
+        common::build_test_app_for_local_requests_with_analytics(Some(ADMIN_KEY));
+    let event_key = create_restricted_key(&app, &["search"], &[INDEX]).await;
+
+    let ingest_response = app
+        .clone()
+        .oneshot(authed_request(
+            Method::POST,
+            "/1/events",
+            &event_key,
+            Some(json!({
+                "events": [
+                    view_event(INDEX, "GDPR Target", TARGET_USER, "target-object"),
+                    view_event(INDEX, "GDPR Control", CONTROL_USER, "control-object")
+                ]
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ingest_response.status(), StatusCode::OK);
+
+    let debug_users = |body: &serde_json::Value| {
+        body["events"]
+            .as_array()
+            .expect("debug events must be an array")
+            .iter()
+            .map(|event| {
+                event["userToken"]
+                    .as_str()
+                    .expect("debug userToken must be a string")
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let before_response = app
+        .clone()
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/1/events/debug?index={INDEX}"),
+            ADMIN_KEY,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(before_response.status(), StatusCode::OK);
+    let mut before_users = debug_users(&body_json(before_response).await);
+    before_users.sort();
+    assert_eq!(
+        before_users,
+        vec![CONTROL_USER.to_string(), TARGET_USER.to_string()],
+        "precondition: both users must be observable before deletion"
+    );
+
+    let delete_response = app
+        .clone()
+        .oneshot(authed_request(
+            Method::DELETE,
+            &format!("/1/usertokens/{TARGET_USER}"),
+            ADMIN_KEY,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_response.status(), StatusCode::OK);
+
+    let after_response = app
+        .clone()
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/1/events/debug?index={INDEX}"),
+            ADMIN_KEY,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(after_response.status(), StatusCode::OK);
+    let after_body = body_json(after_response).await;
+    assert_eq!(
+        debug_users(&after_body),
+        vec![CONTROL_USER.to_string()],
+        "GDPR deletion must remove target debug PII without deleting another user's record: {after_body}"
+    );
+}
+
+#[tokio::test]
+async fn event_ingress_idempotency_replay_has_no_duplicate_or_cross_index_side_effect() {
+    const INDEX_A: &str = "sec_events_idempotency_a";
+    const INDEX_B: &str = "sec_events_idempotency_b";
+    const IDEMPOTENCY_KEY: &str = "event-retry-01";
+
+    let (app, _tmp, analytics_collector, analytics_engine) =
+        common::build_test_app_for_local_requests_with_analytics(Some(ADMIN_KEY));
+    let key_a = create_restricted_key(&app, &["search"], &[INDEX_A]).await;
+    let key_b = create_restricted_key(&app, &["search"], &[INDEX_B]).await;
+    let timestamp_ms = chrono::Utc::now().timestamp_millis();
+    let analytics_date = chrono::DateTime::from_timestamp_millis(timestamp_ms)
+        .expect("current timestamp must be representable")
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let event_a = click_event(
+        INDEX_A,
+        "Idempotent Event A",
+        "idempotent_user_a",
+        "idempotent_object_a",
+        timestamp_ms,
+    );
+    let event_b = click_event(
+        INDEX_B,
+        "Idempotent Event B",
+        "idempotent_user_b",
+        "idempotent_object_b",
+        timestamp_ms,
+    );
+
+    let first = common::send_authed_response(
+        &app,
+        Method::POST,
+        "/1/events",
+        &key_a,
+        "test",
+        &[("x-flapjack-idempotency-key", IDEMPOTENCY_KEY)],
+        Some(json!({"events": [event_a.clone()]})),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert!(
+        first
+            .headers()
+            .get("x-flapjack-idempotency-replayed")
+            .is_none(),
+        "the first accepted event must not be marked as a replay"
+    );
+    assert_eq!(
+        body_json(first).await,
+        json!({"status": 200, "message": "OK"})
+    );
+
+    let replay = common::send_authed_response(
+        &app,
+        Method::POST,
+        "/1/events",
+        &key_a,
+        "test",
+        &[("x-flapjack-idempotency-key", IDEMPOTENCY_KEY)],
+        Some(json!({"events": [event_a]})),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(
+        replay
+            .headers()
+            .get("x-flapjack-idempotency-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true"),
+        "a retry must replay the first response before recording another event"
+    );
+    assert_eq!(
+        body_json(replay).await,
+        json!({"status": 200, "message": "OK"})
+    );
+
+    let other_index = common::send_authed_response(
+        &app,
+        Method::POST,
+        "/1/events",
+        &key_b,
+        "test",
+        &[("x-flapjack-idempotency-key", IDEMPOTENCY_KEY)],
+        Some(json!({"events": [event_b]})),
+    )
+    .await;
+    assert_eq!(other_index.status(), StatusCode::OK);
+    assert!(
+        other_index
+            .headers()
+            .get("x-flapjack-idempotency-replayed")
+            .is_none(),
+        "the same token on a different authorized index must remain independent"
+    );
+    assert_eq!(
+        body_json(other_index).await,
+        json!({"status": 200, "message": "OK"})
+    );
+
+    for (index, expected_object) in [
+        (INDEX_A, "idempotent_object_a"),
+        (INDEX_B, "idempotent_object_b"),
+    ] {
+        let debug_response = app
+            .clone()
+            .oneshot(authed_request(
+                Method::GET,
+                &format!("/1/events/debug?index={index}"),
+                ADMIN_KEY,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(debug_response.status(), StatusCode::OK);
+        let debug_body = body_json(debug_response).await;
+        assert_eq!(debug_body["count"], 1, "debug body: {debug_body}");
+        assert_eq!(
+            debug_body["events"][0]["objectIds"],
+            json!([expected_object])
+        );
+    }
+
+    analytics_collector.flush_insights();
+    for (index, expected_object) in [
+        (INDEX_A, "idempotent_object_a"),
+        (INDEX_B, "idempotent_object_b"),
+    ] {
+        let analytics_body = analytics_engine
+            .top_hits(index, &analytics_date, &analytics_date, 10)
+            .await
+            .expect("analytics query must succeed");
+        let hits = analytics_body["hits"]
+            .as_array()
+            .expect("analytics hits must be an array");
+        assert_eq!(hits.len(), 1, "analytics body: {analytics_body}");
+        assert_eq!(hits[0]["count"], 1, "analytics body: {analytics_body}");
+        let object_ids: Vec<String> = serde_json::from_str(
+            hits[0]["hit"]
+                .as_str()
+                .expect("analytics hit must encode object IDs"),
+        )
+        .expect("analytics hit must be valid JSON");
+        assert_eq!(object_ids, vec![expected_object]);
+    }
+}
+
+#[tokio::test]
+async fn event_idempotency_does_not_replay_object_response_from_colliding_index_name() {
+    const EVENT_INDEX: &str = "products";
+    const OBJECT_INDEX: &str = "[\"products\"]";
+    const IDEMPOTENCY_KEY: &str = "cross-route-retry-01";
+
+    assert!(
+        flapjack::validate_index_name(OBJECT_INDEX).is_ok(),
+        "the regression requires the old event scope to be a valid object index"
+    );
+    let event_scope = flapjack_http::idempotency::event_index_set_segment([EVENT_INDEX]);
+    assert!(
+        flapjack::validate_index_name(&event_scope).is_err(),
+        "event cache segments must stay outside the valid object-index namespace"
+    );
+
+    let (app, _tmp, analytics_collector, analytics_engine) =
+        common::build_test_app_for_local_requests_with_analytics(Some(ADMIN_KEY));
+    let event_key = create_restricted_key(&app, &["search"], &[EVENT_INDEX]).await;
+    let timestamp_ms = chrono::Utc::now().timestamp_millis();
+    let analytics_date = chrono::DateTime::from_timestamp_millis(timestamp_ms)
+        .expect("current timestamp must be representable")
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let object_response = common::send_authed_response(
+        &app,
+        Method::POST,
+        "/1/indexes/%5B%22products%22%5D",
+        ADMIN_KEY,
+        "test",
+        &[("x-flapjack-idempotency-key", IDEMPOTENCY_KEY)],
+        Some(json!({"name": "literal collision fixture"})),
+    )
+    .await;
+    assert_eq!(object_response.status(), StatusCode::CREATED);
+    assert!(object_response
+        .headers()
+        .get("x-flapjack-idempotency-replayed")
+        .is_none());
+    let object_body = body_json(object_response).await;
+    assert!(
+        object_body["objectID"].is_string(),
+        "object create response: {object_body}"
+    );
+
+    let event_response = common::send_authed_response(
+        &app,
+        Method::POST,
+        "/1/events",
+        &event_key,
+        "test",
+        &[("x-flapjack-idempotency-key", IDEMPOTENCY_KEY)],
+        Some(json!({
+            "events": [click_event(
+                EVENT_INDEX,
+                "Cross Route Event",
+                "cross_route_user",
+                "cross_route_object",
+                timestamp_ms,
+            )]
+        })),
+    )
+    .await;
+    assert_eq!(
+        event_response.status(),
+        StatusCode::OK,
+        "an object cache entry must not replace the event response"
+    );
+    assert!(
+        event_response
+            .headers()
+            .get("x-flapjack-idempotency-replayed")
+            .is_none(),
+        "the first event request must not replay another route's cache entry"
+    );
+    assert_eq!(
+        body_json(event_response).await,
+        json!({"status": 200, "message": "OK"})
+    );
+
+    let debug_response = app
+        .clone()
+        .oneshot(authed_request(
+            Method::GET,
+            "/1/events/debug?index=products",
+            ADMIN_KEY,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(debug_response.status(), StatusCode::OK);
+    let debug_body = body_json(debug_response).await;
+    assert_eq!(debug_body["count"], 1, "debug body: {debug_body}");
+    assert_eq!(
+        debug_body["events"][0]["objectIds"],
+        json!(["cross_route_object"])
+    );
+
+    analytics_collector.flush_insights();
+    let analytics_body = analytics_engine
+        .top_hits(EVENT_INDEX, &analytics_date, &analytics_date, 10)
+        .await
+        .expect("analytics query must succeed");
+    let hits = analytics_body["hits"]
+        .as_array()
+        .expect("analytics hits must be an array");
+    assert_eq!(hits.len(), 1, "analytics body: {analytics_body}");
+    assert_eq!(hits[0]["count"], 1, "analytics body: {analytics_body}");
+    let object_ids: Vec<String> = serde_json::from_str(
+        hits[0]["hit"]
+            .as_str()
+            .expect("analytics hit must encode object IDs"),
+    )
+    .expect("analytics hit must be valid JSON");
+    assert_eq!(object_ids, vec!["cross_route_object"]);
+}
+
+#[tokio::test]
+async fn invalid_object_index_does_not_replay_colliding_event_response() {
+    const EVENT_INDEX: &str = "products";
+    const IDEMPOTENCY_KEY: &str = "reverse-cross-route-retry-01";
+
+    let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
+    let event_response = common::send_authed_response(
+        &app,
+        Method::POST,
+        "/1/events",
+        ADMIN_KEY,
+        "test",
+        &[("x-flapjack-idempotency-key", IDEMPOTENCY_KEY)],
+        Some(json!({
+            "events": [view_event(
+                EVENT_INDEX,
+                "Reverse Cross Route Event",
+                "reverse_cross_route_user",
+                "reverse_cross_route_object",
+            )]
+        })),
+    )
+    .await;
+    assert_eq!(event_response.status(), StatusCode::OK);
+    assert!(
+        event_response
+            .headers()
+            .get("x-flapjack-idempotency-replayed")
+            .is_none(),
+        "the first event request must populate, not replay, its cache entry"
+    );
+    assert_eq!(
+        body_json(event_response).await,
+        json!({"status": 200, "message": "OK"})
+    );
+
+    let object_response = common::send_authed_response(
+        &app,
+        Method::POST,
+        "/1/indexes/%2Fevents%2F%5B%22products%22%5D",
+        ADMIN_KEY,
+        "test",
+        &[("x-flapjack-idempotency-key", IDEMPOTENCY_KEY)],
+        Some(json!({"name": "must not be created"})),
+    )
+    .await;
+    assert_eq!(
+        object_response.status(),
+        StatusCode::BAD_REQUEST,
+        "an invalid decoded object index must be rejected before cache lookup"
+    );
+    assert!(
+        object_response
+            .headers()
+            .get("x-flapjack-idempotency-replayed")
+            .is_none(),
+        "invalid object targets must not replay another route's response"
+    );
+    assert_eq!(
+        body_json(object_response).await,
+        json!({
+            "message": "Index name contains invalid characters (path traversal not allowed)",
+            "status": 400
+        })
+    );
+}
+
+#[tokio::test]
 async fn restricted_key_accepts_event_for_allowed_index() {
     let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
     let key = create_restricted_key(&app, &["search"], &["tenant_allowed"]).await;

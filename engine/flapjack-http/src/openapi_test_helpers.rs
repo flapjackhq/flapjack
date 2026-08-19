@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/openapi_test_helpers.rs.
 use crate::mutation_parity::HIGH_RISK_MUTATION_PARITY_CASES;
 use crate::openapi::{DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS, DOCUMENTED_MEMBERSHIP_SCHEMA_NAMES};
 
@@ -20,6 +21,7 @@ fn assert_schema_ref(
     );
 }
 
+/// TODO: Document assert_response_statuses.
 fn assert_response_statuses(
     operation: &serde_json::Value,
     expected_statuses: &[&str],
@@ -52,6 +54,7 @@ fn assert_api_key_security(operation: &serde_json::Value, context: &str) {
     );
 }
 
+/// TODO: Document assert_add_peer_openapi_contract.
 pub(crate) fn assert_add_peer_openapi_contract(doc: &serde_json::Value) {
     let path = DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS[0];
     const CONTEXT: &str = "POST /internal/cluster/peers";
@@ -81,6 +84,7 @@ pub(crate) fn assert_add_peer_openapi_contract(doc: &serde_json::Value) {
     }
 }
 
+/// TODO: Document assert_remove_peer_openapi_contract.
 pub(crate) fn assert_remove_peer_openapi_contract(doc: &serde_json::Value) {
     let path = DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS[1];
     const CONTEXT: &str = "DELETE /internal/cluster/peers/{node_id}";
@@ -185,6 +189,7 @@ pub(crate) fn assert_cluster_status_openapi_contract(doc: &serde_json::Value) {
         .is_some());
 }
 
+/// TODO: Document schema_ref.
 pub(crate) fn schema_ref<'a>(doc: &'a serde_json::Value, schema_pointer: &str) -> Option<&'a str> {
     if let Some(reference) = doc
         .pointer(&format!("{schema_pointer}/$ref"))
@@ -210,6 +215,7 @@ pub(crate) fn schema_ref<'a>(doc: &'a serde_json::Value, schema_pointer: &str) -
     None
 }
 
+/// TODO: Document schema_composition_refs.
 pub(crate) fn schema_composition_refs<'a>(
     doc: &'a serde_json::Value,
     schema_pointer: &str,

@@ -1,3 +1,5 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/spool_lifecycle.rs.
+
 use super::*;
 use crate::handlers::migration::AsyncMigrationSourceProvider;
 
@@ -31,6 +33,7 @@ impl SpoolStore {
         self.commit_manifest(&manifest)
     }
 
+    /// TODO: Document SpoolStore.commit_settings_once.
     pub(crate) fn commit_settings_once(
         &self,
         job_uuid: Uuid,
@@ -97,6 +100,7 @@ impl SpoolStore {
         self.complete_object_resource(job_uuid, ObjectResource::Synonyms, count, hash)
     }
 
+    /// TODO: Document SpoolStore.checkpoint.
     #[cfg(test)]
     pub(crate) fn checkpoint(
         &self,
@@ -297,6 +301,7 @@ impl SpoolStore {
         self.commit_manifest(&manifest)
     }
 
+    /// TODO: Document SpoolStore.complete_object_resource.
     fn complete_object_resource(
         &self,
         job_uuid: Uuid,
@@ -404,6 +409,7 @@ fn checkpoint_view(manifest: &SpoolManifest) -> ExportCheckpoint {
     }
 }
 
+/// TODO: Document ensure_resource_incomplete.
 pub(super) fn ensure_resource_incomplete(
     manifest: &SpoolManifest,
     kind: ArtifactKind,

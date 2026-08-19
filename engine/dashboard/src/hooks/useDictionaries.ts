@@ -20,6 +20,9 @@ export function useDictionarySearch(dictName: DictionaryName, query = '') {
   });
 }
 
+/**
+ * TODO: Document useAddDictionaryEntry.
+ */
 export function useAddDictionaryEntry(dictName: DictionaryName) {
   const queryClient = useQueryClient();
   const { toast } = useToast();
@@ -45,6 +48,9 @@ export function useAddDictionaryEntry(dictName: DictionaryName) {
   });
 }
 
+/**
+ * TODO: Document useDeleteDictionaryEntry.
+ */
 export function useDeleteDictionaryEntry(dictName: DictionaryName) {
   const queryClient = useQueryClient();
   const { toast } = useToast();

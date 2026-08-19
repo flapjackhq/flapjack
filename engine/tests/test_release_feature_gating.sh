@@ -48,7 +48,7 @@ else
   fail "flapjack-http disables flapjack dependency defaults" "expected default-features = false on flapjack dependency"
 fi
 
-if rg -q 'flapjack = \{ path = "\.\.", default-features = false \}' "$REPLICATION_CARGO"; then
+if rg -q 'flapjack = \{ path = "\.\.", default-features = false, features = \["analytics"\] \}' "$REPLICATION_CARGO"; then
   pass "flapjack-replication disables flapjack dependency defaults"
 else
   fail "flapjack-replication disables flapjack dependency defaults" "expected default-features = false on flapjack dependency"
@@ -59,6 +59,13 @@ if printf "%s\n" "$TREE_OUTPUT" | grep -Eq "ort-sys|fastembed|openssl-sys"; then
   fail "no-default-features graph excludes ORT/openssl path" "dependency graph still contains ort-sys/fastembed/openssl-sys"
 else
   pass "no-default-features graph excludes ORT/openssl path"
+fi
+
+VECTOR_TREE_OUTPUT="$(cd "$REPO_ROOT/engine" && cargo tree -p flapjack-server --target all --no-default-features --features vector-search)"
+if printf "%s\n" "$VECTOR_TREE_OUTPUT" | grep -Eq '(^| )numkong v'; then
+  fail "release vector-search graph excludes NumKong" "dependency graph still contains NumKong"
+else
+  pass "release vector-search graph excludes NumKong"
 fi
 
 printf "\nTotal: %d  Failed: %d\n" "$TESTS_RUN" "$TESTS_FAILED"

@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/translation_bundle.rs.
 use crate::handlers::settings::{
     payload_merge::{merge_non_topology_settings_payload, validate_and_apply_replicas},
     SetSettingsRequest,
@@ -399,6 +400,7 @@ fn normalized_matching_critical_values(
         .collect()
 }
 
+/// TODO: Document normalized_matching_critical_value.
 fn normalized_matching_critical_value(settings_value: &Value, field: &str) -> Option<Value> {
     let raw_value = raw_matching_critical_value(settings_value, field);
     let mut field_payload = serde_json::Map::new();
@@ -455,6 +457,7 @@ fn raw_default_equivalent_value(raw_value: Option<&Value>) -> Option<Value> {
     }
 }
 
+/// TODO: Document push_prefixed_failures.
 fn push_prefixed_failures(
     report_entries: &mut Vec<TranslationReportEntry>,
     source_replica_name: &str,
@@ -506,6 +509,7 @@ fn source_ranking_enables_custom_ranking(replica_settings_value: &Value) -> bool
         .unwrap_or(true)
 }
 
+/// TODO: Document lifted_custom_ranking_tokens.
 fn lifted_custom_ranking_tokens(
     replica_settings_value: &Value,
     source_replica_name: &str,
@@ -585,6 +589,7 @@ fn replica_settings_indexed_field_path(
     format!(r#"$.replicaSettings["{source_replica_name}"].{field}[{index}]"#)
 }
 
+/// TODO: Document raw_replica_strings.
 fn raw_replica_strings(
     raw_replicas: &Value,
     target_index_name: &str,
@@ -612,6 +617,7 @@ fn validate_source_replica_topology(
         .map_err(|_| source_replica_topology_error(source_index_name, raw_replicas))
 }
 
+/// TODO: Document translate_settings.
 pub(super) fn translate_settings(
     settings_value: &Value,
     failures: &mut Vec<TypedTranslationFailure>,
@@ -717,6 +723,7 @@ fn fold_deprecated_settings_aliases(settings_value: &Value) -> Value {
     Value::Object(folded)
 }
 
+/// TODO: Document translate_document.
 pub(super) fn translate_document(
     document: &Value,
     page_index: usize,
@@ -738,6 +745,7 @@ pub(super) fn translate_document(
     }
 }
 
+/// TODO: Document translate_serde_value.
 pub(super) fn translate_serde_value<T: DeserializeOwned>(
     value: &Value,
     page_index: usize,
@@ -824,6 +832,7 @@ fn canonical_virtual_replica_string(translation: &ReplicaTopologyTranslation) ->
     format!("virtual({})", translation.derived_entry.name())
 }
 
+/// TODO: Document annotate_replica_validation_error.
 fn annotate_replica_validation_error(
     target_index_name: &str,
     translations: &[ReplicaTopologyTranslation],
@@ -853,6 +862,7 @@ fn source_replica_topology_error(
     replica_topology_error(&source_replica_name)
 }
 
+/// TODO: Document first_invalid_source_replica_name.
 fn first_invalid_source_replica_name(
     source_index_name: &str,
     raw_replicas: &[String],
@@ -878,6 +888,7 @@ fn first_invalid_source_replica_name(
     None
 }
 
+/// TODO: Document first_invalid_derived_replica_name.
 fn first_invalid_derived_replica_name(
     target_index_name: &str,
     translations: &[ReplicaTopologyTranslation],

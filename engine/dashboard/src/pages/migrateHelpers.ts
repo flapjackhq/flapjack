@@ -1,3 +1,6 @@
+/**
+ * @module Stub summary for engine/dashboard/src/pages/migrateHelpers.ts.
+ */
 import axios from 'axios';
 import { useAuth } from '@/hooks/useAuth';
 

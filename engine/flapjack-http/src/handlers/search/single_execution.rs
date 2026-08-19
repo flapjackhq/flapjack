@@ -93,6 +93,11 @@ fn prepare_search_params(
     let filter = req.build_combined_filter()?;
     let sort = resolve_search_sort(req);
     let loaded_settings = state.manager.get_settings(effective_index);
+    if req.hits_per_page.is_none() {
+        req.hits_per_page = loaded_settings
+            .as_ref()
+            .map(|settings| settings.hits_per_page as usize);
+    }
     let facet_requests = build_facet_requests(req, loaded_settings.as_deref());
     let distinct_count = resolve_distinct_count(req, loaded_settings.as_deref());
     let geo_params = req.build_geo_params();

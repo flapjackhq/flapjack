@@ -1,6 +1,8 @@
 //! Algolia Insights API-compatible event ingestion, debug event inspection, and GDPR user token deletion handlers.
 use axum::{
     extract::{Path, Query, State},
+    http::HeaderMap,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
 use std::sync::Arc;
@@ -9,8 +11,11 @@ use flapjack::analytics::schema::{validate_user_token, InsightEvent};
 use flapjack::analytics::{AnalyticsCollector, DebugEvent};
 use flapjack::error::FlapjackError;
 
-use super::analytics::enforce_analytics_index_access;
-use crate::auth::{key_allows_index, ApiKey, SecuredKeyRestrictions};
+use super::analytics::{analytics_request_has_index_restrictions, enforce_analytics_index_access};
+use crate::auth::{key_allows_index, ApiKey, AuthenticatedAppId, SecuredKeyRestrictions};
+use crate::idempotency::{
+    event_index_set_segment, IdempotencyCache, IdempotencyRecord, IDEMPOTENCY_HEADER,
+};
 
 const DEBUG_EVENTS_DEFAULT_LIMIT: usize = 100;
 const DEBUG_EVENTS_MAX_LIMIT: usize = 1000;
@@ -25,8 +30,11 @@ pub async fn post_events(
     State(collector): State<Arc<AnalyticsCollector>>,
     api_key: Option<Extension<ApiKey>>,
     secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
+    authenticated_app_id: Option<Extension<AuthenticatedAppId>>,
+    idempotency_cache: Option<Extension<Arc<IdempotencyCache>>>,
+    headers: HeaderMap,
     Json(body): Json<InsightsRequest>,
-) -> Result<Json<serde_json::Value>, FlapjackError> {
+) -> Result<Response, FlapjackError> {
     if body.events.len() > 1000 {
         return Err(FlapjackError::InvalidQuery(
             "Maximum 1000 events per request".to_string(),
@@ -43,6 +51,39 @@ pub async fn post_events(
     // persisted before a later forbidden event rejects the batch.
     for event in &body.events {
         enforce_analytics_index_access(api_key, secured_restrictions, &event.index)?;
+    }
+
+    let idempotency_key = headers
+        .get(IDEMPOTENCY_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let app_id = authenticated_app_id
+        .as_ref()
+        .map(|Extension(app_id)| app_id.0.as_str())
+        .or_else(|| {
+            headers
+                .get("x-algolia-application-id")
+                .and_then(|value| value.to_str().ok())
+        });
+    let idempotency_scope = event_idempotency_scope(&body.events);
+    if let Some(key) = idempotency_key {
+        let app_id = app_id.ok_or_else(|| {
+            FlapjackError::InvalidQuery(
+                "X-Algolia-Application-Id is required with an idempotency key".to_string(),
+            )
+        })?;
+        let cache = idempotency_cache
+            .as_ref()
+            .ok_or_else(|| FlapjackError::Io("idempotency cache is unavailable".to_string()))?;
+        match cache.lookup_scoped(app_id, &idempotency_scope, key) {
+            Ok(Some(record)) => return Ok(record.into_response()),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::error!(error = %err, "event idempotency cache lookup failed");
+                return Err(FlapjackError::Io(
+                    "idempotency persistence lookup failed".to_string(),
+                ));
+            }
+        }
     }
 
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -82,10 +123,35 @@ pub async fn post_events(
         )));
     }
 
-    Ok(Json(serde_json::json!({
+    let response_body = serde_json::json!({
         "status": 200,
         "message": "OK"
-    })))
+    });
+
+    if let (Some(key), Some(app_id), Some(Extension(cache))) =
+        (idempotency_key, app_id, idempotency_cache)
+    {
+        let response_bytes = serde_json::to_vec(&response_body).unwrap_or_default();
+        if let Err(err) = cache.store_scoped(
+            app_id,
+            &idempotency_scope,
+            key,
+            IdempotencyRecord::json(axum::http::StatusCode::OK, response_bytes.into()),
+        ) {
+            tracing::error!(
+                error = %err,
+                app_id,
+                idempotency_scope,
+                "event idempotency cache store failed after accepted events; returning success"
+            );
+        }
+    }
+
+    Ok(Json(response_body).into_response())
+}
+
+fn event_idempotency_scope(events: &[InsightEvent]) -> String {
+    event_index_set_segment(events.iter().map(|event| event.index.as_str()))
 }
 
 /// GET /1/events/debug - Return recent events from the debug ring buffer
@@ -199,51 +265,99 @@ fn parse_debug_timestamp(value: Option<&str>) -> Result<Option<i64>, FlapjackErr
     Ok(Some(parsed))
 }
 
-/// DELETE /1/usertokens/{userToken} - GDPR deletion for all insight events tied to a user token
+/// DELETE /1/usertokens/{userToken} - Delete insight events tied to a user token.
 ///
-/// Multi-store cleanup: purges insight events from analytics collector AND
-/// deletes the personalization profile cache for the user token. Ordering is
-/// deterministic (analytics first, then profile cache) with best-effort
-/// semantics — each store is cleaned independently so a failure in one does
-/// not block cleanup of the other.
+/// Admin and unrestricted keys retain the full GDPR cleanup across analytics
+/// and the global personalization profile. Index-restricted keys purge only
+/// authorized analytics partitions because the profile has no index scope.
 #[utoipa::path(delete, path = "/1/usertokens/{userToken}", tag = "insights",
     params(("userToken" = String, Path, description = "User token to delete")),
     security(("api_key" = [])))]
 pub async fn delete_usertoken(
     State(state): State<GdprDeleteState>,
     Path(user_token): Path<String>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
     validate_user_token(&user_token).map_err(FlapjackError::InvalidQuery)?;
 
-    // 1. Purge analytics events (in-memory buffer + on-disk Parquet)
-    if let Err(e) = state.analytics_collector.purge_user_token(&user_token) {
-        tracing::warn!(
-            user_token_len = user_token.len(),
-            "GDPR delete: failed to purge analytics events: {e}"
-        );
-    }
+    let api_key = api_key.as_ref().map(|Extension(api_key)| api_key);
+    let secured_restrictions = secured_restrictions
+        .as_ref()
+        .map(|Extension(restrictions)| restrictions);
+    let index_restricted = analytics_request_has_index_restrictions(api_key, secured_restrictions);
 
-    // 2. Delete personalization profile cache
-    let profile_store =
-        flapjack::personalization::PersonalizationProfileStore::new(&state.profile_store_base_path);
-    if let Err(e) = profile_store.delete_profile(&user_token) {
+    // A full deletion must prove the profile target is safe before analytics
+    // mutation starts. Restricted deletion has no global profile scope.
+    let (profile_store, _profile_operation) = if index_restricted {
+        (None, None)
+    } else {
+        let store = flapjack::personalization::PersonalizationProfileStore::new(
+            &state.profile_store_base_path,
+        );
+        let operation = store.begin_user_operation(&user_token).await.map_err(|e| {
+            tracing::warn!(
+                user_token_len = user_token.len(),
+                "GDPR delete: failed to order personalization profile deletion: {e}"
+            );
+            FlapjackError::Io("failed to order user profile deletion".to_string())
+        })?;
+        store.preflight_delete_profile(&user_token).map_err(|e| {
+            tracing::warn!(
+                user_token_len = user_token.len(),
+                "GDPR delete: unsafe personalization profile target: {e}"
+            );
+            FlapjackError::Io("failed to validate user profile deletion".to_string())
+        })?;
+        (Some(store), Some(operation))
+    };
+
+    // Restricted keys can purge only their authorized event partitions. The
+    // unscoped profile and notification remain reserved for a full deletion.
+    let purge_result = if index_restricted {
+        state
+            .analytics_collector
+            .purge_user_token_where_index(&user_token, &|index| {
+                api_key.is_some_and(|key| key_allows_index(key, secured_restrictions, index))
+            })
+    } else {
+        state.analytics_collector.purge_user_token(&user_token)
+    };
+    purge_result.map_err(|e| {
         tracing::warn!(
             user_token_len = user_token.len(),
-            "GDPR delete: failed to remove personalization profile: {e}"
+            "user-token deletion: failed to purge analytics events: {e}"
         );
+        FlapjackError::Io("failed to purge user analytics".to_string())
+    })?;
+
+    if let Some(profile_store) = profile_store {
+        // Delete the global personalization profile only for a full deletion.
+        profile_store.delete_profile(&user_token).map_err(|e| {
+            tracing::warn!(
+                user_token_len = user_token.len(),
+                "GDPR delete: failed to remove personalization profile: {e}"
+            );
+            FlapjackError::Io("failed to delete user profile".to_string())
+        })?;
+
+        if let Some(notifier) = &state.gdpr_notifier {
+            notifier.send_gdpr_confirmation(&user_token);
+        }
     }
 
     let deleted_at = chrono::Utc::now().to_rfc3339();
 
-    if let Some(notifier) = crate::notifications::global_notifier() {
-        notifier.send_gdpr_confirmation(&user_token);
-    }
-
-    Ok(Json(serde_json::json!({
+    let mut response = serde_json::json!({
         "status": 200,
         "message": "OK",
         "deletedAt": deleted_at
-    })))
+    });
+    if index_restricted {
+        response["deletionScope"] = serde_json::json!("authorizedIndexes");
+    }
+
+    Ok(Json(response))
 }
 
 /// State for the GDPR delete endpoint, bundling the analytics collector and
@@ -252,6 +366,8 @@ pub async fn delete_usertoken(
 pub struct GdprDeleteState {
     pub analytics_collector: Arc<AnalyticsCollector>,
     pub profile_store_base_path: std::path::PathBuf,
+    /// Canonical notifier supplied by `AppState` through the production router.
+    pub gdpr_notifier: Option<Arc<crate::notifications::NotificationService>>,
 }
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]

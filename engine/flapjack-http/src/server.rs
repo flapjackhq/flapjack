@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/server.rs.
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -164,6 +165,7 @@ pub(crate) async fn run_pre_serve_barrier(
         .await
 }
 
+/// TODO: Document run_pre_serve_barrier_with_catchup.
 async fn run_pre_serve_barrier_with_catchup<Catchup>(
     state: &crate::handlers::AppState,
     catchup: Catchup,
@@ -241,6 +243,7 @@ where
     .await
 }
 
+/// TODO: Document flush_then_wait_for_migration_and_manager_shutdown.
 async fn flush_then_wait_for_migration_and_manager_shutdown<
     FlushFn,
     MigrationFuture,
@@ -297,6 +300,7 @@ where
     outcome
 }
 
+/// TODO: Document full_graceful_shutdown_with_migrations.
 async fn full_graceful_shutdown_with_migrations<FlushFn, MigrationFuture, ShutdownFuture, OtelFn>(
     shutdown_timeout_secs: u64,
     flush_analytics: FlushFn,

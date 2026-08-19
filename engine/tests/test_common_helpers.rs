@@ -81,6 +81,7 @@ fn parses_valid_usize() {
     );
 }
 
+/// TODO: Document send_json_response_with_headers_preserves_single_content_type_header.
 #[tokio::test(flavor = "current_thread")]
 async fn send_json_response_with_headers_preserves_single_content_type_header() {
     let app = Router::new().route("/inspect", post(inspect_request));
@@ -128,6 +129,7 @@ async fn make_test_app_state_wires_manager_dictionary_and_defaults() {
     assert!(state.experiment_store.is_none());
 }
 
+/// TODO: Document make_test_app_state_preserves_manager_override_and_rewires_dictionary.
 #[tokio::test]
 async fn make_test_app_state_preserves_manager_override_and_rewires_dictionary() {
     let tmp = tempdir().expect("tempdir");
@@ -151,6 +153,7 @@ async fn make_test_app_state_preserves_manager_override_and_rewires_dictionary()
     assert!(Arc::ptr_eq(manager_dm, &state.dictionary_manager));
 }
 
+/// TODO: Document dropping_temp_dir_stops_attached_server.
 #[tokio::test]
 async fn dropping_temp_dir_stops_attached_server() {
     let (app, mut temp_dir) = common::state::build_test_app_for_local_requests(None);

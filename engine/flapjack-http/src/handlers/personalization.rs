@@ -1,3 +1,4 @@
+//! Stub summary for personalization.rs.
 use axum::{
     extract::{Path, State},
     Json,
@@ -213,6 +214,11 @@ pub async fn delete_user_profile(
     store
         .profile_path(&user_token)
         .map_err(FlapjackError::InvalidQuery)?;
+
+    let _operation = store
+        .begin_user_operation(&user_token)
+        .await
+        .map_err(FlapjackError::Io)?;
 
     store
         .delete_profile(&user_token)

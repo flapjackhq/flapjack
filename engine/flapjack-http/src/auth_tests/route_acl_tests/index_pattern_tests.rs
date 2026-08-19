@@ -1,3 +1,4 @@
+//! Stub summary for index_pattern_tests.rs.
 use super::super::*;
 
 // ── index_pattern_matches ──
@@ -56,6 +57,7 @@ fn key_allows_index_with_no_restrictions_matches_any_index() {
     let api_key = test_search_api_key("unrestricted key");
     assert!(key_allows_index(&api_key, None, "products"));
 }
+/// TODO: Document key_allows_index_requires_parent_and_secured_restrictions_to_match.
 #[test]
 fn key_allows_index_requires_parent_and_secured_restrictions_to_match() {
     let mut api_key = test_search_api_key("restricted key");

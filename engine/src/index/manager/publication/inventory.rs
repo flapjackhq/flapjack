@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/manager/publication/inventory.rs.
 use super::{invalid_publication, Result, TantivyManagedInventory};
 use std::collections::BTreeSet;
 use std::io;
@@ -27,6 +28,7 @@ fn reject_symlinked_inventory_root(root: &Path) -> Result<()> {
     }
 }
 
+/// TODO: Document collect_relative_files.
 fn collect_relative_files(
     root: &Path,
     current: &Path,

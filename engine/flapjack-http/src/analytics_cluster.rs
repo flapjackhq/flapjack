@@ -407,6 +407,32 @@ mod tests {
         (format!("http://{addr}"), rx)
     }
 
+    async fn spawn_json_peer(body: serde_json::Value) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test peer must bind before fan-out");
+        let addr = listener
+            .local_addr()
+            .expect("test peer must expose address");
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("test peer should accept");
+            let _ = read_request_headers(&mut socket).await;
+            let body = serde_json::to_string(&body).expect("peer JSON must serialize");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("test peer should write response");
+        });
+
+        format!("http://{addr}")
+    }
+
     fn cluster_for_peer(
         peer_addr: String,
         peer_credential: Option<String>,
@@ -470,6 +496,56 @@ mod tests {
         let client = client.unwrap();
         assert_eq!(client.node_id, "node-a");
         assert_eq!(client.peers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fan_out_top_searches_has_deterministic_ties_and_global_average() {
+        let peer_addr = spawn_json_peer(json!({"searches": [
+            {
+                "search": "trail",
+                "count": 9,
+                "nbHits": 10,
+                "_nbHitsSum": 90,
+                "_nbHitsCount": 9
+            },
+            {"search": "beta", "count": 2, "nbHits": 4}
+        ]}))
+        .await;
+        let cluster = cluster_for_peer(peer_addr, None);
+        let local = json!({"searches": [
+            {
+                "search": "trail",
+                "count": 1,
+                "nbHits": 100,
+                "_nbHitsSum": 100,
+                "_nbHitsCount": 1
+            },
+            {"search": "zebra", "count": 2, "nbHits": 2},
+            {"search": "alpha", "count": 2, "nbHits": 3}
+        ]});
+
+        let merged = cluster
+            .fan_out_and_merge(
+                "searches",
+                "/2/searches",
+                "index=products&startDate=2026-08-18&endDate=2026-08-18",
+                local,
+                10,
+                &axum::http::HeaderMap::new(),
+            )
+            .await;
+        let searches = merged["searches"].as_array().unwrap();
+        let queries: Vec<&str> = searches
+            .iter()
+            .map(|row| row["search"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(queries, vec!["trail", "alpha", "beta", "zebra"]);
+        assert_eq!(searches[0]["count"], 10);
+        assert_eq!(searches[0]["nbHits"], 19);
+        assert!(searches[0].get("_nbHitsSum").is_none());
+        assert!(searches[0].get("_nbHitsCount").is_none());
+        assert_eq!(merged["cluster"]["nodes_responding"], 2);
     }
 
     #[tokio::test]

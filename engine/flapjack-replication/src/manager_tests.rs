@@ -171,6 +171,7 @@ fn replace_peers_preserves_memory_when_persistence_fails() {
     assert!(!manager.is_peer_available("new-peer"));
 }
 
+/// TODO: Document spawn_single_response_peer.
 async fn spawn_single_response_peer(
     response: GetOpsResponse,
 ) -> (String, tokio::task::JoinHandle<()>) {
@@ -197,6 +198,7 @@ async fn spawn_single_response_peer(
     (format!("http://{}", addr), handle)
 }
 
+/// TODO: Document spawn_single_tenant_list_peer.
 async fn spawn_single_tenant_list_peer(
     response: ListTenantsResponse,
 ) -> (String, tokio::task::JoinHandle<()>) {
@@ -223,6 +225,7 @@ async fn spawn_single_tenant_list_peer(
     (format!("http://{}", addr), handle)
 }
 
+/// TODO: Document spawn_replicate_peer.
 async fn spawn_replicate_peer(
     acked_seq: u64,
     expected_requests: usize,
@@ -278,6 +281,7 @@ async fn spawn_observed_status_peer() -> (String, oneshot::Receiver<()>) {
     (format!("http://{}", addr), request_seen_rx)
 }
 
+/// TODO: Document spawn_barrier_replicate_peer.
 async fn spawn_barrier_replicate_peer(
     acked_seq: u64,
     accepted_barrier: Arc<Barrier>,
@@ -327,6 +331,7 @@ fn mutable_peer_test_op(seq: u64) -> OpLogEntry {
     }
 }
 
+/// TODO: Document wait_for_acked_seq.
 async fn wait_for_acked_seq(
     manager: &ReplicationManager,
     tenant_id: &str,
@@ -384,6 +389,7 @@ fn test_manager_no_peers() {
     assert_eq!(manager.peer_count(), 0);
 }
 
+/// TODO: Document add_peer_returns_receipt_from_mutation_snapshot.
 #[test]
 fn add_peer_returns_receipt_from_mutation_snapshot() {
     let manager = new_test_manager(
@@ -433,6 +439,7 @@ fn add_peer_persists_membership_to_node_json_for_restart() {
     );
 }
 
+/// TODO: Document remove_peer_returns_receipt_from_mutation_snapshot.
 #[test]
 fn remove_peer_returns_receipt_from_mutation_snapshot() {
     let manager = new_test_manager(
@@ -1592,6 +1599,7 @@ fn ops_contract_peer_statuses_maps_runtime_wire_tokens() {
     );
 }
 
+/// TODO: Document mutable_peer_replicate_ops_uses_snapshots_while_membership_changes.
 #[tokio::test]
 async fn mutable_peer_replicate_ops_uses_snapshots_while_membership_changes() {
     let accepted_barrier = Arc::new(Barrier::new(2));
@@ -1652,6 +1660,7 @@ async fn mutable_peer_replicate_ops_uses_snapshots_while_membership_changes() {
     .expect("membership mutation must not deadlock in-flight replication");
 }
 
+/// TODO: Document mutable_peer_duplicate_add_rejects_atomically_and_remove_clears_cursors.
 #[test]
 fn mutable_peer_duplicate_add_rejects_atomically_and_remove_clears_cursors() {
     let manager = new_test_manager(
@@ -1771,6 +1780,7 @@ fn mutable_peer_duplicate_add_rejects_atomically_and_remove_clears_cursors() {
     );
 }
 
+/// TODO: Document mutable_peer_no_mutation_preserves_status_and_cursor_views.
 #[tokio::test]
 async fn mutable_peer_no_mutation_preserves_status_and_cursor_views() {
     let (node_b_url, node_b_handle) = spawn_replicate_peer(11, 1).await;
@@ -1837,6 +1847,7 @@ async fn mutable_peer_no_mutation_preserves_status_and_cursor_views() {
     );
 }
 
+/// TODO: Document mutable_peer_runtime_added_peer_uses_retained_peer_credential.
 #[tokio::test]
 async fn mutable_peer_runtime_added_peer_uses_retained_peer_credential() {
     let (peer_url, peer_handle) = spawn_replicate_peer(33, 1).await;
@@ -1871,6 +1882,7 @@ async fn mutable_peer_runtime_added_peer_uses_retained_peer_credential() {
     wait_for_acked_seq(&manager, "tenant-red", "node-b", 33).await;
 }
 
+/// TODO: Document mutable_peer_removed_peer_cursor_does_not_reappear_after_in_flight_completion.
 #[tokio::test]
 async fn mutable_peer_removed_peer_cursor_does_not_reappear_after_in_flight_completion() {
     let accepted_barrier = Arc::new(Barrier::new(2));
@@ -2071,6 +2083,7 @@ async fn test_catch_up_from_peer_no_peers_returns_error() {
     assert!(result.unwrap_err().contains("No peers available"));
 }
 
+/// TODO: Document test_catch_up_from_peer_merges_ops_from_all_available_peers.
 #[tokio::test]
 async fn test_catch_up_from_peer_merges_ops_from_all_available_peers() {
     let peer_a_response = GetOpsResponse {
@@ -2146,6 +2159,7 @@ async fn test_catch_up_from_peer_merges_ops_from_all_available_peers() {
         .any(|entry| entry.node_id == "node-c" && entry.seq == 1));
 }
 
+/// TODO: Document test_catch_up_from_peer_with_metadata_strict_rejects_partial_peer_success.
 #[tokio::test]
 async fn test_catch_up_from_peer_with_metadata_strict_rejects_partial_peer_success() {
     let peer_a_response = GetOpsResponse {
@@ -2441,6 +2455,7 @@ async fn strict_catch_up_rejects_conflicting_duplicate_seq_from_one_peer() {
     );
 }
 
+/// TODO: Document test_discover_tenants_from_peers_strict_rejects_partial_peer_success.
 #[tokio::test]
 async fn test_discover_tenants_from_peers_strict_rejects_partial_peer_success() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2498,6 +2513,7 @@ async fn test_discover_tenants_from_peers_strict_rejects_partial_peer_success() 
     );
 }
 
+/// TODO: Document test_discover_tenants_from_peers_skips_invalid_tenant_ids.
 #[tokio::test]
 async fn test_discover_tenants_from_peers_skips_invalid_tenant_ids() {
     let (peer_url, peer_handle) = spawn_single_tenant_list_peer(ListTenantsResponse {
@@ -2524,6 +2540,7 @@ async fn test_discover_tenants_from_peers_skips_invalid_tenant_ids() {
     assert_eq!(tenants, vec!["tenant-red".to_string()]);
 }
 
+/// TODO: Document test_discover_tenants_from_peers_strict_rejects_invalid_tenant_ids.
 #[tokio::test]
 async fn test_discover_tenants_from_peers_strict_rejects_invalid_tenant_ids() {
     let (peer_url, peer_handle) = spawn_single_tenant_list_peer(ListTenantsResponse {

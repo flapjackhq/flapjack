@@ -1,3 +1,4 @@
+//! Stub summary for openapi_export_tests.rs.
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -91,6 +92,7 @@ fn default_output_path_targets_engine_docs2_openapi_json() {
     );
 }
 
+/// TODO: Document committed_docs2_openapi_matches_export_output.
 #[cfg(not(feature = "fault-injection"))]
 #[test]
 fn committed_docs2_openapi_matches_export_output() {
@@ -137,6 +139,7 @@ fn committed_demo_openapi_matches_export_output() {
     );
 }
 
+/// TODO: Document export_output_covers_recommend_personalization_and_experiments_routes.
 #[test]
 fn export_output_covers_recommend_personalization_and_experiments_routes() {
     let doc = exported_openapi_doc();
@@ -293,6 +296,7 @@ fn export_output_declares_typesense_preview_payload_schema() {
         "Meilisearch request schema must not grow the Typesense attestation field"
     );
 }
+/// TODO: Document export_output_includes_federated_batch_contract_components.
 #[test]
 fn export_output_includes_federated_batch_contract_components() {
     let doc = exported_openapi_doc();

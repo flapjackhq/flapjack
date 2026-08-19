@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/manager/search_phases/search_helpers.rs.
 use super::super::*;
 use super::query_execution::{
     execute_expanded_queries, maybe_cache_facets, resolve_total_hits,
@@ -36,6 +37,7 @@ pub(super) struct RankedSearchOutput {
     pub facet_result: Option<FacetResultCache>,
 }
 
+/// TODO: Document build_search_parser.
 pub(super) fn build_search_parser(
     resolved: &ResolvedSearch,
     preprocessed: &PreprocessedQuery,
@@ -119,6 +121,7 @@ pub(super) fn build_search_parser(
     }
 }
 
+/// TODO: Document execute_zero_limit_search.
 pub(super) fn execute_zero_limit_search(
     manager: &IndexManager,
     resolved: &ResolvedSearch,
@@ -198,6 +201,7 @@ fn execute_uncached_zero_limit_search(
     ))
 }
 
+/// TODO: Document execute_ranked_search.
 pub(super) fn execute_ranked_search(
     manager: &IndexManager,
     resolved: &ResolvedSearch,
@@ -256,6 +260,7 @@ pub(super) fn execute_ranked_search(
     })
 }
 
+/// TODO: Document build_execution_limits.
 pub(super) fn build_execution_limits(
     prepared: &PreparedSearchFilters,
     preprocessed: &PreprocessedQuery,
@@ -289,6 +294,7 @@ mod tests {
 
     const METRICS_TENANT_ID: &str = "tenant_zero_limit_metrics";
 
+    /// TODO: Document prepared_filters_with_window.
     fn prepared_filters_with_window(limit: usize, offset: usize) -> PreparedSearchFilters {
         let mut schema_builder = tantivy::schema::Schema::builder();
         let json_search_field =

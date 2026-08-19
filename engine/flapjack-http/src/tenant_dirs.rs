@@ -10,6 +10,7 @@ pub(crate) fn visible_tenant_dir_name(entry: &std::fs::DirEntry) -> Option<Strin
     visible_tenant_name_if_visible_directory(entry.file_name(), is_directory)
 }
 
+/// TODO: Document visible_tenant_name_if_visible_directory.
 fn visible_tenant_name_if_visible_directory(
     name: std::ffi::OsString,
     is_directory: bool,
@@ -82,6 +83,7 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
     use tempfile::TempDir;
 
+    /// TODO: Document visible_tenant_dir_name_returns_only_visible_directories.
     #[test]
     fn visible_tenant_dir_name_returns_only_visible_directories() {
         let temp_dir = TempDir::new().unwrap();

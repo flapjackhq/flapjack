@@ -1,8 +1,10 @@
+//! Stub summary for engine/flapjack-http/src/idempotency.rs.
 use axum::body::{Body, Bytes};
 use axum::http::StatusCode;
 use axum::response::Response;
 use dashmap::DashMap;
 use rusqlite::{params, Connection};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -11,12 +13,22 @@ use thiserror::Error;
 
 pub const IDEMPOTENCY_HEADER: &str = "x-flapjack-idempotency-key";
 pub const BATCH_INDEX_WILDCARD: &str = "*";
+const EVENT_INDEX_SET_PREFIX: &str = "/events/";
 
 const DEFAULT_TTL_SECS: u64 = 300;
 const MIN_TTL_SECS: u64 = 1;
 const IDENTITY_WILDCARD: &str = "*";
 const PERSIST_ENV_CANONICAL: &str = "FLAPJACK_IDEMPOTENCY_PERSISTENT";
 const PERSIST_ENV_COMPAT: &str = "FLAPJACK_IDEMPOTENCY_PERSIST";
+
+/// Return a stable event-batch cache segment outside the object-index namespace.
+/// Object writes use a validated index name (or `*`); index validation rejects
+/// the slash in this prefix, so the domains cannot collide in memory or SQLite.
+pub fn event_index_set_segment<'a>(indexes: impl IntoIterator<Item = &'a str>) -> String {
+    let indexes = indexes.into_iter().collect::<BTreeSet<_>>();
+    let encoded = serde_json::to_string(&indexes).expect("event index strings must serialize");
+    format!("{EVENT_INDEX_SET_PREFIX}{encoded}")
+}
 
 #[derive(Clone)]
 pub struct IdempotencyRecord {
@@ -74,6 +86,7 @@ pub enum IdempotencyStoreError {
     Sqlite(#[from] rusqlite::Error),
 }
 
+/// TODO: Document IdempotencyStore.
 trait IdempotencyStore: Send + Sync {
     fn lookup(
         &self,
@@ -107,6 +120,7 @@ impl MemoryStore {
         }
     }
 
+    /// TODO: Document MemoryStore.maybe_trim.
     fn maybe_trim(&self, ttl: Duration) {
         let interval_millis = ttl.as_millis() as u64;
         let now_millis = now_unix_ms() as u64;
@@ -129,6 +143,7 @@ impl MemoryStore {
 }
 
 impl IdempotencyStore for MemoryStore {
+    /// TODO: Document MemoryStore.lookup.
     fn lookup(
         &self,
         key: &CompositeKey,
@@ -184,6 +199,7 @@ struct SqliteStore {
 }
 
 impl SqliteStore {
+    /// TODO: Document SqliteStore.open.
     fn open(path: &Path) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -212,6 +228,7 @@ impl SqliteStore {
         })
     }
 
+    /// TODO: Document SqliteStore.maybe_trim.
     fn maybe_trim(&self, ttl: Duration) -> Result<(), IdempotencyStoreError> {
         let interval_millis = ttl.as_millis() as u64;
         let now_millis = now_unix_ms() as u64;
@@ -245,6 +262,7 @@ impl SqliteStore {
 }
 
 impl IdempotencyStore for SqliteStore {
+    /// TODO: Document SqliteStore.lookup.
     fn lookup(
         &self,
         key: &CompositeKey,
@@ -289,6 +307,7 @@ impl IdempotencyStore for SqliteStore {
         }))
     }
 
+    /// TODO: Document SqliteStore.store.
     fn store(
         &self,
         key: CompositeKey,
@@ -381,6 +400,7 @@ impl IdempotencyCache {
         Self::from_env_with_data_dir(Path::new("."))
     }
 
+    /// TODO: Document IdempotencyCache.from_env_with_data_dir.
     pub fn from_env_with_data_dir(data_dir: &Path) -> Self {
         let ttl_secs = std::env::var("FLAPJACK_IDEMPOTENCY_TTL_SECS")
             .ok()
@@ -419,6 +439,7 @@ impl IdempotencyCache {
         self.store.lookup(&key, self.ttl)
     }
 
+    /// TODO: Document IdempotencyCache.store_scoped.
     pub fn store_scoped(
         &self,
         application_id: &str,
@@ -556,6 +577,7 @@ mod tests {
         assert_eq!(cache.len(), 1_000);
     }
 
+    /// TODO: Document from_env_clamps_zero_ttl_to_one_second.
     #[test]
     fn from_env_clamps_zero_ttl_to_one_second() {
         // Hold ENV_MUTEX while mutating process-global env vars and route
@@ -625,6 +647,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document composite_key_isolates_same_idempotency_key_across_application_and_index.
     #[test]
     fn composite_key_isolates_same_idempotency_key_across_application_and_index() {
         let cache = IdempotencyCache::new(Duration::from_secs(60));
@@ -659,6 +682,7 @@ mod tests {
             .is_none());
     }
 
+    /// TODO: Document memory_ttl_uses_wall_clock_elapsed_time.
     #[test]
     fn memory_ttl_uses_wall_clock_elapsed_time() {
         let cache = IdempotencyCache::new(Duration::from_millis(25));
@@ -681,6 +705,7 @@ mod tests {
             .is_none());
     }
 
+    /// TODO: Document sqlite_restart_survives_then_expires_by_wall_clock_ttl.
     #[test]
     fn sqlite_restart_survives_then_expires_by_wall_clock_ttl() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -720,6 +745,7 @@ mod tests {
         assert!(expected.exists());
     }
 
+    /// TODO: Document sqlite_store_surfaces_write_failures.
     #[test]
     fn sqlite_store_surfaces_write_failures() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -740,6 +766,7 @@ mod tests {
         assert!(result.is_err(), "store must surface sqlite write failures");
     }
 
+    /// TODO: Document sqlite_store_surfaces_expired_delete_failures.
     #[test]
     fn sqlite_store_surfaces_expired_delete_failures() {
         let temp = tempfile::tempdir().expect("tempdir");

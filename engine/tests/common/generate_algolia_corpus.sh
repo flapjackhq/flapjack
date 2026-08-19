@@ -15,6 +15,7 @@ die() {
   exit "${2:-1}"
 }
 
+# TODO: Document parse_args.
 parse_args() {
   MODE="${1:-}"
   [ "$#" -gt 0 ] && shift
@@ -48,6 +49,7 @@ parse_args() {
   [ "$CORPUS_SIZE" -ge 2 ] || die "--corpus-size must be at least 2 for scale probe coverage" 2
 }
 
+# TODO: Document document_json_for.
 document_json_for() {
   local number="$1" object_id category name description price popularity color
   printf -v object_id 'scale-%06d' "$number"
@@ -98,6 +100,7 @@ emit_documents() {
   done
 }
 
+# TODO: Document source_configuration_json.
 source_configuration_json() {
   local rule_object_id="$1"
   jq -cn --arg rule_object_id "$rule_object_id" --argjson pagination_limited_to "$CORPUS_SIZE" '
@@ -126,6 +129,7 @@ source_configuration_json() {
     }'
 }
 
+# TODO: Document emit_manifest.
 emit_manifest() {
   local first_id final_id known_answers source_configuration
   local jackets shoes red blue green black

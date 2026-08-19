@@ -21,6 +21,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use crate::geoip::GeoIpReader;
 use crate::handlers::migration::TEST_ALGOLIA_BASE_URL_ENV;
 use crate::handlers::AppState;
+use crate::notifications::NotificationService;
 
 #[derive(Clone, Default)]
 pub(crate) struct SharedLogBuffer {
@@ -308,6 +309,7 @@ pub(crate) struct TestStateBuilder<'tmp> {
     experiment_store: Option<Arc<ExperimentStore>>,
     geoip_reader: Option<Arc<GeoIpReader>>,
     replication_manager: Option<Arc<ReplicationManager>>,
+    notification_service: Option<Arc<NotificationService>>,
     migration_capacity: usize,
     bulk_replace_max_bytes: u64,
 }
@@ -320,6 +322,7 @@ impl<'tmp> TestStateBuilder<'tmp> {
             experiment_store: None,
             geoip_reader: None,
             replication_manager: None,
+            notification_service: None,
             migration_capacity: crate::handlers::migration::DEFAULT_ASYNC_MIGRATION_CAPACITY,
             bulk_replace_max_bytes: crate::handlers::migration::spool::SpoolLimits::default()
                 .max_bytes_per_job,
@@ -364,6 +367,14 @@ impl<'tmp> TestStateBuilder<'tmp> {
         self
     }
 
+    pub(crate) fn with_notification_service(
+        mut self,
+        notification_service: Arc<NotificationService>,
+    ) -> Self {
+        self.notification_service = Some(notification_service);
+        self
+    }
+
     pub(crate) fn with_migration_capacity(mut self, capacity: usize) -> Self {
         self.migration_capacity = capacity;
         self
@@ -400,7 +411,7 @@ impl<'tmp> TestStateBuilder<'tmp> {
             metrics_state: Some(crate::handlers::metrics::MetricsState::new()),
             usage_counters: Arc::new(dashmap::DashMap::new()),
             usage_persistence: None,
-            notification_service: None,
+            notification_service: self.notification_service,
             paused_indexes: crate::pause_registry::PausedIndexes::new(),
             geoip_reader: self.geoip_reader,
             migration_runner,

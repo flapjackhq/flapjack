@@ -2,6 +2,7 @@
 /.cargo
 /.cache
 **/node_modules/
+**/.svelte-kit/
 node_modules/
 .secret/
 
@@ -42,9 +43,10 @@ demo-dualclient/public/openapi.json
 **/dist/
 
 # Lock files for dependencies
-# Keep: Cargo.lock (binary crate), dashboard + sdk_test package-lock.json
+# Keep: Cargo.lock (binary crate), console + dashboard + sdk_test package-lock.json
 # Ignore: other SDK/integration lock files (published libraries, not apps)
 **/package-lock.json
+!engine/console/package-lock.json
 !engine/dashboard/package-lock.json
 !engine/sdk_test/package-lock.json
 **/yarn.lock
@@ -154,12 +156,6 @@ engine/examples/ha-cluster/results/
 # Remote measurement evidence fetched by run_remote.sh --evidence-local; local
 # run output, never committed.
 engine/dashboard/.evidence/
-
-# scrai incremental scan caches — derived from source code; nothing outside scrai reads them
-.scrai/state.json
-.scrai/summaries.json
-.scrai/dir_summaries.json
-.scrai/codemap_graph_cache.json
 
 # Beads physical-root workspace gate (local runtime state)
 /.beads.gate.lock*
