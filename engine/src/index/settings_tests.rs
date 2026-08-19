@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/settings_tests.rs.
 use super::*;
 
 #[path = "settings_tests/serde_optional_roundtrip.rs"]
@@ -17,6 +18,7 @@ fn test_parse_modifiers() {
     assert_eq!(parse_facet_modifier("searchable(brand)"), "brand");
 }
 
+/// TODO: Document ranking_criterion_token_classifier_accepts_only_runtime_textual_criteria.
 #[test]
 fn ranking_criterion_token_classifier_accepts_only_runtime_textual_criteria() {
     let recognized = [
@@ -40,6 +42,7 @@ fn ranking_criterion_token_classifier_accepts_only_runtime_textual_criteria() {
     }
 }
 
+/// TODO: Document custom_ranking_token_parser_preserves_runtime_grammar.
 #[test]
 fn custom_ranking_token_parser_preserves_runtime_grammar() {
     assert_eq!(

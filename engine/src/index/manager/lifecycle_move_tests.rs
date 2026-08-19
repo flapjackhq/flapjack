@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/manager/lifecycle_move_tests.rs.
 use super::*;
 use crate::analytics::AnalyticsConfig;
 use crate::index::manager::publication::PublicationFaultPoint;
@@ -6,7 +7,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+/// TODO: Document artifact_tree_bytes.
 fn artifact_tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    /// TODO: Document collect.
     fn collect(root: &Path, current: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
         if !current.exists() {
             return;
@@ -34,6 +37,7 @@ fn artifact_tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     files
 }
 
+/// TODO: Document create_tenant.
 async fn create_tenant(manager: &IndexManager, tenant: &str, marker: &str) {
     manager.create_tenant(tenant).unwrap();
     manager
@@ -52,6 +56,7 @@ async fn create_tenant(manager: &IndexManager, tenant: &str, marker: &str) {
     manager.unload(&tenant.to_string()).unwrap();
 }
 
+/// TODO: Document write_sidecars.
 fn write_sidecars(base: &Path, tenant: &str, marker: &str) {
     let query_suggestions = QsConfigStore::new(base)
         .target_artifact_paths(tenant)
@@ -89,6 +94,7 @@ fn test_analytics_config(base: &Path) -> AnalyticsConfig {
     }
 }
 
+/// TODO: Document sidecar_bytes.
 fn sidecar_bytes(
     base: &Path,
     tenant: &str,
@@ -113,6 +119,7 @@ fn all_sidecar_bytes(base: &Path) -> (BTreeMap<PathBuf, Vec<u8>>, BTreeMap<PathB
     )
 }
 
+/// TODO: Document move_index_promotes_target_keyed_sidecars_and_removes_source_artifacts.
 #[tokio::test]
 async fn move_index_promotes_target_keyed_sidecars_and_removes_source_artifacts() {
     let temp_dir = TempDir::new().unwrap();
@@ -208,6 +215,7 @@ async fn move_index_replaces_destination_documents_without_replaying_destination
         .is_none());
 }
 
+/// TODO: Document replace_index_contents_preserves_destination_target_keyed_sidecars.
 #[tokio::test]
 async fn replace_index_contents_preserves_destination_target_keyed_sidecars() {
     let temp_dir = TempDir::new().unwrap();
@@ -240,6 +248,7 @@ async fn replace_index_contents_preserves_destination_target_keyed_sidecars() {
         .is_none());
 }
 
+/// TODO: Document move_index_fault_preserves_source_and_destination_sidecars_byte_for_byte.
 #[tokio::test]
 async fn move_index_fault_preserves_source_and_destination_sidecars_byte_for_byte() {
     for fault in [

@@ -7,6 +7,25 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.14] - 2026-08-19
+
+### Added
+
+- **Algolia migrations can resume interrupted imports without restarting completed work.**
+  Provider interruptions are deterministic, source indexes remain unchanged, and replica
+  declarations retain explicit translation warnings where Flapjack uses virtual replicas.
+- **Query Suggestions now exposes an honest durable build outcome.** Failed source reads preserve
+  the prior destination, status distinguishes never-built, running, succeeded, and failed, and
+  config deletion cannot race an active build or leak stale build metadata.
+- **Paid-beta search controls now cover the migration-relevant relevance and merchandising set.**
+  Advanced ranking, typo, highlighting, pagination, language, fallback, and rules behavior is
+  persisted and exercised through exact search consequences.
+
+### Fixed
+
+- **Aggregated analytics return correct tenant-scoped counts, averages, top queries, and no-result
+  data.** Multi-node analytics merge deterministically without averaging an already-averaged value.
+
 ## [1.0.13] - 2026-08-14
 
 ### Added

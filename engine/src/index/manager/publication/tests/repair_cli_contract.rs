@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/manager/publication/tests/repair_cli_contract.rs.
 use super::repair_cli_manifest::{self,
     base_boundary_claims, load_scenario_manifest, observed_publication_boundaries,
     SUPPORTED_MUTATIONS,
@@ -9,6 +10,7 @@ use std::path::{Path, PathBuf};
 #[path = "repair_cli_generator.rs"]
 mod generator;
 
+/// TODO: Document publication_repair_cli_manifest_is_closed_over_recorded_activation_boundaries.
 #[test]
 fn publication_repair_cli_manifest_is_closed_over_recorded_activation_boundaries() {
     let manifest = load_scenario_manifest();
@@ -34,6 +36,7 @@ fn publication_repair_cli_manifest_is_closed_over_recorded_activation_boundaries
     );
 }
 
+/// TODO: Document publication_repair_cli_manifest_uses_current_policy_and_cli_vocabularies.
 #[test]
 fn publication_repair_cli_manifest_uses_current_policy_and_cli_vocabularies() {
     let manifest = load_scenario_manifest();

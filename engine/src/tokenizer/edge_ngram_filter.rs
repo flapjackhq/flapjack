@@ -1,3 +1,4 @@
+//! Stub summary for edge_ngram_filter.rs.
 use tantivy::tokenizer::{Token, TokenFilter, TokenStream, Tokenizer};
 
 #[derive(Clone)]
@@ -56,6 +57,7 @@ pub struct EdgeNgramTokenStream<T> {
 }
 
 impl<T: TokenStream> TokenStream for EdgeNgramTokenStream<T> {
+    /// TODO: Document EdgeNgramTokenStream.advance.
     fn advance(&mut self) -> bool {
         loop {
             if let Some(ref token) = self.current_token {

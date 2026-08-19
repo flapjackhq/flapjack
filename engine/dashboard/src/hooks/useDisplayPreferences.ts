@@ -106,6 +106,9 @@ export function clearPreferences(indexName: string): void {
   useDisplayPreferencesStore.getState().clearPreferences(indexName);
 }
 
+/**
+ * TODO: Document autoDetectPreferences.
+ */
 export function autoDetectPreferences(fields: FieldInfo[]): DisplayPreferences | null {
   if (fields.length === 0) {
     return null;

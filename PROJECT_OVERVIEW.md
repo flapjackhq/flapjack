@@ -23,9 +23,9 @@ mission, scope, adoption truth, and product-surface policy; it does not duplicat
 
 ## Product surfaces
 
-`engine/dashboard/` (React) is **the shipping UI, and it is frozen against new screens as of 2026-08-08.** This section is the single owner of that policy:
-`.scrai/overview.md` — which assembles into `CLAUDE.md` and `AGENTS.md` — deliberately states no scheduling policy and points every agent here, so this is
-the only place the answer exists. **Corrected 2026-08-08: this section previously read "not frozen and not scheduled for replacement," which was false in both
+`engine/dashboard/` (React) is **the shipping UI, and it is frozen against new screens as of 2026-08-08.** This section is the single owner of that policy.
+Repository instructions route here instead of restating its mutable status, so this is the only place the answer exists. **Corrected 2026-08-08: this section
+previously read "not frozen and not scheduled for replacement," which was false in both
 halves and contradicted this file's own product-surface policy two sections above it.** That is `DOC-SSOT-1`'s defect recurring one day after it closed — not as a stale
 restatement this time, but as an owner that disagreed with itself, which is the harder version to notice.
 

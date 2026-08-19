@@ -99,6 +99,7 @@ section() {
   printf "\n\033[1m%s\033[0m\n" "$1"
 }
 
+# TODO: Document cleanup.
 cleanup() {
   local script_exit_code=$?
   if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -119,6 +120,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# TODO: Document require_tools.
 require_tools() {
   local missing=0
   local tool
@@ -172,6 +174,7 @@ create_temp_layout() {
   mkdir -p "$INSTALL_ROOT" "$TMP_DATA"
 }
 
+# TODO: Document install_flapjack.
 install_flapjack() {
   local install_url="${FLAPJACK_INSTALL_URL:-https://install.flapjack.foo}"
   local install_output
@@ -193,6 +196,7 @@ install_flapjack() {
   return 1
 }
 
+# TODO: Document start_server.
 start_server() {
   local wait_helper="$ENGINE_DIR/tests/common/wait_for_flapjack.sh"
   local server_log="$TMP_DATA/server.log"
@@ -218,6 +222,7 @@ start_server() {
   pass 'First boot generated admin key and auto-port server is ready'
 }
 
+# TODO: Document wait_for_task.
 wait_for_task() {
   local task_id="$1"
   local task_status_body=""
@@ -237,6 +242,7 @@ wait_for_task() {
   return 1
 }
 
+# TODO: Document seed_readme_movies.
 seed_readme_movies() {
   local batch_response
   local task_id
@@ -259,6 +265,7 @@ seed_readme_movies() {
   fail 'README POST /1/indexes/movies/batch returns numeric taskID' "HTTP ${LAST_HTTP} - ${LAST_BODY}"
 }
 
+# TODO: Document assert_typo_query.
 assert_typo_query() {
   local query_response
 
@@ -297,6 +304,7 @@ report_summary() {
   return 0
 }
 
+# TODO: Document main.
 main() {
   echo 'README Quickstart Cold-Install Smoke'
   require_tools

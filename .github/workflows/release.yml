@@ -107,6 +107,8 @@ jobs:
     needs: validate_release_version
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      FLAPJACK_REQUIRE_DASHBOARD: "1"
     defaults:
       run:
         working-directory: engine
@@ -117,11 +119,11 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             use_cross: true
-            features: "" # usearch/simsimd x86_64-musl cross toolchain incompatibility
+            features: "vector-search"
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             use_cross: true
-            features: "" # usearch/simsimd aarch64-musl toolchain incompatibility
+            features: "vector-search"
           - target: x86_64-apple-darwin
             os: macos-15-intel
             use_cross: false

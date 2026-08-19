@@ -1,3 +1,6 @@
+/**
+ * @module Stub summary for engine/dashboard/tests/fixtures/algolia.fixture.ts.
+ */
 import { algoliasearch } from 'algoliasearch';
 import { randomUUID } from 'node:crypto';
 import { PRODUCTS, SYNONYMS, RULES, SETTINGS } from './test-data';
@@ -385,6 +388,9 @@ function formatUnknownError(error: unknown): string {
   return String(error);
 }
 
+/**
+ * TODO: Document waitForDeletion.
+ */
 async function waitForDeletion(
   owner: string,
   indexName: string,
@@ -427,6 +433,9 @@ async function probeAlgoliaIndexDeleted(ctx: AlgoliaTestContext): Promise<Deleti
   };
 }
 
+/**
+ * TODO: Document probeFlapjackIndexDeleted.
+ */
 async function probeFlapjackIndexDeleted(indexName: string): Promise<DeletionProbeResult> {
   const response = await fetch(buildApiPath('/1/indexes'), {
     headers: API_HEADERS,
@@ -454,6 +463,9 @@ async function probeFlapjackIndexDeleted(indexName: string): Promise<DeletionPro
   };
 }
 
+/**
+ * TODO: Document waitForFlapjackTaskPublished.
+ */
 async function waitForFlapjackTaskPublished(
   taskID: number,
   maxWaitMs = CLEANUP_TIMEOUT_MS,

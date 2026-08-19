@@ -8,7 +8,7 @@
  * These tests are READ-ONLY — they never create, modify, or delete data.
  * They fail-fast if the benchmark index is not populated with >= 90k documents.
  *
- * STANDARDS COMPLIANCE (~/.matt/scrai/globals/standards/browser_testing.md):
+ * STANDARDS COMPLIANCE (engine/dashboard/_dev/testing/TESTING.md):
  * - Zero CSS class selectors — uses data-testid, getByRole, getByText
  * - Zero XPath selectors
  * - Zero page.evaluate() calls

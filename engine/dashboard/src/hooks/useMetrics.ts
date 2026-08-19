@@ -11,6 +11,9 @@ function getEffectiveMetricsAppId(appId: string | null | undefined) {
   return normalizedAppId || DEFAULT_METRICS_APP_ID;
 }
 
+/**
+ * TODO: Document usePrometheusMetrics.
+ */
 export function usePrometheusMetrics() {
   const appId = useAuth((state) => state.appId);
   const isAuthenticated = useAuth((state) => state.isAuthenticated);

@@ -1,3 +1,4 @@
+//! Stub summary for promote.rs.
 use super::*;
 
 /// Apply the winning variant's settings to the main index. Mode B copies all settings from a dedicated variant index. Mode A applies promotable fields (custom_ranking, remove_words_if_no_results) from query overrides, logging any query-time-only fields that cannot be persisted. Invalidates the main index's settings cache.
@@ -25,6 +26,7 @@ pub(super) fn promote_variant_settings(
     Ok(())
 }
 
+/// TODO: Document promote_mode_b_settings.
 fn promote_mode_b_settings(
     state: &AppState,
     main_index: &str,
@@ -62,6 +64,7 @@ fn promote_mode_b_settings(
     Ok(())
 }
 
+/// TODO: Document promote_mode_a_overrides.
 fn promote_mode_a_overrides(
     state: &AppState,
     main_index: &str,
@@ -104,6 +107,7 @@ fn promote_mode_a_overrides(
     Ok(())
 }
 
+/// TODO: Document collect_query_only_override_fields.
 fn collect_query_only_override_fields(overrides: &QueryOverrides) -> Vec<&'static str> {
     [
         overrides.typo_tolerance.as_ref().map(|_| "typoTolerance"),
@@ -132,6 +136,7 @@ mod tests {
         TestStateBuilder::new(tmp).with_experiments().build_shared()
     }
 
+    /// TODO: Document promote_mode_b_rejects_path_traversal_variant_index.
     #[tokio::test]
     async fn promote_mode_b_rejects_path_traversal_variant_index() {
         let tmp = TempDir::new().unwrap();
@@ -164,6 +169,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document promote_mode_a_rejects_path_traversal_main_index.
     #[tokio::test]
     async fn promote_mode_a_rejects_path_traversal_main_index() {
         let tmp = TempDir::new().unwrap();
@@ -184,6 +190,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document collect_query_only_override_fields_returns_only_query_time_keys.
     #[test]
     fn collect_query_only_override_fields_returns_only_query_time_keys() {
         let overrides = QueryOverrides {

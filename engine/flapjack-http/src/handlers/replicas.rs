@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/replicas.rs.
 use super::AppState;
 use flapjack::error::FlapjackError;
 use flapjack::index::manager::validate_index_name;
@@ -277,6 +278,7 @@ mod tests {
     use flapjack::IndexManager;
     use tempfile::TempDir;
 
+    /// TODO: Document make_state.
     fn make_state(base: &std::path::Path) -> Arc<AppState> {
         let manager = IndexManager::new(base);
         let dictionary_manager = Arc::new(DictionaryManager::new(base));
@@ -329,6 +331,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document persist_replica_primary_links_rejects_path_traversal_primary.
     #[tokio::test]
     async fn persist_replica_primary_links_rejects_path_traversal_primary() {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -347,6 +350,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document persist_replica_primary_link_with_settings_rejects_path_traversal_primary.
     #[tokio::test]
     async fn persist_replica_primary_link_with_settings_rejects_path_traversal_primary() {
         let temp_dir = TempDir::new().expect("temp dir");

@@ -855,6 +855,127 @@ async fn search_snippet_ellipsis_text_customizes_ellipsis() {
     );
 }
 
+/// Omitted request fields inherit the selected saved highlighting and snippet settings.
+#[tokio::test]
+async fn search_uses_saved_highlight_and_snippet_defaults() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_basic_search_state(&tmp);
+    let index_name = "saved_highlight_defaults_idx";
+
+    state.manager.create_tenant(index_name).unwrap();
+    let settings = flapjack::index::settings::IndexSettings {
+        searchable_attributes: Some(vec!["title".to_string(), "description".to_string()]),
+        attributes_to_highlight: Some(vec!["description".to_string()]),
+        attributes_to_snippet: Some(vec!["description:3".to_string()]),
+        highlight_pre_tag: Some("<mark>".to_string()),
+        highlight_post_tag: Some("</mark>".to_string()),
+        snippet_ellipsis_text: Some(" [...]".to_string()),
+        ..Default::default()
+    };
+    save_index_settings(&state, index_name, &settings);
+    state
+        .manager
+        .add_documents_sync(
+            index_name,
+            vec![Document {
+                id: "pbv2-trail-001".to_string(),
+                fields: HashMap::from([
+                    (
+                        "title".to_string(),
+                        FieldValue::Text("Bluebird Ridge Jacket".to_string()),
+                    ),
+                    (
+                        "description".to_string(),
+                        FieldValue::Text(
+                            "Weatherproof alpine shell for bluebird ridge hikes".to_string(),
+                        ),
+                    ),
+                ]),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let app = search_router(state);
+    let response = post_search(&app, index_name, json!({"query": "bluebird"}), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let hit = &body["hits"][0];
+
+    assert!(hit["_highlightResult"].get("title").is_none());
+    assert_eq!(
+        hit["_highlightResult"]["description"]["value"],
+        "Weatherproof alpine shell for <mark>bluebird</mark> ridge hikes"
+    );
+    assert!(
+        hit["_snippetResult"]["description"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("<mark>bluebird</mark>") && value.contains("[...]")),
+        "saved snippet attributes, tags, and ellipsis must affect the response"
+    );
+}
+
+/// An explicit request remains authoritative over saved highlighting defaults.
+#[tokio::test]
+async fn search_request_overrides_saved_highlight_defaults() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_basic_search_state(&tmp);
+    let index_name = "saved_highlight_override_idx";
+
+    state.manager.create_tenant(index_name).unwrap();
+    let settings = flapjack::index::settings::IndexSettings {
+        searchable_attributes: Some(vec!["title".to_string(), "description".to_string()]),
+        attributes_to_highlight: Some(vec!["description".to_string()]),
+        highlight_pre_tag: Some("<saved>".to_string()),
+        highlight_post_tag: Some("</saved>".to_string()),
+        ..Default::default()
+    };
+    save_index_settings(&state, index_name, &settings);
+    state
+        .manager
+        .add_documents_sync(
+            index_name,
+            vec![Document {
+                id: "1".to_string(),
+                fields: HashMap::from([
+                    (
+                        "title".to_string(),
+                        FieldValue::Text("Bluebird Ridge Jacket".to_string()),
+                    ),
+                    (
+                        "description".to_string(),
+                        FieldValue::Text("Bluebird shell".to_string()),
+                    ),
+                ]),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let app = search_router(state);
+    let response = post_search(
+        &app,
+        index_name,
+        json!({
+            "query": "bluebird",
+            "attributesToHighlight": ["title"],
+            "highlightPreTag": "<request>",
+            "highlightPostTag": "</request>"
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let highlight = &body["hits"][0]["_highlightResult"];
+
+    assert_eq!(
+        highlight["title"]["value"],
+        "<request>Bluebird</request> Ridge Jacket"
+    );
+    assert!(highlight.get("description").is_none());
+}
+
 // ── sortFacetValuesBy integration test ──
 
 /// Order facet values alphabetically when sortFacetValuesBy is "alpha", and by descending frequency when "count".

@@ -1,3 +1,4 @@
+//! Stub summary for mutation_parity.rs.
 use serde::Serialize;
 
 /// Deterministic inventory of the highest-risk mutation endpoints whose
@@ -343,6 +344,7 @@ mod tests {
         exported_algolia_parity_cases, MutationParityKind, HIGH_RISK_MUTATION_PARITY_CASES,
     };
 
+    /// TODO: Document exported_algolia_parity_cases_include_only_algolia_rows.
     #[test]
     fn exported_algolia_parity_cases_include_only_algolia_rows() {
         let exported_rows = exported_algolia_parity_cases();

@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/analytics/config.rs.
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_ANALYTICS_RETENTION_DAYS: u32 = 90;
@@ -28,6 +29,7 @@ pub struct AnalyticsTargetArtifactPaths {
 }
 
 impl AnalyticsConfig {
+    /// TODO: Document AnalyticsConfig.path_component.
     fn path_component(value: &str) -> String {
         let safe_literal = !value.is_empty()
             && value != "."
@@ -52,6 +54,15 @@ impl AnalyticsConfig {
         encoded
     }
 
+    /// Recover the logical value from the reversible on-disk path encoding.
+    pub(crate) fn value_from_path_component(component: &std::ffi::OsStr) -> Option<String> {
+        let component = component.to_str()?;
+        let Some(encoded) = component.strip_prefix("_fj_") else {
+            return Some(component.to_string());
+        };
+        String::from_utf8(hex::decode(encoded).ok()?).ok()
+    }
+
     /// Load config from environment variables with sensible defaults.
     pub fn from_env() -> Self {
         let base_data_dir =
@@ -67,6 +78,7 @@ impl AnalyticsConfig {
         Self::with_data_dir(data_dir.join("analytics"))
     }
 
+    /// TODO: Document AnalyticsConfig.with_data_dir.
     fn with_data_dir(data_dir: PathBuf) -> Self {
         Self {
             enabled: std::env::var("FLAPJACK_ANALYTICS_ENABLED")
@@ -245,6 +257,21 @@ mod tests {
                 .join("manifest.json")
         );
         assert!(path.starts_with(&cfg.data_dir));
+    }
+
+    #[test]
+    fn analytics_path_components_round_trip_encoded_and_literal_values() {
+        for value in ["tenant-a", "tenant-a café", "../outside", "_fj_reserved"] {
+            let component = AnalyticsConfig::path_component(value);
+            assert_eq!(
+                AnalyticsConfig::value_from_path_component(component.as_ref()).as_deref(),
+                Some(value)
+            );
+        }
+        assert_eq!(
+            AnalyticsConfig::value_from_path_component(std::ffi::OsStr::new("_fj_not-hex")),
+            None
+        );
     }
 
     #[test]

@@ -96,6 +96,19 @@
       "risks": ["dashboard"]
     },
     {
+      "id": "console",
+      "minimum_tier": "public_fast",
+      "owner_jobs": [".github/workflows/ci.yml#console"],
+      "required_exact_commands": [
+        "npm run test:unit:run",
+        "npm run check",
+        "npm run build",
+        "npm run lint:browser-tests:unmocked",
+        "npm run test:browser:unmocked"
+      ],
+      "risks": ["console"]
+    },
+    {
       "id": "sdks",
       "minimum_tier": "public_fast",
       "owner_jobs": [

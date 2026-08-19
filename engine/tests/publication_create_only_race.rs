@@ -1,3 +1,4 @@
+//! Stub summary for engine/tests/publication_create_only_race.rs.
 use flapjack::index::manager::publication::{
     canonical_tenant_tree_digest, PreStagedActivationError, PreStagedPublication,
     PublicationGenerationEvidence, PublicationJournal, PublicationPaths, PublicationPhase,
@@ -35,6 +36,7 @@ mod index {
         mod publication {
             use super::super::super::*;
 
+            /// TODO: Document create_only_refuses_target_created_before_existence_snapshot_without_mutation.
             #[tokio::test]
             async fn create_only_refuses_target_created_before_existence_snapshot_without_mutation()
             {

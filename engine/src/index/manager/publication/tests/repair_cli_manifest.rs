@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/manager/publication/tests/repair_cli_manifest.rs.
 use super::super::executor;
 use super::*;
 use crate::analytics::AnalyticsConfig;
@@ -27,6 +28,7 @@ pub(super) struct ScenarioManifest {
     pub(super) scenarios: Vec<Scenario>,
 }
 
+/// TODO: Document Scenario.
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct Scenario {
     pub(super) id: String,
@@ -113,6 +115,7 @@ pub(super) struct ResidueOracle {
     pub(super) quarantine: String,
 }
 
+/// TODO: Document LiveHttpFixture.
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct LiveHttpFixture {
     pub(super) target_index: String,
@@ -174,6 +177,7 @@ pub(super) struct LiveHttpResolvedTargetProjection<'a> {
 }
 
 impl LiveHttpFixture {
+    /// TODO: Document LiveHttpFixture.resolve_target_projection.
     pub(super) fn resolve_target_projection(
         &self,
         scenario_id: &str,
@@ -252,6 +256,7 @@ impl ScenarioManifest {
         }
     }
 
+    /// TODO: Document ScenarioManifest.validate_shape.
     pub(super) fn validate_shape(&self) {
         assert_eq!(self.schema_version, 1);
         validate_live_http_fixture(&self.live_http_fixture);
@@ -318,6 +323,7 @@ pub(super) fn observed_publication_boundaries() -> BTreeSet<ObservedBoundary> {
     .collect()
 }
 
+/// TODO: Document observed_boundaries.
 pub(super) fn observed_boundaries(
     activation: ActivationKind,
     base: &Path,
@@ -338,6 +344,7 @@ pub(super) fn observed_boundaries(
     observed
 }
 
+/// TODO: Document normalized_operation.
 pub(super) fn normalized_operation(base: &Path, operation: &PublicationOperation) -> Option<String> {
     match operation {
         PublicationOperation::Rename { from, to } => Some(format!(
@@ -360,6 +367,7 @@ pub(super) fn normalized_operation(base: &Path, operation: &PublicationOperation
     }
 }
 
+/// TODO: Document owner_resolved_manifest.
 pub(super) fn owner_resolved_manifest(fixture: &ActivationFixture) -> PublicationArtifactManifest {
     let query_suggestions = QsConfigStore::new(fixture.base());
     let analytics = contract_analytics_config(fixture.base());
@@ -379,6 +387,7 @@ pub(super) fn owner_resolved_manifest(fixture: &ActivationFixture) -> Publicatio
     .unwrap()
 }
 
+/// TODO: Document write_owner_resolved_sidecars.
 pub(super) fn write_owner_resolved_sidecars(
     fixture: &ActivationFixture,
     old: &str,
@@ -414,6 +423,7 @@ pub(super) fn write_owner_resolved_sidecars(
     write_directory_sidecar_path(&analytics.target_artifact_paths(&staging_key).index_root, new);
 }
 
+/// TODO: Document assert_source_oracles.
 pub(super) fn assert_source_oracles(scenario: &Scenario) -> std::result::Result<(), String> {
     let oracles = owner_source_oracles();
     assert_tenant_source_digest(scenario, "old", Some(oracles.old_tenant.as_str()))?;
@@ -459,6 +469,7 @@ struct SidecarSourceOracle {
     new: String,
 }
 
+/// TODO: Document owner_source_oracles.
 fn owner_source_oracles() -> OwnerSourceOracles {
     let fixture = ActivationFixture::new();
     let old_root = fixture.base().join("oracle_old");
@@ -503,6 +514,7 @@ fn owner_source_oracles() -> OwnerSourceOracles {
     }
 }
 
+/// TODO: Document assert_tenant_source_digest.
 fn assert_tenant_source_digest(
     scenario: &Scenario,
     field: &str,
@@ -525,6 +537,7 @@ fn assert_tenant_source_digest(
     Ok(())
 }
 
+/// TODO: Document assert_sidecar_source_digest.
 fn assert_sidecar_source_digest(
     scenario: &Scenario,
     name: &str,
@@ -549,6 +562,7 @@ fn assert_sidecar_source_digest(
     Ok(())
 }
 
+/// TODO: Document assert_sidecar_observed_digest.
 fn assert_sidecar_observed_digest(
     scenario: &Scenario,
     name: &str,
@@ -572,6 +586,7 @@ fn assert_sidecar_observed_digest(
     ))
 }
 
+/// TODO: Document record_activation.
 fn record_activation(kind: ActivationKind) -> Vec<ObservedBoundary> {
     let fixture = ActivationFixture::new();
     if kind == ActivationKind::Replacement {
@@ -600,6 +615,7 @@ fn record_activation(kind: ActivationKind) -> Vec<ObservedBoundary> {
     observed_boundaries(kind, fixture.base(), &recording.operations())
 }
 
+/// TODO: Document validate_common_oracles.
 fn validate_common_oracles(scenario: &Scenario) {
     assert!(
         matches!(
@@ -646,6 +662,7 @@ fn validate_common_oracles(scenario: &Scenario) {
     }
 }
 
+/// TODO: Document validate_base_scenario.
 fn validate_base_scenario(scenario: &Scenario) {
     let activation = scenario
         .activation
@@ -714,6 +731,7 @@ fn validate_base_scenario(scenario: &Scenario) {
     );
 }
 
+/// TODO: Document validate_mutation_scenario.
 fn validate_mutation_scenario<'a>(
     scenario: &'a Scenario,
     base_ids: &BTreeSet<&str>,
@@ -763,6 +781,7 @@ fn expected_mutation_disposition(mutation: &str) -> &'static str {
     }
 }
 
+/// TODO: Document validate_live_http_fixture.
 fn validate_live_http_fixture(fixture: &LiveHttpFixture) {
     PublicationTarget::new(&fixture.target_index)
         .unwrap_or_else(|error| panic!("live_http_fixture target_index invalid: {error}"));
@@ -806,6 +825,7 @@ fn validate_live_http_fixture(fixture: &LiveHttpFixture) {
     }
 }
 
+/// TODO: Document validate_live_http_target_projections.
 fn validate_live_http_target_projections(fixture: &LiveHttpFixture) {
     let expected_keys = ["new-meta", "old-meta"].into_iter().collect::<BTreeSet<_>>();
     let actual_keys = fixture
@@ -848,6 +868,7 @@ fn validate_live_http_target_projections(fixture: &LiveHttpFixture) {
     }
 }
 
+/// TODO: Document validate_live_http_surface_statuses.
 fn validate_live_http_surface_statuses(fixture: &LiveHttpFixture) {
     let expected_keys = [
         "index_absent",
@@ -871,6 +892,7 @@ fn validate_live_http_surface_statuses(fixture: &LiveHttpFixture) {
     }
 }
 
+/// TODO: Document validate_live_http_surface_status.
 fn validate_live_http_surface_status(key: &str, status: &LiveHttpSurfaceStatus) {
     assert!(
         (400..=599).contains(&status.status),
@@ -893,6 +915,7 @@ fn validate_live_http_surface_status(key: &str, status: &LiveHttpSurfaceStatus) 
     );
 }
 
+/// TODO: Document validate_live_http_object.
 fn validate_live_http_object(name: &str, object: &LiveHttpObject) {
     assert!(!object.object_id.is_empty(), "live_http_fixture {name} missing object_id");
     let body = object
@@ -932,6 +955,7 @@ pub(super) fn production_highlight_value_strings(
     Ok(rendered)
 }
 
+/// TODO: Document flatten_highlight_value.
 fn flatten_highlight_value(
     path: &str,
     value: &HighlightValue,
@@ -982,6 +1006,7 @@ fn validate_live_http_visibility(key: &str, visibility: &LiveHttpVisibility) {
     }
 }
 
+/// TODO: Document validate_scenario_live_http_projection.
 fn validate_scenario_live_http_projection(scenario: &Scenario, fixture: &LiveHttpFixture) {
     match scenario.visible.search.as_str() {
         "loadable" => {
@@ -1006,6 +1031,7 @@ fn validate_scenario_live_http_projection(scenario: &Scenario, fixture: &LiveHtt
     }
 }
 
+/// TODO: Document deserialize_unique_btree_map.
 fn deserialize_unique_btree_map<'de, D, V>(
     deserializer: D,
 ) -> std::result::Result<BTreeMap<String, V>, D::Error>

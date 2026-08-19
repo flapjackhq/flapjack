@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/error_response.rs.
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -155,6 +156,7 @@ mod tests {
         (status, json)
     }
 
+    /// TODO: Document json_error_parts_with_code_preserves_standard_shape.
     #[test]
     fn json_error_parts_with_code_preserves_standard_shape() {
         let (status, axum::Json(body)) = json_error_parts_with_code(
@@ -174,6 +176,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document handler_error_coded_delegates_to_coded_json_helper.
     #[tokio::test]
     async fn handler_error_coded_delegates_to_coded_json_helper() {
         let he = HandlerError::coded(
@@ -213,6 +216,7 @@ mod tests {
     }
 
     // ── HandlerError adapter: delegates to FlapjackError ──
+    /// TODO: Document handler_error_core_io_produces_sanitized_500_json.
     #[tokio::test]
     async fn handler_error_core_io_produces_sanitized_500_json() {
         let he = HandlerError::from(std::io::Error::new(

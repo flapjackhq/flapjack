@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/manager/publication/fault.rs.
 use super::fsops::{fsync_dir, fsync_file, rename_with_transient_retry};
 use super::{invalid_publication, Result};
 use std::fs;
@@ -119,6 +120,7 @@ impl<'a> PublicationIo<'a> {
         Ok(())
     }
 
+    /// TODO: Document PublicationIo.rename.
     pub(super) fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         if let Some(parent) = to.parent() {
             self.create_dir_all(parent)?;
@@ -204,6 +206,7 @@ impl CheckpointFaultHook {
 
 #[cfg(test)]
 impl PublicationFaultHook for CheckpointFaultHook {
+    /// TODO: Document CheckpointFaultHook.before_operation.
     fn before_operation(&self, operation: &PublicationOperation) -> Result<()> {
         let PublicationOperation::Checkpoint(actual) = operation else {
             return Ok(());

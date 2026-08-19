@@ -1,3 +1,4 @@
+//! Stub summary for batch.rs.
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -131,6 +132,7 @@ impl BatchExecutionState {
         Ok(())
     }
 
+    /// TODO: Document BatchExecutionState.queue_add.
     fn queue_add(
         &mut self,
         mut body: HashMap<String, serde_json::Value>,
@@ -664,6 +666,7 @@ mod tests {
         }
     }
 
+    /// TODO: Document batch_operations_from_legacy_request_wraps_docs_as_add_object_actions.
     #[test]
     fn batch_operations_from_legacy_request_wraps_docs_as_add_object_actions() {
         let operations = batch_operations_from_request(AddDocumentsRequest::Legacy {

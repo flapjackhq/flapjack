@@ -1,0 +1,121 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  color: var(--console-text);
+  background: var(--console-surface);
+  font-family: var(--console-font);
+}
+
+.console_host,
+.console_auth {
+  min-height: 100vh;
+  padding: var(--console-space-lg);
+  color: var(--console-text);
+  background: var(--console-surface);
+  font-family: var(--console-font);
+}
+
+.console_header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--console-space-md);
+  padding-block-end: var(--console-space-md);
+  border-block-end: var(--console-border-width) solid var(--console-border);
+}
+
+.console_header h1 {
+  margin: 0;
+  font-size: var(--console-heading-size);
+}
+
+.console_content {
+  min-height: var(--console-content-min-height);
+  margin-block-start: var(--console-space-lg);
+  border-radius: var(--console-radius);
+  background: var(--console-surface-muted);
+  box-shadow: var(--console-shadow);
+}
+
+.console_header nav,
+.console_auth form {
+  display: flex;
+  align-items: center;
+  gap: var(--console-space-md);
+}
+
+.console_header nav {
+  flex-wrap: wrap;
+}
+
+.console_header a {
+  color: inherit;
+}
+
+.console_header a[aria-current='page'] {
+  font-weight: 700;
+}
+
+.console_auth {
+  display: grid;
+  place-items: center;
+}
+
+.console_auth form {
+  width: min(100%, 24rem);
+  align-items: stretch;
+  flex-direction: column;
+  padding: var(--console-space-lg);
+  border: var(--console-border-width) solid var(--console-border);
+  border-radius: var(--console-radius);
+  background: var(--console-surface-muted);
+  box-shadow: var(--console-shadow);
+}
+
+button,
+input,
+textarea {
+  border: var(--console-border-width) solid var(--console-border);
+  border-radius: var(--console-radius);
+  padding: var(--console-space-sm) var(--console-space-md);
+  color: inherit;
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+  background: var(--console-surface-muted);
+}
+
+button:disabled {
+  cursor: not-allowed;
+  color: var(--console-text-muted);
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+a:focus-visible {
+  outline: calc(var(--console-border-width) * 2) solid var(--console-focus);
+  outline-offset: calc(var(--console-border-width) * 2);
+}
+
+[role='alert'] {
+  color: var(--console-danger);
+}
+
+@media (max-width: 40rem) {
+  .console_header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

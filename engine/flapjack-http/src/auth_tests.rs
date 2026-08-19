@@ -1,3 +1,4 @@
+//! Stub summary for auth_tests.rs.
 use super::*;
 use crate::test_helpers::body_json;
 use axum::{
@@ -129,6 +130,7 @@ fn rate_limiter_parallel_admission_respects_the_global_bucket_cap() {
     assert_eq!(limiter.counters.len(), CAPACITY);
 }
 
+/// TODO: Document test_search_api_key.
 fn test_search_api_key(description: &str) -> ApiKey {
     ApiKey {
         hash: String::new(),

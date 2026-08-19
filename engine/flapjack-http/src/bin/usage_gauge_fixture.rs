@@ -1,3 +1,5 @@
+//! Stub summary for engine/flapjack-http/src/bin/usage_gauge_fixture.rs.
+
 use chrono::NaiveDate;
 use dashmap::DashMap;
 use flapjack_http::usage_middleware::TenantUsageCounters;
@@ -7,6 +9,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// TODO: Document fixture_gauges.
 fn fixture_gauges() -> HashMap<String, CapturedUsageGauges> {
     HashMap::from([
         (
@@ -33,6 +36,7 @@ fn fixture_gauges() -> HashMap<String, CapturedUsageGauges> {
     ])
 }
 
+/// TODO: Document remove_legacy_gauges.
 fn remove_legacy_gauges(snapshot_path: &Path) -> io::Result<()> {
     let snapshot_bytes = std::fs::read(snapshot_path)?;
     let mut snapshot: Value = serde_json::from_slice(&snapshot_bytes)
@@ -62,6 +66,7 @@ fn remove_legacy_gauges(snapshot_path: &Path) -> io::Result<()> {
     std::fs::rename(temporary_path, snapshot_path)
 }
 
+/// TODO: Document parse_arguments.
 fn parse_arguments() -> Result<(PathBuf, String), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args_os().skip(1);
     let data_dir = arguments

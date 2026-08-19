@@ -220,6 +220,9 @@ export function resolveLaneCBundleDir(
   return resolvedCandidate;
 }
 
+/**
+ * TODO: Document resolveLaneCBaselineRoot.
+ */
 function resolveLaneCBaselineRoot(candidate: string | undefined): string {
   if (!candidate) {
     return LANE_C_BASELINE_ROOT;
@@ -247,6 +250,9 @@ function resolveLaneCRepoRelativePath(candidate: string): string {
     : path.resolve(LANE_C_REPO_ROOT, candidate);
 }
 
+/**
+ * TODO: Document seedMovieCorpus.
+ */
 async function seedMovieCorpus(
   request: APIRequestContext,
   target: MovieSeedTarget,
@@ -269,6 +275,9 @@ async function seedMovieCorpus(
   return finalResponse;
 }
 
+/**
+ * TODO: Document withMovieSeedLock.
+ */
 async function withMovieSeedLock<T>(seed: () => Promise<T>): Promise<T> {
   const lockDir = resolveMovieSeedLockDir();
   const deadline = Date.now() + MOVIES_SEED_LOCK_TIMEOUT_MS;
@@ -316,6 +325,9 @@ function removeStaleMovieSeedLock(lockDir: string): void {
   }
 }
 
+/**
+ * TODO: Document readReadyMovieCorpus.
+ */
 async function readReadyMovieCorpus(
   request: APIRequestContext,
   indexName: string,
@@ -344,6 +356,9 @@ async function readReadyMovieCorpus(
   }
 }
 
+/**
+ * TODO: Document movieHitsByObjectIDFromResponse.
+ */
 function movieHitsByObjectIDFromResponse(
   response: SearchIndexResponse,
 ): Map<string, Record<string, unknown>> | null {
@@ -391,6 +406,9 @@ function movieFieldMatches(
   return actualValue === expectedValue;
 }
 
+/**
+ * TODO: Document waitForMoviesReady.
+ */
 async function waitForMoviesReady(
   request: APIRequestContext,
   indexName: string,
@@ -426,6 +444,9 @@ function writeSeedVerification(response: SearchIndexResponse, verificationFileNa
   );
 }
 
+/**
+ * TODO: Document rejectSymlinkedBundlePath.
+ */
 function rejectSymlinkedBundlePath(targetPath: string, baselineRoot: string): void {
   let currentPath = baselineRoot;
   const relativeTarget = path.relative(baselineRoot, targetPath);
@@ -446,6 +467,9 @@ function rejectSymlinkedBundlePath(targetPath: string, baselineRoot: string): vo
   }
 }
 
+/**
+ * TODO: Document canonicalizeBundleCandidatePath.
+ */
 function canonicalizeBundleCandidatePath(candidatePath: string): string {
   if (fs.existsSync(candidatePath)) {
     return fs.realpathSync.native(candidatePath);
@@ -464,6 +488,9 @@ function canonicalizeBundleCandidatePath(candidatePath: string): string {
   return path.join(canonicalParent, suffix);
 }
 
+/**
+ * TODO: Document findLatestLaneCBundleDir.
+ */
 function findLatestLaneCBundleDir(baselineRoot: string = LANE_C_BASELINE_ROOT): string | null {
   if (!fs.existsSync(baselineRoot)) {
     return null;

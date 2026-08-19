@@ -31,6 +31,7 @@ REQUIRED_RISKS = {
     "vector_isolation",
     "process_global_isolation",
     "dashboard",
+    "console",
     "sdks",
     "installer",
     "migration",
@@ -152,6 +153,27 @@ def verify_local_runner(root=ROOT, runner_text=None, named_source_text=None):
             "local runner must run its integration surface exactly once without fail-fast"
         )
 
+    console_commands = (
+        'npm --prefix "$ENGINE_DIR/console" run test:unit:run',
+        'npm --prefix "$ENGINE_DIR/console" run check',
+        'npm --prefix "$ENGINE_DIR/console" run build',
+        'npm --prefix "$ENGINE_DIR/console" run lint:browser-tests:unmocked',
+        'npm --prefix "$ENGINE_DIR/console" run test:browser:unmocked',
+    )
+    console_start = "# -- Console checks --"
+    console_end = "# -- End console checks --"
+    if runner_text.count(console_start) != 1 or runner_text.count(console_end) != 1:
+        raise ContractError("local runner must contain one bounded Console checks section")
+    console_text = runner_text.split(console_start, 1)[1].split(console_end, 1)[0]
+    runner_lines = [line.strip() for line in runner_text.splitlines()]
+    for command in console_commands:
+        count = runner_lines.count(command)
+        if count != 1:
+            raise ContractError(
+                f"local runner Console checks must execute {command!r} exactly once "
+                f"(found {count})"
+            )
+
     named_source_path = (
         Path(root)
         / "engine/flapjack-http/src/handlers/migration/async_status_tests.rs"
@@ -205,6 +227,14 @@ def verify(root=ROOT, manifest_path=MANIFEST_PATH, jobs=None, actual_ignored=Non
             if fragment not in combined_owner_text:
                 raise ContractError(
                     f"{entry['id']} owner jobs are missing required fragment: {fragment}"
+                )
+        owner_lines = [line.strip() for line in combined_owner_text.splitlines()]
+        for command in entry.get("required_exact_commands", []):
+            count = owner_lines.count(command)
+            if count != 1:
+                raise ContractError(
+                    f"{entry['id']} owner must execute {command!r} exactly once "
+                    f"(found {count})"
                 )
         for source_contract in entry.get("source_contracts", []):
             source_path = Path(root) / source_contract["path"]
@@ -306,6 +336,78 @@ class TestTierContract(unittest.TestCase):
                 jobs[owner] = mutated
                 with self.assertRaisesRegex(ContractError, "missing required fragment"):
                     verify(jobs=jobs)
+
+    def test_console_ci_owner_rejects_omitted_and_duplicated_commands(self):
+        console_class = next(
+            entry for entry in load_manifest()["classes"] if entry["id"] == "console"
+        )
+        for command in console_class["required_exact_commands"]:
+            with self.subTest(command=command, mutation="omitted"):
+                jobs = workflow_job_blocks()
+                owner = ".github/workflows/ci.yml#console"
+                mutated = jobs[owner].replace(f"          {command}\n", "", 1)
+                self.assertNotEqual(jobs[owner], mutated)
+                jobs[owner] = mutated
+                with self.assertRaisesRegex(ContractError, "exactly once .*found 0"):
+                    verify(jobs=jobs)
+
+            with self.subTest(command=command, mutation="duplicated"):
+                jobs = workflow_job_blocks()
+                owner = ".github/workflows/ci.yml#console"
+                mutated = jobs[owner].replace(
+                    f"          {command}\n",
+                    f"          {command}\n          {command}\n",
+                    1,
+                )
+                self.assertNotEqual(jobs[owner], mutated)
+                jobs[owner] = mutated
+                with self.assertRaisesRegex(ContractError, "exactly once .*found 2"):
+                    verify(jobs=jobs)
+
+    def test_console_local_runner_rejects_omitted_and_duplicated_commands(self):
+        commands = (
+            'npm --prefix "$ENGINE_DIR/console" run test:unit:run',
+            'npm --prefix "$ENGINE_DIR/console" run check',
+            'npm --prefix "$ENGINE_DIR/console" run build',
+            'npm --prefix "$ENGINE_DIR/console" run lint:browser-tests:unmocked',
+            'npm --prefix "$ENGINE_DIR/console" run test:browser:unmocked',
+        )
+        runner = local_runner_path().read_text(encoding="utf-8")
+        prefix, console_and_suffix = runner.split("# -- Console checks --", 1)
+        console, suffix = console_and_suffix.split("# -- End console checks --", 1)
+        for command in commands:
+            with self.subTest(command=command, mutation="omitted"):
+                mutated_console = console.replace(f"  {command}\n", "", 1)
+                mutated = (
+                    prefix
+                    + "# -- Console checks --"
+                    + mutated_console
+                    + "# -- End console checks --"
+                    + suffix
+                )
+                self.assertNotEqual(runner, mutated)
+                with self.assertRaisesRegex(ContractError, "exactly once .*found 0"):
+                    verify_local_runner(runner_text=mutated)
+
+            with self.subTest(command=command, mutation="duplicated"):
+                mutated_console = console.replace(
+                    f"  {command}\n", f"  {command}\n  {command}\n", 1
+                )
+                mutated = (
+                    prefix
+                    + "# -- Console checks --"
+                    + mutated_console
+                    + "# -- End console checks --"
+                    + suffix
+                )
+                self.assertNotEqual(runner, mutated)
+                with self.assertRaisesRegex(ContractError, "exactly once .*found 2"):
+                    verify_local_runner(runner_text=mutated)
+
+            with self.subTest(command=command, mutation="duplicated_outside_owner"):
+                mutated = f"{command}\n{runner}"
+                with self.assertRaisesRegex(ContractError, "exactly once .*found 2"):
+                    verify_local_runner(runner_text=mutated)
 
     def test_local_runner_rejects_flapjack_http_in_the_in_process_lib_union(self):
         runner = local_runner_path().read_text(encoding="utf-8")

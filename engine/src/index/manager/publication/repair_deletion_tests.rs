@@ -1,7 +1,9 @@
+//! Stub summary for engine/src/index/manager/publication/repair_deletion_tests.rs.
 use super::*;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+/// TODO: Document committed_sidecar_deletion_remains_valid_during_repair.
 #[test]
 fn committed_sidecar_deletion_remains_valid_during_repair() {
     let temp_dir = TempDir::new().unwrap();

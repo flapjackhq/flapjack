@@ -1,6 +1,7 @@
 use super::config::{BuildStatus, LogEntry, QsConfig, QsConfigStore};
 use crate::analytics::AnalyticsQueryEngine;
 use crate::index::oplog::write_committed_seq;
+use crate::index::settings::IndexSettings;
 use crate::types::{Document, FieldValue};
 use crate::IndexManager;
 use std::collections::HashMap;
@@ -93,6 +94,17 @@ pub async fn build_suggestions_index(
     manager
         .create_tenant(&staging_name)
         .map_err(|e| e.to_string())?;
+
+    // Query Suggestions clients browse the generated index with an empty query.
+    // Persist the ranking on every staging generation so the atomic replacement
+    // publishes search-frequency order instead of the engine's objectID fallback.
+    IndexSettings {
+        searchable_attributes: Some(vec!["query".to_string()]),
+        custom_ranking: Some(vec!["desc(popularity)".to_string()]),
+        ..Default::default()
+    }
+    .save(manager.base_path.join(&staging_name).join("settings.json"))
+    .map_err(|e| e.to_string())?;
 
     // Aggregate suggestions across all source indices.
     // Key: query string → max popularity across sources

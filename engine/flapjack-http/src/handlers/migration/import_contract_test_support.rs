@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/import_contract_test_support.rs.
 use super::super::spool::{SpoolLimits, SpoolStore};
 use crate::dto::SearchRequest;
 use crate::extractors::ValidatedIndexName;
@@ -36,6 +37,7 @@ const PREEXISTING_DOCUMENT_CATEGORY: &str = "tools";
 const PREEXISTING_SYNONYM_ID: &str = "kept-synonym";
 const PREEXISTING_RULE_ID: &str = "kept-rule";
 
+/// TODO: Document seed_preexisting_target_resources.
 pub(super) async fn seed_preexisting_target_resources(
     state: &Arc<crate::handlers::AppState>,
     target_index: &str,
@@ -82,6 +84,7 @@ pub(super) async fn seed_preexisting_target_resources(
     state.manager.drain_all_write_queues().await.unwrap();
 }
 
+/// TODO: Document assert_preexisting_target_resources.
 pub(super) async fn assert_preexisting_target_resources(
     state: &Arc<crate::handlers::AppState>,
     target_index: &str,
@@ -185,6 +188,7 @@ fn preexisting_synonym() -> Synonym {
     }
 }
 
+/// TODO: Document preexisting_rule.
 fn preexisting_rule() -> Rule {
     Rule {
         object_id: PREEXISTING_RULE_ID.to_string(),
@@ -202,6 +206,7 @@ fn preexisting_rule() -> Rule {
     }
 }
 
+/// TODO: Document query_hit_count.
 pub(super) async fn query_hit_count(
     state: &Arc<crate::handlers::AppState>,
     target_index: &str,
@@ -221,6 +226,7 @@ pub(super) async fn query_hit_count(
     search_response["hits"].as_array().unwrap().len()
 }
 
+/// TODO: Document assert_object_fields.
 pub(super) async fn assert_object_fields(
     state: &Arc<crate::handlers::AppState>,
     target_index: &str,
@@ -241,6 +247,7 @@ pub(super) async fn assert_object_fields(
     assert_eq!(object["score"], score);
 }
 
+/// TODO: Document assert_query_returns_document.
 pub(super) async fn assert_query_returns_document(
     state: &Arc<crate::handlers::AppState>,
     target_index: &str,
@@ -275,6 +282,7 @@ pub(super) fn directory_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     snapshot
 }
 
+/// TODO: Document collect_directory_snapshot.
 fn collect_directory_snapshot(
     root: &Path,
     current: &Path,
@@ -297,6 +305,7 @@ fn collect_directory_snapshot(
     }
 }
 
+/// TODO: Document assert_target_absent_from_disk_and_list.
 pub(super) async fn assert_target_absent_from_disk_and_list(
     state: &Arc<crate::handlers::AppState>,
     target_index: &str,

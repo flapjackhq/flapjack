@@ -1,3 +1,4 @@
+//! Stub summary for fastembed_rejected_tests.rs.
 use super::*;
 use flapjack::index::settings::IndexSettings;
 use flapjack::types::{Document, FieldValue};
@@ -9,6 +10,7 @@ fn save_settings(state: &Arc<AppState>, index_name: &str, settings: &IndexSettin
     std::fs::create_dir_all(&dir).unwrap();
     settings.save(dir.join("settings.json")).unwrap();
 }
+/// TODO: Document test_fastembed_config_rejected_without_feature.
 #[tokio::test]
 async fn test_fastembed_config_rejected_without_feature() {
     let tmp = TempDir::new().unwrap();

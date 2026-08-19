@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/router_inline_tests.rs.
 use super::*;
 #[cfg(feature = "fault-injection")]
 use crate::middleware::REQUEST_ID_HEADER_NAME;
@@ -33,6 +34,7 @@ fn build_test_router_for_data_dir(
     build_test_router_with_state_for_data_dir(tmp, key_store, data_dir).0
 }
 
+/// TODO: Document build_test_router_with_state_for_data_dir.
 fn build_test_router_with_state_for_data_dir(
     tmp: &TempDir,
     key_store: Option<Arc<KeyStore>>,
@@ -692,6 +694,7 @@ async fn global_concurrency_limit_queues_health_while_fault_sleep_owns_slot() {
         .unwrap();
 }
 
+/// TODO: Document body_limit_from_env_rejects_payload_over_limit.
 #[tokio::test]
 async fn body_limit_from_env_rejects_payload_over_limit() {
     // `with_env_var` holds ENV_MUTEX for the guard's whole lifetime and
@@ -726,6 +729,7 @@ async fn body_limit_from_env_allows_payload_under_limit() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
+/// TODO: Document build_router_open_mode_allows_protected_routes_without_auth_layer.
 #[tokio::test]
 async fn build_router_open_mode_allows_protected_routes_without_auth_layer() {
     let tmp = TempDir::new().unwrap();
@@ -755,6 +759,7 @@ async fn build_router_open_mode_allows_protected_routes_without_auth_layer() {
         "search response should include hits"
     );
 }
+/// TODO: Document build_router_open_mode_allows_dictionary_routes_without_auth_layer.
 #[tokio::test]
 async fn build_router_open_mode_allows_dictionary_routes_without_auth_layer() {
     let tmp = TempDir::new().unwrap();
@@ -802,6 +807,7 @@ async fn build_router_open_mode_does_not_expose_internal_routes() {
     let response = send_empty_request(&app, Method::GET, "/internal/storage").await;
     assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
 }
+/// TODO: Document build_router_does_not_log_trusted_proxy_initialization.
 #[tokio::test]
 async fn build_router_does_not_log_trusted_proxy_initialization() {
     let tmp = TempDir::new().unwrap();
@@ -821,6 +827,7 @@ async fn build_router_does_not_log_trusted_proxy_initialization() {
         "router construction should not re-log trusted proxy initialization"
     );
 }
+/// TODO: Document cors_preflight_returns_expected_allow_origin_for_restricted_and_loopback_modes.
 #[tokio::test]
 async fn cors_preflight_returns_expected_allow_origin_for_restricted_and_loopback_modes() {
     let restricted_router = Router::new()
@@ -871,6 +878,7 @@ async fn cors_preflight_returns_expected_allow_origin_for_restricted_and_loopbac
     assert_eq!(loopback_origin, Some("http://127.0.0.1:5173"));
 }
 
+/// TODO: Document cors_preflight_blocks_non_loopback_origins_in_loopback_mode.
 #[tokio::test]
 async fn cors_preflight_blocks_non_loopback_origins_in_loopback_mode() {
     let app = Router::new()
@@ -899,6 +907,7 @@ async fn cors_preflight_blocks_non_loopback_origins_in_loopback_mode() {
         "non-loopback origin should not receive access-control-allow-origin in default mode"
     );
 }
+/// TODO: Document cors_preflight_rejects_blocked_origins_in_restricted_mode.
 #[tokio::test]
 async fn cors_preflight_rejects_blocked_origins_in_restricted_mode() {
     let app = Router::new()
@@ -957,6 +966,7 @@ async fn metrics_returns_403_without_auth_headers() {
         })
     );
 }
+/// TODO: Document metrics_returns_200_with_admin_key_only.
 #[tokio::test]
 async fn metrics_returns_200_with_admin_key_only() {
     use axum::body::Body;

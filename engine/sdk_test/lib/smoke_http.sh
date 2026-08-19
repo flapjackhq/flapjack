@@ -58,6 +58,7 @@ assert_request_header_present() {
   fi
 }
 
+# TODO: Document send_request.
 send_request() {
   local method="$1"
   local path="$2"
@@ -116,6 +117,7 @@ extract_task_status() {
   echo "$response" | grep -Eo '"status"[[:space:]]*:[[:space:]]*"[^"]*"' | grep -Eo 'published|notPublished' | head -n1 || true
 }
 
+# TODO: Document wait_for_task_published.
 wait_for_task_published() {
   local task_id="$1"
   local task_path_template="$2"
@@ -181,6 +183,7 @@ assert_response_contains() {
   fi
 }
 
+# TODO: Document run_standard_sdk_smoke_test.
 run_standard_sdk_smoke_test() {
   local sdk_label="$1"
   local index_name="$2"

@@ -129,6 +129,7 @@ http_success_code() {
   [[ "$code" =~ ^[0-9]+$ ]] && [ "$code" -ge 200 ] && [ "$code" -le 299 ]
 }
 
+# TODO: Document parse_args.
 parse_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -338,6 +339,7 @@ resolve_cancel_index_names() {
   [ "$SOURCE_INDEX" != "$TARGET_INDEX" ] || die "cancel source and target index names must differ" 2
 }
 
+# TODO: Document load_credentials.
 load_credentials() {
   if [ "$EXPECT_MODE" = "unavailable" ]; then
     SOURCE_APP_ID="stub_app_id"
@@ -375,6 +377,7 @@ prepare_scale_fixture() {
   VERIFICATION_MANIFEST="$manifest_path"
 }
 
+# TODO: Document init_run.
 init_run() {
   require_tool curl
   require_tool jq
@@ -568,6 +571,7 @@ record_check() {
   mv "$next" "$RECEIPT"
 }
 
+# TODO: Document build_or_resolve_binary.
 build_or_resolve_binary() {
   if [ -n "${FLAPJACK_BIN:-}" ]; then
     [ -x "$FLAPJACK_BIN" ] || die "FLAPJACK_BIN is not executable"
@@ -598,6 +602,7 @@ record_binary_identity() {
   mv "$next" "$RECEIPT"
 }
 
+# TODO: Document start_server.
 start_server() {
   if [ "$SCENARIO" = "cancel" ]; then
     CANCEL_PRECOMMIT_BARRIER_DIR="$WORK_DIR/cancel-precommit-barrier"
@@ -637,6 +642,7 @@ start_server() {
   record_check "local_server" "pass" "started"
 }
 
+# TODO: Document flapjack_request.
 flapjack_request() {
   local method="$1" path="$2" body="$3" out="$4" status body_file=""
   set +e
@@ -714,6 +720,7 @@ minimum_distinct_sidecar_samples() {
   fi
 }
 
+# TODO: Document capture_scale_trial_artifacts.
 capture_scale_trial_artifacts() {
   local job_dir="$1" candidate_dir="$2" observed_size="$3"
   local sidecar="$job_dir/completed_object_ids" live_manifest="$job_dir/manifest.json"
@@ -739,6 +746,7 @@ capture_scale_trial_artifacts() {
   mv "$candidate_dir/manifest.candidate" "$latest_manifest"
 }
 
+# TODO: Document commit_scale_trial_artifact_pair.
 commit_scale_trial_artifact_pair() {
   local candidate_dir="$1" pair_dir="$2" expected_pages="$3" condition="$4"
   local sampled_sidecar="$candidate_dir/completed_object_ids" final_size manifest pair_candidate
@@ -763,6 +771,7 @@ commit_scale_trial_artifact_pair() {
   return 1
 }
 
+# TODO: Document sample_scale_trial.
 sample_scale_trial() {
   local marker="$1" out="$2" jobs_dir="$DATA_DIR/migration_exports/jobs"
   local peak_rss=0 rss job_dir="" sidecar="" size last_size="" error="" interval_ms
@@ -835,6 +844,7 @@ execute_migration_request() {
   fi
 }
 
+# TODO: Document measured_scale_migration_request.
 measured_scale_migration_request() {
   local body="$1" out="$2" jobs_dir="$DATA_DIR/migration_exports/jobs"
   local before_count marker sample_out sampler_pid started_ms ended_ms rc elapsed_ms
@@ -860,6 +870,7 @@ measured_scale_migration_request() {
   return "$rc"
 }
 
+# TODO: Document build_scale_trial_record.
 build_scale_trial_record() {
   local sample_out="$1" elapsed_ms="$2" curl_rc="$3"
   local expected_pages minimum_distinct_samples archive_dir job_dir final_size distinct_count total_rewritten manifest_path next job_archive_ref sampled_artifacts
@@ -940,6 +951,7 @@ build_scale_trial_record() {
     || fail_scale_check "scale_spool_manifest" "scale trial spool manifest counters did not match observed evidence"
 }
 
+# TODO: Document source_algolia_request.
 source_algolia_request() {
   local method="$1" path="$2" body="$3" out="$4" status body_file=""
   set +e
@@ -1009,6 +1021,7 @@ source_algolia_mutation() {
   wait_source_algolia_task "$index_name" "$task_id" "$label"
 }
 
+# TODO: Document seed_replica_source_fixture.
 seed_replica_source_fixture() {
   local source_relevance source_relevance_topology_entry source_standard records primary_settings relevance_settings standard_settings
   [ "$SCENARIO" = "replicas" ] || return 0
@@ -1058,6 +1071,7 @@ query_index() {
     || die "${label} query response was malformed"
 }
 
+# TODO: Document browse_index.
 browse_index() {
   local index_name="$1" label="$2" request="$3" path code payload
   path="$(encoded_index_path "$index_name")/browse"
@@ -1110,6 +1124,7 @@ fail_scale_check() {
   die "$detail"
 }
 
+# TODO: Document assert_scale_aggregates.
 assert_scale_aggregates() {
   local source_count="$1" request target_total expected_final
   local page_size=1000 page=0 page_count label ids_file fetched_count duplicate_count
@@ -1181,6 +1196,7 @@ target_listing_count() {
     "$LOG_DIR/${label}.json"
 }
 
+# TODO: Document assert_target_list_exactly_once.
 assert_target_list_exactly_once() {
   local label="$1"
   flapjack_request GET "/1/indexes" "" "$LOG_DIR/${label}.raw" \
@@ -1202,6 +1218,7 @@ assert_target_list_exactly_once() {
   record_check "replica_public_list" "pass" "primary and two replicas listed exactly once"
 }
 
+# TODO: Document delete_verified_target.
 delete_verified_target() {
   local target="$1" label="$2" listed code payload remaining=40
   listed="$(target_listing_count "$target" "cleanup-${label}-before")" || return 1
@@ -1276,6 +1293,7 @@ append_scale_trial_record() {
   mv "$next" "$RECEIPT"
 }
 
+# TODO: Document summarize_scale_condition.
 summarize_scale_condition() {
   local condition="$1" next
   next="$(mktemp)"
@@ -1310,6 +1328,7 @@ summarize_scale_condition() {
   mv "$next" "$RECEIPT"
 }
 
+# TODO: Document record_two_point_ratio.
 record_two_point_ratio() {
   local next ratio_status
   next="$(mktemp)"
@@ -1342,6 +1361,7 @@ record_two_point_ratio() {
   esac
 }
 
+# TODO: Document run_scale_condition_trials.
 run_scale_condition_trials() {
   local condition="$1" trial base_target
   CORPUS_SIZE="$condition"
@@ -1420,6 +1440,7 @@ assert_scale_two_point() {
   record_two_point_ratio
 }
 
+# TODO: Document record_replica_sequences.
 record_replica_sequences() {
   local primary="$1" relevance="$2" standard="$3" next
   next="$(mktemp)"
@@ -1439,6 +1460,7 @@ record_replica_sequences() {
   mv "$next" "$RECEIPT"
 }
 
+# TODO: Document assert_replica_warnings.
 assert_replica_warnings() {
   jq -e '
     (.warnings | type) == "array"
@@ -1480,6 +1502,7 @@ assert_replica_hit_sets_equal() {
   record_check "replica_hit_sets" "pass" "primary and replicas returned identical objectID sets"
 }
 
+# TODO: Document assert_virtual_sidecar_structure.
 assert_virtual_sidecar_structure() {
   local index_name="$1" label="$2" jq_filter="$3" index_dir find_log
   index_dir="$DATA_DIR/$index_name"
@@ -1509,6 +1532,7 @@ assert_replica_check_receipt_guard() {
   ' "$RECEIPT" >/dev/null || die "replica scenario receipt checks were vacuous or had invalid statuses"
 }
 
+# TODO: Document assert_replica_scenario_import.
 assert_replica_scenario_import() {
   local primary_ids relevance_ids standard_ids
   assert_replica_warnings
@@ -1582,6 +1606,7 @@ copy_evidence_path() {
   cp -R "$source" "$target" 2>/dev/null || EVIDENCE_COPY_FAILED=1
 }
 
+# TODO: Document preserve_run_evidence.
 preserve_run_evidence() {
   local announce="${1:-1}"
   if [ -z "$EVIDENCE_DIR" ]; then
@@ -1673,6 +1698,7 @@ cleanup_current_mode_fixture() {
   return 1
 }
 
+# TODO: Document cleanup.
 cleanup() {
   local script_exit_code=$?
   local effective_exit_code="$script_exit_code"
@@ -1742,6 +1768,7 @@ cleanup() {
   fi
 }
 
+# TODO: Document main.
 main() {
   ORIGINAL_ARGS=("$@")
   parse_args "$@"

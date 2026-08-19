@@ -1,8 +1,9 @@
+//! Stub summary for engine/flapjack-http/src/router_tests.rs.
 use std::{collections::HashMap, fs, path::Path, sync::Arc};
 
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
-use flapjack::analytics::{AnalyticsCollector, AnalyticsConfig};
+use flapjack::analytics::{AnalyticsCollector, AnalyticsConfig, AnalyticsQueryEngine};
 use flapjack::index::manager::publication::{
     ContentDigest, PublicationEvent, PublicationGenerationEvidence, PublicationJournal,
     PublicationPaths, PublicationTarget, PublicationTransactionId,
@@ -62,6 +63,49 @@ fn build_no_auth_test_app() -> (TempDir, axum::Router) {
     (tmp, app)
 }
 
+#[tokio::test]
+async fn production_insights_route_uses_app_state_gdpr_notifier() {
+    let tmp = TempDir::new().unwrap();
+    let notifier = Arc::new(crate::notifications::NotificationService::disabled());
+    let state = TestStateBuilder::new(&tmp)
+        .with_analytics()
+        .with_notification_service(Arc::clone(&notifier))
+        .build_shared();
+    let analytics_collector = AnalyticsCollector::new(AnalyticsConfig {
+        enabled: true,
+        data_dir: tmp.path().join("analytics"),
+        flush_interval_secs: 3600,
+        flush_size: 100_000,
+        retention_days: 90,
+    });
+    let app = crate::router::build_router(
+        state,
+        None,
+        analytics_collector,
+        Arc::new(crate::middleware::TrustedProxyMatcher::from_optional_csv(None).unwrap()),
+        tmp.path(),
+        crate::router::RouterConfig {
+            cors_mode: crate::startup::CorsMode::LoopbackOnly,
+            disable_dashboard: true,
+            replication_api_key: None,
+            api_profile: crate::api_profile::ApiProfile::Full,
+        },
+    );
+
+    let response =
+        send_empty_request(&app, Method::DELETE, "/1/usertokens/production-notifier").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        notifier
+            .gdpr_call_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "production route state must use AppState.notification_service"
+    );
+}
+
+/// TODO: Document build_test_router_with_dashboard_policy.
 fn build_test_router_with_dashboard_policy(
     tmp: &TempDir,
     key_store: Option<Arc<KeyStore>>,
@@ -132,6 +176,7 @@ async fn openapi_migration_status_schema_includes_resume_fields() {
     );
 }
 
+/// TODO: Document openapi_membership_contract_is_hidden_when_auth_is_disabled.
 #[tokio::test]
 async fn openapi_membership_contract_is_hidden_when_auth_is_disabled() {
     let (_tmp, app) = build_no_auth_test_app();
@@ -161,6 +206,7 @@ async fn openapi_membership_contract_is_hidden_when_auth_is_disabled() {
     }
 }
 
+/// TODO: Document build_no_auth_router_for_state.
 fn build_no_auth_router_for_state(
     tmp: &TempDir,
     state: Arc<crate::handlers::AppState>,
@@ -226,6 +272,7 @@ fn publication_digest() -> ContentDigest {
     ContentDigest::new(format!("sha256:{}", "b".repeat(64))).unwrap()
 }
 
+/// TODO: Document seed_document.
 async fn seed_document(manager: &IndexManager, tenant: &str, object_id: &str, version: &str) {
     manager.create_tenant(tenant).unwrap();
     manager
@@ -246,6 +293,7 @@ async fn seed_document(manager: &IndexManager, tenant: &str, object_id: &str, ve
         .unwrap();
 }
 
+/// TODO: Document create_journaled_publication_evidence.
 async fn create_journaled_publication_evidence(
     base: &std::path::Path,
     target_name: &str,
@@ -310,6 +358,7 @@ fn item_names(body: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+/// TODO: Document assert_reserved_search_rejected.
 async fn assert_reserved_search_rejected(app: &axum::Router, index_name: &str) {
     let response = send_json_request(
         app,
@@ -337,6 +386,7 @@ fn search_only_key_value(key_store: &KeyStore) -> String {
         .value
 }
 
+/// TODO: Document create_test_key_with_acl.
 fn create_test_key_with_acl(key_store: &KeyStore, acl: &str) -> String {
     let key = ApiKey {
         hash: String::new(),
@@ -493,6 +543,7 @@ async fn assert_migration_job_action_contract(
     }
 }
 
+/// TODO: Document post_json.
 async fn post_json(
     app: &axum::Router,
     uri: &str,
@@ -552,6 +603,7 @@ fn peer_configured_replication_manager(data_dir: &std::path::Path) -> Arc<Replic
     )
 }
 
+/// TODO: Document get_request.
 async fn get_request(
     app: &axum::Router,
     uri: &str,
@@ -567,6 +619,155 @@ async fn get_request(
         .oneshot(builder.body(Body::empty()).unwrap())
         .await
         .unwrap()
+}
+
+async fn delete_request(app: &axum::Router, uri: &str, api_key: &str) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(uri)
+                .header("x-algolia-api-key", api_key)
+                .header("x-algolia-application-id", "route-contract-app")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn restricted_key_deletes_usertoken_events_only_from_its_authorized_index() {
+    use flapjack::personalization::{PersonalizationProfile, PersonalizationProfileStore};
+
+    let tmp = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(
+        &tmp.path().join("keys"),
+        "admin-key",
+    ));
+    let restricted_key = key_store
+        .create_key(ApiKey {
+            hash: String::new(),
+            salt: String::new(),
+            hmac_key: None,
+            created_at: 0,
+            acl: vec!["deleteObject".to_string()],
+            description: "tenant A deletion key".to_string(),
+            indexes: vec!["tenant-a*".to_string()],
+            max_hits_per_query: 0,
+            max_queries_per_ip_per_hour: 0,
+            query_parameters: String::new(),
+            referers: vec![],
+            restrict_sources: None,
+            validity: 0,
+        })
+        .1;
+    let analytics_config = AnalyticsConfig {
+        enabled: true,
+        data_dir: tmp.path().join("analytics"),
+        flush_interval_secs: 3600,
+        flush_size: 10_000,
+        retention_days: 30,
+    };
+    let collector = AnalyticsCollector::new(analytics_config.clone());
+    let app = crate::router::build_router(
+        TestStateBuilder::new(&tmp).with_analytics().build_shared(),
+        Some(key_store),
+        Arc::clone(&collector),
+        Arc::new(crate::middleware::TrustedProxyMatcher::from_optional_csv(None).unwrap()),
+        tmp.path(),
+        crate::router::RouterConfig {
+            cors_mode: crate::startup::CorsMode::LoopbackOnly,
+            disable_dashboard: false,
+            replication_api_key: None,
+            api_profile: crate::api_profile::ApiProfile::Full,
+        },
+    );
+    let token = "shared-customer-token";
+    // This accepted Insights index is encoded as an on-disk path component.
+    // The deletion ACL must still be evaluated against its logical name.
+    let authorized_index = "tenant-a café";
+
+    let ingest = post_json(
+        &app,
+        "/1/events",
+        Some("admin-key"),
+        serde_json::json!({
+            "events": [
+                {
+                    "eventType": "view",
+                    "eventName": "Tenant A view",
+                    "index": authorized_index,
+                    "userToken": token,
+                    "objectIDs": ["a-1"]
+                },
+                {
+                    "eventType": "view",
+                    "eventName": "Tenant B view",
+                    "index": "tenant-b",
+                    "userToken": token,
+                    "objectIDs": ["b-1"]
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(ingest.status(), StatusCode::OK);
+    collector.flush_all();
+
+    let profiles = PersonalizationProfileStore::new(tmp.path());
+    profiles
+        .save_profile(&PersonalizationProfile {
+            user_token: token.to_string(),
+            last_event_at: None,
+            scores: Default::default(),
+        })
+        .unwrap();
+
+    let deleted = delete_request(&app, &format!("/1/usertokens/{token}"), &restricted_key).await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    let deleted_body = body_json(deleted).await;
+    assert_eq!(
+        deleted_body["deletionScope"], "authorizedIndexes",
+        "restricted success must not claim application-wide GDPR completion"
+    );
+
+    let query = AnalyticsQueryEngine::new(analytics_config);
+    let tenant_a_rows = query
+        .query_events(authorized_index, "SELECT user_token FROM events")
+        .await
+        .unwrap();
+    let tenant_b_rows = query
+        .query_events("tenant-b", "SELECT user_token FROM events")
+        .await
+        .unwrap();
+    assert!(
+        tenant_a_rows.is_empty(),
+        "authorized tenant events must be deleted: {tenant_a_rows:?}"
+    );
+    assert_eq!(
+        tenant_b_rows,
+        vec![serde_json::json!({"user_token": token})],
+        "another tenant's matching token must survive"
+    );
+
+    let debug_events = collector.get_debug_events(10, None, None, None, None, None);
+    assert!(
+        debug_events
+            .iter()
+            .all(|event| event.index != authorized_index),
+        "authorized tenant debug rows must be deleted: {debug_events:?}"
+    );
+    assert!(
+        debug_events
+            .iter()
+            .any(|event| event.index == "tenant-b" && event.user_token == token),
+        "another tenant's matching debug row must survive: {debug_events:?}"
+    );
+    assert!(
+        profiles.load_profile(token).unwrap().is_some(),
+        "restricted deletion cannot erase the unscoped personalization profile"
+    );
 }
 
 async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
@@ -626,6 +827,7 @@ async fn internal_snapshot_capability_remains_available_without_authentication()
     );
 }
 
+/// TODO: Document migration_routes_preserve_admin_contract.
 #[tokio::test]
 async fn migration_routes_preserve_admin_contract() {
     let tmp = TempDir::new().unwrap();
@@ -2635,6 +2837,7 @@ async fn health_route_is_public() {
     assert_eq!(body["status"], "ok");
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
 }
+/// TODO: Document dashboard_route_is_public_and_serves_html.
 #[tokio::test]
 async fn dashboard_route_is_public_and_serves_html() {
     let (_tmp, app) = build_auth_test_app();
@@ -2655,6 +2858,7 @@ async fn dashboard_route_is_public_and_serves_html() {
     assert_eq!(body_bytes(resp).await, dashboard_test_index_bytes());
 }
 
+/// TODO: Document dashboard_trailing_slash_route_is_public_and_serves_html.
 #[tokio::test]
 async fn dashboard_trailing_slash_route_is_public_and_serves_html() {
     let (_tmp, app) = build_auth_test_app();
@@ -2759,6 +2963,7 @@ async fn dashboard_prefix_without_separator_is_not_public() {
     assert_invalid_credentials_response(resp).await;
 }
 
+/// TODO: Document dashboard_routes_follow_lockdown_policy.
 #[tokio::test]
 async fn dashboard_routes_follow_lockdown_policy() {
     let (_tmp, locked_app) = build_auth_test_app_with_dashboard_policy(true);
@@ -2819,6 +3024,7 @@ async fn metrics_returns_403_without_auth_headers() {
     let resp = send_empty_request(&app, Method::GET, "/metrics").await;
     assert_invalid_credentials_response(resp).await;
 }
+/// TODO: Document request_id_present_on_auth_403.
 #[tokio::test]
 async fn request_id_present_on_auth_403() {
     let (_tmp, app) = build_auth_test_app();
@@ -2838,6 +3044,7 @@ async fn request_id_present_on_auth_403() {
         "request ID should be UUID v4"
     );
 }
+/// TODO: Document metrics_returns_200_with_admin_key_only.
 #[tokio::test]
 async fn metrics_returns_200_with_admin_key_only() {
     let (_tmp, app) = build_auth_test_app();
@@ -2883,6 +3090,7 @@ async fn metrics_rejects_query_param_admin_key() {
     assert_invalid_credentials_response(resp).await;
 }
 
+/// TODO: Document internal_replication_routes_remain_available_when_auth_disabled.
 #[tokio::test]
 async fn internal_replication_routes_remain_available_when_auth_disabled() {
     let (_tmp, app) = build_no_auth_test_app();
@@ -2946,6 +3154,7 @@ async fn internal_replication_routes_remain_available_when_auth_disabled() {
     );
 }
 
+/// TODO: Document publication_namespace_interrupted_replacement_serves_only_live_target.
 #[tokio::test]
 async fn publication_namespace_interrupted_replacement_serves_only_live_target() {
     let tmp = TempDir::new().unwrap();
@@ -2995,6 +3204,7 @@ async fn publication_namespace_interrupted_replacement_serves_only_live_target()
     assert_reserved_search_rejected(&app, ".publication_quarantine").await;
 }
 
+/// TODO: Document publication_namespace_interrupted_create_is_invisible.
 #[tokio::test]
 async fn publication_namespace_interrupted_create_is_invisible() {
     let tmp = TempDir::new().unwrap();
@@ -3043,6 +3253,7 @@ async fn publication_namespace_interrupted_create_is_invisible() {
         "readiness and failed search must not load a staged-only target"
     );
 }
+/// TODO: Document internal_storage_returns_403_with_admin_key_only_no_app_id.
 #[tokio::test]
 async fn internal_storage_returns_403_with_admin_key_only_no_app_id() {
     let (_tmp, app) = build_auth_test_app();

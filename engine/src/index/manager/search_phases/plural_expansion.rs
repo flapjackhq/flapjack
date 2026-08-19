@@ -1,3 +1,4 @@
+//! Stub summary for plural_expansion.rs.
 use super::super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,6 +377,7 @@ fn append_unique_terms_for_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// TODO: Document plural_forms_for_word_merges_builtin_and_custom_without_duplicates.
     #[test]
     fn plural_forms_for_word_merges_builtin_and_custom_without_duplicates() {
         let plural_specs = vec![
@@ -400,6 +402,7 @@ mod tests {
         assert_eq!(forms, vec!["shoe", "shoes", "chaussure"]);
     }
 
+    /// TODO: Document decompound_parts_for_word_merges_custom_and_normalized_keys.
     #[cfg(feature = "decompound")]
     #[test]
     fn decompound_parts_for_word_merges_custom_and_normalized_keys() {

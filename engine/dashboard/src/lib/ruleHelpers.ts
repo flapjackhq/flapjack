@@ -1,3 +1,6 @@
+/**
+ * @module Stub summary for ruleHelpers.ts.
+ */
 import type { Rule, RuleCondition, RuleHide, RulePromote } from './types'
 
 export interface ParseRuleEditorJsonResult {
@@ -126,6 +129,9 @@ function cleanParams(params?: Record<string, unknown>): Record<string, unknown> 
   return Object.keys(clean).length > 0 ? clean : undefined
 }
 
+/**
+ * TODO: Document normalizeRuleForSerialization.
+ */
 export function normalizeRuleForSerialization(rule: Rule): Rule {
   const normalizedRule = normalizeRule(rule)
   const conditions = normalizedRule.conditions
@@ -175,6 +181,9 @@ export function normalizeRuleForSerialization(rule: Rule): Rule {
   return result
 }
 
+/**
+ * TODO: Document validateRule.
+ */
 export function validateRule(rule: Rule): string[] {
   const errors: string[] = []
 
@@ -227,6 +236,9 @@ export function validateRule(rule: Rule): string[] {
   return errors
 }
 
+/**
+ * TODO: Document prepareRuleEditorSave.
+ */
 export function prepareRuleEditorSave(rule: Rule): PrepareRuleEditorSaveResult {
   const candidateRule = normalizeRuleForSerialization(rule)
   const validationErrors = validateRule(candidateRule)

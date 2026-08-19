@@ -1,3 +1,4 @@
+//! Stub summary for geo.rs.
 use crate::types::FieldValue;
 
 const EARTH_RADIUS_M: f64 = 6_371_000.0;
@@ -531,6 +532,7 @@ mod tests {
         assert!(params.filter_point(35.0, -75.0));
     }
 
+    /// TODO: Document filter_point_doc_mentions_polygon_constraints.
     #[test]
     fn filter_point_doc_mentions_polygon_constraints() {
         let source = include_str!("geo.rs");

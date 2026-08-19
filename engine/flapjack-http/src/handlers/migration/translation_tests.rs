@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/translation_tests.rs.
 use super::super::source_reader::SourceConfigurationRecord;
 use super::super::spool::{
     AcceptedSpoolReader, AsyncMigrationPublicationSemantic, ResourceDenominators, SpoolError,
@@ -35,6 +36,7 @@ struct AcceptedSpoolFixture {
     reader: AcceptedSpoolReader,
 }
 
+/// TODO: Document spool_payload.
 pub(in crate::handlers::migration) fn spool_payload(
     settings: serde_json::Value,
     document_pages: Vec<Vec<serde_json::Value>>,
@@ -367,6 +369,7 @@ fn translated_documents(translated: &TranslatedSpoolPayload) -> Vec<&Document> {
 mod replica_topology_translation {
     use super::*;
 
+    /// TODO: Document standard_and_virtual_source_entries_derive_virtual_targets_with_source_kind.
     #[test]
     fn standard_and_virtual_source_entries_derive_virtual_targets_with_source_kind() {
         let translated = translate_replica_topology(
@@ -398,6 +401,7 @@ mod replica_topology_translation {
         );
     }
 
+    /// TODO: Document prefix_replacement_is_byte_exact_case_sensitive_and_separator_preserving.
     #[test]
     fn prefix_replacement_is_byte_exact_case_sensitive_and_separator_preserving() {
         let translated = translate_replica_topology(
@@ -529,6 +533,7 @@ mod replica_ranking_translation {
     use super::super::translation_report::warning_message;
     use super::*;
 
+    /// TODO: Document warning_message_contract_maps_only_warning_codes.
     #[test]
     fn warning_message_contract_maps_only_warning_codes() {
         let cases = [
@@ -611,6 +616,7 @@ mod replica_ranking_translation {
         }
     }
 
+    /// TODO: Document matching_critical_field_inventory_is_canonical.
     #[test]
     fn matching_critical_field_inventory_is_canonical() {
         assert_eq!(
@@ -634,6 +640,7 @@ mod replica_ranking_translation {
         );
     }
 
+    /// TODO: Document g1_standard_replica_preserves_ranking_and_reports_exhaustive_sort_approximation.
     #[test]
     fn g1_standard_replica_preserves_ranking_and_reports_exhaustive_sort_approximation() {
         let primary = json!({
@@ -690,6 +697,7 @@ mod replica_ranking_translation {
         );
     }
 
+    /// TODO: Document g2_numeric_filter_alias_divergence_preserves_value_and_reports_canonical_path.
     #[test]
     fn g2_numeric_filter_alias_divergence_preserves_value_and_reports_canonical_path() {
         let primary = json!({
@@ -736,6 +744,7 @@ mod replica_ranking_translation {
         );
     }
 
+    /// TODO: Document g3_strictness_preserves_replica_value_and_reports_primary_and_semantic_gaps.
     #[test]
     fn g3_strictness_preserves_replica_value_and_reports_primary_and_semantic_gaps() {
         let primary = json!({
@@ -778,6 +787,7 @@ mod replica_ranking_translation {
         );
     }
 
+    /// TODO: Document standard_and_virtual_replicas_use_their_own_carried_ranking_settings.
     #[test]
     fn standard_and_virtual_replicas_use_their_own_carried_ranking_settings() {
         let primary = json!({
@@ -878,6 +888,7 @@ mod replica_ranking_translation {
         );
     }
 
+    /// TODO: Document exhaustive_sort_ranking_lifts_desc_price_first.
     #[test]
     fn exhaustive_sort_ranking_lifts_desc_price_first() {
         let primary = ranking_primary_settings();
@@ -916,6 +927,7 @@ mod replica_ranking_translation {
         );
     }
 
+    /// TODO: Document custom_ranking_only_survives_when_source_ranking_keeps_custom.
     #[test]
     fn custom_ranking_only_survives_when_source_ranking_keeps_custom() {
         let primary = ranking_primary_settings();
@@ -965,6 +977,7 @@ mod replica_ranking_translation {
         );
     }
 
+    /// TODO: Document matching_critical_divergence_uses_normalized_settings_semantics.
     #[test]
     fn matching_critical_divergence_uses_normalized_settings_semantics() {
         let primary = json!({
@@ -1018,6 +1031,7 @@ mod replica_ranking_translation {
         );
     }
 
+    /// TODO: Document numeric_filtering_legacy_alias_warns_at_canonical_matching_path.
     #[test]
     fn numeric_filtering_legacy_alias_warns_at_canonical_matching_path() {
         let primary = json!({
@@ -1049,6 +1063,7 @@ mod replica_ranking_translation {
         );
     }
 
+    /// TODO: Document report_codes_and_paths_cover_ranking_and_fidelity_limits.
     #[test]
     fn report_codes_and_paths_cover_ranking_and_fidelity_limits() {
         let primary = json!({
@@ -1132,6 +1147,7 @@ mod replica_ranking_translation {
         }
     }
 
+    /// TODO: Document matching_critical_field_warnings_are_parameterized_from_inventory.
     #[test]
     fn matching_critical_field_warnings_are_parameterized_from_inventory() {
         let primary = primary_matching_critical_settings();
@@ -1169,6 +1185,7 @@ mod replica_ranking_translation {
         );
     }
 
+    /// TODO: Document omitted_replica_matching_critical_field_warns_against_non_default_primary.
     #[test]
     fn omitted_replica_matching_critical_field_warns_against_non_default_primary() {
         let primary = json!({
@@ -1197,6 +1214,7 @@ mod replica_ranking_translation {
         );
     }
 
+    /// TODO: Document empty_optional_matching_critical_lists_match_omitted_defaults.
     #[test]
     fn empty_optional_matching_critical_lists_match_omitted_defaults() {
         let primary = json!({
@@ -1223,6 +1241,7 @@ mod replica_ranking_translation {
         .is_empty());
     }
 
+    /// TODO: Document missing_or_malformed_carried_replica_settings_fail_closed.
     #[test]
     fn missing_or_malformed_carried_replica_settings_fail_closed() {
         let primary = ranking_primary_settings();
@@ -1266,6 +1285,7 @@ mod replica_ranking_translation {
         })
     }
 
+    /// TODO: Document primary_matching_critical_settings.
     fn primary_matching_critical_settings() -> serde_json::Value {
         json!({
             "replicas": ["virtual(products_price_desc)"],
@@ -1287,6 +1307,7 @@ mod replica_ranking_translation {
         })
     }
 
+    /// TODO: Document complete_replica_settings.
     fn complete_replica_settings() -> BTreeMap<String, serde_json::Value> {
         BTreeMap::from([
             (
@@ -1354,6 +1375,7 @@ fn matrix_denominator_is_explicit_stage3_oracle() {
     assert_eq!(denominator, STAGE1_MATRIX_EXPECTED_DENOMINATOR);
 }
 
+/// TODO: Document matcher_inventory_matches_independent_stage1_list.
 #[test]
 fn matcher_inventory_matches_independent_stage1_list() {
     let actual: Vec<_> = stage1_matrix()
@@ -1526,6 +1548,7 @@ fn document_attributes_use_exact_json_catch_all() {
 // They must never be "fixed" by weakening the assertions or flipping a production
 // matrix row in this stage — they are the falsifiable proof that Stage 1 did not
 // silently activate replica migration.
+/// TODO: Document replicas_matrix_row_remains_red_until_stage4.
 #[test]
 fn replicas_matrix_row_remains_red_until_stage4() {
     let row = resolve_source_field(ResourceKind::Settings, "replicas");
@@ -1548,6 +1571,7 @@ fn replicas_matrix_row_remains_red_until_stage4() {
     let _ = ReportCode::ReplicaTopologyNotMigrated;
 }
 
+/// TODO: Document relevancy_strictness_matrix_row_remains_red_until_stage4.
 #[test]
 fn relevancy_strictness_matrix_row_remains_red_until_stage4() {
     let row = resolve_source_field(ResourceKind::Settings, "relevancyStrictness");
@@ -1570,6 +1594,7 @@ fn relevancy_strictness_matrix_row_remains_red_until_stage4() {
     let _ = ReportCode::ReplicaTopologyNotMigrated;
 }
 
+/// TODO: Document supported_synonym_payloads_resolve_to_schema_rows.
 #[test]
 fn supported_synonym_payloads_resolve_to_schema_rows() {
     let cases = [
@@ -1609,6 +1634,7 @@ fn supported_synonym_payloads_resolve_to_schema_rows() {
     }
 }
 
+/// TODO: Document translates_complete_spool_payload_and_preserves_resource_order.
 #[test]
 fn translates_complete_spool_payload_and_preserves_resource_order() {
     let translated = translated(complete_spool_payload());
@@ -1923,6 +1949,7 @@ fn accepted_typesense_spool_translation_uses_persisted_source_provider() {
     );
 }
 
+/// TODO: Document translates_accepted_spool_in_bounded_document_batches.
 #[test]
 fn translates_accepted_spool_in_bounded_document_batches() {
     let fixture = accepted_spool_fixture(
@@ -2015,7 +2042,7 @@ fn translates_accepted_spool_in_bounded_document_batches() {
     );
     assert_eq!(
         translated.report.report_digest.as_deref(),
-        Some("155f86f68e259b608efa8f50dfc62ec4fe9d99af8b61d57efb529ca5aa42dca4")
+        Some("0d6865142f81127352eeacc2b34f56741ec13147fa8da9c5dd681ad8f9ca2d68")
     );
 }
 
@@ -2286,6 +2313,7 @@ fn accepted_typesense_spool_preserves_provider_native_settings_payload() {
     assert_eq!(translated.bundle.settings.pagination_limited_to, 1000);
 }
 
+/// TODO: Document accepted_spool_translation_preserves_malformed_typed_payload_paths.
 #[test]
 fn accepted_spool_translation_preserves_malformed_typed_payload_paths() {
     let fixture = accepted_spool_fixture(
@@ -2413,14 +2441,12 @@ fn in_memory_translation_observes_carried_replica_settings_count() {
     assert_eq!(instrumentation.replica_settings_count, 2);
 }
 
+/// TODO: Document exact_document_and_settings_rows_persist_payload_values.
 #[test]
 fn exact_document_and_settings_rows_persist_payload_values() {
     let faceting_row = resolve_source_field(ResourceKind::Settings, "attributesForFaceting");
-    assert_eq!(faceting_row.disposition, Disposition::Warned);
-    assert_eq!(
-        faceting_row.warning_code,
-        Some(WarningCode::PersistedNoBehaviorSetting)
-    );
+    assert_eq!(faceting_row.disposition, Disposition::Exact);
+    assert_eq!(faceting_row.warning_code, None);
     assert_eq!(faceting_row.target_owner, TargetOwner::SettingsPayloadMerge);
     let searchable_row = resolve_source_field(ResourceKind::Settings, "searchableAttributes");
     assert_eq!(searchable_row.disposition, Disposition::Exact);
@@ -2562,6 +2588,7 @@ fn assert_exact_document_payload_values(translated: &TranslatedSpoolPayload) {
     );
 }
 
+/// TODO: Document transformed_settings_distinct_and_deprecated_aliases_persist.
 #[test]
 fn transformed_settings_distinct_and_deprecated_aliases_persist() {
     for field in ["distinct", "attributesToIndex", "numericAttributesToIndex"] {
@@ -2626,6 +2653,7 @@ fn legacy_attributes_to_index_transforms_with_canonical_field_precedence() {
     assert_eq!(translated.report.summary.hard_rejections, 0);
 }
 
+/// TODO: Document source_reader_vendor_default_settings_are_accepted.
 #[test]
 fn source_reader_vendor_default_settings_are_accepted() {
     let translated = translated(spool_payload(
@@ -2746,47 +2774,7 @@ fn source_reader_vendor_default_settings_are_accepted() {
                 ReportResource::Settings,
                 None,
                 None,
-                "$.attributesForFaceting".to_string()
-            ),
-            (
-                ReportSeverity::Warning,
-                ReportCode::PersistedNoBehaviorSetting,
-                ReportResource::Settings,
-                None,
-                None,
-                "$.attributesToHighlight".to_string()
-            ),
-            (
-                ReportSeverity::Warning,
-                ReportCode::PersistedNoBehaviorSetting,
-                ReportResource::Settings,
-                None,
-                None,
                 "$.attributesToSnippet".to_string()
-            ),
-            (
-                ReportSeverity::Warning,
-                ReportCode::PersistedNoBehaviorSetting,
-                ReportResource::Settings,
-                None,
-                None,
-                "$.highlightPostTag".to_string()
-            ),
-            (
-                ReportSeverity::Warning,
-                ReportCode::PersistedNoBehaviorSetting,
-                ReportResource::Settings,
-                None,
-                None,
-                "$.highlightPreTag".to_string()
-            ),
-            (
-                ReportSeverity::Warning,
-                ReportCode::PersistedNoBehaviorSetting,
-                ReportResource::Settings,
-                None,
-                None,
-                "$.hitsPerPage".to_string()
             ),
             (
                 ReportSeverity::Warning,
@@ -2815,9 +2803,10 @@ fn source_reader_vendor_default_settings_are_accepted() {
         ]
     );
     assert_eq!(translated.report.summary.hard_rejections, 0);
-    assert_eq!(translated.report.summary.warnings, 9);
+    assert_eq!(translated.report.summary.warnings, 4);
 }
 
+/// TODO: Document vendor_settings_fields_merge_non_default_values_into_existing_owner.
 #[test]
 fn vendor_settings_fields_merge_non_default_values_into_existing_owner() {
     let translated = translated(spool_payload(
@@ -2850,9 +2839,10 @@ fn vendor_settings_fields_merge_non_default_values_into_existing_owner() {
     assert_eq!(settings.alternatives_as_exact, vec!["ignorePlurals"]);
     assert_eq!(settings.optional_words, vec!["shoe"]);
     assert_eq!(translated.report.summary.hard_rejections, 0);
-    assert_eq!(translated.report.summary.warnings, 4);
+    assert_eq!(translated.report.summary.warnings, 2);
 }
 
+/// TODO: Document warned_allow_compression_setting_persists_and_reports_warning.
 #[test]
 fn warned_allow_compression_setting_persists_and_reports_warning() {
     let translated = translated(spool_payload(
@@ -2876,6 +2866,7 @@ fn warned_allow_compression_setting_persists_and_reports_warning() {
     assert_eq!(translated.report.summary.warnings, 1);
 }
 
+/// TODO: Document primary_relevancy_strictness_without_replicas_does_not_emit_replica_warning.
 #[test]
 fn primary_relevancy_strictness_without_replicas_does_not_emit_replica_warning() {
     let translated = translated(spool_payload(
@@ -2896,6 +2887,7 @@ fn primary_relevancy_strictness_without_replicas_does_not_emit_replica_warning()
     assert_eq!(translated.report.summary.warnings, 0);
 }
 
+/// TODO: Document hard_rejected_settings_emit_canonical_codes_and_paths.
 #[test]
 fn hard_rejected_settings_emit_canonical_codes_and_paths() {
     let mut payload = spool_payload(
@@ -2924,6 +2916,7 @@ fn hard_rejected_settings_emit_canonical_codes_and_paths() {
     assert_eq!(unknown.json_path, "$.notAFlapjackOwnedField");
 }
 
+/// TODO: Document closed_unknown_fields_reject_settings_rules_and_synonyms.
 #[test]
 fn closed_unknown_fields_reject_settings_rules_and_synonyms() {
     let report = rejected(spool_payload(
@@ -2983,6 +2976,7 @@ fn closed_unknown_fields_reject_settings_rules_and_synonyms() {
     );
 }
 
+/// TODO: Document scope_gap_entries_have_deterministic_order.
 #[test]
 fn scope_gap_entries_have_deterministic_order() {
     let translated = translated(spool_payload(json!({}), vec![], vec![], vec![]));
@@ -3017,6 +3011,7 @@ fn scope_gap_entries_have_deterministic_order() {
     );
 }
 
+/// TODO: Document translates_empty_resource_pages.
 #[test]
 fn translates_empty_resource_pages() {
     let translated = translated(spool_payload(
@@ -3195,6 +3190,7 @@ fn malformed_document_page_emits_one_snapshot_violation_and_skips_page_identity_
     );
 }
 
+/// TODO: Document invalid_object_id_report_preserves_resource_coordinates.
 #[test]
 fn invalid_object_id_report_preserves_resource_coordinates() {
     for (payload, resource) in [
@@ -3262,6 +3258,7 @@ fn rule_and_synonym_duplicate_reports_are_scoped_per_resource() {
     );
 }
 
+/// TODO: Document rejects_closed_schema_and_malformed_payloads.
 #[test]
 fn rejects_closed_schema_and_malformed_payloads() {
     for (payload, code) in [
@@ -3361,6 +3358,7 @@ fn rejects_closed_schema_and_malformed_payloads() {
     }
 }
 
+/// TODO: Document malformed_payload_reports_cover_settings_document_rule_and_synonym_paths.
 #[test]
 fn malformed_payload_reports_cover_settings_document_rule_and_synonym_paths() {
     let report = rejected(spool_payload(
@@ -3426,6 +3424,7 @@ fn malformed_payload_reports_cover_settings_document_rule_and_synonym_paths() {
     }
 }
 
+/// TODO: Document typed_failures_are_aggregated_without_duplicate_invalid_id_entries.
 #[test]
 fn typed_failures_are_aggregated_without_duplicate_invalid_id_entries() {
     let report = rejected(spool_payload(
@@ -3459,6 +3458,7 @@ fn typed_failures_are_aggregated_without_duplicate_invalid_id_entries() {
     assert_eq!(report.summary.total_entries, 8);
 }
 
+/// TODO: Document reports_all_core_serde_failures_at_their_source_coordinates.
 #[test]
 fn reports_all_core_serde_failures_at_their_source_coordinates() {
     let report = rejected(spool_payload(
@@ -3505,6 +3505,7 @@ fn reports_all_core_serde_failures_at_their_source_coordinates() {
     assert_eq!(synonym_entry.json_path, "$");
 }
 
+/// TODO: Document rejects_topology_settings_and_scope_gaps_without_payload_fields.
 #[test]
 fn rejects_topology_settings_and_scope_gaps_without_payload_fields() {
     let mut payload = spool_payload(
@@ -3547,6 +3548,7 @@ fn rejects_topology_settings_and_scope_gaps_without_payload_fields() {
     );
 }
 
+/// TODO: Document every_rule_schema_matcher_has_an_owner_path_case.
 #[test]
 fn every_rule_schema_matcher_has_an_owner_path_case() {
     let cases = [
@@ -3672,6 +3674,7 @@ where
         .unwrap_or_else(|err| panic!("failed to parse live fixture {}: {err}", path.display()))
 }
 
+/// TODO: Document supported_live_baseline_input.
 fn supported_live_baseline_input() -> SpoolTranslationInput {
     spool_payload(
         json!({
@@ -3779,6 +3782,7 @@ fn live_positive_oracle_rejects_rule_field_drift() {
     assert!(std::panic::catch_unwind(|| assert_positive_live_translation(input)).is_err());
 }
 
+/// TODO: Document live_mutation_oracle_rejects_extra_hard_rejections.
 #[test]
 fn live_mutation_oracle_rejects_extra_hard_rejections() {
     let baseline = supported_live_baseline_input();
@@ -3800,6 +3804,7 @@ fn live_mutation_oracle_rejects_extra_hard_rejections() {
     .is_err());
 }
 
+/// TODO: Document assert_positive_live_translation.
 fn assert_positive_live_translation(input: SpoolTranslationInput) {
     let translated = translated(input);
 
@@ -4073,6 +4078,7 @@ fn assert_positive_live_report(translated: &TranslatedSpoolPayload) {
     assert!(translated.report.report_digest.is_some());
 }
 
+/// TODO: Document assert_live_mutation_report.
 fn assert_live_mutation_report(
     baseline: &SpoolTranslationInput,
     mutate: impl FnOnce(&mut SpoolTranslationInput),
@@ -4098,6 +4104,7 @@ fn assert_live_mutation_report(
     );
 }
 
+/// TODO: Document live_algolia_translation_fixtures.
 #[test]
 fn live_algolia_translation_fixtures() {
     let Some(baseline) = live_fixture_input_from_env() else {

@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/manager/publication/digest.rs.
 use super::{
     classify_tenant_relative_path, invalid_publication, ContentDigest, Result,
     TantivyManagedInventory,
@@ -30,6 +31,7 @@ struct DigestRecord {
     bytes: Vec<u8>,
 }
 
+/// TODO: Document collect_tree_records.
 fn collect_tree_records(
     root: &Path,
     current: &Path,

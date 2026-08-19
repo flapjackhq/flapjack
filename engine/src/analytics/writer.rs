@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/analytics/writer.rs.
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, Float64Builder,
     Int64Array, Int64Builder, StringArray, StringBuilder, UInt32Array, UInt32Builder,
@@ -81,6 +82,7 @@ pub fn flush_rollup_window(
         .map(|(path, _event_count)| path)
 }
 
+/// TODO: Document flush_rollup_window_with_event_count.
 pub fn flush_rollup_window_with_event_count(
     config: &AnalyticsConfig,
     index_name: &str,
@@ -170,6 +172,7 @@ pub fn flush_rollup_window_with_event_count(
     Ok((parquet_path, event_count))
 }
 
+/// TODO: Document require_canonical_hourly_source_coverage.
 fn require_canonical_hourly_source_coverage(
     config: &AnalyticsConfig,
     index_name: &str,
@@ -268,6 +271,7 @@ struct CertifiedHourlySource {
     event_count: i64,
 }
 
+/// TODO: Document validate_rollup_window.
 fn validate_rollup_window(
     tier: &str,
     window_start_ms: i64,
@@ -281,6 +285,7 @@ fn validate_rollup_window(
     )
 }
 
+/// TODO: Document validate_rollup_window_with_hour_window_ms.
 fn validate_rollup_window_with_hour_window_ms(
     tier: &str,
     window_start_ms: i64,
@@ -710,6 +715,7 @@ fn unique_rollup_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     path.with_extension(format!("parquet.{}.{}", now_ns, suffix))
 }
 
+/// TODO: Document stage_existing_rollup_backup.
 fn stage_existing_rollup_backup(path: &Path) -> Result<Option<PathBuf>, String> {
     if !path.exists() {
         return Ok(None);
@@ -783,6 +789,7 @@ fn remove_file_if_exists(path: &Path) -> Result<(), String> {
     }
 }
 
+/// TODO: Document reject_symlink_if_exists.
 fn reject_symlink_if_exists(path: &Path, path_role: &str) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
@@ -1155,7 +1162,7 @@ pub fn purge_insight_events_for_user_token(
     events_dir: &Path,
     user_token: &str,
 ) -> Result<u64, String> {
-    if !events_dir.exists() {
+    if !preflight_insight_events_purge(events_dir)? {
         return Ok(0);
     }
 
@@ -1165,6 +1172,36 @@ pub fn purge_insight_events_for_user_token(
         removed_rows += purge_user_token_from_file(&file_path, user_token)?;
     }
     Ok(removed_rows)
+}
+
+/// Validate one events tree without following symlinked roots or descendants.
+/// Returns `false` only when the root does not exist.
+pub(crate) fn preflight_insight_events_purge(events_dir: &Path) -> Result<bool, String> {
+    let metadata = match fs::symlink_metadata(events_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "failed to stat analytics events root {}: {}",
+                events_dir.display(),
+                error
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing symlinked analytics events root {}",
+            events_dir.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(format!(
+            "analytics events root is not a directory: {}",
+            events_dir.display()
+        ));
+    }
+    collect_parquet_files(events_dir)?;
+    Ok(true)
 }
 
 /// Recursively collect all `.parquet` file paths under `dir`.
@@ -1379,6 +1416,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document partitioned_parquet_path_rejects_symlinked_partition_dir.
     #[cfg(unix)]
     #[test]
     fn partitioned_parquet_path_rejects_symlinked_partition_dir() {
@@ -1403,6 +1441,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document flush_rollup_window_rejects_symlinked_rollup_dir.
     #[cfg(unix)]
     #[test]
     fn flush_rollup_window_rejects_symlinked_rollup_dir() {
@@ -1922,6 +1961,7 @@ mod tests {
         assert_eq!(day_state.total_event_count, 7);
     }
 
+    /// TODO: Document flush_rollup_window_rejects_non_canonical_utc_windows.
     #[test]
     fn flush_rollup_window_rejects_non_canonical_utc_windows() {
         let tmp = TempDir::new().unwrap();
@@ -1973,6 +2013,7 @@ mod tests {
             .expect("minute override should be accepted when validation uses the same width");
     }
 
+    /// TODO: Document flush_rollup_window_idempotent_on_rerun.
     #[test]
     fn flush_rollup_window_idempotent_on_rerun() {
         let tmp = TempDir::new().unwrap();
@@ -2045,6 +2086,7 @@ mod tests {
         assert!(day_state.complete);
     }
 
+    /// TODO: Document flush_rollup_window_daily_requires_canonical_hourly_coverage.
     #[test]
     fn flush_rollup_window_daily_requires_canonical_hourly_coverage() {
         let tmp = TempDir::new().unwrap();
@@ -2104,6 +2146,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document flush_rollup_window_write_is_atomic_against_partial_failures.
     #[test]
     fn flush_rollup_window_write_is_atomic_against_partial_failures() {
         let tmp = TempDir::new().unwrap();
@@ -2152,6 +2195,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document flush_rollup_window_daily_fails_when_certified_hourly_file_missing.
     #[test]
     fn flush_rollup_window_daily_fails_when_certified_hourly_file_missing() {
         let tmp = TempDir::new().unwrap();
@@ -2192,6 +2236,7 @@ mod tests {
         }
     }
 
+    /// TODO: Document flush_rollup_window_daily_rejects_manifest_path_traversal.
     #[test]
     fn flush_rollup_window_daily_rejects_manifest_path_traversal() {
         let tmp = TempDir::new().unwrap();
@@ -2247,6 +2292,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document flush_rollup_window_daily_rejects_symlinked_certified_hourly_source.
     #[cfg(unix)]
     #[test]
     fn flush_rollup_window_daily_rejects_symlinked_certified_hourly_source() {
@@ -2300,6 +2346,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document flush_rollup_window_daily_fails_when_certified_hourly_rows_violate_manifest_window.
     #[test]
     fn flush_rollup_window_daily_fails_when_certified_hourly_rows_violate_manifest_window() {
         let tmp = TempDir::new().unwrap();
@@ -2361,6 +2408,7 @@ mod tests {
         }
     }
 
+    /// TODO: Document flush_rollup_window_daily_fails_when_certified_hourly_count_mismatches_manifest.
     #[test]
     fn flush_rollup_window_daily_fails_when_certified_hourly_count_mismatches_manifest() {
         let tmp = TempDir::new().unwrap();
@@ -2411,6 +2459,7 @@ mod tests {
         }
     }
 
+    /// TODO: Document flush_rollup_window_daily_recomputes_state_from_hourly_windows_not_stale_bits.
     #[test]
     fn flush_rollup_window_daily_recomputes_state_from_hourly_windows_not_stale_bits() {
         let tmp = TempDir::new().unwrap();
@@ -2453,6 +2502,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document flush_rollup_window_daily_fails_on_corrupt_hourly_hll_payload.
     #[test]
     fn flush_rollup_window_daily_fails_on_corrupt_hourly_hll_payload() {
         let tmp = TempDir::new().unwrap();
@@ -2503,6 +2553,7 @@ mod tests {
         }
     }
 
+    /// TODO: Document flush_rollup_window_hourly_removes_new_parquet_when_manifest_load_fails.
     #[test]
     fn flush_rollup_window_hourly_removes_new_parquet_when_manifest_load_fails() {
         let tmp = TempDir::new().unwrap();
@@ -2530,6 +2581,7 @@ mod tests {
         }
     }
 
+    /// TODO: Document flush_rollup_window_hourly_restores_previous_parquet_when_manifest_load_fails.
     #[test]
     fn flush_rollup_window_hourly_restores_previous_parquet_when_manifest_load_fails() {
         let tmp = TempDir::new().unwrap();

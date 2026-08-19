@@ -145,6 +145,7 @@ fn load_or_create_refuses_to_overwrite_corrupt_keys_json() {
         "failed initialization must preserve the malformed file for recovery and diagnosis"
     );
 }
+/// TODO: Document load_or_create_rotates_admin_hash_when_admin_key_changes.
 #[test]
 fn load_or_create_rotates_admin_hash_when_admin_key_changes() {
     let temp_dir = TempDir::new().unwrap();
@@ -220,6 +221,7 @@ fn load_or_create_refuses_to_overwrite_corrupt_key_material() {
     );
 }
 
+/// TODO: Document concurrent_runtime_admin_key_rotations_leave_persisted_key_authorized.
 #[test]
 fn concurrent_runtime_admin_key_rotations_leave_persisted_key_authorized() {
     let temp_dir = TempDir::new().unwrap();
@@ -296,6 +298,7 @@ fn runtime_admin_rotation_failure_preserves_old_memory_and_disk_credentials() {
         original_keys_json
     );
 }
+/// TODO: Document create_key_persists_restrict_sources_across_reload.
 #[test]
 fn create_key_persists_restrict_sources_across_reload() {
     let temp_dir = TempDir::new().unwrap();
@@ -320,6 +323,7 @@ fn create_key_persists_restrict_sources_across_reload() {
         "restrictSources must round-trip through keys.json persistence"
     );
 }
+/// TODO: Document load_or_create_defaults_missing_restrict_sources_to_none.
 #[test]
 fn load_or_create_defaults_missing_restrict_sources_to_none() {
     let temp_dir = TempDir::new().unwrap();

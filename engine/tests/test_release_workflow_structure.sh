@@ -55,6 +55,20 @@ assert_not_contains() {
   fi
 }
 
+assert_exact_count() {
+  local file_path="$1"
+  local pattern="$2"
+  local expected_count="$3"
+  local description="$4"
+  local actual_count
+  actual_count="$(grep -Ec "$pattern" "$file_path" || true)"
+  if [ "$actual_count" -eq "$expected_count" ]; then
+    pass "$description"
+  else
+    fail "$description (expected $expected_count, found $actual_count)"
+  fi
+}
+
 assert_file_executable() {
   local file_path="$1"
   local description="$2"
@@ -132,6 +146,20 @@ sys.exit(0 if sys.argv[2] in passthrough else 1)
 PY
 }
 
+assert_cross_passthrough_variable() {
+  local variable_name="$1"
+  local description="$2"
+  local passthrough_status=0
+  cross_passthrough_contains "$variable_name" || passthrough_status=$?
+  if [ "$passthrough_status" -eq 0 ]; then
+    pass "$description"
+  elif [ "$passthrough_status" -eq 2 ]; then
+    fail "$description (Cross.toml could not be read; see INDETERMINATE above)"
+  else
+    fail "$description"
+  fi
+}
+
 assert_cross_build_revision_passthrough() {
   if [ ! -f "$CROSS_TOML" ]; then
     fail "engine/Cross.toml owns the cross container build-identity passthrough"
@@ -142,18 +170,9 @@ assert_cross_build_revision_passthrough() {
   assert_file_absent "$ROOT_CROSS_TOML" \
     "Cross.toml is not misplaced at the repo root where the release build never reads it"
 
-  local passthrough_status=0
-  cross_passthrough_contains "FLAPJACK_BUILD_REVISION" || passthrough_status=$?
-  if [ "$passthrough_status" -eq 0 ]; then
-    pass "engine/Cross.toml [build.env] passthrough delivers FLAPJACK_BUILD_REVISION into the container build"
-  elif [ "$passthrough_status" -eq 2 ]; then
-    # Indeterminate is still a failure — an unverified contract has not been verified —
-    # but it must not be reported as the contract being broken. The stderr line above
-    # names the real cause.
-    fail "engine/Cross.toml [build.env] passthrough COULD NOT BE READ (see INDETERMINATE above); this is a probe failure, not proof the passthrough is missing"
-  else
-    fail "engine/Cross.toml [build.env] passthrough delivers FLAPJACK_BUILD_REVISION into the container build"
-  fi
+  assert_cross_passthrough_variable \
+    "FLAPJACK_BUILD_REVISION" \
+    "engine/Cross.toml [build.env] passthrough delivers FLAPJACK_BUILD_REVISION into the container build"
 
   if cross_passthrough_contains "FLAPJACK_INTERNAL_BUILD_REVISION"; then
     fail "engine/Cross.toml passthrough must not carry the build.rs-emitted internal revision name"
@@ -297,6 +316,7 @@ expected_build = {
     "features": ["vector-search"],
     "capabilities": {"vectorSearch": True, "vectorSearchLocal": False},
 }
+
 expected_artifact = {
     "file": archive_path.name,
     "target": "x86_64-unknown-linux-gnu",
@@ -325,6 +345,28 @@ PY
   fi
 
   rm -rf "$tmp_dir"
+}
+
+assert_linux_release_matrix_advertises_vector_search() {
+  local counts
+  counts="$(awk '
+    /- target: .*linux-musl/ {
+      linux_rows += 1
+      in_linux_row = 1
+      next
+    }
+    in_linux_row && /features:/ {
+      if ($2 == "\"vector-search\"") vector_rows += 1
+      in_linux_row = 0
+    }
+    END { printf "%d %d", linux_rows, vector_rows }
+  ' "$RELEASE_WORKFLOW")"
+
+  if [ "$counts" = "2 2" ]; then
+    pass "both canonical Linux release artifacts compile vector-search"
+  else
+    fail "both canonical Linux release artifacts compile vector-search (linux/vector rows: $counts)"
+  fi
 }
 
 section "Release workflow sequencing"
@@ -421,10 +463,16 @@ assert_job_contains "release_ci_status_preflight" '"\$\{\{ github\.repository \}
 assert_job_needs "release" "release_ci_status_preflight" "the public tag and GitHub Release wait for terminal push CI status"
 
 section "Release build identity packaging"
+assert_linux_release_matrix_advertises_vector_search
 assert_contains "$HTTP_MANIFEST" 'utoipa-swagger-ui = \{ version = "8\.0", features = \["axum", "vendored"\] \}' "release builds vendor Swagger UI instead of downloading it during compilation"
 assert_contains "$RELEASE_WORKFLOW" "github\\.sha.*\\^\\[0-9a-f\\]\\{40\\}\\$|\\^\\[0-9a-f\\]\\{40\\}\\$.*github\\.sha" "release.yml verifies github.sha is exactly 40 lowercase hex characters"
 assert_contains "$RELEASE_WORKFLOW" "FLAPJACK_BUILD_REVISION: \\$\\{\\{ github\\.sha \\}\\}" "release.yml exports github.sha as FLAPJACK_BUILD_REVISION for release builds"
 assert_cross_build_revision_passthrough
+assert_job_contains "build" '^      FLAPJACK_REQUIRE_DASHBOARD: "1"$' "the build job owns the fail-closed dashboard requirement for every matrix lane"
+assert_exact_count "$RELEASE_WORKFLOW" '^\s*FLAPJACK_REQUIRE_DASHBOARD:\s*"1"\s*$' 1 "release.yml declares the build-job dashboard requirement exactly once"
+assert_cross_passthrough_variable \
+  "FLAPJACK_REQUIRE_DASHBOARD" \
+  "engine/Cross.toml delivers the dashboard asset requirement into cross release builds"
 assert_contains "$RELEASE_WORKFLOW" "package/release_artifact_manifest \\$\\{\\{ matrix\\.target \\}\\} target/\\$\\{\\{ matrix\\.target \\}\\}/release/flapjack " "unix packaging calls the shared release_artifact_manifest helper"
 assert_contains "$RELEASE_WORKFLOW" "package/release_artifact_manifest \\$\\{\\{ matrix\\.target \\}\\} target/\\$\\{\\{ matrix\\.target \\}\\}/release/flapjack\\.exe " "windows packaging calls the shared release_artifact_manifest helper"
 assert_contains "$RELEASE_WORKFLOW" "flapjack-\\*\\.manifest\\.json" "release.yml uploads and publishes manifest JSON assets"

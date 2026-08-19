@@ -1,3 +1,4 @@
+//! Stub summary for manifest.rs.
 use super::schema::rollup_schema_version_u32;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
@@ -55,6 +56,7 @@ impl RollupManifest {
         }
     }
 
+    /// TODO: Document RollupManifest.load.
     pub fn load(path: &Path) -> io::Result<Self> {
         match fs::read_to_string(path) {
             Ok(content) => serde_json::from_str(&content)
@@ -120,6 +122,7 @@ impl RollupManifest {
         "raw"
     }
 
+    /// TODO: Document RollupManifest.derived_date_state.
     fn derived_date_state(&self, date: &str, tier: &str, date_state: &DateState) -> (bool, i64) {
         match tier {
             "1hour" => {
@@ -247,6 +250,7 @@ impl RollupManifest {
         date_state.complete = has_canonical_hourly_coverage(date, &date_state.windows);
     }
 
+    /// TODO: Document RollupManifest.recompute_daily_date_state.
     fn recompute_daily_date_state(&mut self, date: &str) {
         let hourly_snapshot = self
             .tiers
@@ -317,6 +321,7 @@ mod tests {
     use super::*;
     use crate::analytics::schema::rollup_schema_version_u32;
 
+    /// TODO: Document sample_manifest.
     fn sample_manifest() -> RollupManifest {
         let mut m = RollupManifest::new("products");
         let day_start = parse_utc_date_start_ms("2026-04-10").unwrap();
@@ -369,6 +374,7 @@ mod tests {
 
     // ── Round-trip persistence ──────────────────────────────────────────
 
+    /// TODO: Document round_trip_save_load.
     #[test]
     fn round_trip_save_load() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -597,6 +603,7 @@ mod tests {
         assert_eq!(m.best_tier_for_date("2026-04-10"), "raw");
     }
 
+    /// TODO: Document best_tier_returns_1day_over_1hour.
     #[test]
     fn best_tier_returns_1day_over_1hour() {
         let mut m = sample_manifest();
@@ -628,6 +635,7 @@ mod tests {
         assert_eq!(m.best_tier_for_date("2026-04-10"), "1hour");
     }
 
+    /// TODO: Document best_tier_skips_uncertified_rollup_tiers.
     #[test]
     fn best_tier_skips_uncertified_rollup_tiers() {
         let mut m = sample_manifest();
@@ -655,6 +663,7 @@ mod tests {
         assert_eq!(m.best_tier_for_date("2026-04-10"), "1hour");
     }
 
+    /// TODO: Document best_tier_returns_5min_when_no_higher.
     #[test]
     fn best_tier_returns_5min_when_no_higher() {
         let mut m = RollupManifest::new("idx");
@@ -679,6 +688,7 @@ mod tests {
         assert_eq!(m.best_tier_for_date("2026-04-10"), "5min");
     }
 
+    /// TODO: Document best_tier_skips_incomplete_higher_tier.
     #[test]
     fn best_tier_skips_incomplete_higher_tier() {
         let mut m = sample_manifest();
@@ -704,6 +714,7 @@ mod tests {
         assert_eq!(m.best_tier_for_date("2026-04-10"), "1hour");
     }
 
+    /// TODO: Document best_tier_skips_closed_tier_when_date_marked_incomplete.
     #[test]
     fn best_tier_skips_closed_tier_when_date_marked_incomplete() {
         let mut m = sample_manifest();
@@ -729,6 +740,7 @@ mod tests {
         assert_eq!(m.best_tier_for_date("2026-04-10"), "1day");
     }
 
+    /// TODO: Document record_window_single_hourly_window_does_not_mark_day_complete.
     #[test]
     fn record_window_single_hourly_window_does_not_mark_day_complete() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -750,6 +762,7 @@ mod tests {
         assert_eq!(m.best_tier_for_date("2025-06-15"), "raw");
     }
 
+    /// TODO: Document daily_certification_requires_canonical_closed_hourly_coverage.
     #[test]
     fn daily_certification_requires_canonical_closed_hourly_coverage() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -774,6 +787,7 @@ mod tests {
         assert_eq!(m.best_tier_for_date("2025-06-15"), "raw");
     }
 
+    /// TODO: Document load_rejects_stale_complete_and_total_bits_for_partial_hourly_date.
     #[test]
     fn load_rejects_stale_complete_and_total_bits_for_partial_hourly_date() {
         let dir = tempfile::TempDir::new().unwrap();

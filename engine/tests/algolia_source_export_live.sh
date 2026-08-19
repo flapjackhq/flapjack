@@ -79,6 +79,7 @@ load_credentials() {
   rm -f "$loader_output"
 }
 
+# TODO: Document init_run.
 init_run() {
   require_tool curl
   require_tool jq
@@ -167,6 +168,7 @@ algolia_base() {
 http_body() { sed '$d'; }
 http_code() { tail -1; }
 
+# TODO: Document algolia_request.
 algolia_request() {
   local mode="$1" method="$2" path="$3" key="$4" body="${5:-}"
   local base
@@ -408,6 +410,7 @@ start_server() {
   record_check "local_server" "pass" "started ${label} launcher=${SERVER_LAUNCH_PID} serving=${SERVER_SERVING_PID} port=${SERVER_PORT}"
 }
 
+# TODO: Document make_fixture_files.
 make_fixture_files() {
   python3 - "$WORK_DIR" "$RUN_PREFIX" <<'PY'
 import json, os, sys
@@ -508,6 +511,7 @@ create_key() {
   printf '%s\n' "$key"
 }
 
+# TODO: Document seed_index.
 seed_index() {
   local index="$1" documents_file="$2"
   record_index "$index"
@@ -547,6 +551,7 @@ seed_rules_synonyms() {
   [ -n "$task" ] && wait_task "$index" "$task"
 }
 
+# TODO: Document setup_vendor.
 setup_vendor() {
   make_fixture_files
   local source_index="${RUN_PREFIX}_source"
@@ -574,6 +579,7 @@ setup_vendor() {
   record_check "vendor_setup" "pass" "created prefixed resources"
 }
 
+# TODO: Document collect_paginated_ids.
 collect_paginated_ids() {
   local resource="$1" index="$2" out="$3" page_size="${4:-1}"
   local page=0 ids_file response code payload nb_pages path body encoded request_status
@@ -637,6 +643,7 @@ collect_paginated_ids_or_die() {
   esac
 }
 
+# TODO: Document verify_vendor_pagination.
 verify_vendor_pagination() {
   local source_index="${RUN_PREFIX}_source"
   local index_ids="$LOG_DIR/index-page-ids.json"
@@ -669,6 +676,7 @@ assert_no_destination_index() {
     || die "Flapjack index membership changed during source-only export"
 }
 
+# TODO: Document inspect_spool.
 inspect_spool() {
   local expected="$WORK_DIR/expected.json"
   python3 - "$DATA_DIR" "$expected" <<'PY'
@@ -759,6 +767,7 @@ release_drift_export_barrier() {
   : >"$DRIFT_BARRIER_RELEASE_FILE"
 }
 
+# TODO: Document run_permitted_and_denied_migrations.
 run_permitted_and_denied_migrations() {
   local source_index="${RUN_PREFIX}_source"
   local permitted denied before after body response code payload summary
@@ -792,6 +801,7 @@ run_permitted_and_denied_migrations() {
   record_check "migration_acl_and_spool" "pass" "$summary"
 }
 
+# TODO: Document run_drift_refusal.
 run_drift_refusal() {
   local drift_index="${RUN_PREFIX}_drift" permitted body curl_out curl_pid barrier_path drift_job_dir mutation_payload mutation_out response code payload
   permitted="$(cat "$WORK_DIR/permitted.key")"
@@ -1024,6 +1034,7 @@ run_mig5_async_and_ha_refusals() {
   record_check "mig5_ha_refusals" "pass" "peer_count=1; overwrite true HTTP 400; overwrite false HTTP 503 migration_ha_unsupported"
 }
 
+# TODO: Document cleanup_vendor.
 cleanup_vendor() {
   [ -n "$WORK_DIR" ] || return 0
   local key index fp remaining response code payload task
@@ -1075,6 +1086,7 @@ cleanup_vendor() {
   fi
 }
 
+# TODO: Document preserve_run_evidence.
 preserve_run_evidence() {
   local announce="${1:-1}"
   if [ -z "$EVIDENCE_DIR" ]; then
@@ -1141,6 +1153,7 @@ stop_server() {
   SERVER_PID=""
 }
 
+# TODO: Document cleanup.
 cleanup() {
   local script_exit_code=$?
   local effective_exit_code="$script_exit_code"
@@ -1180,6 +1193,7 @@ cleanup() {
   exit "$effective_exit_code"
 }
 
+# TODO: Document main.
 main() {
   parse_args "$@"
   load_credentials

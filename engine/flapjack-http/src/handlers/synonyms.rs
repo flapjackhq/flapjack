@@ -1,3 +1,4 @@
+//! Stub summary for synonyms.rs.
 use axum::{
     extract::{Path, Query, State},
     Json,

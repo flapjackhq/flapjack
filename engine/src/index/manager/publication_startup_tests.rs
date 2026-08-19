@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/manager/publication_startup_tests.rs.
 use super::*;
 use crate::index::manager::publication::{
     PublicationScanAction, PublicationTarget, PublicationTargetDisposition,
@@ -5,6 +6,7 @@ use crate::index::manager::publication::{
 };
 use tempfile::TempDir;
 
+/// TODO: Document startup_repair_unloads_only_publication_targets_and_reports_fail_closed_disposition.
 #[tokio::test]
 async fn startup_repair_unloads_only_publication_targets_and_reports_fail_closed_disposition() {
     let temp = TempDir::new().unwrap();
@@ -32,6 +34,7 @@ async fn startup_repair_unloads_only_publication_targets_and_reports_fail_closed
     assert!(manager.loaded.contains_key("unrelated"));
 }
 
+/// TODO: Document clean_target_repair_preserves_runtime_state_without_publication_evidence.
 #[tokio::test]
 async fn clean_target_repair_preserves_runtime_state_without_publication_evidence() {
     let temp = TempDir::new().unwrap();
@@ -59,6 +62,7 @@ async fn clean_target_repair_preserves_runtime_state_without_publication_evidenc
     assert!(manager.facet_cache.contains_key(&facet_cache_key));
 }
 
+/// TODO: Document quarantined_repair_without_live_byte_mutation_preserves_runtime_state.
 #[tokio::test]
 async fn quarantined_repair_without_live_byte_mutation_preserves_runtime_state() {
     let temp = TempDir::new().unwrap();

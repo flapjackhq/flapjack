@@ -83,6 +83,7 @@ parse_write_failure_row() {
   sed -E 's/^.*:[[:space:]]*([0-9]+\.[0-9]+)%[[:space:]]+([0-9]+)[[:space:]]+out of[[:space:]]+([0-9]+).*/\1\t\2\t\3/' <<<"$write_row"
 }
 
+# TODO: Document parse_write_check_rate.
 parse_write_check_rate() {
   local stdout_path="$1"
   local check_name="$2"
@@ -137,6 +138,7 @@ assert_comparison_verdict_passes() {
   [[ "$COMPARISON_VERDICT" == "$VERDICT_TUNABLE_VERIFIED" ]] || fail "tuned/baseline successful_writes uplift ratio ${COMPARISON_UPLIFT_RATIO} is below required ${MIN_TUNED_BASELINE_UPLIFT_RATIO} (${VERDICT_TUNABLE_INSUFFICIENT})"
 }
 
+# TODO: Document run_with_timeout.
 run_with_timeout() {
   local timeout_seconds="$1"
   shift
@@ -180,6 +182,7 @@ run_mixed_soak_with_artifacts() {
     run_loadtest_scenario_with_artifacts "$LOADTEST_DIR" "mixed-soak" "" "$json_path" "$stdout_path"
 }
 
+# TODO: Document write_case_summary_json.
 write_case_summary_json() {
   local case_name="$1"
   local case_dir="$2"
@@ -251,6 +254,7 @@ JSON
   LAST_CASE_SUMMARY_PATH="$summary_path"
 }
 
+# TODO: Document start_case_server.
 start_case_server() {
   local case_name="$1"
   local batch_size_override="$2"
@@ -269,6 +273,7 @@ start_case_server() {
   wait_for_loadtest_health "$FLAPJACK_BASE_URL" "$SERVER_PID" "300" "0.1" "$case_log_path" "$FLAPJACK_BIND_ADDR"
 }
 
+# TODO: Document run_case.
 run_case() {
   local case_name="$1"
   local batch_size_override="$2"
@@ -309,6 +314,7 @@ assert_contract_preserved() {
   [[ "$write_unexpected_4xx" == "0" || "$write_unexpected_4xx" == "0.00" ]] || fail "contract breach: write_http_unexpected_4xx_rate must be 0.00, got $write_unexpected_4xx"
 }
 
+# TODO: Document compute_stage3_comparison.
 compute_stage3_comparison() {
   local baseline_summary="$1"
   local tuned_summary="$2"
@@ -338,6 +344,7 @@ evaluate_and_persist_stage3_comparison() {
   assert_comparison_verdict_passes
 }
 
+# TODO: Document write_combined_summary.
 write_combined_summary() {
   local baseline_summary="$1"
   local tuned_summary="$2"
@@ -384,6 +391,7 @@ write_combined_tsv() {
   } >"$tsv_path"
 }
 
+# TODO: Document assert_selftest_summary_matches_contract.
 assert_selftest_summary_matches_contract() {
   local summary_path="$1"
   local verdict
@@ -419,6 +427,7 @@ assert_selftest_fixture_discriminates_non_ratio_rules() {
   (( tuned_minus_baseline < 25000 )) || fail "selftest pass fixture must stay below absolute delta gate guardrail (25000), got ${tuned_minus_baseline}"
 }
 
+# TODO: Document assert_selftest_pass_fixture_persists_combined_tsv.
 assert_selftest_pass_fixture_persists_combined_tsv() {
   local tsv_path="$1"
   local expected_header
@@ -461,6 +470,7 @@ assert_selftest_pass_fixture_rejects_malformed_tsv() {
   mv "$malformed_tsv_path" "$tsv_assertion_path"
 }
 
+# TODO: Document assert_selftest_below_threshold_rejected.
 assert_selftest_below_threshold_rejected() {
   local baseline_summary="$1"
   local tuned_summary="$2"
@@ -508,6 +518,7 @@ assert_selftest_below_threshold_rejected() {
   grep -F "$VERDICT_TUNABLE_INSUFFICIENT" <<<"$comparison_output" >/dev/null || fail "selftest expected failure output to include verdict ${VERDICT_TUNABLE_INSUFFICIENT}"
 }
 
+# TODO: Document run_selftest_stage3_comparison.
 run_selftest_stage3_comparison() {
   local selftest_dir
   local baseline_summary
@@ -592,6 +603,7 @@ JSON
   rm -rf "$selftest_dir"
 }
 
+# TODO: Document main.
 main() {
   if [[ "${PL10_ACCEPTANCE_SELFTEST:-0}" == "1" ]]; then
     run_selftest_stage3_comparison

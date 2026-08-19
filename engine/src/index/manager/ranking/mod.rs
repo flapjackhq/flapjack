@@ -327,12 +327,12 @@ pub(super) fn sort_results_with_stage2_ranking(
 
     let default_ordering = |a: &RankedDoc, b: &RankedDoc| {
         compare_builtin_ranking_criteria(a, b, &ranking_criteria, all_query_words_optional)
+            .then_with(|| compare_custom_values(&a.custom_values, &b.custom_values, &custom_specs))
             .then_with(|| {
                 b.tuned_score
                     .partial_cmp(&a.tuned_score)
                     .unwrap_or(Ordering::Equal)
             })
-            .then_with(|| compare_custom_values(&a.custom_values, &b.custom_values, &custom_specs))
             .then_with(|| a.doc_id.cmp(&b.doc_id))
     };
 

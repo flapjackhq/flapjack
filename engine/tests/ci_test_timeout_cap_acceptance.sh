@@ -38,6 +38,7 @@ assert_contains() {
   fi
 }
 
+# TODO: Document emit_binding_signals.
 emit_binding_signals() {
   printf '__BINDING_SIGNAL__job_block_unique=%s\n' "$1"
   printf '__BINDING_SIGNAL__canonical_prebuild_present=%s\n' "$2"
@@ -45,6 +46,7 @@ emit_binding_signals() {
   printf '__BINDING_SIGNAL__prebuild_before_capped=%s\n' "$4"
 }
 
+# TODO: Document read_numeric_signal.
 read_numeric_signal() {
   local signal_output="$1"
   local signal_name="$2"
@@ -58,6 +60,7 @@ read_numeric_signal() {
   '
 }
 
+# TODO: Document read_named_signal.
 read_named_signal() {
   local signal_output="$1"
   local signal_name="$2"
@@ -71,6 +74,7 @@ read_named_signal() {
   '
 }
 
+# TODO: Document extract_matching_step_block.
 extract_matching_step_block() {
   local file_path="$1"
   local step_name="$2"
@@ -169,6 +173,7 @@ extract_matching_step_block() {
   ' "$file_path"
 }
 
+# TODO: Document extract_matching_job_block.
 extract_matching_job_block() {
   local file_path="$1"
   local job_key="$2"
@@ -212,6 +217,7 @@ extract_matching_job_block() {
   ' "$file_path"
 }
 
+# TODO: Document assert_capped_vector_job_prebuild_binding.
 assert_capped_vector_job_prebuild_binding() {
   local workflow_file="$1"
   local workflow_label="$2"
@@ -308,6 +314,7 @@ assert_capped_vector_job_prebuild_binding() {
   rm -f "$job_block_file" "$sanitized_job_block" "$prebuild_block_file" "$capped_block_file"
 }
 
+# TODO: Document assert_duplicate_step_name_regression_fixture.
 assert_duplicate_step_name_regression_fixture() {
   local fixture_file
   fixture_file="$(mktemp)"
@@ -360,6 +367,7 @@ YAML
   rm -f "$fixture_file"
 }
 
+# TODO: Document assert_duplicate_step_fixture_guards_wrong_failure_mode.
 assert_duplicate_step_fixture_guards_wrong_failure_mode() {
   local original_binding_function
   original_binding_function="$(declare -f assert_capped_vector_job_prebuild_binding)"
@@ -384,6 +392,7 @@ assert_duplicate_step_fixture_guards_wrong_failure_mode() {
   eval "$original_binding_function"
 }
 
+# TODO: Document assert_duplicate_step_fixture_ignores_helper_prose_changes.
 assert_duplicate_step_fixture_ignores_helper_prose_changes() {
   local original_binding_function
   original_binding_function="$(declare -f assert_capped_vector_job_prebuild_binding)"
@@ -412,6 +421,7 @@ assert_duplicate_step_fixture_ignores_helper_prose_changes() {
   eval "$original_binding_function"
 }
 
+# TODO: Document assert_step_contract.
 assert_step_contract() {
   local workflow_file="$1"
   local workflow_label="$2"
@@ -446,6 +456,7 @@ assert_step_contract() {
   rm -f "$block_file"
 }
 
+# TODO: Document assert_job_contains_pattern.
 assert_job_contains_pattern() {
   local workflow_file="$1"
   local workflow_label="$2"
@@ -475,6 +486,7 @@ assert_job_contains_pattern() {
   rm -f "$job_block_file"
 }
 
+# TODO: Document assert_named_step_order_in_job.
 assert_named_step_order_in_job() {
   local workflow_file="$1"
   local workflow_label="$2"
@@ -528,6 +540,14 @@ assert_job_contains_pattern "$CI_WORKFLOW" "ci.yml" "rust-tests-all" '^[[:space:
 assert_named_step_order_in_job "$CI_WORKFLOW" "ci.yml" "rust-tests-all" "Install cargo audit/deny tools for security audit tests" "All tests (vector-search)"
 assert_capped_vector_job_prebuild_binding "$CI_WORKFLOW" "ci.yml" "rust-tests-all" "All tests (vector-search)" "cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci --no-fail-fast"
 assert_step_contract "$NIGHTLY_WORKFLOW" "nightly.yml" "Run all tests" "cargo nextest run -P ci" "45"
+
+section "Playwright browser install timeout contract"
+assert_step_contract "$CI_WORKFLOW" "ci.yml" "Install console Playwright browser" "npx playwright install chromium" "5"
+assert_step_contract "$CI_WORKFLOW" "ci.yml" "Install dashboard page Playwright browser" "npx playwright install chromium" "5"
+assert_step_contract "$CI_WORKFLOW" "ci.yml" "Install dashboard full Playwright browser" "npx playwright install chromium" "5"
+assert_step_contract "$CI_WORKFLOW" "ci.yml" "Install dashboard integration Playwright browser" "npx playwright install chromium" "5"
+assert_step_contract "$CI_WORKFLOW" "ci.yml" "Install SDK Playwright browser" "npx playwright install chromium" "5"
+assert_step_contract "$NIGHTLY_WORKFLOW" "nightly.yml" "Install dashboard nightly Playwright browser" "npx playwright install chromium" "5"
 
 printf '\n\033[1mResults: %d/%d passed\033[0m\n' "$TESTS_PASSED" "$TESTS_RUN"
 if [ "$TESTS_FAILED" -gt 0 ]; then

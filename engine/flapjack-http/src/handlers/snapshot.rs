@@ -1,3 +1,4 @@
+//! Stub summary for snapshot.rs.
 use super::AppState;
 use crate::error_response::json_error;
 use crate::extractors::ValidatedIndexName;
@@ -588,6 +589,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document export_snapshot_missing_index_returns_json_without_router_error_wrapper.
     #[tokio::test]
     async fn export_snapshot_missing_index_returns_json_without_router_error_wrapper() {
         let tmp = TempDir::new().unwrap();
@@ -624,6 +626,7 @@ mod tests {
             })
         );
     }
+    /// TODO: Document import_snapshot_success_returns_json_without_router_error_wrapper.
     #[tokio::test]
     async fn import_snapshot_success_returns_json_without_router_error_wrapper() {
         flapjack::index::write_queue::clear_writer_lifecycle_test_events();
@@ -1011,6 +1014,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document import_snapshot_invalid_payload_returns_sanitized_500_message.
     #[tokio::test]
     async fn import_snapshot_invalid_payload_returns_sanitized_500_message() {
         let tmp = TempDir::new().unwrap();
@@ -1058,6 +1062,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document restore_key_override_rejects_cross_index_snapshot_keys.
     #[tokio::test]
     async fn restore_key_override_rejects_cross_index_snapshot_keys() {
         let response =
@@ -1071,6 +1076,7 @@ mod tests {
         .await;
     }
 
+    /// TODO: Document restore_key_override_accepts_requested_index_snapshot_keys.
     #[test]
     fn restore_key_override_accepts_requested_index_snapshot_keys() {
         assert!(validate_restore_key_override(

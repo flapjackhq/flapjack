@@ -98,6 +98,9 @@ export async function gotoIndexPage(page: Page, indexName: string): Promise<void
   await waitForSearchResultsOrEmptyState(page);
 }
 
+/**
+ * TODO: Document waitForOverviewIndexRow.
+ */
 export async function waitForOverviewIndexRow(page: Page, indexName: string): Promise<Locator> {
   const row = getOverviewIndexRow(page, indexName);
 

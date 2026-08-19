@@ -1,3 +1,4 @@
+//! Stub summary for settings.rs.
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -401,6 +402,7 @@ fn collect_index_document_ids(
     Ok(object_ids)
 }
 
+/// TODO: Document rebuild_documents_for_updated_faceting.
 async fn rebuild_documents_for_updated_faceting(
     state: &Arc<AppState>,
     index_name: &str,

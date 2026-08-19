@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/startup.rs.
 use axum::http::HeaderValue;
 use fs2::FileExt;
 use std::fs::OpenOptions;
@@ -130,6 +131,7 @@ fn normalized_env_mode(env_mode: &str) -> &str {
     }
 }
 
+/// TODO: Document validate_development_no_auth_bind.
 fn validate_development_no_auth_bind(
     no_auth: bool,
     resolved_bind_addr: &str,
@@ -179,6 +181,7 @@ fn is_hostname_socket_address(bind_addr: &str) -> bool {
         })
 }
 
+/// TODO: Document exit_for_startup_auth_validation_error.
 pub(crate) fn exit_for_startup_auth_validation_error(error: StartupAuthValidationError) -> ! {
     match error {
         StartupAuthValidationError::NoAuthInProduction => {
@@ -588,6 +591,7 @@ pub(crate) fn initialize_key_store(
     })
 }
 
+/// TODO: Document resolve_admin_key.
 fn resolve_admin_key(
     server_config: &ServerConfig,
     admin_key_file: &Path,
@@ -649,6 +653,7 @@ fn load_existing_admin_key(admin_key_file: &Path, data_dir: &str) -> String {
     }
 }
 
+/// TODO: Document shell_quote_argument.
 fn shell_quote_argument(value: &str) -> String {
     let is_shell_safe = !value.is_empty()
         && value.bytes().all(|byte| {
@@ -835,6 +840,7 @@ pub(crate) fn format_capabilities_line() -> String {
     )
 }
 
+/// TODO: Document print_new_key_banner.
 fn print_new_key_banner(key: &str, url: &str, data_dir: &str) {
     use colored::Colorize;
     let reset_admin_key_command = format_reset_admin_key_command(data_dir);

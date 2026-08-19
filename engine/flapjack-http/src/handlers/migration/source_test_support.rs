@@ -1,3 +1,5 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/source_test_support.rs.
+
 use super::algolia_client::{AlgoliaClientError, AlgoliaIndexRecord};
 use super::meilisearch_client::{
     MeilisearchClientError, MeilisearchErrorKind, MeilisearchSourceObservation,
@@ -297,6 +299,7 @@ impl ScriptedSourceReader {
         self.synonym_reads.push_back(synonyms);
     }
 
+    /// TODO: Document ScriptedSourceReader.push_document_pass_failing_after_page.
     pub(super) fn push_document_pass_failing_after_page(
         &mut self,
         settings: Value,

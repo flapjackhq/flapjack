@@ -259,6 +259,7 @@ init_report
 # JS SDK
 # ============================================================================
 
+# TODO: Document run_js.
 run_js() {
   local sdk="js"
   echo ""
@@ -323,6 +324,7 @@ run_js() {
 # Go SDK
 # ============================================================================
 
+# TODO: Document run_go.
 run_go() {
   local sdk="go"
   echo ""
@@ -406,6 +408,7 @@ run_go() {
 # Python SDK
 # ============================================================================
 
+# TODO: Document run_python.
 run_python() {
   local sdk="python"
   echo ""
@@ -475,6 +478,7 @@ run_python() {
 # Ruby SDK
 # ============================================================================
 
+# TODO: Document run_ruby.
 run_ruby() {
   local sdk="ruby"
   echo ""
@@ -541,6 +545,7 @@ run_ruby() {
 # PHP SDK
 # ============================================================================
 
+# TODO: Document run_php.
 run_php() {
   local sdk="php"
   echo ""
@@ -598,6 +603,7 @@ run_php() {
 # Java SDK
 # ============================================================================
 
+# TODO: Document run_java.
 run_java() {
   local sdk="java"
   echo ""
@@ -663,6 +669,7 @@ run_java() {
 # Swift SDK
 # ============================================================================
 
+# TODO: Document run_swift.
 run_swift() {
   local sdk="swift"
   echo ""

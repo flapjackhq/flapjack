@@ -107,6 +107,9 @@ function buildKeysPath(...segments: string[]): string {
 
 const RULES_SEARCH_PAGE_SIZE = 1000;
 
+/**
+ * TODO: Document readListItems.
+ */
 function readListItems(body: unknown): unknown[] {
   if (Array.isArray(body)) {
     return body;
@@ -815,6 +818,9 @@ function readNumber(value: unknown, fallback = 0): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
+/**
+ * TODO: Document normalizeInterleaving.
+ */
 function normalizeInterleaving(
   value: unknown,
 ): ExperimentResultsInterleaving | null {
@@ -833,6 +839,9 @@ function normalizeInterleaving(
   };
 }
 
+/**
+ * TODO: Document normalizeExperimentResults.
+ */
 function normalizeExperimentResults(
   value: unknown,
 ): ExperimentResultsRecord {
@@ -914,6 +923,9 @@ async function fetchExperimentListPage(
   return normalizeExperimentListPage(await res.json());
 }
 
+/**
+ * TODO: Document postExperimentLifecycleAction.
+ */
 async function postExperimentLifecycleAction(
   request: APIRequestContext,
   experimentId: string,

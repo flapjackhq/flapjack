@@ -1,3 +1,5 @@
+//! Stub summary for security.rs.
+
 /// Whether the operator has explicitly opted in to loopback / private
 /// outbound destinations.
 ///
@@ -185,6 +187,7 @@ pub fn first_blocked_outbound_host_ip(
     first_blocked_outbound_ip(&resolve_outbound_host_ips(host, port)?, allow_local)
 }
 
+/// TODO: Document resolve_outbound_host_ips.
 fn resolve_outbound_host_ips(host: &str, port: Option<u16>) -> Option<Vec<std::net::IpAddr>> {
     use std::net::ToSocketAddrs;
 

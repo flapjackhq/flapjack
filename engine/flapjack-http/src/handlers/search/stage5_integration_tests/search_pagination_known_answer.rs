@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/search/stage5_integration_tests/search_pagination_known_answer.rs.
 use super::*;
 use crate::handlers::AppState;
 use crate::test_helpers::body_json;
@@ -99,6 +100,7 @@ fn assert_no_hit_id_overlap(left: &Value, right: &Value) {
     );
 }
 
+/// TODO: Document search_pagination_known_answer_simple_search_uses_total_hits.
 #[tokio::test]
 async fn search_pagination_known_answer_simple_search_uses_total_hits() {
     let tmp = TempDir::new().unwrap();
@@ -137,6 +139,7 @@ async fn search_pagination_known_answer_simple_search_uses_total_hits() {
     assert_no_hit_id_overlap(&page_0, &page_2);
 }
 
+/// TODO: Document search_pagination_known_answer_distinct_uses_current_group_total_contract.
 #[tokio::test]
 async fn search_pagination_known_answer_distinct_uses_current_group_total_contract() {
     let tmp = TempDir::new().unwrap();
@@ -175,6 +178,7 @@ async fn search_pagination_known_answer_distinct_uses_current_group_total_contra
     assert_eq!(hit_len(&page_2), 0);
 }
 
+/// TODO: Document search_pagination_known_answer_faceted_query_keeps_total_hits.
 #[tokio::test]
 async fn search_pagination_known_answer_faceted_query_keeps_total_hits() {
     let tmp = TempDir::new().unwrap();
@@ -215,6 +219,7 @@ async fn search_pagination_known_answer_faceted_query_keeps_total_hits() {
     assert_eq!(page_2["facets"]["category"]["odd"].as_u64(), Some(12));
 }
 
+/// TODO: Document search_pagination_known_answer_empty_query_browse_uses_total_hits.
 #[tokio::test]
 async fn search_pagination_known_answer_empty_query_browse_uses_total_hits() {
     let tmp = TempDir::new().unwrap();
@@ -252,6 +257,7 @@ async fn search_pagination_known_answer_empty_query_browse_uses_total_hits() {
     assert_eq!(hit_len(&page_2), 5);
 }
 
+/// TODO: Document search_pagination_known_answer_sorted_query_keeps_sorted_total_hits.
 #[tokio::test]
 async fn search_pagination_known_answer_sorted_query_keeps_sorted_total_hits() {
     let tmp = TempDir::new().unwrap();

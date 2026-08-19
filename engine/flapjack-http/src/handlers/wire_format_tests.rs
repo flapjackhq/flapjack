@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/wire_format_tests.rs.
 /// Stage 2: SDK Wire Format Verification Tests
 ///
 /// These are confirmation/regression-lock tests for protocol-level behavior that is
@@ -33,6 +34,7 @@ mod tests {
     // Test infrastructure
     // ──────────────────────────────────────────────────────────────────────────
 
+    /// TODO: Document full_stack_router.
     fn full_stack_router(
         state: Arc<AppState>,
         key_store: Arc<KeyStore>,

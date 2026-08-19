@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/health.rs.
 use axum::{
     extract::{Extension, State},
     Json,
@@ -120,6 +121,7 @@ mod tests {
             .with_state(state)
     }
 
+    /// TODO: Document health_omits_sensitive_build_fingerprint_fields.
     #[tokio::test]
     async fn health_omits_sensitive_build_fingerprint_fields() {
         let tmp = TempDir::new().unwrap();
@@ -158,6 +160,7 @@ mod tests {
         }
     }
 
+    /// TODO: Document request_health_json.
     async fn request_health_json(state: Arc<AppState>) -> serde_json::Value {
         let response = test_router(state)
             .oneshot(

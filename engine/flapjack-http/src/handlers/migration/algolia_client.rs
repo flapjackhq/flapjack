@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/algolia_client.rs.
 use serde_json::Value;
 use std::collections::HashSet;
 use std::future::Future;
@@ -388,6 +389,7 @@ impl AlgoliaClient {
         .await
     }
 
+    /// TODO: Document AlgoliaClient.wait_for_quiescent_source.
     pub(super) async fn wait_for_quiescent_source(
         &self,
     ) -> Result<AlgoliaIndexRecord, AlgoliaClientError> {
@@ -405,6 +407,7 @@ impl AlgoliaClient {
         .await
     }
 
+    /// TODO: Document AlgoliaClient.paginated_hits.
     pub(super) async fn paginated_hits<F, E>(
         &self,
         endpoint: &str,
@@ -427,6 +430,7 @@ impl AlgoliaClient {
         .await
     }
 
+    /// TODO: Document AlgoliaClient.browse_documents.
     pub(super) async fn browse_documents<F, E>(&self, consume_page: F) -> Result<(), BrowseError<E>>
     where
         F: FnMut(Vec<Value>) -> Result<(), E>,
@@ -662,6 +666,7 @@ struct ReqwestTransport<'a> {
 }
 
 impl AlgoliaTransport for ReqwestTransport<'_> {
+    /// TODO: Document ReqwestTransport.send.
     fn send<'a>(
         &'a mut self,
         request: PlannedRequest,
@@ -691,6 +696,7 @@ impl AlgoliaTransport for ReqwestTransport<'_> {
     }
 }
 
+/// TODO: Document read_capped_response_body.
 async fn read_capped_response_body(
     mut response: reqwest::Response,
     max_response_bytes: usize,
@@ -847,6 +853,7 @@ fn key_path(api_key: &str) -> String {
     format!("/1/keys/{}", urlencoding::encode(api_key))
 }
 
+/// TODO: Document plan_request.
 fn plan_request(
     app_id: &str,
     api_key: &str,
@@ -865,6 +872,7 @@ fn plan_request(
     )
 }
 
+/// TODO: Document plan_control_request.
 fn plan_control_request(
     app_id: &str,
     api_key: &str,
@@ -883,6 +891,7 @@ fn plan_control_request(
     )
 }
 
+/// TODO: Document plan_request_with_response_limit.
 fn plan_request_with_response_limit(
     app_id: &str,
     api_key: &str,
@@ -902,6 +911,7 @@ fn plan_request_with_response_limit(
     )
 }
 
+/// TODO: Document plan_control_request_with_response_limit.
 fn plan_control_request_with_response_limit(
     app_id: &str,
     api_key: &str,
@@ -921,6 +931,7 @@ fn plan_control_request_with_response_limit(
     )
 }
 
+/// TODO: Document plan_request_with_host_and_response_limit.
 fn plan_request_with_host_and_response_limit(
     app_id: &str,
     api_key: &str,
@@ -977,6 +988,7 @@ fn plan_request_with_host_and_response_limit(
     })
 }
 
+/// TODO: Document execute_json_with_retry.
 async fn execute_json_with_retry<T: AlgoliaTransport>(
     transport: &mut T,
     request: PlannedRequest,
@@ -1007,6 +1019,7 @@ async fn execute_json_with_retry<T: AlgoliaTransport>(
     }))
 }
 
+/// TODO: Document execute_json_once.
 async fn execute_json_once<T: AlgoliaTransport>(
     transport: &mut T,
     request: PlannedRequest,
@@ -1066,6 +1079,7 @@ fn response_byte_limit_error() -> AlgoliaClientError {
     )
 }
 
+/// TODO: Document list_indexes_with_transport.
 async fn list_indexes_with_transport<T: AlgoliaTransport>(
     transport: &mut T,
     app_id: &str,
@@ -1105,6 +1119,7 @@ async fn list_indexes_for_quiescence_with_transport<T: AlgoliaTransport>(
     .await
 }
 
+/// TODO: Document list_indexes_with_transport_policy.
 async fn list_indexes_with_transport_policy<T: AlgoliaTransport>(
     transport: &mut T,
     app_id: &str,
@@ -1157,6 +1172,7 @@ async fn list_indexes_with_transport_policy<T: AlgoliaTransport>(
     }
 }
 
+/// TODO: Document key_allows_unretrievable_with_transport.
 async fn key_allows_unretrievable_with_transport<T: AlgoliaTransport>(
     transport: &mut T,
     app_id: &str,
@@ -1177,6 +1193,7 @@ async fn key_allows_unretrievable_with_transport<T: AlgoliaTransport>(
         .any(acl_allows_unretrievable))
 }
 
+/// TODO: Document require_unretrievable_access_with_transport.
 async fn require_unretrievable_access_with_transport<T: AlgoliaTransport>(
     transport: &mut T,
     app_id: &str,
@@ -1206,6 +1223,7 @@ fn acl_allows_unretrievable(acl: &str) -> bool {
     matches!(acl, "admin" | "seeUnretrievableAttributes")
 }
 
+/// TODO: Document wait_for_quiescent_source_with_transport.
 async fn wait_for_quiescent_source_with_transport<T, S, SleepFuture>(
     transport: &mut T,
     app_id: &str,
@@ -1236,6 +1254,7 @@ where
     ))
 }
 
+/// TODO: Document selected_index_record.
 fn selected_index_record(
     indexes: &[AlgoliaIndexRecord],
     source_index: &str,
@@ -1259,6 +1278,7 @@ fn selected_index_record(
     Ok(selected)
 }
 
+/// TODO: Document parse_index_list_page.
 fn parse_index_list_page(
     value: &Value,
     expected_page: usize,
@@ -1352,6 +1372,7 @@ fn parse_pending_task(
     }
 }
 
+/// TODO: Document paginated_hits_with_transport.
 async fn paginated_hits_with_transport<Transport, F, E>(
     transport: &mut Transport,
     app_id: &str,
@@ -1376,6 +1397,7 @@ where
     .await
 }
 
+/// TODO: Document paginated_hits_with_transport_and_limits.
 async fn paginated_hits_with_transport_and_limits<Transport, F, E>(
     transport: &mut Transport,
     app_id: &str,
@@ -1425,6 +1447,7 @@ where
     }
 }
 
+/// TODO: Document parse_raw_hits_page.
 fn parse_raw_hits_page(
     value: &Value,
     expected_page: usize,
@@ -1486,6 +1509,7 @@ fn reject_nonempty_zero_nb_pages(
     }
 }
 
+/// TODO: Document browse_documents_with_transport.
 async fn browse_documents_with_transport<T, F, E>(
     transport: &mut T,
     app_id: &str,
@@ -1508,6 +1532,7 @@ where
     .await
 }
 
+/// TODO: Document browse_documents_with_transport_and_limits.
 async fn browse_documents_with_transport_and_limits<T, F, E>(
     transport: &mut T,
     app_id: &str,
@@ -1614,6 +1639,7 @@ fn parse_browse_cursor(response: &Value) -> Result<Option<String>, AlgoliaClient
         .transpose()
 }
 
+/// TODO: Document parse_raw_hits.
 fn parse_raw_hits(
     hits: &[Value],
     seen_object_ids: &mut HashSet<String>,

@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/objects/mod.rs.
 mod batch;
 
 use axum::{
@@ -290,6 +291,8 @@ pub async fn add_documents(
 ) -> Result<axum::response::Response, FlapjackError> {
     use crate::idempotency::{IdempotencyRecord, BATCH_INDEX_WILDCARD, IDEMPOTENCY_HEADER};
 
+    validate_object_idempotency_targets(&index_name, &req)?;
+
     let index_segment = if index_name == BATCH_INDEX_WILDCARD {
         BATCH_INDEX_WILDCARD
     } else {
@@ -349,6 +352,28 @@ pub async fn add_documents(
     Ok(Json(response).into_response())
 }
 
+fn validate_object_idempotency_targets(
+    index_name: &str,
+    request: &serde_json::Value,
+) -> Result<(), FlapjackError> {
+    if index_name != crate::idempotency::BATCH_INDEX_WILDCARD {
+        return flapjack::validate_index_name(index_name);
+    }
+
+    if let Ok(AddDocumentsRequest::Batch { requests }) =
+        serde_json::from_value::<AddDocumentsRequest>(request.clone())
+    {
+        for target in requests
+            .iter()
+            .filter_map(|operation| operation.index_name.as_deref())
+        {
+            flapjack::validate_index_name(target)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Failure outcome of the add-documents pipeline.
 ///
 /// Distinguishes a request rejected before it was ever enqueued (no task exists)
@@ -376,6 +401,7 @@ impl AddDocumentsError {
 }
 
 impl axum::response::IntoResponse for AddDocumentsError {
+    /// TODO: Document AddDocumentsError.into_response.
     fn into_response(self) -> axum::response::Response {
         match self {
             AddDocumentsError::Rejected(err) => err.into_response(),
@@ -409,6 +435,7 @@ impl axum::response::IntoResponse for AddDocumentsError {
     }
 }
 
+/// TODO: Document run_add_documents.
 async fn run_add_documents(
     state: &Arc<AppState>,
     index_name: &str,
@@ -924,6 +951,8 @@ pub async fn add_record_auto_id(
     Json(mut body): Json<serde_json::Map<String, serde_json::Value>>,
 ) -> Result<axum::response::Response, FlapjackError> {
     use crate::idempotency::{IdempotencyRecord, IDEMPOTENCY_HEADER};
+
+    flapjack::validate_index_name(&index_name)?;
 
     let idem_key = headers
         .get(IDEMPOTENCY_HEADER)

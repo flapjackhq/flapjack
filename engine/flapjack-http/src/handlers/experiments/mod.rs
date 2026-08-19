@@ -1,3 +1,4 @@
+//! Stub summary for mod.rs.
 #[cfg(test)]
 use axum::http::StatusCode;
 use axum::{

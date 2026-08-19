@@ -1,3 +1,4 @@
+//! Stub summary for c5_split_brain_precedence.rs.
 // Contract C5: Split-Brain Precedence (LWW)
 //
 // Decision 0003 §C5 verdict: already upheld at HEAD.
@@ -7,6 +8,7 @@
 use crate::common;
 use flapjack::IndexManager;
 
+/// TODO: Document make_upsert_op.
 fn make_upsert_op(
     seq: u64,
     timestamp_ms: u64,
@@ -43,6 +45,7 @@ fn make_delete_op(
     }
 }
 
+/// TODO: Document lww_same_timestamp_higher_node_id_wins.
 #[tokio::test]
 async fn lww_same_timestamp_higher_node_id_wins() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -66,6 +69,7 @@ async fn lww_same_timestamp_higher_node_id_wins() {
     );
 }
 
+/// TODO: Document lww_stale_delete_does_not_remove_newer_upsert.
 #[tokio::test]
 async fn lww_stale_delete_does_not_remove_newer_upsert() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -86,6 +90,7 @@ async fn lww_stale_delete_does_not_remove_newer_upsert() {
     assert!(manager.get_document("c5_t2", "doc1").unwrap().is_some());
 }
 
+/// TODO: Document lww_map_rebuilt_from_oplog_blocks_stale_op_after_restart.
 #[tokio::test]
 async fn lww_map_rebuilt_from_oplog_blocks_stale_op_after_restart() {
     let tmp = tempfile::TempDir::new().unwrap();

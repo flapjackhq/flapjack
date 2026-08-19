@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/experiments/response_helpers.rs.
 use super::{
     dto_algolia, metrics, resolve::resolve_store_and_experiment_id, AppState, Experiment,
     ExperimentArm, ExperimentConclusion, ExperimentError, ExperimentStatus, ExperimentStore,
@@ -229,6 +230,7 @@ mod tests {
         response::IntoResponse,
     };
 
+    /// TODO: Document sample_experiment.
     fn sample_experiment(
         status: ExperimentStatus,
         conclusion: Option<ExperimentConclusion>,
@@ -281,6 +283,7 @@ mod tests {
         }
     }
 
+    /// TODO: Document concluded_experiment_fixture.
     fn concluded_experiment_fixture(conclusion: Option<ExperimentConclusion>) -> Experiment {
         Experiment {
             id: "exp_123".to_string(),
@@ -332,6 +335,7 @@ mod tests {
         assert_eq!(json["message"], "bad traffic split");
     }
 
+    /// TODO: Document experiment_client_error_variants_preserve_status_and_message.
     #[tokio::test]
     async fn experiment_client_error_variants_preserve_status_and_message() {
         let cases = vec![
@@ -361,6 +365,7 @@ mod tests {
         }
     }
 
+    /// TODO: Document concluded_experiment_response_keeps_required_conclusion_payload.
     #[test]
     fn concluded_experiment_response_keeps_required_conclusion_payload() {
         let response = concluded_experiment_response(sample_experiment(
@@ -383,6 +388,7 @@ mod tests {
         assert!(response.conclusion.significant);
     }
 
+    /// TODO: Document concluded_experiment_response_preserves_conclusion_payload.
     #[test]
     fn concluded_experiment_response_preserves_conclusion_payload() {
         let expected_conclusion = experiment_conclusion();
@@ -466,6 +472,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document attach_experiment_warning_header_preserves_existing_headers_when_warning_missing.
     #[test]
     fn attach_experiment_warning_header_preserves_existing_headers_when_warning_missing() {
         let mut response = Response::new(Body::empty());

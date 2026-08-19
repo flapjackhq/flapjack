@@ -111,6 +111,7 @@ fn build_stage4_app(tmp: &TempDir) -> (Router, Arc<AnalyticsCollector>) {
         .with_state(handlers::insights::GdprDeleteState {
             analytics_collector: collector.clone(),
             profile_store_base_path: tmp.path().to_path_buf(),
+            gdpr_notifier: None,
         });
 
     (

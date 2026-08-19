@@ -13,7 +13,7 @@ When we say "e2e-ui tests" we mean **non-mocked, simulated-human, real-browser t
 
 ## Browser-Test Naming Resolution
 
-This repo keeps `tests/e2e-ui/{smoke,full}` as the established equivalent of the browser-unmocked layout in `~/.matt/scrai/globals/standards/browser_testing.md`. Mocked specs remain identified by the `*-mocked.spec.ts` filename suffix. The strict browser-testing lint and authoring rules apply to browser specs regardless of directory naming.
+This repo keeps `tests/e2e-ui/{smoke,full}` as the browser-unmocked layout defined by [`../_dev/testing/TESTING.md`](../_dev/testing/TESTING.md). Mocked specs remain identified by the `*-mocked.spec.ts` filename suffix. The strict browser-testing lint and authoring rules apply to browser specs regardless of directory naming.
 
 ## Directory Structure
 

@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/openapi_tests.rs.
 use super::*;
 use crate::openapi::{documented_openapi, DOCUMENTED_INTERNAL_MEMBERSHIP_PATHS};
 use crate::openapi_test_helpers::{
@@ -41,6 +42,7 @@ fn openapi_membership_paths_are_hidden_when_auth_is_disabled() {
     }
 }
 
+/// TODO: Document schema_contains_type.
 fn schema_contains_type(schema: &serde_json::Value, expected_type: &str) -> bool {
     match schema {
         serde_json::Value::Object(map) => {
@@ -74,6 +76,7 @@ fn schema_contains_type(schema: &serde_json::Value, expected_type: &str) -> bool
     }
 }
 
+/// TODO: Document schema_contains_ref.
 fn schema_contains_ref(schema: &serde_json::Value, expected_ref: &str) -> bool {
     match schema {
         serde_json::Value::Object(map) => {
@@ -95,6 +98,7 @@ fn schema_contains_ref(schema: &serde_json::Value, expected_ref: &str) -> bool {
     }
 }
 
+/// TODO: Document key_endpoints_use_concrete_schema_components.
 #[test]
 fn key_endpoints_use_concrete_schema_components() {
     let doc = openapi_json();
@@ -301,6 +305,7 @@ fn experiments_endpoints_are_documented() {
     assert_path_method(&doc, "/2/abtests/{id}/results", "get");
 }
 
+/// TODO: Document abtests_list_exposes_index_name_query_parameter.
 #[test]
 fn abtests_list_exposes_index_name_query_parameter() {
     let doc = openapi_json();
@@ -331,6 +336,7 @@ fn abtests_list_exposes_index_name_query_parameter() {
     ));
 }
 
+/// TODO: Document experiment_estimate_and_results_endpoints_use_concrete_schemas.
 #[test]
 fn experiment_estimate_and_results_endpoints_use_concrete_schemas() {
     let doc = openapi_json();
@@ -414,6 +420,7 @@ fn experiment_estimate_and_results_endpoints_use_concrete_schemas() {
     }
 }
 
+/// TODO: Document experiment_endpoints_document_internal_mapping_500s.
 #[test]
 fn experiment_endpoints_document_internal_mapping_500s() {
     let doc = openapi_json();
@@ -464,6 +471,7 @@ fn experiment_endpoints_document_internal_mapping_500s() {
     }
 }
 
+/// TODO: Document experiment_schema_renamed_properties_and_enum_shapes.
 #[test]
 fn experiment_schema_renamed_properties_and_enum_shapes() {
     let doc = openapi_json();
@@ -607,6 +615,7 @@ fn experiment_schema_renamed_properties_and_enum_shapes() {
     }
 }
 
+/// TODO: Document high_risk_mutation_openapi_contracts_match_shared_matrix.
 #[test]
 fn high_risk_mutation_openapi_contracts_match_shared_matrix() {
     let doc = openapi_json();

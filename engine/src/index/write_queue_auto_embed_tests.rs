@@ -36,6 +36,7 @@ type OplogWriteQueueSetup = (
     Arc<crate::index::oplog::OpLog>,
 );
 
+/// TODO: Document setup_write_queue_core.
 fn setup_write_queue_core(
     tmp: &tempfile::TempDir,
     tenant_id: &str,
@@ -113,6 +114,7 @@ fn rest_embedder_batch_config(server_uri: &str, dimensions: usize) -> serde_json
 
 // ── Add/Upsert tests ──
 
+/// TODO: Document test_auto_embed_on_add.
 #[tokio::test]
 #[serial(flapjack_outbound_url_policy)]
 async fn test_auto_embed_on_add() {
@@ -174,6 +176,7 @@ async fn test_auto_embed_on_add() {
     assert_eq!(results[0].doc_id, "doc1");
 }
 
+/// TODO: Document test_auto_embed_on_upsert_replaces_vector.
 #[tokio::test]
 #[serial(flapjack_outbound_url_policy)]
 async fn test_auto_embed_on_upsert_replaces_vector() {
@@ -271,6 +274,7 @@ async fn test_auto_embed_on_upsert_replaces_vector() {
     );
 }
 
+/// TODO: Document test_batch_embed_multiple_docs.
 #[tokio::test]
 #[serial(flapjack_outbound_url_policy)]
 async fn test_batch_embed_multiple_docs() {
@@ -329,6 +333,7 @@ async fn test_batch_embed_multiple_docs() {
     assert_eq!(vi.len(), 5, "all 5 docs should be in vector index");
 }
 
+/// TODO: Document test_vector_index_auto_created.
 #[tokio::test]
 #[serial(flapjack_outbound_url_policy)]
 async fn test_vector_index_auto_created() {
@@ -381,6 +386,7 @@ async fn test_vector_index_auto_created() {
 
 // ── User-provided vector tests ──
 
+/// TODO: Document test_vectors_field_used_directly.
 #[tokio::test]
 async fn test_vectors_field_used_directly() {
     let server = MockServer::start().await;
@@ -441,6 +447,7 @@ async fn test_vectors_field_used_directly() {
     assert_eq!(results[0].doc_id, "doc1");
 }
 
+/// TODO: Document test_vectors_field_wrong_dimensions_rejected.
 #[tokio::test]
 async fn test_vectors_field_wrong_dimensions_rejected() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -521,6 +528,7 @@ async fn test_vectors_field_wrong_dimensions_rejected() {
 
 // ── Fallback/error tests ──
 
+/// TODO: Document test_no_embed_without_embedder_config.
 #[tokio::test]
 async fn test_no_embed_without_embedder_config() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -554,6 +562,7 @@ async fn test_no_embed_without_embedder_config() {
     );
 }
 
+/// TODO: Document test_embed_failure_does_not_block_tantivy.
 #[tokio::test]
 #[serial(flapjack_outbound_url_policy)]
 async fn test_embed_failure_does_not_block_tantivy() {
@@ -615,6 +624,7 @@ async fn test_embed_failure_does_not_block_tantivy() {
     );
 }
 
+/// TODO: Document test_user_provided_source_no_vectors_field_skipped.
 #[tokio::test]
 async fn test_user_provided_source_no_vectors_field_skipped() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -660,6 +670,7 @@ async fn test_user_provided_source_no_vectors_field_skipped() {
 
 // ── Delete tests ──
 
+/// TODO: Document test_delete_removes_from_vector_index.
 #[tokio::test]
 #[serial(flapjack_outbound_url_policy)]
 async fn test_delete_removes_from_vector_index() {
@@ -720,6 +731,7 @@ async fn test_delete_removes_from_vector_index() {
     );
 }
 
+/// TODO: Document test_delete_nonexistent_in_vector_index_silent.
 #[tokio::test]
 async fn test_delete_nonexistent_in_vector_index_silent() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -756,6 +768,7 @@ async fn test_delete_nonexistent_in_vector_index_silent() {
 
 // ── Stripping test ──
 
+/// TODO: Document test_vectors_field_stripped_from_tantivy.
 #[tokio::test]
 async fn test_vectors_field_stripped_from_tantivy() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -864,6 +877,7 @@ async fn test_vectors_field_stripped_from_tantivy() {
 
 // ── Vector index disk persistence tests (8.1) ──
 
+/// TODO: Document test_vector_index_saved_after_commit.
 #[tokio::test]
 #[serial(flapjack_outbound_url_policy)]
 async fn test_vector_index_saved_after_commit() {
@@ -935,6 +949,7 @@ async fn test_vector_index_saved_after_commit() {
     assert_eq!(results.len(), 2);
 }
 
+/// TODO: Document test_vector_index_save_reflects_deletes.
 #[tokio::test]
 #[serial(flapjack_outbound_url_policy)]
 async fn test_vector_index_save_reflects_deletes() {
@@ -1006,6 +1021,7 @@ async fn test_vector_index_save_reflects_deletes() {
     assert_eq!(results[0].doc_id, "doc2");
 }
 
+/// TODO: Document test_vector_save_skipped_when_no_vector_changes.
 #[tokio::test]
 async fn test_vector_save_skipped_when_no_vector_changes() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1048,6 +1064,7 @@ async fn test_vector_save_skipped_when_no_vector_changes() {
     );
 }
 
+/// TODO: Document test_vector_index_save_reflects_upserts.
 #[tokio::test]
 #[serial(flapjack_outbound_url_policy)]
 async fn test_vector_index_save_reflects_upserts() {
@@ -1127,6 +1144,7 @@ async fn test_vector_index_save_reflects_upserts() {
 
 // ── Oplog vector storage tests (8.7) ──
 
+/// TODO: Document setup_write_queue_with_oplog.
 fn setup_write_queue_with_oplog(
     tmp: &tempfile::TempDir,
     tenant_id: &str,
@@ -1145,6 +1163,7 @@ fn setup_write_queue_with_oplog(
     (tx, handle, tasks, vector_indices, oplog)
 }
 
+/// TODO: Document extract_oplog_vectors.
 fn extract_oplog_vectors(oplog: &crate::index::oplog::OpLog, embedder_name: &str) -> Vec<f64> {
     let entries = oplog.read_since(0).unwrap();
     let upsert = entries
@@ -1164,6 +1183,7 @@ fn extract_oplog_vectors(oplog: &crate::index::oplog::OpLog, embedder_name: &str
         .collect()
 }
 
+/// TODO: Document test_computed_vectors_stored_in_oplog.
 #[tokio::test]
 #[serial(flapjack_outbound_url_policy)]
 async fn test_computed_vectors_stored_in_oplog() {
@@ -1212,6 +1232,7 @@ async fn test_computed_vectors_stored_in_oplog() {
     assert!((vec_array[2] - 0.3).abs() < 0.01);
 }
 
+/// TODO: Document test_user_provided_vectors_preserved_in_oplog.
 #[tokio::test]
 async fn test_user_provided_vectors_preserved_in_oplog() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1263,6 +1284,7 @@ async fn test_user_provided_vectors_preserved_in_oplog() {
     assert_eq!(vec_array, vec![1.0, 0.0, 0.0]);
 }
 
+/// TODO: Document test_oplog_vectors_contain_all_embedder_results.
 #[tokio::test]
 #[serial(flapjack_outbound_url_policy)]
 async fn test_oplog_vectors_contain_all_embedder_results() {
@@ -1316,6 +1338,7 @@ async fn test_oplog_vectors_contain_all_embedder_results() {
     assert_eq!(vec_b.len(), 3);
 }
 
+/// TODO: Document test_fingerprint_saved_alongside_vector_index.
 #[tokio::test]
 #[serial(flapjack_outbound_url_policy)]
 async fn test_fingerprint_saved_alongside_vector_index() {
@@ -1386,6 +1409,7 @@ async fn test_fingerprint_saved_alongside_vector_index() {
 #[tokio::test]
 // Concurrent ONNX model cache initialization can race and flake with
 // "Failed to retrieve onnx/model.onnx" when these tests run in parallel.
+/// TODO: Document test_fastembed_auto_embed_on_add.
 #[serial]
 async fn test_fastembed_auto_embed_on_add() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1438,6 +1462,7 @@ async fn test_fastembed_auto_embed_on_add() {
     );
 }
 
+/// TODO: Document test_fastembed_vectors_in_oplog.
 #[cfg(feature = "vector-search-local")]
 #[tokio::test]
 #[serial]

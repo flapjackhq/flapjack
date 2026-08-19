@@ -51,6 +51,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/**
+ * TODO: Document parsePeer.
+ */
 function parsePeer(peer: unknown, index: number): ClusterPeer {
   if (!isRecord(peer)) {
     throw new ClusterStatusContractError(`peer ${index + 1} must be an object`);
@@ -82,6 +85,9 @@ function parsePeer(peer: unknown, index: number): ClusterPeer {
   };
 }
 
+/**
+ * TODO: Document parseClusterStatusResponse.
+ */
 function parseClusterStatusResponse(data: unknown): ClusterStatusResponse {
   if (!isRecord(data)) {
     throw new ClusterStatusContractError('response body must be an object');

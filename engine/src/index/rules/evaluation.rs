@@ -1,3 +1,4 @@
+//! Stub summary for evaluation.rs.
 use super::*;
 use std::collections::HashMap;
 
@@ -362,6 +363,7 @@ impl RuleStore {
 
 #[cfg(test)]
 mod tests {
+    /// TODO: Document apply_rule_promotes_doc_stays_scoped_to_promotions.
     #[test]
     fn apply_rule_promotes_doc_stays_scoped_to_promotions() {
         let source = include_str!("evaluation.rs");

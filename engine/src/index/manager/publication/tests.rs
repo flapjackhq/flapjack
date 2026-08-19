@@ -207,6 +207,7 @@ fn privacy_scrub_generation_evidence_rejects_symlinked_journal() {
     assert!(error.contains("symlink"), "{error}");
 }
 
+/// TODO: Document reserved_namespace_classifier_recognizes_publication_evidence_paths.
 #[test]
 fn reserved_namespace_classifier_recognizes_publication_evidence_paths() {
     for relative in [
@@ -225,6 +226,7 @@ fn reserved_namespace_classifier_recognizes_publication_evidence_paths() {
     }
 }
 
+/// TODO: Document reserved_namespace_classifier_rejects_unsafe_and_lookalike_paths.
 #[test]
 fn reserved_namespace_classifier_rejects_unsafe_and_lookalike_paths() {
     for relative in [
@@ -247,6 +249,7 @@ fn reserved_namespace_classifier_rejects_unsafe_and_lookalike_paths() {
     }
 }
 
+/// TODO: Document transaction_namespace_paths_are_deterministic_and_isolated.
 #[test]
 fn transaction_namespace_paths_are_deterministic_and_isolated() {
     let tmp = TempDir::new().unwrap();
@@ -274,6 +277,7 @@ fn transaction_namespace_paths_are_deterministic_and_isolated() {
     assert_ne!(paths.backup, paths.target);
 }
 
+/// TODO: Document target_and_transaction_reject_caller_chosen_path_components.
 #[test]
 fn target_and_transaction_reject_caller_chosen_path_components() {
     for invalid in [
@@ -303,6 +307,7 @@ fn public_surface_stays_node_local_and_rejects_cluster_atomicity() {
     }
 }
 
+/// TODO: Document journal_round_trip_preserves_exact_contract_values.
 #[test]
 fn journal_round_trip_preserves_exact_contract_values() {
     let journal = prepared_journal().apply(PublicationEvent::Commit).unwrap();
@@ -474,6 +479,7 @@ fn handoff_requires_publication_outcome_before_tombstone_retention() {
     assert_eq!(tombstone.fence_evidence, Some(fence));
 }
 
+/// TODO: Document tenant_inventory_classifies_only_owner_known_artifacts.
 #[test]
 fn tenant_inventory_classifies_only_owner_known_artifacts() {
     let inventory = TantivyManagedInventory::new(vec![PathBuf::from("meta.json")]).unwrap();
@@ -520,6 +526,7 @@ fn version_store_sidecar_is_classified_by_publication_policy() {
     }
 }
 
+/// TODO: Document external_inventory_fails_closed_and_excludes_global_experiments.
 #[test]
 fn external_inventory_fails_closed_and_excludes_global_experiments() {
     let known_qs = vec![
@@ -593,6 +600,7 @@ fn policy_table_covers_required_dispositions() {
     assert!(policies.iter().all(|p| !p.repair.is_empty()));
 }
 
+/// TODO: Document canonical_tree_digest_is_stable_and_rejects_unknown_artifacts.
 #[test]
 fn canonical_tree_digest_is_stable_and_rejects_unknown_artifacts() {
     let tmp = TempDir::new().unwrap();
@@ -619,6 +627,7 @@ fn canonical_tree_digest_is_stable_and_rejects_unknown_artifacts() {
     assert!(reordered.to_string().contains("z.txt"));
 }
 
+/// TODO: Document canonical_tree_digest_changes_for_path_type_and_content.
 #[test]
 fn canonical_tree_digest_changes_for_path_type_and_content() {
     let tmp = TempDir::new().unwrap();
@@ -675,6 +684,7 @@ fn canonical_tree_digest_rejects_symlinks() {
     assert!(error.to_string().contains("symlink"));
 }
 
+/// TODO: Document activation_rejects_unknown_artifacts_before_mutation.
 #[test]
 fn activation_rejects_unknown_artifacts_before_mutation() {
     let fixture = ActivationFixture::new();
@@ -737,6 +747,7 @@ fn activation_rejects_invalid_manifest_without_deleting_outside_artifact_root() 
     assert_eq!(fixture.read_target_file("index_meta.json"), b"old-meta");
 }
 
+/// TODO: Document replacement_activation_rolls_back_losslessly_after_promote_failure.
 #[test]
 fn replacement_activation_rolls_back_losslessly_after_promote_failure() {
     let fixture = ActivationFixture::new();
@@ -770,6 +781,7 @@ fn replacement_activation_rolls_back_losslessly_after_promote_failure() {
     assert_eq!(journal.phase, PublicationPhase::RolledBack);
 }
 
+/// TODO: Document failed_create_removes_target_staging_backup_and_records_rollback.
 #[test]
 fn failed_create_removes_target_staging_backup_and_records_rollback() {
     let fixture = ActivationFixture::new();
@@ -794,6 +806,7 @@ fn failed_create_removes_target_staging_backup_and_records_rollback() {
     assert_eq!(fixture.read_journal().phase, PublicationPhase::RolledBack);
 }
 
+/// TODO: Document pre_staged_activation_reports_the_failed_filesystem_phase.
 #[test]
 fn pre_staged_activation_reports_the_failed_filesystem_phase() {
     let temp = tempfile::TempDir::new().unwrap();
@@ -818,6 +831,7 @@ fn pre_staged_activation_reports_the_failed_filesystem_phase() {
     assert_eq!(error.stage(), PreStagedActivationStage::PromoteStaging);
 }
 
+/// TODO: Document ambiguous_failed_create_quarantines_digest_bearing_journal.
 #[test]
 fn ambiguous_failed_create_quarantines_digest_bearing_journal() {
     let fixture = ActivationFixture::new();
@@ -846,6 +860,7 @@ fn ambiguous_failed_create_quarantines_digest_bearing_journal() {
     assert_eq!(quarantined.digest.as_str(), expected_digest.as_str());
 }
 
+/// TODO: Document successful_activation_promotes_journaled_sidecar_and_records_digests.
 #[test]
 fn successful_activation_promotes_journaled_sidecar_and_records_digests() {
     let fixture = ActivationFixture::new();
@@ -894,6 +909,7 @@ fn successful_activation_promotes_journaled_sidecar_and_records_digests() {
     assert_eq!(persisted_entry.promoted_digest, entry.promoted_digest);
 }
 
+/// TODO: Document activation_rejects_symlinked_manifest_components_before_mutation.
 #[cfg(unix)]
 #[test]
 fn activation_rejects_symlinked_manifest_components_before_mutation() {
@@ -934,6 +950,7 @@ fn activation_rejects_symlinked_manifest_components_before_mutation() {
     assert!(!fixture.paths.backup.exists());
 }
 
+/// TODO: Document manifest_builds_query_suggestions_and_analytics_entries_from_owner_resolvers.
 #[test]
 fn manifest_builds_query_suggestions_and_analytics_entries_from_owner_resolvers() {
     let tmp = TempDir::new().unwrap();
@@ -999,6 +1016,7 @@ fn manifest_builds_query_suggestions_and_analytics_entries_from_owner_resolvers(
     );
 }
 
+/// TODO: Document manifest_rejects_overlapping_artifact_ownership.
 #[test]
 fn manifest_rejects_overlapping_artifact_ownership() {
     let fixture = ActivationFixture::new();
@@ -1024,6 +1042,7 @@ fn manifest_rejects_overlapping_artifact_ownership() {
     assert!(error.to_string().contains("overlapping"));
 }
 
+/// TODO: Document replacement_rollback_removes_sidecar_backup_residue.
 #[test]
 fn replacement_rollback_removes_sidecar_backup_residue() {
     let fixture = ActivationFixture::new();
@@ -1049,6 +1068,7 @@ fn replacement_rollback_removes_sidecar_backup_residue() {
     assert!(!fixture.sidecar_backup_dir().exists());
 }
 
+/// TODO: Document activation_fault_hook_covers_durability_boundaries_without_success.
 #[test]
 fn activation_fault_hook_covers_durability_boundaries_without_success() {
     for fault in [
@@ -1096,6 +1116,7 @@ fn activation_fault_hook_covers_durability_boundaries_without_success() {
     assert!(result.is_err(), "DuringQuarantine unexpectedly succeeded");
 }
 
+/// TODO: Document replacement_faults_after_promotion_restore_the_exact_old_publication.
 #[test]
 fn replacement_faults_after_promotion_restore_the_exact_old_publication() {
     for fault in [
@@ -1161,6 +1182,7 @@ fn replacement_faults_after_promotion_restore_the_exact_old_publication() {
     }
 }
 
+/// TODO: Document post_commit_faults_preserve_the_committed_publication.
 #[test]
 fn post_commit_faults_preserve_the_committed_publication() {
     for fault in [
@@ -2355,6 +2377,7 @@ impl PublicationFaultHook for PanicAtCheckpoint {
     }
 }
 
+/// TODO: Document activation_fault_hook_observes_every_durable_filesystem_boundary.
 #[test]
 fn activation_fault_hook_observes_every_durable_filesystem_boundary() {
     let fixture = ActivationFixture::new();
@@ -2495,6 +2518,7 @@ fn activation_fault_hook_observes_every_durable_filesystem_boundary() {
     assert_eq!(prepared.fence_evidence, Some(fence));
 }
 
+/// TODO: Document every_activation_filesystem_fault_restores_the_old_publication.
 #[test]
 fn every_activation_filesystem_fault_restores_the_old_publication() {
     let fixture = ActivationFixture::new();
@@ -2615,6 +2639,7 @@ fn every_activation_filesystem_fault_restores_the_old_publication() {
     }
 }
 
+/// TODO: Document every_precommit_create_fault_resolves_without_publication_residue.
 #[test]
 fn every_precommit_create_fault_resolves_without_publication_residue() {
     let fixture = ActivationFixture::new();
@@ -2722,6 +2747,7 @@ fn assert_precommit_fault_reached_clean_disposition(
     }
 }
 
+/// TODO: Document activation_fixture_old_new_and_control_indexes_reopen_through_index_manager.
 #[tokio::test]
 async fn activation_fixture_old_new_and_control_indexes_reopen_through_index_manager() {
     let fixture = ActivationFixture::new();
@@ -2773,6 +2799,7 @@ async fn activation_fixture_old_new_and_control_indexes_reopen_through_index_man
     );
 }
 
+/// TODO: Document activation_fixture_fresh_generations_have_identical_managed_inventories_and_digests.
 #[test]
 fn activation_fixture_fresh_generations_have_identical_managed_inventories_and_digests() {
     let first = ActivationFixture::new();
@@ -2808,6 +2835,7 @@ struct ActivationFixture {
 }
 
 impl ActivationFixture {
+    /// TODO: Document ActivationFixture.new.
     fn new() -> Self {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().to_path_buf();
@@ -2818,6 +2846,7 @@ impl ActivationFixture {
         Self::from_base(base, None)
     }
 
+    /// TODO: Document ActivationFixture.from_base.
     fn from_base(base: PathBuf, tmp: Option<TempDir>) -> Self {
         let target = PublicationTarget::new("products").unwrap();
         let transaction = PublicationTransactionId::new("txn_001").unwrap();
@@ -2940,6 +2969,7 @@ impl ActivationFixture {
             .join("query_suggestions")
     }
 
+    /// TODO: Document ActivationFixture.read_target_file.
     fn read_target_file(&self, relative: &str) -> Vec<u8> {
         self.read_target_file_from_root(&self.paths.target, relative)
     }
@@ -3161,6 +3191,7 @@ fn write_authentic_fixture_tree(root: &Path, kind: FixtureTreeKind) {
     std::fs::write(root.join("committed_seq"), b"0").unwrap();
 }
 
+/// TODO: Document deterministic_fixture_oplog.
 fn deterministic_fixture_oplog(kind: FixtureTreeKind) -> Vec<u8> {
     let entry = serde_json::json!({
         "seq": 1,
@@ -3190,6 +3221,7 @@ fn copy_fixture_tree(source: &Path, destination: &Path) {
     copy_fixture_tree_inner(source, destination);
 }
 
+/// TODO: Document copy_fixture_tree_inner.
 fn copy_fixture_tree_inner(source: &Path, destination: &Path) {
     std::fs::create_dir_all(destination).unwrap();
     let mut entries = std::fs::read_dir(source)
@@ -3235,6 +3267,7 @@ fn collect_fixture_tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     files
 }
 
+/// TODO: Document collect_fixture_tree_bytes_inner.
 fn collect_fixture_tree_bytes_inner(
     root: &Path,
     current: &Path,
@@ -3277,6 +3310,7 @@ fn replace_path_with_symlink(path: &Path, target: &Path) {
     std::os::unix::fs::symlink(target, path).unwrap();
 }
 
+/// TODO: Document write_fixture_control_index.
 async fn write_fixture_control_index(base: &Path) {
     let manager = IndexManager::new(base);
     manager.create_tenant("control_products").unwrap();
@@ -3296,6 +3330,7 @@ async fn write_fixture_control_index(base: &Path) {
     manager.graceful_shutdown().await;
 }
 
+/// TODO: Document assert_reopenable_fixture_tree.
 fn assert_reopenable_fixture_tree(
     base: &Path,
     tenant: &str,
@@ -3364,6 +3399,7 @@ fn assert_fixture_control_reopenable(base: &Path) {
     );
 }
 
+/// TODO: Document repair_decision_table_is_total_for_every_phase_and_artifact_evidence.
 #[test]
 fn repair_decision_table_is_total_for_every_phase_and_artifact_evidence() {
     let phases = [
@@ -3439,6 +3475,7 @@ fn repair_decision_table_is_total_for_every_phase_and_artifact_evidence() {
     }
 }
 
+/// TODO: Document repair_evidence_is_proven.
 fn repair_evidence_is_proven(evidence: RepairEvidence) -> bool {
     use RepairArtifactEvidence::{MatchesNew as New, MatchesOld as Old, Missing};
     matches!(
@@ -3556,6 +3593,7 @@ fn repair_decision_table_limits_pre_journal_epoch_cleanup() {
     );
 }
 
+/// TODO: Document repair_decision_table_only_allows_digest_proven_mutations.
 #[test]
 fn repair_decision_table_only_allows_digest_proven_mutations() {
     let cases = [
@@ -3640,6 +3678,7 @@ fn rolled_back_runtime_mutated_target_without_residue_is_converged() {
     assert_eq!(decide_publication_repair(evidence), RepairDecision::None);
 }
 
+/// TODO: Document repair_decision_table_never_promotes_temp_journal_to_authority.
 #[test]
 fn repair_decision_table_never_promotes_temp_journal_to_authority() {
     let mut valid = RepairEvidence::valid(
@@ -3667,6 +3706,7 @@ fn repair_decision_table_never_promotes_temp_journal_to_authority() {
     }
 }
 
+/// TODO: Document repair_decision_table_quarantines_invalid_manifest_and_ambiguous_states.
 #[test]
 fn repair_decision_table_quarantines_invalid_manifest_and_ambiguous_states() {
     let mut invalid_manifest = RepairEvidence::valid(
@@ -3693,6 +3733,7 @@ fn repair_decision_table_quarantines_invalid_manifest_and_ambiguous_states() {
     );
 }
 
+/// TODO: Document repair_publication_completes_prepared_swap_with_digest_proof.
 #[test]
 fn repair_publication_completes_prepared_swap_with_digest_proof() {
     let fixture = ActivationFixture::new();
@@ -3717,6 +3758,7 @@ fn repair_publication_completes_prepared_swap_with_digest_proof() {
     assert!(!fixture.paths.staging.exists());
 }
 
+/// TODO: Document repair_publication_completes_journaled_sidecar_promotion.
 #[test]
 fn repair_publication_completes_journaled_sidecar_promotion() {
     let fixture = ActivationFixture::new();
@@ -3744,6 +3786,7 @@ fn repair_publication_completes_journaled_sidecar_promotion() {
     assert!(!fixture.promoted_sidecar_path().exists());
 }
 
+/// TODO: Document repair_publication_quarantines_sidecar_digest_mismatch_before_mutation.
 #[test]
 fn repair_publication_quarantines_sidecar_digest_mismatch_before_mutation() {
     let fixture = ActivationFixture::new();
@@ -3785,6 +3828,7 @@ fn repair_publication_quarantines_sidecar_digest_mismatch_before_mutation() {
     assert!(fixture.paths.quarantine.join("journal.json").exists());
 }
 
+/// TODO: Document repair_publication_rolls_back_journaled_sidecar_from_backup.
 #[test]
 fn repair_publication_rolls_back_journaled_sidecar_from_backup() {
     let fixture = ActivationFixture::new();
@@ -3821,6 +3865,7 @@ fn repair_publication_rolls_back_journaled_sidecar_from_backup() {
     assert!(!fixture.sidecar_backup_dir().exists());
 }
 
+/// TODO: Document repair_publication_rejects_symlinked_managed_parent_before_mutation.
 #[cfg(unix)]
 #[test]
 fn repair_publication_rejects_symlinked_managed_parent_before_mutation() {
@@ -3848,6 +3893,7 @@ fn repair_publication_rejects_symlinked_managed_parent_before_mutation() {
     assert!(!fixture.paths.backup.exists());
 }
 
+/// TODO: Document failed_create_removes_newly_promoted_sidecar.
 #[test]
 fn failed_create_removes_newly_promoted_sidecar() {
     let fixture = ActivationFixture::new();
@@ -3871,6 +3917,7 @@ fn failed_create_removes_newly_promoted_sidecar() {
     assert!(!fixture.promoted_sidecar_path().exists());
 }
 
+/// TODO: Document repair_publication_cleans_committed_backup_and_stale_journal_temp.
 #[test]
 fn repair_publication_cleans_committed_backup_and_stale_journal_temp() {
     let fixture = ActivationFixture::new();
@@ -3895,6 +3942,7 @@ fn repair_publication_cleans_committed_backup_and_stale_journal_temp() {
     assert_eq!(fixture.read_journal().phase, PublicationPhase::Committed);
 }
 
+/// TODO: Document repair_publication_faults_converge_without_second_recovery_path.
 #[test]
 fn repair_publication_faults_converge_without_second_recovery_path() {
     for fault in [
@@ -3978,6 +4026,7 @@ fn repair_publication_faults_converge_without_second_recovery_path() {
     }
 }
 
+/// TODO: Document every_repair_filesystem_fault_converges_from_live_old_target_and_new_staging.
 #[test]
 fn every_repair_filesystem_fault_converges_from_live_old_target_and_new_staging() {
     let fixture = ActivationFixture::new();
@@ -4056,6 +4105,7 @@ fn prepared_sidecar_completion_fixture() -> (ActivationFixture, PublicationArtif
     (fixture, manifest)
 }
 
+/// TODO: Document every_sidecar_completion_repair_fault_converges.
 #[test]
 fn every_sidecar_completion_repair_fault_converges() {
     let (fixture, manifest) = prepared_sidecar_completion_fixture();
@@ -4128,6 +4178,7 @@ fn every_sidecar_completion_repair_fault_converges() {
     }
 }
 
+/// TODO: Document prepared_sidecar_rollback_fixture.
 fn prepared_sidecar_rollback_fixture() -> (ActivationFixture, PublicationArtifactManifest) {
     let fixture = ActivationFixture::new();
     fixture.write_new_staging();
@@ -4150,6 +4201,7 @@ fn prepared_sidecar_rollback_fixture() -> (ActivationFixture, PublicationArtifac
     (fixture, manifest)
 }
 
+/// TODO: Document every_sidecar_rollback_repair_fault_converges.
 #[test]
 fn every_sidecar_rollback_repair_fault_converges() {
     let (fixture, manifest) = prepared_sidecar_rollback_fixture();
@@ -4210,6 +4262,7 @@ fn every_sidecar_rollback_repair_fault_converges() {
     }
 }
 
+/// TODO: Document rolled_back_repair_is_idempotent_on_second_scan.
 #[test]
 fn rolled_back_repair_is_idempotent_on_second_scan() {
     let (fixture, manifest) = prepared_sidecar_rollback_fixture();
@@ -4241,6 +4294,7 @@ fn rolled_back_repair_is_idempotent_on_second_scan() {
     assert_eq!(fixture.read_journal().phase, PublicationPhase::RolledBack);
 }
 
+/// TODO: Document repair_publication_quarantines_unproven_evidence_without_touching_live_target.
 #[test]
 fn repair_publication_quarantines_unproven_evidence_without_touching_live_target() {
     let fixture = ActivationFixture::new();
@@ -4267,6 +4321,7 @@ fn repair_publication_quarantines_unproven_evidence_without_touching_live_target
     assert!(fixture.paths.quarantine.join("staging").exists());
 }
 
+/// TODO: Document repair_publication_rejects_serialized_path_mismatch.
 #[test]
 fn repair_publication_rejects_serialized_path_mismatch() {
     let fixture = ActivationFixture::new();

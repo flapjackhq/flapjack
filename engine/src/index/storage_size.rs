@@ -3,13 +3,33 @@
 use std::io::{self, ErrorKind};
 use std::path::Path;
 
+/// Return whether two directory paths are the same or one contains the other.
+///
+/// The lexical check covers missing paths. Canonical paths additionally catch
+/// configured aliases such as `..` once both directories exist.
+pub(crate) fn directory_paths_overlap(left: &Path, right: &Path) -> bool {
+    if left.starts_with(right) || right.starts_with(left) {
+        return true;
+    }
+
+    let (Ok(left), Ok(right)) = (left.canonicalize(), right.canonicalize()) else {
+        return false;
+    };
+    left.starts_with(&right) || right.starts_with(&left)
+}
+
 /// Recursively sum the sizes of all regular files under `path`.
 ///
 /// Symlinks are skipped (not followed) to avoid double-counting and loops.
 /// Returns `Ok(0)` for an empty directory.
 pub fn dir_size_bytes(path: &Path) -> io::Result<u64> {
     let mut total: u64 = 0;
-    if !path.is_dir() {
+    let root_metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
         return Ok(0);
     }
     let entries = match std::fs::read_dir(path) {
@@ -107,11 +127,103 @@ mod tests {
         assert_eq!(size, 100);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn dir_size_bytes_skips_symlink_root() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("external.bin"), [0_u8; 123]).unwrap();
+        let link = tmp.path().join("linked-root");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(dir_size_bytes(&link).unwrap(), 0);
+    }
+
     #[tokio::test]
     async fn tenant_storage_bytes_nonexistent_tenant() {
         let tmp = TempDir::new().unwrap();
         let manager = crate::IndexManager::new(tmp.path());
         assert_eq!(manager.tenant_storage_bytes("no_such_tenant"), 0);
+    }
+
+    #[tokio::test]
+    async fn tenant_storage_bytes_includes_index_and_analytics_files() {
+        let tmp = TempDir::new().unwrap();
+        let manager = crate::IndexManager::new(tmp.path());
+        let analytics = crate::analytics::AnalyticsConfig {
+            enabled: true,
+            data_dir: tmp.path().join("analytics"),
+            flush_interval_secs: 60,
+            flush_size: 10_000,
+            retention_days: crate::analytics::config::DEFAULT_ANALYTICS_RETENTION_DAYS,
+        };
+        manager.set_analytics_config(analytics.clone());
+
+        let index_dir = tmp.path().join("products");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::write(index_dir.join("segment"), [0_u8; 100]).unwrap();
+
+        let events_dir = analytics.events_dir("products");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        std::fs::write(events_dir.join("events.parquet"), [0_u8; 200]).unwrap();
+
+        assert_eq!(manager.tenant_storage_bytes("products"), 300);
+    }
+
+    #[tokio::test]
+    async fn tenant_storage_bytes_does_not_double_count_lexically_aliased_nested_analytics() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("data");
+        let manager = crate::IndexManager::new(&base);
+
+        let alias_component = base.join("alias");
+        std::fs::create_dir_all(&alias_component).unwrap();
+        let analytics = crate::analytics::AnalyticsConfig {
+            enabled: true,
+            data_dir: alias_component.join("..").join("products/analytics"),
+            flush_interval_secs: 60,
+            flush_size: 10_000,
+            retention_days: crate::analytics::config::DEFAULT_ANALYTICS_RETENTION_DAYS,
+        };
+        manager.set_analytics_config(analytics.clone());
+
+        let index_dir = base.join("products");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::write(index_dir.join("segment"), [0_u8; 100]).unwrap();
+        let events_dir = analytics.events_dir("products");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        std::fs::write(events_dir.join("events.parquet"), [0_u8; 200]).unwrap();
+
+        assert_eq!(manager.tenant_storage_bytes("products"), 300);
+    }
+
+    #[tokio::test]
+    async fn tenant_storage_bytes_does_not_expand_to_analytics_ancestor() {
+        let tmp = TempDir::new().unwrap();
+        let analytics_root = tmp.path().join("analytics");
+        let base = analytics_root.join("products/indexes");
+        let manager = crate::IndexManager::new(&base);
+        let analytics = crate::analytics::AnalyticsConfig {
+            enabled: true,
+            data_dir: analytics_root,
+            flush_interval_secs: 60,
+            flush_size: 10_000,
+            retention_days: crate::analytics::config::DEFAULT_ANALYTICS_RETENTION_DAYS,
+        };
+        manager.set_analytics_config(analytics.clone());
+
+        let index_dir = base.join("products");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::write(index_dir.join("segment"), [0_u8; 100]).unwrap();
+        let other_tenant = base.join("orders");
+        std::fs::create_dir_all(&other_tenant).unwrap();
+        std::fs::write(other_tenant.join("segment"), [0_u8; 400]).unwrap();
+        let events_dir = analytics.events_dir("products");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        std::fs::write(events_dir.join("events.parquet"), [0_u8; 200]).unwrap();
+
+        assert_eq!(manager.tenant_storage_bytes("products"), 100);
     }
 
     /// Verify that `all_tenant_storage` returns an entry with non-zero byte count for every loaded tenant.

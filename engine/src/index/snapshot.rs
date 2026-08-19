@@ -1,3 +1,4 @@
+//! Stub summary for snapshot.rs.
 use crate::error::{FlapjackError, Result};
 use crate::index::utils::copy_dir_recursive;
 use aes_gcm_siv::aead::{Aead, KeyInit, Payload};
@@ -19,6 +20,7 @@ const SNAPSHOT_ENCRYPTION_VERSION: u8 = 1;
 const SNAPSHOT_ENCRYPTION_NONCE_LEN: usize = 12;
 const SNAPSHOT_ENCRYPTION_HEADER_LEN: usize = 21;
 
+/// TODO: Document reject_invalid_snapshot_entry_path.
 fn reject_invalid_snapshot_entry_path(entry_path: &Path) -> Result<()> {
     if entry_path.is_absolute() {
         return Err(crate::error::FlapjackError::InvalidDocument(format!(
@@ -42,6 +44,7 @@ fn reject_invalid_snapshot_entry_path(entry_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// TODO: Document validate_archive_entries.
 fn validate_archive_entries<R: std::io::Read>(archive: &mut Archive<R>) -> Result<()> {
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;

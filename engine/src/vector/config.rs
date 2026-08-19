@@ -1,3 +1,4 @@
+//! Stub summary for config.rs.
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};

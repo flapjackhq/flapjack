@@ -1,3 +1,4 @@
+//! Stub summary for readiness.rs.
 use crate::error_response::HandlerError;
 use crate::tenant_dirs::visible_tenant_dir_names;
 use axum::{extract::State, http::StatusCode, Json};
@@ -73,6 +74,7 @@ mod tests {
     use tempfile::TempDir;
     use tower::ServiceExt;
 
+    /// TODO: Document readiness_response_json.
     async fn readiness_response_json(app: Router) -> (StatusCode, serde_json::Value) {
         let response = app
             .oneshot(
@@ -174,6 +176,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, serde_json::json!({ "ready": true }));
     }
+    /// TODO: Document ready_returns_canonical_503_when_visible_tenant_discovery_fails.
     #[tokio::test]
     async fn ready_returns_canonical_503_when_visible_tenant_discovery_fails() {
         let tmp = TempDir::new().unwrap();

@@ -68,6 +68,7 @@ make_sourceable_script() {
   chmod +x "$dest"
 }
 
+# TODO: Document write_fixture_helpers.
 write_fixture_helpers() {
   local dest="$1"
   cat > "$dest" <<'HELPERS'
@@ -118,6 +119,7 @@ HELPERS
   chmod +x "$dest"
 }
 
+# TODO: Document run_main_with_fixture.
 run_main_with_fixture() {
   local sourceable_script="$1"
   local helper_script="$2"
@@ -212,6 +214,7 @@ CURL_FIXTURE
   rm -rf "$tmp_dir"
 }
 
+# TODO: Document test_missing_index_fails.
 test_missing_index_fails() {
   local tmp_dir
   tmp_dir="$(mktemp -d)"
@@ -237,6 +240,7 @@ test_missing_index_fails() {
   rm -rf "$tmp_dir"
 }
 
+# TODO: Document test_zero_doc_index_fails.
 test_zero_doc_index_fails() {
   local tmp_dir
   tmp_dir="$(mktemp -d)"
@@ -262,6 +266,7 @@ test_zero_doc_index_fails() {
   rm -rf "$tmp_dir"
 }
 
+# TODO: Document test_bad_query_catalog_fails.
 test_bad_query_catalog_fails() {
   local tmp_dir
   tmp_dir="$(mktemp -d)"
@@ -287,6 +292,7 @@ test_bad_query_catalog_fails() {
   rm -rf "$tmp_dir"
 }
 
+# TODO: Document test_empty_query_catalog_fails.
 test_empty_query_catalog_fails() {
   local tmp_dir
   tmp_dir="$(mktemp -d)"
@@ -312,6 +318,7 @@ test_empty_query_catalog_fails() {
   rm -rf "$tmp_dir"
 }
 
+# TODO: Document test_search_request_failure_fails.
 test_search_request_failure_fails() {
   local tmp_dir
   tmp_dir="$(mktemp -d)"

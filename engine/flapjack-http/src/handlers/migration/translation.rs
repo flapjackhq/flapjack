@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/translation.rs.
 #![cfg_attr(not(test), allow(dead_code))]
 
 #[path = "meilisearch_settings.rs"]
@@ -80,6 +81,7 @@ pub(super) fn push_unique_entry(
     }
 }
 
+/// TODO: Document validate_settings_payload.
 fn validate_settings_payload(settings: &Value, entries: &mut Vec<TranslationReportEntry>) {
     let Some(settings_object) = settings.as_object() else {
         entries.push(hard_entry(
@@ -234,6 +236,7 @@ impl RuleSchemaMatcher {
         path == owner_path && fields.matches(source)
     }
 
+    /// TODO: Document RuleSchemaMatcher.object_field_spec.
     fn object_field_spec(self) -> Option<(RuleSchemaPath, ClosedObjectFields)> {
         Some(match self {
             Self::Condition => (
@@ -302,6 +305,7 @@ impl SynonymSchemaMatcher {
         object_string(source, "type") == Some(synonym_type) && fields.matches(source)
     }
 
+    /// TODO: Document SynonymSchemaMatcher.field_spec.
     fn field_spec(self) -> (&'static str, ClosedObjectFields) {
         match self {
             Self::Regular => (
@@ -456,6 +460,7 @@ struct RowSemantics {
     owner_path_precondition: OwnerPathPrecondition,
 }
 
+/// TODO: Document row.
 const fn row(
     resource: ResourceKind,
     matcher: SourceMatcher,
@@ -476,6 +481,7 @@ const fn row(
     }
 }
 
+/// TODO: Document exact_settings.
 const fn exact_settings(field: &'static str) -> CompatibilityRow {
     row(
         ResourceKind::Settings,
@@ -493,6 +499,7 @@ const fn exact_settings(field: &'static str) -> CompatibilityRow {
     )
 }
 
+/// TODO: Document transformed_settings.
 const fn transformed_settings(field: &'static str) -> CompatibilityRow {
     row(
         ResourceKind::Settings,
@@ -510,6 +517,7 @@ const fn transformed_settings(field: &'static str) -> CompatibilityRow {
     )
 }
 
+/// TODO: Document read_only_source_reader_setting.
 const fn read_only_source_reader_setting(field: &'static str) -> CompatibilityRow {
     row(
         ResourceKind::Settings,
@@ -547,6 +555,7 @@ const fn persisted_no_behavior_setting(field: &'static str) -> CompatibilityRow 
     )
 }
 
+/// TODO: Document exact_resource_field.
 const fn exact_resource_field(resource: ResourceKind, field: &'static str) -> CompatibilityRow {
     row(
         resource,
@@ -568,6 +577,7 @@ const fn exact_resource_field(resource: ResourceKind, field: &'static str) -> Co
     )
 }
 
+/// TODO: Document schema_row.
 const fn schema_row(resource: ResourceKind, matcher: SourceMatcher) -> CompatibilityRow {
     row(
         resource,
@@ -597,6 +607,7 @@ const fn synonym_schema(matcher: SynonymSchemaMatcher) -> CompatibilityRow {
     schema_row(ResourceKind::Synonym, SourceMatcher::SynonymSchema(matcher))
 }
 
+/// TODO: Document closed_unknown.
 const fn closed_unknown(resource: ResourceKind) -> CompatibilityRow {
     row(
         resource,
@@ -636,6 +647,7 @@ fn resolve_rule_schema(path: RuleSchemaPath, source: &serde_json::Value) -> Comp
     })
 }
 
+/// TODO: Document resolve_matching_row.
 fn resolve_matching_row(
     resource: ResourceKind,
     mut matches: impl FnMut(SourceMatcher) -> bool,
@@ -668,21 +680,21 @@ fn resolve_matching_row(
 // Algolia standard and virtual replicas both migrate as Flapjack virtual replicas.
 // Flapjack sorts at query time, so a physical replica would duplicate the corpus without benefit.
 static STAGE1_MATRIX: &[CompatibilityRow] = &[
-    persisted_no_behavior_setting("attributesForFaceting"),
+    exact_settings("attributesForFaceting"),
     exact_settings("searchableAttributes"),
     transformed_settings("attributesToIndex"),
     exact_settings("ranking"),
     exact_settings("customRanking"),
     exact_settings("attributesToRetrieve"),
     exact_settings("unretrievableAttributes"),
-    persisted_no_behavior_setting("attributesToHighlight"),
+    exact_settings("attributesToHighlight"),
     persisted_no_behavior_setting("attributesToSnippet"),
     exact_settings("paginationLimitedTo"),
     exact_settings("attributeForDistinct"),
     transformed_settings("distinct"),
-    persisted_no_behavior_setting("highlightPreTag"),
-    persisted_no_behavior_setting("highlightPostTag"),
-    persisted_no_behavior_setting("hitsPerPage"),
+    exact_settings("highlightPreTag"),
+    exact_settings("highlightPostTag"),
+    exact_settings("hitsPerPage"),
     exact_settings("minWordSizefor1Typo"),
     exact_settings("minWordSizefor2Typos"),
     exact_settings("maxValuesPerFacet"),

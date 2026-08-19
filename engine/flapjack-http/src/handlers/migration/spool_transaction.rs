@@ -1,3 +1,5 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/spool_transaction.rs.
+
 use super::*;
 #[cfg(test)]
 use std::cell::RefCell;
@@ -97,6 +99,7 @@ impl SpoolStore {
         self.completed_resource_ids(job_uuid, ObjectResource::Synonyms)
     }
 
+    /// TODO: Document SpoolStore.commit_object_page.
     fn commit_object_page(
         &self,
         job_uuid: Uuid,
@@ -175,6 +178,7 @@ impl SpoolStore {
         Ok(())
     }
 
+    /// TODO: Document SpoolStore.stage_transaction_files.
     fn stage_transaction_files(
         &self,
         job_uuid: Uuid,
@@ -198,6 +202,7 @@ impl SpoolStore {
         self.completed_resource_ids_from_manifest(job_uuid, &manifest, resource)
     }
 
+    /// TODO: Document SpoolStore.completed_resource_ids_from_manifest.
     pub(super) fn completed_resource_ids_from_manifest(
         &self,
         job_uuid: Uuid,
@@ -246,6 +251,7 @@ struct CompletedSidecarAppend<'a> {
 }
 
 impl SpoolStore {
+    /// TODO: Document SpoolStore.completed_resource_page_check.
     fn completed_resource_page_check(
         &self,
         job_uuid: Uuid,
@@ -296,6 +302,7 @@ impl SpoolStore {
         })
     }
 
+    /// TODO: Document SpoolStore.remember_completed_resource_append.
     fn remember_completed_resource_append(
         &self,
         job_uuid: Uuid,
@@ -331,6 +338,7 @@ impl SpoolStore {
             update_sidecar_digest_state(append.previous_digest_state, append.sidecar_delta);
     }
 
+    /// TODO: Document SpoolStore.read_completed_sidecar_snapshot.
     fn read_completed_sidecar_snapshot(
         &self,
         job_uuid: Uuid,
@@ -429,6 +437,7 @@ fn id_lines(object_ids: &[&str]) -> Vec<u8> {
     bytes
 }
 
+/// TODO: Document append_completed_id_lines.
 pub(super) fn append_completed_id_lines(
     path: &Path,
     sidecar: &SidecarManifest,
@@ -493,6 +502,7 @@ fn update_sidecar_digest_state(mut state: u64, bytes: &[u8]) -> u64 {
     state
 }
 
+/// TODO: Document new_staged_artifact.
 pub(super) fn new_staged_artifact(
     kind: ArtifactKind,
     bytes: &[u8],

@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/tests/ack_on_durable_integration.rs.
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +30,7 @@ use tokio::time::{sleep, Instant};
 const DEFAULT_WRITE_DURABLE_TIMEOUT_MS_FOR_TEST: u64 = 30_000;
 static DURABLE_TIMEOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// TODO: Document make_state.
 fn make_state(tmp: &TempDir) -> Arc<AppState> {
     let manager = IndexManager::new(tmp.path());
     let dictionary_manager = Arc::new(DictionaryManager::new(tmp.path()));
@@ -65,6 +67,7 @@ fn make_state(tmp: &TempDir) -> Arc<AppState> {
     })
 }
 
+/// TODO: Document post_single_doc.
 async fn post_single_doc(
     state: &Arc<AppState>,
     index: &str,
@@ -111,6 +114,7 @@ fn extract_numeric_task_id(payload: &Value, context: &str) -> i64 {
         .unwrap_or_else(|| panic!("{context} response should include numeric taskID: {payload}"))
 }
 
+/// TODO: Document wait_for_task_terminal.
 async fn wait_for_task_terminal(
     manager: &Arc<IndexManager>,
     numeric_task_id: i64,
@@ -136,6 +140,7 @@ async fn wait_for_task_terminal(
     }
 }
 
+/// TODO: Document seed_committed_doc.
 async fn seed_committed_doc(
     state: &Arc<AppState>,
     manager: &Arc<IndexManager>,
@@ -293,6 +298,7 @@ fn test_environment_lock_recovery_preserves_later_test_coverage() {
     drop(recovered);
 }
 
+/// TODO: Document test_durable_timeout_env_override_requires_isolation.
 #[test]
 fn test_durable_timeout_env_override_requires_isolation() {
     let first_override = set_durable_timeout_env_for_test(111);
@@ -320,6 +326,7 @@ fn test_durable_timeout_env_override_requires_isolation() {
     );
 }
 
+/// TODO: Document test_http_200_implies_tantivy_durable.
 #[tokio::test(flavor = "current_thread")]
 async fn test_http_200_implies_tantivy_durable() {
     let _durable_timeout_override = set_default_durable_timeout_env_for_test();
@@ -368,6 +375,7 @@ async fn test_http_200_implies_tantivy_durable() {
     );
 }
 
+/// TODO: Document test_queue_full_returns_429_retry_after.
 #[tokio::test(flavor = "current_thread")]
 async fn test_queue_full_returns_429_retry_after() {
     let tmp = TempDir::new().expect("tempdir should create");
@@ -402,6 +410,7 @@ async fn test_queue_full_returns_429_retry_after() {
     );
 }
 
+/// TODO: Document test_commit_failure_returns_5xx.
 #[tokio::test(flavor = "current_thread")]
 async fn test_commit_failure_returns_5xx() {
     let _durable_timeout_override = set_default_durable_timeout_env_for_test();
@@ -467,6 +476,7 @@ async fn test_commit_failure_returns_5xx() {
     );
 }
 
+/// TODO: Document test_delete_object_restart_returns_bounded_503.
 #[tokio::test(flavor = "current_thread")]
 async fn test_delete_object_restart_returns_bounded_503() {
     let tmp = TempDir::new().expect("tempdir should create");
@@ -569,6 +579,7 @@ async fn test_delete_object_restart_returns_bounded_503() {
     );
 }
 
+/// TODO: Document test_delete_object_replica_durable_failure_preserves_task_id.
 #[tokio::test(flavor = "current_thread")]
 async fn test_delete_object_replica_durable_failure_preserves_task_id() {
     let _durable_timeout_override = set_default_durable_timeout_env_for_test();
@@ -624,6 +635,7 @@ async fn test_delete_object_replica_durable_failure_preserves_task_id() {
     );
 }
 
+/// TODO: Document test_delete_object_replica_queue_full_preserves_task_id_and_retry_after.
 #[tokio::test(flavor = "current_thread")]
 async fn test_delete_object_replica_queue_full_preserves_task_id_and_retry_after() {
     let _durable_timeout_override = set_default_durable_timeout_env_for_test();

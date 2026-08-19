@@ -20,7 +20,13 @@ fn test_analytics_config(tmp: &TempDir) -> AnalyticsConfig {
 }
 
 fn app_router(collector: Arc<AnalyticsCollector>) -> Router {
-    app_router_with_base(collector, std::path::PathBuf::from("/dev/null"))
+    let profile_store_base_path = collector
+        .config()
+        .data_dir
+        .parent()
+        .expect("test analytics dir should have a parent")
+        .to_path_buf();
+    app_router_with_base(collector, profile_store_base_path)
 }
 
 /// Build the test router with a custom profile store base path for GDPR delete integration tests.
@@ -28,9 +34,18 @@ fn app_router_with_base(
     collector: Arc<AnalyticsCollector>,
     profile_store_base_path: std::path::PathBuf,
 ) -> Router {
+    app_router_with_base_and_notifier(collector, profile_store_base_path, None)
+}
+
+fn app_router_with_base_and_notifier(
+    collector: Arc<AnalyticsCollector>,
+    profile_store_base_path: std::path::PathBuf,
+    gdpr_notifier: Option<Arc<crate::notifications::NotificationService>>,
+) -> Router {
     let gdpr_state = GdprDeleteState {
         analytics_collector: Arc::clone(&collector),
         profile_store_base_path,
+        gdpr_notifier,
     };
     Router::new()
         .route("/1/events", post(post_events))

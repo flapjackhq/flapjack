@@ -17,7 +17,7 @@
  * - BETA badge: displayed
  * - Clear Analytics: confirmation dialog flow
  *
- * STANDARDS COMPLIANCE (~/.matt/scrai/globals/standards/browser_testing.md):
+ * STANDARDS COMPLIANCE (engine/dashboard/_dev/testing/TESTING.md):
  * - Zero page.evaluate() — all assertions via Playwright locators
  * - Zero CSS class selectors — uses data-testid, getByRole, getByText
  * - Zero conditional skipping — all assertions are hard (no if/catch guards)

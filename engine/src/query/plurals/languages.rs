@@ -1,3 +1,4 @@
+//! Stub summary for languages.rs.
 // ── French plural rules ──
 // French plurals are simpler than English: mostly add -s.
 // Key exceptions: -eau → -eaux, -al → -aux, -ou (some) → -oux
@@ -226,6 +227,7 @@ fn generate_spanish_plural(word: &str) -> String {
 // ── Portuguese plural rules ──
 // Rule-based approximation for common productive patterns.
 
+/// TODO: Document is_portuguese_vowel.
 fn is_portuguese_vowel(ch: char) -> bool {
     matches!(
         ch,

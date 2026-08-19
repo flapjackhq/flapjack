@@ -130,6 +130,7 @@ where
         }
     }
 
+    /// TODO: Document CapturedLogLines.on_event.
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let mut message_visitor = EventMessageVisitor::default();
         event.record(&mut message_visitor);
@@ -164,6 +165,7 @@ fn request_id_test_router() -> Router {
         )
         .layer(axum::middleware::from_fn(request_id_middleware))
 }
+/// TODO: Document request_id_generates_parseable_uuid_v4_when_missing.
 #[tokio::test]
 async fn request_id_generates_parseable_uuid_v4_when_missing() {
     let app = request_id_test_router();
@@ -190,6 +192,7 @@ async fn request_id_generates_parseable_uuid_v4_when_missing() {
         "request ID should be UUID v4"
     );
 }
+/// TODO: Document request_id_echoes_client_header_when_present.
 #[tokio::test]
 async fn request_id_echoes_client_header_when_present() {
     let app = request_id_test_router();
@@ -212,6 +215,7 @@ async fn request_id_echoes_client_header_when_present() {
         .expect("response should include x-request-id");
     assert_eq!(request_id, "client-123");
 }
+/// TODO: Document request_id_generates_parseable_uuid_v4_when_header_is_blank.
 #[tokio::test]
 async fn request_id_generates_parseable_uuid_v4_when_header_is_blank() {
     let app = request_id_test_router();
@@ -239,6 +243,7 @@ async fn request_id_generates_parseable_uuid_v4_when_header_is_blank() {
         "blank request IDs should fall back to UUID v4"
     );
 }
+/// TODO: Document log_line_matches_response_header_value.
 #[test]
 fn log_line_matches_response_header_value() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -277,6 +282,7 @@ fn log_line_matches_response_header_value() {
         log_contents
     );
 }
+/// TODO: Document json_logs_include_request_id_from_middleware_span.
 #[test]
 fn json_logs_include_request_id_from_middleware_span() {
     let runtime = tokio::runtime::Builder::new_current_thread()

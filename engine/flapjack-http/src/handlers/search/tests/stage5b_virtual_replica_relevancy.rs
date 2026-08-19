@@ -1,3 +1,4 @@
+//! Stub summary for stage5b_virtual_replica_relevancy.rs.
 use super::*;
 
 fn make_priority_doc(id: &str, title: String, priority: i64) -> Document {
@@ -24,6 +25,7 @@ fn save_primary_with_replica(
     save_index_settings(state, primary_index_name, &primary_settings);
 }
 
+/// TODO: Document setup_virtual_replica_index.
 async fn setup_virtual_replica_index(
     state: &Arc<AppState>,
     primary_index_name: &str,
@@ -52,6 +54,7 @@ async fn setup_virtual_replica_index(
         .await
         .unwrap();
 }
+/// TODO: Document virtual_replica_search_uses_replica_dictionary_entries.
 #[tokio::test]
 async fn virtual_replica_search_uses_replica_dictionary_entries() {
     let tmp = TempDir::new().unwrap();
@@ -128,6 +131,7 @@ async fn virtual_replica_search_uses_replica_dictionary_entries() {
     );
 }
 
+/// TODO: Document setup_standard_replica_index.
 async fn setup_standard_replica_index(
     state: &Arc<AppState>,
     primary_index_name: &str,
@@ -150,6 +154,7 @@ async fn setup_standard_replica_index(
         .await
         .unwrap();
 }
+/// TODO: Document virtual_replica_search_uses_stored_strictness_when_query_omits_param.
 #[tokio::test]
 async fn virtual_replica_search_uses_stored_strictness_when_query_omits_param() {
     let tmp = TempDir::new().unwrap();
@@ -190,6 +195,7 @@ async fn virtual_replica_search_uses_stored_strictness_when_query_omits_param() 
         "stored strictness=90 should use custom-ranking-first blend for virtual replicas"
     );
 }
+/// TODO: Document query_relevancy_strictness_overrides_virtual_replica_stored_value.
 #[tokio::test]
 async fn query_relevancy_strictness_overrides_virtual_replica_stored_value() {
     let tmp = TempDir::new().unwrap();
@@ -254,6 +260,7 @@ async fn query_relevancy_strictness_overrides_virtual_replica_stored_value() {
         "query strictness should change ordering relative to stored strictness"
     );
 }
+/// TODO: Document virtual_replica_without_stored_strictness_defaults_to_hundred.
 #[tokio::test]
 async fn virtual_replica_without_stored_strictness_defaults_to_hundred() {
     let tmp = TempDir::new().unwrap();
@@ -288,6 +295,7 @@ async fn virtual_replica_without_stored_strictness_defaults_to_hundred() {
         "without stored strictness, virtual replicas should default to strictness=100"
     );
 }
+/// TODO: Document virtual_replica_ctr_reranking_uses_stored_strictness_when_query_omits_param.
 #[tokio::test]
 async fn virtual_replica_ctr_reranking_uses_stored_strictness_when_query_omits_param() {
     let tmp = TempDir::new().unwrap();
@@ -342,6 +350,7 @@ async fn virtual_replica_ctr_reranking_uses_stored_strictness_when_query_omits_p
         "stored strictness=100 should keep text-first ranking during CTR reranking for virtual replicas"
     );
 }
+/// TODO: Document virtual_replica_ctr_reranking_without_stored_strictness_defaults_to_hundred.
 #[tokio::test]
 async fn virtual_replica_ctr_reranking_without_stored_strictness_defaults_to_hundred() {
     let tmp = TempDir::new().unwrap();
@@ -389,6 +398,7 @@ async fn virtual_replica_ctr_reranking_without_stored_strictness_defaults_to_hun
         "without stored strictness, virtual replicas should still default to strictness=100 during CTR reranking"
     );
 }
+/// TODO: Document standard_replica_ctr_reranking_without_query_strictness_keeps_default_fifty.
 #[tokio::test]
 async fn standard_replica_ctr_reranking_without_query_strictness_keeps_default_fifty() {
     let tmp = TempDir::new().unwrap();

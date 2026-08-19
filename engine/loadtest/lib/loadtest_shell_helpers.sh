@@ -228,6 +228,7 @@ loadtest_encode_path_component() {
   jq -rn --arg component "$raw_component" '$component | @uri'
 }
 
+# TODO: Document loadtest_http_request.
 loadtest_http_request() {
   local method="$1"
   local path="$2"
@@ -671,6 +672,7 @@ extract_loadtest_numeric_task_id() {
   jq -er '.taskID | select(type == "number")' <<<"$response_json"
 }
 
+# TODO: Document wait_for_loadtest_task_published.
 wait_for_loadtest_task_published() {
   local task_id="$1"
   local attempt

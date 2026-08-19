@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/auth_tests/route_acl_tests/required_acl_tests.rs.
 use super::super::*;
 use crate::auth::route_acl::RouteAcl;
 
@@ -362,6 +363,7 @@ fn public_path_helper_excludes_internal_acme_route() {
     ));
 }
 
+/// TODO: Document public_path_helper_only_exposes_dashboard_mount.
 #[test]
 fn public_path_helper_only_exposes_dashboard_mount() {
     for path in [
@@ -398,6 +400,7 @@ fn public_path_helper_only_exposes_dashboard_mount() {
     assert!(!is_public_path("/dashboard-admin", false));
     assert!(!is_public_path("/dashboard-admin", true));
 }
+/// TODO: Document acl_personalization_strategy_requires_personalization.
 #[test]
 fn acl_personalization_strategy_requires_personalization() {
     assert_required_acl(

@@ -6,7 +6,10 @@ use serde_json::{json, Value};
 use std::sync::OnceLock;
 
 mod common;
-use common::{spawn_server, spawn_server_with_qs_analytics, spawn_server_without_analytics};
+use common::{
+    spawn_server, spawn_server_with_exact_qs_searches, spawn_server_with_qs_analytics,
+    spawn_server_with_qs_analytics_and_manager, spawn_server_without_analytics,
+};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -84,6 +87,86 @@ fn client_helper_reuses_singleton_client() {
     );
 }
 
+#[tokio::test]
+async fn destination_equal_to_source_is_rejected_without_mutating_source() {
+    let source = "protected-source";
+    let (addr, tmp, manager) = spawn_server_with_qs_analytics_and_manager(source).await;
+    let base = format!("http://{}", addr);
+
+    manager.create_tenant(source).unwrap();
+
+    let settings_path = tmp.path().join(source).join("settings.json");
+    flapjack::index::settings::IndexSettings {
+        searchable_attributes: Some(vec!["title".to_string()]),
+        custom_ranking: Some(vec!["desc(score)".to_string()]),
+        attributes_for_faceting: vec!["category".to_string()],
+        ..Default::default()
+    }
+    .save(settings_path.clone())
+    .unwrap();
+    manager
+        .add_documents_sync(
+            source,
+            vec![
+                flapjack::types::Document::from_json(&json!({
+                    "objectID": "source-a", "title": "alpha source", "category": "safe", "score": 2
+                }))
+                .unwrap(),
+                flapjack::types::Document::from_json(&json!({
+                    "objectID": "source-b", "title": "beta source", "category": "safe", "score": 1
+                }))
+                .unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let settings_before = std::fs::read(&settings_path).unwrap();
+    let documents_before: Value = auth(client().post(format!("{base}/1/indexes/{source}/query")))
+        .json(&json!({"query": "", "hitsPerPage": 100}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let response = post_config(&base, basic_config(source, source)).await;
+    assert_eq!(response.status(), 400);
+
+    let settings_after = std::fs::read(&settings_path).unwrap();
+    let documents_after: Value = auth(client().post(format!("{base}/1/indexes/{source}/query")))
+        .json(&json!({"query": "", "hitsPerPage": 100}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(settings_after, settings_before);
+    assert_eq!(documents_after["hits"], documents_before["hits"]);
+    assert_eq!(documents_after["nbHits"], 2);
+
+    let valid_destination = "protected-suggestions";
+    let response = post_config(&base, basic_config(valid_destination, source)).await;
+    assert_eq!(response.status(), 200);
+    wait_for_build(&base, valid_destination).await;
+
+    let settings_after_build = std::fs::read(&settings_path).unwrap();
+    let documents_after_build: Value =
+        auth(client().post(format!("{base}/1/indexes/{source}/query")))
+            .json(&json!({"query": "", "hitsPerPage": 100}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(settings_after_build, settings_before);
+    assert_eq!(documents_after_build["hits"], documents_before["hits"]);
+    assert_eq!(documents_after_build["nbHits"], 2);
+}
+
 // ── config CRUD ───────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -139,6 +222,10 @@ async fn config_crud_roundtrip() {
     let resp = get_config(&base, "my_suggestions").await;
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["sourceIndices"][0]["minHits"], 10);
+
+    // Updating also starts a build; deletion intentionally refuses to tear
+    // down control files while that authoritative build is running.
+    wait_for_build(&base, "my_suggestions").await;
 
     // Delete
     let resp = auth(client().delete(format!("{}/1/configs/my_suggestions", base)))
@@ -386,6 +473,59 @@ async fn build_from_analytics_data_populates_suggestions() {
     }
 }
 
+/// A deliberately small, noncanonical focused specimen must return its complete
+/// hand-counted suggestion set in descending search-frequency order. Goal 5's
+/// repository fixture is the sole PBV2 release oracle; this only catches an engine
+/// index that has correct documents but silently falls back to objectID ordering.
+#[tokio::test]
+async fn focused_search_orders_exact_suggestions_by_popularity() {
+    let (addr, _tmp) = spawn_server_with_exact_qs_searches(
+        "focused-products",
+        &[
+            ("alpha shoes", 7, 20),
+            ("beta bag", 4, 12),
+            ("gamma hat", 6, 8),
+        ],
+    )
+    .await;
+    let base = format!("http://{}", addr);
+
+    let config = json!({
+        "indexName": "focused_suggestions",
+        "sourceIndices": [{
+            "indexName": "focused-products",
+            "minHits": 5,
+            "minLetters": 4
+        }]
+    });
+    assert_eq!(post_config(&base, config).await.status(), 200);
+    wait_for_build(&base, "focused_suggestions").await;
+
+    let response = auth(client().post(format!("{}/1/indexes/focused_suggestions/query", base)))
+        .json(&json!({"query": "", "hitsPerPage": 10}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    let actual: Vec<(&str, u64)> = body["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| {
+            (
+                hit["query"].as_str().unwrap(),
+                hit["popularity"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        actual,
+        vec![("alpha shoes", 7), ("gamma hat", 6), ("beta bag", 4)]
+    );
+}
+
 #[tokio::test]
 async fn nb_words_correct() {
     // "my_store" does NOT match "product/movie/shop" patterns → uses DEFAULT_QUERIES,
@@ -539,7 +679,7 @@ async fn empty_analytics_builds_empty_index_no_crash() {
 
 #[tokio::test]
 async fn delete_config_does_not_delete_suggestions_index() {
-    let (addr, _tmp) = spawn_server_with_qs_analytics("products").await;
+    let (addr, tmp) = spawn_server_with_qs_analytics("products").await;
     let base = format!("http://{}", addr);
 
     post_config(&base, basic_config("del_no_index_test", "products")).await;
@@ -555,6 +695,16 @@ async fn delete_config_does_not_delete_suggestions_index() {
     // The config is gone
     assert_eq!(get_config(&base, "del_no_index_test").await.status(), 404);
 
+    let control_root = tmp.path().join(".query_suggestions");
+    for suffix in [".json", ".status.json", ".log.jsonl"] {
+        assert!(
+            !control_root
+                .join(format!("del_no_index_test{suffix}"))
+                .exists(),
+            "delete must remove query-suggestions control residue for suffix {suffix}"
+        );
+    }
+
     // But the suggestions index is still searchable
     let resp = auth(client().post(format!("{}/1/indexes/del_no_index_test/query", base)))
         .json(&json!({"query": ""}))
@@ -565,6 +715,28 @@ async fn delete_config_does_not_delete_suggestions_index() {
         resp.status(),
         200,
         "suggestions index should still be searchable after config delete"
+    );
+}
+
+#[tokio::test]
+async fn delete_config_while_building_returns_409_without_losing_config() {
+    let (addr, _tmp) = spawn_server_with_qs_analytics("products").await;
+    let base = format!("http://{}", addr);
+
+    assert_eq!(
+        post_config(&base, basic_config("delete_conflict_test", "products"))
+            .await
+            .status(),
+        200
+    );
+    let response = auth(client().delete(format!("{}/1/configs/delete_conflict_test", base)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    assert_eq!(
+        get_config(&base, "delete_conflict_test").await.status(),
+        200
     );
 }
 
@@ -887,9 +1059,8 @@ async fn update_config_while_building_returns_409() {
 
 // ── no analytics engine ───────────────────────────────────────────────────────
 
-/// When the server has no analytics engine, builds must gracefully skip
-/// (not crash, not get stuck with isRunning=true).
-/// lastBuiltAt stays null — a skipped build is NOT a successful build.
+/// When the server has no analytics engine, the terminal status and logs must
+/// report a failed attempt rather than silently looking like an idle config.
 #[tokio::test]
 async fn no_analytics_engine_build_gracefully_skips() {
     let (addr, _tmp) = spawn_server_without_analytics().await;
@@ -907,9 +1078,23 @@ async fn no_analytics_engine_build_gracefully_skips() {
         status["isRunning"], false,
         "build should not be stuck running when analytics engine is absent"
     );
+    assert!(status["lastBuiltAt"].is_string());
     assert!(
-        status["lastBuiltAt"].is_null(),
-        "lastBuiltAt must be null when build was skipped (no analytics engine): {:?}",
-        status["lastBuiltAt"]
+        status["lastSuccessfulBuiltAt"].is_null(),
+        "a failed attempt must not claim a successful build"
     );
+
+    let logs: Value = auth(client().get(format!("{}/1/logs/no_engine_test", base)))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(logs.as_array().unwrap().iter().any(|entry| {
+        entry["level"] == "ERROR"
+            && entry["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("analytics engine not initialized"))
+    }));
 }

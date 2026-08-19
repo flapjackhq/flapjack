@@ -1,3 +1,4 @@
+//! Stub summary for key_store.rs.
 use aes_gcm_siv::aead::{Aead, KeyInit};
 use aes_gcm_siv::{Aes256GcmSiv, Nonce};
 use base64::Engine;
@@ -694,6 +695,7 @@ fn derive_key_material_encryption_key(admin_key: &str) -> [u8; 32] {
     key_bytes
 }
 
+/// TODO: Document encrypt_key_material_value.
 fn encrypt_key_material_value(
     plaintext_value: &str,
     admin_key: &str,
@@ -714,6 +716,7 @@ fn encrypt_key_material_value(
     })
 }
 
+/// TODO: Document decrypt_key_material_value.
 fn decrypt_key_material_value(
     encrypted: &EncryptedHmacKey,
     admin_key: &str,

@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/vector/embedder_tests.rs.
 use super::*;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -782,6 +783,7 @@ async fn security_dns_rebind_openai_embedder_metadata_rebind_blocked_before_send
     );
 }
 
+/// TODO: Document security_rest_embedder_pins_to_vetted_resolution_addresses.
 #[tokio::test]
 #[serial_test::serial(flapjack_outbound_url_policy)]
 async fn security_rest_embedder_pins_to_vetted_resolution_addresses() {
@@ -826,6 +828,7 @@ async fn security_rest_embedder_pins_to_vetted_resolution_addresses() {
     assert_eq!(embedding, vec![0.1, 0.2, 0.3]);
 }
 
+/// TODO: Document security_openai_embedder_pins_to_vetted_resolution_addresses.
 #[tokio::test]
 #[serial_test::serial(flapjack_outbound_url_policy)]
 async fn security_openai_embedder_pins_to_vetted_resolution_addresses() {

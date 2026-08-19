@@ -9,7 +9,7 @@ import { seedAnalytics, deleteIndex, DEFAULT_ANALYTICS_CONFIG } from '../../fixt
  * These tests go beyond visibility checks — they verify actual data values,
  * mathematical consistency, and correct rollup behavior in the rendered UI.
  *
- * STANDARDS COMPLIANCE (~/.matt/scrai/globals/standards/browser_testing.md):
+ * STANDARDS COMPLIANCE (engine/dashboard/_dev/testing/TESTING.md):
  * - Zero raw locators — uses data-testid and role locators for value extraction
  * - Zero conditional skipping — all assertions are hard
  * - ESLint enforced via tests/e2e-ui/eslint.config.mjs

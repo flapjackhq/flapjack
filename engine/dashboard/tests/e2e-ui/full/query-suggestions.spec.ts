@@ -97,6 +97,9 @@ async function deleteConfigViaUi(page: Page, configName: string) {
     if (dlg.type() === 'confirm') await dlg.accept();
   });
   const card = page.getByTestId('qs-config-card').filter({ hasText: configName });
+  await expect(
+    card.getByRole('button', { name: 'Rebuild suggestions index', exact: true }),
+  ).toBeEnabled({ timeout: 30_000 });
   await card.getByRole('button', { name: /delete config/i }).click();
   await waitForConfigNotVisible(page, configName);
 }

@@ -1,3 +1,4 @@
+//! Stub summary for mod.rs.
 use super::*;
 use crate::handlers::personalization::{
     delete_user_profile, get_user_profile, set_personalization_strategy,
@@ -1977,6 +1978,155 @@ async fn search_personalization_applies_before_pagination_windowing() {
     );
 }
 
+/// Personalized-search computation and unrestricted user-token deletion must
+/// share the profile ordering owner, and an admitted post-purge computation
+/// must not recreate an empty token-bearing profile file.
+#[tokio::test]
+async fn personalized_search_and_full_delete_share_user_ordering() {
+    use crate::handlers::insights::{delete_usertoken, GdprDeleteState};
+    use axum::extract::{Path, State};
+    use flapjack::personalization::{
+        PersonalizationProfile, PersonalizationProfileStore, PersonalizationStrategy,
+    };
+    use std::future::Future;
+    use std::task::Poll;
+
+    let tmp = TempDir::new().unwrap();
+    let analytics_config = test_analytics_config(&tmp);
+    let collector = AnalyticsCollector::new(analytics_config.clone());
+    let analytics_engine = Arc::new(AnalyticsQueryEngine::new(analytics_config));
+    let state = make_basic_search_state_with_analytics(&tmp, Some(Arc::clone(&analytics_engine)));
+    let index_name = "products_personalization_ordering";
+    state.manager.create_tenant(index_name).unwrap();
+    state
+        .manager
+        .add_documents_sync(
+            index_name,
+            vec![
+                make_brand_doc("target-product", "target shoe", "Nike"),
+                make_brand_doc("control-product", "control shoe", "Adidas"),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let strategy = PersonalizationStrategy {
+        events_scoring: vec![flapjack::personalization::EventScoring {
+            event_name: "Product Clicked".to_string(),
+            event_type: "click".to_string(),
+            score: 100,
+        }],
+        facets_scoring: vec![flapjack::personalization::FacetScoring {
+            facet_name: "brand".to_string(),
+            score: 100,
+        }],
+        personalization_impact: 100,
+    };
+    let _ = set_personalization_strategy(State(Arc::clone(&state)), axum::Json(strategy.clone()))
+        .await
+        .unwrap();
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    collector.record_insight(make_click_event(
+        "target-user",
+        index_name,
+        "target-product",
+        now_ms,
+    ));
+    collector.record_insight(make_click_event(
+        "control-user",
+        index_name,
+        "control-product",
+        now_ms,
+    ));
+    collector.flush_all();
+
+    let store = PersonalizationProfileStore::new(tmp.path());
+    let control = PersonalizationProfile {
+        user_token: "control-user".to_string(),
+        last_event_at: None,
+        scores: BTreeMap::from([(
+            "brand".to_string(),
+            BTreeMap::from([("Adidas".to_string(), 20)]),
+        )]),
+    };
+    store.save_profile(&control).unwrap();
+    let probe = store.user_operation_probe_for_test("target-user").unwrap();
+
+    let search_request = SearchRequest {
+        enable_personalization: Some(true),
+        user_token: Some("target-user".to_string()),
+        ..Default::default()
+    };
+    let blocker = store.begin_user_operation("target-user").await.unwrap();
+    let mut search_profile = Box::pin(resolve_personalization_context(
+        &state,
+        &search_request,
+        None,
+    ));
+    let first_search_poll =
+        std::future::poll_fn(|cx| Poll::Ready(search_profile.as_mut().poll(cx))).await;
+    assert!(matches!(first_search_poll, Poll::Pending));
+    assert_eq!(
+        probe.admission_count(),
+        2,
+        "the personalized-search compute path must enter the profile operation owner"
+    );
+    drop(blocker);
+    let computed = search_profile.await.unwrap();
+    assert!(!computed.affinity_scores.is_empty());
+    assert!(store.load_profile("target-user").unwrap().is_some());
+
+    let blocker = store.begin_user_operation("target-user").await.unwrap();
+    let gdpr_state = GdprDeleteState {
+        analytics_collector: Arc::clone(&collector),
+        profile_store_base_path: tmp.path().to_path_buf(),
+        gdpr_notifier: None,
+    };
+    let mut full_delete = Box::pin(delete_usertoken(
+        State(gdpr_state),
+        Path("target-user".to_string()),
+        None,
+        None,
+    ));
+    let first_delete_poll =
+        std::future::poll_fn(|cx| Poll::Ready(full_delete.as_mut().poll(cx))).await;
+    assert!(matches!(first_delete_poll, Poll::Pending));
+    assert_eq!(
+        probe.admission_count(),
+        4,
+        "the unrestricted user-token DELETE must enter the profile operation owner"
+    );
+    let before_delete = analytics_engine
+        .query_events(
+            index_name,
+            "SELECT user_token FROM events WHERE user_token = 'target-user'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(before_delete.len(), 1, "purge ran before lock admission");
+    drop(blocker);
+    let _ = full_delete.await.unwrap();
+
+    assert!(store.load_profile("target-user").unwrap().is_none());
+    assert_eq!(store.load_profile("control-user").unwrap(), Some(control));
+    let after_delete = analytics_engine
+        .query_events(
+            index_name,
+            "SELECT user_token FROM events WHERE user_token = 'target-user'",
+        )
+        .await
+        .unwrap();
+    assert!(after_delete.is_empty());
+
+    let after_purge = resolve_personalization_context(&state, &search_request, None).await;
+    assert!(after_purge.is_none());
+    assert!(
+        store.load_profile("target-user").unwrap().is_none(),
+        "post-purge empty computation must not recreate a token-bearing profile file"
+    );
+}
+
 /// Test the complete personalization workflow: set strategy, build profile via clicks, verify ranking changes, and validate profile deletion.
 #[tokio::test]
 async fn stage6_personalization_lifecycle_d2() {
@@ -3451,6 +3601,74 @@ async fn response_enforces_pagination_limited_to_from_settings() {
     );
 }
 
+/// An omitted request window uses the saved hitsPerPage value, while an explicit
+/// request value remains authoritative.
+#[tokio::test]
+async fn response_uses_saved_hits_per_page_when_request_omits_it() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_basic_search_state(&tmp);
+    let index_name = "saved_hits_per_page_idx";
+
+    state.manager.create_tenant(index_name).unwrap();
+    let settings = flapjack::index::settings::IndexSettings {
+        searchable_attributes: Some(vec!["title".to_string()]),
+        hits_per_page: 2,
+        ..Default::default()
+    };
+    save_index_settings(&state, index_name, &settings);
+    state
+        .manager
+        .add_documents_sync(
+            index_name,
+            (1..=5)
+                .map(|number| Document {
+                    id: format!("pbv2-trail-{number:03}"),
+                    fields: HashMap::from([(
+                        "title".to_string(),
+                        FieldValue::Text(format!("trail jacket {number}")),
+                    )]),
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+
+    let app = search_router(state.clone());
+    let saved_default = post_search(&app, index_name, json!({"query": "trail"}), None).await;
+    assert_eq!(saved_default.status(), StatusCode::OK);
+    let saved_default = body_json(saved_default).await;
+    assert_eq!(saved_default["hitsPerPage"], 2);
+    assert_eq!(saved_default["nbPages"], 3);
+    assert_eq!(saved_default["hits"].as_array().map(Vec::len), Some(2));
+
+    let request_override = post_search(
+        &app,
+        index_name,
+        json!({"query": "trail", "hitsPerPage": 3}),
+        None,
+    )
+    .await;
+    assert_eq!(request_override.status(), StatusCode::OK);
+    let request_override = body_json(request_override).await;
+    assert_eq!(request_override["hitsPerPage"], 3);
+    assert_eq!(request_override["hits"].as_array().map(Vec::len), Some(3));
+
+    save_index_settings(
+        &state,
+        index_name,
+        &flapjack::index::settings::IndexSettings {
+            searchable_attributes: Some(vec!["title".to_string()]),
+            hits_per_page: 0,
+            ..Default::default()
+        },
+    );
+    let zero_default = post_search(&app, index_name, json!({"query": "trail"}), None).await;
+    assert_eq!(zero_default.status(), StatusCode::OK);
+    let zero_default = body_json(zero_default).await;
+    assert_eq!(zero_default["hitsPerPage"], 0);
+    assert_eq!(zero_default["hits"].as_array().map(Vec::len), Some(0));
+}
+
 /// Verify that unretrievableAttributes are hidden unless the API key has seeUnretrievableAttributes ACL.
 #[tokio::test]
 async fn response_unretrievable_attributes_respects_see_unretrievable_acl() {
@@ -4754,6 +4972,7 @@ fn parse_client_ip_for_geo_returns_none_for_missing_or_invalid_values() {
         Some("8.8.8.8".parse().unwrap())
     );
 }
+/// TODO: Document resolve_geoip_lookup_ip_requires_eligible_request_and_valid_user_ip.
 #[test]
 fn resolve_geoip_lookup_ip_requires_eligible_request_and_valid_user_ip() {
     let disabled = SearchRequest {
@@ -4793,6 +5012,7 @@ fn resolve_geoip_reader_returns_none_when_unavailable() {
     let no_reader: Option<Arc<crate::geoip::GeoIpReader>> = None;
     assert!(resolve_geoip_reader(&no_reader).is_none());
 }
+/// TODO: Document around_lat_lng_via_ip_resolves_coords_from_geoip.
 #[test]
 fn around_lat_lng_via_ip_resolves_coords_from_geoip() {
     // Requires a real MMDB file — skip if not available

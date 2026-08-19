@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/manager/publication/tests/repair_cli_generator.rs.
 use super::super::repair_cli_manifest::{
     self, load_scenario_manifest, load_scenario_manifest_from_path, ActivationKind, Scenario,
     ScenarioKind,
@@ -27,6 +28,7 @@ const PAUSE_WAIT: Duration = Duration::from_secs(10);
 #[path = "repair_cli_generator_tests.rs"]
 mod tests;
 
+/// TODO: Document GeneratedLayout.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct GeneratedLayout {
     scenario_id: String,
@@ -48,6 +50,7 @@ struct GeneratedLayout {
 }
 
 impl GeneratedLayout {
+    /// TODO: Document GeneratedLayout.from_scenario.
     fn from_scenario(scenario: &Scenario, boundaries: Vec<String>) -> Self {
         Self {
             scenario_id: scenario.id.clone(),
@@ -86,6 +89,7 @@ impl GeneratedLayout {
         self
     }
 
+    /// TODO: Document GeneratedLayout.minimal.
     fn minimal(scenario_id: String, kind: &str, boundaries: Vec<String>) -> Self {
         Self {
             scenario_id,
@@ -161,6 +165,7 @@ impl GeneratedResidueOracle {
     }
 }
 
+/// TODO: Document generate_from_environment.
 pub(super) fn generate_from_environment() {
     if std::env::var_os(WORKER_ENV).is_some() {
         run_worker_from_environment();
@@ -205,11 +210,13 @@ fn generate_scenario(
     }
 }
 
+/// TODO: Document generate_base_scenario.
 fn generate_base_scenario(artifact_root: &Path, scenario: &Scenario) -> GeneratedLayout {
     let manifest = load_scenario_manifest();
     generate_base_scenario_with_manifest(artifact_root, &manifest, scenario)
 }
 
+/// TODO: Document generate_base_scenario_with_manifest.
 fn generate_base_scenario_with_manifest(
     artifact_root: &Path,
     manifest: &ScenarioManifest,
@@ -239,11 +246,13 @@ fn generate_base_scenario_with_manifest(
     layout
 }
 
+/// TODO: Document generate_mutation_scenario.
 fn generate_mutation_scenario(artifact_root: &Path, scenario: &Scenario) -> GeneratedLayout {
     let manifest = load_scenario_manifest();
     generate_mutation_scenario_with_manifest(artifact_root, &manifest, scenario)
 }
 
+/// TODO: Document generate_mutation_scenario_with_manifest.
 fn generate_mutation_scenario_with_manifest(
     artifact_root: &Path,
     manifest: &ScenarioManifest,
@@ -301,6 +310,7 @@ fn run_worker_from_environment() {
         .expect("worker completed without pausing at requested boundary");
 }
 
+/// TODO: Document materialize_worker_layout.
 fn materialize_worker_layout(
     fixture: &ActivationFixture,
     activation: ActivationKind,
@@ -342,6 +352,7 @@ struct PausingFaultHook {
 }
 
 impl PausingFaultHook {
+    /// TODO: Document PausingFaultHook.new.
     fn new(
         case_id: String,
         activation: ActivationKind,
@@ -433,6 +444,7 @@ fn wait_for_valid_pause_report(
     report
 }
 
+/// TODO: Document wait_for_pause_report_with_timeout.
 fn wait_for_pause_report_with_timeout(
     child: &mut Child,
     report_path: &Path,
@@ -467,6 +479,7 @@ fn parse_pause_report(raw: &str) -> std::result::Result<PauseReport, String> {
     serde_json::from_str(raw).map_err(|error| format!("failed to parse pause report: {error}"))
 }
 
+/// TODO: Document validate_pause_report.
 fn validate_pause_report(
     report: &PauseReport,
     child_pid: u32,
@@ -497,6 +510,7 @@ fn validate_pause_report(
     Ok(())
 }
 
+/// TODO: Document validate_generated_layout_index.
 fn validate_generated_layout_index(
     manifest: &ScenarioManifest,
     generated: &[GeneratedLayout],
@@ -595,6 +609,7 @@ fn assert_generated_case_matches_manifest_with_fixture(
     Ok(())
 }
 
+/// TODO: Document assert_layout_preserves_manifest_oracles.
 fn assert_layout_preserves_manifest_oracles(
     scenario: &Scenario,
     layout: &GeneratedLayout,
@@ -630,6 +645,7 @@ fn assert_layout_preserves_manifest_oracles(
     Ok(())
 }
 
+/// TODO: Document assert_repaired_projection_matches_manifest.
 fn assert_repaired_projection_matches_manifest(
     case_root: &Path,
     scenario: &Scenario,
@@ -684,6 +700,7 @@ impl ExpectedIndexProjection {
         }
     }
 
+    /// TODO: Document ExpectedIndexProjection.from_visible_target.
     fn from_visible_target(
         fixture: &repair_cli_manifest::LiveHttpFixture,
         scenario: &Scenario,
@@ -710,6 +727,7 @@ fn index_manager_document_body(body: &serde_json::Value, object_id: &str) -> ser
     body
 }
 
+/// TODO: Document assert_index_projection.
 fn assert_index_projection(
     base: &Path,
     expected: ExpectedIndexProjection,
@@ -765,6 +783,7 @@ fn assert_index_projection(
     .map_err(|_| "projection validation thread panicked".to_string())?
 }
 
+/// TODO: Document write_manifest_control_index.
 fn write_manifest_control_index(
     base: &Path,
     fixture: &repair_cli_manifest::LiveHttpFixture,
@@ -796,6 +815,7 @@ fn assert_manifest_source_oracles(scenario: &Scenario) -> std::result::Result<()
     repair_cli_manifest::assert_source_oracles(scenario)
 }
 
+/// TODO: Document assert_manifest_path_policy_and_residue_oracles.
 fn assert_manifest_path_policy_and_residue_oracles(
     case_root: &Path,
     scenario: &Scenario,
@@ -842,6 +862,7 @@ fn assert_manifest_path_policy_and_residue_oracles(
     Ok(())
 }
 
+/// TODO: Document assert_materialized_journal_matches_manifest_identity.
 fn assert_materialized_journal_matches_manifest_identity(
     case_root: &Path,
     scenario: &Scenario,
@@ -903,6 +924,7 @@ fn fresh_case_root(artifact_root: &Path, scenario_id: &str) -> PathBuf {
     case_root
 }
 
+/// TODO: Document case_root_for.
 fn case_root_for(artifact_root: &Path, scenario_id: &str) -> PathBuf {
     assert!(
         !scenario_id.is_empty()
@@ -920,6 +942,7 @@ fn case_root_for(artifact_root: &Path, scenario_id: &str) -> PathBuf {
     case_root
 }
 
+/// TODO: Document copy_directory.
 fn copy_directory(from: &Path, to: &Path) {
     fs::create_dir_all(to).expect("failed to create copied directory");
     for entry in fs::read_dir(from).expect("failed to read copied directory") {

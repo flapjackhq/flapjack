@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/oplog.rs.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -422,6 +423,7 @@ impl OpLog {
         Ok(receipts)
     }
 
+    /// TODO: Document OpLog.committed_task_ids.
     pub(crate) fn committed_task_ids(
         &self,
         committed_seq: u64,

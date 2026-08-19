@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/spool_tests.rs.
 use super::*;
 use crate::handlers::migration::AsyncMigrationSourceProvider;
 use chrono::{TimeZone, Utc};
@@ -326,6 +327,7 @@ fn privacy_scrub_terminal_replay_preserves_phase() {
     assert_eq!(store.job_uuids().unwrap(), vec![job_uuid]);
 }
 
+/// TODO: Document default_limit_export.
 fn default_limit_export() -> (TempDir, SpoolStore, SpoolManifest) {
     let tmp = TempDir::new().unwrap();
     let limits = SpoolLimits::default();
@@ -415,6 +417,7 @@ fn fixed_width_document_pages(page_count: usize, page_size: usize) -> Vec<Vec<St
         .collect()
 }
 
+/// TODO: Document completed_id_checkpoints_write_only_delta.
 #[test]
 fn completed_id_checkpoints_write_only_delta() {
     let tmp = TempDir::new().unwrap();
@@ -518,6 +521,7 @@ fn completed_id_checkpoints_write_only_delta() {
     assert_eq!(retained_ids, expected_all_ids);
 }
 
+/// TODO: Document completed_id_sidecar_corruption_after_committed_prefix_fails_closed.
 #[test]
 fn completed_id_sidecar_corruption_after_committed_prefix_fails_closed() {
     for resource in [
@@ -566,6 +570,7 @@ fn completed_id_sidecar_corruption_after_committed_prefix_fails_closed() {
     }
 }
 
+/// TODO: Document commit_resource_page_with_ids.
 fn commit_resource_page_with_ids(
     store: &SpoolStore,
     job_uuid: uuid::Uuid,
@@ -597,6 +602,7 @@ fn completed_ids_for_resource(
     }
 }
 
+/// TODO: Document accepted_store_with_artifacts.
 fn accepted_store_with_artifacts() -> (TempDir, SpoolStore, uuid::Uuid) {
     let tmp = TempDir::new().unwrap();
     let store = fixed_store(&tmp);
@@ -644,6 +650,7 @@ fn accepted_store_with_artifacts() -> (TempDir, SpoolStore, uuid::Uuid) {
     (tmp, store, view.job_uuid)
 }
 
+/// TODO: Document migration_phase_record_uses_caller_uuid_and_survives_reopen.
 #[test]
 fn migration_phase_record_uses_caller_uuid_and_survives_reopen() {
     let tmp = TempDir::new().unwrap();
@@ -684,6 +691,7 @@ fn migration_phase_record_uses_caller_uuid_and_survives_reopen() {
     assert!(phase.cancel_requested);
 }
 
+/// TODO: Document migration_phase_record_defaults_missing_cancel_requested_to_false.
 #[test]
 fn migration_phase_record_defaults_missing_cancel_requested_to_false() {
     let tmp = TempDir::new().unwrap();
@@ -714,6 +722,7 @@ fn migration_phase_record_defaults_missing_cancel_requested_to_false() {
     assert!(!phase.cancel_requested);
 }
 
+/// TODO: Document request_async_migration_cancel_is_idempotent_for_running_jobs.
 #[test]
 fn request_async_migration_cancel_is_idempotent_for_running_jobs() {
     let tmp = TempDir::new().unwrap();
@@ -735,6 +744,7 @@ fn request_async_migration_cancel_is_idempotent_for_running_jobs() {
     assert_eq!(second.disposition, MigrationDisposition::Running);
 }
 
+/// TODO: Document request_async_migration_cancel_is_noop_for_terminal_jobs.
 #[test]
 fn request_async_migration_cancel_is_noop_for_terminal_jobs() {
     let tmp = TempDir::new().unwrap();
@@ -789,6 +799,7 @@ fn request_async_migration_cancel_is_noop_for_terminal_jobs() {
     }
 }
 
+/// TODO: Document request_async_migration_cancel_detects_post_commit_boundary.
 #[test]
 fn request_async_migration_cancel_detects_post_commit_boundary() {
     let tmp = TempDir::new().unwrap();
@@ -839,6 +850,7 @@ fn request_async_migration_cancel_detects_post_commit_boundary() {
     );
 }
 
+/// TODO: Document request_async_migration_cancel_allows_preexisting_target_before_journal.
 #[test]
 fn request_async_migration_cancel_allows_preexisting_target_before_journal() {
     let tmp = TempDir::new().unwrap();
@@ -892,6 +904,7 @@ fn requested_cancel_record(decision: MigrationCancelRequest) -> MigrationPhaseRe
     }
 }
 
+/// TODO: Document migration_phase_progress_is_labeled_export_progress_not_completion.
 #[test]
 fn migration_phase_progress_is_labeled_export_progress_not_completion() {
     let tmp = TempDir::new().unwrap();
@@ -958,6 +971,7 @@ fn migration_phase_progress_is_labeled_export_progress_not_completion() {
     assert!(!raw_phase.contains("percent"));
 }
 
+/// TODO: Document migration_phase_read_rejects_missing_and_corrupt_records_by_uuid.
 #[test]
 fn migration_phase_read_rejects_missing_and_corrupt_records_by_uuid() {
     let tmp = TempDir::new().unwrap();
@@ -982,6 +996,7 @@ fn migration_phase_read_rejects_missing_and_corrupt_records_by_uuid() {
     );
 }
 
+/// TODO: Document migration_phase_record_survives_export_artifact_deletion.
 #[test]
 fn migration_phase_record_survives_export_artifact_deletion() {
     let tmp = TempDir::new().unwrap();
@@ -1013,6 +1028,7 @@ fn migration_phase_record_survives_export_artifact_deletion() {
     );
 }
 
+/// TODO: Document create_export_phase_write_failure_does_not_publish_manifest.
 #[test]
 fn create_export_phase_write_failure_does_not_publish_manifest() {
     let tmp = TempDir::new().unwrap();
@@ -1038,6 +1054,7 @@ fn create_export_phase_write_failure_does_not_publish_manifest() {
     assert_eq!(phase.export_progress, None);
 }
 
+/// TODO: Document create_export_recovers_after_crash_between_phase_and_manifest.
 #[test]
 fn create_export_recovers_after_crash_between_phase_and_manifest() {
     let tmp = TempDir::new().unwrap();
@@ -1094,6 +1111,7 @@ fn create_export_rejects_mismatched_source_identity_on_readmission() {
     );
 }
 
+/// TODO: Document migration_phase_read_rejects_foreign_uuid_record.
 #[test]
 fn migration_phase_read_rejects_foreign_uuid_record() {
     let tmp = TempDir::new().unwrap();
@@ -1126,6 +1144,7 @@ fn migration_phase_read_rejects_foreign_uuid_record() {
     );
 }
 
+/// TODO: Document migration_phase_transitions_reject_backward_and_skipped_edges.
 #[test]
 fn migration_phase_transitions_reject_backward_and_skipped_edges() {
     let tmp = TempDir::new().unwrap();
@@ -1180,6 +1199,7 @@ fn migration_phase_transitions_reject_backward_and_skipped_edges() {
     );
 }
 
+/// TODO: Document succeed_migration_requires_activating_phase.
 #[test]
 fn succeed_migration_requires_activating_phase() {
     let tmp = TempDir::new().unwrap();
@@ -1362,6 +1382,7 @@ fn legacy_phase_record_without_import_outcome_field_reads_as_none() {
     assert_eq!(legacy.import_outcome, None);
 }
 
+/// TODO: Document read_migration_phase_reconciles_stale_progress_from_manifest.
 #[test]
 fn read_migration_phase_reconciles_stale_progress_from_manifest() {
     let tmp = TempDir::new().unwrap();
@@ -1480,6 +1501,7 @@ fn first_page_error_kind(
     page.unwrap_err().kind()
 }
 
+/// TODO: Document default_limits_accept_algolia_free_build_plan_item_counts.
 #[test]
 fn default_limits_accept_algolia_free_build_plan_item_counts() {
     for items in [23_407, 999_999, 1_000_000] {
@@ -1492,6 +1514,7 @@ fn default_limits_accept_algolia_free_build_plan_item_counts() {
     }
 }
 
+/// TODO: Document default_limits_refuse_items_above_resource_boundary.
 #[test]
 fn default_limits_refuse_items_above_resource_boundary() {
     let direct_items = 1_000_001;
@@ -1516,6 +1539,7 @@ fn default_limits_refuse_items_above_resource_boundary() {
     );
 }
 
+/// TODO: Document manifest_freezes_default_item_limit_at_export_creation.
 #[test]
 fn manifest_freezes_default_item_limit_at_export_creation() {
     let (tmp, _store, manifest) = default_limit_export();
@@ -1546,6 +1570,7 @@ fn manifest_freezes_default_item_limit_at_export_creation() {
     );
 }
 
+/// TODO: Document creates_jobs_under_migration_export_root_with_private_mode.
 #[tokio::test]
 async fn creates_jobs_under_migration_export_root_with_private_mode() {
     let tmp = TempDir::new().unwrap();
@@ -1583,6 +1608,7 @@ async fn creates_jobs_under_migration_export_root_with_private_mode() {
     }
 }
 
+/// TODO: Document manifest_scrubs_source_data_and_public_progress_is_derived.
 #[test]
 fn manifest_scrubs_source_data_and_public_progress_is_derived() {
     let tmp = TempDir::new().unwrap();
@@ -1634,6 +1660,7 @@ fn manifest_scrubs_source_data_and_public_progress_is_derived() {
     assert!((status.progress.ratio - 3.0 / 7.0).abs() < f64::EPSILON);
 }
 
+/// TODO: Document limits_reject_writes_without_advancing_manifest_or_exposing_artifacts.
 #[test]
 fn limits_reject_writes_without_advancing_manifest_or_exposing_artifacts() {
     let tmp = TempDir::new().unwrap();
@@ -1669,6 +1696,7 @@ fn limits_reject_writes_without_advancing_manifest_or_exposing_artifacts() {
     );
 }
 
+/// TODO: Document staged_artifacts_recover_without_unregistered_visible_files.
 #[test]
 fn staged_artifacts_recover_without_unregistered_visible_files() {
     let tmp = TempDir::new().unwrap();
@@ -1702,6 +1730,7 @@ fn staged_artifacts_recover_without_unregistered_visible_files() {
         .exists());
 }
 
+/// TODO: Document completed_object_sidecar_uses_only_committed_prefix_after_reopen.
 #[test]
 fn completed_object_sidecar_uses_only_committed_prefix_after_reopen() {
     let tmp = TempDir::new().unwrap();
@@ -1738,6 +1767,7 @@ fn completed_object_sidecar_uses_only_committed_prefix_after_reopen() {
         .unwrap());
 }
 
+/// TODO: Document deletion_fence_is_digest_checked_and_blocks_future_commits.
 #[test]
 fn deletion_fence_is_digest_checked_and_blocks_future_commits() {
     let tmp = TempDir::new().unwrap();
@@ -1780,6 +1810,7 @@ fn deletion_fence_is_digest_checked_and_blocks_future_commits() {
     );
 }
 
+/// TODO: Document garbage_collection_keeps_tombstone_and_does_not_scan_unregistered_paths.
 #[test]
 fn garbage_collection_keeps_tombstone_and_does_not_scan_unregistered_paths() {
     let tmp = TempDir::new().unwrap();
@@ -2190,6 +2221,7 @@ fn manifest_payload_accounting(
     )
 }
 
+/// TODO: Document recovery_handles_each_artifact_transaction_boundary.
 #[test]
 fn recovery_handles_each_artifact_transaction_boundary() {
     let tmp = TempDir::new().unwrap();
@@ -2260,6 +2292,7 @@ fn recovery_handles_each_artifact_transaction_boundary() {
     }
 }
 
+/// TODO: Document typed_artifact_methods_account_exact_limits_and_leave_no_partial_state.
 #[test]
 fn typed_artifact_methods_account_exact_limits_and_leave_no_partial_state() {
     let tmp = TempDir::new().unwrap();
@@ -2323,6 +2356,7 @@ fn typed_artifact_methods_account_exact_limits_and_leave_no_partial_state() {
     assert_eq!(status.progress.total, 7);
 }
 
+/// TODO: Document global_byte_limit_is_derived_across_jobs_under_root_lock.
 #[test]
 fn global_byte_limit_is_derived_across_jobs_under_root_lock() {
     let tmp = TempDir::new().unwrap();
@@ -2380,6 +2414,7 @@ fn global_byte_limit_is_derived_across_jobs_under_root_lock() {
     );
 }
 
+/// TODO: Document completed_object_sidecar_commits_exact_membership_and_truncates_tail.
 #[test]
 fn completed_object_sidecar_commits_exact_membership_and_truncates_tail() {
     let tmp = TempDir::new().unwrap();
@@ -2424,6 +2459,7 @@ fn completed_object_sidecar_commits_exact_membership_and_truncates_tail() {
         .unwrap());
 }
 
+/// TODO: Document completed_object_sidecar_ignores_uncommitted_tail_before_next_commit.
 #[test]
 fn completed_object_sidecar_ignores_uncommitted_tail_before_next_commit() {
     let tmp = TempDir::new().unwrap();
@@ -2462,6 +2498,7 @@ fn completed_object_sidecar_ignores_uncommitted_tail_before_next_commit() {
         .unwrap());
 }
 
+/// TODO: Document completed_object_sidecar_corruption_is_rejected.
 #[test]
 fn completed_object_sidecar_corruption_is_rejected() {
     let tmp = TempDir::new().unwrap();
@@ -2488,6 +2525,7 @@ fn completed_object_sidecar_corruption_is_rejected() {
     );
 }
 
+/// TODO: Document deletion_removes_completed_object_sidecar_and_resets_public_progress.
 #[test]
 fn deletion_removes_completed_object_sidecar_and_resets_public_progress() {
     let tmp = TempDir::new().unwrap();
@@ -2527,6 +2565,7 @@ fn deletion_removes_completed_object_sidecar_and_resets_public_progress() {
     );
 }
 
+/// TODO: Document recovery_recalculates_progress_when_visible_artifact_is_missing.
 #[test]
 fn recovery_recalculates_progress_when_visible_artifact_is_missing() {
     let tmp = TempDir::new().unwrap();
@@ -2562,6 +2601,7 @@ fn recovery_recalculates_progress_when_visible_artifact_is_missing() {
     );
 }
 
+/// TODO: Document same_job_two_handles_preserve_artifact_and_sidecar_progress.
 #[test]
 fn same_job_two_handles_preserve_artifact_and_sidecar_progress() {
     let tmp = TempDir::new().unwrap();
@@ -2608,6 +2648,7 @@ fn same_job_two_handles_preserve_artifact_and_sidecar_progress() {
     );
 }
 
+/// TODO: Document cross_job_two_handles_cannot_exceed_global_cap_or_leave_orphans.
 #[test]
 fn cross_job_two_handles_cannot_exceed_global_cap_or_leave_orphans() {
     let tmp = TempDir::new().unwrap();
@@ -2687,6 +2728,7 @@ fn cross_job_two_handles_cannot_exceed_global_cap_or_leave_orphans() {
     assert_eq!(visible_count, 1);
 }
 
+/// TODO: Document public_outputs_and_errors_are_scrubbed_and_source_identity_must_be_digest.
 #[test]
 fn public_outputs_and_errors_are_scrubbed_and_source_identity_must_be_digest() {
     let tmp = TempDir::new().unwrap();
@@ -2751,6 +2793,7 @@ fn public_outputs_and_errors_are_scrubbed_and_source_identity_must_be_digest() {
     }
 }
 
+/// TODO: Document accepted_reader_decodes_only_accepted_jobs_and_typed_artifacts.
 #[test]
 fn accepted_reader_decodes_only_accepted_jobs_and_typed_artifacts() {
     let (_tmp, store, accepted_job) = accepted_store_with_artifacts();
@@ -3035,6 +3078,7 @@ fn push_visible_config_artifact_with_item_count(
     std::fs::write(store.job_dir(job_uuid).join(final_path), bytes).unwrap();
 }
 
+/// TODO: Document accepted_reader_refuses_unsafe_manifest_artifact_paths.
 #[test]
 fn accepted_reader_refuses_unsafe_manifest_artifact_paths() {
     for final_path in [
@@ -3076,6 +3120,7 @@ fn accepted_reader_refuses_symlink_artifact_targets() {
     );
 }
 
+/// TODO: Document accepted_reader_refuses_corrupt_artifact_payloads.
 #[test]
 fn accepted_reader_refuses_corrupt_artifact_payloads() {
     let cases: Vec<(&str, SpoolErrorKind, ArtifactCorruption)> = vec![

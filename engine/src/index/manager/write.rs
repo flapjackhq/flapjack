@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/manager/write.rs.
 use super::*;
 #[cfg(test)]
 use std::sync::{Arc, Mutex, OnceLock};
@@ -411,6 +412,7 @@ impl super::IndexManager {
         )
     }
 
+    /// TODO: Document IndexManager.admit_write_actions.
     fn admit_write_actions(
         &self,
         tenant_id: &str,

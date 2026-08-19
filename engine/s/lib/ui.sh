@@ -150,6 +150,7 @@ else
 fi
 _SPINNER_FRAME_COUNT=${#_SPINNER_FRAMES[@]}
 
+# TODO: Document spin_start.
 spin_start() {
   local msg="$1"
   # No spinner in non-interactive mode
@@ -169,6 +170,7 @@ spin_start() {
   _SPINNER_PID=$!
 }
 
+# TODO: Document spin_stop.
 spin_stop() {
   local status="${1:-success}"
   local msg="${2:-}"

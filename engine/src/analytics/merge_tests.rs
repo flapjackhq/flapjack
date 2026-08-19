@@ -22,6 +22,56 @@ fn test_merge_top_k_overlapping() {
 }
 
 #[test]
+fn test_merge_top_k_ties_are_sorted_by_key() {
+    let node_a = json!({"searches": [
+        {"search": "zebra", "count": 1, "nbHits": 2},
+        {"search": "alpha", "count": 2, "nbHits": 3},
+    ]});
+    let node_b = json!({"searches": [
+        {"search": "zebra", "count": 1, "nbHits": 2},
+        {"search": "beta", "count": 2, "nbHits": 4},
+    ]});
+
+    let merged = merge_top_k(&[node_a, node_b], "searches", "search", 10);
+    let queries: Vec<&str> = merged["searches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["search"].as_str().unwrap())
+        .collect();
+
+    assert_eq!(queries, vec!["alpha", "beta", "zebra"]);
+}
+
+#[test]
+fn test_merge_top_k_uses_global_weighted_nb_hits_average() {
+    // Node A saw one 100-hit search. Node B saw nine 10-hit searches.
+    // The global average is (100 + 90) / 10 = 19, not 100 + 10 = 110
+    // and not the unweighted node average 55.
+    let node_a = json!({"searches": [{
+        "search": "trail",
+        "count": 1,
+        "nbHits": 100,
+        "_nbHitsSum": 100,
+        "_nbHitsCount": 1
+    }]});
+    let node_b = json!({"searches": [{
+        "search": "trail",
+        "count": 9,
+        "nbHits": 10,
+        "_nbHitsSum": 90,
+        "_nbHitsCount": 9
+    }]});
+
+    let merged = merge_top_k(&[node_a, node_b], "searches", "search", 10);
+    let trail = &merged["searches"][0];
+    assert_eq!(trail["count"], 10);
+    assert_eq!(trail["nbHits"], 19);
+    assert!(trail.get("_nbHitsSum").is_none());
+    assert!(trail.get("_nbHitsCount").is_none());
+}
+
+#[test]
 fn test_merge_rates_never_average() {
     // Node A: 1 no-result out of 4 searches = 25%
     // Node B: 2 no-results out of 6 searches = 33%
@@ -440,10 +490,10 @@ fn test_merge_histogram_no_duplicates_on_zero() {
     assert_eq!(positions[0]["clickCount"], 5);
 }
 
-// B2 regression: nbHits must be summed, not taken from arbitrary first node
-/// Regression: verify that `nbHits` is summed across nodes rather than taken from an arbitrary first occurrence, and that entries lacking `nbHits` do not gain the field.
+// B2 regression: nbHits must be globally weighted, not added across nodes.
+/// Regression: verify that `nbHits` is weighted by node search count and that entries lacking `nbHits` do not gain the field.
 #[test]
-fn test_merge_top_k_sums_nb_hits() {
+fn test_merge_top_k_weights_legacy_nb_hits() {
     let r1 = json!({"searches": [
         {"search": "iphone", "count": 100, "nbHits": 5000},
         {"search": "samsung", "count": 50, "nbHits": 2000},
@@ -458,10 +508,10 @@ fn test_merge_top_k_sums_nb_hits() {
 
     let iphone = searches.iter().find(|s| s["search"] == "iphone").unwrap();
     assert_eq!(iphone["count"], 180);
-    // nbHits must be summed: 5000 + 3000 = 8000
+    // Weighted legacy fallback: (5000*100 + 3000*80) / 180 = 4111.
     assert_eq!(
-        iphone["nbHits"], 8000,
-        "nbHits should be summed across nodes"
+        iphone["nbHits"], 4111,
+        "nbHits should be globally weighted across nodes"
     );
 
     let samsung = searches.iter().find(|s| s["search"] == "samsung").unwrap();

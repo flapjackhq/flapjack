@@ -154,6 +154,7 @@ build_or_reuse_binary() {
   [[ -x "$SERVER_BINARY" ]] || fail "build completed without producing $SERVER_BINARY"
 }
 
+# TODO: Document start_server.
 start_server() {
   mkdir -p "$SERVER_DATA_DIR"
   SERVER_LOG_PATH="$RESULTS_DIR/server.log"
@@ -174,6 +175,7 @@ start_server() {
   fi
 }
 
+# TODO: Document stop_server.
 stop_server() {
   if [[ -z "$SERVER_PID" ]]; then
     return 0
@@ -198,6 +200,7 @@ stop_server() {
   SERVER_PID=""
 }
 
+# TODO: Document wait_for_health.
 wait_for_health() {
   local health_url="$FLAPJACK_BASE_URL/health"
   local max_attempts=300
@@ -223,6 +226,7 @@ wait_for_health() {
   fail "timed out waiting for $health_url"
 }
 
+# TODO: Document metric_value.
 metric_value() {
   local metric_name="$1"
   local label_fragment="${2:-}"
@@ -305,6 +309,7 @@ assert_analytics_metric_contract() {
   fi
 }
 
+# TODO: Document capture_analytics_proof.
 capture_analytics_proof() {
   local accepted_events
   local dropped_events
@@ -388,6 +393,7 @@ capture_analytics_proof() {
   return 0
 }
 
+# TODO: Document discover_analytics_evidence_paths.
 discover_analytics_evidence_paths() {
   local analytics_dir="$SERVER_DATA_DIR/analytics"
   local manifests=()
@@ -421,6 +427,7 @@ discover_analytics_evidence_paths() {
   fi
 }
 
+# TODO: Document run_retention_gate_probe.
 run_retention_gate_probe() {
   local probe_output
   local probe_status=0
@@ -453,6 +460,7 @@ run_retention_gate_probe() {
   return 0
 }
 
+# TODO: Document write_summary_on_analytics_probe_failure.
 write_summary_on_analytics_probe_failure() {
   local failure_reason="$1"
   discover_analytics_evidence_paths
@@ -606,6 +614,7 @@ stop_sampler() {
   SAMPLER_PID=""
 }
 
+# TODO: Document run_soak_scenario.
 run_soak_scenario() {
   local scenario_to_run="$SCENARIO_NAME"
   if [[ "$SCENARIO_NAME" == "analytics-soak" ]]; then
@@ -688,6 +697,7 @@ search_hit_count() {
   jq -r '.nbHits' <<<"$response"
 }
 
+# TODO: Document capture_stable_index_snapshot.
 capture_stable_index_snapshot() {
   local index_name="$1"
   local payload="$2"
@@ -774,6 +784,7 @@ load_phase_consistency_snapshot() {
   printf '%s,%s,%s,%s' "$read_doc_count" "$write_doc_count" "$macbook_hits" "$write_index_hits"
 }
 
+# TODO: Document capture_consistency_snapshot.
 capture_consistency_snapshot() {
   local phase="$1"
   local read_doc_count
@@ -800,6 +811,7 @@ capture_consistency_snapshot() {
     fail "expected write index query hits during ${phase}, got ${write_index_hits}"
 }
 
+# TODO: Document read_consistency_value.
 read_consistency_value() {
   local key="$1"
 
@@ -1197,6 +1209,7 @@ capture_write_soak_proof() {
   [[ "$WRITE_OVERALL_VERDICT" != "FALSIFIED_UNBOUNDED_OR_REGRESSED" ]]
 }
 
+# TODO: Document write_summary.
 write_summary() {
   local write_summary_status=0
   local sample_count
@@ -1346,6 +1359,7 @@ verify_restart_preserved_counts() {
   assert_restart_preserved_value "write_index_hits" "write index hit count"
 }
 
+# TODO: Document cleanup.
 cleanup() {
   local script_exit_code=$?
   local effective_exit_code="$script_exit_code"
@@ -1383,6 +1397,7 @@ cleanup() {
   fi
 }
 
+# TODO: Document main.
 main() {
   while [[ $# -gt 0 ]]; do
     case "$1" in

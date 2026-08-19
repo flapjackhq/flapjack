@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-server/src/ingest.rs.
 use crate::credentials::{validate_http_header_value, SecretSource};
 use clap::{Args, ValueEnum};
 use serde::de::{MapAccess, SeqAccess, Visitor};
@@ -25,6 +26,7 @@ const EXIT_OUTCOME_UNKNOWN: i32 = 4;
 const EXIT_RETRY_EXHAUSTED: i32 = 5;
 const EXIT_LOCAL_CLEANUP: i32 = 6;
 
+/// TODO: Document IngestArgs.
 #[derive(Args, Debug)]
 pub(crate) struct IngestArgs {
     /// Base HTTP endpoint, for example http://127.0.0.1:7700
@@ -173,6 +175,7 @@ trait OperationSink {
     ) -> Result<(), IngestError>;
 }
 
+/// TODO: Document run.
 pub(crate) fn run(args: &IngestArgs) -> Result<(), Box<dyn std::error::Error>> {
     let result = run_ingest(args);
     match result {
@@ -191,6 +194,7 @@ pub(crate) fn run(args: &IngestArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// TODO: Document finish.
 fn finish(
     report: IngestReport,
     report_json: bool,
@@ -222,6 +226,7 @@ struct IngestError {
     classification: FailureClassification,
 }
 
+/// TODO: Document run_ingest.
 fn run_ingest(args: &IngestArgs) -> Result<IngestReport, IngestFailure> {
     validate_args(args)?;
     let api_key = read_api_key(args)?;
@@ -264,6 +269,7 @@ fn run_ingest(args: &IngestArgs) -> Result<IngestReport, IngestFailure> {
     }
 }
 
+/// TODO: Document validate_args.
 fn validate_args(args: &IngestArgs) -> Result<(), IngestFailure> {
     if args.batch_size == 0 {
         return Err(config_error("--batch-size must be greater than 0"));
@@ -315,6 +321,7 @@ fn input_error(message: String, api_key: &str) -> IngestFailure {
     }
 }
 
+/// TODO: Document read_api_key.
 fn read_api_key(args: &IngestArgs) -> Result<String, IngestFailure> {
     api_key_source(args)
         .read("API key")
@@ -329,6 +336,7 @@ fn api_key_source(args: &IngestArgs) -> SecretSource<'_> {
     )
 }
 
+/// TODO: Document process_source.
 fn process_source<S: OperationSink>(
     args: &IngestArgs,
     sink: &mut S,
@@ -381,6 +389,7 @@ fn process_json_array<S: OperationSink>(
         .map_err(|error| input_ingest_error(format!("trailing JSON array data: {error}")))
 }
 
+/// TODO: Document process_ndjson.
 fn process_ndjson<S: OperationSink>(
     reader: BufReader<Box<dyn Read>>,
     args: &IngestArgs,
@@ -418,6 +427,7 @@ impl<'de, S: OperationSink> Visitor<'de> for JsonArrayVisitor<'_, S> {
         formatter.write_str("a JSON array of objects")
     }
 
+    /// TODO: Document JsonArrayVisitor.visit_seq.
     fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
     where
         A: SeqAccess<'de>,
@@ -578,6 +588,7 @@ fn input_ingest_error(message: String) -> IngestError {
     }
 }
 
+/// TODO: Document homogeneous_envelopes.
 fn homogeneous_envelopes(operations: Vec<RecordOperation>) -> Vec<BatchEnvelope> {
     let mut envelopes = Vec::new();
     let mut current_action = None;
@@ -631,6 +642,7 @@ enum AttemptOutcome {
 }
 
 impl HttpSink<'_> {
+    /// TODO: Document HttpSink.send.
     fn send(
         &mut self,
         envelope: &BatchEnvelope,
@@ -682,6 +694,7 @@ impl HttpSink<'_> {
         }
     }
 
+    /// TODO: Document HttpSink.send_once.
     fn send_once(&self, path: &str, body: &str, key: &str) -> AttemptOutcome {
         let mut stream = match TcpStream::connect((self.endpoint.host.as_str(), self.endpoint.port))
         {
@@ -750,6 +763,7 @@ impl HttpSink<'_> {
     }
 }
 
+/// TODO: Document classify_response.
 fn classify_response(response: &[u8]) -> AttemptOutcome {
     if response.is_empty() {
         return AttemptOutcome::Retryable {
@@ -843,6 +857,7 @@ fn new_ingest_run_id() -> String {
     format!("{}-{nanos}", std::process::id())
 }
 
+/// TODO: Document parse_endpoint.
 fn parse_endpoint(endpoint: &str) -> Result<Endpoint, String> {
     validate_request_target_value("endpoint", endpoint)?;
     let rest = endpoint

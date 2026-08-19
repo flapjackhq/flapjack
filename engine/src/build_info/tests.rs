@@ -17,6 +17,7 @@ fn raw_inputs() -> RawBuildInputs {
     }
 }
 
+/// TODO: Document build_info_serializes_exact_public_contract.
 #[test]
 fn build_info_serializes_exact_public_contract() {
     let info = build_info_from_inputs(
@@ -66,6 +67,7 @@ fn build_info_serializes_exact_public_contract() {
     }
 }
 
+/// TODO: Document unknown_vcs_values_serialize_as_honest_null_pairs.
 #[test]
 fn unknown_vcs_values_serialize_as_honest_null_pairs() {
     let mut inputs = raw_inputs();
@@ -88,6 +90,7 @@ fn unknown_vcs_values_serialize_as_honest_null_pairs() {
     );
 }
 
+/// TODO: Document capability_projection_covers_vector_feature_combinations.
 #[test]
 fn capability_projection_covers_vector_feature_combinations() {
     let cases = [
@@ -273,6 +276,7 @@ fn build_info_from_inputs_normalizes_explicit_feature_capabilities() {
     assert!(info.capabilities.vector_search_local);
 }
 
+/// TODO: Document vcs_discovery_preserves_independent_known_states.
 #[test]
 fn vcs_discovery_preserves_independent_known_states() {
     struct Case {
@@ -344,6 +348,7 @@ fn vcs_discovery_preserves_independent_known_states() {
     }
 }
 
+/// TODO: Document revision_override_is_validated_and_does_not_invent_dirty_state.
 #[test]
 fn revision_override_is_validated_and_does_not_invent_dirty_state() {
     let uppercase_revision = REVISION.to_uppercase();
@@ -367,6 +372,7 @@ fn revision_override_is_validated_and_does_not_invent_dirty_state() {
     }
 }
 
+/// TODO: Document vcs_invalidation_tracks_head_and_active_branch_ref.
 #[test]
 fn vcs_invalidation_tracks_head_and_active_branch_ref() {
     let paths = vcs_invalidation_paths(|arguments| match arguments {
@@ -385,6 +391,7 @@ fn vcs_invalidation_tracks_head_and_active_branch_ref() {
     );
 }
 
+/// TODO: Document workspace_digest_is_order_independent_and_known.
 #[test]
 fn workspace_digest_is_order_independent_and_known() {
     let first = TempDir::new().unwrap();
@@ -406,6 +413,7 @@ fn workspace_digest_is_order_independent_and_known() {
     assert_eq!(first_digest, first_digest.to_lowercase());
 }
 
+/// TODO: Document workspace_digest_changes_for_included_bytes_and_relative_paths.
 #[test]
 fn workspace_digest_changes_for_included_bytes_and_relative_paths() {
     let fixture = TempDir::new().unwrap();
@@ -425,6 +433,7 @@ fn workspace_digest_changes_for_included_bytes_and_relative_paths() {
     assert_ne!(bytes_changed, path_changed);
 }
 
+/// TODO: Document workspace_digest_includes_nested_rust_sources_with_generated_output_names.
 #[test]
 fn workspace_digest_includes_nested_rust_sources_with_generated_output_names() {
     let fixture = TempDir::new().unwrap();
@@ -456,6 +465,7 @@ fn workspace_digest_includes_nested_rust_sources_with_generated_output_names() {
         .any(|path| path == Path::new("src/target/mod.rs")));
 }
 
+/// TODO: Document workspace_digest_ignores_generated_local_metadata_and_absolute_root.
 #[test]
 fn workspace_digest_ignores_generated_local_metadata_and_absolute_root() {
     let fixture_root = TempDir::new().unwrap();
@@ -487,6 +497,7 @@ fn workspace_digest_ignores_generated_local_metadata_and_absolute_root() {
         .contains(first.to_string_lossy().as_ref())));
 }
 
+/// TODO: Document write_fixture.
 fn write_fixture(root: &Path, reverse_order: bool) {
     let mut files = vec![
         ("Cargo.toml", b"[workspace]\n".as_slice()),

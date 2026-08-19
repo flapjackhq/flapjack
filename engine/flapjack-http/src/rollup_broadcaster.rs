@@ -1,3 +1,4 @@
+//! Stub summary for rollup_broadcaster.rs.
 use crate::analytics_cluster::{AnalyticsClusterClient, AnalyticsRollup};
 use flapjack::analytics::{AnalyticsConfig, AnalyticsQueryEngine, AnalyticsQueryParams};
 use std::collections::HashMap;
@@ -340,6 +341,7 @@ mod tests {
         run_rollup_broadcast(&engine, &config, &cluster, "local").await;
         // If we reach here without panic, the test passes
     }
+    /// TODO: Document broadcast_rollups_for_indexes_empty_input_is_noop.
     #[tokio::test]
     async fn broadcast_rollups_for_indexes_empty_input_is_noop() {
         use flapjack_replication::config::{NodeConfig, PeerConfig};

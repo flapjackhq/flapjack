@@ -1,3 +1,4 @@
+//! Stub summary for settings.rs.
 use crate::query::plurals::IgnorePluralsValue;
 use crate::query::stopwords::RemoveStopWordsValue;
 use serde::{Deserialize, Serialize, Serializer};
@@ -99,14 +100,6 @@ where
     D: serde::Deserializer<'de>,
 {
     Option::<Vec<String>>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
-}
-
-fn remove_stop_words_is_default(v: &RemoveStopWordsValue) -> bool {
-    matches!(v, RemoveStopWordsValue::Disabled)
-}
-
-fn ignore_plurals_is_default(v: &IgnorePluralsValue) -> bool {
-    matches!(v, IgnorePluralsValue::Disabled)
 }
 
 fn vec_is_empty(v: &[String]) -> bool {
@@ -275,18 +268,10 @@ pub struct IndexSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distinct: Option<DistinctValue>,
 
-    #[serde(
-        rename = "removeStopWords",
-        default,
-        skip_serializing_if = "remove_stop_words_is_default"
-    )]
+    #[serde(rename = "removeStopWords", default)]
     pub remove_stop_words: RemoveStopWordsValue,
 
-    #[serde(
-        rename = "queryLanguages",
-        default,
-        skip_serializing_if = "vec_is_empty"
-    )]
+    #[serde(rename = "queryLanguages", default)]
     pub query_languages: Vec<String>,
 
     #[serde(
@@ -296,11 +281,7 @@ pub struct IndexSettings {
     )]
     pub index_languages: Vec<String>,
 
-    #[serde(
-        rename = "ignorePlurals",
-        default,
-        skip_serializing_if = "ignore_plurals_is_default"
-    )]
+    #[serde(rename = "ignorePlurals", default)]
     pub ignore_plurals: IgnorePluralsValue,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -559,6 +540,7 @@ impl IndexSettings {
         by_char.into_iter().collect()
     }
 
+    /// TODO: Document IndexSettings.load.
     pub fn load<P: AsRef<Path>>(path: P) -> crate::error::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let settings: IndexSettings = serde_json::from_str(&content)?;

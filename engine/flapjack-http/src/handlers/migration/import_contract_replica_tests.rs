@@ -1,3 +1,5 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/import_contract_replica_tests.rs.
+
 use super::*;
 use crate::handlers::AppState;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};

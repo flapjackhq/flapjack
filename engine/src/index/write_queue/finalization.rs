@@ -1,3 +1,4 @@
+//! Stub summary for finalization.rs.
 use std::sync::Arc;
 
 use crate::types::{TaskInfo, TaskStatus};
@@ -503,6 +504,7 @@ fn numeric_task_id(tasks: &Arc<dashmap::DashMap<String, TaskInfo>>, task_id: &st
         .unwrap_or_else(|| task_id.to_string())
 }
 
+/// TODO: Document apply_failed_status.
 fn apply_failed_status(
     tasks: &Arc<dashmap::DashMap<String, TaskInfo>>,
     task_id: &str,

@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/startup_catchup.rs.
 use crate::handlers::internal::apply_ops_to_manager;
 use crate::handlers::AppState;
 use flapjack::index::manager::publication::{
@@ -43,6 +44,7 @@ async fn run_lenient_catchup_round(state: &AppState, log_prefix: &str, skip_reas
     }
 }
 
+/// TODO: Document run_pre_serve_catchup.
 pub async fn run_pre_serve_catchup(state: &AppState) -> Result<(), String> {
     let has_peers = state
         .replication_manager
@@ -74,6 +76,7 @@ pub async fn run_pre_serve_catchup(state: &AppState) -> Result<(), String> {
     wait_for_write_queues(state, deadline, timeout_secs, strict_bootstrap).await
 }
 
+/// TODO: Document execute_timed_catchup.
 async fn execute_timed_catchup(
     state: &AppState,
     timeout: tokio::time::Duration,
@@ -800,6 +803,7 @@ async fn catchup_single_tenant(
     apply_and_log_ops(&state.manager, tenant_id, &response.ops, log_prefix).await
 }
 
+/// TODO: Document fetch_missed_ops.
 async fn fetch_missed_ops(
     repl_mgr: &Arc<flapjack_replication::manager::ReplicationManager>,
     tenant_id: &str,
@@ -915,6 +919,7 @@ mod tests {
         entries
     }
 
+    /// TODO: Document snapshot_tree_inner.
     fn snapshot_tree_inner(
         root: &Path,
         current: &Path,
@@ -957,6 +962,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document snapshot_activation_stages_preserve_stable_response_tags.
     #[test]
     fn snapshot_activation_stages_preserve_stable_response_tags() {
         use flapjack::index::manager::publication::PreStagedActivationStage;
@@ -1036,6 +1042,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document pre_serve_catchup_fails_with_unreachable_peer_when_strict.
     #[tokio::test]
     async fn pre_serve_catchup_fails_with_unreachable_peer_when_strict() {
         let _env_guard = env_lock().lock().await;
@@ -1046,6 +1053,7 @@ mod tests {
             std::env::remove_var("FLAPJACK_STARTUP_CATCHUP_TIMEOUT_SECS");
         }
 
+        /// TODO: Document spawn_tenant_listing_peer.
         async fn spawn_tenant_listing_peer(
             addr: std::net::SocketAddr,
             state: Arc<AppState>,
@@ -1264,6 +1272,7 @@ mod tests {
         assert!(!retention_gap_detected(250, &response));
     }
 
+    /// TODO: Document retention_gap_false_for_brand_new_replica_when_metadata_missing_but_first_op_is_present.
     #[test]
     fn retention_gap_false_for_brand_new_replica_when_metadata_missing_but_first_op_is_present() {
         let response = GetOpsResponse {
@@ -1283,6 +1292,7 @@ mod tests {
         assert!(!retention_gap_detected(0, &response));
     }
 
+    /// TODO: Document retention_gap_true_for_brand_new_replica_when_metadata_missing_and_first_op_is_truncated.
     #[test]
     fn retention_gap_true_for_brand_new_replica_when_metadata_missing_and_first_op_is_truncated() {
         let response = GetOpsResponse {
@@ -1301,6 +1311,7 @@ mod tests {
         };
         assert!(retention_gap_detected(0, &response));
     }
+    /// TODO: Document retention_gap_true_even_when_ops_present.
     #[test]
     fn retention_gap_true_even_when_ops_present() {
         let dummy_op = flapjack::index::oplog::OpLogEntry {
@@ -1323,6 +1334,7 @@ mod tests {
         // full snapshot restore is needed.
         assert!(retention_gap_detected(150, &response));
     }
+    /// TODO: Document install_snapshot_bytes_keeps_existing_tenant_on_invalid_snapshot.
     #[tokio::test]
     async fn install_snapshot_bytes_keeps_existing_tenant_on_invalid_snapshot() {
         let tmp = TempDir::new().unwrap();
@@ -1360,6 +1372,7 @@ mod tests {
         assert!(manager.facet_cache.contains_key(&facet_cache_key));
         assert_unjournaled_snapshot_transaction_removed(&manager, tenant_id);
     }
+    /// TODO: Document install_snapshot_bytes_replaces_existing_tenant_on_valid_snapshot.
     #[tokio::test]
     async fn install_snapshot_bytes_replaces_existing_tenant_on_valid_snapshot() {
         let tmp = TempDir::new().unwrap();
@@ -1470,6 +1483,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document install_snapshot_bytes_rejects_snapshot_without_oplog.
     #[tokio::test]
     async fn install_snapshot_bytes_rejects_snapshot_without_oplog() {
         let tmp = TempDir::new().unwrap();
@@ -1506,6 +1520,7 @@ mod tests {
         assert_unjournaled_snapshot_transaction_removed(&manager, tenant_id);
     }
 
+    /// TODO: Document install_snapshot_bytes_rejects_foreign_tenant_snapshot_oplog.
     #[tokio::test]
     async fn install_snapshot_bytes_rejects_foreign_tenant_snapshot_oplog() {
         let tmp = TempDir::new().unwrap();
@@ -1550,6 +1565,7 @@ mod tests {
         );
         assert_unjournaled_snapshot_transaction_removed(&manager, tenant_id);
     }
+    /// TODO: Document install_snapshot_bytes_restores_backup_before_retrying_failed_snapshot.
     #[tokio::test]
     async fn install_snapshot_bytes_restores_backup_before_retrying_failed_snapshot() {
         let tmp = TempDir::new().unwrap();
@@ -1588,6 +1604,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document install_snapshot_bytes_rejects_path_traversal_tenant_id.
     #[tokio::test]
     async fn install_snapshot_bytes_rejects_path_traversal_tenant_id() {
         let tmp = TempDir::new().unwrap();
@@ -1631,6 +1648,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document install_snapshot_bytes_rejects_symlinked_backup_path.
     #[cfg(unix)]
     #[tokio::test]
     async fn install_snapshot_bytes_rejects_symlinked_backup_path() {
@@ -1681,6 +1699,7 @@ mod tests {
         );
     }
 
+    /// TODO: Document install_snapshot_bytes_rejects_symlinked_staging_path.
     #[cfg(unix)]
     #[tokio::test]
     async fn install_snapshot_bytes_rejects_symlinked_staging_path() {
@@ -1732,6 +1751,7 @@ mod tests {
     /// left in `PeerCursor::Failed` state, before running the pull round.
     #[tokio::test]
     async fn periodic_catchup_repushes_failed_peer_missing_range_before_pull_round() {
+        /// TODO: Document spawn_internal_server_on.
         async fn spawn_internal_server_on(
             addr: std::net::SocketAddr,
             state: Arc<AppState>,
@@ -1775,6 +1795,7 @@ mod tests {
             (shutdown_tx, handle)
         }
 
+        /// TODO: Document wait_for_cursor.
         async fn wait_for_cursor<F>(manager: &ReplicationManager, tenant_id: &str, check: F) -> bool
         where
             F: Fn(&flapjack_replication::manager::PeerCursor) -> bool,

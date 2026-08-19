@@ -19,6 +19,9 @@ export interface SearchabilityExpectation {
 
 export type ChatSearchMode = 'keywordSearch' | 'neuralSearch';
 
+/**
+ * TODO: Document hasStubAiProvider.
+ */
 function hasStubAiProvider(settings: Record<string, unknown>): boolean {
   if (settings.mode !== 'neuralSearch') {
     return false;

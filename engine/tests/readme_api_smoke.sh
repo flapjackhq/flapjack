@@ -56,6 +56,7 @@ extract_task_id() {
   printf '%s\n' "$response_body" | sed -n 's/.*"taskID":\([0-9]*\).*/\1/p' | head -1
 }
 
+# TODO: Document readme_has_api_docs_swagger_link.
 readme_has_api_docs_swagger_link() {
   target_readme="$1"
   awk '
@@ -69,6 +70,7 @@ readme_has_api_docs_swagger_link() {
   ' "$target_readme"
 }
 
+# TODO: Document readme_has_migration_quickstart_contract.
 readme_has_migration_quickstart_contract() {
   target_readme="$1"
   awk '
@@ -107,6 +109,7 @@ readme_has_migration_quickstart_contract() {
   ' "$target_readme"
 }
 
+# TODO: Document wait_for_task_published.
 wait_for_task_published() {
   task_id="$1"
 

@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/openapi_tests_endpoints.rs.
 use std::collections::BTreeSet;
 
 use super::*;
@@ -270,6 +271,7 @@ fn response_schema_ref<'a>(
         .and_then(serde_json::Value::as_str)
 }
 
+/// TODO: Document assert_migration_post_documents_admission_refusals.
 fn assert_migration_post_documents_admission_refusals(doc: &serde_json::Value) {
     let responses = doc
         .pointer("/paths/~11~1migrate-from-algolia/post/responses")
@@ -297,6 +299,7 @@ fn assert_migration_post_documents_admission_refusals(doc: &serde_json::Value) {
     );
 }
 
+/// TODO: Document assert_async_migration_post_documents_contract.
 fn assert_async_migration_post_documents_contract(doc: &serde_json::Value, path: &str) {
     let responses = operation_responses(doc, path, "post");
 
@@ -313,6 +316,7 @@ fn assert_async_migration_post_documents_contract(doc: &serde_json::Value, path:
     );
 }
 
+/// TODO: Document assert_async_migration_get_documents_contract.
 fn assert_async_migration_get_documents_contract(doc: &serde_json::Value, path: &str) {
     let responses = operation_responses(doc, path, "get");
 
@@ -349,6 +353,7 @@ fn assert_async_migration_get_documents_contract(doc: &serde_json::Value, path: 
     );
 }
 
+/// TODO: Document assert_async_migration_cancel_documents_contract.
 fn assert_async_migration_cancel_documents_contract(doc: &serde_json::Value, path: &str) {
     let responses = operation_responses(doc, path, "post");
 
@@ -501,6 +506,7 @@ fn chat_endpoint_documents_sse_content_type() {
     );
 }
 
+/// TODO: Document personalization_and_experiment_lifecycle_use_typed_schemas.
 #[test]
 fn personalization_and_experiment_lifecycle_use_typed_schemas() {
     let doc = openapi_json();
@@ -1194,6 +1200,7 @@ fn assert_nullable_schema(doc: &serde_json::Value, schema_pointer: &str) {
 
 // --- Stage 7 Security Review: regression guards for auth-correct OpenAPI exposure ---
 
+/// TODO: Document health_endpoint_has_no_security_requirement.
 #[test]
 fn health_endpoint_has_no_security_requirement() {
     let doc = openapi_json();

@@ -21,11 +21,13 @@ impl super::AnalyticsQueryEngine {
             ) {
                 let sql = format!(
                     "SELECT query as search, SUM(count) as count, \
-                     CAST(SUM(nb_hits_sum) / NULLIF(SUM(nb_hits_count), 0) AS INTEGER) as \"nbHits\" \
+                     CAST(SUM(nb_hits_sum) / NULLIF(SUM(nb_hits_count), 0) AS INTEGER) as \"nbHits\", \
+                     SUM(nb_hits_sum) as \"_nbHitsSum\", \
+                     SUM(nb_hits_count) as \"_nbHitsCount\" \
                      FROM rollups \
                      WHERE window_start_ms >= {} AND window_start_ms <= {} \
                      GROUP BY query \
-                     ORDER BY SUM(count) DESC \
+                     ORDER BY SUM(count) DESC, query ASC \
                      LIMIT {}",
                     start_ms, end_ms, params.limit
                 );
@@ -62,11 +64,13 @@ impl super::AnalyticsQueryEngine {
 
         let sql = format!(
             "SELECT query as search, COUNT(*) as count, \
-             CAST(AVG(nb_hits) AS INTEGER) as \"nbHits\" \
+             CAST(AVG(nb_hits) AS INTEGER) as \"nbHits\", \
+             SUM(nb_hits) as \"_nbHitsSum\", \
+             COUNT(nb_hits) as \"_nbHitsCount\" \
              FROM searches \
              WHERE {} \
              GROUP BY query \
-             ORDER BY count DESC \
+             ORDER BY count DESC, query ASC \
              LIMIT {}",
             where_clause, params.limit
         );
@@ -222,7 +226,7 @@ impl super::AnalyticsQueryEngine {
              FROM searches \
              WHERE timestamp_ms >= {} AND timestamp_ms <= {} AND has_results = false \
              GROUP BY query \
-             ORDER BY count DESC \
+             ORDER BY count DESC, query ASC \
              LIMIT {}",
             start_ms, end_ms, limit
         );

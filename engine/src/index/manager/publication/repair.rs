@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/manager/publication/repair.rs.
 use super::digest::canonical_tenant_tree_digest;
 use super::epoch::{observe_publication_epoch, PublicationEpochObservation};
 use super::executor::{
@@ -164,6 +165,7 @@ pub fn repair_publication(
         .map(|outcome| outcome.decision)
 }
 
+/// TODO: Document repair_publication_outcome.
 pub(super) fn repair_publication_outcome(
     base: &Path,
     target: PublicationTarget,
@@ -203,6 +205,7 @@ pub(super) fn repair_publication_outcome_with_epoch(
     )
 }
 
+/// TODO: Document repair_publication_for_test.
 #[cfg(test)]
 pub(crate) fn repair_publication_for_test(
     base: &Path,
@@ -228,6 +231,7 @@ pub(crate) fn repair_publication_for_test(
     .map(|outcome| outcome.decision)
 }
 
+/// TODO: Document repair_publication_with_faults_for_test.
 #[cfg(test)]
 pub(crate) fn repair_publication_with_faults_for_test(
     base: &Path,
@@ -252,6 +256,7 @@ pub(crate) fn repair_publication_with_faults_for_test(
     .map(|outcome| outcome.decision)
 }
 
+/// TODO: Document repair_publication_inner.
 fn repair_publication_inner(
     base: &Path,
     target: PublicationTarget,
@@ -342,6 +347,7 @@ fn repair_publication_inner(
     })
 }
 
+/// TODO: Document validate_repair_managed_paths.
 fn validate_repair_managed_paths(
     base: &Path,
     paths: &PublicationPaths,
@@ -360,6 +366,7 @@ fn validate_repair_managed_paths(
     Ok(())
 }
 
+/// TODO: Document validated_repair_manifest.
 fn validated_repair_manifest(
     journal: &PublicationJournal,
     resolved: &PublicationArtifactManifest,
@@ -393,6 +400,7 @@ struct RepairInspectionContext<'a> {
     io: &'a PublicationIo<'a>,
 }
 
+/// TODO: Document inspect_publication_repair.
 fn inspect_publication_repair(context: RepairInspectionContext<'_>) -> Result<InspectedRepair> {
     let RepairInspectionContext {
         paths,
@@ -468,6 +476,7 @@ fn inspect_publication_repair(context: RepairInspectionContext<'_>) -> Result<In
     })
 }
 
+/// TODO: Document validate_repair_journal.
 fn validate_repair_journal(
     paths: &PublicationPaths,
     target: &PublicationTarget,
@@ -499,6 +508,7 @@ fn validate_repair_journal(
     Ok(())
 }
 
+/// TODO: Document validate_manifest_layout.
 fn validate_manifest_layout(
     journal: &PublicationArtifactManifest,
     resolved: &PublicationArtifactManifest,
@@ -512,6 +522,7 @@ fn validate_manifest_layout(
     }
 }
 
+/// TODO: Document validate_manifest_artifacts.
 fn validate_manifest_artifacts(
     paths: &PublicationPaths,
     journal: &PublicationJournal,
@@ -529,6 +540,7 @@ fn validate_manifest_artifacts(
     Ok(())
 }
 
+/// TODO: Document validate_manifest_artifact.
 fn validate_manifest_artifact(
     paths: &PublicationPaths,
     phase: PublicationPhase,
@@ -593,6 +605,7 @@ fn observed_artifact_digest(path: &Path, io: &PublicationIo<'_>) -> Result<Optio
     artifact_digest(path).map(Some)
 }
 
+/// TODO: Document classify_tree_evidence.
 fn classify_tree_evidence(
     path: &Path,
     journal: &PublicationJournal,
@@ -683,6 +696,7 @@ fn classify_pre_journal_residue(path: &Path, io: &PublicationIo<'_>) -> RepairAr
     }
 }
 
+/// TODO: Document complete_publication_repair.
 fn complete_publication_repair(
     paths: &PublicationPaths,
     journal: Option<&PublicationJournal>,
@@ -704,6 +718,7 @@ fn complete_publication_repair(
     cleanup_repair_residue(paths, &journal_temp_path(paths), io)
 }
 
+/// TODO: Document rollback_publication_repair.
 fn rollback_publication_repair(
     paths: &PublicationPaths,
     journal: Option<&PublicationJournal>,
@@ -738,6 +753,7 @@ fn cleanup_repair_residue(
     Ok(())
 }
 
+/// TODO: Document quarantine_repair_evidence.
 fn quarantine_repair_evidence(
     paths: &PublicationPaths,
     journal_temp: &Path,

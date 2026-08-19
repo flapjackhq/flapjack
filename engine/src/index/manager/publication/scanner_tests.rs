@@ -1,3 +1,4 @@
+//! Stub summary for engine/src/index/manager/publication/scanner_tests.rs.
 use super::*;
 use crate::analytics::AnalyticsConfig;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,7 @@ fn tree_digest(path: &Path) -> ContentDigest {
     canonical_tenant_tree_digest(path, &TantivyManagedInventory::new([]).unwrap()).unwrap()
 }
 
+/// TODO: Document write_journal.
 fn write_journal(
     base: &Path,
     target_name: &str,
@@ -81,6 +83,7 @@ fn scanner_returns_no_actions_for_clean_storage() {
     );
 }
 
+/// TODO: Document target_scanner_reports_clean_without_creating_namespace.
 #[test]
 fn target_scanner_reports_clean_without_creating_namespace() {
     let temp = TempDir::new().unwrap();
@@ -101,6 +104,7 @@ fn target_scanner_reports_clean_without_creating_namespace() {
     assert!(!temp.path().join(".publication/products").exists());
 }
 
+/// TODO: Document target_scanner_reports_existing_empty_namespace_as_unresolved_evidence.
 #[test]
 fn target_scanner_reports_existing_empty_namespace_as_unresolved_evidence() {
     let temp = TempDir::new().unwrap();
@@ -294,6 +298,7 @@ fn scanner_rejects_corrupt_epoch_sidecar_in_namespace_with_transaction_directory
     );
 }
 
+/// TODO: Document target_scanner_reports_symlinked_live_tenant_without_namespace_as_unresolved.
 #[cfg(unix)]
 #[test]
 fn target_scanner_reports_symlinked_live_tenant_without_namespace_as_unresolved() {
@@ -324,6 +329,7 @@ fn target_scanner_reports_symlinked_live_tenant_without_namespace_as_unresolved(
     );
 }
 
+/// TODO: Document target_scanner_reports_symlinked_publication_namespace_as_unresolved_evidence.
 #[cfg(unix)]
 #[test]
 fn target_scanner_reports_symlinked_publication_namespace_as_unresolved_evidence() {
@@ -403,6 +409,7 @@ fn scanner_rejects_symlinked_publication_root_before_enumerating_targets() {
     );
 }
 
+/// TODO: Document target_scanner_rejects_symlinked_publication_root_before_external_journal_read.
 #[cfg(unix)]
 #[test]
 fn target_scanner_rejects_symlinked_publication_root_before_external_journal_read() {
@@ -444,6 +451,7 @@ fn target_scanner_rejects_symlinked_publication_root_before_external_journal_rea
     );
 }
 
+/// TODO: Document target_scanner_rejects_symlinked_transaction_root_before_inventory_contents.
 #[cfg(unix)]
 #[test]
 fn target_scanner_rejects_symlinked_transaction_root_before_inventory_contents() {
@@ -475,6 +483,7 @@ fn target_scanner_rejects_symlinked_transaction_root_before_inventory_contents()
     );
 }
 
+/// TODO: Document target_scanner_rejects_symlinked_journal_before_reading_external_evidence.
 #[cfg(unix)]
 #[test]
 fn target_scanner_rejects_symlinked_journal_before_reading_external_evidence() {
@@ -508,6 +517,7 @@ fn target_scanner_rejects_symlinked_journal_before_reading_external_evidence() {
     assert!(external_paths.journal.exists());
 }
 
+/// TODO: Document prestaged_publication_allocates_activates_and_aborts_its_own_namespace.
 #[test]
 fn prestaged_publication_allocates_activates_and_aborts_its_own_namespace() {
     let temp = TempDir::new().unwrap();
@@ -622,6 +632,7 @@ fn prestaged_publication_rejects_symlinked_publication_parent() {
     assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
 }
 
+/// TODO: Document scanner_repairs_prepared_replacement_and_reports_loadable_target.
 #[test]
 fn scanner_repairs_prepared_replacement_and_reports_loadable_target() {
     let temp = TempDir::new().unwrap();
@@ -699,6 +710,7 @@ fn scanner_repairs_legacy_v1_prepared_replacement_without_quarantine() {
     assert_eq!(committed.fence_evidence, None);
 }
 
+/// TODO: Document scanner_rolls_back_backup_without_target.
 #[test]
 fn scanner_rolls_back_backup_without_target() {
     let temp = TempDir::new().unwrap();
@@ -730,6 +742,7 @@ fn scanner_rolls_back_backup_without_target() {
     );
 }
 
+/// TODO: Document scanner_cleans_committed_target_with_backup.
 #[test]
 fn scanner_cleans_committed_target_with_backup() {
     let temp = TempDir::new().unwrap();
@@ -759,6 +772,7 @@ fn scanner_cleans_committed_target_with_backup() {
     );
 }
 
+/// TODO: Document scanner_quarantines_stale_staging_without_loading_an_unproven_create.
 #[test]
 fn scanner_quarantines_stale_staging_without_loading_an_unproven_create() {
     let temp = TempDir::new().unwrap();
@@ -778,6 +792,7 @@ fn scanner_quarantines_stale_staging_without_loading_an_unproven_create() {
     assert!(!paths.target.exists());
 }
 
+/// TODO: Document scanner_quarantines_corrupt_journal_without_mutating_live_target.
 #[test]
 fn scanner_quarantines_corrupt_journal_without_mutating_live_target() {
     let temp = TempDir::new().unwrap();
@@ -805,6 +820,7 @@ fn scanner_quarantines_corrupt_journal_without_mutating_live_target() {
     );
 }
 
+/// TODO: Document scanner_quarantines_sidecar_boundary_violation_but_keeps_proven_old_target_loadable.
 #[test]
 fn scanner_quarantines_sidecar_boundary_violation_but_keeps_proven_old_target_loadable() {
     let temp = TempDir::new().unwrap();
@@ -843,6 +859,7 @@ fn scanner_quarantines_sidecar_boundary_violation_but_keeps_proven_old_target_lo
     assert!(paths.quarantine.join("journal.json").exists());
 }
 
+/// TODO: Document scanner_reports_duplicate_transactions_once_without_choosing_by_iteration_order.
 #[test]
 fn scanner_reports_duplicate_transactions_once_without_choosing_by_iteration_order() {
     let temp = TempDir::new().unwrap();
@@ -876,6 +893,7 @@ fn scanner_reports_duplicate_transactions_once_without_choosing_by_iteration_ord
     assert!(second.staging.exists());
 }
 
+/// TODO: Document scanner_orders_targets_and_transactions_stably_after_startup_crash.
 #[test]
 fn scanner_orders_targets_and_transactions_stably_after_startup_crash() {
     let temp = TempDir::new().unwrap();

@@ -1,3 +1,5 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/job_runner.rs.
+
 use super::source_reader::MigrationSourceReader;
 use super::spool::{
     AsyncMigrationMetadata, AsyncMigrationPublicationSemantic, MigrationDisposition,
@@ -163,6 +165,7 @@ impl MigrationJobRunner {
             .await
     }
 
+    /// TODO: Document MigrationJobRunner.submit_algolia_import_for_owner.
     pub(super) async fn submit_algolia_import_for_owner<F, R>(
         &self,
         payload: MigrateFromAlgoliaRequest,
@@ -333,6 +336,7 @@ impl MigrationJobRunner {
         }
     }
 
+    /// TODO: Document MigrationJobRunner.submit_algolia_import_with_test_hooks.
     #[cfg(test)]
     pub(super) async fn submit_algolia_import_with_test_hooks<F, R>(
         &self,
@@ -350,6 +354,7 @@ impl MigrationJobRunner {
             .await
     }
 
+    /// TODO: Document MigrationJobRunner.submit_algolia_import_with_test_hooks_for_owner.
     #[cfg(test)]
     pub(super) async fn submit_algolia_import_with_test_hooks_for_owner<F, R>(
         &self,
@@ -398,6 +403,7 @@ impl MigrationJobRunner {
         Ok((job_uuid, phase_record))
     }
 
+    /// TODO: Document MigrationJobRunner.spawn_import.
     #[allow(dead_code)]
     fn spawn_import<R>(
         &self,
@@ -511,6 +517,7 @@ impl MigrationJobRunner {
         let _ = published.send(());
     }
 
+    /// TODO: Document MigrationJobRunner.spawn_import_with_hooks.
     #[cfg(test)]
     fn spawn_import_with_hooks<R>(
         &self,
@@ -571,6 +578,7 @@ impl MigrationJobRunner {
         let _ = published.send(());
     }
 
+    /// TODO: Document MigrationJobRunner.recover_async_jobs_before_serve.
     pub(crate) async fn recover_async_jobs_before_serve(
         &self,
         publication_reports: &[PublicationRepairReport],
@@ -612,6 +620,7 @@ impl MigrationJobRunner {
             .is_some_and(|task| task.operation == ActiveMigrationOperation::Resume)
     }
 
+    /// TODO: Document MigrationJobRunner.recover_async_job.
     async fn recover_async_job(
         &self,
         spool: &SpoolStore,
@@ -744,6 +753,7 @@ impl MigrationJobRunner {
         Ok(())
     }
 
+    /// TODO: Document MigrationJobRunner.recover_cancel_requested_async_job.
     async fn recover_cancel_requested_async_job(
         &self,
         spool: &SpoolStore,
@@ -855,6 +865,7 @@ impl MigrationJobRunner {
     }
 }
 
+/// TODO: Document proven_committed_report.
 fn proven_committed_report<'a>(
     metadata: &AsyncMigrationMetadata,
     publication_reports: &'a [PublicationRepairReport],
@@ -960,6 +971,7 @@ fn spool_root_entry_is_present(manager: &Arc<IndexManager>) -> bool {
     }
 }
 
+/// TODO: Document replica_names_for_primary.
 fn replica_names_for_primary(
     manager: &Arc<IndexManager>,
     primary: &str,
@@ -987,6 +999,7 @@ fn replica_names_for_primary(
         .collect()
 }
 
+/// TODO: Document replica_is_job_owned.
 fn replica_is_job_owned(
     manager: &Arc<IndexManager>,
     replica_name: &str,
@@ -1130,6 +1143,7 @@ mod tests {
         }
     }
 
+    /// TODO: Document source_factory_failure_does_not_persist_hidden_async_job.
     #[tokio::test]
     async fn source_factory_failure_does_not_persist_hidden_async_job() {
         let temp_dir = TempDir::new().unwrap();

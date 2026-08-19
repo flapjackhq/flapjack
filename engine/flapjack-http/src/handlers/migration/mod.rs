@@ -1,3 +1,4 @@
+//! Stub summary for engine/flapjack-http/src/handlers/migration/mod.rs.
 use axum::{
     body::Bytes,
     extract::{Extension, Path as AxumPath, Query, State},
@@ -1737,6 +1738,7 @@ where
     }))
 }
 
+/// TODO: Document submit_source_migration_impl.
 async fn submit_source_migration_impl<P, F, R>(
     source_provider: AsyncMigrationSourceProvider,
     state: Arc<AppState>,
@@ -1943,6 +1945,7 @@ where
     .await
 }
 
+/// TODO: Document migrate_from_algolia_impl.
 async fn migrate_from_algolia_impl<F, R>(
     state: Arc<AppState>,
     payload: MigrateFromAlgoliaRequest,
@@ -1966,6 +1969,7 @@ where
     .await
 }
 
+/// TODO: Document admit_migration_request.
 fn admit_migration_request(
     state: &AppState,
     payload: &MigrateFromAlgoliaRequest,
@@ -2539,6 +2543,7 @@ pub(super) fn resume_spool_error(error: spool::SpoolError) -> MigrateError {
     }
 }
 
+/// TODO: Document ensure_async_migration_owner.
 fn ensure_async_migration_owner(
     spool: &spool::SpoolStore,
     job_uuid: Uuid,
@@ -2705,6 +2710,7 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    /// TODO: Document migration_dto_wire_contract.
     #[tokio::test]
     async fn migration_dto_wire_contract() {
         let migrate_request: MigrateFromAlgoliaRequest = serde_json::from_value(json!({

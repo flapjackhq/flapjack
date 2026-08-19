@@ -23,6 +23,7 @@ initialize_loadtest_auth_headers
 ENCODED_READ_INDEX="$(loadtest_encode_path_component "$FLAPJACK_READ_INDEX")"
 ENCODED_WRITE_INDEX="$(loadtest_encode_path_component "$FLAPJACK_WRITE_INDEX")"
 
+# TODO: Document seed_read_documents.
 seed_read_documents() {
   local docs_file
   local total_docs
@@ -102,6 +103,7 @@ process.stdout.write(JSON.stringify(docs));
   rm -f "$docs_file"
 }
 
+# TODO: Document verify_post_seed_state.
 verify_post_seed_state() {
   local post_search_response
   local get_search_response
