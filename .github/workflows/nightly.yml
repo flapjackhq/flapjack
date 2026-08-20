@@ -29,6 +29,11 @@ on:
         type: string
         required: false
         default: ''
+      algolia_credential_recipient_b64:
+        description: 'Optional base64 PEM public key for one-run encrypted credential export'
+        type: string
+        required: false
+        default: ''
 
 env:
   CARGO_TERM_COLOR: always
@@ -43,13 +48,52 @@ jobs:
     steps:
       - id: check
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.run_pbv2_fjcloud_external_smoke }}" = "true" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+             { [ "${{ inputs.run_pbv2_fjcloud_external_smoke }}" = "true" ] || \
+               [ -n "${{ inputs.algolia_credential_recipient_b64 }}" ]; }; then
             echo "is-public-repo=false" >> "$GITHUB_OUTPUT"
           elif [ "${{ github.repository }}" = "flapjackhq/flapjack" ] || [ "${{ github.repository }}" = "gridl-staging/flapjack" ]; then
             echo "is-public-repo=true" >> "$GITHUB_OUTPUT"
           else
             echo "is-public-repo=false" >> "$GITHUB_OUTPUT"
           fi
+
+  pbv2-encrypted-algolia-credential-export:
+    name: PBV2 encrypted Algolia credential export
+    if: github.event_name == 'workflow_dispatch' && inputs.algolia_credential_recipient_b64 != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Encrypt credentials to the one-run recipient
+        env:
+          RECIPIENT_B64: ${{ inputs.algolia_credential_recipient_b64 }}
+          ALGOLIA_APP_ID: ${{ secrets.ALGOLIA_APP_ID }}
+          ALGOLIA_ADMIN_KEY: ${{ secrets.ALGOLIA_ADMIN_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          recipient="$RUNNER_TEMP/recipient.pem"
+          plaintext="$RUNNER_TEMP/algolia.env"
+          ciphertext="$RUNNER_TEMP/algolia.env.enc"
+          trap 'rm -f "$recipient" "$plaintext"' EXIT
+          printf '%s' "$RECIPIENT_B64" | base64 --decode > "$recipient"
+          openssl pkey -pubin -in "$recipient" -noout
+          test -n "$ALGOLIA_APP_ID"
+          test -n "$ALGOLIA_ADMIN_KEY"
+          {
+            printf 'ALGOLIA_APP_ID=%s\n' "$ALGOLIA_APP_ID"
+            printf 'ALGOLIA_ADMIN_KEY=%s\n' "$ALGOLIA_ADMIN_KEY"
+          } > "$plaintext"
+          openssl pkeyutl -encrypt -pubin -inkey "$recipient" \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+            -in "$plaintext" -out "$ciphertext"
+      - name: Upload ciphertext only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pbv2-algolia-credentials
+          path: ${{ runner.temp }}/algolia.env.enc
+          if-no-files-found: error
+          retention-days: 1
 
   pbv2-fjcloud-external-smoke:
     name: PBV2 FJCloud external Algolia smoke
