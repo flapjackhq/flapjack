@@ -5,9 +5,11 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -29,6 +31,29 @@ TOPOLOGY_AUTHORITIES = (
     ".github/workflows/README.md",
     "engine/docs2/3_IMPLEMENTATION/DEPLOYMENT.md",
 )
+# Historical receipts must keep exact identities intact. Test fixtures also retain
+# the forbidden spelling so they can prove the production guards reject it.
+RETIRED_TOPOLOGY_HISTORY_PREFIXES = (
+    ".mike/",
+    "chats/",
+    "chatting/",
+    "docs/live-state/",
+    "docs/reference/research/",
+    "engine/docs/research/",
+    "engine/docs2/4_EVIDENCE/",
+    "engine/loadtest/results/",
+    "engine/state/",
+    "implemented/",
+    "s/file_bundler/",
+)
+RETIRED_TOPOLOGY_NEGATIVE_CONTROLS = {
+    "engine/tests/test_ci_test_tiers.py",
+    "engine/tests/test_install.sh",
+    "scripts/tests/publish_guard_test.sh",
+    "scripts/tests/publish_public_candidate_test.sh",
+}
+RETIRED_STAGE_ROOTS = ("stage_01", "stage_03", "stage_04", "stage_05", "stage_06")
+RETIRED_STAGING_IDENTITY = "gridl-staging"
 REQUIRED_RISKS = {
     "core_search_index",
     "durability",
@@ -173,6 +198,59 @@ def topology_texts(root=ROOT):
         relative: (Path(root) / relative).read_text(encoding="utf-8")
         for relative in TOPOLOGY_AUTHORITIES
     }
+
+
+def verify_retired_staging_absence(root=ROOT, identity_paths=None):
+    """Reject live staging artifacts without rewriting immutable history or test oracles."""
+    root = Path(root)
+    stale_roots = [name for name in RETIRED_STAGE_ROOTS if (root / name).exists()]
+
+    if identity_paths is None:
+        # Git grep reads only tracked files, avoiding operator-local secrets and build output.
+        excluded_pathspecs = [
+            f":(exclude){prefix}**" for prefix in RETIRED_TOPOLOGY_HISTORY_PREFIXES
+        ]
+        excluded_pathspecs.extend(
+            f":(exclude){relative}"
+            for relative in sorted(RETIRED_TOPOLOGY_NEGATIVE_CONTROLS)
+        )
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "grep",
+                "-Ilz",
+                "-F",
+                RETIRED_STAGING_IDENTITY,
+                "--",
+                ".",
+                *excluded_pathspecs,
+            ],
+            capture_output=True,
+        )
+        if result.returncode not in {0, 1}:
+            raise ContractError("cannot inspect tracked files for retired staging identity")
+        identity_paths = [
+            value.decode("utf-8")
+            for value in result.stdout.split(b"\0")
+            if value
+        ]
+
+    stale_identity_paths = [
+        relative
+        for relative in identity_paths
+        if relative not in RETIRED_TOPOLOGY_NEGATIVE_CONTROLS
+        and not any(
+            relative.startswith(prefix) for prefix in RETIRED_TOPOLOGY_HISTORY_PREFIXES
+        )
+    ]
+
+    if stale_roots or stale_identity_paths:
+        raise ContractError(
+            "retired staging topology remains active: "
+            f"roots={stale_roots} identity_paths={stale_identity_paths}"
+        )
 
 
 def verify_public_candidate_topology(root=ROOT, texts=None):
@@ -385,8 +463,11 @@ def verify_local_runner(root=ROOT, runner_text=None, named_source_text=None):
 
 
 def verify(root=ROOT, manifest_path=MANIFEST_PATH, jobs=None, actual_ignored=None):
+    scan_live_tree = jobs is None and actual_ignored is None
     verify_local_runner(root)
     verify_public_candidate_topology(root)
+    if scan_live_tree:
+        verify_retired_staging_absence(root)
     manifest = load_manifest(manifest_path)
     if manifest.get("schema_version") != 1:
         raise ContractError("test-tier manifest schema_version must be 1")
@@ -507,6 +588,56 @@ class TestTierContract(unittest.TestCase):
 
     def test_live_manifest_and_workflows_converge(self):
         verify()
+
+    def test_retired_staging_identity_in_active_path_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = root / ".debbie/post-sync.sh"
+            active.parent.mkdir(parents=True)
+            active.write_text(RETIRED_STAGING_IDENTITY, encoding="utf-8")
+            with self.assertRaisesRegex(ContractError, "identity_paths"):
+                verify_retired_staging_absence(root, identity_paths=[".debbie/post-sync.sh"])
+
+    def test_retired_stage_root_fixture_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "stage_03").mkdir()
+            with self.assertRaisesRegex(ContractError, "stage_03"):
+                verify_retired_staging_absence(root, identity_paths=[])
+
+    def test_retired_identity_scan_prunes_exclusions_before_git_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=b"chats/incident.md\0scripts/tests/publish_guard_test.sh\0",
+            )
+            with mock.patch.object(subprocess, "run", return_value=result) as git_grep:
+                verify_retired_staging_absence(directory)
+
+            command = git_grep.call_args.args[0]
+            separator = command.index("--")
+            pathspecs = command[separator + 1:]
+            self.assertEqual(pathspecs[0], ".")
+            self.assertIn(":(exclude)chats/**", pathspecs)
+            self.assertIn(
+                ":(exclude)scripts/tests/publish_guard_test.sh",
+                pathspecs,
+            )
+
+    def test_retired_staging_history_and_negative_controls_are_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            preserved = (
+                "chats/incident.md",
+                "engine/docs2/4_EVIDENCE/receipt.md",
+                "scripts/tests/publish_guard_test.sh",
+            )
+            for relative in preserved:
+                candidate = root / relative
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                candidate.write_text(RETIRED_STAGING_IDENTITY, encoding="utf-8")
+            verify_retired_staging_absence(root, identity_paths=preserved)
 
     def test_candidate_branch_trigger_cannot_be_removed(self):
         texts = self.topology_mutation(

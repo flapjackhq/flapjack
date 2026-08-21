@@ -382,9 +382,9 @@ The workflow YAML remains execution truth. `engine/tests/ci_test_tiers.json` is 
 | Packaging, images, and release preflights | Release | manually dispatched `release.yml` and development-image `docker.yml`; never part of candidate feedback |
 | Twenty long-running or live-system ignored Rust evidence harnesses | Manual evidence | exact source/name allowlist in `ci_test_tiers.json` |
 
-### Public-staging baseline (before the candidate split)
+### Historical baseline from the former pre-candidate topology
 
-These are successful, first-attempt `gridl-staging/flapjack` push-CI specimens. Durations are run/job wall clock from GitHub timestamps; compare jobs within this workflow family only.
+These successful first-attempt runs are retained only as performance history from the former public-staging topology. Current acceptance runs on the rendered `public-candidate/**` branch in the sole public product repository and must pass `Public candidate gate`; recurring workflows run on public main. Durations below are run/job wall clock from GitHub timestamps, so compare jobs only within this historical workflow family.
 
 | Run | Workflow | Rust fast | Rust all | Integration smoke | Release contracts |
 |-----|----------|-----------|----------|-------------------|-------------------|
