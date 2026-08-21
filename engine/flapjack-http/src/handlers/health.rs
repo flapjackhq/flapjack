@@ -138,7 +138,7 @@ mod tests {
         assert_eq!(json["build"]["apiProfile"], "full");
         assert_eq!(
             json["build"]["supportedApiProfiles"],
-            serde_json::json!(["full", "paid_beta_v1"])
+            serde_json::json!(["full", "paid_beta_v1", "paid_beta_v3"])
         );
         assert_eq!(
             json["build"]["capabilities"],

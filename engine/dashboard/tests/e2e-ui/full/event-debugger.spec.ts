@@ -57,7 +57,9 @@ async function seedDebugEvents(request: APIRequestContext): Promise<SeededEvents
   const clickName = `Product Clicked ${suffix}`;
   const purchaseName = `Product Purchased ${suffix}`;
   const viewName = `Product Viewed ${suffix}`;
-  const clickUserToken = `e2e-user-click-${suffix}`;
+  const clickUserToken = crypto.randomUUID();
+  const purchaseUserToken = crypto.randomUUID();
+  const purchaseQueryID = randomHex32();
 
   await sendEvents(request, [
     {
@@ -71,11 +73,14 @@ async function seedDebugEvents(request: APIRequestContext): Promise<SeededEvents
     },
     {
       eventType: 'conversion',
+      eventSubtype: 'purchase',
       eventName: purchaseName,
       index: TEST_INDEX,
-      userToken: `e2e-user-conversion-${suffix}`,
+      userToken: purchaseUserToken,
       objectIDs: ['p03'],
-      queryID: randomHex32(),
+      objectData: [{ queryID: purchaseQueryID, price: 12.5, quantity: 2 }],
+      value: 25,
+      currency: 'USD',
     },
     {
       eventType: 'view',

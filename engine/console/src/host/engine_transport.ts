@@ -226,12 +226,13 @@ function parseSearchSemantics(value: unknown, vectorSearchLocal: boolean): Searc
 export function createEngineTransport(fetcher: typeof fetch): ConsoleTransport {
   const applicationHeaders = { 'x-algolia-application-id': 'flapjack' };
   const analyticsTokenStorageKey = 'fj-dashboard-user-token';
+  const hyphenatedUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   let activeAnalyticsToken: string | null = null;
 
   function searchAnalyticsToken(): string {
     const existing = globalThis.sessionStorage?.getItem(analyticsTokenStorageKey);
-    if (existing) return existing;
-    const token = `dashboard-${globalThis.crypto.randomUUID()}`;
+    if (existing && hyphenatedUuid.test(existing)) return existing;
+    const token = globalThis.crypto.randomUUID();
     globalThis.sessionStorage?.setItem(analyticsTokenStorageKey, token);
     return token;
   }

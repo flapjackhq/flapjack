@@ -416,6 +416,7 @@ describe('engine console transport', () => {
 
   it('maps analytics Off and On searches plus one correlated result-open event', async () => {
     globalThis.sessionStorage.clear();
+    globalThis.sessionStorage.setItem('fj-dashboard-user-token', 'dashboard-legacy-token');
     const queryId = 'abcdef0123456789abcdef0123456789';
     const fetcher = vi
       .fn<typeof fetch>()
@@ -471,7 +472,7 @@ describe('engine console transport', () => {
       'Content-Type': 'application/json',
       'x-algolia-application-id': 'flapjack',
       'x-algolia-usertoken': expect.stringMatching(
-        /^dashboard-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
       ),
     });
     expect(fetcher.mock.calls[1]?.[1]?.body).toBe(

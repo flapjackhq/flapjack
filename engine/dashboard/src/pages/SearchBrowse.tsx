@@ -22,11 +22,12 @@ import type { SearchParams, HybridSearchParams } from '@/lib/types';
 function readOrCreateDashboardUserToken(): string {
   const key = 'fj-dashboard-user-token';
   const existingToken = sessionStorage.getItem(key);
-  if (existingToken) {
+  const hyphenatedUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (existingToken && hyphenatedUuid.test(existingToken)) {
     return existingToken;
   }
 
-  const newToken = `dashboard-${crypto.randomUUID().slice(0, 8)}`;
+  const newToken = crypto.randomUUID();
   sessionStorage.setItem(key, newToken);
   return newToken;
 }

@@ -217,15 +217,15 @@ extract_matching_job_block() {
   ' "$file_path"
 }
 
-# TODO: Document assert_capped_vector_job_prebuild_binding.
-assert_capped_vector_job_prebuild_binding() {
+# TODO: Document assert_capped_job_prebuild_binding.
+assert_capped_job_prebuild_binding() {
   local workflow_file="$1"
   local workflow_label="$2"
   local job_key="$3"
   local capped_step_name="$4"
   local capped_step_command="$5"
-  local prebuild_step_name="Build vector-search test binaries"
-  local prebuild_command="cargo build --tests -p flapjack -p flapjack-http --features vector-search"
+  local prebuild_step_name="$6"
+  local prebuild_command="$7"
   local signal_job_block_unique="0"
   local signal_canonical_prebuild_present="0"
   local signal_canonical_capped_present="0"
@@ -245,9 +245,9 @@ assert_capped_vector_job_prebuild_binding() {
 
   if [ "$job_match_count" -eq 1 ]; then
     signal_job_block_unique="1"
-    pass "$workflow_label defines exactly one '$job_key' job block for vector-search timeout assertions"
+    pass "$workflow_label defines exactly one '$job_key' job block for capped-test assertions"
   else
-    fail "$workflow_label defines exactly one '$job_key' job block for vector-search timeout assertions"
+    fail "$workflow_label defines exactly one '$job_key' job block for capped-test assertions"
     if [ "${EMIT_BINDING_SIGNALS:-0}" = "1" ]; then
       emit_binding_signals \
         "$signal_job_block_unique" \
@@ -267,9 +267,9 @@ assert_capped_vector_job_prebuild_binding() {
   prebuild_match_count="${prebuild_match_count:-0}"
   if [ "$prebuild_match_count" -eq 1 ]; then
     signal_canonical_prebuild_present="1"
-    pass "$workflow_label '$job_key' contains '$prebuild_step_name' with canonical vector-search prebuild command"
+    pass "$workflow_label '$job_key' contains '$prebuild_step_name' with canonical prebuild command"
   else
-    fail "$workflow_label '$job_key' contains '$prebuild_step_name' with canonical vector-search prebuild command"
+    fail "$workflow_label '$job_key' contains '$prebuild_step_name' with canonical prebuild command"
   fi
 
   local capped_block_file
@@ -280,9 +280,9 @@ assert_capped_vector_job_prebuild_binding() {
   capped_match_count="${capped_match_count:-0}"
   if [ "$capped_match_count" -eq 1 ]; then
     signal_canonical_capped_present="1"
-    pass "$workflow_label '$job_key' contains capped vector-search step '$capped_step_name' with canonical nextest command"
+    pass "$workflow_label '$job_key' contains capped step '$capped_step_name' with canonical nextest command"
   else
-    fail "$workflow_label '$job_key' contains capped vector-search step '$capped_step_name' with canonical nextest command"
+    fail "$workflow_label '$job_key' contains capped step '$capped_step_name' with canonical nextest command"
   fi
 
   local prebuild_match_start_line
@@ -330,17 +330,19 @@ jobs:
       - name: Fast tests (vector-search)
         run: cargo nextest run -p flapjack -p flapjack-http --features vector-search
       - name: Build vector-search test binaries
-        run: cargo build --tests -p flapjack -p flapjack-http --features vector-search
+        run: cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci --no-run
 YAML
 
   local binding_output
   binding_output="$(
-    EMIT_BINDING_SIGNALS=1 assert_capped_vector_job_prebuild_binding \
+    EMIT_BINDING_SIGNALS=1 assert_capped_job_prebuild_binding \
       "$fixture_file" \
       "fixture.yml" \
       "fixture-job" \
       "Fast tests (vector-search)" \
-      "cargo nextest run -p flapjack -p flapjack-http --features vector-search"
+      "cargo nextest run -p flapjack -p flapjack-http --features vector-search" \
+      "Build vector-search test binaries" \
+      "cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci --no-run"
   )"
 
   local signal_job_block_unique
@@ -370,10 +372,10 @@ YAML
 # TODO: Document assert_duplicate_step_fixture_guards_wrong_failure_mode.
 assert_duplicate_step_fixture_guards_wrong_failure_mode() {
   local original_binding_function
-  original_binding_function="$(declare -f assert_capped_vector_job_prebuild_binding)"
+  original_binding_function="$(declare -f assert_capped_job_prebuild_binding)"
 
   # Simulate a broken canonical extractor that still emits the expected ordering failure.
-  assert_capped_vector_job_prebuild_binding() {
+  assert_capped_job_prebuild_binding() {
     printf '  [FAIL] fixture.yml '\''fixture-job'\'' contains '\''Build vector-search test binaries'\'' with canonical vector-search prebuild command\n'
     printf '  [FAIL] fixture.yml '\''fixture-job'\'' contains capped vector-search step '\''Fast tests (vector-search)'\'' with canonical nextest command\n'
     printf '  [FAIL] fixture.yml '\''fixture-job'\'' runs '\''Build vector-search test binaries'\'' before '\''Fast tests (vector-search)'\''\n'
@@ -395,10 +397,10 @@ assert_duplicate_step_fixture_guards_wrong_failure_mode() {
 # TODO: Document assert_duplicate_step_fixture_ignores_helper_prose_changes.
 assert_duplicate_step_fixture_ignores_helper_prose_changes() {
   local original_binding_function
-  original_binding_function="$(declare -f assert_capped_vector_job_prebuild_binding)"
+  original_binding_function="$(declare -f assert_capped_job_prebuild_binding)"
 
   # Simulate helper message rewording while preserving canonical binding outcomes.
-  assert_capped_vector_job_prebuild_binding() {
+  assert_capped_job_prebuild_binding() {
     printf '__BINDING_SIGNAL__job_block_unique=1\n'
     printf '__BINDING_SIGNAL__canonical_prebuild_present=1\n'
     printf '__BINDING_SIGNAL__canonical_capped_present=1\n'
@@ -419,6 +421,47 @@ assert_duplicate_step_fixture_ignores_helper_prose_changes() {
   fi
 
   eval "$original_binding_function"
+}
+
+assert_wrong_job_same_name_fixture() {
+  local fixture_file
+  fixture_file="$(mktemp)"
+  cat > "$fixture_file" <<'YAML'
+jobs:
+  target-job:
+    steps:
+      - name: Build remaining test binaries
+        run: cargo build -p flapjack-server
+      - name: All tests (remaining)
+        run: cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci --no-fail-fast
+  decoy-job:
+    steps:
+      - name: Build remaining test binaries
+        run: cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci --no-run
+YAML
+
+  local binding_output
+  binding_output="$(
+    EMIT_BINDING_SIGNALS=1 assert_capped_job_prebuild_binding \
+      "$fixture_file" \
+      "fixture.yml" \
+      "target-job" \
+      "All tests (remaining)" \
+      "cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci --no-fail-fast" \
+      "Build remaining test binaries" \
+      "cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci --no-run"
+  )"
+
+  if [ "$(read_numeric_signal "$binding_output" "__BINDING_SIGNAL__job_block_unique")" -eq 1 ] \
+    && [ "$(read_numeric_signal "$binding_output" "__BINDING_SIGNAL__canonical_prebuild_present")" -eq 0 ] \
+    && [ "$(read_numeric_signal "$binding_output" "__BINDING_SIGNAL__canonical_capped_present")" -eq 1 ] \
+    && [ "$(read_numeric_signal "$binding_output" "__BINDING_SIGNAL__prebuild_before_capped")" -eq 0 ]; then
+    pass "same-named prebuild in another job cannot satisfy the capped job binding"
+  else
+    fail "same-named prebuild in another job cannot satisfy the capped job binding"
+  fi
+
+  rm -f "$fixture_file"
 }
 
 # TODO: Document assert_step_contract.
@@ -531,14 +574,17 @@ section "Rust test timeout acceptance contract"
 assert_duplicate_step_name_regression_fixture
 assert_duplicate_step_fixture_guards_wrong_failure_mode
 assert_duplicate_step_fixture_ignores_helper_prose_changes
+assert_wrong_job_same_name_fixture
 assert_step_contract "$CI_WORKFLOW" "ci.yml" "Build candidate core test binary" 'cargo test -p flapjack --lib --no-run --message-format=json > candidate_build.json && python3 tests/extract_candidate_binary.py candidate_build.json "$GITHUB_OUTPUT"' "30"
 assert_step_contract "$CI_WORKFLOW" "ci.yml" "Candidate test-tier inventory" "python3 tests/test_ci_test_tiers.py --verify" "10"
 assert_step_contract "$CI_WORKFLOW" "ci.yml" "Candidate core tests" 'timeout --kill-after=60s 300s "${{ steps.candidate-build.outputs.executable }}"' "6"
 assert_step_contract "$CI_WORKFLOW" "ci.yml" "All tests (vector-search)" "cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci --no-fail-fast" "20"
+assert_step_contract "$CI_WORKFLOW" "ci.yml" "Build remaining test binaries" "cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci --no-run" "30"
 assert_step_contract "$CI_WORKFLOW" "ci.yml" "All tests (remaining)" "cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci --no-fail-fast"
 assert_job_contains_pattern "$CI_WORKFLOW" "ci.yml" "rust-tests-all" '^[[:space:]]*tool:[[:space:]]*cargo-audit,cargo-deny[[:space:]]*$' "ci.yml 'rust-tests-all' installs cargo-audit and cargo-deny before running vector-search tests"
 assert_named_step_order_in_job "$CI_WORKFLOW" "ci.yml" "rust-tests-all" "Install cargo audit/deny tools for security audit tests" "All tests (vector-search)"
-assert_capped_vector_job_prebuild_binding "$CI_WORKFLOW" "ci.yml" "rust-tests-all" "All tests (vector-search)" "cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci --no-fail-fast"
+assert_capped_job_prebuild_binding "$CI_WORKFLOW" "ci.yml" "rust-tests-all" "All tests (vector-search)" "cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci --no-fail-fast" "Build vector-search test binaries" "cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci --no-run"
+assert_capped_job_prebuild_binding "$CI_WORKFLOW" "ci.yml" "rust-tests-all" "All tests (remaining)" "cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci --no-fail-fast" "Build remaining test binaries" "cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci --no-run"
 assert_step_contract "$NIGHTLY_WORKFLOW" "nightly.yml" "Run all tests" "cargo nextest run -P ci" "45"
 
 section "Playwright browser install timeout contract"

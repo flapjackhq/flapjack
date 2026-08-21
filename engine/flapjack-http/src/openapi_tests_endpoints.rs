@@ -57,6 +57,13 @@ fn insights_endpoints_are_documented() {
 
     assert_path_exists(&doc, "/1/usertokens/{userToken}");
     assert_path_method(&doc, "/1/usertokens/{userToken}", "delete");
+
+    assert_path_exists(&doc, "/1/indexes/{indexName}/usertokens/{userToken}");
+    assert_path_method(
+        &doc,
+        "/1/indexes/{indexName}/usertokens/{userToken}",
+        "delete",
+    );
 }
 
 /// Stage 7: Verify migration endpoints appear in the generated spec.

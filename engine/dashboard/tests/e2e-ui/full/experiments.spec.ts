@@ -102,7 +102,7 @@ async function collectUserTokensForArm(
   const tokens: string[] = [];
 
   for (let i = 0; i < 400 && tokens.length < count; i += 1) {
-    const candidate = `e2e-exp-arm-${targetArm}-${i}-${uniqueSuffix()}`;
+    const candidate = crypto.randomUUID();
     const response = await searchIndex(request, indexName, EXPERIMENT_QUERY, {
       userToken: candidate,
       analytics: false,
@@ -183,7 +183,7 @@ async function seedSoftGateReadyTraffic(
   // Generate 20 unique users, each doing 1 search + 1 click (100% CTR).
   // With 50/50 split, each arm gets ~10 users — enough for both arms.
   for (let i = 0; i < 20; i += 1) {
-    const token = `e2e-exp-soft-${i}-${uniqueSuffix()}`;
+    const token = crypto.randomUUID();
     await clickFirstSearchHit(request, indexName, token, 'e2e-exp-soft');
   }
 
@@ -227,7 +227,7 @@ async function seedInterleavingTraffic(
   experimentId: string,
   indexName: string,
 ): Promise<void> {
-  const interleavingToken = `e2e-exp-interleave-${uniqueSuffix()}`;
+  const interleavingToken = crypto.randomUUID();
 
   for (let i = 0; i < 6; i += 1) {
     const response = await searchWithExperimentTracking(

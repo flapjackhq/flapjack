@@ -206,6 +206,10 @@ pub async fn batch_search(
         .extensions()
         .get::<crate::api_profile::PaidBetaV1CustomerRequest>()
         .is_some();
+    let paid_beta_v3_customer = request
+        .extensions()
+        .get::<crate::api_profile::PaidBetaV3CustomerRequest>()
+        .is_some();
     let dictionary_lookup_tenant = request
         .extensions()
         .get::<crate::auth::AuthenticatedAppId>()
@@ -218,6 +222,8 @@ pub async fn batch_search(
         .map_err(|e| FlapjackError::InvalidQuery(format!("Invalid JSON: {}", e)))?;
     let batch: BatchSearchRequest = if paid_beta_v1_customer {
         crate::api_profile::prepare_paid_beta_v1_batch(body, api_key.as_ref())?
+    } else if paid_beta_v3_customer {
+        crate::api_profile::prepare_paid_beta_v3_batch(body, api_key.as_ref())?
     } else {
         serde_json::from_value(body).map_err(|e| {
             tracing::error!("Batch search deserialization failed: {}", e);

@@ -64,7 +64,7 @@ async fn assert_forbidden_invalid_auth(
 }
 
 #[tokio::test]
-async fn application_id_query_transport_authenticates_without_header() {
+async fn application_id_query_transport_is_rejected_on_privileged_routes() {
     let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
 
     let response = send_request(
@@ -75,11 +75,11 @@ async fn application_id_query_transport_authenticates_without_header() {
     )
     .await;
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
-async fn api_key_supports_header_and_query_param_and_header_wins_when_both_present() {
+async fn privileged_routes_require_header_credentials_without_query_fallback() {
     let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
 
     let header_only = send_request(
@@ -94,14 +94,24 @@ async fn api_key_supports_header_and_query_param_and_header_wins_when_both_prese
     .await;
     assert_eq!(header_only.status(), StatusCode::OK);
 
-    let query_only = send_request(
+    assert_forbidden_invalid_auth(
         &app,
         Method::GET,
         &format!("/1/indexes?x-algolia-api-key={ADMIN_KEY}"),
         &[("x-algolia-application-id", "test")],
     )
     .await;
-    assert_eq!(query_only.status(), StatusCode::OK);
+
+    assert_forbidden_invalid_auth(
+        &app,
+        Method::GET,
+        &format!("/1/indexes?x-algolia-api-key={ADMIN_KEY}"),
+        &[
+            ("x-algolia-api-key", ADMIN_KEY),
+            ("x-algolia-application-id", "test"),
+        ],
+    )
+    .await;
 
     assert_forbidden_invalid_auth(
         &app,

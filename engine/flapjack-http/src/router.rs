@@ -16,7 +16,7 @@ use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
-use crate::api_profile::ApiProfile;
+use crate::api_profile::{is_paid_beta_v3_customer_path, ApiProfile};
 use crate::auth::{
     authenticate_and_authorize, request_application_id,
     session::{DashboardSessionStore, SessionStoreError},
@@ -146,7 +146,11 @@ fn build_router_with_resource_bounds(
         .validate_auth_enabled(key_store.is_some())
         .unwrap_or_else(|error| panic!("invalid API profile configuration: {error}"));
     let config = RouterConfig {
-        disable_dashboard: config.disable_dashboard || config.api_profile == ApiProfile::PaidBetaV1,
+        disable_dashboard: config.disable_dashboard
+            || matches!(
+                config.api_profile,
+                ApiProfile::PaidBetaV1 | ApiProfile::PaidBetaV3
+            ),
         ..config
     };
     let authentication = key_store.clone().map(|key_store| {
@@ -751,6 +755,10 @@ fn build_insights_routes(
         .merge(
             Router::new()
                 .route(
+                    "/1/indexes/:indexName/usertokens/:userToken",
+                    delete(handlers::insights::delete_index_usertoken),
+                )
+                .route(
                     "/1/usertokens/:userToken",
                     delete(handlers::insights::delete_usertoken),
                 )
@@ -758,20 +766,55 @@ fn build_insights_routes(
         )
 }
 
-pub(crate) fn build_cors_layer(mode: &CorsMode) -> CorsLayer {
+fn build_cors_origin_layer(mode: &CorsMode) -> CorsLayer {
     let max_age = std::time::Duration::from_secs(86400);
     match mode {
         CorsMode::LoopbackOnly => CorsLayer::new()
             .allow_origin(AllowOrigin::predicate(is_loopback_origin))
-            .allow_methods(Any)
-            .allow_headers(Any)
             .max_age(max_age),
         CorsMode::Restricted(origins) => CorsLayer::new()
             .allow_origin(AllowOrigin::list(origins.iter().cloned()))
-            .allow_methods(Any)
-            .allow_headers(Any)
             .max_age(max_age),
     }
+}
+
+pub(crate) fn build_cors_layer(mode: &CorsMode) -> CorsLayer {
+    build_cors_origin_layer(mode)
+        .allow_methods(Any)
+        .allow_headers(Any)
+}
+
+fn build_profile_cors_layer(mode: &CorsMode, profile: ApiProfile) -> CorsLayer {
+    if profile != ApiProfile::PaidBetaV3 {
+        return build_cors_layer(mode);
+    }
+
+    build_cors_origin_layer(mode)
+        .allow_methods([Method::POST])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            HeaderName::from_static("x-algolia-application-id"),
+            HeaderName::from_static("x-algolia-api-key"),
+            HeaderName::from_static("x-algolia-agent"),
+        ])
+}
+
+async fn enforce_profile_cors_admission(
+    request: Request<axum::body::Body>,
+    next: middleware::Next,
+    profile: ApiProfile,
+) -> Response {
+    if profile == ApiProfile::PaidBetaV3 && request.method() == Method::OPTIONS {
+        let requested_method = request
+            .headers()
+            .get("access-control-request-method")
+            .and_then(|value| value.to_str().ok());
+        if !is_paid_beta_v3_customer_path(request.uri().path()) || requested_method != Some("POST")
+        {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    }
+    next.run(request).await
 }
 
 /// TODO: Document is_loopback_origin.
@@ -985,7 +1028,12 @@ fn apply_middleware(
             enforce_request_timeout(request, next, resource_bounds.request_timeout)
         }))
         .layer(middleware::from_fn(ensure_json_errors))
-        .layer(build_cors_layer(&config.cors_mode))
+        .layer(build_profile_cors_layer(&config.cors_mode, api_profile))
+        // CORS short-circuits valid preflights, so this profile gate must wrap
+        // it to keep every unpublished PBV3 route and method hidden.
+        .layer(middleware::from_fn(move |request, next| {
+            enforce_profile_cors_admission(request, next, api_profile)
+        }))
         .layer(middleware::from_fn(allow_private_network))
         .layer(middleware::from_fn(observe_request_latency))
         // Catch panics inside request_id_middleware so the canonical 500 JSON

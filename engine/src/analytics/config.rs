@@ -2,6 +2,10 @@
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_ANALYTICS_RETENTION_DAYS: u32 = 90;
+const SEARCHES_DIR_COMPONENT: &str = "searches";
+const EVENTS_DIR_COMPONENT: &str = "events";
+const ROLLUPS_DIR_COMPONENT: &str = "rollups";
+const ROLLUP_MANIFEST_FILE: &str = "manifest.json";
 
 /// Configuration for the analytics subsystem, loaded from environment variables.
 #[derive(Debug, Clone)]
@@ -115,21 +119,21 @@ impl AnalyticsConfig {
     pub fn searches_dir(&self, index_name: &str) -> PathBuf {
         self.data_dir
             .join(Self::path_component(index_name))
-            .join("searches")
+            .join(SEARCHES_DIR_COMPONENT)
     }
 
     /// Path to insight events for a given index.
     pub fn events_dir(&self, index_name: &str) -> PathBuf {
         self.data_dir
             .join(Self::path_component(index_name))
-            .join("events")
+            .join(EVENTS_DIR_COMPONENT)
     }
 
     /// Path to rollup Parquet files for a given index and tier.
     pub fn rollups_dir(&self, index_name: &str, tier: &str) -> PathBuf {
         self.data_dir
             .join(Self::path_component(index_name))
-            .join("rollups")
+            .join(ROLLUPS_DIR_COMPONENT)
             .join(Self::path_component(tier))
     }
 
@@ -137,18 +141,27 @@ impl AnalyticsConfig {
     pub fn rollup_manifest_path(&self, index_name: &str) -> PathBuf {
         self.data_dir
             .join(Self::path_component(index_name))
-            .join("rollups")
-            .join("manifest.json")
+            .join(ROLLUPS_DIR_COMPONENT)
+            .join(ROLLUP_MANIFEST_FILE)
     }
 
     pub fn target_artifact_paths(&self, index_name: &str) -> AnalyticsTargetArtifactPaths {
-        let index_root = self.data_dir.join(Self::path_component(index_name));
+        Self::target_artifact_paths_in(&self.data_dir, index_name)
+    }
+
+    pub(crate) fn target_artifact_paths_in(
+        data_dir: &Path,
+        index_name: &str,
+    ) -> AnalyticsTargetArtifactPaths {
+        let index_root = data_dir.join(Self::path_component(index_name));
         AnalyticsTargetArtifactPaths {
-            data_dir: self.data_dir.clone(),
-            searches_dir: self.searches_dir(index_name),
-            events_dir: self.events_dir(index_name),
-            rollups_dir: index_root.join("rollups"),
-            rollup_manifest_path: self.rollup_manifest_path(index_name),
+            data_dir: data_dir.to_path_buf(),
+            searches_dir: index_root.join(SEARCHES_DIR_COMPONENT),
+            events_dir: index_root.join(EVENTS_DIR_COMPONENT),
+            rollups_dir: index_root.join(ROLLUPS_DIR_COMPONENT),
+            rollup_manifest_path: index_root
+                .join(ROLLUPS_DIR_COMPONENT)
+                .join(ROLLUP_MANIFEST_FILE),
             index_root,
         }
     }

@@ -5,11 +5,33 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const TIER_PREFERENCE: &[&str] = &["1day", "1hour", "5min"];
 const HOUR_MS: i64 = 3_600_000;
 const DAY_MS: i64 = 86_400_000;
+
+/// Resolve a manifest-owned artifact filename beneath its canonical tier
+/// directory. Writers and destructive retention checks share this boundary so
+/// neither accepts absolute paths or traversal components from persisted JSON.
+pub(crate) fn manifest_artifact_path(tier_dir: &Path, file_name: &str) -> Result<PathBuf, String> {
+    let candidate = Path::new(file_name);
+    let mut components = candidate.components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None)
+            if candidate
+                .extension()
+                .is_some_and(|extension| extension == "parquet") =>
+        {
+            Ok(tier_dir.join(candidate))
+        }
+        _ => Err(format!(
+            "invalid manifest artifact filename '{}': expected one Parquet basename beneath {}",
+            file_name,
+            tier_dir.display()
+        )),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -175,6 +197,8 @@ impl RollupManifest {
         entry: WindowEntry,
         tier_dir: &Path,
     ) -> io::Result<()> {
+        manifest_artifact_path(tier_dir, &entry.file)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         {
             let tier_state = self
                 .tiers
@@ -197,13 +221,15 @@ impl RollupManifest {
                 .iter()
                 .position(|w| w.start_ms == entry.start_ms)
             {
-                let old = date_state.windows.remove(idx);
+                let old = &date_state.windows[idx];
                 if !old.file.is_empty() && old.file != entry.file {
-                    let old_path = tier_dir.join(&old.file);
+                    let old_path = manifest_artifact_path(tier_dir, &old.file)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                     if old_path.exists() {
                         fs::remove_file(&old_path)?;
                     }
                 }
+                date_state.windows.remove(idx);
             }
 
             date_state.windows.push(entry);

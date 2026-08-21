@@ -81,7 +81,7 @@ export async function createFixtureSearchKey() {
   const client = clientForTest();
   const { indexName } = testConfiguration();
   const created = await client.addApiKey({
-    acl: ['search'],
+    acl: ['search', 'browse'],
     description: 'Temporary real-client browser fixture key',
     indexes: [indexName],
   });
@@ -93,7 +93,7 @@ export async function createFixtureSearchKey() {
     // Reading the key back proves both restrictions reached the canonical key store
     // before a browser is allowed to use the credential.
     const stored = await client.getApiKey({ key: created.key });
-    if (JSON.stringify(stored.acl) !== JSON.stringify(['search'])
+    if (JSON.stringify(stored.acl) !== JSON.stringify(['search', 'browse'])
       || JSON.stringify(stored.indexes) !== JSON.stringify([indexName])) {
       throw new Error(`Fixture key restrictions were not persisted: ${JSON.stringify(stored)}`);
     }

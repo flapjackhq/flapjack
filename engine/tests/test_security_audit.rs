@@ -1468,7 +1468,7 @@ async fn a05_public_health_uses_explicit_metadata_denylist() {
             "version": flapjack::build_info().version,
             "profile": flapjack::build_info().profile,
             "apiProfile": "full",
-            "supportedApiProfiles": ["full", "paid_beta_v1"],
+            "supportedApiProfiles": ["full", "paid_beta_v1", "paid_beta_v3"],
             "capabilities": flapjack::build_info().capabilities,
         })
     );

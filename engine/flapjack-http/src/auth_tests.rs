@@ -23,14 +23,21 @@ fn application_id_accepts_official_browser_query_transport() {
         Some("browser-app")
     );
 
-    let header_wins = Request::builder()
+    let mixed_disagreement = Request::builder()
         .uri("/1/indexes/*/queries?x-algolia-application-id=query-app")
         .header("x-algolia-application-id", "header-app")
         .body(Body::empty())
         .unwrap();
+    assert_eq!(request_application_id(&mixed_disagreement), None);
+
+    let matching_mixed = Request::builder()
+        .uri("/1/indexes/*/queries?x-algolia-application-id=browser-app")
+        .header("x-algolia-application-id", "browser-app")
+        .body(Body::empty())
+        .unwrap();
     assert_eq!(
-        request_application_id(&header_wins).as_deref(),
-        Some("header-app")
+        request_application_id(&matching_mixed).as_deref(),
+        Some("browser-app")
     );
 
     let encoded = Request::builder()

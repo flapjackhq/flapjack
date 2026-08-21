@@ -8,8 +8,8 @@ use axum::{
 use std::net::IpAddr;
 
 use crate::api_profile::{
-    ApiProfile, PaidBetaV1CustomerRequest, PAID_BETA_V1_APPLICATION_ID,
-    PAID_BETA_V1_DIRECT_SEARCH_PATH,
+    is_paid_beta_v3_customer_path, ApiProfile, PaidBetaV1CustomerRequest,
+    PaidBetaV3CustomerRequest, PAID_BETA_V1_APPLICATION_ID, PAID_BETA_V1_DIRECT_SEARCH_PATH,
 };
 use crate::error_response::json_error;
 use crate::security_audit::{self, Actor, AuditPath, Target};
@@ -18,10 +18,10 @@ use super::route_acl::RouteAcl;
 use super::session::DashboardSessionStore;
 use super::session_cookie::presented_session_token;
 use super::{
-    api_key_restrict_sources_match, invalid_api_credentials_error, key_allows_index,
-    referer_matches, request_application_id, required_acl_for_route, restrict_sources_match,
-    validate_secured_key, ApiKey, AuthenticatedAppId, KeyStore, RateLimiter,
-    ReplicationPeerCredential, SecuredKeyRestrictions, PRIVATE_MIGRATION_ACL,
+    api_key_restrict_sources_match, canonical_request_credential, invalid_api_credentials_error,
+    key_allows_index, referer_matches, required_acl_for_route, restrict_sources_match,
+    validate_secured_key, ApiKey, AuthenticatedAppId, CanonicalRequestCredential, KeyStore,
+    RateLimiter, ReplicationPeerCredential, SecuredKeyRestrictions,
     REPLICATION_PEER_APPLICATION_ID,
 };
 
@@ -89,11 +89,9 @@ pub(crate) fn extract_index_name(path: &str) -> Option<String> {
 
 /// Extract API key from request headers or query string.
 ///
-/// First checks the `x-algolia-api-key` header. If not found and the route is a
-/// privileged operational route (`admin` or `privateMigration` ACL), returns `None`
-/// to prevent credential leakage via logs, shell history, proxy access logs, or
-/// referrer-like surfaces. Otherwise attempts to extract the key from the
-/// `x-algolia-api-key` query string parameter.
+/// Query transport is limited to the read-only Search/Browse ACL surfaces used
+/// by official browser clients. Indexing, debugger, administration, migration,
+/// replication, and every unmapped route remain header-only.
 ///
 /// # Arguments
 ///
@@ -102,25 +100,18 @@ pub(crate) fn extract_index_name(path: &str) -> Option<String> {
 /// # Returns
 ///
 /// `Some(key)` if an API key is found, `None` otherwise.
-fn extract_api_key_for_route(request: &Request, route_acl: RouteAcl) -> Option<String> {
-    if let Some(val) = request.headers().get("x-algolia-api-key") {
-        return val.to_str().ok().map(|s| s.to_string());
+fn extract_api_key_for_route(
+    request: &Request,
+    route_acl: RouteAcl,
+) -> Result<Option<CanonicalRequestCredential>, ()> {
+    let credential = canonical_request_credential(request, "x-algolia-api-key")?;
+    if credential
+        .as_ref()
+        .is_some_and(|presented| presented.from_query && requires_header_credentials(route_acl))
+    {
+        return Err(());
     }
-
-    // Privileged operational routes reject URL-borne credentials so sensitive
-    // leak via logs, shell history, proxy access logs, or referrer-like surfaces.
-    if requires_header_credentials(route_acl) {
-        return None;
-    }
-
-    if let Some(query) = request.uri().query() {
-        for pair in query.split('&') {
-            if let Some(val) = pair.strip_prefix("x-algolia-api-key=") {
-                return Some(val.to_string());
-            }
-        }
-    }
-    None
+    Ok(credential)
 }
 
 fn extract_bearer_api_key(request: &Request) -> Option<String> {
@@ -139,14 +130,15 @@ fn extract_api_key(request: &Request) -> Option<String> {
         request,
         required_acl_for_route(request.method(), request.uri().path()),
     )
+    .ok()
+    .flatten()
+    .map(|credential| credential.value)
 }
 
 fn requires_header_credentials(route_acl: RouteAcl) -> bool {
-    matches!(
+    !matches!(
         route_acl,
-        RouteAcl::Required("admin")
-            | RouteAcl::Required(PRIVATE_MIGRATION_ACL)
-            | RouteAcl::PeerOrAdmin
+        RouteAcl::Required("search") | RouteAcl::Required("browse")
     )
 }
 
@@ -402,15 +394,41 @@ pub async fn authenticate_and_authorize(
     };
     let key_store = key_store.clone();
 
-    let application_id_opt = request_application_id(&request);
-    let standard_api_key = extract_api_key_for_route(&request, route_acl);
+    let customer_path_is_visible = match api_profile {
+        ApiProfile::PaidBetaV1 => path == PAID_BETA_V1_DIRECT_SEARCH_PATH,
+        ApiProfile::PaidBetaV3 => {
+            request.method() == Method::POST && is_paid_beta_v3_customer_path(&path)
+        }
+        ApiProfile::Full => true,
+    };
+    let credential_error = || {
+        log_auth_failure(&path, "malformed", "credential_sources_disagree");
+        if customer_path_is_visible {
+            invalid_api_credentials_error()
+        } else {
+            StatusCode::NOT_FOUND.into_response()
+        }
+    };
+    let application_id_credential =
+        canonical_request_credential(&request, "x-algolia-application-id")
+            .map_err(|()| credential_error())?;
+    if application_id_credential
+        .as_ref()
+        .is_some_and(|presented| presented.from_query && requires_header_credentials(route_acl))
+    {
+        return Err(credential_error());
+    }
+    let application_id_opt = application_id_credential.map(|credential| credential.value);
+    let standard_api_key_credential =
+        extract_api_key_for_route(&request, route_acl).map_err(|()| credential_error())?;
+    let standard_api_key = standard_api_key_credential.map(|credential| credential.value);
     let session_is_valid = request
         .extensions()
         .get::<std::sync::Arc<DashboardSessionStore>>()
         .zip(presented_session_token(&request))
         .is_some_and(|(store, token)| store.validate_session(&token));
 
-    if api_profile == ApiProfile::PaidBetaV1 && path != PAID_BETA_V1_DIRECT_SEARCH_PATH {
+    if !customer_path_is_visible {
         let admin_request = standard_api_key
             .as_deref()
             .is_some_and(|key| key_store.is_admin(key));
@@ -449,6 +467,13 @@ pub async fn authenticate_and_authorize(
         && !standard_api_key
             .as_deref()
             .is_some_and(|key| key_store.is_admin(key));
+    let pbv3_customer_route = api_profile == ApiProfile::PaidBetaV3
+        && request.method() == Method::POST
+        && is_paid_beta_v3_customer_path(&path)
+        && !session_is_valid
+        && !standard_api_key
+            .as_deref()
+            .is_some_and(|key| key_store.is_admin(key));
     let presented_key = if pbv1_customer_route {
         extract_bearer_api_key(&request)
     } else {
@@ -480,7 +505,8 @@ pub async fn authenticate_and_authorize(
         }
     };
 
-    if pbv1_customer_route && application_id != PAID_BETA_V1_APPLICATION_ID {
+    if (pbv1_customer_route || pbv3_customer_route) && application_id != PAID_BETA_V1_APPLICATION_ID
+    {
         log_auth_failure(&path, "direct", "application_id_invalid");
         return Err(invalid_api_credentials_error());
     }
@@ -521,13 +547,13 @@ pub async fn authenticate_and_authorize(
             return Err(invalid_api_credentials_error());
         }
     };
-    if pbv1_customer_route && secured_restrictions.is_some() {
+    if (pbv1_customer_route || pbv3_customer_route) && secured_restrictions.is_some() {
         return Err(invalid_api_credentials_error());
     }
     if let Some(response) = ensure_key_is_not_expired(&api_key) {
         return Err(response);
     }
-    let authorization_acl = if pbv1_customer_route {
+    let authorization_acl = if pbv1_customer_route || pbv3_customer_route {
         RouteAcl::Required("search")
     } else {
         route_acl
@@ -541,6 +567,15 @@ pub async fn authenticate_and_authorize(
         &path,
     ) {
         return Err(response);
+    }
+    if pbv3_customer_route {
+        let exact_managed_search_scope = api_key.acl.len() == 2
+            && api_key.acl.iter().any(|acl| acl == "search")
+            && api_key.acl.iter().any(|acl| acl == "browse")
+            && api_key.indexes.len() == 1;
+        if !exact_managed_search_scope {
+            return Err(invalid_api_credentials_error());
+        }
     }
     if let Some(response) = ensure_referer_is_allowed(&request, &api_key) {
         return Err(response);
@@ -579,6 +614,9 @@ pub async fn authenticate_and_authorize(
     request.extensions_mut().insert(api_key);
     if pbv1_customer_route {
         request.extensions_mut().insert(PaidBetaV1CustomerRequest);
+    }
+    if pbv3_customer_route {
+        request.extensions_mut().insert(PaidBetaV3CustomerRequest);
     }
     if let Some(restrictions) = secured_restrictions {
         request.extensions_mut().insert(restrictions);

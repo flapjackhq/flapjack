@@ -206,7 +206,21 @@ async fn async_submit_returns_admission_snapshot_and_status_reads_durable_phase(
     assert!(current.terminal_at.is_none());
 
     release_documents.notify_waiters();
-    let terminal = wait_for_async_terminal(&state, submitted.job_id, "async-owner-app", None).await;
+    // This test owns the spawned job, so join that exact task instead of using
+    // a time-bound status poll. The durable read below still proves the result.
+    tokio::time::timeout(
+        ASYNC_STATUS_TERMINAL_TIMEOUT,
+        state.migration_runner.drain_active_imports(),
+    )
+    .await
+    .expect("owned async import should finish after release");
+    let Json(terminal) = get_algolia_migration_status(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(AuthenticatedAppId("async-owner-app".to_string())),
+        AxumPath(submitted.job_id.to_string()),
+    )
+    .await
+    .expect("status should expose the terminal durable phase after the owned task joins");
     assert_eq!(terminal.phase, AsyncMigrationPhase::Activating);
     assert_eq!(terminal.disposition, AsyncMigrationDisposition::Succeeded);
 }
