@@ -8,7 +8,7 @@
 #   ./s/test                  # default: unit + integ + server
 #   ./s/test --rwork-contract  # validate repository Rwork + Dev Container config
 #   ./s/test --sdk-host-safety # scan shipped sdks/ for vendor host literals
-#   ./s/test --publish-guard   # prove the mirror publish guard refuses unmerged trees
+#   ./s/test --publish-guard   # prove publish guard + public-candidate safety
 #   ./s/test --unit           # core in-process + HTTP libs process-isolated
 #   ./s/test --integ          # cargo nextest run --no-fail-fast
 #   ./s/test --server         # cargo test -p flapjack-server (~10s, 12 tests)
@@ -110,7 +110,7 @@ if [ "$RUN_LIST" = "true" ]; then
   divider
   echo "  (no flags)         unit + integ + server (default)               host-dependent"
   echo "  --sdk-host-safety  scan shipped sdks/ for vendor host literals   ~1s"
-  echo "  --publish-guard    prove the mirror publish guard refuses unmerged  ~2s"
+  echo "  --publish-guard    prove guard + public-candidate safety            ~15s"
   echo "  --rwork-contract   validate repository Rwork + Dev Container config  <1s"
   echo "  --unit             core in-process + HTTP libs isolated          host-dependent"
   echo "  --integ            process-isolated integration tests            host-dependent"
@@ -518,7 +518,7 @@ fi
 # Dev-only, and this runner is its only automatic runner: `scripts/` and `.debbie/`
 # are outside the debbie sync scope, so mirror CI cannot run these tests, and dev
 # repos keep GitHub Actions disabled. Behavioural cases against throwaway git repos;
-# ~2s. The test lives under scripts/ rather than engine/tests/ precisely so it is
+# ~15s. The tests live under scripts/ rather than engine/tests/ precisely so they are
 # never synced to a mirror where the guard it tests does not exist.
 #
 # THIS FILE IS SYNCED (engine/_dev/s/test -> engine/s/test), so this block runs on the
@@ -532,22 +532,29 @@ fi
 
 if [ "$RUN_PUBLISH_GUARD" = "true" ]; then
   if [ -f "$ROOT_DIR/.debbie.toml" ]; then
-    next_step "Publish: mirror publish guard refuses an unmerged dev tree"
+    next_step "Publish: guard and deterministic public-candidate contracts"
     ssot_guard="$ROOT_DIR/scripts/check_migration_ssot_owners.sh"
-    if [ ! -f "$ROOT_DIR/scripts/tests/publish_guard_test.sh" ]; then
+    publish_guard_test="$ROOT_DIR/scripts/tests/publish_guard_test.sh"
+    candidate_test="$ROOT_DIR/scripts/tests/publish_public_candidate_test.sh"
+    if [ ! -f "$publish_guard_test" ]; then
       # `error` prints but does not exit, so without this the run falls through to a bare
       # 127 from the missing file — a status that reads like a tooling fault rather than
       # the contract violation it is.
       error "This clone can publish (.debbie.toml present) but scripts/tests/publish_guard_test.sh is missing"
       exit 1
     fi
+    if [ ! -f "$candidate_test" ]; then
+      error "This clone can publish (.debbie.toml present) but scripts/tests/publish_public_candidate_test.sh is missing"
+      exit 1
+    fi
     if [ ! -x "$ssot_guard" ]; then
       error "This clone can publish (.debbie.toml present) but the migration SSOT owner guard is missing or not executable"
       exit 1
     fi
-    bash "$ROOT_DIR/scripts/tests/publish_guard_test.sh"
+    bash "$publish_guard_test"
+    bash "$candidate_test"
     MIGRATION_SSOT_ENGINE_DIR="$ENGINE_DIR" bash "$ssot_guard"
-    success "Publish guard contract holds"
+    success "Publish safety contracts hold"
   else
     next_step "Publish: guard not applicable in a mirror clone (no .debbie.toml)"
     success "Skipped — a mirror is a sync target, never a sync source"

@@ -1,0 +1,13 @@
+   Compiling flapjack v1.0.1 (/Users/stuart/parallel_development/flapjack_dev/may25_1248pm_owasp_top10_audit/flapjack_dev/engine)
+   Compiling flapjack-replication v1.0.1 (/Users/stuart/parallel_development/flapjack_dev/may25_1248pm_owasp_top10_audit/flapjack_dev/engine/flapjack-replication)
+   Compiling flapjack-http v1.0.1 (/Users/stuart/parallel_development/flapjack_dev/may25_1248pm_owasp_top10_audit/flapjack_dev/engine/flapjack-http)
+    Finished `test` profile [optimized + debuginfo] target(s) in 45.83s
+     Running tests/test_security_audit.rs (target/debug/deps/test_security_audit-8bd81655fc494f1d)
+
+running 3 tests
+test a03_top_searches_country_sql_injection_payload_does_not_broaden_results ... ok
+test a03_top_searches_tags_sql_injection_payload_does_not_broaden_results ... ok
+test a03_search_rejects_malformed_filters_instead_of_ignoring_them ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.30s
+

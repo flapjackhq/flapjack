@@ -47,16 +47,19 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # Guard: only run on recognized public repos. The private dev repo is
-  # intentionally excluded — CI belongs on staging/prod where Actions is free.
+  # Guard: only run in the public product repository. Candidate pushes use ci.yml;
+  # this expensive recurring diagnostic remains separate from the merge gate.
   check-repo:
     runs-on: ubuntu-latest
     outputs:
       is-public-repo: ${{ steps.check.outputs.is-public-repo }}
     steps:
       - id: check
+        env:
+          ACTUAL_REPOSITORY: ${{ github.repository }}
+          ACTUAL_REF: ${{ github.ref }}
         run: |
-          if [ "${{ github.repository }}" = "flapjackhq/flapjack" ] || [ "${{ github.repository }}" = "gridl-staging/flapjack" ]; then
+          if [ "$ACTUAL_REPOSITORY" = "flapjackhq/flapjack" ] && [ "$ACTUAL_REF" = "refs/heads/main" ]; then
             echo "is-public-repo=true" >> "$GITHUB_OUTPUT"
           else
             echo "is-public-repo=false" >> "$GITHUB_OUTPUT"

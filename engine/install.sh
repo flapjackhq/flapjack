@@ -3,7 +3,7 @@
 #
 # Usage:
 #   curl -fsSL https://install.flapjack.foo | sh            # latest from prod
-#   curl -fsSL https://install.flapjack.foo | sh             # latest from staging
+#   curl -fsSL https://staging.flapjack.foo | sh             # latest from staging
 #   curl -fsSL https://install.flapjack.foo | sh -s -- v1.0.10   # pinned version
 #
 # Environment variables:

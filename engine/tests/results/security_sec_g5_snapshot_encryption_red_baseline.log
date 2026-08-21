@@ -1,0 +1,71 @@
+   Compiling flapjack-http v1.0.10 (/Users/stuart/parallel_development/flapjack_dev/jul31_2pm_4_optional_snapshot_encryption/flapjack_dev/engine/flapjack-http)
+   Compiling flapjack v1.0.10 (/Users/stuart/parallel_development/flapjack_dev/jul31_2pm_4_optional_snapshot_encryption/flapjack_dev/engine)
+    Finished `test` profile [optimized + debuginfo] target(s) in 7.59s
+────────────
+ Nextest run ID 27548d46-cce9-4e8e-8601-e3f940484c59 with nextest profile: default
+    Starting 4 tests across 1 binary
+        FAIL [   0.014s] (1/4) flapjack::test_snapshot_encryption_contract encrypted_export_is_not_readable_without_the_key
+  stdout ───
+
+    running 1 test
+    test encrypted_export_is_not_readable_without_the_key ... FAILED
+
+    failures:
+
+    failures:
+        encrypted_export_is_not_readable_without_the_key
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'encrypted_export_is_not_readable_without_the_key' (517034613) panicked at tests/test_snapshot_encryption_contract.rs:71:66:
+    encrypted export: Config("snapshot encryption not implemented")
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  Cancelling due to test failure: 3 tests still running
+        PASS [   0.015s] (2/4) flapjack::test_snapshot_encryption_contract encrypted_magic_does_not_collide_with_gzip
+        FAIL [   0.014s] (3/4) flapjack::test_snapshot_encryption_contract encrypted_export_is_not_readable_with_the_wrong_key
+  stdout ───
+
+    running 1 test
+    test encrypted_export_is_not_readable_with_the_wrong_key ... FAILED
+
+    failures:
+
+    failures:
+        encrypted_export_is_not_readable_with_the_wrong_key
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'encrypted_export_is_not_readable_with_the_wrong_key' (517034611) panicked at tests/test_snapshot_encryption_contract.rs:88:66:
+    encrypted export: Config("snapshot encryption not implemented")
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        FAIL [   0.015s] (4/4) flapjack::test_snapshot_encryption_contract encrypted_export_round_trips_with_the_key
+  stdout ───
+
+    running 1 test
+    test encrypted_export_round_trips_with_the_key ... FAILED
+
+    failures:
+
+    failures:
+        encrypted_export_round_trips_with_the_key
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'encrypted_export_round_trips_with_the_key' (517034614) panicked at tests/test_snapshot_encryption_contract.rs:53:66:
+    encrypted export: Config("snapshot encryption not implemented")
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+────────────
+     Summary [   0.015s] 4 tests run: 1 passed, 3 failed, 0 skipped
+        FAIL [   0.014s] (1/4) flapjack::test_snapshot_encryption_contract encrypted_export_is_not_readable_without_the_key
+        FAIL [   0.014s] (3/4) flapjack::test_snapshot_encryption_contract encrypted_export_is_not_readable_with_the_wrong_key
+        FAIL [   0.015s] (4/4) flapjack::test_snapshot_encryption_contract encrypted_export_round_trips_with_the_key
+error: test run failed

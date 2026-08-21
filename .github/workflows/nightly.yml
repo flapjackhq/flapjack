@@ -1,9 +1,8 @@
 name: Nightly Tests
 
-# Comprehensive nightly test suite — runs on public repos only (staging/prod).
-# The private dev repo is excluded because GitHub
-# Actions minutes cost money on private repos. Use `debbie sync staging` to
-# push changes where nightly CI runs for free.
+# Comprehensive nightly test suite — runs only in the public product repository.
+# The private development repository keeps Actions disabled, and candidate branches
+# use ci.yml instead of duplicating this scheduled main-branch suite.
 #
 # Covers: all Rust tests, dashboard integration with Algolia, all SDK versions,
 # all integration tests.
@@ -24,16 +23,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Guard: only run on recognized public repos. The private dev repo is
-  # intentionally excluded — CI belongs on staging/prod where Actions is free.
+  # Guard: only run in the public product repository. The private development
+  # repository remains intentionally excluded.
   check-repo:
     runs-on: ubuntu-latest
     outputs:
       is-public-repo: ${{ steps.check.outputs.is-public-repo }}
     steps:
       - id: check
+        env:
+          ACTUAL_REPOSITORY: ${{ github.repository }}
+          ACTUAL_REF: ${{ github.ref }}
         run: |
-          if [ "${{ github.repository }}" = "flapjackhq/flapjack" ] || [ "${{ github.repository }}" = "gridl-staging/flapjack" ]; then
+          if [ "$ACTUAL_REPOSITORY" = "flapjackhq/flapjack" ] && [ "$ACTUAL_REF" = "refs/heads/main" ]; then
             echo "is-public-repo=true" >> "$GITHUB_OUTPUT"
           else
             echo "is-public-repo=false" >> "$GITHUB_OUTPUT"

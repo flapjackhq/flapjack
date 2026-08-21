@@ -1,0 +1,19 @@
+Server ready at http://127.0.0.1:54735 (pid 21057)
+SEC-G4 served RED expectations: checks 1,3,4,5,6,7 FAIL; checks 2,8,9 PASS on the unfixed tree.
+  [FAIL] 1 admin auth success event emitted
+         matching safe event lines: 0
+  [PASS] 2 admin key absent from server log
+  [FAIL] 3 create-key event emitted and returned key absent
+         matching canonical event lines: 0; forbidden returned-key occurrences: 0
+  [FAIL] 4 delete-key success and failure events emitted and raw path key absent
+         matching canonical success/failure lines: 0/0; forbidden path-key occurrences: 0
+  [FAIL] 5 delete-index success and failure targets recorded
+         matching canonical success/failure lines: 0/0
+  [FAIL] 6 settings event names userData and omits probe token
+         matching canonical event lines: 0; forbidden probe-token occurrences: 0
+  [FAIL] 7 snapshot import success and failure events emitted
+         matching canonical success/failure lines: 0/0
+  [PASS] 8 search-only auth emits zero auth-success delta
+  [PASS] 9 header name and distinctive query-string probe absent
+SEC-G4 served probe summary: checks=9 failed=6
+INFO: preserved security audit probe evidence at /var/folders/v6/b8qh29l57ql_p7hdw2qhpqkw0000gn/T//fj-sec-g4-probe.HHk6xD

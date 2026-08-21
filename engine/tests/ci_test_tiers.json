@@ -13,6 +13,7 @@
   "infrastructure_jobs": [
     ".github/workflows/ci.yml#check-repo",
     ".github/workflows/ci.yml#build-server",
+    ".github/workflows/ci.yml#public-candidate-gate",
     ".github/workflows/nightly.yml#check-repo",
     ".github/workflows/nightly.yml#build-server",
     ".github/workflows/nightly.yml#nightly-summary",

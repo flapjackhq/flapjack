@@ -1,0 +1,102 @@
+    Finished `test` profile [optimized + debuginfo] target(s) in 6.30s
+     Running unittests src/lib.rs (target/debug/deps/flapjack-c68ce0e994ced1fa)
+
+running 80 tests
+test integ_tests::test_analytics::click_without_query_id_with_positions_ok ... ok
+test integ_tests::test_analytics::click_without_query_id_no_positions_rejected ... ok
+test integ_tests::test_analytics::effective_object_ids_falls_back_to_alt ... ok
+test integ_tests::test_analytics::click_after_search_positions_length_mismatch ... ok
+test integ_tests::test_analytics::click_after_search_missing_positions ... ok
+test integ_tests::test_analytics::effective_object_ids_prefers_primary ... ok
+test integ_tests::test_analytics::empty_event_name ... ok
+test integ_tests::test_analytics::empty_object_ids ... ok
+test integ_tests::test_analytics::empty_user_token ... ok
+test integ_tests::test_analytics::event_subtype_add_to_cart_on_click_rejected ... ok
+test integ_tests::test_analytics::event_name_too_long ... ok
+test integ_tests::test_analytics::event_subtype_invalid_on_conversion_rejected ... ok
+test integ_tests::test_analytics::event_subtype_add_to_cart_on_conversion_accepted ... ok
+test integ_tests::test_analytics::event_subtype_purchase_on_conversion_accepted ... ok
+test integ_tests::test_analytics::event_subtype_purchase_on_view_rejected ... ok
+test integ_tests::test_analytics::invalid_event_type ... ok
+test integ_tests::test_analytics::invalid_query_id_non_hex ... ok
+test integ_tests::test_analytics::invalid_query_id_too_short ... ok
+test integ_tests::test_analytics::handles_missing_directory ... ok
+test integ_tests::test_analytics::max_boundary_event_name_64_chars ... ok
+test integ_tests::test_analytics::max_boundary_20_object_ids ... ok
+test integ_tests::test_analytics::max_boundary_user_token_129_chars ... ok
+test integ_tests::test_analytics::no_timestamp_accepted ... ok
+test integ_tests::test_analytics::ignores_non_date_directories ... ok
+test integ_tests::test_analytics::query_id_correlation ... ok
+test integ_tests::test_analytics::keeps_recent_partitions ... ok
+test integ_tests::test_analytics::timestamp_too_old_rejected ... ok
+test integ_tests::test_analytics::timestamp_within_4_days_accepted ... ok
+test integ_tests::test_analytics::too_many_object_ids ... ok
+test integ_tests::test_analytics::user_token_too_long ... ok
+test integ_tests::test_analytics::user_token_with_spaces_rejected ... ok
+test integ_tests::test_analytics::user_token_with_special_chars_rejected ... ok
+test integ_tests::test_analytics::user_token_with_valid_charset_accepted ... ok
+test integ_tests::test_analytics::valid_click_passes ... ok
+test integ_tests::test_analytics::valid_conversion_passes ... ok
+test integ_tests::test_analytics::valid_view_passes ... ok
+test integ_tests::test_analytics::cleans_multiple_indices ... ok
+test integ_tests::test_analytics::removes_old_partitions ... ok
+test integ_tests::test_analytics_io::cleanup_analytics_dir_missing ... ok
+test integ_tests::test_analytics::retention_gate_deletes_certified_partitions ... ok
+test integ_tests::test_analytics::retention_gate_retains_uncertified_partitions ... ok
+test integ_tests::test_analytics_io::cleanup_no_analytics_data ... ok
+test integ_tests::test_analytics_io::disabled_collector_does_not_write ... ok
+test integ_tests::test_analytics_io::empty_events_is_noop ... ok
+test integ_tests::test_analytics_io::auto_flush_at_threshold ... ok
+test integ_tests::test_analytics_io::cleanup_all_orphaned ... ok
+test integ_tests::test_analytics_io::events_grouped_by_index ... ok
+test integ_tests::test_analytics_io::cleanup_mixed ... ok
+test integ_tests::test_analytics_io::cleanup_no_orphans ... ok
+test integ_tests::test_analytics_io::flush_all_empties_both_buffers ... ok
+test integ_tests::test_analytics_io::insight_events_flush_to_parquet ... ok
+test integ_tests::test_analytics_io::insight_event_interleaving_team_roundtrip ... ok
+test integ_tests::test_analytics_io::insight_event_null_interleaving_team_roundtrip ... ok
+test integ_tests::test_analytics_io::query_id_cache_returns_none_for_unknown ... ok
+test integ_tests::test_analytics_io::query_id_cache_stores_and_retrieves ... ok
+test integ_tests::test_analytics_io::analytics_persists_truncated_client_ip_only ... FAILED
+test integ_tests::test_analytics_io::record_search_stores_in_buffer ... ok
+test integ_tests::test_analytics_io::status_reflects_config ... ok
+test integ_tests::test_analytics::users_count_hll_returns_sketch_and_deduplicates ... ok
+test integ_tests::test_analytics::users_count_hll_internal_fields_stripped_in_response ... ok
+test integ_tests::test_analytics_io::query_empty_index_returns_empty ... ok
+test integ_tests::test_analytics_io::write_insight_events_creates_parquet_file ... ok
+test integ_tests::test_analytics_io::write_search_events_creates_parquet_file ... ok
+test integ_tests::test_analytics_io::filters_query_returns_filter_data ... ok
+test integ_tests::test_analytics::analytics_disabled_suppresses_recording ... ok
+test integ_tests::test_analytics_io::filter_values_extracts_attribute_values ... ok
+test integ_tests::test_analytics_io::writer_roundtrip_with_null_experiment_fields ... ok
+test integ_tests::test_analytics_io::writer_roundtrip_with_experiment_fields ... ok
+test integ_tests::test_analytics_io::no_results_searches_returns_zero_hit_queries ... ok
+test integ_tests::test_analytics::revenue_zero_data ... ok
+test integ_tests::test_analytics_io::no_results_rate_calculation ... ok
+test integ_tests::test_analytics_io::search_events_roundtrip_via_query_engine ... ok
+test integ_tests::test_analytics_io::search_count_with_daily_breakdown ... ok
+test integ_tests::test_analytics::revenue_positive_case ... ok
+test integ_tests::test_analytics::revenue_multi_currency ... ok
+test integ_tests::test_analytics_io::users_count_deduplicates ... ok
+test integ_tests::test_analytics::date_range_filtering ... ok
+test integ_tests::test_analytics::non_correlated_events_recorded_but_dont_inflate_ctr ... ok
+test integ_tests::test_analytics::rate_endpoints_return_null_when_denominator_is_zero ... ok
+test integ_tests::test_analytics::full_analytics_pipeline ... ok
+
+failures:
+
+---- integ_tests::test_analytics_io::analytics_persists_truncated_client_ip_only stdout ----
+
+thread 'integ_tests::test_analytics_io::analytics_persists_truncated_client_ip_only' (307168239) panicked at src/integ_tests/test_analytics_io.rs:824:5:
+assertion `left == right` failed
+  left: [("203.0.113.47", "US", "CA"), ("2001:db8:1234:5678::1", "DE", "BE")]
+ right: [("203.0.113.0", "US", "CA"), ("2001:db8:1234::", "DE", "BE")]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    integ_tests::test_analytics_io::analytics_persists_truncated_client_ip_only
+
+test result: FAILED. 79 passed; 1 failed; 0 ignored; 0 measured; 2071 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `-p flapjack --lib`

@@ -1,0 +1,20 @@
+[PASS] timeout curl_exit expected=0 actual=0
+[FAIL] timeout http_status expected=408 actual=200
+[FAIL] timeout body expected={"message":"Request timed out","status":408} actual=ok
+[FAIL] timeout bounded_elapsed expected=less_than_2s actual=2s
+[FAIL] concurrency health_pending expected=pending while sleep owns slot actual=completed
+[PASS] concurrency sleep_curl_exit expected=0 actual=0
+[PASS] concurrency sleep_http_status expected=200 actual=200
+[PASS] concurrency health_curl_exit expected=0 actual=0
+[PASS] concurrency health_http_status expected=200 actual=200
+curl: (52) Empty reply from server
+[FAIL] panic curl_exit expected=0 actual=52
+[FAIL] panic http_status expected=500 actual=000
+[FAIL] panic body expected={"message":"Internal server error","status":500} actual=
+[PASS] panic subsequent_health_status expected=200 actual=200
+[PASS] release_shape sleep_curl_exit expected=0 actual=0
+[PASS] release_shape sleep_http_status expected=404 actual=404
+[PASS] release_shape panic_curl_exit expected=0 actual=0
+[PASS] release_shape panic_http_status expected=404 actual=404
+SUMMARY checks_run=17 checks_failed=7 indeterminate=0
+INFO: preserved resource-bounds evidence at /var/folders/v6/b8qh29l57ql_p7hdw2qhpqkw0000gn/T//flapjack-resource-bounds.ibhzwh

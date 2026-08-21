@@ -1,0 +1,110 @@
+=== Flapjack Docker Runtime E2E ===
+Started: 2026-07-31T05:47:31Z
+Image: flapjack-secg11-baseline
+Platform: linux/arm64
+Expected version: 1.0.10
+Container: flapjack_stage2_s11
+Host port: 27701 -> 7700
+
+[2026-07-31T05:47:31Z] PASS: docker-available
+[2026-07-31T05:47:31Z] FAIL: non-root-uid
+  expected: non-empty UID other than 0
+  actual:   uid=0 exit=0
+
+--- Step 1: Start published image ---
+Host data dir: /var/folders/v6/b8qh29l57ql_p7hdw2qhpqkw0000gn/T/tmp.V3i9YKg0uA
+docker run exit: 0
+docker run output: 8e46aa0fb1e845ce49064ee41d6ddfbea9bc0433d69f9af55fa728bd13dd45c0
+
+[2026-07-31T05:47:31Z] PASS: container-started
+
+--- Step 2: Health check ---
+[2026-07-31T05:47:31Z] PASS: server-starts
+  /health response: {"status":"ok","version":"1.0.10","build":{"schemaVersion":1,"version":"1.0.10","profile":"release","capabilities":{"vectorSearch":true,"vectorSearchLocal":false}},"uptime_secs":0,"capabilities":{"vectorSearch":true,"vectorSearchLocal":false},"active_writers":0,"max_concurrent_writers":40,"facet_cache_entries":0,"facet_cache_cap":500,"heap_allocated_mb":8,"system_limit_mb":11934,"pressure_level":"normal","allocator":"jemalloc","tenants_loaded":0}
+[2026-07-31T05:47:31Z] PASS: health-status-ok
+[2026-07-31T05:47:31Z] PASS: health-version-match (1.0.10)
+[2026-07-31T05:47:31Z] PASS: health-capability-vector-search
+
+--- Step 2b: Architecture assertion ---
+[2026-07-31T05:47:31Z] PASS: image-architecture-match (linux/arm64)
+
+--- Step 2c: Pre-existing /data upgrade fixtures ---
+[2026-07-31T05:47:32Z] PASS: data-volume-writable-starts
+[2026-07-31T05:48:03Z] FAIL: data-volume-unwritable-refuses
+  expected: non-zero exit within 30s and operator-actionable docker run ... chown ... /data log
+  actual:   prepare=0 start=0 stopped=false exit=<running-or-missing>
+Unwritable fixture prepare/start output:
+a3787c7c3e59b9a304d90a4176fec23a59bd2837ba7d8e18c7bb8779ae70b8b3
+Unwritable fixture container logs:
+[2m2026-07-31T05:47:32.675784Z[0m [32m INFO[0m [2mflapjack_http::startup[0m[2m:[0m Memory configuration loaded [3mallocator[0m[2m=[0m"jemalloc" [3mmemory_limit_mb[0m[2m=[0m11934 [3mlimit_source[0m[2m=[0msysinfo [3mhigh_watermark_pct[0m[2m=[0m80 [3mcritical_pct[0m[2m=[0m90 [3mmax_concurrent_writers[0m[2m=[0m40
+[2m2026-07-31T05:47:32.675834Z[0m [32m INFO[0m [2mflapjack_replication::config[0m[2m:[0m No node.json found, running in standalone mode: node_id=a3787c7c3e59
+[2m2026-07-31T05:47:32.675967Z[0m [32m INFO[0m [2mflapjack_http::startup[0m[2m:[0m API key authentication enabled
+[2m2026-07-31T05:47:32.676047Z[0m [32m INFO[0m [2mflapjack_http::server_init[0m[2m:[0m Trusted proxy header forwarding enabled with secure defaults [3mtrusted_proxy_ranges[0m[2m=[0m2 [3mdefault_trusted_proxy_cidrs[0m[2m=[0m"127.0.0.0/8,::1/128"
+[2m2026-07-31T05:47:32.676051Z[0m [32m INFO[0m [2mflapjack_http::server_init[0m[2m:[0m Replication disabled (no peers in node.json)
+[2m2026-07-31T05:47:32.676056Z[0m [32m INFO[0m [2mflapjack_http::server_init[0m[2m:[0m [SSL] SSL management disabled: Configuration error: FLAPJACK_SSL_EMAIL is required for SSL auto-renewal
+[2m2026-07-31T05:47:32.676076Z[0m [32m INFO[0m [2mflapjack_http::server_init[0m[2m:[0m [analytics] Analytics enabled (flush every 60s, retain 90d)
+[2m2026-07-31T05:47:32.676110Z[0m [32m INFO[0m [2mflapjack_http::server_init[0m[2m:[0m [usage] No snapshot for today (date=2026-07-31); starting fresh
+[2m2026-07-31T05:47:32.676125Z[0m [33m WARN[0m [2mflapjack_http::geoip[0m[2m:[0m GeoIP database not loaded from /data/GeoLite2-City.mmdb: i/o error: No such file or directory (os error 2)
+[2m2026-07-31T05:47:32.676134Z[0m [32m INFO[0m [2mflapjack_http::server_init[0m[2m:[0m [geoip] GeoIP unavailable (no database at /data/GeoLite2-City.mmdb). IP geolocation disabled.
+[2m2026-07-31T05:47:32.676136Z[0m [32m INFO[0m [2mflapjack_http::notifications[0m[2m:[0m [notifications] SES notifications disabled
+[2m2026-07-31T05:47:32.676142Z[0m [32m INFO[0m [2mflapjack_http::server[0m[2m:[0m Server infrastructure initialized [3menv_mode[0m[2m=[0mdevelopment [3mreplication_peers[0m[2m=[0m0 [3mtrusted_proxy_ranges[0m[2m=[0m2
+[2m2026-07-31T05:47:32.676146Z[0m [32m INFO[0m [2mflapjack_http::server[0m[2m:[0m CORS: default loopback-only mode (non-loopback origins require FLAPJACK_ALLOWED_ORIGINS)
+[2m2026-07-31T05:47:32.676147Z[0m [32m INFO[0m [2mflapjack_http::server_init[0m[2m:[0m [startup] Dependency status summary [3ms3_snapshots_enabled[0m[2m=[0mfalse [3ms3_snapshot_interval_secs[0m[2m=[0mNone [3mreplication_peer_count[0m[2m=[0m0 [3mssl_enabled[0m[2m=[0mfalse [3manalytics_enabled[0m[2m=[0mtrue [3mgeoip_enabled[0m[2m=[0mfalse [3mvector_search_compiled[0m[2m=[0mtrue [3mauth_enabled[0m[2m=[0mtrue
+[2m2026-07-31T05:47:32.676348Z[0m [32m INFO[0m [2mflapjack_http::background_tasks[0m[2m:[0m [analytics] Analytics enabled (flush every 60s, retain 90d)
+[2m2026-07-31T05:47:32.676354Z[0m [32m INFO[0m [2mflapjack_http::background_tasks[0m[2m:[0m [analytics] Local rollup generation enabled (interval=300s)
+[2m2026-07-31T05:47:32.676358Z[0m [32m INFO[0m [2mflapjack_http::background_tasks[0m[2m:[0m [migration] Spool GC enabled (interval=300s)
+
+  🥞 Flapjack v1.0.10  ready in 9ms
+
+  →  Local:      http://0.0.0.0:7700
+  →  Dashboard:  http://0.0.0.0:7700/dashboard
+  →  API Docs:   http://0.0.0.0:7700/swagger-ui
+  →  Capabilities: vector-search: enabled, local-embeddings: disabled
+
+  ! Save this API key — it won’t be shown again!
+
+  🔑  Admin API Key:  [REDACTED_ADMIN_KEY]
+
+     1. Copy this key to a safe place (password manager, secrets vault)
+     2. Use it to authenticate API requests:
+        curl -H 'X-Algolia-API-Key: [REDACTED_ADMIN_KEY]' \
+             -H 'X-Algolia-Application-ID: flapjack' \
+             http://0.0.0.0:7700/1/indexes
+
+     ✓ Stored in: /data/.admin_key
+     ✓ Keys hashed at rest (SHA-256 + unique salt)
+     ! Never commit .admin_key to version control
+     → If lost: flapjack --data-dir /data reset-admin-key
+     → Production: set FLAPJACK_ADMIN_KEY env var
+
+--- Step 3: Admin key discovery ---
+[2026-07-31T05:48:03Z] PASS: admin-key-file-exists
+[2026-07-31T05:48:03Z] PASS: admin-key-non-empty
+  admin key length: 41 chars
+
+--- Step 4: Batch ingest ---
+Batch HTTP code: 200
+Batch response: {"taskID":1785476883994,"objectIDs":["1","2"]}
+[2026-07-31T05:48:04Z] PASS: batch-accepted
+[2026-07-31T05:48:04Z] PASS: batch-taskID-present (taskID=1785476883994)
+
+--- Step 5: Task publication ---
+Final task response: {"status":"published","pendingTask":false}
+[2026-07-31T05:48:04Z] PASS: task-published
+
+--- Step 6: Search validation ---
+Search response: {"hits":[{"objectID":"1","title":"The Matrix","year":1999,"_highlightResult":{"year":{"value":"1999","matchLevel":"none","matchedWords":[]},"title":{"value":"The <em>Matrix</em>","matchLevel":"full","matchedWords":["matrix"],"fullyHighlighted":false}}}],"nbHits":1,"page":0,"nbPages":1,"hitsPerPage":20,"processingTimeMS":1,"serverTimeMS":1,"query":"matrix","params":"query=matrix&hitsPerPage=20","exhaustive":{"nbHits":true,"typo":true,"facetValues":true,"rulesMatch":true},"exhaustiveNbHits":true,"exhaustiveTypo":true,"index":"test_movies","renderingContent":{},"serverUsed":"8e46aa0fb1e8","_automaticInsights":false,"processingTimingsMS":{"queue":126,"search":1950,"highlight":12,"total":1969},"parsedQuery":"matrix"}
+[2026-07-31T05:48:04Z] PASS: search-nbHits (nbHits=1)
+[2026-07-31T05:48:04Z] PASS: search-exact-match
+
+--- Step 7: Auth contract ---
+Auth test (no Application-Id) HTTP code: 403
+Auth test response: {"message":"Invalid Application-ID or API key","status":403}
+[2026-07-31T05:48:04Z] PASS: auth-403-without-appid
+[2026-07-31T05:48:04Z] PASS: auth-200-with-both-headers
+
+=== Summary ===
+Finished: 2026-07-31T05:48:04Z
+Total: 19  Passed: 17  Failed: 2
+VERDICT: FAIL (first failure: non-root-uid)
+INFO: preserving docker e2e host data dir for triage: /var/folders/v6/b8qh29l57ql_p7hdw2qhpqkw0000gn/T/tmp.V3i9YKg0uA

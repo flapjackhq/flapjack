@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# version.sh — Shared version helper for dev release scripts.
-# Sourced by release.sh, dev-deploy.sh, dev-test-deploy.sh, pipeline-staging.sh,
-# and sync-test-deploy.sh.
+# version.sh — Shared version helper for the public release launcher.
+# Sourced by release.sh.
 #
 # Exports:
 #   latest_release_version REPO    — resolve latest GitHub release tag to semver
@@ -33,7 +32,7 @@ latest_release_version() {
 #
 # Usage:
 #   auto_bump_version "owner/repo" "beta"              → e.g. "1.0.4-beta"
-#   auto_bump_version "owner/repo" "staging" "1.0.3"   → "1.0.4-staging"
+#   auto_bump_version "owner/repo" "beta" "1.0.3"      → "1.0.4-beta"
 auto_bump_version() {
   local repo="$1"
   local channel="$2"

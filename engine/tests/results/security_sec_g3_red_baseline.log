@@ -1,0 +1,30 @@
+INFO: probing http://127.0.0.1:56368
+[PASS] health http_status expected=200 actual=200
+[FAIL] health content_security_policy expected=default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none' actual=
+[FAIL] health x_content_type_options expected=nosniff actual=
+[FAIL] health referrer_policy expected=no-referrer actual=
+[FAIL] health permissions_policy expected=camera=(), microphone=(), geolocation=() actual=
+[FAIL] health frame_protection expected=CSP frame-ancestors 'none' or X-Frame-Options DENY actual=csp=missing;x-frame-options=missing
+[PASS] health hsts_absent expected=absent actual=absent
+[PASS] dashboard http_status expected=200 actual=200
+[FAIL] dashboard content_security_policy expected=default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none' actual=
+[FAIL] dashboard x_content_type_options expected=nosniff actual=
+[FAIL] dashboard referrer_policy expected=no-referrer actual=
+[FAIL] dashboard permissions_policy expected=camera=(), microphone=(), geolocation=() actual=
+[FAIL] dashboard frame_protection expected=CSP frame-ancestors 'none' or X-Frame-Options DENY actual=csp=missing;x-frame-options=missing
+[PASS] dashboard hsts_absent expected=absent actual=absent
+[PASS] swagger http_status expected=200 actual=200
+[FAIL] swagger content_security_policy expected=default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none' actual=
+[FAIL] swagger x_content_type_options expected=nosniff actual=
+[FAIL] swagger referrer_policy expected=no-referrer actual=
+[FAIL] swagger permissions_policy expected=camera=(), microphone=(), geolocation=() actual=
+[FAIL] swagger frame_protection expected=CSP frame-ancestors 'none' or X-Frame-Options DENY actual=csp=missing;x-frame-options=missing
+[PASS] swagger hsts_absent expected=absent actual=absent
+[PASS] swagger swagger_document_body expected=Swagger UI HTML actual=Swagger UI HTML
+[PASS] swagger swagger_script_tags expected=<script src="./swagger-ui-bundle.js" charset="UTF-8">|<script src="./swagger-ui-standalone-preset.js" charset="UTF-8">|<script src="./swagger-initializer.js" charset="UTF-8"> actual=<script src="./swagger-ui-bundle.js" charset="UTF-8">|<script src="./swagger-ui-standalone-preset.js" charset="UTF-8">|<script src="./swagger-initializer.js" charset="UTF-8">
+SWAGGER_INLINE_SCRIPT_PRESENT=false
+[PASS] swagger swagger_inline_script_present expected=false actual=false
+INFO: swagger csp_script_compatibility skipped because CSP is missing; missing CSP is recorded by content_security_policy
+[PASS] summary surfaces_exercised expected=3 actual=3
+SUMMARY checks_run=25 checks_failed=15 surfaces_exercised=3 indeterminate=0
+INFO: preserved security header evidence at /var/folders/v6/b8qh29l57ql_p7hdw2qhpqkw0000gn/T//fj_security_headers.OjfIXg

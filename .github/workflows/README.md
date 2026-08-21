@@ -9,22 +9,26 @@ This directory contains GitHub Actions workflows that are synced to the public `
    ./engine/s/test --ci
    ```
 
-2. **Public Repo (flapjackhq/flapjack)**: Tests run automatically
-   - On every push to `main` after `debbie sync staging` / `debbie sync prod`
-   - Nightly at 2 AM UTC (comprehensive test suite)
+2. **Public repo (`flapjackhq/flapjack`)**: CI runs automatically
+   - On every push to `main`
+   - On every trusted `public-candidate/**` branch produced by
+     `scripts/publish_public_candidate.sh`
+   - Nightly at 2 AM UTC on public `main` (comprehensive test suite)
 
 ## Workflows
 
 ### ci.yml - Continuous Integration
 
-Runs on every push to `main` in the public repo only.
+Runs the same complete job graph on public `main` and trusted
+`public-candidate/**` branches. The stable **Public candidate gate** fails unless
+every expected job succeeds, so branch protection needs only one durable check
+name.
 
 **Tests included:**
 - Rust engine (rustfmt, clippy, fast tests)
-- Rust engine (all tests) - main branch only
-- Installer tests (Ubuntu + macOS)
+- Rust engine (all tests)
 - Dashboard (unit tests, build, page tests)
-- Dashboard integration tests (main branch only, requires Algolia secrets)
+- Dashboard full and integration tests (requires Algolia secrets)
 - All SDKs (PHP 8.1-8.3, Python 3.9-3.12, JS, Go 1.21-1.23, Ruby 3.1-3.3, Java, C#)
 - Integrations (Laravel Scout, WordPress)
 
@@ -44,12 +48,16 @@ Runs every night at 2 AM UTC on the public repo only.
 
 ## Sync Process
 
-Use Debbie from the canonical dev repo to publish workflow updates:
+From a clean, published private `main`, render an exact public candidate against
+a clean clone of `flapjackhq/flapjack`:
 
 ```bash
-uv run --project <path-to-debbie-project> debbie sync staging
-uv run --project <path-to-debbie-project> debbie sync prod
+scripts/publish_public_candidate.sh /path/to/clean/flapjackhq/flapjack
 ```
+
+The publisher opens or reuses a candidate PR. It never merges, tags, releases,
+or deploys. Merge the reviewed public PR only after **Public candidate gate** is
+green.
 
 ## Required GitHub Secrets
 
@@ -79,8 +87,9 @@ export ALGOLIA_ADMIN_KEY="your-admin-key"
 
 The workflows use a tiered approach:
 
-- **Fast tests on every push**: Essential checks that run quickly
-- **Comprehensive tests on main**: Full test suite after merge
-- **Nightly tests**: Extended compatibility matrix, all versions
+- **Complete push CI**: The same required jobs on trusted candidates and `main`
+- **Stable aggregate**: One fail-closed branch-protection result
+- **Nightly tests**: Extended compatibility matrix on public `main`
 
-This balances speed (fast PR feedback) with coverage (catch edge cases).
+The private development repository keeps Actions disabled; local development
+uses the canonical runner shown above.

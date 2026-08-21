@@ -1,0 +1,26 @@
+   Compiling flapjack-http v1.0.10 (/Users/stuart/parallel_development/flapjack_dev/jul30_11pm_1_credential_parser_robustness/flapjack_dev/engine/flapjack-http)
+   Compiling flapjack v1.0.10 (/Users/stuart/parallel_development/flapjack_dev/jul30_11pm_1_credential_parser_robustness/flapjack_dev/engine)
+    Finished `test` profile [optimized + debuginfo] target(s) in 6.82s
+     Running tests/test_security_audit.rs (target/debug/deps/test_security_audit-e82153e24b70e095)
+
+running 1 test
+test a07_secured_key_validation_survives_non_char_boundary_payload ... FAILED
+
+failures:
+
+---- a07_secured_key_validation_survives_non_char_boundary_payload stdout ----
+
+thread 'a07_secured_key_validation_survives_non_char_boundary_payload' (319585289) panicked at flapjack-http/src/auth/mod.rs:454:46:
+end byte index 64 is not a char boundary; it is inside 'é' (bytes 63..65) of `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaétrailing_ascii_params`
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'a07_secured_key_validation_survives_non_char_boundary_payload' (319585289) panicked at tests/test_security_audit.rs:415:5:
+validate_secured_key must reject a non-char-boundary secured key by returning None, not panic at the decoded_str[..64] byte slice (SEC-G1)
+
+
+failures:
+    a07_secured_key_validation_survives_non_char_boundary_payload
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 44 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p flapjack --test test_security_audit`
