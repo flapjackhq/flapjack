@@ -21,6 +21,14 @@ WORKFLOWS = (
     ".github/workflows/test-installer.yml",
     ".github/workflows/release.yml",
 )
+TOPOLOGY_AUTHORITIES = (
+    ".github/workflows/ci.yml",
+    ".github/workflows/nightly.yml",
+    ".github/workflows/union.yml",
+    ".github/workflows/release.yml",
+    ".github/workflows/README.md",
+    "engine/docs2/3_IMPLEMENTATION/DEPLOYMENT.md",
+)
 REQUIRED_RISKS = {
     "core_search_index",
     "durability",
@@ -60,18 +68,203 @@ def workflow_job_blocks(root=ROOT):
     blocks = {}
     for relative in WORKFLOWS:
         text = (Path(root) / relative).read_text(encoding="utf-8")
-        jobs_marker = re.search(r"^jobs:\s*$", text, re.MULTILINE)
-        if jobs_marker is None:
-            raise ContractError(f"workflow has no jobs mapping: {relative}")
-        # Event keys under `on:` use the same two-space indentation as job keys.
-        # Restrict extraction to the jobs mapping so push/schedule/dispatch can
-        # never be misclassified as executable test owners.
-        jobs_text = text[jobs_marker.end():]
-        matches = list(JOB_RE.finditer(jobs_text))
-        for index, match in enumerate(matches):
-            end = matches[index + 1].start() if index + 1 < len(matches) else len(jobs_text)
-            blocks[f"{relative}#{match.group(1)}"] = jobs_text[match.start():end]
+        for job_name, block in _jobs_from_workflow(text).items():
+            blocks[f"{relative}#{job_name}"] = block
     return blocks
+
+
+def _top_level_block(text, key):
+    """Return one top-level YAML mapping without accepting same-named job content."""
+    match = re.search(rf"^{re.escape(key)}:\s*$", text, re.MULTILINE)
+    if match is None:
+        raise ContractError(f"workflow has no top-level {key!r} mapping")
+    remainder = text[match.end():]
+    next_mapping = re.search(r"^[A-Za-z0-9_-]+:\s*$", remainder, re.MULTILINE)
+    return remainder[: next_mapping.start() if next_mapping else len(remainder)]
+
+
+def _event_block(on_block, event):
+    match = re.search(rf"^  {re.escape(event)}:(?:\s*#.*)?\s*$", on_block, re.MULTILINE)
+    if match is None:
+        return None
+    remainder = on_block[match.end():]
+    next_event = re.search(r"^  [A-Za-z0-9_-]+:", remainder, re.MULTILINE)
+    return remainder[: next_event.start() if next_event else len(remainder)]
+
+
+def _workflow_events(text):
+    on_block = _top_level_block(text, "on")
+    return set(re.findall(r"^  ([A-Za-z0-9_-]+):", on_block, re.MULTILINE))
+
+
+def _push_branches(text):
+    push_block = _event_block(_top_level_block(text, "on"), "push")
+    if push_block is None:
+        return []
+    inline = re.search(r"^    branches:\s*\[([^]]*)\]\s*$", push_block, re.MULTILINE)
+    if inline:
+        return [item.strip().strip("'\"") for item in inline.group(1).split(",")]
+    branches = re.search(r"^    branches:\s*$", push_block, re.MULTILINE)
+    if branches is None:
+        return []
+    remainder = push_block[branches.end():]
+    lines = []
+    for line in remainder.splitlines():
+        if re.match(r"^    [A-Za-z0-9_-]+:", line):
+            break
+        item = re.match(r"^      -\s+(.+?)\s*$", line)
+        if item:
+            lines.append(item.group(1).strip("'\""))
+    return lines
+
+
+def _jobs_from_workflow(text):
+    jobs_marker = re.search(r"^jobs:\s*$", text, re.MULTILINE)
+    if jobs_marker is None:
+        raise ContractError("workflow has no jobs mapping")
+    jobs_text = text[jobs_marker.end():]
+    # The aggregate denominator must not silently shrink when a valid YAML job key
+    # uses syntax outside our deliberately small parser (for example, a quoted key).
+    headers = [
+        line
+        for line in jobs_text.splitlines()
+        if line.startswith("  ")
+        and not line.startswith("   ")
+        and line[2:].strip()
+        and not line[2:].startswith("#")
+    ]
+    unsupported = [
+        header
+        for header in headers
+        if not re.fullmatch(r"  [A-Za-z0-9_-]+:\s*", header)
+    ]
+    if unsupported:
+        raise ContractError(f"workflow has unsupported job headers: {unsupported}")
+    matches = list(JOB_RE.finditer(jobs_text))
+    return {
+        match.group(1): jobs_text[
+            match.start(): matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(jobs_text)
+        ]
+        for index, match in enumerate(matches)
+    }
+
+
+def _job_needs(job):
+    inline = re.search(r"^    needs:\s*\[([^]]*)\]\s*$", job, re.MULTILINE)
+    if inline:
+        return {item.strip() for item in inline.group(1).split(",") if item.strip()}
+    needs = re.search(r"^    needs:\s*$", job, re.MULTILINE)
+    if needs is None:
+        return set()
+    dependencies = set()
+    for line in job[needs.end():].splitlines():
+        if re.match(r"^    [A-Za-z0-9_-]+:", line):
+            break
+        item = re.match(r"^      -\s+([A-Za-z0-9_-]+)\s*$", line)
+        if item:
+            dependencies.add(item.group(1))
+    return dependencies
+
+
+def topology_texts(root=ROOT):
+    return {
+        relative: (Path(root) / relative).read_text(encoding="utf-8")
+        for relative in TOPOLOGY_AUTHORITIES
+    }
+
+
+def verify_public_candidate_topology(root=ROOT, texts=None):
+    """Keep candidate validation complete without broadening release/recurring triggers."""
+    texts = topology_texts(root) if texts is None else texts
+    ci = texts[".github/workflows/ci.yml"]
+    ci_events = _workflow_events(ci)
+    if ci_events != {"push"}:
+        raise ContractError(f"public CI events must be push-only, found {sorted(ci_events)}")
+    branches = _push_branches(ci)
+    if branches != ["main", "public-candidate/**"]:
+        raise ContractError(
+            "public CI push branches must be exactly main and public-candidate/**, "
+            f"found {branches}"
+        )
+    if not re.search(r"^permissions:\s*\n  contents:\s*read\s*$", ci, re.MULTILINE):
+        raise ContractError("public CI must default to contents: read")
+
+    jobs = _jobs_from_workflow(ci)
+    ci_check = jobs.get("check-repo", "")
+    if (
+        "ACTUAL_REPOSITORY: ${{ github.repository }}" not in ci_check
+        or '[ "$ACTUAL_REPOSITORY" = "flapjackhq/flapjack" ]' not in ci_check
+    ):
+        raise ContractError("public CI repository identity must be env-bound before shell use")
+    gate = jobs.get("public-candidate-gate")
+    if gate is None:
+        raise ContractError("public CI is missing the public-candidate-gate job")
+    expected_dependencies = set(jobs) - {"public-candidate-gate"}
+    actual_dependencies = _job_needs(gate)
+    if actual_dependencies != expected_dependencies:
+        raise ContractError(
+            "Public candidate gate dependencies drift: "
+            f"missing={sorted(expected_dependencies - actual_dependencies)} "
+            f"unexpected={sorted(actual_dependencies - expected_dependencies)}"
+        )
+    if not re.search(r"^    if:\s*always\(\)\s*$", gate, re.MULTILINE):
+        raise ContractError("Public candidate gate must have a job-level if: always()")
+    required_gate_fragments = (
+        "name: Public candidate gate",
+        "NEEDS_JSON: ${{ toJSON(needs) }}",
+        'result.get("result") != "success"',
+        "flapjackhq/flapjack",
+        "refs/heads/public-candidate/",
+    )
+    for fragment in required_gate_fragments:
+        if fragment not in gate:
+            raise ContractError(f"Public candidate gate is missing fail-closed fragment: {fragment}")
+    for relative in (".github/workflows/nightly.yml", ".github/workflows/union.yml"):
+        events = _workflow_events(texts[relative])
+        if events != {"schedule", "workflow_dispatch"}:
+            raise ContractError(
+                f"{relative} must remain scheduled/manual public-main validation, found {sorted(events)}"
+            )
+        recurring_check = _jobs_from_workflow(texts[relative]).get("check-repo", "")
+        safe_fragments = (
+            "ACTUAL_REPOSITORY: ${{ github.repository }}",
+            "ACTUAL_REF: ${{ github.ref }}",
+            '[ "$ACTUAL_REPOSITORY" = "flapjackhq/flapjack" ]',
+            '[ "$ACTUAL_REF" = "refs/heads/main" ]',
+        )
+        if any(fragment not in recurring_check for fragment in safe_fragments):
+            raise ContractError(f"{relative} must refuse non-main manual dispatches")
+
+    release = texts[".github/workflows/release.yml"]
+    if _workflow_events(release) != {"workflow_dispatch"}:
+        raise ContractError("release.yml must remain workflow_dispatch-only")
+    release_validation = _jobs_from_workflow(release).get("validate_release_version", "")
+    ref_binding = "ACTUAL_REF: ${{ github.ref }}"
+    main_ref_guard = 'if [[ "$ACTUAL_REF" != "refs/heads/main" ]]; then'
+    if ref_binding not in release_validation or main_ref_guard not in release_validation:
+        raise ContractError("release validation must refuse dispatch from a non-main ref")
+
+    active_paths = (
+        ".github/workflows/ci.yml",
+        ".github/workflows/nightly.yml",
+        ".github/workflows/union.yml",
+        ".github/workflows/README.md",
+        "engine/docs2/3_IMPLEMENTATION/DEPLOYMENT.md",
+    )
+    stale = [path for path in active_paths if "gridl-staging/flapjack" in texts[path]]
+    if stale:
+        raise ContractError(f"active workflow/topology authorities still name staging: {stale}")
+
+    workflow_readme = texts[".github/workflows/README.md"]
+    for fragment in ("public-candidate/**", "Public candidate gate", "publish_public_candidate.sh"):
+        if fragment not in workflow_readme:
+            raise ContractError(f"workflow README is missing candidate publication guidance: {fragment}")
+    deployment = texts["engine/docs2/3_IMPLEMENTATION/DEPLOYMENT.md"]
+    for fragment in ("gridl-dev/flapjack_dev", "flapjackhq/flapjack", "public-candidate/"):
+        if fragment not in deployment:
+            raise ContractError(f"deployment topology is missing: {fragment}")
 
 
 def ignored_tests(root=ROOT):
@@ -193,6 +386,7 @@ def verify_local_runner(root=ROOT, runner_text=None, named_source_text=None):
 
 def verify(root=ROOT, manifest_path=MANIFEST_PATH, jobs=None, actual_ignored=None):
     verify_local_runner(root)
+    verify_public_candidate_topology(root)
     manifest = load_manifest(manifest_path)
     if manifest.get("schema_version") != 1:
         raise ContractError("test-tier manifest schema_version must be 1")
@@ -304,8 +498,114 @@ def verify(root=ROOT, manifest_path=MANIFEST_PATH, jobs=None, actual_ignored=Non
 
 
 class TestTierContract(unittest.TestCase):
+    def topology_mutation(self, relative, old, new):
+        texts = topology_texts()
+        mutated = texts[relative].replace(old, new, 1)
+        self.assertNotEqual(texts[relative], mutated, f"mutation must change {relative}")
+        texts[relative] = mutated
+        return texts
+
     def test_live_manifest_and_workflows_converge(self):
         verify()
+
+    def test_candidate_branch_trigger_cannot_be_removed(self):
+        texts = self.topology_mutation(
+            ".github/workflows/ci.yml", "      - public-candidate/**\n", ""
+        )
+        with self.assertRaisesRegex(ContractError, "push branches must be exactly"):
+            verify_public_candidate_topology(texts=texts)
+
+    def test_untrusted_pull_request_trigger_is_rejected(self):
+        texts = self.topology_mutation(
+            ".github/workflows/ci.yml", "on:\n", "on:\n  pull_request:\n",
+        )
+        with self.assertRaisesRegex(ContractError, "push-only"):
+            verify_public_candidate_topology(texts=texts)
+
+    def test_aggregate_gate_cannot_drop_a_required_job(self):
+        texts = self.topology_mutation(
+            ".github/workflows/ci.yml", "      - rust-tests-all\n", ""
+        )
+        with self.assertRaisesRegex(ContractError, "gate dependencies drift"):
+            verify_public_candidate_topology(texts=texts)
+
+    def test_aggregate_denominator_rejects_unsupported_job_header(self):
+        texts = self.topology_mutation(
+            ".github/workflows/ci.yml",
+            "jobs:\n",
+            "jobs:\n  hidden-job: # valid YAML, unsupported parser shape\n"
+            "    runs-on: ubuntu-latest\n",
+        )
+        with self.assertRaisesRegex(ContractError, "unsupported job headers"):
+            verify_public_candidate_topology(texts=texts)
+
+    def test_aggregate_gate_always_condition_must_remain_job_level(self):
+        texts = self.topology_mutation(
+            ".github/workflows/ci.yml",
+            "    name: Public candidate gate\n    if: always()\n",
+            "    name: Public candidate gate\n",
+        )
+        with self.assertRaisesRegex(ContractError, "job-level if: always"):
+            verify_public_candidate_topology(texts=texts)
+
+    def test_staging_identity_cannot_return_to_active_topology(self):
+        texts = self.topology_mutation(
+            "engine/docs2/3_IMPLEMENTATION/DEPLOYMENT.md",
+            "flapjackhq/flapjack",
+            "gridl-staging/flapjack",
+        )
+        with self.assertRaisesRegex(ContractError, "still name staging"):
+            verify_public_candidate_topology(texts=texts)
+
+    def test_recurring_workflow_rejects_any_extra_automatic_trigger(self):
+        texts = self.topology_mutation(
+            ".github/workflows/nightly.yml", "on:\n", "on:\n  pull_request:\n"
+        )
+        with self.assertRaisesRegex(ContractError, "scheduled/manual public-main"):
+            verify_public_candidate_topology(texts=texts)
+
+    def test_recurring_workflow_cannot_accept_non_main_dispatch(self):
+        texts = self.topology_mutation(
+            ".github/workflows/union.yml",
+            ' && [ "$ACTUAL_REF" = "refs/heads/main" ]',
+            "",
+        )
+        with self.assertRaisesRegex(ContractError, "refuse non-main manual dispatches"):
+            verify_public_candidate_topology(texts=texts)
+
+    def test_recurring_ref_expression_must_be_env_bound(self):
+        texts = self.topology_mutation(
+            ".github/workflows/nightly.yml",
+            "          ACTUAL_REF: ${{ github.ref }}\n",
+            "",
+        )
+        with self.assertRaisesRegex(ContractError, "refuse non-main manual dispatches"):
+            verify_public_candidate_topology(texts=texts)
+
+    def test_release_cannot_gain_an_automatic_trigger(self):
+        texts = self.topology_mutation(
+            ".github/workflows/release.yml", "on:\n", "on:\n  push:\n"
+        )
+        with self.assertRaisesRegex(ContractError, "workflow_dispatch-only"):
+            verify_public_candidate_topology(texts=texts)
+
+    def test_release_main_ref_guard_cannot_be_removed(self):
+        texts = self.topology_mutation(
+            ".github/workflows/release.yml",
+            '          if [[ "$ACTUAL_REF" != "refs/heads/main" ]]; then\n',
+            "",
+        )
+        with self.assertRaisesRegex(ContractError, "refuse dispatch from a non-main ref"):
+            verify_public_candidate_topology(texts=texts)
+
+    def test_release_ref_expression_must_be_env_bound(self):
+        texts = self.topology_mutation(
+            ".github/workflows/release.yml",
+            "          ACTUAL_REF: ${{ github.ref }}\n",
+            "",
+        )
+        with self.assertRaisesRegex(ContractError, "refuse dispatch from a non-main ref"):
+            verify_public_candidate_topology(texts=texts)
 
     def test_unknown_workflow_job_is_rejected(self):
         jobs = workflow_job_blocks()

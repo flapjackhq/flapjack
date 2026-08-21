@@ -1,0 +1,30 @@
+Compose project: s3_sse_probe_22806
+Results dir: engine/tests/results/s3_sse_http_probe_20260731T212224Z_22806
+MinIO container: 8d867f74af46d09262e45ae3138838d085ad5a340868ba33fc1356113be59a40
+MinIO image ID: sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+MinIO repo digest: ["minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"]
+mc image ID: sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+mc repo digest: ["minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"]
+  [PASS] documents batch accepted
+  [PASS] documents batch task published
+  [PASS] search before snapshot returns 1 laptop hit
+  [PASS] manual snapshot status uploaded
+  [PASS] manual snapshot key present
+Manual snapshot key: snapshots/s3_sse_probe_idx_22806/20260731T212232Z.tar.gz
+  [FAIL] manual HTTP-route snapshot object SSE is AES256
+         observed '<missing>' for key snapshots/s3_sse_probe_idx_22806/20260731T212232Z.tar.gz
+Waiting for scheduled snapshot distinct from manual key...
+  [PASS] scheduled snapshot produced distinct key
+Scheduled snapshot key: snapshots/s3_sse_probe_idx_22806/20260731T212301Z.tar.gz
+  [FAIL] scheduled snapshot object SSE is AES256
+         observed '<missing>' for key snapshots/s3_sse_probe_idx_22806/20260731T212301Z.tar.gz
+  [PASS] index delete before restore accepted
+  [PASS] index delete task published
+  [PASS] index query returns 404 before restore
+  [FAIL] restore by manual key status restored
+         HTTP 500 body={"message":"Internal server error","status":500,"sub_step":"recover_interrupted"}
+  [FAIL] restore round-trip returns all 3 known documents
+         observed -1
+Compose logs captured for diagnostics; object metadata is the SSE oracle.
+Checks: 9/13 passed
+INFO: preserved S3 SSE probe evidence at engine/tests/results/s3_sse_http_probe_20260731T212224Z_22806

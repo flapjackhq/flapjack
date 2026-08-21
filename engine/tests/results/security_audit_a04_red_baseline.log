@@ -1,0 +1,71 @@
+# Stage 5 A04 RED Baseline
+
+Command:
+cd engine && cargo test -p flapjack --no-fail-fast --test test_security_audit a04_
+
+Run date: 2026-05-25
+
+Replay method:
+This baseline was regenerated from pre-fix A04 behavior using an API-compatible seam replay in the owner files (`startup.rs`, `router.rs`, `auth/key_store.rs`) so the run remains executable against the current test harness while restoring the exact insecure defaults from before Stage 5 fixes. The replay-only edits were restored to HEAD immediately after command capture.
+
+## Raw output
+
+   Compiling flapjack-http v1.0.1 (/Users/stuart/parallel_development/flapjack_dev/may25_1248pm_owasp_top10_audit/flapjack_dev/engine/flapjack-http)
+warning: function `is_loopback_origin` is never used
+   --> flapjack-http/src/router.rs:500:4
+    |
+500 | fn is_loopback_origin(origin: &axum::http::HeaderValue, _: &axum::http::request::Parts) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `flapjack-http` (lib) generated 1 warning
+   Compiling flapjack v1.0.1 (/Users/stuart/parallel_development/flapjack_dev/may25_1248pm_owasp_top10_audit/flapjack_dev/engine)
+    Finished `test` profile [optimized + debuginfo] target(s) in 45.79s
+     Running tests/test_security_audit.rs (target/debug/deps/test_security_audit-8bd81655fc494f1d)
+
+running 5 tests
+test a04_production_bootstrap_rejects_missing_blank_or_short_admin_key ... ok
+test a04_unset_allowed_origins_defaults_to_loopback_only_contract ... FAILED
+test a04_default_cors_blocks_non_loopback_browser_origins ... FAILED
+test a04_shipped_default_search_key_has_bounded_rate_limit ... FAILED
+test a04_auth_enabled_routes_fail_closed_without_credentials ... ok
+
+failures:
+
+---- a04_unset_allowed_origins_defaults_to_loopback_only_contract stdout ----
+
+thread 'a04_unset_allowed_origins_defaults_to_loopback_only_contract' (62046370) panicked at tests/test_security_audit.rs:571:5:
+assertion `left == right` failed
+  left: Restricted([])
+ right: LoopbackOnly
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a04_default_cors_blocks_non_loopback_browser_origins stdout ----
+
+thread 'a04_default_cors_blocks_non_loopback_browser_origins' (62046367) panicked at tests/test_security_audit.rs:594:5:
+default CORS mode must not allow non-loopback browser origins without FLAPJACK_ALLOWED_ORIGINS
+
+---- a04_shipped_default_search_key_has_bounded_rate_limit stdout ----
+
+thread 'a04_shipped_default_search_key_has_bounded_rate_limit' (62046369) panicked at tests/test_security_audit.rs:634:5:
+default search key must not ship with an unbounded per-IP hourly query limit
+
+
+failures:
+    a04_default_cors_blocks_non_loopback_browser_origins
+    a04_shipped_default_search_key_has_bounded_rate_limit
+    a04_unset_allowed_origins_defaults_to_loopback_only_contract
+
+test result: FAILED. 2 passed; 3 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p flapjack --test test_security_audit`
+error: 1 target failed:
+    `-p flapjack --test test_security_audit`
+
+## Hypothesis status annotations
+- GREEN at RED baseline: `a04_auth_enabled_routes_fail_closed_without_credentials` (protected route rejected without credentials).
+- GREEN at RED baseline: `a04_production_bootstrap_rejects_missing_blank_or_short_admin_key` (production bootstrap validator rejected missing/blank/short key and no-auth in production).
+- RED finding: `a04_unset_allowed_origins_defaults_to_loopback_only_contract` failed; pre-fix startup-default contract did not enforce loopback-only behavior when `FLAPJACK_ALLOWED_ORIGINS` was unset.
+- RED finding: `a04_default_cors_blocks_non_loopback_browser_origins` failed; default CORS path still allowed non-loopback origin (OWASP A04 insecure default).
+- RED finding: `a04_shipped_default_search_key_has_bounded_rate_limit` failed; default search key shipped with `maxQueriesPerIPPerHour=0` (unbounded).

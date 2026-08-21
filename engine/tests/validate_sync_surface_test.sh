@@ -93,7 +93,6 @@ write_clean_fixture() {
   mkdir -p \
     "$repo/.github/workflows" \
     "$repo/.beads" \
-    "$repo/engine/_dev/s/lib" \
     "$repo/engine/_dev/s/manual-tests" \
     "$repo/engine/docs2" \
     "$repo/engine/flapjack-http/src" \
@@ -134,30 +133,6 @@ from = "engine/_dev/s/manual-tests/cli_smoke.sh"
 to = "engine/s/manual-tests/cli_smoke.sh"
 EOF
 
-  cat > "$repo/engine/_dev/s/lib/sync-core.sh" <<'EOF'
-#!/usr/bin/env bash
-
-sync_root_files() {
-  # Root-level files (copy individually, don't blindly sync)
-  for path in \
-    PROJECT_OVERVIEW.md \
-    ROADMAP.md \
-    README.md
-  do
-    :
-  done
-}
-
-sync_engine_files() {
-  # Engine-level files (Dockerfile, install.sh, Rust toolchain, etc.)
-  for path in \
-    rust-toolchain.toml
-  do
-    :
-  done
-}
-EOF
-
   local path
   for path in \
     PROJECT_OVERVIEW.md \
@@ -190,7 +165,7 @@ assert_clean_fixture() {
   status="$(run_validator "$repo" "$output")"
   assert_status 0 "$status" "$context"
   assert_contains "$output" 'All checked link targets are within .debbie sync surface' "$context"
-  assert_not_contains "$output" 'debbie sync staging --dry-run' "$context"
+  assert_not_contains "$output" 'debbie sync prod --dry-run' "$context"
 }
 
 restore_and_assert_clean() {
@@ -292,21 +267,6 @@ add_multiline_sync_file() {
   mv "$config.tmp" "$config"
 }
 
-add_manual_root_entry() {
-  local sync_core="$1"
-  local entry="$2"
-  awk -v entry="$entry" '
-    /README\.md/ && inserted == 0 {
-      print
-      print "    " entry
-      inserted = 1
-      next
-    }
-    { print }
-  ' "$sync_core" > "$sync_core.tmp"
-  mv "$sync_core.tmp" "$sync_core"
-}
-
 assert_red_arm() {
   local repo="$1"
   local context="$2"
@@ -392,22 +352,6 @@ main() {
   add_sync_remap "$repo/.debbie.toml" ".beads/private" "private"
   assert_red_arm "$repo" beads_remap_added_to_sync_surface '.beads/ must stay out of the public sync surface'
   restore_and_assert_clean "$pristine" "$repo" .debbie.toml beads_remap_added_to_sync_surface
-
-  remove_line "$repo/engine/_dev/s/lib/sync-core.sh" 'PROJECT_OVERVIEW.md'
-  assert_red_arm "$repo" project_overview_removed_from_manual_root 'manual root sync list must include PROJECT_OVERVIEW.md'
-  restore_and_assert_clean "$pristine" "$repo" engine/_dev/s/lib/sync-core.sh project_overview_removed_from_manual_root
-
-  remove_line "$repo/engine/_dev/s/lib/sync-core.sh" 'ROADMAP.md'
-  assert_red_arm "$repo" roadmap_removed_from_manual_root 'manual root sync list must include ROADMAP.md'
-  restore_and_assert_clean "$pristine" "$repo" engine/_dev/s/lib/sync-core.sh roadmap_removed_from_manual_root
-
-  add_manual_root_entry "$repo/engine/_dev/s/lib/sync-core.sh" 'PRIORITIES.md \'
-  assert_red_arm "$repo" priorities_added_to_manual_root 'manual root sync list must not include retired PRIORITIES.md'
-  restore_and_assert_clean "$pristine" "$repo" engine/_dev/s/lib/sync-core.sh priorities_added_to_manual_root
-
-  add_manual_root_entry "$repo/engine/_dev/s/lib/sync-core.sh" '.debbie.toml \'
-  assert_red_arm "$repo" debbie_toml_added_to_manual_root 'manual root sync list still includes .debbie.toml'
-  restore_and_assert_clean "$pristine" "$repo" engine/_dev/s/lib/sync-core.sh debbie_toml_added_to_manual_root
 }
 
 main "$@"

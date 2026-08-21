@@ -11,20 +11,22 @@ For shipped/readiness status, see [../FEATURES.md](../FEATURES.md).
 
 ## Repository & deploy topology
 
-Flapjack spans a three-repo dev → staging → prod chain plus a separate fjcloud
-control plane. Knowing which is which avoids the most common traps when checking
-release or engine status:
+Flapjack spans one private development repository, one deliberately public
+product repository, and a separate fjcloud control plane. Knowing which is
+which avoids the most common traps when checking release or engine status:
 
-- **Repos:** dev `gridl-dev/flapjack_dev` (private; CI disabled) → staging
-  `gridl-staging/flapjack` → prod `flapjackhq/flapjack` (the public face).
-  `debbie sync` (see `.debbie.toml`) curates files along that chain; CI runs free
-  on the staging and prod mirrors. The **prod mirror's `release.yml` is the
-  Authoritative CI for release closeout** — git tags, GitHub Releases, and GHCR
-  images exist only on the prod mirror, never on the dev repo (`git tag -l` on
-  dev is empty even when a release shipped). If GHCR package metadata is
+- **Repos:** `gridl-dev/flapjack_dev` is the private source of truth with Actions
+  disabled. `flapjackhq/flapjack` is the sole public OSS, CI, and release
+  repository. `scripts/publish_public_candidate.sh` renders Debbie's whitelist
+  from exact private `main` into `public-candidate/<dev-sha>` and opens a public
+  PR; the stable **Public candidate gate** must pass before that PR is merged.
+  The publisher never releases. The public repo's dispatch-only `release.yml` is
+  the **authoritative CI for release closeout** — git tags, GitHub Releases, and
+  GHCR images exist only there, never on the dev repo (`git tag -l` on dev is
+  empty even when a release shipped). If GHCR package metadata is
   unlinked (`repository:null`), the repo `GITHUB_TOKEN` cannot publish that
   package, but recovery remains agent-doable with an org-admin PAT carrying
-  `write:packages` plus a re-dispatch of prod mirror `release.yml`.
+  `write:packages` plus a re-dispatch of public `release.yml` from exact `main`.
 - **`/version.dev_sha` is the fjcloud control-plane SHA, not the engine
   version.** `api.{staging.}flapjack.foo/version.dev_sha` reports
   `FJCLOUD_DEV_SHA`, baked at fjcloud CI build time. The flapjack engine reaches

@@ -108,7 +108,7 @@ fail_banner() {
 }
 
 # Next-steps block — suggest commands after completion
-# Usage: next_steps "gh run watch --repo ..." "./s/pipeline-prod.sh 0.0.20-beta"
+# Usage: next_steps "gh run watch --repo ..." "gh release view --repo ..."
 next_steps() {
   echo -e "  ${BOLD}Next:${NC}"
   for cmd in "$@"; do
@@ -256,7 +256,7 @@ _UI_LOG_DIR="${FLAPJACK_LOG_DIR:-${HOME}/.flapjack/logs}"
 _UI_LOG_FILE=""
 
 # Initialize a log file for this run
-# Usage: log_init "pipeline-staging"
+# Usage: log_init "local-validation"
 log_init() {
   local name="$1"
   mkdir -p "$_UI_LOG_DIR"

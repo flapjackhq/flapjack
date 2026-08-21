@@ -7,6 +7,14 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.16] - 2026-08-20
+
+### Changed
+
+- **Release publication now uses one exact Debbie-rendered public candidate.**
+  Public CI validates candidate and main through one stable aggregate gate, while release
+  dispatch remains main-only.
+
 ## [1.0.15] - 2026-08-20
 
 ### Added

@@ -1,0 +1,50 @@
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.23s
+     Running tests/test_security_audit.rs (target/debug/deps/test_security_audit-9c7f32cd40dc6672)
+
+running 2 tests
+test a03_top_searches_tags_sql_injection_payload_does_not_broaden_results ... ok
+test a03_search_rejects_malformed_filters_instead_of_ignoring_them ... FAILED
+
+failures:
+
+---- a03_search_rejects_malformed_filters_instead_of_ignoring_them stdout ----
+
+thread 'a03_search_rejects_malformed_filters_instead_of_ignoring_them' (60868073) panicked at tests/test_security_audit.rs:406:5:
+assertion `left == right` failed: malformed filters must be rejected instead of broadening to an unfiltered search
+  left: 200
+ right: 400
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a03_search_rejects_malformed_filters_instead_of_ignoring_them
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.20s
+
+error: test failed, to rerun pass `-p flapjack --test test_security_audit`
+error: 1 target failed:
+    `-p flapjack --test test_security_audit`
+
+# ---- A03 country equality-injection RED (sanitize_sql_eq removed from search_analytics.rs:45) ----
+     Running tests/test_security_audit.rs (target/debug/deps/test_security_audit-8bd81655fc494f1d)
+
+running 1 test
+test a03_top_searches_country_sql_injection_payload_does_not_broaden_results ... FAILED
+
+failures:
+
+---- a03_top_searches_country_sql_injection_payload_does_not_broaden_results stdout ----
+
+thread 'a03_top_searches_country_sql_injection_payload_does_not_broaden_results' (61195663) panicked at tests/test_security_audit.rs:506:5:
+quoted analytics country payload must not widen results: [Object {"search": String("boots"), "count": Number(1), "nbHits": Number(1)}, Object {"search": String("sandals"), "count": Number(1), "nbHits": Number(1)}]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a03_top_searches_country_sql_injection_payload_does_not_broaden_results
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p flapjack --test test_security_audit`
+error: 1 target failed:
+    `-p flapjack --test test_security_audit`

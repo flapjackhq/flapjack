@@ -81,37 +81,12 @@ fi
 # ── Configuration Defaults ───────────────────────────────────────────────────
 section "Configuration Defaults"
 
-# Test 5: REPO default matches the environment (staging vs prod)
-# In staging CI: expect gridl-staging/flapjack
-# In prod CI: expect flapjackhq/flapjack
-# Locally: accept either (dev repo has prod default, but staging sync rewrites it)
-if [ -n "${GITHUB_REPOSITORY:-}" ]; then
-  case "$GITHUB_REPOSITORY" in
-    gridl-staging/flapjack)
-      if grep -q 'REPO=.*gridl-staging/flapjack' "$INSTALL_SCRIPT"; then
-        pass "Default REPO is gridl-staging/flapjack (staging environment)"
-      else
-        fail "Default REPO should be gridl-staging/flapjack in staging environment"
-      fi
-      ;;
-    flapjackhq/flapjack)
-      if grep -q 'REPO=.*flapjackhq/flapjack' "$INSTALL_SCRIPT" && ! grep -q 'gridl-staging' "$INSTALL_SCRIPT"; then
-        pass "Default REPO is flapjackhq/flapjack (production environment)"
-      else
-        fail "Default REPO should be flapjackhq/flapjack in production environment"
-      fi
-      ;;
-    *)
-      fail "Unexpected GITHUB_REPOSITORY: $GITHUB_REPOSITORY"
-      ;;
-  esac
+# Test 5: the installer has one public repository identity.
+if grep -Fq "REPO=\"\${FLAPJACK_REPO:-flapjackhq/flapjack}\"" "$INSTALL_SCRIPT" \
+  && ! grep -Fq 'gridl-staging' "$INSTALL_SCRIPT"; then
+  pass "Default REPO is flapjackhq/flapjack"
 else
-  # Local dev: accept either repo (dev has prod default, staging sync rewrites it)
-  if grep -q 'REPO=.*flapjackhq/flapjack\|gridl-staging/flapjack' "$INSTALL_SCRIPT"; then
-    pass "Default REPO is set (local dev environment)"
-  else
-    fail "Default REPO should be flapjackhq/flapjack or gridl-staging/flapjack"
-  fi
+  fail "Default REPO should be exactly flapjackhq/flapjack"
 fi
 
 # Test 6: BINARY_NAME is flapjack

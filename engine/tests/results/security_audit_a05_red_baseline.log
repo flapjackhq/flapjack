@@ -1,0 +1,30 @@
+   Compiling flapjack-http v1.0.1 (/Users/stuart/parallel_development/flapjack_dev/may25_1248pm_owasp_top10_audit/flapjack_dev/engine/flapjack-http)
+   Compiling flapjack v1.0.1 (/Users/stuart/parallel_development/flapjack_dev/may25_1248pm_owasp_top10_audit/flapjack_dev/engine)
+    Finished `test` profile [optimized + debuginfo] target(s) in 35.04s
+     Running tests/test_security_audit.rs (target/debug/deps/test_security_audit-8bd81655fc494f1d)
+
+running 3 tests
+test a05_internal_route_unauthorized_response_has_canonical_shape_only ... ok
+test a05_public_health_uses_explicit_metadata_denylist ... FAILED
+test a05_invalid_credentials_error_contract_has_no_metadata_leaks ... ok
+
+failures:
+
+---- a05_public_health_uses_explicit_metadata_denylist stdout ----
+
+thread 'a05_public_health_uses_explicit_metadata_denylist' (62682679) panicked at tests/test_security_audit.rs:682:5:
+public /health must not expose version metadata
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a05_public_health_uses_explicit_metadata_denylist
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p flapjack --test test_security_audit`
+error: 1 target failed:
+    `-p flapjack --test test_security_audit`
+
+[Stage 6 repo-grounded scope note]
+- No standalone public version endpoint is routed at HEAD beyond `/health` (verified via `build_public_health_routes` in `engine/flapjack-http/src/router.rs`).

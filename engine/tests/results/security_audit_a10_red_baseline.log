@@ -1,0 +1,47 @@
+   Compiling flapjack v1.0.1 (/Users/stuart/parallel_development/flapjack_dev/may25_1248pm_owasp_top10_audit/flapjack_dev/engine)
+   Compiling flapjack-replication v1.0.1 (/Users/stuart/parallel_development/flapjack_dev/may25_1248pm_owasp_top10_audit/flapjack_dev/engine/flapjack-replication)
+   Compiling flapjack-http v1.0.1 (/Users/stuart/parallel_development/flapjack_dev/may25_1248pm_owasp_top10_audit/flapjack_dev/engine/flapjack-http)
+    Finished `test` profile [optimized + debuginfo] target(s) in 14.87s
+     Running tests/test_security_audit.rs (target/debug/deps/test_security_audit-b09a3feab8b17f9c)
+
+running 4 tests
+test a10_vector_embedders_reject_ssrf_payload_urls ... FAILED
+test a10_peer_address_intake_rejects_unsafe_env_destinations_before_client_construction ... FAILED
+test a10_chat_ai_provider_rejects_unsafe_base_urls_from_env ... FAILED
+test a10_chat_ai_provider_rejects_unsafe_base_urls_from_settings ... FAILED
+
+failures:
+
+---- a10_vector_embedders_reject_ssrf_payload_urls stdout ----
+
+thread 'a10_vector_embedders_reject_ssrf_payload_urls' (69972319) panicked at tests/test_security_audit.rs:260:23:
+openAi embedder must reject payload http://localhost.
+
+---- a10_peer_address_intake_rejects_unsafe_env_destinations_before_client_construction stdout ----
+
+thread 'a10_peer_address_intake_rejects_unsafe_env_destinations_before_client_construction' (69972318) panicked at tests/test_security_audit.rs:314:5:
+unsafe peer destinations must be dropped by config intake
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a10_chat_ai_provider_rejects_unsafe_base_urls_from_env stdout ----
+
+thread 'a10_chat_ai_provider_rejects_unsafe_base_urls_from_env' (69972316) panicked at tests/test_security_audit.rs:164:44:
+called `Result::unwrap()` on an `Err` value: PoisonError { .. }
+
+---- a10_chat_ai_provider_rejects_unsafe_base_urls_from_settings stdout ----
+
+thread 'a10_chat_ai_provider_rejects_unsafe_base_urls_from_settings' (69972317) panicked at tests/test_security_audit.rs:93:44:
+called `Result::unwrap()` on an `Err` value: PoisonError { .. }
+
+
+failures:
+    a10_chat_ai_provider_rejects_unsafe_base_urls_from_env
+    a10_chat_ai_provider_rejects_unsafe_base_urls_from_settings
+    a10_peer_address_intake_rejects_unsafe_env_destinations_before_client_construction
+    a10_vector_embedders_reject_ssrf_payload_urls
+
+test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p flapjack --test test_security_audit`
+error: 1 target failed:
+    `-p flapjack --test test_security_audit`

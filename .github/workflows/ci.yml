@@ -1,29 +1,39 @@
 name: CI
 
-# CI runs on the public staging and prod repos only. The private dev repo
-# must never run CI — it burns paid Actions minutes.
-# Use `debbie sync staging` to push changes to the public repo where CI is free.
+# CI runs only in the public product repository. The private development
+# repository keeps Actions disabled; trusted public-candidate branches are the
+# deliberate pre-merge validation boundary.
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - public-candidate/**
+
+# Candidate code receives no repository write capability. Credentialed integration
+# jobs are reached only by trusted candidate branches published from private main,
+# never by pull_request code from an untrusted fork.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Guard: only run on recognized public repos. The private dev repo is
-  # intentionally excluded — CI belongs on staging/prod where Actions is free.
+  # The workflow is synced from private development, so fail closed if Actions is
+  # ever enabled there or this file is copied to an unrelated repository.
   check-repo:
     runs-on: ubuntu-latest
     outputs:
       is-public-repo: ${{ steps.check.outputs.is-public-repo }}
     steps:
       - id: check
+        env:
+          ACTUAL_REPOSITORY: ${{ github.repository }}
         run: |
-          if [ "${{ github.repository }}" = "flapjackhq/flapjack" ] || [ "${{ github.repository }}" = "gridl-staging/flapjack" ]; then
-            echo "is-public-repo=true" >> $GITHUB_OUTPUT
+          if [ "$ACTUAL_REPOSITORY" = "flapjackhq/flapjack" ]; then
+            echo "is-public-repo=true" >> "$GITHUB_OUTPUT"
           else
-            echo "is-public-repo=false" >> $GITHUB_OUTPUT
+            echo "is-public-repo=false" >> "$GITHUB_OUTPUT"
           fi
   # Shape contracts for the release path, and for CI-harness wiring that a browser
   # suite would otherwise only surface hours later. These are pure shell + python3 (no
@@ -39,6 +49,9 @@ jobs:
     if: needs.check-repo.outputs.is-public-repo == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -185,7 +198,7 @@ jobs:
   rust-tests-all:
     name: Rust tests (all)
     needs: check-repo
-    if: needs.check-repo.outputs.is-public-repo == 'true' && github.ref == 'refs/heads/main'
+    if: needs.check-repo.outputs.is-public-repo == 'true'
     runs-on: ubuntu-latest
     env:
       CACHE_ON_FAILURE: true
@@ -456,7 +469,7 @@ jobs:
   dashboard-full-e2e:
     name: Dashboard full e2e tests
     needs: [check-repo, build-server]
-    if: needs.check-repo.outputs.is-public-repo == 'true' && github.ref == 'refs/heads/main'
+    if: needs.check-repo.outputs.is-public-repo == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -515,7 +528,7 @@ jobs:
   dashboard-integration:
     name: Dashboard integration tests
     needs: [check-repo, build-server]
-    if: needs.check-repo.outputs.is-public-repo == 'true' && github.ref == 'refs/heads/main'
+    if: needs.check-repo.outputs.is-public-repo == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -961,3 +974,71 @@ jobs:
       - name: Run integration tests
         working-directory: sdks/wordpress
         run: composer run test:integration
+
+  # One stable branch-protection check owns the complete CI result. `always()` is
+  # load-bearing: GitHub otherwise skips a dependent job after any failed/cancelled
+  # prerequisite, which would make the required check disappear instead of fail.
+  public-candidate-gate:
+    name: Public candidate gate
+    if: always()
+    needs:
+      - check-repo
+      - release-contracts
+      - fmt
+      - clippy
+      - rust-tests-fast
+      - rust-tests-all
+      - build-server
+      - integration-smoke
+      - console
+      - dashboard-unit
+      - dashboard-build
+      - dashboard-pages
+      - dashboard-full-e2e
+      - dashboard-integration
+      - sdk-php
+      - sdk-python
+      - sdk-javascript
+      - sdk-contract
+      - sdk-go
+      - sdk-go-e2e
+      - sdk-ruby
+      - sdk-java
+      - sdk-csharp
+      - integration-laravel-scout
+      - integration-wordpress
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Require the trusted repository, branch, and every expected job
+        env:
+          ACTUAL_REPOSITORY: ${{ github.repository }}
+          ACTUAL_REF: ${{ github.ref }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          repository = os.environ["ACTUAL_REPOSITORY"]
+          ref = os.environ["ACTUAL_REF"]
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          failed = {
+              name: result.get("result")
+              for name, result in needs.items()
+              if result.get("result") != "success"
+          }
+          trusted_ref = ref == "refs/heads/main" or ref.startswith(
+              "refs/heads/public-candidate/"
+          )
+          if repository != "flapjackhq/flapjack" or not trusted_ref or failed:
+              print(
+                  "Public candidate gate refused: "
+                  f"repository={repository!r} ref={ref!r} non_success={failed}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          print(f"Public candidate gate passed for {repository}@{ref}")
+          PY

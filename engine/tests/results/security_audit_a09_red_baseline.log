@@ -1,0 +1,36 @@
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.71s
+     Running tests/test_security_audit.rs (target/debug/deps/test_security_audit-b09a3feab8b17f9c)
+
+running 3 tests
+test a09_failed_direct_key_auth_emits_audit_event_without_secret_or_query_leaks ... FAILED
+test a09_failed_secured_key_auth_emits_audit_event_without_token_payload_or_query_leaks ... FAILED
+test a09_rotate_admin_key_success_emits_audit_event_without_key_leaks ... FAILED
+
+failures:
+
+---- a09_failed_direct_key_auth_emits_audit_event_without_secret_or_query_leaks stdout ----
+
+thread 'a09_failed_direct_key_auth_emits_audit_event_without_secret_or_query_leaks' (67955139) panicked at tests/test_security_audit.rs:1104:5:
+direct-key auth failures must emit a detectable A09 security event; logs=
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a09_failed_secured_key_auth_emits_audit_event_without_token_payload_or_query_leaks stdout ----
+
+thread 'a09_failed_secured_key_auth_emits_audit_event_without_token_payload_or_query_leaks' (67955140) panicked at tests/test_security_audit.rs:1179:5:
+secured-key auth failures must emit a detectable A09 security event; logs=
+
+---- a09_rotate_admin_key_success_emits_audit_event_without_key_leaks stdout ----
+
+thread 'a09_rotate_admin_key_success_emits_audit_event_without_key_leaks' (67955141) panicked at tests/test_security_audit.rs:1223:5:
+successful rotate-admin-key calls must emit a detectable A09 admin-action event; logs= INFO http_request{request_id=a321b3ba-ed72-4da9-895d-ef9e79422c11}: Admin key rotated at runtime
+
+
+
+failures:
+    a09_failed_direct_key_auth_emits_audit_event_without_secret_or_query_leaks
+    a09_failed_secured_key_auth_emits_audit_event_without_token_payload_or_query_leaks
+    a09_rotate_admin_key_success_emits_audit_event_without_key_leaks
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 38 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p flapjack --test test_security_audit`

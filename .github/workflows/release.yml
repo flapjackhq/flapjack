@@ -32,9 +32,18 @@ jobs:
       - name: Verify requested version matches checked-in release files
         env:
           VERSION: ${{ github.event.inputs.version }}
+          ACTUAL_REF: ${{ github.ref }}
         shell: bash
         run: |
           set -euo pipefail
+
+          # workflow_dispatch lets an operator select any branch or tag. Refuse that
+          # valid GitHub UI/API shape before credentials or downstream publication
+          # jobs can run; releases are cut only from the exact public main ref.
+          if [[ "$ACTUAL_REF" != "refs/heads/main" ]]; then
+            echo "ERROR: releases must be dispatched from refs/heads/main, got $ACTUAL_REF" >&2
+            exit 1
+          fi
 
           # The workflow input is reused in Cargo, changelog, git tag, and Docker
           # tag contexts. Keep it to a literal semver-like subset that those
