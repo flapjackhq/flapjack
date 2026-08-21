@@ -1,13 +1,17 @@
 use super::*;
-use crate::test_helpers::{body_json, send_empty_request, send_json_request};
+use crate::auth::{ApiKey, KeyStore};
+use crate::test_helpers::{body_json, send_empty_request, send_json_request, TestStateBuilder};
 use axum::{
+    body::Body,
     http::{Method, StatusCode},
     routing::{delete, get, post},
     Router,
 };
+use flapjack::analytics::schema::SearchEvent;
 use flapjack::analytics::{AnalyticsConfig, AnalyticsQueryEngine};
 use serde_json::json;
 use tempfile::TempDir;
+use tower::ServiceExt;
 
 fn test_analytics_config(tmp: &TempDir) -> AnalyticsConfig {
     AnalyticsConfig {
@@ -53,16 +57,386 @@ fn app_router_with_base_and_notifier(
         .with_state(collector)
         .merge(
             Router::new()
+                .route(
+                    "/1/indexes/:indexName/usertokens/:userToken",
+                    delete(delete_index_usertoken),
+                )
                 .route("/1/usertokens/:userToken", delete(delete_usertoken))
                 .with_state(gdpr_state),
         )
 }
 
-/// Send a one-shot HTTP request with a JSON body to the given router and return the raw response.
+/// Assert the standard malformed-event HTTP statuses used by the JSON and handler layers.
 fn assert_rejected_event_status(status: StatusCode) {
     assert!(
         status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY,
         "expected 400 or 422, got {status}"
+    );
+}
+
+fn pbv3_search_event(index: &str, query_id: &str, user_token: &str) -> SearchEvent {
+    SearchEvent {
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        query: "shoes".to_string(),
+        query_id: Some(query_id.to_string()),
+        index_name: index.to_string(),
+        nb_hits: 1,
+        processing_time_ms: 1,
+        user_token: Some(user_token.to_string()),
+        user_ip: None,
+        filters: None,
+        facets: None,
+        analytics_tags: None,
+        page: 0,
+        hits_per_page: 20,
+        has_results: true,
+        country: None,
+        region: None,
+        experiment_id: None,
+        variant_id: None,
+        assignment_method: None,
+    }
+}
+
+fn pbv3_key(key_store: &KeyStore, indexes: Vec<String>, max_per_hour: i64) -> String {
+    key_store
+        .create_key(ApiKey {
+            hash: String::new(),
+            salt: String::new(),
+            hmac_key: None,
+            created_at: 0,
+            acl: vec!["search".to_string()],
+            description: "PBV3 Insights test key".to_string(),
+            indexes,
+            max_hits_per_query: 0,
+            max_queries_per_ip_per_hour: max_per_hour,
+            query_parameters: String::new(),
+            referers: vec![],
+            restrict_sources: None,
+            validity: 0,
+        })
+        .1
+}
+
+fn pbv3_production_app(
+    tmp: &TempDir,
+    collector: Arc<AnalyticsCollector>,
+    key_store: Arc<KeyStore>,
+) -> Router {
+    crate::router::build_router(
+        TestStateBuilder::new(tmp).with_analytics().build_shared(),
+        Some(key_store),
+        collector,
+        Arc::new(crate::middleware::TrustedProxyMatcher::from_optional_csv(None).unwrap()),
+        tmp.path(),
+        crate::router::RouterConfig {
+            cors_mode: crate::startup::CorsMode::LoopbackOnly,
+            disable_dashboard: true,
+            replication_api_key: None,
+            api_profile: crate::api_profile::ApiProfile::Full,
+        },
+    )
+}
+
+async fn pbv3_authed_event_request(
+    app: &Router,
+    api_key: &str,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/1/events")
+                .header("content-type", "application/json")
+                .header("x-algolia-application-id", "pbv3-app")
+                .header("x-algolia-api-key", api_key)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn pbv3_official_after_search_click_and_purchase_persist_correlation_and_rates() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_analytics_config(&tmp);
+    let collector = AnalyticsCollector::new(config.clone());
+    let app = app_router(Arc::clone(&collector));
+    let index = "tenant__products";
+    let user_token = "018f6b5e-4d3c-7a21-8b9c-0123456789ab";
+    let click_query_id = "0123456789abcdef0123456789abcdef";
+    let purchase_query_id = "abcdef0123456789abcdef0123456789";
+
+    collector.record_search(pbv3_search_event(index, click_query_id, user_token));
+    collector.record_search(pbv3_search_event(index, purchase_query_id, user_token));
+
+    let click = send_json_request(
+        &app,
+        Method::POST,
+        "/1/events",
+        json!({
+            "events": [{
+                "eventType": "click",
+                "eventName": "PBV3 Click",
+                "index": index,
+                "queryID": click_query_id,
+                "objectIDs": ["sku-1"],
+                "positions": [7],
+                "userToken": user_token
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(click.status(), StatusCode::OK);
+
+    let purchase = send_json_request(
+        &app,
+        Method::POST,
+        "/1/events",
+        json!({
+            "events": [{
+                "eventType": "conversion",
+                "eventSubtype": "purchase",
+                "eventName": "PBV3 Purchase",
+                "index": index,
+                "objectIDs": ["sku-1"],
+                "objectData": [{
+                    "queryID": purchase_query_id,
+                    "price": 19.95,
+                    "quantity": 2
+                }],
+                "value": 39.90,
+                "currency": "USD",
+                "userToken": user_token
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(purchase.status(), StatusCode::OK);
+
+    collector.flush_all();
+    let query = AnalyticsQueryEngine::new(config);
+    let rows = query
+        .query_events(
+            index,
+            "SELECT event_type, event_subtype, query_id, user_token, positions, value, currency FROM events ORDER BY event_type",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "both selected official methods must persist");
+    assert_eq!(rows[0]["event_type"], "click");
+    assert_eq!(rows[0]["query_id"], click_query_id);
+    assert_eq!(rows[0]["positions"], "[7]");
+    assert_eq!(rows[0]["user_token"], user_token);
+    assert_eq!(rows[1]["event_type"], "conversion");
+    assert_eq!(rows[1]["event_subtype"], "purchase");
+    assert_eq!(rows[1]["query_id"], purchase_query_id);
+    assert_eq!(rows[1]["value"], 39.90);
+    assert_eq!(rows[1]["currency"], "USD");
+    assert_eq!(rows[1]["user_token"], user_token);
+
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let ctr = query
+        .click_through_rate(index, &today, &today)
+        .await
+        .unwrap();
+    assert_eq!(ctr["trackedSearchCount"], 2);
+    assert_eq!(ctr["clickCount"], 1);
+    assert_eq!(ctr["rate"], 0.5);
+    let purchase_rate = query
+        .conversion_rate_for_subtype(index, &today, &today, "purchase")
+        .await
+        .unwrap();
+    assert_eq!(purchase_rate["trackedSearchCount"], 2);
+    assert_eq!(purchase_rate["purchaseCount"], 1);
+    assert_eq!(purchase_rate["rate"], 0.5);
+}
+
+#[tokio::test]
+async fn pbv3_mixed_valid_invalid_batch_is_atomic_with_no_debug_or_persisted_effect() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_analytics_config(&tmp);
+    let collector = AnalyticsCollector::new(config.clone());
+    let app = app_router(Arc::clone(&collector));
+    let user_token = "018f6b5e-4d3c-7a21-8b9c-0123456789ab";
+
+    let response = send_json_request(
+        &app,
+        Method::POST,
+        "/1/events",
+        json!({
+            "events": [
+                {
+                    "eventType": "click",
+                    "eventName": "Would otherwise persist",
+                    "index": "tenant__products",
+                    "queryID": "0123456789abcdef0123456789abcdef",
+                    "objectIDs": ["sku-1"],
+                    "positions": [1],
+                    "userToken": user_token
+                },
+                {
+                    "eventType": "click",
+                    "eventName": "Invalid missing positions",
+                    "index": "tenant__products",
+                    "queryID": "abcdef0123456789abcdef0123456789",
+                    "objectIDs": ["sku-2"],
+                    "userToken": user_token
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_rejected_event_status(response.status());
+    assert!(
+        collector
+            .get_debug_events(10, None, None, None, None, None)
+            .is_empty(),
+        "an atomically rejected request must not enter the debugger"
+    );
+    collector.flush_all();
+    let rows = AnalyticsQueryEngine::new(config)
+        .query_events("tenant__products", "SELECT event_name FROM events")
+        .await
+        .unwrap();
+    assert!(
+        rows.is_empty(),
+        "an atomically rejected request persisted rows"
+    );
+    assert_eq!(
+        collector.analytics_metrics_snapshot().accepted_events_total,
+        0,
+        "an atomically rejected request must not increment analytics metrics"
+    );
+}
+
+#[tokio::test]
+async fn pbv3_index_restrictions_and_low_cap_reject_before_event_effects() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_analytics_config(&tmp);
+    let collector = AnalyticsCollector::new(config.clone());
+    let key_store = Arc::new(KeyStore::load_or_create(
+        &tmp.path().join("keys"),
+        "admin-key",
+    ));
+    let scoped_key = pbv3_key(&key_store, vec!["tenant-a".to_string()], 0);
+    let limited_key = pbv3_key(&key_store, vec!["tenant-a".to_string()], 1);
+    let app = pbv3_production_app(&tmp, Arc::clone(&collector), key_store);
+    let user_token = "018f6b5e-4d3c-7a21-8b9c-0123456789ab";
+    let click = |event_name: &str, index: &str, object_id: &str| {
+        json!({
+            "eventType": "click",
+            "eventName": event_name,
+            "index": index,
+            "queryID": "0123456789abcdef0123456789abcdef",
+            "objectIDs": [object_id],
+            "positions": [1],
+            "userToken": user_token
+        })
+    };
+    let purchase = |event_name: &str, index: &str, object_id: &str| {
+        json!({
+            "eventType": "conversion",
+            "eventSubtype": "purchase",
+            "eventName": event_name,
+            "index": index,
+            "objectIDs": [object_id],
+            "objectData": [{
+                "queryID": "abcdef0123456789abcdef0123456789",
+                "price": 12.5,
+                "quantity": 1
+            }],
+            "value": 12.5,
+            "currency": "USD",
+            "userToken": user_token
+        })
+    };
+
+    let same_index = pbv3_authed_event_request(
+        &app,
+        &scoped_key,
+        json!({
+            "events": [
+                click("Same-index accepted", "tenant-a", "a-1"),
+                purchase("Same-index purchase", "tenant-a", "a-1")
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(same_index.status(), StatusCode::OK);
+
+    let mixed_index = pbv3_authed_event_request(
+        &app,
+        &scoped_key,
+        json!({
+            "events": [
+                click("Mixed allowed", "tenant-a", "a-2"),
+                click("Mixed forbidden", "tenant-b", "b-1")
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(mixed_index.status(), StatusCode::FORBIDDEN);
+
+    let within_cap = pbv3_authed_event_request(
+        &app,
+        &limited_key,
+        json!({"events": [click("Rate accepted", "tenant-a", "a-3")]}),
+    )
+    .await;
+    assert_eq!(within_cap.status(), StatusCode::OK);
+    let over_cap = pbv3_authed_event_request(
+        &app,
+        &limited_key,
+        json!({"events": [click("Rate rejected", "tenant-a", "a-4")]}),
+    )
+    .await;
+    assert_eq!(over_cap.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let debug_names: Vec<String> = collector
+        .get_debug_events(10, None, None, None, None, None)
+        .into_iter()
+        .map(|event| event.event_name)
+        .collect();
+    assert_eq!(
+        debug_names,
+        vec![
+            "Rate accepted".to_string(),
+            "Same-index purchase".to_string(),
+            "Same-index accepted".to_string()
+        ]
+    );
+    collector.flush_all();
+    let query = AnalyticsQueryEngine::new(config);
+    let rows = query
+        .query_events(
+            "tenant-a",
+            "SELECT event_name FROM events ORDER BY event_name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            json!({"event_name": "Rate accepted"}),
+            json!({"event_name": "Same-index accepted"}),
+            json!({"event_name": "Same-index purchase"})
+        ]
+    );
+    let forbidden_rows = query
+        .query_events("tenant-b", "SELECT event_name FROM events")
+        .await
+        .unwrap();
+    assert!(
+        forbidden_rows.is_empty(),
+        "the forbidden second index must have no persisted effect"
+    );
+    assert_eq!(
+        collector.analytics_metrics_snapshot().accepted_events_total,
+        3,
+        "only the two same-index events and one within-cap event are accepted"
     );
 }
 
@@ -146,6 +520,66 @@ async fn delete_usertoken_purges_events_from_analytics_queries() {
     );
 }
 
+#[tokio::test]
+async fn delete_index_usertoken_purges_only_the_exact_index_and_preserves_profile() {
+    use flapjack::personalization::{PersonalizationProfile, PersonalizationProfileStore};
+
+    let tmp = TempDir::new().unwrap();
+    let config = test_analytics_config(&tmp);
+    let collector = AnalyticsCollector::new(config.clone());
+    let app = app_router(Arc::clone(&collector));
+    let token = "shared-user";
+
+    let ingest_response = send_json_request(
+        &app,
+        Method::POST,
+        "/1/events",
+        json!({
+            "events": [
+                {"eventType": "view", "eventName": "A", "index": "tenant-a", "userToken": token, "objectIDs": ["a"]},
+                {"eventType": "view", "eventName": "B", "index": "tenant-b", "userToken": token, "objectIDs": ["b"]}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(ingest_response.status(), StatusCode::OK);
+    collector.flush_all();
+
+    let profiles = PersonalizationProfileStore::new(tmp.path());
+    profiles
+        .save_profile(&PersonalizationProfile {
+            user_token: token.to_string(),
+            last_event_at: None,
+            scores: Default::default(),
+        })
+        .unwrap();
+
+    let response = send_empty_request(
+        &app,
+        Method::DELETE,
+        "/1/indexes/tenant-a/usertokens/shared-user",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["deletionScope"], "exactIndex");
+
+    let query = AnalyticsQueryEngine::new(config);
+    assert!(query
+        .query_events("tenant-a", "SELECT user_token FROM events")
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        query
+            .query_events("tenant-b", "SELECT user_token FROM events")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(profiles.load_profile(token).unwrap().is_some());
+}
+
 /// Verify that click events without a `positions` array are rejected with 400 or 422.
 #[tokio::test]
 async fn post_events_rejects_click_without_positions() {
@@ -158,7 +592,7 @@ async fn post_events_rejects_click_without_positions() {
             "eventType": "click",
             "eventName": "Product Clicked",
             "index": "products",
-            "userToken": "user_123",
+            "userToken": "018f6b5e-4d3c-7a21-8b9c-0123456789ab",
             "objectIDs": ["obj1"]
         }]
     });
@@ -202,7 +636,7 @@ async fn post_events_accepts_click_with_query_id_and_matching_positions() {
             "eventType": "click",
             "eventName": "Product Clicked",
             "index": "products",
-            "userToken": "user_123",
+            "userToken": "018f6b5e-4d3c-7a21-8b9c-0123456789ab",
             "objectIDs": ["obj1"],
             "positions": [1],
             "queryID": query_id
@@ -333,8 +767,15 @@ async fn post_events_accepts_purchase_event_subtype_on_conversion_events() {
             "eventType": "conversion",
             "eventName": "Product Purchased",
             "index": "products",
-            "userToken": "user_123",
+            "userToken": "018f6b5e-4d3c-7a21-8b9c-0123456789ab",
             "objectIDs": ["obj1"],
+            "objectData": [{
+                "queryID": "0123456789abcdef0123456789abcdef",
+                "price": 12.5,
+                "quantity": 2
+            }],
+            "value": 25.0,
+            "currency": "USD",
             "eventSubtype": "purchase"
         }]
     });
@@ -378,14 +819,13 @@ async fn debug_endpoint_returns_empty_when_no_events() {
     assert_eq!(body["events"].as_array().unwrap().len(), 0);
 }
 
-/// Verify that the debug ring buffer records both accepted (200) and rejected (422) events with correct metadata.
+/// Verify that an atomically rejected batch publishes no Event Debugger entries.
 #[tokio::test]
-async fn debug_endpoint_records_valid_and_invalid_events() {
+async fn debug_endpoint_omits_atomically_rejected_batch() {
     let tmp = TempDir::new().unwrap();
     let collector = AnalyticsCollector::new(test_analytics_config(&tmp));
     let app = app_router(collector);
 
-    // Send a mix of valid and invalid events
     let ingest_body = json!({
         "events": [
             {
@@ -405,25 +845,13 @@ async fn debug_endpoint_records_valid_and_invalid_events() {
         ]
     });
     let resp = send_json_request(&app, Method::POST, "/1/events", ingest_body).await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_rejected_event_status(resp.status());
 
-    // Query debug endpoint
     let debug_resp = send_empty_request(&app, Method::GET, "/1/events/debug").await;
     assert_eq!(debug_resp.status(), StatusCode::OK);
     let body = body_json(debug_resp).await;
-    assert_eq!(body["count"], 2);
-
-    let events = body["events"].as_array().unwrap();
-    // Newest first (reverse chronological)
-    let invalid = &events[0];
-    assert_eq!(invalid["eventType"], "bogus");
-    assert_eq!(invalid["httpCode"], 422);
-    assert!(!invalid["validationErrors"].as_array().unwrap().is_empty());
-
-    let valid = &events[1];
-    assert_eq!(valid["eventType"], "view");
-    assert_eq!(valid["httpCode"], 200);
-    assert!(valid["validationErrors"].as_array().unwrap().is_empty());
+    assert_eq!(body["count"], 0);
+    assert!(body["events"].as_array().unwrap().is_empty());
 }
 
 /// Verify that the debug endpoint correctly filters events by `index` and `status` query parameters.

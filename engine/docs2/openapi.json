@@ -2345,6 +2345,42 @@
         ]
       }
     },
+    "/1/indexes/{indexName}/usertokens/{userToken}": {
+      "delete": {
+        "tags": [
+          "insights"
+        ],
+        "summary": "DELETE /1/indexes/{indexName}/usertokens/{userToken} - Delete insight\nevents tied to a user token from exactly one index.",
+        "description": "This operational endpoint deliberately leaves the VM-global\npersonalization profile and GDPR notification untouched. It is used by a\ntenant-aware control plane after it has resolved the tenant's physical\nindex name.",
+        "operationId": "delete_index_usertoken",
+        "parameters": [
+          {
+            "name": "indexName",
+            "in": "path",
+            "description": "Exact physical index name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "userToken",
+            "in": "path",
+            "description": "User token to delete",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {},
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
     "/1/indexes/{indexName}/{objectID}": {
       "get": {
         "tags": [
@@ -9592,7 +9628,7 @@
       },
       "InsightEvent": {
         "type": "object",
-        "description": "Sent by client via Insights API (click, conversion, view events).",
+        "description": "Wire representation used for both deserialization and generated API schema.",
         "required": [
           "eventType",
           "eventName",
@@ -9633,13 +9669,13 @@
               "null"
             ]
           },
-          "objectIDs": {
+          "objectData": {
             "type": "array",
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/InsightEventObjectData"
             }
           },
-          "objectIds": {
+          "objectIDs": {
             "type": "array",
             "items": {
               "type": "string"
@@ -9678,6 +9714,32 @@
               "null"
             ],
             "format": "double"
+          }
+        }
+      },
+      "InsightEventObjectData": {
+        "type": "object",
+        "properties": {
+          "price": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "quantity": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "queryID": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },

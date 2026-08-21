@@ -53,6 +53,27 @@ pub async fn post_events(
         enforce_analytics_index_access(api_key, secured_restrictions, &event.index)?;
     }
 
+    // Validate the complete request before publishing debugger, persistence, or
+    // analytics effects. Official Insights sends batches as one request; a
+    // single malformed member therefore rejects the complete batch atomically.
+    let validation_errors: Vec<String> = body
+        .events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            event
+                .validate()
+                .err()
+                .map(|error| format!("event {index}: {error}"))
+        })
+        .collect();
+    if !validation_errors.is_empty() {
+        return Err(FlapjackError::InvalidQuery(format!(
+            "Event batch rejected: {}",
+            validation_errors.join("; ")
+        )));
+    }
+
     let idempotency_key = headers
         .get(IDEMPOTENCY_HEADER)
         .and_then(|value| value.to_str().ok());
@@ -87,9 +108,6 @@ pub async fn post_events(
     }
 
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let mut accepted = 0;
-    let mut errors: Vec<String> = Vec::new();
-
     for event in body.events {
         let debug_entry = |http_code: u16, validation_errors: Vec<String>| DebugEvent {
             timestamp_ms: event.timestamp.unwrap_or(now_ms),
@@ -103,24 +121,8 @@ pub async fn post_events(
             validation_errors,
         };
 
-        match event.validate() {
-            Ok(()) => {
-                collector.record_debug_event(debug_entry(200, vec![]));
-                collector.record_insight(event);
-                accepted += 1;
-            }
-            Err(e) => {
-                collector.record_debug_event(debug_entry(422, vec![e.clone()]));
-                errors.push(e);
-            }
-        }
-    }
-
-    if !errors.is_empty() && accepted == 0 {
-        return Err(FlapjackError::InvalidQuery(format!(
-            "All events rejected: {}",
-            errors.join("; ")
-        )));
+        collector.record_debug_event(debug_entry(200, vec![]));
+        collector.record_insight(event);
     }
 
     let response_body = serde_json::json!({
@@ -358,6 +360,46 @@ pub async fn delete_usertoken(
     }
 
     Ok(Json(response))
+}
+
+/// DELETE /1/indexes/{indexName}/usertokens/{userToken} - Delete insight
+/// events tied to a user token from exactly one index.
+///
+/// This operational endpoint deliberately leaves the VM-global
+/// personalization profile and GDPR notification untouched. It is used by a
+/// tenant-aware control plane after it has resolved the tenant's physical
+/// index name.
+#[utoipa::path(delete, path = "/1/indexes/{indexName}/usertokens/{userToken}", tag = "insights",
+    params(
+        ("indexName" = String, Path, description = "Exact physical index name"),
+        ("userToken" = String, Path, description = "User token to delete")
+    ),
+    security(("api_key" = [])))]
+pub async fn delete_index_usertoken(
+    State(state): State<GdprDeleteState>,
+    Path((index_name, user_token)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, FlapjackError> {
+    flapjack::validate_index_name(&index_name)?;
+    validate_user_token(&user_token).map_err(FlapjackError::InvalidQuery)?;
+
+    state
+        .analytics_collector
+        .purge_user_token_where_index(&user_token, &|index| index == index_name)
+        .map_err(|error| {
+            tracing::warn!(
+                index_name,
+                user_token_len = user_token.len(),
+                "index user-token deletion: failed to purge analytics events: {error}"
+            );
+            FlapjackError::Io("failed to purge user analytics".to_string())
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "status": 200,
+        "message": "OK",
+        "deletedAt": chrono::Utc::now().to_rfc3339(),
+        "deletionScope": "exactIndex"
+    })))
 }
 
 /// State for the GDPR delete endpoint, bundling the analytics collector and

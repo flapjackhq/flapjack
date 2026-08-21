@@ -133,7 +133,7 @@ derive_k6_api_addr() {
 
 initialize_soak_marker_user_token() {
   SOAK_MARKER_USER_TOKEN="$(
-    node -e 'process.stdout.write(`soak-marker-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`)'
+    node -e 'process.stdout.write(require("node:crypto").randomUUID())'
   )"
   [[ -n "$SOAK_MARKER_USER_TOKEN" ]] || fail "failed to initialize soak marker user token"
   export FLAPJACK_LOADTEST_SOAK_MARKER_USER_TOKEN="$SOAK_MARKER_USER_TOKEN"

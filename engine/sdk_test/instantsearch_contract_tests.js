@@ -8,6 +8,7 @@ import {
 const client = createFlapjackClient();
 
 const RUN_ID = Date.now();
+const SELECTED_EVENT_USER_TOKEN = '3f25cf54-46f6-4f67-9ac8-87c4a34c86f1';
 const MAIN_INDEX = `instantsearch_contract_${RUN_ID}`;
 const REPLICA_ASC_INDEX = `${MAIN_INDEX}_price_asc`;
 const REPLICA_DESC_INDEX = `${MAIN_INDEX}_price_desc`;
@@ -654,7 +655,7 @@ test('clickAnalytics returns queryID and accepts click event', async () => {
         eventType: 'click',
         eventName: 'Product Clicked',
         index: MAIN_INDEX,
-        userToken: `test-user-${RUN_ID}`,
+        userToken: SELECTED_EVENT_USER_TOKEN,
         queryID: result.queryID,
         objectIDs: [result.hits[0].objectID],
         positions: [1]

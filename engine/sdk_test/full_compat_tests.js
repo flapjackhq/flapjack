@@ -34,6 +34,7 @@ import {
 const client = createFlapjackClient();
 
 const RUN_ID = Date.now();
+const SELECTED_EVENT_USER_TOKEN = '3f25cf54-46f6-4f67-9ac8-87c4a34c86f1';
 const TEST_INDEX = `compat_test_${RUN_ID}`;
 const REPLICA_INDEX = `${TEST_INDEX}_price_asc`;
 const BROWSE_INDEX = `${TEST_INDEX}_browse`;
@@ -580,7 +581,7 @@ test('clickAnalytics end-to-end', async () => {
         eventType: 'click',
         eventName: clickEventName,
         index: TEST_INDEX,
-        userToken: 'test_click_user',
+        userToken: SELECTED_EVENT_USER_TOKEN,
         objectIDs: [searchObjectId],
         positions: [1],
         queryID: expectedQueryID,

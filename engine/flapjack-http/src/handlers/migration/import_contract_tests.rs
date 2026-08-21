@@ -31,6 +31,7 @@ use crate::handlers::migration::spool::AsyncMigrationPublicationSemantic;
 use crate::handlers::migration::spool::{
     MigrationCancelRequest, MigrationDisposition, MigrationExportProgress, MigrationPhase,
     MigrationPhaseRecord, ResourceDenominators, SpoolErrorKind, SpoolLimits, SpoolStore,
+    SPOOL_ROOT,
 };
 use crate::handlers::migration::AsyncMigrationSourceProvider;
 use crate::handlers::rules::get_rule;
@@ -3850,7 +3851,14 @@ async fn async_migration_resume_after_committed_page_has_exact_target_id_set() {
     ] {
         let refusal_job_uuid =
             seed_resume_refusal_job(&state, &owner_identity, case_name, lifecycle);
-        let before_refusal = directory_snapshot(&state.manager.base_path);
+        let spool_root = state.manager.base_path.join(SPOOL_ROOT);
+        let before_refusal_spool = directory_snapshot(&spool_root);
+        let before_refusal_counters = (
+            counters.traversal_starts.load(Ordering::SeqCst),
+            counters
+                .second_traversal_pages_served
+                .load(Ordering::SeqCst),
+        );
         let refusal = post_resume_request(
             &app,
             "admin-key",
@@ -3864,9 +3872,41 @@ async fn async_migration_resume_after_committed_page_has_exact_target_id_set() {
         .await;
         resume_not_available_body(refusal, refusal_job_uuid, lifecycle).await;
         assert_eq!(
-            directory_snapshot(&state.manager.base_path),
-            before_refusal,
-            "{lifecycle} resume refusal must not mutate manifest, artifacts, sidecars, counters, or lifecycle"
+            directory_snapshot(&spool_root),
+            before_refusal_spool,
+            "{lifecycle} resume refusal must not mutate migration manifests, artifacts, sidecars, counters, or lifecycle"
+        );
+        assert_eq!(
+            (
+                counters.traversal_starts.load(Ordering::SeqCst),
+                counters
+                    .second_traversal_pages_served
+                    .load(Ordering::SeqCst),
+            ),
+            before_refusal_counters,
+            "{lifecycle} resume refusal must not start another source traversal"
+        );
+        assert_eq!(
+            state.migration_runner.active_count_for_test(),
+            0,
+            "{lifecycle} resume refusal must not claim an active migration slot"
+        );
+    }
+
+    let target = state.manager.get_or_load(TARGET_INDEX).unwrap();
+    assert_eq!(
+        target.reader().searcher().num_docs(),
+        expected_target_ids.len() as u64,
+        "resume refusals must not change the exact destination document count"
+    );
+    for object_id in &expected_target_ids {
+        assert!(
+            state
+                .manager
+                .get_document(TARGET_INDEX, object_id)
+                .unwrap_or_else(|error| panic!("failed to read {object_id}: {error}"))
+                .is_some(),
+            "resume refusals must preserve destination document {object_id}"
         );
     }
 }

@@ -404,7 +404,7 @@ assert_contains "$RELEASE_WORKFLOW" "docker/setup-qemu-action@v3" "release.yml d
 assert_contains "$RELEASE_WORKFLOW" "docker buildx imagetools inspect" "release.yml verifies candidate manifest contents"
 assert_contains "$RELEASE_WORKFLOW" "^\\s*RELEASE_REGISTRY: ghcr\\.io$" "release.yml declares one owner for the release registry host"
 assert_image_identity_ssot "$RELEASE_WORKFLOW" "this checkout"
-assert_job_contains "docker_prepare" 'image="\$\{RELEASE_REGISTRY\}/\$\{RELEASE_IMAGE_REPOSITORY\}"' "docker_prepare composes its tags from the declared registry coordinates"
+assert_job_contains "docker_prepare" 'image="[$][{]RELEASE_REGISTRY[}]/[$][{]RELEASE_IMAGE_REPOSITORY[}]"' "docker_prepare composes its tags from the declared registry coordinates"
 # Re-run the identity-sensitive assertions against a copy whose repository
 # identity has been rewritten, which is exactly what debbie does when it syncs
 # to each mirror. Without this the suite passes locally and on the production

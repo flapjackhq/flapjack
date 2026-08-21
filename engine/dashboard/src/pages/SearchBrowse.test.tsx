@@ -216,7 +216,22 @@ describe('SearchBrowse', () => {
 
     await user.click(screen.getByLabelText(/track analytics/i))
 
-    expect(sessionStorage.getItem('fj-dashboard-user-token')).toMatch(/^dashboard-/)
+    expect(sessionStorage.getItem('fj-dashboard-user-token')).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    )
+  })
+
+  it('replaces a legacy non-UUID analytics token when tracking is enabled', async () => {
+    const user = userEvent.setup()
+    sessionStorage.setItem('fj-dashboard-user-token', 'dashboard-legacy-token')
+    vi.mocked(useIndexes).mockReturnValue({ data: [INDEX], isLoading: false } as any)
+
+    render(<SearchBrowse />, { wrapper: withIndex })
+    await user.click(screen.getByLabelText(/track analytics/i))
+
+    expect(sessionStorage.getItem('fj-dashboard-user-token')).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    )
   })
 
   it('keeps browse controls but delegates cross-page navigation to the shared index tab bar', () => {

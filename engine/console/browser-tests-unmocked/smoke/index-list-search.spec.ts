@@ -185,7 +185,7 @@ test.describe('standalone shared Index List and Basic Search', () => {
     });
     const previewToken = onSearchExchange.userToken;
     expect(previewToken).toMatch(
-      /^dashboard-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
     );
     expect(onSearchExchange.responseQueryId).toMatch(/^[0-9a-f]{32}$/);
 

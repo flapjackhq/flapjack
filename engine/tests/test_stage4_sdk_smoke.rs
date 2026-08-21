@@ -246,7 +246,10 @@ async fn insights_to_analytics_full_lifecycle_smoke_has_expected_shapes() {
         Method::POST,
         "/1/indexes/products/query",
         Some(json!({ "query": "shoe", "clickAnalytics": true })),
-        &[("x-algolia-usertoken", "sdk-user-1")],
+        &[(
+            "x-algolia-usertoken",
+            "00000000-0000-4000-8000-000000000001",
+        )],
     )
     .await;
     assert_eq!(search_resp.status(), StatusCode::OK);
@@ -258,7 +261,7 @@ async fn insights_to_analytics_full_lifecycle_smoke_has_expected_shapes() {
         "shoe",
         &query_id,
         "products",
-        "sdk-user-1",
+        "00000000-0000-4000-8000-000000000001",
         None,
         None,
     );
@@ -273,7 +276,7 @@ async fn insights_to_analytics_full_lifecycle_smoke_has_expected_shapes() {
                     "eventType": "click",
                     "eventName": "Product Clicked",
                     "index": "products",
-                    "userToken": "sdk-user-1",
+                    "userToken": "00000000-0000-4000-8000-000000000001",
                     "queryID": query_id,
                     "objectIDs": ["p1"],
                     "positions": [1]
@@ -283,9 +286,14 @@ async fn insights_to_analytics_full_lifecycle_smoke_has_expected_shapes() {
                     "eventSubtype": "purchase",
                     "eventName": "Purchased",
                     "index": "products",
-                    "userToken": "sdk-user-1",
+                    "userToken": "00000000-0000-4000-8000-000000000001",
                     "queryID": query_id,
                     "objectIDs": ["p1"],
+                    "objectData": [{
+                        "queryID": query_id,
+                        "price": 49.99,
+                        "quantity": 1
+                    }],
                     "value": 49.99,
                     "currency": "USD"
                 },
@@ -294,7 +302,7 @@ async fn insights_to_analytics_full_lifecycle_smoke_has_expected_shapes() {
                     "eventSubtype": "addToCart",
                     "eventName": "Added to Cart",
                     "index": "products",
-                    "userToken": "sdk-user-1",
+                    "userToken": "00000000-0000-4000-8000-000000000001",
                     "queryID": query_id,
                     "objectIDs": ["p1"]
                 }
@@ -492,7 +500,7 @@ async fn ab_lifecycle_smoke_populates_variant_metrics_and_honors_stop_side_effec
         if user_token_by_arm.len() == 2 {
             break;
         }
-        let user_token = format!("ab-user-{i}");
+        let user_token = format!("00000000-0000-4000-8000-{i:012x}");
         let search_resp = send_json_with_headers(
             &app,
             Method::POST,
@@ -565,6 +573,11 @@ async fn ab_lifecycle_smoke_populates_variant_metrics_and_honors_stop_side_effec
                     "userToken": user_token,
                     "queryID": query_id,
                     "objectIDs": [object_id],
+                    "objectData": [{
+                        "queryID": query_id,
+                        "price": 10.0,
+                        "quantity": 1
+                    }],
                     "value": 10.0,
                     "currency": "USD"
                 }),

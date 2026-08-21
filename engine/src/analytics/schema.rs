@@ -27,34 +27,157 @@ pub struct SearchEvent {
 }
 
 /// Sent by client via Insights API (click, conversion, view events).
-#[derive(Debug, Clone, serde::Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct InsightEvent {
     pub event_type: String,
-    #[serde(default)]
     pub event_subtype: Option<String>,
     pub event_name: String,
     pub index: String,
     pub user_token: String,
-    #[serde(default)]
     pub authenticated_user_token: Option<String>,
-    #[serde(default, rename = "queryID", alias = "queryId")]
     pub query_id: Option<String>,
-    #[serde(default)]
     pub object_ids: Vec<String>,
-    #[serde(default, rename = "objectIDs")]
     pub object_ids_alt: Vec<String>,
-    #[serde(default)]
     pub positions: Option<Vec<u32>>,
-    #[serde(default)]
     pub timestamp: Option<i64>,
-    #[serde(default)]
     pub value: Option<f64>,
-    #[serde(default)]
     pub currency: Option<String>,
-    #[serde(default)]
     pub interleaving_team: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+/// Wire representation used for both deserialization and generated API schema.
+struct InsightEventWire {
+    event_type: String,
+    #[serde(default)]
+    event_subtype: Option<String>,
+    event_name: String,
+    index: String,
+    user_token: String,
+    #[serde(default)]
+    authenticated_user_token: Option<String>,
+    #[serde(default, rename = "queryID", alias = "queryId")]
+    query_id: Option<String>,
+    #[serde(default, rename = "objectIDs", alias = "objectIds")]
+    object_ids: Vec<String>,
+    #[serde(default)]
+    positions: Option<Vec<u32>>,
+    #[serde(default)]
+    timestamp: Option<i64>,
+    #[serde(default)]
+    value: Option<f64>,
+    #[serde(default)]
+    currency: Option<String>,
+    #[serde(default)]
+    interleaving_team: Option<String>,
+    #[serde(default)]
+    object_data: Vec<InsightEventObjectData>,
+}
+
+#[derive(serde::Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+struct InsightEventObjectData {
+    #[serde(default, rename = "queryID", alias = "queryId")]
+    query_id: Option<String>,
+    #[serde(default)]
+    price: Option<f64>,
+    #[serde(default)]
+    quantity: Option<u32>,
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for InsightEvent {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        <InsightEventWire as utoipa::PartialSchema>::schema()
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for InsightEvent {
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        <InsightEventWire as utoipa::ToSchema>::schemas(schemas);
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for InsightEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let wire = InsightEventWire::deserialize(deserializer)?;
+        let mut query_id = wire.query_id;
+        if wire.event_subtype.as_deref() == Some("purchase") {
+            if wire.object_ids.len() != 1 || wire.object_data.len() != 1 {
+                return Err(D::Error::custom(
+                    "purchase requires exactly one objectID and one matching objectData entry",
+                ));
+            }
+            let object_data = &wire.object_data[0];
+            let object_query_id = object_data
+                .query_id
+                .as_deref()
+                .ok_or_else(|| D::Error::custom("purchase objectData.queryID is required"))?;
+            if query_id
+                .as_deref()
+                .is_some_and(|top_level| top_level != object_query_id)
+            {
+                return Err(D::Error::custom(
+                    "purchase queryID must match objectData.queryID",
+                ));
+            }
+            object_data
+                .price
+                .filter(|price| price.is_finite() && *price > 0.0)
+                .ok_or_else(|| D::Error::custom("purchase objectData.price must be positive"))?;
+            object_data
+                .quantity
+                .filter(|quantity| *quantity > 0)
+                .ok_or_else(|| D::Error::custom("purchase objectData.quantity must be positive"))?;
+            wire.value
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .ok_or_else(|| D::Error::custom("purchase value must be positive"))?;
+            let currency = wire.currency.as_deref().ok_or_else(|| {
+                D::Error::custom("purchase currency must be an ISO-4217 alphabetic code")
+            })?;
+            if currency.len() != 3 || !currency.bytes().all(|byte| byte.is_ascii_uppercase()) {
+                return Err(D::Error::custom(
+                    "purchase currency must be an ISO-4217 alphabetic code",
+                ));
+            }
+            query_id = Some(object_query_id.to_string());
+        } else if !wire.object_data.is_empty() {
+            return Err(D::Error::custom(
+                "objectData is supported only for purchase conversion events",
+            ));
+        }
+
+        Ok(Self {
+            event_type: wire.event_type,
+            event_subtype: wire.event_subtype,
+            event_name: wire.event_name,
+            index: wire.index,
+            user_token: wire.user_token,
+            authenticated_user_token: wire.authenticated_user_token,
+            query_id,
+            object_ids: wire.object_ids,
+            object_ids_alt: Vec::new(),
+            positions: wire.positions,
+            timestamp: wire.timestamp,
+            value: wire.value,
+            currency: wire.currency,
+            interleaving_team: wire.interleaving_team,
+        })
+    }
 }
 
 impl InsightEvent {
@@ -87,6 +210,9 @@ impl InsightEvent {
                 Some(pos) if pos.len() != oids.len() => {
                     return Err("positions length must match objectIDs length".to_string());
                 }
+                Some(pos) if pos.contains(&0) => {
+                    return Err("positions must be one-based positive integers".to_string());
+                }
                 _ => {}
             }
         }
@@ -101,6 +227,22 @@ impl InsightEvent {
         if let Some(ref qid) = self.query_id {
             if qid.len() != 32 || !qid.chars().all(|c| c.is_ascii_hexdigit()) {
                 return Err("queryID must be 32-char hex string".to_string());
+            }
+        }
+        if (self.event_type == "click" && self.query_id.is_some())
+            || (self.event_type == "conversion"
+                && self.event_subtype.as_deref() == Some("purchase"))
+        {
+            let parsed = uuid::Uuid::parse_str(&self.user_token)
+                .map_err(|_| "selected after-search events require a UUID userToken".to_string())?;
+            if !parsed
+                .hyphenated()
+                .to_string()
+                .eq_ignore_ascii_case(&self.user_token)
+            {
+                return Err(
+                    "selected after-search events require a hyphenated UUID userToken".to_string(),
+                );
             }
         }
         // Reject events older than 4 days
@@ -216,7 +358,7 @@ mod tests {
             event_subtype: None,
             event_name: "Product Clicked".to_string(),
             index: "products".to_string(),
-            user_token: "user123".to_string(),
+            user_token: "018f6b5e-4d3c-7a21-8b9c-0123456789ab".to_string(),
             authenticated_user_token: None,
             query_id: None,
             object_ids: vec!["obj1".to_string()],
@@ -580,7 +722,7 @@ mod tests {
 
     #[test]
     fn insight_event_deserializes_query_id_from_queryid() {
-        let json = r#"{"eventType":"click","eventName":"Clicked","index":"products","userToken":"user1","queryID":"abcdef0123456789abcdef0123456789","objectIDs":["obj1"],"positions":[1]}"#;
+        let json = r#"{"eventType":"click","eventName":"Clicked","index":"products","userToken":"018f6b5e-4d3c-7a21-8b9c-0123456789ab","queryID":"abcdef0123456789abcdef0123456789","objectIDs":["obj1"],"positions":[1]}"#;
         let event: InsightEvent = serde_json::from_str(json).unwrap();
         assert_eq!(
             event.query_id.as_deref(),
@@ -590,11 +732,134 @@ mod tests {
 
     #[test]
     fn insight_event_deserializes_query_id_from_queryid_alias() {
-        let json = r#"{"eventType":"click","eventName":"Clicked","index":"products","userToken":"user1","queryId":"abcdef0123456789abcdef0123456789","objectIDs":["obj1"],"positions":[1]}"#;
+        let json = r#"{"eventType":"click","eventName":"Clicked","index":"products","userToken":"018f6b5e-4d3c-7a21-8b9c-0123456789ab","queryId":"abcdef0123456789abcdef0123456789","objectIDs":["obj1"],"positions":[1]}"#;
         let event: InsightEvent = serde_json::from_str(json).unwrap();
         assert_eq!(
             event.query_id.as_deref(),
             Some("abcdef0123456789abcdef0123456789")
+        );
+    }
+
+    #[test]
+    fn pbv3_official_purchase_shape_normalizes_object_data_query_id() {
+        let json = r#"{
+            "eventType":"conversion",
+            "eventSubtype":"purchase",
+            "eventName":"Purchased",
+            "index":"products",
+            "userToken":"018f6b5e-4d3c-7a21-8b9c-0123456789ab",
+            "objectIDs":["sku-1"],
+            "objectData":[{
+                "queryID":"abcdef0123456789abcdef0123456789",
+                "price":19.95,
+                "quantity":2
+            }],
+            "value":39.9,
+            "currency":"USD"
+        }"#;
+        let event: InsightEvent = serde_json::from_str(json).unwrap();
+
+        assert!(event.validate().is_ok());
+        assert_eq!(
+            event.query_id.as_deref(),
+            Some("abcdef0123456789abcdef0123456789")
+        );
+        assert_eq!(event.effective_object_ids(), &["sku-1"]);
+        assert_eq!(event.value, Some(39.9));
+        assert_eq!(event.currency.as_deref(), Some("USD"));
+    }
+
+    #[test]
+    fn pbv3_purchase_rejects_invalid_commercial_fields() {
+        let valid = serde_json::json!({
+            "eventType": "conversion",
+            "eventSubtype": "purchase",
+            "eventName": "Purchased",
+            "index": "products",
+            "userToken": "018f6b5e-4d3c-7a21-8b9c-0123456789ab",
+            "objectIDs": ["sku-1"],
+            "objectData": [{
+                "queryID": "abcdef0123456789abcdef0123456789",
+                "price": 19.95,
+                "quantity": 2
+            }],
+            "value": 39.9,
+            "currency": "USD"
+        });
+        let mut invalid_cases = Vec::new();
+
+        let mut missing_object_data = valid.clone();
+        missing_object_data
+            .as_object_mut()
+            .unwrap()
+            .remove("objectData");
+        invalid_cases.push(missing_object_data);
+
+        let mut zero_price = valid.clone();
+        zero_price["objectData"][0]["price"] = serde_json::json!(0);
+        invalid_cases.push(zero_price);
+
+        let mut zero_quantity = valid.clone();
+        zero_quantity["objectData"][0]["quantity"] = serde_json::json!(0);
+        invalid_cases.push(zero_quantity);
+
+        let mut zero_value = valid.clone();
+        zero_value["value"] = serde_json::json!(0);
+        invalid_cases.push(zero_value);
+
+        let mut malformed_currency = valid;
+        malformed_currency["currency"] = serde_json::json!("usd");
+        invalid_cases.push(malformed_currency);
+
+        for invalid in invalid_cases {
+            assert!(serde_json::from_value::<InsightEvent>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn pbv3_click_after_search_requires_positive_position_and_uuid() {
+        let mut event = valid_event();
+        event.query_id = Some("abcdef0123456789abcdef0123456789".to_string());
+        event.positions = Some(vec![0]);
+        assert!(event.validate().is_err());
+
+        event.positions = Some(vec![1]);
+        event.user_token = "not-a-uuid".to_string();
+        assert!(event.validate().is_err());
+    }
+
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn pbv3_openapi_schema_uses_official_wire_fields() {
+        let schema = serde_json::to_value(<InsightEvent as utoipa::PartialSchema>::schema())
+            .expect("InsightEvent schema must serialize");
+        let properties = schema["properties"]
+            .as_object()
+            .expect("InsightEvent must remain an object schema");
+
+        for field in [
+            "eventType",
+            "eventSubtype",
+            "queryID",
+            "objectIDs",
+            "objectData",
+        ] {
+            assert!(properties.contains_key(field), "missing wire field {field}");
+        }
+        for forbidden in ["event_type", "query_id", "object_ids", "object_data"] {
+            assert!(
+                !properties.contains_key(forbidden),
+                "internal field leaked into wire schema: {forbidden}"
+            );
+        }
+
+        let mut dependencies = Vec::new();
+        <InsightEvent as utoipa::ToSchema>::schemas(&mut dependencies);
+        assert!(
+            dependencies
+                .iter()
+                .any(|(name, _)| name == "InsightEventObjectData"),
+            "objectData component must be registered"
         );
     }
 

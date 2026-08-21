@@ -27,7 +27,10 @@ export default defineConfig({
     baseURL,
     browserName: 'chromium',
     headless: true,
-    trace: 'retain-on-failure',
+    // Native query credentials are intentionally exercised. Persisting a browser
+    // trace would copy them into a test artifact, so this conformance owner keeps
+    // tracing disabled and makes failures rely on redacted assertions/reporting.
+    trace: 'off',
     screenshot: 'only-on-failure',
   },
   webServer: {
@@ -38,8 +41,10 @@ export default defineConfig({
     timeout: 30_000,
     env: {
       VITE_FLAPJACK_URL: process.env.FLAPJACK_URL,
+      VITE_FLAPJACK_APPLICATION_ID: 'flapjack',
       VITE_FLAPJACK_SEARCH_KEY: process.env.REAL_CLIENT_SEARCH_KEY,
       VITE_REAL_CLIENT_INDEX_NAME: process.env.REAL_CLIENT_INDEX_NAME,
+      VITE_REAL_CLIENT_USER_TOKEN: '3f25cf54-46f6-4f67-9ac8-87c4a34c86f1',
     },
   },
 });

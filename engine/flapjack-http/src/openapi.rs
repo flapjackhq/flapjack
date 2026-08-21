@@ -172,6 +172,7 @@ pub const DOCUMENTED_INTERNAL_PATHS: [&str; 5] = [
         // Stage 7: Insights
         crate::handlers::insights::post_events,
         crate::handlers::insights::get_debug_events,
+        crate::handlers::insights::delete_index_usertoken,
         crate::handlers::insights::delete_usertoken,
         // Stage 7: Migration
         crate::handlers::migration::migrate_from_algolia,

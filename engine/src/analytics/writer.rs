@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use super::config::AnalyticsConfig;
 use super::hll::HllSketch;
-use super::manifest::{RollupManifest, WindowEntry, WindowStatus};
+use super::manifest::{manifest_artifact_path, RollupManifest, WindowEntry, WindowStatus};
 use super::schema::{
     insight_event_schema, search_event_schema, search_rollup_schema, InsightEvent, SearchEvent,
 };
@@ -115,10 +115,10 @@ pub fn flush_rollup_window_with_event_count(
     let batch = aggregates_to_rollup_batch(window_start_ms, window_end_ms, aggregates)?;
 
     let tier_dir = config.rollups_dir(index_name, tier);
-    reject_symlink_if_exists(&tier_dir, "rollup dir")?;
+    reject_rollup_path_symlinks(config, index_name, &tier_dir)?;
     fs::create_dir_all(&tier_dir)
         .map_err(|e| format!("Failed to create rollup dir {}: {}", tier_dir.display(), e))?;
-    reject_symlink_if_exists(&tier_dir, "rollup dir")?;
+    reject_rollup_path_symlinks(config, index_name, &tier_dir)?;
     let filename = rollup_window_filename(tier, window_start_ms);
     let parquet_path = tier_dir.join(&filename);
     reject_symlink_if_exists(&parquet_path, "rollup parquet path")?;
@@ -251,16 +251,13 @@ fn require_canonical_hourly_source_coverage(
 /// rollup directory. Daily compaction should only trust plain basenames that
 /// the writer itself emitted, never traversal segments or absolute paths.
 fn manifest_hourly_source_path(hourly_dir: &Path, file_name: &str) -> Result<PathBuf, String> {
-    let candidate = Path::new(file_name);
-    let mut components = candidate.components();
-    match (components.next(), components.next()) {
-        (Some(std::path::Component::Normal(_)), None) => Ok(hourly_dir.join(candidate)),
-        _ => Err(format!(
+    manifest_artifact_path(hourly_dir, file_name).map_err(|_| {
+        format!(
             "invalid certified hourly source filename '{}': must stay inside {}",
             file_name,
             hourly_dir.display()
-        )),
-    }
+        )
+    })
 }
 
 #[derive(Debug)]
@@ -806,6 +803,23 @@ fn reject_symlink_if_exists(path: &Path, path_role: &str) -> Result<(), String> 
             error
         )),
     }
+}
+
+fn reject_rollup_path_symlinks(
+    config: &AnalyticsConfig,
+    index_name: &str,
+    tier_dir: &Path,
+) -> Result<(), String> {
+    let paths = config.target_artifact_paths(index_name);
+    for (path, role) in [
+        (paths.data_dir.as_path(), "analytics root"),
+        (paths.index_root.as_path(), "analytics index root"),
+        (paths.rollups_dir.as_path(), "rollups parent"),
+        (tier_dir, "rollup dir"),
+    ] {
+        reject_symlink_if_exists(path, role)?;
+    }
+    Ok(())
 }
 
 /// UTC date string (YYYY-MM-DD) for the start of a rollup window, used as the
@@ -1463,6 +1477,61 @@ mod tests {
         assert!(
             err.contains("refusing symlinked rollup dir"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn flush_rollup_window_rejects_symlinked_rollups_parent() {
+        let tmp = TempDir::new().unwrap();
+        let config = rollup_test_config(&tmp);
+        let start = base_ts_2025_06_15_noon();
+        seed_raw_events(&config, &fixture_events(start), "2025-06-15");
+
+        let paths = config.target_artifact_paths("products");
+        let outside_rollups = tmp.path().join("outside-rollups");
+        let outside_hourly = outside_rollups.join("1hour");
+        fs::create_dir_all(&outside_hourly).unwrap();
+        let victim_path = outside_hourly.join("victim.parquet");
+        let victim_bytes = b"must survive symlinked rollups parent";
+        fs::write(&victim_path, victim_bytes).unwrap();
+
+        let mut manifest = RollupManifest::new("products");
+        manifest
+            .record_window(
+                "1hour",
+                "2025-06-15",
+                WindowEntry {
+                    start_ms: start,
+                    end_ms: start + 3_600_000,
+                    status: WindowStatus::Closed,
+                    event_count: 7,
+                    file: "victim.parquet".to_string(),
+                },
+                &outside_hourly,
+            )
+            .unwrap();
+        manifest
+            .save(&outside_rollups.join("manifest.json"))
+            .unwrap();
+        symlink(&outside_rollups, &paths.rollups_dir).unwrap();
+
+        let error = flush_rollup_window(&config, "products", "1hour", start, start + 3_600_000)
+            .expect_err("rollup writer must reject a symlinked rollups parent");
+        assert!(
+            error.contains("refusing symlinked rollups parent"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read(&victim_path).unwrap(),
+            victim_bytes,
+            "writer must not delete through a symlinked rollups parent"
+        );
+        assert!(
+            !outside_hourly
+                .join(rollup_window_filename("1hour", start))
+                .exists(),
+            "writer must not publish through a symlinked rollups parent"
         );
     }
 
@@ -2633,5 +2702,66 @@ mod tests {
             original_bytes,
             "failed manifest load must restore the previous hourly parquet bytes"
         );
+    }
+
+    fn assert_corrupt_replacement_artifact_fails_closed(use_absolute_path: bool) {
+        let tmp = TempDir::new().unwrap();
+        let config = rollup_test_config(&tmp);
+        let base_ts = base_ts_2025_06_15_noon();
+        seed_raw_events(&config, &fixture_events(base_ts), "2025-06-15");
+
+        let (start, end) = hour_window_ms(2025, 6, 15, 12);
+        let hourly_path = flush_rollup_window(&config, "products", "1hour", start, end).unwrap();
+        let original_bytes = fs::read(&hourly_path).unwrap();
+
+        let victim_path = tmp.path().join("victim.parquet");
+        let victim_bytes = b"must survive corrupt manifest replacement";
+        fs::write(&victim_path, victim_bytes).unwrap();
+
+        let manifest_path = config.rollup_manifest_path("products");
+        let mut manifest = RollupManifest::load(&manifest_path).unwrap();
+        let existing = manifest
+            .tiers
+            .get_mut("1hour")
+            .and_then(|tier| tier.dates.get_mut("2025-06-15"))
+            .and_then(|date| {
+                date.windows
+                    .iter_mut()
+                    .find(|window| window.start_ms == start)
+            })
+            .unwrap();
+        existing.file = if use_absolute_path {
+            victim_path.to_string_lossy().into_owned()
+        } else {
+            "../../../victim.parquet".to_string()
+        };
+        manifest.save(&manifest_path).unwrap();
+
+        let error = flush_rollup_window(&config, "products", "1hour", start, end)
+            .expect_err("corrupt replacement artifact must fail closed");
+        assert!(
+            error.contains("invalid manifest artifact filename"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read(&victim_path).unwrap(),
+            victim_bytes,
+            "corrupt manifest filename must not delete an external file"
+        );
+        assert_eq!(
+            fs::read(&hourly_path).unwrap(),
+            original_bytes,
+            "failed replacement must restore the staged canonical rollup"
+        );
+    }
+
+    #[test]
+    fn flush_rollup_window_replacement_rejects_manifest_traversal() {
+        assert_corrupt_replacement_artifact_fails_closed(false);
+    }
+
+    #[test]
+    fn flush_rollup_window_replacement_rejects_manifest_absolute_path() {
+        assert_corrupt_replacement_artifact_fails_closed(true);
     }
 }

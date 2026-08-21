@@ -187,28 +187,67 @@ impl ReplicationPeerCredential {
     }
 }
 
-pub fn request_application_id(request: &Request) -> Option<String> {
-    let header_value = request
-        .headers()
-        .get("x-algolia-application-id")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned);
-    if header_value.is_some() {
-        return header_value;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CanonicalRequestCredential {
+    pub(crate) value: String,
+    pub(crate) from_query: bool,
+}
+
+/// Extract one Algolia credential without assigning precedence to a transport.
+///
+/// Header lines, comma-combined header values, and repeated query parameters are
+/// one credential set. Every presented value must be non-empty UTF-8 and agree
+/// exactly. The caller separately decides whether the route permits query-string
+/// credentials; keeping collection here gives Search and privileged routes one
+/// canonical disagreement rule.
+pub(crate) fn canonical_request_credential(
+    request: &Request,
+    name: &'static str,
+) -> Result<Option<CanonicalRequestCredential>, ()> {
+    let mut values = Vec::new();
+    for raw in request.headers().get_all(name) {
+        let raw = raw.to_str().map_err(|_| ())?;
+        for value in raw.split(',') {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(());
+            }
+            values.push(value.to_owned());
+        }
     }
 
-    // Algolia's official browser requester sends both compatibility credentials in
-    // the query string to avoid a CORS preflight. Application IDs are public routing
-    // identifiers, so accepting this transport does not weaken the separate API-key
-    // rule that still forbids URL credentials on privileged operational routes.
-    request.uri().query().and_then(|query| {
-        url::form_urlencoded::parse(query.as_bytes())
-            .find(|(name, _)| name == "x-algolia-application-id")
-            .map(|(_, value)| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-    })
+    let mut from_query = false;
+    if let Some(query) = request.uri().query() {
+        for (_, value) in url::form_urlencoded::parse(query.as_bytes())
+            .filter(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        {
+            from_query = true;
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(());
+            }
+            values.push(value.to_owned());
+        }
+    }
+
+    let Some(first) = values.first() else {
+        return Ok(None);
+    };
+    if values.iter().any(|value| value != first) {
+        return Err(());
+    }
+
+    Ok(Some(CanonicalRequestCredential {
+        value: first.clone(),
+        from_query,
+    }))
+}
+
+pub fn request_application_id(request: &Request) -> Option<String> {
+    canonical_request_credential(request, "x-algolia-application-id")
+        .ok()
+        .flatten()
+        .map(|credential| credential.value)
 }
 
 /// Canonical set of valid Algolia ACL values. Algolia has NO `admin` ACL.

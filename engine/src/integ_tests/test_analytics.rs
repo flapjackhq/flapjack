@@ -51,6 +51,14 @@ fn save_manifest(base: &std::path::Path, index: &str, manifest: &RollupManifest)
     manifest.save(&manifest_path).unwrap();
 }
 
+fn write_certified_hourly_artifacts(base: &std::path::Path, index: &str, windows: &[WindowEntry]) {
+    let tier_dir = base.join(index).join("rollups").join("1hour");
+    std::fs::create_dir_all(&tier_dir).unwrap();
+    for window in windows {
+        std::fs::write(tier_dir.join(&window.file), b"certified rollup").unwrap();
+    }
+}
+
 /// Verify that partitions older than the retention window are evicted while recent ones are preserved.
 #[test]
 fn removes_old_partitions() {
@@ -59,20 +67,20 @@ fn removes_old_partitions() {
         .format("%Y-%m-%d")
         .to_string();
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    create_partition(tmp.path(), "products", "searches", &old_date);
-    create_partition(tmp.path(), "products", "searches", &today);
+    create_partition(tmp.path(), "products", "events", &old_date);
+    create_partition(tmp.path(), "products", "events", &today);
     let removed = cleanup_old_partitions(tmp.path(), 90).unwrap();
     assert_eq!(removed, 1);
     assert!(!tmp
         .path()
         .join("products")
-        .join("searches")
+        .join("events")
         .join(format!("date={}", old_date))
         .exists());
     assert!(tmp
         .path()
         .join("products")
-        .join("searches")
+        .join("events")
         .join(format!("date={}", today))
         .exists());
 }
@@ -110,6 +118,23 @@ fn retention_removes_only_expired_legacy_full_ip_partition() {
         "2024-04-01",
         &["198.51.100.23"],
     );
+    let date = "2024-03-01";
+    let windows = certified_hourly_windows(date);
+    write_certified_hourly_artifacts(tmp.path(), "products", &windows);
+    let mut manifest = RollupManifest::new("products");
+    let mut tier = TierState {
+        dates: HashMap::new(),
+    };
+    tier.dates.insert(
+        date.to_string(),
+        DateState {
+            total_event_count: windows.iter().map(|window| window.event_count).sum(),
+            windows,
+            complete: true,
+        },
+    );
+    manifest.tiers.insert("1hour".to_string(), tier);
+    save_manifest(tmp.path(), "products", &manifest);
 
     let removed = cleanup_old_partitions_at(
         tmp.path(),
@@ -140,9 +165,9 @@ fn cleans_multiple_indices() {
         .to_string();
     create_partition(tmp.path(), "products", "searches", &old_date);
     create_partition(tmp.path(), "products", "events", &old_date);
-    create_partition(tmp.path(), "articles", "searches", &old_date);
+    create_partition(tmp.path(), "articles", "events", &old_date);
     let removed = cleanup_old_partitions(tmp.path(), 90).unwrap();
-    assert_eq!(removed, 3);
+    assert_eq!(removed, 2);
 }
 
 #[test]
@@ -211,6 +236,7 @@ fn retention_gate_deletes_certified_partitions() {
 
     let mut manifest = RollupManifest::new(index);
     let windows = certified_hourly_windows(date);
+    write_certified_hourly_artifacts(tmp.path(), index, &windows);
     let total_event_count = windows.iter().map(|window| window.event_count).sum();
     let mut tier = TierState {
         dates: HashMap::new(),
@@ -241,6 +267,8 @@ fn retention_gate_deletes_certified_partitions() {
 
 use crate::analytics::schema::InsightEvent;
 
+const VALID_SELECTED_USER_TOKEN: &str = "00000000-0000-4000-8000-000000000000";
+
 /// Build a valid click `InsightEvent` with a correlated query ID, one object, and position 1.
 fn valid_click() -> InsightEvent {
     InsightEvent {
@@ -248,7 +276,7 @@ fn valid_click() -> InsightEvent {
         event_subtype: None,
         event_name: "Product Click".to_string(),
         index: "products".to_string(),
-        user_token: "user123".to_string(),
+        user_token: VALID_SELECTED_USER_TOKEN.to_string(),
         authenticated_user_token: None,
         query_id: Some("a".repeat(32)),
         object_ids: vec!["obj1".to_string()],
@@ -268,7 +296,7 @@ fn valid_conversion() -> InsightEvent {
         event_subtype: None,
         event_name: "Purchase".to_string(),
         index: "products".to_string(),
-        user_token: "user123".to_string(),
+        user_token: VALID_SELECTED_USER_TOKEN.to_string(),
         authenticated_user_token: None,
         query_id: Some("b".repeat(32)),
         object_ids: vec!["obj1".to_string()],
@@ -360,7 +388,7 @@ fn user_token_too_long() {
 
 #[test]
 fn max_boundary_user_token_129_chars() {
-    let mut e = valid_click();
+    let mut e = valid_view();
     e.user_token = "x".repeat(129);
     assert!(e.validate().is_ok());
 }
@@ -383,7 +411,7 @@ fn user_token_with_special_chars_rejected() {
 
 #[test]
 fn user_token_with_valid_charset_accepted() {
-    let mut e = valid_click();
+    let mut e = valid_view();
     e.user_token = "abc-123_XYZ".to_string();
     assert!(e.validate().is_ok());
 }

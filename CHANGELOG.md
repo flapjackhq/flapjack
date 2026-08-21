@@ -7,6 +7,14 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.15] - 2026-08-20
+
+### Added
+
+- **Paid Beta v3 adds native Algolia-compatible search and Insights Starter endpoints.**
+  Official pinned browser clients work directly against the engine while unsupported and
+  privileged surfaces remain fail-closed.
+
 ## [1.0.14] - 2026-08-19
 
 ### Added

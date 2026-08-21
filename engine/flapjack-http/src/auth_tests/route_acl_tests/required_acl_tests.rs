@@ -122,6 +122,15 @@ fn acl_usertoken_delete_requires_delete_object() {
 }
 
 #[test]
+fn exact_index_usertoken_delete_requires_admin() {
+    assert_required_acl(
+        Method::DELETE,
+        "/1/indexes/products/usertokens/user_123",
+        "admin",
+    );
+}
+
+#[test]
 fn acl_list_indexes() {
     assert_required_acl(Method::GET, "/1/indexes", "listIndexes");
 }
