@@ -207,9 +207,9 @@ impl SynonymStore {
 
     /// Expand a query string into alternative queries by substituting matching synonym terms.
     ///
-    /// For `Regular` synonyms, each whitespace-delimited token is checked against the synonym
-    /// list and replaced with every alternative. For `OneWay` synonyms, the input phrase is
-    /// replaced with each target synonym (but not in reverse). Alt-correction and placeholder
+    /// For `Regular` synonyms, each whitespace-delimited term or phrase is checked against the
+    /// synonym list and replaced with every alternative. For `OneWay` synonyms, the input phrase
+    /// is replaced with each target synonym (but not in reverse). Alt-correction and placeholder
     /// synonyms are not expanded.
     ///
     /// # Returns
@@ -237,6 +237,20 @@ impl SynonymStore {
                             }
                         }
                     }
+                    for phrase in synonyms
+                        .iter()
+                        .filter(|value| value.split_whitespace().count() > 1)
+                    {
+                        for alt in synonyms {
+                            if !alt.eq_ignore_ascii_case(phrase) {
+                                if let Some(new_query) = replace_phrase(query, phrase, alt) {
+                                    if !expanded.contains(&new_query) {
+                                        expanded.push(new_query);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 Synonym::OneWay {
                     input, synonyms, ..
@@ -255,6 +269,42 @@ impl SynonymStore {
         }
 
         expanded
+    }
+}
+
+fn replace_phrase(query: &str, phrase: &str, replacement: &str) -> Option<String> {
+    let query_folded = query.to_ascii_lowercase();
+    let phrase_folded = phrase.to_ascii_lowercase();
+    let mut output = String::with_capacity(query.len() + replacement.len());
+    let mut copied_through = 0;
+    let mut search_from = 0;
+    let mut replaced = false;
+
+    while let Some(relative_start) = query_folded[search_from..].find(&phrase_folded) {
+        let start = search_from + relative_start;
+        let end = start + phrase.len();
+        let starts_at_boundary = start == 0
+            || query[..start]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace);
+        let ends_at_boundary =
+            end == query.len() || query[end..].chars().next().is_some_and(char::is_whitespace);
+
+        if starts_at_boundary && ends_at_boundary {
+            output.push_str(&query[copied_through..start]);
+            output.push_str(replacement);
+            copied_through = end;
+            replaced = true;
+        }
+        search_from = end;
+    }
+
+    if replaced {
+        output.push_str(&query[copied_through..]);
+        Some(output)
+    } else {
+        None
     }
 }
 
@@ -442,6 +492,18 @@ mod tests {
         let expanded = store.expand_query("laptop");
         assert!(expanded.contains(&"laptop".to_string()));
         assert!(expanded.contains(&"notebook".to_string()));
+    }
+
+    #[test]
+    fn expand_regular_multi_word_synonym_on_whitespace_boundaries() {
+        let mut store = SynonymStore::new();
+        store.insert(regular("1", &["aurora", "northern lights"]));
+
+        let expanded = store.expand_query("See NORTHERN LIGHTS tonight");
+        assert!(expanded.contains(&"See aurora tonight".to_string()));
+        assert!(!store
+            .expand_query("prenorthern lights")
+            .contains(&"preaurora".to_string()));
     }
 
     #[test]

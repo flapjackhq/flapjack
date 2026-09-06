@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, Query, State},
     response::IntoResponse,
     response::Response,
-    Json,
+    Extension, Json,
 };
 pub(super) use flapjack::experiments::config::QueryOverrides;
 use flapjack::experiments::{
@@ -24,6 +24,10 @@ use super::dto_algolia::{
     AlgoliaListAbTestsResponse,
 };
 use super::AppState;
+use crate::api_profile::ApiProfile;
+use crate::auth::{
+    invalid_api_credentials_error, key_allows_index, ApiKey, SecuredKeyRestrictions,
+};
 
 mod promote;
 mod resolve;
@@ -39,8 +43,67 @@ use resolve::{
 pub use response_helpers::ConcludedExperimentResponse;
 use response_helpers::{
     algolia_action_response, apply_metrics_to_algolia_response, attach_experiment_warning_header,
-    concluded_experiment_response, experiment_error_to_response, lifecycle_action_response,
+    concluded_experiment_response, experiment_error_to_response, internal_server_error_response,
+    lifecycle_action_response,
 };
+
+fn extension_value<T>(extension: &Option<Extension<T>>) -> Option<&T> {
+    extension.as_ref().map(|Extension(value)| value)
+}
+
+#[allow(clippy::result_large_err)]
+fn enforce_experiment_index_access(
+    api_key: Option<&ApiKey>,
+    secured_restrictions: Option<&SecuredKeyRestrictions>,
+    experiment: &Experiment,
+) -> Result<(), Response> {
+    let Some(api_key) = api_key else {
+        return Ok(());
+    };
+
+    if results::resolve_experiment_index_names(experiment)
+        .iter()
+        .all(|index| key_allows_index(api_key, secured_restrictions, index))
+    {
+        Ok(())
+    } else {
+        Err(invalid_api_credentials_error())
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn load_authorized_experiment(
+    store: &ExperimentStore,
+    uuid: &str,
+    api_key: Option<&ApiKey>,
+    secured_restrictions: Option<&SecuredKeyRestrictions>,
+) -> Result<Experiment, Response> {
+    let experiment = store.get(uuid).map_err(experiment_error_to_response)?;
+    enforce_experiment_index_access(api_key, secured_restrictions, &experiment)?;
+    Ok(experiment)
+}
+
+#[allow(clippy::result_large_err)]
+fn map_experiment_to_algolia(
+    store: &ExperimentStore,
+    experiment: &Experiment,
+    numeric_id: i64,
+) -> Result<dto_algolia::AlgoliaAbTest, Response> {
+    dto_algolia::experiment_to_algolia_with_updated_at(
+        experiment,
+        numeric_id,
+        store.get_last_updated_ms(&experiment.id),
+    )
+    .map_err(|reason| {
+        tracing::error!(
+            experiment_id = %experiment.id,
+            experiment_status = ?experiment.status,
+            reason,
+            "persisted experiment conclusion invariant failed during Algolia read conversion"
+        );
+        internal_server_error_response()
+    })
+}
 pub use schemas::{
     ArmResponse, BayesianResponse, ConcludeExperimentRequest, CreateExperimentRequest,
     GateResponse, GuardRailAlertResponse, InterleavingResponse, ListExperimentsQuery,
@@ -208,16 +271,14 @@ pub async fn list_experiments(
     let page: Vec<(Experiment, i64)> = exp_with_ids.into_iter().skip(offset).take(limit).collect();
     let count = page.len();
 
-    let abtests: Vec<_> = page
+    let abtests: Vec<_> = match page
         .iter()
-        .map(|(exp, numeric_id)| {
-            dto_algolia::experiment_to_algolia_with_updated_at(
-                exp,
-                *numeric_id,
-                store.get_last_updated_ms(&exp.id),
-            )
-        })
-        .collect();
+        .map(|(experiment, numeric_id)| map_experiment_to_algolia(store, experiment, *numeric_id))
+        .collect::<Result<Vec<_>, Response>>()
+    {
+        Ok(abtests) => abtests,
+        Err(response) => return response,
+    };
 
     let abtests = if total == 0 { None } else { Some(abtests) };
 
@@ -251,19 +312,25 @@ pub async fn list_experiments(
 pub async fn get_experiment(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
 ) -> Response {
     let (store, uuid, numeric_id) = match resolve_store_and_experiment_id(&state, &id) {
         Ok(values) => values,
         Err(response) => return response,
     };
 
-    match store.get(&uuid) {
+    match load_authorized_experiment(
+        store,
+        &uuid,
+        extension_value(&api_key),
+        extension_value(&secured_restrictions),
+    ) {
         Ok(experiment) => {
-            let mut payload = dto_algolia::experiment_to_algolia_with_updated_at(
-                &experiment,
-                numeric_id,
-                store.get_last_updated_ms(&experiment.id),
-            );
+            let mut payload = match map_experiment_to_algolia(store, &experiment, numeric_id) {
+                Ok(payload) => payload,
+                Err(response) => return response,
+            };
 
             if let Some(engine) = state.analytics_engine.as_ref() {
                 let index_names = results::resolve_experiment_index_names(&experiment);
@@ -290,7 +357,7 @@ pub async fn get_experiment(
 
             Json(payload).into_response()
         }
-        Err(err) => experiment_error_to_response(err),
+        Err(response) => response,
     }
 }
 
@@ -323,6 +390,8 @@ pub async fn get_experiment(
 pub async fn update_experiment(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
     Json(body): Json<CreateExperimentRequest>,
 ) -> Response {
     let (store, uuid, numeric_id) = match resolve_store_and_experiment_id(&state, &id) {
@@ -330,9 +399,14 @@ pub async fn update_experiment(
         Err(response) => return response,
     };
 
-    let existing = match store.get(&uuid) {
+    let existing = match load_authorized_experiment(
+        store,
+        &uuid,
+        extension_value(&api_key),
+        extension_value(&secured_restrictions),
+    ) {
         Ok(experiment) => experiment,
-        Err(err) => return experiment_error_to_response(err),
+        Err(response) => return response,
     };
 
     let updated = Experiment {
@@ -354,13 +428,19 @@ pub async fn update_experiment(
         interleaving: body.interleaving.or(existing.interleaving),
     };
 
+    if let Err(response) = enforce_experiment_index_access(
+        extension_value(&api_key),
+        extension_value(&secured_restrictions),
+        &updated,
+    ) {
+        return response;
+    }
+
     match store.update(updated) {
-        Ok(experiment) => Json(dto_algolia::experiment_to_algolia_with_updated_at(
-            &experiment,
-            numeric_id,
-            store.get_last_updated_ms(&experiment.id),
-        ))
-        .into_response(),
+        Ok(experiment) => match map_experiment_to_algolia(store, &experiment, numeric_id) {
+            Ok(payload) => Json(payload).into_response(),
+            Err(response) => response,
+        },
         Err(err) => experiment_error_to_response(err),
     }
 }
@@ -388,15 +468,22 @@ pub async fn update_experiment(
 pub async fn delete_experiment(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
 ) -> Response {
     let (store, uuid, numeric_id) = match resolve_store_and_experiment_id(&state, &id) {
         Ok(values) => values,
         Err(response) => return response,
     };
 
-    let experiment = match store.get(&uuid) {
-        Ok(exp) => exp,
-        Err(err) => return experiment_error_to_response(err),
+    let experiment = match load_authorized_experiment(
+        store,
+        &uuid,
+        extension_value(&api_key),
+        extension_value(&secured_restrictions),
+    ) {
+        Ok(experiment) => experiment,
+        Err(response) => return response,
     };
 
     let index_name = experiment.index_name.clone();
@@ -436,8 +523,16 @@ pub async fn delete_experiment(
 pub async fn start_experiment(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
 ) -> Response {
-    lifecycle_action_response(&state, &id, ExperimentStore::start)
+    lifecycle_action_response(
+        &state,
+        &id,
+        extension_value(&api_key),
+        extension_value(&secured_restrictions),
+        ExperimentStore::start,
+    )
 }
 
 /// Stop a running experiment, freezing its traffic assignment.
@@ -470,8 +565,16 @@ pub async fn start_experiment(
 pub async fn stop_experiment(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
 ) -> Response {
-    lifecycle_action_response(&state, &id, ExperimentStore::stop)
+    lifecycle_action_response(
+        &state,
+        &id,
+        extension_value(&api_key),
+        extension_value(&secured_restrictions),
+        ExperimentStore::stop,
+    )
 }
 
 /// Concludes an experiment, optionally promotes the winning variant settings,
@@ -499,12 +602,34 @@ pub async fn stop_experiment(
 pub async fn conclude_experiment(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
+    api_profile: Option<Extension<ApiProfile>>,
     Json(body): Json<ConcludeExperimentRequest>,
 ) -> Response {
     let (store, uuid) = match resolve_store_and_experiment_uuid(&state, &id) {
         Ok(values) => values,
         Err(response) => return response,
     };
+
+    if let Err(response) = load_authorized_experiment(
+        store,
+        &uuid,
+        extension_value(&api_key),
+        extension_value(&secured_restrictions),
+    ) {
+        return response;
+    }
+
+    if body.promoted
+        && api_profile.as_ref().is_some_and(|Extension(profile)| {
+            matches!(profile, ApiProfile::PaidBetaV4 | ApiProfile::PaidBetaV5)
+        })
+    {
+        return experiment_error_to_response(ExperimentError::InvalidConfig(
+            "promoted=true is not supported under restricted paid beta profiles".to_string(),
+        ));
+    }
 
     let winner = match validate_conclusion_winner(body.winner) {
         Ok(winner) => winner,

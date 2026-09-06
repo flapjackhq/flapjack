@@ -2,6 +2,25 @@ use flapjack::index::oplog::OpLogEntry;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Opt-in release transport headers layered over the existing replication
+/// endpoints. Legacy peer traffic omits the contract header and keeps its
+/// existing JSON wire format; release orchestration must bind every response
+/// to one tenant and one exact source sequence interval.
+pub const RELEASE_TRANSFER_CONTRACT_HEADER: &str = "x-flapjack-release-transfer";
+pub const RELEASE_TRANSFER_CONTRACT_V1: &str = "one-uid-contiguous-v1";
+pub const RELEASE_TRANSFER_TENANT_HEADER: &str = "x-flapjack-release-transfer-tenant";
+pub const RELEASE_TRANSFER_AFTER_SEQ_HEADER: &str = "x-flapjack-release-transfer-after-seq";
+pub const RELEASE_TRANSFER_THROUGH_SEQ_HEADER: &str = "x-flapjack-release-transfer-through-seq";
+pub const RELEASE_TRANSFER_STATUS_HEADER: &str = "x-flapjack-release-transfer-status";
+pub const RELEASE_TRANSFER_STATUS_CONTIGUOUS: &str = "contiguous";
+pub const RELEASE_TRANSFER_STATUS_RESNAPSHOT_REQUIRED: &str = "resnapshot_required";
+pub const RELEASE_TRANSFER_STATUS_ACKNOWLEDGED: &str = "acknowledged";
+pub const RELEASE_TRANSFER_SNAPSHOT_SHA256_HEADER: &str =
+    "x-flapjack-release-transfer-snapshot-sha256";
+pub const RELEASE_TRANSFER_TRANSACTION_HEADER: &str = "x-flapjack-release-transfer-transaction";
+pub const RELEASE_TRANSFER_PAYLOAD_SHA256_HEADER: &str =
+    "x-flapjack-release-transfer-payload-sha256";
+
 /// Request to replicate operations to a peer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicateOpsRequest {

@@ -408,6 +408,27 @@ async fn test_set_settings_pagination_limited_to_roundtrip() {
     assert_eq!(json["paginationLimitedTo"], serde_json::json!(50));
 }
 
+#[tokio::test]
+async fn test_set_settings_index_languages_roundtrip() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let app = settings_router(state);
+
+    let response = post_settings(&app, r#"{"indexLanguages":["en"]}"#).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let response_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        response_json.get("unsupportedParams").is_none(),
+        "indexLanguages must be handled rather than silently reported unsupported: {response_json}"
+    );
+
+    let settings = get_settings_json(&app).await;
+    assert_eq!(settings["indexLanguages"], serde_json::json!(["en"]));
+}
+
 /// TODO: Document test_set_settings_reindexes_existing_documents_for_facets.
 #[tokio::test]
 async fn test_set_settings_reindexes_existing_documents_for_facets() {

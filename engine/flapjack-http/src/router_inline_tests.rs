@@ -1041,6 +1041,125 @@ async fn metrics_returns_200_with_admin_key_only() {
     assert!(value > 0.0, "expected positive oplog seq, got: {value}");
 }
 
+#[tokio::test]
+async fn internal_count_only_search_returns_no_hits_and_does_not_meter() {
+    use flapjack::types::{Document, FieldValue};
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+
+    let tmp = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let (app, state) = build_test_router_with_state(&tmp, Some(key_store));
+
+    state.manager.create_tenant("recovery_probe").unwrap();
+    state
+        .manager
+        .add_documents_sync(
+            "recovery_probe",
+            vec![
+                Document {
+                    id: "one".to_string(),
+                    fields: HashMap::from([(
+                        "name".to_string(),
+                        FieldValue::Text("recovery fixture".to_string()),
+                    )]),
+                },
+                Document {
+                    id: "two".to_string(),
+                    fields: HashMap::from([(
+                        "name".to_string(),
+                        FieldValue::Text("recovery fixture".to_string()),
+                    )]),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    state
+        .usage_counters
+        .entry("recovery_probe".to_string())
+        .or_default()
+        .search_count
+        .store(7, Ordering::Relaxed);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/internal/indexes/recovery_probe/count")
+                .header("content-type", "application/json")
+                .header("x-algolia-application-id", "recovery-controller")
+                .header("x-algolia-api-key", "admin-key")
+                .body(Body::from(
+                    serde_json::json!({"query": "recovery", "hitsPerPage": 0}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "index": "recovery_probe",
+            "status": "ready",
+            "nbHits": 2
+        })
+    );
+    assert!(
+        body.get("hits").is_none(),
+        "internal probe must not return documents"
+    );
+    assert_eq!(
+        state
+            .usage_counters
+            .get("recovery_probe")
+            .unwrap()
+            .search_count
+            .load(Ordering::Relaxed),
+        7,
+        "internal recovery verification must not mutate customer search usage"
+    );
+}
+
+#[tokio::test]
+async fn internal_count_only_search_requires_admin_auth_and_zero_hits_per_page() {
+    let tmp = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let app = build_test_router(&tmp, Some(key_store));
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/internal/indexes/recovery_probe/count")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":"","hitsPerPage":0}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::FORBIDDEN);
+
+    let nonzero_page_size = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/internal/indexes/recovery_probe/count")
+                .header("content-type", "application/json")
+                .header("x-algolia-application-id", "recovery-controller")
+                .header("x-algolia-api-key", "admin-key")
+                .body(Body::from(r#"{"query":"","hitsPerPage":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(nonzero_page_size.status(), StatusCode::BAD_REQUEST);
+}
+
 /// Proves that the `DefaultBodyLimit` layer returns HTTP 413 with an
 /// Algolia-compatible JSON error when the request body exceeds the configured
 /// `FLAPJACK_MAX_BODY_MB`. The `ensure_json_errors` middleware wraps the
@@ -1086,5 +1205,47 @@ async fn oversized_body_returns_413_json_error() {
     assert!(
         body["message"].as_str().is_some(),
         "JSON error wrapper must include a message string"
+    );
+}
+
+#[tokio::test]
+async fn release_fence_blocks_mutations_without_blocking_safe_post_reads() {
+    let tmp = TempDir::new().unwrap();
+    let (app, state) = build_test_router_with_state(&tmp, None);
+    state
+        .global_mutation_fence
+        .acquire("release-test-transaction")
+        .await
+        .unwrap();
+
+    let mutation = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/1/indexes/products")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"objectID":"blocked"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mutation.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let safe_read = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/1/indexes/products/query")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":""}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        safe_read.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "POST search is a read and must remain available while writes are fenced"
     );
 }

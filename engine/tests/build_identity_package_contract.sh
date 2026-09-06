@@ -257,6 +257,299 @@ package_binary() {
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=lib/build_identity_package_assertions.sh
 source "$SCRIPT_DIR/lib/build_identity_package_assertions.sh"
+
+assert_legacy_predecessor_normalization() {
+  local fixture_root="$TMP_ROOT/legacy_normalization"
+  local binary="$fixture_root/flapjack"
+  local seed="$fixture_root/seed"
+  local expected="$fixture_root/expected-coordinate.json"
+  local receipt="$fixture_root/build-packet.json"
+  local legacy_manifest="$fixture_root/flapjack-aarch64-unknown-linux-musl.manifest.json"
+  local legacy_archive="$seed/flapjack-aarch64-unknown-linux-musl.tar.gz"
+  local output_one="$fixture_root/normalized-one"
+  local output_two="$fixture_root/normalized-two"
+  local mutant_root="$fixture_root/mutants"
+  local target="aarch64-unknown-linux-musl"
+
+  mkdir -p "$seed" "$mutant_root"
+  python3 - "$binary" <<'PY'
+import json
+import pathlib
+import sys
+
+binary = pathlib.Path(sys.argv[1])
+build = {
+    "schemaVersion": 1,
+    "version": "1.0.16",
+    "revision": "a" * 40,
+    "revisionKnown": True,
+    "dirty": None,
+    "dirtyKnown": False,
+    "workspaceDigest": "b" * 64,
+    "profile": "release",
+    "target": "aarch64-unknown-linux-musl",
+    "features": ["vector-search"],
+    "capabilities": {"vectorSearch": True, "vectorSearchLocal": False},
+}
+record = json.dumps(build, sort_keys=True, separators=(",", ":"))
+binary.write_text(
+    "#!/bin/sh\n"
+    ": <<'BUILD_INFO'\n"
+    "FLAPJACK_BUILD_INFO_JSON_BEGIN\n"
+    f"{record}\n"
+    "FLAPJACK_BUILD_INFO_JSON_END\n"
+    "BUILD_INFO\n"
+    "exit 99\n"
+)
+binary.chmod(0o755)
+PY
+
+  "$PACKAGE_HELPER" "$target" "$binary" "$seed" >/dev/null
+  python3 - "$seed/flapjack-${target}.manifest.json" "$legacy_manifest" \
+    "$legacy_archive" "$binary" "$receipt" "$expected" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+current_path = pathlib.Path(sys.argv[1])
+legacy_path = pathlib.Path(sys.argv[2])
+archive_path = pathlib.Path(sys.argv[3])
+binary_path = pathlib.Path(sys.argv[4])
+receipt_path = pathlib.Path(sys.argv[5])
+expected_path = pathlib.Path(sys.argv[6])
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+current = json.loads(current_path.read_text())
+artifact = dict(current["artifact"])
+del artifact["binarySha256"]
+legacy = {"schemaVersion": 1, "artifact": artifact, "build": current["build"]}
+legacy_path.write_text(json.dumps(legacy, sort_keys=True, separators=(",", ":")) + "\n")
+receipt = {
+    "validationFjcloudRevision": "c" * 40,
+    "canonicalFjcloudRevision": "d" * 40,
+    "fjcloudTree": "e" * 40,
+    "flapjackRevision": current["build"]["revision"],
+    "flapjackTree": "f" * 40,
+    "target": current["build"]["target"],
+    "archiveSha256": digest(archive_path),
+    "manifestSha256": digest(legacy_path),
+    "binarySha256": digest(binary_path),
+}
+receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+expected = {
+    "schemaVersion": 1,
+    "kind": "flapjack_legacy_predecessor_v1",
+    "sourceSha": receipt["flapjackRevision"],
+    "sourceTree": receipt["flapjackTree"],
+    "target": receipt["target"],
+    "receiptSha256": digest(receipt_path),
+    "manifestSha256": receipt["manifestSha256"],
+    "archiveSha256": receipt["archiveSha256"],
+    "binarySha256": receipt["binarySha256"],
+}
+expected_path.write_text(json.dumps(expected, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+
+  "$PACKAGE_HELPER" --normalize-legacy-predecessor \
+    "$expected" "$receipt" "$legacy_manifest" "$legacy_archive" "$output_one" >/dev/null
+  "$PACKAGE_HELPER" --normalize-legacy-predecessor \
+    "$expected" "$receipt" "$legacy_manifest" "$legacy_archive" "$output_two" >/dev/null
+
+  python3 - "$expected" "$receipt" "$legacy_manifest" "$legacy_archive" "$output_one" "$output_two" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+expected_path = pathlib.Path(sys.argv[1])
+receipt_path = pathlib.Path(sys.argv[2])
+legacy_manifest_path = pathlib.Path(sys.argv[3])
+legacy_archive_path = pathlib.Path(sys.argv[4])
+first = pathlib.Path(sys.argv[5])
+second = pathlib.Path(sys.argv[6])
+target = "aarch64-unknown-linux-musl"
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+receipt = json.loads(receipt_path.read_text())
+manifest_name = f"flapjack-{target}.manifest.json"
+archive_name = f"flapjack-{target}.tar.gz"
+evidence_name = f"flapjack-{target}.normalization.json"
+for name in (manifest_name, archive_name, archive_name + ".sha256", evidence_name):
+    if (first / name).read_bytes() != (second / name).read_bytes():
+        raise SystemExit(f"normalization is not deterministic for {name}")
+
+manifest = json.loads((first / manifest_name).read_text())
+legacy = json.loads(legacy_manifest_path.read_text())
+evidence_path = first / evidence_name
+evidence = json.loads(evidence_path.read_text())
+if evidence["expectedCoordinateSha256"] != digest(expected_path):
+    raise SystemExit("normalization evidence does not bind the immutable expected coordinate")
+if manifest["schemaVersion"] != 2 or manifest["build"] != legacy["build"]:
+    raise SystemExit("normalization did not preserve the build identity in schema 2")
+if manifest["artifact"]["binarySha256"] != receipt["binarySha256"]:
+    raise SystemExit("normalization did not preserve the exact binary identity")
+if digest(first / archive_name) != receipt["archiveSha256"]:
+    raise SystemExit("deterministic repackaging changed canonical archive bytes")
+if evidence["original"] != {
+    "receiptSha256": digest(receipt_path),
+    "manifestSha256": digest(legacy_manifest_path),
+    "archiveSha256": digest(legacy_archive_path),
+    "binarySha256": receipt["binarySha256"],
+    "manifestSchemaVersion": 1,
+}:
+    raise SystemExit("normalization evidence does not bind exact original coordinates")
+normalized = evidence["normalized"]
+if normalized["manifestSha256"] != digest(first / manifest_name):
+    raise SystemExit("normalization evidence does not bind the schema-2 manifest")
+if normalized["archiveSha256"] != digest(first / archive_name):
+    raise SystemExit("normalization evidence does not bind the normalized archive")
+if normalized["binarySha256"] != receipt["binarySha256"]:
+    raise SystemExit("normalization evidence does not bind the unchanged binary")
+canonical = json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n"
+if evidence_path.read_text() != canonical:
+    raise SystemExit("normalization evidence is not canonical JSON")
+PY
+
+  if "$PACKAGE_HELPER" --normalize-legacy-predecessor \
+    "$expected" "$receipt" "$legacy_manifest" "$legacy_archive" "$output_one" >/dev/null 2>&1; then
+    die "legacy normalization overwrote an existing create-once output"
+  fi
+
+  python3 - "$expected" "$receipt" "$legacy_manifest" "$legacy_archive" "$mutant_root" <<'PY'
+import gzip
+import hashlib
+import json
+import pathlib
+import sys
+import tarfile
+
+expected_path = pathlib.Path(sys.argv[1])
+receipt_path = pathlib.Path(sys.argv[2])
+manifest_path = pathlib.Path(sys.argv[3])
+archive_path = pathlib.Path(sys.argv[4])
+root = pathlib.Path(sys.argv[5])
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def write_json(path, value):
+    path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+receipt = json.loads(receipt_path.read_text())
+manifest = json.loads(manifest_path.read_text())
+expected = json.loads(expected_path.read_text())
+
+# Same semantic tuple but different receipt bytes must not satisfy the expected
+# immutable receipt digest.
+write_json(root / "reserialized-receipt.json", receipt)
+
+boolean_expected = dict(expected)
+boolean_expected["schemaVersion"] = True
+write_json(root / "boolean-expected.json", boolean_expected)
+
+wrong_kind_expected = dict(expected)
+wrong_kind_expected["kind"] = "public_release_tag_v1"
+write_json(root / "wrong-kind-expected.json", wrong_kind_expected)
+
+wrong_digest = dict(receipt)
+wrong_digest["archiveSha256"] = "0" * 64
+write_json(root / "wrong-digest-receipt.json", wrong_digest)
+
+boolean_manifest = json.loads(json.dumps(manifest))
+boolean_manifest["schemaVersion"] = True
+write_json(root / "boolean-schema-manifest.json", boolean_manifest)
+boolean_receipt = dict(receipt)
+boolean_receipt["manifestSha256"] = digest(root / "boolean-schema-manifest.json")
+write_json(root / "boolean-schema-receipt.json", boolean_receipt)
+
+wrong_target = dict(receipt)
+wrong_target["target"] = "x86_64-unknown-linux-musl"
+write_json(root / "wrong-target-receipt.json", wrong_target)
+
+with tarfile.open(archive_path, "r:gz") as archive:
+    member = next(member for member in archive.getmembers() if member.isfile())
+    handle = archive.extractfile(member)
+    if handle is None:
+        raise SystemExit("fixture binary missing")
+    changed_binary = handle.read() + b"changed"
+changed_archive = root / "changed-binary.tar.gz"
+with changed_archive.open("wb") as output:
+    with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.GNU_FORMAT) as archive:
+            directory = tarfile.TarInfo(".")
+            directory.type = tarfile.DIRTYPE
+            directory.mode = 0o755
+            directory.mtime = 0
+            archive.addfile(directory)
+            binary = tarfile.TarInfo("./flapjack")
+            binary.size = len(changed_binary)
+            binary.mode = 0o755
+            binary.mtime = 0
+            import io
+            archive.addfile(binary, io.BytesIO(changed_binary))
+changed_manifest = json.loads(json.dumps(manifest))
+changed_manifest["artifact"]["sha256"] = digest(changed_archive)
+write_json(root / "changed-binary-manifest.json", changed_manifest)
+changed_receipt = dict(receipt)
+changed_receipt["archiveSha256"] = digest(changed_archive)
+changed_receipt["manifestSha256"] = digest(root / "changed-binary-manifest.json")
+# Keep the authoritative original binary digest. Coherently changing archive and
+# manifest must not launder a changed executable through the receipt.
+write_json(root / "changed-binary-receipt.json", changed_receipt)
+PY
+
+  local status=0
+  "$PACKAGE_HELPER" --normalize-legacy-predecessor \
+    "$expected" "$mutant_root/reserialized-receipt.json" "$legacy_manifest" "$legacy_archive" \
+    "$mutant_root/out-reserialized-receipt" >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || die "legacy normalization ignored the immutable receipt byte digest"
+  status=0
+  "$PACKAGE_HELPER" --normalize-legacy-predecessor \
+    "$mutant_root/boolean-expected.json" "$receipt" "$legacy_manifest" "$legacy_archive" \
+    "$mutant_root/out-boolean-expected" >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || die "legacy normalization accepted boolean expected-coordinate schemaVersion"
+  status=0
+  "$PACKAGE_HELPER" --normalize-legacy-predecessor \
+    "$mutant_root/wrong-kind-expected.json" "$receipt" "$legacy_manifest" "$legacy_archive" \
+    "$mutant_root/out-wrong-kind" >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || die "legacy normalization accepted a foreign expected-coordinate kind"
+  status=0
+  "$PACKAGE_HELPER" --normalize-legacy-predecessor \
+    "$expected" "$mutant_root/wrong-digest-receipt.json" "$legacy_manifest" "$legacy_archive" \
+    "$mutant_root/out-wrong-digest" >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || die "legacy normalization accepted a wrong receipt digest"
+  status=0
+  "$PACKAGE_HELPER" --normalize-legacy-predecessor \
+    "$expected" "$mutant_root/boolean-schema-receipt.json" "$mutant_root/boolean-schema-manifest.json" \
+    "$legacy_archive" "$mutant_root/out-boolean-schema" >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || die "legacy normalization accepted boolean manifest schemaVersion"
+  status=0
+  "$PACKAGE_HELPER" --normalize-legacy-predecessor \
+    "$expected" "$mutant_root/wrong-target-receipt.json" "$legacy_manifest" "$legacy_archive" \
+    "$mutant_root/out-wrong-target" >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || die "legacy normalization accepted the wrong target"
+  status=0
+  "$PACKAGE_HELPER" --normalize-legacy-predecessor \
+    "$expected" "$mutant_root/changed-binary-receipt.json" "$mutant_root/changed-binary-manifest.json" \
+    "$mutant_root/changed-binary.tar.gz" "$mutant_root/out-changed-binary" \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] \
+    || die "legacy normalization accepted a coherent foreign same-version binary tuple"
+
+  log "legacy predecessor normalization contract passed for $target"
+}
 # Distinguishes a host/toolchain locality failure (which must DEFER, not fail)
 # from a real passthrough defect. Only concrete failure signatures belong here.
 # The container prints a benign "expected behaviour if you are running under
@@ -574,9 +867,9 @@ if first["build"].get("profile") != "release":
     raise SystemExit("build.profile must be release")
 if set(first["build"].get("capabilities") or {}) != {"vectorSearch", "vectorSearchLocal"}:
     raise SystemExit(f"capability keys are not canonical: {first['build'].get('capabilities')}")
-if first.get("schemaVersion") != 1:
-    raise SystemExit("schemaVersion must be 1")
-if set(artifact) != {"file", "target", "arch", "profile", "sha256"}:
+if first.get("schemaVersion") != 2:
+    raise SystemExit("schemaVersion must be 2")
+if set(artifact) != {"file", "target", "arch", "profile", "binarySha256", "sha256"}:
     raise SystemExit(f"artifact keys mismatch: {sorted(artifact)}")
 
 archive_sha = hashlib.sha256(archive.read_bytes()).hexdigest()
@@ -607,10 +900,16 @@ TMP_ROOT="$(mktemp -d)"
 case "${1:-}" in
   --foreign-target-only)
     assert_foreign_target_manifest_contract "$PACKAGE_HELPER" "foreign_target"
+    assert_compatibility_contract_rejects_ambiguous_claims
+    assert_target_specific_predecessor_selection
     assert_malformed_embedded_records_rejected
     assert_traversal_target_rejected_without_outside_write
     assert_incomplete_build_record_rejected
     log "foreign target manifest contract passed for $FOREIGN_TARGET"
+    exit 0
+    ;;
+  --legacy-normalization-only)
+    assert_legacy_predecessor_normalization
     exit 0
     ;;
   --linux-musl-native-mismatch-only)
@@ -637,9 +936,12 @@ case "${1:-}" in
     ;;
   "")
     assert_foreign_target_manifest_contract "$PACKAGE_HELPER" "foreign_target"
+    assert_compatibility_contract_rejects_ambiguous_claims
+    assert_target_specific_predecessor_selection
     assert_malformed_embedded_records_rejected
     assert_traversal_target_rejected_without_outside_write
     assert_incomplete_build_record_rejected
+    assert_legacy_predecessor_normalization
     ;;
   *)
     die "unknown argument: $1"

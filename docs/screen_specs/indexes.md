@@ -2,7 +2,7 @@
 
 ## Task
 
-Choose an index to search and confirm its exact record count and stored byte count.
+Choose an index to search and inspect its exact record count and stored byte count when available.
 
 ## Layout
 
@@ -22,11 +22,12 @@ Choose an index to search and confirm its exact record count and stored byte cou
 
 ### Empty
 
-- `No indexes yet.` is shown only after a successful empty response.
+- `No indexes yet.` is shown only after a successful response with no indexes.
 
 ### Populated
 
 - Name, entry count, and literal byte count come directly from the normalized transport contract. Host-only metadata is not invented.
+- When counts are unavailable, the index remains visible and searchable while Entries and Data size each show `Unavailable`.
 
 ## Navigation
 
@@ -37,6 +38,7 @@ Choose an index to search and confirm its exact record count and stored byte cou
 ## Acceptance criteria
 
 - Given a successful response, each exact normalized index value is visible in transport order.
+- Given an index with unavailable counts, its row and Search action remain visible and both count cells show `Unavailable`.
 - Given a failed response, retry makes exactly one new list request.
 - Selecting an index focuses the Search query input and makes zero search requests.
 

@@ -3,8 +3,13 @@ import type { DashboardCreateExperimentPayload } from '../../src/lib/experiment-
 import {
   createExperiment,
   deleteExperiment,
+  flushAnalytics,
+  getExperimentResults,
   listExperiments,
+  sendEvents,
   type ExperimentRecord,
+  type ExperimentResultsRecord,
+  type InsightEvent,
 } from './api-helpers';
 import { API_BASE, API_HEADERS } from './local-instance';
 
@@ -127,4 +132,162 @@ export async function seedRouteAuditExperiment(
     status: 'draft',
     primaryMetricLabel: 'CTR',
   };
+}
+
+type ExperimentBatchResult = {
+  abTestVariantID?: unknown;
+  hits?: Array<{ objectID?: unknown }>;
+  queryID?: unknown;
+};
+
+const EXPERIMENT_BATCH_LIMIT = 50;
+const EXPERIMENT_SEARCHES_PER_ARM = 200;
+const EXPERIMENT_CONTROL_CLICKS = 190;
+
+async function runExperimentBatch(
+  request: APIRequestContext,
+  indexName: string,
+  userTokens: string[],
+  analytics: boolean,
+): Promise<ExperimentBatchResult[]> {
+  const response = await request.post(`${API_BASE}/1/indexes/*/queries`, {
+    headers: API_HEADERS,
+    data: {
+      requests: userTokens.map((userToken) => ({
+        indexName,
+        query: 'apple',
+        userToken,
+        analytics,
+        clickAnalytics: analytics,
+        hitsPerPage: 1,
+      })),
+    },
+  });
+  if (!response.ok()) {
+    throw new Error(`experiment batch failed (${response.status()}): ${await response.text()}`);
+  }
+
+  const body = await response.json() as { results?: ExperimentBatchResult[] };
+  if (!Array.isArray(body.results) || body.results.length !== userTokens.length) {
+    throw new Error('experiment batch returned an unexpected result count');
+  }
+  return body.results;
+}
+
+function readAssignedArm(result: ExperimentBatchResult): 'control' | 'variant' | null {
+  return result.abTestVariantID === 'control' || result.abTestVariantID === 'variant'
+    ? result.abTestVariantID
+    : null;
+}
+
+function clickEventForResult(
+  result: ExperimentBatchResult,
+  indexName: string,
+  userToken: string,
+  arm: 'control' | 'variant',
+  ordinal: number,
+): InsightEvent {
+  const queryID = typeof result.queryID === 'string' ? result.queryID : null;
+  const objectID = Array.isArray(result.hits) && typeof result.hits[0]?.objectID === 'string'
+    ? result.hits[0].objectID
+    : null;
+  if (!queryID || !objectID) {
+    throw new Error(`tracked ${arm} search ${ordinal} lacked queryID or objectID`);
+  }
+
+  return {
+    eventType: 'click',
+    eventName: `deterministic-experiment-${arm}-${ordinal}`,
+    index: indexName,
+    userToken,
+    objectIDs: [objectID],
+    positions: [1],
+    queryID,
+  };
+}
+
+function assertKnownExperimentResults(results: ExperimentResultsRecord): void {
+  const control = results.control as Record<string, unknown>;
+  const variant = results.variant as Record<string, unknown>;
+  if (
+    control.searches !== EXPERIMENT_SEARCHES_PER_ARM
+    || variant.searches !== EXPERIMENT_SEARCHES_PER_ARM
+    || control.clicks !== EXPERIMENT_CONTROL_CLICKS
+    || variant.clicks !== EXPERIMENT_SEARCHES_PER_ARM
+    || control.ctr !== 0.95
+    || variant.ctr !== 1
+  ) {
+    throw new Error(`unexpected deterministic experiment results: ${JSON.stringify({ control, variant })}`);
+  }
+}
+
+function deterministicCandidateUserToken(index: number): string {
+  return `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, '0')}`;
+}
+
+/**
+ * Seed one stable token per arm with eight bounded 50-query batches.
+ *
+ * A single analytics-disabled candidate batch resolves both assignments. The
+ * selected tokens are then reused, proving stable-userToken behavior without
+ * a sequential arm-discovery loop or NaN-based minimum-N shortcut.
+ */
+export async function seedDeterministicExperimentTraffic(
+  request: APIRequestContext,
+  experimentId: string,
+  indexName: string,
+): Promise<ExperimentResultsRecord> {
+  const candidateTokens = Array.from(
+    { length: EXPERIMENT_BATCH_LIMIT },
+    (_, index) => deterministicCandidateUserToken(index),
+  );
+  const candidateResults = await runExperimentBatch(
+    request,
+    indexName,
+    candidateTokens,
+    false,
+  );
+  const tokenByArm = new Map<'control' | 'variant', string>();
+  candidateResults.forEach((result, index) => {
+    const arm = readAssignedArm(result);
+    if (arm && !tokenByArm.has(arm)) {
+      tokenByArm.set(arm, candidateTokens[index]);
+    }
+  });
+
+  const controlToken = tokenByArm.get('control');
+  const variantToken = tokenByArm.get('variant');
+  if (!controlToken || !variantToken) {
+    throw new Error('deterministic candidate batch did not contain both experiment arms');
+  }
+
+  const clickEvents: InsightEvent[] = [];
+  for (const [arm, userToken] of [
+    ['control', controlToken],
+    ['variant', variantToken],
+  ] as const) {
+    for (let batch = 0; batch < EXPERIMENT_SEARCHES_PER_ARM / EXPERIMENT_BATCH_LIMIT; batch += 1) {
+      const batchResults = await runExperimentBatch(
+        request,
+        indexName,
+        Array(EXPERIMENT_BATCH_LIMIT).fill(userToken),
+        true,
+      );
+      batchResults.forEach((result, index) => {
+        const ordinal = batch * EXPERIMENT_BATCH_LIMIT + index;
+        if (readAssignedArm(result) !== arm) {
+          throw new Error(`${arm} stable userToken changed assignment at search ${ordinal}`);
+        }
+        if (arm === 'variant' || ordinal < EXPERIMENT_CONTROL_CLICKS) {
+          clickEvents.push(clickEventForResult(result, indexName, userToken, arm, ordinal));
+        }
+      });
+    }
+  }
+
+  await sendEvents(request, clickEvents);
+  await flushAnalytics(request, indexName);
+  const results = await getExperimentResults(request, experimentId);
+  assertKnownExperimentResults(results);
+  return results;
 }

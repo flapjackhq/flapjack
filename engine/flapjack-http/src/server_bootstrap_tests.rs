@@ -5,12 +5,16 @@ use super::{
 use crate::api_profile::ApiProfile;
 use crate::startup::{acquire_data_dir_process_lock, ServerConfig};
 use crate::test_helpers::{EnvVarRestoreGuard, ENV_MUTEX};
+use flapjack::analytics::schema::SearchEvent;
 use flapjack::index::oplog::OpLogEntry;
+use flapjack_replication::autoheal::{AutohealJournal, EvictionDecision};
 use flapjack_replication::config::{NodeConfig, PeerConfig};
 use flapjack_replication::manager::ReplicationManager;
 use flapjack_replication::peer::REPLICATION_PEER_APPLICATION_ID;
 use serde_json::Value;
+use std::io::Write;
 use std::net::SocketAddr;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -220,6 +224,105 @@ async fn serve_startup_uses_configured_peer_credential_for_outbound_replication(
     )));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn infrastructure_manager_deletion_uses_its_configured_analytics_collector() {
+    let _env_lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let data_dir = tempfile::tempdir().unwrap();
+    let analytics_dir = tempfile::tempdir().unwrap();
+    let _analytics_enabled = EnvVarRestoreGuard::set("FLAPJACK_ANALYTICS_ENABLED", "true");
+    let _analytics_dir = EnvVarRestoreGuard::set(
+        "FLAPJACK_ANALYTICS_DIR",
+        analytics_dir.path().to_str().unwrap(),
+    );
+    let server_config = server_config_for_data_dir(&data_dir, None);
+    let infrastructure = crate::server::initialize_server_infrastructure(
+        &server_config,
+        data_dir.path(),
+        Some("admin-secret".to_string()),
+        server_config.node_config.clone(),
+    )
+    .await
+    .unwrap();
+    let tenant = "startup-analytics-delete";
+    infrastructure.manager.create_tenant(tenant).unwrap();
+    infrastructure
+        .analytics_collector
+        .record_search(SearchEvent {
+            timestamp_ms: 1_700_000_000_000,
+            query: "query".to_string(),
+            query_id: Some("startup-query-id".to_string()),
+            index_name: tenant.to_string(),
+            nb_hits: 1,
+            processing_time_ms: 1,
+            user_token: Some("user-1".to_string()),
+            user_ip: None,
+            filters: None,
+            facets: None,
+            analytics_tags: None,
+            page: 0,
+            hits_per_page: 20,
+            has_results: true,
+            country: None,
+            region: None,
+            experiment_id: None,
+            variant_id: None,
+            assignment_method: None,
+        });
+    infrastructure.analytics_collector.flush_searches();
+    let analytics_root = infrastructure
+        .analytics_config
+        .target_artifact_paths(tenant)
+        .index_root;
+    assert!(analytics_root.is_dir());
+
+    infrastructure
+        .manager
+        .delete_tenant(&tenant.to_string())
+        .await
+        .unwrap();
+
+    assert!(
+        !analytics_root.exists(),
+        "the initialized manager must purge through the returned collector"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_task_orchestrator_registers_storage_maintenance_semantically() {
+    let _env_lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let data_dir = tempfile::tempdir().unwrap();
+    let server_config = server_config_for_data_dir(&data_dir, None);
+    let infrastructure = crate::server::initialize_server_infrastructure(
+        &server_config,
+        data_dir.path(),
+        Some("admin-secret".to_string()),
+        server_config.node_config.clone(),
+    )
+    .await
+    .unwrap();
+    let state = crate::server_init::initialize_state(
+        &infrastructure,
+        None,
+        data_dir.path().to_str().unwrap(),
+        Instant::now(),
+    )
+    .unwrap();
+
+    let _registration =
+        crate::background_tasks::spawn_background_tasks(&state, &infrastructure).unwrap();
+
+    assert!(
+        state
+            .background_task_health
+            .is_running_for_test("storage-maintenance"),
+        "the actual background-task orchestrator must register supervised storage maintenance"
+    );
+}
+
 #[tokio::test]
 async fn serve_startup_without_peer_key_does_not_send_admin_key_to_peers() {
     let data_dir = tempfile::tempdir().unwrap();
@@ -378,6 +481,145 @@ async fn bootstrap_join_posts_identity_merges_status_and_persists_membership() {
             "peers": serde_json::to_value(&config.peers).unwrap()
         })
     );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // Process-global env guard must span startup.
+async fn active_release_fence_suppresses_bootstrap_and_preserves_startup_state() {
+    let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+    let _allow_cleartext =
+        EnvVarRestoreGuard::set("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS", "1");
+    let (bootstrap_peer, _client, mut server) = spawn_fake_bootstrap(vec![(
+        500,
+        serde_json::json!({"message": "must not be reached"}).to_string(),
+    )])
+    .await;
+    let bootstrap_peer = bootstrap_peer.replace("bootstrap.test", "127.0.0.1");
+    let data_dir = tempfile::tempdir().unwrap();
+    let mut journal = AutohealJournal::new(data_dir.path()).unwrap();
+    journal
+        .record_eviction_intent(
+            &["node-b".to_string(), "node-c".to_string()],
+            "node-b",
+            None,
+            EvictionDecision::Evict {
+                node_id: "node-b".to_string(),
+                reason: "test dangling intent".to_string(),
+            },
+        )
+        .unwrap();
+    let journal_path = AutohealJournal::path_in_data_dir(data_dir.path());
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&journal_path)
+        .unwrap()
+        .write_all(br#"{"decision_id":"partial"#)
+        .unwrap();
+    let journal_before = std::fs::read(&journal_path).unwrap();
+    let membership_before = br#"{"node_id":"joiner-a","peers":[],"sentinel":"unchanged"}\n"#;
+    let membership_path = data_dir.path().join("node.json");
+    std::fs::write(&membership_path, membership_before).unwrap();
+    let fence = crate::pause_registry::GlobalMutationFence::open(data_dir.path()).unwrap();
+    fence.acquire("release-active-startup-1").await.unwrap();
+
+    let server_config = server_config_for_data_dir(&data_dir, None);
+    let infrastructure = crate::server::initialize_server_infrastructure(
+        &server_config,
+        data_dir.path(),
+        Some("admin-secret".to_string()),
+        bootstrap_node_config(bootstrap_peer),
+    )
+    .await
+    .unwrap();
+    let replication_manager = infrastructure
+        .replication_manager
+        .as_ref()
+        .expect("bootstrap intent should initialize replication");
+    let fence_for_admission = infrastructure.global_mutation_fence.clone();
+    replication_manager.start_health_probe_with_admission(1, true, move || {
+        let fence = fence_for_admission.clone();
+        async move { fence.admit_mutation().await.ok() }
+    });
+
+    assert!(
+        tokio::time::timeout(tokio::time::Duration::from_millis(75), &mut server)
+            .await
+            .is_err(),
+        "active release fence must suppress all bootstrap HTTP"
+    );
+    server.abort();
+    assert_eq!(std::fs::read(&membership_path).unwrap(), membership_before);
+    assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+    assert_eq!(infrastructure.node_config.peers, Vec::<PeerConfig>::new());
+    assert_eq!(
+        infrastructure
+            .global_mutation_fence
+            .status()
+            .await
+            .unwrap()
+            .transaction_id,
+        "release-active-startup-1"
+    );
+
+    infrastructure
+        .global_mutation_fence
+        .release("release-active-startup-1")
+        .await
+        .unwrap();
+    tokio::time::timeout(tokio::time::Duration::from_secs(3), async {
+        loop {
+            let content = std::fs::read_to_string(&journal_path).unwrap();
+            if !content.contains("partial") && content.contains("eviction_recovery") {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first admitted autoheal pass should repair the journal once");
+    assert!(replication_manager.stop_health_probe());
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // Process-global env guard must span startup.
+async fn released_fence_retains_ordinary_bootstrap_join() {
+    let _guard = ENV_MUTEX.lock().expect("env mutex should lock");
+    let _allow_cleartext =
+        EnvVarRestoreGuard::set("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS", "1");
+    let status = serde_json::json!({
+        "node_id": "bootstrap-a",
+        "replication_enabled": true,
+        "peers": [{
+            "peer_id": "node-c",
+            "addr": "https://node-c.example.com:7700",
+            "status": "healthy",
+            "last_success_secs_ago": 1
+        }]
+    });
+    let (bootstrap_peer, _client, server) = spawn_fake_bootstrap(vec![
+        (200, serde_json::json!({"ok": true}).to_string()),
+        (200, status.to_string()),
+    ])
+    .await;
+    let bootstrap_peer = bootstrap_peer.replace("bootstrap.test", "127.0.0.1");
+    let data_dir = tempfile::tempdir().unwrap();
+    let fence = crate::pause_registry::GlobalMutationFence::open(data_dir.path()).unwrap();
+    fence.acquire("release-complete-startup-1").await.unwrap();
+    fence.release("release-complete-startup-1").await.unwrap();
+    let server_config = server_config_for_data_dir(&data_dir, None);
+
+    let infrastructure = crate::server::initialize_server_infrastructure(
+        &server_config,
+        data_dir.path(),
+        Some("admin-secret".to_string()),
+        bootstrap_node_config(bootstrap_peer),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(server.await.unwrap().len(), 2);
+    assert_eq!(infrastructure.node_config.peers.len(), 2);
+    assert_eq!(infrastructure.replication_manager.unwrap().peer_count(), 2);
 }
 
 #[allow(clippy::await_holding_lock)] // Process-global env guard must span bootstrap.

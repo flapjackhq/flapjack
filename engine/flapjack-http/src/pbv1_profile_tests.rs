@@ -8,20 +8,24 @@ use tower::ServiceExt;
 use tracing_subscriber::prelude::*;
 
 use crate::api_profile::{
-    prepare_paid_beta_v1_batch, prepare_paid_beta_v3_batch, ApiProfile, ApiProfileConfigError,
-    FLAPJACK_API_PROFILE_ENV, PAID_BETA_V1_DIRECT_SEARCH_PATH, PAID_BETA_V1_SEARCH_PARAMS,
-    PAID_BETA_V3_EVENTS_PATH, PAID_BETA_V3_SEARCH_PARAMS,
+    prepare_paid_beta_v1_batch, prepare_paid_beta_v3_batch, prepare_paid_beta_v4_batch,
+    prepare_paid_beta_v5_batch, ApiProfile, ApiProfileConfigError, FLAPJACK_API_PROFILE_ENV,
+    PAID_BETA_V1_DIRECT_SEARCH_PATH, PAID_BETA_V1_SEARCH_PARAMS, PAID_BETA_V3_EVENTS_PATH,
+    PAID_BETA_V3_SEARCH_PARAMS,
 };
+use crate::auth::session::DashboardSessionStore;
+use crate::auth::session_cookie::DASHBOARD_SESSION_COOKIE_NAME;
 use crate::auth::{ApiKey, KeyStore};
 use crate::middleware::TrustedProxyMatcher;
-use crate::router::{build_router, RouterConfig};
+use crate::router::{build_router, RouterConfig, PBV4_CRAWLER_ROUTES_ENABLED};
 use crate::startup::CorsMode;
-use crate::test_helpers::{body_json, SharedLogBuffer, TestStateBuilder};
+use crate::test_helpers::{body_json, build_test_router, SharedLogBuffer, TestStateBuilder};
 
 const ADMIN_KEY: &str = "pbv1-admin-key";
 const INDEX_NAME: &str = "tenant_123_products";
 const DIRECT_SEARCH_PATH: &str = "/1/indexes/*/queries";
 const PEER_KEY: &str = "pbv1-replication-peer-key";
+const RECOMMEND_ANALYTICS_PATH: &str = "/internal/recommendations/analytics?index=tenant_123_products&model=trending-items&startDate=2026-08-01&endDate=2026-08-01";
 
 struct PbV1Fixture {
     _tmp: TempDir,
@@ -65,6 +69,16 @@ fn build_profile_router_with_replication(
     profile: ApiProfile,
     replication_api_key: Option<String>,
 ) -> axum::Router {
+    build_profile_router_with_options(tmp, key_store, profile, replication_api_key, true)
+}
+
+fn build_profile_router_with_options(
+    tmp: &TempDir,
+    key_store: Arc<KeyStore>,
+    profile: ApiProfile,
+    replication_api_key: Option<String>,
+    disable_dashboard: bool,
+) -> axum::Router {
     let state = TestStateBuilder::new(tmp).with_analytics().build_shared();
     state.manager.create_tenant(INDEX_NAME).unwrap();
     let analytics_config = AnalyticsConfig {
@@ -82,7 +96,7 @@ fn build_profile_router_with_replication(
         tmp.path(),
         RouterConfig {
             cors_mode: CorsMode::LoopbackOnly,
-            disable_dashboard: true,
+            disable_dashboard,
             replication_api_key,
             api_profile: profile,
         },
@@ -113,6 +127,39 @@ fn pbv3_fixture() -> PbV1Fixture {
         key_store,
         search_key,
     }
+}
+
+fn pbv4_fixture() -> PbV1Fixture {
+    let tmp = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), ADMIN_KEY));
+    let (_, search_key) = key_store.create_key(api_key(&["search", "browse"], &[INDEX_NAME], 0));
+    let app = build_profile_router(&tmp, Arc::clone(&key_store), ApiProfile::PaidBetaV4);
+    PbV1Fixture {
+        _tmp: tmp,
+        app,
+        key_store,
+        search_key,
+    }
+}
+
+fn pbv5_fixture() -> (PbV1Fixture, String) {
+    let tmp = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), ADMIN_KEY));
+    let (_, search_key) = key_store.create_key(api_key(&["search", "browse"], &[INDEX_NAME], 0));
+    let session_token = DashboardSessionStore::open(tmp.path(), ADMIN_KEY)
+        .unwrap()
+        .mint_session()
+        .unwrap();
+    let app = build_profile_router(&tmp, Arc::clone(&key_store), ApiProfile::PaidBetaV5);
+    (
+        PbV1Fixture {
+            _tmp: tmp,
+            app,
+            key_store,
+            search_key,
+        },
+        session_token,
+    )
 }
 
 fn direct_request(
@@ -175,6 +222,263 @@ fn admin_request(method: Method, path: &str, body: serde_json::Value) -> Request
         .header("x-algolia-api-key", ADMIN_KEY)
         .body(Body::from(body.to_string()))
         .unwrap()
+}
+
+fn crawler_profile_request(
+    method: Method,
+    path: &str,
+    application_id: Option<&str>,
+    api_key: Option<&str>,
+    session_token: Option<&str>,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json");
+    if let Some(application_id) = application_id {
+        builder = builder.header("x-algolia-application-id", application_id);
+    }
+    if let Some(api_key) = api_key {
+        builder = builder.header("x-algolia-api-key", api_key);
+    }
+    if let Some(session_token) = session_token {
+        builder = builder.header(
+            "cookie",
+            format!("{DASHBOARD_SESSION_COOKIE_NAME}={session_token}"),
+        );
+    }
+    builder.body(Body::from("{}")).unwrap()
+}
+
+#[tokio::test]
+async fn pbv5_real_router_mounts_recommend_analytics_only_for_exact_node_admin_auth() {
+    let (fixture, _) = pbv5_fixture();
+
+    let mounted = fixture
+        .app
+        .clone()
+        .oneshot(admin_request(
+            Method::GET,
+            RECOMMEND_ANALYTICS_PATH,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(mounted.status(), StatusCode::OK);
+    let mounted_body = body_json(mounted).await;
+    assert_eq!(mounted_body["index"], INDEX_NAME);
+    assert_eq!(mounted_body["model"], "trending-items");
+
+    let customer_key = fixture
+        .app
+        .clone()
+        .oneshot(managed_search_request(
+            Method::GET,
+            RECOMMEND_ANALYTICS_PATH,
+            &fixture.search_key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(customer_key.status(), StatusCode::NOT_FOUND);
+
+    let missing_auth = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(RECOMMEND_ANALYTICS_PATH)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_auth.status(), StatusCode::NOT_FOUND);
+
+    for fixture in [pbv1_fixture(), pbv3_fixture(), pbv4_fixture()] {
+        let earlier_profile = fixture
+            .app
+            .oneshot(admin_request(
+                Method::GET,
+                RECOMMEND_ANALYTICS_PATH,
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(earlier_profile.status(), StatusCode::NOT_FOUND);
+    }
+
+    let no_auth_tmp = TempDir::new().unwrap();
+    let no_auth = build_test_router(&no_auth_tmp, None)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(RECOMMEND_ANALYTICS_PATH)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_auth.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn pbv5_real_router_conceals_all_crawler_operations_unless_both_credentials_are_exact() {
+    let (fixture, session_token) = pbv5_fixture();
+    let non_v7_run_id = "00000000-0000-4000-8000-000000000000";
+    for (method, path, expected_boundary) in [
+        (
+            Method::POST,
+            "/internal/crawler/runs".to_string(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            Method::GET,
+            format!("/internal/crawler/runs/{non_v7_run_id}"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::POST,
+            format!("/internal/crawler/runs/{non_v7_run_id}/cancel"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::POST,
+            format!("/internal/crawler/runs/{non_v7_run_id}/ack"),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        for (application_id, api_key, session, case) in [
+            (None, Some(ADMIN_KEY), None, "missing application ID"),
+            (
+                Some("another-application"),
+                Some(ADMIN_KEY),
+                None,
+                "wrong application ID",
+            ),
+            (Some("flapjack"), None, None, "missing key"),
+            (Some("flapjack"), Some("invalid-key"), None, "invalid key"),
+            (
+                Some("flapjack"),
+                Some(fixture.search_key.as_str()),
+                None,
+                "non-admin key",
+            ),
+            (
+                Some("flapjack"),
+                None,
+                Some(session_token.as_str()),
+                "dashboard session without direct admin key",
+            ),
+        ] {
+            let concealed = fixture
+                .app
+                .clone()
+                .oneshot(crawler_profile_request(
+                    method.clone(),
+                    &path,
+                    application_id,
+                    api_key,
+                    session,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                concealed.status(),
+                StatusCode::NOT_FOUND,
+                "{case} leaked {method} {path}"
+            );
+        }
+
+        let mounted = fixture
+            .app
+            .clone()
+            .oneshot(crawler_profile_request(
+                method.clone(),
+                &path,
+                Some("flapjack"),
+                Some(ADMIN_KEY),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            mounted.status(),
+            expected_boundary,
+            "fixed application ID and admin key did not reach {method} {path}"
+        );
+
+        for query in [
+            format!("{path}?x-algolia-api-key={ADMIN_KEY}"),
+            format!("{path}?x-algolia-application-id=flapjack&x-algolia-api-key={ADMIN_KEY}"),
+        ] {
+            let query_substitute = fixture
+                .app
+                .clone()
+                .oneshot(crawler_profile_request(
+                    method.clone(),
+                    &query,
+                    Some("flapjack"),
+                    None,
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                query_substitute.status(),
+                StatusCode::NOT_FOUND,
+                "query credentials substituted for direct headers on {method} {path}"
+            );
+        }
+    }
+
+    let correct_customer = fixture
+        .app
+        .clone()
+        .oneshot(managed_search_request(
+            Method::POST,
+            DIRECT_SEARCH_PATH,
+            &fixture.search_key,
+            pbv3_query_batch(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(correct_customer.status(), StatusCode::OK);
+    for (api_key, session, case) in [
+        (Some(fixture.search_key.as_str()), None, "customer key"),
+        (None, Some(session_token.as_str()), "dashboard session"),
+    ] {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(DIRECT_SEARCH_PATH)
+            .header("content-type", "application/json")
+            .header("x-algolia-application-id", "another-application");
+        if let Some(api_key) = api_key {
+            builder = builder.header("x-algolia-api-key", api_key);
+        }
+        if let Some(session) = session {
+            builder = builder.header(
+                "cookie",
+                format!("{DASHBOARD_SESSION_COOKIE_NAME}={session}"),
+            );
+        }
+        let wrong_application = fixture
+            .app
+            .clone()
+            .oneshot(
+                builder
+                    .body(Body::from(pbv3_query_batch().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            wrong_application.status(),
+            StatusCode::FORBIDDEN,
+            "PBV5 {case} bypassed the fixed customer application ID"
+        );
+    }
 }
 
 fn valid_batch() -> serde_json::Value {
@@ -341,6 +645,205 @@ fn pbv3_profile_parser_and_parameter_inventory_are_explicit() {
     assert_eq!(
         ApiProfile::PaidBetaV3.validate_auth_enabled(false),
         Err(ApiProfileConfigError::AuthenticationRequired)
+    );
+}
+
+#[test]
+fn pbv4_profile_parser_is_exact_and_requires_authentication() {
+    let profile = ApiProfile::from_optional_value(Some("paid_beta_v4"))
+        .expect("the managed PBV4 profile must parse exactly");
+    assert_eq!(profile.as_str(), "paid_beta_v4");
+    assert_eq!(
+        profile.validate_auth_enabled(false),
+        Err(ApiProfileConfigError::AuthenticationRequired)
+    );
+    assert_eq!(
+        ApiProfile::from_optional_value(Some("paid-beta-v4")),
+        Err(ApiProfileConfigError::UnknownValue(
+            "paid-beta-v4".to_string()
+        ))
+    );
+
+    let key = api_key(&["search", "browse"], &[INDEX_NAME], 0);
+    assert_eq!(
+        format!(
+            "{:?}",
+            prepare_paid_beta_v4_batch(pbv3_allowed_params_batch(), Some(&key)).unwrap()
+        ),
+        format!(
+            "{:?}",
+            prepare_paid_beta_v3_batch(pbv3_allowed_params_batch(), Some(&key)).unwrap()
+        ),
+        "PBV4's customer data plane must inherit PBV3 exactly"
+    );
+}
+
+#[test]
+fn pbv5_profile_parser_is_exact_and_inherits_pbv4_customer_search() {
+    let profile = ApiProfile::from_optional_value(Some("paid_beta_v5"))
+        .expect("the managed PBV5 profile must parse exactly");
+    assert_eq!(profile.as_str(), "paid_beta_v5");
+    assert_eq!(
+        profile.validate_auth_enabled(false),
+        Err(ApiProfileConfigError::AuthenticationRequired)
+    );
+    assert_eq!(
+        ApiProfile::from_optional_value(Some("paid-beta-v5")),
+        Err(ApiProfileConfigError::UnknownValue(
+            "paid-beta-v5".to_string()
+        ))
+    );
+
+    let key = api_key(&["search", "browse"], &[INDEX_NAME], 0);
+    assert_eq!(
+        format!(
+            "{:?}",
+            prepare_paid_beta_v5_batch(pbv3_allowed_params_batch(), Some(&key)).unwrap()
+        ),
+        format!(
+            "{:?}",
+            prepare_paid_beta_v4_batch(pbv3_allowed_params_batch(), Some(&key)).unwrap()
+        ),
+        "PBV5's customer search data plane must inherit PBV4 exactly"
+    );
+}
+
+#[tokio::test]
+async fn pbv4_managed_surface_is_exact_and_crawler_stays_hidden() {
+    assert!(!PBV4_CRAWLER_ROUTES_ENABLED);
+    let fixture = pbv4_fixture();
+
+    let search = fixture
+        .app
+        .clone()
+        .oneshot(managed_search_request(
+            Method::POST,
+            DIRECT_SEARCH_PATH,
+            &fixture.search_key,
+            pbv3_query_batch(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(search.status(), StatusCode::OK);
+
+    let events = fixture
+        .app
+        .clone()
+        .oneshot(managed_search_request(
+            Method::POST,
+            PAID_BETA_V3_EVENTS_PATH,
+            &fixture.search_key,
+            serde_json::json!({"events": []}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(events.status(), StatusCode::OK);
+
+    for path in [DIRECT_SEARCH_PATH, PAID_BETA_V3_EVENTS_PATH] {
+        assert_eq!(
+            fixture
+                .app
+                .clone()
+                .oneshot(pbv3_preflight(path, "POST"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK,
+            "PBV4 must preserve PBV3 CORS on {path}"
+        );
+    }
+
+    for (method, path) in [
+        (Method::GET, "/dashboard/"),
+        (Method::GET, "/swagger-ui/"),
+        (Method::GET, "/api-docs/openapi.json"),
+        (Method::GET, "/2/abtests"),
+        (Method::POST, "/1/indexes/*/recommendations"),
+        (Method::POST, "/internal/crawler/runs"),
+        (
+            Method::GET,
+            "/internal/crawler/runs/018f3e2a-7b1c-7d45-8c90-1234567890ab",
+        ),
+        (
+            Method::POST,
+            "/internal/crawler/runs/018f3e2a-7b1c-7d45-8c90-1234567890ab/cancel",
+        ),
+        (
+            Method::POST,
+            "/internal/crawler/runs/018f3e2a-7b1c-7d45-8c90-1234567890ab/ack",
+        ),
+    ] {
+        let customer_response = fixture
+            .app
+            .clone()
+            .oneshot(managed_search_request(
+                method.clone(),
+                path,
+                &fixture.search_key,
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            customer_response.status(),
+            StatusCode::NOT_FOUND,
+            "PBV4 customer surface leaked {path}"
+        );
+
+        if path.starts_with("/internal/crawler/") {
+            let admin_response = fixture
+                .app
+                .clone()
+                .oneshot(admin_request(method, path, serde_json::json!({})))
+                .await
+                .unwrap();
+            assert_eq!(
+                admin_response.status(),
+                StatusCode::NOT_FOUND,
+                "unproven crawler route mounted at {path}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn pbv4_forces_react_dashboard_off_and_reports_profile() {
+    let tmp = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), ADMIN_KEY));
+    let app =
+        build_profile_router_with_options(&tmp, key_store, ApiProfile::PaidBetaV4, None, false);
+
+    let dashboard = app
+        .clone()
+        .oneshot(admin_request(
+            Method::GET,
+            "/dashboard/",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(dashboard.status(), StatusCode::NOT_FOUND);
+
+    let health = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json = body_json(health).await;
+    assert_eq!(json["build"]["apiProfile"], "paid_beta_v4");
+    assert_eq!(
+        json["build"]["supportedApiProfiles"],
+        serde_json::json!([
+            "full",
+            "paid_beta_v1",
+            "paid_beta_v3",
+            "paid_beta_v4",
+            "paid_beta_v5"
+        ])
     );
 }
 
@@ -875,7 +1378,13 @@ async fn pbv1_health_reports_the_active_runtime_profile() {
     assert_eq!(json["build"]["apiProfile"], "paid_beta_v1");
     assert_eq!(
         json["build"]["supportedApiProfiles"],
-        serde_json::json!(["full", "paid_beta_v1", "paid_beta_v3"])
+        serde_json::json!([
+            "full",
+            "paid_beta_v1",
+            "paid_beta_v3",
+            "paid_beta_v4",
+            "paid_beta_v5"
+        ])
     );
 }
 

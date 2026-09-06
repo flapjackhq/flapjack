@@ -219,6 +219,8 @@ pub fn make_test_app_state(
         metrics_state,
         usage_counters: Arc::new(dashmap::DashMap::new()),
         paused_indexes: flapjack_http::pause_registry::PausedIndexes::new(),
+        global_mutation_fence: flapjack_http::pause_registry::GlobalMutationFence::open(data_dir)
+            .expect("integration test data root must host the mutation fence"),
         usage_persistence: None,
         geoip_reader: None,
         notification_service: None,

@@ -1,6 +1,158 @@
 //! Integration tests validating search request parameter parsing, feature interaction, and ranking behavior for advanced search options including syntax features, filtering, faceting, highlighting, synonyms, and exact matching modes.
 use super::*;
 
+#[tokio::test]
+async fn pbv5_exp_004_multi_word_regular_synonyms_affect_http_search() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_basic_search_state(&tmp);
+    let index_name = "pbv5_exp_004_synonyms_idx";
+    create_search_index_with_titles(
+        &state,
+        index_name,
+        &["Aurora field guide", "Northern lights guide"],
+    )
+    .await;
+
+    let mut store = flapjack::index::synonyms::SynonymStore::new();
+    store.insert(flapjack::index::synonyms::Synonym::Regular {
+        object_id: "aurora-rule".to_string(),
+        synonyms: vec![
+            "aurora".to_string(),
+            "glow".to_string(),
+            "northern lights".to_string(),
+        ],
+    });
+    store
+        .save(
+            state
+                .manager
+                .base_path
+                .join(index_name)
+                .join("synonyms.json"),
+        )
+        .unwrap();
+    state.manager.invalidate_synonyms_cache(index_name);
+    let app = search_router(state);
+
+    let phrase = post_search(
+        &app,
+        index_name,
+        json!({"query": "northern lights", "analytics": false}),
+        None,
+    )
+    .await;
+    assert_eq!(phrase.status(), StatusCode::OK);
+    assert!(hit_ids(&body_json(phrase).await).contains(&"doc_0".to_string()));
+
+    let reverse = post_search(
+        &app,
+        index_name,
+        json!({"query": "aurora", "analytics": false}),
+        None,
+    )
+    .await;
+    assert_eq!(reverse.status(), StatusCode::OK);
+    assert!(hit_ids(&body_json(reverse).await).contains(&"doc_1".to_string()));
+
+    let single = post_search(
+        &app,
+        index_name,
+        json!({"query": "glow", "analytics": false}),
+        None,
+    )
+    .await;
+    assert_eq!(single.status(), StatusCode::OK);
+    assert!(hit_ids(&body_json(single).await).contains(&"doc_0".to_string()));
+
+    let unrelated = post_search(
+        &app,
+        index_name,
+        json!({"query": "sunset", "analytics": false}),
+        None,
+    )
+    .await;
+    assert_eq!(unrelated.status(), StatusCode::OK);
+    assert!(hit_ids(&body_json(unrelated).await).is_empty());
+}
+
+#[tokio::test]
+async fn pbv5_exp_012_query_type_http_validation_and_semantics() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_basic_search_state(&tmp);
+    let index_name = "pbv5_exp_012_query_type_idx";
+    create_search_index_with_titles(
+        &state,
+        index_name,
+        &[
+            "Astrophysics Observatory",
+            "astro Observatory",
+            "astro observ",
+        ],
+    )
+    .await;
+    let app = search_router(state);
+
+    for (query_type, expected) in [
+        ("prefixAll", vec!["doc_0", "doc_1", "doc_2"]),
+        ("prefixLast", vec!["doc_1", "doc_2"]),
+        ("prefixNone", vec!["doc_2"]),
+    ] {
+        let response = post_search(
+            &app,
+            index_name,
+            json!({
+                "query": "astro observ",
+                "queryType": query_type,
+                "analytics": false,
+                "hitsPerPage": 10
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "queryType={query_type}");
+        let ids = hit_ids(&body_json(response).await);
+        for id in &expected {
+            assert!(
+                ids.contains(&(*id).to_string()),
+                "queryType={query_type}: {ids:?}"
+            );
+        }
+        assert_eq!(ids.len(), expected.len(), "queryType={query_type}: {ids:?}");
+    }
+
+    for invalid in [json!(""), json!("unknown"), json!("PrefixLast"), json!(7)] {
+        let string_value = invalid.is_string();
+        let response = post_search(
+            &app,
+            index_name,
+            json!({
+                "query": "astro observ",
+                "queryType": invalid,
+                "analytics": false
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        if string_value {
+            let message = body_json(response).await["message"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            assert!(message.contains("queryType"), "unexpected error: {message}");
+            assert!(message.contains("prefixAll"), "unexpected error: {message}");
+            assert!(
+                message.contains("prefixLast"),
+                "unexpected error: {message}"
+            );
+            assert!(
+                message.contains("prefixNone"),
+                "unexpected error: {message}"
+            );
+        }
+    }
+}
+
 /// Create an index with searchable "title" attribute and add documents using the provided titles as content.
 ///
 /// # Arguments

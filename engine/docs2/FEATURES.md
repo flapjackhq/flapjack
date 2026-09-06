@@ -179,43 +179,26 @@ Env-var details for operational behavior are canonical in
 | Graceful shutdown timeout (Stage 5) | ✅ | `FLAPJACK_SHUTDOWN_TIMEOUT_SECS` controls write-queue drain deadline before forced-exit warning. |
 | Startup dependency summary (Stage 6) | ✅ | Emits a structured `[startup] Dependency status summary` event in both text and JSON logging modes. |
 
-## SDK & Widget Compatibility
+## Client compatibility
 
-**Read this before the table.** The per-language rows below describe **wire compatibility of this
-repository's `sdks/` sources against a running Flapjack server**. They do not describe what a user
-gets from a package registry, and for two languages those are different things. The published
-Python and Ruby packages named `flapjack-search` still resolve **Algolia's** production hosts, so a
-caller's Flapjack admin key is transmitted to another vendor, rejected, and burned in that vendor's
-logs. The source correction has been in `sdks/` since 2026-07-16; only publication is outstanding.
-Per-channel state, measured 2026-08-09:
-
-| Published artifact | Consumer-safe? | State |
-|---|---|---|
-| `github.com/flapjackhq/flapjack-search-go/v4` | ✅ Yes, since `v4.0.1` | `v4.0.0` retracted with reason `Flapjack credentials could be sent to Algolia hosts`; clean-room `go get @latest` resolves `v4.0.1`; request-counting proof observed zero Algolia host attempts. Advisory `GHSA-jc2w-7wq6-r5w7`. |
-| PyPI `flapjack-search` | ❌ **No — do not use** | No fixed package is live. Advisory `GHSA-jhcc-64c6-pfq2` published with key-rotation guidance. Blocked on a registry credential, not on code: no `~/.pypirc` and no `TWINE_*` environment exist on the release host, and the inherited Algolia-owned release workflow was removed with no proven Flapjack-owned publish path. |
-| RubyGems `flapjack-search` | ❌ **No — do not use** | Same disposition as PyPI. Advisory `GHSA-q67x-w5fw-5mw2` published. Blocked on a missing `~/.gem/credentials` / `GEM_HOST_*`. |
-| Live owner source refs (Go, Python, Ruby) | ✅ Clean | Zero-hit outbound-host scan across Go 349 files / 1 branch, Python 759 / 1, Ruby 1457 / 2, against a starting inventory of 23 hits over 4 branches and 2,568 tree files. |
-
-The public remediation receipt is:
-[`4_EVIDENCE/2026_08_08_aug08_9pm_2_sdk_receipt.md`](4_EVIDENCE/2026_08_08_aug08_9pm_2_sdk_receipt.md).
-Clause `(d)` needs an operator with registry credentials, not an engineer.
+Flapjack supports the official Algolia clients only. The Flapjack-specific SDKs were retired from this repository in 2026-09; sources remain in git history. Do not install the retired packages. Historical releases sent Flapjack API keys to Algolia hosts: PyPI `flapjack-search` (`GHSA-jhcc-64c6-pfq2`), RubyGems `flapjack-search` (`GHSA-q67x-w5fw-5mw2`), and Go v4.0.0 (`GHSA-jc2w-7wq6-r5w7`). The historical receipt records the Go v4.0.1 correction; it does not establish completion of the retirement operations. Registry deprecation and removal actions and the public history tag `sdks-retired-2026-09` remain pending operator work. Historical remediation receipt: [`4_EVIDENCE/2026_08_08_aug08_9pm_2_sdk_receipt.md`](4_EVIDENCE/2026_08_08_aug08_9pm_2_sdk_receipt.md).
 
 | Client | Status | Verification |
 |---|---|---|
 | JavaScript / TypeScript (algoliasearch v5) | ✅ | 32 contract + 13 full-compat tests |
 | SDK contract CI gate | ✅ | Public CI runs `engine/sdk_test/contract_tests.js` against a built Flapjack server, protecting Algolia-compatible client behavior outside local-only scripts. |
-| PHP | ✅ | Smoke test |
-| Python | ✅ source / ❌ **published package unfixed** | Smoke test against `sdks/` source. The PyPI artifact is not consumer-safe — see the published-artifact table above. |
-| Ruby | ✅ source / ❌ **published package unfixed** | Smoke test against `sdks/` source. The RubyGems artifact is not consumer-safe — see the published-artifact table above. |
-| Go | ✅ source and published | Smoke test; published `v4.0.1` verified consumer-safe from a clean room. |
-| Java | ✅ | Smoke test |
-| Swift | ✅ | Smoke test |
+| PHP | Protocol smoke only | curl protocol smoke (`engine/sdk_test/php_smoke_test.sh`) |
+| Python | Protocol smoke only | curl protocol smoke (`engine/sdk_test/python_smoke_test.sh`) |
+| Ruby | Protocol smoke only | curl protocol smoke (`engine/sdk_test/ruby_smoke_test.sh`) |
+| Go | Protocol smoke only | curl protocol smoke (`engine/sdk_test/go_smoke_test.sh`) |
+| Java | Protocol smoke only | curl protocol smoke (`engine/sdk_test/java_smoke_test.sh`) |
+| Swift | Protocol smoke only | curl protocol smoke (`engine/sdk_test/swift_smoke_test.sh`) |
 | InstantSearch.js 4.111.0 | ✅ | Official package rendered in Chromium through `algoliasearch/lite` and an index-scoped search key; distinct exact query, facet, and pagination results |
 | React InstantSearch 7.44.0 | ✅ | Official React 18 package rendered in Chromium with the same scoped-key proof |
 | Vue InstantSearch 4.29.2 | ✅ | Official Vue 3 package rendered in Chromium with the same scoped-key proof |
 | Angular InstantSearch | ⚠️ | No rendered-client proof |
-| InstantSearch Android | ⚠️ | Kotlin/Java protocol smoke only; no rendered-client proof |
-| InstantSearch iOS | ⚠️ | Swift protocol smoke only; no rendered-client proof |
+| InstantSearch Android | ⚠️ | Java curl protocol smoke (`engine/sdk_test/java_smoke_test.sh`); no rendered-client proof |
+| InstantSearch iOS | ⚠️ | Swift curl protocol smoke (`engine/sdk_test/swift_smoke_test.sh`); no rendered-client proof |
 | Autocomplete.js | ⚠️ | Multi-index API contract only; no rendered-client proof |
 
 The recurring real-client owner is

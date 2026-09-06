@@ -1,6 +1,8 @@
 //! Stub summary for engine/src/index/manager/publication/repair.rs.
 use super::digest::canonical_tenant_tree_digest;
-use super::epoch::{observe_publication_epoch, PublicationEpochObservation};
+use super::epoch::{
+    fence_publication_admission, observe_publication_epoch, PublicationEpochObservation,
+};
 use super::executor::{
     artifact_digest, capture_journaled_sidecars, cleanup_publication_residue, copy_path_durably,
     persist_journal, promote_journaled_sidecars, remove_path_if_exists, rename_path,
@@ -173,6 +175,9 @@ pub(super) fn repair_publication_outcome(
     resolved_manifest: PublicationArtifactManifest,
     inventory: &TantivyManagedInventory,
 ) -> Result<RepairOutcome> {
+    let _repair_fence = fence_publication_admission(base, &target).map_err(|error| {
+        invalid_publication(format!("publication repair target fence failed: {error}"))
+    })?;
     let epoch = observe_publication_epoch(base, &target)
         .map_err(|error| invalid_publication(error.to_string()))?;
     repair_publication_outcome_with_epoch(
@@ -279,7 +284,11 @@ fn repair_publication_inner(
         epoch,
         io,
     })?;
-    let decision = decide_publication_repair(inspected.evidence);
+    let decision = constrain_prepared_repair_decision(
+        decide_publication_repair(inspected.evidence),
+        inspected.evidence,
+        inspected.journal.as_ref(),
+    );
     let live_target_mutated = match decision {
         RepairDecision::Complete => paths.staging.exists(),
         RepairDecision::Rollback => paths.backup.exists(),
@@ -345,6 +354,55 @@ fn repair_publication_inner(
         live_target_proven,
         live_target_mutated,
     })
+}
+
+fn constrain_prepared_repair_decision(
+    decision: RepairDecision,
+    evidence: RepairEvidence,
+    journal: Option<&PublicationJournal>,
+) -> RepairDecision {
+    if decision == RepairDecision::Complete
+        && evidence.phase == PublicationPhase::Prepared
+        && evidence.staging == RepairArtifactEvidence::MatchesNew
+        && journal.is_some_and(|journal| journal.crawler_completion.is_some())
+    {
+        // A prepared crawler journal proves admission only in the crashed
+        // process. If staging still exists, repair would be the first actor to
+        // publish it without a live cancel/deadline/terminal guard. Roll back;
+        // the post-promotion state has no staging tree and remains completable.
+        return RepairDecision::Rollback;
+    }
+    if decision == RepairDecision::Quarantine
+        && evidence.phase == PublicationPhase::Prepared
+        && evidence.target == RepairArtifactEvidence::MatchesNew
+        && evidence.backup == RepairArtifactEvidence::Missing
+        && evidence.staging == RepairArtifactEvidence::Missing
+        && journal.is_some_and(|journal| journal.prior_digest.is_none())
+    {
+        // The prepared digest proves the populated staging tree completed its
+        // one atomic rename into an absent target. Finishing the journal records
+        // that already-visible generation; rollback would erase a publication
+        // whose filesystem commit point has already passed.
+        return RepairDecision::Complete;
+    }
+    if decision == RepairDecision::Quarantine
+        && evidence.phase == PublicationPhase::Prepared
+        && evidence.target == RepairArtifactEvidence::Missing
+        && evidence.backup == RepairArtifactEvidence::Missing
+        && matches!(
+            evidence.staging,
+            RepairArtifactEvidence::MatchesNew | RepairArtifactEvidence::Missing
+        )
+        && journal.is_some_and(|journal| journal.prior_digest.is_none())
+    {
+        // Create-only has no visible reservation anymore. A crash before the
+        // staging rename therefore leaves the target and backup absent while the
+        // prepared journal proves there was no prior tree. The only safe outcome
+        // is to discard the unacknowledged staged generation; quarantining it
+        // would retain permanent transaction residue for a fully understood state.
+        return RepairDecision::Rollback;
+    }
+    decision
 }
 
 /// TODO: Document validate_repair_managed_paths.
@@ -427,7 +485,7 @@ fn inspect_publication_repair(context: RepairInspectionContext<'_>) -> Result<In
                     staging,
                     manifest_valid: true,
                     journal_temp_present,
-                    epoch: pre_journal_epoch_evidence(epoch),
+                    epoch: pre_journal_epoch_evidence(epoch, paths),
                 },
                 journal: None,
             });
@@ -796,9 +854,22 @@ fn journal_temp_path(paths: &PublicationPaths) -> PathBuf {
     paths.journal.with_extension("json.tmp")
 }
 
-fn pre_journal_epoch_evidence(epoch: PublicationEpochObservation) -> RepairEpochEvidence {
+fn pre_journal_epoch_evidence(
+    epoch: PublicationEpochObservation,
+    paths: &PublicationPaths,
+) -> RepairEpochEvidence {
     if epoch.has_sidecar_residue() {
-        return RepairEpochEvidence::FencedMissing;
+        // A retained lock alone is not generation evidence, but it is only safe
+        // to classify the pre-journal window as legacy when the fully-written
+        // temporary journal explicitly carries no fence. Missing, corrupt, or
+        // fenced temporary evidence remains fail-closed.
+        let legacy_unfenced_temp = std::fs::read_to_string(journal_temp_path(paths))
+            .ok()
+            .and_then(|raw| PublicationJournal::from_recovery_json(&raw).ok())
+            .is_some_and(|journal| journal.fence_evidence.is_none());
+        if !legacy_unfenced_temp {
+            return RepairEpochEvidence::FencedMissing;
+        }
     }
     match epoch.durable_epoch() {
         Some(epoch) if epoch.0 > 0 => RepairEpochEvidence::PreJournalAdvanced,

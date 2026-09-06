@@ -53,6 +53,32 @@ function themeTokens(css: string, theme: string): Set<string> {
   return new Set(block?.match(/--console-[a-z0-9-]+(?=\s*:)/g) ?? []);
 }
 
+function themeTokenValues(css: string, theme: string): Map<string, string> {
+  const escapedTheme = theme.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const block = css.match(
+    new RegExp(`\\[data-console-theme=['"]${escapedTheme}['"]\\]\\s*\\{([^}]*)\\}`)
+  )?.[1];
+  return new Map(
+    [...(block?.matchAll(/(--console-[a-z0-9-]+)\s*:\s*(#[0-9a-f]{6})/gi) ?? [])].map(
+      (match) => [match[1] ?? '', match[2] ?? '']
+    )
+  );
+}
+
+function relativeLuminance(hex: string): number {
+  const channels = [1, 3, 5].map((offset) => Number.parseInt(hex.slice(offset, offset + 2), 16) / 255);
+  const linear = channels.map((channel) =>
+    channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4
+  );
+  return 0.2126 * (linear[0] ?? 0) + 0.7152 * (linear[1] ?? 0) + 0.0722 * (linear[2] ?? 0);
+}
+
+function contrastRatio(left: string, right: string): number {
+  const leftLuminance = relativeLuminance(left);
+  const rightLuminance = relativeLuminance(right);
+  return (Math.max(leftLuminance, rightLuminance) + 0.05) / (Math.min(leftLuminance, rightLuminance) + 0.05);
+}
+
 function validateFoundation(root: string): string[] {
   const findings: string[] = [];
 
@@ -193,5 +219,32 @@ describe('console foundation contract', () => {
     );
 
     expect(validateFoundation(root)).toContain('theme semantic set differs: fjcloud');
+  });
+
+  it('keeps text, actions, controls, statuses, and focus indicators at AA contrast', () => {
+    const tokenCss = readFileSync(join(process.cwd(), 'src/lib/design/tokens.css'), 'utf8');
+    const requiredPairs = [
+      ['--console-text', '--console-surface', 4.5],
+      ['--console-text-muted', '--console-surface', 4.5],
+      ['--console-on-accent', '--console-accent', 4.5],
+      ['--console-danger', '--console-danger-surface', 4.5],
+      ['--console-status', '--console-status-surface', 4.5],
+      ['--console-border', '--console-surface-muted', 3],
+      ['--console-focus', '--console-surface', 3],
+    ] as const;
+
+    for (const theme of REQUIRED_THEMES) {
+      const values = themeTokenValues(tokenCss, theme);
+      for (const [foregroundToken, backgroundToken, minimum] of requiredPairs) {
+        const foreground = values.get(foregroundToken) ?? '';
+        const background = values.get(backgroundToken) ?? '';
+        expect(foreground, `${theme} is missing ${foregroundToken}`).toMatch(/^#[0-9a-f]{6}$/i);
+        expect(background, `${theme} is missing ${backgroundToken}`).toMatch(/^#[0-9a-f]{6}$/i);
+        expect(
+          contrastRatio(foreground, background),
+          `${theme} ${foregroundToken} on ${backgroundToken}`
+        ).toBeGreaterThanOrEqual(minimum);
+      }
+    }
   });
 });

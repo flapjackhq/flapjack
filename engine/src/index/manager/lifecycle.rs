@@ -119,6 +119,51 @@ impl PublicationArtifactMode {
 }
 
 impl super::IndexManager {
+    fn finish_pending_analytics_deletion(&self, target: &PublicationTarget) -> Result<()> {
+        let collector = self.analytics_collector.get().ok_or_else(|| {
+            FlapjackError::Config(
+                "pending analytics deletion requires the configured collector".to_string(),
+            )
+        })?;
+        let quarantine = collector
+            .config()
+            .index_deletion_quarantine_path(target.as_str());
+        if !quarantine.exists() {
+            collector
+                .stage_index_deletion(target.as_str(), &quarantine)
+                .map_err(FlapjackError::Io)?;
+        }
+        collector
+            .finish_index_deletion(target.as_str(), &quarantine)
+            .map_err(FlapjackError::Io)?;
+        publication::clear_analytics_purge_pending(&self.base_path, target)
+    }
+
+    pub(super) fn reconcile_pending_analytics_deletion_while_fenced(
+        &self,
+        target: &PublicationTarget,
+    ) -> Result<()> {
+        if !publication::analytics_purge_is_pending(&self.base_path, target)? {
+            return Ok(());
+        }
+        let collector = self.analytics_collector.get().ok_or_else(|| {
+            FlapjackError::Config(
+                "pending analytics deletion requires the configured collector".to_string(),
+            )
+        })?;
+        let quarantine = collector
+            .config()
+            .index_deletion_quarantine_path(target.as_str());
+        if self.base_path.join(target.as_str()).exists() {
+            collector
+                .rollback_index_deletion(target.as_str(), &quarantine)
+                .map_err(FlapjackError::Io)?;
+            publication::clear_analytics_purge_pending(&self.base_path, target)
+        } else {
+            self.finish_pending_analytics_deletion(target)
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn set_replacement_reopen_proof_hook_for_test(
         hook: impl Fn(&super::IndexManager, &str, &mut publication::PublicationJournal)
@@ -153,7 +198,16 @@ impl super::IndexManager {
     /// Ok(()) if the tenant already exists and is loaded, or if creation succeeds. Errors if tenant ID is invalid or index creation fails.
     pub fn create_tenant(&self, tenant_id: &str) -> Result<()> {
         validate_index_name(tenant_id)?;
+        let target = PublicationTarget::new(tenant_id)?;
+        if publication::analytics_purge_is_pending(&self.base_path, &target)? {
+            return Err(FlapjackError::Io(
+                "index creation is blocked by pending analytics deletion".to_string(),
+            ));
+        }
         if self.loaded.contains_key(tenant_id) {
+            if let Some(collector) = self.analytics_collector.get() {
+                collector.activate_index(tenant_id);
+            }
             return Ok(());
         }
 
@@ -174,14 +228,33 @@ impl super::IndexManager {
                 )?,
             );
             self.publish_loaded_runtime_state_if_unfenced(tenant_id, index)?;
+            if let Some(collector) = self.analytics_collector.get() {
+                collector.activate_index(tenant_id);
+            }
             return Ok(());
         }
 
+        // Initial creation is a target effect just like publication. Register it
+        // with the existing admission owner so a create-only publication either
+        // waits for a creator that started first or excludes one that arrives
+        // while its staged tree is being committed. The fence lives under
+        // `.publication`, so this never materializes a placeholder tenant.
+        let observed_epoch = publication::capture_publication_epoch(&self.base_path, &target)
+            .map_err(|error| Self::admission_epoch_error(tenant_id, error))?;
+        let _creation_admission = publication::try_validate_publication_epoch_admission(
+            &self.base_path,
+            &target,
+            observed_epoch,
+        )
+        .map_err(|error| Self::admission_epoch_error(tenant_id, error))?;
         let index = initialize_new_tenant_tree(&path)?;
         // Publish runtime state only after every required on-disk artifact is
         // durable. Otherwise a failed create can make a retry return success
         // from the cache while the tenant tree is still incomplete.
         self.loaded.insert(tenant_id.to_string(), index);
+        if let Some(collector) = self.analytics_collector.get() {
+            collector.activate_index(tenant_id);
+        }
 
         Ok(())
     }
@@ -252,6 +325,47 @@ impl super::IndexManager {
         validate_index_name(tenant_id)?;
         let path = self.base_path.join(tenant_id);
         if !path.exists() {
+            let target = PublicationTarget::new(tenant_id.as_str())?;
+            let pending = publication::analytics_purge_is_pending(&self.base_path, &target)?;
+            let analytics_root = self.analytics_collector.get().map(|collector| {
+                collector
+                    .config()
+                    .target_artifact_paths(target.as_str())
+                    .index_root
+            });
+            let analytics_exist = match analytics_root.as_ref().map(std::fs::symlink_metadata) {
+                Some(Ok(_)) => true,
+                Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Some(Err(error)) => return Err(error.into()),
+                None => false,
+            };
+            let epoch_paths = publication::publication_epoch_paths_for_target_path(
+                &self.base_path.join(target.as_str()),
+            );
+            let publication_evidence_exists =
+                match epoch_paths.lock.parent().map(std::fs::symlink_metadata) {
+                    Some(Ok(_)) => true,
+                    Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Some(Err(error)) => return Err(error.into()),
+                    None => false,
+                };
+            if !pending && !analytics_exist && !publication_evidence_exists {
+                return Err(FlapjackError::TenantNotFound(tenant_id.to_string()));
+            }
+            // Existing analytics or a durable purge marker is real lifecycle
+            // evidence and must be reconciled under the target fence. A wholly
+            // absent target returns above without inventing a namespace/lock.
+            let _target_fence = publication::fence_publication_admission(&self.base_path, &target)
+                .map_err(|error| {
+                    FlapjackError::Io(format!("analytics deletion target fence failed: {error}"))
+                })?;
+            if path.exists() {
+                return Err(FlapjackError::IndexAlreadyExists(tenant_id.to_string()));
+            }
+            if !pending {
+                publication::mark_analytics_purge_pending(&self.base_path, &target)?;
+            }
+            self.finish_pending_analytics_deletion(&target)?;
             return Err(FlapjackError::TenantNotFound(tenant_id.to_string()));
         }
 
@@ -260,6 +374,17 @@ impl super::IndexManager {
         // must abort deletion because no safe removal guarantee exists.
         let target = PublicationTarget::new(tenant_id.as_str())?;
         let _quiesce = self.quiesce_replacement_tenant(tenant_id, &target).await?;
+        if let Some(collector) = self.analytics_collector.get() {
+            publication::mark_analytics_purge_pending(&self.base_path, &target)?;
+            let quarantine = collector
+                .config()
+                .index_deletion_quarantine_path(target.as_str());
+            if let Err(error) = collector.stage_index_deletion(tenant_id, &quarantine) {
+                collector.activate_index(tenant_id);
+                publication::clear_analytics_purge_pending(&self.base_path, &target)?;
+                return Err(FlapjackError::Io(error));
+            }
+        }
         self.clear_tenant_runtime_state(tenant_id);
         self.admission_stores.remove(tenant_id);
 
@@ -274,28 +399,62 @@ impl super::IndexManager {
         // only as defense in depth against transient filesystem errors (a slow
         // antivirus scan, a lingering external handle) and no longer relies on
         // merge threads still draining after the writer was dropped.
+        #[cfg(test)]
+        let mut last_err = self
+            .fail_next_tenant_removal
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+            .then(|| std::io::Error::other("injected tenant removal failure"));
+        #[cfg(not(test))]
         let mut last_err = None;
-        for _ in 0..10 {
-            match std::fs::remove_dir_all(&path) {
-                Ok(()) => {
-                    last_err = None;
-                    break;
-                }
-                // The path can disappear after the existence check due to a concurrent delete.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    last_err = None;
-                    break;
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+        if last_err.is_none() {
+            for _ in 0..10 {
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => {
+                        last_err = None;
+                        break;
+                    }
+                    // The path can disappear after the existence check due to a concurrent delete.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        last_err = None;
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
                 }
             }
         }
         if let Some(e) = last_err {
+            if let Some(collector) = self.analytics_collector.get() {
+                let quarantine = collector
+                    .config()
+                    .index_deletion_quarantine_path(target.as_str());
+                collector
+                    .rollback_index_deletion(tenant_id, &quarantine)
+                    .map_err(FlapjackError::Io)?;
+                publication::clear_analytics_purge_pending(&self.base_path, &target)?;
+            }
             return Err(e.into());
         }
-        publication::retire_committed_publication_journals(&self.base_path, &target)?;
+        if self.analytics_collector.get().is_some() {
+            if let Err(error) = self.finish_pending_analytics_deletion(&target) {
+                tracing::error!(
+                    target = %tenant_id,
+                    error = %error,
+                    "analytics deletion cleanup remains durably pending"
+                );
+            }
+        }
+        if let Err(error) =
+            publication::retire_committed_publication_journals(&self.base_path, &target)
+        {
+            tracing::error!(
+                target = %tenant_id,
+                error = %error,
+                "publication journal retirement remains pending after index deletion"
+            );
+        }
         crate::index::write_queue::backpressure::remove_tenant_state(&self.base_path, tenant_id);
         Ok(())
     }
@@ -446,10 +605,44 @@ impl super::IndexManager {
             publication,
             destination,
             staging_baseline,
+            None,
             #[cfg(feature = "test-support")]
             None,
         )
         .await
+    }
+
+    /// Publish one crawler generation without materializing a first destination
+    /// before the run has passed its final durable cancellation/deadline check.
+    /// Existing destinations retain the replacement fence/delta path; a missing
+    /// destination uses the existing create-only activation fence.
+    pub(crate) async fn publish_crawler_from_pre_staged_with_reserved_task(
+        &self,
+        publication: PreStagedPublication,
+        destination: &str,
+        staging_baseline: PublicationStagingBaseline,
+        task: TaskInfo,
+    ) -> Result<TaskInfo> {
+        validate_index_name(destination)?;
+        if self.base_path.join(destination).exists() {
+            return self
+                .replace_index_contents_from_pre_staged_inner(
+                    publication,
+                    destination,
+                    staging_baseline,
+                    Some(task),
+                    #[cfg(feature = "test-support")]
+                    None,
+                )
+                .await;
+        }
+
+        let journal = publication
+            .activate_create_only()
+            .map_err(pre_staged_activation_error)?;
+        ensure_committed_move(&journal)?;
+        self.clear_tenant_runtime_state(&destination.to_string());
+        Ok(self.commit_reserved_noop_task(destination, task))
     }
 
     #[cfg(feature = "test-support")]
@@ -464,6 +657,7 @@ impl super::IndexManager {
             publication,
             destination,
             staging_baseline,
+            None,
             Some(fault),
         )
         .await
@@ -474,12 +668,16 @@ impl super::IndexManager {
         publication: PreStagedPublication,
         destination: &str,
         staging_baseline: PublicationStagingBaseline,
+        reserved_task: Option<TaskInfo>,
         #[cfg(feature = "test-support")] publication_fault: Option<PublicationFaultPoint>,
     ) -> Result<TaskInfo> {
         validate_index_name(destination)?;
         let source_path = publication.paths().staging.clone();
         if !source_path.exists() {
-            return self.make_noop_task(destination);
+            return match reserved_task {
+                Some(task) => Ok(self.commit_reserved_noop_task(destination, task)),
+                None => self.make_noop_task(destination),
+            };
         }
         let target = PublicationTarget::new(destination)?;
         let replacement_quiesce = self
@@ -522,7 +720,10 @@ impl super::IndexManager {
             PublicationArtifactMode::PreserveDestination,
             &journal,
         )?;
-        self.make_noop_task(destination)
+        match reserved_task {
+            Some(task) => Ok(self.commit_reserved_noop_task(destination, task)),
+            None => self.make_noop_task(destination),
+        }
     }
 
     pub fn capture_replacement_staging_baseline(
@@ -860,6 +1061,11 @@ impl super::IndexManager {
             .read_since(baseline)?;
         Self::require_contiguous_delta(&delta, baseline, watermark)?;
 
+        // Resolve staged legacy rows while their original oplog and committed
+        // sequence still identify them. Replay may otherwise encounter an
+        // ambiguous equal tuple, and alignment replaces this sequence domain.
+        Self::resolve_legacy_version_proofs(source_path)?;
+
         self.replay_delta_into_staged_tree(
             source,
             destination,
@@ -871,6 +1077,23 @@ impl super::IndexManager {
         self.align_staged_oplog_to_destination(source, source_path, destination_path, watermark)?;
         self.verify_staged_watermark(source, source_path, watermark)?;
         Ok(watermark)
+    }
+
+    fn resolve_legacy_version_proofs(generation_path: &Path) -> Result<()> {
+        if !generation_path.join(VERSION_STORE_DIR).exists() {
+            return Ok(());
+        }
+        let retained =
+            crate::index::oplog::retained_effect_entries(generation_path).map_err(|error| {
+                version_store_alignment_error(VersionStoreError::AmbiguousProof(format!(
+                    "retained oplog inventory is unreadable: {error}"
+                )))
+            })?;
+        VersionStore::open(generation_path)
+            .map_err(version_store_alignment_error)?
+            .resolve_legacy_proofs_from_retained_entries(&retained)
+            .map_err(version_store_alignment_error)?;
+        Ok(())
     }
 
     /// Define `W` as the drained destination oplog high-water mark and strictly
@@ -981,10 +1204,10 @@ impl super::IndexManager {
     ) -> Result<()> {
         self.oplogs.remove(source);
         let staged_oplog_dir = source_path.join(OPLOG_DIR);
-        replace_directory(&destination_path.join(OPLOG_DIR), &staged_oplog_dir)?;
-
         let source_version_store_dir = source_path.join(VERSION_STORE_DIR);
         let destination_version_store_dir = destination_path.join(VERSION_STORE_DIR);
+        replace_directory(&destination_path.join(OPLOG_DIR), &staged_oplog_dir)?;
+
         if source_version_store_dir.exists() || destination_version_store_dir.exists() {
             let staged_store =
                 VersionStore::open(source_path).map_err(version_store_alignment_error)?;

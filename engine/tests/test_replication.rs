@@ -3574,6 +3574,10 @@ async fn test_rollup_broadcaster_integration_periodic() {
     };
     let cluster = flapjack_http::analytics_cluster::AnalyticsClusterClient::new(&node_cfg, None)
         .expect("Should build cluster client");
+    let data_root = tmp_a.path().join("data");
+    std::fs::create_dir_all(&data_root).unwrap();
+    let mutation_fence =
+        flapjack_http::pause_registry::GlobalMutationFence::open(&data_root).unwrap();
 
     // Spawn broadcaster with a 1-second interval
     flapjack_http::rollup_broadcaster::spawn_rollup_broadcaster(
@@ -3582,6 +3586,7 @@ async fn test_rollup_broadcaster_integration_periodic() {
         cluster,
         "node-a-periodic".to_string(),
         1, // 1s interval for test speed
+        mutation_fence.clone(),
     );
 
     // Wait up to 4 seconds for the broadcaster to fire at least once

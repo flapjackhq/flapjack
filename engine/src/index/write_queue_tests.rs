@@ -445,7 +445,8 @@ fn dur1_replicated_documents(
                 ReplicatedWriteOrigin::new(
                     10_000 + index as u64,
                     format!("dur1-replica-node-{index}"),
-                ),
+                )
+                .with_origin_seq(index as u64 + 1),
             )
         })
         .collect()

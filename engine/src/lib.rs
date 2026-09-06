@@ -65,6 +65,7 @@
 //! for the full embedding guide.
 
 pub mod build_info;
+pub mod crawler;
 pub mod dictionaries;
 pub mod error;
 pub mod experiments;

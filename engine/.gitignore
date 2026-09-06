@@ -133,8 +133,6 @@ docs2/3_IMPLEMENTATION/decisions/active/*
 !docs2/3_IMPLEMENTATION/decisions/active/0006_console_source_home.md
 docs2/6_TODO/
 docs2/Checklists/
-docs2/integrations/handoffs/
-docs2/SDK/handoffs/
 docs2/0_META/OPEN_SOURCE_REPO_TRANSFER_GUIDE.md
 
 # Stage 5 live ops-contract harness runtime artifacts (harness-owned, not committed)

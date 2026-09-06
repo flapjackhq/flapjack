@@ -1,15 +1,20 @@
 //! Stub summary for engine/src/analytics/collector.rs.
 use dashmap::DashMap;
 use std::collections::VecDeque;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tokio::sync::Notify;
 
 use super::aggregation::QueryAggregator;
 use super::config::AnalyticsConfig;
 use super::mutation;
-use super::schema::{InsightEvent, SearchEvent};
+use super::schema::{
+    is_recommendation_fallback_identity, InsightEvent, SearchEvent,
+    RECOMMENDATION_FALLBACK_IDENTITY_MARKER, RECOMMENDATION_REQUEST_EVENT_TYPE,
+};
 use super::writer;
 
 /// Maximum number of debug events retained in the ring buffer.
@@ -51,14 +56,34 @@ pub struct AnalyticsMetricsSnapshot {
 /// swap the buffer without holding the lock during I/O.
 pub struct AnalyticsCollector {
     config: AnalyticsConfig,
+    /// Exact indexes deleted by the lifecycle owner. This closes the narrow
+    /// gap where a request that searched before deletion records afterward.
+    deleted_indexes: DashMap<String, ()>,
+    /// Canonical tenant root bound by IndexManager. Absence is the durable
+    /// admission fence across restart; `deleted_indexes` covers only in-flight
+    /// deletion before the tenant directory is removed.
+    index_data_dir: OnceLock<std::path::PathBuf>,
+    #[cfg(test)]
+    fail_next_quarantine_remove: AtomicBool,
+    /// Linearizes search ingestion, flush publication, and exact-index deletion.
+    search_mutation: Mutex<()>,
     search_buffer: Mutex<Vec<SearchEvent>>,
-    /// Linearizes insight ingestion, flush publication, and user deletion.
+    #[cfg(test)]
+    search_flush_after_take_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Linearizes insight ingestion, batch take, and deletion admission.
     insight_mutation: Mutex<()>,
+    /// Prevents an exact-user purge from committing while a taken insight
+    /// batch is still publishing. Exact-index deletion deliberately uses its
+    /// existing admission and per-index fences so it need not wait for I/O.
+    /// Paths needing both locks acquire this before `insight_mutation`.
+    insight_publication: Mutex<()>,
     insight_buffer: Mutex<Vec<InsightEvent>>,
     #[cfg(test)]
     insight_flush_after_take_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     insight_purge_before_lock_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    index_purge_before_lock_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     debug_buffer: Mutex<VecDeque<DebugEvent>>,
     aggregator: QueryAggregator,
     /// queryID -> (query, index_name, timestamp_ms) for correlating clicks with searches
@@ -90,13 +115,23 @@ impl AnalyticsCollector {
             .filter(|value| !value.is_empty());
         Arc::new(Self {
             config,
+            deleted_indexes: DashMap::new(),
+            index_data_dir: OnceLock::new(),
+            #[cfg(test)]
+            fail_next_quarantine_remove: AtomicBool::new(false),
+            search_mutation: Mutex::new(()),
             search_buffer: Mutex::new(Vec::with_capacity(1024)),
+            #[cfg(test)]
+            search_flush_after_take_hook: Mutex::new(None),
             insight_mutation: Mutex::new(()),
+            insight_publication: Mutex::new(()),
             insight_buffer: Mutex::new(Vec::with_capacity(256)),
             #[cfg(test)]
             insight_flush_after_take_hook: Mutex::new(None),
             #[cfg(test)]
             insight_purge_before_lock_hook: Mutex::new(None),
+            #[cfg(test)]
+            index_purge_before_lock_hook: Mutex::new(None),
             debug_buffer: Mutex::new(VecDeque::with_capacity(DEBUG_BUFFER_CAP)),
             aggregator: QueryAggregator::new(30),
             query_id_cache: DashMap::new(),
@@ -119,38 +154,59 @@ impl AnalyticsCollector {
         &self.config
     }
 
+    pub(crate) fn bind_index_data_dir(&self, data_dir: std::path::PathBuf) {
+        let _ = self.index_data_dir.set(data_dir);
+    }
+
+    fn index_admission_closed(&self, index_name: &str) -> bool {
+        self.deleted_indexes.contains_key(index_name)
+            || self.index_data_dir.get().is_some_and(|data_dir| {
+                crate::index::manager::validate_index_name(index_name).is_err()
+                    || !data_dir.join(index_name).is_dir()
+            })
+    }
+
     /// Record a search event. Called from the search path after results are computed.
     pub fn record_search(&self, event: SearchEvent) {
         if !self.config.enabled {
             return;
         }
 
-        // Store queryID mapping for click correlation
-        if let Some(ref qid) = event.query_id {
-            self.query_id_cache.insert(
-                qid.clone(),
-                QueryIdEntry {
-                    query: event.query.clone(),
-                    index_name: event.index_name.clone(),
-                    timestamp_ms: event.timestamp_ms,
-                },
-            );
-        }
-
-        // Check aggregation: should this count as a distinct search?
-        let user_id = event
-            .user_token
-            .as_deref()
-            .or(event.user_ip.as_deref())
-            .unwrap_or("anonymous");
-        let _is_new_search = self
-            .aggregator
-            .should_count(user_id, &event.index_name, &event.query);
-        // We always store the raw event; aggregation is applied at query time.
-        // The aggregator is kept for future use (e.g. deduped search count queries).
-        self.accepted_events_total.fetch_add(1, Ordering::Relaxed);
-
         let should_flush = {
+            let _mutation = self.search_mutation.lock().unwrap();
+            // The search may have resolved immediately before deletion. Check
+            // durable tenant presence here so its late analytics cannot create
+            // queryID/buffer state after the physical generation is gone.
+            if self.index_admission_closed(&event.index_name) {
+                self.dropped_events_total.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+
+            // Store queryID mapping for click correlation
+            if let Some(ref qid) = event.query_id {
+                self.query_id_cache.insert(
+                    qid.clone(),
+                    QueryIdEntry {
+                        query: event.query.clone(),
+                        index_name: event.index_name.clone(),
+                        timestamp_ms: event.timestamp_ms,
+                    },
+                );
+            }
+
+            // Check aggregation: should this count as a distinct search?
+            let user_id = event
+                .user_token
+                .as_deref()
+                .or(event.user_ip.as_deref())
+                .unwrap_or("anonymous");
+            let _is_new_search =
+                self.aggregator
+                    .should_count(user_id, &event.index_name, &event.query);
+            // We always store the raw event; aggregation is applied at query time.
+            // The aggregator is kept for future use (e.g. deduped search count queries).
+            self.accepted_events_total.fetch_add(1, Ordering::Relaxed);
+
             let mut buf = self.search_buffer.lock().unwrap();
             buf.push(event);
             buf.len() >= self.config.flush_size
@@ -171,6 +227,10 @@ impl AnalyticsCollector {
 
         let should_flush = {
             let _mutation = self.insight_mutation.lock().unwrap();
+            if self.index_admission_closed(&event.index) {
+                self.dropped_events_total.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             let mut buf = self.insight_buffer.lock().unwrap();
             buf.push(event);
             buf.len() >= self.config.flush_size
@@ -181,8 +241,45 @@ impl AnalyticsCollector {
         }
     }
 
+    /// Record one successfully admitted Recommend request in the existing
+    /// durable insight pipeline. The public Insights validator cannot create
+    /// this internal discriminator.
+    pub fn record_recommendation_request(
+        &self,
+        index_name: &str,
+        model: &str,
+        user_token: Option<&str>,
+        user_ip: Option<&str>,
+        query_id: Option<String>,
+        timestamp_ms: i64,
+    ) {
+        let identity = writer::recommendation_user_identity(user_token, user_ip);
+        self.record_insight(InsightEvent {
+            event_type: RECOMMENDATION_REQUEST_EVENT_TYPE.to_string(),
+            event_subtype: Some(model.to_string()),
+            event_name: "Recommend request".to_string(),
+            index: index_name.to_string(),
+            user_token: identity,
+            authenticated_user_token: user_token
+                .is_none()
+                .then(|| RECOMMENDATION_FALLBACK_IDENTITY_MARKER.to_string()),
+            query_id,
+            object_ids: Vec::new(),
+            object_ids_alt: Vec::new(),
+            positions: None,
+            timestamp: Some(timestamp_ms),
+            value: None,
+            currency: None,
+            interleaving_team: None,
+        });
+    }
+
     /// Record a debug event entry for the event debugger UI.
     pub fn record_debug_event(&self, event: DebugEvent) {
+        let _mutation = self.search_mutation.lock().unwrap();
+        if self.index_admission_closed(&event.index) {
+            return;
+        }
         let mut buf = self.debug_buffer.lock().unwrap();
         if buf.len() >= DEBUG_BUFFER_CAP {
             buf.pop_front();
@@ -252,11 +349,16 @@ impl AnalyticsCollector {
     pub fn flush_searches(&self) {
         let flush_started_at = Instant::now();
         let events = {
+            let _mutation = self.search_mutation.lock().unwrap();
             let mut buf = self.search_buffer.lock().unwrap();
             std::mem::take(&mut *buf)
         };
         if events.is_empty() {
             return;
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.search_flush_after_take_hook.lock().unwrap().clone() {
+            hook();
         }
 
         // Group events by index_name for per-index Parquet files
@@ -272,20 +374,28 @@ impl AnalyticsCollector {
         let mut dropped_events = 0_u64;
         for (index_name, index_events) in by_index {
             let dir = self.config.searches_dir(&index_name);
-            if let Err(e) = writer::flush_search_events(&index_events, &dir) {
-                dropped_events += index_events.len() as u64;
-                tracing::error!(
-                    "[analytics] Failed to flush {} search events for {}: {}",
-                    index_events.len(),
-                    index_name,
-                    e
-                );
-            } else {
-                tracing::debug!(
+            match mutation::with_index_mutation(&self.config, &index_name, || {
+                if self.index_admission_closed(&index_name) {
+                    return Ok(false);
+                }
+                writer::flush_search_events(&index_events, &dir)?;
+                Ok(true)
+            }) {
+                Ok(true) => tracing::debug!(
                     "[analytics] Flushed {} search events for {}",
                     index_events.len(),
                     index_name
-                );
+                ),
+                Ok(false) => dropped_events += index_events.len() as u64,
+                Err(e) => {
+                    dropped_events += index_events.len() as u64;
+                    tracing::error!(
+                        "[analytics] Failed to flush {} search events for {}: {}",
+                        index_events.len(),
+                        index_name,
+                        e
+                    );
+                }
             }
         }
         if dropped_events > 0 {
@@ -298,8 +408,9 @@ impl AnalyticsCollector {
     /// Flush insight events to Parquet.
     pub fn flush_insights(&self) {
         let flush_started_at = Instant::now();
-        let _mutation = self.insight_mutation.lock().unwrap();
+        let _publication = self.insight_publication.lock().unwrap();
         let events = {
+            let _mutation = self.insight_mutation.lock().unwrap();
             let mut buf = self.insight_buffer.lock().unwrap();
             std::mem::take(&mut *buf)
         };
@@ -320,22 +431,28 @@ impl AnalyticsCollector {
         let mut dropped_events = 0_u64;
         for (index_name, index_events) in by_index {
             let dir = self.config.events_dir(&index_name);
-            if let Err(e) = mutation::with_index_mutation(&self.config, &index_name, || {
-                writer::flush_insight_events(&index_events, &dir)
+            match mutation::with_index_mutation(&self.config, &index_name, || {
+                if self.index_admission_closed(&index_name) {
+                    return Ok(false);
+                }
+                writer::flush_insight_events(&index_events, &dir)?;
+                Ok(true)
             }) {
-                dropped_events += index_events.len() as u64;
-                tracing::error!(
-                    "[analytics] Failed to flush {} insight events for {}: {}",
-                    index_events.len(),
-                    index_name,
-                    e
-                );
-            } else {
-                tracing::debug!(
+                Ok(true) => tracing::debug!(
                     "[analytics] Flushed {} insight events for {}",
                     index_events.len(),
                     index_name
-                );
+                ),
+                Ok(false) => dropped_events += index_events.len() as u64,
+                Err(e) => {
+                    dropped_events += index_events.len() as u64;
+                    tracing::error!(
+                        "[analytics] Failed to flush {} insight events for {}: {}",
+                        index_events.len(),
+                        index_name,
+                        e
+                    );
+                }
             }
         }
         if dropped_events > 0 {
@@ -349,6 +466,141 @@ impl AnalyticsCollector {
     pub fn flush_all(&self) {
         self.flush_searches();
         self.flush_insights();
+    }
+
+    /// Run the complete periodic analytics mutation pass. HTTP-layer
+    /// schedulers call this only while holding the process-wide release
+    /// mutation permit, keeping persistence and cache eviction inside one
+    /// admitted effect.
+    pub fn run_periodic_flush_pass(&self) {
+        self.flush_all();
+        self.aggregator.evict_expired();
+        self.evict_old_query_ids();
+    }
+
+    /// Generate one rollup through the same exact-index admission owner as
+    /// deletion, so a stale scheduler snapshot cannot recreate deleted data.
+    pub fn flush_rollup_window_with_event_count(
+        &self,
+        index_name: &str,
+        tier: &str,
+        window_start_ms: i64,
+        window_end_ms: i64,
+    ) -> Result<(std::path::PathBuf, i64), String> {
+        mutation::with_index_mutation(&self.config, index_name, || {
+            if self.index_admission_closed(index_name) {
+                return Err("analytics index is pending deletion".to_string());
+            }
+            writer::flush_rollup_window_with_event_count(
+                &self.config,
+                index_name,
+                tier,
+                window_start_ms,
+                window_end_ms,
+            )
+        })
+    }
+
+    /// Fence late ingress and atomically move persisted analytics out of the
+    /// canonical namespace before the tenant tree is removed.
+    pub fn stage_index_deletion(
+        &self,
+        index_name: &str,
+        quarantine: &std::path::Path,
+    ) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(hook) = self.index_purge_before_lock_hook.lock().unwrap().clone() {
+            hook();
+        }
+        {
+            let _search_mutation = self.search_mutation.lock().unwrap();
+            let _insight_mutation = self.insight_mutation.lock().unwrap();
+            self.deleted_indexes.insert(index_name.to_string(), ());
+        }
+        if let Err(error) = mutation::stage_index_root(&self.config, index_name, quarantine) {
+            self.deleted_indexes.remove(index_name);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Restore staged analytics when physical tenant removal did not commit.
+    pub fn rollback_index_deletion(
+        &self,
+        index_name: &str,
+        quarantine: &std::path::Path,
+    ) -> Result<(), String> {
+        mutation::rollback_staged_index_root(&self.config, index_name, quarantine)?;
+        {
+            let _search_mutation = self.search_mutation.lock().unwrap();
+            let _insight_mutation = self.insight_mutation.lock().unwrap();
+            self.deleted_indexes.remove(index_name);
+        }
+        Ok(())
+    }
+
+    /// Commit exact-index in-memory deletion and erase the staged filesystem
+    /// tree. A transient erase failure leaves the lifecycle fence in place for
+    /// startup or an explicit absent-index retry.
+    pub fn finish_index_deletion(
+        &self,
+        index_name: &str,
+        quarantine: &std::path::Path,
+    ) -> Result<(), String> {
+        {
+            let _search_mutation = self.search_mutation.lock().unwrap();
+            let _insight_mutation = self.insight_mutation.lock().unwrap();
+            self.deleted_indexes.insert(index_name.to_string(), ());
+            self.purge_index_memory_locked(index_name)?;
+        }
+        #[cfg(test)]
+        if self
+            .fail_next_quarantine_remove
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err("injected analytics quarantine erase failure".to_string());
+        }
+        let result = mutation::remove_staged_index_root(&self.config, index_name, quarantine);
+        self.deleted_indexes.remove(index_name);
+        result
+    }
+
+    fn purge_index_memory_locked(&self, index_name: &str) -> Result<(), String> {
+        self.search_buffer
+            .lock()
+            .map_err(|error| format!("analytics search buffer poisoned: {error}"))?
+            .retain(|event| event.index_name != index_name);
+        self.insight_buffer
+            .lock()
+            .map_err(|error| format!("analytics insight buffer poisoned: {error}"))?
+            .retain(|event| event.index != index_name);
+        self.debug_buffer
+            .lock()
+            .map_err(|error| format!("analytics debug buffer poisoned: {error}"))?
+            .retain(|event| event.index != index_name);
+        self.query_id_cache
+            .retain(|_, entry| entry.index_name != index_name);
+        self.aggregator.purge_index(index_name);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_quarantine_remove_for_test(&self) {
+        self.fail_next_quarantine_remove
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn deleting_index_count(&self) -> usize {
+        self.deleted_indexes.len()
+    }
+
+    /// Reactivate analytics admission only after the lifecycle owner has made
+    /// the exact tenant visible again.
+    pub fn activate_index(&self, index_name: &str) {
+        let _search_mutation = self.search_mutation.lock().unwrap();
+        let _insight_mutation = self.insight_mutation.lock().unwrap();
+        self.deleted_indexes.remove(index_name);
     }
 
     /// Purge all insight events for a user token from memory and on-disk analytics data.
@@ -376,6 +628,10 @@ impl AnalyticsCollector {
         if let Some(hook) = self.insight_purge_before_lock_hook.lock().unwrap().clone() {
             hook();
         }
+        let _publication = self
+            .insight_publication
+            .lock()
+            .map_err(|error| format!("analytics insight publication lock poisoned: {error}"))?;
         let _mutation = self
             .insight_mutation
             .lock()
@@ -387,6 +643,7 @@ impl AnalyticsCollector {
             let before = buf.len();
             buf.retain(|event| {
                 event.user_token != user_token
+                    || is_recommendation_fallback_identity(event)
                     || !index_matches.is_none_or(|matches| matches(&event.index))
             });
             (before - buf.len()) as u64
@@ -494,9 +751,7 @@ impl AnalyticsCollector {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    self.flush_all();
-                    self.aggregator.evict_expired();
-                    self.evict_old_query_ids();
+                    self.run_periodic_flush_pass();
                 }
                 _ = self.shutdown.notified() => {
                     self.flush_all();
@@ -609,6 +864,8 @@ fn percentile_99(samples: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analytics::schema::SearchEvent;
+    use crate::analytics::AnalyticsQueryEngine;
     use tempfile::TempDir;
 
     fn test_config(temp_dir: &TempDir) -> AnalyticsConfig {
@@ -663,6 +920,290 @@ mod tests {
             currency: None,
             interleaving_team: None,
         }
+    }
+
+    fn search_event(index_name: &str, query_id: &str) -> SearchEvent {
+        SearchEvent {
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            query: "query".to_string(),
+            query_id: Some(query_id.to_string()),
+            index_name: index_name.to_string(),
+            nb_hits: 1,
+            processing_time_ms: 1,
+            user_token: Some("user-1".to_string()),
+            user_ip: None,
+            filters: None,
+            facets: None,
+            analytics_tags: None,
+            page: 0,
+            hits_per_page: 20,
+            has_results: true,
+            country: None,
+            region: None,
+            experiment_id: None,
+            variant_id: None,
+            assignment_method: None,
+        }
+    }
+
+    fn purge_index(collector: &AnalyticsCollector, config: &AnalyticsConfig, index_name: &str) {
+        let quarantine = config.data_dir.join(format!(".{index_name}-delete-test"));
+        collector
+            .stage_index_deletion(index_name, &quarantine)
+            .expect("stage index deletion");
+        if let Some(index_data_dir) = collector.index_data_dir.get() {
+            std::fs::remove_dir_all(index_data_dir.join(index_name))
+                .expect("remove physical index before committed analytics cleanup");
+        }
+        collector
+            .finish_index_deletion(index_name, &quarantine)
+            .expect("finish index deletion");
+    }
+
+    #[tokio::test]
+    async fn analytics_delete_removes_real_and_buffered_data_without_touching_other_indexes() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let config = test_config(&temp_dir);
+        let collector = AnalyticsCollector::new(config.clone());
+
+        collector.record_search(search_event("delete-me", "delete-flushed"));
+        collector.record_insight(InsightEvent {
+            index: "delete-me".to_string(),
+            ..insight_event("delete-user")
+        });
+        collector.record_search(search_event("keep-me", "keep-flushed"));
+        collector.record_insight(InsightEvent {
+            index: "keep-me".to_string(),
+            ..insight_event("keep-user")
+        });
+        collector.flush_all();
+
+        let deleted_rollup = config
+            .rollups_dir("delete-me", "1day")
+            .join("deleted.parquet");
+        std::fs::create_dir_all(deleted_rollup.parent().unwrap()).unwrap();
+        std::fs::write(&deleted_rollup, b"deleted rollup").unwrap();
+        let retained_rollup = config
+            .rollups_dir("keep-me", "1day")
+            .join("retained.parquet");
+        std::fs::create_dir_all(retained_rollup.parent().unwrap()).unwrap();
+        std::fs::write(&retained_rollup, b"retained rollup").unwrap();
+        collector.record_debug_event(test_event(1, "delete-me", "search", "deleted", 200));
+        collector.record_debug_event(test_event(2, "keep-me", "search", "retained", 200));
+
+        collector.record_search(search_event("delete-me", "delete-buffered"));
+        collector.record_insight(InsightEvent {
+            index: "delete-me".to_string(),
+            ..insight_event("delete-buffered-user")
+        });
+        collector.record_search(search_event("keep-me", "keep-buffered"));
+
+        let quarantine = config.data_dir.join(".delete-me-delete-test");
+        collector
+            .stage_index_deletion("delete-me", &quarantine)
+            .expect("stage index deletion");
+        collector.record_search(search_event("delete-me", "delete-late"));
+        collector.record_insight(InsightEvent {
+            index: "delete-me".to_string(),
+            ..insight_event("delete-late-user")
+        });
+        collector.record_debug_event(test_event(3, "delete-me", "search", "late", 200));
+        collector.flush_all();
+        let hour_end = chrono::Utc::now().timestamp_millis().div_euclid(3_600_000) * 3_600_000;
+        assert!(collector
+            .flush_rollup_window_with_event_count(
+                "delete-me",
+                "1hour",
+                hour_end - 3_600_000,
+                hour_end,
+            )
+            .unwrap_err()
+            .contains("pending deletion"));
+        collector
+            .finish_index_deletion("delete-me", &quarantine)
+            .expect("finish index deletion");
+        assert_eq!(collector.deleting_index_count(), 0);
+
+        assert!(
+            !config
+                .target_artifact_paths("delete-me")
+                .index_root
+                .exists(),
+            "deleted analytics must not be recreated by a buffered flush"
+        );
+        assert!(
+            config.target_artifact_paths("keep-me").index_root.exists(),
+            "exact-index purge must preserve the control index"
+        );
+        assert!(collector.lookup_query_id("delete-flushed").is_none());
+        assert!(collector.lookup_query_id("delete-buffered").is_none());
+        assert!(collector.lookup_query_id("delete-late").is_none());
+        assert!(collector.lookup_query_id("keep-flushed").is_some());
+        assert!(collector.lookup_query_id("keep-buffered").is_some());
+        assert!(collector
+            .get_debug_events(10, Some("delete-me"), None, None, None, None)
+            .is_empty());
+        assert_eq!(
+            collector
+                .get_debug_events(10, Some("keep-me"), None, None, None, None)
+                .len(),
+            1
+        );
+        assert!(retained_rollup.exists(), "control rollup must be preserved");
+
+        let searches = AnalyticsQueryEngine::new(config.clone())
+            .query_searches("keep-me", "SELECT COUNT(*) AS count FROM searches")
+            .await
+            .expect("query retained searches");
+        assert_eq!(searches[0]["count"], serde_json::json!(2));
+        let insights = AnalyticsQueryEngine::new(config)
+            .query_events("keep-me", "SELECT COUNT(*) AS count FROM events")
+            .await
+            .expect("query retained insights");
+        assert_eq!(insights[0]["count"], serde_json::json!(1));
+
+        collector.activate_index("delete-me");
+        collector.record_search(search_event("delete-me", "recreated"));
+        collector.flush_searches();
+        assert!(collector.lookup_query_id("recreated").is_some());
+    }
+
+    #[test]
+    fn analytics_delete_restart_rejects_late_ingress_until_exact_recreate() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let config = test_config(&temp_dir);
+        let index_data_dir = temp_dir.path().join("indexes");
+        std::fs::create_dir_all(&index_data_dir).unwrap();
+        let collector = AnalyticsCollector::new(config.clone());
+        collector.bind_index_data_dir(index_data_dir.clone());
+
+        collector.record_search(search_event("deleted", "late"));
+        collector.record_insight(InsightEvent {
+            index: "deleted".to_string(),
+            ..insight_event("late")
+        });
+        collector.record_debug_event(test_event(1, "deleted", "search", "late", 200));
+        collector.flush_all();
+        assert!(!config.target_artifact_paths("deleted").index_root.exists());
+        assert!(collector.lookup_query_id("late").is_none());
+        assert!(collector
+            .get_debug_events(10, Some("deleted"), None, None, None, None)
+            .is_empty());
+
+        std::fs::create_dir_all(index_data_dir.join("deleted")).unwrap();
+        collector.activate_index("deleted");
+        collector.record_search(search_event("deleted", "recreated"));
+        collector.flush_searches();
+        assert!(config.target_artifact_paths("deleted").index_root.exists());
+    }
+
+    #[test]
+    fn analytics_delete_blocks_taken_search_batch_from_post_stage_write() {
+        use std::sync::{mpsc, Barrier};
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let config = test_config(&temp_dir);
+        let collector = AnalyticsCollector::new(config.clone());
+        let index_data_dir = temp_dir.path().join("indexes");
+        std::fs::create_dir_all(index_data_dir.join("delete-me")).unwrap();
+        collector.bind_index_data_dir(index_data_dir);
+        collector.record_search(search_event("delete-me", "inflight"));
+
+        let flush_taken = Arc::new(Barrier::new(2));
+        let release_flush = Arc::new(Barrier::new(2));
+        let hook_taken = Arc::clone(&flush_taken);
+        let hook_release = Arc::clone(&release_flush);
+        *collector.search_flush_after_take_hook.lock().unwrap() = Some(Arc::new(move || {
+            hook_taken.wait();
+            hook_release.wait();
+        }));
+        let flush_collector = Arc::clone(&collector);
+        let flush_thread = std::thread::spawn(move || flush_collector.flush_searches());
+        flush_taken.wait();
+
+        let purge_attempted = Arc::new(Barrier::new(2));
+        let hook_attempted = Arc::clone(&purge_attempted);
+        *collector.index_purge_before_lock_hook.lock().unwrap() = Some(Arc::new(move || {
+            hook_attempted.wait();
+        }));
+        let (purge_tx, purge_rx) = mpsc::channel();
+        let purge_collector = Arc::clone(&collector);
+        let purge_config = config.clone();
+        let purge_thread = std::thread::spawn(move || {
+            purge_tx
+                .send(purge_index(&purge_collector, &purge_config, "delete-me"))
+                .unwrap();
+        });
+        purge_attempted.wait();
+        purge_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("purge must commit while the pre-admitted flush is paused");
+
+        release_flush.wait();
+        flush_thread.join().unwrap();
+        purge_thread.join().unwrap();
+        collector.flush_all();
+        assert!(!config
+            .target_artifact_paths("delete-me")
+            .index_root
+            .exists());
+    }
+
+    #[test]
+    fn analytics_delete_blocks_taken_insight_batch_from_post_stage_write() {
+        use std::sync::{mpsc, Barrier};
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let config = test_config(&temp_dir);
+        let collector = AnalyticsCollector::new(config.clone());
+        let index_data_dir = temp_dir.path().join("indexes");
+        std::fs::create_dir_all(index_data_dir.join("delete-me")).unwrap();
+        collector.bind_index_data_dir(index_data_dir);
+        collector.record_insight(InsightEvent {
+            index: "delete-me".to_string(),
+            ..insight_event("inflight")
+        });
+
+        let flush_taken = Arc::new(Barrier::new(2));
+        let release_flush = Arc::new(Barrier::new(2));
+        let hook_taken = Arc::clone(&flush_taken);
+        let hook_release = Arc::clone(&release_flush);
+        *collector.insight_flush_after_take_hook.lock().unwrap() = Some(Arc::new(move || {
+            hook_taken.wait();
+            hook_release.wait();
+        }));
+        let flush_collector = Arc::clone(&collector);
+        let flush_thread = std::thread::spawn(move || flush_collector.flush_insights());
+        flush_taken.wait();
+
+        let purge_attempted = Arc::new(Barrier::new(2));
+        let hook_attempted = Arc::clone(&purge_attempted);
+        *collector.index_purge_before_lock_hook.lock().unwrap() = Some(Arc::new(move || {
+            hook_attempted.wait();
+        }));
+        let (purge_tx, purge_rx) = mpsc::channel();
+        let purge_collector = Arc::clone(&collector);
+        let purge_config = config.clone();
+        let purge_thread = std::thread::spawn(move || {
+            purge_tx
+                .send(purge_index(&purge_collector, &purge_config, "delete-me"))
+                .unwrap();
+        });
+        purge_attempted.wait();
+        purge_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("purge must commit while the pre-admitted flush is paused");
+
+        release_flush.wait();
+        flush_thread.join().unwrap();
+        purge_thread.join().unwrap();
+        collector.flush_all();
+        assert!(!config
+            .target_artifact_paths("delete-me")
+            .index_root
+            .exists());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

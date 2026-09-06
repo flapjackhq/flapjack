@@ -101,6 +101,9 @@ fn apply_search_config_fields(settings: &mut IndexSettings, payload: &mut SetSet
     if let Some(v) = payload.query_languages.take() {
         settings.query_languages = v;
     }
+    if let Some(v) = payload.index_languages.take() {
+        settings.index_languages = v;
+    }
     if let Some(v) = payload.query_type.take() {
         settings.query_type = v;
     }

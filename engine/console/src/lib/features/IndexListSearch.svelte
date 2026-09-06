@@ -65,8 +65,8 @@
                   {index.name}
                 </button>
               </th>
-              <td>{index.entries}</td>
-              <td>{index.dataSize} bytes</td>
+              <td>{index.entries ?? 'Unavailable'}</td>
+              <td>{index.dataSize === null ? 'Unavailable' : `${index.dataSize} bytes`}</td>
             </tr>
           {/each}
         </tbody>

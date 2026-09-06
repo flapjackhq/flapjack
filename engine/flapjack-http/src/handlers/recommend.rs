@@ -1,7 +1,17 @@
 //! HTTP handler for the batched recommendations endpoint, dispatching to trending-items, trending-facets, related-products, bought-together, and looking-similar models with validation, rule application, and replica resolution.
-use axum::{extract::State, Json};
+use axum::{
+    extract::{FromRequestParts, Query, State},
+    http::{request::Parts, StatusCode},
+    response::{IntoResponse, Response},
+    Json,
+};
+use chrono::{Duration, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use sha2::{Digest, Sha256};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::net::IpAddr;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use flapjack::error::FlapjackError;
@@ -16,17 +26,137 @@ use flapjack::recommend::{
 use flapjack::validate_index_name;
 
 use super::AppState;
+use crate::auth::{
+    invalid_api_credentials_flapjack_error, key_allows_index, ApiKey, AuthenticatedAdminKey,
+    AuthenticatedAppId, SecuredKeyRestrictions,
+};
+use crate::idempotency::{IdempotencyRecord, IDEMPOTENCY_HEADER};
+
+const RECOMMEND_IDEMPOTENCY_LOCK_STRIPES: usize = 64;
+pub(crate) const TRUSTED_RECOMMEND_CLIENT_IP_HEADER: &str =
+    "x-flapjack-trusted-recommend-client-ip";
+static RECOMMEND_IDEMPOTENCY_LOCKS: LazyLock<Vec<tokio::sync::Mutex<()>>> = LazyLock::new(|| {
+    (0..RECOMMEND_IDEMPOTENCY_LOCK_STRIPES)
+        .map(|_| tokio::sync::Mutex::new(()))
+        .collect()
+});
+
+pub struct RecommendRequestContext {
+    api_key: Option<ApiKey>,
+    secured_restrictions: Option<SecuredKeyRestrictions>,
+    application_id: Option<String>,
+    idempotency_key: Option<String>,
+    user_ip: Option<String>,
+    #[cfg(test)]
+    test_hooks: Option<RecommendTestHooks>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct RecommendTestHooks {
+    analytics_collector: Option<Arc<flapjack::analytics::AnalyticsCollector>>,
+    yield_after_idempotency_miss: bool,
+    before_idempotency_store: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[axum::async_trait]
+impl<S> FromRequestParts<S> for RecommendRequestContext
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        // Reuse the canonical proxy-aware resolver without consuming the body.
+        // The final Request extractor retains the existing handler-local body
+        // cap and content-type-independent JSON parsing contract.
+        let mut request = axum::extract::Request::new(axum::body::Body::empty());
+        *request.headers_mut() = parts.headers.clone();
+        *request.extensions_mut() = parts.extensions.clone();
+        let authenticated_admin = parts.extensions.get::<AuthenticatedAdminKey>().is_some();
+        let pbv5_profile = matches!(
+            parts.extensions.get::<crate::api_profile::ApiProfile>(),
+            Some(crate::api_profile::ApiProfile::PaidBetaV5)
+        );
+        let user_ip = resolve_recommend_user_ip(&request, authenticated_admin, pbv5_profile)
+            .map(|ip| ip.to_string());
+        let api_key = parts.extensions.get::<ApiKey>().cloned();
+        let secured_restrictions = parts.extensions.get::<SecuredKeyRestrictions>().cloned();
+        let authenticated_app_id = parts
+            .extensions
+            .get::<AuthenticatedAppId>()
+            .map(|id| id.0.clone());
+        let idempotency_key = parts
+            .headers
+            .get(IDEMPOTENCY_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let application_id = authenticated_app_id.or_else(|| {
+            parts
+                .headers
+                .get("x-algolia-application-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        });
+
+        Ok(Self {
+            api_key,
+            secured_restrictions,
+            application_id,
+            idempotency_key,
+            user_ip,
+            #[cfg(test)]
+            test_hooks: parts.extensions.get::<RecommendTestHooks>().cloned(),
+        })
+    }
+}
+
+fn resolve_recommend_user_ip(
+    request: &axum::extract::Request,
+    authenticated_admin: bool,
+    pbv5_profile: bool,
+) -> Option<IpAddr> {
+    let internal_values = request
+        .headers()
+        .get_all(TRUSTED_RECOMMEND_CLIENT_IP_HEADER)
+        .iter()
+        .collect::<Vec<_>>();
+    if authenticated_admin {
+        let trusted = match internal_values.as_slice() {
+            [value] => value
+                .to_str()
+                .ok()
+                .and_then(|value| value.trim().parse::<IpAddr>().ok()),
+            [] | [_, _, ..] => None,
+        };
+        if trusted.is_some() || pbv5_profile {
+            return trusted;
+        }
+    }
+
+    crate::middleware::extract_client_ip_opt(request)
+}
+
+fn recommendation_idempotency_lock(
+    application_id: &str,
+    scope: &str,
+    idempotency_key: &str,
+) -> &'static tokio::sync::Mutex<()> {
+    let mut hasher = DefaultHasher::new();
+    (application_id, scope, idempotency_key).hash(&mut hasher);
+    &RECOMMEND_IDEMPOTENCY_LOCKS[(hasher.finish() as usize) % RECOMMEND_IDEMPOTENCY_LOCK_STRIPES]
+}
 
 // ── Request DTOs ────────────────────────────────────────────────────────────
 
 /// Batched recommendations request body.
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct RecommendBatchRequest {
     pub requests: Vec<RecommendRequest>,
 }
 
 /// A single recommendation request within a batch.
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RecommendRequest {
     pub index_name: String,
@@ -46,6 +176,49 @@ pub struct RecommendRequest {
     #[serde(default)]
     #[schema(value_type = Option<Object>)]
     pub fallback_parameters: Option<serde_json::Value>,
+    /// Count this request in Recommend Analytics; defaults to true.
+    #[serde(default, deserialize_with = "deserialize_strict_optional_bool")]
+    #[schema(default = true, nullable = false)]
+    pub analytics: Option<bool>,
+    /// Return a queryID for Events attribution; requires analytics and a UUID userToken.
+    #[serde(default, deserialize_with = "deserialize_strict_optional_bool")]
+    #[schema(default = false, nullable = false)]
+    pub click_analytics: Option<bool>,
+    /// Optional 1-129 ASCII token; click attribution requires a hyphenated UUID.
+    #[serde(default, deserialize_with = "deserialize_strict_optional_string")]
+    #[schema(
+        min_length = 1,
+        max_length = 129,
+        pattern = r"^[A-Za-z0-9_-]+$",
+        nullable = false
+    )]
+    pub user_token: Option<String>,
+}
+
+fn deserialize_strict_optional_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Bool(value) => Ok(Some(value)),
+        serde_json::Value::Null => Err(D::Error::custom("expected boolean, found null")),
+        _ => Err(D::Error::custom("expected boolean")),
+    }
+}
+
+fn deserialize_strict_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(value) => Ok(Some(value)),
+        serde_json::Value::Null => Err(D::Error::custom("expected string, found null")),
+        _ => Err(D::Error::custom("expected string")),
+    }
 }
 
 // ── Response DTOs ───────────────────────────────────────────────────────────
@@ -61,6 +234,42 @@ pub struct RecommendResult {
     pub hits: Vec<serde_json::Value>,
     #[serde(rename = "processingTimeMS")]
     pub processing_time_ms: u64,
+    #[serde(rename = "queryID", skip_serializing_if = "Option::is_none")]
+    pub query_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecommendAnalyticsParams {
+    pub index: String,
+    pub model: String,
+    pub start_date: String,
+    pub end_date: String,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RecommendAnalyticsResponse {
+    pub index: String,
+    pub model: String,
+    pub start_date: String,
+    pub end_date: String,
+    pub total_users: u64,
+    pub total_recommendations: u64,
+    pub tracked_recommendations: u64,
+    pub clicked_recommendations: u64,
+    pub converted_recommendations: u64,
+    pub click_through_rate: f64,
+    pub conversion_rate: f64,
+    pub click_position_distribution: Vec<ClickPositionCount>,
+    pub average_click_position: Option<f64>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ClickPositionCount {
+    pub position: u32,
+    pub count: u64,
 }
 
 // ── Validation ──────────────────────────────────────────────────────────────
@@ -144,7 +353,74 @@ fn validate_request(req: &RecommendRequest) -> Result<(), FlapjackError> {
         ));
     }
 
+    if let Some(user_token) = req.user_token.as_deref() {
+        flapjack::analytics::schema::validate_user_token(user_token)
+            .map_err(FlapjackError::InvalidQuery)?;
+    }
+
+    if req.click_analytics == Some(true) && req.analytics == Some(false) {
+        return Err(FlapjackError::InvalidQuery(
+            "analytics=false cannot be combined with clickAnalytics=true".to_string(),
+        ));
+    }
+    if req.click_analytics == Some(true) && req.user_token.is_none() {
+        return Err(FlapjackError::InvalidQuery(
+            "clickAnalytics=true requires a present valid userToken".to_string(),
+        ));
+    }
+    if req.click_analytics == Some(true) {
+        flapjack::analytics::schema::validate_attributed_user_token(
+            req.user_token
+                .as_deref()
+                .expect("presence checked immediately above"),
+        )
+        .map_err(FlapjackError::InvalidQuery)?;
+    }
+
     Ok(())
+}
+
+fn recommendation_idempotency_scope(body: &RecommendBatchRequest) -> String {
+    let canonical = serde_json::to_vec(body).expect("recommend request must serialize");
+    format!(
+        "/recommendations/{}",
+        hex::encode(Sha256::digest(canonical))
+    )
+}
+
+fn recommendation_analytics_bounds(
+    start_date: &str,
+    end_date: &str,
+) -> Result<(i64, i64), FlapjackError> {
+    let start = NaiveDate::parse_from_str(start_date, "%Y-%m-%d")
+        .map_err(|_| FlapjackError::InvalidQuery("startDate must be YYYY-MM-DD".to_string()))?;
+    let end = NaiveDate::parse_from_str(end_date, "%Y-%m-%d")
+        .map_err(|_| FlapjackError::InvalidQuery("endDate must be YYYY-MM-DD".to_string()))?;
+    if end < start {
+        return Err(FlapjackError::InvalidQuery(
+            "endDate must not be before startDate".to_string(),
+        ));
+    }
+    let inclusive_days = end.signed_duration_since(start).num_days() + 1;
+    if inclusive_days > 30 {
+        return Err(FlapjackError::InvalidQuery(
+            "recommendation analytics date range must not exceed 30 days".to_string(),
+        ));
+    }
+    let start_ms = Utc
+        .from_utc_datetime(&start.and_hms_opt(0, 0, 0).expect("midnight is valid"))
+        .timestamp_millis();
+    let end_exclusive = end.checked_add_signed(Duration::days(1)).ok_or_else(|| {
+        FlapjackError::InvalidQuery("endDate is outside the supported range".to_string())
+    })?;
+    let end_exclusive_ms = Utc
+        .from_utc_datetime(
+            &end_exclusive
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight is valid"),
+        )
+        .timestamp_millis();
+    Ok((start_ms, end_exclusive_ms))
 }
 
 // ── Handler ─────────────────────────────────────────────────────────────────
@@ -164,14 +440,92 @@ fn validate_request(req: &RecommendRequest) -> Result<(), FlapjackError> {
 )]
 pub async fn recommend(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<RecommendBatchRequest>,
-) -> Result<Json<RecommendBatchResponse>, FlapjackError> {
-    let mut results = Vec::with_capacity(body.requests.len());
+    context: RecommendRequestContext,
+    request: axum::extract::Request,
+) -> Result<Response, FlapjackError> {
+    let body_bytes = axum::body::to_bytes(request.into_body(), 10_000_000)
+        .await
+        .map_err(|error| {
+            FlapjackError::InvalidQuery(format!("failed to read recommendations request: {error}"))
+        })?;
+    let body: RecommendBatchRequest = serde_json::from_slice(&body_bytes).map_err(|error| {
+        FlapjackError::InvalidQuery(format!("invalid recommendations request: {error}"))
+    })?;
+    let RecommendRequestContext {
+        api_key,
+        secured_restrictions,
+        application_id,
+        idempotency_key,
+        user_ip,
+        #[cfg(test)]
+        test_hooks,
+    } = context;
 
+    let api_key_ref = api_key.as_ref();
+    let secured_restrictions_ref = secured_restrictions.as_ref();
+    // The wildcard route has no concrete path index for middleware to authorize.
+    // Validate and authorize the complete batch before resolving any targets so a
+    // later forbidden request cannot cause earlier index or analytics work.
     for req in &body.requests {
         validate_request(req)?;
-        let target_index = resolve_recommend_data_index(&state, &req.index_name);
+        if api_key_ref
+            .is_some_and(|key| !key_allows_index(key, secured_restrictions_ref, &req.index_name))
+        {
+            return Err(invalid_api_credentials_flapjack_error());
+        }
+    }
 
+    let mut prepared = Vec::with_capacity(body.requests.len());
+    for req in &body.requests {
+        let target_index = resolve_recommend_data_index(&state, &req.index_name);
+        // Event storage can outlive an index. Resolve through the live index owner
+        // before querying analytics so deleted targets cannot return stale hits.
+        state.manager.get_or_load(&target_index)?;
+        prepared.push((req, target_index));
+    }
+
+    let idempotency_scope = recommendation_idempotency_scope(&body);
+    let idempotency_admission = if let Some(key) = idempotency_key.as_deref() {
+        let app_id = application_id.as_deref().ok_or_else(|| {
+            FlapjackError::InvalidQuery(
+                "X-Algolia-Application-Id is required with an idempotency key".to_string(),
+            )
+        })?;
+        // Serialize the complete lookup -> execution -> durable response store ->
+        // telemetry publication sequence. A bounded stripe set avoids an
+        // attacker-controlled per-key lock registry while preserving exact replay.
+        let guard = recommendation_idempotency_lock(app_id, &idempotency_scope, key)
+            .lock()
+            .await;
+        match state
+            .idempotency_cache
+            .lookup_scoped(app_id, &idempotency_scope, key)
+        {
+            Ok(Some(record)) => return Ok(record.into_response()),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(error = %error, "recommend idempotency cache lookup failed");
+                return Err(FlapjackError::Io(
+                    "idempotency persistence lookup failed".to_string(),
+                ));
+            }
+        }
+        #[cfg(test)]
+        if test_hooks
+            .as_ref()
+            .is_some_and(|hooks| hooks.yield_after_idempotency_miss)
+        {
+            tokio::task::yield_now().await;
+        }
+        Some((guard, app_id.to_string(), key.to_string()))
+    } else {
+        None
+    };
+
+    let mut results = Vec::with_capacity(body.requests.len());
+    let mut telemetry = Vec::with_capacity(body.requests.len());
+
+    for (req, target_index) in prepared {
         let start = Instant::now();
         let max_recs = req
             .max_recommendations
@@ -217,13 +571,168 @@ pub async fn recommend(
         let hits = apply_recommend_rules(&state.manager, &target_index, req, hits);
 
         let elapsed = start.elapsed().as_millis() as u64;
+        let query_id = req
+            .click_analytics
+            .is_some_and(|enabled| enabled)
+            .then(|| hex::encode(uuid::Uuid::new_v4().as_bytes()));
         results.push(RecommendResult {
             hits,
             processing_time_ms: elapsed,
+            query_id: query_id.clone(),
         });
+        if req.analytics != Some(false) {
+            telemetry.push((
+                req.index_name.clone(),
+                req.model.as_str(),
+                req.user_token.as_deref(),
+                query_id,
+            ));
+        }
     }
 
-    Ok(Json(RecommendBatchResponse { results }))
+    let response_body = RecommendBatchResponse { results };
+    if let Ok(_mutation_permit) = state.global_mutation_fence.admit_mutation().await {
+        if let Some((_guard, app_id, key)) = &idempotency_admission {
+            #[cfg(test)]
+            if let Some(hook) = test_hooks
+                .as_ref()
+                .and_then(|hooks| hooks.before_idempotency_store.as_ref())
+            {
+                hook();
+            }
+            let response_bytes = serde_json::to_vec(&response_body).map_err(|error| {
+                FlapjackError::Io(format!(
+                    "failed to serialize idempotent recommendation response: {error}"
+                ))
+            })?;
+            state
+                .idempotency_cache
+                .store_scoped(
+                    app_id,
+                    &idempotency_scope,
+                    key,
+                    IdempotencyRecord::json(StatusCode::OK, response_bytes.into()),
+                )
+                .map_err(|error| {
+                    tracing::error!(error = %error, "recommend idempotency cache store failed");
+                    FlapjackError::Io("idempotency persistence store failed".to_string())
+                })?;
+        }
+
+        // Every request has completed and any idempotent response is durable before
+        // telemetry becomes visible. Store failure therefore returns no queryID and
+        // creates no count that a retry could duplicate.
+        #[cfg(test)]
+        let collector = test_hooks
+            .as_ref()
+            .and_then(|hooks| hooks.analytics_collector.as_ref())
+            .or_else(|| flapjack::analytics::get_global_collector());
+        #[cfg(not(test))]
+        let collector = flapjack::analytics::get_global_collector();
+        if let Some(collector) = collector {
+            let timestamp_ms = Utc::now().timestamp_millis();
+            for (requested_index, model, user_token, query_id) in &telemetry {
+                collector.record_recommendation_request(
+                    requested_index,
+                    model,
+                    *user_token,
+                    user_ip.as_deref(),
+                    query_id.clone(),
+                    timestamp_ms,
+                );
+            }
+        }
+    } else {
+        tracing::debug!("release mutation fence active; optional Recommend persistence suppressed");
+    }
+
+    Ok(Json(response_body).into_response())
+}
+
+/// GET /internal/recommendations/analytics
+#[utoipa::path(
+    get,
+    path = "/internal/recommendations/analytics",
+    tag = "recommendations",
+    params(
+        ("index" = String, Query, description = "Exact physical index name"),
+        ("model" = String, Query, description = "Recommend model"),
+        ("startDate" = String, Query, description = "Inclusive UTC start date"),
+        ("endDate" = String, Query, description = "Inclusive UTC end date")
+    ),
+    responses(
+        (status = 200, description = "Bounded Recommend analytics", body = RecommendAnalyticsResponse),
+        (status = 400, description = "Invalid model, index, or date range"),
+        (status = 503, description = "Analytics unavailable")
+    ),
+    security(("api_key" = []))
+)]
+pub async fn recommendation_analytics(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<RecommendAnalyticsParams>,
+) -> Result<Response, FlapjackError> {
+    validate_index_name(&params.index)?;
+    if !VALID_MODELS.contains(&params.model.as_str()) {
+        return Err(FlapjackError::InvalidQuery(format!(
+            "unsupported recommendation model: {}",
+            params.model
+        )));
+    }
+    let (start_ms, end_exclusive_ms) =
+        recommendation_analytics_bounds(&params.start_date, &params.end_date)?;
+    let Some(engine) = state.analytics_engine.as_ref() else {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "message": "recommendation analytics unavailable",
+                "status": 503
+            })),
+        )
+            .into_response());
+    };
+    let summary = match engine
+        .recommendation_analytics(&params.index, &params.model, start_ms, end_exclusive_ms)
+        .await
+    {
+        Ok(summary) => summary,
+        Err(error) => {
+            tracing::warn!(
+                index = %params.index,
+                model = %params.model,
+                error = %error,
+                "recommendation analytics query unavailable"
+            );
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "message": "recommendation analytics unavailable",
+                    "status": 503
+                })),
+            )
+                .into_response());
+        }
+    };
+
+    Ok(Json(RecommendAnalyticsResponse {
+        index: params.index,
+        model: params.model,
+        start_date: params.start_date,
+        end_date: params.end_date,
+        total_users: summary.total_users,
+        total_recommendations: summary.total_recommendations,
+        tracked_recommendations: summary.tracked_recommendations,
+        clicked_recommendations: summary.clicked_recommendations,
+        converted_recommendations: summary.converted_recommendations,
+        click_through_rate: summary.click_through_rate,
+        conversion_rate: summary.conversion_rate,
+        click_position_distribution: summary
+            .click_position_distribution
+            .into_iter()
+            .map(|(position, count)| ClickPositionCount { position, count })
+            .collect(),
+        average_click_position: summary.average_click_position,
+    })
+    .into_response())
 }
 
 fn resolve_recommend_data_index(state: &Arc<AppState>, requested_index: &str) -> String {

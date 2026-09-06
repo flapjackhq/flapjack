@@ -3,7 +3,23 @@ use std::path::{Path, PathBuf};
 
 use utoipa::OpenApi;
 
-use crate::openapi::ApiDoc;
+use crate::openapi::{pbv4_crawler_openapi, ApiDoc};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenApiDocument {
+    Public,
+    Pbv4Crawler,
+}
+
+impl OpenApiDocument {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "public" => Some(Self::Public),
+            "pbv4-crawler" => Some(Self::Pbv4Crawler),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum OpenApiExportError {
@@ -38,9 +54,25 @@ pub fn default_docs2_output_path() -> PathBuf {
         .join("openapi.json")
 }
 
+pub fn default_pbv4_crawler_output_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../docs2")
+        .join("pbv4-crawler-openapi.json")
+}
+
 pub fn write_openapi_json(output_path: &Path) -> Result<(), OpenApiExportError> {
-    let openapi_json =
-        serde_json::to_string_pretty(&ApiDoc::openapi()).map_err(OpenApiExportError::Serialize)?;
+    write_openapi_document_json(OpenApiDocument::Public, output_path)
+}
+
+pub fn write_openapi_document_json(
+    document: OpenApiDocument,
+    output_path: &Path,
+) -> Result<(), OpenApiExportError> {
+    let openapi_json = match document {
+        OpenApiDocument::Public => serde_json::to_string_pretty(&ApiDoc::openapi()),
+        OpenApiDocument::Pbv4Crawler => serde_json::to_string_pretty(&pbv4_crawler_openapi()),
+    }
+    .map_err(OpenApiExportError::Serialize)?;
 
     if let Some(parent_dir) = output_path.parent() {
         std::fs::create_dir_all(parent_dir).map_err(OpenApiExportError::CreateParentDir)?;

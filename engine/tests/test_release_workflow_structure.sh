@@ -2,12 +2,19 @@
 
 set -euo pipefail
 
+SECONDS=0
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RELEASE_WORKFLOW="${RELEASE_WORKFLOW_UNDER_TEST:-$REPO_DIR/.github/workflows/release.yml}"
 DOCKER_WORKFLOW="$REPO_DIR/.github/workflows/docker.yml"
 CI_WORKFLOW="$REPO_DIR/.github/workflows/ci.yml"
 RELEASE_MANIFEST_HELPER="$REPO_DIR/engine/package/release_artifact_manifest"
+RELEASE_RUNTIME_GATE="$REPO_DIR/engine/package/release_artifact_runtime_gate"
+RELEASE_BUILD_HELPER="$REPO_DIR/engine/package/build_release_artifact"
+RELEASE_BUILD_HELPER_CONTRACT="$REPO_DIR/engine/tests/build_release_artifact_contract.sh"
+BUILD_IDENTITY_PACKAGE_CONTRACT="$REPO_DIR/engine/tests/build_identity_package_contract.sh"
+ENGINE_COMPATIBILITY="$REPO_DIR/engine/package/engine_compatibility.json"
 HTTP_MANIFEST="$REPO_DIR/engine/flapjack-http/Cargo.toml"
 DOCKERFILE="$REPO_DIR/engine/Dockerfile"
 CROSS_TOML="$REPO_DIR/engine/Cross.toml"
@@ -205,6 +212,17 @@ assert_job_contains() {
   fi
 }
 
+assert_job_not_contains() {
+  local job_name="$1"
+  local pattern="$2"
+  local description="$3"
+  if job_block "$job_name" | grep -Eq "$pattern"; then
+    fail "$description"
+  else
+    pass "$description"
+  fi
+}
+
 assert_job_needs() {
   local job_name="$1"
   local dependency="$2"
@@ -212,6 +230,21 @@ assert_job_needs() {
   local needs
   needs="$(job_block "$job_name" | sed -nE 's/^[[:space:]]*needs:[[:space:]]*\[([^]]*)\][[:space:]]*$/\1/p')"
   if printf '%s\n' "$needs" | tr ',' '\n' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g' | grep -Fxq "$dependency"; then
+    pass "$description"
+  else
+    fail "$description"
+  fi
+}
+
+assert_job_order() {
+  local job_name="$1"
+  local earlier_pattern="$2"
+  local later_pattern="$3"
+  local description="$4"
+  local earlier_line later_line
+  earlier_line="$(job_block "$job_name" | grep -En "$earlier_pattern" | head -1 | cut -d: -f1 || true)"
+  later_line="$(job_block "$job_name" | grep -En "$later_pattern" | head -1 | cut -d: -f1 || true)"
+  if [ -n "$earlier_line" ] && [ -n "$later_line" ] && [ "$earlier_line" -lt "$later_line" ]; then
     pass "$description"
   else
     fail "$description"
@@ -270,11 +303,41 @@ assert_image_identity_ssot() {
 }
 
 assert_release_helper_contract() {
-  local tmp_dir bin_path output_dir manifest_path
+  local tmp_dir bin_path output_dir manifest_path fake_bin predecessors mutated_manifest
   tmp_dir="$(mktemp -d)"
   bin_path="$tmp_dir/flapjack"
   output_dir="$tmp_dir/out"
-  mkdir -p "$output_dir"
+  fake_bin="$tmp_dir/fake-bin"
+  mkdir -p "$output_dir" "$fake_bin"
+
+  # macOS bsdtar can materialize AppleDouble entries for extended attributes.
+  # This fake tar makes that failure portable: a release owner that delegates
+  # archive creation to ambient tar will emit the forbidden extra member, while
+  # the canonical xattr-free packager is unaffected.
+  cat >"$fake_bin/tar" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "$#" -ne 5 ] || [ "$1" != "czf" ] || [ "$3" != "-C" ] || [ "$5" != "." ]; then
+  printf 'unexpected tar invocation\n' >&2
+  exit 64
+fi
+python3 - "$2" "$4" <<'PY'
+import io
+import pathlib
+import tarfile
+import sys
+
+archive_path = pathlib.Path(sys.argv[1])
+staging_dir = pathlib.Path(sys.argv[2])
+with tarfile.open(archive_path, "w:gz") as archive:
+    archive.add(staging_dir, arcname=".")
+    payload = b"forbidden AppleDouble metadata\n"
+    member = tarfile.TarInfo("./._flapjack")
+    member.size = len(payload)
+    archive.addfile(member, io.BytesIO(payload))
+PY
+EOF
+  chmod +x "$fake_bin/tar"
 
   cat >"$bin_path" <<'EOF'
 #!/usr/bin/env bash
@@ -283,25 +346,27 @@ if [ "$#" -ne 2 ] || [ "$1" != "build-info" ] || [ "$2" != "--json" ]; then
   echo "unexpected invocation: $*" >&2
   exit 64
 fi
-printf '%s\n' '{"schemaVersion":1,"version":"1.2.3","revision":"0123456789abcdef0123456789abcdef01234567","revisionKnown":true,"dirty":false,"dirtyKnown":true,"workspaceDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"release","target":"x86_64-unknown-linux-gnu","features":["vector-search"],"capabilities":{"vectorSearch":true,"vectorSearchLocal":false}}'
+printf '%s\n' '{"schemaVersion":1,"version":"1.2.3","revision":"0123456789abcdef0123456789abcdef01234567","revisionKnown":true,"dirty":false,"dirtyKnown":true,"workspaceDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"release","target":"x86_64-unknown-linux-musl","features":["vector-search"],"capabilities":{"vectorSearch":true,"vectorSearchLocal":false}}'
 : <<'FLAPJACK_BUILD_INFO_EMBED'
 FLAPJACK_BUILD_INFO_JSON_BEGIN
-{"schemaVersion":1,"version":"1.2.3","revision":"0123456789abcdef0123456789abcdef01234567","revisionKnown":true,"dirty":false,"dirtyKnown":true,"workspaceDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"release","target":"x86_64-unknown-linux-gnu","features":["vector-search"],"capabilities":{"vectorSearch":true,"vectorSearchLocal":false}}
+{"schemaVersion":1,"version":"1.2.3","revision":"0123456789abcdef0123456789abcdef01234567","revisionKnown":true,"dirty":false,"dirtyKnown":true,"workspaceDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"release","target":"x86_64-unknown-linux-musl","features":["vector-search"],"capabilities":{"vectorSearch":true,"vectorSearchLocal":false}}
 FLAPJACK_BUILD_INFO_JSON_END
 FLAPJACK_BUILD_INFO_EMBED
 EOF
   chmod +x "$bin_path"
 
-  if "$RELEASE_MANIFEST_HELPER" "x86_64-unknown-linux-gnu" "$bin_path" "$output_dir" >/dev/null 2>&1; then
-    manifest_path="$output_dir/flapjack-x86_64-unknown-linux-gnu.manifest.json"
-    if python3 - "$manifest_path" "$output_dir/flapjack-x86_64-unknown-linux-gnu.tar.gz" <<'PY'
+  if PATH="$fake_bin:$PATH" "$RELEASE_MANIFEST_HELPER" "x86_64-unknown-linux-musl" "$bin_path" "$output_dir" >/dev/null 2>&1; then
+    manifest_path="$output_dir/flapjack-x86_64-unknown-linux-musl.manifest.json"
+    if python3 - "$manifest_path" "$output_dir/flapjack-x86_64-unknown-linux-musl.tar.gz" "$bin_path" <<'PY'
 import hashlib
 import json
 import pathlib
 import sys
+import tarfile
 
 manifest_path = pathlib.Path(sys.argv[1])
 archive_path = pathlib.Path(sys.argv[2])
+binary_path = pathlib.Path(sys.argv[3])
 manifest = json.loads(manifest_path.read_text())
 expected_build = {
     "schemaVersion": 1,
@@ -312,33 +377,72 @@ expected_build = {
     "dirtyKnown": True,
     "workspaceDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "profile": "release",
-    "target": "x86_64-unknown-linux-gnu",
+    "target": "x86_64-unknown-linux-musl",
     "features": ["vector-search"],
     "capabilities": {"vectorSearch": True, "vectorSearchLocal": False},
+}
+expected_compatibility = {
+    "schemaVersion": 1,
+    "target": "x86_64-unknown-linux-musl",
+    "predecessors": [],
+    "dataDisposition": "preserve",
+    "mixedVersionReplication": "not_guaranteed",
 }
 
 expected_artifact = {
     "file": archive_path.name,
-    "target": "x86_64-unknown-linux-gnu",
+    "target": "x86_64-unknown-linux-musl",
     "arch": "x86_64",
     "profile": "release",
+    "binarySha256": hashlib.sha256(binary_path.read_bytes()).hexdigest(),
     "sha256": hashlib.sha256(archive_path.read_bytes()).hexdigest(),
 }
-if manifest.get("schemaVersion") != 1:
-    raise SystemExit("manifest schemaVersion must be 1")
+with tarfile.open(archive_path, "r:gz") as archive:
+    members = [member.name for member in archive.getmembers()]
+if members != [".", "./flapjack"]:
+    raise SystemExit(f"archive member contract mismatch: {members}")
+if manifest.get("schemaVersion") != 2:
+    raise SystemExit("manifest schemaVersion must be 2")
 if manifest.get("artifact") != expected_artifact:
     raise SystemExit(f"artifact contract mismatch: {manifest.get('artifact')}")
 if manifest.get("build") != expected_build:
     raise SystemExit(f"build object must be copied verbatim: {manifest.get('build')}")
+if manifest.get("compatibility") != expected_compatibility:
+    raise SystemExit(
+        f"compatibility object must be copied from the canonical contract: {manifest.get('compatibility')}"
+    )
 serialized = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
 for forbidden in ("algolia_migration_v1", "algoliaMigrationV1"):
     if forbidden in serialized:
         raise SystemExit(f"forbidden migration capability spelling present: {forbidden}")
 PY
     then
-      pass "release_artifact_manifest writes schemaVersion, artifact fields, and verbatim canonical build object"
+      pass "release_artifact_manifest writes artifact, build, and canonical compatibility objects"
     else
-      fail "release_artifact_manifest writes schemaVersion, artifact fields, and verbatim canonical build object"
+      fail "release_artifact_manifest writes artifact, build, and canonical compatibility objects"
+    fi
+
+    if predecessors="$($RELEASE_MANIFEST_HELPER --compatibility-predecessors "$manifest_path" 2>/dev/null)" \
+      && [ -z "$predecessors" ]; then
+      pass "release_artifact_manifest validates the candidate manifest and reports no unclaimed predecessors"
+    else
+      fail "release_artifact_manifest validates the candidate manifest and reports no unclaimed predecessors"
+    fi
+
+    mutated_manifest="$tmp_dir/divergent.manifest.json"
+    python3 - "$manifest_path" "$mutated_manifest" <<'PY'
+import json
+import pathlib
+import sys
+
+source = json.loads(pathlib.Path(sys.argv[1]).read_text())
+source.setdefault("compatibility", {})["dataDisposition"] = "replace"
+pathlib.Path(sys.argv[2]).write_text(json.dumps(source, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+    if "$RELEASE_MANIFEST_HELPER" --compatibility-predecessors "$mutated_manifest" >/dev/null 2>&1; then
+      fail "release_artifact_manifest rejects compatibility that diverges from the source contract"
+    else
+      pass "release_artifact_manifest rejects compatibility that diverges from the source contract"
     fi
   else
     fail "release_artifact_manifest accepts target, binary path, and output directory CLI"
@@ -347,25 +451,152 @@ PY
   rm -rf "$tmp_dir"
 }
 
-assert_linux_release_matrix_advertises_vector_search() {
-  local counts
-  counts="$(awk '
-    /- target: .*linux-musl/ {
-      linux_rows += 1
-      in_linux_row = 1
-      next
-    }
-    in_linux_row && /features:/ {
-      if ($2 == "\"vector-search\"") vector_rows += 1
-      in_linux_row = 0
-    }
-    END { printf "%d %d", linux_rows, vector_rows }
-  ' "$RELEASE_WORKFLOW")"
+assert_release_runtime_gate_contract() {
+  local tmp_dir fixtures_dir output_dir case_name weakened_gate
+  tmp_dir="$(mktemp -d)"
+  fixtures_dir="$tmp_dir/fixtures"
+  mkdir -p "$fixtures_dir"
 
-  if [ "$counts" = "2 2" ]; then
-    pass "both canonical Linux release artifacts compile vector-search"
+  if [ ! -x "$RELEASE_RUNTIME_GATE" ]; then
+    fail "release_artifact_runtime_gate is an executable shared archive and identity owner"
+    rm -rf "$tmp_dir"
+    return
+  fi
+  pass "release_artifact_runtime_gate is an executable shared archive and identity owner"
+
+  python3 - "$fixtures_dir" <<'PY'
+import io
+import json
+import pathlib
+import tarfile
+import sys
+
+root = pathlib.Path(sys.argv[1])
+build = {
+    "schemaVersion": 1,
+    "version": "1.2.3",
+    "revision": "0123456789abcdef0123456789abcdef01234567",
+    "revisionKnown": True,
+    "dirty": False,
+    "dirtyKnown": True,
+    "workspaceDigest": "a" * 64,
+    "profile": "release",
+    "target": "x86_64-unknown-linux-musl",
+    "features": ["vector-search"],
+    "capabilities": {"vectorSearch": True, "vectorSearchLocal": False},
+}
+(root / "manifest.json").write_text(
+    json.dumps({"schemaVersion": 2, "artifact": {}, "build": build, "compatibility": {}}, sort_keys=True, separators=(",", ":")) + "\n"
+)
+rust_order = json.dumps(build, separators=(",", ":"))
+outputs = (
+    ("good-bin", rust_order),
+    ("wrong-bin", rust_order.replace('"version":"1.2.3"', '"version":"9.9.9"')),
+    ("duplicate-bin", rust_order.replace('"version":"1.2.3",', '"version":"1.2.3","version":"1.2.3",')),
+)
+for name, output in outputs:
+    path = root / name
+    path.write_text("#!/usr/bin/env bash\nset -euo pipefail\n[ \"$#\" -eq 2 ] && [ \"$1\" = build-info ] && [ \"$2\" = --json ]\nprintf '%s\\n' '" + output + "'\n")
+    path.chmod(0o755)
+
+def member(name, member_type=tarfile.REGTYPE, linkname="", payload=b"candidate-binary"):
+    item = tarfile.TarInfo(name)
+    item.type = member_type
+    item.linkname = linkname
+    item.mode = 0o755
+    if member_type == tarfile.REGTYPE:
+        item.size = len(payload)
+    return item, payload
+
+def archive(name, members):
+    with tarfile.open(root / f"{name}.tar.gz", "w:gz") as tar:
+        directory = tarfile.TarInfo(".")
+        directory.type = tarfile.DIRTYPE
+        directory.mode = 0o755
+        tar.addfile(directory)
+        for item, payload in members:
+            tar.addfile(item, io.BytesIO(payload) if item.type == tarfile.REGTYPE else None)
+
+archive("good", [member("./flapjack")])
+archive("extra", [member("./flapjack"), member("./extra", payload=b"extra")])
+archive("absolute", [member("/flapjack")])
+archive("traversal", [member("../flapjack")])
+archive("symlink", [member("./flapjack", tarfile.SYMTYPE, "./target", b"")])
+archive("hardlink", [member("./flapjack", tarfile.LNKTYPE, "./target", b"")])
+archive("device", [member("./flapjack", tarfile.CHRTYPE, "", b"")])
+PY
+
+  output_dir="$tmp_dir/good-output"
+  mkdir -p "$output_dir"
+  if "$RELEASE_RUNTIME_GATE" extract "$fixtures_dir/good.tar.gz" "$output_dir" \
+    && [ -x "$output_dir/flapjack" ] \
+    && [ "$(cat "$output_dir/flapjack")" = "candidate-binary" ]; then
+    pass "runtime gate safely materializes the exact release archive contract"
   else
-    fail "both canonical Linux release artifacts compile vector-search (linux/vector rows: $counts)"
+    fail "runtime gate safely materializes the exact release archive contract"
+  fi
+
+  for case_name in extra absolute traversal symlink hardlink device; do
+    output_dir="$tmp_dir/${case_name}-output"
+    mkdir -p "$output_dir"
+    if "$RELEASE_RUNTIME_GATE" extract "$fixtures_dir/${case_name}.tar.gz" "$output_dir" >/dev/null 2>&1 \
+      || find "$output_dir" -mindepth 1 -print -quit | grep -q .; then
+      fail "runtime gate rejects ${case_name} archive members before materialization"
+    else
+      pass "runtime gate rejects ${case_name} archive members before materialization"
+    fi
+  done
+
+  if "$RELEASE_RUNTIME_GATE" attest "$fixtures_dir/good-bin" "$fixtures_dir/manifest.json"; then
+    pass "runtime gate accepts real Rust-order build-info JSON by semantic object equality"
+  else
+    fail "runtime gate accepts real Rust-order build-info JSON by semantic object equality"
+  fi
+  if "$RELEASE_RUNTIME_GATE" attest "$fixtures_dir/wrong-bin" "$fixtures_dir/manifest.json" >/dev/null 2>&1; then
+    fail "runtime gate rejects a candidate binary whose build-info differs from its manifest"
+  else
+    pass "runtime gate rejects a candidate binary whose build-info differs from its manifest"
+  fi
+  if "$RELEASE_RUNTIME_GATE" attest "$fixtures_dir/duplicate-bin" "$fixtures_dir/manifest.json" >/dev/null 2>&1; then
+    fail "runtime gate rejects duplicate-key build-info even when the duplicate value is unchanged"
+  else
+    pass "runtime gate rejects duplicate-key build-info even when the duplicate value is unchanged"
+  fi
+  weakened_gate="$tmp_dir/weakened-runtime-gate"
+  python3 - "$RELEASE_RUNTIME_GATE" "$weakened_gate" <<'PY'
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text()
+needle = "            object_pairs_hook=reject_duplicate_keys,\n"
+if source.count(needle) != 1:
+    raise SystemExit("strict decoder mutation point must occur exactly once")
+pathlib.Path(sys.argv[2]).write_text(source.replace(needle, ""))
+PY
+  chmod +x "$weakened_gate"
+  if "$weakened_gate" attest "$fixtures_dir/duplicate-bin" "$fixtures_dir/manifest.json" >/dev/null 2>&1; then
+    pass "duplicate-key fixture kills a decoder mutation that silently keeps the last value"
+  else
+    fail "duplicate-key fixture kills a decoder mutation that silently keeps the last value"
+  fi
+
+  rm -rf "$tmp_dir"
+}
+
+assert_public_release_matrix_is_closed() {
+  local actual expected
+  actual="$(job_block "build" | sed -nE 's/^[[:space:]]*- target:[[:space:]]*([^[:space:]]+)[[:space:]]*$/\1/p' | sort)"
+  expected="$(printf '%s\n' \
+    aarch64-apple-darwin \
+    aarch64-unknown-linux-musl \
+    x86_64-apple-darwin \
+    x86_64-pc-windows-msvc \
+    x86_64-unknown-linux-musl | sort)"
+
+  if [ "$actual" = "$expected" ]; then
+    pass "the public release workflow retains exactly its five existing target lanes"
+  else
+    fail "the public release workflow retains exactly its five existing target lanes"
   fi
 }
 
@@ -400,7 +631,10 @@ assert_contains "$RELEASE_WORKFLOW" '^\s*docker_manifest_verify:' "release.yml d
 assert_contains "$RELEASE_WORKFLOW" '^\s*docker_promote_stable:' "release.yml defines stable promotion lane"
 assert_contains "$RELEASE_WORKFLOW" "linux/amd64" "release.yml references linux/amd64"
 assert_contains "$RELEASE_WORKFLOW" "linux/arm64" "release.yml references linux/arm64"
-assert_contains "$RELEASE_WORKFLOW" "docker/setup-qemu-action@v3" "release.yml defines explicit qemu fallback path"
+assert_exact_count "$RELEASE_WORKFLOW" 'docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130' 2 "both QEMU lanes use the same full reviewed setup-qemu commit"
+assert_exact_count "$RELEASE_WORKFLOW" 'image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0' 2 "both QEMU lanes use the same immutable binfmt image index"
+assert_not_contains "$RELEASE_WORKFLOW" 'docker/setup-qemu-action@v[0-9]' "release.yml rejects mutable setup-qemu tags"
+assert_not_contains "$RELEASE_WORKFLOW" 'tonistiigi/binfmt:(latest|[A-Za-z0-9._-]+)' "release.yml rejects tagged or default-latest binfmt images"
 assert_contains "$RELEASE_WORKFLOW" "docker buildx imagetools inspect" "release.yml verifies candidate manifest contents"
 assert_contains "$RELEASE_WORKFLOW" "^\\s*RELEASE_REGISTRY: ghcr\\.io$" "release.yml declares one owner for the release registry host"
 assert_image_identity_ssot "$RELEASE_WORKFLOW" "this checkout"
@@ -422,8 +656,6 @@ assert_contains "$RELEASE_WORKFLOW" 'CHANGELOG\.md' "release.yml verifies change
 assert_contains "$RELEASE_WORKFLOW" 'grep -Fxq "version = \\"\$VERSION\\""' "release.yml uses literal Cargo manifest matching for the requested version"
 assert_contains "$RELEASE_WORKFLOW" 'grep -Fq "## \[\$\{VERSION\}\] - "' "release.yml uses literal changelog heading matching for the requested version"
 assert_contains "$RELEASE_WORKFLOW" 'version must match MAJOR\.MINOR\.PATCH or MAJOR\.MINOR\.PATCH-prerelease' "release.yml rejects unsafe release-version syntax before tagging or publishing"
-assert_contains "$RELEASE_WORKFLOW" "^\\s*if:\\s*\\$\\{\\{\\s*runner\\.os\\s*!=\\s*'Windows'\\s*\\}\\}" "unix packaging step uses valid runner.os expression syntax"
-assert_contains "$RELEASE_WORKFLOW" "^\\s*if:\\s*\\$\\{\\{\\s*runner\\.os\\s*==\\s*'Windows'\\s*\\}\\}" "windows packaging step uses valid runner.os expression syntax"
 
 section "GHCR publish credential preflight"
 # release.yml cuts the git tag and publishes the GitHub Release in `release`,
@@ -463,25 +695,82 @@ assert_job_contains "release_ci_status_preflight" '"\$\{\{ github\.repository \}
 assert_job_needs "release" "release_ci_status_preflight" "the public tag and GitHub Release wait for terminal push CI status"
 
 section "Release build identity packaging"
-assert_linux_release_matrix_advertises_vector_search
+assert_public_release_matrix_is_closed
 assert_contains "$HTTP_MANIFEST" 'utoipa-swagger-ui = \{ version = "8\.0", features = \["axum", "vendored"\] \}' "release builds vendor Swagger UI instead of downloading it during compilation"
-assert_contains "$RELEASE_WORKFLOW" "github\\.sha.*\\^\\[0-9a-f\\]\\{40\\}\\$|\\^\\[0-9a-f\\]\\{40\\}\\$.*github\\.sha" "release.yml verifies github.sha is exactly 40 lowercase hex characters"
-assert_contains "$RELEASE_WORKFLOW" "FLAPJACK_BUILD_REVISION: \\$\\{\\{ github\\.sha \\}\\}" "release.yml exports github.sha as FLAPJACK_BUILD_REVISION for release builds"
+assert_file_executable "$RELEASE_BUILD_HELPER" "build_release_artifact helper is executable"
+assert_file_executable "$RELEASE_BUILD_HELPER_CONTRACT" "build_release_artifact focused contract is executable"
+assert_contains "$RELEASE_BUILD_HELPER" '\^\[0-9a-f\]\{40\}\$' "build helper validates exact lowercase source SHA and tree coordinates"
+assert_contains "$RELEASE_BUILD_HELPER" '^export FLAPJACK_BUILD_REVISION="\$SOURCE_SHA"$' "build helper binds the embedded revision to the exact checked-out source"
+assert_contains "$RELEASE_BUILD_HELPER" '^export FLAPJACK_REQUIRE_DASHBOARD=1$' "build helper owns the fail-closed dashboard requirement for every profile"
 assert_cross_build_revision_passthrough
-assert_job_contains "build" '^      FLAPJACK_REQUIRE_DASHBOARD: "1"$' "the build job owns the fail-closed dashboard requirement for every matrix lane"
-assert_exact_count "$RELEASE_WORKFLOW" '^\s*FLAPJACK_REQUIRE_DASHBOARD:\s*"1"\s*$' 1 "release.yml declares the build-job dashboard requirement exactly once"
 assert_cross_passthrough_variable \
   "FLAPJACK_REQUIRE_DASHBOARD" \
   "engine/Cross.toml delivers the dashboard asset requirement into cross release builds"
-assert_contains "$RELEASE_WORKFLOW" "package/release_artifact_manifest \\$\\{\\{ matrix\\.target \\}\\} target/\\$\\{\\{ matrix\\.target \\}\\}/release/flapjack " "unix packaging calls the shared release_artifact_manifest helper"
-assert_contains "$RELEASE_WORKFLOW" "package/release_artifact_manifest \\$\\{\\{ matrix\\.target \\}\\} target/\\$\\{\\{ matrix\\.target \\}\\}/release/flapjack\\.exe " "windows packaging calls the shared release_artifact_manifest helper"
+assert_job_contains "build" 'package/build_release_artifact[[:space:]]*\\?$' "the public build matrix calls the shared build helper"
+assert_job_contains "build" '^[[:space:]]*public-all[[:space:]]*\\?$' "the public build matrix selects only the public-all closed profile"
+assert_job_contains "build" 'git rev-parse.*github\.sha.*\^\{tree\}' "the public build matrix supplies the exact candidate tree to the helper"
+assert_job_contains "build" '^[[:space:]]*package/engine_compatibility\.json[[:space:]]*\\?$' "the public build matrix passes only the checked-in compatibility SSOT"
+assert_job_not_contains "build" '^[[:space:]]*(cargo|cross) build|npm (ci|run build)|package/release_artifact_manifest' "release.yml cannot bypass the shared build and packaging owner"
+assert_job_not_contains "build" '^[[:space:]]*(features|use_cross):' "release.yml does not duplicate the helper's builder or feature map"
 assert_contains "$RELEASE_WORKFLOW" "flapjack-\\*\\.manifest\\.json" "release.yml uploads and publishes manifest JSON assets"
 assert_contains "$RELEASE_WORKFLOW" "flapjack-\\*\\.tar\\.gz" "release.yml uploads and publishes Unix archives"
 assert_contains "$RELEASE_WORKFLOW" "flapjack-\\*\\.tar\\.gz\\.sha256" "release.yml uploads and publishes Unix checksum sidecars"
 assert_contains "$RELEASE_WORKFLOW" "flapjack-\\*\\.zip" "release.yml uploads and publishes Windows archives"
 assert_contains "$RELEASE_WORKFLOW" "flapjack-\\*\\.zip\\.sha256" "release.yml uploads and publishes Windows checksum sidecars"
+assert_job_contains "build" 'engine/flapjack-\$\{\{ matrix\.target \}\}\.build\.json' "the build job uploads each exact source/toolchain build receipt"
+assert_job_contains "release" 'flapjack-\*\.build\.json' "the public release publishes every exact source/toolchain build receipt"
 assert_file_executable "$RELEASE_MANIFEST_HELPER" "release_artifact_manifest helper is executable"
+assert_contains "$ENGINE_COMPATIBILITY" '^\{"dataDisposition":"preserve","mixedVersionReplication":"not_guaranteed","schemaVersion":2,"targets":\{"aarch64-unknown-linux-musl":\[\{"binarySha256":"70912ad660d67f0c2457814d6e0c6149e9676b787a37ad761848725731bed88c","forwardTransferMode":"reuse_same_data_directory","manifestSha256":"9d567fc7a6c902793d51859a4808eba2cf5b26c7bdb6da5b81516c9798edadff","parityProfile":"same_data_upgrade_smoke_v1","releaseTag":"v1\.0\.16","rollbackMode":"binary_reactivate_same_data","transitionMode":"routine_same_host"\}\],"x86_64-unknown-linux-musl":\[\]\}\}$' "engine compatibility SSOT binds the normalized PBV6 predecessor for routine aarch64 replacement"
+assert_contains "$RELEASE_BUILD_HELPER" 'COMPATIBILITY_SOURCE_SHA256' "build helper binds the exact compatibility source digest in its receipt"
+assert_contains "$RELEASE_BUILD_HELPER" 'COMPATIBILITY_SELECTED_SHA256' "build helper binds the exact target-selected compatibility digest in its receipt"
 assert_release_helper_contract
+assert_release_runtime_gate_contract
+if bash "$RELEASE_BUILD_HELPER_CONTRACT"; then
+  pass "the fast closed-profile build helper contract is green"
+else
+  fail "the fast closed-profile build helper contract is green"
+fi
+if bash "$BUILD_IDENTITY_PACKAGE_CONTRACT" --legacy-normalization-only; then
+  pass "the fast legacy predecessor normalization contract is green"
+else
+  fail "the fast legacy predecessor normalization contract is green"
+fi
+
+section "Exact predecessor compatibility gate"
+assert_contains "$RELEASE_WORKFLOW" '^\s*engine_compatibility_gate:' "release.yml defines the pre-publication engine compatibility gate"
+assert_job_contains "engine_compatibility_gate" '^\s*needs:\s*build\s*$' "engine compatibility gate waits for packaged artifacts"
+assert_job_contains "engine_compatibility_gate" '^\s*timeout-minutes:\s*6\s*$' "engine compatibility gate has a bounded release-only runtime"
+assert_job_contains "engine_compatibility_gate" 'aarch64-unknown-linux-musl' "engine compatibility gate certifies the production aarch64 target"
+assert_job_contains "engine_compatibility_gate" 'x86_64-unknown-linux-musl' "engine compatibility gate certifies the x86_64 target"
+assert_job_contains "engine_compatibility_gate" 'docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130' "engine compatibility gate enables the pinned arm64 QEMU authority"
+assert_job_contains "engine_compatibility_gate" 'image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0' "engine compatibility gate pins the arm64 interpreter image by digest"
+assert_job_contains "engine_compatibility_gate" 'compatibility-predecessors' "engine compatibility gate enumerates only validated exact predecessor manifests"
+assert_job_contains "engine_compatibility_gate" 'timeout --signal=TERM --kill-after=5s 15s package/release_artifact_runtime_gate attest' "every candidate executes under a hard build-info attestation timeout"
+assert_job_order "engine_compatibility_gate" 'release_artifact_runtime_gate attest' 'if \[ ! -s "\$predecessors_file" \]' "candidate build-info attestation precedes the empty-predecessor decision"
+if [ "${RELEASE_STRUCTURE_SKIP_MUTANTS:-0}" != "1" ]; then
+  ATTESTATION_REMOVED_WORKFLOW="$(mktemp "${TMPDIR:-/tmp}/flapjack-release-no-attest.XXXXXX")"
+  sed '/timeout --signal=TERM --kill-after=5s 15s package\/release_artifact_runtime_gate attest/d' \
+    "$RELEASE_WORKFLOW" >"$ATTESTATION_REMOVED_WORKFLOW"
+  if RELEASE_STRUCTURE_SKIP_MUTANTS=1 RELEASE_WORKFLOW_UNDER_TEST="$ATTESTATION_REMOVED_WORKFLOW" \
+    bash "$0" >/dev/null 2>&1; then
+    fail "release structure contract kills removal of candidate runtime attestation"
+  else
+    pass "release structure contract kills removal of candidate runtime attestation"
+  fi
+  rm -f "$ATTESTATION_REMOVED_WORKFLOW"
+fi
+assert_exact_count "$RELEASE_WORKFLOW" 'package/release_artifact_runtime_gate extract' 2 "candidate and predecessor archives share one safe extraction owner"
+if job_block "engine_compatibility_gate" | grep -Eq 'tar -xzf'; then
+  fail "engine compatibility gate never delegates candidate or predecessor extraction to ambient tar"
+else
+  pass "engine compatibility gate never delegates candidate or predecessor extraction to ambient tar"
+fi
+assert_job_contains "engine_compatibility_gate" 'gh release download "\$release_tag"' "engine compatibility gate fetches each named published predecessor"
+assert_job_contains "engine_compatibility_gate" 'manifestSha256' "engine compatibility gate verifies the exact predecessor manifest digest"
+assert_job_contains "engine_compatibility_gate" 'old-binary-sha256 "\$binary_sha"' "engine compatibility smoke binds the predecessor executable to the exact declaration"
+assert_job_contains "engine_compatibility_gate" 'tests/upgrade_smoke\.sh' "engine compatibility gate executes the same-data-dir smoke owner"
+assert_job_contains "engine_compatibility_gate" 'timeout --signal=TERM --kill-after=5s 90s' "each historical upgrade smoke has a 90-second hard ceiling"
+assert_job_needs "release" "engine_compatibility_gate" "the public tag and release wait for exact predecessor compatibility proof"
 
 section "Docker build hang protection and retry safety"
 assert_contains "$DOCKERFILE" '^ARG FLAPJACK_BUILD_REVISION$' "Dockerfile accepts the canonical build revision as a build argument"
@@ -541,6 +830,12 @@ assert_contains "$CI_WORKFLOW" '^\s*run: bash engine/tests/validate_public_ledge
 # run 31213083385 failed exactly that way while this assertion was green. Requiring the
 # token here means the failing shape can no longer satisfy the contract.
 assert_contains "$CI_WORKFLOW" '^\s*run: GH_TOKEN="\$\{\{ github\.token \}\}" bash engine/tests/test_release_ci_status_preflight\.sh\s*$' "ci.yml runs the release CI-status preflight contract with GH_TOKEN"
+
+if [ "$SECONDS" -le 30 ]; then
+  pass "release workflow structure contract stays within its 30-second hard cap (${SECONDS}s)"
+else
+  fail "release workflow structure contract stays within its 30-second hard cap (${SECONDS}s)"
+fi
 
 printf '\n\033[1mResults: %d/%d passed\033[0m\n' "$TESTS_PASSED" "$TESTS_RUN"
 if [ "$TESTS_FAILED" -gt 0 ]; then

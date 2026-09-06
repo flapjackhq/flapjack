@@ -1,5 +1,5 @@
 //! Stub summary for engine/flapjack-http/src/startup_catchup.rs.
-use crate::handlers::internal::apply_ops_to_manager;
+use crate::handlers::internal::apply_ops_to_state;
 use crate::handlers::AppState;
 use flapjack::index::manager::publication::{
     PreStagedActivationStage, PreStagedPublication, PublicationTargetDisposition,
@@ -23,6 +23,10 @@ pub async fn run_startup_catchup(state: Arc<AppState>) {
     if state.replication_manager.is_none() {
         return; // Standalone mode — nothing to do
     }
+    let Ok(_mutation_permit) = state.global_mutation_fence.admit_mutation().await else {
+        tracing::info!("release mutation fence is active; skipping startup catch-up");
+        return;
+    };
     delayed_catchup_from_peers(&state).await;
 }
 
@@ -175,6 +179,10 @@ pub async fn run_periodic_catchup(state: Arc<AppState>) {
     if state.replication_manager.is_none() {
         return;
     }
+    let Ok(_mutation_permit) = state.global_mutation_fence.admit_mutation().await else {
+        tracing::debug!("release mutation fence is active; periodic catch-up skipped");
+        return;
+    };
     run_lenient_catchup_round(&state, "REPL-sync", "periodic catch-up skipped").await;
 }
 
@@ -400,6 +408,15 @@ fn stage_snapshot_bytes(
     let repair = manager
         .repair_publication_target(tenant_id)
         .map_err(|error| (snapshot_repair_step(&error), error.to_string()))?;
+    stage_snapshot_bytes_after_repair(manager, tenant_id, snapshot_bytes, repair)
+}
+
+fn stage_snapshot_bytes_after_repair(
+    manager: &flapjack::IndexManager,
+    tenant_id: &str,
+    snapshot_bytes: &[u8],
+    repair: flapjack::index::manager::publication::PublicationRepairReport,
+) -> Result<PreStagedPublication, (SnapshotInstallStep, String)> {
     if !matches!(
         repair.disposition,
         PublicationTargetDisposition::Loadable | PublicationTargetDisposition::Vacant
@@ -498,9 +515,17 @@ async fn prepare_snapshot_restore(
     validate_tenant_id(tenant_id)
         .map_err(|error| (SnapshotInstallStep::ValidateTenantId, error))?;
     if manager.base_path.join(tenant_id).exists() {
-        let quiesce = quiesce_snapshot_destination(manager, tenant_id).await?;
-        let publication =
-            stage_snapshot_bytes_off_runtime(manager, tenant_id, snapshot_bytes).await?;
+        let (quiesce, repair) = manager
+            .quiesce_and_repair_publication_target(tenant_id)
+            .await
+            .map_err(|error| (snapshot_repair_step(&error), error.to_string()))?;
+        let publication = stage_snapshot_bytes_after_repair_off_runtime(
+            manager,
+            tenant_id,
+            snapshot_bytes,
+            repair,
+        )
+        .await?;
         return Ok((quiesce, publication));
     }
 
@@ -524,6 +549,21 @@ async fn stage_snapshot_bytes_off_runtime(
     tokio::task::spawn_blocking(move || stage_snapshot_bytes(&manager, &tenant, &snapshot_bytes))
         .await
         .map_err(|join_error| (SnapshotInstallStep::ImportExtract, join_error.to_string()))?
+}
+
+async fn stage_snapshot_bytes_after_repair_off_runtime(
+    manager: &Arc<flapjack::IndexManager>,
+    tenant_id: &str,
+    snapshot_bytes: Vec<u8>,
+    repair: flapjack::index::manager::publication::PublicationRepairReport,
+) -> Result<PreStagedPublication, (SnapshotInstallStep, String)> {
+    let manager = Arc::clone(manager);
+    let tenant = tenant_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        stage_snapshot_bytes_after_repair(&manager, &tenant, &snapshot_bytes, repair)
+    })
+    .await
+    .map_err(|join_error| (SnapshotInstallStep::ImportExtract, join_error.to_string()))?
 }
 
 async fn quiesce_snapshot_destination(
@@ -800,7 +840,7 @@ async fn catchup_single_tenant(
         tenant_id,
         local_seq
     );
-    apply_and_log_ops(&state.manager, tenant_id, &response.ops, log_prefix).await
+    apply_and_log_ops(state, tenant_id, &response.ops, log_prefix).await
 }
 
 /// TODO: Document fetch_missed_ops.
@@ -824,12 +864,12 @@ async fn fetch_missed_ops(
 /// Applies a batch of oplog entries to a tenant via the index manager and logs
 /// the resulting sequence number or error.
 async fn apply_and_log_ops(
-    manager: &flapjack::IndexManager,
+    state: &AppState,
     tenant_id: &str,
     ops: &[flapjack::index::oplog::OpLogEntry],
     log_prefix: &str,
 ) -> Result<(), String> {
-    match apply_ops_to_manager(manager, tenant_id, ops).await {
+    match apply_ops_to_state(state, tenant_id, ops).await {
         Ok(seq) => {
             tracing::info!(
                 "[{}] Applied ops up to seq {} for tenant '{}'",
@@ -952,13 +992,23 @@ mod tests {
         tenant_id: &str,
     ) {
         let publication_root = manager.base_path.join(".publication").join(tenant_id);
+        let retained_paths = if publication_root.exists() {
+            std::fs::read_dir(&publication_root)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let epoch_paths =
+            flapjack::index::manager::publication::publication_epoch_paths_for_target_path(
+                &manager.base_path.join(tenant_id),
+            );
         assert!(
-            !publication_root.exists()
-                || std::fs::read_dir(publication_root)
-                    .unwrap()
-                    .next()
-                    .is_none(),
-            "failed validation must remove its unjournaled transaction"
+            retained_paths
+                .iter()
+                .all(|path| path == &epoch_paths.epoch || path == &epoch_paths.lock),
+            "failed validation must remove its unjournaled transaction and may retain only canonical durable epoch/lock evidence; retained: {retained_paths:?}"
         );
     }
 

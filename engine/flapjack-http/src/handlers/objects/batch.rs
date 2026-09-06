@@ -541,8 +541,15 @@ pub(super) fn trigger_replication(
     };
     let mgr = Arc::clone(&state.manager);
     let tenant = index_name.to_string();
+    let mutation_permit = crate::pause_registry::request_mutation_permit()
+        .or_else(|| state.global_mutation_fence.try_admit_mutation().ok());
+    let Some(mutation_permit) = mutation_permit else {
+        tracing::warn!("[REPL] no admitted mutation permit for document replication child");
+        return;
+    };
 
     tokio::spawn(async move {
+        let _mutation_permit = mutation_permit;
         if needs_delay {
             // Write queue flushes every ~100ms; 300ms gives a comfortable margin.
             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;

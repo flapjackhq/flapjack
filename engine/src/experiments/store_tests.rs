@@ -1,5 +1,7 @@
 use super::*;
 use crate::experiments::config::*;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use tempfile::TempDir;
 
 /// Create a minimal draft `Experiment` fixture for testing with the given ID and index name.
@@ -46,6 +48,75 @@ fn create_and_get_succeeds() {
     let loaded = store.get("abc-123").unwrap();
     assert_eq!(loaded.name, "test");
     assert_eq!(loaded.index_name, "products");
+}
+
+#[test]
+fn load_only_startup_preserves_experiment_bytes_and_defers_missing_directory_creation() {
+    let populated = TempDir::new().unwrap();
+    let store = ExperimentStore::new(populated.path()).unwrap();
+    store
+        .create(make_experiment("persisted-exp", "products"))
+        .unwrap();
+    let experiment_path = populated.path().join(".experiments/persisted-exp.json");
+    let map_path = populated.path().join(".experiments/_id_map.json");
+    let before = (
+        std::fs::read(&experiment_path).unwrap(),
+        std::fs::read(&map_path).unwrap(),
+    );
+    #[cfg(unix)]
+    let before_inodes = (
+        std::fs::metadata(&experiment_path).unwrap().ino(),
+        std::fs::metadata(&map_path).unwrap().ino(),
+    );
+
+    let reopened = ExperimentStore::load_only(populated.path()).unwrap();
+    assert_eq!(reopened.get("persisted-exp").unwrap().id, "persisted-exp");
+    assert_eq!(
+        (
+            std::fs::read(&experiment_path).unwrap(),
+            std::fs::read(&map_path).unwrap()
+        ),
+        before
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        (
+            std::fs::metadata(&experiment_path).unwrap().ino(),
+            std::fs::metadata(&map_path).unwrap().ino()
+        ),
+        before_inodes,
+        "load-only startup must not atomically republish experiment state"
+    );
+
+    let retried = ExperimentStore::load_only(populated.path()).unwrap();
+    assert_eq!(retried.get("persisted-exp").unwrap().id, "persisted-exp");
+    assert_eq!(
+        (
+            std::fs::read(&experiment_path).unwrap(),
+            std::fs::read(&map_path).unwrap()
+        ),
+        before
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        (
+            std::fs::metadata(&experiment_path).unwrap().ino(),
+            std::fs::metadata(&map_path).unwrap().ino()
+        ),
+        before_inodes,
+        "a retried load-only startup must remain zero-write"
+    );
+
+    let absent = TempDir::new().unwrap();
+    let deferred = ExperimentStore::load_only(absent.path()).unwrap();
+    assert!(!absent.path().join(".experiments").exists());
+    deferred
+        .create(make_experiment("after-release", "products"))
+        .expect("the first post-release mutation should initialize persistence");
+    assert!(absent
+        .path()
+        .join(".experiments/after-release.json")
+        .is_file());
 }
 
 #[test]

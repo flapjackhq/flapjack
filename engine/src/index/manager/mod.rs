@@ -30,6 +30,8 @@ use dashmap::DashMap;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 
@@ -152,6 +154,7 @@ pub struct IndexManager {
     node_id: String,
     pub(crate) loaded: DashMap<TenantId, Arc<Index>>,
     tenant_load_locks: DashMap<TenantId, Arc<std::sync::Mutex<()>>>,
+    replication_apply_locks: DashMap<TenantId, Arc<tokio::sync::Mutex<()>>>,
     admission_stores: DashMap<TenantId, Arc<WriteAdmissionStore>>,
     pub(crate) write_queues: DashMap<TenantId, WriteQueue>,
     pub(crate) write_task_handles: DashMap<TenantId, WriteTaskHandle>,
@@ -175,6 +178,9 @@ pub struct IndexManager {
     /// Optional dictionary manager for custom stopwords/plurals/compounds in the query pipeline.
     dictionary_manager: OnceLock<Arc<crate::dictionaries::manager::DictionaryManager>>,
     analytics_config: OnceLock<crate::analytics::AnalyticsConfig>,
+    analytics_collector: OnceLock<Arc<crate::analytics::AnalyticsCollector>>,
+    #[cfg(test)]
+    fail_next_tenant_removal: AtomicBool,
     bulk_build_writer_config: BulkBuildWriterConfig,
 }
 
@@ -243,6 +249,7 @@ impl IndexManager {
                 node_id: node_id.into(),
                 loaded: DashMap::new(),
                 tenant_load_locks: DashMap::new(),
+                replication_apply_locks: DashMap::new(),
                 admission_stores: DashMap::new(),
                 write_queues: DashMap::new(),
                 write_task_handles: DashMap::new(),
@@ -260,6 +267,9 @@ impl IndexManager {
                 vector_indices: Arc::new(DashMap::new()),
                 dictionary_manager: OnceLock::new(),
                 analytics_config: OnceLock::new(),
+                analytics_collector: OnceLock::new(),
+                #[cfg(test)]
+                fail_next_tenant_removal: AtomicBool::new(false),
                 bulk_build_writer_config,
             }
         })
@@ -299,6 +309,19 @@ impl IndexManager {
         let _ = self.analytics_config.set(config);
     }
 
+    /// Bind the running analytics mutation owner to index lifecycle deletion.
+    pub fn set_analytics_collector(&self, collector: Arc<crate::analytics::AnalyticsCollector>) {
+        collector.bind_index_data_dir(self.base_path.clone());
+        let _ = self.analytics_config.set(collector.config().clone());
+        let _ = self.analytics_collector.set(collector);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_tenant_removal_for_test(&self) {
+        self.fail_next_tenant_removal
+            .store(true, AtomicOrdering::SeqCst);
+    }
+
     pub(super) fn publication_analytics_config(&self) -> crate::analytics::AnalyticsConfig {
         self.analytics_config
             .get()
@@ -323,6 +346,19 @@ impl IndexManager {
             .map_err(Into::into)
     }
 
+    /// Serialize one tenant's replication comparison, effects, and durable acknowledgement.
+    pub async fn lock_replication_apply(
+        &self,
+        tenant_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.replication_apply_locks
+            .entry(tenant_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+            .lock_owned()
+            .await
+    }
+
     /// Arm one tenant's next write-queue commit to fail.
     ///
     /// This control exists only in explicit fault-injection builds.
@@ -341,6 +377,38 @@ impl IndexManager {
         fault_point: crate::index::write_queue::FinalizationFaultPoint,
     ) -> impl Drop {
         crate::index::write_queue::fail_next_finalization_for_test(tenant_id, fault_point)
+    }
+
+    /// Arm the next tenant write at the pre-Tantivy-commit boundary.
+    ///
+    /// This named test seam avoids exposing the internal finalization enum to
+    /// fault-injection consumers outside the core crate.
+    #[cfg(feature = "fault-injection")]
+    pub fn fail_next_before_tantivy_commit_for_test(&self, tenant_id: &str) -> impl Drop {
+        crate::index::write_queue::fail_next_finalization_for_test(
+            tenant_id,
+            crate::index::write_queue::FinalizationFaultPoint::BeforeTantivyCommit,
+        )
+    }
+
+    /// Arm the existing compensation seam to fail a bounded number of times.
+    ///
+    /// This control exists only in explicit fault-injection builds.
+    #[cfg(feature = "fault-injection")]
+    pub fn fail_compensation_attempts_for_test(
+        &self,
+        tenant_id: &str,
+        attempts: usize,
+    ) -> impl Drop {
+        crate::index::write_queue::fail_compensation_attempts_for_test(tenant_id, attempts)
+    }
+
+    /// Return the remaining injected compensation failures for one tenant.
+    ///
+    /// This control exists only in explicit fault-injection builds.
+    #[cfg(feature = "fault-injection")]
+    pub fn compensation_fault_attempts_remaining_for_test(&self, tenant_id: &str) -> usize {
+        crate::index::write_queue::compensation_fault_attempts_remaining_for_test(tenant_id)
     }
 
     pub fn get_task(&self, task_id: &str) -> Result<TaskInfo> {
@@ -487,9 +555,97 @@ impl IndexManager {
         self.loaded.len()
     }
 
+    /// Fallibly measure the total disk usage for one tenant's index and analytics data.
+    ///
+    /// When neither the index nor analytics storage root exists, this fallible
+    /// path reports unavailable. The compatibility wrapper below still maps
+    /// that error to zero, while cached metering can retain its last known
+    /// value. Either root may exist independently, and a missing optional root
+    /// contributes a known zero.
+    pub fn try_tenant_storage_bytes(&self, tenant_id: &str) -> Result<u64> {
+        validate_index_name(tenant_id)?;
+        let index_path = self.base_path.join(tenant_id);
+        let analytics_path = self
+            .publication_analytics_config()
+            .target_artifact_paths(tenant_id)
+            .index_root;
+
+        // `dir_size_bytes` intentionally maps a missing or non-directory root
+        // to zero. This fallible path must distinguish those cases so cached
+        // metering can retain its last known value instead of publishing a
+        // false zero. Recheck after each scan to detect root replacement or
+        // removal during measurement.
+        let directory_present = |path: &std::path::Path| -> Result<bool> {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_dir() => Ok(true),
+                Ok(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("tenant storage root is not a directory: {}", path.display()),
+                )
+                .into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error.into()),
+            }
+        };
+
+        let index_present = directory_present(&index_path)?;
+        let index_bytes = if index_present {
+            let bytes = crate::index::storage_size::dir_size_bytes(&index_path)?;
+            if !directory_present(&index_path)? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("tenant storage root disappeared: {}", index_path.display()),
+                )
+                .into());
+            }
+            bytes
+        } else {
+            0
+        };
+
+        if crate::index::storage_size::directory_paths_overlap(&index_path, &analytics_path) {
+            if !index_present {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("tenant storage root not found: {}", index_path.display()),
+                )
+                .into());
+            }
+            return Ok(index_bytes);
+        }
+
+        let analytics_present = directory_present(&analytics_path)?;
+        if !index_present && !analytics_present {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("tenant storage roots not found for {tenant_id}"),
+            )
+            .into());
+        }
+        let analytics_bytes = if analytics_present {
+            let bytes = crate::index::storage_size::dir_size_bytes(&analytics_path)?;
+            if !directory_present(&analytics_path)? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "tenant storage root disappeared: {}",
+                        analytics_path.display()
+                    ),
+                )
+                .into());
+            }
+            bytes
+        } else {
+            0
+        };
+        Ok(index_bytes.saturating_add(analytics_bytes))
+    }
+
     /// Return the total disk usage in bytes for a single tenant's index and analytics data.
     ///
-    /// Returns 0 if neither tenant directory exists.
+    /// This compatibility wrapper preserves the historical per-root
+    /// zero-on-error behavior. Callers that must distinguish unavailable from
+    /// known zero use [`Self::try_tenant_storage_bytes`].
     pub fn tenant_storage_bytes(&self, tenant_id: &str) -> u64 {
         if validate_index_name(tenant_id).is_err() {
             return 0;
@@ -538,6 +694,20 @@ impl IndexManager {
             .map(|r| r.num_docs() as u64)
             .sum();
         Some(count)
+    }
+
+    /// Read the committed document count without loading or recovering a tenant.
+    ///
+    /// This opens only Tantivy's durable reader metadata. It does not replay the
+    /// oplog, create a writer, or insert into `loaded`.
+    pub fn tenant_durable_doc_count(&self, tenant_id: &str) -> Result<u64> {
+        validate_index_name(tenant_id)?;
+        let index = tantivy::Index::open_in_dir(self.base_path.join(tenant_id))?;
+        let reader: tantivy::IndexReader = index
+            .reader_builder()
+            .reload_policy(tantivy::ReloadPolicy::Manual)
+            .try_into()?;
+        Ok(reader.searcher().num_docs())
     }
 
     /// Load durable index metadata for a tenant without requiring the full index to be loaded.
@@ -589,15 +759,28 @@ impl IndexManager {
     }
 
     pub fn make_noop_task(&self, index_name: &str) -> Result<TaskInfo> {
-        // Synchronous metadata operations still publish ordinary task IDs, so
-        // they must pass through the same retention owner as queued writes.
+        let task = self.reserve_noop_task(index_name)?;
+        Ok(self.commit_reserved_noop_task(index_name, task))
+    }
+
+    /// Reserve the real task identity before an atomic publication journal is
+    /// committed. Numeric gaps on failed publication are safe; fabricated or
+    /// post-commit identities are not.
+    pub(crate) fn reserve_noop_task(&self, index_name: &str) -> Result<TaskInfo> {
+        validate_index_name(index_name)?;
         let numeric_id = self.next_numeric_task_id();
         let task_id = format!("task_{}_{}", index_name, uuid::Uuid::new_v4());
         let mut task = TaskInfo::new(task_id.clone(), numeric_id, 0);
         task.status = TaskStatus::Succeeded;
+        Ok(task)
+    }
+
+    pub(crate) fn commit_reserved_noop_task(&self, index_name: &str, task: TaskInfo) -> TaskInfo {
+        // Synchronous metadata operations still publish ordinary task IDs, so
+        // they must pass through the same retention owner as queued writes.
         self.task_retention
             .insert(&self.tasks, index_name, task.clone(), MAX_TASKS_PER_TENANT);
-        Ok(task)
+        task
     }
 
     /// Return the tenant's `OpLog`, creating and caching it on first access. Opens the

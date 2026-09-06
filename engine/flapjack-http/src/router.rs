@@ -16,11 +16,14 @@ use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
-use crate::api_profile::{is_paid_beta_v3_customer_path, ApiProfile};
+use crate::api_profile::{
+    is_paid_beta_v3_customer_path, is_paid_beta_v4_customer_path, is_paid_beta_v5_customer_path,
+    ApiProfile,
+};
 use crate::auth::{
-    authenticate_and_authorize, request_application_id,
+    authenticate_and_authorize, request_application_id, route_policy,
     session::{DashboardSessionStore, SessionStoreError},
-    AuthenticatedAppId, KeyStore, RateLimiter, ReplicationPeerCredential,
+    AuthenticatedAppId, KeyStore, RateLimiter, ReplicationPeerCredential, RouteEffect,
 };
 use crate::handlers;
 use crate::handlers::analytics;
@@ -149,7 +152,10 @@ fn build_router_with_resource_bounds(
         disable_dashboard: config.disable_dashboard
             || matches!(
                 config.api_profile,
-                ApiProfile::PaidBetaV1 | ApiProfile::PaidBetaV3
+                ApiProfile::PaidBetaV1
+                    | ApiProfile::PaidBetaV3
+                    | ApiProfile::PaidBetaV4
+                    | ApiProfile::PaidBetaV5
             ),
         ..config
     };
@@ -178,7 +184,11 @@ fn build_router_with_resource_bounds(
             data_dir,
             state.notification_service.clone(),
         ))
-        .merge(build_internal_routes(state.clone(), auth_enabled));
+        .merge(build_internal_routes(
+            state.clone(),
+            auth_enabled,
+            config.api_profile,
+        ));
 
     let app = if config.disable_dashboard {
         app
@@ -540,7 +550,11 @@ fn build_protected_routes(state: Arc<AppState>, data_dir: &Path, auth_enabled: b
 }
 
 /// TODO: Document build_internal_routes.
-fn build_internal_routes(state: Arc<AppState>, auth_enabled: bool) -> Router {
+fn build_internal_routes(
+    state: Arc<AppState>,
+    auth_enabled: bool,
+    api_profile: ApiProfile,
+) -> Router {
     let public_routes = Router::new()
         .route(
             "/.well-known/acme-challenge/:token",
@@ -563,7 +577,10 @@ fn build_internal_routes(state: Arc<AppState>, auth_enabled: bool) -> Router {
     // membership is excluded because that surface can persist attacker-chosen
     // peer origins and drive server-side fan-out traffic.
     let replication_mesh_routes = Router::new()
-        .route("/internal/replicate", post(internal::replicate_ops))
+        .route(
+            "/internal/replicate",
+            post(internal::replicate_ops_with_headers),
+        )
         .route("/internal/ops", get(internal::get_ops))
         .route("/internal/tenants", get(internal::list_tenants))
         .route(
@@ -581,12 +598,32 @@ fn build_internal_routes(state: Arc<AppState>, auth_enabled: bool) -> Router {
         let admin_internal_routes = Router::new()
             .route("/internal/cluster/peers", post(internal::add_cluster_peer))
             .route(
+                "/internal/build-info",
+                get(handlers::health::protected_build_info),
+            )
+            .route(
+                "/internal/indexes/:indexName/count",
+                post(internal::count_only_search),
+            )
+            .route(
                 "/internal/cluster/peers/:node_id",
                 delete(internal::remove_cluster_peer),
             )
             .route("/internal/rollup-cache", get(internal::rollup_cache_status))
             .route("/internal/storage", get(internal::storage_all))
             .route("/internal/storage/:indexName", get(internal::storage_index))
+            .route(
+                "/internal/release-write-fence/status",
+                get(internal::release_write_fence_status),
+            )
+            .route(
+                "/internal/release-write-fence/acquire",
+                post(internal::acquire_release_write_fence),
+            )
+            .route(
+                "/internal/release-write-fence/release",
+                post(internal::release_release_write_fence),
+            )
             .route("/internal/pause/:indexName", post(internal::pause_index))
             .route("/internal/resume/:indexName", post(internal::resume_index))
             .route(
@@ -596,10 +633,29 @@ fn build_internal_routes(state: Arc<AppState>, auth_enabled: bool) -> Router {
             .with_state(state.clone());
         #[cfg(feature = "fault-injection")]
         let admin_internal_routes = admin_internal_routes.merge(build_fault_routes(state.clone()));
-        Router::new()
+        let admin_routes = Router::new()
             .merge(internal_read_routes)
             .merge(replication_mesh_routes)
-            .merge(admin_internal_routes)
+            .merge(admin_internal_routes);
+        let admin_routes = if api_profile == ApiProfile::PaidBetaV5 {
+            admin_routes.merge(
+                Router::new()
+                    .route(
+                        "/internal/recommendations/analytics",
+                        get(handlers::recommend::recommendation_analytics),
+                    )
+                    .with_state(state.clone()),
+            )
+        } else {
+            admin_routes
+        };
+        if (api_profile == ApiProfile::PaidBetaV4 && PBV4_CRAWLER_ROUTES_ENABLED)
+            || api_profile == ApiProfile::PaidBetaV5
+        {
+            admin_routes.merge(build_pbv4_crawler_routes(state.clone()))
+        } else {
+            admin_routes
+        }
     } else {
         // No-auth mode still needs replication/catch-up routes for HA convergence.
         Router::new()
@@ -608,6 +664,32 @@ fn build_internal_routes(state: Arc<AppState>, auth_enabled: bool) -> Router {
     };
 
     public_routes.merge(internal_routes)
+}
+
+/// Wave-0 freezes the canonical route wiring without exposing an incomplete
+/// crawler runtime. The PBV4 coordinator alone may flip this after the full
+/// publication/replay/cancellation proof lands.
+pub(crate) const PBV4_CRAWLER_ROUTES_ENABLED: bool = false;
+
+fn build_pbv4_crawler_routes(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route(
+            "/internal/crawler/runs",
+            post(handlers::crawler::start_crawler_run),
+        )
+        .route(
+            "/internal/crawler/runs/:run_id",
+            get(handlers::crawler::get_crawler_run),
+        )
+        .route(
+            "/internal/crawler/runs/:run_id/cancel",
+            post(handlers::crawler::cancel_crawler_run),
+        )
+        .route(
+            "/internal/crawler/runs/:run_id/ack",
+            post(handlers::crawler::ack_crawler_run),
+        )
+        .with_state(state)
 }
 
 #[cfg(feature = "fault-injection")]
@@ -785,7 +867,10 @@ pub(crate) fn build_cors_layer(mode: &CorsMode) -> CorsLayer {
 }
 
 fn build_profile_cors_layer(mode: &CorsMode, profile: ApiProfile) -> CorsLayer {
-    if profile != ApiProfile::PaidBetaV3 {
+    if !matches!(
+        profile,
+        ApiProfile::PaidBetaV3 | ApiProfile::PaidBetaV4 | ApiProfile::PaidBetaV5
+    ) {
         return build_cors_layer(mode);
     }
 
@@ -804,13 +889,22 @@ async fn enforce_profile_cors_admission(
     next: middleware::Next,
     profile: ApiProfile,
 ) -> Response {
-    if profile == ApiProfile::PaidBetaV3 && request.method() == Method::OPTIONS {
+    if matches!(
+        profile,
+        ApiProfile::PaidBetaV3 | ApiProfile::PaidBetaV4 | ApiProfile::PaidBetaV5
+    ) && request.method() == Method::OPTIONS
+    {
         let requested_method = request
             .headers()
             .get("access-control-request-method")
             .and_then(|value| value.to_str().ok());
-        if !is_paid_beta_v3_customer_path(request.uri().path()) || requested_method != Some("POST")
-        {
+        let customer_path = match profile {
+            ApiProfile::PaidBetaV3 => is_paid_beta_v3_customer_path(request.uri().path()),
+            ApiProfile::PaidBetaV4 => is_paid_beta_v4_customer_path(request.uri().path()),
+            ApiProfile::PaidBetaV5 => is_paid_beta_v5_customer_path(request.uri().path()),
+            _ => false,
+        };
+        if !customer_path || requested_method != Some("POST") {
             return StatusCode::NOT_FOUND.into_response();
         }
     }
@@ -955,6 +1049,7 @@ fn apply_middleware(
     let max_body_mb: usize =
         max_body_mb_from_value(std::env::var("FLAPJACK_MAX_BODY_MB").ok().as_deref());
     let security_header_policy = SecurityHeaderPolicy::from_env();
+    let mutation_fence = state.global_mutation_fence.clone();
 
     let mgr_for_pressure = Arc::clone(&state.manager);
     let default_facet_cache_cap = state
@@ -1014,6 +1109,10 @@ fn apply_middleware(
 
     let api_profile = config.api_profile;
     app_id_layer(app)
+        .layer(middleware::from_fn(move |request, next| {
+            let mutation_fence = mutation_fence.clone();
+            enforce_global_mutation_fence(request, next, mutation_fence)
+        }))
         .layer(memory_middleware)
         .layer(DefaultBodyLimit::max(max_body_mb * 1024 * 1024))
         .layer(middleware::from_fn(normalize_content_type))
@@ -1044,6 +1143,37 @@ fn apply_middleware(
             insert_security_headers(request, next, security_header_policy.clone())
         }))
         .layer(Extension(api_profile))
+}
+
+async fn enforce_global_mutation_fence(
+    mut request: axum::extract::Request,
+    next: middleware::Next,
+    mutation_fence: crate::pause_registry::GlobalMutationFence,
+) -> Response {
+    let policy = route_policy(request.method(), request.uri().path());
+    let requires_permit = match policy.effect {
+        RouteEffect::Mutation => true,
+        RouteEffect::Read | RouteEffect::FenceControl => false,
+        RouteEffect::Unmapped => !matches!(
+            *request.method(),
+            Method::GET | Method::HEAD | Method::OPTIONS
+        ),
+    };
+    if !requires_permit {
+        return next.run(request).await;
+    }
+
+    let permit = match mutation_fence.admit_mutation().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            return crate::error_response::json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Mutations are temporarily unavailable during a release upgrade",
+            )
+        }
+    };
+    request.extensions_mut().insert(permit.clone());
+    crate::pause_registry::scope_request_mutation(permit, next.run(request)).await
 }
 
 async fn enforce_request_timeout(

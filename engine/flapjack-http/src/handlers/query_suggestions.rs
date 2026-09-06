@@ -1,6 +1,6 @@
 //! Stub summary for query_suggestions.rs.
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -111,6 +111,7 @@ pub async fn list_configs(State(state): State<Arc<AppState>>) -> impl IntoRespon
 )]
 pub async fn create_config(
     State(state): State<Arc<AppState>>,
+    Extension(mutation_permit): Extension<crate::pause_registry::MutationPermit>,
     Json(config): Json<QsConfig>,
 ) -> impl IntoResponse {
     if let Err(message) = validate_qs_config(&config) {
@@ -135,7 +136,7 @@ pub async fn create_config(
 
     // Mark as running and fire off async build
     mark_build_running(&s, &config.index_name);
-    spawn_build(Arc::clone(&state), config.clone());
+    spawn_build(Arc::clone(&state), config.clone(), mutation_permit);
 
     mutation_success_response(
         "Configuration was created, and a new indexing job has been scheduled.",
@@ -179,6 +180,7 @@ pub async fn get_config(
     security(("api_key" = [])))]
 pub async fn update_config(
     State(state): State<Arc<AppState>>,
+    Extension(mutation_permit): Extension<crate::pause_registry::MutationPermit>,
     Path(index_name): Path<String>,
     Json(mut config): Json<QsConfig>,
 ) -> impl IntoResponse {
@@ -213,7 +215,7 @@ pub async fn update_config(
     }
 
     mark_build_running(&s, &config.index_name);
-    spawn_build(Arc::clone(&state), config);
+    spawn_build(Arc::clone(&state), config, mutation_permit);
 
     mutation_success_response(
         "Configuration was updated, and a new indexing job has been scheduled.",
@@ -308,6 +310,7 @@ pub async fn get_logs(
     security(("api_key" = [])))]
 pub async fn trigger_build(
     State(state): State<Arc<AppState>>,
+    Extension(mutation_permit): Extension<crate::pause_registry::MutationPermit>,
     Path(index_name): Path<String>,
 ) -> impl IntoResponse {
     if let Err(message) = validate_qs_index_name(&index_name) {
@@ -333,18 +336,23 @@ pub async fn trigger_build(
     }
 
     mark_build_running(&s, &index_name);
-    spawn_build(Arc::clone(&state), config);
+    spawn_build(Arc::clone(&state), config, mutation_permit);
 
     mutation_success_response("Build triggered.")
 }
 
 /// Spawn a background build task.
-fn spawn_build(state: Arc<AppState>, config: QsConfig) {
+fn spawn_build(
+    state: Arc<AppState>,
+    config: QsConfig,
+    mutation_permit: crate::pause_registry::MutationPermit,
+) {
     let manager = Arc::clone(&state.manager);
     let analytics_engine = state.analytics_engine.clone();
     let base_path = state.manager.base_path.clone();
 
     tokio::spawn(async move {
+        let _mutation_permit = mutation_permit;
         let store = QsConfigStore::new(&base_path);
 
         let engine = match analytics_engine {

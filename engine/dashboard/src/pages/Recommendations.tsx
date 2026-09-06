@@ -200,11 +200,11 @@ export function Recommendations() {
           <div key={`recommendation-result-${resultIndex}`} className="space-y-2 border-t pt-3 first:border-t-0 first:pt-0">
             <p className="text-xs text-muted-foreground">processingTimeMS: {result.processingTimeMS}</p>
             {result.hits.map((hit, hitIndex) => (
-              <div key={`recommendation-hit-${resultIndex}-${hitIndex}`} className="rounded-md border p-3 text-sm">
+              <div key={`recommendation-hit-${resultIndex}-${hitIndex}`} className="min-w-0 rounded-md border p-3 text-sm">
                 {isTrendingFacetHit(hit) ? (
-                  <p>{hit.facetName}: {hit.facetValue}</p>
+                  <p className="break-all">{hit.facetName}: {hit.facetValue}</p>
                 ) : (
-                  <p>{String(hit.objectID)}</p>
+                  <p className="break-all">{String(hit.objectID)}</p>
                 )}
               </div>
             ))}

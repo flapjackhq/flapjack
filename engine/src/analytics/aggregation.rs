@@ -93,6 +93,10 @@ impl QueryAggregator {
         self.windows
             .retain(|_, v| v.last_seen.elapsed().as_secs() < cutoff_secs);
     }
+
+    pub(crate) fn purge_index(&self, index_name: &str) {
+        self.windows.retain(|(_, index), _| index != index_name);
+    }
 }
 
 #[cfg(test)]

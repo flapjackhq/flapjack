@@ -37,10 +37,9 @@ Important:
 | Dashboard unit | 542 passed / 542 total | ~8s | `cd dashboard && npm run test:unit:run` |
 | Dashboard browser smoke | 12 executed (10 specs + seed/cleanup) | ~5s | `cd dashboard && npm run test:e2e-ui:smoke` |
 | Dashboard browser full | 332 executed (330 specs + seed/cleanup) | ~2 min | `cd dashboard && npm run test:e2e-ui:full` |
-| JS SDK + real clients (no Algolia) | API suites + 3 rendered clients + 6 protocol smokes | ~25s | `./s/test --sdk` |
-| JS SDK Algolia migration | 24 | ~3s | `./s/test --sdk-algolia` (test_algolia_migration.js) |
-| JS SDK Algolia validation | 18 (+1 skip) | ~16s | `./s/test --sdk-algolia` (algolia_validation.js) |
-| Go SDK | ~3 | ~5s | `cd ../sdks/go && go test ./flapjack/...` |
+| Official JS client + real clients (no Algolia) | API suites + 3 rendered clients + 6 protocol smokes | ~25s | `./s/test --sdk` |
+| Official JS client Algolia migration | 24 | ~3s | `./s/test --sdk-algolia` (test_algolia_migration.js) |
+| Official JS client Algolia validation | 18 (+1 skip) | ~16s | `./s/test --sdk-algolia` (algolia_validation.js) |
 | CLI smoke | 17 checks | ~10s | `./s/test --e2e` (real binary, curl-based) |
 
 ### Unified test runner
@@ -51,12 +50,11 @@ Important:
 ./s/test --integ          # integration tests via nextest (~2 min)
 ./s/test --server         # server binary tests (~10s)
 ./s/test --smoke          # nextest smoke profile (~3s)
-./s/test --sdk            # JS SDK: test.js + contract_tests.js (~8s)
-./s/test --sdk-algolia    # JS SDK: needs Algolia creds (~15s)
+./s/test --sdk            # official clients + protocol smokes (~25s)
+./s/test --sdk-algolia    # Algolia migration/validation; needs credentials (~15s)
 ./s/test --dashboard      # vitest unit + playwright smoke (~2.5 min)
 ./s/test --dashboard-full # + playwright full e2e (~5 min)
 ./s/test --e2e            # build binary + server + sdk + cli smoke (~30s)
-./s/test --go             # Go SDK unit tests (~5s)
 ./s/test --all            # everything except --sdk-algolia (~20 min)
 ./s/test --ci             # unit + integ + server + dashboard (~5 min)
 ./s/test --list           # print all flags and exit
@@ -120,13 +118,11 @@ Note: `flapjack-server` has no lib target — do not include it in the count.
 
 Dashboard testing is covered by the browser smoke/full suites and the HTTP-only API shape suite listed above, with standards enforced by `dashboard/BROWSER_TESTING_STANDARDS_2.md`.
 
-### SDK tests
-- **JS SDK tests** (`sdk_test/`): Uses `algoliasearch` npm package against running server. Run via `./s/test --sdk` (test.js + contract_tests.js) or `./s/test --sdk-algolia` (needs Algolia creds).
+### Client compatibility tests
+- **Official JavaScript client tests** (`sdk_test/`): Uses the `algoliasearch` npm package against a running server. Run via `./s/test --sdk` (test.js + contract_tests.js) or `./s/test --sdk-algolia` (needs Algolia credentials).
 - **Real client browser tests** (`sdk_test/browser_tests_unmocked/`): Chromium renders the official InstantSearch.js, React InstantSearch, and Vue InstantSearch packages against the real server. The three clients share one dataset and exact query/facet/pagination assertions. Run via `./s/test --sdk` or `npm run test:real_clients` with a server already running.
-- **SDK bootstrap decoupling:** `engine/sdk_test` is self-contained with its own `package.json`; bootstrap now runs local `npm ci` in `sdk_test` instead of depending on `dashboard/node_modules`.
-- **Go SDK** (`sdks/go/`): Unit tests, run via `./s/test --go`.
-- **Other SDKs** (PHP, Python, Ruby, Java, C#): CI only, require their runtimes. A legacy aggregate runner covers Go + PHP only.
-- **Note:** The legacy aggregate runner does NOT run JS SDK tests. Use `./s/test --sdk` for that.
+- **Test bootstrap:** `engine/sdk_test` is self-contained with its own `package.json`; bootstrap runs local `npm ci` instead of depending on `dashboard/node_modules`.
+- **Protocol smokes:** PHP, Python, Ruby, Go, Java, and Swift use curl-based request/response checks under `sdk_test/`; `./s/test --sdk` runs all six.
 
 ---
 
@@ -324,7 +320,7 @@ default-filter = "all()"
 
 ---
 
-## SDK Tests (`sdk_test/`)
+## Client compatibility tests (`sdk_test/`)
 
 JavaScript tests using the official `algoliasearch` npm package against a running server.
 
@@ -351,7 +347,7 @@ JavaScript tests using the official `algoliasearch` npm package against a runnin
 | `test_exhaustive_fields.js` | Debug utility, needs Algolia, no assertions |
 | `test_algolia_multi_pin.js` | Debug/exploratory, needs Algolia |
 
-All automated SDK tests require a running server (`./s/test --sdk` handles this automatically).
+All automated client compatibility tests require a running server (`./s/test --sdk` handles this automatically).
 
 ## Manual Tests
 
@@ -375,9 +371,9 @@ The workflow YAML remains execution truth. `engine/tests/ci_test_tiers.json` is 
 | Authentication, index boundary, API compatibility, startup/wiring | Public fast | `ci.yml` → `integration-smoke` |
 | Rust HTTP, vector, server, TLS, and replication | Public complete | `ci.yml` → `rust-tests-all`, using nextest process isolation |
 | Source quality and test-harness contracts | Public fast | `ci.yml` → `fmt`, `clippy`, and `release-contracts` |
-| Dashboard and SDKs | Public fast | `ci.yml` dashboard and SDK job families; surface details stay in their own READMEs |
+| Dashboard and client compatibility | Public fast | `ci.yml` dashboard jobs and the `sdk-contract` official-client gate |
 | Installer and migration oracles | Nightly | `nightly.yml` installer and migration jobs |
-| Comprehensive default-feature Rust/dashboard/SDK/integration | Nightly | `nightly.yml` comprehensive job families |
+| Comprehensive default-feature Rust/dashboard/integration | Nightly | `nightly.yml` comprehensive job families |
 | Process-global leak detection | Union | `union.yml` → `rust-in-process-union`; never substitute nextest |
 | Packaging, images, and release preflights | Release | manually dispatched `release.yml` and development-image `docker.yml`; never part of candidate feedback |
 | Twenty long-running or live-system ignored Rust evidence harnesses | Manual evidence | exact source/name allowlist in `ci_test_tiers.json` |
@@ -414,10 +410,10 @@ On an uncontended Apple Silicon host with an absent worktree target directory, `
 | Server binary | `cargo test -p flapjack-server` | 25 | ~10s | Startup modes, key management, multi-instance |
 | Dashboard unit | `npm run test:unit:run` | 542 | ~8s | React components, hooks, config parser |
 | Dashboard browser smoke | `npm run test:e2e-ui:smoke` | 12 executed (10 specs + seed/cleanup) | ~5s | Critical user paths |
-| JS SDK + real clients | `./s/test --sdk` | API suites + 3 rendered clients + 6 protocol smokes | ~25s | API contracts and official-client browser behavior |
+| Official JS client + real clients | `./s/test --sdk` | API suites + 3 rendered clients + 6 protocol smokes | ~25s | API contracts and official-client browser behavior |
 | CLI smoke | `./s/test --e2e` | 17 | ~10s | Real binary curl tests |
-| SDK migration | `node test_algolia_migration.js` | 24 | ~3s | Algolia drop-in proof |
-| SDK validation | `node algolia_validation.js` | 18 (+1 skip) | ~16s | Response accuracy vs Algolia |
+| Client migration | `node test_algolia_migration.js` | 24 | ~3s | Algolia drop-in proof |
+| Client validation | `node algolia_validation.js` | 18 (+1 skip) | ~16s | Response accuracy vs Algolia |
 
 **Recommended workflow:**
 1. `./s/test --smoke` — quick sanity check (~3s)

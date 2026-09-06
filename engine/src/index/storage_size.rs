@@ -148,6 +148,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fallible_tenant_storage_treats_missing_index_as_unavailable() {
+        let tmp = TempDir::new().unwrap();
+        let manager = crate::IndexManager::new(tmp.path());
+
+        assert!(
+            manager
+                .try_tenant_storage_bytes("removed_after_inventory")
+                .is_err(),
+            "a missing inventoried index must not become a false billable zero"
+        );
+        assert_eq!(
+            manager.tenant_storage_bytes("removed_after_inventory"),
+            0,
+            "the legacy compatibility wrapper must preserve its zero-on-error contract"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallible_tenant_storage_rejects_non_directory_root() {
+        let tmp = TempDir::new().unwrap();
+        let manager = crate::IndexManager::new(tmp.path());
+        let analytics = crate::analytics::AnalyticsConfig {
+            enabled: true,
+            data_dir: tmp.path().join("analytics"),
+            flush_interval_secs: 60,
+            flush_size: 10_000,
+            retention_days: crate::analytics::config::DEFAULT_ANALYTICS_RETENTION_DAYS,
+        };
+        manager.set_analytics_config(analytics.clone());
+        std::fs::write(tmp.path().join("replaced_after_inventory"), []).unwrap();
+        let events_dir = analytics.events_dir("replaced_after_inventory");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        std::fs::write(events_dir.join("events.parquet"), [0_u8; 200]).unwrap();
+
+        assert!(
+            manager
+                .try_tenant_storage_bytes("replaced_after_inventory")
+                .is_err(),
+            "a tenant root replaced by a file must not become a false billable zero"
+        );
+        assert_eq!(
+            manager.tenant_storage_bytes("replaced_after_inventory"),
+            200,
+            "the compatibility wrapper must still count an independently readable root"
+        );
+    }
+
+    #[tokio::test]
     async fn tenant_storage_bytes_includes_index_and_analytics_files() {
         let tmp = TempDir::new().unwrap();
         let manager = crate::IndexManager::new(tmp.path());
@@ -169,6 +217,64 @@ mod tests {
         std::fs::write(events_dir.join("events.parquet"), [0_u8; 200]).unwrap();
 
         assert_eq!(manager.tenant_storage_bytes("products"), 300);
+    }
+
+    #[tokio::test]
+    async fn tenant_storage_bytes_preserves_analytics_only_storage() {
+        let tmp = TempDir::new().unwrap();
+        let manager = crate::IndexManager::new(tmp.path().join("indexes"));
+        let analytics = crate::analytics::AnalyticsConfig {
+            enabled: true,
+            data_dir: tmp.path().join("analytics"),
+            flush_interval_secs: 60,
+            flush_size: 10_000,
+            retention_days: crate::analytics::config::DEFAULT_ANALYTICS_RETENTION_DAYS,
+        };
+        manager.set_analytics_config(analytics.clone());
+
+        let events_dir = analytics.events_dir("products");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        std::fs::write(events_dir.join("events.parquet"), [0_u8; 200]).unwrap();
+        assert!(!manager.base_path.join("products").exists());
+
+        assert_eq!(manager.try_tenant_storage_bytes("products").unwrap(), 200);
+        assert_eq!(manager.tenant_storage_bytes("products"), 200);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn try_tenant_storage_bytes_propagates_directory_scan_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct PermissionRestore {
+            path: std::path::PathBuf,
+            mode: u32,
+        }
+        impl Drop for PermissionRestore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(
+                    &self.path,
+                    std::fs::Permissions::from_mode(self.mode),
+                );
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let manager = crate::IndexManager::new(tmp.path());
+        let index_path = tmp.path().join("unreadable");
+        std::fs::create_dir(&index_path).unwrap();
+        std::fs::write(index_path.join("segment"), [0_u8; 64]).unwrap();
+        let original_mode = std::fs::metadata(&index_path).unwrap().permissions().mode();
+        let _restore = PermissionRestore {
+            path: index_path.clone(),
+            mode: original_mode,
+        };
+        std::fs::set_permissions(&index_path, std::fs::Permissions::from_mode(0)).unwrap();
+
+        assert!(
+            manager.try_tenant_storage_bytes("unreadable").is_err(),
+            "fallible storage measurement must not turn a scan failure into zero"
+        );
     }
 
     #[tokio::test]

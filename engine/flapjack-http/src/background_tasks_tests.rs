@@ -2,10 +2,16 @@
         autoheal_enabled_from_env, completed_utc_day, enforce_backup_retention,
         extract_s3_snapshot_tenant_id, migration_spool_gc_interval_secs, parse_autoheal_enabled,
         positive_interval_secs, rollup_window_bounds_ms, run_migration_spool_gc_loop,
-        run_usage_rollover, spawn_supervised, BackgroundTaskHealth, BackgroundTaskIntervals,
-        HOUR_MS, AUTOHEAL_ENABLED_ENV, MIGRATION_SPOOL_GC_INTERVAL_ENV, ROLLUP_INTERVAL_ENV,
-        SYNC_INTERVAL_ENV,
+        run_analytics_retention_pass_if_admitted, run_background_mutation_if_admitted,
+        run_storage_maintenance_pass, run_usage_rollover, spawn_storage_maintenance_task,
+        spawn_metrics_refresh_task, spawn_supervised, BackgroundTaskHealth, BackgroundTaskIntervals, HOUR_MS,
+        AUTOHEAL_ENABLED_ENV,
+        MIGRATION_SPOOL_GC_INTERVAL_ENV, ROLLUP_INTERVAL_ENV, SYNC_INTERVAL_ENV,
     };
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::get;
+    use axum::Router;
     use crate::handlers::migration::spool::{
         AsyncMigrationPublicationSemantic, MigrationDisposition, ResourceDenominators, SpoolLimits,
         SpoolStore,
@@ -21,8 +27,355 @@
     use std::sync::Arc;
     use tokio::sync::Notify;
     use tokio::time::{timeout, Duration};
+    use tower::ServiceExt;
     use tracing_subscriber::prelude::*;
     use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+    async fn metrics_text(state: Arc<crate::handlers::AppState>) -> String {
+        let app = Router::new()
+            .route("/metrics", get(crate::handlers::metrics::metrics_handler))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    fn metric_values(text: &str, metric_name: &str) -> std::collections::BTreeMap<String, f64> {
+        let metric_prefix = format!("{metric_name}{{");
+        text.lines()
+            .filter(|line| line.starts_with(&metric_prefix))
+            .map(|line| {
+                let index_start = line.find("index=\"").expect("index label") + 7;
+                let remainder = &line[index_start..];
+                let index_end = remainder.find('"').expect("closing index label");
+                let value = line
+                    .split_whitespace()
+                    .last()
+                    .expect("metric value")
+                    .parse()
+                    .expect("numeric metric value");
+                (remainder[..index_end].to_string(), value)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn metric_values_require_exact_metric_name() {
+        let text = concat!(
+            "flapjack_storage_bytes{index=\"products\"} 7\n",
+            "flapjack_storage_bytes_suffix{index=\"products\"} 91\n",
+        );
+
+        assert_eq!(
+            metric_values(text, "flapjack_storage_bytes"),
+            std::collections::BTreeMap::from([("products".to_string(), 7.0)]),
+            "a similarly named metric must not overwrite the real series"
+        );
+    }
+
+    async fn let_metrics_refresh_run() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn document(id: &str) -> flapjack::types::Document {
+        flapjack::types::Document {
+            id: id.to_string(),
+            fields: std::collections::HashMap::new(),
+        }
+    }
+
+    /// RED 2: the periodic refresh must enumerate a committed index that is
+    /// not loaded in the refreshing manager, without changing loaded_count.
+    #[tokio::test(start_paused = true)]
+    async fn metrics_refresh_includes_durable_unloaded_index_without_loading() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let creator = flapjack::IndexManager::new(tmp.path());
+        creator.create_tenant("durable-unloaded").unwrap();
+        creator
+            .add_documents_sync("durable-unloaded", vec![document("d1"), document("d2")])
+            .await
+            .unwrap();
+
+        let state = TestStateBuilder::new(&tmp).build_shared();
+        assert_eq!(state.manager.loaded_count(), 0);
+        spawn_metrics_refresh_task(&state);
+        let_metrics_refresh_run().await;
+
+        let text = metrics_text(Arc::clone(&state)).await;
+        let storage = metric_values(&text, "flapjack_storage_bytes");
+        let documents = metric_values(&text, "flapjack_documents_count");
+        assert!(
+            storage
+                .get("durable-unloaded")
+                .is_some_and(|bytes| *bytes > 0.0),
+            "durable unloaded storage was omitted: {storage:?}"
+        );
+        assert_eq!(documents.get("durable-unloaded"), Some(&2.0));
+        assert_eq!(
+            state.manager.loaded_count(),
+            0,
+            "metrics refresh must not recover or load the durable index"
+        );
+    }
+
+    /// RED 4: loaded, empty, and restarted indexes retain explicit gauge
+    /// semantics, while an authoritative deletion removes both labels.
+    #[tokio::test(start_paused = true)]
+    async fn metrics_refresh_preserves_lifecycle_states_and_removes_deleted_labels() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let initial = TestStateBuilder::new(&tmp).build_shared();
+        initial.manager.create_tenant("loaded").unwrap();
+        initial
+            .manager
+            .add_documents_sync("loaded", vec![document("d1")])
+            .await
+            .unwrap();
+        initial.manager.create_tenant("empty").unwrap();
+        spawn_metrics_refresh_task(&initial);
+        let_metrics_refresh_run().await;
+
+        let before_restart = metrics_text(Arc::clone(&initial)).await;
+        assert_eq!(
+            metric_values(&before_restart, "flapjack_documents_count").get("loaded"),
+            Some(&1.0)
+        );
+        assert_eq!(
+            metric_values(&before_restart, "flapjack_documents_count").get("empty"),
+            Some(&0.0)
+        );
+
+        let restarted = TestStateBuilder::new(&tmp).build_shared();
+        assert_eq!(restarted.manager.loaded_count(), 0);
+        spawn_metrics_refresh_task(&restarted);
+        let_metrics_refresh_run().await;
+
+        let after_restart = metrics_text(Arc::clone(&restarted)).await;
+        let restarted_documents = metric_values(&after_restart, "flapjack_documents_count");
+        assert_eq!(restarted_documents.get("loaded"), Some(&1.0));
+        assert_eq!(restarted_documents.get("empty"), Some(&0.0));
+        assert_eq!(restarted.manager.loaded_count(), 0);
+
+        initial
+            .manager
+            .delete_tenant(&"loaded".to_string())
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let_metrics_refresh_run().await;
+
+        let after_delete = metrics_text(Arc::clone(&restarted)).await;
+        for metric_name in ["flapjack_storage_bytes", "flapjack_documents_count"] {
+            let values = metric_values(&after_delete, metric_name);
+            assert!(
+                !values.contains_key("loaded"),
+                "deleted label remained in {metric_name}: {values:?}"
+            );
+            assert!(
+                values.contains_key("empty"),
+                "surviving empty index disappeared from {metric_name}: {values:?}"
+            );
+        }
+    }
+
+    /// RED 5: a transient directory-read failure must retain the last known
+    /// storage value rather than replacing it with a billable zero.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn metrics_refresh_retains_last_known_storage_on_measurement_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct PermissionRestore {
+            path: PathBuf,
+            mode: u32,
+        }
+        impl Drop for PermissionRestore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(
+                    &self.path,
+                    std::fs::Permissions::from_mode(self.mode),
+                );
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = TestStateBuilder::new(&tmp).build_shared();
+        state.manager.create_tenant("storage-fault").unwrap();
+        state
+            .manager
+            .add_documents_sync("storage-fault", vec![document("d1")])
+            .await
+            .unwrap();
+        spawn_metrics_refresh_task(&state);
+        let_metrics_refresh_run().await;
+
+        let metrics_state = state.metrics_state.as_ref().unwrap();
+        let last_known = metrics_state
+            .index_gauge_snapshot()
+            .get("storage-fault")
+            .expect("initial refresh must publish storage")
+            .storage_bytes
+            .expect("initial refresh must measure storage");
+        assert!(last_known > 0);
+
+        let index_path = tmp.path().join("storage-fault");
+        let original_mode = std::fs::metadata(&index_path).unwrap().permissions().mode();
+        let _restore = PermissionRestore {
+            path: index_path.clone(),
+            mode: original_mode,
+        };
+        std::fs::set_permissions(&index_path, std::fs::Permissions::from_mode(0)).unwrap();
+        assert_eq!(
+            state.manager.tenant_storage_bytes("storage-fault"),
+            0,
+            "fault fixture must exercise the current swallowed-error path"
+        );
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let_metrics_refresh_run().await;
+        let after_error = metrics_state
+            .index_gauge_snapshot()
+            .get("storage-fault")
+            .expect("transient measurement failure must not remove the known index")
+            .storage_bytes
+            .expect("last known storage must remain available");
+        assert_eq!(after_error, last_known);
+    }
+
+    #[test]
+    fn production_autoheal_registration_uses_complete_pass_mutation_admission() {
+        let source = include_str!("background_tasks.rs");
+        assert!(
+            source.contains("start_health_probe_with_admission(10, autoheal_enabled"),
+            "production autoheal registration must use the admission-aware manager owner"
+        );
+        assert!(
+            source.contains("mutation_fence.admit_mutation().await.ok()"),
+            "the complete autoheal pass must retain the existing global mutation permit"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_startup_fence_defers_migration_spool_layout_until_release() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let _interval = EnvVarRestoreGuard::set(MIGRATION_SPOOL_GC_INTERVAL_ENV, "1");
+        let temp = tempfile::tempdir().unwrap();
+        let state = Arc::new(TestStateBuilder::new(&temp).build());
+        state
+            .global_mutation_fence
+            .acquire("release-spool-startup-1")
+            .await
+            .unwrap();
+
+        let _registration = spawn_storage_maintenance_task(&state);
+        tokio::time::sleep(Duration::from_millis(1_150)).await;
+        assert!(
+            !temp.path().join("migration_exports").exists(),
+            "active fenced startup must not create the spool layout"
+        );
+
+        state
+            .global_mutation_fence
+            .release("release-spool-startup-1")
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if temp.path().join("migration_exports/jobs").is_dir() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the first admitted maintenance pass should initialize the spool");
+    }
+
+    #[tokio::test]
+    async fn background_mutation_permit_lives_until_the_async_effect_finishes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_root = temp.path().join("flapjack/data");
+        std::fs::create_dir_all(&data_root).unwrap();
+        let fence = crate::pause_registry::GlobalMutationFence::open(&data_root).unwrap();
+        let pass_started = Arc::new(Notify::new());
+        let finish_pass = Arc::new(Notify::new());
+
+        let pass_fence = fence.clone();
+        let started = Arc::clone(&pass_started);
+        let finish = Arc::clone(&finish_pass);
+        let pass = tokio::spawn(async move {
+            run_background_mutation_if_admitted(&pass_fence, || async move {
+                started.notify_one();
+                finish.notified().await;
+            })
+            .await
+        });
+        pass_started.notified().await;
+
+        let acquire_fence = fence.clone();
+        let acquire = tokio::spawn(async move { acquire_fence.acquire("analytics-drain-1").await });
+        tokio::task::yield_now().await;
+        assert!(
+            !acquire.is_finished(),
+            "the release fence must wait for an admitted analytics write to finish"
+        );
+
+        finish_pass.notify_one();
+        assert!(pass.await.unwrap());
+        acquire.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn persisted_release_fence_suppresses_startup_analytics_retention() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_root = temp.path().join("flapjack/data");
+        let analytics_root = temp.path().join("analytics");
+        let expired = analytics_root
+            .join("products/events/date=2000-01-01")
+            .join("events.parquet");
+        std::fs::create_dir_all(&data_root).unwrap();
+        std::fs::create_dir_all(expired.parent().unwrap()).unwrap();
+        std::fs::write(&expired, b"expired analytics").unwrap();
+
+        let fence = crate::pause_registry::GlobalMutationFence::open(&data_root).unwrap();
+        fence.acquire("analytics-retention-1").await.unwrap();
+        assert!(
+            !run_analytics_retention_pass_if_admitted(
+                &fence,
+                analytics_root.as_path(),
+                30,
+                "Startup",
+            )
+            .await
+        );
+        assert!(
+            expired.exists(),
+            "startup retention must not mutate while a persisted release fence is active"
+        );
+
+        fence.release("analytics-retention-1").await.unwrap();
+        assert!(
+            run_analytics_retention_pass_if_admitted(
+                &fence,
+                analytics_root.as_path(),
+                30,
+                "Startup",
+            )
+            .await
+        );
+        assert!(!expired.exists());
+    }
 
     #[test]
     fn background_interval_parser_rejects_zero_and_invalid_values() {
@@ -47,6 +400,25 @@
         assert_eq!(
             BackgroundTaskIntervals::from_env().unwrap_err(),
             "FLAPJACK_ROLLUP_INTERVAL_SECS must be a positive integer, got \"0\""
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn storage_maintenance_registration_runs_under_production_supervision() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = TestStateBuilder::new(&tmp).build_shared();
+
+        let _registration = spawn_storage_maintenance_task(&state);
+
+        assert_eq!(
+            state
+                .background_task_health
+                .tasks
+                .lock()
+                .unwrap()
+                .get("storage-maintenance"),
+            Some(&true),
+            "the production registration boundary must supervise storage maintenance"
         );
     }
 
@@ -283,6 +655,66 @@
         let _guard = with_env_var(MIGRATION_SPOOL_GC_INTERVAL_ENV, "42");
 
         assert_eq!(migration_spool_gc_interval_secs(), 42);
+    }
+
+    #[test]
+    fn storage_maintenance_prunes_acknowledged_crawler_files_across_restart() {
+        use flapjack::index::manager::publication::{
+            ContentDigest, CrawlerRunCountersEvidence, CrawlerRunExecutionClaimDisposition,
+            CrawlerRunErrorCodeEvidence, CrawlerRunStore, CrawlerTerminalOutcome,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let spool = SpoolStore::new(tmp.path(), SpoolLimits::default()).unwrap();
+        let store = CrawlerRunStore::new(tmp.path());
+        let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+        let terminal_at = 10_000;
+        store
+            .start(
+                run_id,
+                ContentDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
+                9_000,
+            )
+            .unwrap();
+        let claim = match store.claim_execution(run_id).unwrap() {
+            CrawlerRunExecutionClaimDisposition::Acquired(claim) => claim,
+            _ => panic!("new crawler run must own its execution lock"),
+        };
+        drop(claim);
+        store
+            .finish_without_publication(
+                run_id,
+                CrawlerTerminalOutcome::Failed {
+                    error_code: CrawlerRunErrorCodeEvidence::WorkerLost,
+                },
+                CrawlerRunCountersEvidence::default(),
+                1_000,
+                terminal_at,
+            )
+            .unwrap();
+        store.acknowledge(run_id, terminal_at + 1).unwrap();
+
+        let retained_root = tmp.path().join(".crawler_run_tombstones");
+        let tombstone = retained_root.join(format!("{run_id}.json"));
+        let execution_lock = retained_root.join(format!("{run_id}.execution.lock"));
+        assert!(tombstone.exists());
+        assert!(execution_lock.exists());
+
+        assert_eq!(
+            run_storage_maintenance_pass(
+                Some(&spool),
+                &store,
+                terminal_at + CrawlerRunStore::RETENTION_MS,
+            )
+            .unwrap(),
+            1
+        );
+        assert!(!tombstone.exists());
+        assert!(!execution_lock.exists());
+        assert!(CrawlerRunStore::new(tmp.path())
+            .load(run_id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -596,7 +1028,6 @@
         let tmp = tempfile::TempDir::new().unwrap();
         let state = TestStateBuilder::new(&tmp).build_shared();
         let persistence = UsagePersistence::new(tmp.path()).unwrap();
-        let gauges = state.metrics_state.as_ref().unwrap().storage_gauges.clone();
 
         // Seed all seven counter fields with distinct non-zero values.
         {
@@ -619,8 +1050,7 @@
             now,
             &persistence,
             &state.usage_counters,
-            &state.manager,
-            Some(&gauges),
+            state.metrics_state.as_ref(),
         )
         .unwrap();
 
@@ -665,31 +1095,30 @@
         let tmp = tempfile::TempDir::new().unwrap();
         let state = TestStateBuilder::new(&tmp).build_shared();
         let persistence = UsagePersistence::new(tmp.path()).unwrap();
-        let gauges = state.metrics_state.as_ref().unwrap().storage_gauges.clone();
-        gauges.clear();
-
-        // "products": loaded with 3 documents and a storage gauge.
-        state.manager.create_tenant("products").unwrap();
-        state
-            .manager
-            .add_documents_sync(
-                "products",
-                (0..3u64)
-                    .map(|i| flapjack::types::Document {
-                        id: format!("products_{i}"),
-                        fields: std::collections::HashMap::new(),
-                    })
-                    .collect(),
-            )
-            .await
-            .unwrap();
-        gauges.insert("products".to_string(), 12_345);
-
-        // "storage_only": gauge-only index, not loaded — unions into the snapshot.
-        gauges.insert("storage_only".to_string(), 4_096);
-
-        // "empty": explicit-zero storage gauge, not loaded — Some(0) must survive.
-        gauges.insert("empty".to_string(), 0);
+        let metrics_state = state.metrics_state.as_ref().unwrap();
+        metrics_state.replace_index_gauges(std::collections::BTreeMap::from([
+            (
+                "products".to_string(),
+                crate::handlers::metrics::IndexGaugeValues {
+                    documents_count: Some(3),
+                    storage_bytes: Some(12_345),
+                },
+            ),
+            (
+                "storage_only".to_string(),
+                crate::handlers::metrics::IndexGaugeValues {
+                    documents_count: None,
+                    storage_bytes: Some(4_096),
+                },
+            ),
+            (
+                "empty".to_string(),
+                crate::handlers::metrics::IndexGaugeValues {
+                    documents_count: None,
+                    storage_bytes: Some(0),
+                },
+            ),
+        ]));
 
         // "counter_only": counter-backed, not loaded, no gauge — gauges stay None.
         {
@@ -711,8 +1140,7 @@
             now,
             &persistence,
             &state.usage_counters,
-            &state.manager,
-            Some(&gauges),
+            Some(metrics_state),
         )
         .unwrap();
 
@@ -747,10 +1175,33 @@
         assert_eq!(counter_only.search_operations, 11);
 
         // The captured gauge source is not mutated by rollover.
-        assert_eq!(gauges.len(), 3);
-        assert_eq!(*gauges.get("products").unwrap().value(), 12_345);
-        assert_eq!(*gauges.get("storage_only").unwrap().value(), 4_096);
-        assert_eq!(*gauges.get("empty").unwrap().value(), 0);
+        assert_eq!(
+            metrics_state.index_gauge_snapshot(),
+            std::sync::Arc::new(std::collections::BTreeMap::from([
+                (
+                    "products".to_string(),
+                    crate::handlers::metrics::IndexGaugeValues {
+                        documents_count: Some(3),
+                        storage_bytes: Some(12_345),
+                    },
+                ),
+                (
+                    "storage_only".to_string(),
+                    crate::handlers::metrics::IndexGaugeValues {
+                        documents_count: None,
+                        storage_bytes: Some(4_096),
+                    },
+                ),
+                (
+                    "empty".to_string(),
+                    crate::handlers::metrics::IndexGaugeValues {
+                        documents_count: None,
+                        storage_bytes: Some(0),
+                    },
+                ),
+            ])),
+            "rollover must not mutate the captured generation"
+        );
 
         // Only the seven usage counter atomics are reset.
         let entry = state.usage_counters.get("counter_only").unwrap();

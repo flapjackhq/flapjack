@@ -12,6 +12,7 @@ use super::types::{
 use dashmap::DashMap;
 use flapjack::index::oplog::OpLogEntry;
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -256,7 +257,7 @@ impl ReplicationManager {
             return AutohealLifecycleState::default();
         }
 
-        let events = match AutohealJournal::new(data_dir).and_then(|journal| journal.events()) {
+        let events = match AutohealJournal::read_events_read_only(data_dir) {
             Ok(events) => events,
             Err(error) => {
                 tracing::warn!(
@@ -623,8 +624,10 @@ impl ReplicationManager {
         }
     }
 
-    /// Replicate operations to all available peers (fire-and-forget).
-    /// Skips peers with tripped circuit breakers.
+    /// Replicate operations to all available peers, settling every peer task
+    /// before the pass returns. The HTTP owner may run this pass in a detached
+    /// request-child task, but that task can now retain one mutation permit
+    /// until every per-peer delivery has completed.
     pub async fn replicate_ops(self: &Arc<Self>, tenant_id: &str, ops: Vec<OpLogEntry>) {
         if ops.is_empty() {
             return;
@@ -633,18 +636,23 @@ impl ReplicationManager {
         let tenant_id = tenant_id.to_string();
 
         let peers = self.peer_snapshot();
+        let mut peer_tasks = tokio::task::JoinSet::new();
         for peer in peers {
             let peer_id = peer.peer_id().to_string();
             let tenant_id = tenant_id.clone();
             let ops = ops.clone();
             let manager = Arc::clone(self);
 
-            // Fire-and-forget: spawn task and don't await
-            tokio::spawn(async move {
+            peer_tasks.spawn(async move {
                 let _ = manager
                     .replicate_to_single_peer(peer, tenant_id, peer_id, ops)
                     .await;
             });
+        }
+        while let Some(result) = peer_tasks.join_next().await {
+            if let Err(error) = result {
+                tracing::error!(error = %error, "replication peer task failed");
+            }
         }
     }
 
@@ -1354,25 +1362,52 @@ impl ReplicationManager {
         self.start_health_probe_with_interval(Duration::from_secs(interval_secs), autoheal_enabled);
     }
 
+    /// Start the owned autoheal loop with one caller-supplied admission permit
+    /// retained across each complete probe, eviction, and readmission pass.
+    pub fn start_health_probe_with_admission<Admit, AdmitFuture, Permit>(
+        self: &Arc<Self>,
+        interval_secs: u64,
+        autoheal_enabled: bool,
+        admit: Admit,
+    ) where
+        Admit: Fn() -> AdmitFuture + Send + Sync + 'static,
+        AdmitFuture: Future<Output = Option<Permit>> + Send + 'static,
+        Permit: Send + 'static,
+    {
+        self.start_health_probe_with_interval_and_admission(
+            Duration::from_secs(interval_secs),
+            autoheal_enabled,
+            admit,
+        );
+    }
+
     fn start_health_probe_with_interval(
         self: &Arc<Self>,
         interval_duration: Duration,
         autoheal_enabled: bool,
     ) {
+        self.start_health_probe_with_interval_and_admission(
+            interval_duration,
+            autoheal_enabled,
+            || async { Some(()) },
+        );
+    }
+
+    fn start_health_probe_with_interval_and_admission<Admit, AdmitFuture, Permit>(
+        self: &Arc<Self>,
+        interval_duration: Duration,
+        autoheal_enabled: bool,
+        admit: Admit,
+    ) where
+        Admit: Fn() -> AdmitFuture + Send + Sync + 'static,
+        AdmitFuture: Future<Output = Option<Permit>> + Send + 'static,
+        Permit: Send + 'static,
+    {
         self.stop_health_probe();
         self.initialize_autoheal_lifecycle(autoheal_enabled);
         let manager = Arc::clone(self);
         let handle = tokio::spawn(async move {
-            let mut journal = match AutohealJournal::new(&manager.data_dir) {
-                Ok(journal) => Some(journal),
-                Err(error) => {
-                    tracing::error!(
-                        "[autoheal] journal unavailable; continuing health probes without auto-heal recording: {}",
-                        error
-                    );
-                    None
-                }
-            };
+            let mut journal = None;
             let mut cycle = AutohealCycle::new(
                 autoheal_enabled,
                 DEFAULT_AUTOHEAL_SUSTAINED_FAILURE_THRESHOLD,
@@ -1384,6 +1419,23 @@ impl ReplicationManager {
 
             loop {
                 interval.tick().await;
+
+                let Some(_mutation_permit) = admit().await else {
+                    continue;
+                };
+
+                if journal.is_none() {
+                    journal = match AutohealJournal::new(&manager.data_dir) {
+                        Ok(journal) => Some(journal),
+                        Err(error) => {
+                            tracing::error!(
+                                "[autoheal] journal unavailable after mutation admission; continuing health probes without auto-heal recording: {}",
+                                error
+                            );
+                            None
+                        }
+                    };
+                }
 
                 match journal.as_mut() {
                     Some(journal) => {

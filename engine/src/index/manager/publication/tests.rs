@@ -14,7 +14,8 @@ use crate::{Document, IndexManager};
 use crate::query_suggestions::QsConfigStore;
 use crate::Index;
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, Barrier, OnceLock};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 #[path = "tests/repair_cli_contract.rs"]
@@ -474,9 +475,1454 @@ fn handoff_requires_publication_outcome_before_tombstone_retention() {
     let adopted = PublicationJobHandoff::adopt(&committed).unwrap();
     let tombstone = PublicationTombstone::from_adopted(&committed, &adopted).unwrap();
     assert!(tombstone.retention_eligible());
-    assert_eq!(tombstone.outcome, PublicationDisposition::Committed);
+    assert_eq!(
+        tombstone.outcome,
+        Some(PublicationDisposition::Committed)
+    );
     // Fence evidence must survive terminal compaction into the tombstone.
     assert_eq!(tombstone.fence_evidence, Some(fence));
+}
+
+#[test]
+fn crawler_success_is_atomic_with_commit_and_survives_handoff_compaction() {
+    let prepared = prepared_journal();
+    let request_digest = ContentDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap();
+    let completion = CrawlerPublicationCompletion {
+        run_id: "018f3e2a-7b1c-7d45-8c90-1234567890ab".to_string(),
+        request_digest,
+        counters: CrawlerRunCountersEvidence {
+            fetched: 2,
+            discovered: 3,
+            transformed: 2,
+            published: 2,
+        },
+        duration_ms: 41,
+        terminal_at_unix_ms: 1_725_000_000_000,
+        task_id: 42,
+    };
+
+    let committed = prepared.apply_crawler_success(completion).unwrap();
+    let terminal = committed
+        .crawler_terminal
+        .as_ref()
+        .expect("committed crawler journal must contain terminal truth");
+    assert_eq!(terminal.run_id, "018f3e2a-7b1c-7d45-8c90-1234567890ab");
+    assert_eq!(terminal.outcome, CrawlerTerminalOutcome::Succeeded);
+    let publication = terminal
+        .publication
+        .as_ref()
+        .expect("success must contain publication evidence");
+    assert_eq!(publication.transaction_id, committed.transaction_id);
+    assert_eq!(publication.generation, committed.generation);
+    assert_eq!(publication.digest, committed.digest);
+    assert_eq!(publication.task_id, 42);
+
+    let adopted = PublicationJobHandoff::adopt(&committed).unwrap();
+    let tombstone = PublicationTombstone::from_adopted(&committed, &adopted).unwrap();
+    assert_eq!(
+        tombstone
+            .crawler_run
+            .as_ref()
+            .and_then(|run| run.terminal.as_ref()),
+        committed.crawler_terminal.as_ref()
+    );
+}
+
+#[test]
+fn crawler_journal_decode_fails_closed_on_terminal_publication_disagreement() {
+    let committed = prepared_journal()
+        .apply_crawler_success(CrawlerPublicationCompletion {
+            run_id: "018f3e2a-7b1c-7d45-8c90-1234567890ab".to_string(),
+            request_digest: digest(),
+            counters: CrawlerRunCountersEvidence::default(),
+            duration_ms: 1,
+            terminal_at_unix_ms: 2,
+            task_id: 3,
+        })
+        .unwrap();
+    let mut value = committed.to_json_value();
+    value["crawler_terminal"]["publication"]["digest"] =
+        serde_json::json!(format!("sha256:{}", "c".repeat(64)));
+    assert!(PublicationJournal::from_json(&value.to_string())
+        .unwrap_err()
+        .to_string()
+        .contains("disagrees"));
+}
+
+#[test]
+fn cancel_before_start_binds_digest_once_and_never_gains_publication() {
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    let request_digest = ContentDigest::new(format!("sha256:{}", "b".repeat(64))).unwrap();
+    let mut tombstone = PublicationTombstone::cancel_before_start(run_id, 100).unwrap();
+    assert!(tombstone
+        .crawler_run
+        .as_ref()
+        .expect("crawler tombstone")
+        .request_digest
+        .is_none());
+
+    tombstone
+        .bind_canceled_start(
+            request_digest.clone(),
+            CrawlerRunCountersEvidence::default(),
+            3,
+            103,
+        )
+        .unwrap();
+    let run = tombstone.crawler_run.as_ref().unwrap();
+    assert_eq!(run.request_digest.as_ref(), Some(&request_digest));
+    let terminal = run.terminal.as_ref().expect("canceled terminal truth");
+    assert_eq!(terminal.outcome, CrawlerTerminalOutcome::Canceled);
+    assert!(terminal.publication.is_none());
+    assert!(tombstone
+        .bind_canceled_start(
+            ContentDigest::new(format!("sha256:{}", "c".repeat(64))).unwrap(),
+            CrawlerRunCountersEvidence::default(),
+            4,
+            104,
+        )
+        .is_err());
+}
+
+#[test]
+fn crawler_store_replays_matching_start_and_rejects_digest_mismatch() {
+    let tmp = TempDir::new().unwrap();
+    let store = CrawlerRunStore::new(tmp.path());
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    let first = PublicationTombstone::started(run_id, digest(), 100).unwrap();
+    store.create(&first).unwrap();
+    store.create(&first).expect("matching replay is idempotent");
+    assert!(matches!(
+        store
+            .start_classified_with_admission(run_id, digest(), 101, false)
+            .unwrap(),
+        CrawlerRunStartDisposition::Replay(_)
+    ));
+    assert!(matches!(
+        store.start_classified_with_admission(
+            "018f3e2a-7b1c-7d45-8c90-000000000000",
+            digest(),
+            101,
+            false,
+        ),
+        Err(CrawlerRunStartError::AdmissionRejected)
+    ));
+
+    let mismatch = PublicationTombstone::started(
+        run_id,
+        ContentDigest::new(format!("sha256:{}", "c".repeat(64))).unwrap(),
+        100,
+    )
+    .unwrap();
+    assert!(store
+        .create(&mismatch)
+        .unwrap_err()
+        .to_string()
+        .contains("digest disagrees"));
+}
+
+#[test]
+fn crawler_store_expiry_uses_the_durable_deadline_and_requires_no_live_owner() {
+    let tmp = TempDir::new().unwrap();
+    let store = CrawlerRunStore::new(tmp.path());
+    let canceled_run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    store
+        .start_classified_with_deadline_admission(
+            canceled_run_id,
+            digest(),
+            100,
+            Some(150),
+            true,
+        )
+        .unwrap();
+
+    assert!(store
+        .terminalize_expired_if_unowned(canceled_run_id, 149, 999)
+        .unwrap()
+        .is_none());
+    let live_claim = match store.claim_execution(canceled_run_id).unwrap() {
+        CrawlerRunExecutionClaimDisposition::Acquired(claim) => claim,
+        _ => panic!("new run must have one execution owner"),
+    };
+    assert!(store
+        .terminalize_expired_if_unowned(canceled_run_id, 150, 999)
+        .unwrap()
+        .is_none());
+    drop(live_claim);
+
+    store.request_cancel(canceled_run_id, 149).unwrap();
+    let canceled = store
+        .terminalize_expired_if_unowned(canceled_run_id, 150, 999)
+        .unwrap();
+    assert_eq!(
+        canceled
+            .unwrap()
+            .crawler_run
+            .as_ref()
+            .unwrap()
+            .terminal
+            .as_ref()
+            .unwrap()
+            .outcome,
+        CrawlerTerminalOutcome::Canceled
+    );
+    let replay = store
+        .start_classified_with_deadline_admission(
+            canceled_run_id,
+            digest(),
+            500,
+            Some(550),
+            false,
+        )
+        .unwrap();
+    assert!(matches!(replay, CrawlerRunStartDisposition::Replay(_)));
+    store.acknowledge(canceled_run_id, 151).unwrap();
+    store.acknowledge(canceled_run_id, 999).unwrap();
+    assert_eq!(
+        store
+            .load(canceled_run_id)
+            .unwrap()
+            .unwrap()
+            .crawler_run
+            .unwrap()
+            .terminal
+            .unwrap()
+            .outcome,
+        CrawlerTerminalOutcome::Canceled
+    );
+
+    let lost_run_id = "018f3e2a-7b1c-7d45-8c90-000000000001";
+    store
+        .start_classified_with_deadline_admission(lost_run_id, digest(), 200, Some(250), true)
+        .unwrap();
+    let lost = store
+        .terminalize_expired_if_unowned(lost_run_id, 250, 999)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        lost.crawler_run
+            .unwrap()
+            .terminal
+            .unwrap()
+            .outcome,
+        CrawlerTerminalOutcome::Failed {
+            error_code: CrawlerRunErrorCodeEvidence::WorkerLost,
+        }
+    );
+    assert_eq!(
+        store.request_cancel_with_disposition(lost_run_id, 251).unwrap(),
+        CrawlerRunCancelDispositionEvidence::AlreadyTerminal
+    );
+
+    assert!(
+        PublicationTombstone::started_with_deadline(canceled_run_id, digest(), 100, Some(99))
+            .is_err()
+    );
+}
+
+#[test]
+fn crawler_store_reads_replays_and_expires_a_serialized_legacy_run_without_a_deadline_field() {
+    let tmp = TempDir::new().unwrap();
+    let store = CrawlerRunStore::new(tmp.path());
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    let request_digest = format!("sha256:{}", "a".repeat(64));
+    let legacy_json = format!(
+        r#"{{"transaction_id":null,"target":null,"generation":null,"digest":null,"fence_evidence":null,"outcome":null,"adopted":false,"crawler_run":{{"run_id":"{run_id}","request_digest":"{request_digest}","started_at_unix_ms":100,"cancel_requested_at_unix_ms":null,"terminal":null}}}}"#
+    );
+    assert!(!legacy_json.contains("deadline_at_unix_ms"));
+    let root = tmp.path().join(CRAWLER_TOMBSTONE_DIR);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join(format!("{run_id}.json")), legacy_json).unwrap();
+
+    let retained = store.load(run_id).unwrap().unwrap();
+    assert_eq!(
+        retained
+            .crawler_run
+            .as_ref()
+            .unwrap()
+            .deadline_at_unix_ms,
+        None
+    );
+    assert!(matches!(
+        store
+            .start_classified_with_deadline_admission(run_id, digest(), 999, Some(1_049), false)
+            .unwrap(),
+        CrawlerRunStartDisposition::Replay(_)
+    ));
+    assert!(store
+        .terminalize_expired_if_unowned(run_id, 149, 50)
+        .unwrap()
+        .is_none());
+    let terminal = store
+        .terminalize_expired_if_unowned(run_id, 150, 50)
+        .unwrap()
+        .expect("legacy run must expire at start plus the compatibility bound");
+    assert_eq!(
+        terminal
+            .crawler_run
+            .unwrap()
+            .terminal
+            .unwrap()
+            .outcome,
+        CrawlerTerminalOutcome::Failed {
+            error_code: CrawlerRunErrorCodeEvidence::WorkerLost,
+        }
+    );
+}
+
+#[test]
+fn crawler_store_runtime_terminalization_atomically_respects_cancellation_ordering() {
+    let tmp = TempDir::new().unwrap();
+    let store = CrawlerRunStore::new(tmp.path());
+    let canceled_run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    store.start(canceled_run_id, digest(), 100).unwrap();
+    store.request_cancel(canceled_run_id, 110).unwrap();
+    let canceled = store
+        .finish_runtime_without_publication(
+            canceled_run_id,
+            CrawlerTerminalOutcome::Failed {
+                error_code: CrawlerRunErrorCodeEvidence::FetchTimeout,
+            },
+            CrawlerRunCountersEvidence::default(),
+            20,
+            120,
+        )
+        .unwrap();
+    assert_eq!(
+        canceled
+            .crawler_run
+            .unwrap()
+            .terminal
+            .unwrap()
+            .outcome,
+        CrawlerTerminalOutcome::Canceled
+    );
+
+    let failed_run_id = "018f3e2a-7b1c-7d45-8c90-000000000001";
+    store.start(failed_run_id, digest(), 200).unwrap();
+    let failed = store
+        .finish_runtime_without_publication(
+            failed_run_id,
+            CrawlerTerminalOutcome::Failed {
+                error_code: CrawlerRunErrorCodeEvidence::FetchTimeout,
+            },
+            CrawlerRunCountersEvidence::default(),
+            20,
+            220,
+        )
+        .unwrap();
+    assert_eq!(
+        failed
+            .crawler_run
+            .unwrap()
+            .terminal
+            .unwrap()
+            .outcome,
+        CrawlerTerminalOutcome::Failed {
+            error_code: CrawlerRunErrorCodeEvidence::FetchTimeout,
+        }
+    );
+    assert_eq!(
+        store.request_cancel_with_disposition(failed_run_id, 221).unwrap(),
+        CrawlerRunCancelDispositionEvidence::AlreadyTerminal
+    );
+}
+
+#[test]
+fn crawler_store_cancel_before_start_is_durable_and_prevents_running_state() {
+    let tmp = TempDir::new().unwrap();
+    let store = CrawlerRunStore::new(tmp.path());
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    store.request_cancel(run_id, 100).unwrap();
+
+    let reserved = store.load(run_id).unwrap().expect("durable cancellation");
+    let reservation_terminal = reserved
+        .crawler_run
+        .as_ref()
+        .and_then(|run| run.terminal.as_ref())
+        .expect("cancel-before-start is immediately terminal");
+    assert_eq!(
+        reservation_terminal.outcome,
+        CrawlerTerminalOutcome::Canceled
+    );
+    store.acknowledge_classified(run_id, 101).unwrap();
+
+    let canceled = store
+        .bind_canceled_start(
+            run_id,
+            digest(),
+            CrawlerRunCountersEvidence::default(),
+            2,
+            102,
+        )
+        .unwrap();
+    let terminal = canceled
+        .crawler_run
+        .as_ref()
+        .and_then(|run| run.terminal.as_ref())
+        .unwrap();
+    assert_eq!(terminal.outcome, CrawlerTerminalOutcome::Canceled);
+    assert_eq!(terminal.acknowledged_at_unix_ms, Some(101));
+    assert!(terminal.publication.is_none());
+    assert_eq!(store.load(run_id).unwrap(), Some(canceled));
+}
+
+fn write_crawler_success_journal(
+    base: &std::path::Path,
+    run_id: &str,
+) -> PublicationJournal {
+    let target = PublicationTarget::new("products").unwrap();
+    let transaction = PublicationTransactionId::new(format!("txn_{}", &run_id[..8])).unwrap();
+    let paths = PublicationPaths::new(base, &target, &transaction);
+    let journal = PublicationJournal::prepare(
+        transaction,
+        target,
+        PublicationGenerationEvidence::new("crawler_generation_1").unwrap(),
+        digest(),
+        paths.clone(),
+    )
+    .apply_crawler_success(CrawlerPublicationCompletion {
+        run_id: run_id.to_string(),
+        request_digest: ContentDigest::new(format!("sha256:{}", "b".repeat(64))).unwrap(),
+        counters: CrawlerRunCountersEvidence {
+            fetched: 2,
+            discovered: 3,
+            transformed: 2,
+            published: 2,
+        },
+        duration_ms: 40,
+        terminal_at_unix_ms: 1_000,
+        task_id: 17,
+    })
+    .unwrap();
+    std::fs::create_dir_all(paths.journal.parent().unwrap()).unwrap();
+    std::fs::write(
+        &paths.journal,
+        serde_json::to_vec_pretty(&journal.to_json_value()).unwrap(),
+    )
+    .unwrap();
+    journal
+}
+
+#[test]
+fn crawler_store_recovers_success_from_commit_before_projection_or_response() {
+    let tmp = TempDir::new().unwrap();
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    let journal = write_crawler_success_journal(tmp.path(), run_id);
+    let store = CrawlerRunStore::new(tmp.path());
+
+    let recovered = store.load(run_id).unwrap().expect("journal truth");
+    assert_eq!(
+        recovered
+            .crawler_run
+            .as_ref()
+            .and_then(|run| run.terminal.as_ref()),
+        journal.crawler_terminal.as_ref()
+    );
+}
+
+#[test]
+fn crawler_store_recovers_success_when_data_dir_is_dot_relative() {
+    let tmp = tempfile::tempdir_in(".").unwrap();
+    let base = PathBuf::from(tmp.path().file_name().expect("temporary directory name")).join("data");
+    std::fs::create_dir(&base).unwrap();
+    assert!(!base.is_absolute(), "fixture must exercise a relative data dir");
+
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    let request_digest = ContentDigest::new(format!("sha256:{}", "b".repeat(64))).unwrap();
+    let store = CrawlerRunStore::new(&base);
+    store.start(run_id, request_digest, 900).unwrap();
+    let journal = write_crawler_success_journal(&base, run_id);
+
+    let expected = relative_path_evidence(&journal.target, &journal.transaction_id);
+    let mut legacy = journal.to_json_value();
+    legacy["paths"] = serde_json::json!({
+        "target": PathBuf::from("./data").join(&expected.target),
+        "staging": PathBuf::from("./data").join(&expected.staging),
+        "backup": PathBuf::from("./data").join(&expected.backup),
+        "journal": PathBuf::from("./data").join(&expected.journal),
+        "quarantine": PathBuf::from("./data").join(&expected.quarantine),
+    });
+    std::fs::write(
+        &journal.paths.journal,
+        serde_json::to_vec_pretty(&legacy).unwrap(),
+    )
+    .unwrap();
+
+    let recovered = store
+        .load(run_id)
+        .expect("legacy ./data journal paths must remain replayable")
+        .expect("committed journal must supersede its running precursor");
+    assert_eq!(
+        recovered.crawler_run.unwrap().terminal,
+        journal.crawler_terminal
+    );
+    assert_eq!(
+        journal.to_json_value()["paths"],
+        serde_json::json!({
+            "target": expected.target,
+            "staging": expected.staging,
+            "backup": expected.backup,
+            "journal": expected.journal,
+            "quarantine": expected.quarantine,
+        })
+    );
+}
+
+#[test]
+fn publication_journal_recovers_one_shared_safe_relative_path_prefix() {
+    let journal = prepared_journal();
+    let expected = relative_path_evidence(&journal.target, &journal.transaction_id);
+
+    for prefix in ["data", "state/runtime", "./data"] {
+        let mut raw = journal.to_json_value();
+        raw["paths"] = serde_json::json!({
+            "target": PathBuf::from(prefix).join(&expected.target),
+            "staging": PathBuf::from(prefix).join(&expected.staging),
+            "backup": PathBuf::from(prefix).join(&expected.backup),
+            "journal": PathBuf::from(prefix).join(&expected.journal),
+            "quarantine": PathBuf::from(prefix).join(&expected.quarantine),
+        });
+        assert_eq!(
+            PublicationJournal::from_recovery_json(&raw.to_string())
+                .unwrap_or_else(|error| panic!("safe shared prefix {prefix:?}: {error}"))
+                .paths,
+            expected,
+        );
+    }
+}
+
+#[test]
+fn publication_journal_rejects_inconsistent_or_unsafe_relative_path_prefixes() {
+    let journal = prepared_journal();
+    let expected = relative_path_evidence(&journal.target, &journal.transaction_id);
+    let prefixed = |prefix: &str| {
+        serde_json::json!({
+            "target": PathBuf::from(prefix).join(&expected.target),
+            "staging": PathBuf::from(prefix).join(&expected.staging),
+            "backup": PathBuf::from(prefix).join(&expected.backup),
+            "journal": PathBuf::from(prefix).join(&expected.journal),
+            "quarantine": PathBuf::from(prefix).join(&expected.quarantine),
+        })
+    };
+
+    let mut inconsistent = journal.to_json_value();
+    inconsistent["paths"] = prefixed("state");
+    inconsistent["paths"]["journal"] =
+        serde_json::json!(PathBuf::from("other").join(&expected.journal));
+
+    let mut suffix_mismatch = journal.to_json_value();
+    suffix_mismatch["paths"] = prefixed("state");
+    suffix_mismatch["paths"]["target"] = serde_json::json!("state/other-target");
+
+    let mut inconsistent_curdir = journal.to_json_value();
+    inconsistent_curdir["paths"] = prefixed("state");
+    inconsistent_curdir["paths"]["target"] =
+        serde_json::json!(PathBuf::from("./state").join(&expected.target));
+
+    for (label, paths) in [
+        ("inconsistent base", inconsistent["paths"].clone()),
+        ("suffix mismatch", suffix_mismatch["paths"].clone()),
+        (
+            "inconsistent leading curdir",
+            inconsistent_curdir["paths"].clone(),
+        ),
+        ("absolute base", prefixed("/state")),
+        ("parent traversal", prefixed("../state")),
+    ] {
+        let mut raw = journal.to_json_value();
+        raw["paths"] = paths;
+        assert!(
+            PublicationJournal::from_recovery_json(&raw.to_string()).is_err(),
+            "{label} must fail closed"
+        );
+    }
+}
+
+#[test]
+fn crawler_success_recovery_supersedes_only_its_matching_running_precursor() {
+    let tmp = TempDir::new().unwrap();
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    let request_digest = ContentDigest::new(format!("sha256:{}", "b".repeat(64))).unwrap();
+    let store = CrawlerRunStore::new(tmp.path());
+    store
+        .create(&PublicationTombstone::started(
+            run_id,
+            request_digest.clone(),
+            900,
+        )
+        .unwrap())
+        .unwrap();
+    let journal = write_crawler_success_journal(tmp.path(), run_id);
+
+    let recovered = store.load(run_id).unwrap().unwrap();
+    assert_eq!(
+        recovered.crawler_run.unwrap().terminal,
+        journal.crawler_terminal
+    );
+
+    let mut wrong = PublicationTombstone::started(
+        run_id,
+        ContentDigest::new(format!("sha256:{}", "c".repeat(64))).unwrap(),
+        900,
+    )
+    .unwrap();
+    wrong.request_cancel(901).unwrap();
+    store.persist(&wrong).unwrap();
+    assert!(store.load(run_id).is_err());
+}
+
+#[test]
+fn crawler_store_compacts_before_journal_removal_and_refuses_disagreement() {
+    let tmp = TempDir::new().unwrap();
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    let journal = write_crawler_success_journal(tmp.path(), run_id);
+    let store = CrawlerRunStore::new(tmp.path());
+    store.compact_success(&journal).unwrap();
+
+    let mut conflicting = store.load(run_id).unwrap().unwrap();
+    conflicting
+        .crawler_run
+        .as_mut()
+        .unwrap()
+        .terminal
+        .as_mut()
+        .unwrap()
+        .counters
+        .published = 99;
+    store.persist(&conflicting).unwrap();
+    assert!(store.load(run_id).is_err());
+
+    store.persist(&PublicationTombstone::from_adopted(
+        &journal,
+        &PublicationJobHandoff::adopt(&journal).unwrap(),
+    ).unwrap()).unwrap();
+    std::fs::remove_dir_all(journal.paths.journal.parent().unwrap()).unwrap();
+    assert_eq!(
+        store
+            .load(run_id)
+            .unwrap()
+            .unwrap()
+            .crawler_run
+            .unwrap()
+            .terminal,
+        journal.crawler_terminal
+    );
+}
+
+#[test]
+fn crawler_cleanup_path_persists_handoff_tombstone_before_deleting_journal() {
+    let tmp = TempDir::new().unwrap();
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    let journal = write_crawler_success_journal(tmp.path(), run_id);
+
+    retire_committed_publication_journals(tmp.path(), &journal.target).unwrap();
+
+    assert!(!journal.paths.journal.exists());
+    let retained = CrawlerRunStore::new(tmp.path())
+        .load(run_id)
+        .unwrap()
+        .expect("cleanup must compact crawler truth before journal deletion");
+    assert_eq!(
+        retained.crawler_run.unwrap().terminal,
+        journal.crawler_terminal
+    );
+}
+
+#[test]
+fn crawler_success_ack_updates_journal_truth_and_compacted_projection() {
+    let tmp = TempDir::new().unwrap();
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    let journal = write_crawler_success_journal(tmp.path(), run_id);
+    let store = CrawlerRunStore::new(tmp.path());
+
+    store.acknowledge(run_id, 2_000).unwrap();
+
+    let persisted = PublicationJournal::from_json(
+        &std::fs::read_to_string(&journal.paths.journal).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        persisted
+            .crawler_terminal
+            .as_ref()
+            .unwrap()
+            .acknowledged_at_unix_ms,
+        Some(2_000)
+    );
+    assert_eq!(
+        store
+            .load(run_id)
+            .unwrap()
+            .unwrap()
+            .crawler_run
+            .unwrap()
+            .terminal
+            .unwrap()
+            .acknowledged_at_unix_ms,
+        Some(2_000)
+    );
+}
+
+#[test]
+fn crawler_store_ack_and_retention_boundaries_never_prune_unacked_truth() {
+    let tmp = TempDir::new().unwrap();
+    let store = CrawlerRunStore::new(tmp.path());
+    let terminal_at = 10_000;
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    let mut failed = PublicationTombstone::started(run_id, digest(), 9_000).unwrap();
+    failed
+        .finish_without_publication(
+            CrawlerTerminalOutcome::Failed {
+                error_code: CrawlerRunErrorCodeEvidence::WorkerLost,
+            },
+            CrawlerRunCountersEvidence::default(),
+            1_000,
+            terminal_at,
+        )
+        .unwrap();
+    store.create(&failed).unwrap();
+
+    assert_eq!(
+        store.prune(terminal_at + CrawlerRunStore::RETENTION_MS).unwrap(),
+        0,
+        "unacknowledged terminal truth is never pruned"
+    );
+    store.acknowledge(run_id, terminal_at + 1).unwrap();
+    assert_eq!(
+        store
+            .prune(terminal_at + CrawlerRunStore::RETENTION_MS - 1)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store.prune(terminal_at + CrawlerRunStore::RETENTION_MS).unwrap(),
+        1
+    );
+    assert!(store.load(run_id).unwrap().is_none());
+}
+
+#[test]
+fn crawler_store_prune_never_unlinks_a_live_execution_owner() {
+    let tmp = TempDir::new().unwrap();
+    let store = CrawlerRunStore::new(tmp.path());
+    let terminal_at = 10_000;
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    store.start(run_id, digest(), 9_000).unwrap();
+    let live_claim = match store.claim_execution(run_id).unwrap() {
+        CrawlerRunExecutionClaimDisposition::Acquired(claim) => claim,
+        _ => panic!("started run must own its execution lock"),
+    };
+    store
+        .finish_without_publication(
+            run_id,
+            CrawlerTerminalOutcome::Failed {
+                error_code: CrawlerRunErrorCodeEvidence::WorkerLost,
+            },
+            CrawlerRunCountersEvidence::default(),
+            1_000,
+            terminal_at,
+        )
+        .unwrap();
+    store.acknowledge(run_id, terminal_at + 1).unwrap();
+
+    assert_eq!(
+        store
+            .prune(terminal_at + CrawlerRunStore::RETENTION_MS)
+            .unwrap(),
+        0,
+        "maintenance must not unlink a lock path while an execution owner is live"
+    );
+    assert!(store.load(run_id).unwrap().is_some());
+
+    drop(live_claim);
+    assert_eq!(
+        store
+            .prune(terminal_at + CrawlerRunStore::RETENTION_MS)
+            .unwrap(),
+        1
+    );
+    assert!(store.load(run_id).unwrap().is_none());
+}
+
+#[test]
+fn crawler_store_prune_preserves_current_success_journal_replay_across_restart() {
+    let tmp = TempDir::new().unwrap();
+    let store = CrawlerRunStore::new(tmp.path());
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    let request_digest = ContentDigest::new(format!("sha256:{}", "b".repeat(64))).unwrap();
+    store.start(run_id, request_digest, 900).unwrap();
+    let claim = match store.claim_execution(run_id).unwrap() {
+        CrawlerRunExecutionClaimDisposition::Acquired(claim) => claim,
+        _ => panic!("started run must create its execution lock"),
+    };
+    drop(claim);
+    let journal = write_crawler_success_journal(tmp.path(), run_id);
+    store.acknowledge(run_id, 2_000).unwrap();
+    let acknowledged_terminal = store
+        .load(run_id)
+        .unwrap()
+        .unwrap()
+        .crawler_run
+        .unwrap()
+        .terminal;
+
+    assert_eq!(
+        store
+            .prune(1_000 + CrawlerRunStore::RETENTION_MS)
+            .unwrap(),
+        1
+    );
+    assert!(journal.paths.journal.exists());
+    let restarted = CrawlerRunStore::new(tmp.path());
+    assert_eq!(
+        restarted
+            .load(run_id)
+            .unwrap()
+            .unwrap()
+            .crawler_run
+            .unwrap()
+            .terminal,
+        acknowledged_terminal
+    );
+}
+
+#[test]
+fn crawler_store_prune_makes_lock_removal_durable_before_tombstone_removal() {
+    fn seed() -> (TempDir, CrawlerRunStore, PathBuf, PathBuf, u64) {
+        let tmp = TempDir::new().unwrap();
+        let store = CrawlerRunStore::new(tmp.path());
+        let terminal_at = 10_000;
+        let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+        store.start(run_id, digest(), 9_000).unwrap();
+        let claim = match store.claim_execution(run_id).unwrap() {
+            CrawlerRunExecutionClaimDisposition::Acquired(claim) => claim,
+            _ => panic!("started run must own its execution lock"),
+        };
+        drop(claim);
+        store
+            .finish_without_publication(
+                run_id,
+                CrawlerTerminalOutcome::Failed {
+                    error_code: CrawlerRunErrorCodeEvidence::WorkerLost,
+                },
+                CrawlerRunCountersEvidence::default(),
+                1_000,
+                terminal_at,
+            )
+            .unwrap();
+        store.acknowledge(run_id, terminal_at + 1).unwrap();
+        let root = tmp.path().join(CRAWLER_TOMBSTONE_DIR);
+        let lock = root.join(format!("{run_id}.execution.lock"));
+        let tombstone = root.join(format!("{run_id}.json"));
+        (tmp, store, lock, tombstone, terminal_at)
+    }
+
+    let (_tmp, store, lock, tombstone, terminal_at) = seed();
+    let recording = PublicationFaultScript::recording();
+    assert_eq!(
+        store
+            .prune_with_faults_for_test(
+                terminal_at + CrawlerRunStore::RETENTION_MS,
+                &recording,
+            )
+            .unwrap(),
+        1
+    );
+    let operations = recording.operations();
+    assert_eq!(
+        operations,
+        vec![
+            PublicationOperation::Remove(lock.clone()),
+            PublicationOperation::SyncDirectory(lock.parent().unwrap().to_path_buf()),
+            PublicationOperation::Remove(tombstone.clone()),
+            PublicationOperation::SyncDirectory(tombstone.parent().unwrap().to_path_buf()),
+        ]
+    );
+
+    let (_tmp, store, lock, tombstone, terminal_at) = seed();
+    let crash_before_tombstone_remove = PublicationFaultScript::failing_at(2);
+    store
+        .prune_with_faults_for_test(
+            terminal_at + CrawlerRunStore::RETENTION_MS,
+            &crash_before_tombstone_remove,
+        )
+        .expect_err("simulated crash must stop before tombstone removal");
+    assert!(!lock.exists());
+    assert!(tombstone.exists());
+    assert_eq!(
+        crash_before_tombstone_remove.operations(),
+        vec![
+            PublicationOperation::Remove(lock.clone()),
+            PublicationOperation::SyncDirectory(lock.parent().unwrap().to_path_buf()),
+            PublicationOperation::Remove(tombstone.clone()),
+        ]
+    );
+}
+
+fn seed_unacknowledged_crawler_tombstones(
+    base: &std::path::Path,
+    run_id_prefix: &str,
+    numbers: std::ops::Range<usize>,
+) {
+    let root = base.join(CRAWLER_TOMBSTONE_DIR);
+    std::fs::create_dir_all(&root).unwrap();
+    for number in numbers {
+        let run_id = format!("{run_id_prefix}{number:012}");
+        let tombstone = PublicationTombstone::cancel_before_start(&run_id, 1).unwrap();
+        std::fs::write(
+            root.join(format!("{run_id}.json")),
+            serde_json::to_vec(&tombstone).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn crawler_store_enforces_finite_unacknowledged_cap() {
+    let tmp = TempDir::new().unwrap();
+    let store = CrawlerRunStore::new(tmp.path());
+    let run_id_prefix = "018f3e2a-7b1c-7d45-8c90-";
+    let first_run_id = format!("{run_id_prefix}{:012}", 0);
+    store
+        .create(&PublicationTombstone::cancel_before_start(&first_run_id, 1).unwrap())
+        .expect("the production create path must establish the durable namespace");
+    seed_unacknowledged_crawler_tombstones(
+        tmp.path(),
+        run_id_prefix,
+        1..CrawlerRunStore::MAX_UNACKNOWLEDGED - 1,
+    );
+    assert_eq!(
+        store.unacknowledged_count_unlocked().unwrap(),
+        CrawlerRunStore::MAX_UNACKNOWLEDGED - 1
+    );
+    let boundary_run_id = format!(
+        "{run_id_prefix}{:012}",
+        CrawlerRunStore::MAX_UNACKNOWLEDGED - 1
+    );
+    store
+        .create(&PublicationTombstone::cancel_before_start(&boundary_run_id, 1).unwrap())
+        .expect("the final retained slot must remain usable");
+    assert_eq!(
+        store.unacknowledged_count_unlocked().unwrap(),
+        CrawlerRunStore::MAX_UNACKNOWLEDGED
+    );
+    let overflow_run_id = "018f3e2a-7b1c-7d45-8c90-999999999999";
+    let overflow = PublicationTombstone::cancel_before_start(overflow_run_id, 1).unwrap();
+    assert!(store
+        .create(&overflow)
+        .unwrap_err()
+        .to_string()
+        .contains("retention cap"));
+    assert!(!tmp
+        .path()
+        .join(CRAWLER_TOMBSTONE_DIR)
+        .join(format!("{overflow_run_id}.json"))
+        .exists());
+}
+
+#[test]
+fn crawler_start_transition_has_exactly_one_concurrent_owner() {
+    let tmp = TempDir::new().unwrap();
+    let store = CrawlerRunStore::new(tmp.path());
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    let workers = 16;
+    let barrier = Arc::new(Barrier::new(workers));
+    let mut joins = Vec::new();
+
+    for _ in 0..workers {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        joins.push(std::thread::spawn(move || {
+            barrier.wait();
+            store.start(run_id, digest(), 100).unwrap()
+        }));
+    }
+
+    let dispositions = joins
+        .into_iter()
+        .map(|join| join.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        dispositions
+            .iter()
+            .filter(|disposition| matches!(disposition, CrawlerRunStartDisposition::Started(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        dispositions
+            .iter()
+            .filter(|disposition| matches!(disposition, CrawlerRunStartDisposition::Replay(_)))
+            .count(),
+        workers - 1
+    );
+}
+
+#[test]
+fn crawler_cancel_before_start_is_terminal_and_late_start_only_binds_digest() {
+    let tmp = TempDir::new().unwrap();
+    let store = CrawlerRunStore::new(tmp.path());
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    store.request_cancel(run_id, 90).unwrap();
+
+    let disposition = store.start(run_id, digest(), 100).unwrap();
+    let CrawlerRunStartDisposition::Canceled(canceled) = disposition else {
+        panic!("cancel-before-start must never acquire fetch ownership");
+    };
+    let run = canceled.crawler_run.unwrap();
+    assert_eq!(run.cancel_requested_at_unix_ms, Some(90));
+    assert_eq!(run.request_digest, Some(digest()));
+    assert_eq!(
+        run.terminal.unwrap().outcome,
+        CrawlerTerminalOutcome::Canceled
+    );
+    assert!(matches!(
+        store.start(run_id, digest(), 101).unwrap(),
+        CrawlerRunStartDisposition::Replay(_)
+    ));
+}
+
+#[test]
+fn crawler_cancel_ack_and_execution_claim_dispositions_are_atomic() {
+    let tmp = TempDir::new().unwrap();
+    let store = CrawlerRunStore::new(tmp.path());
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    store.start(run_id, digest(), 100).unwrap();
+
+    let CrawlerRunExecutionClaimDisposition::Acquired(first_claim) =
+        store.claim_execution(run_id).unwrap()
+    else {
+        panic!("first executor must acquire the durable run slot");
+    };
+    assert!(matches!(
+        store.claim_execution(run_id).unwrap(),
+        CrawlerRunExecutionClaimDisposition::AlreadyExecuting
+    ));
+    drop(first_claim);
+    let CrawlerRunExecutionClaimDisposition::Acquired(restart_claim) =
+        store.claim_execution(run_id).unwrap()
+    else {
+        panic!("dropped worker claim must be restartable");
+    };
+    drop(restart_claim);
+
+    assert_eq!(
+        store
+            .request_cancel_with_disposition(run_id, 101)
+            .unwrap(),
+        CrawlerRunCancelDispositionEvidence::CancelRequested
+    );
+    assert_eq!(
+        store
+            .request_cancel_with_disposition(run_id, 102)
+            .unwrap(),
+        CrawlerRunCancelDispositionEvidence::AlreadyRequested
+    );
+    assert!(matches!(
+        store.claim_execution(run_id).unwrap(),
+        CrawlerRunExecutionClaimDisposition::NotRunnable
+    ));
+    assert!(matches!(
+        store.acknowledge_classified(run_id, 103),
+        Err(CrawlerRunAcknowledgeError::NotTerminal)
+    ));
+
+    store
+        .finish_without_publication(
+            run_id,
+            CrawlerTerminalOutcome::Canceled,
+            CrawlerRunCountersEvidence::default(),
+            3,
+            104,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .request_cancel_with_disposition(run_id, 105)
+            .unwrap(),
+        CrawlerRunCancelDispositionEvidence::AlreadyTerminal
+    );
+    store.acknowledge_classified(run_id, 106).unwrap();
+    store.acknowledge_classified(run_id, 107).unwrap();
+    assert_eq!(
+        store
+            .load(run_id)
+            .unwrap()
+            .unwrap()
+            .crawler_run
+            .unwrap()
+            .terminal
+            .unwrap()
+            .acknowledged_at_unix_ms,
+        Some(106)
+    );
+    assert!(matches!(
+        store.acknowledge_classified("018f3e2a-7b1c-7d45-8c90-000000000000", 1),
+        Err(CrawlerRunAcknowledgeError::NotFound)
+    ));
+}
+
+fn crawler_completion(run_id: &str, request_digest: ContentDigest) -> CrawlerPublicationCompletion {
+    CrawlerPublicationCompletion {
+        run_id: run_id.to_string(),
+        request_digest,
+        counters: CrawlerRunCountersEvidence {
+            fetched: 1,
+            discovered: 1,
+            transformed: 1,
+            published: 1,
+        },
+        duration_ms: 10,
+        terminal_at_unix_ms: 110,
+        task_id: 42,
+    }
+}
+
+#[test]
+fn crawler_publication_admission_rechecks_digest_cancel_terminal_and_deadline() {
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+
+    let mismatch_tmp = TempDir::new().unwrap();
+    let mismatch_store = CrawlerRunStore::new(mismatch_tmp.path());
+    mismatch_store.start(run_id, digest(), 100).unwrap();
+    let mismatch = crawler_completion(
+        run_id,
+        ContentDigest::new(format!("sha256:{}", "b".repeat(64))).unwrap(),
+    );
+    assert!(mismatch_store
+        .admit_publication(mismatch, Instant::now() + Duration::from_secs(60))
+        .unwrap_err()
+        .to_string()
+        .contains("digest disagrees"));
+
+    let canceled_tmp = TempDir::new().unwrap();
+    let canceled_store = CrawlerRunStore::new(canceled_tmp.path());
+    canceled_store.start(run_id, digest(), 100).unwrap();
+    canceled_store.request_cancel(run_id, 101).unwrap();
+    assert!(canceled_store
+        .admit_publication(
+            crawler_completion(run_id, digest()),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("canceled"));
+
+    let terminal_tmp = TempDir::new().unwrap();
+    let terminal_store = CrawlerRunStore::new(terminal_tmp.path());
+    terminal_store.start(run_id, digest(), 100).unwrap();
+    terminal_store
+        .finish_without_publication(
+            run_id,
+            CrawlerTerminalOutcome::Failed {
+                error_code: CrawlerRunErrorCodeEvidence::WorkerLost,
+            },
+            CrawlerRunCountersEvidence::default(),
+            10,
+            110,
+        )
+        .unwrap();
+    assert!(terminal_store
+        .admit_publication(
+            crawler_completion(run_id, digest()),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("terminal"));
+
+    let deadline_tmp = TempDir::new().unwrap();
+    let deadline_store = CrawlerRunStore::new(deadline_tmp.path());
+    deadline_store.start(run_id, digest(), 100).unwrap();
+    assert!(deadline_store
+        .admit_publication(
+            crawler_completion(run_id, digest()),
+            Instant::now() - Duration::from_secs(1),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("deadline"));
+
+    let capacity_tmp = TempDir::new().unwrap();
+    let capacity_store = CrawlerRunStore::new(capacity_tmp.path());
+    capacity_store.start(run_id, digest(), 100).unwrap();
+    let capacity_root = capacity_tmp.path().join(CRAWLER_TOMBSTONE_DIR);
+    seed_unacknowledged_crawler_tombstones(
+        capacity_tmp.path(),
+        "018f3e2a-7b1c-7d45-8c91-",
+        0..CrawlerRunStore::MAX_UNACKNOWLEDGED - 1,
+    );
+    let admission_at_cap = capacity_store
+        .admit_publication(
+            crawler_completion(run_id, digest()),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .expect("updating one of the capped retained runs adds no durable record");
+    drop(admission_at_cap);
+    let overflow_run_id = "018f3e2a-7b1c-7d45-8c91-999999999999";
+    let overflow = PublicationTombstone::started(overflow_run_id, digest(), 100).unwrap();
+    std::fs::write(
+        capacity_root.join(format!("{overflow_run_id}.json")),
+        serde_json::to_vec_pretty(&overflow).unwrap(),
+    )
+    .unwrap();
+    assert!(capacity_store
+        .admit_publication(
+            crawler_completion(run_id, digest()),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("capacity"));
+}
+
+#[test]
+fn crawler_publication_exclusion_blocks_competing_run_transition_until_release() {
+    let tmp = TempDir::new().unwrap();
+    let store = CrawlerRunStore::new(tmp.path());
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    store.start(run_id, digest(), 100).unwrap();
+    let admission = store
+        .admit_publication(
+            crawler_completion(run_id, digest()),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+
+    let contender = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tmp.path().join(CRAWLER_TOMBSTONE_DIR).join(CRAWLER_TOMBSTONE_LOCK_FILE))
+        .unwrap();
+    assert!(matches!(
+        contender.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(admission);
+    contender.try_lock().unwrap();
+}
+
+#[test]
+fn canceled_crawler_binding_fails_before_any_target_or_journal_effect() {
+    let tmp = TempDir::new().unwrap();
+    let target = PublicationTarget::new("products").unwrap();
+    std::fs::create_dir_all(tmp.path().join("products")).unwrap();
+    std::fs::write(tmp.path().join("products/old.txt"), "old").unwrap();
+    let publication = PreStagedPublication::prepare(tmp.path(), target).unwrap();
+    let transaction_namespace = publication.paths().staging.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&publication.paths().staging).unwrap();
+    std::fs::write(publication.paths().staging.join("new.txt"), "new").unwrap();
+
+    let store = CrawlerRunStore::new(tmp.path());
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    store.start(run_id, digest(), 100).unwrap();
+    store.request_cancel(run_id, 101).unwrap();
+    let error = publication
+        .with_crawler_completion(
+            &store,
+            crawler_completion(run_id, digest()),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .err()
+        .expect("canceled run must reject publication binding");
+
+    assert!(error.to_string().contains("canceled"));
+    assert_eq!(std::fs::read(tmp.path().join("products/old.txt")).unwrap(), b"old");
+    assert!(!tmp.path().join("products/new.txt").exists());
+    assert!(!transaction_namespace.exists());
+    assert!(
+        std::fs::read_dir(tmp.path().join(PUBLICATION_DIR).join("products"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "rejected binding may leave only the empty target namespace"
+    );
+}
+
+#[test]
+fn admitted_crawler_success_commits_once_and_replays_from_durable_truth() {
+    let tmp = TempDir::new().unwrap();
+    let target = PublicationTarget::new("products").unwrap();
+    std::fs::create_dir_all(tmp.path().join("products")).unwrap();
+    std::fs::write(tmp.path().join("products/old.txt"), "old").unwrap();
+    let publication = PreStagedPublication::prepare(tmp.path(), target).unwrap();
+    std::fs::create_dir_all(&publication.paths().staging).unwrap();
+    std::fs::write(publication.paths().staging.join("new.txt"), "new").unwrap();
+
+    let store = CrawlerRunStore::new(tmp.path());
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    store.start(run_id, digest(), 100).unwrap();
+    let committed = publication
+        .with_crawler_completion(
+            &store,
+            crawler_completion(run_id, digest()),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap()
+        .activate()
+        .unwrap();
+
+    assert_eq!(std::fs::read(tmp.path().join("products/new.txt")).unwrap(), b"new");
+    assert_eq!(
+        store
+            .load(run_id)
+            .unwrap()
+            .unwrap()
+            .crawler_run
+            .unwrap()
+            .terminal,
+        committed.crawler_terminal
+    );
+    assert!(matches!(
+        store.start(run_id, digest(), 120).unwrap(),
+        CrawlerRunStartDisposition::Replay(_)
+    ));
+}
+
+#[test]
+fn crawler_repair_after_promote_crash_preserves_atomic_success_truth() {
+    let tmp = TempDir::new().unwrap();
+    let target = PublicationTarget::new("products").unwrap();
+    write_authentic_fixture_tree(&tmp.path().join("products"), FixtureTreeKind::Old);
+    let publication = PreStagedPublication::prepare(tmp.path(), target.clone()).unwrap();
+    write_authentic_fixture_tree(&publication.paths().staging, FixtureTreeKind::New);
+
+    let store = CrawlerRunStore::new(tmp.path());
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+    store.start(run_id, digest(), 100).unwrap();
+    let publication = publication
+        .with_crawler_completion(
+            &store,
+            crawler_completion(run_id, digest()),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+
+    let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        publication
+            .activate_with_faults_for_test(&PanicAtCheckpoint::new(
+                PublicationFaultPoint::AfterStagingPromote,
+            ))
+            .unwrap();
+    }));
+    assert!(crash.is_err(), "the fault hook must model process loss");
+
+    let report = scan_and_repair_publication_target(
+        tmp.path(),
+        &AnalyticsConfig::for_data_dir(tmp.path()),
+        target,
+    )
+    .unwrap();
+    assert_eq!(
+        report.action,
+        PublicationScanAction::Repaired(RepairDecision::Complete)
+    );
+    let recovered = store.load(run_id).unwrap().expect("durable run truth");
+    assert_eq!(
+        recovered
+            .crawler_run
+            .and_then(|run| run.terminal)
+            .map(|terminal| terminal.outcome),
+        Some(CrawlerTerminalOutcome::Succeeded),
+        "repair must commit the crawler success fact with the promoted tree"
+    );
+}
+
+#[derive(Clone, Copy)]
+enum PreEffectCrawlerInterruption {
+    Cancel,
+    Terminal,
+    DeadlineProofLost,
+}
+
+#[test]
+fn crawler_pre_effect_crash_repair_never_starts_publication_without_live_admission() {
+    let cases = [
+        (
+            PublicationFaultPoint::AfterPrepareJournal,
+            PreEffectCrawlerInterruption::Cancel,
+        ),
+        (
+            PublicationFaultPoint::AfterTargetBackup,
+            PreEffectCrawlerInterruption::Terminal,
+        ),
+        (
+            PublicationFaultPoint::AfterPrepareJournal,
+            PreEffectCrawlerInterruption::DeadlineProofLost,
+        ),
+    ];
+
+    for (fault, interruption) in cases {
+        let tmp = TempDir::new().unwrap();
+        let target = PublicationTarget::new("products").unwrap();
+        write_authentic_fixture_tree(&tmp.path().join("products"), FixtureTreeKind::Old);
+        let old_tree = collect_fixture_tree_bytes(&tmp.path().join("products"));
+        let publication = PreStagedPublication::prepare(tmp.path(), target.clone()).unwrap();
+        let paths = publication.paths().clone();
+        write_authentic_fixture_tree(&paths.staging, FixtureTreeKind::New);
+
+        let store = CrawlerRunStore::new(tmp.path());
+        let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ab";
+        store.start(run_id, digest(), 100).unwrap();
+        let publication = publication
+            .with_crawler_completion(
+                &store,
+                crawler_completion(run_id, digest()),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+
+        let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            publication
+                .activate_with_faults_for_test(&PanicAtCheckpoint::new(fault))
+                .unwrap();
+        }));
+        assert!(crash.is_err(), "{fault:?} must model process loss");
+
+        match interruption {
+            PreEffectCrawlerInterruption::Cancel => {
+                store.request_cancel(run_id, 101).unwrap();
+            }
+            PreEffectCrawlerInterruption::Terminal => {
+                store
+                    .finish_without_publication(
+                        run_id,
+                        CrawlerTerminalOutcome::Failed {
+                            error_code: CrawlerRunErrorCodeEvidence::WorkerLost,
+                        },
+                        CrawlerRunCountersEvidence::default(),
+                        1,
+                        101,
+                    )
+                    .unwrap();
+            }
+            PreEffectCrawlerInterruption::DeadlineProofLost => {
+                // A monotonic Instant cannot survive process loss. With no live
+                // admission guard, repair has no proof that the deadline remains open.
+            }
+        }
+
+        let report = scan_and_repair_publication_target(
+            tmp.path(),
+            &AnalyticsConfig::for_data_dir(tmp.path()),
+            target,
+        )
+        .unwrap();
+        assert_eq!(
+            report.action,
+            PublicationScanAction::Repaired(RepairDecision::Rollback),
+            "{fault:?} must not initiate crawler target effects after restart"
+        );
+        assert_eq!(collect_fixture_tree_bytes(&paths.target), old_tree);
+        let rolled_back = PublicationJournal::from_recovery_json(
+            &std::fs::read_to_string(&paths.journal).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rolled_back.phase, PublicationPhase::RolledBack);
+        assert!(rolled_back.crawler_completion.is_none());
+        assert!(rolled_back.crawler_terminal.is_none());
+    }
 }
 
 /// TODO: Document tenant_inventory_classifies_only_owner_known_artifacts.
@@ -2375,6 +3821,270 @@ impl PublicationFaultHook for PanicAtCheckpoint {
         }
         Ok(())
     }
+}
+
+#[derive(Clone)]
+struct PublicationCheckpointGate {
+    state: std::sync::Arc<(std::sync::Mutex<(bool, bool)>, std::sync::Condvar)>,
+}
+
+impl PublicationCheckpointGate {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Arc::new((
+                std::sync::Mutex::new((false, false)),
+                std::sync::Condvar::new(),
+            )),
+        }
+    }
+
+    fn wait_until_reached(&self) {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().unwrap();
+        while !state.0 {
+            state = changed.wait(state).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().unwrap();
+        state.1 = true;
+        changed.notify_all();
+    }
+}
+
+impl PublicationFaultHook for PublicationCheckpointGate {
+    fn before_operation(&self, operation: &PublicationOperation) -> Result<()> {
+        if *operation != PublicationOperation::Checkpoint(PublicationCheckpoint::AfterPrepareJournal)
+        {
+            return Ok(());
+        }
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().unwrap();
+        state.0 = true;
+        changed.notify_all();
+        while !state.1 {
+            state = changed.wait(state).unwrap();
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn create_only_prepared_publication_is_invisible_to_concurrent_observers() {
+    let fixture = ActivationFixture::new();
+    let publication = PreStagedPublication::prepare(fixture.base(), fixture.target.clone()).unwrap();
+    fixture.write_new_tree(&publication.paths().staging);
+    let target = publication.paths().target.clone();
+    let gate = PublicationCheckpointGate::new();
+    let activation_gate = gate.clone();
+
+    let activation = std::thread::spawn(move || {
+        publication.activate_create_only_with_faults_for_test(&activation_gate)
+    });
+
+    gate.wait_until_reached();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _runtime_guard = runtime.enter();
+    let competing_manager = IndexManager::new(fixture.base());
+    let competing_create = competing_manager
+        .create_tenant(fixture.target.as_str())
+        .expect_err("the create-only publication fence must exclude ordinary tenant creation");
+    assert!(
+        matches!(
+            competing_create,
+            crate::error::FlapjackError::IndexPaused(ref tenant)
+                if tenant == fixture.target.as_str()
+        ),
+        "the competing creator must receive the canonical retriable fence error: {competing_create:?}"
+    );
+    let target_was_hidden = !target.exists();
+    gate.release();
+    assert!(activation.join().unwrap().is_ok());
+    assert!(
+        target_was_hidden,
+        "a durable prepared journal must not expose an empty destination"
+    );
+    assert!(target.exists(), "the populated staging tree must publish atomically");
+}
+
+#[test]
+fn initial_tenant_creation_honors_an_external_publication_fence() {
+    let fixture = ActivationFixture::new();
+    let lock_path = publication_epoch_paths_for_target_path(&fixture.paths.target).lock;
+    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let external_fence = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .unwrap();
+    external_fence.lock().unwrap();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _runtime_guard = runtime.enter();
+    let manager = IndexManager::new(fixture.base());
+    let blocked = manager
+        .create_tenant(fixture.target.as_str())
+        .expect_err("an external publication fence must exclude initial tenant creation");
+    assert!(
+        matches!(
+            blocked,
+            crate::error::FlapjackError::IndexPaused(ref tenant)
+                if tenant == fixture.target.as_str()
+        ),
+        "external exclusion must use the canonical retriable error: {blocked:?}"
+    );
+    assert!(
+        !fixture.paths.target.exists(),
+        "a cross-process fence must prevent any visible tenant tree"
+    );
+
+    external_fence.unlock().unwrap();
+    manager.create_tenant(fixture.target.as_str()).unwrap();
+    assert!(fixture.paths.target.exists());
+}
+
+#[test]
+fn create_only_process_loss_after_prepare_leaves_no_visible_destination() {
+    let fixture = ActivationFixture::new();
+    let publication = PreStagedPublication::prepare(fixture.base(), fixture.target.clone()).unwrap();
+    fixture.write_new_tree(&publication.paths().staging);
+    let paths = publication.paths().clone();
+
+    let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = publication.activate_create_only_with_faults_for_test(&PanicAtCheckpoint::new(
+            PublicationCheckpoint::AfterPrepareJournal,
+        ));
+    }));
+
+    assert!(crash.is_err(), "the injected process-loss checkpoint must fire");
+    assert!(paths.journal.exists(), "prepared evidence must be durable");
+    assert!(paths.staging.exists(), "recovery must retain the staged tree evidence");
+    assert!(
+        !paths.target.exists(),
+        "process loss before promotion must not leave a visible empty destination"
+    );
+}
+
+#[test]
+#[serial_test::serial(publication_epoch_open_lock_file_checkpoint_hook)]
+fn startup_repair_fences_before_inspecting_a_create_only_target() {
+    let fixture = ActivationFixture::new();
+    let publication = PreStagedPublication::prepare(fixture.base(), fixture.target.clone()).unwrap();
+    fixture.write_new_tree(&publication.paths().staging);
+    let paths = publication.paths().clone();
+    let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = publication.activate_create_only_with_faults_for_test(&PanicAtCheckpoint::new(
+            PublicationCheckpoint::AfterPrepareJournal,
+        ));
+    }));
+    assert!(crash.is_err());
+
+    let expected_lock = publication_epoch_paths_for_target_path(&paths.target).lock;
+    let (repair_opened_tx, repair_opened_rx) = std::sync::mpsc::channel();
+    let (release_repair_tx, release_repair_rx) = std::sync::mpsc::channel();
+    let release_repair_rx = std::sync::Mutex::new(release_repair_rx);
+    let opened_once = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _hook = set_publication_epoch_open_lock_file_checkpoint_hook_for_test({
+        let opened_once = std::sync::Arc::clone(&opened_once);
+        move |lock_path| {
+            if lock_path == expected_lock
+                && !opened_once.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                repair_opened_tx.send(()).unwrap();
+                release_repair_rx.lock().unwrap().recv().unwrap();
+            }
+        }
+    });
+
+    let base = fixture.base().to_path_buf();
+    let target = fixture.target.clone();
+    let repair = std::thread::spawn(move || {
+        scan_and_repair_publication_target(
+            &base,
+            &AnalyticsConfig::for_data_dir(&base),
+            target,
+        )
+    });
+    repair_opened_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("repair must acquire target exclusion before inspecting evidence");
+
+    // Model a creator in another process that completed just before repair took
+    // the cross-process lock. Repair must inspect this tree after acquisition and
+    // quarantine the ambiguous transaction without deleting the creator's data.
+    fixture.write_old_tree(&paths.target);
+    release_repair_tx.send(()).unwrap();
+    let report = repair.join().unwrap().unwrap();
+
+    assert_eq!(report.action, PublicationScanAction::Quarantined);
+    assert_eq!(fixture.read_target_file("index_meta.json"), b"old-meta");
+}
+
+#[test]
+fn create_only_process_loss_after_promote_repairs_committed_generation() {
+    let fixture = ActivationFixture::new();
+    let publication = PreStagedPublication::prepare(fixture.base(), fixture.target.clone()).unwrap();
+    fixture.write_new_tree(&publication.paths().staging);
+    let store = CrawlerRunStore::new(fixture.base());
+    let run_id = "018f3e2a-7b1c-7d45-8c90-1234567890ac";
+    store.start(run_id, digest(), 100).unwrap();
+    let publication = publication
+        .with_crawler_completion(
+            &store,
+            crawler_completion(run_id, digest()),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+    let paths = publication.paths().clone();
+
+    let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = publication.activate_create_only_with_faults_for_test(&PanicAtCheckpoint::new(
+            PublicationCheckpoint::AfterStagingPromote,
+        ));
+    }));
+
+    assert!(crash.is_err(), "the injected process-loss checkpoint must fire");
+    assert!(paths.target.exists(), "the atomic staging rename must be visible");
+    assert!(!paths.staging.exists(), "the staged tree must have been promoted");
+    let read_journal = || {
+        PublicationJournal::from_json(&std::fs::read_to_string(&paths.journal).unwrap()).unwrap()
+    };
+    assert_eq!(read_journal().phase, PublicationPhase::Prepared);
+
+    let report = scan_and_repair_publication_target(
+        fixture.base(),
+        &AnalyticsConfig::for_data_dir(fixture.base()),
+        fixture.target.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        report.action,
+        PublicationScanAction::Repaired(RepairDecision::Complete)
+    );
+    assert_eq!(report.disposition, PublicationTargetDisposition::Loadable);
+    assert_eq!(read_journal().phase, PublicationPhase::Committed);
+    assert_eq!(fixture.read_target_file("index_meta.json"), b"new-meta");
+    assert!(!paths.backup.exists(), "create-only never owns a prior backup");
+    assert_eq!(
+        store
+            .load(run_id)
+            .unwrap()
+            .and_then(|state| state.crawler_run)
+            .and_then(|run| run.terminal)
+            .map(|terminal| terminal.outcome),
+        Some(CrawlerTerminalOutcome::Succeeded),
+        "repair must commit the crawler terminal fact with the published generation"
+    );
 }
 
 /// TODO: Document activation_fault_hook_observes_every_durable_filesystem_boundary.
