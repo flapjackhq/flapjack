@@ -29,7 +29,7 @@ The repo already has executable proof surfaces for the core operational paths:
 | Startup failure (env, auth, lock, blank key) | `cargo test -p flapjack-server --test env_mode_test` |
 | Admin-key rotation and recovery | `cargo test -p flapjack-server --test admin_key_test` |
 | Metrics auth contract | `cargo test -p flapjack-http router::tests::metrics_returns_200_with_admin_key_only -- --exact` |
-| Release-to-release data-dir handoff | `engine/tests/upgrade_smoke.sh --old-bin <old> --new-bin <new>` |
+| Release-to-release data-dir handoff | Exact predecessor declarations in `engine/package/engine_compatibility.json`, enforced by `release.yml` through `engine/tests/upgrade_smoke.sh` |
 
 The main remaining gap is not whether these flows exist. It is how much
 long-duration and release-to-release evidence has been captured around them.
@@ -53,9 +53,34 @@ proof surfaces over restating their contents.
 
 ## Upgrade smoke
 
-Flapjack does not yet maintain a versioned historical compatibility matrix across
-arbitrary old releases. The current bar is a repeatable upgrade smoke against a
-known-good prior build on the same data directory.
+Flapjack does not infer upgrade safety from semantic versions. Every release
+artifact manifest carries the target-selected projection of the canonical
+`engine/package/engine_compatibility.json` map. Each projection names the exact
+artifact target; a target absent from the map receives an empty predecessor set
+and cannot infer upgrade safety from another architecture. A predecessor is
+eligible only when its release tag, published manifest SHA-256, and installed
+executable SHA-256 all match one entry declared for that target. The declaration
+starts with no predecessors; adding one makes the bounded same-data-directory
+smoke for that target a mandatory pre-publication release job. The production
+aarch64 and x86_64 Linux targets are certified in parallel; the aarch64 lane
+uses the release workflow's existing QEMU/binfmt authority.
+
+Before deciding whether that target declares any predecessor, the release gate
+validates the archive's exact two-member shape, materializes its single regular
+non-link `flapjack` entry through the shared safe extractor, verifies its binary
+digest, and executes `build-info --json` under a hard timeout. The output must be
+strict duplicate-free JSON whose object is type-for-type equal to `manifest.build`;
+JSON object field order is not significant. The aarch64 execution uses
+the same full-commit QEMU action and immutable binfmt image as the Docker fallback;
+x86_64 executes natively. Repeated predecessor binary digests, or a predecessor
+digest equal to the candidate, are invalid declarations rather than extra proof.
+
+Release artifact manifest schema 2 binds both the final archive digest
+(`artifact.sha256`) and the executable digest (`artifact.binarySha256`). The
+manifest `build` object is the executable's embedded BuildInfo. An operator can
+attest the running process with authenticated `GET /internal/build-info` and
+require exact JSON equality with `manifest.build`. Public `GET /health` remains
+a deliberately reduced projection and must not be used for exact attestation.
 
 ### Minimum upgrade smoke
 
@@ -76,7 +101,13 @@ For the documented Linux/systemd path, use the same deployment contract in
 The repo also ships a reusable focused harness:
 
 ```bash
-engine/tests/upgrade_smoke.sh --old-bin <old-binary> --new-bin <new-binary>
+engine/tests/upgrade_smoke.sh \
+  --old-bin <old-binary> \
+  --old-manifest <old-manifest> \
+  --old-binary-sha256 <declared-predecessor-binary-sha256> \
+  --new-bin <new-binary> \
+  --new-manifest <new-manifest> \
+  --rollback-mode <restore_pre_upgrade_backup|binary_reactivate_same_data>
 ```
 
 That script exercises:
@@ -86,6 +117,9 @@ That script exercises:
 - writes still work after upgrade
 - `/health` and `/health/ready` still succeed
 - `/dashboard` still serves HTML on the upgraded binary
+- the authenticated runtime BuildInfo exactly matches the new executable and manifest
+- `binary_reactivate_same_data`, when declared, also proves the predecessor can
+  restart after the new binary accepted a write and can search both generations
 
 ## Rollback guidance
 
@@ -96,8 +130,10 @@ needed, restoring operator-controlled data taken before the upgrade.
 
 - Forward startup on an existing data directory is exercised by normal restart
   and upgrade-smoke workflows.
-- Backward compatibility of an upgraded data directory with an older binary is
-  **best-effort**, not a guaranteed contract across arbitrary historical builds.
+- Backward compatibility is pair-specific. Only a predecessor entry with
+  `rollbackMode: binary_reactivate_same_data` has proved binary-only rollback
+  after target startup and a target write. All other pairs require restoration
+  of the pre-upgrade backup before the predecessor restarts.
 - Operators should treat a pre-upgrade snapshot or filesystem backup as the
   rollback boundary.
 

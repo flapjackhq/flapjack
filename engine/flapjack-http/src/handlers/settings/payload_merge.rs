@@ -77,6 +77,14 @@ fn log_safe_embedder_name(name: &str) -> String {
 /// Covers fields that affect indexing, ranking, query interpretation, and search mode (16 fields).
 /// Each field is consumed via `.take()` so the caller retains ownership of remaining fields.
 fn apply_search_config_fields(settings: &mut IndexSettings, payload: &mut SetSettingsRequest) {
+    apply_indexing_and_ranking_fields(settings, payload);
+    apply_query_behavior_fields(settings, payload);
+}
+
+fn apply_indexing_and_ranking_fields(
+    settings: &mut IndexSettings,
+    payload: &mut SetSettingsRequest,
+) {
     if let Some(v) = payload.attributes_for_faceting.take() {
         settings.attributes_for_faceting = v;
     }
@@ -101,12 +109,18 @@ fn apply_search_config_fields(settings: &mut IndexSettings, payload: &mut SetSet
     if let Some(v) = payload.query_languages.take() {
         settings.query_languages = v;
     }
+    if let Some(v) = payload.index_languages.take() {
+        settings.index_languages = v;
+    }
     if let Some(v) = payload.query_type.take() {
         settings.query_type = v;
     }
     if let Some(v) = payload.hits_per_page.take() {
         settings.hits_per_page = v;
     }
+}
+
+fn apply_query_behavior_fields(settings: &mut IndexSettings, payload: &mut SetSettingsRequest) {
     if let Some(v) = payload.min_word_size_for_1_typo.take() {
         settings.min_word_size_for_1_typo = v;
     }

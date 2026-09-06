@@ -822,6 +822,7 @@ fn migration_job_route_for_provider_with_test_source_factory(
     state: Arc<AppState>,
     test_source_factory: Option<TestMigrationSourceReaderFactory>,
 ) -> MigrationLifecycleRoutes {
+    let mutation_permit = state.global_mutation_fence.try_admit_mutation().unwrap();
     let provider_routes = Router::new()
         .route("/", post(submit_algolia_migration_http))
         .route("/:job_id", get(get_algolia_migration_status_http))
@@ -831,7 +832,8 @@ fn migration_job_route_for_provider_with_test_source_factory(
             post(acknowledge_algolia_migration_http),
         )
         .route("/:job_id/cancel", post(cancel_algolia_migration_http))
-        .with_state(state);
+        .with_state(state)
+        .layer(axum::extract::Extension(mutation_permit));
     let provider_routes = match test_source_factory {
         Some(factory) => provider_routes.layer(axum::extract::Extension(factory)),
         None => provider_routes,

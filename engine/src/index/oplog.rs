@@ -1,6 +1,7 @@
 //! Stub summary for engine/src/index/oplog.rs.
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,51 @@ const SEGMENT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 pub(crate) const OPLOG_DIR: &str = "oplog";
 pub(crate) const COMMITTED_SEQ_FILE: &str = "committed_seq";
 const OPLOG_TASK_ID_FIELD: &str = "_flapjack_task_id";
+const OPLOG_ORIGIN_SEQ_FIELD: &str = "_flapjack_origin_seq";
+
+#[cfg(test)]
+type AfterBatchSequenceSnapshotHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+static AFTER_BATCH_SEQUENCE_SNAPSHOT_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<AfterBatchSequenceSnapshotHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct AfterBatchSequenceSnapshotHookGuard {
+    previous: Option<AfterBatchSequenceSnapshotHook>,
+}
+
+#[cfg(test)]
+impl Drop for AfterBatchSequenceSnapshotHookGuard {
+    fn drop(&mut self) {
+        *after_batch_sequence_snapshot_hook().lock().unwrap() = self.previous.take();
+    }
+}
+
+#[cfg(test)]
+fn after_batch_sequence_snapshot_hook(
+) -> &'static std::sync::Mutex<Option<AfterBatchSequenceSnapshotHook>> {
+    AFTER_BATCH_SEQUENCE_SNAPSHOT_HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn set_after_batch_sequence_snapshot_hook_for_test(
+    hook: impl Fn() + Send + Sync + 'static,
+) -> AfterBatchSequenceSnapshotHookGuard {
+    let mut slot = after_batch_sequence_snapshot_hook().lock().unwrap();
+    AfterBatchSequenceSnapshotHookGuard {
+        previous: slot.replace(std::sync::Arc::new(hook)),
+    }
+}
+
+#[cfg(test)]
+fn run_after_batch_sequence_snapshot_hook_for_test() {
+    let hook = after_batch_sequence_snapshot_hook().lock().unwrap().clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpLogEntry {
@@ -26,6 +72,7 @@ pub struct OpLogEntry {
 pub struct OpLogOrigin {
     pub timestamp_ms: u64,
     pub node_id: String,
+    pub origin_seq: Option<u64>,
 }
 
 impl OpLogOrigin {
@@ -33,7 +80,13 @@ impl OpLogOrigin {
         Self {
             timestamp_ms,
             node_id: node_id.into(),
+            origin_seq: None,
         }
+    }
+
+    pub fn with_origin_seq(mut self, origin_seq: u64) -> Self {
+        self.origin_seq = Some(origin_seq);
+        self
     }
 }
 
@@ -79,6 +132,82 @@ pub struct OpLogReceipt {
     pub timestamp_ms: u64,
     pub node_id: String,
     pub is_tombstone: bool,
+    pub origin_seq: Option<u64>,
+    pub effect_digest: Option<[u8; 32]>,
+}
+
+const REPLICATION_EFFECT_DIGEST_DOMAIN: &[u8] = b"flapjack-replication-effect\0v1\0";
+
+/// Digest the full accepted upsert body, including its canonical object ID and
+/// any vectors, before internal task metadata is injected into the oplog row.
+pub fn upsert_effect_digest(document: &crate::types::Document) -> [u8; 32] {
+    digest_logical_effect(b"upsert", &document.to_json())
+}
+
+/// Digest a delete in a domain distinct from an upsert of the same object ID.
+pub fn delete_effect_digest(object_id: &str) -> [u8; 32] {
+    digest_logical_effect(b"delete", &serde_json::Value::String(object_id.to_string()))
+}
+
+fn digest_logical_effect(domain: &[u8], effect: &serde_json::Value) -> [u8; 32] {
+    let canonical = crate::index::utils::canonicalize_json_value(effect);
+    let bytes = serde_json::to_vec(&canonical)
+        .expect("accepted logical document effects always serialize to JSON");
+    let mut digest = Sha256::new();
+    digest.update(REPLICATION_EFFECT_DIGEST_DOMAIN);
+    digest.update(domain);
+    digest.update([0]);
+    digest.update(bytes);
+    digest.finalize().into()
+}
+
+pub(crate) fn operation_effect_digest(
+    op_type: &str,
+    payload: &serde_json::Value,
+) -> Option<[u8; 32]> {
+    match op_type {
+        "upsert" => payload
+            .get("body")
+            .and_then(|body| crate::types::Document::from_json(body).ok())
+            .map(|document| upsert_effect_digest(&document)),
+        "delete" => payload
+            .get("objectID")
+            .and_then(serde_json::Value::as_str)
+            .map(delete_effect_digest),
+        _ => None,
+    }
+}
+
+/// Read the stable source sequence carried inside one document oplog payload.
+///
+/// This reserved metadata survives destination-local oplog renumbering without
+/// expanding the public `OpLogEntry` wire structure. Presence with any JSON
+/// type other than an unsigned integer is corrupt replication evidence.
+pub fn replication_origin_seq(payload: &serde_json::Value) -> crate::error::Result<Option<u64>> {
+    let Some(value) = payload.get(OPLOG_ORIGIN_SEQ_FIELD) else {
+        return Ok(None);
+    };
+    value.as_u64().map(Some).ok_or_else(|| {
+        crate::error::FlapjackError::Json(format!(
+            "reserved {OPLOG_ORIGIN_SEQ_FIELD} must be an unsigned integer"
+        ))
+    })
+}
+
+fn insert_replication_origin_seq(
+    payload: &mut serde_json::Value,
+    origin_seq: u64,
+) -> crate::error::Result<()> {
+    let object = payload.as_object_mut().ok_or_else(|| {
+        crate::error::FlapjackError::Json(
+            "document oplog payload must be an object before origin metadata insertion".to_string(),
+        )
+    })?;
+    object.insert(
+        OPLOG_ORIGIN_SEQ_FIELD.to_string(),
+        serde_json::Value::from(origin_seq),
+    );
+    Ok(())
 }
 
 struct ActiveSegment {
@@ -141,6 +270,40 @@ pub fn read_committed_seq(tenant_path: &Path) -> u64 {
         .ok()
         .flatten()
         .unwrap_or(0)
+}
+
+/// Strictly read every committed retained oplog entry once for legacy proof recovery.
+pub(crate) fn retained_effect_entries(
+    tenant_path: &Path,
+) -> crate::error::Result<BTreeMap<u64, OpLogEntry>> {
+    let oplog_dir = tenant_path.join(OPLOG_DIR);
+    if !oplog_dir.is_dir() {
+        return Ok(BTreeMap::new());
+    }
+    let Some(committed_seq) = read_checked_committed_seq(tenant_path)? else {
+        return Ok(BTreeMap::new());
+    };
+    let mut retained = BTreeMap::new();
+    for segment in sorted_segment_entries(&oplog_dir)? {
+        for line in BufReader::new(File::open(segment.path())?).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry: OpLogEntry = serde_json::from_str(&line)
+                .map_err(|error| crate::error::FlapjackError::Json(error.to_string()))?;
+            if entry.seq > committed_seq {
+                continue;
+            }
+            let sequence = entry.seq;
+            if retained.insert(sequence, entry).is_some() {
+                return Err(crate::error::FlapjackError::Json(format!(
+                    "duplicate retained oplog sequence {sequence}"
+                )));
+            }
+        }
+    }
+    Ok(retained)
 }
 
 /// Persist the durable committed sequence number for a tenant.
@@ -281,33 +444,13 @@ impl OpLog {
     /// * `op_type` - Operation kind (e.g. `"upsert"`, `"delete"`).
     /// * `payload` - Arbitrary JSON payload for the operation.
     pub fn append(&self, op_type: &str, payload: serde_json::Value) -> crate::error::Result<u64> {
-        let seq = self.current_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let entry = OpLogEntry {
-            seq,
-            timestamp_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
-            node_id: self.node_id.clone(),
-            tenant_id: self.tenant_id.clone(),
-            op_type: op_type.to_string(),
-            payload,
-        };
-
-        let line = serde_json::to_string(&entry)
-            .map_err(|e| crate::error::FlapjackError::Io(e.to_string()))?;
-
-        let mut seg = self.segment.lock().unwrap();
-        seg.writer.write_all(line.as_bytes())?;
-        seg.writer.write_all(b"\n")?;
-        seg.writer.flush()?;
-        seg.size += line.len() as u64 + 1;
-
-        if seg.size >= SEGMENT_MAX_BYTES {
-            self.rotate_segment_locked(&mut seg)?;
-        }
-
-        Ok(seq)
+        self.append_operations_with_task_id(
+            None,
+            std::iter::once(OpLogOperation::local(op_type, payload)),
+        )?
+        .first()
+        .map(|receipt| receipt.seq)
+        .ok_or_else(|| crate::error::FlapjackError::Io("oplog append produced no receipt".into()))
     }
 
     /// Append multiple operations in a single lock acquisition and return the last assigned sequence number.
@@ -350,7 +493,8 @@ impl OpLog {
     where
         I: IntoIterator<Item = OpLogOperation>,
     {
-        let mut last_seq = self.current_seq.load(Ordering::SeqCst);
+        #[cfg(test)]
+        run_after_batch_sequence_snapshot_hook_for_test();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -358,19 +502,47 @@ impl OpLog {
         let mut receipts = Vec::new();
 
         let mut seg = self.segment.lock().unwrap();
+        let mut last_seq = self.current_seq.load(Ordering::SeqCst);
         for op in ops {
             last_seq += 1;
+            let effect_digest = operation_effect_digest(&op.op_type, &op.payload);
             let mut payload = op.payload;
+            let embedded_origin_seq = if effect_digest.is_some() {
+                replication_origin_seq(&payload)?
+            } else {
+                None
+            };
             if let (Some(task_id), Some(object)) = (task_id, payload.as_object_mut()) {
                 object.insert(
                     OPLOG_TASK_ID_FIELD.to_string(),
                     serde_json::Value::String(task_id.to_string()),
                 );
             }
-            let origin = op.origin.unwrap_or_else(|| OpLogOrigin {
-                timestamp_ms: now,
-                node_id: self.node_id.clone(),
-            });
+            let (origin, origin_seq) = match op.origin {
+                Some(origin) => {
+                    let origin_seq = match (origin.origin_seq, embedded_origin_seq) {
+                        (Some(explicit), Some(embedded)) if explicit != embedded => {
+                            return Err(crate::error::FlapjackError::Json(format!(
+                                "replicated oplog origin sequence {explicit} conflicts with embedded sequence {embedded}"
+                            )));
+                        }
+                        (Some(explicit), _) => Some(explicit),
+                        (None, embedded) => embedded,
+                    };
+                    (origin, origin_seq)
+                }
+                None => (
+                    OpLogOrigin {
+                        timestamp_ms: now,
+                        node_id: self.node_id.clone(),
+                        origin_seq: Some(last_seq),
+                    },
+                    Some(last_seq),
+                ),
+            };
+            if let (Some(_), Some(origin_seq)) = (effect_digest, origin_seq) {
+                insert_replication_origin_seq(&mut payload, origin_seq)?;
+            }
             let object_id = payload_object_id(&payload).map(str::to_string);
             let is_tombstone = op.op_type == "delete";
             let entry = OpLogEntry {
@@ -408,13 +580,15 @@ impl OpLog {
                 timestamp_ms: origin.timestamp_ms,
                 node_id: origin.node_id,
                 is_tombstone,
+                origin_seq,
+                effect_digest,
             });
         }
         seg.writer.flush()?;
         if task_id.is_some() {
             seg.writer.get_ref().sync_all()?;
         }
-        self.current_seq.store(last_seq, Ordering::SeqCst);
+        self.current_seq.fetch_max(last_seq, Ordering::SeqCst);
 
         if seg.size >= SEGMENT_MAX_BYTES {
             self.rotate_segment_locked(&mut seg)?;
@@ -619,7 +793,7 @@ impl OpLog {
     }
 }
 
-fn payload_object_id(payload: &serde_json::Value) -> Option<&str> {
+pub(crate) fn payload_object_id(payload: &serde_json::Value) -> Option<&str> {
     payload
         .get("objectID")
         .and_then(|value| value.as_str())
@@ -630,6 +804,12 @@ fn payload_object_id(payload: &serde_json::Value) -> Option<&str> {
                 .and_then(|value| value.as_str())
         })
         .filter(|object_id| !object_id.is_empty())
+}
+
+pub(crate) fn payload_task_id(payload: &serde_json::Value) -> Option<&str> {
+    payload
+        .get(OPLOG_TASK_ID_FIELD)
+        .and_then(|value| value.as_str())
 }
 
 #[path = "oplog_retraction.rs"]

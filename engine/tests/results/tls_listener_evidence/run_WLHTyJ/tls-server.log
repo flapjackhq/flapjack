@@ -1,0 +1,36 @@
+2026-08-02T04:36:13.753413Z  INFO flapjack_http::startup: Memory configuration loaded allocator="jemalloc" memory_limit_mb=131072 limit_source=sysinfo high_watermark_pct=80 critical_pct=90 max_concurrent_writers=40
+2026-08-02T04:36:13.754168Z  INFO flapjack_replication::config: No node.json found, running in standalone mode: node_id=stuarts-MacBook-Pro-3.local
+2026-08-02T04:36:13.757465Z  INFO flapjack_http::startup: API key authentication enabled
+2026-08-02T04:36:13.758644Z  INFO flapjack_http::server_init: Trusted proxy header forwarding enabled with secure defaults trusted_proxy_ranges=2 default_trusted_proxy_cidrs="127.0.0.0/8,::1/128"
+2026-08-02T04:36:13.758677Z  INFO flapjack_http::server_init: Replication disabled (no peers in node.json)
+2026-08-02T04:36:13.758730Z  INFO flapjack_http::server_init: [SSL] SSL management disabled: Configuration error: FLAPJACK_SSL_EMAIL is required for SSL auto-renewal
+2026-08-02T04:36:13.759200Z  INFO flapjack_http::server_init: [analytics] Analytics enabled (flush every 60s, retain 90d)
+2026-08-02T04:36:13.759625Z  INFO flapjack_http::server_init: [usage] No snapshot for today (date=2026-08-02); starting fresh
+2026-08-02T04:36:13.759710Z  WARN flapjack_http::geoip: GeoIP database not loaded from <tmp-root>/tls-data/GeoLite2-City.mmdb: i/o error: No such file or directory (os error 2)
+2026-08-02T04:36:13.759752Z  INFO flapjack_http::server_init: [geoip] GeoIP unavailable (no database at <tmp-root>/tls-data/GeoLite2-City.mmdb). IP geolocation disabled.
+2026-08-02T04:36:13.759798Z  INFO flapjack_http::notifications: [notifications] SES notifications disabled
+2026-08-02T04:36:13.759858Z  INFO flapjack_http::server: Server infrastructure initialized env_mode=development replication_peers=0 trusted_proxy_ranges=2
+2026-08-02T04:36:13.759876Z  INFO flapjack_http::server: CORS: default loopback-only mode (non-loopback origins require FLAPJACK_ALLOWED_ORIGINS)
+2026-08-02T04:36:13.759895Z  INFO flapjack_http::server_init: [startup] Dependency status summary s3_snapshots_enabled=false s3_snapshot_interval_secs=None replication_peer_count=0 ssl_enabled=false analytics_enabled=true geoip_enabled=false vector_search_compiled=false auth_enabled=true
+2026-08-02T04:36:13.761899Z  INFO flapjack_http::background_tasks: [analytics] Analytics enabled (flush every 60s, retain 90d)
+2026-08-02T04:36:13.762020Z  INFO flapjack_http::background_tasks: [analytics] Local rollup generation enabled (interval=300s)
+2026-08-02T04:36:13.762125Z  INFO flapjack_http::background_tasks: [migration] Spool GC enabled (interval=300s)
+
+  🥞 Flapjack v1.0.10  ready in 45ms
+
+  →  Local:      https://127.0.0.1:54624
+  →  Dashboard:  https://127.0.0.1:54624/dashboard
+  →  API Docs:   https://127.0.0.1:54624/swagger-ui
+  →  Capabilities: vector-search: disabled, local-embeddings: disabled
+
+  ✓ Auth enabled  (loaded from <tmp-root>/tls-data/.admin_key)
+
+2026-08-02T04:36:14.016227Z  WARN http_request{request_id=7d3fd395-7078-4707-9034-eac1258b6daa}: flapjack_http::handlers::indices: Failed to load index _usage: Tantivy error: Failed to open file for read: 'FileDoesNotExist("meta.json")'
+2026-08-02T04:36:14.016410Z  WARN http_request{request_id=7d3fd395-7078-4707-9034-eac1258b6daa}: flapjack_http::handlers::indices: Failed to load index migration_exports: Tantivy error: Failed to open file for read: 'FileDoesNotExist("meta.json")'
+2026-08-02T04:36:14.016486Z  WARN http_request{request_id=7d3fd395-7078-4707-9034-eac1258b6daa}: flapjack_http::handlers::indices: Failed to load index .experiments: Tantivy error: Failed to open file for read: 'FileDoesNotExist("meta.json")'
+2026-08-02T04:36:14.029534Z  WARN flapjack_http::tls_serve: TLS handshake failed: received corrupt message of type InvalidContentType peer_addr=127.0.0.1:54749
+2026-08-02T04:36:14.032387Z  INFO flapjack_http::startup: [shutdown] Received SIGTERM
+2026-08-02T04:36:14.033232Z  INFO flapjack_http::server: [shutdown] Server stopped accepting connections, cleaning up... timeout_env_var="FLAPJACK_SHUTDOWN_TIMEOUT_SECS" timeout_secs=30
+2026-08-02T04:36:14.033269Z  INFO flapjack_http::server: [shutdown] Analytics buffers flushed
+2026-08-02T04:36:14.033345Z  INFO flapjack::analytics::collector: [analytics] Flush loop shutting down
+2026-08-02T04:36:14.033373Z  INFO flapjack_http::server: [shutdown] All write queues drained before deadline timeout_env_var="FLAPJACK_SHUTDOWN_TIMEOUT_SECS" timeout_secs=30

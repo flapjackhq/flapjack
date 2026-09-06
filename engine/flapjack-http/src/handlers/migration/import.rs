@@ -567,9 +567,10 @@ async fn import_accepted_export_inner(
         ),
         publication,
     )?;
-    // Entering `activate_create_only()` reaches `reserve_publication_target`,
-    // the create-only point of no return. Before then, a cancellation may still
-    // abort the unjournaled transaction; once journaled, `abort()` must refuse.
+    // Entering `activate_create_only()` takes the target-scoped publication fence
+    // and reaches the create-only point of no return. Before then, a cancellation
+    // may still abort the unjournaled transaction; once journaled, `abort()` must
+    // refuse.
     let ((), publication) =
         abort_publication_on_error(spool, job_uuid, cancellation.check(), publication)?;
     settle_import_result(

@@ -4,7 +4,7 @@ use crate::conversation_store::ConversationStore;
 use crate::geoip::GeoIpReader;
 use crate::idempotency::IdempotencyCache;
 use crate::notifications::NotificationService;
-use crate::pause_registry::PausedIndexes;
+use crate::pause_registry::{GlobalMutationFence, PausedIndexes};
 use crate::usage_middleware::TenantUsageCounters;
 use crate::usage_persistence::UsagePersistence;
 use dashmap::DashMap;
@@ -21,6 +21,7 @@ pub mod analytics;
 pub mod analytics_dto;
 pub mod browse;
 pub mod chat;
+pub mod crawler;
 pub mod dashboard;
 pub mod dashboard_session;
 pub mod dictionaries;
@@ -71,6 +72,7 @@ pub struct AppState {
     pub usage_counters: Arc<DashMap<String, TenantUsageCounters>>,
     pub usage_persistence: Option<Arc<UsagePersistence>>,
     pub paused_indexes: PausedIndexes,
+    pub global_mutation_fence: GlobalMutationFence,
     pub geoip_reader: Option<Arc<GeoIpReader>>,
     pub notification_service: Option<Arc<NotificationService>>,
     pub migration_runner: Arc<migration::MigrationJobRunner>,

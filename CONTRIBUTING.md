@@ -4,16 +4,14 @@ Thanks for your interest in improving Flapjack.
 
 ## Licensing of Contributions
 
-Flapjack's engine is licensed under the [Elastic License 2.0](LICENSE); the
-client SDKs and framework integrations under [sdks/](sdks/) and
-[integrations/](integrations/) are MIT. [NOTICE](NOTICE) maps each path to its
-license.
+Flapjack is licensed under the [Elastic License 2.0](LICENSE). [NOTICE](NOTICE)
+records its license history.
 
 By opening a pull request you confirm that you wrote the contribution or
 otherwise have the right to submit it, and you grant Stuart Robinson a
 perpetual, worldwide, non-exclusive, royalty-free, irrevocable right to use,
 reproduce, modify, distribute, and sublicense your contribution under any
-license terms, including the licenses above and commercial terms. You keep
+license terms, including that license and commercial terms. You keep
 your own copyright in the contribution.
 
 This grant is what lets the project offer both the source-available engine and

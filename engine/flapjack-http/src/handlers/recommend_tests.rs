@@ -1,7 +1,9 @@
 use super::*;
 use axum::body::Body;
+use axum::extract::Extension;
 use axum::http::{Request, StatusCode};
-use axum::routing::post;
+use axum::middleware;
+use axum::routing::{get, post};
 use axum::Router;
 use chrono::Utc;
 use flapjack::{
@@ -11,6 +13,7 @@ use flapjack::{
     types::{Document, FieldValue},
 };
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -20,6 +23,93 @@ fn recommend_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+fn recommend_router_with_hooks(state: Arc<AppState>, hooks: RecommendTestHooks) -> Router {
+    Router::new()
+        .route("/1/indexes/:_wildcard/recommendations", post(recommend))
+        .layer(Extension(hooks))
+        .with_state(state)
+}
+
+fn trusted_admin_recommend_router_with_hooks(
+    state: Arc<AppState>,
+    hooks: RecommendTestHooks,
+) -> Router {
+    Router::new()
+        .route("/1/indexes/:_wildcard/recommendations", post(recommend))
+        .layer(Extension(hooks))
+        .layer(Extension(crate::auth::AuthenticatedAdminKey))
+        .layer(Extension(crate::api_profile::ApiProfile::PaidBetaV5))
+        .with_state(state)
+}
+
+fn recommend_router_with_key(state: Arc<AppState>, indexes: Vec<String>) -> Router {
+    Router::new()
+        .route("/1/indexes/:_wildcard/recommendations", post(recommend))
+        .layer(Extension(crate::auth::ApiKey {
+            hash: "recommend-test-hash".to_string(),
+            salt: "recommend-test-salt".to_string(),
+            hmac_key: None,
+            created_at: 0,
+            acl: vec!["recommendation".to_string()],
+            description: "recommend index-scope test key".to_string(),
+            indexes,
+            max_hits_per_query: 0,
+            max_queries_per_ip_per_hour: 0,
+            query_parameters: String::new(),
+            referers: Vec::new(),
+            restrict_sources: None,
+            validity: 0,
+        }))
+        .with_state(state)
+}
+
+fn recommend_analytics_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route(
+            "/internal/recommendations/analytics",
+            get(recommendation_analytics),
+        )
+        .with_state(state)
+}
+
+fn authenticated_recommend_ip_probe_router(
+    key_store: Arc<crate::auth::KeyStore>,
+    profile: crate::api_profile::ApiProfile,
+) -> Router {
+    Router::new()
+        .route(
+            "/1/indexes/products/recommendations",
+            post(|context: RecommendRequestContext| async move {
+                context.user_ip.unwrap_or_else(|| "anonymous".to_string())
+            }),
+        )
+        .layer(middleware::from_fn(|request, next| async move {
+            crate::auth::authenticate_and_authorize(request, next, false).await
+        }))
+        .layer(Extension(profile))
+        .layer(Extension(crate::auth::RateLimiter::new()))
+        .layer(Extension(key_store))
+}
+
+fn authenticated_recommend_ip_probe_request(key: &str, internal_ip: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/1/indexes/products/recommendations")
+        .header(
+            "x-algolia-application-id",
+            crate::api_profile::PAID_BETA_V1_APPLICATION_ID,
+        )
+        .header("x-algolia-api-key", key);
+    if let Some(internal_ip) = internal_ip {
+        builder = builder.header(TRUSTED_RECOMMEND_CLIENT_IP_HEADER, internal_ip);
+    }
+    let mut request = builder.body(Body::empty()).unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        "10.0.0.5:43210".parse::<SocketAddr>().unwrap(),
+    ));
+    request
+}
+
 /// Send a POST request to the recommend endpoint and return the status code and parsed JSON body.
 ///
 /// # Arguments
@@ -27,18 +117,7 @@ fn recommend_router(state: Arc<AppState>) -> Router {
 /// * `app` - The Axum router under test.
 /// * `body` - JSON request body conforming to `RecommendBatchRequest`.
 async fn post_recommend(app: &Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/1/indexes/*/recommendations")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let resp = send_recommend(app, body, &[]).await;
 
     let status = resp.status();
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -46,6 +125,47 @@ async fn post_recommend(app: &Router, body: serde_json::Value) -> (StatusCode, s
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
     (status, json)
+}
+
+async fn send_recommend(
+    app: &Router,
+    body: serde_json::Value,
+    headers: &[(&str, &str)],
+) -> axum::response::Response {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/1/indexes/*/recommendations")
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    app.clone()
+        .oneshot(
+            request
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn send_recommend_with_peer(
+    app: &Router,
+    body: serde_json::Value,
+    peer_ip: IpAddr,
+    trusted_client_ip: &str,
+) -> axum::response::Response {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/1/indexes/*/recommendations")
+        .header("content-type", "application/json")
+        .header(TRUSTED_RECOMMEND_CLIENT_IP_HEADER, trusted_client_ip)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(SocketAddr::new(peer_ip, 43210)));
+    app.clone().oneshot(request).await.unwrap()
 }
 
 // ── C0: Validation tests (RED) ──────────────────────────────────────
@@ -154,6 +274,959 @@ async fn recommend_max_recommendations_zero_returns_400() {
     .await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn recommend_analytics_parameters_reject_null_wrong_types_and_contradictions() {
+    let tmp = TempDir::new().unwrap();
+    let app = recommend_router(crate::test_helpers::TestStateBuilder::new(&tmp).build_shared());
+    for extra in [
+        serde_json::json!({"analytics": null}),
+        serde_json::json!({"analytics": "false"}),
+        serde_json::json!({"clickAnalytics": null}),
+        serde_json::json!({"clickAnalytics": 1}),
+        serde_json::json!({"userToken": null}),
+        serde_json::json!({"userToken": 7}),
+        serde_json::json!({"userToken": "invalid token"}),
+        serde_json::json!({"clickAnalytics": true}),
+        serde_json::json!({
+            "clickAnalytics": true,
+            "userToken": "customer_user-1"
+        }),
+        serde_json::json!({
+            "analytics": false,
+            "clickAnalytics": true,
+            "userToken": "00000000-0000-4000-8000-000000000001"
+        }),
+    ] {
+        let mut request = serde_json::json!({
+            "indexName": "products",
+            "model": "trending-items",
+            "threshold": 0
+        });
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let (status, _) = post_recommend(&app, serde_json::json!({"requests": [request]})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "accepted {extra}");
+    }
+}
+
+#[tokio::test]
+async fn recommend_preserves_content_type_independent_json_and_exact_body_cap() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _) = make_test_state_with_analytics(&tmp);
+    state.manager.create_tenant("products").unwrap();
+    let app = recommend_router(state);
+    let body = serde_json::to_vec(&serde_json::json!({
+        "requests": [{
+            "indexName": "products",
+            "model": "trending-items",
+            "threshold": 0
+        }]
+    }))
+    .unwrap();
+
+    let accepted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/1/indexes/*/recommendations")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+
+    let mut oversized = body;
+    oversized.resize(10_000_001, b' ');
+    let rejected = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/1/indexes/*/recommendations")
+                .body(Body::from(oversized))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn recommend_defaults_are_counted_but_not_attributable() {
+    let request: RecommendBatchRequest = serde_json::from_value(serde_json::json!({
+        "requests": [{
+            "indexName": "products",
+            "model": "trending-items",
+            "threshold": 0
+        }]
+    }))
+    .unwrap();
+    let request = &request.requests[0];
+    assert_ne!(request.analytics, Some(false));
+    assert_ne!(request.click_analytics, Some(true));
+    assert!(request.user_token.is_none());
+    validate_request(request).unwrap();
+}
+
+#[tokio::test]
+async fn trusted_internal_recommend_ip_preserves_distinct_anonymous_user_buckets() {
+    let tmp = TempDir::new().unwrap();
+    let (state, collector) = make_test_state_with_analytics(&tmp);
+    state.manager.create_tenant("products").unwrap();
+    let app = trusted_admin_recommend_router_with_hooks(
+        state,
+        RecommendTestHooks {
+            analytics_collector: Some(Arc::clone(&collector)),
+            ..Default::default()
+        },
+    );
+    let body = serde_json::json!({
+        "requests": [{
+            "indexName": "products",
+            "model": "trending-items",
+            "threshold": 0
+        }]
+    });
+    let proxy_peer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+
+    for trusted_client_ip in ["198.51.100.19", "203.0.113.27"] {
+        let response =
+            send_recommend_with_peer(&app, body.clone(), proxy_peer, trusted_client_ip).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    collector.flush_all();
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let (start_ms, end_ms) = recommendation_analytics_bounds(&today, &today).unwrap();
+    let summary = AnalyticsQueryEngine::new(analytics_config(&tmp))
+        .recommendation_analytics("products", "trending-items", start_ms, end_ms)
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.total_users, 2,
+        "the proxy peer must not collapse users"
+    );
+}
+
+#[test]
+fn recommend_client_ip_ignores_internal_header_without_admin_auth() {
+    let peer_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+    let mut request = Request::builder()
+        .header(TRUSTED_RECOMMEND_CLIENT_IP_HEADER, "198.51.100.19")
+        .body(Body::empty())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(SocketAddr::new(peer_ip, 43210)));
+
+    assert_eq!(
+        resolve_recommend_user_ip(&request, false, true),
+        Some(peer_ip)
+    );
+    assert_eq!(
+        resolve_recommend_user_ip(&request, true, true),
+        Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 19)))
+    );
+
+    request
+        .headers_mut()
+        .remove(TRUSTED_RECOMMEND_CLIENT_IP_HEADER);
+    assert_eq!(resolve_recommend_user_ip(&request, true, true), None);
+    request.headers_mut().append(
+        TRUSTED_RECOMMEND_CLIENT_IP_HEADER,
+        "not-an-ip".parse().unwrap(),
+    );
+    assert_eq!(resolve_recommend_user_ip(&request, true, true), None);
+    request.headers_mut().append(
+        TRUSTED_RECOMMEND_CLIENT_IP_HEADER,
+        "203.0.113.27".parse().unwrap(),
+    );
+    assert_eq!(resolve_recommend_user_ip(&request, true, true), None);
+}
+
+#[tokio::test]
+async fn auth_middleware_marks_only_the_exact_admin_for_internal_recommend_ip() {
+    let tmp = TempDir::new().unwrap();
+    let key_store = Arc::new(crate::auth::KeyStore::load_or_create(
+        tmp.path(),
+        "recommend-admin-key",
+    ));
+    let (_, customer_key) = key_store.create_key(crate::auth::ApiKey {
+        hash: String::new(),
+        salt: String::new(),
+        hmac_key: None,
+        created_at: 0,
+        acl: vec!["recommendation".to_string()],
+        description: "recommend auth-boundary key".to_string(),
+        indexes: vec!["products".to_string()],
+        max_hits_per_query: 0,
+        max_queries_per_ip_per_hour: 0,
+        query_parameters: String::new(),
+        referers: vec![],
+        validity: 0,
+        restrict_sources: None,
+    });
+    let pbv5_admin = authenticated_recommend_ip_probe_router(
+        Arc::clone(&key_store),
+        crate::api_profile::ApiProfile::PaidBetaV5,
+    );
+    let response = pbv5_admin
+        .oneshot(authenticated_recommend_ip_probe_request(
+            "recommend-admin-key",
+            Some("198.51.100.19"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), b"198.51.100.19");
+
+    let customer = authenticated_recommend_ip_probe_router(
+        Arc::clone(&key_store),
+        crate::api_profile::ApiProfile::Full,
+    );
+    let response = customer
+        .oneshot(authenticated_recommend_ip_probe_request(
+            &customer_key,
+            Some("198.51.100.19"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        body.as_ref(),
+        b"10.0.0.5",
+        "ordinary API keys must not control the internal Recommend header"
+    );
+
+    let inherited_key_store = Arc::clone(&key_store);
+    let legacy = authenticated_recommend_ip_probe_router(
+        key_store,
+        crate::api_profile::ApiProfile::PaidBetaV4,
+    );
+    let response = legacy
+        .oneshot(authenticated_recommend_ip_probe_request(
+            "recommend-admin-key",
+            None,
+        ))
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        body.as_ref(),
+        b"10.0.0.5",
+        "non-PBV5 admin requests must preserve their inherited socket identity"
+    );
+
+    let inherited_header = authenticated_recommend_ip_probe_router(
+        inherited_key_store,
+        crate::api_profile::ApiProfile::PaidBetaV1,
+    );
+    let response = inherited_header
+        .oneshot(authenticated_recommend_ip_probe_request(
+            "recommend-admin-key",
+            Some("198.51.100.19"),
+        ))
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        body.as_ref(),
+        b"198.51.100.19",
+        "all-surfaces transport must preserve the exact-admin canonical header"
+    );
+}
+
+#[test]
+fn recommend_click_identity_domain_matches_attributed_events() {
+    let attributed = "00000000-0000-4000-8000-000000000001";
+    let request: RecommendBatchRequest = serde_json::from_value(serde_json::json!({
+        "requests": [{
+            "indexName": "products",
+            "model": "trending-items",
+            "threshold": 0,
+            "clickAnalytics": true,
+            "userToken": attributed
+        }]
+    }))
+    .unwrap();
+    validate_request(&request.requests[0]).unwrap();
+    let event = SchemaInsightEvent {
+        event_type: "click".to_string(),
+        event_subtype: None,
+        event_name: "Recommend click".to_string(),
+        index: "products".to_string(),
+        user_token: attributed.to_string(),
+        authenticated_user_token: None,
+        query_id: Some("0123456789abcdef0123456789abcdef".to_string()),
+        object_ids: vec!["object-1".to_string()],
+        object_ids_alt: vec![],
+        positions: Some(vec![1]),
+        timestamp: Some(Utc::now().timestamp_millis()),
+        value: None,
+        currency: None,
+        interleaving_team: None,
+    };
+    event.validate().unwrap();
+
+    let non_uuid = "customer_user-1";
+    let request: RecommendBatchRequest = serde_json::from_value(serde_json::json!({
+        "requests": [{
+            "indexName": "products",
+            "model": "trending-items",
+            "threshold": 0,
+            "clickAnalytics": true,
+            "userToken": non_uuid
+        }]
+    }))
+    .unwrap();
+    assert!(validate_request(&request.requests[0]).is_err());
+    assert!(SchemaInsightEvent {
+        user_token: non_uuid.to_string(),
+        ..event
+    }
+    .validate()
+    .is_err());
+}
+
+#[tokio::test]
+async fn click_analytics_returns_only_lowercase_query_ids_for_attributable_requests() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _) = make_test_state_with_analytics(&tmp);
+    state.manager.create_tenant("products").unwrap();
+    let app = recommend_router(state);
+
+    let (status, body) = post_recommend(
+        &app,
+        serde_json::json!({
+            "requests": [
+                {
+                    "indexName": "products",
+                    "model": "trending-items",
+                    "threshold": 0,
+                    "clickAnalytics": true,
+                    "userToken": "00000000-0000-4000-8000-000000000001"
+                },
+                {
+                    "indexName": "products",
+                    "model": "trending-items",
+                    "threshold": 0
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let query_id = body["results"][0]["queryID"].as_str().unwrap();
+    assert_eq!(query_id.len(), 32);
+    assert!(
+        query_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "queryID must be lowercase hex: {query_id}"
+    );
+    assert!(body["results"][1].get("queryID").is_none());
+}
+
+#[tokio::test]
+async fn idempotent_recommend_replay_reuses_the_exact_query_id() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _) = make_test_state_with_analytics(&tmp);
+    state.manager.create_tenant("products").unwrap();
+    let app = recommend_router(state);
+    let body = serde_json::json!({
+        "requests": [{
+            "indexName": "products",
+            "model": "trending-items",
+            "threshold": 0,
+            "clickAnalytics": true,
+            "userToken": "00000000-0000-4000-8000-000000000001"
+        }]
+    });
+    let headers = [
+        ("x-algolia-application-id", "recommend-test-app"),
+        (IDEMPOTENCY_HEADER, "recommend-replay-1"),
+    ];
+
+    let first = send_recommend(&app, body.clone(), &headers).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert!(first
+        .headers()
+        .get("x-flapjack-idempotency-replayed")
+        .is_none());
+    let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+
+    let replay = send_recommend(&app, body, &headers).await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(
+        replay
+            .headers()
+            .get("x-flapjack-idempotency-replayed")
+            .unwrap(),
+        "true"
+    );
+    let replay_body = axum::body::to_bytes(replay.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let replay_json: serde_json::Value = serde_json::from_slice(&replay_body).unwrap();
+    assert_eq!(replay_json, first_json);
+    assert_eq!(
+        replay_json["results"][0]["queryID"],
+        first_json["results"][0]["queryID"]
+    );
+}
+
+#[tokio::test]
+async fn release_fence_keeps_recommend_available_without_idempotency_or_analytics_persistence() {
+    let tmp = TempDir::new().unwrap();
+    let (state, collector) = make_test_state_with_analytics(&tmp);
+    state.manager.create_tenant("products").unwrap();
+    state
+        .global_mutation_fence
+        .acquire("recommend-read-1")
+        .await
+        .unwrap();
+    let app = recommend_router_with_hooks(
+        state,
+        RecommendTestHooks {
+            analytics_collector: Some(Arc::clone(&collector)),
+            ..Default::default()
+        },
+    );
+    let body = serde_json::json!({
+        "requests": [{
+            "indexName": "products",
+            "model": "trending-items",
+            "threshold": 0,
+            "clickAnalytics": true,
+            "userToken": "00000000-0000-4000-8000-000000000001"
+        }]
+    });
+    let headers = [
+        ("x-algolia-application-id", "recommend-fenced-app"),
+        (IDEMPOTENCY_HEADER, "recommend-fenced-1"),
+    ];
+
+    let first = send_recommend(&app, body.clone(), &headers).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert!(first
+        .headers()
+        .get("x-flapjack-idempotency-replayed")
+        .is_none());
+    let second = send_recommend(&app, body, &headers).await;
+    assert_eq!(second.status(), StatusCode::OK);
+    assert!(
+        second
+            .headers()
+            .get("x-flapjack-idempotency-replayed")
+            .is_none(),
+        "a fenced read must not persist an idempotency response"
+    );
+
+    collector.flush_all();
+    assert!(
+        !analytics_config(&tmp).events_dir("products").exists(),
+        "a fenced Recommend read must not persist optional telemetry"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recommend_persistence_permit_is_held_through_idempotency_and_telemetry() {
+    let tmp = TempDir::new().unwrap();
+    let (state, collector) = make_test_state_with_analytics(&tmp);
+    state.manager.create_tenant("products").unwrap();
+    let mutation_fence = state.global_mutation_fence.clone();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+    let finish_rx = Arc::new(std::sync::Mutex::new(finish_rx));
+    let app = recommend_router_with_hooks(
+        state,
+        RecommendTestHooks {
+            analytics_collector: Some(collector),
+            before_idempotency_store: Some(Arc::new(move || {
+                entered_tx.send(()).unwrap();
+                finish_rx.lock().unwrap().recv().unwrap();
+            })),
+            ..Default::default()
+        },
+    );
+    let request = tokio::spawn(async move {
+        send_recommend(
+            &app,
+            serde_json::json!({
+                "requests": [{
+                    "indexName": "products",
+                    "model": "trending-items",
+                    "threshold": 0,
+                    "clickAnalytics": true,
+                    "userToken": "00000000-0000-4000-8000-000000000001"
+                }]
+            }),
+            &[
+                ("x-algolia-application-id", "recommend-race-app"),
+                (IDEMPOTENCY_HEADER, "recommend-race-1"),
+            ],
+        )
+        .await
+    });
+    entered_rx.recv().unwrap();
+
+    let mut acquire =
+        tokio::spawn(async move { mutation_fence.acquire("recommend-flush-race-1").await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut acquire)
+            .await
+            .is_err(),
+        "fence acquisition must wait for Recommend persistence to finish"
+    );
+
+    finish_tx.send(()).unwrap();
+    assert_eq!(request.await.unwrap().status(), StatusCode::OK);
+    acquire.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_idempotent_recommend_requests_publish_once_and_replay_exactly() {
+    let tmp = TempDir::new().unwrap();
+    let (state, collector) = make_test_state_with_analytics(&tmp);
+    state.manager.create_tenant("products").unwrap();
+    let app = recommend_router_with_hooks(
+        state,
+        RecommendTestHooks {
+            analytics_collector: Some(Arc::clone(&collector)),
+            yield_after_idempotency_miss: true,
+            ..Default::default()
+        },
+    );
+    let body = serde_json::json!({
+        "requests": [{
+            "indexName": "products",
+            "model": "trending-items",
+            "threshold": 0,
+            "clickAnalytics": true,
+            "userToken": "00000000-0000-4000-8000-000000000001"
+        }]
+    });
+    let headers = [
+        ("x-algolia-application-id", "recommend-concurrent-app"),
+        (IDEMPOTENCY_HEADER, "recommend-concurrent-1"),
+    ];
+
+    let (first, second) = tokio::join!(
+        send_recommend(&app, body.clone(), &headers),
+        send_recommend(&app, body, &headers)
+    );
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_ne!(
+        first
+            .headers()
+            .get("x-flapjack-idempotency-replayed")
+            .is_some(),
+        second
+            .headers()
+            .get("x-flapjack-idempotency-replayed")
+            .is_some(),
+        "exactly one concurrent response must be a replay"
+    );
+    let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(first_body, second_body);
+
+    collector.flush_all();
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let (start_ms, end_ms) = recommendation_analytics_bounds(&today, &today).unwrap();
+    let summary = AnalyticsQueryEngine::new(analytics_config(&tmp))
+        .recommendation_analytics("products", "trending-items", start_ms, end_ms)
+        .await
+        .unwrap();
+    assert_eq!(summary.total_recommendations, 1);
+    assert_eq!(summary.tracked_recommendations, 1);
+}
+
+#[tokio::test]
+async fn idempotency_store_failure_returns_no_query_id_and_publishes_no_telemetry() {
+    let tmp = TempDir::new().unwrap();
+    let config = analytics_config(&tmp);
+    let collector = AnalyticsCollector::new(config.clone());
+    let mut state = crate::test_helpers::TestStateBuilder::new(&tmp)
+        .with_analytics_engine(Arc::new(AnalyticsQueryEngine::new(config.clone())))
+        .build();
+    state.manager.create_tenant("products").unwrap();
+    let idempotency_path = tmp.path().join("recommend-idempotency.db");
+    state.idempotency_cache = Arc::new(
+        crate::idempotency::IdempotencyCache::persistent(
+            std::time::Duration::from_secs(60),
+            &idempotency_path,
+        )
+        .unwrap(),
+    );
+    let hook_path = idempotency_path.clone();
+    let app = recommend_router_with_hooks(
+        Arc::new(state),
+        RecommendTestHooks {
+            analytics_collector: Some(Arc::clone(&collector)),
+            before_idempotency_store: Some(Arc::new(move || {
+                rusqlite::Connection::open(&hook_path)
+                    .unwrap()
+                    .execute("DROP TABLE idempotency_cache", [])
+                    .unwrap();
+            })),
+            ..Default::default()
+        },
+    );
+    let response = send_recommend(
+        &app,
+        serde_json::json!({
+            "requests": [{
+                "indexName": "products",
+                "model": "trending-items",
+                "threshold": 0,
+                "clickAnalytics": true,
+                "userToken": "00000000-0000-4000-8000-000000000001"
+            }]
+        }),
+        &[
+            ("x-algolia-application-id", "recommend-store-failure-app"),
+            (IDEMPOTENCY_HEADER, "recommend-store-failure-1"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&response_body).contains("queryID"));
+
+    collector.flush_all();
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let (start_ms, end_ms) = recommendation_analytics_bounds(&today, &today).unwrap();
+    let summary = AnalyticsQueryEngine::new(config)
+        .recommendation_analytics("products", "trending-items", start_ms, end_ms)
+        .await
+        .unwrap();
+    assert_eq!(summary.total_recommendations, 0);
+    assert_eq!(summary.tracked_recommendations, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn http_recommend_publication_survives_restart_with_defaults_opt_out_and_attribution() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = analytics_config(&tmp);
+    config.flush_interval_secs =
+        flapjack::analytics::config::PBV5_MAX_ANALYTICS_FLUSH_INTERVAL_SECS;
+    let collector = AnalyticsCollector::new(config.clone());
+    let state = crate::test_helpers::TestStateBuilder::new(&tmp)
+        .with_analytics_engine(Arc::new(AnalyticsQueryEngine::new(config.clone())))
+        .build_shared();
+    state.manager.create_tenant("products").unwrap();
+    let app = recommend_router_with_hooks(
+        Arc::clone(&state),
+        RecommendTestHooks {
+            analytics_collector: Some(Arc::clone(&collector)),
+            ..Default::default()
+        },
+    );
+    let flush_task = tokio::spawn(Arc::clone(&collector).run_flush_loop());
+    tokio::task::yield_now().await;
+
+    let (status, body) = post_recommend(
+        &app,
+        serde_json::json!({
+            "requests": [
+                {
+                    "indexName": "products",
+                    "model": "trending-items",
+                    "threshold": 0
+                },
+                {
+                    "indexName": "products",
+                    "model": "trending-items",
+                    "threshold": 0,
+                    "analytics": false,
+                    "userToken": "00000000-0000-4000-8000-000000000004"
+                },
+                {
+                    "indexName": "products",
+                    "model": "trending-items",
+                    "threshold": 0,
+                    "clickAnalytics": true,
+                    "userToken": "00000000-0000-4000-8000-000000000003"
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["results"][0].get("queryID").is_none());
+    assert!(body["results"][1].get("queryID").is_none());
+    let query_id = body["results"][2]["queryID"].as_str().unwrap();
+    let at = Utc::now().timestamp_millis();
+    collector.record_insight(SchemaInsightEvent {
+        event_type: "click".to_string(),
+        event_subtype: None,
+        event_name: "Recommend click".to_string(),
+        index: "products".to_string(),
+        user_token: "00000000-0000-4000-8000-000000000003".to_string(),
+        authenticated_user_token: None,
+        query_id: Some(query_id.to_string()),
+        object_ids: vec!["object-1".to_string()],
+        object_ids_alt: Vec::new(),
+        positions: Some(vec![2]),
+        timestamp: Some(at),
+        value: None,
+        currency: None,
+        interleaving_team: None,
+    });
+    collector.record_insight(SchemaInsightEvent {
+        event_type: "conversion".to_string(),
+        event_subtype: None,
+        event_name: "Recommend conversion".to_string(),
+        index: "products".to_string(),
+        user_token: "00000000-0000-4000-8000-000000000003".to_string(),
+        authenticated_user_token: None,
+        query_id: Some(query_id.to_string()),
+        object_ids: vec!["object-1".to_string()],
+        object_ids_alt: Vec::new(),
+        positions: None,
+        timestamp: Some(at),
+        value: None,
+        currency: None,
+        interleaving_team: None,
+    });
+    tokio::time::advance(std::time::Duration::from_secs(
+        flapjack::analytics::config::PBV5_MAX_ANALYTICS_FLUSH_INTERVAL_SECS,
+    ))
+    .await;
+    tokio::task::yield_now().await;
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let (start_ms, end_ms) = recommendation_analytics_bounds(&today, &today).unwrap();
+    let published = AnalyticsQueryEngine::new(config.clone())
+        .recommendation_analytics("products", "trending-items", start_ms, end_ms)
+        .await
+        .unwrap();
+    assert_eq!(published.total_users, 2);
+    assert_eq!(published.total_recommendations, 2);
+    assert_eq!(published.tracked_recommendations, 1);
+
+    collector.shutdown();
+    flush_task.await.unwrap();
+    drop(app);
+    drop(state);
+    drop(collector);
+
+    let restarted = crate::test_helpers::TestStateBuilder::new(&tmp)
+        .with_analytics_engine(Arc::new(AnalyticsQueryEngine::new(config)))
+        .build_shared();
+    let analytics_app = recommend_analytics_router(restarted);
+    let (status, analytics) = get_recommend_analytics(
+        &analytics_app,
+        &format!("index=products&model=trending-items&startDate={today}&endDate={today}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(analytics["totalUsers"], 2);
+    assert_eq!(analytics["totalRecommendations"], 2);
+    assert_eq!(analytics["trackedRecommendations"], 1);
+    assert_eq!(analytics["clickedRecommendations"], 1);
+    assert_eq!(analytics["convertedRecommendations"], 1);
+    assert_eq!(analytics["clickThroughRate"], 100.0);
+    assert_eq!(analytics["conversionRate"], 100.0);
+    assert_eq!(
+        analytics["clickPositionDistribution"],
+        serde_json::json!([{"position": 2, "count": 1}])
+    );
+    assert_eq!(analytics["averageClickPosition"], 2.0);
+}
+
+async fn get_recommend_analytics(app: &Router, query: &str) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/internal/recommendations/analytics?{query}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = serde_json::from_slice(&bytes).unwrap_or_default();
+    (status, body)
+}
+
+#[tokio::test]
+async fn internal_recommend_analytics_returns_the_exact_frozen_wire() {
+    let tmp = TempDir::new().unwrap();
+    let config = analytics_config(&tmp);
+    let collector = AnalyticsCollector::new(config.clone());
+    let at = chrono::DateTime::parse_from_rfc3339("2026-08-01T12:00:00Z")
+        .unwrap()
+        .timestamp_millis();
+    let user = "00000000-0000-4000-8000-000000000001";
+    let query_id = "11111111111111111111111111111111";
+    collector.record_recommendation_request(
+        "products",
+        "related-products",
+        Some(user),
+        None,
+        Some(query_id.to_string()),
+        at,
+    );
+    collector.record_insight(SchemaInsightEvent {
+        event_type: "click".to_string(),
+        event_subtype: None,
+        event_name: "Recommend click".to_string(),
+        index: "products".to_string(),
+        user_token: user.to_string(),
+        authenticated_user_token: None,
+        query_id: Some(query_id.to_string()),
+        object_ids: vec!["a".to_string(), "b".to_string()],
+        object_ids_alt: vec![],
+        positions: Some(vec![1, 3]),
+        timestamp: Some(at),
+        value: None,
+        currency: None,
+        interleaving_team: None,
+    });
+    collector.record_insight(SchemaInsightEvent {
+        event_type: "conversion".to_string(),
+        event_subtype: None,
+        event_name: "Recommend conversion".to_string(),
+        index: "products".to_string(),
+        user_token: user.to_string(),
+        authenticated_user_token: None,
+        query_id: Some(query_id.to_string()),
+        object_ids: vec!["a".to_string()],
+        object_ids_alt: vec![],
+        positions: None,
+        timestamp: Some(at),
+        value: None,
+        currency: None,
+        interleaving_team: None,
+    });
+    collector.flush_all();
+    drop(collector);
+
+    let state = crate::test_helpers::TestStateBuilder::new(&tmp)
+        .with_analytics_engine(Arc::new(AnalyticsQueryEngine::new(config)))
+        .build_shared();
+    let app = recommend_analytics_router(state);
+    let (status, body) = get_recommend_analytics(
+        &app,
+        "index=products&model=related-products&startDate=2026-08-01&endDate=2026-08-01",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "index": "products",
+            "model": "related-products",
+            "startDate": "2026-08-01",
+            "endDate": "2026-08-01",
+            "totalUsers": 1,
+            "totalRecommendations": 1,
+            "trackedRecommendations": 1,
+            "clickedRecommendations": 1,
+            "convertedRecommendations": 1,
+            "clickThroughRate": 100.0,
+            "conversionRate": 100.0,
+            "clickPositionDistribution": [
+                {"position": 1, "count": 1},
+                {"position": 3, "count": 1}
+            ],
+            "averageClickPosition": 2.0
+        })
+    );
+}
+
+#[tokio::test]
+async fn internal_recommend_analytics_rejects_unbounded_or_unknown_queries() {
+    let tmp = TempDir::new().unwrap();
+    let state = crate::test_helpers::TestStateBuilder::new(&tmp)
+        .with_analytics()
+        .build_shared();
+    let app = recommend_analytics_router(state);
+    for query in [
+        "index=products&model=unknown&startDate=2026-08-01&endDate=2026-08-01",
+        "index=products&model=related-products&startDate=bad&endDate=2026-08-01",
+        "index=products&model=related-products&startDate=2026-08-02&endDate=2026-08-01",
+        "index=products&model=related-products&startDate=2026-08-01&endDate=2026-08-31",
+        "index=products&model=related-products&startDate=2026-08-01&endDate=2026-08-01&unknown=true",
+    ] {
+        let (status, _) = get_recommend_analytics(&app, query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "accepted query {query}");
+    }
+}
+
+#[tokio::test]
+async fn internal_recommend_analytics_returns_sanitized_unavailable_response() {
+    let tmp = TempDir::new().unwrap();
+    let app =
+        recommend_analytics_router(crate::test_helpers::TestStateBuilder::new(&tmp).build_shared());
+    let (status, body) = get_recommend_analytics(
+        &app,
+        "index=products&model=related-products&startDate=2026-08-01&endDate=2026-08-01",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "message": "recommendation analytics unavailable",
+            "status": 503
+        })
+    );
+}
+
+#[tokio::test]
+async fn internal_recommend_analytics_no_data_is_an_exact_zero_200() {
+    let tmp = TempDir::new().unwrap();
+    let app = recommend_analytics_router(
+        crate::test_helpers::TestStateBuilder::new(&tmp)
+            .with_analytics()
+            .build_shared(),
+    );
+    let (status, body) = get_recommend_analytics(
+        &app,
+        "index=products&model=looking-similar&startDate=2026-08-01&endDate=2026-08-01",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["totalUsers"], 0);
+    assert_eq!(body["totalRecommendations"], 0);
+    assert_eq!(body["trackedRecommendations"], 0);
+    assert_eq!(body["clickedRecommendations"], 0);
+    assert_eq!(body["convertedRecommendations"], 0);
+    assert_eq!(body["clickThroughRate"], 0.0);
+    assert_eq!(body["conversionRate"], 0.0);
+    assert_eq!(body["clickPositionDistribution"], serde_json::json!([]));
+    assert!(body["averageClickPosition"].is_null());
 }
 
 /// Verify that omitting `objectID` for the `related-products` model is rejected with 400 Bad Request.
@@ -466,11 +1539,249 @@ fn record_conversion_events(collector: &AnalyticsCollector, events: Vec<SchemaIn
     collector.flush_insights();
 }
 
+fn hit_ids_and_scores(result: &serde_json::Value) -> Vec<(&str, u64)> {
+    result["hits"]
+        .as_array()
+        .expect("result must contain hits")
+        .iter()
+        .map(|hit| {
+            (
+                hit["objectID"]
+                    .as_str()
+                    .expect("item hit must contain objectID"),
+                hit["_score"]
+                    .as_u64()
+                    .expect("item hit must contain numeric _score"),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn recommend_batch_rejects_mixed_index_scope_before_dispatch() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _) = make_test_state_with_analytics(&tmp);
+    let app = recommend_router_with_key(state, vec!["missing-owned-products".to_string()]);
+
+    let (status, body) = post_recommend(
+        &app,
+        serde_json::json!({
+            "requests": [
+                {
+                    "indexName": "missing-owned-products",
+                    "model": "trending-items",
+                    "threshold": 0
+                },
+                {
+                    "indexName": "other-tenant-products",
+                    "model": "trending-items",
+                    "threshold": 0
+                }
+            ]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        body["message"].as_str(),
+        Some(crate::auth::INVALID_API_CREDENTIALS_MESSAGE)
+    );
+}
+
+#[tokio::test]
+async fn recommend_deleted_index_cannot_return_stale_event_candidates() {
+    let tmp = TempDir::new().unwrap();
+    let (state, collector) = make_test_state_with_analytics(&tmp);
+    let app = recommend_router(state.clone());
+
+    insert_recommend_docs(
+        &state,
+        "deleted-products",
+        vec![make_text_doc("stale-sku", &[("name", "Stale Product")])],
+    )
+    .await;
+    record_conversion_events(
+        &collector,
+        vec![make_conversion_event(
+            "deleted-products",
+            "stale-user",
+            "stale-sku",
+            "conversion",
+            Utc::now().timestamp_millis(),
+        )],
+    );
+    state
+        .manager
+        .delete_tenant(&"deleted-products".to_string())
+        .await
+        .unwrap();
+
+    let (status, body) = post_recommend(
+        &app,
+        serde_json::json!({
+            "requests": [{
+                "indexName": "deleted-products",
+                "model": "trending-items",
+                "threshold": 0
+            }]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        body["message"].as_str(),
+        Some("Index 'deleted-products' does not exist")
+    );
+}
+
+#[tokio::test]
+async fn recommend_closed_five_model_batch_returns_hand_calculated_answers() {
+    let tmp = TempDir::new().unwrap();
+    let (state, collector) = make_test_state_with_analytics(&tmp);
+    let app = recommend_router(state.clone());
+
+    insert_recommend_docs(
+        &state,
+        "products",
+        vec![
+            Document {
+                id: "seed".to_string(),
+                fields: HashMap::from([
+                    (
+                        "name".to_string(),
+                        FieldValue::Text(
+                            "Wireless Bluetooth Headphones with active noise cancelling"
+                                .to_string(),
+                        ),
+                    ),
+                    ("brand".to_string(), FieldValue::Facet("Audio".to_string())),
+                ]),
+            },
+            Document {
+                id: "near".to_string(),
+                fields: HashMap::from([
+                    (
+                        "name".to_string(),
+                        FieldValue::Text(
+                            "Wireless Bluetooth Headphones with active noise cancelling travel"
+                                .to_string(),
+                        ),
+                    ),
+                    ("brand".to_string(), FieldValue::Facet("Audio".to_string())),
+                ]),
+            },
+            Document {
+                id: "mid".to_string(),
+                fields: HashMap::from([
+                    (
+                        "name".to_string(),
+                        FieldValue::Text("Wireless Bluetooth Headphones".to_string()),
+                    ),
+                    ("brand".to_string(), FieldValue::Facet("Travel".to_string())),
+                ]),
+            },
+            Document {
+                id: "zero-overlap".to_string(),
+                fields: HashMap::from([
+                    (
+                        "name".to_string(),
+                        FieldValue::Text("Ceramic coffee grinder".to_string()),
+                    ),
+                    (
+                        "brand".to_string(),
+                        FieldValue::Facet("Kitchen".to_string()),
+                    ),
+                ]),
+            },
+        ],
+    )
+    .await;
+    save_settings(&state, "products", &text_searchable_settings());
+
+    let timestamp = Utc::now().timestamp_millis();
+    record_conversion_events(
+        &collector,
+        vec![
+            make_purchase_event("products", "buyer-a", "seed", timestamp),
+            make_purchase_event("products", "buyer-a", "near", timestamp),
+            make_purchase_event("products", "buyer-b", "seed", timestamp),
+            make_purchase_event("products", "buyer-b", "near", timestamp),
+            make_conversion_event("products", "browser-c", "seed", "Converted Seed", timestamp),
+            make_conversion_event("products", "browser-c", "mid", "Converted Mid", timestamp),
+        ],
+    );
+
+    let (status, body) = post_recommend(
+        &app,
+        serde_json::json!({
+            "requests": [
+                {
+                    "indexName": "products",
+                    "model": "related-products",
+                    "objectID": "seed",
+                    "threshold": 0
+                },
+                {
+                    "indexName": "products",
+                    "model": "bought-together",
+                    "objectID": "seed",
+                    "threshold": 0
+                },
+                {
+                    "indexName": "products",
+                    "model": "trending-items",
+                    "threshold": 0
+                },
+                {
+                    "indexName": "products",
+                    "model": "trending-facets",
+                    "facetName": "brand",
+                    "threshold": 0
+                },
+                {
+                    "indexName": "products",
+                    "model": "looking-similar",
+                    "objectID": "seed",
+                    "threshold": 0
+                }
+            ]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let results = body["results"].as_array().expect("batch results");
+    assert_eq!(results.len(), 5);
+    assert_eq!(
+        hit_ids_and_scores(&results[0]),
+        vec![("near", 100), ("mid", 50)]
+    );
+    assert_eq!(hit_ids_and_scores(&results[1]), vec![("near", 100)]);
+    assert_eq!(
+        hit_ids_and_scores(&results[2]),
+        vec![("seed", 100), ("near", 67), ("mid", 33)]
+    );
+    assert_eq!(
+        results[3]["hits"],
+        serde_json::json!([
+            {"facetName": "brand", "facetValue": "Audio", "_score": 100},
+            {"facetName": "brand", "facetValue": "Travel", "_score": 20}
+        ])
+    );
+    assert_eq!(
+        hit_ids_and_scores(&results[4]),
+        vec![("near", 100), ("mid", 0)]
+    );
+}
+
 /// Verify that a batched request returns one result per sub-request in the original request order.
 #[tokio::test]
 async fn recommend_batched_preserves_ordering() {
     let tmp = TempDir::new().unwrap();
     let (state, _) = make_test_state_with_analytics(&tmp);
+    state.manager.create_tenant("products").unwrap();
     let app = recommend_router(state);
 
     let (status, body) = post_recommend(
@@ -922,7 +2233,13 @@ async fn recommend_trending_items_respects_threshold_and_max_recommendations() {
 async fn recommend_replicas_follow_primary_scope() {
     let tmp = TempDir::new().unwrap();
     let (state, collector) = make_test_state_with_analytics(&tmp);
-    let app = recommend_router(state.clone());
+    let app = recommend_router_with_hooks(
+        state.clone(),
+        RecommendTestHooks {
+            analytics_collector: Some(Arc::clone(&collector)),
+            ..Default::default()
+        },
+    );
 
     let primary_index_name = "products";
     let standard_replica_name = "products_standard";
@@ -1076,6 +2393,25 @@ async fn recommend_replicas_follow_primary_scope() {
         primary_hits, virtual_hits,
         "virtual replica should produce same recommendation behavior as primary"
     );
+
+    collector.flush_all();
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let (start_ms, end_ms) = recommendation_analytics_bounds(&today, &today).unwrap();
+    let analytics = AnalyticsQueryEngine::new(analytics_config(&tmp));
+    for requested_index in [
+        primary_index_name,
+        standard_replica_name,
+        virtual_replica_name,
+    ] {
+        let summary = analytics
+            .recommendation_analytics(requested_index, "trending-items", start_ms, end_ms)
+            .await
+            .unwrap();
+        assert_eq!(
+            summary.total_recommendations, 1,
+            "telemetry must remain isolated under requested index {requested_index}"
+        );
+    }
 }
 
 // ── C2: Trending Facets tests (RED) ──────────────────────────────

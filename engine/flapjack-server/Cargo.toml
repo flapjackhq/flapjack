@@ -12,6 +12,7 @@ default = []
 otel = ["flapjack-http/otel"]
 vector-search = ["flapjack/vector-search", "flapjack-http/vector-search"]
 vector-search-local = ["vector-search", "flapjack/vector-search-local", "flapjack-http/vector-search-local"]
+fault-injection = ["flapjack/fault-injection", "flapjack-http/fault-injection"]
 
 [dependencies]
 flapjack = { path = "..", default-features = false, features = ["memory-stats", "axum-support", "s3-snapshots", "openapi", "analytics", "decompound"] }

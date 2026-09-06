@@ -1,6 +1,6 @@
 //! Stub summary for engine/flapjack-http/src/auth_tests/route_acl_tests/required_acl_tests.rs.
 use super::super::*;
-use crate::auth::route_acl::RouteAcl;
+use crate::auth::route_acl::{route_policy, RouteAcl, RouteEffect};
 
 // ── required_acl_for_route ──
 
@@ -21,6 +21,70 @@ fn assert_unmapped_route(method: Method, path: &str) {
 
 fn assert_peer_or_admin_route(method: Method, path: &str) {
     assert_eq!(required_acl_for_route(&method, path), RouteAcl::PeerOrAdmin);
+}
+
+fn assert_route_effect(method: Method, path: &str, effect: RouteEffect) {
+    assert_eq!(
+        route_policy(&method, path).effect,
+        effect,
+        "{method} {path}"
+    );
+}
+
+#[test]
+fn route_policy_distinguishes_safe_post_reads_from_mutations() {
+    for (method, path) in [
+        (Method::POST, "/1/indexes/products/query"),
+        (Method::POST, "/1/indexes/products/browse"),
+        (Method::POST, "/1/indexes/products/chat"),
+        (Method::POST, "/1/indexes/products/objects"),
+        (Method::POST, "/1/dictionaries/stopwords/search"),
+        (Method::POST, "/1/migrations/algolia/preview"),
+        (Method::POST, "/1/migrations/typesense/list-indexes"),
+        (Method::POST, "/2/abtests/estimate"),
+        (Method::POST, "/internal/indexes/products/count"),
+    ] {
+        assert_route_effect(method, path, RouteEffect::Read);
+    }
+
+    for (method, path) in [
+        (Method::POST, "/1/indexes/products/batch"),
+        (Method::PUT, "/1/indexes/products/settings"),
+        (Method::POST, "/1/events"),
+        (Method::POST, "/internal/replicate"),
+        (Method::POST, "/1/migrations/algolia"),
+        (Method::POST, "/1/configs/products/build"),
+        (Method::POST, "/internal/crawler/runs"),
+    ] {
+        assert_route_effect(method, path, RouteEffect::Mutation);
+    }
+}
+
+#[test]
+fn release_fence_controls_are_the_only_control_bypass() {
+    for path in [
+        "/internal/release-write-fence/status",
+        "/internal/release-write-fence/acquire",
+        "/internal/release-write-fence/release",
+    ] {
+        let method = if path.ends_with("status") {
+            Method::GET
+        } else {
+            Method::POST
+        };
+        assert_route_effect(method.clone(), path, RouteEffect::FenceControl);
+        assert_required_acl(method, path, "admin");
+    }
+    assert_route_effect(
+        Method::POST,
+        "/internal/release-write-fence/unknown",
+        RouteEffect::Mutation,
+    );
+}
+
+#[test]
+fn unknown_unsafe_route_is_unmapped_and_therefore_fails_closed_when_fenced() {
+    assert_route_effect(Method::POST, "/future/write-route", RouteEffect::Unmapped);
 }
 
 #[test]

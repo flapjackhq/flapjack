@@ -210,6 +210,14 @@ pub async fn batch_search(
         .extensions()
         .get::<crate::api_profile::PaidBetaV3CustomerRequest>()
         .is_some();
+    let paid_beta_v4_customer = request
+        .extensions()
+        .get::<crate::api_profile::PaidBetaV4CustomerRequest>()
+        .is_some();
+    let paid_beta_v5_customer = request
+        .extensions()
+        .get::<crate::api_profile::PaidBetaV5CustomerRequest>()
+        .is_some();
     let dictionary_lookup_tenant = request
         .extensions()
         .get::<crate::auth::AuthenticatedAppId>()
@@ -224,6 +232,10 @@ pub async fn batch_search(
         crate::api_profile::prepare_paid_beta_v1_batch(body, api_key.as_ref())?
     } else if paid_beta_v3_customer {
         crate::api_profile::prepare_paid_beta_v3_batch(body, api_key.as_ref())?
+    } else if paid_beta_v4_customer {
+        crate::api_profile::prepare_paid_beta_v4_batch(body, api_key.as_ref())?
+    } else if paid_beta_v5_customer {
+        crate::api_profile::prepare_paid_beta_v5_batch(body, api_key.as_ref())?
     } else {
         serde_json::from_value(body).map_err(|e| {
             tracing::error!("Batch search deserialization failed: {}", e);

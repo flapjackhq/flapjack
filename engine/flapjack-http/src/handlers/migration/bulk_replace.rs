@@ -77,6 +77,7 @@ pub struct BulkReplaceReceipt {
 pub async fn submit_bulk_replace_http(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
+    Extension(mutation_permit): Extension<crate::pause_registry::MutationPermit>,
     headers: HeaderMap,
     Query(query): Query<BulkReplaceQuery>,
     body: Body,
@@ -155,6 +156,7 @@ pub async fn submit_bulk_replace_http(
         target_index.clone(),
         publication_mode,
         permit,
+        mutation_permit,
     );
     Ok((
         StatusCode::ACCEPTED,

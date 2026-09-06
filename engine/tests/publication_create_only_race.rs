@@ -1,8 +1,10 @@
 //! Stub summary for engine/tests/publication_create_only_race.rs.
+use flapjack::analytics::schema::SearchEvent;
+use flapjack::analytics::{AnalyticsCollector, AnalyticsConfig, AnalyticsQueryEngine};
 use flapjack::index::manager::publication::{
-    canonical_tenant_tree_digest, PreStagedActivationError, PreStagedPublication,
-    PublicationGenerationEvidence, PublicationJournal, PublicationPaths, PublicationPhase,
-    PublicationRepairStatus, PublicationScanAction, PublicationTarget,
+    canonical_tenant_tree_digest, scan_and_repair_publication_target, PreStagedActivationError,
+    PreStagedPublication, PublicationGenerationEvidence, PublicationJournal, PublicationPaths,
+    PublicationPhase, PublicationRepairStatus, PublicationScanAction, PublicationTarget,
     PublicationTargetDisposition, PublicationTransactionId, RepairDecision,
     TantivyManagedInventory,
 };
@@ -111,7 +113,7 @@ mod index {
             /// inside its check/act window — measured at roughly two runs in three — so one
             /// trial would let the defect through often enough to be useless as a gate.
             /// Independent trials drive detection to a near-certainty without weakening
-            /// anything: an atomic reservation yields exactly one winner under *every*
+            /// anything: the target-scoped publication fence yields exactly one winner under *every*
             /// interleaving, so no trial count can make a correct implementation fail here.
             /// The barrier only widens the window; it is not what makes the expectation
             /// hold. There are no sleeps and no retries — each trial asserts on its own.
@@ -126,6 +128,132 @@ mod index {
                         &format!("{TARGET_TENANT}_{trial}"),
                     );
                 }
+            }
+
+            /// The public deletion owner removes exact customer analytics even
+            /// when analytics storage is configured outside the index data root.
+            /// Late ingress stays fenced until an exact successful recreate.
+            #[tokio::test]
+            async fn index_delete_purges_external_analytics_and_blocks_late_resurrection() {
+                let temp = TempDir::new().unwrap();
+                let index_data_dir = temp.path().join("indexes");
+                let analytics_data_dir = temp.path().join("external-analytics");
+                let manager = IndexManager::new(&index_data_dir);
+                let collector = AnalyticsCollector::new(AnalyticsConfig {
+                    enabled: true,
+                    data_dir: analytics_data_dir.clone(),
+                    flush_interval_secs: 60,
+                    flush_size: 100,
+                    retention_days: 90,
+                });
+                manager.set_analytics_collector(Arc::clone(&collector));
+                manager.create_tenant("delete-me").unwrap();
+                manager.create_tenant("keep-me").unwrap();
+
+                collector.record_search(search_event("delete-me", "deleted-query"));
+                collector.record_search(search_event("keep-me", "retained-query"));
+                collector.flush_searches();
+                assert!(analytics_data_dir.join("delete-me").is_dir());
+                assert!(analytics_data_dir.join("keep-me").is_dir());
+
+                manager
+                    .delete_tenant(&"delete-me".to_string())
+                    .await
+                    .unwrap();
+                assert!(!analytics_data_dir.join("delete-me").exists());
+                assert!(analytics_data_dir.join("keep-me").is_dir());
+                assert!(collector.lookup_query_id("deleted-query").is_none());
+
+                collector.record_search(search_event("delete-me", "late-query"));
+                collector.flush_searches();
+                assert!(!analytics_data_dir.join("delete-me").exists());
+                assert!(collector.lookup_query_id("late-query").is_none());
+
+                manager.create_tenant("delete-me").unwrap();
+                collector.record_search(search_event("delete-me", "recreated-query"));
+                collector.flush_searches();
+                assert!(analytics_data_dir.join("delete-me").is_dir());
+                assert!(collector.lookup_query_id("recreated-query").is_some());
+            }
+
+            #[tokio::test(flavor = "current_thread")]
+            async fn raw_publication_scanner_refuses_loadable_while_analytics_delete_is_pending() {
+                let temp = TempDir::new().unwrap();
+                let base = temp.path();
+                let manager = IndexManager::new(base);
+                manager.create_tenant("pending-analytics-delete").unwrap();
+                let marker =
+                    base.join(".publication/pending-analytics-delete/analytics-purge-pending.json");
+                fs::create_dir_all(marker.parent().unwrap()).unwrap();
+                fs::write(
+                    &marker,
+                    br#"{"schemaVersion":1,"target":"pending-analytics-delete"}"#,
+                )
+                .unwrap();
+
+                let report = scan_and_repair_publication_target(
+                    base,
+                    &AnalyticsConfig::for_data_dir(base),
+                    PublicationTarget::new("pending-analytics-delete").unwrap(),
+                )
+                .unwrap();
+
+                assert_eq!(report.status, PublicationRepairStatus::Unresolved);
+                assert_eq!(report.action, PublicationScanAction::Unresolved);
+                assert_eq!(
+                    report.disposition,
+                    PublicationTargetDisposition::Unavailable
+                );
+                assert!(marker.is_file());
+            }
+
+            #[test]
+            fn raw_scanner_fences_an_initially_missing_namespace_before_reporting_loadable() {
+                let temp = TempDir::new().unwrap();
+                let base = temp.path();
+                let target = "missing-namespace-live-target";
+                fs::create_dir(base.join(target)).unwrap();
+                assert!(!base.join(".publication").exists());
+
+                let report = scan_and_repair_publication_target(
+                    base,
+                    &AnalyticsConfig::for_data_dir(base),
+                    PublicationTarget::new(target).unwrap(),
+                )
+                .unwrap();
+
+                assert_eq!(report.disposition, PublicationTargetDisposition::Loadable);
+                assert!(
+                    base.join(format!(".publication/{target}/epoch.lock"))
+                        .is_file(),
+                    "a targeted scan must leave the existing ABA-safe fence sidecar"
+                );
+            }
+
+            #[test]
+            fn analytics_index_listing_decodes_customer_names_and_skips_internal_quarantine() {
+                let temp = TempDir::new().unwrap();
+                let config = AnalyticsConfig::for_data_dir(temp.path());
+                for index in ["keep-me", "_fj_customer"] {
+                    fs::create_dir_all(config.target_artifact_paths(index).index_root).unwrap();
+                }
+                fs::create_dir_all(
+                    config
+                        .data_dir
+                        .join("_fj_index_deletion_quarantine")
+                        .join("deleted-customer"),
+                )
+                .unwrap();
+
+                let mut indices = AnalyticsQueryEngine::new(config)
+                    .list_analytics_indices()
+                    .unwrap();
+                indices.sort();
+
+                assert_eq!(
+                    indices,
+                    vec!["_fj_customer".to_string(), "keep-me".to_string()]
+                );
             }
 
             /// Race two create-only activations for `tenant` and assert the invariant.
@@ -196,7 +324,7 @@ mod index {
             }
 
             /// A create-only activation has no prior target, so it journals no prior digest
-            /// and leaves behind neither a backup tree nor its empty reservation.
+            /// and leaves behind neither a backup tree nor a visible placeholder.
             #[tokio::test]
             async fn successful_create_only_activation_records_no_prior_target_and_leaves_no_residue(
             ) {
@@ -225,7 +353,7 @@ mod index {
                 );
                 assert!(
                     directory_entry_count(&paths.target) > 0,
-                    "the reservation must be replaced by the staged tree, not left empty"
+                    "the published target must be the populated staged tree"
                 );
                 assert!(
                     paths.journal.exists(),
@@ -239,12 +367,13 @@ mod index {
                 );
             }
 
-            /// An activation that fails after reserving must hand the target name back.
+            /// An activation that fails while holding the external target fence must hand
+            /// the target name back without creating a visible placeholder.
             ///
             /// Leaving `staging` unpopulated fails the digest step, which runs after the
-            /// reservation is held — the narrowest public-API way to reach that window.
+            /// target fence is held — the narrowest public-API way to reach that window.
             #[tokio::test]
-            async fn create_only_activation_failure_after_reservation_releases_the_target_name() {
+            async fn create_only_activation_failure_after_fencing_releases_the_target_name() {
                 let temp = TempDir::new().unwrap();
                 let base = temp.path();
                 let target = PublicationTarget::new(TARGET_TENANT).unwrap();
@@ -259,7 +388,7 @@ mod index {
                 );
                 assert!(
                     !unstaged_paths.target.exists(),
-                    "a failed create-only activation must release the reserved target name"
+                    "a failed create-only activation must not expose the target name"
                 );
 
                 // The released name is reusable by a later create-only activation.
@@ -274,13 +403,13 @@ mod index {
                 );
             }
 
-            /// Startup repair must release a reservation orphaned by a crash and must not
-            /// promote the uncommitted staging tree that crash left behind.
+            /// Startup repair must discard a pre-promotion create-only transaction and must
+            /// not promote the uncommitted staging tree that crash left behind.
             #[tokio::test]
-            async fn startup_repair_releases_an_orphaned_create_only_reservation() {
+            async fn startup_repair_discards_an_orphaned_create_only_transaction() {
                 let temp = TempDir::new().unwrap();
                 let base = temp.path();
-                let orphan = orphaned_create_only_reservation(base);
+                let orphan = orphaned_create_only_transaction(base);
 
                 let manager = IndexManager::new(base);
                 let report = manager.repair_publication_target(TARGET_TENANT).unwrap();
@@ -296,7 +425,7 @@ mod index {
                 );
                 assert!(
                     !orphan.target.exists(),
-                    "repair must release the orphaned reservation"
+                    "repair must not materialize a destination for the orphaned transaction"
                 );
                 assert!(
                     !orphan.staging.exists(),
@@ -309,10 +438,9 @@ mod index {
             }
 
             /// Build the exact on-disk state a crash between the prepare journal and the
-            /// promote rename leaves behind for a create-only activation: the reservation
-            /// still held at the target, the staged tree uncommitted, and a prepared
-            /// journal recording no prior digest because no prior target ever existed.
-            fn orphaned_create_only_reservation(base: &Path) -> PublicationPaths {
+            /// promote rename leaves behind for a create-only activation: no visible target,
+            /// the staged tree uncommitted, and a prepared journal recording no prior digest.
+            fn orphaned_create_only_transaction(base: &Path) -> PublicationPaths {
                 let target = PublicationTarget::new(TARGET_TENANT).unwrap();
                 let transaction = PublicationTransactionId::new("snapshot_orphan").unwrap();
                 let generation = PublicationGenerationEvidence::new("snapshot_orphan").unwrap();
@@ -341,7 +469,6 @@ mod index {
                     serde_json::to_vec_pretty(&journal.to_json_value()).unwrap(),
                 )
                 .unwrap();
-                fs::create_dir(&paths.target).unwrap();
                 paths
             }
 
@@ -380,5 +507,29 @@ mod index {
                     .unwrap_or_default()
             }
         }
+    }
+}
+
+fn search_event(index_name: &str, query_id: &str) -> SearchEvent {
+    SearchEvent {
+        timestamp_ms: 1_700_000_000_000,
+        query: "query".to_string(),
+        query_id: Some(query_id.to_string()),
+        index_name: index_name.to_string(),
+        nb_hits: 1,
+        processing_time_ms: 1,
+        user_token: Some("user-1".to_string()),
+        user_ip: None,
+        filters: None,
+        facets: None,
+        analytics_tags: None,
+        page: 0,
+        hits_per_page: 20,
+        has_results: true,
+        country: None,
+        region: None,
+        experiment_id: None,
+        variant_id: None,
+        assignment_method: None,
     }
 }

@@ -76,6 +76,12 @@ pub struct AutohealJournal {
     next_sequence: u64,
 }
 
+struct JournalHydration {
+    events: Vec<AutohealJournalEvent>,
+    valid_len: u64,
+    has_truncated_final_fragment: bool,
+}
+
 impl AutohealJournal {
     pub fn new(data_dir: &Path) -> Result<Self, String> {
         Self::with_max_bytes(data_dir, DEFAULT_AUTOHEAL_JOURNAL_MAX_BYTES)
@@ -102,7 +108,11 @@ impl AutohealJournal {
             max_bytes,
             next_sequence: 1,
         };
-        let events = journal.read_events_repairing_final_fragment()?;
+        let hydration = journal.read_hydration()?;
+        if hydration.has_truncated_final_fragment {
+            truncate_file(&journal.path, hydration.valid_len)?;
+        }
+        let events = hydration.events;
         journal.next_sequence = next_decision_sequence(&events);
         journal.close_dangling_intents(&events)?;
         journal.compact_if_needed()?;
@@ -111,6 +121,14 @@ impl AutohealJournal {
 
     pub fn path_in_data_dir(data_dir: &Path) -> PathBuf {
         data_dir.join(AUTOHEAL_JOURNAL_FILE)
+    }
+
+    /// Hydrate all complete journal records without creating, truncating,
+    /// closing, or compacting the journal. A malformed final fragment is
+    /// ignored in the projection and left byte-for-byte untouched.
+    pub fn read_events_read_only(data_dir: &Path) -> Result<Vec<AutohealJournalEvent>, String> {
+        let path = Self::path_in_data_dir(data_dir);
+        read_journal_hydration(&path).map(|hydration| hydration.events)
     }
 
     pub fn fresh_observation_window<I, S>(
@@ -266,13 +284,13 @@ impl AutohealJournal {
     }
 
     pub fn events(&self) -> Result<Vec<AutohealJournalEvent>, String> {
-        self.read_events_repairing_final_fragment()
+        self.read_hydration().map(|hydration| hydration.events)
     }
 
     pub fn unresolved_readmission_candidates(
         &self,
     ) -> Result<Vec<UnresolvedReadmissionCandidate>, String> {
-        let events = self.read_events_repairing_final_fragment()?;
+        let events = self.read_hydration()?.events;
         Ok(transactions_by_decision(&events)
             .into_iter()
             .filter_map(|transaction| unresolved_readmission_candidate(&transaction))
@@ -322,40 +340,8 @@ impl AutohealJournal {
         self.compact_if_needed()
     }
 
-    fn read_events_repairing_final_fragment(&self) -> Result<Vec<AutohealJournalEvent>, String> {
-        let file = File::open(&self.path)
-            .map_err(|error| format!("failed to open {}: {error}", self.path.display()))?;
-        let mut offset = 0_u64;
-        let mut events = Vec::new();
-        for line in BufReader::new(file).split(b'\n') {
-            let line =
-                line.map_err(|error| format!("failed to read {}: {error}", self.path.display()))?;
-            if line.is_empty() {
-                offset += 1;
-                continue;
-            }
-            match serde_json::from_slice::<AutohealJournalEvent>(&line) {
-                Ok(event) => {
-                    offset += line.len() as u64 + 1;
-                    events.push(event);
-                }
-                Err(error) => {
-                    let metadata_len = std::fs::metadata(&self.path)
-                        .map_err(|metadata_error| {
-                            format!("failed to stat {}: {metadata_error}", self.path.display())
-                        })?
-                        .len();
-                    if offset + line.len() as u64 >= metadata_len {
-                        truncate_file(&self.path, offset)?;
-                        return Ok(events);
-                    }
-                    return Err(format!(
-                        "malformed auto-heal journal line before final fragment: {error}"
-                    ));
-                }
-            }
-        }
-        Ok(events)
+    fn read_hydration(&self) -> Result<JournalHydration, String> {
+        read_journal_hydration(&self.path)
     }
 
     fn close_dangling_intents(&mut self, events: &[AutohealJournalEvent]) -> Result<(), String> {
@@ -408,7 +394,13 @@ impl AutohealJournal {
     }
 
     fn ensure_event_can_be_compacted(&self, event: &AutohealJournalEvent) -> Result<(), String> {
-        let mut events = self.read_events_repairing_final_fragment()?;
+        let hydration = self.read_hydration()?;
+        if hydration.has_truncated_final_fragment {
+            return Err(
+                "auto-heal journal acquired a malformed final fragment after admission".to_string(),
+            );
+        }
+        let mut events = hydration.events;
         events.push(event.clone());
         compacted_events(events, self.max_bytes).map(|_| ())
     }
@@ -421,7 +413,13 @@ impl AutohealJournal {
         {
             return Ok(());
         }
-        let events = self.read_events_repairing_final_fragment()?;
+        let hydration = self.read_hydration()?;
+        if hydration.has_truncated_final_fragment {
+            return Err(
+                "auto-heal journal acquired a malformed final fragment after admission".to_string(),
+            );
+        }
+        let events = hydration.events;
         let retained = compacted_events(events, self.max_bytes)?;
         self.replace_events(retained)
     }
@@ -853,6 +851,56 @@ fn sync_directory(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("failed to open directory {}: {error}", path.display()))?
         .sync_all()
         .map_err(|error| format!("failed to sync directory {}: {error}", path.display()))
+}
+
+fn read_journal_hydration(path: &Path) -> Result<JournalHydration, String> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(JournalHydration {
+                events: Vec::new(),
+                valid_len: 0,
+                has_truncated_final_fragment: false,
+            });
+        }
+        Err(error) => return Err(format!("failed to open {}: {error}", path.display())),
+    };
+    let metadata_len = file
+        .metadata()
+        .map_err(|error| format!("failed to stat {}: {error}", path.display()))?
+        .len();
+    let mut offset = 0_u64;
+    let mut events = Vec::new();
+    for line in BufReader::new(file).split(b'\n') {
+        let line = line.map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        if line.is_empty() {
+            offset = offset.saturating_add(1);
+            continue;
+        }
+        match serde_json::from_slice::<AutohealJournalEvent>(&line) {
+            Ok(event) => {
+                offset = offset.saturating_add(line.len() as u64 + 1);
+                events.push(event);
+            }
+            Err(_) if offset + line.len() as u64 >= metadata_len => {
+                return Ok(JournalHydration {
+                    events,
+                    valid_len: offset,
+                    has_truncated_final_fragment: true,
+                });
+            }
+            Err(error) => {
+                return Err(format!(
+                    "malformed auto-heal journal line before final fragment: {error}"
+                ));
+            }
+        }
+    }
+    Ok(JournalHydration {
+        events,
+        valid_len: metadata_len,
+        has_truncated_final_fragment: false,
+    })
 }
 
 fn truncate_file(path: &Path, len: u64) -> Result<(), String> {

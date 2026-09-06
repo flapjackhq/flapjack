@@ -12,8 +12,11 @@ use super::manifest::RollupManifest;
 mod click_analytics;
 mod conversion_analytics;
 mod filters_analytics;
+mod recommend_analytics;
 mod search_analytics;
 mod user_analytics;
+
+pub use recommend_analytics::RecommendAnalyticsSummary;
 
 #[cfg(test)]
 #[path = "query_concurrency_tests.rs"]
@@ -395,11 +398,20 @@ impl AnalyticsQueryEngine {
         let entries = std::fs::read_dir(dir).map_err(|e| format!("read_dir error: {}", e))?;
         for entry in entries {
             let entry = entry.map_err(|e| format!("entry error: {}", e))?;
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    indices.push(name.to_string());
-                }
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("entry type error for {}: {e}", entry.path().display()))?;
+            if file_type.is_symlink() {
+                return Err(format!(
+                    "refusing to traverse symlinked analytics path {}",
+                    entry.path().display()
+                ));
+            }
+            if !file_type.is_dir() {
+                continue;
+            }
+            if let Some(name) = AnalyticsConfig::value_from_path_component(&entry.file_name()) {
+                indices.push(name);
             }
         }
         Ok(indices)

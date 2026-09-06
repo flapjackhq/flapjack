@@ -1,7 +1,8 @@
 //! Test conversion and serialization of Algolia A/B test request DTOs to internal Experiment types, including field mapping, validation, and timestamp handling.
 use super::*;
 use flapjack::experiments::config::{
-    Experiment, ExperimentArm, ExperimentStatus, PrimaryMetric, QueryOverrides,
+    Experiment, ExperimentArm, ExperimentConclusion, ExperimentStatus, PrimaryMetric,
+    QueryOverrides,
 };
 
 /// Construct a sample Experiment with running status, control and variant arms with query overrides, and typical test values.
@@ -75,6 +76,56 @@ fn status_draft_with_past_end_maps_to_expired() {
         status_to_algolia(&ExperimentStatus::Draft, Some(1000)),
         "expired"
     );
+}
+
+#[test]
+fn experiment_to_algolia_persisted_conclusion_contract() {
+    let conclusion = ExperimentConclusion {
+        winner: Some("variant".to_string()),
+        reason: "Persisted operator decision".to_string(),
+        control_metric: 0.12,
+        variant_metric: 0.14,
+        confidence: 0.97,
+        significant: true,
+        promoted: false,
+    };
+    let expected_conclusion = serde_json::to_value(&conclusion).unwrap();
+
+    let mut concluded = sample_experiment();
+    concluded.status = ExperimentStatus::Concluded;
+    concluded.conclusion = Some(conclusion.clone());
+    let concluded_json =
+        serde_json::to_value(experiment_to_algolia_with_updated_at(&concluded, 42, None).unwrap())
+            .unwrap();
+    assert_eq!(concluded_json["status"], "stopped");
+    assert_eq!(concluded_json["conclusion"], expected_conclusion);
+
+    for status in [
+        ExperimentStatus::Stopped,
+        ExperimentStatus::Running,
+        ExperimentStatus::Draft,
+    ] {
+        let mut not_concluded = sample_experiment();
+        not_concluded.status = status;
+        not_concluded.conclusion = None;
+        let json = serde_json::to_value(
+            experiment_to_algolia_with_updated_at(&not_concluded, 42, None).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            json.get("conclusion").is_none(),
+            "non-concluded status must not expose persisted conclusion"
+        );
+    }
+
+    let mut concluded_without_payload = sample_experiment();
+    concluded_without_payload.status = ExperimentStatus::Concluded;
+    assert!(experiment_to_algolia_with_updated_at(&concluded_without_payload, 42, None).is_err());
+
+    let mut stopped_with_payload = sample_experiment();
+    stopped_with_payload.status = ExperimentStatus::Stopped;
+    stopped_with_payload.conclusion = Some(conclusion);
+    assert!(experiment_to_algolia_with_updated_at(&stopped_with_payload, 42, None).is_err());
 }
 
 // -- Timestamp conversion tests --

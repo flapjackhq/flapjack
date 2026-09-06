@@ -97,9 +97,7 @@ write_clean_fixture() {
     "$repo/engine/docs2" \
     "$repo/engine/flapjack-http/src" \
     "$repo/engine/loadtest" \
-    "$repo/engine/sdk_test" \
-    "$repo/integrations/laravel-scout/src" \
-    "$repo/integrations/laravel-scout/tests"
+    "$repo/engine/sdk_test"
 
   cat > "$repo/.debbie.toml" <<'EOF'
 [sync]
@@ -155,6 +153,10 @@ EOF
   do
     printf 'Fixture content for %s.\n' "$path" > "$repo/$path"
   done
+
+  # Positive link control: the fixture's only relative link targets a synced
+  # file, so the clean run must extract and check exactly one link.
+  printf '[Library](engine/LIB.md)\n' >> "$repo/README.md"
 }
 
 assert_clean_fixture() {
@@ -163,8 +165,10 @@ assert_clean_fixture() {
   local output="$repo/${context}.log"
   local status
   status="$(run_validator "$repo" "$output")"
+  assert_not_contains "$output" 'Laravel Scout readiness incomplete' "$context"
   assert_status 0 "$status" "$context"
   assert_contains "$output" 'All checked link targets are within .debbie sync surface' "$context"
+  assert_contains "$output" 'Checked 1 relative links' "$context"
   assert_not_contains "$output" 'debbie sync prod --dry-run' "$context"
 }
 
@@ -352,6 +356,34 @@ main() {
   add_sync_remap "$repo/.debbie.toml" ".beads/private" "private"
   assert_red_arm "$repo" beads_remap_added_to_sync_surface '.beads/ must stay out of the public sync surface'
   restore_and_assert_clean "$pristine" "$repo" .debbie.toml beads_remap_added_to_sync_surface
+
+  sed -i.bak 's|(engine/LIB.md)|(engine/sdk_test/README.md)|' "$repo/README.md" && rm -f "$repo/README.md.bak"
+  assert_red_arm "$repo" readme_links_unsynced_target 'README.md:2 → engine/sdk_test/README.md (resolves to engine/sdk_test/README.md, outside sync surface)'
+  restore_and_assert_clean "$pristine" "$repo" README.md readme_links_unsynced_target
+
+  remove_line "$repo/.debbie.toml" '"engine/LIB.md"'
+  assert_red_arm "$repo" linked_target_dropped_from_sync 'README.md:2 → engine/LIB.md (resolves to engine/LIB.md, outside sync surface)'
+  restore_and_assert_clean "$pristine" "$repo" .debbie.toml linked_target_dropped_from_sync
+
+  printf '// api-key is your admin key or a search key\n' >> "$repo/README.md"
+  assert_red_arm "$repo" readme_admin_key_claim "permits an admin key: 'api-key is your admin key or a search key'"
+  assert_not_contains "$repo/readme_admin_key_claim.log" "accept: 'readWrite'" readme_admin_key_claim
+  restore_and_assert_clean "$pristine" "$repo" README.md readme_admin_key_claim
+
+  printf "accept: 'readWrite'\n" >> "$repo/README.md"
+  assert_red_arm "$repo" readme_write_capable_client_claim "configures a write-capable browser client: accept: 'readWrite'"
+  assert_not_contains "$repo/readme_write_capable_client_claim.log" 'api-key is your admin key or a search key' readme_write_capable_client_claim
+  restore_and_assert_clean "$pristine" "$repo" README.md readme_write_capable_client_claim
+
+  printf 'The one-click path does everything automatically.\n' >> "$repo/engine/sdk_test/README.md"
+  assert_red_arm "$repo" sdk_readme_automatic_claim "overclaims the one-click POST /1/migrate-from-algolia path 'does everything automatically'"
+  assert_not_contains "$repo/sdk_readme_automatic_claim.log" 'migrates an entire Algolia index in a single call' sdk_readme_automatic_claim
+  restore_and_assert_clean "$pristine" "$repo" engine/sdk_test/README.md sdk_readme_automatic_claim
+
+  printf 'Migrates an entire Algolia index in a single call.\n' >> "$repo/engine/sdk_test/README.md"
+  assert_red_arm "$repo" sdk_readme_single_call_claim 'overclaims that the one-click path migrates an entire Algolia index in a single call'
+  assert_not_contains "$repo/sdk_readme_single_call_claim.log" 'does everything automatically' sdk_readme_single_call_claim
+  restore_and_assert_clean "$pristine" "$repo" engine/sdk_test/README.md sdk_readme_single_call_claim
 }
 
 main "$@"

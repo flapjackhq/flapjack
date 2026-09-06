@@ -27,6 +27,85 @@ struct RecoveryWriterContext<'a> {
     id_field: tantivy::schema::Field,
 }
 
+struct RecoveryDocumentPlan {
+    receipt: OpLogReceipt,
+    apply_effect: bool,
+}
+
+struct RecoveryOriginProofs {
+    actions_by_task: HashMap<String, Vec<WriteAction>>,
+}
+
+impl RecoveryOriginProofs {
+    fn load(tenant_id: &str, tenant_path: &Path) -> Result<Self> {
+        let base_path = tenant_path.parent().ok_or_else(|| {
+            FlapjackError::Tantivy(format!(
+                "[RECOVERY {tenant_id}] tenant path has no data-root parent"
+            ))
+        })?;
+        let store = WriteAdmissionStore::open(base_path, tenant_id)?;
+        let actions_by_task = store
+            .load_records()?
+            .into_iter()
+            .map(|record| (record.task_id, record.actions))
+            .collect();
+        Ok(Self { actions_by_task })
+    }
+
+    fn take_origin_seq(
+        &mut self,
+        entry: &OpLogEntry,
+        object_id: Option<&str>,
+        effect_digest: Option<[u8; 32]>,
+    ) -> Option<u64> {
+        let task_id = crate::index::oplog::payload_task_id(&entry.payload)?;
+        let actions = self.actions_by_task.get_mut(task_id)?;
+        let position = actions.iter().position(|action| {
+            recovery_action_matches(action, entry.op_type.as_str(), object_id, effect_digest)
+        })?;
+        match actions.remove(position) {
+            WriteAction::UpsertWithOrigin { origin, .. }
+            | WriteAction::DeleteWithOrigin { origin, .. } => origin.origin_seq,
+            WriteAction::Add(_) | WriteAction::Upsert(_) | WriteAction::Delete(_) => {
+                Some(entry.seq)
+            }
+            WriteAction::UpsertNoLwwUpdate(_)
+            | WriteAction::DeleteNoLwwUpdate(_)
+            | WriteAction::Compact => None,
+        }
+    }
+}
+
+fn recovery_action_matches(
+    action: &WriteAction,
+    op_type: &str,
+    object_id: Option<&str>,
+    effect_digest: Option<[u8; 32]>,
+) -> bool {
+    match action {
+        WriteAction::Add(document)
+        | WriteAction::Upsert(document)
+        | WriteAction::UpsertNoLwwUpdate(document)
+        | WriteAction::UpsertWithOrigin { doc: document, .. } => {
+            op_type == "upsert"
+                && object_id == Some(document.id.as_str())
+                && effect_digest == Some(crate::index::oplog::upsert_effect_digest(document))
+        }
+        WriteAction::Delete(action_object_id)
+        | WriteAction::DeleteNoLwwUpdate(action_object_id)
+        | WriteAction::DeleteWithOrigin {
+            object_id: action_object_id,
+            ..
+        } => {
+            op_type == "delete"
+                && object_id == Some(action_object_id.as_str())
+                && effect_digest
+                    == Some(crate::index::oplog::delete_effect_digest(action_object_id))
+        }
+        WriteAction::Compact => false,
+    }
+}
+
 impl IndexManager {
     /// Recover the uncommitted oplog tail for a tenant after startup.
     ///
@@ -88,9 +167,6 @@ impl IndexManager {
             },
             &document_ops,
         )?;
-
-        #[cfg(feature = "vector-search")]
-        self.rebuild_vector_index(tenant_id, tenant_path, &ops);
 
         Ok(())
     }
@@ -220,25 +296,49 @@ impl IndexManager {
         context: RecoveryDocumentContext<'_>,
         ops: &[OpLogEntry],
     ) -> Result<()> {
+        let mut origin_proofs = RecoveryOriginProofs::load(context.tenant_id, context.tenant_path)?;
+        let version_store = crate::index::version_store::VersionStore::open(context.tenant_path)?;
+        let plans = self.prepare_recovery_document_plans(
+            context.tenant_id,
+            ops,
+            &mut origin_proofs,
+            &version_store,
+        )?;
+        #[cfg(feature = "vector-search")]
+        let selected_vector_ops = ops
+            .iter()
+            .zip(&plans)
+            .filter_map(|(entry, plan)| plan.apply_effect.then_some(entry.clone()))
+            .collect::<Vec<_>>();
         let mut writer = context.index.writer()?;
         let schema = context.index.inner().schema();
         let id_field = schema.get_field("_id").unwrap();
-        let receipts = self.recover_document_entries(
-            RecoveryWriterContext {
+        {
+            let mut writer_context = RecoveryWriterContext {
                 tenant_id: context.tenant_id,
                 index: context.index,
                 settings: context.settings,
                 writer: &mut writer,
                 id_field,
-            },
-            ops,
-        )?;
+            };
+            for (entry, plan) in ops.iter().zip(&plans) {
+                if plan.apply_effect {
+                    self.recover_document_effect(&mut writer_context, entry)?;
+                }
+            }
+        }
 
         writer.commit()?;
         context.index.reader().reload()?;
         context.index.invalidate_searchable_paths_cache();
 
-        let version_store = crate::index::version_store::VersionStore::open(context.tenant_path)?;
+        #[cfg(feature = "vector-search")]
+        self.rebuild_vector_index(context.tenant_id, context.tenant_path, &selected_vector_ops);
+
+        let receipts = plans
+            .into_iter()
+            .map(|plan| plan.receipt)
+            .collect::<Vec<_>>();
         version_store.apply_receipts(&receipts)?;
         write_committed_seq(context.tenant_path, context.seq_window.final_seq)?;
         tracing::info!(
@@ -250,29 +350,135 @@ impl IndexManager {
         Ok(())
     }
 
-    fn recover_document_entries(
+    fn prepare_recovery_document_plans(
         &self,
-        mut context: RecoveryWriterContext<'_>,
+        tenant_id: &str,
         ops: &[OpLogEntry],
-    ) -> Result<Vec<OpLogReceipt>> {
-        let mut receipts = Vec::with_capacity(ops.len());
+        origin_proofs: &mut RecoveryOriginProofs,
+        version_store: &crate::index::version_store::VersionStore,
+    ) -> Result<Vec<RecoveryDocumentPlan>> {
+        use crate::index::version_store::{VersionProofComparison, VersionRecord};
+
+        let mut plans = Vec::with_capacity(ops.len());
+        let mut planned_versions: HashMap<String, VersionRecord> = HashMap::new();
         for entry in ops {
-            receipts.push(self.recover_document_entry(&mut context, entry)?);
+            if entry.op_type == "clear" {
+                plans.push(RecoveryDocumentPlan {
+                    receipt: OpLogReceipt {
+                        seq: entry.seq,
+                        object_id: None,
+                        timestamp_ms: entry.timestamp_ms,
+                        node_id: entry.node_id.clone(),
+                        is_tombstone: false,
+                        origin_seq: None,
+                        effect_digest: None,
+                    },
+                    apply_effect: true,
+                });
+                continue;
+            }
+
+            let (object_id, effect_digest, is_tombstone) =
+                Self::recovery_document_identity(tenant_id, entry)?;
+            let stable_origin_seq = crate::index::oplog::replication_origin_seq(&entry.payload)
+                .map_err(|error| {
+                    FlapjackError::Tantivy(format!(
+                        "[RECOVERY {tenant_id}] invalid origin proof at seq {}: {error}",
+                        entry.seq
+                    ))
+                })?;
+            let admission_origin_seq =
+                origin_proofs.take_origin_seq(entry, Some(&object_id), Some(effect_digest));
+            let durable = match planned_versions.get(&object_id) {
+                Some(version) => Some((version.clone(), true)),
+                None => version_store
+                    .get(&object_id)?
+                    .map(|version| (version, false)),
+            };
+            let origin_seq = match (stable_origin_seq, admission_origin_seq) {
+                (Some(stable), Some(admission)) if stable != admission => {
+                    return Err(FlapjackError::Tantivy(format!(
+                        "[RECOVERY {tenant_id}] conflicting stable/admission origin proof for {object_id} at seq {}",
+                        entry.seq
+                    )));
+                }
+                (Some(stable), _) => stable,
+                (None, Some(admission)) => admission,
+                (None, None) => durable
+                    .as_ref()
+                    .and_then(|(version, _)| {
+                        if version.timestamp_ms == entry.timestamp_ms
+                            && version.node_id == entry.node_id
+                            && version.tombstone == is_tombstone
+                            && version.effect_digest == Some(effect_digest)
+                        {
+                            version.origin_seq
+                        } else {
+                            None
+                        }
+                    })
+                    .ok_or_else(|| {
+                        FlapjackError::Tantivy(format!(
+                            "[RECOVERY {tenant_id}] missing stable origin proof for {object_id} at seq {}",
+                            entry.seq
+                        ))
+                    })?,
+            };
+            let candidate =
+                VersionRecord::new(entry.timestamp_ms, &entry.node_id, is_tombstone, entry.seq)
+                    .with_origin_proof(origin_seq, effect_digest);
+            let apply_effect = match durable {
+                Some((existing, from_planned_tail)) => {
+                    match candidate.compare_replication_proof(&existing) {
+                        VersionProofComparison::Newer => {
+                            planned_versions.insert(object_id.clone(), candidate.clone());
+                            true
+                        }
+                        VersionProofComparison::Older => false,
+                        VersionProofComparison::Exact => !from_planned_tail,
+                        VersionProofComparison::Ambiguous => {
+                            return Err(FlapjackError::Tantivy(format!(
+                                "[RECOVERY {tenant_id}] ambiguous origin proof for {object_id} at seq {}",
+                                entry.seq
+                            )));
+                        }
+                    }
+                }
+                None => {
+                    planned_versions.insert(object_id.clone(), candidate.clone());
+                    true
+                }
+            };
+            plans.push(RecoveryDocumentPlan {
+                receipt: OpLogReceipt {
+                    seq: entry.seq,
+                    object_id: Some(object_id),
+                    timestamp_ms: entry.timestamp_ms,
+                    node_id: entry.node_id.clone(),
+                    is_tombstone,
+                    origin_seq: Some(origin_seq),
+                    effect_digest: Some(effect_digest),
+                },
+                apply_effect,
+            });
         }
-        Ok(receipts)
+        Ok(plans)
     }
 
-    fn recover_document_entry(
+    fn recover_document_effect(
         &self,
         context: &mut RecoveryWriterContext<'_>,
         entry: &OpLogEntry,
-    ) -> Result<OpLogReceipt> {
-        let object_id = match entry.op_type.as_str() {
-            "upsert" => Some(self.recover_upsert_entry(context, entry)?),
-            "delete" => Some(Self::recover_delete_entry(context, entry)?),
+    ) -> Result<()> {
+        match entry.op_type.as_str() {
+            "upsert" => {
+                self.recover_upsert_entry(context, entry)?;
+            }
+            "delete" => {
+                Self::recover_delete_entry(context, entry)?;
+            }
             "clear" => {
                 context.writer.delete_all_documents()?;
-                None
             }
             _ => {
                 return Err(FlapjackError::Tantivy(format!(
@@ -280,14 +486,49 @@ impl IndexManager {
                     context.tenant_id, entry.op_type, entry.seq
                 )));
             }
-        };
-        Ok(OpLogReceipt {
-            seq: entry.seq,
-            object_id,
-            timestamp_ms: entry.timestamp_ms,
-            node_id: entry.node_id.clone(),
-            is_tombstone: entry.op_type == "delete",
-        })
+        }
+        Ok(())
+    }
+
+    fn recovery_document_identity(
+        tenant_id: &str,
+        entry: &OpLogEntry,
+    ) -> Result<(String, [u8; 32], bool)> {
+        match entry.op_type.as_str() {
+            "upsert" => {
+                let body = entry
+                    .payload
+                    .get("body")
+                    .ok_or_else(|| Self::invalid_recovery_entry(tenant_id, entry, "body"))?;
+                let document = crate::types::Document::from_json(body).map_err(|error| {
+                    FlapjackError::Tantivy(format!(
+                        "[RECOVERY {tenant_id}] failed to parse document at seq {}: {error}",
+                        entry.seq
+                    ))
+                })?;
+                Ok((
+                    document.id.clone(),
+                    crate::index::oplog::upsert_effect_digest(&document),
+                    false,
+                ))
+            }
+            "delete" => {
+                let object_id = entry
+                    .payload
+                    .get("objectID")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| Self::invalid_recovery_entry(tenant_id, entry, "objectID"))?;
+                Ok((
+                    object_id.to_string(),
+                    crate::index::oplog::delete_effect_digest(object_id),
+                    true,
+                ))
+            }
+            _ => Err(FlapjackError::Tantivy(format!(
+                "[RECOVERY {tenant_id}] unsupported proof operation '{}' at seq {}",
+                entry.op_type, entry.seq
+            ))),
+        }
     }
 
     fn recover_upsert_entry(
@@ -514,6 +755,248 @@ mod tests {
     use crate::index::version_store::{VersionRecord, VersionStore};
     use tempfile::TempDir;
 
+    #[test]
+    fn replication_origin_proof_recovery_resolves_source_seq_from_admission() {
+        let document = crate::types::Document::from_json(&serde_json::json!({
+            "objectID": "recovered",
+            "title": "accepted body"
+        }))
+        .unwrap();
+        let mut proofs = RecoveryOriginProofs {
+            actions_by_task: HashMap::from([(
+                "task-1".to_string(),
+                vec![WriteAction::UpsertWithOrigin {
+                    doc: document.clone(),
+                    origin: ReplicatedWriteOrigin::new(5_000, "source-node".to_string())
+                        .with_origin_seq(91),
+                }],
+            )]),
+        };
+        let entry = OpLogEntry {
+            seq: 7,
+            timestamp_ms: 5_000,
+            node_id: "source-node".to_string(),
+            tenant_id: "tenant".to_string(),
+            op_type: "upsert".to_string(),
+            payload: serde_json::json!({
+                "objectID": "recovered",
+                "body": document.to_json(),
+                "_flapjack_task_id": "task-1"
+            }),
+        };
+        let digest = crate::index::oplog::operation_effect_digest("upsert", &entry.payload);
+
+        assert_eq!(
+            proofs.take_origin_seq(&entry, Some("recovered"), digest),
+            Some(91),
+            "recovery must preserve source seq rather than destination oplog seq"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replication_origin_proof_recovery_refuses_unproven_or_contradictory_tail() {
+        for (case, seed_contradictory_version) in
+            [("missing-proof", false), ("contradictory-proof", true)]
+        {
+            let temp_dir = TempDir::new().unwrap();
+            let tenant_id = format!("recovery-{case}");
+            let tenant_path = temp_dir.path().join(&tenant_id);
+            std::fs::create_dir_all(&tenant_path).unwrap();
+            let schema = crate::index::schema::Schema::builder().build();
+            let index = Arc::new(crate::index::Index::create(&tenant_path, schema).unwrap());
+            IndexSettings::default()
+                .save(tenant_path.join("settings.json"))
+                .unwrap();
+            let document = crate::types::Document::from_json(&serde_json::json!({
+                "objectID": "unproven-tail",
+                "title": "must not recover without exact origin proof"
+            }))
+            .unwrap();
+            let oplog = OpLog::open(&tenant_path.join("oplog"), &tenant_id, "local-node").unwrap();
+            oplog
+                .append_operations_for_task(
+                    "unproven-recovery-task",
+                    vec![OpLogOperation::replicated(
+                        "upsert",
+                        serde_json::json!({
+                            "objectID": document.id.clone(),
+                            "body": document.to_json()
+                        }),
+                        OpLogOrigin::new(5_000, "source-node"),
+                    )],
+                )
+                .unwrap();
+            drop(oplog);
+
+            let expected_existing = seed_contradictory_version.then(|| {
+                VersionRecord::new(5_000, "source-node", false, 1).with_origin_proof(91, [0xaa; 32])
+            });
+            if let Some(version) = expected_existing.as_ref() {
+                assert!(VersionStore::open(&tenant_path)
+                    .unwrap()
+                    .upsert("unproven-tail", version)
+                    .unwrap());
+            }
+
+            let manager = IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+            let error = manager
+                .recover_from_oplog(&tenant_id, &index, &tenant_path)
+                .expect_err("an unproven replicated tail must fail before mutation");
+
+            assert!(
+                error.to_string().contains("origin") || error.to_string().contains("proof"),
+                "{case} refusal must identify missing or contradictory origin proof: {error}"
+            );
+            assert_eq!(read_committed_seq(&tenant_path), 0, "{case}");
+            assert_eq!(index.reader().searcher().num_docs(), 0, "{case}");
+            assert_eq!(
+                VersionStore::open(&tenant_path)
+                    .unwrap()
+                    .get("unproven-tail")
+                    .unwrap(),
+                expected_existing,
+                "{case} must leave durable version evidence unchanged"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replication_origin_proof_recovery_accepts_already_durable_exact_complete_version() {
+        let temp_dir = TempDir::new().unwrap();
+        let tenant_id = "recovery-exact-durable-proof";
+        let tenant_path = temp_dir.path().join(tenant_id);
+        std::fs::create_dir_all(&tenant_path).unwrap();
+        let schema = crate::index::schema::Schema::builder().build();
+        let index = Arc::new(crate::index::Index::create(&tenant_path, schema).unwrap());
+        IndexSettings::default()
+            .save(tenant_path.join("settings.json"))
+            .unwrap();
+        let document = crate::types::Document::from_json(&serde_json::json!({
+            "objectID": "exact-tail",
+            "title": "durable exact effect"
+        }))
+        .unwrap();
+        let oplog = OpLog::open(&tenant_path.join("oplog"), tenant_id, "local-node").unwrap();
+        oplog
+            .append_operations_for_task(
+                "exact-recovery-task",
+                vec![OpLogOperation::replicated(
+                    "upsert",
+                    serde_json::json!({
+                        "objectID": document.id.clone(),
+                        "body": document.to_json()
+                    }),
+                    OpLogOrigin::new(6_000, "source-node"),
+                )],
+            )
+            .unwrap();
+        drop(oplog);
+        let exact_version = VersionRecord::new(6_000, "source-node", false, 1)
+            .with_origin_proof(92, crate::index::oplog::upsert_effect_digest(&document));
+        assert!(VersionStore::open(&tenant_path)
+            .unwrap()
+            .upsert("exact-tail", &exact_version)
+            .unwrap());
+
+        let manager = IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+        manager
+            .recover_from_oplog(tenant_id, &index, &tenant_path)
+            .expect("an already-durable exact complete version may finish recovery safely");
+
+        assert_eq!(read_committed_seq(&tenant_path), 1);
+        assert_eq!(index.reader().searcher().num_docs(), 1);
+        assert_eq!(
+            VersionStore::open(&tenant_path)
+                .unwrap()
+                .get("exact-tail")
+                .unwrap(),
+            Some(exact_version)
+        );
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn olr_vector_recovery_applies_only_selected_document_plans() {
+        let temp_dir = TempDir::new().unwrap();
+        let tenant_id = "olr-selected-vector-recovery";
+        let tenant_path = temp_dir.path().join(tenant_id);
+        std::fs::create_dir_all(&tenant_path).unwrap();
+        let schema = crate::index::schema::Schema::builder().build();
+        let _index = crate::index::Index::create(&tenant_path, schema).unwrap();
+        IndexSettings::default()
+            .save(tenant_path.join("settings.json"))
+            .unwrap();
+        let newer_document = crate::types::Document::from_json(&serde_json::json!({
+            "objectID": "same-doc",
+            "title": "newer-a",
+            "_vectors": {"default": [1.0, 0.0, 0.0]}
+        }))
+        .unwrap();
+        let older_document = crate::types::Document::from_json(&serde_json::json!({
+            "objectID": "same-doc",
+            "title": "older-b",
+            "_vectors": {"default": [0.0, 1.0, 0.0]}
+        }))
+        .unwrap();
+        let oplog = OpLog::open(&tenant_path.join("oplog"), tenant_id, "local-node").unwrap();
+        oplog
+            .append_operations_for_task(
+                "olr-vector-recovery",
+                vec![
+                    OpLogOperation::replicated(
+                        "upsert",
+                        serde_json::json!({
+                            "objectID": "same-doc",
+                            "body": newer_document.to_json()
+                        }),
+                        OpLogOrigin::new(2_000, "source-node").with_origin_seq(20),
+                    ),
+                    OpLogOperation::replicated(
+                        "upsert",
+                        serde_json::json!({
+                            "objectID": "same-doc",
+                            "body": older_document.to_json()
+                        }),
+                        OpLogOrigin::new(1_000, "source-node").with_origin_seq(10),
+                    ),
+                ],
+            )
+            .unwrap();
+        write_committed_seq(&tenant_path, 0).unwrap();
+        drop(oplog);
+        drop(_index);
+
+        let manager = IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+        manager.get_or_load(tenant_id).unwrap();
+
+        let recovered = manager
+            .get_document(tenant_id, "same-doc")
+            .unwrap()
+            .expect("the selected newer document must be searchable");
+        assert!(matches!(
+            recovered.fields.get("title"),
+            Some(crate::types::FieldValue::Text(value)) if value == "newer-a"
+        ));
+        assert_eq!(
+            manager.get_object_version(tenant_id, "same-doc").unwrap(),
+            Some(
+                VersionRecord::new(2_000, "source-node", false, 1).with_origin_proof(
+                    20,
+                    crate::index::oplog::upsert_effect_digest(&newer_document),
+                ),
+            )
+        );
+        let vector_index = manager
+            .get_vector_index(tenant_id)
+            .expect("the selected document vector must be recovered");
+        assert_eq!(
+            vector_index.read().unwrap().get("same-doc").unwrap(),
+            Some(vec![1.0, 0.0, 0.0]),
+            "an older skipped document plan must not overwrite the selected vector effect"
+        );
+        assert_eq!(read_committed_seq(&tenant_path), 2);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn recovery_replays_after_committed_seq_into_version_store() {
         let temp_dir = TempDir::new().unwrap();
@@ -537,7 +1020,7 @@ mod tests {
                             "objectID": "already-committed",
                             "body": {"objectID": "already-committed", "title": "Committed"}
                         }),
-                        OpLogOrigin::new(1000, "node-a"),
+                        OpLogOrigin::new(1000, "node-a").with_origin_seq(1),
                     ),
                     OpLogOperation::replicated(
                         "upsert",
@@ -545,12 +1028,12 @@ mod tests {
                             "objectID": "recovered-upsert",
                             "body": {"objectID": "recovered-upsert", "title": "Recovered"}
                         }),
-                        OpLogOrigin::new(5000, "node-b"),
+                        OpLogOrigin::new(5000, "node-b").with_origin_seq(2),
                     ),
                     OpLogOperation::replicated(
                         "delete",
                         serde_json::json!({"objectID": "recovered-delete"}),
-                        OpLogOrigin::new(6000, "node-c"),
+                        OpLogOrigin::new(6000, "node-c").with_origin_seq(3),
                     ),
                 ],
             )
@@ -578,11 +1061,33 @@ mod tests {
         );
         assert_eq!(
             recovered_store.get("recovered-upsert").unwrap(),
-            Some(VersionRecord::new(5000, "node-b", false, 2))
+            Some(VersionRecord {
+                timestamp_ms: 5000,
+                node_id: "node-b".to_string(),
+                tombstone: false,
+                oplog_seq: 2,
+                origin_seq: Some(2),
+                effect_digest: Some(crate::index::oplog::upsert_effect_digest(
+                    &crate::types::Document::from_json(&serde_json::json!({
+                        "objectID": "recovered-upsert",
+                        "title": "Recovered"
+                    }))
+                    .unwrap(),
+                )),
+            })
         );
         assert_eq!(
             recovered_store.get("recovered-delete").unwrap(),
-            Some(VersionRecord::new(6000, "node-c", true, 3))
+            Some(VersionRecord {
+                timestamp_ms: 6000,
+                node_id: "node-c".to_string(),
+                tombstone: true,
+                oplog_seq: 3,
+                origin_seq: Some(3),
+                effect_digest: Some(crate::index::oplog::delete_effect_digest(
+                    "recovered-delete",
+                )),
+            })
         );
         assert_eq!(read_committed_seq(&tenant_path), 3);
         let retained = OpLog::open(&tenant_path.join("oplog"), tenant_id, "local-node")

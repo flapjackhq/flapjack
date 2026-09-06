@@ -1,19 +1,13 @@
-export const PRODUCTS = Object.freeze([
-  { objectID: 'product_1', name: 'Alpha Laptop', brand: 'Acme', sortOrder: 1 },
-  { objectID: 'product_2', name: 'Beta Laptop', brand: 'Acme', sortOrder: 3 },
-  { objectID: 'product_3', name: 'Gamma Phone', brand: 'Nova', sortOrder: 2 },
-  { objectID: 'product_4', name: 'Delta Phone', brand: 'Nova', sortOrder: 4 },
-  { objectID: 'product_5', name: 'Epsilon Tablet', brand: 'Zenith', sortOrder: 5 },
-]);
+import { readFileSync } from 'node:fs';
 
-export const INDEX_SETTINGS = Object.freeze({
-  searchableAttributes: ['name'],
-  attributesForFaceting: ['brand'],
-  customRanking: ['asc(sortOrder)'],
-  paginationLimitedTo: 100,
-});
+const fixture = JSON.parse(readFileSync(
+  new URL('../fixtures/official_client_contract.json', import.meta.url),
+  'utf8',
+));
 
-export const FIRST_PAGE_NAMES = Object.freeze(['Alpha Laptop', 'Gamma Phone']);
-export const SECOND_PAGE_NAMES = Object.freeze(['Beta Laptop', 'Delta Phone']);
-export const LAPTOP_NAMES = Object.freeze(['Alpha Laptop', 'Beta Laptop']);
-export const NOVA_NAMES = Object.freeze(['Gamma Phone', 'Delta Phone']);
+export const PRODUCTS = Object.freeze(fixture.products);
+export const INDEX_SETTINGS = Object.freeze(fixture.settings);
+export const FIRST_PAGE_NAMES = Object.freeze(fixture.expected.firstPageNames);
+export const SECOND_PAGE_NAMES = Object.freeze(fixture.expected.secondPageNames);
+export const LAPTOP_NAMES = Object.freeze(fixture.expected.laptopNames);
+export const NOVA_NAMES = Object.freeze(fixture.expected.novaNames);

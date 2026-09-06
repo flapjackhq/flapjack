@@ -2,14 +2,33 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPATIBILITY_PATH="$SCRIPT_DIR/engine_compatibility.json"
+
 usage() {
   cat >&2 <<'EOF'
 Usage:
   package/release_artifact_manifest <target-triple> <binary-path> <output-dir>
+  package/release_artifact_manifest --compatibility-source <path> <target-triple> <binary-path> <output-dir>
+  package/release_artifact_manifest --compatibility-target <target-triple>
+  package/release_artifact_manifest --compatibility-source <path> --compatibility-target <target-triple>
+  package/release_artifact_manifest --compatibility-predecessors <candidate-manifest>
+  package/release_artifact_manifest --compatibility-source <path> --compatibility-predecessors <candidate-manifest>
+  package/release_artifact_manifest --normalize-legacy-predecessor <expected-coordinate> <receipt> <manifest> <archive> <output-dir>
 
 Creates the release archive, checksum sidecar, and build manifest for an already-built
 flapjack binary. The manifest build object is copied from the binary's embedded
 build identity record, with native binaries cross-checked against `build-info --json`.
+The second form emits the validated canonical compatibility projection for one
+target. The third form validates the candidate's target-selected compatibility object
+against the canonical source map and emits one tab-separated exact predecessor
+record per line. Fields are release tag, manifest digest, binary digest,
+transition mode, forward transfer mode, rollback mode, and parity profile.
+An explicit compatibility source is validated by the same owner and is intended
+for a deployment build whose predecessor evidence is published separately. The
+normalization form verifies one legacy schema-1 receipt/manifest/archive tuple,
+safely extracts its executable, packages those unchanged bytes with the current
+schema-2 format, and writes an original-to-normalized evidence record.
 EOF
 }
 
@@ -17,6 +36,603 @@ die() {
   printf 'ERROR: %s\n' "$*" >&2
   exit 1
 }
+
+normalize_legacy_predecessor() {
+  local expected_path="$1"
+  local receipt_path="$2"
+  local manifest_path="$3"
+  local archive_path="$4"
+  local output_dir="$5"
+  local target binary_path normalized_manifest normalized_archive normalized_sidecar
+  local evidence_path temp_dir temp_output
+
+  [ -f "$expected_path" ] || die "expected predecessor coordinate does not exist: $expected_path"
+  [ -f "$receipt_path" ] || die "legacy receipt does not exist: $receipt_path"
+  [ -f "$manifest_path" ] || die "legacy manifest does not exist: $manifest_path"
+  [ -f "$archive_path" ] || die "legacy archive does not exist: $archive_path"
+  [ -n "$output_dir" ] || die "normalization output directory must not be empty"
+  [ ! -e "$output_dir" ] \
+    || die "normalization output directory already exists: $output_dir"
+
+  temp_dir="$(mktemp -d)"
+  temp_output="$temp_dir/output"
+  mkdir -p "$temp_output"
+  trap 'rm -rf "$temp_dir"' EXIT RETURN
+
+  target="$(python3 - "$expected_path" "$receipt_path" "$manifest_path" "$archive_path" "$temp_dir/flapjack" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+import tarfile
+
+expected_path = pathlib.Path(sys.argv[1])
+receipt_path = pathlib.Path(sys.argv[2])
+manifest_path = pathlib.Path(sys.argv[3])
+archive_path = pathlib.Path(sys.argv[4])
+binary_path = pathlib.Path(sys.argv[5])
+
+EXPECTED_KEYS = {
+    "schemaVersion", "kind", "sourceSha", "sourceTree", "target",
+    "receiptSha256", "manifestSha256", "archiveSha256", "binarySha256",
+}
+
+RECEIPT_KEYS = {
+    "validationFjcloudRevision", "canonicalFjcloudRevision", "fjcloudTree",
+    "flapjackRevision", "flapjackTree", "target", "archiveSha256",
+    "manifestSha256", "binarySha256",
+}
+MANIFEST_KEYS = {"schemaVersion", "artifact", "build"}
+ARTIFACT_KEYS = {"arch", "file", "profile", "sha256", "target"}
+BUILD_KEYS = {
+    "schemaVersion", "version", "revision", "revisionKnown", "dirty",
+    "dirtyKnown", "workspaceDigest", "profile", "target", "features",
+    "capabilities",
+}
+
+
+def fail(message):
+    raise SystemExit(f"legacy predecessor normalization {message}")
+
+
+def reject_duplicate_keys(pairs):
+    value = {}
+    for key, member in pairs:
+        if key in value:
+            fail(f"contains duplicate key {key!r}")
+        value[key] = member
+    return value
+
+
+def load(path, label):
+    try:
+        return json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        fail(f"cannot decode {label}: {error}")
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def is_hex(value, length):
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+expected_raw = expected_path.read_bytes()
+expected = load(expected_path, "expected coordinate")
+if not isinstance(expected, dict) or set(expected) != EXPECTED_KEYS:
+    fail("expected coordinate keys mismatch")
+if type(expected["schemaVersion"]) is not int or expected["schemaVersion"] != 1:
+    fail("expected coordinate schemaVersion must be integer 1")
+if expected["kind"] != "flapjack_legacy_predecessor_v1":
+    fail("expected coordinate kind is unsupported")
+if not is_hex(expected["sourceSha"], 40) or not is_hex(expected["sourceTree"], 40):
+    fail("expected source SHA and tree must be 40 lowercase hex characters")
+if expected["target"] not in {
+    "aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"
+}:
+    fail("expected target is not a certified Linux release target")
+for key in ("receiptSha256", "manifestSha256", "archiveSha256", "binarySha256"):
+    if not is_hex(expected[key], 64):
+        fail(f"expected {key} must be 64 lowercase hex characters")
+expected_canonical = (
+    json.dumps(expected, sort_keys=True, separators=(",", ":")) + "\n"
+).encode()
+if expected_raw != expected_canonical:
+    fail("expected coordinate must use canonical sorted compact JSON")
+if digest(receipt_path) != expected["receiptSha256"]:
+    fail("receipt digest differs from the immutable expected coordinate")
+
+receipt = load(receipt_path, "receipt")
+if not isinstance(receipt, dict) or set(receipt) != RECEIPT_KEYS:
+    fail("receipt keys mismatch")
+for key in (
+    "validationFjcloudRevision", "canonicalFjcloudRevision", "flapjackRevision"
+):
+    if not is_hex(receipt[key], 40):
+        fail(f"receipt {key} must be 40 lowercase hex characters")
+for key in ("fjcloudTree", "flapjackTree"):
+    if not is_hex(receipt[key], 40):
+        fail(f"receipt {key} must be 40 lowercase hex characters")
+for key in ("archiveSha256", "manifestSha256", "binarySha256"):
+    if not is_hex(receipt[key], 64):
+        fail(f"receipt {key} must be 64 lowercase hex characters")
+
+target = receipt["target"]
+if target != expected["target"]:
+    fail("receipt target differs from the immutable expected coordinate")
+if receipt["flapjackRevision"] != expected["sourceSha"]:
+    fail("receipt source SHA differs from the immutable expected coordinate")
+if receipt["flapjackTree"] != expected["sourceTree"]:
+    fail("receipt source tree differs from the immutable expected coordinate")
+for receipt_key, expected_key in (
+    ("manifestSha256", "manifestSha256"),
+    ("archiveSha256", "archiveSha256"),
+    ("binarySha256", "binarySha256"),
+):
+    if receipt[receipt_key] != expected[expected_key]:
+        fail(f"receipt {receipt_key} differs from the immutable expected coordinate")
+if digest(manifest_path) != receipt["manifestSha256"]:
+    fail("manifest digest differs from the receipt")
+if digest(archive_path) != receipt["archiveSha256"]:
+    fail("archive digest differs from the receipt")
+
+manifest = load(manifest_path, "manifest")
+if not isinstance(manifest, dict) or set(manifest) != MANIFEST_KEYS:
+    fail("manifest keys mismatch")
+if type(manifest["schemaVersion"]) is not int or manifest["schemaVersion"] != 1:
+    fail("manifest schemaVersion must be integer 1")
+artifact = manifest["artifact"]
+build = manifest["build"]
+if not isinstance(artifact, dict) or set(artifact) != ARTIFACT_KEYS:
+    fail("manifest artifact keys mismatch")
+if not isinstance(build, dict) or set(build) != BUILD_KEYS:
+    fail("manifest build keys mismatch")
+if type(build["schemaVersion"]) is not int or build["schemaVersion"] != 1:
+    fail("manifest build schemaVersion must be integer 1")
+if artifact["target"] != target or build["target"] != target:
+    fail("receipt, artifact, and build targets differ")
+if artifact["file"] != f"flapjack-{target}.tar.gz":
+    fail("legacy archive name is noncanonical")
+if artifact["sha256"] != receipt["archiveSha256"]:
+    fail("manifest archive digest differs from the receipt")
+if artifact["profile"] != "release" or build["profile"] != "release":
+    fail("legacy artifact and build profiles must be release")
+if build["revision"] != receipt["flapjackRevision"] or build["revisionKnown"] is not True:
+    fail("legacy build revision differs from the receipt")
+
+try:
+    with tarfile.open(archive_path, mode="r:gz") as archive:
+        members = archive.getmembers()
+        names = [member.name for member in members]
+        if names != [".", "./flapjack"]:
+            fail(f"archive members must be exactly '.' and './flapjack', got {names!r}")
+        root, binary = members
+        if not root.isdir() or root.mode != 0o755 or root.mtime != 0:
+            fail("archive root metadata is noncanonical")
+        if not binary.isfile() or binary.mode != 0o755 or binary.mtime != 0:
+            fail("archive binary metadata is noncanonical")
+        if root.uid != 0 or root.gid != 0 or binary.uid != 0 or binary.gid != 0:
+            fail("archive ownership metadata is noncanonical")
+        source = archive.extractfile(binary)
+        if source is None:
+            fail("archive binary cannot be read")
+        binary_bytes = source.read()
+except (OSError, tarfile.TarError) as error:
+    fail(f"cannot safely extract archive: {error}")
+
+if hashlib.sha256(binary_bytes).hexdigest() != receipt["binarySha256"]:
+    fail("extracted binary digest differs from the receipt")
+binary_path.write_bytes(binary_bytes)
+binary_path.chmod(0o755)
+print(target)
+PY
+)"
+
+  binary_path="$temp_dir/flapjack"
+  "$SCRIPT_DIR/release_artifact_manifest" \
+    --compatibility-source "$COMPATIBILITY_PATH" \
+    "$target" "$binary_path" "$temp_output" >/dev/null
+
+  normalized_manifest="$temp_output/flapjack-${target}.manifest.json"
+  normalized_archive="$temp_output/flapjack-${target}.tar.gz"
+  normalized_sidecar="${normalized_archive}.sha256"
+  evidence_path="$temp_output/flapjack-${target}.normalization.json"
+
+  python3 - \
+    "$expected_path" "$receipt_path" "$manifest_path" "$archive_path" \
+    "$normalized_manifest" "$normalized_archive" "$binary_path" \
+    "$COMPATIBILITY_PATH" "$evidence_path" "$target" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+expected_path = pathlib.Path(sys.argv[1])
+receipt_path = pathlib.Path(sys.argv[2])
+original_manifest_path = pathlib.Path(sys.argv[3])
+original_archive_path = pathlib.Path(sys.argv[4])
+normalized_manifest_path = pathlib.Path(sys.argv[5])
+normalized_archive_path = pathlib.Path(sys.argv[6])
+binary_path = pathlib.Path(sys.argv[7])
+compatibility_path = pathlib.Path(sys.argv[8])
+evidence_path = pathlib.Path(sys.argv[9])
+target = sys.argv[10]
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+receipt = json.loads(receipt_path.read_text())
+original_manifest = json.loads(original_manifest_path.read_text())
+normalized_manifest = json.loads(normalized_manifest_path.read_text())
+binary_sha = digest(binary_path)
+
+if binary_sha != receipt["binarySha256"]:
+    raise SystemExit("normalized binary identity changed")
+if normalized_manifest["artifact"]["binarySha256"] != binary_sha:
+    raise SystemExit("normalized manifest does not bind the unchanged binary")
+if normalized_manifest["build"] != original_manifest["build"]:
+    raise SystemExit("normalization changed the embedded build identity")
+if normalized_manifest["schemaVersion"] != 2:
+    raise SystemExit("normalized manifest must use schemaVersion 2")
+
+selected = normalized_manifest["compatibility"]
+selected_bytes = (json.dumps(selected, sort_keys=True, separators=(",", ":")) + "\n").encode()
+evidence = {
+    "schemaVersion": 1,
+    "target": target,
+    "expectedCoordinateSha256": digest(expected_path),
+    "original": {
+        "receiptSha256": digest(receipt_path),
+        "manifestSha256": digest(original_manifest_path),
+        "archiveSha256": digest(original_archive_path),
+        "binarySha256": receipt["binarySha256"],
+        "manifestSchemaVersion": 1,
+    },
+    "normalized": {
+        "manifestSha256": digest(normalized_manifest_path),
+        "archiveSha256": digest(normalized_archive_path),
+        "binarySha256": binary_sha,
+        "manifestSchemaVersion": 2,
+        "compatibilitySourceSha256": digest(compatibility_path),
+        "compatibilitySelectedSha256": hashlib.sha256(selected_bytes).hexdigest(),
+    },
+}
+evidence_path.write_text(
+    json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n"
+)
+PY
+
+  mkdir -p "$output_dir"
+  for source in "$normalized_archive" "$normalized_sidecar" "$normalized_manifest" "$evidence_path"; do
+    local destination
+    destination="$output_dir/$(basename "$source")"
+    [ ! -e "$destination" ] || die "normalization output already exists: $destination"
+  done
+  mv "$normalized_archive" "$output_dir/"
+  mv "$normalized_sidecar" "$output_dir/"
+  mv "$normalized_manifest" "$output_dir/"
+  mv "$evidence_path" "$output_dir/"
+  trap - EXIT RETURN
+  rm -rf "$temp_dir"
+  printf '%s\n' "$output_dir/flapjack-${target}.normalization.json"
+}
+
+compatibility_contract() {
+  local mode="$1"
+  local input="${2:-}"
+  python3 - "$COMPATIBILITY_PATH" "$mode" "$input" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+compatibility_path = pathlib.Path(sys.argv[1])
+mode = sys.argv[2]
+input_value = sys.argv[3]
+
+EXPECTED_SOURCE_KEYS = {
+    "schemaVersion",
+    "targets",
+    "dataDisposition",
+    "mixedVersionReplication",
+}
+EXPECTED_SELECTED_KEYS = {
+    "schemaVersion",
+    "target",
+    "predecessors",
+    "dataDisposition",
+    "mixedVersionReplication",
+}
+EXPECTED_PREDECESSOR_KEYS = {
+    "releaseTag",
+    "manifestSha256",
+    "binarySha256",
+    "transitionMode",
+    "forwardTransferMode",
+    "rollbackMode",
+    "parityProfile",
+}
+TRANSITION_RECIPES = {
+    # Routine releases reuse one data directory and execute the existing
+    # same-data upgrade smoke.  The backup restore variant remains explicit
+    # because it has different rollback effects even though the forward path is
+    # identical.
+    "routine_same_host": {
+        (
+            "reuse_same_data_directory",
+            "binary_reactivate_same_data",
+            "same_data_upgrade_smoke_v1",
+        ),
+        (
+            "reuse_same_data_directory",
+            "restore_pre_upgrade_backup",
+            "same_data_upgrade_smoke_v1",
+        ),
+    },
+    # Exceptional replacement moves state to a distinct host and preserves the
+    # predecessor for a reverse-tail rollback.  Keeping this as one complete
+    # tuple prevents callers from assembling an unreviewed hybrid procedure.
+    "exceptional_blue_green": {
+        (
+            "snapshot_then_tail_replication",
+            "reverse_tail_to_retained_predecessor",
+            "populated_engine_exact_v1",
+        ),
+    },
+}
+FORWARD_TRANSFER_MODES = {
+    recipe[0]
+    for recipes in TRANSITION_RECIPES.values()
+    for recipe in recipes
+}
+ROLLBACK_MODES = {
+    recipe[1]
+    for recipes in TRANSITION_RECIPES.values()
+    for recipe in recipes
+}
+PARITY_PROFILES = {
+    recipe[2]
+    for recipes in TRANSITION_RECIPES.values()
+    for recipe in recipes
+}
+# These are the executable Linux targets owned by the release compatibility
+# job. A source-map key without a matching execution lane would be an untested
+# upgrade claim, so adding another key requires extending that job deliberately.
+CERTIFIED_TARGETS = {
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl",
+}
+RELEASE_TAG = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$")
+TARGET_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.]*(?:-[A-Za-z0-9_][A-Za-z0-9_.]*)+$")
+
+
+def fail(message):
+    raise SystemExit(f"engine compatibility {message}")
+
+
+def reject_duplicate_keys(pairs):
+    value = {}
+    for key, member in pairs:
+        if key in value:
+            fail(f"contains duplicate key: {key}")
+        value[key] = member
+    return value
+
+
+def load_strict(path, label):
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        fail(f"cannot read {label} {path}: {error}")
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+    except UnicodeDecodeError as error:
+        fail(f"{label} is not UTF-8: {error}")
+    except json.JSONDecodeError as error:
+        fail(f"{label} is malformed JSON: {error}")
+    return raw, value
+
+
+def is_sha256(value):
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def validate_predecessors(predecessors, label):
+    if not isinstance(predecessors, list):
+        fail(f"{label} predecessors must be an array")
+    if len(predecessors) > 3:
+        fail(f"{label} predecessors must contain at most 3 entries")
+
+    sort_keys = []
+    release_tags = set()
+    manifest_digests = set()
+    binary_digests = set()
+    for index, predecessor in enumerate(predecessors):
+        member_label = f"{label} predecessors[{index}]"
+        if not isinstance(predecessor, dict) or set(predecessor) != EXPECTED_PREDECESSOR_KEYS:
+            actual = sorted(predecessor) if isinstance(predecessor, dict) else []
+            fail(f"{member_label} keys mismatch: {actual}")
+        release_tag = predecessor["releaseTag"]
+        if not isinstance(release_tag, str) or RELEASE_TAG.fullmatch(release_tag) is None:
+            fail(f"{member_label}.releaseTag must be an exact v-prefixed release tag")
+        if not is_sha256(predecessor["manifestSha256"]):
+            fail(f"{member_label}.manifestSha256 must be 64 lowercase hex characters")
+        if not is_sha256(predecessor["binarySha256"]):
+            fail(f"{member_label}.binarySha256 must be 64 lowercase hex characters")
+        transition_mode = predecessor["transitionMode"]
+        forward_transfer_mode = predecessor["forwardTransferMode"]
+        rollback_mode = predecessor["rollbackMode"]
+        parity_profile = predecessor["parityProfile"]
+        for coordinate, value in (
+            ("transitionMode", transition_mode),
+            ("forwardTransferMode", forward_transfer_mode),
+            ("rollbackMode", rollback_mode),
+            ("parityProfile", parity_profile),
+        ):
+            if not isinstance(value, str):
+                fail(f"{member_label}.{coordinate} must be a string")
+        if transition_mode not in TRANSITION_RECIPES:
+            fail(f"{member_label}.transitionMode is unsupported")
+        if forward_transfer_mode not in FORWARD_TRANSFER_MODES:
+            fail(f"{member_label}.forwardTransferMode is unsupported")
+        if rollback_mode not in ROLLBACK_MODES:
+            fail(f"{member_label}.rollbackMode is unsupported")
+        if parity_profile not in PARITY_PROFILES:
+            fail(f"{member_label}.parityProfile is unsupported")
+        recipe = (forward_transfer_mode, rollback_mode, parity_profile)
+        if recipe not in TRANSITION_RECIPES[transition_mode]:
+            fail(f"{member_label} transition recipe is ambiguous or unsupported")
+        if release_tag in release_tags:
+            fail(f"{label} repeats releaseTag {release_tag}")
+        if predecessor["manifestSha256"] in manifest_digests:
+            fail(f"{label} repeats manifestSha256 {predecessor['manifestSha256']}")
+        if predecessor["binarySha256"] in binary_digests:
+            fail(f"{label} repeats binarySha256 {predecessor['binarySha256']}")
+        release_tags.add(release_tag)
+        manifest_digests.add(predecessor["manifestSha256"])
+        binary_digests.add(predecessor["binarySha256"])
+        sort_keys.append((release_tag, predecessor["manifestSha256"]))
+
+    if sort_keys != sorted(sort_keys):
+        fail(f"{label} predecessors must be sorted by releaseTag then manifestSha256")
+
+
+raw, source = load_strict(compatibility_path, "source")
+if not isinstance(source, dict) or set(source) != EXPECTED_SOURCE_KEYS:
+    actual = sorted(source) if isinstance(source, dict) else []
+    fail(f"source keys mismatch: {actual}")
+if type(source["schemaVersion"]) is not int or source["schemaVersion"] != 2:
+    fail("source schemaVersion must be integer 2")
+if source["dataDisposition"] != "preserve":
+    fail("source dataDisposition must be preserve")
+if source["mixedVersionReplication"] != "not_guaranteed":
+    fail("source mixedVersionReplication must be not_guaranteed")
+targets = source["targets"]
+if not isinstance(targets, dict):
+    fail("source targets must be an object")
+if set(targets) != CERTIFIED_TARGETS:
+    fail(f"source targets must be exactly {sorted(CERTIFIED_TARGETS)}")
+for target, predecessors in targets.items():
+    if TARGET_NAME.fullmatch(target) is None:
+        fail(f"source target name is invalid: {target!r}")
+    validate_predecessors(predecessors, f"source target {target}")
+
+canonical_source = (json.dumps(source, sort_keys=True, separators=(",", ":")) + "\n").encode()
+if raw != canonical_source:
+    fail("source must use canonical sorted compact JSON with one trailing newline")
+
+
+def selected_contract(target):
+    if not isinstance(target, str) or TARGET_NAME.fullmatch(target) is None:
+        fail(f"candidate target is invalid: {target!r}")
+    return {
+        "schemaVersion": 1,
+        "target": target,
+        "predecessors": targets.get(target, []),
+        "dataDisposition": source["dataDisposition"],
+        "mixedVersionReplication": source["mixedVersionReplication"],
+    }
+
+
+if mode == "canonical":
+    selected = selected_contract(input_value)
+    canonical_selected = json.dumps(selected, sort_keys=True, separators=(",", ":")) + "\n"
+    sys.stdout.write(canonical_selected)
+elif mode == "predecessors":
+    if not input_value:
+        fail("candidate manifest path is required")
+    manifest_path = pathlib.Path(input_value)
+    _, manifest = load_strict(manifest_path, "candidate manifest")
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "schemaVersion", "artifact", "build", "compatibility"
+    }:
+        actual = sorted(manifest) if isinstance(manifest, dict) else []
+        fail(f"candidate manifest keys mismatch: {actual}")
+    if type(manifest["schemaVersion"]) is not int or manifest["schemaVersion"] != 2:
+        fail("candidate manifest schemaVersion must be integer 2")
+    artifact = manifest["artifact"]
+    build = manifest["build"]
+    artifact_target = artifact.get("target") if isinstance(artifact, dict) else None
+    candidate_binary_sha = artifact.get("binarySha256") if isinstance(artifact, dict) else None
+    if not is_sha256(candidate_binary_sha):
+        fail("candidate artifact.binarySha256 must be 64 lowercase hex characters")
+    build_target = build.get("target") if isinstance(build, dict) else None
+    if artifact_target != build_target:
+        fail("candidate artifact and build targets differ")
+    selected = selected_contract(artifact_target)
+    candidate_compatibility = manifest["compatibility"]
+    if not isinstance(candidate_compatibility, dict) or set(candidate_compatibility) != EXPECTED_SELECTED_KEYS:
+        actual = sorted(candidate_compatibility) if isinstance(candidate_compatibility, dict) else []
+        fail(f"candidate compatibility keys mismatch: {actual}")
+    # Python bool is an int subclass, so equality alone would accept JSON true
+    # as schema version 1.  Schema coordinates must retain their JSON type.
+    if (
+        type(candidate_compatibility["schemaVersion"]) is not int
+        or candidate_compatibility["schemaVersion"] != 1
+    ):
+        fail("candidate compatibility schemaVersion must be integer 1")
+    if candidate_compatibility != selected:
+        fail("candidate manifest diverges from the target-selected canonical source")
+    predecessors = selected["predecessors"]
+    for predecessor in predecessors:
+        if predecessor["binarySha256"] == candidate_binary_sha:
+            fail("candidate binarySha256 must differ from every predecessor binarySha256")
+        print(
+            predecessor["releaseTag"],
+            predecessor["manifestSha256"],
+            predecessor["binarySha256"],
+            predecessor["transitionMode"],
+            predecessor["forwardTransferMode"],
+            predecessor["rollbackMode"],
+            predecessor["parityProfile"],
+            sep="\t",
+        )
+else:
+    fail(f"requested unknown validation mode {mode}")
+PY
+}
+
+if [ "${1:-}" = "--normalize-legacy-predecessor" ]; then
+  [ "$#" -eq 6 ] || {
+    usage
+    die "normalization expects expected coordinate, receipt, manifest, archive, and output directory"
+  }
+  normalize_legacy_predecessor "$2" "$3" "$4" "$5" "$6"
+  exit 0
+fi
+
+if [ "${1:-}" = "--compatibility-source" ]; then
+  [ "$#" -ge 3 ] || {
+    usage
+    die "--compatibility-source requires a path and an operation"
+  }
+  COMPATIBILITY_PATH="$2"
+  shift 2
+fi
+
+if [ "$#" -eq 2 ] && [ "$1" = "--compatibility-predecessors" ]; then
+  compatibility_contract predecessors "$2"
+  exit 0
+fi
+
+if [ "$#" -eq 2 ] && [ "$1" = "--compatibility-target" ]; then
+  compatibility_contract canonical "$2"
+  exit 0
+fi
 
 if [ "$#" -ne 3 ]; then
   usage
@@ -59,9 +675,11 @@ trap cleanup EXIT
 
 STAGING_DIR="$TMP_DIR/staging"
 BUILD_JSON="$TMP_DIR/build.json"
+COMPATIBILITY_JSON="$TMP_DIR/compatibility.json"
 mkdir -p "$STAGING_DIR"
 
 cp "$BINARY_PATH" "$STAGING_DIR/$PACKAGED_BINARY_NAME"
+compatibility_contract canonical "$TARGET_TRIPLE" >"$COMPATIBILITY_JSON"
 
 host_triple() {
   rustc -vV | awk '/^host: / { print $2 }'
@@ -258,7 +876,31 @@ with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as arc
 PY
     ;;
   *.tar.gz)
-    tar czf "$ARCHIVE_PATH" -C "$STAGING_DIR" .
+    python3 - "$STAGING_DIR/$PACKAGED_BINARY_NAME" "$ARCHIVE_PATH" <<'PY'
+import gzip
+import pathlib
+import sys
+import tarfile
+
+binary_path = pathlib.Path(sys.argv[1])
+archive_path = pathlib.Path(sys.argv[2])
+
+with archive_path.open("wb") as output:
+    with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.GNU_FORMAT) as archive:
+            root = tarfile.TarInfo(".")
+            root.type = tarfile.DIRTYPE
+            root.mode = 0o755
+            root.mtime = 0
+            archive.addfile(root)
+
+            binary = tarfile.TarInfo("./flapjack")
+            binary.size = binary_path.stat().st_size
+            binary.mode = 0o755
+            binary.mtime = 0
+            with binary_path.open("rb") as contents:
+                archive.addfile(binary, contents)
+PY
     ;;
   *)
     die "unsupported archive extension for $ARCHIVE_NAME"
@@ -274,20 +916,32 @@ import sys
 print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
 PY
 )"
+BINARY_SHA256="$(
+  python3 - "$STAGING_DIR/$PACKAGED_BINARY_NAME" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)"
 printf '%s  %s\n' "$SHA256" "$ARCHIVE_NAME" >"$CHECKSUM_PATH"
 
-python3 - "$BUILD_JSON" "$TARGET_TRIPLE" "$ARCHIVE_NAME" "$SHA256" "$MANIFEST_PATH" <<'PY'
+python3 - "$BUILD_JSON" "$COMPATIBILITY_JSON" "$TARGET_TRIPLE" "$ARCHIVE_NAME" "$SHA256" "$BINARY_SHA256" "$MANIFEST_PATH" <<'PY'
 import json
 import pathlib
 import sys
 
 build_path = pathlib.Path(sys.argv[1])
-target_triple = sys.argv[2]
-archive_name = sys.argv[3]
-archive_sha256 = sys.argv[4]
-manifest_path = pathlib.Path(sys.argv[5])
+compatibility_path = pathlib.Path(sys.argv[2])
+target_triple = sys.argv[3]
+archive_name = sys.argv[4]
+archive_sha256 = sys.argv[5]
+binary_sha256 = sys.argv[6]
+manifest_path = pathlib.Path(sys.argv[7])
 
 build = json.loads(build_path.read_text())
+compatibility = json.loads(compatibility_path.read_text())
 if build.get("target") != target_triple:
     raise SystemExit(
         f"build.target {build.get('target')!r} does not match target argument {target_triple!r}"
@@ -302,12 +956,14 @@ artifact = {
     "target": target_triple,
     "arch": target_triple.split("-", 1)[0],
     "profile": build["profile"],
+    "binarySha256": binary_sha256,
     "sha256": archive_sha256,
 }
 manifest = {
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "artifact": artifact,
     "build": build,
+    "compatibility": compatibility,
 }
 
 serialized = json.dumps(manifest, sort_keys=True, separators=(",", ":"))

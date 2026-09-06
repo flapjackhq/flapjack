@@ -1,6 +1,5 @@
 //! Stub summary for engine/flapjack-http/src/usage_capture.rs.
 use crate::usage_persistence::CapturedUsageGauges;
-use dashmap::DashMap;
 use std::collections::HashMap;
 
 #[derive(Clone, Copy)]
@@ -25,33 +24,29 @@ impl UsageGaugeSelection {
     }
 }
 
-/// Capture current live gauge values for all loaded indexes.
+/// Capture current gauge values from one whole cached generation.
 ///
-/// Document counts come from successful `tenant_doc_count` reads. A filtered
-/// per-index request first loads an existing durable tenant so a server restart
-/// does not turn a real index into an absent gauge; missing tenants are never
-/// created. Unfiltered capture remains bounded to already loaded tenants.
-/// Storage bytes come from the background metrics cache (`storage_gauges`).
-/// Missing storage remains `None`; explicit `0` remains `Some(0)`.
-/// No manager-wide storage or directory walk is performed.
+/// Missing values remain `None`; explicit zero remains `Some(0)`. This path
+/// never loads an index or scans storage.
 pub(crate) fn capture_live_gauges(
-    manager: &flapjack::IndexManager,
-    storage_gauges: Option<&DashMap<String, u64>>,
+    metrics_state: Option<&crate::handlers::metrics::MetricsState>,
 ) -> HashMap<String, CapturedUsageGauges> {
-    capture_requested_live_gauges(manager, storage_gauges, UsageGaugeSelection::both(), None)
+    capture_requested_live_gauges(metrics_state, UsageGaugeSelection::both(), None)
 }
 
 /// Capture only the requested gauge dimensions, optionally for one index.
 pub(crate) fn capture_requested_live_gauges(
-    manager: &flapjack::IndexManager,
-    storage_gauges: Option<&DashMap<String, u64>>,
+    metrics_state: Option<&crate::handlers::metrics::MetricsState>,
     selection: UsageGaugeSelection,
     index_filter: Option<&str>,
 ) -> HashMap<String, CapturedUsageGauges> {
+    let snapshot = metrics_state
+        .map(|metrics_state| metrics_state.index_gauge_snapshot())
+        .unwrap_or_default();
     capture_requested_from_sources(
         selection,
-        |captured| capture_document_counts(manager, index_filter, captured),
-        |captured| capture_storage_bytes(storage_gauges, index_filter, captured),
+        |captured| capture_document_counts(&snapshot, index_filter, captured),
+        |captured| capture_storage_bytes(&snapshot, index_filter, captured),
     )
 }
 
@@ -77,25 +72,29 @@ where
 
 /// TODO: Document capture_document_counts.
 fn capture_document_counts(
-    manager: &flapjack::IndexManager,
+    snapshot: &crate::handlers::metrics::IndexGaugeSnapshot,
     index_filter: Option<&str>,
     captured: &mut HashMap<String, CapturedUsageGauges>,
 ) {
     match index_filter {
         Some(index_name) => {
-            if manager.get_or_load(index_name).is_ok() {
-                if let Some(value) = manager.tenant_doc_count(index_name) {
-                    captured
-                        .entry(index_name.to_string())
-                        .or_default()
-                        .documents_count = Some(value);
-                }
+            if let Some(value) = snapshot
+                .get(index_name)
+                .and_then(|gauges| gauges.documents_count)
+            {
+                captured
+                    .entry(index_name.to_string())
+                    .or_default()
+                    .documents_count = Some(value);
             }
         }
         None => {
-            for index_name in manager.loaded_tenant_ids() {
-                if let Some(value) = manager.tenant_doc_count(&index_name) {
-                    captured.entry(index_name).or_default().documents_count = Some(value);
+            for (index_name, gauges) in snapshot {
+                if let Some(value) = gauges.documents_count {
+                    captured
+                        .entry(index_name.clone())
+                        .or_default()
+                        .documents_count = Some(value);
                 }
             }
         }
@@ -104,15 +103,16 @@ fn capture_document_counts(
 
 /// TODO: Document capture_storage_bytes.
 fn capture_storage_bytes(
-    storage_gauges: Option<&DashMap<String, u64>>,
+    snapshot: &crate::handlers::metrics::IndexGaugeSnapshot,
     index_filter: Option<&str>,
     captured: &mut HashMap<String, CapturedUsageGauges>,
 ) {
     match index_filter {
         Some(index_name) => {
-            let value = storage_gauges
-                .and_then(|gauges| gauges.get(index_name).map(|entry| *entry.value()));
-            if let Some(value) = value {
+            if let Some(value) = snapshot
+                .get(index_name)
+                .and_then(|gauges| gauges.storage_bytes)
+            {
                 captured
                     .entry(index_name.to_string())
                     .or_default()
@@ -120,12 +120,12 @@ fn capture_storage_bytes(
             }
         }
         None => {
-            if let Some(gauges) = storage_gauges {
-                for entry in gauges.iter() {
+            for (index_name, gauges) in snapshot {
+                if let Some(value) = gauges.storage_bytes {
                     captured
-                        .entry(entry.key().clone())
+                        .entry(index_name.clone())
                         .or_default()
-                        .storage_bytes = Some(*entry.value());
+                        .storage_bytes = Some(value);
                 }
             }
         }
@@ -208,46 +208,45 @@ mod tests {
     /// The single-index fast path must produce the exact same gauge values as
     /// filtering the full-tenant capture to that index, across loaded/unloaded,
     /// present/absent storage, and explicit-zero cases.
-    #[tokio::test]
-    async fn single_index_capture_matches_full_walk() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
-        let manager = &state.manager;
-        let gauges = state.metrics_state.as_ref().unwrap().storage_gauges.clone();
-        gauges.clear();
+    #[test]
+    fn single_index_capture_matches_full_snapshot_filter() {
+        let metrics_state = crate::handlers::metrics::MetricsState::new();
+        metrics_state.replace_index_gauges(std::collections::BTreeMap::from([
+            (
+                "products".to_string(),
+                crate::handlers::metrics::IndexGaugeValues {
+                    documents_count: Some(3),
+                    storage_bytes: Some(12_345),
+                },
+            ),
+            (
+                "empty".to_string(),
+                crate::handlers::metrics::IndexGaugeValues {
+                    documents_count: Some(0),
+                    storage_bytes: Some(0),
+                },
+            ),
+            (
+                "docs_only".to_string(),
+                crate::handlers::metrics::IndexGaugeValues {
+                    documents_count: Some(0),
+                    storage_bytes: None,
+                },
+            ),
+            (
+                "storage_only".to_string(),
+                crate::handlers::metrics::IndexGaugeValues {
+                    documents_count: None,
+                    storage_bytes: Some(4_096),
+                },
+            ),
+        ]));
 
-        // "products": 3 live docs, 12_345 storage bytes.
-        manager.create_tenant("products").unwrap();
-        manager
-            .add_documents_sync(
-                "products",
-                (0..3u64)
-                    .map(|i| flapjack::types::Document {
-                        id: format!("products_{i}"),
-                        fields: std::collections::HashMap::new(),
-                    })
-                    .collect(),
-            )
-            .await
-            .unwrap();
-        gauges.insert("products".to_string(), 12_345);
-
-        // "empty": 0 live docs, explicit 0 storage bytes.
-        manager.create_tenant("empty").unwrap();
-        gauges.insert("empty".to_string(), 0);
-
-        // "docs_only": loaded (0 docs), no storage gauge.
-        manager.create_tenant("docs_only").unwrap();
-
-        // "storage_only": not loaded, storage gauge present.
-        gauges.insert("storage_only".to_string(), 4_096);
-
-        let full = capture_live_gauges(manager, Some(&gauges));
+        let full = capture_live_gauges(Some(&metrics_state));
 
         for index in ["products", "empty", "docs_only", "storage_only", "unknown"] {
             let single = capture_requested_live_gauges(
-                manager,
-                Some(&gauges),
+                Some(&metrics_state),
                 UsageGaugeSelection::both(),
                 Some(index),
             );
@@ -263,8 +262,7 @@ mod tests {
         // being wrong in the same way.
         let capture_index = |index_name| {
             capture_requested_live_gauges(
-                manager,
-                Some(&gauges),
+                Some(&metrics_state),
                 UsageGaugeSelection::both(),
                 Some(index_name),
             )
@@ -292,17 +290,13 @@ mod tests {
         let unknown = capture_index("unknown");
         assert_eq!(unknown, CapturedUsageGauges::default());
 
-        // Absent metrics state yields no storage, matching the full-walk contract.
-        let no_storage = capture_requested_live_gauges(
-            manager,
-            None,
-            UsageGaugeSelection::both(),
-            Some("products"),
-        )
-        .get("products")
-        .copied()
-        .unwrap_or_default();
-        assert_eq!(no_storage.documents_count, Some(3));
+        // Absent metrics state yields no request-time recovery or scan.
+        let no_storage =
+            capture_requested_live_gauges(None, UsageGaugeSelection::both(), Some("products"))
+                .get("products")
+                .copied()
+                .unwrap_or_default();
+        assert_eq!(no_storage.documents_count, None);
         assert_eq!(no_storage.storage_bytes, None);
     }
 }

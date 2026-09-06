@@ -25,6 +25,104 @@ use std::collections::{BTreeMap, HashMap};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+#[tokio::test]
+async fn release_fence_keeps_search_available_without_analytics_persistence() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_basic_search_state(&tmp);
+    state.manager.create_tenant("fenced-search").unwrap();
+    state
+        .global_mutation_fence
+        .acquire("search-read-1")
+        .await
+        .unwrap();
+
+    let config = AnalyticsConfig {
+        enabled: true,
+        data_dir: tmp.path().join("fenced-analytics"),
+        flush_interval_secs: 3600,
+        flush_size: 1,
+        retention_days: 90,
+    };
+    let collector = AnalyticsCollector::new(config.clone());
+    let event = flapjack::analytics::schema::SearchEvent {
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        query: "available read".to_string(),
+        query_id: Some("fenced-search-qid".to_string()),
+        index_name: "fenced-search".to_string(),
+        nb_hits: 0,
+        processing_time_ms: 1,
+        user_token: None,
+        user_ip: None,
+        filters: None,
+        facets: None,
+        analytics_tags: None,
+        page: 0,
+        hits_per_page: 20,
+        has_results: false,
+        country: None,
+        region: None,
+        experiment_id: None,
+        variant_id: None,
+        assignment_method: None,
+    };
+    let recorded =
+        super::response::record_search_analytics_if_admitted(&state, &collector, event.clone());
+    assert!(!recorded);
+    assert!(!config.searches_dir("fenced-search").exists());
+
+    let response = search_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/1/indexes/fenced-search/query")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":"available"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    state
+        .global_mutation_fence
+        .release("search-read-1")
+        .await
+        .unwrap();
+    assert!(super::response::record_search_analytics_if_admitted(
+        &state, &collector, event,
+    ));
+    assert!(config.searches_dir("fenced-search").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_analytics_permit_is_held_through_the_synchronous_flush() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_basic_search_state(&tmp);
+    let worker_state = Arc::clone(&state);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+    let effect = tokio::task::spawn_blocking(move || {
+        super::response::run_search_analytics_if_admitted(&worker_state, || {
+            entered_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+        })
+    });
+    entered_rx.recv().unwrap();
+
+    let fence = state.global_mutation_fence.clone();
+    let mut acquire = tokio::spawn(async move { fence.acquire("search-flush-race-1").await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut acquire)
+            .await
+            .is_err(),
+        "fence acquisition must wait until synchronous analytics persistence finishes"
+    );
+
+    finish_tx.send(()).unwrap();
+    assert!(effect.await.unwrap());
+    acquire.await.unwrap().unwrap();
+}
+
 #[cfg(feature = "vector-search")]
 use axum::extract::State;
 

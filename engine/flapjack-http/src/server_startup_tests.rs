@@ -245,3 +245,19 @@ fn ssl_renewal_starts_only_after_http_listener_is_bound() {
         "HTTP-01 must be reachable before immediate SSL renewal starts"
     );
 }
+
+#[tokio::test]
+async fn startup_persistence_mode_is_derived_from_the_opened_persisted_fence() {
+    let temp = TempDir::new().unwrap();
+    let fence = crate::pause_registry::GlobalMutationFence::open(temp.path()).unwrap();
+    assert_eq!(
+        startup_persistence_mode(&fence).await,
+        crate::startup::StartupPersistenceMode::Ordinary
+    );
+
+    fence.acquire("release-startup-mode-test").await.unwrap();
+    assert_eq!(
+        startup_persistence_mode(&fence).await,
+        crate::startup::StartupPersistenceMode::FenceActive
+    );
+}
