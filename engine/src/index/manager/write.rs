@@ -509,7 +509,7 @@ impl super::IndexManager {
         Ok(task)
     }
 
-    fn admission_epoch_error(
+    pub(super) fn admission_epoch_error(
         tenant_id: &str,
         error: publication::PublicationEpochAdmissionError,
     ) -> FlapjackError {

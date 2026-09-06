@@ -256,11 +256,25 @@ fn bayesian_prob_is_between_0_and_1() {
 #[test]
 fn sample_size_baseline_0_12_mde_0_05_power_80_alpha_05() {
     let est = required_sample_size(0.12, 0.05, 0.05, 0.80, 0.5);
-    assert!(
-        est.per_arm > 40_000 && est.per_arm < 65_000,
-        "per_arm={}",
-        est.per_arm
-    );
+    assert_eq!(est.per_arm, 47_045);
+    assert_eq!(est.total, 94_090);
+}
+
+#[test]
+fn sample_size_invalid_probability_inputs_fail_closed() {
+    for (baseline, mde, alpha, power, split) in [
+        (1.0, 0.05, 0.05, 0.80, 0.5),
+        (0.99, 0.05, 0.05, 0.80, 0.5),
+        (f64::NAN, 0.05, 0.05, 0.80, 0.5),
+        (0.12, f64::INFINITY, 0.05, 0.80, 0.5),
+        (0.12, 0.05, 0.0, 0.80, 0.5),
+        (0.12, 0.05, 0.05, 1.0, 0.5),
+        (0.12, 0.05, 0.05, 0.80, 0.0),
+    ] {
+        let estimate = required_sample_size(baseline, mde, alpha, power, split);
+        assert_eq!(estimate.per_arm, u64::MAX);
+        assert_eq!(estimate.total, u64::MAX);
+    }
 }
 
 #[test]

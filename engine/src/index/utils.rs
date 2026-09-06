@@ -7,6 +7,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static ATOMIC_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
+/// Return a recursively key-sorted JSON value for stable semantic hashing.
+///
+/// Array order and scalar representation remain significant; object insertion
+/// order does not. Callers that persist or compare digests share this owner so
+/// retries cannot disagree merely because a `HashMap` serialized differently.
+pub(crate) fn canonicalize_json_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_unstable_by_key(|(key, _)| *key);
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), canonicalize_json_value(value)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonicalize_json_value).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
 pub(crate) fn is_temporary_entry(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;

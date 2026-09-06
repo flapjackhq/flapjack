@@ -7,9 +7,9 @@
 
 use axum::http::Method;
 
-pub(crate) const MOUNTED_INTERNAL_ROUTE_COUNT: usize = 18;
+pub(crate) const MOUNTED_INTERNAL_ROUTE_COUNT: usize = 28;
 pub(crate) const PEER_ALLOWED_ROUTE_COUNT: usize = 8;
-pub(crate) const ADMIN_ONLY_ROUTE_COUNT: usize = 10;
+pub(crate) const ADMIN_ONLY_ROUTE_COUNT: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InternalRouteTier {
@@ -106,6 +106,23 @@ pub(crate) const INTERNAL_ROUTE_CONTRACT: &[InternalRouteRow] = &[
         rationale: "re-shapes runtime membership and can persist attacker-chosen origins",
     },
     InternalRouteRow {
+        method: Method::GET,
+        mounted_pattern: "/internal/build-info",
+        specimen_path: "/internal/build-info",
+        tier: InternalRouteTier::AdminOnly,
+        high_risk_mutation: false,
+        rationale:
+            "exact build provenance is an operator attestation surface, not peer or public data",
+    },
+    InternalRouteRow {
+        method: Method::POST,
+        mounted_pattern: "/internal/indexes/:indexName/count",
+        specimen_path: "/internal/indexes/baseline_index/count",
+        tier: InternalRouteTier::AdminOnly,
+        high_risk_mutation: false,
+        rationale: "cross-tenant operational probe; no replication transport requires it",
+    },
+    InternalRouteRow {
         method: Method::DELETE,
         mounted_pattern: "/internal/cluster/peers/:node_id",
         specimen_path: "/internal/cluster/peers/bogus-peer",
@@ -138,6 +155,30 @@ pub(crate) const INTERNAL_ROUTE_CONTRACT: &[InternalRouteRow] = &[
         rationale: "per-index storage inventory; operator surface",
     },
     InternalRouteRow {
+        method: Method::GET,
+        mounted_pattern: "/internal/release-write-fence/status",
+        specimen_path: "/internal/release-write-fence/status",
+        tier: InternalRouteTier::AdminOnly,
+        high_risk_mutation: false,
+        rationale: "operator-only status for the release write fence",
+    },
+    InternalRouteRow {
+        method: Method::POST,
+        mounted_pattern: "/internal/release-write-fence/acquire",
+        specimen_path: "/internal/release-write-fence/acquire",
+        tier: InternalRouteTier::AdminOnly,
+        high_risk_mutation: false,
+        rationale: "write-fence acquisition is operator-only authority",
+    },
+    InternalRouteRow {
+        method: Method::POST,
+        mounted_pattern: "/internal/release-write-fence/release",
+        specimen_path: "/internal/release-write-fence/release",
+        tier: InternalRouteTier::AdminOnly,
+        high_risk_mutation: false,
+        rationale: "write-fence release is operator-only authority",
+    },
+    InternalRouteRow {
         method: Method::POST,
         mounted_pattern: "/internal/pause/:indexName",
         specimen_path: "/internal/pause/baseline_index",
@@ -160,6 +201,47 @@ pub(crate) const INTERNAL_ROUTE_CONTRACT: &[InternalRouteRow] = &[
         tier: InternalRouteTier::AdminOnly,
         high_risk_mutation: true,
         rationale: "issues a new administrative credential; the worst peer escalation",
+    },
+    InternalRouteRow {
+        method: Method::POST,
+        mounted_pattern: "/internal/crawler/runs",
+        specimen_path: "/internal/crawler/runs",
+        tier: InternalRouteTier::AdminOnly,
+        high_risk_mutation: false,
+        rationale: "PBV4 crawler start is node-admin-only and remains hidden until runtime proof",
+    },
+    InternalRouteRow {
+        method: Method::GET,
+        mounted_pattern: "/internal/crawler/runs/:run_id",
+        specimen_path: "/internal/crawler/runs/018f3e2a-7b1c-7d45-8c90-1234567890ab",
+        tier: InternalRouteTier::AdminOnly,
+        high_risk_mutation: false,
+        rationale:
+            "durable crawler outcome may expose physical publication facts only to node admin",
+    },
+    InternalRouteRow {
+        method: Method::POST,
+        mounted_pattern: "/internal/crawler/runs/:run_id/cancel",
+        specimen_path: "/internal/crawler/runs/018f3e2a-7b1c-7d45-8c90-1234567890ab/cancel",
+        tier: InternalRouteTier::AdminOnly,
+        high_risk_mutation: false,
+        rationale: "crawler cancellation controls server work and publication eligibility",
+    },
+    InternalRouteRow {
+        method: Method::POST,
+        mounted_pattern: "/internal/crawler/runs/:run_id/ack",
+        specimen_path: "/internal/crawler/runs/018f3e2a-7b1c-7d45-8c90-1234567890ab/ack",
+        tier: InternalRouteTier::AdminOnly,
+        high_risk_mutation: false,
+        rationale: "crawler acknowledgement changes durable replay-retention state",
+    },
+    InternalRouteRow {
+        method: Method::GET,
+        mounted_pattern: "/internal/recommendations/analytics",
+        specimen_path: "/internal/recommendations/analytics",
+        tier: InternalRouteTier::AdminOnly,
+        high_risk_mutation: false,
+        rationale: "PBV5 recommendation telemetry spans tenant data and remains node-admin-only",
     },
     InternalRouteRow {
         method: Method::GET,

@@ -2,10 +2,13 @@
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_ANALYTICS_RETENTION_DAYS: u32 = 90;
+pub const PBV5_MIN_ANALYTICS_RETENTION_DAYS: u32 = 30;
+pub const PBV5_MAX_ANALYTICS_FLUSH_INTERVAL_SECS: u64 = 10;
 const SEARCHES_DIR_COMPONENT: &str = "searches";
 const EVENTS_DIR_COMPONENT: &str = "events";
 const ROLLUPS_DIR_COMPONENT: &str = "rollups";
 const ROLLUP_MANIFEST_FILE: &str = "manifest.json";
+const INDEX_DELETION_QUARANTINE_COMPONENT: &str = "_fj_index_deletion_quarantine";
 
 /// Configuration for the analytics subsystem, loaded from environment variables.
 #[derive(Debug, Clone)]
@@ -149,6 +152,12 @@ impl AnalyticsConfig {
         Self::target_artifact_paths_in(&self.data_dir, index_name)
     }
 
+    pub(crate) fn index_deletion_quarantine_path(&self, index_name: &str) -> PathBuf {
+        self.data_dir
+            .join(INDEX_DELETION_QUARANTINE_COMPONENT)
+            .join(Self::path_component(index_name))
+    }
+
     pub(crate) fn target_artifact_paths_in(
         data_dir: &Path,
         index_name: &str,
@@ -165,6 +174,31 @@ impl AnalyticsConfig {
             index_root,
         }
     }
+}
+
+/// Validate the analytics part of the coordinator-owned `paid_beta_v5` profile.
+///
+/// The profile owner deliberately calls this pure seam instead of duplicating
+/// analytics lifecycle rules in HTTP startup code.
+pub fn validate_paid_beta_v5_analytics_config(
+    enabled: bool,
+    flush_interval_secs: u64,
+    retention_days: u32,
+) -> Result<(), String> {
+    if !enabled {
+        return Err("paid_beta_v5 requires analytics to be enabled".to_string());
+    }
+    if retention_days < PBV5_MIN_ANALYTICS_RETENTION_DAYS {
+        return Err(format!(
+            "paid_beta_v5 requires analytics retention of at least {PBV5_MIN_ANALYTICS_RETENTION_DAYS} days"
+        ));
+    }
+    if !(1..=PBV5_MAX_ANALYTICS_FLUSH_INTERVAL_SECS).contains(&flush_interval_secs) {
+        return Err(format!(
+            "paid_beta_v5 requires an analytics flush interval from 1 through {PBV5_MAX_ANALYTICS_FLUSH_INTERVAL_SECS} seconds"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -188,6 +222,65 @@ mod tests {
     #[test]
     fn canonical_retention_default_is_90() {
         assert_eq!(DEFAULT_ANALYTICS_RETENTION_DAYS, 90);
+    }
+
+    #[test]
+    fn paid_beta_v5_analytics_config_requires_enabled_thirty_days_and_bounded_flush() {
+        let mut config = AnalyticsConfig::disabled();
+        assert!(validate_paid_beta_v5_analytics_config(
+            config.enabled,
+            config.flush_interval_secs,
+            config.retention_days
+        )
+        .unwrap_err()
+        .contains("enabled"));
+
+        config.enabled = true;
+        config.retention_days = PBV5_MIN_ANALYTICS_RETENTION_DAYS - 1;
+        assert!(validate_paid_beta_v5_analytics_config(
+            config.enabled,
+            config.flush_interval_secs,
+            config.retention_days
+        )
+        .unwrap_err()
+        .contains("at least 30 days"));
+
+        config.retention_days = PBV5_MIN_ANALYTICS_RETENTION_DAYS;
+        assert!(validate_paid_beta_v5_analytics_config(
+            config.enabled,
+            config.flush_interval_secs,
+            config.retention_days
+        )
+        .unwrap_err()
+        .contains("from 1 through 10 seconds"));
+
+        config.flush_interval_secs = 0;
+        assert!(validate_paid_beta_v5_analytics_config(
+            config.enabled,
+            config.flush_interval_secs,
+            config.retention_days
+        )
+        .unwrap_err()
+        .contains("from 1 through 10 seconds"));
+
+        config.flush_interval_secs = PBV5_MAX_ANALYTICS_FLUSH_INTERVAL_SECS;
+        assert_eq!(
+            validate_paid_beta_v5_analytics_config(
+                config.enabled,
+                config.flush_interval_secs,
+                config.retention_days
+            ),
+            Ok(())
+        );
+        config.retention_days = DEFAULT_ANALYTICS_RETENTION_DAYS;
+        assert_eq!(
+            validate_paid_beta_v5_analytics_config(
+                config.enabled,
+                config.flush_interval_secs,
+                config.retention_days
+            ),
+            Ok(())
+        );
     }
 
     #[test]

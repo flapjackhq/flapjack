@@ -158,8 +158,8 @@ fn dynamic_route_rows_assert_against_concrete_served_paths() {
         }
     }
     assert_eq!(
-        dynamic_rows, 5,
-        "expected 5 dynamic internal patterns (:tenantId, :node_id, :indexName x3)"
+        dynamic_rows, 9,
+        "expected 9 dynamic internal patterns (:tenantId, :node_id, :indexName x4, :run_id x3)"
     );
 }
 

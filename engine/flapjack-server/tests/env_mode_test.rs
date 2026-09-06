@@ -799,6 +799,21 @@ fn auto_port_binds_ephemeral_loopback_and_prints_resolved_addr() {
     );
 }
 
+#[test]
+fn plaintext_server_lifetime_is_not_bounded_by_shutdown_timeout() {
+    let tmp = TempDir::new(&format!("fj_test_plaintext_lifetime_{}", unique_suffix()));
+    let server = RunningServer::spawn_no_auth_auto_port_with_env(
+        tmp.path(),
+        &[("FLAPJACK_SHUTDOWN_TIMEOUT_SECS", "1")],
+    );
+
+    std::thread::sleep(Duration::from_millis(1_200));
+
+    let health = http_request(server.bind_addr(), "GET", "/health", None)
+        .expect("plaintext server should remain reachable until a shutdown signal arrives");
+    assert_eq!(health.status, 200, "expected /health after timeout window");
+}
+
 /// Verify that `--auto-port` ignores both `FLAPJACK_BIND_ADDR` and `FLAPJACK_PORT` env vars, binding to an ephemeral loopback port instead.
 #[test]
 fn auto_port_overrides_env_bind_addr_and_port() {

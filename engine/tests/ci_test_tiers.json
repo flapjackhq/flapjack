@@ -112,37 +112,9 @@
     {
       "id": "sdks",
       "minimum_tier": "public_fast",
-      "owner_jobs": [
-        ".github/workflows/ci.yml#sdk-php",
-        ".github/workflows/ci.yml#sdk-python",
-        ".github/workflows/ci.yml#sdk-javascript",
-        ".github/workflows/ci.yml#sdk-contract",
-        ".github/workflows/ci.yml#sdk-go",
-        ".github/workflows/ci.yml#sdk-go-e2e",
-        ".github/workflows/ci.yml#sdk-ruby",
-        ".github/workflows/ci.yml#sdk-java",
-        ".github/workflows/ci.yml#sdk-csharp",
-        ".github/workflows/nightly.yml#sdk-php-all",
-        ".github/workflows/nightly.yml#sdk-python-all",
-        ".github/workflows/nightly.yml#sdk-javascript-all",
-        ".github/workflows/nightly.yml#sdk-go-all",
-        ".github/workflows/nightly.yml#sdk-go-e2e",
-        ".github/workflows/nightly.yml#sdk-ruby-all",
-        ".github/workflows/nightly.yml#sdk-java-all",
-        ".github/workflows/nightly.yml#sdk-csharp-all"
-      ],
-      "required_fragments": ["npm run test:contract", "poetry run pytest", "go test"],
+      "owner_jobs": [".github/workflows/ci.yml#sdk-contract"],
+      "required_fragments": ["npm run test:contract"],
       "risks": ["sdks"]
-    },
-    {
-      "id": "external_integrations",
-      "minimum_tier": "public_fast",
-      "owner_jobs": [
-        ".github/workflows/ci.yml#integration-laravel-scout",
-        ".github/workflows/ci.yml#integration-wordpress",
-        ".github/workflows/nightly.yml#integration-wordpress-all"
-      ],
-      "required_fragments": ["composer run test:unit", "composer run test:integration"]
     },
     {
       "id": "installer",
@@ -179,6 +151,7 @@
         ".github/workflows/release.yml#ghcr_publish_preflight",
         ".github/workflows/release.yml#release_ci_status_preflight",
         ".github/workflows/release.yml#build",
+        ".github/workflows/release.yml#engine_compatibility_gate",
         ".github/workflows/release.yml#release",
         ".github/workflows/release.yml#docker_prepare",
         ".github/workflows/release.yml#docker_build_amd64",

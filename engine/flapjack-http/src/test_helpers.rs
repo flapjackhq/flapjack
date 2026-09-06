@@ -413,6 +413,10 @@ impl<'tmp> TestStateBuilder<'tmp> {
             usage_persistence: None,
             notification_service: self.notification_service,
             paused_indexes: crate::pause_registry::PausedIndexes::new(),
+            global_mutation_fence: crate::pause_registry::GlobalMutationFence::open(
+                self.tmp.path(),
+            )
+            .unwrap(),
             geoip_reader: self.geoip_reader,
             migration_runner,
             bulk_replace_max_bytes: self.bulk_replace_max_bytes,

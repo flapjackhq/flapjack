@@ -8,8 +8,9 @@ use axum::{
 use std::net::IpAddr;
 
 use crate::api_profile::{
-    is_paid_beta_v3_customer_path, ApiProfile, PaidBetaV1CustomerRequest,
-    PaidBetaV3CustomerRequest, PAID_BETA_V1_APPLICATION_ID, PAID_BETA_V1_DIRECT_SEARCH_PATH,
+    is_paid_beta_v3_customer_path, is_paid_beta_v4_customer_path, is_paid_beta_v5_customer_path,
+    ApiProfile, PaidBetaV1CustomerRequest, PaidBetaV3CustomerRequest, PaidBetaV4CustomerRequest,
+    PaidBetaV5CustomerRequest, PAID_BETA_V1_APPLICATION_ID, PAID_BETA_V1_DIRECT_SEARCH_PATH,
 };
 use crate::error_response::json_error;
 use crate::security_audit::{self, Actor, AuditPath, Target};
@@ -20,9 +21,9 @@ use super::session_cookie::presented_session_token;
 use super::{
     api_key_restrict_sources_match, canonical_request_credential, invalid_api_credentials_error,
     key_allows_index, referer_matches, required_acl_for_route, restrict_sources_match,
-    validate_secured_key, ApiKey, AuthenticatedAppId, CanonicalRequestCredential, KeyStore,
-    RateLimiter, ReplicationPeerCredential, SecuredKeyRestrictions,
-    REPLICATION_PEER_APPLICATION_ID,
+    validate_secured_key, ApiKey, AuthenticatedAdminKey, AuthenticatedAppId,
+    CanonicalRequestCredential, KeyStore, RateLimiter, ReplicationPeerCredential,
+    SecuredKeyRestrictions, REPLICATION_PEER_APPLICATION_ID,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,6 +380,9 @@ pub async fn authenticate_and_authorize(
         .get::<ApiProfile>()
         .copied()
         .unwrap_or_default();
+    let concealed_crawler_route =
+        matches!(api_profile, ApiProfile::PaidBetaV4 | ApiProfile::PaidBetaV5)
+            && crate::handlers::crawler::is_pbv4_crawler_path(&path);
 
     match route_exposure(&path, disable_dashboard) {
         RouteExposure::Public => return Ok(next.run(request).await),
@@ -398,6 +402,12 @@ pub async fn authenticate_and_authorize(
         ApiProfile::PaidBetaV1 => path == PAID_BETA_V1_DIRECT_SEARCH_PATH,
         ApiProfile::PaidBetaV3 => {
             request.method() == Method::POST && is_paid_beta_v3_customer_path(&path)
+        }
+        ApiProfile::PaidBetaV4 => {
+            request.method() == Method::POST && is_paid_beta_v4_customer_path(&path)
+        }
+        ApiProfile::PaidBetaV5 => {
+            request.method() == Method::POST && is_paid_beta_v5_customer_path(&path)
         }
         ApiProfile::Full => true,
     };
@@ -427,6 +437,14 @@ pub async fn authenticate_and_authorize(
         .get::<std::sync::Arc<DashboardSessionStore>>()
         .zip(presented_session_token(&request))
         .is_some_and(|(store, token)| store.validate_session(&token));
+    if concealed_crawler_route
+        && !standard_api_key
+            .as_deref()
+            .is_some_and(|key| key_store.is_admin(key))
+    {
+        log_auth_failure(&path, "direct", "crawler_node_admin_header_required");
+        return Err(StatusCode::NOT_FOUND.into_response());
+    }
 
     if !customer_path_is_visible {
         let admin_request = standard_api_key
@@ -474,6 +492,24 @@ pub async fn authenticate_and_authorize(
         && !standard_api_key
             .as_deref()
             .is_some_and(|key| key_store.is_admin(key));
+    let pbv4_customer_route = api_profile == ApiProfile::PaidBetaV4
+        && request.method() == Method::POST
+        && is_paid_beta_v4_customer_path(&path)
+        && !session_is_valid
+        && !standard_api_key
+            .as_deref()
+            .is_some_and(|key| key_store.is_admin(key));
+    // PBV5 fixes the application ID for every customer request, including
+    // trusted dashboard sessions. Keep that path fact separate from the
+    // narrower non-admin customer-key classification used below.
+    let pbv5_customer_path = api_profile == ApiProfile::PaidBetaV5
+        && request.method() == Method::POST
+        && is_paid_beta_v5_customer_path(&path);
+    let pbv5_customer_route = pbv5_customer_path
+        && !session_is_valid
+        && !standard_api_key
+            .as_deref()
+            .is_some_and(|key| key_store.is_admin(key));
     let presented_key = if pbv1_customer_route {
         extract_bearer_api_key(&request)
     } else {
@@ -495,6 +531,10 @@ pub async fn authenticate_and_authorize(
         Some(id) => id,
         // Allow admin-key-only metrics scraping for metering agents.
         None if path == "/metrics" && key_store.is_admin(&api_key_value) => String::new(),
+        None if concealed_crawler_route => {
+            log_auth_failure(&path, "missing", "application_id_missing");
+            return Err(StatusCode::NOT_FOUND.into_response());
+        }
         None => {
             log_auth_failure(
                 &path,
@@ -505,7 +545,13 @@ pub async fn authenticate_and_authorize(
         }
     };
 
-    if (pbv1_customer_route || pbv3_customer_route) && application_id != PAID_BETA_V1_APPLICATION_ID
+    if concealed_crawler_route && application_id != PAID_BETA_V1_APPLICATION_ID {
+        log_auth_failure(&path, "direct", "application_id_invalid");
+        return Err(StatusCode::NOT_FOUND.into_response());
+    }
+
+    if (pbv1_customer_route || pbv3_customer_route || pbv4_customer_route || pbv5_customer_path)
+        && application_id != PAID_BETA_V1_APPLICATION_ID
     {
         log_auth_failure(&path, "direct", "application_id_invalid");
         return Err(invalid_api_credentials_error());
@@ -547,13 +593,15 @@ pub async fn authenticate_and_authorize(
             return Err(invalid_api_credentials_error());
         }
     };
-    if (pbv1_customer_route || pbv3_customer_route) && secured_restrictions.is_some() {
+    if (pbv1_customer_route || pbv3_customer_route || pbv4_customer_route)
+        && secured_restrictions.is_some()
+    {
         return Err(invalid_api_credentials_error());
     }
     if let Some(response) = ensure_key_is_not_expired(&api_key) {
         return Err(response);
     }
-    let authorization_acl = if pbv1_customer_route || pbv3_customer_route {
+    let authorization_acl = if pbv1_customer_route || pbv3_customer_route || pbv4_customer_route {
         RouteAcl::Required("search")
     } else {
         route_acl
@@ -568,7 +616,7 @@ pub async fn authenticate_and_authorize(
     ) {
         return Err(response);
     }
-    if pbv3_customer_route {
+    if pbv3_customer_route || pbv4_customer_route {
         let exact_managed_search_scope = api_key.acl.len() == 2
             && api_key.acl.iter().any(|acl| acl == "search")
             && api_key.acl.iter().any(|acl| acl == "browse")
@@ -612,11 +660,20 @@ pub async fn authenticate_and_authorize(
         .extensions_mut()
         .insert(AuthenticatedAppId(application_id));
     request.extensions_mut().insert(api_key);
+    if key_store.is_admin(&api_key_value) {
+        request.extensions_mut().insert(AuthenticatedAdminKey);
+    }
     if pbv1_customer_route {
         request.extensions_mut().insert(PaidBetaV1CustomerRequest);
     }
     if pbv3_customer_route {
         request.extensions_mut().insert(PaidBetaV3CustomerRequest);
+    }
+    if pbv4_customer_route {
+        request.extensions_mut().insert(PaidBetaV4CustomerRequest);
+    }
+    if pbv5_customer_route {
+        request.extensions_mut().insert(PaidBetaV5CustomerRequest);
     }
     if let Some(restrictions) = secured_restrictions {
         request.extensions_mut().insert(restrictions);

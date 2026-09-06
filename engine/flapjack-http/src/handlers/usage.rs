@@ -232,14 +232,9 @@ fn live_gauge_values(
     stats: &[&str],
     index_filter: Option<&str>,
 ) -> CapturedUsageGauges {
-    let storage_gauges = state
-        .metrics_state
-        .as_ref()
-        .map(|ms| ms.storage_gauges.as_ref());
     let selection = crate::usage_capture::UsageGaugeSelection::from_statistics(stats);
     let captured = crate::usage_capture::capture_requested_live_gauges(
-        &state.manager,
-        storage_gauges,
+        state.metrics_state.as_ref(),
         selection,
         index_filter,
     );

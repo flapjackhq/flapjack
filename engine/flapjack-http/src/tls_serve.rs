@@ -529,6 +529,8 @@ where
     B::Error: Into<BoxError>,
     Shutdown: Future<Output = ()> + Send + 'static,
 {
+    let graceful_connection_drain_timeout =
+        Duration::from_secs(crate::startup::shutdown_timeout_secs_from_env());
     let acceptor = TlsAcceptor::from(tls_config);
     let graceful = GracefulShutdown::new();
     let (handshake_shutdown_tx, _) = watch::channel(false);
@@ -600,8 +602,26 @@ where
             None => {}
         }
     }
-    graceful.shutdown().await;
+    await_graceful_connection_drain(graceful.shutdown(), graceful_connection_drain_timeout).await?;
     Ok(())
+}
+
+async fn await_graceful_connection_drain<Drain>(
+    drain: Drain,
+    timeout: Duration,
+) -> std::io::Result<()>
+where
+    Drain: Future<Output = ()>,
+{
+    tokio::time::timeout(timeout, drain).await.map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "TLS graceful connection drain timed out after {}ms",
+                timeout.as_millis()
+            ),
+        )
+    })
 }
 
 async fn accept_tcp<A: TcpAccept>(
@@ -814,3 +834,32 @@ mod tls_serve_source_tests;
 #[cfg(test)]
 #[path = "tls_serve_tests.rs"]
 mod tls_serve_tests;
+
+#[cfg(test)]
+mod shutdown_deadline_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn graceful_connection_drain_timeout_is_an_explicit_error() {
+        let observed = tokio::time::timeout(
+            Duration::from_millis(100),
+            await_graceful_connection_drain(std::future::pending::<()>(), Duration::from_millis(1)),
+        )
+        .await;
+
+        let error = observed
+            .expect("the configured drain timeout must terminate the wait")
+            .expect_err("a timed-out connection drain must fail the server stop");
+        assert_eq!(
+            error.to_string(),
+            "TLS graceful connection drain timed out after 1ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_connection_drain_preserves_successful_completion() {
+        await_graceful_connection_drain(std::future::ready(()), Duration::from_millis(1))
+            .await
+            .unwrap();
+    }
+}

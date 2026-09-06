@@ -684,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn finalization_applies_version_receipts_before_advancing_committed_seq() {
+    fn replication_origin_proof_finalization_precedes_committed_seq() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let tenant_id = "durable_finalization";
         let tenant_path = temp_dir.path().join(tenant_id);
@@ -702,12 +702,12 @@ mod tests {
                     crate::index::oplog::OpLogOperation::replicated(
                         "upsert",
                         serde_json::json!({"objectID": "doc-a", "body": {"objectID": "doc-a"}}),
-                        crate::index::oplog::OpLogOrigin::new(5000, "node-a"),
+                        crate::index::oplog::OpLogOrigin::new(5000, "node-a").with_origin_seq(50),
                     ),
                     crate::index::oplog::OpLogOperation::replicated(
                         "delete",
                         serde_json::json!({"objectID": "doc-b"}),
-                        crate::index::oplog::OpLogOrigin::new(6000, "node-b"),
+                        crate::index::oplog::OpLogOrigin::new(6000, "node-b").with_origin_seq(60),
                     ),
                 ],
             )
@@ -740,15 +740,25 @@ mod tests {
         let version_store = crate::index::version_store::VersionStore::open(&tenant_path).unwrap();
         assert_eq!(
             version_store.get("doc-a").unwrap(),
-            Some(crate::index::version_store::VersionRecord::new(
-                5000, "node-a", false, 1,
-            ))
+            Some(
+                crate::index::version_store::VersionRecord::new(5000, "node-a", false, 1,)
+                    .with_origin_proof(
+                        50,
+                        crate::index::oplog::upsert_effect_digest(
+                            &crate::types::Document::from_json(
+                                &serde_json::json!({"objectID": "doc-a"}),
+                            )
+                            .unwrap(),
+                        ),
+                    )
+            )
         );
         assert_eq!(
             version_store.get("doc-b").unwrap(),
-            Some(crate::index::version_store::VersionRecord::new(
-                6000, "node-b", true, 2,
-            ))
+            Some(
+                crate::index::version_store::VersionRecord::new(6000, "node-b", true, 2,)
+                    .with_origin_proof(60, crate::index::oplog::delete_effect_digest("doc-b"))
+            )
         );
         assert_eq!(
             crate::index::oplog::read_committed_seq(&tenant_path),

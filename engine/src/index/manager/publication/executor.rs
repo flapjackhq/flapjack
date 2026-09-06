@@ -9,9 +9,10 @@ use super::fsops::reject_symlinked_managed_path_components;
 use super::{
     artifact_policy_table, classify_external_relative_path, invalid_publication,
     read_strict_committed_seq, relative_path_evidence, validate_relative_path, ArtifactDisposition,
-    ContentDigest, ExternalArtifactRoot, PublicationDisposition, PublicationEvent,
-    PublicationFenceEvidence, PublicationGenerationEvidence, PublicationJournal, PublicationPaths,
-    PublicationPhase, PublicationTarget, PublicationTransactionId, Result, TantivyManagedInventory,
+    ContentDigest, CrawlerPublicationAdmission, CrawlerPublicationCompletion, CrawlerRunStore,
+    ExternalArtifactRoot, PublicationDisposition, PublicationEvent, PublicationFenceEvidence,
+    PublicationGenerationEvidence, PublicationJournal, PublicationPaths, PublicationPhase,
+    PublicationTarget, PublicationTransactionId, Result, TantivyManagedInventory,
 };
 use crate::analytics::config::{AnalyticsConfig, AnalyticsTargetArtifactPaths};
 use crate::query_suggestions::config::{QsConfigStore, QsTargetArtifactPaths};
@@ -21,6 +22,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// Filesystem phase reached by a caller-populated publication activation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,8 +44,8 @@ pub struct PreStagedActivationError {
 enum ActivationMode {
     /// Replace any existing target tree, backing it up first so rollback can restore it.
     Replace,
-    /// Publish only into a target name this activation reserved for itself, refusing
-    /// a target that already exists rather than replacing it.
+    /// Publish only into a target name held by the target-scoped publication fence,
+    /// refusing a target that already exists rather than replacing it.
     CreateOnly,
 }
 
@@ -55,6 +57,7 @@ struct ActivationContext<'a> {
     // It lives here alongside the other run-scoped activation state (`io`,
     // `stage`, `mode`) that `activate_publication_inner` threads through.
     fence_evidence: Option<PublicationFenceEvidence>,
+    crawler_admission: Option<CrawlerPublicationAdmission>,
 }
 
 impl PreStagedActivationError {
@@ -81,6 +84,7 @@ pub struct PreStagedPublication {
     target: PublicationTarget,
     transaction_id: PublicationTransactionId,
     generation: PublicationGenerationEvidence,
+    crawler_admission: Option<CrawlerPublicationAdmission>,
 }
 
 /// Remove an unjournaled transaction namespace for recovery code that only has
@@ -122,6 +126,7 @@ impl PreStagedPublication {
             target,
             transaction_id,
             generation,
+            crawler_admission: None,
         })
     }
 
@@ -136,6 +141,44 @@ impl PreStagedPublication {
 
     pub fn generation(&self) -> &PublicationGenerationEvidence {
         &self.generation
+    }
+
+    /// Bind crawler success only after the durable run owner has rechecked
+    /// start/digest/replay/cancel/terminal state under its exclusion lock. The
+    /// guard is held through commit or rollback, and the deadline is rechecked
+    /// immediately before any target effect.
+    pub fn with_crawler_completion(
+        mut self,
+        store: &CrawlerRunStore,
+        completion: CrawlerPublicationCompletion,
+        deadline: Instant,
+    ) -> Result<Self> {
+        if self.crawler_admission.is_some() {
+            return Err(invalid_publication(
+                "crawler completion is already bound to publication",
+            ));
+        }
+        let admission = match store.admit_publication(completion, deadline) {
+            Ok(admission) => admission,
+            Err(error) => {
+                let _ = discard_transaction_namespace(&self.paths);
+                return Err(error);
+            }
+        };
+        let publication_base = self
+            .paths
+            .target
+            .parent()
+            .ok_or_else(|| invalid_publication("publication target has no base"))?;
+        if publication_base != admission.base.as_path() {
+            drop(admission);
+            let _ = discard_transaction_namespace(&self.paths);
+            return Err(invalid_publication(
+                "crawler run store and publication base disagree",
+            ));
+        }
+        self.crawler_admission = Some(admission);
+        Ok(self)
     }
 
     /// Remove only this transaction when no durable journal has been written.
@@ -157,10 +200,11 @@ impl PreStagedPublication {
     /// Activate the validated staging tree only if the target name is still free.
     ///
     /// Unlike [`PreStagedPublication::activate`], this never replaces an existing
-    /// target: it atomically reserves the target name or fails with
+    /// target: it holds the existing target-scoped publication fence or fails with
     /// [`crate::error::FlapjackError::IndexAlreadyExists`], leaving whatever is
-    /// already published there untouched. The reservation excludes concurrent
-    /// create-only activations, so exactly one of them can win a race for a name.
+    /// already published there untouched. The fence lives in the existing
+    /// publication control namespace, so concurrent observers never see an
+    /// empty target and exactly one create-only activation can win a name race.
     pub fn activate_create_only(
         self,
     ) -> std::result::Result<PublicationJournal, PreStagedActivationError> {
@@ -197,8 +241,8 @@ impl PreStagedPublication {
         fence_evidence: Option<PublicationFenceEvidence>,
         io: &PublicationIo<'_>,
     ) -> std::result::Result<PublicationJournal, PreStagedActivationError> {
-        // The inventory is collected before any reservation so it observes the real
-        // trees rather than this activation's own empty reservation directory.
+        // The inventory is collected before the create-only fence because the
+        // fence is outside the target tree and therefore cannot affect its digest.
         let inventory = TantivyManagedInventory::from_existing_trees([
             self.paths.target.as_path(),
             self.paths.staging.as_path(),
@@ -208,17 +252,40 @@ impl PreStagedPublication {
             stage: PreStagedActivationStage::Prepare,
             source,
         })?;
-        if mode == ActivationMode::CreateOnly {
-            if let Err(source) = reserve_publication_target(&self.paths.target, &self.target) {
-                // Losing the name is terminal for this transaction and nothing is
-                // journaled yet, so the staged tree is pure residue.
-                let _ = discard_transaction_namespace(&self.paths);
+        let _create_only_fence = if mode == ActivationMode::CreateOnly {
+            let publication_base =
+                self.paths
+                    .target
+                    .parent()
+                    .ok_or_else(|| PreStagedActivationError {
+                        stage: PreStagedActivationStage::Prepare,
+                        source: invalid_publication("publication target has no base"),
+                    })?;
+            let fence = super::fence_publication_admission(publication_base, &self.target)
+                .map_err(|error| PreStagedActivationError {
+                    stage: PreStagedActivationStage::Prepare,
+                    source: crate::error::FlapjackError::Io(format!(
+                        "create-only publication fence failed: {error}"
+                    )),
+                })?;
+            if self.paths.target.exists() {
+                discard_transaction_namespace(&self.paths).map_err(|source| {
+                    PreStagedActivationError {
+                        stage: PreStagedActivationStage::Prepare,
+                        source,
+                    }
+                })?;
                 return Err(PreStagedActivationError {
                     stage: PreStagedActivationStage::Prepare,
-                    source,
+                    source: crate::error::FlapjackError::IndexAlreadyExists(
+                        self.target.as_str().to_string(),
+                    ),
                 });
             }
-        }
+            Some(fence)
+        } else {
+            None
+        };
         let stage = std::cell::Cell::new(PreStagedActivationStage::Prepare);
         activate_publication_inner(
             PublicationActivationInputs {
@@ -229,11 +296,12 @@ impl PreStagedPublication {
                 manifest: PublicationArtifactManifest::default(),
                 inventory: &inventory,
             },
-            &ActivationContext {
+            ActivationContext {
                 io,
                 stage: &stage,
                 mode,
                 fence_evidence,
+                crawler_admission: self.crawler_admission,
             },
         )
         .map_err(|source| PreStagedActivationError {
@@ -280,11 +348,12 @@ impl PreStagedPublication {
                 manifest: PublicationArtifactManifest::default(),
                 inventory: &inventory,
             },
-            &ActivationContext {
+            ActivationContext {
                 io: &io,
                 stage: &stage,
                 mode: ActivationMode::Replace,
                 fence_evidence: None,
+                crawler_admission: self.crawler_admission,
             },
         )
         .map_err(|source| PreStagedActivationError {
@@ -292,27 +361,23 @@ impl PreStagedPublication {
             source,
         })
     }
-}
 
-/// Atomically claim an unused target name for a create-only activation.
-///
-/// `create_dir` is the exclusion primitive: the filesystem either creates the
-/// directory or reports `AlreadyExists`, so two concurrent activations can never
-/// both believe they own the name. This is why create-only never snapshots
-/// `exists()` — a snapshot can go stale between the check and the promote, while
-/// the reservation cannot.
-///
-/// The reserved directory is deliberately left empty and held until
-/// [`promote_staging`] renames the staged tree onto it, which POSIX `rename`
-/// permits precisely because the destination is an empty directory.
-fn reserve_publication_target(target_path: &Path, target: &PublicationTarget) -> Result<()> {
-    fs::create_dir_all(require_parent(target_path)?)?;
-    match fs::create_dir(target_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(
-            crate::error::FlapjackError::IndexAlreadyExists(target.as_str().to_string()),
-        ),
-        Err(error) => Err(error.into()),
+    #[cfg(test)]
+    pub(crate) fn activate_with_faults_for_test(
+        self,
+        faults: &dyn PublicationFaultHook,
+    ) -> std::result::Result<PublicationJournal, PreStagedActivationError> {
+        let io = PublicationIo::with_faults(faults);
+        self.activate_with_mode_fence_and_io(ActivationMode::Replace, None, &io)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activate_create_only_with_faults_for_test(
+        self,
+        faults: &dyn PublicationFaultHook,
+    ) -> std::result::Result<PublicationJournal, PreStagedActivationError> {
+        let io = PublicationIo::with_faults(faults);
+        self.activate_with_mode_fence_and_io(ActivationMode::CreateOnly, None, &io)
     }
 }
 
@@ -579,11 +644,12 @@ pub fn activate_publication_with_fence(
     let stage = std::cell::Cell::new(PreStagedActivationStage::Prepare);
     activate_publication_inner(
         inputs,
-        &ActivationContext {
+        ActivationContext {
             io: &io,
             stage: &stage,
             mode: ActivationMode::Replace,
             fence_evidence,
+            crawler_admission: None,
         },
     )
 }
@@ -624,11 +690,12 @@ pub(crate) fn activate_publication_with_fence_and_faults_for_test(
     let stage = std::cell::Cell::new(PreStagedActivationStage::Prepare);
     activate_publication_inner(
         inputs,
-        &ActivationContext {
+        ActivationContext {
             io: &io,
             stage: &stage,
             mode: ActivationMode::Replace,
             fence_evidence,
+            crawler_admission: None,
         },
     )
 }
@@ -636,7 +703,7 @@ pub(crate) fn activate_publication_with_fence_and_faults_for_test(
 /// TODO: Document activate_publication_inner.
 fn activate_publication_inner(
     inputs: PublicationActivationInputs<'_>,
-    context: &ActivationContext<'_>,
+    context: ActivationContext<'_>,
 ) -> Result<PublicationJournal> {
     let PublicationActivationInputs {
         paths,
@@ -649,17 +716,16 @@ fn activate_publication_inner(
     let io = context.io;
     let target_existed = match context.mode {
         ActivationMode::Replace => paths.target.exists(),
-        // The caller holds an empty reservation at the target. It is this
-        // transaction's own state, never a prior tree, so it must not be digested,
-        // backed up, or restored as one — and this activation owns releasing it on
-        // every pre-commit failure below.
+        // Create-only holds the target-scoped publication fence outside the visible
+        // tenant namespace and has already proved the target absent. It therefore
+        // has no prior tree to digest, back up, or restore.
         ActivationMode::CreateOnly => false,
     };
     let evidence = prepare_digest_evidence(paths, &mut manifest, inventory, target_existed, io);
     let (prior_digest, digest) = match evidence {
         Ok(evidence) => evidence,
         Err(error) => {
-            cleanup_unprepared_transaction(paths, &manifest, inventory, context)?;
+            cleanup_unprepared_transaction(paths, &manifest, inventory, &context)?;
             return Err(error);
         }
     };
@@ -668,8 +734,14 @@ fn activate_publication_inner(
             verify_staged_committed_seq_watermark(paths, context.fence_evidence.as_ref())
         })
     {
-        cleanup_unprepared_transaction(paths, &manifest, inventory, context)?;
+        cleanup_unprepared_transaction(paths, &manifest, inventory, &context)?;
         return Err(error);
+    }
+    if let Some(admission) = &context.crawler_admission {
+        if let Err(error) = admission.validate_before_target_effects() {
+            cleanup_unprepared_transaction(paths, &manifest, inventory, &context)?;
+            return Err(error);
+        }
     }
     let mut journal =
         PublicationJournal::prepare(transaction_id, target, generation, digest, paths.clone());
@@ -678,13 +750,28 @@ fn activate_publication_inner(
     // persisted; `apply` preserves it through commit, rollback, and quarantine.
     journal.fence_evidence = context.fence_evidence.clone();
     journal.artifact_manifest = manifest.clone();
+    if let Some(admission) = &context.crawler_admission {
+        if let Err(error) = journal.bind_crawler_completion(admission.completion.clone()) {
+            cleanup_unprepared_transaction(paths, &manifest, inventory, &context)?;
+            return Err(error);
+        }
+    }
     let activation_result = (|| {
         io.checkpoint(PublicationFaultPoint::DuringStagingSync)?;
         sync_tree(&paths.staging, io)?;
+        if let Some(admission) = &context.crawler_admission {
+            admission.validate_deadline()?;
+        }
         persist_journal(paths, &journal, JournalWritePhase::Prepare, io)?;
         io.checkpoint(PublicationFaultPoint::AfterPrepareJournal)?;
+        if let Some(admission) = &context.crawler_admission {
+            admission.validate_deadline()?;
+        }
         promote_staging(paths, &manifest, target_existed, io, context.stage)?;
         io.checkpoint(PublicationFaultPoint::BeforeCommitJournal)?;
+        // `apply(Commit)` consumes any pending crawler completion serialized in
+        // the prepared journal. Startup repair calls the same transition, so a
+        // crash after promotion cannot lose the run success fact.
         let committed = journal.clone().apply(PublicationEvent::Commit)?;
         persist_journal(paths, &committed, JournalWritePhase::Commit, io)?;
         Ok(committed)
@@ -693,7 +780,12 @@ fn activate_publication_inner(
         Ok(committed) => {
             let _ = io.checkpoint(PublicationFaultPoint::CommitDurable);
             let _ = io.checkpoint(PublicationFaultPoint::AfterCommitJournal);
-            if context.mode == ActivationMode::Replace {
+            // The success journal is now the atomic run owner. Release the
+            // transition exclusion before compacting older crawler journals;
+            // each compaction takes the same lock for its complete transition.
+            let mode = context.mode;
+            drop(context.crawler_admission);
+            if mode == ActivationMode::Replace {
                 let _ = cleanup_superseded_committed_journals(paths, &committed.target, io);
             }
             let _ = cleanup_publication_residue(paths, io);
@@ -756,6 +848,13 @@ fn cleanup_committed_publication_journals(
             && journal.phase == PublicationPhase::Committed
             && journal.disposition == Some(PublicationDisposition::Committed)
         {
+            if journal.crawler_terminal.is_some() {
+                let base = target_root
+                    .parent()
+                    .and_then(Path::parent)
+                    .ok_or_else(|| invalid_publication("publication target root has no base"))?;
+                super::CrawlerRunStore::new(base).compact_success(&journal)?;
+            }
             io.remove_if_exists(&path)?;
         }
     }
@@ -835,12 +934,6 @@ fn cleanup_unprepared_transaction(
         return Err(invalid_publication(
             "cannot clean up a journaled publication transaction",
         ));
-    }
-    if context.mode == ActivationMode::CreateOnly {
-        // Release the reservation this activation is holding. Gating on the mode
-        // rather than on `target_existed` matters: a replace activation must never
-        // remove a target it does not own, even when it observed none.
-        io.remove_if_exists(&paths.target)?;
     }
     for entry in &manifest.entries {
         if let Some(promoted) = cleanup_candidate_promoted_path(entry) {
@@ -1029,12 +1122,18 @@ fn rollback_activation(
     target_existed: bool,
     io: &PublicationIo<'_>,
 ) -> Result<()> {
+    let staging_was_promoted = !paths.staging.exists();
     io.remove_if_exists(&paths.staging)?;
     if target_existed && paths.backup.exists() {
         io.remove_if_exists(&paths.target)?;
         io.rename(&paths.backup, &paths.target)?;
     } else if !target_existed {
-        io.remove_if_exists(&paths.target)?;
+        // A missing staging tree proves this activation completed the atomic
+        // staging-to-target rename. If staging is still present, a separately
+        // created target won the name and is not ours to remove.
+        if staging_was_promoted {
+            io.remove_if_exists(&paths.target)?;
+        }
         io.remove_if_exists(&paths.backup)?;
     }
     restore_journaled_sidecars(paths, manifest, io)?;

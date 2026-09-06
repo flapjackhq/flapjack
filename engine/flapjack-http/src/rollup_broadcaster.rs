@@ -130,6 +130,34 @@ pub async fn run_rollup_broadcast(
     broadcast_rollups_for_indexes(engine, cluster, node_id, &indexes).await;
 }
 
+async fn run_rollup_broadcast_if_admitted(
+    mutation_fence: &crate::pause_registry::GlobalMutationFence,
+    engine: &AnalyticsQueryEngine,
+    config: &AnalyticsConfig,
+    cluster: &AnalyticsClusterClient,
+    node_id: &str,
+) -> bool {
+    run_rollup_pass_if_admitted(mutation_fence, || async move {
+        run_rollup_broadcast(engine, config, cluster, node_id).await;
+    })
+    .await
+}
+
+async fn run_rollup_pass_if_admitted<Run, RunFuture>(
+    mutation_fence: &crate::pause_registry::GlobalMutationFence,
+    run: Run,
+) -> bool
+where
+    Run: FnOnce() -> RunFuture,
+    RunFuture: std::future::Future<Output = ()>,
+{
+    let Ok(_mutation_permit) = mutation_fence.admit_mutation().await else {
+        return false;
+    };
+    run().await;
+    true
+}
+
 /// Computes and pushes analytics rollups for each index to all replication peers,
 /// enabling cluster-wide analytics aggregation.
 async fn broadcast_rollups_for_indexes(
@@ -167,6 +195,7 @@ pub fn spawn_rollup_broadcaster(
     cluster: Arc<AnalyticsClusterClient>,
     node_id: String,
     interval_secs: u64,
+    mutation_fence: crate::pause_registry::GlobalMutationFence,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
@@ -177,7 +206,20 @@ pub fn spawn_rollup_broadcaster(
 
         loop {
             interval.tick().await;
-            run_rollup_broadcast(&engine, &config, &cluster, &node_id).await;
+            if !run_rollup_broadcast_if_admitted(
+                &mutation_fence,
+                &engine,
+                &config,
+                &cluster,
+                &node_id,
+            )
+            .await
+            {
+                tracing::debug!(
+                    "[ROLLUP-BROADCAST] Release mutation fence active; broadcast skipped"
+                );
+                continue;
+            }
         }
     })
 }
@@ -340,6 +382,81 @@ mod tests {
         // because with no indexes there's nothing to push.
         run_rollup_broadcast(&engine, &config, &cluster, "local").await;
         // If we reach here without panic, the test passes
+    }
+
+    #[tokio::test]
+    async fn active_release_fence_suppresses_the_complete_rollup_broadcast_pass() {
+        use flapjack_replication::config::{NodeConfig, PeerConfig};
+
+        let dir = TempDir::new().unwrap();
+        let data_root = dir.path().join("data");
+        std::fs::create_dir_all(&data_root).unwrap();
+        let fence = crate::pause_registry::GlobalMutationFence::open(&data_root).unwrap();
+        fence.acquire("rollup-release-1").await.unwrap();
+        let config = flapjack::analytics::AnalyticsConfig {
+            enabled: true,
+            data_dir: dir.path().join("analytics"),
+            flush_interval_secs: 3600,
+            flush_size: 100_000,
+            retention_days: 90,
+        };
+        let engine = AnalyticsQueryEngine::new(config.clone());
+        let cluster = AnalyticsClusterClient::new(
+            &NodeConfig {
+                node_id: "local".to_string(),
+                bind_addr: "127.0.0.1:0".to_string(),
+                advertise_addr: None,
+                bootstrap_peer: None,
+                peers: vec![PeerConfig {
+                    node_id: "peer".to_string(),
+                    addr: "http://127.0.0.1:19999".to_string(),
+                }],
+            },
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !run_rollup_broadcast_if_admitted(&fence, &engine, &config, &cluster, "local").await,
+            "a rollup pass must not start after the release fence becomes active"
+        );
+        assert!(
+            include_str!("rollup_broadcaster.rs").contains("if !run_rollup_broadcast_if_admitted("),
+            "the production scheduler must route every cycle through the admission-aware owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_rollup_pass_holds_its_permit_until_the_pass_settles() {
+        let dir = TempDir::new().unwrap();
+        let data_root = dir.path().join("data");
+        std::fs::create_dir_all(&data_root).unwrap();
+        let fence = crate::pause_registry::GlobalMutationFence::open(&data_root).unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let pass_fence = fence.clone();
+        let pass = tokio::spawn(async move {
+            run_rollup_pass_if_admitted(&pass_fence, || async move {
+                started_tx.send(()).unwrap();
+                finish_rx.await.unwrap();
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+
+        let release = {
+            let fence = fence.clone();
+            tokio::spawn(async move { fence.acquire("rollup-release-lifetime-1").await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !release.is_finished(),
+            "release acquisition must remain blocked throughout an admitted rollup pass"
+        );
+
+        finish_tx.send(()).unwrap();
+        assert!(pass.await.unwrap());
+        release.await.unwrap().unwrap();
     }
     /// TODO: Document broadcast_rollups_for_indexes_empty_input_is_noop.
     #[tokio::test]

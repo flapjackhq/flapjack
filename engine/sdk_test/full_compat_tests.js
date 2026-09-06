@@ -3,7 +3,8 @@
 
 SDKs:
 - algoliasearch (JS/TS): Covered by contract_tests.js + full_compat_tests.js + instantsearch_contract_tests.js
-- PHP/Python: Covered by php_smoke_test.sh + python_smoke_test.sh (protocol-level)
+- Python: Official synchronous client proof in python_client_contract_test.sh; separate python_smoke_test.sh (protocol-level)
+- PHP: Covered by php_smoke_test.sh (protocol-level)
 - Ruby/Go/Java/Swift: GAP (planned Stage 2 protocol edge-case verification)
 
 InstantSearch libs:

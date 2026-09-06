@@ -1,0 +1,12 @@
+{
+  "status": "canceled",
+  "schema_version": 1,
+  "run_id": "018f3e2a-7b1c-7d45-8c90-1234567890ab",
+  "counters": {
+    "fetched": 3,
+    "discovered": 8,
+    "transformed": 2,
+    "published": 0
+  },
+  "duration_ms": 417
+}

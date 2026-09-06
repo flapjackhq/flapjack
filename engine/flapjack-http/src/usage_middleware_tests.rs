@@ -325,6 +325,8 @@ fn make_app_state(tmp: &tempfile::TempDir) -> std::sync::Arc<crate::handlers::Ap
         usage_counters: Arc::new(DashMap::new()),
         usage_persistence: None,
         paused_indexes: crate::pause_registry::PausedIndexes::new(),
+        global_mutation_fence: crate::pause_registry::GlobalMutationFence::open(tmp.path())
+            .unwrap(),
         geoip_reader: None,
         notification_service: None,
         migration_runner: std::sync::Arc::new(crate::handlers::migration::MigrationJobRunner::new(

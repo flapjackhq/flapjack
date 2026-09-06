@@ -439,28 +439,44 @@ async fn peer_credential_is_refused_on_administrative_mutations() {
     }
 }
 
-/// The three high-risk mutations are necessary but not sufficient: a peer
-/// credential also must not reach admin-only read diagnostics or fault routes.
+/// The three high-risk mutations are necessary but not sufficient: missing,
+/// search-only, and peer credentials also must not reach any admin-only route.
 #[tokio::test]
-async fn peer_credential_is_refused_on_every_admin_only_internal_route() {
+async fn non_admin_credentials_are_refused_on_every_admin_only_internal_route() {
     let (_temp_dir, key_store) = admin_key_store();
+    let (_, search_key_value) =
+        key_store.create_key(search_only_api_key("admin-only route refusal key"));
 
     for row in admin_only_routes() {
         let method = row.method.as_str();
         let path = row.specimen_path;
-        let outcome = probe(
-            Arc::clone(&key_store),
-            method,
-            path,
-            Some(PEER_APP_ID),
-            Some(PEER_SECRET),
-        )
-        .await;
-        assert_refused(
-            &outcome,
-            INVALID_CREDENTIALS_MESSAGE,
-            &format!("peer credential on admin-only route {method} {path}"),
-        );
+        for (app_id, credential, expected_message, label) in [
+            (
+                None,
+                None,
+                INVALID_CREDENTIALS_MESSAGE,
+                "missing credential",
+            ),
+            (
+                Some("baseline-app"),
+                Some(search_key_value.as_str()),
+                ACL_MISMATCH_MESSAGE,
+                "search-only credential",
+            ),
+            (
+                Some(PEER_APP_ID),
+                Some(PEER_SECRET),
+                INVALID_CREDENTIALS_MESSAGE,
+                "peer credential",
+            ),
+        ] {
+            let outcome = probe(Arc::clone(&key_store), method, path, app_id, credential).await;
+            assert_refused(
+                &outcome,
+                expected_message,
+                &format!("{label} on admin-only route {method} {path}"),
+            );
+        }
     }
 }
 

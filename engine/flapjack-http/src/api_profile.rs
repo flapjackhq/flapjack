@@ -10,7 +10,13 @@ pub const FLAPJACK_API_PROFILE_ENV: &str = "FLAPJACK_API_PROFILE";
 pub const PAID_BETA_V1_DIRECT_SEARCH_PATH: &str = "/1/indexes/*/queries";
 pub const PAID_BETA_V1_APPLICATION_ID: &str = "flapjack";
 pub const PAID_BETA_V3_EVENTS_PATH: &str = "/1/events";
-pub const SUPPORTED_API_PROFILES: [&str; 3] = ["full", "paid_beta_v1", "paid_beta_v3"];
+pub const SUPPORTED_API_PROFILES: [&str; 5] = [
+    "full",
+    "paid_beta_v1",
+    "paid_beta_v3",
+    "paid_beta_v4",
+    "paid_beta_v5",
+];
 pub const PAID_BETA_V1_SEARCH_PARAMS: [&str; 6] = [
     "query",
     "page",
@@ -40,6 +46,8 @@ pub enum ApiProfile {
     Full,
     PaidBetaV1,
     PaidBetaV3,
+    PaidBetaV4,
+    PaidBetaV5,
 }
 
 impl ApiProfile {
@@ -48,6 +56,8 @@ impl ApiProfile {
             None | Some("full") => Ok(Self::Full),
             Some("paid_beta_v1") => Ok(Self::PaidBetaV1),
             Some("paid_beta_v3") => Ok(Self::PaidBetaV3),
+            Some("paid_beta_v4") => Ok(Self::PaidBetaV4),
+            Some("paid_beta_v5") => Ok(Self::PaidBetaV5),
             Some(value) => Err(ApiProfileConfigError::UnknownValue(value.to_string())),
         }
     }
@@ -67,11 +77,17 @@ impl ApiProfile {
             Self::Full => "full",
             Self::PaidBetaV1 => "paid_beta_v1",
             Self::PaidBetaV3 => "paid_beta_v3",
+            Self::PaidBetaV4 => "paid_beta_v4",
+            Self::PaidBetaV5 => "paid_beta_v5",
         }
     }
 
     pub fn validate_auth_enabled(self, auth_enabled: bool) -> Result<(), ApiProfileConfigError> {
-        if matches!(self, Self::PaidBetaV1 | Self::PaidBetaV3) && !auth_enabled {
+        if matches!(
+            self,
+            Self::PaidBetaV1 | Self::PaidBetaV3 | Self::PaidBetaV4 | Self::PaidBetaV5
+        ) && !auth_enabled
+        {
             Err(ApiProfileConfigError::AuthenticationRequired)
         } else {
             Ok(())
@@ -90,7 +106,7 @@ impl fmt::Display for ApiProfileConfigError {
         match self {
             Self::UnknownValue(value) => write!(
                 formatter,
-                "{FLAPJACK_API_PROFILE_ENV} has unsupported value {value:?}; supported values are full, paid_beta_v1, and paid_beta_v3"
+                "{FLAPJACK_API_PROFILE_ENV} has unsupported value {value:?}; supported values are full, paid_beta_v1, paid_beta_v3, paid_beta_v4, and paid_beta_v5"
             ),
             Self::AuthenticationRequired => write!(
                 formatter,
@@ -113,8 +129,28 @@ pub(crate) struct PaidBetaV1CustomerRequest;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PaidBetaV3CustomerRequest;
 
+/// Marker inserted only after the PBV4 managed-search credential boundary
+/// succeeds. PBV4 deliberately inherits PBV3's direct search/events surface;
+/// its control-plane features continue to use node-admin transport.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PaidBetaV4CustomerRequest;
+
+/// Marker inserted only after the PBV5 managed-search credential boundary
+/// succeeds. PBV5 inherits the PBV4 customer data plane exactly; its crawler
+/// and Recommend Analytics control paths continue to use node-admin transport.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PaidBetaV5CustomerRequest;
+
 pub(crate) fn is_paid_beta_v3_customer_path(path: &str) -> bool {
     path == PAID_BETA_V1_DIRECT_SEARCH_PATH || path == PAID_BETA_V3_EVENTS_PATH
+}
+
+pub(crate) fn is_paid_beta_v4_customer_path(path: &str) -> bool {
+    is_paid_beta_v3_customer_path(path)
+}
+
+pub(crate) fn is_paid_beta_v5_customer_path(path: &str) -> bool {
+    is_paid_beta_v4_customer_path(path)
 }
 
 fn invalid_batch(profile: &str, message: impl Into<String>) -> FlapjackError {
@@ -205,10 +241,12 @@ fn prepare_paid_beta_batch(
                 "page" => valid_nonnegative_integer(value),
                 "hitsPerPage" => {
                     valid_nonnegative_integer(value)
-                        && (profile == "paid_beta_v3" || value.as_u64() != Some(0))
+                        && (matches!(profile, "paid_beta_v3" | "paid_beta_v4" | "paid_beta_v5")
+                            || value.as_u64() != Some(0))
                 }
                 "facets" => {
-                    (profile == "paid_beta_v3" && value.is_string())
+                    (matches!(profile, "paid_beta_v3" | "paid_beta_v4" | "paid_beta_v5")
+                        && value.is_string())
                         || value
                             .as_array()
                             .is_some_and(|values| values.iter().all(serde_json::Value::is_string))
@@ -280,6 +318,38 @@ pub(crate) fn prepare_paid_beta_v3_batch(
         body,
         api_key,
         "paid_beta_v3",
+        &PAID_BETA_V3_SEARCH_PARAMS,
+        true,
+    )
+}
+
+/// Validate the PBV4 managed-search body. The direct data plane deliberately
+/// inherits PBV3; A/B, Recommend, and crawler control use server-held admin
+/// credentials and do not widen this customer-key boundary.
+pub(crate) fn prepare_paid_beta_v4_batch(
+    body: serde_json::Value,
+    api_key: Option<&ApiKey>,
+) -> Result<BatchSearchRequest, FlapjackError> {
+    prepare_paid_beta_batch(
+        body,
+        api_key,
+        "paid_beta_v4",
+        &PAID_BETA_V3_SEARCH_PARAMS,
+        true,
+    )
+}
+
+/// Validate the PBV5 managed-search body. The customer data plane deliberately
+/// inherits PBV4 exactly; PBV5 adds only node-admin crawler and Recommend
+/// Analytics control paths.
+pub(crate) fn prepare_paid_beta_v5_batch(
+    body: serde_json::Value,
+    api_key: Option<&ApiKey>,
+) -> Result<BatchSearchRequest, FlapjackError> {
+    prepare_paid_beta_batch(
+        body,
+        api_key,
+        "paid_beta_v5",
         &PAID_BETA_V3_SEARCH_PARAMS,
         true,
     )

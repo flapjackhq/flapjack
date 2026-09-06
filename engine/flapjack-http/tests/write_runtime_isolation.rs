@@ -79,7 +79,6 @@ struct BatchOutcome {
 
 struct RuntimeLivenessScenario {
     _tmp: TempDir,
-    app: axum::Router,
     state: Arc<AppState>,
     samples: Vec<LivenessSample>,
     outcome: BatchOutcome,
@@ -119,6 +118,8 @@ fn make_state(tmp: &TempDir) -> Arc<AppState> {
         usage_counters: Arc::new(DashMap::<String, TenantUsageCounters>::new()),
         usage_persistence: None,
         paused_indexes: PausedIndexes::new(),
+        global_mutation_fence: flapjack_http::pause_registry::GlobalMutationFence::open(tmp.path())
+            .unwrap(),
         geoip_reader: None,
         notification_service: None,
         start_time: std::time::Instant::now(),
@@ -551,23 +552,6 @@ fn liveness_classification_covers_each_measured_outcome() {
     );
 }
 
-async fn latest_document_count(app: &axum::Router) -> u64 {
-    let response = request(
-        app,
-        Method::GET,
-        &format!("/1/usage/documents_count/{INDEX_NAME}"),
-        None,
-    )
-    .await;
-    assert!(response.status().is_success());
-    let payload = response_json(response).await;
-    payload["documents_count"]
-        .as_array()
-        .and_then(|series| series.last())
-        .and_then(|sample| sample["v"].as_u64())
-        .expect("usage response contains the current document count")
-}
-
 async fn prepare_index(app: &axum::Router) {
     let create = request(
         app,
@@ -656,7 +640,7 @@ async fn join_liveness_and_batch(
     }
 }
 
-async fn assert_committed_batch(app: &axum::Router, state: &Arc<AppState>, outcome: BatchOutcome) {
+async fn assert_committed_batch(state: &Arc<AppState>, outcome: BatchOutcome) {
     assert!(
         outcome.response.status().is_success(),
         "batch request succeeds"
@@ -677,11 +661,18 @@ async fn assert_committed_batch(app: &axum::Router, state: &Arc<AppState>, outco
     assert_eq!(task.numeric_id, task_id);
     assert_eq!(task.status, TaskStatus::Succeeded);
     assert!(
+        state
+            .manager
+            .get_document(INDEX_NAME, "blocked-commit")
+            .unwrap()
+            .is_some(),
+        "succeeded task must make the committed document durable"
+    );
+    assert!(
         outcome.elapsed >= Duration::from_millis(COMMIT_DELAY_MS),
         "debug commit delay must be enabled; batch completed in {:?}",
         outcome.elapsed
     );
-    assert_eq!(latest_document_count(app).await, 1);
 }
 
 async fn prepare_runtime_liveness_scenario() -> (TempDir, axum::Router, Arc<AppState>) {
@@ -710,7 +701,6 @@ async fn run_prepared_delayed_commit_liveness_scenario(
     let (samples, outcome) = join_liveness_and_batch(sampler, batch).await;
     RuntimeLivenessScenario {
         _tmp: tmp,
-        app,
         state,
         samples,
         outcome,
@@ -726,7 +716,7 @@ async fn run_delayed_commit_liveness_scenario() -> RuntimeLivenessScenario {
 #[serial_test::serial]
 async fn single_worker_runtime_serves_count_during_injected_two_second_commit() {
     let scenario = run_delayed_commit_liveness_scenario().await;
-    assert_committed_batch(&scenario.app, &scenario.state, scenario.outcome).await;
+    assert_committed_batch(&scenario.state, scenario.outcome).await;
     assert_liveness_distribution(&scenario.samples);
 }
 
@@ -736,13 +726,6 @@ async fn routes_stay_live_while_backpressure_pause_and_commit_overlap() {
     let tmp = TempDir::new().expect("temporary data directory");
     let (app, state) = make_router(&tmp);
     prepare_index(&app).await;
-
-    state.manager.unload_tenant(INDEX_NAME);
-    assert_eq!(
-        latest_document_count(&app).await,
-        0,
-        "the count route must reload the durable tenant through get_or_load"
-    );
 
     let _delay_guard = EnvVarGuard::set(COMMIT_DELAY_ENV_VAR, &COMMIT_DELAY_MS.to_string());
     let batch_complete = Arc::new(AtomicBool::new(false));
@@ -763,7 +746,7 @@ async fn routes_stay_live_while_backpressure_pause_and_commit_overlap() {
 
     let (samples, outcome) = join_liveness_and_batch(sampler, batch).await;
     let overlap_elapsed = outcome.elapsed;
-    assert_committed_batch(&app, &state, outcome).await;
+    assert_committed_batch(&state, outcome).await;
     let overlap_samples = samples_during_batch_overlap(&samples);
     assert!(
         overlap_samples.len() >= REQUIRED_SAMPLE_COUNT,

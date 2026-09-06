@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "fixture_id": "pbv5-recommend-analytics-known-answer-v1",
+  "window": {
+    "start_date": "2026-08-01",
+    "end_date": "2026-08-01",
+    "timezone": "UTC",
+    "bounds": "inclusive"
+  },
+  "index": "products",
+  "fallback_identity": {
+    "request_ip": "198.51.100.42",
+    "persisted_identity": "198.51.100.0",
+    "rule": "IPv4 /24 coarsening; IPv6 /48 coarsening"
+  },
+  "recommendation_requests": [
+    {"id":"r1","model":"related-products","userToken":"00000000-0000-4000-8000-000000000001","analytics":true,"clickAnalytics":true,"queryID":"11111111111111111111111111111111"},
+    {"id":"r2","model":"related-products","userToken":"00000000-0000-4000-8000-000000000002","analytics":true,"clickAnalytics":true,"queryID":"22222222222222222222222222222222"},
+    {"id":"r3","model":"related-products","userToken":"00000000-0000-4000-8000-000000000001","analytics":"omitted","clickAnalytics":"omitted","queryID":null},
+    {"id":"t1","model":"trending-items","userToken":"00000000-0000-4000-8000-000000000003","analytics":true,"clickAnalytics":true,"queryID":"33333333333333333333333333333333"},
+    {"id":"t2","model":"trending-items","userToken":null,"request_ip":"198.51.100.42","analytics":true,"clickAnalytics":false,"queryID":null},
+    {"id":"excluded","model":"related-products","userToken":"00000000-0000-4000-8000-000000000004","analytics":false,"clickAnalytics":false,"queryID":null}
+  ],
+  "attributed_events": [
+    {"eventType":"click","model":"related-products","queryID":"11111111111111111111111111111111","userToken":"00000000-0000-4000-8000-000000000001","positions":[1,3]},
+    {"eventType":"conversion","model":"related-products","queryID":"11111111111111111111111111111111","userToken":"00000000-0000-4000-8000-000000000001"},
+    {"eventType":"click","model":"trending-items","queryID":"33333333333333333333333333333333","userToken":"00000000-0000-4000-8000-000000000003","positions":[2]},
+    {"eventType":"conversion","model":"trending-items","queryID":"33333333333333333333333333333333","userToken":"00000000-0000-4000-8000-000000000003"}
+  ],
+  "expected": {
+    "related-products": {
+      "totalUsers": 2,
+      "totalRecommendations": 3,
+      "trackedRecommendations": 2,
+      "clickedRecommendations": 1,
+      "convertedRecommendations": 1,
+      "clickThroughRate": 50.0,
+      "conversionRate": 50.0,
+      "clickPositionDistribution": [{"position":1,"count":1},{"position":3,"count":1}],
+      "averageClickPosition": 2.0
+    },
+    "trending-items": {
+      "totalUsers": 2,
+      "totalRecommendations": 2,
+      "trackedRecommendations": 1,
+      "clickedRecommendations": 1,
+      "convertedRecommendations": 1,
+      "clickThroughRate": 100.0,
+      "conversionRate": 100.0,
+      "clickPositionDistribution": [{"position":2,"count":1}],
+      "averageClickPosition": 2.0
+    }
+  }
+}

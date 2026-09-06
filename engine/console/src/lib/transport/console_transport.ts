@@ -1,7 +1,7 @@
 export type IndexSummary = {
   name: string;
-  entries: number;
-  dataSize: number;
+  entries: number | null;
+  dataSize: number | null;
 };
 
 export type SearchRequest = {

@@ -14,9 +14,7 @@ use tower::ServiceExt;
 
 /// Create a minimal `AppState` for usage tests with no persistence layer and empty counters.
 fn make_state(tmp: &TempDir) -> Arc<AppState> {
-    let mut state = crate::test_helpers::TestStateBuilder::new(tmp).build();
-    state.metrics_state = None;
-    Arc::new(state)
+    crate::test_helpers::TestStateBuilder::new(tmp).build_shared()
 }
 
 fn usage_router(state: Arc<AppState>) -> Router {
@@ -57,6 +55,11 @@ async fn seed_loaded_documents(state: &Arc<AppState>, index_name: &str, count: u
         Some(count),
         "test setup must create the expected live segment document count"
     );
+    crate::background_tasks::refresh_metrics_snapshot(
+        &state.manager,
+        state.metrics_state.as_ref().unwrap(),
+    )
+    .unwrap();
 }
 
 // ── Red tests ──
@@ -441,7 +444,9 @@ async fn usage_response_format_matches_algolia() {
 #[tokio::test]
 async fn usage_storage_bytes_absent_cache_is_explicit_not_zero() {
     let tmp = TempDir::new().unwrap();
-    let state = make_state(&tmp);
+    let mut state = crate::test_helpers::TestStateBuilder::new(&tmp).build();
+    state.metrics_state = None;
+    let state = Arc::new(state);
 
     state
         .usage_counters
@@ -468,13 +473,22 @@ async fn usage_storage_bytes_per_index_reads_metrics_cache() {
     let tmp = TempDir::new().unwrap();
     let state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
     let metrics_state = state.metrics_state.as_ref().unwrap();
-    metrics_state.storage_gauges.clear();
-    metrics_state
-        .storage_gauges
-        .insert("products".to_string(), 12_345);
-    metrics_state
-        .storage_gauges
-        .insert("other".to_string(), 6_789);
+    metrics_state.replace_index_gauges(std::collections::BTreeMap::from([
+        (
+            "products".to_string(),
+            crate::handlers::metrics::IndexGaugeValues {
+                documents_count: None,
+                storage_bytes: Some(12_345),
+            },
+        ),
+        (
+            "other".to_string(),
+            crate::handlers::metrics::IndexGaugeValues {
+                documents_count: None,
+                storage_bytes: Some(6_789),
+            },
+        ),
+    ]));
 
     let app = usage_router(state);
     let resp = get_usage(app, "/1/usage/storage_bytes/products").await;
@@ -492,13 +506,22 @@ async fn usage_storage_bytes_global_sums_metrics_cache() {
     let tmp = TempDir::new().unwrap();
     let state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
     let metrics_state = state.metrics_state.as_ref().unwrap();
-    metrics_state.storage_gauges.clear();
-    metrics_state
-        .storage_gauges
-        .insert("products".to_string(), 12_345);
-    metrics_state
-        .storage_gauges
-        .insert("articles".to_string(), 6_789);
+    metrics_state.replace_index_gauges(std::collections::BTreeMap::from([
+        (
+            "products".to_string(),
+            crate::handlers::metrics::IndexGaugeValues {
+                documents_count: None,
+                storage_bytes: Some(12_345),
+            },
+        ),
+        (
+            "articles".to_string(),
+            crate::handlers::metrics::IndexGaugeValues {
+                documents_count: None,
+                storage_bytes: Some(6_789),
+            },
+        ),
+    ]));
 
     let app = usage_router(state);
     let resp = get_usage(app, "/1/usage/storage_bytes").await;
@@ -518,6 +541,11 @@ async fn usage_documents_count_explicit_zero_is_emitted() {
     let state = make_state(&tmp);
     state.manager.create_tenant("empty").unwrap();
     assert_eq!(state.manager.tenant_doc_count("empty"), Some(0));
+    crate::background_tasks::refresh_metrics_snapshot(
+        &state.manager,
+        state.metrics_state.as_ref().unwrap(),
+    )
+    .unwrap();
 
     let app = usage_router(state);
     let resp = get_usage(app, "/1/usage/documents_count/empty").await;
@@ -530,7 +558,7 @@ async fn usage_documents_count_explicit_zero_is_emitted() {
 }
 
 #[tokio::test]
-async fn usage_documents_count_per_index_loads_existing_index_after_restart() {
+async fn usage_documents_count_per_index_reads_cached_index_after_restart_without_loading() {
     let tmp = TempDir::new().unwrap();
     {
         let initial_state = make_state(&tmp);
@@ -547,6 +575,11 @@ async fn usage_documents_count_per_index_loads_existing_index_after_restart() {
     let missing_path = tmp.path().join("missing_products");
     assert!(durable_path.is_dir());
     assert!(!missing_path.exists());
+    crate::background_tasks::refresh_metrics_snapshot(
+        &restarted_state.manager,
+        restarted_state.metrics_state.as_ref().unwrap(),
+    )
+    .unwrap();
 
     let app = usage_router(Arc::clone(&restarted_state));
     let resp = get_usage(app.clone(), "/1/usage/documents_count/durable_products").await;
@@ -555,9 +588,9 @@ async fn usage_documents_count_per_index_loads_existing_index_after_restart() {
     assert_eq!(
         json["documents_count"][0]["v"].as_u64(),
         Some(3),
-        "the per-index count must load and read the durable segment set"
+        "the per-index count must read the cached durable segment count"
     );
-    assert_eq!(restarted_state.manager.loaded_count(), 1);
+    assert_eq!(restarted_state.manager.loaded_count(), 0);
 
     let missing_resp = get_usage(app, "/1/usage/documents_count/missing_products").await;
     assert_eq!(missing_resp.status(), StatusCode::OK);
@@ -579,8 +612,13 @@ async fn usage_storage_bytes_explicit_zero_is_emitted() {
     let tmp = TempDir::new().unwrap();
     let state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
     let metrics_state = state.metrics_state.as_ref().unwrap();
-    metrics_state.storage_gauges.clear();
-    metrics_state.storage_gauges.insert("empty".to_string(), 0);
+    metrics_state.replace_index_gauges(std::collections::BTreeMap::from([(
+        "empty".to_string(),
+        crate::handlers::metrics::IndexGaugeValues {
+            documents_count: None,
+            storage_bytes: Some(0),
+        },
+    )]));
 
     let app = usage_router(state);
     let resp = get_usage(app, "/1/usage/storage_bytes/empty").await;
@@ -600,7 +638,6 @@ fn make_state_with_persistence(
     persistence: Arc<crate::usage_persistence::UsagePersistence>,
 ) -> Arc<AppState> {
     let mut state = crate::test_helpers::TestStateBuilder::new(tmp).build();
-    state.metrics_state = None;
     state.usage_persistence = Some(persistence);
     Arc::new(state)
 }
