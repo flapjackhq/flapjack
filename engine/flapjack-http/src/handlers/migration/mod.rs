@@ -938,6 +938,7 @@ macro_rules! define_source_migration_openapi_lifecycle {
         pub async fn $submit_fn(
             State(state): State<Arc<AppState>>,
             Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
+            Extension(mutation_permit): Extension<crate::pause_registry::MutationPermit>,
             Json(payload): Json<$request_ty>,
         ) -> Result<(StatusCode, Json<AsyncMigrationStatusResponse>), MigrateError> {
             submit_source_migration_impl(
@@ -946,6 +947,7 @@ macro_rules! define_source_migration_openapi_lifecycle {
                 authenticated_app_id,
                 payload,
                 $source_reader,
+                mutation_permit,
             )
             .await
         }
@@ -1064,6 +1066,7 @@ macro_rules! define_source_migration_openapi_lifecycle {
         pub async fn $resume_fn(
             State(state): State<Arc<AppState>>,
             Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
+            Extension(mutation_permit): Extension<crate::pause_registry::MutationPermit>,
             headers: HeaderMap,
             AxumPath(job_id): AxumPath<String>,
             Json(payload): Json<MigrateFromAlgoliaRequest>,
@@ -1075,6 +1078,7 @@ macro_rules! define_source_migration_openapi_lifecycle {
                 job_id,
                 payload,
                 algolia_source_reader,
+                mutation_permit,
             )
             .await
         }
@@ -1389,6 +1393,7 @@ pub(crate) async fn preview_algolia_migration_http(
 pub(crate) async fn submit_algolia_migration_http(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
+    Extension(mutation_permit): Extension<crate::pause_registry::MutationPermit>,
     source_provider: Option<Extension<AsyncMigrationSourceProvider>>,
     #[cfg(test)] test_source_factory: Option<Extension<TestMigrationSourceReaderFactory>>,
     headers: HeaderMap,
@@ -1409,6 +1414,7 @@ pub(crate) async fn submit_algolia_migration_http(
                     owner,
                     payload,
                     |_: &MigrateFromAlgoliaRequest| factory.build(source_provider),
+                    mutation_permit,
                 )
                 .await;
             }
@@ -1418,6 +1424,7 @@ pub(crate) async fn submit_algolia_migration_http(
                 owner,
                 payload,
                 algolia_source_reader,
+                mutation_permit,
             )
             .await
         }
@@ -1431,6 +1438,7 @@ pub(crate) async fn submit_algolia_migration_http(
                     owner,
                     payload,
                     |_: &MigrateFromMeilisearchRequest| factory.build(source_provider),
+                    mutation_permit,
                 )
                 .await;
             }
@@ -1440,6 +1448,7 @@ pub(crate) async fn submit_algolia_migration_http(
                 owner,
                 payload,
                 meilisearch_source_reader,
+                mutation_permit,
             )
             .await
         }
@@ -1453,6 +1462,7 @@ pub(crate) async fn submit_algolia_migration_http(
                     owner,
                     payload,
                     |_: &MigrateFromTypesenseRequest| factory.build(source_provider),
+                    mutation_permit,
                 )
                 .await;
             }
@@ -1462,6 +1472,7 @@ pub(crate) async fn submit_algolia_migration_http(
                 owner,
                 payload,
                 typesense_source_reader,
+                mutation_permit,
             )
             .await
         }
@@ -1470,8 +1481,15 @@ pub(crate) async fn submit_algolia_migration_http(
 
 pub(crate) async fn resume_algolia_migration_http(
     State(state): State<Arc<AppState>>,
-    Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
-    source_provider: Option<Extension<AsyncMigrationSourceProvider>>,
+    (
+        Extension(AuthenticatedAppId(authenticated_app_id)),
+        Extension(mutation_permit),
+        source_provider,
+    ): (
+        Extension<AuthenticatedAppId>,
+        Extension<crate::pause_registry::MutationPermit>,
+        Option<Extension<AsyncMigrationSourceProvider>>,
+    ),
     #[cfg(test)] test_source_factory: Option<Extension<TestMigrationSourceReaderFactory>>,
     headers: HeaderMap,
     AxumPath(job_id): AxumPath<String>,
@@ -1492,6 +1510,7 @@ pub(crate) async fn resume_algolia_migration_http(
             job_id,
             payload,
             |_: &MigrateFromAlgoliaRequest| factory.build(source_provider),
+            mutation_permit,
         )
         .await;
     }
@@ -1502,6 +1521,7 @@ pub(crate) async fn resume_algolia_migration_http(
         job_id,
         payload,
         algolia_source_reader,
+        mutation_permit,
     )
     .await
 }
@@ -1513,6 +1533,7 @@ async fn resume_source_migration<F, R>(
     job_id: String,
     payload: MigrateFromAlgoliaRequest,
     source_factory: F,
+    mutation_permit: crate::pause_registry::MutationPermit,
 ) -> Result<(StatusCode, Json<AsyncMigrationStatusResponse>), MigrateError>
 where
     F: FnOnce(&MigrateFromAlgoliaRequest) -> Result<R, AlgoliaClientError>,
@@ -1522,7 +1543,13 @@ where
     let (job_uuid, checkpoint_handle) = resumable_algolia_job(&state, &owner, &job_id)?;
     let phase_record = state
         .migration_runner
-        .resume_algolia_import(job_uuid, checkpoint_handle, payload, source_factory)
+        .resume_algolia_import_with_permit(
+            job_uuid,
+            checkpoint_handle,
+            payload,
+            source_factory,
+            mutation_permit,
+        )
         .await?;
     Ok((
         StatusCode::ACCEPTED,
@@ -1563,12 +1590,14 @@ where
     F: FnOnce(&MigrateFromAlgoliaRequest) -> Result<R, AlgoliaClientError>,
     R: source_reader::MigrationSourceReader + Send + 'static,
 {
+    let mutation_permit = state.global_mutation_fence.admit_mutation().await.unwrap();
     submit_source_migration_impl(
         source_provider,
         state,
         authenticated_app_id,
         payload,
         source_factory,
+        mutation_permit,
     )
     .await
 }
@@ -1745,6 +1774,7 @@ async fn submit_source_migration_impl<P, F, R>(
     authenticated_app_id: String,
     payload: P,
     source_factory: F,
+    mutation_permit: crate::pause_registry::MutationPermit,
 ) -> Result<(StatusCode, Json<AsyncMigrationStatusResponse>), MigrateError>
 where
     P: AsyncMigrationSubmitPayload,
@@ -1759,6 +1789,7 @@ where
             payload,
             Some(authenticated_app_id),
             source_factory,
+            mutation_permit,
         )
         .await?;
     Ok((

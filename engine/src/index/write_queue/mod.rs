@@ -18,9 +18,12 @@ mod writer_lifecycle;
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
 pub use backpressure::force_backpressure_pause_for_test;
 pub(crate) use compensation::{compensate_uncommitted_tasks, DurableReplayState};
-#[cfg(test)]
+#[cfg(any(test, feature = "fault-injection"))]
 pub(crate) use compensation::{
     compensation_fault_attempts_remaining_for_test, fail_compensation_attempts_for_test,
+};
+#[cfg(test)]
+pub(crate) use compensation::{
     fail_next_compensation_for_test, set_compensation_before_oplog_retraction_hook_for_test,
 };
 pub(crate) use finalization::PERSISTED_VECTORS_DIR;
@@ -759,6 +762,8 @@ impl WriteQueueWorkerGate {
 pub struct ReplicatedWriteOrigin {
     pub timestamp_ms: u64,
     pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_seq: Option<u64>,
 }
 
 impl ReplicatedWriteOrigin {
@@ -766,11 +771,19 @@ impl ReplicatedWriteOrigin {
         Self {
             timestamp_ms,
             node_id,
+            origin_seq: None,
         }
     }
 
+    pub fn with_origin_seq(mut self, origin_seq: u64) -> Self {
+        self.origin_seq = Some(origin_seq);
+        self
+    }
+
     fn into_oplog_origin(self) -> crate::index::oplog::OpLogOrigin {
-        crate::index::oplog::OpLogOrigin::new(self.timestamp_ms, self.node_id)
+        let mut origin = crate::index::oplog::OpLogOrigin::new(self.timestamp_ms, self.node_id);
+        origin.origin_seq = self.origin_seq;
+        origin
     }
 }
 

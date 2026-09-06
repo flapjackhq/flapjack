@@ -3,7 +3,7 @@ use axum::body::{Body, Bytes};
 use axum::http::StatusCode;
 use axum::response::Response;
 use dashmap::DashMap;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -360,6 +360,140 @@ impl IdempotencyStore for SqliteStore {
     }
 }
 
+/// SQLite persistence that observes an existing database read-only during a
+/// release-fenced restart and opens the ordinary writer only on the first
+/// admitted post-release store. This avoids SQLite journal/schema effects at
+/// startup without silently degrading later idempotency durability to memory.
+struct DeferredSqliteStore {
+    path: PathBuf,
+    writable: Mutex<Option<SqliteStore>>,
+}
+
+impl DeferredSqliteStore {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            writable: Mutex::new(None),
+        }
+    }
+
+    fn read_only_connection(&self) -> Result<Option<Connection>, IdempotencyStoreError> {
+        if !self.path.is_file() {
+            return Ok(None);
+        }
+        Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map(Some)
+            .map_err(IdempotencyStoreError::from)
+    }
+
+    fn lookup_read_only(
+        &self,
+        key: &CompositeKey,
+        ttl: Duration,
+    ) -> Result<Option<IdempotencyRecord>, IdempotencyStoreError> {
+        let Some(conn) = self.read_only_connection()? else {
+            return Ok(None);
+        };
+        let mut stmt = conn.prepare(
+            "SELECT status, body, inserted_at_unix_ms
+             FROM idempotency_cache
+             WHERE application_id = ?1 AND index_segment = ?2 AND idempotency_key = ?3",
+        )?;
+        let row = match stmt.query_row(
+            params![key.application_id, key.index_segment, key.idempotency_key],
+            |row| {
+                Ok((
+                    row.get::<_, u16>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        ) {
+            Ok(row) => row,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if now_unix_ms().saturating_sub(row.2) > ttl.as_millis() as i64 {
+            // Expired rows are intentionally not trimmed by the read-only
+            // startup projection. The first ordinary writer owns cleanup.
+            return Ok(None);
+        }
+        Ok(Some(IdempotencyRecord {
+            status: row.0,
+            body: Bytes::from(row.1),
+        }))
+    }
+
+    fn read_only_len(&self) -> usize {
+        self.read_only_connection()
+            .ok()
+            .flatten()
+            .and_then(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM idempotency_cache", [], |row| {
+                    row.get(0)
+                })
+                .ok()
+            })
+            .unwrap_or(0)
+    }
+}
+
+impl IdempotencyStore for DeferredSqliteStore {
+    fn lookup(
+        &self,
+        key: &CompositeKey,
+        ttl: Duration,
+    ) -> Result<Option<IdempotencyRecord>, IdempotencyStoreError> {
+        let writable = self
+            .writable
+            .lock()
+            .map_err(|_| IdempotencyStoreError::MutexPoisoned)?;
+        match writable.as_ref() {
+            Some(store) => store.lookup(key, ttl),
+            None => self.lookup_read_only(key, ttl),
+        }
+    }
+
+    fn store(
+        &self,
+        key: CompositeKey,
+        value: TimedRecord,
+        ttl: Duration,
+    ) -> Result<(), IdempotencyStoreError> {
+        let mut writable = self
+            .writable
+            .lock()
+            .map_err(|_| IdempotencyStoreError::MutexPoisoned)?;
+        if writable.is_none() {
+            *writable = Some(SqliteStore::open(&self.path)?);
+        }
+        writable
+            .as_ref()
+            .expect("writer initialized above")
+            .store(key, value, ttl)
+    }
+
+    fn trim_count(&self) -> u64 {
+        self.writable
+            .lock()
+            .ok()
+            .and_then(|store| store.as_ref().map(SqliteStore::trim_count))
+            .unwrap_or(0)
+    }
+
+    fn len(&self) -> usize {
+        self.writable
+            .lock()
+            .ok()
+            .and_then(|store| store.as_ref().map(SqliteStore::len))
+            .unwrap_or_else(|| self.read_only_len())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 pub struct IdempotencyCache {
     store: Box<dyn IdempotencyStore>,
     ttl: Duration,
@@ -402,12 +536,7 @@ impl IdempotencyCache {
 
     /// TODO: Document IdempotencyCache.from_env_with_data_dir.
     pub fn from_env_with_data_dir(data_dir: &Path) -> Self {
-        let ttl_secs = std::env::var("FLAPJACK_IDEMPOTENCY_TTL_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_TTL_SECS)
-            .max(MIN_TTL_SECS);
-        let ttl = Duration::from_secs(ttl_secs);
+        let ttl = configured_ttl();
         if persistent_mode_enabled_from_env() {
             match Self::persistent_under_data_dir(ttl, data_dir) {
                 Ok(cache) => cache,
@@ -415,6 +544,20 @@ impl IdempotencyCache {
                     tracing::warn!(error = %err, "failed to initialize persistent idempotency cache; falling back to memory");
                     Self::memory(ttl)
                 }
+            }
+        } else {
+            Self::memory(ttl)
+        }
+    }
+
+    pub(crate) fn from_env_with_data_dir_load_only(data_dir: &Path) -> Self {
+        let ttl = configured_ttl();
+        if persistent_mode_enabled_from_env() {
+            let path = Self::canonical_db_path(data_dir);
+            Self {
+                store: Box::new(DeferredSqliteStore::new(path.clone())),
+                ttl,
+                sqlite_path: Some(path),
             }
         } else {
             Self::memory(ttl)
@@ -481,6 +624,16 @@ impl IdempotencyCache {
     pub fn trim_count(&self) -> u64 {
         self.store.trim_count()
     }
+}
+
+fn configured_ttl() -> Duration {
+    Duration::from_secs(
+        std::env::var("FLAPJACK_IDEMPOTENCY_TTL_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_TTL_SECS)
+            .max(MIN_TTL_SECS),
+    )
 }
 
 fn now_unix_ms() -> i64 {
@@ -606,6 +759,62 @@ mod tests {
         let _guard = crate::test_helpers::with_env_var(PERSIST_ENV_CANONICAL, "1");
         let cache = IdempotencyCache::from_env_with_data_dir(temp.path());
         assert!(cache.persistence_path().is_some());
+    }
+
+    #[test]
+    fn load_only_persistent_startup_preserves_sqlite_and_initializes_on_first_later_write() {
+        let populated = tempfile::tempdir().expect("tempdir");
+        let _guard = crate::test_helpers::with_env_var(PERSIST_ENV_CANONICAL, "1");
+        let seeded = IdempotencyCache::from_env_with_data_dir(populated.path());
+        seeded
+            .store(
+                "persisted-key".to_string(),
+                IdempotencyRecord::json(StatusCode::OK, Bytes::from_static(b"{\"ok\":true}")),
+            )
+            .unwrap();
+        drop(seeded);
+        let db_path = IdempotencyCache::canonical_db_path(populated.path());
+        let before = std::fs::read(&db_path).unwrap();
+        #[cfg(unix)]
+        let before_inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&db_path).unwrap().ino()
+        };
+
+        let reopened = IdempotencyCache::from_env_with_data_dir_load_only(populated.path());
+        assert!(reopened.lookup("persisted-key").unwrap().is_some());
+        assert_eq!(std::fs::read(&db_path).unwrap(), before);
+        assert!(!db_path.with_extension("db-wal").exists());
+        assert!(!db_path.with_extension("db-shm").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(&db_path).unwrap().ino(), before_inode);
+        }
+        drop(reopened);
+
+        let retried = IdempotencyCache::from_env_with_data_dir_load_only(populated.path());
+        assert!(retried.lookup("persisted-key").unwrap().is_some());
+        assert_eq!(std::fs::read(&db_path).unwrap(), before);
+        assert!(!db_path.with_extension("db-wal").exists());
+        assert!(!db_path.with_extension("db-shm").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(&db_path).unwrap().ino(), before_inode);
+        }
+
+        let absent = tempfile::tempdir().expect("tempdir");
+        let deferred = IdempotencyCache::from_env_with_data_dir_load_only(absent.path());
+        let deferred_path = IdempotencyCache::canonical_db_path(absent.path());
+        assert!(!deferred_path.exists());
+        deferred
+            .store(
+                "after-release".to_string(),
+                IdempotencyRecord::json(StatusCode::CREATED, Bytes::from_static(b"{}")),
+            )
+            .expect("the first post-release write should create sqlite persistence");
+        assert!(deferred_path.is_file());
     }
 
     #[test]

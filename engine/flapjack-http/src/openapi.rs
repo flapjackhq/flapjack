@@ -438,6 +438,78 @@ pub const DOCUMENTED_INTERNAL_PATHS: [&str; 5] = [
 )]
 pub struct ApiDoc;
 
+/// Canonical cross-repository PBV4 crawler wire document. It is intentionally
+/// separate from the public Algolia-compatible API document and remains a
+/// generated contract even while the runtime routes are hidden.
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Flapjack PBV4 Internal Crawler API",
+        version = "1.0.0",
+        description = "Node-admin-only run_id keyed start, cancel, outcome, and acknowledgement protocol. HTTP indexes are projections; PublicationJournal, PublicationTombstone, and their handoff remain durable truth."
+    ),
+    paths(
+        crate::handlers::crawler::start_crawler_run,
+        crate::handlers::crawler::cancel_crawler_run,
+        crate::handlers::crawler::get_crawler_run,
+        crate::handlers::crawler::ack_crawler_run,
+    ),
+    components(schemas(
+        crate::handlers::crawler::CrawlerRunStartRequest,
+        crate::handlers::crawler::CrawlerRunId,
+        crate::handlers::crawler::CrawlerRunLimits,
+        crate::handlers::crawler::CrawlerSelectedField,
+        crate::handlers::crawler::CrawlerCanonicalField,
+        crate::handlers::crawler::CrawlerTransform,
+        crate::handlers::crawler::CrawlerObjectIdDerivation,
+        crate::handlers::crawler::CrawlerObjectIdAlgorithm,
+        crate::handlers::crawler::CrawlerRunCounters,
+        crate::handlers::crawler::CrawlerPublicationFact,
+        crate::handlers::crawler::CrawlerRunErrorCode,
+        crate::handlers::crawler::CrawlerRunOutcome,
+        crate::handlers::crawler::CrawlerCancelDisposition,
+        crate::handlers::crawler::CrawlerRunCancelResponse,
+        crate::handlers::crawler::CrawlerRunAckResponse,
+    )),
+    tags((
+        name = "internal-crawler",
+        description = "PBV4 internal crawler run protocol"
+    )),
+    modifiers(&CrawlerSecurityAddon)
+)]
+pub struct Pbv4CrawlerApiDoc;
+
+pub fn pbv4_crawler_openapi() -> utoipa::openapi::OpenApi {
+    let document = Pbv4CrawlerApiDoc::openapi();
+    let mut value = serde_json::to_value(document).expect("crawler OpenAPI must serialize");
+    if let Some(schemas) = value.pointer_mut("/components/schemas") {
+        recursively_close_object_schemas(schemas);
+    }
+    serde_json::from_value(value).expect("closed crawler OpenAPI must deserialize")
+}
+
+fn recursively_close_object_schemas(value: &mut serde_json::Value) {
+    if value.get("type") == Some(&serde_json::json!("object")) {
+        value
+            .as_object_mut()
+            .expect("object schema must be a JSON object")
+            .insert("additionalProperties".to_string(), serde_json::json!(false));
+    }
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                recursively_close_object_schemas(value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                recursively_close_object_schemas(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// TODO: Document documented_openapi.
 pub fn documented_openapi(auth_enabled: bool) -> utoipa::openapi::OpenApi {
     let mut document = ApiDoc::openapi();
@@ -459,6 +531,31 @@ pub fn documented_openapi(auth_enabled: bool) -> utoipa::openapi::OpenApi {
 }
 
 struct SecurityAddon;
+
+struct CrawlerSecurityAddon;
+
+impl utoipa::Modify for CrawlerSecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "application_id",
+                utoipa::openapi::security::SecurityScheme::ApiKey(
+                    utoipa::openapi::security::ApiKey::Header(
+                        utoipa::openapi::security::ApiKeyValue::new("x-algolia-application-id"),
+                    ),
+                ),
+            );
+            components.add_security_scheme(
+                "api_key",
+                utoipa::openapi::security::SecurityScheme::ApiKey(
+                    utoipa::openapi::security::ApiKey::Header(
+                        utoipa::openapi::security::ApiKeyValue::new("x-algolia-api-key"),
+                    ),
+                ),
+            );
+        }
+    }
+}
 
 impl utoipa::Modify for SecurityAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
@@ -500,7 +597,32 @@ impl utoipa::Modify for OpsSchemaConstraintsAddon {
             true,
         );
         set_schema_property_array_max_items(openapi, "ClusterStatusStandaloneResponse", "peers", 0);
+        close_experiment_conclusion_schema(openapi);
     }
+}
+
+fn close_experiment_conclusion_schema(openapi: &mut utoipa::openapi::OpenApi) {
+    use utoipa::openapi::schema::{AdditionalProperties, Schema, SchemaType, Type};
+
+    let Some(conclusion) = schema_object_mut(openapi, "ExperimentConclusion") else {
+        return;
+    };
+    conclusion.additional_properties = Some(Box::new(AdditionalProperties::FreeForm(false)));
+    if !conclusion.required.iter().any(|field| field == "winner") {
+        conclusion.required.push("winner".to_string());
+    }
+
+    let Some(utoipa::openapi::RefOr::T(Schema::Object(winner))) =
+        conclusion.properties.get_mut("winner")
+    else {
+        return;
+    };
+    winner.schema_type = SchemaType::from_iter([Type::String, Type::Null]);
+    winner.enum_values = Some(vec![
+        serde_json::Value::String("control".to_string()),
+        serde_json::Value::String("variant".to_string()),
+        serde_json::Value::Null,
+    ]);
 }
 
 fn set_schema_property_bool_enum(
@@ -544,6 +666,18 @@ fn schema_property_mut<'a>(
         utoipa::openapi::RefOr::T(schema) => Some(schema),
         utoipa::openapi::RefOr::Ref(_) => None,
     }
+}
+
+fn schema_object_mut<'a>(
+    openapi: &'a mut utoipa::openapi::OpenApi,
+    schema_name: &str,
+) -> Option<&'a mut utoipa::openapi::schema::Object> {
+    let components = openapi.components.as_mut()?;
+    let schema = components.schemas.get_mut(schema_name)?;
+    let utoipa::openapi::RefOr::T(utoipa::openapi::schema::Schema::Object(object)) = schema else {
+        return None;
+    };
+    Some(object)
 }
 
 /// Adds `text/event-stream` as an additional 200-response content type on the

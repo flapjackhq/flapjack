@@ -14,6 +14,7 @@
 
 <script lang="ts">
   import { onDestroy, type Snippet } from 'svelte';
+  import Button from '../ui/Button.svelte';
 
   let {
     state: viewState,
@@ -106,16 +107,23 @@
       <p>Review each key's access before sharing it.</p>
     </div>
     {#if onCreate}
-      <button type="button" disabled={!interactive} onclick={createKey}>{createActionLabel}</button>
+      <Button
+        label={createActionLabel}
+        variant="primary"
+        disabled={!interactive}
+        onpress={createKey}
+      />
     {/if}
   </header>
 
   {#if viewState.kind === 'loading'}
-    <p role="status" aria-live="polite">Loading API keys…</p>
+    <p class="state_message" role="status" aria-live="polite">Loading API keys…</p>
   {:else if viewState.kind === 'error'}
-    <div class="state_message">
+    <div class="state_message state_message_error">
       <p role="alert">{viewState.message}</p>
-      {#if onRetry}<button type="button" disabled={!interactive} onclick={onRetry}>Retry</button>{/if}
+      {#if onRetry}
+        <Button label="Retry" variant="secondary" disabled={!interactive} onpress={onRetry} />
+      {/if}
     </div>
   {:else}
     {#if filterOptions.length > 0 && readyKeys.length > 0}
@@ -131,9 +139,15 @@
     {/if}
 
     {#if readyKeys.length === 0}
-      <p>No API keys yet.</p>
+      <div class="empty_state">
+        <p class="empty_title">No API keys yet.</p>
+        <p>Create a scoped key when you are ready to connect an application.</p>
+      </div>
     {:else if visibleKeys.length === 0}
-      <p>No API keys match this filter.</p>
+      <div class="empty_state">
+        <p class="empty_title">No API keys match this filter.</p>
+        <p>Choose another index or show all indexes.</p>
+      </div>
     {:else}
       <div class="key_list">
         {#each visibleKeys as key (key.opaqueId)}
@@ -146,27 +160,29 @@
             {#if details}{@render details(key)}{/if}
             <div class="key_actions">
               {#if copyText}
-                <button
-                  type="button"
+                <Button
+                  label="Copy"
+                  variant="secondary"
                   disabled={!interactive}
-                  aria-label={`Copy ${key.displayName}`}
-                  onclick={() => void copyKey(key)}
-                >Copy</button>
+                  ariaLabel={`Copy ${key.displayName}`}
+                  onpress={() => void copyKey(key)}
+                />
               {/if}
               {#if onRequestRemove}
-                <button
-                  type="button"
+                <Button
+                  label={removeActionLabel}
+                  variant="danger"
                   disabled={!interactive}
-                  aria-label={`${removeActionLabel} ${key.displayName}`}
-                  onclick={(event) => requestRemoval(key, event)}
-                >{removeActionLabel}</button>
+                  ariaLabel={`${removeActionLabel} ${key.displayName}`}
+                  onpress={(event) => requestRemoval(key, event)}
+                />
               {/if}
             </div>
             {#if copyFeedback?.opaqueId === key.opaqueId}
               {#if copyFeedback.kind === 'success'}
-                <p role="status">Copied</p>
+                <p class="action_feedback action_feedback_success" role="status">Copied</p>
               {:else}
-                <p role="alert">Could not copy</p>
+                <p class="action_feedback action_feedback_error" role="alert">Could not copy</p>
               {/if}
             {/if}
           </article>
@@ -178,7 +194,15 @@
 
 <style>
   .api_key_shell {
+    width: 100%;
+    min-width: 0;
     padding: var(--console-space-lg);
+    border: var(--console-border-width) solid var(--console-border);
+    border-radius: var(--console-radius);
+    color: var(--console-text);
+    background: var(--console-surface);
+    box-shadow: var(--console-shadow);
+    font-family: var(--console-font);
   }
 
   header,
@@ -197,12 +221,69 @@
   h1,
   h2,
   h3,
-  header p {
+  header p,
+  .state_message p,
+  .empty_state p,
+  .action_feedback {
     margin-block: 0;
+  }
+
+  h1,
+  h2,
+  h3 {
+    color: var(--console-text);
+  }
+
+  h1,
+  header h2 {
+    font-size: var(--console-heading-size);
+  }
+
+  article h2,
+  article h3 {
+    font-size: var(--console-subheading-size);
   }
 
   header p {
     margin-block-start: var(--console-space-sm);
+    color: var(--console-text-muted);
+  }
+
+  .state_message,
+  .empty_state {
+    min-height: var(--console-content-min-height);
+    margin-block-start: var(--console-space-lg);
+    padding: var(--console-space-lg);
+    border: var(--console-border-width) solid var(--console-border);
+    border-radius: var(--console-radius);
+    background: var(--console-surface-muted);
+  }
+
+  .state_message {
+    justify-content: space-between;
+    flex-wrap: wrap;
+  }
+
+  .state_message_error {
+    border-color: var(--console-danger);
+    background: var(--console-danger-surface);
+  }
+
+  .empty_state {
+    display: grid;
+    align-content: center;
+    gap: var(--console-space-sm);
+    border-style: dashed;
+    text-align: center;
+  }
+
+  .empty_title {
+    color: var(--console-text);
+    font-size: var(--console-subheading-size);
+    font-weight: var(--console-control-font-weight);
+  }
+
+  .empty_state p:not(.empty_title) {
     color: var(--console-text-muted);
   }
 
@@ -213,18 +294,30 @@
     margin-block: var(--console-space-lg);
   }
 
+  .filter_control span {
+    color: var(--console-text);
+    font-weight: var(--console-control-font-weight);
+  }
+
   select {
+    width: 100%;
+    min-height: var(--console-control-min-height);
     border: var(--console-border-width) solid var(--console-border);
     border-radius: var(--console-radius);
     padding: var(--console-space-sm) var(--console-space-md);
-    color: inherit;
+    color: var(--console-text);
     background: var(--console-surface-muted);
     font: inherit;
   }
 
   select:focus-visible {
-    outline: calc(var(--console-border-width) * 2) solid var(--console-focus);
+    outline: calc(var(--console-border-width) * 3) solid var(--console-focus);
     outline-offset: calc(var(--console-border-width) * 2);
+  }
+
+  select:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
   }
 
   .key_list {
@@ -239,10 +332,41 @@
     border: var(--console-border-width) solid var(--console-border);
     border-radius: var(--console-radius);
     background: var(--console-surface-muted);
+    box-shadow: var(--console-shadow);
   }
 
   .key_actions {
     flex-wrap: wrap;
     margin-block-start: var(--console-space-md);
+  }
+
+  .action_feedback {
+    display: inline-block;
+    margin-block-start: var(--console-space-sm);
+    padding: var(--console-space-sm) var(--console-space-md);
+    border-radius: var(--console-radius);
+    font-weight: var(--console-control-font-weight);
+  }
+
+  .action_feedback_success {
+    color: var(--console-status);
+    background: var(--console-status-surface);
+  }
+
+  .action_feedback_error {
+    color: var(--console-danger);
+    background: var(--console-danger-surface);
+  }
+
+  @media (max-width: 40rem) {
+    .api_key_shell {
+      padding: var(--console-space-md);
+    }
+
+    header,
+    .state_message {
+      align-items: stretch;
+      flex-direction: column;
+    }
   }
 </style>

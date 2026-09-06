@@ -660,19 +660,19 @@
     },
     {
       "capability": "Source export: Algolia → durable on-disk spool (checkpointed, resumable)",
-      "features_ref": "FEATURES.md:241 Source migration",
+      "features_ref": "FEATURES.md:224 Source migration",
       "surface": "dashboard route",
       "proof_key": "P29"
     },
     {
       "capability": "Translation: spool → Flapjack documents/settings/synonyms/rules",
-      "features_ref": "FEATURES.md:242 Source migration",
+      "features_ref": "FEATURES.md:225 Source migration",
       "surface": "dashboard route",
       "proof_key": "P29"
     },
     {
       "capability": "Import: translated content → target index via staged publication",
-      "features_ref": "FEATURES.md:243 Source migration",
+      "features_ref": "FEATURES.md:226 Source migration",
       "surface": "dashboard route",
       "proof_key": "P29"
     },
@@ -714,7 +714,7 @@
     },
     {
       "capability": "Staged publication primitive (crash-safe, node-local)",
-      "features_ref": "FEATURES.md:244 Source migration",
+      "features_ref": "FEATURES.md:227 Source migration",
       "surface": "API only",
       "proof_key": null
     }

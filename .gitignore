@@ -44,16 +44,14 @@ demo-dualclient/public/openapi.json
 
 # Lock files for dependencies
 # Keep: Cargo.lock (binary crate), console + dashboard + sdk_test package-lock.json
-# Ignore: other SDK/integration lock files (published libraries, not apps)
+# Ignore: other integration/library lock files (published libraries, not apps)
 **/package-lock.json
 !engine/console/package-lock.json
 !engine/dashboard/package-lock.json
 !engine/sdk_test/package-lock.json
 **/yarn.lock
-!sdks/javascript/yarn.lock
 **/Gemfile.lock
 **/poetry.lock
-!sdks/python/poetry.lock
 **/pubspec.lock
 **/composer.lock
 
@@ -115,7 +113,6 @@ NESL_INSTRUCTIONS.md
 *.ntvs*
 *.njsproj
 *.sln
-!sdks/csharp/*.sln
 *.sw?
 
 # Node
@@ -124,11 +121,6 @@ node_modules/
 **/__pycache__/
 **/*.pyc
 **/*.pyo
-
-# Large binary/archive files
-sdks/wordpress/*.zip
-sdks/javascript/.yarn/releases/
-
 
 *.parquet
 

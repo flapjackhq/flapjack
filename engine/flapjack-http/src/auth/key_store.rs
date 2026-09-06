@@ -87,6 +87,46 @@ impl KeyStore {
         Ok(store)
     }
 
+    /// Load an existing credential store without repairing, rotating, or
+    /// republishing any protected credential bytes.
+    ///
+    /// A release-fenced restart is allowed to observe the predecessor's
+    /// credentials, but changing them would make rollback depend on successor
+    /// state. Missing stores and an admin-key mismatch therefore fail closed;
+    /// ordinary startup remains the sole create/rotation owner.
+    pub(crate) fn try_load_existing_read_only(
+        data_dir: &Path,
+        admin_key: &str,
+    ) -> Result<Self, String> {
+        let file_path = data_dir.join("keys.json");
+        if !file_path.is_file() {
+            return Err("active release fence requires an existing keys.json".to_string());
+        }
+        let key_material_path = data_dir.join(KEY_MATERIAL_FILE_NAME);
+        let admin_key_path = data_dir.join(".admin_key");
+        let previous_admin_key = read_optional_admin_key(&admin_key_path)?;
+        let mut data = Self::read_key_store_data(&file_path)?;
+        hydrate_hmac_keys_from_material_file(
+            &key_material_path,
+            &mut data,
+            admin_key,
+            previous_admin_key.as_deref(),
+        )?;
+        let matches_persisted_admin = admin_key_entry(&data.keys)
+            .is_some_and(|entry| verify_key(admin_key, &entry.hash, &entry.salt));
+        if !matches_persisted_admin {
+            return Err(
+                "active release fence forbids rotating the persisted admin credential".to_string(),
+            );
+        }
+        Ok(Self {
+            data: RwLock::new(data),
+            file_path,
+            key_material_path,
+            admin_key_value: RwLock::new(admin_key.to_string()),
+        })
+    }
+
     fn load_key_store_data_or_default(
         file_path: &Path,
         admin_key: &str,

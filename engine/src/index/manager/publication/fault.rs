@@ -152,6 +152,12 @@ impl<'a> PublicationIo<'a> {
         self.sync_dir(require_parent(path)?)
     }
 
+    pub(super) fn remove_file(&self, path: &Path) -> Result<()> {
+        self.check(PublicationOperation::Remove(path.to_path_buf()))?;
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
     pub(super) fn remove_dir_if_empty(&self, path: &Path) -> Result<()> {
         if !path.exists() {
             return Ok(());

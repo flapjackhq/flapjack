@@ -1,10 +1,11 @@
 //! Stub summary for engine/flapjack-http/src/startup_tests.rs.
 use super::{
     acquire_data_dir_process_lock, build_log_layer_with_writer, build_tracing_subscriber,
-    cors_origins_from_value, initialize_key_store, load_server_config, log_format_from_value,
-    normalize_admin_key, read_admin_key, shutdown_timeout_secs_from_value, startup_banner_urls,
-    validate_startup_auth_policy, CorsMode, LogFormat, ServerConfig, StartupAuthValidationError,
-    StartupAuthValidationOutcome, TlsPaths, NO_AUTH_PUBLIC_BIND_WARNING,
+    cors_origins_from_value, initialize_key_store, initialize_key_store_for_mode,
+    load_server_config, log_format_from_value, normalize_admin_key, read_admin_key,
+    shutdown_timeout_secs_from_value, startup_banner_urls, validate_startup_auth_policy, CorsMode,
+    LogFormat, ServerConfig, StartupAuthValidationError, StartupAuthValidationOutcome,
+    StartupPersistenceMode, TlsPaths, NO_AUTH_PUBLIC_BIND_WARNING,
 };
 use crate::test_helpers::{EnvVarRestoreGuard, ENV_MUTEX};
 use axum::http::HeaderValue;
@@ -12,7 +13,7 @@ use flapjack_replication::config::NodeConfig;
 use serde_json::Value;
 use std::net::SocketAddr;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tracing_subscriber::layer::SubscriberExt;
@@ -583,6 +584,108 @@ fn initialize_key_store_persists_env_admin_key_with_restrictive_permissions() {
     assert_eq!(initialized.admin_key, Some("env-admin-key".to_string()));
     assert!(!initialized.key_is_new);
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn active_fence_rejects_credential_rotation_without_changing_protected_bytes() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut server_config = ServerConfig {
+        env_mode: "development".to_string(),
+        no_auth: false,
+        api_profile: crate::api_profile::ApiProfile::Full,
+        disable_dashboard: false,
+        allow_no_auth_public_bind: false,
+        admin_key_env: Some("predecessor-admin-key".to_string()),
+        replication_api_key_env: None,
+        data_dir: temp_dir.path().display().to_string(),
+        bind_addr: "127.0.0.1:7700".to_string(),
+        tls_paths: None,
+        node_config: NodeConfig {
+            node_id: "node-a".to_string(),
+            bind_addr: "127.0.0.1:7700".to_string(),
+            advertise_addr: None,
+            peers: Vec::new(),
+            bootstrap_peer: None,
+        },
+        _data_dir_lock: acquire_data_dir_process_lock(temp_dir.path()).unwrap(),
+    };
+    initialize_key_store(&server_config, temp_dir.path()).unwrap();
+    let protected_paths = [".admin_key", "keys.json", "key_material.json"];
+    let before = protected_paths.map(|name| std::fs::read(temp_dir.path().join(name)).unwrap());
+    #[cfg(unix)]
+    let before_inodes =
+        protected_paths.map(|name| std::fs::metadata(temp_dir.path().join(name)).unwrap().ino());
+
+    initialize_key_store_for_mode(
+        &server_config,
+        temp_dir.path(),
+        StartupPersistenceMode::FenceActive,
+    )
+    .expect("a matching predecessor credential should load read-only");
+    assert_eq!(
+        protected_paths.map(|name| std::fs::read(temp_dir.path().join(name)).unwrap()),
+        before,
+        "matching credential bytes must not be republished"
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        protected_paths
+            .map(|name| { std::fs::metadata(temp_dir.path().join(name)).unwrap().ino() }),
+        before_inodes,
+        "matching credential files must not be atomically replaced"
+    );
+
+    server_config.admin_key_env = Some("successor-admin-key".to_string());
+    let error = match initialize_key_store_for_mode(
+        &server_config,
+        temp_dir.path(),
+        StartupPersistenceMode::FenceActive,
+    ) {
+        Ok(_) => panic!("an active persisted fence must not rotate predecessor credentials"),
+        Err(error) => error,
+    };
+
+    assert!(error.contains("active release fence"));
+    let after = protected_paths.map(|name| std::fs::read(temp_dir.path().join(name)).unwrap());
+    assert_eq!(after, before, "credential-state hashes must remain exact");
+
+    let retry_error = match initialize_key_store_for_mode(
+        &server_config,
+        temp_dir.path(),
+        StartupPersistenceMode::FenceActive,
+    ) {
+        Ok(_) => panic!("a retried fenced startup must still reject credential rotation"),
+        Err(error) => error,
+    };
+    assert!(retry_error.contains("active release fence"));
+    let after_retry =
+        protected_paths.map(|name| std::fs::read(temp_dir.path().join(name)).unwrap());
+    assert_eq!(
+        after_retry, before,
+        "a retried fenced startup must preserve credential-state hashes"
+    );
+}
+
+#[test]
+fn server_opens_persisted_fence_before_mutable_startup_owners() {
+    let source = include_str!("server.rs");
+    let fence_open = source
+        .find("GlobalMutationFence::open(data_dir)")
+        .expect("server startup must open the persisted mutation fence");
+    let mode_selection = source
+        .find("startup_persistence_mode(&global_mutation_fence).await")
+        .expect("server startup must derive persistence mode from the opened fence");
+    let key_store = source
+        .find("initialize_key_store_for_mode(&server_config")
+        .expect("credential startup must receive the fence-derived mode");
+    let infrastructure = source
+        .find("initialize_server_infrastructure_with_fence(")
+        .expect("subsystem startup must receive the already-open fence");
+
+    assert!(
+        fence_open < mode_selection && mode_selection < key_store && key_store < infrastructure,
+        "the persisted fence must be opened and classified before credentials and every downstream mutable startup owner"
+    );
 }
 
 /// TODO: Document shared_admin_key_persistence_sets_restrictive_permissions.

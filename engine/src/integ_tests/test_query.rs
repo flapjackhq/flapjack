@@ -709,6 +709,64 @@ mod synonyms {
         let loaded = SynonymStore::load(&path).unwrap();
         assert!(loaded.get("pants-trousers").is_some());
     }
+
+    #[tokio::test]
+    async fn pbv5_exp_004_multi_word_regular_synonyms_change_search_bidirectionally() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = IndexManager::new(temp_dir.path());
+        manager.create_tenant("test").unwrap();
+
+        let mut store = SynonymStore::new();
+        store.insert(Synonym::Regular {
+            object_id: "aurora-rule".to_string(),
+            synonyms: vec![
+                "aurora".to_string(),
+                "glow".to_string(),
+                "northern lights".to_string(),
+            ],
+        });
+        store
+            .save(temp_dir.path().join("test/synonyms.json"))
+            .unwrap();
+        manager.invalidate_synonyms_cache("test");
+
+        manager
+            .add_documents_sync(
+                "test",
+                vec![
+                    doc("aurora-doc", vec![("title", text("Aurora field guide"))]),
+                    doc("phrase-doc", vec![("title", text("Northern lights guide"))]),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let phrase = manager
+            .search("test", "northern lights", None, None, 10)
+            .unwrap();
+        let phrase_ids = result_ids(&phrase);
+        assert!(
+            phrase_ids.contains(&"aurora-doc"),
+            "a multi-word regular synonym must expand to its single-word peer"
+        );
+
+        let reverse = manager.search("test", "aurora", None, None, 10).unwrap();
+        let reverse_ids = result_ids(&reverse);
+        assert!(
+            reverse_ids.contains(&"phrase-doc"),
+            "the single-word peer must expand back to the multi-word regular synonym"
+        );
+
+        let single_word = manager.search("test", "glow", None, None, 10).unwrap();
+        let single_word_ids = result_ids(&single_word);
+        assert!(single_word_ids.contains(&"aurora-doc"));
+
+        let unrelated = manager.search("test", "sunset", None, None, 10).unwrap();
+        assert_eq!(
+            unrelated.total, 0,
+            "unrelated queries must remain unrelated"
+        );
+    }
 }
 
 // ============================================================
@@ -1233,6 +1291,48 @@ mod decompound {
             with_ids.contains(&"split"),
             "split form must match via Dutch decompounding when enabled"
         );
+    }
+
+    #[tokio::test]
+    async fn pbv5_exp_011_german_stemming_composes_with_query_decompounding() {
+        let settings = IndexSettings {
+            query_languages: vec!["de".to_string()],
+            index_languages: vec!["de".to_string()],
+            query_type: "prefixNone".to_string(),
+            ..Default::default()
+        };
+        let (_tmp, manager) = setup_tenant_fixture(
+            settings,
+            vec![
+                doc("compound", vec![("title", text("Hundehütte"))]),
+                doc("split", vec![("title", text("Hunde Hütte"))]),
+            ],
+            true,
+        )
+        .await;
+
+        let without = search_with_decompound_flag(&manager, "Hundehütte", false).unwrap();
+        assert_eq!(result_ids(&without), vec!["compound"]);
+
+        let with = search_with_decompound_flag(&manager, "Hundehütte", true).unwrap();
+        let mut with_ids = result_ids(&with);
+        with_ids.sort_unstable();
+        assert_eq!(with_ids, vec!["compound", "split"]);
+
+        let default = manager
+            .search_full_with_stop_words_with_hits_per_page_cap(
+                "test",
+                "Hundehütte",
+                &crate::index::SearchOptions {
+                    limit: 10,
+                    typo_tolerance: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut default_ids = result_ids(&default);
+        default_ids.sort_unstable();
+        assert_eq!(default_ids, vec!["compound", "split"]);
     }
 }
 

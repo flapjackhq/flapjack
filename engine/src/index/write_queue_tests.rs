@@ -445,7 +445,8 @@ fn dur1_replicated_documents(
                 ReplicatedWriteOrigin::new(
                     10_000 + index as u64,
                     format!("dur1-replica-node-{index}"),
-                ),
+                )
+                .with_origin_seq(index as u64 + 1),
             )
         })
         .collect()
@@ -3906,7 +3907,7 @@ async fn contended_idle_queue_keeps_merge_owner_until_backlog_converges() {
     )
     .await;
 
-    let observation = tokio::time::timeout(Duration::from_secs(10), async {
+    let observation = tokio::time::timeout(WRITE_QUEUE_PROGRESS_TIMEOUT, async {
         loop {
             if task_succeeded(tasks_b.as_ref(), &task_b) {
                 let observation = observed_segments(index_a.as_ref());

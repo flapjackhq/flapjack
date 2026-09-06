@@ -3,6 +3,67 @@ use flapjack::validate_index_name;
 use flapjack::IndexManager;
 use serde_json::Value;
 
+pub(crate) fn preflight_index_op(tenant_id: &str, op_entry: &OpLogEntry) -> Result<(), String> {
+    let validate_endpoint = |operation: &str, field_name: &str| {
+        let value = op_entry
+            .payload
+            .get(field_name)
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "[REPL {}] {} seq {} missing {} field",
+                    tenant_id, operation, op_entry.seq, field_name
+                )
+            })?;
+        validate_index_name(value).map_err(|error| {
+            format!(
+                "[REPL {}] {} seq {} invalid {} '{}': {}",
+                tenant_id, operation, op_entry.seq, field_name, value, error
+            )
+        })?;
+        Ok::<&str, String>(value)
+    };
+    let validate_distinct_endpoints = |operation: &str, source: &str, destination: &str| {
+        if source == destination {
+            return Err(format!(
+                "[REPL {}] {} seq {} source and destination must differ",
+                tenant_id, operation, op_entry.seq
+            ));
+        }
+        Ok(())
+    };
+
+    match op_entry.op_type.as_str() {
+        "move_index" => {
+            let source = validate_endpoint("move_index", "source")?;
+            let destination = validate_endpoint("move_index", "destination")?;
+            validate_distinct_endpoints("move_index", source, destination)?;
+            Err(format!(
+                "[REPL {}] move_index replication is disabled at seq {} because exact prior application cannot be proven",
+                tenant_id, op_entry.seq
+            ))
+        }
+        "copy_index" => {
+            let source = validate_endpoint("copy_index", "source")?;
+            let destination = validate_endpoint("copy_index", "destination")?;
+            validate_distinct_endpoints("copy_index", source, destination)?;
+            parse_copy_scope(tenant_id, op_entry)?;
+            Err(format!(
+                "[REPL {}] copy_index replication is disabled at seq {} because exact prior application cannot be proven",
+                tenant_id, op_entry.seq
+            ))
+        }
+        "clear_index" => {
+            validate_endpoint("clear_index", "index_name")?;
+            Err(format!(
+                "[REPL {}] clear_index replication is disabled at seq {} because exact prior application cannot be proven",
+                tenant_id, op_entry.seq
+            ))
+        }
+        _ => unreachable!("index preflight only receives index operations"),
+    }
+}
+
 /// Apply a move-index replication op.
 pub(crate) async fn apply_move_index_op(
     manager: &IndexManager,
@@ -113,7 +174,7 @@ pub(crate) async fn apply_copy_index_op(
             "source_settings",
             "settings.json",
             |index_manager, index_name| index_manager.invalidate_settings_cache(index_name),
-        );
+        )?;
     }
 
     if scope_includes(scope.as_deref(), "synonyms") {
@@ -125,7 +186,7 @@ pub(crate) async fn apply_copy_index_op(
             "source_synonyms",
             "synonyms.json",
             |index_manager, index_name| index_manager.invalidate_synonyms_cache(index_name),
-        );
+        )?;
     }
 
     if scope_includes(scope.as_deref(), "rules") {
@@ -137,7 +198,7 @@ pub(crate) async fn apply_copy_index_op(
             "source_rules",
             "rules.json",
             |index_manager, index_name| index_manager.invalidate_rules_cache(index_name),
-        );
+        )?;
     }
 
     Ok(())
@@ -199,7 +260,8 @@ fn copy_scoped_payload_if_present<F>(
     payload_key: &str,
     filename: &str,
     invalidate_cache: F,
-) where
+) -> Result<(), String>
+where
     F: FnOnce(&IndexManager, &str),
 {
     let Some(payload) = op_entry
@@ -207,10 +269,10 @@ fn copy_scoped_payload_if_present<F>(
         .get(payload_key)
         .filter(|value| !value.is_null())
     else {
-        return;
+        return Ok(());
     };
 
-    if let Err(error) = copy_scoped_json_file(ScopedJsonFileCopy {
+    copy_scoped_json_file(ScopedJsonFileCopy {
         manager,
         tenant_id,
         seq: op_entry.seq,
@@ -219,9 +281,7 @@ fn copy_scoped_payload_if_present<F>(
         payload_key,
         filename,
         invalidate_cache,
-    }) {
-        tracing::warn!("{}", error);
-    }
+    })
 }
 
 /// Apply a clear-index replication op.
@@ -249,12 +309,22 @@ pub(crate) async fn apply_clear_index_op(
     let relevance_path = index_path.join("relevance.json");
 
     let settings = if settings_path.exists() {
-        std::fs::read(&settings_path).ok()
+        Some(std::fs::read(&settings_path).map_err(|error| {
+            format!(
+                "[REPL {}] clear_index seq {} failed to read settings for {}: {}",
+                tenant_id, op_entry.seq, index_name, error
+            )
+        })?)
     } else {
         None
     };
     let relevance = if relevance_path.exists() {
-        std::fs::read(&relevance_path).ok()
+        Some(std::fs::read(&relevance_path).map_err(|error| {
+            format!(
+                "[REPL {}] clear_index seq {} failed to read relevance for {}: {}",
+                tenant_id, op_entry.seq, index_name, error
+            )
+        })?)
     } else {
         None
     };
@@ -277,29 +347,23 @@ pub(crate) async fn apply_clear_index_op(
     })?;
 
     if let Some(data) = settings {
-        if let Err(error) =
-            flapjack::index::atomic_write_file(&settings_path, &data).map_err(|error| {
-                format!(
-                    "[REPL {}] clear_index seq {} failed to restore settings for {}: {}",
-                    tenant_id, op_entry.seq, index_name, error
-                )
-            })
-        {
-            tracing::warn!("{}", error);
-        }
+        flapjack::index::atomic_write_file(&settings_path, &data).map_err(|error| {
+            format!(
+                "[REPL {}] clear_index seq {} failed to restore settings for {}: {}",
+                tenant_id, op_entry.seq, index_name, error
+            )
+        })?;
+        manager.invalidate_settings_cache(index_name);
+        manager.invalidate_facet_cache(index_name);
     }
 
     if let Some(data) = relevance {
-        if let Err(error) =
-            flapjack::index::atomic_write_file(&relevance_path, &data).map_err(|error| {
-                format!(
-                    "[REPL {}] clear_index seq {} failed to restore relevance for {}: {}",
-                    tenant_id, op_entry.seq, index_name, error
-                )
-            })
-        {
-            tracing::warn!("{}", error);
-        }
+        flapjack::index::atomic_write_file(&relevance_path, &data).map_err(|error| {
+            format!(
+                "[REPL {}] clear_index seq {} failed to restore relevance for {}: {}",
+                tenant_id, op_entry.seq, index_name, error
+            )
+        })?;
     }
 
     Ok(())

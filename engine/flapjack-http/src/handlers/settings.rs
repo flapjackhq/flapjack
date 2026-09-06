@@ -26,9 +26,11 @@ use crate::security_audit::{
     emit_set_settings_action, Actor, AuditIndexName, Outcome, SettingsChangedFields, Target,
 };
 use flapjack::index::{
+    replica::{validate_replicas, ReplicaEntry},
     settings::{IndexMode, IndexSettings, SemanticSearchSettings},
     SearchOptions,
 };
+use flapjack::validate_index_name;
 
 const FACET_REINDEX_SCAN_PAGE_SIZE: usize = 1000;
 const FACET_REINDEX_WRITE_BATCH_SIZE: usize = 250;
@@ -103,6 +105,9 @@ pub struct SetSettingsRequest {
 
     #[serde(rename = "queryLanguages")]
     pub query_languages: Option<Vec<String>>,
+
+    #[serde(rename = "indexLanguages")]
+    pub index_languages: Option<Vec<String>>,
 
     #[serde(rename = "queryType")]
     pub query_type: Option<String>,
@@ -320,6 +325,7 @@ fn settings_changed_fields(payload: &SetSettingsRequest) -> SettingsChangedField
         remove_stop_words => "removeStopWords",
         ignore_plurals => "ignorePlurals",
         query_languages => "queryLanguages",
+        index_languages => "indexLanguages",
         query_type => "queryType",
         exact_on_single_word_query => "exactOnSingleWordQuery",
         remove_words_if_no_results => "removeWordsIfNoResults",
@@ -360,9 +366,25 @@ fn faceting_configuration_changed(
     previous_settings.attributes_for_faceting != next_settings.attributes_for_faceting
 }
 
+pub(in crate::handlers) fn validate_exact_index_settings(
+    index_name: &str,
+    settings: &IndexSettings,
+) -> Result<Vec<ReplicaEntry>, String> {
+    validate_index_name(index_name).map_err(|error| error.to_string())?;
+    if let Some(primary) = settings.primary.as_deref() {
+        validate_index_name(primary).map_err(|error| error.to_string())?;
+        if primary == index_name {
+            return Err("an index cannot be its own primary".to_string());
+        }
+    }
+    settings.validate_embedders()?;
+    validate_replicas(index_name, settings.replicas.as_deref().unwrap_or_default())
+        .map_err(|error| error.to_string())
+}
+
 /// TODO: Document collect_index_documents.
 fn collect_index_document_ids(
-    state: &Arc<AppState>,
+    state: &AppState,
     index_name: &str,
 ) -> Result<Vec<String>, HandlerError> {
     let mut object_ids = Vec::new();
@@ -404,7 +426,7 @@ fn collect_index_document_ids(
 
 /// TODO: Document rebuild_documents_for_updated_faceting.
 async fn rebuild_documents_for_updated_faceting(
-    state: &Arc<AppState>,
+    state: &AppState,
     index_name: &str,
 ) -> Result<(), HandlerError> {
     // Snapshot object IDs first, then reload documents in bounded batches so a
@@ -432,14 +454,86 @@ async fn rebuild_documents_for_updated_faceting(
             continue;
         }
 
-        state
+        let task = state
             .manager
-            .add_documents_sync(index_name, documents)
-            .await
+            .add_documents_for_replication(index_name, documents)
             .map_err(|error| HandlerError::from(error.to_string()))?;
+        super::internal_ops::wait_for_durable_replication_task(
+            &state.manager,
+            index_name,
+            "settings faceting rebuild",
+            &task.id,
+        )
+        .await
+        .map_err(HandlerError::from)?;
     }
 
     Ok(())
+}
+
+pub(in crate::handlers) struct ExactSettingsApplication {
+    pub faceting_reindex_required: bool,
+    pub is_virtual_settings_only: bool,
+}
+
+/// Persist one complete settings snapshot and apply its semantic side effects
+/// without emitting a destination settings oplog entry.
+pub(in crate::handlers) async fn apply_exact_index_settings_no_oplog(
+    state: &AppState,
+    index_name: &str,
+    settings: &IndexSettings,
+    ensure_faceting_on_exact_reapply: bool,
+) -> Result<ExactSettingsApplication, HandlerError> {
+    let validated_replicas =
+        validate_exact_index_settings(index_name, settings).map_err(HandlerError::bad_request)?;
+    let index_path = state.manager.base_path.join(index_name);
+    let settings_path = settings_file_path(&state.manager.base_path, index_name);
+    let settings_existed = settings_path.exists();
+    let previous_settings = load_settings_or_default(&settings_path)?;
+    let previous_replicas = previous_settings.replicas.clone();
+    let faceting_changed = faceting_configuration_changed(&previous_settings, settings);
+    let faceting_reindex_required =
+        faceting_changed || (ensure_faceting_on_exact_reapply && settings_existed);
+    let is_virtual_settings_only =
+        settings.primary.is_some() && !index_path.join("meta.json").exists();
+
+    if is_virtual_settings_only {
+        std::fs::create_dir_all(&index_path)
+            .map_err(|error| HandlerError::from(error.to_string()))?;
+    } else {
+        state
+            .manager
+            .create_tenant(index_name)
+            .map_err(|error| HandlerError::from(error.to_string()))?;
+    }
+
+    // Reconcile replica links before replacing the primary's settings snapshot.
+    // If a link write fails, the old replica list remains available for a safe retry.
+    clear_removed_replica_primary_links(
+        state,
+        index_name,
+        previous_replicas.as_deref(),
+        &validated_replicas,
+    )
+    .map_err(|error| HandlerError::from(error.to_string()))?;
+    persist_replica_primary_links(state, index_name, &validated_replicas)
+        .map_err(|error| HandlerError::from(error.to_string()))?;
+
+    save_settings(settings, &settings_path)?;
+    state.manager.invalidate_settings_cache(index_name);
+    state.manager.invalidate_facet_cache(index_name);
+
+    #[cfg(feature = "vector-search")]
+    state.embedder_store.invalidate(index_name);
+
+    if faceting_reindex_required && !is_virtual_settings_only {
+        rebuild_documents_for_updated_faceting(state, index_name).await?;
+    }
+
+    Ok(ExactSettingsApplication {
+        faceting_reindex_required,
+        is_virtual_settings_only,
+    })
 }
 
 /// Parse an optional boolean query parameter, defaulting to `false` when absent.
@@ -460,16 +554,10 @@ pub(super) fn parse_bool_query_param(
 
 struct SettingsMutationPlan {
     settings: IndexSettings,
-    previous_replicas: Option<Vec<String>>,
-    validated_replicas: Option<Vec<flapjack::index::replica::ReplicaEntry>>,
     unsupported: Vec<String>,
     forward_to_replicas: bool,
     attributes_for_faceting_provided: bool,
     query_languages_provided: bool,
-    faceting_changed: bool,
-    is_virtual_settings_only: bool,
-    #[cfg(feature = "vector-search")]
-    embedders_updated: bool,
 }
 
 async fn persist_settings_mutation(
@@ -478,21 +566,12 @@ async fn persist_settings_mutation(
     settings_path: &Path,
     plan: SettingsMutationPlan,
 ) -> Result<(StatusCode, Json<SetSettingsResponse>), HandlerError> {
-    save_settings(&plan.settings, settings_path)?;
-    state.manager.invalidate_settings_cache(index_name);
-    state.manager.invalidate_facet_cache(index_name);
-
-    if let Some(ref replicas) = plan.validated_replicas {
-        clear_removed_replica_primary_links(
-            state,
-            index_name,
-            plan.previous_replicas.as_deref(),
-            replicas,
-        )
-        .map_err(|error| HandlerError::from(error.to_string()))?;
-        persist_replica_primary_links(state, index_name, replicas)
-            .map_err(|error| HandlerError::from(error.to_string()))?;
-    }
+    debug_assert_eq!(
+        settings_path,
+        settings_file_path(&state.manager.base_path, index_name)
+    );
+    let exact_application =
+        apply_exact_index_settings_no_oplog(state, index_name, &plan.settings, false).await?;
 
     if plan.forward_to_replicas {
         forward_settings_to_replicas(
@@ -504,20 +583,15 @@ async fn persist_settings_mutation(
         .map_err(|error| HandlerError::from(error.to_string()))?;
     }
 
-    if plan.faceting_changed && !plan.is_virtual_settings_only {
-        rebuild_documents_for_updated_faceting(state, index_name).await?;
-        if plan.forward_to_replicas {
-            for replica_name in standard_replicas_for_primary(state, index_name)
-                .map_err(|error| HandlerError::from(error.to_string()))?
-            {
-                rebuild_documents_for_updated_faceting(state, &replica_name).await?;
-            }
+    if exact_application.faceting_reindex_required
+        && !exact_application.is_virtual_settings_only
+        && plan.forward_to_replicas
+    {
+        for replica_name in standard_replicas_for_primary(state, index_name)
+            .map_err(|error| HandlerError::from(error.to_string()))?
+        {
+            rebuild_documents_for_updated_faceting(state, &replica_name).await?;
         }
-    }
-
-    #[cfg(feature = "vector-search")]
-    if plan.embedders_updated {
-        state.embedder_store.invalidate(index_name);
     }
 
     state.manager.append_oplog(
@@ -574,26 +648,15 @@ pub async fn set_settings(
     }
 
     let forward_to_replicas = parse_bool_query_param(&query_params, "forwardToReplicas")?;
-    if !is_virtual_settings_only {
-        state
-            .manager
-            .create_tenant(&index_name)
-            .map_err(|error| HandlerError::from(error.to_string()))?;
-    }
-
     let settings_path = settings_file_path(&state.manager.base_path, &index_name);
     let unsupported = unsupported_settings_params(&payload);
     let attributes_for_faceting_provided = payload.attributes_for_faceting.is_some();
     let query_languages_provided = payload.query_languages.is_some();
-    #[cfg(feature = "vector-search")]
-    let embedders_updated = payload.embedders.is_some();
-
     let mut settings = load_settings_or_default(&settings_path)?;
     let previous_settings = settings.clone();
-    let previous_replicas = settings.replicas.clone();
     let old_embedders = settings.embedders.clone();
 
-    let validated_replicas = merge_settings_payload(&mut settings, payload, &index_name)
+    let _validated_replicas = merge_settings_payload(&mut settings, payload, &index_name)
         .map_err(|(status, message)| HandlerError::Custom { status, message })?;
     let audit_target = Target::index_settings(&AuditIndexName::from_validated(&index_name));
     settings.restore_redacted_response_secrets(&previous_settings);
@@ -601,24 +664,16 @@ pub async fn set_settings(
         .validate_embedders()
         .map_err(HandlerError::bad_request)?;
     log_embedder_changes(&old_embedders, &settings);
-    let faceting_changed = faceting_configuration_changed(&previous_settings, &settings);
-
     let mutation_result = persist_settings_mutation(
         &state,
         &index_name,
         &settings_path,
         SettingsMutationPlan {
             settings,
-            previous_replicas,
-            validated_replicas,
             unsupported,
             forward_to_replicas,
             attributes_for_faceting_provided,
             query_languages_provided,
-            faceting_changed,
-            is_virtual_settings_only,
-            #[cfg(feature = "vector-search")]
-            embedders_updated,
         },
     )
     .await;

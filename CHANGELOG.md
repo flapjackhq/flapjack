@@ -7,6 +7,11 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Removed
+
+- **The Flapjack-specific client SDKs are retired; the supported clients are the official Algolia SDKs.** `sdks/` (eleven generated language clients and the WordPress plugin) is deleted with its CI jobs and the `--go` / `--sdk-host-safety` test flags. Sources remain in git history. Registry deprecation and removal actions and the public history tag `sdks-retired-2026-09` remain pending operator work.
+- `integrations/` (django, rails, laravel-scout) is deleted; they depended on the retired SDKs. Use `algoliasearch-rails`, `algoliasearch-django`, or Laravel Scout's Algolia driver.
+
 ## [1.0.16] - 2026-08-20
 
 ### Changed

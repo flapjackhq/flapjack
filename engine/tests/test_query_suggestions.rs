@@ -44,13 +44,16 @@ async fn get_config(base: &str, index_name: &str) -> reqwest::Response {
 }
 
 async fn get_status(base: &str, index_name: &str) -> Value {
-    auth(client().get(format!("{}/1/configs/{}/status", base, index_name)))
+    let response = auth(client().get(format!("{}/1/configs/{}/status", base, index_name)))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap()
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "status request for '{index_name}' returned HTTP {}",
+        response.status()
+    );
+    response.json().await.unwrap()
 }
 
 /// Poll status until isRunning is false or timeout.
@@ -414,7 +417,14 @@ async fn build_status_reflects_last_build() {
     let (addr, _tmp) = spawn_server_with_qs_analytics("products").await;
     let base = format!("http://{}", addr);
 
-    post_config(&base, basic_config("status_test", "products")).await;
+    let create_response = post_config(&base, basic_config("status_test", "products")).await;
+    let create_status = create_response.status();
+    let create_body = create_response.text().await.unwrap();
+    assert_eq!(
+        create_status,
+        reqwest::StatusCode::OK,
+        "create config returned HTTP {create_status}: {create_body}"
+    );
     wait_for_build(&base, "status_test").await;
 
     let status = get_status(&base, "status_test").await;

@@ -59,8 +59,17 @@ fn replicate_oplog_entry(
     if let Some(oplog) = state.manager.get_oplog(index_name) {
         match oplog.read_since(pre_seq) {
             Ok(ops) if !ops.is_empty() => {
+                let mutation_permit = crate::pause_registry::request_mutation_permit()
+                    .or_else(|| state.global_mutation_fence.try_admit_mutation().ok());
+                let Some(mutation_permit) = mutation_permit else {
+                    tracing::warn!(
+                        "[REPL] no admitted mutation permit for index replication child"
+                    );
+                    return;
+                };
                 let tenant = index_name.to_string();
                 tokio::spawn(async move {
+                    let _mutation_permit = mutation_permit;
                     repl_mgr.replicate_ops(&tenant, ops).await;
                 });
             }

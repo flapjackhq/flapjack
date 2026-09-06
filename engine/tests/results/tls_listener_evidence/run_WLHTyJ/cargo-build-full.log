@@ -1,0 +1,23 @@
+   Compiling hyper-util v0.1.20
+   Compiling tokio-rustls v0.26.4
+   Compiling flapjack v1.0.10 (<engine-dir>)
+   Compiling rustls-pemfile v2.2.0
+   Compiling hyper-rustls v0.27.9
+   Compiling axum v0.7.9
+   Compiling aws-smithy-http-client v1.1.12
+   Compiling reqwest v0.12.28
+   Compiling instant-acme v0.8.5
+   Compiling aws-smithy-runtime v1.11.3
+   Compiling flapjack-ssl v1.0.10 (<engine-dir>/flapjack-ssl)
+   Compiling rust-s3 v0.37.2
+   Compiling utoipa-swagger-ui v8.1.0
+   Compiling aws-runtime v1.7.4
+   Compiling aws-sdk-sts v1.104.0
+   Compiling aws-sdk-sso v1.99.0
+   Compiling aws-sdk-ssooidc v1.101.0
+   Compiling aws-sdk-sesv2 v1.119.0
+   Compiling aws-config v1.8.17
+   Compiling flapjack-replication v1.0.10 (<engine-dir>/flapjack-replication)
+   Compiling flapjack-http v1.0.10 (<engine-dir>/flapjack-http)
+   Compiling flapjack-server v1.0.10 (<engine-dir>/flapjack-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 35.91s

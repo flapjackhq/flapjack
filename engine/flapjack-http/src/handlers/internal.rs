@@ -1,20 +1,23 @@
+use crate::dto::SearchRequest;
 use crate::extractors::ValidatedIndexName;
 use crate::handlers::internal_ops::{
     apply_clear_index_op, apply_clear_rules_op, apply_clear_synonyms_op, apply_copy_index_op,
     apply_delete_op, apply_delete_rule_op, apply_delete_synonym_op, apply_move_index_op,
     apply_save_rule_op, apply_save_rules_op, apply_save_synonym_op, apply_save_synonyms_op,
-    apply_upsert_op, flush_document_batch, ReplicatedDocumentBatch,
+    apply_settings_op, apply_upsert_op, flush_document_batch, preflight_document_op,
+    preflight_index_op, preflight_resource_op, preflight_settings_op, ReplicatedDocumentBatch,
 };
 use crate::handlers::AppState;
+use crate::pause_registry::data_root_sibling_name;
 use crate::security_audit::{self, Action, Actor, Outcome, Target};
 use axum::{
     extract::{Path, Query, State},
-    http::header,
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use chrono::{DateTime, Utc};
+use flapjack::index::manager::publication::{ContentDigest, PublicationTransactionId};
 use flapjack::index::oplog::{OpLog, OpLogEntry};
 use flapjack::{validate_index_name, IndexManager};
 use flapjack_replication::config::{NodeConfig, PeerConfig};
@@ -23,24 +26,220 @@ use flapjack_replication::manager::{
 };
 use flapjack_replication::types::{
     GetOpsQuery, GetOpsResponse, ListTenantsResponse, ReplicateOpsRequest, ReplicateOpsResponse,
+    RELEASE_TRANSFER_AFTER_SEQ_HEADER, RELEASE_TRANSFER_CONTRACT_HEADER,
+    RELEASE_TRANSFER_CONTRACT_V1, RELEASE_TRANSFER_PAYLOAD_SHA256_HEADER,
+    RELEASE_TRANSFER_SNAPSHOT_SHA256_HEADER, RELEASE_TRANSFER_STATUS_ACKNOWLEDGED,
+    RELEASE_TRANSFER_STATUS_CONTIGUOUS, RELEASE_TRANSFER_STATUS_HEADER,
+    RELEASE_TRANSFER_STATUS_RESNAPSHOT_REQUIRED, RELEASE_TRANSFER_TENANT_HEADER,
+    RELEASE_TRANSFER_THROUGH_SEQ_HEADER, RELEASE_TRANSFER_TRANSACTION_HEADER,
 };
 use flapjack_ssl::manager::RenewalStatus;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
+use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 use utoipa::ToSchema;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReleaseWriteFenceRequest {
+    transaction_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseWriteFenceResponse {
+    active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_id: Option<String>,
+}
+
+fn mutation_fence_error(error: crate::pause_registry::MutationFenceError) -> Response {
+    use crate::pause_registry::MutationFenceError;
+    match error {
+        MutationFenceError::InvalidTransaction => crate::error_response::json_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid release transaction identifier",
+        ),
+        MutationFenceError::Conflict => crate::error_response::json_error(
+            StatusCode::CONFLICT,
+            "Release mutation fence transaction conflict",
+        ),
+        MutationFenceError::Storage(error) => {
+            tracing::error!("release mutation fence storage failed: {error}");
+            crate::error_response::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error",
+            )
+        }
+    }
+}
+
+pub async fn release_write_fence_status(
+    State(state): State<Arc<AppState>>,
+) -> Json<ReleaseWriteFenceResponse> {
+    let status = state.global_mutation_fence.status().await;
+    Json(ReleaseWriteFenceResponse {
+        active: status.is_some(),
+        transaction_id: status.map(|status| status.transaction_id),
+    })
+}
+
+pub async fn acquire_release_write_fence(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ReleaseWriteFenceRequest>,
+) -> Response {
+    match state
+        .global_mutation_fence
+        .acquire(&request.transaction_id)
+        .await
+    {
+        Ok(status) => Json(ReleaseWriteFenceResponse {
+            active: true,
+            transaction_id: Some(status.transaction_id),
+        })
+        .into_response(),
+        Err(error) => mutation_fence_error(error),
+    }
+}
+
+pub async fn release_release_write_fence(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ReleaseWriteFenceRequest>,
+) -> Response {
+    match state
+        .global_mutation_fence
+        .release(&request.transaction_id)
+        .await
+    {
+        Ok(()) => Json(ReleaseWriteFenceResponse {
+            active: false,
+            transaction_id: Some(request.transaction_id),
+        })
+        .into_response(),
+        Err(error) => mutation_fence_error(error),
+    }
+}
+
+/// Canonical document inventory used by both the protected runtime probe and
+/// the post-drain shutdown receipt. IndexManager is tenant-per-index, so one
+/// stable identifier names both ownership scopes without duplicating fields.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ReleaseInventoryEntry {
+    pub index_id: String,
+    pub document_count: u64,
+}
+
+/// Load every durable tenant after the listener closes and before the final
+/// queue drain. This prevents a cold, currently-unloaded tenant from silently
+/// disappearing from the post-drain release inventory.
+pub(crate) fn prepare_release_inventory(manager: &IndexManager) -> Result<(), String> {
+    let index_ids =
+        crate::tenant_dirs::visible_tenant_dir_names(&manager.base_path).map_err(|error| {
+            format!("release inventory could not enumerate durable tenants: {error}")
+        })?;
+    for index_id in index_ids {
+        manager
+            .get_or_load(&index_id)
+            .map_err(|error| format!("release inventory could not load {index_id}: {error}"))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn canonical_release_inventory(
+    manager: &IndexManager,
+) -> Result<Vec<ReleaseInventoryEntry>, String> {
+    let mut durable_index_ids = crate::tenant_dirs::visible_tenant_dir_names(&manager.base_path)
+        .map_err(|error| {
+            format!("release inventory could not enumerate durable tenants: {error}")
+        })?;
+    durable_index_ids.sort();
+    let mut index_ids = manager.loaded_tenant_ids();
+    index_ids.sort();
+    if index_ids != durable_index_ids {
+        return Err(format!(
+            "release inventory loaded/durable tenant mismatch: loaded={index_ids:?} durable={durable_index_ids:?}"
+        ));
+    }
+    index_ids
+        .into_iter()
+        .map(|index_id| {
+            let document_count = manager.tenant_doc_count(&index_id).ok_or_else(|| {
+                format!("loaded index {index_id} has no authoritative document count")
+            })?;
+            Ok(ReleaseInventoryEntry {
+                index_id,
+                document_count,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InternalCountOnlySearchRequest {
+    #[serde(default)]
+    pub query: String,
+    pub hits_per_page: Option<usize>,
+}
+
+fn validate_count_only_hits_per_page(
+    hits_per_page: Option<usize>,
+) -> Result<(), (StatusCode, String)> {
+    if hits_per_page == Some(0) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::BAD_REQUEST,
+        "internal count-only search requires hitsPerPage: 0".to_string(),
+    ))
+}
 
 /// Core apply logic: parse ops and write to IndexManager.
 /// Returns the highest sequence number applied, or an error string.
 ///
-/// Conflict admission compares `(timestamp_ms, node_id)` tuples against the
-/// durable version store and an invocation-scoped overlay.
+/// Conflict admission compares `(timestamp_ms, node_id, source_seq)` against
+/// durable origin proof. Equal proven tuples succeed only for the same logical
+/// effect digest; legacy or contradictory equal evidence fails closed.
 pub async fn apply_ops_to_manager(
     manager: &IndexManager,
     tenant_id: &str,
     ops: &[OpLogEntry],
 ) -> Result<u64, String> {
+    apply_ops(manager, None, tenant_id, ops).await
+}
+
+pub(crate) async fn apply_ops_to_state(
+    state: &AppState,
+    tenant_id: &str,
+    ops: &[OpLogEntry],
+) -> Result<u64, String> {
+    apply_ops(&state.manager, Some(state), tenant_id, ops).await
+}
+
+async fn apply_ops(
+    manager: &IndexManager,
+    state: Option<&AppState>,
+    tenant_id: &str,
+    ops: &[OpLogEntry],
+) -> Result<u64, String> {
     validate_index_name(tenant_id).map_err(|e| e.to_string())?;
+    #[cfg(test)]
+    if let Some(first) = ops.first() {
+        crate::handlers::internal_ops::run_after_document_proof_accepted_hook_for_test(first.seq);
+    }
+    let _replication_guard = manager.lock_replication_apply(tenant_id).await;
+    preflight_replication_batch(tenant_id, ops)?;
+    if state.is_none() && ops.iter().any(|entry| entry.op_type == "settings") {
+        return Err(format!(
+            "[REPL {}] settings replication requires application state",
+            tenant_id
+        ));
+    }
 
     bootstrap_document_version_state(manager, tenant_id, ops)?;
 
@@ -48,13 +247,787 @@ pub async fn apply_ops_to_manager(
     let mut document_batch = ReplicatedDocumentBatch::default();
 
     for op_entry in ops {
-        max_seq = max_seq.max(op_entry.seq);
+        if !matches!(op_entry.op_type.as_str(), "upsert" | "delete") {
+            flush_document_batch(manager, tenant_id, std::mem::take(&mut document_batch)).await?;
+        }
         let incoming = (op_entry.timestamp_ms, op_entry.node_id.clone());
-        apply_replication_op(manager, tenant_id, op_entry, incoming, &mut document_batch).await?;
+        apply_replication_op(
+            manager,
+            state,
+            tenant_id,
+            op_entry,
+            incoming,
+            &mut document_batch,
+        )
+        .await?;
+        max_seq = max_seq.max(op_entry.seq);
     }
 
     flush_document_batch(manager, tenant_id, document_batch).await?;
     Ok(max_seq)
+}
+
+fn preflight_replication_batch(tenant_id: &str, ops: &[OpLogEntry]) -> Result<(), String> {
+    for op_entry in ops {
+        if op_entry.tenant_id != tenant_id {
+            return Err(format!(
+                "[REPL {}] inner tenant {} does not match outer tenant {} at seq {}",
+                tenant_id, op_entry.tenant_id, tenant_id, op_entry.seq
+            ));
+        }
+    }
+
+    for op_entry in ops {
+        preflight_replication_op(tenant_id, op_entry)?;
+    }
+    Ok(())
+}
+
+fn validate_single_sender_sequence(tenant_id: &str, ops: &[OpLogEntry]) -> Result<(), String> {
+    for entries in ops.windows(2) {
+        let previous = &entries[0];
+        let current = &entries[1];
+        let expected = previous.seq.checked_add(1);
+        if expected != Some(current.seq) {
+            return Err(format!(
+                "[REPL {}] non-adjacent replication sequence: {} followed by {}",
+                tenant_id, previous.seq, current.seq
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReleaseTailStatus {
+    Contiguous,
+    ResnapshotRequired,
+}
+
+impl ReleaseTailStatus {
+    fn as_header(self) -> &'static str {
+        match self {
+            Self::Contiguous => RELEASE_TRANSFER_STATUS_CONTIGUOUS,
+            Self::ResnapshotRequired => RELEASE_TRANSFER_STATUS_RESNAPSHOT_REQUIRED,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ReleaseTailProjection {
+    status: ReleaseTailStatus,
+    through_seq: u64,
+    ops: Vec<OpLogEntry>,
+}
+
+/// Turn the oplog's authoritative sequence coordinates into a release-only
+/// contiguous tail. A retention gap never returns a usable suffix: callers
+/// must take another one-UID snapshot and replace their receipt watermark.
+fn release_tail_projection(
+    requested_after_seq: u64,
+    current_seq: u64,
+    oldest_retained_seq: Option<u64>,
+    ops: Vec<OpLogEntry>,
+) -> Result<ReleaseTailProjection, String> {
+    if ops.iter().any(|entry| entry.seq == 0) {
+        return Err("release tail contains invalid sequence 0".to_string());
+    }
+
+    let next_required = requested_after_seq.checked_add(1);
+    if current_seq < requested_after_seq
+        || oldest_retained_seq.is_some_and(|oldest| next_required.is_none_or(|next| oldest > next))
+    {
+        return Ok(ReleaseTailProjection {
+            status: ReleaseTailStatus::ResnapshotRequired,
+            through_seq: current_seq,
+            ops: Vec::new(),
+        });
+    }
+
+    if current_seq == requested_after_seq {
+        if ops.is_empty() {
+            return Ok(ReleaseTailProjection {
+                status: ReleaseTailStatus::Contiguous,
+                through_seq: current_seq,
+                ops,
+            });
+        }
+        return Err(
+            "release tail returned operations beyond the authoritative current sequence"
+                .to_string(),
+        );
+    }
+
+    if ops.is_empty() {
+        return Err(format!(
+            "release tail omitted operations for authoritative interval {}..={current_seq}",
+            next_required.unwrap_or(u64::MAX)
+        ));
+    }
+    for (offset, entry) in ops.iter().enumerate() {
+        let expected = next_required
+            .and_then(|first| first.checked_add(offset as u64))
+            .ok_or_else(|| "release tail sequence interval overflowed".to_string())?;
+        if entry.seq != expected {
+            return Err(format!(
+                "release tail is noncontiguous: expected sequence {expected}, observed {}",
+                entry.seq
+            ));
+        }
+    }
+    if ops.last().map(|entry| entry.seq) != Some(current_seq) {
+        return Err(format!(
+            "release tail omitted operations before authoritative sequence {current_seq}"
+        ));
+    }
+
+    Ok(ReleaseTailProjection {
+        status: ReleaseTailStatus::Contiguous,
+        through_seq: current_seq,
+        ops,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum ReleaseRequestMode {
+    Snapshot,
+    Tail(u64),
+    Apply,
+}
+
+#[derive(Debug)]
+struct ReleaseRequest {
+    transaction_id: String,
+    payload_sha256: Option<String>,
+    window: Option<(u64, u64)>,
+}
+
+fn exact_release_request_header<'a>(
+    headers: &'a HeaderMap,
+    name: &'static str,
+) -> Result<Option<&'a str>, String> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(format!(
+            "release transfer duplicated protected header {name}"
+        ));
+    }
+    value
+        .to_str()
+        .map(Some)
+        .map_err(|_| format!("release transfer {name} is not visible ASCII"))
+}
+
+fn strict_release_sequence_header(headers: &HeaderMap, name: &'static str) -> Result<u64, String> {
+    let value = exact_release_request_header(headers, name)?
+        .ok_or_else(|| format!("release transfer missing {name}"))?;
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| format!("release transfer {name} is not an unsigned integer"))?;
+    if parsed.to_string() != value {
+        return Err(format!("release transfer {name} is not canonical"));
+    }
+    Ok(parsed)
+}
+
+fn strict_release_request(
+    headers: &HeaderMap,
+    expected_tenant_id: &str,
+    mode: ReleaseRequestMode,
+) -> Result<Option<ReleaseRequest>, String> {
+    let contract = exact_release_request_header(headers, RELEASE_TRANSFER_CONTRACT_HEADER)?;
+    let protected_without_contract = [
+        RELEASE_TRANSFER_TENANT_HEADER,
+        RELEASE_TRANSFER_TRANSACTION_HEADER,
+        RELEASE_TRANSFER_AFTER_SEQ_HEADER,
+        RELEASE_TRANSFER_THROUGH_SEQ_HEADER,
+        RELEASE_TRANSFER_PAYLOAD_SHA256_HEADER,
+        RELEASE_TRANSFER_STATUS_HEADER,
+        RELEASE_TRANSFER_SNAPSHOT_SHA256_HEADER,
+    ]
+    .iter()
+    .any(|name| headers.contains_key(*name));
+    let Some(contract) = contract else {
+        return if protected_without_contract {
+            Err("release transfer protected headers require the exact contract header".to_string())
+        } else {
+            Ok(None)
+        };
+    };
+    if contract != RELEASE_TRANSFER_CONTRACT_V1 {
+        return Err("unknown release transfer contract".to_string());
+    }
+
+    let tenant_id = exact_release_request_header(headers, RELEASE_TRANSFER_TENANT_HEADER)?
+        .ok_or_else(|| "release transfer missing exact tenant header".to_string())?;
+    if tenant_id != expected_tenant_id {
+        return Err("release transfer tenant does not match the requested tenant".to_string());
+    }
+    let transaction_id =
+        exact_release_request_header(headers, RELEASE_TRANSFER_TRANSACTION_HEADER)?
+            .ok_or_else(|| "release transfer missing exact transaction header".to_string())?;
+    PublicationTransactionId::new(transaction_id).map_err(|_| {
+        "release transfer transaction header is not a canonical identifier".to_string()
+    })?;
+    for response_only in [
+        RELEASE_TRANSFER_STATUS_HEADER,
+        RELEASE_TRANSFER_SNAPSHOT_SHA256_HEADER,
+    ] {
+        if exact_release_request_header(headers, response_only)?.is_some() {
+            return Err(format!(
+                "release transfer request supplied response-only header {response_only}"
+            ));
+        }
+    }
+
+    let (window, payload_sha256) = match mode {
+        ReleaseRequestMode::Snapshot => {
+            if exact_release_request_header(headers, RELEASE_TRANSFER_AFTER_SEQ_HEADER)?.is_some()
+                || exact_release_request_header(headers, RELEASE_TRANSFER_THROUGH_SEQ_HEADER)?
+                    .is_some()
+                || exact_release_request_header(headers, RELEASE_TRANSFER_PAYLOAD_SHA256_HEADER)?
+                    .is_some()
+            {
+                return Err("release snapshot request supplied tail/apply coordinates".to_string());
+            }
+            (None, None)
+        }
+        ReleaseRequestMode::Tail(expected_after_seq) => {
+            let after = strict_release_sequence_header(headers, RELEASE_TRANSFER_AFTER_SEQ_HEADER)?;
+            if after != expected_after_seq {
+                return Err(
+                    "release tail header does not match the requested source interval".to_string(),
+                );
+            }
+            if exact_release_request_header(headers, RELEASE_TRANSFER_THROUGH_SEQ_HEADER)?.is_some()
+                || exact_release_request_header(headers, RELEASE_TRANSFER_PAYLOAD_SHA256_HEADER)?
+                    .is_some()
+            {
+                return Err("release tail request supplied response/apply coordinates".to_string());
+            }
+            (Some((after, after)), None)
+        }
+        ReleaseRequestMode::Apply => {
+            let after = strict_release_sequence_header(headers, RELEASE_TRANSFER_AFTER_SEQ_HEADER)?;
+            let through =
+                strict_release_sequence_header(headers, RELEASE_TRANSFER_THROUGH_SEQ_HEADER)?;
+            if through < after {
+                return Err("release transfer through sequence precedes after sequence".to_string());
+            }
+            let payload_sha256 =
+                exact_release_request_header(headers, RELEASE_TRANSFER_PAYLOAD_SHA256_HEADER)?
+                    .ok_or_else(|| {
+                        "release apply request is missing the operations digest".to_string()
+                    })?;
+            ContentDigest::new(format!("sha256:{payload_sha256}"))
+                .map_err(|_| "release apply payload digest is not canonical SHA-256".to_string())?;
+            if !payload_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            {
+                return Err(
+                    "release apply payload digest is not canonical lowercase SHA-256".to_string(),
+                );
+            }
+            (Some((after, through)), Some(payload_sha256.to_string()))
+        }
+    };
+    Ok(Some(ReleaseRequest {
+        transaction_id: transaction_id.to_string(),
+        payload_sha256,
+        window,
+    }))
+}
+
+fn validate_release_apply_window(
+    tenant_id: &str,
+    after_seq: u64,
+    through_seq: u64,
+    ops: &[OpLogEntry],
+) -> Result<(), String> {
+    if through_seq == after_seq && ops.is_empty() {
+        return Err(format!(
+            "[REPL {tenant_id}] empty release tail cannot prove the destination watermark"
+        ));
+    }
+    if ops.iter().any(|entry| entry.seq == 0) {
+        return Err(format!(
+            "[REPL {tenant_id}] release tail contains invalid sequence 0"
+        ));
+    }
+    let expected_count = through_seq
+        .checked_sub(after_seq)
+        .ok_or_else(|| format!("[REPL {tenant_id}] invalid release tail interval"))?;
+    if usize::try_from(expected_count).ok() != Some(ops.len()) {
+        return Err(format!(
+            "[REPL {tenant_id}] release tail count does not match exact interval"
+        ));
+    }
+    for (offset, entry) in ops.iter().enumerate() {
+        let expected = after_seq
+            .checked_add(1)
+            .and_then(|first| first.checked_add(offset as u64))
+            .ok_or_else(|| format!("[REPL {tenant_id}] release tail interval overflowed"))?;
+        if entry.seq != expected {
+            return Err(format!(
+                "[REPL {tenant_id}] release tail is noncontiguous: expected {expected}, observed {}",
+                entry.seq
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn release_transfer_response_headers(
+    request: &ReleaseRequest,
+    tenant_id: &str,
+    after_seq: u64,
+    through_seq: u64,
+    status: &'static str,
+    payload_sha256: &str,
+) -> Result<HeaderMap, crate::error_response::HandlerError> {
+    let mut headers = HeaderMap::new();
+    for (name, value) in [
+        (
+            RELEASE_TRANSFER_CONTRACT_HEADER,
+            RELEASE_TRANSFER_CONTRACT_V1.to_string(),
+        ),
+        (RELEASE_TRANSFER_TENANT_HEADER, tenant_id.to_string()),
+        (
+            RELEASE_TRANSFER_TRANSACTION_HEADER,
+            request.transaction_id.clone(),
+        ),
+        (RELEASE_TRANSFER_AFTER_SEQ_HEADER, after_seq.to_string()),
+        (RELEASE_TRANSFER_THROUGH_SEQ_HEADER, through_seq.to_string()),
+        (RELEASE_TRANSFER_STATUS_HEADER, status.to_string()),
+        (
+            RELEASE_TRANSFER_PAYLOAD_SHA256_HEADER,
+            payload_sha256.to_string(),
+        ),
+    ] {
+        headers.insert(
+            name,
+            HeaderValue::from_str(&value).map_err(|_| {
+                crate::error_response::HandlerError::internal(
+                    "release transfer response header was invalid",
+                )
+            })?,
+        );
+    }
+    Ok(headers)
+}
+
+const RELEASE_APPLY_RECEIPT_KIND: &str = "flapjack_release_apply_interval";
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReleaseApplyPhase {
+    Prepared,
+    Committed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReleaseApplyReceipt {
+    schema_version: u8,
+    kind: String,
+    tenant_id: String,
+    after_seq: u64,
+    through_seq: u64,
+    transaction_id: String,
+    payload_sha256: String,
+    phase: ReleaseApplyPhase,
+    acked_seq: Option<u64>,
+}
+
+#[derive(Debug)]
+enum ReleaseApplyReceiptError {
+    Conflict(String),
+    Storage(String),
+}
+
+impl std::fmt::Display for ReleaseApplyReceiptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict(message) | Self::Storage(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl ReleaseApplyReceiptError {
+    #[cfg(test)]
+    fn contains(&self, needle: &str) -> bool {
+        self.to_string().contains(needle)
+    }
+}
+
+#[derive(Debug)]
+struct ReleaseApplyGuard {
+    _lock: File,
+    receipt_path: PathBuf,
+    receipt: ReleaseApplyReceipt,
+}
+
+impl ReleaseApplyGuard {
+    fn commit(mut self, acked_seq: u64) -> Result<(), ReleaseApplyReceiptError> {
+        if acked_seq != self.receipt.through_seq {
+            return Err(ReleaseApplyReceiptError::Storage(
+                "release apply acknowledgement did not match the prepared interval".to_string(),
+            ));
+        }
+        self.receipt.phase = ReleaseApplyPhase::Committed;
+        self.receipt.acked_seq = Some(acked_seq);
+        persist_release_apply_receipt(&self.receipt_path, &self.receipt)
+    }
+}
+
+#[derive(Debug)]
+enum ReleaseApplyDisposition {
+    Apply(ReleaseApplyGuard),
+    Replay(u64),
+}
+
+fn release_apply_receipt_root(data_root: &StdPath) -> Result<PathBuf, ReleaseApplyReceiptError> {
+    let canonical_data_root = data_root.canonicalize().map_err(|error| {
+        ReleaseApplyReceiptError::Storage(format!(
+            "release apply data root could not be canonicalized: {error}"
+        ))
+    })?;
+    let parent = canonical_data_root.parent().ok_or_else(|| {
+        ReleaseApplyReceiptError::Storage(
+            "release apply data root has no receipt-state parent".to_string(),
+        )
+    })?;
+    let data_name = canonical_data_root.file_name().ok_or_else(|| {
+        ReleaseApplyReceiptError::Storage("release apply data root has no file name".to_string())
+    })?;
+    let root = parent.join(data_root_sibling_name(data_name, "release-apply"));
+    match std::fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(ReleaseApplyReceiptError::Storage(
+                "release apply receipt root must be a real directory".to_string(),
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&root).map_err(|error| {
+                ReleaseApplyReceiptError::Storage(format!(
+                    "release apply receipt root could not be created: {error}"
+                ))
+            })?;
+        }
+        Err(error) => {
+            return Err(ReleaseApplyReceiptError::Storage(format!(
+                "release apply receipt root could not be inspected: {error}"
+            )))
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| {
+                ReleaseApplyReceiptError::Storage(format!(
+                    "release apply receipt root could not be made private: {error}"
+                ))
+            },
+        )?;
+    }
+    Ok(root)
+}
+
+fn release_apply_receipt_path(
+    data_root: &StdPath,
+    tenant_id: &str,
+    after_seq: u64,
+    through_seq: u64,
+) -> Result<PathBuf, ReleaseApplyReceiptError> {
+    let root = release_apply_receipt_root(data_root)?;
+    let coordinate = format!("{tenant_id}\n{after_seq}\n{through_seq}\n");
+    Ok(root.join(format!("{:x}.json", Sha256::digest(coordinate.as_bytes()))))
+}
+
+fn open_release_apply_lock(path: &StdPath) -> Result<File, ReleaseApplyReceiptError> {
+    let lock_path = path.with_extension("lock");
+    if let Ok(metadata) = std::fs::symlink_metadata(&lock_path) {
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(ReleaseApplyReceiptError::Storage(
+                "release apply interval lock must be a regular non-symlink file".to_string(),
+            ));
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options.open(&lock_path).map_err(|error| {
+        ReleaseApplyReceiptError::Storage(format!(
+            "release apply interval lock could not be opened: {error}"
+        ))
+    })?;
+    lock.lock_exclusive().map_err(|error| {
+        ReleaseApplyReceiptError::Storage(format!(
+            "release apply interval lock could not be acquired: {error}"
+        ))
+    })?;
+    Ok(lock)
+}
+
+fn validate_release_apply_receipt(
+    receipt: &ReleaseApplyReceipt,
+) -> Result<(), ReleaseApplyReceiptError> {
+    if receipt.schema_version != 1 || receipt.kind != RELEASE_APPLY_RECEIPT_KIND {
+        return Err(ReleaseApplyReceiptError::Storage(
+            "release apply receipt schema or kind is invalid".to_string(),
+        ));
+    }
+    PublicationTransactionId::new(&receipt.transaction_id).map_err(|_| {
+        ReleaseApplyReceiptError::Storage(
+            "release apply receipt transaction is invalid".to_string(),
+        )
+    })?;
+    ContentDigest::new(format!("sha256:{}", receipt.payload_sha256)).map_err(|_| {
+        ReleaseApplyReceiptError::Storage(
+            "release apply receipt payload digest is invalid".to_string(),
+        )
+    })?;
+    match (receipt.phase, receipt.acked_seq) {
+        (ReleaseApplyPhase::Prepared, None) => Ok(()),
+        (ReleaseApplyPhase::Committed, Some(acked)) if acked == receipt.through_seq => Ok(()),
+        _ => Err(ReleaseApplyReceiptError::Storage(
+            "release apply receipt phase and acknowledgement disagree".to_string(),
+        )),
+    }
+}
+
+fn persist_release_apply_receipt(
+    path: &StdPath,
+    receipt: &ReleaseApplyReceipt,
+) -> Result<(), ReleaseApplyReceiptError> {
+    validate_release_apply_receipt(receipt)?;
+    let mut payload = serde_json::to_vec(receipt).map_err(|error| {
+        ReleaseApplyReceiptError::Storage(format!(
+            "release apply receipt could not be serialized: {error}"
+        ))
+    })?;
+    payload.push(b'\n');
+    flapjack::index::atomic_write_private_file(path, &payload).map_err(|error| {
+        ReleaseApplyReceiptError::Storage(format!(
+            "release apply receipt could not be persisted: {error}"
+        ))
+    })
+}
+
+fn prepare_release_apply_receipt(
+    data_root: &StdPath,
+    tenant_id: &str,
+    after_seq: u64,
+    through_seq: u64,
+    transaction_id: &str,
+    payload_sha256: &str,
+) -> Result<ReleaseApplyDisposition, ReleaseApplyReceiptError> {
+    let receipt_path = release_apply_receipt_path(data_root, tenant_id, after_seq, through_seq)?;
+    let lock = open_release_apply_lock(&receipt_path)?;
+    let expected = ReleaseApplyReceipt {
+        schema_version: 1,
+        kind: RELEASE_APPLY_RECEIPT_KIND.to_string(),
+        tenant_id: tenant_id.to_string(),
+        after_seq,
+        through_seq,
+        transaction_id: transaction_id.to_string(),
+        payload_sha256: payload_sha256.to_string(),
+        phase: ReleaseApplyPhase::Prepared,
+        acked_seq: None,
+    };
+    validate_release_apply_receipt(&expected)?;
+
+    let receipt = match std::fs::symlink_metadata(&receipt_path) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(ReleaseApplyReceiptError::Storage(
+                    "release apply receipt must be a regular non-symlink file".to_string(),
+                ));
+            }
+            let payload = std::fs::read(&receipt_path).map_err(|error| {
+                ReleaseApplyReceiptError::Storage(format!(
+                    "release apply receipt could not be read: {error}"
+                ))
+            })?;
+            let receipt: ReleaseApplyReceipt =
+                serde_json::from_slice(&payload).map_err(|error| {
+                    ReleaseApplyReceiptError::Storage(format!(
+                        "release apply receipt is invalid: {error}"
+                    ))
+                })?;
+            validate_release_apply_receipt(&receipt)?;
+            receipt
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            persist_release_apply_receipt(&receipt_path, &expected)?;
+            expected
+        }
+        Err(error) => {
+            return Err(ReleaseApplyReceiptError::Storage(format!(
+                "release apply receipt could not be inspected: {error}"
+            )))
+        }
+    };
+
+    if receipt.tenant_id != tenant_id
+        || receipt.after_seq != after_seq
+        || receipt.through_seq != through_seq
+        || receipt.transaction_id != transaction_id
+        || receipt.payload_sha256 != payload_sha256
+    {
+        return Err(ReleaseApplyReceiptError::Conflict(
+            "release apply interval does not match its durable receipt".to_string(),
+        ));
+    }
+
+    match receipt.phase {
+        ReleaseApplyPhase::Prepared => Ok(ReleaseApplyDisposition::Apply(ReleaseApplyGuard {
+            _lock: lock,
+            receipt_path,
+            receipt,
+        })),
+        ReleaseApplyPhase::Committed => Ok(ReleaseApplyDisposition::Replay(
+            receipt
+                .acked_seq
+                .expect("validated committed receipt has an ACK"),
+        )),
+    }
+}
+
+/// Encode one JSON value using release canonical-value encoding v1.
+///
+/// Containers carry an element count, strings carry a UTF-8 byte length,
+/// object keys use Unicode scalar order, integers use exact decimal magnitude,
+/// and floats use big-endian IEEE-754 bits with floating negative zero
+/// normalized to zero. Type tags and terminators make the encoding injective.
+fn write_canonical_release_json(
+    value: &serde_json::Value,
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
+    match value {
+        serde_json::Value::Null => output.push(b'n'),
+        serde_json::Value::Bool(true) => output.push(b't'),
+        serde_json::Value::Bool(false) => output.push(b'f'),
+        serde_json::Value::Number(number) => {
+            if let Some(value) = number.as_u64() {
+                output.push(b'u');
+                output.extend_from_slice(value.to_string().as_bytes());
+                output.push(b';');
+            } else if let Some(value) = number.as_i64() {
+                output.push(b'i');
+                output.extend_from_slice(value.to_string().as_bytes());
+                output.push(b';');
+            } else {
+                let value = number
+                    .as_f64()
+                    .filter(|value| value.is_finite())
+                    .ok_or_else(|| "release JSON float must be finite".to_string())?;
+                let normalized = if value == 0.0 { 0.0 } else { value };
+                output.push(b'd');
+                output.extend_from_slice(format!("{:016x}", normalized.to_bits()).as_bytes());
+            }
+        }
+        serde_json::Value::String(value) => {
+            output.push(b's');
+            output.extend_from_slice(value.len().to_string().as_bytes());
+            output.push(b':');
+            output.extend_from_slice(value.as_bytes());
+        }
+        serde_json::Value::Array(values) => {
+            output.push(b'a');
+            output.extend_from_slice(values.len().to_string().as_bytes());
+            output.push(b':');
+            for value in values {
+                write_canonical_release_json(value, output)?;
+            }
+        }
+        serde_json::Value::Object(object) => {
+            output.push(b'o');
+            output.extend_from_slice(object.len().to_string().as_bytes());
+            output.push(b':');
+            let sorted: BTreeMap<_, _> = object.iter().collect();
+            for (key, value) in sorted {
+                write_canonical_release_json(&serde_json::Value::String(key.clone()), output)?;
+                write_canonical_release_json(value, output)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn canonical_release_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    write_canonical_release_json(value, &mut output)?;
+    Ok(output)
+}
+
+fn canonical_release_operations_sha256(ops: &[OpLogEntry]) -> Result<String, String> {
+    let value = serde_json::to_value(ops)
+        .map_err(|error| format!("release operations could not be canonicalized: {error}"))?;
+    let canonical = canonical_release_json_bytes(&value)?;
+    Ok(format!("{:x}", Sha256::digest(canonical)))
+}
+
+fn release_apply_receipt_handler_error(
+    error: ReleaseApplyReceiptError,
+) -> crate::error_response::HandlerError {
+    match error {
+        ReleaseApplyReceiptError::Conflict(message) => {
+            crate::error_response::HandlerError::bad_request(message)
+        }
+        ReleaseApplyReceiptError::Storage(message) => {
+            tracing::error!("release apply receipt failed: {message}");
+            crate::error_response::HandlerError::internal("release apply receipt is unavailable")
+        }
+    }
+}
+
+fn release_apply_ack_response(
+    request: &ReleaseRequest,
+    tenant_id: &str,
+    after_seq: u64,
+    through_seq: u64,
+    payload_sha256: &str,
+) -> Result<Response, crate::error_response::HandlerError> {
+    let response = Json(ReplicateOpsResponse {
+        tenant_id: tenant_id.to_string(),
+        acked_seq: through_seq,
+    });
+    let response_headers = release_transfer_response_headers(
+        request,
+        tenant_id,
+        after_seq,
+        through_seq,
+        RELEASE_TRANSFER_STATUS_ACKNOWLEDGED,
+        payload_sha256,
+    )?;
+    Ok((response_headers, response).into_response())
+}
+
+fn preflight_replication_op(tenant_id: &str, op_entry: &OpLogEntry) -> Result<(), String> {
+    match op_entry.op_type.as_str() {
+        "upsert" | "delete" => preflight_document_op(tenant_id, op_entry),
+        "move_index" | "copy_index" | "clear_index" => preflight_index_op(tenant_id, op_entry),
+        "settings" => preflight_settings_op(tenant_id, op_entry),
+        "save_synonym" | "save_synonyms" | "delete_synonym" | "clear_synonyms" | "save_rule"
+        | "save_rules" | "delete_rule" | "clear_rules" => {
+            preflight_resource_op(tenant_id, op_entry)
+        }
+        _ => Err(format!(
+            "[REPL {}] unknown op_type {} at seq {}",
+            tenant_id, op_entry.op_type, op_entry.seq
+        )),
+    }
 }
 
 fn bootstrap_document_version_state(
@@ -82,6 +1055,7 @@ fn contains_document_replication_ops(ops: &[OpLogEntry]) -> bool {
 /// Applies a single replicated oplog entry (upsert, delete, settings change, copy/move, etc.) to the local index, accumulating batch upserts and deletes.
 async fn apply_replication_op(
     manager: &IndexManager,
+    state: Option<&AppState>,
     tenant_id: &str,
     op_entry: &OpLogEntry,
     incoming: (u64, String),
@@ -94,37 +1068,34 @@ async fn apply_replication_op(
         "delete" => {
             apply_delete_op(manager, tenant_id, op_entry, incoming, document_batch)?;
         }
-        "move_index" => {
-            log_op_error(apply_move_index_op(manager, tenant_id, op_entry).await);
+        "move_index" => apply_move_index_op(manager, tenant_id, op_entry).await?,
+        "copy_index" => apply_copy_index_op(manager, tenant_id, op_entry).await?,
+        "clear_index" => apply_clear_index_op(manager, tenant_id, op_entry).await?,
+        "settings" => {
+            let state = state.ok_or_else(|| {
+                format!(
+                    "[REPL {}] settings replication requires application state",
+                    tenant_id
+                )
+            })?;
+            apply_settings_op(state, tenant_id, op_entry).await?;
         }
-        "copy_index" => {
-            log_op_error(apply_copy_index_op(manager, tenant_id, op_entry).await);
+        "save_synonym" => apply_save_synonym_op(manager, tenant_id, op_entry)?,
+        "save_synonyms" => apply_save_synonyms_op(manager, tenant_id, op_entry)?,
+        "delete_synonym" => apply_delete_synonym_op(manager, tenant_id, op_entry)?,
+        "clear_synonyms" => apply_clear_synonyms_op(manager, tenant_id, op_entry)?,
+        "save_rule" => apply_save_rule_op(manager, tenant_id, op_entry)?,
+        "save_rules" => apply_save_rules_op(manager, tenant_id, op_entry)?,
+        "delete_rule" => apply_delete_rule_op(manager, tenant_id, op_entry)?,
+        "clear_rules" => apply_clear_rules_op(manager, tenant_id, op_entry)?,
+        _ => {
+            return Err(format!(
+                "[REPL {}] unknown op_type {} at seq {}",
+                tenant_id, op_entry.op_type, op_entry.seq
+            ));
         }
-        "clear_index" => {
-            log_op_error(apply_clear_index_op(manager, tenant_id, op_entry).await);
-        }
-        "save_synonym" => apply_save_synonym_op(manager, tenant_id, op_entry),
-        "save_synonyms" => apply_save_synonyms_op(manager, tenant_id, op_entry),
-        "delete_synonym" => apply_delete_synonym_op(manager, tenant_id, op_entry),
-        "clear_synonyms" => apply_clear_synonyms_op(manager, tenant_id, op_entry),
-        "save_rule" => apply_save_rule_op(manager, tenant_id, op_entry),
-        "save_rules" => apply_save_rules_op(manager, tenant_id, op_entry),
-        "delete_rule" => apply_delete_rule_op(manager, tenant_id, op_entry),
-        "clear_rules" => apply_clear_rules_op(manager, tenant_id, op_entry),
-        _ => tracing::warn!(
-            "[REPL {}] unknown op_type {} at seq {}",
-            tenant_id,
-            op_entry.op_type,
-            op_entry.seq
-        ),
     }
     Ok(())
-}
-
-fn log_op_error(result: Result<(), String>) {
-    if let Err(error) = result {
-        tracing::warn!("{}", error);
-    }
 }
 
 fn local_node_current_seq_map(state: &AppState, current_seq: u64) -> BTreeMap<String, u64> {
@@ -140,14 +1111,71 @@ fn local_node_current_seq_map(state: &AppState, current_seq: u64) -> BTreeMap<St
 pub async fn replicate_ops(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ReplicateOpsRequest>,
-) -> Result<Json<ReplicateOpsResponse>, crate::error_response::HandlerError> {
+) -> Result<Response, crate::error_response::HandlerError> {
+    replicate_ops_with_headers(State(state), HeaderMap::new(), Json(req)).await
+}
+
+/// HTTP entrypoint that layers exact release-transfer coordinates over the
+/// legacy replication body. Startup catch-up continues to call
+/// [`replicate_ops`] directly and therefore cannot accidentally claim a
+/// release-scoped acknowledgement.
+pub async fn replicate_ops_with_headers(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ReplicateOpsRequest>,
+) -> Result<Response, crate::error_response::HandlerError> {
     let tenant_id = req.tenant_id.clone();
 
     // Preserve 400 semantics for malformed peer input before apply_ops_to_manager
     // erases validation failures into a plain String for shared non-HTTP callers.
     validate_index_name(&tenant_id).map_err(crate::error_response::HandlerError::from)?;
+    validate_single_sender_sequence(&tenant_id, &req.ops)?;
+    let release_request = strict_release_request(&headers, &tenant_id, ReleaseRequestMode::Apply)
+        .map_err(crate::error_response::HandlerError::bad_request)?;
+    let release_window = release_request.as_ref().and_then(|request| request.window);
+    let mut release_guard = None;
+    if let Some((after_seq, through_seq)) = release_window {
+        validate_release_apply_window(&tenant_id, after_seq, through_seq, &req.ops)
+            .map_err(crate::error_response::HandlerError::bad_request)?;
+        let payload_sha256 = canonical_release_operations_sha256(&req.ops)
+            .map_err(crate::error_response::HandlerError::bad_request)?;
+        let request = release_request
+            .as_ref()
+            .expect("release interval is present only for a release request");
+        if request.payload_sha256.as_deref() != Some(payload_sha256.as_str()) {
+            return Err(crate::error_response::HandlerError::bad_request(
+                "release apply body does not match the operations digest",
+            ));
+        }
+        match prepare_release_apply_receipt(
+            &state.manager.base_path,
+            &tenant_id,
+            after_seq,
+            through_seq,
+            &request.transaction_id,
+            &payload_sha256,
+        )
+        .map_err(release_apply_receipt_handler_error)?
+        {
+            ReleaseApplyDisposition::Apply(guard) => release_guard = Some(guard),
+            ReleaseApplyDisposition::Replay(acked_seq) => {
+                if acked_seq != through_seq {
+                    return Err(crate::error_response::HandlerError::internal(
+                        "release apply replay acknowledgement is invalid",
+                    ));
+                }
+                return release_apply_ack_response(
+                    request,
+                    &tenant_id,
+                    after_seq,
+                    through_seq,
+                    &payload_sha256,
+                );
+            }
+        }
+    }
 
-    let max_seq = apply_ops_to_manager(&state.manager, &tenant_id, &req.ops).await?;
+    let max_seq = apply_ops_to_state(&state, &tenant_id, &req.ops).await?;
 
     tracing::info!(
         "[REPL {}] applied {} ops (max_seq={})",
@@ -156,22 +1184,51 @@ pub async fn replicate_ops(
         max_seq
     );
 
-    Ok(Json(ReplicateOpsResponse {
+    let acked_seq = release_window.map_or(max_seq, |(_, through_seq)| through_seq);
+    if let Some(guard) = release_guard {
+        guard
+            .commit(acked_seq)
+            .map_err(release_apply_receipt_handler_error)?;
+    }
+    let response = Json(ReplicateOpsResponse {
         tenant_id,
-        acked_seq: max_seq,
-    }))
+        acked_seq,
+    });
+    if let Some((after_seq, through_seq)) = release_window {
+        let request = release_request
+            .as_ref()
+            .expect("release interval is present only for a release request");
+        return release_apply_ack_response(
+            request,
+            &response.0.tenant_id,
+            after_seq,
+            through_seq,
+            request
+                .payload_sha256
+                .as_deref()
+                .expect("release apply requests require a payload digest"),
+        );
+    }
+    Ok(response.into_response())
 }
 
 /// GET /internal/ops?tenant_id=X&since_seq=N
 /// Fetch operations since a given sequence number for catch-up
 pub async fn get_ops(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(query): Query<GetOpsQuery>,
-) -> Result<Json<GetOpsResponse>, crate::error_response::HandlerError> {
+) -> Result<Response, crate::error_response::HandlerError> {
     use crate::error_response::HandlerError;
 
     let tenant_id = query.tenant_id.clone();
     validate_index_name(&tenant_id).map_err(HandlerError::from)?;
+    let release_transfer = strict_release_request(
+        &headers,
+        &tenant_id,
+        ReleaseRequestMode::Tail(query.since_seq),
+    )
+    .map_err(HandlerError::bad_request)?;
 
     // Get oplog for tenant
     let oplog = match state.manager.get_oplog(&tenant_id) {
@@ -192,13 +1249,14 @@ pub async fn get_ops(
                     query.since_seq,
                     current_seq
                 );
-                return Ok(Json(GetOpsResponse {
+                let payload = GetOpsResponse {
                     tenant_id,
                     ops,
                     current_seq,
                     oldest_retained_seq: None,
                     node_current_seqs: local_node_current_seq_map(&state, current_seq),
-                }));
+                };
+                return release_ops_response(release_transfer.as_ref(), query.since_seq, payload);
             }
 
             tracing::warn!("[REPL {}] oplog not found", tenant_id);
@@ -223,13 +1281,46 @@ pub async fn get_ops(
         current_seq
     );
 
-    Ok(Json(GetOpsResponse {
-        tenant_id,
-        ops,
-        current_seq,
-        oldest_retained_seq,
-        node_current_seqs: local_node_current_seq_map(&state, current_seq),
-    }))
+    release_ops_response(
+        release_transfer.as_ref(),
+        query.since_seq,
+        GetOpsResponse {
+            tenant_id,
+            ops,
+            current_seq,
+            oldest_retained_seq,
+            node_current_seqs: local_node_current_seq_map(&state, current_seq),
+        },
+    )
+}
+
+fn release_ops_response(
+    release_transfer: Option<&ReleaseRequest>,
+    requested_after_seq: u64,
+    mut payload: GetOpsResponse,
+) -> Result<Response, crate::error_response::HandlerError> {
+    let Some(release_request) = release_transfer else {
+        return Ok(Json(payload).into_response());
+    };
+    let projection = release_tail_projection(
+        requested_after_seq,
+        payload.current_seq,
+        payload.oldest_retained_seq,
+        std::mem::take(&mut payload.ops),
+    )
+    .map_err(crate::error_response::HandlerError::internal)?;
+    payload.ops = projection.ops;
+    let payload_sha256 = canonical_release_operations_sha256(&payload.ops)
+        .map_err(crate::error_response::HandlerError::internal)?;
+    let response_headers = release_transfer_response_headers(
+        release_request,
+        &payload.tenant_id,
+        requested_after_seq,
+        projection.through_seq,
+        projection.status.as_header(),
+        &payload_sha256,
+    )?;
+    Ok((response_headers, Json(payload)).into_response())
 }
 
 /// GET /internal/tenants
@@ -246,9 +1337,14 @@ pub async fn list_tenants(
 /// Export a tenant directory as gzipped snapshot bytes for startup gap recovery.
 pub async fn internal_snapshot(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     ValidatedIndexName(tenant_id): ValidatedIndexName,
 ) -> Result<impl IntoResponse, crate::error_response::HandlerError> {
     use crate::error_response::HandlerError;
+
+    let release_transfer =
+        strict_release_request(&headers, &tenant_id, ReleaseRequestMode::Snapshot)
+            .map_err(HandlerError::bad_request)?;
 
     let tenant_path = state.manager.base_path.join(&tenant_id);
     if !tenant_path.exists() {
@@ -271,6 +1367,20 @@ pub async fn internal_snapshot(
             HandlerError::from(error)
         })?;
 
+    let through_seq = if release_transfer.is_some() {
+        state
+            .manager
+            // Quiesce deliberately clears loaded runtime state, including the
+            // cached oplog. Reopen the durable oplog while admission remains
+            // fenced so this watermark names the exact bytes exported below.
+            .get_or_create_oplog(&tenant_id)
+            .ok_or_else(|| {
+                HandlerError::internal("release snapshot could not open the durable oplog")
+            })?
+            .current_seq()
+    } else {
+        0
+    };
     let export_tenant_id = tenant_id.clone();
     let bytes = tokio::task::spawn_blocking(move || {
         crate::snapshot_byte_ops::export_snapshot_bytes(&tenant_path, &export_tenant_id)
@@ -290,7 +1400,33 @@ pub async fn internal_snapshot(
         HandlerError::from(error)
     })?;
 
-    Ok(([(header::CONTENT_TYPE, "application/gzip")], bytes))
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/gzip"),
+    );
+    if let Some(release_request) = release_transfer.as_ref() {
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        response_headers = release_transfer_response_headers(
+            release_request,
+            &tenant_id,
+            0,
+            through_seq,
+            RELEASE_TRANSFER_STATUS_CONTIGUOUS,
+            &digest,
+        )?;
+        response_headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/gzip"),
+        );
+        response_headers.insert(
+            RELEASE_TRANSFER_SNAPSHOT_SHA256_HEADER,
+            HeaderValue::from_str(&digest)
+                .map_err(|_| HandlerError::internal("snapshot digest header was invalid"))?,
+        );
+    }
+
+    Ok((response_headers, bytes))
 }
 
 /// Search all tenant oplogs for a `move_index` entry whose source matches `source_tenant`.
@@ -938,23 +2074,24 @@ pub async fn rollup_cache_status() -> impl IntoResponse {
 }
 
 /// GET /internal/storage
-/// Returns disk usage and doc count for all loaded tenants.
-pub async fn storage_all(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let tenants: Vec<serde_json::Value> = state
-        .manager
-        .all_tenant_storage()
+/// Returns disk usage and doc count for every durable tenant.
+pub async fn storage_all(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, crate::error_response::HandlerError> {
+    prepare_release_inventory(&state.manager)?;
+    let tenants = canonical_release_inventory(&state.manager)?
         .into_iter()
-        .map(|(id, bytes)| {
-            let doc_count = state.manager.tenant_doc_count(&id).unwrap_or(0);
-            serde_json::json!({"id": id, "bytes": bytes, "doc_count": doc_count})
+        .map(|entry| {
+            let bytes = state.manager.tenant_storage_bytes(&entry.index_id);
+            serde_json::json!({
+                "id": entry.index_id,
+                "bytes": bytes,
+                "doc_count": entry.document_count,
+            })
         })
-        .collect();
+        .collect::<Vec<_>>();
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "tenants": tenants })),
-    )
-        .into_response()
+    Ok(Json(serde_json::json!({ "tenants": tenants })))
 }
 
 /// GET /internal/storage/:indexName
@@ -970,6 +2107,44 @@ pub async fn storage_index(
         Json(serde_json::json!({ "index": index_name, "bytes": bytes, "doc_count": doc_count })),
     )
         .into_response()
+}
+
+/// POST /internal/indexes/:indexName/count
+///
+/// Executes the canonical search pipeline with a zero-sized hit window and
+/// returns only readiness plus the matching count. This route is mounted only
+/// in the authenticated internal-admin group and outside customer usage
+/// middleware.
+pub async fn count_only_search(
+    State(state): State<Arc<AppState>>,
+    ValidatedIndexName(index_name): ValidatedIndexName,
+    Json(request): Json<InternalCountOnlySearchRequest>,
+) -> Result<Json<serde_json::Value>, crate::error_response::HandlerError> {
+    validate_count_only_hits_per_page(request.hits_per_page)
+        .map_err(crate::error_response::HandlerError::from)?;
+
+    let search_request = SearchRequest {
+        query: request.query,
+        hits_per_page: Some(0),
+        analytics: Some(false),
+        click_analytics: Some(false),
+        attributes_to_retrieve: Some(Vec::new()),
+        ..Default::default()
+    };
+    let Json(result) =
+        crate::handlers::search::search_single(State(state), index_name.clone(), search_request)
+            .await
+            .map_err(crate::error_response::HandlerError::from)?;
+    let count = result
+        .get("nbHits")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| crate::error_response::HandlerError::internal("search count missing"))?;
+
+    Ok(Json(serde_json::json!({
+        "index": index_name,
+        "status": "ready",
+        "nbHits": count,
+    })))
 }
 
 /// GET /.well-known/acme-challenge/:token
