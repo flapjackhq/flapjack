@@ -1,5 +1,40 @@
 use super::*;
 
+#[test]
+fn pbv5_exp_012_query_type_is_a_closed_per_query_enum() {
+    for valid in ["prefixAll", "prefixLast", "prefixNone"] {
+        let req = SearchRequest {
+            query_type_prefix: Some(valid.to_string()),
+            ..Default::default()
+        };
+        assert!(req.validate().is_ok(), "{valid} must remain valid");
+    }
+
+    for invalid in ["", "unknown", "PrefixLast"] {
+        let req = SearchRequest {
+            query_type_prefix: Some(invalid.to_string()),
+            ..Default::default()
+        };
+        let error = req
+            .validate()
+            .expect_err("invalid queryType strings must fail closed")
+            .to_string();
+        assert!(error.contains("queryType"), "unexpected error: {error}");
+        assert!(error.contains("prefixAll"), "unexpected error: {error}");
+        assert!(error.contains("prefixLast"), "unexpected error: {error}");
+        assert!(error.contains("prefixNone"), "unexpected error: {error}");
+    }
+
+    let mut params_req = SearchRequest {
+        params: Some("queryType=unknown".to_string()),
+        ..Default::default()
+    };
+    params_req.apply_params_string();
+    assert!(params_req.validate().is_err());
+
+    assert!(serde_json::from_str::<SearchRequest>(r#"{"queryType":7}"#).is_err());
+}
+
 // ── effective_hits_per_page ──
 
 #[test]

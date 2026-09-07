@@ -5,172 +5,181 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SDK_TEST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENGINE_DIR="$(cd "$SDK_TEST_DIR/.." && pwd)"
 RUNNER="$ENGINE_DIR/s/test"
-
 TMP_DIR="$(mktemp -d)"
 BIN_DIR="$TMP_DIR/bin"
 OUTPUT_FILE="$TMP_DIR/output.log"
-NPM_LOG="$TMP_DIR/npm.log"
-NODE_LOG="$TMP_DIR/node.log"
-
-SDK_NODE_MODULES="$ENGINE_DIR/sdk_test/node_modules"
-SDK_NODE_MODULES_BACKUP="$TMP_DIR/sdk_node_modules.backup"
-SDK_NODE_MODULES_WAS_PRESENT=false
-SDK_LOCKFILE="$ENGINE_DIR/sdk_test/package-lock.json"
-
-resolve_cli_smoke_script() {
-  local canonical_path="$ENGINE_DIR/s/manual-tests/cli_smoke.sh"
-  local dev_path="$ENGINE_DIR/_dev/s/manual-tests/cli_smoke.sh"
-
-  if [ -f "$canonical_path" ]; then
-    echo "$canonical_path"
-    return 0
-  fi
-
-  if [ -f "$dev_path" ]; then
-    echo "$dev_path"
-    return 0
-  fi
-
-  echo "Unable to locate cli_smoke.sh under canonical or dev runner paths" >&2
-  exit 1
-}
-
-CLI_SMOKE_SCRIPT="$(resolve_cli_smoke_script)"
-CLI_SMOKE_MODE_BEFORE=""
-
-file_mode() {
-  local target="$1"
-  if stat -f '%Lp' "$target" >/dev/null 2>&1; then
-    stat -f '%Lp' "$target"
-  else
-    stat -c '%a' "$target"
-  fi
-}
+export STUB_NPM_LOG="$TMP_DIR/npm.log" STUB_NODE_LOG="$TMP_DIR/node.log"
+source "$SCRIPT_DIR/sdk_runner_contract_support.sh"
 
 cleanup() {
-  if [ -n "$CLI_SMOKE_MODE_BEFORE" ]; then
-    chmod "$CLI_SMOKE_MODE_BEFORE" "$CLI_SMOKE_SCRIPT" || true
+  if [ -f "$TMP_DIR/private-forwarder" ]; then
+    rm -f "$RUNNER"
+    mv "$TMP_DIR/private-forwarder" "$RUNNER"
+    rm -f "$ENGINE_DIR/s/lib" "$ENGINE_DIR/s/manual-tests"
   fi
-
-  rm -rf "$SDK_NODE_MODULES"
-
-  if [ "$SDK_NODE_MODULES_WAS_PRESENT" = "true" ]; then
-    mv "$SDK_NODE_MODULES_BACKUP" "$SDK_NODE_MODULES"
+  restore_runner_scripts
+  local project
+  for project in sdk_test dashboard console; do
+    [ -f "$TMP_DIR/$project.prepared" ] || continue
+    rm -rf "$ENGINE_DIR/$project/node_modules"
+    if [ -e "$TMP_DIR/$project.node_modules" ]; then
+      mv "$TMP_DIR/$project.node_modules" "$ENGINE_DIR/$project/node_modules"
+    fi
+  done
+  if [ -f "$TMP_DIR/dist.created" ]; then
+    rm -rf "$ENGINE_DIR/dashboard/dist"
+  elif [ -f "$TMP_DIR/index.created" ]; then
+    rm -f "$ENGINE_DIR/dashboard/dist/index.html"
   fi
-
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
 
+prepare_modules() {
+  local project="$1"
+  local modules="$ENGINE_DIR/$project/node_modules"
+  if [ -e "$modules" ]; then
+    mv "$modules" "$TMP_DIR/$project.node_modules"
+  fi
+  touch "$TMP_DIR/$project.prepared"
+  mkdir -p "$modules"
+  cksum "$ENGINE_DIR/$project/package-lock.json" | awk '{print $1 ":" $2}' > "$modules/.flapjack-package-lock.cksum"
+}
+
 mkdir -p "$BIN_DIR"
-: > "$NPM_LOG"
-: > "$NODE_LOG"
-
-if [ -e "$SDK_NODE_MODULES" ]; then
-  SDK_NODE_MODULES_WAS_PRESENT=true
-  mv "$SDK_NODE_MODULES" "$SDK_NODE_MODULES_BACKUP"
+for project in sdk_test dashboard console; do prepare_modules "$project"; done
+if [ ! -d "$ENGINE_DIR/dashboard/dist" ]; then
+  touch "$TMP_DIR/dist.created"
+elif [ ! -f "$ENGINE_DIR/dashboard/dist/index.html" ]; then
+  touch "$TMP_DIR/index.created"
 fi
-
-mkdir -p "$SDK_NODE_MODULES/algoliasearch" "$SDK_NODE_MODULES/dotenv"
-printf '%s\n' "$(cksum "$SDK_LOCKFILE" | awk '{print $1 ":" $2}')" > "$SDK_NODE_MODULES/.flapjack-package-lock.cksum"
-
-CLI_SMOKE_MODE_BEFORE="$(file_mode "$CLI_SMOKE_SCRIPT")"
-chmod a-x "$CLI_SMOKE_SCRIPT"
-
-cat > "$BIN_DIR/curl" <<'WRAP'
-#!/usr/bin/env bash
-set -euo pipefail
-if [[ "$*" == *"/health"* ]]; then
-  echo '{"status":"ok"}'
-  exit 0
+setup_python_contract_stub
+stub_protocol_smokes
+if [ -f "$ENGINE_DIR/_dev/s/manual-tests/cli_smoke.sh" ]; then
+  stub_runner_script "$ENGINE_DIR/_dev/s/manual-tests/cli_smoke.sh"
+else
+  stub_runner_script "$ENGINE_DIR/s/manual-tests/cli_smoke.sh"
 fi
-if [[ "$*" == *"/1/keys"* ]]; then
-  exit 0
-fi
-exit 0
-WRAP
-chmod +x "$BIN_DIR/curl"
+configure_synthetic_runner_origin
 
-cat > "$BIN_DIR/npm" <<'WRAP'
-#!/usr/bin/env bash
-set -euo pipefail
-printf 'cwd=%s args=%s\n' "$PWD" "$*" >> "$STUB_NPM_LOG"
-if [[ "${1:-}" == "ci" ]]; then
-  exit 0
-fi
-exit 0
-WRAP
-chmod +x "$BIN_DIR/npm"
-
-cat > "$BIN_DIR/node" <<'WRAP'
-#!/usr/bin/env bash
+cat > "$BIN_DIR/node" <<'STUB'
+#!/bin/bash
 set -euo pipefail
 printf '%s\n' "$*" >> "$STUB_NODE_LOG"
-if [[ "${1:-}" == "--version" ]]; then
-  echo "v20.10.0"
-  exit 0
-fi
-if [[ "${1:-}" == "-e" ]]; then
-  if [[ -d "$PWD/node_modules/algoliasearch" && -d "$PWD/node_modules/dotenv" ]]; then
-    exit 0
-  fi
-  exit 42
-fi
 case "${1:-}" in
-  test.js|contract_tests.js|full_compat_tests.js|instantsearch_contract_tests.js)
-    exit 0
-    ;;
+  --version) echo v20.10.0 ;;
+  -e)
+    case "$2" in
+      *server.address*) echo "$FJ_BACKEND_PORT" ;;
+      *randomUUID*) echo synthetic-console-instance ;;
+      *require.resolve*) exit 0 ;;
+      *) exit 65 ;;
+    esac ;;
+  test.js|contract_tests.js|full_compat_tests.js|instantsearch_contract_tests.js) ;;
+  scripts/playwright-webserver.mjs) ;;
+  *) exit 66 ;;
 esac
-exit 0
-WRAP
-chmod +x "$BIN_DIR/node"
+STUB
+cat > "$BIN_DIR/npm" <<'STUB'
+#!/bin/bash
+printf 'cwd=%s args=%s\n' "$PWD" "$*" >> "$STUB_NPM_LOG"
+case "$*" in
+  'run test:real_clients'|'run test:unit:run'|'run test:e2e-ui:smoke'|'run test:e2e-ui:full') exit 0 ;;
+  --prefix*' run test:unit:run'|--prefix*' run check'|--prefix*' run build'|--prefix*' run lint:browser-tests:unmocked'|--prefix*' run test:browser:unmocked') exit 0 ;;
+  *) exit 69 ;;
+esac
+STUB
+cat > "$BIN_DIR/curl" <<'STUB'
+#!/bin/bash
+case "$*" in
+  */health*|*/1/keys*) echo '{"status":"ok"}' ;;
+  *) exit 67 ;;
+esac
+STUB
+cat > "$BIN_DIR/cargo" <<'STUB'
+#!/bin/bash
+case "$1" in
+  test|nextest|build) exit 0 ;;
+  *) exit 68 ;;
+esac
+STUB
+cat > "$BIN_DIR/bash" <<'STUB'
+#!/bin/bash
+case "$1" in
+  */scripts/tests/rwork_repository_contract_test.sh|*/scripts/tests/publish_guard_test.sh|*/scripts/tests/publish_public_candidate_test.sh|*/scripts/check_migration_ssot_owners.sh) exit 0 ;;
+  *) exec /bin/bash "$@" ;;
+esac
+STUB
+chmod +x "$BIN_DIR/"*
 
-PATH="$BIN_DIR:$PATH" \
-STUB_NPM_LOG="$NPM_LOG" \
-STUB_NODE_LOG="$NODE_LOG" \
-"$RUNNER" --sdk --e2e >"$OUTPUT_FILE" 2>&1
+assert_count() {
+  local expected="$1" needle="$2" file="$3"
+  local count
+  count=$(grep -Fxc "$needle" "$file" || true)
+  if [ "$count" != "$expected" ]; then
+    echo "Expected $expected occurrences of $needle; got $count"
+    cat "$file" "$OUTPUT_FILE"
+    exit 1
+  fi
+}
 
-if grep -Fq "args=ci" "$NPM_LOG"; then
-  echo "Did not expect npm ci on valid sdk_test node_modules cache hit during --sdk --e2e"
-  cat "$NPM_LOG"
-  cat "$OUTPUT_FILE"
-  exit 1
-fi
-
-for script_name in test.js contract_tests.js full_compat_tests.js instantsearch_contract_tests.js; do
-  run_count=$(grep -cx "$script_name" "$NODE_LOG" || true)
-  if [ "$run_count" != "1" ]; then
-    echo "Expected $script_name to run exactly once under --sdk --e2e, got $run_count"
-    cat "$NODE_LOG"
+run_mode() {
+  local python_exit="$1"
+  shift
+  local prefix=E2E status=0 script_name
+  [ "$*" != --sdk ] || prefix=SDK
+  : > "$STUB_NPM_LOG"
+  : > "$STUB_NODE_LOG"
+  : > "$STUB_PYTHON_LOG"
+  PATH="$BIN_DIR:$PATH" STUB_PYTHON_EXIT="$python_exit" \
+    "$RUNNER" "$@" > "$OUTPUT_FILE" 2>&1 || status=$?
+  assert_python_contract_execution
+  if [ "$status" != "$python_exit" ]; then
+    echo "Expected runner $* to return Python status $python_exit; got $status"
     cat "$OUTPUT_FILE"
     exit 1
   fi
-done
+  grep -Fq "$prefix: official Python client contract" "$OUTPUT_FILE"
+  for script_name in test.js contract_tests.js full_compat_tests.js instantsearch_contract_tests.js; do
+    assert_count 1 "$script_name" "$STUB_NODE_LOG"
+  done
+  assert_count 1 "cwd=$SDK_TEST_DIR args=run test:real_clients" "$STUB_NPM_LOG"
+  if [ "$python_exit" = 0 ]; then
+    grep -Fq 'Official Python client contract passed' "$OUTPUT_FILE"
+  elif grep -Fq 'Official Python client contract passed' "$OUTPUT_FILE"; then
+    echo 'Failed Python execution must not print success'
+    exit 1
+  fi
+  if [ "$prefix" = SDK ]; then
+    grep -Fq 'SDK: Python protocol smoke test' "$OUTPUT_FILE"
+    grep -Fq 'Python protocol smoke test passed' "$OUTPUT_FILE"
+  elif grep -Eq 'SDK: (JS|.*protocol smoke)' "$OUTPUT_FILE"; then
+    echo 'E2E must subsume SDK JS/browser and exclude protocol smokes'
+    exit 1
+  fi
+  echo "PASS: $* executes official Python exactly once (exit $python_exit), JS/browser once, and preserves protocol-smoke scope"
+}
 
-real_client_count=$(grep -Fc "args=run test:real_clients" "$NPM_LOG" || true)
-if [ "$real_client_count" != "1" ]; then
-  echo "Expected real-client browser conformance to run exactly once under --sdk --e2e, got $real_client_count"
-  cat "$NPM_LOG"
-  cat "$OUTPUT_FILE"
-  exit 1
+run_all_modes() {
+  run_mode 0 --sdk
+  run_mode 81 --sdk
+  run_mode 0 --e2e
+  run_mode 82 --e2e
+  run_mode 0 --all
+  run_mode 83 --all
+  run_mode 0 --sdk --e2e
+  run_mode 84 --sdk --e2e
+}
+
+run_all_modes
+
+# Exercise the public remap using the same runner bytes, without copying it.
+if [ -f "$ENGINE_DIR/_dev/s/test" ]; then
+  [ ! -e "$ENGINE_DIR/s/lib" ] && [ ! -e "$ENGINE_DIR/s/manual-tests" ]
+  mv "$RUNNER" "$TMP_DIR/private-forwarder"
+  ln -s ../_dev/s/test "$RUNNER"
+  ln -s ../_dev/s/lib "$ENGINE_DIR/s/lib"
+  ln -s ../_dev/s/manual-tests "$ENGINE_DIR/s/manual-tests"
+  run_all_modes
+  echo 'PASS: public remap preserves engine-root resolution and SDK/E2E dispatch'
 fi
-
-if grep -Fq "SDK: JS test.js" "$OUTPUT_FILE"; then
-  echo "Expected SDK-only JS suite block to be skipped when --e2e is enabled"
-  cat "$OUTPUT_FILE"
-  exit 1
-fi
-
-if grep -Fq "SDK: PHP protocol smoke test" "$OUTPUT_FILE"; then
-  echo "Expected SDK protocol smoke tests to be skipped when --e2e is enabled"
-  cat "$OUTPUT_FILE"
-  exit 1
-fi
-
-if ! grep -Fq "E2E: JS test.js" "$OUTPUT_FILE"; then
-  echo "Expected E2E JS suite to run under --sdk --e2e"
-  cat "$OUTPUT_FILE"
-  exit 1
-fi
-
-echo "PASS: s/test --sdk --e2e runs core JS suite once and skips SDK-only duplicate path"

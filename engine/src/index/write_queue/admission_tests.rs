@@ -144,8 +144,41 @@ fn upsert_with_origin(
 ) -> WriteAction {
     WriteAction::UpsertWithOrigin {
         doc: replicated_document(object_id),
-        origin: ReplicatedWriteOrigin::new(origin_timestamp_ms, origin_node_id.to_string()),
+        origin: ReplicatedWriteOrigin::new(origin_timestamp_ms, origin_node_id.to_string())
+            .with_origin_seq(1),
     }
+}
+
+fn upsert_with_origin_seq(
+    object_id: &str,
+    origin_timestamp_ms: u64,
+    origin_node_id: &str,
+    origin_seq: u64,
+) -> WriteAction {
+    let mut serialized = serde_json::to_value(upsert_with_origin(
+        object_id,
+        origin_timestamp_ms,
+        origin_node_id,
+    ))
+    .unwrap();
+    serialized["UpsertWithOrigin"]["origin"]["origin_seq"] = json!(origin_seq);
+    serde_json::from_value(serialized).unwrap()
+}
+
+#[test]
+fn replication_origin_proof_legacy_origin_record_defaults_source_seq_to_null() {
+    let mut serialized =
+        serde_json::to_value(upsert_with_origin("legacy-object", 1_234, "legacy-node")).unwrap();
+    serialized["UpsertWithOrigin"]["origin"]
+        .as_object_mut()
+        .unwrap()
+        .remove("origin_seq");
+    let decoded: WriteAction = serde_json::from_value(serialized).unwrap();
+
+    assert!(matches!(
+        decoded,
+        WriteAction::UpsertWithOrigin { origin, .. } if origin.origin_seq.is_none()
+    ));
 }
 
 fn delete_with_origin(
@@ -155,7 +188,8 @@ fn delete_with_origin(
 ) -> WriteAction {
     WriteAction::DeleteWithOrigin {
         object_id: object_id.to_string(),
-        origin: ReplicatedWriteOrigin::new(origin_timestamp_ms, origin_node_id.to_string()),
+        origin: ReplicatedWriteOrigin::new(origin_timestamp_ms, origin_node_id.to_string())
+            .with_origin_seq(1),
     }
 }
 
@@ -177,10 +211,57 @@ fn admission_record(
 /// skipped last-writer-wins upsert would leave a replay-direction test passing
 /// because the row is missing rather than because its tuple differs.
 fn publish_version(version_store: &VersionStore, object_id: &str, version: &VersionRecord) {
+    let effect_digest = if version.tombstone {
+        crate::index::oplog::delete_effect_digest(object_id)
+    } else {
+        crate::index::oplog::upsert_effect_digest(&replicated_document(object_id))
+    };
+    let proven_version = version.clone().with_origin_proof(1, effect_digest);
     assert!(
-        version_store.upsert(object_id, version).unwrap(),
+        version_store.upsert(object_id, &proven_version).unwrap(),
         "fixture version row for {object_id} must be durable before reconciliation"
     );
+}
+
+fn overwrite_origin_proof(
+    tenant_path: &std::path::Path,
+    object_id: &str,
+    origin_seq: u64,
+    effect_digest: &[u8; 32],
+) {
+    let connection = rusqlite::Connection::open(VersionStore::database_path(tenant_path)).unwrap();
+    let columns = connection
+        .prepare("PRAGMA table_info(object_versions)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    if !columns.iter().any(|column| column == "origin_seq") {
+        connection
+            .execute("ALTER TABLE object_versions ADD COLUMN origin_seq BLOB", [])
+            .unwrap();
+    }
+    if !columns.iter().any(|column| column == "effect_digest") {
+        connection
+            .execute(
+                "ALTER TABLE object_versions ADD COLUMN effect_digest BLOB",
+                [],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "UPDATE object_versions
+             SET origin_seq = ?2, effect_digest = ?3
+             WHERE object_id = ?1",
+            rusqlite::params![
+                object_id,
+                origin_seq.to_be_bytes().as_slice(),
+                effect_digest.as_slice()
+            ],
+        )
+        .unwrap();
 }
 
 fn surviving_task_ids(store: &WriteAdmissionStore) -> Vec<String> {
@@ -198,7 +279,7 @@ fn surviving_task_ids(store: &WriteAdmissionStore) -> Vec<String> {
 /// version store must be reclaimed, not re-driven, even when the committed-prefix
 /// replay set is empty and the transient finalized-task marker is already gone.
 #[test]
-fn reconcile_reclaims_records_already_published_by_the_version_store() {
+fn replication_origin_proof_admission_exact_digest_reclaims_published_record() {
     let (_tmp, store, version_store) = replicated_reconcile_fixture("replicated_reclaim");
     store
         .append_record(admission_record(
@@ -230,6 +311,74 @@ fn reconcile_reclaims_records_already_published_by_the_version_store() {
             .collect::<Vec<_>>()
     );
     assert_eq!(surviving_task_ids(&store), Vec::<String>::new());
+}
+
+#[test]
+fn replication_origin_proof_admission_digest_mismatch_fails_closed() {
+    let (tmp, store, version_store) = replicated_reconcile_fixture("digest_mismatch");
+    store
+        .append_record(admission_record(
+            "digest_mismatch",
+            "task_digest_mismatch",
+            vec![upsert_with_origin_seq(
+                "replicated_object",
+                4_300,
+                "peer-node",
+                17,
+            )],
+        ))
+        .unwrap();
+    publish_version(
+        &version_store,
+        "replicated_object",
+        &VersionRecord::new(4_300, "peer-node", false, 9),
+    );
+    overwrite_origin_proof(
+        &tmp.path().join("digest_mismatch"),
+        "replicated_object",
+        17,
+        &[0xaa; 32],
+    );
+
+    let error = reconcile_records(&store, &BTreeSet::new())
+        .expect_err("an equal origin tuple with a mismatched effect digest must fail closed");
+    assert!(
+        error.to_string().contains("effect digest"),
+        "digest mismatch refusal must be explicit: {error}"
+    );
+    assert_eq!(
+        surviving_task_ids(&store),
+        vec!["task_digest_mismatch".to_string()]
+    );
+}
+
+#[test]
+fn replication_origin_proof_admission_legacy_null_fails_closed() {
+    let (_tmp, store, version_store) = replicated_reconcile_fixture("legacy_null_proof");
+    store
+        .append_record(admission_record(
+            "legacy_null_proof",
+            "task_legacy_null_proof",
+            vec![upsert_with_origin("replicated_object", 4_400, "peer-node")],
+        ))
+        .unwrap();
+    assert!(version_store
+        .upsert(
+            "replicated_object",
+            &VersionRecord::new(4_400, "peer-node", false, 9),
+        )
+        .unwrap());
+
+    let error = reconcile_records(&store, &BTreeSet::new())
+        .expect_err("legacy NULL origin proof must not silently retire an admission record");
+    assert!(
+        error.to_string().contains("legacy NULL origin sequence"),
+        "legacy proof refusal must be explicit: {error}"
+    );
+    assert_eq!(
+        surviving_task_ids(&store),
+        vec!["task_legacy_null_proof".to_string()]
+    );
 }
 
 /// The same reclamation must not fire when the durable version tuple differs from
@@ -334,10 +483,11 @@ fn reconcile_reclaims_replicated_deletes_published_as_tombstones() {
     assert_eq!(surviving_task_ids(&store), Vec::<String>::new());
 }
 
-/// The tombstone flag is part of the published-version identity: a live row that
-/// happens to share the delete's timestamp and node has not applied that delete.
+/// The tombstone and effect digest are part of the published-version identity.
+/// A live row with the same complete origin tuple is contradictory evidence, so
+/// reconciliation must fail closed instead of replaying an ambiguous delete.
 #[test]
-fn reconcile_replays_replicated_deletes_whose_durable_row_is_not_a_tombstone() {
+fn replication_origin_proof_admission_conflicting_tombstone_fails_closed() {
     let (_tmp, store, version_store) = replicated_reconcile_fixture("replicated_live_row");
     store
         .append_record(admission_record(
@@ -352,15 +502,12 @@ fn reconcile_replays_replicated_deletes_whose_durable_row_is_not_a_tombstone() {
         &VersionRecord::new(8_100, "peer-node", false, 6),
     );
 
-    let pending = reconcile_records(&store, &BTreeSet::new()).unwrap();
+    let error = reconcile_records(&store, &BTreeSet::new())
+        .expect_err("equal source proof with a different tombstone must fail closed");
 
-    assert_eq!(
-        pending
-            .iter()
-            .map(|record| record.task_id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["task_replicated_live_row"],
-        "a delete whose durable row is still live must be replayed"
+    assert!(
+        error.to_string().contains("effect digest mismatch"),
+        "contradictory tombstone proof must be explicit: {error}"
     );
     assert_eq!(
         surviving_task_ids(&store),
@@ -423,26 +570,7 @@ fn reconcile_reclaims_records_already_applied_from_the_committed_prefix() {
 }
 
 fn checksum(record: &serde_json::Value) -> String {
-    let canonical = canonical_json(record);
+    let canonical = crate::index::utils::canonicalize_json_value(record);
     let bytes = serde_json::to_vec(&canonical).unwrap();
     format!("{:x}", Sha256::digest(bytes))
-}
-
-fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut entries: Vec<_> = map.iter().collect();
-            entries.sort_unstable_by_key(|(key, _)| *key);
-            serde_json::Value::Object(
-                entries
-                    .into_iter()
-                    .map(|(key, value)| (key.clone(), canonical_json(value)))
-                    .collect(),
-            )
-        }
-        serde_json::Value::Array(values) => {
-            serde_json::Value::Array(values.iter().map(canonical_json).collect())
-        }
-        _ => value.clone(),
-    }
 }

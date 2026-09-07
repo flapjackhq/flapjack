@@ -18,16 +18,23 @@ mod writer_lifecycle;
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
 pub use backpressure::force_backpressure_pause_for_test;
 pub(crate) use compensation::{compensate_uncommitted_tasks, DurableReplayState};
-#[cfg(test)]
+#[cfg(any(test, feature = "fault-injection"))]
 pub(crate) use compensation::{
     compensation_fault_attempts_remaining_for_test, fail_compensation_attempts_for_test,
+};
+#[cfg(test)]
+pub(crate) use compensation::{
     fail_next_compensation_for_test, set_compensation_before_oplog_retraction_hook_for_test,
 };
+#[cfg(test)]
+pub(crate) use finalization::fail_finalization_sequence_for_test;
+#[cfg(feature = "fault-injection")]
+pub(crate) use finalization::set_before_tantivy_commit_hook_for_test;
 pub(crate) use finalization::PERSISTED_VECTORS_DIR;
 #[cfg(any(test, feature = "fault-injection"))]
 pub(crate) use finalization::{
-    fail_next_commit_for_test, fail_next_finalization_for_test, inject_finalization_fault,
-    FinalizationFaultPoint,
+    fail_next_commit_for_test, fail_next_finalization_for_test, finalization_fault_is_armed,
+    inject_finalization_fault, FinalizationFaultPoint,
 };
 #[cfg(test)]
 pub(crate) use writer_lifecycle::set_writer_close_hook_for_test;
@@ -759,6 +766,8 @@ impl WriteQueueWorkerGate {
 pub struct ReplicatedWriteOrigin {
     pub timestamp_ms: u64,
     pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_seq: Option<u64>,
 }
 
 impl ReplicatedWriteOrigin {
@@ -766,11 +775,19 @@ impl ReplicatedWriteOrigin {
         Self {
             timestamp_ms,
             node_id,
+            origin_seq: None,
         }
     }
 
+    pub fn with_origin_seq(mut self, origin_seq: u64) -> Self {
+        self.origin_seq = Some(origin_seq);
+        self
+    }
+
     fn into_oplog_origin(self) -> crate::index::oplog::OpLogOrigin {
-        crate::index::oplog::OpLogOrigin::new(self.timestamp_ms, self.node_id)
+        let mut origin = crate::index::oplog::OpLogOrigin::new(self.timestamp_ms, self.node_id);
+        origin.origin_seq = self.origin_seq;
+        origin
     }
 }
 
@@ -1794,6 +1811,7 @@ fn process_doc_vectors(
 /// leaves durable Tantivy state that must survive, so it marks failed directly.
 fn fail_batch_with_compensation(
     context: &WriteFinalizationContext<'_>,
+    finalization_permit: &mut Option<crate::index::oplog::OpLogFinalizationPermit>,
     pre_batch_oplog_seq: Option<u64>,
     batch_task_ids: &[String],
     error: crate::error::FlapjackError,
@@ -1802,6 +1820,9 @@ fn fail_batch_with_compensation(
         compensation::compensate_failed_commit_batch(context, pre_batch_oplog_seq, batch_task_ids)
     {
         return compensation_error;
+    }
+    if let Some(permit) = finalization_permit {
+        permit.mark_safe();
     }
     finalization::mark_tasks_failed(context.tasks, batch_task_ids, &error);
     error
@@ -1822,9 +1843,16 @@ async fn commit_batch(
     #[cfg(not(feature = "vector-search"))]
     let _ = &ctx.vector_ctx;
     let batch_task_ids: Vec<String> = ops.iter().map(|op| op.task_id.clone()).collect();
+    let mut finalization_permit = match &ctx.oplog {
+        Some(oplog) => Some(oplog.acquire_finalization().await?),
+        None => None,
+    };
     let settings = match load_write_settings(&ctx.base_path, &ctx.tenant_id) {
         Ok(settings) => settings,
         Err(error) => {
+            if let Some(permit) = &mut finalization_permit {
+                permit.mark_safe();
+            }
             finalization::mark_tasks_failed(&ctx.tasks, &batch_task_ids, &error);
             return Err(error);
         }
@@ -1856,6 +1884,7 @@ async fn commit_batch(
             Err(error) => {
                 return Err(fail_batch_with_compensation(
                     &finalization_context,
+                    &mut finalization_permit,
                     pre_batch_oplog_seq,
                     &batch_task_ids,
                     error,
@@ -1885,6 +1914,7 @@ async fn commit_batch(
             // resurrect writes the client is about to be told failed (DUR-1).
             return Err(fail_batch_with_compensation(
                 &finalization_context,
+                &mut finalization_permit,
                 pre_batch_oplog_seq,
                 &batch_task_ids,
                 error,
@@ -1893,10 +1923,14 @@ async fn commit_batch(
     };
     publish_committed_batch(
         &finalization_context,
+        finalization_permit.as_ref(),
         &prepared_batch.operations,
         build_secs,
         &batch_task_ids,
     )?;
+    if let Some(permit) = &mut finalization_permit {
+        permit.mark_safe();
+    }
 
     observe_write_queue_phase(PHASE_COMMIT_BATCH, phase_start);
     Ok(())
@@ -1933,6 +1967,7 @@ async fn stage_batch_for_commit(
 
 fn publish_committed_batch(
     context: &WriteFinalizationContext<'_>,
+    finalization_permit: Option<&crate::index::oplog::OpLogFinalizationPermit>,
     prepared_ops: &[PreparedWriteOperation],
     build_secs: u64,
     batch_task_ids: &[String],
@@ -1945,7 +1980,12 @@ fn publish_committed_batch(
         finalization::mark_tasks_failed(context.tasks, batch_task_ids, &error);
         return Err(error);
     }
-    if let Err(error) = finalization::finalize_committed_batch(context, prepared_ops, build_secs) {
+    if let Err(error) = finalization::finalize_committed_batch(
+        context,
+        finalization_permit,
+        prepared_ops,
+        build_secs,
+    ) {
         finalization::mark_tasks_failed(context.tasks, batch_task_ids, &error);
         return Err(error);
     }

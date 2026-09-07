@@ -101,6 +101,7 @@ fn target_scanner_reports_clean_without_creating_namespace() {
     assert_eq!(report.transaction_id, None);
     assert_eq!(report.phase, None);
     assert_eq!(report.evidence, None);
+    assert_eq!(report.disposition, PublicationTargetDisposition::Vacant);
     assert!(!temp.path().join(".publication/products").exists());
 }
 

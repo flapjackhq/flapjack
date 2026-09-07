@@ -7,6 +7,99 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static ATOMIC_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(any(test, feature = "fault-injection"))]
+static DIRECTORY_SYNC_FAULTS: once_cell::sync::Lazy<
+    dashmap::DashMap<std::path::PathBuf, ArmedDirectorySyncFault>,
+> = once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
+#[cfg(any(test, feature = "fault-injection"))]
+struct ArmedDirectorySyncFault {
+    point: DirectorySyncFaultPoint,
+    successful_calls_before_failure: usize,
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectorySyncFaultPoint {
+    Open,
+    OpenNotFound,
+    Sync,
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+pub struct DirectorySyncFaultGuard {
+    path: std::path::PathBuf,
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+impl DirectorySyncFaultGuard {
+    pub fn was_triggered(&self) -> bool {
+        !DIRECTORY_SYNC_FAULTS.contains_key(&self.path)
+    }
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+impl Drop for DirectorySyncFaultGuard {
+    fn drop(&mut self) {
+        DIRECTORY_SYNC_FAULTS.remove(&self.path);
+    }
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+pub(crate) fn fail_next_directory_sync_for_test(
+    path: &Path,
+    fault_point: DirectorySyncFaultPoint,
+) -> DirectorySyncFaultGuard {
+    fail_directory_sync_after_for_test(path, fault_point, 0)
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+pub(crate) fn fail_directory_sync_after_for_test(
+    path: &Path,
+    fault_point: DirectorySyncFaultPoint,
+    successful_calls_before_failure: usize,
+) -> DirectorySyncFaultGuard {
+    let path = path.to_path_buf();
+    assert!(
+        DIRECTORY_SYNC_FAULTS
+            .insert(
+                path.clone(),
+                ArmedDirectorySyncFault {
+                    point: fault_point,
+                    successful_calls_before_failure,
+                },
+            )
+            .is_none(),
+        "a directory sync fault is already armed for {}",
+        path.display()
+    );
+    DirectorySyncFaultGuard { path }
+}
+
+/// Return a recursively key-sorted JSON value for stable semantic hashing.
+///
+/// Array order and scalar representation remain significant; object insertion
+/// order does not. Callers that persist or compare digests share this owner so
+/// retries cannot disagree merely because a `HashMap` serialized differently.
+pub(crate) fn canonicalize_json_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_unstable_by_key(|(key, _)| *key);
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), canonicalize_json_value(value)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonicalize_json_value).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
 pub(crate) fn is_temporary_entry(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
@@ -35,6 +128,109 @@ fn is_legacy_atomic_write_temp_name(name: &str) -> bool {
 
 pub(crate) fn atomic_write(path: &Path, payload: &[u8]) -> std::io::Result<()> {
     atomic_write_with_before_rename(path, payload, |_| {})
+}
+
+pub(crate) fn durable_remove_file(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => sync_parent_directory(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match sync_parent_directory(path) {
+                Err(parent_error) if parent_error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                result => result,
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Create or validate a private directory and durably publish its parent entry.
+///
+/// A missing directory is created with mode `0700` on Unix and its parent is
+/// synced so the new entry survives power loss. An existing real directory is
+/// reused and its mode is restored to `0700`. Regular files and symbolic links
+/// at `path` are rejected with `InvalidData`; a missing parent surfaces as
+/// `NotFound` because creation is deliberately non-recursive.
+pub(crate) fn ensure_private_directory(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "private state path is not a real directory: {}",
+                    path.display()
+                ),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder.create(path)?;
+        }
+        Err(error) => return Err(error),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    sync_parent_directory(path)
+}
+
+/// Durably sync a directory's entry namespace after a create, rename, or unlink.
+pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(any(test, feature = "fault-injection"))]
+    if consume_directory_sync_fault(path, DirectorySyncFaultPoint::Open) {
+        return Err(std::io::Error::other("injected directory open failure"));
+    }
+    #[cfg(any(test, feature = "fault-injection"))]
+    if consume_directory_sync_fault(path, DirectorySyncFaultPoint::OpenNotFound) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "injected directory disappeared before open",
+        ));
+    }
+    let directory = File::open(path)?;
+    #[cfg(any(test, feature = "fault-injection"))]
+    if consume_directory_sync_fault(path, DirectorySyncFaultPoint::Sync) {
+        return Err(std::io::Error::other("injected directory sync failure"));
+    }
+    directory.sync_all()
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+fn consume_directory_sync_fault(path: &Path, fault_point: DirectorySyncFaultPoint) -> bool {
+    let Some(mut armed) = DIRECTORY_SYNC_FAULTS.get_mut(path) else {
+        return false;
+    };
+    if armed.point != fault_point {
+        return false;
+    }
+    if armed.successful_calls_before_failure > 0 {
+        armed.successful_calls_before_failure -= 1;
+        return false;
+    }
+    drop(armed);
+    let should_fail = true;
+    if should_fail {
+        DIRECTORY_SYNC_FAULTS.remove(path);
+    }
+    should_fail
+}
+
+/// Sync the directory that holds `path`; a path without a parent is `InvalidInput`.
+pub(crate) fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("path has no parent directory: {}", path.display()),
+        )
+    })?;
+    sync_directory(parent)
 }
 
 pub(crate) fn atomic_write_with_before_rename(
@@ -87,7 +283,7 @@ fn atomic_write_with(
         drop(file);
         before_rename(&temp_path)?;
         std::fs::rename(&temp_path, path)?;
-        File::open(parent)?.sync_all()
+        sync_directory(parent)
     })();
 
     if write_result.is_err() {
@@ -169,6 +365,241 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(unix)]
+    fn unix_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn set_unix_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn ensure_private_directory_creates_then_reuses_a_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join(".private-state");
+
+        ensure_private_directory(&private).unwrap();
+        assert!(private.is_dir());
+        #[cfg(unix)]
+        assert_eq!(unix_mode(&private), 0o700);
+
+        fs::write(private.join("kept.json"), b"kept").unwrap();
+        ensure_private_directory(&private).unwrap();
+        assert_eq!(fs::read(private.join("kept.json")).unwrap(), b"kept");
+        #[cfg(unix)]
+        assert_eq!(unix_mode(&private), 0o700);
+    }
+
+    #[test]
+    fn ensure_private_directory_rejects_a_regular_file_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".private-state");
+        fs::write(&target, b"not a directory").unwrap();
+
+        let error = ensure_private_directory(&target).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&target).unwrap(), b"not a directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_directory_rejects_a_symlink_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = dir.path().join(".private-state");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let error = ensure_private_directory(&link).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn ensure_private_directory_propagates_a_missing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("missing-parent").join(".private-state");
+
+        let error = ensure_private_directory(&target).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!dir.path().join("missing-parent").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_directory_propagates_parent_open_failure_after_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("write-only-parent");
+        fs::create_dir(&parent).unwrap();
+        let target = parent.join(".private-state");
+        set_unix_mode(&parent, 0o300);
+        assert!(
+            File::open(&parent).is_err(),
+            "write-only parent open denial is unsupported on this host"
+        );
+
+        let result = ensure_private_directory(&target);
+        set_unix_mode(&parent, 0o700);
+
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "the parent-directory sync failure must reach the caller"
+        );
+        assert!(target.is_dir());
+    }
+
+    #[test]
+    fn sync_directory_propagates_open_failure_for_a_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let error = sync_directory(&dir.path().join("missing")).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        sync_directory(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn sync_parent_directory_rejects_a_path_without_a_parent() {
+        let error = sync_parent_directory(Path::new("/")).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn sync_parent_directory_syncs_the_existing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("state.json");
+        fs::write(&file, b"state").unwrap();
+
+        sync_parent_directory(&file).unwrap();
+
+        let error =
+            sync_parent_directory(&dir.path().join("missing").join("state.json")).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn durable_remove_syncs_parent_after_unlink_and_on_missing_file_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("resource.json");
+        fs::write(&target, b"resource").unwrap();
+
+        let unlink_fault =
+            fail_next_directory_sync_for_test(dir.path(), DirectorySyncFaultPoint::Sync);
+        let error = durable_remove_file(&target).unwrap_err();
+        assert_eq!(error.to_string(), "injected directory sync failure");
+        assert!(unlink_fault.was_triggered());
+        assert!(!target.exists());
+
+        let retry_fault =
+            fail_next_directory_sync_for_test(dir.path(), DirectorySyncFaultPoint::Sync);
+        let error = durable_remove_file(&target).unwrap_err();
+        assert_eq!(error.to_string(), "injected directory sync failure");
+        assert!(retry_fault.was_triggered());
+
+        durable_remove_file(&target).unwrap();
+    }
+
+    #[test]
+    fn durable_remove_missing_target_syncs_existing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("missing.json");
+        let fault = fail_next_directory_sync_for_test(dir.path(), DirectorySyncFaultPoint::Open);
+
+        let error = durable_remove_file(&target).unwrap_err();
+
+        assert_eq!(error.to_string(), "injected directory open failure");
+        assert!(fault.was_triggered());
+    }
+
+    #[test]
+    fn durable_remove_missing_target_and_parent_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_parent = dir.path().join("missing-parent");
+
+        durable_remove_file(&missing_parent.join("missing.json")).unwrap();
+
+        assert!(!missing_parent.exists());
+    }
+
+    #[test]
+    fn durable_remove_propagates_non_not_found_unlink_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("directory-not-file");
+        fs::create_dir(&target).unwrap();
+        let expected_kind = fs::remove_file(&target).unwrap_err().kind();
+
+        let error = durable_remove_file(&target).unwrap_err();
+
+        assert_eq!(error.kind(), expected_kind);
+        assert!(target.is_dir());
+    }
+
+    #[test]
+    fn durable_remove_propagates_parent_open_and_sync_errors_after_unlink() {
+        for (fault_point, expected_message) in [
+            (
+                DirectorySyncFaultPoint::Open,
+                "injected directory open failure",
+            ),
+            (
+                DirectorySyncFaultPoint::Sync,
+                "injected directory sync failure",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("resource.json");
+            fs::write(&target, b"resource").unwrap();
+            let fault = fail_next_directory_sync_for_test(dir.path(), fault_point);
+
+            let error = durable_remove_file(&target).unwrap_err();
+
+            assert_eq!(error.to_string(), expected_message);
+            assert!(fault.was_triggered());
+            assert!(!target.exists());
+        }
+    }
+
+    #[test]
+    fn durable_remove_fails_closed_when_parent_disappears_after_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("resource.json");
+        fs::write(&target, b"resource").unwrap();
+        let fault =
+            fail_next_directory_sync_for_test(dir.path(), DirectorySyncFaultPoint::OpenNotFound);
+
+        let error = durable_remove_file(&target).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(fault.was_triggered());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn atomic_write_propagates_directory_open_and_sync_failures() {
+        for fault_point in [DirectorySyncFaultPoint::Open, DirectorySyncFaultPoint::Sync] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("durable.json");
+            let fault = fail_next_directory_sync_for_test(dir.path(), fault_point);
+
+            assert!(atomic_write(&target, b"new").is_err());
+            assert!(fault.was_triggered());
+            atomic_write(&target, b"retry").unwrap();
+            assert_eq!(fs::read(&target).unwrap(), b"retry");
+        }
+    }
 
     #[test]
     fn copies_files() {

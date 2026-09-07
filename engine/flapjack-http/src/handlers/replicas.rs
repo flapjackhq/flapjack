@@ -123,7 +123,7 @@ pub(crate) fn resolve_search_target(
 /// Standard replicas are physical indexes (create_tenant), virtual replicas are
 /// settings-only directories with `settings.json` and no Tantivy data files.
 pub(crate) fn persist_replica_primary_links(
-    state: &Arc<AppState>,
+    state: &AppState,
     primary_index_name: &str,
     replicas: &[ReplicaEntry],
 ) -> Result<(), FlapjackError> {
@@ -182,7 +182,7 @@ pub(crate) fn persist_replica_primary_link_with_settings(
 
 /// Remove `primary` link from replicas removed from a primary's replicas list.
 pub(crate) fn clear_removed_replica_primary_links(
-    state: &Arc<AppState>,
+    state: &AppState,
     primary_index_name: &str,
     previous_replicas: Option<&[String]>,
     next_replicas: &[ReplicaEntry],
@@ -297,6 +297,7 @@ mod tests {
             usage_counters: Arc::new(DashMap::new()),
             usage_persistence: None,
             paused_indexes: crate::pause_registry::PausedIndexes::new(),
+            global_mutation_fence: crate::pause_registry::GlobalMutationFence::open(base).unwrap(),
             geoip_reader: None,
             notification_service: None,
             migration_runner: Arc::new(crate::handlers::migration::MigrationJobRunner::new(

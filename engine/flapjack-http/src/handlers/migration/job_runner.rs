@@ -25,6 +25,15 @@ use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+#[cfg(test)]
+async fn test_mutation_permit(manager: &IndexManager) -> crate::pause_registry::MutationPermit {
+    crate::pause_registry::GlobalMutationFence::open(&manager.base_path)
+        .unwrap()
+        .admit_mutation()
+        .await
+        .unwrap()
+}
+
 pub const DEFAULT_ASYNC_MIGRATION_CAPACITY: usize = 2;
 
 struct ActiveMigrationTask {
@@ -86,6 +95,7 @@ impl MigrationJobRunner {
         target_index: String,
         publication_mode: MigrationPublicationMode,
         permit: OwnedSemaphorePermit,
+        mutation_permit: crate::pause_registry::MutationPermit,
     ) {
         let manager = Arc::clone(&self.manager);
         let monitor_manager = Arc::clone(&self.manager);
@@ -106,6 +116,7 @@ impl MigrationJobRunner {
             .await
         });
         let monitor = tokio::spawn(async move {
+            let _mutation_permit = mutation_permit;
             let task_result = task.await;
             if !matches!(&task_result, Ok(Ok(()))) {
                 tracing::error!(%job_uuid, result = ?task_result, "async bulk replacement failed");
@@ -149,7 +160,7 @@ impl MigrationJobRunner {
 
     /// Admit and spawn an async Algolia import, returning the durable admission
     /// record committed by `SpoolStore`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(super) async fn submit_algolia_import<F, R>(
         &self,
         payload: MigrateFromAlgoliaRequest,
@@ -166,6 +177,7 @@ impl MigrationJobRunner {
     }
 
     /// TODO: Document MigrationJobRunner.submit_algolia_import_for_owner.
+    #[cfg(test)]
     pub(super) async fn submit_algolia_import_for_owner<F, R>(
         &self,
         payload: MigrateFromAlgoliaRequest,
@@ -178,11 +190,13 @@ impl MigrationJobRunner {
         ) -> Result<R, super::algolia_client::AlgoliaClientError>,
         R: MigrationSourceReader + Send + 'static,
     {
+        let mutation_permit = test_mutation_permit(&self.manager).await;
         self.submit_source_import_for_owner(
             AsyncMigrationSourceProvider::Algolia,
             payload,
             authenticated_app_id,
             source_factory,
+            mutation_permit,
         )
         .await
     }
@@ -205,11 +219,13 @@ impl MigrationJobRunner {
         ) -> Result<R, super::algolia_client::AlgoliaClientError>,
         R: MigrationSourceReader + Send + 'static,
     {
+        let mutation_permit = test_mutation_permit(&self.manager).await;
         self.submit_source_import_for_owner(
             AsyncMigrationSourceProvider::Meilisearch,
             payload,
             authenticated_app_id,
             source_factory,
+            mutation_permit,
         )
         .await
     }
@@ -220,6 +236,7 @@ impl MigrationJobRunner {
         payload: P,
         authenticated_app_id: Option<String>,
         source_factory: F,
+        mutation_permit: crate::pause_registry::MutationPermit,
     ) -> Result<(Uuid, MigrationPhaseRecord), MigrateError>
     where
         P: AsyncMigrationSubmitPayload,
@@ -256,16 +273,18 @@ impl MigrationJobRunner {
             },
             reader,
             permit,
+            mutation_permit,
         );
         Ok((job_uuid, phase_record))
     }
 
-    pub(super) async fn resume_algolia_import<F, R>(
+    pub(super) async fn resume_algolia_import_with_permit<F, R>(
         &self,
         job_uuid: Uuid,
         checkpoint_handle: String,
         payload: MigrateFromAlgoliaRequest,
         source_factory: F,
+        mutation_permit: crate::pause_registry::MutationPermit,
     ) -> Result<MigrationPhaseRecord, MigrateError>
     where
         F: FnOnce(
@@ -309,8 +328,35 @@ impl MigrationJobRunner {
             reader,
             checkpoint,
             permit,
+            mutation_permit,
         );
         Ok(phase_record)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(super) async fn resume_algolia_import<F, R>(
+        &self,
+        job_uuid: Uuid,
+        checkpoint_handle: String,
+        payload: MigrateFromAlgoliaRequest,
+        source_factory: F,
+    ) -> Result<MigrationPhaseRecord, MigrateError>
+    where
+        F: FnOnce(
+            &MigrateFromAlgoliaRequest,
+        ) -> Result<R, super::algolia_client::AlgoliaClientError>,
+        R: MigrationSourceReader + Send + 'static,
+    {
+        let mutation_permit = test_mutation_permit(&self.manager).await;
+        self.resume_algolia_import_with_permit(
+            job_uuid,
+            checkpoint_handle,
+            payload,
+            source_factory,
+            mutation_permit,
+        )
+        .await
     }
 
     fn resume_publication_mode(
@@ -370,6 +416,7 @@ impl MigrationJobRunner {
         R: MigrationSourceReader + Send + 'static,
     {
         let admitted = payload.admit_async(&self.manager, self.replication_manager.as_ref())?;
+        let mutation_permit = test_mutation_permit(&self.manager).await;
         let permit = self
             .capacity
             .clone()
@@ -398,6 +445,7 @@ impl MigrationJobRunner {
             },
             reader,
             permit,
+            mutation_permit,
             hooks,
         );
         Ok((job_uuid, phase_record))
@@ -411,6 +459,7 @@ impl MigrationJobRunner {
         request: import::SourceImportRequest,
         mut reader: R,
         permit: OwnedSemaphorePermit,
+        mutation_permit: crate::pause_registry::MutationPermit,
     ) where
         R: MigrationSourceReader + Send + 'static,
     {
@@ -424,6 +473,7 @@ impl MigrationJobRunner {
                 .await
         });
         let monitor = tokio::spawn(async move {
+            let _mutation_permit = mutation_permit;
             let result = import_task.await;
             if let Err(error) = result {
                 tracing::error!(
@@ -464,6 +514,7 @@ impl MigrationJobRunner {
         mut reader: R,
         checkpoint: super::spool::ExportCheckpoint,
         permit: OwnedSemaphorePermit,
+        mutation_permit: crate::pause_registry::MutationPermit,
     ) where
         R: MigrationSourceReader + Send + 'static,
     {
@@ -484,6 +535,7 @@ impl MigrationJobRunner {
             .await
         });
         let monitor = tokio::spawn(async move {
+            let _mutation_permit = mutation_permit;
             let result = import_task.await;
             if let Err(error) = result {
                 tracing::error!(
@@ -525,6 +577,7 @@ impl MigrationJobRunner {
         request: import::SourceImportRequest,
         mut reader: R,
         permit: OwnedSemaphorePermit,
+        mutation_permit: crate::pause_registry::MutationPermit,
         hooks: import::ImportTestHooks,
     ) where
         R: MigrationSourceReader + Send + 'static,
@@ -545,6 +598,7 @@ impl MigrationJobRunner {
             .await
         });
         let monitor = tokio::spawn(async move {
+            let _mutation_permit = mutation_permit;
             let result = import_task.await;
             if let Err(error) = result {
                 tracing::error!(

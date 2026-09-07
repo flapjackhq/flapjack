@@ -219,6 +219,8 @@ pub fn make_test_app_state(
         metrics_state,
         usage_counters: Arc::new(dashmap::DashMap::new()),
         paused_indexes: flapjack_http::pause_registry::PausedIndexes::new(),
+        global_mutation_fence: flapjack_http::pause_registry::GlobalMutationFence::open(data_dir)
+            .expect("integration test data root must host the mutation fence"),
         usage_persistence: None,
         geoip_reader: None,
         notification_service: None,
@@ -288,6 +290,7 @@ pub(crate) async fn spawn_router(app: Router, temp_dir: &mut TempDir) -> String 
 
 /// TODO: Document build_query_suggestions_test_routes.
 fn build_query_suggestions_test_routes(state: Arc<flapjack_http::handlers::AppState>) -> Router {
+    let mutation_fence = state.global_mutation_fence.clone();
     let public_health_routes =
         flapjack_http::router::build_public_health_routes().with_state(state.clone());
 
@@ -329,9 +332,12 @@ fn build_query_suggestions_test_routes(state: Arc<flapjack_http::handlers::AppSt
         )
         .with_state(state);
 
-    Router::new()
-        .merge(public_health_routes)
-        .merge(query_suggestions_routes)
+    flapjack_http::router::apply_global_mutation_fence(
+        Router::new()
+            .merge(public_health_routes)
+            .merge(query_suggestions_routes),
+        mutation_fence,
+    )
 }
 
 pub fn build_test_app_for_local_requests(admin_key: Option<&str>) -> (Router, TempDir) {

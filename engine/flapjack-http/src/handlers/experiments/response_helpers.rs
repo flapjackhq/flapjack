@@ -1,9 +1,10 @@
 //! Stub summary for engine/flapjack-http/src/handlers/experiments/response_helpers.rs.
 use super::{
-    dto_algolia, metrics, resolve::resolve_store_and_experiment_id, AppState, Experiment,
-    ExperimentArm, ExperimentConclusion, ExperimentError, ExperimentStatus, ExperimentStore,
-    PrimaryMetric, EXPERIMENT_WARNING_HEADER_NAME,
+    dto_algolia, load_authorized_experiment, metrics, resolve::resolve_store_and_experiment_id,
+    AppState, Experiment, ExperimentArm, ExperimentConclusion, ExperimentError, ExperimentStatus,
+    ExperimentStore, PrimaryMetric, EXPERIMENT_WARNING_HEADER_NAME,
 };
+use crate::auth::{ApiKey, SecuredKeyRestrictions};
 use crate::error_response::json_error;
 use axum::{
     http::StatusCode,
@@ -32,7 +33,7 @@ pub(super) fn experiment_error_to_response(err: ExperimentError) -> Response {
     }
 }
 
-fn internal_server_error_response() -> Response {
+pub(super) fn internal_server_error_response() -> Response {
     json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
 }
 
@@ -50,12 +51,18 @@ pub(super) fn algolia_action_response(numeric_id: i64, index_name: String) -> Re
 pub(super) fn lifecycle_action_response(
     state: &AppState,
     id_str: &str,
+    api_key: Option<&ApiKey>,
+    secured_restrictions: Option<&SecuredKeyRestrictions>,
     action: fn(&ExperimentStore, &str) -> Result<Experiment, ExperimentError>,
 ) -> Response {
     let (store, uuid, numeric_id) = match resolve_store_and_experiment_id(state, id_str) {
         Ok(values) => values,
         Err(response) => return response,
     };
+
+    if let Err(response) = load_authorized_experiment(store, &uuid, api_key, secured_restrictions) {
+        return response;
+    }
 
     match action(store, &uuid) {
         Ok(experiment) => algolia_action_response(numeric_id, experiment.index_name),

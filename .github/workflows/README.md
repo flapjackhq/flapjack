@@ -29,8 +29,7 @@ name.
 - Rust engine (all tests)
 - Dashboard (unit tests, build, page tests)
 - Dashboard full and integration tests (requires Algolia secrets)
-- All SDKs (PHP 8.1-8.3, Python 3.9-3.12, JS, Go 1.21-1.23, Ruby 3.1-3.3, Java, C#)
-- Integrations (Laravel Scout, WordPress)
+- Official Algolia client and InstantSearch contract tests
 
 **Repository Check:**
 All jobs check `github.repository == flapjackhq/flapjack` to ensure they only run in the public repo.
@@ -40,11 +39,9 @@ All jobs check `github.repository == flapjackhq/flapjack` to ensure they only ru
 Runs every night at 2 AM UTC on the public repo only.
 
 **Additional coverage:**
-- Extended version matrices (PHP 8.4, Python 3.13, Node 18/20/22, Java 17/21, .NET 7/8)
 - All Rust tests (not just fast subset)
 - Dashboard integration tests
 - Cross-platform installer tests
-- Full SDK compatibility matrix
 
 ## Sync Process
 
@@ -89,7 +86,7 @@ The workflows use a tiered approach:
 
 - **Complete push CI**: The same required jobs on trusted candidates and `main`
 - **Stable aggregate**: One fail-closed branch-protection result
-- **Nightly tests**: Extended compatibility matrix on public `main`
+- **Nightly tests**: Broader Rust, dashboard, installer, and migration coverage on public `main`
 
 The private development repository keeps Actions disabled; local development
 uses the canonical runner shown above.

@@ -314,16 +314,6 @@ pub(super) fn oplog_io_error(
 
 pub(super) fn remove_segment_file(path: &Path) -> crate::error::Result<()> {
     fs::remove_file(path)?;
-    sync_parent_directory(path)
-}
-
-pub(super) fn sync_parent_directory(path: &Path) -> crate::error::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("segment path has no parent: {}", path.display()),
-        )
-    })?;
-    File::open(parent)?.sync_all()?;
+    crate::index::utils::sync_parent_directory(path)?;
     Ok(())
 }

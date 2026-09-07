@@ -9,9 +9,8 @@ use super::AppState;
 
 /// GET /metrics — returns Prometheus text exposition format.
 ///
-/// Gauges are populated on each request from live AppState / IndexManager /
-/// MemoryObserver values. Per-tenant storage gauges are updated by a background
-/// poller (see `server.rs`) and stored in `MetricsState`.
+/// Runtime gauges come from live process state. Per-index storage and document
+/// gauges come only from one background-published `MetricsState` generation.
 pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let registry = Registry::new();
     let state = state.as_ref();
@@ -113,11 +112,32 @@ fn register_replication_gauges(registry: &Registry, state: &AppState) {
 }
 
 fn register_live_index_state_gauges(registry: &Registry, state: &AppState) {
+    register_live_index_state_gauges_with_snapshot_hook(registry, state, || {});
+}
+
+/// Register one captured index-gauge generation.
+///
+/// The hook is a deterministic test seam for publishing a newer generation
+/// after capture. Production passes a no-op, and every per-index gauge below
+/// still receives the same immutable snapshot.
+fn register_live_index_state_gauges_with_snapshot_hook<AfterSnapshot>(
+    registry: &Registry,
+    state: &AppState,
+    after_snapshot: AfterSnapshot,
+) where
+    AfterSnapshot: FnOnce(),
+{
     // `/metrics` is an authenticated admin endpoint; keep one stable per-index
     // contract across test and runtime builds so dashboard parsing behavior
     // matches production.
-    register_storage_bytes_gauge(registry, state);
-    register_documents_count_gauge(registry, state);
+    let snapshot = state
+        .metrics_state
+        .as_ref()
+        .map(|metrics_state| metrics_state.index_gauge_snapshot())
+        .unwrap_or_default();
+    after_snapshot();
+    register_storage_bytes_gauge(registry, &snapshot);
+    register_documents_count_gauge(registry, &snapshot);
     register_oplog_sequence_gauge(registry, state);
 }
 
@@ -186,8 +206,8 @@ fn register_analytics_gauges(registry: &Registry) {
     );
 }
 
-fn register_storage_bytes_gauge(registry: &Registry, state: &AppState) {
-    let values = collect_storage_gauge_values(state);
+fn register_storage_bytes_gauge(registry: &Registry, snapshot: &IndexGaugeSnapshot) {
+    let values = collect_storage_gauge_values(snapshot);
     register_index_labeled_gauge_values(
         registry,
         "flapjack_storage_bytes",
@@ -198,11 +218,16 @@ fn register_storage_bytes_gauge(registry: &Registry, state: &AppState) {
 
 #[cfg(test)]
 fn register_public_storage_bytes_gauge(registry: &Registry, state: &AppState) {
+    let snapshot = state
+        .metrics_state
+        .as_ref()
+        .map(|metrics_state| metrics_state.index_gauge_snapshot())
+        .unwrap_or_default();
     register_gauge(
         registry,
         "flapjack_storage_bytes",
         "Aggregate disk storage in bytes across all tenant indexes",
-        collect_storage_gauge_values(state)
+        collect_storage_gauge_values(&snapshot)
             .into_iter()
             .map(|(_, value)| value)
             .sum(),
@@ -210,17 +235,12 @@ fn register_public_storage_bytes_gauge(registry: &Registry, state: &AppState) {
 }
 
 /// Registers per-tenant Prometheus gauges for document counts.
-fn register_documents_count_gauge(registry: &Registry, state: &AppState) {
-    let values = state
-        .manager
-        .loaded_tenant_ids()
-        .into_iter()
-        .filter_map(|tenant_id| {
-            state
-                .manager
-                .tenant_doc_count(&tenant_id)
-                .map(|document_count| (tenant_id, document_count as f64))
-        });
+fn register_documents_count_gauge(registry: &Registry, snapshot: &IndexGaugeSnapshot) {
+    let values = snapshot.iter().filter_map(|(tenant_id, gauges)| {
+        gauges
+            .documents_count
+            .map(|document_count| (tenant_id.clone(), document_count as f64))
+    });
     register_index_labeled_gauge_values(
         registry,
         "flapjack_documents_count",
@@ -231,11 +251,14 @@ fn register_documents_count_gauge(registry: &Registry, state: &AppState) {
 
 #[cfg(test)]
 fn register_public_documents_count_gauge(registry: &Registry, state: &AppState) {
-    let total_documents = state
-        .manager
-        .loaded_tenant_ids()
-        .into_iter()
-        .filter_map(|tenant_id| state.manager.tenant_doc_count(&tenant_id))
+    let snapshot = state
+        .metrics_state
+        .as_ref()
+        .map(|metrics_state| metrics_state.index_gauge_snapshot())
+        .unwrap_or_default();
+    let total_documents = snapshot
+        .values()
+        .filter_map(|gauges| gauges.documents_count)
         .sum::<u64>() as f64;
     register_gauge(
         registry,
@@ -318,24 +341,16 @@ fn bool_as_gauge_value(value: bool) -> f64 {
     }
 }
 
-/// Collects per-index storage-size gauge values from the metrics poller.
-fn collect_storage_gauge_values(state: &AppState) -> Vec<(String, f64)> {
-    let mut merged_values: std::collections::BTreeMap<String, f64> = state
-        .manager
-        .all_tenant_storage()
-        .into_iter()
-        .map(|(tenant_id, bytes)| (tenant_id, bytes as f64))
-        .collect();
-
-    if let Some(metrics_state) = state.metrics_state.as_ref() {
-        // Prefer poller-owned values when present, but keep manager-derived entries
-        // so newly-created indexes are never omitted between poller cycles.
-        for entry in metrics_state.storage_gauges.iter() {
-            merged_values.insert(entry.key().clone(), *entry.value() as f64);
-        }
-    }
-
-    merged_values.into_iter().collect()
+/// Collect per-index storage values from one already-captured generation.
+fn collect_storage_gauge_values(snapshot: &IndexGaugeSnapshot) -> Vec<(String, f64)> {
+    snapshot
+        .iter()
+        .filter_map(|(tenant_id, gauges)| {
+            gauges
+                .storage_bytes
+                .map(|storage_bytes| (tenant_id.clone(), storage_bytes as f64))
+        })
+        .collect()
 }
 
 fn register_index_labeled_gauge_values<I>(registry: &Registry, name: &str, help: &str, values: I)
@@ -409,20 +424,41 @@ fn register_billing_usage_gauges(
     }
 }
 
-/// Shared state for metrics updated by background tasks.
-///
-/// The storage background poller writes per-tenant byte counts here;
-/// the `/metrics` handler reads them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct IndexGaugeValues {
+    pub(crate) documents_count: Option<u64>,
+    pub(crate) storage_bytes: Option<u64>,
+}
+
+pub(crate) type IndexGaugeSnapshot = std::collections::BTreeMap<String, IndexGaugeValues>;
+
+/// Shared whole-generation state updated by the existing metrics refresh task.
 #[derive(Clone)]
 pub struct MetricsState {
-    pub storage_gauges: Arc<dashmap::DashMap<String, u64>>,
+    index_gauges: Arc<std::sync::RwLock<Arc<IndexGaugeSnapshot>>>,
 }
 
 impl MetricsState {
     pub fn new() -> Self {
         MetricsState {
-            storage_gauges: Arc::new(dashmap::DashMap::new()),
+            index_gauges: Arc::new(std::sync::RwLock::new(Arc::new(IndexGaugeSnapshot::new()))),
         }
+    }
+
+    pub(crate) fn index_gauge_snapshot(&self) -> Arc<IndexGaugeSnapshot> {
+        Arc::clone(
+            &self
+                .index_gauges
+                .read()
+                .expect("metrics snapshot lock poisoned"),
+        )
+    }
+
+    pub(crate) fn replace_index_gauges(&self, snapshot: IndexGaugeSnapshot) {
+        *self
+            .index_gauges
+            .write()
+            .expect("metrics snapshot lock poisoned") = Arc::new(snapshot);
     }
 }
 
@@ -444,8 +480,12 @@ mod tests {
 
     /// Parse a labeled metric value from Prometheus text output.
     fn find_metric_value(text: &str, metric_name: &str, label_value: &str) -> f64 {
+        let exact_sample = format!("{metric_name}{{index=\"{label_value}\"}}");
         text.lines()
-            .find(|l| l.contains(metric_name) && l.contains(label_value) && !l.starts_with('#'))
+            .find(|line| {
+                let sample = line.split_whitespace().next().unwrap_or_default();
+                sample == exact_sample
+            })
             .unwrap_or_else(|| {
                 panic!(
                     "metric {}{{..={}}} not found in:\n{}",
@@ -679,8 +719,13 @@ mod tests {
 
         // Simulate the background poller by publishing a known storage snapshot.
         let ms = state.metrics_state.as_ref().unwrap();
-        ms.storage_gauges.clear();
-        ms.storage_gauges.insert("store1".to_string(), 1234);
+        ms.replace_index_gauges(IndexGaugeSnapshot::from([(
+            "store1".to_string(),
+            IndexGaugeValues {
+                documents_count: None,
+                storage_bytes: Some(1234),
+            },
+        )]));
 
         let text = fetch_metrics_text(state).await;
 
@@ -856,6 +901,11 @@ mod tests {
             .add_documents_sync("docs_idx", docs)
             .await
             .unwrap();
+        crate::background_tasks::refresh_metrics_snapshot(
+            &state.manager,
+            state.metrics_state.as_ref().unwrap(),
+        )
+        .unwrap();
 
         let text = fetch_metrics_text(state).await;
 
@@ -960,19 +1010,6 @@ mod tests {
 
         state.manager.create_tenant("public_a").unwrap();
         state.manager.create_tenant("public_b").unwrap();
-        state.metrics_state.as_ref().unwrap().storage_gauges.clear();
-        state
-            .metrics_state
-            .as_ref()
-            .unwrap()
-            .storage_gauges
-            .insert("public_a".to_string(), 100);
-        state
-            .metrics_state
-            .as_ref()
-            .unwrap()
-            .storage_gauges
-            .insert("public_b".to_string(), 50);
         state
             .manager
             .add_documents_sync(
@@ -987,6 +1024,26 @@ mod tests {
             )
             .await
             .unwrap();
+        state
+            .metrics_state
+            .as_ref()
+            .unwrap()
+            .replace_index_gauges(IndexGaugeSnapshot::from([
+                (
+                    "public_a".to_string(),
+                    IndexGaugeValues {
+                        documents_count: Some(1),
+                        storage_bytes: Some(100),
+                    },
+                ),
+                (
+                    "public_b".to_string(),
+                    IndexGaugeValues {
+                        documents_count: Some(0),
+                        storage_bytes: Some(50),
+                    },
+                ),
+            ]));
 
         let registry = Registry::new();
         register_public_storage_bytes_gauge(&registry, &state);

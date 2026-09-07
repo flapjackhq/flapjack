@@ -2,6 +2,7 @@ import '@testing-library/jest-dom/vitest';
 import { fireEvent, render, screen, within } from '@testing-library/svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import ApiKeyShellHarness from './fixtures/ApiKeyShellHarness.svelte';
+import * as apiKeyShellStories from '../src/lib/features/ApiKeyShell.stories';
 
 const readyKeys = [
   {
@@ -41,7 +42,9 @@ describe('shared API key interaction shell', () => {
 
     await rerender({ state: { kind: 'error', message: 'Keys are unavailable.' }, onRetry });
     expect(screen.getByRole('alert')).toHaveTextContent('Keys are unavailable.');
-    await fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    const retryButton = screen.getByRole('button', { name: 'Retry' });
+    expect(retryButton).toHaveAttribute('data-variant', 'secondary');
+    await fireEvent.click(retryButton);
     expect(onRetry).toHaveBeenCalledOnce();
   });
 
@@ -53,7 +56,9 @@ describe('shared API key interaction shell', () => {
 
     expect(screen.getByRole('heading', { name: 'API Keys' })).toBeInTheDocument();
     expect(screen.getByText('No API keys yet.')).toBeInTheDocument();
-    await fireEvent.click(screen.getByRole('button', { name: 'Create API Key' }));
+    const createButton = screen.getByRole('button', { name: 'Create API Key' });
+    expect(createButton).toHaveAttribute('data-variant', 'primary');
+    await fireEvent.click(createButton);
     expect(onCreate).toHaveBeenCalledOnce();
   });
 
@@ -192,6 +197,11 @@ describe('shared API key interaction shell', () => {
     const removeButton = within(productsCard).getByRole('button', {
       name: 'Remove Products browser key',
     });
+    expect(within(productsCard).getByRole('button', { name: 'Copy Products browser key' })).toHaveAttribute(
+      'data-variant',
+      'secondary'
+    );
+    expect(removeButton).toHaveAttribute('data-variant', 'danger');
     await fireEvent.click(removeButton);
     expect(onRequestRemove).toHaveBeenCalledOnce();
     expect(onRequestRemove.mock.calls[0]?.[0]).toEqual({
@@ -203,5 +213,14 @@ describe('shared API key interaction shell', () => {
     for (const secret of readyKeys.map((key) => key.opaqueId)) {
       expect(document.querySelector(`[id*="${secret}"], [data-testid*="${secret}"]`)).toBeNull();
     }
+  });
+
+  it('registers every supported collection state as an executable story', () => {
+    expect(Object.keys(apiKeyShellStories).sort()).toEqual([
+      'emptyApiKeyShellStory',
+      'errorApiKeyShellStory',
+      'loadingApiKeyShellStory',
+      'populatedApiKeyShellStory',
+    ]);
   });
 });

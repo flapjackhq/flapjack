@@ -325,6 +325,29 @@ restart until served rotation is wired separately. Any ACME-backed in-binary
 design must keep HTTP-01 reachable over plaintext port 80 while the HTTPS
 listener serves TLS.
 
+### Test-only crawler HTTPS fixture transport
+
+The crawler's local HTTPS fixture seam is compiled only when
+`flapjack-server` is explicitly built with `--features fault-injection`.
+Production release builds must omit that feature. `/health` does not attest
+whether the feature is present, so local-stack launchers own the build flag and
+the complete configuration below.
+
+These four variables are all-or-none. With all four absent, crawler admission
+and transport use the production public-HTTPS policy unchanged. A partial or
+invalid configuration fails closed for crawler requests.
+
+| Name | Required validation |
+|---|---|
+| `FLAPJACK_TEST_CRAWLER_FIXTURE_HOST` | One lowercase DNS hostname with at least one dot; labels use only ASCII letters, digits, and interior hyphens. It must not be an IP literal. Only this exact hostname gets the fixture transport. |
+| `FLAPJACK_TEST_CRAWLER_FIXTURE_PUBLIC_IP` | One IP accepted by the normal strict-public crawler policy. It is retained as admission evidence and is not the transport destination. |
+| `FLAPJACK_TEST_CRAWLER_FIXTURE_ENDPOINT` | One explicit nonzero-port loopback socket address. The post-admission transport is pinned to this address; no other private or loopback destination is enabled. |
+| `FLAPJACK_TEST_CRAWLER_FIXTURE_CA_PATH` | Absolute path to an existing, regular, non-symlink PEM CA file. Fixture requests trust only this CA, bypass ambient proxies, and refuse redirects. |
+
+This seam is for a worktree-scoped hermetic fixture only. It does not relax
+production DNS/private-IP admission, create a general local-network opt-in, or
+change the default trust roots for any other hostname.
+
 ## Auth
 
 | Name | Type / Values | Default | Description |
@@ -513,7 +536,7 @@ authoritative reads on the returning node.
 |---|---|---|---|
 | `FLAPJACK_ANALYTICS_ENABLED` | `false`/`0` disables; anything else enables | enabled | Master switch for analytics collection/retention loops. |
 | `FLAPJACK_ANALYTICS_DIR` | Filesystem path | `${FLAPJACK_DATA_DIR}/analytics` | Analytics storage directory. |
-| `FLAPJACK_ANALYTICS_FLUSH_INTERVAL` | Integer seconds | `60` | Flush interval for analytics writer. |
+| `FLAPJACK_ANALYTICS_FLUSH_INTERVAL` | Integer seconds | `60` | Flush interval for the analytics writer. Exact `paid_beta_v5` startup requires `1..=10`; the PBV5 release value is `10`, which leaves at least 50 seconds of the focused 60-second smoke budget for transport and assertions. Other profiles retain the general default. |
 | `FLAPJACK_ANALYTICS_FLUSH_SIZE` | Integer event count | `10000` | Flush batch size threshold. |
 | `FLAPJACK_ANALYTICS_RETENTION_DAYS` | Integer days | `90` | Retention window for analytics data. |
 | `FLAPJACK_ROLLUP_INTERVAL_SECS` | Integer seconds | `300` | Cluster rollup broadcast interval when analytics cluster is active. |

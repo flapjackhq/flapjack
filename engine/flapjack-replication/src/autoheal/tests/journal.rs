@@ -342,6 +342,39 @@ fn autoheal_journal_reopen_truncates_only_malformed_final_fragment() {
 }
 
 #[test]
+fn autoheal_journal_read_only_hydration_preserves_dangling_and_truncated_bytes() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let membership = journal_membership();
+    {
+        let mut journal = AutohealJournal::with_max_bytes(temp_dir.path(), 16 * 1024).unwrap();
+        journal
+            .record_eviction_intent(&membership, CANDIDATE, None, expected_evict(CANDIDATE))
+            .unwrap();
+    }
+    let path = AutohealJournal::path_in_data_dir(temp_dir.path());
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(br#"{"decision_id":"partial"#)
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    let events = AutohealJournal::read_events_read_only(temp_dir.path()).unwrap();
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].action.phase, "eviction_intent");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    let repaired = AutohealJournal::with_max_bytes(temp_dir.path(), 16 * 1024).unwrap();
+    let repaired_events = repaired.events().unwrap();
+    assert_eq!(repaired_events.len(), 2);
+    assert_eq!(repaired_events[1].action.phase, "eviction_recovery");
+    assert_eq!(repaired_events[1].action.outcome, "outcome_unknown");
+    assert!(!std::fs::read_to_string(path).unwrap().contains("partial"));
+}
+
+#[test]
 fn autoheal_journal_write_failure_surfaces_before_eviction_action_runs() {
     let temp_dir = tempfile::tempdir().unwrap();
     let membership = journal_membership();

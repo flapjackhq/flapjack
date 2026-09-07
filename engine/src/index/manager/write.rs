@@ -15,6 +15,11 @@ const DEFAULT_WRITE_DURABLE_TIMEOUT_MS: u64 = 30_000;
 const WRITE_DURABLE_FAIL_CLOSED_GRACE_MS: u64 = 1_000;
 const WRITE_DURABLE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+#[cfg(any(test, feature = "fault-injection"))]
+tokio::task_local! {
+    static WRITE_DURABLE_TIMEOUT_FOR_TEST: Duration;
+}
+
 #[derive(Clone, Copy)]
 enum WriteAdmissionMode {
     Live,
@@ -509,7 +514,7 @@ impl super::IndexManager {
         Ok(task)
     }
 
-    fn admission_epoch_error(
+    pub(super) fn admission_epoch_error(
         tenant_id: &str,
         error: publication::PublicationEpochAdmissionError,
     ) -> FlapjackError {
@@ -539,6 +544,10 @@ impl super::IndexManager {
     /// Resolve the durable-write deadline from `FLAPJACK_WRITE_DURABLE_TIMEOUT_MS`,
     /// falling back to [`DEFAULT_WRITE_DURABLE_TIMEOUT_MS`] when unset or unparseable.
     fn durable_write_timeout() -> Duration {
+        #[cfg(any(test, feature = "fault-injection"))]
+        if let Ok(timeout) = WRITE_DURABLE_TIMEOUT_FOR_TEST.try_with(|timeout| *timeout) {
+            return timeout;
+        }
         let ms = std::env::var("FLAPJACK_WRITE_DURABLE_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -656,9 +665,29 @@ impl super::IndexManager {
         }
     }
 
-    fn compensate_stopped_uncommitted_task(&self, tenant_id: &str, task_id: &str) -> Result<()> {
+    pub(super) fn compensate_stopped_uncommitted_task(
+        &self,
+        tenant_id: &str,
+        task_id: &str,
+    ) -> Result<()> {
         let admission_store = self.get_or_create_admission_store(tenant_id)?;
         let oplog = self.get_or_create_oplog_result(tenant_id)?;
+        let mut recovery_permit = oplog.acquire_recovery()?;
+        let committed_seq = oplog.committed_seq()?.unwrap_or(0);
+        let mut task_ids = vec![task_id.to_string()];
+        for entry in oplog.read_since(committed_seq)? {
+            let entry_task_id = crate::index::oplog::payload_task_id(&entry.payload).ok_or_else(
+                || {
+                    FlapjackError::Io(format!(
+                        "uncommitted oplog row {} has no task identity; stopped-task cleanup cannot certify the tenant suffix",
+                        entry.seq
+                    ))
+                },
+            )?;
+            task_ids.push(entry_task_id.to_string());
+        }
+        task_ids.sort_unstable();
+        task_ids.dedup();
         crate::index::write_queue::compensate_uncommitted_tasks(
             crate::index::write_queue::DurableReplayState {
                 tenant_id,
@@ -666,8 +695,10 @@ impl super::IndexManager {
                 oplog: Some(oplog.as_ref()),
             },
             0,
-            &[task_id.to_string()],
-        )
+            &task_ids,
+        )?;
+        recovery_permit.mark_recovered()?;
+        Ok(())
     }
 
     /// Bounded durable wait used by HTTP handlers. They retain the enqueued task
@@ -678,6 +709,17 @@ impl super::IndexManager {
     /// acknowledged for recovery. Active writes retain the retryable timeout.
     pub async fn wait_for_write_durable(&self, task_id: &str) -> Result<()> {
         self.await_task_terminal(task_id, Some(Self::durable_write_timeout()))
+            .await
+    }
+
+    /// Override the deadline only while polling this future, without changing other tasks.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub async fn with_durable_write_timeout_for_test<F: std::future::Future>(
+        timeout: Duration,
+        operation: F,
+    ) -> F::Output {
+        WRITE_DURABLE_TIMEOUT_FOR_TEST
+            .scope(timeout, operation)
             .await
     }
 

@@ -409,9 +409,18 @@ impl SearchRequest {
         Ok(())
     }
 
-    /// Validates advancedSyntaxFeatures, sortFacetValuesBy, exactOnSingleWordQuery,
+    /// Validates queryType, advancedSyntaxFeatures, sortFacetValuesBy, exactOnSingleWordQuery,
     /// alternativesAsExact, and minProximity.
     fn validate_structural_params(&self) -> Result<(), FlapjackError> {
+        if let Some(ref value) = self.query_type_prefix {
+            if value != "prefixAll" && value != "prefixLast" && value != "prefixNone" {
+                return Err(FlapjackError::InvalidQuery(format!(
+                    "Invalid queryType value: \"{}\". Must be \"prefixAll\", \"prefixLast\", or \"prefixNone\"",
+                    value
+                )));
+            }
+        }
+
         if let Some(ref features) = self.advanced_syntax_features {
             for f in features {
                 if f != "exactPhrase" && f != "excludeWords" {

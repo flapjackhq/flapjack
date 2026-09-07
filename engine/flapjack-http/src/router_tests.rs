@@ -807,6 +807,37 @@ async fn internal_snapshot_capability_requires_admin_authentication() {
     );
 }
 
+#[tokio::test]
+async fn internal_build_info_is_admin_only_and_returns_exact_embedded_identity() {
+    let tmp = TempDir::new().unwrap();
+    let key_store = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let search_key = search_only_key_value(&key_store);
+    let app = build_test_router(&tmp, Some(key_store));
+
+    assert_invalid_credentials_response(get_request(&app, "/internal/build-info", None).await)
+        .await;
+    assert_method_not_allowed_response(
+        get_request(&app, "/internal/build-info", Some(&search_key)).await,
+    )
+    .await;
+
+    let admin = get_request(&app, "/internal/build-info", Some("admin-key")).await;
+    assert_eq!(admin.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(admin).await,
+        serde_json::to_value(flapjack::build_info()).unwrap(),
+        "served protected identity must be the complete canonical embedded BuildInfo"
+    );
+
+    let (_tmp, no_auth_app) = build_no_auth_test_app();
+    let no_auth = get_request(&no_auth_app, "/internal/build-info", None).await;
+    assert_eq!(
+        no_auth.status(),
+        StatusCode::NOT_FOUND,
+        "exact identity must not appear on the public/no-auth router"
+    );
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn internal_snapshot_capability_remains_available_without_authentication() {

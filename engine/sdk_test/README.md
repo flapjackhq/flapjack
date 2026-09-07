@@ -1,10 +1,43 @@
 # SDK & Migration Tests
 
-End-to-end tests that validate Flapjack's Algolia API compatibility against real Algolia.
+Tests of Flapjack's Algolia API compatibility using official clients against Flapjack.
+Only the explicitly labeled Algolia comparison and migration scripts contact Algolia.
 
 **Prerequisites:** Flapjack running on `FLAPJACK_URL` (default `http://localhost:7700`).
 The Algolia comparison/migration scripts additionally require `ALGOLIA_APP_ID` and
 `ALGOLIA_ADMIN_KEY` in `.secret/.env.secret`.
+
+## Official synchronous Python client
+
+`python_client_contract_test.sh` bootstraps the test environment and runs
+`python_client_contract_test.py` using the official `algoliasearch` client. The bounded
+journey creates a unique index, applies settings, batches records, waits for tasks,
+checks exact search hits and facet values, then deletes the index and closes the client.
+It uses only the configured Flapjack origin.
+`FLAPJACK_ADMIN_KEY` is required. Plain HTTP is accepted only for a loopback
+origin; use HTTPS for any remote test server so the key is not sent in cleartext.
+
+Install CPython 3.12 first; the bootstrap selects `python3.12` or the executable in
+`FLAPJACK_SDK_PYTHON`. From `engine/sdk_test`, with a server running:
+
+```bash
+FLAPJACK_URL=http://localhost:7700 FLAPJACK_ADMIN_KEY=your-local-test-key \
+  bash python_client_contract_test.sh
+```
+
+The bootstrap manages its own virtual environment under `.cache/`; the test-only
+`requirements-python-client.txt` owns the official package pin. Both Python and the
+browser adapter consume `fixtures/official_client_contract.json` as their shared oracle.
+
+From `engine/`, `./s/test --sdk`, `./s/test --e2e`, `./s/test --all`, and
+`./s/test --sdk --e2e` run the labeled official Python proof exactly once against the
+managed server. `--sdk` also retains the separate curl-based `python_smoke_test.sh`;
+E2E modes subsume SDK client coverage and omit the protocol smokes.
+
+The existing `sdk-contract` CI job selects Python 3.12 and invokes the same shell
+entrypoint. Its recurring regressions are `npm run test:runner-shell`,
+`npm run test:python-client:unit` (no server needed), and the existing
+`npm run test:real_clients:wiring`.
 
 ## Real InstantSearch clients
 

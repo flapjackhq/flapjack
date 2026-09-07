@@ -50,6 +50,179 @@ pub struct VettedOutboundUrlTarget {
     pub resolved_ips: Vec<std::net::IpAddr>,
 }
 
+/// A crawler URL admitted by the strict public-HTTPS policy.
+///
+/// The canonical URL retains its hostname for HTTP Host and TLS SNI. The
+/// complete DNS answer set is carried separately so the fetch client can pin
+/// exactly the addresses that were checked. Callers must admit every fetch
+/// afresh; this value is deliberately not a DNS cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VettedCrawlerUrlTarget {
+    pub canonical_url: reqwest::Url,
+    pub host: String,
+    pub port: u16,
+    pub resolved_ips: Vec<std::net::IpAddr>,
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+pub(crate) const CRAWLER_FIXTURE_HOST_ENV: &str = "FLAPJACK_TEST_CRAWLER_FIXTURE_HOST";
+#[cfg(any(test, feature = "fault-injection"))]
+pub(crate) const CRAWLER_FIXTURE_PUBLIC_IP_ENV: &str = "FLAPJACK_TEST_CRAWLER_FIXTURE_PUBLIC_IP";
+#[cfg(any(test, feature = "fault-injection"))]
+pub(crate) const CRAWLER_FIXTURE_ENDPOINT_ENV: &str = "FLAPJACK_TEST_CRAWLER_FIXTURE_ENDPOINT";
+#[cfg(any(test, feature = "fault-injection"))]
+pub(crate) const CRAWLER_FIXTURE_CA_PATH_ENV: &str = "FLAPJACK_TEST_CRAWLER_FIXTURE_CA_PATH";
+
+/// Explicit, feature-gated transport coordinates for one hermetic crawler
+/// fixture. The public IP is admission evidence only; transport is pinned to
+/// the loopback endpoint after the ordinary strict-public check accepts it.
+#[cfg(any(test, feature = "fault-injection"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CrawlerFixtureTransportConfig {
+    pub host: String,
+    pub public_ip: std::net::IpAddr,
+    pub endpoint: std::net::SocketAddr,
+    pub ca_path: std::path::PathBuf,
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+pub(crate) fn crawler_fixture_transport_config() -> Result<Option<CrawlerFixtureTransportConfig>, ()>
+{
+    let values = [
+        std::env::var_os(CRAWLER_FIXTURE_HOST_ENV),
+        std::env::var_os(CRAWLER_FIXTURE_PUBLIC_IP_ENV),
+        std::env::var_os(CRAWLER_FIXTURE_ENDPOINT_ENV),
+        std::env::var_os(CRAWLER_FIXTURE_CA_PATH_ENV),
+    ];
+    if values.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    let [Some(host), Some(public_ip), Some(endpoint), Some(ca_path)] = values else {
+        return Err(());
+    };
+    let host = host.into_string().map_err(|_| ())?;
+    let public_ip = public_ip.into_string().map_err(|_| ())?;
+    let endpoint = endpoint.into_string().map_err(|_| ())?;
+    let ca_path = std::path::PathBuf::from(ca_path);
+    if host.trim() != host || host != host.to_ascii_lowercase() || !fixture_hostname_is_exact(&host)
+    {
+        return Err(());
+    }
+    let public_ip = public_ip.parse::<std::net::IpAddr>().map_err(|_| ())?;
+    if !is_strict_public_ip(&public_ip) {
+        return Err(());
+    }
+    let endpoint = endpoint.parse::<std::net::SocketAddr>().map_err(|_| ())?;
+    if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
+        return Err(());
+    }
+    if !ca_path.is_absolute() {
+        return Err(());
+    }
+    let ca_metadata = std::fs::symlink_metadata(&ca_path).map_err(|_| ())?;
+    if ca_metadata.file_type().is_symlink() || !ca_metadata.is_file() {
+        return Err(());
+    }
+    Ok(Some(CrawlerFixtureTransportConfig {
+        host,
+        public_ip,
+        endpoint,
+        ca_path,
+    }))
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+fn fixture_hostname_is_exact(host: &str) -> bool {
+    host.len() <= 253
+        && host.contains('.')
+        && host.parse::<std::net::IpAddr>().is_err()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+impl VettedCrawlerUrlTarget {
+    pub fn socket_addrs(&self) -> Vec<std::net::SocketAddr> {
+        self.resolved_ips
+            .iter()
+            .copied()
+            .map(|ip| std::net::SocketAddr::new(ip, self.port))
+            .collect()
+    }
+}
+
+/// Safe crawler admission failures. Deliberately carries no URL, hostname,
+/// query, credential, or resolver detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CrawlerTargetAdmissionError {
+    #[error("Crawler target is not allowed")]
+    TargetRejected,
+    #[error("Crawler target DNS validation failed")]
+    DnsResolutionFailed,
+}
+
+/// Admit one fetch target under the crawler's fail-closed public-HTTPS rule.
+///
+/// Unlike [`vet_outbound_url_target`], this owner never permits HTTP, local
+/// opt-ins, unresolved DNS, empty answers, or mixed public/non-public answers.
+/// It rejects URL credentials and removes fragments from fetch identity.
+pub fn vet_crawler_url_target(
+    raw_url: &str,
+) -> Result<VettedCrawlerUrlTarget, CrawlerTargetAdmissionError> {
+    use CrawlerTargetAdmissionError::{DnsResolutionFailed, TargetRejected};
+
+    let mut canonical_url = reqwest::Url::parse(raw_url).map_err(|_| TargetRejected)?;
+    if canonical_url.scheme() != "https"
+        || !canonical_url.username().is_empty()
+        || canonical_url.password().is_some()
+    {
+        return Err(TargetRejected);
+    }
+    canonical_url.set_fragment(None);
+    let host = canonical_url
+        .host_str()
+        .ok_or(TargetRejected)?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    let port = canonical_url
+        .port_or_known_default()
+        .ok_or(TargetRejected)?;
+    #[cfg(any(test, feature = "fault-injection"))]
+    let fixture = crawler_fixture_transport_config().map_err(|_| TargetRejected)?;
+    #[cfg(any(test, feature = "fault-injection"))]
+    let fixture_public_ip = fixture
+        .as_ref()
+        .filter(|fixture| fixture.host == host)
+        .map(|fixture| fixture.public_ip);
+    #[cfg(not(any(test, feature = "fault-injection")))]
+    let fixture_public_ip: Option<std::net::IpAddr> = None;
+    let mut resolved_ips = match fixture_public_ip {
+        Some(public_ip) => vec![public_ip],
+        None => resolve_outbound_host_ips(&host, Some(port))
+            .filter(|ips| !ips.is_empty())
+            .ok_or(DnsResolutionFailed)?,
+    };
+    if resolved_ips.iter().any(|ip| !is_strict_public_ip(ip)) {
+        return Err(DnsResolutionFailed);
+    }
+    resolved_ips.sort_unstable();
+    resolved_ips.dedup();
+
+    Ok(VettedCrawlerUrlTarget {
+        canonical_url,
+        host,
+        port,
+        resolved_ips,
+    })
+}
+
 impl VettedOutboundUrlTarget {
     /// Return the already-vetted socket addresses a client must pin.
     ///
@@ -261,6 +434,44 @@ fn is_public_vendor_ip(ip: &std::net::IpAddr) -> bool {
                 && ip
                     .to_ipv4_mapped()
                     .is_none_or(|mapped| is_public_vendor_ip(&std::net::IpAddr::V4(mapped)))
+        }
+    }
+}
+
+/// Conservative globally-routable classification for crawler destinations.
+///
+/// This intentionally rejects whole special-purpose allocations instead of
+/// maintaining exception lists inside them. A false negative is safe; a false
+/// positive can become an SSRF primitive.
+fn is_strict_public_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            !(matches!(a, 0 | 10 | 127)
+                || a == 100 && (64..=127).contains(&b)
+                || a == 169 && b == 254
+                || a == 172 && (16..=31).contains(&b)
+                || a == 192 && b == 0 && c == 0
+                || a == 192 && b == 0 && c == 2
+                || a == 192 && b == 88 && c == 99
+                || a == 192 && b == 168
+                || a == 198 && (18..=19).contains(&b)
+                || a == 198 && b == 51 && c == 100
+                || a == 203 && b == 0 && c == 113
+                || a >= 224)
+        }
+        std::net::IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_strict_public_ip(&std::net::IpAddr::V4(mapped));
+            }
+            let segments = ip.segments();
+            // Admit only global-unicast 2000::/3, then subtract the
+            // special-purpose ranges inside that allocation.
+            segments[0] & 0xe000 == 0x2000
+                && !(segments[0] == 0x2001 && segments[1] <= 0x01ff)
+                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+                && segments[0] != 0x2002
+                && !(segments[0] == 0x3fff && segments[1] <= 0x0fff)
         }
     }
 }

@@ -73,6 +73,15 @@ impl UsagePersistence {
         Ok(Self { usage_dir })
     }
 
+    /// Construct the startup view without creating or repairing persistence.
+    /// The first admitted post-fence write creates the directory through the
+    /// ordinary write owner below, so a fenced restart remains byte-exact.
+    pub(crate) fn load_only(data_dir: &Path) -> Self {
+        Self {
+            usage_dir: data_dir.join("_usage"),
+        }
+    }
+
     /// Path to the snapshot file for a given date.
     fn snapshot_path(&self, date: &str) -> PathBuf {
         self.usage_dir.join(format!("{}.json", date))
@@ -100,6 +109,7 @@ impl UsagePersistence {
     }
 
     fn write_snapshot(&self, date: &str, snapshot: &DailyUsageSnapshot) -> io::Result<()> {
+        std::fs::create_dir_all(&self.usage_dir)?;
         let json = serde_json::to_string_pretty(&snapshot).map_err(io::Error::other)?;
         let final_path = self.snapshot_path(date);
         flapjack::index::atomic_write_file(&final_path, json.as_bytes())
@@ -297,6 +307,33 @@ mod tests {
                 .fetch_add(2, Ordering::Relaxed);
         }
         counters
+    }
+
+    #[test]
+    fn load_only_startup_preserves_snapshot_bytes_and_defers_missing_directory_creation() {
+        let populated = TempDir::new().unwrap();
+        let persistence = UsagePersistence::new(populated.path()).unwrap();
+        persistence
+            .save_snapshot("2026-08-28", &make_counters())
+            .unwrap();
+        let snapshot_path = persistence.snapshot_path("2026-08-28");
+        let before = std::fs::read(&snapshot_path).unwrap();
+
+        let reopened = UsagePersistence::load_only(populated.path());
+        assert!(reopened.load_snapshot("2026-08-28").unwrap().is_some());
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), before);
+
+        let retried = UsagePersistence::load_only(populated.path());
+        assert!(retried.load_snapshot("2026-08-28").unwrap().is_some());
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), before);
+
+        let absent = TempDir::new().unwrap();
+        let deferred = UsagePersistence::load_only(absent.path());
+        assert!(!absent.path().join("_usage").exists());
+        deferred
+            .save_snapshot("2026-08-28", &make_counters())
+            .expect("the first post-release write should initialize persistence");
+        assert!(absent.path().join("_usage/2026-08-28.json").is_file());
     }
 
     fn assert_zero_counters(snapshot: &IndexUsageSnapshot) {

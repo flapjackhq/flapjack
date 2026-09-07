@@ -1,0 +1,24 @@
+{
+  "products": [
+    {"objectID": "product_1", "name": "Alpha Laptop", "brand": "Acme", "sortOrder": 1},
+    {"objectID": "product_2", "name": "Beta Laptop", "brand": "Acme", "sortOrder": 3},
+    {"objectID": "product_3", "name": "Gamma Phone", "brand": "Nova", "sortOrder": 2},
+    {"objectID": "product_4", "name": "Delta Phone", "brand": "Nova", "sortOrder": 4},
+    {"objectID": "product_5", "name": "Epsilon Tablet", "brand": "Zenith", "sortOrder": 5}
+  ],
+  "settings": {
+    "searchableAttributes": ["name"],
+    "attributesForFaceting": ["searchable(brand)"],
+    "customRanking": ["asc(sortOrder)"],
+    "paginationLimitedTo": 100
+  },
+  "expected": {
+    "firstPageNames": ["Alpha Laptop", "Gamma Phone"],
+    "secondPageNames": ["Beta Laptop", "Delta Phone"],
+    "laptopNames": ["Alpha Laptop", "Beta Laptop"],
+    "novaNames": ["Gamma Phone", "Delta Phone"],
+    "laptopObjectIDs": ["product_1", "product_2"],
+    "laptopNbHits": 2,
+    "brandFacetHits": [{"value": "Nova", "count": 2}]
+  }
+}

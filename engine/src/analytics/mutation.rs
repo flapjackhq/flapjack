@@ -102,6 +102,136 @@ pub(super) fn clear_index(config: &AnalyticsConfig, index_name: &str) -> Result<
     })
 }
 
+pub(super) fn stage_index_root(
+    config: &AnalyticsConfig,
+    index_name: &str,
+    quarantine: &Path,
+) -> Result<(), String> {
+    with_index_mutation(config, index_name, || {
+        let index_root = config.target_artifact_paths(index_name).index_root;
+        reject_symlink_or_non_directory(&index_root, true)?;
+        reject_symlink_or_non_directory(quarantine, true)?;
+        if !index_root.exists() {
+            return Ok(());
+        }
+        if quarantine.exists() {
+            return Err(format!(
+                "analytics deletion quarantine already exists: {}",
+                quarantine.display()
+            ));
+        }
+        let parent = quarantine
+            .parent()
+            .ok_or_else(|| "analytics deletion quarantine has no parent".to_string())?;
+        reject_symlink_or_non_directory(&config.data_dir, false)?;
+        reject_symlink_or_non_directory(parent, true)?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+        std::fs::rename(&index_root, quarantine).map_err(|error| {
+            format!(
+                "failed to stage analytics deletion {}: {error}",
+                index_root.display()
+            )
+        })?;
+        sync_directory(&config.data_dir)?;
+        sync_directory(parent)
+    })
+}
+
+pub(super) fn rollback_staged_index_root(
+    config: &AnalyticsConfig,
+    index_name: &str,
+    quarantine: &Path,
+) -> Result<(), String> {
+    with_index_mutation(config, index_name, || {
+        let index_root = config.target_artifact_paths(index_name).index_root;
+        let quarantine_parent = quarantine
+            .parent()
+            .ok_or_else(|| "analytics deletion quarantine has no parent".to_string())?;
+        reject_symlink_or_non_directory(&config.data_dir, false)?;
+        reject_symlink_or_non_directory(quarantine_parent, true)?;
+        reject_symlink_or_non_directory(&index_root, true)?;
+        reject_symlink_or_non_directory(quarantine, true)?;
+        if !quarantine.exists() {
+            return Ok(());
+        }
+        if index_root.exists() {
+            return Err(format!(
+                "cannot restore analytics while canonical root exists: {}",
+                index_root.display()
+            ));
+        }
+        std::fs::rename(quarantine, &index_root).map_err(|error| {
+            format!(
+                "failed to restore staged analytics {}: {error}",
+                index_root.display()
+            )
+        })?;
+        sync_directory(&config.data_dir)?;
+        sync_directory(
+            quarantine
+                .parent()
+                .ok_or_else(|| "analytics deletion quarantine has no parent".to_string())?,
+        )
+    })
+}
+
+pub(super) fn remove_staged_index_root(
+    config: &AnalyticsConfig,
+    index_name: &str,
+    quarantine: &Path,
+) -> Result<(), String> {
+    with_index_mutation(config, index_name, || {
+        let quarantine_parent = quarantine
+            .parent()
+            .ok_or_else(|| "analytics deletion quarantine has no parent".to_string())?;
+        match std::fs::symlink_metadata(&config.data_dir) {
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            _ => {}
+        }
+        reject_symlink_or_non_directory(&config.data_dir, false)?;
+        reject_symlink_or_non_directory(quarantine_parent, true)?;
+        reject_symlink_or_non_directory(quarantine, true)?;
+        match std::fs::remove_dir_all(quarantine) {
+            Ok(()) => sync_directory(
+                quarantine
+                    .parent()
+                    .ok_or_else(|| "analytics deletion quarantine has no parent".to_string())?,
+            ),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "failed to remove analytics deletion quarantine {}: {error}",
+                quarantine.display()
+            )),
+        }
+    })
+}
+
+fn reject_symlink_or_non_directory(path: &Path, absent_ok: bool) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "refusing symlinked analytics path {}",
+            path.display()
+        )),
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(format!(
+            "analytics path is not a directory: {}",
+            path.display()
+        )),
+        Err(error) if absent_ok && error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "failed to inspect analytics path {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn sync_directory(path: &Path) -> Result<(), String> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("failed to sync directory {}: {error}", path.display()))
+}
+
 fn operation_state(index_root: PathBuf) -> Result<Arc<IndexOperationState>, String> {
     let mut states = INDEX_OPERATION_STATES
         .lock()

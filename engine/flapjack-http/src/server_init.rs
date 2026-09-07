@@ -7,8 +7,8 @@ use crate::handlers::AppState;
 use crate::middleware::{TrustedProxyMatcher, DEFAULT_TRUSTED_PROXY_CIDRS};
 use crate::notifications::{init_global_notifier, NotificationService};
 use crate::pause_registry;
-use crate::ssl_startup::{initialize_ssl_material, ConfiguredSslMaterial};
-use crate::startup::ServerConfig;
+use crate::ssl_startup::{initialize_ssl_material_for_mode, ConfiguredSslMaterial};
+use crate::startup::{ServerConfig, StartupPersistenceMode};
 use crate::tls_serve::ReloadableTlsResolver;
 use crate::usage_persistence::UsagePersistence;
 use flapjack::analytics::{AnalyticsCollector, AnalyticsConfig, AnalyticsQueryEngine};
@@ -30,6 +30,8 @@ use dashmap::DashMap;
 
 /// TODO: Document InfrastructureState.
 pub(crate) struct InfrastructureState {
+    pub global_mutation_fence: pause_registry::GlobalMutationFence,
+    pub startup_persistence_mode: StartupPersistenceMode,
     pub manager: Arc<IndexManager>,
     pub dictionary_manager: Arc<DictionaryManager>,
     pub node_config: NodeConfig,
@@ -105,6 +107,8 @@ pub(crate) async fn initialize_infrastructure(
     data_dir: &Path,
     admin_key: Option<String>,
     mut node_config: NodeConfig,
+    global_mutation_fence: pause_registry::GlobalMutationFence,
+    persistence_mode: StartupPersistenceMode,
 ) -> Result<InfrastructureState, Box<dyn std::error::Error>> {
     let manager = IndexManager::new(data_dir);
     let dictionary_manager = Arc::new(flapjack::dictionaries::manager::DictionaryManager::new(
@@ -125,30 +129,44 @@ pub(crate) async fn initialize_infrastructure(
         let replication_manager = replication_manager
             .as_ref()
             .expect("bootstrap intent must initialize replication manager");
-        let client = build_bootstrap_http_client()?;
-        bootstrap_join_with_client(
-            &client,
-            &mut node_config,
-            replication_manager,
-            admin_key.as_deref(),
-        )
-        .await
-        .map_err(std::io::Error::other)?;
+        match global_mutation_fence.admit_mutation().await {
+            Ok(_mutation_permit) => {
+                let client = build_bootstrap_http_client()?;
+                bootstrap_join_with_client(
+                    &client,
+                    &mut node_config,
+                    replication_manager,
+                    admin_key.as_deref(),
+                )
+                .await
+                .map_err(std::io::Error::other)?;
+            }
+            Err(_) => {
+                tracing::info!(
+                    "release mutation fence is active; skipping bootstrap registration and membership persistence"
+                );
+            }
+        }
     }
     initialize_analytics_cluster(&node_config, peer_credential);
-    let managed_ssl = initialize_ssl_material().await;
-    let (s3_config, s3_snapshot_interval_secs) = initialize_s3(data_dir, &manager).await;
+    let managed_ssl = initialize_ssl_material_for_mode(persistence_mode).await;
+    let (s3_config, s3_snapshot_interval_secs) =
+        initialize_s3(data_dir, &manager, &global_mutation_fence).await?;
 
     let (analytics_config, analytics_collector, analytics_engine) =
-        initialize_analytics_subsystem();
+        initialize_analytics_subsystem(server_config.api_profile).map_err(std::io::Error::other)?;
     manager.set_analytics_config(analytics_config.clone());
+    manager.set_analytics_collector(Arc::clone(&analytics_collector));
     let metrics_state = Some(crate::handlers::metrics::MetricsState::new());
     let usage_counters = Arc::new(dashmap::DashMap::new());
-    let usage_persistence = initialize_usage_persistence(data_dir, &usage_counters);
+    let usage_persistence =
+        initialize_usage_persistence(data_dir, &usage_counters, persistence_mode);
     let geoip_reader = initialize_geoip(data_dir);
     let notification_service = initialize_notification_service().await;
 
     Ok(InfrastructureState {
+        global_mutation_fence,
+        startup_persistence_mode: persistence_mode,
         manager,
         dictionary_manager,
         node_config,
@@ -425,31 +443,45 @@ fn insert_bootstrap_member(
 async fn initialize_s3(
     data_dir: &Path,
     manager: &Arc<IndexManager>,
-) -> (Option<flapjack::index::s3::S3Config>, Option<u64>) {
+    mutation_fence: &pause_registry::GlobalMutationFence,
+) -> Result<(Option<flapjack::index::s3::S3Config>, Option<u64>), std::io::Error> {
     if let Some(config) = flapjack::index::s3::S3Config::from_env() {
-        crate::background_tasks::auto_restore_from_s3(
-            &data_dir.to_string_lossy(),
-            &config,
-            manager,
-        )
-        .await;
+        if mutation_fence.status().await.is_none() {
+            let _mutation_permit = mutation_fence.admit_mutation().await.map_err(|_| {
+                std::io::Error::other("release mutation fence became active before S3 restore")
+            })?;
+            crate::background_tasks::auto_restore_from_s3(
+                &data_dir.to_string_lossy(),
+                &config,
+                manager,
+            )
+            .await;
+        } else {
+            tracing::info!("release mutation fence is active; skipping startup S3 restore");
+        }
         let interval_secs: u64 = std::env::var("FLAPJACK_SNAPSHOT_INTERVAL")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        (Some(config), Some(interval_secs).filter(|secs| *secs > 0))
+        Ok((Some(config), Some(interval_secs).filter(|secs| *secs > 0)))
     } else {
-        (None, None)
+        Ok((None, None))
     }
 }
 
 /// Initializes the analytics subsystem: config, event collector, and query engine.
-fn initialize_analytics_subsystem() -> (
-    AnalyticsConfig,
-    Arc<AnalyticsCollector>,
-    Arc<AnalyticsQueryEngine>,
-) {
+fn initialize_analytics_subsystem(
+    api_profile: crate::api_profile::ApiProfile,
+) -> Result<
+    (
+        AnalyticsConfig,
+        Arc<AnalyticsCollector>,
+        Arc<AnalyticsQueryEngine>,
+    ),
+    String,
+> {
     let config = AnalyticsConfig::from_env();
+    validate_profile_analytics_config(api_profile, &config)?;
     let collector = AnalyticsCollector::new(config.clone());
     let engine = Arc::new(AnalyticsQueryEngine::new(config.clone()));
 
@@ -463,23 +495,42 @@ fn initialize_analytics_subsystem() -> (
     } else {
         tracing::info!("[analytics] Analytics disabled");
     }
-    (config, collector, engine)
+    Ok((config, collector, engine))
+}
+
+fn validate_profile_analytics_config(
+    api_profile: crate::api_profile::ApiProfile,
+    analytics_config: &AnalyticsConfig,
+) -> Result<(), String> {
+    if api_profile == crate::api_profile::ApiProfile::PaidBetaV5 {
+        flapjack::analytics::config::validate_paid_beta_v5_analytics_config(
+            analytics_config.enabled,
+            analytics_config.flush_interval_secs,
+            analytics_config.retention_days,
+        )
+    } else {
+        Ok(())
+    }
 }
 
 /// Initializes per-tenant usage persistence and restores counters from disk.
 fn initialize_usage_persistence(
     data_dir: &Path,
     usage_counters: &Arc<DashMap<String, TenantUsageCounters>>,
+    persistence_mode: StartupPersistenceMode,
 ) -> Option<Arc<UsagePersistence>> {
-    let persistence = match UsagePersistence::new(data_dir) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(
-                "[usage] Could not initialise usage persistence directory: {}",
-                e
-            );
-            return None;
-        }
+    let persistence = match persistence_mode {
+        StartupPersistenceMode::FenceActive => UsagePersistence::load_only(data_dir),
+        StartupPersistenceMode::Ordinary => match UsagePersistence::new(data_dir) {
+            Ok(persistence) => persistence,
+            Err(error) => {
+                tracing::warn!(
+                    "[usage] Could not initialise usage persistence directory: {}",
+                    error
+                );
+                return None;
+            }
+        },
     };
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     log_usage_reload_result(
@@ -544,12 +595,16 @@ pub(crate) fn initialize_state(
             .and_then(|configured| configured.manager.clone()),
         analytics_engine: Some(Arc::clone(&infrastructure.analytics_engine)),
         recommend_config: RecommendConfig::from_env(),
-        experiment_store: Some(Arc::new(ExperimentStore::new(Path::new(data_dir))?)),
+        experiment_store: Some(Arc::new(match infrastructure.startup_persistence_mode {
+            StartupPersistenceMode::FenceActive => ExperimentStore::load_only(Path::new(data_dir))?,
+            StartupPersistenceMode::Ordinary => ExperimentStore::new(Path::new(data_dir))?,
+        })),
         dictionary_manager: Arc::clone(&infrastructure.dictionary_manager),
         metrics_state: infrastructure.metrics_state.clone(),
         usage_counters: Arc::clone(&infrastructure.usage_counters),
         usage_persistence: infrastructure.usage_persistence.clone(),
         paused_indexes: pause_registry::PausedIndexes::new(),
+        global_mutation_fence: infrastructure.global_mutation_fence.clone(),
         geoip_reader: infrastructure.geoip_reader.clone(),
         notification_service: infrastructure.notification_service.clone(),
         migration_runner: Arc::new(crate::handlers::migration::MigrationJobRunner::new(
@@ -563,16 +618,26 @@ pub(crate) fn initialize_state(
         start_time: startup_start,
         conversation_store: ConversationStore::default_shared(),
         embedder_store: Arc::new(crate::embedder_store::EmbedderStore::new()),
-        idempotency_cache: Arc::new(
-            crate::idempotency::IdempotencyCache::from_env_with_data_dir(Path::new(data_dir)),
-        ),
+        idempotency_cache: Arc::new(match infrastructure.startup_persistence_mode {
+            StartupPersistenceMode::FenceActive => {
+                crate::idempotency::IdempotencyCache::from_env_with_data_dir_load_only(Path::new(
+                    data_dir,
+                ))
+            }
+            StartupPersistenceMode::Ordinary => {
+                crate::idempotency::IdempotencyCache::from_env_with_data_dir(Path::new(data_dir))
+            }
+        }),
         background_task_health: Arc::new(crate::background_tasks::BackgroundTaskHealth::default()),
     }))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{log_startup_summary, StartupSummary};
+    use super::{log_startup_summary, validate_profile_analytics_config, StartupSummary};
+    use crate::api_profile::ApiProfile;
+    use flapjack::analytics::config::PBV5_MIN_ANALYTICS_RETENTION_DAYS;
+    use flapjack::analytics::AnalyticsConfig;
     use serde_json::Value;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::layer::SubscriberExt;
@@ -607,6 +672,54 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
+    }
+
+    #[test]
+    fn paid_beta_v5_profile_enforces_enabled_retained_and_bounded_analytics() {
+        let mut config = AnalyticsConfig::disabled();
+        assert_eq!(
+            validate_profile_analytics_config(ApiProfile::PaidBetaV5, &config),
+            Err("paid_beta_v5 requires analytics to be enabled".to_string())
+        );
+        assert_eq!(
+            validate_profile_analytics_config(ApiProfile::PaidBetaV4, &config),
+            Ok(())
+        );
+        assert_eq!(
+            validate_profile_analytics_config(ApiProfile::Full, &config),
+            Ok(())
+        );
+
+        config.enabled = true;
+        config.retention_days = PBV5_MIN_ANALYTICS_RETENTION_DAYS - 1;
+        assert_eq!(
+            validate_profile_analytics_config(ApiProfile::PaidBetaV5, &config),
+            Err("paid_beta_v5 requires analytics retention of at least 30 days".to_string())
+        );
+
+        config.retention_days = PBV5_MIN_ANALYTICS_RETENTION_DAYS;
+        assert_eq!(
+            validate_profile_analytics_config(ApiProfile::PaidBetaV5, &config),
+            Err(
+                "paid_beta_v5 requires an analytics flush interval from 1 through 10 seconds"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            validate_profile_analytics_config(ApiProfile::PaidBetaV4, &config),
+            Ok(())
+        );
+        assert_eq!(
+            validate_profile_analytics_config(ApiProfile::Full, &config),
+            Ok(())
+        );
+
+        config.flush_interval_secs =
+            flapjack::analytics::config::PBV5_MAX_ANALYTICS_FLUSH_INTERVAL_SECS;
+        assert_eq!(
+            validate_profile_analytics_config(ApiProfile::PaidBetaV5, &config),
+            Ok(())
+        );
     }
 
     /// TODO: Document startup_summary_struct_fields_reflect_values.

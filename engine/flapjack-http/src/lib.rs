@@ -5,6 +5,8 @@ pub mod api_profile;
 pub mod auth;
 pub mod conversation_store;
 #[cfg(test)]
+mod crawler_contract_tests;
+#[cfg(test)]
 mod dashboard_build;
 pub mod dto;
 pub mod filter_parser;

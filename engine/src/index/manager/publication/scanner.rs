@@ -1,5 +1,7 @@
 //! Stub summary for engine/src/index/manager/publication/scanner.rs.
-use super::epoch::{observe_publication_epoch, publication_epoch_paths_for_target_path};
+use super::epoch::{
+    fence_publication_admission, observe_publication_epoch, publication_epoch_paths_for_target_path,
+};
 use super::fsops::reject_symlinked_managed_path_components;
 use super::repair::repair_publication_outcome_with_epoch;
 use super::{
@@ -148,17 +150,106 @@ pub fn scan_and_repair_publication_target(
 ) -> Result<PublicationRepairReport> {
     let discovery = target_transactions(base, &target)?;
     match discovery {
+        // A missing namespace and missing live target is already a complete,
+        // linearizable vacant observation. Creating epoch.lock here would turn
+        // the scanner's own fence into false repair evidence. A present live
+        // target must still be fenced before it can be reported loadable.
+        TargetTransactionDiscovery::MissingNamespace => {
+            if !clean_target_paths_are_proven(base, &target)? {
+                return Ok(unresolved_target_report(target, Vec::new(), None));
+            }
+            match std::fs::symlink_metadata(base.join(target.as_str())) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => return Ok(unresolved_target_report(target, Vec::new(), None)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(vacant_target_report(target, Vec::new()));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        // A symlink or non-directory namespace is itself the complete unsafe
+        // evidence. Reject it before attempting to create/read an epoch lock.
+        TargetTransactionDiscovery::NamespaceNotDirectory => {
+            return repair_target_discovery(
+                base,
+                analytics,
+                target,
+                TargetTransactionDiscovery::NamespaceNotDirectory,
+            );
+        }
+        TargetTransactionDiscovery::Present { .. } => {}
+    }
+
+    let _repair_fence = fence_publication_admission(base, &target).map_err(|error| {
+        invalid_publication(format!("publication repair target fence failed: {error}"))
+    })?;
+    scan_and_repair_publication_target_while_fenced(base, analytics, target)
+}
+
+/// Whether startup owns target-scoped repair work beyond stable epoch sidecars.
+pub(crate) fn publication_target_has_repair_candidate(
+    base: &Path,
+    target: &PublicationTarget,
+) -> Result<bool> {
+    Ok(match target_transactions(base, target)? {
+        TargetTransactionDiscovery::MissingNamespace => false,
+        TargetTransactionDiscovery::NamespaceNotDirectory => true,
+        TargetTransactionDiscovery::Present {
+            namespace_contents, ..
+        } => namespace_contents != TargetNamespaceContents::OnlyEpochSidecars,
+    })
+}
+
+/// Repair one target while the caller holds its publication admission fence.
+/// IndexManager uses this to keep analytics lifecycle reconciliation and the
+/// returned publication disposition in one cross-process critical section.
+pub(crate) fn scan_and_repair_publication_target_while_fenced(
+    base: &Path,
+    analytics: &AnalyticsConfig,
+    target: PublicationTarget,
+) -> Result<PublicationRepairReport> {
+    let discovery = target_transactions(base, &target)?;
+    repair_target_discovery(base, analytics, target, discovery)
+}
+
+fn repair_target_discovery(
+    base: &Path,
+    analytics: &AnalyticsConfig,
+    target: PublicationTarget,
+    discovery: TargetTransactionDiscovery,
+) -> Result<PublicationRepairReport> {
+    if matches!(discovery, TargetTransactionDiscovery::NamespaceNotDirectory) {
+        return Ok(unresolved_target_report(
+            target.clone(),
+            Vec::new(),
+            Some(target_namespace_evidence(&target)),
+        ));
+    }
+    // The raw/offline scanner does not own analytics deletion recovery. Never
+    // report a target loadable while the IndexManager lifecycle owner still
+    // has a durable purge to reconcile.
+    if super::analytics_purge_is_pending(base, &target)? {
+        let transactions = match &discovery {
+            TargetTransactionDiscovery::Present { transactions, .. } => transactions.clone(),
+            TargetTransactionDiscovery::MissingNamespace
+            | TargetTransactionDiscovery::NamespaceNotDirectory => Vec::new(),
+        };
+        return Ok(unresolved_target_report(
+            target.clone(),
+            transactions,
+            Some(target_namespace_evidence(&target)),
+        ));
+    }
+    match discovery {
         TargetTransactionDiscovery::MissingNamespace => {
             if clean_target_paths_are_proven(base, &target)? {
                 return Ok(clean_target_report(target, Vec::new()));
             }
             Ok(unresolved_target_report(target, Vec::new(), None))
         }
-        TargetTransactionDiscovery::NamespaceNotDirectory => Ok(unresolved_target_report(
-            target.clone(),
-            Vec::new(),
-            Some(target_namespace_evidence(&target)),
-        )),
+        TargetTransactionDiscovery::NamespaceNotDirectory => unreachable!(
+            "non-directory publication namespace returned before analytics marker inspection"
+        ),
         TargetTransactionDiscovery::Present {
             transactions,
             namespace_contents,
@@ -390,18 +481,17 @@ fn target_transactions(
     for entry in std::fs::read_dir(&root)? {
         let entry = entry?;
         entry_count += 1;
-        if entry.file_type()?.is_dir() {
+        let path = entry.path();
+        if path == super::analytics_purge_pending_path(base, target) {
+            super::analytics_purge_is_pending(base, target)?;
+        } else if entry.file_type()?.is_dir() {
             let name = entry.file_name().into_string().map_err(|_| {
                 invalid_publication("publication transaction directory name is not UTF-8")
             })?;
             transactions.push(PublicationTransactionId::new(name)?);
             namespace_contents = TargetNamespaceContents::OtherEntries;
-        } else if epoch_sidecar_path(base, target, &entry.path()) {
-            reject_symlinked_managed_path_components(
-                base,
-                &entry.path(),
-                "publication epoch sidecar",
-            )?;
+        } else if epoch_sidecar_path(base, target, &path) {
+            reject_symlinked_managed_path_components(base, &path, "publication epoch sidecar")?;
         } else {
             namespace_contents = TargetNamespaceContents::OtherEntries;
         }

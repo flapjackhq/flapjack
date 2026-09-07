@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+
+"""Safely materialize and attest release engine artifacts."""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+
+
+def fail(message: str) -> None:
+    raise SystemExit(f"release artifact runtime gate: {message}")
+
+
+def reject_duplicate_keys(pairs):
+    value = {}
+    for key, member in pairs:
+        if key in value:
+            fail(f"JSON contains duplicate key: {key}")
+        value[key] = member
+    return value
+
+
+def decode_json(raw: bytes, label: str):
+    try:
+        text = raw.decode("utf-8")
+        return json.loads(
+            text,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=lambda value: fail(
+                f"{label} contains non-standard JSON constant: {value}"
+            ),
+        )
+    except UnicodeDecodeError as error:
+        fail(f"{label} is not UTF-8: {error}")
+    except json.JSONDecodeError as error:
+        fail(f"{label} is malformed JSON: {error}")
+
+
+def json_values_equal(left, right) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return set(left) == set(right) and all(
+            json_values_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            json_values_equal(left_member, right_member)
+            for left_member, right_member in zip(left, right)
+        )
+    return left == right
+
+
+def load_manifest(path: pathlib.Path) -> dict:
+    if path.is_symlink() or not path.is_file():
+        fail(f"manifest must be a regular non-link file: {path}")
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        fail(f"cannot read manifest {path}: {error}")
+    manifest = decode_json(raw, "manifest")
+    expected_keys = {"schemaVersion", "artifact", "build", "compatibility"}
+    if not isinstance(manifest, dict) or set(manifest) != expected_keys:
+        fail("candidate manifest keys are unsupported")
+    if type(manifest["schemaVersion"]) is not int or manifest["schemaVersion"] != 2:
+        fail("candidate manifest schemaVersion must be integer 2")
+    if not isinstance(manifest["build"], dict):
+        fail("candidate manifest build must be an object")
+    return manifest
+
+
+def extract(archive_path: pathlib.Path, output_dir: pathlib.Path) -> None:
+    if archive_path.is_symlink() or not archive_path.is_file():
+        fail(f"archive must be a regular non-link file: {archive_path}")
+    if output_dir.is_symlink() or not output_dir.is_dir():
+        fail(f"output must be an existing real directory: {output_dir}")
+    if any(output_dir.iterdir()):
+        fail(f"output directory must be empty: {output_dir}")
+
+    try:
+        with tarfile.open(archive_path, mode="r:gz") as archive:
+            members = archive.getmembers()
+            if [member.name for member in members] != [".", "./flapjack"]:
+                fail("archive members must be exactly '.' and './flapjack' in order")
+            root, binary = members
+            if not root.isdir() or root.linkname:
+                fail("archive root must be one real directory")
+            if not binary.isreg() or binary.linkname:
+                fail("archive flapjack member must be one regular non-link file")
+            source = archive.extractfile(binary)
+            if source is None:
+                fail("archive flapjack payload is unreadable")
+
+            destination = output_dir / "flapjack"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(destination, flags, 0o755)
+            try:
+                target_file = os.fdopen(descriptor, "wb", closefd=True)
+                descriptor = -1
+                with source, target_file as target:
+                    shutil.copyfileobj(source, target)
+                    target.flush()
+                    os.fsync(target.fileno())
+                if destination.stat().st_size != binary.size:
+                    destination.unlink(missing_ok=True)
+                    fail("materialized flapjack size differs from the archive header")
+                destination.chmod(0o755)
+            except BaseException:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                destination.unlink(missing_ok=True)
+                raise
+    except (OSError, tarfile.TarError) as error:
+        fail(f"cannot validate archive {archive_path}: {error}")
+
+
+def attest(binary_path: pathlib.Path, manifest_path: pathlib.Path) -> None:
+    if binary_path.is_symlink() or not binary_path.is_file():
+        fail(f"candidate binary must be a regular non-link file: {binary_path}")
+    mode = binary_path.stat().st_mode
+    if not mode & stat.S_IXUSR:
+        fail(f"candidate binary must be executable: {binary_path}")
+    manifest = load_manifest(manifest_path)
+    try:
+        result = subprocess.run(
+            [str(binary_path), "build-info", "--json"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        fail(f"cannot execute candidate build-info: {error}")
+    if result.returncode != 0:
+        fail(f"candidate build-info exited {result.returncode}")
+    observed = decode_json(result.stdout, "candidate build-info")
+    if not json_values_equal(observed, manifest["build"]):
+        fail("candidate build-info JSON object differs from manifest.build")
+
+
+def usage() -> None:
+    print(
+        "Usage:\n"
+        "  package/release_artifact_runtime_gate extract <archive.tar.gz> <empty-output-dir>\n"
+        "  package/release_artifact_runtime_gate attest <flapjack-binary> <candidate-manifest>",
+        file=sys.stderr,
+    )
+
+
+def main() -> None:
+    if len(sys.argv) != 4:
+        usage()
+        fail("expected an operation and two paths")
+    operation = sys.argv[1]
+    first = pathlib.Path(sys.argv[2])
+    second = pathlib.Path(sys.argv[3])
+    if operation == "extract":
+        extract(first, second)
+    elif operation == "attest":
+        attest(first, second)
+    else:
+        usage()
+        fail(f"unsupported operation: {operation}")
+
+
+if __name__ == "__main__":
+    main()

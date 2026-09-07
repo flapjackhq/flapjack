@@ -3054,9 +3054,10 @@ fn all_migration_env_mutation_shares_one_canonical_synchronization_owner() {
     }
 }
 
-/// Census every direct access to the resolver/pin test-hook family, then prove
-/// the process-global outbound resolver has one lifetime owner. The exact census
-/// keeps a newly added reader, mutator, re-export, or wrapper visible here; the
+/// Census the resolver/pin hook symbols permitted in each source owner, then
+/// prove the process-global outbound resolver has one lifetime owner. The
+/// symbol-per-owner contract keeps a newly added reader, mutator, re-export, or
+/// wrapper visible without coupling this audit to invocation counts. The
 /// nested-drop assertion is the fail-capable contract for the audited gap.
 #[test]
 #[serial_test::serial(flapjack_outbound_url_policy)]
@@ -3065,9 +3066,9 @@ fn resolver_hook_family_has_one_lifetime_isolation_owner() {
         .parent()
         .expect("flapjack-http must live below the engine workspace");
     assert_eq!(
-        resolver_hook_access_counts(engine_root),
-        expected_resolver_hook_access_counts(),
-        "every hook-family reader and mutator must stay in the audited table owned by security::test_helpers"
+        resolver_hook_symbols_by_owner(engine_root),
+        expected_resolver_hook_symbols_by_owner(),
+        "every hook-family reader, mutator, and wrapper must be permitted for its source owner"
     );
     assert_outbound_resolver_lifetime_isolation();
 }
@@ -3084,22 +3085,15 @@ fn resolver_hook_names() -> [String; 7] {
     ]
 }
 
-fn resolver_hook_access_count(source: &str, hook_names: &[String]) -> usize {
-    hook_names
-        .iter()
-        .map(|hook| source.matches(hook).count())
-        .sum()
-}
-
-fn resolver_hook_access_counts(
+fn resolver_hook_symbols_by_owner(
     engine_root: &std::path::Path,
-) -> std::collections::BTreeMap<String, usize> {
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
     let hook_names = resolver_hook_names();
     let mut observed = std::collections::BTreeMap::new();
     for path in rust_sources_recursively(engine_root) {
         let source = std::fs::read_to_string(&path).unwrap();
-        let access_count = resolver_hook_access_count(&source, &hook_names);
-        if access_count == 0 {
+        let symbols = resolver_hook_symbols_outside_line_comments(&source, &hook_names);
+        if symbols.is_empty() {
             continue;
         }
         let relative = path
@@ -3107,63 +3101,81 @@ fn resolver_hook_access_counts(
             .expect("workspace Rust source must be below engine root")
             .to_string_lossy()
             .replace('\\', "/");
-        observed.insert(relative, access_count);
+        observed.insert(relative, symbols);
     }
     observed
 }
 
-fn expected_resolver_hook_access_counts() -> std::collections::BTreeMap<String, usize> {
-    std::collections::BTreeMap::from([
-        ("flapjack-http/src/ai_provider.rs".to_string(), 3),
-        ("flapjack-http/src/handlers/chat_tests.rs".to_string(), 5),
-        (
-            "flapjack-http/src/handlers/migration/algolia_client.rs".to_string(),
-            8,
-        ),
-        (
-            "flapjack-http/src/handlers/migration/algolia_client_tests.rs".to_string(),
-            18,
-        ),
-        (
-            "flapjack-http/src/handlers/migration/meilisearch_client_tests.rs".to_string(),
-            7,
-        ),
-        ("flapjack-http/src/handlers/migration/mod.rs".to_string(), 1),
-        (
-            "flapjack-http/src/handlers/migration/preview_tests/meilisearch.rs".to_string(),
-            4,
-        ),
-        (
-            "flapjack-http/src/handlers/migration/preview_tests/typesense.rs".to_string(),
-            3,
-        ),
-        (
-            "flapjack-http/src/handlers/migration/source_reader_tests.rs".to_string(),
-            2,
-        ),
-        (
-            "flapjack-http/src/handlers/migration/typesense_client_tests.rs".to_string(),
-            8,
-        ),
-        ("flapjack-http/src/router_tests.rs".to_string(), 3),
-        ("src/security.rs".to_string(), 3),
-        // Core guard coverage adds one installer call while keeping
-        // `security::test_helpers` as the hook family's single owner.
-        ("src/security_tests.rs".to_string(), 12),
-        ("src/vector/config_tests.rs".to_string(), 1),
-        ("src/vector/embedder.rs".to_string(), 3),
-        ("src/vector/embedder_tests.rs".to_string(), 10),
-    ])
+fn resolver_hook_symbols_outside_line_comments(
+    source: &str,
+    hook_names: &[String],
+) -> std::collections::BTreeSet<String> {
+    source
+        .lines()
+        .filter_map(|line| line.split("//").next())
+        .flat_map(|code| {
+            code.split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        })
+        .filter(|identifier| hook_names.iter().any(|hook| hook == identifier))
+        .map(str::to_string)
+        .collect()
 }
 
-#[test]
-fn resolver_hook_census_counts_multiple_accesses_on_one_line() {
+fn expected_resolver_hook_symbols_by_owner(
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
     let hook_names = resolver_hook_names();
-    let two_accesses_on_one_line = format!("{}({}())", hook_names[0], hook_names[1]);
-    assert_eq!(
-        resolver_hook_access_count(&two_accesses_on_one_line, &hook_names),
-        2
-    );
+    let permitted: &[(&str, &[usize])] = &[
+        ("flapjack-http/src/ai_provider.rs", &[2, 3]),
+        ("flapjack-http/src/handlers/chat_tests.rs", &[0, 2]),
+        (
+            "flapjack-http/src/handlers/migration/algolia_client.rs",
+            &[0, 2, 3, 4, 5, 6],
+        ),
+        (
+            "flapjack-http/src/handlers/migration/algolia_client_tests.rs",
+            &[0, 2, 4, 5, 6],
+        ),
+        (
+            "flapjack-http/src/handlers/migration/meilisearch_client_tests.rs",
+            &[0],
+        ),
+        ("flapjack-http/src/handlers/migration/mod.rs", &[6]),
+        (
+            "flapjack-http/src/handlers/migration/preview_tests/meilisearch.rs",
+            &[0],
+        ),
+        (
+            "flapjack-http/src/handlers/migration/preview_tests/typesense.rs",
+            &[0],
+        ),
+        (
+            "flapjack-http/src/handlers/migration/source_reader_tests.rs",
+            &[5],
+        ),
+        (
+            "flapjack-http/src/handlers/migration/typesense_client_tests.rs",
+            &[0],
+        ),
+        ("flapjack-http/src/router_tests.rs", &[6]),
+        ("src/crawler/tests.rs", &[0]),
+        ("src/security.rs", &[0, 1]),
+        ("src/security_tests.rs", &[0]),
+        ("src/vector/embedder.rs", &[2, 3]),
+        ("src/vector/embedder_tests.rs", &[0, 2]),
+    ];
+
+    permitted
+        .iter()
+        .map(|(owner, permitted_symbol_indexes)| {
+            (
+                (*owner).to_string(),
+                permitted_symbol_indexes
+                    .iter()
+                    .map(|index| hook_names[*index].clone())
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 fn assert_outbound_resolver_lifetime_isolation() {

@@ -148,6 +148,25 @@ describe('Recommendations page', () => {
     })
   })
 
+  it('renders the exact closed five-model picker', () => {
+    mockHook()
+
+    renderRecommendationsInMemoryRouter()
+
+    expect(
+      screen.getAllByRole('option').map((option) => ({
+        value: (option as HTMLOptionElement).value,
+        label: option.textContent,
+      })),
+    ).toEqual([
+      { value: 'related-products', label: 'Related Products' },
+      { value: 'bought-together', label: 'Bought Together' },
+      { value: 'trending-items', label: 'Trending Items' },
+      { value: 'trending-facets', label: 'Trending Facets' },
+      { value: 'looking-similar', label: 'Looking Similar' },
+    ])
+  })
+
   it('does not issue live settings requests through the IndexLayout tab shell', async () => {
     const mockedUseSettings = vi.mocked(useSettings)
     const settingsGetSpy = vi.spyOn(api, 'get').mockResolvedValue({ data: {} } as any)
@@ -227,6 +246,28 @@ describe('Recommendations page', () => {
     })
 
     expect(hook.mutateAsync).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps an unbroken recommendation identifier inside its result card', async () => {
+    const user = userEvent.setup()
+    const longObjectID = `sku-${'x'.repeat(120)}`
+    mockHook({
+      mutateAsync: vi.fn().mockResolvedValue([
+        {
+          hits: [{ objectID: longObjectID, _score: 100 }],
+          processingTimeMS: 1,
+        },
+      ]),
+    })
+
+    renderRecommendationsInMemoryRouter()
+
+    await user.type(screen.getByTestId('recommendations-object-input'), 'seed')
+    await user.click(screen.getByTestId('get-recommendations-btn'))
+
+    await waitFor(() => {
+      expect(screen.getByText(longObjectID)).toHaveClass('break-all')
+    })
   })
 
   it('clears stale results when the selected model changes', async () => {

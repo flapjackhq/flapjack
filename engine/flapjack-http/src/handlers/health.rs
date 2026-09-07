@@ -9,6 +9,7 @@ use utoipa::ToSchema;
 
 use super::AppState;
 use crate::api_profile::{ApiProfile, SUPPORTED_API_PROFILES};
+use crate::error_response::HandlerError;
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +42,15 @@ impl From<&flapjack::BuildInfo> for PublicBuildInfo {
     fn from(build: &flapjack::BuildInfo) -> Self {
         Self::new(build, ApiProfile::Full)
     }
+}
+
+/// Returns the complete identity embedded in the running executable.
+///
+/// This handler is mounted only in the authenticated admin-internal router.
+/// Public health intentionally uses [`PublicBuildInfo`] so source provenance
+/// never becomes an unauthenticated fingerprinting surface.
+pub async fn protected_build_info() -> Result<Json<flapjack::BuildInfo>, HandlerError> {
+    Ok(Json(flapjack::build_info().clone()))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -138,7 +148,13 @@ mod tests {
         assert_eq!(json["build"]["apiProfile"], "full");
         assert_eq!(
             json["build"]["supportedApiProfiles"],
-            serde_json::json!(["full", "paid_beta_v1", "paid_beta_v3"])
+            serde_json::json!([
+                "full",
+                "paid_beta_v1",
+                "paid_beta_v3",
+                "paid_beta_v4",
+                "paid_beta_v5"
+            ])
         );
         assert_eq!(
             json["build"]["capabilities"],

@@ -6265,6 +6265,16 @@
             ],
             "format": "double"
           },
+          "conclusion": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ExperimentConclusion"
+              }
+            ]
+          },
           "configuration": {
             "$ref": "#/components/schemas/AlgoliaConfiguration"
           },
@@ -9150,7 +9160,8 @@
           "variantMetric",
           "confidence",
           "significant",
-          "promoted"
+          "promoted",
+          "winner"
         ],
         "properties": {
           "confidence": {
@@ -9178,9 +9189,15 @@
             "type": [
               "string",
               "null"
+            ],
+            "enum": [
+              "control",
+              "variant",
+              null
             ]
           }
-        }
+        },
+        "additionalProperties": false
       },
       "ExperimentStatus": {
         "type": "string",
@@ -10926,6 +10943,16 @@
           "model"
         ],
         "properties": {
+          "analytics": {
+            "type": "boolean",
+            "description": "Count this request in Recommend Analytics; defaults to true.",
+            "default": true
+          },
+          "clickAnalytics": {
+            "type": "boolean",
+            "description": "Return a queryID for Events attribution; requires analytics and a UUID userToken.",
+            "default": false
+          },
           "facetName": {
             "type": [
               "string",
@@ -10977,6 +11004,13 @@
             ],
             "format": "int32",
             "minimum": 0
+          },
+          "userToken": {
+            "type": "string",
+            "description": "Optional 1-129 ASCII token; click attribution requires a hyphenated UUID.",
+            "maxLength": 129,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_-]+$"
           }
         }
       },
@@ -10997,6 +11031,12 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "queryID": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -12466,6 +12506,15 @@
                     "$ref": "#/components/schemas/IgnorePluralsValue"
                   }
                 ]
+              },
+              "indexLanguages": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                }
               },
               "maxValuesPerFacet": {
                 "type": [

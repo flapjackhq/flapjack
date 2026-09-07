@@ -69,6 +69,25 @@ describe('shared Index List and basic Search', () => {
     expect(transport.searchIndex).not.toHaveBeenCalled();
   });
 
+  it('keeps an unavailable index visible and searchable without fabricated metrics', async () => {
+    const user = userEvent.setup();
+    const unavailableIndex = {
+      name: 'pending',
+      entries: null,
+      dataSize: null,
+    } satisfies IndexSummary;
+    const listIndexes = vi.fn(async () => [unavailableIndex]);
+    const searchIndex = vi.fn<ConsoleTransport['searchIndex']>();
+    render(IndexListSearch, { props: { transport: fixture(listIndexes, searchIndex) } });
+
+    expect(
+      await screen.findByRole('row', { name: 'pending Unavailable Unavailable' }),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Search pending' }));
+    expect(screen.getByRole('searchbox', { name: 'Query' })).toHaveFocus();
+    expect(searchIndex).not.toHaveBeenCalled();
+  });
+
   it('keeps empty and failed list states distinct and retries only on request', async () => {
     const user = userEvent.setup();
     const listIndexes = vi

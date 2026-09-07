@@ -1,4 +1,7 @@
-use super::{register_index_labeled_gauge_values, register_live_index_state_gauges};
+use super::{
+    register_index_labeled_gauge_values, register_live_index_state_gauges, IndexGaugeSnapshot,
+    IndexGaugeValues,
+};
 use prometheus::Registry;
 use tempfile::TempDir;
 
@@ -21,6 +24,11 @@ async fn register_live_index_state_gauges_emits_storage_documents_and_oplog() {
         .add_documents_sync("live_idx", docs)
         .await
         .unwrap();
+    crate::background_tasks::refresh_metrics_snapshot(
+        &state.manager,
+        state.metrics_state.as_ref().unwrap(),
+    )
+    .unwrap();
 
     let registry = Registry::new();
     register_live_index_state_gauges(&registry, &state);
@@ -84,10 +92,10 @@ fn register_index_labeled_gauge_values_registers_and_sets_values() {
     assert_eq!(values_by_label.get("beta"), Some(&99.0));
 }
 
-/// Verify storage gauges still include newly-created tenants when the poller
-/// snapshot is stale and missing those tenant IDs.
+/// Verify a request does not merge newly-created tenant files into a stale
+/// cached generation.
 #[tokio::test]
-async fn register_live_index_state_gauges_merges_stale_storage_snapshot_with_live_state() {
+async fn register_live_index_state_gauges_uses_only_cached_snapshot() {
     let tmp = TempDir::new().unwrap();
     let state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
 
@@ -108,10 +116,13 @@ async fn register_live_index_state_gauges_merges_stale_storage_snapshot_with_liv
         .unwrap();
 
     let metrics_state = state.metrics_state.as_ref().unwrap();
-    metrics_state.storage_gauges.clear();
-    metrics_state
-        .storage_gauges
-        .insert("stale_only_idx".to_string(), 123);
+    metrics_state.replace_index_gauges(IndexGaugeSnapshot::from([(
+        "stale_only_idx".to_string(),
+        IndexGaugeValues {
+            documents_count: Some(9),
+            storage_bytes: Some(123),
+        },
+    )]));
 
     let registry = Registry::new();
     register_live_index_state_gauges(&registry, &state);
@@ -133,8 +144,5 @@ async fn register_live_index_state_gauges_merges_stale_storage_snapshot_with_liv
         })
         .collect();
 
-    assert!(
-        labels.iter().any(|label| label == "fresh_idx"),
-        "storage metrics should include live tenant ids even when the poller snapshot is stale; labels={labels:?}"
-    );
+    assert_eq!(labels, vec!["stale_only_idx".to_string()]);
 }

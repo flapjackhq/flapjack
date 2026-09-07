@@ -565,19 +565,51 @@ pub(crate) struct InitializedKeyStore {
     pub key_is_new: bool,
 }
 
+/// Selects whether startup may publish durable subsystem state.
+///
+/// The persisted release fence is opened before this value is derived.  The
+/// fenced variant must stay load-only; ordinary request mutation admission
+/// resumes once the same fence is released by the release transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupPersistenceMode {
+    Ordinary,
+    FenceActive,
+}
+
+#[cfg(test)]
 pub(crate) fn initialize_key_store(
     server_config: &ServerConfig,
     data_dir: &Path,
 ) -> Result<InitializedKeyStore, String> {
+    initialize_key_store_for_mode(server_config, data_dir, StartupPersistenceMode::Ordinary)
+}
+
+pub(crate) fn initialize_key_store_for_mode(
+    server_config: &ServerConfig,
+    data_dir: &Path,
+    persistence_mode: StartupPersistenceMode,
+) -> Result<InitializedKeyStore, String> {
     let admin_key_file = data_dir.join(".admin_key");
-    let (admin_key, key_is_new) = resolve_admin_key(server_config, &admin_key_file);
+    let (admin_key, key_is_new) = match persistence_mode {
+        StartupPersistenceMode::Ordinary => resolve_admin_key(server_config, &admin_key_file),
+        StartupPersistenceMode::FenceActive => {
+            resolve_admin_key_read_only(server_config, &admin_key_file)?
+        }
+    };
 
     let key_store = match admin_key.as_ref() {
         Some(key) => {
-            let key_store = Arc::new(KeyStore::try_load_or_create(data_dir, key)?);
-            // Publish only after KeyStore has used the previous file value, if
-            // any, to re-encrypt secured-key material during startup rotation.
-            persist_admin_key_file(&admin_key_file, key, PermissionFailureMode::ReturnError)?;
+            let key_store = Arc::new(match persistence_mode {
+                StartupPersistenceMode::Ordinary => KeyStore::try_load_or_create(data_dir, key)?,
+                StartupPersistenceMode::FenceActive => {
+                    KeyStore::try_load_existing_read_only(data_dir, key)?
+                }
+            });
+            if persistence_mode == StartupPersistenceMode::Ordinary {
+                // Publish only after KeyStore has used the previous file value,
+                // if any, to re-encrypt secured-key material during rotation.
+                persist_admin_key_file(&admin_key_file, key, PermissionFailureMode::ReturnError)?;
+            }
             tracing::info!("API key authentication enabled");
             Some(key_store)
         }
@@ -589,6 +621,28 @@ pub(crate) fn initialize_key_store(
         admin_key,
         key_is_new,
     })
+}
+
+fn resolve_admin_key_read_only(
+    server_config: &ServerConfig,
+    admin_key_file: &Path,
+) -> Result<(Option<String>, bool), String> {
+    if server_config.no_auth {
+        return Ok((None, false));
+    }
+    if let Some(key) = server_config
+        .admin_key_env
+        .as_deref()
+        .and_then(normalize_admin_key)
+    {
+        return Ok((Some(key), false));
+    }
+    if !admin_key_file.is_file() {
+        return Err("active release fence requires an existing .admin_key".to_string());
+    }
+    // Do not chmod during fenced startup: even metadata repair belongs to the
+    // ordinary predecessor/successor lifecycle, not read-only validation.
+    Ok((Some(read_admin_key(admin_key_file)?), false))
 }
 
 /// TODO: Document resolve_admin_key.

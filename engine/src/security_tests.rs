@@ -604,3 +604,147 @@ fn typesense_endpoint_policy_accepts_public_cloud_hosts_and_pins_addresses() {
         ]
     );
 }
+
+#[test]
+#[serial(flapjack_outbound_url_policy)]
+fn crawler_target_admission_is_strict_public_https_and_canonical() {
+    let _resolver = install_test_outbound_host_resolver(Arc::new(|host, port| {
+        assert_eq!(host, "example.com");
+        assert_eq!(port, Some(443));
+        Some(vec!["8.8.8.8".parse().unwrap(), "1.1.1.1".parse().unwrap()])
+    }));
+
+    let target = super::vet_crawler_url_target("HTTPS://EXAMPLE.COM:443/catalog?q=1#section")
+        .expect("public HTTPS crawler target must pass");
+    assert_eq!(
+        target.canonical_url.as_str(),
+        "https://example.com/catalog?q=1"
+    );
+    assert_eq!(target.host, "example.com");
+    assert_eq!(target.port, 443);
+    assert_eq!(
+        target.socket_addrs(),
+        vec![
+            "1.1.1.1:443".parse().unwrap(),
+            "8.8.8.8:443".parse().unwrap()
+        ]
+    );
+}
+
+#[test]
+#[serial(flapjack_outbound_url_policy)]
+fn crawler_target_admission_rejects_credentials_non_https_and_unresolved_dns() {
+    let _resolver = install_test_outbound_host_resolver(Arc::new(|host, _port| {
+        (host != "unresolved.example").then(|| vec!["8.8.8.8".parse().unwrap()])
+    }));
+
+    for raw in [
+        "http://example.com/",
+        "https://user@example.com/",
+        "https://user:secret@example.com/",
+        "https://unresolved.example/",
+    ] {
+        assert!(
+            super::vet_crawler_url_target(raw).is_err(),
+            "crawler admission must reject {raw}"
+        );
+    }
+}
+
+#[test]
+#[serial(flapjack_outbound_url_policy)]
+fn crawler_target_admission_rejects_every_mixed_or_non_public_answer() {
+    let _resolver = install_test_outbound_host_resolver(Arc::new(|host, _port| {
+        Some(match host {
+            "mixed.example" => vec!["8.8.8.8".parse().unwrap(), "127.0.0.1".parse().unwrap()],
+            "documentation.example" => vec!["203.0.113.10".parse().unwrap()],
+            "reserved.example" => vec!["192.0.0.1".parse().unwrap()],
+            "benchmark.example" => vec!["198.18.0.1".parse().unwrap()],
+            "nat64.example" => vec!["64:ff9b::7f00:1".parse().unwrap()],
+            "documentation-v6.example" => vec!["3fff::1".parse().unwrap()],
+            _ => vec!["127.0.0.1".parse().unwrap()],
+        })
+    }));
+
+    for host in [
+        "mixed.example",
+        "documentation.example",
+        "reserved.example",
+        "benchmark.example",
+        "nat64.example",
+        "documentation-v6.example",
+        "loopback.example",
+    ] {
+        assert!(
+            super::vet_crawler_url_target(&format!("https://{host}/")).is_err(),
+            "crawler admission must reject any non-public resolution for {host}"
+        );
+    }
+}
+
+#[test]
+fn crawler_target_admission_rejects_literal_special_purpose_encodings() {
+    for raw in [
+        "https://0.0.0.0/",
+        "https://10.0.0.1/",
+        "https://100.64.0.1/",
+        "https://127.0.0.1/",
+        "https://2130706433/",
+        "https://0x7f000001/",
+        "https://169.254.169.254/latest/meta-data/",
+        "https://172.16.0.1/",
+        "https://192.0.0.9/",
+        "https://192.0.2.1/",
+        "https://192.88.99.1/",
+        "https://192.168.0.1/",
+        "https://198.18.0.1/",
+        "https://198.51.100.1/",
+        "https://203.0.113.1/",
+        "https://224.0.0.1/",
+        "https://240.0.0.1/",
+        "https://[::1]/",
+        "https://[::ffff:127.0.0.1]/",
+        "https://[64:ff9b::7f00:1]/",
+        "https://[2001:db8::1]/",
+        "https://[2002::1]/",
+        "https://[3fff::1]/",
+        "https://[fc00::1]/",
+        "https://[fe80::1]/",
+        "https://[ff00::1]/",
+    ] {
+        assert_eq!(
+            super::vet_crawler_url_target(raw),
+            Err(super::CrawlerTargetAdmissionError::DnsResolutionFailed),
+            "strict crawler admission must reject {raw}"
+        );
+    }
+}
+
+#[test]
+fn crawler_target_admission_accepts_public_ip_literals_without_dns_rebinding() {
+    let ipv4 = super::vet_crawler_url_target("https://1.1.1.1:8443/a?q=1#gone").unwrap();
+    assert_eq!(ipv4.canonical_url.as_str(), "https://1.1.1.1:8443/a?q=1");
+    assert_eq!(ipv4.socket_addrs(), vec!["1.1.1.1:8443".parse().unwrap()]);
+
+    let ipv6 = super::vet_crawler_url_target("https://[2606:4700:4700::1111]/").unwrap();
+    assert_eq!(
+        ipv6.socket_addrs(),
+        vec!["[2606:4700:4700::1111]:443".parse().unwrap()]
+    );
+}
+
+#[test]
+fn crawler_target_admission_errors_are_closed_and_redacted() {
+    assert_eq!(
+        super::vet_crawler_url_target("https://user:secret@example.com/?token=private"),
+        Err(super::CrawlerTargetAdmissionError::TargetRejected)
+    );
+    assert_eq!(
+        super::CrawlerTargetAdmissionError::TargetRejected.to_string(),
+        "Crawler target is not allowed"
+    );
+    assert_eq!(
+        super::CrawlerTargetAdmissionError::DnsResolutionFailed.to_string(),
+        "Crawler target DNS validation failed"
+    );
+}

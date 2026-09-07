@@ -3,11 +3,17 @@
   --console-surface-muted: #ffffff;
   --console-text: #231942;
   --console-text-muted: #655c7a;
-  --console-border: #ded7e8;
+  --console-border: #8e80a3;
   --console-focus: #7c3aed;
-  --console-accent: #db2777;
+  --console-accent: #be185d;
+  --console-accent-hover: #9d174d;
+  --console-on-accent: #ffffff;
   --console-danger: #b42318;
+  --console-danger-surface: #fef3f2;
+  --console-danger-hover: #fee4e2;
   --console-status: #147d64;
+  --console-status-surface: #ecfdf3;
+  --console-surface-hover: #f5f0f8;
   --console-font: Inter, ui-sans-serif, system-ui, sans-serif;
   --console-space-sm: 0.5rem;
   --console-space-md: 1rem;
@@ -16,6 +22,10 @@
   --console-radius: 0.75rem;
   --console-shadow: 0 0.5rem 1.5rem rgb(35 25 66 / 8%);
   --console-heading-size: 1.5rem;
+  --console-subheading-size: 1.125rem;
+  --console-control-min-height: 2.75rem;
+  --console-control-font-weight: 700;
+  --console-motion-duration: 140ms;
   --console-content-min-height: 12rem;
 }
 
@@ -24,11 +34,17 @@
   --console-surface-muted: #ffffff;
   --console-text: #172033;
   --console-text-muted: #5d687a;
-  --console-border: #d8deea;
+  --console-border: #7b879c;
   --console-focus: #2563eb;
   --console-accent: #0f766e;
+  --console-accent-hover: #115e59;
+  --console-on-accent: #ffffff;
   --console-danger: #b42318;
+  --console-danger-surface: #fef3f2;
+  --console-danger-hover: #fee4e2;
   --console-status: #147d64;
+  --console-status-surface: #ecfdf3;
+  --console-surface-hover: #eef2f7;
   --console-font: Inter, ui-sans-serif, system-ui, sans-serif;
   --console-space-sm: 0.5rem;
   --console-space-md: 1rem;
@@ -37,5 +53,9 @@
   --console-radius: 0.75rem;
   --console-shadow: 0 0.5rem 1.5rem rgb(23 32 51 / 8%);
   --console-heading-size: 1.5rem;
+  --console-subheading-size: 1.125rem;
+  --console-control-min-height: 2.75rem;
+  --console-control-font-weight: 700;
+  --console-motion-duration: 140ms;
   --console-content-min-height: 12rem;
 }

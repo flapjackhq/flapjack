@@ -23,6 +23,7 @@
 mod common;
 
 use common::state::make_test_app_state;
+use flapjack::index::oplog::AppendDurability;
 use flapjack::types::Document;
 use flapjack::IndexManager;
 use serde_json::Value;
@@ -806,10 +807,15 @@ async fn seed_newer_version_then_truncate(temp: &TempDir, tenant_id: &str) {
         .append(
             "noop",
             serde_json::json!({"marker": "segment-rotate", "blob": oversized_payload}),
+            AppendDurability::Buffered,
         )
         .expect("forcing segment rotation should succeed");
     let retained_seq = oplog
-        .append("noop", serde_json::json!({"marker": "retained"}))
+        .append(
+            "noop",
+            serde_json::json!({"marker": "retained"}),
+            AppendDurability::Buffered,
+        )
         .expect("appending retained entry should succeed");
     let removed_segments = oplog
         .truncate_before(retained_seq)
@@ -2179,18 +2185,19 @@ async fn test_internal_ops_moved_source_fallback_stops_at_move_boundary() {
         Some("src_idx"),
         "fallback response should keep the requested source tenant id"
     );
-    assert!(
-        body["current_seq"].as_u64().is_some(),
-        "fallback response should include current_seq"
-    );
-    assert!(
-        body.get("oldest_retained_seq").is_none()
-            || body.get("oldest_retained_seq") == Some(&serde_json::Value::Null),
-        "moved-source fallback should not report retained-bound metadata from destination stream"
-    );
     let ops = body["ops"]
         .as_array()
         .expect("ops should be an array in get_ops response");
+    let first_served_seq = ops
+        .first()
+        .and_then(|op| op["seq"].as_u64())
+        .expect("fallback must serve at least the move boundary row");
+    assert_eq!(
+        body["oldest_retained_seq"].as_u64(),
+        Some(first_served_seq),
+        "moved-source fallback must report the relocated source oplog's own retention floor, \
+         which is the first served row while nothing has been retired"
+    );
     assert!(
         ops.iter()
             .any(|op| op["op_type"].as_str() == Some("move_index")),
@@ -2200,6 +2207,15 @@ async fn test_internal_ops_moved_source_fallback_stops_at_move_boundary() {
         ops.last().and_then(|op| op["op_type"].as_str()),
         Some("move_index"),
         "source catch-up stream must stop at move boundary"
+    );
+    let move_seq = ops
+        .last()
+        .and_then(|op| op["seq"].as_u64())
+        .expect("move boundary must carry a numeric sequence");
+    assert_eq!(
+        body["current_seq"].as_u64(),
+        Some(move_seq),
+        "fallback cursor must equal the committed move boundary"
     );
     assert!(
         !ops.iter().any(|op| {
@@ -2984,11 +3000,16 @@ async fn test_restart_restores_snapshot_when_peer_oplog_is_compacted() {
         .append(
             "noop",
             serde_json::json!({ "marker": "segment-rotate", "blob": oversized_payload }),
+            AppendDurability::Buffered,
         )
         .expect("forcing segment rotation should succeed");
     for seq_marker in 22..=30 {
         oplog
-            .append("noop", serde_json::json!({ "marker": seq_marker }))
+            .append(
+                "noop",
+                serde_json::json!({ "marker": seq_marker }),
+                AppendDurability::Buffered,
+            )
             .expect("appending retained noop entries should succeed");
     }
 
@@ -3070,6 +3091,7 @@ async fn test_fresh_node_bootstrap_restores_snapshot_when_peer_oplog_is_compacte
         .append(
             "noop",
             serde_json::json!({ "marker": "segment-rotate", "blob": oversized_payload }),
+            AppendDurability::Buffered,
         )
         .expect("forcing segment rotation should succeed");
     for doc_id in 4..=doc_count {
@@ -3082,6 +3104,7 @@ async fn test_fresh_node_bootstrap_restores_snapshot_when_peer_oplog_is_compacte
                         "num": doc_id
                     }
                 }),
+                AppendDurability::Buffered,
             )
             .expect("appending retained duplicate upsert should succeed");
     }
@@ -3574,6 +3597,10 @@ async fn test_rollup_broadcaster_integration_periodic() {
     };
     let cluster = flapjack_http::analytics_cluster::AnalyticsClusterClient::new(&node_cfg, None)
         .expect("Should build cluster client");
+    let data_root = tmp_a.path().join("data");
+    std::fs::create_dir_all(&data_root).unwrap();
+    let mutation_fence =
+        flapjack_http::pause_registry::GlobalMutationFence::open(&data_root).unwrap();
 
     // Spawn broadcaster with a 1-second interval
     flapjack_http::rollup_broadcaster::spawn_rollup_broadcaster(
@@ -3582,6 +3609,7 @@ async fn test_rollup_broadcaster_integration_periodic() {
         cluster,
         "node-a-periodic".to_string(),
         1, // 1s interval for test speed
+        mutation_fence.clone(),
     );
 
     // Wait up to 4 seconds for the broadcaster to fire at least once

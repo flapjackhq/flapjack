@@ -1,6 +1,8 @@
 //! Stub summary for engine/src/index/manager/tests.rs.
 use super::write::WriteAdmissionCheckpoint;
 use super::*;
+use crate::analytics::schema::SearchEvent;
+use crate::analytics::{AnalyticsCollector, AnalyticsConfig};
 use crate::index::memory::{MemoryBudget, MemoryBudgetConfig};
 use crate::index::rules::GeneratedFacetFilter;
 use crate::index::write_queue::admission::{
@@ -9,7 +11,7 @@ use crate::index::write_queue::admission::{
 use crate::index::write_queue::{FinalizationFaultPoint, ReplicatedWriteOrigin, WriteOp};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
     mpsc, Arc,
 };
 use std::time::{Duration, Instant};
@@ -819,7 +821,6 @@ async fn create_move_fixture(manager: &IndexManager, tenant: &str, marker: &str)
     .unwrap();
     std::fs::create_dir_all(path.join("oplog")).unwrap();
     std::fs::write(path.join("oplog/move_test.jsonl"), marker).unwrap();
-    std::fs::write(path.join("committed_seq"), "41").unwrap();
     let version = crate::index::version_store::VersionRecord::new(41, marker, false, 41);
     let version_store = crate::index::version_store::VersionStore::open(&path).unwrap();
     assert!(version_store.upsert("move-object", &version).unwrap());
@@ -1055,12 +1056,26 @@ async fn import_tenant_staging_does_not_block_the_async_runtime() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn delete_tenant_preserves_directory_when_quiesce_fails() {
+async fn analytics_delete_preserves_directory_when_quiesce_fails() {
     let temp_dir = TempDir::new().unwrap();
     let manager = IndexManager::new(temp_dir.path());
     let tenant_id = "delete_quiesce_failure";
 
     manager.create_tenant(tenant_id).unwrap();
+    let analytics_config = AnalyticsConfig {
+        enabled: true,
+        data_dir: temp_dir.path().join("analytics"),
+        flush_interval_secs: 60,
+        flush_size: 100,
+        retention_days: 90,
+    };
+    let collector = AnalyticsCollector::new(analytics_config.clone());
+    manager.set_analytics_collector(collector);
+    let analytics_marker = analytics_config
+        .searches_dir(tenant_id)
+        .join("retained.parquet");
+    std::fs::create_dir_all(analytics_marker.parent().unwrap()).unwrap();
+    std::fs::write(&analytics_marker, b"retained analytics").unwrap();
     if let Some((_, handle)) = manager.write_task_handles.remove(tenant_id) {
         handle.abort();
     }
@@ -1086,6 +1101,12 @@ async fn delete_tenant_preserves_directory_when_quiesce_fails() {
         temp_dir.path().join(tenant_id).is_dir(),
         "failed quiesce must leave the tenant directory intact"
     );
+    assert!(
+        analytics_marker.exists(),
+        "failed quiesce must not erase analytics for a tenant that remains live"
+    );
+    let target = publication::PublicationTarget::new(tenant_id).unwrap();
+    assert!(!publication::analytics_purge_is_pending(temp_dir.path(), &target).unwrap());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1106,6 +1127,302 @@ async fn deleting_absent_tenant_does_not_leave_publication_fence_residue() {
         !epoch_paths.lock.exists(),
         "an absent delete must not leave an epoch lock that poisons later publication repair"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(publication_epoch_open_lock_file_checkpoint_hook)]
+async fn analytics_delete_target_fence_pauses_concurrent_create_until_absence_commits() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = Arc::new(IndexManager::new(temp_dir.path()));
+    let tenant_id = "analytics_delete_create_race".to_string();
+    let analytics_config = AnalyticsConfig {
+        enabled: true,
+        data_dir: temp_dir.path().join("analytics"),
+        flush_interval_secs: 60,
+        flush_size: 100,
+        retention_days: 90,
+    };
+    manager.set_analytics_collector(AnalyticsCollector::new(analytics_config.clone()));
+    std::fs::create_dir_all(
+        analytics_config
+            .target_artifact_paths(&tenant_id)
+            .searches_dir,
+    )
+    .unwrap();
+    let expected_lock_path = temp_dir
+        .path()
+        .join(".publication/analytics_delete_create_race/epoch.lock");
+    let first_matching_open = Arc::new(AtomicBool::new(true));
+    let (delete_entered_tx, delete_entered_rx) = mpsc::channel();
+    let (release_delete_tx, release_delete_rx) = mpsc::channel();
+    let release_delete_rx = std::sync::Mutex::new(release_delete_rx);
+    let _hook = publication::set_publication_epoch_open_lock_file_checkpoint_hook_for_test({
+        let first_matching_open = Arc::clone(&first_matching_open);
+        move |lock_path| {
+            if lock_path == expected_lock_path
+                && first_matching_open.swap(false, AtomicOrdering::SeqCst)
+            {
+                delete_entered_tx.send(()).unwrap();
+                release_delete_rx.lock().unwrap().recv().unwrap();
+            }
+        }
+    });
+
+    let delete_manager = Arc::clone(&manager);
+    let delete_tenant = tenant_id.clone();
+    let delete_thread = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(delete_manager.delete_tenant(&delete_tenant))
+    });
+    delete_entered_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("absent delete must pause before acquiring its target fence");
+
+    let create_error = manager
+        .create_tenant(&tenant_id)
+        .expect_err("target fence admission must pause a concurrent create");
+    assert!(
+        matches!(&create_error, FlapjackError::IndexPaused(_)),
+        "the concurrent create must observe the real pending target fence, got {create_error}"
+    );
+    assert!(!matches!(&create_error, FlapjackError::TenantNotFound(_)));
+    release_delete_tx.send(()).unwrap();
+    let error = delete_thread
+        .join()
+        .unwrap()
+        .expect_err("the exclusively fenced absent delete must report not-found");
+
+    assert!(matches!(error, FlapjackError::TenantNotFound(_)));
+    assert!(!temp_dir.path().join(&tenant_id).exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn analytics_delete_does_not_report_not_found_when_target_fence_fails() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let tenant_id = "analytics_delete_fence_failure".to_string();
+    std::fs::create_dir_all(
+        temp_dir
+            .path()
+            .join(".publication/analytics_delete_fence_failure/epoch.lock"),
+    )
+    .unwrap();
+
+    let error = manager
+        .delete_tenant(&tenant_id)
+        .await
+        .expect_err("invalid target fence must fail closed");
+
+    assert!(!matches!(error, FlapjackError::TenantNotFound(_)));
+    assert!(error.to_string().contains("target fence failed"));
+}
+
+#[test]
+fn analytics_delete_rejects_marker_with_mismatched_target_identity() {
+    let temp_dir = TempDir::new().unwrap();
+    let target = publication::PublicationTarget::new("marker-target").unwrap();
+    publication::mark_analytics_purge_pending(temp_dir.path(), &target).unwrap();
+    let marker_path = temp_dir
+        .path()
+        .join(".publication/marker-target/analytics-purge-pending.json");
+    std::fs::write(
+        marker_path,
+        br#"{"schemaVersion":1,"target":"different-target"}"#,
+    )
+    .unwrap();
+
+    let error = publication::analytics_purge_is_pending(temp_dir.path(), &target)
+        .expect_err("marker identity mismatch must fail closed");
+    assert!(error.to_string().contains("identity"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn analytics_delete_treats_an_absent_analytics_root_as_already_clean() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let tenant_id = "analytics_root_never_created";
+    let analytics_config = AnalyticsConfig {
+        enabled: true,
+        data_dir: temp_dir.path().join("analytics"),
+        flush_interval_secs: 60,
+        flush_size: 100,
+        retention_days: 90,
+    };
+    manager.set_analytics_collector(AnalyticsCollector::new(analytics_config.clone()));
+    manager.create_tenant(tenant_id).unwrap();
+    assert!(
+        !analytics_config.data_dir.exists(),
+        "the regression requires analytics to have never created its root"
+    );
+
+    manager
+        .delete_tenant(&tenant_id.to_string())
+        .await
+        .expect("an absent analytics root is already clean");
+
+    let target = publication::PublicationTarget::new(tenant_id).unwrap();
+    assert!(!temp_dir.path().join(tenant_id).exists());
+    assert!(!publication::analytics_purge_is_pending(temp_dir.path(), &target).unwrap());
+    assert!(!analytics_config
+        .index_deletion_quarantine_path(tenant_id)
+        .exists());
+    assert!(
+        !analytics_config.data_dir.exists(),
+        "cleanup must not create an empty analytics namespace"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn analytics_delete_survives_quarantine_erase_failure_and_startup_finishes_it() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let tenant_id = "analytics_orphan_retry";
+    let analytics_config = AnalyticsConfig {
+        enabled: true,
+        data_dir: temp_dir.path().join("analytics"),
+        flush_interval_secs: 60,
+        flush_size: 100,
+        retention_days: 90,
+    };
+    let collector = AnalyticsCollector::new(analytics_config.clone());
+    manager.set_analytics_collector(Arc::clone(&collector));
+    manager.create_tenant(tenant_id).unwrap();
+
+    let analytics_root = analytics_config.target_artifact_paths(tenant_id).index_root;
+    std::fs::create_dir_all(analytics_root.join("searches")).unwrap();
+    std::fs::write(
+        analytics_root.join("searches/customer.parquet"),
+        b"customer",
+    )
+    .unwrap();
+    collector.fail_next_quarantine_remove_for_test();
+
+    manager
+        .delete_tenant(&tenant_id.to_string())
+        .await
+        .expect("physical deletion stays committed when quarantine erase is transient");
+    assert!(!temp_dir.path().join(tenant_id).exists());
+    let target = publication::PublicationTarget::new(tenant_id).unwrap();
+    assert!(publication::analytics_purge_is_pending(temp_dir.path(), &target).unwrap());
+    let quarantine = analytics_config.index_deletion_quarantine_path(tenant_id);
+    assert!(
+        quarantine.exists(),
+        "customer data remains quarantined for retry"
+    );
+    assert!(
+        !analytics_root.exists(),
+        "canonical analytics must stay absent"
+    );
+    let create_error = manager
+        .create_tenant(tenant_id)
+        .expect_err("pending analytics deletion must block ABA recreation");
+    assert!(create_error
+        .to_string()
+        .contains("pending analytics deletion"));
+
+    collector.fail_next_quarantine_remove_for_test();
+    let retry_error = manager
+        .delete_tenant(&tenant_id.to_string())
+        .await
+        .expect_err("transient absent cleanup failure must remain retryable");
+    assert!(
+        !matches!(retry_error, FlapjackError::TenantNotFound(_)),
+        "FJCloud treats TenantNotFound as committed and would discard the cleanup retry"
+    );
+    assert!(publication::analytics_purge_is_pending(temp_dir.path(), &target).unwrap());
+    assert!(quarantine.exists());
+
+    let clean_retry = manager
+        .delete_tenant(&tenant_id.to_string())
+        .await
+        .expect_err("a clean absent target must report ordinary not-found");
+    assert!(matches!(clean_retry, FlapjackError::TenantNotFound(_)));
+    assert!(
+        !quarantine.exists(),
+        "the identical retry must finish the pending erasure"
+    );
+    assert!(!publication::analytics_purge_is_pending(temp_dir.path(), &target).unwrap());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn analytics_delete_failed_tenant_removal_restores_staged_data_and_admission() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let tenant_id = "analytics_delete_rollback";
+    let analytics_config = AnalyticsConfig {
+        enabled: true,
+        data_dir: temp_dir.path().join("analytics"),
+        flush_interval_secs: 60,
+        flush_size: 100,
+        retention_days: 90,
+    };
+    let collector = AnalyticsCollector::new(analytics_config.clone());
+    manager.set_analytics_collector(collector);
+    manager.create_tenant(tenant_id).unwrap();
+    let customer_data = analytics_config
+        .searches_dir(tenant_id)
+        .join("customer.parquet");
+    std::fs::create_dir_all(customer_data.parent().unwrap()).unwrap();
+    std::fs::write(&customer_data, b"customer").unwrap();
+    manager.fail_next_tenant_removal_for_test();
+
+    manager
+        .delete_tenant(&tenant_id.to_string())
+        .await
+        .expect_err("injected physical deletion failure");
+
+    let target = publication::PublicationTarget::new(tenant_id).unwrap();
+    assert!(temp_dir.path().join(tenant_id).exists());
+    assert!(
+        customer_data.exists(),
+        "rollback must restore exact analytics"
+    );
+    assert!(!analytics_config
+        .index_deletion_quarantine_path(tenant_id)
+        .exists());
+    assert!(!publication::analytics_purge_is_pending(temp_dir.path(), &target).unwrap());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn analytics_delete_targeted_repair_restores_staged_data_when_removal_never_committed() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let tenant_id = "analytics_delete_precommit_crash";
+    let analytics_config = AnalyticsConfig {
+        enabled: true,
+        data_dir: temp_dir.path().join("analytics"),
+        flush_interval_secs: 60,
+        flush_size: 100,
+        retention_days: 90,
+    };
+    let collector = AnalyticsCollector::new(analytics_config.clone());
+    manager.set_analytics_collector(Arc::clone(&collector));
+    manager.create_tenant(tenant_id).unwrap();
+    let analytics_root = analytics_config.target_artifact_paths(tenant_id).index_root;
+    std::fs::create_dir_all(analytics_root.join("searches")).unwrap();
+    let customer_data = analytics_root.join("searches/customer.parquet");
+    std::fs::write(&customer_data, b"customer").unwrap();
+
+    let target = publication::PublicationTarget::new(tenant_id).unwrap();
+    let quarantine = analytics_config.index_deletion_quarantine_path(tenant_id);
+    publication::mark_analytics_purge_pending(temp_dir.path(), &target).unwrap();
+    collector
+        .stage_index_deletion(tenant_id, &quarantine)
+        .unwrap();
+    assert!(temp_dir.path().join(tenant_id).exists());
+    assert!(quarantine.exists());
+
+    manager.repair_publication_target(tenant_id).unwrap();
+
+    assert!(
+        customer_data.exists(),
+        "targeted repair must restore precommit analytics"
+    );
+    assert!(!quarantine.exists());
+    assert!(!publication::analytics_purge_is_pending(temp_dir.path(), &target).unwrap());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1183,15 +1500,20 @@ async fn index_deletion_and_replacement_quiesce_the_persistent_writer() {
         .await
         .unwrap();
     let destination_version =
-        crate::index::version_store::VersionRecord::new(401, "shared-node", true, 17);
+        crate::index::version_store::VersionRecord::new(401, "shared-node", true, 17)
+            .with_origin_proof(41, [0x41; 32]);
     let source_version =
-        crate::index::version_store::VersionRecord::new(401, "shared-node", true, 2);
+        crate::index::version_store::VersionRecord::new(401, "shared-node", true, 2)
+            .with_origin_proof(41, [0x41; 32]);
     let source_only_version =
-        crate::index::version_store::VersionRecord::new(302, "source-node", true, 2);
+        crate::index::version_store::VersionRecord::new(302, "source-node", true, 2)
+            .with_origin_proof(30, [0x30; 32]);
     let destination_older_version =
-        crate::index::version_store::VersionRecord::new(450, "source-wins", false, 55);
+        crate::index::version_store::VersionRecord::new(450, "source-wins", false, 55)
+            .with_origin_proof(45, [0x45; 32]);
     let source_newer_version =
-        crate::index::version_store::VersionRecord::new(451, "source-wins", true, 2);
+        crate::index::version_store::VersionRecord::new(451, "source-wins", true, 2)
+            .with_origin_proof(46, [0x46; 32]);
     {
         let destination_store =
             crate::index::version_store::VersionStore::open(&temp_dir.path().join(replace_target))
@@ -1276,23 +1598,407 @@ async fn index_deletion_and_replacement_quiesce_the_persistent_writer() {
     );
     assert_eq!(
         promoted_store.get("source-only-version").unwrap(),
-        Some(crate::index::version_store::VersionRecord::new(
-            source_only_version.timestamp_ms,
-            source_only_version.node_id,
-            source_only_version.tombstone,
-            promoted_watermark,
-        )),
+        Some(
+            crate::index::version_store::VersionRecord::new(
+                source_only_version.timestamp_ms,
+                source_only_version.node_id.clone(),
+                source_only_version.tombstone,
+                promoted_watermark,
+            )
+            .with_origin_proof(
+                source_only_version.origin_seq.unwrap(),
+                source_only_version.effect_digest.unwrap(),
+            )
+        ),
         "replacement must preserve staged-only rows with a destination-local sequence"
     );
     assert_eq!(
         promoted_store.get("source-newer-version").unwrap(),
-        Some(crate::index::version_store::VersionRecord::new(
-            source_newer_version.timestamp_ms,
-            source_newer_version.node_id,
-            source_newer_version.tombstone,
-            promoted_watermark,
-        )),
+        Some(
+            crate::index::version_store::VersionRecord::new(
+                source_newer_version.timestamp_ms,
+                source_newer_version.node_id.clone(),
+                source_newer_version.tombstone,
+                promoted_watermark,
+            )
+            .with_origin_proof(
+                source_newer_version.origin_seq.unwrap(),
+                source_newer_version.effect_digest.unwrap(),
+            )
+        ),
         "replacement must preserve staged-newer rows with a destination-local sequence"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(stage_4_manager_quiesce)]
+async fn olr_replacement_legacy_null_requires_exact_retained_oplog() {
+    fn persist_raw_legacy(
+        tenant_path: &Path,
+        object_id: &str,
+        receipt: &crate::index::oplog::OpLogReceipt,
+        oplog_seq: u64,
+        partial_origin: bool,
+    ) {
+        let connection = rusqlite::Connection::open(
+            crate::index::version_store::VersionStore::database_path(tenant_path),
+        )
+        .unwrap();
+        let origin_seq = partial_origin.then(|| receipt.origin_seq.unwrap().to_be_bytes());
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE object_versions SET
+                        timestamp_ms = ?1,
+                        node_id = ?2,
+                        tombstone = ?3,
+                        oplog_seq = ?4,
+                        origin_seq = ?5,
+                        effect_digest = NULL
+                     WHERE object_id = ?6",
+                    rusqlite::params![
+                        receipt.timestamp_ms.to_be_bytes().as_slice(),
+                        receipt.node_id,
+                        receipt.is_tombstone,
+                        oplog_seq.to_be_bytes().as_slice(),
+                        origin_seq.as_ref().map(|value| value.as_slice()),
+                        object_id,
+                    ],
+                )
+                .unwrap(),
+            1,
+            "the fixture must rewrite one real persisted row to the legacy schema shape"
+        );
+    }
+
+    for case in [
+        "exact",
+        "missing",
+        "mismatch",
+        "partial",
+        "duplicate",
+        "atomic",
+    ] {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = IndexManager::new_with_node_id(temp_dir.path(), "destination-node");
+        let destination = format!("olr_legacy_destination_{case}");
+        let staging = format!("olr_legacy_staging_{case}");
+        manager.create_tenant(&destination).unwrap();
+        manager.create_tenant(&staging).unwrap();
+        let exact_document = write_queue_test_document("shared-doc", "exact retained effect");
+        manager
+            .add_documents_sync(&destination, vec![exact_document.clone()])
+            .await
+            .unwrap();
+        manager
+            .add_documents_sync(&staging, vec![exact_document.clone()])
+            .await
+            .unwrap();
+        manager
+            .add_documents_sync(
+                &destination,
+                vec![write_queue_test_document(
+                    "destination-sentinel",
+                    "must survive a refused publication",
+                )],
+            )
+            .await
+            .unwrap();
+
+        let baseline = manager
+            .capture_replacement_staging_baseline(&destination)
+            .unwrap();
+
+        let origin = crate::index::oplog::OpLogOrigin::new(9_000_000_000_000, "source-node")
+            .with_origin_seq(77);
+        let atomic_document = (case == "atomic")
+            .then(|| write_queue_test_document("atomic-doc", "atomic retained proof"));
+        if let Some(atomic_document) = &atomic_document {
+            manager
+                .add_documents_sync(&staging, vec![atomic_document.clone()])
+                .await
+                .unwrap();
+        }
+        let destination_receipt = manager
+            .get_oplog(&destination)
+            .unwrap()
+            .append_operations_for_task(
+                "olr-destination-proof",
+                vec![crate::index::oplog::OpLogOperation::replicated(
+                    "upsert",
+                    serde_json::json!({
+                        "objectID": "shared-doc",
+                        "body": exact_document.to_json()
+                    }),
+                    origin.clone(),
+                )],
+            )
+            .unwrap()
+            .remove(0);
+        let staging_oplog = crate::index::oplog::OpLog::open(
+            &temp_dir
+                .path()
+                .join(&staging)
+                .join(crate::index::oplog::OPLOG_DIR),
+            "logical-source-before-relocation",
+            "staging-local",
+        )
+        .unwrap();
+        for ordinal in 0..4 {
+            staging_oplog
+                .append(
+                    "settings",
+                    serde_json::json!({"ordinal": ordinal}),
+                    crate::index::oplog::AppendDurability::Synced,
+                )
+                .unwrap();
+        }
+        let staging_receipt = staging_oplog
+            .append_operations_for_task(
+                "olr-staging-proof",
+                vec![crate::index::oplog::OpLogOperation::replicated(
+                    "upsert",
+                    serde_json::json!({
+                        "objectID": "shared-doc",
+                        "body": exact_document.to_json()
+                    }),
+                    origin.clone(),
+                )],
+            )
+            .unwrap()
+            .remove(0);
+        let atomic_receipt = atomic_document.as_ref().map(|atomic_document| {
+            staging_oplog
+                .append_operations_for_task(
+                    "olr-staging-atomic-proof",
+                    vec![crate::index::oplog::OpLogOperation::replicated(
+                        "upsert",
+                        serde_json::json!({
+                            "objectID": "atomic-doc",
+                            "body": atomic_document.to_json()
+                        }),
+                        origin,
+                    )],
+                )
+                .unwrap()
+                .remove(0)
+        });
+        crate::index::oplog::write_committed_seq(
+            &temp_dir.path().join(&destination),
+            manager.get_oplog(&destination).unwrap().current_seq(),
+        )
+        .unwrap();
+        crate::index::oplog::write_committed_seq(
+            &temp_dir.path().join(&staging),
+            staging_oplog.current_seq(),
+        )
+        .unwrap();
+        assert!(
+            staging_receipt.seq > destination_receipt.seq,
+            "the relocated staged sequence domain must exceed destination W"
+        );
+        assert!(
+            baseline.value() < destination_receipt.seq,
+            "replacement must replay a non-empty destination delta"
+        );
+        let staged_legacy_oplog_seq = if case == "missing" {
+            staging_receipt.seq + 10_000
+        } else {
+            staging_receipt.seq
+        };
+        let destination_store =
+            crate::index::version_store::VersionStore::open(&temp_dir.path().join(&destination))
+                .unwrap();
+        destination_store
+            .apply_receipts(std::slice::from_ref(&destination_receipt))
+            .unwrap();
+        let destination_only_legacy = crate::index::version_store::VersionRecord::new(
+            7_777,
+            "legacy-destination-node",
+            false,
+            77_777,
+        );
+        assert!(destination_store
+            .upsert("destination-only-legacy", &destination_only_legacy)
+            .unwrap());
+        drop(destination_store);
+        persist_raw_legacy(
+            &temp_dir.path().join(&staging),
+            "shared-doc",
+            &staging_receipt,
+            staged_legacy_oplog_seq,
+            case == "partial",
+        );
+        if case == "mismatch" {
+            let connection = rusqlite::Connection::open(
+                crate::index::version_store::VersionStore::database_path(
+                    &temp_dir.path().join(&staging),
+                ),
+            )
+            .unwrap();
+            connection
+                .execute(
+                    "UPDATE object_versions SET node_id = 'wrong-source-node' WHERE object_id = 'shared-doc'",
+                    [],
+                )
+                .unwrap();
+        }
+        if let Some(atomic_receipt) = &atomic_receipt {
+            persist_raw_legacy(
+                &temp_dir.path().join(&staging),
+                "atomic-doc",
+                atomic_receipt,
+                atomic_receipt.seq + 10_000,
+                false,
+            );
+        }
+        if case == "duplicate" {
+            let segment = std::fs::read_dir(
+                temp_dir
+                    .path()
+                    .join(&staging)
+                    .join(crate::index::oplog::OPLOG_DIR),
+            )
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("segment_"))
+            .unwrap()
+            .path();
+            let contents = std::fs::read_to_string(&segment).unwrap();
+            let duplicate = contents
+                .lines()
+                .find(|line| {
+                    serde_json::from_str::<crate::index::oplog::OpLogEntry>(line)
+                        .is_ok_and(|entry| entry.seq == staging_receipt.seq)
+                })
+                .unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(segment)
+                .unwrap();
+            std::io::Write::write_all(&mut file, format!("{duplicate}\n").as_bytes()).unwrap();
+            std::io::Write::flush(&mut file).unwrap();
+        }
+
+        let result = manager
+            .replace_index_contents(&staging, &destination, baseline)
+            .await;
+
+        if case == "exact" {
+            result.expect("matching retained oplog effects must prove an exact legacy merge");
+            assert_document_title(
+                &manager,
+                &destination,
+                "shared-doc",
+                "exact retained effect",
+            );
+            let promoted_store = crate::index::version_store::VersionStore::open(
+                &temp_dir.path().join(&destination),
+            )
+            .unwrap();
+            let promoted_staged = promoted_store.get("shared-doc").unwrap().unwrap();
+            assert_eq!(promoted_staged.origin_seq, staging_receipt.origin_seq);
+            assert_eq!(promoted_staged.effect_digest, staging_receipt.effect_digest);
+            assert_eq!(
+                promoted_store.get("destination-only-legacy").unwrap(),
+                Some(destination_only_legacy),
+                "a non-overlapping destination-only legacy row must survive without invented proof"
+            );
+        } else {
+            let error = result.expect_err(
+                "missing or mismatched retained oplog evidence must refuse replacement",
+            );
+            assert!(
+                error.to_string().contains("proof") || error.to_string().contains("ambiguous"),
+                "{case} must fail with explicit retained-proof context: {error}"
+            );
+            assert_document_title(
+                &manager,
+                &destination,
+                "destination-sentinel",
+                "must survive a refused publication",
+            );
+            if case == "atomic" {
+                let staged_store = crate::index::version_store::VersionStore::open(
+                    &temp_dir.path().join(&staging),
+                )
+                .unwrap();
+                assert_eq!(
+                    staged_store.get("shared-doc").unwrap().unwrap().origin_seq,
+                    None,
+                    "one bad row must roll back every staged legacy proof update"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn analytics_delete_purges_exact_data_and_preserves_publication_epoch_fence() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let config = AnalyticsConfig {
+        enabled: true,
+        data_dir: temp_dir.path().join("analytics"),
+        flush_interval_secs: 60,
+        flush_size: 100,
+        retention_days: 90,
+    };
+    let collector = AnalyticsCollector::new(config.clone());
+    manager.set_analytics_collector(Arc::clone(&collector));
+    manager.create_tenant("delete-analytics").unwrap();
+    manager.create_tenant("keep-analytics").unwrap();
+
+    let event = |index_name: &str, query_id: &str| SearchEvent {
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        query: "query".to_string(),
+        query_id: Some(query_id.to_string()),
+        index_name: index_name.to_string(),
+        nb_hits: 1,
+        processing_time_ms: 1,
+        user_token: Some("user-1".to_string()),
+        user_ip: None,
+        filters: None,
+        facets: None,
+        analytics_tags: None,
+        page: 0,
+        hits_per_page: 20,
+        has_results: true,
+        country: None,
+        region: None,
+        experiment_id: None,
+        variant_id: None,
+        assignment_method: None,
+    };
+    collector.record_search(event("delete-analytics", "delete-flushed"));
+    collector.record_search(event("keep-analytics", "keep-flushed"));
+    collector.flush_all();
+    collector.record_search(event("delete-analytics", "delete-buffered"));
+
+    manager
+        .delete_tenant(&"delete-analytics".to_string())
+        .await
+        .unwrap();
+    collector.flush_all();
+
+    assert!(!config
+        .target_artifact_paths("delete-analytics")
+        .index_root
+        .exists());
+    assert!(config
+        .target_artifact_paths("keep-analytics")
+        .index_root
+        .exists());
+    let epoch_paths = publication::publication_epoch_paths_for_target_path(
+        &temp_dir.path().join("delete-analytics"),
+    );
+    assert!(
+        epoch_paths.epoch.exists(),
+        "delete must retain the ABA epoch"
+    );
+    assert!(
+        epoch_paths.lock.exists(),
+        "delete must retain the ABA epoch lock"
     );
 }
 
@@ -1304,6 +2010,8 @@ async fn move_index_replaces_destination_and_preserves_complete_source_tree() {
     create_move_fixture(&manager, "source", "source_marker").await;
     create_move_fixture(&manager, "destination", "old_destination_marker").await;
     let expected_source = tenant_tree_bytes(&temp_dir.path().join("source"));
+    let expected_committed_seq =
+        std::fs::read_to_string(temp_dir.path().join("source/committed_seq")).unwrap();
 
     let task = manager.move_index("source", "destination").await.unwrap();
 
@@ -1322,7 +2030,7 @@ async fn move_index_replaces_destination_and_preserves_complete_source_tree() {
     );
     assert_eq!(
         std::fs::read_to_string(temp_dir.path().join("destination/committed_seq")).unwrap(),
-        "41"
+        expected_committed_seq
     );
     let moved_store =
         crate::index::version_store::VersionStore::open(&temp_dir.path().join("destination"))
@@ -3426,11 +4134,11 @@ async fn create_failed_boundary_run(
             vec![
                 (
                     replicated_doc("boundary-a", "first durable receipt"),
-                    ReplicatedWriteOrigin::new(10_000, "node-a".to_string()),
+                    ReplicatedWriteOrigin::new(10_000, "node-a".to_string()).with_origin_seq(100),
                 ),
                 (
                     replicated_doc("boundary-b", "second durable receipt"),
-                    ReplicatedWriteOrigin::new(20_000, "node-b".to_string()),
+                    ReplicatedWriteOrigin::new(20_000, "node-b".to_string()).with_origin_seq(101),
                 ),
             ],
         )
@@ -3603,13 +4311,27 @@ async fn assert_boundary_recovered(
             &restarted,
             tenant_id,
             "boundary-a",
-            &crate::index::version_store::VersionRecord::new(10_000, "node-a", false, 2),
+            &crate::index::version_store::VersionRecord::new(10_000, "node-a", false, 2)
+                .with_origin_proof(
+                    100,
+                    crate::index::oplog::upsert_effect_digest(&replicated_doc(
+                        "boundary-a",
+                        "first durable receipt",
+                    )),
+                ),
         );
         assert_version_tuple(
             &restarted,
             tenant_id,
             "boundary-b",
-            &crate::index::version_store::VersionRecord::new(20_000, "node-b", false, 3),
+            &crate::index::version_store::VersionRecord::new(20_000, "node-b", false, 3)
+                .with_origin_proof(
+                    101,
+                    crate::index::oplog::upsert_effect_digest(&replicated_doc(
+                        "boundary-b",
+                        "second durable receipt",
+                    )),
+                ),
         );
     }
     assert_eq!(tenant_admission_record_count(temp_dir.path(), tenant_id), 0);
@@ -3745,6 +4467,7 @@ async fn post_commit_finalization_failure_keeps_admission_and_never_succeeds_tas
     manager.create_tenant(tenant_id).unwrap();
     let tenant_path = temp_dir.path().join(tenant_id);
     let committed_seq_path = tenant_path.join("committed_seq");
+    let oplog = manager.get_or_create_oplog_result(tenant_id).unwrap();
     assert!(std::fs::symlink_metadata(&committed_seq_path)
         .unwrap()
         .file_type()
@@ -3792,6 +4515,24 @@ async fn post_commit_finalization_failure_keeps_admission_and_never_succeeds_tas
             .map(|record| record.oplog_seq),
         Some(1),
         "the version transaction must complete before the injected sidecar failure"
+    );
+
+    let poisoned_tail = oplog.current_seq();
+    let append_result = manager
+        .append_oplog(
+            tenant_id,
+            "settings",
+            serde_json::json!({"searchableAttributes": ["title"]}),
+        )
+        .await;
+    assert!(
+        append_result.is_err(),
+        "poisoned finalization must reject taskless publication"
+    );
+    assert_eq!(
+        oplog.current_seq(),
+        poisoned_tail,
+        "post-Tantivy publication failure must block taskless finalization until recovery"
     );
 }
 
@@ -3900,6 +4641,7 @@ async fn replay_config_ops_surfaces_settings_write_failures() {
             serde_json::json!({
                 "searchableAttributes": ["title"]
             }),
+            crate::index::oplog::AppendDurability::Synced,
         )
         .unwrap();
     let ops = oplog.read_since(0).unwrap();
@@ -3911,8 +4653,38 @@ async fn replay_config_ops_surfaces_settings_write_failures() {
     );
 }
 
+#[test]
+fn metadata_oplog_classification_has_one_immediate_commit_owner() {
+    for op_type in [
+        "settings",
+        "save_synonym",
+        "save_synonyms",
+        "delete_synonym",
+        "clear_synonyms",
+        "save_rule",
+        "save_rules",
+        "delete_rule",
+        "clear_rules",
+        "clear_index",
+        "move_index",
+        "copy_index",
+    ] {
+        assert!(
+            is_immediately_committed_op(op_type),
+            "{op_type} must use immediate durable publication"
+        );
+    }
+
+    for op_type in ["upsert", "delete", "compact", "unknown"] {
+        assert!(
+            !is_immediately_committed_op(op_type),
+            "{op_type} must remain on the document/buffered path"
+        );
+    }
+}
+
 #[tokio::test]
-async fn synchronous_metadata_oplog_appends_advance_committed_seq() {
+async fn metadata_oplog_appends_are_synced_and_advance_their_own_sequence() {
     let temp_dir = TempDir::new().unwrap();
     let manager = IndexManager::new(temp_dir.path());
     let tenant_id = "metadata_committed_seq";
@@ -3932,8 +4704,14 @@ async fn synchronous_metadata_oplog_appends_advance_committed_seq() {
         ("save_rules", serde_json::json!({"rules": []})),
         ("delete_rule", serde_json::json!({"objectID": "rule_1"})),
         ("clear_rules", serde_json::json!({})),
+        ("clear_index", serde_json::json!({})),
+        ("move_index", serde_json::json!({})),
+        ("copy_index", serde_json::json!({})),
     ] {
-        manager.append_oplog(tenant_id, op_type, payload);
+        manager
+            .append_oplog(tenant_id, op_type, payload)
+            .await
+            .unwrap();
         let current_seq = manager
             .get_or_create_oplog_result(tenant_id)
             .unwrap()
@@ -3941,9 +4719,296 @@ async fn synchronous_metadata_oplog_appends_advance_committed_seq() {
         assert_eq!(
             crate::index::oplog::read_committed_seq(&tenant_path),
             current_seq,
-            "{op_type} is a synchronous metadata write and must advance committed_seq"
+            "{op_type} must advance committed_seq to its own appended sequence"
         );
     }
+
+    manager
+        .append_oplog(
+            tenant_id,
+            "upsert",
+            serde_json::json!({"objectID": "buffered-document"}),
+        )
+        .await
+        .unwrap();
+    let oplog = manager.get_or_create_oplog_result(tenant_id).unwrap();
+    assert_eq!(oplog.current_seq(), 13);
+    assert_eq!(
+        crate::index::oplog::read_committed_seq(&tenant_path),
+        12,
+        "document operations must remain buffered and unpublished by this path"
+    );
+}
+
+#[tokio::test]
+async fn metadata_oplog_every_immediate_operation_uses_synced_append() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+
+    for (ordinal, op_type) in [
+        "settings",
+        "save_synonym",
+        "save_synonyms",
+        "delete_synonym",
+        "clear_synonyms",
+        "save_rule",
+        "save_rules",
+        "delete_rule",
+        "clear_rules",
+        "clear_index",
+        "move_index",
+        "copy_index",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tenant_id = format!("metadata_synced_{ordinal}_{op_type}");
+        manager.create_tenant(&tenant_id).unwrap();
+        let fault = crate::index::write_queue::fail_next_finalization_for_test(
+            &tenant_id,
+            FinalizationFaultPoint::BeforeTasklessOplogRowSync,
+        );
+
+        let result = manager
+            .append_oplog(&tenant_id, op_type, serde_json::json!({}))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "{op_type} must reach the synced fault seam"
+        );
+        assert!(
+            fault.was_triggered(),
+            "{op_type} must consume the synced fault"
+        );
+        let oplog = manager.get_or_create_oplog_result(&tenant_id).unwrap();
+        assert_eq!(
+            oplog.current_seq(),
+            0,
+            "{op_type} must roll back its failed row"
+        );
+        assert_eq!(
+            crate::index::oplog::read_committed_seq(&temp_dir.path().join(&tenant_id)),
+            0,
+            "{op_type} must preserve the prior watermark"
+        );
+    }
+}
+
+#[tokio::test]
+async fn metadata_oplog_invalid_tenant_acquisition_is_not_cached_or_reported_as_success() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let tenant_id = "../metadata_invalid_tenant";
+
+    let result = manager
+        .append_oplog(tenant_id, "settings", serde_json::json!({}))
+        .await;
+
+    assert!(result.is_err());
+    assert!(!manager.oplogs.contains_key(tenant_id));
+    assert!(manager.get_oplog(tenant_id).is_none());
+}
+
+#[tokio::test]
+async fn metadata_oplog_unopenable_acquisition_is_not_cached_or_reported_as_success() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let tenant_id = "metadata_unopenable_oplog";
+    let tenant_path = temp_dir.path().join(tenant_id);
+    std::fs::create_dir_all(&tenant_path).unwrap();
+    std::fs::write(tenant_path.join("oplog"), b"not a directory").unwrap();
+
+    let result = manager
+        .append_oplog(tenant_id, "settings", serde_json::json!({}))
+        .await;
+
+    assert!(result.is_err());
+    assert!(!manager.oplogs.contains_key(tenant_id));
+    assert!(manager.get_oplog(tenant_id).is_none());
+}
+
+#[tokio::test]
+async fn metadata_oplog_poisoned_finalization_returns_error_without_changing_tail_or_watermark() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let tenant_id = "metadata_poisoned_finalization";
+    let tenant_path = temp_dir.path().join(tenant_id);
+    manager.create_tenant(tenant_id).unwrap();
+    manager
+        .append_oplog(tenant_id, "settings", serde_json::json!({"seed": true}))
+        .await
+        .unwrap();
+    let oplog = manager.get_or_create_oplog_result(tenant_id).unwrap();
+    let prior_tail = oplog.current_seq();
+    let prior_watermark = std::fs::read(tenant_path.join("committed_seq")).unwrap();
+    drop(oplog.acquire_finalization().await.unwrap());
+
+    let result = manager
+        .append_oplog(tenant_id, "settings", serde_json::json!({"failed": true}))
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(oplog.current_seq(), prior_tail);
+    assert_eq!(
+        std::fs::read(tenant_path.join("committed_seq")).unwrap(),
+        prior_watermark
+    );
+}
+
+#[tokio::test]
+async fn metadata_oplog_synced_append_failure_restores_prior_suffix_and_watermark() {
+    let temp_dir = TempDir::new().unwrap();
+    let tenant_id = "metadata_synced_append_rollback";
+    let tenant_path = temp_dir.path().join(tenant_id);
+    let manager = IndexManager::new(temp_dir.path());
+    manager.create_tenant(tenant_id).unwrap();
+    manager
+        .append_oplog(tenant_id, "settings", serde_json::json!({"seed": true}))
+        .await
+        .unwrap();
+    let prior_watermark = std::fs::read(tenant_path.join("committed_seq")).unwrap();
+    let fault = crate::index::write_queue::fail_next_finalization_for_test(
+        tenant_id,
+        FinalizationFaultPoint::BeforeTasklessOplogRowSync,
+    );
+
+    let result = manager
+        .append_oplog(tenant_id, "save_rule", serde_json::json!({"failed": true}))
+        .await;
+
+    assert!(result.is_err());
+    assert!(fault.was_triggered());
+    assert_eq!(
+        std::fs::read(tenant_path.join("committed_seq")).unwrap(),
+        prior_watermark
+    );
+    drop(manager);
+
+    let reopened = IndexManager::new(temp_dir.path());
+    let oplog = reopened.get_or_create_oplog_result(tenant_id).unwrap();
+    assert_eq!(oplog.current_seq(), 1);
+    assert_eq!(oplog.read_since(0).unwrap().len(), 1);
+    assert_eq!(oplog.committed_seq().unwrap(), Some(1));
+}
+
+async fn assert_metadata_oplog_rejects_invalid_watermark(
+    tenant_id: &str,
+    invalid_watermark: &[u8],
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let tenant_path = temp_dir.path().join(tenant_id);
+    manager.create_tenant(tenant_id).unwrap();
+    manager
+        .append_oplog(tenant_id, "settings", serde_json::json!({"seed": true}))
+        .await
+        .unwrap();
+    let watermark_path = tenant_path.join("committed_seq");
+    std::fs::write(&watermark_path, invalid_watermark).unwrap();
+
+    let result = manager
+        .append_oplog(
+            tenant_id,
+            "save_synonym",
+            serde_json::json!({"failed": true}),
+        )
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&watermark_path).unwrap(), invalid_watermark);
+    let oplog = manager.get_or_create_oplog_result(tenant_id).unwrap();
+    assert_eq!(
+        oplog.current_seq(),
+        2,
+        "the synced row precedes watermark validation"
+    );
+    assert_eq!(oplog.read_since(0).unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn metadata_oplog_malformed_watermark_is_preserved_and_returns_error() {
+    assert_metadata_oplog_rejects_invalid_watermark(
+        "metadata_malformed_watermark",
+        b"not-a-sequence\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn metadata_oplog_watermark_beyond_tail_is_preserved_and_returns_error() {
+    assert_metadata_oplog_rejects_invalid_watermark("metadata_watermark_beyond_tail", b"99").await;
+}
+
+#[tokio::test]
+async fn metadata_oplog_pre_watermark_fault_leaves_durable_row_unpublished() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = IndexManager::new(temp_dir.path());
+    let tenant_id = "metadata_pre_watermark_fault";
+    let tenant_path = temp_dir.path().join(tenant_id);
+    manager.create_tenant(tenant_id).unwrap();
+    manager
+        .append_oplog(tenant_id, "settings", serde_json::json!({"seed": true}))
+        .await
+        .unwrap();
+    let prior_watermark = std::fs::read(tenant_path.join("committed_seq")).unwrap();
+    let fault = crate::index::write_queue::fail_next_finalization_for_test(
+        tenant_id,
+        FinalizationFaultPoint::BeforeCommittedSeqPublication,
+    );
+
+    let result = manager
+        .append_oplog(tenant_id, "save_rule", serde_json::json!({"failed": true}))
+        .await;
+
+    assert!(result.is_err());
+    assert!(fault.was_triggered());
+    assert_eq!(
+        std::fs::read(tenant_path.join("committed_seq")).unwrap(),
+        prior_watermark
+    );
+    let oplog = manager.get_or_create_oplog_result(tenant_id).unwrap();
+    assert_eq!(oplog.current_seq(), 2);
+    assert_eq!(oplog.read_since(1).unwrap().len(), 1);
+    assert_eq!(oplog.committed_seq().unwrap(), Some(1));
+}
+
+#[tokio::test]
+async fn stopped_batch_cleanup_retracts_every_uncommitted_task_before_unblocking() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let tenant_id = "stopped_batch_cleanup";
+    let manager = IndexManager::new_with_node_id(temp_dir.path(), "local-node");
+    manager.create_tenant(tenant_id).unwrap();
+    let oplog = manager.get_or_create_oplog_result(tenant_id).unwrap();
+
+    let permit = oplog.acquire_finalization().await.unwrap();
+    oplog
+        .append_operations_for_task(
+            "task_stopped_batch_cleanup_one",
+            vec![crate::index::oplog::OpLogOperation::local(
+                "upsert",
+                serde_json::json!({"body": {"_id": "one"}}),
+            )],
+        )
+        .unwrap();
+    oplog
+        .append_operations_for_task(
+            "task_stopped_batch_cleanup_two",
+            vec![crate::index::oplog::OpLogOperation::local(
+                "upsert",
+                serde_json::json!({"body": {"_id": "two"}}),
+            )],
+        )
+        .unwrap();
+    drop(permit);
+
+    manager
+        .compensate_stopped_uncommitted_task(tenant_id, "task_stopped_batch_cleanup_one")
+        .unwrap();
+
+    assert!(oplog.read_since(0).unwrap().is_empty());
+    let mut ordinary = oplog.acquire_finalization().await.unwrap();
+    ordinary.mark_safe();
 }
 
 /// TODO: Document read_committed_seq_does_not_require_tenant_load.
@@ -3993,6 +5058,7 @@ fn setup_tenant_with_pending_document_recovery(base_path: &Path, tenant_id: &str
                     "title": "Concurrent recovery fixture"
                 }
             }),
+            crate::index::oplog::AppendDurability::Buffered,
         )
         .unwrap();
 
@@ -5979,6 +7045,32 @@ async fn tenant_doc_count_returns_correct_count() {
 
     let count = manager.tenant_doc_count("t1");
     assert_eq!(count, Some(3), "should have 3 docs after adding 3");
+}
+
+#[tokio::test]
+async fn tenant_durable_doc_count_reads_committed_unloaded_index_without_loading() {
+    let tmp = TempDir::new().unwrap();
+    let creator = IndexManager::new(tmp.path());
+    creator.create_tenant("durable_count").unwrap();
+    creator
+        .add_documents_sync(
+            "durable_count",
+            vec![
+                write_queue_test_document("d1", "one"),
+                write_queue_test_document("d2", "two"),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let reader = IndexManager::new(tmp.path());
+    assert_eq!(reader.loaded_count(), 0);
+    assert_eq!(reader.tenant_durable_doc_count("durable_count").unwrap(), 2);
+    assert_eq!(
+        reader.loaded_count(),
+        0,
+        "durable counting must not recover, replay, create a writer, or insert into loaded"
+    );
 }
 
 #[tokio::test]

@@ -477,6 +477,181 @@ async fn privacy_scrub_durability_ack_is_idempotent_after_exact_absence() {
     assert_eq!(body_json(duplicate).await, first_ack);
 }
 
+#[cfg(feature = "fault-injection")]
+#[derive(Clone, Copy)]
+enum PrivacyMetadataResource {
+    Synonym,
+    Rule,
+}
+
+#[cfg(feature = "fault-injection")]
+#[derive(Clone, Copy)]
+enum PrivacyMetadataFault {
+    BeforeRowSync,
+    BeforeWatermark,
+}
+
+#[cfg(feature = "fault-injection")]
+fn assert_privacy_metadata_resource_absent(
+    data_root: &std::path::Path,
+    tenant_id: &str,
+    resource: PrivacyMetadataResource,
+) {
+    let (resource_file, deleted_id) = match resource {
+        PrivacyMetadataResource::Synonym => ("synonyms.json", "kept-synonym"),
+        PrivacyMetadataResource::Rule => ("rules.json", "kept-rule"),
+    };
+    assert!(
+        !fs::read_to_string(data_root.join(tenant_id).join(resource_file))
+            .unwrap()
+            .contains(deleted_id),
+        "the resource mutation must precede failed oplog publication"
+    );
+}
+
+#[cfg(feature = "fault-injection")]
+fn assert_privacy_metadata_oplog_boundary(
+    data_root: &std::path::Path,
+    tenant_id: &str,
+    prior_seq: u64,
+    fault: PrivacyMetadataFault,
+) {
+    let reopened_manager = flapjack::IndexManager::new(data_root);
+    let reopened_oplog = reopened_manager.get_or_create_oplog(tenant_id).unwrap();
+    match fault {
+        PrivacyMetadataFault::BeforeRowSync => {
+            assert_eq!(reopened_oplog.current_seq(), prior_seq);
+            assert!(reopened_oplog.read_since(prior_seq).unwrap().is_empty());
+        }
+        PrivacyMetadataFault::BeforeWatermark => {
+            assert_eq!(reopened_oplog.current_seq(), prior_seq + 1);
+            assert_eq!(reopened_oplog.read_since(prior_seq).unwrap().len(), 1);
+            assert_eq!(reopened_oplog.committed_seq().unwrap(), Some(prior_seq));
+        }
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+async fn assert_privacy_scrub_metadata_oplog_failure(
+    tenant_id: &str,
+    resource: PrivacyMetadataResource,
+    fault: PrivacyMetadataFault,
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&temp_dir)
+        .with_analytics()
+        .build_shared();
+    let key_store = Arc::new(KeyStore::load_or_create(temp_dir.path(), "admin-key"));
+    let private_key = privacy_scrub_private_key(&key_store);
+    seed_preexisting_target_resources(&state, tenant_id).await;
+    let generation = format!("generation-{tenant_id}");
+    write_current_generation_evidence(&state.manager.base_path, tenant_id, &generation);
+    let app = privacy_scrub_test_router(&temp_dir, Arc::clone(&state), key_store);
+    let payload = json!({
+        "scrubId": format!("scrub-{tenant_id}"),
+        "tenant": tenant_id,
+        "expectedGeneration": generation,
+        "objectIDs": [],
+        "synonymIDs": if matches!(resource, PrivacyMetadataResource::Synonym) {
+            json!(["kept-synonym"])
+        } else {
+            json!([])
+        },
+        "ruleIDs": if matches!(resource, PrivacyMetadataResource::Rule) {
+            json!(["kept-rule"])
+        } else {
+            json!([])
+        }
+    });
+    let oplog = state.manager.get_or_create_oplog(tenant_id).unwrap();
+    let prior_seq = oplog.current_seq();
+    let watermark_path = temp_dir.path().join(tenant_id).join("committed_seq");
+    let prior_watermark = fs::read(&watermark_path).unwrap();
+
+    let response = match fault {
+        PrivacyMetadataFault::BeforeRowSync => {
+            let _fault = state
+                .manager
+                .fail_next_taskless_oplog_row_sync_for_test(tenant_id);
+            post_privacy_scrub(&app, &private_key, payload.clone()).await
+        }
+        PrivacyMetadataFault::BeforeWatermark => {
+            let _fault = state
+                .manager
+                .fail_next_committed_seq_publication_for_test(tenant_id);
+            post_privacy_scrub(&app, &private_key, payload.clone()).await
+        }
+    };
+
+    assert!(!response.status().is_success());
+    assert_ne!(body_json(response).await["disposition"], "acknowledged");
+    let spool = SpoolStore::new(&state.manager.base_path, SpoolLimits::default()).unwrap();
+    let jobs = spool.job_uuids().unwrap();
+    assert_eq!(jobs.len(), 1);
+    let failed_phase = spool.read_migration_phase(jobs[0]).unwrap();
+    assert_eq!(failed_phase.disposition, MigrationDisposition::Failed);
+    assert!(failed_phase.terminal_at.is_some());
+    assert_privacy_metadata_resource_absent(temp_dir.path(), tenant_id, resource);
+    assert_eq!(fs::read(&watermark_path).unwrap(), prior_watermark);
+    assert_privacy_metadata_oplog_boundary(temp_dir.path(), tenant_id, prior_seq, fault);
+
+    let replay = post_privacy_scrub(&app, &private_key, payload).await;
+    assert!(!replay.status().is_success());
+    assert_ne!(body_json(replay).await["disposition"], "acknowledged");
+    assert_eq!(
+        SpoolStore::new(&state.manager.base_path, SpoolLimits::default())
+            .unwrap()
+            .read_migration_phase(jobs[0])
+            .unwrap()
+            .disposition,
+        MigrationDisposition::Failed
+    );
+}
+
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+async fn metadata_oplog_privacy_synonym_scrub_fails_before_row_sync() {
+    assert_privacy_scrub_metadata_oplog_failure(
+        "metadata_privacy_synonym_row_sync",
+        PrivacyMetadataResource::Synonym,
+        PrivacyMetadataFault::BeforeRowSync,
+    )
+    .await;
+}
+
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+async fn metadata_oplog_privacy_synonym_scrub_fails_before_watermark() {
+    assert_privacy_scrub_metadata_oplog_failure(
+        "metadata_privacy_synonym_watermark",
+        PrivacyMetadataResource::Synonym,
+        PrivacyMetadataFault::BeforeWatermark,
+    )
+    .await;
+}
+
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+async fn metadata_oplog_privacy_rule_scrub_fails_before_row_sync() {
+    assert_privacy_scrub_metadata_oplog_failure(
+        "metadata_privacy_rule_row_sync",
+        PrivacyMetadataResource::Rule,
+        PrivacyMetadataFault::BeforeRowSync,
+    )
+    .await;
+}
+
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+async fn metadata_oplog_privacy_rule_scrub_fails_before_watermark() {
+    assert_privacy_scrub_metadata_oplog_failure(
+        "metadata_privacy_rule_watermark",
+        PrivacyMetadataResource::Rule,
+        PrivacyMetadataFault::BeforeWatermark,
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn privacy_scrub_durability_concurrent_duplicate_gets_no_false_ack() {
     let tmp = TempDir::new().unwrap();

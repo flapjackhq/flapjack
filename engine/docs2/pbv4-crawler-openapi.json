@@ -1,0 +1,670 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Flapjack PBV4 Internal Crawler API",
+    "description": "Node-admin-only run_id keyed start, cancel, outcome, and acknowledgement protocol. HTTP indexes are projections; PublicationJournal, PublicationTombstone, and their handoff remain durable truth.",
+    "license": {
+      "name": "Elastic-2.0",
+      "identifier": "Elastic-2.0"
+    },
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/internal/crawler/runs": {
+      "post": {
+        "tags": [
+          "internal-crawler"
+        ],
+        "operationId": "start_crawler_run",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CrawlerRunStartRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Current durable run state or terminal outcome",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CrawlerRunOutcome"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or out-of-policy request"
+          },
+          "404": {
+            "description": "Missing or invalid application ID and missing, invalid, or non-admin API keys are concealed as not found"
+          },
+          "409": {
+            "description": "run_id replay disagrees with retained truth"
+          },
+          "429": {
+            "description": "Unacknowledged durable run capacity is exhausted"
+          },
+          "503": {
+            "description": "Crawler runtime is not enabled"
+          }
+        },
+        "security": [
+          {
+            "api_key": [],
+            "application_id": []
+          }
+        ]
+      }
+    },
+    "/internal/crawler/runs/{run_id}": {
+      "get": {
+        "tags": [
+          "internal-crawler"
+        ],
+        "operationId": "get_crawler_run",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "description": "Durable UUIDv7 crawler run identity",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/CrawlerRunId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current durable run state or terminal outcome",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CrawlerRunOutcome"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid run_id"
+          },
+          "404": {
+            "description": "No durable run truth is retained for run_id, or authentication failed and was concealed"
+          },
+          "503": {
+            "description": "Crawler runtime is not enabled"
+          }
+        },
+        "security": [
+          {
+            "api_key": [],
+            "application_id": []
+          }
+        ]
+      }
+    },
+    "/internal/crawler/runs/{run_id}/ack": {
+      "post": {
+        "tags": [
+          "internal-crawler"
+        ],
+        "operationId": "ack_crawler_run",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "description": "Durable UUIDv7 crawler run identity",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/CrawlerRunId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Durable idempotent acknowledgement",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CrawlerRunAckResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid run_id"
+          },
+          "404": {
+            "description": "No terminal run truth is retained for run_id, or authentication failed and was concealed"
+          },
+          "409": {
+            "description": "Run is not terminal"
+          },
+          "503": {
+            "description": "Crawler runtime is not enabled"
+          }
+        },
+        "security": [
+          {
+            "api_key": [],
+            "application_id": []
+          }
+        ]
+      }
+    },
+    "/internal/crawler/runs/{run_id}/cancel": {
+      "post": {
+        "tags": [
+          "internal-crawler"
+        ],
+        "operationId": "cancel_crawler_run",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "description": "Durable UUIDv7 crawler run identity",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/CrawlerRunId"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Durable cancellation disposition",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CrawlerRunCancelResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid run_id"
+          },
+          "404": {
+            "description": "Authentication failures are concealed as not found"
+          },
+          "503": {
+            "description": "Crawler runtime is not enabled"
+          }
+        },
+        "security": [
+          {
+            "api_key": [],
+            "application_id": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CrawlerCancelDisposition": {
+        "type": "string",
+        "enum": [
+          "cancel_requested",
+          "already_requested",
+          "already_terminal"
+        ]
+      },
+      "CrawlerCanonicalField": {
+        "type": "string",
+        "enum": [
+          "url",
+          "title",
+          "metadata",
+          "text"
+        ]
+      },
+      "CrawlerObjectIdAlgorithm": {
+        "type": "string",
+        "enum": [
+          "sha256"
+        ]
+      },
+      "CrawlerObjectIdDerivation": {
+        "type": "object",
+        "required": [
+          "source",
+          "algorithm"
+        ],
+        "properties": {
+          "algorithm": {
+            "$ref": "#/components/schemas/CrawlerObjectIdAlgorithm"
+          },
+          "source": {
+            "$ref": "#/components/schemas/CrawlerCanonicalField"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CrawlerPublicationFact": {
+        "type": "object",
+        "required": [
+          "destination_index",
+          "task_id",
+          "transaction_id",
+          "generation",
+          "digest"
+        ],
+        "properties": {
+          "destination_index": {
+            "type": "string"
+          },
+          "digest": {
+            "type": "string"
+          },
+          "generation": {
+            "type": "string"
+          },
+          "task_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "transaction_id": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CrawlerRunAckResponse": {
+        "type": "object",
+        "required": [
+          "schema_version",
+          "run_id",
+          "acknowledged"
+        ],
+        "properties": {
+          "acknowledged": {
+            "type": "boolean"
+          },
+          "run_id": {
+            "$ref": "#/components/schemas/CrawlerRunId"
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "CrawlerRunCancelResponse": {
+        "type": "object",
+        "required": [
+          "schema_version",
+          "run_id",
+          "disposition"
+        ],
+        "properties": {
+          "disposition": {
+            "$ref": "#/components/schemas/CrawlerCancelDisposition"
+          },
+          "run_id": {
+            "$ref": "#/components/schemas/CrawlerRunId"
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "CrawlerRunCounters": {
+        "type": "object",
+        "required": [
+          "fetched",
+          "discovered",
+          "transformed",
+          "published"
+        ],
+        "properties": {
+          "discovered": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "fetched": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "published": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "transformed": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "CrawlerRunErrorCode": {
+        "type": "string",
+        "enum": [
+          "target_rejected",
+          "dns_resolution_failed",
+          "redirect_rejected",
+          "content_type_rejected",
+          "fetch_timeout",
+          "body_limit_exceeded",
+          "crawl_limit_exceeded",
+          "transform_invalid",
+          "transform_failed",
+          "publication_failed",
+          "deadline_exceeded",
+          "worker_lost",
+          "internal_failure"
+        ]
+      },
+      "CrawlerRunId": {
+        "type": "string",
+        "format": "uuid",
+        "description": "Caller-generated UUIDv7 crawler run identity",
+        "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-7[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+      },
+      "CrawlerRunLimits": {
+        "type": "object",
+        "required": [
+          "max_depth",
+          "max_pages",
+          "max_decoded_body_bytes",
+          "max_record_bytes",
+          "max_records",
+          "max_concurrency"
+        ],
+        "properties": {
+          "max_concurrency": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "max_decoded_body_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_depth": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "max_pages": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "max_record_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_records": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "CrawlerRunOutcome": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "schema_version",
+              "run_id",
+              "counters",
+              "status"
+            ],
+            "properties": {
+              "counters": {
+                "$ref": "#/components/schemas/CrawlerRunCounters"
+              },
+              "run_id": {
+                "$ref": "#/components/schemas/CrawlerRunId"
+              },
+              "schema_version": {
+                "type": "integer",
+                "format": "int32",
+                "maximum": 1,
+                "minimum": 1
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "running"
+                ]
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "schema_version",
+              "run_id",
+              "counters",
+              "duration_ms",
+              "publication",
+              "status"
+            ],
+            "properties": {
+              "counters": {
+                "$ref": "#/components/schemas/CrawlerRunCounters"
+              },
+              "duration_ms": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "publication": {
+                "$ref": "#/components/schemas/CrawlerPublicationFact"
+              },
+              "run_id": {
+                "$ref": "#/components/schemas/CrawlerRunId"
+              },
+              "schema_version": {
+                "type": "integer",
+                "format": "int32",
+                "maximum": 1,
+                "minimum": 1
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "succeeded"
+                ]
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "schema_version",
+              "run_id",
+              "counters",
+              "duration_ms",
+              "status"
+            ],
+            "properties": {
+              "counters": {
+                "$ref": "#/components/schemas/CrawlerRunCounters"
+              },
+              "duration_ms": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "run_id": {
+                "$ref": "#/components/schemas/CrawlerRunId"
+              },
+              "schema_version": {
+                "type": "integer",
+                "format": "int32",
+                "maximum": 1,
+                "minimum": 1
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "canceled"
+                ]
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "schema_version",
+              "run_id",
+              "counters",
+              "duration_ms",
+              "error_code",
+              "status"
+            ],
+            "properties": {
+              "counters": {
+                "$ref": "#/components/schemas/CrawlerRunCounters"
+              },
+              "duration_ms": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "error_code": {
+                "$ref": "#/components/schemas/CrawlerRunErrorCode"
+              },
+              "run_id": {
+                "$ref": "#/components/schemas/CrawlerRunId"
+              },
+              "schema_version": {
+                "type": "integer",
+                "format": "int32",
+                "maximum": 1,
+                "minimum": 1
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "failed"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        ]
+      },
+      "CrawlerRunStartRequest": {
+        "type": "object",
+        "required": [
+          "schema_version",
+          "run_id",
+          "destination_index",
+          "start_url",
+          "limits",
+          "transform",
+          "max_run_duration_ms"
+        ],
+        "properties": {
+          "destination_index": {
+            "type": "string"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/CrawlerRunLimits"
+          },
+          "max_run_duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "run_id": {
+            "$ref": "#/components/schemas/CrawlerRunId",
+            "description": "Caller-generated UUIDv7. Its embedded timestamp makes the seven-day\nreplay admission window enforceable after acknowledged truth is pruned."
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 1
+          },
+          "start_url": {
+            "type": "string"
+          },
+          "transform": {
+            "$ref": "#/components/schemas/CrawlerTransform"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CrawlerSelectedField": {
+        "type": "object",
+        "description": "One selected canonical extraction field. Omission is the PBV4 drop\noperation; changing `output` is its rename operation.",
+        "required": [
+          "source",
+          "output"
+        ],
+        "properties": {
+          "output": {
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/CrawlerCanonicalField"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CrawlerTransform": {
+        "type": "object",
+        "required": [
+          "fields",
+          "object_id"
+        ],
+        "properties": {
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CrawlerSelectedField"
+            }
+          },
+          "object_id": {
+            "$ref": "#/components/schemas/CrawlerObjectIdDerivation"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "securitySchemes": {
+      "api_key": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-algolia-api-key"
+      },
+      "application_id": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-algolia-application-id"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "internal-crawler",
+      "description": "PBV4 internal crawler run protocol"
+    }
+  ]
+}

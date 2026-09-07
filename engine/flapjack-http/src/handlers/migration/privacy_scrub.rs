@@ -348,27 +348,47 @@ async fn run_privacy_scrub(
             .map_err(|error| {
                 json_error_parts(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
             })?;
-        state.manager.append_oplog(
-            &intent.tenant,
-            "delete_synonym",
-            serde_json::json!({"objectID": synonym_id}),
-        );
+        state
+            .manager
+            .append_oplog(
+                &intent.tenant,
+                "delete_synonym",
+                serde_json::json!({"objectID": synonym_id}),
+            )
+            .await
+            .map_err(|error| fail_privacy_scrub_publication(spool, job_uuid, error))?;
     }
     for rule_id in &intent.rule_ids {
         delete_resource_item::<RuleStore>(state.manager.as_ref(), &intent.tenant, rule_id)
             .map_err(|error| {
                 json_error_parts(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
             })?;
-        state.manager.append_oplog(
-            &intent.tenant,
-            "delete_rule",
-            serde_json::json!({"objectID": rule_id}),
-        );
+        state
+            .manager
+            .append_oplog(
+                &intent.tenant,
+                "delete_rule",
+                serde_json::json!({"objectID": rule_id}),
+            )
+            .await
+            .map_err(|error| fail_privacy_scrub_publication(spool, job_uuid, error))?;
     }
     assert_privacy_scrub_absence(state, intent).map_err(|error| {
         let _ = spool.fail_migration(job_uuid);
         json_error_parts(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
     })
+}
+
+fn fail_privacy_scrub_publication(
+    spool: &spool::SpoolStore,
+    job_uuid: Uuid,
+    error: flapjack::error::FlapjackError,
+) -> MigrateError {
+    tracing::error!(%job_uuid, "privacy scrub oplog publication failed: {error}");
+    match spool.fail_migration(job_uuid) {
+        Ok(_) => json_error_parts(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        Err(spool_error) => privacy_scrub_spool_error(spool_error),
+    }
 }
 
 fn assert_privacy_scrub_absence(

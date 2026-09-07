@@ -47,6 +47,20 @@ pub fn atomic_write_file(path: &Path, payload: &[u8]) -> std::io::Result<()> {
     utils::atomic_write(path, payload)
 }
 
+/// Durably remove an authoritative file and sync its parent directory.
+pub fn durable_remove_file(path: &Path) -> std::io::Result<()> {
+    utils::durable_remove_file(path)
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+pub use utils::DirectorySyncFaultGuard;
+
+/// Inject one failure into the next directory sync at `path`.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn fail_next_directory_sync_for_test(path: &Path) -> DirectorySyncFaultGuard {
+    utils::fail_next_directory_sync_for_test(path, utils::DirectorySyncFaultPoint::Sync)
+}
+
 /// Durably replace a private file without exposing a partially written payload.
 ///
 /// This is the narrow cross-crate facade for the canonical atomic-write owner in
@@ -66,6 +80,16 @@ pub fn atomic_write_private_file(path: &Path, payload: &[u8]) -> std::io::Result
             Ok(())
         },
     )
+}
+
+/// Create or validate a private directory and durably publish its parent entry.
+///
+/// This is the narrow cross-crate facade for the directory owner in
+/// `index::utils`: mode `0700` on Unix, rejection of files and symlinks, and a
+/// parent-directory sync so a first-ever private state directory cannot vanish
+/// after power loss.
+pub fn ensure_private_directory(path: &Path) -> std::io::Result<()> {
+    utils::ensure_private_directory(path)
 }
 
 /// Cached facet query results per tenant index: `(timestamp, hit_count, facet_values, facet_stats, exhaustive)`.

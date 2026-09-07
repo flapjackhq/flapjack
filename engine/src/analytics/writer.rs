@@ -20,6 +20,7 @@ use super::hll::HllSketch;
 use super::manifest::{manifest_artifact_path, RollupManifest, WindowEntry, WindowStatus};
 use super::schema::{
     insight_event_schema, search_event_schema, search_rollup_schema, InsightEvent, SearchEvent,
+    RECOMMENDATION_FALLBACK_IDENTITY_MARKER, RECOMMENDATION_REQUEST_EVENT_TYPE,
 };
 
 static PARQUET_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -957,6 +958,20 @@ fn truncate_user_ip_for_analytics(user_ip: Option<&str>) -> Option<String> {
     Some(truncated.to_string())
 }
 
+/// Resolve the persisted identity for a Recommend analytics request.
+///
+/// Stable tokens win. Otherwise the canonical client address is coarsened at
+/// this analytics ingestion boundary; invalid or absent addresses collapse to
+/// one non-selectable anonymous bucket rather than preserving raw input.
+pub(crate) fn recommendation_user_identity(
+    user_token: Option<&str>,
+    user_ip: Option<&str>,
+) -> String {
+    user_token.map(str::to_owned).unwrap_or_else(|| {
+        truncate_user_ip_for_analytics(user_ip).unwrap_or_else(|| "anonymous".to_string())
+    })
+}
+
 /// Convert a slice of search events into an Arrow `RecordBatch`.
 ///
 /// Maps each `SearchEvent` field to a typed Arrow array column, preserving nullability for optional fields.
@@ -1329,10 +1344,27 @@ fn build_keep_mask(batch: &RecordBatch, user_token: &str) -> Result<BooleanArray
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| "user_token column is not Utf8".to_string())?;
+    let event_type_col = batch
+        .schema()
+        .index_of("event_type")
+        .ok()
+        .and_then(|index| batch.column(index).as_any().downcast_ref::<StringArray>());
+    let authenticated_user_token_col = batch
+        .schema()
+        .index_of("authenticated_user_token")
+        .ok()
+        .and_then(|index| batch.column(index).as_any().downcast_ref::<StringArray>());
 
     let mut keep = BooleanBuilder::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
-        let retain = user_col.is_null(row) || user_col.value(row) != user_token;
+        let is_fallback_recommendation = event_type_col.is_some_and(|column| {
+            !column.is_null(row) && column.value(row) == RECOMMENDATION_REQUEST_EVENT_TYPE
+        }) && authenticated_user_token_col.is_some_and(|column| {
+            !column.is_null(row) && column.value(row) == RECOMMENDATION_FALLBACK_IDENTITY_MARKER
+        });
+        let retain = user_col.is_null(row)
+            || user_col.value(row) != user_token
+            || is_fallback_recommendation;
         keep.append_value(retain);
     }
     Ok(keep.finish())
@@ -1393,6 +1425,27 @@ mod tests {
         assert_eq!(
             truncate_user_ip_for_analytics(Some("not-an-ip-address")),
             None
+        );
+    }
+
+    #[test]
+    fn recommendation_identity_prefers_token_and_never_persists_raw_fallback_ip() {
+        assert_eq!(
+            recommendation_user_identity(Some("stable_user-1"), Some("203.0.113.47")),
+            "stable_user-1"
+        );
+        assert_eq!(
+            recommendation_user_identity(None, Some("203.0.113.47")),
+            "203.0.113.0"
+        );
+        assert_eq!(
+            recommendation_user_identity(None, Some("2001:db8:1234:5678::1")),
+            "2001:db8:1234::"
+        );
+        assert_eq!(recommendation_user_identity(None, None), "anonymous");
+        assert_eq!(
+            recommendation_user_identity(None, Some("not-an-ip-address")),
+            "anonymous"
         );
     }
 

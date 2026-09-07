@@ -1,10 +1,12 @@
 //! Stub summary for engine/flapjack-http/src/handlers/experiments_tests.rs.
 use super::*;
+use crate::api_profile::ApiProfile;
+use crate::auth::{ApiKey, SecuredKeyRestrictions};
 use crate::test_helpers::{body_json, send_empty_request, send_json_request};
 use axum::{
     http::Method,
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use flapjack::analytics::schema::SearchEvent;
 use flapjack::analytics::AnalyticsQueryEngine;
@@ -31,6 +33,24 @@ fn make_experiments_state_with_analytics_engine(
 
 fn make_experiments_state(tmp: &TempDir) -> Arc<AppState> {
     make_experiments_state_with_analytics_engine(tmp, None)
+}
+
+fn experiment_api_key(indexes: &[&str]) -> ApiKey {
+    ApiKey {
+        hash: "experiment-test-key".to_string(),
+        salt: "experiment-test-salt".to_string(),
+        hmac_key: None,
+        created_at: 0,
+        acl: vec!["analytics".to_string(), "editSettings".to_string()],
+        description: "experiment handler test key".to_string(),
+        indexes: indexes.iter().map(|index| (*index).to_string()).collect(),
+        max_hits_per_query: 0,
+        max_queries_per_ip_per_hour: 0,
+        query_parameters: String::new(),
+        referers: Vec::new(),
+        restrict_sources: None,
+        validity: 0,
+    }
 }
 
 /// Write synthetic `SearchEvent` records to the analytics directory for a given index, creating the required directory structure on disk.
@@ -408,6 +428,107 @@ async fn create_experiment_returns_200() {
         .as_i64()
         .expect("create returns numeric abTestID");
     assert_algolia_action_shape(&json, id, "products");
+}
+
+#[tokio::test]
+async fn id_routes_reject_disallowed_variant_index_before_reads_and_effects() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_experiments_state(&tmp);
+    let store = state.experiment_store.as_ref().unwrap().clone();
+    let app = app_router(state).layer(Extension(experiment_api_key(&["products"])));
+
+    let id = create_experiment_and_get_id(&app).await;
+    let uuid = store
+        .get_uuid_for_numeric(id)
+        .expect("created experiment must have UUID mapping");
+
+    for (method, path) in [
+        (Method::GET, format!("/2/abtests/{id}")),
+        (Method::GET, format!("/2/abtests/{id}/results")),
+        (Method::DELETE, format!("/2/abtests/{id}")),
+        (Method::POST, format!("/2/abtests/{id}/start")),
+    ] {
+        let response = send_empty_request(&app, method, &path).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+
+    let update_response = send_json_request(
+        &app,
+        Method::PUT,
+        &format!("/2/abtests/{id}"),
+        update_experiment_body(),
+    )
+    .await;
+    assert_eq!(update_response.status(), StatusCode::FORBIDDEN);
+    assert!(matches!(
+        store.get(&uuid).unwrap().status,
+        ExperimentStatus::Draft
+    ));
+
+    store.start(&uuid).unwrap();
+
+    let stop_response =
+        send_empty_request(&app, Method::POST, &format!("/2/abtests/{id}/stop")).await;
+    assert_eq!(stop_response.status(), StatusCode::FORBIDDEN);
+
+    let conclude_response = send_json_request(
+        &app,
+        Method::POST,
+        &format!("/2/abtests/{id}/conclude"),
+        conclude_experiment_body(),
+    )
+    .await;
+    assert_eq!(conclude_response.status(), StatusCode::FORBIDDEN);
+    assert!(matches!(
+        store.get(&uuid).unwrap().status,
+        ExperimentStatus::Running
+    ));
+}
+
+#[tokio::test]
+async fn id_routes_enforce_secured_key_index_restrictions_after_load() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_experiments_state(&tmp);
+    let app = app_router(state)
+        .layer(Extension(experiment_api_key(&["products*"])))
+        .layer(Extension(SecuredKeyRestrictions {
+            restrict_indices: Some(vec!["products".to_string()]),
+            ..SecuredKeyRestrictions::default()
+        }));
+
+    let id = create_experiment_and_get_id(&app).await;
+    let response = send_empty_request(&app, Method::GET, &format!("/2/abtests/{id}")).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn paid_beta_v4_rejects_promoted_conclusion_before_effect() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_experiments_state(&tmp);
+    let store = state.experiment_store.as_ref().unwrap().clone();
+    let app = app_router(state).layer(Extension(ApiProfile::PaidBetaV4));
+
+    let id = create_experiment_and_get_id(&app).await;
+    let uuid = store
+        .get_uuid_for_numeric(id)
+        .expect("created experiment must have UUID mapping");
+    store.start(&uuid).unwrap();
+
+    let mut body = conclude_experiment_body();
+    body["promoted"] = serde_json::json!(true);
+    let response = send_json_request(
+        &app,
+        Method::POST,
+        &format!("/2/abtests/{id}/conclude"),
+        body,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(matches!(
+        store.get(&uuid).unwrap().status,
+        ExperimentStatus::Running
+    ));
 }
 
 #[tokio::test]
@@ -1002,6 +1123,137 @@ async fn conclude_experiment_returns_200_and_sets_conclusion() {
     assert_eq!(get_json["conclusion"]["controlMetric"], 0.12);
 }
 
+#[tokio::test]
+async fn get_and_list_expose_persisted_conclusion_contract() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_experiments_state(&tmp);
+    let app = app_router(state);
+
+    let id = create_experiment_and_get_id(&app).await;
+    let start_response =
+        send_empty_request(&app, Method::POST, &format!("/2/abtests/{id}/start")).await;
+    assert_eq!(start_response.status(), StatusCode::OK);
+    let conclude_response = send_json_request(
+        &app,
+        Method::POST,
+        &format!("/2/abtests/{id}/conclude"),
+        conclude_experiment_body(),
+    )
+    .await;
+    assert_eq!(conclude_response.status(), StatusCode::OK);
+
+    let get_response = send_empty_request(&app, Method::GET, &format!("/2/abtests/{id}")).await;
+    assert_eq!(get_response.status(), StatusCode::OK);
+    let get_json = body_json(get_response).await;
+    assert_eq!(get_json["status"], "stopped");
+    assert_eq!(
+        get_json["conclusion"],
+        serde_json::json!({
+            "winner": "variant",
+            "reason": "Statistically significant result",
+            "controlMetric": 0.12,
+            "variantMetric": 0.14,
+            "confidence": 0.97,
+            "significant": true,
+            "promoted": false
+        })
+    );
+
+    let stopped_id = create_experiment_and_get_id(&app).await;
+    let start_stopped_response = send_empty_request(
+        &app,
+        Method::POST,
+        &format!("/2/abtests/{stopped_id}/start"),
+    )
+    .await;
+    assert_eq!(start_stopped_response.status(), StatusCode::OK);
+    let stop_response =
+        send_empty_request(&app, Method::POST, &format!("/2/abtests/{stopped_id}/stop")).await;
+    assert_eq!(stop_response.status(), StatusCode::OK);
+    let stopped_get_response =
+        send_empty_request(&app, Method::GET, &format!("/2/abtests/{stopped_id}")).await;
+    assert_eq!(stopped_get_response.status(), StatusCode::OK);
+    let stopped_get_json = body_json(stopped_get_response).await;
+    assert_eq!(stopped_get_json["status"], "stopped");
+    assert!(stopped_get_json.get("conclusion").is_none());
+
+    let list_response = send_empty_request(&app, Method::GET, "/2/abtests").await;
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let list_json = body_json(list_response).await;
+    let abtests = list_json["abtests"].as_array().unwrap();
+    let listed_concluded = abtests.iter().find(|item| item["abTestID"] == id).unwrap();
+    assert_eq!(listed_concluded["status"], "stopped");
+    assert_eq!(listed_concluded["conclusion"], get_json["conclusion"]);
+    let listed_stopped = abtests
+        .iter()
+        .find(|item| item["abTestID"] == stopped_id)
+        .unwrap();
+    assert_eq!(listed_stopped["status"], "stopped");
+    assert!(listed_stopped.get("conclusion").is_none());
+
+    let conclusion_keys = sorted_object_keys(&get_json["conclusion"]);
+    assert_eq!(
+        conclusion_keys,
+        vec![
+            "confidence",
+            "controlMetric",
+            "promoted",
+            "reason",
+            "significant",
+            "variantMetric",
+            "winner",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn persisted_conclusion_contract_rejects_corrupt_get_and_list_reads() {
+    let conclusion = ExperimentConclusion {
+        winner: Some("variant".to_string()),
+        reason: "Persisted operator decision".to_string(),
+        control_metric: 0.12,
+        variant_metric: 0.14,
+        confidence: 0.97,
+        significant: true,
+        promoted: false,
+    };
+
+    for (status, persisted_conclusion) in [
+        (ExperimentStatus::Concluded, None),
+        (ExperimentStatus::Stopped, Some(conclusion)),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let state = make_experiments_state(&tmp);
+        let store = state.experiment_store.as_ref().unwrap().clone();
+        let mut corrupt = dto_algolia::algolia_create_to_experiment(
+            &serde_json::from_value(create_experiment_body()).unwrap(),
+        )
+        .unwrap();
+        corrupt.status = status;
+        corrupt.conclusion = persisted_conclusion;
+        let created = store.create(corrupt).unwrap();
+        let numeric_id = store.get_numeric_id(&created.id).unwrap();
+        let app = app_router(state);
+
+        for path in [format!("/2/abtests/{numeric_id}"), "/2/abtests".to_string()] {
+            let response = send_empty_request(&app, Method::GET, &path).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{path}"
+            );
+            assert_eq!(
+                body_json(response).await,
+                serde_json::json!({
+                    "message": "Internal server error",
+                    "status": 500
+                }),
+                "{path}"
+            );
+        }
+    }
+}
+
 /// Verify that concluding without specifying a winner (inconclusive result) returns 200 with a null winner and `significant: false`.
 #[tokio::test]
 async fn conclude_experiment_without_winner_returns_200() {
@@ -1355,9 +1607,9 @@ fn make_experiments_state_with_analytics(
         .build_shared()
 }
 
-/// Verify that results reflect real search and click metrics from seeded analytics events, with correct per-arm counts and non-zero CTR values.
+/// Prove the complete API lifecycle with deterministic stable-userToken analytics.
 #[tokio::test]
-async fn results_with_seeded_analytics_returns_real_metrics() {
+async fn deterministic_api_lifecycle_returns_known_experiment_results() {
     use flapjack::analytics::schema::{InsightEvent, SearchEvent};
     use flapjack::analytics::writer;
 
@@ -1367,21 +1619,23 @@ async fn results_with_seeded_analytics_returns_real_metrics() {
     let state = make_experiments_state_with_analytics(&tmp, &analytics_dir);
     let app = app_router(state.clone());
 
-    // Create and start an experiment
     let id = create_experiment_and_get_id(&app).await;
     let start_resp =
         send_empty_request(&app, Method::POST, &format!("/2/abtests/{id}/start")).await;
     assert_eq!(start_resp.status(), StatusCode::OK);
     let internal_id = get_internal_experiment_id(&app, id).await;
 
-    // Seed search events for the experiment
-    let mut search_events = Vec::new();
-    let mut click_events = Vec::new();
+    let mut search_events = Vec::with_capacity(400);
+    let mut click_events = Vec::with_capacity(390);
 
-    for i in 0..20u32 {
-        let variant = if i < 10 { "control" } else { "variant" };
-        let user = format!("user_{}", i % 4);
-        let qid = format!("qid_{}", i);
+    for i in 0..400u32 {
+        let (arm, arm_offset) = if i < 200 {
+            ("control", i)
+        } else {
+            ("variant", i - 200)
+        };
+        let user = format!("{arm}-stable-user-{arm_offset}");
+        let qid = format!("{arm}-query-{arm_offset}");
         search_events.push(SearchEvent {
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
             query: "test".to_string(),
@@ -1400,12 +1654,11 @@ async fn results_with_seeded_analytics_returns_real_metrics() {
             country: None,
             region: None,
             experiment_id: Some(internal_id.clone()),
-            variant_id: Some(variant.to_string()),
+            variant_id: Some(arm.to_string()),
             assignment_method: Some("user_token".to_string()),
         });
 
-        // Give some clicks (6 for control arm qids 0-5, 8 for variant arm qids 10-17)
-        if i < 6 || (10..18).contains(&i) {
+        if arm == "variant" || arm_offset < 190 {
             click_events.push(InsightEvent {
                 event_type: "click".to_string(),
                 event_subtype: None,
@@ -1430,23 +1683,65 @@ async fn results_with_seeded_analytics_returns_real_metrics() {
     writer::flush_search_events(&search_events, &searches_dir).unwrap();
     writer::flush_insight_events(&click_events, &events_dir).unwrap();
 
-    // Fetch results
     let resp = send_empty_request(&app, Method::GET, &format!("/2/abtests/{id}/results")).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
 
-    // Verify real metrics came through
-    assert_eq!(json["control"]["searches"], 10);
-    assert_eq!(json["variant"]["searches"], 10);
-    assert_eq!(json["control"]["clicks"].as_u64().unwrap(), 6);
-    assert_eq!(json["variant"]["clicks"].as_u64().unwrap(), 8);
-    assert!(json["control"]["ctr"].as_f64().unwrap() > 0.0);
-    assert!(json["variant"]["ctr"].as_f64().unwrap() > 0.0);
-
-    // Gate should not be ready (not enough data)
+    assert_eq!(json["status"], "running");
+    assert_eq!(json["control"]["searches"], 200);
+    assert_eq!(json["variant"]["searches"], 200);
+    assert_eq!(json["control"]["users"], 200);
+    assert_eq!(json["variant"]["users"], 200);
+    assert_eq!(json["control"]["clicks"], 190);
+    assert_eq!(json["variant"]["clicks"], 200);
+    assert_eq!(json["control"]["ctr"], 0.95);
+    assert_eq!(json["variant"]["ctr"], 1.0);
+    assert_eq!(json["noStableIdQueries"], 0);
+    assert_eq!(json["gate"]["requiredSearchesPerArm"], 177);
+    assert_eq!(json["gate"]["currentSearchesPerArm"], 200);
+    assert_eq!(json["gate"]["minimumNReached"], true);
+    assert_eq!(json["gate"]["minimumDaysReached"], false);
     assert_eq!(json["gate"]["readyToRead"], false);
-    // Significance should be null since gate not ready
-    assert!(json["significance"].is_null());
+    assert_eq!(json["significance"]["significant"], true);
+    assert_eq!(json["significance"]["winner"], "variant");
+
+    let stop_resp = send_empty_request(&app, Method::POST, &format!("/2/abtests/{id}/stop")).await;
+    assert_eq!(stop_resp.status(), StatusCode::OK);
+
+    let conclude_resp = send_json_request(
+        &app,
+        Method::POST,
+        &format!("/2/abtests/{id}/conclude"),
+        serde_json::json!({
+            "winner": "variant",
+            "reason": "Deterministic stable-userToken fixture",
+            "controlMetric": 0.95,
+            "variantMetric": 1.0,
+            "confidence": 0.99,
+            "significant": true,
+            "promoted": false
+        }),
+    )
+    .await;
+    assert_eq!(conclude_resp.status(), StatusCode::OK);
+
+    let concluded_resp =
+        send_empty_request(&app, Method::GET, &format!("/2/abtests/{id}/results")).await;
+    assert_eq!(concluded_resp.status(), StatusCode::OK);
+    let concluded = body_json(concluded_resp).await;
+    assert_eq!(concluded["status"], "concluded");
+    assert_eq!(concluded["control"]["searches"], 200);
+    assert_eq!(concluded["variant"]["searches"], 200);
+    assert_eq!(concluded["conclusion"]["winner"], "variant");
+    assert_eq!(
+        concluded["conclusion"]["reason"],
+        "Deterministic stable-userToken fixture"
+    );
+    assert_eq!(concluded["conclusion"]["controlMetric"], 0.95);
+    assert_eq!(concluded["conclusion"]["variantMetric"], 1.0);
+    assert_eq!(concluded["conclusion"]["confidence"], 0.99);
+    assert_eq!(concluded["conclusion"]["significant"], true);
+    assert_eq!(concluded["conclusion"]["promoted"], false);
 }
 
 /// Verify that all experiment endpoints return 503 Service Unavailable with an error message when `experiment_store` is `None`.
