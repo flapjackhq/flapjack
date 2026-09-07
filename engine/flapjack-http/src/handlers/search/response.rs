@@ -40,6 +40,22 @@ pub(super) struct ResponseAssemblyContext<'a> {
     pub(super) is_virtual_replica_search: bool,
 }
 
+pub(super) fn run_search_analytics_if_admitted(state: &Arc<AppState>, run: impl FnOnce()) -> bool {
+    let Ok(_mutation_permit) = state.global_mutation_fence.try_admit_mutation() else {
+        return false;
+    };
+    run();
+    true
+}
+
+pub(super) fn record_search_analytics_if_admitted(
+    state: &Arc<AppState>,
+    collector: &flapjack::analytics::AnalyticsCollector,
+    event: flapjack::analytics::schema::SearchEvent,
+) -> bool {
+    run_search_analytics_if_admitted(state, || collector.record_search(event))
+}
+
 fn build_response_params_string(req: &SearchRequest, hits_per_page: usize) -> String {
     build_params_string(
         req,
@@ -481,7 +497,7 @@ pub(super) fn format_search_response(
         if let Some(collector) = flapjack::analytics::get_global_collector() {
             let (country, region) =
                 resolve_country_region_from_ip(&req.user_ip, &state.geoip_reader);
-            collector.record_search(build_search_event(&SearchEventParams {
+            let event = build_search_event(&SearchEventParams {
                 req,
                 query_id: query_id.clone(),
                 index_name: effective_index.to_string(),
@@ -492,7 +508,12 @@ pub(super) fn format_search_response(
                 experiment_ctx: experiment_ctx.as_ref(),
                 country,
                 region,
-            }));
+            });
+            if !record_search_analytics_if_admitted(state, collector, event) {
+                tracing::debug!(
+                    "release mutation fence active; optional search analytics suppressed"
+                );
+            }
         }
     }
 

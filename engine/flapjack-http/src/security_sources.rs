@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct SecuritySourceEntry {
     pub source: String,
@@ -78,24 +81,52 @@ impl SecuritySourcesStore {
         Ok(())
     }
 
-    fn file_modified_time(&self) -> Result<Option<SystemTime>, FlapjackError> {
-        if !self.file_path.exists() {
-            return Ok(None);
+    fn file_fingerprint(&self) -> Result<AllowlistFileFingerprint, FlapjackError> {
+        match std::fs::metadata(&self.file_path) {
+            Ok(metadata) => Ok(AllowlistFileFingerprint::from_metadata(&metadata)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(AllowlistFileFingerprint::Missing)
+            }
+            Err(error) => Err(error.into()),
         }
-        let metadata = std::fs::metadata(&self.file_path)?;
-        Ok(metadata.modified().ok())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AllowlistFileFingerprint {
+    Missing,
+    Present {
+        modified: Option<SystemTime>,
+        len: u64,
+        #[cfg(unix)]
+        device: u64,
+        #[cfg(unix)]
+        inode: u64,
+    },
+}
+
+impl AllowlistFileFingerprint {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self::Present {
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        }
     }
 }
 
 #[derive(Default)]
 struct AllowlistCache {
-    file_modified: Option<SystemTime>,
+    file_fingerprint: Option<AllowlistFileFingerprint>,
     networks: Vec<IpNet>,
 }
 
 /// Cached source-allowlist matcher used by request middleware.
 ///
-/// Tracks file mtime to avoid reparsing unchanged allowlists. Always checks
+/// Tracks file metadata to avoid reparsing unchanged allowlists. Always checks
 /// the filesystem on each call (stat is cheap) to ensure security-critical
 /// changes are visible immediately.
 #[derive(Clone)]
@@ -120,20 +151,20 @@ impl SecuritySourcesMatcher {
         Ok(networks.iter().any(|cidr| cidr.contains(&ip)))
     }
 
-    /// Reload and cache the parsed CIDR networks from disk when the backing file's mtime has changed.
+    /// Reload and cache the parsed CIDR networks when the backing file's metadata has changed.
     ///
-    /// Uses a double-checked locking pattern: a read lock checks the cached mtime, and only acquires a write lock when the file has been modified. Returns an empty `Vec` (allow-all) when the file does not exist.
+    /// Uses a double-checked locking pattern: a read lock checks the cached fingerprint, and only acquires a write lock when the file has changed. Returns an empty `Vec` (allow-all) when the file does not exist.
     ///
     /// # Returns
     ///
     /// The current set of parsed `IpNet` entries, or an error if the file contains an unparseable CIDR.
     fn current_networks(&self) -> Result<Vec<IpNet>, FlapjackError> {
-        let file_modified = self.store.file_modified_time()?;
+        let file_fingerprint = self.store.file_fingerprint()?;
 
-        // Fast path: read lock, return cached if file mtime unchanged.
+        // Fast path: read lock, return cached if file metadata is unchanged.
         {
             let cache = self.cache.read().expect("allowlist cache lock poisoned");
-            if cache.file_modified == file_modified {
+            if cache.file_fingerprint.as_ref() == Some(&file_fingerprint) {
                 return Ok(cache.networks.clone());
             }
         }
@@ -142,7 +173,7 @@ impl SecuritySourcesMatcher {
         let mut cache = self.cache.write().expect("allowlist cache lock poisoned");
 
         // Double-check after acquiring write lock (another thread may have reloaded).
-        if cache.file_modified == file_modified {
+        if cache.file_fingerprint.as_ref() == Some(&file_fingerprint) {
             return Ok(cache.networks.clone());
         }
 
@@ -160,7 +191,7 @@ impl SecuritySourcesMatcher {
             .collect::<Result<Vec<_>, _>>()?;
 
         cache.networks = networks.clone();
-        cache.file_modified = file_modified;
+        cache.file_fingerprint = Some(file_fingerprint);
         Ok(networks)
     }
 }
@@ -230,6 +261,52 @@ fn upsert_entry(entries: &mut Vec<SecuritySourceEntry>, candidate: SecuritySourc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn matcher_refreshes_atomic_replacement_when_mtime_and_length_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let matcher = SecuritySourcesMatcher::new(dir.path());
+        let store = SecuritySourcesStore::new(dir.path());
+
+        store
+            .replace(vec![SecuritySourceEntry {
+                source: "10.0.0.0/8".to_string(),
+                description: "original".to_string(),
+            }])
+            .unwrap();
+        assert!(matcher.allows_ip("10.2.3.4".parse().unwrap()).unwrap());
+
+        store
+            .replace(vec![SecuritySourceEntry {
+                source: "203.0.113.0/24".to_string(),
+                description: "replacement".to_string(),
+            }])
+            .unwrap();
+        let colliding_fingerprint = match store.file_fingerprint().unwrap() {
+            AllowlistFileFingerprint::Present {
+                modified,
+                len,
+                device,
+                inode,
+            } => AllowlistFileFingerprint::Present {
+                modified,
+                len,
+                device,
+                inode: inode ^ 1,
+            },
+            AllowlistFileFingerprint::Missing => panic!("replacement allowlist must exist"),
+        };
+
+        matcher
+            .cache
+            .write()
+            .expect("allowlist cache lock poisoned")
+            .file_fingerprint = Some(colliding_fingerprint);
+
+        assert!(matcher.allows_ip("203.0.113.7".parse().unwrap()).unwrap());
+        assert!(!matcher.allows_ip("10.2.3.4".parse().unwrap()).unwrap());
+    }
 
     #[test]
     fn normalize_cidr_rejects_invalid_values() {

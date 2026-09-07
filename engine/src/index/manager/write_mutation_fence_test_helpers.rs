@@ -337,6 +337,7 @@
             .append(
                 "upsert",
                 serde_json::json!({"objectID": document.id, "body": document.to_json()}),
+                crate::index::oplog::AppendDurability::Buffered,
             )
             .unwrap()
     }

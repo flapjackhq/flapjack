@@ -25,15 +25,22 @@ use std::path::PathBuf;
 pub async fn get_experiment_results(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    api_key: Option<Extension<ApiKey>>,
+    secured_restrictions: Option<Extension<SecuredKeyRestrictions>>,
 ) -> Response {
     let (store, uuid, _numeric_id) = match resolve_store_and_experiment_id(&state, &id) {
         Ok(values) => values,
         Err(response) => return response,
     };
 
-    let experiment = match store.get(&uuid) {
-        Ok(exp) => exp,
-        Err(err) => return experiment_error_to_response(err),
+    let experiment = match load_authorized_experiment(
+        store,
+        &uuid,
+        extension_value(&api_key),
+        extension_value(&secured_restrictions),
+    ) {
+        Ok(experiment) => experiment,
+        Err(response) => return response,
     };
 
     let analytics_data_dir = resolve_analytics_data_dir(&state);

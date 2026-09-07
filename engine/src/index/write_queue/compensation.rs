@@ -67,12 +67,12 @@ pub(crate) fn compensate_uncommitted_tasks(
         .remove_tasks(task_ids.iter().map(String::as_str))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fault-injection"))]
 pub(crate) struct CompensationFaultGuard {
     tenant_id: String,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fault-injection"))]
 impl Drop for CompensationFaultGuard {
     fn drop(&mut self) {
         COMPENSATION_FAULTS.remove(&self.tenant_id);
@@ -84,7 +84,7 @@ pub(crate) fn fail_next_compensation_for_test(tenant_id: &str) -> CompensationFa
     fail_compensation_attempts_for_test(tenant_id, 1)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fault-injection"))]
 pub(crate) fn fail_compensation_attempts_for_test(
     tenant_id: &str,
     attempts: usize,
@@ -121,7 +121,7 @@ fn inject_compensation_fault(tenant_id: &str) -> crate::error::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fault-injection"))]
 pub(crate) fn compensation_fault_attempts_remaining_for_test(tenant_id: &str) -> usize {
     COMPENSATION_FAULTS
         .get(tenant_id)

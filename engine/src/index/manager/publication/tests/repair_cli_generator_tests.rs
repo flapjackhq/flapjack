@@ -55,7 +55,7 @@ fn generated_layout_index_preserves_manifest_oracle_data() {
     assert_eq!(layout.residue.journal, "present");
     assert_eq!(
         layout.digests.get("target").map(String::as_str),
-        Some("sha256:066beb98a824179f5326e6cc453d86669ca00dcebaafc72ce34630adcf96892a")
+        Some("sha256:9ad237df97d66c464ead7c4ecea99604e96b4c57b1b3e0bd507cf2b7477d9cb1")
     );
 }
 
@@ -1025,8 +1025,8 @@ fn manifest_with_base(id: &str) -> ScenarioManifest {
             "policy_keys": [],
             "digests": {
                 "old": "absent",
-                "new": "sha256:066beb98a824179f5326e6cc453d86669ca00dcebaafc72ce34630adcf96892a",
-                "target": "sha256:066beb98a824179f5326e6cc453d86669ca00dcebaafc72ce34630adcf96892a",
+                "new": "sha256:9ad237df97d66c464ead7c4ecea99604e96b4c57b1b3e0bd507cf2b7477d9cb1",
+                "target": "sha256:9ad237df97d66c464ead7c4ecea99604e96b4c57b1b3e0bd507cf2b7477d9cb1",
                 "staging": "absent",
                 "backup": "absent"
             },

@@ -20,6 +20,9 @@ which avoids the most common traps when checking release or engine status:
   repository. `scripts/publish_public_candidate.sh` renders Debbie's whitelist
   from exact private `main` into `public-candidate/<dev-sha>` and opens a public
   PR; the stable **Public candidate gate** must pass before that PR is merged.
+  The daily shadow candidate runs `scripts/shadow_public_candidate.sh` from a pinned runner clone; launchd requests one run each day at 09:00 host-local time.
+  A successful reconciliation leaves exactly one open candidate for the private-main SHA fetched by that run, or zero when the fetched public-main manifest already names that SHA; lock contention is a logged exit-zero no-op without reconciliation, while failures exit nonzero with an actionable log message.
+  It never auto-merges, approves, tags, releases, or dispatches workflows; operators use `gui/<uid>/com.flapjack.shadow-candidate` and `/Users/stuart/.matt/shadow_candidate.log`.
   The publisher never releases. The public repo's dispatch-only `release.yml` is
   the **authoritative CI for release closeout** — git tags, GitHub Releases, and
   GHCR images exist only there, never on the dev repo (`git tag -l` on dev is

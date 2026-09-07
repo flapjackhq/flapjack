@@ -77,6 +77,7 @@ pub struct BulkReplaceReceipt {
 pub async fn submit_bulk_replace_http(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
+    Extension(mutation_permit): Extension<crate::pause_registry::MutationPermit>,
     headers: HeaderMap,
     Query(query): Query<BulkReplaceQuery>,
     body: Body,
@@ -155,6 +156,7 @@ pub async fn submit_bulk_replace_http(
         target_index.clone(),
         publication_mode,
         permit,
+        mutation_permit,
     );
     Ok((
         StatusCode::ACCEPTED,
@@ -530,6 +532,7 @@ mod tests {
         let state = TestStateBuilder::new(&tmp)
             .with_bulk_replace_max_bytes(MAX_BYTES)
             .build_shared();
+        let mutation_permit = state.global_mutation_fence.try_admit_mutation().unwrap();
         let app = Router::new()
             .route("/1/migrations/bulk-replace", post(submit_bulk_replace_http))
             .with_state(state);
@@ -548,6 +551,7 @@ mod tests {
         request
             .extensions_mut()
             .insert(AuthenticatedAppId("bulk-owner-app".to_string()));
+        request.extensions_mut().insert(mutation_permit);
 
         let mut response = Box::pin(app.oneshot(request));
         tokio::select! {

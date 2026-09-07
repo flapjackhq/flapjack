@@ -823,12 +823,18 @@ mod oplog {
         )
         .await
         .unwrap();
-        mgr.append_oplog("oplog_dup", "settings", json!({"test": true}));
-        mgr.append_oplog("oplog_dup", "save_synonym", json!({"word": "hi"}));
+        mgr.append_oplog("oplog_dup", "settings", json!({"test": true}))
+            .await
+            .unwrap();
+        mgr.append_oplog("oplog_dup", "save_synonym", json!({"word": "hi"}))
+            .await
+            .unwrap();
         mgr.add_documents_sync("oplog_dup", vec![make_doc("3", "Gamma")])
             .await
             .unwrap();
-        mgr.append_oplog("oplog_dup", "clear_rules", json!({}));
+        mgr.append_oplog("oplog_dup", "clear_rules", json!({}))
+            .await
+            .unwrap();
 
         let entries = read_oplog_entries(&tmp.path().join("oplog_dup").join("oplog"));
         let mut seqs: Vec<u64> = entries.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
@@ -1293,8 +1299,20 @@ mod oplog_replay {
         let seg_path = seg_files[0].path();
         let mut content = std::fs::read_to_string(&seg_path).unwrap();
         content.push_str("{this is not valid json\n");
-        content.push_str("{\"seq\":2,\"timestamp_ms\":1,\"node_id\":\"n\",\"tenant_id\":\"replay_corrupt\",\"op_type\":\"upsert\",\"payload\":{\"objectID\":\"2\",\"body\":{\"_id\":\"2\",\"name\":\"AfterCorrupt\"}}}\n");
         std::fs::write(&seg_path, content).unwrap();
+        let oplog = flapjack::index::oplog::OpLog::open(&oplog_dir, "replay_corrupt", "n").unwrap();
+        let assigned_seq = oplog
+            .append(
+                "upsert",
+                json!({
+                    "objectID": "2",
+                    "body": {"_id": "2", "name": "AfterCorrupt"}
+                }),
+                flapjack::index::oplog::AppendDurability::Buffered,
+            )
+            .unwrap();
+        assert_eq!(assigned_seq, 2);
+        drop(oplog);
 
         nuke_and_recreate_index(&base.join("replay_corrupt"));
         std::fs::write(base.join("replay_corrupt").join("committed_seq"), "0").unwrap();
@@ -1329,7 +1347,9 @@ mod oplog_replay {
                 "replay_unknown",
                 "unknown_future_op",
                 serde_json::json!({"irrelevant": true}),
-            );
+            )
+            .await
+            .unwrap();
             mgr.add_documents_sync("replay_unknown", vec![make_doc("2", "StillKnown")])
                 .await
                 .unwrap();
@@ -1541,7 +1561,9 @@ mod oplog_replay {
                 serde_json::json!({
                     "body": {"searchableAttributes": ["name"], "queryType": "prefixAll"}
                 }),
-            );
+            )
+            .await
+            .unwrap();
             mgr.graceful_shutdown().await;
         }
 
@@ -1617,7 +1639,9 @@ mod oplog_replay {
                     "searchableAttributes": ["name", "description", "category"],
                     "attributesForFaceting": ["category"]
                 }),
-            );
+            )
+            .await
+            .unwrap();
             mgr.append_oplog(
                 "replay_config_only",
                 "save_synonyms",
@@ -1629,7 +1653,9 @@ mod oplog_replay {
                     }],
                     "replace": false
                 }),
-            );
+            )
+            .await
+            .unwrap();
             mgr.append_oplog(
                 "replay_config_only",
                 "save_rules",
@@ -1637,7 +1663,9 @@ mod oplog_replay {
                     "rules": [],
                     "clearExisting": true
                 }),
-            );
+            )
+            .await
+            .unwrap();
             mgr.graceful_shutdown().await;
         }
 

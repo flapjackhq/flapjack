@@ -3,11 +3,22 @@ use flapjack::validate_index_name;
 use std::path::Path;
 
 pub(crate) fn visible_tenant_dir_name(entry: &std::fs::DirEntry) -> Option<String> {
-    let is_directory = entry
-        .file_type()
-        .map(|file_type| file_type.is_dir())
-        .unwrap_or(false);
-    visible_tenant_name_if_visible_directory(entry.file_name(), is_directory)
+    try_visible_tenant_dir_name(entry).ok().flatten()
+}
+
+/// Fallible form used when the directory list is authoritative.
+///
+/// A file-type lookup failure must invalidate that inventory rather than make
+/// one tenant look deleted. The permissive single-entry helper above remains
+/// available to callers that intentionally treat an unreadable entry as hidden.
+fn try_visible_tenant_dir_name(
+    entry: &std::fs::DirEntry,
+) -> Result<Option<String>, std::io::Error> {
+    let is_directory = entry.file_type()?.is_dir();
+    Ok(visible_tenant_name_if_visible_directory(
+        entry.file_name(),
+        is_directory,
+    ))
 }
 
 /// TODO: Document visible_tenant_name_if_visible_directory.
@@ -48,11 +59,25 @@ fn utf8_directory_name(name: std::ffi::OsString, is_directory: bool) -> Option<S
 }
 
 pub(crate) fn visible_tenant_dir_names(data_path: &Path) -> Result<Vec<String>, std::io::Error> {
-    Ok(data_path
-        .read_dir()?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| visible_tenant_dir_name(&entry))
-        .collect())
+    collect_visible_tenant_dir_names(data_path.read_dir()?)
+}
+
+/// Collect a complete visible-tenant inventory or fail the whole generation.
+///
+/// Keeping this logic in the tenant-directory owner gives every caller of the
+/// complete-list API the same all-or-error inventory rule.
+fn collect_visible_tenant_dir_names<I>(entries: I) -> Result<Vec<String>, std::io::Error>
+where
+    I: IntoIterator<Item = Result<std::fs::DirEntry, std::io::Error>>,
+{
+    let mut tenant_names = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if let Some(tenant_name) = try_visible_tenant_dir_name(&entry)? {
+            tenant_names.push(tenant_name);
+        }
+    }
+    Ok(tenant_names)
 }
 
 pub(crate) fn valid_index_tenant_dir_names(
@@ -75,8 +100,9 @@ pub(crate) fn has_visible_tenant_dirs(data_path: &Path) -> Result<bool, std::io:
 #[cfg(test)]
 mod tests {
     use super::{
-        has_visible_tenant_dirs, valid_index_tenant_dir_names, visible_tenant_dir_name,
-        visible_tenant_dir_names, visible_tenant_name_if_visible_directory,
+        collect_visible_tenant_dir_names, has_visible_tenant_dirs, valid_index_tenant_dir_names,
+        visible_tenant_dir_name, visible_tenant_dir_names,
+        visible_tenant_name_if_visible_directory,
     };
     use std::fs;
     #[cfg(unix)]
@@ -117,6 +143,19 @@ mod tests {
         let tenant_dirs = visible_tenant_dir_names(temp_dir.path()).unwrap();
 
         assert_eq!(tenant_dirs, vec!["products".to_string()]);
+    }
+
+    #[test]
+    fn visible_tenant_inventory_propagates_iteration_errors() {
+        let injected_error = std::io::Error::other("injected directory iteration failure");
+
+        let result = collect_visible_tenant_dir_names(std::iter::once(Err(injected_error)));
+
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::Other,
+            "an incomplete inventory must fail instead of silently proving deletion"
+        );
     }
 
     #[test]

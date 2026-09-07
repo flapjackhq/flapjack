@@ -445,7 +445,8 @@ fn dur1_replicated_documents(
                 ReplicatedWriteOrigin::new(
                     10_000 + index as u64,
                     format!("dur1-replica-node-{index}"),
-                ),
+                )
+                .with_origin_seq(index as u64 + 1),
             )
         })
         .collect()
@@ -693,93 +694,158 @@ async fn dur1_successful_durable_write_survives_restart() {
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(write_queue_commit_failure_hook)]
-async fn compensation_preserves_concurrent_metadata_oplog_append() {
+async fn committed_prefix_blocks_metadata_while_document_batch_pending() {
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let tenant_id = "compensation_preserves_metadata";
-    let baseline_id = "metadata_compensation_baseline";
-    let rejected_ids = [
-        "metadata_compensation_rejected_a",
-        "metadata_compensation_rejected_b",
-    ];
+    let tenant_id = "committed_prefix_blocks_metadata";
     let manager = Arc::new(crate::index::manager::IndexManager::new_with_node_id(
         temp_dir.path(),
         "local-node",
     ));
     manager.create_tenant(tenant_id).unwrap();
-    manager
-        .add_documents_sync(
-            tenant_id,
-            vec![text_document(
-                baseline_id,
-                "title",
-                "metadata compensation baseline",
-            )],
-        )
+
+    let (commit_entered_tx, commit_entered_rx) = std::sync::mpsc::channel();
+    let (release_commit_tx, release_commit_rx) = std::sync::mpsc::channel();
+    let release_commit_rx = Arc::new(std::sync::Mutex::new(release_commit_rx));
+    let hook_release = Arc::clone(&release_commit_rx);
+    let _pause = crate::index::write_queue::finalization::set_before_tantivy_commit_hook_for_test(
+        tenant_id,
+        Arc::new(move |hook_tenant_id| {
+            if hook_tenant_id == tenant_id {
+                commit_entered_tx.send(()).unwrap();
+                hook_release.lock().unwrap().recv().unwrap();
+            }
+        }),
+    );
+
+    let document_manager = Arc::clone(&manager);
+    let document_write = tokio::spawn(async move {
+        document_manager
+            .add_documents_sync(
+                tenant_id,
+                vec![text_document("pending-document", "title", "pending")],
+            )
+            .await
+    });
+    tokio::task::spawn_blocking(move || commit_entered_rx.recv().unwrap())
         .await
         .unwrap();
 
-    let hook_manager = Arc::clone(&manager);
-    let hook_admission_path = temp_dir.path().to_path_buf();
-    let admission_was_durable_before_retraction = Arc::new(AtomicBool::new(false));
-    let hook_observation = Arc::clone(&admission_was_durable_before_retraction);
-    let _metadata_append =
+    let prior_committed_seq =
+        crate::index::oplog::read_committed_seq(&temp_dir.path().join(tenant_id));
+    let metadata_manager = Arc::clone(&manager);
+    let mut metadata_append = tokio::spawn(async move {
+        metadata_manager
+            .append_oplog(
+                tenant_id,
+                "settings",
+                serde_json::json!({"searchableAttributes": ["title"]}),
+            )
+            .await
+    });
+    let metadata_returned_early =
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut metadata_append)
+            .await
+            .is_ok();
+    let committed_while_pending =
+        crate::index::oplog::read_committed_seq(&temp_dir.path().join(tenant_id));
+
+    release_commit_tx.send(()).unwrap();
+    document_write.await.unwrap().unwrap();
+    if !metadata_returned_early {
+        metadata_append.await.unwrap().unwrap();
+    }
+
+    assert_eq!(committed_while_pending, prior_committed_seq);
+    assert!(
+        !metadata_returned_early,
+        "metadata append returned while a lower document sequence was uncommitted"
+    );
+    let oplog = manager.get_oplog(tenant_id).unwrap();
+    let entries = oplog.read_since(0).unwrap();
+    assert_eq!(
+        entries.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(entries[1].op_type, "settings");
+    assert_eq!(oplog.committed_seq().unwrap(), Some(2));
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(write_queue_commit_failure_hook)]
+async fn metadata_waits_for_failed_document_retraction_before_publication() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let tenant_id = "metadata_waits_for_retraction";
+    let manager = Arc::new(crate::index::manager::IndexManager::new_with_node_id(
+        temp_dir.path(),
+        "local-node",
+    ));
+    manager.create_tenant(tenant_id).unwrap();
+
+    let compensation_observed = Arc::new(AtomicBool::new(false));
+    let hook_observation = Arc::clone(&compensation_observed);
+    let _compensation_hook =
         crate::index::write_queue::set_compensation_before_oplog_retraction_hook_for_test(
             Arc::new(move |hook_tenant_id| {
-                let records = crate::index::write_queue::admission::WriteAdmissionStore::open(
-                    &hook_admission_path,
-                    hook_tenant_id,
-                )
-                .unwrap()
-                .load_records()
-                .unwrap();
-                assert!(
-                    !records.is_empty(),
-                    "admission replay must remain durable until oplog retraction succeeds"
-                );
-                hook_observation.store(true, Ordering::SeqCst);
-                hook_manager.append_oplog(
-                    hook_tenant_id,
-                    "settings",
-                    serde_json::json!({"searchableAttributes": ["title"]}),
-                );
+                if hook_tenant_id == tenant_id {
+                    hook_observation.store(true, Ordering::SeqCst);
+                }
             }),
         );
+
+    let (commit_entered_tx, commit_entered_rx) = std::sync::mpsc::channel();
+    let (release_commit_tx, release_commit_rx) = std::sync::mpsc::channel();
+    let release_commit_rx = Arc::new(std::sync::Mutex::new(release_commit_rx));
+    let hook_release = Arc::clone(&release_commit_rx);
+    let _pause = crate::index::write_queue::finalization::set_before_tantivy_commit_hook_for_test(
+        tenant_id,
+        Arc::new(move |hook_tenant_id| {
+            if hook_tenant_id == tenant_id {
+                commit_entered_tx.send(()).unwrap();
+                hook_release.lock().unwrap().recv().unwrap();
+            }
+        }),
+    );
     let _fault = crate::index::write_queue::fail_next_finalization_for_test(
         tenant_id,
         FinalizationFaultPoint::BeforeTantivyCommit,
     );
-    let task = manager
-        .admit_replicated_documents_durable_for_test(
-            tenant_id,
-            dur1_replicated_documents(&rejected_ids),
-        )
+
+    let document_manager = Arc::clone(&manager);
+    let document_write = tokio::spawn(async move {
+        document_manager
+            .add_documents_sync(
+                tenant_id,
+                vec![text_document("rejected-document", "title", "rejected")],
+            )
+            .await
+    });
+    tokio::task::spawn_blocking(move || commit_entered_rx.recv().unwrap())
+        .await
         .unwrap();
-
-    assert!(manager.wait_for_write_durable(&task.id).await.is_err());
+    let metadata_manager = Arc::clone(&manager);
+    let mut metadata_append = tokio::spawn(async move {
+        metadata_manager
+            .append_oplog(tenant_id, "settings", serde_json::json!({"ranking": []}))
+            .await
+    });
     assert!(
-        admission_was_durable_before_retraction.load(Ordering::SeqCst),
-        "compensation must observe admission before retracting the oplog"
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut metadata_append)
+            .await
+            .is_err(),
+        "metadata must wait while failed document cleanup is pending"
     );
-    let handle = manager
-        .write_task_handles
-        .get(tenant_id)
-        .map(|entry| entry.clone())
-        .expect("failed durable write must leave a tenant worker handle to drain");
-    assert!(handle.drain(tenant_id.to_string()).await.is_err());
 
-    let tenant_path = temp_dir.path().join(tenant_id);
-    let committed_seq = crate::index::oplog::read_committed_seq(&tenant_path);
+    release_commit_tx.send(()).unwrap();
+    assert!(document_write.await.unwrap().is_err());
+    drop(metadata_append.await.unwrap().unwrap());
+    assert!(compensation_observed.load(Ordering::SeqCst));
+
     let oplog = manager.get_oplog(tenant_id).unwrap();
     let entries = oplog.read_since(0).unwrap();
-    assert!(
-        entries.iter().any(|entry| entry.op_type == "settings"),
-        "compensation must not delete unrelated synchronous metadata rows: {entries:?}"
-    );
-    assert!(
-        oplog.current_seq() >= committed_seq,
-        "compensation must not rewind the oplog tail below committed_seq; current_seq={}, committed_seq={committed_seq}",
-        oplog.current_seq()
-    );
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].seq, 1);
+    assert_eq!(entries[0].op_type, "settings");
+    assert_eq!(oplog.committed_seq().unwrap(), Some(1));
 }
 
 async fn setup_compensation_manager(
@@ -946,6 +1012,23 @@ async fn assert_public_timeout_retries_compensation() {
         "test precondition: the injected compensation failure must stop the worker before the public timeout"
     );
 
+    let oplog = manager.get_oplog(tenant_id).unwrap();
+    let blocked_tail = oplog.current_seq();
+    let blocked_watermark = oplog.committed_seq().unwrap();
+    let blocked_append = manager
+        .append_oplog(
+            tenant_id,
+            "settings",
+            serde_json::json!({"searchableAttributes": ["title"]}),
+        )
+        .await;
+    assert!(
+        blocked_append.is_err(),
+        "unretracted document suffix must block metadata publication"
+    );
+    assert_eq!(oplog.current_seq(), blocked_tail);
+    assert_eq!(oplog.committed_seq().unwrap(), blocked_watermark);
+
     let durable_result = manager
         .wait_for_write_durable_with_timeout_for_test(&task.id, Duration::from_millis(25))
         .await;
@@ -971,6 +1054,17 @@ async fn assert_public_timeout_retries_compensation() {
 
     wait_for_task_replay_routes_absent(&manager, temp_dir.path(), tenant_id, &task.id).await;
     assert_task_replay_routes_absent(&manager, temp_dir.path(), tenant_id, &task.id);
+    let cleaned_tail = oplog.current_seq();
+    manager
+        .append_oplog(
+            tenant_id,
+            "settings",
+            serde_json::json!({"searchableAttributes": ["title"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oplog.current_seq(), cleaned_tail + 1);
+    assert_eq!(oplog.committed_seq().unwrap(), Some(cleaned_tail + 1));
 
     manager.unload(&tenant_id.to_string()).unwrap();
     drop(manager);
@@ -3906,7 +4000,7 @@ async fn contended_idle_queue_keeps_merge_owner_until_backlog_converges() {
     )
     .await;
 
-    let observation = tokio::time::timeout(Duration::from_secs(10), async {
+    let observation = tokio::time::timeout(WRITE_QUEUE_PROGRESS_TIMEOUT, async {
         loop {
             if task_succeeded(tasks_b.as_ref(), &task_b) {
                 let observation = observed_segments(index_a.as_ref());
@@ -4421,7 +4515,7 @@ async fn test_batch_settings_load_failure_marks_all_tasks_failed() {
     let tmp = tempfile::TempDir::new().unwrap();
     let tenant_id = "invalid_settings_tenant";
     let tenant_path = tmp.path().join(tenant_id);
-    let (tx, handle, tasks) = setup_write_queue(&tmp, tenant_id);
+    let (tx, handle, tasks, oplog) = setup_write_queue_with_oplog(&tmp, tenant_id);
 
     std::fs::write(tenant_path.join("settings.json"), "{ invalid json").unwrap();
 
@@ -4449,6 +4543,12 @@ async fn test_batch_settings_load_failure_marks_all_tasks_failed() {
 
     assert_task_failed(tasks.as_ref(), &task_1);
     assert_task_failed(tasks.as_ref(), &task_2);
+
+    let mut permit = oplog
+        .acquire_finalization()
+        .await
+        .expect("settings failure before oplog allocation must leave finalization ready");
+    permit.mark_safe();
 }
 
 #[tokio::test]

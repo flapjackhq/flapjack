@@ -408,6 +408,27 @@ async fn test_set_settings_pagination_limited_to_roundtrip() {
     assert_eq!(json["paginationLimitedTo"], serde_json::json!(50));
 }
 
+#[tokio::test]
+async fn test_set_settings_index_languages_roundtrip() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let app = settings_router(state);
+
+    let response = post_settings(&app, r#"{"indexLanguages":["en"]}"#).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let response_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        response_json.get("unsupportedParams").is_none(),
+        "indexLanguages must be handled rather than silently reported unsupported: {response_json}"
+    );
+
+    let settings = get_settings_json(&app).await;
+    assert_eq!(settings["indexLanguages"], serde_json::json!(["en"]));
+}
+
 /// TODO: Document test_set_settings_reindexes_existing_documents_for_facets.
 #[tokio::test]
 async fn test_set_settings_reindexes_existing_documents_for_facets() {
@@ -2027,6 +2048,14 @@ fn replica_sync_router_with_synonyms_rules(state: Arc<AppState>) -> Router {
                 "/1/indexes/:indexName/rules/batch",
                 post(crate::handlers::rules::save_rules),
             )
+            .route(
+                "/1/indexes/:indexName/rules/clear",
+                post(crate::handlers::rules::clear_rules),
+            )
+            .route(
+                "/1/indexes/:indexName/synonyms/clear",
+                post(crate::handlers::synonyms::clear_synonyms),
+            )
             .with_state(state),
     )
 }
@@ -2276,6 +2305,9 @@ async fn post_rules_batch(
         .await
         .unwrap()
 }
+
+#[path = "settings_tests/metadata_oplog.rs"]
+mod metadata_oplog;
 
 /// Verify that a rules batch with `forwardToReplicas=true` propagates rules to replicas.
 #[tokio::test]

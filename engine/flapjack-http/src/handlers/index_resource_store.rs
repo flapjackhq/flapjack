@@ -6,11 +6,15 @@ use flapjack::index::settings::IndexSettings;
 use flapjack::index::synonyms::{Synonym, SynonymStore};
 use flapjack::IndexManager;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use super::AppState;
 
 pub(crate) trait IndexResourceStore: Sized {
     type Item;
 
     const FILE_NAME: &'static str;
+    const DELETE_OPLOG_OPERATION: &'static str;
 
     fn new_empty() -> Self;
     fn load(path: &Path) -> Result<Self, FlapjackError>;
@@ -25,6 +29,7 @@ impl IndexResourceStore for RuleStore {
     type Item = Rule;
 
     const FILE_NAME: &'static str = "rules.json";
+    const DELETE_OPLOG_OPERATION: &'static str = "delete_rule";
 
     fn new_empty() -> Self {
         Self::new()
@@ -59,6 +64,7 @@ impl IndexResourceStore for SynonymStore {
     type Item = Synonym;
 
     const FILE_NAME: &'static str = "synonyms.json";
+    const DELETE_OPLOG_OPERATION: &'static str = "delete_synonym";
 
     fn new_empty() -> Self {
         Self::new()
@@ -179,14 +185,31 @@ pub(crate) fn delete_resource_item<S: IndexResourceStore>(
     Ok(true)
 }
 
+pub(crate) async fn delete_resource_item_and_publish<S: IndexResourceStore>(
+    state: &Arc<AppState>,
+    index_name: &str,
+    object_id: &str,
+) -> Result<bool, FlapjackError> {
+    let removed = delete_resource_item::<S>(state.manager.as_ref(), index_name, object_id)?;
+    if removed || super::replicas::has_physical_index_data(state, index_name) {
+        state
+            .manager
+            .append_oplog(
+                index_name,
+                S::DELETE_OPLOG_OPERATION,
+                serde_json::json!({"objectID": object_id}),
+            )
+            .await?;
+    }
+    Ok(removed)
+}
+
 pub(crate) fn clear_resource_store<S: IndexResourceStore>(
     manager: &IndexManager,
     index_name: &str,
 ) -> Result<(), FlapjackError> {
     let path = resource_path::<S>(manager, index_name);
-    if path.exists() {
-        std::fs::remove_file(&path)?;
-    }
+    flapjack::index::durable_remove_file(&path)?;
 
     S::invalidate(manager, index_name);
     Ok(())

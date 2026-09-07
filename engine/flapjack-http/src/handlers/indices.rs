@@ -35,44 +35,37 @@ fn dir_size(path: &std::path::Path) -> u64 {
 
 /// Append an operation to the index oplog and asynchronously replicate new entries to followers.
 ///
-/// Captures the current oplog sequence number before appending, then reads back any new
-/// operations and spawns a background task to push them through the replication manager.
-/// No-ops silently when replication is not configured.
-fn replicate_oplog_entry(
+/// Verify the exact appended row under the append receipt's lifecycle/finalization guards,
+/// including when peer replication is disabled. Network delivery remains best-effort.
+async fn replicate_oplog_entry(
     state: &Arc<AppState>,
     index_name: &str,
     op_type: &str,
     payload: serde_json::Value,
-) {
-    let pre_seq = state
+) -> Result<(), FlapjackError> {
+    let mut appended = state
         .manager
-        .get_oplog(index_name)
-        .map(|ol| ol.current_seq())
-        .unwrap_or(0);
-
-    state.manager.append_oplog(index_name, op_type, payload);
+        .append_oplog(index_name, op_type, payload)
+        .await?;
+    let entry = appended.read_entry()?;
+    drop(appended);
 
     let Some(repl_mgr) = state.replication_manager.as_ref().map(Arc::clone) else {
-        return;
+        return Ok(());
     };
-
-    if let Some(oplog) = state.manager.get_oplog(index_name) {
-        match oplog.read_since(pre_seq) {
-            Ok(ops) if !ops.is_empty() => {
-                let tenant = index_name.to_string();
-                tokio::spawn(async move {
-                    repl_mgr.replicate_ops(&tenant, ops).await;
-                });
-            }
-            Ok(_) => {}
-            Err(e) => tracing::warn!(
-                "[REPL] failed to read oplog for index {} while replicating {}: {}",
-                index_name,
-                op_type,
-                e
-            ),
-        }
-    }
+    let ops = vec![entry];
+    let mutation_permit = crate::pause_registry::request_mutation_permit()
+        .or_else(|| state.global_mutation_fence.try_admit_mutation().ok());
+    let Some(mutation_permit) = mutation_permit else {
+        tracing::warn!("[REPL] no admitted mutation permit for index replication child");
+        return Ok(());
+    };
+    let tenant = index_name.to_string();
+    tokio::spawn(async move {
+        let _mutation_permit = mutation_permit;
+        repl_mgr.replicate_ops(&tenant, ops).await;
+    });
+    Ok(())
 }
 
 fn read_optional_json_file(path: &std::path::Path) -> serde_json::Value {
@@ -417,17 +410,18 @@ pub(crate) async fn clear_index_impl(
     reject_writes_to_virtual_replica(state, index_name)?;
     let replica_names = standard_replicas_for_primary(state, index_name)?;
 
+    clear_single_index_preserving_settings(state, index_name).await?;
+    for replica_name in replica_names {
+        clear_single_index_preserving_settings(state, &replica_name).await?;
+    }
+
     replicate_oplog_entry(
         state,
         index_name,
         "clear_index",
         serde_json::json!({ "index_name": index_name }),
-    );
-
-    clear_single_index_preserving_settings(state, index_name).await?;
-    for replica_name in replica_names {
-        clear_single_index_preserving_settings(state, &replica_name).await?;
-    }
+    )
+    .await?;
 
     let task = state.manager.make_noop_task(index_name)?;
     Ok(task.numeric_id)
@@ -821,7 +815,8 @@ pub async fn operation_index(
                     "source": index_name.clone(),
                     "destination": req.destination.clone()
                 }),
-            );
+            )
+            .await?;
             task
         }
         "copy" => {
@@ -850,7 +845,8 @@ pub async fn operation_index(
                     "source_synonyms": source_synonyms,
                     "source_rules": source_rules
                 }),
-            );
+            )
+            .await?;
             task
         }
         _ => {
@@ -866,3 +862,7 @@ pub async fn operation_index(
         "updatedAt": chrono::Utc::now().to_rfc3339()
     })))
 }
+
+#[cfg(test)]
+#[path = "indices/oplog_tests.rs"]
+mod oplog_tests;

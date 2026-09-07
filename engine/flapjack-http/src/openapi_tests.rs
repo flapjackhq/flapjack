@@ -615,6 +615,83 @@ fn experiment_schema_renamed_properties_and_enum_shapes() {
     }
 }
 
+#[test]
+fn abtests_expose_persisted_conclusion_contract() {
+    let doc = openapi_json();
+    let conclusion = doc
+        .pointer("/components/schemas/AlgoliaAbTest/properties/conclusion")
+        .expect("AlgoliaAbTest.conclusion should be documented");
+    assert!(schema_contains_ref(
+        conclusion,
+        "#/components/schemas/ExperimentConclusion"
+    ));
+
+    let required = doc
+        .pointer("/components/schemas/AlgoliaAbTest/required")
+        .and_then(serde_json::Value::as_array)
+        .expect("AlgoliaAbTest required fields should be documented");
+    assert!(!required.iter().any(|field| field == "conclusion"));
+
+    let conclusion_schema = doc
+        .pointer("/components/schemas/ExperimentConclusion")
+        .expect("ExperimentConclusion should be documented");
+    assert_eq!(
+        conclusion_schema.get("additionalProperties"),
+        Some(&serde_json::Value::Bool(false)),
+        "ExperimentConclusion must reject undeclared fields"
+    );
+
+    let mut required_fields: Vec<&str> = conclusion_schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .expect("ExperimentConclusion required fields should be documented")
+        .iter()
+        .map(|field| field.as_str().expect("required field must be a string"))
+        .collect();
+    required_fields.sort_unstable();
+    assert_eq!(
+        required_fields,
+        vec![
+            "confidence",
+            "controlMetric",
+            "promoted",
+            "reason",
+            "significant",
+            "variantMetric",
+            "winner",
+        ]
+    );
+
+    let conclusion_properties = conclusion_schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .expect("ExperimentConclusion properties should be documented");
+    let mut conclusion_fields: Vec<&str> =
+        conclusion_properties.keys().map(String::as_str).collect();
+    conclusion_fields.sort_unstable();
+    assert_eq!(
+        conclusion_fields,
+        vec![
+            "confidence",
+            "controlMetric",
+            "promoted",
+            "reason",
+            "significant",
+            "variantMetric",
+            "winner",
+        ]
+    );
+
+    assert_eq!(
+        conclusion_properties.get("winner"),
+        Some(&serde_json::json!({
+            "type": ["string", "null"],
+            "enum": ["control", "variant", null]
+        })),
+        "winner must be required but nullable and closed to control|variant|null"
+    );
+}
+
 /// TODO: Document high_risk_mutation_openapi_contracts_match_shared_matrix.
 #[test]
 fn high_risk_mutation_openapi_contracts_match_shared_matrix() {

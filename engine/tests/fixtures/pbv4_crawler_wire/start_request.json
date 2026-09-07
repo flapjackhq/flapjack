@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "run_id": "018f3e2a-7b1c-7d45-8c90-1234567890ab",
+  "destination_index": "tenant_123_products",
+  "start_url": "https://example.com/catalog",
+  "limits": {
+    "max_depth": 2,
+    "max_pages": 100,
+    "max_decoded_body_bytes": 8388608,
+    "max_record_bytes": 65536,
+    "max_records": 5000,
+    "max_concurrency": 4
+  },
+  "transform": {
+    "fields": [
+      { "source": "url", "output": "url" },
+      { "source": "title", "output": "title" },
+      { "source": "text", "output": "description" }
+    ],
+    "object_id": { "source": "url", "algorithm": "sha256" }
+  },
+  "max_run_duration_ms": 300000
+}

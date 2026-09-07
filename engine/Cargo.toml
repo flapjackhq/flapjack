@@ -62,7 +62,9 @@ flate2 = { version = "1.1.9", optional = true }
 tar = { version = "0.4.44", optional = true }
 rust-s3 = { version = "0.37", default-features = false, features = ["tokio-rustls-tls"], optional = true }
 quick-xml = { version = "0.38", features = ["serialize"], optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "gzip", "brotli", "deflate", "zstd"] }
+futures = "0.3"
+scraper = "0.27"
 rusqlite = { version = "0.32", features = ["bundled"] }
 once_cell = "1.19"
 prometheus = { version = "0.13", default-features = false }
@@ -95,8 +97,11 @@ dotenvy = "0.15"
 serial_test = "3.0"
 http-body-util = "0.1"
 if-addrs = "0.13"
-tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync", "time", "net", "test-util"] }
+tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "test-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rcgen = "0.13"
+tokio-rustls = "0.26"
+flate2 = "1.1.9"
 uuid = { version = "1.0", features = ["v4"] }
 chrono = "0.4"
 flapjack-http = { path = "flapjack-http" }

@@ -491,6 +491,16 @@ pub fn check_guard_rail(
 
 /// Two-proportion power analysis for sample size estimation.
 /// Returns per-arm sample size needed to detect relative MDE at given power/alpha.
+fn unavailable_sample_size_estimate() -> SampleSizeEstimate {
+    SampleSizeEstimate {
+        per_arm: u64::MAX,
+        total: u64::MAX,
+        estimated_days: None,
+        minimum_days: 14,
+        effective_days: 14.0,
+    }
+}
+
 pub fn required_sample_size(
     baseline_rate: f64,
     relative_mde: f64,
@@ -502,14 +512,21 @@ pub fn required_sample_size(
     let p2 = baseline_rate * (1.0 + relative_mde);
     let delta = (p2 - p1).abs();
 
-    if delta == 0.0 {
-        return SampleSizeEstimate {
-            per_arm: u64::MAX,
-            total: u64::MAX,
-            estimated_days: None,
-            minimum_days: 14,
-            effective_days: 14.0,
-        };
+    if !p1.is_finite()
+        || !p2.is_finite()
+        || !relative_mde.is_finite()
+        || !alpha.is_finite()
+        || !power.is_finite()
+        || !traffic_split.is_finite()
+        || !(0.0..1.0).contains(&p1)
+        || !(0.0..1.0).contains(&p2)
+        || relative_mde <= 0.0
+        || !(0.0..1.0).contains(&alpha)
+        || !(0.0..1.0).contains(&power)
+        || !(0.0..1.0).contains(&traffic_split)
+        || delta == 0.0
+    {
+        return unavailable_sample_size_estimate();
     }
 
     // z-values for alpha/2 upper tail and power
@@ -523,15 +540,26 @@ pub fn required_sample_size(
     // n = (z_alpha * sqrt(2*p_bar*(1-p_bar)) + z_power * sqrt(p1*(1-p1) + p2*(1-p2)))^2 / delta^2
     let numerator = z_alpha * (2.0 * p_bar * (1.0 - p_bar)).sqrt()
         + z_power * (p1 * (1.0 - p1) + p2 * (1.0 - p2)).sqrt();
-    let per_arm = (numerator.powi(2) / delta.powi(2)).ceil() as u64;
+    let raw_per_arm = (numerator.powi(2) / delta.powi(2)).ceil();
+    if !raw_per_arm.is_finite() || raw_per_arm <= 0.0 || raw_per_arm >= u64::MAX as f64 {
+        return unavailable_sample_size_estimate();
+    }
+    let per_arm = raw_per_arm as u64;
 
     // Adjust for traffic split: if split != 0.5, the smaller arm needs more total traffic
     let split_factor = 1.0 / (traffic_split * (1.0 - traffic_split) * 4.0);
-    let adjusted_per_arm = (per_arm as f64 * split_factor).ceil() as u64;
+    let raw_adjusted_per_arm = (per_arm as f64 * split_factor).ceil();
+    if !raw_adjusted_per_arm.is_finite()
+        || raw_adjusted_per_arm <= 0.0
+        || raw_adjusted_per_arm >= u64::MAX as f64
+    {
+        return unavailable_sample_size_estimate();
+    }
+    let adjusted_per_arm = raw_adjusted_per_arm as u64;
 
     SampleSizeEstimate {
         per_arm: adjusted_per_arm,
-        total: adjusted_per_arm * 2,
+        total: adjusted_per_arm.saturating_mul(2),
         estimated_days: None, // Caller must compute from daily traffic
         minimum_days: 14,
         effective_days: 14.0, // Updated by caller

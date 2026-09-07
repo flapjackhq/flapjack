@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use super::{
     index_resource_store::{
-        clear_resource_store, delete_resource_item, forward_store_to_replicas, load_existing_store,
-        load_store_or_empty, save_resource_batch, save_resource_item,
+        clear_resource_store, delete_resource_item_and_publish, forward_store_to_replicas,
+        load_existing_store, load_store_or_empty, save_resource_batch, save_resource_item,
     },
     safe_nb_pages,
     settings::parse_bool_query_param,
@@ -84,11 +84,15 @@ pub async fn save_rule(
     save_resource_item::<RuleStore>(state.manager.as_ref(), &index_name, rule.clone())
         .map_err(HandlerError::internal)?;
 
-    state.manager.append_oplog(
-        &index_name,
-        "save_rule",
-        serde_json::to_value(&rule).unwrap_or_default(),
-    );
+    state
+        .manager
+        .append_oplog(
+            &index_name,
+            "save_rule",
+            serde_json::to_value(&rule).unwrap_or_default(),
+        )
+        .await
+        .map_err(HandlerError::internal)?;
 
     let task = state
         .manager
@@ -123,20 +127,16 @@ pub async fn delete_rule(
     Path((index_name, object_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, HandlerError> {
     validate_index_http(&index_name)?;
-    if !delete_resource_item::<RuleStore>(state.manager.as_ref(), &index_name, &object_id)
-        .map_err(HandlerError::internal)?
-    {
+    let removed = delete_resource_item_and_publish::<RuleStore>(&state, &index_name, &object_id)
+        .await
+        .map_err(HandlerError::internal)?;
+
+    if !removed {
         return Err(HandlerError::not_found(format!(
             "Rule {} not found",
             object_id
         )));
     }
-
-    state.manager.append_oplog(
-        &index_name,
-        "delete_rule",
-        serde_json::json!({"objectID": object_id}),
-    );
 
     let task = state
         .manager
@@ -191,11 +191,15 @@ pub async fn save_rules(
             .map_err(HandlerError::internal)?;
     }
 
-    state.manager.append_oplog(
-        &index_name,
-        "save_rules",
-        serde_json::json!({"rules": rules_json, "clearExisting": clear_existing}),
-    );
+    state
+        .manager
+        .append_oplog(
+            &index_name,
+            "save_rules",
+            serde_json::json!({"rules": rules_json, "clearExisting": clear_existing}),
+        )
+        .await
+        .map_err(HandlerError::internal)?;
 
     let task = state
         .manager
@@ -230,7 +234,9 @@ pub async fn clear_rules(
         .map_err(HandlerError::internal)?;
     state
         .manager
-        .append_oplog(&index_name, "clear_rules", serde_json::json!({}));
+        .append_oplog(&index_name, "clear_rules", serde_json::json!({}))
+        .await
+        .map_err(HandlerError::internal)?;
 
     let task = state
         .manager

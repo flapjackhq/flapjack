@@ -9,11 +9,17 @@ pub(crate) const PERSISTED_VECTORS_DIR: &str = "vectors";
 
 #[cfg(any(test, feature = "fault-injection"))]
 static FINALIZATION_FAULTS: once_cell::sync::Lazy<
-    dashmap::DashMap<String, FinalizationFaultPoint>,
+    dashmap::DashMap<String, std::collections::VecDeque<FinalizationFaultPoint>>,
 > = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 #[cfg(test)]
 static COMMITS_IN_PROGRESS: once_cell::sync::Lazy<dashmap::DashSet<String>> =
     once_cell::sync::Lazy::new(dashmap::DashSet::new);
+#[cfg(any(test, feature = "fault-injection"))]
+type BeforeTantivyCommitHook = Arc<dyn Fn(&str) + Send + Sync>;
+#[cfg(any(test, feature = "fault-injection"))]
+static BEFORE_TANTIVY_COMMIT_HOOKS: once_cell::sync::Lazy<
+    dashmap::DashMap<String, BeforeTantivyCommitHook>,
+> = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
 #[cfg(test)]
 struct CommitInProgressGuard<'a> {
@@ -28,6 +34,54 @@ impl Drop for CommitInProgressGuard<'_> {
 }
 
 #[cfg(any(test, feature = "fault-injection"))]
+pub(crate) struct BeforeTantivyCommitHookGuard {
+    tenant_id: String,
+    hook: BeforeTantivyCommitHook,
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+impl Drop for BeforeTantivyCommitHookGuard {
+    fn drop(&mut self) {
+        if let dashmap::mapref::entry::Entry::Occupied(entry) =
+            BEFORE_TANTIVY_COMMIT_HOOKS.entry(self.tenant_id.clone())
+        {
+            if Arc::ptr_eq(entry.get(), &self.hook) {
+                entry.remove();
+            }
+        }
+    }
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+pub(crate) fn set_before_tantivy_commit_hook_for_test(
+    tenant_id: &str,
+    hook: BeforeTantivyCommitHook,
+) -> BeforeTantivyCommitHookGuard {
+    match BEFORE_TANTIVY_COMMIT_HOOKS.entry(tenant_id.to_string()) {
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            entry.insert(Arc::clone(&hook));
+        }
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            panic!("a pre-Tantivy-commit hook is already registered for tenant {tenant_id}")
+        }
+    }
+    BeforeTantivyCommitHookGuard {
+        tenant_id: tenant_id.to_string(),
+        hook,
+    }
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+fn run_before_tantivy_commit_hook_for_test(tenant_id: &str) {
+    let hook = BEFORE_TANTIVY_COMMIT_HOOKS
+        .get(tenant_id)
+        .map(|hook| Arc::clone(hook.value()));
+    if let Some(hook) = hook {
+        hook(tenant_id);
+    }
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
 pub(crate) struct FinalizationFaultGuard {
     tenant_id: String,
 }
@@ -35,19 +89,27 @@ pub(crate) struct FinalizationFaultGuard {
 #[cfg(test)]
 impl FinalizationFaultGuard {
     pub(crate) fn was_triggered(&self) -> bool {
-        !FINALIZATION_FAULTS.contains_key(&self.tenant_id)
+        FINALIZATION_FAULTS
+            .get(&self.tenant_id)
+            .is_none_or(|faults| faults.is_empty())
     }
 }
 
 #[cfg(any(test, feature = "fault-injection"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FinalizationFaultPoint {
+    BeforeTasklessOplogIntentPersistence,
+    DuringTasklessOplogAppendAfterPartialWrite,
+    BeforeTasklessOplogRowSync,
+    AfterTasklessOplogRowSyncBeforeCompletion,
+    DuringTasklessOplogRollback,
     BeforeTantivyCommit,
     DuringOplogAppendAfterPartialDurableWrite,
     AfterOplogAppendBeforeTantivyCommit,
     AfterTantivyCommitBeforeVersionReceipts,
     AfterFirstVersionReceiptStatement,
     AfterVersionTransactionBeforeCommittedSeq,
+    BeforeCommittedSeqPublication,
     AfterCommittedSeqBeforeOplogTruncation,
     AfterOplogTruncationBeforeAdmissionAck,
 }
@@ -69,10 +131,19 @@ pub(crate) fn fail_next_finalization_for_test(
     tenant_id: &str,
     fault_point: FinalizationFaultPoint,
 ) -> FinalizationFaultGuard {
+    fail_finalization_sequence_for_test(tenant_id, &[fault_point])
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+pub(crate) fn fail_finalization_sequence_for_test(
+    tenant_id: &str,
+    fault_points: &[FinalizationFaultPoint],
+) -> FinalizationFaultGuard {
+    assert!(!fault_points.is_empty(), "a fault sequence cannot be empty");
     let tenant_id = tenant_id.to_string();
     assert!(
         FINALIZATION_FAULTS
-            .insert(tenant_id.clone(), fault_point)
+            .insert(tenant_id.clone(), fault_points.iter().copied().collect())
             .is_none(),
         "a finalization failure is already armed for tenant {tenant_id}"
     );
@@ -91,11 +162,20 @@ pub(crate) fn inject_finalization_fault(
 ) -> crate::error::Result<()> {
     let should_inject = FINALIZATION_FAULTS
         .get(tenant_id)
-        .is_some_and(|armed| *armed.value() == fault_point);
+        .and_then(|armed| armed.front().copied())
+        == Some(fault_point);
     if !should_inject {
         return Ok(());
     }
-    FINALIZATION_FAULTS.remove(tenant_id);
+    let remove_tenant = if let Some(mut armed) = FINALIZATION_FAULTS.get_mut(tenant_id) {
+        armed.pop_front();
+        armed.is_empty()
+    } else {
+        false
+    };
+    if remove_tenant {
+        FINALIZATION_FAULTS.remove(tenant_id);
+    }
     match fault_point {
         FinalizationFaultPoint::BeforeTantivyCommit => {
             return Err(crate::error::FlapjackError::Tantivy(
@@ -112,6 +192,17 @@ pub(crate) fn inject_finalization_fault(
     Err(crate::error::FlapjackError::Tantivy(format!(
         "injected write-queue finalization failure at {fault_point:?}"
     )))
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+pub(crate) fn finalization_fault_is_armed(
+    tenant_id: &str,
+    fault_point: FinalizationFaultPoint,
+) -> bool {
+    FINALIZATION_FAULTS
+        .get(tenant_id)
+        .and_then(|armed| armed.front().copied())
+        == Some(fault_point)
 }
 
 pub(super) fn write_valid_documents(
@@ -174,6 +265,8 @@ pub(super) fn commit_writer_with_panic_guard(
         rejected_count
     );
     #[cfg(any(test, feature = "fault-injection"))]
+    run_before_tantivy_commit_hook_for_test(tenant_id);
+    #[cfg(any(test, feature = "fault-injection"))]
     inject_finalization_fault(tenant_id, FinalizationFaultPoint::BeforeTantivyCommit)?;
     #[cfg(test)]
     let _commit_in_progress = {
@@ -227,6 +320,7 @@ pub(super) fn commit_writer_with_panic_guard(
 /// version store already reports its task as published.
 pub(super) fn finalize_committed_batch(
     context: &WriteFinalizationContext<'_>,
+    finalization_permit: Option<&crate::index::oplog::OpLogFinalizationPermit>,
     prepared_ops: &[PreparedWriteOperation],
     build_secs: u64,
 ) -> crate::error::Result<()> {
@@ -245,7 +339,7 @@ pub(super) fn finalize_committed_batch(
     let oplog_state_start = std::time::Instant::now();
     persist_oplog_commit_state(
         context.oplog,
-        context.base_path,
+        finalization_permit,
         context.tenant_id,
         committed_watermark,
     )?;
@@ -425,7 +519,7 @@ fn truncate_committed_oplog(
 /// than the retention window (`FLAPJACK_OPLOG_RETENTION`, default 1000 entries).
 fn persist_oplog_commit_state(
     oplog: Option<&Arc<crate::index::oplog::OpLog>>,
-    base_path: &std::path::Path,
+    finalization_permit: Option<&crate::index::oplog::OpLogFinalizationPermit>,
     tenant_id: &str,
     committed_watermark: Option<u64>,
 ) -> crate::error::Result<()> {
@@ -437,8 +531,12 @@ fn persist_oplog_commit_state(
             "committed receipts for tenant {tenant_id} have no oplog owner"
         ))
     })?;
-    let tenant_path = base_path.join(tenant_id);
-    crate::index::oplog::write_committed_seq(&tenant_path, committed_seq)?;
+    let permit = finalization_permit.ok_or_else(|| {
+        crate::error::FlapjackError::Io(format!(
+            "committed receipts for tenant {tenant_id} have no finalization permit"
+        ))
+    })?;
+    permit.advance_committed_seq(committed_seq)?;
     #[cfg(any(test, feature = "fault-injection"))]
     inject_finalization_fault(
         tenant_id,
@@ -446,7 +544,8 @@ fn persist_oplog_commit_state(
     )?;
     #[cfg(any(test, feature = "fault-injection"))]
     if FINALIZATION_FAULTS.get(tenant_id).is_some_and(|armed| {
-        *armed.value() == FinalizationFaultPoint::AfterOplogTruncationBeforeAdmissionAck
+        armed.front().copied()
+            == Some(FinalizationFaultPoint::AfterOplogTruncationBeforeAdmissionAck)
     }) {
         oplog.rotate_segment_for_test()?;
     }
@@ -684,7 +783,35 @@ mod tests {
     }
 
     #[test]
-    fn finalization_applies_version_receipts_before_advancing_committed_seq() {
+    #[serial_test::serial(write_queue_commit_failure_hook)]
+    fn before_tantivy_commit_hooks_are_isolated_and_removed_by_their_guard() {
+        let tenant_a_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tenant_b_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tenant_a_guard = set_before_tantivy_commit_hook_for_test("hook_tenant_a", {
+            let calls = Arc::clone(&tenant_a_calls);
+            Arc::new(move |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        });
+        let _tenant_b_guard = set_before_tantivy_commit_hook_for_test("hook_tenant_b", {
+            let calls = Arc::clone(&tenant_b_calls);
+            Arc::new(move |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        });
+
+        run_before_tantivy_commit_hook_for_test("hook_tenant_a");
+        run_before_tantivy_commit_hook_for_test("hook_tenant_b");
+        drop(tenant_a_guard);
+        run_before_tantivy_commit_hook_for_test("hook_tenant_a");
+        run_before_tantivy_commit_hook_for_test("hook_tenant_b");
+
+        assert_eq!(tenant_a_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(tenant_b_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn replication_origin_proof_finalization_precedes_committed_seq() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let tenant_id = "durable_finalization";
         let tenant_path = temp_dir.path().join(tenant_id);
@@ -695,6 +822,7 @@ mod tests {
             crate::index::oplog::OpLog::open(&tenant_path.join("oplog"), tenant_id, "local-node")
                 .unwrap(),
         );
+        let mut finalization_permit = oplog.acquire_finalization().await.unwrap();
         let receipts = oplog
             .append_operations_for_task(
                 "task-1",
@@ -702,12 +830,12 @@ mod tests {
                     crate::index::oplog::OpLogOperation::replicated(
                         "upsert",
                         serde_json::json!({"objectID": "doc-a", "body": {"objectID": "doc-a"}}),
-                        crate::index::oplog::OpLogOrigin::new(5000, "node-a"),
+                        crate::index::oplog::OpLogOrigin::new(5000, "node-a").with_origin_seq(50),
                     ),
                     crate::index::oplog::OpLogOperation::replicated(
                         "delete",
                         serde_json::json!({"objectID": "doc-b"}),
-                        crate::index::oplog::OpLogOrigin::new(6000, "node-b"),
+                        crate::index::oplog::OpLogOrigin::new(6000, "node-b").with_origin_seq(60),
                     ),
                 ],
             )
@@ -735,20 +863,31 @@ mod tests {
             embedder_configs: &[],
         };
 
-        finalize_committed_batch(&context, &[prepared], 0).unwrap();
+        finalize_committed_batch(&context, Some(&finalization_permit), &[prepared], 0).unwrap();
+        finalization_permit.mark_safe();
 
         let version_store = crate::index::version_store::VersionStore::open(&tenant_path).unwrap();
         assert_eq!(
             version_store.get("doc-a").unwrap(),
-            Some(crate::index::version_store::VersionRecord::new(
-                5000, "node-a", false, 1,
-            ))
+            Some(
+                crate::index::version_store::VersionRecord::new(5000, "node-a", false, 1,)
+                    .with_origin_proof(
+                        50,
+                        crate::index::oplog::upsert_effect_digest(
+                            &crate::types::Document::from_json(
+                                &serde_json::json!({"objectID": "doc-a"}),
+                            )
+                            .unwrap(),
+                        ),
+                    )
+            )
         );
         assert_eq!(
             version_store.get("doc-b").unwrap(),
-            Some(crate::index::version_store::VersionRecord::new(
-                6000, "node-b", true, 2,
-            ))
+            Some(
+                crate::index::version_store::VersionRecord::new(6000, "node-b", true, 2,)
+                    .with_origin_proof(60, crate::index::oplog::delete_effect_digest("doc-b"))
+            )
         );
         assert_eq!(
             crate::index::oplog::read_committed_seq(&tenant_path),

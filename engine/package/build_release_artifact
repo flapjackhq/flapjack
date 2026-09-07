@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENGINE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_DIR="$(cd "$ENGINE_DIR/.." && pwd)"
+MANIFEST_HELPER="$SCRIPT_DIR/release_artifact_manifest"
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  package/build_release_artifact <profile> <target> <source-sha> <source-tree> <compatibility-source> <output-dir>
+
+Profiles:
+  cloud-arm64  Build the one FJCloud production engine target.
+  public-all   Build one target from the existing public release matrix.
+
+The caller selects one target per invocation. This helper owns the closed target,
+builder, and feature mapping; release_artifact_manifest remains the sole package,
+manifest, and compatibility owner.
+EOF
+}
+
+die() {
+  printf 'ERROR: build release artifact: %s\n' "$*" >&2
+  exit 1
+}
+
+require_tool() {
+  command -v "$1" >/dev/null 2>&1 || die "required tool is unavailable: $1"
+}
+
+if [ "$#" -ne 6 ]; then
+  usage
+  die "expected profile, target, source SHA, source tree, compatibility source, and output directory"
+fi
+
+PROFILE="$1"
+TARGET="$2"
+SOURCE_SHA="$3"
+SOURCE_TREE="$4"
+COMPATIBILITY_ARGUMENT="$5"
+OUTPUT_ARGUMENT="$6"
+
+if ! [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+  die "source SHA must be exactly 40 lowercase hexadecimal characters"
+fi
+if ! [[ "$SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]]; then
+  die "source tree must be exactly 40 lowercase hexadecimal characters"
+fi
+[ -n "$OUTPUT_ARGUMENT" ] || die "output directory must not be empty"
+[ -f "$COMPATIBILITY_ARGUMENT" ] \
+  || die "compatibility source does not exist: $COMPATIBILITY_ARGUMENT"
+[ -r "$COMPATIBILITY_ARGUMENT" ] \
+  || die "compatibility source is not readable: $COMPATIBILITY_ARGUMENT"
+
+BUILD_TOOL=""
+FEATURE_NAME=""
+case "$PROFILE:$TARGET" in
+  cloud-arm64:aarch64-unknown-linux-musl)
+    BUILD_TOOL="cross"
+    FEATURE_NAME="vector-search"
+    ;;
+  public-all:x86_64-unknown-linux-musl|public-all:aarch64-unknown-linux-musl)
+    BUILD_TOOL="cross"
+    FEATURE_NAME="vector-search"
+    ;;
+  public-all:x86_64-apple-darwin|public-all:aarch64-apple-darwin)
+    BUILD_TOOL="cargo"
+    FEATURE_NAME="vector-search"
+    ;;
+  public-all:x86_64-pc-windows-msvc)
+    BUILD_TOOL="cargo"
+    ;;
+  cloud-arm64:*|public-all:*)
+    die "target $TARGET is not in the closed $PROFILE profile"
+    ;;
+  *)
+    die "unsupported build profile: $PROFILE"
+    ;;
+esac
+
+if [ "$PROFILE" = "public-all" ] \
+  && ! [ "$COMPATIBILITY_ARGUMENT" -ef "$SCRIPT_DIR/engine_compatibility.json" ]; then
+  die "public-all must use the checked-in canonical compatibility source"
+fi
+
+require_tool git
+require_tool npm
+require_tool python3
+require_tool cargo
+require_tool cmp
+require_tool node
+require_tool rustc
+require_tool uname
+require_tool "$BUILD_TOOL"
+[ -x "$MANIFEST_HELPER" ] || die "manifest owner is not executable: $MANIFEST_HELPER"
+
+TEMP_DIR="$(mktemp -d)"
+cleanup() {
+  rm -rf "$TEMP_DIR"
+}
+trap cleanup EXIT
+COMPATIBILITY_SNAPSHOT="$TEMP_DIR/engine_compatibility.json"
+SELECTED_COMPATIBILITY="$TEMP_DIR/selected_compatibility.json"
+cp "$COMPATIBILITY_ARGUMENT" "$COMPATIBILITY_SNAPSHOT"
+"$MANIFEST_HELPER" --compatibility-source "$COMPATIBILITY_SNAPSHOT" \
+  --compatibility-target "$TARGET" >"$SELECTED_COMPATIBILITY"
+read -r COMPATIBILITY_SOURCE_SHA256 COMPATIBILITY_SELECTED_SHA256 < <(
+  python3 - "$COMPATIBILITY_SNAPSHOT" "$SELECTED_COMPATIBILITY" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+print(
+    hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest(),
+    hashlib.sha256(pathlib.Path(sys.argv[2]).read_bytes()).hexdigest(),
+)
+PY
+)
+
+ACTUAL_ROOT="$(git -C "$REPO_DIR" rev-parse --show-toplevel 2>/dev/null)" \
+  || die "repository root is not a Git worktree"
+[ "$ACTUAL_ROOT" -ef "$REPO_DIR" ] \
+  || die "helper path is not inside the repository worktree it is building"
+
+ACTUAL_SHA="$(git -C "$REPO_DIR" rev-parse HEAD)" \
+  || die "cannot resolve checked-out source SHA"
+ACTUAL_TREE="$(git -C "$REPO_DIR" rev-parse 'HEAD^{tree}')" \
+  || die "cannot resolve checked-out source tree"
+[ "$ACTUAL_SHA" = "$SOURCE_SHA" ] \
+  || die "checked-out source SHA $ACTUAL_SHA differs from expected $SOURCE_SHA"
+[ "$ACTUAL_TREE" = "$SOURCE_TREE" ] \
+  || die "checked-out source tree $ACTUAL_TREE differs from expected $SOURCE_TREE"
+
+SOURCE_STATUS="$(git -C "$REPO_DIR" status --porcelain=v1 --untracked-files=all)" \
+  || die "cannot inspect source cleanliness"
+[ -z "$SOURCE_STATUS" ] || die "source worktree must be completely clean before building"
+
+CARGO_VERSION="$(cargo --version)" || die "cannot observe cargo version"
+NODE_VERSION="$(node --version)" || die "cannot observe node version"
+NPM_VERSION="$(npm --version)" || die "cannot observe npm version"
+RUSTC_VERSION="$(rustc --version)" || die "cannot observe rustc version"
+RUNNER_OS="$(uname -s)" || die "cannot observe runner operating system"
+RUNNER_ARCH="$(uname -m)" || die "cannot observe runner architecture"
+[[ "$NODE_VERSION" =~ ^v20\. ]] \
+  || die "Node 20 is required for byte-aligned public and cloud dashboard builds, got $NODE_VERSION"
+if [ "$BUILD_TOOL" = "cross" ]; then
+  CROSS_VERSION="$(cross --version)" || die "cannot observe cross version"
+else
+  CROSS_VERSION=""
+fi
+
+CALLER_DIR="$(pwd -P)"
+OUTPUT_DIR="$(python3 - "$CALLER_DIR" "$OUTPUT_ARGUMENT" <<'PY'
+import pathlib
+import sys
+
+caller = pathlib.Path(sys.argv[1])
+requested = pathlib.Path(sys.argv[2])
+if not requested.is_absolute():
+    requested = caller / requested
+print(requested.resolve())
+PY
+)"
+mkdir -p "$OUTPUT_DIR"
+
+export FLAPJACK_BUILD_REVISION="$SOURCE_SHA"
+export FLAPJACK_REQUIRE_DASHBOARD=1
+
+(
+  cd "$ENGINE_DIR/dashboard"
+  npm ci
+  npm run build
+)
+
+(
+  cd "$ENGINE_DIR"
+  if [ -n "$FEATURE_NAME" ]; then
+    "$BUILD_TOOL" build --release --target "$TARGET" \
+      --package flapjack-server --no-default-features --features "$FEATURE_NAME"
+  else
+    "$BUILD_TOOL" build --release --target "$TARGET" \
+      --package flapjack-server --no-default-features
+  fi
+)
+
+BINARY_PATH="target/$TARGET/release/flapjack"
+case "$TARGET" in
+  *-windows-*) BINARY_PATH="${BINARY_PATH}.exe" ;;
+esac
+
+(
+  cd "$ENGINE_DIR"
+  "$MANIFEST_HELPER" --compatibility-source "$COMPATIBILITY_SNAPSHOT" \
+    "$TARGET" "$BINARY_PATH" "$OUTPUT_DIR"
+)
+
+MANIFEST_PATH="$OUTPUT_DIR/flapjack-${TARGET}.manifest.json"
+case "$TARGET" in
+  *-windows-*) ARCHIVE_PATH="$OUTPUT_DIR/flapjack-${TARGET}.zip" ;;
+  *) ARCHIVE_PATH="$OUTPUT_DIR/flapjack-${TARGET}.tar.gz" ;;
+esac
+CHECKSUM_PATH="${ARCHIVE_PATH}.sha256"
+
+[ -f "$MANIFEST_PATH" ] || die "manifest owner did not create $MANIFEST_PATH"
+[ -f "$ARCHIVE_PATH" ] || die "manifest owner did not create $ARCHIVE_PATH"
+[ -f "$CHECKSUM_PATH" ] || die "manifest owner did not create $CHECKSUM_PATH"
+
+"$MANIFEST_HELPER" --compatibility-source "$COMPATIBILITY_SNAPSHOT" \
+  --compatibility-predecessors "$MANIFEST_PATH" >/dev/null
+
+python3 - "$MANIFEST_PATH" "$ARCHIVE_PATH" "$CHECKSUM_PATH" \
+  "$TARGET" "$SOURCE_SHA" "$FEATURE_NAME" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+manifest_path = pathlib.Path(sys.argv[1])
+archive_path = pathlib.Path(sys.argv[2])
+checksum_path = pathlib.Path(sys.argv[3])
+target = sys.argv[4]
+source_sha = sys.argv[5]
+expected_features = ["vector-search"] if sys.argv[6] else []
+
+
+def fail(message):
+    raise SystemExit(f"build release artifact: {message}")
+
+
+def reject_duplicate_keys(pairs):
+    value = {}
+    for key, member in pairs:
+        if key in value:
+            fail(f"manifest contains duplicate key: {key}")
+        value[key] = member
+    return value
+
+
+try:
+    manifest = json.loads(
+        manifest_path.read_text(), object_pairs_hook=reject_duplicate_keys
+    )
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    fail(f"cannot decode manifest: {error}")
+
+if not isinstance(manifest, dict) or set(manifest) != {
+    "schemaVersion", "artifact", "build", "compatibility"
+}:
+    fail("manifest top-level contract is unsupported")
+if type(manifest["schemaVersion"]) is not int or manifest["schemaVersion"] != 2:
+    fail("manifest schemaVersion must be integer 2")
+
+artifact = manifest["artifact"]
+build = manifest["build"]
+compatibility = manifest["compatibility"]
+if not isinstance(artifact, dict) or artifact.get("target") != target:
+    fail("manifest artifact target differs from the selected target")
+if artifact.get("file") != archive_path.name:
+    fail("manifest artifact file differs from the canonical archive name")
+if artifact.get("profile") != "release":
+    fail("manifest artifact profile must be release")
+if not isinstance(build, dict) or build.get("target") != target:
+    fail("manifest build target differs from the selected target")
+if build.get("profile") != "release":
+    fail("manifest build profile must be release")
+if build.get("revision") != source_sha or build.get("revisionKnown") is not True:
+    fail("manifest build revision differs from the exact candidate source")
+dirty = build.get("dirty")
+dirty_known = build.get("dirtyKnown")
+if dirty is True:
+    fail("manifest build identity reports dirty source")
+if dirty not in (None, False) or dirty_known is not (type(dirty) is bool):
+    fail("manifest build dirty coordinates are inconsistent")
+if build.get("features") != expected_features:
+    fail("manifest build features differ from the closed profile")
+if not isinstance(compatibility, dict) or compatibility.get("target") != target:
+    fail("manifest compatibility target differs from the selected target")
+
+archive_digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+if artifact.get("sha256") != archive_digest:
+    fail("manifest archive digest differs from the produced archive")
+if checksum_path.read_text() != f"{archive_digest}  {archive_path.name}\n":
+    fail("checksum sidecar differs from the produced archive")
+PY
+
+FINAL_SHA="$(git -C "$REPO_DIR" rev-parse HEAD)"
+FINAL_TREE="$(git -C "$REPO_DIR" rev-parse 'HEAD^{tree}')"
+[ "$FINAL_SHA" = "$SOURCE_SHA" ] || die "source SHA changed during the build"
+[ "$FINAL_TREE" = "$SOURCE_TREE" ] || die "source tree changed during the build"
+git -C "$REPO_DIR" diff --quiet -- \
+  || die "tracked source changed during the build"
+git -C "$REPO_DIR" diff --cached --quiet -- \
+  || die "staged source changed during the build"
+cmp -s "$COMPATIBILITY_ARGUMENT" "$COMPATIBILITY_SNAPSHOT" \
+  || die "compatibility source changed during the build"
+
+RECEIPT_PATH="$OUTPUT_DIR/flapjack-${TARGET}.build.json"
+python3 - "$RECEIPT_PATH" "$MANIFEST_PATH" "$PROFILE" "$TARGET" \
+  "$SOURCE_SHA" "$SOURCE_TREE" "$BUILD_TOOL" "$FEATURE_NAME" \
+  "$RUNNER_OS" "$RUNNER_ARCH" "$CARGO_VERSION" "$CROSS_VERSION" \
+  "$RUSTC_VERSION" "$NODE_VERSION" "$NPM_VERSION" \
+  "$COMPATIBILITY_SOURCE_SHA256" "$COMPATIBILITY_SELECTED_SHA256" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+receipt_path = pathlib.Path(sys.argv[1])
+manifest_path = pathlib.Path(sys.argv[2])
+profile = sys.argv[3]
+target = sys.argv[4]
+source_sha = sys.argv[5]
+source_tree = sys.argv[6]
+builder = sys.argv[7]
+feature = sys.argv[8]
+runner_os = sys.argv[9]
+runner_arch = sys.argv[10]
+cargo_version = sys.argv[11]
+cross_version = sys.argv[12] or None
+rustc_version = sys.argv[13]
+node_version = sys.argv[14]
+npm_version = sys.argv[15]
+compatibility_source_sha256 = sys.argv[16]
+compatibility_selected_sha256 = sys.argv[17]
+
+argv = [
+    builder,
+    "build",
+    "--release",
+    "--target",
+    target,
+    "--package",
+    "flapjack-server",
+    "--no-default-features",
+]
+if feature:
+    argv.extend(["--features", feature])
+
+receipt = {
+    "schemaVersion": 2,
+    "profile": profile,
+    "source": {"clean": True, "sha": source_sha, "tree": source_tree},
+    "invocation": {
+        "argv": argv,
+        "runner": {"arch": runner_arch, "os": runner_os},
+        "tools": {
+            "cargo": cargo_version,
+            "cross": cross_version,
+            "node": node_version,
+            "npm": npm_version,
+            "rustc": rustc_version,
+        },
+    },
+    "manifest": {
+        "file": manifest_path.name,
+        "sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+    },
+    "compatibility": {
+        "sourceSha256": compatibility_source_sha256,
+        "selectedSha256": compatibility_selected_sha256,
+    },
+}
+receipt_path.write_text(
+    json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
+)
+PY

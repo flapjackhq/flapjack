@@ -366,6 +366,8 @@ async fn smoke_internal_endpoint() {
         metrics_state: None,
         usage_counters: std::sync::Arc::new(dashmap::DashMap::new()),
         paused_indexes: flapjack_http::pause_registry::PausedIndexes::new(),
+        global_mutation_fence: flapjack_http::pause_registry::GlobalMutationFence::open(tmp.path())
+            .unwrap(),
         usage_persistence: None,
         geoip_reader: None,
         notification_service: None,
@@ -481,6 +483,10 @@ mod cors {
             metrics_state: None,
             usage_counters: std::sync::Arc::new(dashmap::DashMap::new()),
             paused_indexes: flapjack_http::pause_registry::PausedIndexes::new(),
+            global_mutation_fence: flapjack_http::pause_registry::GlobalMutationFence::open(
+                temp_dir.path(),
+            )
+            .unwrap(),
             usage_persistence: None,
             geoip_reader: None,
             notification_service: None,

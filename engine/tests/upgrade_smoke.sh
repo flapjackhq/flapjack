@@ -5,14 +5,18 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  ./engine/tests/upgrade_smoke.sh --old-bin <path> --new-bin <path>
+  ./engine/tests/upgrade_smoke.sh \
+    --old-bin <path> --old-manifest <path> --old-binary-sha256 <digest> \
+    --new-bin <path> --new-manifest <path> \
+    --rollback-mode <restore_pre_upgrade_backup|binary_reactivate_same_data>
 
 Runs a minimal upgrade smoke by:
 1. starting the old binary on a temp data dir
 2. seeding data and verifying search
 3. stopping the old binary
 4. starting the new binary on the same data dir
-5. verifying /health, /health/ready, /dashboard, search, and writes
+5. verifying exact protected identity, health/readiness, dashboard, search, and writes
+6. when declared, restarting the predecessor on the post-write data dir and rechecking data
 EOF
 }
 
@@ -23,7 +27,11 @@ INDEX_NAME="upgrade_smoke"
 QUERY_TOKEN="upgrade-smoke-token"
 
 OLD_BIN=""
+OLD_MANIFEST=""
+OLD_BINARY_SHA256=""
 NEW_BIN=""
+NEW_MANIFEST=""
+ROLLBACK_MODE=""
 TMP_DIR=""
 DATA_DIR=""
 OLD_LOG=""
@@ -138,6 +146,84 @@ verify_search_hits() {
   [ "$hits" = "$expected_hits" ] || fail "expected $expected_hits hits for query '$query', got $hits"
 }
 
+validate_binary_manifest() {
+  local label="$1"
+  local bin_path="$2"
+  local manifest_path="$3"
+  local require_binary_digest="$4"
+  local canonical_build_path="$5"
+  local expected_binary_digest="$6"
+
+  "$bin_path" build-info --json >"$canonical_build_path" \
+    || fail "$label binary did not expose build-info --json"
+  python3 - \
+    "$label" \
+    "$bin_path" \
+    "$manifest_path" \
+    "$require_binary_digest" \
+    "$canonical_build_path" \
+    "$expected_binary_digest" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+label = sys.argv[1]
+binary_path = pathlib.Path(sys.argv[2])
+manifest_path = pathlib.Path(sys.argv[3])
+require_binary_digest = sys.argv[4] == "1"
+build_path = pathlib.Path(sys.argv[5])
+expected_binary_digest = sys.argv[6]
+
+
+def reject_duplicate_keys(pairs):
+    value = {}
+    for key, member in pairs:
+        if key in value:
+            raise ValueError(f"duplicate key: {key}")
+        value[key] = member
+    return value
+
+
+def load(path):
+    return json.loads(path.read_text(), object_pairs_hook=reject_duplicate_keys)
+
+
+try:
+    manifest = load(manifest_path)
+    cli_build = load(build_path)
+except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+    raise SystemExit(f"{label} identity input is invalid: {error}") from error
+
+schema_version = manifest.get("schemaVersion")
+expected_keys = {
+    1: {"schemaVersion", "artifact", "build"},
+    2: {"schemaVersion", "artifact", "build", "compatibility"},
+}
+if schema_version not in expected_keys or set(manifest) != expected_keys[schema_version]:
+    raise SystemExit(f"{label} manifest schema or keys are unsupported")
+if manifest["build"] != cli_build:
+    raise SystemExit(f"{label} manifest build does not match executable build-info")
+
+artifact = manifest["artifact"]
+if not isinstance(artifact, dict):
+    raise SystemExit(f"{label} manifest artifact must be an object")
+if artifact.get("target") != cli_build.get("target"):
+    raise SystemExit(f"{label} artifact target does not match executable target")
+if artifact.get("profile") != "release" or cli_build.get("profile") != "release":
+    raise SystemExit(f"{label} manifest and executable must use the release profile")
+
+binary_digest = artifact.get("binarySha256")
+actual_binary_digest = hashlib.sha256(binary_path.read_bytes()).hexdigest()
+if expected_binary_digest and actual_binary_digest != expected_binary_digest:
+    raise SystemExit(f"{label} executable does not match the declared binarySha256")
+if require_binary_digest and binary_digest is None:
+    raise SystemExit(f"{label} manifest must bind artifact.binarySha256")
+if binary_digest is not None and binary_digest != actual_binary_digest:
+    raise SystemExit(f"{label} artifact.binarySha256 does not match executable bytes")
+PY
+}
+
 start_server() {
   local bin_path="$1"
   local log_path="$2"
@@ -159,8 +245,24 @@ main() {
         OLD_BIN="${2:-}"
         shift 2
         ;;
+      --old-manifest)
+        OLD_MANIFEST="${2:-}"
+        shift 2
+        ;;
+      --old-binary-sha256)
+        OLD_BINARY_SHA256="${2:-}"
+        shift 2
+        ;;
       --new-bin)
         NEW_BIN="${2:-}"
+        shift 2
+        ;;
+      --new-manifest)
+        NEW_MANIFEST="${2:-}"
+        shift 2
+        ;;
+      --rollback-mode)
+        ROLLBACK_MODE="${2:-}"
         shift 2
         ;;
       --help|-h)
@@ -176,9 +278,19 @@ main() {
   done
 
   [ -n "$OLD_BIN" ] || { echo "ERROR: --old-bin is required" >&2; usage >&2; return 1; }
+  [ -n "$OLD_MANIFEST" ] || { echo "ERROR: --old-manifest is required" >&2; usage >&2; return 1; }
+  [[ "$OLD_BINARY_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+    || { echo "ERROR: --old-binary-sha256 must be 64 lowercase hex characters" >&2; usage >&2; return 1; }
   [ -n "$NEW_BIN" ] || { echo "ERROR: --new-bin is required" >&2; usage >&2; return 1; }
+  [ -n "$NEW_MANIFEST" ] || { echo "ERROR: --new-manifest is required" >&2; usage >&2; return 1; }
+  case "$ROLLBACK_MODE" in
+    restore_pre_upgrade_backup|binary_reactivate_same_data) ;;
+    *) echo "ERROR: --rollback-mode must name a supported compatibility mode" >&2; usage >&2; return 1 ;;
+  esac
   [ -x "$OLD_BIN" ] || fail "old binary is not executable: $OLD_BIN"
+  [ -f "$OLD_MANIFEST" ] || fail "old manifest does not exist: $OLD_MANIFEST"
   [ -x "$NEW_BIN" ] || fail "new binary is not executable: $NEW_BIN"
+  [ -f "$NEW_MANIFEST" ] || fail "new manifest does not exist: $NEW_MANIFEST"
   [ -x "$WAIT_HELPER" ] || fail "missing wait helper: $WAIT_HELPER"
 
   ADMIN_KEY="$(generate_admin_key)"
@@ -187,6 +299,11 @@ main() {
   OLD_LOG="$TMP_DIR/old.log"
   NEW_LOG="$TMP_DIR/new.log"
   mkdir -p "$DATA_DIR"
+
+  local old_build_json="$TMP_DIR/old-build.json"
+  local new_build_json="$TMP_DIR/new-build.json"
+  validate_binary_manifest "old" "$OLD_BIN" "$OLD_MANIFEST" 0 "$old_build_json" "$OLD_BINARY_SHA256"
+  validate_binary_manifest "new" "$NEW_BIN" "$NEW_MANIFEST" 1 "$new_build_json" ""
 
   OLD_PID="$(start_server "$OLD_BIN" "$OLD_LOG")"
   "$WAIT_HELPER" --pid "$OLD_PID" --port auto --log-path "$OLD_LOG" >/dev/null
@@ -236,6 +353,18 @@ main() {
   curl -fsS "$new_base/health" >/dev/null || fail "new binary health check failed"
   curl -fsS "$new_base/health/ready" >/dev/null || fail "new binary readiness check failed"
   curl -fsS "$new_base/dashboard" >/dev/null || fail "new binary dashboard load failed"
+  local live_build_json="$TMP_DIR/live-build.json"
+  local expected_live_build_json="$TMP_DIR/expected-live-build.canonical.json"
+  local actual_live_build_json="$TMP_DIR/actual-live-build.canonical.json"
+  http_json GET "$new_base/internal/build-info" >"$live_build_json" \
+    || fail "new binary protected build identity check failed"
+  jq -S -c . "$new_build_json" >"$expected_live_build_json" \
+    || fail "new binary CLI build identity was not valid JSON"
+  jq -S -c . "$live_build_json" >"$actual_live_build_json" \
+    || fail "new binary protected build identity was not valid JSON"
+  cmp -s "$expected_live_build_json" "$actual_live_build_json" \
+    || fail "new binary protected build identity does not match its executable and manifest"
+  pass "new binary served the exact authenticated manifest identity"
   verify_search_hits "$new_base" "$QUERY_TOKEN" "2"
   pass "new binary preserved pre-upgrade search state"
 
@@ -257,6 +386,28 @@ main() {
   wait_for_task_published "$new_base" "$upgrade_task_id"
   verify_search_hits "$new_base" "post-upgrade-token" "1"
   pass "new binary accepted writes on the upgraded data dir"
+
+  if [ "$ROLLBACK_MODE" = "binary_reactivate_same_data" ]; then
+    kill "$NEW_PID" 2>/dev/null || true
+    wait "$NEW_PID" 2>/dev/null || true
+    NEW_PID=""
+
+    OLD_LOG="$TMP_DIR/rollback-old.log"
+    OLD_PID="$(start_server "$OLD_BIN" "$OLD_LOG")"
+    "$WAIT_HELPER" --pid "$OLD_PID" --port auto --log-path "$OLD_LOG" >/dev/null
+    local rollback_port
+    rollback_port="$(extract_port_from_log "$OLD_LOG")"
+    [ -n "$rollback_port" ] || fail "could not detect rollback predecessor port"
+    local rollback_base="http://127.0.0.1:$rollback_port"
+
+    curl -fsS "$rollback_base/health" >/dev/null \
+      || fail "rollback predecessor health check failed"
+    curl -fsS "$rollback_base/health/ready" >/dev/null \
+      || fail "rollback predecessor readiness check failed"
+    verify_search_hits "$rollback_base" "$QUERY_TOKEN" "2"
+    verify_search_hits "$rollback_base" "post-upgrade-token" "1"
+    pass "predecessor restarted on the post-write data dir and preserved both generations"
+  fi
 }
 
 trap cleanup EXIT

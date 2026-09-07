@@ -822,6 +822,7 @@ fn migration_job_route_for_provider_with_test_source_factory(
     state: Arc<AppState>,
     test_source_factory: Option<TestMigrationSourceReaderFactory>,
 ) -> MigrationLifecycleRoutes {
+    let mutation_fence = state.global_mutation_fence.clone();
     let provider_routes = Router::new()
         .route("/", post(submit_algolia_migration_http))
         .route("/:job_id", get(get_algolia_migration_status_http))
@@ -840,7 +841,10 @@ fn migration_job_route_for_provider_with_test_source_factory(
         Some(provider) => provider_routes.layer(axum::extract::Extension(provider)),
         None => provider_routes,
     };
-    MigrationLifecycleRoutes::mounted(provider, provider_routes)
+    MigrationLifecycleRoutes::mounted(
+        provider,
+        crate::router::apply_global_mutation_fence(provider_routes, mutation_fence),
+    )
 }
 
 fn public_provider_migration_routes(state: &Arc<AppState>) -> Vec<MigrationLifecycleRoutes> {
@@ -2789,6 +2793,8 @@ async fn stale_generation_cannot_mutate_terminal_or_ack_state_for_any_provider()
         assert_eq!(submit.status(), StatusCode::ACCEPTED);
         let job_uuid = job_uuid_from_submit_response(submit).await;
         wait_for_route_terminal(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
+        // Stop background backpressure-file writes before comparing lifecycle effects.
+        drop(state.manager.quiesce_tenant(&target_index).await.unwrap());
         let terminal_before = spool.read_migration_phase(job_uuid).unwrap();
         let metadata = spool.read_async_migration_metadata(job_uuid).unwrap();
         let job_row_before = std::fs::read(spool.migration_phase_path(job_uuid)).unwrap();

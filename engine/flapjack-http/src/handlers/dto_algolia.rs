@@ -1,6 +1,8 @@
 //! Define Algolia-compatible request/response DTOs and bidirectional conversion between Algolia and internal experiment formats.
 
-use flapjack::experiments::config::{Experiment, ExperimentArm, ExperimentStatus, QueryOverrides};
+use flapjack::experiments::config::{
+    Experiment, ExperimentArm, ExperimentConclusion, ExperimentStatus, QueryOverrides,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -25,6 +27,8 @@ pub struct AlgoliaAbTest {
     pub started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conclusion: Option<ExperimentConclusion>,
     pub variants: Vec<AlgoliaVariant>,
     pub configuration: AlgoliaConfiguration,
     pub click_significance: Option<f64>,
@@ -347,6 +351,20 @@ fn query_overrides_to_custom_params(overrides: &QueryOverrides) -> Option<serde_
 /// `numeric_id` is the integer ID alias assigned by the store.
 pub fn experiment_to_algolia(experiment: &Experiment, numeric_id: i64) -> AlgoliaAbTest {
     experiment_to_algolia_with_updated_at(experiment, numeric_id, None)
+        .expect("experiment must satisfy the persisted conclusion invariant")
+}
+
+fn validated_experiment_conclusion(
+    experiment: &Experiment,
+) -> Result<Option<ExperimentConclusion>, &'static str> {
+    match (&experiment.status, experiment.conclusion.as_ref()) {
+        (ExperimentStatus::Concluded, Some(conclusion)) => Ok(Some(conclusion.clone())),
+        (ExperimentStatus::Concluded, None) => {
+            Err("concluded experiment is missing its persisted conclusion")
+        }
+        (_, Some(_)) => Err("non-concluded experiment contains a persisted conclusion"),
+        (_, None) => Ok(None),
+    }
 }
 
 /// Convert an internal `Experiment` to the Algolia wire format, with optional updatedAt override.
@@ -357,7 +375,8 @@ pub fn experiment_to_algolia_with_updated_at(
     experiment: &Experiment,
     numeric_id: i64,
     updated_at_ms_override: Option<i64>,
-) -> AlgoliaAbTest {
+) -> Result<AlgoliaAbTest, &'static str> {
+    let conclusion = validated_experiment_conclusion(experiment)?;
     let control_traffic = ((1.0 - experiment.traffic_split) * 100.0).round() as i64;
     let variant_traffic = (experiment.traffic_split * 100.0).round() as i64;
 
@@ -400,7 +419,7 @@ pub fn experiment_to_algolia_with_updated_at(
         .or(experiment.started_at)
         .unwrap_or(experiment.created_at);
 
-    AlgoliaAbTest {
+    Ok(AlgoliaAbTest {
         ab_test_id: numeric_id,
         name: experiment.name.clone(),
         status: status_to_algolia(&experiment.status, experiment.ended_at).to_string(),
@@ -409,6 +428,7 @@ pub fn experiment_to_algolia_with_updated_at(
         updated_at: epoch_ms_to_rfc3339(updated_at_ms),
         started_at,
         stopped_at,
+        conclusion,
         variants: vec![control_variant, variant_variant],
         configuration: AlgoliaConfiguration {
             minimum_detectable_effect: None,
@@ -423,7 +443,7 @@ pub fn experiment_to_algolia_with_updated_at(
         add_to_cart_significance: None,
         purchase_significance: None,
         revenue_significance: None,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------

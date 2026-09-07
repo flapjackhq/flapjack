@@ -2,6 +2,22 @@
 use arrow::datatypes::{DataType, Field, Schema};
 use std::sync::Arc;
 
+/// Internal event discriminator for counted Recommend requests. This value is
+/// never accepted by the public Insights API.
+pub const RECOMMENDATION_REQUEST_EVENT_TYPE: &str = "_flapjack_recommendation_request";
+
+/// Internal provenance marker for Recommend-request rows whose identity came
+/// from the coarsened-IP/anonymous fallback rather than a stable user token.
+/// Public Insights callers cannot forge the paired internal event type.
+pub(crate) const RECOMMENDATION_FALLBACK_IDENTITY_MARKER: &str =
+    "_flapjack_recommendation_fallback_identity";
+
+pub(crate) fn is_recommendation_fallback_identity(event: &InsightEvent) -> bool {
+    event.event_type == RECOMMENDATION_REQUEST_EVENT_TYPE
+        && event.authenticated_user_token.as_deref()
+            == Some(RECOMMENDATION_FALLBACK_IDENTITY_MARKER)
+}
+
 /// Recorded automatically on every search request.
 #[derive(Debug, Clone)]
 pub struct SearchEvent {
@@ -229,21 +245,8 @@ impl InsightEvent {
                 return Err("queryID must be 32-char hex string".to_string());
             }
         }
-        if (self.event_type == "click" && self.query_id.is_some())
-            || (self.event_type == "conversion"
-                && self.event_subtype.as_deref() == Some("purchase"))
-        {
-            let parsed = uuid::Uuid::parse_str(&self.user_token)
-                .map_err(|_| "selected after-search events require a UUID userToken".to_string())?;
-            if !parsed
-                .hyphenated()
-                .to_string()
-                .eq_ignore_ascii_case(&self.user_token)
-            {
-                return Err(
-                    "selected after-search events require a hyphenated UUID userToken".to_string(),
-                );
-            }
+        if matches!(self.event_type.as_str(), "click" | "conversion") && self.query_id.is_some() {
+            validate_attributed_user_token(&self.user_token)?;
         }
         // Reject events older than 4 days
         if let Some(ts) = self.timestamp {
@@ -275,6 +278,23 @@ pub fn validate_user_token(user_token: &str) -> Result<(), String> {
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
         return Err("userToken must contain only [a-zA-Z0-9\\-_]".to_string());
+    }
+    Ok(())
+}
+
+/// Validate the user identity shared by Recommend click-attribution and
+/// after-search Events. Keeping the domain here prevents Recommend from
+/// issuing a queryID that the Events endpoint cannot consume.
+pub fn validate_attributed_user_token(user_token: &str) -> Result<(), String> {
+    validate_user_token(user_token)?;
+    let parsed = uuid::Uuid::parse_str(user_token)
+        .map_err(|_| "selected after-search events require a UUID userToken".to_string())?;
+    if !parsed
+        .hyphenated()
+        .to_string()
+        .eq_ignore_ascii_case(user_token)
+    {
+        return Err("selected after-search events require a hyphenated UUID userToken".to_string());
     }
     Ok(())
 }
@@ -415,6 +435,13 @@ mod tests {
         let mut e = valid_event();
         e.event_type = "hover".to_string();
         assert!(e.validate().is_err());
+    }
+
+    #[test]
+    fn public_insights_cannot_forge_internal_recommendation_request_rows() {
+        let mut event = valid_event();
+        event.event_type = RECOMMENDATION_REQUEST_EVENT_TYPE.to_string();
+        assert!(event.validate().is_err());
     }
 
     // ── validate: event_name ────────────────────────────────────────────
@@ -826,6 +853,22 @@ mod tests {
         event.positions = Some(vec![1]);
         event.user_token = "not-a-uuid".to_string();
         assert!(event.validate().is_err());
+    }
+
+    #[test]
+    fn attributed_conversion_requires_hyphenated_uuid_user_token_for_every_subtype() {
+        for subtype in [None, Some("addToCart"), Some("purchase")] {
+            let mut event = valid_event();
+            event.event_type = "conversion".to_string();
+            event.event_subtype = subtype.map(str::to_string);
+            event.positions = None;
+            event.query_id = Some("abcdef0123456789abcdef0123456789".to_string());
+            event.user_token = "not-a-uuid".to_string();
+            assert!(event.validate().is_err(), "accepted subtype {subtype:?}");
+
+            event.user_token = "018f6b5e-4d3c-7a21-8b9c-0123456789ab".to_string();
+            assert!(event.validate().is_ok(), "rejected subtype {subtype:?}");
+        }
     }
 
     #[cfg(feature = "openapi")]

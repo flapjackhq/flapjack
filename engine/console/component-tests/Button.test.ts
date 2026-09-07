@@ -3,7 +3,9 @@ import { render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { Button } from '../src/lib/ui';
-import { disabledButtonStory, primaryButtonStory } from '../src/lib/ui/Button.stories';
+import * as buttonStories from '../src/lib/ui/Button.stories';
+
+const { disabledButtonStory, primaryButtonStory } = buttonStories;
 
 describe('Button public contract', () => {
   it('has an accessible name, receives Tab focus, and activates once with Enter', async () => {
@@ -28,5 +30,20 @@ describe('Button public contract', () => {
     expect(button).toBeDisabled();
     await user.click(button);
     expect(onpress).not.toHaveBeenCalled();
+  });
+
+  it('publishes governed primary, secondary, and danger variants', () => {
+    expect(
+      Object.values(buttonStories)
+        .map((story) => story.props.variant)
+        .filter(Boolean)
+        .sort()
+    ).toEqual(['danger', 'primary', 'secondary']);
+
+    render(primaryButtonStory.component, { props: primaryButtonStory.props });
+    expect(screen.getByRole('button', { name: primaryButtonStory.props.label })).toHaveAttribute(
+      'data-variant',
+      'primary'
+    );
   });
 });

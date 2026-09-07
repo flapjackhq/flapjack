@@ -108,17 +108,38 @@ Use `--instance <name>` to run isolated instances with separate data directories
 
 ---
 
-## Available SDKs
+## Clients
 
-Flapjack ships client SDKs across multiple languages; the list below reflects which are currently installable from public package registries.
+Use the official Algolia clients: `algoliasearch` v5, InstantSearch.js (vanilla, React, Vue), and Algolia's official clients for other languages, pointed at your Flapjack host with any application ID and a search-only key. No Flapjack-specific client is needed or supported. The former `flapjack-search` SDKs were retired in 2026-09 and their published packages are deprecated; their sources remain in git history at tag [`sdks-retired-2026-09`](https://github.com/flapjackhq/flapjack/tree/sdks-retired-2026-09). Do not install the retired packages.
 
-- **JavaScript** — `flapjack-search` on npm (with `@flapjack-search/*` scoped support packages: `client-common`, `client-search`, `logger-console`, `requester-browser-xhr`, `requester-fetch`, `requester-node-http`)
-- **Python** — `flapjack-search` on PyPI
-- **Go** — `github.com/flapjackhq/flapjack-search-go/v4`
+### JavaScript quickstart
 
-A Ruby prerelease gem (`flapjack-search 0.1.0.pre.beta.1`) exists on RubyGems, but its published install path has not passed verification — build from source under `sdks/ruby/` for now. PHP, Java, C#, Dart, Scala, Kotlin, Swift, and the WordPress plugin are source-available under `sdks/` but not yet published to their public registries.
+```javascript
+import { liteClient as algoliasearch } from 'algoliasearch/lite';
 
-See `docs/reference/research/jun04_sdk_truth_matrix.md` for the per-package publication evidence.
+// The application ID can be any string. The browser must receive a restricted
+// search-only key, never your admin key. The key's permissions enforce read-only
+// access; `accept: 'read'` selects this host for read requests.
+const client = algoliasearch('flapjack', 'your-flapjack-search-only-key', {
+  hosts: [{ url: 'localhost:7700', protocol: 'http', accept: 'read' }],
+});
+
+// Everything else stays the same
+```
+
+Click and conversion events use the official `search-insights` client with `host` set to your Flapjack origin: `aa("init", { appId, apiKey, host: "http://localhost:7700" })`. With InstantSearch pass `insights: { insightsInitParams: { host } }`. Without `host`, events and your key go to Algolia. Here `appId` is the same non-empty application ID, `apiKey` is the browser search-only key, and `host` is your Flapjack origin.
+
+### Host configuration by client
+
+| Official package | Imports | Flapjack host configuration |
+|---|---|---|
+| JavaScript — `algoliasearch` v5 | `liteClient` (search-only) | See the [JavaScript quickstart](#javascript-quickstart) above |
+| Python — `algoliasearch` v4 | `SearchClient` from `algoliasearch.search.client`, `SearchConfig` from `algoliasearch.search.config`, `Host, HostsCollection` from `algoliasearch.http.hosts` | `config = SearchConfig(appId, key); config.hosts = HostsCollection([Host("localhost", scheme="http", port=7700)]); SearchClient.create_with_config(config)` — the client is asynchronous, so calls require `await` |
+| PHP — `algolia/algoliasearch-client-php` v4 | `Algolia\AlgoliaSearch\Api\SearchClient`, `Algolia\AlgoliaSearch\Configuration\SearchConfig` | `SearchClient::createWithConfig(SearchConfig::create($appId, $key)->setFullHosts(["http://localhost:7700"]))` |
+| Go — `github.com/algolia/algoliasearch-client-go/v4` | `algolia/search`, `algolia/transport`, `algolia/call` | `search.NewClientWithConfig(search.SearchConfiguration{Configuration: transport.Configuration{AppID: appId, ApiKey: key, Hosts: []transport.StatefulHost{transport.NewStatefulHost("http", "localhost:7700", call.IsReadWrite)}}})` |
+| Ruby — `algolia` v3 | `require "algolia"` | `Algolia::SearchClient.create_with_config(Algolia::Configuration.new(appId, key, [Algolia::Transport::StatefulHost.new("localhost", protocol: "http://", port: 7700)], "Search"))` |
+
+These examples target local loopback; use your actual HTTPS origin for a remote server. Browser and Insights examples use restricted search-only keys; backend keys need only the permissions required by their operations and stay on the server. These are configuration examples, not a claim that the curl smokes execute every official language package.
 
 ---
 
@@ -137,19 +158,7 @@ curl -X POST http://localhost:7700/1/migrate-from-algolia \
   -d '{"appId":"YOUR_ALGOLIA_APP_ID","apiKey":"YOUR_ALGOLIA_ADMIN_KEY","sourceIndex":"products"}'
 ```
 
-Then initialize your frontend with `flapjackSearch(...)`:
-
-```javascript
-import { flapjackSearch } from 'flapjack-search';
-
-// app-id can be any string; the browser must receive a restricted search-only
-// key — never your admin key. The host is read-only so a leaked key cannot write.
-const client = flapjackSearch('flapjack', 'your-flapjack-search-only-key', {
-  hosts: [{ url: 'localhost:7700', protocol: 'http', accept: 'read' }],
-});
-
-// Everything else stays the same
-```
+Then initialize your frontend with the official `algoliasearch` client and the Insights `host` guardrail described under [Clients](#clients).
 
 ### Migration API and search check
 
@@ -162,9 +171,6 @@ curl -X POST http://localhost:7700/1/indexes/products/query \
   -H "Content-Type: application/json" \
   -d '{"query":"widget"}'
 ```
-
-For the full JavaScript migration checklist and method matrix, see
-[`sdks/javascript/MIGRATION.md`](sdks/javascript/MIGRATION.md).
 
 InstantSearch.js widgets work as-is — `SearchBox`, `Hits`, `RefinementList`, `Pagination`, `GeoSearch`, etc.
 
@@ -229,7 +235,7 @@ The official InstantSearch.js 4.x, React InstantSearch 7.x, and Vue InstantSearc
 
 **Q: What is the licensing and support model?**
 
-The engine is source-available under the [Elastic License 2.0](LICENSE) and free to self-host with no feature gates. Run it for your own business, including inside a commercial product, at any scale, for free. The one thing you may not do is provide Flapjack itself to third parties as a hosted or managed search service. The client SDKs under [sdks/](sdks/) are MIT, so nothing the license restricts reaches your application code. For managed hosting, [Flapjack Cloud](https://cloud.flapjack.foo) handles provisioning, backups, and updates. Community support is available through the [GitHub repository](https://github.com/flapjackhq/flapjack).
+The engine is source-available under the [Elastic License 2.0](LICENSE) and free to self-host with no feature gates. Run it for your own business, including inside a commercial product, at any scale, for free. The one thing you may not do is provide Flapjack itself to third parties as a hosted or managed search service. Your application talks to Flapjack through Algolia's own MIT-licensed clients, so nothing the license restricts reaches your application code. For managed hosting, [Flapjack Cloud](https://cloud.flapjack.foo) handles provisioning, backups, and updates. Community support is available through the [GitHub repository](https://github.com/flapjackhq/flapjack).
 
 **Q: How do HMAC-scoped API keys work?**
 
@@ -435,8 +441,7 @@ Flapjack includes a built-in dashboard UI served at `http://localhost:7700/dashb
 
 ## License
 
-The engine is [Elastic License 2.0](LICENSE). The client SDKs and framework
-integrations are MIT. [NOTICE](NOTICE) maps every path to its license.
+The engine is [Elastic License 2.0](LICENSE); [NOTICE](NOTICE) maps the remaining paths and records the license history.
 
 **You can, for free and forever:** run Flapjack for your own business at any
 scale; use it behind a commercial product or paid app; self-host it for

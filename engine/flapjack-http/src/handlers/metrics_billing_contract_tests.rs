@@ -1,4 +1,7 @@
-use super::{metrics_handler, register_billing_usage_gauges};
+use super::{
+    metrics_handler, register_billing_usage_gauges, register_live_index_state_gauges,
+    register_live_index_state_gauges_with_snapshot_hook,
+};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::get;
@@ -20,14 +23,150 @@ const BILLING_METRIC_NAMES: [&str; 7] = [
 
 /// Extract the numeric value for a metric+index from Prometheus text output.
 fn find_metric_value(text: &str, metric_name: &str, index: &str) -> f64 {
+    let exact_sample = format!("{metric_name}{{index=\"{index}\"}}");
     text.lines()
-        .find(|line| line.contains(metric_name) && line.contains(index) && !line.starts_with('#'))
+        .find(|line| {
+            let sample = line.split_whitespace().next().unwrap_or_default();
+            sample == exact_sample
+        })
         .unwrap_or_else(|| panic!("{}{{index={}}} not found in:\n{}", metric_name, index, text))
         .split_whitespace()
         .last()
         .unwrap()
         .parse()
         .unwrap()
+}
+
+#[test]
+fn metric_text_lookup_requires_exact_metric_and_index() {
+    let text = concat!(
+        "flapjack_search_requests_total_suffix{index=\"target\"} 91\n",
+        "flapjack_search_requests_total{index=\"target_shadow\"} 73\n",
+        "flapjack_search_requests_total{index=\"target\"} 7\n",
+    );
+
+    assert_eq!(
+        find_metric_value(text, "flapjack_search_requests_total", "target"),
+        7.0,
+        "decoy metric and index substrings must not satisfy the assertion"
+    );
+}
+
+fn index_metric_values(
+    registry: &Registry,
+    metric_name: &str,
+) -> std::collections::BTreeMap<String, f64> {
+    registry
+        .gather()
+        .into_iter()
+        .find(|family| family.get_name() == metric_name)
+        .map(|family| {
+            family
+                .get_metric()
+                .iter()
+                .map(|metric| {
+                    let index = metric
+                        .get_label()
+                        .iter()
+                        .find(|pair| pair.get_name() == "index")
+                        .expect("per-index gauge must carry the index label")
+                        .get_value()
+                        .to_string();
+                    (index, metric.get_gauge().get_value())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// RED 1: creating durable files must not make a gauge visible until the
+/// background owner publishes a new cached generation.
+#[tokio::test]
+async fn index_gauge_scrape_does_not_scan_request_path() {
+    let tmp = TempDir::new().unwrap();
+    let state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
+    let metrics_state = state.metrics_state.as_ref().unwrap();
+    metrics_state.replace_index_gauges(std::collections::BTreeMap::from([(
+        "cached_only".to_string(),
+        super::IndexGaugeValues {
+            documents_count: None,
+            storage_bytes: Some(77),
+        },
+    )]));
+
+    state.manager.create_tenant("not_refreshed").unwrap();
+    state
+        .manager
+        .add_documents_sync(
+            "not_refreshed",
+            vec![flapjack::types::Document {
+                id: "doc-1".to_string(),
+                fields: std::collections::HashMap::new(),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let registry = Registry::new();
+    register_live_index_state_gauges(&registry, &state);
+
+    assert_eq!(
+        index_metric_values(&registry, "flapjack_storage_bytes"),
+        std::collections::BTreeMap::from([("cached_only".to_string(), 77.0)]),
+        "request-time collection must expose only the last published generation"
+    );
+    assert!(
+        index_metric_values(&registry, "flapjack_documents_count").is_empty(),
+        "document files created after the cached generation must remain invisible until refresh"
+    );
+}
+
+/// A scrape interleaved with publication must keep using the generation it
+/// captured before the publication boundary.
+#[tokio::test]
+async fn index_gauge_publication_is_whole_generation_after_capture() {
+    let tmp = TempDir::new().unwrap();
+    let state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
+    let metrics_state = state.metrics_state.as_ref().unwrap().clone();
+    metrics_state.replace_index_gauges(std::collections::BTreeMap::from([(
+        "old".to_string(),
+        super::IndexGaugeValues {
+            documents_count: Some(1),
+            storage_bytes: Some(10),
+        },
+    )]));
+
+    let registry = Registry::new();
+    register_live_index_state_gauges_with_snapshot_hook(&registry, &state, || {
+        metrics_state.replace_index_gauges(std::collections::BTreeMap::from([(
+            "new".to_string(),
+            super::IndexGaugeValues {
+                documents_count: Some(2),
+                storage_bytes: Some(20),
+            },
+        )]));
+    });
+    let observed_storage = index_metric_values(&registry, "flapjack_storage_bytes");
+    let observed_documents = index_metric_values(&registry, "flapjack_documents_count");
+
+    let old_storage = std::collections::BTreeMap::from([("old".to_string(), 10.0)]);
+    let old_documents = std::collections::BTreeMap::from([("old".to_string(), 1.0)]);
+    assert_eq!(
+        observed_storage, old_storage,
+        "storage must stay on the generation captured before publication"
+    );
+    assert_eq!(
+        observed_documents, old_documents,
+        "documents must stay on the generation captured before publication"
+    );
+    assert_eq!(
+        metrics_state
+            .index_gauge_snapshot()
+            .get("new")
+            .and_then(|gauges| gauges.storage_bytes),
+        Some(20),
+        "the hook must really publish the newer generation during registration"
+    );
 }
 
 /// Poll /metrics on a test app and return the body as a string.

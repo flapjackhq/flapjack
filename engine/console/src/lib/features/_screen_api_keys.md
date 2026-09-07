@@ -17,6 +17,13 @@ Hosts select whether this section owns a level-one or level-two heading and may 
 controls disabled until host interaction wiring is ready. Disabled interaction is fail-closed: no
 create, filter, copy, or removal callback fires.
 
-The supported populated state is registered in `ApiKeyShell.stories.ts`. Loading, retry, empty,
-filtering, clipboard success/failure, removal intent, and escaping are owned by
-`component-tests/ApiKeyShell.test.ts`.
+The host must place the shell below either `data-console-theme="flapjack"` or
+`data-console-theme="fjcloud"`. The shell presents one primary create action, secondary retry/copy
+actions, a danger removal action, a labeled bordered index filter, elevated key cards, and distinct
+loading, error, empty, filtered-empty, copy-success, and copy-error treatments. All controls retain
+a 44px minimum target and visible focus indication. At 390px, the header and state actions stack
+without horizontal page overflow.
+
+Loading, error, empty, and populated states are registered in `ApiKeyShell.stories.ts`. Retry,
+filtering, clipboard success/failure, removal intent, disabled interaction, and escaping are owned
+by `component-tests/ApiKeyShell.test.ts`.

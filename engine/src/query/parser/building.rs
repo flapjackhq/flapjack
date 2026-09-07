@@ -387,7 +387,12 @@ impl QueryParser {
         let mut plural_clauses: Vec<QueryClause> =
             vec![(tantivy::query::Occur::Should, token_query)];
         for plural in context.plural_forms {
-            let plural_term_text = format!("{}\0s{}", context.path, plural);
+            let effective_plural: std::borrow::Cow<'_, str> = if context.is_prefix {
+                std::borrow::Cow::Borrowed(plural.as_str())
+            } else {
+                self.stem_token(plural)
+            };
+            let plural_term_text = format!("{}\0s{}", context.path, effective_plural);
             let plural_term =
                 tantivy::Term::from_field_text(context.target_field, &plural_term_text);
             let plural_query: Box<dyn TantivyQuery> = Box::new(tantivy::query::TermQuery::new(

@@ -39,7 +39,24 @@ impl ExperimentStore {
             next_numeric_id: AtomicI64::new(1),
             dir,
         };
-        store.load_all()?;
+        store.load_all(true)?;
+        Ok(store)
+    }
+
+    /// Hydrate existing experiment state without creating directories or
+    /// republishing the numeric-ID map. Release-fenced startup uses this path;
+    /// later admitted mutations lazily initialize missing persistence through
+    /// the canonical `persist_json` owner.
+    pub fn load_only(data_dir: &std::path::Path) -> Result<Self, ExperimentError> {
+        let store = Self {
+            experiments: DashMap::new(),
+            active_by_index: DashMap::new(),
+            id_to_numeric: DashMap::new(),
+            numeric_to_id: DashMap::new(),
+            next_numeric_id: AtomicI64::new(1),
+            dir: data_dir.join(".experiments"),
+        };
+        store.load_all(false)?;
         Ok(store)
     }
 
@@ -53,7 +70,10 @@ impl ExperimentStore {
     ///
     /// Returns an error if any persisted experiment fails validation or if multiple running
     /// experiments target the same index.
-    fn load_all(&self) -> Result<(), ExperimentError> {
+    fn load_all(&self, persist_repairs: bool) -> Result<(), ExperimentError> {
+        if !self.dir.exists() {
+            return Ok(());
+        }
         // Load the numeric ID mapping if it exists.
         let mapping_path = self.dir.join("_id_map.json");
         if mapping_path.exists() {
@@ -98,7 +118,9 @@ impl ExperimentStore {
             }
         }
         // Persist mapping in case new IDs were assigned during load.
-        self.persist_id_map()?;
+        if persist_repairs {
+            self.persist_id_map()?;
+        }
         Ok(())
     }
 
@@ -152,6 +174,7 @@ impl ExperimentStore {
         file_name: &str,
         value: &T,
     ) -> Result<(), ExperimentError> {
+        std::fs::create_dir_all(&self.dir)?;
         let data = serde_json::to_string_pretty(value)?;
         crate::index::utils::atomic_write(&self.dir.join(file_name), data.as_bytes())?;
         Ok(())

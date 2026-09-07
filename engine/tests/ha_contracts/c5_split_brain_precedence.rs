@@ -10,6 +10,7 @@ use flapjack::IndexManager;
 
 /// TODO: Document make_upsert_op.
 fn make_upsert_op(
+    tenant_id: &str,
     seq: u64,
     timestamp_ms: u64,
     node_id: &str,
@@ -20,7 +21,7 @@ fn make_upsert_op(
         seq,
         timestamp_ms,
         node_id: node_id.to_string(),
-        tenant_id: "ha-c5".to_string(),
+        tenant_id: tenant_id.to_string(),
         op_type: "upsert".to_string(),
         payload: serde_json::json!({
             "objectID": object_id,
@@ -30,6 +31,7 @@ fn make_upsert_op(
 }
 
 fn make_delete_op(
+    tenant_id: &str,
     seq: u64,
     timestamp_ms: u64,
     node_id: &str,
@@ -39,7 +41,7 @@ fn make_delete_op(
         seq,
         timestamp_ms,
         node_id: node_id.to_string(),
-        tenant_id: "ha-c5".to_string(),
+        tenant_id: tenant_id.to_string(),
         op_type: "delete".to_string(),
         payload: serde_json::json!({"objectID": object_id}),
     }
@@ -51,13 +53,13 @@ async fn lww_same_timestamp_higher_node_id_wins() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = IndexManager::new(tmp.path());
 
-    let op_z = vec![make_upsert_op(1, 1000, "z-node", "doc1", "ZNode")];
+    let op_z = vec![make_upsert_op("c5_t1", 1, 1000, "z-node", "doc1", "ZNode")];
     flapjack_http::handlers::internal::apply_ops_to_manager(&manager, "c5_t1", &op_z)
         .await
         .unwrap();
     common::wait_for_document_text_field(&manager, "c5_t1", "doc1", "name", "ZNode").await;
 
-    let op_a = vec![make_upsert_op(2, 1000, "a-node", "doc1", "ANode")];
+    let op_a = vec![make_upsert_op("c5_t1", 2, 1000, "a-node", "doc1", "ANode")];
     flapjack_http::handlers::internal::apply_ops_to_manager(&manager, "c5_t1", &op_a)
         .await
         .unwrap();
@@ -75,13 +77,13 @@ async fn lww_stale_delete_does_not_remove_newer_upsert() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = IndexManager::new(tmp.path());
 
-    let upsert = vec![make_upsert_op(1, 2000, "node-a", "doc1", "Alive")];
+    let upsert = vec![make_upsert_op("c5_t2", 1, 2000, "node-a", "doc1", "Alive")];
     flapjack_http::handlers::internal::apply_ops_to_manager(&manager, "c5_t2", &upsert)
         .await
         .unwrap();
     common::wait_for_document_exists(&manager, "c5_t2", "doc1").await;
 
-    let stale_delete = vec![make_delete_op(2, 1000, "node-b", "doc1")];
+    let stale_delete = vec![make_delete_op("c5_t2", 2, 1000, "node-b", "doc1")];
     flapjack_http::handlers::internal::apply_ops_to_manager(&manager, "c5_t2", &stale_delete)
         .await
         .unwrap();
@@ -122,6 +124,7 @@ async fn lww_map_rebuilt_from_oplog_blocks_stale_op_after_restart() {
     {
         let manager = IndexManager::new(&base);
         let stale = vec![make_upsert_op(
+            "c5_restart",
             99,
             primary_ts.saturating_sub(1),
             "remote",

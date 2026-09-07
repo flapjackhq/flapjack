@@ -10,6 +10,7 @@ pub use middleware::authenticate_and_authorize;
 pub(crate) use middleware::{extract_index_name, is_public_path, route_exposure, RouteExposure};
 pub(crate) use route_acl::is_acme_challenge_path;
 pub use route_acl::required_acl_for_route;
+pub(crate) use route_acl::{route_policy, RouteEffect};
 
 #[cfg(test)]
 use axum::http::Method;
@@ -32,6 +33,11 @@ use crate::error_response::json_error;
 
 pub(crate) const INVALID_API_CREDENTIALS_MESSAGE: &str = "Invalid Application-ID or API key";
 pub(crate) const PRIVATE_MIGRATION_ACL: &str = "privateMigration";
+
+/// Marks requests authenticated with the exact node-admin key. Internal
+/// transport metadata must never be accepted from ordinary customer keys.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AuthenticatedAdminKey;
 
 pub(super) fn invalid_api_credentials_error() -> Response {
     json_error(StatusCode::FORBIDDEN, INVALID_API_CREDENTIALS_MESSAGE)

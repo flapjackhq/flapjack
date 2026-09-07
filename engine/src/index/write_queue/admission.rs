@@ -1,7 +1,7 @@
 //! Stub summary for engine/src/index/write_queue/admission.rs.
 use crate::error::{FlapjackError, Result};
 use crate::index::manager::publication::PublicationEpoch;
-use crate::index::version_store::VersionStore;
+use crate::index::version_store::{VersionProofComparison, VersionRecord, VersionStore};
 use crate::index::write_queue::{WriteAction, WriteOp};
 use crate::types::{TaskInfo, TaskStatus};
 use serde::{Deserialize, Serialize};
@@ -680,9 +680,36 @@ fn action_is_committed_by_version_store(
     let Some(actual) = version_store.get(expected.object_id)? else {
         return Ok(false);
     };
-    Ok(actual.timestamp_ms == expected.timestamp_ms
-        && actual.node_id == expected.node_id
-        && actual.tombstone == expected.tombstone)
+    let expected_origin_seq = expected.origin_seq.ok_or_else(|| {
+        FlapjackError::Tantivy(format!(
+            "cannot prove admission effect for {}: missing source origin sequence",
+            expected.object_id
+        ))
+    })?;
+    let expected_version = VersionRecord::new(
+        expected.timestamp_ms,
+        expected.node_id,
+        expected.tombstone,
+        0,
+    )
+    .with_origin_proof(expected_origin_seq, expected.effect_digest);
+    match expected_version.compare_replication_proof(&actual) {
+        VersionProofComparison::Newer => Ok(false),
+        VersionProofComparison::Older | VersionProofComparison::Exact => Ok(true),
+        VersionProofComparison::Ambiguous => {
+            let detail = if actual.origin_seq.is_none() {
+                "durable version has legacy NULL origin sequence"
+            } else if actual.effect_digest.is_none() {
+                "durable version has legacy NULL effect digest"
+            } else {
+                "effect digest mismatch at equal origin tuple"
+            };
+            Err(FlapjackError::Tantivy(format!(
+                "cannot prove admission effect for {}: {detail}",
+                expected.object_id
+            )))
+        }
+    }
 }
 
 struct ExpectedActionVersion<'a> {
@@ -690,6 +717,8 @@ struct ExpectedActionVersion<'a> {
     timestamp_ms: u64,
     node_id: &'a str,
     tombstone: bool,
+    origin_seq: Option<u64>,
+    effect_digest: [u8; 32],
 }
 
 fn replicated_action_version(action: &WriteAction) -> Option<ExpectedActionVersion<'_>> {
@@ -699,12 +728,16 @@ fn replicated_action_version(action: &WriteAction) -> Option<ExpectedActionVersi
             timestamp_ms: origin.timestamp_ms,
             node_id: &origin.node_id,
             tombstone: false,
+            origin_seq: origin.origin_seq,
+            effect_digest: crate::index::oplog::upsert_effect_digest(doc),
         }),
         WriteAction::DeleteWithOrigin { object_id, origin } => Some(ExpectedActionVersion {
             object_id: object_id.as_str(),
             timestamp_ms: origin.timestamp_ms,
             node_id: &origin.node_id,
             tombstone: true,
+            origin_seq: origin.origin_seq,
+            effect_digest: crate::index::oplog::delete_effect_digest(object_id),
         }),
         _ => None,
     }
@@ -777,31 +810,13 @@ fn record_value_checksum(record: &serde_json::Value) -> Result<String> {
                 "failed to normalize write admission record checksum: {error}"
             ))
         })?;
-    let canonical_record = canonicalize_json_value(&normalized_record);
+    let canonical_record = crate::index::utils::canonicalize_json_value(&normalized_record);
     let bytes = serde_json::to_vec(&canonical_record).map_err(|error| {
         FlapjackError::Json(format!(
             "failed to checksum write admission record: {error}"
         ))
     })?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
-}
-
-fn canonicalize_json_value(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut entries: Vec<_> = map.iter().collect();
-            entries.sort_unstable_by_key(|(key, _)| *key);
-            let mut canonical = serde_json::Map::new();
-            for (key, value) in entries {
-                canonical.insert(key.clone(), canonicalize_json_value(value));
-            }
-            serde_json::Value::Object(canonical)
-        }
-        serde_json::Value::Array(values) => {
-            serde_json::Value::Array(values.iter().map(canonicalize_json_value).collect())
-        }
-        _ => value.clone(),
-    }
 }
 
 fn system_time_ms(time: SystemTime) -> u64 {

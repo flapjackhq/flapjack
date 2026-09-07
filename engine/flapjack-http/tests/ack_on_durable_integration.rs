@@ -49,6 +49,8 @@ fn make_state(tmp: &TempDir) -> Arc<AppState> {
         usage_counters: Arc::new(DashMap::<String, TenantUsageCounters>::new()),
         usage_persistence: None,
         paused_indexes: PausedIndexes::new(),
+        global_mutation_fence: flapjack_http::pause_registry::GlobalMutationFence::open(tmp.path())
+            .unwrap(),
         geoip_reader: None,
         notification_service: None,
         start_time: std::time::Instant::now(),

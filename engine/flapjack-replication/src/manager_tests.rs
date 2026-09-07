@@ -281,6 +281,27 @@ async fn spawn_observed_status_peer() -> (String, oneshot::Receiver<()>) {
     (format!("http://{}", addr), request_seen_rx)
 }
 
+async fn spawn_barrier_status_peer(
+    accepted_barrier: Arc<Barrier>,
+    release_barrier: Arc<Barrier>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request_buf = [0u8; 1024];
+        let _ = socket.read(&mut request_buf).await;
+        accepted_barrier.wait().await;
+        release_barrier.wait().await;
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let _ = socket.shutdown().await;
+    });
+    format!("http://{}", addr)
+}
+
 /// TODO: Document spawn_barrier_replicate_peer.
 async fn spawn_barrier_replicate_peer(
     acked_seq: u64,
@@ -329,6 +350,42 @@ fn mutable_peer_test_op(seq: u64) -> OpLogEntry {
             "body": {"_id": format!("doc-{seq}"), "name": format!("Doc {seq}")}
         }),
     }
+}
+
+#[tokio::test]
+async fn replication_pass_does_not_finish_before_every_spawned_peer_task() {
+    let accepted = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let (peer_url, peer_handle) =
+        spawn_barrier_replicate_peer(1, Arc::clone(&accepted), Arc::clone(&release)).await;
+    let manager = new_test_manager(
+        NodeConfig {
+            node_id: "node-a".to_string(),
+            bind_addr: "127.0.0.1:0".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
+            peers: vec![PeerConfig {
+                node_id: "node-b".to_string(),
+                addr: peer_url,
+            }],
+        },
+        None,
+    );
+    let replication_manager = Arc::clone(&manager.manager);
+    let pass = tokio::spawn(async move {
+        replication_manager
+            .replicate_ops("tenant-red", vec![mutable_peer_test_op(1)])
+            .await;
+    });
+
+    accepted.wait().await;
+    assert!(
+        !pass.is_finished(),
+        "the complete replication pass must own every spawned peer task until delivery settles"
+    );
+    release.wait().await;
+    pass.await.unwrap();
+    peer_handle.await.unwrap();
 }
 
 /// TODO: Document wait_for_acked_seq.
@@ -1623,9 +1680,12 @@ async fn mutable_peer_replicate_ops_uses_snapshots_while_membership_changes() {
     );
 
     tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
-        manager
-            .replicate_ops("tenant-red", vec![mutable_peer_test_op(1)])
-            .await;
+        let first_manager = Arc::clone(&manager.manager);
+        let first_replication = tokio::spawn(async move {
+            first_manager
+                .replicate_ops("tenant-red", vec![mutable_peer_test_op(1)])
+                .await;
+        });
         accepted_barrier.wait().await;
 
         assert!(manager
@@ -1647,6 +1707,7 @@ async fn mutable_peer_replicate_ops_uses_snapshots_while_membership_changes() {
             .await;
 
         release_barrier.wait().await;
+        first_replication.await.unwrap();
         let _ = node_b_handle.await;
         let node_c_requests = node_c_handle.await.expect("node-c handler should finish");
 
@@ -1904,9 +1965,12 @@ async fn mutable_peer_removed_peer_cursor_does_not_reappear_after_in_flight_comp
     );
 
     tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
-        manager
-            .replicate_ops("tenant-red", vec![mutable_peer_test_op(1)])
-            .await;
+        let in_flight_manager = Arc::clone(&manager.manager);
+        let in_flight = tokio::spawn(async move {
+            in_flight_manager
+                .replicate_ops("tenant-red", vec![mutable_peer_test_op(1)])
+                .await;
+        });
         accepted_barrier.wait().await;
 
         assert!(manager
@@ -1915,6 +1979,7 @@ async fn mutable_peer_removed_peer_cursor_does_not_reappear_after_in_flight_comp
             .is_some());
 
         release_barrier.wait().await;
+        in_flight.await.unwrap();
         let _ = peer_handle.await;
         assert!(
             tokio::time::timeout(tokio::time::Duration::from_millis(250), async {
@@ -2002,6 +2067,88 @@ async fn health_probe_supervisor_keeps_probing_when_autoheal_journal_startup_fai
     })
     .await
     .expect("successful health probe should still update peer health status");
+    assert!(manager.stop_health_probe());
+}
+
+#[tokio::test]
+async fn autoheal_pass_does_not_probe_when_mutation_admission_is_refused() {
+    let (peer_url, request_seen) = spawn_observed_status_peer().await;
+    let manager = new_test_manager(
+        NodeConfig {
+            node_id: "node-a".to_string(),
+            bind_addr: "0.0.0.0:7700".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
+            peers: vec![PeerConfig {
+                node_id: "node-b".to_string(),
+                addr: peer_url,
+            }],
+        },
+        None,
+    );
+
+    manager.start_health_probe_with_interval_and_admission(
+        tokio::time::Duration::from_millis(1),
+        false,
+        || async { None::<()> },
+    );
+    assert!(
+        tokio::time::timeout(tokio::time::Duration::from_millis(30), request_seen)
+            .await
+            .is_err(),
+        "a refused release-fence admission must suppress the complete autoheal pass"
+    );
+    assert!(manager.stop_health_probe());
+}
+
+#[tokio::test]
+async fn autoheal_pass_holds_its_admission_permit_until_the_peer_probe_settles() {
+    struct DropSignal(Option<oneshot::Sender<()>>);
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(signal) = self.0.take() {
+                let _ = signal.send(());
+            }
+        }
+    }
+
+    let accepted = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let peer_url = spawn_barrier_status_peer(Arc::clone(&accepted), Arc::clone(&release)).await;
+    let manager = new_test_manager(
+        NodeConfig {
+            node_id: "node-a".to_string(),
+            bind_addr: "0.0.0.0:7700".to_string(),
+            advertise_addr: None,
+            bootstrap_peer: None,
+            peers: vec![PeerConfig {
+                node_id: "node-b".to_string(),
+                addr: peer_url,
+            }],
+        },
+        None,
+    );
+    let (dropped_tx, mut dropped_rx) = oneshot::channel();
+    let signal = Arc::new(std::sync::Mutex::new(Some(dropped_tx)));
+    manager.start_health_probe_with_interval_and_admission(
+        tokio::time::Duration::from_millis(1),
+        false,
+        move || {
+            let signal = Arc::clone(&signal);
+            async move { Some(DropSignal(signal.lock().unwrap().take())) }
+        },
+    );
+
+    accepted.wait().await;
+    tokio::select! {
+        _ = &mut dropped_rx => panic!("autoheal permit dropped before the in-flight probe settled"),
+        _ = tokio::time::sleep(tokio::time::Duration::from_millis(30)) => {}
+    }
+    release.wait().await;
+    tokio::time::timeout(tokio::time::Duration::from_secs(1), &mut dropped_rx)
+        .await
+        .expect("autoheal permit must drop after the complete pass")
+        .expect("drop signal owner must remain live");
     assert!(manager.stop_health_probe());
 }
 

@@ -4,11 +4,12 @@ use crate::handlers::AppState;
 use crate::server_init::InfrastructureState;
 use crate::ssl_background::{ssl_background_plan, ConfiguredSsl};
 use crate::tenant_dirs::{has_visible_tenant_dirs, visible_tenant_dir_names};
+use flapjack::index::manager::publication::CrawlerRunStore;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 const HOUR_MS: i64 = 3_600_000;
@@ -53,6 +54,16 @@ impl BackgroundTaskHealth {
     #[cfg(test)]
     pub(crate) fn record_exit_for_test(&self, name: &'static str) {
         self.record_exit(name);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_running_for_test(&self, name: &'static str) -> bool {
+        self.tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(name)
+            .copied()
+            .unwrap_or(false)
     }
 }
 
@@ -279,6 +290,7 @@ pub(crate) async fn scheduled_s3_backups(
     data_dir: String,
     s3_config: flapjack::index::s3::S3Config,
     manager: std::sync::Arc<flapjack::IndexManager>,
+    mutation_fence: crate::pause_registry::GlobalMutationFence,
     interval_secs: u64,
 ) {
     let data_path = std::path::PathBuf::from(data_dir);
@@ -286,7 +298,100 @@ pub(crate) async fn scheduled_s3_backups(
     interval.tick().await;
     loop {
         interval.tick().await;
-        run_scheduled_s3_backup_pass(&manager, &s3_config, data_path.as_path()).await;
+        if !run_background_mutation_if_admitted(&mutation_fence, || {
+            run_scheduled_s3_backup_pass(&manager, &s3_config, data_path.as_path())
+        })
+        .await
+        {
+            tracing::debug!("[BACKUP] Release mutation fence active; scheduled snapshot skipped");
+        }
+    }
+}
+
+async fn run_background_mutation_if_admitted<Run, RunFuture>(
+    mutation_fence: &crate::pause_registry::GlobalMutationFence,
+    run: Run,
+) -> bool
+where
+    Run: FnOnce() -> RunFuture,
+    RunFuture: std::future::Future<Output = ()>,
+{
+    let Ok(_mutation_permit) = mutation_fence.admit_mutation().await else {
+        return false;
+    };
+    run().await;
+    true
+}
+
+async fn run_analytics_retention_pass_if_admitted(
+    mutation_fence: &crate::pause_registry::GlobalMutationFence,
+    analytics_dir: &std::path::Path,
+    retention_days: u32,
+    phase: &str,
+) -> bool {
+    run_background_mutation_if_admitted(mutation_fence, || async move {
+        match flapjack::analytics::retention::cleanup_old_partitions(analytics_dir, retention_days)
+        {
+            Ok(removed) => tracing::info!(removed, phase, "[analytics] Retention cleanup complete"),
+            Err(error) => tracing::warn!(error, phase, "[analytics] Retention cleanup failed"),
+        }
+    })
+    .await
+}
+
+async fn run_startup_analytics_retention_pass(
+    mutation_fence: &crate::pause_registry::GlobalMutationFence,
+    analytics_dir: &std::path::Path,
+    retention_days: u32,
+) {
+    if !run_analytics_retention_pass_if_admitted(
+        mutation_fence,
+        analytics_dir,
+        retention_days,
+        "Startup",
+    )
+    .await
+    {
+        tracing::debug!("[analytics] Release mutation fence active; startup retention skipped");
+    }
+}
+
+async fn run_scheduled_analytics_retention_pass(
+    mutation_fence: &crate::pause_registry::GlobalMutationFence,
+    analytics_dir: &std::path::Path,
+    retention_days: u32,
+) {
+    if !run_analytics_retention_pass_if_admitted(
+        mutation_fence,
+        analytics_dir,
+        retention_days,
+        "Retention",
+    )
+    .await
+    {
+        tracing::debug!("[analytics] Release mutation fence active; retention pass skipped");
+    }
+}
+
+async fn run_analytics_retention_loop(
+    mutation_fence: crate::pause_registry::GlobalMutationFence,
+    analytics_dir: std::path::PathBuf,
+    retention_days: u32,
+) {
+    if retention_days == 0 {
+        tracing::info!("[analytics] Retention cleanup disabled (retention_days=0)");
+        return;
+    }
+
+    run_startup_analytics_retention_pass(&mutation_fence, &analytics_dir, retention_days).await;
+
+    let mut interval = tokio::time::interval(Duration::from_secs(86_400));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        run_scheduled_analytics_retention_pass(&mutation_fence, &analytics_dir, retention_days)
+            .await;
     }
 }
 
@@ -399,21 +504,21 @@ async fn enforce_backup_retention(s3_config: &flapjack::index::s3::S3Config, ten
 pub(crate) fn spawn_background_tasks(
     state: &Arc<AppState>,
     infrastructure: &InfrastructureState,
-) -> Result<(), String> {
+) -> Result<StorageMaintenanceRegistration, String> {
     // Validate every externally configured duration before spawning anything.
     // This avoids a partial background subsystem when one Tokio interval would
     // otherwise panic after the server has begun accepting traffic.
     let intervals = BackgroundTaskIntervals::from_env()?;
     let health = Arc::clone(&state.background_task_health);
     spawn_ssl_renewal(infrastructure, &health);
-    spawn_analytics_tasks(infrastructure, intervals.rollup_secs, &health);
-    spawn_s3_backup_task(infrastructure, &health);
+    spawn_analytics_tasks(state, infrastructure, intervals.rollup_secs, &health);
+    spawn_s3_backup_task(state, infrastructure, &health);
     spawn_replication_tasks(state, infrastructure, intervals.sync_secs, &health);
-    spawn_migration_spool_gc_task(state);
+    let storage_maintenance = spawn_storage_maintenance_task(state);
     spawn_usage_rollup_task(state);
     spawn_metrics_refresh_task(state);
     spawn_usage_alert_task(state);
-    Ok(())
+    Ok(storage_maintenance)
 }
 
 fn migration_spool_gc_interval_secs() -> u64 {
@@ -449,28 +554,67 @@ fn autoheal_enabled_from_env() -> bool {
     }
 }
 
-fn spawn_migration_spool_gc_task(state: &Arc<AppState>) {
+/// Compile-time evidence that the required storage-maintenance loop was
+/// registered by server startup. Returning this from `spawn_background_tasks`
+/// makes deleting or commenting its production registration a build failure.
+pub(crate) struct StorageMaintenanceRegistration;
+
+fn spawn_storage_maintenance_task(state: &Arc<AppState>) -> StorageMaintenanceRegistration {
     let interval_secs = migration_spool_gc_interval_secs();
-    let store = match SpoolStore::new(&state.manager.base_path, SpoolLimits::default()) {
-        Ok(store) => store,
-        Err(error) => {
-            tracing::error!("[migration] Spool GC task disabled: {}", error);
-            return;
-        }
-    };
+    // Do not create the spool layout while a persisted release fence is active.
+    // The first admitted maintenance pass initializes the ordinary store and
+    // every later pass reuses it.
+    let spool_store = Arc::new(Mutex::new(None::<SpoolStore>));
+    let spool_data_root = state.manager.base_path.clone();
+    let crawler_store = CrawlerRunStore::new(&state.manager.base_path);
+    let mutation_fence = state.global_mutation_fence.clone();
 
     spawn_supervised(
         Arc::clone(&state.background_task_health),
-        "migration-spool-gc",
+        "storage-maintenance",
         async move {
             run_migration_spool_gc_loop(Duration::from_secs(interval_secs), move || {
-                let store = store.clone();
-                async move { run_migration_spool_gc_pass(&store) }
+                let spool_store = spool_store.clone();
+                let spool_data_root = spool_data_root.clone();
+                let crawler_store = crawler_store.clone();
+                let mutation_fence = mutation_fence.clone();
+                async move {
+                    let Ok(_mutation_permit) = mutation_fence.admit_mutation().await else {
+                        return Ok(());
+                    };
+                    let spool_store = {
+                        let mut initialized = spool_store
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if initialized.is_none() {
+                            match SpoolStore::new(&spool_data_root, SpoolLimits::default()) {
+                                Ok(store) => *initialized = Some(store),
+                                Err(error) => tracing::error!(
+                                    "[maintenance] Migration spool GC disabled: {}",
+                                    error
+                                ),
+                            }
+                        }
+                        initialized.clone()
+                    };
+                    let now_unix_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?
+                        .as_millis()
+                        .try_into()
+                        .map_err(|_| "system clock exceeds crawler timestamp range".to_string())?;
+                    run_storage_maintenance_pass(spool_store.as_ref(), &crawler_store, now_unix_ms)
+                        .map(|_| ())
+                }
             })
             .await;
         },
     );
-    tracing::info!("[migration] Spool GC enabled (interval={}s)", interval_secs);
+    tracing::info!(
+        "[maintenance] Storage cleanup enabled (interval={}s)",
+        interval_secs
+    );
+    StorageMaintenanceRegistration
 }
 
 async fn run_migration_spool_gc_loop<RunPass, PassFuture, PassError>(
@@ -487,7 +631,7 @@ async fn run_migration_spool_gc_loop<RunPass, PassFuture, PassError>(
     loop {
         interval.tick().await;
         if let Err(error) = run_pass().await {
-            tracing::error!("[migration] Spool GC pass failed: {}", error);
+            tracing::error!("[maintenance] Storage cleanup pass failed: {}", error);
         }
     }
 }
@@ -496,7 +640,66 @@ fn run_migration_spool_gc_pass(store: &SpoolStore) -> Result<(), SpoolError> {
     store.collect_garbage()
 }
 
+fn run_storage_maintenance_pass(
+    spool_store: Option<&SpoolStore>,
+    crawler_store: &CrawlerRunStore,
+    now_unix_ms: u64,
+) -> Result<usize, String> {
+    let spool_error = spool_store
+        .and_then(|store| run_migration_spool_gc_pass(store).err())
+        .map(|error| error.to_string());
+    let crawler_result = crawler_store.prune(now_unix_ms);
+
+    if let Ok(removed) = crawler_result.as_ref() {
+        if *removed > 0 {
+            tracing::info!(removed, "[maintenance] Pruned acknowledged crawler runs");
+        }
+    }
+
+    match (spool_error, crawler_result) {
+        (None, Ok(removed)) => Ok(removed),
+        (Some(spool_error), Ok(_)) => Err(format!("migration spool GC failed: {spool_error}")),
+        (None, Err(crawler_error)) => Err(format!("crawler retention failed: {crawler_error}")),
+        (Some(spool_error), Err(crawler_error)) => Err(format!(
+            "migration spool GC failed: {spool_error}; crawler retention failed: {crawler_error}"
+        )),
+    }
+}
+
 fn spawn_ssl_renewal(infrastructure: &InfrastructureState, health: &Arc<BackgroundTaskHealth>) {
+    if let Some(config) = infrastructure
+        .managed_ssl
+        .as_ref()
+        .and_then(|configured| configured.deferred_config.clone())
+    {
+        let mutation_fence = infrastructure.global_mutation_fence.clone();
+        spawn_supervised(Arc::clone(health), "ssl-renewal-deferred", async move {
+            // A fenced target must serve existing material without contacting
+            // ACME. Poll the persisted fence and initialize the ordinary owner
+            // only after the release transaction durably reopens mutations.
+            loop {
+                if mutation_fence.status().await.is_none() {
+                    let _permit = match mutation_fence.admit_mutation().await {
+                        Ok(permit) => permit,
+                        Err(_) => continue,
+                    };
+                    match flapjack::SslManager::new(config).await {
+                        Ok(manager) => {
+                            flapjack_ssl::set_global_manager(Arc::clone(&manager));
+                            drop(_permit);
+                            manager.start_renewal_loop().await;
+                        }
+                        Err(error) => {
+                            tracing::error!(error = %error, "[SSL] Deferred initialization failed");
+                        }
+                    }
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        tracing::info!("[SSL] Auto-renewal deferred until release fence opens");
+    }
     let plan = ssl_background_plan(
         infrastructure
             .managed_ssl
@@ -544,6 +747,7 @@ fn spawn_ssl_renewal(infrastructure: &InfrastructureState, health: &Arc<Backgrou
 
 /// Spawns background tasks for analytics rollup and retention cleanup.
 fn spawn_analytics_tasks(
+    state: &Arc<AppState>,
     infrastructure: &InfrastructureState,
     rollup_interval_secs: u64,
     health: &Arc<BackgroundTaskHealth>,
@@ -554,14 +758,31 @@ fn spawn_analytics_tasks(
     }
 
     let collector = Arc::clone(&infrastructure.analytics_collector);
+    let flush_interval_secs = infrastructure.analytics_config.flush_interval_secs;
+    let mutation_fence = state.global_mutation_fence.clone();
     spawn_supervised(Arc::clone(health), "analytics-flush", async move {
-        collector.run_flush_loop().await
+        let mut interval = tokio::time::interval(Duration::from_secs(flush_interval_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if !run_background_mutation_if_admitted(&mutation_fence, || async {
+                collector.run_periodic_flush_pass();
+            })
+            .await
+            {
+                tracing::debug!(
+                    "[analytics] Release mutation fence active; periodic flush skipped"
+                );
+            }
+        }
     });
 
     let retention_dir = infrastructure.analytics_config.data_dir.clone();
     let retention_days = infrastructure.analytics_config.retention_days;
+    let mutation_fence = state.global_mutation_fence.clone();
     spawn_supervised(Arc::clone(health), "analytics-retention", async move {
-        flapjack::analytics::retention::run_retention_loop(retention_dir, retention_days).await;
+        run_analytics_retention_loop(mutation_fence, retention_dir, retention_days).await;
     });
 
     tracing::info!(
@@ -570,7 +791,7 @@ fn spawn_analytics_tasks(
         infrastructure.analytics_config.retention_days
     );
 
-    spawn_local_rollup_generation_task(infrastructure, rollup_interval_secs, health);
+    spawn_local_rollup_generation_task(state, infrastructure, rollup_interval_secs, health);
 
     if let Some(cluster) = crate::analytics_cluster::get_global_cluster() {
         let local_node_id = cluster.node_id().to_string();
@@ -580,6 +801,7 @@ fn spawn_analytics_tasks(
             cluster,
             local_node_id,
             rollup_interval_secs,
+            state.global_mutation_fence.clone(),
         );
         supervise_handle(Arc::clone(health), "rollup-broadcast", handle);
         tracing::info!(
@@ -591,12 +813,14 @@ fn spawn_analytics_tasks(
 
 /// TODO: Document spawn_local_rollup_generation_task.
 fn spawn_local_rollup_generation_task(
+    state: &Arc<AppState>,
     infrastructure: &InfrastructureState,
     rollup_interval_secs: u64,
     health: &Arc<BackgroundTaskHealth>,
 ) {
     let collector = Arc::clone(&infrastructure.analytics_collector);
     let analytics_config = infrastructure.analytics_config.clone();
+    let mutation_fence = state.global_mutation_fence.clone();
     spawn_supervised(Arc::clone(health), "local-rollup-generation", async move {
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(rollup_interval_secs));
@@ -604,7 +828,15 @@ fn spawn_local_rollup_generation_task(
         interval.tick().await;
         loop {
             interval.tick().await;
-            run_local_rollup_generation_pass(&analytics_config, &collector);
+            if !run_background_mutation_if_admitted(&mutation_fence, || async {
+                run_local_rollup_generation_pass(&analytics_config, &collector);
+            })
+            .await
+            {
+                tracing::debug!(
+                    "[analytics] Release mutation fence active; local rollup generation skipped"
+                );
+            }
         }
     });
     tracing::info!(
@@ -627,8 +859,7 @@ fn run_local_rollup_generation_pass(
 
     for index_name in indexes {
         let started = Instant::now();
-        match flapjack::analytics::writer::flush_rollup_window_with_event_count(
-            analytics_config,
+        match collector.flush_rollup_window_with_event_count(
             &index_name,
             "1hour",
             hour_start_ms,
@@ -731,7 +962,11 @@ mod snapshot_restore_tests {
 }
 
 /// Spawns a periodic S3 snapshot backup task for all tenants.
-fn spawn_s3_backup_task(infrastructure: &InfrastructureState, health: &Arc<BackgroundTaskHealth>) {
+fn spawn_s3_backup_task(
+    state: &Arc<AppState>,
+    infrastructure: &InfrastructureState,
+    health: &Arc<BackgroundTaskHealth>,
+) {
     if let Some(s3_config) = infrastructure.s3_config.as_ref() {
         if let Some(interval_secs) = infrastructure.s3_snapshot_interval_secs {
             let data_dir = infrastructure
@@ -741,8 +976,10 @@ fn spawn_s3_backup_task(infrastructure: &InfrastructureState, health: &Arc<Backg
                 .to_string();
             let manager = Arc::clone(&infrastructure.manager);
             let config = s3_config.clone();
+            let mutation_fence = state.global_mutation_fence.clone();
             spawn_supervised(Arc::clone(health), "s3-backup", async move {
-                scheduled_s3_backups(data_dir, config, manager, interval_secs).await;
+                scheduled_s3_backups(data_dir, config, manager, mutation_fence, interval_secs)
+                    .await;
             });
             tracing::info!("Scheduled S3 backups every {}s", interval_secs);
         }
@@ -758,7 +995,11 @@ fn spawn_replication_tasks(
 ) {
     if let Some(replication_manager) = infrastructure.replication_manager.as_ref() {
         let autoheal_enabled = autoheal_enabled_from_env();
-        replication_manager.start_health_probe(10, autoheal_enabled);
+        let mutation_fence = state.global_mutation_fence.clone();
+        replication_manager.start_health_probe_with_admission(10, autoheal_enabled, move || {
+            let mutation_fence = mutation_fence.clone();
+            async move { mutation_fence.admit_mutation().await.ok() }
+        });
         let health_probe = Arc::clone(replication_manager);
         spawn_supervised(
             Arc::clone(health),
@@ -803,11 +1044,10 @@ fn run_usage_rollover(
     now: chrono::DateTime<chrono::Utc>,
     persistence: &crate::usage_persistence::UsagePersistence,
     counters: &dashmap::DashMap<String, crate::usage_middleware::TenantUsageCounters>,
-    manager: &flapjack::IndexManager,
-    storage_gauges: Option<&dashmap::DashMap<String, u64>>,
+    metrics_state: Option<&crate::handlers::metrics::MetricsState>,
 ) -> std::io::Result<String> {
     let completed_day = completed_utc_day(now);
-    let captured_gauges = crate::usage_capture::capture_live_gauges(manager, storage_gauges);
+    let captured_gauges = crate::usage_capture::capture_live_gauges(metrics_state);
     persistence.rollup_with_gauges(&completed_day, counters, &captured_gauges)?;
     Ok(completed_day)
 }
@@ -816,8 +1056,8 @@ fn run_usage_rollover(
 fn spawn_usage_rollup_task(state: &Arc<AppState>) {
     if let Some(persistence) = state.usage_persistence.clone() {
         let counters = Arc::clone(&state.usage_counters);
-        let manager = Arc::clone(&state.manager);
-        let storage_gauges = state.metrics_state.clone().map(|m| m.storage_gauges);
+        let metrics_state = state.metrics_state.clone();
+        let mutation_fence = state.global_mutation_fence.clone();
         spawn_supervised(
             Arc::clone(&state.background_task_health),
             "usage-rollup",
@@ -836,26 +1076,85 @@ fn spawn_usage_rollup_task(state: &Arc<AppState>) {
                     // the just-completed UTC date rather than the new current day.
                     let rollup_now = chrono::Utc::now();
                     let completed_day = completed_utc_day(rollup_now);
-                    match run_usage_rollover(
-                        rollup_now,
-                        &persistence,
-                        &counters,
-                        &manager,
-                        storage_gauges.as_deref(),
-                    ) {
-                        Ok(_) => {
-                            tracing::info!("[usage] Daily rollup complete (date={})", completed_day)
+                    if !run_background_mutation_if_admitted(&mutation_fence, || async {
+                        match run_usage_rollover(
+                            rollup_now,
+                            &persistence,
+                            &counters,
+                            metrics_state.as_ref(),
+                        ) {
+                            Ok(_) => tracing::info!(
+                                "[usage] Daily rollup complete (date={})",
+                                completed_day
+                            ),
+                            Err(e) => tracing::error!(
+                                "[usage] Daily rollup failed (date={}): {}",
+                                completed_day,
+                                e
+                            ),
                         }
-                        Err(e) => tracing::error!(
-                            "[usage] Daily rollup failed (date={}): {}",
-                            completed_day,
-                            e
-                        ),
+                    })
+                    .await
+                    {
+                        tracing::debug!(
+                            "[usage] Release mutation fence active; daily rollup skipped"
+                        );
                     }
                 }
             },
         );
     }
+}
+
+/// Build a complete per-index gauge generation off-lock, then publish it once.
+///
+/// Inventory failure retains the entire prior generation. Per-index read
+/// failures retain that dimension's last known value (or unknown when none was
+/// ever published). Only the authoritative visible-directory inventory removes
+/// an index from the next generation.
+pub(crate) fn refresh_metrics_snapshot(
+    manager: &flapjack::IndexManager,
+    metrics_state: &crate::handlers::metrics::MetricsState,
+) -> std::io::Result<()> {
+    let tenant_ids = visible_tenant_dir_names(&manager.base_path)?;
+    let previous = metrics_state.index_gauge_snapshot();
+    let mut next = crate::handlers::metrics::IndexGaugeSnapshot::new();
+
+    for tenant_id in tenant_ids {
+        let prior = previous.get(&tenant_id).copied().unwrap_or_default();
+        let documents_count = match manager.tenant_durable_doc_count(&tenant_id) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                tracing::warn!(
+                    tenant = %tenant_id,
+                    error = %error,
+                    "metrics refresh retained prior document count"
+                );
+                prior.documents_count
+            }
+        };
+        let storage_bytes = match manager.try_tenant_storage_bytes(&tenant_id) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                tracing::warn!(
+                    tenant = %tenant_id,
+                    error = %error,
+                    "metrics refresh retained prior storage measurement"
+                );
+                prior.storage_bytes
+            }
+        };
+        next.insert(
+            tenant_id,
+            crate::handlers::metrics::IndexGaugeValues {
+                documents_count,
+                storage_bytes,
+            },
+        );
+    }
+
+    metrics_state.replace_index_gauges(next);
+    Ok(())
 }
 
 /// Spawns a periodic task to refresh per-index Prometheus metric gauges.
@@ -869,10 +1168,11 @@ fn spawn_metrics_refresh_task(state: &Arc<AppState>) {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
                 loop {
                     interval.tick().await;
-                    let storage = manager.all_tenant_storage();
-                    ms.storage_gauges.clear();
-                    for (tenant, bytes) in storage {
-                        ms.storage_gauges.insert(tenant, bytes);
+                    if let Err(error) = refresh_metrics_snapshot(&manager, &ms) {
+                        tracing::warn!(
+                            error = %error,
+                            "metrics refresh retained prior generation after inventory failure"
+                        );
                     }
                 }
             },
@@ -922,4 +1222,32 @@ fn spawn_usage_alert_task(state: &Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     include!("background_tasks_tests.rs");
+
+    #[tokio::test]
+    async fn release_fence_suppresses_scheduled_backup_mutation_pass() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_root = temp.path().join("flapjack/data");
+        std::fs::create_dir_all(&data_root).unwrap();
+        let fence = crate::pause_registry::GlobalMutationFence::open(&data_root).unwrap();
+        fence.acquire("release-backup-1").await.unwrap();
+
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_in_pass = std::sync::Arc::clone(&ran);
+        assert!(
+            !super::run_background_mutation_if_admitted(&fence, || async move {
+                ran_in_pass.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await
+        );
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+
+        fence.release("release-backup-1").await.unwrap();
+        assert!(
+            super::run_background_mutation_if_admitted(&fence, || async {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await
+        );
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
 }
