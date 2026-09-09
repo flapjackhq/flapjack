@@ -23,6 +23,47 @@ which avoids the most common traps when checking release or engine status:
   The daily shadow candidate runs `scripts/shadow_public_candidate.sh` from a pinned runner clone; launchd requests one run each day at 09:00 host-local time.
   A successful reconciliation leaves exactly one open candidate for the private-main SHA fetched by that run, or zero when the fetched public-main manifest already names that SHA; lock contention is a logged exit-zero no-op without reconciliation, while failures exit nonzero with an actionable log message.
   It never auto-merges, approves, tags, releases, or dispatches workflows; operators use `gui/<uid>/com.flapjack.shadow-candidate` and `/Users/stuart/.matt/shadow_candidate.log`.
+  **Verifying the installed runner:** `scripts/shadow_public_candidate.sh --check-runner`
+  is the only supported way to confirm an installed runner without reconciling. It takes
+  the same lock, performs the same single private `fetch origin main`, creates the same
+  detached execution worktree at the fetched SHA, and runs the same provenance validation
+  as a normal run, then exits before touching the public repository or GitHub. Verified
+  provenance requires **both** signals, checked separately: the observed process result
+  `PROBE_EXIT=0` (capture it as `PROBE_EXIT=0; ... || PROBE_EXIT=$?`, never as an
+  unconditional `PROBE_EXIT=0` after the call, which masks failure), **and** exactly one
+  stdout receipt `Shadow runner check succeeded: executed=<40-hex> reconciles=<40-hex>`
+  whose two full SHAs are equal. Exit 0 with no receipt means the probe hit lock
+  contention and did nothing — that is not verified provenance; rerun it when the lock is
+  free. `executed` is the commit whose code actually ran; `reconciles` is the commit that
+  run would have reconciled.
+  **Runner identity vs. probe SHAs:** the installed-runner identity is the reviewed and
+  landed private-main SHA the runner clone is pinned to, and it is *not* what the probe
+  prints. The probe's two equal SHAs name the private `origin/main` commit that run
+  selected, and they are legitimately newer than the pinned bootstrap SHA whenever private
+  `main` has advanced — ordinary reconciler changes are picked up automatically by design.
+  Do not treat a newer probe SHA as drift.
+  **One-time installation of a reviewed, landed bootstrap SHA** (`<install-sha>` must
+  already be on private `main`). Hold an installation lock over the whole re-pin so no
+  scheduled run observes a half-installed runner, and release it before probing so the
+  probe acquires the normal reconciliation lock itself:
+  1. Refuse to proceed unless the runner clone is detached (`git -C <runner> rev-parse
+     --abbrev-ref HEAD` prints `HEAD`), clean (`git -C <runner> status --porcelain=v1
+     --untracked-files=all` prints nothing), and on the expected origin (`git -C <runner>
+     config --get remote.origin.url` is `git@github.com:gridl-dev/flapjack_dev.git`).
+  2. `git -C <runner> fetch --quiet origin main` first, then verify `git -C <runner>
+     rev-parse --verify refs/remotes/origin/main^{commit}` equals `<install-sha>` exactly.
+     If it does not, stop — re-pinning to anything else installs unreviewed code.
+  3. `git -C <runner> checkout --detach origin/main`.
+  4. Release the installation lock.
+  5. Run `<runner>/scripts/shadow_public_candidate.sh --check-runner` and apply the
+     two-signal check above.
+  `.debbie.toml` in the runner clone stays pinned-runner configuration and is read from
+  the pin, not from selected code. Ordinary reconciler fixes need no reinstall; only a
+  landed topology change or a change to the bootstrap protocol itself requires repeating
+  the sequence above. Installation and verification stop there: do not kickstart or
+  otherwise poke launchd, do not run the reconciler without `--check-runner` to "test" it,
+  do not change credentials or policy, and do not alter the 09:00 (Hour 9, Minute 0)
+  schedule.
   The publisher never releases. The public repo's dispatch-only `release.yml` is
   the **authoritative CI for release closeout** — git tags, GitHub Releases, and
   GHCR images exist only there, never on the dev repo (`git tag -l` on dev is
