@@ -1,5 +1,52 @@
 use super::*;
 
+const STARTUP_FIXTURE_NODE_ID: &str = "startup-fixture-node";
+const STARTUP_FIXTURE_BIND_ADDR: &str = "192.0.2.10:7700";
+const MANAGED_FLEET_FIXTURE_DATA_DIR_ENV: &str = "MANAGED_FLEET_HA_FIXTURE_DATA_DIR";
+const MANAGED_FLEET_FIXTURE_VERDICT_PREFIX: &str = "MANAGED_FLEET_HA_FIXTURE_VERDICT=";
+
+fn with_startup_fixture(test: impl FnOnce(&tempfile::TempDir)) {
+    let _env_lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp_dir = tempfile::tempdir().expect("startup fixture directory must be created");
+    let _node_id = EnvVarRestoreGuard::set("FLAPJACK_NODE_ID", STARTUP_FIXTURE_NODE_ID);
+    let _bind_addr = EnvVarRestoreGuard::set("FLAPJACK_BIND_ADDR", STARTUP_FIXTURE_BIND_ADDR);
+    let _peers = EnvVarRestoreGuard::remove("FLAPJACK_PEERS");
+    let _bootstrap_peer = EnvVarRestoreGuard::remove("FLAPJACK_BOOTSTRAP_PEER");
+    let _advertise_addr = EnvVarRestoreGuard::remove("FLAPJACK_ADVERTISE_ADDR");
+    let _replication_key = EnvVarRestoreGuard::remove("FLAPJACK_REPLICATION_API_KEY");
+    let _allow_cleartext = EnvVarRestoreGuard::remove("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS");
+
+    test(&temp_dir);
+}
+
+#[test]
+#[ignore = "fixture adapter invoked explicitly by the managed-fleet contract harness"]
+fn managed_fleet_ha_provisioning_fixture_verdict() {
+    let data_dir = std::env::var_os(MANAGED_FLEET_FIXTURE_DATA_DIR_ENV)
+        .map(std::path::PathBuf::from)
+        .expect("MANAGED_FLEET_HA_FIXTURE_DATA_DIR must name the caller-created data directory");
+
+    let verdict = match NodeConfig::load_for_server_startup(&data_dir) {
+        Ok(config) => serde_json::json!({
+            "outcome": "loaded",
+            "intent": config.has_replication_intent(),
+            "node_id": config.node_id,
+            "bind_addr": config.bind_addr,
+            "peers": config.peers,
+            "bootstrap_peer": config.bootstrap_peer,
+            "advertise_addr": config.advertise_addr,
+        }),
+        Err(error) => serde_json::json!({
+            "outcome": "startup_error",
+            "error": error,
+        }),
+    };
+
+    println!("{MANAGED_FLEET_FIXTURE_VERDICT_PREFIX}{verdict}");
+}
+
 #[test]
 fn bootstrap_peer_env_is_normalized_as_a_safe_origin() {
     let _guard = ENV_MUTEX.lock().unwrap();
@@ -354,4 +401,394 @@ fn node_json_cleartext_peer_escape_repermits_and_warns() {
             || output.contains("persisted-cleartext"),
         "warning must name the persisted cleartext peer, got: {output:?}"
     );
+}
+
+#[test]
+fn startup_standalone_environment_loads_without_replication_intent() {
+    with_startup_fixture(|temp_dir| {
+        let config = NodeConfig::load_for_server_startup(temp_dir.path())
+            .expect("standalone startup configuration must load");
+
+        assert_eq!(config.node_id, STARTUP_FIXTURE_NODE_ID);
+        assert_eq!(config.bind_addr, STARTUP_FIXTURE_BIND_ADDR);
+        assert!(config.peers.is_empty());
+        assert_eq!(config.bootstrap_peer, None);
+        assert_eq!(config.advertise_addr, None);
+        assert!(!config.has_replication_intent());
+    });
+}
+
+#[test]
+fn startup_environment_peer_loads_with_replication_intent() {
+    with_startup_fixture(|temp_dir| {
+        let _peers = EnvVarRestoreGuard::set(
+            "FLAPJACK_PEERS",
+            "environment-peer=https://environment-peer.example.com:8443///",
+        );
+
+        let config = NodeConfig::load_for_server_startup(temp_dir.path())
+            .expect("HTTPS environment peer must load");
+
+        assert_eq!(config.node_id, STARTUP_FIXTURE_NODE_ID);
+        assert_eq!(config.bind_addr, STARTUP_FIXTURE_BIND_ADDR);
+        assert_eq!(
+            config.peers,
+            vec![PeerConfig {
+                node_id: "environment-peer".to_string(),
+                addr: "https://environment-peer.example.com:8443".to_string(),
+            }]
+        );
+        assert_eq!(config.bootstrap_peer, None);
+        assert_eq!(config.advertise_addr, None);
+        assert!(config.has_replication_intent());
+    });
+}
+
+#[test]
+fn startup_environment_bootstrap_loads_with_replication_intent() {
+    with_startup_fixture(|temp_dir| {
+        let _bootstrap_peer = EnvVarRestoreGuard::set(
+            "FLAPJACK_BOOTSTRAP_PEER",
+            "https://bootstrap-startup.example.com:8443///",
+        );
+
+        let config = NodeConfig::load_for_server_startup(temp_dir.path())
+            .expect("HTTPS environment bootstrap peer must load");
+
+        assert_eq!(config.node_id, STARTUP_FIXTURE_NODE_ID);
+        assert_eq!(config.bind_addr, STARTUP_FIXTURE_BIND_ADDR);
+        assert!(config.peers.is_empty());
+        assert_eq!(
+            config.bootstrap_peer.as_deref(),
+            Some("https://bootstrap-startup.example.com:8443")
+        );
+        assert_eq!(config.advertise_addr, None);
+        assert!(config.has_replication_intent());
+    });
+}
+
+#[test]
+fn startup_environment_advertise_loads_with_replication_intent() {
+    with_startup_fixture(|temp_dir| {
+        let _advertise_addr = EnvVarRestoreGuard::set(
+            "FLAPJACK_ADVERTISE_ADDR",
+            "https://advertise-startup.example.com:8443///",
+        );
+
+        let config = NodeConfig::load_for_server_startup(temp_dir.path())
+            .expect("HTTPS environment advertise address must load");
+
+        assert_eq!(config.node_id, STARTUP_FIXTURE_NODE_ID);
+        assert_eq!(config.bind_addr, STARTUP_FIXTURE_BIND_ADDR);
+        assert!(config.peers.is_empty());
+        assert_eq!(config.bootstrap_peer, None);
+        assert_eq!(
+            config.advertise_addr.as_deref(),
+            Some("https://advertise-startup.example.com:8443")
+        );
+        assert!(config.has_replication_intent());
+    });
+}
+
+#[test]
+fn startup_persisted_peer_loads_with_replication_intent() {
+    with_startup_fixture(|temp_dir| {
+        let node_json = serde_json::json!({
+            "node_id": "persisted-peer-node",
+            "bind_addr": "198.51.100.20:7700",
+            "peers": [{
+                "node_id": "persisted-peer",
+                "addr": "https://persisted-peer.example.com:8443"
+            }]
+        });
+        std::fs::write(temp_dir.path().join("node.json"), node_json.to_string())
+            .expect("persisted peer fixture must be writable");
+
+        let config = NodeConfig::load_for_server_startup(temp_dir.path())
+            .expect("persisted HTTPS peer must load");
+
+        assert_eq!(config.node_id, "persisted-peer-node");
+        assert_eq!(config.bind_addr, "198.51.100.20:7700");
+        assert_eq!(
+            config.peers,
+            vec![PeerConfig {
+                node_id: "persisted-peer".to_string(),
+                addr: "https://persisted-peer.example.com:8443".to_string(),
+            }]
+        );
+        assert_eq!(config.bootstrap_peer, None);
+        assert_eq!(config.advertise_addr, None);
+        assert!(config.has_replication_intent());
+    });
+}
+
+#[test]
+fn startup_persisted_cleartext_peer_loads_without_replication_credential() {
+    with_startup_fixture(|temp_dir| {
+        let node_json = serde_json::json!({
+            "node_id": "persisted-cleartext-node",
+            "bind_addr": "198.51.100.24:7700",
+            "peers": [{
+                "node_id": "persisted-cleartext-peer",
+                "addr": "http://persisted-cleartext.example.com:7700"
+            }]
+        });
+        std::fs::write(temp_dir.path().join("node.json"), node_json.to_string())
+            .expect("persisted cleartext fixture must be writable");
+
+        let config = NodeConfig::load_for_server_startup(temp_dir.path())
+            .expect("cleartext peer without a configured credential must load");
+
+        assert_eq!(
+            config.peers,
+            vec![PeerConfig {
+                node_id: "persisted-cleartext-peer".to_string(),
+                addr: "http://persisted-cleartext.example.com:7700".to_string(),
+            }]
+        );
+    });
+}
+
+#[test]
+fn startup_persisted_advertise_loads_with_replication_intent() {
+    with_startup_fixture(|temp_dir| {
+        let node_json = serde_json::json!({
+            "node_id": "persisted-advertise-node",
+            "bind_addr": "198.51.100.21:7700",
+            "advertise_addr": "https://persisted-advertise.example.com:8443",
+            "peers": []
+        });
+        std::fs::write(temp_dir.path().join("node.json"), node_json.to_string())
+            .expect("persisted advertise fixture must be writable");
+
+        let config = NodeConfig::load_for_server_startup(temp_dir.path())
+            .expect("persisted HTTPS advertise address must load");
+
+        assert_eq!(config.node_id, "persisted-advertise-node");
+        assert_eq!(config.bind_addr, "198.51.100.21:7700");
+        assert!(config.peers.is_empty());
+        assert_eq!(config.bootstrap_peer, None);
+        assert_eq!(
+            config.advertise_addr.as_deref(),
+            Some("https://persisted-advertise.example.com:8443")
+        );
+        assert!(config.has_replication_intent());
+    });
+}
+
+#[test]
+fn startup_persisted_standalone_overrides_all_topology_environment() {
+    with_startup_fixture(|temp_dir| {
+        let node_json = serde_json::json!({
+            "node_id": "persisted-standalone-node",
+            "bind_addr": "198.51.100.22:7700",
+            "peers": []
+        });
+        std::fs::write(temp_dir.path().join("node.json"), node_json.to_string())
+            .expect("persisted standalone fixture must be writable");
+        let _peers = EnvVarRestoreGuard::set(
+            "FLAPJACK_PEERS",
+            "conflicting-peer=https://conflicting-peer.example.com:8443",
+        );
+        let _bootstrap_peer = EnvVarRestoreGuard::set(
+            "FLAPJACK_BOOTSTRAP_PEER",
+            "https://conflicting-bootstrap.example.com:8443",
+        );
+        let _advertise_addr = EnvVarRestoreGuard::set(
+            "FLAPJACK_ADVERTISE_ADDR",
+            "https://conflicting-advertise.example.com:8443",
+        );
+
+        let config = NodeConfig::load_for_server_startup(temp_dir.path())
+            .expect("persisted standalone configuration must load");
+
+        assert_eq!(config.node_id, "persisted-standalone-node");
+        assert_eq!(config.bind_addr, "198.51.100.22:7700");
+        assert!(config.peers.is_empty());
+        assert_eq!(config.bootstrap_peer, None);
+        assert_eq!(config.advertise_addr, None);
+        assert!(!config.has_replication_intent());
+    });
+}
+
+#[test]
+fn startup_persisted_topology_overrides_all_topology_environment() {
+    with_startup_fixture(|temp_dir| {
+        let node_json = serde_json::json!({
+            "node_id": "persisted-topology-node",
+            "bind_addr": "198.51.100.23:7700",
+            "advertise_addr": "https://persisted-topology.example.com:8443",
+            "peers": [{
+                "node_id": "persisted-topology-peer",
+                "addr": "https://persisted-topology-peer.example.com:8443"
+            }]
+        });
+        std::fs::write(temp_dir.path().join("node.json"), node_json.to_string())
+            .expect("persisted topology fixture must be writable");
+        let _peers = EnvVarRestoreGuard::set(
+            "FLAPJACK_PEERS",
+            "conflicting-peer=https://conflicting-peer.example.com:8443",
+        );
+        let _bootstrap_peer = EnvVarRestoreGuard::set(
+            "FLAPJACK_BOOTSTRAP_PEER",
+            "https://conflicting-bootstrap.example.com:8443",
+        );
+        let _advertise_addr = EnvVarRestoreGuard::set(
+            "FLAPJACK_ADVERTISE_ADDR",
+            "https://conflicting-advertise.example.com:8443",
+        );
+
+        let config = NodeConfig::load_for_server_startup(temp_dir.path())
+            .expect("persisted topology configuration must load");
+
+        assert_eq!(config.node_id, "persisted-topology-node");
+        assert_eq!(config.bind_addr, "198.51.100.23:7700");
+        assert_eq!(
+            config.peers,
+            vec![PeerConfig {
+                node_id: "persisted-topology-peer".to_string(),
+                addr: "https://persisted-topology-peer.example.com:8443".to_string(),
+            }]
+        );
+        assert_eq!(config.bootstrap_peer, None);
+        assert_eq!(
+            config.advertise_addr.as_deref(),
+            Some("https://persisted-topology.example.com:8443")
+        );
+        assert!(config.has_replication_intent());
+    });
+}
+
+#[test]
+fn startup_malformed_file_falls_back_to_standalone_environment() {
+    with_startup_fixture(|temp_dir| {
+        let node_json = temp_dir.path().join("node.json");
+        std::fs::write(&node_json, b"{ malformed startup config")
+            .expect("malformed fixture must be writable");
+
+        let config = NodeConfig::load_for_server_startup(temp_dir.path())
+            .expect("malformed file must fall back to standalone environment");
+
+        assert_eq!(config.node_id, STARTUP_FIXTURE_NODE_ID);
+        assert_eq!(config.bind_addr, STARTUP_FIXTURE_BIND_ADDR);
+        assert!(config.peers.is_empty());
+        assert_eq!(config.bootstrap_peer, None);
+        assert_eq!(config.advertise_addr, None);
+        assert!(!config.has_replication_intent());
+        assert_eq!(
+            std::fs::read(&node_json).expect("malformed file must remain present"),
+            b"{ malformed startup config"
+        );
+    });
+}
+
+#[test]
+fn startup_malformed_file_falls_back_to_environment_topology() {
+    with_startup_fixture(|temp_dir| {
+        let node_json = temp_dir.path().join("node.json");
+        std::fs::write(&node_json, b"{ malformed startup config")
+            .expect("malformed fixture must be writable");
+        let _bootstrap_peer = EnvVarRestoreGuard::set(
+            "FLAPJACK_BOOTSTRAP_PEER",
+            "https://fallback-bootstrap.example.com:8443///",
+        );
+
+        let config = NodeConfig::load_for_server_startup(temp_dir.path())
+            .expect("malformed file must fall back to valid environment topology");
+
+        assert_eq!(config.node_id, STARTUP_FIXTURE_NODE_ID);
+        assert_eq!(config.bind_addr, STARTUP_FIXTURE_BIND_ADDR);
+        assert!(config.peers.is_empty());
+        assert_eq!(
+            config.bootstrap_peer.as_deref(),
+            Some("https://fallback-bootstrap.example.com:8443")
+        );
+        assert_eq!(config.advertise_addr, None);
+        assert!(config.has_replication_intent());
+        assert_eq!(
+            std::fs::read(&node_json).expect("malformed file must remain present"),
+            b"{ malformed startup config"
+        );
+    });
+}
+
+#[test]
+fn startup_rejects_credentialed_cleartext_environment_peer() {
+    with_startup_fixture(|temp_dir| {
+        let _replication_key =
+            EnvVarRestoreGuard::set("FLAPJACK_REPLICATION_API_KEY", "startup-fixture-key");
+        let _peers = EnvVarRestoreGuard::set(
+            "FLAPJACK_PEERS",
+            "cleartext-environment=http://cleartext-environment.example.com:7700",
+        );
+
+        let error = NodeConfig::load_for_server_startup(temp_dir.path())
+            .expect_err("credentialed cleartext environment peer must fail startup");
+
+        assert!(error.contains("cleartext-environment"), "got: {error}");
+        assert!(
+            error.contains("http://cleartext-environment.example.com:7700"),
+            "got: {error}"
+        );
+        assert!(
+            error.contains("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1"),
+            "got: {error}"
+        );
+    });
+}
+
+#[test]
+fn startup_rejects_credentialed_cleartext_persisted_peer() {
+    with_startup_fixture(|temp_dir| {
+        let _replication_key =
+            EnvVarRestoreGuard::set("FLAPJACK_REPLICATION_API_KEY", "startup-fixture-key");
+        let node_json = serde_json::json!({
+            "node_id": "persisted-cleartext-node",
+            "bind_addr": "198.51.100.24:7700",
+            "peers": [{
+                "node_id": "persisted-cleartext-peer",
+                "addr": "http://persisted-cleartext.example.com:7700"
+            }]
+        });
+        std::fs::write(temp_dir.path().join("node.json"), node_json.to_string())
+            .expect("persisted cleartext fixture must be writable");
+
+        let error = NodeConfig::load_for_server_startup(temp_dir.path())
+            .expect_err("credentialed cleartext persisted peer must fail startup");
+
+        assert!(error.contains("persisted-cleartext-peer"), "got: {error}");
+        assert!(
+            error.contains("http://persisted-cleartext.example.com:7700"),
+            "got: {error}"
+        );
+        assert!(
+            error.contains("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1"),
+            "got: {error}"
+        );
+    });
+}
+
+#[test]
+fn startup_rejects_credentialed_cleartext_environment_bootstrap_peer() {
+    with_startup_fixture(|temp_dir| {
+        let _replication_key =
+            EnvVarRestoreGuard::set("FLAPJACK_REPLICATION_API_KEY", "startup-fixture-key");
+        let _bootstrap_peer = EnvVarRestoreGuard::set(
+            "FLAPJACK_BOOTSTRAP_PEER",
+            "http://cleartext-bootstrap.example.com:7700",
+        );
+
+        let error = NodeConfig::load_for_server_startup(temp_dir.path())
+            .expect_err("credentialed cleartext bootstrap peer must fail startup");
+
+        assert!(error.contains("bootstrap"), "got: {error}");
+        assert!(
+            error.contains("http://cleartext-bootstrap.example.com:7700"),
+            "got: {error}"
+        );
+        assert!(
+            error.contains("FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS=1"),
+            "got: {error}"
+        );
+    });
 }
