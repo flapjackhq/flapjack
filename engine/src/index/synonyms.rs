@@ -175,7 +175,7 @@ impl SynonymStore {
         page: usize,
         hits_per_page: usize,
     ) -> (Vec<Synonym>, usize) {
-        let filtered: Vec<Synonym> = self
+        let mut filtered: Vec<Synonym> = self
             .synonyms
             .values()
             .filter(|syn| {
@@ -191,6 +191,8 @@ impl SynonymStore {
             })
             .cloned()
             .collect();
+
+        filtered.sort_by(|a, b| a.object_id().cmp(b.object_id()));
 
         let total = filtered.len();
         let start = page.saturating_mul(hits_per_page);
@@ -468,6 +470,24 @@ mod tests {
 
         let (page_oob, _) = store.search("", None, 10, 2);
         assert!(page_oob.is_empty(), "out-of-bounds page should be empty");
+    }
+
+    #[test]
+    fn search_orders_by_object_id_before_pagination() {
+        let mut store = SynonymStore::new();
+        for i in (0..20).rev() {
+            store.insert(regular(&format!("syn-{i:02}"), &[&format!("word-{i}")]));
+        }
+
+        let mut object_ids = Vec::new();
+        for page in 0..4 {
+            let (results, total) = store.search("", None, page, 5);
+            assert_eq!(total, 20);
+            object_ids.extend(results.iter().map(|synonym| synonym.object_id().to_owned()));
+        }
+        let expected: Vec<_> = (0..20).map(|i| format!("syn-{i:02}")).collect();
+
+        assert_eq!(object_ids, expected);
     }
 
     #[test]
