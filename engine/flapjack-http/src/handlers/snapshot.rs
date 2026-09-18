@@ -1,12 +1,12 @@
 //! Stub summary for snapshot.rs.
-use super::AppState;
+use super::{internal::prepare_release_import, AppState};
 use crate::error_response::json_error;
 use crate::extractors::ValidatedIndexName;
 use crate::security_audit::{emit_admin_action, Action, Actor, AuditIndexName, Outcome, Target};
 use axum::{
     body::Bytes,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -245,6 +245,7 @@ pub async fn export_snapshot(
     request_body(content = Vec<u8>, description = "Snapshot tar.gz file"),
     responses(
         (status = 200, description = "Import successful", body = serde_json::Value),
+        (status = 400, description = "Invalid release transfer metadata"),
         (status = 500, description = "Import failed")
     ),
     security(
@@ -254,8 +255,17 @@ pub async fn export_snapshot(
 pub async fn import_snapshot(
     State(state): State<Arc<AppState>>,
     ValidatedIndexName(index_name): ValidatedIndexName,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let release_response_headers = match prepare_release_import(&headers, &index_name, &body) {
+        Ok(response_headers) => response_headers,
+        Err(error) => {
+            emit_snapshot_action(&index_name, Action::ImportSnapshot, Outcome::Failure);
+            return error.into_response();
+        }
+    };
+
     // The destination writer is drained and merge-quiesced before the snapshot
     // is installed; the synchronous gzip+tar decode and directory-rename
     // plumbing then run off the tokio worker pool inside `restore_snapshot_bytes`
@@ -267,7 +277,11 @@ pub async fn import_snapshot(
     {
         Ok(()) => {
             emit_snapshot_action(&index_name, Action::ImportSnapshot, Outcome::Success);
-            Json(serde_json::json!({ "status": "imported" })).into_response()
+            let success = Json(serde_json::json!({ "status": "imported" }));
+            match release_response_headers {
+                Some(response_headers) => (response_headers, success).into_response(),
+                None => success.into_response(),
+            }
         }
         Err((step, error)) => {
             emit_snapshot_action(&index_name, Action::ImportSnapshot, Outcome::Failure);
@@ -451,12 +465,19 @@ mod tests {
     };
     use axum::{
         body::Body,
-        http::{Request, StatusCode},
+        http::{HeaderMap, HeaderValue, Request, StatusCode},
         response::Response,
         routing::{get, post},
         Router,
     };
     use flapjack::types::{Document, FieldValue};
+    use flapjack_replication::types::{
+        RELEASE_TRANSFER_AFTER_SEQ_HEADER, RELEASE_TRANSFER_CONTRACT_HEADER,
+        RELEASE_TRANSFER_PAYLOAD_SHA256_HEADER, RELEASE_TRANSFER_SNAPSHOT_SHA256_HEADER,
+        RELEASE_TRANSFER_STATUS_HEADER, RELEASE_TRANSFER_TENANT_HEADER,
+        RELEASE_TRANSFER_THROUGH_SEQ_HEADER, RELEASE_TRANSFER_TRANSACTION_HEADER,
+    };
+    use sha2::{Digest, Sha256};
     use std::{collections::HashMap, sync::Arc};
     use tempfile::TempDir;
     use tower::ServiceExt;
@@ -479,6 +500,185 @@ mod tests {
             document.fields.get("title"),
             Some(&FieldValue::Text(title.to_string()))
         );
+    }
+
+    const RELEASE_IMPORT_PROOF_HEADERS: [&str; 8] = [
+        RELEASE_TRANSFER_CONTRACT_HEADER,
+        RELEASE_TRANSFER_TENANT_HEADER,
+        RELEASE_TRANSFER_TRANSACTION_HEADER,
+        RELEASE_TRANSFER_AFTER_SEQ_HEADER,
+        RELEASE_TRANSFER_THROUGH_SEQ_HEADER,
+        RELEASE_TRANSFER_STATUS_HEADER,
+        RELEASE_TRANSFER_PAYLOAD_SHA256_HEADER,
+        RELEASE_TRANSFER_SNAPSHOT_SHA256_HEADER,
+    ];
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReleaseImportDestination {
+        Absent,
+        Existing,
+    }
+
+    async fn release_import_snapshot_bytes() -> (TempDir, Vec<u8>) {
+        release_import_snapshot_bytes_for("products").await
+    }
+
+    async fn release_import_snapshot_bytes_for(tenant_id: &str) -> (TempDir, Vec<u8>) {
+        let source_tmp = TempDir::new().unwrap();
+        let source = TestStateBuilder::new(&source_tmp).build_shared();
+        source.manager.create_tenant(tenant_id).unwrap();
+        source
+            .manager
+            .add_documents_sync(
+                tenant_id,
+                vec![test_document("1", "release snapshot source")],
+            )
+            .await
+            .unwrap();
+        let snapshot_bytes = quiesced_snapshot_bytes(&source.manager, tenant_id).await;
+        (source_tmp, snapshot_bytes)
+    }
+
+    async fn release_import_destination(
+        kind: ReleaseImportDestination,
+    ) -> (TempDir, Arc<AppState>, Router) {
+        release_import_destination_for(kind, "products").await
+    }
+
+    async fn release_import_destination_for(
+        kind: ReleaseImportDestination,
+        tenant_id: &str,
+    ) -> (TempDir, Arc<AppState>, Router) {
+        let destination_tmp = TempDir::new().unwrap();
+        let destination = TestStateBuilder::new(&destination_tmp).build_shared();
+        match kind {
+            ReleaseImportDestination::Absent => {
+                assert!(!destination.manager.base_path.join(tenant_id).exists());
+            }
+            ReleaseImportDestination::Existing => {
+                destination.manager.create_tenant(tenant_id).unwrap();
+                destination
+                    .manager
+                    .add_documents_sync(
+                        tenant_id,
+                        vec![test_document("original", "original destination")],
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let app = Router::new()
+            .route("/1/indexes/:indexName/import", post(import_snapshot))
+            .with_state(Arc::clone(&destination));
+        (destination_tmp, destination, app)
+    }
+
+    fn assert_release_import_content(destination: &Arc<AppState>) {
+        assert_release_import_content_for(destination, "products");
+    }
+
+    fn assert_release_import_content_for(destination: &Arc<AppState>, tenant_id: &str) {
+        let restored = destination
+            .manager
+            .search(tenant_id, "", None, None, 10)
+            .unwrap();
+        assert_eq!(restored.total, 1);
+        assert_document_title(destination, tenant_id, "1", "release snapshot source");
+        assert!(destination
+            .manager
+            .get_document(tenant_id, "original")
+            .unwrap()
+            .is_none());
+    }
+
+    fn assert_release_import_proof(
+        headers: &HeaderMap,
+        snapshot_digest: &str,
+        through_sequence: &str,
+    ) {
+        assert_release_import_proof_for_tenant(
+            headers,
+            snapshot_digest,
+            through_sequence,
+            "products",
+        );
+    }
+
+    fn assert_release_import_proof_for_tenant(
+        headers: &HeaderMap,
+        snapshot_digest: &str,
+        through_sequence: &str,
+        tenant_id: &str,
+    ) {
+        for (name, expected) in [
+            ("x-flapjack-release-transfer", "one-uid-contiguous-v1"),
+            ("x-flapjack-release-transfer-tenant", tenant_id),
+            (
+                "x-flapjack-release-transfer-transaction",
+                "release-import-transaction",
+            ),
+            ("x-flapjack-release-transfer-after-seq", "0"),
+            ("x-flapjack-release-transfer-through-seq", through_sequence),
+            ("x-flapjack-release-transfer-status", "acknowledged"),
+            (
+                "x-flapjack-release-transfer-payload-sha256",
+                snapshot_digest,
+            ),
+            (
+                "x-flapjack-release-transfer-snapshot-sha256",
+                snapshot_digest,
+            ),
+        ] {
+            let values: Vec<_> = headers.get_all(name).iter().collect();
+            assert_eq!(values.len(), 1, "{name} must occur exactly once");
+            assert_eq!(values[0], expected, "unexpected {name} value");
+        }
+    }
+
+    fn assert_no_release_import_proof(headers: &HeaderMap) {
+        for name in RELEASE_IMPORT_PROOF_HEADERS {
+            assert!(
+                headers.get_all(name).iter().next().is_none(),
+                "response must omit protected release header {name}"
+            );
+        }
+    }
+
+    fn release_import_request(
+        snapshot_bytes: Vec<u8>,
+        snapshot_digest: &str,
+        through_seq: Option<&str>,
+    ) -> Request<Body> {
+        release_import_stage2_tests::ReleaseImportCase {
+            name: "valid release import".to_string(),
+            snapshot_bytes,
+            headers: release_import_stage2_tests::release_import_headers(
+                snapshot_digest,
+                through_seq,
+            ),
+        }
+        .request()
+    }
+
+    fn release_import_request_for_tenant(
+        snapshot_bytes: Vec<u8>,
+        snapshot_digest: &str,
+        through_seq: Option<&str>,
+        tenant_id: &str,
+    ) -> Request<Body> {
+        let mut request = release_import_request(snapshot_bytes, snapshot_digest, through_seq);
+        *request.uri_mut() = format!("/1/indexes/{tenant_id}/import").parse().unwrap();
+        request.headers_mut().insert(
+            RELEASE_TRANSFER_TENANT_HEADER,
+            HeaderValue::from_str(tenant_id).unwrap(),
+        );
+        request
+    }
+
+    mod release_import_stage2_tests {
+        use super::*;
+
+        include!("snapshot_release_import_tests.rs");
     }
 
     // The process-global environment lock must span each asynchronous handler
@@ -740,6 +940,32 @@ mod tests {
             .unwrap();
         assert_eq!(restored.total, 1);
         assert_document_title(&destination, "products", "1", "snapshot source");
+    }
+
+    #[tokio::test]
+    async fn release_import_acknowledges_installed_snapshot() {
+        let (_source_tmp, snapshot_bytes) = release_import_snapshot_bytes().await;
+        let snapshot_digest = format!("{:x}", Sha256::digest(&snapshot_bytes));
+        let (_destination_tmp, destination, app) =
+            release_import_destination(ReleaseImportDestination::Absent).await;
+
+        let response = app
+            .oneshot(release_import_request(
+                snapshot_bytes,
+                &snapshot_digest,
+                Some("7"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_headers = response.headers().clone();
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({ "status": "imported" })
+        );
+        assert_release_import_content(&destination);
+        assert_release_import_proof(&response_headers, &snapshot_digest, "7");
     }
 
     #[allow(clippy::await_holding_lock)]

@@ -7,6 +7,15 @@ use crate::{FlapjackError, Result};
 use std::sync::Arc;
 
 impl IndexManager {
+    /// Hand a committed native snapshot to the runtime before releasing quiesce.
+    /// The journal stays immutable; subsequent runtime writes need not retain its digest.
+    pub fn adopt_snapshot_publication(
+        &self,
+        journal: &super::publication::PublicationJournal,
+    ) -> Result<()> {
+        super::publication::adopt_snapshot_publication(&self.base_path, journal)
+    }
+
     /// Repair and report a single node-local publication target.
     pub fn repair_publication_target(&self, tenant: &str) -> Result<PublicationRepairReport> {
         let target = PublicationTarget::new(tenant)?;

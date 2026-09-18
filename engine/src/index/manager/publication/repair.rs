@@ -198,8 +198,16 @@ pub(super) fn repair_publication_outcome_with_epoch(
     inventory: &TantivyManagedInventory,
     epoch: PublicationEpochObservation,
 ) -> Result<RepairOutcome> {
+    let paths = PublicationPaths::new(base, &target, &transaction_id);
+    if super::snapshot_adoption::publication_runtime_is_adopted(base, &paths, epoch)? {
+        return Ok(RepairOutcome {
+            decision: RepairDecision::None,
+            live_target_proven: true,
+            live_target_mutated: false,
+        });
+    }
     let io = PublicationIo::production();
-    repair_publication_inner(
+    let outcome = repair_publication_inner(
         base,
         target,
         transaction_id,
@@ -207,7 +215,11 @@ pub(super) fn repair_publication_outcome_with_epoch(
         inventory,
         epoch,
         &io,
-    )
+    )?;
+    if outcome.live_target_proven {
+        super::snapshot_adoption::adopt_repaired_publication(base, &paths)?;
+    }
+    Ok(outcome)
 }
 
 /// TODO: Document repair_publication_for_test.

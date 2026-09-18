@@ -78,6 +78,19 @@ cat >"$FIXTURE_REPO/engine/dashboard/package-lock.json" <<'EOF'
 {}
 EOF
 
+# Mirror the real dashboard ignore contract: the bundler's output is ignored
+# except the tracked RustEmbed placeholder that every dashboard build rewrites.
+mkdir -p "$FIXTURE_REPO/engine/dashboard/dist"
+cat >"$FIXTURE_REPO/engine/dashboard/.gitignore" <<'EOF'
+node_modules
+dist/*
+!dist/index.html
+EOF
+
+COMMITTED_DASHBOARD_PLACEHOLDER='<script src="/dashboard/assets/index-committed.js"></script>'
+printf '%s\n' "$COMMITTED_DASHBOARD_PLACEHOLDER" \
+  >"$FIXTURE_REPO/engine/dashboard/dist/index.html"
+
 cat >"$FIXTURE_REPO/engine/package/engine_compatibility.json" <<'EOF'
 {"dataDisposition":"preserve","mixedVersionReplication":"not_guaranteed","schemaVersion":2,"targets":{"aarch64-unknown-linux-musl":[],"x86_64-unknown-linux-musl":[]}}
 EOF
@@ -228,6 +241,7 @@ python3 - "$output/flapjack-${target}.manifest.json" "$manifest_target" \
   "$compatibility_source" <<'PY'
 import hashlib
 import json
+import os
 import pathlib
 import sys
 
@@ -246,6 +260,18 @@ selected_compatibility = {
     "target": target,
 }
 archive_path = manifest_path.parent / archive_name
+embedded_features = [
+    "analytics",
+    "axum-support",
+    "decompound",
+    "memory-stats",
+    "openapi",
+    "s3-snapshots",
+]
+if target != "x86_64-pc-windows-msvc":
+    embedded_features.append("vector-search")
+if os.environ.get("FAKE_MANIFEST_MODE") == "requested-features-only":
+    embedded_features = [] if target == "x86_64-pc-windows-msvc" else ["vector-search"]
 manifest = {
     "schemaVersion": 2,
     "artifact": {
@@ -260,7 +286,7 @@ manifest = {
         "capabilities": {"vectorSearch": target != "x86_64-pc-windows-msvc", "vectorSearchLocal": False},
         "dirty": dirty,
         "dirtyKnown": dirty_known,
-        "features": [] if target == "x86_64-pc-windows-msvc" else ["vector-search"],
+        "features": embedded_features,
         "profile": "release",
         "revision": revision,
         "revisionKnown": True,
@@ -284,6 +310,17 @@ if [ "${1:-}" = "--version" ]; then
   exit 0
 fi
 printf 'npm %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+if [ "${1:-}" = "run" ] && [ "${2:-}" = "build" ]; then
+  # Model the real bundler: every build emits freshly content-hashed assets and
+  # rewrites the tracked placeholder to reference them.
+  nonce="$(wc -l <"$FAKE_COMMAND_LOG" | tr -d ' ')"
+  mkdir -p dist/assets
+  printf 'asset\n' >"dist/assets/index-${nonce}.js"
+  printf '<script src="/dashboard/assets/index-%s.js"></script>\n' "$nonce" >dist/index.html
+  if [ -n "${FAKE_NPM_BUILD_EXIT_STATUS:-}" ]; then
+    exit "$FAKE_NPM_BUILD_EXIT_STATUS"
+  fi
+fi
 EOF
 
 cat >"$FAKE_BIN/cargo" <<'EOF'
@@ -296,6 +333,9 @@ fi
 [ "${FLAPJACK_BUILD_REVISION:-}" = "${FAKE_EXPECTED_SOURCE_SHA:-missing}" ] || exit 67
 [ "${FLAPJACK_REQUIRE_DASHBOARD:-}" = "1" ] || exit 68
 printf '%s %s\n' "$(basename "$0")" "$*" >>"$FAKE_COMMAND_LOG"
+if [ -n "${FAKE_BUILD_EXIT_STATUS:-}" ]; then
+  exit "$FAKE_BUILD_EXIT_STATUS"
+fi
 target=""
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--target" ]; then
@@ -312,6 +352,10 @@ printf 'binary:%s\n' "$target" >"$binary"
 chmod +x "$binary"
 if [ "${FAKE_BUILD_MUTATE_TRACKED:-0}" = "1" ]; then
   printf 'mutated\n' >>dashboard/package-lock.json
+fi
+if [ "${FAKE_BUILD_MUTATE_DASHBOARD_PLACEHOLDER:-0}" = "1" ]; then
+  printf '<script src="/dashboard/assets/cross-mutated.js"></script>\n' \
+    >dashboard/dist/index.html
 fi
 EOF
 
@@ -478,6 +522,49 @@ PY
   fi
 }
 
+assert_dashboard_build_leaves_source_clean() {
+  local description="$1"
+  local status
+  status="$(git -C "$FIXTURE_REPO" status --porcelain=v1 --untracked-files=all)"
+  if [ -z "$status" ] \
+    && [ "$(cat "$FIXTURE_REPO/engine/dashboard/dist/index.html")" \
+      = "$COMMITTED_DASHBOARD_PLACEHOLDER" ]; then
+    pass "$description"
+  else
+    printf '%s\n' "$status" | sed 's/^/    LOG: /'
+    fail "$description"
+  fi
+}
+
+assert_failed_build_restores_dashboard() {
+  local build_case="$1"
+  local failure_setting="$2"
+  local expected_status="$3"
+  local description="$4"
+  local actual_status=0
+  local profile="${build_case%%:*}"
+  local source_status
+  local target="${build_case#*:}"
+
+  : >"$COMMAND_LOG"
+  rm -rf "$OUTPUT_ROOT/current"
+  run_helper "$profile" "$target" current \
+    "$failure_setting" || actual_status=$?
+  source_status="$(git -C "$FIXTURE_REPO" status --porcelain=v1 --untracked-files=all)"
+
+  if [ "$actual_status" -eq "$expected_status" ] \
+    && [ -z "$source_status" ] \
+    && [ "$(cat "$FIXTURE_REPO/engine/dashboard/dist/index.html")" \
+      = "$COMMITTED_DASHBOARD_PLACEHOLDER" ]; then
+    pass "$description"
+  else
+    printf '    LOG: expected status %s, got %s\n' \
+      "$expected_status" "$actual_status"
+    printf '%s\n' "$source_status" | sed 's/^/    LOG: /'
+    fail "$description"
+  fi
+}
+
 run_external_compatibility_case() {
   : >"$COMMAND_LOG"
   rm -rf "$OUTPUT_ROOT/current"
@@ -492,6 +579,8 @@ run_external_compatibility_case() {
     "external compatibility source still delegates one exact canonical build and package"
   assert_build_receipt cloud-arm64 aarch64-unknown-linux-musl cross vector-search \
     "$EXTERNAL_COMPATIBILITY"
+  assert_dashboard_build_leaves_source_clean \
+    "cloud-arm64 leaves the tracked dashboard placeholder restored"
   if python3 - "$OUTPUT_ROOT/current/flapjack-aarch64-unknown-linux-musl.manifest.json" \
     "$EXTERNAL_COMPATIBILITY" <<'PY'
 import json
@@ -589,12 +678,18 @@ run_valid_case() {
   else
     assert_build_receipt "$profile" "$target" "$builder" ""
   fi
+  assert_dashboard_build_leaves_source_clean \
+    "$profile leaves the tracked dashboard placeholder restored for $target"
 }
 
 run_valid_case public-all x86_64-unknown-linux-musl cross ' --features vector-search'
 run_valid_case public-all x86_64-apple-darwin cargo ' --features vector-search'
 run_valid_case public-all x86_64-pc-windows-msvc cargo ''
 run_external_compatibility_case
+
+expect_failure "cloud-arm64 rejects identity that omits statically enabled core features" \
+  run_helper cloud-arm64 aarch64-unknown-linux-musl incomplete-feature-identity \
+    FAKE_MANIFEST_MODE=requested-features-only
 
 expect_failure "cloud-arm64 rejects every non-production target" \
   run_helper cloud-arm64 x86_64-unknown-linux-musl rejected-cloud
@@ -656,10 +751,26 @@ expect_failure "non-Node-20 dashboard toolchains are rejected before build" \
   run_helper cloud-arm64 aarch64-unknown-linux-musl wrong-node \
     FAKE_NODE_VERSION=v22.1.0
 
+assert_failed_build_restores_dashboard \
+  cloud-arm64:aarch64-unknown-linux-musl FAKE_NPM_BUILD_EXIT_STATUS=71 71 \
+  "npm build failure preserves its status and restores the tracked dashboard placeholder"
+assert_failed_build_restores_dashboard \
+  cloud-arm64:aarch64-unknown-linux-musl FAKE_BUILD_EXIT_STATUS=72 72 \
+  "cross failure preserves its status and restores the tracked dashboard placeholder"
+assert_failed_build_restores_dashboard \
+  public-all:x86_64-apple-darwin FAKE_BUILD_EXIT_STATUS=73 73 \
+  "cargo failure preserves its status and restores the tracked dashboard placeholder"
+
 expect_failure "tracked source mutation during the build is rejected before handoff" \
   run_helper cloud-arm64 aarch64-unknown-linux-musl build-mutates-source \
     FAKE_BUILD_MUTATE_TRACKED=1
 git -C "$FIXTURE_REPO" checkout -q -- engine/dashboard/package-lock.json
+
+expect_failure "cross-side mutation of the dashboard placeholder is rejected" \
+  run_helper cloud-arm64 aarch64-unknown-linux-musl cross-mutates-dashboard \
+    FAKE_BUILD_MUTATE_DASHBOARD_PLACEHOLDER=1
+assert_dashboard_build_leaves_source_clean \
+  "rejected cross-side placeholder mutation is restored after detection"
 
 if [ "$SECONDS" -le 8 ]; then
   pass "focused helper contract stays within its 8-second hard cap (${SECONDS}s)"
