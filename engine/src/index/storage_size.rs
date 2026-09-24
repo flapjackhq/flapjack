@@ -1,7 +1,7 @@
 //! Per-tenant disk usage calculator providing a recursive, symlink-safe directory size function used by metrics and internal storage endpoints.
 
-use crate::error::Result;
-use crate::index::manager::{validate_index_name, IndexManager};
+use crate::error::{FlapjackError, Result};
+use crate::index::manager::{publication, validate_index_name, IndexManager};
 use std::io::{self, ErrorKind};
 use std::path::Path;
 
@@ -191,6 +191,22 @@ impl IndexManager {
             .map(|r| r.num_docs() as u64)
             .sum();
         Some(count)
+    }
+
+    /// Read a committed watermark without loading an index or recovering an oplog.
+    /// Missing evidence or an unavailable publication lock yields no observation;
+    /// malformed evidence is an error, and a durable zero remains `Some(0)`.
+    pub fn tenant_durable_oplog_seq(&self, tenant_id: &str) -> Result<Option<u64>> {
+        validate_index_name(tenant_id)?;
+        let target = publication::PublicationTarget::new(tenant_id)?;
+        let Some(_guard) = publication::try_lock_publication_observation(&self.base_path, &target)
+            .map_err(|error| FlapjackError::Io(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        Ok(crate::index::oplog::read_checked_committed_seq(
+            &self.base_path.join(tenant_id),
+        )?)
     }
 
     /// Read the committed document count without loading or recovering a tenant.

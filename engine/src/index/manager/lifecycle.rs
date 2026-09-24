@@ -719,7 +719,7 @@ impl super::IndexManager {
         ensure_committed_move(&journal)?;
         self.clear_tenant_runtime_state(&destination.to_string());
         self.run_replacement_reopen_proof_hook(destination, &mut journal);
-        self.certify_replacement_reopen(
+        self.certify_and_adopt_replacement(
             destination,
             PublicationArtifactMode::PreserveDestination,
             &journal,
@@ -863,7 +863,7 @@ impl super::IndexManager {
             self.clear_tenant_runtime_state(&destination.to_string());
         }
         self.run_replacement_reopen_proof_hook(destination, &mut journal);
-        self.certify_replacement_reopen(destination, artifact_mode, &journal)?;
+        self.certify_and_adopt_replacement(destination, artifact_mode, &journal)?;
         #[cfg(test)]
         if fault == Some(PublicationFaultPoint::BeforeSourceCleanup) {
             return Err(FlapjackError::InvalidQuery(
@@ -907,7 +907,7 @@ impl super::IndexManager {
         }
     }
 
-    fn certify_replacement_reopen(
+    fn certify_and_adopt_replacement(
         &self,
         destination: &str,
         artifact_mode: PublicationArtifactMode,
@@ -922,7 +922,8 @@ impl super::IndexManager {
             )
         })?;
         self.verify_replacement_epoch_reopen(destination, journal, fence)?;
-        self.verify_replacement_watermark_reopen(destination, fence)
+        self.verify_replacement_watermark_reopen(destination, fence)?;
+        publication::adopt_fenced_publication(&self.base_path, journal)
     }
 
     fn verify_replacement_epoch_reopen(

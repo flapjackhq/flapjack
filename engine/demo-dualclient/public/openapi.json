@@ -1280,6 +1280,9 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid release transfer metadata"
+          },
           "500": {
             "description": "Import failed"
           }

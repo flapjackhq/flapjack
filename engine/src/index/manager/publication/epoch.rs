@@ -360,6 +360,45 @@ pub(crate) fn run_if_publication_admission_unfenced<T>(
     Some(operation())
 }
 
+/// Hold an existing publication lock for a read-only observation. Never create
+/// sidecars from a scrape. Legacy targets without a lock have no safely fenced
+/// observation until an ordinary admission establishes one.
+pub(crate) fn try_lock_publication_observation(
+    base: &Path,
+    target: &PublicationTarget,
+) -> Result<Option<File>, PublicationEpochError> {
+    let paths = publication_epoch_paths(base, target);
+    reject_epoch_managed_paths(base, &paths, &paths.lock)?;
+    let io_error = |source| PublicationEpochError::Io {
+        path: paths.lock.clone(),
+        source,
+    };
+    run_publication_epoch_open_lock_file_checkpoint_for_test(&paths.lock);
+    let metadata = match fs::symlink_metadata(&paths.lock) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(error)),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(PublicationEpochError::CorruptState { path: paths.lock });
+    }
+    let file = File::open(&paths.lock).map_err(io_error)?;
+    if !file.metadata().map_err(io_error)?.is_file() {
+        return Err(PublicationEpochError::CorruptState { path: paths.lock });
+    }
+    // Only admission and the nonblocking lock acquisition share the registry
+    // critical section; filesystem observation must not stall other targets.
+    let registry = publication_admission_registry().0.lock().unwrap();
+    if registry.pending_advances.contains_key(&paths.lock) {
+        return Ok(None);
+    }
+    match file.try_lock_shared() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(io_error(error)),
+    }
+}
+
 pub fn compare_and_advance_publication_epoch(
     base: &Path,
     target: &PublicationTarget,

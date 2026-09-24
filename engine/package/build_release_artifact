@@ -6,6 +6,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENGINE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_DIR="$(cd "$ENGINE_DIR/.." && pwd)"
 MANIFEST_HELPER="$SCRIPT_DIR/release_artifact_manifest"
+DASHBOARD_DIR="$ENGINE_DIR/dashboard"
+# Tracked RustEmbed placeholder that the dashboard build rewrites with freshly
+# content-hashed asset names on every invocation.
+GENERATED_DASHBOARD_PLACEHOLDER="$DASHBOARD_DIR/dist/index.html"
 
 usage() {
   cat >&2 <<'EOF'
@@ -56,19 +60,19 @@ fi
   || die "compatibility source is not readable: $COMPATIBILITY_ARGUMENT"
 
 BUILD_TOOL=""
-FEATURE_NAME=""
+BUILD_FEATURE_NAME=""
 case "$PROFILE:$TARGET" in
   cloud-arm64:aarch64-unknown-linux-musl)
     BUILD_TOOL="cross"
-    FEATURE_NAME="vector-search"
+    BUILD_FEATURE_NAME="vector-search"
     ;;
   public-all:x86_64-unknown-linux-musl|public-all:aarch64-unknown-linux-musl)
     BUILD_TOOL="cross"
-    FEATURE_NAME="vector-search"
+    BUILD_FEATURE_NAME="vector-search"
     ;;
   public-all:x86_64-apple-darwin|public-all:aarch64-apple-darwin)
     BUILD_TOOL="cargo"
-    FEATURE_NAME="vector-search"
+    BUILD_FEATURE_NAME="vector-search"
     ;;
   public-all:x86_64-pc-windows-msvc)
     BUILD_TOOL="cargo"
@@ -80,6 +84,11 @@ case "$PROFILE:$TARGET" in
     die "unsupported build profile: $PROFILE"
     ;;
 esac
+
+EXPECTED_CORE_FEATURES="analytics,axum-support,decompound,memory-stats,openapi,s3-snapshots"
+if [ -n "$BUILD_FEATURE_NAME" ]; then
+  EXPECTED_CORE_FEATURES="$EXPECTED_CORE_FEATURES,$BUILD_FEATURE_NAME"
+fi
 
 if [ "$PROFILE" = "public-all" ] \
   && ! [ "$COMPATIBILITY_ARGUMENT" -ef "$SCRIPT_DIR/engine_compatibility.json" ]; then
@@ -98,8 +107,34 @@ require_tool "$BUILD_TOOL"
 [ -x "$MANIFEST_HELPER" ] || die "manifest owner is not executable: $MANIFEST_HELPER"
 
 TEMP_DIR="$(mktemp -d)"
+DASHBOARD_PLACEHOLDER_RESTORE_REQUIRED=0
+DASHBOARD_PLACEHOLDER_BUILD_DIFF="$TEMP_DIR/dashboard-placeholder-after-build.diff"
+
+restore_generated_dashboard_placeholder() {
+  [ "$DASHBOARD_PLACEHOLDER_RESTORE_REQUIRED" -eq 1 ] || return 0
+  git -C "$REPO_DIR" checkout -- "$GENERATED_DASHBOARD_PLACEHOLDER" \
+    || return 1
+  DASHBOARD_PLACEHOLDER_RESTORE_REQUIRED=0
+}
+
 cleanup() {
-  rm -rf "$TEMP_DIR"
+  local exit_status=$?
+  trap - EXIT
+
+  if ! restore_generated_dashboard_placeholder; then
+    printf 'ERROR: build release artifact: cannot restore the generated dashboard placeholder\n' >&2
+    if [ "$exit_status" -eq 0 ]; then
+      exit_status=1
+    fi
+  fi
+  if ! rm -rf "$TEMP_DIR"; then
+    printf 'ERROR: build release artifact: cannot remove temporary build data\n' >&2
+    if [ "$exit_status" -eq 0 ]; then
+      exit_status=1
+    fi
+  fi
+
+  exit "$exit_status"
 }
 trap cleanup EXIT
 COMPATIBILITY_SNAPSHOT="$TEMP_DIR/engine_compatibility.json"
@@ -168,23 +203,37 @@ mkdir -p "$OUTPUT_DIR"
 
 export FLAPJACK_BUILD_REVISION="$SOURCE_SHA"
 export FLAPJACK_REQUIRE_DASHBOARD=1
+DASHBOARD_PLACEHOLDER_RESTORE_REQUIRED=1
 
 (
-  cd "$ENGINE_DIR/dashboard"
+  cd "$DASHBOARD_DIR"
   npm ci
   npm run build
 )
+git -C "$REPO_DIR" diff --binary --no-ext-diff -- \
+  "$GENERATED_DASHBOARD_PLACEHOLDER" >"$DASHBOARD_PLACEHOLDER_BUILD_DIFF" \
+  || die "cannot capture the generated dashboard placeholder state"
 
 (
   cd "$ENGINE_DIR"
-  if [ -n "$FEATURE_NAME" ]; then
+  if [ -n "$BUILD_FEATURE_NAME" ]; then
     "$BUILD_TOOL" build --release --target "$TARGET" \
-      --package flapjack-server --no-default-features --features "$FEATURE_NAME"
+      --package flapjack-server --no-default-features --features "$BUILD_FEATURE_NAME"
   else
     "$BUILD_TOOL" build --release --target "$TARGET" \
       --package flapjack-server --no-default-features
   fi
 )
+git -C "$REPO_DIR" diff --binary --no-ext-diff -- \
+  "$GENERATED_DASHBOARD_PLACEHOLDER" \
+  | cmp -s "$DASHBOARD_PLACEHOLDER_BUILD_DIFF" - \
+  || die "tracked dashboard placeholder changed after dashboard build"
+
+# The binary has embedded the freshly built dashboard, so discard this helper's
+# own rewrite of the tracked placeholder. The post-build integrity guards below
+# then judge a genuinely unchanged worktree instead of this build's side effect.
+restore_generated_dashboard_placeholder \
+  || die "cannot restore the generated dashboard placeholder"
 
 BINARY_PATH="target/$TARGET/release/flapjack"
 case "$TARGET" in
@@ -212,7 +261,7 @@ CHECKSUM_PATH="${ARCHIVE_PATH}.sha256"
   --compatibility-predecessors "$MANIFEST_PATH" >/dev/null
 
 python3 - "$MANIFEST_PATH" "$ARCHIVE_PATH" "$CHECKSUM_PATH" \
-  "$TARGET" "$SOURCE_SHA" "$FEATURE_NAME" <<'PY'
+  "$TARGET" "$SOURCE_SHA" "$EXPECTED_CORE_FEATURES" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -223,7 +272,7 @@ archive_path = pathlib.Path(sys.argv[2])
 checksum_path = pathlib.Path(sys.argv[3])
 target = sys.argv[4]
 source_sha = sys.argv[5]
-expected_features = ["vector-search"] if sys.argv[6] else []
+expected_features = sys.argv[6].split(",") if sys.argv[6] else []
 
 
 def fail(message):
@@ -299,7 +348,7 @@ cmp -s "$COMPATIBILITY_ARGUMENT" "$COMPATIBILITY_SNAPSHOT" \
 
 RECEIPT_PATH="$OUTPUT_DIR/flapjack-${TARGET}.build.json"
 python3 - "$RECEIPT_PATH" "$MANIFEST_PATH" "$PROFILE" "$TARGET" \
-  "$SOURCE_SHA" "$SOURCE_TREE" "$BUILD_TOOL" "$FEATURE_NAME" \
+  "$SOURCE_SHA" "$SOURCE_TREE" "$BUILD_TOOL" "$BUILD_FEATURE_NAME" \
   "$RUNNER_OS" "$RUNNER_ARCH" "$CARGO_VERSION" "$CROSS_VERSION" \
   "$RUSTC_VERSION" "$NODE_VERSION" "$NPM_VERSION" \
   "$COMPATIBILITY_SOURCE_SHA256" "$COMPATIBILITY_SELECTED_SHA256" <<'PY'

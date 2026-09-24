@@ -2,7 +2,8 @@
 use crate::handlers::internal::apply_ops_to_state;
 use crate::handlers::AppState;
 use flapjack::index::manager::publication::{
-    PreStagedActivationStage, PreStagedPublication, PublicationTargetDisposition,
+    PreStagedActivationStage, PreStagedPublication, PublicationJournal,
+    PublicationTargetDisposition,
 };
 use flapjack::index::oplog::read_committed_seq;
 use flapjack::index::snapshot::import_from_bytes;
@@ -395,7 +396,7 @@ pub(crate) fn install_snapshot_bytes(
     snapshot_bytes: &[u8],
 ) -> Result<(), (SnapshotInstallStep, String)> {
     let publication = stage_snapshot_bytes(manager, tenant_id, snapshot_bytes)?;
-    activate_snapshot_publication(manager, tenant_id, publication)
+    activate_snapshot_publication(manager, tenant_id, publication).map(|_| ())
 }
 
 fn stage_snapshot_bytes(
@@ -453,7 +454,7 @@ fn activate_snapshot_publication(
     manager: &flapjack::IndexManager,
     tenant_id: &str,
     publication: PreStagedPublication,
-) -> Result<(), (SnapshotInstallStep, String)> {
+) -> Result<PublicationJournal, (SnapshotInstallStep, String)> {
     // The destination writer is quiesced by `restore_snapshot_bytes` before this
     // synchronous install runs, so the drain is no longer masqueraded by an
     // `unload` here — the `snapshot_restore_publication` checkpoint is reached
@@ -467,7 +468,7 @@ fn activate_snapshot_publication(
         .activate()
         .map_err(|error| (snapshot_activation_step(error.stage()), error.to_string()));
     unload_for_snapshot_publication(manager, tenant_id)?;
-    activation.map(|_| ())
+    activation
 }
 
 /// Stage and validate a snapshot off the async runtime, quiesce its destination,
@@ -484,13 +485,23 @@ pub(crate) async fn restore_snapshot_bytes(
     tenant_id: &str,
     snapshot_bytes: Vec<u8>,
 ) -> Result<(), (SnapshotInstallStep, String)> {
-    let (_quiesce, publication) =
+    #[cfg(test)]
+    flapjack::index::write_queue::record_writer_lifecycle_publication_checkpoint(
+        tenant_id,
+        "snapshot_restore_entry",
+    );
+    let (quiesce, publication) =
         prepare_snapshot_restore(manager, tenant_id, snapshot_bytes).await?;
 
     let manager = Arc::clone(manager);
     let tenant = tenant_id.to_string();
     tokio::task::spawn_blocking(move || {
-        activate_snapshot_publication(&manager, &tenant, publication)
+        // Keep the fence with the blocking work even if the async caller is canceled.
+        let _quiesce = quiesce;
+        let journal = activate_snapshot_publication(&manager, &tenant, publication)?;
+        manager
+            .adopt_snapshot_publication(&journal)
+            .map_err(|error| (SnapshotInstallStep::RecoverInterrupted, error.to_string()))
     })
     .await
     .map_err(|join_error| {
@@ -893,7 +904,9 @@ mod tests {
         restore_snapshot_bytes, retention_gap_detected,
     };
     use crate::handlers::AppState;
-    use crate::test_helpers::{assert_quiescence_before_publication, quiesced_snapshot_bytes};
+    use crate::test_helpers::{
+        assert_quiescence_before_publication, quiesced_snapshot_bytes, snapshot_tree,
+    };
     use axum::{extract::State, routing::get, routing::post, Json, Router};
     use flapjack::index::oplog::AppendDurability;
     use flapjack::index::snapshot::export_to_bytes;
@@ -901,16 +914,26 @@ mod tests {
     use flapjack_replication::manager::ReplicationManager;
     use flapjack_replication::types::GetOpsResponse;
     use flapjack_replication::types::ReplicateOpsRequest;
-    use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, OnceLock};
     use tempfile::TempDir;
 
-    #[derive(Debug, PartialEq, Eq)]
-    enum SnapshotTreeEntry {
-        Directory,
-        File(Vec<u8>),
-        Symlink(PathBuf),
+    fn test_document(id: &str, title: &str) -> flapjack::types::Document {
+        flapjack::types::Document::from_json(&serde_json::json!({
+            "objectID": id,
+            "title": title,
+        }))
+        .unwrap()
+    }
+
+    async fn snapshot_bytes_with_document(tenant_id: &str, id: &str, title: &str) -> Vec<u8> {
+        let temp = TempDir::new().unwrap();
+        let manager = flapjack::IndexManager::new(temp.path());
+        manager.create_tenant(tenant_id).unwrap();
+        manager
+            .add_documents_sync(tenant_id, vec![test_document(id, title)])
+            .await
+            .unwrap();
+        quiesced_snapshot_bytes(&manager, tenant_id).await
     }
 
     #[tokio::test]
@@ -952,40 +975,6 @@ mod tests {
         );
         publication.abort().unwrap();
         drop(quiesce);
-    }
-
-    fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, SnapshotTreeEntry> {
-        let mut entries = BTreeMap::new();
-        snapshot_tree_inner(root, root, &mut entries);
-        entries
-    }
-
-    /// TODO: Document snapshot_tree_inner.
-    fn snapshot_tree_inner(
-        root: &Path,
-        current: &Path,
-        entries: &mut BTreeMap<PathBuf, SnapshotTreeEntry>,
-    ) {
-        for entry in std::fs::read_dir(current).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            let relative = path.strip_prefix(root).unwrap().to_path_buf();
-            let metadata = std::fs::symlink_metadata(&path).unwrap();
-            if metadata.file_type().is_symlink() {
-                entries.insert(
-                    relative,
-                    SnapshotTreeEntry::Symlink(std::fs::read_link(&path).unwrap()),
-                );
-            } else if metadata.is_dir() {
-                entries.insert(relative, SnapshotTreeEntry::Directory);
-                snapshot_tree_inner(root, &path, entries);
-            } else {
-                entries.insert(
-                    relative,
-                    SnapshotTreeEntry::File(std::fs::read(&path).unwrap()),
-                );
-            }
-        }
     }
 
     fn assert_unjournaled_snapshot_transaction_removed(
@@ -1485,31 +1474,22 @@ mod tests {
             "deletion must leave durable evidence that the target is safely vacant"
         );
 
-        let snapshot_src = TempDir::new().unwrap();
-        let restored_marker_name = "restored.txt";
-        std::fs::write(snapshot_src.path().join(restored_marker_name), "restored").unwrap();
-        let oplog = flapjack::index::oplog::OpLog::open(
-            &snapshot_src.path().join("oplog"),
-            tenant_id,
-            "peer-node",
-        )
-        .unwrap();
-        oplog
-            .append(
-                "upsert",
-                serde_json::json!({"objectID": "doc-1", "body": {"_id": "doc-1", "title": "Restored"}}),
-                AppendDurability::Buffered,
-            )
-            .unwrap();
-        let snapshot_bytes = export_to_bytes(snapshot_src.path()).unwrap();
+        let snapshot_bytes = snapshot_bytes_with_document(tenant_id, "doc-1", "Restored").await;
 
         restore_snapshot_bytes(&manager, tenant_id, snapshot_bytes.clone())
             .await
             .expect("a valid snapshot must recreate an explicitly deleted tenant");
+        let restored_document = manager
+            .get_document(tenant_id, "doc-1")
+            .unwrap()
+            .expect("restored tenant must contain the snapshot document");
         assert_eq!(
-            std::fs::read_to_string(tenant_path.join(restored_marker_name)).unwrap(),
-            "restored",
-            "restored tenant must contain the snapshot generation"
+            restored_document
+                .fields
+                .get("title")
+                .and_then(|value| value.as_text()),
+            Some("Restored"),
+            "restored tenant must serve the snapshot generation"
         );
 
         manager.delete_tenant(&tenant_id.to_string()).await.unwrap();
@@ -1529,11 +1509,112 @@ mod tests {
         restore_snapshot_bytes(&manager, tenant_id, snapshot_bytes)
             .await
             .expect("the same valid snapshot must survive a second delete-restore cycle");
+        let restored_document = manager
+            .get_document(tenant_id, "doc-1")
+            .unwrap()
+            .expect("restored tenant must contain the snapshot document after a second cycle");
         assert_eq!(
-            std::fs::read_to_string(tenant_path.join(restored_marker_name)).unwrap(),
-            "restored",
-            "second restore must publish the same snapshot generation"
+            restored_document
+                .fields
+                .get("title")
+                .and_then(|value| value.as_text()),
+            Some("Restored"),
+            "second restore must serve the same snapshot generation"
         );
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_bytes_accepts_fenced_promotion_after_catchup_mutation() {
+        use flapjack::index::manager::publication::{
+            PreStagedPublication, PublicationPaths, PublicationPhase, PublicationRepairStatus,
+            PublicationScanAction, PublicationTarget, PublicationTargetDisposition,
+        };
+        let tenant_id = "fenced_promotion_catchup_restore";
+        let destination_tmp = TempDir::new().unwrap();
+        let manager = Arc::new(flapjack::IndexManager::new(destination_tmp.path()));
+        manager.create_tenant(tenant_id).unwrap();
+        manager
+            .add_documents_sync(
+                tenant_id,
+                vec![test_document("generation-a", "initial generation")],
+            )
+            .await
+            .unwrap();
+
+        let promoted_snapshot =
+            snapshot_bytes_with_document(tenant_id, "generation-b", "promoted generation").await;
+        let staging_baseline = manager
+            .capture_replacement_staging_baseline(tenant_id)
+            .unwrap();
+        let target = PublicationTarget::new(tenant_id).unwrap();
+        let publication =
+            PreStagedPublication::prepare(&manager.base_path, target.clone()).unwrap();
+        flapjack::index::snapshot::import_from_bytes(
+            &promoted_snapshot,
+            &publication.paths().staging,
+        )
+        .unwrap();
+        manager
+            .replace_index_contents_from_pre_staged(publication, tenant_id, staging_baseline)
+            .await
+            .unwrap();
+
+        manager
+            .add_documents_sync(
+                tenant_id,
+                vec![test_document("catchup", "forward catch-up")],
+            )
+            .await
+            .unwrap();
+        assert!(manager
+            .get_document(tenant_id, "generation-b")
+            .unwrap()
+            .is_some());
+        assert!(manager
+            .get_document(tenant_id, "catchup")
+            .unwrap()
+            .is_some());
+
+        let replacement_snapshot =
+            snapshot_bytes_with_document(tenant_id, "generation-c", "replacement generation").await;
+        let repair = manager.repair_publication_target(tenant_id).unwrap();
+        let transaction = repair.transaction_id.clone().unwrap();
+        let paths = PublicationPaths::new(&manager.base_path, &target, &transaction);
+        let journal_exists_before_restore = paths.journal.exists();
+        let adoption_exists_before_restore = paths
+            .journal
+            .with_file_name("runtime-adoption.json")
+            .exists();
+        let staging_exists_before_restore = paths.staging.exists();
+        let backup_exists_before_restore = paths.backup.exists();
+        let restore_result =
+            restore_snapshot_bytes(&manager, tenant_id, replacement_snapshot).await;
+        assert_eq!(repair.status, PublicationRepairStatus::Clean);
+        assert_eq!(repair.action, PublicationScanAction::Clean);
+        assert_eq!(repair.phase, Some(PublicationPhase::Committed));
+        assert_eq!(
+            repair.disposition,
+            PublicationTargetDisposition::Loadable,
+            "snapshot restore returned {restore_result:?}"
+        );
+        assert!(journal_exists_before_restore);
+        assert!(adoption_exists_before_restore);
+        assert!(!staging_exists_before_restore);
+        assert!(!backup_exists_before_restore);
+        restore_result
+            .expect("adopted fenced publication must remain safe for snapshot replacement");
+        assert!(manager
+            .get_document(tenant_id, "generation-c")
+            .unwrap()
+            .is_some());
+        assert!(manager
+            .get_document(tenant_id, "generation-b")
+            .unwrap()
+            .is_none());
+        assert!(manager
+            .get_document(tenant_id, "catchup")
+            .unwrap()
+            .is_none());
     }
 
     /// TODO: Document install_snapshot_bytes_rejects_snapshot_without_oplog.

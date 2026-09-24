@@ -73,6 +73,9 @@ returns it to red today.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import tempfile
 from collections import Counter
 from dataclasses import dataclass
 import re
@@ -505,6 +508,58 @@ def check_spawn_backend_server(_contract: dict) -> list[str]:
     return findings
 
 
+def check_unified_runner_backend(contract: dict) -> list[str]:
+    """Exercise the unified runner's child environment against the existing contract."""
+    runner = REPO_ROOT / "engine/_dev/s/test"
+    source = runner.read_text(encoding="utf-8")
+    functions = []
+    for name in ("start_server", "stop_server"):
+        match = re.search(rf"^{name}\(\) \{{.*?^\}}", source, re.MULTILINE | re.DOTALL)
+        if match is None:
+            return [f"{runner.name}: missing {name} function"]
+        functions.append(match.group(0))
+    expected = {
+        name: value
+        for requirement in contract["requirements"] if not requirement.get("env_absent")
+        for name, value in requirement.get("env", {}).items()
+    }
+    with tempfile.TemporaryDirectory(prefix="fj-runner-contract-") as directory:
+        root = Path(directory)
+        binary = root / "target/debug/flapjack"
+        binary.parent.mkdir(parents=True)
+        capture = root / "environment.json"
+        binary.write_text(
+            f"#!{sys.executable}\nimport json, os, signal\n"
+            f"with open({str(capture)!r}, 'w') as output:\n"
+            f" json.dump({{name: os.environ.get(name) for name in {list(expected)!r}}}, output)\n"
+            "signal.pause()\n", encoding="utf-8",
+        )
+        binary.chmod(0o700)
+        env = {name: value for name, value in os.environ.items() if name not in expected}
+        env.update(
+            ENGINE_DIR=str(root), FJ_BACKEND_PORT="1",
+            FJ_TEST_ADMIN_KEY=expected["FLAPJACK_REPLICATION_API_KEY"],
+            RUNNER_CAPTURE=str(capture),
+        )
+        script = "\n".join(functions) + """
+info() { :; }
+success() { :; }
+error() { echo "$*" >&2; }
+server_is_healthy() { test -s "$RUNNER_CAPTURE"; }
+trap stop_server EXIT
+start_server
+"""
+        result = subprocess.run(
+            ["bash", "-eu", "-c", script], env=env,
+            capture_output=True, text=True, timeout=25,
+        )
+        if result.returncode or not capture.exists():
+            return ["unified runner failed to start its isolated backend contract probe"]
+        actual = json.loads(capture.read_text(encoding="utf-8"))
+    return [f"unified runner backend missing contract environment: {name}"
+            for name, value in expected.items() if actual.get(name) != value]
+
+
 def check_gate_is_wired() -> list[str]:
     """This gate must itself be invoked by CI.
 
@@ -681,6 +736,7 @@ def main() -> int:
     findings = (
         check_workflows(contract, scripts)
         + check_spawn_backend_server(contract)
+        + check_unified_runner_backend(contract)
         + check_gate_is_wired()
         + check_no_duplicate_step_names()
         + check_base_requirements_match_readiness(contract)
@@ -700,7 +756,7 @@ def main() -> int:
     print(
         "Dashboard e2e backend contract: OK "
         f"({len(contract['requirements'])} requirement(s) checked against "
-        f"{len(list(WORKFLOW_DIR.glob('*.yml')))} workflow file(s) and spawnBackendServer)"
+        f"{len(list(WORKFLOW_DIR.glob('*.yml')))} workflow file(s), spawnBackendServer and unified runner)"
     )
     return 0
 

@@ -29,7 +29,7 @@ const DEFAULT_HTTP_REQUEST_BUDGET: Duration = Duration::from_secs(4);
 /// Sockets reject a zero read timeout, so a nearly spent budget still gets the
 /// smallest usable attempt window.
 const MIN_HTTP_READ_TIMEOUT: Duration = Duration::from_millis(10);
-const FLAPJACK_AMBIENT_ENV_VARS: [&str; 19] = [
+const FLAPJACK_AMBIENT_ENV_VARS: [&str; 26] = [
     "FLAPJACK_ADMIN_KEY",
     "FLAPJACK_NO_AUTH",
     "FLAPJACK_ENV",
@@ -39,6 +39,13 @@ const FLAPJACK_AMBIENT_ENV_VARS: [&str; 19] = [
     "FLAPJACK_ALLOW_NO_AUTH_PUBLIC_BIND",
     "FLAPJACK_PORT",
     "FLAPJACK_DATA_DIR",
+    "FLAPJACK_NODE_ID",
+    "FLAPJACK_PEERS",
+    "FLAPJACK_BOOTSTRAP_PEER",
+    "FLAPJACK_ADVERTISE_ADDR",
+    "FLAPJACK_REPLICATION_API_KEY",
+    "FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS",
+    "FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS",
     "FLAPJACK_IDEMPOTENCY_TTL_SECS",
     "FLAPJACK_IDEMPOTENCY_PERSISTENT",
     "FLAPJACK_IDEMPOTENCY_PERSIST",
@@ -92,7 +99,7 @@ fn strip_flapjack_ambient_env_from_process_command(command: &mut std::process::C
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_task_poll_response, http_request_before_deadline,
+        classify_task_poll_response, flapjack_process_command, http_request_before_deadline,
         http_request_with_headers_and_budget, is_transient_http_transport_error,
         read_http_response, with_each_flapjack_ambient_env_var, HttpRequestBudget,
         HttpResponseReader, TaskPollOutcome, DEFAULT_HTTP_READ_TIMEOUT,
@@ -117,6 +124,30 @@ mod tests {
                 .map(|env_var| env_var.to_string())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn flapjack_process_command_removes_ambient_topology_and_credentials() {
+        let command = flapjack_process_command();
+        let removals = command
+            .get_envs()
+            .filter_map(|(name, value)| value.is_none().then_some(name))
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "FLAPJACK_NODE_ID",
+            "FLAPJACK_PEERS",
+            "FLAPJACK_BOOTSTRAP_PEER",
+            "FLAPJACK_ADVERTISE_ADDR",
+            "FLAPJACK_REPLICATION_API_KEY",
+            "FLAPJACK_ALLOW_CLEARTEXT_REPLICATION_PEERS",
+            "FLAPJACK_ALLOW_UNAUTHENTICATED_REPLICATION_PEERS",
+        ] {
+            assert!(
+                removals.iter().any(|name| *name == expected),
+                "flapjack process command must remove ambient {expected}"
+            );
+        }
     }
 
     #[test]
