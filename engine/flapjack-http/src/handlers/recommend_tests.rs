@@ -3421,6 +3421,29 @@ async fn recommend_looking_similar_index_without_vectors_falls_back_to_term_simi
     assert_term_fallback_hits(&body, vec!["near", "mid"]);
 }
 
+#[tokio::test]
+async fn recommend_looking_similar_missing_index_returns_empty() {
+    let tmp = TempDir::new().unwrap();
+    let state = crate::test_helpers::TestStateBuilder::new(&tmp).build_shared();
+    let app = recommend_router(state);
+
+    let (status, body) = post_recommend(
+        &app,
+        serde_json::json!({
+            "requests": [{
+                "indexName": "missing-products",
+                "model": "looking-similar",
+                "objectID": "seed",
+                "threshold": 0
+            }]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["results"][0]["hits"], serde_json::json!([]));
+}
+
 /// Catch default-feature binaries silently returning no capped looking-similar recommendations.
 #[tokio::test]
 async fn recommend_looking_similar_returns_hits_without_vector_search_feature() {

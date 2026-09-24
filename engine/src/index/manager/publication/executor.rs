@@ -106,10 +106,14 @@ pub fn abort_unjournaled_publication(
 impl PreStagedPublication {
     /// Allocate an exclusive transaction namespace before the caller extracts content.
     pub fn prepare(base: &Path, target: PublicationTarget) -> Result<Self> {
-        let transaction_id =
-            PublicationTransactionId::new(format!("snapshot_{}", uuid::Uuid::new_v4().simple()))?;
+        let transaction_id = PublicationTransactionId::new(format!(
+            "{}{}",
+            super::SNAPSHOT_TRANSACTION_PREFIX,
+            uuid::Uuid::new_v4().simple()
+        ))?;
         let generation = PublicationGenerationEvidence::new(format!(
-            "snapshot_{}",
+            "{}{}",
+            super::SNAPSHOT_TRANSACTION_PREFIX,
             uuid::Uuid::new_v4().simple()
         ))?;
         let paths = PublicationPaths::new(base, &target, &transaction_id);

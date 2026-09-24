@@ -73,6 +73,104 @@ async fn snapshot_fixture_bytes(app: &axum::Router, index_name: &str) -> Vec<u8>
         .to_vec()
 }
 
+async fn snapshot_fixture_with_document(index_name: &str, object_id: &str) -> Vec<u8> {
+    let (app, _tmp) = common::build_test_app_for_local_requests(None);
+    common::seed_docs(
+        &app,
+        index_name,
+        "fixture-key",
+        vec![json!({ "objectID": object_id, "name": object_id })],
+    )
+    .await;
+    snapshot_fixture_bytes(&app, index_name).await
+}
+
+async fn import_snapshot_with_key(
+    app: &axum::Router,
+    index_name: &str,
+    snapshot_bytes: Vec<u8>,
+    admin_key: &str,
+) -> axum::http::Response<Body> {
+    common::send_oneshot(
+        app,
+        Method::POST,
+        &format!("/1/indexes/{index_name}/import"),
+        &[
+            ("content-type", "application/gzip"),
+            ("x-algolia-api-key", admin_key),
+            ("x-algolia-application-id", "test"),
+        ],
+        Body::from(snapshot_bytes),
+    )
+    .await
+}
+
+async fn authenticated_query(
+    app: &axum::Router,
+    index_name: &str,
+    admin_key: &str,
+) -> axum::http::Response<Body> {
+    common::send_oneshot(
+        app,
+        Method::POST,
+        &format!("/1/indexes/{index_name}/query"),
+        &[
+            ("content-type", "application/json"),
+            ("x-algolia-api-key", admin_key),
+            ("x-algolia-application-id", "test"),
+        ],
+        Body::from(json!({ "query": "" }).to_string()),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn loaded_tenant_accepts_replacement_snapshot_import() {
+    const ADMIN_KEY: &str = "snapshot-replacement-admin-key";
+    let index_name = "snapshot-loaded-replacement-contract";
+    let initial_snapshot = snapshot_fixture_with_document(index_name, "initial-generation").await;
+    let replacement_snapshot =
+        snapshot_fixture_with_document(index_name, "replacement-generation").await;
+    let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
+
+    let initial_import =
+        import_snapshot_with_key(&app, index_name, initial_snapshot, ADMIN_KEY).await;
+    assert_eq!(initial_import.status(), StatusCode::OK);
+    assert_eq!(
+        common::parse_response_json(initial_import).await,
+        json!({ "status": "imported" })
+    );
+
+    let loaded_query = authenticated_query(&app, index_name, ADMIN_KEY).await;
+    assert_eq!(loaded_query.status(), StatusCode::OK);
+    let loaded_body = common::parse_response_json(loaded_query).await;
+    assert_eq!(
+        loaded_body["hits"][0]["objectID"],
+        json!("initial-generation")
+    );
+
+    let replacement_import =
+        import_snapshot_with_key(&app, index_name, replacement_snapshot, ADMIN_KEY).await;
+    let replacement_status = replacement_import.status();
+    let replacement_import_body = common::parse_response_json(replacement_import).await;
+    assert_eq!(
+        replacement_status,
+        StatusCode::OK,
+        "loaded destination must accept a replacement snapshot: {}",
+        replacement_import_body
+    );
+    assert_eq!(replacement_import_body, json!({ "status": "imported" }));
+
+    let replacement_query = authenticated_query(&app, index_name, ADMIN_KEY).await;
+    assert_eq!(replacement_query.status(), StatusCode::OK);
+    let replacement_search_body = common::parse_response_json(replacement_query).await;
+    assert_eq!(replacement_search_body["nbHits"], json!(1));
+    assert_eq!(
+        replacement_search_body["hits"][0]["objectID"],
+        json!("replacement-generation")
+    );
+}
+
 async fn post_batch_without_wait(
     app: &axum::Router,
     index_name: &str,

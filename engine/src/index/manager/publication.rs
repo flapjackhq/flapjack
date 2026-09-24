@@ -14,6 +14,7 @@ use fault::PublicationIo;
 // 1 predates that evidence entirely and is refused on read (see `from_json`).
 const SCHEMA_VERSION: u32 = 2;
 const LEGACY_PRE_FENCE_SCHEMA_VERSION: u32 = 1;
+const SNAPSHOT_TRANSACTION_PREFIX: &str = "snapshot_";
 const PUBLICATION_DIR: &str = ".publication";
 const QUARANTINE_DIR: &str = ".publication_quarantine";
 const CRAWLER_TOMBSTONE_DIR: &str = ".crawler_run_tombstones";
@@ -51,6 +52,8 @@ mod repair;
 #[cfg(test)]
 mod repair_deletion_tests;
 mod scanner;
+mod snapshot_adoption;
+pub(crate) use snapshot_adoption::{adopt_fenced_publication, adopt_snapshot_publication};
 #[cfg(test)]
 mod scanner_tests;
 pub use digest::canonical_tenant_tree_digest;
@@ -58,7 +61,7 @@ pub use digest::canonical_tenant_tree_digest;
 pub(crate) use epoch::set_publication_epoch_open_lock_file_checkpoint_hook_for_test;
 pub(crate) use epoch::{
     capture_publication_epoch, run_if_publication_admission_unfenced,
-    try_validate_publication_epoch_admission,
+    try_lock_publication_observation, try_validate_publication_epoch_admission,
 };
 pub use epoch::{
     compare_and_advance_publication_epoch, fence_publication_admission,

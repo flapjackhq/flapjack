@@ -268,25 +268,44 @@ fn register_public_documents_count_gauge(registry: &Registry, state: &AppState) 
     );
 }
 
+fn durable_oplog_sequences(state: &AppState) -> Vec<(String, u64)> {
+    let tenants = match crate::tenant_dirs::visible_tenant_dir_names(&state.manager.base_path) {
+        Ok(tenants) => tenants,
+        Err(error) => {
+            tracing::warn!(%error, "cannot discover durable oplog metrics");
+            return Vec::new();
+        }
+    };
+    tenants
+        .into_iter()
+        .filter_map(
+            |tenant_id| match state.manager.tenant_durable_oplog_seq(&tenant_id) {
+                Ok(Some(sequence)) => Some((tenant_id, sequence)),
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::warn!(%tenant_id, %error, "cannot read durable oplog metric");
+                    None
+                }
+            },
+        )
+        .collect()
+}
+
 fn register_oplog_sequence_gauge(registry: &Registry, state: &AppState) {
-    let values = state
-        .manager
-        .all_tenant_oplog_seqs()
+    let values = durable_oplog_sequences(state)
         .into_iter()
         .map(|(tenant_id, sequence)| (tenant_id, sequence as f64));
     register_index_labeled_gauge_values(
         registry,
         "flapjack_oplog_current_seq",
-        "Current oplog sequence number per tenant",
+        "Durable committed oplog sequence number per tenant",
         values,
     );
 }
 
 #[cfg(test)]
 fn register_public_oplog_sequence_gauge(registry: &Registry, state: &AppState) {
-    let max_sequence = state
-        .manager
-        .all_tenant_oplog_seqs()
+    let max_sequence = durable_oplog_sequences(state)
         .into_iter()
         .map(|(_, sequence)| sequence)
         .max()

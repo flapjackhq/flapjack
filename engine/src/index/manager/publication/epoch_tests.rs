@@ -787,3 +787,44 @@ mod existing_epoch_tests {
         std::os::windows::fs::symlink_dir(target, link)
     }
 }
+
+#[test]
+#[serial_test::serial(publication_epoch_open_lock_file_checkpoint_hook)]
+fn metric_file_observation_does_not_hold_global_admission_registry() {
+    let tmp = TempDir::new().unwrap();
+    let products = target("metric_products");
+    drop(
+        try_validate_publication_epoch_admission(tmp.path(), &products, PublicationEpoch(0))
+            .unwrap(),
+    );
+    let paths = super::publication_epoch_paths_for_target_path(&tmp.path().join(products.as_str()));
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let _hook = set_publication_epoch_open_lock_file_checkpoint_hook_for_test(move |path| {
+        if path == paths.lock {
+            started_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }
+    });
+    let reader_base = tmp.path().to_path_buf();
+    let reader = std::thread::spawn(move || {
+        super::epoch::try_lock_publication_observation(&reader_base, &products)
+    });
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let other_base = tmp.path().to_path_buf();
+    let (admitted_tx, admitted_rx) = mpsc::channel();
+    let other = std::thread::spawn(move || {
+        let result = super::fence_publication_admission(&other_base, &target("unrelated"));
+        admitted_tx.send(result.is_ok()).unwrap();
+    });
+    let admitted_while_reader_paused = admitted_rx.recv_timeout(Duration::from_millis(100));
+    release_tx.send(()).unwrap();
+    assert!(reader.join().unwrap().unwrap().is_some());
+    other.join().unwrap();
+    assert_eq!(
+        admitted_while_reader_paused.ok(),
+        Some(true),
+        "filesystem work must not block unrelated publication admission"
+    );
+}
