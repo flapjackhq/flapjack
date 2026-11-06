@@ -19,7 +19,7 @@ use super::single_support::resolve_effective_relevancy_strictness;
 pub(super) struct CoreSearchContext<'a> {
     pub(super) state: &'a Arc<AppState>,
     pub(super) effective_index: &'a str,
-    pub(super) dictionary_lookup_tenant: &'a str,
+    pub(super) dictionary_application_id: &'a str,
     pub(super) req: &'a SearchRequest,
     pub(super) params: &'a mut PreparedSearchParams,
     pub(super) experiment_ctx: Option<ExperimentContext>,
@@ -34,7 +34,8 @@ struct SearchInvocation<'a> {
     req: &'a SearchRequest,
     params: &'a PreparedSearchParams,
     secured_hits_per_page_cap: Option<usize>,
-    dictionary_lookup_tenant: &'a str,
+    dictionary_application_id: &'a str,
+    dictionary_snapshot: Option<&'a flapjack::dictionaries::manager::DictionarySnapshot>,
 }
 
 impl SearchInvocation<'_> {
@@ -47,11 +48,7 @@ impl SearchInvocation<'_> {
         offset: usize,
     ) -> Result<SearchResult, FlapjackError> {
         let resolved_target = resolve_search_target(self.state, tenant_id);
-        let dictionary_lookup_tenant = if resolved_target.settings_override.is_some() {
-            tenant_id
-        } else {
-            self.dictionary_lookup_tenant
-        };
+        let dictionary_application_id = self.dictionary_application_id;
         let effective_relevancy_strictness = resolve_effective_relevancy_strictness(
             self.req,
             resolved_target.settings_override.as_ref(),
@@ -88,7 +85,8 @@ impl SearchInvocation<'_> {
                     secured_hits_per_page_cap: self.secured_hits_per_page_cap,
                     decompound_query: self.req.decompound_query,
                     settings_override: resolved_target.settings_override.as_ref(),
-                    dictionary_lookup_tenant: Some(dictionary_lookup_tenant),
+                    dictionary_application_id: Some(dictionary_application_id),
+                    dictionary_snapshot: self.dictionary_snapshot,
                     all_query_words_optional: self.params.all_query_words_optional,
                     relevancy_strictness: Some(effective_relevancy_strictness),
                     min_proximity: self.req.min_proximity,
@@ -126,7 +124,7 @@ pub(super) fn execute_core_search(
     let CoreSearchContext {
         state,
         effective_index,
-        dictionary_lookup_tenant,
+        dictionary_application_id,
         req,
         params,
         experiment_ctx,
@@ -143,12 +141,28 @@ pub(super) fn execute_core_search(
             .as_ref(),
     );
 
+    let dictionary_snapshot = if req.dictionary_snapshot.is_none() {
+        state
+            .manager
+            .dictionary_manager()
+            .map(|manager| manager.snapshot(dictionary_application_id))
+            .transpose()
+            .map_err(|error| {
+                FlapjackError::ApplicationConfigurationUnavailable(error.to_string())
+            })?
+    } else {
+        None
+    };
     let invocation = SearchInvocation {
         state,
         req,
         params,
         secured_hits_per_page_cap,
-        dictionary_lookup_tenant,
+        dictionary_application_id,
+        dictionary_snapshot: req
+            .dictionary_snapshot
+            .as_deref()
+            .or(dictionary_snapshot.as_ref()),
     };
     let CoreSearchOutcome {
         result,

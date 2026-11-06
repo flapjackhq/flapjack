@@ -19,6 +19,9 @@ PROVIDER_PID=""
 SERVER_PID=""
 BASE=""
 PROVIDER_BASE=""
+REPLACEMENT_COMPLETED=0
+CATALOG_MISMATCH=0
+FIRST_CATALOG_MISMATCH=""
 
 die() {
   printf 'PBV2_ALGOLIA_MIGRATION=RED reason=%s\n' "$1" >&2
@@ -43,7 +46,7 @@ cleanup() {
   local rc=$?
   terminate_pid "$SERVER_PID"
   terminate_pid "$PROVIDER_PID"
-  if [ "$rc" -eq 0 ] && [ -n "$TMP" ] && [ -d "$TMP" ]; then
+  if [ "$rc" -eq 0 ] && [ "$REPLACEMENT_COMPLETED" -eq 0 ] && [ -n "$TMP" ] && [ -d "$TMP" ]; then
     rm -rf "$TMP"
   elif [ -n "$TMP" ]; then
     printf 'PBV2_ALGOLIA_MIGRATION=INFO evidence=%s\n' "$TMP" >&2
@@ -127,10 +130,10 @@ request() {
 }
 
 poll_job() {
-  local job_id="$1" attempt disposition
+  local job_id="$1" label="${2:-terminal}" attempt disposition
   for attempt in $(seq 1 240); do
-    request terminal GET "/1/migrations/algolia/$job_id" '' 200
-    disposition="$(jq -er .disposition "$TMP/terminal.json")"
+    request "$label" GET "/1/migrations/algolia/$job_id" '' 200
+    disposition="$(jq -er .disposition "$TMP/${label}.json")"
     case "$disposition" in
       succeeded) return 0 ;;
       running) sleep 0.1 ;;
@@ -138,6 +141,29 @@ poll_job() {
     esac
   done
   die 'migration_poll_timeout'
+}
+
+wait_for_task() {
+  local label="$1" task_id="$2" attempt status
+  [ -n "$task_id" ] && [ "$task_id" != null ] || die "${label}_task_id_missing"
+  for attempt in $(seq 1 240); do
+    request "${label}_task" GET "/1/indexes/$TARGET_INDEX/task/$task_id" '' 200
+    status="$(jq -er .status "$TMP/${label}_task.json")" || die "${label}_task_status_invalid"
+    case "$status" in
+      published) return 0 ;;
+      notPublished) sleep 0.1 ;;
+      *) die "${label}_task_status_${status}" ;;
+    esac
+  done
+  die "${label}_task_poll_timeout"
+}
+
+seed_write() {
+  local label="$1" method="$2" path="$3" body="$4" task_id
+  request "$label" "$method" "$path" "$body" 200
+  task_id="$(jq -er '.taskID | select(type == "string" or type == "number")' "$TMP/${label}.json")" \
+    || die "${label}_task_id_invalid"
+  wait_for_task "$label" "$task_id"
 }
 
 assert_preview() {
@@ -208,6 +234,241 @@ assert_import_and_search() {
   request deleted_replica_absent POST "/1/indexes/$TARGET_REPLICA/query" '{"query":"trail"}' 404
 }
 
+derive_generation_a() {
+  jq '
+    .documents
+    | map(if .objectID == "pbv2-trail-001" then .title = "Generation A overlapping trail jacket" else . end)
+    + [{objectID:"generation-a-document",title:"Generation A only document",popularity:999}]
+  ' "$FIXTURE" >"$TMP/generation_a_documents.json"
+  jq '
+    .rules
+    | map(if .objectID == "pbv2-rule-trail-outerwear" then .description = "Generation A overlapping rule" else . end)
+    + [{objectID:"generation-a-rule",conditions:[],consequence:{}}]
+  ' "$FIXTURE" >"$TMP/generation_a_rules.json"
+  jq '
+    .synonyms
+    | map(if .objectID == "pbv2-syn-shell-jacket" then .synonyms = ["jacket","shell"] else . end)
+    + [{objectID:"generation-a-synonym",type:"synonym",synonyms:["generation","alpha"]}]
+  ' "$FIXTURE" >"$TMP/generation_a_synonyms.json"
+  jq '
+    .settings
+    | .hitsPerPage = 3
+    | .ranking = ["custom","exact","attribute","proximity","filters","words","geo","typo"]
+    | .attributeForDistinct = "brand"
+    | .distinct = true
+  ' "$FIXTURE" >"$TMP/generation_a_settings.json"
+}
+
+seed_generation_a() {
+  local body object_id
+  request generation_a_create POST /1/indexes "$(jq -cn --arg uid "$TARGET_INDEX" '{uid:$uid}')" 200
+  jq -e --arg uid "$TARGET_INDEX" '.uid == $uid and (has("taskID") | not)' \
+    "$TMP/generation_a_create.json" >/dev/null || die 'generation_a_create_response_invalid'
+
+  body="$(jq -c '{requests:map({action:"addObject",body:.})}' "$TMP/generation_a_documents.json")"
+  seed_write generation_a_documents_seed POST "/1/indexes/$TARGET_INDEX/batch" "$body"
+  seed_write generation_a_settings_seed PUT "/1/indexes/$TARGET_INDEX/settings" \
+    "$(jq -c . "$TMP/generation_a_settings.json")"
+  while IFS= read -r body; do
+    object_id="$(jq -er .objectID <<<"$body")" || die 'generation_a_rule_id_invalid'
+    seed_write "generation_a_rule_seed_${object_id}" PUT "/1/indexes/$TARGET_INDEX/rules/$object_id" "$body"
+  done < <(jq -c '.[]' "$TMP/generation_a_rules.json")
+  while IFS= read -r body; do
+    object_id="$(jq -er .objectID <<<"$body")" || die 'generation_a_synonym_id_invalid'
+    seed_write "generation_a_synonym_seed_${object_id}" PUT "/1/indexes/$TARGET_INDEX/synonyms/$object_id" "$body"
+  done < <(jq -c '.[]' "$TMP/generation_a_synonyms.json")
+}
+
+enumerate_documents() {
+  local label="$1" page=0 cursor="" body response next_cursor seen_cursors='[]'
+  jq -cn '[]' >"$TMP/${label}_documents.json"
+  while [ "$page" -lt 1000 ]; do
+    if [ -z "$cursor" ]; then
+      body='{"hitsPerPage":2}'
+    else
+      body="$(jq -cn --arg cursor "$cursor" '{cursor:$cursor,hitsPerPage:2}')"
+    fi
+    request "${label}_documents_page_${page}" POST "/1/indexes/$TARGET_INDEX/browse" "$body" 200
+    response="$TMP/${label}_documents_page_${page}.json"
+    jq -e '.hits | type == "array"' "$response" >/dev/null \
+      || die "${label}_documents_page_${page}_malformed"
+    jq -s '.[0] + .[1].hits' "$TMP/${label}_documents.json" "$response" \
+      >"$TMP/${label}_documents.next.json"
+    mv "$TMP/${label}_documents.next.json" "$TMP/${label}_documents.json"
+    next_cursor="$(jq -er 'if (.cursor == null or has("cursor") == false) then "" elif (.cursor|type) == "string" and .cursor != "" then .cursor else error("invalid cursor") end' "$response")" \
+      || die "${label}_documents_page_${page}_cursor_invalid"
+    [ -n "$next_cursor" ] || break
+    jq -e --arg cursor "$next_cursor" 'index($cursor) == null' <<<"$seen_cursors" >/dev/null \
+      || die "${label}_documents_repeated_cursor"
+    seen_cursors="$(jq -c --arg cursor "$next_cursor" '. + [$cursor]' <<<"$seen_cursors")"
+    cursor="$next_cursor"
+    page=$((page + 1))
+  done
+  [ "$page" -lt 1000 ] || die "${label}_documents_page_bound_exhausted"
+  jq -e 'all(.[]; (.objectID|type) == "string") and ([.[].objectID] | length == (unique | length))' \
+    "$TMP/${label}_documents.json" >/dev/null || die "${label}_documents_duplicate_or_invalid_id"
+}
+
+enumerate_numbered() {
+  local label="$1" dimension="$2" path="$3" page=0 response nb_pages="" nb_hits=""
+  jq -cn '[]' >"$TMP/${label}_${dimension}.json"
+  while [ "$page" -lt 1000 ]; do
+    request "${label}_${dimension}_page_${page}" POST "$path" \
+      "$(jq -cn --argjson page "$page" '{query:"",page:$page,hitsPerPage:1}')" 200
+    response="$TMP/${label}_${dimension}_page_${page}.json"
+    jq -e --argjson page "$page" '
+      (.hits|type) == "array" and .page == $page and
+      (.nbPages|type) == "number" and .nbPages >= 0 and (.nbPages|floor) == .nbPages and
+      (.nbHits|type) == "number" and .nbHits >= 0 and (.nbHits|floor) == .nbHits
+    ' "$response" >/dev/null || die "${label}_${dimension}_page_${page}_malformed"
+    if [ -z "$nb_pages" ]; then
+      nb_pages="$(jq -er .nbPages "$response")"
+      nb_hits="$(jq -er .nbHits "$response")"
+    else
+      jq -e --argjson pages "$nb_pages" --argjson hits "$nb_hits" \
+        '.nbPages == $pages and .nbHits == $hits' "$response" >/dev/null \
+        || die "${label}_${dimension}_unstable_counts"
+    fi
+    jq -s '.[0] + .[1].hits' "$TMP/${label}_${dimension}.json" "$response" \
+      >"$TMP/${label}_${dimension}.next.json"
+    mv "$TMP/${label}_${dimension}.next.json" "$TMP/${label}_${dimension}.json"
+    [ "$nb_pages" -eq 0 ] || [ $((page + 1)) -ge "$nb_pages" ] && break
+    page=$((page + 1))
+  done
+  [ "$page" -lt 1000 ] || die "${label}_${dimension}_page_bound_exhausted"
+  jq -e --argjson hits "$nb_hits" '
+    length == $hits and all(.[]; (.objectID|type) == "string") and
+    ([.[].objectID] | length == (unique | length))
+  ' "$TMP/${label}_${dimension}.json" >/dev/null \
+    || die "${label}_${dimension}_truncated_duplicate_or_invalid_id"
+}
+
+record_catalog_mismatch() {
+  local phase="$1" dimension="$2" id_path="$3" expected="$4" actual="$5" mismatch
+  mismatch="$(jq -cn --arg phase "$phase" --arg dimension "$dimension" --arg path "$id_path" \
+    --argjson expected "$expected" --argjson actual "$actual" \
+    '{phase:$phase,dimension:$dimension,path:$path,expected:$expected,actual:$actual}')"
+  printf '%s\n' "$mismatch" >>"$TMP/catalog_mismatches.ndjson"
+  if [ "$CATALOG_MISMATCH" -eq 0 ]; then
+    FIRST_CATALOG_MISMATCH="$mismatch"
+  fi
+  CATALOG_MISMATCH=1
+}
+
+compare_record_dimension() {
+  local phase="$1" dimension="$2" expected_file="$3" actual_file="$4" difference
+  difference="$(jq -cn --slurpfile expected "$expected_file" --slurpfile actual "$actual_file" '
+    def by_id: map({key:.objectID,value:.}) | from_entries;
+    def display_path:
+      map(if type == "number" then "[\(.)]" else tostring end) | join(".");
+    ($expected[0] | by_id) as $e | ($actual[0] | by_id) as $a |
+    (($e|keys) + ($a|keys) | unique) as $ids |
+    first($ids[] as $id | select($e[$id] != $a[$id]) |
+      $e[$id] as $expected_body | $a[$id] as $actual_body |
+      if $expected_body == null or $actual_body == null then
+        {id:$id,path:"$",expected:$expected_body,actual:$actual_body}
+      else
+        ([($expected_body | paths), ($actual_body | paths)] | unique_by(tojson)) as $paths |
+        (first($paths[] as $path |
+          select(($expected_body | getpath($path)) != ($actual_body | getpath($path))) |
+          {id:$id,path:($path | display_path),
+           expected:($expected_body | getpath($path)),actual:($actual_body | getpath($path))}) //
+         {id:$id,path:"$",expected:$expected_body,actual:$actual_body})
+      end) // empty
+  ')"
+  [ -z "$difference" ] || record_catalog_mismatch "$phase" "$dimension" \
+    "$(jq -r '.id + ":" + .path' <<<"$difference")" \
+    "$(jq -c .expected <<<"$difference")" "$(jq -c .actual <<<"$difference")"
+}
+
+compare_settings() {
+  local phase="$1" generation="$2" expected_file actual_file difference
+  actual_file="$TMP/${phase}_settings.json"
+  if [ "$generation" = A ]; then
+    expected_file="$TMP/generation_a_settings.json"
+    difference="$(jq -cn --slurpfile expected "$expected_file" --slurpfile actual "$actual_file" '
+      $expected[0] as $e | $actual[0] as $a |
+      first(($e|keys[]) as $key | select($e[$key] != $a[$key]) |
+        {path:$key,expected:$e[$key],actual:$a[$key]}) //
+      if (($a.replicas // []) != []) then {path:"replicas",expected:[],actual:$a.replicas} else empty end
+    ')"
+  else
+    expected_file="$FIXTURE"
+    difference="$(jq -cn --slurpfile fixture "$expected_file" --slurpfile actual "$actual_file" '
+      $fixture[0].settings as $e | $actual[0] as $a |
+      first(($e|keys[]) as $key | select($e[$key] != $a[$key]) |
+        {path:$key,expected:$e[$key],actual:$a[$key]}) //
+      if $a.replicas != ["virtual(pbv2_acceptance_imported_price_asc)"] then
+        {path:"replicas",expected:["virtual(pbv2_acceptance_imported_price_asc)"],actual:($a.replicas // null)}
+      elif $a.attributeForDistinct != null then
+        {path:"attributeForDistinct",expected:null,actual:$a.attributeForDistinct}
+      elif ($a|has("distinct")) then
+        {path:"distinct",expected:"absent",actual:$a.distinct}
+      else empty end
+    ')"
+  fi
+  [ -z "$difference" ] || record_catalog_mismatch "$phase" settings \
+    "$(jq -r .path <<<"$difference")" "$(jq -c .expected <<<"$difference")" \
+    "$(jq -c .actual <<<"$difference")"
+}
+
+observe_catalog() {
+  local label="$1" generation="$2" prefix expected_order actual_order
+  enumerate_documents "$label"
+  enumerate_numbered "$label" rules "/1/indexes/$TARGET_INDEX/rules/search"
+  enumerate_numbered "$label" synonyms "/1/indexes/$TARGET_INDEX/synonyms/search"
+  request "${label}_settings" GET "/1/indexes/$TARGET_INDEX/settings" '' 200
+  request "${label}_search" POST "/1/indexes/$TARGET_INDEX/query" \
+    '{"query":"trail","hitsPerPage":100,"distinct":false}' 200
+
+  if [ "$generation" = A ]; then
+    prefix="$TMP/generation_a"
+  else
+    jq '.documents' "$FIXTURE" >"$TMP/canonical_b_documents.json"
+    jq '.rules' "$FIXTURE" >"$TMP/canonical_b_rules.json"
+    jq '.synonyms' "$FIXTURE" >"$TMP/canonical_b_synonyms.json"
+    prefix="$TMP/canonical_b"
+  fi
+  compare_record_dimension "$label" documents "${prefix}_documents.json" "$TMP/${label}_documents.json"
+  compare_record_dimension "$label" rules "${prefix}_rules.json" "$TMP/${label}_rules.json"
+  compare_record_dimension "$label" synonyms "${prefix}_synonyms.json" "$TMP/${label}_synonyms.json"
+  compare_settings "$label" "$generation"
+  expected_order="$(jq -c '.oracles.search.trail_baseline_order' "$FIXTURE")"
+  actual_order="$(jq -c '[.hits[].objectID]' "$TMP/${label}_search.json")" \
+    || die "${label}_search_envelope_invalid"
+  [ "$actual_order" = "$expected_order" ] || record_catalog_mismatch "$label" search hit_order \
+    "$expected_order" "$actual_order"
+}
+
+assert_replacement() {
+  local primary payload job_id
+  derive_generation_a
+  seed_generation_a
+  observe_catalog generation_a A
+  [ "$CATALOG_MISMATCH" -eq 0 ] || die "generation_a_setup_mismatch_${FIRST_CATALOG_MISMATCH}"
+
+  primary="$(jq -er .oracles.replicas.source_primary "$FIXTURE")"
+  payload="$(jq -cn --arg app "$SOURCE_APP" --arg key "$SOURCE_KEY" --arg source "$primary" \
+    --arg target "$TARGET_INDEX" \
+    '{appId:$app,apiKey:$key,sourceIndex:$source,targetIndex:$target,overwrite:true}')"
+  request replacement_submit POST /1/migrations/algolia "$payload" 202
+  job_id="$(jq -er .jobId "$TMP/replacement_submit.json")" || die 'replacement_submit_job_id_missing'
+  poll_job "$job_id" replacement_terminal
+  jq -e '.phase == "activating" and .disposition == "succeeded" and .terminalAt != null' \
+    "$TMP/replacement_terminal.json" >/dev/null || die 'replacement_terminal_contract_mismatch'
+
+  observe_catalog post_terminal B
+  request replacement_ack_1 POST "/1/migrations/algolia/$job_id/acknowledge" '' 204
+  observe_catalog post_ack_1 B
+  request replacement_ack_2 POST "/1/migrations/algolia/$job_id/acknowledge" '' 204
+  observe_catalog post_ack_2 B
+  request replacement_delete_primary DELETE "/1/indexes/$TARGET_INDEX" '' 200
+  request replacement_delete_replica DELETE "/1/indexes/$TARGET_REPLICA" '' 200
+  request replacement_deleted_primary_absent POST "/1/indexes/$TARGET_INDEX/query" '{"query":"trail"}' 404
+  request replacement_deleted_replica_absent POST "/1/indexes/$TARGET_REPLICA/query" '{"query":"trail"}' 404
+  REPLACEMENT_COMPLETED=1
+}
+
 assert_source_unchanged() {
   curl -fsS "$PROVIDER_BASE/__state" >"$TMP/source-after.json" || die 'provider_final_state_unreachable'
   jq -e --slurpfile before "$TMP/source-before.json" '
@@ -224,7 +485,12 @@ main() {
   start_flapjack
   assert_preview
   assert_import_and_search
+  assert_replacement
   assert_source_unchanged
+  if [ "$CATALOG_MISMATCH" -ne 0 ]; then
+    printf 'PBV2_ALGOLIA_MIGRATION=RED reason=catalog_mismatch first=%s\n' "$FIRST_CATALOG_MISMATCH" >&2
+    return 1
+  fi
   printf 'PBV2_ALGOLIA_MIGRATION=PASS fixture_sha=111919b3780478fa5c653cb15551d170f8b6f8d96ee88333a19b47012686ef44 source_nonmutation=PASS zero_residue=PASS\n'
 }
 

@@ -7,8 +7,137 @@ use predicates::str::contains;
 use std::time::Duration;
 use support::{
     admin_entry_exists_in_json, extract_admin_key_hash_from_json, extract_key_from_banner,
-    flapjack_cmd, http_request, unique_suffix, RunningServer, TempDir,
+    flapjack_cmd, http_request, http_request_with_headers, unique_suffix, RunningServer, TempDir,
 };
+
+fn authenticated_replication_status(server: &RunningServer, admin_key: &str) -> (bool, u64) {
+    let response = http_request_with_headers(
+        server.bind_addr(),
+        "GET",
+        "/internal/status",
+        &[
+            ("X-Algolia-Application-ID", "flapjack"),
+            ("X-Algolia-API-Key", admin_key),
+        ],
+        None,
+    )
+    .expect("authenticated internal status request should succeed");
+    assert_eq!(
+        response.status, 200,
+        "authenticated internal status should return HTTP 200, body: {}",
+        response.body
+    );
+
+    let status: serde_json::Value = serde_json::from_str(&response.body)
+        .expect("authenticated internal status should return valid JSON");
+    let replication_enabled = status["replication_enabled"]
+        .as_bool()
+        .expect("replication_enabled should be a Boolean");
+    let peer_count = status["peer_count"]
+        .as_u64()
+        .expect("peer_count should be a nonnegative integer");
+    (replication_enabled, peer_count)
+}
+
+#[cfg(unix)]
+fn managed_mode_standalone_control(
+    server: &RunningServer,
+    fixture: &TempDir,
+    admin_key: &str,
+) -> std::process::ExitStatus {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::process::{Command, Stdio};
+
+    for tool in ["bash", "curl", "jq"] {
+        let status = Command::new(tool)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap_or_else(|error| panic!("required test tool {tool} is not invocable: {error}"));
+        assert!(
+            status.success(),
+            "required test tool {tool} is not invocable"
+        );
+    }
+
+    let curl_config = fixture.root().join("status.curl-config");
+    let mut config = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&curl_config)
+        .expect("curl config should be created atomically");
+    use std::io::Write;
+    writeln!(config, "header = \"X-Algolia-Application-ID: flapjack\"")
+        .expect("curl config should contain the canonical application ID");
+    writeln!(config, "header = \"X-Algolia-API-Key: {admin_key}\"")
+        .expect("curl config should contain the synthetic admin credential");
+    drop(config);
+    let mode = std::fs::metadata(&curl_config)
+        .expect("curl config metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "curl config must be readable only by its owner"
+    );
+
+    const ASSERT_STANDALONE: &str = r#"set -o pipefail
+curl --fail --silent --show-error --config "$FJ_STATUS_CURL_CONFIG" \
+  "$FJ_ENGINE_ORIGIN/internal/status" |
+  jq -e '(.replication_enabled | type) == "boolean" and .replication_enabled == false'"#;
+
+    Command::new("bash")
+        .arg("-c")
+        .arg(ASSERT_STANDALONE)
+        .env("FJ_ENGINE_ORIGIN", format!("http://{}", server.bind_addr()))
+        .env("FJ_STATUS_CURL_CONFIG", &curl_config)
+        .status()
+        .expect("managed-mode standalone control should run")
+}
+
+#[cfg(unix)]
+#[test]
+fn authenticated_internal_status_reports_no_replication_intent() {
+    let fixture = TempDir::new("fj_authenticated_status_no_replication");
+    let admin_key = "synthetic-admin-key";
+    let server = RunningServer::spawn_auth_auto_port_with_env(
+        fixture.path(),
+        &[("FLAPJACK_ADMIN_KEY", admin_key)],
+    );
+
+    let (replication_enabled, peer_count) = authenticated_replication_status(&server, admin_key);
+    assert!(!replication_enabled);
+    assert_eq!(peer_count, 0);
+
+    let control = managed_mode_standalone_control(&server, &fixture, admin_key);
+    assert_eq!(control.code(), Some(0));
+}
+
+#[cfg(unix)]
+#[test]
+fn authenticated_internal_status_reports_advertise_only_replication_intent() {
+    let fixture = TempDir::new("fj_authenticated_status_advertise_only");
+    let admin_key = "synthetic-admin-key";
+    let server = RunningServer::spawn_auth_auto_port_with_env(
+        fixture.path(),
+        &[
+            ("FLAPJACK_ADMIN_KEY", admin_key),
+            ("FLAPJACK_REPLICATION_API_KEY", "synthetic-peer-key"),
+            ("FLAPJACK_ADVERTISE_ADDR", "https://self.invalid:7700"),
+        ],
+    );
+
+    let (replication_enabled, peer_count) = authenticated_replication_status(&server, admin_key);
+    assert!(replication_enabled);
+    assert_eq!(peer_count, 0);
+
+    let control = managed_mode_standalone_control(&server, &fixture, admin_key);
+    assert_eq!(control.code(), Some(1));
+}
 
 #[test]
 fn repair_publication_reports_clean_without_creating_evidence() {
@@ -797,6 +926,239 @@ fn auto_port_binds_ephemeral_loopback_and_prints_resolved_addr() {
         "expected healthy status payload, got: {}",
         health.body
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn application_storage_survives_clean_shutdown_and_restart() {
+    use flapjack::personalization::{PersonalizationProfile, PersonalizationProfileStore};
+
+    let fixture = TempDir::new("fj_storage_shutdown");
+    // The shutdown receipt lives beside the data root; keep both task-owned.
+    let data = fixture.root().join("data");
+    // One application-only dictionary store and one preceding a same-named index.
+    let dictionary_settings: flapjack::dictionaries::DictionarySettings =
+        serde_json::from_value(serde_json::json!({
+            "disableStandardEntries": {"stopwords": {"en": true}}
+        }))
+        .unwrap();
+    let dictionary_paths = ["flapjack", "products"].map(|name| {
+        let dictionaries =
+            flapjack::dictionaries::persistence::DictionaryStore::for_application(&data, name)
+                .unwrap();
+        dictionaries.save_settings(&dictionary_settings).unwrap();
+        data.join(".applications")
+            .join(name)
+            .join(".dictionaries/settings.json")
+    });
+    let dictionary_bytes = dictionary_paths
+        .each_ref()
+        .map(|path| std::fs::read(path).unwrap());
+    let store = PersonalizationProfileStore::new(&data);
+    let profile = PersonalizationProfile {
+        user_token: "shutdown-user".to_string(),
+        last_event_at: None,
+        scores: Default::default(),
+    };
+    store.save_profile(&profile).unwrap();
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let manager = flapjack::IndexManager::new(&data);
+        manager.create_tenant("products").unwrap();
+        manager
+            .add_documents_sync(
+                "products",
+                [
+                    serde_json::json!({"objectID":"kept", "name":"persistent product"}),
+                    serde_json::json!({"objectID":"alpha", "name":"alpha particles"}),
+                    serde_json::json!({"objectID":"delta", "name":"delta waves"}),
+                ]
+                .iter()
+                .map(|doc| flapjack::types::Document::from_json(doc).unwrap())
+                .collect(),
+            )
+            .await
+            .unwrap();
+        manager.drain_all_write_queues().await.unwrap();
+    });
+    let admin_key = "synthetic-shutdown-admin";
+    let headers = [
+        ("X-Algolia-Application-ID", "flapjack"),
+        ("X-Algolia-API-Key", admin_key),
+    ];
+    let mut server = RunningServer::spawn_auth_auto_port_with_env(
+        data.to_str().unwrap(),
+        &[("FLAPJACK_ADMIN_KEY", admin_key)],
+    );
+    for (application_id, word) in [("flapjack", "alpha"), ("products", "delta")] {
+        let body = serde_json::json!({"requests":[{"action":"addEntry","body":{"objectID":"custom","language":"en","word":word,"state":"enabled","type":"custom"}}]}).to_string();
+        let response = http_request_with_headers(
+            server.bind_addr(),
+            "POST",
+            "/1/dictionaries/stopwords/batch",
+            &[
+                ("X-Algolia-Application-ID", application_id),
+                ("X-Algolia-API-Key", admin_key),
+            ],
+            Some(&body),
+        )
+        .unwrap();
+        assert_eq!(response.status, 200, "{}", response.body);
+    }
+    let strategy =
+        serde_json::json!({"eventsScoring":[],"facetsScoring":[],"personalizationImpact":37});
+    let response = http_request_with_headers(
+        server.bind_addr(),
+        "POST",
+        "/1/strategies/personalization",
+        &headers,
+        Some(&strategy.to_string()),
+    )
+    .unwrap();
+    assert_eq!(response.status, 200, "{}", response.body);
+    let fence = http_request_with_headers(
+        server.bind_addr(),
+        "POST",
+        "/internal/release-write-fence/acquire",
+        &headers,
+        Some(r#"{"transactionId":"personalization-shutdown"}"#),
+    )
+    .unwrap();
+    assert_eq!(fence.status, 200, "{}", fence.body);
+
+    assert!(server.shutdown(Duration::from_secs(10)).success());
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(fixture.root().join("shutdown-inventory.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["kind"], "flapjack_shutdown_inventory");
+    assert_eq!(receipt["transactionId"], "personalization-shutdown");
+    assert_eq!(
+        receipt["inventory"],
+        serde_json::json!([{"indexId": "products", "documentCount": 3}])
+    );
+    assert_eq!(
+        store.load_profile("shutdown-user").unwrap(),
+        Some(profile.clone())
+    );
+
+    let mut restarted = RunningServer::spawn_auth_auto_port_with_env(
+        data.to_str().unwrap(),
+        &[("FLAPJACK_ADMIN_KEY", admin_key)],
+    );
+    let response = http_request_with_headers(
+        restarted.bind_addr(),
+        "GET",
+        "/1/indexes/products/kept",
+        &headers,
+        None,
+    )
+    .unwrap();
+    assert_eq!(response.status, 200, "{}", response.body);
+    let document: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(document["objectID"], "kept");
+    assert_eq!(document["name"], "persistent product");
+    assert_eq!(store.load_profile("shutdown-user").unwrap(), Some(profile));
+    let response = http_request_with_headers(
+        restarted.bind_addr(),
+        "GET",
+        "/1/strategies/personalization",
+        &headers,
+        None,
+    )
+    .unwrap();
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&response.body).unwrap(),
+        strategy
+    );
+    let dictionaries = http_request_with_headers(
+        restarted.bind_addr(),
+        "GET",
+        "/1/dictionaries/x/settings",
+        &headers,
+        None,
+    )
+    .unwrap();
+    assert_eq!(dictionaries.status, 200, "{}", dictionaries.body);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&dictionaries.body).unwrap(),
+        serde_json::to_value(&dictionary_settings).unwrap()
+    );
+    for (application_id, expected_id) in [("flapjack", "delta"), ("products", "alpha")] {
+        let response = http_request_with_headers(restarted.bind_addr(), "POST", "/1/indexes/products/query",
+            &[("X-Algolia-Application-ID", application_id),("X-Algolia-API-Key",admin_key)],
+            Some(r#"{"query":"alpha delta","removeStopWords":true,"queryLanguages":["en"],"queryType":"prefixNone"}"#)).unwrap();
+        assert_eq!(response.status, 200, "{}", response.body);
+        let result: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(result["nbHits"], 1);
+        assert_eq!(result["hits"][0]["objectID"], expected_id);
+    }
+    assert!(restarted.shutdown(Duration::from_secs(10)).success());
+    assert_index_snapshot_preserves_application_sentinel(
+        &data,
+        &fixture.root().join("restored"),
+        &dictionary_settings,
+        admin_key,
+    );
+    for (path, before) in dictionary_paths.iter().zip(&dictionary_bytes) {
+        assert_eq!(&std::fs::read(path).unwrap(), before);
+    }
+}
+
+#[cfg(unix)]
+fn assert_index_snapshot_preserves_application_sentinel(
+    data: &std::path::Path,
+    target_data: &std::path::Path,
+    dictionary_settings: &flapjack::dictionaries::DictionarySettings,
+    admin_key: &str,
+) {
+    let headers = [
+        ("X-Algolia-Application-ID", "flapjack"),
+        ("X-Algolia-API-Key", admin_key),
+    ];
+    // A native index snapshot restores documents, leaving target application state alone.
+    let bytes =
+        flapjack::index::snapshot::export_to_bytes_with_key(&data.join("products"), None).unwrap();
+    let target_dictionary = flapjack::dictionaries::persistence::DictionaryStore::for_application(
+        target_data,
+        "other-app",
+    )
+    .unwrap();
+    target_dictionary
+        .save_settings(dictionary_settings)
+        .unwrap();
+    flapjack::index::snapshot::import_from_bytes_with_key(
+        &bytes,
+        &target_data.join("products"),
+        None,
+    )
+    .unwrap();
+    let mut target = RunningServer::spawn_auth_auto_port_with_env(
+        target_data.to_str().unwrap(),
+        &[("FLAPJACK_ADMIN_KEY", admin_key)],
+    );
+    let response = http_request_with_headers(
+        target.bind_addr(),
+        "GET",
+        "/1/indexes/products/kept",
+        &headers,
+        None,
+    )
+    .unwrap();
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&response.body).unwrap()["name"],
+        "persistent product"
+    );
+    assert_eq!(
+        &target_dictionary.load_settings().unwrap(),
+        dictionary_settings
+    );
+    assert!(
+        !target_data.join(".applications/flapjack").exists(),
+        "index-only restoration must not claim application-state recovery"
+    );
+    assert!(target.shutdown(Duration::from_secs(10)).success());
 }
 
 #[test]

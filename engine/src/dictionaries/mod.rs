@@ -1,13 +1,13 @@
-//! Custom dictionaries API types and serialization for stopwords, plurals, and compounds, scoped per-tenant rather than per-index.
+//! Custom dictionaries API types and serialization for stopwords, plurals, and compounds, scoped per application rather than per index.
 
 pub mod manager;
 pub mod persistence;
 
 use serde::{Deserialize, Serialize};
 
-/// Default tenant ID for dictionary operations.
-/// Dictionaries are per-tenant (application-level), not per-index.
-pub const DEFAULT_DICTIONARY_TENANT: &str = "_default";
+/// Default application ID for dictionary operations.
+/// Core callers without application context use this application; never infer it from an index ID.
+pub const DEFAULT_DICTIONARY_APPLICATION_ID: &str = "_default";
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;

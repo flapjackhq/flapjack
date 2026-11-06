@@ -68,9 +68,9 @@ scraper = "0.27"
 rusqlite = { version = "0.32", features = ["bundled"] }
 once_cell = "1.19"
 prometheus = { version = "0.13", default-features = false }
-datafusion = { version = "44", default-features = false, features = ["parquet"], optional = true }
-arrow = { version = "53", default-features = false, features = ["json"], optional = true }
-parquet = { version = "53", default-features = false, features = ["zstd", "async"], optional = true }
+datafusion = { version = "55.2", default-features = false, features = ["parquet", "sql"], optional = true }
+arrow = { version = "59.3.2", default-features = false, features = ["json"], optional = true }
+parquet = { version = "59.3.2", default-features = false, features = ["zstd", "async"], optional = true }
 hostname = "0.4"
 utoipa = { version = "5.3", features = ["uuid"], optional = true }
 flapjack-ssl = { path = "flapjack-ssl" }

@@ -25,6 +25,8 @@ use std::collections::{BTreeMap, HashMap};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+mod rule_counts;
+
 #[tokio::test]
 async fn release_fence_keeps_search_available_without_analytics_persistence() {
     let tmp = TempDir::new().unwrap();

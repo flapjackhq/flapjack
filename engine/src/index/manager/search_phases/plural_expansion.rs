@@ -23,7 +23,7 @@ pub(super) fn build_plural_map(
     ignore_plurals_override: Option<&crate::query::plurals::IgnorePluralsValue>,
     effective_query_languages: &[String],
     query_text_stopped: &str,
-    dictionary_manager: Option<&Arc<crate::dictionaries::manager::DictionaryManager>>,
+    dictionary_manager: Option<&crate::dictionaries::manager::DictionarySnapshot>,
 ) -> Option<HashMap<String, Vec<String>>> {
     let ignore_plurals = effective_ignore_plurals(settings, ignore_plurals_override)?;
 
@@ -52,7 +52,7 @@ pub(super) fn apply_decompound(
     decompound_langs: &[String],
     decompound_keep_diacritics: &str,
     custom_normalization: &[(char, String)],
-    dictionary_manager: Option<&Arc<crate::dictionaries::manager::DictionaryManager>>,
+    dictionary_manager: Option<&crate::dictionaries::manager::DictionarySnapshot>,
 ) -> Option<HashMap<String, Vec<String>>> {
     let decompound_specs =
         build_decompound_language_specs(tenant_id, decompound_langs, dictionary_manager);
@@ -86,7 +86,7 @@ fn effective_ignore_plurals<'a>(
 fn build_plural_language_specs(
     tenant_id: &str,
     plural_languages: &[String],
-    dictionary_manager: Option<&Arc<crate::dictionaries::manager::DictionaryManager>>,
+    dictionary_manager: Option<&crate::dictionaries::manager::DictionarySnapshot>,
 ) -> Vec<PluralLanguageSpec> {
     plural_languages
         .iter()
@@ -102,7 +102,7 @@ fn build_plural_language_specs(
 fn build_plural_language_spec(
     tenant_id: &str,
     language: &str,
-    dictionary_manager: Option<&Arc<crate::dictionaries::manager::DictionaryManager>>,
+    dictionary_manager: Option<&crate::dictionaries::manager::DictionarySnapshot>,
 ) -> Option<PluralLanguageSpec> {
     let mut include_builtin = crate::query::plurals::has_plural_support(language);
     let mut custom_sets = Vec::new();
@@ -128,7 +128,7 @@ fn build_plural_language_spec(
 /// Query the dictionary manager for whether built-in plural rules are enabled for
 /// a language. Defaults to `true` on error.
 fn read_builtin_plural_setting(
-    dictionary_manager: &crate::dictionaries::manager::DictionaryManager,
+    dictionary_manager: &crate::dictionaries::manager::DictionarySnapshot,
     tenant_id: &str,
     language: &str,
 ) -> bool {
@@ -148,7 +148,7 @@ fn read_builtin_plural_setting(
 /// Load custom plural word sets from the dictionary manager for a language. Returns
 /// an empty vec on error, falling back to built-in rules only.
 fn read_custom_plural_sets(
-    dictionary_manager: &crate::dictionaries::manager::DictionaryManager,
+    dictionary_manager: &crate::dictionaries::manager::DictionarySnapshot,
     tenant_id: &str,
     language: &str,
 ) -> Vec<Vec<String>> {
@@ -217,7 +217,7 @@ fn plural_forms_for_word(word: &str, plural_specs: &[PluralLanguageSpec]) -> Vec
 fn build_decompound_language_specs(
     tenant_id: &str,
     decompound_languages: &[String],
-    dictionary_manager: Option<&Arc<crate::dictionaries::manager::DictionaryManager>>,
+    dictionary_manager: Option<&crate::dictionaries::manager::DictionarySnapshot>,
 ) -> Vec<DecompoundLanguageSpec> {
     decompound_languages
         .iter()
@@ -234,7 +234,7 @@ fn build_decompound_language_specs(
 fn build_decompound_language_spec(
     tenant_id: &str,
     language: &str,
-    dictionary_manager: Option<&Arc<crate::dictionaries::manager::DictionaryManager>>,
+    dictionary_manager: Option<&crate::dictionaries::manager::DictionarySnapshot>,
 ) -> Option<DecompoundLanguageSpec> {
     let mut include_builtin = true;
     let mut custom_parts_by_word = HashMap::new();
@@ -263,7 +263,7 @@ fn build_decompound_language_spec(
 /// to `true` on error.
 #[cfg(feature = "decompound")]
 fn read_builtin_decompound_setting(
-    dictionary_manager: &crate::dictionaries::manager::DictionaryManager,
+    dictionary_manager: &crate::dictionaries::manager::DictionarySnapshot,
     tenant_id: &str,
     language: &str,
 ) -> bool {
@@ -288,7 +288,7 @@ fn read_builtin_decompound_setting(
 /// Returns an empty map on error, falling back to built-in behavior only.
 #[cfg(feature = "decompound")]
 fn read_custom_decompound_map(
-    dictionary_manager: &crate::dictionaries::manager::DictionaryManager,
+    dictionary_manager: &crate::dictionaries::manager::DictionarySnapshot,
     tenant_id: &str,
     language: &str,
 ) -> HashMap<String, Vec<String>> {

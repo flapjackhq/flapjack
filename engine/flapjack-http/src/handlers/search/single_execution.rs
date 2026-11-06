@@ -34,7 +34,7 @@ pub(super) async fn search_single_with_secured_hits_per_page_cap(
     mut req: SearchRequest,
     secured_hits_per_page_cap: Option<usize>,
     can_see_unretrievable: bool,
-    dictionary_lookup_tenant: Option<String>,
+    dictionary_application_id: Option<String>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
     req.validate()?;
     resolve_around_lat_lng_via_ip(&mut req, &state.geoip_reader);
@@ -54,7 +54,8 @@ pub(super) async fn search_single_with_secured_hits_per_page_cap(
 
     let (query_vector, hybrid_params) =
         resolve_hybrid_search_inputs(&state, &effective_index, &req).await;
-    let dictionary_lookup_tenant = dictionary_lookup_tenant.unwrap_or_else(|| index_name.clone());
+    let dictionary_application_id = dictionary_application_id
+        .unwrap_or_else(|| flapjack::dictionaries::DEFAULT_DICTIONARY_APPLICATION_ID.to_string());
 
     let index_settings = state.manager.get_settings(&effective_index);
     let personalization_ctx =
@@ -65,7 +66,7 @@ pub(super) async fn search_single_with_secured_hits_per_page_cap(
             state,
             index_name,
             effective_index,
-            dictionary_lookup_tenant,
+            dictionary_application_id,
             req,
             secured_hits_per_page_cap,
             can_see_unretrievable_attributes: can_see_unretrievable,
@@ -150,7 +151,7 @@ struct SearchSyncContext {
     state: Arc<AppState>,
     index_name: String,
     effective_index: String,
-    dictionary_lookup_tenant: String,
+    dictionary_application_id: String,
     req: SearchRequest,
     secured_hits_per_page_cap: Option<usize>,
     can_see_unretrievable_attributes: bool,
@@ -172,7 +173,7 @@ fn search_single_sync(
         state,
         index_name,
         effective_index,
-        dictionary_lookup_tenant,
+        dictionary_application_id,
         mut req,
         secured_hits_per_page_cap,
         can_see_unretrievable_attributes,
@@ -198,7 +199,7 @@ fn search_single_sync(
     let (mut result, experiment_ctx, is_interleaving) = execute_core_search(CoreSearchContext {
         state: &state,
         effective_index: &effective_index,
-        dictionary_lookup_tenant: &dictionary_lookup_tenant,
+        dictionary_application_id: &dictionary_application_id,
         req: &req,
         params: &mut params,
         experiment_ctx,

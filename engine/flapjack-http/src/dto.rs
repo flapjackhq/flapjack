@@ -175,6 +175,11 @@ pub struct BatchSearchRequest {
 #[derive(Debug, Default, Deserialize, Clone, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchRequest {
+    /// Trusted request-local view; never deserialized from customer input.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub dictionary_snapshot:
+        Option<std::sync::Arc<flapjack::dictionaries::manager::DictionarySnapshot>>,
     #[serde(default)]
     pub index_name: Option<String>,
     #[serde(default)]

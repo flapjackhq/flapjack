@@ -54,9 +54,9 @@ async fn setup_virtual_replica_index(
         .await
         .unwrap();
 }
-/// TODO: Document virtual_replica_search_uses_replica_dictionary_entries.
+/// TODO: Document virtual_replica_search_uses_authenticated_application_dictionary.
 #[tokio::test]
-async fn virtual_replica_search_uses_replica_dictionary_entries() {
+async fn virtual_replica_search_uses_authenticated_application_dictionary() {
     let tmp = TempDir::new().unwrap();
     let state = make_basic_search_state(&tmp);
     let primary_index_name = "stage5b_primary_dictionary_routing";
@@ -70,7 +70,7 @@ async fn virtual_replica_search_uses_replica_dictionary_entries() {
     let dictionary_manager = state.manager.dictionary_manager().unwrap();
     dictionary_manager
         .batch(
-            virtual_replica_name,
+            "application-a",
             flapjack::dictionaries::DictionaryName::Stopwords,
             &flapjack::dictionaries::BatchDictionaryRequest {
                 clear_existing_dictionary_entries: false,
@@ -89,7 +89,7 @@ async fn virtual_replica_search_uses_replica_dictionary_entries() {
         .unwrap();
     dictionary_manager
         .batch(
-            primary_index_name,
+            virtual_replica_name,
             flapjack::dictionaries::DictionaryName::Stopwords,
             &flapjack::dictionaries::BatchDictionaryRequest {
                 clear_existing_dictionary_entries: false,
@@ -107,7 +107,9 @@ async fn virtual_replica_search_uses_replica_dictionary_entries() {
         )
         .unwrap();
 
-    let app = search_router(state);
+    let app = search_router(state).layer(axum::Extension(crate::auth::AuthenticatedAppId(
+        "application-a".to_string(),
+    )));
     let resp = post_search(
         &app,
         virtual_replica_name,
@@ -127,7 +129,7 @@ async fn virtual_replica_search_uses_replica_dictionary_entries() {
     assert_eq!(
         ids,
         vec!["doc-delta".to_string()],
-        "virtual replica searches must use replica-local dictionary entries rather than the primary index dictionary"
+        "virtual replica search must use its authenticated application, not a same-spelled index dictionary identity"
     );
 }
 

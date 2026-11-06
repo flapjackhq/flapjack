@@ -1,35 +1,10 @@
 name: In-Process Union
 
-# The IN-PROCESS workspace union: `cargo test --workspace --no-fail-fast`.
-#
-# Why this exists as its own workflow, since every other Rust job here is faster and greener:
-#
-# Every other Rust job in this repository runs `cargo nextest run` — ci.yml and nightly.yml's
-# `Rust all tests`. nextest gives each test its OWN PROCESS. That is why the suite is green in
-# ~16 minutes, and it is also why those jobs are structurally incapable of observing the bug class
-# ROADMAP.md rows TEST-FLAKE-1, TEST-FLAKE-2 and TEST-FLAKE-3 exist for: one test mutating
-# process-global state and corrupting another test's assertion. With one process per test there is
-# no shared process to leak through. ROADMAP.md states this directly — Linux nextest passing
-# ~5,800 process-isolated tests does NOT refute the in-process union red.
-#
-# Until this job, the only run that could see those defects was a ~2.5-hour `cargo test --workspace`
-# on one shared developer Mac, contended by every other agent session on the host. It failed to
-# complete twice for want of wall-clock (UNION_EXIT=124) while green nextest runs looked like
-# reassurance the whole time.
-#
-# WHY NOT A JOB INSIDE nightly.yml, which is the obvious home:
-# the union is EXPECTED RED today — that is precisely why those three rows are open. A red job in
-# nightly.yml would flip that workflow's conclusion to `failure`, which would (a) reset NIGHT-1,
-# whose exit is two consecutive green SCHEDULED nightly runs, and (b) fail SYNC-1's gate clause `b`
-# (`nightly_success`), the gate currently holding the production publish. That would hold the
-# release hostage to a flake investigation. Separate question, separate workflow, separate
-# conclusion — this workflow may be red for as long as it takes without blocking anything else.
-#
-# It is deliberately NOT continue-on-error. A gate that cannot fail is not a gate; this repository
-# has already found three inert contracts that way. The union's redness must turn THIS workflow red.
-#
-# Wiring is asserted by engine/tests/union_recurring_gate_test.rs, which reds if the job is removed,
-# renamed, restricted to workflow_dispatch, switched to nextest, or made continue-on-error.
+# The in-process workspace union probes shared-state interference that process-
+# isolated nextest runs cannot observe. It stays separate from the merge gate,
+# but a red result is a defect: ci-red.yml records it in private Beads.
+# Keep cargo test --workspace --no-fail-fast and CARGO_INCREMENTAL=0; the existing
+# union_recurring_gate_test.rs verifies this recurring diagnostic remains active.
 
 on:
   schedule:

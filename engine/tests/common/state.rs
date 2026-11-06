@@ -142,7 +142,7 @@ pub fn apply_test_app_id_layer(app: Router) -> Router {
             {
                 let application_id = flapjack_http::auth::request_application_id(&request)
                     .unwrap_or_else(|| {
-                        flapjack::dictionaries::DEFAULT_DICTIONARY_TENANT.to_string()
+                        flapjack::dictionaries::DEFAULT_DICTIONARY_APPLICATION_ID.to_string()
                     });
                 request
                     .extensions_mut()

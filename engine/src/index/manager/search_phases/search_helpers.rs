@@ -5,8 +5,8 @@ use super::query_execution::{
     ExpandedQueryExecutionContext, FacetResultCache, PreparedSearchFilters,
 };
 use super::{
-    apply_rule_effects, sort_with_stage2_ranking, PreprocessedQuery, ResolvedSearch,
-    RuleEffectsResult,
+    apply_rule_effects, count_ordinary_rule_effects, sort_with_stage2_ranking, PreprocessedQuery,
+    ResolvedSearch, RuleCountContext, RuleEffectsResult,
 };
 use crate::index::FacetCacheKey;
 
@@ -210,10 +210,27 @@ pub(super) fn execute_ranked_search(
     parser: &QueryParser,
     context: RankedSearchContext<'_, '_>,
 ) -> Result<RankedSearchOutput> {
-    let (mut all_results, query_totals, facet_result) = execute_expanded_queries(
+    let count_rules = count_ordinary_rule_effects(resolved, prepared, context.distinct);
+    let rule_count_ids: Vec<String> = prepared
+        .rule_effects
+        .as_ref()
+        .filter(|_| count_rules)
+        .into_iter()
+        .flat_map(|effects| {
+            effects
+                .hidden
+                .iter()
+                .chain(effects.pins.iter().map(|(id, _)| id))
+        })
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let (mut all_results, query_counts, facet_result) = execute_expanded_queries(
         prepared.expanded_queries.clone(),
         context.facet_result,
         &ExpandedQueryExecutionContext {
+            rule_count_ids: &rule_count_ids,
             manager,
             index: &resolved.index,
             searcher: &resolved.searcher,
@@ -244,6 +261,7 @@ pub(super) fn execute_ranked_search(
         context.opts,
     );
 
+    let query_totals: Vec<_> = query_counts.iter().map(|query| query.total).collect();
     let total = resolve_total_hits(&query_totals, all_results.len(), context.effective_limit);
     let ruled_result = apply_rule_effects(
         all_results,
@@ -252,6 +270,10 @@ pub(super) fn execute_ranked_search(
         prepared,
         context.query_text,
         context.max_values_per_facet,
+        count_rules.then_some(RuleCountContext {
+            queries: &query_counts,
+            effective_limit: context.effective_limit,
+        }),
     )?;
 
     Ok(RankedSearchOutput {

@@ -58,7 +58,7 @@ fn mounted_internal_method_patterns() -> BTreeSet<(String, String)> {
             );
         };
         let route_block = &after_route[..next_route_offset];
-        for method_name in ["get", "post", "delete"] {
+        for method_name in ["get", "post", "put", "delete"] {
             let needle = format!("{method_name}(");
             if route_block.contains(&needle) {
                 found.insert((

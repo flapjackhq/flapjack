@@ -1,9 +1,13 @@
 name: CI
 
-# CI runs only in the public product repository. The private development
-# repository keeps Actions disabled; trusted public-candidate branches are the
-# deliberate pre-merge validation boundary.
+# Public mirror release check. Private PRs and the merge queue use private-ci.yml.
 on:
+  workflow_dispatch:
+    inputs:
+      source-ref:
+        description: 'Exact private commit to validate with the full sharded Rust suite'
+        type: string
+        required: true
   push:
     branches:
       - main
@@ -19,18 +23,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The workflow is synced from private development, so fail closed if Actions is
-  # ever enabled there or this file is copied to an unrelated repository.
+  # Public secret-bearing jobs run only for trusted mirror pushes.
   check-repo:
     runs-on: ubuntu-latest
     outputs:
       is-public-repo: ${{ steps.check.outputs.is-public-repo }}
+      rust-needed: ${{ steps.paths.outputs.rust-needed }}
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: paths
+        env:
+          BASE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: python3 .github/scripts/ci_paths.py
       - id: check
         env:
           ACTUAL_REPOSITORY: ${{ github.repository }}
+          ACTUAL_EVENT: ${{ github.event_name }}
         run: |
-          if [ "$ACTUAL_REPOSITORY" = "flapjackhq/flapjack" ]; then
+          if [ "$ACTUAL_REPOSITORY" = "flapjackhq/flapjack" ] && [ "$ACTUAL_EVENT" = "push" ]; then
             echo "is-public-repo=true" >> "$GITHUB_OUTPUT"
           else
             echo "is-public-repo=false" >> "$GITHUB_OUTPUT"
@@ -105,6 +119,8 @@ jobs:
 
       - name: Candidate binary handoff contract
         run: python3 engine/tests/test_extract_candidate_binary.py
+      - name: CI execution budget contract
+        run: bash engine/tests/ci_test_timeout_cap_acceptance.sh
 
   # ============================================================================
   # RUST ENGINE TESTS
@@ -161,10 +177,9 @@ jobs:
   rust-tests-fast:
     name: Rust candidate (fast)
     needs: check-repo
-    if: needs.check-repo.outputs.is-public-repo == 'true'
+    if: needs.check-repo.outputs.is-public-repo == 'true' && needs.check-repo.outputs.rust-needed == 'true'
     runs-on: ubuntu-latest
     env:
-      CACHE_ON_FAILURE: true
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: 0
       RUSTFLAGS: -C debuginfo=0
@@ -177,8 +192,9 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: engine
+          cache-on-failure: true
       - name: Create dashboard dist stub (for RustEmbed)
-        run: mkdir -p dashboard/dist && echo '<html></html>' > dashboard/dist/index.html
+        run: mkdir -p dashboard/dist/assets && echo '<html></html>' > dashboard/dist/index.html
       # Compile outside the behavioral timeout. If the cache is cold, this step
       # reports cold compilation honestly instead of consuming the test budget.
       - name: Build candidate core test binary
@@ -198,55 +214,8 @@ jobs:
   rust-tests-all:
     name: Rust tests (all)
     needs: check-repo
-    if: needs.check-repo.outputs.is-public-repo == 'true'
-    runs-on: ubuntu-latest
-    env:
-      CACHE_ON_FAILURE: true
-      CARGO_BUILD_JOBS: 2
-      CARGO_INCREMENTAL: 0
-      RUSTFLAGS: -C debuginfo=0
-    defaults:
-      run:
-        working-directory: engine
-    steps:
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
-          sudo apt-get clean
-          df -h
-        working-directory: .
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: engine
-      - uses: taiki-e/install-action@a93b01ec36baa756f8701f3a0a8daa54a46d6339 # nextest
-      - name: Install cargo audit/deny tools for security audit tests
-        uses: taiki-e/install-action@a93b01ec36baa756f8701f3a0a8daa54a46d6339 # cargo-audit,cargo-deny
-        with:
-          tool: cargo-audit,cargo-deny
-          fallback: none
-      - name: Create dashboard dist stub (for RustEmbed)
-        run: mkdir -p dashboard/dist && echo '<html></html>' > dashboard/dist/index.html
-      - name: Build binaries (needed by integration tests)
-        timeout-minutes: 30
-        run: cargo build --package flapjack-server --features vector-search
-      - name: Build vector-search test binaries
-        timeout-minutes: 30
-        # Use Nextest's exact test profile so the following execution-only
-        # timeout cannot silently spend its budget recompiling dev artifacts.
-        run: cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci --no-run
-      - name: All tests (vector-search)
-        timeout-minutes: 20
-        run: cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci --no-fail-fast
-      - name: Build remaining test binaries
-        timeout-minutes: 30
-        # Preserve the lean/default feature contract, but keep cold compilation
-        # outside the bounded execution step just as the vector lane does.
-        run: cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci --no-run
-      - name: All tests (remaining)
-        timeout-minutes: 10
-        run: cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci --no-fail-fast
+    if: needs.check-repo.outputs.is-public-repo == 'true' && needs.check-repo.outputs.rust-needed == 'true'
+    uses: ./.github/workflows/rust-tests.yml
 
   # ============================================================================
   # BUILD SERVER (shared by client contract tests)
@@ -656,7 +625,7 @@ jobs:
   # prerequisite, which would make the required check disappear instead of fail.
   public-candidate-gate:
     name: Public candidate gate
-    if: always()
+    if: always() && github.repository == 'flapjackhq/flapjack' && github.event_name == 'push'
     needs:
       - check-repo
       - release-contracts
@@ -682,6 +651,7 @@ jobs:
           ACTUAL_REPOSITORY: ${{ github.repository }}
           ACTUAL_REF: ${{ github.ref }}
           NEEDS_JSON: ${{ toJSON(needs) }}
+          RUST_NEEDED: ${{ needs.check-repo.outputs.rust-needed }}
         run: |
           python3 - <<'PY'
           import json
@@ -691,10 +661,12 @@ jobs:
           repository = os.environ["ACTUAL_REPOSITORY"]
           ref = os.environ["ACTUAL_REF"]
           needs = json.loads(os.environ["NEEDS_JSON"])
+          optional_rust = {"rust-tests-fast", "rust-tests-all"} if os.environ["RUST_NEEDED"] == "false" else set()
           failed = {
               name: result.get("result")
               for name, result in needs.items()
               if result.get("result") != "success"
+              and not (name in optional_rust and result.get("result") == "skipped")
           }
           trusted_ref = ref == "refs/heads/main" or ref.startswith(
               "refs/heads/public-candidate/"
@@ -708,3 +680,32 @@ jobs:
               sys.exit(1)
           print(f"Public candidate gate passed for {repository}@{ref}")
           PY
+
+  rust-validation:
+    name: Sharded Rust validation
+    if: github.repository == 'gridl-dev/flapjack_dev' && github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/rust-tests.yml
+    with:
+      source-ref: ${{ inputs.source-ref }}
+
+  validation-status:
+    name: Report sharded validation
+    if: always() && github.repository == 'gridl-dev/flapjack_dev' && github.event_name == 'workflow_dispatch'
+    needs: rust-validation
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - name: Report the actual suite result on the validated commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source-ref }}
+          SUITE_RESULT: ${{ needs.rust-validation.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          state=failure
+          [ "$SUITE_RESULT" != success ] || state=success
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$SOURCE_SHA" \
+            -f state="$state" -f context='Sharded Rust tests' \
+            -f target_url="$RUN_URL" -f description="Full sharded Rust suite: $SUITE_RESULT"

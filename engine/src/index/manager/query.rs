@@ -291,7 +291,7 @@ pub(super) fn remove_stop_words_with_dictionary_manager(
     setting: &crate::query::stopwords::RemoveStopWordsValue,
     query_type: &str,
     normalized_query_languages: &[String],
-    dictionary_manager: Option<&Arc<crate::dictionaries::manager::DictionaryManager>>,
+    dictionary_manager: Option<&crate::dictionaries::manager::DictionarySnapshot>,
     tenant_id: &str,
 ) -> String {
     let dict_tenant = tenant_id;

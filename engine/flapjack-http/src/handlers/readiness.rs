@@ -2,19 +2,9 @@
 use crate::error_response::HandlerError;
 use crate::tenant_dirs::visible_tenant_dir_names;
 use axum::{extract::State, http::StatusCode, Json};
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use super::AppState;
-
-fn first_searchable_tenant_to_probe(
-    data_path: &Path,
-    mut visible_tenants: Vec<String>,
-) -> Option<String> {
-    visible_tenants.sort();
-    visible_tenants
-        .into_iter()
-        .find(|tenant| data_path.join(tenant).join("meta.json").is_file())
-}
 
 fn readiness_service_unavailable() -> HandlerError {
     HandlerError::Custom {
@@ -33,24 +23,30 @@ pub async fn ready(
         return Err(readiness_service_unavailable());
     }
 
-    let visible_tenants = visible_tenant_dir_names(&state.manager.base_path).map_err(|error| {
-        tracing::warn!(
-            "readiness probe failed to inspect tenant dirs at {:?}: {}",
-            state.manager.base_path,
-            error
-        );
-        readiness_service_unavailable()
-    })?;
+    let mut visible_tenants =
+        visible_tenant_dir_names(&state.manager.base_path).map_err(|error| {
+            tracing::warn!(
+                "readiness probe failed to inspect tenant dirs at {:?}: {}",
+                state.manager.base_path,
+                error
+            );
+            readiness_service_unavailable()
+        })?;
 
-    let Some(first_searchable_tenant) =
-        first_searchable_tenant_to_probe(&state.manager.base_path, visible_tenants)
-    else {
+    visible_tenants.sort();
+    for index_id in &visible_tenants {
+        state.manager.get_or_load(index_id).map_err(|error| {
+            tracing::warn!(index_id, %error, "readiness could not load a durable index");
+            readiness_service_unavailable()
+        })?;
+    }
+    let Some(first_searchable_tenant) = visible_tenants.first() else {
         return Ok(Json(serde_json::json!({ "ready": true })));
     };
 
     state
         .manager
-        .search(&first_searchable_tenant, "", None, None, 1)
+        .search(first_searchable_tenant, "", None, None, 1)
         .map_err(|error| {
             tracing::warn!(
                 "readiness probe failed to search tenant {}: {}",
@@ -147,7 +143,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ready_skips_visible_non_index_tenant_dirs() {
+    async fn storage_ownership_ready_rejects_damaged_index_beside_healthy_index() {
+        for (index_id, corrupt_meta) in [
+            ("zeta", false),
+            ("zeta", true),
+            ("personalization_strategy.json", false),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let state = TestStateBuilder::new(&tmp).build_shared();
+            state.manager.create_tenant("alpha").unwrap();
+            let damaged = tmp.path().join(index_id);
+            std::fs::create_dir(&damaged).unwrap();
+            if corrupt_meta {
+                std::fs::write(damaged.join("meta.json"), b"invalid").unwrap();
+            }
+            let app = Router::new()
+                .route("/health/ready", get(ready))
+                .with_state(state);
+            let (status, body) = readiness_response_json(app).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "damaged index must not disappear behind healthy alpha: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_rejects_legacy_application_directory_beside_an_index() {
         let tmp = TempDir::new().unwrap();
         let state = TestStateBuilder::new(&tmp).build_shared();
         state.manager.create_tenant("zeta").unwrap();
@@ -158,12 +181,15 @@ mod tests {
 
         let (status, body) = readiness_response_json(app).await;
 
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, serde_json::json!({ "ready": true }));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            serde_json::json!({ "message": "Service unavailable", "status": 503 })
+        );
     }
 
     #[tokio::test]
-    async fn ready_returns_ready_when_only_visible_non_index_tenant_dirs_exist() {
+    async fn ready_rejects_legacy_application_directory_without_an_index() {
         let tmp = TempDir::new().unwrap();
         let state = TestStateBuilder::new(&tmp).build_shared();
         std::fs::create_dir_all(tmp.path().join("flapjack").join(".dictionaries")).unwrap();
@@ -173,8 +199,11 @@ mod tests {
 
         let (status, body) = readiness_response_json(app).await;
 
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, serde_json::json!({ "ready": true }));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            serde_json::json!({ "message": "Service unavailable", "status": 503 })
+        );
     }
     /// TODO: Document ready_returns_canonical_503_when_visible_tenant_discovery_fails.
     #[tokio::test]
@@ -201,21 +230,6 @@ mod tests {
                 "status": 503
             }),
             "canonical readiness failures must keep the shared 503 envelope stable"
-        );
-    }
-
-    #[test]
-    fn first_searchable_tenant_probe_sorts_names_before_selection() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join("zeta")).unwrap();
-        std::fs::write(tmp.path().join("zeta").join("meta.json"), "{}").unwrap();
-
-        assert_eq!(
-            first_searchable_tenant_to_probe(
-                tmp.path(),
-                vec!["zeta".to_string(), "alpha".to_string()]
-            ),
-            Some("zeta".to_string())
         );
     }
 }

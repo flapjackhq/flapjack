@@ -281,8 +281,6 @@ fn encrypted_export_round_trips_with_the_key() {
 #[test]
 fn hostile_fixture_envelope_matches_production_header_contract() {
     let source = source_fixture();
-    let production_plaintext =
-        export_to_bytes_with_key(source.path(), None).expect("production plaintext export");
     let production_encrypted = export_to_bytes_with_key(source.path(), Some(&TEST_KEY))
         .expect("production encrypted export");
     let fixture_plaintext = b"hostile fixture plaintext";
@@ -302,11 +300,14 @@ fn hostile_fixture_envelope_matches_production_header_contract() {
             "header must end at byte {SNAPSHOT_ENCRYPTION_HEADER_LEN}, before ciphertext"
         );
     }
-    assert_eq!(
-        decrypt_local_envelope(&production_encrypted),
-        production_plaintext,
-        "production envelope ciphertext must begin at the local header length"
-    );
+    // Each export stages a fresh tree, whose directory timestamps may differ.
+    // Independently decrypt at the asserted header boundary, then prove the
+    // decoded archive preserves the source payload instead of comparing two exports.
+    let production_plaintext = decrypt_local_envelope(&production_encrypted);
+    let restored = TempDir::new().expect("restored tempdir must be created");
+    import_from_bytes_with_key(&production_plaintext, restored.path(), None)
+        .expect("production envelope must contain a complete plaintext snapshot");
+    assert_restored_matches_source(source.path(), restored.path());
     assert_eq!(
         decrypt_local_envelope(&fixture_encrypted),
         fixture_plaintext,

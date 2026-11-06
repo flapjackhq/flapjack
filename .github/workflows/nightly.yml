@@ -1,8 +1,7 @@
 name: Nightly Tests
 
 # Comprehensive nightly test suite — runs only in the public product repository.
-# The private development repository keeps Actions disabled, and candidate branches
-# use ci.yml instead of duplicating this scheduled main-branch suite.
+# Private PRs use private-ci.yml; mirror candidates use ci.yml.
 #
 # Covers: all Rust tests, dashboard integration with Algolia,
 # installer matrices, plus migration import and opt-in scale contracts.
@@ -45,8 +44,8 @@ jobs:
   # RUST ENGINE TESTS (ALL)
   # ============================================================================
 
-  rust-all-tests:
-    name: Rust all tests
+  rust-style:
+    name: Nightly Rust style
     needs: check-repo
     if: needs.check-repo.outputs.is-public-repo == 'true'
     runs-on: ubuntu-latest
@@ -67,12 +66,6 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: engine
-      - uses: taiki-e/install-action@a93b01ec36baa756f8701f3a0a8daa54a46d6339 # nextest
-      - name: Install cargo audit/deny tools for security audit tests
-        uses: taiki-e/install-action@a93b01ec36baa756f8701f3a0a8daa54a46d6339 # cargo-audit,cargo-deny
-        with:
-          tool: cargo-audit,cargo-deny
-          fallback: none
       - name: Create dashboard dist stub (for RustEmbed)
         run: mkdir -p dashboard/dist && echo '<html></html>' > dashboard/dist/index.html
       - name: Rustfmt
@@ -84,11 +77,14 @@ jobs:
           -A clippy::type_complexity
           -A clippy::only_used_in_recursion
           -A deprecated
-      - name: Build binaries
-        run: cargo build --package flapjack-server
-      - name: Run all tests
-        timeout-minutes: 45
-        run: cargo nextest run -P ci
+
+  rust-all-tests:
+    name: Rust all tests
+    needs: check-repo
+    if: needs.check-repo.outputs.is-public-repo == 'true'
+    uses: ./.github/workflows/rust-tests.yml
+    with:
+      workspace: true
 
   installer-all:
     name: Installer tests (all platforms)
@@ -490,6 +486,7 @@ jobs:
     needs:
       - check-repo
       - rust-all-tests
+      - rust-style
       - installer-all
       - dashboard-all
       - build-server

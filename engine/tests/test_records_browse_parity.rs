@@ -680,3 +680,51 @@ async fn browse_1m_docs_full_scan_slow() {
     // - Peak RSS growth stayed within the 2GB soft bound.
     // Per these results, browse is bounded enough for now; no follow-up mitigation ticket opened.
 }
+
+#[tokio::test]
+async fn browse_query_uses_authenticated_application_dictionary() {
+    let (app, _tmp) = common::build_test_app_for_local_requests(Some(ADMIN_KEY));
+    common::seed_docs(
+        &app,
+        "products",
+        ADMIN_KEY,
+        vec![json!({"objectID":"delta", "title":"delta"})],
+    )
+    .await;
+    common::put_settings_and_wait(
+        &app,
+        "products",
+        ADMIN_KEY,
+        json!({
+            "removeStopWords":["en"], "queryLanguages":["en"],
+            "queryType":"prefixNone", "removeWordsIfNoResults":"none"
+        }),
+        false,
+    )
+    .await;
+    for (app_id, word) in [("customer-a", "alpha"), ("_default", "beta")] {
+        let (status, _) = common::send_authed(&app, Method::POST, "/1/dictionaries/stopwords/batch", ADMIN_KEY, app_id, &[], Some(json!({
+            "requests":[{"action":"addEntry","body":{"objectID":"custom","language":"en","word":word}}]
+        }))).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    for endpoint in ["query", "browse"] {
+        let (status, body) = common::send_authed(
+            &app,
+            Method::POST,
+            &format!("/1/indexes/products/{endpoint}"),
+            ADMIN_KEY,
+            "customer-a",
+            &[],
+            Some(json!({"query":"alpha delta"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["hits"].as_array().unwrap().len(),
+            1,
+            "{endpoint}: authenticated application stopword must apply"
+        );
+        assert_eq!(body["hits"][0]["objectID"], "delta");
+    }
+}

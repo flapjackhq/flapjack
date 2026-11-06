@@ -400,12 +400,20 @@ enum ReleaseRequestMode {
     Snapshot,
     Tail(u64),
     Apply,
+    Import,
 }
 
 #[derive(Debug)]
 struct ReleaseRequest {
     transaction_id: String,
     payload_sha256: Option<String>,
+    snapshot_sha256: Option<String>,
+    window: Option<(u64, u64)>,
+}
+
+struct ReleaseRequestCoordinates {
+    payload_sha256: Option<String>,
+    snapshot_sha256: Option<String>,
     window: Option<(u64, u64)>,
 }
 
@@ -438,6 +446,95 @@ fn strict_release_sequence_header(headers: &HeaderMap, name: &'static str) -> Re
         return Err(format!("release transfer {name} is not canonical"));
     }
     Ok(parsed)
+}
+
+fn validate_canonical_sha256(digest: &str) -> Result<(), String> {
+    ContentDigest::new(format!("sha256:{digest}"))
+        .map_err(|_| "digest is not canonical SHA-256".to_string())?;
+    if !digest
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err("digest is not canonical lowercase SHA-256".to_string());
+    }
+    Ok(())
+}
+
+fn strict_release_request_coordinates(
+    headers: &HeaderMap,
+    mode: ReleaseRequestMode,
+) -> Result<ReleaseRequestCoordinates, String> {
+    let (window, payload_sha256, snapshot_sha256) = match mode {
+        ReleaseRequestMode::Snapshot => {
+            if exact_release_request_header(headers, RELEASE_TRANSFER_AFTER_SEQ_HEADER)?.is_some()
+                || exact_release_request_header(headers, RELEASE_TRANSFER_THROUGH_SEQ_HEADER)?
+                    .is_some()
+                || exact_release_request_header(headers, RELEASE_TRANSFER_PAYLOAD_SHA256_HEADER)?
+                    .is_some()
+            {
+                return Err("release snapshot request supplied tail/apply coordinates".to_string());
+            }
+            (None, None, None)
+        }
+        ReleaseRequestMode::Tail(expected_after_seq) => {
+            let after = strict_release_sequence_header(headers, RELEASE_TRANSFER_AFTER_SEQ_HEADER)?;
+            if after != expected_after_seq {
+                return Err(
+                    "release tail header does not match the requested source interval".to_string(),
+                );
+            }
+            if exact_release_request_header(headers, RELEASE_TRANSFER_THROUGH_SEQ_HEADER)?.is_some()
+                || exact_release_request_header(headers, RELEASE_TRANSFER_PAYLOAD_SHA256_HEADER)?
+                    .is_some()
+            {
+                return Err("release tail request supplied response/apply coordinates".to_string());
+            }
+            (Some((after, after)), None, None)
+        }
+        ReleaseRequestMode::Apply => {
+            let after = strict_release_sequence_header(headers, RELEASE_TRANSFER_AFTER_SEQ_HEADER)?;
+            let through =
+                strict_release_sequence_header(headers, RELEASE_TRANSFER_THROUGH_SEQ_HEADER)?;
+            if through < after {
+                return Err("release transfer through sequence precedes after sequence".to_string());
+            }
+            let payload_sha256 =
+                exact_release_request_header(headers, RELEASE_TRANSFER_PAYLOAD_SHA256_HEADER)?
+                    .ok_or_else(|| {
+                        "release apply request is missing the operations digest".to_string()
+                    })?;
+            validate_canonical_sha256(payload_sha256)
+                .map_err(|error| format!("release apply payload {error}"))?;
+            (
+                Some((after, through)),
+                Some(payload_sha256.to_string()),
+                None,
+            )
+        }
+        ReleaseRequestMode::Import => {
+            if exact_release_request_header(headers, RELEASE_TRANSFER_AFTER_SEQ_HEADER)?.is_some()
+                || exact_release_request_header(headers, RELEASE_TRANSFER_PAYLOAD_SHA256_HEADER)?
+                    .is_some()
+            {
+                return Err("release import request supplied response-only coordinates".to_string());
+            }
+            let through =
+                strict_release_sequence_header(headers, RELEASE_TRANSFER_THROUGH_SEQ_HEADER)?;
+            let snapshot_sha256 =
+                exact_release_request_header(headers, RELEASE_TRANSFER_SNAPSHOT_SHA256_HEADER)?
+                    .ok_or_else(|| {
+                        "release import request is missing the snapshot digest".to_string()
+                    })?;
+            validate_canonical_sha256(snapshot_sha256)
+                .map_err(|error| format!("release import snapshot {error}"))?;
+            (Some((0, through)), None, Some(snapshot_sha256.to_string()))
+        }
+    };
+    Ok(ReleaseRequestCoordinates {
+        payload_sha256,
+        snapshot_sha256,
+        window,
+    })
 }
 
 fn strict_release_request(
@@ -479,74 +576,69 @@ fn strict_release_request(
     PublicationTransactionId::new(transaction_id).map_err(|_| {
         "release transfer transaction header is not a canonical identifier".to_string()
     })?;
-    for response_only in [
-        RELEASE_TRANSFER_STATUS_HEADER,
-        RELEASE_TRANSFER_SNAPSHOT_SHA256_HEADER,
-    ] {
-        if exact_release_request_header(headers, response_only)?.is_some() {
-            return Err(format!(
-                "release transfer request supplied response-only header {response_only}"
-            ));
-        }
+    if exact_release_request_header(headers, RELEASE_TRANSFER_STATUS_HEADER)?.is_some() {
+        return Err(format!(
+            "release transfer request supplied response-only header {RELEASE_TRANSFER_STATUS_HEADER}"
+        ));
+    }
+    if !matches!(mode, ReleaseRequestMode::Import)
+        && exact_release_request_header(headers, RELEASE_TRANSFER_SNAPSHOT_SHA256_HEADER)?.is_some()
+    {
+        return Err(format!(
+            "release transfer request supplied response-only header {RELEASE_TRANSFER_SNAPSHOT_SHA256_HEADER}"
+        ));
     }
 
-    let (window, payload_sha256) = match mode {
-        ReleaseRequestMode::Snapshot => {
-            if exact_release_request_header(headers, RELEASE_TRANSFER_AFTER_SEQ_HEADER)?.is_some()
-                || exact_release_request_header(headers, RELEASE_TRANSFER_THROUGH_SEQ_HEADER)?
-                    .is_some()
-                || exact_release_request_header(headers, RELEASE_TRANSFER_PAYLOAD_SHA256_HEADER)?
-                    .is_some()
-            {
-                return Err("release snapshot request supplied tail/apply coordinates".to_string());
-            }
-            (None, None)
-        }
-        ReleaseRequestMode::Tail(expected_after_seq) => {
-            let after = strict_release_sequence_header(headers, RELEASE_TRANSFER_AFTER_SEQ_HEADER)?;
-            if after != expected_after_seq {
-                return Err(
-                    "release tail header does not match the requested source interval".to_string(),
-                );
-            }
-            if exact_release_request_header(headers, RELEASE_TRANSFER_THROUGH_SEQ_HEADER)?.is_some()
-                || exact_release_request_header(headers, RELEASE_TRANSFER_PAYLOAD_SHA256_HEADER)?
-                    .is_some()
-            {
-                return Err("release tail request supplied response/apply coordinates".to_string());
-            }
-            (Some((after, after)), None)
-        }
-        ReleaseRequestMode::Apply => {
-            let after = strict_release_sequence_header(headers, RELEASE_TRANSFER_AFTER_SEQ_HEADER)?;
-            let through =
-                strict_release_sequence_header(headers, RELEASE_TRANSFER_THROUGH_SEQ_HEADER)?;
-            if through < after {
-                return Err("release transfer through sequence precedes after sequence".to_string());
-            }
-            let payload_sha256 =
-                exact_release_request_header(headers, RELEASE_TRANSFER_PAYLOAD_SHA256_HEADER)?
-                    .ok_or_else(|| {
-                        "release apply request is missing the operations digest".to_string()
-                    })?;
-            ContentDigest::new(format!("sha256:{payload_sha256}"))
-                .map_err(|_| "release apply payload digest is not canonical SHA-256".to_string())?;
-            if !payload_sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-            {
-                return Err(
-                    "release apply payload digest is not canonical lowercase SHA-256".to_string(),
-                );
-            }
-            (Some((after, through)), Some(payload_sha256.to_string()))
-        }
-    };
+    let coordinates = strict_release_request_coordinates(headers, mode)?;
     Ok(Some(ReleaseRequest {
         transaction_id: transaction_id.to_string(),
-        payload_sha256,
-        window,
+        payload_sha256: coordinates.payload_sha256,
+        snapshot_sha256: coordinates.snapshot_sha256,
+        window: coordinates.window,
     }))
+}
+
+fn snapshot_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+pub(crate) fn prepare_release_import(
+    headers: &HeaderMap,
+    tenant_id: &str,
+    body: &[u8],
+) -> Result<Option<HeaderMap>, crate::error_response::HandlerError> {
+    use crate::error_response::HandlerError;
+
+    let Some(request) = strict_release_request(headers, tenant_id, ReleaseRequestMode::Import)
+        .map_err(HandlerError::bad_request)?
+    else {
+        return Ok(None);
+    };
+    let snapshot_digest = snapshot_sha256(body);
+    if request.snapshot_sha256.as_deref() != Some(snapshot_digest.as_str()) {
+        return Err(HandlerError::bad_request(
+            "release import snapshot digest does not match the uploaded bytes",
+        ));
+    }
+    let through_seq = request
+        .window
+        .map(|(_, through_seq)| through_seq)
+        .ok_or_else(|| HandlerError::bad_request("release import sequence metadata is missing"))?;
+    let mut response_headers = release_transfer_response_headers(
+        &request,
+        tenant_id,
+        0,
+        through_seq,
+        RELEASE_TRANSFER_STATUS_ACKNOWLEDGED,
+        &snapshot_digest,
+    )
+    .map_err(|_| HandlerError::bad_request("release import metadata is not valid HTTP"))?;
+    response_headers.insert(
+        RELEASE_TRANSFER_SNAPSHOT_SHA256_HEADER,
+        HeaderValue::from_str(&snapshot_digest)
+            .map_err(|_| HandlerError::bad_request("release import digest is not valid HTTP"))?,
+    );
+    Ok(Some(response_headers))
 }
 
 fn validate_release_apply_window(
@@ -1451,7 +1543,7 @@ pub async fn internal_snapshot(
         HeaderValue::from_static("application/gzip"),
     );
     if let Some(release_request) = release_transfer.as_ref() {
-        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let digest = snapshot_sha256(&bytes);
         response_headers = release_transfer_response_headers(
             release_request,
             &tenant_id,

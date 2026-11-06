@@ -6,6 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CI_WORKFLOW="$REPO_DIR/.github/workflows/ci.yml"
 NIGHTLY_WORKFLOW="$REPO_DIR/.github/workflows/nightly.yml"
+RUST_TESTS_WORKFLOW="${FLAPJACK_RUST_TESTS_WORKFLOW:-$REPO_DIR/.github/workflows/rust-tests.yml}"
+PRIVATE_WORKFLOW="$REPO_DIR/.github/workflows/private-ci.yml"
 
 TESTS_RUN=0
 TESTS_PASSED=0
@@ -150,14 +152,14 @@ extract_matching_step_block() {
       if (have_candidate == 1) {
         candidate_block = candidate_block line "\n"
 
-        if (line ~ /^[[:space:]]*run:[[:space:]]*[^>|].*$/) {
+        if (line ~ /^[[:space:]]*run:[[:space:]]*[^[:space:]>|].*$/) {
           run_line = line
           sub(/^[[:space:]]*run:[[:space:]]*/, "", run_line)
           candidate_run = run_line
           next
         }
 
-        if (line ~ /^[[:space:]]*run:[[:space:]]*[>|][[:space:]]*$/) {
+        if (line ~ /^[[:space:]]*run:[[:space:]]*[>|][-+]?[[:space:]]*$/) {
           in_multiline_run = 1
           multiline_indent = line_indent
           next
@@ -490,7 +492,7 @@ assert_step_contract() {
     return
   fi
 
-  if grep -v '^__' "$block_file" | grep -Eq "^[[:space:]]*timeout-minutes:[[:space:]]*${expected_timeout}$"; then
+  if grep -v '^__' "$block_file" | sed -nE 's/^[[:space:]]*timeout-minutes:[[:space:]]*(.*)$/\1/p' | grep -Fxq "$expected_timeout"; then
     pass "$workflow_label '$step_name' enforces timeout-minutes: $expected_timeout"
   else
     fail "$workflow_label '$step_name' enforces timeout-minutes: $expected_timeout"
@@ -576,16 +578,26 @@ assert_duplicate_step_fixture_guards_wrong_failure_mode
 assert_duplicate_step_fixture_ignores_helper_prose_changes
 assert_wrong_job_same_name_fixture
 assert_step_contract "$CI_WORKFLOW" "ci.yml" "Build candidate core test binary" 'cargo test -p flapjack --lib --no-run --message-format=json > candidate_build.json && python3 tests/extract_candidate_binary.py candidate_build.json "$GITHUB_OUTPUT"' "30"
+assert_step_contract "$PRIVATE_WORKFLOW" "private-ci.yml" "Build candidate core test binary" 'cargo test -p flapjack --lib --no-run --message-format=json > candidate_build.json && python3 tests/extract_candidate_binary.py candidate_build.json "$GITHUB_OUTPUT"' "30"
 assert_step_contract "$CI_WORKFLOW" "ci.yml" "Candidate test-tier inventory" "python3 tests/test_ci_test_tiers.py --verify" "10"
 assert_step_contract "$CI_WORKFLOW" "ci.yml" "Candidate core tests" 'timeout --kill-after=60s 300s "${{ steps.candidate-build.outputs.executable }}"' "6"
-assert_step_contract "$CI_WORKFLOW" "ci.yml" "All tests (vector-search)" "cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci --no-fail-fast" "20"
-assert_step_contract "$CI_WORKFLOW" "ci.yml" "Build remaining test binaries" "cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci --no-run" "30"
-assert_step_contract "$CI_WORKFLOW" "ci.yml" "All tests (remaining)" "cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci --no-fail-fast"
-assert_job_contains_pattern "$CI_WORKFLOW" "ci.yml" "rust-tests-all" '^[[:space:]]*tool:[[:space:]]*cargo-audit,cargo-deny[[:space:]]*$' "ci.yml 'rust-tests-all' installs cargo-audit and cargo-deny before running vector-search tests"
-assert_named_step_order_in_job "$CI_WORKFLOW" "ci.yml" "rust-tests-all" "Install cargo audit/deny tools for security audit tests" "All tests (vector-search)"
-assert_capped_job_prebuild_binding "$CI_WORKFLOW" "ci.yml" "rust-tests-all" "All tests (vector-search)" "cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci --no-fail-fast" "Build vector-search test binaries" "cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci --no-run"
-assert_capped_job_prebuild_binding "$CI_WORKFLOW" "ci.yml" "rust-tests-all" "All tests (remaining)" "cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci --no-fail-fast" "Build remaining test binaries" "cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci --no-run"
-assert_step_contract "$NIGHTLY_WORKFLOW" "nightly.yml" "Run all tests" "cargo nextest run -P ci" "45"
+assert_step_contract "$PRIVATE_WORKFLOW" "private-ci.yml" "Candidate core tests" 'timeout --kill-after=60s 300s "${{ steps.candidate-build.outputs.executable }}"' "6"
+assert_job_contains_pattern "$PRIVATE_WORKFLOW" "private-ci.yml" "check" '^    timeout-minutes:[[:space:]]*40$' "private candidate job allows setup and cleanup outside compilation and execution caps"
+assert_step_contract "$RUST_TESTS_WORKFLOW" "rust-tests.yml" "Run the complete shard from the archive" 'cargo nextest run --config-file "$RUNNER_TEMP/nextest.toml" -P ci --no-fail-fast --archive-file tests.tar.zst --workspace-remap "$PWD" --extract-to "$PWD" --partition "hash:${SHARD}/4"' '${{ matrix.lane == '\''remaining'\'' && 10 || matrix.lane == '\''workspace'\'' && 45 || 20 }}'
+for caller in "$CI_WORKFLOW:rust-tests-all" "$NIGHTLY_WORKFLOW:rust-all-tests" "$PRIVATE_WORKFLOW:rust-all"; do
+  workflow="${caller%:*}"
+  job="${caller##*:}"
+  assert_job_contains_pattern "$workflow" "$(basename "$workflow")" "$job" '^[[:space:]]*uses: \./\.github/workflows/rust-tests\.yml$' "$(basename "$workflow") '$job' delegates to the bounded archive workflow"
+done
+assert_job_contains_pattern "$RUST_TESTS_WORKFLOW" "rust-tests.yml" "build" '^    timeout-minutes:[[:space:]]*75$' "archive jobs allow setup and upload outside the cold-build budget"
+assert_job_contains_pattern "$RUST_TESTS_WORKFLOW" "rust-tests.yml" "build" '^        timeout-minutes:[[:space:]]*60$' "archive construction retains its bounded 60-minute cold-build budget"
+assert_job_contains_pattern "$RUST_TESTS_WORKFLOW" "rust-tests.yml" "test" '^    needs:[[:space:]]*build$' "shards wait for successful archive construction"
+for job in build test; do
+  assert_job_contains_pattern "$RUST_TESTS_WORKFLOW" "rust-tests.yml" "$job" '^[[:space:]]*name: rust-tests-\$\{\{ matrix\.lane \}\}$' "archive producer and consumer bind the same feature-lane artifact in '$job'"
+  assert_job_contains_pattern "$RUST_TESTS_WORKFLOW" "rust-tests.yml" "$job" '^[[:space:]]+sudo apt-get clean$' "'$job' preserves the original free-disk setup"
+done
+assert_job_contains_pattern "$RUST_TESTS_WORKFLOW" "rust-tests.yml" "test" '^[[:space:]]*tool:[[:space:]]*cargo-audit,cargo-deny[[:space:]]*$' "shards install cargo-audit and cargo-deny before security tests"
+assert_named_step_order_in_job "$RUST_TESTS_WORKFLOW" "rust-tests.yml" "test" "Install audit tools used by security tests" "Run the complete shard from the archive"
 
 section "Playwright browser install timeout contract"
 assert_step_contract "$CI_WORKFLOW" "ci.yml" "Install console Playwright browser" "npx playwright install chromium" "5"

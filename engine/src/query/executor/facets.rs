@@ -51,6 +51,21 @@ impl QueryExecutor {
         params: &FacetSearchParams<'_>,
         optional_boosts: &[(String, String, f32)],
     ) -> Result<SearchResult> {
+        self.execute_with_rule_membership(searcher, query, filter, params, optional_boosts, &[])
+            .map(|(result, _)| result)
+    }
+
+    /// Capture rule-document membership from the same prepared query used by
+    /// the collectors, before top-N collection or distinct can discard a hit.
+    pub(crate) fn execute_with_rule_membership(
+        &self,
+        searcher: &Searcher,
+        query: Box<dyn TantivyQuery>,
+        filter: Option<&crate::types::Filter>,
+        params: &FacetSearchParams<'_>,
+        optional_boosts: &[(String, String, f32)],
+        rule_ids: &[String],
+    ) -> Result<(SearchResult, std::collections::HashSet<String>)> {
         let count_only = params.limit == 0 && params.offset == 0;
         let facet_requests = params
             .facet_requests
@@ -65,12 +80,14 @@ impl QueryExecutor {
             (false, None, Some(Sort::ByField { .. })) => QueryExecutionPath::SortFast,
         };
         let _phase_guard = self.begin_phase_report(searcher, execution_path);
-        (|| {
+        let mut matching_rule_ids = std::collections::HashSet::new();
+        let result = (|| {
             let expanded_query = self.expand_short_query_with_searcher(query, searcher)?;
             let prepare_started_at = std::time::Instant::now();
             let boosted_query = self.apply_optional_boosts(expanded_query, optional_boosts)?;
             let final_query = self.apply_filter(boosted_query, filter)?;
             self.observe_phase(QueryPhase::Prepare, prepare_started_at);
+            matching_rule_ids = self.matching_rule_ids(searcher, final_query.as_ref(), rule_ids)?;
 
             if let Some(facets) = facet_requests {
                 return self.execute_with_facets_internal(searcher, final_query, facets, params);
@@ -141,7 +158,8 @@ impl QueryExecutor {
                 effective_around_lat_lng: None,
                 effective_around_radius: None,
             })
-        })()
+        })()?;
+        Ok((result, matching_rule_ids))
     }
 
     /// Execute a search with facet collection and optional distinct deduplication. Handles both relevance-based and field-based sorting with optional custom ranking, applies pagination with document reconstruction, and extracts count-based and numeric statistics for facets. When limit and offset are both 0, skips document reconstruction but still collects complete facet data.
