@@ -366,6 +366,27 @@ async fn invalid_csp_env_fails_closed_to_strict_default_security_header_policy()
 }
 
 #[tokio::test]
+async fn swagger_routes_keep_redirect_config_assets_and_missing_asset_contracts() {
+    let tmp = TempDir::new().unwrap();
+    let app = build_test_router(&tmp, None);
+    let response = get_response(app.clone(), "/swagger-ui").await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()["location"], "/swagger-ui/");
+
+    let response = get_response(app.clone(), "/swagger-ui/swagger-initializer.js").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_text(response).await.contains("/api-docs/openapi.json"));
+
+    let response = get_response(app.clone(), "/api-docs/openapi.json").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let doc: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert!(doc["paths"].as_object().unwrap().contains_key("/health"));
+
+    let response = get_response(app, "/swagger-ui/not-an-asset.js").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn swagger_ui_script_shape_is_recorded_for_csp_policy() {
     let tmp = TempDir::new().unwrap();
     let app = build_test_router(&tmp, None);

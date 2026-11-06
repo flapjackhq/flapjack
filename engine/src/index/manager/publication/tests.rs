@@ -1938,7 +1938,6 @@ fn tenant_inventory_classifies_only_owner_known_artifacts() {
         "oplog/segment_0001.jsonl",
         "committed_seq",
         "vectors/id_map.json",
-        ".dictionaries/stopwords.json",
         "recommend_rules/related-products/rules.json",
     ] {
         assert_eq!(
@@ -1947,6 +1946,7 @@ fn tenant_inventory_classifies_only_owner_known_artifacts() {
             "{relative}"
         );
     }
+    assert!(classify_tenant_relative_path(Path::new(".dictionaries/stopwords.json"), &inventory).is_err());
     let error = classify_tenant_relative_path(Path::new("segment_deadbeef.idx"), &inventory)
         .unwrap_err()
         .to_string();

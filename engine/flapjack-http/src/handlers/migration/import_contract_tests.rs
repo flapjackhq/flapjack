@@ -81,6 +81,8 @@ mod import_contract_recovery_tests;
 mod import_contract_replica_tests;
 #[path = "import_contract_test_support.rs"]
 mod import_contract_test_support;
+#[path = "import_native_snapshot_tests.rs"]
+mod import_native_snapshot_tests;
 use import_contract_test_support::{
     assert_no_retained_accepted_spool_document_artifacts, assert_object_fields,
     assert_preexisting_target_resources, assert_preexisting_target_resources_exactly_absent,
@@ -2774,17 +2776,14 @@ async fn async_import_retries_real_backpressure_pause_and_succeeds() {
             let staging_parent = paths
                 .staging
                 .parent()
-                .expect("staging path should have a transaction namespace");
-            let staging_tenant = paths
-                .staging
-                .file_name()
-                .and_then(|name| name.to_str())
-                .expect("staging path should end in a UTF-8 tenant");
+                .expect("staging path should have a transaction namespace")
+                .join(".bulk-build");
+            let staging_tenant = target.as_str();
 
             // Option (b) exercises real admission; hook-only IndexPaused injection would
             // bypass ensure_bulk_admission_allowed and miss the producer contract.
             flapjack::index::write_queue::force_backpressure_pause_for_test(
-                staging_parent,
+                &staging_parent,
                 staging_tenant,
             )?;
             pause_forced_by_hook.store(true, Ordering::SeqCst);
@@ -3237,6 +3236,7 @@ async fn duplicate_id_in_replace_input_fails_before_publication() {
             }
             BulkBuildTestEvent::StagingWriterMergeQuiesced => {}
             BulkBuildTestEvent::PrepublicationValidationVerdict => {}
+            BulkBuildTestEvent::StagingReady => {}
             BulkBuildTestEvent::ActivationFence => {
                 hook_activation_reached.store(true, Ordering::SeqCst);
             }
@@ -3310,6 +3310,7 @@ async fn bulk_build_quiesces_staging_writer_before_activation() {
             BulkBuildTestEvent::StagingWriterMergeQuiesced,
             BulkBuildTestEvent::PrepublicationValidationStarting,
             BulkBuildTestEvent::PrepublicationValidationVerdict,
+            BulkBuildTestEvent::StagingReady,
             BulkBuildTestEvent::ActivationFence,
         ],
         "staging must reach merge quiescence before validation and activation"
@@ -3344,6 +3345,7 @@ async fn duplicate_validation_runs_before_any_activation_fence() {
             BulkBuildTestEvent::StagingWriterMergeQuiesced,
             BulkBuildTestEvent::PrepublicationValidationStarting,
             BulkBuildTestEvent::PrepublicationValidationVerdict,
+            BulkBuildTestEvent::StagingReady,
             BulkBuildTestEvent::ActivationFence,
         ],
         "the default service wiring must validate exactly once before activation"

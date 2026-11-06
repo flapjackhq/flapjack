@@ -1,13 +1,14 @@
 //! Stub summary for browse.rs.
 use axum::{
     extract::{Path, State},
-    Json,
+    Extension, Json,
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::AppState;
+use crate::auth::AuthenticatedAppId;
 use crate::dto::SearchRequest;
 use crate::filter_parser::parse_filter;
 use crate::handlers::search::build_params_echo;
@@ -196,9 +197,16 @@ fn build_next_cursor(
 pub async fn browse_index(
     State(state): State<Arc<AppState>>,
     Path(index_name): Path<String>,
+    application: Option<Extension<AuthenticatedAppId>>,
+    required_configuration: Option<Extension<crate::auth::RequiredApplicationConfiguration>>,
     Json(mut req): Json<BrowseRequest>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
     req.apply_params_string();
+    let dictionary_snapshot = super::search::capture_required_configuration(
+        &state,
+        application.as_ref().map(|Extension(id)| id.0.as_str()),
+        required_configuration.map(|Extension(required)| required),
+    )?;
 
     let index = state.manager.get_or_load(&index_name)?;
     let reader = index.reader();
@@ -247,6 +255,8 @@ pub async fn browse_index(
         &index_name,
         &effective_query,
         &SearchOptions {
+            dictionary_application_id: application.as_ref().map(|Extension(id)| id.0.as_str()),
+            dictionary_snapshot: dictionary_snapshot.as_deref(),
             filter: filter.as_ref(),
             limit: hits_per_page,
             offset,

@@ -4740,12 +4740,7 @@ async fn test_write_queue_phase_metrics_records_batch_lifecycle_series() {
     }
 }
 
-// Serialized against `oplog_append_phase_ignores_noop_paths`: both read/write the
-// process-global `oplog_append` phase histogram, and this test is the only default-run
-// producer of a real append, so the no-op test's exact-equality snapshot must not
-// overlap this test's appends.
 #[tokio::test(flavor = "current_thread")]
-#[serial_test::serial(oplog_append_phase_metric)]
 async fn write_phase_metrics_separate_prepare_commit_reload_versions_and_oplog() {
     let tmp = tempfile::TempDir::new().unwrap();
     let tenant_id = format!("phase_detail_{}", uuid::Uuid::new_v4().simple());
@@ -4892,10 +4887,7 @@ fn legacy_replicated_actions_replay_without_inventing_oplog_origin() {
     );
 }
 
-// Serialized with the real-append test above so the exact-equality snapshot below is
-// not perturbed by a concurrent producer of the global `oplog_append` phase histogram.
 #[test]
-#[serial_test::serial(oplog_append_phase_metric)]
 fn oplog_append_phase_ignores_noop_paths() {
     let tmp = tempfile::TempDir::new().unwrap();
     let tenant_id = "oplog_noop_phase";
@@ -4905,23 +4897,64 @@ fn oplog_append_phase_ignores_noop_paths() {
         crate::index::oplog::OpLog::open(&tenant_path.join("oplog"), tenant_id, "test_node")
             .unwrap(),
     );
-    let baseline = histogram_count(
-        "flapjack_write_queue_phase_seconds",
-        &[("phase", "oplog_append")],
-    );
+    // No-op calls are synchronous. Capture only this thread so another queue's
+    // real append cannot contaminate their exact observation count.
+    let (_, noop_observations) =
+        count_write_queue_phase_observations_for_test(PHASE_OPLOG_APPEND, || {
+            finalization::append_batch_to_oplog(None, "task_none", &[], tenant_id).unwrap();
+            finalization::append_batch_to_oplog(Some(&oplog), "task_empty", &[], tenant_id)
+                .unwrap();
 
-    finalization::append_batch_to_oplog(None, "task_none", &[], tenant_id).unwrap();
-    finalization::append_batch_to_oplog(Some(&oplog), "task_empty", &[], tenant_id).unwrap();
+            // Reproduce another write queue recording the same process-global phase
+            // while this test is measuring no-op calls. Joining makes the race deterministic.
+            std::thread::spawn(|| {
+                let other_tmp = tempfile::TempDir::new().unwrap();
+                let other_tenant = "oplog_phase_other_writer";
+                let other_oplog = Arc::new(
+                    crate::index::oplog::OpLog::open(other_tmp.path(), other_tenant, "other_node")
+                        .unwrap(),
+                );
+                let operations = [crate::index::oplog::OpLogOperation::local(
+                    "delete",
+                    serde_json::json!({"objectID": "other-document"}),
+                )];
+                finalization::append_batch_to_oplog(
+                    Some(&other_oplog),
+                    "other_task",
+                    &operations,
+                    other_tenant,
+                )
+                .unwrap();
+                assert_eq!(other_oplog.current_seq(), 1);
+            })
+            .join()
+            .unwrap();
+        });
 
     assert_eq!(
-        histogram_count(
-            "flapjack_write_queue_phase_seconds",
-            &[("phase", "oplog_append")]
-        ),
-        baseline,
+        noop_observations, 0,
         "oplog append latency should only record attempted appends"
     );
     assert_eq!(oplog.current_seq(), 0, "empty append path should not write");
+
+    // Positive control: the same capture must observe a real append, so a broken
+    // observer cannot make the no-op assertion pass by recording nothing.
+    let (receipts, append_observations) =
+        count_write_queue_phase_observations_for_test(PHASE_OPLOG_APPEND, || {
+            finalization::append_batch_to_oplog(
+                Some(&oplog),
+                "task_real",
+                &[crate::index::oplog::OpLogOperation::local(
+                    "delete",
+                    serde_json::json!({"objectID": "real-document"}),
+                )],
+                tenant_id,
+            )
+            .unwrap()
+        });
+    assert_eq!(append_observations, 1);
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(oplog.current_seq(), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]

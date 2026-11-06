@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::types::{Document, FieldValue};
 
+pub const PERSONALIZATION_DIR: &str = ".personalization";
 pub const STRATEGY_FILENAME: &str = "personalization_strategy.json";
 pub const MAX_EVENTS: usize = 15;
 pub const MAX_FACETS: usize = 15;
@@ -571,8 +572,46 @@ impl PersonalizationProfileStore {
         }
     }
 
+    /// Reject old server state before it can appear as an absent/default profile.
+    pub fn validate_data_layout(base: &Path) -> Result<(), String> {
+        for path in [
+            base.join(PERSONALIZATION_DIR),
+            base.join(PERSONALIZATION_DIR).join("profiles"),
+        ] {
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => {
+                    return Err(format!(
+                        "personalization storage must be a real directory: {}",
+                        path.display()
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("cannot inspect personalization storage: {error}"))
+                }
+            }
+        }
+        for path in [
+            base.join("personalization").join("profiles"),
+            base.join(STRATEGY_FILENAME),
+        ] {
+            match std::fs::symlink_metadata(&path) {
+                // The obsolete strategy is a file. A real directory with this
+                // legal index name must still go through strict index admission.
+                Ok(meta) if meta.is_dir() && path == base.join(STRATEGY_FILENAME) => {},
+                Ok(_) => return Err(format!("unsupported legacy personalization layout at {}; server state belongs under .personalization; data was not moved or deleted", path.display())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => return Err(format!("cannot inspect personalization storage: {error}")),
+            }
+        }
+        Ok(())
+    }
+
     pub fn strategy_path(&self) -> PathBuf {
-        self.base_path.join(STRATEGY_FILENAME)
+        self.base_path
+            .join(PERSONALIZATION_DIR)
+            .join(STRATEGY_FILENAME)
     }
 
     /// Enter the ordering domain shared by profile computation and deletion.
@@ -618,10 +657,11 @@ impl PersonalizationProfileStore {
     }
 
     pub fn profile_path(&self, user_token: &str) -> Result<PathBuf, String> {
+        Self::validate_data_layout(&self.base_path)?;
         validate_user_token_component(user_token)?;
         Ok(self
             .base_path
-            .join("personalization")
+            .join(PERSONALIZATION_DIR)
             .join("profiles")
             .join(format!("{}.json", user_token)))
     }
@@ -693,7 +733,7 @@ impl PersonalizationProfileStore {
     /// The HTTP deletion flow calls this before changing analytics data.
     pub fn preflight_delete_profile(&self, user_token: &str) -> Result<(), String> {
         let profile_path = self.profile_path(user_token)?;
-        let personalization_dir = self.base_path.join("personalization");
+        let personalization_dir = self.base_path.join(PERSONALIZATION_DIR);
         let profiles_dir = personalization_dir.join("profiles");
         for (path, role) in [
             (&self.base_path, "profile data root"),
@@ -1020,6 +1060,59 @@ mod tests {
             std::fs::metadata(&path).unwrap().ino(),
             original_inode,
             "profile updates must publish by rename, not truncate the live file"
+        );
+    }
+}
+
+#[cfg(test)]
+mod storage_ownership_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn storage_ownership_strategy_filename_can_name_a_real_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = crate::IndexManager::new(tmp.path());
+        manager.create_tenant(STRATEGY_FILENAME).unwrap();
+        let store = PersonalizationProfileStore::new(tmp.path());
+        assert_eq!(store.load_profile("user").unwrap(), None);
+        assert_eq!(
+            manager
+                .search(STRATEGY_FILENAME, "", None, None, 10)
+                .unwrap()
+                .total,
+            0
+        );
+    }
+
+    #[test]
+    fn legacy_personalization_is_rejected_without_hiding_data() {
+        for legacy in ["personalization/profiles/user.json", STRATEGY_FILENAME] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join(legacy);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"{}").unwrap();
+            let store = PersonalizationProfileStore::new(tmp.path());
+            assert!(store
+                .load_profile("user")
+                .unwrap_err()
+                .contains("unsupported legacy personalization"));
+            assert_eq!(std::fs::read(path).unwrap(), b"{}");
+            assert!(!tmp.path().join(PERSONALIZATION_DIR).exists());
+        }
+    }
+
+    #[test]
+    fn personalization_paths_are_server_owned() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = PersonalizationProfileStore::new(tmp.path());
+        assert_eq!(
+            store.profile_path("user").unwrap(),
+            tmp.path().join(".personalization/profiles/user.json")
+        );
+        assert_eq!(
+            store.strategy_path(),
+            tmp.path()
+                .join(".personalization/personalization_strategy.json")
         );
     }
 }

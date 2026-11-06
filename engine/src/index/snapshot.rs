@@ -50,6 +50,26 @@ fn validate_archive_entries<R: std::io::Read>(archive: &mut Archive<R>) -> Resul
         let mut entry = entry_result?;
         let entry_path = entry.path()?.into_owned();
         reject_invalid_snapshot_entry_path(&entry_path)?;
+        let root = entry_path
+            .components()
+            .find_map(|component| match component {
+                std::path::Component::Normal(name) => Some(name),
+                _ => None,
+            });
+        if root.is_some_and(|name| {
+            [
+                crate::dictionaries::persistence::DICTIONARIES_DIR,
+                crate::dictionaries::persistence::APPLICATIONS_DIR,
+                crate::personalization::profile::PERSONALIZATION_DIR,
+            ]
+            .iter()
+            .any(|reserved| name == *reserved)
+        }) {
+            return Err(FlapjackError::InvalidDocument(format!(
+                "index snapshot contains unsupported application/server storage: {}",
+                entry_path.display()
+            )));
+        }
 
         // Links can pivot writes outside the destination tree at extraction time.
         // Reject link entries so snapshot imports are fail-closed by default.
@@ -436,5 +456,32 @@ mod tests {
 
         assert!(message.contains("64 hex characters"), "{message}");
         assert!(message.contains("32 raw bytes"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod storage_ownership_tests {
+    use super::*;
+    #[test]
+    fn storage_ownership_rejects_application_and_legacy_artifacts_in_index_snapshots() {
+        for name in [".dictionaries", ".applications", ".personalization"] {
+            let source = tempfile::tempdir().unwrap();
+            std::fs::create_dir(source.path().join(name)).unwrap();
+            std::fs::write(source.path().join(name).join("sentinel.json"), b"{}").unwrap();
+            assert!(
+                export_to_bytes_with_key(source.path(), None).is_err(),
+                "index snapshot must reject {name}"
+            );
+            // Build an untrusted archive directly, without the production exporter.
+            let mut archive = Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+            archive.append_dir_all(".", source.path()).unwrap();
+            let bytes = archive.into_inner().unwrap().finish().unwrap();
+            let target = tempfile::tempdir().unwrap();
+            assert!(import_from_bytes_with_key(&bytes, target.path(), None).is_err());
+            assert!(
+                target.path().read_dir().unwrap().next().is_none(),
+                "rejected archive must not extract any entry"
+            );
+        }
     }
 }

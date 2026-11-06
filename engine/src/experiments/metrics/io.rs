@@ -20,7 +20,9 @@ pub async fn get_experiment_metrics(
 ) -> Result<ExperimentMetrics, String> {
     use datafusion::prelude::*;
 
-    let ctx = SessionContext::new();
+    let ctx = SessionContext::new_with_config(
+        datafusion::prelude::SessionConfig::new().with_collect_statistics(false),
+    );
 
     // Collect search rows from all relevant indexes
     let mut all_searches: Vec<SearchRow> = Vec::new();
@@ -60,7 +62,9 @@ pub async fn get_interleaving_metrics(
 ) -> Result<Option<InterleavingMetrics>, String> {
     use datafusion::prelude::*;
 
-    let ctx = SessionContext::new();
+    let ctx = SessionContext::new_with_config(
+        datafusion::prelude::SessionConfig::new().with_collect_statistics(false),
+    );
     let mut all_events: Vec<EventRow> = Vec::new();
 
     for index_name in index_names {
@@ -130,8 +134,7 @@ async fn register_parquet_table(
     let opts = ListingOptions::new(std::sync::Arc::new(
         datafusion::datasource::file_format::parquet::ParquetFormat::default(),
     ))
-    .with_file_extension(".parquet")
-    .with_collect_stat(false);
+    .with_file_extension(".parquet");
 
     ctx.register_listing_table(&table_name, &dir.to_string_lossy(), opts, None, None)
         .await
@@ -339,7 +342,9 @@ pub async fn get_pre_experiment_covariates(
     let lookback_ms = (lookback_days as i64) * 24 * 60 * 60 * 1000;
     let window_start = started_at_ms - lookback_ms;
 
-    let ctx = SessionContext::new();
+    let ctx = SessionContext::new_with_config(
+        datafusion::prelude::SessionConfig::new().with_collect_statistics(false),
+    );
 
     let searches_dir = analytics_data_dir.join(index_name).join("searches");
     let events_dir = analytics_data_dir.join(index_name).join("events");

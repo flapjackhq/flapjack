@@ -252,7 +252,7 @@ async fn gdpr_delete_profile_obstruction_returns_sanitized_error_without_notific
     let tmp = TempDir::new().unwrap();
     let blocked_profile = tmp
         .path()
-        .join("personalization/profiles/blocked-user.json");
+        .join(".personalization/profiles/blocked-user.json");
     std::fs::create_dir_all(&blocked_profile).unwrap();
 
     let collector = AnalyticsCollector::new(test_analytics_config(&tmp));
@@ -294,7 +294,7 @@ async fn gdpr_delete_rejects_symlinked_profiles_parent_before_analytics_mutation
     let outside_bytes = br#"{"user_token":"delete-me","scores":{}}"#;
     std::fs::write(&outside_profile, outside_bytes).unwrap();
 
-    let personalization_dir = tmp.path().join("personalization");
+    let personalization_dir = tmp.path().join(".personalization");
     std::fs::create_dir_all(&personalization_dir).unwrap();
     symlink(&outside_profiles, personalization_dir.join("profiles")).unwrap();
 
@@ -334,7 +334,7 @@ async fn gdpr_delete_rejects_symlinked_profile_file_before_analytics_mutation() 
     let outside_bytes = br#"{"user_token":"delete-me","scores":{}}"#;
     std::fs::write(&outside_profile, outside_bytes).unwrap();
 
-    let profiles_dir = tmp.path().join("personalization/profiles");
+    let profiles_dir = tmp.path().join(".personalization/profiles");
     std::fs::create_dir_all(&profiles_dir).unwrap();
     symlink(&outside_profile, profiles_dir.join("delete-me.json")).unwrap();
 

@@ -11,7 +11,7 @@ use flapjack::dictionaries::{
 use std::sync::Arc;
 
 use super::AppState;
-use crate::auth::AuthenticatedAppId;
+use crate::auth::{AuthenticatedAppId, RequiredApplicationConfiguration};
 use crate::error_response::json_error;
 
 fn dict_error_response(err: flapjack::dictionaries::DictionaryError) -> Response {
@@ -75,15 +75,37 @@ pub async fn dictionary_batch(
 pub async fn dictionary_search(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedAppId(tenant)): Extension<AuthenticatedAppId>,
+    required: Option<Extension<RequiredApplicationConfiguration>>,
     Path(dict_name_str): Path<String>,
     Json(body): Json<DictionarySearchRequest>,
 ) -> Response {
+    let managed = required.is_some();
+    let snapshot = match required {
+        Some(Extension(required)) => state
+            .dictionary_manager
+            .snapshot_at_least(&tenant, required.0),
+        None => state.dictionary_manager.snapshot(&tenant),
+    };
+    let snapshot = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(error) if !managed => return dict_error_response(error),
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "application configuration unavailable",
+            )
+        }
+    };
+
     let dict_name = match dict_name_str.parse::<DictionaryName>() {
         Ok(n) => n,
         Err(e) => return bad_request_response(e.to_string()),
     };
 
-    match state.dictionary_manager.search(&tenant, dict_name, &body) {
+    match state
+        .dictionary_manager
+        .search_snapshot(snapshot, dict_name, &body)
+    {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => dict_error_response(e),
     }
@@ -99,11 +121,27 @@ pub async fn dictionary_search(
 pub async fn dictionary_get_settings(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedAppId(tenant)): Extension<AuthenticatedAppId>,
+    required: Option<Extension<RequiredApplicationConfiguration>>,
 ) -> Response {
-    match state.dictionary_manager.get_settings(&tenant) {
-        Ok(settings) => (StatusCode::OK, Json(settings)).into_response(),
-        Err(e) => dict_error_response(e),
-    }
+    let managed = required.is_some();
+    let snapshot = match required {
+        Some(Extension(required)) => state
+            .dictionary_manager
+            .snapshot_at_least(&tenant, required.0),
+        None => state.dictionary_manager.snapshot(&tenant),
+    };
+    let snapshot = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(error) if !managed => return dict_error_response(error),
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "application configuration unavailable",
+            )
+        }
+    };
+
+    (StatusCode::OK, Json(snapshot.settings)).into_response()
 }
 
 /// PUT /1/dictionaries/*/settings
@@ -136,8 +174,27 @@ pub async fn dictionary_set_settings(
 pub async fn dictionary_list_languages(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedAppId(tenant)): Extension<AuthenticatedAppId>,
+    required: Option<Extension<RequiredApplicationConfiguration>>,
 ) -> Response {
-    match state.dictionary_manager.list_languages(&tenant) {
+    let managed = required.is_some();
+    let snapshot = match required {
+        Some(Extension(required)) => state
+            .dictionary_manager
+            .snapshot_at_least(&tenant, required.0),
+        None => state.dictionary_manager.snapshot(&tenant),
+    };
+    let snapshot = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(error) if !managed => return dict_error_response(error),
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "application configuration unavailable",
+            )
+        }
+    };
+
+    match state.dictionary_manager.list_languages_snapshot(&snapshot) {
         Ok(langs) => (StatusCode::OK, Json(langs)).into_response(),
         Err(e) => dict_error_response(e),
     }

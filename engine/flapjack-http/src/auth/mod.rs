@@ -734,3 +734,7 @@ pub(super) fn api_key_restrict_sources_match(
 #[cfg(test)]
 #[path = "../auth_tests.rs"]
 mod tests;
+
+/// Minimum durable application generation asserted only by the node administrator.
+#[derive(Clone, Copy, Debug)]
+pub struct RequiredApplicationConfiguration(pub u64);

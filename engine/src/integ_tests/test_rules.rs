@@ -13,6 +13,50 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 
+mod counts;
+
+#[tokio::test]
+async fn promoted_only_result_has_nonzero_total() -> Result<()> {
+    let (manager, temp_dir, index_name) = setup_test().await;
+    manager
+        .add_documents_sync(
+            &index_name,
+            vec![Document::from_json(
+                &json!({"_id":"phone", "name":"phone"}),
+            )?],
+        )
+        .await?;
+    let mut store = crate::index::rules::RuleStore::new();
+    store.insert(serde_json::from_value(json!({
+        "objectID":"featured-phone",
+        "conditions":[{"pattern":"featured", "anchoring":"is"}],
+        "consequence":{"promote":[{"objectID":"phone", "position":0}]}
+    }))?);
+    store.save(&temp_dir.path().join(&index_name).join("rules.json"))?;
+
+    let disabled = manager.search_with_options(
+        &index_name,
+        "featured",
+        &SearchOptions {
+            enable_rules: Some(false),
+            limit: 20,
+            ..Default::default()
+        },
+    )?;
+    assert!(disabled.documents.is_empty());
+    assert_eq!(disabled.total, 0);
+
+    let result = manager.search(&index_name, "featured", None, None, 20)?;
+    assert_eq!(result.documents.len(), 1);
+    assert_eq!(result.documents[0].document.id, "phone");
+    assert_eq!(result.applied_rules, vec!["featured-phone"]);
+    assert_eq!(
+        result.total, 1,
+        "a promoted-only hit must not trigger no-results UI"
+    );
+    Ok(())
+}
+
 // ============================================================
 // Helper — creates a fresh index with a UUID-based name
 // (avoids cross-test interference when tests run in parallel)

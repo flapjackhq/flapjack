@@ -71,9 +71,21 @@ fn classify_search_query() {
 }
 
 #[test]
-fn classify_search_queries() {
+fn classify_batch_envelopes_as_unattributed() {
     assert_eq!(
         classify_request(&Method::POST, "/1/indexes/products/queries"),
+        None
+    );
+    assert_eq!(
+        classify_request(&Method::POST, "/1/indexes/*/queries"),
+        None
+    );
+}
+
+#[test]
+fn classify_facet_search() {
+    assert_eq!(
+        classify_request(&Method::POST, "/1/indexes/products/facets/category/query"),
         Some(RequestKind::Search)
     );
 }

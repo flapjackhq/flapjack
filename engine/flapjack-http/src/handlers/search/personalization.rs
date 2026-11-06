@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use flapjack::personalization::{
     extract_facet_values, PersonalizationProfile, PersonalizationProfileStore,
-    PersonalizationStrategy, STRATEGY_FILENAME,
+    PersonalizationStrategy,
 };
 use flapjack::types::{Document, ScoredDocument};
 
@@ -21,7 +21,7 @@ pub(super) struct PersonalizationContext {
 }
 
 pub(super) fn personalization_strategy_path(state: &AppState) -> PathBuf {
-    state.manager.base_path.join(STRATEGY_FILENAME)
+    PersonalizationProfileStore::new(&*state.manager.base_path).strategy_path()
 }
 
 pub(super) fn parse_personalization_filter(filter: &str) -> Option<(String, String)> {

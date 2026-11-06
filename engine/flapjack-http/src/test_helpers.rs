@@ -10,9 +10,11 @@ use flapjack::analytics::{AnalyticsConfig, AnalyticsQueryEngine};
 use flapjack::experiments::store::ExperimentStore;
 use flapjack::recommend::RecommendConfig;
 use flapjack_replication::manager::ReplicationManager;
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -461,6 +463,83 @@ pub(crate) async fn quiesced_snapshot_bytes(
     .await
     .expect("snapshot fixture export task must not panic")
     .expect("snapshot fixture bytes must export from a quiesced tenant")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SnapshotTreeEntry {
+    Directory,
+    File(Vec<u8>),
+    Symlink(PathBuf),
+}
+
+pub(crate) fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, SnapshotTreeEntry> {
+    for _ in 0..10 {
+        let mut entries = BTreeMap::new();
+        if !root.exists() {
+            return entries;
+        }
+        match snapshot_tree_inner(root, root, &mut entries) {
+            Ok(()) => return entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => panic!(
+                "failed to inspect snapshot tree at {}: {error}",
+                root.display()
+            ),
+        }
+    }
+    panic!(
+        "snapshot tree at {} kept changing during observation",
+        root.display()
+    );
+}
+
+pub(crate) async fn settled_snapshot_tree(root: &Path) -> BTreeMap<PathBuf, SnapshotTreeEntry> {
+    const REQUIRED_STABLE_OBSERVATIONS: usize = 5;
+    const MAX_OBSERVATIONS: usize = 250;
+    let mut previous = snapshot_tree(root);
+    let mut stable_observations = 0;
+    for _ in 0..MAX_OBSERVATIONS {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let current = snapshot_tree(root);
+        if current == previous {
+            stable_observations += 1;
+            if stable_observations == REQUIRED_STABLE_OBSERVATIONS {
+                return current;
+            }
+        } else {
+            stable_observations = 0;
+        }
+        previous = current;
+    }
+    panic!("snapshot tree at {} did not settle", root.display());
+}
+
+fn snapshot_tree_inner(
+    root: &Path,
+    current: &Path,
+    entries: &mut BTreeMap<PathBuf, SnapshotTreeEntry>,
+) -> io::Result<()> {
+    for entry in std::fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .expect("walked paths must stay beneath the snapshot root")
+            .to_path_buf();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            entries.insert(
+                relative,
+                SnapshotTreeEntry::Symlink(std::fs::read_link(&path)?),
+            );
+        } else if metadata.is_dir() {
+            entries.insert(relative, SnapshotTreeEntry::Directory);
+            snapshot_tree_inner(root, &path, entries)?;
+        } else {
+            entries.insert(relative, SnapshotTreeEntry::File(std::fs::read(&path)?));
+        }
+    }
+    Ok(())
 }
 
 /// Send a JSON request through a router and return the raw response.

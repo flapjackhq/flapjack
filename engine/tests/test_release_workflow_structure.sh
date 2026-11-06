@@ -931,7 +931,7 @@ assert_job_needs "release" "release_ci_status_preflight" "the public tag and Git
 
 section "Release build identity packaging"
 assert_public_release_matrix_is_closed
-assert_contains "$HTTP_MANIFEST" 'utoipa-swagger-ui = \{ version = "8\.0", features = \["axum", "vendored"\] \}' "release builds vendor Swagger UI instead of downloading it during compilation"
+assert_contains "$HTTP_MANIFEST" '^utoipa-swagger-ui = \{ .*features = \[[^]]*"vendored"[^]]*\].*\}' "release builds vendor Swagger UI instead of downloading it during compilation"
 assert_file_executable "$RELEASE_BUILD_HELPER" "build_release_artifact helper is executable"
 assert_file_executable "$RELEASE_BUILD_HELPER_CONTRACT" "build_release_artifact focused contract is executable"
 assert_contains "$RELEASE_BUILD_HELPER" '\^\[0-9a-f\]\{40\}\$' "build helper validates exact lowercase source SHA and tree coordinates"

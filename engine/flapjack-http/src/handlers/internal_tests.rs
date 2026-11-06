@@ -9111,3 +9111,42 @@ async fn internal_snapshot_quiesces_the_persistent_writer_before_reading_bytes()
         "internal snapshot bytes must contain the committed generation"
     );
 }
+
+#[tokio::test]
+async fn storage_ownership_inventory_keeps_legitimate_index_names() {
+    let tmp = TempDir::new().unwrap();
+    let dictionaries = flapjack::dictionaries::manager::DictionaryManager::new(tmp.path());
+    dictionaries.get_settings("personalization").unwrap();
+    let profiles = flapjack::personalization::PersonalizationProfileStore::new(tmp.path());
+    profiles
+        .save_profile(&flapjack::personalization::PersonalizationProfile {
+            user_token: "user".to_string(),
+            last_event_at: None,
+            scores: Default::default(),
+        })
+        .unwrap();
+    let manager = IndexManager::new(tmp.path());
+    manager.create_tenant("personalization").unwrap();
+    manager.create_tenant("products").unwrap();
+    prepare_release_inventory(&manager).unwrap();
+    assert_eq!(
+        serde_json::to_value(canonical_release_inventory(&manager).unwrap()).unwrap(),
+        serde_json::json!([{"indexId":"personalization","documentCount":0},{"indexId":"products","documentCount":0}])
+    );
+}
+
+#[tokio::test]
+async fn storage_ownership_inventory_refuses_ambiguous_and_damaged_roots() {
+    for artifact in [".dictionaries/settings.json", "meta.json", "unknown/file"] {
+        let tmp = TempDir::new().unwrap();
+        let manager = IndexManager::new(tmp.path());
+        let path = tmp.path().join("damaged").join(artifact);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"invalid").unwrap();
+        assert!(
+            prepare_release_inventory(&manager).is_err(),
+            "must not skip {artifact}"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"invalid");
+    }
+}

@@ -3381,3 +3381,235 @@ async fn latency_histogram_captures_success_and_auth_rejection_while_metrics_sta
         "expected POST 4xx request_duration_seconds_count for /1/indexes in:\n{text}"
     );
 }
+
+#[tokio::test]
+async fn managed_dictionary_delivery_drives_authenticated_search_and_refuses_missing_state() {
+    use flapjack::dictionaries::manager::DictionarySnapshot;
+    let tmp = TempDir::new().unwrap();
+    let keys = Arc::new(KeyStore::load_or_create(tmp.path(), "admin-key"));
+    let search_key = search_only_key_value(&keys);
+    let state = TestStateBuilder::new(&tmp).with_analytics().build_shared();
+    seed_document(&state.manager, "products", "one", "available").await;
+    let app = build_auth_router_for_state(&tmp, state.clone(), keys);
+    async fn call(
+        app: &axum::Router,
+        method: Method,
+        path: &str,
+        customer: &str,
+        key: &str,
+        revision: Option<u64>,
+        body: serde_json::Value,
+    ) -> axum::response::Response {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("x-algolia-application-id", customer)
+            .header("x-algolia-api-key", key)
+            .header("content-type", "application/json");
+        if let Some(revision) = revision {
+            request = request.header("x-flapjack-configuration-revision", revision);
+        }
+        app.clone()
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+    }
+    let query = serde_json::json!({"query":"alpha product", "removeStopWords":true,"queryLanguages":["en"],"typoTolerance":false});
+    let missing = call(
+        &app,
+        Method::POST,
+        "/1/indexes/products/query",
+        "a",
+        "admin-key",
+        Some(0),
+        query.clone(),
+    )
+    .await;
+    assert_eq!(
+        missing.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "missing cannot satisfy valid zero"
+    );
+    for (method, path, body) in [
+        (
+            Method::GET,
+            "/1/dictionaries/*/settings",
+            serde_json::json!(null),
+        ),
+        (
+            Method::GET,
+            "/1/dictionaries/*/languages",
+            serde_json::json!(null),
+        ),
+        (
+            Method::POST,
+            "/1/dictionaries/stopwords/search",
+            serde_json::json!({"query":""}),
+        ),
+    ] {
+        let response = call(&app, method, path, "a", "admin-key", Some(0), body).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "missing configuration cannot return empty management data: {path}"
+        );
+    }
+    let absent_receipt = call(
+        &app,
+        Method::GET,
+        "/internal/application-configuration",
+        "a",
+        "admin-key",
+        Some(0),
+        serde_json::json!(null),
+    )
+    .await;
+    assert_eq!(
+        absent_receipt.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "default empty state is not an installed receipt"
+    );
+    let empty = DictionarySnapshot::empty("a").unwrap();
+    let prepared = call(&app, Method::POST, "/internal/application-configuration/prepare", "a", "admin-key", None,
+        serde_json::json!({"base":empty,"revision":1,"command":{"operation":"batch","dictionary":"stopwords","request":{"requests":[{"action":"addEntry","body":{"objectID":"alpha","word":"alpha","language":"en"}}]}}})).await;
+    assert_eq!(prepared.status(), StatusCode::OK);
+    let generation = body_json(prepared).await;
+    assert!(
+        state.dictionary_manager.snapshot_at_least("a", 0).is_err(),
+        "prepare does not activate"
+    );
+    let denied = call(
+        &app,
+        Method::PUT,
+        "/internal/application-configuration",
+        "a",
+        &search_key,
+        None,
+        generation.clone(),
+    )
+    .await;
+    assert!(!denied.status().is_success());
+    let installed = call(
+        &app,
+        Method::PUT,
+        "/internal/application-configuration",
+        "a",
+        "admin-key",
+        None,
+        generation.clone(),
+    )
+    .await;
+    assert_eq!(installed.status(), StatusCode::OK);
+    let response = call(
+        &app,
+        Method::POST,
+        "/1/indexes/products/query",
+        "a",
+        "admin-key",
+        Some(1),
+        query.clone(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["nbHits"], 1);
+    let other = call(
+        &app,
+        Method::POST,
+        "/1/indexes/products/query",
+        "b",
+        "admin-key",
+        Some(1),
+        query.clone(),
+    )
+    .await;
+    assert_eq!(other.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let stale = call(
+        &app,
+        Method::POST,
+        "/1/indexes/products/query",
+        "a",
+        "admin-key",
+        Some(2),
+        query.clone(),
+    )
+    .await;
+    assert_eq!(stale.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let spoof = call(
+        &app,
+        Method::POST,
+        "/1/indexes/products/query",
+        "a",
+        &search_key,
+        Some(0),
+        query.clone(),
+    )
+    .await;
+    assert_eq!(spoof.status(), StatusCode::FORBIDDEN);
+    let batch = call(&app, Method::POST, "/1/indexes/*/queries", "a", "admin-key", Some(1),
+        serde_json::json!({"requests":[{"indexName":"products","query":"alpha product","removeStopWords":true,"queryLanguages":["en"],"typoTolerance":false}]})).await;
+    assert_eq!(batch.status(), StatusCode::OK);
+    assert_eq!(body_json(batch).await["results"][0]["nbHits"], 1);
+    let browse = call(
+        &app,
+        Method::POST,
+        "/1/indexes/products/browse",
+        "a",
+        "admin-key",
+        Some(2),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(browse.status(), StatusCode::SERVICE_UNAVAILABLE);
+    for (method, path, body) in [
+        (
+            Method::GET,
+            "/1/dictionaries/*/settings",
+            serde_json::json!(null),
+        ),
+        (
+            Method::GET,
+            "/1/dictionaries/*/languages",
+            serde_json::json!(null),
+        ),
+        (
+            Method::POST,
+            "/1/dictionaries/stopwords/search",
+            serde_json::json!({"query":"alpha"}),
+        ),
+    ] {
+        let current = call(
+            &app,
+            method.clone(),
+            path,
+            "a",
+            "admin-key",
+            Some(1),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(current.status(), StatusCode::OK);
+        let stale = call(&app, method, path, "a", "admin-key", Some(2), body).await;
+        assert_eq!(stale.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+    }
+    std::fs::remove_file(
+        tmp.path()
+            .join(".applications/a/.dictionaries/configuration.json"),
+    )
+    .unwrap();
+    for (method, path, body) in [
+        (Method::POST, "/1/indexes/products/query", query),
+        (
+            Method::GET,
+            "/1/dictionaries/*/settings",
+            serde_json::json!(null),
+        ),
+    ] {
+        let lost = call(&app, method, path, "a", "admin-key", Some(1), body).await;
+        assert_eq!(
+            lost.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "lost generation: {path}"
+        );
+    }
+    state.manager.drain_all_write_queues().await.unwrap();
+}

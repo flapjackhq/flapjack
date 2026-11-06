@@ -1047,8 +1047,14 @@ fn admitted_in_flight_batch_replays_after_served_crash_restart() {
         .map(|request| request.object_id.clone())
         .collect::<HashSet<_>>();
 
-    let records =
-        wait_for_admission_record_count(tmp.root(), index_name, 1, Duration::from_secs(3));
+    // Sample every submitted request before killing the process: a partial
+    // sample lets another admission arrive between sampling and the crash.
+    let records = wait_for_admission_record_count(
+        tmp.root(),
+        index_name,
+        requests.len(),
+        Duration::from_secs(3),
+    );
     let sampled_records = records
         .into_iter()
         .filter(|record| {
@@ -1075,16 +1081,21 @@ fn admitted_in_flight_batch_replays_after_served_crash_restart() {
         }
     }
 
+    let expected_object_ids = sampled_records
+        .iter()
+        .flat_map(|record| record.object_ids.iter().cloned())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        expected_object_ids, requested_object_ids,
+        "pre-kill sample must contain every submitted object ID"
+    );
+
     server.kill_and_restart_no_auth_auto_port(tmp.path());
 
     for request in requests.drain(..) {
         let _ = request.handle.join();
     }
 
-    let expected_object_ids = sampled_records
-        .iter()
-        .flat_map(|record| record.object_ids.iter().cloned())
-        .collect::<HashSet<_>>();
     let replayed_search = server.search(index_name, json!({ "query": replay_token }));
     assert_eq!(
         replayed_search["nbHits"],

@@ -2,6 +2,7 @@
 """Fail-closed ownership contract for Flapjack test execution tiers."""
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -17,6 +18,9 @@ ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = ROOT / "engine/tests/ci_test_tiers.json"
 WORKFLOWS = (
     ".github/workflows/ci.yml",
+    ".github/workflows/private-ci.yml",
+    ".github/workflows/ci-red.yml",
+    ".github/workflows/rust-tests.yml",
     ".github/workflows/docker.yml",
     ".github/workflows/nightly.yml",
     ".github/workflows/union.yml",
@@ -258,8 +262,8 @@ def verify_public_candidate_topology(root=ROOT, texts=None):
     texts = topology_texts(root) if texts is None else texts
     ci = texts[".github/workflows/ci.yml"]
     ci_events = _workflow_events(ci)
-    if ci_events != {"push"}:
-        raise ContractError(f"public CI events must be push-only, found {sorted(ci_events)}")
+    if ci_events != {"push", "workflow_dispatch"}:
+        raise ContractError(f"public CI events must be push-only plus private validation dispatch, found {sorted(ci_events)}")
     branches = _push_branches(ci)
     if branches != ["main", "public-candidate/**"]:
         raise ContractError(
@@ -273,13 +277,15 @@ def verify_public_candidate_topology(root=ROOT, texts=None):
     ci_check = jobs.get("check-repo", "")
     if (
         "ACTUAL_REPOSITORY: ${{ github.repository }}" not in ci_check
+        or "ACTUAL_EVENT: ${{ github.event_name }}" not in ci_check
+        or '[ "$ACTUAL_EVENT" = "push" ]' not in ci_check
         or '[ "$ACTUAL_REPOSITORY" = "flapjackhq/flapjack" ]' not in ci_check
     ):
         raise ContractError("public CI repository identity must be env-bound before shell use")
     gate = jobs.get("public-candidate-gate")
     if gate is None:
         raise ContractError("public CI is missing the public-candidate-gate job")
-    expected_dependencies = set(jobs) - {"public-candidate-gate"}
+    expected_dependencies = set(jobs) - {"public-candidate-gate", "rust-validation", "validation-status"}
     actual_dependencies = _job_needs(gate)
     if actual_dependencies != expected_dependencies:
         raise ContractError(
@@ -287,7 +293,7 @@ def verify_public_candidate_topology(root=ROOT, texts=None):
             f"missing={sorted(expected_dependencies - actual_dependencies)} "
             f"unexpected={sorted(actual_dependencies - expected_dependencies)}"
         )
-    if not re.search(r"^    if:\s*always\(\)\s*$", gate, re.MULTILINE):
+    if not re.search(r"^    if:\s*always\(\) && github.repository == 'flapjackhq/flapjack' && github.event_name == 'push'\s*$", gate, re.MULTILINE):
         raise ContractError("Public candidate gate must have a job-level if: always()")
     required_gate_fragments = (
         "name: Public candidate gate",
@@ -561,24 +567,47 @@ def verify(root=ROOT, manifest_path=MANIFEST_PATH, jobs=None, actual_ignored=Non
             f"stale={sorted(expected_ignored - actual_ignored)}"
         )
 
-    all_job = jobs[".github/workflows/ci.yml#rust-tests-all"]
-    if "RUSTFLAGS: -C debuginfo=0" not in all_job:
-        raise ContractError("rust-tests-all must own one canonical job-level RUSTFLAGS profile")
-    prebuild = (
-        "cargo nextest run -p flapjack -p flapjack-http "
-        "--features vector-search -P ci --no-run"
-    )
-    if prebuild not in all_job or "RUSTFLAGS='" + "-C debuginfo=0 -C strip=debuginfo' " + prebuild in all_job:
-        raise ContractError("vector prebuild and nextest must share the job-level compilation identity")
-    remaining_prebuild = (
-        "cargo nextest run -p flapjack-server -p flapjack-ssl "
-        "-p flapjack-replication -P ci --no-run"
-    )
-    if remaining_prebuild not in all_job:
-        raise ContractError("remaining-crates prebuild must share the capped nextest compilation identity")
+    archive = jobs[".github/workflows/rust-tests.yml#build"]
+    shards = jobs[".github/workflows/rust-tests.yml#test"]
+    for owner in (".github/workflows/ci.yml#rust-tests-all", ".github/workflows/nightly.yml#rust-all-tests", ".github/workflows/private-ci.yml#rust-all"):
+        if "uses: ./.github/workflows/rust-tests.yml" not in jobs[owner]:
+            raise ContractError(f"{owner} must use the shared complete Rust test owner")
+    for fragment in (
+        "cargo nextest archive --config-file \"$RUNNER_TEMP/nextest.toml\" --locked -p flapjack -p flapjack-http --features vector-search -P ci",
+        "cargo nextest archive --config-file \"$RUNNER_TEMP/nextest.toml\" --locked -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci",
+        "cargo nextest archive --config-file \"$RUNNER_TEMP/nextest.toml\" --locked --workspace -P ci",
+        "fail-fast: false",
+    ):
+        if fragment not in archive:
+            raise ContractError(f"Rust archive coverage is missing required fragment: {fragment}")
+    for fragment in ("--no-fail-fast", '--partition "hash:${SHARD}/4"', "shard: [1, 2, 3, 4]", "--workspace-remap", "--extract-to", "fail-fast: false"):
+        if fragment not in shards:
+            raise ContractError(f"Rust shard coverage is missing required fragment: {fragment}")
 
 
 class TestTierContract(unittest.TestCase):
+    def test_backend_environment_contract_runs_in_both_runner_layouts(self):
+        spec = importlib.util.spec_from_file_location(
+            "backend_contract", ROOT / "engine/tests/test_dashboard_e2e_backend_contract.py"
+        )
+        backend = importlib.util.module_from_spec(spec)
+        self.addCleanup(sys.modules.pop, spec.name, None)
+        sys.modules[spec.name] = backend
+        spec.loader.exec_module(backend)
+        contract = json.loads(backend.CONTRACT_PATH.read_text())
+        source = local_runner_path().read_text()
+        for layout in ("engine/_dev/s/test", "engine/s/test"):
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory() as directory:
+                runner = Path(directory) / layout
+                runner.parent.mkdir(parents=True)
+                runner.write_text(source)
+                with mock.patch.object(backend, "REPO_ROOT", Path(directory)):
+                    self.assertEqual(backend.check_unified_runner_backend(contract), [])
+                    runner.write_text(source.replace(
+                        "FLAPJACK_NODE_ID=", "FJ_BROKEN_NODE_ID=",
+                    ))
+                    self.assertTrue(backend.check_unified_runner_backend(contract))
+
     def topology_mutation(self, relative, old, new):
         texts = topology_texts()
         mutated = texts[relative].replace(old, new, 1)
@@ -653,6 +682,13 @@ class TestTierContract(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "push-only"):
             verify_public_candidate_topology(texts=texts)
 
+    def test_private_dispatch_cannot_enable_public_secret_jobs(self):
+        texts = self.topology_mutation(
+            ".github/workflows/ci.yml", ' && [ "$ACTUAL_EVENT" = "push" ]', ""
+        )
+        with self.assertRaisesRegex(ContractError, "repository identity"):
+            verify_public_candidate_topology(texts=texts)
+
     def test_aggregate_gate_cannot_drop_a_required_job(self):
         texts = self.topology_mutation(
             ".github/workflows/ci.yml", "      - rust-tests-all\n", ""
@@ -673,7 +709,7 @@ class TestTierContract(unittest.TestCase):
     def test_aggregate_gate_always_condition_must_remain_job_level(self):
         texts = self.topology_mutation(
             ".github/workflows/ci.yml",
-            "    name: Public candidate gate\n    if: always()\n",
+            "    name: Public candidate gate\n    if: always() && github.repository == 'flapjackhq/flapjack' && github.event_name == 'push'\n",
             "    name: Public candidate gate\n",
         )
         with self.assertRaisesRegex(ContractError, "job-level if: always"):
@@ -755,27 +791,11 @@ class TestTierContract(unittest.TestCase):
             verify(actual_ignored=mutated)
 
     def test_public_complete_owners_cannot_regress_to_fail_fast(self):
-        owner = ".github/workflows/ci.yml#rust-tests-all"
-        commands = (
-            "cargo nextest run -p flapjack -p flapjack-http --features vector-search "
-            "-P ci --no-fail-fast",
-            "cargo nextest run -p flapjack-server -p flapjack-ssl "
-            "-p flapjack-replication -P ci --no-fail-fast",
-        )
-        for command in commands:
-            with self.subTest(command=command):
-                jobs = workflow_job_blocks()
-                mutated = jobs[owner].replace(
-                    command,
-                    command.removesuffix(" --no-fail-fast"),
-                    1,
-                )
-                self.assertNotEqual(
-                    jobs[owner], mutated, "mutation must restore fail-fast"
-                )
-                jobs[owner] = mutated
-                with self.assertRaisesRegex(ContractError, "missing required fragment"):
-                    verify(jobs=jobs)
+        owner = ".github/workflows/rust-tests.yml#test"
+        jobs = workflow_job_blocks()
+        jobs[owner] = jobs[owner].replace(" --no-fail-fast", "", 1)
+        with self.assertRaisesRegex(ContractError, "missing required fragment"):
+            verify(jobs=jobs)
 
     def test_console_ci_owner_rejects_omitted_and_duplicated_commands(self):
         console_class = next(
