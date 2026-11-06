@@ -829,7 +829,7 @@ mod tests {
     /// TODO: Document import_snapshot_success_returns_json_without_router_error_wrapper.
     #[tokio::test]
     async fn import_snapshot_success_returns_json_without_router_error_wrapper() {
-        flapjack::index::write_queue::clear_writer_lifecycle_test_events();
+        flapjack::index::write_queue::clear_writer_lifecycle_test_events_for_tenant("products");
         let tmp = TempDir::new().unwrap();
         let state = TestStateBuilder::new(&tmp).build_shared();
         state.manager.create_tenant("products").unwrap();
@@ -885,7 +885,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_snapshot_into_absent_tenant_survives_quiesce_fence_repair() {
-        flapjack::index::write_queue::clear_writer_lifecycle_test_events();
+        flapjack::index::write_queue::clear_writer_lifecycle_test_events_for_tenant("products");
         let source_tmp = TempDir::new().unwrap();
         let source = TestStateBuilder::new(&source_tmp).build_shared();
         source.manager.create_tenant("products").unwrap();
@@ -1167,10 +1167,10 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_restore_into_tenant_with_live_writer_quiesces_before_rename() {
-        flapjack::index::write_queue::clear_writer_lifecycle_test_events();
+        let tenant_id = "stage4_snapshot_restore_quiesce";
+        flapjack::index::write_queue::clear_writer_lifecycle_test_events_for_tenant(tenant_id);
         let tmp = TempDir::new().unwrap();
         let state = TestStateBuilder::new(&tmp).build_shared();
-        let tenant_id = "stage4_snapshot_restore_quiesce";
         state.manager.create_tenant(tenant_id).unwrap();
         state
             .manager

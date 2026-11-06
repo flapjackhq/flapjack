@@ -105,7 +105,7 @@ async fn rejection_baseline(
         crate::test_helpers::snapshot_tree(&tenant_path)
     };
     let publication_tree = crate::test_helpers::snapshot_tree(&publication_path);
-    flapjack::index::write_queue::clear_writer_lifecycle_test_events();
+    flapjack::index::write_queue::clear_writer_lifecycle_test_events_for_tenant("products");
     RejectionBaseline {
         tenant_path,
         publication_path,

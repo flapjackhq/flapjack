@@ -235,6 +235,12 @@ impl WriterLifecycleTestLog {
         self.tenant_order.clear();
     }
 
+    fn clear_tenant(&mut self, tenant_id: &str) {
+        self.events_by_tenant.remove(tenant_id);
+        self.next_sequence_by_tenant.remove(tenant_id);
+        self.tenant_order.retain(|tenant| tenant != tenant_id);
+    }
+
     fn push(&mut self, tenant_id: &str, reason: &str, phase: &'static str) {
         if !self.events_by_tenant.contains_key(tenant_id) {
             self.tenant_order.push_back(tenant_id.to_string());
@@ -503,6 +509,40 @@ mod tests {
         wait_thread.join().unwrap();
     }
 
+    #[test]
+    fn clearing_lifecycle_events_preserves_other_tenants() {
+        let mut log = WriterLifecycleTestLog::default();
+        log.push("admitted_import", "publication", "snapshot_restore_entry");
+        log.push("rejected_import", "channel_closed", "merge_quiesced");
+        log.push(
+            "admitted_import",
+            "publication",
+            "snapshot_restore_publication",
+        );
+        let admitted_events = log.events_for_tenant("admitted_import");
+
+        log.clear_tenant("rejected_import");
+        assert_eq!(
+            log.events_for_tenant("admitted_import"),
+            admitted_events,
+            "a parallel rejection baseline must preserve admitted-import evidence"
+        );
+        assert!(log.events_for_tenant("rejected_import").is_empty());
+
+        for _ in 0..5000 {
+            log.push("rejected_import", "channel_closed", "merge_quiesced");
+            assert_eq!(log.events_for_tenant("rejected_import")[0].sequence, 1);
+            log.clear_tenant("rejected_import");
+        }
+        assert_eq!(
+            log.events_for_tenant("admitted_import"),
+            admitted_events,
+            "repeated scoped resets must not evict unrelated lifecycle evidence"
+        );
+        log.push("admitted_import", "channel_closed", "merge_quiesced");
+        assert_eq!(log.events_for_tenant("admitted_import")[2].sequence, 3);
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     fn writer_lifecycle_sequence_is_scoped_per_tenant() {
@@ -683,6 +723,15 @@ pub fn clear_writer_lifecycle_test_events() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clear();
+}
+
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
+/// Resets one tenant's diagnostics without erasing parallel tenants' evidence.
+pub fn clear_writer_lifecycle_test_events_for_tenant(tenant_id: &str) {
+    WRITER_LIFECYCLE_TEST_LOG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear_tenant(tenant_id);
 }
 
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
