@@ -1,12 +1,60 @@
+use super::metrics::QueryPhase;
 use super::QueryExecutor;
 use crate::error::Result;
 use crate::index::rules::RuleEffects;
 use crate::types::{Filter, ScoredDocument};
-use tantivy::query::{BooleanQuery, Occur, Query as TantivyQuery, TermQuery};
+use tantivy::query::{BooleanQuery, Occur, Query as TantivyQuery, TermQuery, TermSetQuery};
 use tantivy::schema::IndexRecordOption;
 use tantivy::Searcher;
 
 impl QueryExecutor {
+    /// Only inspect IDs affected by rules, intersected with the actual prepared
+    /// query. Absence from a bounded ranked window is not evidence of nonmatch.
+    pub(super) fn matching_rule_ids(
+        &self,
+        searcher: &Searcher,
+        query: &dyn TantivyQuery,
+        rule_ids: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        if rule_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let prepare_started_at = std::time::Instant::now();
+        let id_field = self.tantivy_schema.get_field("_id")?;
+        let ids = TermSetQuery::new(
+            rule_ids
+                .iter()
+                .map(|id| tantivy::Term::from_field_text(id_field, id)),
+        );
+        let intersection = BooleanQuery::new(vec![
+            (Occur::Must, query.box_clone()),
+            (Occur::Must, Box::new(ids)),
+        ]);
+        self.observe_phase(QueryPhase::Prepare, prepare_started_at);
+        let collect_started_at = std::time::Instant::now();
+        let addresses = self.search_bounded(
+            searcher,
+            &intersection,
+            &tantivy::collector::TopDocs::with_limit(rule_ids.len()).order_by_score(),
+        )?;
+        self.observe_phase(QueryPhase::Collect, collect_started_at);
+        let fetch_started_at = std::time::Instant::now();
+        let mut ids = std::collections::HashSet::new();
+        for (_, address) in addresses {
+            let doc: tantivy::TantivyDocument = searcher.doc(address)?;
+            let id = doc
+                .get_first(id_field)
+                .and_then(|value| match tantivy::schema::OwnedValue::from(value) {
+                    tantivy::schema::OwnedValue::Str(id) => Some(id),
+                    _ => None,
+                })
+                .ok_or_else(|| crate::error::FlapjackError::MissingField("_id".into()))?;
+            ids.insert(id);
+        }
+        self.observe_phase(QueryPhase::Fetch, fetch_started_at);
+        Ok(ids)
+    }
+
     /// Apply rule effects (hide, pin, promote) to the scored result set, removing
     /// hidden docs and inserting promoted/pinned docs at their target positions.
     pub(crate) fn apply_rules_to_results(

@@ -100,3 +100,17 @@ async fn quarantined_repair_without_live_byte_mutation_preserves_runtime_state()
     );
     assert!(paths.quarantine.join("staging/settings.json").exists());
 }
+
+#[tokio::test]
+async fn startup_repair_leaves_absent_data_root_absent() {
+    let temp = TempDir::new().unwrap();
+    let absent = temp.path().join("absent");
+    let manager = IndexManager::new(&absent);
+    assert!(manager
+        .repair_publications_before_serve()
+        .unwrap()
+        .is_empty());
+    assert!(!absent.exists());
+    std::fs::write(&absent, "not a directory").unwrap();
+    assert!(manager.repair_publications_before_serve().is_err());
+}

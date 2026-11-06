@@ -1,4 +1,4 @@
-//! On-disk persistence for per-tenant dictionary data (stopwords, plurals, compounds, settings) using atomic temp-file-plus-rename writes.
+//! On-disk persistence for application dictionary data (stopwords, plurals, compounds, settings) using atomic temp-file-plus-rename writes.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -8,8 +8,9 @@ use super::{
 };
 
 pub(crate) const DICTIONARIES_DIR: &str = ".dictionaries";
+pub(crate) const APPLICATIONS_DIR: &str = ".applications";
 
-/// Manages on-disk storage for one tenant's dictionaries.
+/// Manages on-disk storage for one application's dictionaries.
 pub struct DictionaryStore {
     dir: PathBuf,
 }
@@ -23,10 +24,126 @@ impl DictionaryStore {
         Ok(Self { dir })
     }
 
-    /// Construct the store path for a given tenant under a data directory.
-    pub fn for_tenant(data_dir: &Path, tenant_id: &str) -> Result<Self, DictionaryError> {
-        let dir = data_dir.join(tenant_id).join(DICTIONARIES_DIR);
-        Self::new(dir)
+    /// Reject application IDs that could cause path traversal or filesystem issues.
+    fn validate_application_id(application_id: &str) -> Result<(), DictionaryError> {
+        if application_id.is_empty() || application_id == "." {
+            return Err(DictionaryError::InvalidEntry(
+                "application ID must name a nonempty path component other than '.'".to_string(),
+            ));
+        }
+        if application_id.contains("..")
+            || application_id.contains('/')
+            || application_id.contains('\\')
+            || application_id.contains('\0')
+        {
+            return Err(DictionaryError::InvalidEntry(
+                "application ID contains invalid characters".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Dictionaries are application-owned, never an index child.
+    pub fn for_application(data_dir: &Path, application_id: &str) -> Result<Self, DictionaryError> {
+        Self::validate_application_id(application_id)?;
+        if application_id == APPLICATIONS_DIR {
+            Self::validate_applications_directory(data_dir)?;
+        } else {
+            Self::reject_legacy_index_directory(&data_dir.join(application_id))?;
+        }
+        let applications = data_dir.join(APPLICATIONS_DIR);
+        let application = applications.join(application_id);
+        let dir = application.join(DICTIONARIES_DIR);
+        for path in [&applications, &application, &dir] {
+            match std::fs::symlink_metadata(path) {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "application storage must be a real directory: {}",
+                            path.display()
+                        ),
+                    )
+                    .into())
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(Self { dir })
+    }
+
+    /// Old index-shaped dictionary storage has no unambiguous application owner.
+    /// Never reinterpret, migrate or discard it during admission.
+    pub fn reject_legacy_index_directory(path: &Path) -> std::io::Result<()> {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_file() => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+            _ => {}
+        }
+        let legacy = path.join(DICTIONARIES_DIR);
+        match std::fs::symlink_metadata(&legacy) {
+            Ok(_) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                format!("unsupported legacy dictionary layout at {}; application dictionaries belong under .applications/<application-id>/.dictionaries; data was not moved or deleted", legacy.display()))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Validate the explicit application namespace, including obsolete layouts
+    /// whose application ID happened to be `.applications`.
+    fn validate_applications_directory(data_dir: &Path) -> std::io::Result<()> {
+        let applications = data_dir.join(APPLICATIONS_DIR);
+        match std::fs::symlink_metadata(&applications) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    ".applications must be a real directory",
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        for application in applications.read_dir()? {
+            let application = application?;
+            if !application.file_type()?.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "application storage must be a real directory: {}",
+                        application.path().display()
+                    ),
+                ));
+            }
+            for artifact in application.path().read_dir()? {
+                let artifact = artifact?;
+                if artifact.file_name() != DICTIONARIES_DIR || !artifact.file_type()?.is_dir() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                        format!("unsupported application storage layout at {}; expected .applications/<application-id>/.dictionaries; data was not moved or deleted", artifact.path().display())));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Read-only startup/inventory validation also catches obsolete reserved IDs.
+    pub fn validate_data_layout(data_dir: &Path) -> std::io::Result<()> {
+        Self::validate_applications_directory(data_dir)?;
+        let entries = match data_dir.read_dir() {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_name() != APPLICATIONS_DIR && entry.file_type()?.is_dir() {
+                Self::reject_legacy_index_directory(&entry.path())?;
+            }
+        }
+        Ok(())
     }
 
     fn file_path(&self, name: &str) -> PathBuf {
@@ -35,6 +152,18 @@ impl DictionaryStore {
 
     fn read_file(&self, name: &str) -> Result<Option<Vec<u8>>, DictionaryError> {
         let path = self.file_path(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "dictionary artifact must be a regular file",
+                )
+                .into())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
         match std::fs::read(&path) {
             Ok(data) => Ok(Some(data)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -48,7 +177,43 @@ impl DictionaryStore {
         value: &T,
     ) -> Result<(), DictionaryError> {
         let data = serde_json::to_vec_pretty(value)?;
+        std::fs::create_dir_all(&self.dir)?;
         crate::index::utils::atomic_write(&self.file_path(name), &data)?;
+        Ok(())
+    }
+
+    pub(crate) fn load_configuration(
+        &self,
+    ) -> Result<Option<super::manager::DictionarySnapshot>, DictionaryError> {
+        match self.read_file("configuration")? {
+            Some(data) => Ok(Some(serde_json::from_slice(&data)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn save_configuration(
+        &self,
+        configuration: &super::manager::DictionarySnapshot,
+    ) -> Result<(), DictionaryError> {
+        // Publish the application namespace entries as well as the leaf file.
+        // Read paths never create directories; retries resync existing parents.
+        let application = self
+            .dir
+            .parent()
+            .ok_or_else(|| std::io::Error::other("dictionary application parent missing"))?;
+        let applications = application
+            .parent()
+            .ok_or_else(|| std::io::Error::other("application namespace parent missing"))?;
+        for path in [applications, application, self.dir.as_path()] {
+            crate::index::utils::ensure_private_directory(path)?;
+        }
+        self.save_json("configuration", configuration)
+    }
+
+    pub(crate) fn reject_managed_mutation(&self) -> Result<(), DictionaryError> {
+        if self.load_configuration()?.is_some() {
+            return Err(DictionaryError::InvalidEntry("managed application configuration must be changed through its durable control-plane task".into()));
+        }
         Ok(())
     }
 
@@ -402,13 +567,30 @@ mod tests {
         );
     }
 
-    // ── For-tenant constructor ────────────────────────────────────────
+    // ── For-application constructor ────────────────────────────────────────
 
     #[test]
-    fn test_for_tenant_creates_dir() {
+    fn test_for_application_reads_are_pure_and_writes_create_reserved_dir() {
         let tmp = TempDir::new().unwrap();
-        let store = DictionaryStore::for_tenant(tmp.path(), "my-tenant").unwrap();
-        assert!(store.dir.exists());
-        assert!(store.dir.ends_with("my-tenant/.dictionaries"));
+        let store = DictionaryStore::for_application(tmp.path(), "my-tenant").unwrap();
+        assert!(!store.dir.exists());
+        assert_eq!(
+            store.load_settings().unwrap(),
+            DictionarySettings::default()
+        );
+        assert!(
+            !tmp.path().join(".applications").exists(),
+            "reading missing state must not create artifacts"
+        );
+        assert!(store.dir.ends_with(".applications/my-tenant/.dictionaries"));
+        store.save_settings(&DictionarySettings::default()).unwrap();
+        assert!(store.dir.join("settings.json").is_file());
+        assert_eq!(
+            DictionaryStore::for_application(tmp.path(), "my-tenant")
+                .unwrap()
+                .load_settings()
+                .unwrap(),
+            DictionarySettings::default()
+        );
     }
 }

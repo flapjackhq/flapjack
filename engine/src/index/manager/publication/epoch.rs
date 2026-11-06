@@ -256,6 +256,93 @@ pub fn read_publication_epoch(
     observe_publication_epoch(base, target).map(PublicationEpochObservation::value)
 }
 
+/// Establish durable epoch zero only for a newly owned, still-vacant namespace.
+/// Unknown preexisting residue is never reconstructed as an initial epoch.
+pub(super) fn initialize_vacant_target_epoch(
+    base: &Path,
+    target: &PublicationTarget,
+) -> Result<(), PublicationEpochError> {
+    let paths = publication_epoch_paths(base, target);
+    let live = base.join(target.as_str());
+    let root = base.join(PUBLICATION_DIR);
+    let namespace = root.join(target.as_str());
+    let at = |path: &Path, source| PublicationEpochError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    reject_epoch_managed_paths(base, &paths, &paths.lock)?;
+    reject_symlinked_managed_path_components(base, &live, "publication target")
+        .map_err(|error| at(&live, error))?;
+    match fs::symlink_metadata(&live) {
+        // A concurrent creator won. Its existing target is quiesced by the
+        // snapshot owner later; do not mint a vacancy certificate for it.
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(at(&live, error)),
+    }
+    let sync_namespace = || {
+        // Also complete a prior attempt whose epoch rename succeeded but a
+        // directory sync failed. Visible epoch bytes alone cannot acknowledge
+        // the durability of a newly created namespace on that retry.
+        for directory in [namespace.as_path(), root.as_path(), base] {
+            fsync_dir(directory).map_err(|error| at(directory, error))?;
+        }
+        Ok(())
+    };
+    let require_durable_epoch = || match observe_publication_epoch(base, target)? {
+        PublicationEpochObservation::Durable(_) => sync_namespace(),
+        _ => Err(PublicationEpochError::CorruptState {
+            path: namespace.clone(),
+        }),
+    };
+    match fs::symlink_metadata(&namespace) {
+        // Also avoids taking a second lock when a quiesced, explicitly deleted
+        // destination already has durable epoch evidence.
+        Ok(_) => return require_durable_epoch(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(at(&namespace, error)),
+    }
+
+    let pending = PublicationEpochPendingAdvance::register(paths.lock.clone());
+    wait_for_unfenced_publication_operations(&paths.lock);
+    fs::create_dir_all(&root).map_err(|error| at(&root, error))?;
+    match fs::create_dir(&namespace) {
+        Ok(()) => {}
+        // The pre-lock absence observation is not authority: only the atomic
+        // directory creator may establish zero. A racing initializer may need
+        // one retry; an unknown namespace stays refused.
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return require_durable_epoch()
+        }
+        Err(error) => return Err(at(&namespace, error)),
+    }
+    let _fence = PublicationAdmissionFence {
+        _lock: acquire_epoch_lock(base, &paths)?,
+        _pending_advance: pending,
+    };
+    reject_symlinked_managed_path_components(base, &live, "publication target")
+        .map_err(|error| at(&live, error))?;
+    match fs::symlink_metadata(&live) {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(at(&live, error)),
+    }
+    for entry in fs::read_dir(&namespace).map_err(|error| at(&namespace, error))? {
+        let entry = entry.map_err(|error| at(&namespace, error))?;
+        if entry.path() != paths.lock
+            || !entry
+                .file_type()
+                .map_err(|error| at(&entry.path(), error))?
+                .is_file()
+        {
+            return Err(PublicationEpochError::CorruptState { path: entry.path() });
+        }
+    }
+    persist_epoch(base, &paths, PublicationEpoch(0))?;
+    // Persist the newly created ancestors before allocating any transaction.
+    sync_namespace()
+}
+
 pub(crate) fn capture_publication_epoch(
     base: &Path,
     target: &PublicationTarget,
@@ -358,6 +445,45 @@ pub(crate) fn run_if_publication_admission_unfenced<T>(
     let paths = publication_epoch_paths(base, target);
     let _reservation = PublicationUnfencedOperation::try_register(paths.lock)?;
     Some(operation())
+}
+
+/// Hold an existing publication lock for a read-only observation. Never create
+/// sidecars from a scrape. Legacy targets without a lock have no safely fenced
+/// observation until an ordinary admission establishes one.
+pub(crate) fn try_lock_publication_observation(
+    base: &Path,
+    target: &PublicationTarget,
+) -> Result<Option<File>, PublicationEpochError> {
+    let paths = publication_epoch_paths(base, target);
+    reject_epoch_managed_paths(base, &paths, &paths.lock)?;
+    let io_error = |source| PublicationEpochError::Io {
+        path: paths.lock.clone(),
+        source,
+    };
+    run_publication_epoch_open_lock_file_checkpoint_for_test(&paths.lock);
+    let metadata = match fs::symlink_metadata(&paths.lock) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(error)),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(PublicationEpochError::CorruptState { path: paths.lock });
+    }
+    let file = File::open(&paths.lock).map_err(io_error)?;
+    if !file.metadata().map_err(io_error)?.is_file() {
+        return Err(PublicationEpochError::CorruptState { path: paths.lock });
+    }
+    // Only admission and the nonblocking lock acquisition share the registry
+    // critical section; filesystem observation must not stall other targets.
+    let registry = publication_admission_registry().0.lock().unwrap();
+    if registry.pending_advances.contains_key(&paths.lock) {
+        return Ok(None);
+    }
+    match file.try_lock_shared() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(io_error(error)),
+    }
 }
 
 pub fn compare_and_advance_publication_epoch(

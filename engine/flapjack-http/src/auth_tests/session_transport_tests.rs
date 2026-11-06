@@ -616,3 +616,88 @@ async fn logout_revokes_session_cookie_while_health_stays_public() {
     .await;
     assert_invalid_credentials(replay).await;
 }
+
+#[tokio::test]
+async fn managed_configuration_transport_refuses_dashboard_session_authority() {
+    let temp = TempDir::new().unwrap();
+    let keys = Arc::new(KeyStore::load_or_create(temp.path(), ADMIN_KEY));
+    let state = crate::test_helpers::TestStateBuilder::new(&temp)
+        .with_analytics()
+        .build_shared();
+    let app = crate::router::build_router(
+        state,
+        Some(keys),
+        flapjack::analytics::AnalyticsCollector::new(flapjack::analytics::AnalyticsConfig {
+            enabled: false,
+            data_dir: temp.path().join("analytics"),
+            flush_interval_secs: 60,
+            flush_size: 1000,
+            retention_days: 30,
+        }),
+        Arc::new(crate::middleware::TrustedProxyMatcher::from_optional_csv(None).unwrap()),
+        temp.path(),
+        crate::router::RouterConfig {
+            cors_mode: crate::startup::CorsMode::LoopbackOnly,
+            disable_dashboard: false,
+            replication_api_key: Some("configuration-peer-fixture".into()),
+            api_profile: crate::api_profile::ApiProfile::PaidBetaV5,
+        },
+    );
+    let exchange = exchange_session(&app).await;
+    assert_eq!(exchange.status(), StatusCode::OK);
+    let cookie = single_set_cookie(&exchange)
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    for (method, path) in [
+        (Method::GET, "/internal/application-configuration"),
+        (Method::POST, "/internal/application-configuration/prepare"),
+        (Method::PUT, "/internal/application-configuration"),
+    ] {
+        let response = send_request_with_headers(
+            &app,
+            method.clone(),
+            path,
+            Some(json!({})),
+            &[
+                ("x-algolia-application-id", "customer-a"),
+                ("cookie", &cookie),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path}: dashboard session is not node-admin transport authority"
+        );
+        let peer = send_request_with_headers(
+            &app,
+            method,
+            path,
+            Some(json!({})),
+            &[
+                ("x-algolia-application-id", "customer-a"),
+                ("x-algolia-api-key", "configuration-peer-fixture"),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(peer.status(), StatusCode::FORBIDDEN);
+    }
+    let admin = send_request_with_headers(
+        &app,
+        Method::GET,
+        "/internal/application-configuration",
+        None,
+        &[
+            ("x-algolia-application-id", "customer-a"),
+            ("x-algolia-api-key", ADMIN_KEY),
+        ],
+        None,
+    )
+    .await;
+    // Authorized, but this fixture has no installed configuration receipt.
+    assert_eq!(admin.status(), StatusCode::SERVICE_UNAVAILABLE);
+}

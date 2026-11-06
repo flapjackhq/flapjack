@@ -30,7 +30,8 @@ pub async fn search_single(
 struct ExtractedRequestContext {
     secured_restrictions: Option<crate::auth::SecuredKeyRestrictions>,
     api_key: Option<crate::auth::ApiKey>,
-    dictionary_lookup_tenant: Option<String>,
+    dictionary_application_id: Option<String>,
+    required_configuration: Option<crate::auth::RequiredApplicationConfiguration>,
     user_token_header: Option<String>,
     user_ip: Option<String>,
     session_id_header: Option<String>,
@@ -44,7 +45,7 @@ impl ExtractedRequestContext {
             .get::<crate::auth::SecuredKeyRestrictions>()
             .cloned();
         let api_key = request.extensions().get::<crate::auth::ApiKey>().cloned();
-        let dictionary_lookup_tenant = request
+        let dictionary_application_id = request
             .extensions()
             .get::<crate::auth::AuthenticatedAppId>()
             .map(|id| id.0.clone());
@@ -52,7 +53,11 @@ impl ExtractedRequestContext {
         Self {
             secured_restrictions,
             api_key,
-            dictionary_lookup_tenant,
+            dictionary_application_id,
+            required_configuration: request
+                .extensions()
+                .get::<crate::auth::RequiredApplicationConfiguration>()
+                .copied(),
             user_token_header,
             user_ip,
             session_id_header,
@@ -113,13 +118,18 @@ pub async fn search(
         .map_err(|e| FlapjackError::InvalidQuery(format!("Invalid JSON: {}", e)))?;
     req.apply_params_string();
     ctx.apply_to(&mut req);
+    req.dictionary_snapshot = super::capture_required_configuration(
+        &state,
+        ctx.dictionary_application_id.as_deref(),
+        ctx.required_configuration,
+    )?;
     let Json(response) = search_single_with_secured_hits_per_page_cap(
         State(state),
         index_name,
         req,
         ctx.hits_cap(),
         ctx.can_see_unretrievable(),
-        ctx.dictionary_lookup_tenant,
+        ctx.dictionary_application_id,
     )
     .await?;
 
@@ -162,13 +172,18 @@ pub async fn search_get(
     };
     req.apply_params_string();
     ctx.apply_to(&mut req);
+    req.dictionary_snapshot = super::capture_required_configuration(
+        &state,
+        ctx.dictionary_application_id.as_deref(),
+        ctx.required_configuration,
+    )?;
     let mut response = search_single_with_secured_hits_per_page_cap(
         State(state),
         index_name,
         req,
         ctx.hits_cap(),
         ctx.can_see_unretrievable(),
-        ctx.dictionary_lookup_tenant,
+        ctx.dictionary_application_id,
     )
     .await?
     .0;

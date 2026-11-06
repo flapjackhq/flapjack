@@ -75,7 +75,8 @@ pub fn classify_request(method: &Method, path: &str) -> Option<RequestKind> {
 
     match (method, first_segment) {
         // Search operations
-        (&Method::POST, "query") | (&Method::POST, "queries") => Some(RequestKind::Search),
+        (&Method::POST, "query") => Some(RequestKind::Search),
+        (&Method::POST, "facets") if suffix.ends_with("/query") => Some(RequestKind::Search),
 
         // Read operations
         (&Method::POST, "objects") | (&Method::POST, "browse") => Some(RequestKind::Read),
@@ -101,6 +102,12 @@ pub async fn usage_counting_layer(
     let method = request.method().clone();
 
     if let Some(index_name) = extract_index_name(&path) {
+        // Batch paths are envelopes; the handler counts executed physical-index
+        // operands. Do not create an envelope entry or attribute its bytes.
+        if method == Method::POST && path == format!("/1/indexes/{index_name}/queries") {
+            return next.run(request).await;
+        }
+
         let content_length: u64 = request
             .headers()
             .get("content-length")
@@ -135,3 +142,7 @@ pub async fn usage_counting_layer(
 #[cfg(test)]
 #[path = "usage_middleware_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "usage_batch_tests.rs"]
+mod batch_tests;

@@ -14,7 +14,16 @@ pub(crate) fn visible_tenant_dir_name(entry: &std::fs::DirEntry) -> Option<Strin
 fn try_visible_tenant_dir_name(
     entry: &std::fs::DirEntry,
 ) -> Result<Option<String>, std::io::Error> {
-    let is_directory = entry.file_type()?.is_dir();
+    let kind = entry.file_type()?;
+    if kind.is_symlink()
+        && visible_tenant_name_if_visible_directory(entry.file_name(), true).is_some()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "index directory must not be a symlink",
+        ));
+    }
+    let is_directory = kind.is_dir();
     Ok(visible_tenant_name_if_visible_directory(
         entry.file_name(),
         is_directory,
@@ -59,6 +68,9 @@ fn utf8_directory_name(name: std::ffi::OsString, is_directory: bool) -> Option<S
 }
 
 pub(crate) fn visible_tenant_dir_names(data_path: &Path) -> Result<Vec<String>, std::io::Error> {
+    flapjack::dictionaries::persistence::DictionaryStore::validate_data_layout(data_path)?;
+    flapjack::personalization::PersonalizationProfileStore::validate_data_layout(data_path)
+        .map_err(std::io::Error::other)?;
     collect_visible_tenant_dir_names(data_path.read_dir()?)
 }
 

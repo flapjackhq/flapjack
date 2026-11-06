@@ -426,6 +426,8 @@ start_server() {
     FLAPJACK_ADVERTISE_ADDR=https://dashboard-e2e.invalid:7700 \
     FLAPJACK_REPLICATION_API_KEY="$FJ_TEST_ADMIN_KEY" \
     FLAPJACK_AI_ALLOW_LOCAL_URLS=1 \
+    FJ_ENABLE_MEILISEARCH_PREVIEW_LOOPBACK=1 \
+    FJ_ENABLE_TYPESENSE_PREVIEW_LOOPBACK=1 \
     "$ENGINE_DIR/target/debug/flapjack" --data-dir "$FJ_TMP_DIR" --port "$FJ_BACKEND_PORT" &
   FJ_PID=$!
 
@@ -451,24 +453,36 @@ start_server() {
 }
 
 stop_server() {
+  local status=0
   if [ -n "$FJ_PID" ]; then
     kill "$FJ_PID" 2>/dev/null || true
-    wait "$FJ_PID" 2>/dev/null || true
+    wait "$FJ_PID" 2>/dev/null || status=$?
     FJ_PID=""
+    if [ "$status" -ne 0 ]; then
+      error "Server shutdown failed with status $status"
+    fi
   fi
   if [ -n "$FJ_TMP_DIR" ]; then
-    rm -rf "$FJ_TMP_DIR"
+    rm -rf "$FJ_TMP_DIR" || return $?
     FJ_TMP_DIR=""
   fi
+  return "$status"
 }
 
 cleanup() {
-  stop_server
+  local status="$1"
+  local shutdown_status=0
+  stop_server || shutdown_status=$?
   _ui_cleanup
+  # Keep the original test failure/cancellation while still reporting stop errors.
+  if [ "$status" -ne 0 ]; then
+    return "$status"
+  fi
+  return "$shutdown_status"
 }
-trap cleanup EXIT
-trap 'cleanup; exit 130' INT
-trap 'cleanup; exit 143' TERM
+trap 'cleanup "$?"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Track whether the shared server process is already running.
 SERVER_STARTED=false
@@ -565,6 +579,7 @@ fi
 # ── Rust unit tests ───────────────────────────────────────────────────────────
 
 if [ "$RUN_UNIT" = "true" ]; then
+  python3 "$ENGINE_DIR/tests/test_runner_shutdown.py"
   next_step "Rust: library tests (core in-process, HTTP process-isolated)"
   cd "$ENGINE_DIR"
   ensure_dashboard_dist
@@ -772,4 +787,5 @@ fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 
+stop_server
 done_banner "All tests passed!" "$(timer_elapsed)"

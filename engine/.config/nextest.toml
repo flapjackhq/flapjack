@@ -26,3 +26,5 @@ default-filter = "binary(test_smoke)"
 
 [profile.ci]
 default-filter = "all()"
+# Integration tests also discover this sibling binary by its conventional path.
+archive.include = [{ path = "debug/flapjack", relative-to = "target", on-missing = "error" }]

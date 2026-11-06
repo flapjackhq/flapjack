@@ -508,9 +508,13 @@ fn prepare_recommendations<'a>(
     let mut prepared = Vec::with_capacity(requests.len());
     for request in requests {
         let target_index = resolve_recommend_data_index(state, &request.index_name);
-        // Event storage can outlive an index. Resolve through the live index owner
-        // before querying analytics so deleted targets cannot return stale hits.
-        state.manager.get_or_load(&target_index)?;
+        // Event storage can outlive an index. Resolve analytics-backed models
+        // through the live index owner so deleted targets cannot return stale
+        // hits. Looking-similar owns its missing-index-as-empty behavior in the
+        // compute path and does not query analytics.
+        if request.model != "looking-similar" {
+            state.manager.get_or_load(&target_index)?;
+        }
         prepared.push((request, target_index));
     }
     Ok(prepared)

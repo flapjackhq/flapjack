@@ -7,9 +7,9 @@
 
 use axum::http::Method;
 
-pub(crate) const MOUNTED_INTERNAL_ROUTE_COUNT: usize = 28;
+pub(crate) const MOUNTED_INTERNAL_ROUTE_COUNT: usize = 31;
 pub(crate) const PEER_ALLOWED_ROUTE_COUNT: usize = 8;
-pub(crate) const ADMIN_ONLY_ROUTE_COUNT: usize = 20;
+pub(crate) const ADMIN_ONLY_ROUTE_COUNT: usize = 23;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InternalRouteTier {
@@ -33,6 +33,31 @@ pub(crate) struct InternalRouteRow {
 }
 
 pub(crate) const INTERNAL_ROUTE_CONTRACT: &[InternalRouteRow] = &[
+    InternalRouteRow {
+        method: Method::GET,
+        mounted_pattern: "/internal/application-configuration",
+        specimen_path: "/internal/application-configuration",
+        tier: InternalRouteTier::AdminOnly,
+        high_risk_mutation: false,
+        rationale: "reads installed customer configuration receipt; not replication peer state",
+    },
+    InternalRouteRow {
+        method: Method::PUT,
+        mounted_pattern: "/internal/application-configuration",
+        specimen_path: "/internal/application-configuration",
+        tier: InternalRouteTier::AdminOnly,
+        high_risk_mutation: false,
+        rationale:
+            "installs canonical customer configuration under node-admin publication authority",
+    },
+    InternalRouteRow {
+        method: Method::POST,
+        mounted_pattern: "/internal/application-configuration/prepare",
+        specimen_path: "/internal/application-configuration/prepare",
+        tier: InternalRouteTier::AdminOnly,
+        high_risk_mutation: false,
+        rationale: "validates customer configuration without activation; exact node-admin only",
+    },
     InternalRouteRow {
         method: Method::GET,
         mounted_pattern: "/internal/status",

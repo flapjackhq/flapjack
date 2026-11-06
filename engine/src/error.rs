@@ -67,6 +67,9 @@ pub enum FlapjackError {
     #[error("Write acknowledgment timed out")]
     WriteAckTimeout,
 
+    #[error("Application configuration unavailable: {0}")]
+    ApplicationConfigurationUnavailable(String),
+
     #[error("IO error: {0}")]
     Io(String),
 
@@ -204,6 +207,9 @@ impl FlapjackError {
             FlapjackError::ObjectNotFound => StatusCode::NOT_FOUND,
             FlapjackError::QueueFull => StatusCode::TOO_MANY_REQUESTS,
             FlapjackError::WriteAckTimeout => StatusCode::SERVICE_UNAVAILABLE,
+            FlapjackError::ApplicationConfigurationUnavailable(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             FlapjackError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             FlapjackError::Tantivy(_) => StatusCode::INTERNAL_SERVER_ERROR,
             FlapjackError::QueryParse(_) => StatusCode::BAD_REQUEST,
@@ -227,6 +233,7 @@ impl FlapjackError {
         match self {
             FlapjackError::MemoryPressure { .. } => Some(Duration::from_secs(5)),
             FlapjackError::IndexPaused(_)
+            | FlapjackError::ApplicationConfigurationUnavailable(_)
             | FlapjackError::QueueFull
             | FlapjackError::TooManyConcurrentWrites { .. }
             | FlapjackError::WriteAckTimeout => Some(Duration::from_secs(1)),
@@ -858,6 +865,9 @@ impl FlapjackError {
                 "Server under memory pressure, retry later".to_string()
             }
             FlapjackError::IndexPaused(_) => "Index is temporarily unavailable".to_string(),
+            FlapjackError::ApplicationConfigurationUnavailable(_) => {
+                "Application configuration is temporarily unavailable".into()
+            }
             FlapjackError::Forbidden(msg) => msg.clone(),
             // Internal errors — sanitized, no details leaked
             FlapjackError::Io(_)

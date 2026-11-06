@@ -1,8 +1,10 @@
-//! Provides the DictionaryManager, the single entry point for all dictionary operations including batch mutations, search, settings, and per-language counts across a multi-tenant data directory.
+//! Provides the DictionaryManager, the single entry point for all dictionary operations including batch mutations, search, settings, and per-language counts across applications.
 
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::persistence::DictionaryStore;
 use super::{
@@ -14,14 +16,19 @@ use super::{
 mod batch;
 mod effective;
 mod search;
+mod snapshot;
+pub use snapshot::{DictionaryCommand, DictionarySnapshot};
 
 /// Application-level dictionary manager.
 ///
-/// In a multi-tenant setup, dictionaries are per-tenant. The manager uses the
-/// data directory root and resolves per-tenant stores on demand.
+/// In a multi-tenant setup, dictionaries are per-application. The manager uses the
+/// data directory root and resolves per-application stores on demand.
+/// Concurrent writers for a data root must share this manager (normally via Arc).
+/// Mutation locks do not coordinate independent managers or other processes.
 pub struct DictionaryManager {
     data_dir: PathBuf,
     next_task_id: AtomicI64,
+    mutation_locks: DashMap<String, Arc<Mutex<()>>>,
 }
 
 impl DictionaryManager {
@@ -29,31 +36,26 @@ impl DictionaryManager {
         Self {
             data_dir: data_dir.to_path_buf(),
             next_task_id: AtomicI64::new(1),
+            mutation_locks: DashMap::new(),
         }
     }
 
-    fn store_for(&self, tenant_id: &str) -> Result<DictionaryStore, DictionaryError> {
-        Self::validate_tenant_id(tenant_id)?;
-        DictionaryStore::for_tenant(&self.data_dir, tenant_id)
+    fn store_for(&self, application_id: &str) -> Result<DictionaryStore, DictionaryError> {
+        DictionaryStore::for_application(&self.data_dir, application_id)
     }
 
-    /// Reject tenant IDs that could cause path traversal or filesystem issues.
-    fn validate_tenant_id(tenant_id: &str) -> Result<(), DictionaryError> {
-        if tenant_id.is_empty() {
-            return Err(DictionaryError::InvalidEntry(
-                "tenant ID must not be empty".to_string(),
-            ));
+    fn mutation_lock(&self, application_id: &str) -> Arc<Mutex<()>> {
+        let lock = self
+            .mutation_locks
+            .entry(application_id.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        // Test-only scheduling observes contention without holding a DashMap guard.
+        #[cfg(test)]
+        if matches!(lock.try_lock(), Err(std::sync::TryLockError::WouldBlock)) {
+            concurrency_tests::after_batch_read();
         }
-        if tenant_id.contains("..")
-            || tenant_id.contains('/')
-            || tenant_id.contains('\\')
-            || tenant_id.contains('\0')
-        {
-            return Err(DictionaryError::InvalidEntry(
-                "tenant ID contains invalid characters".to_string(),
-            ));
-        }
-        Ok(())
+        lock
     }
 
     fn make_mutation_response(&self) -> MutationResponse {
@@ -82,20 +84,39 @@ impl DictionaryManager {
 
     // ── Settings ──────────────────────────────────────────────────────
 
-    pub fn get_settings(&self, tenant_id: &str) -> Result<DictionarySettings, DictionaryError> {
-        self.store_for(tenant_id)?.load_settings()
+    pub fn get_settings(
+        &self,
+        application_id: &str,
+    ) -> Result<DictionarySettings, DictionaryError> {
+        Ok(self.snapshot(application_id)?.settings)
     }
 
-    /// Persist dictionary settings for a tenant, normalizing all language codes.
+    /// Persist dictionary settings for an application, normalizing all language codes.
     ///
     /// # Returns
     ///
     /// A `MutationResponse` with a monotonically increasing task ID and an RFC 3339 timestamp.
     pub fn set_settings(
         &self,
-        tenant_id: &str,
+        application_id: &str,
         settings: &DictionarySettings,
     ) -> Result<MutationResponse, DictionaryError> {
+        let normalized = self.normalize_settings(settings)?;
+
+        let store = self.store_for(application_id)?;
+        let lock = self.mutation_lock(application_id);
+        let _guard = lock
+            .lock()
+            .map_err(|_| std::io::Error::other("dictionary mutation lock poisoned"))?;
+        store.reject_managed_mutation()?;
+        store.save_settings(&normalized)?;
+        Ok(self.make_mutation_response())
+    }
+
+    pub(super) fn normalize_settings(
+        &self,
+        settings: &DictionarySettings,
+    ) -> Result<DictionarySettings, DictionaryError> {
         let mut normalized = DictionarySettings::default();
         for (dict_name, language_map) in &settings.disable_standard_entries {
             let normalized_map = normalized
@@ -108,8 +129,7 @@ impl DictionaryManager {
             }
         }
 
-        self.store_for(tenant_id)?.save_settings(&normalized)?;
-        Ok(self.make_mutation_response())
+        Ok(normalized)
     }
 
     // ── Languages ─────────────────────────────────────────────────────
@@ -117,10 +137,50 @@ impl DictionaryManager {
     /// Returns per-language custom entry counts across all dictionary types.
     pub fn list_languages(
         &self,
-        tenant_id: &str,
+        application_id: &str,
     ) -> Result<HashMap<String, LanguageDictionaryCounts>, DictionaryError> {
-        let store = self.store_for(tenant_id)?;
-        let counts = store.count_entries_by_language()?;
+        self.list_languages_snapshot(&self.snapshot(application_id)?)
+    }
+
+    pub fn list_languages_snapshot(
+        &self,
+        snapshot: &DictionarySnapshot,
+    ) -> Result<HashMap<String, LanguageDictionaryCounts>, DictionaryError> {
+        let mut counts: HashMap<String, HashMap<DictionaryName, usize>> = HashMap::new();
+        for (name, languages) in [
+            (
+                DictionaryName::Stopwords,
+                snapshot
+                    .stopwords
+                    .iter()
+                    .map(|e| &e.language)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                DictionaryName::Plurals,
+                snapshot
+                    .plurals
+                    .iter()
+                    .map(|e| &e.language)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                DictionaryName::Compounds,
+                snapshot
+                    .compounds
+                    .iter()
+                    .map(|e| &e.language)
+                    .collect::<Vec<_>>(),
+            ),
+        ] {
+            for language in languages {
+                *counts
+                    .entry(language.clone())
+                    .or_default()
+                    .entry(name)
+                    .or_default() += 1;
+            }
+        }
 
         let mut result = HashMap::new();
         for (lang, type_counts) in counts {
@@ -151,3 +211,9 @@ impl DictionaryManager {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod concurrency_tests;
+
+#[cfg(test)]
+mod configuration_tests;

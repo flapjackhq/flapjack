@@ -11,6 +11,11 @@ pub(super) type FacetResultCache = (
 
 pub(super) type OptionalFilterGroup = Vec<(String, String, f32)>;
 
+pub(super) struct QueryRuleCount {
+    pub total: usize,
+    pub matched_rule_ids: HashSet<String>,
+}
+
 /// Prepared filter/query state that feeds the main Tantivy execution phase.
 pub(in crate::index::manager) struct PreparedSearchFilters {
     pub effective_params: EffectiveSearchParams,
@@ -30,6 +35,7 @@ pub(in crate::index::manager) struct PreparedSearchFilters {
 /// to the index, searcher, parser, filters, facet requests, and split-alternative
 /// settings to avoid threading individual parameters.
 pub(super) struct ExpandedQueryExecutionContext<'a> {
+    pub rule_count_ids: &'a [String],
     pub manager: &'a super::super::IndexManager,
     pub index: &'a Arc<Index>,
     pub searcher: &'a tantivy::Searcher,
@@ -100,7 +106,7 @@ pub(super) fn execute_expanded_queries(
     context: &ExpandedQueryExecutionContext<'_>,
 ) -> Result<(
     Vec<crate::types::ScoredDocument>,
-    Vec<usize>,
+    Vec<QueryRuleCount>,
     Option<FacetResultCache>,
 )> {
     let mut all_results = Vec::new();
@@ -110,7 +116,7 @@ pub(super) fn execute_expanded_queries(
     let mut query_idx = 0;
 
     while query_idx < expanded_queries.len() {
-        let result = execute_single_expanded_query(
+        let (result, matched_rule_ids) = execute_single_expanded_query(
             &expanded_queries[query_idx],
             query_idx,
             facet_result.is_some(),
@@ -134,7 +140,10 @@ pub(super) fn execute_expanded_queries(
             ));
         }
 
-        query_totals.push(result.total);
+        query_totals.push(QueryRuleCount {
+            total: result.total,
+            matched_rule_ids,
+        });
         for doc in result.documents {
             if seen_ids.insert(doc.document.id.clone()) {
                 all_results.push(doc);
@@ -175,7 +184,7 @@ fn execute_single_expanded_query(
     query_idx: usize,
     has_cached_facets: bool,
     context: &ExpandedQueryExecutionContext<'_>,
-) -> Result<crate::types::SearchResult> {
+) -> Result<(crate::types::SearchResult, HashSet<String>)> {
     let tq0 = std::time::Instant::now();
     let query = crate::types::Query {
         text: expanded_query.to_string(),
@@ -201,7 +210,7 @@ fn execute_single_expanded_query(
         None
     };
 
-    let result = executor.execute_with_facets_and_optional_boosts(
+    let result = executor.execute_with_rule_membership(
         context.searcher,
         parsed_query,
         context.effective_filter,
@@ -218,6 +227,7 @@ fn execute_single_expanded_query(
             },
         },
         &optional_boosts,
+        context.rule_count_ids,
     )?;
     let report = executor.phase_report();
     tracing::debug!(

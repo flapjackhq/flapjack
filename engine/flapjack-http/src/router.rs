@@ -54,7 +54,6 @@ use crate::openapi::documented_openapi;
 use crate::security_sources::SecuritySourcesMatcher;
 use crate::startup::CorsMode;
 use flapjack::analytics::AnalyticsCollector;
-use utoipa_swagger_ui::SwaggerUi;
 
 pub struct RouterConfig {
     pub cors_mode: CorsMode,
@@ -193,12 +192,9 @@ fn build_router_with_resource_bounds(
     let app = if config.disable_dashboard {
         app
     } else {
-        app.merge(
-            SwaggerUi::new("/swagger-ui")
-                .url("/api-docs/openapi.json", documented_openapi(auth_enabled)),
-        )
-        .route("/dashboard/", get(dashboard_handler))
-        .nest("/dashboard", Router::new().fallback(get(dashboard_handler)))
+        app.merge(build_swagger_routes(auth_enabled))
+            .route("/dashboard/", get(dashboard_handler))
+            .nest("/dashboard", Router::new().fallback(get(dashboard_handler)))
     };
 
     apply_middleware(
@@ -209,6 +205,44 @@ fn build_router_with_resource_bounds(
         &config,
         resource_bounds,
     )
+}
+
+// Use Swagger's framework-independent asset server: its Axum adapter now targets
+// Axum 0.8, while the application's public HTTP contract remains on Axum 0.7.
+fn build_swagger_routes(auth_enabled: bool) -> Router {
+    let openapi = documented_openapi(auth_enabled);
+    let config = Arc::new(utoipa_swagger_ui::Config::new(["/api-docs/openapi.json"]));
+    let assets = get(serve_swagger_asset).layer(Extension(config));
+    Router::new()
+        .route(
+            "/api-docs/openapi.json",
+            get(move || async move { axum::Json(openapi) }),
+        )
+        .route(
+            "/swagger-ui",
+            get(|| async { axum::response::Redirect::to("/swagger-ui/") }),
+        )
+        .route("/swagger-ui/", assets.clone())
+        .route("/swagger-ui/*rest", assets)
+}
+
+async fn serve_swagger_asset(
+    path: Option<axum::extract::Path<String>>,
+    Extension(config): Extension<Arc<utoipa_swagger_ui::Config<'static>>>,
+) -> Response {
+    let path = path.as_ref().map(|path| path.0.as_str()).unwrap_or("");
+    match utoipa_swagger_ui::serve(path, config) {
+        Ok(Some(file)) => (
+            [(header::CONTENT_TYPE, file.content_type)],
+            file.bytes.into_owned(),
+        )
+            .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "Failed to serve Swagger asset");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// The credential owners the auth layer needs, held together so the layer can never be
@@ -596,6 +630,15 @@ fn build_internal_routes(
     let internal_routes = if auth_enabled {
         // Auth mode: expose all internal routes plus admin key rotation.
         let admin_internal_routes = Router::new()
+            .route(
+                "/internal/application-configuration/prepare",
+                post(handlers::dictionary_configuration::prepare),
+            )
+            .route(
+                "/internal/application-configuration",
+                get(handlers::dictionary_configuration::current)
+                    .put(handlers::dictionary_configuration::install),
+            )
             .route("/internal/cluster/peers", post(internal::add_cluster_peer))
             .route(
                 "/internal/build-info",
@@ -1026,7 +1069,7 @@ pub(crate) fn app_id_layer(app: Router) -> Router {
             if request.extensions().get::<AuthenticatedAppId>().is_none() {
                 // Dictionaries still need a tenant key in open mode, where auth is intentionally skipped.
                 let application_id = request_application_id(&request).unwrap_or_else(|| {
-                    flapjack::dictionaries::DEFAULT_DICTIONARY_TENANT.to_string()
+                    flapjack::dictionaries::DEFAULT_DICTIONARY_APPLICATION_ID.to_string()
                 });
                 request
                     .extensions_mut()

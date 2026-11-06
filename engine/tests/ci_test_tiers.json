@@ -17,7 +17,11 @@
     ".github/workflows/nightly.yml#check-repo",
     ".github/workflows/nightly.yml#build-server",
     ".github/workflows/nightly.yml#nightly-summary",
-    ".github/workflows/union.yml#check-repo"
+    ".github/workflows/union.yml#check-repo",
+    ".github/workflows/private-ci.yml#rust-all",
+    ".github/workflows/ci-red.yml#record",
+    ".github/workflows/ci.yml#rust-validation",
+    ".github/workflows/ci.yml#validation-status"
   ],
   "classes": [
     {
@@ -25,7 +29,8 @@
       "minimum_tier": "public_fast",
       "owner_jobs": [
         ".github/workflows/ci.yml#fmt",
-        ".github/workflows/ci.yml#clippy"
+        ".github/workflows/ci.yml#clippy",
+        ".github/workflows/nightly.yml#rust-style"
       ],
       "required_fragments": ["cargo fmt --all --check", "cargo clippy"]
     },
@@ -35,7 +40,8 @@
       "owner_jobs": [".github/workflows/ci.yml#release-contracts"],
       "required_fragments": [
         "python3 engine/tests/test_ci_test_tiers.py --verify",
-        "python3 engine/tests/test_extract_candidate_binary.py"
+        "python3 engine/tests/test_extract_candidate_binary.py",
+        "bash engine/tests/ci_test_timeout_cap_acceptance.sh"
       ],
       "risks": ["test_harness_integrity"]
     },
@@ -56,14 +62,20 @@
       "minimum_tier": "public_complete",
       "owner_jobs": [
         ".github/workflows/ci.yml#rust-tests-all",
-        ".github/workflows/nightly.yml#rust-all-tests"
+        ".github/workflows/nightly.yml#rust-all-tests",
+        ".github/workflows/rust-tests.yml#build",
+        ".github/workflows/rust-tests.yml#test"
       ],
       "required_fragments": [
-        "cargo nextest run -p flapjack -p flapjack-http --features vector-search -P ci --no-fail-fast",
-        "cargo nextest run -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci --no-fail-fast",
-        "cargo nextest run -P ci"
+        "cargo nextest archive --config-file \"$RUNNER_TEMP/nextest.toml\" --locked -p flapjack -p flapjack-http --features vector-search -P ci",
+        "cargo nextest archive --config-file \"$RUNNER_TEMP/nextest.toml\" --locked -p flapjack-server -p flapjack-ssl -p flapjack-replication -P ci",
+        "cargo nextest archive --config-file \"$RUNNER_TEMP/nextest.toml\" --locked --workspace -P ci",
+        "cargo nextest run --config-file \"$RUNNER_TEMP/nextest.toml\" -P ci --no-fail-fast"
       ],
-      "risks": ["vector_isolation", "process_global_isolation"]
+      "risks": [
+        "vector_isolation",
+        "process_global_isolation"
+      ]
     },
     {
       "id": "integration_smoke",
@@ -169,9 +181,11 @@
       "owner_jobs": [".github/workflows/docker.yml#docker"],
       "required_fragments": ["docker/build-push-action@v6", "engine/Dockerfile"],
       "risks": ["release"]
-    }
+    },
+    {"id": "private_candidate", "minimum_tier": "candidate", "owner_jobs": [".github/workflows/private-ci.yml#check"], "required_fragments": ["name: Private candidate gate", "cargo test -p flapjack --lib --no-run", "timeout --kill-after=60s 300s", "bash engine/tests/ci_test_timeout_cap_acceptance.sh"], "risks": ["core_search_index", "durability", "test_harness_integrity"]}
   ],
   "ignored_tests": [
+    {"source": "engine/flapjack-replication/src/config_bootstrap_tests.rs", "name": "managed_fleet_ha_provisioning_fixture_verdict", "minimum_tier": "manual_evidence"},
     {"source": "engine/src/integ_tests/test_perf.rs", "name": "facet_p95_meets_frozen_per_query_gate_on_local_standard_specimen_very_slow", "minimum_tier": "manual_evidence"},
     {"source": "engine/src/integ_tests/test_perf.rs", "name": "result_cache_disabled_still_meets_scale_gate_very_slow", "minimum_tier": "manual_evidence"},
     {"source": "engine/src/integ_tests/test_perf.rs", "name": "local_standard_specimen_calibration_curve_very_slow", "minimum_tier": "manual_evidence"},

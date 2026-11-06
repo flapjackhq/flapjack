@@ -47,13 +47,35 @@ impl super::IndexManager {
         opts: &SearchOptions<'_>,
     ) -> Result<SearchResult> {
         let resolved = self.resolve_search_settings(tenant_id, opts.settings_override)?;
-        let dictionary_tenant_id = opts.dictionary_lookup_tenant.unwrap_or(tenant_id);
+        let application_id = opts
+            .dictionary_application_id
+            .unwrap_or(crate::dictionaries::DEFAULT_DICTIONARY_APPLICATION_ID);
+        let captured = if opts.dictionary_snapshot.is_none() {
+            self.dictionary_manager()
+                .map(|manager| manager.snapshot(application_id))
+                .transpose()
+                .map_err(|error| {
+                    FlapjackError::ApplicationConfigurationUnavailable(error.to_string())
+                })?
+        } else {
+            None
+        };
+        let pinned = SearchOptions {
+            dictionary_snapshot: opts.dictionary_snapshot.or(captured.as_ref()),
+            ..*opts
+        };
+        let opts = &pinned;
+        if let Some(snapshot) = opts.dictionary_snapshot {
+            snapshot
+                .require_application(application_id)
+                .map_err(|error| FlapjackError::Io(error.to_string()))?;
+        }
         let preprocessed = search_phases::preprocess_query(
-            dictionary_tenant_id,
+            application_id,
             &resolved.settings,
             query_text,
             opts,
-            self.dictionary_manager(),
+            opts.dictionary_snapshot,
         );
         let normalized_query = preprocessed.query_text_stopped.as_str();
 

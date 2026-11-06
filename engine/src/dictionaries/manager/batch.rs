@@ -4,12 +4,19 @@ impl DictionaryManager {
     /// Execute a batch of dictionary mutations for the given tenant + dictionary type.
     pub fn batch(
         &self,
-        tenant_id: &str,
+        application_id: &str,
         dict_name: DictionaryName,
         request: &BatchDictionaryRequest,
     ) -> Result<MutationResponse, DictionaryError> {
-        let store = self.store_for(tenant_id)?;
+        let store = self.store_for(application_id)?;
+        // Hold through load, full batch validation, atomic publication and acknowledgement.
+        // Other applications have independent locks and can continue writing.
+        let lock = self.mutation_lock(application_id);
+        let _guard = lock
+            .lock()
+            .map_err(|_| std::io::Error::other("dictionary mutation lock poisoned"))?;
 
+        store.reject_managed_mutation()?;
         match dict_name {
             DictionaryName::Stopwords => self.batch_stopwords(&store, request)?,
             DictionaryName::Plurals => self.batch_plurals(&store, request)?,
@@ -27,11 +34,22 @@ impl DictionaryManager {
         store: &DictionaryStore,
         request: &BatchDictionaryRequest,
     ) -> Result<(), DictionaryError> {
-        let mut entries = if request.clear_existing_dictionary_entries {
-            Vec::new()
-        } else {
-            store.load_stopwords()?
-        };
+        let mut entries = store.load_stopwords()?;
+        self.apply_stopwords(&mut entries, request)?;
+        store.save_stopwords(&entries)
+    }
+
+    pub(super) fn apply_stopwords(
+        &self,
+        entries: &mut Vec<StopwordEntry>,
+        request: &BatchDictionaryRequest,
+    ) -> Result<(), DictionaryError> {
+        if request.clear_existing_dictionary_entries {
+            entries.clear();
+        }
+
+        #[cfg(test)]
+        super::concurrency_tests::after_batch_read();
 
         for req in &request.requests {
             self.validate_object_id(&req.body)?;
@@ -51,7 +69,7 @@ impl DictionaryManager {
             }
         }
 
-        store.save_stopwords(&entries)
+        Ok(())
     }
 
     /// Apply a batch of plural-set mutations (add/upsert/delete) to the given store.
@@ -62,11 +80,22 @@ impl DictionaryManager {
         store: &DictionaryStore,
         request: &BatchDictionaryRequest,
     ) -> Result<(), DictionaryError> {
-        let mut entries = if request.clear_existing_dictionary_entries {
-            Vec::new()
-        } else {
-            store.load_plurals()?
-        };
+        let mut entries = store.load_plurals()?;
+        self.apply_plurals(&mut entries, request)?;
+        store.save_plurals(&entries)
+    }
+
+    pub(super) fn apply_plurals(
+        &self,
+        entries: &mut Vec<PluralEntry>,
+        request: &BatchDictionaryRequest,
+    ) -> Result<(), DictionaryError> {
+        if request.clear_existing_dictionary_entries {
+            entries.clear();
+        }
+
+        #[cfg(test)]
+        super::concurrency_tests::after_batch_read();
 
         for req in &request.requests {
             self.validate_object_id(&req.body)?;
@@ -85,7 +114,7 @@ impl DictionaryManager {
             }
         }
 
-        store.save_plurals(&entries)
+        Ok(())
     }
 
     /// Apply a batch of compound-word mutations (add/upsert/delete) to the given store.
@@ -96,11 +125,22 @@ impl DictionaryManager {
         store: &DictionaryStore,
         request: &BatchDictionaryRequest,
     ) -> Result<(), DictionaryError> {
-        let mut entries = if request.clear_existing_dictionary_entries {
-            Vec::new()
-        } else {
-            store.load_compounds()?
-        };
+        let mut entries = store.load_compounds()?;
+        self.apply_compounds(&mut entries, request)?;
+        store.save_compounds(&entries)
+    }
+
+    pub(super) fn apply_compounds(
+        &self,
+        entries: &mut Vec<CompoundEntry>,
+        request: &BatchDictionaryRequest,
+    ) -> Result<(), DictionaryError> {
+        if request.clear_existing_dictionary_entries {
+            entries.clear();
+        }
+
+        #[cfg(test)]
+        super::concurrency_tests::after_batch_read();
 
         for req in &request.requests {
             self.validate_object_id(&req.body)?;
@@ -119,7 +159,7 @@ impl DictionaryManager {
             }
         }
 
-        store.save_compounds(&entries)
+        Ok(())
     }
 
     fn validate_object_id(&self, body: &serde_json::Value) -> Result<(), DictionaryError> {

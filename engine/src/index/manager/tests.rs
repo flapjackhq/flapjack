@@ -7587,6 +7587,7 @@ async fn test_custom_stopword_removes_term_from_query() {
             "t1",
             "alpha delta",
             &SearchOptions {
+                dictionary_application_id: Some("application-a"),
                 limit: 10,
                 remove_stop_words: Some(&crate::query::stopwords::RemoveStopWordsValue::All),
                 query_languages: Some(&en_langs),
@@ -7600,14 +7601,11 @@ async fn test_custom_stopword_removes_term_from_query() {
         "without custom stopword wiring, 'alpha delta' requires both terms and returns no hits"
     );
 
-    // Add "alpha" as a custom English stopword under the search tenant "t1".
-    // Also add conflicting "_default" stopword data so wrong-tenant lookup is observable.
-    // BUG (RED): The search path hardcodes DEFAULT_DICTIONARY_TENANT ("_default") in
-    // remove_stop_words_with_dictionary_manager (query.rs:295), so this lookup reads
-    // "_default" instead of tenant "t1" until Stage 3 threads tenant_id through preprocess_query.
+    // Add "alpha" as a custom English stopword for application-a, searching index t1.
+    // Also add conflicting "_default" stopword data so wrong-application lookup is observable.
     let dm = manager.dictionary_manager().unwrap();
     dm.batch(
-        "t1",
+        "application-a",
         crate::dictionaries::DictionaryName::Stopwords,
         &crate::dictionaries::BatchDictionaryRequest {
             clear_existing_dictionary_entries: false,
@@ -7625,7 +7623,7 @@ async fn test_custom_stopword_removes_term_from_query() {
     )
     .unwrap();
     dm.batch(
-        crate::dictionaries::DEFAULT_DICTIONARY_TENANT,
+        crate::dictionaries::DEFAULT_DICTIONARY_APPLICATION_ID,
         crate::dictionaries::DictionaryName::Stopwords,
         &crate::dictionaries::BatchDictionaryRequest {
             clear_existing_dictionary_entries: false,
@@ -7652,6 +7650,7 @@ async fn test_custom_stopword_removes_term_from_query() {
             "t1",
             "alpha delta",
             &SearchOptions {
+                dictionary_application_id: Some("application-a"),
                 limit: 10,
                 remove_stop_words: Some(&crate::query::stopwords::RemoveStopWordsValue::All),
                 query_languages: Some(&en_langs),
@@ -7661,7 +7660,7 @@ async fn test_custom_stopword_removes_term_from_query() {
         )
         .unwrap();
 
-    // Only d1 should match — tenant "t1" stopword "alpha" should be used.
+    // Only d1 should match — application-a stopword "alpha" should be used.
     // If "_default" leaks in, "delta" is removed instead and d2 matches.
     assert_eq!(
         result.total, 1,
@@ -7670,9 +7669,7 @@ async fn test_custom_stopword_removes_term_from_query() {
     assert_eq!(result.documents[0].document.id, "d1");
 }
 
-/// Regression: stopwords stored under `_default` must NOT bleed into tenant "t1" searches.
-/// Currently FAILS (RED) because `remove_stop_words_with_dictionary_manager` hardcodes
-/// `DEFAULT_DICTIONARY_TENANT`, causing `_default` entries to apply to ALL tenants.
+/// Regression: stopwords stored under `_default` must NOT bleed into application-a searches.
 #[tokio::test]
 async fn test_stopword_isolation_no_cross_tenant_bleed() {
     let tmp = TempDir::new().unwrap();
@@ -7715,11 +7712,11 @@ async fn test_stopword_isolation_no_cross_tenant_bleed() {
     ];
     manager.add_documents_sync("t2", t2_docs).await.unwrap();
 
-    // "t1" should remove "alpha", while "t2"/"_default" remove "delta".
+    // "application-a" should remove "alpha", while "application-b"/"_default" remove "delta".
     // A t1 search for "alpha delta" must therefore match d1 only.
     let dm = manager.dictionary_manager().unwrap();
     dm.batch(
-        "t1",
+        "application-a",
         crate::dictionaries::DictionaryName::Stopwords,
         &crate::dictionaries::BatchDictionaryRequest {
             clear_existing_dictionary_entries: false,
@@ -7737,7 +7734,7 @@ async fn test_stopword_isolation_no_cross_tenant_bleed() {
     )
     .unwrap();
     dm.batch(
-        "t2",
+        "application-b",
         crate::dictionaries::DictionaryName::Stopwords,
         &crate::dictionaries::BatchDictionaryRequest {
             clear_existing_dictionary_entries: false,
@@ -7755,7 +7752,7 @@ async fn test_stopword_isolation_no_cross_tenant_bleed() {
     )
     .unwrap();
     dm.batch(
-        crate::dictionaries::DEFAULT_DICTIONARY_TENANT,
+        crate::dictionaries::DEFAULT_DICTIONARY_APPLICATION_ID,
         crate::dictionaries::DictionaryName::Stopwords,
         &crate::dictionaries::BatchDictionaryRequest {
             clear_existing_dictionary_entries: false,
@@ -7779,6 +7776,7 @@ async fn test_stopword_isolation_no_cross_tenant_bleed() {
             "t1",
             "alpha delta",
             &SearchOptions {
+                dictionary_application_id: Some("application-a"),
                 limit: 10,
                 remove_stop_words: Some(&crate::query::stopwords::RemoveStopWordsValue::All),
                 query_languages: Some(&en_langs),
@@ -7788,11 +7786,11 @@ async fn test_stopword_isolation_no_cross_tenant_bleed() {
         )
         .unwrap();
 
-    // Tenant "t1" must use its own stopword set ("alpha"), so query becomes "delta"
-    // and returns d1. If "_default"/other-tenant data leaks in, "delta" is removed and d2 wins.
+    // Application-a must use its own stopword set ("alpha"), so query becomes "delta"
+    // and returns d1. If "_default"/other-application data leaks in, "delta" is removed and d2 wins.
     assert_eq!(
         result.total, 1,
-        "t1 search must route stopword lookup to t1 dictionary entries"
+        "index t1 search must use application-a stopwords"
     );
     assert_eq!(result.documents[0].document.id, "d1");
 }
@@ -7820,6 +7818,7 @@ async fn test_custom_plural_expands_query() {
             "t1",
             "cactus",
             &SearchOptions {
+                dictionary_application_id: Some("application-a"),
                 limit: 10,
                 ignore_plurals: Some(&crate::query::plurals::IgnorePluralsValue::All),
                 query_languages: Some(&en_langs),
@@ -7832,13 +7831,10 @@ async fn test_custom_plural_expands_query() {
         "without a custom plural entry, 'cactus' should not match 'cacti' here"
     );
 
-    // Add custom plural pair [cactus, cacti] under the search tenant "t1".
-    // BUG (RED): The search path hardcodes DEFAULT_DICTIONARY_TENANT ("_default") in
-    // build_plural_language_spec (search_phases.rs:1117), so this lookup will miss
-    // the tenant-scoped entry until Stage 3 threads tenant_id through preprocess_query.
+    // Add custom plural pair [cactus, cacti] for application-a, searching index t1.
     let dm = manager.dictionary_manager().unwrap();
     dm.batch(
-        "t1",
+        "application-a",
         crate::dictionaries::DictionaryName::Plurals,
         &crate::dictionaries::BatchDictionaryRequest {
             clear_existing_dictionary_entries: false,
@@ -7861,6 +7857,7 @@ async fn test_custom_plural_expands_query() {
             "t1",
             "cactus",
             &SearchOptions {
+                dictionary_application_id: Some("application-a"),
                 limit: 10,
                 ignore_plurals: Some(&crate::query::plurals::IgnorePluralsValue::All),
                 query_languages: Some(&en_langs),
@@ -7873,9 +7870,7 @@ async fn test_custom_plural_expands_query() {
     assert_eq!(result.documents[0].document.id, "d1");
 }
 
-/// Regression: plurals stored under `_default` must NOT expand queries for tenant "t1".
-/// Currently FAILS (RED) because `build_plural_language_spec` hardcodes
-/// `DEFAULT_DICTIONARY_TENANT`, causing `_default` entries to apply to ALL tenants.
+/// Regression: plurals stored under `_default` must NOT expand queries for application-a.
 #[tokio::test]
 async fn test_plural_isolation_no_cross_tenant_bleed() {
     let tmp = TempDir::new().unwrap();
@@ -7900,11 +7895,11 @@ async fn test_plural_isolation_no_cross_tenant_bleed() {
     }];
     manager.add_documents_sync("t2", t2_docs).await.unwrap();
 
-    // "t1" should expand cactus->cacti, while "t2"/"_default" map cactus->cactuses.
+    // "application-a" should expand cactus->cacti, while "application-b"/"_default" map cactus->cactuses.
     // A t1 search must therefore resolve to d1.
     let dm = manager.dictionary_manager().unwrap();
     dm.batch(
-        "t1",
+        "application-a",
         crate::dictionaries::DictionaryName::Plurals,
         &crate::dictionaries::BatchDictionaryRequest {
             clear_existing_dictionary_entries: false,
@@ -7921,7 +7916,7 @@ async fn test_plural_isolation_no_cross_tenant_bleed() {
     )
     .unwrap();
     dm.batch(
-        "t2",
+        "application-b",
         crate::dictionaries::DictionaryName::Plurals,
         &crate::dictionaries::BatchDictionaryRequest {
             clear_existing_dictionary_entries: false,
@@ -7938,7 +7933,7 @@ async fn test_plural_isolation_no_cross_tenant_bleed() {
     )
     .unwrap();
     dm.batch(
-        crate::dictionaries::DEFAULT_DICTIONARY_TENANT,
+        crate::dictionaries::DEFAULT_DICTIONARY_APPLICATION_ID,
         crate::dictionaries::DictionaryName::Plurals,
         &crate::dictionaries::BatchDictionaryRequest {
             clear_existing_dictionary_entries: false,
@@ -7961,6 +7956,7 @@ async fn test_plural_isolation_no_cross_tenant_bleed() {
             "t1",
             "cactus",
             &SearchOptions {
+                dictionary_application_id: Some("application-a"),
                 limit: 10,
                 ignore_plurals: Some(&crate::query::plurals::IgnorePluralsValue::All),
                 query_languages: Some(&en_langs),
@@ -7969,9 +7965,12 @@ async fn test_plural_isolation_no_cross_tenant_bleed() {
         )
         .unwrap();
 
-    // Tenant "t1" configured [cactus, cacti], so cactus should match d1.
-    // If "_default"/other-tenant data is used instead, expansion targets "cactuses" and d1 is missed.
-    assert_eq!(result.total, 1, "t1 search must use t1 plural dictionary");
+    // Application-a configured [cactus, cacti], so cactus should match d1.
+    // If "_default"/other-application data is used instead, expansion targets "cactuses" and d1 is missed.
+    assert_eq!(
+        result.total, 1,
+        "index t1 search must use application-a plurals"
+    );
     assert_eq!(result.documents[0].document.id, "d1");
 }
 
@@ -8000,6 +7999,7 @@ async fn test_custom_compound_decomposition_expands_query() {
             "t1",
             "xylophonographischfest",
             &SearchOptions {
+                dictionary_application_id: Some("application-a"),
                 limit: 10,
                 query_languages: Some(&de_langs),
                 decompound_query: Some(true),
@@ -8012,13 +8012,10 @@ async fn test_custom_compound_decomposition_expands_query() {
         "without custom decomposition, this synthetic compound should not match"
     );
 
-    // Add custom compound decomposition under the search tenant "t1".
-    // BUG (RED): The search path hardcodes DEFAULT_DICTIONARY_TENANT ("_default") in
-    // build_decompound_language_spec (search_phases.rs:1236), so this lookup will miss
-    // the tenant-scoped entry until Stage 3 threads tenant_id through preprocess_query.
+    // Add custom compound decomposition for application-a, searching index t1.
     let dm = manager.dictionary_manager().unwrap();
     dm.batch(
-        "t1",
+        "application-a",
         crate::dictionaries::DictionaryName::Compounds,
         &crate::dictionaries::BatchDictionaryRequest {
             clear_existing_dictionary_entries: false,
@@ -8042,6 +8039,7 @@ async fn test_custom_compound_decomposition_expands_query() {
             "t1",
             "xylophonographischfest",
             &SearchOptions {
+                dictionary_application_id: Some("application-a"),
                 limit: 10,
                 query_languages: Some(&de_langs),
                 decompound_query: Some(true),
@@ -8054,9 +8052,7 @@ async fn test_custom_compound_decomposition_expands_query() {
     assert_eq!(result.documents[0].document.id, "d1");
 }
 
-/// Regression: decompound entries under `_default` must NOT expand queries for tenant "t1".
-/// Currently FAILS (RED) because `build_decompound_language_spec` hardcodes
-/// `DEFAULT_DICTIONARY_TENANT`, causing `_default` entries to apply to ALL tenants.
+/// Regression: decompound entries under `_default` must NOT expand queries for application-a.
 #[cfg(feature = "decompound")]
 #[tokio::test]
 async fn test_decompound_isolation_no_cross_tenant_bleed() {
@@ -8082,12 +8078,12 @@ async fn test_decompound_isolation_no_cross_tenant_bleed() {
     }];
     manager.add_documents_sync("t2", t2_docs).await.unwrap();
 
-    // "t1" should decompose to ["xylophonographisch","fest"], while "t2"/"_default"
+    // "application-a" should decompose to ["xylophonographisch","fest"], while "application-b"/"_default"
     // use conflicting decomposition terms that cannot match d1.
-    // Disable built-in decompound for "_default" so this test isolates tenant routing.
+    // Disable built-in decompound for "_default" so this test isolates application routing.
     let dm = manager.dictionary_manager().unwrap();
     dm.batch(
-        "t1",
+        "application-a",
         crate::dictionaries::DictionaryName::Compounds,
         &crate::dictionaries::BatchDictionaryRequest {
             clear_existing_dictionary_entries: false,
@@ -8105,7 +8101,7 @@ async fn test_decompound_isolation_no_cross_tenant_bleed() {
     )
     .unwrap();
     dm.batch(
-        "t2",
+        "application-b",
         crate::dictionaries::DictionaryName::Compounds,
         &crate::dictionaries::BatchDictionaryRequest {
             clear_existing_dictionary_entries: false,
@@ -8128,12 +8124,12 @@ async fn test_decompound_isolation_no_cross_tenant_bleed() {
         [("de".to_string(), true)].into_iter().collect(),
     );
     dm.set_settings(
-        crate::dictionaries::DEFAULT_DICTIONARY_TENANT,
+        crate::dictionaries::DEFAULT_DICTIONARY_APPLICATION_ID,
         &default_settings,
     )
     .unwrap();
     dm.batch(
-        crate::dictionaries::DEFAULT_DICTIONARY_TENANT,
+        crate::dictionaries::DEFAULT_DICTIONARY_APPLICATION_ID,
         crate::dictionaries::DictionaryName::Compounds,
         &crate::dictionaries::BatchDictionaryRequest {
             clear_existing_dictionary_entries: false,
@@ -8157,6 +8153,7 @@ async fn test_decompound_isolation_no_cross_tenant_bleed() {
             "t1",
             "xylophonographischfest",
             &SearchOptions {
+                dictionary_application_id: Some("application-a"),
                 limit: 10,
                 query_languages: Some(&de_langs),
                 decompound_query: Some(true),
@@ -8165,11 +8162,11 @@ async fn test_decompound_isolation_no_cross_tenant_bleed() {
         )
         .unwrap();
 
-    // Tenant "t1" configured the matching decomposition for d1.
-    // If "_default"/other-tenant mappings are used, expansion misses d1.
+    // Application-a configured the matching decomposition for d1.
+    // If "_default"/other-application mappings are used, expansion misses d1.
     assert_eq!(
         result.total, 1,
-        "t1 search must use t1 decompound dictionary"
+        "index t1 search must use application-a compounds"
     );
     assert_eq!(result.documents[0].document.id, "d1");
 }

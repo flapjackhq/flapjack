@@ -885,7 +885,7 @@ fn write_parquet_batches<W: std::io::Write + Send>(
 ) -> Result<(), String> {
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
-        .set_max_row_group_size(100_000)
+        .set_max_row_group_row_count(Some(100_000))
         .build();
 
     let mut writer = ArrowWriter::try_new(target, schema, Some(props))

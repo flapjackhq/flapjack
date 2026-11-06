@@ -4,12 +4,14 @@ use crate::index::FacetCacheKey;
 
 mod plural_expansion;
 mod query_execution;
+mod rule_counts;
 mod search_helpers;
 
 #[cfg(feature = "decompound")]
 use plural_expansion::apply_decompound;
 use plural_expansion::build_plural_map;
 use query_execution::{FacetResultCache, PreparedSearchFilters};
+use rule_counts::RuleCountContext;
 use search_helpers::{
     build_execution_limits, build_search_parser, execute_ranked_search, execute_zero_limit_search,
     RankedSearchContext, ZeroLimitSearchContext,
@@ -74,7 +76,7 @@ pub(super) fn preprocess_query(
     settings: &Option<Arc<IndexSettings>>,
     query_text: &str,
     opts: &SearchOptions<'_>,
-    dictionary_manager: Option<&Arc<crate::dictionaries::manager::DictionaryManager>>,
+    dictionary_manager: Option<&crate::dictionaries::manager::DictionarySnapshot>,
 ) -> PreprocessedQuery {
     let qt = opts
         .query_type
@@ -343,7 +345,7 @@ pub(super) fn execute_search_query(
 
     let effective_around_lat_lng = effective_params.around_lat_lng.clone();
     let effective_around_radius = effective_params.around_radius.clone();
-    if effective_params.limit == 0 {
+    if effective_params.limit == 0 && !count_ordinary_rule_effects(resolved, prepared, distinct) {
         return execute_zero_limit_search(
             manager,
             resolved,
@@ -519,7 +521,8 @@ fn facet_cache_supports_options(opts: &SearchOptions<'_>) -> bool {
         secured_hits_per_page_cap: _,
         decompound_query,
         settings_override,
-        dictionary_lookup_tenant,
+        dictionary_application_id,
+        dictionary_snapshot: _,
         all_query_words_optional,
         relevancy_strictness: _,
         min_proximity: _,
@@ -544,7 +547,7 @@ fn facet_cache_supports_options(opts: &SearchOptions<'_>) -> bool {
         && restrict_searchable_attrs.is_none()
         && decompound_query.is_none()
         && settings_override.is_none()
-        && dictionary_lookup_tenant.is_none()
+        && dictionary_application_id.is_none()
         && !all_query_words_optional
 }
 
@@ -608,6 +611,7 @@ fn apply_rule_effects(
     prepared: &PreparedSearchFilters,
     query_text: &str,
     max_values_per_facet: Option<usize>,
+    count_context: Option<RuleCountContext<'_>>,
 ) -> Result<RuleEffectsResult> {
     let Some(effects) = prepared.rule_effects.as_ref() else {
         return Ok(RuleEffectsResult {
@@ -628,6 +632,12 @@ fn apply_rule_effects(
             .filter(|doc| hidden_ids.contains(doc.document.id.as_str()))
             .count()
     };
+    let original_ids = count_context.as_ref().map(|_| {
+        all_results
+            .iter()
+            .map(|doc| doc.document.id.clone())
+            .collect::<HashSet<_>>()
+    });
     let executor = QueryExecutor::new(resolved.index.converter(), prepared.schema.clone())
         .with_settings(resolved.settings.clone())
         .with_query(query_text.to_string())
@@ -639,13 +649,37 @@ fn apply_rule_effects(
         prepared.effective_params.filter.as_ref(),
     )?;
 
+    let total = match (count_context, original_ids) {
+        (Some(context), Some(original_ids)) => {
+            context.adjusted_total(&original_ids, &documents, effects)
+        }
+        _ => total.saturating_sub(hidden_count),
+    };
+
     Ok(RuleEffectsResult {
         documents,
-        total: total.saturating_sub(hidden_count),
+        total,
         user_data: effects.user_data.clone(),
         applied_rules: effects.applied_rules.clone(),
         rendering_content: effects.rendering_content.clone(),
     })
+}
+
+fn count_ordinary_rule_effects(
+    resolved: &ResolvedSearch,
+    prepared: &PreparedSearchFilters,
+    distinct: Option<u32>,
+) -> bool {
+    let counts_groups = distinct.is_some_and(|count| count > 0)
+        && resolved
+            .settings
+            .as_ref()
+            .is_some_and(|s| s.attribute_for_distinct.is_some());
+    !counts_groups
+        && prepared
+            .rule_effects
+            .as_ref()
+            .is_some_and(|effects| !effects.pins.is_empty() || !effects.hidden.is_empty())
 }
 
 /// TODO: Document finalize_search_result.
@@ -889,7 +923,10 @@ mod tests {
             &resolved.settings,
             query_text,
             &opts,
-            manager.dictionary_manager(),
+            manager
+                .dictionary_manager()
+                .map(|m| m.snapshot(tenant_id).unwrap())
+                .as_ref(),
         );
         let prepared = prepare_search_filters(
             &manager,
@@ -958,7 +995,10 @@ mod tests {
             &resolved.settings,
             query_text,
             &opts,
-            manager.dictionary_manager(),
+            manager
+                .dictionary_manager()
+                .map(|m| m.snapshot(tenant_id).unwrap())
+                .as_ref(),
         );
         let mut cached_prepared = prepare_search_filters(
             &manager,

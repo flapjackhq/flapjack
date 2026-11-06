@@ -1101,3 +1101,135 @@ fn test_tenant_id_rejects_path_traversal() {
         assert!(result.is_err(), "should reject tenant_id {:?}", bad_id);
     }
 }
+
+#[tokio::test]
+async fn storage_ownership_dictionary_read_does_not_create_an_index_directory() {
+    let (tmp, manager) = make_manager();
+    manager.get_settings("products").unwrap();
+    assert!(
+        !tmp.path().join("products").exists(),
+        "application dictionary reads must not create index-shaped storage"
+    );
+    assert!(
+        !tmp.path().join(".applications").exists(),
+        "a read must not create application storage either"
+    );
+    let indexes = crate::IndexManager::new(tmp.path());
+    indexes.create_tenant("products").unwrap();
+    assert!(tmp.path().join("products/meta.json").is_file());
+}
+
+#[test]
+fn storage_ownership_legacy_dictionary_layout_is_rejected_without_mutation() {
+    let (tmp, manager) = make_manager();
+    let old = tmp.path().join("products/.dictionaries");
+    std::fs::create_dir_all(&old).unwrap();
+    let path = old.join("settings.json");
+    std::fs::write(&path, b"{}").unwrap();
+    assert!(manager
+        .get_settings("products")
+        .unwrap_err()
+        .to_string()
+        .contains("unsupported legacy dictionary layout"));
+    assert!(DictionaryStore::validate_data_layout(tmp.path()).is_err());
+    assert_eq!(std::fs::read(path).unwrap(), b"{}");
+    assert!(!tmp.path().join(".applications").exists());
+}
+
+#[tokio::test]
+async fn storage_ownership_index_lifecycle_preserves_application_configuration() {
+    let (tmp, dictionaries) = make_manager();
+    let settings: DictionarySettings = serde_json::from_value(
+        serde_json::json!({"disableStandardEntries":{"stopwords":{"en":true}}}),
+    )
+    .unwrap();
+    dictionaries.set_settings("products", &settings).unwrap();
+    dictionaries
+        .set_settings("other-app", &DictionarySettings::default())
+        .unwrap();
+    let manager = crate::IndexManager::new(tmp.path());
+    manager.create_tenant("products").unwrap();
+    manager
+        .add_documents_sync(
+            "products",
+            vec![crate::types::Document::from_json(
+                &serde_json::json!({"objectID":"kept","title":"persistent"}),
+            )
+            .unwrap()],
+        )
+        .await
+        .unwrap();
+    manager.copy_index("products", "copy", None).await.unwrap();
+    assert_eq!(
+        manager.get_document("copy", "kept").unwrap().unwrap().id,
+        "kept"
+    );
+    manager.drain_all_write_queues().await.unwrap();
+    let bytes =
+        crate::index::snapshot::export_to_bytes_with_key(&tmp.path().join("products"), None)
+            .unwrap();
+    let restored = TempDir::new().unwrap();
+    let target_dictionaries = DictionaryManager::new(restored.path());
+    target_dictionaries
+        .set_settings("other-app", &settings)
+        .unwrap();
+    crate::index::snapshot::import_from_bytes_with_key(
+        &bytes,
+        &restored.path().join("products"),
+        None,
+    )
+    .unwrap();
+    let target = crate::IndexManager::new(restored.path());
+    assert_eq!(
+        target.get_document("products", "kept").unwrap().unwrap().id,
+        "kept"
+    );
+    assert_eq!(
+        target_dictionaries.get_settings("other-app").unwrap(),
+        settings
+    );
+    assert!(
+        !restored.path().join(".applications/products").exists(),
+        "an index snapshot must not pretend to recover an application's configuration"
+    );
+    manager
+        .delete_tenant(&"products".to_string())
+        .await
+        .unwrap();
+    assert_eq!(dictionaries.get_settings("products").unwrap(), settings);
+    assert_eq!(
+        dictionaries.get_settings("other-app").unwrap(),
+        DictionarySettings::default()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_ownership_application_scope_rejects_aliases_and_symlinks() {
+    let (tmp, manager) = make_manager();
+    for id in [".", "..", "../outside", "a/b"] {
+        assert!(manager.get_settings(id).is_err());
+    }
+    let outside = TempDir::new().unwrap();
+    std::os::unix::fs::symlink(outside.path(), tmp.path().join(".applications")).unwrap();
+    assert!(manager.get_settings("app").is_err());
+    assert!(DictionaryStore::validate_data_layout(tmp.path()).is_err());
+    assert!(outside.path().read_dir().unwrap().next().is_none());
+}
+
+#[test]
+fn storage_ownership_application_names_do_not_alias_reserved_roots() {
+    let (tmp, manager) = make_manager();
+    for application in [".dictionaries", ".applications", ".personalization"] {
+        manager.get_settings(application).unwrap();
+    }
+    DictionaryStore::validate_data_layout(tmp.path()).unwrap();
+    assert!(!tmp.path().join(".personalization").exists());
+    // The prior layout using a reserved-looking application ID is still unsupported.
+    let legacy = TempDir::new().unwrap();
+    let path = legacy.path().join(".applications/.dictionaries");
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::write(path.join("settings.json"), b"{}").unwrap();
+    assert!(DictionaryStore::validate_data_layout(legacy.path()).is_err());
+    assert_eq!(std::fs::read(path.join("settings.json")).unwrap(), b"{}");
+}

@@ -143,6 +143,8 @@ impl MigrationJobRunner {
         let _ = published.send(());
     }
 
+    // Pause only once the durable receipt names a fully staged generation, before
+    // run_bulk_replace checks cancellation and enters activation.
     #[cfg(test)]
     pub(crate) fn set_bulk_replace_prepublication_hook_for_test(
         &self,
@@ -150,8 +152,7 @@ impl MigrationJobRunner {
     ) {
         let hooks =
             super::bulk_build::BulkBuildTestHooks::default().with_event_hook(move |event| {
-                if event == super::bulk_build::BulkBuildTestEvent::PrepublicationValidationStarting
-                {
+                if event == super::bulk_build::BulkBuildTestEvent::StagingReady {
                     hook();
                 }
             });

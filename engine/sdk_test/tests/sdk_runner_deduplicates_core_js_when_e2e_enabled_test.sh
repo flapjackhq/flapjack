@@ -106,7 +106,7 @@ STUB
 cat > "$BIN_DIR/bash" <<'STUB'
 #!/bin/bash
 case "$1" in
-  */scripts/tests/rwork_repository_contract_test.sh|*/scripts/tests/publish_guard_test.sh|*/scripts/tests/publish_public_candidate_test.sh|*/scripts/check_migration_ssot_owners.sh) exit 0 ;;
+  */scripts/tests/rwork_repository_contract_test.sh|*/scripts/tests/publish_guard_test.sh|*/scripts/tests/publish_public_candidate_test.sh|*/scripts/tests/shadow_public_candidate_test.sh|*/scripts/check_migration_ssot_owners.sh) exit 0 ;;
   *) exec /bin/bash "$@" ;;
 esac
 STUB

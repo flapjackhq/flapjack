@@ -22,7 +22,7 @@ use crate::auth::{ApiKey, KeyStore, RateLimiter, ReplicationPeerCredential};
 use axum::{
     body::Body,
     http::{Request, StatusCode},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Extension, Router,
 };
 use flapjack_replication::peer::REPLICATION_PEER_APPLICATION_ID;
@@ -101,6 +101,7 @@ fn peer_boundary_app(key_store: Arc<KeyStore>, downstream_marker: Arc<AtomicBool
         let method_router = match row.method {
             axum::http::Method::GET => get(ok),
             axum::http::Method::POST => post(ok),
+            axum::http::Method::PUT => put(ok),
             axum::http::Method::DELETE => delete(ok),
             ref method => panic!("unsupported shared contract method {method}"),
         };
@@ -450,6 +451,13 @@ async fn non_admin_credentials_are_refused_on_every_admin_only_internal_route() 
     for row in admin_only_routes() {
         let method = row.method.as_str();
         let path = row.specimen_path;
+        // Configuration transport requires the exact node-admin credential before
+        // ordinary key ACL checks (and before dashboard-session fallback).
+        let search_key_error = match path {
+            "/internal/application-configuration"
+            | "/internal/application-configuration/prepare" => INVALID_CREDENTIALS_MESSAGE,
+            _ => ACL_MISMATCH_MESSAGE,
+        };
         for (app_id, credential, expected_message, label) in [
             (
                 None,
@@ -460,7 +468,7 @@ async fn non_admin_credentials_are_refused_on_every_admin_only_internal_route() 
             (
                 Some("baseline-app"),
                 Some(search_key_value.as_str()),
-                ACL_MISMATCH_MESSAGE,
+                search_key_error,
                 "search-only credential",
             ),
             (
