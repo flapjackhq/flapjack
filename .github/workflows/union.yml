@@ -20,6 +20,9 @@ env:
   # run from a clean tree at CARGO_INCREMENTAL=0. A CI runner is already clean; this keeps the
   # remote run comparable to the local one rather than subtly different from it.
   CARGO_INCREMENTAL: 0
+  # Full workspace debug artifacts exhausted the hosted runner's disk.
+  CARGO_BUILD_JOBS: 2
+  RUSTFLAGS: -C debuginfo=0
 
 jobs:
   # Guard: only run in the public product repository. Candidate pushes use ci.yml;
