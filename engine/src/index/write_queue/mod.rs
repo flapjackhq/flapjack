@@ -41,8 +41,9 @@ pub(crate) use writer_lifecycle::set_writer_close_hook_for_test;
 pub(crate) use writer_lifecycle::WriteTaskHandle;
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
 pub use writer_lifecycle::{
-    clear_writer_lifecycle_test_events, record_writer_lifecycle_publication_checkpoint,
-    writer_lifecycle_test_events, WriterLifecycleTestEvent,
+    clear_writer_lifecycle_test_events, clear_writer_lifecycle_test_events_for_tenant,
+    record_writer_lifecycle_publication_checkpoint, writer_lifecycle_test_events,
+    WriterLifecycleTestEvent,
 };
 
 use crate::types::{DocFailure, Document, TaskInfo, TaskStatus};

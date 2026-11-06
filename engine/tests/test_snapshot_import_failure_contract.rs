@@ -286,10 +286,10 @@ async fn invalid_snapshot_import_returns_500_json_and_preserves_existing_index_d
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_fixture_bytes_quiesce_active_writer_before_export() {
-    flapjack::index::write_queue::clear_writer_lifecycle_test_events();
+    let index_name = "snapshot-fixture-quiesce-contract";
+    flapjack::index::write_queue::clear_writer_lifecycle_test_events_for_tenant(index_name);
     let (app, _tmp) = common::build_test_app_for_local_requests(None);
     let app = Arc::new(app);
-    let index_name = "snapshot-fixture-quiesce-contract";
 
     common::seed_doc_local(&app, index_name).await;
 

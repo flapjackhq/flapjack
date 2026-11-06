@@ -940,8 +940,8 @@ mod tests {
 
     #[tokio::test]
     async fn absent_snapshot_destination_is_fenced_before_installation() {
-        flapjack::index::write_queue::clear_writer_lifecycle_test_events();
         let tenant_id = "absent_restore_admission_fence";
+        flapjack::index::write_queue::clear_writer_lifecycle_test_events_for_tenant(tenant_id);
         let source_tmp = TempDir::new().unwrap();
         let source_manager = flapjack::IndexManager::new(source_tmp.path());
         source_manager.create_tenant(tenant_id).unwrap();

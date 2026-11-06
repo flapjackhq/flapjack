@@ -1006,7 +1006,7 @@ async fn snapshot_export_under_load_restores_with_exact_doc_count_and_record_par
 #[serial_test::serial(snapshot_under_load_shared_state)]
 async fn snapshot_during_active_write_restores_exact_record_parity() {
     let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
-    flapjack::index::write_queue::clear_writer_lifecycle_test_events();
+    flapjack::index::write_queue::clear_writer_lifecycle_test_events_for_tenant(INDEX_NAME);
     let _commit_delay = EnvVarGuard::set(WRITE_QUEUE_TEST_COMMIT_DELAY_ENV_VAR, "250");
     let (addr_a, _tmp_a) = common::spawn_server_with_key(None).await;
     let client = reqwest::Client::new();

@@ -7,6 +7,7 @@ async fn assert_successful_release_import(
     let snapshot_digest = format!("{:x}", Sha256::digest(snapshot_bytes));
     let (_destination_tmp, destination, app) =
         release_import_destination_for(destination_kind, tenant_id).await;
+    flapjack::index::write_queue::clear_writer_lifecycle_test_events_for_tenant(tenant_id);
     let writer_closes_before = retained_channel_closed_count(tenant_id);
     let response = app
         .oneshot(release_import_request_for_tenant(
@@ -113,6 +114,7 @@ async fn release_import_invalid_archive_preserves_installation_error_contract() 
     ] {
         let (destination_tmp, destination, app) =
             release_import_destination_for(destination_kind, tenant_id).await;
+        flapjack::index::write_queue::clear_writer_lifecycle_test_events_for_tenant(tenant_id);
         let response = app
             .clone()
             .oneshot(release_import_request_for_tenant(
