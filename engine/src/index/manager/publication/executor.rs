@@ -104,12 +104,25 @@ pub fn abort_unjournaled_publication(
 }
 
 impl PreStagedPublication {
+    /// Prepare a snapshot after the scanner reported a vacant destination.
+    /// Freshness is re-established by atomic namespace ownership under the
+    /// epoch owner, never inferred from the caller's earlier observation.
+    pub fn prepare_for_vacant_target(base: &Path, target: PublicationTarget) -> Result<Self> {
+        super::epoch::initialize_vacant_target_epoch(base, &target)
+            .map_err(|error| invalid_publication(error.to_string()))?;
+        Self::prepare(base, target)
+    }
+
     /// Allocate an exclusive transaction namespace before the caller extracts content.
     pub fn prepare(base: &Path, target: PublicationTarget) -> Result<Self> {
-        let transaction_id =
-            PublicationTransactionId::new(format!("snapshot_{}", uuid::Uuid::new_v4().simple()))?;
+        let transaction_id = PublicationTransactionId::new(format!(
+            "{}{}",
+            super::SNAPSHOT_TRANSACTION_PREFIX,
+            uuid::Uuid::new_v4().simple()
+        ))?;
         let generation = PublicationGenerationEvidence::new(format!(
-            "snapshot_{}",
+            "{}{}",
+            super::SNAPSHOT_TRANSACTION_PREFIX,
             uuid::Uuid::new_v4().simple()
         ))?;
         let paths = PublicationPaths::new(base, &target, &transaction_id);

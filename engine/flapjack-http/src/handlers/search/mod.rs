@@ -56,3 +56,36 @@ mod tests;
 #[cfg(test)]
 #[path = "stage5_integration_tests.rs"]
 mod stage5_integration_tests;
+
+/// Capture once at admission so fallback and grouped work retain their view.
+pub(super) fn capture_required_configuration(
+    state: &crate::handlers::AppState,
+    application_id: Option<&str>,
+    required: Option<crate::auth::RequiredApplicationConfiguration>,
+) -> Result<
+    Option<std::sync::Arc<flapjack::dictionaries::manager::DictionarySnapshot>>,
+    flapjack::error::FlapjackError,
+> {
+    let Some(application) = application_id else {
+        return if required.is_some() {
+            Err(
+                flapjack::error::FlapjackError::ApplicationConfigurationUnavailable(
+                    "required application identity missing".into(),
+                ),
+            )
+        } else {
+            Ok(None)
+        };
+    };
+    let snapshot = match required {
+        Some(required) => state
+            .dictionary_manager
+            .snapshot_at_least(application, required.0),
+        None => state.dictionary_manager.snapshot(application),
+    };
+    snapshot
+        .map(|snapshot| Some(std::sync::Arc::new(snapshot)))
+        .map_err(|error| {
+            flapjack::error::FlapjackError::ApplicationConfigurationUnavailable(error.to_string())
+        })
+}

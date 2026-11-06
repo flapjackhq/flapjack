@@ -1834,3 +1834,64 @@ async fn full_profile_retains_existing_search_key_routes_and_transport() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn managed_customer_batch_accepts_only_node_admin_forwarded_application() {
+    let (fixture, session) = pbv5_fixture();
+    let customer_app = "00112233445566778899aabbccddeeff";
+    for (application, key, cookie, expected) in [
+        (
+            customer_app,
+            Some(fixture.search_key.as_str()),
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            customer_app,
+            None,
+            Some(session.as_str()),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "00112233445566778899AABBCCDDEEFF",
+            Some(ADMIN_KEY),
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "00112233445566778899aabbccddee",
+            Some(ADMIN_KEY),
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        ("_default", Some(ADMIN_KEY), None, StatusCode::FORBIDDEN),
+        (customer_app, Some(ADMIN_KEY), None, StatusCode::OK),
+    ] {
+        let mut request = crawler_profile_request(
+            Method::POST,
+            DIRECT_SEARCH_PATH,
+            Some(application),
+            key,
+            cookie,
+        );
+        *request.body_mut() = Body::from(
+            serde_json::json!({"requests":[{"indexName":INDEX_NAME,"params":"query=ridge"}]})
+                .to_string(),
+        );
+        let response = fixture.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            expected,
+            "only direct node-admin forwarding may select canonical managed customer context"
+        );
+        if expected == StatusCode::OK {
+            assert_eq!(
+                body_json(response).await["results"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+}

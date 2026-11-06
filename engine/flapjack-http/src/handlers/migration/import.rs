@@ -761,7 +761,7 @@ async fn stage_export(
         json_error_parts(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
     })?;
     let counts = bulk_build
-        .finish_staging(&staging, source_identity_validation)
+        .finish_staging(staging, publication, source_identity_validation)
         .await?;
     Ok(StagedImport {
         counts,

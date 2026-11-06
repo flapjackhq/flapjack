@@ -432,6 +432,39 @@ pub async fn authenticate_and_authorize(
     let standard_api_key_credential =
         extract_api_key_for_route(&request, route_acl).map_err(|()| credential_error())?;
     let standard_api_key = standard_api_key_credential.map(|credential| credential.value);
+    if matches!(
+        path.as_str(),
+        "/internal/application-configuration" | "/internal/application-configuration/prepare"
+    ) && !standard_api_key
+        .as_deref()
+        .is_some_and(|key| key_store.is_admin(key))
+    {
+        return Err(invalid_api_credentials_error());
+    }
+
+    let required_configuration =
+        if let Some(header) = request.headers().get("x-flapjack-configuration-revision") {
+            if !standard_api_key
+                .as_deref()
+                .is_some_and(|key| key_store.is_admin(key))
+            {
+                return Err(invalid_api_credentials_error());
+            }
+            let revision = header
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    json_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid application configuration revision",
+                    )
+                })?;
+            Some(super::RequiredApplicationConfiguration(revision))
+        } else {
+            None
+        };
+
     let session_is_valid = request
         .extensions()
         .get::<std::sync::Arc<DashboardSessionStore>>()
@@ -499,9 +532,8 @@ pub async fn authenticate_and_authorize(
         && !standard_api_key
             .as_deref()
             .is_some_and(|key| key_store.is_admin(key));
-    // PBV5 fixes the application ID for every customer request, including
-    // trusted dashboard sessions. Keep that path fact separate from the
-    // narrower non-admin customer-key classification used below.
+    // Direct customer keys and dashboard sessions retain the fixed PBV5 ID.
+    // Only a node-admin request may carry cloud-admitted customer context.
     let pbv5_customer_path = api_profile == ApiProfile::PaidBetaV5
         && request.method() == Method::POST
         && is_paid_beta_v5_customer_path(&path);
@@ -550,8 +582,16 @@ pub async fn authenticate_and_authorize(
         return Err(StatusCode::NOT_FOUND.into_response());
     }
 
+    let managed_customer_context = pbv5_customer_path
+        && !authenticated_by_session
+        && key_store.is_admin(&api_key_value)
+        && application_id.len() == 32
+        && application_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
     if (pbv1_customer_route || pbv3_customer_route || pbv4_customer_route || pbv5_customer_path)
         && application_id != PAID_BETA_V1_APPLICATION_ID
+        && !managed_customer_context
     {
         log_auth_failure(&path, "direct", "application_id_invalid");
         return Err(invalid_api_credentials_error());
@@ -655,6 +695,9 @@ pub async fn authenticate_and_authorize(
     }
 
     let mut request = request;
+    if let Some(required) = required_configuration {
+        request.extensions_mut().insert(required);
+    }
     // Store auth context for downstream handlers (search and dictionaries rely on these values).
     request
         .extensions_mut()

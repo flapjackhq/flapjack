@@ -68,7 +68,7 @@ utoipa = { version = "5.3", features = ["axum_extras", "chrono", "uuid"] }
 # Keep release builds hermetic. Without `vendored`, this crate downloads
 # Swagger UI during compilation and a transient network failure can abort an
 # otherwise reproducible platform build.
-utoipa-swagger-ui = { version = "8.0", features = ["axum", "vendored"] }
+utoipa-swagger-ui = { version = "10.0.2", features = ["vendored"] }
 ipnet = "2.11"
 maxminddb = "0.27"
 aws-config = "1"

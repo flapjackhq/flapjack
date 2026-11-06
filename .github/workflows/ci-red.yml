@@ -1,0 +1,53 @@
+name: Record red CI
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_run:
+    workflows: [Private CI]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: record-red-ci
+  cancel-in-progress: false
+
+jobs:
+  record:
+    if: github.repository == 'gridl-dev/flapjack_dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: read
+      actions: read
+    steps:
+      # workflow_run executes trusted default-branch code, never PR artifacts/code.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: main
+      - name: Install the pinned Beads CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/beads"
+          gh release download v1.2.2 --repo steveyegge/beads --dir "$RUNNER_TEMP/beads" --pattern beads_1.2.2_linux_amd64.tar.gz --pattern checksums.txt
+          cd "$RUNNER_TEMP/beads"
+          sha256sum --check --ignore-missing checksums.txt
+          tar -xzf beads_1.2.2_linux_amd64.tar.gz
+          echo "$RUNNER_TEMP/beads" >> "$GITHUB_PATH"
+      - name: Record current failures in private Beads
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "Flapjack CI"
+          git config user.email "ci@users.noreply.github.com"
+          # Dolt clones outside this checkout, so its git transport needs a runner-scoped helper.
+          git config --global credential.https://github.com.helper '!gh auth git-credential'
+          bd bootstrap --yes
+          python3 .github/scripts/report_ci_red.py
+          bd dolt commit -m "Record red CI"
+          bd dolt push || { bd dolt pull && bd dolt push; }

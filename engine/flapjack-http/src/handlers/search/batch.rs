@@ -1,5 +1,5 @@
 //! Stub summary for batch.rs.
-use std::sync::Arc;
+use std::sync::{atomic::Ordering, Arc};
 
 use axum::{extract::State, Json};
 
@@ -218,10 +218,18 @@ pub async fn batch_search(
         .extensions()
         .get::<crate::api_profile::PaidBetaV5CustomerRequest>()
         .is_some();
-    let dictionary_lookup_tenant = request
+    let dictionary_application_id = request
         .extensions()
         .get::<crate::auth::AuthenticatedAppId>()
         .map(|id| id.0.clone());
+    let dictionary_snapshot = super::capture_required_configuration(
+        &state,
+        dictionary_application_id.as_deref(),
+        request
+            .extensions()
+            .get::<crate::auth::RequiredApplicationConfiguration>()
+            .copied(),
+    )?;
     let (user_token_header, user_ip, session_id_header) = extract_analytics_headers(&request);
     let body_bytes = axum::body::to_bytes(request.into_body(), 10_000_000)
         .await
@@ -271,6 +279,7 @@ pub async fn batch_search(
     let mut prepared = Vec::new();
     for (position, mut request) in batch.requests.into_iter().enumerate() {
         request.apply_params_string();
+        request.dictionary_snapshot = dictionary_snapshot.clone();
         apply_key_restrictions(&mut request, &api_key);
         if request.user_token.is_none() {
             request.user_token = user_token_header.clone();
@@ -305,6 +314,7 @@ pub async fn batch_search(
             .index_name
             .clone()
             .ok_or_else(|| FlapjackError::InvalidQuery("Missing indexName".to_string()))?;
+        flapjack::index::manager::validate_index_name(&index_name)?;
         prepared.push(PreparedBatchQuery {
             position,
             index_name,
@@ -318,7 +328,7 @@ pub async fn batch_search(
     if let Some(federation_config) = federation {
         let metadata = collect_federation_query_metadata(&prepared);
         let query_results =
-            execute_batch_parallel(state, prepared, dictionary_lookup_tenant).await?;
+            execute_batch_parallel(state, prepared, dictionary_application_id).await?;
         let processing_time_ms = start.elapsed().as_millis();
         let response = build_federated_response_value(
             query_results,
@@ -330,9 +340,9 @@ pub async fn batch_search(
     }
 
     let results = if stop_if_enough {
-        execute_batch_stop_if_enough(state, prepared, dictionary_lookup_tenant).await?
+        execute_batch_stop_if_enough(state, prepared, dictionary_application_id).await?
     } else {
-        execute_batch_parallel(state, prepared, dictionary_lookup_tenant).await?
+        execute_batch_parallel(state, prepared, dictionary_application_id).await?
     };
 
     Ok(Json(serde_json::json!({"results": results})))
@@ -345,8 +355,17 @@ async fn execute_single_batch_query(
     req: SearchRequest,
     secured_hits_per_page_cap: Option<usize>,
     can_see_unretrievable_attributes: bool,
-    dictionary_lookup_tenant: Option<String>,
+    dictionary_application_id: Option<String>,
 ) -> Result<serde_json::Value, FlapjackError> {
+    // Count attempts after whole-batch validation and only when dispatched,
+    // including facet queries and failures, but excluding early-stop skips.
+    state
+        .usage_counters
+        .entry(index_name.clone())
+        .or_default()
+        .search_count
+        .fetch_add(1, Ordering::Relaxed);
+
     if req.query_type.as_deref() == Some("facet") {
         let facet_name = req.facet.clone().unwrap_or_default();
         let facet_query = req.facet_query.clone().unwrap_or_default();
@@ -370,7 +389,7 @@ async fn execute_single_batch_query(
         req,
         secured_hits_per_page_cap,
         can_see_unretrievable_attributes,
-        dictionary_lookup_tenant,
+        dictionary_application_id,
     )
     .await?;
     Ok(result.0)
@@ -380,7 +399,7 @@ async fn execute_single_batch_query(
 async fn execute_batch_parallel(
     state: Arc<AppState>,
     prepared: Vec<PreparedBatchQuery>,
-    dictionary_lookup_tenant: Option<String>,
+    dictionary_application_id: Option<String>,
 ) -> Result<Vec<serde_json::Value>, FlapjackError> {
     let mut join_set = tokio::task::JoinSet::new();
     for query in prepared {
@@ -392,7 +411,7 @@ async fn execute_batch_parallel(
             can_see_unretrievable_attributes,
         } = query;
         let state = state.clone();
-        let dictionary_lookup_tenant = dictionary_lookup_tenant.clone();
+        let dictionary_application_id = dictionary_application_id.clone();
         join_set.spawn(async move {
             let result = execute_single_batch_query(
                 state,
@@ -400,7 +419,7 @@ async fn execute_batch_parallel(
                 request,
                 secured_hits_per_page_cap,
                 can_see_unretrievable_attributes,
-                dictionary_lookup_tenant,
+                dictionary_application_id,
             )
             .await?;
             Ok::<_, FlapjackError>((position, result))
@@ -423,7 +442,7 @@ async fn execute_batch_parallel(
 async fn execute_batch_stop_if_enough(
     state: Arc<AppState>,
     prepared: Vec<PreparedBatchQuery>,
-    dictionary_lookup_tenant: Option<String>,
+    dictionary_application_id: Option<String>,
 ) -> Result<Vec<serde_json::Value>, FlapjackError> {
     let total = prepared.len();
     let mut results: Vec<serde_json::Value> = Vec::with_capacity(total);
@@ -449,7 +468,7 @@ async fn execute_batch_stop_if_enough(
             request,
             secured_hits_per_page_cap,
             can_see_unretrievable_attributes,
-            dictionary_lookup_tenant.clone(),
+            dictionary_application_id.clone(),
         )
         .await?;
 

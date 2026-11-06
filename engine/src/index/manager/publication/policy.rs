@@ -106,16 +106,16 @@ static ARTIFACT_POLICIES: [ArtifactPolicy; 13] = [
         "reload or rebuild vector state"
     ),
     artifact_policy!(
-        "dictionaries",
+        "legacy_dictionaries",
         "engine/src/dictionaries/persistence.rs",
-        ArtifactDisposition::Preserve,
-        "DICTIONARIES_DIR",
-        "Dictionary data is per tenant and moves with the tenant directory.",
-        "tenant/.dictionaries",
-        "backup tenant directory",
-        "target tenant directory",
-        "restore tenant directory backup",
-        "reload dictionary store"
+        ArtifactDisposition::Reject,
+        "DictionaryStore::for_application",
+        "Application dictionaries are not index artifacts; ambiguous prior layouts require explicit operator handling.",
+        "unsupported tenant/.dictionaries",
+        "reject before publication",
+        "reject before publication",
+        "leave data unchanged",
+        "application storage has its own owner; no automatic migration"
     ),
     artifact_policy!(
         "recommend_rules",

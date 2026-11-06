@@ -4,11 +4,20 @@ impl DictionaryManager {
     /// Search dictionary entries for a given tenant + dictionary type.
     pub fn search(
         &self,
-        tenant_id: &str,
+        application_id: &str,
         dict_name: DictionaryName,
         request: &DictionarySearchRequest,
     ) -> Result<DictionarySearchResponse, DictionaryError> {
-        let store = self.store_for(tenant_id)?;
+        self.search_snapshot(self.snapshot(application_id)?, dict_name, request)
+    }
+
+    /// Search the same immutable generation that the HTTP boundary admitted.
+    pub fn search_snapshot(
+        &self,
+        snapshot: DictionarySnapshot,
+        dict_name: DictionaryName,
+        request: &DictionarySearchRequest,
+    ) -> Result<DictionarySearchResponse, DictionaryError> {
         let page = request.page.unwrap_or(0);
         let hits_per_page = request.hits_per_page.unwrap_or(20).clamp(1, 1000);
         let query_lower = request.query.to_lowercase();
@@ -21,7 +30,7 @@ impl DictionaryManager {
         // Collect matching entries as JSON values
         let mut hits: Vec<serde_json::Value> = match dict_name {
             DictionaryName::Stopwords => {
-                let entries = store.load_stopwords()?;
+                let entries = snapshot.stopwords;
                 entries
                     .into_iter()
                     .filter(|e| self.stopword_matches(e, &query_lower, &language))
@@ -29,7 +38,7 @@ impl DictionaryManager {
                     .collect()
             }
             DictionaryName::Plurals => {
-                let entries = store.load_plurals()?;
+                let entries = snapshot.plurals;
                 entries
                     .into_iter()
                     .filter(|e| self.plural_matches(e, &query_lower, &language))
@@ -37,7 +46,7 @@ impl DictionaryManager {
                     .collect()
             }
             DictionaryName::Compounds => {
-                let entries = store.load_compounds()?;
+                let entries = snapshot.compounds;
                 entries
                     .into_iter()
                     .filter(|e| self.compound_matches(e, &query_lower, &language))

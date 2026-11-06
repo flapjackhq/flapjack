@@ -133,3 +133,5 @@ pub use usage::{usage_global, usage_per_index};
 
 #[cfg(test)]
 mod wire_format_tests;
+
+pub mod dictionary_configuration;

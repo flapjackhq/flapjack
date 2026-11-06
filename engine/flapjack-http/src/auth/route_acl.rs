@@ -173,6 +173,9 @@ fn fixed_path_policy(method: &Method, path: &str) -> Option<RoutePolicy> {
             },
         ));
     }
+    if *method == Method::POST && path == "/internal/application-configuration/prepare" {
+        return Some(required("admin", RouteEffect::Read));
+    }
     if path.starts_with("/internal/") {
         let read = is_read_method(method)
             || (*method == Method::POST

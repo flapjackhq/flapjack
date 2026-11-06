@@ -110,6 +110,9 @@ pub(crate) async fn initialize_infrastructure(
     global_mutation_fence: pause_registry::GlobalMutationFence,
     persistence_mode: StartupPersistenceMode,
 ) -> Result<InfrastructureState, Box<dyn std::error::Error>> {
+    flapjack::dictionaries::persistence::DictionaryStore::validate_data_layout(data_dir)?;
+    flapjack::personalization::PersonalizationProfileStore::validate_data_layout(data_dir)
+        .map_err(std::io::Error::other)?;
     let manager = IndexManager::new(data_dir);
     let dictionary_manager = Arc::new(flapjack::dictionaries::manager::DictionaryManager::new(
         data_dir,

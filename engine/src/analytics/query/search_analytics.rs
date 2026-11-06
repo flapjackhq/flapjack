@@ -27,7 +27,7 @@ impl super::AnalyticsQueryEngine {
                      FROM rollups \
                      WHERE window_start_ms >= {} AND window_start_ms <= {} \
                      GROUP BY query \
-                     ORDER BY SUM(count) DESC, query ASC \
+                     ORDER BY count DESC, search ASC \
                      LIMIT {}",
                     start_ms, end_ms, params.limit
                 );

@@ -10,7 +10,8 @@ use flapjack::error::FlapjackError;
 #[cfg(test)]
 use flapjack::index::manager::publication::PublicationFaultPoint;
 use flapjack::index::manager::publication::{
-    PreStagedActivationError, PreStagedPublication, PublicationTarget,
+    fsync_dir, rename_with_transient_retry, PreStagedActivationError, PreStagedPublication,
+    PublicationTarget,
 };
 use flapjack::index::rules::RuleStore;
 use flapjack::index::synonyms::SynonymStore;
@@ -43,6 +44,7 @@ pub(super) enum BulkBuildTestEvent {
     StagingWriterMergeQuiesced,
     PrepublicationValidationStarting,
     PrepublicationValidationVerdict,
+    StagingReady,
     ActivationFence,
 }
 
@@ -280,15 +282,12 @@ impl<'a> BulkBuildService<'a> {
             .staging
             .parent()
             .expect("publication staging path should have a transaction namespace");
-        let tenant = publication
-            .paths()
-            .staging
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(internal_error)?
-            .to_string();
+        // Directory placement is temporary; durable tenant identity is not.
+        // Keep the private manager inside this transaction so abort owns it,
+        // without colliding with canonical staging/backup/journal names.
+        let tenant = self.target_index.to_string();
         let manager = IndexManager::new_for_bulk_build(
-            staging_parent,
+            staging_parent.join(".bulk-build"),
             flapjack::index::BulkBuildWriterConfig::from_env(),
         );
         self.cancellation.check()?;
@@ -365,7 +364,8 @@ impl<'a> BulkBuildService<'a> {
 
     pub(super) async fn finish_staging(
         &self,
-        staging: &BulkBuildStaging,
+        staging: BulkBuildStaging,
+        publication: &PreStagedPublication,
         source_identity_validation: SourceIdentityValidation,
     ) -> Result<BulkBuildCounts, MigrateError> {
         staging
@@ -387,6 +387,30 @@ impl<'a> BulkBuildService<'a> {
         self.cancellation.check()?;
         let counts = self.counts_for(&staging.manager, &staging.tenant)?;
         self.validate_before_publication(source_identity_validation)?;
+        // counts_for reopens the index. Close that handle and drop the private
+        // manager before moving its tree; no writer may recreate the old path.
+        staging
+            .manager
+            .unload(&staging.tenant)
+            .map_err(flapjack_error)?;
+        let build_root = staging.manager.base_path.clone();
+        let tenant_path = build_root.join(&staging.tenant);
+        drop(staging);
+        rename_with_transient_retry(&tenant_path, &publication.paths().staging)
+            .map_err(|error| flapjack_error(error.into()))?;
+        fsync_dir(&build_root).map_err(|error| flapjack_error(error.into()))?;
+        // Only the retired private manager's runtime residue remains here.
+        std::fs::remove_dir_all(&build_root).map_err(|error| flapjack_error(error.into()))?;
+        fsync_dir(
+            publication
+                .paths()
+                .staging
+                .parent()
+                .expect("transaction namespace"),
+        )
+        .map_err(|error| flapjack_error(error.into()))?;
+        #[cfg(test)]
+        self.test_hooks.emit(BulkBuildTestEvent::StagingReady);
         Ok(counts)
     }
 

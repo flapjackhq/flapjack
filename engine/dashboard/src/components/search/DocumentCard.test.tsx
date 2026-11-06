@@ -343,7 +343,7 @@ describe('DocumentCard display preferences contract', () => {
     expect(writeText).toHaveBeenCalledWith(expect.stringContaining('"objectID": "p01"'));
 
     await user.click(screen.getByRole('button', { name: 'JSON' }));
-    expect(screen.getByTestId('monaco-editor')).toBeInTheDocument();
+    expect(await screen.findByTestId('monaco-editor')).toBeInTheDocument();
 
     await user.click(screen.getByTitle('Delete document'));
     expect(onDelete).toHaveBeenCalledWith('p01');

@@ -8,9 +8,7 @@ use std::sync::Arc;
 
 use super::AppState;
 use flapjack::error::FlapjackError;
-use flapjack::personalization::{
-    PersonalizationProfileStore, PersonalizationStrategy, STRATEGY_FILENAME,
-};
+use flapjack::personalization::{PersonalizationProfileStore, PersonalizationStrategy};
 
 // ── Response DTOs ───────────────────────────────────────────────────────────
 
@@ -27,8 +25,10 @@ pub struct DeleteProfileResponse {
     pub deleted_until: String,
 }
 
-fn strategy_path(state: &AppState) -> std::path::PathBuf {
-    state.manager.base_path.join(STRATEGY_FILENAME)
+fn strategy_path(state: &AppState) -> Result<std::path::PathBuf, FlapjackError> {
+    PersonalizationProfileStore::validate_data_layout(&state.manager.base_path)
+        .map_err(FlapjackError::Io)?;
+    Ok(PersonalizationProfileStore::new(&*state.manager.base_path).strategy_path())
 }
 
 fn profile_store(state: &AppState) -> PersonalizationProfileStore {
@@ -55,7 +55,9 @@ pub async fn set_personalization_strategy(
 ) -> Result<Json<SetStrategyResponse>, FlapjackError> {
     strategy.validate().map_err(FlapjackError::InvalidQuery)?;
 
-    let path = strategy_path(&state);
+    let path = strategy_path(&state)?;
+    std::fs::create_dir_all(path.parent().expect("canonical strategy path has a parent"))
+        .map_err(|e| FlapjackError::Io(e.to_string()))?;
     let json =
         serde_json::to_string_pretty(&strategy).map_err(|e| FlapjackError::Json(e.to_string()))?;
     flapjack::index::atomic_write_file(&path, json.as_bytes())
@@ -81,7 +83,7 @@ pub async fn set_personalization_strategy(
 pub async fn get_personalization_strategy(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<PersonalizationStrategy>, FlapjackError> {
-    let path = strategy_path(&state);
+    let path = strategy_path(&state)?;
     if !path.exists() {
         return Err(FlapjackError::TenantNotFound(
             "No personalization strategy configured".to_string(),
@@ -99,7 +101,7 @@ pub async fn get_personalization_strategy(
 pub async fn delete_personalization_strategy(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
-    let path = strategy_path(&state);
+    let path = strategy_path(&state)?;
     match std::fs::remove_file(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -138,7 +140,7 @@ pub async fn get_user_profile(
         .map_err(FlapjackError::InvalidQuery)?;
 
     // Load strategy — required for profile computation
-    let strategy_path = strategy_path(&state);
+    let strategy_path = strategy_path(&state)?;
     if !strategy_path.exists() {
         return Err(FlapjackError::TenantNotFound(
             "No personalization strategy configured".to_string(),

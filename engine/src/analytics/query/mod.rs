@@ -251,7 +251,9 @@ impl AnalyticsQueryEngine {
             return Ok(Vec::new());
         }
 
-        let ctx = SessionContext::new();
+        let ctx = SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new().with_collect_statistics(false),
+        );
 
         // Find all parquet files recursively (Hive-partitioned)
         let parquet_files = find_parquet_files(dir)?;
@@ -263,8 +265,7 @@ impl AnalyticsQueryEngine {
         let opts = ListingOptions::new(Arc::new(
             datafusion::datasource::file_format::parquet::ParquetFormat::default(),
         ))
-        .with_file_extension(".parquet")
-        .with_collect_stat(false);
+        .with_file_extension(".parquet");
 
         let table_path = dir.to_string_lossy().to_string();
         ctx.register_listing_table(table_name, &table_path, opts, None, None)
@@ -490,7 +491,9 @@ impl AnalyticsQueryEngine {
         index_name: &str,
     ) -> Result<AnalyticsSession, String> {
         let snapshot = super::mutation::begin_index_read(&self.config, index_name).await?;
-        let ctx = SessionContext::new();
+        let ctx = SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new().with_collect_statistics(false),
+        );
         self.register_searches_table(&ctx, index_name).await?;
         run_analytics_read_stage_hook(AnalyticsReadStage::AfterSearchesRegistration, index_name);
         Ok(AnalyticsSession {
@@ -505,7 +508,9 @@ impl AnalyticsQueryEngine {
         index_name: &str,
     ) -> Result<AnalyticsSession, String> {
         let snapshot = super::mutation::begin_index_read(&self.config, index_name).await?;
-        let ctx = SessionContext::new();
+        let ctx = SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new().with_collect_statistics(false),
+        );
         self.register_events_table(&ctx, index_name).await?;
         Ok(AnalyticsSession {
             context: ctx,
@@ -518,7 +523,9 @@ impl AnalyticsQueryEngine {
         index_name: &str,
     ) -> Result<AnalyticsSession, String> {
         let snapshot = super::mutation::begin_index_read(&self.config, index_name).await?;
-        let ctx = SessionContext::new();
+        let ctx = SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new().with_collect_statistics(false),
+        );
         self.register_searches_table(&ctx, index_name).await?;
         self.register_events_table(&ctx, index_name).await?;
         Ok(AnalyticsSession {
@@ -549,8 +556,7 @@ impl AnalyticsQueryEngine {
         let opts = ListingOptions::new(Arc::new(
             datafusion::datasource::file_format::parquet::ParquetFormat::default(),
         ))
-        .with_file_extension(".parquet")
-        .with_collect_stat(false);
+        .with_file_extension(".parquet");
         let table_path = dir.to_string_lossy().to_string();
         ctx.register_listing_table("searches", &table_path, opts, None, None)
             .await
@@ -580,8 +586,7 @@ impl AnalyticsQueryEngine {
         let opts = ListingOptions::new(Arc::new(
             datafusion::datasource::file_format::parquet::ParquetFormat::default(),
         ))
-        .with_file_extension(".parquet")
-        .with_collect_stat(false);
+        .with_file_extension(".parquet");
         let table_path = dir.to_string_lossy().to_string();
         ctx.register_listing_table("events", &table_path, opts, None, None)
             .await

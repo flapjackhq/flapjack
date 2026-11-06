@@ -196,7 +196,10 @@ pub struct SearchOptions<'a> {
 
     // Settings
     pub settings_override: Option<&'a IndexSettings>,
-    pub dictionary_lookup_tenant: Option<&'a str>,
+    /// Application owner for custom dictionaries; never an index-name override.
+    pub dictionary_application_id: Option<&'a str>,
+    /// Coherent admitted dictionary state, reused by internal fallback searches.
+    pub dictionary_snapshot: Option<&'a crate::dictionaries::manager::DictionarySnapshot>,
 
     // Ranking
     pub all_query_words_optional: bool,
@@ -258,7 +261,8 @@ impl<'a> Default for SearchOptions<'a> {
             secured_hits_per_page_cap: None,
             decompound_query: None,
             settings_override: None,
-            dictionary_lookup_tenant: None,
+            dictionary_application_id: None,
+            dictionary_snapshot: None,
             all_query_words_optional: false,
             relevancy_strictness: None,
             min_proximity: None,
@@ -724,6 +728,7 @@ impl Index {
             Self::stemmer_language_for_index(index_languages)
         };
         let path = path.as_ref().to_path_buf();
+        crate::dictionaries::persistence::DictionaryStore::reject_legacy_index_directory(&path)?;
         let inner = TantivyIndex::open_in_dir(&path)?;
 
         Self::register_tokenizers(
@@ -757,6 +762,7 @@ impl Index {
     /// Open an existing index with an explicit memory budget.
     pub fn open_with_budget<P: AsRef<Path>>(path: P, budget: Arc<MemoryBudget>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        crate::dictionaries::persistence::DictionaryStore::reject_legacy_index_directory(&path)?;
         let inner = TantivyIndex::open_in_dir(&path)?;
 
         Self::register_tokenizers(&inner, true, &[], "", &[], None);
