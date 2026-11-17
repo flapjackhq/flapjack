@@ -336,6 +336,7 @@ import pathlib
 import re
 import sys
 
+sys.stdout.reconfigure(newline="\n")
 compatibility_path = pathlib.Path(sys.argv[1])
 mode = sys.argv[2]
 input_value = sys.argv[3]
@@ -913,6 +914,7 @@ import hashlib
 import pathlib
 import sys
 
+sys.stdout.reconfigure(newline="\n")
 print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
 PY
 )"
@@ -922,6 +924,7 @@ import hashlib
 import pathlib
 import sys
 
+sys.stdout.reconfigure(newline="\n")
 print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
 PY
 )"
