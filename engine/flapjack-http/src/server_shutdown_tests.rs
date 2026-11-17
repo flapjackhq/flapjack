@@ -361,6 +361,7 @@ async fn write_queue_failure_is_a_failed_service_stop() {
 /// The receipt is emitted only after the listener is closed and every write
 /// owner has drained. It binds the exact runtime, data-root identity, and
 /// sorted document inventory without reading or hashing customer files.
+#[cfg(unix)]
 #[tokio::test]
 async fn drained_shutdown_persists_one_strict_atomic_inventory_receipt() {
     let temp = tempfile::TempDir::new().unwrap();
@@ -400,6 +401,33 @@ async fn drained_shutdown_persists_one_strict_atomic_inventory_receipt() {
         .file_name()
         .to_string_lossy()
         .contains("atomic-write")));
+}
+
+#[cfg(not(unix))]
+#[tokio::test]
+async fn shutdown_inventory_refuses_unsupported_identity_without_writing_receipts() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let data_root = temp.path().join("data");
+    std::fs::create_dir(&data_root).unwrap();
+    let manager = flapjack::IndexManager::new(&data_root);
+    let receipt_path = temp.path().join("shutdown-inventory.json");
+    let sentinel = b"retained receipt";
+    std::fs::write(&receipt_path, sentinel).unwrap();
+
+    let error =
+        persist_shutdown_inventory_receipt(&manager, &receipt_path, "unsupported").unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(
+        error.to_string(),
+        "Flapjack release inventory requires Unix data-root identity"
+    );
+    assert_eq!(std::fs::read(&receipt_path).unwrap(), sentinel);
+
+    let absent_path = temp.path().join("absent-receipt.json");
+    let error =
+        persist_shutdown_inventory_receipt(&manager, &absent_path, "unsupported").unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert!(!absent_path.exists());
 }
 
 #[test]

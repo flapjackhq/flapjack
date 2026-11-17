@@ -522,6 +522,70 @@ assert_image_identity_ssot() {
     "release.yml never re-hardcodes the composed image reference ($context)"
 }
 
+assert_predecessor_consumer_contract() {
+  local template="$1" tmp_dir="$2" selected candidate predecessors block consumer observed
+  selected="$tmp_dir/arm-selected.json"
+  candidate="$tmp_dir/arm-candidate.json"
+  predecessors="$tmp_dir/predecessors.tsv"
+  block="$tmp_dir/compatibility-job.yml"
+  consumer="$tmp_dir/consume-predecessors.sh"
+  observed="$tmp_dir/consumed-predecessors.tsv"
+
+  if ! "$RELEASE_MANIFEST_HELPER" --compatibility-target aarch64-unknown-linux-musl >"$selected" \
+    || ! job_block engine_compatibility_gate >"$block"; then
+    fail "workflow consumes the manifest owner's complete predecessor recipes"
+    return
+  fi
+  # This is a metadata fixture for the producer/consumer boundary, not an ARM
+  # executable. Keep the real manifest shape and canonical selected recipe.
+  if ! python3 - "$template" "$selected" "$candidate" "$block" "$consumer" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+template, selected, candidate, block, consumer = map(pathlib.Path, sys.argv[1:])
+manifest = json.loads(template.read_text())
+manifest["artifact"].update(
+    file="flapjack-aarch64-unknown-linux-musl.tar.gz",
+    target="aarch64-unknown-linux-musl",
+    arch="aarch64",
+)
+manifest["build"]["target"] = "aarch64-unknown-linux-musl"
+manifest["compatibility"] = json.loads(selected.read_text())
+if not manifest["compatibility"]["predecessors"]:
+    raise SystemExit("consumer fixture requires the declared ARM predecessor")
+candidate.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+statements = [
+    line.strip() for line in block.read_text().splitlines()
+    if re.match(r"^\s*while IFS=.*read -r release_tag\b", line)
+]
+if len(statements) != 1:
+    raise SystemExit("expected one actual predecessor consumer statement")
+consumer.write_text(
+    "set -euo pipefail\n"
+    "_transition_mode= _forward_transfer_mode= _parity_profile=\n"
+    + statements[0] + "\n"
+    + r'''  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$release_tag" "$manifest_sha" "$binary_sha" "$_transition_mode" \
+    "$_forward_transfer_mode" "$rollback_mode" "$_parity_profile"
+done < "$1"
+'''
+)
+PY
+  then
+    fail "workflow consumes the manifest owner's complete predecessor recipes"
+    return
+  fi
+  if "$RELEASE_MANIFEST_HELPER" --compatibility-predecessors "$candidate" >"$predecessors" \
+    && "$BASH" "$consumer" "$predecessors" >"$observed" \
+    && cmp -s "$predecessors" "$observed"; then
+    pass "workflow consumes the manifest owner's complete predecessor recipes"
+  else
+    fail "workflow consumes the manifest owner's complete predecessor recipes"
+  fi
+}
+
 assert_release_helper_contract() {
   local tmp_dir bin_path output_dir manifest_path fake_bin predecessors mutated_manifest
   tmp_dir="$(mktemp -d)"
@@ -648,6 +712,8 @@ PY
     else
       fail "release_artifact_manifest validates the candidate manifest and reports no unclaimed predecessors"
     fi
+
+    assert_predecessor_consumer_contract "$manifest_path" "$tmp_dir"
 
     mutated_manifest="$tmp_dir/divergent.manifest.json"
     python3 - "$manifest_path" "$mutated_manifest" <<'PY'
@@ -1001,6 +1067,7 @@ assert_job_contains "engine_compatibility_gate" 'gh release download "\$release_
 assert_job_contains "engine_compatibility_gate" 'manifestSha256' "engine compatibility gate verifies the exact predecessor manifest digest"
 assert_job_contains "engine_compatibility_gate" 'old-binary-sha256 "\$binary_sha"' "engine compatibility smoke binds the predecessor executable to the exact declaration"
 assert_job_contains "engine_compatibility_gate" 'tests/upgrade_smoke\.sh' "engine compatibility gate executes the same-data-dir smoke owner"
+assert_job_contains "engine_compatibility_gate" 'rollback-mode "\$rollback_mode"' "engine compatibility smoke receives the selected rollback coordinate"
 assert_job_contains "engine_compatibility_gate" 'timeout --signal=TERM --kill-after=5s 90s' "each historical upgrade smoke has a 90-second hard ceiling"
 assert_job_needs "release" "engine_compatibility_gate" "the public tag and release wait for exact predecessor compatibility proof"
 

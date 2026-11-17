@@ -24,7 +24,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WAIT_HELPER="$SCRIPT_DIR/common/wait_for_flapjack.sh"
 ADMIN_KEY=""
 INDEX_NAME="upgrade_smoke"
-QUERY_TOKEN="upgrade-smoke-token"
+# Disjoint single tokens prevent default all-attribute search from matching
+# the other generation's title or analyzed marker words.
+QUERY_TOKEN="zebracobaltquartz"
+NEW_QUERY_TOKEN="velvetorchidplume"
+OLD_OBJECT_IDS='["old-doc-1","old-doc-2"]'
+NEW_OBJECT_IDS='["new-doc-1"]'
 
 OLD_BIN=""
 OLD_MANIFEST=""
@@ -136,6 +141,7 @@ verify_search_hits() {
   local base_url="$1"
   local query="$2"
   local expected_hits="$3"
+  local expected_ids="$4"
   local request_body
   local response
   local hits
@@ -144,6 +150,9 @@ verify_search_hits() {
   response="$(http_json POST "$base_url/1/indexes/$INDEX_NAME/query" "$request_body")"
   hits="$(printf '%s' "$response" | jq -r '.nbHits')"
   [ "$hits" = "$expected_hits" ] || fail "expected $expected_hits hits for query '$query', got $hits"
+  printf '%s' "$response" | jq -e --argjson expected "$expected_ids" \
+    '([.hits[].objectID] | sort) == ($expected | sort)' >/dev/null \
+    || fail "unexpected object IDs for query '$query'"
 }
 
 validate_binary_manifest() {
@@ -336,7 +345,7 @@ main() {
   }')"
   task_id="$(printf '%s' "$batch_response" | jq -r '.taskID')"
   wait_for_task_published "$old_base" "$task_id"
-  verify_search_hits "$old_base" "$QUERY_TOKEN" "2"
+  verify_search_hits "$old_base" "$QUERY_TOKEN" "2" "$OLD_OBJECT_IDS"
   pass "old binary seeded and searchable"
 
   kill "$OLD_PID" 2>/dev/null || true
@@ -365,7 +374,7 @@ main() {
   cmp -s "$expected_live_build_json" "$actual_live_build_json" \
     || fail "new binary protected build identity does not match its executable and manifest"
   pass "new binary served the exact authenticated manifest identity"
-  verify_search_hits "$new_base" "$QUERY_TOKEN" "2"
+  verify_search_hits "$new_base" "$QUERY_TOKEN" "2" "$OLD_OBJECT_IDS"
   pass "new binary preserved pre-upgrade search state"
 
   local upgrade_write_response
@@ -377,14 +386,14 @@ main() {
         "body": {
           "objectID": "new-doc-1",
           "title": "Upgrade smoke new doc",
-          "token": "post-upgrade-token"
+          "token": "'"$NEW_QUERY_TOKEN"'"
         }
       }
     ]
   }')"
   upgrade_task_id="$(printf '%s' "$upgrade_write_response" | jq -r '.taskID')"
   wait_for_task_published "$new_base" "$upgrade_task_id"
-  verify_search_hits "$new_base" "post-upgrade-token" "1"
+  verify_search_hits "$new_base" "$NEW_QUERY_TOKEN" "1" "$NEW_OBJECT_IDS"
   pass "new binary accepted writes on the upgraded data dir"
 
   if [ "$ROLLBACK_MODE" = "binary_reactivate_same_data" ]; then
@@ -404,8 +413,8 @@ main() {
       || fail "rollback predecessor health check failed"
     curl -fsS "$rollback_base/health/ready" >/dev/null \
       || fail "rollback predecessor readiness check failed"
-    verify_search_hits "$rollback_base" "$QUERY_TOKEN" "2"
-    verify_search_hits "$rollback_base" "post-upgrade-token" "1"
+    verify_search_hits "$rollback_base" "$QUERY_TOKEN" "2" "$OLD_OBJECT_IDS"
+    verify_search_hits "$rollback_base" "$NEW_QUERY_TOKEN" "1" "$NEW_OBJECT_IDS"
     pass "predecessor restarted on the post-write data dir and preserved both generations"
   fi
 }

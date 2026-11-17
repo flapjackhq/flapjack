@@ -392,33 +392,36 @@ fn persist_shutdown_inventory_receipt(
     let canonical_data_root = manager.base_path.canonicalize()?;
     let metadata = canonical_data_root.metadata()?;
     #[cfg(unix)]
-    let (device, inode) = {
+    {
         use std::os::unix::fs::MetadataExt;
-        (metadata.dev(), metadata.ino())
-    };
-    #[cfg(not(unix))]
-    return Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "Flapjack release inventory requires Unix data-root identity",
-    ));
+        let (device, inode) = (metadata.dev(), metadata.ino());
 
-    let inventory = crate::handlers::internal::canonical_release_inventory(manager)
-        .map_err(std::io::Error::other)?;
-    let receipt = ShutdownInventoryReceipt {
-        schema_version: 1,
-        kind: "flapjack_shutdown_inventory",
-        runtime: flapjack::build_info().clone(),
-        transaction_id: transaction_id.to_string(),
-        data_root: DataRootIdentity {
-            path: canonical_data_root.display().to_string(),
-            device,
-            inode,
-        },
-        inventory,
-    };
-    let mut payload = serde_json::to_vec(&receipt).map_err(std::io::Error::other)?;
-    payload.push(b'\n');
-    flapjack::index::atomic_write_private_file(receipt_path, &payload)
+        let inventory = crate::handlers::internal::canonical_release_inventory(manager)
+            .map_err(std::io::Error::other)?;
+        let receipt = ShutdownInventoryReceipt {
+            schema_version: 1,
+            kind: "flapjack_shutdown_inventory",
+            runtime: flapjack::build_info().clone(),
+            transaction_id: transaction_id.to_string(),
+            data_root: DataRootIdentity {
+                path: canonical_data_root.display().to_string(),
+                device,
+                inode,
+            },
+            inventory,
+        };
+        let mut payload = serde_json::to_vec(&receipt).map_err(std::io::Error::other)?;
+        payload.push(b'\n');
+        flapjack::index::atomic_write_private_file(receipt_path, &payload)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (metadata, receipt_path, transaction_id);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Flapjack release inventory requires Unix data-root identity",
+        ))
+    }
 }
 
 /// Flushes analytics data then waits for the index manager to complete its graceful
