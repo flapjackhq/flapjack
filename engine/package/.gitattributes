@@ -1,0 +1,2 @@
+# The release contract validates and hashes these exact UTF-8/LF bytes.
+engine_compatibility.json text eol=lf

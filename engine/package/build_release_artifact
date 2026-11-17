@@ -7,8 +7,8 @@ ENGINE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_DIR="$(cd "$ENGINE_DIR/.." && pwd)"
 MANIFEST_HELPER="$SCRIPT_DIR/release_artifact_manifest"
 DASHBOARD_DIR="$ENGINE_DIR/dashboard"
-# Tracked RustEmbed placeholder that the dashboard build rewrites with freshly
-# content-hashed asset names on every invocation.
+# The private tree tracks this entrypoint; the public mirror generates it.
+# Both forms are rewritten with fresh content-hashed asset names during builds.
 GENERATED_DASHBOARD_PLACEHOLDER="$DASHBOARD_DIR/dist/index.html"
 
 usage() {
@@ -108,12 +108,19 @@ require_tool "$BUILD_TOOL"
 
 TEMP_DIR="$(mktemp -d)"
 DASHBOARD_PLACEHOLDER_RESTORE_REQUIRED=0
-DASHBOARD_PLACEHOLDER_BUILD_DIFF="$TEMP_DIR/dashboard-placeholder-after-build.diff"
+DASHBOARD_PLACEHOLDER_EXISTED=0
+DASHBOARD_PLACEHOLDER_BEFORE_BUILD="$TEMP_DIR/dashboard-placeholder-before-build.html"
+DASHBOARD_PLACEHOLDER_AFTER_BUILD="$TEMP_DIR/dashboard-placeholder-after-build.html"
 
 restore_generated_dashboard_placeholder() {
   [ "$DASHBOARD_PLACEHOLDER_RESTORE_REQUIRED" -eq 1 ] || return 0
-  git -C "$REPO_DIR" checkout -- "$GENERATED_DASHBOARD_PLACEHOLDER" \
-    || return 1
+  # Remove only our exact output first, so a later symlink cannot redirect a
+  # preimage restore. Never remove the generated asset directory.
+  rm -f -- "$GENERATED_DASHBOARD_PLACEHOLDER" || return 1
+  if [ "$DASHBOARD_PLACEHOLDER_EXISTED" -eq 1 ]; then
+    mkdir -p "$(dirname "$GENERATED_DASHBOARD_PLACEHOLDER")" || return 1
+    cp -p "$DASHBOARD_PLACEHOLDER_BEFORE_BUILD" "$GENERATED_DASHBOARD_PLACEHOLDER" || return 1
+  fi
   DASHBOARD_PLACEHOLDER_RESTORE_REQUIRED=0
 }
 
@@ -148,6 +155,8 @@ import hashlib
 import pathlib
 import sys
 
+# Bash consumes exact fields; native Windows text stdout otherwise adds CR.
+sys.stdout.reconfigure(newline="\n")
 print(
     hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest(),
     hashlib.sha256(pathlib.Path(sys.argv[2]).read_bytes()).hexdigest(),
@@ -192,6 +201,7 @@ OUTPUT_DIR="$(python3 - "$CALLER_DIR" "$OUTPUT_ARGUMENT" <<'PY'
 import pathlib
 import sys
 
+sys.stdout.reconfigure(newline="\n")
 caller = pathlib.Path(sys.argv[1])
 requested = pathlib.Path(sys.argv[2])
 if not requested.is_absolute():
@@ -203,6 +213,16 @@ mkdir -p "$OUTPUT_DIR"
 
 export FLAPJACK_BUILD_REVISION="$SOURCE_SHA"
 export FLAPJACK_REQUIRE_DASHBOARD=1
+if [ -L "$GENERATED_DASHBOARD_PLACEHOLDER" ] \
+  || { [ -e "$GENERATED_DASHBOARD_PLACEHOLDER" ] && [ ! -f "$GENERATED_DASHBOARD_PLACEHOLDER" ]; }; then
+  die "initial dashboard entrypoint must be absent or a regular file"
+fi
+if [ -f "$GENERATED_DASHBOARD_PLACEHOLDER" ]; then
+  cp -p "$GENERATED_DASHBOARD_PLACEHOLDER" "$DASHBOARD_PLACEHOLDER_BEFORE_BUILD" \
+    || die "cannot capture the initial dashboard entrypoint"
+  DASHBOARD_PLACEHOLDER_EXISTED=1
+fi
+# npm ci can execute lifecycle scripts, so cleanup is armed before either call.
 DASHBOARD_PLACEHOLDER_RESTORE_REQUIRED=1
 
 (
@@ -210,8 +230,7 @@ DASHBOARD_PLACEHOLDER_RESTORE_REQUIRED=1
   npm ci
   npm run build
 )
-git -C "$REPO_DIR" diff --binary --no-ext-diff -- \
-  "$GENERATED_DASHBOARD_PLACEHOLDER" >"$DASHBOARD_PLACEHOLDER_BUILD_DIFF" \
+cp "$GENERATED_DASHBOARD_PLACEHOLDER" "$DASHBOARD_PLACEHOLDER_AFTER_BUILD" \
   || die "cannot capture the generated dashboard placeholder state"
 
 (
@@ -224,14 +243,11 @@ git -C "$REPO_DIR" diff --binary --no-ext-diff -- \
       --package flapjack-server --no-default-features
   fi
 )
-git -C "$REPO_DIR" diff --binary --no-ext-diff -- \
-  "$GENERATED_DASHBOARD_PLACEHOLDER" \
-  | cmp -s "$DASHBOARD_PLACEHOLDER_BUILD_DIFF" - \
-  || die "tracked dashboard placeholder changed after dashboard build"
+cmp -s "$DASHBOARD_PLACEHOLDER_AFTER_BUILD" "$GENERATED_DASHBOARD_PLACEHOLDER" \
+  || die "dashboard entrypoint changed after dashboard build"
 
-# The binary has embedded the freshly built dashboard, so discard this helper's
-# own rewrite of the tracked placeholder. The post-build integrity guards below
-# then judge a genuinely unchanged worktree instead of this build's side effect.
+# The binary has embedded the dashboard. Restore the entrypoint's exact initial
+# bytes or absence before the post-build source integrity guards run.
 restore_generated_dashboard_placeholder \
   || die "cannot restore the generated dashboard placeholder"
 

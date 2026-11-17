@@ -310,6 +310,11 @@ if [ "${1:-}" = "--version" ]; then
   exit 0
 fi
 printf 'npm %s\n' "$*" >>"$FAKE_COMMAND_LOG"
+if [ "${1:-}" = "ci" ] && [ -n "${FAKE_NPM_CI_EXIT_STATUS:-}" ]; then
+  mkdir -p dist
+  printf 'ci-mutated entrypoint\n' >dist/index.html
+  exit "$FAKE_NPM_CI_EXIT_STATUS"
+fi
 if [ "${1:-}" = "run" ] && [ "${2:-}" = "build" ]; then
   # Model the real bundler: every build emits freshly content-hashed assets and
   # rewrites the tracked placeholder to reference them.
@@ -349,6 +354,26 @@ binary="target/${target}/release/flapjack"
 case "$target" in *-windows-*) binary="${binary}.exe" ;; esac
 mkdir -p "$(dirname "$binary")"
 printf 'binary:%s\n' "$target" >"$binary"
+if [ "${FAKE_BUILD_EMBED_IDENTITY:-0}" = "1" ]; then
+  python3 - "$binary" "$target" "$FLAPJACK_BUILD_REVISION" <<'PY'
+import json
+import pathlib
+import sys
+
+build = {
+    "schemaVersion": 1, "version": "1.0.17", "revision": sys.argv[3],
+    "revisionKnown": True, "dirty": None, "dirtyKnown": False,
+    "workspaceDigest": "2" * 64, "profile": "release", "target": sys.argv[2],
+    "features": ["analytics", "axum-support", "decompound", "memory-stats", "openapi", "s3-snapshots"],
+    "capabilities": {"vectorSearch": False, "vectorSearchLocal": False},
+}
+pathlib.Path(sys.argv[1]).write_bytes(
+    b"fixture\nFLAPJACK_BUILD_INFO_JSON_BEGIN\n"
+    + json.dumps(build, sort_keys=True, separators=(",", ":")).encode()
+    + b"\nFLAPJACK_BUILD_INFO_JSON_END\n"
+)
+PY
+fi
 chmod +x "$binary"
 if [ "${FAKE_BUILD_MUTATE_TRACKED:-0}" = "1" ]; then
   printf 'mutated\n' >>dashboard/package-lock.json
@@ -356,6 +381,12 @@ fi
 if [ "${FAKE_BUILD_MUTATE_DASHBOARD_PLACEHOLDER:-0}" = "1" ]; then
   printf '<script src="/dashboard/assets/cross-mutated.js"></script>\n' \
     >dashboard/dist/index.html
+fi
+if [ -n "${FAKE_BUILD_LINK_TARGET:-}" ]; then
+  cp dashboard/dist/index.html "$FAKE_BUILD_LINK_TARGET"
+  cp "$FAKE_BUILD_LINK_TARGET" "$FAKE_BUILD_LINK_TARGET.expected"
+  rm dashboard/dist/index.html
+  ln -s "$FAKE_BUILD_LINK_TARGET" dashboard/dist/index.html
 fi
 EOF
 
@@ -771,6 +802,165 @@ expect_failure "cross-side mutation of the dashboard placeholder is rejected" \
     FAKE_BUILD_MUTATE_DASHBOARD_PLACEHOLDER=1
 assert_dashboard_build_leaves_source_clean \
   "rejected cross-side placeholder mutation is restored after detection"
+
+run_public_placeholder_cases() {
+  local entrypoint="$FIXTURE_REPO/engine/dashboard/dist/index.html"
+  local preimage="$TMP_ROOT/public-entrypoint-before-build" case_name expected_exit actual_exit
+  local -a controls
+  git -C "$FIXTURE_REPO" rm -q -- engine/dashboard/dist/index.html
+  git -C "$FIXTURE_REPO" commit -qm "public mirror fixture omits generated dist"
+  SOURCE_SHA="$(git -C "$FIXTURE_REPO" rev-parse HEAD)"
+  SOURCE_TREE="$(git -C "$FIXTURE_REPO" rev-parse 'HEAD^{tree}')"
+  printf 'distinct cached public entrypoint\n' >"$preimage"
+  chmod 640 "$preimage"
+  for case_name in absent-success npm-ci-failure npm-build-failure cargo-failure cross-mutation ignored-success ignored-failure ignored-symlink; do
+    controls=()
+    expected_exit=0
+    case "$case_name" in
+      npm-ci-failure) controls=(FAKE_NPM_CI_EXIT_STATUS=69); expected_exit=69 ;;
+      npm-build-failure) controls=(FAKE_NPM_BUILD_EXIT_STATUS=71); expected_exit=71 ;;
+      cargo-failure) controls=(FAKE_BUILD_EXIT_STATUS=72); expected_exit=72 ;;
+      cross-mutation) controls=(FAKE_BUILD_MUTATE_DASHBOARD_PLACEHOLDER=1); expected_exit=1 ;;
+      ignored-failure) controls=(FAKE_BUILD_EXIT_STATUS=72); expected_exit=72 ;;
+      ignored-symlink) controls=(FAKE_BUILD_LINK_TARGET="$TMP_ROOT/generated-link-target") ;;
+    esac
+    rm -f "$entrypoint"
+    case "$case_name" in
+      ignored-*)
+        # A nearer ignored .gitignore overrides the tracked index.html exception.
+        printf '/index.html\n' >"$FIXTURE_REPO/engine/dashboard/dist/.gitignore"
+        cp -p "$preimage" "$entrypoint"
+        ;;
+    esac
+    : >"$COMMAND_LOG"
+    actual_exit=0
+    run_helper public-all x86_64-pc-windows-msvc "public-$case_name" ${controls[@]+"${controls[@]}"} \
+      >"$TMP_ROOT/public-$case_name.log" 2>&1 || actual_exit=$?
+    if [ "$actual_exit" = "$expected_exit" ] \
+      && case "$case_name" in
+        ignored-*) cmp -s "$preimage" "$entrypoint" \
+          && python3 -c 'import pathlib,stat,sys; assert stat.S_IMODE(pathlib.Path(sys.argv[1]).stat().st_mode)==0o640' "$entrypoint" ;;
+        *) [ ! -e "$entrypoint" ] && [ ! -L "$entrypoint" ] ;;
+      esac \
+      && { [ "$case_name" != ignored-symlink ] || cmp -s "$TMP_ROOT/generated-link-target.expected" "$TMP_ROOT/generated-link-target"; } \
+      && [ -z "$(git -C "$FIXTURE_REPO" status --porcelain=v1 --untracked-files=all)" ] \
+      && { [ "$expected_exit" = 0 ] || [ ! -e "$OUTPUT_ROOT/public-$case_name/flapjack-x86_64-pc-windows-msvc.build.json" ]; }; then
+      pass "public entrypoint preimage and exact exit survive $case_name"
+    else
+      fail "public entrypoint preimage and exact exit survive $case_name"
+      tail -4 "$TMP_ROOT/public-$case_name.log"
+    fi
+  done
+  rm -f "$entrypoint"
+  for case_name in directory symlink dangling-symlink; do
+    printf 'distinct cached public entrypoint\n' >"$preimage"
+    case "$case_name" in
+      directory) mkdir "$entrypoint"; printf 'untouched\n' >"$entrypoint/child" ;;
+      symlink) ln -s "$preimage" "$entrypoint" ;;
+      dangling-symlink) ln -s "$TMP_ROOT/missing-entrypoint" "$entrypoint" ;;
+    esac
+    : >"$COMMAND_LOG"
+    actual_exit=0
+    run_helper public-all x86_64-pc-windows-msvc "unsafe-$case_name" \
+      >"$TMP_ROOT/unsafe-$case_name.log" 2>&1 || actual_exit=$?
+    if [ "$actual_exit" != 0 ] \
+      && ! grep -Eq '^(npm (ci|run build)|(cargo|cross) build)' "$COMMAND_LOG" \
+      && case "$case_name" in
+        directory) [ "$(cat "$entrypoint/child")" = untouched ] ;;
+        *) [ -L "$entrypoint" ] ;;
+      esac \
+      && [ "$(cat "$preimage")" = 'distinct cached public entrypoint' ] \
+      && [ ! -e "$TMP_ROOT/missing-entrypoint" ]; then
+      pass "initial $case_name entrypoint is refused before mutation"
+    else
+      fail "initial $case_name entrypoint is refused before mutation"
+    fi
+    # Only this case-owned fixture path is removed, never generated assets.
+    rm -rf "$entrypoint"
+    rm -f "$TMP_ROOT/missing-entrypoint"
+  done
+  rm "$FIXTURE_REPO/engine/dashboard/dist/.gitignore"
+}
+
+run_public_placeholder_cases
+
+run_windows_machine_output_case() {
+  local target="x86_64-pc-windows-msvc" package_dir="$FIXTURE_REPO/engine/package"
+  local original="$TMP_ROOT/committed-compatibility.json" crlf="$TMP_ROOT/crlf-compatibility.json"
+  local python_site="$TMP_ROOT/windows-python"
+  # Use the actual packaging owner, rather than the stub used by orchestration
+  # refusal cases, so this case covers the complete path/digest byte handoff.
+  cp "$ENGINE_DIR/package/release_artifact_manifest" "$package_dir/release_artifact_manifest"
+  if [ -f "$ENGINE_DIR/package/.gitattributes" ]; then
+    cp "$ENGINE_DIR/package/.gitattributes" "$package_dir/.gitattributes"
+  fi
+  git -C "$FIXTURE_REPO" -c core.autocrlf=false add engine/package
+  git -C "$FIXTURE_REPO" commit -qm "native packaging fixture"
+  SOURCE_SHA="$(git -C "$FIXTURE_REPO" rev-parse HEAD)"
+  SOURCE_TREE="$(git -C "$FIXTURE_REPO" rev-parse 'HEAD^{tree}')"
+  git -C "$FIXTURE_REPO" show HEAD:engine/package/engine_compatibility.json >"$original"
+  rm "$CANONICAL_COMPATIBILITY"
+  GIT_ATTR_NOSYSTEM=1 git -C "$FIXTURE_REPO" -c core.attributesFile=/dev/null \
+    -c core.autocrlf=true checkout-index --force -- engine/package/engine_compatibility.json
+  if cmp -s "$original" "$CANONICAL_COMPATIBILITY" \
+    && "$package_dir/release_artifact_manifest" --compatibility-source "$CANONICAL_COMPATIBILITY" \
+      --compatibility-target "$target" >"$TMP_ROOT/windows-selected.json"; then
+    pass "Windows Git checkout preserves the raw canonical compatibility bytes"
+  else
+    fail "Windows Git checkout preserves the raw canonical compatibility bytes"
+  fi
+  python3 - "$original" "$crlf" <<'PY'
+import pathlib
+import sys
+pathlib.Path(sys.argv[2]).write_bytes(pathlib.Path(sys.argv[1]).read_bytes().replace(b"\n", b"\r\n"))
+PY
+  expect_failure "the actual compatibility owner still rejects noncanonical CRLF input" \
+    "$package_dir/release_artifact_manifest" --compatibility-source "$crlf" --compatibility-target "$target"
+  mkdir -p "$python_site"
+  cat >"$python_site/sitecustomize.py" <<'PY'
+import sys
+# Model native Windows Python text stdout without changing the producer code.
+sys.stdout.reconfigure(newline="\r\n")
+PY
+  : >"$COMMAND_LOG"
+  rm -rf "$OUTPUT_ROOT/current"
+  if run_helper public-all "$target" current \
+    PYTHONPATH="$python_site" PYTHONDONTWRITEBYTECODE=1 FAKE_BUILD_EMBED_IDENTITY=1; then
+    pass "actual Windows package and receipt survive native Python stdout newline translation"
+  else
+    fail "actual Windows package and receipt survive native Python stdout newline translation"
+    return
+  fi
+  assert_build_receipt public-all "$target" cargo ""
+  if python3 - "$OUTPUT_ROOT/current" "$target" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+import zipfile
+
+root, target = pathlib.Path(sys.argv[1]), sys.argv[2]
+manifest = json.loads((root / f"flapjack-{target}.manifest.json").read_bytes())
+with zipfile.ZipFile(root / manifest["artifact"]["file"]) as archive:
+    binary = archive.read("flapjack.exe")
+if manifest["artifact"]["binarySha256"] != hashlib.sha256(binary).hexdigest():
+    raise SystemExit("manifest binary digest does not bind the ZIP executable bytes")
+PY
+  then
+    pass "Windows manifest binary digest matches the actual ZIP executable bytes"
+  else
+    fail "Windows manifest binary digest matches the actual ZIP executable bytes"
+  fi
+  if [ ! -e "$FIXTURE_REPO/engine/dashboard/dist/index.html" ] \
+    && [ ! -L "$FIXTURE_REPO/engine/dashboard/dist/index.html" ] \
+    && [ -z "$(git -C "$FIXTURE_REPO" status --porcelain=v1 --untracked-files=all)" ]; then
+    pass "native Windows packaging preserves the public entrypoint's original absence"
+  else
+    fail "native Windows packaging preserves the public entrypoint's original absence"
+  fi
+}
+
+run_windows_machine_output_case
 
 if [ "$SECONDS" -le 8 ]; then
   pass "focused helper contract stays within its 8-second hard cap (${SECONDS}s)"
